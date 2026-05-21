@@ -1,5 +1,5 @@
 /*
-validator_api.proto defines the gRPC service interface for the Bitcoin SV transaction
+validator_api.proto defines the gRPC service interface for the BSV Blockchain transaction
 validation service. It specifies the methods and message types for transaction
 validation, health checking, and block information retrieval.
 */
@@ -57,10 +57,11 @@ message ValidateTransactionRequest {
   bytes transaction_data = 1;    // Raw transaction data to validate
   uint32 block_height = 2;       // Block height for validation context
   // validation options
-  optional bool skip_utxo_create = 3;     // Skip UTXO creation for validation
+  optional bool skip_utxo_creation = 3;     // Skip UTXO creation for validation
   optional bool add_tx_to_block_assembly = 4; // Add transaction to block assembly
   optional bool skip_policy_checks = 5;     // Skip policy checks
   optional bool create_conflicting = 6;     // Create conflicting transaction
+  optional bool skip_txmeta_publishing = 7; // Skip publishing txmeta to Kafka
 }
 
 // ValidateTransactionResponse provides transaction validation results
@@ -81,7 +82,7 @@ message ValidateTransactionBatchRequest {
 // ValidateTransactionBatchResponse provides batch validation results
 // swagger:model ValidateTransactionBatchResponse
 message ValidateTransactionBatchResponse {
-  bool valid = 1;                    // Overall batch validation status
+  bool valid = 1;                    // Always true; callers must inspect per-item errors below.
   repeated errors.TError errors = 2;        // Array of error messages, one per transaction
   repeated bytes metadata = 3;       // Array of metadata for each transaction
 }

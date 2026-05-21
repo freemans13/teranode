@@ -16,12 +16,12 @@
   let age = ''
   let fields: MsgDisplayField[] = []
   let title = ''
-  
+
   // Format JSON with syntax highlighting
   function formatJSON(obj: any): string {
     try {
       let json = JSON.stringify(obj, null, 2)
-      
+
       // Basic syntax highlighting
       json = json
         // Strings (but not property names)
@@ -34,7 +34,7 @@
         .replace(/: (null)/g, ': <span class="json-null">$1</span>')
         // Property names
         .replace(/"([^"]+)":/g, '<span class="json-key">"$1"</span>:')
-        
+
       return json
     } catch (e) {
       return '{}'
@@ -201,37 +201,37 @@
     word-break: break-all;
     color: var(--msgbox-value-color);
   }
-  
+
   .json-display {
     margin: 0;
     padding: 0;
     font-family: 'JetBrains Mono', 'Courier New', monospace;
     font-size: 12px;
     line-height: 1.5;
-    color: #b4b4b4;
+    color: var(--json-display-color, #b4b4b4);
     white-space: pre-wrap;
     word-wrap: break-word;
     overflow-wrap: break-word;
     max-width: 100%;
   }
-  
+
   :global(.json-display .json-key) {
-    color: #a8c0ff;
+    color: var(--json-display-key-color, #a8c0ff);
   }
-  
+
   :global(.json-display .json-string) {
-    color: #98c379;
+    color: var(--json-display-string-color, #98c379);
   }
-  
+
   :global(.json-display .json-number) {
-    color: #d19a66;
+    color: var(--json-display-number-color, #d19a66);
   }
-  
+
   :global(.json-display .json-boolean) {
-    color: #56b6c2;
+    color: var(--json-display-boolean-color, #56b6c2);
   }
-  
+
   :global(.json-display .json-null) {
-    color: #abb2bf;
+    color: var(--json-display-null-color, #abb2bf);
   }
 </style>

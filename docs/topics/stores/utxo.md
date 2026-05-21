@@ -26,7 +26,7 @@
     - [6.1. Shared Buffer Optimization](#61-shared-buffer-optimization)
 7. [Directory Structure and Main Files](#7-directory-structure-and-main-files)
 8. [Running the Store Locally](#8-running-the-store-locally)
-    - [How to run](#how-to-run)
+    - [How to run](#8-running-the-store-locally)
 9. [Configuration and Settings](#9-configuration-and-settings)
 10. [Other Resources](#10-other-resources)
 
@@ -606,7 +606,7 @@ UTXO Store Package Structure (stores/utxo)
 The UTXO Store is a data store component that is used by various services. It is not run independently. To use the UTXO Store locally, run services that depend on it, such as the Validator or UTXO Persister:
 
 ```shell
-SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] go run . -validator=1 
+SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] go run . -validator=1
 ```
 
 Please refer to the [Locally Running Services Documentation](../../howto/locallyRunningServices.md) document for more information on running services locally.

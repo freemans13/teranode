@@ -147,19 +147,19 @@
     padding: 0;
     background: transparent;
     border: none;
-    color: rgba(255, 255, 255, 0.66);
+    color: var(--comp-label-color);
     cursor: pointer;
     transition: all 0.2s ease;
     border-radius: 4px;
   }
 
   .clear-sort-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
-    color: rgba(255, 255, 255, 0.9);
+    background: var(--app-overlay-color);
+    color: var(--app-color);
   }
 
   .clear-sort-btn:active {
-    background: rgba(255, 255, 255, 0.15);
+    background: var(--app-overlay-strong-color);
   }
 
   .live {
@@ -167,7 +167,7 @@
     align-items: center;
     gap: 4px;
 
-    color: rgba(255, 255, 255, 0.66);
+    color: var(--comp-label-color);
 
     font-family: Satoshi;
     font-size: 13px;
@@ -185,7 +185,7 @@
     color: #15b241;
   }
   .live-label {
-    color: rgba(255, 255, 255, 0.66);
+    color: var(--comp-label-color);
   }
 
   .title {
@@ -194,37 +194,37 @@
     gap: 8px;
   }
 
-  
+
   /* Highlight the current node name */
   :global(.current-node-name) {
     color: #4a9eff !important;
     font-weight: bold;
   }
-  
+
   /* Column header alignments */
   /* State column (1st) - center align */
   :global(th:nth-child(1)),
   :global(.th:nth-child(1)) {
     text-align: center !important;
   }
-  
+
   :global(th:nth-child(1) .table-cell-row),
   :global(.th:nth-child(1) .table-cell-row) {
     justify-content: center !important;
   }
-  
+
   /* Version (3rd column now) - explicitly left align */
   :global(th:nth-child(3)),
   :global(.th:nth-child(3)) {
     text-align: left !important;
   }
-  
+
   :global(th:nth-child(3) .table-cell-row),
   :global(.th:nth-child(3) .table-cell-row) {
     text-align: left !important;
     justify-content: flex-start !important;
   }
-  
+
   :global(th:nth-child(4)), /* Height - right align */
   :global(.th:nth-child(4)),
   :global(th:nth-child(6)), /* Chain Rank - right align */
@@ -264,14 +264,14 @@
   :global(.th:nth-child(6)) {
     white-space: nowrap !important;
   }
-  
+
   /* Right-align numeric values */
   :global(.num) {
     text-align: right !important;
     display: block !important;
     width: 100% !important;
   }
-  
+
   :global(.chainwork-score-top) {
     color: #15b241 !important;
     font-weight: bold;

@@ -34,7 +34,7 @@ message KafkaTxValidationTopicMessage {
 }
 
 message KafkaTxValidationOptions {
-  bool skipUtxoCreate = 1;
+  bool skipUtxoCreation = 1;
   bool addTXToBlockAssembly = 2;
   bool skipPolicyChecks = 3;
   bool createConflicting = 4;

@@ -4,15 +4,26 @@ set -euo pipefail
 
 # Parse command line arguments
 DB_FILTER=""
+RETRY_COUNT=${TEST_RETRY_COUNT:-3}
+RETRY_DELAY=${TEST_RETRY_DELAY:-2}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --db)
             DB_FILTER="$2"
             shift 2
             ;;
+        --retry)
+            RETRY_COUNT="$2"
+            shift 2
+            ;;
+        --retry-delay)
+            RETRY_DELAY="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--db sqlite|postgres|aerospike]"
+            echo "Usage: $0 [--db sqlite|postgres|aerospike] [--retry COUNT] [--retry-delay SECONDS]"
             exit 1
             ;;
     esac
@@ -57,38 +68,63 @@ TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
 SKIPPED_TESTS=0
+FLAKY_TESTS=0
 
 # Arrays to store test results for summary
 declare -a FAILED_TEST_NAMES
 declare -a PASSED_TEST_NAMES
 declare -a SKIPPED_TEST_NAMES
+declare -a FLAKY_TEST_NAMES
 
-# Function to run a test and update counters
+# Function to run a test with retry logic and update counters
 run_test() {
     local test_name=$1
     local test_binary=$2
-    local output
-    output=$("./${test_binary}" -test.run "^${test_name}$" -test.timeout 120s -test.count=1 2>&1)
-    local result=$?
+    local attempt=1
+    local max_attempts=$RETRY_COUNT
 
-    echo "$output" | sed '$d'
-    
-    if echo "$output" | grep -q "warning: no tests to run"; then
-        SKIPPED_TESTS=$((SKIPPED_TESTS + 1))
-        SKIPPED_TEST_NAMES+=("$test_name")
-        echo "SKIPPED"
-        return 0
-    elif [ $result -eq 0 ]; then
-        PASSED_TESTS=$((PASSED_TESTS + 1))
-        PASSED_TEST_NAMES+=("$test_name")
-        echo "PASSED"
-        return 0
-    else
-        FAILED_TESTS=$((FAILED_TESTS + 1))
-        FAILED_TEST_NAMES+=("$test_name")
-        echo "FAILED"
-        return 1
-    fi
+    while [ $attempt -le $max_attempts ]; do
+        if [ $attempt -gt 1 ]; then
+            echo "  ⏳ Retry attempt $attempt/$max_attempts (after ${RETRY_DELAY}s delay)..."
+            sleep $RETRY_DELAY
+        fi
+
+        local output
+        output=$("./${test_binary}" -test.run "^${test_name}$" -test.timeout 120s -test.count=1 2>&1)
+        local result=$?
+
+        # Only show output on first attempt or final failure
+        if [ $attempt -eq 1 ] || [ $attempt -eq $max_attempts ]; then
+            echo "$output" | sed '$d'
+        fi
+
+        if echo "$output" | grep -q "warning: no tests to run"; then
+            SKIPPED_TESTS=$((SKIPPED_TESTS + 1))
+            SKIPPED_TEST_NAMES+=("$test_name")
+            echo "SKIPPED"
+            return 0
+        elif [ $result -eq 0 ]; then
+            if [ $attempt -eq 1 ]; then
+                PASSED_TESTS=$((PASSED_TESTS + 1))
+                PASSED_TEST_NAMES+=("$test_name")
+                echo "✅ PASSED"
+            else
+                FLAKY_TESTS=$((FLAKY_TESTS + 1))
+                FLAKY_TEST_NAMES+=("$test_name (passed on attempt $attempt/$max_attempts)")
+                PASSED_TESTS=$((PASSED_TESTS + 1))
+                echo "⚠️  FLAKY - PASSED on attempt $attempt/$max_attempts"
+            fi
+            return 0
+        elif [ $attempt -eq $max_attempts ]; then
+            # Final failure after all retries
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            FAILED_TEST_NAMES+=("$test_name")
+            echo "❌ FAILED after $max_attempts attempts"
+            return 1
+        fi
+
+        attempt=$((attempt + 1))
+    done
 }
 
 any_test_failed=0
@@ -103,12 +139,12 @@ for test_file in $test_files; do
 
     # Store all test functions in an array
     IFS=$'\n' read -r -d '' -a test_functions < <(grep -n "^func Test" "$test_filename" | grep -v "^func TestMain" && printf '\0')
-    
+
     for ((i=0; i<${#test_functions[@]}; i++)); do
         line_info="${test_functions[i]}"
         line_num=$(echo "$line_info" | cut -d: -f1)
         line=$(echo "$line_info" | cut -d: -f2-)
-        
+
         # Extract the test function name
         test_func=$(echo "$line" | awk '{print $2}' | cut -d'(' -f1)
 
@@ -138,7 +174,7 @@ for test_file in $test_files; do
                 subtest_name=$(echo "$subtest_line" | sed -n 's/.*t.Run("\([^"]*\)".*/\1/p')
                 if [ ! -z "$subtest_name" ]; then
                     echo -e "\nRunning $test_func / $subtest_name"
-                    
+
                     TOTAL_TESTS=$((TOTAL_TESTS + 1))
                     if ! run_test "${test_func}/${subtest_name}" "${test_binary}"; then
                         any_test_failed=1
@@ -146,7 +182,7 @@ for test_file in $test_files; do
                 fi
             fi
         done < <(sed -n "${line_num},${next_line_num}p" "$test_filename")
-        
+
         # If no subtests found, run the main test function
         if [ "$has_subtests" = false ]; then
             echo "Running: $test_func"
@@ -167,20 +203,56 @@ done
 find . -name "*.test" -type f -delete
 
 # Print summary
-echo -e "\nTest Summary:"
-echo "Total Tests: $TOTAL_TESTS"
-echo "Passed: $PASSED_TESTS"
-echo "Failed: $FAILED_TESTS"
-echo "Skipped: $SKIPPED_TESTS"
+echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📊 Test Summary"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Total Tests:    $TOTAL_TESTS"
+echo "✅ Passed:      $PASSED_TESTS"
+echo "❌ Failed:      $FAILED_TESTS"
+echo "⏭️  Skipped:     $SKIPPED_TESTS"
+if [ "$FLAKY_TESTS" -gt 0 ]; then
+    echo "⚠️  Flaky:       $FLAKY_TESTS"
+fi
+echo ""
+echo "Retry Configuration:"
+echo "  Max Retries:  $RETRY_COUNT"
+echo "  Retry Delay:  ${RETRY_DELAY}s"
+
+# Print flaky tests if any
+if [ "$FLAKY_TESTS" -gt 0 ]; then
+    echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "⚠️  FLAKY TESTS DETECTED"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "The following tests failed initially but passed on retry:"
+    for test in "${FLAKY_TEST_NAMES[@]}"; do
+        echo "  - $test"
+    done
+    echo ""
+    echo "⚠️  WARNING: Flaky tests may indicate race conditions or timing issues"
+    echo "   that should be investigated and fixed."
+fi
+
+# Print failed tests if any
+if [ "$FAILED_TESTS" -gt 0 ]; then
+    echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "❌ FAILED TESTS"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "The following tests failed after $RETRY_COUNT attempts:"
+    for test in "${FAILED_TEST_NAMES[@]}"; do
+        echo "  - $test"
+    done
+fi
 
 # Print end time and duration
 end_time=$(date +%s)
 duration=$((end_time - start_time))
-echo -e "\nTest execution completed at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Test execution completed at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "Total duration: $((duration / 60)) minutes and $((duration % 60)) seconds"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if [ "$FAILED_TESTS" -gt 0 ]; then
-    echo -e "\nSome tests failed!"
+    echo -e "\n❌ Some tests failed after retries!"
     exit 1
 fi
 

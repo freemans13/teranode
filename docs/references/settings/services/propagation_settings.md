@@ -17,10 +17,13 @@
 | SendBatchTimeout | int | 5 | propagation_sendBatchTimeout | Batch timeout configuration (milliseconds) |
 | GRPCAddresses | []string | [] | propagation_grpcAddresses | gRPC client connections |
 | GRPCListenAddress | string | "" | propagation_grpcListenAddress | **CRITICAL** - gRPC server binding (service skipped if empty) |
+| IPv6AllowedSources | []string | [] | propagation_ipv6_allowed_sources | Restrict UDP sources by IP or CIDR (empty = allow all) |
+| HTTPBodyLimit | string | 100MB | propagation_httpBodyLimit | Maximum HTTP request body size (prevents OOM on oversized requests) |
 
 ## Configuration Dependencies
 
 ### HTTP Server Management
+
 - When `HTTPListenAddress` is not empty, HTTP server starts
 - `HTTPRateLimit` controls request rate limiting when HTTP server is active
 
@@ -35,10 +38,12 @@
 - `GRPCMaxConnectionAge` controls connection lifecycle
 
 ### Transport Selection
+
 - `AlwaysUseHTTP` forces HTTP transport over gRPC for transaction operations
 - Affects client-side transport selection in transaction processing
 
 ### IPv6 Multicast
+
 - When `IPv6Addresses` is not empty, starts UDP6 listeners
 - Uses `IPv6Interface` for network interface selection (defaults to "en0")
 
@@ -64,8 +69,8 @@
 ### Basic Configuration
 
 ```text
-propagation_grpcListenAddress = ":9905"
-propagation_httpListenAddress = ":8080"
+propagation_grpcListenAddress = ":8084"
+propagation_httpListenAddress = ":8833"
 ```
 
 ### HTTP Rate Limiting

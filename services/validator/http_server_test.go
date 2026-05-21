@@ -98,7 +98,7 @@ func TestHTTPEndpoints(t *testing.T) {
 		utxoMock.On("GetBlockState").Return(utxo.BlockState{Height: 1000, MedianTime: 1625097600})
 		utxoMock.On("PreviousOutputsDecorate", mock.Anything, mock.Anything).Return(nil)
 
-		// Add expectation for the Get method which may be called regardless of SkipUtxoCreate
+		// Add expectation for the Get method which may be called regardless of skipUtxoCreation
 		metaData := &meta.Data{
 			Fee:         32279815860,
 			SizeInBytes: 245,
@@ -119,7 +119,7 @@ func TestHTTPEndpoints(t *testing.T) {
 		e := echo.New()
 
 		// Build URL with parameters to bypass validation issues
-		queryParams := "SkipUtxoCreate=true&addTxToBlockAssembly=false&skipPolicyChecks=true&createConflicting=false"
+		queryParams := "skipUtxoCreation=true&addTxToBlockAssembly=false&skipPolicyChecks=true&createConflicting=false"
 		req := httptest.NewRequest(http.MethodPost, "/tx?"+queryParams, bytes.NewReader(txBytes))
 		rec := httptest.NewRecorder()
 
@@ -175,7 +175,7 @@ func TestHTTPEndpoints(t *testing.T) {
 		buf.Write(txBytes)
 
 		// Build URL with parameters to bypass validation issues
-		queryParams := "SkipUtxoCreate=true&addTxToBlockAssembly=false&skipPolicyChecks=true&createConflicting=false"
+		queryParams := "skipUtxoCreation=true&addTxToBlockAssembly=false&skipPolicyChecks=true&createConflicting=false"
 		req := httptest.NewRequest(http.MethodPost, "/txs?"+queryParams, &buf)
 		rec := httptest.NewRecorder()
 

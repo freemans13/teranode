@@ -8,12 +8,12 @@
   let nodeId = ''
   let nodeUrl = ''
   let blockAssembly: any = null
-  
+
   // Subtree pagination state
   let subtreesExpanded = false
   let subtreesPage = 1
   let subtreesPerPage = 10
-  
+
   $: totalSubtrees = blockAssembly?.subtrees?.length || 0
   $: totalPages = Math.ceil(totalSubtrees / subtreesPerPage)
   $: paginatedSubtrees = blockAssembly?.subtrees?.slice(
@@ -44,11 +44,11 @@
       handleClose()
     }
   }
-  
+
   function toggleSubtrees() {
     subtreesExpanded = !subtreesExpanded
   }
-  
+
   function goToPage(page: number) {
     if (page >= 1 && page <= totalPages) {
       subtreesPage = page
@@ -80,7 +80,7 @@
         <h2>Block Assembly Details</h2>
         <button class="close-btn" on:click={handleClose}>×</button>
       </div>
-      
+
       <div class="node-info">
         <span class="node-label">Node:</span>
         <span class="node-value">{nodeUrl}</span>
@@ -110,8 +110,8 @@
         <div class="detail-item full-width">
           <span class="label">Current Hash:</span>
           {#if blockAssembly.currentHash}
-            <a 
-              href="/viewer/block?hash={blockAssembly.currentHash}" 
+            <a
+              href="/viewer/block?hash={blockAssembly.currentHash}"
               class="value hash-link"
               target="_blank"
               rel="noopener noreferrer"
@@ -131,15 +131,15 @@
                 <span class="label">Subtrees ({formatNum(blockAssembly.subtrees.length)})</span>
               </button>
             </div>
-            
+
             {#if subtreesExpanded}
               <div class="subtrees-container">
                 <div class="subtrees-list">
                   {#each paginatedSubtrees as subtree, index}
                     <div class="subtree-item">
                       <span class="subtree-index">{startIndex + index}.</span>
-                      <a 
-                        href="/viewer/subtree/?hash={subtree}" 
+                      <a
+                        href="/viewer/subtree/?hash={subtree}"
                         class="subtree-hash-link"
                         target="_blank"
                         rel="noopener noreferrer"
@@ -149,24 +149,24 @@
                     </div>
                   {/each}
                 </div>
-                
+
                 {#if totalPages > 1}
                   <div class="pagination">
-                    <button 
-                      class="page-btn" 
+                    <button
+                      class="page-btn"
                       on:click={() => goToPage(subtreesPage - 1)}
                       disabled={subtreesPage === 1}
                     >
                       ←
                     </button>
-                    
+
                     <span class="page-info">
-                      Page {subtreesPage} of {totalPages} 
+                      Page {subtreesPage} of {totalPages}
                       <span class="page-range">({startIndex}-{endIndex} of {totalSubtrees})</span>
                     </span>
-                    
-                    <button 
-                      class="page-btn" 
+
+                    <button
+                      class="page-btn"
                       on:click={() => goToPage(subtreesPage + 1)}
                       disabled={subtreesPage === totalPages}
                     >
@@ -185,8 +185,8 @@
 
 <style>
   .modal-content {
-    background: #2a2b36;
-    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: var(--app-bg-color);
+    border: 1px solid var(--app-border-color);
     border-radius: 12px;
     padding: 24px;
     min-width: 400px;
@@ -202,14 +202,14 @@
     align-items: center;
     margin-bottom: 20px;
     padding-bottom: 12px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    border-bottom: 1px solid var(--app-border-color);
   }
 
   .modal-header h2 {
     margin: 0;
     font-size: 20px;
     font-weight: 600;
-    color: #ffffff;
+    color: var(--app-color);
   }
 
   .close-btn {
@@ -217,7 +217,7 @@
     border: none;
     font-size: 28px;
     line-height: 1;
-    color: #999;
+    color: var(--comp-label-color);
     cursor: pointer;
     padding: 0;
     width: 32px;
@@ -230,8 +230,8 @@
   }
 
   .close-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
-    color: #ffffff;
+    background: var(--app-overlay-color);
+    color: var(--app-color);
   }
 
   .node-info {
@@ -239,17 +239,17 @@
     gap: 8px;
     margin-bottom: 20px;
     padding: 8px 12px;
-    background: rgba(0, 0, 0, 0.3);
+    background: var(--app-subtle-bg-color);
     border-radius: 6px;
   }
 
   .node-label {
     font-weight: 600;
-    color: #999;
+    color: var(--comp-label-color);
   }
 
   .node-value {
-    color: #ffffff;
+    color: var(--app-color);
   }
 
   .details-grid {
@@ -271,14 +271,14 @@
   .label {
     font-size: 12px;
     font-weight: 600;
-    color: #999;
+    color: var(--comp-label-color);
     text-transform: uppercase;
     letter-spacing: 0.5px;
   }
 
   .value {
     font-size: 16px;
-    color: #ffffff;
+    color: var(--app-color);
     font-weight: 500;
   }
 
@@ -294,19 +294,19 @@
     font-size: 13px;
     word-break: break-all;
     line-height: 1.4;
-    color: #4a9eff;
+    color: var(--link-default-enabled-color);
     text-decoration: none;
     display: inline-block;
     transition: all 0.2s;
   }
 
   .value.hash-link:hover {
-    color: #6fb4ff;
+    color: var(--link-default-hover-color);
     text-decoration: underline;
   }
 
   .value.hash-link:active {
-    color: #3a8eef;
+    color: var(--link-default-active-color);
   }
 
   .value.state-active {
@@ -340,11 +340,11 @@
   }
 
   .expand-btn:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--app-subtle-bg-color);
   }
 
   .expand-icon {
-    color: #999;
+    color: var(--comp-label-color);
     font-size: 12px;
     transition: transform 0.2s;
   }
@@ -372,8 +372,8 @@
     max-height: 300px;
     overflow-y: auto;
     padding: 12px;
-    background: rgba(0, 0, 0, 0.3);
-    border: 1px solid rgba(255, 255, 255, 0.05);
+    background: var(--app-subtle-bg-color);
+    border: 1px solid var(--app-border-color);
     border-radius: 4px;
   }
 
@@ -386,18 +386,18 @@
   }
 
   .subtree-index {
-    color: #777;
+    color: var(--comp-label-color);
     min-width: 40px;
     text-align: right;
   }
 
   .subtree-hash {
-    color: #ddd;
+    color: var(--app-color);
     word-break: break-all;
   }
 
   .subtree-hash-link {
-    color: #4a9eff;
+    color: var(--link-default-enabled-color);
     text-decoration: none;
     word-break: break-all;
     transition: all 0.2s;
@@ -406,12 +406,12 @@
   }
 
   .subtree-hash-link:hover {
-    color: #6fb4ff;
+    color: var(--link-default-hover-color);
     text-decoration: underline;
   }
 
   .subtree-hash-link:active {
-    color: #3a8eef;
+    color: var(--link-default-active-color);
   }
 
   .pagination {
@@ -421,14 +421,14 @@
     gap: 12px;
     margin-top: 12px;
     padding: 8px 12px;
-    background: rgba(0, 0, 0, 0.2);
+    background: var(--app-subtle-bg-color);
     border-radius: 6px;
   }
 
   .page-btn {
-    background: rgba(255, 255, 255, 0.1);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    color: #fff;
+    background: var(--app-overlay-color);
+    border: 1px solid var(--app-border-color);
+    color: var(--app-color);
     padding: 4px 12px;
     border-radius: 4px;
     cursor: pointer;
@@ -437,8 +437,8 @@
   }
 
   .page-btn:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.2);
-    border-color: rgba(255, 255, 255, 0.2);
+    background: var(--app-overlay-strong-color);
+    border-color: var(--app-border-color);
   }
 
   .page-btn:disabled {
@@ -447,13 +447,13 @@
   }
 
   .page-info {
-    color: #fff;
+    color: var(--app-color);
     font-size: 13px;
     text-align: center;
   }
 
   .page-range {
-    color: #999;
+    color: var(--comp-label-color);
     font-size: 12px;
   }
 </style>

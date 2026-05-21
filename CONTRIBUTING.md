@@ -1,15 +1,15 @@
 # Contributing Guide
 
-* [New Contributor Guide](#contributing-guide)
-  * [Pull Request Workflow](#pull-request-workflow)
+- [New Contributor Guide](#contributing-guide)
+    - [Pull Request Workflow](#pull-request-workflow)
 
 Welcome! We are glad you are excited to contribute to Teranode.
 
 As you get started, you are in the best position to give us feedback on areas of
 our project that we need help with including:
 
-* Problems found during setting up a new developer environment
-* Gaps in our documentationa
+- Problems found during setting up a new developer environment
+- Gaps in our documentation
 
 If anything doesn't make sense, or doesn't work when you run it, please open a
 bug report and let us know!
@@ -25,7 +25,8 @@ walkthrough](https://github.com/gabrieldemarmiesse/getting_started_open_source)
 covers what we expect contributors to follow.
 
 To briefly summarize, we expect users to:
-1. Fork this repository 
+
+1. Fork this repository
 2. Checkout a branch that tracks `main`
 3. Commit changes locally
 4. Pushes the branch to their remote fork

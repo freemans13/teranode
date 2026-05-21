@@ -12,7 +12,6 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -220,7 +219,7 @@ func TestServerValidateTransaction(t *testing.T) {
 				return &meta.Data{
 					Fee:         32279815860,
 					SizeInBytes: 245,
-					TxInpoints:  subtree.TxInpoints{ParentTxHashes: []chainhash.Hash{*txid}, Idxs: [][]uint32{{0}}},
+					TxInpoints:  singleParentInpoints(txid, 0),
 				}, nil
 			},
 		}
@@ -266,7 +265,7 @@ func TestServerValidateTransaction(t *testing.T) {
 				return &meta.Data{
 					Fee:         32279815860,
 					SizeInBytes: 245,
-					TxInpoints:  subtree.TxInpoints{ParentTxHashes: []chainhash.Hash{*txid}, Idxs: [][]uint32{{0}}},
+					TxInpoints:  singleParentInpoints(txid, 0),
 				}, nil
 			},
 		}
@@ -279,7 +278,7 @@ func TestServerValidateTransaction(t *testing.T) {
 		req := &validator_api.ValidateTransactionRequest{
 			TransactionData:      sampleTx,
 			BlockHeight:          100,
-			SkipUtxoCreate:       &skipUtxo,
+			SkipUtxoCreation:     &skipUtxo,
 			AddTxToBlockAssembly: &addToBlock,
 			SkipPolicyChecks:     &skipPolicy,
 			CreateConflicting:    &createConflict,
@@ -328,7 +327,7 @@ func TestServerValidateTransactionBatch(t *testing.T) {
 				return &meta.Data{
 					Fee:         32279815860,
 					SizeInBytes: 245,
-					TxInpoints:  subtree.TxInpoints{ParentTxHashes: []chainhash.Hash{*txid}, Idxs: [][]uint32{{0}}},
+					TxInpoints:  singleParentInpoints(txid, 0),
 				}, nil
 			},
 		}
@@ -363,7 +362,7 @@ func TestServerValidateTransactionBatch(t *testing.T) {
 					return &meta.Data{
 						Fee:         32279815860,
 						SizeInBytes: 245,
-						TxInpoints:  subtree.TxInpoints{ParentTxHashes: []chainhash.Hash{*txid}, Idxs: [][]uint32{{0}}},
+						TxInpoints:  singleParentInpoints(txid, 0),
 					}, nil
 				}
 				return nil, errors.NewServiceError("validation error")
@@ -482,32 +481,32 @@ func TestExtractValidationParams(t *testing.T) {
 
 		height, options := extractValidationParams(c)
 		require.Equal(t, uint32(0), height)
-		require.False(t, options.SkipUtxoCreate)
+		require.False(t, options.SkipUtxoCreation)
 		require.True(t, options.AddTXToBlockAssembly) // Default is true
 		require.False(t, options.SkipPolicyChecks)
 		require.False(t, options.CreateConflicting)
 	})
 
 	t.Run("all parameters true", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/tx?blockHeight=100&SkipUtxoCreate=true&addTxToBlockAssembly=true&skipPolicyChecks=true&createConflicting=true", nil)
+		req := httptest.NewRequest(http.MethodPost, "/tx?blockHeight=100&skipUtxoCreation=true&addTxToBlockAssembly=true&skipPolicyChecks=true&createConflicting=true", nil)
 		rec := httptest.NewRecorder()
 		c := e.NewContext(req, rec)
 
 		height, options := extractValidationParams(c)
 		require.Equal(t, uint32(100), height)
-		require.True(t, options.SkipUtxoCreate)
+		require.True(t, options.SkipUtxoCreation)
 		require.True(t, options.AddTXToBlockAssembly)
 		require.True(t, options.SkipPolicyChecks)
 		require.True(t, options.CreateConflicting)
 	})
 
 	t.Run("parameters with 1", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/tx?SkipUtxoCreate=1&addTxToBlockAssembly=1&skipPolicyChecks=1&createConflicting=1", nil)
+		req := httptest.NewRequest(http.MethodPost, "/tx?skipUtxoCreation=1&addTxToBlockAssembly=1&skipPolicyChecks=1&createConflicting=1", nil)
 		rec := httptest.NewRecorder()
 		c := e.NewContext(req, rec)
 
 		_, options := extractValidationParams(c)
-		require.True(t, options.SkipUtxoCreate)
+		require.True(t, options.SkipUtxoCreation)
 		require.True(t, options.AddTXToBlockAssembly)
 		require.True(t, options.SkipPolicyChecks)
 		require.True(t, options.CreateConflicting)

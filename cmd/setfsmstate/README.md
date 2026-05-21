@@ -7,12 +7,13 @@ The `setfsmstate` package provides utilities for managing and updating the Finit
 This package is typically used as a command-line tool to set the FSM state of the blockchain client to a desired state.
 
 ## Features
+
 - Update FSM state to pre-defined states (e.g., "idle", "running", "catchingblocks", "legacysyncing").
 
 ## Development
 
 - See `set_fsm_state.go` for the main logic and entry points.
-- Run tests with `go test ./...` in this directory.
+- Run tests with `go test -race -tags testtxmetacache ./...` in this directory, or use `make test` from the project root.
 
 ---
 

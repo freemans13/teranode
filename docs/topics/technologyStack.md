@@ -1,6 +1,6 @@
 # 🔧 Technology Stack
 
-## Go (1.25.2 or above)
+## Go (1.26.0 or above)
 
 Teranode is written in **Go**, leveraging its efficiency and simplicity to build scalable, concurrent microservices. **Go** was chosen for its high performance, especially when dealing with concurrent processes, which is crucial for handling the scale of blockchain validation and transaction processing within Teranode.
 
@@ -97,7 +97,7 @@ Teranode employs various storage technologies, each selected for its specific st
      - Used for block and transaction persistence in distributed deployments
      - Lustre file systems (provided via S3-backed shared volumes) offer high-throughput storage solution, and it is a recommended shared storage option
 
-------
+---
 
 ## Kafka
 
@@ -109,7 +109,7 @@ Teranode employs various storage technologies, each selected for its specific st
 
 2. **High Availability**: Kafka’s fault tolerance and replication ensure that event streams are durable and highly available, which is essential for the integrity of a distributed system like Teranode.
 
-------
+---
 
 ## Containerization & Orchestration
 

@@ -12,6 +12,11 @@ export enum ScriptType {
   UNKNOWN = 'Unknown'
 }
 
+export interface LegacyAddressVersions {
+  p2pkh: number
+  p2sh: number
+}
+
 // Bitcoin opcodes
 const OP_FALSE = 0x00
 const OP_DUP = 0x76
@@ -34,20 +39,20 @@ export function detectScriptType(scriptHex: string): ScriptType {
 
   // Convert hex to bytes for pattern matching
   const bytes = hexToBytes(scriptHex)
-  
+
   // P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-  if (bytes.length === 25 && 
-      bytes[0] === OP_DUP && 
-      bytes[1] === OP_HASH160 && 
+  if (bytes.length === 25 &&
+      bytes[0] === OP_DUP &&
+      bytes[1] === OP_HASH160 &&
       bytes[2] === 0x14 && // Push 20 bytes
-      bytes[23] === OP_EQUALVERIFY && 
+      bytes[23] === OP_EQUALVERIFY &&
       bytes[24] === OP_CHECKSIG) {
     return ScriptType.P2PKH
   }
 
   // P2SH: OP_HASH160 <20 bytes> OP_EQUAL
-  if (bytes.length === 23 && 
-      bytes[0] === OP_HASH160 && 
+  if (bytes.length === 23 &&
+      bytes[0] === OP_HASH160 &&
       bytes[1] === 0x14 && // Push 20 bytes
       bytes[22] === OP_EQUAL) {
     return ScriptType.P2SH
@@ -104,7 +109,7 @@ export function scriptToAsm(scriptHex: string): string {
 
   while (i < bytes.length) {
     const opcode = bytes[i]
-    
+
     // Handle push data operations
     if (opcode > 0 && opcode <= 75) {
       // Direct push of N bytes
@@ -272,7 +277,7 @@ export function extractOpReturnData(scriptHex: string): string | null {
 
   // Extract the data bytes
   const dataBytes = bytes.slice(dataStart)
-  
+
   // Try to decode as UTF-8
   try {
     const decoder = new TextDecoder('utf-8', { fatal: true })
@@ -304,7 +309,7 @@ export function getScriptTypeDescription(type: ScriptType): string {
  */
 function base58Encode(bytes: Uint8Array): string {
   const digits = [0]
-  
+
   for (let i = 0; i < bytes.length; i++) {
     let carry = bytes[i]
     for (let j = 0; j < digits.length; j++) {
@@ -317,20 +322,20 @@ function base58Encode(bytes: Uint8Array): string {
       carry = Math.floor(carry / 58)
     }
   }
-  
+
   // Convert digits to base58 string
   let result = ''
-  
+
   // Add leading 1s for leading zero bytes
   for (let i = 0; i < bytes.length && bytes[i] === 0; i++) {
     result += '1'
   }
-  
+
   // Convert digits to characters
   for (let i = digits.length - 1; i >= 0; i--) {
     result += BASE58_ALPHABET[digits[i]]
   }
-  
+
   return result
 }
 
@@ -356,28 +361,46 @@ async function doubleSha256(data: Uint8Array): Promise<Uint8Array> {
  * @param scriptType - The detected script type
  * @returns The Bitcoin address or null if not applicable
  */
-export async function extractAddress(scriptHex: string, scriptType: ScriptType): Promise<string | null> {
+export async function extractAddress(
+  scriptHex: string,
+  scriptType: ScriptType,
+  versionsOverride?: Partial<LegacyAddressVersions>,
+): Promise<string | null> {
   const bytes = hexToBytes(scriptHex)
-  
+
+  const versions: LegacyAddressVersions = {
+    p2pkh: 0x00,
+    p2sh: 0x05,
+  }
+
+  if (versionsOverride) {
+    if (typeof versionsOverride.p2pkh === 'number') {
+      versions.p2pkh = versionsOverride.p2pkh
+    }
+    if (typeof versionsOverride.p2sh === 'number') {
+      versions.p2sh = versionsOverride.p2sh
+    }
+  }
+
   if (scriptType === ScriptType.P2PKH) {
     // P2PKH: Extract the 20-byte public key hash
     // Script structure: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
     if (bytes.length === 25 && bytes[2] === 0x14) {
       const pubKeyHash = bytes.slice(3, 23)
-      
+
       // Add version byte (0x00 for mainnet P2PKH)
       const versionedHash = new Uint8Array(21)
-      versionedHash[0] = 0x00 // Bitcoin mainnet P2PKH version
+      versionedHash[0] = versions.p2pkh
       versionedHash.set(pubKeyHash, 1)
-      
+
       // Calculate checksum (first 4 bytes of double SHA-256)
       const checksum = (await doubleSha256(versionedHash)).slice(0, 4)
-      
+
       // Combine version + hash + checksum
       const addressBytes = new Uint8Array(25)
       addressBytes.set(versionedHash, 0)
       addressBytes.set(checksum, 21)
-      
+
       // Base58 encode
       return base58Encode(addressBytes)
     }
@@ -386,25 +409,25 @@ export async function extractAddress(scriptHex: string, scriptType: ScriptType):
     // Script structure: OP_HASH160 <20 bytes> OP_EQUAL
     if (bytes.length === 23 && bytes[1] === 0x14) {
       const scriptHash = bytes.slice(2, 22)
-      
+
       // Add version byte (0x05 for mainnet P2SH)
       const versionedHash = new Uint8Array(21)
-      versionedHash[0] = 0x05 // Bitcoin mainnet P2SH version
+      versionedHash[0] = versions.p2sh
       versionedHash.set(scriptHash, 1)
-      
+
       // Calculate checksum
       const checksum = (await doubleSha256(versionedHash)).slice(0, 4)
-      
+
       // Combine version + hash + checksum
       const addressBytes = new Uint8Array(25)
       addressBytes.set(versionedHash, 0)
       addressBytes.set(checksum, 21)
-      
+
       // Base58 encode
       return base58Encode(addressBytes)
     }
   }
-  
+
   return null
 }
 
@@ -414,7 +437,7 @@ export async function extractAddress(scriptHex: string, scriptType: ScriptType):
  */
 export function extractPubKeyHash(scriptHex: string, scriptType: ScriptType): string | null {
   const bytes = hexToBytes(scriptHex)
-  
+
   if (scriptType === ScriptType.P2PKH) {
     // P2PKH: Extract the 20-byte public key hash
     if (bytes.length === 25 && bytes[2] === 0x14) {
@@ -428,6 +451,6 @@ export function extractPubKeyHash(scriptHex: string, scriptType: ScriptType): st
       return scriptHash.map(b => b.toString(16).padStart(2, '0')).join('')
     }
   }
-  
+
   return null
 }

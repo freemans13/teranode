@@ -1,5 +1,5 @@
 /*
-Package validator implements Bitcoin SV transaction validation functionality.
+Package validator implements BSV Blockchain transaction validation functionality.
 
 This file implements option patterns for both general validation options and
 transaction validator-specific options, providing flexible configuration for
@@ -19,9 +19,9 @@ type ParentTxMetadata struct {
 
 // Options defines the configuration options for validation operations
 type Options struct {
-	// SkipUtxoCreate determines whether UTXO creation should be skipped
+	// SkipUtxoCreation determines whether UTXO creation should be skipped
 	// When true, the validator won't create new UTXOs for transaction outputs
-	SkipUtxoCreate bool
+	SkipUtxoCreation bool
 
 	// AddTXToBlockAssembly determines whether transactions should be added to block assembly
 	// When true, validated transactions are forwarded to the block assembly process
@@ -41,21 +41,26 @@ type Options struct {
 	// IgnoreLocked determines whether to ignore transactions marked as locked when spending
 	IgnoreLocked bool
 
-	// SkipUtxoSpend skips spending parent UTXOs in UTXO store
-	// Used for validate-only mode (CPU-intensive validation without I/O)
+	// SkipUtxoSpend skips the UTXO spend pass. Used in the validation phase of
+	// pipelined block validation, where validation runs with SkipUtxoSpend=true
+	// and a follow-up storage call runs with SkipValidation=true to perform the spend.
 	SkipUtxoSpend bool
 
-	// SkipValidation skips script execution and signature verification
-	// Used for store-only mode (I/O operations without CPU-intensive validation)
+	// SkipValidation skips finals checks, coinbase checks, height fetches and the
+	// Teranode/BDK validateTransaction call. Used in the storage phase of pipelined
+	// block validation to reuse the spend/create logic without re-running CPU work.
 	SkipValidation bool
 
 	// ParentMetadata provides pre-fetched metadata for parent transactions
 	// When provided, the validator will check this map before calling utxoStore.Get()
-	// This allows validation of Level N while Level N-1 is still storing
-	// SAFETY: Only includes transactions that successfully validated AND created UTXOs
-	// This prevents validation bypass when child references a failed parent transaction
+	// This enables validation to proceed without UTXO store lookups for in-block parents
 	// Key: parent transaction hash, Value: metadata (block height)
 	ParentMetadata map[chainhash.Hash]*ParentTxMetadata
+
+	// SkipTxMetaPublishing determines whether txmeta should be published to Kafka
+	// When true, the validator won't publish transaction metadata to the txmeta Kafka topic
+	// Used during legacy catchup (quickValidationMode) where no consumer needs the data
+	SkipTxMetaPublishing bool
 }
 
 // Option defines a function type for setting options
@@ -64,14 +69,14 @@ type Option func(*Options)
 
 // NewDefaultOptions creates a new Options instance with default settings
 // Default configuration:
-//   - SkipUtxoCreate: false (UTXOs will be created)
+//   - skipUtxoCreation: false (UTXOs will be created)
 //   - addTXToBlockAssembly: true (transactions will be added to block assembly)
 //
 // Returns:
 //   - *Options: New options instance with default settings
 func NewDefaultOptions() *Options {
 	return &Options{
-		SkipUtxoCreate:       false,
+		SkipUtxoCreation:     false,
 		AddTXToBlockAssembly: true,
 		SkipPolicyChecks:     false,
 		CreateConflicting:    false,
@@ -93,15 +98,15 @@ func ProcessOptions(opts ...Option) *Options {
 	return options
 }
 
-// WithSkipUtxoCreate creates an option to control UTXO creation
+// WithSkipUtxoCreation creates an option to control UTXO creation
 // Parameters:
 //   - skip: When true, UTXO creation will be skipped
 //
 // Returns:
-//   - Option: Function that sets the skipUtxoCreate option
-func WithSkipUtxoCreate(skip bool) Option {
+//   - Option: Function that sets the skipUtxoCreation option
+func WithSkipUtxoCreation(skip bool) Option {
 	return func(o *Options) {
-		o.SkipUtxoCreate = skip
+		o.SkipUtxoCreation = skip
 	}
 }
 
@@ -165,26 +170,28 @@ func WithIgnoreLocked(ignoreLocked bool) Option {
 	}
 }
 
-// WithSkipUtxoSpend creates an option to skip UTXO store spending
-// Used for validate-only mode (CPU-intensive validation without I/O operations)
+// WithSkipTxMetaPublishing creates an option to control txmeta Kafka publishing
 // Parameters:
-//   - skip: When true, utxoStore.Spend() will be skipped
+//   - skip: When true, txmeta will not be published to Kafka
 //
 // Returns:
-//   - Option: Function that sets the SkipUtxoSpend option
+//   - Option: Function that sets the skipTxMetaPublishing option
+func WithSkipTxMetaPublishing(skip bool) Option {
+	return func(o *Options) {
+		o.SkipTxMetaPublishing = skip
+	}
+}
+
+// WithSkipUtxoSpend creates an option to skip UTXO spending.
+// Used in the validation phase of pipelined block validation (CPU-bound work without I/O).
 func WithSkipUtxoSpend(skip bool) Option {
 	return func(o *Options) {
 		o.SkipUtxoSpend = skip
 	}
 }
 
-// WithSkipValidation creates an option to skip script validation
-// Used for store-only mode (I/O operations without CPU-intensive validation)
-// Parameters:
-//   - skip: When true, script execution and signature verification will be skipped
-//
-// Returns:
-//   - Option: Function that sets the SkipValidation option
+// WithSkipValidation creates an option to skip the validation pass.
+// Used in the storage phase of pipelined block validation (I/O-bound work without CPU).
 func WithSkipValidation(skip bool) Option {
 	return func(o *Options) {
 		o.SkipValidation = skip
@@ -192,15 +199,11 @@ func WithSkipValidation(skip bool) Option {
 }
 
 // WithParentMetadata creates an option to provide pre-fetched parent transaction metadata
-// This allows the validator to skip UTXO store lookups for in-block parents, enabling
-// validation of Level N transactions while Level N-1 is still storing to the UTXO store.
-// SAFETY: Only provide metadata for transactions that successfully validated
-//
 // Parameters:
-//   - metadata: Map of parent transaction hashes to their metadata (block height)
+//   - metadata: Map of parent transaction hashes to their metadata (block height, etc.)
 //
 // Returns:
-//   - Option: Function that sets the ParentMetadata option
+//   - Option: Function that sets the parentMetadata option
 func WithParentMetadata(metadata map[chainhash.Hash]*ParentTxMetadata) Option {
 	return func(o *Options) {
 		o.ParentMetadata = metadata

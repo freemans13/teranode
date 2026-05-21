@@ -593,7 +593,7 @@ message KafkaTxValidationTopicMessage {
 }
 
 message KafkaTxValidationOptions {
-  bool SkipUtxoCreate = 1;        // Skip UTXO creation if true
+  bool skipUtxoCreation = 1;        // Skip UTXO creation if true
   bool addTXToBlockAssembly = 2;    // Add transaction to block assembly if true
   bool skipPolicyChecks = 3;        // Skip policy checks if true
   bool createConflicting = 4;       // Allow conflicting transactions if true
@@ -622,7 +622,7 @@ message KafkaTxValidationOptions {
 
 ##### KafkaTxValidationOptions
 
-###### SkipUtxoCreate
+###### skipUtxoCreation
 
 - Type: bool
 - Description: When true, the validator will not create UTXO entries for this transaction
@@ -655,7 +655,7 @@ Here's a JSON representation of the message content (for illustration purposes o
   "tx": "<binary data - variable length>",
   "height": 12345,
   "options": {
-    "SkipUtxoCreate": false,
+    "skipUtxoCreation": false,
     "addTXToBlockAssembly": true,
     "skipPolicyChecks": false,
     "createConflicting": false
@@ -674,7 +674,7 @@ currentHeight := uint32(12345)     // current blockchain height
 
 // Create options (using defaults in this example)
 options := &kafkamessage.KafkaTxValidationOptions{
-    SkipUtxoCreate:     false,
+    SkipUtxoCreation:     false,
     AddTXToBlockAssembly: true,
     SkipPolicyChecks:     false,
     CreateConflicting:    false,
@@ -726,13 +726,13 @@ func handleTxValidationMessage(msg *kafka.Message) error {
     }
 
     // Process the transaction with the provided options...
-    SkipUtxoCreate := options.SkipUtxoCreate
+    skipUtxoCreation := options.SkipUtxoCreation
     addToBlockAssembly := options.AddTXToBlockAssembly
     skipPolicyChecks := options.SkipPolicyChecks
     createConflicting := options.CreateConflicting
 
     // Perform validation based on options...
-    return validateTransaction(tx, height, SkipUtxoCreate, addToBlockAssembly, skipPolicyChecks, createConflicting)
+    return validateTransaction(tx, height, skipUtxoCreation, addToBlockAssembly, skipPolicyChecks, createConflicting)
 }
 ```
 

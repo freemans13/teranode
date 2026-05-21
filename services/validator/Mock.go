@@ -1,15 +1,13 @@
 /*
-Package validator implements Bitcoin SV transaction validation functionality.
+Package validator implements BSV Blockchain transaction validation functionality.
 
-This package provides comprehensive transaction validation for Bitcoin SV nodes,
-including script verification, UTXO management, and policy enforcement. It supports
-multiple script interpreters (GoBT, GoSDK, GoBDK) and implements the full Bitcoin
-transaction validation ruleset.
+This package provides comprehensive transaction validation for BSV Blockchain nodes,
+including BDK transaction validation, UTXO management, and policy enforcement.
 
 Key features:
   - Transaction validation against Bitcoin consensus rules
   - UTXO spending and creation
-  - Script verification using multiple interpreters
+  - BDK transaction validation
   - Policy enforcement
   - Block assembly integration
   - Kafka integration for transaction metadata
@@ -110,29 +108,15 @@ func (m *MockValidatorClient) ValidateWithOptions(ctx context.Context, tx *bt.Tx
 		return nil, err
 	}
 
-	// If SkipUtxoCreate is true (validation-only phase), return empty metadata without storing
-	if validationOptions.SkipUtxoCreate {
-		return &meta.Data{}, nil
-	}
-
-	// Extend transaction if needed (real validator does this automatically)
-	// Only extend if transaction isn't already extended
-	if len(tx.Inputs) > 0 && tx.Inputs[0].PreviousTxScript == nil {
-		for _, input := range tx.Inputs {
-			parentHash := input.PreviousTxIDChainHash()
-			if parentHash != nil {
-				parentMeta, err := m.UtxoStore.Get(ctx, parentHash, utxo.MetaFieldsWithTx...)
-				if err == nil && parentMeta.Tx != nil && len(parentMeta.Tx.Outputs) > int(input.PreviousTxOutIndex) {
-					input.PreviousTxSatoshis = parentMeta.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
-					input.PreviousTxScript = parentMeta.Tx.Outputs[input.PreviousTxOutIndex].LockingScript
-				}
-			}
-		}
-	}
-
-	return m.UtxoStore.Create(context.Background(), tx, blockHeight)
+	return m.UtxoStore.Create(context.Background(), tx, 0)
 }
 
 // TriggerBatcher implements the batcher trigger interface for testing.
 // This is a no-op in the mock implementation as no actual batching occurs.
 func (m *MockValidatorClient) TriggerBatcher() {}
+
+// EnsureMTPLoaded implements mock MTP store pre-warming.
+// This is a no-op in the mock implementation as no actual MTP loading occurs.
+func (m *MockValidatorClient) EnsureMTPLoaded(_ context.Context, _ uint32) error {
+	return nil
+}

@@ -260,7 +260,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		currentBlockHeaderIDs := []uint32{}
 
 		// This should hit many validation paths
-		valid, err := block.Valid(ctx, logger, subtreeStore, txMetaStore, oldBlockIDsMap, currentChain, currentBlockHeaderIDs, settings)
+		valid, err := block.Valid(ctx, logger, subtreeStore, txMetaStore, oldBlockIDsMap, currentChain, currentBlockHeaderIDs, settings, nil)
 		// May pass or fail, but we're testing coverage
 		_ = valid
 		_ = err
@@ -292,7 +292,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should fail validation (may hit difficulty or timestamp validation)
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
 		assert.False(t, valid)
 		assert.Error(t, err) // Just verify it fails - the specific error depends on validation order
 	})
@@ -316,7 +316,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the nil coinbase validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
 		assert.False(t, valid)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "no coinbase tx")
@@ -349,7 +349,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the median timestamp validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), currentChain, []uint32{}, tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), currentChain, []uint32{}, tSettings, nil)
 		// May pass or fail, but we're testing the median timestamp code path
 		_ = valid
 		_ = err
@@ -374,7 +374,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the coinbase height validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
 		// Will likely fail due to height mismatch, but we're testing the code path
 		_ = valid
 		_ = err
@@ -402,7 +402,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		subtreeStore := &mockSubtreeStore{shouldError: true} // Empty store
 
 		// This should hit the subtree validation path
-		valid, err := block.Valid(ctx, logger, subtreeStore, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
+		valid, err := block.Valid(ctx, logger, subtreeStore, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
 		// Will likely fail due to missing subtree, but we're testing the code path
 		_ = valid
 		_ = err
@@ -425,7 +425,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should skip median timestamp validation due to empty chain
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
 		// Should hit the empty chain path
 		_ = valid
 		_ = err
@@ -934,7 +934,32 @@ func TestBlock_Bytes(t *testing.T) {
 		blockBytes, err := block.Bytes()
 		require.NoError(t, err)
 
-		assert.Equal(t, 98, len(blockBytes))
+		assert.Equal(t, 99, len(blockBytes))
+	})
+
+	t.Run("test block bytes - with coinbase bump", func(t *testing.T) {
+		blockHeaderBytes, _ := hex.DecodeString(block1Header)
+		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+		require.NoError(t, err)
+
+		bump := []byte{0x01, 0x02, 0x03, 0x04}
+		block := &Block{
+			Header:           blockHeader,
+			CoinbaseTx:       coinbaseTx,
+			TransactionCount: 1,
+			SizeInBytes:      123,
+			Subtrees:         []*chainhash.Hash{},
+			Height:           800000,
+			CoinbaseBUMP:     bump,
+		}
+
+		blockBytes, err := block.Bytes()
+		require.NoError(t, err)
+
+		blockFromBytes, err := NewBlockFromBytes(blockBytes)
+		require.NoError(t, err)
+
+		assert.Equal(t, bump, []byte(blockFromBytes.CoinbaseBUMP))
 	})
 
 	t.Run("test block bytes", func(t *testing.T) {
@@ -1176,7 +1201,7 @@ func TestBlock_ValidWithOneTransaction(t *testing.T) {
 
 	currentChain[0].HashPrevBlock = &chainhash.Hash{}
 	oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, utxoStore, oldBlockIDs, currentChain, currentChainIDs, settings)
+	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, utxoStore, oldBlockIDs, currentChain, currentChainIDs, settings, nil)
 	require.NoError(t, err)
 	require.True(t, v)
 
@@ -1248,12 +1273,78 @@ func TestCheckDuplicateTransactions(t *testing.T) {
 		123, 0, 0)
 	require.NoError(t, err)
 
-	err = b.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency)
+	err = b.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency, nil)
 	_ = err // To stop lint warning
 }
 
 // TODO reactivate this test when we have a way to check for duplicate transactions
 // require.Error(t, err)
+
+// TestBlock_Valid_DupTxDetected_NilSubtreeStore verifies that the duplicate-tx check (CVE-2012-2459)
+// runs even when subtreeStore is nil, provided SubtreeSlices is already populated. The audit
+// (#4584) flagged the original gate (subtreeStore != nil) as a defense-in-depth gap.
+func TestBlock_Valid_DupTxDetected_NilSubtreeStore(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+
+	blockHeaderBytes, _ := hex.DecodeString(block1Header)
+	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+	require.NoError(t, err)
+
+	coinbase, err := bt.NewTxFromString(CoinbaseHex)
+	require.NoError(t, err)
+
+	leafCount := 4
+	subtree, err := subtreepkg.NewTreeByLeafCount(leafCount)
+	require.NoError(t, err)
+
+	// First node is the coinbase placeholder (skipped by the dup check on subIdx==0,txIdx==0).
+	require.NoError(t, subtree.AddCoinbaseNode())
+
+	dupBytes := make([]byte, 32)
+	_, _ = rand.Read(dupBytes)
+	dupHash, err := chainhash.NewHash(dupBytes)
+	require.NoError(t, err)
+
+	otherBytes := make([]byte, 32)
+	_, _ = rand.Read(otherBytes)
+	otherHash, err := chainhash.NewHash(otherBytes)
+	require.NoError(t, err)
+
+	require.NoError(t, subtree.AddNode(*dupHash, 1, 0))
+	require.NoError(t, subtree.AddNode(*otherHash, 1, 0))
+	require.NoError(t, subtree.AddNode(*dupHash, 1, 0)) // duplicate
+
+	b, err := NewBlock(
+		blockHeader,
+		coinbase,
+		[]*chainhash.Hash{subtree.RootHash()},
+		uint64(leafCount),
+		123, 0, 0)
+	require.NoError(t, err)
+
+	// Pre-populate SubtreeSlices so Valid can reach checkDuplicateTransactions without a subtree store.
+	b.SubtreeSlices = []*subtreepkg.Subtree{subtree}
+
+	currentChain := make([]*BlockHeader, 11)
+	currentChainIDs := make([]uint32, 11)
+	for i := 0; i < 11; i++ {
+		currentChain[i] = &BlockHeader{
+			HashPrevBlock:  &chainhash.Hash{},
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      1231469665 - uint32(i), // nolint:gosec
+		}
+		currentChainIDs[i] = uint32(i) // nolint:gosec
+	}
+	currentChain[0].HashPrevBlock = &chainhash.Hash{}
+
+	oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+
+	valid, err := b.Valid(context.Background(), ulogger.TestLogger{}, nil, nil, oldBlockIDs, currentChain, currentChainIDs, tSettings, nil)
+	require.False(t, valid)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected ErrBlockInvalid, got %v", err)
+	require.Contains(t, err.Error(), "duplicate transaction")
+}
 
 func TestCheckParentExistsOnChain(t *testing.T) {
 	ctx := context.Background()
@@ -1278,8 +1369,11 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 	_, err = utxoStore.Create(context.Background(), tx, blockID101, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 101, BlockHeight: 101}))
 	require.NoError(t, err)
 
+	blockID102 := uint32(102)
+
 	currentBlockHeaderIDsMap := make(map[uint32]struct{})
 	currentBlockHeaderIDsMap[blockID100] = struct{}{}
+	currentBlockHeaderIDsMap[blockID102] = struct{}{}
 
 	block := &Block{}
 
@@ -1295,16 +1389,18 @@ func TestCheckParentExistsOnChain(t *testing.T) {
 	})
 
 	t.Run("test parent is not in a previous block", func(t *testing.T) {
-		// swap parent/tx hashes to simulate a missing parent
+		// swap parent/tx hashes so the parent resolves to block ID 101, which falls
+		// within the cached range [100, 102] but is missing from the set (a gap).
+		// This defers to the validator's checkOldBlockIDs instead of erroring,
+		// because block IDs can have gaps due to orphan/invalid blocks.
 		parentTxStruct := missingParentTx{
 			parentTxHash: *tx.TxIDChainHash(),
 			txHash:       *txParent.TxIDChainHash(),
 		}
 
 		oldBlockIDs, err := block.checkParentExistsOnChain(context.Background(), logger, utxoStore, parentTxStruct, currentBlockHeaderIDsMap)
-		require.Error(t, err)
-		require.True(t, len(oldBlockIDs) == 0)
-		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
+		require.NoError(t, err)
+		require.True(t, len(oldBlockIDs) > 0, "should defer to checkOldBlockIDs")
 	})
 
 	t.Run("test parent has no block ID", func(t *testing.T) {
@@ -1733,6 +1829,94 @@ func TestBlock_CheckDuplicateTransactionsInSubtree(t *testing.T) {
 	})
 }
 
+// TestBlock_CheckDuplicateTransactions_ManySubtrees is a regression guard for issue #900.
+// PR #198 replaced the O(1) base-index formula (subIdx*subtreeSize) with an O(N) prefix-sum
+// loop that called Subtree.Size() on every prior subtree. Subtree.Size() takes an RWMutex,
+// so under the concurrent dedup workers this scaled as O(N^2) atomic ops on shared cache
+// lines, pinning every core on lock contention for blocks with hundreds of thousands of
+// subtrees. This test exercises the dedup path with a few thousand subtrees (last one
+// smaller, exercising the "first tree, except the last one" invariant) and asserts both
+// correctness of the global indices and that the work completes within a tight wall-clock
+// budget — the O(1) path completes the dedup call in well under 100 ms on a developer
+// machine; the budget below is sized for slow CI runners while still tripping on any
+// reintroduced O(N^2) implementation, which under worker fan-out and RWMutex contention
+// would blow past it by orders of magnitude.
+func TestBlock_CheckDuplicateTransactions_ManySubtrees(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+
+	const (
+		numSubtrees = 2000
+		subtreeSize = 16 // capacity of every full subtree
+		lastSize    = 8  // capacity of the trailing (smaller) subtree
+		budget      = 2 * time.Second
+	)
+
+	blockHeaderBytes, err := hex.DecodeString(block1Header)
+	require.NoError(t, err)
+	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+	require.NoError(t, err)
+	coinbase, err := bt.NewTxFromString(CoinbaseHex)
+	require.NoError(t, err)
+
+	subtreeHashes := make([]*chainhash.Hash, numSubtrees)
+	subtrees := make([]*subtreepkg.Subtree, numSubtrees)
+	// Track a few node hashes we'll probe back to ensure indices are correct at scale.
+	probeIndices := []int{0, 1, subtreeSize, (numSubtrees / 2) * subtreeSize, (numSubtrees-1)*subtreeSize + lastSize - 1}
+	probeHashes := make(map[int]chainhash.Hash, len(probeIndices))
+	probeSet := make(map[int]struct{}, len(probeIndices))
+	for _, p := range probeIndices {
+		probeSet[p] = struct{}{}
+	}
+
+	totalTxs := uint64(0)
+	for sIdx := 0; sIdx < numSubtrees; sIdx++ {
+		capacity := subtreeSize
+		if sIdx == numSubtrees-1 {
+			capacity = lastSize
+		}
+		st, sErr := subtreepkg.NewTreeByLeafCount(capacity)
+		require.NoError(t, sErr)
+
+		for nIdx := 0; nIdx < capacity; nIdx++ {
+			buf := make([]byte, 32)
+			_, _ = rand.Read(buf)
+			h, hErr := chainhash.NewHash(buf)
+			require.NoError(t, hErr)
+			require.NoError(t, st.AddNode(*h, 1, 0))
+
+			global := sIdx*subtreeSize + nIdx
+			if _, ok := probeSet[global]; ok {
+				probeHashes[global] = *h
+			}
+		}
+
+		subtrees[sIdx] = st
+		subtreeHashes[sIdx] = st.RootHash()
+		totalTxs += uint64(capacity)
+	}
+
+	b, err := NewBlock(blockHeader, coinbase, subtreeHashes, totalTxs, 0, 0, 0)
+	require.NoError(t, err)
+	b.SubtreeSlices = subtrees
+
+	start := time.Now()
+	err = b.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency, nil)
+	elapsed := time.Since(start)
+	require.NoError(t, err, "dedup should succeed on a block with unique hashes")
+	require.Less(t, elapsed, budget, "dedup wall time exceeded %s (got %s) — likely a re-introduced O(N^2) prefix sum, see issue #900", budget, elapsed)
+
+	// Spot-check that probed nodes ended up at the expected global indices — this is the
+	// invariant the prefix-sum loop was (mistakenly) trying to defend, and proves the
+	// O(1) formula handles the last-smaller-subtree case correctly.
+	for _, global := range probeIndices {
+		hash, ok := probeHashes[global]
+		require.True(t, ok, "probe at global index %d not recorded", global)
+		got, exists := b.txMap.Get(hash)
+		require.True(t, exists, "probe hash at global index %d not in txMap", global)
+		require.Equal(t, uint64(global), got, "global index mismatch for probe at %d", global)
+	}
+}
+
 func TestBlock_GetSubtrees(t *testing.T) {
 	t.Run("get subtrees with missing store", func(t *testing.T) {
 		tSettings := test.CreateBaseTestSettings(t)
@@ -1786,7 +1970,7 @@ func TestBlock_ValidOrderAndBlessed_ErrorCases(t *testing.T) {
 			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "txMap is nil")
 	})
@@ -1820,7 +2004,7 @@ func TestBlock_ValidOrderAndBlessed_WithSubtrees(t *testing.T) {
 			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		require.NoError(t, err) // Should succeed with empty subtrees
 	})
 }
@@ -1903,6 +2087,45 @@ func TestBlock_CheckMerkleRoot_MoreCases(t *testing.T) {
 		err = block.CheckMerkleRoot(context.Background())
 		require.Error(t, err) // Will fail because merkle root won't match
 	})
+}
+
+func TestBlock_CheckMerkleRoot_DuplicateSubtreeRoots(t *testing.T) {
+	blockHeaderBytes, _ := hex.DecodeString(block1Header)
+	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+	require.NoError(t, err)
+
+	coinbase, err := bt.NewTxFromString(CoinbaseHex)
+	require.NoError(t, err)
+
+	subtree1, err := subtreepkg.NewTreeByLeafCount(1)
+	require.NoError(t, err)
+	err = subtree1.AddCoinbaseNode()
+	require.NoError(t, err)
+
+	subtree2, err := subtreepkg.NewTreeByLeafCount(1)
+	require.NoError(t, err)
+	err = subtree2.AddNode(*coinbase.TxIDChainHash(), 1, uint64(coinbase.Size())) // nolint: gosec
+	require.NoError(t, err)
+
+	rootHash1, err := subtree1.RootHashWithReplaceRootNode(coinbase.TxIDChainHash(), 0, uint64(coinbase.Size())) // nolint: gosec
+	require.NoError(t, err)
+
+	rootHash2 := subtree2.RootHash()
+	require.NotNil(t, rootHash2)
+
+	require.Equal(t, *rootHash1, *rootHash2, "test setup must produce colliding subtree root hashes")
+
+	subtreeHashes := []*chainhash.Hash{subtree1.RootHash(), subtree2.RootHash()}
+	block, err := NewBlock(blockHeader, coinbase, subtreeHashes, 2, 123, 0, 0)
+	require.NoError(t, err)
+
+	block.SubtreeSlices = []*subtreepkg.Subtree{subtree1, subtree2}
+
+	err = block.CheckMerkleRoot(context.Background())
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected BlockInvalidError, got %v", err)
+	require.Contains(t, err.Error(), "duplicate")
+	require.Contains(t, err.Error(), rootHash1.String())
 }
 
 func TestBlock_NewFromMsgBlock_ErrorCases(t *testing.T) {
@@ -2063,7 +2286,7 @@ func TestBlock_Valid_MoreCoverage(t *testing.T) {
 
 		// Call with txMetaStore to trigger validOrderAndBlessed path
 		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 
 		// This might error due to missing subtrees, but we're testing the path
 		_ = valid
@@ -2296,7 +2519,7 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 
 		// Test with nil subtreeStore to skip the subtree check
 		valid, err := block.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 
 		// Should succeed because we're skipping most validation
 		require.NoError(t, err)
@@ -2304,7 +2527,7 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 
 		// Test with subtreeStore but no txMetaStore to test different paths
 		valid, err = block.Valid(ctx, logger, mockSubtreeStore, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 
 		// This will error due to missing subtrees but tests the path
 		_ = valid
@@ -2312,7 +2535,7 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 
 		// Test with txMetaStore to trigger validOrderAndBlessed
 		valid, err = block.Valid(ctx, logger, nil, txMetaStore, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 
 		_ = valid
 		_ = err
@@ -2419,14 +2642,14 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		// Test with only subtreeStore
 		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
 		_, err = block.Valid(ctx, logger, mockSubtreeStore, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 		// Will error but exercises the subtree validation path
 		_ = err
 
 		// Test checkBlockRewardAndFees path with height > 0
 		block.Height = 100
 		_, err = block.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 		// Will error but exercises checkBlockRewardAndFees path
 		_ = err
 	})
@@ -2485,7 +2708,7 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should now trigger validateSubtree function
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		// Will likely error due to missing metadata but exercises the validateSubtree path
 		_ = err
 	})
@@ -2546,7 +2769,7 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This exercises more complex validation paths
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		// Will error but exercises multiple validation functions
 		_ = err
 	})
@@ -2582,7 +2805,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 
 		block1.SubtreeSlices = []*subtreepkg.Subtree{subtree}
 		_, err = block1.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 		_ = err // Exercises checkBlockRewardAndFees path safely
 
 		// Test path 2: GetAndValidateSubtrees path
@@ -2594,7 +2817,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
 
 		_, err = block2.Valid(ctx, logger, mockSubtreeStore, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 		_ = err // Exercises GetAndValidateSubtrees path
 
 		// Test path 3: validOrderAndBlessed path with txMetaStore
@@ -2602,7 +2825,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		require.NoError(t, err)
 		txMetaStore := createTestUTXOStore(t)
 		_, err = block3.Valid(ctx, logger, nil, txMetaStore, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 		_ = err // Exercises validOrderAndBlessed path
 
 		// Test path 4: CheckMerkleRoot path
@@ -2617,7 +2840,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 
 		block4.SubtreeSlices = []*subtreepkg.Subtree{subtree2}
 		_, err = block4.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			[]*BlockHeader{}, []uint32{}, tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings, nil)
 		_ = err // Exercises CheckMerkleRoot path
 	})
 
@@ -2678,7 +2901,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		// This should exercise deep validation paths including:
 		// - validateSubtree with multiple nodes
 		// - validateTransaction for each transaction
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
 		_ = err // Will error but exercises many code paths
 	})
 
@@ -2708,7 +2931,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		block.SubtreeSlices = []*subtreepkg.Subtree{subtree1, subtree2}
 
 		// Test checkDuplicateTransactions
-		err = block.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency)
+		err = block.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency, nil)
 		assert.Error(t, err) // Should detect duplicates
 		assert.Contains(t, err.Error(), "duplicate transaction")
 	})
@@ -2999,12 +3222,20 @@ func createSubtreeMetadataWithParents(subtree *subtreepkg.Subtree, nodeIndex int
 	for i := 0; i < subtree.Length(); i++ {
 		// Add parent hashes to specific node
 		if i == nodeIndex && len(parentHashes) > 0 {
-			txInpoints := subtreepkg.NewTxInpoints()
-			// Add parent hashes (simplified - in real usage would need proper input indices)
-			for _, parentHash := range parentHashes {
-				// Create mock input with parent hash
-				txInpoints.ParentTxHashes = append(txInpoints.ParentTxHashes, parentHash)
-				txInpoints.Idxs = append(txInpoints.Idxs, []uint32{0}) // Mock output index
+			// Build mock inputs — vout 0 for each parent hash.
+			inputs := make([]*bt.Input, 0, len(parentHashes))
+			for j := range parentHashes {
+				in := &bt.Input{PreviousTxOutIndex: 0}
+				if err := in.PreviousTxIDAdd(&parentHashes[j]); err != nil {
+					return nil, err
+				}
+
+				inputs = append(inputs, in)
+			}
+
+			txInpoints, err := subtreepkg.NewTxInpointsFromInputs(inputs)
+			if err != nil {
+				return nil, err
 			}
 
 			subtreeMeta.TxInpoints[i] = txInpoints
@@ -4091,7 +4322,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		}
 
 		// This should pass validation - coinbase placeholder is in correct position
-		err = block.validOrderAndBlessed(ctx, logger, deps, 1)
+		err = block.validOrderAndBlessed(ctx, logger, deps, 1, nil)
 		// Note: this will likely fail on other validation checks, but it should pass the coinbase placeholder check
 		_ = err
 	})
@@ -4134,7 +4365,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 
 		// This should fail the coinbase placeholder check
 		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings, nil)
 		require.Error(t, err)
 		require.False(t, valid)
 		assert.Contains(t, err.Error(), "first transaction in first subtree is not a coinbase placeholder")
@@ -4184,7 +4415,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 
 		// This should fail validation - coinbase placeholder must be in first subtree, first position
 		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings, nil)
 		require.Error(t, err)
 		require.False(t, valid)
 		assert.Contains(t, err.Error(), "first transaction in first subtree is not a coinbase placeholder")
@@ -4216,7 +4447,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		// With empty subtree slices, the validation should pass this check
 		// (it will fail on other validations)
 		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings, nil)
 		_ = valid
 		_ = err
 		// The coinbase placeholder check should be skipped for empty subtrees
@@ -4337,26 +4568,35 @@ func TestValidateSubtreeBenchmark(t *testing.T) {
 		// Create subtree metadata
 		subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
 		for i := 0; i < subtree.Length(); i++ {
-			txInpoints := subtreepkg.NewTxInpoints()
 			// Skip coinbase placeholder in first subtree
 			if s == 0 && i == 0 {
-				subtreeMeta.TxInpoints[i] = txInpoints
+				subtreeMeta.TxInpoints[i] = subtreepkg.NewTxInpoints()
 				continue
 			}
 
+			var parentHash *chainhash.Hash
 			if i <= numExternalParents {
 				// First N transactions reference external parents (need UTXO lookup)
-				txInpoints.ParentTxHashes = append(txInpoints.ParentTxHashes, allParentHashes[s][i])
-				txInpoints.Idxs = append(txInpoints.Idxs, []uint32{0})
+				parentHash = &allParentHashes[s][i]
 			} else {
 				// Remaining transactions reference the previous tx in the subtree (in txMap)
 				prevIdx := i - 1
 				if prevIdx >= 0 && prevIdx < len(allTxHashes[s]) {
-					txInpoints.ParentTxHashes = append(txInpoints.ParentTxHashes, allTxHashes[s][prevIdx])
-					txInpoints.Idxs = append(txInpoints.Idxs, []uint32{0})
+					parentHash = &allTxHashes[s][prevIdx]
 				}
 			}
-			subtreeMeta.TxInpoints[i] = txInpoints
+
+			if parentHash != nil {
+				in := &bt.Input{PreviousTxOutIndex: 0}
+				require.NoError(t, in.PreviousTxIDAdd(parentHash))
+
+				ti, err := subtreepkg.NewTxInpointsFromInputs([]*bt.Input{in})
+				require.NoError(t, err)
+
+				subtreeMeta.TxInpoints[i] = ti
+			} else {
+				subtreeMeta.TxInpoints[i] = subtreepkg.NewTxInpoints()
+			}
 		}
 
 		subtreeMetaBytes, err := subtreeMeta.Serialize()
@@ -4482,5 +4722,258 @@ func TestValidateSubtreeBenchmark(t *testing.T) {
 
 	if benchErr != nil {
 		fmt.Printf("\nNote: validateSubtree returned error (may be expected): %v\n", benchErr)
+	}
+}
+
+// TestCheckMerkleRoot_LiftsIncompleteFinalSubtree verifies that CheckMerkleRoot
+// accepts a block whose final subtree is incomplete by lifting its root to the
+// height of the preceding complete subtrees.
+func TestCheckMerkleRoot_LiftsIncompleteFinalSubtree(t *testing.T) {
+	// Build 258 random tx hashes: 256 in the first subtree, 2 in the second.
+	const (
+		totalTxs    = 258
+		subtreeSize = 256
+	)
+
+	block, expectedRoot := buildBlockWithSubtrees(t, subtreeSize, totalTxs)
+	block.Header.HashMerkleRoot = expectedRoot
+
+	require.NoError(t, block.CheckMerkleRoot(context.Background()))
+}
+
+// TestCheckMerkleRoot_RejectsMidStreamIncompleteSubtree verifies that
+// CheckMerkleRoot rejects a block whose middle subtree has fewer leaves than
+// the first subtree. Only the final subtree may be shorter than the first.
+func TestCheckMerkleRoot_RejectsMidStreamIncompleteSubtree(t *testing.T) {
+	// Three subtrees with leaf counts [4, 2, 4]: the middle (non-final) has
+	// fewer leaves than the first, which is illegal.
+	block := buildBlockWithMidStreamIncomplete(t)
+
+	err := block.CheckMerkleRoot(context.Background())
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected BlockInvalidError, got %v", err)
+	require.Contains(t, err.Error(), "only the final subtree may be incomplete")
+}
+
+// TestCheckMerkleRoot_RejectsFinalSubtreeLargerThanFirst verifies that
+// CheckMerkleRoot rejects a block whose final subtree contains more leaves
+// than the first subtree. The first subtree dictates the target length and
+// the final subtree must not exceed it.
+func TestCheckMerkleRoot_RejectsFinalSubtreeLargerThanFirst(t *testing.T) {
+	// First subtree has 2 leaves (capacity 2), second has 4 leaves (capacity 4).
+	block := buildBlockWithFinalSubtreeLargerThanFirst(t)
+
+	err := block.CheckMerkleRoot(context.Background())
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected BlockInvalidError, got %v", err)
+	require.Contains(t, err.Error(), "final subtree exceeds first subtree size")
+}
+
+// TestCheckMerkleRoot_AcceptsNonPowerOfTwoFinalSubtree verifies that
+// CheckMerkleRoot accepts a block whose final subtree leaf count is not a
+// power of two. The duplicate-when-odd rule already pads the subtree's own
+// merkle root internally, so the phantom-step lift composes correctly with
+// non-power-of-two final lengths — see issue #901 for why this matters.
+func TestCheckMerkleRoot_AcceptsNonPowerOfTwoFinalSubtree(t *testing.T) {
+	// 7 leaves split across two capacity-4 subtrees: [4, 3]. The final subtree
+	// has a non-power-of-two leaf count.
+	const (
+		totalTxs    = 7
+		subtreeSize = 4
+	)
+
+	block, expectedRoot := buildBlockWithSubtrees(t, subtreeSize, totalTxs)
+	block.Header.HashMerkleRoot = expectedRoot
+
+	require.NoError(t, block.CheckMerkleRoot(context.Background()))
+}
+
+// TestCheckMerkleRoot_RejectsFirstSubtreeNotPowerOfTwo verifies that
+// CheckMerkleRoot rejects a block whose first subtree's leaf count is not a
+// power of two. The lift math depends on this invariant — without the guard a
+// peer can craft a non-power-of-two first subtree and produce a merkle root
+// that diverges from the canonical flat tree.
+func TestCheckMerkleRoot_RejectsFirstSubtreeNotPowerOfTwo(t *testing.T) {
+	block := buildBlockWithFirstSubtreeNonPowerOfTwo(t)
+
+	err := block.CheckMerkleRoot(context.Background())
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected BlockInvalidError, got %v", err)
+	require.Contains(t, err.Error(), "first subtree leaf count is not a power of two")
+}
+
+// buildBlockWithFirstSubtreeNonPowerOfTwo returns a Block whose first subtree
+// has 3 leaves (non-power-of-two) and second subtree is complete with 4 leaves.
+// Under the lift rules the first subtree's length is the canonical capacity, so
+// allowing a non-power-of-two value here would break the merkle-root math.
+func buildBlockWithFirstSubtreeNonPowerOfTwo(t *testing.T) *Block {
+	t.Helper()
+
+	first, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		require.NoError(t, first.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	second, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 10; i < 14; i++ {
+		require.NoError(t, second.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	return &Block{
+		Header:        newTestBlockHeader(t),
+		CoinbaseTx:    newTestCoinbaseTx(t),
+		Subtrees:      []*chainhash.Hash{first.RootHash(), second.RootHash()},
+		SubtreeSlices: []*subtreepkg.Subtree{first, second},
+	}
+}
+
+// newTestCoinbaseTx returns a fresh coinbase tx parsed from the shared
+// CoinbaseHex constant used elsewhere in this file.
+func newTestCoinbaseTx(t *testing.T) *bt.Tx {
+	t.Helper()
+
+	coinbase, err := bt.NewTxFromString(CoinbaseHex)
+	require.NoError(t, err)
+
+	return coinbase
+}
+
+// newTestBlockHeader returns a BlockHeader parsed from the shared block1Header
+// constant. Tests that build Block structs directly use this to ensure header
+// pointer fields (HashPrevBlock, Bits, HashMerkleRoot) are non-nil so that
+// error formatting via Block.String() does not panic on the failure path.
+func newTestBlockHeader(t *testing.T) *BlockHeader {
+	t.Helper()
+
+	headerBytes, err := hex.DecodeString(block1Header)
+	require.NoError(t, err)
+
+	header, err := NewBlockHeaderFromBytes(headerBytes)
+	require.NoError(t, err)
+
+	return header
+}
+
+// buildBlockWithSubtrees constructs a Block with two subtrees: a fully populated
+// first subtree of `subtreeSize` leaves and a final subtree containing the
+// remaining `totalTxs - subtreeSize` leaves (which may be fewer than
+// `subtreeSize`, and may be a non-power-of-two count). It returns the block
+// and the expected top-level merkle root computed with the final subtree's
+// root lifted to the first subtree's height.
+func buildBlockWithSubtrees(t *testing.T, subtreeSize, totalTxs int) (*Block, *chainhash.Hash) {
+	t.Helper()
+	require.Greater(t, totalTxs, subtreeSize)
+	require.LessOrEqual(t, totalTxs-subtreeSize, subtreeSize)
+
+	hashes := make([]chainhash.Hash, totalTxs)
+	for i := range hashes {
+		hashes[i] = chainhash.HashH([]byte{byte(i), byte(i >> 8)})
+	}
+
+	left, err := subtreepkg.NewTreeByLeafCount(subtreeSize)
+	require.NoError(t, err)
+
+	for i := 0; i < subtreeSize; i++ {
+		require.NoError(t, left.AddNode(hashes[i], 0, 0))
+	}
+
+	rightLeafCount := totalTxs - subtreeSize
+
+	right, err := subtreepkg.NewIncompleteTreeByLeafCount(rightLeafCount)
+	require.NoError(t, err)
+
+	for i := subtreeSize; i < totalTxs; i++ {
+		require.NoError(t, right.AddNode(hashes[i], 0, 0))
+	}
+
+	coinbaseTx := newTestCoinbaseTx(t)
+
+	leftRoot, err := left.RootHashWithReplaceRootNode(coinbaseTx.TxIDChainHash(), 0, uint64(coinbaseTx.Size())) // nolint: gosec
+	require.NoError(t, err)
+
+	rightLifted, err := right.RootHashPadded(left.Height)
+	require.NoError(t, err)
+
+	top, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, top.AddNode(*leftRoot, 0, 0))
+	require.NoError(t, top.AddNode(*rightLifted, 0, 0))
+
+	block := &Block{
+		Header:        newTestBlockHeader(t),
+		CoinbaseTx:    coinbaseTx,
+		Subtrees:      []*chainhash.Hash{left.RootHash(), right.RootHash()},
+		SubtreeSlices: []*subtreepkg.Subtree{left, right},
+	}
+
+	return block, top.RootHash()
+}
+
+// buildBlockWithMidStreamIncomplete returns a Block with three subtrees whose
+// leaf counts are [4, 2, 4]. The middle (non-final) subtree has fewer leaves
+// than the first, which violates the rule that only the final subtree may be
+// shorter than the first.
+func buildBlockWithMidStreamIncomplete(t *testing.T) *Block {
+	t.Helper()
+
+	first, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 0; i < 4; i++ {
+		require.NoError(t, first.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	middle, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 10; i < 12; i++ {
+		require.NoError(t, middle.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	third, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 20; i < 24; i++ {
+		require.NoError(t, third.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	return &Block{
+		Header:        newTestBlockHeader(t),
+		CoinbaseTx:    newTestCoinbaseTx(t),
+		Subtrees:      []*chainhash.Hash{first.RootHash(), middle.RootHash(), third.RootHash()},
+		SubtreeSlices: []*subtreepkg.Subtree{first, middle, third},
+	}
+}
+
+// buildBlockWithFinalSubtreeLargerThanFirst returns a Block whose final
+// subtree contains more leaves than the first. The first subtree has 2 leaves
+// (capacity 2) and the second has 4 leaves (capacity 4), which violates the
+// rule that the final subtree must not exceed the first subtree's length.
+func buildBlockWithFinalSubtreeLargerThanFirst(t *testing.T) *Block {
+	t.Helper()
+
+	first, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+
+	for i := 0; i < 2; i++ {
+		require.NoError(t, first.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	second, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 10; i < 14; i++ {
+		require.NoError(t, second.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	return &Block{
+		Header:        newTestBlockHeader(t),
+		CoinbaseTx:    newTestCoinbaseTx(t),
+		Subtrees:      []*chainhash.Hash{first.RootHash(), second.RootHash()},
+		SubtreeSlices: []*subtreepkg.Subtree{first, second},
 	}
 }

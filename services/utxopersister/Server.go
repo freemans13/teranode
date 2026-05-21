@@ -254,15 +254,18 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		// Blocks until the FSM transitions from the IDLE state
 		err = s.blockchainClient.WaitUntilFSMTransitionFromIdleState(ctx)
 		if err != nil {
+			if errors.IsContextError(err) {
+				s.logger.Infof("[UTXOPersister Service] Shutting down during FSM wait")
+				return err
+			}
 			s.logger.Errorf("[UTXOPersister Service] Failed to wait for FSM transition from IDLE state: %s", err)
-
 			return err
 		}
 
 		if s.blockchainClient == nil {
 			ch = make(chan *blockchain.Notification) // Create a dummy channel
 		} else {
-			ch, err = s.blockchainClient.Subscribe(ctx, "utxo-persister")
+			ch, err = s.blockchainClient.Subscribe(ctx, blockchain.SubscriberUTXOPersister)
 			if err != nil {
 				return err
 			}

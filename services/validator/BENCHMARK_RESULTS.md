@@ -5,6 +5,7 @@
 This document presents benchmark results for the consolidation transaction validation feature introduced in PR #3577. The benchmarks measure the performance impact of the new validation logic.
 
 ## System Information
+
 - **CPU**: Apple M3 Max
 - **Architecture**: arm64
 - **OS**: darwin
@@ -15,7 +16,7 @@ This document presents benchmark results for the consolidation transaction valid
 
 This is the lightweight check used in fee validation to determine if a transaction qualifies as a consolidation.
 
-```
+```text
 BenchmarkIsConsolidationTxForFees-16    1000000000    1.636 ns/op
 ```
 
@@ -34,24 +35,12 @@ Full validation includes all checks: ratio validation, script standardness, conf
 
 **Key Finding**: Performance scales linearly with the number of inputs. Even large consolidations (1000 inputs) complete in under 0.4ms.
 
-### 3. Script Validation (`isStandardInputScript`)
-
-Performance of push-only script validation:
-
-| Script Type | Time per Operation |
-|-------------|-------------------|
-| Empty script | 4.356 ns |
-| Standard P2PKH unlock | 422.9 ns |
-| Complex push-only (10 pushes) | 861.8 ns |
-| Non-standard with ops | 177.6 ns |
-
-**Key Finding**: Script validation is efficient, with typical P2PKH scripts validated in ~423ns.
-
-### 4. Fee Validation Impact Comparison
+### 3. Fee Validation Impact Comparison
 
 Comparison of fee validation with and without consolidation checks:
 
 #### With Consolidation Check (New Code)
+
 | Transaction Type | Inputs | Outputs | Time per Operation |
 |-----------------|--------|---------|-------------------|
 | Regular tx | 2 | 2 | 572.0 ns |
@@ -60,6 +49,7 @@ Comparison of fee validation with and without consolidation checks:
 | Large consolidation | 100 | 5 | 2.462 ns ✨ |
 
 #### Without Consolidation Check (Simulated Old Code)
+
 | Transaction Type | Inputs | Outputs | Time per Operation |
 |-----------------|--------|---------|-------------------|
 | Regular tx | 2 | 2 | 4.077 ns |

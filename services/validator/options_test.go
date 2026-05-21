@@ -7,8 +7,8 @@ import (
 func TestNewDefaultOptions(t *testing.T) {
 	opts := NewDefaultOptions()
 
-	if opts.SkipUtxoCreate {
-		t.Error("Default SkipUtxoCreate should be false")
+	if opts.SkipUtxoCreation {
+		t.Error("Default SkipUtxoCreation should be false")
 	}
 
 	if !opts.AddTXToBlockAssembly {
@@ -34,7 +34,7 @@ func TestProcessOptions(t *testing.T) {
 			name: "No options",
 			opts: []Option{},
 			expected: Options{
-				SkipUtxoCreate:       false,
+				SkipUtxoCreation:     false,
 				AddTXToBlockAssembly: true,
 				SkipPolicyChecks:     false,
 				CreateConflicting:    false,
@@ -43,10 +43,10 @@ func TestProcessOptions(t *testing.T) {
 		{
 			name: "Single option",
 			opts: []Option{
-				WithSkipUtxoCreate(true),
+				WithSkipUtxoCreation(true),
 			},
 			expected: Options{
-				SkipUtxoCreate:       true,
+				SkipUtxoCreation:     true,
 				AddTXToBlockAssembly: true,
 				SkipPolicyChecks:     false,
 				CreateConflicting:    false,
@@ -55,13 +55,13 @@ func TestProcessOptions(t *testing.T) {
 		{
 			name: "Multiple options",
 			opts: []Option{
-				WithSkipUtxoCreate(true),
+				WithSkipUtxoCreation(true),
 				WithAddTXToBlockAssembly(false),
 				WithSkipPolicyChecks(true),
 				WithCreateConflicting(true),
 			},
 			expected: Options{
-				SkipUtxoCreate:       true,
+				SkipUtxoCreation:     true,
 				AddTXToBlockAssembly: false,
 				SkipPolicyChecks:     true,
 				CreateConflicting:    true,
@@ -72,8 +72,8 @@ func TestProcessOptions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := ProcessOptions(tt.opts...)
-			if result.SkipUtxoCreate != tt.expected.SkipUtxoCreate {
-				t.Errorf("SkipUtxoCreate = %v, want %v", result.SkipUtxoCreate, tt.expected.SkipUtxoCreate)
+			if result.SkipUtxoCreation != tt.expected.SkipUtxoCreation {
+				t.Errorf("SkipUtxoCreation = %v, want %v", result.SkipUtxoCreation, tt.expected.SkipUtxoCreation)
 			}
 
 			if result.AddTXToBlockAssembly != tt.expected.AddTXToBlockAssembly {
@@ -91,7 +91,7 @@ func TestProcessOptions(t *testing.T) {
 	}
 }
 
-func TestWithSkipUtxoCreate(t *testing.T) {
+func TestWithSkipUtxoCreation(t *testing.T) {
 	tests := []struct {
 		name     string
 		skip     bool
@@ -103,9 +103,9 @@ func TestWithSkipUtxoCreate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opts := ProcessOptions(WithSkipUtxoCreate(tt.skip))
-			if opts.SkipUtxoCreate != tt.expected {
-				t.Errorf("SkipUtxoCreate = %v, want %v", opts.SkipUtxoCreate, tt.expected)
+			opts := ProcessOptions(WithSkipUtxoCreation(tt.skip))
+			if opts.SkipUtxoCreation != tt.expected {
+				t.Errorf("SkipUtxoCreation = %v, want %v", opts.SkipUtxoCreation, tt.expected)
 			}
 		})
 	}

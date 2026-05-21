@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
-	"log"
 	"math"
 	"runtime"
 	"slices"
@@ -41,7 +40,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/retry"
@@ -50,8 +48,26 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const splitMapBuckets = 4 * 1024
+// splitMapBuckets is the fallback bucket count for SplitTxInpointsMap when
+// the BlockAssembly.SplitMapBuckets setting is unset, zero, or out of range.
+// Matches the documented setting default in
+// settings/blockassembly_settings.go. Production dev-scale-2 profile showed
+// 4096 buckets exhibited measurable per-bucket lock contention with 375
+// workers; 16K buckets at roughly the same total footprint reduces collision
+// probability ~4×. Exported to package-internal callers (tests) so they can
+// construct fresh maps without re-deriving the value.
+const splitMapBuckets = 16 * 1024
+
+// splitMapBucketsMax is the inclusive upper bound for
+// BlockAssembly.SplitMapBuckets — driven by the uint16 internal
+// representation in SplitTxInpointsMap. Settings above this are clamped
+// (with a warning log) in NewSubtreeProcessor.
+const splitMapBucketsMax = 65535
 const maxBatchesPerIteration = 64
+
+type cancelHolder struct {
+	f context.CancelFunc
+}
 
 // Job represents a mining job with its associated data.
 // A Job encapsulates all the information needed for a miner to attempt finding a valid
@@ -69,10 +85,12 @@ type Job struct {
 // and the subtree processor, including an error channel for asynchronous result reporting.
 
 type NewSubtreeRequest struct {
-	Subtree          *subtreepkg.Subtree // The subtree to process
-	ParentTxMap      TxInpointsMap       // Map of parent transactions
-	SkipNotification bool                // Whether to skip notification to the network
-	ErrChan          chan error          // Channel for error reporting
+	Subtree           *subtreepkg.Subtree                                     // The subtree to process
+	ParentTxMap       TxInpointsMap                                           // Map of parent transactions
+	DeletedTxs        *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] // Backup map for deleted transactions
+	SkipNotification  bool                                                    // Whether to skip notification to the network
+	ErrChan           chan error                                              // Channel for error reporting
+	OnStorageComplete func()                                                  // Called when storage completes to trigger cleanup
 }
 
 // moveBlockRequest represents a request to move a block in the chain.
@@ -120,6 +138,25 @@ type ResetResponse struct {
 	Err error
 }
 
+// PrecomputedMiningData holds pre-computed data for mining candidate generation.
+// Updated in real-time by the subtree processor's main goroutine.
+// Read atomically by GetMiningCandidate without synchronization.
+// Derived values (fees, tx count, merkle proof, etc.) are computed by the caller
+// from Subtrees, to keep the subtree processor's hot path lightweight.
+type PrecomputedMiningData struct {
+	// Block identification
+	PreviousHeader *model.BlockHeader // Previous block header (use PreviousHeader.Hash() for the hash)
+
+	// Subtrees snapshot for lock-free access
+	Subtrees []*subtreepkg.Subtree
+
+	// Metadata
+	UpdatedAt time.Time
+
+	// Flag for incomplete subtree case
+	IsFromIncomplete bool // True if based on incomplete subtree (no completed subtrees)
+}
+
 // RemainderTransactionParams groups parameters for processRemainderTransactionsAndDequeue
 // to comply with SonarQube's parameter count recommendations.
 type RemainderTransactionParams struct {
@@ -128,6 +165,12 @@ type RemainderTransactionParams struct {
 	CurrentSubtree    *subtreepkg.Subtree
 	TransactionMap    *SplitSwissMap
 	LosingTxHashesMap txmap.TxMap
+	// ConflictingHashes is the transient set of every tx hash flagged
+	// Conflicting=true by the cascade that triggered this drain (immediate
+	// losers + every descendant returned by MarkConflictingRecursively).
+	// Scoped to a single drain — the dequeue filter checks self-hash and
+	// every TxInpoints.ParentTxHashes entry, then the set is discarded.
+	ConflictingHashes map[chainhash.Hash]struct{}
 	CurrentTxMap      TxInpointsMap
 	SkipDequeue       bool
 	SkipNotification  bool
@@ -173,6 +216,9 @@ type SubtreeProcessor struct {
 	// getSubtreesChan handles requests to retrieve current subtrees
 	getSubtreesChan chan chan []*subtreepkg.Subtree
 
+	// getIncompleteSubtreeDataChan handles on-demand requests for incomplete subtree mining data
+	getIncompleteSubtreeDataChan chan chan *PrecomputedMiningData
+
 	// getSubtreeHashesChan handles requests to retrieve current subtree hashes
 	getSubtreeHashesChan chan chan []chainhash.Hash
 
@@ -201,17 +247,23 @@ type SubtreeProcessor struct {
 	newSubtreeChan chan NewSubtreeRequest
 
 	// chainedSubtrees stores the ordered list of completed subtrees
-	chainedSubtrees []*subtreepkg.Subtree
+	// chainedSubtreesMu protects chainedSubtrees from races between Stop() and closeChainedSubtrees()
+	chainedSubtrees   []*subtreepkg.Subtree
+	chainedSubtreesMu sync.Mutex
 
 	// chainedSubtreeCount tracks the number of chained subtrees atomically
 	chainedSubtreeCount atomic.Int32
+
+	// chainedSubtreesTotalSize tracks the total size in bytes of chained subtrees atomically
+	// This allows safe concurrent access without channel-based synchronization
+	chainedSubtreesTotalSize atomic.Uint64
 
 	// currentSubtree represents the subtree currently being built
 	// Uses atomic.Pointer for safe concurrent access from external callers (e.g., gRPC handlers)
 	currentSubtree atomic.Pointer[subtreepkg.Subtree]
 
-	// currentBlockHeader stores the current block header being processed
-	currentBlockHeader *model.BlockHeader
+	// currentBlockHeader stores the current block header being processed (atomic for thread-safe access)
+	currentBlockHeader atomic.Pointer[model.BlockHeader]
 
 	// txCount tracks the total number of transactions processed
 	txCount atomic.Uint64
@@ -222,8 +274,23 @@ type SubtreeProcessor struct {
 	// currentTxMap tracks transactions currently held in the subtree processor
 	currentTxMap TxInpointsMap
 
+	// deletedTxs stores transaction parent info for recently deleted transactions
+	// This provides a backup/fallback for Server when transactions are deleted during async storage
+	deletedTxs *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]
+
 	// removeMap tracks transactions marked for removal
 	removeMap txmap.TxMap
+
+	// reverseCascadedConflictingSet is populated by reorgBlocks during its
+	// moveBack loop: every tx whose Conflicting flag ReverseProcessConflicting
+	// flipped to true (demoted txs + their unmined descendants) is added
+	// here. The subsequent moveForward calls' processConflictingTransactions
+	// surfaces this set as the per-block conflictingSet when the filter
+	// short-circuits ProcessConflicting, so the in-memory rebuild evicts the
+	// reverse-cascade losers from the next mining candidate.
+	// Reset at the start of every reorgBlocks call. Not safe for concurrent
+	// reorgs — reorgBlocks runs serialised on stp.reorgBlockChan.
+	reverseCascadedConflictingSet map[chainhash.Hash]struct{}
 
 	// blockchainClient provides access to blockchain data
 	blockchainClient blockchain.ClientI
@@ -246,14 +313,68 @@ type SubtreeProcessor struct {
 	// announcementTicker periodically triggers currentSubtree announcements
 	announcementTicker *time.Ticker
 
-	// cancel is the cancel function for the processor context
-	cancel context.CancelFunc
+	cancelPtr atomic.Pointer[cancelHolder]
 
 	// stopOnce ensures Stop() is only executed once
 	stopOnce sync.Once
 
 	// startOnce ensures the processing goroutine is only started once
 	startOnce sync.Once
+
+	// stopped indicates the worker goroutine has exited (set on context cancellation)
+	stopped atomic.Bool
+
+	// precomputedMiningData holds pre-computed data for mining candidate generation.
+	// Updated by the main goroutine, read atomically by GetMiningCandidate.
+	precomputedMiningData atomic.Pointer[PrecomputedMiningData]
+
+	// mmapDir, when non-empty, enables mmap-backed subtree Nodes.
+	mmapDir string
+
+	// txMapDirs, when non-empty, enables disk-backed DiskTxMap across these directories.
+	txMapDirs []string
+
+	// diskTxMap is the disk-backed tx map (non-nil when txMapDirs is set).
+	diskTxMap *DiskTxMap
+
+	// txMapPool is a reusable transactionMap built in CreateTransactionMap.
+	// Allocated lazily on the first call (sized for that block) and Clear()ed
+	// between calls to avoid per-block ~600M-entry allocations that dominate
+	// GC in profiling. Owned exclusively by the Start() goroutine — no
+	// concurrent access, no locking beyond what SplitSwissMap already provides.
+	txMapPool *SplitSwissMap
+
+	// txMapPoolCapacity tracks the (per-bucket × buckets) sizing the pool was
+	// last allocated for. When a block's estimated map size exceeds this,
+	// the pool is reallocated at the new high-water mark rather than
+	// suffering swiss.Map's internal auto-rehash mid-fill — which would
+	// allocate inside the hot path and defeat much of the pooling win.
+	txMapPoolCapacity int
+
+	// currentTxMapShadow is the inactive half of a double-buffered currentTxMap
+	// used to avoid per-block 4096-shard SyncedMap allocations in
+	// resetSubtreeState. nil when diskTxMap is in use (that path reuses
+	// in place via Clear).
+	currentTxMapShadow *SplitTxInpointsMap
+
+	// splitMapBuckets is the bucket count used for the in-memory
+	// SplitTxInpointsMap, plumbed from BlockAssembly.SplitMapBuckets at
+	// constructor time. Retained so the fresh-allocation fallback path
+	// (used during multi-block reorgs where rollback must restore the
+	// captured pre-loop pointer) can build new maps of the same shape.
+	splitMapBuckets uint16
+
+	// disableCurrentTxMapPool disables the double-buffer swap pattern for
+	// currentTxMap, falling back to per-call fresh allocation. Used by
+	// reorgBlocks for the duration of a multi-block reorg so that
+	// captured originalCurrentTxMap pointers continue to reference the
+	// pre-reorg data unchanged. Only mutated by the single Start()
+	// goroutine; no synchronisation required.
+	disableCurrentTxMapPool bool
+
+	// clock is the source of wall time for codepaths that need a deterministic
+	// substitute in tests (validFromMillis calculations). Replaced in tests.
+	clock clock
 }
 
 type State uint32
@@ -360,36 +481,57 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 	// - Small memory footprint (18 * sizeof(int) = 144 bytes)
 	const subtreeSampleSize = 18
 
+	// Validate and clamp the SplitMapBuckets setting. Out-of-range values
+	// (zero/negative or larger than uint16) would otherwise wrap silently
+	// when cast to uint16.
+	splitBucketsCfg := tSettings.BlockAssembly.SplitMapBuckets
+
+	var splitBuckets uint16
+
+	switch {
+	case splitBucketsCfg <= 0:
+		splitBuckets = splitMapBuckets
+	case splitBucketsCfg > splitMapBucketsMax:
+		logger.Warnf("BlockAssembly.SplitMapBuckets=%d exceeds max %d; clamping to %d", splitBucketsCfg, splitMapBucketsMax, splitMapBucketsMax)
+		splitBuckets = splitMapBucketsMax
+	default:
+		splitBuckets = uint16(splitBucketsCfg)
+	}
+
 	stp := &SubtreeProcessor{
-		settings:                 tSettings,
-		blockStartTime:           time.Time{},
-		subtreesInBlock:          0,
-		blockIntervals:           make([]time.Duration, 0, 10),
-		maxBlockSamples:          10,
-		subtreeNodeCounts:        ring.New(subtreeSampleSize),
-		subtreeNodeCountsSize:    subtreeSampleSize,
-		getSubtreesChan:          make(chan chan []*subtreepkg.Subtree),
-		getSubtreeHashesChan:     make(chan chan []chainhash.Hash),
-		getTransactionHashesChan: make(chan chan []chainhash.Hash),
-		moveForwardBlockChan:     make(chan moveBlockRequest),
-		reorgBlockChan:           make(chan reorgBlocksRequest),
-		resetCh:                  make(chan *resetBlocks),
-		removeTxCh:               make(chan chainhash.Hash, 100),
-		lengthCh:                 make(chan chan int),
-		checkSubtreeProcessorCh:  make(chan chan error),
-		newSubtreeChan:           newSubtreeChan,
-		chainedSubtrees:          make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees),
-		chainedSubtreeCount:      atomic.Int32{},
-		queue:                    queue,
-		currentTxMap:             NewSplitTxInpointsMap(splitMapBuckets),
-		removeMap:                txmap.NewSplitSwissMap(256, 16),
-		blockchainClient:         blockchainClient,
-		subtreeStore:             subtreeStore,
-		utxoStore:                utxoStore,
-		logger:                   logger,
-		stats:                    gocore.NewStat("subtreeProcessor").NewStat("Add", false),
-		currentRunningState:      atomic.Value{},
-		announcementTicker:       time.NewTicker(tSettings.BlockAssembly.SubtreeAnnouncementInterval),
+		settings:                     tSettings,
+		blockStartTime:               time.Time{},
+		subtreesInBlock:              0,
+		blockIntervals:               make([]time.Duration, 0, 10),
+		maxBlockSamples:              10,
+		subtreeNodeCounts:            ring.New(subtreeSampleSize),
+		subtreeNodeCountsSize:        subtreeSampleSize,
+		getSubtreesChan:              make(chan chan []*subtreepkg.Subtree),
+		getIncompleteSubtreeDataChan: make(chan chan *PrecomputedMiningData),
+		getSubtreeHashesChan:         make(chan chan []chainhash.Hash),
+		getTransactionHashesChan:     make(chan chan []chainhash.Hash),
+		moveForwardBlockChan:         make(chan moveBlockRequest),
+		reorgBlockChan:               make(chan reorgBlocksRequest),
+		resetCh:                      make(chan *resetBlocks),
+		removeTxCh:                   make(chan chainhash.Hash, 100),
+		lengthCh:                     make(chan chan int),
+		checkSubtreeProcessorCh:      make(chan chan error),
+		newSubtreeChan:               newSubtreeChan,
+		chainedSubtrees:              make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees),
+		chainedSubtreeCount:          atomic.Int32{},
+		queue:                        queue,
+		currentTxMap:                 NewSplitTxInpointsMap(splitBuckets),
+		splitMapBuckets:              splitBuckets,
+		deletedTxs:                   txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints](),
+		removeMap:                    txmap.NewSplitSwissMap(256, 16),
+		blockchainClient:             blockchainClient,
+		subtreeStore:                 subtreeStore,
+		utxoStore:                    utxoStore,
+		logger:                       logger,
+		stats:                        gocore.NewStat("subtreeProcessor").NewStat("Add", false),
+		currentRunningState:          atomic.Value{},
+		announcementTicker:           time.NewTicker(tSettings.BlockAssembly.SubtreeAnnouncementInterval),
+		clock:                        realClock{},
 	}
 	stp.currentSubtree.Store(firstSubtree)
 	stp.setCurrentRunningState(StateStarting)
@@ -400,6 +542,47 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 
 	for _, opts := range options {
 		opts(stp)
+	}
+
+	// If mmap dir is configured, recreate first subtree with mmap backing
+	if stp.mmapDir != "" {
+		mmapSubtree, mmapErr := subtreepkg.NewTreeByLeafCountMmap(initialItemsPerFile, stp.mmapDir)
+		if mmapErr != nil {
+			logger.Warnf("mmap subtree creation failed, using heap: %v", mmapErr)
+		} else {
+			if coinbaseErr := mmapSubtree.AddCoinbaseNode(); coinbaseErr != nil {
+				mmapSubtree.Close()
+				logger.Warnf("mmap subtree coinbase failed, using heap: %v", coinbaseErr)
+			} else {
+				firstSubtree.Close()
+				firstSubtree = mmapSubtree
+				stp.currentSubtree.Store(firstSubtree)
+			}
+		}
+	}
+
+	// If tx map dirs are configured, replace currentTxMap with DiskTxMap
+	if len(stp.txMapDirs) > 0 {
+		diskMap, diskErr := NewDiskTxMap(DiskTxMapOptions{
+			BasePaths:      stp.txMapDirs,
+			Prefix:         "ba-txmap",
+			FilterCapacity: uint(initialItemsPerFile * ExpectedNumberOfSubtrees),
+		})
+		if diskErr != nil {
+			logger.Warnf("DiskTxMap creation failed, using in-memory map: %v", diskErr)
+		} else {
+			stp.currentTxMap = diskMap
+			stp.diskTxMap = diskMap
+			reportDiskMapStats(diskMap.Stats())
+		}
+	}
+
+	// Pre-allocate the shadow half of the double-buffered currentTxMap so that
+	// resetSubtreeState can swap pointers instead of allocating a fresh
+	// 4096-shard SyncedMap structure on every block. Only applicable to the
+	// in-memory path — DiskTxMap already reuses storage in place via Clear().
+	if stp.diskTxMap == nil {
+		stp.currentTxMapShadow = NewSplitTxInpointsMap(splitBuckets)
 	}
 
 	// Goroutine does not start automatically - Start(ctx) must be called explicitly
@@ -420,13 +603,14 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 
 		// Create a child context with cancel for managing the processor lifecycle
 		processorCtx, cancel := context.WithCancel(ctx)
-		stp.cancel = cancel
+		stp.cancelPtr.Store(&cancelHolder{f: cancel})
 
 		stp.setCurrentRunningState(StateRunning)
 
 		go func() {
 			// Recover from panics (e.g., send on closed channel during shutdown)
 			defer func() {
+				stp.stopped.Store(true) // Must be set on any exit so Stop() does not hang
 				if r := recover(); r != nil {
 					logger.Warnf("[SubtreeProcessor] goroutine recovered from panic: %v", r)
 				}
@@ -443,6 +627,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 				case <-processorCtx.Done():
 					logger.Infof("[SubtreeProcessor] context cancelled, stopping processor")
 					stp.announcementTicker.Stop()
+					stp.stopped.Store(true)
 					return
 
 				case getSubtreesChan := <-stp.getSubtreesChan:
@@ -472,7 +657,11 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						send := NewSubtreeRequest{
 							Subtree:     incompleteSubtree,
 							ParentTxMap: stp.currentTxMap,
+							DeletedTxs:  stp.deletedTxs,
 							ErrChan:     make(chan error),
+							OnStorageComplete: func() {
+								stp.cleanupDeletedTxs(incompleteSubtree)
+							},
 						}
 
 						// Send announcement, respecting context cancellation
@@ -519,6 +708,47 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					logger.Debugf("[SubtreeProcessor] get current subtree hashes DONE")
 					stp.setCurrentRunningState(StateRunning)
 
+				case responseChan := <-stp.getIncompleteSubtreeDataChan:
+					// On-demand snapshot of incomplete subtree for mining (only when requested)
+					currentSt := stp.currentSubtree.Load()
+					if stp.chainedSubtreeCount.Load() > 0 || currentSt == nil || currentSt.Length() <= 1 {
+						responseChan <- nil
+					} else {
+						incompleteSubtree, err := stp.createIncompleteSubtreeCopy()
+						if err != nil {
+							logger.Errorf("[SubtreeProcessor] error creating incomplete subtree snapshot: %s", err.Error())
+							responseChan <- nil
+						} else {
+							// Store (and announce) the incomplete subtree so it exists in the blob store
+							// when callers read it by hash (e.g., checkTransactionsInMiningCandidate).
+							send := NewSubtreeRequest{
+								Subtree:     incompleteSubtree,
+								ParentTxMap: stp.currentTxMap,
+								ErrChan:     make(chan error),
+							}
+
+							select {
+							case stp.newSubtreeChan <- send:
+								select {
+								case <-send.ErrChan:
+									stp.resetAnnouncementTicker()
+								case <-processorCtx.Done():
+									return
+								}
+							case <-processorCtx.Done():
+								return
+							}
+
+							currentBlockHeader := stp.currentBlockHeader.Load()
+							responseChan <- &PrecomputedMiningData{
+								PreviousHeader:   currentBlockHeader,
+								Subtrees:         []*subtreepkg.Subtree{incompleteSubtree},
+								UpdatedAt:        time.Now(),
+								IsFromIncomplete: true,
+							}
+						}
+					}
+
 				case getTransactionHashesChan := <-stp.getTransactionHashesChan:
 					stp.setCurrentRunningState(StateGetTransactionHashes)
 					logger.Debugf("[SubtreeProcessor] get current transaction hashes")
@@ -560,14 +790,14 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					originalChainedSubtrees := stp.chainedSubtrees
 					originalCurrentSubtree := stp.currentSubtree.Load()
 					originalCurrentTxMap := stp.currentTxMap
-					currentBlockHeader := stp.currentBlockHeader
+					currentBlockHeader := stp.currentBlockHeader.Load()
 
-					if _, err = stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true); err != nil {
+					if _, _, err = stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true); err != nil {
 						// rollback to previous state
 						stp.chainedSubtrees = originalChainedSubtrees
 						stp.currentSubtree.Store(originalCurrentSubtree)
 						stp.currentTxMap = originalCurrentTxMap
-						stp.currentBlockHeader = currentBlockHeader
+						stp.currentBlockHeader.Store(currentBlockHeader)
 
 						// recalculate tx count from subtrees
 						stp.setTxCountFromSubtrees()
@@ -616,9 +846,12 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					stp.setCurrentRunningState(StateRunning)
 
 				case <-stp.announcementTicker.C:
-					// Periodically announce the current subtree if it has transactions
-					if stp.currentSubtree.Load().Length() > 1 {
-						logger.Debugf("[SubtreeProcessor] periodic announcement of current subtree with %d transactions", stp.currentSubtree.Load().Length()-1)
+					// Periodically announce the current subtree if it has transactions.
+					// Skip if the subtree is nearly full: a complete subtree is imminent and
+					// a partial here would just duplicate the announcement that follows.
+					currentSt := stp.currentSubtree.Load()
+					if currentSt.Length() > 1 && !nearlyFullSubtree(currentSt) {
+						logger.Debugf("[SubtreeProcessor] periodic announcement of current subtree with %d transactions", currentSt.Length()-1)
 
 						incompleteSubtree, err := stp.createIncompleteSubtreeCopy()
 						if err != nil {
@@ -629,7 +862,11 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						send := NewSubtreeRequest{
 							Subtree:     incompleteSubtree,
 							ParentTxMap: stp.currentTxMap,
+							DeletedTxs:  stp.deletedTxs,
 							ErrChan:     make(chan error),
+							OnStorageComplete: func() {
+								stp.cleanupDeletedTxs(incompleteSubtree)
+							},
 						}
 
 						// Send announcement, but respect context cancellation
@@ -658,7 +895,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					// Calculate validFromMillis based on DoubleSpendWindow
 					validFromMillis := int64(0)
 					if stp.settings.BlockAssembly.DoubleSpendWindow > 0 {
-						validFromMillis = time.Now().Add(-stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
+						validFromMillis = stp.clock.Now().Add(-stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
 					}
 
 					for batchNum := 0; batchNum < maxBatchesPerIteration; batchNum++ {
@@ -671,8 +908,10 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					}
 
 					if len(dequeueBatches) == 0 {
-						runtime.Gosched()
 						stp.setCurrentRunningState(StateRunning)
+						// Sleep briefly to avoid busy-wait when queue is empty.
+						// This prevents excessive CPU usage from goroutine scheduling overhead.
+						time.Sleep(stp.settings.BlockAssembly.IdleSleepDuration)
 						continue
 					}
 
@@ -804,6 +1043,26 @@ func (stp *SubtreeProcessor) setCurrentRunningState(state State) {
 	prometheusSubtreeProcessorCurrentState.Set(float64(state))
 }
 
+// nearlyFullSubtreeThresholdPct is the fill percentage at or above which the periodic
+// announcement skips emitting a partial subtree, because a complete subtree is imminent.
+const nearlyFullSubtreeThresholdPct = 90
+
+// nearlyFullSubtree reports whether the subtree is at or above the threshold fill ratio,
+// indicating that natural completion is imminent and a partial announcement would just
+// duplicate the full one that is about to follow.
+func nearlyFullSubtree(st *subtreepkg.Subtree) bool {
+	if st == nil {
+		return false
+	}
+
+	capacity := st.Size()
+	if capacity <= 0 {
+		return false
+	}
+
+	return st.Length()*100 >= capacity*nearlyFullSubtreeThresholdPct
+}
+
 // resetAnnouncementTicker safely resets the announcement ticker by draining any pending ticks
 // before resetting. This prevents an immediate tick if one was already queued.
 //
@@ -823,13 +1082,28 @@ func (stp *SubtreeProcessor) resetAnnouncementTicker() {
 // It creates a new subtree with the same configuration and copies all nodes (except coinbase placeholder)
 // from the current subtree.
 //
+// The new subtree is sized to match the source subtree's capacity, not the current
+// currentItemsPerFile setting. adjustSubtreeSize can shrink currentItemsPerFile
+// between blocks while the in-flight currentSubtree retains its larger original
+// capacity; sizing the copy off currentItemsPerFile in that window would overflow.
+//
 // Returns:
 //   - *subtreepkg.Subtree: The incomplete subtree copy, or nil if creation failed
 //   - error: Any error encountered during subtree creation or node copying
 func (stp *SubtreeProcessor) createIncompleteSubtreeCopy() (*subtreepkg.Subtree, error) {
-	itemsPerFile := int(stp.currentItemsPerFile.Load())
+	currentSt := stp.currentSubtree.Load()
+	if currentSt == nil {
+		return nil, errors.NewProcessingError("createIncompleteSubtreeCopy: no current subtree")
+	}
 
-	incompleteSubtree, err := subtreepkg.NewTreeByLeafCount(itemsPerFile)
+	capacity := currentSt.Size()
+	if capacity <= 0 {
+		// Fall back to the configured size if the current subtree somehow reports
+		// no capacity; NewTreeByLeafCount will reject zero/negative values.
+		capacity = int(stp.currentItemsPerFile.Load())
+	}
+
+	incompleteSubtree, err := subtreepkg.NewTreeByLeafCount(capacity)
 	if err != nil {
 		return nil, err
 	}
@@ -840,16 +1114,37 @@ func (stp *SubtreeProcessor) createIncompleteSubtreeCopy() (*subtreepkg.Subtree,
 	}
 
 	// Copy all nodes from current subtree (skipping the coinbase placeholder at index 0)
-	for _, node := range stp.currentSubtree.Load().Nodes[1:] {
+	for _, node := range currentSt.Nodes[1:] {
 		if err = incompleteSubtree.AddSubtreeNodeWithoutLock(node); err != nil {
 			return nil, err
 		}
 	}
 
 	// Copy fees
-	incompleteSubtree.Fees = stp.currentSubtree.Load().Fees
+	incompleteSubtree.Fees = currentSt.Fees
 
 	return incompleteSubtree, nil
+}
+
+// cleanupDeletedTxs performs actual deletion from currentTxMap for transactions
+// that were previously soft-deleted. Called after subtree storage completes.
+// Only deletes if the transaction is still marked as deleted (not re-added).
+//
+// This function is called via the OnStorageComplete callback to safely remove
+// transactions that were marked for deletion while the subtree was being stored.
+//
+// Parameters:
+//   - subtree: The subtree whose soft-deleted transactions should be cleaned up
+func (stp *SubtreeProcessor) cleanupDeletedTxs(subtree *subtreepkg.Subtree) {
+	if stp.deletedTxs == nil {
+		return
+	}
+	for _, node := range subtree.Nodes {
+		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			// Remove from deletedTxs backup map (transaction data no longer needed after storage)
+			stp.deletedTxs.Delete(node.Hash)
+		}
+	}
 }
 
 // GetCurrentRunningState returns the current operational state of the processor.
@@ -907,12 +1202,55 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 
 	defer deferFn()
 
-	stp.chainedSubtrees = make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees)
-	stp.chainedSubtreeCount.Store(0)
+	ctx := context.Background()
+
+	// Mark all currently-in-assembly transactions as NOT on longest chain before clearing state.
+	//
+	// Some assembly transactions may have unmined_since=NULL in the UTXO store if a competing
+	// fork's BlockValidation processed them (it inserts them with UnminedSince=0, i.e. "mined").
+	// Without this step, loadUnminedTransactions() — which uses the unmined_since index
+	// (WHERE unmined_since IS NOT NULL) — will not find them, and they will be silently dropped
+	// from block assembly after the reset.
+	//
+	// This mirrors exactly what reorgBlocks() does at lines 2665-2710 before it finalises a reorg.
+	// The call is idempotent: for transactions that already have unmined_since set, it is a no-op.
+	{
+		currentSubtree := stp.currentSubtree.Load()
+		subtreeNodeCount := len(currentSubtree.Nodes)
+		for _, st := range stp.chainedSubtrees {
+			subtreeNodeCount += len(st.Nodes)
+		}
+
+		assemblyTxHashes := make([]chainhash.Hash, 0, subtreeNodeCount)
+		for _, st := range stp.chainedSubtrees {
+			for _, node := range st.Nodes {
+				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+					assemblyTxHashes = append(assemblyTxHashes, node.Hash)
+				}
+			}
+		}
+		for _, node := range currentSubtree.Nodes {
+			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				assemblyTxHashes = append(assemblyTxHashes, node.Hash)
+			}
+		}
+
+		if len(assemblyTxHashes) > 0 {
+			stp.logger.Infof("[SubtreeProcessor][reset] marking %d assembly txs as not on longest chain before clearing state", len(assemblyTxHashes))
+			if err := stp.markNotOnLongestChain(ctx, assemblyTxHashes); err != nil {
+				return errors.NewProcessingError("[SubtreeProcessor][reset] error marking assembly txs as not on longest chain before reset", err)
+			}
+		}
+	}
+
+	stp.closeChainedSubtrees()
 
 	itemsPerFile := int(stp.currentItemsPerFile.Load())
 
-	newSubtree, _ := subtreepkg.NewTreeByLeafCount(itemsPerFile)
+	if cs := stp.currentSubtree.Load(); cs != nil {
+		cs.Close()
+	}
+	newSubtree, _ := stp.newSubtree(itemsPerFile)
 	stp.currentSubtree.Store(newSubtree)
 	if err := stp.currentSubtree.Load().AddCoinbaseNode(); err != nil {
 		return errors.NewProcessingError("[SubtreeProcessor][Reset] error adding coinbase placeholder to new current subtree", err)
@@ -927,8 +1265,6 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 
 	// reset tx count
 	stp.setTxCountFromSubtrees()
-
-	ctx := context.Background()
 
 	// the processed conflicting hashes map keeps track of all the conflicting hashes we've already processed
 	// this is to avoid processing the same conflicting hash multiple times if it appears in multiple blocks
@@ -954,6 +1290,21 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 				processedConflictingHashesMap[hash] = true
 			}
 		}
+	}
+
+	// Clear processed_at for all moveBack blocks concurrently — these blocks are
+	// being "un-processed" during the reset so their timestamps must be removed.
+	if len(moveBackBlocks) > 0 {
+		g, gCtx := errgroup.WithContext(ctx)
+		for _, block := range moveBackBlocks {
+			g.Go(func() error {
+				if err := stp.blockchainClient.SetBlockProcessedAt(gCtx, block.Header.Hash(), true); err != nil {
+					stp.logger.Warnf("[SubtreeProcessor][Reset] error clearing block processed_at for %s: %v", block.String(), err)
+				}
+				return nil // non-critical, don't fail reset
+			})
+		}
+		_ = g.Wait()
 	}
 
 	// optimized version for legacy sync
@@ -988,7 +1339,19 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 			return errors.NewProcessingError("[SubtreeProcessor][Reset] error processing coinbase utxos", err)
 		}
 
-		stp.currentBlockHeader = blockHeader
+		// Mark processed_at for all blocks. For intermediate blocks use a lightweight
+		// direct SetBlockProcessedAt call to avoid running adjustSubtreeSize and
+		// updatePrecomputedMiningData on stale stats repeatedly during fast-forward.
+		// Only the final block gets full finalizeBlockProcessing.
+		for i, block := range moveForwardBlocks {
+			if i < len(moveForwardBlocks)-1 {
+				if err := stp.blockchainClient.SetBlockProcessedAt(ctx, block.Header.Hash()); err != nil {
+					stp.logger.Warnf("[SubtreeProcessor][Reset] error setting block processed_at for %s: %v", block.String(), err)
+				}
+			} else {
+				stp.finalizeBlockProcessing(ctx, block)
+			}
+		}
 	} else {
 		for _, block := range moveForwardBlocks {
 			// A block has potentially some conflicting transactions that need to be processed when we move forward the block
@@ -998,25 +1361,48 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 			}
 
 			if len(conflictingNodes) > 0 {
-				if block.Height == 0 {
-					// get the block height from the blockchain client
-					_, blockHeaderMeta, err := stp.blockchainClient.GetBlockHeader(ctx, block.Hash())
-					if err != nil {
-						return errors.NewProcessingError("[moveForwardBlock][%s] error getting block header meta", block.String(), err)
+				// Skip hashes already handled by an earlier moveBack pass
+				// that ran ReverseProcessConflicting. See the symmetric
+				// filter in processConflictingTransactions for the full
+				// rationale — re-running ProcessConflicting on the same
+				// hashes double-applies the UTXO swap.
+				filteredConflictingNodes := conflictingNodes[:0:0]
+				for _, h := range conflictingNodes {
+					if !processedConflictingHashesMap[h] {
+						filteredConflictingNodes = append(filteredConflictingNodes, h)
+					}
+				}
+
+				if len(filteredConflictingNodes) == 0 {
+					stp.logger.Debugf("[moveForwardBlock][%s] reset path: skipping ProcessConflicting — all %d conflicting nodes already handled by earlier moveBack reverse", block.String(), len(conflictingNodes))
+				} else {
+					conflictingNodes = filteredConflictingNodes
+
+					if block.Height == 0 {
+						// get the block height from the blockchain client
+						_, blockHeaderMeta, err := stp.blockchainClient.GetBlockHeader(ctx, block.Hash())
+						if err != nil {
+							return errors.NewProcessingError("[moveForwardBlock][%s] error getting block header meta", block.String(), err)
+						}
+
+						block.Height = blockHeaderMeta.Height
 					}
 
-					block.Height = blockHeaderMeta.Height
-				}
+					// The Reset path replays moveForwardBlocks and discards the entire
+					// queue at the end (see the validUntilMillis drain after
+					// postProcess). Any in-flight tx whose parent gets cascaded here
+					// is dropped by that drain regardless of cascade discovery, so
+					// the per-block transient set is not needed here.
+					losingTxHashesMap, _, err := utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, conflictingNodes, processedConflictingHashesMap)
+					if err != nil {
+						return errors.NewProcessingError("[moveForwardBlock][%s] error processing conflicting transactions in Reset()", block.String(), err)
+					}
 
-				losingTxHashesMap, err := utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, conflictingNodes, processedConflictingHashesMap)
-				if err != nil {
-					return errors.NewProcessingError("[moveForwardBlock][%s] error processing conflicting transactions in Reset()", block.String(), err)
-				}
-
-				if losingTxHashesMap.Length() > 0 {
-					// mark all the losing txs in the subtrees in the blocks they were mined into as conflicting
-					if err = stp.markConflictingTxsInSubtrees(ctx, losingTxHashesMap); err != nil {
-						return errors.NewProcessingError("[moveForwardBlock][%s] error marking conflicting transactions", block.String(), err)
+					if losingTxHashesMap.Length() > 0 {
+						// mark all the losing txs in the subtrees in the blocks they were mined into as conflicting
+						if err = stp.markConflictingTxsInSubtrees(ctx, losingTxHashesMap); err != nil {
+							return errors.NewProcessingError("[moveForwardBlock][%s] error marking conflicting transactions", block.String(), err)
+						}
 					}
 				}
 			}
@@ -1025,18 +1411,37 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 				return errors.NewProcessingError("[SubtreeProcessor][Reset] error processing coinbase utxos", err)
 			}
 		}
+
+		// Mark processed_at for all blocks. For intermediate blocks use a lightweight
+		// direct SetBlockProcessedAt call to avoid running adjustSubtreeSize and
+		// updatePrecomputedMiningData on stale stats repeatedly during fast-forward.
+		// Only the final block gets full finalizeBlockProcessing.
+		for i, block := range moveForwardBlocks {
+			if i < len(moveForwardBlocks)-1 {
+				if err := stp.blockchainClient.SetBlockProcessedAt(ctx, block.Header.Hash()); err != nil {
+					stp.logger.Warnf("[SubtreeProcessor][Reset] error setting block processed_at for %s: %v", block.String(), err)
+				}
+			} else {
+				stp.finalizeBlockProcessing(ctx, block)
+			}
+		}
 	}
 
-	// persist the current state
-	if len(moveForwardBlocks) > 0 {
-		stp.finalizeBlockProcessing(ctx, moveForwardBlocks[len(moveForwardBlocks)-1])
-	} else if len(moveBackBlocks) > 0 {
+	// persist the current state — only needed when there are NO moveForward blocks
+	// (moveForward blocks are now finalized individually in the loop above)
+	if len(moveForwardBlocks) == 0 && len(moveBackBlocks) > 0 {
 		// we only moved back, finalize with the parent of the last block we moved back
 		block, err := stp.blockchainClient.GetBlock(ctx, moveBackBlocks[len(moveBackBlocks)-1].Header.HashPrevBlock)
 		if err != nil {
 			return errors.NewProcessingError("[SubtreeProcessor][Reset] error getting parent block of last block we moved back", err)
 		}
 		stp.finalizeBlockProcessing(ctx, block)
+	} else if len(moveForwardBlocks) == 0 && len(moveBackBlocks) == 0 {
+		// no-op reset: block assembly is already at the target block, but chainedSubtrees
+		// and currentSubtree were just cleared above. Refresh precomputedMiningData so it
+		// no longer references the old (now-closed) subtrees.
+		stp.currentBlockHeader.Store(blockHeader)
+		stp.updatePrecomputedMiningData()
 	}
 
 	if postProcess != nil {
@@ -1046,15 +1451,15 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		}
 	}
 
-	// dequeue all batches
+	// dequeue all batches enqueued up to the time anchor below. Batches
+	// arriving concurrently after this anchor (e.g. fresh producer
+	// enqueues during the reset) are intentionally left in the queue.
 	stp.logger.Warnf("[SubtreeProcessor][Reset] Dequeueing all transactions")
 
-	validUntilMillis := time.Now().UnixMilli()
+	validUntilMillis := stp.clock.Now().UnixMilli()
 
 	for {
-		batch, found := stp.queue.dequeueBatch(0)
-		if !found || batch.time > validUntilMillis {
-			// we are done
+		if _, found := stp.queue.dequeueBatchUntil(validUntilMillis); !found {
 			break
 		}
 	}
@@ -1089,6 +1494,10 @@ func (stp *SubtreeProcessor) getConflictingNodes(ctx context.Context, block *mod
 				}
 			}
 
+			defer func() {
+				_ = subtreeReader.Close()
+			}()
+
 			subtreeConflictingNodes, err := subtreepkg.DeserializeSubtreeConflictingFromReader(subtreeReader)
 			if err != nil {
 				return errors.NewProcessingError("[moveForwardBlock][%s] error deserializing subtree conflicting nodes", block.String(), err)
@@ -1112,19 +1521,21 @@ func (stp *SubtreeProcessor) getConflictingNodes(ctx context.Context, block *mod
 }
 
 // GetCurrentBlockHeader returns the current block header being processed.
+// This method is safe for concurrent access.
 //
 // Returns:
 //   - *model.BlockHeader: Current block header
 func (stp *SubtreeProcessor) GetCurrentBlockHeader() *model.BlockHeader {
-	return stp.currentBlockHeader
+	return stp.currentBlockHeader.Load()
 }
 
 // SetCurrentBlockHeader sets the current block header being processed.
+// This method is safe for concurrent access.
 //
 // Parameters:
 //   - blockHeader: New block header to set
 func (stp *SubtreeProcessor) SetCurrentBlockHeader(blockHeader *model.BlockHeader) {
-	stp.currentBlockHeader = blockHeader
+	stp.currentBlockHeader.Store(blockHeader)
 }
 
 // GetCurrentSubtree returns the subtree currently being built.
@@ -1169,20 +1580,119 @@ func (stp *SubtreeProcessor) GetRemoveMapLength() int {
 	return stp.removeMap.Length()
 }
 
+// collectMoveForwardTxHashes loads the tx hashes from every subtree of every
+// moveForward block into a set. Used by reorgBlocks to decide which entries
+// in a moveBack block's subtree.ConflictingNodes are re-mined on the new
+// chain and therefore should not be reversed (their canonical-spender
+// state carries across).
+//
+// Returns an empty (non-nil) map when moveForwardBlocks is empty so callers
+// can do a single existence check without nil-guarding. Subtree-load errors
+// are surfaced so the reorg fails loudly instead of silently skipping
+// legitimate carry-over txs.
+func (stp *SubtreeProcessor) collectMoveForwardTxHashes(ctx context.Context, moveForwardBlocks []*model.Block) (map[chainhash.Hash]struct{}, error) {
+	out := make(map[chainhash.Hash]struct{})
+
+	for _, block := range moveForwardBlocks {
+		if block == nil {
+			continue
+		}
+
+		for _, subtreeHash := range block.Subtrees {
+			if subtreeHash == nil {
+				continue
+			}
+
+			subtreeReader, err := stp.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+			if err != nil {
+				subtreeReader, err = stp.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+				if err != nil {
+					return nil, errors.NewServiceError("[collectMoveForwardTxHashes][%s] error getting subtree %s", block.String(), subtreeHash.String(), err)
+				}
+			}
+
+			subtree := &subtreepkg.Subtree{}
+			if err = subtree.DeserializeFromReader(subtreeReader); err != nil {
+				_ = subtreeReader.Close()
+				return nil, errors.NewProcessingError("[collectMoveForwardTxHashes][%s] error deserializing subtree %s", block.String(), subtreeHash.String(), err)
+			}
+
+			_ = subtreeReader.Close()
+
+			for _, node := range subtree.Nodes {
+				if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+					continue
+				}
+
+				out[node.Hash] = struct{}{}
+			}
+		}
+	}
+
+	return out, nil
+}
+
+// cloneReverseCascadedSet returns a copy of the current reorgBlocks-scoped
+// reverse-cascade conflicting set. processConflictingTransactions calls this
+// when its filter short-circuits ProcessConflicting so the per-block
+// conflictingSet still carries the cascade — without it the rebuilt
+// chainedSubtrees would re-admit losers that moveBack's
+// ReverseProcessConflicting just flipped to Conflicting=true. Returns nil
+// outside an active reorg.
+func (stp *SubtreeProcessor) cloneReverseCascadedSet() map[chainhash.Hash]struct{} {
+	if len(stp.reverseCascadedConflictingSet) == 0 {
+		return nil
+	}
+
+	out := make(map[chainhash.Hash]struct{}, len(stp.reverseCascadedConflictingSet))
+	for h := range stp.reverseCascadedConflictingSet {
+		out[h] = struct{}{}
+	}
+
+	return out
+}
+
 // GetChainedSubtrees returns all completed subtrees in the chain.
 //
 // Returns:
 //   - []*util.Subtree: Array of chained subtrees
 func (stp *SubtreeProcessor) GetChainedSubtrees() []*subtreepkg.Subtree {
-	return stp.chainedSubtrees
+	// When processor is not running or has stopped, direct access is safe (no concurrent writers)
+	if stp.GetCurrentRunningState() == StateStarting || stp.stopped.Load() {
+		return stp.chainedSubtrees
+	}
+	// Processor running - use channel-based sync to avoid race
+	response := make(chan []*subtreepkg.Subtree)
+	stp.getSubtreesChan <- response
+	return <-response
 }
 
-func (stp *SubtreeProcessor) GetSubtreeHashes() []chainhash.Hash {
-	response := make(chan []chainhash.Hash)
+func (stp *SubtreeProcessor) GetSubtreeHashes(ctx context.Context) []chainhash.Hash {
+	// response is buffered size 1 so that even if this function returns
+	// early (because ctx cancelled before the main loop responded), the
+	// main loop's send at line 707 — `getSubtreeHashesChan <- subtreeHashes`
+	// in Start.func1 — never blocks. Combined with the ctx-aware select
+	// on the request send below, this eliminates the goroutine leak that
+	// previously kept ~one parked goroutine per GetBlockAssemblyState RPC
+	// every time the SubtreeProcessor main loop was busy (e.g. inside
+	// moveForwardBlock).
+	response := make(chan []chainhash.Hash, 1)
 
-	stp.getSubtreeHashesChan <- response
+	select {
+	case stp.getSubtreeHashesChan <- response:
+	case <-ctx.Done():
+		return nil
+	}
 
-	return <-response
+	select {
+	case r := <-response:
+		return r
+	case <-ctx.Done():
+		// Main loop will still write into the buffered response channel
+		// when it gets there; the buffer absorbs the write so the main
+		// loop doesn't block. Nothing leaks.
+		return nil
+	}
 }
 
 func (stp *SubtreeProcessor) GetTransactionHashes() []chainhash.Hash {
@@ -1263,7 +1773,17 @@ func (stp *SubtreeProcessor) SubtreeCount() int {
 	// not using len(chainSubtrees) to avoid Race condition
 	// should we be using locks around all chainSubtree operations instead?
 	// the subtree count isn't mission-critical - it's just for statistics
-	return int(stp.chainedSubtreeCount.Load()) + 01
+	return int(stp.chainedSubtreeCount.Load()) + 1
+}
+
+// GetChainedSubtreesTotalSize returns the total size in bytes of all chained subtrees.
+// This uses atomic access and is safe to call from any context without channel-based
+// synchronization, avoiding potential deadlocks in scenarios where the worker is blocked.
+//
+// Returns:
+//   - uint64: Total size in bytes of all chained subtrees
+func (stp *SubtreeProcessor) GetChainedSubtreesTotalSize() uint64 {
+	return stp.chainedSubtreesTotalSize.Load()
 }
 
 // adjustSubtreeSize calculates and sets a new subtree size based on recent block statistics
@@ -1447,11 +1967,11 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 }
 
 // InitCurrentBlockHeader sets the initial block header.
-// This function is not thread-safe.
+// The currentBlockHeader access is thread-safe.
 func (stp *SubtreeProcessor) InitCurrentBlockHeader(blockHeader *model.BlockHeader) {
 	stp.logger.Infof("[SubtreeProcessor] initializing current block header to %s", blockHeader.String())
 
-	stp.currentBlockHeader = blockHeader
+	stp.currentBlockHeader.Store(blockHeader)
 	stp.blockStartTime = time.Now()
 	stp.subtreesInBlock = 0
 }
@@ -1483,7 +2003,7 @@ func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.T
 	if stp.currentSubtree.Load() == nil {
 		itemsPerFile := int(stp.currentItemsPerFile.Load())
 
-		newSubtree, err := subtreepkg.NewTreeByLeafCount(itemsPerFile)
+		newSubtree, err := stp.newSubtree(itemsPerFile)
 		if err != nil {
 			return err
 		}
@@ -1524,7 +2044,7 @@ func (stp *SubtreeProcessor) addNodePreValidated(node subtreepkg.Node, skipNotif
 	if stp.currentSubtree.Load() == nil {
 		itemsPerFile := int(stp.currentItemsPerFile.Load())
 
-		newSubtree, err := subtreepkg.NewTreeByLeafCount(itemsPerFile)
+		newSubtree, err := stp.newSubtree(itemsPerFile)
 		if err != nil {
 			return err
 		}
@@ -1578,8 +2098,19 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	}
 
 	// Add the subtree to the chain
+	chainedIdx := len(stp.chainedSubtrees)
 	stp.chainedSubtrees = append(stp.chainedSubtrees, currentSubtree)
 	stp.chainedSubtreeCount.Add(1)
+	stp.chainedSubtreesTotalSize.Add(currentSubtree.SizeInBytes)
+
+	// Update SubtreeIndex for all txs in this subtree so removeTxFromSubtrees can do O(1) lookup.
+	// Store chainedIdx+1 so that 0 (zero value) means "unassigned" and is safe across serialization.
+	if stp.diskTxMap != nil {
+		idx := int16(chainedIdx + 1)
+		for _, node := range currentSubtree.Nodes {
+			_ = stp.diskTxMap.UpdateSubtreeIndex(node.Hash, idx)
+		}
+	}
 
 	stp.subtreesInBlock++ // Track number of subtrees in current block
 
@@ -1587,7 +2118,7 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	oldSubtreeHash := oldSubtree.RootHash()
 
 	// create a new subtree with the same size as the previous subtree
-	newSubtree, err := subtreepkg.NewTreeByLeafCount(oldSubtree.Size())
+	newSubtree, err := stp.newSubtree(oldSubtree.Size())
 	if err != nil {
 		return errors.NewProcessingError("[%s] error creating new subtree", oldSubtreeHash.String(), err)
 	}
@@ -1599,8 +2130,12 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	stp.newSubtreeChan <- NewSubtreeRequest{
 		Subtree:          oldSubtree,
 		ParentTxMap:      stp.currentTxMap,
+		DeletedTxs:       stp.deletedTxs,
 		SkipNotification: skipNotification,
 		ErrChan:          errCh,
+		OnStorageComplete: func() {
+			stp.cleanupDeletedTxs(oldSubtree)
+		},
 	}
 
 	// wait for the writing of the subtree to complete in a separate goroutine
@@ -1614,6 +2149,9 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	if !skipNotification {
 		stp.resetAnnouncementTicker()
 	}
+
+	// Update pre-computed mining data with the new subtree
+	stp.updatePrecomputedMiningData()
 
 	return nil
 }
@@ -1789,18 +2327,38 @@ func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chai
 	foundSubtreeIndex := -1
 
 	if foundIndex == -1 {
-		// not found in the current subtree, check chained subtrees
-		for subtreeIndex, subtree := range stp.chainedSubtrees {
-			idx := subtree.NodeIndex(hash)
-			if idx >= 0 {
-				foundSubtreeIndex = subtreeIndex
-				foundIndex = idx
+		// Use SubtreeIndex for O(1) lookup when DiskTxMap is active.
+		// SubtreeIndex is stored as chainedIdx+1, so >0 means assigned.
+		if stp.diskTxMap != nil {
+			if inpoints, found := stp.currentTxMap.Get(hash); found && inpoints.SubtreeIndex > 0 {
+				chainedIdx := int(inpoints.SubtreeIndex - 1)
+				if chainedIdx < len(stp.chainedSubtrees) {
+					idx := stp.chainedSubtrees[chainedIdx].NodeIndex(hash)
+					if idx >= 0 {
+						foundSubtreeIndex = chainedIdx
+						foundIndex = idx
+					}
+				}
+			}
+		}
+
+		// Fallback: linear scan (when DiskTxMap is not active or SubtreeIndex lookup missed)
+		if foundIndex == -1 {
+			for subtreeIndex, subtree := range stp.chainedSubtrees {
+				idx := subtree.NodeIndex(hash)
+				if idx >= 0 {
+					foundSubtreeIndex = subtreeIndex
+					foundIndex = idx
+				}
 			}
 		}
 	}
 
 	if foundIndex >= 0 {
-		// remove tx from the currentTxMap
+		// Save to deleted backup map before removing (for Server fallback during async storage)
+		if txInpoints, found := stp.currentTxMap.Get(hash); found {
+			stp.deletedTxs.Set(hash, *txInpoints)
+		}
 		stp.currentTxMap.Delete(hash)
 
 		// we found the transaction in a subtree
@@ -1813,6 +2371,11 @@ func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chai
 		// it was found in a chained subtree, remove it from there and chain the subtrees again from the point it was removed
 		// this is a bit more complex, as we need to remove the transaction from the subtree it is in and then make sure
 		// the subtrees are chained correctly again
+
+		// Deep copy the subtree before mutating so that any precomputed mining data
+		// snapshot that holds a pointer to the original remains safe for concurrent reads.
+		stp.chainedSubtrees[foundSubtreeIndex] = stp.chainedSubtrees[foundSubtreeIndex].Duplicate()
+
 		if err := stp.chainedSubtrees[foundSubtreeIndex].RemoveNodeAtIndex(foundIndex); err != nil {
 			return errors.NewProcessingError("[SubtreeProcessor][removeTxFromSubtrees][%s] error removing node from subtree", hash.String(), err)
 		}
@@ -1864,7 +2427,10 @@ func (stp *SubtreeProcessor) removeTxsFromSubtrees(ctx context.Context, hashes [
 		}
 
 		if foundIndex >= 0 {
-			// remove tx from the currentTxMap
+			// Save to deleted backup map before removing (for Server fallback during async storage)
+			if txInpoints, found := stp.currentTxMap.Get(hash); found {
+				stp.deletedTxs.Set(hash, *txInpoints)
+			}
 			stp.currentTxMap.Delete(hash)
 
 			// we found the transaction in a subtree
@@ -1877,6 +2443,11 @@ func (stp *SubtreeProcessor) removeTxsFromSubtrees(ctx context.Context, hashes [
 			// it was found in a chained subtree, remove it from there and chain the subtrees again from the point it was removed
 			// this is a bit more complex, as we need to remove the transaction from the subtree it is in and then make sure
 			// the subtrees are chained correctly again
+
+			// Deep copy the subtree before mutating so that any precomputed mining data
+			// snapshot that holds a pointer to the original remains safe for concurrent reads.
+			stp.chainedSubtrees[foundSubtreeIndex] = stp.chainedSubtrees[foundSubtreeIndex].Duplicate()
+
 			if err := stp.chainedSubtrees[foundSubtreeIndex].RemoveNodeAtIndex(foundIndex); err != nil {
 				return errors.NewProcessingError("[SubtreeProcessor][removeTxsFromSubtrees][%s] error removing node from subtree", hash.String(), err)
 			}
@@ -1916,9 +2487,19 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 
 	stp.chainedSubtreeCount.Store(fromIndexInt32)
 
+	// Recompute total size from remaining chained subtrees
+	var totalSize uint64
+	for _, st := range stp.chainedSubtrees {
+		totalSize += st.SizeInBytes
+	}
+	stp.chainedSubtreesTotalSize.Store(totalSize)
+
 	itemsPerFile := int(stp.currentItemsPerFile.Load())
 
-	newSubtree, err := subtreepkg.NewTreeByLeafCount(itemsPerFile)
+	if cs := stp.currentSubtree.Load(); cs != nil {
+		cs.Close()
+	}
+	newSubtree, err := stp.newSubtree(itemsPerFile)
 	if err != nil {
 		return errors.NewProcessingError("error creating new current subtree", err)
 	}
@@ -1951,14 +2532,28 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 				return errors.NewProcessingError("error getting txInpoints from currentTxMap for %s", node.Hash.String())
 			}
 
-			// Remove from currentTxMap so addNode won't skip it as a duplicate
+			// Save to deleted backup before removing (protects brief window during delete-and-readd)
+			stp.deletedTxs.Set(node.Hash, *parents)
+
+			// Delete from currentTxMap so addNode won't skip it as a duplicate
 			stp.currentTxMap.Delete(node.Hash)
 
-			// Immediately re-add the node
+			// Re-add the node (adds back to currentTxMap)
 			if err = stp.addNode(node, parents, true); err != nil {
+				// Restore to currentTxMap to avoid inconsistent state
+				stp.currentTxMap.Set(node.Hash, parents)
+				stp.deletedTxs.Delete(node.Hash)
 				return errors.NewProcessingError("error adding node to subtree", err)
 			}
+
+			// Clear from deletedTxs (transaction successfully re-added, no longer deleted)
+			stp.deletedTxs.Delete(node.Hash)
 		}
+	}
+
+	// Close old subtrees that were re-chained
+	for _, st := range originalSubtrees {
+		st.Close()
 	}
 
 	return nil
@@ -2058,6 +2653,69 @@ func (stp *SubtreeProcessor) GetCompletedSubtreesForMiningCandidate() []*subtree
 	return subtrees
 }
 
+// GetPrecomputedMiningData returns the pre-computed mining data for lock-free reads.
+// This can be called from any goroutine without synchronization.
+// Updated when a subtree completes or a block is processed.
+func (stp *SubtreeProcessor) GetPrecomputedMiningData() *PrecomputedMiningData {
+	return stp.precomputedMiningData.Load()
+}
+
+// GetIncompleteSubtreeMiningData requests a snapshot of the incomplete subtree from
+// the processing goroutine. Called on-demand by GetMiningCandidate when no complete
+// subtrees exist, avoiding the cost of snapshotting on every transaction.
+// Uses a hard timeout of 5 seconds to prevent blocking indefinitely when the
+// processing goroutine is busy (e.g., during a reorg). The caller's context
+// is also respected for earlier cancellation.
+func (stp *SubtreeProcessor) GetIncompleteSubtreeMiningData(ctx context.Context) *PrecomputedMiningData {
+	const timeout = 5 * time.Second
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	responseCh := make(chan *PrecomputedMiningData, 1)
+	select {
+	case stp.getIncompleteSubtreeDataChan <- responseCh:
+	case <-ctx.Done():
+		return nil
+	}
+	select {
+	case data := <-responseCh:
+		return data
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// updatePrecomputedMiningData snapshots chainedSubtrees and stores them for mining candidate generation.
+// Derived values (fees, tx count, merkle proof, etc.) are computed by the caller (GetMiningCandidate).
+// This should only be called from the main processing goroutine.
+func (stp *SubtreeProcessor) updatePrecomputedMiningData() {
+	currentBlockHeader := stp.currentBlockHeader.Load()
+	if currentBlockHeader == nil {
+		return
+	}
+
+	chainedSubtrees := stp.chainedSubtrees
+	if len(chainedSubtrees) == 0 {
+		// No completed subtrees - store with nil Subtrees.
+		// Incomplete subtree snapshot is created on-demand via GetIncompleteSubtreeMiningData.
+		stp.precomputedMiningData.Store(&PrecomputedMiningData{
+			PreviousHeader: currentBlockHeader,
+			UpdatedAt:      time.Now(),
+		})
+		return
+	}
+
+	// Copy subtrees for lock-free access
+	subtreesCopy := make([]*subtreepkg.Subtree, len(chainedSubtrees))
+	copy(subtreesCopy, chainedSubtrees)
+
+	stp.precomputedMiningData.Store(&PrecomputedMiningData{
+		PreviousHeader: currentBlockHeader,
+		Subtrees:       subtreesCopy,
+		UpdatedAt:      time.Now(),
+	})
+}
+
 // MoveForwardBlock updates the subtrees when a new block is found.
 //
 // Parameters:
@@ -2128,6 +2786,15 @@ func (stp *SubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlo
 // Returns:
 //   - error: Any error encountered during reorg (triggers fallback to reset())
 func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block) (err error) {
+	// reorgBlocks captures originalCurrentTxMap once and expects the pointer
+	// to remain valid (pointing at unchanged pre-reorg data) for the entire
+	// loop so that rollback can restore it. The double-buffer swap pattern
+	// breaks that contract across multiple moveForward iterations, so disable
+	// pooling for the duration of this call. Single-goroutine — no
+	// synchronisation needed.
+	stp.disableCurrentTxMapPool = true
+	defer func() { stp.disableCurrentTxMapPool = false }()
+
 	if moveBackBlocks == nil {
 		return errors.NewProcessingError("you must pass in blocks to move down the chain")
 	}
@@ -2136,7 +2803,13 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		return errors.NewProcessingError("you must pass in blocks to move up the chain")
 	}
 
-	stp.logger.Infof("reorgBlocks with %d moveBackBlocks and %d moveForwardBlocks", len(moveBackBlocks), len(moveForwardBlocks))
+	// trace the entire reorg process, which can be long-running for large reorgs, to help identify bottlenecks and monitor performance
+	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "reorgBlocks",
+		tracing.WithAlwaysSample(),
+		tracing.WithParentStat(stp.stats),
+		tracing.WithLogMessage(stp.logger, "[SubtreeProcessor][reorgBlocks] starting reorg with %d moveBackBlocks and %d moveForwardBlocks", len(moveBackBlocks), len(moveForwardBlocks)),
+	)
+	defer deferFn()
 
 	if len(moveForwardBlocks) > 0 && len(moveBackBlocks) == 0 {
 		// wait for the last block to be processed first, mined_set etc.
@@ -2156,19 +2829,19 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		originalChainedSubtrees := stp.chainedSubtrees
 		originalCurrentSubtree := stp.currentSubtree.Load()
 		originalCurrentTxMap := stp.currentTxMap
-		currentBlockHeader := stp.currentBlockHeader
+		currentBlockHeader := stp.currentBlockHeader.Load()
 
 		// Just move forward the blocks and do not go into a full reorg
 		for idx, block := range moveForwardBlocks {
 			// skip dequeue if not the last block
 			skipNotificationsAndDequeue := idx != len(moveForwardBlocks)-1
 
-			if _, err = stp.moveForwardBlock(ctx, block, skipNotificationsAndDequeue, processedConflictingHashesMap, skipNotificationsAndDequeue, true); err != nil {
+			if _, _, err = stp.moveForwardBlock(ctx, block, skipNotificationsAndDequeue, processedConflictingHashesMap, skipNotificationsAndDequeue, true); err != nil {
 				// rollback to previous state
 				stp.chainedSubtrees = originalChainedSubtrees
 				stp.currentSubtree.Store(originalCurrentSubtree)
 				stp.currentTxMap = originalCurrentTxMap
-				stp.currentBlockHeader = currentBlockHeader
+				stp.currentBlockHeader.Store(currentBlockHeader)
 
 				// recalculate tx count from subtrees
 				stp.setTxCountFromSubtrees()
@@ -2180,7 +2853,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 				stp.finalizeBlockProcessing(ctx, block)
 			}
 
-			stp.currentBlockHeader = block.Header
+			stp.currentBlockHeader.Store(block.Header)
 		}
 
 		return nil
@@ -2193,7 +2866,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	}
 
 	// dequeueDuringBlockMovement all transactions that are in the queue
-	if err = stp.dequeueDuringBlockMovement(nil, nil, true); err != nil {
+	if err = stp.dequeueDuringBlockMovement(nil, nil, nil, true); err != nil {
 		return errors.NewProcessingError("[reorgBlocks] error dequeueing transactions during block movement", err)
 	}
 
@@ -2201,7 +2874,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	originalChainedSubtrees := stp.chainedSubtrees
 	originalCurrentSubtree := stp.currentSubtree.Load()
 	originalCurrentTxMap := stp.currentTxMap
-	currentBlockHeader := stp.currentBlockHeader
+	currentBlockHeader := stp.currentBlockHeader.Load()
 
 	defer func() {
 		if err != nil {
@@ -2209,7 +2882,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			stp.chainedSubtrees = originalChainedSubtrees
 			stp.currentSubtree.Store(originalCurrentSubtree)
 			stp.currentTxMap = originalCurrentTxMap
-			stp.currentBlockHeader = currentBlockHeader
+			stp.currentBlockHeader.Store(currentBlockHeader)
 
 			// recalculate the tx count
 			stp.setTxCountFromSubtrees()
@@ -2228,7 +2901,36 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	// movedBackBlockTxMap keeps track of all the transactions that were in the blocks we moved back
 	// this is used to determine which transactions need to be marked as on the longest chain when moving forward
 	// if a transaction was in a block we moved back, it means it was on the longest chain before the reorg
-	movedBackBlockTxMap := make(map[chainhash.Hash]bool) // keeps track of all the transactions that were in the blocks we moved back
+	movedBackBlockTxMap := make(map[chainhash.Hash]struct{}) // keeps track of all the transactions that were in the blocks we moved back
+
+	// reverseCascadedConflictingSet collects every tx whose Conflicting flag
+	// ReverseProcessConflicting flipped to true during the moveBack loop —
+	// the demoted txs from each moveBackBlock's subtree.ConflictingNodes plus
+	// any unmined descendants reached via MarkConflictingRecursively. The
+	// moveForward calls' processConflictingTransactions surfaces this set as
+	// the conflictingSet return when the filter short-circuits
+	// ProcessConflicting, so processRemainderTransactionsAndDequeue evicts
+	// the cascade from the rebuilt chainedSubtrees. We also feed it into a
+	// final dequeueDuringBlockMovement at the end of the moveForward loop
+	// so any items still in the queue get dropped.
+	stp.reverseCascadedConflictingSet = make(map[chainhash.Hash]struct{})
+	reverseCascadedConflictingSet := stp.reverseCascadedConflictingSet
+	defer func() {
+		stp.reverseCascadedConflictingSet = nil
+	}()
+
+	// Build the set of txs that will be mined in moveForwardBlocks. A tx
+	// that appears in BOTH a moveBackBlock's subtree.ConflictingNodes AND
+	// a moveForward block is one whose canonical-spender status is the
+	// SAME across both forks — moveForward will handle it via its own
+	// ProcessConflicting. Reversing it in moveBack only to re-process in
+	// moveForward (or worse, have the filter skip the re-process) leaves
+	// the UTXO state inconsistent with what moveForward expects. Skip
+	// these in the Reverse call.
+	moveForwardTxSet, err := stp.collectMoveForwardTxHashes(ctx, moveForwardBlocks)
+	if err != nil {
+		return errors.NewProcessingError("[reorgBlocks] error collecting moveForward tx hashes", err)
+	}
 
 	for _, block := range moveBackBlocks {
 		// move back the block, getting all the transactions in the block and any conflicting hashes
@@ -2240,8 +2942,127 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		}
 
 		if len(conflictingHashes) > 0 {
+			// The block being moved back carried a non-empty
+			// subtree.ConflictingNodes list. Its original moveForwardBlock
+			// therefore invoked ProcessConflicting in the UTXO store,
+			// swapping parent.SpendingDatas to the txs in
+			// conflictingHashes and flipping the prior counter-spenders
+			// to Conflicting=true. moveBack does not naturally undo those
+			// UTXO-level side effects — call ReverseProcessConflicting so
+			// the UTXO state matches what it would have been had the now-
+			// orphaned block never been part of the chain.
+			//
+			// Touched hashes are added to processedConflictingHashesMap so
+			// the subsequent moveForwardBlock pass can recognise both
+			// sides of the swap (demoted hashes AND restored counters) and
+			// skip re-running ProcessConflicting on them — the swap they
+			// would have applied has already been applied (in the inverse
+			// direction) and re-running corrupts the UTXO records.
+			//
+			// cascadedConflicting is the subset of touched whose flag
+			// flipped to true (demoted txs + their unmined descendants).
+			// These need eviction from the in-memory queue/subtrees so
+			// the next mining candidate doesn't include them — collected
+			// into reverseCascadedConflictingSet to feed downstream
+			// dequeueDuringBlockMovement.
+			// Filter out hashes that are re-mined in moveForwardBlocks.
+			// Their canonical-spender status carries across the reorg, so
+			// the moveForward path's ProcessConflicting handles them
+			// natively. Reversing them in moveBack only to either re-
+			// process or filter-skip in moveForward leaves UTXO state
+			// inconsistent with what the new tip expects.
+			reverseInputs := conflictingHashes[:0:0]
+			for _, h := range conflictingHashes {
+				if _, inForward := moveForwardTxSet[h]; inForward {
+					stp.logger.Debugf("[reorgBlocks][%s] skipping reverse for tx %s — re-mined in a moveForward block", block.String(), h.String())
+					continue
+				}
+
+				reverseInputs = append(reverseInputs, h)
+			}
+
+			cascadedConflicting, touched, reverseErr := utxostore.ReverseProcessConflicting(ctx, stp.utxoStore, block.Height, reverseInputs)
+			if reverseErr != nil {
+				return errors.NewProcessingError("[reorgBlocks][%s] error reversing conflict resolution from moved-back block", block.String(), reverseErr)
+			}
+
 			for _, hash := range conflictingHashes {
 				processedConflictingHashesMap[hash] = true
+			}
+
+			for _, hash := range touched {
+				processedConflictingHashesMap[hash] = true
+			}
+
+			for _, hash := range cascadedConflicting {
+				reverseCascadedConflictingSet[hash] = struct{}{}
+			}
+
+			// Evict each newly-conflicting tx from block assembly's in-memory
+			// subtree state. moveBackBlockCreateNewSubtrees has already
+			// re-added the block's txs (including the demoted hashes) via
+			// addNode before our Reverse decided to flip them. The forward
+			// path's dequeueDuringBlockMovement only filters the QUEUE and
+			// rebuilds via losingTxHashesMap — neither touches a tx that's
+			// already settled in chainedSubtrees. Mirror what
+			// BlockAssembler.markAsConflicting does on the validate-inputs
+			// path: walk the cascade and call Remove on each.
+			//
+			// Counter-side (un-cascaded) hashes are intentionally NOT
+			// re-added to chainedSubtrees here. Their state after the
+			// reverse:
+			//   - Conflicting=false in the UTXO store (valid mempool entry
+			//     visible via RPC / GetSpend).
+			//   - NOT in chainedSubtrees — they were Conflicting=true before
+			//     the reverse and so never made it into the in-memory
+			//     subtree. The reverse only flips the flag; it does not
+			//     stp.Add them.
+			// Re-introduction to the mining flow therefore depends on:
+			//   - Validator re-feeding from gossip (works when other nodes
+			//     also held the tx), or
+			//   - Operator RPC resubmit.
+			// For a tx only this node held — which is rare since the
+			// original demotion was triggered by a competing mined tx the
+			// rest of the network saw too — the counter is effectively
+			// shelved until resubmit. The alternative is calling stp.Add
+			// here per counter, but that needs the tx body in hand and
+			// risks adding txs whose parents are still missing post-reorg.
+			// Documented gap, not silently swept under "valid mempool entry".
+			//
+			// Warn-and-continue on Remove error (mirrors BlockAssembler.go:2551).
+			// Failing the reorg here would not roll the UTXO mutations back —
+			// the cascade is already committed as Conflicting=true, the
+			// counter-side already Spend/Unmarked. The realistic Remove failure
+			// is "tx already absent" (race with a concurrent eviction) which is
+			// the desired end state anyway. A genuine corruption case is
+			// recoverable via the next reorg/reset or `teranode-cli
+			// resetblockassembly --validate-inputs` — the same recovery path
+			// the validate-inputs cascade relies on.
+			for _, h := range cascadedConflicting {
+				if removeErr := stp.Remove(ctx, h); removeErr != nil {
+					stp.logger.Warnf("[reorgBlocks][%s] failed to evict reverse-demoted tx %s from in-memory subtree: %v", block.String(), h.String(), removeErr)
+				}
+			}
+
+			// Persist the newly-conflicting demoted txs (and their cascaded
+			// descendants) into the on-disk subtrees that contain them.
+			// markConflictingTxsInSubtrees only adds — never removes — so
+			// running it here keeps the "subtree.ConflictingNodes is the
+			// historical superset of every tx ever flagged conflicting"
+			// invariant intact. Without this, only the moveForward path
+			// would persist (via processConflictingTransactions →
+			// markConflictingTxsInSubtrees), and the filter that
+			// short-circuits ProcessConflicting on reverse-cascade hashes
+			// would skip that persist too.
+			if len(cascadedConflicting) > 0 {
+				cascadeMap := txmap.NewSplitSwissMap(len(cascadedConflicting))
+				for _, h := range cascadedConflicting {
+					_ = cascadeMap.Put(h, 1)
+				}
+
+				if err = stp.markConflictingTxsInSubtrees(ctx, cascadeMap); err != nil {
+					return errors.NewProcessingError("[reorgBlocks][%s] error marking reverse-cascade conflicting txs in subtrees", block.String(), err)
+				}
 			}
 		}
 
@@ -2249,7 +3070,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		for _, subtreeNodes := range subtreesNodes {
 			for _, node := range subtreeNodes {
 				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-					movedBackBlockTxMap[node.Hash] = true
+					movedBackBlockTxMap[node.Hash] = struct{}{}
 				}
 			}
 		}
@@ -2263,11 +3084,17 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			return errors.NewProcessingError("[reorgBlocks] error getting parent block header during reorg", err)
 		}
 
-		stp.currentBlockHeader = parentHeader
+		stp.currentBlockHeader.Store(parentHeader)
 	}
 
 	var (
-		transactionMap     *SplitSwissMap
+		transactionMap    *SplitSwissMap
+		losingTxHashesMap txmap.TxMap
+		// winningTxSet and losingTxSet track tx membership for dedup/filtering
+		winningTxSet = make(map[chainhash.Hash]struct{})
+		losingTxSet  = make(map[chainhash.Hash]struct{})
+		// markOnLongestChain collects hashes that need to be marked as on longest chain;
+		// filtered inline to avoid a second pass
 		markOnLongestChain = make([]chainhash.Hash, 0, 1024)
 	)
 
@@ -2275,80 +3102,131 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		lastMoveForwardBlock := blockIdx == len(moveForwardBlocks)-1
 		// we skip the notifications for now and do them all at the end
 		// transactionMap is returned so we can check which transactions need to be marked as on the longest chain
-		if transactionMap, err = stp.moveForwardBlock(ctx, block, true, processedConflictingHashesMap, !lastMoveForwardBlock, lastMoveForwardBlock); err != nil {
+		if transactionMap, losingTxHashesMap, err = stp.moveForwardBlock(ctx, block, true, processedConflictingHashesMap, !lastMoveForwardBlock, lastMoveForwardBlock); err != nil {
 			return err
 		}
 
 		if transactionMap != nil {
 			transactionMap.Iter(func(hash chainhash.Hash, _ struct{}) bool {
-				// if the transaction is not in the movedBackBlockTxMap, it means it was not part of the blocks we moved back
-				// and therefore needs to be marked in the utxo store as on the longest chain now
-				// since it was on the block moving forward
-				if !hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) && !movedBackBlockTxMap[hash] {
-					markOnLongestChain = append(markOnLongestChain, hash)
+				if !hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+					winningTxSet[hash] = struct{}{}
+					if _, inMovedBack := movedBackBlockTxMap[hash]; !inMovedBack {
+						markOnLongestChain = append(markOnLongestChain, hash)
+					}
 				}
 
 				return true
 			})
 		}
 
-		stp.currentBlockHeader = block.Header
+		// Build losingTxSet directly from the map iterator, avoiding Keys() intermediate slice
+		if losingTxHashesMap != nil && losingTxHashesMap.Length() > 0 {
+			losingTxHashesMap.Iter(func(hash chainhash.Hash, _ uint64) bool {
+				if _, isWinning := winningTxSet[hash]; !isWinning {
+					losingTxSet[hash] = struct{}{}
+				}
+				return true
+			})
+		}
+
+		stp.currentBlockHeader.Store(block.Header)
 	}
 
-	movedBackBlockTxMap = nil // free up memory
+	// Evict txs whose Conflicting flag flipped to true via
+	// ReverseProcessConflicting from the moveBack passes above. The per-block
+	// moveForwardBlock dequeue (driven by processConflictingTransactions's
+	// conflictingSet return) wouldn't otherwise touch these — the filter on
+	// processedConflictingHashesMap short-circuits ProcessConflicting for
+	// hashes the reverse already swapped, leaving its conflictingSet empty.
+	if len(reverseCascadedConflictingSet) > 0 {
+		if err = stp.dequeueDuringBlockMovement(nil, nil, reverseCascadedConflictingSet, true); err != nil {
+			return errors.NewProcessingError("[reorgBlocks] error dequeuing reverse-cascade conflicting transactions", err)
+		}
+	}
+
+	// Build allLosingTxHashes directly from losingTxSet (already deduped, already filtered vs winningTxSet)
+	allLosingTxHashes := getHashSlice(len(losingTxSet))
+	for hash := range losingTxSet {
+		*allLosingTxHashes = append(*allLosingTxHashes, hash)
+	}
+
+	// Filter markOnLongestChain against losingTxSet in-place to avoid a second slice allocation
+	n := 0
+	for _, hash := range markOnLongestChain {
+		if _, isLosing := losingTxSet[hash]; !isLosing {
+			markOnLongestChain[n] = hash
+			n++
+		}
+	}
+	filteredMarkOnLongestChain := markOnLongestChain[:n]
 
 	// all the transactions in markOnLongestChain need to be marked as on the longest chain in the utxo store
-	if len(markOnLongestChain) > 0 {
-		if err = stp.utxoStore.MarkTransactionsOnLongestChain(ctx, markOnLongestChain, true); err != nil {
+	if len(filteredMarkOnLongestChain) > 0 {
+		if err = stp.utxoStore.MarkTransactionsOnLongestChain(ctx, filteredMarkOnLongestChain, true); err != nil {
 			return errors.NewProcessingError("[reorgBlocks] error marking transactions as on longest chain in utxo store", err)
 		}
 	}
 
-	// everything now in block assembly is not mined on the longest chain
-	// so we need to set the unminedSince for all transactions in block assembly
+	// Consolidate all "mark as not on longest chain" operations:
+	// 1. Losing conflicting transactions from moveForward blocks
+	// 2. All transactions currently in block assembly (chainedSubtrees + currentSubtree)
+	//
+	// Assembly txs must be included because some may have entered the UTXO store via
+	// block validation of a non-longest-chain block (e.g., competing fork), where they
+	// were inserted with UnminedSince=0 (mined). These need unmined_since set.
+	// For txs that already have unmined_since set (from propagation), this is idempotent.
+	//
+	// MoveBack txs are handled by BlockAssembler.Reset (which calls
+	// MarkTransactionsOnLongestChain before reorgBlocks runs).
+	subtreeNodeCount := 0
 	for _, subtree := range stp.chainedSubtrees {
-		notOnLongestChain := make([]chainhash.Hash, 0, len(subtree.Nodes))
+		subtreeNodeCount += len(subtree.Nodes)
+	}
+	currentSubtree := stp.currentSubtree.Load()
+	subtreeNodeCount += len(currentSubtree.Nodes)
 
+	allMarkFalse := getHashSlice(len(*allLosingTxHashes) + subtreeNodeCount)
+
+	// Add losing conflicting transactions
+	*allMarkFalse = append(*allMarkFalse, *allLosingTxHashes...)
+	putHashSlice(allLosingTxHashes)
+
+	// Add all transactions in block assembly
+	for _, subtree := range stp.chainedSubtrees {
 		for _, node := range subtree.Nodes {
-			if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				// skip coinbase placeholder
-				continue
-			}
-
-			notOnLongestChain = append(notOnLongestChain, node.Hash)
-		}
-
-		if len(notOnLongestChain) > 0 {
-			if err = stp.markNotOnLongestChain(ctx, moveBackBlocks, moveForwardBlocks, notOnLongestChain); err != nil {
-				return err
+			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				*allMarkFalse = append(*allMarkFalse, node.Hash)
 			}
 		}
 	}
-
-	// also for the current subtree
-	currentSubtree := stp.currentSubtree.Load()
-	notOnLongestChain := make([]chainhash.Hash, 0, len(currentSubtree.Nodes))
 
 	for _, node := range currentSubtree.Nodes {
-		if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			// skip coinbase placeholder
-			continue
+		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			*allMarkFalse = append(*allMarkFalse, node.Hash)
 		}
-
-		notOnLongestChain = append(notOnLongestChain, node.Hash)
 	}
 
-	if len(notOnLongestChain) > 0 {
-		if err = stp.markNotOnLongestChain(ctx, moveBackBlocks, moveForwardBlocks, notOnLongestChain); err != nil {
+	if len(*allMarkFalse) > 0 {
+		if err = stp.markNotOnLongestChain(ctx, *allMarkFalse); err != nil {
+			putHashSlice(allMarkFalse)
 			return err
 		}
 	}
+	putHashSlice(allMarkFalse)
 
 	// announce all the subtrees to the network
 	// this will also store it by the Server in the subtree store
 	for _, subtree := range stp.chainedSubtrees {
 		errCh := make(chan error)
-		stp.newSubtreeChan <- NewSubtreeRequest{Subtree: subtree, ParentTxMap: stp.currentTxMap, ErrChan: errCh}
+		stp.newSubtreeChan <- NewSubtreeRequest{
+			Subtree:     subtree,
+			ParentTxMap: stp.currentTxMap,
+			DeletedTxs:  stp.deletedTxs,
+			ErrChan:     errCh,
+			OnStorageComplete: func() {
+				stp.cleanupDeletedTxs(subtree)
+			},
+		}
 
 		if err = <-errCh; err != nil {
 			return errors.NewProcessingError("[reorgBlocks] error sending subtree to newSubtreeChan", err)
@@ -2379,105 +3257,21 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	return nil
 }
 
-func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, markNotOnLongestChain []chainhash.Hash) error {
-	if len(moveBackBlocks) == 1 && len(moveForwardBlocks) == 0 {
-		// special case: likely an invalidation; validate whether to update the transactions or not
-		_, blockHeaderMeta, err := stp.blockchainClient.GetBlockHeader(ctx, moveBackBlocks[0].Header.Hash())
-		if err != nil {
-			return errors.NewProcessingError("[reorgBlocks] error getting block header meta for block we moved back", err)
-		}
-
-		if blockHeaderMeta.Invalid {
-			// the block we moved back is invalid, so we cannot just mark all transactions as not on the longest chain
-			markNotOnLongestChain, err = stp.checkMarkNotOnLongestChain(ctx, moveBackBlocks[0], markNotOnLongestChain)
-			if err != nil {
-				return errors.NewProcessingError("[reorgBlocks] error checking which transactions to mark as not on longest chain", err)
-			}
-		}
-	}
-
-	// check again if we have any transactions to mark, after the checkMarkNotOnLongestChain
-	if len(markNotOnLongestChain) > 0 {
-		if err := stp.utxoStore.MarkTransactionsOnLongestChain(ctx, markNotOnLongestChain, false); err != nil {
+func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, txHashes []chainhash.Hash) error {
+	// Mark transactions as not on longest chain (set unmined_since).
+	// Called with the combined set of:
+	// 1. Losing conflicting txs from moveForward blocks
+	// 2. All txs currently in block assembly
+	//
+	// For txs that already have unmined_since set, this is an idempotent write.
+	// MoveBack txs are handled by BlockAssembler.Reset before reorgBlocks runs.
+	if len(txHashes) > 0 {
+		if err := stp.utxoStore.MarkTransactionsOnLongestChain(ctx, txHashes, false); err != nil {
 			return errors.NewProcessingError("[reorgBlocks] error marking transactions as not on longest chain in utxo store", err)
 		}
 	}
 
 	return nil
-}
-
-func (stp *SubtreeProcessor) checkMarkNotOnLongestChain(ctx context.Context, invalidBlock *model.Block, markNotOnLongestChain []chainhash.Hash) ([]chainhash.Hash, error) {
-	stp.logger.Infof("[reorgBlocks] block %s we moved back is invalid, checking whether to mark transactions as not on longest chain", invalidBlock.String())
-
-	checkMarkNotOnLongestChain := make([]chainhash.Hash, 0, len(markNotOnLongestChain))
-
-	_, lastBlockHeaderMetas, err := stp.blockchainClient.GetBlockHeaders(ctx, invalidBlock.Header.HashPrevBlock, 1000)
-	if err != nil {
-		return nil, errors.NewProcessingError("[reorgBlocks] error getting last block headers", err)
-	}
-
-	lastBlockHeaderIDs := make(map[uint32]bool)
-	for _, header := range lastBlockHeaderMetas {
-		lastBlockHeaderIDs[header.ID] = true
-	}
-
-	txMetas := make([]*meta.Data, len(markNotOnLongestChain))
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(stp.settings.UtxoStore.GetBatcherSize * 2)
-
-	// we need to check each transaction in the block we moved back and see if it is still on the longest chain or not
-	for idx, hash := range markNotOnLongestChain {
-		idx := idx
-		hashRef := &hash
-
-		g.Go(func() error {
-			txMeta, err := stp.utxoStore.Get(gCtx, hashRef, fields.BlockIDs)
-			if err != nil {
-				return errors.NewProcessingError("[reorgBlocks] error getting transaction from utxo store", err)
-			}
-
-			txMetas[idx] = txMeta
-
-			return nil
-		})
-	}
-
-	if err = g.Wait(); err != nil {
-		return nil, err
-	}
-
-	for idx, hash := range markNotOnLongestChain {
-		txMeta := txMetas[idx]
-		if txMeta == nil {
-			// transaction not found, not OK
-			return nil, errors.NewProcessingError("[reorgBlocks] error getting transaction %s from longest chain", hash.String(), err)
-		}
-
-		if len(txMeta.BlockIDs) == 1 && txMeta.BlockIDs[0] == invalidBlock.ID {
-			// the transaction is only in the invalid block, so it is definitely not on the longest chain
-			checkMarkNotOnLongestChain = append(checkMarkNotOnLongestChain, hash)
-		} else {
-			for _, blockID := range txMeta.BlockIDs {
-				if lastBlockHeaderIDs[blockID] {
-					// the transaction is still in one of the last 1000 blocks, so it is still on the longest chain
-					// do not mark it as not on the longest chain
-					continue
-				}
-			}
-
-			// check BlockIDs to see if the transaction is still on the longest chain
-			onLongestChain, err := stp.blockchainClient.CheckBlockIsInCurrentChain(ctx, txMeta.BlockIDs)
-			if err != nil {
-				return nil, errors.NewProcessingError("[reorgBlocks] error checking if transaction is on longest chain", err)
-			}
-
-			if !onLongestChain {
-				checkMarkNotOnLongestChain = append(checkMarkNotOnLongestChain, hash)
-			}
-		}
-	}
-
-	return checkMarkNotOnLongestChain, nil
 }
 
 // setTxCountFromSubtrees recalculates the total transaction count
@@ -2525,6 +3319,7 @@ func (stp *SubtreeProcessor) moveBackBlock(ctx context.Context, block *model.Blo
 	}
 
 	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "moveBackBlock",
+		tracing.WithAlwaysSample(),
 		tracing.WithCounter(prometheusSubtreeProcessorMoveBackBlock),
 		tracing.WithHistogram(prometheusSubtreeProcessorMoveBackBlockDuration),
 		tracing.WithLogMessage(stp.logger, "[moveBackBlock][%s] with %d subtrees", block.String(), len(block.Subtrees)),
@@ -2621,41 +3416,188 @@ func (stp *SubtreeProcessor) moveBackBlockCreateNewSubtrees(ctx context.Context,
 		// we create as few subtrees as possible when moving back, to avoid fragmentation and lots of small writes to disk
 		subtreeSize = 1024 * 1024
 	}
-	newSubtree, err := subtreepkg.NewTreeByLeafCount(subtreeSize)
+	if cs := stp.currentSubtree.Load(); cs != nil {
+		cs.Close()
+	}
+	newSubtree, err := stp.newSubtree(subtreeSize)
 	if err != nil {
 		return nil, nil, errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s] error creating new subtree", block.String(), err)
 	}
 	stp.currentSubtree.Store(newSubtree)
 
-	stp.chainedSubtrees = make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees)
-	stp.chainedSubtreeCount.Store(0)
+	stp.closeChainedSubtrees()
 
 	// add first coinbase placeholder transaction
 	_ = stp.currentSubtree.Load().AddCoinbaseNode()
 
 	// run through the nodes of the subtrees in order and add to the new subtrees
 	if len(subtreesNodes) > 0 {
-		for idx, subtreeNodes := range subtreesNodes {
-			subtreeHash := block.Subtrees[idx]
-
-			if idx == 0 {
-				// skip the first transaction of the first subtree (coinbase)
-				for i := 1; i < len(subtreeNodes); i++ {
-					if err = stp.addNode(subtreeNodes[i], &subtreeMetaTxInpoints[idx][i], true); err != nil {
-						return nil, nil, errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s][%s] error adding node to subtree", block.String(), subtreeHash.String(), err)
-					}
-				}
-			} else {
-				for i, node := range subtreeNodes {
-					if err = stp.addNode(node, &subtreeMetaTxInpoints[idx][i], true); err != nil {
-						return nil, nil, errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s][%s] error adding node to subtree", block.String(), subtreeHash.String(), err)
-					}
-				}
-			}
+		if err = stp.addMoveBackBlockNodesToSubtrees(block, subtreesNodes, subtreeMetaTxInpoints); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	return subtreesNodes, conflictingHashes, nil
+}
+
+// addMoveBackBlockNodesToSubtrees inserts every tx from a moved-back block
+// into the currentTxMap and rebuilds the subtree chain. For large blocks the
+// map inserts are parallelised in chunks; the subtree fill remains
+// sequential because subtree ordering is canonical and AddSubtreeNode is not
+// safe for concurrent writes on a single currentSubtree.
+//
+// Splits work into two stages when the input is over
+// ParallelSetIfNotExistsThreshold:
+//
+//	Stage A — parallel chunked SetIfNotExists into currentTxMap; wasInserted
+//	tracked per-node.
+//	Stage B — serial walk in canonical order calling addNodePreValidated
+//	(which skips the map insert). Duplicate nodes (wasInserted == false) are
+//	skipped, matching the original addNode semantics.
+//
+// Falls back to the original serial path for small blocks or when the
+// configured currentTxMap is not the in-memory SplitTxInpointsMap (DiskTxMap
+// path).
+func (stp *SubtreeProcessor) addMoveBackBlockNodesToSubtrees(block *model.Block,
+	subtreesNodes [][]subtreepkg.Node, subtreeMetaTxInpoints [][]subtreepkg.TxInpoints) error {
+	totalNodes := 0
+	for _, ss := range subtreesNodes {
+		totalNodes += len(ss)
+	}
+
+	threshold := stp.settings.BlockAssembly.ParallelSetIfNotExistsThreshold
+	_, splitMapPath := stp.currentTxMap.(*SplitTxInpointsMap)
+
+	if !splitMapPath || totalNodes < threshold {
+		// Serial path: matches the historical behaviour exactly.
+		for idx, subtreeNodes := range subtreesNodes {
+			subtreeHash := block.Subtrees[idx]
+
+			startI := 0
+			if idx == 0 {
+				// skip the first transaction of the first subtree (coinbase)
+				startI = 1
+			}
+
+			for i := startI; i < len(subtreeNodes); i++ {
+				if err := stp.addNode(subtreeNodes[i], &subtreeMetaTxInpoints[idx][i], true); err != nil {
+					return errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s][%s] error adding node to subtree", block.String(), subtreeHash.String(), err)
+				}
+			}
+		}
+
+		return nil
+	}
+
+	// Stage A — parallel chunked map insert.
+	// One []bool per outer subtree avoids per-node allocations during fill.
+	wasInserted := make([][]bool, len(subtreesNodes))
+	for i := range subtreesNodes {
+		wasInserted[i] = make([]bool, len(subtreesNodes[i]))
+	}
+
+	concurrencyLimit := stp.settings.BlockAssembly.ProcessRemainderTxHashesConcurrency
+	if concurrencyLimit <= 0 {
+		concurrencyLimit = runtime.NumCPU()
+	}
+
+	numWorkers := min(runtime.NumCPU(), concurrencyLimit)
+	if numWorkers > totalNodes {
+		numWorkers = totalNodes
+	}
+
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	chunkSize := (totalNodes + numWorkers - 1) / numWorkers
+
+	g, _ := errgroup.WithContext(context.Background())
+
+	for w := 0; w < numWorkers; w++ {
+		flatStart := w * chunkSize
+
+		flatEnd := flatStart + chunkSize
+		if flatEnd > totalNodes {
+			flatEnd = totalNodes
+		}
+
+		if flatStart >= flatEnd {
+			continue
+		}
+
+		g.Go(func() error {
+			sIdx, i := flatIndexToSubtreeNode(subtreesNodes, flatStart)
+
+			for flatIdx := flatStart; flatIdx < flatEnd; flatIdx++ {
+				// Skip the coinbase placeholder at (0, 0).
+				if !(sIdx == 0 && i == 0) {
+					// Pointer aliases the input slice element (no per-node
+					// allocation); subtreeMetaTxInpoints outlives the map
+					// because Stage B retains both via closure.
+					_, wasSet := stp.currentTxMap.SetIfNotExists(subtreesNodes[sIdx][i].Hash, &subtreeMetaTxInpoints[sIdx][i])
+					wasInserted[sIdx][i] = wasSet
+				}
+
+				// Advance to the next entry, skipping any zero-length subtree
+				// slices in between. A single if-step would panic on the very
+				// next iteration if subtreesNodes[sIdx+1] (or any subsequent
+				// slice up to flatEnd) were empty.
+				i++
+				for sIdx < len(subtreesNodes) && i >= len(subtreesNodes[sIdx]) {
+					sIdx++
+					i = 0
+				}
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// Stage B — serial subtree fill in canonical order.
+	for idx, subtreeNodes := range subtreesNodes {
+		subtreeHash := block.Subtrees[idx]
+
+		startI := 0
+		if idx == 0 {
+			startI = 1
+		}
+
+		for i := startI; i < len(subtreeNodes); i++ {
+			if !wasInserted[idx][i] {
+				// duplicate transaction ignored (matches addNode's wasSet==false branch)
+				continue
+			}
+
+			if err := stp.addNodePreValidated(subtreeNodes[i], true); err != nil {
+				return errors.NewProcessingError("[moveBackBlock:CreateNewSubtrees][%s][%s] error adding node to subtree", block.String(), subtreeHash.String(), err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// flatIndexToSubtreeNode translates a flat node index across all subtreesNodes
+// into (sIdx, i). Used by parallel workers to locate their starting position.
+// Linear in len(subtreesNodes), which is bounded (~1024 at scale-2).
+func flatIndexToSubtreeNode(subtreesNodes [][]subtreepkg.Node, flat int) (sIdx int, i int) {
+	remaining := flat
+
+	for s, nodes := range subtreesNodes {
+		if remaining < len(nodes) {
+			return s, remaining
+		}
+
+		remaining -= len(nodes)
+	}
+
+	// flat == totalNodes: position just past the end.
+	return len(subtreesNodes), 0
 }
 
 // removeCoinbaseUtxos removes the coinbase UTXO and its child spends from the UTXO store.
@@ -2763,6 +3705,10 @@ func (stp *SubtreeProcessor) moveBackBlockGetSubtrees(ctx context.Context, block
 					return errors.NewServiceError("[moveBackBlock:GetSubtrees][%s] error getting subtree meta %s", block.String(), subtreeHash.String(), err)
 				}
 
+				defer func() {
+					_ = subtreeMetaReader.Close()
+				}()
+
 				subtreeMeta, err := subtreepkg.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
 				if err != nil {
 					return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] error deserializing subtree meta", block.String(), err)
@@ -2845,13 +3791,60 @@ func (stp *SubtreeProcessor) createTransactionMapIfNeeded(ctx context.Context, b
 	return transactionMap, conflictingNodes, nil
 }
 
-// processConflictingTransactions handles conflicting transactions and returns losing transaction hashes
+// processConflictingTransactions handles conflicting transactions and returns
+// losing transaction hashes plus the transient conflicting-hash set populated
+// from the BFS cascade. Callers feed the set into the immediately-following
+// dequeueDuringBlockMovement so any queue-resident children of cascaded
+// parents are rejected before the default-case dequeue picks them up. The
+// set is scoped to this single block-movement event and not persisted on the
+// processor.
 func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context, block *model.Block,
-	conflictingNodes []chainhash.Hash, processedConflictingHashesMap map[chainhash.Hash]bool) (txmap.TxMap, error) {
-	var losingTxHashesMap txmap.TxMap
+	conflictingNodes []chainhash.Hash, processedConflictingHashesMap map[chainhash.Hash]bool) (txmap.TxMap, map[chainhash.Hash]struct{}, error) {
+	var (
+		losingTxHashesMap txmap.TxMap
+		conflictingSet    map[chainhash.Hash]struct{}
+	)
 
 	// process conflicting txs
 	if len(conflictingNodes) > 0 {
+		// Skip hashes already handled by a moveBack pass that ran
+		// ReverseProcessConflicting earlier in this reorg. Their UTXO swap
+		// is already in the desired direction; re-running ProcessConflicting
+		// on them would double-spend the parent UTXOs and fail.
+		filteredConflictingNodes := conflictingNodes[:0:0]
+		for _, h := range conflictingNodes {
+			if !processedConflictingHashesMap[h] {
+				filteredConflictingNodes = append(filteredConflictingNodes, h)
+			}
+		}
+
+		if len(filteredConflictingNodes) == 0 {
+			// All conflicting nodes were already handled by moveBack's
+			// ReverseProcessConflicting. Returning empty conflictingSet +
+			// losingTxHashesMap here would leave reverse-cascaded losers in
+			// the in-memory chainedSubtrees — the rebuild in
+			// processRemainderTxHashes filters chainedSubtrees by
+			// losingTxHashesMap, and dequeueDuringBlockMovement filters
+			// queue items by conflictingHashes. Surface the reverse-
+			// cascade set in both so the next mining candidate excludes
+			// these losers.
+			cascade := stp.cloneReverseCascadedSet()
+
+			conflictingSet = cascade
+
+			if len(cascade) > 0 {
+				losingTxHashesMap = txmap.NewSplitSwissMap(len(cascade))
+				for h := range cascade {
+					_ = losingTxHashesMap.Put(h, 1)
+				}
+			}
+
+			stp.logger.Debugf("[moveForwardBlock][%s] skipping ProcessConflicting — all %d conflicting nodes already handled by earlier moveBack reverse; surfacing %d reverse-cascade conflicting hashes for in-memory eviction", block.String(), len(conflictingNodes), len(cascade))
+			return losingTxHashesMap, conflictingSet, nil
+		}
+
+		conflictingNodes = filteredConflictingNodes
+
 		ctx, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "processConflictingTransactions",
 			tracing.WithParentStat(stp.stats),
 			tracing.WithLogMessage(stp.logger, "[moveForwardBlock][%s] processing %d conflicting transactions", block.String(), len(conflictingNodes)),
@@ -2864,38 +3857,82 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 		// we can then process the conflicting transactions
 		_, err := stp.waitForBlockBeingMined(ctx, block.Header.Hash())
 		if err != nil {
-			return nil, errors.NewProcessingError("[moveForwardBlock][%s] error waiting for block to be mined", block.String(), err)
+			return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error waiting for block to be mined", block.String(), err)
 		}
 
 		if block.Height == 0 {
 			// get the block height from the blockchain client
 			_, blockHeaderMeta, err := stp.blockchainClient.GetBlockHeader(ctx, block.Header.Hash())
 			if err != nil {
-				return nil, errors.NewProcessingError("[moveForwardBlock][%s] error getting block header for genesis block", block.String(), err)
+				return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error getting block header for genesis block", block.String(), err)
 			}
 
 			block.Height = blockHeaderMeta.Height
 		}
 
-		if losingTxHashesMap, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, conflictingNodes, processedConflictingHashesMap); err != nil {
-			return nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing conflicting transactions", block.String(), err)
+		var allMarkedConflicting []chainhash.Hash
+		if losingTxHashesMap, allMarkedConflicting, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, conflictingNodes, processedConflictingHashesMap); err != nil {
+			return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing conflicting transactions", block.String(), err)
+		}
+
+		if len(allMarkedConflicting) > 0 {
+			conflictingSet = make(map[chainhash.Hash]struct{}, len(allMarkedConflicting))
+			for _, h := range allMarkedConflicting {
+				conflictingSet[h] = struct{}{}
+			}
 		}
 
 		if losingTxHashesMap.Length() > 0 {
 			// mark all the losing txs in the subtrees in the blocks they were mined into as conflicting
 			if err = stp.markConflictingTxsInSubtrees(ctx, losingTxHashesMap); err != nil {
-				return nil, errors.NewProcessingError("[moveForwardBlock][%s] error marking conflicting transactions", block.String(), err)
+				return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error marking conflicting transactions", block.String(), err)
 			}
 		}
 	}
 
-	return losingTxHashesMap, nil
+	return losingTxHashesMap, conflictingSet, nil
 }
 
-// resetSubtreeState resets the current subtree state and returns the old state
+// resetSubtreeState resets the current subtree state and returns the old state.
+//
+// For the in-memory currentTxMap path, we swap the active map with a
+// pre-allocated shadow rather than allocating a fresh one. The newly-active
+// (freshly-current) map is empty because moveForwardBlock's commit path
+// Clear()ed it after the previous block was processed (or it was empty since
+// constructor time). The just-deactivated map (now in currentTxMapShadow)
+// still holds the previous block's contents, which is exactly what callers
+// who captured a pointer before reset need to read from. The shadow is
+// Clear()ed at moveForwardBlock commit, after readers are guaranteed to have
+// finished — see swapCurrentTxMapBack for the rollback inverse.
 func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool) (err error) {
-	// Save current state
-	stp.currentTxMap = NewSplitTxInpointsMap(splitMapBuckets)
+	// Track whether the in-memory pool swap has already been performed in this
+	// call. If a later step fails (notably stp.newSubtree below) we must roll
+	// the swap back here, atomically, because moveForwardBlock's own rollback
+	// defer is not yet registered when this function returns — and would not
+	// fire on an error path that exits before that registration.
+	var swappedHere bool
+
+	defer func() {
+		if err != nil && swappedHere {
+			stp.swapCurrentTxMapBack()
+		}
+	}()
+
+	if stp.diskTxMap != nil {
+		reportDiskMapStats(stp.diskTxMap.Stats())
+		stp.diskTxMap.Clear()
+		clearDiskMapStats()
+		// DiskTxMap.Clear() recreates internal state but keeps the same object.
+		// This is safe because DiskTxMap is only assigned once in the constructor.
+	} else if stp.disableCurrentTxMapPool {
+		// Multi-block reorg in progress: fall back to fresh allocation so the
+		// pre-loop captured pointer in reorgBlocks continues to reference the
+		// unchanged original data, preserving the existing rollback contract.
+		stp.currentTxMap = NewSplitTxInpointsMap(stp.splitMapBuckets)
+	} else {
+		stp.currentTxMap, stp.currentTxMapShadow = stp.currentTxMapShadow, stp.currentTxMap.(*SplitTxInpointsMap)
+		swappedHere = true
+	}
 
 	subtreeSize := int(stp.currentItemsPerFile.Load())
 	if !createProperlySizedSubtrees {
@@ -2905,14 +3942,16 @@ func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool)
 		subtreeSize = 1024 * 1024
 	}
 
-	newSubtree, err := subtreepkg.NewTreeByLeafCount(subtreeSize)
+	if cs := stp.currentSubtree.Load(); cs != nil {
+		cs.Close()
+	}
+	newSubtree, err := stp.newSubtree(subtreeSize)
 	if err != nil {
 		return err
 	}
 	stp.currentSubtree.Store(newSubtree)
 
-	stp.chainedSubtrees = make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees)
-	stp.chainedSubtreeCount.Store(0)
+	stp.closeChainedSubtrees()
 
 	// Add first coinbase placeholder transaction
 	_ = stp.currentSubtree.Load().AddCoinbaseNode()
@@ -2923,9 +3962,16 @@ func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool)
 // processRemainderTransactionsAndDequeue processes remaining transactions from the block
 func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.Context, params *RemainderTransactionParams) error {
 	if params.TransactionMap != nil && params.TransactionMap.Length() > 0 {
+		txCount := stp.TxCount()
+		mapLen := uint64(params.TransactionMap.Length())
+		var remainderCount uint64
+		if txCount > mapLen {
+			remainderCount = txCount - mapLen
+		}
+
 		_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "processRemainderTransactionsAndDequeue",
 			tracing.WithParentStat(stp.stats),
-			tracing.WithLogMessage(stp.logger, "[moveForwardBlock][%s] processing %d remainder tx hashes into subtrees", params.Block.String(), stp.TxCount()-uint64(params.TransactionMap.Length())),
+			tracing.WithLogMessage(stp.logger, "[moveForwardBlock][%s] processing %d remainder tx hashes into subtrees", params.Block.String(), remainderCount),
 		)
 
 		defer deferFn()
@@ -2951,7 +3997,7 @@ func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.
 		stp.logger.Debugf("[moveForwardBlock][%s] processing queue while moveForwardBlock: %d", params.Block.String(), stp.queue.length())
 
 		if !params.SkipDequeue {
-			if err := stp.dequeueDuringBlockMovement(params.TransactionMap, params.LosingTxHashesMap, params.SkipNotification); err != nil {
+			if err := stp.dequeueDuringBlockMovement(params.TransactionMap, params.LosingTxHashesMap, params.ConflictingHashes, params.SkipNotification); err != nil {
 				return errors.NewProcessingError("[moveForwardBlock][%s] error moving up block deQueue", params.Block.String(), err)
 			}
 		}
@@ -3058,7 +4104,7 @@ func (stp *SubtreeProcessor) finalizeBlockProcessing(ctx context.Context, block 
 	stp.setTxCountFromSubtrees()
 
 	// set the current block header
-	stp.currentBlockHeader = block.Header
+	stp.currentBlockHeader.Store(block.Header)
 
 	// When starting a new block, calculate the average interval per subtree
 	// from the previous block and adjust the subtree size
@@ -3082,17 +4128,21 @@ func (stp *SubtreeProcessor) finalizeBlockProcessing(ctx context.Context, block 
 		// Don't return error here, as this is not critical for the operation
 		stp.logger.Warnf("[moveForwardBlock][%s] error setting block processed_at timestamp: %v", block.String(), err)
 	}
+
+	// Update pre-computed mining data after block finalization
+	stp.updatePrecomputedMiningData()
 }
 
 // moveForwardBlock cleans out all transactions that are in the current subtrees and also in the block
 // given. It is akin to moving up the blockchain to the next block.
 func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.Block, skipNotification bool,
-	processedConflictingHashesMap map[chainhash.Hash]bool, skipDequeue bool, createProperlySizedSubtrees bool) (transactionMap *SplitSwissMap, err error) {
+	processedConflictingHashesMap map[chainhash.Hash]bool, skipDequeue bool, createProperlySizedSubtrees bool) (transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, err error) {
 	if block == nil {
-		return nil, errors.NewProcessingError("[moveForwardBlock] you must pass in a block to moveForwardBlock")
+		return nil, nil, errors.NewProcessingError("[moveForwardBlock] you must pass in a block to moveForwardBlock")
 	}
 
 	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "moveForwardBlock",
+		tracing.WithAlwaysSample(),
 		tracing.WithParentStat(stp.stats),
 		tracing.WithCounter(prometheusSubtreeProcessorMoveForwardBlock),
 		tracing.WithHistogram(prometheusSubtreeProcessorMoveForwardBlockDuration),
@@ -3103,8 +4153,9 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		deferFn()
 	}()
 
-	if !block.Header.HashPrevBlock.IsEqual(stp.currentBlockHeader.Hash()) {
-		return nil, errors.NewProcessingError("the block passed in does not match the current block header: [%s] - [%s]", block.Header.StringDump(), stp.currentBlockHeader.StringDump())
+	currentBlockHeader := stp.currentBlockHeader.Load()
+	if !block.Header.HashPrevBlock.IsEqual(currentBlockHeader.Hash()) {
+		return nil, nil, errors.NewProcessingError("the block passed in does not match the current block header: [%s] - [%s]", block.Header.StringDump(), currentBlockHeader.StringDump())
 	}
 
 	if len(block.Subtrees) == 0 {
@@ -3113,10 +4164,10 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 
 		// create the coinbase after processing all other transaction operations
 		if err = stp.processCoinbaseUtxos(ctx, block); err != nil {
-			return nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
+			return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
 		}
 
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	stp.logger.Debugf("[moveForwardBlock][%s] resetting subtrees: %v", block.String(), block.Subtrees)
@@ -3129,22 +4180,35 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	// Create transaction map from remaining block subtrees
 	transactionMap, conflictingNodes, err = stp.createTransactionMapIfNeeded(ctx, block, blockSubtreesMap)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Process conflicting transactions
-	losingTxHashesMap, err := stp.processConflictingTransactions(ctx, block, conflictingNodes, processedConflictingHashesMap)
+	var conflictingHashes map[chainhash.Hash]struct{}
+	losingTxHashesMap, conflictingHashes, err = stp.processConflictingTransactions(ctx, block, conflictingNodes, processedConflictingHashesMap)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	originalCurrentSubtree := stp.currentSubtree.Load()
 	originalCurrentTxMap := stp.currentTxMap
 
-	// Reset subtree state
+	// Reset subtree state. After this, stp.currentTxMap is the freshly-empty
+	// shadow and the previous content is in stp.currentTxMapShadow (== the
+	// originalCurrentTxMap captured just above). If any subsequent step
+	// fails, we must swap them back so callers see the pre-reset state and
+	// the double-buffer invariant (current=active, shadow=empty) is restored.
 	if err = stp.resetSubtreeState(createProperlySizedSubtrees); err != nil {
-		return nil, errors.NewProcessingError("[moveForwardBlock][%s] error resetting subtree state", block.String(), err)
+		return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error resetting subtree state", block.String(), err)
 	}
+
+	// From this point the double-buffer swap has happened. Any error return
+	// before commit must swap back so the caller sees pre-reset state.
+	defer func() {
+		if err != nil {
+			stp.swapCurrentTxMapBack()
+		}
+	}()
 
 	// Process remainder transactions and dequeueDuringBlockMovement
 	err = stp.processRemainderTransactionsAndDequeue(ctx, &RemainderTransactionParams{
@@ -3153,18 +4217,25 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		CurrentSubtree:    originalCurrentSubtree,
 		TransactionMap:    transactionMap,
 		LosingTxHashesMap: losingTxHashesMap,
+		ConflictingHashes: conflictingHashes,
 		CurrentTxMap:      originalCurrentTxMap,
 		SkipDequeue:       skipDequeue,
 		SkipNotification:  skipNotification,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// create the coinbase after processing all other transaction operations
 	if err = stp.processCoinbaseUtxos(ctx, block); err != nil {
-		return nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
+		return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
 	}
+
+	// Commit point of moveForwardBlock: any captured pointer to the old
+	// currentTxMap (now in currentTxMapShadow) is guaranteed unused. Empty
+	// the shadow in place so the next resetSubtreeState swap exposes a
+	// clean slate.
+	stp.clearCurrentTxMapShadow()
 
 	// Log memory stats after block processing if debug logging is enabled
 	if stp.logger.LogLevel() <= 0 { // 0 is DEBUG level
@@ -3184,7 +4255,42 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		}
 	}
 
-	return transactionMap, nil
+	return transactionMap, losingTxHashesMap, nil
+}
+
+// swapCurrentTxMapBack restores currentTxMap to the value it held before
+// resetSubtreeState was called (used on rollback paths). Only meaningful for
+// the pooled in-memory path; no-op when DiskTxMap is in use or when the pool
+// is disabled (multi-block reorg).
+//
+// IMPORTANT: the freshly-current map may have been partially populated by a
+// failed moveForwardBlock attempt before the error was returned. If we simply
+// swapped pointers, that partial data would survive as the shadow and re-
+// emerge as "current" on the next reset — violating the
+// "freshly-current map is always empty" invariant and silently dropping
+// any tx whose hash happens to collide with a leftover entry (SetIfNotExists
+// would report wasSet=false). Clear the partial-data map before the swap so
+// the shadow ends up empty for the next cycle. Clearing on the error path
+// adds work, but errors are rare and the alternative is corrupt state.
+func (stp *SubtreeProcessor) swapCurrentTxMapBack() {
+	if stp.diskTxMap != nil || stp.disableCurrentTxMapPool {
+		return
+	}
+
+	stp.currentTxMap.(*SplitTxInpointsMap).Clear()
+
+	stp.currentTxMap, stp.currentTxMapShadow = stp.currentTxMapShadow, stp.currentTxMap.(*SplitTxInpointsMap)
+}
+
+// clearCurrentTxMapShadow empties the inactive half of the double-buffered
+// currentTxMap, leaving it ready to become "current" on the next reset.
+// No-op when DiskTxMap is in use or when the pool is disabled.
+func (stp *SubtreeProcessor) clearCurrentTxMapShadow() {
+	if stp.diskTxMap != nil || stp.disableCurrentTxMapPool {
+		return
+	}
+
+	stp.currentTxMapShadow.Clear()
 }
 
 func (stp *SubtreeProcessor) waitForBlockBeingMined(ctx context.Context, blockHash *chainhash.Hash) (bool, error) {
@@ -3218,10 +4324,10 @@ func (stp *SubtreeProcessor) waitForBlockBeingMined(ctx context.Context, blockHa
 
 // WaitForPendingBlocks waits for any pending blocks to be processed before loading unmined transactions.
 // This method continuously polls the blockchain client to check if there are any blocks that have not been
-// marked as mined yet. It will wait until the list of blocks returned by GetBlocksMinedNotSet is empty,
-// indicating that all blocks have been processed and marked as mined.
+// marked as mined yet. It will wait until GetBlocksMinedNotSet returns an empty list, indicating that all
+// blocks have been processed and marked as mined.
 //
-// The method implements a polling loop with a 1-second interval and includes logging to provide visibility
+// The method implements a polling loop with exponential backoff and includes logging to provide visibility
 // into the waiting process. This ensures that the BlockAssembly service doesn't start loading unmined
 // transactions until all pending blocks have been fully processed.
 //
@@ -3267,22 +4373,82 @@ func (stp *SubtreeProcessor) WaitForPendingBlocks(ctx context.Context) error {
 	return err
 }
 
+// DrainQueue is the public entry point for BlockAssembler to flush in-flight
+// children of conflicting parents from the input queue before the event-loop
+// goroutine starts (BA.Start path) or before the existing post-postProcess
+// drain runs (Reset path's postProcess closure).
+//
+// Internally calls dequeueDuringBlockMovement with the supplied transient
+// drop set as the filter. Non-conflicting txs in the queue are added to the
+// current subtree as part of the same drain — same routing as default-case
+// dequeue would have used. skipNotification=true so this is safe to invoke
+// before subtree-announcement listeners are wired up.
+func (stp *SubtreeProcessor) DrainQueue(dropHashes map[chainhash.Hash]struct{}) {
+	if len(dropHashes) == 0 {
+		return
+	}
+	if err := stp.dequeueDuringBlockMovement(nil, nil, dropHashes, true); err != nil {
+		stp.logger.Errorf("[SubtreeProcessor][DrainQueue] error: %v", err)
+	}
+}
+
 // dequeueDuringBlockMovement processes the transaction queue during block movement.
 //
 // Parameters:
 //   - transactionMap: Map of transactions that were in the block and need to be removed
 //   - losingTxHashesMap: Map of transactions that were conflicting and need to be removed
+//   - conflictingHashes: transient set of every tx hash flagged Conflicting=true
+//     by the cascade that triggered this drain (immediate losers + every
+//     descendant returned by MarkConflictingRecursively). May be nil/empty.
+//     A queued tx is rejected if its own hash is in the set OR any hash in
+//     its TxInpoints.ParentTxHashes is in the set; on rejection by parent
+//     match the tx's own hash is added to the set so any later-in-batch
+//     descendants are also caught. The set is scoped to this single drain
+//     and discarded by the caller.
 //   - skipNotification: Whether to skip notification of new subtrees
 //
 // Returns:
 //   - error: Any error encountered during processing
-func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, skipNotification bool) (err error) {
+func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, conflictingHashes map[chainhash.Hash]struct{}, skipNotification bool) (err error) {
+	// Bound the drain by two complementary cutoffs:
+	//
+	//  1. Time: validFromMillis = clock.Now() at function entry (or
+	//     clock.Now() - DoubleSpendWindow when that filter is enabled).
+	//     The queue filter at queue.go:96 holds back any batch whose
+	//     enqueue timestamp is >= this value, so we only drain batches
+	//     that existed before this moment. Batches arriving during the
+	//     drain stay queued and roll forward to the next state-transition
+	//     cycle. By design AddTxBatchColumnar (the gRPC ingest path) does
+	//     not backpressure, so this time cap is what stops the loop from
+	//     chasing ingest.
+	//
+	//  2. Items: queueLength snapshotted at entry, compared against items
+	//     drained. Belt-and-braces — if clock granularity ever caused the
+	//     time filter to admit slightly more than expected, this caps
+	//     total work at the snapshot.
+	//
+	// Previous form left validFromMillis=0 when DoubleSpendWindow=0,
+	// which disables the queue filter entirely (queue.go:96 short-circuits
+	// on `validFromMillis > 0`). And the items-bound compared
+	// `nrBatchesProcessed` to `queueLength`, but queue.length() returns
+	// total *items* (queue.go:71 / 75 add len(nodes)), not batches. With
+	// ~1k items/batch and ingest at line-rate, neither bound fired — the
+	// scaling-2 pod sat for 35+ minutes at 558 GB RSS inside this loop.
 	queueLength := stp.queue.length()
 	if queueLength > 0 {
-		nrBatchesProcessed := int64(0)
-		validFromMillis := time.Now().Add(-1 * stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
+		itemsProcessed := int64(0)
+		// Take a single clock sample so both the zero-window and
+		// non-zero-window branches anchor on the same moment — the
+		// "function entry" semantic the docstring describes. Calling
+		// stp.clock.Now() twice would let the second call admit batches
+		// enqueued in the gap between the two samples.
+		now := stp.clock.Now()
+		validFromMillis := now.UnixMilli()
+		if stp.settings.BlockAssembly.DoubleSpendWindow > 0 {
+			validFromMillis = now.Add(-stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
+		}
 
-		for {
+		for itemsProcessed < queueLength {
 			batch, found := stp.queue.dequeueBatch(validFromMillis)
 			if !found {
 				break
@@ -3292,17 +4458,37 @@ func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwi
 			for i, node := range batch.nodes {
 				txInpoints := batch.txInpoints[i]
 
-				if (transactionMap == nil || !transactionMap.Exists(node.Hash)) && (losingTxHashesMap == nil || !losingTxHashesMap.Exists(node.Hash)) {
-					_ = stp.addNode(node, txInpoints, skipNotification)
+				if transactionMap != nil && transactionMap.Exists(node.Hash) {
+					continue
 				}
+				if losingTxHashesMap != nil && losingTxHashesMap.Exists(node.Hash) {
+					continue
+				}
+
+				if len(conflictingHashes) > 0 {
+					if _, ok := conflictingHashes[node.Hash]; ok {
+						continue
+					}
+					if txInpoints != nil {
+						matched := false
+						for _, parent := range txInpoints.ParentTxHashes {
+							if _, ok := conflictingHashes[parent]; ok {
+								matched = true
+								break
+							}
+						}
+						if matched {
+							conflictingHashes[node.Hash] = struct{}{}
+							continue
+						}
+					}
+				}
+
+				_ = stp.addNode(node, txInpoints, skipNotification)
 			}
 
+			itemsProcessed += int64(len(batch.nodes))
 			prometheusSubtreeProcessorDequeuedTxs.Add(float64(len(batch.nodes)))
-
-			nrBatchesProcessed++
-			if nrBatchesProcessed > queueLength {
-				break
-			}
 		}
 	}
 
@@ -3323,8 +4509,7 @@ func (stp *SubtreeProcessor) processCoinbaseUtxos(ctx context.Context, block *mo
 	prometheusSubtreeProcessorProcessCoinbaseTx.Inc()
 
 	if block == nil || block.CoinbaseTx == nil {
-		log.Printf("********************************************* block or coinbase is nil")
-		return nil
+		return errors.NewProcessingError("[SubtreeProcessor][coinbase] block or coinbase transaction is nil")
 	}
 
 	utxos, err := utxostore.GetUtxoHashes(block.CoinbaseTx)
@@ -3435,12 +4620,23 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 				return nil
 			}
 
-			// Pre-allocate result arrays indexed by position
-			existedInTxMap := make([]bool, n)    // true if SetIfExists found the key
-			existsInLosingMap := make([]bool, n) // true if in losingTxHashesMap
-			isRemoveMap := make([]bool, n)       // true if in removeMap (to delete)
+			// Pack 3 boolean flags per element into a single byte array:
+			// bit 0 = existedInTxMap, bit 1 = existsInLosingMap, bit 2 = isRemoveMap
+			// Saves ~66% memory vs three separate []bool arrays
+			const (
+				flagExistedInTxMap    = 1 << 0
+				flagExistsInLosingMap = 1 << 1
+				flagIsRemoveMap       = 1 << 2
+			)
+			nodeFlags := make([]byte, n)
 
-			numWorkers := min(runtime.NumCPU(), n/100, 16)
+			// Phase 1 of processRemainderTxHashes scales linearly with input
+			// size; the previous literal 16-worker cap left ~170-core pods
+			// massively idle on 30M-tx remainders. Cap only at NumCPU so the
+			// kernel scheduler can make the call, with a floor of 2 workers and
+			// a minimum chunk of 1024 nodes per worker to keep coordination
+			// overhead down on small inputs.
+			numWorkers := min(runtime.NumCPU(), n/1024)
 			if numWorkers < 2 {
 				numWorkers = 2
 			}
@@ -3466,16 +4662,16 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 						}
 
 						if removeMapLength > 0 && stp.removeMap.Exists(node.Hash) {
-							isRemoveMap[i] = true
+							nodeFlags[i] = flagIsRemoveMap
 							continue
 						}
 
 						// SetIfExists: atomic check + set (1 lock instead of 2)
 						existed := transactionMap.Exists(node.Hash)
-						existedInTxMap[i] = existed
-
-						if !existed && losingTxHashesMap != nil {
-							existsInLosingMap[i] = losingTxHashesMap.Exists(node.Hash)
+						if existed {
+							nodeFlags[i] = flagExistedInTxMap
+						} else if losingTxHashesMap != nil && losingTxHashesMap.Exists(node.Hash) {
+							nodeFlags[i] = flagExistsInLosingMap
 						}
 					}
 				}(start, end)
@@ -3489,12 +4685,13 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 					continue
 				}
 
-				if isRemoveMap[i] {
+				f := nodeFlags[i]
+				if f&flagIsRemoveMap != 0 {
 					_ = stp.removeMap.Delete(node.Hash)
 					continue
 				}
 
-				if !existedInTxMap[i] && !existsInLosingMap[i] {
+				if f&(flagExistedInTxMap|flagExistsInLosingMap) == 0 {
 					remainderSubtrees[idx] = append(remainderSubtrees[idx], node)
 				}
 			}
@@ -3578,6 +4775,142 @@ func (stp *SubtreeProcessor) parallelGetAndSetIfNotExists(
 		return nil
 	}
 
+	// Fast path: write target is the in-memory SplitTxInpointsMap. Use
+	// bucket-affinity sharding so every destination bucket is touched by at
+	// most one worker, eliminating cross-worker mutex contention on the
+	// underlying per-bucket SyncedMap. Profiling showed that contention
+	// previously cost ~17 % of every SetIfNotExists call.
+	if splitMap, ok := stp.currentTxMap.(*SplitTxInpointsMap); ok {
+		return stp.bucketShardedGetAndSetIfNotExists(splitMap, nodes, currentTxMap, removeMapLength, concurrencyLimit, wasInserted)
+	}
+
+	// Fallback (e.g. DiskTxMap path): original per-node parallel scheme.
+	return stp.legacyParallelGetAndSetIfNotExists(nodes, currentTxMap, removeMapLength, concurrencyLimit, wasInserted)
+}
+
+// bucketShardedGetAndSetIfNotExists partitions nodes by destination bucket and
+// dispatches one worker per non-empty bucket (subject to concurrencyLimit).
+// Because each bucket has exactly one writer, the per-bucket RWMutex in the
+// underlying SyncedMap is never contended across workers.
+func (stp *SubtreeProcessor) bucketShardedGetAndSetIfNotExists(
+	splitMap *SplitTxInpointsMap,
+	nodes []subtreepkg.Node,
+	currentTxMap TxInpointsMap,
+	removeMapLength int,
+	concurrencyLimit int,
+	wasInserted []bool,
+) error {
+	nrOfBuckets := splitMap.Buckets()
+
+	// Phase 1 (sequential pre-filter): handle coinbase placeholder + removeMap
+	// skips in a single pass. Cheap relative to the rest of the work.
+	keep := make([]bool, len(nodes))
+	bucket := make([]uint16, len(nodes))
+	kept := 0
+
+	for i := range nodes {
+		hash := nodes[i].Hash
+
+		if hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+			wasInserted[i] = false
+			continue
+		}
+
+		if removeMapLength > 0 && stp.removeMap.Exists(hash) {
+			if err := stp.removeMap.Delete(hash); err != nil {
+				stp.logger.Errorf("error removing tx from remove map: %s", err.Error())
+			}
+
+			wasInserted[i] = false
+
+			continue
+		}
+
+		keep[i] = true
+		bucket[i] = splitMap.BucketFor(hash)
+		kept++
+	}
+
+	if kept == 0 {
+		return nil
+	}
+
+	// Phase 2 (sequential bucket-partition): allocate per-bucket index slices
+	// and place each kept node's original index in its bucket. Counting first
+	// avoids slice growth during fill.
+	counts := make([]int, nrOfBuckets)
+	for i := range nodes {
+		if keep[i] {
+			counts[bucket[i]]++
+		}
+	}
+
+	perBucket := make([][]int, nrOfBuckets)
+	for b, c := range counts {
+		if c > 0 {
+			perBucket[b] = make([]int, 0, c)
+		}
+	}
+
+	for i := range nodes {
+		if keep[i] {
+			perBucket[bucket[i]] = append(perBucket[bucket[i]], i)
+		}
+	}
+
+	// Phase 3 (parallel per-bucket): each goroutine owns one bucket end-to-end:
+	// gather parents from the old map, bulk-insert into the new map. No two
+	// goroutines ever touch the same destination bucket.
+	g, _ := errgroup.WithContext(context.Background())
+	util.SafeSetLimit(g, concurrencyLimit)
+
+	for b := uint16(0); b < nrOfBuckets; b++ {
+		indices := perBucket[b]
+		if len(indices) == 0 {
+			continue
+		}
+
+		bucketIdx := b
+
+		g.Go(func() error {
+			keys := make([]chainhash.Hash, len(indices))
+			vals := make([]*subtreepkg.TxInpoints, len(indices))
+
+			for j, origIdx := range indices {
+				hash := nodes[origIdx].Hash
+
+				parents, found := currentTxMap.Get(hash)
+				if !found {
+					return errors.NewProcessingError("node %s not found in currentTxMap", hash.String())
+				}
+
+				keys[j] = hash
+				vals[j] = parents
+			}
+
+			results := splitMap.PutMultiBucketTxInpoints(bucketIdx, keys, vals)
+
+			for j, origIdx := range indices {
+				wasInserted[origIdx] = results[j]
+			}
+
+			return nil
+		})
+	}
+
+	return g.Wait()
+}
+
+// legacyParallelGetAndSetIfNotExists is the original per-node parallel scheme,
+// retained for the DiskTxMap path where bucket-affinity sharding is not
+// available.
+func (stp *SubtreeProcessor) legacyParallelGetAndSetIfNotExists(
+	nodes []subtreepkg.Node,
+	currentTxMap TxInpointsMap,
+	removeMapLength int,
+	concurrencyLimit int,
+	wasInserted []bool,
+) error {
 	batchSize := (len(nodes) + concurrencyLimit - 1) / concurrencyLimit
 	if batchSize < 1 {
 		batchSize = 1
@@ -3596,28 +4929,26 @@ func (stp *SubtreeProcessor) parallelGetAndSetIfNotExists(
 			for idx := start; idx < end; idx++ {
 				node := nodes[idx]
 
-				// Skip coinbase placeholder
 				if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
 					wasInserted[idx] = false
 					continue
 				}
 
-				// Check and remove from removeMap if present
 				if removeMapLength > 0 && stp.removeMap.Exists(node.Hash) {
 					if err := stp.removeMap.Delete(node.Hash); err != nil {
 						stp.logger.Errorf("error removing tx from remove map: %s", err.Error())
 					}
+
 					wasInserted[idx] = false
+
 					continue
 				}
 
-				// Get parents from old currentTxMap (thread-safe read with RLock)
 				nodeParents, found := currentTxMap.Get(node.Hash)
 				if !found {
 					return errors.NewProcessingError("node %s not found in currentTxMap", node.Hash.String())
 				}
 
-				// SetIfNotExists on new stp.currentTxMap (thread-safe write with Lock)
 				_, wasSet := stp.currentTxMap.SetIfNotExists(node.Hash, nodeParents)
 				wasInserted[idx] = wasSet
 
@@ -3625,6 +4956,7 @@ func (stp *SubtreeProcessor) parallelGetAndSetIfNotExists(
 					stp.logger.Debugf("duplicate transaction ignored: %s", node.Hash.String())
 				}
 			}
+
 			return nil
 		})
 	}
@@ -3673,8 +5005,33 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 		mapSize = len(blockSubtreesMap) * avgTxPerSubtree
 	}
 
-	stp.logger.Debugf("Allocating transaction map with size: %d", mapSize)
-	transactionMap := NewSplitSwissMap(1024, mapSize) // 4K buckets
+	// Reuse a pooled transactionMap across blocks to eliminate the per-block
+	// ~600M-entry allocation that dominated GC in profiling. The pool is owned
+	// by the single Start() goroutine, so no locking beyond what SplitSwissMap
+	// already provides. swiss.Map.Clear is in-place and retains capacity.
+	//
+	// Sizing policy: high-water mark. The pool is reallocated when a block
+	// requests more capacity than the pool was last sized for, otherwise the
+	// existing buckets are Clear()ed and reused in place. Reallocating on
+	// growth avoids swiss.Map's internal auto-rehash firing mid-fill — that
+	// would allocate inside the hot path and defeat most of the pooling win
+	// when the first observed block is smaller than later ones (e.g. node
+	// started during a low-traffic window).
+	switch {
+	case stp.txMapPool == nil:
+		stp.logger.Debugf("Allocating pooled transaction map with size: %d", mapSize)
+		stp.txMapPool = NewSplitSwissMap(1024, mapSize) // 1024 buckets
+		stp.txMapPoolCapacity = mapSize
+	case mapSize > stp.txMapPoolCapacity:
+		stp.logger.Debugf("Growing pooled transaction map from %d to %d", stp.txMapPoolCapacity, mapSize)
+		stp.txMapPool = NewSplitSwissMap(1024, mapSize)
+		stp.txMapPoolCapacity = mapSize
+	default:
+		stp.logger.Debugf("Reusing pooled transaction map (clearing prior contents, requested size: %d, pool capacity: %d)", mapSize, stp.txMapPoolCapacity)
+		stp.txMapPool.Clear()
+	}
+
+	transactionMap := stp.txMapPool
 
 	conflictingNodesPerSubtree := make([][]chainhash.Hash, totalSubtreesInBlock)
 
@@ -3826,11 +5183,13 @@ func (stp *SubtreeProcessor) markConflictingTxsInSubtrees(ctx context.Context, l
 						return errors.NewProcessingError("error serializing subtree %s", subtreeHash.String(), err)
 					}
 
+					dah := stp.utxoStore.GetBlockHeight() + stp.settings.GlobalBlockHeightRetention
 					if err = stp.subtreeStore.Set(gCtx,
 						subtreeHash[:],
 						fileformat.FileTypeSubtree,
 						subtreeBytes,
 						options.WithAllowOverwrite(true),
+						options.WithDeleteAt(dah),
 					); err != nil {
 						return errors.NewServiceError("error saving subtree %s", subtreeHash.String(), err)
 					}
@@ -3856,6 +5215,10 @@ func (stp *SubtreeProcessor) getSubtreeAndConflictingTransactionsMap(ctx context
 			return nil, nil, errors.NewServiceError("error getting subtree %s", subtreeHash.String())
 		}
 	}
+
+	defer func() {
+		_ = subtreeReader.Close()
+	}()
 
 	subtree := &subtreepkg.Subtree{}
 	if err = subtree.DeserializeFromReader(subtreeReader); err != nil {
@@ -3988,8 +5351,63 @@ func DeserializeHashesFromReaderIntoBuckets(reader io.Reader, nBuckets uint16, h
 //   - ctx: Context for the stop operation (currently unused, for future extensibility)
 func (stp *SubtreeProcessor) Stop(ctx context.Context) {
 	stp.stopOnce.Do(func() {
-		if stp.cancel != nil {
-			stp.cancel()
+		h := stp.cancelPtr.Swap(nil)
+		if h != nil && h.f != nil {
+			h.f()
+			// Wait for the main goroutine to exit before cleaning up chainedSubtrees
+			// to avoid data race with closeChainedSubtrees()
+			deadline := time.Now().Add(5 * time.Second)
+			for !stp.stopped.Load() {
+				if time.Now().After(deadline) {
+					stp.logger.Warnf("[SubtreeProcessor] Stop timeout waiting for goroutine to exit")
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		// Clean up mmap-backed subtrees (hold mutex to avoid race with closeChainedSubtrees)
+		stp.chainedSubtreesMu.Lock()
+		toClose := stp.chainedSubtrees
+		stp.chainedSubtrees = nil
+		stp.chainedSubtreesMu.Unlock()
+		for _, st := range toClose {
+			st.Close()
+		}
+		if cs := stp.currentSubtree.Load(); cs != nil {
+			cs.Close()
+		}
+		// Clean up DiskTxMap
+		if stp.diskTxMap != nil {
+			reportDiskMapStats(stp.diskTxMap.Stats())
+			_ = stp.diskTxMap.Close()
+			clearDiskMapStats()
 		}
 	})
+}
+
+// newSubtree creates a new subtree with the given leaf count.
+// Uses mmap-backed storage when mmapDir is configured, with heap fallback.
+func (stp *SubtreeProcessor) newSubtree(leafCount int) (*subtreepkg.Subtree, error) {
+	if stp.mmapDir != "" {
+		st, err := subtreepkg.NewTreeByLeafCountMmap(leafCount, stp.mmapDir)
+		if err != nil {
+			stp.logger.Warnf("mmap subtree creation failed, falling back to heap: %v", err)
+			return subtreepkg.NewTreeByLeafCount(leafCount)
+		}
+		return st, nil
+	}
+	return subtreepkg.NewTreeByLeafCount(leafCount)
+}
+
+// closeChainedSubtrees closes all mmap-backed chained subtrees and resets the slice.
+func (stp *SubtreeProcessor) closeChainedSubtrees() {
+	stp.chainedSubtreesMu.Lock()
+	toClose := stp.chainedSubtrees
+	stp.chainedSubtrees = make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees)
+	stp.chainedSubtreeCount.Store(0)
+	stp.chainedSubtreesTotalSize.Store(0)
+	stp.chainedSubtreesMu.Unlock()
+	for _, st := range toClose {
+		st.Close()
+	}
 }

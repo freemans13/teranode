@@ -712,6 +712,8 @@ func TestCatchup_CompetingEqualWorkChains(t *testing.T) {
 			Return([]*model.Block{}, nil).Maybe()
 		mockBlockchainClient.On("GetBlocksSubtreesNotSet", mock.Anything).
 			Return([]*model.Block{}, nil).Maybe()
+		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).
+			Return(true, nil).Maybe()
 
 		// Mock GetBlockExists - genesis and best block exist, others don't
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, bestBlockHeader.Hash()).
@@ -968,8 +970,10 @@ func TestCatchup_ForkBattleSimulation(t *testing.T) {
 func TestCatchup_ReorgMetrics(t *testing.T) {
 	t.Run("TrackReorgDepthAndWork", func(t *testing.T) {
 		ctx := context.Background()
-		server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+		server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
 		defer cleanup()
+
+		mockUTXOStore.On("GetBlockHeight").Return(uint32(1000))
 
 		// Create a reorg scenario
 		reorgChain := testhelpers.CreateChainWithWork(t, 50, 950, 1200000)
@@ -1043,8 +1047,10 @@ func TestCatchup_ReorgMetrics(t *testing.T) {
 func TestCatchup_TimestampValidationDuringFork(t *testing.T) {
 	t.Run("RejectForkWithInvalidTimestamps", func(t *testing.T) {
 		ctx := context.Background()
-		server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+		server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
 		defer cleanup()
+
+		mockUTXOStore.On("GetBlockHeight").Return(uint32(1000))
 
 		// Create fork with timestamps going backwards
 		forkChain := testhelpers.CreateChainWithWork(t, 20, 1000, 1000000)

@@ -10,8 +10,8 @@
 | QuorumAbsoluteTimeout | time.Duration | 30s | subtree_quorum_absolute_timeout | Quorum operation timeout |
 | SubtreeStore | *url.URL | "" | subtreestore | **CRITICAL** - Subtree data storage |
 | GetMissingTransactions | int | max(4, CPU/2) | subtreevalidation_getMissingTransactions | **CRITICAL** - Missing transaction retrieval concurrency |
-| GRPCAddress | string | "localhost:8089" | subtreevalidation_grpcAddress | gRPC client connections |
-| GRPCListenAddress | string | ":8089" | subtreevalidation_grpcListenAddress | **CRITICAL** - gRPC server binding, health checks only run if not empty |
+| GRPCAddress | string | "localhost:8089" (Go default; overridden to `localhost:8086` by `settings.conf` via `SUBTREE_VALIDATION_GRPC_PORT`) | subtreevalidation_grpcAddress | gRPC client connections |
+| GRPCListenAddress | string | ":8089" (Go default; overridden to `:8086` by `settings.conf` via `SUBTREE_VALIDATION_GRPC_PORT`) | subtreevalidation_grpcListenAddress | **CRITICAL** - gRPC server binding, health checks only run if not empty |
 | ProcessTxMetaUsingCacheBatchSize | int | 1024 | subtreevalidation_processTxMetaUsingCache_BatchSize | **CRITICAL** - Cache processing batch size |
 | ProcessTxMetaUsingCacheConcurrency | int | 32 | subtreevalidation_processTxMetaUsingCache_Concurrency | **CRITICAL** - Cache processing concurrency |
 | ProcessTxMetaUsingCacheMissingTxThreshold | int | 1 | subtreevalidation_processTxMetaUsingCache_MissingTxThreshold | Cache miss threshold |
@@ -32,28 +32,34 @@
 | PauseTimeout | time.Duration | 5m | subtreevalidation_pauseTimeout | **CRITICAL** - Maximum pause duration |
 | TxBatchSize | int | 1048576 | subtreevalidation_check_block_subtrees_tx_batch_size | Transaction batch size for CheckBlockSubtrees (0 = no batching) |
 | UseOrderedLevelAlgorithm | bool | true | subtreevalidation_useOrderedLevelAlgorithm | **CRITICAL** - Optimized O(V*I) algorithm for ordered transactions |
+| BlocksOnly | bool | false | subtreevalidation_blocks_only | Only process subtrees from blocks, skip peer-announced subtrees |
 
 ## Configuration Dependencies
 
 ### Cache Processing
+
 - `ProcessTxMetaUsingCacheBatchSize`, `ProcessTxMetaUsingCacheConcurrency`, and `ProcessTxMetaUsingCacheMissingTxThreshold` work together
 - Controls cache-based transaction metadata processing performance
 
 ### Missing Transaction Handling
+
 - When `BatchMissingTransactions = true`, uses `MissingTransactionsBatchSize` and `GetMissingTransactions`
 - `PercentageMissingGetFullData` determines full subtree vs individual transaction fetching
 
 ### Concurrency Control
+
 - `CheckBlockSubtreesConcurrency` controls block subtree checking operations
 - `SpendBatcherSize` controls spend operation batch processing and concurrency limits
 - `GetMissingTransactions` controls missing transaction retrieval concurrency
 - `TxBatchSize` controls transaction batching for CheckBlockSubtrees (0 disables batching)
 
 ### Algorithm Optimization
+
 - `UseOrderedLevelAlgorithm` enables optimized O(V*I) algorithm assuming transactions are ordered
 - When true, improves performance for ordered transaction processing
 
 ### gRPC Server Management
+
 - When `GRPCListenAddress` is not empty, gRPC server starts and health checks are enabled
 
 ## Service Dependencies
@@ -80,7 +86,7 @@
 ### Basic Configuration
 
 ```bash
-subtreevalidation_grpcListenAddress=:8089
+subtreevalidation_grpcListenAddress=:8086
 subtreestore=memory:///
 ```
 

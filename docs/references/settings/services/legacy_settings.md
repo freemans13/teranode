@@ -25,6 +25,7 @@
 | TempStore | *url.URL | "file://./data/tempstore" | temp_store | **CRITICAL** - Temporary storage location |
 | PeerIdleTimeout | time.Duration | 125s | legacy_peerIdleTimeout | **CRITICAL** - Peer inactivity timeout |
 | PeerProcessingTimeout | time.Duration | 3m | legacy_peerProcessingTimeout | **CRITICAL** - Message processing timeout |
+| Upnp | bool | false | legacy_upnp | Enable UPnP for automatic port mapping |
 
 ## Configuration Dependencies
 
@@ -37,10 +38,12 @@
 - `SavePeers` controls peer information persistence to disk
 
 ### Batch Processing Performance
+
 - Batch sizes and concurrency settings work together for memory and performance control
 - `StoreBatcherSize` * `StoreBatcherConcurrency` limits concurrent requests
 
 ### Peer Timeout Management
+
 - `PeerIdleTimeout` set to 125s to accommodate 2-minute ping/pong intervals
 - `PeerProcessingTimeout` set to 3m for block processing (largest operations)
 

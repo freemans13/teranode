@@ -7,6 +7,7 @@ The `peercli` package provides a command-line interface for interacting with Bit
 This package is typically used as a CLI tool to establish connections with Bitcoin peers and send protocol messages such as "inv", "getdata", "ping", etc.
 
 ## Features
+
 - Connect to Bitcoin peers
 - Send protocol messages (e.g., "inv", "getdata", "ping")
 - Interactive CLI mode for user commands
@@ -14,7 +15,7 @@ This package is typically used as a CLI tool to establish connections with Bitco
 ## Development
 
 - See `main.go` for the main logic and entry points.
-- Run tests with `go test ./...` in this directory.
+- Run tests with `go test -race -tags testtxmetacache ./...` in this directory, or use `make test` from the project root.
 
 ## Example
 
