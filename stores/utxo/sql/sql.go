@@ -286,6 +286,53 @@ func (s *Store) GetBlockState() utxo.BlockState {
 	}
 }
 
+// Close drains the batched-write workers and closes the underlying SQL
+// connection.
+//
+// The batchers run in background=true mode for create/get/unlock and
+// background=false for spend — every Put returns to the caller before the
+// underlying SQL write commits. Closing each batcher invokes go-batcher's
+// shutdown drain (see batcher.go:Close), which closes the input channel,
+// pulls any pending items out, and dispatches them through the registered
+// callback. Without this, a SIGTERM mid-flight silently loses queued
+// writes: the parent block has already been acked elsewhere but the UTXO
+// state never reaches the DB; on restart, dependent blocks fail with
+// missing-parent errors.
+//
+// The drain runs in a goroutine bounded by the supplied context. If the
+// context expires, the function returns its error but the drain
+// continues best-effort.
+func (s *Store) Close(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Drain in dependency order: state-mutating writers last so they
+		// have the best chance of committing before the deadline.
+		if s.unlockBatcher != nil {
+			s.unlockBatcher.Close()
+		}
+		if s.getBatcher != nil {
+			s.getBatcher.Close()
+		}
+		if s.spendBatcher != nil {
+			s.spendBatcher.Close()
+		}
+		if s.createBatcher != nil {
+			s.createBatcher.Close()
+		}
+	}()
+
+	select {
+	case <-done:
+		if s.db != nil {
+			return s.db.Close()
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Health checks the database connection and returns status information.
 func (s *Store) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	details := fmt.Sprintf("SQL Engine is %s", s.engine)

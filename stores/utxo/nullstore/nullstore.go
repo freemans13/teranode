@@ -72,6 +72,11 @@ func (m *NullStore) Health(ctx context.Context, checkLiveness bool) (int, string
 	return http.StatusOK, "NullStore Store available", nil
 }
 
+// Close is a no-op for the null store: it owns no batchers or connections.
+func (m *NullStore) Close(_ context.Context) error {
+	return nil
+}
+
 func (m *NullStore) Get(ctx context.Context, hash *chainhash.Hash, fields ...fields.FieldName) (*meta.Data, error) {
 	return &meta.Data{}, nil
 }
