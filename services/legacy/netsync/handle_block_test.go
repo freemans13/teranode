@@ -689,6 +689,129 @@ func TestSyncManager_extendFromTxMap_OOB(t *testing.T) {
 	require.Contains(t, err.Error(), parentHash.String())
 }
 
+// buildInRangeFixture constructs a parent (2 outputs) and a child whose only
+// input references PreviousTxOutIndex == 0 (in range), plus a txMap containing
+// both. Used by the nil-deref regression tests so the bounds-check passes and
+// the nil-check is the one that must fire.
+func buildInRangeFixture(t *testing.T) (*chainhash.Hash, *bt.Tx, *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) {
+	t.Helper()
+
+	parentScript := &bscript.Script{}
+	parent := &bt.Tx{
+		Version: 1,
+		Inputs:  []*bt.Input{},
+		Outputs: []*bt.Output{
+			{Satoshis: 100, LockingScript: parentScript},
+			{Satoshis: 200, LockingScript: parentScript},
+		},
+	}
+	parent.SetExtended(true)
+	parentHash := parent.TxIDChainHash()
+
+	child := &bt.Tx{
+		Version: 1,
+		Inputs: []*bt.Input{
+			{
+				UnlockingScript:    &bscript.Script{},
+				PreviousTxOutIndex: 0,
+			},
+		},
+		Outputs: []*bt.Output{
+			{Satoshis: 50, LockingScript: &bscript.Script{}},
+		},
+	}
+	require.NoError(t, child.Inputs[0].PreviousTxIDAdd(parentHash))
+
+	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](2)
+	txMap.Set(*parentHash, &TxMapWrapper{Tx: parent})
+	txMap.Set(*child.TxIDChainHash(), &TxMapWrapper{Tx: child})
+
+	return parentHash, child, txMap
+}
+
+// TestSyncManager_extendFromTxMap_NilParentTx verifies that extendFromTxMap
+// returns a TxInvalidError (rather than panicking) when the parent's
+// TxMapWrapper carries a nil Tx pointer.
+func TestSyncManager_extendFromTxMap_NilParentTx(t *testing.T) {
+	initPrometheusMetrics()
+
+	sm := &SyncManager{
+		settings: test.CreateBaseTestSettings(t),
+		logger:   ulogger.TestLogger{},
+	}
+
+	parentHash, child, txMap := buildInRangeFixture(t)
+	// Replace the parent wrapper with one that has a nil Tx — the child's hash
+	// is already keyed before this mutation, so the child lookup still succeeds.
+	txMap.Set(*parentHash, &TxMapWrapper{Tx: nil})
+
+	err := sm.extendFromTxMap(context.Background(), child, txMap)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxInvalid), "expected TxInvalid error, got %v", err)
+	require.Contains(t, err.Error(), "missing previous transaction")
+	require.Contains(t, err.Error(), parentHash.String())
+}
+
+// TestSyncManager_extendFromTxMap_NilOutput verifies that extendFromTxMap
+// returns a TxInvalidError when the referenced parent output is nil.
+func TestSyncManager_extendFromTxMap_NilOutput(t *testing.T) {
+	initPrometheusMetrics()
+
+	sm := &SyncManager{
+		settings: test.CreateBaseTestSettings(t),
+		logger:   ulogger.TestLogger{},
+	}
+
+	parentHash, child, txMap := buildInRangeFixture(t)
+	parentWrapper, _ := txMap.Get(*parentHash)
+	parentWrapper.Tx.Outputs[0] = nil
+
+	err := sm.extendFromTxMap(context.Background(), child, txMap)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxInvalid), "expected TxInvalid error, got %v", err)
+	require.Contains(t, err.Error(), "nil or has nil locking script")
+}
+
+// TestSyncManager_extendFromTxMap_NilLockingScript verifies that extendFromTxMap
+// returns a TxInvalidError when the referenced parent output's locking script
+// is nil (which would otherwise panic on the deref into bscript.NewFromBytes).
+func TestSyncManager_extendFromTxMap_NilLockingScript(t *testing.T) {
+	initPrometheusMetrics()
+
+	sm := &SyncManager{
+		settings: test.CreateBaseTestSettings(t),
+		logger:   ulogger.TestLogger{},
+	}
+
+	parentHash, child, txMap := buildInRangeFixture(t)
+	parentWrapper, _ := txMap.Get(*parentHash)
+	parentWrapper.Tx.Outputs[0].LockingScript = nil
+
+	err := sm.extendFromTxMap(context.Background(), child, txMap)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxInvalid), "expected TxInvalid error, got %v", err)
+	require.Contains(t, err.Error(), "nil or has nil locking script")
+}
+
+// TestSyncManager_ExtendTransaction_NilParentTx mirrors the same guard on the
+// parallel-decoration path used by ExtendTransaction.
+func TestSyncManager_ExtendTransaction_NilParentTx(t *testing.T) {
+	initPrometheusMetrics()
+
+	sm := &SyncManager{
+		settings: test.CreateBaseTestSettings(t),
+		logger:   ulogger.TestLogger{},
+	}
+
+	parentHash, child, txMap := buildInRangeFixture(t)
+	txMap.Set(*parentHash, &TxMapWrapper{Tx: nil})
+
+	err := sm.ExtendTransaction(context.Background(), child, txMap)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxInvalid), "expected TxInvalid error, got %v", err)
+	require.Contains(t, err.Error(), parentHash.String())
+}
+
 // countingValidator tracks how many times Validate is called and optionally fails
 // the first N calls. It checks context cancellation to detect cascade behavior.
 type countingValidator struct {

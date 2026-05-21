@@ -1121,9 +1121,23 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		// goroutine.
 		txWrapper.SomeParentsInBlock = true
 
+		// A malformed/hostile block could carry a wrapper without a parsed
+		// parent transaction; fail with a TxInvalidError instead of panicking
+		// on the dereferences below.
+		if prevTxWrapper.Tx == nil {
+			return errors.NewTxInvalidError("tx %s input %d references missing previous transaction %s",
+				tx.TxIDChainHash(), i, prevTxHash)
+		}
+
 		if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
 			return errors.NewTxInvalidError("tx %s input %d references out-of-range output %d on parent %s (has %d outputs)",
 				tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+		}
+
+		prevOutput := prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex]
+		if prevOutput == nil || prevOutput.LockingScript == nil {
+			return errors.NewTxInvalidError("tx %s input %d previous output %d is nil or has nil locking script (parent %s)",
+				tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash)
 		}
 
 		// Parent's Outputs are populated at wire-parse time and never mutated
@@ -1133,8 +1147,8 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		// (IsExtended checks the parent's *inputs*, not its outputs) and caused
 		// a deadlock under the two-phase flow in extendTransactions, where a
 		// pure-non-local-parent tx only becomes "extended" after phase 2 runs.
-		tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
-		tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
+		tx.Inputs[i].PreviousTxSatoshis = prevOutput.Satoshis
+		tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevOutput.LockingScript)
 	}
 
 	return nil
@@ -1385,12 +1399,26 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 			g.Go(func() error {
 				txWrapper.SomeParentsInBlock = true
 
+				// A malformed/hostile block could carry a wrapper without a parsed
+				// parent transaction; fail fast instead of panicking on the
+				// dereferences below.
+				if prevTxWrapper.Tx == nil {
+					return errors.NewTxInvalidError("tx %s input %d references missing previous transaction %s",
+						tx.TxIDChainHash(), i, prevTxHash)
+				}
+
 				// Parent Outputs are populated at wire-parse time and never mutated afterwards,
 				// so the bounds check is safe to run before WaitForParent and lets us reject
 				// malformed peer blocks without burning up to 120s on the polling loop.
 				if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
 					return errors.NewTxInvalidError("tx %s input %d references out-of-range output %d on parent %s (has %d outputs)",
 						tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+				}
+
+				prevOutput := prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex]
+				if prevOutput == nil || prevOutput.LockingScript == nil {
+					return errors.NewTxInvalidError("tx %s input %d previous output %d is nil or has nil locking script (parent %s)",
+						tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash)
 				}
 
 				// we do have a parent, but since everything is happening in parallel, we need to check if the parent has
@@ -1412,8 +1440,8 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 				}
 
 				// No lock needed - each goroutine writes to a unique index
-				tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
-				tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
+				tx.Inputs[i].PreviousTxSatoshis = prevOutput.Satoshis
+				tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevOutput.LockingScript)
 
 				populatedInputs.Add(1)
 
