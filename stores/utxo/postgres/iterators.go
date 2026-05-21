@@ -188,6 +188,30 @@ func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 	return newUnminedTxIterator(s)
 }
 
+// GetConflictingTxIterator returns an iterator over transactions currently
+// marked conflicting=true. Reuses the unminedTxIterator row-mapping machinery
+// with the filter flipped.
+func (s *Store) GetConflictingTxIterator() (utxo.UnminedTxIterator, error) {
+	return newConflictingTxIterator(s)
+}
+
+func newConflictingTxIterator(store *Store) (*unminedTxIterator, error) {
+	q := `
+		SELECT hash, fee, size_in_bytes, inserted_at, coinbase,
+		       locked, unmined_since, raw_tx, block_ids
+		FROM txs
+		WHERE conflicting = true
+		ORDER BY hash
+	`
+
+	rows, err := store.pool.Query(context.Background(), q)
+	if err != nil {
+		return nil, err
+	}
+
+	return &unminedTxIterator{store: store, rows: rows}, nil
+}
+
 // ScanInconsistentUnminedTxs is a no-op for Postgres — the Postgres store always uses
 // index-based queries on unmined_since, so there's no fullScan inconsistency to fix.
 func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
