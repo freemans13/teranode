@@ -317,10 +317,15 @@ func New(
 		// New returns an error only on invalid Config. The defaults we
 		// provide in settings/adaptivefetch_settings.go pass validation,
 		// so this branch triggers only if an operator sets a nonsense
-		// value in settings_local.conf. Fall back to hardcoded defaults —
-		// adaptive-fetch is an optimisation, not a correctness gate.
-		logger.Errorf("[BlockValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults", afErr)
-		af, _ = adaptivefetch.New(adaptivefetch.DefaultConfig(), "blockvalidation", prometheus.DefaultRegisterer)
+		// numeric value in settings_local.conf. Fall back to hardcoded
+		// defaults but force BootstrapMode to ModePessimistic — a typo in
+		// adaptive_fetch_window_size (etc.) must not silently re-enable
+		// optimistic skipping just because DefaultConfig() ships with
+		// ModeAuto for direct package callers.
+		safeFallback := adaptivefetch.DefaultConfig()
+		safeFallback.BootstrapMode = adaptivefetch.ModePessimistic
+		logger.Errorf("[BlockValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults pinned to pessimistic", afErr)
+		af, _ = adaptivefetch.New(safeFallback, "blockvalidation", prometheus.DefaultRegisterer)
 	}
 
 	bVal := &Server{

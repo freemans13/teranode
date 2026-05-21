@@ -217,8 +217,14 @@ func New(
 		BootstrapMode:             bootstrap,
 	}, "subtreevalidation", prometheus.DefaultRegisterer)
 	if afErr != nil {
-		logger.Errorf("[SubtreeValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults", afErr)
-		af, _ = adaptivefetch.New(adaptivefetch.DefaultConfig(), "subtreevalidation", prometheus.DefaultRegisterer)
+		// Fall back to hardcoded defaults but force BootstrapMode to
+		// ModePessimistic — a typo in numeric adaptive_fetch_* values
+		// must not silently re-enable optimistic skipping just because
+		// DefaultConfig() ships with ModeAuto for direct package callers.
+		safeFallback := adaptivefetch.DefaultConfig()
+		safeFallback.BootstrapMode = adaptivefetch.ModePessimistic
+		logger.Errorf("[SubtreeValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults pinned to pessimistic", afErr)
+		af, _ = adaptivefetch.New(safeFallback, "subtreevalidation", prometheus.DefaultRegisterer)
 	}
 	u.adaptiveFetch = af
 
