@@ -969,21 +969,26 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 	}
 	if localExists {
 		localBytes, getErr := u.subtreeStore.Get(spanCtx, subtreeHash[:], localFileType)
-		if getErr == nil && localBytes != nil {
-			u.logger.Debugf("[getSubtreeTxHashes][%s] found local subtree file in store (%s), using it instead of network request", subtreeHash.String(), localFileType.String())
-
-			subtree, err := subtreepkg.NewSubtreeFromBytes(localBytes)
-			if err != nil {
-				return nil, errors.NewProcessingError("[getSubtreeTxHashes][%s] failed to create subtree from local bytes", subtreeHash.String(), err)
-			}
-
-			// return the transaction hashes from the subtree
-			for _, node := range subtree.Nodes {
-				txHashes = append(txHashes, node.Hash)
-			}
-
-			return txHashes, nil
+		if getErr != nil {
+			return nil, errors.NewStorageError("[getSubtreeTxHashes][%s] failed to read local subtree (%s)", subtreeHash.String(), localFileType.String(), getErr)
 		}
+		if localBytes == nil {
+			return nil, errors.NewStorageError("[getSubtreeTxHashes][%s] local subtree (%s) returned nil bytes despite Exists=true", subtreeHash.String(), localFileType.String())
+		}
+
+		u.logger.Debugf("[getSubtreeTxHashes][%s] found local subtree file in store (%s), using it instead of network request", subtreeHash.String(), localFileType.String())
+
+		subtree, err := subtreepkg.NewSubtreeFromBytes(localBytes)
+		if err != nil {
+			return nil, errors.NewProcessingError("[getSubtreeTxHashes][%s] failed to create subtree from local bytes", subtreeHash.String(), err)
+		}
+
+		// return the transaction hashes from the subtree
+		for _, node := range subtree.Nodes {
+			txHashes = append(txHashes, node.Hash)
+		}
+
+		return txHashes, nil
 	}
 
 	// do http request to baseUrl + subtreeHash.String()

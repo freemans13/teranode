@@ -191,7 +191,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				// request fails outright.
 				localFileType, localExists, err := u.findLocalSubtreeFile(gCtx, subtreeHash)
 				if err != nil {
-					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree exists in store", subtreeHash.String(), err)
+					return errors.NewStorageError("[CheckBlockSubtrees][%s] failed to check if subtree exists in store", subtreeHash.String(), err)
 				}
 
 				var subtreeToCheck *subtreepkg.Subtree
