@@ -5060,10 +5060,30 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 			// Calculate expected bucket size with better distribution
 			nBuckets := transactionMap.Buckets()
 
-			txHashBuckets := make(map[uint16][]chainhash.Hash, nBuckets)
-			for i := uint16(0); i < nBuckets; i++ {
-				txHashBuckets[i] = make([]chainhash.Hash, 0, 512)
+			// Estimate per-bucket fill from the block-level hint so we only
+			// pre-allocate when the amortized cost is worth paying. The old
+			// unconditional `make([]chainhash.Hash, 0, 512)` per bucket cost
+			// 16 MiB per subtree (1024 buckets × 512 × 32 B) — almost entirely
+			// wasted on early-mainnet legacy catchup where each block has
+			// 1–2 transactions and 99.9% of buckets stay empty.
+			expectedPerBucket := 0
+			if estimatedTxCount > 0 && totalSubtreesInBlock > 0 {
+				expectedPerSubtree := (int(estimatedTxCount) + totalSubtreesInBlock - 1) / totalSubtreesInBlock
+				expectedPerBucket = expectedPerSubtree / int(nBuckets)
 			}
+
+			txHashBuckets := make(map[uint16][]chainhash.Hash, nBuckets)
+			if expectedPerBucket > 4 {
+				// Big-block path: buckets will be meaningfully filled, so
+				// pre-allocate exact size and skip the append-grow doublings.
+				for i := uint16(0); i < nBuckets; i++ {
+					txHashBuckets[i] = make([]chainhash.Hash, 0, expectedPerBucket)
+				}
+			}
+			// else: leave map empty. append-to-nil-slice in the deserializer
+			// handles per-bucket lazy creation. Saves 16 MiB / subtree on
+			// the small-block legacy-catchup hot path; for any block with
+			// >~4k txs the predicate above kicks back in.
 
 			conflictingNodes := make([]chainhash.Hash, 0, 32)
 
