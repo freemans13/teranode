@@ -264,11 +264,15 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 			// MissingFetches=0 below because this code path doesn't yet know
 			// how many txs the optimistic skip caused to be missing. That means
 			// the Opt→Pess threshold cannot trip from real miss detection in
-			// this service — operator must restart the node to reset to
-			// pessimistic if optimistic mode misbehaves. The threshold logic in
-			// State.maybeTransition is wired up; it just receives no signal
-			// here. A future improvement is to plumb real miss counts through
-			// the validation path so Opt→Pess auto-trips on observed misses.
+			// this service. The threshold logic in State.maybeTransition is
+			// wired up; it just receives no signal here. Until real
+			// MissingFetches plumbing lands, recovery from a degraded
+			// optimistic deployment requires the operator to change
+			// adaptive_fetch_bootstrap_mode to "pessimistic" (or "auto") and
+			// restart — a plain restart with bootstrap_mode pinned to
+			// "optimistic" will come back up optimistic. A future improvement
+			// is to plumb real miss counts through the validation path so
+			// Opt→Pess auto-trips on observed misses.
 			txCount := 0
 			if work.block != nil {
 				txCount = int(work.block.TransactionCount)

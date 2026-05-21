@@ -359,11 +359,16 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				// have been processed (a "wait then try" gate, not a measurement).
 				// The Opt→Pess transition will not fire from observations alone —
 				// it relies on downstream processTransactionsInLevels surfacing a
-				// validation error, the block failing, and operator response /
-				// node restart auto-bootstrapping pessimistic. A future improvement
-				// would plumb real UTXO hit counts and processMissingTransactions
-				// recovery counts through this path so the state machine can
-				// self-correct without a restart.
+				// validation error and the block failing. Until real
+				// MissingFetches plumbing lands, recovery from a degraded
+				// optimistic deployment requires the operator to change
+				// adaptive_fetch_bootstrap_mode to "pessimistic" (or "auto")
+				// and restart — a plain restart with bootstrap_mode pinned to
+				// "optimistic" will come back up optimistic. A future
+				// improvement would plumb real UTXO hit counts and
+				// processMissingTransactions recovery counts through this
+				// path so the state machine can self-correct without a
+				// restart or config change.
 				txCount := subtreeToCheck.Length()
 				if txCount > 0 {
 					// Tag the observation with the mode we sampled before
