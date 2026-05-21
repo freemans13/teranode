@@ -397,6 +397,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BatchMaxWait:              getDuration("validator_batchMaxWait", 5*time.Millisecond, alternativeContext...),
 			BatchMaxConcurrent:        getInt("validator_batchMaxConcurrent", 64, alternativeContext...),
 			BatchCoalescerDrainMode:   getBool("validator_batchCoalescerDrainMode", true, alternativeContext...),
+			TxMetaWireFormat:          getString("validator_txmeta_wireFormat", "v1", alternativeContext...),
+			TxMetaNumPartitions:       getInt("validator_txmeta_numPartitions", 32, alternativeContext...),
 		},
 		Region: RegionSettings{
 			Name: getString("regionName", "defaultRegionName", alternativeContext...),
@@ -553,6 +555,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SubtreeDAHConcurrency:                     getInt("subtreevalidation_subtreeDAHConcurrency", 8, alternativeContext...),
 			TxMetaCacheEnabled:                        getBool("subtreevalidation_txMetaCacheEnabled", true, alternativeContext...),
 			TxMetaCacheMaxMB:                          getInt("txMetaCacheMaxMB", 256, alternativeContext...),
+			TxMetaCacheBucketType:                     getString("subtreevalidation_txMetaCacheBucketType", "unallocated", alternativeContext...),
+			TxMetaCacheTrimRatio:                      getInt("subtreevalidation_txMetaCacheTrimRatio", 2, alternativeContext...),
 			TxChanBufferSize:                          getInt("subtreevalidation_txChanBufferSize", 0, alternativeContext...),
 			BatchMissingTransactions:                  getBool("subtreevalidation_batch_missing_transactions", true, alternativeContext...),
 			SpendBatcherSize:                          getInt("subtreevalidation_spendBatcherSize", 1024, alternativeContext...),
@@ -568,6 +572,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseOrderedLevelAlgorithm:                  getBool("subtreevalidation_useOrderedLevelAlgorithm", true, alternativeContext...),
 			BlocksOnly:                                getBool("subtreevalidation_blocks_only", false, alternativeContext...),
 			CheckBlockSubtreesTimeout:                 getDuration("subtreevalidation_check_block_subtrees_timeout", 30*time.Minute, alternativeContext...),
+			MaxIncomingSubtreeBytes:                   int64(getInt("subtreevalidation_max_incoming_subtree_bytes", 128*1024*1024, alternativeContext...)),
 		},
 		Legacy: LegacySettings{
 			WorkingDir:                       getString("legacy_workingDir", "../../data", alternativeContext...),

@@ -37,6 +37,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/ordishs/go-bitcoin"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -1068,6 +1069,62 @@ func TestSyncManager_quickValidationAllowed(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			sm := &SyncManager{chainParams: tt.chainParams}
 			require.Equal(t, tt.want, sm.quickValidationAllowed(tt.height))
+		})
+	}
+}
+
+// TestClassifyAndCountPrewarmError verifies that classifyAndCountPrewarmError routes
+// each validator error class to the correct prometheusLegacyNetsyncPrewarmErrors label,
+// preserving the silent-drop semantics flagged by issue #4590 while restoring observability.
+func TestClassifyAndCountPrewarmError(t *testing.T) {
+	initPrometheusMetrics()
+
+	tests := []struct {
+		name  string
+		err   error
+		label string
+	}{
+		{
+			name:  "tx_invalid",
+			err:   errors.NewTxInvalidError("script failed"),
+			label: "tx_invalid",
+		},
+		{
+			name:  "service",
+			err:   errors.NewServiceError("validator unavailable"),
+			label: "service",
+		},
+		{
+			name:  "processing",
+			err:   errors.NewProcessingError("transient processing error"),
+			label: "processing",
+		},
+		{
+			name:  "policy_conflicting",
+			err:   errors.NewTxConflictingError("double-spend in mempool"),
+			label: "policy",
+		},
+		{
+			name:  "policy_already_exists",
+			err:   errors.NewTxExistsError("already in mempool"),
+			label: "policy",
+		},
+		{
+			name:  "other",
+			err:   errors.NewStorageError("disk full"),
+			label: "other",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			counter := prometheusLegacyNetsyncPrewarmErrors.WithLabelValues(tt.label)
+			before := testutil.ToFloat64(counter)
+
+			classifyAndCountPrewarmError(ulogger.TestLogger{}, tt.err)
+
+			after := testutil.ToFloat64(counter)
+			require.Equal(t, before+1, after, "counter for label %q must increment by 1", tt.label)
 		})
 	}
 }
