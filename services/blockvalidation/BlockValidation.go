@@ -1501,13 +1501,22 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			go func() {
 				defer optimisticMiningWg.Done()
 
-				blockHeaderIDs, err := u.blockchainClient.GetBlockHeaderIDs(decoupledCtx, block.Header.HashPrevBlock, u.settings.BlockValidation.MaxPreviousBlockHeadersToCheck)
-				if err != nil {
-					u.logger.Errorf("[ValidateBlock][%s] failed to get block header ids: %v", block.String(), err)
+				// blockHeaderIDs feeds Block.Valid's positive-membership prefetch for
+				// parent-on-chain checks. When the off-chain set toggle is on, the
+				// validator's checkOldBlockIDsInMemory answers parent membership in
+				// O(1), so the prefetch is redundant — same situation PR #934 fixed
+				// for checkOldBlockIDs. Skip the upstream RPC and let Block.Valid
+				// take its no-prefetch route via a nil IDs slice.
+				var blockHeaderIDs []uint32
+				if !u.settings.BlockChain.UseInMemoryChainCheck {
+					blockHeaderIDs, err = u.blockchainClient.GetBlockHeaderIDs(decoupledCtx, block.Header.HashPrevBlock, u.settings.BlockValidation.MaxPreviousBlockHeadersToCheck)
+					if err != nil {
+						u.logger.Errorf("[ValidateBlock][%s] failed to get block header ids: %v", block.String(), err)
 
-					u.ReValidateBlock(block, baseURL)
+						u.ReValidateBlock(block, baseURL)
 
-					return
+						return
+					}
 				}
 
 				u.logger.Infof("[ValidateBlock][%s] GetBlockHeaders DONE", block.Header.Hash().String())
@@ -1590,9 +1599,14 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				return errors.NewServiceError("[ValidateBlock][%s] failed to get block headers", block.String(), err)
 			}
 
-			blockHeaderIDs := make([]uint32, len(blockHeadersMeta))
-			for i, blockHeaderMeta := range blockHeadersMeta {
-				blockHeaderIDs[i] = blockHeaderMeta.ID
+			// Skip the IDs slice when the no-prefetch toggle is on — see the same
+			// rationale on the optimistic-mining path above.
+			var blockHeaderIDs []uint32
+			if !u.settings.BlockChain.UseInMemoryChainCheck {
+				blockHeaderIDs = make([]uint32, len(blockHeadersMeta))
+				for i, blockHeaderMeta := range blockHeadersMeta {
+					blockHeaderIDs[i] = blockHeaderMeta.ID
+				}
 			}
 
 			u.logger.Infof("[ValidateBlock][%s] GetBlockHeaderIDs DONE", block.Header.Hash().String())
@@ -1911,10 +1925,15 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 		return errors.NewServiceError("[reValidateBlock][%s] failed to get block headers", blockData.block.String(), err)
 	}
 
-	// Extract block header IDs from the fresh block headers metadata
-	blockHeaderIDs := make([]uint32, len(blockHeadersMeta))
-	for i, blockHeaderMeta := range blockHeadersMeta {
-		blockHeaderIDs[i] = blockHeaderMeta.ID
+	// Extract block header IDs from the fresh block headers metadata.
+	// Skipped when the off-chain-set toggle is on — see the matching no-prefetch
+	// paths in ValidateBlock above.
+	var blockHeaderIDs []uint32
+	if !u.settings.BlockChain.UseInMemoryChainCheck {
+		blockHeaderIDs = make([]uint32, len(blockHeadersMeta))
+		for i, blockHeaderMeta := range blockHeadersMeta {
+			blockHeaderIDs[i] = blockHeaderMeta.ID
+		}
 	}
 
 	// Check if parent block is invalid during revalidation

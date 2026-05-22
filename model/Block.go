@@ -572,6 +572,7 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 			currentBlockHeaderIDs: currentBlockHeaderIDs,
 			oldBlockIDsMap:        oldBlockIDsMap,
 			metaRegenerator:       metaRegenerator,
+			useInMemoryChainCheck: settings != nil && settings.BlockChain.UseInMemoryChainCheck,
 		}
 		err = b.validOrderAndBlessed(ctx, logger, deps, settings.Block.ValidOrderAndBlessedConcurrency, settings.Block.DiskMapDirs)
 		if err != nil {
@@ -765,6 +766,12 @@ type validationDependencies struct {
 	currentBlockHeaderIDs []uint32
 	oldBlockIDsMap        *txmap.SyncedMap[chainhash.Hash, []uint32]
 	metaRegenerator       SubtreeMetaRegeneratorI // optional: nil means no regeneration
+
+	// useInMemoryChainCheck mirrors settings.BlockChain.UseInMemoryChainCheck.
+	// When true, checkParentExistsOnChain skips the prefetched-main-chain-IDs
+	// fast path and always defers parent block-id membership to the validator's
+	// checkOldBlockIDsInMemory route, which is now O(1) via the off-chain set.
+	useInMemoryChainCheck bool
 }
 
 func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger, deps *validationDependencies, validOrderAndBlessedConcurrency int, diskMapDirs []string) error {
@@ -802,9 +809,21 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 		defer PutParentSpendsMap(pooled, expectedInpoints)
 	}
 
+	// When the off-chain (forked) set toggle is on, the validator's
+	// checkOldBlockIDsInMemory route answers parent-on-chain questions in O(1)
+	// via the blockchain store's in-memory off-chain set, so the prefetched
+	// main-chain ID map is redundant. Leaving it nil here switches
+	// checkParentExistsOnChain into its no-prefetch route, where every parent
+	// defers to that O(1) lookup instead of going through positive membership
+	// in the local map first. Same shape as PR #934's swap for checkOldBlockIDs.
+	var blockHeaderIDsMap map[uint32]struct{}
+	if !deps.useInMemoryChainCheck {
+		blockHeaderIDsMap = b.buildBlockHeaderIDsMap(deps.currentBlockHeaderIDs)
+	}
+
 	validationCtx := &validationContext{
 		currentBlockHeaderHashesMap: b.buildBlockHeaderHashesMap(deps.currentChain),
-		currentBlockHeaderIDsMap:    b.buildBlockHeaderIDsMap(deps.currentBlockHeaderIDs),
+		currentBlockHeaderIDsMap:    blockHeaderIDsMap,
 		parentSpendsMap:             psMap,
 	}
 
@@ -968,6 +987,17 @@ func (b *Block) checkParentExistsOnChain(gCtx context.Context, logger ulogger.Lo
 
 	if len(parentTxMeta.BlockIDs) > 0 && parentTxMeta.BlockIDs[0] == GenesisBlockID {
 		// when blockIds[0] is GenesisBlockID, it means the transaction was imported from a restore and is on a valid chain
+		return oldBlockIDs, nil
+	}
+
+	// No-prefetch route. When the caller passes a nil currentBlockHeaderIDsMap
+	// (set up in validOrderAndBlessed when blockchain_use_in_memory_chain_check
+	// is true) we skip the positive-membership shortcut entirely and hand the
+	// parent's block IDs to oldBlockIDsMap so the validator's
+	// checkOldBlockIDsInMemory answers them via the O(1) off-chain set route.
+	// Same shape as PR #934's no-prefetch swap for checkOldBlockIDs.
+	if currentBlockHeaderIDsMap == nil {
+		oldBlockIDs = append(oldBlockIDs, parentTxMeta.BlockIDs...)
 		return oldBlockIDs, nil
 	}
 
