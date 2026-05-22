@@ -2438,6 +2438,26 @@ func Test_checkOldBlockIDs_noPrefetchRoute(t *testing.T) {
 		require.Contains(t, err.Error(), "are not from current chain")
 	})
 
+	t.Run("RPC error returns ProcessingError", func(t *testing.T) {
+		// CheckBlockIsInCurrentChain returning an error (network blip,
+		// blockchain service unavailable, etc.) must surface as a
+		// ProcessingError — *not* a BlockInvalidError — so the caller
+		// retries rather than invalidating the block.
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		oldBlockIDsMap.Set(chainhash.HashH([]byte("only")), []uint32{42})
+
+		blockchainMock.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{42}).
+			Return(false, errors.NewServiceError("blockchain unavailable")).Once()
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to check if old blocks are part of the current chain")
+		require.NotContains(t, err.Error(), "are not from current chain")
+	})
+
 }
 
 func TestBlockValidation_ParentAndChildInSameBlock(t *testing.T) {

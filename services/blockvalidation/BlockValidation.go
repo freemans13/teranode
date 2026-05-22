@@ -2127,11 +2127,14 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 		return false
 	}
 
-	iterationError, fastPathCount, slowPathCount, cacheHitCount :=
+	iterationError, fastPathCount, lookupCount, cacheHitCount :=
 		u.iterateOldBlockIDsWithCachedLookup(ctx, oldBlockIDsMap, block, fastPath, u.blockchainClient.CheckBlockIsInCurrentChain)
 
 	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] prefetch route done: fastPath=%d, slowPath=%d, cacheHit=%d", block.Hash().String(), fastPathCount, slowPathCount, cacheHitCount)
+		// "slowPath" is the historical name for the per-tx lookup reached
+		// on a fast-path miss. Kept in the log key for grep continuity even
+		// though the helper counter is now route-neutral (lookupCount).
+		u.logger.Infof("[checkOldBlockIDs][%s] prefetch route done: fastPath=%d, slowPath=%d, cacheHit=%d", block.Hash().String(), fastPathCount, lookupCount, cacheHitCount)
 	}
 
 	return
@@ -2163,14 +2166,14 @@ func (u *BlockValidation) checkOldBlockIDsWithoutPrefetch(ctx context.Context,
 	block *model.Block,
 ) (iterationError error) {
 	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] no-prefetch route, checking %d old block ID entries", block.Hash().String(), oldBlockIDsMap.Length())
+		u.logger.Infof("[checkOldBlockIDs][%s] no-prefetch route: checking %d old block ID entries", block.Hash().String(), oldBlockIDsMap.Length())
 	}
 
-	iterationError, _, rpcCount, cacheHitCount :=
+	iterationError, _, lookupCount, cacheHitCount :=
 		u.iterateOldBlockIDsWithCachedLookup(ctx, oldBlockIDsMap, block, nil, u.blockchainClient.CheckBlockIsInCurrentChain)
 
 	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] no-prefetch route done: rpc=%d, cacheHit=%d", block.Hash().String(), rpcCount, cacheHitCount)
+		u.logger.Infof("[checkOldBlockIDs][%s] no-prefetch route done: lookup=%d, cacheHit=%d", block.Hash().String(), lookupCount, cacheHitCount)
 	}
 
 	return
@@ -2191,15 +2194,18 @@ func (u *BlockValidation) checkOldBlockIDsWithoutPrefetch(ctx context.Context,
 //     CheckBlockIsInCurrentChain RPC), caches the result, and either
 //     continues iteration on hit or records a BlockInvalidError on miss.
 //
-// Returns the iteration error (or nil) plus counters for each path. The
-// counters are intended for the per-route summary log line.
+// Returns the iteration error (or nil) plus counters. lookupCount counts
+// how many times the lookup callback was actually invoked (i.e. cache
+// misses that weren't short-circuited by fastPath); it is reported in
+// each route's log under the route-appropriate name (the prefetch route
+// historically calls it "slowPath").
 func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 	ctx context.Context,
 	oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
 	block *model.Block,
 	fastPath func(blockIDs []uint32) bool,
 	lookup func(ctx context.Context, blockIDs []uint32) (bool, error),
-) (iterationError error, fastPathCount, rpcCount, cacheHitCount int) {
+) (iterationError error, fastPathCount, lookupCount, cacheHitCount int) {
 	cache := make(map[string]bool, oldBlockIDsMap.Length())
 	var builder strings.Builder
 
@@ -2233,7 +2239,7 @@ func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 			return true
 		}
 
-		rpcCount++
+		lookupCount++
 		blocksPartOfCurrentChain, err := lookup(ctx, blockIDs)
 		if err != nil {
 			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] failed to check if old blocks are part of the current chain", block.String(), err)
