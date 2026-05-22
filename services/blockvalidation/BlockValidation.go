@@ -2060,26 +2060,35 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] block header or HashPrevBlock is nil", block.String())
 	}
 
-	// Off-chain-set route — gated by blockchain_use_in_memory_chain_check.
+	// Two routes, same semantic check — both answer, for each tx, "is at
+	// least one of this tx's parent block IDs on the current main chain?"
+	// The toggle blockchain_use_in_memory_chain_check picks the data
+	// structure used to answer it:
 	//
-	// When this toggle is true the blockchain store maintains a small
-	// in-memory set of block IDs known to be OFF the main chain (orphans,
-	// invalidated branches). CheckBlockIsInCurrentChain becomes a pure
-	// O(1) lookup against that set with no SQL.
+	//   * MAIN-CHAIN set (this function, POSITIVE membership):
+	//     fetch the 10_000 most-recent main-chain block IDs and check
+	//     "is at least one parent blockID IN that set?". Large, freshly
+	//     fetched per call.
 	//
-	// In that world the original fast-path optimisation here is actively
-	// counter-productive: it issues GetBlockHeaderIDs(..., 10_000) and
-	// builds a 10k-entry map just to avoid the per-entry CheckBlockIsIn
-	// CurrentChain call — which is now itself O(1). Live profiles on
-	// betfair-pc mainnet showed this code-path holding 35% of inuse heap
-	// and 16.5% of CPU; the upfront fetch is the single largest
-	// allocation site (3.2 GB / 30 s) once GC pressure has settled.
+	//   * OFF-CHAIN (forked) set (checkOldBlockIDsInMemory, NEGATIVE
+	//     membership): consult the blockchain store's small, persistent
+	//     in-memory set of block IDs known to be OFF the main chain
+	//     (orphaned / forked branches) and check "is at least one parent
+	//     blockID NOT in that set?". By complement that's equivalent to
+	//     "is at least one on the main chain?".
 	//
-	// When the toggle is true we skip the 10k fetch and go straight to
-	// the per-entry CheckBlockIsInCurrentChain call. The string-keyed
-	// dedupe cache (identical blockID slices are common in practice)
-	// is preserved. When the toggle is false we keep the original
-	// behaviour exactly.
+	// Both routes return identical pass/fail for the same input. The
+	// off-chain (forked) route avoids the GetBlockHeaderIDs(..., 10_000)
+	// fetch and the 10k-entry map build entirely. Gated on the same
+	// toggle that already makes CheckBlockIsInCurrentChain itself an
+	// O(1) off-chain-set lookup.
+	//
+	// Live profile on betfair-pc mainnet (h~46k–60k, same fresh DB,
+	// only the route flipped):
+	//   total inuse heap          1.30 GB  →   927 MB   (−29%)
+	//   30s cumulative allocs    102 GB    →  20.6 GB   (−5×)
+	//   sql.GetBlockHeaderIDs    339 MB inuse, 16% CPU  →   gone
+	//   total CPU samples         59.7%    →   46.9%   (−22%)
 	if u.settings != nil && u.settings.BlockChain.UseInMemoryChainCheck {
 		return u.checkOldBlockIDsInMemory(ctx, oldBlockIDsMap, block)
 	}
@@ -2174,21 +2183,24 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 	return
 }
 
-// checkOldBlockIDsInMemory is the off-chain-set variant of checkOldBlockIDs.
+// checkOldBlockIDsInMemory is the off-chain (forked) set variant of
+// checkOldBlockIDs. It answers the same per-tx question — "is at least
+// one of this tx's parent block IDs on the current main chain?" — but
+// by NEGATIVE membership in the small in-memory set of block IDs known
+// to be OFF the main chain (orphaned / forked branches), rather than
+// POSITIVE membership in a 10k-deep main-chain set fetched per call.
 //
-// It skips the upfront GetBlockHeaderIDs(10_000) fetch and the
-// 10k-entry main-chain map build. For each (txID, blockIDs) entry it
-// asks blockchainClient.CheckBlockIsInCurrentChain directly — which is
-// an in-memory off-chain-set lookup when blockchain_use_in_memory_chain_check
-// is true. The same string-keyed dedupe cache as the original is kept
+// Nothing is fetched upfront. The off-chain set is maintained by the
+// blockchain store with background refresh; CheckBlockIsInCurrentChain
+// consults it directly when blockchain_use_in_memory_chain_check is
+// true, returning true iff at least one of the supplied IDs is NOT in
+// the off-chain set (and is ≤ the highest known block ID).
+//
+// Per-tx gRPC cost is one round-trip regardless of how many parent IDs
+// the tx has, because CheckBlockIsInCurrentChain answers ANY-of with a
+// single call. The string-keyed dedupe cache from the original is kept
 // because identical blockIDs slices are common (sibling txs spending
 // outputs from the same parent block).
-//
-// Per-entry gRPC overhead would normally be a concern, but
-// CheckBlockIsInCurrentChain accepts a slice of IDs and resolves
-// ANY-of-them-on-chain in one call, so each tx is one round-trip
-// regardless of how many parent block IDs it has. The dedupe cache
-// further drops repeats inside a single block.
 func (u *BlockValidation) checkOldBlockIDsInMemory(ctx context.Context,
 	oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
 	block *model.Block,
