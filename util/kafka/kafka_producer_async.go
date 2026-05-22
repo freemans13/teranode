@@ -342,6 +342,14 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*Kaf
 // before being drained into franz-go. This is decoupled from
 // FlushFrequency: that field is the franz-go per-partition linger
 // (kgo.ProducerLinger), a separate concern.
+//
+// Note on the adaptive-slow bounds [50ms, 500ms]: when this function
+// was driven by FlushFrequency (default 10s, scale-1/2 setting 1s) the
+// bounds were [200ms, 5s] — i.e. 10× larger. They were compressed by
+// the same factor when the base switched to OuterBatcherLinger
+// (default 10ms). The bounds still serve their original purpose
+// (don't drop below "a few base lingers", don't sit above "a small
+// multiple of base") at the new scale.
 func (c *KafkaAsyncProducer) currentBatchLinger() time.Duration {
 	base := c.Config.OuterBatcherLinger
 	if base <= 0 {
