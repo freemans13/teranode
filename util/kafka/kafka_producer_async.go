@@ -53,24 +53,29 @@ const defaultOuterBatcherLinger = 10 * time.Millisecond
 
 // KafkaProducerConfig holds configuration for the async Kafka producer.
 //
-// The three URL params named after Sarama's Flush.* triggers map to
-// franz-go options with materially different semantics — set them with
-// intent, not by analogy to Sarama:
+// The three URL params named after Sarama's Flush.* triggers no longer map
+// cleanly onto a single knob each — set them with intent, not by analogy
+// to Sarama:
 //
-//   - FlushFrequency → kgo.ProducerLinger (PER-PARTITION linger; controls
-//     how long franz-go waits for a partition's batch to fill before
-//     sending it to the broker). NOT a "max time between flushes".
-//   - FlushMessages → kgo.MaxBufferedRecords (global back-pressure cap;
-//     once exceeded Produce() blocks). NOT a flush trigger.
+//   - FlushFrequency → kgo.ProducerLinger only. This is franz-go's
+//     PER-PARTITION linger: how long franz-go waits for a partition's
+//     batch to fill before sending it to the broker. It does NOT drive
+//     the outer batcher's drain timer any more — see OuterBatcherLinger.
+//   - FlushMessages has TWO effects, both keyed on the same value:
+//     (1) kgo.MaxBufferedRecords — global back-pressure cap; once
+//     exceeded Produce() blocks; (2) outer-batcher flush-size trigger
+//     via currentBatchSize(): when the wrapper's pending buffer reaches
+//     this length, it drains into franz-go without waiting for the
+//     linger. So it IS a (coarse) flush trigger, just not at the
+//     broker level.
 //   - FlushBytes → kgo.ProducerBatchMaxBytes (per-partition batch hard
-//     cap; clamped to ≥1 MiB). NOT a flush trigger either.
+//     cap; clamped to ≥1 MiB). Not a flush trigger.
 //
-// OuterBatcherLinger is a separate, internal knob for the wrapper's
-// outer drain goroutine. It used to be derived from FlushFrequency,
-// which silently stacked a second linger on every record and caused
-// the dev-scale-1/2 txmeta regression at 1.2M TPS. It is now decoupled
-// and defaults to defaultOuterBatcherLinger (10ms); operators should
-// rarely need to change it.
+// OuterBatcherLinger is the outer drain goroutine's straggler-flush
+// timer. It used to be derived from FlushFrequency, which silently
+// stacked a second linger on every record and caused the dev-scale-1/2
+// txmeta regression at 1.2M TPS. It is now decoupled and defaults to
+// defaultOuterBatcherLinger (10ms); operators should rarely change it.
 type KafkaProducerConfig struct {
 	Logger                ulogger.Logger // Logger instance
 	URL                   *url.URL       // Kafka URL
@@ -80,9 +85,9 @@ type KafkaProducerConfig struct {
 	ReplicationFactor     int16          // Replication factor for topic
 	RetentionPeriodMillis string         // Message retention period
 	SegmentBytes          string         // Segment size in bytes
-	FlushBytes            int            // Flush threshold in bytes → kgo.ProducerBatchMaxBytes (see above)
-	FlushMessages         int            // Number of messages before flush → kgo.MaxBufferedRecords (see above)
-	FlushFrequency        time.Duration  // Time between flushes → kgo.ProducerLinger (see above)
+	FlushBytes            int            // → kgo.ProducerBatchMaxBytes (per-partition batch hard cap, clamped ≥1 MiB). See doc above.
+	FlushMessages         int            // Dual use: kgo.MaxBufferedRecords AND outer-batcher flush-size trigger via currentBatchSize(). See doc above.
+	FlushFrequency        time.Duration  // → kgo.ProducerLinger only (per-partition broker-side linger). Outer batcher now uses OuterBatcherLinger. See doc above.
 	OuterBatcherLinger    time.Duration  // Straggler-flush timer for the outer drain goroutine; defaults to defaultOuterBatcherLinger when zero/negative
 
 	// TLS/Authentication configuration
