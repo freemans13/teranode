@@ -138,6 +138,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 // Start initializes the create and spend batchers for throughput optimization.
 // Without calling Start(), Create() and Spend() work in direct (unbatched) mode.
 func (s *Store) Start(_ context.Context) {
+	maxConcurrent := s.settings.UtxoStore.BatcherMaxConcurrent
+
 	// Create batcher — pipelines N creates via COPY to staging + INSERT...SELECT.
 	storeBatchSize := s.settings.UtxoStore.StoreBatcherSize
 	if storeBatchSize <= 0 {
@@ -148,6 +150,7 @@ func (s *Store) Start(_ context.Context) {
 		storeBatchDuration = 10 * time.Millisecond
 	}
 	s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
+	tuneBatcher(s.createBatcher, s.settings.UtxoStore.StoreBatcherDrainMode, maxConcurrent)
 
 	// Spend batcher — pipelines N validation CTEs via SendBatch (no transaction needed).
 	// background=true is safe because pipelined CTEs don't hold row locks across batches.
@@ -160,17 +163,44 @@ func (s *Store) Start(_ context.Context) {
 		spendBatchDuration = 10 * time.Millisecond
 	}
 	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, true)
+	tuneBatcher(s.spendBatcher, s.settings.UtxoStore.SpendBatcherDrainMode, maxConcurrent)
 
 	// Get batcher — pipelines N SELECTs via SendBatch.
-	// Duration matches spend/create batcher (configured via settings).
-	getBatchSize := 500
-	getBatchDuration := storeBatchDuration
+	getBatchSize := s.settings.UtxoStore.GetBatcherSize
+	if getBatchSize <= 0 {
+		getBatchSize = 500
+	}
+	getBatchDuration := time.Duration(s.settings.UtxoStore.GetBatcherDurationMillis) * time.Millisecond
+	if getBatchDuration <= 0 {
+		getBatchDuration = storeBatchDuration
+	}
 	s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, true)
+	tuneBatcher(s.getBatcher, s.settings.UtxoStore.GetBatcherDrainMode, maxConcurrent)
 
 	// Unlock batcher — pipelines N UPDATEs via SendBatch.
-	unlockBatchSize := 500
-	unlockBatchDuration := storeBatchDuration
+	// (The settings key is named LockedBatcher* to match the aerospike store.)
+	unlockBatchSize := s.settings.UtxoStore.LockedBatcherSize
+	if unlockBatchSize <= 0 {
+		unlockBatchSize = 500
+	}
+	unlockBatchDuration := time.Duration(s.settings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
+	if unlockBatchDuration <= 0 {
+		unlockBatchDuration = storeBatchDuration
+	}
 	s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
+	tuneBatcher(s.unlockBatcher, s.settings.UtxoStore.LockedBatcherDrainMode, maxConcurrent)
+}
+
+// tuneBatcher applies optional drain mode and max-concurrent caps after a
+// batcher is constructed. No-op for zero / false values so existing
+// deployments see identical behaviour until they opt in.
+func tuneBatcher[T any](b *batcher.Batcher[T], drainMode bool, maxConcurrent int) {
+	if drainMode {
+		b.SetDrainMode(true)
+	}
+	if maxConcurrent > 0 {
+		b.SetMaxConcurrent(maxConcurrent)
+	}
 }
 
 // Close drains the batched-write workers and releases the connection pool.
