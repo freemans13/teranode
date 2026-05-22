@@ -82,11 +82,25 @@ func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blo
 			return outputArrayParams{}, err
 		}
 		p.idx = append(p.idx, int64(i))
+		// Coerce nil → empty []byte. The outputs.locking_script column is
+		// BYTEA NOT NULL; a zero-byte pkScript is legal on chain (BSV testnet
+		// has historical blocks with 1-sat anyone-can-spend outputs whose
+		// pkScript is genuinely 0 bytes — e.g. testnet block 50767 tx
+		// 38e6f72bc717d8a423e717f59c098b8f6f7adb2f0f85833ec02e4266bf3fad65,
+		// vout 0). Without this coercion the INSERT fails with
+		// "null value in column \"locking_script\" violates not-null
+		// constraint" and the block stalls forever in legacy catchup.
+		//
+		// nil arises because go-wire's arena.Alloc(0) returns nil, which
+		// propagates through bytes.Clone(nil) and []byte(*LockingScript).
+		// Empty []byte is valid bytea and round-trips correctly.
+		script := []byte{}
 		if output.LockingScript != nil {
-			p.lockingScript = append(p.lockingScript, []byte(*output.LockingScript))
-		} else {
-			p.lockingScript = append(p.lockingScript, nil)
+			if s := []byte(*output.LockingScript); s != nil {
+				script = s
+			}
 		}
+		p.lockingScript = append(p.lockingScript, script)
 		p.satoshis = append(p.satoshis, int64(output.Satoshis))
 		p.frozen = append(p.frozen, false)
 		p.utxoHash = append(p.utxoHash, utxoHash[:])
