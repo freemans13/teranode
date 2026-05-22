@@ -379,6 +379,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Drain mode is beneficial for stages that receive bursts (Get, Create)
 	// but harmful for stages where items trickle in one-at-a-time (Spend,
 	// SetLocked) — single-item batches trigger Aerospike executeSingle fallback.
+	// Outpoint sits between the two: under #893's BatchPreviousOutputsDecorate
+	// fan-out the batcher fills by size from concurrent producers, so drain
+	// mode would shrink those wide batches; under the single-producer fallbacks
+	// (cmd/rewindblockchain, legacy per-tx decorate) the batcher otherwise
+	// idles on its 10 ms timer, so drain mode helps. Default off — operators opt in.
 	if tSettings.UtxoStore.GetBatcherDrainMode {
 		s.getBatcher.SetDrainMode(true)
 	}
