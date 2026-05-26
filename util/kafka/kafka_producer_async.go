@@ -44,7 +44,38 @@ type KafkaAsyncProducerI interface {
 	Publish(msg *Message)
 }
 
+// defaultOuterBatcherLinger is the default time the outer async batcher
+// waits for stragglers to join the buffer before draining into franz-go.
+// It is intentionally short — the outer batcher exists only to amortise
+// channel reads, NOT to batch records at the broker level (franz-go's
+// per-partition batcher does that). See KafkaProducerConfig.OuterBatcherLinger.
+const defaultOuterBatcherLinger = 10 * time.Millisecond
+
 // KafkaProducerConfig holds configuration for the async Kafka producer.
+//
+// The three URL params named after Sarama's Flush.* triggers no longer map
+// cleanly onto a single knob each — set them with intent, not by analogy
+// to Sarama:
+//
+//   - FlushFrequency → kgo.ProducerLinger only. This is franz-go's
+//     PER-PARTITION linger: how long franz-go waits for a partition's
+//     batch to fill before sending it to the broker. It does NOT drive
+//     the outer batcher's drain timer any more — see OuterBatcherLinger.
+//   - FlushMessages has TWO effects, both keyed on the same value:
+//     (1) kgo.MaxBufferedRecords — global back-pressure cap; once
+//     exceeded Produce() blocks; (2) outer-batcher flush-size trigger
+//     via currentBatchSize(): when the wrapper's pending buffer reaches
+//     this length, it drains into franz-go without waiting for the
+//     linger. So it IS a (coarse) flush trigger, just not at the
+//     broker level.
+//   - FlushBytes → kgo.ProducerBatchMaxBytes (per-partition batch hard
+//     cap; clamped to ≥1 MiB). Not a flush trigger.
+//
+// OuterBatcherLinger is the outer drain goroutine's straggler-flush
+// timer. It used to be derived from FlushFrequency, which silently
+// stacked a second linger on every record and caused the dev-scale-1/2
+// txmeta regression at 1.2M TPS. It is now decoupled and defaults to
+// defaultOuterBatcherLinger (10ms); operators should rarely change it.
 type KafkaProducerConfig struct {
 	Logger                ulogger.Logger // Logger instance
 	URL                   *url.URL       // Kafka URL
@@ -54,9 +85,10 @@ type KafkaProducerConfig struct {
 	ReplicationFactor     int16          // Replication factor for topic
 	RetentionPeriodMillis string         // Message retention period
 	SegmentBytes          string         // Segment size in bytes
-	FlushBytes            int            // Flush threshold in bytes
-	FlushMessages         int            // Number of messages before flush
-	FlushFrequency        time.Duration  // Time between flushes
+	FlushBytes            int            // → kgo.ProducerBatchMaxBytes (per-partition batch hard cap, clamped ≥1 MiB). See doc above.
+	FlushMessages         int            // Dual use: kgo.MaxBufferedRecords AND outer-batcher flush-size trigger via currentBatchSize(). See doc above.
+	FlushFrequency        time.Duration  // → kgo.ProducerLinger only (per-partition broker-side linger). Outer batcher now uses OuterBatcherLinger. See doc above.
+	OuterBatcherLinger    time.Duration  // Straggler-flush timer for the outer drain goroutine; defaults to defaultOuterBatcherLinger when zero/negative
 
 	// TLS/Authentication configuration
 	EnableTLS     bool   // Enable TLS for Kafka connection
@@ -166,6 +198,7 @@ func NewKafkaAsyncProducerFromURL(ctx context.Context, logger ulogger.Logger, ur
 		FlushBytes:            util.GetQueryParamInt(url, "flush_bytes", 1024*1024),
 		FlushMessages:         util.GetQueryParamInt(url, "flush_messages", 50_000),
 		FlushFrequency:        util.GetQueryParamDuration(url, "flush_frequency", 10*time.Second),
+		OuterBatcherLinger:    util.GetQueryParamDuration(url, "outer_batcher_linger", defaultOuterBatcherLinger),
 		EnableTLS:             enableTLS,
 		TLSSkipVerify:         tlsSkipVerify,
 		TLSCAFile:             tlsCAFile,
@@ -241,7 +274,9 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*Kaf
 		logger.Warnf("flush_bytes=%d for topic %s clamped to %d for franz-go compatibility", cfg.FlushBytes, cfg.Topic, batchMaxBytes)
 	}
 
-	// Build franz-go client options
+	// Build franz-go client options. The mapping between the URL's flush_*
+	// query params and franz-go options is documented on KafkaProducerConfig;
+	// read those comments before changing any of these settings.
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.BrokersURL...),
 		kgo.DefaultProduceTopic(cfg.Topic),
@@ -302,21 +337,35 @@ func NewKafkaAsyncProducer(logger ulogger.Logger, cfg KafkaProducerConfig) (*Kaf
 	return producer, nil
 }
 
+// currentBatchLinger returns the straggler-flush timeout for the outer
+// drain goroutine — how long a non-empty buffer waits for more records
+// before being drained into franz-go. This is decoupled from
+// FlushFrequency: that field is the franz-go per-partition linger
+// (kgo.ProducerLinger), a separate concern.
+//
+// Note on the adaptive-slow bounds [50ms, 500ms]: when this function
+// was driven by FlushFrequency (default 10s, scale-1/2 setting 1s) the
+// bounds were [200ms, 5s] — i.e. 10× larger. They were compressed by
+// the same factor when the base switched to OuterBatcherLinger
+// (default 10ms). The bounds still serve their original purpose
+// (don't drop below "a few base lingers", don't sit above "a small
+// multiple of base") at the new scale.
 func (c *KafkaAsyncProducer) currentBatchLinger() time.Duration {
+	base := c.Config.OuterBatcherLinger
+	if base <= 0 {
+		base = defaultOuterBatcherLinger
+	}
 	if c.adaptiveSlow.Load() {
-		linger := c.Config.FlushFrequency * 4
-		if linger < 200*time.Millisecond {
-			linger = 200 * time.Millisecond
+		linger := base * 4
+		if linger < 50*time.Millisecond {
+			linger = 50 * time.Millisecond
 		}
-		if linger > 5*time.Second {
-			linger = 5 * time.Second
+		if linger > 500*time.Millisecond {
+			linger = 500 * time.Millisecond
 		}
 		return linger
 	}
-	if c.Config.FlushFrequency <= 0 {
-		return 10 * time.Second
-	}
-	return c.Config.FlushFrequency
+	return base
 }
 
 func (c *KafkaAsyncProducer) currentBatchSize() int {
