@@ -714,6 +714,15 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 		return
 	}
 
+	// If the peer's socket was already torn down by the time this newPeerMsg
+	// drained from msgChan, don't insert it into peerStates at all. Pairs
+	// with the Connected() guard in startSync to close the window during
+	// which a dead pointer can sit in the map waiting for a donePeerMsg.
+	if !peer.Connected() {
+		sm.logger.Debugf("[handleNewPeerMsg] peer %s already disconnected before registration, skipping", peer.String())
+		return
+	}
+
 	sm.logger.Infof("New valid peer %s (%s)", peer, peer.UserAgent())
 
 	// Initialize the peer state
@@ -2075,7 +2084,9 @@ out:
 func (sm *SyncManager) NewPeer(peer *peerpkg.Peer, done chan struct{}) {
 	// Ignore if we are shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
-		done <- struct{}{}
+		if done != nil {
+			done <- struct{}{}
+		}
 		return
 	}
 	sm.msgChan <- &newPeerMsg{peer: peer, reply: done}
@@ -2087,7 +2098,9 @@ func (sm *SyncManager) NewPeer(peer *peerpkg.Peer, done chan struct{}) {
 func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan struct{}) {
 	// Don't accept more transactions if we're shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
-		done <- struct{}{}
+		if done != nil {
+			done <- struct{}{}
+		}
 		return
 	}
 
@@ -2178,7 +2191,9 @@ func (sm *SyncManager) QueueHeaders(headers *wire.MsgHeaders, peer *peerpkg.Peer
 func (sm *SyncManager) DonePeer(peer *peerpkg.Peer, done chan struct{}) {
 	// Ignore if we are shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
-		done <- struct{}{}
+		if done != nil {
+			done <- struct{}{}
+		}
 		return
 	}
 
