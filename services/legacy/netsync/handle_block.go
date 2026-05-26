@@ -880,6 +880,12 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					validator.WithSkipPolicyChecks(true),
 					validator.WithSkipTxMetaPublishing(true),
 					validator.WithCreateConflicting(true),
+					// PreValidateTransactions is only reached via the quickValidationMode
+					// path (see prepareSubtrees → ValidateTransactionsLegacyMode), which
+					// runs only when the block height is at or below the highest
+					// hard-coded checkpoint. PoW + checkpoint linkage establish the chain
+					// as canonical, so re-running BDK scripts is pure overhead.
+					validator.WithSkipScriptValidation(true),
 				); validateErr != nil {
 					// ErrTxConflicting is expected during legacy catchup when the UTXO store
 					// has stale spending data. The block is confirmed, so its transactions
