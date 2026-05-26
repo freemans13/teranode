@@ -478,6 +478,17 @@ func (sm *SyncManager) startSync() {
 			continue
 		}
 
+		// Defence-in-depth: never elect a peer whose socket has already been
+		// torn down. If one slips into peerStates (e.g. a future regression in
+		// the new-peer registration path), picking it here would push
+		// getheaders into a closed connection and stall sync for the duration
+		// of maxLastBlockTime before rotating.
+		if !peer.Connected() {
+			sm.logger.Debugf("[startSync] peer %v is not connected, skipping", peer.String())
+
+			continue
+		}
+
 		// Add any peers on the same block to okPeers. These should
 		// only be used as a last resort.
 
