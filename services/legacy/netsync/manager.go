@@ -342,15 +342,16 @@ type SyncManager struct {
 	quit         chan struct{}
 
 	// TERANODE services
-	blockchainClient  teranodeblockchain.ClientI
-	validationClient  validator.Interface
-	utxoStore         utxostore.Store
-	subtreeStore      blob.Store
-	subtreeValidation subtreevalidation.Interface
-	blockValidation   blockvalidation.Interface
-	blockAssembly     blockassembly.ClientI
-	legacyKafkaInvCh  chan *kafka.Message
-	txAnnounceBatcher *batcher.BatcherWithDedup[TxHashAndFee]
+	blockchainClient    teranodeblockchain.ClientI
+	validationClient    validator.Interface
+	utxoStore           utxostore.Store
+	subtreeStore        blob.Store
+	subtreeValidation   subtreevalidation.Interface
+	blockValidation     blockvalidation.Interface
+	blockAssembly       blockassembly.ClientI
+	legacyKafkaInvCh    chan *kafka.Message
+	txAnnounceBatcher   *batcher.BatcherWithDedup[TxHashAndFee]
+	subtreeWriteBatcher *SubtreeWriteBatcher // lazily created on first catch-up block; nil outside catch-up
 
 	// These fields should only be accessed from the blockHandler thread
 	// (except syncPeer/syncPeerState which are protected by syncPeerMu).
@@ -2204,7 +2205,18 @@ func (sm *SyncManager) Stop() error {
 	sm.requestedTxns.Stop()
 	sm.requestedBlocks.Stop()
 
-	return nil
+	var stopErr error
+	if sm.subtreeWriteBatcher != nil {
+		if err := sm.subtreeWriteBatcher.Stop(context.Background()); err != nil {
+			// Log and propagate: a drain failure may mean buffered subtree
+			// items were lost, and callers need to see the unclean shutdown.
+			sm.logger.Errorf("[SyncManager] SubtreeWriteBatcher.Stop: %v", err)
+			stopErr = err
+		}
+		sm.subtreeWriteBatcher = nil
+	}
+
+	return stopErr
 }
 
 // SyncPeerID returns the ID of the current sync peer, or 0 if there is none.
