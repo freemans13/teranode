@@ -15,6 +15,7 @@ func TestDAHSchemaObjectsExist(t *testing.T) {
 		{"brin spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_spent_at_height_brin'`},
 		{"brin txs", `SELECT 1 FROM pg_indexes WHERE indexname='txs_p00_mined_at_height_brin'`},
 		{"dah_watermark table", `SELECT 1 FROM information_schema.tables WHERE table_name='dah_watermark'`},
+		{"dah_watermark seed row", `SELECT last_swept_height FROM dah_watermark WHERE id = 1`},
 	} {
 		var ok int
 		err := store.pool.QueryRow(ctx, q.sql).Scan(&ok)
