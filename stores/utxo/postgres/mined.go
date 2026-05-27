@@ -53,42 +53,17 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	// so duplicates are harmless.
 	var updateSQL string
 	if minedBlockInfo.OnLongestChain {
-		retention := uint32(0)
-		if s.settings != nil {
-			retention = s.settings.GetUtxoStoreBlockHeightRetention()
-		}
-		if retention > 0 {
-			newDAH := int64(s.blockHeight.Load() + 1 + retention)
-			// DAH handling on mine:
-			//   - preserve_until set → leave DAH alone.
-			//   - existing DAH lower than newDAH → bump it.
-			//   - DAH NULL AND every output already has a spend row → set DAH
-			//     (covers the case where a tx is mined after all its outputs
-			//     were already spent; without this branch the tx would never
-			//     become prunable).
-			//   - otherwise → leave DAH unchanged.
-			updateSQL = fmt.Sprintf(`UPDATE txs t SET
+		currentHeight := int64(s.blockHeight.Load())
+		// Record mined_at_height for Worker 2 (deferred DAH sweep).
+		// DAH is no longer stamped inline here; Worker 2 handles the
+		// "fully-spent-then-mined" case by reading mined_at_height.
+		updateSQL = fmt.Sprintf(`UPDATE txs SET
 				block_ids = COALESCE(block_ids, '{}') || $2::int[],
 				block_heights = COALESCE(block_heights, '{}') || $3::int[],
 				subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
 				locked = false, unmined_since = NULL,
-				delete_at_height = CASE
-					WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
-					WHEN t.delete_at_height IS NOT NULL AND t.delete_at_height < %d THEN %d
-					WHEN t.delete_at_height IS NULL
-					     AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
-					         = (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash)
-					     THEN %d
-					ELSE t.delete_at_height END
-			WHERE t.hash = ANY($1)`, newDAH, newDAH, newDAH)
-		} else {
-			updateSQL = `UPDATE txs SET
-				block_ids = COALESCE(block_ids, '{}') || $2::int[],
-				block_heights = COALESCE(block_heights, '{}') || $3::int[],
-				subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
-				locked = false, unmined_since = NULL
-			WHERE hash = ANY($1)`
-		}
+				mined_at_height = %d
+			WHERE hash = ANY($1)`, currentHeight)
 	} else {
 		updateSQL = `UPDATE txs SET
 			block_ids = COALESCE(block_ids, '{}') || $2::int[],

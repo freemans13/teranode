@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
@@ -79,6 +80,50 @@ func spendAllOutputs(t *testing.T, store *Store, parentTx *bt.Tx, spendHeight ui
 		`SELECT count(*) FROM outputs WHERE tx_hash=$1`, parentHash).Scan(&outputCount))
 	require.Equal(t, outputCount, spendCount,
 		"parent must be fully spent (count(spends) == count(outputs))")
+}
+
+// newUnminedSingleOutputTx creates a transaction WITHOUT mined info (unmined_since set,
+// block_ids NULL). Uses testExtendedTx and stores it at the given createHeight.
+func newUnminedSingleOutputTx(t *testing.T, store *Store) *bt.Tx {
+	t.Helper()
+	ctx := context.Background()
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 10) // create at height 10, no WithMinedBlockInfo
+	require.NoError(t, err)
+	return tx
+}
+
+// mineTx marks tx as mined at minedHeight by calling SetMinedMulti.
+// It sets the store's block height to minedHeight first so that mined_at_height is stamped correctly.
+func mineTx(t *testing.T, store *Store, tx *bt.Tx, minedHeight uint32) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, store.SetBlockHeight(minedHeight))
+	_, err := store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{
+		BlockID:        minedHeight,
+		BlockHeight:    minedHeight,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	})
+	require.NoError(t, err)
+}
+
+func TestSetMinedTagsHeightAndDoesNotStampInline(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	tx := newUnminedSingleOutputTx(t, store)
+	spendAllOutputs(t, store, tx, 50) // fully spent while unmined
+	mineTx(t, store, tx, 60)          // SetMinedMulti at height 60
+
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, tx.TxIDChainHash()[:]).Scan(&dah))
+	require.Nil(t, dah, "set-mined must not stamp delete_at_height inline")
+
+	var mh *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT mined_at_height FROM txs WHERE hash=$1`, tx.TxIDChainHash()[:]).Scan(&mh))
+	require.NotNil(t, mh, "set-mined must tag mined_at_height for Worker 2")
 }
 
 func TestSpendTagsHeightAndDoesNotStampInline(t *testing.T) {
