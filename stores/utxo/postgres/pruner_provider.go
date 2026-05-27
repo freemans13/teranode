@@ -48,17 +48,27 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 
 // postgresPrunerService implements pruner.Service for the postgres store.
 type postgresPrunerService struct {
-	store     *Store
-	logger    interface{ Infof(string, ...interface{}) }
-	observers []pruner.Observer
-	mu        sync.Mutex
+	store         *Store
+	logger        interface{ Infof(string, ...interface{}) }
+	observers     []pruner.Observer
+	mu            sync.Mutex
+	cursorStarted bool
 }
 
 var _ pruner.Service = (*postgresPrunerService)(nil)
 
-// Start starts the pruner service. No background goroutines needed.
-func (s *postgresPrunerService) Start(_ context.Context) {
-	s.logger.Infof("[PostgresPrunerService] service ready")
+// Start starts the pruner service and launches the continuous DAH cursor (Worker 2).
+// It is idempotent — subsequent calls are no-ops.
+func (s *postgresPrunerService) Start(ctx context.Context) {
+	s.mu.Lock()
+	if s.cursorStarted {
+		s.mu.Unlock()
+		return
+	}
+	s.cursorStarted = true
+	s.mu.Unlock()
+	s.logger.Infof("[PostgresPrunerService] starting DAH cursor (Worker 2)")
+	go s.runDAHCursor(ctx)
 }
 
 // AddObserver adds an observer to be notified when pruning completes.

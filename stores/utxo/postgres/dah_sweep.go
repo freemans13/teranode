@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
 )
@@ -95,6 +96,49 @@ func (s *Store) dahSafeTip(lag int64) int64 {
 	}
 
 	return h - lag
+}
+
+// runDAHCursor is the Worker 2 background loop: it wakes on a ticker, sweeps
+// sweepDAHUpTo(dahSafeTip(lag)) in a tight inner loop until fewer than batch
+// rows are touched, then sleeps until the next tick. The loop exits cleanly
+// when ctx is cancelled.
+func (s *postgresPrunerService) runDAHCursor(ctx context.Context) {
+	cfg := s.store.settings.UtxoStore
+	batch := cfg.PostgresDAHSweepBatchSize
+	if batch <= 0 {
+		batch = 50000
+	}
+	interval := time.Duration(cfg.PostgresDAHSweepIntervalMillis) * time.Millisecond
+	if interval <= 0 {
+		interval = 200 * time.Millisecond
+	}
+	lag := int64(cfg.PostgresDAHSweepLag)
+	if lag <= 0 {
+		lag = 2
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for {
+				n, err := s.store.sweepDAHUpTo(ctx, s.store.dahSafeTip(lag), batch)
+				if err != nil {
+					s.logger.Infof("[dahCursor] sweep error (retry next tick): %v", err)
+					break
+				}
+				if n < batch {
+					break
+				}
+				if ctx.Err() != nil {
+					return
+				}
+			}
+		}
+	}
 }
 
 // RewindDAHWatermark moves the sweep watermark BACK to forkHeight so that a reorg

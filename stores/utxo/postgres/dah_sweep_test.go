@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -324,6 +325,30 @@ func newUniqueUnminedTx(t *testing.T, store *Store) *bt.Tx {
 	_, err := store.Create(ctx, tx, 10) // unmined — no WithMinedBlockInfo
 	require.NoError(t, err)
 	return tx
+}
+
+func TestWorker2LoopStampsBacklog(t *testing.T) {
+	store, _ := setupTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const N = 30
+	for i := 0; i < N; i++ {
+		p := newUniqueUnminedTx(t, store)
+		mineTx(t, store, p, 100)
+		spendAllOutputs(t, store, p, 101)
+	}
+	require.NoError(t, store.SetBlockHeight(110)) // tip above spends so safeTip>=101
+
+	svc := &postgresPrunerService{store: store, logger: store.logger}
+	svc.Start(ctx)
+
+	require.Eventually(t, func() bool {
+		var n int
+		_ = store.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM txs WHERE delete_at_height IS NOT NULL`).Scan(&n)
+		return n == N
+	}, 10*time.Second, 100*time.Millisecond, "Worker 2 loop must stamp the backlog")
 }
 
 func TestDAHParityBothCompletionOrders(t *testing.T) {
