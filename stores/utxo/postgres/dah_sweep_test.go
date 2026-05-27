@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"math/rand"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -266,4 +267,55 @@ func TestSweepDoesNotProcessAboveSafeTip(t *testing.T) {
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
 	require.NotNil(t, dah)
+}
+
+// newUniqueUnminedTx creates a fresh parentless transaction with randomised
+// output satoshis so that every call produces a distinct txid. It has no
+// inputs (fee = 0) and two P2PKH outputs. Use it instead of
+// newUnminedSingleOutputTx when a test needs multiple independent parent txs
+// in the same store (the canonical testExtendedTx always has the same txid
+// and would cause a primary-key collision on the second insert).
+func newUniqueUnminedTx(t *testing.T, store *Store) *bt.Tx {
+	t.Helper()
+	ctx := context.Background()
+	tx := bt.NewTx()
+	//nolint:gosec
+	_ = tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", rand.Uint64()%1_000_000+10_000)
+	//nolint:gosec
+	_ = tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", rand.Uint64()%1_000_000+10_000)
+	_, err := store.Create(ctx, tx, 10) // unmined — no WithMinedBlockInfo
+	require.NoError(t, err)
+	return tx
+}
+
+func TestDAHParityBothCompletionOrders(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
+
+	// Order 1 — mined FIRST, then fully spent later (completing event = spend).
+	// create unmined, mine at 150, spend all at 160 → completion = max(160,150) = 160.
+	a := newUniqueUnminedTx(t, store)
+	mineTx(t, store, a, 150)
+	spendAllOutputs(t, store, a, 160)
+
+	// Order 2 — fully spent while UNMINED, then mined (completing event = set-mined).
+	// create unmined, spend all at 150, mine at 160 → completion = max(150,160) = 160.
+	b := newUniqueUnminedTx(t, store)
+	spendAllOutputs(t, store, b, 150)
+	mineTx(t, store, b, 160)
+
+	// Sweep with the tip well above 160 so both are in-range and below safe_tip.
+	// SetBlockHeight must come AFTER the final mineTx call (which itself calls
+	// store.SetBlockHeight internally) so the sweep sees height=200.
+	require.NoError(t, store.SetBlockHeight(200))
+	_, err := store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000)
+	require.NoError(t, err)
+
+	for name, tx := range map[string]*bt.Tx{"order1-spend-completes": a, "order2-mine-completes": b} {
+		var dah *int64
+		require.NoError(t, store.pool.QueryRow(ctx,
+			`SELECT delete_at_height FROM txs WHERE hash=$1`, tx.TxIDChainHash()[:]).Scan(&dah))
+		require.NotNil(t, dah, "%s: must be stamped", name)
+		require.Equal(t, int64(160)+1+ret, *dah, "%s: DAH must be completion(160)+1+retention", name)
+	}
 }
