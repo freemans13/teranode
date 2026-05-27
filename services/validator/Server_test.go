@@ -489,6 +489,14 @@ func (m *TestMockValidator) EnsureMTPLoaded(_ context.Context, _ uint32) error {
 	return nil
 }
 
+func (m *TestMockValidator) ValidateBatch(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...Option) ([]ValidationResult, error) {
+	results := make([]ValidationResult, len(txs))
+	for i, tx := range txs {
+		results[i].TxHash = *tx.TxIDChainHash()
+	}
+	return results, nil
+}
+
 // TestServer_Start_FSMContextCancellation verifies graceful shutdown handling
 // when the context is cancelled during the FSM wait. The error must be returned
 // (not swallowed) and must be a context error so the service manager can
