@@ -93,8 +93,11 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 	// normally keeps this current; this guarantees Prune never misses a tx that
 	// completed just before pruning. The stamped DAH is a FUTURE height
 	// (completion+retention), so it is disjoint from what this prune deletes.
-	const dahSweepLag = 2
-	if _, err := s.store.sweepDAHUpTo(ctx, s.store.dahSafeTip(dahSweepLag), 100000); err != nil {
+	lag := int64(s.store.settings.UtxoStore.PostgresDAHSweepLag)
+	if lag <= 0 {
+		lag = 2
+	}
+	if _, err := s.store.sweepDAHUpTo(ctx, s.store.dahSafeTip(lag), 100000); err != nil {
 		s.logger.Infof("[pruner][%s:%d] DAH catch-up sweep error (continuing): %v", blockHashStr, blockHeight, err)
 	}
 
