@@ -351,6 +351,34 @@ func TestWorker2LoopStampsBacklog(t *testing.T) {
 	}, 10*time.Second, 100*time.Millisecond, "Worker 2 loop must stamp the backlog")
 }
 
+func TestBackstopRecoversMissedParent(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(110))
+
+	p := newMinedSingleOutputTx(t, store, 100)
+	spendAllOutputs(t, store, p, 101)
+	// Simulate a missed enumeration: null the height tags so the height-range
+	// sweep can no longer find it.
+	_, err := store.pool.Exec(ctx, `UPDATE spends SET spent_at_height = NULL WHERE prev_tx_hash=$1`, p.TxIDChainHash()[:])
+	require.NoError(t, err)
+	_, err = store.pool.Exec(ctx, `UPDATE txs SET mined_at_height = NULL WHERE hash=$1`, p.TxIDChainHash()[:])
+	require.NoError(t, err)
+
+	// The normal sweep misses it now.
+	_, err = store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000)
+	require.NoError(t, err)
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx, `SELECT delete_at_height FROM txs WHERE hash=$1`, p.TxIDChainHash()[:]).Scan(&dah))
+	require.Nil(t, dah, "height-range sweep cannot find a tag-less tx")
+
+	// Backstop over the full keyspace recovers it.
+	n, err := store.backstopReconcile(ctx, 0x00, 0xff, 100000)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, n, 1)
+	require.NoError(t, store.pool.QueryRow(ctx, `SELECT delete_at_height FROM txs WHERE hash=$1`, p.TxIDChainHash()[:]).Scan(&dah))
+	require.NotNil(t, dah, "backstop must stamp the missed parent")
+}
+
 func TestDAHParityBothCompletionOrders(t *testing.T) {
 	store, ctx := setupTestStore(t)
 	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())

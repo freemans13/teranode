@@ -119,6 +119,11 @@ func (s *postgresPrunerService) runDAHCursor(ctx context.Context) {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	backstopTicker := time.NewTicker(backstopInterval)
+	defer backstopTicker.Stop()
+	var backstopByte int // rotates 0x00..0xff
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -137,8 +142,59 @@ func (s *postgresPrunerService) runDAHCursor(ctx context.Context) {
 					return
 				}
 			}
+		case <-backstopTicker.C:
+			b := backstopByte
+			backstopByte = (backstopByte + 1) & 0xff
+			n, err := s.store.backstopReconcile(ctx, b, b, batch)
+			if err != nil {
+				s.logger.Infof("[dahBackstop] slice 0x%02x error (best-effort, continuing): %v", b, err)
+				continue
+			}
+			if n > 0 {
+				s.logger.Infof("[dahBackstop] slice 0x%02x recovered %d missed tx(s)", b, n)
+			}
 		}
 	}
+}
+
+// backstopInterval is the period between keyspace-slice ticks in the backstop
+// reconciliation loop embedded in runDAHCursor (G5 guarantee-of-last-resort).
+// One byte-slice is processed per tick; the full 256-byte keyspace is covered
+// every 256 ticks (≈4.3 minutes at the default 1-tick/second rate).
+const backstopInterval = 60 * time.Second
+
+// backstopReconcile stamps DAH for mined, fully-spent, un-stamped txs whose hash
+// leading byte is in [loByte, hiByte]. Keyspace-sliced so each run is bounded;
+// the cursor rotates slices over time. Guarantee-of-last-resort (G5) against any
+// enumeration gap in the height-range sweep; normally finds nothing. Stamp-only.
+func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit int) (int, error) {
+	retention := int64(s.settings.GetUtxoStoreBlockHeightRetention())
+	if retention == 0 {
+		return 0, nil
+	}
+	tag, err := s.pool.Exec(ctx, `
+		WITH cand AS (
+			SELECT t.hash,
+			       GREATEST(COALESCE((SELECT max(sp.spent_at_height) FROM spends sp WHERE sp.prev_tx_hash = t.hash), 0),
+			                COALESCE(t.mined_at_height, 0)) AS completion_height
+			FROM txs t
+			WHERE get_byte(t.hash, 0) BETWEEN $1 AND $2
+			  AND t.delete_at_height IS NULL
+			  AND t.preserve_until IS NULL
+			  AND t.unmined_since IS NULL
+			  AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) IS NOT NULL
+			  AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash) > 0
+			  AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
+			      = (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash)
+			LIMIT $3
+		)
+		UPDATE txs t SET delete_at_height = c.completion_height + 1 + $4
+		FROM cand c WHERE t.hash = c.hash`,
+		loByte, hiByte, limit, retention)
+	if err != nil {
+		return 0, errors.NewStorageError("[dahBackstop] [%d,%d]: %v", loByte, hiByte, err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // RewindDAHWatermark moves the sweep watermark BACK to forkHeight so that a reorg
