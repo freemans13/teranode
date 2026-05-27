@@ -456,6 +456,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ReAssignedUtxoSpendableAfterBlocks:      getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
 			BatcherMaxConcurrent:                    getInt("utxostore_batcherMaxConcurrent", 64, alternativeContext...),
 			QueryIdleTimeoutSeconds:                 getInt("utxostore_queryIdleTimeoutSeconds", 60, alternativeContext...),
+			PostgresDAHSweepBatchSize:               getInt("utxostore_postgresDAHSweepBatchSize", 50000, alternativeContext...),
+			PostgresDAHSweepIntervalMillis:          getInt("utxostore_postgresDAHSweepIntervalMillis", 200, alternativeContext...),
+			PostgresDAHSweepLag:                     getInt("utxostore_postgresDAHSweepLag", 2, alternativeContext...),
 		},
 		P2P: P2PSettings{
 			BlockTopic:         getString("p2p_block_topic", "", alternativeContext...),

@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
@@ -18,7 +19,11 @@ func TestMinedThenSpendAllPrunes_Postgres(t *testing.T) {
 	ResetPrunerServiceForTests()
 	t.Cleanup(ResetPrunerServiceForTests)
 
-	store, ctx := setupTestStore(t)
+	store, _ := setupTestStore(t)
+
+	// Use a cancellable ctx so the Worker 2 cursor goroutine exits when the test ends.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
 	provider := any(store).(pruner.PrunerServiceProvider)
 	prunerSvc, err := provider.GetPrunerService()

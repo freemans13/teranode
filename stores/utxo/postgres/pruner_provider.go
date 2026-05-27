@@ -48,17 +48,27 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 
 // postgresPrunerService implements pruner.Service for the postgres store.
 type postgresPrunerService struct {
-	store     *Store
-	logger    interface{ Infof(string, ...interface{}) }
-	observers []pruner.Observer
-	mu        sync.Mutex
+	store         *Store
+	logger        interface{ Infof(string, ...interface{}) }
+	observers     []pruner.Observer
+	mu            sync.Mutex
+	cursorStarted bool
 }
 
 var _ pruner.Service = (*postgresPrunerService)(nil)
 
-// Start starts the pruner service. No background goroutines needed.
-func (s *postgresPrunerService) Start(_ context.Context) {
-	s.logger.Infof("[PostgresPrunerService] service ready")
+// Start starts the pruner service and launches the continuous DAH cursor (Worker 2).
+// It is idempotent — subsequent calls are no-ops.
+func (s *postgresPrunerService) Start(ctx context.Context) {
+	s.mu.Lock()
+	if s.cursorStarted {
+		s.mu.Unlock()
+		return
+	}
+	s.cursorStarted = true
+	s.mu.Unlock()
+	s.logger.Infof("[PostgresPrunerService] starting DAH cursor (Worker 2)")
+	go s.runDAHCursor(ctx)
 }
 
 // AddObserver adds an observer to be notified when pruning completes.
@@ -78,6 +88,18 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 
 	s.logger.Infof("[pruner][%s:%d] starting cleanup scan (delete_at_height <= %d)",
 		blockHashStr, blockHeight, blockHeight)
+
+	// Catch-up DAH sweep up to a committed safe-tip before deleting. Worker 2
+	// normally keeps this current; this guarantees Prune never misses a tx that
+	// completed just before pruning. The stamped DAH is a FUTURE height
+	// (completion+retention), so it is disjoint from what this prune deletes.
+	lag := int64(s.store.settings.UtxoStore.PostgresDAHSweepLag)
+	if lag <= 0 {
+		lag = 2
+	}
+	if _, err := s.store.sweepDAHUpTo(ctx, s.store.dahSafeTip(lag), 100000); err != nil {
+		s.logger.Infof("[pruner][%s:%d] DAH catch-up sweep error (continuing): %v", blockHashStr, blockHeight, err)
+	}
 
 	deletedCount, err := s.deleteTombstoned(ctx, blockHeight)
 	if err != nil {

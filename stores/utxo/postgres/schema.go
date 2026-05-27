@@ -79,6 +79,32 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
+	// BRIN indexes on the monotonic height columns. spends is append-only and
+	// inserted in increasing height order → BRIN is near-free on insert (summary
+	// per heap range, no per-row entries) and selective for recent-height scans.
+	for i := 0; i < numPartitions; i++ {
+		brinStmts := []string{
+			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_spent_at_height_brin ON spends_p%02d USING brin (spent_at_height) WITH (pages_per_range = 32, autosummarize = on)`, i, i),
+			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS txs_p%02d_mined_at_height_brin ON txs_p%02d USING brin (mined_at_height) WITH (pages_per_range = 32, autosummarize = on)`, i, i),
+		}
+		for _, ddl := range brinStmts {
+			if _, err := pool.Exec(ctx, ddl); err != nil {
+				return errors.NewStorageError("brin index creation failed: %v", err)
+			}
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS dah_watermark (
+			id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+			last_swept_height BIGINT NOT NULL DEFAULT 0
+		)`); err != nil {
+		return errors.NewStorageError("dah_watermark creation failed: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO dah_watermark (id, last_swept_height) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`); err != nil {
+		return errors.NewStorageError("dah_watermark seed failed: %v", err)
+	}
+
 	// Partial indexes on txs for iterator/pruner queries.
 	if _, err := pool.Exec(ctx, txsIndexesDDL); err != nil {
 		return errors.NewStorageError("index creation failed: %v", err)
@@ -123,7 +149,8 @@ CREATE TABLE IF NOT EXISTS txs (
     block_heights        INT[],
     subtree_idxs         INT[],
     conflicting_children BYTEA[],
-    inserted_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    inserted_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    mined_at_height      BIGINT
 ) PARTITION BY HASH (hash);`
 
 // Partial indexes on txs.
@@ -155,6 +182,7 @@ CREATE TABLE IF NOT EXISTS spends (
     prev_tx_hash    BYTEA  NOT NULL,
     prev_output_idx BIGINT NOT NULL,
     spending_data   BYTEA  NOT NULL,
+    spent_at_height BIGINT,
     UNIQUE (prev_tx_hash, prev_output_idx)
 ) PARTITION BY HASH (prev_tx_hash);`
 
