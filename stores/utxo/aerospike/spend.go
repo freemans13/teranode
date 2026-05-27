@@ -520,6 +520,19 @@ func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
 		return
 	}
 
+	s.executeLuaSpendBatch(batch)
+}
+
+// executeLuaSpendBatch runs the Lua UDF spend pipeline for the provided batch. It is the
+// shared backend used by sendSpendBatchLua's Lua route and by the expression path's
+// retry-through-Lua handler. Callers MUST have already run any duplicate-claim
+// filtering, since this method does not re-run it and assumes every item still expects
+// exactly one response on its errCh.
+func (s *Store) executeLuaSpendBatch(batch []*batchSpend) {
+	if len(batch) == 0 {
+		return
+	}
+
 	start := time.Now()
 	stat := gocore.NewStat("sendSpendBatchLua")
 
@@ -536,7 +549,6 @@ func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
 	batchID := s.batchID.Add(1)
 	s.logSpendBatchStart(batchID, len(batch))
 
-	// Prepare and execute batch
 	batchesByKey, err := s.prepareSpendBatches(batch, batchID)
 	if err != nil {
 		return
@@ -548,7 +560,6 @@ func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
 		return
 	}
 
-	// Process results
 	s.processSpendBatchResults(ctx, batchRecords, batchRecordKeys, batchesByKey, batch, batchID)
 	stat.NewStat("postBatchOperate").AddTime(start)
 }

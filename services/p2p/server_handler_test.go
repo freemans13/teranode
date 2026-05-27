@@ -520,6 +520,129 @@ func TestGetNodeStatusMessage(t *testing.T) {
 		require.NotNil(t, msg)
 		assert.Equal(t, 2, msg.ConnectedPeersCount)
 	})
+
+	t.Run("populates FeePolicy from policy settings", func(t *testing.T) {
+		_, pub, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+		require.NoError(t, err)
+		testPeerID, err := peer.IDFromPublicKey(pub)
+		require.NoError(t, err)
+
+		mockP2P := new(MockServerP2PClient)
+		mockP2P.peerID = testPeerID
+
+		mockBC := new(blockchain.Mock)
+		mockBC.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, model.GenesisBlockHeaderMeta, nil)
+		fsmState := blockchain_api.FSMStateType_RUNNING
+		mockBC.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil)
+		blockPersisterData := make([]byte, 4)
+		mockBC.On("GetState", mock.Anything, "BlockPersisterHeight").Return(blockPersisterData, nil)
+
+		tSettings := createBaseTestSettings()
+		tSettings.P2P.ListenMode = settings.ListenModeFull
+		tSettings.Policy.MinMiningTxFee = 0.000005 // 500 sat/kB
+		tSettings.Policy.MaxScriptSizePolicy = 500_000
+		tSettings.Policy.MaxTxSizePolicy = 10_485_760
+		tSettings.Policy.MaxTxSigopsCountsPolicy = 4000
+
+		server := &Server{
+			logger:              ulogger.New("test"),
+			P2PClient:           mockP2P,
+			blockchainClient:    mockBC,
+			settings:            tSettings,
+			startTime:           time.Now(),
+			syncConnectionTimes: sync.Map{},
+			peerRegistry:        NewPeerRegistry(),
+		}
+
+		msg := server.getNodeStatusMessage(context.Background())
+		require.NotNil(t, msg)
+		require.NotNil(t, msg.FeePolicy)
+		assert.Equal(t, uint64(500), msg.FeePolicy.MiningFee.Satoshis)
+		assert.Equal(t, uint64(1000), msg.FeePolicy.MiningFee.Bytes)
+		assert.Equal(t, uint64(500_000), msg.FeePolicy.MaxScriptSizePolicy)
+		assert.Equal(t, uint64(10_485_760), msg.FeePolicy.MaxTxSizePolicy)
+		assert.Equal(t, uint64(4000), msg.FeePolicy.MaxTxSigopsCountsPolicy)
+	})
+
+	t.Run("invalid policy omits both FeePolicy and MinMiningTxFee", func(t *testing.T) {
+		_, pub, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+		require.NoError(t, err)
+		testPeerID, err := peer.IDFromPublicKey(pub)
+		require.NoError(t, err)
+
+		mockP2P := new(MockServerP2PClient)
+		mockP2P.peerID = testPeerID
+
+		mockBC := new(blockchain.Mock)
+		mockBC.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, model.GenesisBlockHeaderMeta, nil)
+		fsmState := blockchain_api.FSMStateType_RUNNING
+		mockBC.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil)
+		blockPersisterData := make([]byte, 4)
+		mockBC.On("GetState", mock.Anything, "BlockPersisterHeight").Return(blockPersisterData, nil)
+
+		tSettings := createBaseTestSettings()
+		tSettings.P2P.ListenMode = settings.ListenModeFull
+		// Negative MaxTxSizePolicy makes policyFromSettings reject the policy.
+		tSettings.Policy.MaxTxSizePolicy = -1
+
+		server := &Server{
+			logger:              ulogger.New("test"),
+			P2PClient:           mockP2P,
+			blockchainClient:    mockBC,
+			settings:            tSettings,
+			startTime:           time.Now(),
+			syncConnectionTimes: sync.Map{},
+			peerRegistry:        NewPeerRegistry(),
+		}
+
+		// Call twice to exercise the sync.Once warn gate — both calls must
+		// still omit the fee fields, only the first call should log Warnf.
+		msg := server.getNodeStatusMessage(context.Background())
+		require.NotNil(t, msg)
+		// Legacy and new fields must agree: both omitted when policy is invalid.
+		assert.Nil(t, msg.FeePolicy)
+		assert.Nil(t, msg.MinMiningTxFee)
+
+		msg2 := server.getNodeStatusMessage(context.Background())
+		require.NotNil(t, msg2)
+		assert.Nil(t, msg2.FeePolicy)
+		assert.Nil(t, msg2.MinMiningTxFee)
+	})
+
+	t.Run("FeePolicy is nil when policy settings are absent", func(t *testing.T) {
+		_, pub, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+		require.NoError(t, err)
+		testPeerID, err := peer.IDFromPublicKey(pub)
+		require.NoError(t, err)
+
+		mockP2P := new(MockServerP2PClient)
+		mockP2P.peerID = testPeerID
+
+		mockBC := new(blockchain.Mock)
+		mockBC.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, model.GenesisBlockHeaderMeta, nil)
+		fsmState := blockchain_api.FSMStateType_RUNNING
+		mockBC.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil)
+		blockPersisterData := make([]byte, 4)
+		mockBC.On("GetState", mock.Anything, "BlockPersisterHeight").Return(blockPersisterData, nil)
+
+		tSettings := createBaseTestSettings()
+		tSettings.P2P.ListenMode = settings.ListenModeFull
+		tSettings.Policy = nil // simulate misconfigured / missing policy
+
+		server := &Server{
+			logger:              ulogger.New("test"),
+			P2PClient:           mockP2P,
+			blockchainClient:    mockBC,
+			settings:            tSettings,
+			startTime:           time.Now(),
+			syncConnectionTimes: sync.Map{},
+			peerRegistry:        NewPeerRegistry(),
+		}
+
+		msg := server.getNodeStatusMessage(context.Background())
+		require.NotNil(t, msg)
+		assert.Nil(t, msg.FeePolicy)
+	})
 }
 
 // --- updatePeerLastMessageTime tests ---
