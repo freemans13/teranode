@@ -14,6 +14,8 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/batchermetrics"
+	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // register pgx stdlib driver
 )
@@ -138,6 +140,19 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 // Start initializes the create and spend batchers for throughput optimization.
 // Without calling Start(), Create() and Spend() work in direct (unbatched) mode.
 func (s *Store) Start(_ context.Context) {
+	// Instrument batchers like the SQL store so batch size / duration / dispatch
+	// reasons are exported via teranode_batcher_* metrics (label batcher="postgres_*").
+	otelTracer := tracing.Tracer("utxo").OTelTracer()
+	batcherOpts := func(name string) []batcher.Option {
+		return []batcher.Option{
+			batcher.WithName(name),
+			batcher.WithLogger(s.logger),
+			batcher.WithMetrics(batchermetrics.Provider()),
+			batcher.WithTracer(otelTracer),
+		}
+	}
+	drain := s.settings.BatcherDrainMode
+
 	// Create batcher — pipelines N creates via COPY to staging + INSERT...SELECT.
 	storeBatchSize := s.settings.UtxoStore.StoreBatcherSize
 	if storeBatchSize <= 0 {
@@ -147,7 +162,10 @@ func (s *Store) Start(_ context.Context) {
 	if storeBatchDuration <= 0 {
 		storeBatchDuration = 10 * time.Millisecond
 	}
-	s.createBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true)
+	s.createBatcher = batcher.NewWithPool(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true, batcherOpts("postgres_create")...)
+	if drain {
+		s.createBatcher.SetDrainMode(true)
+	}
 
 	// Spend batcher — pipelines N validation CTEs via SendBatch (no transaction needed).
 	// background=true is safe because pipelined CTEs don't hold row locks across batches.
@@ -159,18 +177,27 @@ func (s *Store) Start(_ context.Context) {
 	if spendBatchDuration <= 0 {
 		spendBatchDuration = 10 * time.Millisecond
 	}
-	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatch, true)
+	s.spendBatcher = batcher.NewWithPool(spendBatchSize, spendBatchDuration, s.sendSpendBatch, true, batcherOpts("postgres_spend")...)
+	if drain {
+		s.spendBatcher.SetDrainMode(true)
+	}
 
 	// Get batcher — pipelines N SELECTs via SendBatch.
 	// Duration matches spend/create batcher (configured via settings).
 	getBatchSize := 500
 	getBatchDuration := storeBatchDuration
-	s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, true)
+	s.getBatcher = batcher.NewWithPool(getBatchSize, getBatchDuration, s.sendGetBatch, true, batcherOpts("postgres_get")...)
+	if drain {
+		s.getBatcher.SetDrainMode(true)
+	}
 
 	// Unlock batcher — pipelines N UPDATEs via SendBatch.
 	unlockBatchSize := 500
 	unlockBatchDuration := storeBatchDuration
-	s.unlockBatcher = batcher.New(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true)
+	s.unlockBatcher = batcher.NewWithPool(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true, batcherOpts("postgres_unlock")...)
+	if drain {
+		s.unlockBatcher.SetDrainMode(true)
+	}
 }
 
 // Stop closes batchers and database connections.
