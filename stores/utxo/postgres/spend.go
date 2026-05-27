@@ -576,6 +576,8 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		return nil
 	}
 
+	parentSet := make(map[chainhash.Hash]struct{}, len(spends))
+
 	for _, spend := range spends {
 		if spend == nil {
 			continue
@@ -586,6 +588,26 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		)
 		if err != nil {
 			return errors.NewStorageError("[Unspend] failed for %s:%d", spend.TxID, spend.Vout, err)
+		}
+		if spend.TxID != nil {
+			parentSet[*spend.TxID] = struct{}{}
+		}
+	}
+
+	// After deleting spend rows the affected parents are no longer fully spent,
+	// so any deferred-DAH stamp they carry is now invalid. Clear it directly
+	// here (targeted, O(unspent)) rather than relying on the Worker 2 sweep,
+	// which now only enumerates bounded height ranges. This is the reorg-clear.
+	if len(parentSet) > 0 {
+		parentHashes := make([][]byte, 0, len(parentSet))
+		for h := range parentSet {
+			hb := h
+			parentHashes = append(parentHashes, hb[:])
+		}
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE txs SET delete_at_height = NULL WHERE hash = ANY($1)`, parentHashes,
+		); err != nil {
+			return errors.NewStorageError("[Unspend] failed to clear delete_at_height", err)
 		}
 	}
 

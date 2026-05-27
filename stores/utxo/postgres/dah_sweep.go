@@ -11,7 +11,12 @@ import (
 // delete_at_height: stamp completion_height+1+retention when (mined AND fully
 // spent AND not preserved/unmined); clear to NULL otherwise. completion_height =
 // GREATEST(max spent_at_height of its spends, mined_at_height). BRIN indexes make
-// candidate enumeration touch only the recent heap ranges. limit bounds candidates.
+// candidate enumeration touch only the recent heap ranges (both arms are bounded
+// by (fromH, toH]). limit bounds candidates. The target DAH is computed once as
+// new_dah in the state CTE and the UPDATE only writes when it actually changes
+// (IS DISTINCT FROM), avoiding re-stamping the same value every sweep (MVCC churn).
+// Reorg clears are handled directly by Unspend, so no unbounded enumeration of
+// already-stamped txs is needed here.
 func (s *Store) sweepDAHRange(ctx context.Context, fromH, toH int64, limit int) (int, error) {
 	retention := int64(s.settings.GetUtxoStoreBlockHeightRetention())
 	if retention == 0 {
@@ -26,32 +31,30 @@ WITH candidates AS (
         UNION
         SELECT hash FROM txs
         WHERE mined_at_height > $1 AND mined_at_height <= $2
-        UNION
-        -- Already-stamped txs must stay enumerable so a reorg unspend can clear
-        -- their DAH bidirectionally even after their spend rows are deleted
-        -- (bounded by the px_delete_at_height partial index).
-        SELECT hash FROM txs
-        WHERE delete_at_height IS NOT NULL
     ) c
     LIMIT $3
 ),
 state AS (
-    SELECT t.hash, t.preserve_until, t.unmined_since, t.block_ids,
-           (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash) AS out_count,
-           (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash) AS spent_count,
-           GREATEST(COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = t.hash), 0),
-                    COALESCE(t.mined_at_height, 0)) AS completion_height
+    SELECT t.hash,
+           CASE
+               -- "keep current" cases: new_dah == current so the IS DISTINCT FROM
+               -- guard below makes them no-ops (no MVCC churn).
+               WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
+               WHEN t.unmined_since IS NOT NULL THEN t.delete_at_height
+               WHEN t.block_ids IS NULL OR array_length(t.block_ids, 1) IS NULL THEN t.delete_at_height
+               WHEN (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash)
+                    = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
+                    AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash) > 0
+                   THEN GREATEST(COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = t.hash), 0),
+                                 COALESCE(t.mined_at_height, 0)) + 1 + $4
+               ELSE NULL
+           END AS new_dah
     FROM txs t JOIN candidates c ON c.hash = t.hash
 )
-UPDATE txs t SET delete_at_height = CASE
-    WHEN st.preserve_until IS NOT NULL THEN t.delete_at_height
-    WHEN st.unmined_since IS NOT NULL THEN t.delete_at_height
-    WHEN st.block_ids IS NULL OR array_length(st.block_ids, 1) IS NULL THEN t.delete_at_height
-    WHEN st.spent_count = st.out_count AND st.out_count > 0 THEN st.completion_height + 1 + $4
-    ELSE NULL
-    END
+UPDATE txs t SET delete_at_height = st.new_dah
 FROM state st
-WHERE t.hash = st.hash`, fromH, toH, limit, retention)
+WHERE t.hash = st.hash
+  AND t.delete_at_height IS DISTINCT FROM st.new_dah`, fromH, toH, limit, retention)
 	if err != nil {
 		return 0, errors.NewStorageError("[dahSweep] range (%d,%d]: %v", fromH, toH, err)
 	}
@@ -92,4 +95,20 @@ func (s *Store) dahSafeTip(lag int64) int64 {
 	}
 
 	return h - lag
+}
+
+// RewindDAHWatermark moves the sweep watermark BACK to forkHeight so that a reorg
+// causes (forkHeight, tip] to be re-swept: the new chain's spends are tagged at
+// heights the watermark may already have passed, and must be re-evaluated. The
+// guard last_swept_height > forkHeight ensures the watermark is never advanced
+// forward by this call (it only ever rewinds).
+func (s *Store) RewindDAHWatermark(ctx context.Context, forkHeight int64) error {
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE dah_watermark SET last_swept_height = $1 WHERE id = 1 AND last_swept_height > $1`,
+		forkHeight,
+	); err != nil {
+		return errors.NewStorageError("[dahSweep] rewind watermark to %d: %v", forkHeight, err)
+	}
+
+	return nil
 }

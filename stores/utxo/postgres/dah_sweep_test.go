@@ -221,15 +221,53 @@ func TestSweepClearsDAHAfterUnspend(t *testing.T) {
 	_, err := store.sweepDAHUpTo(ctx, 105, 100000)
 	require.NoError(t, err)
 
+	// Sweep must have stamped the fully-spent + mined parent.
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
+	require.NotNil(t, dah, "sweep must stamp fully-spent mined parent")
+
+	// Unspend now clears DAH directly (Change 1): no second sweep needed.
 	unspendAll(t, store, parent)
-	// re-sweep the affected range (reorg would rewind the watermark; here call range directly)
-	_, err = store.sweepDAHRange(ctx, 0, 105, 100000)
+
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
+	require.Nil(t, dah, "Unspend must clear DAH directly, without a re-sweep")
+}
+
+func TestUnspendClearsDAH(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(110))
+
+	parent := newMinedSingleOutputTx(t, store, 100) // pre-mined
+	spendAllOutputs(t, store, parent, 101)          // fully spent at 101
+
+	_, err := store.sweepDAHUpTo(ctx, 110, 100000)
 	require.NoError(t, err)
 
 	var dah *int64
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
-	require.Nil(t, dah, "unspent parent must have DAH cleared (bidirectional)")
+	require.NotNil(t, dah, "fully-spent mined parent must be stamped before unspend")
+
+	unspendAll(t, store, parent)
+
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
+	require.Nil(t, dah, "Unspend must clear delete_at_height for affected parents")
+}
+
+func TestRewindDAHWatermark(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	_, err := store.pool.Exec(ctx, `UPDATE dah_watermark SET last_swept_height = 500 WHERE id = 1`)
+	require.NoError(t, err)
+	require.NoError(t, store.RewindDAHWatermark(ctx, 480))
+	var h int64
+	require.NoError(t, store.pool.QueryRow(ctx, `SELECT last_swept_height FROM dah_watermark WHERE id=1`).Scan(&h))
+	require.Equal(t, int64(480), h)
+	require.NoError(t, store.RewindDAHWatermark(ctx, 600)) // must NOT advance
+	require.NoError(t, store.pool.QueryRow(ctx, `SELECT last_swept_height FROM dah_watermark WHERE id=1`).Scan(&h))
+	require.Equal(t, int64(480), h)
 }
 
 func TestSweepSkipsPartiallySpentAndUnmined(t *testing.T) {
