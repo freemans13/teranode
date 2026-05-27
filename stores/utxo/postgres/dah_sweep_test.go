@@ -379,6 +379,42 @@ func TestBackstopRecoversMissedParent(t *testing.T) {
 	require.NotNil(t, dah, "backstop must stamp the missed parent")
 }
 
+// TestWatermarkResumeAfterRestart documents and guards the crash-safety property
+// of Worker 2's durable state: spent_at_height (in spends) and mined_at_height
+// (in txs) are committed to durable tables before any sweep runs. If the process
+// crashes between the spend commit and the Worker 2 sweep, a fresh sweep resuming
+// from the persisted watermark (which starts at 0) will still find and stamp the
+// parent — the height tags survive the simulated crash.
+func TestWatermarkResumeAfterRestart(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(110))
+
+	// Fully-spent mined parent, but DO NOT run the cursor (simulate a crash
+	// between the spend commit and Worker 2 processing it).
+	p := newMinedSingleOutputTx(t, store, 100)
+	spendAllOutputs(t, store, p, 101)
+
+	// Watermark is still at its seeded value; the height tags are durable.
+	var wm int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT last_swept_height FROM dah_watermark WHERE id=1`).Scan(&wm))
+	require.Equal(t, int64(0), wm, "no sweep ran yet")
+
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, p.TxIDChainHash()[:]).Scan(&dah))
+	require.Nil(t, dah, "not yet stamped")
+
+	// "Restart": a fresh sweep resuming from the persisted watermark still finds
+	// and stamps the parent (the spent_at_height tag survived the simulated crash).
+	_, err := store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000)
+	require.NoError(t, err)
+
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, p.TxIDChainHash()[:]).Scan(&dah))
+	require.NotNil(t, dah, "parent stamped after restart resume — crash-safe")
+}
+
 func TestDAHParityBothCompletionOrders(t *testing.T) {
 	store, ctx := setupTestStore(t)
 	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
