@@ -143,3 +143,127 @@ func TestSpendTagsHeightAndDoesNotStampInline(t *testing.T) {
 	require.NotNil(t, h)
 	require.Equal(t, int64(101), *h)
 }
+
+// ---------------------------------------------------------------------------
+// Task 4 helpers
+// ---------------------------------------------------------------------------
+
+// spendOneOutput spends a SINGLE output (vout) of an already-created parent:
+// it builds a child via getSpendingTx, creates the child in the store, and
+// calls store.Spend at the given height. Unlike spendAllOutputs it does NOT
+// self-assert the parent is fully spent (used by the partial-spend test).
+func spendOneOutput(t *testing.T, store *Store, parentTx *bt.Tx, vout uint32, height uint32) {
+	t.Helper()
+	ctx := context.Background()
+
+	child := getSpendingTx(t, parentTx, vout)
+	_, err := store.Create(ctx, child, height)
+	require.NoError(t, err)
+	_, err = store.Spend(ctx, child, height)
+	require.NoError(t, err)
+}
+
+// unspendAll reverses every recorded spend of parentTx by reading the parent's
+// spend rows and calling store.Unspend. Unspend keys off TxID+Vout only, so
+// the reconstructed *utxo.Spend rows only need those two fields populated.
+func unspendAll(t *testing.T, store *Store, parentTx *bt.Tx) {
+	t.Helper()
+	ctx := context.Background()
+
+	parentHash := parentTx.TxIDChainHash()
+	rows, err := store.pool.Query(ctx,
+		`SELECT prev_output_idx FROM spends WHERE prev_tx_hash=$1`, parentHash[:])
+	require.NoError(t, err)
+
+	var spends []*utxo.Spend
+	for rows.Next() {
+		var vout int64
+		require.NoError(t, rows.Scan(&vout))
+		spends = append(spends, &utxo.Spend{
+			TxID: parentHash,
+			Vout: uint32(vout),
+		})
+	}
+	rows.Close()
+	require.NoError(t, rows.Err())
+	require.NotEmpty(t, spends, "parent must have spend rows to unspend")
+
+	require.NoError(t, store.Unspend(ctx, spends))
+}
+
+func TestSweepStampsFullySpentMinedParent(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(105))
+	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
+
+	parent := newMinedSingleOutputTx(t, store, 100) // pre-mined; 2 outputs
+	spendAllOutputs(t, store, parent, 101)          // fully spent at height 101
+
+	n, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, n, 1)
+
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
+	require.NotNil(t, dah)
+	// completion height = last spend height (101); pre-mined so mined_at_height is NULL.
+	require.Equal(t, int64(101)+1+ret, *dah)
+}
+
+func TestSweepClearsDAHAfterUnspend(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(105))
+
+	parent := newMinedSingleOutputTx(t, store, 100)
+	spendAllOutputs(t, store, parent, 101)
+	_, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	require.NoError(t, err)
+
+	unspendAll(t, store, parent)
+	// re-sweep the affected range (reorg would rewind the watermark; here call range directly)
+	_, err = store.sweepDAHRange(ctx, 0, 105, 100000)
+	require.NoError(t, err)
+
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
+	require.Nil(t, dah, "unspent parent must have DAH cleared (bidirectional)")
+}
+
+func TestSweepSkipsPartiallySpentAndUnmined(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(105))
+
+	parent := newMinedSingleOutputTx(t, store, 100) // 2 outputs
+	spendOneOutput(t, store, parent, 0, 101)        // only 1 of 2 spent
+	_, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	require.NoError(t, err)
+
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
+	require.Nil(t, dah, "partially-spent tx must not be stamped")
+}
+
+func TestSweepDoesNotProcessAboveSafeTip(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(105))
+
+	parent := newMinedSingleOutputTx(t, store, 100)
+	spendAllOutputs(t, store, parent, 105) // fully spent at the tip
+
+	_, err := store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000) // safeTip=103 < 105
+	require.NoError(t, err)
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
+	require.Nil(t, dah, "spends at the open tip must not be swept until below safe_tip")
+
+	require.NoError(t, store.SetBlockHeight(110)) // tip advances; spend at 105 now below safeTip=108
+	_, err = store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000)
+	require.NoError(t, err)
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
+	require.NotNil(t, dah)
+}

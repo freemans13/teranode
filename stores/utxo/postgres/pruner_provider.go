@@ -79,6 +79,15 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 	s.logger.Infof("[pruner][%s:%d] starting cleanup scan (delete_at_height <= %d)",
 		blockHashStr, blockHeight, blockHeight)
 
+	// Catch-up DAH sweep up to a committed safe-tip before deleting. Worker 2
+	// normally keeps this current; this guarantees Prune never misses a tx that
+	// completed just before pruning. The stamped DAH is a FUTURE height
+	// (completion+retention), so it is disjoint from what this prune deletes.
+	const dahSweepLag = 2
+	if _, err := s.store.sweepDAHUpTo(ctx, s.store.dahSafeTip(dahSweepLag), 100000); err != nil {
+		s.logger.Infof("[pruner][%s:%d] DAH catch-up sweep error (continuing): %v", blockHashStr, blockHeight, err)
+	}
+
 	deletedCount, err := s.deleteTombstoned(ctx, blockHeight)
 	if err != nil {
 		return 0, err
