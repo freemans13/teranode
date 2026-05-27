@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"time"
 
@@ -160,25 +161,46 @@ func (s *postgresPrunerService) runDAHCursor(ctx context.Context) {
 // backstopInterval is the period between keyspace-slice ticks in the backstop
 // reconciliation loop embedded in runDAHCursor (G5 guarantee-of-last-resort).
 // One byte-slice is processed per tick; the full 256-byte keyspace is covered
-// every 256 ticks (≈4.3 minutes at the default 1-tick/second rate).
+// every 256 ticks (≈4.3 hours at the default 60s/tick).
 const backstopInterval = 60 * time.Second
 
 // backstopReconcile stamps DAH for mined, fully-spent, un-stamped txs whose hash
 // leading byte is in [loByte, hiByte]. Keyspace-sliced so each run is bounded;
 // the cursor rotates slices over time. Guarantee-of-last-resort (G5) against any
 // enumeration gap in the height-range sweep; normally finds nothing. Stamp-only.
+//
+// The slice is expressed as a bytea range on the hash primary key
+// (hash >= lo AND hash < hi) so the candidate scan rides the hash btree and
+// touches only ~1/256 of the table per single-byte slice, rather than a full
+// partition scan. txids are always exactly 32 bytes and uniformly distributed,
+// so [b,0..0] <= hash < [b+1,0..0] selects exactly first-byte == b. For the
+// top slice (hiByte == 0xff) the upper bound is a 33-byte sentinel
+// [0xff×32, 0x00] which is lexicographically greater than any 32-byte txid,
+// so the all-0xff hash is included.
 func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit int) (int, error) {
 	retention := int64(s.settings.GetUtxoStoreBlockHeightRetention())
 	if retention == 0 {
 		return 0, nil
 	}
+
+	lo := make([]byte, 32)
+	lo[0] = byte(loByte)
+
+	var hi []byte
+	if hiByte < 0xff {
+		hi = make([]byte, 32)
+		hi[0] = byte(hiByte + 1)
+	} else {
+		hi = append(bytes.Repeat([]byte{0xff}, 32), 0x00)
+	}
+
 	tag, err := s.pool.Exec(ctx, `
 		WITH cand AS (
 			SELECT t.hash,
 			       GREATEST(COALESCE((SELECT max(sp.spent_at_height) FROM spends sp WHERE sp.prev_tx_hash = t.hash), 0),
 			                COALESCE(t.mined_at_height, 0)) AS completion_height
 			FROM txs t
-			WHERE get_byte(t.hash, 0) BETWEEN $1 AND $2
+			WHERE t.hash >= $1 AND t.hash < $2
 			  AND t.delete_at_height IS NULL
 			  AND t.preserve_until IS NULL
 			  AND t.unmined_since IS NULL
@@ -190,7 +212,7 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 		)
 		UPDATE txs t SET delete_at_height = c.completion_height + 1 + $4
 		FROM cand c WHERE t.hash = c.hash`,
-		loByte, hiByte, limit, retention)
+		lo, hi, limit, retention)
 	if err != nil {
 		return 0, errors.NewStorageError("[dahBackstop] [%d,%d]: %v", loByte, hiByte, err)
 	}
