@@ -26,13 +26,12 @@ func TestDAHSchemaObjectsExist(t *testing.T) {
 	}
 }
 
-// newMinedSingleOutputTx creates a single-output transaction and stores it
-// pre-mined via store.Create with utxo.WithMinedBlockInfo at the given height.
-// The returned *bt.Tx has exactly one output (vout 0) available to spend.
-//
-// Note: testExtendedTx has 3 outputs; "single-output" here refers to the fact
-// that spendLastOutput only spends vout 0, so only one spend row matters for
-// the DAH-stamping assertion. Using testExtendedTx is idiomatic in this package.
+// newMinedSingleOutputTx creates a transaction and stores it pre-mined via
+// store.Create with utxo.WithMinedBlockInfo at the given height. The tx is the
+// canonical testExtendedTx, which has exactly two spendable P2PKH outputs (no
+// OP_RETURN / unspendable outputs). Paired with spendAllOutputs, the parent is
+// left genuinely fully spent (count(spends) == count(outputs)), which is what
+// Task 4's Worker 2 sweep relies on to stamp delete_at_height.
 func newMinedSingleOutputTx(t *testing.T, store *Store, height uint32) *bt.Tx {
 	t.Helper()
 	ctx := context.Background()
@@ -48,23 +47,45 @@ func newMinedSingleOutputTx(t *testing.T, store *Store, height uint32) *bt.Tx {
 	return tx
 }
 
-// spendLastOutput builds a child tx that spends vout 0 of parentTx, creates it
-// in the store, then calls store.Spend at spendHeight.
-func spendLastOutput(t *testing.T, store *Store, parentTx *bt.Tx, spendHeight uint32) {
+// spendAllOutputs builds a child tx that spends every spendable output of
+// parentTx, creates it in the store, then calls store.Spend at spendHeight.
+// It self-checks that the parent is genuinely fully spent afterwards so that
+// downstream DAH-sweep tests have a correct foundation.
+func spendAllOutputs(t *testing.T, store *Store, parentTx *bt.Tx, spendHeight uint32) {
 	t.Helper()
 	ctx := context.Background()
-	child := getSpendingTx(t, parentTx, 0)
+
+	vouts := make([]uint32, 0, len(parentTx.Outputs))
+	for i, out := range parentTx.Outputs {
+		if out == nil {
+			continue
+		}
+		vouts = append(vouts, uint32(i))
+	}
+	require.NotEmpty(t, vouts, "parent tx must have at least one spendable output")
+
+	child := getSpendingTx(t, parentTx, vouts...)
 	_, err := store.Create(ctx, child, spendHeight)
 	require.NoError(t, err)
 	_, err = store.Spend(ctx, child, spendHeight)
 	require.NoError(t, err)
+
+	// Self-check: the parent must now be fully spent.
+	parentHash := parentTx.TxIDChainHash()[:]
+	var spendCount, outputCount int
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM spends WHERE prev_tx_hash=$1`, parentHash).Scan(&spendCount))
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM outputs WHERE tx_hash=$1`, parentHash).Scan(&outputCount))
+	require.Equal(t, outputCount, spendCount,
+		"parent must be fully spent (count(spends) == count(outputs))")
 }
 
 func TestSpendTagsHeightAndDoesNotStampInline(t *testing.T) {
 	store, ctx := setupTestStore(t)
 
 	parent := newMinedSingleOutputTx(t, store, 100)
-	spendLastOutput(t, store, parent, 101)
+	spendAllOutputs(t, store, parent, 101)
 
 	var dah *int64
 	require.NoError(t, store.pool.QueryRow(ctx,

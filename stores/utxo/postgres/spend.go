@@ -610,17 +610,3 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 
 	return nil
 }
-
-// newDAHOrZero returns the delete_at_height to assign to a tx that becomes
-// fully spent by the current batch, or 0 when retention is disabled. The
-// spend-side SQL CTEs use a `$N > 0` guard to no-op when this is zero.
-func (s *Store) newDAHOrZero() int64 {
-	if s.settings == nil {
-		return 0
-	}
-	retention := s.settings.GetUtxoStoreBlockHeightRetention()
-	if retention == 0 {
-		return 0
-	}
-	return int64(s.blockHeight.Load() + 1 + retention)
-}
