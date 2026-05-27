@@ -42,7 +42,7 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 		DROP FUNCTION IF EXISTS process_delete_at_height(BIGINT) CASCADE;
 		DROP PROCEDURE IF EXISTS materialize_loop() CASCADE;
 		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
-			tx_state, transactions, txs,
+			tx_state, transactions, txs, dah_watermark,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue,
 			batch_notifications CASCADE;
 	`)
