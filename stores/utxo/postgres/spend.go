@@ -33,24 +33,26 @@ type batchSpendItem struct {
 // spendValidationSQL is the CTE used to validate a spend attempt and insert into
 // the append-only spends table. spent_at_height is recorded for deferred DAH
 // computation by Worker 2. Inline DAH stamping (dah_upd) has been removed.
+//
+// v3: the LEFT JOIN to spends in the validation CTE has been dropped.
+// ON CONFLICT DO NOTHING enforces the "spend-once" uniqueness atomically;
+// the caller detects "already spent" by seeing 0 RETURNING rows and then
+// invoking diagnoseSpendFailure (the rare path).
 const spendValidationSQL = `
 WITH validation AS (
     SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
            o.coinbase_spending_height,
            t.locked AS tx_locked, t.conflicting AS tx_conflicting,
-           t.frozen AS tx_frozen,
-           sp.spending_data AS existing_spend
+           t.frozen AS tx_frozen
     FROM outputs o
     JOIN txs t ON t.hash = o.tx_hash
-    LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
     WHERE o.tx_hash = $1 AND o.idx = $2
 ),
 inserted AS (
     INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height)
     SELECT $1, $2, $3, $5
     FROM validation v
-    WHERE v.existing_spend IS NULL
-      AND v.utxo_hash = $4
+    WHERE v.utxo_hash = $4
       AND NOT v.output_frozen AND NOT v.tx_frozen
       AND ($6 OR NOT v.tx_locked)
       AND ($7 OR NOT v.tx_conflicting)
@@ -347,7 +349,6 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	type bulkResult struct {
 		inserted       bool
 		found          bool
-		existingSpend  []byte
 		outputFrozen   bool
 		txFrozen       bool
 		txLocked       bool
@@ -360,12 +361,12 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	for rows.Next() {
 		var bIdx int32
 		r := &bulkResult{}
-		if err := rows.Scan(&bIdx, &r.inserted, &r.existingSpend,
+		if err := rows.Scan(&bIdx, &r.inserted,
 			&r.outputFrozen, &r.txFrozen, &r.txLocked, &r.txConflicting,
 			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock); err != nil {
 			rows.Close()
 			for _, item := range batch {
-				item.errCh <- errors.NewStorageError("[Spend] scan: %v", err)
+				item.errCh <- errors.NewStorageError("[Spend] scan", err)
 			}
 			return false
 		}
@@ -386,20 +387,11 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 			item.errCh <- nil
 			continue
 		}
-		if len(r.existingSpend) > 0 {
-			spendingDataBytes := spend.SpendingData.Bytes()
-			if bytes.Equal(r.existingSpend, spendingDataBytes) {
-				item.errCh <- nil
-				continue
-			}
-			existingSD, parseErr := spendpkg.NewSpendingDataFromBytes(r.existingSpend)
-			if parseErr != nil {
-				item.errCh <- errors.NewProcessingError("failed to parse existing spending data", parseErr)
-				continue
-			}
-			item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSD)
-			continue
-		}
+		// Not inserted — classify by visible validation columns first; if none of
+		// them rejected the spend, the only remaining reason is "row already
+		// existed in spends" (ON CONFLICT DO NOTHING fired). Fall through to
+		// diagnoseSpendFailure to fetch the existing spending_data for the
+		// idempotent-vs-double-spend distinction. This is the rare path.
 		if r.outputFrozen || r.txFrozen {
 			item.errCh <- errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
 		} else if r.txLocked && !item.ignoreLocked {
@@ -413,7 +405,16 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		} else if r.spendableBlock {
 			item.errCh <- errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable yet", spend.TxID, spend.Vout)
 		} else {
-			item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
+			// All validation passed → must be an already-spent row. Look up the
+			// existing spending_data to differentiate idempotent retry vs
+			// double-spend with a different spender.
+			diagErr := s.diagnoseSpendFailure(ctx, item.spend, item.spend.SpendingData.Bytes(),
+				item.blockHeight, item.ignoreLocked, item.ignoreConflicting)
+			if diagErr == nil {
+				item.errCh <- nil // idempotent retry — same spender
+			} else {
+				item.errCh <- diagErr
+			}
 		}
 	}
 
@@ -422,7 +423,14 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 
 // bulkSpendSQL processes an entire batch in ONE query: UNNEST → validate → INSERT → results.
 // spent_at_height is recorded per row for deferred DAH computation by Worker 2.
-// The inline dah_upd CTE (parents + UPDATE txs) has been removed.
+//
+// v3: the LEFT JOIN to spends has been dropped from the validation CTE. The
+// ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING on the INSERT already
+// gives us "already-spent" semantics atomically — duplicate inserts are silently
+// skipped, and the RETURNING set tells us which inputs successfully inserted.
+// The rare "spent but with different spending_data" case (double-spend with a
+// different spender) is classified after the fact by diagnoseSpendFailure,
+// which still queries spends. This drops 1 JOIN per spend on the hot path.
 const bulkSpendSQL = `
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
@@ -439,18 +447,15 @@ validated AS (
            i.expected_utxo_hash, i.block_height, i.ign_locked, i.ign_conflicting,
            o.utxo_hash, o.frozen AS out_frozen, o.spendable_in,
            o.coinbase_spending_height,
-           t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen,
-           sp.spending_data AS existing_spend
+           t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
     FROM items i
     JOIN outputs o ON o.tx_hash = i.prev_tx_hash AND o.idx = i.prev_idx
     JOIN txs t ON t.hash = i.prev_tx_hash
-    LEFT JOIN spends sp ON sp.prev_tx_hash = i.prev_tx_hash AND sp.prev_output_idx = i.prev_idx
 ),
 to_insert AS (
     SELECT prev_tx_hash, prev_idx, spending_data, block_height, batch_idx
     FROM validated
-    WHERE existing_spend IS NULL
-      AND utxo_hash = expected_utxo_hash
+    WHERE utxo_hash = expected_utxo_hash
       AND NOT out_frozen AND NOT tx_frozen
       AND (ign_locked OR NOT tx_locked)
       AND (ign_conflicting OR NOT tx_conflicting)
@@ -465,7 +470,6 @@ inserted AS (
 )
 SELECT v.batch_idx,
        (i.prev_tx_hash IS NOT NULL) AS inserted,
-       v.existing_spend,
        v.out_frozen, v.tx_frozen, v.tx_locked, v.tx_conflicting,
        (v.utxo_hash = v.expected_utxo_hash) AS utxo_match,
        (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > v.block_height) AS coinbase_block,
