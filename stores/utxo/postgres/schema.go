@@ -185,10 +185,3 @@ CREATE TABLE IF NOT EXISTS spends (
     spent_at_height BIGINT,
     UNIQUE (prev_tx_hash, prev_output_idx)
 ) PARTITION BY HASH (prev_tx_hash);`
-
-// createStagingTablesSQL is executed per-connection to ensure temp staging
-// tables exist for the COPY-based create batcher.
-const createStagingTablesSQL = `
-CREATE TEMP TABLE IF NOT EXISTS staging_txs (LIKE txs EXCLUDING ALL) ON COMMIT DELETE ROWS;
-CREATE TEMP TABLE IF NOT EXISTS staging_outputs (LIKE outputs EXCLUDING ALL) ON COMMIT DELETE ROWS;
-`
