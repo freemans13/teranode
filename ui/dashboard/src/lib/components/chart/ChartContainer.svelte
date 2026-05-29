@@ -27,7 +27,7 @@
   style:--height={height}
   style:--width={width}
 >
-  <slot />
+  <slot></slot>
 </div>
 
 <style>

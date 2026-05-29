@@ -19,25 +19,25 @@
     <div class="title-container">
       <div class="title">
         {#if $$slots.title}
-          <slot name="title" />
+          <slot name="title"></slot>
         {:else}
           {title}
         {/if}
       </div>
       <div class="subtitle">
-        <slot name="subtitle" />
+        <slot name="subtitle"></slot>
       </div>
     </div>
     <div class="header-tools">
-      <slot name="header-tools" />
+      <slot name="header-tools"></slot>
     </div>
   </div>
   <div class="content">
-    <slot />
+    <slot></slot>
   </div>
   {#if showFooter}
     <div class="footer">
-      <slot name="footer" />
+      <slot name="footer"></slot>
     </div>
   {/if}
 </div>

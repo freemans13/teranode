@@ -91,9 +91,9 @@
 {#if result}
   <BlockDetailsCard data={result} {display} on:display={onDisplay} />
   {#if display === DetailTab.overview}
-    <div style="height: 20px" />
+    <div style="height: 20px"></div>
     <BlockCoinbaseCard data={result} />
-    <div style="height: 20px" />
+    <div style="height: 20px"></div>
     <BlockSubtreesCard block={result} />
   {/if}
 {:else if $spinCount === 0}

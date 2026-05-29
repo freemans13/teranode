@@ -5,7 +5,6 @@ import (
 
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
 // sampleLocalAvailability checks a sample of transaction hashes from a subtree
@@ -46,7 +45,7 @@ func (u *Server) sampleLocalAvailability(ctx context.Context, subtree *subtreepk
 		if hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 			continue
 		}
-		found, _ := cache.GetMetaCached(ctx, hash, &meta.Data{})
+		_, found := cache.GetMetaCached(ctx, hash)
 		if found {
 			hits++
 		}
