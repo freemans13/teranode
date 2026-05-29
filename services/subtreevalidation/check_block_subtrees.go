@@ -305,7 +305,20 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 					// Retry on 503 — peer's asset service may reject under admission control
 					// while it generates the file on-demand from Aerospike.
-					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(gCtx, url)
+					//
+					// IMPORTANT: pass the parent ctx, NOT gCtx, to the HTTP fetch and the
+					// stream processor. gCtx is the errgroup's cancellable context — using
+					// it here means a single sibling failure cancels every in-flight
+					// subtree_data download in this batch. Because each cancellation closes
+					// the upstream connection, the peer aborts its on-demand creation
+					// (storer.Abort), discarding work that was already paid for in Aerospike
+					// reads. Detaching from gCtx lets each fetch complete (or hit its own
+					// http_streaming_timeout) so the peer can finish writing its subtreeData
+					// file — converting wasted Aerospike work into a pre-warmed cache for
+					// the next retry. The trade-off is that batch failure detection waits
+					// for in-flight peers instead of cancelling early; acceptable here
+					// because the per-fetch streaming timeout still bounds it.
+					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
 					if subtreeDataErr != nil {
 						return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
 					}
@@ -317,8 +330,9 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 						bytesRead: &bytesRead,
 					}
 
-					// Process transactions directly from the stream while storing to disk
-					err = u.processSubtreeDataStream(gCtx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah, arena)
+					// Process transactions directly from the stream while storing to disk.
+					// Same rationale as above for using ctx instead of gCtx.
+					err = u.processSubtreeDataStream(ctx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah, arena)
 					_ = countingBody.Close()
 
 					// Track bytes downloaded from peer after stream is consumed
@@ -439,8 +453,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		return nil, errors.WrapGRPC(err)
 	}
 
-	u.processOrphans(ctx, *block.Header.Hash(), block.Height, blockIds)
-
 	return &subtreevalidation_api.CheckBlockSubtreesResponse{
 		Blessed: true,
 	}, nil
@@ -515,19 +527,11 @@ func (u *Server) validateMissingSubtreesWithOrderedRetry(
 		i, subtreeHash := i, subtreeHash
 
 		g.Go(func() error {
-			subtree, err := validateFn(gCtx, subtreeHash)
-			if err != nil {
+			if _, err := validateFn(gCtx, subtreeHash); err != nil {
 				u.logger.Debugf("[CheckBlockSubtreesRequest] Failed to validate subtree %s: %v", subtreeHash.String(), err)
 				failedParallel[i] = true
 
 				return nil
-			}
-
-			// Remove validated transactions from orphanage
-			if subtree != nil {
-				for _, node := range subtree.Nodes {
-					u.orphanage.Delete(node.Hash)
-				}
 			}
 
 			return nil
@@ -555,16 +559,8 @@ func (u *Server) validateMissingSubtreesWithOrderedRetry(
 			continue
 		}
 
-		subtree, err := validateFn(ctx, subtreeHash)
-		if err != nil {
+		if _, err := validateFn(ctx, subtreeHash); err != nil {
 			return errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err)
-		}
-
-		// Remove validated transactions from orphanage
-		if subtree != nil {
-			for _, node := range subtree.Nodes {
-				u.orphanage.Delete(node.Hash)
-			}
 		}
 	}
 
@@ -854,7 +850,6 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	var (
 		errorsFound         atomic.Uint64
 		missingParentErrors atomic.Uint64
-		addedToOrphanage    atomic.Uint64
 	)
 
 	// Track successfully validated transactions per level for parent metadata
@@ -942,20 +937,11 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 					// Count all other errors
 					errorsFound.Add(1)
 
-					// Handle missing parent transactions by adding to orphanage
 					if errors.Is(err, errors.ErrTxMissingParent) {
+						// missingParentErrors drives the all-missing-parent deferral below;
+						// resolution happens in Phase-3 ordered sequential revalidation.
 						missingParentErrors.Add(1)
-						isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(gCtx, blockchain.FSMStateRUNNING)
-						if runningErr == nil && isRunning {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, adding to orphanage", tx.TxIDChainHash().String())
-							if u.orphanage.Set(*tx.TxIDChainHash(), tx) {
-								addedToOrphanage.Add(1)
-							} else {
-								u.logger.Warnf("[processTransactionsInLevels] Failed to add transaction %s to orphanage - orphanage is full", tx.TxIDChainHash().String())
-							}
-						} else {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", tx.TxIDChainHash().String())
-						}
+						u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent (deferred to sequential revalidation)", tx.TxIDChainHash().String())
 					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
 						// Truly invalid (non-policy) transactions fail the level — no deferral
 						// possible because phase 3 revalidation can't resolve these.
@@ -1010,10 +996,10 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		// stall the block (observed on teratestnet at block 15,631 where
 		// 1,305 of 9,216 txs had cross-subtree parents).
 		if errorsFound.Load() == missingParentErrors.Load() {
-			u.logger.Infof("[processTransactionsInLevels] %d missing-parent errors (deferred to sequential revalidation), %d added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
+			u.logger.Infof("[processTransactionsInLevels] %d missing-parent errors (deferred to sequential revalidation)", errorsFound.Load())
 			return nil
 		}
-		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors (%d missing-parent), %d transactions added to orphanage", errorsFound.Load(), missingParentErrors.Load(), addedToOrphanage.Load())
+		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors (%d missing-parent)", errorsFound.Load(), missingParentErrors.Load())
 	}
 
 	u.logger.Debugf("[processTransactionsInLevels] Successfully processed all %d transactions", totalTxCount)

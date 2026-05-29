@@ -56,7 +56,7 @@
   export let renderKey = ''
 </script>
 
-<div class="chart" use:chartable={{ renderer, theme, options, renderKey }} />
+<div class="chart" use:chartable={{ renderer, theme, options, renderKey }}></div>
 
 <style>
   .chart {
