@@ -145,7 +145,7 @@
   <title>{t('login.title', 'Login - Teranode Admin')}</title>
 </svelte:head>
 
-<div class="login-page">
+<div class="login-page" data-test-id="page-root">
   <div class="login-container">
     <div class="login-card" in:fade={{ duration: 300, delay: 150 }}>
       <div class="login-header">

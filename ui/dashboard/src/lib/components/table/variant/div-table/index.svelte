@@ -151,7 +151,7 @@
         <section class="thead">
           <div class="tr">
             {#if selectable}
-              <div class="th" />
+              <div class="th"></div>
             {/if}
             {#each colDefs as colDef, i (colDef.id)}
               <!-- svelte-ignore a11y-click-events-have-key-events -->
@@ -180,7 +180,7 @@
               </button>
             {/each}
             {#if getRowIconActions}
-              <div class="th" />
+              <div class="th"></div>
             {/if}
           </div>
         </section>
@@ -206,8 +206,7 @@
                       {...{
                         ...getDisplay(renderCells, renderTypes, colDef, idField, item).props,
                         ...(getRenderProps ? getRenderProps(name, colDef, idField, item) : {}),
-                      }}
-                    />
+                      }} />
                   {:else}
                     {getDisplay(renderCells, renderTypes, colDef, idField, item).value}
                   {/if}
@@ -257,8 +256,7 @@
                               ...(getRenderProps
                                 ? getRenderProps(name, colDef, idField, item)
                                 : {}),
-                            }}
-                          />
+                            }} />
                         {:else}
                           {getDisplay(renderCells, renderTypes, colDef, idField, item).value}
                         {/if}
