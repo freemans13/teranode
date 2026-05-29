@@ -130,8 +130,7 @@
           />
           <div
             class="icon"
-            style={`width:var(${switchSizeStr}-icon-size); height:var(${switchSizeStr}-icon-size); border-radius:calc(var(${switchSizeStr}-icon-size) / 2)`}
-          />
+            style={`width:var(${switchSizeStr}-icon-size); height:var(${switchSizeStr}-icon-size); border-radius:calc(var(${switchSizeStr}-icon-size) / 2)`}></div>
         </div>
       </FocusRect>
     </div>

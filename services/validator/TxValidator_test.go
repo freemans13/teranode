@@ -119,6 +119,20 @@ func TestTxValidatorCallsBDKValidationOnceInValidateTransaction(t *testing.T) {
 	assert.Equal(t, []uint32{99, 99}, counter.utxoHeights)
 }
 
+func TestTxValidatorSkipsBDKWhenSkipScriptValidationSet(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	counter := &countingBDKValidator{}
+	txValidator := &TxValidator{
+		logger:   ulogger.TestLogger{},
+		settings: tSettings,
+		bdk:      counter,
+	}
+
+	validationOptions := &Options{SkipPolicyChecks: true, SkipScriptValidation: true}
+	require.NoError(t, txValidator.ValidateTransaction(aTx, 100, []uint32{99, 99}, validationOptions))
+	assert.Equal(t, 0, counter.calls, "BDK ValidateTransaction must not be called when SkipScriptValidation is set")
+}
+
 // policy settings tests
 func TestMaxTxSizePolicy(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
