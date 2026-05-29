@@ -129,7 +129,7 @@
   }
 </script>
 
-<PageWithMenu>
+<PageWithMenu testId="page-root">
   <div class="content">
     <HomeStatsCard loading={statsLoading} data={statsData} onRefresh={getStatsData} />
     {#if Graph}

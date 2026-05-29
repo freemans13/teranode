@@ -227,7 +227,7 @@
   })
 </script>
 
-<PageWithMenu>
+<PageWithMenu testId="page-root">
   <div class="settings-container">
     <header class="settings-header">
       <div class="header-left">
