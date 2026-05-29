@@ -61,7 +61,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aerospike/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -738,8 +738,10 @@ func (s *Store) handleBatchError(batchByKey []aerospike.MapValue, batch []*batch
 		idx := batchItem["idx"].(int)
 		batch[idx].errCh <- errors.NewStorageError("[SPEND_BATCH_LUA][%s] error in aerospike spend batch record, blockHeight %d: %d", batch[idx].spend.TxID.String(), thisBlockHeight, batchID, err)
 	}
-	// Record batch-level failure for circuit breaker
-	if s.spendCircuitBreaker != nil {
+	// Only count infrastructure failures toward the circuit breaker.
+	// Per-record data-state errors (e.g. KEY_NOT_FOUND_ERROR from missing
+	// parents during catch-up sync) must not trip the breaker — issue #953.
+	if s.spendCircuitBreaker != nil && isInfrastructureFailure(err) {
 		s.spendCircuitBreaker.RecordFailure()
 	}
 }

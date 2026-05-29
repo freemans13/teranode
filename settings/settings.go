@@ -196,6 +196,16 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PropagationProxyEnabled: getBool("asset_propagation_proxy_enabled", true, alternativeContext...),
 			PropagationProxyAddress: getString("asset_propagation_proxy_address", "http://localhost:8833", alternativeContext...),
 
+			// Rate limiting and access control
+			HTTPRateLimit:                getInt("asset_httpRateLimit", 1024, alternativeContext...),
+			HTTPHeavyRateLimit:           getInt("asset_httpHeavyRateLimit", 10, alternativeContext...),
+			HTTPPeerRateMultiplier:       getInt("asset_httpPeerRateMultiplier", 5, alternativeContext...),
+			HTTPMinerRateLimit:           getInt("asset_httpMinerRateLimit", 0, alternativeContext...),
+			HTTPBodyLimit:                getString("asset_httpBodyLimit", "100MB", alternativeContext...),
+			TrustedProxyCIDRs:            getString("asset_trustedProxyCIDRs", "", alternativeContext...),
+			PeerAuthAllowlist:            getString("asset_peerAuthAllowlist", "", alternativeContext...),
+			PeerMinerReputationThreshold: getFloat64("asset_peerMinerReputationThreshold", 50.0, alternativeContext...),
+
 			// Concurrency limits for repository methods (0 = unlimited, -1 = NumCPU(), anything else is the specific limit)
 			ConcurrencyGetTransaction:         getInt("asset_concurrency_get_transaction", 0, alternativeContext...),
 			ConcurrencyGetTransactionMeta:     getInt("asset_concurrency_get_transaction_meta", 0, alternativeContext...),
@@ -570,8 +580,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PercentageMissingGetFullData:              getFloat64("subtreevalidation_percentageMissingGetFullData", 20, alternativeContext...),
 			BlacklistedBaseURLs:                       blacklistMap,
 			BlockHeightRetentionAdjustment:            getInt32("subtreevalidation_blockHeightRetentionAdjustment", 0, alternativeContext...),
-			OrphanageTimeout:                          getDuration("subtreevalidation_orphanageTimeout", 15*time.Minute, alternativeContext...),
-			OrphanageMaxSize:                          getInt("subtreevalidation_orphanageMaxSize", 100_000, alternativeContext...),
 			CheckBlockSubtreesConcurrency:             getInt("subtreevalidation_check_block_subtrees_concurrency", 32, alternativeContext...),
 			PauseTimeout:                              getDuration("subtreevalidation_pauseTimeout", 5*time.Minute, alternativeContext...),
 			TxBatchSize:                               getInt("subtreevalidation_check_block_subtrees_tx_batch_size", 1048576, alternativeContext...),

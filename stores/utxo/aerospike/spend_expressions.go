@@ -5,8 +5,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/aerospike/aerospike-client-go/v8"
-	"github.com/aerospike/aerospike-client-go/v8/types"
+	"github.com/bsv-blockchain/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -363,6 +363,10 @@ func (s *Store) processSpendBatchResultsExpressions(
 ) {
 	okCount := 0
 	errCount := 0
+	// infraErrCount tracks only true infrastructure errors so the circuit
+	// breaker does not trip on data-state results like KEY_NOT_FOUND_ERROR
+	// (missing parent during catch-up) or FILTERED_OUT — issue #953.
+	infraErrCount := 0
 
 	// Collect follow-up actions
 	extraRecords := make([]*chainhash.Hash, 0)
@@ -412,6 +416,9 @@ func (s *Store) processSpendBatchResultsExpressions(
 
 			bItem.errCh <- errors.NewStorageError("spend error for %s:%d: %w", bItem.spend.TxID.String(), bItem.spend.Vout, batchRec.Err)
 			errCount++
+			if isInfrastructureFailure(batchRec.Err) {
+				infraErrCount++
+			}
 			continue
 		}
 
@@ -473,12 +480,15 @@ func (s *Store) processSpendBatchResultsExpressions(
 		okCount++
 	}
 
-	// Record successes for circuit breaker
+	// Record circuit-breaker outcome. Only count true infrastructure errors;
+	// data-state errors (KEY_NOT_FOUND_ERROR, FILTERED_OUT) take their own
+	// per-record branches above and are deliberately excluded from
+	// infraErrCount — issue #953.
 	if s.spendCircuitBreaker != nil {
 		if okCount > 0 {
 			s.spendCircuitBreaker.RecordSuccess()
 		}
-		if errCount > 0 {
+		if infraErrCount > 0 {
 			s.spendCircuitBreaker.RecordFailure()
 		}
 	}

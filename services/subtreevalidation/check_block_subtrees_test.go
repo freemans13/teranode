@@ -1581,83 +1581,11 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 		// Add missing parent error
 		mockValidator.Errors = []error{errors.NewTxMissingParentError("missing parent for testing")}
 
-		// Mock blockchain client to return running state
-		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-			mock.Anything, blockchain.FSMStateRUNNING).
-			Return(true, nil)
-
 		// Missing-parent errors are deferred (not fatal) so the caller's
 		// sequential revalidation pass can re-run the failed subtrees in
-		// block order and resolve cross-subtree parent dependencies. The tx
-		// is still recorded in the orphanage.
+		// block order and resolve cross-subtree parent dependencies.
 		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
 		require.NoError(t, err)
-
-		// Verify transaction was added to orphanage for the caller to retry
-		assert.Equal(t, 1, server.orphanage.Len())
-	})
-
-	t.Run("BlockchainNotRunning", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Create test transactions
-		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
-		require.NoError(t, err)
-
-		allTransactions := []*bt.Tx{tx1}
-		blockIds := make(map[uint32]bool)
-
-		// Mock validator to return missing parent errors
-		mockValidator := server.validatorClient.(*validator.MockValidatorClient)
-		mockValidator.UtxoStore = server.utxoStore
-		mockValidator.Errors = []error{errors.NewTxMissingParentError("missing parent for testing")}
-
-		// Mock blockchain client to return NOT running state
-		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-			mock.Anything, blockchain.FSMStateRUNNING).
-			Return(false, nil)
-
-		// Missing-parent errors are deferred to the sequential revalidation
-		// pass. The orphanage is skipped because FSM isn't RUNNING, but the
-		// caller still gets a chance to retry.
-		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
-		require.NoError(t, err)
-
-		// Verify transaction was NOT added to orphanage (blockchain not running)
-		assert.Equal(t, 0, server.orphanage.Len())
-	})
-
-	t.Run("BlockchainClientError", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Create test transactions
-		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
-		require.NoError(t, err)
-
-		allTransactions := []*bt.Tx{tx1}
-		blockIds := make(map[uint32]bool)
-
-		// Mock validator to return missing parent errors
-		mockValidator := server.validatorClient.(*validator.MockValidatorClient)
-		mockValidator.UtxoStore = server.utxoStore
-		mockValidator.Errors = []error{errors.NewTxMissingParentError("missing parent for testing")}
-
-		// Mock blockchain client to return error
-		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-			mock.Anything, blockchain.FSMStateRUNNING).
-			Return(false, errors.NewServiceError("blockchain client error"))
-
-		// Missing-parent errors are deferred even when the FSM check fails.
-		// The orphanage is skipped (conservative when we can't confirm running
-		// state) but the caller's sequential revalidation pass still gets a
-		// chance to retry.
-		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
-		require.NoError(t, err)
-
-		// Verify transaction was NOT added to orphanage (blockchain client error)
-		assert.Equal(t, 0, server.orphanage.Len())
 	})
 
 	t.Run("NilTransaction", func(t *testing.T) {
@@ -2020,46 +1948,6 @@ func TestBlessMissingTransaction(t *testing.T) {
 	})
 }
 
-func TestProcessOrphans(t *testing.T) {
-	t.Run("NoOrphans", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		blockHash := chainhash.Hash{}
-		copy(blockHash[:], []byte("test_block_hash_32_bytes_long___!"))
-
-		blockIds := make(map[uint32]bool)
-
-		// Process orphans with empty orphanage
-		server.processOrphans(context.Background(), blockHash, 100, blockIds)
-
-		// Verify orphanage is still empty
-		assert.Equal(t, 0, server.orphanage.Len())
-	})
-
-	t.Run("WithOrphans", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Add orphaned transaction
-		tx, err := createTestTransaction("orphan")
-		require.NoError(t, err)
-		server.orphanage.Set(*tx.TxIDChainHash(), tx)
-
-		blockHash := chainhash.Hash{}
-		copy(blockHash[:], []byte("test_block_hash_32_bytes_long___!"))
-
-		blockIds := make(map[uint32]bool)
-
-		// Mock validator to return success
-		mockValidator := server.validatorClient.(*validator.MockValidatorClient)
-		mockValidator.UtxoStore = server.utxoStore
-
-		// Process orphans
-		server.processOrphans(context.Background(), blockHash, 100, blockIds)
-	})
-}
-
 func TestCheckBlockSubtrees_ConcurrentProcessing(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -2340,10 +2228,6 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).
 		Return(&currentState, nil).Maybe()
 
-	// Create orphanage to avoid nil pointer dereference
-	orphanage, err := NewOrphanage(time.Minute*10, 100, logger)
-	require.NoError(t, err)
-
 	server := &Server{
 		logger:           logger,
 		settings:         testSettings,
@@ -2352,7 +2236,6 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 		utxoStore:        mockUtxoStore,
 		validatorClient:  mockValidatorClient,
 		blockchainClient: mockBlockchainClient,
-		orphanage:        orphanage,
 	}
 
 	return server, func() {

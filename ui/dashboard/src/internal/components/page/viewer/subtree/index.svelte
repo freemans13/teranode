@@ -111,10 +111,10 @@
 {#if result}
   <SubtreeDetailsCard data={result} {display} {blockHash} on:display={onDisplay} />
   {#if display === DetailTab.overview}
-    <div style="height: 20px" />
+    <div style="height: 20px"></div>
     <SubtreeTxsCard subtree={result} {blockHash} />
   {:else if display === DetailTab.merkleproof}
-    <div style="height: 20px" />
+    <div style="height: 20px"></div>
     <SubtreeMerkleVisualizer subtreeHash={hash} {blockHash} />
   {/if}
 {:else if $spinCount === 0}
