@@ -143,7 +143,7 @@
     </label>
   {/if}
   <div class="content">
-    <slot />
+    <slot></slot>
   </div>
 </div>
 

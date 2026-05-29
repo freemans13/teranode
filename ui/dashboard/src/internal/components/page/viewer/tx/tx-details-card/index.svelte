@@ -216,7 +216,7 @@
       </div>
     {:else if isMerkleProof}
       <div class="merkle-proof">
-        <slot name="merkle-proof" />
+        <slot name="merkle-proof"></slot>
       </div>
     {/if}
   </div>

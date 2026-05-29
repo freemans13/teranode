@@ -33,7 +33,10 @@
         connected = true
         addLog('WebSocket connected')
         addLog('Sending initial connect message...')
-        socket!.send(JSON.stringify({}))
+        // Send a centrifuge bidirectional connect command. The /p2p-ws
+        // endpoint ignores it (it streams raw frames); the asset
+        // /connection/websocket endpoint requires it.
+        socket!.send(JSON.stringify({ id: 1, connect: {} }))
       }
 
       socket.onmessage = (event) => {
@@ -48,37 +51,42 @@
           return
         }
 
-        // Check if this is a node_status message
-        if (data.type === 'node_status' || data?.pub?.data?.type === 'node_status') {
-          const nodeData = data?.pub?.data || data
+        // Two shapes are possible depending on the endpoint:
+        //   - /p2p-ws:                  raw payload at the top level
+        //   - /connection/websocket:    centrifuge push envelope at data.push.pub.data
+        const pubData = data?.push?.pub?.data
+        const payload = pubData ?? data
+        const wrapped = !!pubData
 
+        // Check if this is a node_status message
+        if (payload?.type === 'node_status') {
           // Capture the first node_status
           if (!firstNodeStatus) {
-            firstNodeStatus = nodeData
+            firstNodeStatus = payload
             addLog(`FIRST NODE_STATUS RECEIVED:`)
-            addLog(`  peer_id: ${nodeData.peer_id}`)
-            addLog(`  base_url: ${nodeData.base_url}`)
-            addLog(`  client_name: ${nodeData.client_name || '(not set)'}`)
-            addLog(`  fsm_state: ${nodeData.fsm_state}`)
-            addLog(`  is wrapped: ${!!data?.pub?.data}`)
+            addLog(`  peer_id: ${payload.peer_id}`)
+            addLog(`  base_url: ${payload.base_url}`)
+            addLog(`  client_name: ${payload.client_name || '(not set)'}`)
+            addLog(`  fsm_state: ${payload.fsm_state}`)
+            addLog(`  is wrapped: ${wrapped}`)
           }
 
           messages = [...messages, {
             time: new Date().toISOString(),
-            type: nodeData.type,
-            peer_id: nodeData.peer_id,
-            client_name: nodeData.client_name,
-            wrapped: !!data?.pub?.data,
-            raw: nodeData
+            type: payload.type,
+            peer_id: payload.peer_id,
+            client_name: payload.client_name,
+            wrapped,
+            raw: payload
           }]
         } else {
           // Other message types
-          const msgType = data?.pub?.data?.type || data.type || 'unknown'
+          const msgType = payload?.type || 'unknown'
           messages = [...messages, {
             time: new Date().toISOString(),
             type: msgType,
-            wrapped: !!data?.pub?.data,
-            raw: data?.pub?.data || data
+            wrapped,
+            raw: payload
           }]
         }
       }
@@ -113,7 +121,7 @@
   })
 </script>
 
-<div class="container">
+<div class="container" data-test-id="page-root">
   <Card>
     <div slot="title">
       <Typo variant="title" size="h4" value="WebSocket Test Tool" />

@@ -60,7 +60,7 @@
   tabindex="-1"
 >
   <div class="content">
-    <slot />
+    <slot></slot>
   </div>
   {#if footnote}
     <Typo
