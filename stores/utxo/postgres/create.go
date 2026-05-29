@@ -203,15 +203,26 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 
 	// Build block_id arrays.
 	var blockIDs, blkHeights, subtreeIdxs []int32
+	// minedAtHeight feeds Worker 2's deferred-DAH mine-arm: a tx created already
+	// mined (legacy catch-up) must record the height it was mined at, exactly as
+	// SetMinedMulti does, otherwise the sweep can never enumerate the
+	// fully-spent-then-mined case and it falls to the keyspace backstop. Use the
+	// lowest mined block height (earliest mining).
+	var minedAtHeight *int64
 	if len(options.MinedBlockInfos) > 0 {
 		blockIDs = make([]int32, len(options.MinedBlockInfos))
 		blkHeights = make([]int32, len(options.MinedBlockInfos))
 		subtreeIdxs = make([]int32, len(options.MinedBlockInfos))
+		minH := int64(options.MinedBlockInfos[0].BlockHeight)
 		for i, info := range options.MinedBlockInfos {
 			blockIDs[i] = int32(info.BlockID)
 			blkHeights[i] = int32(info.BlockHeight)
 			subtreeIdxs[i] = int32(info.SubtreeIdx)
+			if int64(info.BlockHeight) < minH {
+				minH = int64(info.BlockHeight)
+			}
 		}
+		minedAtHeight = &minH
 	}
 
 	outArrs, err := buildOutputArrays(txHash, tx, isCoinbase, blockHeight, int(s.settings.ChainCfgParams.CoinbaseMaturity))
@@ -230,14 +241,14 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	err = conn.QueryRow(ctx, `
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
-			block_ids, block_heights, subtree_idxs, conflicting_children)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		ON CONFLICT (hash) DO NOTHING
 		RETURNING hash`,
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
-		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil),
+		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil), minedAtHeight,
 	).Scan(&insertedHash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -455,13 +466,14 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 
 	rows, err := pgxTx.Query(ctx, `
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-			locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs)
+			locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height)
 		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
 		       u.locked, u.conflicting, u.frozen,
 		       CASE WHEN u.mined THEN NULL::bigint ELSE u.unmined_since END,
 		       CASE WHEN u.mined THEN ARRAY[u.block_id]::int[] ELSE NULL::int[] END,
 		       CASE WHEN u.mined THEN ARRAY[u.block_height]::int[] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN ARRAY[u.subtree_idx]::int[] ELSE NULL::int[] END
+		       CASE WHEN u.mined THEN ARRAY[u.subtree_idx]::int[] ELSE NULL::int[] END,
+		       CASE WHEN u.mined THEN u.block_height::bigint ELSE NULL::bigint END
 		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
 		            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
 		            $11::bigint[], $12::boolean[], $13::bigint[], $14::bigint[], $15::bigint[])

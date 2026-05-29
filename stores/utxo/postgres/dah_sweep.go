@@ -63,9 +63,16 @@ state AS (
                WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
                WHEN t.unmined_since IS NOT NULL THEN t.delete_at_height
                WHEN t.block_ids IS NULL OR array_length(t.block_ids, 1) IS NULL THEN t.delete_at_height
+               -- allSpent AND fully within the safe range: the completion height
+               -- (max spent_at_height, mined) must be <= toH ($2). Without this
+               -- bound the mine-arm (or a multi-spend tx the spends-arm enumerates
+               -- via an in-range spend) could stamp DAH off a spend still inside
+               -- the safe-tip lag window — a spend that may still be mid-commit.
                WHEN (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash)
                     = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
                     AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash) > 0
+                    AND GREATEST(COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = t.hash), 0),
+                                 COALESCE(t.mined_at_height, 0)) <= $2
                    THEN GREATEST(COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = t.hash), 0),
                                  COALESCE(t.mined_at_height, 0)) + 1 + $4
                ELSE NULL
