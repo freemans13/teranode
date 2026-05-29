@@ -76,6 +76,28 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 			if _, err := pool.Exec(ctx, ddl); err != nil {
 				return errors.NewStorageError("partition creation failed for %s_p%02d: %v", spec.name, i, err)
 			}
+
+			// Aggressive autovacuum for these high-churn tables (idempotent, so
+			// it also back-fills partitions created before this setting existed).
+			// insert_scale_factor is the important one: spends/outputs are
+			// append-only, so delete/update-driven vacuum never fires from
+			// inserts — but the visibility map must stay fresh or the deferred-DAH
+			// sweep's index-only count subqueries fall back to heap fetches.
+			// Insert-triggered autovacuum keeps the VM current. Cost limit/delay
+			// are sized to keep pace under legacy-sync write volume without
+			// starving the 2GB-budget instance.
+			av := fmt.Sprintf(
+				"ALTER TABLE %s_p%02d SET ("+
+					"autovacuum_vacuum_scale_factor = 0.05, "+
+					"autovacuum_vacuum_insert_scale_factor = 0.02, "+
+					"autovacuum_vacuum_cost_limit = 2000, "+
+					"autovacuum_vacuum_cost_delay = 2, "+
+					"autovacuum_analyze_scale_factor = 0.05)",
+				spec.name, i,
+			)
+			if _, err := pool.Exec(ctx, av); err != nil {
+				return errors.NewStorageError("autovacuum tuning failed for %s_p%02d: %v", spec.name, i, err)
+			}
 		}
 	}
 
