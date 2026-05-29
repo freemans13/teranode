@@ -96,7 +96,7 @@
       <thead>
         <tr>
           {#if selectable}
-            <th />
+            <th></th>
           {/if}
           {#each colDefs as colDef, i (colDef.id)}
             <th
@@ -122,7 +122,7 @@
             </th>
           {/each}
           {#if getRowIconActions}
-            <th />
+            <th></th>
           {/if}
         </tr>
       </thead>
@@ -146,8 +146,7 @@
                     {...{
                       ...getDisplay(renderCells, renderTypes, colDef, idField, item).props,
                       ...(getRenderProps ? getRenderProps(name, colDef, idField, item) : {}),
-                    }}
-                  />
+                    }} />
                 {:else}
                   {getDisplay(renderCells, renderTypes, colDef, idField, item).value}
                 {/if}

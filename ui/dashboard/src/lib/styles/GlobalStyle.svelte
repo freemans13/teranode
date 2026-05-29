@@ -37,7 +37,7 @@
   }
 </script>
 
-<slot />
+<slot></slot>
 
 <style>
   :global(:root) {
