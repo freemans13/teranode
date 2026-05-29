@@ -596,13 +596,31 @@ func (us *UTXOSet) CreateUTXOSet(ctx context.Context, c *consolidator) (err erro
 
 		defer previousUTXOSetReader.Close()
 
-		previousHeader, err := fileformat.ReadHeader(previousUTXOSetReader)
-		if err != nil {
-			return errors.NewStorageError("error reading previous utxo-set header", err)
+		// store.GetIoReader -> validateFileHeader has already consumed the
+		// 8-byte fileformat magic; reading it again here would consume the
+		// first 8 bytes of the block-hash metadata that follows, then the
+		// OUTER loop's UTXOWrapper reader would be misaligned by 8 bytes.
+		// Consume the per-file header fields written by CreateUTXOSet
+		// (32 bytes current block hash + 4 bytes height + 32 bytes
+		// previous block hash) so the loop below starts at the first
+		// UTXOWrapper record. Validate the stored current-block hash
+		// matches what we expected to open, to catch file/key confusion
+		// loudly rather than silently consolidate the wrong UTXOs.
+		var storedCurrentBlockHash chainhash.Hash
+		if _, err := io.ReadFull(previousUTXOSetReader, storedCurrentBlockHash[:]); err != nil {
+			return errors.NewStorageError("error reading previous utxo-set block hash", err)
 		}
-
-		if previousHeader.FileType() != fileformat.FileTypeUtxoSet {
-			return errors.NewStorageError("previous utxo-set header is not a utxo-set header")
+		if !storedCurrentBlockHash.IsEqual(c.firstPreviousBlockHash) {
+			return errors.NewStorageError("previous utxo-set block hash mismatch: want %s got %s",
+				c.firstPreviousBlockHash.String(), storedCurrentBlockHash.String())
+		}
+		// Skip the remaining 36 bytes of per-file metadata (4-byte height
+		// + 32-byte previous block hash). The new set being written
+		// doesn't natively carry the previous set's stored height /
+		// grandparent hash to compare against, so consuming rather than
+		// parsing avoids dead variables.
+		if _, err := io.CopyN(io.Discard, previousUTXOSetReader, 36); err != nil {
+			return errors.NewStorageError("error skipping previous utxo-set header trailer", err)
 		}
 
 	OUTER:
