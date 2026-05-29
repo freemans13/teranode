@@ -92,7 +92,7 @@
   })
 </script>
 
-<PageWithMenu>
+<PageWithMenu testId="page-root">
   <div class="content">
     <div class="fork-nav">
       <Button

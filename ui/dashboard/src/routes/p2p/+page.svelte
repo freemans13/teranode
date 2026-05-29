@@ -177,7 +177,7 @@
 
 <svelte:window bind:innerWidth />
 
-<PageWithMenu>
+<PageWithMenu testId="page-root">
   <div class="tools-container">
     <div class="tools">
       <div class="title">
