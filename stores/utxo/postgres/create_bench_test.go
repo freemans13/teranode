@@ -56,7 +56,7 @@ func setupCreateBenchStore(b *testing.B) (*Store, context.Context) {
 	store, err := New(ctx, ulogger.TestLogger{}, bSettings, storeURL)
 	require.NoError(b, err)
 
-	b.Cleanup(func() { store.Stop() })
+	b.Cleanup(func() { _ = store.Close(context.Background()) })
 	return store, ctx
 }
 

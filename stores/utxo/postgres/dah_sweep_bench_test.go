@@ -56,7 +56,7 @@ func setupBenchStore(b *testing.B) (*Store, context.Context) {
 	require.NoError(b, err)
 
 	b.Cleanup(func() {
-		store.Stop()
+		_ = store.Close(context.Background())
 	})
 
 	return store, ctx
