@@ -4,7 +4,7 @@
   import PageWithMenu from '$internal/components/page/template/menu/index.svelte'
 </script>
 
-<PageWithMenu>
+<PageWithMenu testId="page-root">
   <BlocksTableCard />
 </PageWithMenu>
 

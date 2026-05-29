@@ -127,8 +127,7 @@
           />
           <div
             class="icon"
-            style={`width:var(${radioSizeStr}-icon-size); height:var(${radioSizeStr}-icon-size); border-radius:calc(var(${radioSizeStr}-icon-size) / 2)`}
-          />
+            style={`width:var(${radioSizeStr}-icon-size); height:var(${radioSizeStr}-icon-size); border-radius:calc(var(${radioSizeStr}-icon-size) / 2)`}></div>
         </div>
       </FocusRect>
     </div>
