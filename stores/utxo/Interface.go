@@ -127,6 +127,14 @@ func (s *Spend) Clone() *Spend {
 type IgnoreFlags struct {
 	IgnoreConflicting bool
 	IgnoreLocked      bool
+	// IgnoreUTXOHash records the spend by outpoint only, without verifying the
+	// expected UTXO hash against the stored output. It is a trusted-connect fast
+	// path for legacy IBD below the highest checkpoint: PoW + checkpoint linkage
+	// already establish the chain as canonical, so the spent output is known-good
+	// and the (decorate-derived) UTXO hash check is redundant. Skipping it lets
+	// the caller avoid extending the tx (fetching previous-output scripts/amounts)
+	// entirely. MUST only be set on checkpoint-anchored blocks.
+	IgnoreUTXOHash bool
 }
 
 // ConflictingChildRemoval identifies one (parent, child) pair that should be
