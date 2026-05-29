@@ -168,7 +168,7 @@
       hasBoundaryRight={true}
       on:change={onPage}
     />
-    <div style="height: 24px; width: 12px;" />
+    <div style="height: 24px; width: 12px;"></div>
     <TableToggle value={variant} on:change={onToggle} />
     <Button
       size="small"

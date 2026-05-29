@@ -101,7 +101,7 @@
     {#if showGlobalToolbar}
       <Toolbar style="padding-bottom: 13px;" {showTools} />
     {/if}
-    <slot />
+    <slot></slot>
   </ContentMenu>
 
   <Footer />

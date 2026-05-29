@@ -13,8 +13,7 @@
 <div
   class="cover"
   transition:fade={{ duration: fadeCoverDuration }}
-  style:--cover-col-local={coverCol}
-/>
+  style:--cover-col-local={coverCol}></div>
 
 <div
   class="tui-modal"
@@ -26,7 +25,7 @@
   style:--height-local="{h}px"
   style:--max-content-width={maxContentW}
 >
-  <slot />
+  <slot></slot>
 </div>
 
 <style>
