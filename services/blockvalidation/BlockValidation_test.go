@@ -2317,6 +2317,149 @@ func Test_checkOldBlockIDs(t *testing.T) {
 	})
 }
 
+// Test_checkOldBlockIDs_noPrefetchRoute exercises the no-prefetch route taken
+// when blockchain_use_in_memory_chain_check is true. Mirrors the subtests of
+// Test_checkOldBlockIDs above so the two routes are kept behaviourally
+// equivalent (same pass/fail outcomes per input).
+func Test_checkOldBlockIDs_noPrefetchRoute(t *testing.T) {
+	initPrometheusMetrics()
+
+	testBlock := func() *model.Block {
+		prevHash := chainhash.HashH([]byte("prev"))
+		merkleRoot := chainhash.HashH([]byte("merkle"))
+		return &model.Block{Header: &model.BlockHeader{HashPrevBlock: &prevHash, HashMerkleRoot: &merkleRoot}}
+	}
+
+	// newBlockValidation returns a BlockValidation with settings configured to
+	// dispatch to the no-prefetch route. GetBlockHeaderIDs should never be
+	// called in any of these tests — if it is, that is a bug in the dispatch.
+	newBlockValidation := func(blockchainMock *blockchain.Mock) *BlockValidation {
+		s := &settings.Settings{}
+		s.BlockChain.UseInMemoryChainCheck = true
+		return &BlockValidation{
+			blockchainClient: blockchainMock,
+			settings:         s,
+		}
+	}
+
+	t.Run("dispatches to no-prefetch (no GetBlockHeaderIDs call)", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		txHash := chainhash.HashH([]byte("only-tx"))
+		oldBlockIDsMap.Set(txHash, []uint32{42})
+
+		// Only CheckBlockIsInCurrentChain should be invoked.
+		blockchainMock.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{42}).Return(true, nil).Once()
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.NoError(t, err)
+
+		// Belt-and-braces: assert GetBlockHeaderIDs was NOT called.
+		blockchainMock.AssertNotCalled(t, "GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything)
+		blockchainMock.AssertExpectations(t)
+	})
+
+	t.Run("empty map", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.NoError(t, err)
+		blockchainMock.AssertNotCalled(t, "CheckBlockIsInCurrentChain", mock.Anything, mock.Anything)
+	})
+
+	t.Run("empty parents returns ProcessingError", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		for i := uint32(0); i < 100; i++ {
+			txHash := chainhash.HashH([]byte(fmt.Sprintf("txHash_%d", i)))
+			oldBlockIDsMap.Set(txHash, []uint32{})
+		}
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "blockIDs is empty for txID")
+	})
+
+	t.Run("all parents on chain", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		for i := uint32(0); i < 100; i++ {
+			txHash := chainhash.HashH([]byte(fmt.Sprintf("txHash_%d", i)))
+			oldBlockIDsMap.Set(txHash, []uint32{i})
+		}
+
+		blockchainMock.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.NoError(t, err)
+	})
+
+	t.Run("dedupe cache: identical blockIDs slice hits cache after first lookup", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		for i := uint32(0); i < 100; i++ {
+			txHash := chainhash.HashH([]byte(fmt.Sprintf("txHash_%d", i)))
+			oldBlockIDsMap.Set(txHash, []uint32{1})
+		}
+
+		// Once() — if the dedupe cache fails the mock will fail on the second call.
+		blockchainMock.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{1}).Return(true, nil).Once()
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.NoError(t, err)
+		blockchainMock.AssertExpectations(t)
+	})
+
+	t.Run("not on chain returns BlockInvalidError", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		for i := uint32(0); i < 100; i++ {
+			txHash := chainhash.HashH([]byte(fmt.Sprintf("txHash_%d", i)))
+			oldBlockIDsMap.Set(txHash, []uint32{1})
+		}
+
+		blockchainMock.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{1}).Return(false, nil).Once()
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "are not from current chain")
+	})
+
+	t.Run("RPC error returns ProcessingError", func(t *testing.T) {
+		// CheckBlockIsInCurrentChain returning an error (network blip,
+		// blockchain service unavailable, etc.) must surface as a
+		// ProcessingError — *not* a BlockInvalidError — so the caller
+		// retries rather than invalidating the block.
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		oldBlockIDsMap.Set(chainhash.HashH([]byte("only")), []uint32{42})
+
+		blockchainMock.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{42}).
+			Return(false, errors.NewServiceError("blockchain unavailable")).Once()
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to check if old blocks are part of the current chain")
+		require.NotContains(t, err.Error(), "are not from current chain")
+	})
+
+}
+
 func TestBlockValidation_ParentAndChildInSameBlock(t *testing.T) {
 	initPrometheusMetrics()
 

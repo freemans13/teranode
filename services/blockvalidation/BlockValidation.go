@@ -2107,32 +2107,48 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 
 	defer deferFn()
 
+	// Both routes below dereference block.Header and (transitively, via
+	// block.Hash() inside logging) require a usable header — guard once
+	// up-front so each route can assume a valid block.
+	//
+	// The prefetch route additionally needs HashPrevBlock as the anchor
+	// for GetBlockHeaderIDs. The two call sites of checkOldBlockIDs
+	// differ in whether the block has been committed yet — normal path:
+	// block is NOT in the chain yet (AddBlock runs after this); optimistic
+	// path: block IS in the chain. HashPrevBlock works in both cases. An
+	// earlier version used block.Hash(), which returned empty in the
+	// normal path and defeated the fast-path map.
 	if block.Header == nil || block.Header.HashPrevBlock == nil {
 		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] block header or HashPrevBlock is nil", block.String())
 	}
 
-	// Off-chain-set route — gated by blockchain_use_in_memory_chain_check.
+	// Two strategies, identical result. For every tx in the block we
+	// need to answer "is at least one of this tx's parent block IDs on
+	// the current main chain?".
 	//
-	// When this toggle is true the blockchain store maintains a small
-	// in-memory set of block IDs known to be OFF the main chain (orphans,
-	// invalidated branches). CheckBlockIsInCurrentChain becomes a pure
-	// O(1) lookup against that set with no SQL.
+	//   PREFETCH (this function, default):
+	//     - Fetch the 10,000 most-recent main-chain block IDs via
+	//       GetBlockHeaderIDs.
+	//     - Build a local map and check each tx's parent block IDs
+	//       against it.
+	//     - On miss, fall back to a per-tx CheckBlockIsInCurrentChain
+	//       RPC.
 	//
-	// In that world the original fast-path optimisation here is actively
-	// counter-productive: it issues GetBlockHeaderIDs(..., 10_000) and
-	// builds a 10k-entry map just to avoid the per-entry CheckBlockIsIn
-	// CurrentChain call — which is now itself O(1). Live profiles on
-	// betfair-pc mainnet showed this code-path holding 35% of inuse heap
-	// and 16.5% of CPU; the upfront fetch is the single largest
-	// allocation site (3.2 GB / 30 s) once GC pressure has settled.
+	//   NO-PREFETCH (checkOldBlockIDsWithoutPrefetch, gated by toggle):
+	//     - Skip the prefetch and map build entirely.
+	//     - Just call CheckBlockIsInCurrentChain per tx.
 	//
-	// When the toggle is true we skip the 10k fetch and go straight to
-	// the per-entry CheckBlockIsInCurrentChain call. The string-keyed
-	// dedupe cache (identical blockID slices are common in practice)
-	// is preserved. When the toggle is false we keep the original
-	// behaviour exactly.
+	// The prefetch was a sensible amortisation when
+	// CheckBlockIsInCurrentChain was a recursive SQL CTE per call. When
+	// blockchain_use_in_memory_chain_check is true, the blockchain
+	// store answers that RPC from a small in-memory cache of forked
+	// (off-main-chain) block IDs in O(1) — making the prefetch pure
+	// overhead. Live profiling on betfair-pc mainnet showed the
+	// prefetch holding ~35% of inuse heap (464 MB) and ~16% of CPU on
+	// its own; switching to no-prefetch cut total CPU by 22%, inuse
+	// heap by 29%, and 30 s allocations by 5×.
 	if u.settings != nil && u.settings.BlockChain.UseInMemoryChainCheck {
-		return u.checkOldBlockIDsInMemory(ctx, oldBlockIDsMap, block)
+		return u.checkOldBlockIDsWithoutPrefetch(ctx, oldBlockIDsMap, block)
 	}
 
 	lookupHash := block.Header.HashPrevBlock
@@ -2148,115 +2164,111 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 	}
 
 	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] loaded %d chain block IDs for fast lookup, checking %d old block ID entries", block.Hash().String(), len(currentChainBlockIDs), oldBlockIDsMap.Length())
+		u.logger.Infof("[checkOldBlockIDs][%s] prefetch route: loaded %d chain block IDs, checking %d old block ID entries", block.Hash().String(), len(currentChainBlockIDs), oldBlockIDsMap.Length())
 	}
 
-	currentChainLookupCache := make(map[string]bool, len(currentChainBlockIDs))
-
-	var builder strings.Builder
-	var fastPathCount, slowPathCount, cacheHitCount int
-
-	// range over the oldBlockIDsMap to get txID - oldBlockID pairs
-	oldBlockIDsMap.Iterate(func(txID chainhash.Hash, blockIDs []uint32) bool {
-		if len(blockIDs) == 0 {
-			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] blockIDs is empty for txID: %v", block.String(), txID)
-			return false
-		}
-
-		// check whether the blockIDs are in the current chain we just fetched
+	// Fast pre-check: parent block IDs that appear in the freshly-fetched
+	// main-chain set short-circuit before the dedupe cache and the RPC.
+	fastPath := func(blockIDs []uint32) bool {
 		for _, blockID := range blockIDs {
 			if _, ok := currentChainBlockIDsMap[blockID]; ok {
-				// all good, continue
-				fastPathCount++
 				return true
 			}
 		}
+		return false
+	}
 
-		slices.Sort(blockIDs)
-
-		builder.Reset()
-
-		for i, id := range blockIDs {
-			if i > 0 {
-				builder.WriteString(",") // Add a separator
-			}
-
-			builder.WriteString(strconv.Itoa(int(id)))
-		}
-
-		blockIDsString := builder.String()
-
-		// check whether we already checked exactly the same blockIDs and can use a cache
-		if blocksPartOfCurrentChain, ok := currentChainLookupCache[blockIDsString]; ok {
-			cacheHitCount++
-			if !blocksPartOfCurrentChain {
-				iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain using cache", block.String(), txID, blockIDs)
-				return false
-			}
-
-			return true
-		}
-
-		// Flag to check if the old blocks are part of the current chain
-		slowPathCount++
-		blocksPartOfCurrentChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, blockIDs)
-		// if err is not nil, log the error and continue iterating for the next transaction
-		if err != nil {
-			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] failed to check if old blocks are part of the current chain", block.String(), err)
-			return false
-		}
-
-		// set the cache for the blockIDs
-		currentChainLookupCache[blockIDsString] = blocksPartOfCurrentChain
-
-		// if the blocks are not part of the current chain, stop iteration, set the iterationError and return false
-		if !blocksPartOfCurrentChain {
-			iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain", block.String(), txID, blockIDs)
-			return false
-		}
-
-		return true
-	})
+	iterationError, fastPathCount, lookupCount, cacheHitCount :=
+		u.iterateOldBlockIDsWithCachedLookup(ctx, oldBlockIDsMap, block, fastPath, u.blockchainClient.CheckBlockIsInCurrentChain)
 
 	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] done: fastPath=%d, slowPath=%d, cacheHit=%d", block.Hash().String(), fastPathCount, slowPathCount, cacheHitCount)
+		// "slowPath" is the historical name for the per-tx lookup reached
+		// on a fast-path miss. Kept in the log key for grep continuity even
+		// though the helper counter is now route-neutral (lookupCount).
+		u.logger.Infof("[checkOldBlockIDs][%s] prefetch route done: fastPath=%d, slowPath=%d, cacheHit=%d", block.Hash().String(), fastPathCount, lookupCount, cacheHitCount)
 	}
 
 	return
 }
 
-// checkOldBlockIDsInMemory is the off-chain-set variant of checkOldBlockIDs.
+// checkOldBlockIDsWithoutPrefetch is the no-prefetch variant of
+// checkOldBlockIDs (see checkOldBlockIDs for the strategy comparison).
 //
-// It skips the upfront GetBlockHeaderIDs(10_000) fetch and the
-// 10k-entry main-chain map build. For each (txID, blockIDs) entry it
-// asks blockchainClient.CheckBlockIsInCurrentChain directly — which is
-// an in-memory off-chain-set lookup when blockchain_use_in_memory_chain_check
-// is true. The same string-keyed dedupe cache as the original is kept
-// because identical blockIDs slices are common (sibling txs spending
-// outputs from the same parent block).
+// It answers the same per-tx question — "is at least one of this tx's
+// parent block IDs on the current main chain?" — by calling
+// CheckBlockIsInCurrentChain directly, with no upfront fetch and no
+// local main-chain map.
 //
-// Per-entry gRPC overhead would normally be a concern, but
-// CheckBlockIsInCurrentChain accepts a slice of IDs and resolves
-// ANY-of-them-on-chain in one call, so each tx is one round-trip
-// regardless of how many parent block IDs it has. The dedupe cache
-// further drops repeats inside a single block.
-func (u *BlockValidation) checkOldBlockIDsInMemory(ctx context.Context,
+// When blockchain_use_in_memory_chain_check is enabled (the only
+// configuration under which we are dispatched), that RPC is answered
+// by the blockchain store from a small in-memory cache of forked
+// (off-main-chain) block IDs in O(1). The cache is refreshed in the
+// background; correctness during reorgs is handled by the store —
+// while a rebuild is in flight it automatically falls back to the
+// SQL CTE.
+//
+// Per-tx gRPC cost is one round-trip regardless of how many parent
+// IDs the tx has, because CheckBlockIsInCurrentChain takes the full
+// slice and answers ANY-of in one call. The string-keyed dedupe cache
+// from the original is kept because identical blockIDs slices are
+// common (sibling txs spending outputs from the same parent block).
+func (u *BlockValidation) checkOldBlockIDsWithoutPrefetch(ctx context.Context,
 	oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
 	block *model.Block,
 ) (iterationError error) {
-	lookupCache := make(map[string]bool, oldBlockIDsMap.Length())
+	if u.logger != nil {
+		u.logger.Infof("[checkOldBlockIDs][%s] no-prefetch route: checking %d old block ID entries", block.Hash().String(), oldBlockIDsMap.Length())
+	}
 
-	var builder strings.Builder
-	var rpcCount, cacheHitCount int
+	iterationError, _, lookupCount, cacheHitCount :=
+		u.iterateOldBlockIDsWithCachedLookup(ctx, oldBlockIDsMap, block, nil, u.blockchainClient.CheckBlockIsInCurrentChain)
 
 	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] off-chain-set route (toggle=true), checking %d old block ID entries", block.Hash().String(), oldBlockIDsMap.Length())
+		u.logger.Infof("[checkOldBlockIDs][%s] no-prefetch route done: lookup=%d, cacheHit=%d", block.Hash().String(), lookupCount, cacheHitCount)
 	}
+
+	return
+}
+
+// iterateOldBlockIDsWithCachedLookup is the shared per-tx iterator used by
+// both checkOldBlockIDs (prefetch route) and checkOldBlockIDsWithoutPrefetch
+// (no-prefetch route). For each (txID, blockIDs) entry it:
+//
+//  1. Rejects an empty blockIDs slice as a processing error.
+//  2. (prefetch only) invokes fastPath(blockIDs) and short-circuits true if
+//     a parent is already known on-chain. fastPath may be nil to skip this
+//     step (the no-prefetch route passes nil).
+//  3. Builds a sorted string key from blockIDs and consults a per-call
+//     dedupe cache. Identical blockIDs slices across sibling txs (a parent
+//     block referenced by many children) hit the cache and skip the lookup.
+//  4. On cache miss, calls lookup(ctx, blockIDs) (typically the
+//     CheckBlockIsInCurrentChain RPC), caches the result, and either
+//     continues iteration on hit or records a BlockInvalidError on miss.
+//
+// Returns the iteration error (or nil) plus counters. lookupCount counts
+// how many times the lookup callback was actually invoked (i.e. cache
+// misses that weren't short-circuited by fastPath); it is reported in
+// each route's log under the route-appropriate name (the prefetch route
+// historically calls it "slowPath").
+func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
+	ctx context.Context,
+	oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
+	block *model.Block,
+	fastPath func(blockIDs []uint32) bool,
+	lookup func(ctx context.Context, blockIDs []uint32) (bool, error),
+) (iterationError error, fastPathCount, lookupCount, cacheHitCount int) {
+	cache := make(map[string]bool, oldBlockIDsMap.Length())
+	var builder strings.Builder
 
 	oldBlockIDsMap.Iterate(func(txID chainhash.Hash, blockIDs []uint32) bool {
 		if len(blockIDs) == 0 {
 			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] blockIDs is empty for txID: %v", block.String(), txID)
 			return false
+		}
+
+		if fastPath != nil && fastPath(blockIDs) {
+			fastPathCount++
+			return true
 		}
 
 		slices.Sort(blockIDs)
@@ -2269,7 +2281,7 @@ func (u *BlockValidation) checkOldBlockIDsInMemory(ctx context.Context,
 		}
 		blockIDsString := builder.String()
 
-		if blocksPartOfCurrentChain, ok := lookupCache[blockIDsString]; ok {
+		if blocksPartOfCurrentChain, ok := cache[blockIDsString]; ok {
 			cacheHitCount++
 			if !blocksPartOfCurrentChain {
 				iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain using cache", block.String(), txID, blockIDs)
@@ -2278,14 +2290,14 @@ func (u *BlockValidation) checkOldBlockIDsInMemory(ctx context.Context,
 			return true
 		}
 
-		rpcCount++
-		blocksPartOfCurrentChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, blockIDs)
+		lookupCount++
+		blocksPartOfCurrentChain, err := lookup(ctx, blockIDs)
 		if err != nil {
 			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] failed to check if old blocks are part of the current chain", block.String(), err)
 			return false
 		}
 
-		lookupCache[blockIDsString] = blocksPartOfCurrentChain
+		cache[blockIDsString] = blocksPartOfCurrentChain
 
 		if !blocksPartOfCurrentChain {
 			iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain", block.String(), txID, blockIDs)
@@ -2294,10 +2306,6 @@ func (u *BlockValidation) checkOldBlockIDsInMemory(ctx context.Context,
 
 		return true
 	})
-
-	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] off-chain-set route done: rpc=%d, cacheHit=%d", block.Hash().String(), rpcCount, cacheHitCount)
-	}
 
 	return
 }
