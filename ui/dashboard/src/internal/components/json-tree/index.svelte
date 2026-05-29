@@ -145,8 +145,7 @@
                     {showFinalComma}
                     isLastChild={i === entries.length - 1}
                     id={id + '_' + i}
-                    bind:expandState
-                  />
+                    bind:expandState />
                 {/if}
               {:else if getType(value) === 'array'}
                 {#if !expandState[id + '_' + i] || !inlineArr}
@@ -178,8 +177,7 @@
                             isLastChild={j === entries.length - 1}
                             inlineObj={false}
                             id={id + '_' + i + '_' + j}
-                            bind:expandState
-                          />
+                            bind:expandState />
                         </li>
                       {/each}
                     </ul>

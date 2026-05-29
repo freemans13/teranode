@@ -230,8 +230,7 @@
       on:filter={onFilterClick}
       on:header={onHeaderClick}
       on:paginate={onPaginate}
-      on:action={onAction}
-    />
+      on:action={onAction} />
   {:else}
     <div>Unknown table variant.</div>
   {/if}

@@ -172,6 +172,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 		// Load transactions for this batch of subtrees in parallel
 		subtreeTxs := make([][]*bt.Tx, len(batchSubtrees))
+		batchArenas := make([]*bt.Arena, len(batchSubtrees))
 		g, gCtx := errgroup.WithContext(ctx)
 		util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
 
@@ -180,16 +181,25 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			subtreeIdx := subtreeIdx
 
 			g.Go(func() (err error) {
-				subtreeToCheckExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+				// A subtree may be available locally under either:
+				//   - FileTypeSubtreeToCheck — fetched from a peer, pending validation
+				//   - FileTypeSubtree        — already validated (e.g. legacy catch-up's
+				//                               quickValidationMode validated txs inline
+				//                               before writing the subtree)
+				// We must consult both before falling back to an HTTP fetch. Otherwise
+				// CheckBlockSubtrees will try to HTTP-download a subtree we already have
+				// — and for baseURL="legacy" the synthetic URL has no scheme, so the
+				// request fails outright.
+				localFileType, localExists, err := u.findLocalSubtreeFile(gCtx, subtreeHash)
 				if err != nil {
-					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree exists in store", subtreeHash.String(), err)
+					return errors.NewStorageError("[CheckBlockSubtrees][%s] failed to check if subtree exists in store", subtreeHash.String(), err)
 				}
 
 				var subtreeToCheck *subtreepkg.Subtree
 
-				if subtreeToCheckExists {
-					// get the subtreeToCheck from the store
-					subtreeReader, err := u.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+				if localExists {
+					// read from whichever local file we found
+					subtreeReader, err := u.subtreeStore.GetIoReader(gCtx, subtreeHash[:], localFileType)
 					if err != nil {
 						return errors.NewStorageError("[CheckBlockSubtrees][%s] failed to get subtree from store", subtreeHash.String(), err)
 					}
@@ -278,6 +288,12 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				// PHASE 2: Exact pre-allocation
 				subtreeTxs[subtreeIdx] = make([]*bt.Tx, 0, subtreeToCheck.Length())
 
+				// Allocate a per-subtree arena for zero-copy script decoding.
+				// The arena is stored in batchArenas[subtreeIdx] so it can be released
+				// after processTransactionsInLevels consumes the batch's txs.
+				arena := getSubtreeArena()
+				batchArenas[subtreeIdx] = arena
+
 				subtreeDataExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 				if err != nil {
 					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
@@ -289,7 +305,20 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 					// Retry on 503 — peer's asset service may reject under admission control
 					// while it generates the file on-demand from Aerospike.
-					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(gCtx, url)
+					//
+					// IMPORTANT: pass the parent ctx, NOT gCtx, to the HTTP fetch and the
+					// stream processor. gCtx is the errgroup's cancellable context — using
+					// it here means a single sibling failure cancels every in-flight
+					// subtree_data download in this batch. Because each cancellation closes
+					// the upstream connection, the peer aborts its on-demand creation
+					// (storer.Abort), discarding work that was already paid for in Aerospike
+					// reads. Detaching from gCtx lets each fetch complete (or hit its own
+					// http_streaming_timeout) so the peer can finish writing its subtreeData
+					// file — converting wasted Aerospike work into a pre-warmed cache for
+					// the next retry. The trade-off is that batch failure detection waits
+					// for in-flight peers instead of cancelling early; acceptable here
+					// because the per-fetch streaming timeout still bounds it.
+					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
 					if subtreeDataErr != nil {
 						return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
 					}
@@ -301,8 +330,9 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 						bytesRead: &bytesRead,
 					}
 
-					// Process transactions directly from the stream while storing to disk
-					err = u.processSubtreeDataStream(gCtx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah)
+					// Process transactions directly from the stream while storing to disk.
+					// Same rationale as above for using ctx instead of gCtx.
+					err = u.processSubtreeDataStream(ctx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah, arena)
 					_ = countingBody.Close()
 
 					// Track bytes downloaded from peer after stream is consumed
@@ -320,7 +350,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					}
 				} else {
 					// SubtreeData exists, extract transactions from stored file
-					err = u.extractAndCollectTransactions(gCtx, subtreeToCheck, &subtreeTxs[subtreeIdx])
+					err = u.extractAndCollectTransactions(gCtx, subtreeToCheck, &subtreeTxs[subtreeIdx], arena)
 					if err != nil {
 						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to extract transactions", subtreeHash.String(), err)
 					}
@@ -331,6 +361,12 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 
 		if err = g.Wait(); err != nil {
+			// Release arenas allocated by goroutines that completed before the error.
+			for i := range batchArenas {
+				if batchArenas[i] != nil {
+					putSubtreeArena(batchArenas[i])
+				}
+			}
 			return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to get subtree tx hashes for batch %d", batchNum, err)
 		}
 
@@ -358,6 +394,12 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		// Process transactions for this batch
 		if batchTxCount > 0 {
 			if err = u.processTransactionsInLevels(ctx, allTransactions, *block.Hash(), chainhash.Hash{}, block.Height, blockIds); err != nil {
+				// Release arenas before returning — txs won't be consumed further.
+				for i := range batchArenas {
+					if batchArenas[i] != nil {
+						putSubtreeArena(batchArenas[i])
+					}
+				}
 				return nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to process transactions in batch %d", batchNum, err)
 			}
 			totalProcessedTxs += batchTxCount
@@ -366,6 +408,17 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			// Transactions are now in UTXO store and validator cache, original slice no longer needed
 			allTransactions = nil //nolint:ineffassign // Intentional early GC hint
 		}
+
+		// Release per-subtree arenas: all *bt.Tx pointers were consumed by
+		// processTransactionsInLevels above, so the arena-backed script slices
+		// are no longer referenced and the arenas can be returned to the pool.
+		for i := range batchArenas {
+			if batchArenas[i] != nil {
+				putSubtreeArena(batchArenas[i])
+				batchArenas[i] = nil
+			}
+		}
+		batchArenas = nil //nolint:ineffassign // Intentional early GC hint
 
 		batchSubtrees = nil //nolint:ineffassign // Intentional early GC hint for batch slice view
 		u.logger.Debugf("[CheckBlockSubtrees] Batch %d/%d complete for block %s (%d txs processed, %d total), memory reclaimed", batchNum, totalBatches, block.Hash().String(), batchTxCount, totalProcessedTxs)
@@ -400,11 +453,38 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		return nil, errors.WrapGRPC(err)
 	}
 
-	u.processOrphans(ctx, *block.Header.Hash(), block.Height, blockIds)
-
 	return &subtreevalidation_api.CheckBlockSubtreesResponse{
 		Blessed: true,
 	}, nil
+}
+
+// findLocalSubtreeFile reports whether this node already has a copy of the given
+// subtree in its subtree store, and which file type holds it. It checks
+// FileTypeSubtreeToCheck first (the "downloaded from peer, pending validation"
+// marker used on the normal p2p path) and then falls back to FileTypeSubtree
+// (the "already validated" marker used by legacy catch-up's quickValidationMode
+// and by block assembly / block persister). Either file carries the same
+// tx-hash list, so CheckBlockSubtrees can proceed either way.
+//
+// This avoids a pathological fallback to HTTP when the subtree is in fact
+// present locally — particularly important for baseURL="legacy", where the
+// synthetic URL "legacy/subtree/<hash>" has no scheme and cannot be fetched.
+func (u *Server) findLocalSubtreeFile(ctx context.Context, subtreeHash chainhash.Hash) (fileformat.FileType, bool, error) {
+	exists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+	if err != nil {
+		return fileformat.FileTypeUnknown, false, err
+	}
+	if exists {
+		return fileformat.FileTypeSubtreeToCheck, true, nil
+	}
+	exists, err = u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+	if err != nil {
+		return fileformat.FileTypeUnknown, false, err
+	}
+	if exists {
+		return fileformat.FileTypeSubtree, true, nil
+	}
+	return fileformat.FileTypeUnknown, false, nil
 }
 
 // validateMissingSubtreesWithOrderedRetry runs phase-2 parallel validation and
@@ -447,19 +527,11 @@ func (u *Server) validateMissingSubtreesWithOrderedRetry(
 		i, subtreeHash := i, subtreeHash
 
 		g.Go(func() error {
-			subtree, err := validateFn(gCtx, subtreeHash)
-			if err != nil {
+			if _, err := validateFn(gCtx, subtreeHash); err != nil {
 				u.logger.Debugf("[CheckBlockSubtreesRequest] Failed to validate subtree %s: %v", subtreeHash.String(), err)
 				failedParallel[i] = true
 
 				return nil
-			}
-
-			// Remove validated transactions from orphanage
-			if subtree != nil {
-				for _, node := range subtree.Nodes {
-					u.orphanage.Delete(node.Hash)
-				}
 			}
 
 			return nil
@@ -487,16 +559,8 @@ func (u *Server) validateMissingSubtreesWithOrderedRetry(
 			continue
 		}
 
-		subtree, err := validateFn(ctx, subtreeHash)
-		if err != nil {
+		if _, err := validateFn(ctx, subtreeHash); err != nil {
 			return errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to validate subtree %s", subtreeHash.String(), err)
-		}
-
-		// Remove validated transactions from orphanage
-		if subtree != nil {
-			for _, node := range subtree.Nodes {
-				u.orphanage.Delete(node.Hash)
-			}
 		}
 	}
 
@@ -504,8 +568,9 @@ func (u *Server) validateMissingSubtreesWithOrderedRetry(
 }
 
 // extractAndCollectTransactions extracts all transactions from a subtree's data file
-// and adds them to the shared collection for block-wide processing
-func (u *Server) extractAndCollectTransactions(ctx context.Context, subtree *subtreepkg.Subtree, subtreeTransactions *[]*bt.Tx) error {
+// and adds them to the shared collection for block-wide processing.
+// When arena is non-nil, script bytes are arena-allocated (caller owns arena lifetime).
+func (u *Server) extractAndCollectTransactions(ctx context.Context, subtree *subtreepkg.Subtree, subtreeTransactions *[]*bt.Tx, arena *bt.Arena) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "extractAndCollectTransactions",
 		tracing.WithParentStat(u.stats),
 		tracing.WithDebugLogMessage(u.logger, "[extractAndCollectTransactions] called for subtree %s", subtree.RootHash().String()),
@@ -528,7 +593,7 @@ func (u *Server) extractAndCollectTransactions(ctx context.Context, subtree *sub
 	}()
 
 	// Read transactions directly into the shared collection
-	txCount, err := u.readTransactionsFromSubtreeDataStream(subtree, bufferedReader, subtreeTransactions)
+	txCount, err := u.readTransactionsFromSubtreeDataStream(subtree, bufferedReader, subtreeTransactions, arena)
 	if err != nil {
 		return errors.NewProcessingError("[extractAndCollectTransactions] failed to read transactions from subtreeData", err)
 	}
@@ -544,8 +609,9 @@ func (u *Server) extractAndCollectTransactions(ctx context.Context, subtree *sub
 
 // processSubtreeDataStream downloads subtreeData and simultaneously stores to disk while parsing transactions.
 // PHASE 1: Concurrent streaming - eliminates storage read-back by writing to disk while parsing.
+// When arena is non-nil, script bytes are arena-allocated (caller owns arena lifetime).
 func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreepkg.Subtree,
-	body io.ReadCloser, allTransactions *[]*bt.Tx, dah uint32) error {
+	body io.ReadCloser, allTransactions *[]*bt.Tx, dah uint32, arena *bt.Arena) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processSubtreeDataStream",
 		tracing.WithParentStat(u.stats),
 		tracing.WithDebugLogMessage(u.logger, "[processSubtreeDataStream] called for subtree %s", subtree.RootHash().String()),
@@ -581,7 +647,7 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 	}()
 
 	// Parse transactions while writing to storage
-	txCount, parseErr := u.readTransactionsFromSubtreeDataStream(subtree, bufferedReader, allTransactions)
+	txCount, parseErr := u.readTransactionsFromSubtreeDataStream(subtree, bufferedReader, allTransactions, arena)
 
 	// Close the pipe writer to signal completion to storage goroutine
 	// Use CloseWithError if parsing failed to properly signal the storage goroutine
@@ -614,19 +680,24 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 	return nil
 }
 
-// readTransactionsFromSubtreeDataStream reads transactions directly from subtreeData stream
-// This follows the same pattern as go-subtree's serializeFromReader but appends directly to the shared collection
-func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtree, reader io.Reader, subtreeTransactions *[]*bt.Tx) (int, error) {
+// readTransactionsFromSubtreeDataStream reads transactions directly from subtreeData stream.
+// When arena is non-nil, per-script byte slices are drawn from the arena (caller must keep
+// the arena alive for as long as the returned *bt.Tx values are in use, and call
+// putSubtreeArena only after the txs are fully consumed). When arena is nil, scripts are
+// heap-allocated via the standard tx.ReadFrom path.
+func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtree, reader io.Reader, subtreeTransactions *[]*bt.Tx, arena *bt.Arena) (int, error) {
 	txIndex := 0
 
 	if len(subtree.Nodes) > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 		txIndex = 1
 	}
 
+	var hashScratch []byte
+
 	for {
 		tx := &bt.Tx{}
 
-		_, err := tx.ReadFrom(reader)
+		_, err := tx.ReadFromWithArena(reader, arena)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				// End of stream reached
@@ -641,7 +712,9 @@ func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtr
 			txIndex = 0
 		}
 
-		tx.SetTxHash(tx.TxIDChainHash()) // Cache the transaction hash to avoid recomputing it
+		var h chainhash.Hash
+		h, hashScratch = tx.HashTxIDInto(hashScratch)
+		tx.SetTxHash(&h)
 
 		// Basic sanity check: ensure the transaction hash matches the expected hash from the subtree
 		if txIndex < subtree.Length() {
@@ -777,7 +850,6 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	var (
 		errorsFound         atomic.Uint64
 		missingParentErrors atomic.Uint64
-		addedToOrphanage    atomic.Uint64
 	)
 
 	// Track successfully validated transactions per level for parent metadata
@@ -865,20 +937,11 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 					// Count all other errors
 					errorsFound.Add(1)
 
-					// Handle missing parent transactions by adding to orphanage
 					if errors.Is(err, errors.ErrTxMissingParent) {
+						// missingParentErrors drives the all-missing-parent deferral below;
+						// resolution happens in Phase-3 ordered sequential revalidation.
 						missingParentErrors.Add(1)
-						isRunning, runningErr := u.blockchainClient.IsFSMCurrentState(gCtx, blockchain.FSMStateRUNNING)
-						if runningErr == nil && isRunning {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, adding to orphanage", tx.TxIDChainHash().String())
-							if u.orphanage.Set(*tx.TxIDChainHash(), tx) {
-								addedToOrphanage.Add(1)
-							} else {
-								u.logger.Warnf("[processTransactionsInLevels] Failed to add transaction %s to orphanage - orphanage is full", tx.TxIDChainHash().String())
-							}
-						} else {
-							u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent, but FSM not in RUNNING state - not adding to orphanage", tx.TxIDChainHash().String())
-						}
+						u.logger.Debugf("[processTransactionsInLevels] Transaction %s missing parent (deferred to sequential revalidation)", tx.TxIDChainHash().String())
 					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
 						// Truly invalid (non-policy) transactions fail the level — no deferral
 						// possible because phase 3 revalidation can't resolve these.
@@ -933,10 +996,10 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		// stall the block (observed on teratestnet at block 15,631 where
 		// 1,305 of 9,216 txs had cross-subtree parents).
 		if errorsFound.Load() == missingParentErrors.Load() {
-			u.logger.Infof("[processTransactionsInLevels] %d missing-parent errors (deferred to sequential revalidation), %d added to orphanage", errorsFound.Load(), addedToOrphanage.Load())
+			u.logger.Infof("[processTransactionsInLevels] %d missing-parent errors (deferred to sequential revalidation)", errorsFound.Load())
 			return nil
 		}
-		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors (%d missing-parent), %d transactions added to orphanage", errorsFound.Load(), missingParentErrors.Load(), addedToOrphanage.Load())
+		return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with %d errors (%d missing-parent)", errorsFound.Load(), missingParentErrors.Load())
 	}
 
 	u.logger.Debugf("[processTransactionsInLevels] Successfully processed all %d transactions", totalTxCount)

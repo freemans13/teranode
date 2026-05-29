@@ -145,7 +145,7 @@
       />
     {/if}
     {#if $$slots.default}
-      <div class="label"><slot /></div>
+      <div class="label"><slot></slot></div>
     {/if}
   </div>
 </FocusRect>
