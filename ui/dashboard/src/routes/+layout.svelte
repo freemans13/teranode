@@ -169,7 +169,7 @@
 </script>
 
 <GlobalStyle theme={$theme} themeNs={$themeNs}>
-  <slot />
+  <slot></slot>
 </GlobalStyle>
 
 {#if $spinCount > 0}

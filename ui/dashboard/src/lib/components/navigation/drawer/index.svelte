@@ -100,18 +100,18 @@
     {#key collapsed}
       {#if hasHeader}
         <button class="header" on:click={onHeader} type="button">
-          <slot name="header" />
+          <slot name="header"></slot>
         </button>
       {/if}
     {/key}
 
     <div class="content">
-      <slot />
+      <slot></slot>
     </div>
 
     {#if hasFooter}
       <button class="footer" on:click={onHeader} type="button">
-        <slot name="footer" />
+        <slot name="footer"></slot>
       </button>
     {/if}
   </div>

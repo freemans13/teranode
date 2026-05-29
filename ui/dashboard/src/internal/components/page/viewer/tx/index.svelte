@@ -124,7 +124,7 @@
     </svelte:fragment>
   </TxDetailsCard>
   {#if display === DetailTab.overview}
-    <div style="height: 20px" />
+    <div style="height: 20px"></div>
     <TxIoCard data={result} />
   {/if}
 {:else if $spinCount === 0}
