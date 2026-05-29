@@ -18,7 +18,7 @@
   $: hash = ready ? $page.url.searchParams.get('hash') ?? '' : ''
 </script>
 
-<PageWithMenu>
+<PageWithMenu testId="page-root">
   {#if type === DetailType.block}
     <BlockDetails {hash} />
   {:else if type === DetailType.subtree}
