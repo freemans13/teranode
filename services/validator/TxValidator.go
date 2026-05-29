@@ -151,6 +151,14 @@ func (tv *TxValidator) ValidateTransaction(tx *bt.Tx, blockHeight uint32, utxoHe
 		}
 	}
 
+	// Legacy catchup below the highest hard-coded checkpoint sets this: PoW +
+	// checkpoint linkage already establish the chain as canonical, so re-running
+	// scripts is pure overhead. The caller is responsible for ensuring the block
+	// is actually trusted (see SyncManager.quickValidationAllowed).
+	if validationOptions.SkipScriptValidation {
+		return nil
+	}
+
 	// SkipPolicyChecks is equivalent to BDK consensus=true.
 	// https://github.com/bsv-blockchain/teranode/issues/2367
 	return tv.bdk.ValidateTransaction(tx, blockHeight, validationOptions.SkipPolicyChecks, utxoHeights)

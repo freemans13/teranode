@@ -320,11 +320,11 @@
   })
 </script>
 
-<PageWithMenu>
-  <ConnectedNodesCard 
+<PageWithMenu testId="page-root">
+  <ConnectedNodesCard
     data={paginatedNodes}
     allData={allNodes}
-    {connected} 
+    {connected}
     page={currentPage}
     pageSize={currentPageSize}
     {sortColumn}

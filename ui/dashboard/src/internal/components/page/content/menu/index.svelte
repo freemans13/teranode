@@ -21,7 +21,7 @@
   style:--margin-bottom={marginBottom + 'px'}
   style:--min-height-local="calc(100% - {marginTop + marginBottom}px - var(--footer-height, 0px))"
 >
-  <slot />
+  <slot></slot>
 </div>
 
 <style>

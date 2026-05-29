@@ -3,7 +3,7 @@
 </script>
 
 <div class="tui-mobile-navbar" style:--offset-top={offsetTop}>
-  <slot />
+  <slot></slot>
 </div>
 
 <style>
