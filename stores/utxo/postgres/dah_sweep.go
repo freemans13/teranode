@@ -19,14 +19,33 @@ import (
 // (IS DISTINCT FROM), avoiding re-stamping the same value every sweep (MVCC churn).
 // Reorg clears are handled directly by Unspend, so no unbounded enumeration of
 // already-stamped txs is needed here.
+//
+// The query is pinned to index access via SET LOCAL enable_seqscan = off, scoped
+// to a dedicated transaction: the BRIN selectivity estimate is unreliable (after
+// ANALYZE the planner can value the height-range bitmap scan at full-table rows
+// and flip the mine-activity arm — and the candidates join — to a Seq Scan of
+// txs). That is catastrophic when the range sits above the highest mined height
+// (matches zero rows yet scans the whole table). candidates is MATERIALIZED so
+// the bounded (<= limit) set drives a PK nested loop over txs rather than a
+// hash join that could re-introduce a txs seq scan.
 func (s *Store) sweepDAHRange(ctx context.Context, fromH, toH int64, limit int) (int, error) {
 	retention := int64(s.settings.GetUtxoStoreBlockHeightRetention())
 	if retention == 0 {
 		return 0, nil
 	}
 
-	tag, err := s.pool.Exec(ctx, `
-WITH candidates AS (
+	pgxTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, errors.NewStorageError("[dahSweep] begin: %v", err)
+	}
+	defer pgxTx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := pgxTx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		return 0, errors.NewStorageError("[dahSweep] set local enable_seqscan: %v", err)
+	}
+
+	tag, err := pgxTx.Exec(ctx, `
+WITH candidates AS MATERIALIZED (
     SELECT hash FROM (
         SELECT DISTINCT prev_tx_hash AS hash FROM spends
         WHERE spent_at_height > $1 AND spent_at_height <= $2
@@ -59,6 +78,10 @@ WHERE t.hash = st.hash
   AND t.delete_at_height IS DISTINCT FROM st.new_dah`, fromH, toH, limit, retention)
 	if err != nil {
 		return 0, errors.NewStorageError("[dahSweep] range (%d,%d]: %v", fromH, toH, err)
+	}
+
+	if err := pgxTx.Commit(ctx); err != nil {
+		return 0, errors.NewStorageError("[dahSweep] commit range (%d,%d]: %v", fromH, toH, err)
 	}
 
 	return int(tag.RowsAffected()), nil
