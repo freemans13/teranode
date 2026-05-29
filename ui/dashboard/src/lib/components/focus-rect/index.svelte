@@ -26,10 +26,10 @@
     class:stretch
     style={`${cssVars.join(';')}${style ? `;${style}` : ''}`}
   >
-    <div class="halo"><slot /></div>
+    <div class="halo"><slot></slot></div>
   </div>
 {:else}
-  <slot />
+  <slot></slot>
 {/if}
 
 <style>
