@@ -355,14 +355,6 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 		return nil, 0, err
 	}
 
-	if err = sm.extendTransactions(ctx, block, txMap); err != nil {
-		return nil, 0, err
-	}
-
-	if err = sm.createSubtrees(ctx, block, txMap, subtreeSlices, subtreeDatas, subtreeMetas); err != nil {
-		return nil, 0, err
-	}
-
 	blockHeight32, convErr := safeconversion.Int32ToUint32(block.Height())
 	if convErr != nil {
 		return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to convert block height", convErr)
@@ -374,6 +366,21 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	// FSM state drove the catch-up. The checkpoint list is owned by go-chaincfg — see PR
 	// #844 for the matching FSM-RUN gate that relies on the same invariant.
 	quickValidationMode := sm.quickValidationAllowed(blockHeight32)
+
+	// In quickValidationMode the previous-output decorate is skipped entirely: the
+	// chain is checkpoint-anchored, so scripts/fees/utxo-hash are not re-checked and
+	// inputs are spent trusted (by outpoint) in ValidateTransactionsLegacyMode. Txs
+	// are persisted non-extended; subtree-data readers re-extend on demand. The full
+	// validation path below the checkpoint still extends up front.
+	if !quickValidationMode {
+		if err = sm.extendTransactions(ctx, block, txMap); err != nil {
+			return nil, 0, err
+		}
+	}
+
+	if err = sm.createSubtrees(ctx, block, txMap, subtreeSlices, subtreeDatas, subtreeMetas, quickValidationMode); err != nil {
+		return nil, 0, err
+	}
 
 	if quickValidationMode {
 		// Fetch block ID upfront so UTXOs carry mined info from creation. This ID is
@@ -872,37 +879,33 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					return nil
 				}
 
-				if _, validateErr := sm.validationClient.Validate(ctx,
-					txWrapper.Tx,
-					blockHeight,
-					validator.WithSkipUtxoCreation(true),
-					validator.WithAddTXToBlockAssembly(false),
-					validator.WithSkipPolicyChecks(true),
-					validator.WithSkipTxMetaPublishing(true),
-					validator.WithCreateConflicting(true),
-					// PreValidateTransactions is only reached via the quickValidationMode
-					// path (see prepareSubtrees → ValidateTransactionsLegacyMode), which
-					// runs only when the block height is at or below the highest
-					// hard-coded checkpoint. PoW + checkpoint linkage establish the chain
-					// as canonical, so re-running BDK scripts is pure overhead.
-					validator.WithSkipScriptValidation(true),
-				); validateErr != nil {
-					// ErrTxConflicting is expected during legacy catchup when the UTXO store
-					// has stale spending data. The block is confirmed, so its transactions
-					// take precedence — the conflict will be resolved by ProcessConflicting
-					// during block acceptance.
-					if errors.Is(validateErr, errors.ErrTxConflicting) {
+				// Trusted-connect spend. PreValidateTransactions is only reached via the
+				// quickValidationMode path (prepareSubtrees → ValidateTransactionsLegacyMode),
+				// which runs only at/below the highest hard-coded checkpoint. PoW +
+				// checkpoint linkage make the block canonical, so we record the spends by
+				// outpoint without re-validating (no script execution, no UTXO-hash check,
+				// no fee) and without extending the tx — eliminating the previous-output
+				// decorate, the dominant per-block read/allocation cost during catch-up.
+				// createUtxos already created the outputs (WithSkipUtxoCreation meant the
+				// validator's create was a no-op here anyway), so the spend was the
+				// validator's only net effect on this path. The store skips the UTXO-hash
+				// guard via IgnoreUTXOHash and inserts ON CONFLICT DO NOTHING (idempotent).
+				if _, spendErr := sm.utxoStore.Spend(ctx, txWrapper.Tx, blockHeight, utxo.IgnoreFlags{IgnoreUTXOHash: true}); spendErr != nil {
+					// ErrTxConflicting can still surface from stale spending data in the
+					// store; the confirmed block takes precedence and the conflict is
+					// resolved by ProcessConflicting during block acceptance.
+					if errors.Is(spendErr, errors.ErrTxConflicting) {
 						return nil
 					}
 
-					if errors.IsRetryableError(validateErr) {
+					if errors.IsRetryableError(spendErr) {
 						mu.Lock()
 						retryableTxs = append(retryableTxs, txHash)
-						lastErr = validateErr
+						lastErr = spendErr
 						mu.Unlock()
 					} else {
 						mu.Lock()
-						hardFail = validateErr
+						hardFail = spendErr
 						mu.Unlock()
 					}
 				}
@@ -1255,7 +1258,7 @@ func (sm *SyncManager) extendPerTxFallback(ctx context.Context, txs []*bt.Tx) er
 // subtree 0 and subtreeSize for subsequent subtrees (subject to the final
 // subtree's smaller capacity).
 func (sm *SyncManager) createSubtrees(ctx context.Context, block *bsvutil.Block, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
-	subtreeSlices []*subtreepkg.Subtree, subtreeDatas []*subtreepkg.Data, subtreeMetas []*subtreepkg.Meta) (err error) {
+	subtreeSlices []*subtreepkg.Subtree, subtreeDatas []*subtreepkg.Data, subtreeMetas []*subtreepkg.Meta, quickValidationMode bool) (err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "createSubtrees",
 		tracing.WithLogMessage(sm.logger, "[createSubtrees] called for block %s / height %d", block.Hash(), block.Height()),
 	)
@@ -1299,9 +1302,17 @@ func (sm *SyncManager) createSubtrees(ctx context.Context, block *bsvutil.Block,
 			return err
 		}
 
-		fee, err := calculateTransactionFee(tx)
-		if err != nil {
-			return err
+		// In quickValidationMode the tx is not extended (the decorate was skipped),
+		// so PreviousTxSatoshis are absent and the fee cannot be computed here. Below
+		// the checkpoint the fee is unused (block is historical, not being mined, and
+		// not added to block assembly), so record 0. Above the checkpoint the tx is
+		// extended and the real fee is computed.
+		var fee uint64
+		if !quickValidationMode {
+			fee, err = calculateTransactionFee(tx)
+			if err != nil {
+				return err
+			}
 		}
 
 		if err = subtree.AddNode(txHash, fee, txSize); err != nil {
