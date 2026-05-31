@@ -383,7 +383,7 @@ func TestSyncManager_createSubtrees_MultiSubtreeDistribution(t *testing.T) {
 		subtreeMetas[i] = subtreepkg.NewSubtreeMeta(st)
 	}
 
-	require.NoError(t, sm.createSubtrees(context.Background(), block, txMap, subtreeSlices, subtreeDatas, subtreeMetas, false))
+	require.NoError(t, sm.createSubtrees(context.Background(), block, txMap, subtreeSlices, subtreeDatas, subtreeMetas))
 
 	require.Equal(t, 4, subtreeSlices[0].Length(), "subtree 0 should hold coinbase + 3 regular txs")
 	require.True(t, subtreeSlices[0].IsComplete())
@@ -415,7 +415,6 @@ func Benchmark_createSubtrees(b *testing.B) {
 			[]*subtreepkg.Subtree{subtree},
 			[]*subtreepkg.Data{subtreeData},
 			[]*subtreepkg.Meta{subtreeMeta},
-			false,
 		)
 	}
 }

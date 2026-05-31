@@ -94,22 +94,6 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
 	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
-	useIgnoreUTXOHash := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreUTXOHash
-
-	// Trusted-connect fast path: record spends by outpoint only, no validation
-	// CTE and no expected-UTXO-hash. Only used for checkpoint-anchored legacy IBD
-	// blocks (caller passes IgnoreUTXOHash), where the chain is canonical and the
-	// tx is not extended. Leaves the validated hot path entirely untouched.
-	if useIgnoreUTXOHash {
-		spends, err := utxo.GetSpendsWithoutUTXOHash(tx)
-		if err != nil {
-			return nil, err
-		}
-		if len(spends) == 0 {
-			return nil, errors.NewProcessingError("No spends provided", nil)
-		}
-		return s.spendTrusted(ctx, spends, blockHeight)
-	}
 
 	spends, err := utxo.GetSpends(tx)
 	if err != nil {
@@ -126,44 +110,6 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 	return s.spendDirect(ctx, spends, blockHeight, useIgnoreLocked, useIgnoreConflicting)
 }
-
-// spendTrusted records spends by outpoint with a single append-only bulk INSERT,
-// skipping the expected-UTXO-hash / frozen / locked / conflicting / coinbase
-// validation entirely. It is the trusted-connect path for checkpoint-anchored
-// legacy IBD: PoW + checkpoint linkage already establish the spent outputs as
-// canonical, so the validation is redundant and the tx need not be extended.
-// ON CONFLICT DO NOTHING keeps it idempotent across re-processing. spent_at_height
-// is recorded for Worker 2's deferred DAH sweep, exactly as the validated path.
-func (s *Store) spendTrusted(ctx context.Context, spends []*utxo.Spend, blockHeight uint32) ([]*utxo.Spend, error) {
-	prevTxHashes := make([][]byte, len(spends))
-	prevIdxs := make([]int64, len(spends))
-	spendingDatas := make([][]byte, len(spends))
-
-	for i, sp := range spends {
-		if sp == nil {
-			return nil, errors.NewProcessingError("spend should not be nil")
-		}
-		prevTxHashes[i] = sp.TxID[:]
-		prevIdxs[i] = int64(sp.Vout)
-		spendingDatas[i] = sp.SpendingData.Bytes()
-	}
-
-	if _, err := s.pool.Exec(ctx, trustedSpendSQL,
-		prevTxHashes, prevIdxs, spendingDatas, int64(blockHeight),
-	); err != nil {
-		return spends, errors.NewStorageError("[Spend] trusted spend insert failed", err)
-	}
-
-	return spends, nil
-}
-
-// trustedSpendSQL is the append-only insert used by spendTrusted. Mirrors the
-// INSERT in bulkSpendSQL but with no validation CTE — every supplied outpoint is
-// recorded (or silently skipped if already present).
-const trustedSpendSQL = `
-INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height)
-SELECT unnest($1::bytea[]), unnest($2::bigint[]), unnest($3::bytea[]), $4
-ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING`
 
 // ---------------------------------------------------------------------------
 // spendBatched — enqueue each input into the batcher

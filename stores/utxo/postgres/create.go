@@ -199,12 +199,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		unminedSince = int64(blockHeight)
 	}
 
-	// SerializeBytes emits extended format only when the tx is extended; for a
-	// non-extended tx (trusted-connect legacy IBD, where the decorate is skipped)
-	// it emits standard format. Using ExtendedBytes here would fake-extend a
-	// non-extended tx (extended marker with empty prev-scripts), which reads back
-	// as IsExtended()==true with blank data. Readers re-extend standard txs on demand.
-	rawTx := tx.SerializeBytes()
+	rawTx := tx.ExtendedBytes()
 
 	// Build block_id arrays.
 	var blockIDs, blkHeights, subtreeIdxs []int32
@@ -414,7 +409,7 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		fees = append(fees, int64(txMeta.Fee))
 		sizes = append(sizes, int64(txMeta.SizeInBytes))
 		coinbases = append(coinbases, isCoinbase)
-		rawTxs = append(rawTxs, item.tx.SerializeBytes()) // standard for non-extended (trusted-connect); extended otherwise
+		rawTxs = append(rawTxs, item.tx.ExtendedBytes())
 		lockeds = append(lockeds, item.options.Locked)
 		conflictings = append(conflictings, false) // conflicting items routed to createDirect
 		frozens = append(frozens, item.options.Frozen)
