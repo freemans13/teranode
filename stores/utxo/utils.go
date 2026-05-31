@@ -191,3 +191,27 @@ func GetSpends(tx *bt.Tx) (spends []*Spend, err error) {
 
 	return spends, nil
 }
+
+// GetSpendsWithoutUTXOHash builds spends by outpoint only, leaving UTXOHash nil.
+// Unlike GetSpends it does NOT require the tx to be extended (no PreviousTxScript
+// / PreviousTxSatoshis), so the caller can skip the decorate step entirely. It is
+// for the trusted-connect fast path on checkpoint-anchored legacy IBD blocks,
+// where the spent output is known-good and the UTXO-hash guard is redundant. The
+// store MUST be told to skip the UTXO-hash match (IgnoreFlags.IgnoreUTXOHash) for
+// these spends, since UTXOHash is nil.
+func GetSpendsWithoutUTXOHash(tx *bt.Tx) (spends []*Spend, err error) {
+	txIDChainHash := tx.TxIDChainHash()
+
+	spends = make([]*Spend, 0, len(tx.Inputs))
+
+	for i, input := range tx.Inputs {
+		spends = append(spends, &Spend{
+			TxID:         input.PreviousTxIDChainHash(),
+			Vout:         input.PreviousTxOutIndex,
+			UTXOHash:     nil,
+			SpendingData: spend.NewSpendingData(txIDChainHash, i),
+		})
+	}
+
+	return spends, nil
+}

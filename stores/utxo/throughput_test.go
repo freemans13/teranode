@@ -290,7 +290,7 @@ func newQueueStoreForBench(t *testing.T) utxo.Store {
 		t.Fatalf("queue store: %v", err)
 	}
 	s.Start(ctx)
-	t.Cleanup(func() { s.Stop() })
+	t.Cleanup(func() { _ = s.Close(ctx) })
 	return s
 }
 
