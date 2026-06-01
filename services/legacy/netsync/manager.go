@@ -370,6 +370,14 @@ type SyncManager struct {
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
+	// satoshiCache is an optional off-heap recency cache of parent-output satoshis,
+	// used only during legacy catch-up in quickValidationMode to resolve transaction
+	// fees without a store read. Lazily created on the first quick-validation block
+	// when Legacy.ParentSatoshiCacheMB > 0; nil (zero overhead) otherwise. Created and
+	// read on the blockHandler thread; putTx is called concurrently from createUtxos
+	// but the underlying cache is internally thread-safe.
+	satoshiCache *satoshiCache
+
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64
