@@ -379,6 +379,18 @@ type SyncManager struct {
 	// but the underlying cache is internally thread-safe.
 	satoshiCache *satoshiCache
 
+	// Block-finalization pipeline (legacy_blockFinalizationPipeline). When enabled
+	// for quick-validation blocks, the blockQueue consumer does each block's tx-work
+	// in height order and hands finalization (ProcessBlock/AddBlock/mined_set) to the
+	// finalizeLoop goroutine, which runs in height order on a separate goroutine so it
+	// overlaps the next block's tx-work. finalizeCh is the bounded handoff (its depth
+	// caps the look-ahead horizon); finalizeErrV records the first finalization error
+	// so the consumer halts ingest. Lazily started on the first pipelined block.
+	finalizeCh    chan *finalizeJob
+	finalizeOnce  sync.Once
+	finalizeErrMu sync.Mutex
+	finalizeErrV  error
+
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64

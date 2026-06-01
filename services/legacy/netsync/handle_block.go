@@ -119,10 +119,27 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		return err
 	}
 
+	// Block-finalization pipeline (quick-validation catch-up only): when enabled and
+	// this block is at/below the highest checkpoint, finalization of the previous
+	// block — including its mined_set — runs concurrently on the finalizer goroutine,
+	// so tx-work here must NOT block waiting for it. Safe in quick mode: the trusted
+	// by-outpoint spend never consults parent block heights, and the parent-BlockID
+	// linkage checked at finalization is set at output-creation time, not at mined_set.
+	pipelined := sm.settings.Legacy.BlockFinalizationPipeline && sm.quickValidationAllowed(blockHeight)
+
+	// Surface a prior block's finalization failure before ingesting further blocks.
+	if pipelined {
+		if ferr := sm.finalizeError(); ferr != nil {
+			return ferr
+		}
+	}
+
 	// Wait for the previous block's setTxMined to complete before validating
 	// this block's transactions. Ensures BIP68 sequence lock validation can
-	// correctly look up parent transaction BlockHeights in the UTXO store.
-	if blockHeight > 1 {
+	// correctly look up parent transaction BlockHeights in the UTXO store. Skipped
+	// on the pipelined quick path (see above), where the wait would serialise the
+	// pipeline and is not needed.
+	if blockHeight > 1 && !pipelined {
 		if err = sm.waitForPreviousBlockMined(ctx, &block.MsgBlock().Header.PrevBlock, blockHeight); err != nil {
 			return err
 		}
@@ -182,40 +199,141 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		return errors.NewBlockInvalidError("invalid block header: %s", teranodeBlock.Header.Hash().String(), err)
 	}
 
-	// call the process block wrapper, which will add tracing and logging
-	err = sm.ProcessBlock(ctx, teranodeBlock)
-	if err != nil {
-		return err
-	}
-
-	// process any orphan transactions that are now valid in background
-	// this will also remove the transactions from the orphan pool.
-	//
-	// Pre-extract the tx hashes here, before launching the goroutine, so the
-	// background work does not keep `block` (and therefore the wire.MsgBlock
-	// + its decode arena) reachable for the lifetime of orphan processing.
-	// Copy the hash *values* (not the *chainhash.Hash pointers returned by
-	// tx.Hash(), which alias into the bsvutil.Tx wrapper and would pin it).
+	// Pre-extract the tx hashes here, before any (possibly deferred) finalization,
+	// so the orphan-processing work does not keep `block` (and therefore the
+	// wire.MsgBlock + its decode arena) reachable. Copy the hash *values* (not the
+	// *chainhash.Hash pointers returned by tx.Hash(), which alias into the
+	// bsvutil.Tx wrapper and would pin it).
 	wireTxs := block.Transactions()
 	txHashes := make([]chainhash.Hash, len(wireTxs))
 	for i, tx := range wireTxs {
 		txHashes[i] = *tx.Hash()
 	}
-	blockHashStr := block.Hash().String()
 
+	job := &finalizeJob{
+		ctx:           ctx,
+		teranodeBlock: teranodeBlock,
+		txHashes:      txHashes,
+		blockHashStr:  block.Hash().String(),
+		blockHeight:   blockHeight,
+	}
+
+	// Pipelined quick path: hand finalization (ProcessBlock + mined_set + orphan
+	// processing) to the in-order finalizer goroutine so it overlaps the next
+	// block's tx-work. The bounded handoff channel back-pressures tx-work once the
+	// look-ahead horizon is full. Use the manager context (not the per-call tracing
+	// context, whose span ends when this function returns).
+	if pipelined {
+		job.ctx = sm.ctx
+		sm.enqueueFinalize(job)
+
+		return nil
+	}
+
+	// Serial path (default / above the checkpoint): finalize inline, unchanged.
+	return sm.finalizeBlock(job)
+}
+
+// finalizeJob carries everything block finalization needs, decoupled from the
+// wire block so it can be handed to the finalizer goroutine without pinning the
+// decode arena.
+type finalizeJob struct {
+	ctx           context.Context
+	teranodeBlock *model.Block
+	txHashes      []chainhash.Hash
+	blockHashStr  string
+	blockHeight   uint32
+}
+
+// finalizeBlock runs the order-sensitive tail of block processing: the
+// consensus-checking ProcessBlock (merkle/coinbase/reward, AddBlock, mined_set)
+// and background orphan processing. Called inline on the serial path, or in
+// height order on the finalizer goroutine when the pipeline is enabled.
+func (sm *SyncManager) finalizeBlock(job *finalizeJob) error {
+	if err := sm.ProcessBlock(job.ctx, job.teranodeBlock); err != nil {
+		return err
+	}
+
+	// process any orphan transactions that are now valid in background
+	// this will also remove the transactions from the orphan pool.
 	go func() {
 		acceptedTxs := make([]*TxHashAndFee, 0)
-		for i := range txHashes {
-			sm.processOrphanTransactions(ctx, &txHashes[i], &acceptedTxs)
+		for i := range job.txHashes {
+			sm.processOrphanTransactions(job.ctx, &job.txHashes[i], &acceptedTxs)
 		}
 
 		if len(acceptedTxs) > 0 {
-			sm.logger.Infof("[HandleBlockDirect][%s %d] accepted %d orphan transactions", blockHashStr, blockHeight, len(acceptedTxs))
+			sm.logger.Infof("[finalizeBlock][%s %d] accepted %d orphan transactions", job.blockHashStr, job.blockHeight, len(acceptedTxs))
 			sm.peerNotifier.AnnounceNewTransactions(acceptedTxs)
 		}
 	}()
 
 	return nil
+}
+
+// finalizeChDepth bounds the block-finalization pipeline's look-ahead: at most
+// this many blocks of completed tx-work may sit ahead of finalization before the
+// blockQueue consumer back-pressures. Kept small (per the design's 2–4 horizon)
+// so the in-flight blocks' state stays bounded.
+const finalizeChDepth = 4
+
+// ensureFinalizer lazily starts the finalizer goroutine and its handoff channel
+// on the first pipelined block. Called only from the single blockQueue consumer
+// goroutine, so sync.Once fully serialises construction.
+func (sm *SyncManager) ensureFinalizer() {
+	sm.finalizeOnce.Do(func() {
+		sm.finalizeCh = make(chan *finalizeJob, finalizeChDepth)
+		go sm.finalizeLoop()
+
+		sm.logger.Infof("[finalizeLoop] block-finalization pipeline started (look-ahead horizon %d blocks)", finalizeChDepth)
+	})
+}
+
+// enqueueFinalize hands a job to the finalizer, back-pressuring the caller when
+// the horizon is full, and aborting cleanly on shutdown.
+func (sm *SyncManager) enqueueFinalize(job *finalizeJob) {
+	sm.ensureFinalizer()
+
+	select {
+	case sm.finalizeCh <- job:
+	case <-sm.quit:
+	}
+}
+
+// finalizeLoop finalizes blocks in the height order they were enqueued. On the
+// first error it records it (halting further ingest via finalizeError) and keeps
+// draining so senders never block. On shutdown it exits; any not-yet-finalized
+// blocks are simply re-processed on restart (createUtxos/spend are idempotent).
+func (sm *SyncManager) finalizeLoop() {
+	for {
+		select {
+		case <-sm.quit:
+			return
+		case job := <-sm.finalizeCh:
+			if err := sm.finalizeBlock(job); err != nil {
+				sm.setFinalizeError(err)
+			}
+		}
+	}
+}
+
+// finalizeError returns the first finalization error seen by finalizeLoop, if any.
+func (sm *SyncManager) finalizeError() error {
+	sm.finalizeErrMu.Lock()
+	defer sm.finalizeErrMu.Unlock()
+
+	return sm.finalizeErrV
+}
+
+// setFinalizeError records the first finalization failure.
+func (sm *SyncManager) setFinalizeError(err error) {
+	sm.finalizeErrMu.Lock()
+	defer sm.finalizeErrMu.Unlock()
+
+	if sm.finalizeErrV == nil {
+		sm.finalizeErrV = err
+		sm.logger.Errorf("[finalizeLoop] block finalization failed, halting pipeline ingest: %v", err)
+	}
 }
 
 // waitForPreviousBlockMined waits for the previous block to have mined_set=true.
