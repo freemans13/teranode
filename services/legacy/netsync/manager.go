@@ -353,6 +353,7 @@ type SyncManager struct {
 	legacyKafkaInvCh    chan *kafka.Message
 	txAnnounceBatcher   *batcher.BatcherWithDedup[TxHashAndFee]
 	subtreeWriteBatcher *SubtreeWriteBatcher // lazily created on first catch-up block; nil outside catch-up
+	parentOutputCache   *parentOutputCache   // off-heap recency cache of confirmed outputs; lazily created on first catch-up block when legacy_parentOutputCacheMB>0; nil otherwise
 
 	// These fields should only be accessed from the blockHandler thread
 	// (except syncPeer/syncPeerState which are protected by syncPeerMu).

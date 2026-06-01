@@ -413,6 +413,20 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 		)
 	}
 
+	// Lazily create the off-heap parent-output cache on the first catch-up block
+	// when enabled. Same single-threaded blockHandler safety as above, so no mutex
+	// is needed around the pointer. On error we log and leave it nil (the decorate
+	// falls through to the UTXO store — correct, just not accelerated).
+	if quickValidationMode && sm.parentOutputCache == nil && sm.settings.Legacy.ParentOutputCacheMB > 0 {
+		poc, pocErr := newParentOutputCache(sm.settings.Legacy.ParentOutputCacheMB * 1024 * 1024)
+		if pocErr != nil {
+			sm.logger.Warnf("[prepareSubtrees] failed to create parent-output cache (continuing without): %v", pocErr)
+		} else {
+			sm.parentOutputCache = poc
+			sm.logger.Infof("[prepareSubtrees] parent-output cache enabled: %d MB off-heap", sm.settings.Legacy.ParentOutputCacheMB)
+		}
+	}
+
 	if quickValidationMode {
 		// Fetch block ID upfront so UTXOs carry mined info from creation. This ID is
 		// threaded through to blockvalidation via ProcessBlock so it can call
@@ -934,10 +948,16 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 					existingTxsMu.Lock()
 					existingTxHashes = append(existingTxHashes, &txHash)
 					existingTxsMu.Unlock()
-					return nil
+					// fall through to cache population — the outputs exist in the store
+				} else {
+					return err
 				}
-				return err
 			}
+
+			// Populate the parent-output cache (no-op when disabled) so later
+			// blocks' inputs spending these outputs can be extended from memory.
+			// putTx is concurrent-safe and nil-safe.
+			sm.parentOutputCache.putTx(txWrapper.Tx)
 
 			return nil
 		})
@@ -1331,6 +1351,32 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 
 	if err = g.Wait(); err != nil {
 		return errors.NewProcessingError("failed to extend transactions from txMap", err)
+	}
+
+	// Phase 1.5: resolve inputs whose parents are recent prior blocks from the
+	// off-heap parent-output cache (catch-up only; nil/no-op when disabled). Hits
+	// are filled here so Phase 2's BatchPreviousOutputsDecorate — which skips
+	// inputs that already have PreviousTxScript — only queries the misses. For the
+	// large fraction of IBD spends targeting recently-created outputs this turns
+	// the dominant per-block decorate disk read into a memory lookup. Single
+	// producer (blockHandler goroutine); the cache Get itself is concurrent-safe.
+	if sm.parentOutputCache != nil {
+		dst := make([]byte, 0, 256)
+
+		for _, tx := range txs {
+			for _, input := range tx.Inputs {
+				if input == nil || input.PreviousTxScript != nil {
+					continue
+				}
+
+				sm.parentOutputCache.fillInput(input, &dst)
+			}
+		}
+
+		if hits, misses := sm.parentOutputCache.stats(); hits+misses > 0 {
+			sm.logger.Infof("[extendTransactions] parent-output cache block %s height %d: %d hits, %d misses (%.1f%% hit)",
+				block.Hash(), block.Height(), hits, misses, float64(hits)*100/float64(hits+misses))
+		}
 	}
 
 	// Phase 2: for inputs whose parents are NOT same-block, batch the decoration
