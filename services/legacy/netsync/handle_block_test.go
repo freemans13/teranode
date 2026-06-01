@@ -1016,7 +1016,7 @@ func TestPreValidateTransactions_AllSucceed(t *testing.T) {
 
 	txMap := makeTxMap(t, 10)
 
-	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100)
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100, 0, 0)
 	require.NoError(t, err)
 	assert.Equal(t, int64(10), css.callCount.Load(), "all 10 transactions should be spent")
 }
@@ -1046,7 +1046,7 @@ func TestPreValidateTransactions_PartialFailure_RetriesSucceed(t *testing.T) {
 
 	txMap := makeTxMap(t, 10)
 
-	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100)
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100, 0, 0)
 	require.NoError(t, err, "should succeed after retrying the 3 failed transactions")
 
 	// 10 in first pass + 3 retried = 13 total calls
@@ -1077,7 +1077,7 @@ func TestPreValidateTransactions_AllFail_NoProgress_GivesUp(t *testing.T) {
 
 	txMap := makeTxMap(t, 5)
 
-	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100)
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100, 0, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no progress")
 
@@ -1109,7 +1109,7 @@ func TestPreValidateTransactions_NonRetryableError_FailsImmediately(t *testing.T
 
 	txMap := makeTxMap(t, 5)
 
-	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100)
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100, 0, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "non-retryable")
 
@@ -1139,7 +1139,7 @@ func TestPreValidateTransactions_ParentContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	err := sm.PreValidateTransactions(ctx, txMap, chainhash.Hash{}, 100)
+	err := sm.PreValidateTransactions(ctx, txMap, chainhash.Hash{}, 100, 0, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "context cancelled")
 }
