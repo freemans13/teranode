@@ -3,8 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
-	"fmt"
-	"strings"
+	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -15,12 +14,20 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sync/errgroup"
 )
 
 // maxINClauseSize limits the number of hashes per IN clause to avoid exceeding
 // Postgres parameter limits.
 const maxINClauseSize = 400
+
+// minDecorateChunkSize is the floor on the per-chunk hash count when
+// BatchPreviousOutputsDecorate splits work across concurrent queries. Chunks
+// smaller than this add round-trip/planning overhead that outweighs the extra
+// parallelism, so very small blocks stay in fewer chunks.
+const minDecorateChunkSize = 50
 
 // batchGetItem represents a single Get request queued into the batcher.
 type batchGetItem struct {
@@ -642,85 +649,127 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		return nil
 	}
 
-	// Collect unique parent hashes for chunked IN query.
+	// Collect unique parent hashes for chunked IN queries.
 	parentHashes := make([][]byte, 0, len(needsByParent))
 	for h := range needsByParent {
 		hCopy := h
 		parentHashes = append(parentHashes, hCopy[:])
 	}
 
-	// Query in chunks and build results map.
-	type outputKey struct {
-		hash chainhash.Hash
-		idx  uint32
+	// Parallelise chunk queries when configured. Each chunk fetches a disjoint
+	// set of parent hashes, and the input slots a chunk writes to are disjoint
+	// across chunks by construction (different parents → different inputRefs →
+	// different tx.Inputs[] elements), so workers write directly without shared
+	// state. needsByParent is read-only after construction. missingInputs is the
+	// only cross-worker counter and uses atomic.Int64.
+	//
+	// During legacy IBD this chunk loop is the dominant per-block cost: ~3 s of
+	// serial single-backend lookups into the 84M-row outputs heap at disk QD~1.
+	// Running chunks concurrently overlaps the per-query round-trips and lifts
+	// the SSD's queue depth, which is the actual IBD bottleneck on modest HW.
+	concurrency := s.settings.UtxoStore.BatchPreviousOutputsDecorateConcurrency
+	if concurrency < 1 {
+		concurrency = 1
 	}
-	type outputInfo struct {
-		lockingScript []byte
-		satoshis      uint64
-	}
-	results := make(map[outputKey]*outputInfo)
 
-	for chunkStart := 0; chunkStart < len(parentHashes); chunkStart += maxINClauseSize {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+	// Size chunks so the work splits into ~concurrency parallel queries (raising
+	// DB/disk queue depth), bounded by the IN-clause cap and a sane minimum.
+	// Serial behaviour (concurrency=1) keeps the full IN-clause cap per query.
+	chunkSize := maxINClauseSize
+	if concurrency > 1 && len(parentHashes) > 0 {
+		chunkSize = (len(parentHashes) + concurrency - 1) / concurrency
+		if chunkSize < minDecorateChunkSize {
+			chunkSize = minDecorateChunkSize
 		}
+		if chunkSize > maxINClauseSize {
+			chunkSize = maxINClauseSize
+		}
+	}
 
-		chunkEnd := chunkStart + maxINClauseSize
+	var missingInputs atomic.Int64
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(g, concurrency)
+
+	for chunkStart := 0; chunkStart < len(parentHashes); chunkStart += chunkSize {
+		chunkEnd := chunkStart + chunkSize
 		if chunkEnd > len(parentHashes) {
 			chunkEnd = len(parentHashes)
 		}
 		chunk := parentHashes[chunkStart:chunkEnd]
 
-		inClause, args := buildINClauseLocal(chunk, 1)
-		q := `SELECT tx_hash, idx, locking_script, satoshis FROM outputs WHERE tx_hash IN ` + inClause
+		g.Go(func() error {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+			}
 
-		rows, err := s.pool.Query(ctx, q, args...)
-		if err != nil {
-			return err
-		}
+			inClause, args := buildINClauseLocal(chunk, 1)
+			q := `SELECT tx_hash, idx, locking_script, satoshis FROM outputs WHERE tx_hash IN ` + inClause
 
-		for rows.Next() {
-			var hashBytes []byte
-			var idx uint32
-			var lockingScript []byte
-			var satoshis uint64
-			if err := rows.Scan(&hashBytes, &idx, &lockingScript, &satoshis); err != nil {
-				rows.Close()
+			rows, err := s.pool.Query(gCtx, q, args...)
+			if err != nil {
 				return err
 			}
-			var h chainhash.Hash
-			copy(h[:], hashBytes)
-			results[outputKey{hash: h, idx: idx}] = &outputInfo{
-				lockingScript: lockingScript,
-				satoshis:      satoshis,
+			defer rows.Close()
+
+			// Track which (parentHash, outIdx) pairs this chunk resolved so we
+			// can count the unresolved ones afterwards.
+			type foundKey struct {
+				hash chainhash.Hash
+				idx  uint32
 			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
+			found := make(map[foundKey]struct{}, len(chunk))
+
+			for rows.Next() {
+				var hashBytes []byte
+				var idx uint32
+				var lockingScript []byte
+				var satoshis uint64
+				if err := rows.Scan(&hashBytes, &idx, &lockingScript, &satoshis); err != nil {
+					return err
+				}
+				var h chainhash.Hash
+				copy(h[:], hashBytes)
+				// Dispatch this output to every input that needs (h, idx). The
+				// refs for h live only in this chunk (disjoint hashes), so these
+				// writes never race another worker.
+				for _, ref := range needsByParent[h] {
+					if ref.outIdx == idx {
+						txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxScript = bscript.NewFromBytes(lockingScript)
+						txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxSatoshis = satoshis
+					}
+				}
+				found[foundKey{hash: h, idx: idx}] = struct{}{}
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+
+			// Count input slots in this chunk left unresolved.
+			var localMissing int64
+			for _, hb := range chunk {
+				var h chainhash.Hash
+				copy(h[:], hb)
+				for _, ref := range needsByParent[h] {
+					if _, ok := found[foundKey{hash: h, idx: ref.outIdx}]; !ok {
+						localMissing++
+					}
+				}
+			}
+			if localMissing > 0 {
+				missingInputs.Add(localMissing)
+			}
+			return nil
+		})
 	}
 
-	// Map results back to inputs and track missing.
-	var missingInputs []string
-	for parentHash, refs := range needsByParent {
-		for _, ref := range refs {
-			key := outputKey{hash: parentHash, idx: ref.outIdx}
-			if info, ok := results[key]; ok {
-				txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxScript = bscript.NewFromBytes(info.lockingScript)
-				txs[ref.txIdx].Inputs[ref.inputIdx].PreviousTxSatoshis = info.satoshis
-			} else {
-				missingInputs = append(missingInputs, fmt.Sprintf("tx[%d].input[%d] parent=%x vout=%d",
-					ref.txIdx, ref.inputIdx, parentHash[:], ref.outIdx))
-			}
-		}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
-	if len(missingInputs) > 0 {
-		s.logger.Warnf("[BatchPreviousOutputsDecorate] missing parent outputs: %s", strings.Join(missingInputs, ", "))
-		return errors.NewProcessingError("failed to decorate previous outputs: %d missing", len(missingInputs))
+	if m := missingInputs.Load(); m > 0 {
+		return errors.NewProcessingError("failed to decorate previous outputs: %d missing", m)
 	}
 
 	return nil
