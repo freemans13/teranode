@@ -1691,6 +1691,14 @@ func (sm *SyncManager) resolveQuickFees(ctx context.Context, txMap *txmap.Synced
 		fees[txHash] = inputValue - outputValue
 	}
 
+	// Per-block satoshi-cache effectiveness (catch-up visibility). Only cross-block
+	// parent lookups touch the cache — same-block parents are served from txMap and
+	// never counted here; misses fall to the batched cold store read (len(cold)).
+	if hits, misses := sm.satoshiCache.stats(); hits+misses > 0 {
+		sm.logger.Infof("[resolveQuickFees] satoshi cache: %d hits, %d misses (%.1f%% hit), %d cold store reads",
+			hits, misses, float64(hits)*100/float64(hits+misses), len(cold))
+	}
+
 	return fees, nil
 }
 

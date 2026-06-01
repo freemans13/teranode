@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -55,7 +56,7 @@ func TestResolveQuickFees_SameBlockAndCache(t *testing.T) {
 	require.NoError(t, err)
 	cache.putTx(g) // G:0 = 31_000 available cross-block
 
-	sm := &SyncManager{satoshiCache: cache}
+	sm := &SyncManager{logger: ulogger.TestLogger{}, satoshiCache: cache}
 
 	txMapData := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](4)
 
@@ -101,7 +102,7 @@ func TestResolveQuickFees_ColdMissBatchedStoreRead(t *testing.T) {
 		shell.Inputs[0].PreviousTxSatoshis = 9_000
 	}).Return(nil)
 
-	sm := &SyncManager{utxoStore: mockStore}
+	sm := &SyncManager{logger: ulogger.TestLogger{}, utxoStore: mockStore}
 
 	txMapData := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](1)
 
@@ -131,7 +132,7 @@ func TestResolveQuickFees_RejectsOverspend(t *testing.T) {
 	require.NoError(t, err)
 	cache.putTx(parent)
 
-	sm := &SyncManager{satoshiCache: cache}
+	sm := &SyncManager{logger: ulogger.TestLogger{}, satoshiCache: cache}
 
 	txMapData := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](1)
 
