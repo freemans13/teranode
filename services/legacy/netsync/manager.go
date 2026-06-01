@@ -353,7 +353,6 @@ type SyncManager struct {
 	legacyKafkaInvCh    chan *kafka.Message
 	txAnnounceBatcher   *batcher.BatcherWithDedup[TxHashAndFee]
 	subtreeWriteBatcher *SubtreeWriteBatcher // lazily created on first catch-up block; nil outside catch-up
-	parentOutputCache   *parentOutputCache   // off-heap recency cache of confirmed outputs; lazily created on first catch-up block when legacy_parentOutputCacheMB>0; nil otherwise
 
 	// These fields should only be accessed from the blockHandler thread
 	// (except syncPeer/syncPeerState which are protected by syncPeerMu).
@@ -371,6 +370,14 @@ type SyncManager struct {
 	startHeader      *list.Element
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
+
+	// satoshiCache is an optional off-heap recency cache of parent-output satoshis,
+	// used only during legacy catch-up in quickValidationMode to resolve transaction
+	// fees without a store read. Lazily created on the first quick-validation block
+	// when Legacy.ParentSatoshiCacheMB > 0; nil (zero overhead) otherwise. Created and
+	// read on the blockHandler thread; putTx is called concurrently from createUtxos
+	// but the underlying cache is internally thread-safe.
+	satoshiCache *satoshiCache
 
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator

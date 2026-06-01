@@ -367,6 +367,19 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	// #844 for the matching FSM-RUN gate that relies on the same invariant.
 	quickValidationMode := sm.quickValidationAllowed(blockHeight32)
 
+	// Lazily create the off-heap satoshi cache on the first quick-validation block
+	// (catch-up only). Populated by createUtxos and consulted by resolveQuickFees to
+	// resolve fees without a store read. nil/zero overhead when disabled or synced.
+	if quickValidationMode && sm.satoshiCache == nil && sm.settings.Legacy.ParentSatoshiCacheMB > 0 {
+		poc, cacheErr := newSatoshiCache(sm.settings.Legacy.ParentSatoshiCacheMB * 1024 * 1024)
+		if cacheErr != nil {
+			return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to create satoshi cache", cacheErr)
+		}
+
+		sm.satoshiCache = poc
+		sm.logger.Infof("[prepareSubtrees] created %d MB off-heap satoshi cache for quick-validation fees", sm.settings.Legacy.ParentSatoshiCacheMB)
+	}
+
 	// In quickValidationMode the previous-output decorate is skipped entirely: the
 	// chain is checkpoint-anchored, so scripts/fees/utxo-hash are not re-checked and
 	// inputs are spent trusted (by outpoint) in ValidateTransactionsLegacyMode. Txs
@@ -418,20 +431,6 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 			sm.logger,
 			sm.flushSubtreeWriteBatch,
 		)
-	}
-
-	// Lazily create the off-heap parent-output cache on the first catch-up block
-	// when enabled. Same single-threaded blockHandler safety as above, so no mutex
-	// is needed around the pointer. On error we log and leave it nil (the decorate
-	// falls through to the UTXO store — correct, just not accelerated).
-	if quickValidationMode && sm.parentOutputCache == nil && sm.settings.Legacy.ParentOutputCacheMB > 0 {
-		poc, pocErr := newParentOutputCache(sm.settings.Legacy.ParentOutputCacheMB * 1024 * 1024)
-		if pocErr != nil {
-			sm.logger.Warnf("[prepareSubtrees] failed to create parent-output cache (continuing without): %v", pocErr)
-		} else {
-			sm.parentOutputCache = poc
-			sm.logger.Infof("[prepareSubtrees] parent-output cache enabled: %d MB off-heap", sm.settings.Legacy.ParentOutputCacheMB)
-		}
 	}
 
 	if quickValidationMode {
@@ -961,10 +960,9 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 				}
 			}
 
-			// Populate the parent-output cache (no-op when disabled) so later
-			// blocks' inputs spending these outputs can be extended from memory.
-			// putTx is concurrent-safe and nil-safe.
-			sm.parentOutputCache.putTx(txWrapper.Tx)
+			// Cache this tx's output satoshis for later blocks' fee resolution
+			// (nil-safe no-op when the cache is disabled).
+			sm.satoshiCache.putTx(txWrapper.Tx)
 
 			return nil
 		})
@@ -1356,32 +1354,6 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, block *bsvutil.Bl
 		return errors.NewProcessingError("failed to extend transactions from txMap", err)
 	}
 
-	// Phase 1.5: resolve inputs whose parents are recent prior blocks from the
-	// off-heap parent-output cache (catch-up only; nil/no-op when disabled). Hits
-	// are filled here so Phase 2's BatchPreviousOutputsDecorate — which skips
-	// inputs that already have PreviousTxScript — only queries the misses. For the
-	// large fraction of IBD spends targeting recently-created outputs this turns
-	// the dominant per-block decorate disk read into a memory lookup. Single
-	// producer (blockHandler goroutine); the cache Get itself is concurrent-safe.
-	if sm.parentOutputCache != nil {
-		dst := make([]byte, 0, 256)
-
-		for _, tx := range txs {
-			for _, input := range tx.Inputs {
-				if input == nil || input.PreviousTxScript != nil {
-					continue
-				}
-
-				sm.parentOutputCache.fillInput(input, &dst)
-			}
-		}
-
-		if hits, misses := sm.parentOutputCache.stats(); hits+misses > 0 {
-			sm.logger.Infof("[extendTransactions] parent-output cache block %s height %d: %d hits, %d misses (%.1f%% hit)",
-				block.Hash(), block.Height(), hits, misses, float64(hits)*100/float64(hits+misses))
-		}
-	}
-
 	// Phase 2: for inputs whose parents are NOT same-block, batch the decoration
 	// using the store's internal chunking instead of issuing one DB lookup per tx.
 	// For a 20k-tx block this collapses ~20k round-trips into roughly O(N / chunkSize).
@@ -1532,6 +1504,18 @@ func (sm *SyncManager) createSubtrees(ctx context.Context, block *bsvutil.Block,
 
 	currentSubtreeIdx := 0
 
+	// In quickValidationMode the transactions are not extended (scripts are never
+	// re-validated below the checkpoint), so the fee cannot be derived from the tx
+	// alone. Resolve every tx's fee up front from parent-output satoshis (txMap →
+	// satoshi cache → batched store read). Correct fees are consensus-load-bearing:
+	// model.Block.checkBlockRewardAndFees sums subtree.Fees against the coinbase.
+	var quickFees map[chainhash.Hash]uint64
+	if quickValidationMode {
+		if quickFees, err = sm.resolveQuickFees(ctx, txMap); err != nil {
+			return errors.NewProcessingError("[createSubtrees] failed to resolve quick-validation fees for block %s", block.Hash(), err)
+		}
+	}
+
 	for _, wireTx := range block.Transactions() {
 		txHash := *wireTx.Hash()
 
@@ -1561,13 +1545,13 @@ func (sm *SyncManager) createSubtrees(ctx context.Context, block *bsvutil.Block,
 			return err
 		}
 
-		// In quickValidationMode the tx is not extended (the decorate was skipped),
-		// so PreviousTxSatoshis are absent and the fee cannot be computed here. Below
-		// the checkpoint the fee is unused (block is historical, not being mined, and
-		// not added to block assembly), so record 0. Above the checkpoint the tx is
-		// extended and the real fee is computed.
+		// In quickValidationMode the tx is not extended (scripts are never fetched),
+		// so the fee comes from the satoshi-only resolution computed above. Above the
+		// checkpoint the tx is extended and the fee is computed directly.
 		var fee uint64
-		if !quickValidationMode {
+		if quickValidationMode {
+			fee = quickFees[txHash]
+		} else {
 			fee, err = calculateTransactionFee(tx)
 			if err != nil {
 				return err
@@ -1592,6 +1576,122 @@ func (sm *SyncManager) createSubtrees(ctx context.Context, block *bsvutil.Block,
 	sm.logger.Infof("[createSubtrees] created %d subtrees for block %s / height %d", len(subtreeSlices), block.Hash(), block.Height())
 
 	return nil
+}
+
+// parentOutpoint identifies a specific previous output (parent tx hash + output
+// index) for resolving its satoshis during quick-validation fee computation.
+type parentOutpoint struct {
+	hash chainhash.Hash
+	idx  uint32
+}
+
+// resolveQuickFees computes the correct fee for every non-coinbase transaction in
+// the block using parent-output satoshis ONLY (no locking scripts), for
+// quickValidationMode where the chain is checkpoint-trusted and scripts are never
+// re-validated. It returns a map of tx hash → fee.
+//
+// Satoshi sources, per parent outpoint, in order:
+//  1. same-block parent — read directly from the in-memory txMap (output satoshis
+//     are populated at wire-parse time, so no wait and no store read);
+//  2. recent cross-block parent — the off-heap satoshi cache (populated by
+//     createUtxos as earlier blocks' outputs were created);
+//  3. cold remainder — a single batched store read (satoshis harvested from a
+//     throwaway shell tx so the real block transactions are NEVER mutated and
+//     subtree data stays non-extended).
+//
+// This is the "done right" replacement for the previous fee-0 shortcut: recording
+// 0 fees made model.Block.checkBlockRewardAndFees reject any block whose miner
+// claimed fees, so quick-validation IBD died at the first fee-bearing block.
+func (sm *SyncManager) resolveQuickFees(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) (map[chainhash.Hash]uint64, error) {
+	dst := make([]byte, 0, 16)
+	resolved := make(map[parentOutpoint]uint64)
+	var cold []parentOutpoint
+
+	// Pass 1: resolve every referenced parent outpoint from the txMap or the cache;
+	// collect the cold remainder for a single batched store read. Deduped by outpoint.
+	for _, txHash := range txMap.Keys() {
+		txWrapper, ok := txMap.Get(txHash)
+		if !ok || txWrapper.Tx == nil {
+			continue
+		}
+
+		for _, input := range txWrapper.Tx.Inputs {
+			op := parentOutpoint{hash: *input.PreviousTxIDChainHash(), idx: input.PreviousTxOutIndex}
+			if _, done := resolved[op]; done {
+				continue
+			}
+
+			if parent, inBlock := txMap.Get(op.hash); inBlock && parent.Tx != nil {
+				if int(op.idx) >= len(parent.Tx.Outputs) || parent.Tx.Outputs[op.idx] == nil {
+					return nil, errors.NewTxInvalidError("tx %s references out-of-range output %d on same-block parent %s", txHash, op.idx, op.hash)
+				}
+
+				resolved[op] = parent.Tx.Outputs[op.idx].Satoshis
+				continue
+			}
+
+			if sats, hit := sm.satoshiCache.satoshis(&op.hash, op.idx, &dst); hit {
+				resolved[op] = sats
+				continue
+			}
+
+			resolved[op] = 0 // placeholder; filled by the cold read below
+			cold = append(cold, op)
+		}
+	}
+
+	// Batched satoshi-only store read for the cold remainder. A throwaway shell tx
+	// carries one input per cold outpoint; PreviousOutputsDecorate fills its inputs
+	// in place, leaving the real block transactions untouched.
+	if len(cold) > 0 {
+		shell := &bt.Tx{Inputs: make([]*bt.Input, len(cold))}
+		for i, op := range cold {
+			in := &bt.Input{PreviousTxOutIndex: op.idx}
+			_ = in.PreviousTxIDAdd(&op.hash)
+			shell.Inputs[i] = in
+		}
+
+		if err := sm.utxoStore.PreviousOutputsDecorate(ctx, shell); err != nil {
+			return nil, errors.NewProcessingError("[resolveQuickFees] failed to fetch %d cold parent outputs", len(cold), err)
+		}
+
+		for i, op := range cold {
+			resolved[op] = shell.Inputs[i].PreviousTxSatoshis
+		}
+	}
+
+	// Pass 2: sum each transaction's fee from its resolved parent satoshis.
+	fees := make(map[chainhash.Hash]uint64, txMap.Length())
+
+	for _, txHash := range txMap.Keys() {
+		txWrapper, ok := txMap.Get(txHash)
+		if !ok || txWrapper.Tx == nil {
+			continue
+		}
+
+		tx := txWrapper.Tx
+		if tx.IsCoinbase() {
+			continue
+		}
+
+		var inputValue uint64
+		for _, input := range tx.Inputs {
+			inputValue += resolved[parentOutpoint{hash: *input.PreviousTxIDChainHash(), idx: input.PreviousTxOutIndex}]
+		}
+
+		var outputValue uint64
+		for _, output := range tx.Outputs {
+			outputValue += output.Satoshis
+		}
+
+		if inputValue < outputValue {
+			return nil, errors.NewTxError("transaction %s has invalid fees: input %d < output %d", txHash, inputValue, outputValue)
+		}
+
+		fees[txHash] = inputValue - outputValue
+	}
+
+	return fees, nil
 }
 
 func calculateTransactionFee(tx *bt.Tx) (uint64, error) {

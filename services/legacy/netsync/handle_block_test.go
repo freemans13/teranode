@@ -856,6 +856,40 @@ func (v *countingValidator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, 
 
 func (v *countingValidator) TriggerBatcher() {}
 
+// countingSpendStore is a utxo.Store double for the quick-validation path, where
+// PreValidateTransactions records each transaction via utxoStore.Spend (trusted,
+// IgnoreUTXOHash) rather than the validator. It counts Spend calls and can fail
+// the first N, mirroring countingValidator so the retry/hard-fail/progress logic
+// can be exercised. Embedding *utxo.MockUtxostore satisfies the full interface;
+// only Spend is invoked on this path.
+type countingSpendStore struct {
+	*utxo.MockUtxostore
+	callCount      atomic.Int64
+	failFirst      int
+	failErr        error
+	mu             sync.Mutex
+	ctxCancelCount atomic.Int64 // tracks how many calls saw a cancelled context
+}
+
+func (s *countingSpendStore) Spend(ctx context.Context, _ *bt.Tx, _ uint32, _ ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	if ctx.Err() != nil {
+		s.ctxCancelCount.Add(1)
+		return nil, ctx.Err()
+	}
+
+	callNum := int(s.callCount.Add(1))
+
+	s.mu.Lock()
+	shouldFail := callNum <= s.failFirst
+	s.mu.Unlock()
+
+	if shouldFail {
+		return nil, s.failErr
+	}
+
+	return nil, nil
+}
+
 func makeTxMap(t *testing.T, count int) *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper] {
 	t.Helper()
 	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](count)
@@ -967,6 +1001,7 @@ func TestPreValidateTransactions_AllSucceed(t *testing.T) {
 	initPrometheusMetrics()
 
 	cv := &countingValidator{}
+	css := &countingSpendStore{MockUtxostore: &utxo.MockUtxostore{}}
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.SpendBatcherSize = 2
@@ -976,23 +1011,26 @@ func TestPreValidateTransactions_AllSucceed(t *testing.T) {
 		settings:         tSettings,
 		logger:           ulogger.TestLogger{},
 		validationClient: cv,
+		utxoStore:        css,
 	}
 
 	txMap := makeTxMap(t, 10)
 
 	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 100)
 	require.NoError(t, err)
-	assert.Equal(t, int64(10), cv.callCount.Load(), "all 10 transactions should be validated")
+	assert.Equal(t, int64(10), css.callCount.Load(), "all 10 transactions should be spent")
 }
 
 func TestPreValidateTransactions_PartialFailure_RetriesSucceed(t *testing.T) {
 	initPrometheusMetrics()
 
-	// Fail the first 3 calls, succeed the rest. On retry, those 3 txs will be
+	// Fail the first 3 spends, succeed the rest. On retry, those 3 txs will be
 	// retried and succeed (callCount > failFirst), so the block should pass.
-	cv := &countingValidator{
-		failFirst: 3,
-		failErr:   errors.NewStorageError("DEVICE_OVERLOAD"),
+	cv := &countingValidator{}
+	css := &countingSpendStore{
+		MockUtxostore: &utxo.MockUtxostore{},
+		failFirst:     3,
+		failErr:       errors.NewStorageError("DEVICE_OVERLOAD"),
 	}
 
 	tSettings := test.CreateBaseTestSettings(t)
@@ -1003,6 +1041,7 @@ func TestPreValidateTransactions_PartialFailure_RetriesSucceed(t *testing.T) {
 		settings:         tSettings,
 		logger:           ulogger.TestLogger{},
 		validationClient: cv,
+		utxoStore:        css,
 	}
 
 	txMap := makeTxMap(t, 10)
@@ -1011,16 +1050,18 @@ func TestPreValidateTransactions_PartialFailure_RetriesSucceed(t *testing.T) {
 	require.NoError(t, err, "should succeed after retrying the 3 failed transactions")
 
 	// 10 in first pass + 3 retried = 13 total calls
-	assert.Equal(t, int64(13), cv.callCount.Load())
-	assert.Equal(t, int64(0), cv.ctxCancelCount.Load(), "no calls should have seen a cancelled context")
+	assert.Equal(t, int64(13), css.callCount.Load())
+	assert.Equal(t, int64(0), css.ctxCancelCount.Load(), "no calls should have seen a cancelled context")
 }
 
 func TestPreValidateTransactions_AllFail_NoProgress_GivesUp(t *testing.T) {
 	initPrometheusMetrics()
 
-	cv := &countingValidator{
-		failFirst: 100000, // always fail
-		failErr:   errors.NewStorageError("DEVICE_OVERLOAD"),
+	cv := &countingValidator{}
+	css := &countingSpendStore{
+		MockUtxostore: &utxo.MockUtxostore{},
+		failFirst:     100000, // always fail
+		failErr:       errors.NewStorageError("DEVICE_OVERLOAD"),
 	}
 
 	tSettings := test.CreateBaseTestSettings(t)
@@ -1031,6 +1072,7 @@ func TestPreValidateTransactions_AllFail_NoProgress_GivesUp(t *testing.T) {
 		settings:         tSettings,
 		logger:           ulogger.TestLogger{},
 		validationClient: cv,
+		utxoStore:        css,
 	}
 
 	txMap := makeTxMap(t, 5)
@@ -1040,16 +1082,18 @@ func TestPreValidateTransactions_AllFail_NoProgress_GivesUp(t *testing.T) {
 	assert.Contains(t, err.Error(), "no progress")
 
 	// First pass (5) + one retry attempt (5) = 10, then gives up on no progress
-	assert.Equal(t, int64(10), cv.callCount.Load())
+	assert.Equal(t, int64(10), css.callCount.Load())
 }
 
 func TestPreValidateTransactions_NonRetryableError_FailsImmediately(t *testing.T) {
 	initPrometheusMetrics()
 
-	// A non-retryable error (e.g. double-spend) should not be retried
-	cv := &countingValidator{
-		failFirst: 1,
-		failErr:   errors.NewUtxoFrozenError("utxo is frozen"),
+	// A non-retryable error (e.g. frozen utxo) should not be retried
+	cv := &countingValidator{}
+	css := &countingSpendStore{
+		MockUtxostore: &utxo.MockUtxostore{},
+		failFirst:     1,
+		failErr:       errors.NewUtxoFrozenError("utxo is frozen"),
 	}
 
 	tSettings := test.CreateBaseTestSettings(t)
@@ -1060,6 +1104,7 @@ func TestPreValidateTransactions_NonRetryableError_FailsImmediately(t *testing.T
 		settings:         tSettings,
 		logger:           ulogger.TestLogger{},
 		validationClient: cv,
+		utxoStore:        css,
 	}
 
 	txMap := makeTxMap(t, 5)
@@ -1069,13 +1114,14 @@ func TestPreValidateTransactions_NonRetryableError_FailsImmediately(t *testing.T
 	assert.Contains(t, err.Error(), "non-retryable")
 
 	// All 5 should run (no cascade), but no retry should happen
-	assert.Equal(t, int64(5), cv.callCount.Load())
+	assert.Equal(t, int64(5), css.callCount.Load())
 }
 
 func TestPreValidateTransactions_ParentContextCancelled(t *testing.T) {
 	initPrometheusMetrics()
 
 	slowValidator := &countingValidator{}
+	css := &countingSpendStore{MockUtxostore: &utxo.MockUtxostore{}}
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.SpendBatcherSize = 1
@@ -1085,6 +1131,7 @@ func TestPreValidateTransactions_ParentContextCancelled(t *testing.T) {
 		settings:         tSettings,
 		logger:           ulogger.TestLogger{},
 		validationClient: slowValidator,
+		utxoStore:        css,
 	}
 
 	txMap := makeTxMap(t, 3)
