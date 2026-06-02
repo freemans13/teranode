@@ -45,10 +45,10 @@ jobs:
       # resolved from package-lock.json above) instead of `npx playwright`,
       # which could in principle fetch a different version on-demand.
       - run: ./node_modules/.bin/playwright install --with-deps chromium
-      # NOTE: `npm run check` is intentionally NOT a CI step. The legacy-mode
-      # baseline carries ~33 svelte-check errors that pre-date this PR and are
-      # cleared by the runes migration in a follow-up PR. Re-add this step
-      # once that PR lands and the baseline is clean.
+      # svelte-check gates type-correctness + Svelte deprecation warnings.
+      # The runes migration cleared the legacy baseline (0 errors); this step
+      # keeps it clean and catches any regression to legacy syntax.
+      - run: npm run check
       - run: npm run test:integration
       - if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

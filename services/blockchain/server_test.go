@@ -1045,33 +1045,32 @@ func Test_GetBlockLocator(t *testing.T) {
 
 func TestBlockchain_SavePeerRegistryPeriodically(t *testing.T) {
 	store := newTestBlobStore(t)
-
-	b := &Blockchain{
-		logger:            ulogger.TestLogger{},
-		peerRegistry:      NewCentralizedPeerRegistry(DefaultBanConfig()),
-		peerRegistryStore: store,
-	}
-	b.peerRegistry.Register(&PeerInfo{ID: "p"})
+	reg := NewCentralizedPeerRegistry(DefaultBanConfig())
+	reg.Register(&PeerInfo{ID: "p"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	doneCh := make(chan struct{})
-	go func() {
-		b.savePeerRegistryPeriodically(ctx, 5*time.Millisecond)
-		close(doneCh)
-	}()
+	// StartPeriodicSave registers on the registry's WaitGroup so Close()
+	// drains the loop synchronously.
+	reg.StartPeriodicSave(ctx, 5*time.Millisecond, store)
 
 	require.Eventually(t, func() bool {
 		exists, err := store.Exists(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry)
 		return err == nil && exists
 	}, 200*time.Millisecond, 5*time.Millisecond, "expected periodic save to write the blob")
 
-	cancel()
+	// Close() must return only after the loop exits.
+	doneCh := make(chan struct{})
+	go func() {
+		reg.Close()
+		close(doneCh)
+	}()
+
 	select {
 	case <-doneCh:
 	case <-time.After(time.Second):
-		t.Fatal("savePeerRegistryPeriodically did not return on ctx cancel")
+		t.Fatal("Close did not drain the periodic-save goroutine")
 	}
 }
 

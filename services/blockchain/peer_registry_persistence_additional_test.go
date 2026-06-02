@@ -3,7 +3,7 @@ package blockchain
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -203,7 +203,7 @@ func TestLoadPeerRegistry_AllExpired(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store.Set(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry, data))
 
-	loaded, _, err := loadPeerRegistry(ctx, ulogger.TestLogger{}, store, 24*time.Hour)
+	loaded, _, _, err := loadPeerRegistry(ctx, ulogger.TestLogger{}, store, 24*time.Hour)
 	require.NoError(t, err)
 	require.Empty(t, loaded)
 }
@@ -272,8 +272,12 @@ func TestPersistence_CorruptBlobDroppedAndRegistryStartsEmpty(t *testing.T) {
 }
 
 // TestPersistence_CorruptBlobArchivedToSidecar verifies that a corrupt registry
-// blob isn't lost outright — Load copies the bytes to a timestamped sidecar
-// key (peer-registry.corrupt-<unix>) so operators can debug post-mortem.
+// blob isn't lost outright — Load copies the bytes to a sidecar key and the
+// registry records that key in LastCorruptArchiveKey() so operators (and
+// tests) can locate the archive without probing the wall-clock keyspace.
+// Previously this test searched the keyspace at µs steps; that only worked
+// on macOS where UnixNano() is µs-aligned and failed ~99.9% on Linux where
+// the system clock returns true-ns timestamps.
 func TestPersistence_CorruptBlobArchivedToSidecar(t *testing.T) {
 	store := newTestBlobStore(t)
 	ctx := context.Background()
@@ -281,32 +285,100 @@ func TestPersistence_CorruptBlobArchivedToSidecar(t *testing.T) {
 	corruptPayload := []byte("not valid json {{{")
 	require.NoError(t, store.Set(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry, corruptPayload))
 
-	beforeTs := time.Now().UTC().Unix()
 	r := NewCentralizedPeerRegistry(DefaultBanConfig())
 	require.NoError(t, r.Load(ctx, store, 24*time.Hour))
-	afterTs := time.Now().UTC().Unix()
 
 	// Primary key is gone.
 	exists, err := store.Exists(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry)
 	require.NoError(t, err)
 	require.False(t, exists, "primary key must be deleted")
 
-	// Sidecar key must exist with the same payload. The unix timestamp in the
-	// sidecar key falls within the window of the Load call.
-	var found bool
-	for ts := beforeTs; ts <= afterTs; ts++ {
-		key := []byte(fmt.Sprintf("peer-registry.corrupt-%d", ts))
-		ok, err := store.Exists(ctx, key, fileformat.FileTypePeerRegistry)
-		require.NoError(t, err)
-		if ok {
-			archived, err := store.Get(ctx, key, fileformat.FileTypePeerRegistry)
-			require.NoError(t, err)
-			require.Equal(t, corruptPayload, archived, "sidecar must contain the original bytes verbatim")
-			found = true
-			break
-		}
+	// Registry exposes the exact sidecar key the load path wrote.
+	archiveKey := r.LastCorruptArchiveKey()
+	require.NotEmpty(t, archiveKey, "LastCorruptArchiveKey must be set after a corrupt load")
+	require.True(t, strings.HasPrefix(archiveKey, "peer-registry.corrupt-"),
+		"sidecar key prefix mismatch: %s", archiveKey)
+
+	// Sidecar contents must equal the corrupt payload verbatim — operators
+	// need byte-for-byte fidelity for post-mortem.
+	archived, err := store.Get(ctx, []byte(archiveKey), fileformat.FileTypePeerRegistry)
+	require.NoError(t, err)
+	require.Equal(t, corruptPayload, archived)
+}
+
+// TestPersistence_RejectsFutureVersion confirms that a persisted envelope
+// claiming a Version newer than this binary supports is rejected outright.
+// Silently accepting unknown fields would let a downgrade lose data; the
+// operator-visible error forces a deliberate choice between rolling forward
+// or restoring a backup.
+func TestPersistence_RejectsFutureVersion(t *testing.T) {
+	store := newTestBlobStore(t)
+	ctx := context.Background()
+
+	envelope := persistedRegistry{
+		Version: persistedRegistryVersion + 1,
+		SavedAt: time.Now().UTC(),
+		Peers:   []*PeerInfo{{ID: "p"}},
 	}
-	require.True(t, found, "expected sidecar key peer-registry.corrupt-<unix> to be present")
+	data, err := json.Marshal(&envelope)
+	require.NoError(t, err)
+	require.NoError(t, store.Set(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry, data))
+
+	r := NewCentralizedPeerRegistry(DefaultBanConfig())
+	err = r.Load(ctx, store, 24*time.Hour)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "version")
+	require.Equal(t, 0, r.Count(), "no peers loaded on rejection")
+}
+
+// TestPersistence_FutureVersionDisablesPersistence is the end-to-end check
+// for blocker #2 in PR #988: once Load detects a future-version blob, Save
+// must NOT overwrite the operator's bytes — neither via the next periodic
+// tick nor via the final shutdown save. Without this guarantee the version
+// check is just documentation.
+func TestPersistence_FutureVersionDisablesPersistence(t *testing.T) {
+	store := newTestBlobStore(t)
+	ctx := context.Background()
+
+	envelope := persistedRegistry{
+		Version: persistedRegistryVersion + 1,
+		SavedAt: time.Now().UTC(),
+		Peers:   []*PeerInfo{{ID: "future"}},
+	}
+	originalBytes, err := json.Marshal(&envelope)
+	require.NoError(t, err)
+	require.NoError(t, store.Set(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry, originalBytes))
+
+	r := NewCentralizedPeerRegistry(DefaultBanConfig())
+
+	// Load returns the version error and the registry latches saveDisabled.
+	require.Error(t, r.Load(ctx, store, 24*time.Hour))
+	require.True(t, r.SaveDisabled(), "saveDisabled must be set after future-version Load")
+
+	// A manual Save must be a no-op — registry state is empty, but writing
+	// it would clobber the operator's V=current+1 blob with a V=1 envelope.
+	require.NoError(t, r.Save(ctx, store))
+
+	// Bytes on disk must be unchanged.
+	onDisk, err := store.Get(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry)
+	require.NoError(t, err)
+	require.Equal(t, originalBytes, onDisk, "Save with saveDisabled must NOT mutate the blob")
+
+	// StartPeriodicSave must also refuse — no goroutine, no future tick.
+	// Close() returns immediately because nothing was added to wg.
+	r.StartPeriodicSave(ctx, time.Millisecond, store)
+	done := make(chan struct{})
+	go func() { r.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Close hung — StartPeriodicSave should have been a no-op")
+	}
+
+	// Final paranoid check: blob still unchanged after the would-be tick.
+	onDisk, err = store.Get(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry)
+	require.NoError(t, err)
+	require.Equal(t, originalBytes, onDisk)
 }
 
 func TestPersistence_LoadAnchorsLastDecayWhenMissing(t *testing.T) {

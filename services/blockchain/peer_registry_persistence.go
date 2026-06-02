@@ -41,6 +41,13 @@ type persistedBanEntry struct {
 
 const persistedRegistryVersion = 1
 
+// errFutureRegistryVersion is returned by loadPeerRegistry when the blob's
+// envelope.Version is newer than this binary supports. Callers (currently
+// only Load) use this sentinel to differentiate the version-mismatch path
+// from generic read errors and to gate persistence so the operator's
+// future-version blob is not overwritten on the next save tick.
+var errFutureRegistryVersion = errors.New(errors.ERR_PROCESSING, "peer registry blob is from a newer Version than this binary supports")
+
 // savePeerRegistry marshals the registry envelope to JSON and writes it to the
 // configured blob.Store. The store is responsible for atomic publication
 // (local-fs backend uses temp-file + rename; remote backends use their own
@@ -70,25 +77,29 @@ func savePeerRegistry(ctx context.Context, store blob.Store, peers []*PeerInfo, 
 // peers are exempt from the TTL filter — bans must outlive idle gaps,
 // otherwise restarts would silently clear in-flight bans.
 //
-// Two non-fatal situations are handled silently:
+// Three non-fatal situations are handled:
 //   - Key missing: returns empty state (first startup is fine).
 //   - Stored blob is corrupt JSON: archives the bad blob to a timestamped
-//     sidecar key (peer-registry.corrupt-<unix>) so operators can inspect it
-//     post-mortem, logs an error via the supplied logger, then returns empty
-//     state. The corrupt blob itself is then deleted so the next save can
-//     write to the primary key cleanly.
-func loadPeerRegistry(ctx context.Context, logger ulogger.Logger, store blob.Store, ttl time.Duration) ([]*PeerInfo, map[string]persistedBanEntry, error) {
+//     sidecar key (peer-registry.corrupt-<unixnano>) so operators can inspect
+//     it post-mortem, logs an error via the supplied logger, then returns
+//     empty state. The corrupt blob is deleted so the next save can write to
+//     the primary key cleanly. archiveKey reports the exact sidecar key the
+//     test seam (lastCorruptArchiveKey) records.
+//   - Envelope.Version is newer than this binary supports: returns
+//     errFutureRegistryVersion; Load uses this to gate further persistence so
+//     the operator's blob is not overwritten on the next save tick.
+func loadPeerRegistry(ctx context.Context, logger ulogger.Logger, store blob.Store, ttl time.Duration) (peers []*PeerInfo, bans map[string]persistedBanEntry, archiveKey string, err error) {
 	exists, err := store.Exists(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry)
 	if err != nil {
-		return nil, nil, errors.NewProcessingError("check peer registry blob existence", err)
+		return nil, nil, "", errors.NewProcessingError("check peer registry blob existence", err)
 	}
 	if !exists {
-		return []*PeerInfo{}, nil, nil
+		return []*PeerInfo{}, nil, "", nil
 	}
 
 	data, err := store.Get(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry)
 	if err != nil {
-		return nil, nil, errors.NewProcessingError("read peer registry from blob store", err)
+		return nil, nil, "", errors.NewProcessingError("read peer registry from blob store", err)
 	}
 
 	var envelope persistedRegistry
@@ -98,8 +109,11 @@ func loadPeerRegistry(ctx context.Context, logger ulogger.Logger, store blob.Sto
 		// surface an ERROR-level log line — silent data loss here would mean
 		// a node "successfully" started while having destroyed reputation /
 		// ban history.
-		archiveKey := []byte(fmt.Sprintf("peer-registry.corrupt-%d", time.Now().UTC().Unix()))
-		if archiveErr := store.Set(ctx, archiveKey, fileformat.FileTypePeerRegistry, data,
+		// Nanosecond granularity so two corruption events in the same second
+		// don't collide on the sidecar key (which would clobber via
+		// WithAllowOverwrite=true). Format: peer-registry.corrupt-<unixnano>.
+		archiveKey = fmt.Sprintf("peer-registry.corrupt-%d", time.Now().UTC().UnixNano())
+		if archiveErr := store.Set(ctx, []byte(archiveKey), fileformat.FileTypePeerRegistry, data,
 			options.WithAllowOverwrite(true)); archiveErr != nil {
 			logger.Errorf("peer registry: corrupt blob detected (%v); FAILED to archive to %s: %v; original will be deleted",
 				err, archiveKey, archiveErr)
@@ -108,7 +122,18 @@ func loadPeerRegistry(ctx context.Context, logger ulogger.Logger, store blob.Sto
 				err, archiveKey)
 		}
 		_ = store.Del(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry)
-		return []*PeerInfo{}, nil, nil
+		return []*PeerInfo{}, nil, archiveKey, nil
+	}
+
+	// Reject envelopes from a newer format than this binary understands.
+	// Silently dropping unknown fields would let a downgrade lose data — a
+	// future Version=2 might split bans into a sub-message, for example.
+	// We return a sentinel so Load can disable subsequent Save calls and
+	// preserve the operator's blob.
+	if envelope.Version > persistedRegistryVersion {
+		return nil, nil, "", errors.NewProcessingError(
+			fmt.Sprintf("envelope version %d, this binary supports up to version %d",
+				envelope.Version, persistedRegistryVersion), errFutureRegistryVersion)
 	}
 
 	cutoff := time.Now().Add(-ttl)
@@ -125,14 +150,22 @@ func loadPeerRegistry(ctx context.Context, logger ulogger.Logger, store blob.Sto
 		}
 	}
 
-	return live, envelope.BanScores, nil
+	return live, envelope.BanScores, "", nil
 }
 
 // Save persists the current registry state to the supplied blob.Store. Safe to
 // call concurrently — saveMu serializes the snapshot+write so a slow earlier
 // save can't overwrite a newer one inside the store.
+//
+// Save returns nil without writing when saveDisabled is set. This happens
+// after Load detects a future-version blob: persisting an empty Version=1
+// envelope over the operator's future-version data would destroy exactly what
+// the version check was meant to protect.
 func (r *CentralizedPeerRegistry) Save(ctx context.Context, store blob.Store) error {
 	if store == nil {
+		return nil
+	}
+	if r.saveDisabled.Load() {
 		return nil
 	}
 
@@ -174,13 +207,31 @@ func (r *CentralizedPeerRegistry) Save(ctx context.Context, store blob.Store) er
 // are dropped on load. Ban-score entries that have already expired
 // (BanUntil in the past) are discarded; everything else is restored so a
 // node restart does not reset in-flight bans.
+//
+// When the persisted envelope is from a Version newer than this binary
+// supports, Load returns errFutureRegistryVersion AND sets saveDisabled —
+// subsequent Save / StartPeriodicSave calls become no-ops to preserve the
+// operator's blob until they can decide whether to roll forward or restore a
+// backup.
 func (r *CentralizedPeerRegistry) Load(ctx context.Context, store blob.Store, ttl time.Duration) error {
 	if store == nil {
 		return nil
 	}
 
-	peers, bans, err := loadPeerRegistry(ctx, r.log(), store, ttl)
+	peers, bans, archiveKey, err := loadPeerRegistry(ctx, r.log(), store, ttl)
+	if archiveKey != "" {
+		key := archiveKey
+		r.lastCorruptArchiveKey.Store(&key)
+	}
 	if err != nil {
+		if errors.Is(err, errFutureRegistryVersion) {
+			// Block all subsequent persistence — the operator's blob must not
+			// be overwritten by the empty Version=1 envelope a save would
+			// produce. saveDisabled is one-way; a fresh registry is the only
+			// way to clear it.
+			r.saveDisabled.Store(true)
+			r.log().Errorf("peer registry: %v — persistence disabled until restart", err)
+		}
 		return err
 	}
 

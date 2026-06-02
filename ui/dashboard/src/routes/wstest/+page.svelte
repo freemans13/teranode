@@ -1,15 +1,17 @@
+<svelte:options runes={true} />
+
 <script lang="ts">
   import { onMount } from 'svelte'
   import { Button, TextInput } from '$lib/components'
   import Card from '$internal/components/card/index.svelte'
   import Typo from '$internal/components/typo/index.svelte'
 
-  let wsUrl = 'ws://localhost:9906/p2p-ws'
+  let wsUrl = $state('ws://localhost:9906/p2p-ws')
   let socket: WebSocket | null = null
-  let connected = false
-  let messages: any[] = []
-  let firstNodeStatus: any = null
-  let connectionLog: string[] = []
+  let connected = $state(false)
+  let messages: any[] = $state([])
+  let firstNodeStatus: any = $state(null)
+  let connectionLog: string[] = $state([])
 
   function addLog(msg: string) {
     connectionLog = [...connectionLog, `[${new Date().toISOString()}] ${msg}`]
@@ -123,9 +125,11 @@
 
 <div class="container" data-test-id="page-root">
   <Card>
-    <div slot="title">
-      <Typo variant="title" size="h4" value="WebSocket Test Tool" />
-    </div>
+    {#snippet title()}
+      <div>
+        <Typo variant="title" size="h4" value="WebSocket Test Tool" />
+      </div>
+    {/snippet}
 
     <div class="controls">
       <TextInput
@@ -136,9 +140,9 @@
       />
 
       {#if !connected}
-        <Button on:click={connect} variant="primary">Connect</Button>
+        <Button onclick={connect} variant="primary">Connect</Button>
       {:else}
-        <Button on:click={disconnect} variant="danger">Disconnect</Button>
+        <Button onclick={disconnect} variant="destructive">Disconnect</Button>
       {/if}
 
       <div class="status">

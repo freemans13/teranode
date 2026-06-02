@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -411,7 +412,7 @@ func TestGRPC_PeerInfoProtoRoundTrip(t *testing.T) {
 	}
 
 	proto := peerInfoToProto(original)
-	roundTripped := protoToPeerInfo(proto)
+	roundTripped := protoToPeerInfo(ulogger.TestLogger{}, proto)
 
 	require.Equal(t, original.ID, roundTripped.ID)
 	require.Equal(t, original.TransportType, roundTripped.TransportType)
@@ -455,7 +456,7 @@ func TestGRPC_PeerInfoProtoRoundTrip_NilBlockHash(t *testing.T) {
 	proto := peerInfoToProto(original)
 	require.Nil(t, proto.BlockHash)
 
-	roundTripped := protoToPeerInfo(proto)
+	roundTripped := protoToPeerInfo(ulogger.TestLogger{}, proto)
 	require.Nil(t, roundTripped.BlockHash)
 }
 
@@ -466,7 +467,7 @@ func TestGRPC_PeerInfoProtoRoundTrip_ZeroTimestamps(t *testing.T) {
 	}
 
 	proto := peerInfoToProto(original)
-	roundTripped := protoToPeerInfo(proto)
+	roundTripped := protoToPeerInfo(ulogger.TestLogger{}, proto)
 
 	require.Equal(t, original.ID, roundTripped.ID)
 
@@ -491,7 +492,8 @@ func TestGRPC_BlockHashBytesRoundTrip(t *testing.T) {
 	b := blockHashToBytes(hash)
 	require.Len(t, b, chainhash.HashSize)
 
-	roundTripped := bytesToBlockHash(b)
+	roundTripped, err := bytesToBlockHash(b)
+	require.NoError(t, err)
 	require.NotNil(t, roundTripped)
 	require.Equal(t, hash.String(), roundTripped.String())
 }
@@ -500,18 +502,22 @@ func TestGRPC_BlockHashBytesRoundTrip_Nil(t *testing.T) {
 	b := blockHashToBytes(nil)
 	require.Nil(t, b)
 
-	h := bytesToBlockHash(nil)
+	h, err := bytesToBlockHash(nil)
+	require.NoError(t, err)
 	require.Nil(t, h)
 }
 
 func TestGRPC_BlockHashBytesRoundTrip_Empty(t *testing.T) {
-	h := bytesToBlockHash([]byte{})
+	h, err := bytesToBlockHash([]byte{})
+	require.NoError(t, err)
 	require.Nil(t, h)
 }
 
 func TestGRPC_BlockHashBytesRoundTrip_InvalidLength(t *testing.T) {
-	// A slice that is not 32 bytes should return nil.
-	h := bytesToBlockHash([]byte{0x01, 0x02, 0x03})
+	// A slice that is not 32 bytes returns (nil, error) — caller logs and
+	// continues with the rest of the entry.
+	h, err := bytesToBlockHash([]byte{0x01, 0x02, 0x03})
+	require.Error(t, err)
 	require.Nil(t, h)
 }
 
