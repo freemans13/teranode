@@ -548,6 +548,14 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		}
 		p := &prepared[i]
 		if _, wasNew := newHashSet[*p.txHash]; wasNew {
+			// Consume the hash so only the first item with this hash in the
+			// batch is treated as newly created. Concurrent duplicate creates
+			// of the same tx coalesce into a single bulk INSERT whose ON CONFLICT
+			// DO NOTHING inserts exactly one row (RETURNING it once); without
+			// consuming it here, every same-hash item would be marked created and
+			// each caller would notify block assembly. Subsequent same-hash items
+			// must return TxExists, matching createDirect's ON CONFLICT semantics.
+			delete(newHashSet, *p.txHash)
 			result := s.buildCreateMeta(p.txMeta, item.options, p.isCoinbase, item.blockHeight)
 			s.cache.Add(*p.txHash, result)
 			item.done <- batchCreateResult{Data: result}
