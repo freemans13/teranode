@@ -61,9 +61,23 @@ func satoshiOutpointKey(hash *chainhash.Hash, idx uint32) []byte {
 	return k
 }
 
-// putTx caches every output's satoshis (8-byte LE) keyed by its outpoint, so
-// later blocks' inputs spending these outputs can have their fee contribution
-// resolved from memory.
+// put caches a single output's satoshis (8-byte LE) keyed by its outpoint. Set
+// errors are non-fatal: a later miss just falls through to the store, so block
+// processing is never failed on a cache write.
+func (p *satoshiCache) put(hash *chainhash.Hash, idx uint32, satoshis uint64) {
+	if p == nil {
+		return
+	}
+
+	var v [8]byte
+	binary.LittleEndian.PutUint64(v[:], satoshis)
+
+	_ = p.cache.Set(satoshiOutpointKey(hash, idx), v[:])
+}
+
+// putTx caches every output's satoshis keyed by its outpoint, so later blocks'
+// inputs spending these outputs can have their fee contribution resolved from
+// memory.
 func (p *satoshiCache) putTx(tx *bt.Tx) {
 	if p == nil || tx == nil {
 		return
@@ -81,12 +95,7 @@ func (p *satoshiCache) putTx(tx *bt.Tx) {
 			continue
 		}
 
-		var v [8]byte
-		binary.LittleEndian.PutUint64(v[:], out.Satoshis)
-
-		// Set errors are non-fatal: a later miss just falls through to the store.
-		// Never fail block processing on a cache write.
-		_ = p.cache.Set(satoshiOutpointKey(h, idx), v[:])
+		p.put(h, idx, out.Satoshis)
 	}
 }
 

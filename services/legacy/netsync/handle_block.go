@@ -39,12 +39,6 @@ import (
 func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, msgBlock *wire.MsgBlock) (err error) {
 	sm.logger.Debugf("[HandleBlockDirect][%s] starting handling block", blockHash.String())
 
-	// Make sure we have the correct height for this block before continuing
-	var (
-		blockHeight             uint32
-		previousBlockHeaderMeta *model.BlockHeaderMeta
-	)
-
 	// check whether this block already exists
 	blockExists, err := sm.blockchainClient.GetBlockExists(ctx, &blockHash)
 	if err != nil {
@@ -59,38 +53,14 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 
 	block := bsvutil.NewBlock(msgBlock)
 
-	// Lookup previous block height from blockchain
-	_, previousBlockHeaderMeta, err = sm.blockchainClient.GetBlockHeader(ctx, &block.MsgBlock().Header.PrevBlock)
+	// Determine this block's height. On the quick-validation pipeline path this
+	// reads the checkpoint-anchored in-memory header list (no GetBlockHeader read,
+	// so it does not depend on the parent block being finalized first); otherwise
+	// it falls back to the original blockchain lookup. Side effect: sets block
+	// height via SetHeight.
+	blockHeight, err := sm.deriveBlockHeight(ctx, block, blockHash)
 	if err != nil {
-		sm.logger.Errorf("[HandleBlockDirect][%s] failed to get block header for previous block %s: %s", blockHash.String(), block.MsgBlock().Header.PrevBlock, err)
-		return errors.NewProcessingError("failed to get block header for previous block %s", block.MsgBlock().Header.PrevBlock, err)
-	}
-
-	if block.Height() <= 0 {
-		// block height was not set in the msgBlock, set it from our lookup
-		blockHeight = previousBlockHeaderMeta.Height + 1
-
-		blockHeightInt32, err := safeconversion.Uint32ToInt32(blockHeight)
-		if err != nil {
-			return errors.NewProcessingError("failed to convert block height to int32", err)
-		}
-
-		block.SetHeight(blockHeightInt32)
-	} else {
-		// check whether the block height being reported is the correct block height
-		previousBlockHeightInt32, err := safeconversion.Uint32ToInt32(previousBlockHeaderMeta.Height + 1)
-		if err != nil {
-			return errors.NewProcessingError("failed to convert block height to int32", err)
-		}
-
-		if block.Height() != previousBlockHeightInt32 {
-			return errors.NewBlockInvalidError("block height %d is not the correct height for block %s, expected %d", block.Height(), blockHash, previousBlockHeaderMeta.Height+1)
-		}
-
-		blockHeight, err = safeconversion.Int32ToUint32(block.Height())
-		if err != nil {
-			return errors.NewProcessingError("failed to convert block height to uint32", err)
-		}
+		return err
 	}
 
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "HandleBlockDirect",
@@ -145,77 +115,32 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		}
 	}
 
-	// 3. Create a block message with (block hash, coinbase tx and slice if 1 subtree)
-	var headerBytes bytes.Buffer
-	if err = block.MsgBlock().Header.Serialize(&headerBytes); err != nil {
-		return errors.NewProcessingError("failed to serialize header", err)
+	// Concurrent ahead-creation (the throughput lever, legacy_blockPipelineConcurrency
+	// > 1): run this block's PhaseA tx-work on a bounded worker pool and finalize via
+	// the height-ordered reorder buffer. The consumer establishes the authoritative
+	// finalize start height here (it dispatches in arrival order, contiguous with the
+	// committed tip), and — critically for the create→fee dependency — caches this
+	// block's output satoshis at parse time BEFORE dispatch, so a later block's
+	// concurrent fee resolution finds them regardless of createUtxos order. Then it
+	// returns so the next block's PhaseA can begin immediately.
+	if pipelined && sm.effectivePipelineConcurrency() > 1 {
+		sm.ensureFinalizer(blockHeight)
+		sm.cacheBlockOutputSatoshis(block)
+
+		if err = sm.acquirePipelineSlot(); err != nil {
+			return err
+		}
+
+		go sm.runPhaseAWorker(block, blockHash, blockHeight)
+
+		return nil
 	}
 
-	// create the Teranode compatible block header
-	header, err := model.NewBlockHeaderFromBytes(headerBytes.Bytes())
-	if err != nil {
-		return errors.NewProcessingError("failed to create block header from bytes", err)
-	}
-
-	var coinbase bytes.Buffer
-	if err = block.Transactions()[0].MsgTx().Serialize(&coinbase); err != nil {
-		return errors.NewProcessingError("failed to serialize coinbase", err)
-	}
-
-	// Single coinbase decode per block, retained into the teranodeBlock model
-	// for downstream use; stays on the standard heap path. The arena variant
-	// would require Put before return, at which point coinbaseTx's scripts
-	// would alias soon-to-be-reused memory. Per-block tx loops in legacy
-	// ingestion live in bsvutil/subtree-assembly, which works with
-	// bsvutil.Tx (not bt.Tx) and never round-trips through go-bt decode.
-	coinbaseTx, err := bt.NewTxFromBytes(coinbase.Bytes())
-	if err != nil {
-		return errors.NewProcessingError("failed to create bt.Tx for coinbase", err)
-	}
-
-	// validate all subtrees and store all subtree data
-	// this also should spend and create all utxos
-	subtrees, blockID, err := sm.prepareSubtrees(ctx, block)
+	// Inline PhaseA: serial path (default / above the checkpoint), or the pipelined
+	// path at concurrency 1 (finalization still overlaps the next block's tx-work).
+	job, err := sm.runPhaseA(ctx, block, blockHash, blockHeight)
 	if err != nil {
 		return err
-	}
-
-	// create valid teranode block, with the subtree hash
-	blockSize := block.MsgBlock().SerializeSize()
-
-	blockSizeUint64, err := safeconversion.IntToUint64(blockSize)
-	if err != nil {
-		return err
-	}
-
-	teranodeBlock, err := model.NewBlock(header, coinbaseTx, subtrees, uint64(len(block.Transactions())), blockSizeUint64, blockHeight, blockID)
-	if err != nil {
-		return errors.NewProcessingError("failed to create model.NewBlock", err)
-	}
-
-	// pre-check that there is enough proof of work on the block, before we do any other processing
-	headerValid, _, err := teranodeBlock.Header.HasMetTargetDifficulty()
-	if !headerValid {
-		return errors.NewBlockInvalidError("invalid block header: %s", teranodeBlock.Header.Hash().String(), err)
-	}
-
-	// Pre-extract the tx hashes here, before any (possibly deferred) finalization,
-	// so the orphan-processing work does not keep `block` (and therefore the
-	// wire.MsgBlock + its decode arena) reachable. Copy the hash *values* (not the
-	// *chainhash.Hash pointers returned by tx.Hash(), which alias into the
-	// bsvutil.Tx wrapper and would pin it).
-	wireTxs := block.Transactions()
-	txHashes := make([]chainhash.Hash, len(wireTxs))
-	for i, tx := range wireTxs {
-		txHashes[i] = *tx.Hash()
-	}
-
-	job := &finalizeJob{
-		ctx:           ctx,
-		teranodeBlock: teranodeBlock,
-		txHashes:      txHashes,
-		blockHashStr:  block.Hash().String(),
-		blockHeight:   blockHeight,
 	}
 
 	// Pipelined quick path: hand finalization (ProcessBlock + mined_set + orphan
@@ -232,6 +157,156 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 
 	// Serial path (default / above the checkpoint): finalize inline, unchanged.
 	return sm.finalizeBlock(job)
+}
+
+// runPhaseA performs a block's order-independent tx-work below the checkpoint:
+// build the header/coinbase, prepareSubtrees (create all outputs + trusted spend
+// + write subtree data), assemble the model block and pre-check proof of work.
+// It returns a finalizeJob carrying everything the order-sensitive PhaseB
+// (finalizeBlock) needs, decoupled from the wire block so the decode arena can be
+// released. Safe to run concurrently across blocks once the satoshi cache is
+// pre-built and the cross-block subtree batcher is bypassed (see ensureFinalizer
+// and prepareSubtrees).
+func (sm *SyncManager) runPhaseA(ctx context.Context, block *bsvutil.Block, blockHash chainhash.Hash, blockHeight uint32) (*finalizeJob, error) {
+	// 3. Create a block message with (block hash, coinbase tx and slice if 1 subtree)
+	var headerBytes bytes.Buffer
+	if err := block.MsgBlock().Header.Serialize(&headerBytes); err != nil {
+		return nil, errors.NewProcessingError("failed to serialize header", err)
+	}
+
+	// create the Teranode compatible block header
+	header, err := model.NewBlockHeaderFromBytes(headerBytes.Bytes())
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to create block header from bytes", err)
+	}
+
+	var coinbase bytes.Buffer
+	if err = block.Transactions()[0].MsgTx().Serialize(&coinbase); err != nil {
+		return nil, errors.NewProcessingError("failed to serialize coinbase", err)
+	}
+
+	// Single coinbase decode per block, retained into the teranodeBlock model
+	// for downstream use; stays on the standard heap path. The arena variant
+	// would require Put before return, at which point coinbaseTx's scripts
+	// would alias soon-to-be-reused memory. Per-block tx loops in legacy
+	// ingestion live in bsvutil/subtree-assembly, which works with
+	// bsvutil.Tx (not bt.Tx) and never round-trips through go-bt decode.
+	coinbaseTx, err := bt.NewTxFromBytes(coinbase.Bytes())
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to create bt.Tx for coinbase", err)
+	}
+
+	// validate all subtrees and store all subtree data
+	// this also should spend and create all utxos
+	subtrees, blockID, err := sm.prepareSubtrees(ctx, block)
+	if err != nil {
+		return nil, err
+	}
+
+	// create valid teranode block, with the subtree hash
+	blockSize := block.MsgBlock().SerializeSize()
+
+	blockSizeUint64, err := safeconversion.IntToUint64(blockSize)
+	if err != nil {
+		return nil, err
+	}
+
+	teranodeBlock, err := model.NewBlock(header, coinbaseTx, subtrees, uint64(len(block.Transactions())), blockSizeUint64, blockHeight, blockID)
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to create model.NewBlock", err)
+	}
+
+	// pre-check that there is enough proof of work on the block, before we do any other processing
+	headerValid, _, err := teranodeBlock.Header.HasMetTargetDifficulty()
+	if !headerValid {
+		return nil, errors.NewBlockInvalidError("invalid block header: %s", teranodeBlock.Header.Hash().String(), err)
+	}
+
+	// Pre-extract the tx hashes here, before any (possibly deferred) finalization,
+	// so the orphan-processing work does not keep `block` (and therefore the
+	// wire.MsgBlock + its decode arena) reachable. Copy the hash *values* (not the
+	// *chainhash.Hash pointers returned by tx.Hash(), which alias into the
+	// bsvutil.Tx wrapper and would pin it).
+	wireTxs := block.Transactions()
+	txHashes := make([]chainhash.Hash, len(wireTxs))
+	for i, tx := range wireTxs {
+		txHashes[i] = *tx.Hash()
+	}
+
+	return &finalizeJob{
+		ctx:           ctx,
+		teranodeBlock: teranodeBlock,
+		txHashes:      txHashes,
+		blockHashStr:  block.Hash().String(),
+		blockHeight:   blockHeight,
+	}, nil
+}
+
+// effectivePipelineConcurrency returns the PhaseA window size actually used.
+// Concurrency > 1 requires the parse-time satoshi cache (ParentSatoshiCacheMB >
+// 0): without it every cross-block parent fee would hit the store, which under
+// concurrency may not yet hold the parent's outputs (its createUtxos may not have
+// run), breaking the create→fee dependency. With the cache disabled we clamp to
+// 1 (serial tx-work, still-pipelined finalization), which is always correct.
+func (sm *SyncManager) effectivePipelineConcurrency() int {
+	c := sm.settings.Legacy.BlockPipelineConcurrency
+	if c <= 1 {
+		return 1
+	}
+
+	if sm.settings.Legacy.ParentSatoshiCacheMB <= 0 {
+		return 1
+	}
+
+	return c
+}
+
+// cacheBlockOutputSatoshis records every output's satoshis from a block into the
+// satoshi cache, read straight from wire data (cached tx hashes + TxOut.Value) so
+// it is cheap and needs no bt.Tx conversion. This is the design's step (a):
+// populating at PARSE time on the in-order blockQueue consumer — before a block's
+// PhaseA is dispatched — guarantees that when a later block's concurrent PhaseA
+// resolves a fee against this block's outputs, the satoshis are already cached,
+// independent of whether this block's createUtxos has run. No-op when the cache
+// is disabled.
+func (sm *SyncManager) cacheBlockOutputSatoshis(block *bsvutil.Block) {
+	if sm.satoshiCache == nil {
+		return
+	}
+
+	for _, tx := range block.Transactions() {
+		txHash := tx.Hash()
+
+		for i, out := range tx.MsgTx().TxOut {
+			if out == nil {
+				continue
+			}
+
+			idx, err := safeconversion.IntToUint32(i)
+			if err != nil {
+				continue
+			}
+
+			sm.satoshiCache.put(txHash, idx, uint64(out.Value))
+		}
+	}
+}
+
+// runPhaseAWorker runs runPhaseA off the blockQueue consumer (concurrent window)
+// and hands the resulting job to the in-order finalizer. PhaseA failures halt the
+// pipeline via setFinalizeError (surfaced to the consumer before the next block).
+// It always releases its window slot. Uses the manager context, since the
+// per-call tracing span has already ended by the time this runs.
+func (sm *SyncManager) runPhaseAWorker(block *bsvutil.Block, blockHash chainhash.Hash, blockHeight uint32) {
+	defer sm.releasePipelineSlot()
+
+	job, err := sm.runPhaseA(sm.ctx, block, blockHash, blockHeight)
+	if err != nil {
+		sm.setFinalizeError(err)
+		return
+	}
+
+	sm.enqueueFinalize(job)
 }
 
 // finalizeJob carries everything block finalization needs, decoupled from the
@@ -277,22 +352,58 @@ func (sm *SyncManager) finalizeBlock(job *finalizeJob) error {
 // so the in-flight blocks' state stays bounded.
 const finalizeChDepth = 4
 
-// ensureFinalizer lazily starts the finalizer goroutine and its handoff channel
-// on the first pipelined block. Called only from the single blockQueue consumer
-// goroutine, so sync.Once fully serialises construction.
-func (sm *SyncManager) ensureFinalizer() {
+// ensureFinalizer lazily starts the finalizer goroutine, its handoff channel and
+// the PhaseA window semaphore on the first pipelined block, and records the
+// authoritative finalize start height. Called only from the single blockQueue
+// consumer goroutine, so sync.Once fully serialises construction. startHeight is
+// the first pipelined block's height (contiguous with the committed tip, since
+// the consumer dispatches in arrival order during in-order headers-first sync).
+func (sm *SyncManager) ensureFinalizer(startHeight uint32) {
 	sm.finalizeOnce.Do(func() {
-		sm.finalizeCh = make(chan *finalizeJob, finalizeChDepth)
+		sm.finalizeStartHeight = startHeight
+
+		if sm.settings.Legacy.BlockPipelineConcurrency > 1 && sm.settings.Legacy.ParentSatoshiCacheMB <= 0 {
+			sm.logger.Warnf("[finalizeLoop] legacy_blockPipelineConcurrency>1 ignored: it requires legacy_parentSatoshiCacheMB>0 for fee correctness; running tx-work serially")
+		}
+
+		concurrency := sm.effectivePipelineConcurrency()
+
+		sm.pipelineSem = make(chan struct{}, concurrency)
+
+		// Pre-build the off-heap satoshi fee-cache before any concurrent PhaseA
+		// worker runs prepareSubtrees, so its lazy init there cannot race. No-op
+		// when the cache is disabled; prepareSubtrees still builds it lazily on the
+		// serial/single-worker path.
+		if concurrency > 1 && sm.satoshiCache == nil && sm.settings.Legacy.ParentSatoshiCacheMB > 0 {
+			poc, cacheErr := newSatoshiCache(sm.settings.Legacy.ParentSatoshiCacheMB * 1024 * 1024)
+			if cacheErr != nil {
+				sm.logger.Errorf("[finalizeLoop] failed to pre-create satoshi cache: %v", cacheErr)
+			} else {
+				sm.satoshiCache = poc
+				sm.logger.Infof("[finalizeLoop] pre-created %d MB off-heap satoshi cache for concurrent pipeline", sm.settings.Legacy.ParentSatoshiCacheMB)
+			}
+		}
+
+		if concurrency > 1 && sm.settings.Legacy.SubtreeWriteBatchBlocks > 1 {
+			sm.logger.Warnf("[finalizeLoop] legacy_subtreeWriteBatchBlocks>1 is ignored under legacy_blockPipelineConcurrency>1 (the cross-block subtree-write batcher is single-goroutine); using per-block direct writes")
+		}
+
+		depth := finalizeChDepth
+		if concurrency > depth {
+			depth = concurrency
+		}
+
+		sm.finalizeCh = make(chan *finalizeJob, depth)
 		go sm.finalizeLoop()
 
-		sm.logger.Infof("[finalizeLoop] block-finalization pipeline started (look-ahead horizon %d blocks)", finalizeChDepth)
+		sm.logger.Infof("[finalizeLoop] block-finalization pipeline started (concurrency %d, start height %d, look-ahead horizon %d blocks)", concurrency, startHeight, depth)
 	})
 }
 
 // enqueueFinalize hands a job to the finalizer, back-pressuring the caller when
-// the horizon is full, and aborting cleanly on shutdown.
+// the handoff channel is full, and aborting cleanly on shutdown.
 func (sm *SyncManager) enqueueFinalize(job *finalizeJob) {
-	sm.ensureFinalizer()
+	sm.ensureFinalizer(job.blockHeight)
 
 	select {
 	case sm.finalizeCh <- job:
@@ -300,18 +411,57 @@ func (sm *SyncManager) enqueueFinalize(job *finalizeJob) {
 	}
 }
 
-// finalizeLoop finalizes blocks in the height order they were enqueued. On the
-// first error it records it (halting further ingest via finalizeError) and keeps
-// draining so senders never block. On shutdown it exits; any not-yet-finalized
-// blocks are simply re-processed on restart (createUtxos/spend are idempotent).
+// acquirePipelineSlot takes a PhaseA window token, blocking the consumer when the
+// window is full so it cannot run unboundedly far ahead of finalization. Aborts
+// on shutdown.
+func (sm *SyncManager) acquirePipelineSlot() error {
+	select {
+	case sm.pipelineSem <- struct{}{}:
+		return nil
+	case <-sm.quit:
+		return errors.NewProcessingError("[HandleBlockDirect] shutting down")
+	}
+}
+
+// releasePipelineSlot returns a PhaseA window token once a worker's job has been
+// handed to the finalizer (or its PhaseA failed).
+func (sm *SyncManager) releasePipelineSlot() {
+	<-sm.pipelineSem
+}
+
+// finalizeLoop finalizes blocks in strict ascending height order via the reorder
+// buffer, regardless of the order their (concurrent) PhaseA tx-work completes.
+// Finalizing in order guarantees a block's parent is already on chain when it is
+// added. On the first error it records it (halting further ingest via
+// finalizeError) and keeps draining so senders never block. On shutdown it exits;
+// any not-yet-finalized blocks are simply re-processed on restart
+// (createUtxos/spend are idempotent).
 func (sm *SyncManager) finalizeLoop() {
+	buf := newFinalizeReorderBuffer()
+	buf.setStart(sm.finalizeStartHeight)
+
+	// Watchdog: if a block body for the awaited height is genuinely lost, higher
+	// blocks complete PhaseA and pile up in the buffer while finalization halts.
+	// The pipeline path never trips the stage-1 missing-parent self-heal, so detect
+	// the wedge here and re-request the gap from the tip.
+	detector := &gapStallDetector{timeout: finalizeStallTimeout}
+	ticker := time.NewTicker(finalizeStallCheckInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-sm.quit:
 			return
 		case job := <-sm.finalizeCh:
-			if err := sm.finalizeBlock(job); err != nil {
-				sm.setFinalizeError(err)
+			for _, ready := range buf.add(job) {
+				if err := sm.finalizeBlock(ready); err != nil {
+					sm.setFinalizeError(err)
+				}
+			}
+		case <-ticker.C:
+			waiting, started := buf.waitingFor()
+			if detector.observe(waiting, started, buf.len(), time.Now()) {
+				sm.maybeResyncFinalizeGap(waiting)
 			}
 		}
 	}
@@ -543,7 +693,11 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	// Safety: prepareSubtrees is only ever called from the blockHandler
 	// goroutine (single-threaded block processing path), so no mutex is
 	// needed around the batcher pointer.
-	if quickValidationMode && sm.subtreeWriteBatcher == nil && sm.settings.Legacy.SubtreeWriteBatchBlocks > 1 {
+	// Skip the cross-block batcher under concurrency: it is single-goroutine
+	// (shared in-memory buffer across blocks) and would race when multiple PhaseA
+	// workers write subtrees at once. With it bypassed, writeSubtree streams each
+	// block's subtrees directly to distinct files — concurrency-safe.
+	if quickValidationMode && sm.subtreeWriteBatcher == nil && sm.settings.Legacy.SubtreeWriteBatchBlocks > 1 && sm.effectivePipelineConcurrency() <= 1 {
 		sm.subtreeWriteBatcher = NewSubtreeWriteBatcher(
 			sm.settings.Legacy.SubtreeWriteBatchBlocks,
 			sm.settings.Legacy.SubtreeWriteBatchWait,
