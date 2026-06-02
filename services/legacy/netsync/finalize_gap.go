@@ -60,6 +60,64 @@ func (d *gapStallDetector) observe(waitingHeight uint32, started bool, pending i
 	return false
 }
 
+// markDispatched records that a block height's PhaseA has been dispatched (its
+// tx-work has begun), so the gap watchdog knows it is in-flight rather than
+// missing. Called by the blockQueue consumer for every pipelined block.
+func (sm *SyncManager) markDispatched(height uint32) {
+	sm.dispatchedMu.Lock()
+	defer sm.dispatchedMu.Unlock()
+
+	if sm.dispatched == nil {
+		sm.dispatched = make(map[uint32]struct{})
+	}
+
+	sm.dispatched[height] = struct{}{}
+}
+
+// markFinalized clears a height once it has been finalized, so it no longer
+// counts as in-flight. Called by the finalizer after each block.
+func (sm *SyncManager) markFinalized(height uint32) {
+	sm.dispatchedMu.Lock()
+	defer sm.dispatchedMu.Unlock()
+
+	delete(sm.dispatched, height)
+}
+
+// isDispatched reports whether a height's PhaseA has been dispatched and not yet
+// finalized (i.e. it is in-flight, not missing).
+func (sm *SyncManager) isDispatched(height uint32) bool {
+	sm.dispatchedMu.Lock()
+	defer sm.dispatchedMu.Unlock()
+
+	_, ok := sm.dispatched[height]
+
+	return ok
+}
+
+// pruneDispatchedBelow drops finalized/stale heights below the finalize floor so
+// the in-flight set stays bounded even if a re-requested block is dispatched
+// after the finalizer already passed its height.
+func (sm *SyncManager) pruneDispatchedBelow(floor uint32) {
+	sm.dispatchedMu.Lock()
+	defer sm.dispatchedMu.Unlock()
+
+	for h := range sm.dispatched {
+		if h < floor {
+			delete(sm.dispatched, h)
+		}
+	}
+}
+
+// gapShouldResync decides whether a stalled finalizer should re-request a gap.
+// It re-requests only when the stall detector has fired AND the awaited height
+// was never dispatched (a genuinely missing/lost body). A height that is
+// dispatched-but-not-yet-finalized is in-flight — the finalizer is simply behind,
+// not blocked on a missing block — so it must NOT be re-requested (that was the
+// false-positive that thrashed the fetcher on betfair).
+func (sm *SyncManager) gapShouldResync(detectorFired bool, waiting uint32) bool {
+	return detectorFired && !sm.isDispatched(waiting)
+}
+
 // maybeResyncFinalizeGap re-requests the gap from the tip via the sync peer when
 // the finalizer is stalled behind a missing block height. Rate-limited through
 // the same slot as the consumer-side missing-parent self-heal so the two triggers

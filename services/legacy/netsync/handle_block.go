@@ -115,6 +115,13 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		}
 	}
 
+	// Mark this height in-flight before its PhaseA begins (inline or on a worker),
+	// so the finalizer's gap watchdog can tell it apart from a genuinely missing
+	// block while it waits to finalize it.
+	if pipelined {
+		sm.markDispatched(blockHeight)
+	}
+
 	// Concurrent ahead-creation (the throughput lever, legacy_blockPipelineConcurrency
 	// > 1): run this block's PhaseA tx-work on a bounded worker pool and finalize via
 	// the height-ordered reorder buffer. The consumer establishes the authoritative
@@ -457,10 +464,19 @@ func (sm *SyncManager) finalizeLoop() {
 				if err := sm.finalizeBlock(ready); err != nil {
 					sm.setFinalizeError(err)
 				}
+
+				sm.markFinalized(ready.blockHeight)
 			}
 		case <-ticker.C:
 			waiting, started := buf.waitingFor()
-			if detector.observe(waiting, started, buf.len(), time.Now()) {
+
+			// Keep the in-flight set bounded; everything below the awaited height
+			// is finalized or stale.
+			sm.pruneDispatchedBelow(waiting)
+
+			// Re-request only a genuinely missing block, not one that is simply
+			// queued behind slow finalization (the in-flight false-positive).
+			if sm.gapShouldResync(detector.observe(waiting, started, buf.len(), time.Now()), waiting) {
 				sm.maybeResyncFinalizeGap(waiting)
 			}
 		}
