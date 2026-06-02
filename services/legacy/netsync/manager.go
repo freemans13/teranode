@@ -403,6 +403,18 @@ type SyncManager struct {
 	finalizeErrMu sync.Mutex
 	finalizeErrV  error
 
+	// finalizeStartHeight is the first height the finalizer's reorder buffer will
+	// finalize. Set once (inside finalizeOnce) from the first pipelined block's
+	// height, which the in-order blockQueue consumer dispatches contiguous with the
+	// committed chain tip. Read only by the finalizer goroutine at startup.
+	finalizeStartHeight uint32
+
+	// pipelineSem bounds how many blocks' PhaseA tx-work run concurrently when
+	// legacy_blockPipelineConcurrency > 1 (the throughput lever). Buffered to the
+	// concurrency; a token is acquired by the consumer before spawning a PhaseA
+	// worker and released by the worker once its job is handed to the finalizer.
+	pipelineSem chan struct{}
+
 	// lastMissingParentResyncNano rate-limits gap re-requests during legacy
 	// catch-up (legacy_resyncOnMissingParent): when a block's parent is missing
 	// because the next-needed body was lost, re-request the gap from the tip
