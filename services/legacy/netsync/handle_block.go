@@ -336,6 +336,12 @@ func (sm *SyncManager) finalizeBlock(job *finalizeJob) error {
 		return err
 	}
 
+	// ProcessBlock has completed the (synchronous) block-validation round-trip,
+	// so the parsed subtrees this block put in the cache during PhaseA have now
+	// been read back. Release them to keep the cache bounded to the in-flight
+	// window.
+	sm.evictCachedSubtrees(job.teranodeBlock)
+
 	// process any orphan transactions that are now valid in background
 	// this will also remove the transactions from the orphan pool.
 	go func() {
@@ -825,8 +831,75 @@ func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, block *bsvutil
 // When quickValidationMode flips to false mid-session (e.g. FSM transitions
 // out of catch-up and back to RUNNING), drain and retire the batcher so
 // subsequent blocks take the synchronous path with no lost items.
+// parsedSubtreePutter is the optional capability a subtree store exposes when
+// it carries an in-process parsed-subtree cache (see stores/blob/subtreecache).
+// Implemented structurally so netsync need not import the cache package.
+type parsedSubtreePutter interface {
+	PutParsedSubtree(hash chainhash.Hash, subtree *subtreepkg.Subtree, meta *subtreepkg.Meta)
+}
+
+// parsedSubtreeEvicter is the optional capability used to release a block's
+// cached subtrees once finalization has consumed them.
+type parsedSubtreeEvicter interface {
+	EvictCachedSubtree(hash chainhash.Hash)
+}
+
+// cacheParsedSubtree stashes a freshly built subtree + meta into the subtree
+// store's in-process parsed cache, keyed by the subtree root hash that block
+// finalization will read by. This lets the in-process block-validation re-read
+// (GetAndValidateSubtrees / getSubtreeMetaSlice / computeAndSetCoinbaseBUMP) be
+// served from memory instead of a disk round-trip + re-deserialize. No-op when
+// the store has no cache (decorator absent / cache disabled), so the disk path
+// is unchanged.
+func (sm *SyncManager) cacheParsedSubtree(subtree *subtreepkg.Subtree, meta *subtreepkg.Meta) {
+	if subtree == nil {
+		return
+	}
+
+	if pc, ok := sm.subtreeStore.(parsedSubtreePutter); ok {
+		pc.PutParsedSubtree(*subtree.RootHash(), subtree, meta)
+	}
+}
+
+// evictCachedSubtrees releases a finalized block's subtrees from the store's
+// in-process parsed cache, bounding the cache to the in-flight pipeline window.
+// Called after finalization has read them back. No-op when the store has no
+// cache.
+//
+// Eviction-timing safety: the legacy ProcessBlock path forces
+// DisableOptimisticMining (baseURL defaults to "legacy" → ValidateBlockWithOptions
+// runs the non-optimistic branch), so block.Valid — the cache reader — runs
+// INLINE and completes before sm.ProcessBlock returns. Eviction here is therefore
+// strictly after every consensus read of these subtrees. Even if that ordering
+// ever changed, a post-eviction read simply falls back to the durable disk file,
+// so eviction is a memory-bound, never a correctness, concern.
+func (sm *SyncManager) evictCachedSubtrees(block *model.Block) {
+	if block == nil {
+		return
+	}
+
+	pc, ok := sm.subtreeStore.(parsedSubtreeEvicter)
+	if !ok {
+		return
+	}
+
+	for _, h := range block.Subtrees {
+		if h != nil {
+			pc.EvictCachedSubtree(*h)
+		}
+	}
+}
+
 func (sm *SyncManager) writeSubtree(ctx context.Context, block *bsvutil.Block, subtree *subtreepkg.Subtree,
 	subtreeData *subtreepkg.Data, subtreeMetaData *subtreepkg.Meta, quickValidationMode bool) error {
+	// On the quick-validation (below-checkpoint) path, retain the parsed subtree
+	// + meta in the store's in-process cache so finalization can read them back
+	// without going to disk. Done before the write so both the direct and the
+	// (opt-in) batched write paths are covered.
+	if quickValidationMode {
+		sm.cacheParsedSubtree(subtree, subtreeMetaData)
+	}
+
 	if !quickValidationMode && sm.subtreeWriteBatcher != nil {
 		err := sm.subtreeWriteBatcher.Stop(ctx)
 		sm.subtreeWriteBatcher = nil

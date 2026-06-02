@@ -601,6 +601,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			OutpointBatcherSize:              getInt("legacy_outpointBatcherSize", 1024, alternativeContext...),
 			OutpointBatcherConcurrency:       getInt("legacy_outpointBatcherConcurrency", 32, alternativeContext...),
 			ParentSatoshiCacheMB:             getInt("legacy_parentSatoshiCacheMB", 0, alternativeContext...),
+			SubtreeCacheMB:                   getInt("legacy_subtreeCacheMB", 0, alternativeContext...),
 			BlockFinalizationPipeline:        getBool("legacy_blockFinalizationPipeline", false, alternativeContext...),
 			BlockPipelineConcurrency:         getInt("legacy_blockPipelineConcurrency", 1, alternativeContext...),
 			ResyncOnMissingParent:            getBool("legacy_resyncOnMissingParent", true, alternativeContext...),
