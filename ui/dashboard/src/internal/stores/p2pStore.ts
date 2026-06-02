@@ -3,7 +3,7 @@ import type { Writable } from 'svelte/store'
 //import * as api from '$internal/api'
 
 export const messages: Writable<any[]> = writable([])
-export const miningNodes: any = writable({})
+export const miningNodes: Writable<Record<string, any>> = writable({})
 export const wsUrl: Writable<URL | string> = writable('')
 export const error: Writable<any> = writable(null)
 export const sock: Writable<any> = writable(null)
@@ -202,7 +202,9 @@ export async function connectToP2PServer() {
                   // Keep cache size manageable
                   if (map.size > MAX_BLOCK_HASH_CACHE) {
                     const firstKey = map.keys().next().value
-                    map.delete(firstKey)
+                    if (firstKey !== undefined) {
+                      map.delete(firstKey)
+                    }
                   }
                   return map
                 })
@@ -249,7 +251,9 @@ export async function connectToP2PServer() {
                   // Keep cache size manageable
                   if (map.size > MAX_BLOCK_HASH_CACHE) {
                     const firstKey = map.keys().next().value
-                    map.delete(firstKey)
+                    if (firstKey !== undefined) {
+                      map.delete(firstKey)
+                    }
                   }
                   return map
                 })
