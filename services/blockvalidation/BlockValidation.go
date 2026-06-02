@@ -2101,15 +2101,11 @@ func (u *BlockValidation) liftFinalSubtreeRootForBUMP(ctx context.Context, block
 func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
 	block *model.Block,
 ) (iterationError error) {
-	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "BlockValidation:checkOldBlockIDs",
-		tracing.WithDebugLogMessage(u.logger, "[checkOldBlockIDs][%s] checking %d old block IDs", oldBlockIDsMap.Length(), block.Hash().String()),
-	)
-
-	defer deferFn()
-
 	// Both routes below dereference block.Header and (transitively, via
-	// block.Hash() inside logging) require a usable header — guard once
-	// up-front so each route can assume a valid block.
+	// block.Hash() inside logging/tracing) require a usable header — guard
+	// once up-front, before any tracing or logging touches the block, so
+	// each route can assume a valid block and we never panic dereferencing
+	// a nil header.
 	//
 	// The prefetch route additionally needs HashPrevBlock as the anchor
 	// for GetBlockHeaderIDs. The two call sites of checkOldBlockIDs
@@ -2118,9 +2114,19 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 	// path: block IS in the chain. HashPrevBlock works in both cases. An
 	// earlier version used block.Hash(), which returned empty in the
 	// normal path and defeated the fast-path map.
+	//
+	// Avoid block.String() / block.Hash() in this guard: both dereference
+	// block.Header, so calling them here would panic on the very nil
+	// header we are reporting.
 	if block.Header == nil || block.Header.HashPrevBlock == nil {
-		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] block header or HashPrevBlock is nil", block.String())
+		return errors.NewServiceError("[Block Validation][checkOldBlockIDs] block header or HashPrevBlock is nil")
 	}
+
+	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "BlockValidation:checkOldBlockIDs",
+		tracing.WithDebugLogMessage(u.logger, "[checkOldBlockIDs][%s] checking %d old block IDs", block.Hash().String(), oldBlockIDsMap.Length()),
+	)
+
+	defer deferFn()
 
 	// Two strategies, identical result. For every tx in the block we
 	// need to answer "is at least one of this tx's parent block IDs on
