@@ -280,10 +280,7 @@ func buildAndStoreSubtrees(b *testing.B, store *blob_memory.Memory, txHashes []c
 		subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
 		parentHash := chainhash.HashH([]byte("bench-parent"))
 		for j := range subtree.Nodes {
-			_ = subtreeMeta.SetTxInpoints(j, subtreepkg.TxInpoints{
-				ParentTxHashes: []chainhash.Hash{parentHash},
-				Idxs:           [][]uint32{{0}},
-			})
+			_ = subtreeMeta.SetTxInpoints(j, subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{parentHash}, []uint32{0}))
 		}
 		metaBytes, err := subtreeMeta.Serialize()
 		require.NoError(b, err)
@@ -1012,10 +1009,7 @@ func buildAndStoreSubtreesT(t *testing.T, store *blob_memory.Memory, txHashes []
 		subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
 		parentHash := chainhash.HashH([]byte("bench-parent"))
 		for j := range subtree.Nodes {
-			_ = subtreeMeta.SetTxInpoints(j, subtreepkg.TxInpoints{
-				ParentTxHashes: []chainhash.Hash{parentHash},
-				Idxs:           [][]uint32{{0}},
-			})
+			_ = subtreeMeta.SetTxInpoints(j, subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{parentHash}, []uint32{0}))
 		}
 		metaBytes, err := subtreeMeta.Serialize()
 		require.NoError(t, err)
