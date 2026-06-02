@@ -512,9 +512,13 @@ func (s *Store) Close(ctx context.Context) error {
 
 	select {
 	case <-done:
-		// Drains complete; close the Aerospike client.
+		// Drains complete; close the Aerospike client. The client is shared
+		// per host via util's connection cache, so close-and-evict it rather
+		// than closing in place — otherwise the cache would keep a closed
+		// client and a later store for the same host (e.g. an in-process
+		// daemon restart) would reuse it and fail with INVALID_NODE_ERROR.
 		if s.client != nil {
-			s.client.Close()
+			util.CloseAerospikeClient(s.url.Host)
 		}
 		return nil
 	case <-ctx.Done():
