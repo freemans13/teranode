@@ -459,11 +459,21 @@ func aerospikePolicySummary(p *aerospike.ClientPolicy) string {
 }
 
 func initStats(logger ulogger.Logger, client *uaerospike.Client, tSettings *settings.Settings) {
+	if client == nil {
+		return
+	}
+
 	var nonAlphanumericRegex = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
 	aerospikeStatsRefreshInterval := tSettings.Aerospike.StatsRefreshDuration
 
-	client.EnableMetrics(nil)
+	// Aerospike client metrics are intentionally NOT enabled: the fork's
+	// per-record stats path (nodeStats.updateOrInsert) is quadratic per batch
+	// — every batch command pays ~N^2 counter increments. Worst observed during
+	// mainnet IBD (44-60% of legacy CPU) where batches are largest, but it is a
+	// general per-batch cost. Re-enable once the fork fix lands.
+	// See https://github.com/bsv-blockchain/teranode/issues/1001
+	// client.EnableMetrics(nil)
 
 	aerospikeLatencyBuckets := func() []float64 {
 		buckets := make([]float64, 24)

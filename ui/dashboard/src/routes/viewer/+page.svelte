@@ -1,3 +1,5 @@
+<svelte:options runes={true} />
+
 <script lang="ts">
   import BlocksTableCard from '$internal/components/page/viewer/blocks/blocks-table-card/index.svelte'
 
