@@ -28,6 +28,7 @@ const (
 	FileTypeBatchData      FileType = "batch-data"
 	FileTypeBatchKeys      FileType = "batch-keys"
 	FileTypePreserveUntil  FileType = "preserveUntil"
+	FileTypePeerRegistry   FileType = "peer-registry"
 	FileTypeUnknown        FileType = ""
 )
 
@@ -60,6 +61,7 @@ var (
 	magicBatchData      = [8]byte{'B', 'D', '-', '1', '.', '0', ' ', ' '} // BD-1.0
 	magicBatchKeys      = [8]byte{'B', 'K', '-', '1', '.', '0', ' ', ' '} // BK-1.0
 	magicPreserveUntil  = [8]byte{'P', 'U', '-', '1', '.', '0', ' ', ' '} // PU-1.0
+	magicPeerRegistry   = [8]byte{'P', 'R', '-', '1', '.', '0', ' ', ' '} // PR-1.0
 )
 
 var fileTypeToMagic = map[FileType][8]byte{
@@ -81,6 +83,7 @@ var fileTypeToMagic = map[FileType][8]byte{
 	FileTypeBatchData:      magicBatchData,
 	FileTypeBatchKeys:      magicBatchKeys,
 	FileTypePreserveUntil:  magicPreserveUntil,
+	FileTypePeerRegistry:   magicPeerRegistry,
 }
 
 var magicToFileType = map[[8]byte]FileType{
@@ -103,6 +106,7 @@ var magicToFileType = map[[8]byte]FileType{
 	magicBatchData:      FileTypeBatchData,
 	magicBatchKeys:      FileTypeBatchKeys,
 	magicPreserveUntil:  FileTypePreserveUntil,
+	magicPeerRegistry:   FileTypePeerRegistry,
 }
 
 type Header struct {
