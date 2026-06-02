@@ -2317,10 +2317,13 @@ func Test_checkOldBlockIDs(t *testing.T) {
 	})
 }
 
-// Test_checkOldBlockIDs_noPrefetchRoute exercises the no-prefetch route taken
-// when blockchain_use_in_memory_chain_check is true. Mirrors the subtests of
-// Test_checkOldBlockIDs above so the two routes are kept behaviourally
-// equivalent (same pass/fail outcomes per input).
+// Test_checkOldBlockIDs_noPrefetchRoute exercises the off-chain-prefetch route's
+// rebuilding-fallback sub-path: when OffChainBlockIDs reports rebuilding the
+// route resolves each tx with the per-tx CheckBlockIsInCurrentChain RPC, exactly
+// as the prefetch route does on a fast-path miss. Mirrors the subtests of
+// Test_checkOldBlockIDs above so the two routes stay behaviourally equivalent
+// (same pass/fail outcomes per input). The off-chain-prefetch happy path (set
+// available, resolved locally) is covered by Test_checkOldBlockIDs_offChainPrefetch.
 func Test_checkOldBlockIDs_noPrefetchRoute(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -2331,9 +2334,12 @@ func Test_checkOldBlockIDs_noPrefetchRoute(t *testing.T) {
 	}
 
 	// newBlockValidation returns a BlockValidation with settings configured to
-	// dispatch to the no-prefetch route. GetBlockHeaderIDs should never be
-	// called in any of these tests — if it is, that is a bug in the dispatch.
+	// dispatch to the off-chain-prefetch route, with OffChainBlockIDs reporting
+	// rebuilding so the route takes the per-tx CheckBlockIsInCurrentChain
+	// fallback. GetBlockHeaderIDs should never be called in any of these tests —
+	// if it is, that is a bug in the dispatch.
 	newBlockValidation := func(blockchainMock *blockchain.Mock) *BlockValidation {
+		blockchainMock.On("OffChainBlockIDs", mock.Anything).Return([]uint32(nil), true, nil)
 		s := &settings.Settings{}
 		s.BlockChain.UseInMemoryChainCheck = true
 		return &BlockValidation{
@@ -2458,6 +2464,137 @@ func Test_checkOldBlockIDs_noPrefetchRoute(t *testing.T) {
 		require.NotContains(t, err.Error(), "are not from current chain")
 	})
 
+}
+
+// Test_checkOldBlockIDs_offChainPrefetch exercises the off-chain-prefetch happy
+// path: OffChainBlockIDs returns the complete forked set once and membership is
+// resolved locally (a parent is on the main chain iff it is NOT in the set), so
+// no per-tx CheckBlockIsInCurrentChain RPC is needed unless a tx's parents are
+// all off-chain.
+func Test_checkOldBlockIDs_offChainPrefetch(t *testing.T) {
+	initPrometheusMetrics()
+
+	testBlock := func() *model.Block {
+		prevHash := chainhash.HashH([]byte("prev"))
+		merkleRoot := chainhash.HashH([]byte("merkle"))
+		return &model.Block{Header: &model.BlockHeader{HashPrevBlock: &prevHash, HashMerkleRoot: &merkleRoot}}
+	}
+
+	newBlockValidation := func(blockchainMock *blockchain.Mock) *BlockValidation {
+		s := &settings.Settings{}
+		s.BlockChain.UseInMemoryChainCheck = true
+		return &BlockValidation{
+			blockchainClient: blockchainMock,
+			settings:         s,
+		}
+	}
+
+	t.Run("all parents on chain resolved locally (no RPC)", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		// Off-chain set holds a forked ID that none of the txs (0..99) reference.
+		blockchainMock.On("OffChainBlockIDs", mock.Anything).Return([]uint32{1000}, false, nil).Once()
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		for i := uint32(0); i < 100; i++ {
+			txHash := chainhash.HashH([]byte(fmt.Sprintf("txHash_%d", i)))
+			oldBlockIDsMap.Set(txHash, []uint32{i})
+		}
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.NoError(t, err)
+
+		// Everything resolved from the prefetched set — no per-tx RPC, no on-chain prefetch.
+		blockchainMock.AssertNotCalled(t, "CheckBlockIsInCurrentChain", mock.Anything, mock.Anything)
+		blockchainMock.AssertNotCalled(t, "GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything)
+		blockchainMock.AssertExpectations(t)
+	})
+
+	t.Run("mixed parent set with one on-chain ID is accepted locally", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		// 5 is off-chain, 7 is not — ANY-of ⇒ on chain.
+		blockchainMock.On("OffChainBlockIDs", mock.Anything).Return([]uint32{5}, false, nil).Once()
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		oldBlockIDsMap.Set(chainhash.HashH([]byte("tx")), []uint32{5, 7})
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.NoError(t, err)
+
+		blockchainMock.AssertNotCalled(t, "CheckBlockIsInCurrentChain", mock.Anything, mock.Anything)
+		blockchainMock.AssertExpectations(t)
+	})
+
+	t.Run("parents exclusively off-chain are confirmed via RPC then rejected", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		// The only parent (1) is in the off-chain set ⇒ fast-path miss; the
+		// lookup RPC re-confirms before the block is rejected.
+		blockchainMock.On("OffChainBlockIDs", mock.Anything).Return([]uint32{1}, false, nil).Once()
+		blockchainMock.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{1}).Return(false, nil).Once()
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		oldBlockIDsMap.Set(chainhash.HashH([]byte("tx")), []uint32{1})
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "are not from current chain")
+		blockchainMock.AssertExpectations(t)
+	})
+
+	t.Run("OffChainBlockIDs error surfaces as ServiceError", func(t *testing.T) {
+		blockchainMock := &blockchain.Mock{}
+		blockValidation := newBlockValidation(blockchainMock)
+
+		blockchainMock.On("OffChainBlockIDs", mock.Anything).
+			Return([]uint32(nil), false, errors.NewServiceError("blockchain unavailable")).Once()
+
+		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		oldBlockIDsMap.Set(chainhash.HashH([]byte("tx")), []uint32{1})
+
+		err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, testBlock())
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to get off-chain block IDs")
+		require.NotContains(t, err.Error(), "are not from current chain")
+	})
+}
+
+// Test_checkOldBlockIDs_nilHeader guards the round-1 fix: a nil block header (or
+// nil HashPrevBlock) must return a clean error rather than panicking when the
+// guard, tracing, or logging dereferences the header. Regression test for the
+// panic Copilot flagged.
+func Test_checkOldBlockIDs_nilHeader(t *testing.T) {
+	initPrometheusMetrics()
+
+	blockValidation := &BlockValidation{
+		blockchainClient: &blockchain.Mock{},
+		settings:         &settings.Settings{},
+	}
+
+	oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+	oldBlockIDsMap.Set(chainhash.HashH([]byte("tx")), []uint32{1})
+
+	t.Run("nil header", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, &model.Block{Header: nil})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "header or HashPrevBlock is nil")
+		})
+	})
+
+	t.Run("nil HashPrevBlock", func(t *testing.T) {
+		merkleRoot := chainhash.HashH([]byte("merkle"))
+		block := &model.Block{Header: &model.BlockHeader{HashPrevBlock: nil, HashMerkleRoot: &merkleRoot}}
+		require.NotPanics(t, func() {
+			err := blockValidation.checkOldBlockIDs(t.Context(), oldBlockIDsMap, block)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "header or HashPrevBlock is nil")
+		})
+	})
 }
 
 func TestBlockValidation_ParentAndChildInSameBlock(t *testing.T) {

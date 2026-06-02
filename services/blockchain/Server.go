@@ -1589,6 +1589,25 @@ func (b *Blockchain) CheckBlockIsInCurrentChain(ctx context.Context, req *blockc
 	}, nil
 }
 
+// GetOffChainBlockIDs returns the in-memory off-chain (forked) block ID set so callers
+// can prefetch the negative set once and resolve main-chain membership locally.
+func (b *Blockchain) GetOffChainBlockIDs(ctx context.Context, _ *emptypb.Empty) (*blockchain_api.GetOffChainBlockIDsResponse, error) {
+	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetOffChainBlockIDs",
+		tracing.WithParentStat(b.stats),
+	)
+	defer deferFn()
+
+	ids, rebuilding, err := b.store.OffChainBlockIDs(ctx)
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	return &blockchain_api.GetOffChainBlockIDsResponse{
+		OffChainBlockIds: ids,
+		Rebuilding:       rebuilding,
+	}, nil
+}
+
 // CheckBlockIsAncestorOfBlock verifies if any of the given block IDs are ancestors of a specific block.
 // This is used for double-spend detection on fork blocks where we check against the fork's ancestor chain.
 func (b *Blockchain) CheckBlockIsAncestorOfBlock(ctx context.Context, req *blockchain_api.CheckBlockIsAncestorOfBlockRequest) (*blockchain_api.CheckBlockIsAncestorOfBlockResponse, error) {
