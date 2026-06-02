@@ -2256,6 +2256,13 @@ func (u *BlockValidation) checkOldBlockIDsWithoutPrefetch(ctx context.Context,
 // misses that weren't short-circuited by fastPath); it is reported in
 // each route's log under the route-appropriate name (the prefetch route
 // historically calls it "slowPath").
+//
+// oldBlockIDsCacheHintCap bounds the up-front size hint for the dedupe
+// cache so a block with a very high tx count cannot force a large map
+// allocation. It matches the prefetch route's historical implicit cap
+// (len(currentChainBlockIDs) <= 10_000).
+const oldBlockIDsCacheHintCap = 10_000
+
 func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 	ctx context.Context,
 	oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
@@ -2263,7 +2270,20 @@ func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
 	fastPath func(blockIDs []uint32) bool,
 	lookup func(ctx context.Context, blockIDs []uint32) (bool, error),
 ) (iterationError error, fastPathCount, lookupCount, cacheHitCount int) {
-	cache := make(map[string]bool, oldBlockIDsMap.Length())
+	// The dedupe cache is keyed by the sorted parent-block-ID slice, so it
+	// only ever holds as many entries as there are *distinct* parent-block
+	// sets referenced by the block's txs — typically a handful, bounded by
+	// the number of recent blocks, not by the tx count. Sizing the hint to
+	// oldBlockIDsMap.Length() (which scales with tx count, up to millions on
+	// large blocks) would reserve a large map up-front for almost no
+	// occupancy. Cap the hint to keep per-block heap pressure bounded; the
+	// map still grows if more distinct sets actually appear.
+	cacheHint := oldBlockIDsMap.Length()
+	if cacheHint > oldBlockIDsCacheHintCap {
+		cacheHint = oldBlockIDsCacheHintCap
+	}
+
+	cache := make(map[string]bool, cacheHint)
 	var builder strings.Builder
 
 	oldBlockIDsMap.Iterate(func(txID chainhash.Hash, blockIDs []uint32) bool {
