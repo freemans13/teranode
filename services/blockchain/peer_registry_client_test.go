@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
@@ -160,4 +161,45 @@ func TestPeerRegistryClient_Close_Idempotent(t *testing.T) {
 	// Second close — grpc.ClientConn.Close() is documented as returning an error
 	// on double-close but should not panic.
 	_ = client.Close()
+}
+
+// TestPeerRegistryClient_SetLoggerNoRace exercises concurrent SetLogger and
+// log() on the gRPC-backed client. atomic.Value is the contract; the test is
+// a guardrail against accidentally reverting to a plain field.
+func TestPeerRegistryClient_SetLoggerNoRace(t *testing.T) {
+	addr, stop := startFakePeerRegistryServer(t)
+	defer stop()
+	conn := dialConn(t, addr)
+	clientI := NewPeerRegistryClientFromConn(conn)
+	client := clientI.(*PeerRegistryClient)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			_ = client.log()
+		}
+	}()
+
+	for i := 0; i < 1000; i++ {
+		client.SetLogger(ulogger.TestLogger{})
+	}
+	<-done
+
+	require.NotNil(t, client.log())
+}
+
+// TestPeerRegistryClient_SetLoggerNilIsNoop confirms passing nil is harmless.
+func TestPeerRegistryClient_SetLoggerNilIsNoop(t *testing.T) {
+	addr, stop := startFakePeerRegistryServer(t)
+	defer stop()
+	conn := dialConn(t, addr)
+	clientI := NewPeerRegistryClientFromConn(conn)
+	client := clientI.(*PeerRegistryClient)
+
+	require.NotNil(t, client.log())
+	client.SetLogger(ulogger.TestLogger{})
+	first := client.log()
+	client.SetLogger(nil)
+	require.Equal(t, first, client.log())
 }

@@ -3,11 +3,12 @@ package blockchain
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -19,7 +20,7 @@ func (b *Blockchain) RegisterPeer(_ context.Context, req *blockchain_api.Registe
 	if req.Peer == nil {
 		return nil, status.Error(codes.InvalidArgument, "peer info is required")
 	}
-	info := protoToPeerInfo(req.Peer)
+	info := protoToPeerInfo(b.logger, req.Peer)
 	b.peerRegistry.Register(info)
 	return &emptypb.Empty{}, nil
 }
@@ -211,7 +212,16 @@ func peerInfoToProto(info *PeerInfo) *blockchain_api.PeerRegistryInfo {
 // "explicitly set" by virtue of crossing the registry boundary at all. This
 // matches the semantics callers want — a peer registered via gRPC keeps its
 // transport type sticky across subsequent updates that omit the field.
-func protoToPeerInfo(p *blockchain_api.PeerRegistryInfo) *PeerInfo {
+//
+// An invalid (non-empty but unparseable) BlockHash is logged via the supplied
+// logger and the resulting PeerInfo carries a nil BlockHash; this is
+// non-fatal because the rest of the entry is salvageable. A nil logger is
+// tolerated (rare; only some tests).
+func protoToPeerInfo(logger ulogger.Logger, p *blockchain_api.PeerRegistryInfo) *PeerInfo {
+	hash, err := bytesToBlockHash(p.BlockHash)
+	if err != nil && logger != nil {
+		logger.Errorf("peer registry: dropping invalid BlockHash for peer %s: %v", p.PeerId, err)
+	}
 	return &PeerInfo{
 		ID:                     p.PeerId,
 		TransportType:          p.TransportType,
@@ -237,7 +247,7 @@ func protoToPeerInfo(p *blockchain_api.PeerRegistryInfo) *PeerInfo {
 		LastInteractionSuccess: protoTimeToTime(p.LastInteractionSuccess),
 		LastInteractionFailure: protoTimeToTime(p.LastInteractionFailure),
 		LastSeen:               protoTimeToTime(p.LastSeen),
-		BlockHash:              bytesToBlockHash(p.BlockHash),
+		BlockHash:              hash,
 		IsConnected:            p.IsConnected,
 		LastBlockTime:          protoTimeToTime(p.LastBlockTime),
 		BlocksReceived:         p.BlocksReceived,
@@ -270,19 +280,19 @@ func blockHashToBytes(h *chainhash.Hash) []byte {
 	return append([]byte(nil), h[:]...)
 }
 
-// bytesToBlockHash converts a byte slice to *chainhash.Hash. Returns nil for an
-// empty slice (intentional, e.g. peers that have not advertised a tip yet) and
-// nil with a stderr warning for a non-empty but invalid slice — that path
-// usually means a corrupted persisted registry, which the operator should know
-// about even though the rest of the entry is salvageable.
-func bytesToBlockHash(b []byte) *chainhash.Hash {
+// bytesToBlockHash converts a byte slice to *chainhash.Hash. An empty slice
+// returns (nil, nil) — peers that have not advertised a tip yet legitimately
+// arrive with no hash. A non-empty but invalid slice returns
+// (nil, ProcessingError); the caller is expected to log via its structured
+// logger and continue (the bad hash is recoverable; the rest of the PeerInfo
+// is salvageable).
+func bytesToBlockHash(b []byte) (*chainhash.Hash, error) {
 	if len(b) == 0 {
-		return nil
+		return nil, nil
 	}
 	h, err := chainhash.NewHash(b)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "peer registry: invalid block hash bytes (len=%d): %v\n", len(b), err)
-		return nil
+		return nil, errors.NewProcessingError(fmt.Sprintf("invalid block hash bytes (len=%d)", len(b)), err)
 	}
-	return h
+	return h, nil
 }

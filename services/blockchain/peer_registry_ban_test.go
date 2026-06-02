@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -584,4 +585,44 @@ func TestBanDecay_NoDriftAcrossManyCalls(t *testing.T) {
 	// Tolerate ±1 step worth of wall-clock jitter.
 	require.InDelta(t, float64(expectedScore), float64(entry.Score), 2.0,
 		"observed score %d; expected ~%d after %v elapsed", entry.Score, expectedScore, elapsed)
+}
+
+// ---------------------------------------------------------------------------
+// SetLogger / log() concurrent access
+// ---------------------------------------------------------------------------
+
+// TestRegistry_SetLoggerNoRace exercises SetLogger and log() from concurrent
+// goroutines under -race. atomic.Value Store/Load is the contract guarding
+// the field; this is a guardrail against accidentally reverting to a plain
+// field + r.mu mismatch.
+func TestRegistry_SetLoggerNoRace(t *testing.T) {
+	r := NewCentralizedPeerRegistry(DefaultBanConfig())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			_ = r.log()
+		}
+	}()
+
+	for i := 0; i < 1000; i++ {
+		r.SetLogger(ulogger.TestLogger{})
+	}
+	<-done
+
+	require.NotNil(t, r.log())
+}
+
+// TestRegistry_SetLoggerNilIsNoop confirms that passing nil to SetLogger does
+// not clobber a previously-installed logger, and that log() still returns
+// the default fallback when no logger was ever set.
+func TestRegistry_SetLoggerNilIsNoop(t *testing.T) {
+	r := NewCentralizedPeerRegistry(DefaultBanConfig())
+	require.NotNil(t, r.log(), "default fallback when never set")
+
+	r.SetLogger(ulogger.TestLogger{})
+	first := r.log()
+	r.SetLogger(nil)
+	require.Equal(t, first, r.log(), "nil SetLogger must be a no-op")
 }

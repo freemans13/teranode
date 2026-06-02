@@ -478,7 +478,9 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 				b.logger.Infof("[Blockchain] loaded %d peers from %s", b.peerRegistry.Count(), storeURL.Redacted())
 			}
 			if interval := b.settings.BlockChain.PeerRegistrySaveInterval; interval > 0 {
-				go b.savePeerRegistryPeriodically(ctx, interval)
+				// Tracked on the registry's WaitGroup so Close() drains it on Stop()
+				// alongside ban-decay and TTL cleanup.
+				b.peerRegistry.StartPeriodicSave(ctx, interval, store)
 			} else {
 				b.logger.Warnf("[Blockchain] PeerRegistrySaveInterval not configured, periodic saves disabled")
 			}
@@ -967,24 +969,6 @@ func (b *Blockchain) Stop(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// savePeerRegistryPeriodically saves the peer registry to the configured blob
-// store at the configured interval until ctx is cancelled.
-func (b *Blockchain) savePeerRegistryPeriodically(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := b.peerRegistry.Save(ctx, b.peerRegistryStore); err != nil {
-				b.logger.Warnf("[Blockchain] failed to save peer registry: %v", err)
-			}
-		}
-	}
 }
 
 // AddBlock processes a request to add a new block to the blockchain.
@@ -1602,6 +1586,25 @@ func (b *Blockchain) CheckBlockIsInCurrentChain(ctx context.Context, req *blockc
 
 	return &blockchain_api.CheckBlockIsCurrentChainResponse{
 		IsPartOfCurrentChain: result,
+	}, nil
+}
+
+// GetOffChainBlockIDs returns the in-memory off-chain (forked) block ID set so callers
+// can prefetch the negative set once and resolve main-chain membership locally.
+func (b *Blockchain) GetOffChainBlockIDs(ctx context.Context, _ *emptypb.Empty) (*blockchain_api.GetOffChainBlockIDsResponse, error) {
+	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetOffChainBlockIDs",
+		tracing.WithParentStat(b.stats),
+	)
+	defer deferFn()
+
+	ids, rebuilding, err := b.store.OffChainBlockIDs(ctx)
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	return &blockchain_api.GetOffChainBlockIDsResponse{
+		OffChainBlockIds: ids,
+		Rebuilding:       rebuilding,
 	}, nil
 }
 

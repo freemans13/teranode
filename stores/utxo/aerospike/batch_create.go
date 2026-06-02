@@ -81,6 +81,7 @@ func (s *Store) BatchCreate(ctx context.Context, txs []*bt.Tx, blockHeight uint3
 			tx.IsCoinbase(),
 			false, // conflicting — batch-create always non-conflicting
 			lockedTrue,
+			nil, // arena — batch path uses the non-arena allocation route
 		)
 		if binsErr != nil {
 			results[i].Err = errors.NewProcessingError("[BatchCreate] failed to build bins for tx %s", txHash, binsErr)
