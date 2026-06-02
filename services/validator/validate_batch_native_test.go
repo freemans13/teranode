@@ -112,6 +112,12 @@ func newNativeValidator(t testing.TB) (*Validator, *stubBatchStore) {
 	v := newValidatorForTest(t)
 	stub := &stubBatchStore{}
 	v.setBatchStoreForTest(stub)
+	// Present a ready block state (non-zero MedianTime) so the per-tx finality
+	// check in ValidateBatch passes and these tests exercise the pipeline
+	// phases rather than tripping the "utxo store not ready" readiness gate.
+	// Height 0 keeps the default blockHeight at 1 (Height+1), matching the
+	// prior sqlitememory-backed behaviour.
+	v.setBlockStateForTest(utxo.BlockState{Height: 0, MedianTime: 1700000000})
 	v.settings.Validator.UseBatchValidation = true
 	return v, stub
 }

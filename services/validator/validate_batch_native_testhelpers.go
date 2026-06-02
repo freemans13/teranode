@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
@@ -13,6 +14,13 @@ import (
 // This is a test seam — production code never calls this method.
 func (v *Validator) setBatchStoreForTest(s batchUtxoStore) {
 	v.batchStoreOverride = s
+}
+
+// setBlockStateForTest overrides the value returned by GetBlockState so unit
+// tests can present a "ready" block state (non-zero MedianTime) without a
+// fully-initialised chain. This is a test seam — production never calls it.
+func (v *Validator) setBlockStateForTest(bs utxo.BlockState) {
+	v.blockStateOverride = &bs
 }
 
 // overrideCPUValidationForTest installs a function that replaces the real

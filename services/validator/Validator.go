@@ -176,6 +176,13 @@ type Validator struct {
 	// Kafka producer. nil in production.
 	txMetaPublishOverride func(tx *bt.Tx, m *meta.Data)
 
+	// blockStateOverride is a test seam that, when non-nil, replaces the value
+	// returned by GetBlockState. It lets unit tests supply a ready block state
+	// (non-zero MedianTime) without standing up a fully-initialised chain, so
+	// the finality/readiness checks behave as they would on a live node. nil in
+	// production.
+	blockStateOverride *utxo.BlockState
+
 	// phaseMetrics tracks atomic per-phase counters for ValidateBatch's
 	// six-phase pipeline. The zero value is ready to use; no explicit init
 	// required. External diagnostic tools access counters via PhaseSnapshot.
@@ -317,6 +324,10 @@ func (v *Validator) GetMedianBlockTime() uint32 {
 // from the UTXO store. This prevents race conditions that could occur when reading
 // these values separately, ensuring consistency during validation.
 func (v *Validator) GetBlockState() utxo.BlockState {
+	if v.blockStateOverride != nil {
+		return *v.blockStateOverride
+	}
+
 	return v.utxoStore.GetBlockState()
 }
 

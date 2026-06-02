@@ -46,11 +46,17 @@ func (v *Validator) ValidateBatch(
 		return []ValidationResult{}, nil
 	}
 
+	// Capture the atomic block state once (matching validateInternal) so the
+	// blockHeight default and the per-tx finality check below see a consistent
+	// height/median-time pair, and pre-process the options once for reuse.
+	blockState := v.GetBlockState()
+	validationOptions := ProcessOptions(opts...)
+
 	// Mirror Validator.validateInternal: callers may pass blockHeight=0 meaning
 	// "use current chain tip + 1". Without this, BDK 1.2.4 ValidateTransaction
 	// rejects bh=0 in script validation, breaking parity with the direct path.
 	if blockHeight == 0 {
-		blockHeight = v.GetBlockState().Height + 1
+		blockHeight = blockState.Height + 1
 	}
 
 	store, ok := v.getBatchUtxoStore()
@@ -160,6 +166,18 @@ func (v *Validator) ValidateBatch(
 		}
 		i := i // capture loop var
 		g.Go(func() error {
+			// Contextual checks (coinbase rejection + transaction finality) that
+			// validateInternal runs before script validation. The batch path must
+			// run the identical checks, otherwise Validate and ValidateBatch
+			// disagree and the batch path would accept non-final transactions the
+			// per-tx path rejects.
+			if err := v.checkContextual(txs[i], blockHeight, blockState, validationOptions); err != nil {
+				results[i].Err = err
+				results[i].Phase = PhaseCPU
+				alive[i] = false
+
+				return nil
+			}
 			if err := v.runCPUValidation(gCtx, txs[i], blockHeight, utxoHeightsByTx[i], opts...); err != nil {
 				results[i].Err = err
 				results[i].Phase = PhaseCPU
@@ -318,8 +336,7 @@ func (v *Validator) ValidateBatch(
 	// mirroring the existing single-tx path (Validator.go line ~783).
 	// When SkipTxMetaPublishing is set in the opts, the publish is skipped
 	// entirely (e.g. legacy catchup / quickValidationMode).
-	processedOpts := ProcessOptions(opts...)
-	skipPublish := processedOpts.SkipTxMetaPublishing || (v.txmetaKafkaProducerClient == nil && v.txMetaPublishOverride == nil)
+	skipPublish := validationOptions.SkipTxMetaPublishing || (v.txmetaKafkaProducerClient == nil && v.txMetaPublishOverride == nil)
 	if !skipPublish {
 		for i, tx := range txs {
 			if !alive[i] {
@@ -392,6 +409,35 @@ func (v *Validator) runCPUValidation(ctx context.Context, tx *bt.Tx, blockHeight
 	// merged call still uses utxoHeights for checkFees → isConsolidationTx and
 	// passes them through to the BDK script engine.
 	return v.txValidator.ValidateTransaction(tx, blockHeight, utxoHeights, processedOpts)
+}
+
+// checkContextual runs the per-tx contextual checks that validateInternal
+// performs before script validation — coinbase rejection and transaction
+// finality (nLockTime / median-time-past). The batched pipeline must run the
+// identical checks so Validate(tx) and ValidateBatch([tx]) agree; without this
+// the batch path would accept non-final transactions the per-tx path rejects,
+// and would diverge on the "utxo store not ready" readiness gate.
+func (v *Validator) checkContextual(tx *bt.Tx, blockHeight uint32, blockState utxo.BlockState, validationOptions *Options) error {
+	txID := tx.TxIDChainHash().String()
+
+	// Reject coinbase first, matching validateInternal (and bitcoin-sv
+	// CheckRegularTransaction) which short-circuits before any contextual check.
+	if tx.IsCoinbase() {
+		return terrors.NewProcessingError("[Validate][%s] coinbase transactions are not supported", txID)
+	}
+
+	comparisonTime, skipFinality, finalityErr := selectFinalityComparisonTime(validationOptions, blockHeight, uint32(v.settings.ChainCfgParams.CSVHeight), blockState)
+	if finalityErr != nil {
+		return finalityErr
+	}
+
+	if !skipFinality {
+		if err := util.IsTransactionFinal(tx, blockHeight, comparisonTime); err != nil {
+			return terrors.NewUtxoNonFinalError("[Validate][%s] transaction is not final", txID, err)
+		}
+	}
+
+	return nil
 }
 
 // getBatchUtxoStore returns the validator's UTXO store as a batchUtxoStore if
