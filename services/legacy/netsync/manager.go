@@ -2097,6 +2097,28 @@ func (sm *SyncManager) QueueBlock(block *bsvutil.Block, peer *peerpkg.Peer, done
 	sm.msgChan <- &blockMsg{block: block, peer: peer, reply: done}
 }
 
+// sendDuringShutdown delivers v on ch, recovering from the "send on closed
+// channel" panic that races teardown. Inv delivery runs on peer read-loop
+// goroutines (OnInv -> QueueInv), but the channels they target are torn down by
+// a different goroutine during shutdown: the kafka async producer closes
+// legacyKafkaInvCh in its Stop(), and the block handler stops draining msgChan.
+// The shutdown flag check in QueueInv narrows but cannot close that window — a
+// flag check and a channel send are not atomic against a concurrent close — so
+// a late inv would otherwise crash the whole process. Dropping an inv during
+// shutdown is safe: inv is an advisory announcement, re-sent by the peer (or a
+// later session) on the next connection. Returns false if the channel was closed.
+func sendDuringShutdown[T any](ch chan T, v T) (sent bool) {
+	defer func() {
+		if recover() != nil {
+			sent = false
+		}
+	}()
+
+	ch <- v
+
+	return true
+}
+
 // QueueInv adds the passed inv message and peer to the block handling queue.
 func (sm *SyncManager) QueueInv(inv *wire.MsgInv, peer *peerpkg.Peer) {
 	// No channel handling here because peers do not need to block on inv
@@ -2128,7 +2150,7 @@ func (sm *SyncManager) QueueInv(inv *wire.MsgInv, peer *peerpkg.Peer) {
 
 		if len(invBlockMsg.InvList) > 0 {
 			netsyncInvMsg := invMsg{inv: invBlockMsg, peer: peer}
-			sm.msgChan <- &netsyncInvMsg
+			sendDuringShutdown[interface{}](sm.msgChan, &netsyncInvMsg)
 		}
 
 		if len(invTxMsg.InvList) > 0 {
@@ -2142,13 +2164,13 @@ func (sm *SyncManager) QueueInv(inv *wire.MsgInv, peer *peerpkg.Peer) {
 
 			// write to Kafka
 			sm.logger.Debugf("writing INV message to Kafka from peer %s, length: %d", peer.String(), len(value))
-			sm.legacyKafkaInvCh <- &kafka.Message{
+			sendDuringShutdown(sm.legacyKafkaInvCh, &kafka.Message{
 				Value: value,
-			}
+			})
 		}
 	} else {
 		netsyncInvMsg := invMsg{inv: inv, peer: peer}
-		sm.msgChan <- &netsyncInvMsg
+		sendDuringShutdown[interface{}](sm.msgChan, &netsyncInvMsg)
 	}
 }
 
