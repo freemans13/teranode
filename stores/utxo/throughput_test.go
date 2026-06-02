@@ -33,6 +33,12 @@ func cleanDB(t *testing.T) {
 		t.Skipf("no postgres: %v", err)
 	}
 	defer pool.Close()
+	// pgxpool.New is lazy and does not dial, so explicitly ping to detect an
+	// unreachable server and skip (these are throughput benchmarks that require
+	// a real Postgres, which the plain unit-test job does not provide).
+	if err := pool.Ping(ctx); err != nil {
+		t.Skipf("no postgres: %v", err)
+	}
 	_, _ = pool.Exec(ctx, `SELECT cron.unschedule('materialize')`)
 	_, _ = pool.Exec(ctx, `
 		DROP PROCEDURE IF EXISTS materialize_loop() CASCADE;
