@@ -710,6 +710,24 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 
 	u.logger.Infof("[CheckSubtree] Processing priority subtree message for %s from %s", hash.String(), request.BaseUrl)
 
+	// Post-CSV candidate-parent MTP for the validator's consensus-path finality
+	// check (Options.CandidateParentMedianTime). Without this, two peer-priority
+	// handlers processing the same subtree under different tip-MTP snapshots
+	// could diverge on the finality decision. The request carries the previous
+	// block hash, so the candidate-parent MTP is locally derivable here — see
+	// fetchCandidateParentMedianTime for the parent-chain-walk sourcing rule
+	// and the chain re-anchor + walkParentChain fallback that closes the
+	// reorg-race window. Pre-CSV (CandidateBlockTime) still cannot be
+	// populated on this path because the request does not carry the candidate
+	// block's own header timestamp.
+	var candidateParentMedianTime uint32
+	if request.BlockHeight >= uint32(u.settings.ChainCfgParams.CSVHeight) {
+		candidateParentMedianTime, err = u.fetchCandidateParentMedianTime(ctx, previousBlockHash)
+		if err != nil {
+			return false, errors.NewProcessingError("[CheckSubtree] candidate-parent MTP", err)
+		}
+	}
+
 	// Check if the base URL is "legacy", which indicates that the subtree is coming from a block from the legacy service.
 	if request.BaseUrl == "legacy" {
 		// read from legacy store
@@ -741,10 +759,19 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 			AllowFailFast: false,
 		}
 
+		// CheckSubtree responds to peer subtree-validation requests. The request
+		// does not carry the candidate block's own header timestamp, so
+		// Options.CandidateBlockTime (pre-CSV finality source) stays zero —
+		// the validator skips pre-CSV consensus finality in that case, matching
+		// the prior behaviour. Options.CandidateParentMedianTime (post-CSV) is
+		// populated above from the request's PreviousBlockHash so two
+		// peer-priority handlers processing the same subtree cannot diverge
+		// on tip-MTP snapshots.
 		validatorOptions := []validator.Option{
 			validator.WithSkipPolicyChecks(true),
 			validator.WithCreateConflicting(true),
 			validator.WithIgnoreLocked(true),
+			validator.WithCandidateParentMedianTime(candidateParentMedianTime),
 		}
 
 		currentState, err := u.blockchainClient.GetFSMCurrentState(ctx)
@@ -782,6 +809,10 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 	}
 
 	// Call the ValidateSubtreeInternal method
+	// Options.CandidateBlockTime intentionally not populated (no candidate
+	// block header in the peer-facing request); Options.CandidateParentMedianTime
+	// IS populated from the request's PreviousBlockHash — see the legacy
+	// branch above for the rationale.
 	if _, err = u.ValidateSubtreeInternal(
 		ctx,
 		v,
@@ -790,6 +821,7 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		validator.WithSkipPolicyChecks(true),
 		validator.WithCreateConflicting(true),
 		validator.WithIgnoreLocked(true),
+		validator.WithCandidateParentMedianTime(candidateParentMedianTime),
 	); err != nil {
 		return false, errors.NewProcessingError("[CheckSubtree] Failed to validate subtree %s", hash.String(), err)
 	}
