@@ -415,6 +415,14 @@ type SyncManager struct {
 	// worker and released by the worker once its job is handed to the finalizer.
 	pipelineSem chan struct{}
 
+	// dispatched tracks heights whose PhaseA has been dispatched but which have not
+	// yet been finalized (in-flight). The finalizer's gap watchdog consults it to
+	// tell a genuinely missing block (never dispatched → re-request) apart from one
+	// that is merely queued behind slow finalization (in-flight → leave alone).
+	// Written by the consumer (markDispatched), read/pruned by the finalizer.
+	dispatchedMu sync.Mutex
+	dispatched   map[uint32]struct{}
+
 	// lastMissingParentResyncNano rate-limits gap re-requests during legacy
 	// catch-up (legacy_resyncOnMissingParent): when a block's parent is missing
 	// because the next-needed body was lost, re-request the gap from the tip
@@ -2425,6 +2433,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		headerList:       list.New(),
 		headerHeights:    make(map[chainhash.Hash]int32),
+		dispatched:       make(map[uint32]struct{}),
 		blockSizeTracker: newBlockSizeTracker(10), // track last 10 blocks for rolling average
 		quit:             make(chan struct{}),
 		// feeEstimator:            config.FeeEstimator,
