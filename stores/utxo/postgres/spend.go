@@ -270,6 +270,30 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 // ---------------------------------------------------------------------------
 
 func (s *Store) sendSpendBatch(batch []*batchSpendItem) {
+	// Reject later same-outpoint spend claims with different spending data in
+	// memory before the batch reaches the DB, exactly as the aerospike
+	// (sendSpendBatchLua) and sql stores do. Two concurrent spends of the same
+	// UTXO that coalesce into one batch otherwise both map to the single
+	// ON CONFLICT-inserted row in bulkSpendSQL's result LEFT JOIN and both
+	// return success — a double-spend. Filtering here gives first-seen
+	// exactly-one-error semantics and parity with the aerospike store; it is a
+	// no-op for batches of distinct outpoints (the hot path) and preserves
+	// idempotent retries (identical spending data is kept).
+	batch = utxo.FilterConflictingDuplicateSpendClaims(batch,
+		func(item *batchSpendItem) *utxo.Spend {
+			if item == nil {
+				return nil
+			}
+			return item.spend
+		},
+		func(item *batchSpendItem, err error) {
+			item.errCh <- err
+		},
+	)
+	if len(batch) == 0 {
+		return
+	}
+
 	s.trySendSpendBatch(batch)
 }
 
