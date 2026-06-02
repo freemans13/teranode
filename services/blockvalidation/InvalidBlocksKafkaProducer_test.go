@@ -69,8 +69,8 @@ func (m *MockBlockchainClient) CheckBlockIsInCurrentChain(ctx context.Context, b
 
 // OffChainBlockIDs implements the blockchain.ClientI interface. It reports
 // rebuilding so callers fall back to per-block CheckBlockIsInCurrentChain.
-func (m *MockBlockchainClient) OffChainBlockIDs(ctx context.Context) ([]uint32, bool, error) {
-	return nil, true, nil
+func (m *MockBlockchainClient) OffChainBlockIDs(ctx context.Context) ([]uint32, uint32, bool, error) {
+	return nil, 0, true, nil
 }
 
 // GetBestBlockHeader implements the blockchain.ClientI interface

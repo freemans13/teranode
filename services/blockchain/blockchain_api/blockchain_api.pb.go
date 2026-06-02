@@ -1814,6 +1814,7 @@ type GetOffChainBlockIDsResponse struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	OffChainBlockIds []uint32               `protobuf:"varint,1,rep,packed,name=off_chain_block_ids,json=offChainBlockIds,proto3" json:"off_chain_block_ids,omitempty"` // Block IDs known NOT to be on the main chain
 	Rebuilding       bool                   `protobuf:"varint,2,opt,name=rebuilding,proto3" json:"rebuilding,omitempty"`                                                // True when the set is stale (reorg/startup); callers must fall back to per-set checks
+	MaxBlockId       uint32                 `protobuf:"varint,3,opt,name=max_block_id,json=maxBlockId,proto3" json:"max_block_id,omitempty"`                            // Highest known block ID; IDs above this cannot be on the main chain (mirrors CheckBlockIsInCurrentChain's guard)
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -1860,6 +1861,13 @@ func (x *GetOffChainBlockIDsResponse) GetRebuilding() bool {
 		return x.Rebuilding
 	}
 	return false
+}
+
+func (x *GetOffChainBlockIDsResponse) GetMaxBlockId() uint32 {
+	if x != nil {
+		return x.MaxBlockId
+	}
+	return 0
 }
 
 // GetMedianTimeResponse contains block timestamp information.
@@ -7094,12 +7102,14 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"#FindBlocksContainingSubtreeResponse\x12\x16\n" +
 	"\x06blocks\x18\x01 \x03(\fR\x06blocks\"-\n" +
 	"\x19GetBlockHeaderIDsResponse\x12\x10\n" +
-	"\x03ids\x18\x01 \x03(\rR\x03ids\"l\n" +
+	"\x03ids\x18\x01 \x03(\rR\x03ids\"\x8e\x01\n" +
 	"\x1bGetOffChainBlockIDsResponse\x12-\n" +
 	"\x13off_chain_block_ids\x18\x01 \x03(\rR\x10offChainBlockIds\x12\x1e\n" +
 	"\n" +
 	"rebuilding\x18\x02 \x01(\bR\n" +
-	"rebuilding\"C\n" +
+	"rebuilding\x12 \n" +
+	"\fmax_block_id\x18\x03 \x01(\rR\n" +
+	"maxBlockId\"C\n" +
 	"\x15GetMedianTimeResponse\x12*\n" +
 	"\x11block_header_time\x18\x01 \x03(\rR\x0fblockHeaderTime\"5\n" +
 	"\x15GetBlockHeaderRequest\x12\x1c\n" +

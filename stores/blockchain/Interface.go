@@ -391,11 +391,14 @@ type Store interface {
 	//   - ctx: Context for the operation
 	// Returns:
 	//   - the off-chain block IDs (nil when none)
+	//   - maxBlockID: the highest known block ID. IDs above this cannot be on the
+	//     main chain, so callers must apply the same id > maxBlockID skip that
+	//     CheckBlockIsInCurrentChain enforces, to stay consensus-equivalent
 	//   - rebuilding: true when the in-memory set is unavailable or stale (in-memory
 	//     check disabled, or a reorg/startup rebuild is in progress); callers must
 	//     fall back to per-block CheckBlockIsInCurrentChain checks
 	//   - any error encountered
-	OffChainBlockIDs(ctx context.Context) (offChainBlockIDs []uint32, rebuilding bool, err error)
+	OffChainBlockIDs(ctx context.Context) (offChainBlockIDs []uint32, maxBlockID uint32, rebuilding bool, err error)
 
 	// CheckBlockIsAncestorOfBlock checks if any of the given block IDs are ancestors of the block with the given hash.
 	// This is used for double-spend detection on fork blocks where we need to check against
