@@ -1597,7 +1597,7 @@ func (b *Blockchain) GetOffChainBlockIDs(ctx context.Context, _ *emptypb.Empty) 
 	)
 	defer deferFn()
 
-	ids, rebuilding, err := b.store.OffChainBlockIDs(ctx)
+	ids, maxBlockID, rebuilding, err := b.store.OffChainBlockIDs(ctx)
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
 	}
@@ -1605,6 +1605,7 @@ func (b *Blockchain) GetOffChainBlockIDs(ctx context.Context, _ *emptypb.Empty) 
 	return &blockchain_api.GetOffChainBlockIDsResponse{
 		OffChainBlockIds: ids,
 		Rebuilding:       rebuilding,
+		MaxBlockId:       maxBlockID,
 	}, nil
 }
 

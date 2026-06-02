@@ -2140,7 +2140,7 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 	//     - The window is truncated, so on a miss fall back to a per-tx
 	//       CheckBlockIsInCurrentChain RPC.
 	//
-	//   OFF-CHAIN PREFETCH (checkOldBlockIDsWithoutPrefetch, gated by toggle):
+	//   OFF-CHAIN PREFETCH (checkOldBlockIDsOffChainPrefetch, gated by toggle):
 	//     - Fetch the *complete* off-chain (forked) block ID set once via
 	//       OffChainBlockIDs and check non-membership (absent ⇒ on chain).
 	//     - The set is complete, not a recent window, so one prefetch
@@ -2155,7 +2155,7 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 	// betfair-pc mainnet showed the on-chain prefetch holding ~35% of inuse
 	// heap (464 MB) and ~16% of CPU on its own.
 	if u.settings != nil && u.settings.BlockChain.UseInMemoryChainCheck {
-		return u.checkOldBlockIDsWithoutPrefetch(ctx, oldBlockIDsMap, block)
+		return u.checkOldBlockIDsOffChainPrefetch(ctx, oldBlockIDsMap, block)
 	}
 
 	lookupHash := block.Header.HashPrevBlock
@@ -2198,7 +2198,7 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 	return
 }
 
-// checkOldBlockIDsWithoutPrefetch is the off-chain-prefetch variant of
+// checkOldBlockIDsOffChainPrefetch is the off-chain-prefetch variant of
 // checkOldBlockIDs (see checkOldBlockIDs for the strategy comparison).
 //
 // It answers the same per-tx question — "is at least one of this tx's
@@ -2210,9 +2210,20 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 //     window is truncated, a miss may still be on an older part of the chain
 //     and forces a per-tx CheckBlockIsInCurrentChain RPC.
 //   - This route fetches the *complete* off-chain (forked) set once via
-//     OffChainBlockIDs and checks non-membership (a parent ID absent from the
-//     off-chain set ⇒ on chain). The set is complete, not a recent window, so
-//     there is no "too old" miss: one prefetch resolves every tx locally.
+//     OffChainBlockIDs and checks non-membership. The set is complete, not a
+//     recent window, so there is no "too old" miss: one prefetch resolves
+//     every tx locally.
+//
+// To stay consensus-equivalent with CheckBlockIsInCurrentChain, the local
+// check applies BOTH of the rules the authoritative path applies
+// (CheckBlockIsInCurrentChain.go): a block ID is on the main chain iff
+// (id <= maxBlockID) AND (id is not in the off-chain set). The id > maxBlockID
+// guard is essential — an ID can be allocated (GetNextBlockID) and written into
+// a tx's BlockIDs before AddBlock bumps maxBlockID, so without the guard a
+// fastPath that treated such an id as on-chain would accept a tx the
+// authoritative RPC rejects, a chain-split risk between toggled and untoggled
+// nodes. With the guard, an above-max id is skipped here and falls through to
+// the RPC, which rejects it identically.
 //
 // This costs exactly one round-trip per block regardless of client topology
 // (in-process LocalClient or gRPC), which is the whole point — calling
@@ -2231,11 +2242,11 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 // The string-keyed dedupe cache from the original is kept because identical
 // blockIDs slices are common (sibling txs spending outputs from the same
 // parent block).
-func (u *BlockValidation) checkOldBlockIDsWithoutPrefetch(ctx context.Context,
+func (u *BlockValidation) checkOldBlockIDsOffChainPrefetch(ctx context.Context,
 	oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
 	block *model.Block,
 ) (iterationError error) {
-	offChainIDs, rebuilding, err := u.blockchainClient.OffChainBlockIDs(ctx)
+	offChainIDs, maxBlockID, rebuilding, err := u.blockchainClient.OffChainBlockIDs(ctx)
 	if err != nil {
 		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] failed to get off-chain block IDs", block.String(), err)
 	}
@@ -2263,13 +2274,20 @@ func (u *BlockValidation) checkOldBlockIDsWithoutPrefetch(ctx context.Context,
 	}
 
 	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] off-chain-prefetch route: prefetched %d off-chain block IDs, checking %d old block ID entries", block.Hash().String(), len(offChain), oldBlockIDsMap.Length())
+		u.logger.Infof("[checkOldBlockIDs][%s] off-chain-prefetch route: prefetched %d off-chain block IDs (maxBlockID=%d), checking %d old block ID entries", block.Hash().String(), len(offChain), maxBlockID, oldBlockIDsMap.Length())
 	}
 
-	// ANY-of, inverted: a tx's parent set is on the main chain if at least one
-	// of its parent block IDs is NOT in the off-chain set.
+	// ANY-of, inverted, mirroring CheckBlockIsInCurrentChain exactly: a tx's
+	// parent set is on the main chain if at least one of its parent block IDs is
+	// (id <= maxBlockID) AND NOT in the off-chain set. IDs above maxBlockID
+	// cannot exist yet, so they are skipped here (not treated as on-chain) and
+	// fall through to the authoritative RPC — never short-circuited to accept.
 	fastPath := func(blockIDs []uint32) bool {
 		for _, blockID := range blockIDs {
+			if blockID > maxBlockID {
+				continue
+			}
+
 			if _, isOffChain := offChain[blockID]; !isOffChain {
 				return true
 			}
@@ -2289,8 +2307,9 @@ func (u *BlockValidation) checkOldBlockIDsWithoutPrefetch(ctx context.Context,
 }
 
 // iterateOldBlockIDsWithCachedLookup is the shared per-tx iterator used by
-// both checkOldBlockIDs (prefetch route) and checkOldBlockIDsWithoutPrefetch
-// (no-prefetch route). For each (txID, blockIDs) entry it:
+// both checkOldBlockIDs (on-chain prefetch route) and
+// checkOldBlockIDsOffChainPrefetch (off-chain prefetch route). For each
+// (txID, blockIDs) entry it:
 //
 //  1. Rejects an empty blockIDs slice as a processing error.
 //  2. (prefetch only) invokes fastPath(blockIDs) and short-circuits true if
