@@ -2189,10 +2189,10 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 		u.iterateOldBlockIDsWithCachedLookup(ctx, oldBlockIDsMap, block, fastPath, u.blockchainClient.CheckBlockIsInCurrentChain)
 
 	if u.logger != nil {
-		// "slowPath" is the historical name for the per-tx lookup reached
-		// on a fast-path miss. Kept in the log key for grep continuity even
-		// though the helper counter is now route-neutral (lookupCount).
-		u.logger.Infof("[checkOldBlockIDs][%s] prefetch route done: fastPath=%d, slowPath=%d, cacheHit=%d", block.Hash().String(), fastPathCount, lookupCount, cacheHitCount)
+		// "lookup" is the per-tx CheckBlockIsInCurrentChain reached on a fast-path
+		// miss. Both routes use the same label for this counter so logs are
+		// directly comparable across the on-chain and off-chain prefetch paths.
+		u.logger.Infof("[checkOldBlockIDs][%s] prefetch route done: fastPath=%d, lookup=%d, cacheHit=%d", block.Hash().String(), fastPathCount, lookupCount, cacheHitCount)
 	}
 
 	return
@@ -2324,9 +2324,8 @@ func (u *BlockValidation) checkOldBlockIDsOffChainPrefetch(ctx context.Context,
 //
 // Returns the iteration error (or nil) plus counters. lookupCount counts
 // how many times the lookup callback was actually invoked (i.e. cache
-// misses that weren't short-circuited by fastPath); it is reported in
-// each route's log under the route-appropriate name (the prefetch route
-// historically calls it "slowPath").
+// misses that weren't short-circuited by fastPath); both routes report it
+// under the same "lookup" log label so their logs are directly comparable.
 //
 // oldBlockIDsCacheHintCap bounds the up-front size hint for the dedupe
 // cache so a block with a very high tx count cannot force a large map

@@ -2731,6 +2731,81 @@ func Test_OffChainBlockIDs_StoreBranches(t *testing.T) {
 	})
 }
 
+// BenchmarkCheckOldBlockIDs measures the per-block cost of both chain-membership
+// routes at realistic tx counts, with parents referencing a small set of recent
+// on-chain blocks (so every tx resolves via the local fastPath — the production
+// happy path). It is the guard Oli asked for against a silent regression to the
+// per-tx CheckBlockIsInCurrentChain lookup: if a change stops the fastPath from
+// resolving locally, ns/op and allocs/op here jump (and lookups would dominate),
+// surfacing the regression instead of letting callers fall back to SQL unnoticed.
+//
+//	go test -tags testtxmetacache -bench BenchmarkCheckOldBlockIDs -benchmem ./services/blockvalidation/
+func BenchmarkCheckOldBlockIDs(b *testing.B) {
+	initPrometheusMetrics()
+
+	const distinctParents = uint32(64) // recent main-chain blocks the block's txs spend from
+
+	testBlock := func() *model.Block {
+		prevHash := chainhash.HashH([]byte("prev"))
+		merkleRoot := chainhash.HashH([]byte("merkle"))
+		return &model.Block{Header: &model.BlockHeader{HashPrevBlock: &prevHash, HashMerkleRoot: &merkleRoot}}
+	}
+
+	buildMap := func(numTxs int) *txmap.SyncedMap[chainhash.Hash, []uint32] {
+		m := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+		for i := 0; i < numTxs; i++ {
+			parent := uint32(i)%distinctParents + 1 // ids 1..distinctParents, all on chain
+			m.Set(chainhash.HashH([]byte(fmt.Sprintf("bench-tx-%d", i))), []uint32{parent})
+		}
+		return m
+	}
+
+	for _, numTxs := range []int{1_000, 10_000} {
+		oldBlockIDsMap := buildMap(numTxs)
+
+		b.Run(fmt.Sprintf("on-chain-prefetch/%d", numTxs), func(b *testing.B) {
+			recent := make([]uint32, distinctParents)
+			for i := range recent {
+				recent[i] = uint32(i) + 1
+			}
+			mockClient := &blockchain.Mock{}
+			mockClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return(recent, nil)
+			mockClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+
+			s := &settings.Settings{} // UseInMemoryChainCheck=false → on-chain prefetch route
+			bv := &BlockValidation{blockchainClient: mockClient, settings: s}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := bv.checkOldBlockIDs(context.Background(), oldBlockIDsMap, testBlock()); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("off-chain-prefetch/%d", numTxs), func(b *testing.B) {
+			mockClient := &blockchain.Mock{}
+			// Empty off-chain set + high maxBlockID → every parent (1..64) is on chain
+			// and resolves via the local fastPath, no per-tx lookup.
+			mockClient.On("OffChainBlockIDs", mock.Anything).Return([]uint32(nil), 1_000_000, false, nil)
+			mockClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+
+			s := &settings.Settings{}
+			s.BlockChain.UseInMemoryChainCheck = true // off-chain prefetch route
+			bv := &BlockValidation{blockchainClient: mockClient, settings: s}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := bv.checkOldBlockIDs(context.Background(), oldBlockIDsMap, testBlock()); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func TestBlockValidation_ParentAndChildInSameBlock(t *testing.T) {
 	initPrometheusMetrics()
 
