@@ -391,12 +391,6 @@ type SyncManager struct {
 	finalizeErrMu sync.Mutex
 	finalizeErrV  error
 
-	// lastMissingParentResyncNano rate-limits gap re-requests during legacy
-	// catch-up (legacy_resyncOnMissingParent): when a block's parent is missing
-	// because the next-needed body was lost, re-request the gap from the tip
-	// rather than dropping children and stalling for the requestedBlocks TTL.
-	lastMissingParentResyncNano atomic.Int64
-
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64
@@ -1283,30 +1277,34 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// promote block to the block validation via kafka (p2p -> blockvalidation message),
 	// without calling HandleBlockDirect. Such that it doesn't interfere with the operation of block validation.
 	if err = sm.HandleBlockDirect(sm.ctx, bmsg.peer, bmsg.blockHash, bmsg.block); err != nil {
-		if errors.Is(err, errors.ErrBlockNotFound) {
-			if legacySyncMode || catchingBlocks {
-				// During legacy catch-up the parent is normally only a few blocks
-				// behind in the ordered fetch, so we don't getblocks for every such
-				// block. But if the next-needed body was lost, the in-flight window
-				// fills with unplaceable children and the fetch stalls for the full
-				// requestedBlocks TTL (~1h) — historically only a restart cleared it.
-				// Re-request the gap from the tip (rate-limited) so the node
-				// self-heals without intervention.
-				if sm.settings.Legacy.ResyncOnMissingParent {
-					sm.maybeResyncOnMissingParent(peer, bmsg.blockHash, &bmsg.block.Header.PrevBlock)
-				} else {
-					sm.logger.Errorf("Failed to process new block in legacy mode %v: %v", bmsg.blockHash, err)
-				}
-
-				return nil
-			}
-
+		if (legacySyncMode || catchingBlocks) && errors.Is(err, errors.ErrBlockNotFound) {
+			// previous block not found? Probably a new block message from our syncPeer while we are still syncing
+			sm.logger.Errorf("Failed to process new block in legacy mode %v: %v", bmsg.blockHash, err)
+			return nil
+		} else if errors.Is(err, errors.ErrBlockNotFound) {
 			// We don't have the parent of this block/header, so we'll request it.
 			sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks",
 				bmsg.blockHash, bmsg.block.Header.PrevBlock)
 
-			if rerr := sm.requestBlocksFromTip(peer); rerr != nil {
-				sm.logger.Errorf("Failed to request missing blocks for %s: %v", bmsg.blockHash, rerr)
+			bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+			if err != nil {
+				sm.logger.Errorf("Failed to get best block header: %v", err)
+				return nil
+			}
+			// Create a block locator starting from the parent hash
+			locator, err := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
+			if err != nil {
+				sm.logger.Errorf("Failed to get block locator for the block hash %s: %v",
+					bmsg.blockHash, err)
+				return nil
+			}
+
+			// Send a getblocks message to request missing blocks
+			zeroHash := chainhash.Hash{}
+			if err = peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
+				sm.logger.Errorf("Failed to send getblocks message: %v", err)
+
+				return nil
 			}
 
 			return nil
@@ -2142,57 +2140,6 @@ func (sm *SyncManager) QueueBlock(block *bsvutil.Block, peer *peerpkg.Peer, done
 	}
 
 	sm.msgChan <- &blockMsg{block: block, peer: peer, reply: done}
-}
-
-// requestBlocksFromTip asks the peer for the blocks following our current best
-// block, via a getblocks locator built from the chain tip. Used to recover when
-// a block's parent is missing so the gap gets re-fetched.
-func (sm *SyncManager) requestBlocksFromTip(peer *peerpkg.Peer) error {
-	bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
-	if err != nil {
-		return errors.NewServiceError("failed to get best block header", err)
-	}
-
-	locator, err := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
-	if err != nil {
-		return errors.NewServiceError("failed to get block locator", err)
-	}
-
-	zeroHash := chainhash.Hash{}
-	if err = peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
-		return errors.NewServiceError("failed to send getblocks message", err)
-	}
-
-	return nil
-}
-
-// missingParentResyncInterval rate-limits gap re-requests during legacy catch-up
-// so a burst of unplaceable children triggers at most one getblocks per interval.
-const missingParentResyncInterval = 3 * time.Second
-
-// maybeResyncOnMissingParent re-requests the missing gap from the tip during legacy
-// catch-up, rate-limited. This is the self-heal for the stall where the next-needed
-// block body was lost: rather than dropping the unplaceable children and waiting out
-// the ~1h requestedBlocks TTL (which historically required a manual restart), the node
-// re-requests the gap from its tip and recovers on its own. Called only from the
-// single blockQueue consumer goroutine; the CAS guards against double-issue regardless.
-func (sm *SyncManager) maybeResyncOnMissingParent(peer *peerpkg.Peer, blockHash chainhash.Hash, prevHash *chainhash.Hash) {
-	now := time.Now().UnixNano()
-
-	last := sm.lastMissingParentResyncNano.Load()
-	if now-last < int64(missingParentResyncInterval) {
-		return // a recent gap re-request is already in flight
-	}
-
-	if !sm.lastMissingParentResyncNano.CompareAndSwap(last, now) {
-		return
-	}
-
-	sm.logger.Infof("[legacy] block %s missing parent %s during catch-up; re-requesting gap from tip (self-heal)", blockHash, prevHash)
-
-	if err := sm.requestBlocksFromTip(peer); err != nil {
-		sm.logger.Errorf("[legacy] gap re-request failed: %v", err)
-	}
 }
 
 // sendDuringShutdown delivers v on ch, recovering from the "send on closed

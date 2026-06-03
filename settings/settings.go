@@ -602,7 +602,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			OutpointBatcherConcurrency:       getInt("legacy_outpointBatcherConcurrency", 32, alternativeContext...),
 			ParentSatoshiCacheMB:             getInt("legacy_parentSatoshiCacheMB", 0, alternativeContext...),
 			BlockFinalizationPipeline:        getBool("legacy_blockFinalizationPipeline", false, alternativeContext...),
-			ResyncOnMissingParent:            getBool("legacy_resyncOnMissingParent", true, alternativeContext...),
 			PrintInvMessages:                 getBool("legacy_printInvMessages", false, alternativeContext...),
 			GRPCAddress:                      getString("legacy_grpcAddress", "", alternativeContext...),
 			AllowBlockPriority:               getBool("legacy_allowBlockPriority", false, alternativeContext...),
