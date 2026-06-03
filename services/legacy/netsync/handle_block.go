@@ -119,13 +119,10 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// > 1): run this block's PhaseA tx-work on a bounded worker pool and finalize via
 	// the height-ordered reorder buffer. The consumer establishes the authoritative
 	// finalize start height here (it dispatches in arrival order, contiguous with the
-	// committed tip), and — critically for the create→fee dependency — caches this
-	// block's output satoshis at parse time BEFORE dispatch, so a later block's
-	// concurrent fee resolution finds them regardless of createUtxos order. Then it
+	// committed tip) and pre-builds the satoshi cache before any worker runs, then
 	// returns so the next block's PhaseA can begin immediately.
-	if pipelined && sm.effectivePipelineConcurrency() > 1 {
+	if pipelined && sm.settings.Legacy.BlockPipelineConcurrency > 1 {
 		sm.ensureFinalizer(blockHeight)
-		sm.cacheBlockOutputSatoshis(block)
 
 		if err = sm.acquirePipelineSlot(); err != nil {
 			return err
@@ -242,56 +239,6 @@ func (sm *SyncManager) runPhaseA(ctx context.Context, block *bsvutil.Block, bloc
 	}, nil
 }
 
-// effectivePipelineConcurrency returns the PhaseA window size actually used.
-// Concurrency > 1 requires the parse-time satoshi cache (ParentSatoshiCacheMB >
-// 0): without it every cross-block parent fee would hit the store, which under
-// concurrency may not yet hold the parent's outputs (its createUtxos may not have
-// run), breaking the create→fee dependency. With the cache disabled we clamp to
-// 1 (serial tx-work, still-pipelined finalization), which is always correct.
-func (sm *SyncManager) effectivePipelineConcurrency() int {
-	c := sm.settings.Legacy.BlockPipelineConcurrency
-	if c <= 1 {
-		return 1
-	}
-
-	if sm.settings.Legacy.ParentSatoshiCacheMB <= 0 {
-		return 1
-	}
-
-	return c
-}
-
-// cacheBlockOutputSatoshis records every output's satoshis from a block into the
-// satoshi cache, read straight from wire data (cached tx hashes + TxOut.Value) so
-// it is cheap and needs no bt.Tx conversion. This is the design's step (a):
-// populating at PARSE time on the in-order blockQueue consumer — before a block's
-// PhaseA is dispatched — guarantees that when a later block's concurrent PhaseA
-// resolves a fee against this block's outputs, the satoshis are already cached,
-// independent of whether this block's createUtxos has run. No-op when the cache
-// is disabled.
-func (sm *SyncManager) cacheBlockOutputSatoshis(block *bsvutil.Block) {
-	if sm.satoshiCache == nil {
-		return
-	}
-
-	for _, tx := range block.Transactions() {
-		txHash := tx.Hash()
-
-		for i, out := range tx.MsgTx().TxOut {
-			if out == nil {
-				continue
-			}
-
-			idx, err := safeconversion.IntToUint32(i)
-			if err != nil {
-				continue
-			}
-
-			sm.satoshiCache.put(txHash, idx, uint64(out.Value))
-		}
-	}
-}
-
 // runPhaseAWorker runs runPhaseA off the blockQueue consumer (concurrent window)
 // and hands the resulting job to the in-order finalizer. PhaseA failures halt the
 // pipeline via setFinalizeError (surfaced to the consumer before the next block).
@@ -362,11 +309,10 @@ func (sm *SyncManager) ensureFinalizer(startHeight uint32) {
 	sm.finalizeOnce.Do(func() {
 		sm.finalizeStartHeight = startHeight
 
-		if sm.settings.Legacy.BlockPipelineConcurrency > 1 && sm.settings.Legacy.ParentSatoshiCacheMB <= 0 {
-			sm.logger.Warnf("[finalizeLoop] legacy_blockPipelineConcurrency>1 ignored: it requires legacy_parentSatoshiCacheMB>0 for fee correctness; running tx-work serially")
+		concurrency := sm.settings.Legacy.BlockPipelineConcurrency
+		if concurrency < 1 {
+			concurrency = 1
 		}
-
-		concurrency := sm.effectivePipelineConcurrency()
 
 		sm.pipelineSem = make(chan struct{}, concurrency)
 
@@ -684,7 +630,7 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	// (shared in-memory buffer across blocks) and would race when multiple PhaseA
 	// workers write subtrees at once. With it bypassed, writeSubtree streams each
 	// block's subtrees directly to distinct files — concurrency-safe.
-	if quickValidationMode && sm.subtreeWriteBatcher == nil && sm.settings.Legacy.SubtreeWriteBatchBlocks > 1 && sm.effectivePipelineConcurrency() <= 1 {
+	if quickValidationMode && sm.subtreeWriteBatcher == nil && sm.settings.Legacy.SubtreeWriteBatchBlocks > 1 && sm.settings.Legacy.BlockPipelineConcurrency <= 1 {
 		sm.subtreeWriteBatcher = NewSubtreeWriteBatcher(
 			sm.settings.Legacy.SubtreeWriteBatchBlocks,
 			sm.settings.Legacy.SubtreeWriteBatchWait,
