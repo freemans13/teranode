@@ -371,18 +371,6 @@ type SyncManager struct {
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
-	// headerHeights maps a downloaded header's hash to its height, derived purely
-	// from the in-memory, checkpoint-anchored header list during headers-first
-	// sync. It lets the quick-validation block-finalization pipeline determine a
-	// block's height WITHOUT a GetBlockHeader(prevBlock) round-trip to the
-	// blockchain store — a read that needs the parent block already ADDED (a
-	// finalization-pipeline output), which is exactly what forced an earlier
-	// pipeline attempt to serialise behind the previous block finalizing. Written
-	// by handleHeadersMsg (its own goroutine) and read/pruned by the blockQueue
-	// consumer, so all access is guarded by headerHeightsMu.
-	headerHeightsMu sync.RWMutex
-	headerHeights   map[chainhash.Hash]int32
-
 	// satoshiCache is an optional off-heap recency cache of parent-output satoshis,
 	// used only during legacy catch-up in quickValidationMode to resolve transaction
 	// fees without a store read. Lazily created on the first quick-validation block
@@ -390,44 +378,6 @@ type SyncManager struct {
 	// read on the blockHandler thread; putTx is called concurrently from createUtxos
 	// but the underlying cache is internally thread-safe.
 	satoshiCache *satoshiCache
-
-	// Block-finalization pipeline (legacy_blockFinalizationPipeline). When enabled
-	// for quick-validation blocks, the blockQueue consumer does each block's tx-work
-	// in height order and hands finalization (ProcessBlock/AddBlock/mined_set) to the
-	// finalizeLoop goroutine, which runs in height order on a separate goroutine so it
-	// overlaps the next block's tx-work. finalizeCh is the bounded handoff (its depth
-	// caps the look-ahead horizon); finalizeErrV records the first finalization error
-	// so the consumer halts ingest. Lazily started on the first pipelined block.
-	finalizeCh    chan *finalizeJob
-	finalizeOnce  sync.Once
-	finalizeErrMu sync.Mutex
-	finalizeErrV  error
-
-	// finalizeStartHeight is the first height the finalizer's reorder buffer will
-	// finalize. Set once (inside finalizeOnce) from the first pipelined block's
-	// height, which the in-order blockQueue consumer dispatches contiguous with the
-	// committed chain tip. Read only by the finalizer goroutine at startup.
-	finalizeStartHeight uint32
-
-	// pipelineSem bounds how many blocks' PhaseA tx-work run concurrently when
-	// legacy_blockPipelineConcurrency > 1 (the throughput lever). Buffered to the
-	// concurrency; a token is acquired by the consumer before spawning a PhaseA
-	// worker and released by the worker once its job is handed to the finalizer.
-	pipelineSem chan struct{}
-
-	// dispatched tracks heights whose PhaseA has been dispatched but which have not
-	// yet been finalized (in-flight). The finalizer's gap watchdog consults it to
-	// tell a genuinely missing block (never dispatched → re-request) apart from one
-	// that is merely queued behind slow finalization (in-flight → leave alone).
-	// Written by the consumer (markDispatched), read/pruned by the finalizer.
-	dispatchedMu sync.Mutex
-	dispatched   map[uint32]struct{}
-
-	// lastMissingParentResyncNano rate-limits gap re-requests during legacy
-	// catch-up (legacy_resyncOnMissingParent): when a block's parent is missing
-	// because the next-needed body was lost, re-request the gap from the tip
-	// rather than dropping children and stalling for the requestedBlocks TTL.
-	lastMissingParentResyncNano atomic.Int64
 
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
@@ -465,7 +415,6 @@ func (sm *SyncManager) storeSyncPeer(peer *peerpkg.Peer, state *syncPeerState) {
 func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight int32) {
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
-	sm.resetHeaderHeights()
 	sm.startHeader = nil
 
 	// When there is a next checkpoint, add an entry for the latest known
@@ -1316,30 +1265,34 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// promote block to the block validation via kafka (p2p -> blockvalidation message),
 	// without calling HandleBlockDirect. Such that it doesn't interfere with the operation of block validation.
 	if err = sm.HandleBlockDirect(sm.ctx, bmsg.peer, bmsg.blockHash, bmsg.block); err != nil {
-		if errors.Is(err, errors.ErrBlockNotFound) {
-			if legacySyncMode || catchingBlocks {
-				// During legacy catch-up the parent is normally only a few blocks
-				// behind in the ordered fetch, so we don't getblocks for every such
-				// block. But if the next-needed body was lost, the in-flight window
-				// fills with unplaceable children and the fetch stalls for the full
-				// requestedBlocks TTL (~1h) — historically only a restart cleared it.
-				// Re-request the gap from the tip (rate-limited) so the node
-				// self-heals without intervention.
-				if sm.settings.Legacy.ResyncOnMissingParent {
-					sm.maybeResyncOnMissingParent(peer, bmsg.blockHash, &bmsg.block.Header.PrevBlock)
-				} else {
-					sm.logger.Errorf("Failed to process new block in legacy mode %v: %v", bmsg.blockHash, err)
-				}
-
-				return nil
-			}
-
+		if (legacySyncMode || catchingBlocks) && errors.Is(err, errors.ErrBlockNotFound) {
+			// previous block not found? Probably a new block message from our syncPeer while we are still syncing
+			sm.logger.Errorf("Failed to process new block in legacy mode %v: %v", bmsg.blockHash, err)
+			return nil
+		} else if errors.Is(err, errors.ErrBlockNotFound) {
 			// We don't have the parent of this block/header, so we'll request it.
 			sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks",
 				bmsg.blockHash, bmsg.block.Header.PrevBlock)
 
-			if rerr := sm.requestBlocksFromTip(peer); rerr != nil {
-				sm.logger.Errorf("Failed to request missing blocks for %s: %v", bmsg.blockHash, rerr)
+			bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+			if err != nil {
+				sm.logger.Errorf("Failed to get best block header: %v", err)
+				return nil
+			}
+			// Create a block locator starting from the parent hash
+			locator, err := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
+			if err != nil {
+				sm.logger.Errorf("Failed to get block locator for the block hash %s: %v",
+					bmsg.blockHash, err)
+				return nil
+			}
+
+			// Send a getblocks message to request missing blocks
+			zeroHash := chainhash.Hash{}
+			if err = peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
+				sm.logger.Errorf("Failed to send getblocks message: %v", err)
+
+				return nil
 			}
 
 			return nil
@@ -1359,11 +1312,6 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			return err
 		}
 	}
-
-	// Block accepted: prune its header-list height entry so the lookup stays
-	// bounded to the in-flight window. A later reprocess (rare) falls back to the
-	// GetBlockHeader lookup, by which point the parent is finalized.
-	sm.deleteHeaderHeight(bmsg.blockHash)
 
 	// Meta-data about the new block this peer is reporting. We use this
 	// below to update this peer's latest block height and the heights of
@@ -1492,7 +1440,6 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// from the block after this one up to the end of the chain (zero hash).
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
-	sm.resetHeaderHeights()
 	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
 
 	locator := blockchain.BlockLocator([]*chainhash.Hash{&bmsg.blockHash})
@@ -1684,11 +1631,6 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		if prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
 			node.height = prevNode.height + 1
 			e := sm.headerList.PushBack(&node)
-
-			// Record the height so the quick-validation pipeline can derive it
-			// without a GetBlockHeader(prevBlock) round-trip when the block body
-			// later arrives. See deriveBlockHeight.
-			sm.setHeaderHeight(blockHash, node.height)
 
 			if sm.startHeader == nil {
 				sm.startHeader = e
@@ -2188,57 +2130,6 @@ func (sm *SyncManager) QueueBlock(block *bsvutil.Block, peer *peerpkg.Peer, done
 	sm.msgChan <- &blockMsg{block: block, peer: peer, reply: done}
 }
 
-// requestBlocksFromTip asks the peer for the blocks following our current best
-// block, via a getblocks locator built from the chain tip. Used to recover when
-// a block's parent is missing so the gap gets re-fetched.
-func (sm *SyncManager) requestBlocksFromTip(peer *peerpkg.Peer) error {
-	bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
-	if err != nil {
-		return errors.NewServiceError("failed to get best block header", err)
-	}
-
-	locator, err := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
-	if err != nil {
-		return errors.NewServiceError("failed to get block locator", err)
-	}
-
-	zeroHash := chainhash.Hash{}
-	if err = peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
-		return errors.NewServiceError("failed to send getblocks message", err)
-	}
-
-	return nil
-}
-
-// missingParentResyncInterval rate-limits gap re-requests during legacy catch-up
-// so a burst of unplaceable children triggers at most one getblocks per interval.
-const missingParentResyncInterval = 3 * time.Second
-
-// maybeResyncOnMissingParent re-requests the missing gap from the tip during legacy
-// catch-up, rate-limited. This is the self-heal for the stall where the next-needed
-// block body was lost: rather than dropping the unplaceable children and waiting out
-// the ~1h requestedBlocks TTL (which historically required a manual restart), the node
-// re-requests the gap from its tip and recovers on its own. Called only from the
-// single blockQueue consumer goroutine; the CAS guards against double-issue regardless.
-func (sm *SyncManager) maybeResyncOnMissingParent(peer *peerpkg.Peer, blockHash chainhash.Hash, prevHash *chainhash.Hash) {
-	now := time.Now().UnixNano()
-
-	last := sm.lastMissingParentResyncNano.Load()
-	if now-last < int64(missingParentResyncInterval) {
-		return // a recent gap re-request is already in flight
-	}
-
-	if !sm.lastMissingParentResyncNano.CompareAndSwap(last, now) {
-		return
-	}
-
-	sm.logger.Infof("[legacy] block %s missing parent %s during catch-up; re-requesting gap from tip (self-heal)", blockHash, prevHash)
-
-	if err := sm.requestBlocksFromTip(peer); err != nil {
-		sm.logger.Errorf("[legacy] gap re-request failed: %v", err)
-	}
-}
-
 // sendDuringShutdown delivers v on ch, recovering from the "send on closed
 // channel" panic that races teardown. Inv delivery runs on peer read-loop
 // goroutines (OnInv -> QueueInv), but the channels they target are torn down by
@@ -2432,8 +2323,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		headerList:       list.New(),
-		headerHeights:    make(map[chainhash.Hash]int32),
-		dispatched:       make(map[uint32]struct{}),
 		blockSizeTracker: newBlockSizeTracker(10), // track last 10 blocks for rolling average
 		quit:             make(chan struct{}),
 		// feeEstimator:            config.FeeEstimator,
