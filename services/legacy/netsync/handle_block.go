@@ -440,14 +440,6 @@ func (sm *SyncManager) finalizeLoop() {
 	buf := newFinalizeReorderBuffer()
 	buf.setStart(sm.finalizeStartHeight)
 
-	// Watchdog: if a block body for the awaited height is genuinely lost, higher
-	// blocks complete PhaseA and pile up in the buffer while finalization halts.
-	// The pipeline path never trips the stage-1 missing-parent self-heal, so detect
-	// the wedge here and re-request the gap from the tip.
-	detector := &gapStallDetector{timeout: finalizeStallTimeout}
-	ticker := time.NewTicker(finalizeStallCheckInterval)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-sm.quit:
@@ -457,11 +449,6 @@ func (sm *SyncManager) finalizeLoop() {
 				if err := sm.finalizeBlock(ready); err != nil {
 					sm.setFinalizeError(err)
 				}
-			}
-		case <-ticker.C:
-			waiting, started := buf.waitingFor()
-			if detector.observe(waiting, started, buf.len(), time.Now()) {
-				sm.maybeResyncFinalizeGap(waiting)
 			}
 		}
 	}
