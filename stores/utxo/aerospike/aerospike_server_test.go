@@ -1809,8 +1809,8 @@ func TestAerospikeOutpointBatcherDrainMode(t *testing.T) {
 	}
 	for i, in := range singleChild.Inputs {
 		require.NotNil(t, in.PreviousTxScript, "input %d not decorated", i)
-		assert.Len(t, *in.PreviousTxScript, 25)
-		assert.Equal(t, expected[in.PreviousTxOutIndex], in.PreviousTxSatoshis)
+		require.Len(t, *in.PreviousTxScript, 25)
+		require.Equal(t, expected[in.PreviousTxOutIndex], in.PreviousTxSatoshis)
 	}
 
 	// Concurrent path: BatchPreviousOutputsDecorate fans per-tx calls out via
@@ -1832,8 +1832,8 @@ func TestAerospikeOutpointBatcherDrainMode(t *testing.T) {
 	for _, child := range []*bt.Tx{child1, child2, child3} {
 		for i, in := range child.Inputs {
 			require.NotNil(t, in.PreviousTxScript, "input %d not decorated", i)
-			assert.Len(t, *in.PreviousTxScript, 25)
-			assert.Equal(t, expected[in.PreviousTxOutIndex], in.PreviousTxSatoshis,
+			require.Len(t, *in.PreviousTxScript, 25)
+			require.Equal(t, expected[in.PreviousTxOutIndex], in.PreviousTxSatoshis,
 				"wrong satoshis for vout %d", in.PreviousTxOutIndex)
 		}
 	}

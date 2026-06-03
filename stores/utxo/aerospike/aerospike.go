@@ -382,8 +382,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Outpoint sits between the two. Benchmarking the post-#893
 	// BatchPreviousOutputsDecorate fan-out (drain on vs off, see
 	// BenchmarkBatchPreviousOutputsDecorateDrainMode) showed drain mode is
-	// neutral-to-faster in the mean at every tx count, but bimodal/heavy-tailed
-	// at mid tx counts (~64-256) — a node's concurrent decorate path wants
+	// bimodal/heavy-tailed on that concurrent path: at mid tx counts (~64-256)
+	// drain=false is rock-stable while drain=true has an unpredictable mean
+	// (some runs several× slower). A node's concurrent decorate path wants
 	// predictable latency, so it stays default off there. The clean win is the
 	// single-producer, separate-process caller cmd/rewindblockchain, where each
 	// PreviousOutputsDecorate otherwise idles the full 10 ms timer with nothing
