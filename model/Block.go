@@ -839,13 +839,7 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 		err                 error
 	)
 
-	// Measure the subtree-meta fetch+deserialize cost. With the parsed-subtree
-	// cache off (default) this is the legacy-finalize disk re-read time; with it
-	// on (and the subtree served from cache, so the provenance guard matches) it
-	// should collapse — letting the meta re-read be A/B'd from one build.
-	metaStart := time.Now()
 	subtreeMetaSlice, err = b.getSubtreeMetaSlice(ctx, deps.subtreeStore, *subtreeHash, subtree)
-	logger.Infof("[validateSubtree][%s][%s:%d] subtree meta fetched in %s", b.String(), subtreeHash.String(), sIdx, time.Since(metaStart))
 
 	// Attempt regeneration if meta not found and regenerator is available
 	if err != nil && deps.metaRegenerator != nil {
@@ -1194,14 +1188,7 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 	var (
 		sizeInBytes atomic.Uint64
 		txCount     atomic.Uint64
-		cacheHits   atomic.Uint64 // subtrees served from the in-process parsed cache
 	)
-
-	// Measure the subtree fetch+deserialize cost. With the parsed-subtree cache
-	// off (default) this is the legacy-finalize disk re-read time the cache aims
-	// to remove; with it on, cacheHits should approach the subtree count and the
-	// elapsed time should collapse — a direct A/B from one build.
-	readStart := time.Now()
 
 	concurrency := getAndValidateSubtreesConcurrency
 	if concurrency <= 0 {
@@ -1219,34 +1206,6 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 			subtreeHash := subtreeHash
 
 			g.Go(func() error {
-				// In-process parsed-subtree cache fast path: when the store carries
-				// the parsed subtree (populated by the legacy block handler that
-				// just wrote it), use it directly and skip the disk read +
-				// re-deserialize. Falls through to the disk read on a miss, so
-				// correctness never depends on the cache.
-				//
-				// Consensus equivalence: a cached *Subtree is the exact object that
-				// was Serialize()d to the file, so every consensus input (Nodes'
-				// hashes/fees, RootHash, Length, Fees, Meta inpoints) is identical
-				// to a disk re-parse. The ONLY field that differs is Subtree.Size()
-				// (== cap(Nodes)): the cached object's cap is the next power of two,
-				// a disk re-parse's cap is the exact leaf count. That is currently
-				// inert — the only consensus use of Size() is checkDuplicateTransactions'
-				// baseIdx (subtree-0 is power-of-two-full in multi-subtree blocks, and
-				// baseIdx==0 in single-subtree blocks, so the stored indices match
-				// either way) and meta TxInpoints sizing (extra slots are never
-				// indexed). If a future consensus comparison comes to depend on
-				// Size()/cap(Nodes) rather than Length()/Nodes/hashes, re-verify this.
-				if pc, ok := subtreeStore.(ParsedSubtreeCache); ok {
-					if cached, hit := pc.CachedSubtree(*subtreeHash); hit && cached != nil {
-						b.SubtreeSlices[i] = cached
-						sizeInBytes.Add(cached.SizeInBytes)
-						txCount.Add(uint64(cached.Length())) // nolint: gosec
-						cacheHits.Add(1)
-						return nil
-					}
-				}
-
 				// retry to get the subtree from the store 3 times, there are instances when we get an EOF error,
 				// probably when being moved to permanent storage in another service
 				subtree := &subtreepkg.Subtree{}
@@ -1345,12 +1304,6 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 
 	// TODO something with conflicts
 
-	hits := cacheHits.Load()
-	// NB: use b.Hash() (lock-free), NOT b.String() — this runs while
-	// subtreeSlicesMu is held and String() re-acquires it (would self-deadlock).
-	logger.Infof("[GetAndValidateSubtrees][%s] fetched %d subtrees (%d cache, %d disk, %d bytes) in %s",
-		b.Hash().String(), uint64(nrOfSubtrees), hits, uint64(nrOfSubtrees)-hits, sizeInBytes.Load(), time.Since(readStart)) // nolint: gosec
-
 	return nil
 }
 
@@ -1382,18 +1335,6 @@ func (b *Block) GetSubtreeSlicesCount() int {
 }
 
 func (b *Block) getSubtreeMetaSlice(ctx context.Context, subtreeStore SubtreeStore, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree) (*subtreepkg.Meta, error) {
-	// In-process parsed-meta cache fast path. Only used when the cached meta's
-	// provenance matches the subtree being validated (cachedMeta.Subtree ==
-	// subtree, i.e. the same object served from the cache by
-	// GetAndValidateSubtrees), so a cache hit is byte-for-byte equivalent to
-	// deserializing the meta against this subtree. Falls through to the disk
-	// read otherwise.
-	if pc, ok := subtreeStore.(ParsedSubtreeCache); ok {
-		if cachedMeta, hit := pc.CachedSubtreeMeta(subtreeHash); hit && cachedMeta != nil && cachedMeta.Subtree == subtree {
-			return cachedMeta, nil
-		}
-	}
-
 	// get subtree meta
 	subtreeMetaReader, err := subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
 	if err != nil {

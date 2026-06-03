@@ -15,7 +15,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
-	"github.com/bsv-blockchain/teranode/stores/blob/subtreecache"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
@@ -345,17 +344,6 @@ func (d *Stores) GetSubtreeStore(ctx context.Context, logger ulogger.Logger, app
 		options.WithStoreType(storetypes.SUBTREESTORE))
 	if err != nil {
 		return nil, errors.NewServiceError("could not create subtree store", err)
-	}
-
-	// Optionally wrap the shared subtree store with an in-process parsed-subtree
-	// cache. During legacy below-checkpoint catch-up the block handler parses and
-	// writes each subtree, then block finalization (same process, same store
-	// instance) reads them straight back; the cache serves those parsed objects
-	// from memory, skipping the disk re-read + re-deserialize. Transparent to all
-	// other consumers; bounded and best-effort (every miss falls back to disk).
-	if mb := appSettings.Legacy.SubtreeCacheMB; mb > 0 {
-		d.mainSubtreeStore = subtreecache.NewStore(d.mainSubtreeStore, mb*1024*1024)
-		logger.Infof("[GetSubtreeStore] parsed-subtree cache enabled (%d MB)", mb)
 	}
 
 	return d.mainSubtreeStore, nil
