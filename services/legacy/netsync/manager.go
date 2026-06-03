@@ -371,18 +371,6 @@ type SyncManager struct {
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
-	// headerHeights maps a downloaded header's hash to its height, derived purely
-	// from the in-memory, checkpoint-anchored header list during headers-first
-	// sync. It lets the quick-validation block-finalization pipeline determine a
-	// block's height WITHOUT a GetBlockHeader(prevBlock) round-trip to the
-	// blockchain store — a read that needs the parent block already ADDED (a
-	// finalization-pipeline output), which is exactly what forced an earlier
-	// pipeline attempt to serialise behind the previous block finalizing. Written
-	// by handleHeadersMsg (its own goroutine) and read/pruned by the blockQueue
-	// consumer, so all access is guarded by headerHeightsMu.
-	headerHeightsMu sync.RWMutex
-	headerHeights   map[chainhash.Hash]int32
-
 	// satoshiCache is an optional off-heap recency cache of parent-output satoshis,
 	// used only during legacy catch-up in quickValidationMode to resolve transaction
 	// fees without a store read. Lazily created on the first quick-validation block
@@ -445,7 +433,6 @@ func (sm *SyncManager) storeSyncPeer(peer *peerpkg.Peer, state *syncPeerState) {
 func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight int32) {
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
-	sm.resetHeaderHeights()
 	sm.startHeader = nil
 
 	// When there is a next checkpoint, add an entry for the latest known
@@ -1340,11 +1327,6 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		}
 	}
 
-	// Block accepted: prune its header-list height entry so the lookup stays
-	// bounded to the in-flight window. A later reprocess (rare) falls back to the
-	// GetBlockHeader lookup, by which point the parent is finalized.
-	sm.deleteHeaderHeight(bmsg.blockHash)
-
 	// Meta-data about the new block this peer is reporting. We use this
 	// below to update this peer's latest block height and the heights of
 	// other peers based on their last announced block hash. This allows us
@@ -1472,7 +1454,6 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// from the block after this one up to the end of the chain (zero hash).
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
-	sm.resetHeaderHeights()
 	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
 
 	locator := blockchain.BlockLocator([]*chainhash.Hash{&bmsg.blockHash})
@@ -1664,11 +1645,6 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		if prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
 			node.height = prevNode.height + 1
 			e := sm.headerList.PushBack(&node)
-
-			// Record the height so the quick-validation pipeline can derive it
-			// without a GetBlockHeader(prevBlock) round-trip when the block body
-			// later arrives. See deriveBlockHeight.
-			sm.setHeaderHeight(blockHash, node.height)
 
 			if sm.startHeader == nil {
 				sm.startHeader = e
@@ -2412,7 +2388,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		headerList:       list.New(),
-		headerHeights:    make(map[chainhash.Hash]int32),
 		blockSizeTracker: newBlockSizeTracker(10), // track last 10 blocks for rolling average
 		quit:             make(chan struct{}),
 		// feeEstimator:            config.FeeEstimator,

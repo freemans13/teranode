@@ -39,6 +39,12 @@ import (
 func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, msgBlock *wire.MsgBlock) (err error) {
 	sm.logger.Debugf("[HandleBlockDirect][%s] starting handling block", blockHash.String())
 
+	// Make sure we have the correct height for this block before continuing
+	var (
+		blockHeight             uint32
+		previousBlockHeaderMeta *model.BlockHeaderMeta
+	)
+
 	// check whether this block already exists
 	blockExists, err := sm.blockchainClient.GetBlockExists(ctx, &blockHash)
 	if err != nil {
@@ -53,14 +59,38 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 
 	block := bsvutil.NewBlock(msgBlock)
 
-	// Determine this block's height. On the quick-validation pipeline path this
-	// reads the checkpoint-anchored in-memory header list (no GetBlockHeader read,
-	// so it does not depend on the parent block being finalized first); otherwise
-	// it falls back to the original blockchain lookup. Side effect: sets block
-	// height via SetHeight.
-	blockHeight, err := sm.deriveBlockHeight(ctx, block, blockHash)
+	// Lookup previous block height from blockchain
+	_, previousBlockHeaderMeta, err = sm.blockchainClient.GetBlockHeader(ctx, &block.MsgBlock().Header.PrevBlock)
 	if err != nil {
-		return err
+		sm.logger.Errorf("[HandleBlockDirect][%s] failed to get block header for previous block %s: %s", blockHash.String(), block.MsgBlock().Header.PrevBlock, err)
+		return errors.NewProcessingError("failed to get block header for previous block %s", block.MsgBlock().Header.PrevBlock, err)
+	}
+
+	if block.Height() <= 0 {
+		// block height was not set in the msgBlock, set it from our lookup
+		blockHeight = previousBlockHeaderMeta.Height + 1
+
+		blockHeightInt32, err := safeconversion.Uint32ToInt32(blockHeight)
+		if err != nil {
+			return errors.NewProcessingError("failed to convert block height to int32", err)
+		}
+
+		block.SetHeight(blockHeightInt32)
+	} else {
+		// check whether the block height being reported is the correct block height
+		previousBlockHeightInt32, err := safeconversion.Uint32ToInt32(previousBlockHeaderMeta.Height + 1)
+		if err != nil {
+			return errors.NewProcessingError("failed to convert block height to int32", err)
+		}
+
+		if block.Height() != previousBlockHeightInt32 {
+			return errors.NewBlockInvalidError("block height %d is not the correct height for block %s, expected %d", block.Height(), blockHash, previousBlockHeaderMeta.Height+1)
+		}
+
+		blockHeight, err = safeconversion.Int32ToUint32(block.Height())
+		if err != nil {
+			return errors.NewProcessingError("failed to convert block height to uint32", err)
+		}
 	}
 
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "HandleBlockDirect",
