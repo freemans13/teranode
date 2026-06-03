@@ -14,36 +14,24 @@ import (
 // Ensure Store implements the pruner.PrunerServiceProvider interface.
 var _ pruner.PrunerServiceProvider = (*Store)(nil)
 
-var (
-	prunerServiceInstance pruner.Service
-	prunerServiceMutex    sync.Mutex
-)
-
-// ResetPrunerServiceForTests resets the pruner service singleton. Only for
-// tests — the singleton captures a Store reference, so tests that Stop() their
-// store must reset between runs or subsequent tests see a closed pool.
-func ResetPrunerServiceForTests() {
-	prunerServiceMutex.Lock()
-	defer prunerServiceMutex.Unlock()
-	prunerServiceInstance = nil
-}
-
-// GetPrunerService returns a pruner service for the postgres store.
+// GetPrunerService returns a pruner service scoped to this store instance,
+// creating it lazily on first call. The service holds a reference to the store,
+// so keeping it per-instance (rather than a package global) avoids leaking a
+// closed store's pool into a later store with the same process lifetime.
 func (s *Store) GetPrunerService() (pruner.Service, error) {
-	prunerServiceMutex.Lock()
-	defer prunerServiceMutex.Unlock()
+	s.prunerServiceMu.Lock()
+	defer s.prunerServiceMu.Unlock()
 
-	if prunerServiceInstance != nil {
-		return prunerServiceInstance, nil
+	if s.prunerService != nil {
+		return s.prunerService, nil
 	}
 
-	svc := &postgresPrunerService{
+	s.prunerService = &postgresPrunerService{
 		store:  s,
 		logger: s.logger,
 	}
 
-	prunerServiceInstance = svc
-	return prunerServiceInstance, nil
+	return s.prunerService, nil
 }
 
 // postgresPrunerService implements pruner.Service for the postgres store.

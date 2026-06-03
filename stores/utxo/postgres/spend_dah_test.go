@@ -14,11 +14,8 @@ import (
 // Spend path, the pruner is able to reclaim it. Covers both the bulk spend
 // path (bulkSpendSQL) and the interaction with SetMinedMulti's DAH branch.
 func TestMinedThenSpendAllPrunes_Postgres(t *testing.T) {
-	// Pruner service is a process-wide singleton; reset so it binds to THIS
-	// test's Store (otherwise a later test sees a closed pool from setupTestStore's Cleanup).
-	ResetPrunerServiceForTests()
-	t.Cleanup(ResetPrunerServiceForTests)
-
+	// The pruner service is scoped to the Store instance, so each test's store
+	// gets its own — no global reset needed.
 	store, _ := setupTestStore(t)
 
 	// Use a cancellable ctx so the Worker 2 cursor goroutine exits when the test ends.

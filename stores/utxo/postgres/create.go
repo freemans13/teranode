@@ -283,7 +283,6 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	}
 
 	result := s.buildCreateMeta(txMeta, options, isCoinbase, blockHeight)
-	s.cache.Add(*txHash, result)
 	return result, nil
 }
 
@@ -559,7 +558,6 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 			// must return TxExists, matching createDirect's ON CONFLICT semantics.
 			delete(newHashSet, *p.txHash)
 			result := s.buildCreateMeta(p.txMeta, item.options, p.isCoinbase, item.blockHeight)
-			s.cache.Add(*p.txHash, result)
 			item.done <- batchCreateResult{Data: result}
 		} else {
 			item.done <- batchCreateResult{

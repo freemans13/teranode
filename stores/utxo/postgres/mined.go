@@ -147,46 +147,44 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	currentBlockHeight := int64(s.blockHeight.Load())
 
 	for _, hash := range hashes {
-		// Read current arrays.
-		var blockIDs, blockHeights, subtreeIdxs []int32
-		err := s.pool.QueryRow(ctx,
-			`SELECT block_ids, block_heights, subtree_idxs FROM txs WHERE hash = $1`,
-			hash[:],
-		).Scan(&blockIDs, &blockHeights, &subtreeIdxs)
+		// Remove the entry for blockID from the parallel block_ids / block_heights /
+		// subtree_idxs arrays in a SINGLE atomic UPDATE. The previous SELECT-then-
+		// UPDATE left a window where a concurrent SetMinedMulti could append a block
+		// entry between the read and the write-back, silently dropping it on reorg.
+		//
+		// block_ids removal is array_remove by value; the parallel arrays must drop
+		// the SAME positions, done by unnesting block_ids alongside each parallel
+		// array WITH ORDINALITY and re-aggregating the rows whose block_id != blockID.
+		// All SET expressions read the row's pre-update arrays, and a single UPDATE
+		// statement re-evaluates them against the locked (latest) row version, so a
+		// concurrent append is preserved rather than clobbered. RETURNING yields the
+		// post-update block_ids for the result map.
+		var newBlockIDs []int32
+		err := s.pool.QueryRow(ctx, `
+			UPDATE txs t SET
+				block_ids = array_remove(t.block_ids, $2),
+				block_heights = COALESCE((
+					SELECT array_agg(e.bh ORDER BY e.ord)
+					FROM unnest(t.block_ids, t.block_heights) WITH ORDINALITY AS e(bid, bh, ord)
+					WHERE e.bid <> $2
+				), '{}'::int[]),
+				subtree_idxs = COALESCE((
+					SELECT array_agg(e.si ORDER BY e.ord)
+					FROM unnest(t.block_ids, t.subtree_idxs) WITH ORDINALITY AS e(bid, si, ord)
+					WHERE e.bid <> $2
+				), '{}'::int[]),
+				unmined_since = CASE
+					WHEN COALESCE(array_length(array_remove(t.block_ids, $2), 1), 0) = 0
+					THEN $3::bigint ELSE NULL END
+			WHERE t.hash = $1
+			RETURNING t.block_ids`,
+			hash[:], int32(blockID), currentBlockHeight,
+		).Scan(&newBlockIDs)
 		if err != nil {
-			return nil, errors.NewStorageError("[UnsetMined] read arrays for %s: %v", hash, err)
-		}
-
-		// Remove entry at matching index.
-		newBlockIDs := make([]int32, 0, len(blockIDs))
-		newBlockHeights := make([]int32, 0, len(blockHeights))
-		newSubtreeIdxs := make([]int32, 0, len(subtreeIdxs))
-		for i, bid := range blockIDs {
-			if bid == int32(blockID) {
-				continue
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, errors.NewStorageError("[UnsetMined] tx not found for %s", hash)
 			}
-			newBlockIDs = append(newBlockIDs, bid)
-			if i < len(blockHeights) {
-				newBlockHeights = append(newBlockHeights, blockHeights[i])
-			}
-			if i < len(subtreeIdxs) {
-				newSubtreeIdxs = append(newSubtreeIdxs, subtreeIdxs[i])
-			}
-		}
-
-		// Write back. If no block_ids remain, set unmined_since.
-		var unminedSince interface{}
-		if len(newBlockIDs) == 0 {
-			unminedSince = currentBlockHeight
-		}
-
-		_, err = s.pool.Exec(ctx, `
-			UPDATE txs SET block_ids = $2, block_heights = $3, subtree_idxs = $4, unmined_since = $5
-			WHERE hash = $1`,
-			hash[:], newBlockIDs, newBlockHeights, newSubtreeIdxs, unminedSince,
-		)
-		if err != nil {
-			return nil, errors.NewStorageError("[UnsetMined] UPDATE arrays for %s: %v", hash, err)
+			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s: %v", hash, err)
 		}
 
 		// Build result.

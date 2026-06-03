@@ -9,10 +9,9 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-batcher/v2"
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/batchermetrics"
 	"github.com/bsv-blockchain/teranode/util/tracing"
@@ -21,47 +20,6 @@ import (
 )
 
 var _ utxo.Store = (*Store)(nil)
-
-const txCacheMaxSize = 100_000
-
-// txCache is a simple bounded in-process cache for recently created transactions.
-type txCache struct {
-	mu      sync.RWMutex
-	entries map[chainhash.Hash]*meta.Data
-	maxSize int
-}
-
-func newTxCache(maxSize int) *txCache {
-	return &txCache{
-		entries: make(map[chainhash.Hash]*meta.Data, maxSize),
-		maxSize: maxSize,
-	}
-}
-
-func (c *txCache) Get(hash chainhash.Hash) *meta.Data {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.entries[hash]
-}
-
-func (c *txCache) Add(hash chainhash.Hash, data *meta.Data) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	// Evict randomly when full (simple strategy — LRU not needed for this use case).
-	if len(c.entries) >= c.maxSize {
-		for k := range c.entries {
-			delete(c.entries, k)
-			break
-		}
-	}
-	c.entries[hash] = data
-}
-
-func (c *txCache) Remove(hash chainhash.Hash) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.entries, hash)
-}
 
 // Store implements the utxo.Store interface using direct writes to
 // append-only PostgreSQL tables with optional batching for throughput.
@@ -89,8 +47,9 @@ type Store struct {
 	// achieved batch-size instrumentation (items/batches per batcher).
 	batchStats batchSizeStats
 
-	// in-process cache for recently created transactions.
-	cache *txCache
+	// pruner service — lazily created per store instance (not a package global).
+	prunerService   pruner.Service
+	prunerServiceMu sync.Mutex
 }
 
 // batchSizeStats accumulates the real (post-trigger) batch sizes each batcher
@@ -158,7 +117,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		storeURL: storeURL,
 		pool:     pool,
 		db:       db,
-		cache:    newTxCache(txCacheMaxSize),
 	}
 
 	if err := s.createSchema(ctx); err != nil {

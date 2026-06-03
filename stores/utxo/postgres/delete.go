@@ -29,9 +29,6 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 		}
 	}
 
-	// Evict from cache.
-	s.cache.Remove(*hash)
-
 	return pgxTx.Commit(ctx)
 }
 
