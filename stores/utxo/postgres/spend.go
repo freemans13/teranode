@@ -270,6 +270,8 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 // ---------------------------------------------------------------------------
 
 func (s *Store) sendSpendBatch(batch []*batchSpendItem) {
+	s.batchStats.spendItems.Add(int64(len(batch)))
+	s.batchStats.spendBatches.Add(1)
 	// Reject later same-outpoint spend claims with different spending data in
 	// memory before the batch reaches the DB, exactly as the aerospike
 	// (sendSpendBatchLua) and sql stores do. Two concurrent spends of the same

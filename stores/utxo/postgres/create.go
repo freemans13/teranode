@@ -292,6 +292,8 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 // ---------------------------------------------------------------------------
 
 func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
+	s.batchStats.createItems.Add(int64(len(batch)))
+	s.batchStats.createBatches.Add(1)
 	ctx := context.Background()
 
 	// Single-item: the direct INSERT path handles every option (mined,

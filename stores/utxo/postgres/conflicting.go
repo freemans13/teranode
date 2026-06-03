@@ -160,6 +160,8 @@ type batchUnlockItem struct {
 
 // sendUnlockBatch pipelines N UPDATE queries via SendBatch.
 func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
+	s.batchStats.unlockItems.Add(int64(len(batch)))
+	s.batchStats.unlockBatches.Add(1)
 	ctx := context.Background()
 
 	// Single-item fast path: direct query.

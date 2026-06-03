@@ -67,6 +67,8 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 
 // sendGetBatch pipelines N SELECT queries via SendBatch.
 func (s *Store) sendGetBatch(batch []*batchGetItem) {
+	s.batchStats.getItems.Add(int64(len(batch)))
+	s.batchStats.getBatches.Add(1)
 	ctx := context.Background()
 
 	// Single-item fast path: direct query, no SendBatch overhead.
