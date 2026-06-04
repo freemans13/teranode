@@ -48,7 +48,6 @@ The `teranode-cli` is recommended for scripting and automation. It provides a co
 ### Docker Compose Environment
 
 #### 1. Check Current State
-
 ```bash
 docker exec -it blockchain teranode-cli getfsmstate
 ```

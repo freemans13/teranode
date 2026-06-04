@@ -7,7 +7,6 @@ The `filereader` package provides utilities for reading and processing blockchai
 This package is typically used as a command-line tool to read and process blockchain files for debugging, analysis, or integration with other services.
 
 ## Features
-
 - Read and process blockchain files
 - Extract transactions and metadata
 - Validate and transform data
@@ -20,3 +19,4 @@ This package is typically used as a command-line tool to read and process blockc
 ---
 
 For more information, see the main project documentation.
+

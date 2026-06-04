@@ -35,29 +35,24 @@
 ## Configuration Dependencies
 
 ### Cache Processing
-
 - `ProcessTxMetaUsingCacheBatchSize`, `ProcessTxMetaUsingCacheConcurrency`, and `ProcessTxMetaUsingCacheMissingTxThreshold` work together
 - Controls cache-based transaction metadata processing performance
 
 ### Missing Transaction Handling
-
 - When `BatchMissingTransactions = true`, uses `MissingTransactionsBatchSize` and `GetMissingTransactions`
 - `PercentageMissingGetFullData` determines full subtree vs individual transaction fetching
 
 ### Concurrency Control
-
 - `CheckBlockSubtreesConcurrency` controls block subtree checking operations
 - `SpendBatcherSize` controls spend operation batch processing and concurrency limits
 - `GetMissingTransactions` controls missing transaction retrieval concurrency
 - `TxBatchSize` controls transaction batching for CheckBlockSubtrees (0 disables batching)
 
 ### Algorithm Optimization
-
 - `UseOrderedLevelAlgorithm` enables optimized O(V*I) algorithm assuming transactions are ordered
 - When true, improves performance for ordered transaction processing
 
 ### gRPC Server Management
-
 - When `GRPCListenAddress` is not empty, gRPC server starts and health checks are enabled
 
 ## Service Dependencies

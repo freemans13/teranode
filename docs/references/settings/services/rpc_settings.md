@@ -21,24 +21,20 @@
 ## Configuration Dependencies
 
 ### Authentication System
-
 - `RPCUser` and `RPCPass` provide full access to all RPC commands
 - `RPCLimitUser` and `RPCLimitPass` provide limited access to subset of commands
 - Two-tier authentication system with different access levels
 
 ### Response Caching
-
 - When `CacheEnabled = true`, caches responses for getbestblockhash, getpeerinfo, getblockchaininfo, getinfo, and getchaintips
 - Improves performance for frequently accessed data
 
 ### Timeout Management
-
 - `RPCTimeout` controls overall RPC call duration with context timeout
 - `ClientCallTimeout` controls calls to P2P and Legacy services
 - Prevents hung requests and service calls
 
 ### Network Binding
-
 - `RPCListenerURL` determines server binding interface and port
 - `RPCMaxClients` limits concurrent connections
 

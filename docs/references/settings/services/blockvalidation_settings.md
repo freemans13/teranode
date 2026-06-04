@@ -101,17 +101,14 @@ For checkpoint-verified blocks, a fan-in pipeline overlaps I/O with processing:
   3. **Processor**: Creates/spends UTXOs and writes files in parallel per batch
 
 ### Transaction Metadata Processing
-
 - Cache and store processing work together with threshold-based fallback
 - Batch sizes and concurrency settings control performance
 
 ### Secret Mining Detection
-
 - `SecretMiningThreshold` uses `PreviousBlockHeaderCount` for analysis
 - Detection triggers when block difference exceeds threshold
 
 ### Two-Phase Double-Spend Detection
-
 - `RecentBlockIDsLimit` controls the size of the fast-path in-memory block ID window
 - Transactions mined in blocks within this window are detected immediately (fast path)
 - Transactions mined in older blocks trigger a blockchain service query (slow path)
@@ -119,7 +116,6 @@ For checkpoint-verified blocks, a fan-in pipeline overlaps I/O with processing:
 - Default of 50,000 covers approximately 347 days of blocks at 10-minute intervals
 
 ### Channel Buffer Management
-
 - `BlockFoundChBufferSize` and `CatchupChBufferSize` must accommodate processing loads
 
 ## Service Dependencies

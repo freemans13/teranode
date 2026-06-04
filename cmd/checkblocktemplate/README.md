@@ -7,7 +7,6 @@ The `checkblocktemplate` package provides functionality for validating block tem
 This package is typically used for developing and testing block templates in a blockchain environment.
 
 ## Features
-
 - Fetch block templates from the block assembly service
 - Validate block templates using the block validation service
 - Ensure block templates are ready for use in the blockchain

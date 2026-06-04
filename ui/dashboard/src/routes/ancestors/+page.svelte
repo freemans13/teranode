@@ -32,11 +32,11 @@
   let fetchedPeers: Set<string> = new Set()
 
   const connected = $derived($sock !== null)
-
+  
   // Update table data
   function updateData() {
     const nodes: any[] = []
-
+    
     // Only process if we have real peer data
     if ($miningNodes && Object.keys($miningNodes).length > 0) {
       Object.values($miningNodes).forEach((node) => {
@@ -56,7 +56,7 @@
         const key = node.peer_id
         node.chainwork_score = chainworkScores.get(key) || 0
         node.isCurrentNode = node.peer_id === currentPeerID
-
+        
         // For current node, immediately populate with its best hash
         if (node.isCurrentNode) {
           node.common_block_hash = node.best_block_hash || ''
@@ -91,25 +91,25 @@
 
     data = sorted
   }
-
+  
   // Fetch block locator from backend
   async function fetchBlockLocator() {
     isLoadingLocator = true
-
+    
     try {
       // In dev, use proxy; in production, call asset server directly
-      const url = dev
+      const url = dev 
         ? '/api/blockchain/locator'  // Proxy in development
         : '/api/v1/block_locator'     // Direct in production
-
+        
       const response = await fetch(url)
-
+      
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
-
+      
       const data = await response.json()
-
+      
       if (data.block_locator && Array.isArray(data.block_locator)) {
         blockLocator = data.block_locator
       } else if (Array.isArray(data)) {
@@ -124,29 +124,29 @@
       isLoadingLocator = false
     }
   }
-
+  
   // Refresh everything - block locator, peer data, and common ancestors
   async function refreshAll() {
     // Clear the fetched peers set to re-fetch all
     fetchedPeers.clear()
-
+    
     // Update peer data first
     updateData()
-
+    
     // Fetch fresh block locator
     await fetchBlockLocator()
-
+    
     // Find common ancestors
     if (blockLocator.length > 0 && data.length > 0) {
       await findCommonAncestors()
     }
   }
-
+  
   // Helper function to create a fetch with timeout
   async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs: number = 10000) {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
-
+    
     try {
       const response = await fetch(url, {
         ...options,
@@ -162,19 +162,19 @@
       throw error
     }
   }
-
+  
   // Fetch common ancestor for a single peer
   async function fetchAncestorForPeer(peer: any, index: number) {
     if (!blockLocator.length) {
       return
     }
-
+    
     // Mark this peer as fetched
     fetchedPeers.add(peer.peer_id)
-
+    
     // Create block locator hashes string (concatenated without separators)
     const blockLocatorHashesStr = blockLocator.join('')
-
+    
     // Skip ourselves - use our best hash as the common ancestor
     if (peer.isCurrentNode) {
       peer.common_block_hash = peer.best_block_hash || ''
@@ -184,10 +184,10 @@
       data = [...data]
       return
     }
-
+    
     // Use base_url instead of data_hub_url (that's what comes from the WebSocket)
     const dataHubUrl = peer.base_url || peer.data_hub_url
-
+    
     // Debug: uncomment to see peer data
     // console.log(`Processing peer ${peer.peer_id}:`, {
     //   base_url: peer.base_url,
@@ -197,7 +197,7 @@
     //   best_height: peer.best_height,
     //   isCurrentNode: peer.isCurrentNode
     // })
-
+    
     if (!peer.best_block_hash) {
       peer.common_block_hash = 'No best hash'
       peer.common_block_height = null
@@ -206,7 +206,7 @@
       data = [...data]
       return
     }
-
+    
     if (!dataHubUrl) {
       peer.common_block_hash = 'No DataHub URL'
       peer.common_block_height = null
@@ -215,19 +215,19 @@
       data = [...data]
       return
     }
-
+    
     try {
       // Call the peer's DataHub directly (CORS is enabled on all nodes)
       // base_url already includes /api/v1
       const targetUrl = `${dataHubUrl}/headers_from_common_ancestor/${peer.best_block_hash}/json?block_locator_hashes=${blockLocatorHashesStr}&n=1`
-
+      
       // Debug: uncomment to see request details
       // console.log(`Calling peer ${peer.peer_id} directly:`, {
       //   targetUrl: targetUrl,
       //   blockLocatorLength: blockLocator.length,
       //   blockLocatorHashesLength: blockLocatorHashesStr.length
       // })
-
+      
       // Use fetchWithTimeout with 10-second timeout
       const response = await fetchWithTimeout(targetUrl, {
         method: 'GET',
@@ -235,18 +235,18 @@
           'Accept': 'application/json',
         },
       }, 10000)
-
+      
       if (!response.ok) {
         const errorText = await response.text()
-
+        
         // Check if it's a 404 due to no common block found
         if (response.status === 404) {
           try {
             const errorData = JSON.parse(errorText)
             // Check for error message in the response
             const errorMessage = errorData.error || errorData.message || ''
-            if (errorMessage.includes('BLOCK_NOT_FOUND') ||
-                errorMessage.includes('not found') ||
+            if (errorMessage.includes('BLOCK_NOT_FOUND') || 
+                errorMessage.includes('not found') || 
                 errorMessage.includes('Not Found')) {
               // This is expected when no common ancestor is found
               peer.common_block_hash = 'No common block'
@@ -266,7 +266,7 @@
             return
           }
         }
-
+          
         // Debug: uncomment to see error details
         // console.error(`Request failed for peer ${peer.peer_id}:`, {
         //   status: response.status,
@@ -276,9 +276,9 @@
         // })
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
-
+        
       const headers = await response.json()
-
+      
       if (headers && headers.length > 0) {
         // The first header is the common ancestor
         const commonAncestor = headers[0]
@@ -286,7 +286,7 @@
         peer.common_block_height = commonAncestor.height || null
         peer.common_block_miner = commonAncestor.miner || ''
         ancestorData.set(peer.peer_id, {
-          hash: commonAncestor.hash || '',
+          hash: commonAncestor.hash || '', 
           height: commonAncestor.height || null,
           miner: commonAncestor.miner || ''
         })
@@ -299,7 +299,7 @@
     } catch (error) {
       // Debug: uncomment to see error details
       // console.error(`Error finding common ancestor with peer ${peer.peer_id}:`, error)
-
+      
       // Check if it's a timeout error
       if (error instanceof Error && error.message === 'Timeout') {
         ancestorErrors.set(peer.peer_id, 'Timeout after 10 seconds')
@@ -313,32 +313,32 @@
         ancestorData.set(peer.peer_id, {hash: 'Error', height: null})
       }
     }
-
+      
     // Update the specific row in the data array to trigger reactive update
     data[index] = { ...peer }
     data = [...data]
   }
-
+  
   // Find common ancestors with all peers
   async function findCommonAncestors() {
     if (!blockLocator.length || !data.length) {
       return
     }
-
+    
     findingAncestors = true
     ancestorErrors.clear()
-
+    
     // Process all peers concurrently using Promise.allSettled
-    const promises = data.map((peer, index) =>
+    const promises = data.map((peer, index) => 
       fetchAncestorForPeer(peer, index)
     )
-
+    
     // Wait for all promises to complete (whether they succeed or fail)
     await Promise.allSettled(promises)
-
+    
     findingAncestors = false
   }
-
+  
   // Column definitions for the table
   function getColDefs() {
     return [
@@ -392,7 +392,7 @@
       },
     ]
   }
-
+  
   const colDefs = $derived(getColDefs())
 
   // Custom render functions using RenderSpan component
@@ -402,10 +402,10 @@
       const url = item.base_url || '-'
       const peerId = item.peer_id || '-'
       const isCurrentNode = item.isCurrentNode === true
-
+      
       // Build tooltip with base URL and peer ID
       const tooltip = `${url}\n${peerId}`
-
+      
       return {
         component: RenderSpanWithTooltip,
         props: {
@@ -420,13 +420,13 @@
       const value = item[colId]
       const shortHash = value ? (value.length > 16 ? `${value.slice(0, 8)}...${value.slice(-8)}` : value) : ''
       let miner = item.miner_name || ''
-
+      
       // Fallback to miner cache if not available
       if (!miner && value) {
         const minerCache = get(blockHashToMiner)
         miner = minerCache.get(value) || ''
       }
-
+      
       return {
         component: value ? RenderHashWithMiner : null,
         props: {
@@ -465,7 +465,7 @@
     },
     common_block_hash: (idField, item, colId) => {
       const value = item[colId]
-
+      
       // Handle special cases (errors, no common block, timeout)
       if (value === 'Error' || value === 'Timeout' || value === 'No common block' || value === 'No DataHub URL' || value === 'No best hash') {
         return {
@@ -477,17 +477,17 @@
           value: '',
         }
       }
-
+      
       // Handle normal hash display
       const shortHash = value ? (value.length > 16 ? `${value.slice(0, 8)}...${value.slice(-8)}` : value) : ''
       let miner = item.common_block_miner || ''
-
+      
       // Fallback to miner cache if not available
       if (!miner && value) {
         const minerCache = get(blockHashToMiner)
         miner = minerCache.get(value) || ''
       }
-
+      
       return {
         component: value ? RenderHashWithMiner : null,
         props: {
@@ -505,7 +505,7 @@
     common_block_height: (idField, item, colId) => {
       const value = item[colId]
       const hashValue = item.common_block_hash
-
+      
       // Don't show height if there was an error, timeout, or no common block
       if (hashValue === 'Error' || hashValue === 'Timeout' || hashValue === 'No common block') {
         return {
@@ -517,7 +517,7 @@
           value: '',
         }
       }
-
+      
       return {
         component: RenderSpan,
         props: {
@@ -550,7 +550,7 @@
       }
     },
   }
-
+  
   // React to p2pStore changes - table stays reactive.
   // updateData() reads $miningNodes and writes `data`; tracking only the store
   // (untracking the read/write of `data` inside) avoids a runes update loop.
@@ -681,77 +681,77 @@
     align-items: center;
     gap: 8px;
   }
-
+  
   /* Custom styles for table cells */
   :global(.current-node-name) {
     color: #4a9eff !important;
     font-weight: bold;
   }
-
+  
   /* Right-align numeric columns */
   :global(.num) {
     text-align: right !important;
     display: block !important;
     width: 100% !important;
   }
-
+  
   :global(.chainwork-score-top.num),
   :global(.chainwork-score-other.num) {
     text-align: right !important;
   }
-
+  
   /* Right-align numeric column headers */
   :global(th:nth-child(2)), /* Best Height */
   :global(th:nth-child(4)), /* Chainwork */
   :global(th:nth-child(6)) { /* Common Height */
     text-align: right !important;
   }
-
+  
   :global(th:nth-child(2) .table-cell-row),
   :global(th:nth-child(4) .table-cell-row),
   :global(th:nth-child(6) .table-cell-row) {
     justify-content: flex-end !important;
   }
-
+  
   :global(.hash) {
     font-family: 'JetBrains Mono', monospace;
     font-size: 12px;
     color: var(--comp-label-color);
   }
-
+  
   :global(.url) {
     font-size: 12px;
     color: var(--comp-label-color);
     word-break: break-all;
   }
-
+  
   :global(.muted) {
     color: var(--comp-label-color);
   }
-
+  
   :global(.error-text) {
     color: #ff6b6b;
   }
-
+  
   :global(.warning-text) {
     color: #ffa500;
   }
-
+  
   /* Chainwork score coloring - same as network tab */
   :global(.chainwork-score-top) {
     color: #4caf50 !important;
     font-weight: bold;
   }
-
+  
   :global(.chainwork-score-other) {
     color: var(--comp-label-color);
   }
-
+  
   :global(.num) {
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
-
+  
   .no-data {
     display: flex;
     flex-direction: column;
@@ -760,13 +760,13 @@
     padding: 60px 20px;
     gap: 12px;
   }
-
+  
   .no-data p {
     margin: 0;
     color: var(--comp-label-color);
     font-size: 16px;
   }
-
+  
   .no-data p.sub {
     color: var(--comp-label-color);
     font-size: 14px;

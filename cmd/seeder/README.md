@@ -7,7 +7,6 @@ The `seeder` package is a command-line tool designed to process blockchain heade
 This package is typically used to process blockchain data from specified input files and store the results in appropriate stores.
 
 ### Features
-
 - Process UTXO headers and sets
 - Store processed data in configurable storage backends (PostgreSQL, SQLite, or Aerospike based on settings)
 - Handle system signals for graceful termination

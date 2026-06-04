@@ -183,7 +183,7 @@
               </div>
             {/if}
             <span class="amount">{`${formatSatoshi(output.satoshis)} BSV`}</span>
-
+            
             <button
               class="view-toggle"
               onclick={() => toggleOutputView(i)}
@@ -191,7 +191,7 @@
             >
               {viewMode === 'default' ? 'Show Script' : viewMode === 'asm' ? 'Show Hex' : 'Show Default'}
             </button>
-
+            
             {#if viewMode === 'asm'}
               <div class="script-asm">{scriptToAsm(output.lockingScript)}</div>
             {:else if viewMode === 'hex'}

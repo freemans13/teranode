@@ -48,11 +48,11 @@
       handleClose()
     }
   }
-
+  
   function toggleSubtrees() {
     subtreesExpanded = !subtreesExpanded
   }
-
+  
   function goToPage(page: number) {
     if (page >= 1 && page <= totalPages) {
       subtreesPage = page
@@ -84,7 +84,7 @@
         <h2>Block Assembly Details</h2>
         <button class="close-btn" onclick={handleClose}>×</button>
       </div>
-
+      
       <div class="node-info">
         <span class="node-label">Node:</span>
         <span class="node-value">{nodeUrl}</span>
@@ -114,8 +114,8 @@
         <div class="detail-item full-width">
           <span class="label">Current Hash:</span>
           {#if blockAssembly.currentHash}
-            <a
-              href="/viewer/block?hash={blockAssembly.currentHash}"
+            <a 
+              href="/viewer/block?hash={blockAssembly.currentHash}" 
               class="value hash-link"
               target="_blank"
               rel="noopener noreferrer"
@@ -135,15 +135,15 @@
                 <span class="label">Subtrees ({formatNum(blockAssembly.subtrees.length)})</span>
               </button>
             </div>
-
+            
             {#if subtreesExpanded}
               <div class="subtrees-container">
                 <div class="subtrees-list">
                   {#each paginatedSubtrees as subtree, index}
                     <div class="subtree-item">
                       <span class="subtree-index">{startIndex + index}.</span>
-                      <a
-                        href="/viewer/subtree/?hash={subtree}"
+                      <a 
+                        href="/viewer/subtree/?hash={subtree}" 
                         class="subtree-hash-link"
                         target="_blank"
                         rel="noopener noreferrer"
@@ -153,23 +153,23 @@
                     </div>
                   {/each}
                 </div>
-
+                
                 {#if totalPages > 1}
                   <div class="pagination">
-                    <button
+                    <button 
                       class="page-btn"
                       onclick={() => goToPage(subtreesPage - 1)}
                       disabled={subtreesPage === 1}
                     >
                       ←
                     </button>
-
+                    
                     <span class="page-info">
-                      Page {subtreesPage} of {totalPages}
+                      Page {subtreesPage} of {totalPages} 
                       <span class="page-range">({startIndex}-{endIndex} of {totalSubtrees})</span>
                     </span>
-
-                    <button
+                    
+                    <button 
                       class="page-btn"
                       onclick={() => goToPage(subtreesPage + 1)}
                       disabled={subtreesPage === totalPages}

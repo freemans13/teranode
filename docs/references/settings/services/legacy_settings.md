@@ -38,12 +38,10 @@
 - `SavePeers` controls peer information persistence to disk
 
 ### Batch Processing Performance
-
 - Batch sizes and concurrency settings work together for memory and performance control
 - `StoreBatcherSize` * `StoreBatcherConcurrency` limits concurrent requests
 
 ### Peer Timeout Management
-
 - `PeerIdleTimeout` set to 125s to accommodate 2-minute ping/pong intervals
 - `PeerProcessingTimeout` set to 3m for block processing (largest operations)
 

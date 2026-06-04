@@ -682,16 +682,16 @@
     display: inline;
     width: auto;
   }
-
+  
   .tr.current-node-row {
     background-color: rgba(74, 158, 255, 0.25) !important;
     box-shadow: 0 0 0 1px rgba(74, 158, 255, 0.3) !important;
   }
-
+  
   .tr.current-node-row .td:first-child {
     position: relative;
   }
-
+  
   .tr.current-node-row .td:first-child::before {
     content: '';
     position: absolute;

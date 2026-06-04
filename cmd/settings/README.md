@@ -7,7 +7,6 @@ The `settings` package provides utilities for displaying application settings. I
 This package is typically used to print application settings in JSON format, along with version and commit information, for debugging and documentation purposes.
 
 ## Features
-
 - Print application settings in a structured JSON format
 - Display version and commit metadata
 
@@ -19,3 +18,4 @@ This package is typically used to print application settings in JSON format, alo
 ---
 
 For more information, see the main project documentation.
+

@@ -28,28 +28,23 @@
 ## Configuration Dependencies
 
 ### gRPC Server Management
-
 - Service only starts if `GRPCListenAddress` is not empty
 - Health checks are conditional on gRPC server configuration
 
 ### HTTP Server Management
-
 - HTTP server only starts if `HTTPListenAddress` is not empty
 - Rate limiting applied when HTTP server is enabled
 - Uses `HTTPRateLimit` for middleware configuration
 
 ### Debug Logging
-
 - When `VerboseDebug = true`, provides detailed logging for validation operations
 - Controls logging in block assembly interactions
 
 ### Batch Processing
-
 - `SendBatchSize`, `SendBatchTimeout`, and `SendBatchWorkers` work together
 - Controls transaction batch processing performance
 
 ### Block Validation Retry Logic
-
 - `BlockValidationMaxRetries`, `BlockValidationRetrySleep`, and `BlockValidationDelay` control resilience
 - Manages block validation failure recovery
 

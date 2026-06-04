@@ -7,7 +7,6 @@ The `utxopersister` package provides the implementation for persisting UTXO (Uns
 This package is typically used as a service to persist UTXO data from a blockchain source into a storage backend, such as a blob store or a direct blockchain store. It supports both direct blockchain store interactions and blockchain client-based operations, depending on the configuration.
 
 ## Features
-
 - Persist UTXO data efficiently
 - Support for blob stores and direct blockchain stores
 - Includes tracing and optional HTTP profiling servers

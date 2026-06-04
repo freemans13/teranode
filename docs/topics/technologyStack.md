@@ -97,7 +97,7 @@ Teranode employs various storage technologies, each selected for its specific st
      - Used for block and transaction persistence in distributed deployments
      - Lustre file systems (provided via S3-backed shared volumes) offer high-throughput storage solution, and it is a recommended shared storage option
 
----
+------
 
 ## Kafka
 
@@ -109,7 +109,7 @@ Teranode employs various storage technologies, each selected for its specific st
 
 2. **High Availability**: Kafka’s fault tolerance and replication ensure that event streams are durable and highly available, which is essential for the integrity of a distributed system like Teranode.
 
----
+------
 
 ## Containerization & Orchestration
 

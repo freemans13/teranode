@@ -7,7 +7,6 @@ The `aerospikereader` package provides utilities for reading and displaying reco
 This package is typically used as a command-line tool to fetch and print UTXO records and their associated block information from an Aerospike database, using the provided settings.
 
 ## Features
-
 - Read and print UTXO records by transaction ID
 - Display associated block information
 - Useful for debugging and data inspection
@@ -20,3 +19,4 @@ This package is typically used as a command-line tool to fetch and print UTXO re
 ---
 
 For more information, see the main project documentation.
+
