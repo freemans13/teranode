@@ -63,8 +63,14 @@ type PrunedTxSet struct {
 	perShardCap    uint // capacity of each generation in each shard
 	insertFailures atomic.Int64
 	rotations      atomic.Int64 // number of generation rotations across all shards
-	capacity       int64
 }
+
+// minPerShardCap is the floor applied to each generation's capacity. Without
+// it, a maxEntries smaller than 2×shardCount would drive perShard to 0, which
+// cuckoo.NewH32 rounds up to a single 4-slot bucket — saturating (and so
+// rotating) every few inserts. The floor keeps a degenerate config functional
+// at negligible cost (~1 KiB per generation).
+const minPerShardCap uint = 1024
 
 type prunedTxShard struct {
 	current  atomic.Pointer[cuckoo.H32]
@@ -103,12 +109,14 @@ func NewPrunedTxSet(shardCount int, maxEntries int) *PrunedTxSet {
 	// hard ceiling on RSS; the worst-case allocation overhead is bounded
 	// by the power-of-two rounding.
 	perShard := uint(maxEntries / n / 2)
+	if perShard < minPerShardCap {
+		perShard = minPerShardCap
+	}
 
 	s := &PrunedTxSet{
 		shards:      make([]prunedTxShard, n),
 		mask:        uint8(n - 1),
 		perShardCap: perShard,
-		capacity:    int64(maxEntries),
 	}
 	for i := range s.shards {
 		s.shards[i].current.Store(cuckoo.NewH32(perShard))
