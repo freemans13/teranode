@@ -9,7 +9,7 @@ import (
 )
 
 func runConfigChecks(s *settings.Settings) []ConfigResult {
-	results := make([]ConfigResult, 0, 16) //nolint:prealloc
+	var results []ConfigResult
 
 	results = append(results, checkContext(s))
 	results = append(results, checkNetwork(s))

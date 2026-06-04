@@ -311,7 +311,7 @@ func (bc *BlockCreator) serializeBlockHeader(header *BlockHeader) []byte {
 
 // serializeBlock serializes a complete block (header + transactions) to hex string
 func (bc *BlockCreator) serializeBlock(header *BlockHeader, txs []*bt.Tx) string {
-	buf := make([]byte, 0, 256) //nolint:prealloc
+	var buf []byte
 
 	// Serialize header
 	buf = append(buf, bc.serializeBlockHeader(header)...)

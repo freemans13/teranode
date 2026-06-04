@@ -34,7 +34,7 @@ type serviceClients struct {
 }
 
 func runHealthChecks(ctx context.Context, logger ulogger.Logger, s *settings.Settings) []HealthResult {
-	results := make([]HealthResult, 0, 8) //nolint:prealloc
+	var results []HealthResult
 
 	// Create reusable clients
 	clients := createClients(ctx, logger, s)
