@@ -321,11 +321,22 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				}
 
 				// Adaptive-fetch gate: when optimistic, skip subtreeData entirely.
-				// The subtree's txs are already in the local UTXO store via propagation,
-				// so downstream processTransactionsInLevels processes 0 new transactions
-				// from this subtree (subtreeTxs[subtreeIdx] stays nil). If a tx is
-				// genuinely missing, downstream validation will surface it via the
-				// existing processMissingTransactions fallback in SubtreeValidation.go.
+				//
+				// What this skip is: the work below is only a prewarm. It bulk-loads
+				// the subtree's txs from subtreeData so the real validation step
+				// (ValidateSubtreeInternal, run for every subtree further down) finds
+				// them already cached. Skipping it leaves subtreeTxs[subtreeIdx] nil,
+				// so the bulk processTransactionsInLevels does nothing for this subtree.
+				//
+				// What this skip is NOT: it does not skip validation. Every subtree
+				// still goes through ValidateSubtreeInternal below, which checks the
+				// UTXO store for each tx and fetches anything genuinely missing from
+				// peers on demand (getSubtreeMissingTxs → processMissingTransactions).
+				// So if the optimistic assumption is wrong — a tx was not delivered by
+				// propagation — that tx is still recovered and validated normally. The
+				// only cost of a wrong guess is bandwidth (the tx is fetched during
+				// validation instead of being prewarmed here); correctness and data
+				// integrity are never at risk.
 				//
 				// Capture the live mode (not just the boolean) so the
 				// observation we record below can be tagged with the mode
@@ -419,27 +430,26 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 				// Record a synthetic observation for the adaptive-fetch state machine.
 				//
-				// Neither mode currently measures real hit rate at this layer:
-				// pessimistic-mode observations stamp LocalHits=TotalTxs,
-				// optimistic-mode observations stamp MissingFetches=0. The Pess→Opt
-				// transition therefore fires after WindowSize consecutive subtrees
-				// have been processed (a "wait then try" gate, not a measurement).
-				// The Opt→Pess transition cannot fire from observations today:
-				// adaptivefetch.maybeTransition() only inspects the values
-				// passed to Record/RecordIfMode, and we stamp MissingFetches=0
-				// here. Downstream processTransactionsInLevels may surface a
-				// validation error that fails the block, but that failure is
-				// not fed back into adaptivefetch, so the state machine does
-				// not self-correct from validation failures either. Until
-				// real MissingFetches plumbing lands here, recovery from a
-				// degraded optimistic deployment requires the operator to
-				// change adaptive_fetch_bootstrap_mode to "pessimistic" (or
-				// "auto") and restart — a plain restart with bootstrap_mode
-				// pinned to "optimistic" will come back up optimistic. A
-				// future improvement would plumb real UTXO hit counts and
-				// processMissingTransactions recovery counts through this
-				// path so the state machine can self-correct without a
-				// restart or config change.
+				// We don't measure real hit rate here — every subtree is stamped
+				// LocalHits=TotalTxs, MissingFetches=0. So the Pess→Opt switch is
+				// really just a warm-up timer: after WindowSize subtrees, the node
+				// tries optimistic. It is not a measurement of how local the txs
+				// actually were.
+				//
+				// Because MissingFetches is always 0, the automatic Opt→Pess switch
+				// never fires from this service. What that does and does not mean:
+				//   - It does NOT mean a wrong optimistic guess is dangerous. The
+				//     real validation downstream (see the prewarm note above) still
+				//     recovers any missing txs, so correctness is never at stake — a
+				//     bad guess just costs bandwidth.
+				//   - It DOES mean the mode gauge can stay stuck on "optimistic" even
+				//     while the node is quietly paying that bandwidth. The metric
+				//     under-reports; the node keeps working correctly.
+				// An operator who wants to force bulk-prewarming back on can set
+				// adaptive_fetch_bootstrap_mode to "pessimistic" and restart, but
+				// this is a tuning choice, not a recovery step. A future improvement
+				// is to feed real UTXO-hit and recovery counts in here so the
+				// Opt→Pess switch trips on its own.
 				txCount := subtreeToCheck.Length()
 				if txCount > 0 {
 					// Tag the observation with the mode we sampled before

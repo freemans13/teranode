@@ -212,6 +212,16 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 			// Fetch subtree data for this block — adaptive-fetch state may skip it
 			// entirely when the node is receiving txs via a distributor.
 			//
+			// What the skip actually costs: this fetch is only a prewarm. It
+			// pulls subtreeData ahead of time so the later block-validation step
+			// finds everything already in the store. Skipping it does NOT skip
+			// validation — when the block is validated, subtree validation still
+			// runs and recovers any genuinely-missing txs from peers on demand
+			// (see services/subtreevalidation getSubtreeMissingTxs). So an
+			// optimistic skip that turns out to be wrong costs extra bandwidth
+			// later (the txs get fetched then instead of now); it does not risk
+			// accepting an unvalidated block or losing data.
+			//
 			// Capture the live mode (not just the boolean) so we can later
 			// record the observation against the snapshot. Workers run
 			// concurrently and the mode can transition between this point
@@ -252,27 +262,27 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 
 			// Record a synthetic observation for the adaptive-fetch state machine.
 			//
-			// Pessimistic mode does not actually measure hit rate here — we just
-			// stamp every successful subtreeData fetch as LocalHits=TotalTxs. This
-			// is a deliberate simplification: blockvalidation's catchup layer does
-			// not naturally know how many txs were already local. The Pess→Opt
-			// transition therefore effectively fires after WindowSize consecutive
-			// successful pessimistic blocks — it's a "wait until the node has
-			// proven stable, then try optimistic" gate, not a real measurement.
+			// We don't measure real hit rate here — every successful block is
+			// stamped LocalHits=TotalTxs, MissingFetches=0. So the Pess→Opt
+			// switch is really just a warm-up timer: after WindowSize good
+			// blocks in a row, the node tries optimistic. It is not a
+			// measurement of how local the txs actually were.
 			//
-			// Opt→Pess auto-recovery is NOT yet implemented here. We hardcode
-			// MissingFetches=0 below because this code path doesn't yet know
-			// how many txs the optimistic skip caused to be missing. That means
-			// the Opt→Pess threshold cannot trip from real miss detection in
-			// this service. The threshold logic in State.maybeTransition is
-			// wired up; it just receives no signal here. Until real
-			// MissingFetches plumbing lands, recovery from a degraded
-			// optimistic deployment requires the operator to change
-			// adaptive_fetch_bootstrap_mode to "pessimistic" (or "auto") and
-			// restart — a plain restart with bootstrap_mode pinned to
-			// "optimistic" will come back up optimistic. A future improvement
-			// is to plumb real miss counts through the validation path so
-			// Opt→Pess auto-trips on observed misses.
+			// Because MissingFetches is always 0, the automatic Opt→Pess switch
+			// never fires from this service. To be clear about what that does
+			// and does not mean:
+			//   - It does NOT mean a wrong optimistic guess is dangerous. The
+			//     real validation downstream still recovers any missing txs (see
+			//     the prewarm note above), so correctness and data integrity are
+			//     never at stake — a bad guess just costs bandwidth.
+			//   - It DOES mean the mode gauge can stay stuck on "optimistic"
+			//     even while the node is quietly paying that bandwidth. The
+			//     metric under-reports; the node keeps working correctly.
+			// An operator who wants to force the node back to bulk-prewarming
+			// can set adaptive_fetch_bootstrap_mode to "pessimistic" and
+			// restart, but this is a tuning choice, not a recovery step. A
+			// future improvement is to feed real miss counts in here so the
+			// Opt→Pess switch trips on its own.
 			txCount := 0
 			if work.block != nil {
 				txCount = int(work.block.TransactionCount)
