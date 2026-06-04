@@ -502,10 +502,18 @@ func (s *Store) GetBlockState() utxo.BlockState {
 //
 // Close honors the context for the overall drain timeout. Implementations
 // of batcherIfc.Close are expected to drain promptly; if the context
-// deadline expires first, an error is returned but draining continues
-// best-effort.
+// deadline expires first, an error is returned but draining — and the
+// release of the Aerospike client and external blob store — continues
+// best-effort. The client and external store are released inside the drain
+// goroutine so they are not leaked even when ctx expires first; leaking the
+// client in particular would leave a closed-or-stale entry that a later
+// in-process restart for the same host would reuse and fail with
+// INVALID_NODE_ERROR.
 func (s *Store) Close(ctx context.Context) error {
 	done := make(chan struct{})
+
+	var extErr error
+
 	go func() {
 		defer close(done)
 		// Order is intentional: stop accepting new write ops first (no-op
@@ -535,19 +543,27 @@ func (s *Store) Close(ctx context.Context) error {
 		if s.storeBatcher != nil {
 			s.storeBatcher.Close()
 		}
+
+		// Drains complete; close the external blob store (created in
+		// Store.New) so its handles/connections are not leaked.
+		if s.externalStore != nil {
+			extErr = s.externalStore.Close(ctx)
+		}
+
+		// Close the Aerospike client. The client is shared per host via
+		// util's connection cache, so close-and-evict it rather than closing
+		// in place — otherwise the cache would keep a closed client and a
+		// later store for the same host (e.g. an in-process daemon restart)
+		// would reuse it and fail with INVALID_NODE_ERROR. Done inside the
+		// goroutine so it still runs even when ctx has already expired.
+		if s.client != nil {
+			util.CloseAerospikeClient(s.url.Host)
+		}
 	}()
 
 	select {
 	case <-done:
-		// Drains complete; close the Aerospike client. The client is shared
-		// per host via util's connection cache, so close-and-evict it rather
-		// than closing in place — otherwise the cache would keep a closed
-		// client and a later store for the same host (e.g. an in-process
-		// daemon restart) would reuse it and fail with INVALID_NODE_ERROR.
-		if s.client != nil {
-			util.CloseAerospikeClient(s.url.Host)
-		}
-		return nil
+		return extErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}

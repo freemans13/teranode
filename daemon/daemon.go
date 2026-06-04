@@ -373,10 +373,11 @@ func (d *Daemon) Start(logger ulogger.Logger, args []string, appSettings *settin
 
 	// closeStores must run on BOTH shutdown paths (OS-signal via waitErr,
 	// daemon.Stop() via doneCh) and MUST run after every service has
-	// finished using the stores. Deferring it here, after the select that
-	// waits for service exit, gives us a single ordered teardown point
-	// that runs even if the body returns through a signal-driven exit
-	// rather than an explicit Stop() call.
+	// finished using the stores. The defer is registered here, before the
+	// select below, but runs when this function returns — i.e. after the
+	// select has observed service exit on either path. This gives us a
+	// single ordered teardown point that runs even if the body returns
+	// through a signal-driven exit rather than an explicit Stop() call.
 	//
 	// The UTXO store in particular owns background batched-write workers
 	// whose Close drains in-channel items before returning. Skipping this
