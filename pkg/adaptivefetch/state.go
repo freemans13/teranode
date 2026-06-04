@@ -89,8 +89,7 @@ func (s *State) ShouldSkipSubtreeData() bool {
 	return s.mode == ModeOptimistic
 }
 
-// Record adds an observation to the rolling window, emits per-observation
-// metrics, and may transition modes.
+// Record adds an observation to the rolling window and may transition modes.
 // A nil receiver is a no-op.
 func (s *State) Record(obs Observation) {
 	s.recordWithMode(obs, false, ModePessimistic)
@@ -149,14 +148,6 @@ func (s *State) recordWithMode(obs Observation, requireMode bool, observedAt Mod
 	} else {
 		s.window[s.windowHead] = obs
 		s.windowHead = (s.windowHead + 1) % s.cfg.WindowSize
-	}
-
-	// Per-observation metrics.
-	s.metrics.hitRate.WithLabelValues(s.serviceName).
-		Observe(float64(obs.LocalHits) / float64(obs.TotalTxs))
-	if obs.MissingFetches > 0 {
-		s.metrics.missesTotal.WithLabelValues(s.serviceName).
-			Add(float64(obs.MissingFetches))
 	}
 
 	prev := s.mode

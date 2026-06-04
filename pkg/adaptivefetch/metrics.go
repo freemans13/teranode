@@ -9,10 +9,17 @@ import (
 // All collectors are registered with the supplied registry at construction
 // time so the caller chooses between the global promauto registry (via
 // prometheus.DefaultRegisterer) and a private one (for tests).
+//
+// Only signals that carry real, varying data are exported. The state
+// machine also tracks per-observation hit rate and missing-fetch counts
+// internally (see Observation / maybeTransition), but until the validation
+// hot paths plumb through real LocalHits / MissingFetches counts those
+// values are synthetic (LocalHits=TotalTxs, MissingFetches=0) and would
+// publish a permanently-perfect, meaningless series. They are therefore
+// deliberately NOT exported as metrics yet — add them here when real counts
+// are plumbed through.
 type metrics struct {
 	modeGauge   *prometheus.GaugeVec
-	hitRate     *prometheus.HistogramVec
-	missesTotal *prometheus.CounterVec
 	transitions *prometheus.CounterVec
 }
 
@@ -41,25 +48,6 @@ func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 			},
 			[]string{"service"},
 		)),
-		hitRate: registerOrReuse(reg, prometheus.NewHistogramVec(
-			prometheus.HistogramOpts{
-				Namespace: "teranode",
-				Subsystem: "adaptive_fetch",
-				Name:      "hit_rate",
-				Help:      "Local-UTXO-store hit rate per observation (LocalHits/TotalTxs), by service.",
-				Buckets:   []float64{0.0, 0.5, 0.9, 0.95, 0.99, 0.995, 1.0},
-			},
-			[]string{"service"},
-		)),
-		missesTotal: registerOrReuse(reg, prometheus.NewCounterVec(
-			prometheus.CounterOpts{
-				Namespace: "teranode",
-				Subsystem: "adaptive_fetch",
-				Name:      "missing_fetches_total",
-				Help:      "Running total of transactions recovered/fetched individually after an optimistic-mode skip, by service.",
-			},
-			[]string{"service"},
-		)),
 		transitions: registerOrReuse(reg, prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: "teranode",
@@ -71,11 +59,8 @@ func newMetrics(serviceName string, reg prometheus.Registerer) *metrics {
 		)),
 	}
 	// Initialise all series for this service so dashboards show a line even before first Record.
-	// Note: hitRate (histogram) is intentionally NOT pre-seeded — Observe() always records a real
-	// data point, so pre-seeding would poison the histogram with a fake 0% hit-rate entry.
 	// Gauges (Set) and counters (Add) are genuine no-ops at zero, so they are safe to initialise.
 	m.modeGauge.WithLabelValues(serviceName).Set(0)
-	m.missesTotal.WithLabelValues(serviceName).Add(0)
 	m.transitions.WithLabelValues(serviceName, ModePessimistic.String(), ModeOptimistic.String()).Add(0)
 	m.transitions.WithLabelValues(serviceName, ModeOptimistic.String(), ModePessimistic.String()).Add(0)
 	return m

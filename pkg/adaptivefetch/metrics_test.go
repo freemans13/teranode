@@ -53,10 +53,7 @@ func TestMetrics_TransitionsCounter(t *testing.T) {
 
 func TestMetrics_RegisteredNamesMatchSpec(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	m := newMetrics("test-service", reg)
-	// Seed one real observation so the histogram appears in Gather() output.
-	// (Histograms only show up after at least one Observe call — no pre-seeding in production.)
-	m.hitRate.WithLabelValues("test-service").Observe(0.5)
+	_ = newMetrics("test-service", reg)
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
@@ -68,7 +65,11 @@ func TestMetrics_RegisteredNamesMatchSpec(t *testing.T) {
 	joined := strings.Join(names, ",")
 
 	require.Contains(t, joined, "teranode_adaptive_fetch_mode")
-	require.Contains(t, joined, "teranode_adaptive_fetch_hit_rate")
-	require.Contains(t, joined, "teranode_adaptive_fetch_missing_fetches_total")
 	require.Contains(t, joined, "teranode_adaptive_fetch_mode_transitions_total")
+
+	// hit_rate and missing_fetches_total are intentionally NOT exported: until
+	// the validation hot paths plumb real LocalHits / MissingFetches counts,
+	// they would publish a permanently-perfect (1.0 / 0) series. See metrics.go.
+	require.NotContains(t, joined, "teranode_adaptive_fetch_hit_rate")
+	require.NotContains(t, joined, "teranode_adaptive_fetch_missing_fetches_total")
 }
