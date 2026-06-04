@@ -2224,6 +2224,10 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 	if numFullSubtrees > 0 {
 		fullSubtrees := make([]*subtreepkg.Subtree, numFullSubtrees)
 		g, _ := errgroup.WithContext(ctx)
+		// Bound the fan-out: with small subtree sizes a large reorg can yield thousands of
+		// full subtrees, and spawning one goroutine each would swamp the scheduler and spike
+		// memory. Cap at GOMAXPROCS, which is enough to saturate CPU for this CPU-bound work.
+		g.SetLimit(runtime.GOMAXPROCS(0))
 
 		for i := 0; i < numFullSubtrees; i++ {
 			i := i
@@ -2303,63 +2307,6 @@ func (stp *SubtreeProcessor) updateChainedSubtreeCounts() {
 		totalSize += st.SizeInBytes
 	}
 	stp.chainedSubtreesTotalSize.Store(totalSize)
-}
-
-// finalizeBulkBuildSubtrees handles post-bulk-build bookkeeping for newly created subtrees.
-// It updates the subtree node counts ring buffer and sends each subtree to newSubtreeChan.
-// This should be called after bulkBuildSubtrees when subtrees need to be persisted/announced.
-//
-// Parameters:
-//   - startIdx: index in chainedSubtrees where new subtrees start
-//   - skipNotification: whether to skip network announcement
-func (stp *SubtreeProcessor) finalizeBulkBuildSubtrees(startIdx int, skipNotification bool) {
-	type errChanEntry struct {
-		ch   chan error
-		hash string
-	}
-	var errChans []errChanEntry
-
-	for i := startIdx; i < len(stp.chainedSubtrees); i++ {
-		st := stp.chainedSubtrees[i]
-
-		// Update ring buffer for subtree size auto-tuning
-		actualNodeCount := len(st.Nodes)
-		if actualNodeCount > 0 {
-			stp.subtreeNodeCounts.Value = actualNodeCount
-			stp.subtreeNodeCounts = stp.subtreeNodeCounts.Next()
-		}
-
-		stp.subtreesInBlock++
-
-		// Send to newSubtreeChan for persistence (batch send, then batch wait)
-		errCh := make(chan error, 1)
-		subtreeCopy := st // capture for closure
-		stp.newSubtreeChan <- NewSubtreeRequest{
-			Subtree:          st,
-			ParentTxMap:      stp.currentTxMap,
-			DeletedTxs:       stp.deletedTxs,
-			SkipNotification: skipNotification,
-			ErrChan:          errCh,
-			OnStorageComplete: func() {
-				stp.cleanupDeletedTxs(subtreeCopy)
-			},
-		}
-
-		errChans = append(errChans, errChanEntry{ch: errCh, hash: st.RootHash().String()})
-	}
-
-	// Batch wait for all persistence results
-	for _, entry := range errChans {
-		if err := <-entry.ch; err != nil {
-			stp.logger.Errorf("[%s] error sending subtree to newSubtreeChan: %v", entry.hash, err)
-		}
-	}
-
-	if !skipNotification && startIdx < len(stp.chainedSubtrees) {
-		stp.resetAnnouncementTicker()
-	}
-
-	stp.updatePrecomputedMiningData()
 }
 
 // AddBatch adds a batch of transaction nodes to the processor queue.
@@ -3347,14 +3294,6 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		allLosingTxHashes = append(allLosingTxHashes, hash)
 	}
 
-	filteredMarkOnLongestChain := make([]chainhash.Hash, 0, len(markOnLongestChain))
-	for _, hash := range markOnLongestChain {
-		if losingTxSet[hash] {
-			continue
-		}
-		filteredMarkOnLongestChain = append(filteredMarkOnLongestChain, hash)
-	}
-
 	// Consolidate all "mark as not on longest chain" operations:
 	// 1. Losing conflicting transactions from moveForward blocks
 	// 2. All transactions currently in block assembly (chainedSubtrees + currentSubtree)
@@ -3372,24 +3311,27 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	}
 	currentSubtree := stp.currentSubtree.Load()
 	subtreeNodeCount += len(currentSubtree.Nodes)
-	allMarkFalse := make([]chainhash.Hash, 0, len(allLosingTxHashes)+subtreeNodeCount)
 
-	allMarkFalse = append(allMarkFalse, allLosingTxHashes...)
-
+	// Collect all assembly tx hashes (coinbase placeholders are stripped inside
+	// partitionLongestChainMarks).
+	assemblyHashes := make([]chainhash.Hash, 0, subtreeNodeCount)
 	for _, subtree := range stp.chainedSubtrees {
 		for _, node := range subtree.Nodes {
-			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				allMarkFalse = append(allMarkFalse, node.Hash)
-			}
+			assemblyHashes = append(assemblyHashes, node.Hash)
 		}
 	}
 	for _, node := range currentSubtree.Nodes {
-		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			allMarkFalse = append(allMarkFalse, node.Hash)
-		}
+		assemblyHashes = append(assemblyHashes, node.Hash)
 	}
 
+	// Partition into the two mark sets. partitionLongestChainMarks guarantees the
+	// returned slices are disjoint and de-duplicated, which is the precondition for
+	// running the two MarkTransactionsOnLongestChain calls concurrently below without
+	// racing on the same UTXO record.
+	filteredMarkOnLongestChain, allMarkFalse := partitionLongestChainMarks(markOnLongestChain, allLosingTxHashes, assemblyHashes)
+
 	// Run mark(true) and mark(false) concurrently — they operate on disjoint tx hash sets
+	// (guaranteed by partitionLongestChainMarks above).
 	markGroup, markCtx := errgroup.WithContext(ctx)
 
 	if len(filteredMarkOnLongestChain) > 0 {
@@ -3456,6 +3398,59 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	}
 
 	return nil
+}
+
+// partitionLongestChainMarks splits transactions into the two disjoint sets used by the
+// concurrent MarkTransactionsOnLongestChain calls during a reorg:
+//
+//   - markTrue: hashes to mark as on the longest chain (the moveForward "winning" txs).
+//   - markFalse: hashes to mark as not on the longest chain (losing conflicting txs plus
+//     every tx still sitting in block assembly).
+//
+// losingTxHashes is expected to already be deduped (against the winning set and itself);
+// assemblyHashes is the raw set of assembly node hashes and may contain coinbase
+// placeholders and duplicates. The returned slices are guaranteed to be:
+//
+//   - de-duplicated (markFalse contains each hash at most once), and
+//   - mutually disjoint — any hash present in both the markOnLongestChain input and the
+//     mark-false sources is placed in markFalse ONLY.
+//
+// Disjointness is the safety precondition for issuing mark(true) and mark(false)
+// concurrently against the UTXO store; without it the two calls could race on the same
+// record with a nondeterministic winner. Letting mark(false) win for overlapping hashes
+// preserves the previous sequential behaviour, where mark(false) ran after mark(true).
+func partitionLongestChainMarks(markOnLongestChain, losingTxHashes, assemblyHashes []chainhash.Hash) (markTrue, markFalse []chainhash.Hash) {
+	markFalseSet := make(map[chainhash.Hash]struct{}, len(losingTxHashes)+len(assemblyHashes))
+	markFalse = make([]chainhash.Hash, 0, len(losingTxHashes)+len(assemblyHashes))
+
+	add := func(hash chainhash.Hash) {
+		if hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			return
+		}
+		if _, dup := markFalseSet[hash]; dup {
+			return
+		}
+		markFalseSet[hash] = struct{}{}
+		markFalse = append(markFalse, hash)
+	}
+
+	// losing txs first, then assembly txs — preserves the previous append order.
+	for _, hash := range losingTxHashes {
+		add(hash)
+	}
+	for _, hash := range assemblyHashes {
+		add(hash)
+	}
+
+	markTrue = make([]chainhash.Hash, 0, len(markOnLongestChain))
+	for _, hash := range markOnLongestChain {
+		if _, isMarkFalse := markFalseSet[hash]; isMarkFalse {
+			continue
+		}
+		markTrue = append(markTrue, hash)
+	}
+
+	return markTrue, markFalse
 }
 
 func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, markNotOnLongestChain []chainhash.Hash) error {
@@ -3626,8 +3621,7 @@ func (stp *SubtreeProcessor) moveBackBlock(ctx context.Context, block *model.Blo
 		}
 	}
 
-	// Bulk build: get block subtrees, collect all nodes, and build subtrees in parallel
-	// Bulk build: collect all nodes, then build subtrees in parallel
+	// Bulk build: get block subtrees, collect all nodes, then build subtrees in parallel
 	if subtreesNodes, conflictingHashes, err = stp.moveBackBlockBulkBuild(ctx, block, createProperlySizedSubtrees, chainedSubtrees, lastIncompleteSubtree); err != nil {
 		return nil, nil, err
 	}
