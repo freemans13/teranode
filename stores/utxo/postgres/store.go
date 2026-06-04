@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -16,7 +15,6 @@ import (
 	"github.com/bsv-blockchain/teranode/util/batchermetrics"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib" // register pgx stdlib driver
 )
 
 var _ utxo.Store = (*Store)(nil)
@@ -30,9 +28,6 @@ type Store struct {
 
 	// pgxpool for all pgx-native operations.
 	pool *pgxpool.Pool
-
-	// database/sql.DB for compatibility with code using the standard interface.
-	db *sql.DB
 
 	// block state
 	blockHeight     atomic.Uint32
@@ -92,20 +87,24 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
-	pgxConfig.MaxConns = 100
 
-	// Full durability — financial data requires synchronous_commit = on (the default).
-	// Group commit (commit_delay + commit_siblings) is the safe way to get throughput.
+	// Respect pool_max_conns from the connection URL when supplied; otherwise
+	// default to 100 (the batchers keep many connections busy under load).
+	if !pgxURL.Query().Has("pool_max_conns") {
+		pgxConfig.MaxConns = 100
+	}
+
+	// Full durability — financial data requires synchronous_commit = on. Enforce it
+	// on every connection rather than relying on the server default. Group commit
+	// (commit_delay + commit_siblings) is the safe way to recover throughput, but
+	// those are server-level GUCs and must be configured on the PostgreSQL instance.
+	if pgxConfig.ConnConfig.RuntimeParams == nil {
+		pgxConfig.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	pgxConfig.ConnConfig.RuntimeParams["synchronous_commit"] = "on"
 
 	pool, err := pgxpool.NewWithConfig(ctx, pgxConfig)
 	if err != nil {
-		return nil, err
-	}
-
-	// Open a database/sql connection using the pgx stdlib driver.
-	db, err := sql.Open("pgx", pgxURL.String())
-	if err != nil {
-		pool.Close()
 		return nil, err
 	}
 
@@ -116,12 +115,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		settings: tSettings,
 		storeURL: storeURL,
 		pool:     pool,
-		db:       db,
 	}
 
 	if err := s.createSchema(ctx); err != nil {
 		pool.Close()
-		db.Close()
 		return nil, err
 	}
 
@@ -229,9 +226,6 @@ func (s *Store) Stop() {
 	}
 	if s.pool != nil {
 		s.pool.Close()
-	}
-	if s.db != nil {
-		s.db.Close()
 	}
 }
 

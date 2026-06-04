@@ -146,6 +146,14 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 
 	currentBlockHeight := int64(s.blockHeight.Load())
 
+	// One transaction for the whole set: a reorg that unsets a block_id from many
+	// txs commits all-or-nothing rather than leaving some rows updated on failure.
+	pgxTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, errors.NewStorageError("[UnsetMined] begin: %v", err)
+	}
+	defer pgxTx.Rollback(ctx) //nolint:errcheck
+
 	for _, hash := range hashes {
 		// Remove the entry for blockID from the parallel block_ids / block_heights /
 		// subtree_idxs arrays in a SINGLE atomic UPDATE. The previous SELECT-then-
@@ -160,7 +168,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 		// concurrent append is preserved rather than clobbered. RETURNING yields the
 		// post-update block_ids for the result map.
 		var newBlockIDs []int32
-		err := s.pool.QueryRow(ctx, `
+		err := pgxTx.QueryRow(ctx, `
 			UPDATE txs t SET
 				block_ids = array_remove(t.block_ids, $2),
 				block_heights = COALESCE((
@@ -193,6 +201,10 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 			result[i] = uint32(bid)
 		}
 		resultMap[*hash] = result
+	}
+
+	if err := pgxTx.Commit(ctx); err != nil {
+		return nil, errors.NewStorageError("[UnsetMined] commit: %v", err)
 	}
 
 	return resultMap, nil

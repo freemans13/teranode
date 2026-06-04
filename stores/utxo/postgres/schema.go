@@ -61,6 +61,13 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
+	// Back-fill the spendable column on outputs tables created before it existed.
+	// ALTER on the partitioned parent cascades to existing partitions; the default
+	// TRUE is correct for legacy rows (which were all value/spendable outputs).
+	if _, err := pool.Exec(ctx, `ALTER TABLE outputs ADD COLUMN IF NOT EXISTS spendable BOOLEAN NOT NULL DEFAULT TRUE`); err != nil {
+		return errors.NewStorageError("outputs spendable column migration failed: %v", err)
+	}
+
 	// Create numPartitions hash partitions for each table with appropriate fillfactor.
 	tables := []partitionSpec{
 		{"txs", 70},      // HOT updates — reserve 30% for in-place updates
@@ -183,6 +190,11 @@ CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs (delete_at_height) WHERE d
 // outputs: immutable transaction outputs. LOGGED. Spent-ness is tracked by
 // row-presence in the spends table rather than a nullable column here, so
 // these rows never have to be updated after Create.
+// spendable marks whether an output is a real, spendable UTXO. Zero-value
+// OP_RETURN / data-carrier outputs are stored (so the full output set can be
+// reconstructed) but flagged spendable=false: they can never be spent, so they
+// must be excluded from the "fully spent" pruning check, which otherwise would
+// never see a matching spends row for them and would keep the tx forever.
 const outputsDDL = `
 CREATE TABLE IF NOT EXISTS outputs (
     tx_hash                 BYTEA   NOT NULL,
@@ -193,6 +205,7 @@ CREATE TABLE IF NOT EXISTS outputs (
     coinbase_spending_height BIGINT NOT NULL DEFAULT 0,
     frozen                  BOOLEAN DEFAULT FALSE,
     spendable_in            INT,
+    spendable               BOOLEAN NOT NULL DEFAULT TRUE,
     PRIMARY KEY (tx_hash, idx)
 ) PARTITION BY HASH (tx_hash);`
 

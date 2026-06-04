@@ -59,7 +59,7 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	err = s.pool.QueryRow(ctx, `
 		SELECT NOT EXISTS(
 			SELECT 1 FROM outputs o
-			WHERE o.tx_hash = $1
+			WHERE o.tx_hash = $1 AND o.spendable
 			AND NOT EXISTS (SELECT 1 FROM spends sp WHERE sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx)
 		) AS all_spent`,
 		hash[:],

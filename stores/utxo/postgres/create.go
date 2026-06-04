@@ -47,6 +47,7 @@ type outputArrayParams struct {
 	frozen                 []bool
 	utxoHash               [][]byte
 	coinbaseSpendingHeight []int64
+	spendable              []bool
 }
 
 // buildOutputArrays packs transaction outputs into parallel arrays for UNNEST.
@@ -68,6 +69,7 @@ func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blo
 		frozen:                 make([]bool, 0, count),
 		utxoHash:               make([][]byte, 0, count),
 		coinbaseSpendingHeight: make([]int64, 0, count),
+		spendable:              make([]bool, 0, count),
 	}
 	for i, output := range btTx.Outputs {
 		if output == nil {
@@ -105,6 +107,12 @@ func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blo
 		p.frozen = append(p.frozen, false)
 		p.utxoHash = append(p.utxoHash, utxoHash[:])
 		p.coinbaseSpendingHeight = append(p.coinbaseSpendingHeight, coinbaseSpendingHeight)
+		// A zero-value OP_RETURN / data-carrier output can never be spent, so it
+		// must not count toward the "fully spent" pruning check. Mirror the
+		// aerospike store's ShouldStoreOutputAsUTXO gate. (nil script → no deref,
+		// treated as spendable; non-nil zero-value scripts are inspected.)
+		spendable := output.LockingScript == nil || utxo.ShouldStoreOutputAsUTXO(isCoinbase, output, blockHeight)
+		p.spendable = append(p.spendable, spendable)
 	}
 	return p, nil
 }
@@ -260,15 +268,15 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// Insert outputs via unnest.
 	if len(outArrs.idx) > 0 {
 		_, err = conn.Exec(ctx, `
-			INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
-			SELECT $1, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
+			INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height, spendable)
+			SELECT $1, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh, u.spendable
 			FROM UNNEST($2::bigint[], $3::bytea[], $4::bigint[],
-						$5::boolean[], $6::bytea[], $7::bigint[])
-				AS u(idx, locking_script, satoshis, frozen, utxo_hash, csh)
+						$5::boolean[], $6::bytea[], $7::bigint[], $8::boolean[])
+				AS u(idx, locking_script, satoshis, frozen, utxo_hash, csh, spendable)
 			ON CONFLICT (tx_hash, idx) DO NOTHING`,
 			txHash[:],
 			outArrs.idx, outArrs.lockingScript, outArrs.satoshis,
-			outArrs.frozen, outArrs.utxoHash, outArrs.coinbaseSpendingHeight,
+			outArrs.frozen, outArrs.utxoHash, outArrs.coinbaseSpendingHeight, outArrs.spendable,
 		)
 		if err != nil {
 			return nil, errors.NewStorageError("failed to insert outputs", err)
@@ -367,6 +375,7 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	var outFrozens []bool
 	var outUtxoHashes [][]byte
 	var outCoinbaseSpendingHeights []int64
+	var outSpendables []bool
 
 	for i, item := range batch {
 		txMeta, err := util.TxMetaDataFromTx(item.tx)
@@ -436,6 +445,7 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 			outFrozens = append(outFrozens, outArrs.frozen[j])
 			outUtxoHashes = append(outUtxoHashes, outArrs.utxoHash[j])
 			outCoinbaseSpendingHeights = append(outCoinbaseSpendingHeights, outArrs.coinbaseSpendingHeight[j])
+			outSpendables = append(outSpendables, outArrs.spendable[j])
 		}
 	}
 
@@ -515,14 +525,14 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 
 	if len(outTxHashes) > 0 {
 		_, err = pgxTx.Exec(ctx, `
-			INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height)
-			SELECT u.tx_hash, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh
+			INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height, spendable)
+			SELECT u.tx_hash, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh, u.spendable
 			FROM UNNEST($1::bytea[], $2::bigint[], $3::bytea[], $4::bigint[],
-			            $5::boolean[], $6::bytea[], $7::bigint[])
-			     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh)
+			            $5::boolean[], $6::bytea[], $7::bigint[], $8::boolean[])
+			     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh, spendable)
 			ON CONFLICT (tx_hash, idx) DO NOTHING`,
 			outTxHashes, outIdxs, outLockingScripts, outSatoshis,
-			outFrozens, outUtxoHashes, outCoinbaseSpendingHeights,
+			outFrozens, outUtxoHashes, outCoinbaseSpendingHeights, outSpendables,
 		)
 		if err != nil {
 			for i, item := range batch {
@@ -605,7 +615,8 @@ func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpo
 
 		_, err := conn.Exec(ctx, `
 			UPDATE txs SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
-			WHERE hash = $1`,
+			WHERE hash = $1
+			  AND NOT (COALESCE(conflicting_children, '{}') @> $2::bytea[])`,
 			parentHash[:], [][]byte{childTxHash[:]},
 		)
 		if err != nil {

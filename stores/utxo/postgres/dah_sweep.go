@@ -69,7 +69,7 @@ state AS (
                -- via an in-range spend) could stamp DAH off a spend still inside
                -- the safe-tip lag window — a spend that may still be mid-commit.
                WHEN (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash)
-                    = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
+                    = (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash AND o.spendable)
                     AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash) > 0
                     AND GREATEST(COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = t.hash), 0),
                                  COALESCE(t.mined_at_height, 0)) <= $2
@@ -236,7 +236,7 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 			  AND t.unmined_since IS NULL
 			  AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) IS NOT NULL
 			  AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash) > 0
-			  AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash)
+			  AND (SELECT count(*) FROM outputs o WHERE o.tx_hash = t.hash AND o.spendable)
 			      = (SELECT count(*) FROM spends s WHERE s.prev_tx_hash = t.hash)
 			LIMIT $3
 		)

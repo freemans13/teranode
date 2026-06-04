@@ -88,8 +88,17 @@ func (it *unminedTxIterator) readOne(_ context.Context) (*utxo.UnminedTransactio
 	}
 
 	if !it.rows.Next() {
+		// rows.Next() also returns false on a mid-stream failure (connection
+		// reset, statement timeout). Capture rows.Err() before Close() so a
+		// truncated result set surfaces as an error rather than being mistaken
+		// for a clean end-of-iteration.
+		rowsErr := it.rows.Err()
 		if err := it.Close(); err != nil {
 			it.store.logger.Warnf("failed to close iterator: %v", err)
+		}
+		if rowsErr != nil {
+			it.err = rowsErr
+			return nil, rowsErr
 		}
 		return nil, nil
 	}
@@ -101,7 +110,7 @@ func (it *unminedTxIterator) readOne(_ context.Context) (*utxo.UnminedTransactio
 		insertedAt   time.Time
 		isCoinbase   bool
 		locked       bool
-		unminedSince int64
+		unminedSince *int64 // nullable: conflicting txs may have unmined_since = NULL
 		rawTx        []byte
 		blockIDs     []int32
 	)
@@ -157,6 +166,11 @@ func (it *unminedTxIterator) readOne(_ context.Context) (*utxo.UnminedTransactio
 		bidResult[i] = uint32(bid)
 	}
 
+	var unminedSinceVal int
+	if unminedSince != nil {
+		unminedSinceVal = int(*unminedSince)
+	}
+
 	return &utxo.UnminedTransaction{
 		Node: &subtree.Node{
 			Hash:        *txHash,
@@ -167,7 +181,7 @@ func (it *unminedTxIterator) readOne(_ context.Context) (*utxo.UnminedTransactio
 		CreatedAt:    int(insertedAt.UnixMilli()),
 		Locked:       locked,
 		BlockIDs:     bidResult,
-		UnminedSince: int(unminedSince),
+		UnminedSince: unminedSinceVal,
 	}, nil
 }
 

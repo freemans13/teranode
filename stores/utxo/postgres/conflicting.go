@@ -41,6 +41,20 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 
 	affectedParentSpends := make([]*utxo.Spend, 0, len(txHashes))
 	spendingTxHashes := make([]chainhash.Hash, 0, len(txHashes))
+	// Dedup spending children across the whole call: a multi-output parent has one
+	// spends row per spent output, all recording the same spender, so the raw scan
+	// can yield the same spender hash many times. Callers recurse on these, so
+	// duplicates would double-process.
+	seenSpenders := make(map[chainhash.Hash]struct{})
+
+	// All writes go through one transaction so the flag/DAH updates and the
+	// conflicting_children appends across every hash commit atomically — a
+	// mid-loop failure rolls the whole set back rather than leaving a torn state.
+	pgxTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, errors.NewStorageError("[SetConflicting] begin: %v", err)
+	}
+	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
 	for _, conflictingTxHash := range txHashes {
 		txHash := conflictingTxHash
@@ -54,7 +68,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		// Update txs: set conflicting flag + delete_at_height.
 		if setValue {
 			// When setting conflicting=true: set DAH only if not already set.
-			_, err = s.pool.Exec(ctx, `
+			_, err = pgxTx.Exec(ctx, `
 				UPDATE txs SET
 				  conflicting = $2,
 				  delete_at_height = COALESCE(delete_at_height, $3)
@@ -63,7 +77,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			)
 		} else {
 			// When clearing conflicting: clear DAH.
-			_, err = s.pool.Exec(ctx, `
+			_, err = pgxTx.Exec(ctx, `
 				UPDATE txs SET
 				  conflicting = $2,
 				  delete_at_height = $3
@@ -76,6 +90,9 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		}
 
 		// Append this tx as a conflicting child of each parent (array on txs).
+		// The @> guard makes the append idempotent: a replay/retry must not push a
+		// duplicate child hash into the parent's array (matches the sql store's
+		// ON CONFLICT DO NOTHING).
 		if txMeta.Tx != nil {
 			seen := make(map[chainhash.Hash]struct{}, len(txMeta.Tx.Inputs))
 			for _, input := range txMeta.Tx.Inputs {
@@ -85,9 +102,10 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 				}
 				seen[parentHash] = struct{}{}
 
-				_, insertErr := s.pool.Exec(ctx, `
+				_, insertErr := pgxTx.Exec(ctx, `
 					UPDATE txs SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
-					WHERE hash = $1`,
+					WHERE hash = $1
+					  AND NOT (COALESCE(conflicting_children, '{}') @> $2::bytea[])`,
 					parentHash[:], [][]byte{txHash[:]},
 				)
 				if insertErr != nil {
@@ -115,7 +133,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 
 		// Find spending child transactions by querying the spends table directly.
 		if txMeta.Tx != nil {
-			rows, queryErr := s.pool.Query(ctx, `
+			rows, queryErr := pgxTx.Query(ctx, `
 				SELECT sp.spending_data
 				FROM spends sp
 				WHERE sp.prev_tx_hash = $1`,
@@ -138,7 +156,10 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 						return nil, nil, parseErr
 					}
 					if sd.TxID != nil {
-						spendingTxHashes = append(spendingTxHashes, *sd.TxID)
+						if _, dup := seenSpenders[*sd.TxID]; !dup {
+							seenSpenders[*sd.TxID] = struct{}{}
+							spendingTxHashes = append(spendingTxHashes, *sd.TxID)
+						}
 					}
 				}
 			}
@@ -147,6 +168,10 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 				return nil, nil, rowsErr
 			}
 		}
+	}
+
+	if err := pgxTx.Commit(ctx); err != nil {
+		return nil, nil, errors.NewStorageError("[SetConflicting] commit: %v", err)
 	}
 
 	return affectedParentSpends, spendingTxHashes, nil
@@ -317,7 +342,11 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 
 	if totalUpdated < attempted {
 		missing := attempted - totalUpdated
-		s.logger.Errorf("[MarkTransactionsOnLongestChain] FATAL: %d/%d transactions not found in txs", missing, attempted)
+		s.logger.Errorf("[MarkTransactionsOnLongestChain] %d/%d transactions not found in txs", missing, attempted)
+		// A missing tx is a data-integrity problem the caller must see: the sql
+		// store treats it as fatal. Surface it as an error rather than returning
+		// nil and silently reporting success.
+		return errors.NewStorageError("[MarkTransactionsOnLongestChain] %d/%d transactions not found in txs", missing, attempted)
 	}
 
 	return nil

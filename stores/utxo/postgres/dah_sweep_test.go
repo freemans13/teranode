@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
@@ -256,6 +257,60 @@ func TestUnspendClearsDAH(t *testing.T) {
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
 	require.Nil(t, dah, "Unspend must clear delete_at_height for affected parents")
+}
+
+// TestSweepIgnoresUnspendableOpReturnOutputs is a regression test for the
+// pruning bug where a tx carrying an OP_RETURN / data output could never be
+// stamped for deletion: the "fully spent" check compared count(spends) to
+// count(all outputs), but an unspendable output never gets a spends row, so the
+// equality could never hold. Outputs are now flagged spendable, and the check
+// compares against spendable outputs only.
+func TestSweepIgnoresUnspendableOpReturnOutputs(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(105))
+	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
+
+	// Parent = canonical 2 spendable outputs + an appended zero-value
+	// OP_FALSE OP_RETURN data output (vout 2). The data output can never be spent.
+	parent := testExtendedTx(t)
+	parent.Outputs = append(parent.Outputs, &bt.Output{
+		Satoshis:      0,
+		LockingScript: bscript.NewFromBytes([]byte{0x00, 0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef}),
+	})
+
+	_, err := store.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+		BlockID: 100, BlockHeight: 100, SubtreeIdx: 0, OnLongestChain: true,
+	}))
+	require.NoError(t, err)
+
+	parentHash := parent.TxIDChainHash()
+
+	// All three outputs are stored, but the OP_RETURN one is flagged unspendable.
+	var spendableCount, totalCount int
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT count(*) FILTER (WHERE spendable), count(*) FROM outputs WHERE tx_hash=$1`,
+		parentHash[:]).Scan(&spendableCount, &totalCount))
+	require.Equal(t, 3, totalCount, "all outputs must be stored")
+	require.Equal(t, 2, spendableCount, "the OP_RETURN output must be flagged spendable=false")
+
+	// Spend only the two spendable outputs (0 and 1); the OP_RETURN output remains.
+	child := getSpendingTx(t, parent, 0, 1)
+	_, err = store.Create(ctx, child, 101)
+	require.NoError(t, err)
+	_, err = store.Spend(ctx, child, 101)
+	require.NoError(t, err)
+
+	n, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, n, 1)
+
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, parentHash[:]).Scan(&dah))
+	require.NotNil(t, dah,
+		"a mined parent whose spendable outputs are all spent must be stamped even with an unspent OP_RETURN output")
+	// completion height = last spend height (101); mined_at_height (100) is lower.
+	require.Equal(t, int64(101)+1+ret, *dah)
 }
 
 func TestRewindDAHWatermark(t *testing.T) {
