@@ -41,16 +41,6 @@ type Options struct {
 	// IgnoreLocked determines whether to ignore transactions marked as locked when spending
 	IgnoreLocked bool
 
-	// SkipUtxoSpend skips the UTXO spend pass. Used in the validation phase of
-	// pipelined block validation, where validation runs with SkipUtxoSpend=true
-	// and a follow-up storage call runs with SkipValidation=true to perform the spend.
-	SkipUtxoSpend bool
-
-	// SkipValidation skips finals checks, coinbase checks, height fetches and the
-	// Teranode/BDK validateTransaction call. Used in the storage phase of pipelined
-	// block validation to reuse the spend/create logic without re-running CPU work.
-	SkipValidation bool
-
 	// ParentMetadata provides pre-fetched metadata for parent transactions
 	// When provided, the validator will check this map before calling utxoStore.Get()
 	// This enables validation to proceed without UTXO store lookups for in-block parents
@@ -227,22 +217,6 @@ func WithIgnoreLocked(ignoreLocked bool) Option {
 func WithSkipTxMetaPublishing(skip bool) Option {
 	return func(o *Options) {
 		o.SkipTxMetaPublishing = skip
-	}
-}
-
-// WithSkipUtxoSpend creates an option to skip UTXO spending.
-// Used in the validation phase of pipelined block validation (CPU-bound work without I/O).
-func WithSkipUtxoSpend(skip bool) Option {
-	return func(o *Options) {
-		o.SkipUtxoSpend = skip
-	}
-}
-
-// WithSkipValidation creates an option to skip the validation pass.
-// Used in the storage phase of pipelined block validation (I/O-bound work without CPU).
-func WithSkipValidation(skip bool) Option {
-	return func(o *Options) {
-		o.SkipValidation = skip
 	}
 }
 

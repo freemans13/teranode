@@ -544,74 +544,68 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		blockHeight = blockState.Height + 1
 	}
 
-	// Skip validation (finals, coinbase, BDK/Teranode checks) when SkipValidation=true.
-	// Used by pipelined block validation: the validation pass runs with full checks but
-	// SkipUtxoSpend=true, then the storage pass re-enters with SkipValidation=true so the
-	// spend/create logic is reused without re-running CPU-bound work.
-	if !validationOptions.SkipValidation {
-		// Reject coinbase first, matching bitcoin-sv CheckRegularTransaction
-		// (src/validation.cpp:601-603) which short-circuits before any contextual
-		// (finality / MTP) check.
-		if tx.IsCoinbase() {
-			err = errors.NewProcessingError("[Validate][%s] coinbase transactions are not supported", txID)
+	// Reject coinbase first, matching bitcoin-sv CheckRegularTransaction
+	// (src/validation.cpp:601-603) which short-circuits before any contextual
+	// (finality / MTP) check.
+	if tx.IsCoinbase() {
+		err = errors.NewProcessingError("[Validate][%s] coinbase transactions are not supported", txID)
+		span.RecordError(err)
+
+		return nil, err
+	}
+
+	comparisonTime, skipFinality, finalityErr := selectFinalityComparisonTime(validationOptions, blockHeight, uint32(v.settings.ChainCfgParams.CSVHeight), blockState)
+	if finalityErr != nil {
+		err = finalityErr
+		span.RecordError(err)
+
+		return nil, err
+	}
+
+	if !skipFinality {
+		// this function should be moved into go-bt
+		if err = util.IsTransactionFinal(tx, blockHeight, comparisonTime); err != nil {
+			err = errors.NewUtxoNonFinalError("[Validate][%s] transaction is not final", txID, err)
 			span.RecordError(err)
 
 			return nil, err
 		}
+	}
 
-		comparisonTime, skipFinality, finalityErr := selectFinalityComparisonTime(validationOptions, blockHeight, uint32(v.settings.ChainCfgParams.CSVHeight), blockState)
-		if finalityErr != nil {
-			err = finalityErr
+	var utxoHeights []uint32
+
+	// check whether the transaction is extended, extend it if not
+	// we also get the block heights of the inputs of the transaction since we are doing a DB lookup
+	if !tx.IsExtended() {
+		// get the block heights of all inputs of the transaction and extend the inputs of not extended transaction.
+		// utxoHeights is a slice of block heights for each input
+		// txInpoints is a struct containing the parent tx hashes and the vout indexes of each input
+		if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
+			err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
 			span.RecordError(err)
 
 			return nil, err
 		}
+	}
 
-		if !skipFinality {
-			// this function should be moved into go-bt
-			if err = util.IsTransactionFinal(tx, blockHeight, comparisonTime); err != nil {
-				err = errors.NewUtxoNonFinalError("[Validate][%s] transaction is not final", txID, err)
-				span.RecordError(err)
-
-				return nil, err
-			}
-		}
-
-		var utxoHeights []uint32
-
-		// check whether the transaction is extended, extend it if not
-		// we also get the block heights of the inputs of the transaction since we are doing a DB lookup
-		if !tx.IsExtended() {
-			// get the block heights of all inputs of the transaction and extend the inputs of not extended transaction.
-			// utxoHeights is a slice of block heights for each input
-			// txInpoints is a struct containing the parent tx hashes and the vout indexes of each input
-			if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
-				err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
-				span.RecordError(err)
-
-				return nil, err
-			}
-		}
-
-		// if the transaction was extended, we still need to get the block heights of the inputs
-		// since that processing did not happen before extending the transaction
-		// This must be done BEFORE validateTransaction to ensure BIP68 sequence lock validation has the required heights
-		if len(utxoHeights) == 0 {
-			if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
-				err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
-				span.RecordError(err)
-
-				return nil, err
-			}
-		}
-
-		// Run Teranode-owned checks and BDK transaction validation.
-		if err = v.validateTransaction(ctx, tx, blockHeight, utxoHeights, validationOptions); err != nil {
-			err = errors.NewProcessingError("[Validate][%s] error validating transaction", txID, err)
+	// if the transaction was extended, we still need to get the block heights of the inputs
+	// since that processing did not happen before extending the transaction
+	// This must be done BEFORE validateTransaction to ensure BIP68 sequence lock validation has the required heights
+	if len(utxoHeights) == 0 {
+		if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
+			err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
 			span.RecordError(err)
 
 			return nil, err
 		}
+	}
+
+	// Run Teranode-owned checks and BDK transaction validation.
+	if err = v.validateTransaction(ctx, tx, blockHeight, utxoHeights, validationOptions); err != nil {
+		err = errors.NewProcessingError("[Validate][%s] error validating transaction", txID, err)
+		span.RecordError(err)
+
+		return nil, err
 	}
 
 	// decouple the tracing context to not cancel the context when finalize the block assembly
@@ -633,106 +627,100 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		utxoMapErr error
 	)
 
-	// Skip the spend pass when SkipUtxoSpend=true. Used in the validation phase of
-	// pipelined block validation — the storage phase re-enters Validate with
-	// SkipValidation=true (and SkipUtxoSpend default false) to perform the actual spends.
-	// spentUtxos remains nil so reverseSpends on a later failure is a safe no-op.
-	if !validationOptions.SkipUtxoSpend {
-		// this will reverse the spends if there is an error
-		if spentUtxos, err = v.spendUtxos(decoupledCtx, tx, blockHeight, validationOptions.IgnoreLocked); err != nil {
-			if errors.Is(err, errors.ErrUtxoError) {
-				saveAsConflicting := false
+	// this will reverse the spends if there is an error
+	if spentUtxos, err = v.spendUtxos(decoupledCtx, tx, blockHeight, validationOptions.IgnoreLocked); err != nil {
+		if errors.Is(err, errors.ErrUtxoError) {
+			saveAsConflicting := false
 
-				var spendErrs *errors.Error
+			var spendErrs *errors.Error
 
-				for _, spend := range spentUtxos {
-					if spend.Err != nil {
-						if validationOptions.CreateConflicting && (errors.Is(spend.Err, errors.ErrSpent) || errors.Is(spend.Err, errors.ErrTxConflicting)) {
-							saveAsConflicting = true
-						}
+			for _, spend := range spentUtxos {
+				if spend.Err != nil {
+					if validationOptions.CreateConflicting && (errors.Is(spend.Err, errors.ErrSpent) || errors.Is(spend.Err, errors.ErrTxConflicting)) {
+						saveAsConflicting = true
+					}
 
-						var spendErr *errors.Error
-						if errors.As(spend.Err, &spendErr) {
-							if spendErrs == nil {
-								spendErrs = errors.New(spendErr.Code(), spendErr.Message(), spendErr)
-							} else {
-								spendErrs = errors.New(spendErrs.Code(), spendErrs.Message(), spendErr)
-							}
+					var spendErr *errors.Error
+					if errors.As(spend.Err, &spendErr) {
+						if spendErrs == nil {
+							spendErrs = errors.New(spendErr.Code(), spendErr.Message(), spendErr)
+						} else {
+							spendErrs = errors.New(spendErrs.Code(), spendErrs.Message(), spendErr)
 						}
 					}
 				}
+			}
 
-				if spendErrs != nil {
-					if errors.As(err, &tErr) {
-						tErr.SetWrappedErr(spendErrs)
-					}
+			if spendErrs != nil {
+				if errors.As(err, &tErr) {
+					tErr.SetWrappedErr(spendErrs)
 				}
+			}
 
-				if saveAsConflicting {
-					if txMetaData, utxoMapErr = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, true, false); utxoMapErr != nil {
-						if errors.Is(utxoMapErr, errors.ErrTxExists) {
-							txMetaData = &meta.Data{}
-							if err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); err != nil {
-								err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, err)
+			if saveAsConflicting {
+				if txMetaData, utxoMapErr = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, true, false); utxoMapErr != nil {
+					if errors.Is(utxoMapErr, errors.ErrTxExists) {
+						txMetaData = &meta.Data{}
+						if err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); err != nil {
+							err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed - tx exists but unable to get meta data", txID, err)
+							span.RecordError(err)
+
+							return nil, err
+						}
+
+						// Tx already exists — ensure it and all its spending descendants are marked conflicting.
+						// NOTE: cascaded descendants may still be in the subtree processor's in-memory template
+						// until the next reset/reload — this path has no subtreeProcessor handle to evict them.
+						if !txMetaData.Conflicting {
+							if _, _, setErr := utxo.MarkConflictingRecursively(decoupledCtx, v.utxoStore, []chainhash.Hash{*tx.TxIDChainHash()}); setErr != nil {
+								err = errors.NewProcessingError("[Validate][%s] failed to mark existing tx as conflicting", txID, setErr)
 								span.RecordError(err)
 
 								return nil, err
 							}
-
-							// Tx already exists — ensure it and all its spending descendants are marked conflicting.
-							// NOTE: cascaded descendants may still be in the subtree processor's in-memory template
-							// until the next reset/reload — this path has no subtreeProcessor handle to evict them.
-							if !txMetaData.Conflicting {
-								if _, _, setErr := utxo.MarkConflictingRecursively(decoupledCtx, v.utxoStore, []chainhash.Hash{*tx.TxIDChainHash()}); setErr != nil {
-									err = errors.NewProcessingError("[Validate][%s] failed to mark existing tx as conflicting", txID, setErr)
-									span.RecordError(err)
-
-									return nil, err
-								}
-							}
-
-							err = errors.NewTxConflictingError("[Validate][%s] tx is conflicting (already exists)", txID, err)
-							span.RecordError(err)
-
-							return txMetaData, err
 						}
 
-						err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed: %v", txID, utxoMapErr)
+						err = errors.NewTxConflictingError("[Validate][%s] tx is conflicting (already exists)", txID, err)
 						span.RecordError(err)
 
 						return txMetaData, err
 					}
 
-					// We successfully added the tx to the utxo store as a conflicting tx,
-					// so we can return a conflicting error
-					err = errors.NewTxConflictingError("[Validate][%s] tx is conflicting", txID, err)
+					err = errors.NewProcessingError("[Validate][%s] CreateInUtxoStore failed: %v", txID, utxoMapErr)
 					span.RecordError(err)
 
 					return txMetaData, err
 				}
-			} else if errors.Is(err, errors.ErrTxNotFound) {
-				// The parent transaction was not found. This can legitimately happen when the parent has been DAH-evicted
-				// long after the child was mined. Only short-circuit if the stored metadata confirms prior full validation:
-				//   - tx has been included in at least one block (BlockIDs non-empty), AND
-				//   - tx is NOT marked conflicting, AND
-				//   - tx is NOT locked
-				// Otherwise, surface the original ErrTxNotFound — a "tx exists in store" alone is not proof of validation
-				// (a re-org or DAH window could expose a stale or mid-flight record).
-				txMetaData = &meta.Data{}
-				if metaErr := v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); metaErr == nil {
-					if len(txMetaData.BlockIDs) > 0 && !txMetaData.Conflicting && !txMetaData.Locked {
-						v.logger.Warnf("[Validate][%s] parent tx DAH-evicted, child already mined and not conflicting/locked, assuming blessed (BlockIDs=%v)", txID, txMetaData.BlockIDs)
 
-						return txMetaData, nil
-					}
+				// We successfully added the tx to the utxo store as a conflicting tx,
+				// so we can return a conflicting error
+				err = errors.NewTxConflictingError("[Validate][%s] tx is conflicting", txID, err)
+				span.RecordError(err)
+
+				return txMetaData, err
+			}
+		} else if errors.Is(err, errors.ErrTxNotFound) {
+			// The parent transaction was not found. This can legitimately happen when the parent has been DAH-evicted
+			// long after the child was mined. Only short-circuit if the stored metadata confirms prior full validation:
+			//   - tx has been included in at least one block (BlockIDs non-empty), AND
+			//   - tx is NOT marked conflicting, AND
+			//   - tx is NOT locked
+			// Otherwise, surface the original ErrTxNotFound — a "tx exists in store" alone is not proof of validation
+			// (a re-org or DAH window could expose a stale or mid-flight record).
+			txMetaData = &meta.Data{}
+			if metaErr := v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); metaErr == nil {
+				if len(txMetaData.BlockIDs) > 0 && !txMetaData.Conflicting && !txMetaData.Locked {
+					v.logger.Warnf("[Validate][%s] parent tx DAH-evicted, child already mined and not conflicting/locked, assuming blessed (BlockIDs=%v)", txID, txMetaData.BlockIDs)
+
+					return txMetaData, nil
 				}
 			}
-
-			err = errors.NewProcessingError("[Validate][%s] error spending utxos", txID, err)
-			span.RecordError(err)
-
-			return nil, err
 		}
+
+		err = errors.NewProcessingError("[Validate][%s] error spending utxos", txID, err)
+		span.RecordError(err)
+
+		return nil, err
 	}
 
 	// the option blockAssemblyDisabled is false by default
