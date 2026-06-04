@@ -148,6 +148,23 @@ type Store struct {
 
 	// batchOperateFn is a test-only override for s.client.BatchOperate; nil means use the real client.
 	batchOperateFn func(*aerospike.BatchPolicy, []aerospike.BatchRecordIfc) aerospike.Error
+
+	// batcherWait bounds how long a submitter waits for a batcher to deliver a
+	// result before giving up, so a wedged dispatch fn can never park a caller
+	// for the life of the process. Computed once from the batch policy.
+	batcherWait time.Duration
+}
+
+// batchOperate runs a batch through the underlying Aerospike client, honouring
+// the test-only batchOperateFn override when set. Centralising the call lets
+// unit tests drive the dispatch functions' panic/error/result paths without a
+// live Aerospike instance.
+func (s *Store) batchOperate(policy *aerospike.BatchPolicy, records []aerospike.BatchRecordIfc) aerospike.Error {
+	if s.batchOperateFn != nil {
+		return s.batchOperateFn(policy, records)
+	}
+
+	return s.client.BatchOperate(policy, records)
 }
 
 // New creates a new Aerospike-based UTXO store.
@@ -225,6 +242,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		utxoBatchSize:    utxoBatchSize,
 		externalTxCache:  externalTxCache,
 		externalStoreSem: externalStoreSem,
+		batcherWait:      batcherWaitTimeout(tSettings),
 	}
 
 	// Initialize spendLuaPackages array with configurable count
