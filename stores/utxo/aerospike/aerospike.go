@@ -516,32 +516,43 @@ func (s *Store) Close(ctx context.Context) error {
 
 	go func() {
 		defer close(done)
-		// Order is intentional: stop accepting new write ops first (no-op
-		// here because Put/PutCtx don't have a separate close-gate), then
-		// drain in dependency order. setDAH/locked/outpoint/increment are
-		// best-effort metadata writers; store/spend are the durable UTXO
-		// state writers and are drained last to maximise their chance of
-		// committing before the deadline.
-		if s.setDAHBatcher != nil {
-			s.setDAHBatcher.Close()
-		}
-		if s.lockedBatcher != nil {
-			s.lockedBatcher.Close()
-		}
-		if s.outpointBatcher != nil {
-			s.outpointBatcher.Close()
-		}
-		if s.incrementBatcher != nil {
-			s.incrementBatcher.Close()
-		}
-		if s.getBatcher != nil {
-			s.getBatcher.Close()
+		// Order is dependency-driven: a batcher whose drain callback enqueues
+		// into another batcher MUST be closed before that downstream batcher,
+		// otherwise the drain Puts into an already-closed input channel and
+		// go-batcher panics with "send on closed channel". The only such edge
+		// is the spend batcher: sendSpendBatchLua -> processSpendBatchResults
+		// -> SetDAHForChildRecords / IncrementSpentRecords enqueue into
+		// setDAHBatcher (spend.go) and incrementBatcher (spend.go). So spend
+		// must be drained before setDAH and increment.
+		//
+		// We therefore drain the producer/durable writers first (store, then
+		// spend), then spend's downstream consumers (setDAH, increment), then
+		// the remaining independent batchers (get, outpoint, locked). store
+		// feeds no other batcher; get/outpoint/locked are not fed by any
+		// batcher drain. (Closing each batcher blocks until its worker has
+		// drained — go-batcher v2.0.4.)
+		if s.storeBatcher != nil {
+			s.storeBatcher.Close()
 		}
 		if s.spendBatcher != nil {
 			s.spendBatcher.Close()
 		}
-		if s.storeBatcher != nil {
-			s.storeBatcher.Close()
+		// Downstream consumers of the spend drain — must come after spend.
+		if s.setDAHBatcher != nil {
+			s.setDAHBatcher.Close()
+		}
+		if s.incrementBatcher != nil {
+			s.incrementBatcher.Close()
+		}
+		// Independent batchers (no inbound batcher-drain edge).
+		if s.getBatcher != nil {
+			s.getBatcher.Close()
+		}
+		if s.outpointBatcher != nil {
+			s.outpointBatcher.Close()
+		}
+		if s.lockedBatcher != nil {
+			s.lockedBatcher.Close()
 		}
 
 		// Drains complete; close the external blob store (created in
