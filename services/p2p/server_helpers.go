@@ -112,9 +112,13 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 		return
 	}
 
-	// Note: we intentionally do NOT filter blocks from unhealthy peers here.
-	// Block validation handles bad blocks safely, and filtering blocks from
-	// low-reputation peers prevents catchup when the node is behind.
+	// Note: we intentionally do NOT filter blocks from unhealthy peers here,
+	// unlike handleSubtreeTopic. Block announcements are what *trigger* catchup,
+	// so dropping them from low-reputation peers stops a node that is behind from
+	// ever starting catchup when its only available peers have low reputation.
+	// Block validation handles bad blocks safely, and catchup fetches blocks and
+	// their subtrees directly over HTTP (not via the gossip subtree handler), so
+	// the reputation filter retained in handleSubtreeTopic does not affect catchup.
 
 	hash, err = s.parseHash(blockMessage.Hash, "handleBlockTopic")
 	if err != nil {
