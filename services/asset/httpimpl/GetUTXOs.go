@@ -114,7 +114,7 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 		results := make([]*utxo.SpendResponse, numRecords)
 
 		g, gCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(g, utxosFanoutLimit)
+		util.SafeSetLimit(h.logger, g, utxosFanoutLimit)
 
 		for i := 0; i < numRecords; i++ {
 			recOffset := i * utxosRequestRecordSize

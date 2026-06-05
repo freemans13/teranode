@@ -874,7 +874,7 @@ func (v *Validator) twoPhaseCommitTransaction(ctx context.Context, tx *bt.Tx, tx
 func (v *Validator) getUtxoBlockHeightsAndExtendTx(ctx context.Context, tx *bt.Tx, txID string, validationOptions *Options) ([]uint32, error) {
 	// get the block heights of the input transactions of the transaction
 	g, gCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(g, v.settings.UtxoStore.GetBatcherSize)
+	util.SafeSetLimit(v.logger, g, v.settings.UtxoStore.GetBatcherSize)
 
 	parentTxHashes := make(map[chainhash.Hash][]int)
 	utxoHeights := make([]uint32, len(tx.Inputs))

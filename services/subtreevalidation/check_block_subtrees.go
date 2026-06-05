@@ -98,7 +98,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	// concurrency at CheckBlockSubtreesConcurrency keeps the burst predictable.
 	subtreeMissing := make([]bool, len(block.Subtrees))
 	existsGroup, existsCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(existsGroup, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
+	util.SafeSetLimit(u.logger, existsGroup, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
 
 	for idx, subtreeHash := range block.Subtrees {
 		idx := idx
@@ -253,7 +253,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		subtreeTxs := make([][]*bt.Tx, len(batchSubtrees))
 		batchArenas := make([]*bt.Arena, len(batchSubtrees))
 		g, gCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
+		util.SafeSetLimit(u.logger, g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
 
 		for subtreeIdx, subtreeHash := range batchSubtrees {
 			subtreeHash := subtreeHash
@@ -652,7 +652,7 @@ func (u *Server) validateMissingSubtreesWithOrderedRetry(
 	failedParallel := make([]bool, len(missingSubtrees))
 
 	g, gCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
+	util.SafeSetLimit(u.logger, g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
 
 	for i, subtreeHash := range missingSubtrees {
 		i, subtreeHash := i, subtreeHash
@@ -734,7 +734,7 @@ func (u *Server) validateMissingSubtreesWithOrderedRetryAccumulated(
 	subtreeDeltas := make([]map[chainhash.Hash]*validator.ParentTxMetadata, len(missingSubtrees))
 
 	g, gCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
+	util.SafeSetLimit(u.logger, g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
 
 	// Single shared read-only snapshot of the live accumulator. All Phase 2
 	// goroutines reference this same map for reads; writes go to per-subtree
@@ -1194,7 +1194,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 		// Process all transactions at this level in parallel
 		g, gCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(g, u.settings.SubtreeValidation.SpendBatcherSize*2)
+		util.SafeSetLimit(u.logger, g, u.settings.SubtreeValidation.SpendBatcherSize*2)
 
 		for _, mTx := range levelTxs {
 			tx := mTx.tx

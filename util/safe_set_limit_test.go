@@ -4,6 +4,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -28,10 +29,12 @@ func TestSafeSetLimit(t *testing.T) {
 		require.Equal(t, int32(n), counter.Load())
 	}
 
+	logger := ulogger.TestLogger{}
+
 	t.Run("valid positive limit", func(t *testing.T) {
 		g := &errgroup.Group{}
 
-		SafeSetLimit(g, 2)
+		SafeSetLimit(logger, g, 2)
 		runAll(t, g, 5)
 	})
 
@@ -40,14 +43,14 @@ func TestSafeSetLimit(t *testing.T) {
 
 		// Must not panic and must not deadlock — a raw SetLimit(0) would make
 		// every Go call block forever.
-		SafeSetLimit(g, 0)
+		SafeSetLimit(logger, g, 0)
 		runAll(t, g, 5)
 	})
 
 	t.Run("negative limit falls back to a usable default", func(t *testing.T) {
 		g := &errgroup.Group{}
 
-		SafeSetLimit(g, -1)
+		SafeSetLimit(logger, g, -1)
 		runAll(t, g, 5)
 	})
 }

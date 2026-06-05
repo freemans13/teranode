@@ -131,7 +131,7 @@ func (h *HTTP) GetTransactions() func(c echo.Context) error {
 
 		// Read the body into a 32 byte hashes one by one and stream the tx data back to the client
 		g, gCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(g, 1024)
+		util.SafeSetLimit(h.logger, g, 1024)
 
 		responseBytes := make([]byte, 0, 32*1024*1024) // 32MB initial capacity
 		responseBytesMu := sync.Mutex{}

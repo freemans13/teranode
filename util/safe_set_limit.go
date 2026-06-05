@@ -3,6 +3,7 @@ package util
 import (
 	"runtime"
 
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -17,13 +18,20 @@ import (
 // panic or deadlock, SafeSetLimit falls back to a safe default of
 // runtime.NumCPU() whenever the requested limit is less than 1.
 //
+// The fallback is logged at WARN so the underlying misconfiguration is never
+// silent — the system stays up, but the bad setting is still visible.
+//
 // Parameters:
+//   - logger: used to warn when the limit is clamped to the default
 //   - g: The errgroup.Group to set the limit on
 //   - limit: The maximum number of goroutines active at once; values < 1 fall
 //     back to runtime.NumCPU().
-func SafeSetLimit(g *errgroup.Group, limit int) {
+func SafeSetLimit(logger ulogger.Logger, g *errgroup.Group, limit int) {
 	if limit < 1 {
-		limit = runtime.NumCPU()
+		def := runtime.NumCPU()
+		logger.Warnf("SafeSetLimit: limit %d < 1, clamping to runtime.NumCPU()=%d", limit, def)
+
+		limit = def
 	}
 
 	g.SetLimit(limit)
