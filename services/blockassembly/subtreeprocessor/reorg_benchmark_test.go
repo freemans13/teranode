@@ -251,17 +251,24 @@ func buildAndStoreSubtrees(b *testing.B, store *blob_memory.Memory, txHashes []c
 			require.NoError(b, err)
 		}
 
+		// The first subtree reserves slot 0 for the coinbase, so it can hold
+		// one fewer real transaction. Track how many tx hashes we consume from
+		// txHashes[idx:] explicitly so no hash is skipped (the coinbase occupies
+		// the slot, not a tx hash).
+		consumed := 0
 		for i := 0; i < count; i++ {
 			if isFirst && i == 0 {
-				// Skip first slot for coinbase in first subtree
+				// Slot 0 is the coinbase in the first subtree; it does not
+				// consume a tx hash from txHashes.
 				continue
 			}
 			err = subtree.AddSubtreeNode(subtreepkg.Node{
-				Hash:        txHashes[idx+i],
+				Hash:        txHashes[idx+consumed],
 				Fee:         100,
 				SizeInBytes: 250,
 			})
 			require.NoError(b, err)
+			consumed++
 
 			if subtree.IsComplete() {
 				break
@@ -290,12 +297,8 @@ func buildAndStoreSubtrees(b *testing.B, store *blob_memory.Memory, txHashes []c
 		hashCopy := *rootHash
 		subtreeRootHashes = append(subtreeRootHashes, &hashCopy)
 
-		// Move index forward by actual number of non-coinbase nodes added
-		if isFirst {
-			idx += subtree.Length() - 1 // subtract coinbase
-		} else {
-			idx += subtree.Length()
-		}
+		// Move index forward by the number of tx hashes actually consumed.
+		idx += consumed
 	}
 
 	return subtreeRootHashes
@@ -983,16 +986,23 @@ func buildAndStoreSubtreesT(t *testing.T, store *blob_memory.Memory, txHashes []
 			require.NoError(t, err)
 		}
 
+		// The first subtree reserves slot 0 for the coinbase, so it can hold
+		// one fewer real transaction. Track how many tx hashes we consume from
+		// txHashes[idx:] explicitly so no hash is skipped.
+		consumed := 0
 		for i := 0; i < count; i++ {
 			if isFirst && i == 0 {
+				// Slot 0 is the coinbase in the first subtree; it does not
+				// consume a tx hash from txHashes.
 				continue
 			}
 			err = subtree.AddSubtreeNode(subtreepkg.Node{
-				Hash:        txHashes[idx+i],
+				Hash:        txHashes[idx+consumed],
 				Fee:         100,
 				SizeInBytes: 250,
 			})
 			require.NoError(t, err)
+			consumed++
 
 			if subtree.IsComplete() {
 				break
@@ -1019,11 +1029,8 @@ func buildAndStoreSubtreesT(t *testing.T, store *blob_memory.Memory, txHashes []
 		hashCopy := *rootHash
 		subtreeRootHashes = append(subtreeRootHashes, &hashCopy)
 
-		if isFirst {
-			idx += subtree.Length() - 1
-		} else {
-			idx += subtree.Length()
-		}
+		// Move index forward by the number of tx hashes actually consumed.
+		idx += consumed
 	}
 
 	return subtreeRootHashes

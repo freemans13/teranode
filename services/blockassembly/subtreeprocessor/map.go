@@ -312,6 +312,11 @@ func (s *SplitTxInpointsMap) ParallelBulkSetIfNotExists(
 				if !b.m.Has(hashes[idx]) {
 					b.m.Put(hashes[idx], inpoints[idx])
 					wasSet[idx] = true
+				} else {
+					// Explicitly record the existing-key result so the contract
+					// (wasSet[i] reflects the outcome for hashes[i]) holds even if
+					// the caller reuses a slice with stale true values.
+					wasSet[idx] = false
 				}
 			}
 			b.mu.Unlock()

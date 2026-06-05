@@ -103,11 +103,12 @@ func BenchmarkMarkTransactionsProductionScale(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
+				// Keep the timed section free of per-iteration logging and
+				// time.Now/time.Since bookkeeping; b.Elapsed below is the
+				// authoritative measurement.
 				onLongestChain := (i % 2) == 0
-				start := time.Now()
 				err := store.MarkTransactionsOnLongestChain(ctx, txHashes, onLongestChain)
 				require.NoError(b, err)
-				b.Logf("  Iter %d: %v (%.0f tx/sec)", i+1, time.Since(start), float64(tc.count)/time.Since(start).Seconds())
 			}
 
 			b.StopTimer()
@@ -214,17 +215,14 @@ func BenchmarkConcurrentVsSequentialMarking(b *testing.B) {
 			b.Run("sequential", func(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					start := time.Now()
-
+					// Keep the timed section free of per-iteration logging and
+					// time.Now/time.Since bookkeeping; the benchmark framework
+					// (b.Elapsed) provides the authoritative measurement below.
 					err := store.MarkTransactionsOnLongestChain(ctx, markTrueHashes, true)
 					require.NoError(b, err)
 
 					err = store.MarkTransactionsOnLongestChain(ctx, markFalseHashes, false)
 					require.NoError(b, err)
-
-					elapsed := time.Since(start)
-					b.Logf("  Iter %d: %v (%.0f tx/sec total)", i+1, elapsed,
-						float64(tc.count*2)/elapsed.Seconds())
 				}
 				b.StopTimer()
 				throughput := float64(tc.count*2*b.N) / b.Elapsed().Seconds()
@@ -244,8 +242,9 @@ func BenchmarkConcurrentVsSequentialMarking(b *testing.B) {
 			b.Run("concurrent", func(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					start := time.Now()
-
+					// Keep the timed section free of per-iteration logging and
+					// time.Now/time.Since bookkeeping; b.Elapsed below is the
+					// authoritative measurement.
 					g, gCtx := errgroup.WithContext(ctx)
 					g.Go(func() error {
 						return store.MarkTransactionsOnLongestChain(gCtx, markTrueHashes, true)
@@ -255,10 +254,6 @@ func BenchmarkConcurrentVsSequentialMarking(b *testing.B) {
 					})
 					err := g.Wait()
 					require.NoError(b, err)
-
-					elapsed := time.Since(start)
-					b.Logf("  Iter %d: %v (%.0f tx/sec total)", i+1, elapsed,
-						float64(tc.count*2)/elapsed.Seconds())
 				}
 				b.StopTimer()
 				throughput := float64(tc.count*2*b.N) / b.Elapsed().Seconds()
