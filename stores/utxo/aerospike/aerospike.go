@@ -148,6 +148,23 @@ type Store struct {
 
 	// batchOperateFn is a test-only override for s.client.BatchOperate; nil means use the real client.
 	batchOperateFn func(*aerospike.BatchPolicy, []aerospike.BatchRecordIfc) aerospike.Error
+
+	// batcherWait bounds how long a submitter waits for a batcher to deliver a
+	// result before giving up, so a wedged dispatch fn can never park a caller
+	// for the life of the process. Computed once from the batch policy.
+	batcherWait time.Duration
+}
+
+// batchOperate runs a batch through the underlying Aerospike client, honouring
+// the test-only batchOperateFn override when set. Centralising the call lets
+// unit tests drive the dispatch functions' panic/error/result paths without a
+// live Aerospike instance.
+func (s *Store) batchOperate(policy *aerospike.BatchPolicy, records []aerospike.BatchRecordIfc) aerospike.Error {
+	if s.batchOperateFn != nil {
+		return s.batchOperateFn(policy, records)
+	}
+
+	return s.client.BatchOperate(policy, records)
 }
 
 // New creates a new Aerospike-based UTXO store.
@@ -225,6 +242,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		utxoBatchSize:    utxoBatchSize,
 		externalTxCache:  externalTxCache,
 		externalStoreSem: externalStoreSem,
+		batcherWait:      batcherWaitTimeout(tSettings),
 	}
 
 	// Initialize spendLuaPackages array with configurable count
@@ -380,6 +398,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Drain mode is beneficial for stages that receive bursts (Get, Create)
 	// but harmful for stages where items trickle in one-at-a-time (Spend,
 	// SetLocked) — single-item batches trigger Aerospike executeSingle fallback.
+	// Outpoint sits between the two. Benchmarking the post-#893
+	// BatchPreviousOutputsDecorate fan-out (drain on vs off, see
+	// BenchmarkBatchPreviousOutputsDecorateDrainMode) showed drain mode is
+	// bimodal/heavy-tailed on that concurrent path: at mid tx counts (~64-256)
+	// drain=false is rock-stable while drain=true has an unpredictable mean
+	// (some runs several× slower). A node's concurrent decorate path wants
+	// predictable latency, so it stays default off there. The clean win is the
+	// single-producer, separate-process caller cmd/rewindblockchain, where each
+	// PreviousOutputsDecorate otherwise idles the full 10 ms timer with nothing
+	// else to fill the batch. Operators opt in.
 	if tSettings.UtxoStore.GetBatcherDrainMode {
 		s.getBatcher.SetDrainMode(true)
 	}
@@ -391,6 +419,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 	if tSettings.UtxoStore.LockedBatcherDrainMode {
 		s.lockedBatcher.SetDrainMode(true)
+	}
+	if tSettings.UtxoStore.OutpointBatcherDrainMode {
+		s.outpointBatcher.SetDrainMode(true)
 	}
 
 	// Per-batcher tick interval (fixed-cadence flushing). Applied after drain mode
