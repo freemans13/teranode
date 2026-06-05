@@ -29,7 +29,7 @@ jobs:
             bench_filter: "BenchmarkDirect|BenchmarkSubtree|BenchmarkParallel|BenchmarkSequential|BenchmarkProcess"
           - group: subtreeprocessor-heavy
             packages: ./services/blockassembly/subtreeprocessor
-            bench_filter: "BenchmarkBlockAssembler_AddTx|BenchmarkAddNode"
+            bench_filter: "^(BenchmarkBlockAssembler_AddTx|BenchmarkAddNode|BenchmarkAddNodeWithMap)$"
           - group: blockvalidation
             packages: ./services/blockvalidation
           - group: subtreevalidation-buffer

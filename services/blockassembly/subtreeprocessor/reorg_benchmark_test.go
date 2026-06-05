@@ -340,6 +340,10 @@ func resetProcessorState(b *testing.B, state *reorgBenchState) {
 // BenchmarkMoveBackBlock benchmarks the moveBackBlock operation in isolation.
 // This measures: blob reads + deserialization + per-node addNode calls for block txs + mempool txs.
 func BenchmarkMoveBackBlock(b *testing.B) {
+	if testing.Short() {
+		b.Skip("heavy reorg benchmark; skipped in -short (CI passes -short)")
+	}
+
 	benchmarks := []struct {
 		name           string
 		blockTxCount   int
@@ -364,7 +368,6 @@ func BenchmarkMoveBackBlock(b *testing.B) {
 				b.StopTimer()
 				resetProcessorState(b, state)
 				populateMempool(b, state)
-				runtime.GC()
 				b.StartTimer()
 
 				_, _, err := state.stp.moveBackBlock(context.Background(), state.moveBackBlock, false)
@@ -383,6 +386,10 @@ func BenchmarkMoveBackBlock(b *testing.B) {
 // BenchmarkMoveForwardBlock benchmarks the moveForwardBlock operation in isolation.
 // This measures: subtree filtering + transaction map creation + processRemainderTxHashes.
 func BenchmarkMoveForwardBlock(b *testing.B) {
+	if testing.Short() {
+		b.Skip("heavy reorg benchmark; skipped in -short (CI passes -short)")
+	}
+
 	benchmarks := []struct {
 		name           string
 		blockTxCount   int
@@ -424,7 +431,6 @@ func BenchmarkMoveForwardBlock(b *testing.B) {
 					Nonce:          0,
 				})
 
-				runtime.GC()
 				b.StartTimer()
 
 				_, _, err = state.stp.moveForwardBlock(context.Background(), state.moveForwardBlock, true, make(map[chainhash.Hash]struct{}), true, false)
@@ -441,6 +447,10 @@ func BenchmarkMoveForwardBlock(b *testing.B) {
 // BenchmarkFullReorg benchmarks the complete reorg path: moveBackBlock + moveForwardBlock.
 // This is the primary benchmark to track — it measures end-to-end reorg performance.
 func BenchmarkFullReorg(b *testing.B) {
+	if testing.Short() {
+		b.Skip("heavy reorg benchmark; skipped in -short (CI passes -short)")
+	}
+
 	benchmarks := []struct {
 		name            string
 		blockTxCount    int
@@ -481,7 +491,6 @@ func BenchmarkFullReorg(b *testing.B) {
 				b.StopTimer()
 				resetProcessorState(b, state)
 				populateMempool(b, state)
-				runtime.GC()
 				b.StartTimer()
 
 				// Step 1: moveBackBlock
@@ -519,6 +528,10 @@ func BenchmarkFullReorg(b *testing.B) {
 // BenchmarkAddNodeSequential benchmarks the per-node addNode overhead in isolation.
 // This isolates the mutex lock + append + IsComplete + map insert cost per transaction.
 func BenchmarkAddNodeSequential(b *testing.B) {
+	if testing.Short() {
+		b.Skip("heavy reorg benchmark; skipped in -short (CI passes -short)")
+	}
+
 	benchmarks := []struct {
 		name        string
 		nodeCount   int
@@ -567,7 +580,6 @@ func BenchmarkAddNodeSequential(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				runtime.GC()
 				b.StartTimer()
 
 				for j, node := range nodes {
@@ -585,6 +597,10 @@ func BenchmarkAddNodeSequential(b *testing.B) {
 // BenchmarkProcessRemainderTxHashes benchmarks the remainder processing after moveForwardBlock.
 // This isolates the filter + dedup + sequential addNode/addNodePreValidated cost.
 func BenchmarkProcessRemainderTxHashes(b *testing.B) {
+	if testing.Short() {
+		b.Skip("heavy reorg benchmark; skipped in -short (CI passes -short)")
+	}
+
 	benchmarks := []struct {
 		name            string
 		chainedSubtrees int
@@ -666,7 +682,6 @@ func BenchmarkProcessRemainderTxHashes(b *testing.B) {
 				stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, nil, nil, nil, newSubtreeChan)
 				require.NoError(b, err)
 
-				runtime.GC()
 				b.StartTimer()
 
 				err = stp.processRemainderTxHashes(ctx, chainedSubtrees, transactionMap, nil, currentTxMap, true)
@@ -685,6 +700,10 @@ func BenchmarkProcessRemainderTxHashes(b *testing.B) {
 // BenchmarkReorgMemoryProfile runs a single reorg iteration and reports detailed memory stats.
 // Not a proper benchmark (N=1), but useful for profiling memory usage.
 func BenchmarkReorgMemoryProfile(b *testing.B) {
+	if testing.Short() {
+		b.Skip("heavy reorg memory-profile benchmark; skipped in -short (CI passes -short)")
+	}
+
 	benchmarks := []struct {
 		name           string
 		blockTxCount   int
