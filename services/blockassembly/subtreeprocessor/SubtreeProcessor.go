@@ -3511,7 +3511,12 @@ func (stp *SubtreeProcessor) checkMarkNotOnLongestChain(ctx context.Context, inv
 
 	txMetas := make([]*meta.Data, len(markNotOnLongestChain))
 	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(max(stp.settings.UtxoStore.MaxMinedRoutines, stp.settings.UtxoStore.GetBatcherSize*2))
+	// Use SafeSetLimit (matching every other SetLimit call in this file): it
+	// panics loudly at setup if the computed limit is 0 (a misconfiguration with
+	// both MaxMinedRoutines and GetBatcherSize at 0) rather than letting g.Go
+	// deadlock on a zero-capacity semaphore. With defaults (MaxMinedRoutines=128)
+	// this is always >= 1.
+	util.SafeSetLimit(g, max(stp.settings.UtxoStore.MaxMinedRoutines, stp.settings.UtxoStore.GetBatcherSize*2))
 
 	// we need to check each transaction in the block we moved back and see if it is still on the longest chain or not
 	for idx, hash := range markNotOnLongestChain {
