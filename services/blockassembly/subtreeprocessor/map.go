@@ -261,11 +261,17 @@ func (s *SplitTxInpointsMap) SetIfNotExists(hash chainhash.Hash, inpoints *subtr
 	return inpoints, true
 }
 
+// Clear empties every bucket in place via swiss.Map.Clear, which zeroes the
+// existing control/group arrays and retains capacity, rather than discarding
+// each bucket map. This matches the pool-reuse approach of SplitSwissMap.Clear
+// and avoids per-Clear reallocation + rehashing on the next refill, which
+// matters because SplitTxInpointsMap.Clear is on the currentTxMap double-buffer
+// reuse path.
 func (s *SplitTxInpointsMap) Clear() {
 	for i := uint16(0); i < s.nrOfBuckets; i++ {
 		b := &s.buckets[i]
 		b.mu.Lock()
-		b.m = swiss.NewMap[chainhash.Hash, *subtreepkg.TxInpoints](64)
+		b.m.Clear()
 		b.mu.Unlock()
 	}
 }
@@ -297,30 +303,57 @@ func (s *SplitTxInpointsMap) ParallelBulkSetIfNotExists(
 		bucketIndices[bucket] = append(bucketIndices[bucket], i)
 	}
 
-	// Phase 2: Process each non-empty bucket in parallel (one lock per bucket)
-	var wg sync.WaitGroup
-	for bIdx := uint16(0); bIdx < s.nrOfBuckets; bIdx++ {
+	// Phase 2: Process buckets with a bounded pool of stride workers. Spawning
+	// one goroutine per non-empty bucket would create up to nrOfBuckets (default
+	// 16*1024) goroutines for a large bulk insert, where scheduler churn and
+	// memory spikes can dominate. Cap fan-out at GOMAXPROCS (matching
+	// SplitSwissMap.Clear / bulkBuildSubtrees); each worker strides over buckets.
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers > int(s.nrOfBuckets) {
+		numWorkers = int(s.nrOfBuckets)
+	}
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	processBucket := func(bIdx uint16) {
 		indices := bucketIndices[bIdx]
 		if len(indices) == 0 {
-			continue
+			return
 		}
-		wg.Add(1)
-		go func(b *txInpointsBucket, indices []int) {
-			defer wg.Done()
-			b.mu.Lock()
-			for _, idx := range indices {
-				if !b.m.Has(hashes[idx]) {
-					b.m.Put(hashes[idx], inpoints[idx])
-					wasSet[idx] = true
-				} else {
-					// Explicitly record the existing-key result so the contract
-					// (wasSet[i] reflects the outcome for hashes[i]) holds even if
-					// the caller reuses a slice with stale true values.
-					wasSet[idx] = false
-				}
+		b := &s.buckets[bIdx]
+		b.mu.Lock()
+		for _, idx := range indices {
+			if !b.m.Has(hashes[idx]) {
+				b.m.Put(hashes[idx], inpoints[idx])
+				wasSet[idx] = true
+			} else {
+				// Explicitly record the existing-key result so the contract
+				// (wasSet[i] reflects the outcome for hashes[i]) holds even if
+				// the caller reuses a slice with stale true values.
+				wasSet[idx] = false
 			}
-			b.mu.Unlock()
-		}(&s.buckets[bIdx], indices)
+		}
+		b.mu.Unlock()
+	}
+
+	if numWorkers == 1 {
+		for bIdx := uint16(0); bIdx < s.nrOfBuckets; bIdx++ {
+			processBucket(bIdx)
+		}
+		return
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for w := 0; w < numWorkers; w++ {
+		start := uint16(w)
+		go func() {
+			defer wg.Done()
+			for bIdx := start; bIdx < s.nrOfBuckets; bIdx += uint16(numWorkers) {
+				processBucket(bIdx)
+			}
+		}()
 	}
 	wg.Wait()
 }
