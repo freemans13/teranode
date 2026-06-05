@@ -782,6 +782,10 @@ func (m *MockBlockchainClient) CheckBlockIsInCurrentChain(ctx context.Context, b
 	// Default to true - blocks are on the current chain unless specifically testing reorg scenarios
 	return true, nil
 }
+func (m *MockBlockchainClient) OffChainBlockIDs(ctx context.Context) ([]uint32, uint32, bool, error) {
+	// Report rebuilding so callers fall back to per-block CheckBlockIsInCurrentChain.
+	return nil, 0, true, nil
+}
 func (m *MockBlockchainClient) CheckBlockIsAncestorOfBlock(ctx context.Context, blockIDs []uint32, blockHash *chainhash.Hash) (bool, error) {
 	// Default to false - blocks are not ancestors unless specifically testing reorg scenarios
 	return false, nil
