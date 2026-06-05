@@ -3437,6 +3437,10 @@ func TestBlockWorker_Optimistic_SkipsFetchSubtreeData(t *testing.T) {
 	afStateOptCfg.BootstrapMode = adaptivefetch.ModeOptimistic
 	afState, err := adaptivefetch.New(afStateOptCfg, "test-opt", prometheus.NewRegistry())
 	require.NoError(t, err)
+	// State starts pinned pessimistic; arm it (simulating first FSM RUNNING)
+	// so the optimistic bootstrap mode takes effect.
+	afState.Arm()
+	require.Equal(t, adaptivefetch.ModeOptimistic, afState.Mode())
 
 	var fetchCalls atomic.Int32
 	server := &Server{
@@ -3543,6 +3547,9 @@ func TestBlockvalidation_AdaptiveFetch_PessToOptToPess(t *testing.T) {
 	afE2ECfg.BootstrapMode = adaptivefetch.ModeAuto
 	af, err := adaptivefetch.New(afE2ECfg, "test-e2e", prometheus.NewRegistry())
 	require.NoError(t, err)
+	// State starts pinned pessimistic and unarmed; arm it (simulating first FSM
+	// RUNNING) so the auto Pess→Opt transition is enabled.
+	af.Arm()
 
 	// 10 pessimistic blocks with perfect hit rate (simulates pessimistic-mode
 	// "fake-perfect" observations emitted by blockWorker).

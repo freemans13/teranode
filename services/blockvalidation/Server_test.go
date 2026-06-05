@@ -1014,6 +1014,9 @@ func Test_Start(t *testing.T) {
 	// Create mock blockchain client
 	mockBlockchainClient := &blockchain.Mock{}
 	mockBlockchainClient.On("WaitUntilFSMTransitionFromIdleState", mock.Anything).Return(nil)
+	// Start launches a best-effort goroutine that waits for FSM RUNNING to arm
+	// the adaptive-fetch gate; stub it (Maybe — it races with shutdown).
+	mockBlockchainClient.On("WaitForFSMtoTransitionToGivenState", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	// Create mock kafka consumer
 	mockKafkaConsumer := &mockKafkaConsumer{}
@@ -1057,6 +1060,7 @@ func Test_Start_FSMTransitionError(t *testing.T) {
 	// Create mock blockchain client that returns error
 	mockBlockchainClient := &blockchain.Mock{}
 	mockBlockchainClient.On("WaitUntilFSMTransitionFromIdleState", mock.Anything).Return(errors.New(errors.ERR_BLOCK_NOT_FOUND, "FSM not ready"))
+	mockBlockchainClient.On("WaitForFSMtoTransitionToGivenState", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	// set the GRPC listen address to a random local port to avoid conflicts during testing
 	tSettings.BlockValidation.GRPCListenAddress = "localhost:0"
@@ -1087,6 +1091,7 @@ func Test_Start_FSMContextCancellation(t *testing.T) {
 
 	mockBlockchainClient := &blockchain.Mock{}
 	mockBlockchainClient.On("WaitUntilFSMTransitionFromIdleState", mock.Anything).Return(context.Canceled)
+	mockBlockchainClient.On("WaitForFSMtoTransitionToGivenState", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	tSettings.BlockValidation.GRPCListenAddress = "localhost:0"
 

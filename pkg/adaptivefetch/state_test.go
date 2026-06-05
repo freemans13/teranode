@@ -22,9 +22,36 @@ func TestNew_ReturnsPessimisticByDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ModePessimistic, s.Mode())
 	require.False(t, s.ShouldSkipSubtreeData())
+	require.False(t, s.Armed())
 }
 
-func TestNew_BootstrapOptimistic_StartsOptimistic(t *testing.T) {
+// TestNew_AlwaysStartsPessimisticUntilArmed pins the cold-start safety
+// invariant: regardless of BootstrapMode, a freshly constructed State is
+// pinned pessimistic and unarmed. Optimism is only applied by Arm (tripped by
+// the service on first FSM RUNNING). This guarantees no subtreeData skipping
+// during cold-start IBD.
+func TestNew_AlwaysStartsPessimisticUntilArmed(t *testing.T) {
+	for _, bootstrap := range []Mode{ModeAuto, ModeOptimistic, ModePessimistic} {
+		t.Run(bootstrap.String(), func(t *testing.T) {
+			s, err := New(Config{
+				WindowSize:                10,
+				PessToOptHitRateThreshold: 0.99,
+				OptToPessMissThreshold:    100,
+				OptToPessAvgMissThreshold: 10,
+				BootstrapMode:             bootstrap,
+			}, "test", prometheus.NewRegistry())
+			require.NoError(t, err)
+			require.Equal(t, ModePessimistic, s.Mode(),
+				"must start pessimistic before Arm regardless of BootstrapMode")
+			require.False(t, s.ShouldSkipSubtreeData())
+			require.False(t, s.Armed())
+		})
+	}
+}
+
+// TestArm_OptimisticBootstrap_SwitchesOnArm verifies a ModeOptimistic bootstrap
+// stays pessimistic until armed, then switches to optimistic immediately.
+func TestArm_OptimisticBootstrap_SwitchesOnArm(t *testing.T) {
 	s, err := New(Config{
 		WindowSize:                10,
 		PessToOptHitRateThreshold: 0.99,
@@ -33,20 +60,93 @@ func TestNew_BootstrapOptimistic_StartsOptimistic(t *testing.T) {
 		BootstrapMode:             ModeOptimistic,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
-	require.Equal(t, ModeOptimistic, s.Mode())
+	require.Equal(t, ModePessimistic, s.Mode(), "pessimistic until armed")
+
+	s.Arm()
+	require.True(t, s.Armed())
+	require.Equal(t, ModeOptimistic, s.Mode(), "optimistic bootstrap applies on Arm")
 	require.True(t, s.ShouldSkipSubtreeData())
 }
 
-func TestNew_BootstrapAuto_ResolvesToPessimistic(t *testing.T) {
+// TestArm_AutoDoesNotTransitionBeforeArm verifies the latch: with ModeAuto, no
+// number of perfect observations can flip Pess→Opt until Arm is called.
+func TestArm_AutoDoesNotTransitionBeforeArm(t *testing.T) {
 	s, err := New(Config{
-		WindowSize:                10,
+		WindowSize:                3,
 		PessToOptHitRateThreshold: 0.99,
 		OptToPessMissThreshold:    100,
 		OptToPessAvgMissThreshold: 10,
 		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+
+	// Many full windows of perfect observations must NOT flip while unarmed.
+	for i := 0; i < 30; i++ {
+		s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+		require.Equal(t, ModePessimistic, s.Mode(),
+			"unarmed auto must stay pessimistic at observation %d", i)
+	}
+
+	// Arming clears the pre-arm window, so it takes a fresh full window to flip.
+	s.Arm()
+	require.Equal(t, ModePessimistic, s.Mode(), "Arm clears window; not instantly optimistic")
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+	require.Equal(t, ModePessimistic, s.Mode(), "two-of-three after Arm must not flip")
+	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+	require.Equal(t, ModeOptimistic, s.Mode(), "fresh full window after Arm flips Pess→Opt")
+}
+
+// TestArm_ClearsWindow_NoInstantFlip explicitly guards that observations
+// gathered while pinned (e.g. fake-perfect IBD samples) cannot instantly
+// satisfy the Pess→Opt threshold the moment the node is armed.
+func TestArm_ClearsWindow_NoInstantFlip(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                3,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModeAuto,
+	}, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	// Fill a full window while unarmed.
+	for i := 0; i < 3; i++ {
+		s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
+	}
 	require.Equal(t, ModePessimistic, s.Mode())
+
+	// Arm must NOT see the pre-arm full window as a satisfied threshold.
+	s.Arm()
+	require.Equal(t, ModePessimistic, s.Mode(),
+		"pre-arm window must be discarded on Arm; no instant flip")
+}
+
+// TestArm_Idempotent verifies Arm is a one-way latch safe to call repeatedly.
+func TestArm_Idempotent(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                10,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModeOptimistic,
+	}, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	s.Arm()
+	s.Arm()
+	s.Arm()
+	require.True(t, s.Armed())
+	require.Equal(t, ModeOptimistic, s.Mode(), "repeated Arm is stable")
+}
+
+// TestArm_NilReceiver locks in the nil-safe contract for Arm/Armed.
+func TestArm_NilReceiver(t *testing.T) {
+	var s *State
+	require.NotPanics(t, func() {
+		s.Arm()
+	})
+	require.False(t, s.Armed())
 }
 
 func TestNew_RejectsInvalidConfig(t *testing.T) {
@@ -86,8 +186,8 @@ func TestNew_RejectsInvalidConfig(t *testing.T) {
 }
 
 func TestRecord_PessToOpt_HighHitRateFullWindow(t *testing.T) {
-	// BootstrapMode=Auto enables transitions; pinned pessimistic would not
-	// transition and is covered by TestBootstrapMode_PinnedDoesNotTransition.
+	// BootstrapMode=Auto enables transitions once armed; pinned pessimistic
+	// would not transition (TestBootstrapMode_PinnedPessimisticDoesNotTransition).
 	s, err := New(Config{
 		WindowSize:                5,
 		PessToOptHitRateThreshold: 0.99,
@@ -96,6 +196,7 @@ func TestRecord_PessToOpt_HighHitRateFullWindow(t *testing.T) {
 		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 
 	for i := 0; i < 4; i++ {
 		s.Record(Observation{TotalTxs: 1000, LocalHits: 1000, MissingFetches: 0})
@@ -107,8 +208,8 @@ func TestRecord_PessToOpt_HighHitRateFullWindow(t *testing.T) {
 }
 
 func TestRecord_PessStays_WhenHitRateBelowThreshold(t *testing.T) {
-	// BootstrapMode=Auto so transitions are enabled; the test verifies the
-	// threshold gates the transition (hit rate < threshold = no transition).
+	// BootstrapMode=Auto, armed, so transitions are enabled; the test verifies
+	// the threshold gates the transition (hit rate < threshold = no transition).
 	s, err := New(Config{
 		WindowSize:                3,
 		PessToOptHitRateThreshold: 0.99,
@@ -117,6 +218,7 @@ func TestRecord_PessStays_WhenHitRateBelowThreshold(t *testing.T) {
 		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 
 	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000})
 	s.Record(Observation{TotalTxs: 1000, LocalHits: 1000})
@@ -133,6 +235,7 @@ func TestRecord_OptToPess_SingleBadBlockTrips(t *testing.T) {
 		BootstrapMode:             ModeOptimistic,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 	require.Equal(t, ModeOptimistic, s.Mode())
 
 	s.Record(Observation{TotalTxs: 10000, LocalHits: 9800, MissingFetches: 200})
@@ -148,6 +251,7 @@ func TestRecord_OptStays_WhenMissesBelowSingleBlockThreshold(t *testing.T) {
 		BootstrapMode:             ModeOptimistic,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 
 	s.Record(Observation{TotalTxs: 10000, LocalHits: 9950, MissingFetches: 50})
 	require.Equal(t, ModeOptimistic, s.Mode())
@@ -162,6 +266,7 @@ func TestRecord_OptToPess_RollingAverageTrip(t *testing.T) {
 		BootstrapMode:             ModeOptimistic,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 
 	for i := 0; i < 4; i++ {
 		s.Record(Observation{TotalTxs: 10000, LocalHits: 9980, MissingFetches: 20})
@@ -186,6 +291,7 @@ func TestRecord_OptToPess_ThresholdBoundaryIsInclusive(t *testing.T) {
 			BootstrapMode:             ModeOptimistic,
 		}, "test", prometheus.NewRegistry())
 		require.NoError(t, err)
+		s.Arm()
 
 		// MissingFetches == OptToPessMissThreshold MUST trip (inclusive).
 		s.Record(Observation{TotalTxs: 10000, LocalHits: 9900, MissingFetches: 100})
@@ -202,6 +308,7 @@ func TestRecord_OptToPess_ThresholdBoundaryIsInclusive(t *testing.T) {
 			BootstrapMode:             ModeOptimistic,
 		}, "test", prometheus.NewRegistry())
 		require.NoError(t, err)
+		s.Arm()
 
 		// 5 observations of 10 misses each → average exactly 10 → MUST trip.
 		for i := 0; i < 4; i++ {
@@ -223,6 +330,7 @@ func TestRecord_ConcurrentIsRaceClean(t *testing.T) {
 		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 
 	const goroutines = 16
 	const perGoroutine = 200
@@ -244,6 +352,42 @@ func TestRecord_ConcurrentIsRaceClean(t *testing.T) {
 	require.Equal(t, ModeOptimistic, s.Mode())
 }
 
+// TestArm_ConcurrentWithRecordIsRaceClean exercises Arm racing against
+// concurrent Record/Mode calls to prove the latch is race-clean under -race.
+func TestArm_ConcurrentWithRecordIsRaceClean(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                64,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    1000,
+		OptToPessAvgMissThreshold: 100,
+		BootstrapMode:             ModeAuto,
+	}, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	const goroutines = 16
+	const perGoroutine = 200
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines + 1)
+	go func() {
+		defer wg.Done()
+		s.Arm()
+	}()
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				s.Record(Observation{TotalTxs: 1000, LocalHits: 1000})
+				_ = s.ShouldSkipSubtreeData()
+				_ = s.Mode()
+				_ = s.Armed()
+			}
+		}()
+	}
+	wg.Wait()
+	require.True(t, s.Armed())
+}
+
 func TestRecord_IgnoresInvalidObservations(t *testing.T) {
 	s, err := New(Config{
 		WindowSize:                3,
@@ -253,6 +397,7 @@ func TestRecord_IgnoresInvalidObservations(t *testing.T) {
 		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 
 	// Each of these should be silently dropped — window should stay empty,
 	// so a subsequent Pess→Opt should not fire until 3 VALID observations arrive.
@@ -280,6 +425,7 @@ func TestRecord_RingBufferWraparound(t *testing.T) {
 		BootstrapMode:             ModeOptimistic,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 
 	// Write 2×WindowSize observations to force wraparound. Mode should stay optimistic
 	// because all observations are clean.
@@ -303,6 +449,7 @@ func TestRecordIfMode_DropsCrossModeObservation(t *testing.T) {
 		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 
 	// Fill window with valid pessimistic observations so the next perfect
 	// pessimistic observation will flip the state to optimistic.
@@ -329,10 +476,50 @@ func TestRecordIfMode_DropsCrossModeObservation(t *testing.T) {
 		"matching-mode observation with MissingFetches above threshold must trip Opt→Pess")
 }
 
+// TestRecordSyntheticWarmup verifies the shared warm-up recording helper:
+// totalTxs<=0 is ignored, LocalHits is derived as totalTxs-missingFetches, and
+// the cross-mode guard from RecordIfMode is honoured.
+func TestRecordSyntheticWarmup(t *testing.T) {
+	s, err := New(Config{
+		WindowSize:                3,
+		PessToOptHitRateThreshold: 0.99,
+		OptToPessMissThreshold:    100,
+		OptToPessAvgMissThreshold: 10,
+		BootstrapMode:             ModeAuto,
+	}, "test", prometheus.NewRegistry())
+	require.NoError(t, err)
+	s.Arm()
+
+	// totalTxs <= 0 must be a no-op (window stays empty → no flip).
+	s.RecordSyntheticWarmup(ModePessimistic, 0, 0)
+	s.RecordSyntheticWarmup(ModePessimistic, -10, 0)
+
+	// Three perfect (missingFetches=0) warm-ups fill the window and flip.
+	for i := 0; i < 3; i++ {
+		s.RecordSyntheticWarmup(ModePessimistic, 1000, 0)
+	}
+	require.Equal(t, ModeOptimistic, s.Mode(),
+		"three perfect synthetic warm-ups must flip Pess→Opt")
+
+	// A warm-up carrying a real miss count above the single-block threshold,
+	// tagged with the live (optimistic) mode, must trip back.
+	s.RecordSyntheticWarmup(ModeOptimistic, 10000, 200)
+	require.Equal(t, ModePessimistic, s.Mode(),
+		"warm-up with missingFetches above threshold must trip Opt→Pess")
+}
+
+// TestRecordSyntheticWarmup_NilReceiver locks in the nil-safe contract.
+func TestRecordSyntheticWarmup_NilReceiver(t *testing.T) {
+	var s *State
+	require.NotPanics(t, func() {
+		s.RecordSyntheticWarmup(ModePessimistic, 100, 0)
+	})
+}
+
 // TestBootstrapMode_PinnedPessimisticDoesNotTransition pins the design
 // invariant that an explicitly-configured ModePessimistic stays pessimistic
-// regardless of how many perfect observations arrive. Only BootstrapMode=Auto
-// enables the Pess→Opt transition. See PR #745 Copilot review for rationale.
+// regardless of how many perfect observations arrive, EVEN AFTER Arm. Only
+// BootstrapMode=Auto enables the Pess→Opt transition. See PR #745 review.
 func TestBootstrapMode_PinnedPessimisticDoesNotTransition(t *testing.T) {
 	s, err := New(Config{
 		WindowSize:                3,
@@ -342,6 +529,7 @@ func TestBootstrapMode_PinnedPessimisticDoesNotTransition(t *testing.T) {
 		BootstrapMode:             ModePessimistic,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm() // even armed, pinned pessimistic must not drift
 	require.Equal(t, ModePessimistic, s.Mode())
 
 	// Many full windows of perfect observations must NOT trip Pess→Opt.
@@ -365,6 +553,7 @@ func TestBootstrapMode_PinnedOptimisticStillTripsOptToPess(t *testing.T) {
 		BootstrapMode:             ModeOptimistic,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 	require.Equal(t, ModeOptimistic, s.Mode())
 
 	// A single observation at or above OptToPessMissThreshold trips immediately.
@@ -390,6 +579,7 @@ func TestTransition_ClearsWindow_NoImmediateBackflip(t *testing.T) {
 		BootstrapMode:             ModeAuto,
 	}, "test", prometheus.NewRegistry())
 	require.NoError(t, err)
+	s.Arm()
 
 	// Fill window with perfect pessimistic observations → trip Pess→Opt.
 	for i := 0; i < 3; i++ {
@@ -466,8 +656,10 @@ func TestParseBootstrapMode(t *testing.T) {
 // package, this test's grep-style check fails and forces a review.
 //
 // Rationale: PR #598 was reverted via PR #647 because clock/FSM gating
-// cascaded under load. The adaptive-fetch design deliberately avoids
-// that whole class of bug by driving transitions solely from counts.
+// cascaded under load. The adaptive-fetch design deliberately avoids that
+// whole class of bug by driving transitions solely from counts. The
+// service-layer Arm latch keeps FSM (sync-state) knowledge OUT of this
+// package — Arm is a generic trigger, so this invariant still holds.
 func TestNoWallClockOrFSMDependency(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	require.NoError(t, err)

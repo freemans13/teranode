@@ -325,7 +325,15 @@ func New(
 		safeFallback := adaptivefetch.DefaultConfig()
 		safeFallback.BootstrapMode = adaptivefetch.ModePessimistic
 		logger.Errorf("[BlockValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults pinned to pessimistic", afErr)
-		af, _ = adaptivefetch.New(safeFallback, "blockvalidation", prometheus.DefaultRegisterer)
+
+		var fallbackErr error
+		if af, fallbackErr = adaptivefetch.New(safeFallback, "blockvalidation", prometheus.DefaultRegisterer); fallbackErr != nil {
+			// DefaultConfig() always passes validation, so this is unreachable
+			// in practice — but never swallow it. af stays nil; the gate's
+			// nil-receiver methods are safe and behave pessimistically (always
+			// fetch subtreeData), so the service degrades safely.
+			logger.Errorf("[BlockValidation] adaptive_fetch fallback construction failed (%v) — adaptive fetch disabled, always fetching subtreeData", fallbackErr)
+		}
 	}
 
 	bVal := &Server{
@@ -1103,6 +1111,24 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 			blockvalidation_api.RegisterBlockValidationAPIServer(server, u)
 			closeOnce.Do(func() { close(readyCh) })
 		}, nil)
+	})
+
+	// Arm the adaptive-fetch gate the first time the node reaches RUNNING.
+	// Until then the gate stays pinned pessimistic so a cold-start IBD never
+	// skips subtreeData (when the node is least likely to have txs locally).
+	// Once RUNNING the configured bootstrap behaviour applies, and the latch
+	// never re-locks — a later catch-up burst after RUNNING may use optimistic
+	// mode. Best-effort and FSM-knowledge lives here, not in pkg/adaptivefetch:
+	// on shutdown (ctx cancelled) we simply leave it pessimistic and return nil
+	// so this goroutine never tears down the service.
+	g.Go(func() error {
+		if err := u.blockchainClient.WaitForFSMtoTransitionToGivenState(gctx, blockchain.FSMStateRUNNING); err != nil {
+			u.logger.Infof("[BlockValidation] adaptive-fetch staying pessimistic; FSM did not reach RUNNING: %v", err)
+			return nil
+		}
+		u.logger.Infof("[BlockValidation] FSM reached RUNNING; arming adaptive-fetch (optimism now permitted per bootstrap mode)")
+		u.adaptiveFetch.Arm()
+		return nil
 	})
 
 	return g.Wait()

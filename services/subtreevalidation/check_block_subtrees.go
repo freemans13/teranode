@@ -428,40 +428,14 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					}
 				}
 
-				// Record a synthetic observation for the adaptive-fetch state machine.
-				//
-				// We don't measure real hit rate here — every subtree is stamped
-				// LocalHits=TotalTxs, MissingFetches=0. So the Pess→Opt switch is
-				// really just a warm-up timer: after WindowSize subtrees, the node
-				// tries optimistic. It is not a measurement of how local the txs
-				// actually were.
-				//
-				// Because MissingFetches is always 0, the automatic Opt→Pess switch
-				// never fires from this service. What that does and does not mean:
-				//   - It does NOT mean a wrong optimistic guess is dangerous. The
-				//     real validation downstream (see the prewarm note above) still
-				//     recovers any missing txs, so correctness is never at stake — a
-				//     bad guess just costs bandwidth.
-				//   - It DOES mean the mode gauge can stay stuck on "optimistic" even
-				//     while the node is quietly paying that bandwidth. The metric
-				//     under-reports; the node keeps working correctly.
-				// An operator who wants to force bulk-prewarming back on can set
-				// adaptive_fetch_bootstrap_mode to "pessimistic" and restart, but
-				// this is a tuning choice, not a recovery step. A future improvement
-				// is to feed real UTXO-hit and recovery counts in here so the
-				// Opt→Pess switch trips on its own.
-				txCount := subtreeToCheck.Length()
-				if txCount > 0 {
-					// Tag the observation with the mode we sampled before
-					// the fetch decision. RecordIfMode drops it if the live
-					// mode has since transitioned, preventing cross-mode
-					// samples from contaminating the rolling window.
-					u.adaptiveFetch.RecordIfMode(modeAtSample, adaptivefetch.Observation{
-						TotalTxs:       txCount,
-						LocalHits:      txCount,
-						MissingFetches: 0,
-					})
-				}
+				// Record a synthetic warm-up observation for the adaptive-fetch
+				// state machine. The rationale (why MissingFetches is 0 today,
+				// why that is safe, and the TODO to plumb real counts) lives
+				// once on adaptivefetch.State.RecordSyntheticWarmup. The State is
+				// armed on first FSM RUNNING (see Server), so a node stays
+				// pessimistic through cold-start IBD and only earns optimism once
+				// proven synced.
+				u.adaptiveFetch.RecordSyntheticWarmup(modeAtSample, subtreeToCheck.Length(), 0)
 
 				return nil
 			})

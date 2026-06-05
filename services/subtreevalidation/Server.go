@@ -220,7 +220,15 @@ func New(
 		safeFallback := adaptivefetch.DefaultConfig()
 		safeFallback.BootstrapMode = adaptivefetch.ModePessimistic
 		logger.Errorf("[SubtreeValidation] adaptive_fetch config invalid (%v) — using hardcoded defaults pinned to pessimistic", afErr)
-		af, _ = adaptivefetch.New(safeFallback, "subtreevalidation", prometheus.DefaultRegisterer)
+
+		var fallbackErr error
+		if af, fallbackErr = adaptivefetch.New(safeFallback, "subtreevalidation", prometheus.DefaultRegisterer); fallbackErr != nil {
+			// DefaultConfig() always passes validation, so this is unreachable
+			// in practice — but never swallow it. af stays nil; the gate's
+			// nil-receiver methods are safe and behave pessimistically (always
+			// fetch subtreeData), so the service degrades safely.
+			logger.Errorf("[SubtreeValidation] adaptive_fetch fallback construction failed (%v) — adaptive fetch disabled, always fetching subtreeData", fallbackErr)
+		}
 	}
 	u.adaptiveFetch = af
 
@@ -533,6 +541,21 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		u.logger.Errorf("[Subtree Validation Service] Failed to wait for FSM transition from IDLE state: %s", err)
 		return err
 	}
+
+	// Arm the adaptive-fetch gate the first time the node reaches RUNNING.
+	// Until then the gate stays pinned pessimistic so a cold-start IBD never
+	// skips subtreeData. Once RUNNING the configured bootstrap behaviour
+	// applies and the latch never re-locks (a later catch-up burst may use
+	// optimistic mode). Best-effort: on shutdown (ctx cancelled) we leave it
+	// pessimistic. FSM knowledge lives here so pkg/adaptivefetch stays FSM-free.
+	go func() {
+		if err := u.blockchainClient.WaitForFSMtoTransitionToGivenState(ctx, blockchain.FSMStateRUNNING); err != nil {
+			u.logger.Infof("[SubtreeValidation] adaptive-fetch staying pessimistic; FSM did not reach RUNNING: %v", err)
+			return
+		}
+		u.logger.Infof("[SubtreeValidation] FSM reached RUNNING; arming adaptive-fetch (optimism now permitted per bootstrap mode)")
+		u.adaptiveFetch.Arm()
+	}()
 
 	// start kafka consumers
 	u.subtreeConsumerClient.Start(ctx, u.subtreeMessageHandler(ctx), kafka.WithLogErrorAndMoveOn())

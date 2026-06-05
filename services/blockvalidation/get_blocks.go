@@ -260,44 +260,17 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				continue
 			}
 
-			// Record a synthetic observation for the adaptive-fetch state machine.
-			//
-			// We don't measure real hit rate here — every successful block is
-			// stamped LocalHits=TotalTxs, MissingFetches=0. So the Pess→Opt
-			// switch is really just a warm-up timer: after WindowSize good
-			// blocks in a row, the node tries optimistic. It is not a
-			// measurement of how local the txs actually were.
-			//
-			// Because MissingFetches is always 0, the automatic Opt→Pess switch
-			// never fires from this service. To be clear about what that does
-			// and does not mean:
-			//   - It does NOT mean a wrong optimistic guess is dangerous. The
-			//     real validation downstream still recovers any missing txs (see
-			//     the prewarm note above), so correctness and data integrity are
-			//     never at stake — a bad guess just costs bandwidth.
-			//   - It DOES mean the mode gauge can stay stuck on "optimistic"
-			//     even while the node is quietly paying that bandwidth. The
-			//     metric under-reports; the node keeps working correctly.
-			// An operator who wants to force the node back to bulk-prewarming
-			// can set adaptive_fetch_bootstrap_mode to "pessimistic" and
-			// restart, but this is a tuning choice, not a recovery step. A
-			// future improvement is to feed real miss counts in here so the
-			// Opt→Pess switch trips on its own.
+			// Record a synthetic warm-up observation for the adaptive-fetch
+			// state machine. The rationale (why MissingFetches is 0 today, why
+			// that is safe, and the TODO to plumb real counts) lives once on
+			// adaptivefetch.State.RecordSyntheticWarmup. This gate is only
+			// consulted during catch-up; the State is armed on first FSM
+			// RUNNING (see Server), so a cold-start IBD stays pessimistic.
 			txCount := 0
 			if work.block != nil {
 				txCount = int(work.block.TransactionCount)
 			}
-			if txCount > 0 {
-				// Tag the observation with the mode we sampled before the
-				// fetch decision. RecordIfMode drops it if the live mode
-				// has since transitioned, preventing cross-mode samples
-				// from contaminating the rolling window.
-				u.adaptiveFetch.RecordIfMode(modeAtSample, adaptivefetch.Observation{
-					TotalTxs:       txCount,
-					LocalHits:      txCount,
-					MissingFetches: 0,
-				})
-			}
+			u.adaptiveFetch.RecordSyntheticWarmup(modeAtSample, txCount, 0)
 
 			// Send result
 			result := resultItem{
