@@ -65,6 +65,7 @@ type stableCfg struct {
 	workers    []int
 	unstableCV float64 // CV (%) above which a cell is flagged unreliable
 	tier2      bool    // checkpoint/autovacuum control around the timed window
+	verbose    bool    // per-rep timestamped TPS line (for sustained-run observation)
 }
 
 func defaultStableCfg() stableCfg {
@@ -74,7 +75,11 @@ func defaultStableCfg() stableCfg {
 		measure:    time.Duration(envInt("THROUGHPUT_MEASURE_MS", 4000)) * time.Millisecond,
 		workers:    envWorkers("THROUGHPUT_WORKERS", []int{100, 500, 1000, 5000, 10000, 15000}),
 		unstableCV: 10.0,
-		tier2:      envInt("THROUGHPUT_TIER2", 1) != 0,
+		// Default on; disabled only when explicitly set to "0". (Cannot use envInt
+		// here — it rejects non-positive values, so "0" would fall through to the
+		// default and silently leave Tier 2 enabled.)
+		tier2:   os.Getenv("THROUGHPUT_TIER2") != "0",
+		verbose: os.Getenv("THROUGHPUT_VERBOSE") != "",
 	}
 }
 
@@ -385,7 +390,14 @@ func runStableValidator(t *testing.T, store utxo.Store, numWorkers, workerOffset
 		if elapsed <= 0 {
 			continue
 		}
-		samples = append(samples, float64(ops)/elapsed.Seconds())
+		tps := float64(ops) / elapsed.Seconds()
+		samples = append(samples, tps)
+		// Per-rep timestamped line: lets a sustained run be correlated against an
+		// external pg-stats monitor (checkpoint/autovacuum/WAL) to see which reps a
+		// background event landed in. Default-off so the normal sweep stays terse.
+		if cfg.verbose {
+			t.Logf("[rep] %s workers=%d rep=%d/%d tps=%.0f", time.Now().Format("15:04:05"), numWorkers, r+1, cfg.reps, tps)
+		}
 	}
 	return samples
 }
