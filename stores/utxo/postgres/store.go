@@ -208,6 +208,7 @@ func configureBatcher[T any](b *batcher.Batcher[T], maxConcurrent int, drain boo
 
 // Stop closes batchers and database connections.
 func (s *Store) Stop() {
+	s.stopPrunerCursor()
 	if s.createBatcher != nil {
 		s.createBatcher.Close()
 		s.createBatcher = nil
@@ -236,6 +237,8 @@ func (s *Store) Stop() {
 // committing before the deadline, and the pool is always closed once the drain
 // goroutine finishes so connections are not leaked even if ctx expired first.
 func (s *Store) Close(ctx context.Context) error {
+	s.stopPrunerCursor()
+
 	done := make(chan struct{})
 
 	go func() {
@@ -265,6 +268,17 @@ func (s *Store) Close(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// stopPrunerCursor cancels the background DAH cursor (Worker 2) if a pruner
+// service was started, so it does not outlive the store's connection pool.
+func (s *Store) stopPrunerCursor() {
+	s.prunerServiceMu.Lock()
+	ps := s.prunerService
+	s.prunerServiceMu.Unlock()
+	if pgps, ok := ps.(*postgresPrunerService); ok {
+		pgps.stop()
 	}
 }
 

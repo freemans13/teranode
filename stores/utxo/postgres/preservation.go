@@ -49,12 +49,15 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 // ProcessExpiredPreservations handles transactions whose preservation period has expired.
 // Sets delete_at_height = currentHeight + retention and clears preserve_until.
 func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
-	deleteAtHeight := currentHeight + s.settings.GetUtxoStoreBlockHeightRetention()
+	// Widen to int64 before adding so the sum cannot wrap in uint32 arithmetic.
+	// Stamping on expiry is unconditional by design (matches the aerospike store:
+	// the pruner's safety checks are the gate, not stamp-time eligibility).
+	deleteAtHeight := int64(currentHeight) + int64(s.settings.GetUtxoStoreBlockHeightRetention())
 
 	result, err := s.pool.Exec(ctx, `
 		UPDATE txs SET delete_at_height = $1, preserve_until = NULL
 		WHERE preserve_until IS NOT NULL AND preserve_until <= $2
-	`, int64(deleteAtHeight), int64(currentHeight))
+	`, deleteAtHeight, int64(currentHeight))
 	if err != nil {
 		return errors.NewStorageError("failed to process expired preservations", err)
 	}

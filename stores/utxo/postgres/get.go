@@ -521,6 +521,14 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		}
 		hashToTx[row.hash] = row
 	}
+	// Check rows.Err() BEFORE treating absent hashes as not-found: a mid-stream
+	// failure (connection reset, statement timeout) stops rows.Next() early with
+	// the error parked here. Without this, a truncated result set would wrongly
+	// mark existing transactions as TxNotFound and the function would return nil.
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
 	rows.Close()
 
 	// Mark not-found transactions.

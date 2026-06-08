@@ -605,11 +605,38 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 	return false
 }
 
-// Unspend reverses a previous spend operation by deleting from the spends table.
+// Unspend reverses a previous spend by deleting the owning spend rows and clearing
+// the now-invalid deferred-prune stamp on the affected parents — all in ONE
+// transaction so a reorg never observes a torn state (some outputs unspent while the
+// parent still carries a stale delete_at_height the pruner could act on).
+//
+// Ownership (matches the aerospike and sql stores): a spend row is removed only when
+// the caller's SpendingData token equals the stored spender. A non-owning caller — a
+// stale reorg record whose output has since been re-spent by a different tx — is a
+// no-op for that row (it must NOT wipe the live spender), but its parent still takes
+// part in the DAH housekeeping below. SpendingData is therefore mandatory: a nil
+// token is a hard error rather than an unconditional delete.
 func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) error {
 	if len(spends) == 0 {
 		return nil
 	}
+
+	// SpendingData is the ownership token — reject up front rather than risk
+	// deleting a spend we do not own.
+	for _, spend := range spends {
+		if spend == nil {
+			continue
+		}
+		if spend.SpendingData == nil {
+			return errors.NewProcessingError("[Unspend] SpendingData (ownership token) required for %s:%d", spend.TxID, spend.Vout)
+		}
+	}
+
+	pgxTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return errors.NewStorageError("[Unspend] begin: %v", err)
+	}
+	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
 	parentSet := make(map[chainhash.Hash]struct{}, len(spends))
 
@@ -617,11 +644,13 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		if spend == nil {
 			continue
 		}
-		_, err := s.pool.Exec(ctx,
-			`DELETE FROM spends WHERE prev_tx_hash = $1 AND prev_output_idx = $2`,
-			spend.TxID[:], spend.Vout,
-		)
-		if err != nil {
+		// Ownership-checked delete: the spending_data predicate ensures only this
+		// caller's spend row is removed. A mismatching (non-owning) caller deletes
+		// 0 rows — intentional — but still drives the parent's DAH housekeeping.
+		if _, err := pgxTx.Exec(ctx,
+			`DELETE FROM spends WHERE prev_tx_hash = $1 AND prev_output_idx = $2 AND spending_data = $3`,
+			spend.TxID[:], spend.Vout, spend.SpendingData.Bytes(),
+		); err != nil {
 			return errors.NewStorageError("[Unspend] failed for %s:%d", spend.TxID, spend.Vout, err)
 		}
 		if spend.TxID != nil {
@@ -629,40 +658,37 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		}
 	}
 
-	// After deleting spend rows the affected parents are no longer fully spent,
-	// so any deferred-DAH stamp they carry is now invalid. Clear it directly
-	// here (targeted, O(unspent)) rather than relying on the Worker 2 sweep,
-	// which now only enumerates bounded height ranges. This is the reorg-clear.
+	// Affected parents are no longer fully spent, so any deferred-DAH stamp they
+	// carry is now invalid. Clear it in the SAME transaction as the spend deletion
+	// (the reorg-clear) so the pruner can never see a deleted-spend / stale-DAH
+	// torn state. Housekeeping runs for every affected parent, including the
+	// non-owning no-op deletes above.
 	if len(parentSet) > 0 {
 		parentHashes := make([][]byte, 0, len(parentSet))
 		for h := range parentSet {
 			hb := h
 			parentHashes = append(parentHashes, hb[:])
 		}
-		if _, err := s.pool.Exec(ctx,
+		if _, err := pgxTx.Exec(ctx,
 			`UPDATE txs SET delete_at_height = NULL WHERE hash = ANY($1)`, parentHashes,
 		); err != nil {
-			return errors.NewStorageError("[Unspend] failed to clear delete_at_height", err)
+			return errors.NewStorageError("[Unspend] failed to clear delete_at_height: %v", err)
+		}
+
+		// If requested, lock the parents within the same transaction. SetLocked(true)
+		// semantics also clear DAH (already cleared above); keeping it in-tx preserves
+		// all-or-nothing with the spend reversal.
+		if len(flagAsLocked) > 0 && flagAsLocked[0] {
+			if _, err := pgxTx.Exec(ctx,
+				`UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash = ANY($1)`, parentHashes,
+			); err != nil {
+				return errors.NewStorageError("[Unspend] failed to lock parent txs: %v", err)
+			}
 		}
 	}
 
-	// If flagAsLocked is requested, lock the parent transactions.
-	if len(flagAsLocked) > 0 && flagAsLocked[0] {
-		uniqueHashes := make(map[chainhash.Hash]struct{}, len(spends))
-		for _, spend := range spends {
-			if spend != nil && spend.TxID != nil {
-				uniqueHashes[*spend.TxID] = struct{}{}
-			}
-		}
-		hashes := make([]chainhash.Hash, 0, len(uniqueHashes))
-		for h := range uniqueHashes {
-			hashes = append(hashes, h)
-		}
-		if len(hashes) > 0 {
-			if err := s.SetLocked(ctx, hashes, true); err != nil {
-				return errors.NewStorageError("[Unspend] failed to lock parent txs", err)
-			}
-		}
+	if err := pgxTx.Commit(ctx); err != nil {
+		return errors.NewStorageError("[Unspend] commit: %v", err)
 	}
 
 	return nil

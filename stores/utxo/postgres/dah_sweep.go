@@ -133,8 +133,16 @@ WITH candidates AS MATERIALIZED (
     LIMIT $3
 ),
 spend_agg AS (
-    SELECT s.prev_tx_hash AS hash, count(*) AS spent_count, max(s.spent_at_height) AS max_spent
-    FROM %[1]s s JOIN candidates c ON c.hash = s.prev_tx_hash
+    -- spent_count counts only spends of SPENDABLE outputs, so it is comparable to
+    -- out_agg.spendable_out below. Counting all spend rows (including any recorded
+    -- against a non-spendable output index) could spuriously satisfy the
+    -- fully-spent test and stamp DAH while a spendable output is still unspent.
+    SELECT s.prev_tx_hash AS hash,
+           count(*) FILTER (WHERE t.out_spendables[s.prev_output_idx::int + 1] = true) AS spent_count,
+           max(s.spent_at_height) AS max_spent
+    FROM %[1]s s
+    JOIN candidates c ON c.hash = s.prev_tx_hash
+    JOIN %[2]s t ON t.hash = s.prev_tx_hash
     GROUP BY s.prev_tx_hash
 ),
 out_agg AS (
@@ -242,8 +250,12 @@ func (s *Store) sweepDAHUpTo(ctx context.Context, toH int64, limit int) (int, er
 		total += n
 
 		// Advance the watermark only as far as this window actually swept, so a
-		// crash or cancellation never leaves a gap above the watermark.
-		if _, err := s.pool.Exec(ctx, `UPDATE dah_watermark SET last_swept_height = $1 WHERE id = 1`, stepTo); err != nil {
+		// crash or cancellation never leaves a gap above the watermark. The
+		// `last_swept_height < $1` guard makes the advance forward-only: if a
+		// concurrent sweeper (Prune + the cursor both call this) already advanced
+		// the watermark past stepTo, a lagging caller must not regress it and force
+		// a redundant re-sweep. Re-sweeping is idempotent, so a no-op here is safe.
+		if _, err := s.pool.Exec(ctx, `UPDATE dah_watermark SET last_swept_height = $1 WHERE id = 1 AND last_swept_height < $1`, stepTo); err != nil {
 			return total, errors.NewStorageError("[dahSweep] advance watermark: %v", err)
 		}
 		from = stepTo
@@ -377,7 +389,7 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 	// from the txs.out_spendables array, then stamp the ones that are fully spent.
 	tag, err := s.pool.Exec(ctx, `
 		WITH slice AS (
-			SELECT t.hash, t.mined_at_height,
+			SELECT t.hash, t.mined_at_height, t.out_spendables,
 			       COALESCE(cardinality(t.out_spendables), 0) AS total_out,
 			       COALESCE(cardinality(array_positions(t.out_spendables, true)), 0) AS spendable_out
 			FROM txs t
@@ -389,7 +401,11 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 			LIMIT $3
 		),
 		spend_agg AS (
-			SELECT s.prev_tx_hash AS hash, count(*) AS spent_count, max(s.spent_at_height) AS max_spent
+			-- Count only spends of SPENDABLE outputs (see sweepDAHRangePartition),
+			-- so spent_count is comparable to slice.spendable_out below.
+			SELECT s.prev_tx_hash AS hash,
+			       count(*) FILTER (WHERE sl.out_spendables[s.prev_output_idx::int + 1] = true) AS spent_count,
+			       max(s.spent_at_height) AS max_spent
 			FROM spends s JOIN slice sl ON sl.hash = s.prev_tx_hash
 			GROUP BY s.prev_tx_hash
 		),

@@ -19,10 +19,17 @@ func (s *Store) FreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *settin
 		// the slot exists, is not already frozen, and has no matching spends row.
 		// Performing the guard inside the UPDATE's WHERE closes the check-then-write
 		// race where two concurrent freezes both pass the check and both "succeed".
+		//
+		// Freezing is PER-OUTPUT (gold standard: aerospike freezes only the target
+		// slot). We deliberately do NOT set the transaction-level `frozen` column
+		// here: that column is the whole-tx freeze gate (set only at create via
+		// WithFrozen) and the spend-validation CTE checks it as `tx_frozen`, so
+		// setting it would block every other output of a multi-output tx. The
+		// per-output `out_frozens[slot]` flag is the sole gate for an individually
+		// frozen output.
 		tag, err := s.pool.Exec(ctx, `
 			UPDATE txs
-			SET out_frozens[$2::int + 1] = true,
-			    frozen = true
+			SET out_frozens[$2::int + 1] = true
 			WHERE hash = $1
 			  AND array_length(utxo_hashes, 1) >= $2::int + 1
 			  AND NOT COALESCE(out_frozens[$2::int + 1], false)

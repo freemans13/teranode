@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/stretchr/testify/require"
 )
 
@@ -169,24 +170,29 @@ func spendOneOutput(t *testing.T, store *Store, parentTx *bt.Tx, vout uint32, he
 }
 
 // unspendAll reverses every recorded spend of parentTx by reading the parent's
-// spend rows and calling store.Unspend. Unspend keys off TxID+Vout only, so
-// the reconstructed *utxo.Spend rows only need those two fields populated.
+// spend rows and calling store.Unspend. Unspend is ownership-checked, so each
+// reconstructed *utxo.Spend must carry the stored spending_data token (read back
+// here), mirroring how a real reorg caller derives its spends.
 func unspendAll(t *testing.T, store *Store, parentTx *bt.Tx) {
 	t.Helper()
 	ctx := context.Background()
 
 	parentHash := parentTx.TxIDChainHash()
 	rows, err := store.pool.Query(ctx,
-		`SELECT prev_output_idx FROM spends WHERE prev_tx_hash=$1`, parentHash[:])
+		`SELECT prev_output_idx, spending_data FROM spends WHERE prev_tx_hash=$1`, parentHash[:])
 	require.NoError(t, err)
 
 	var spends []*utxo.Spend
 	for rows.Next() {
 		var vout int64
-		require.NoError(t, rows.Scan(&vout))
+		var sdBytes []byte
+		require.NoError(t, rows.Scan(&vout, &sdBytes))
+		sd, sdErr := spendpkg.NewSpendingDataFromBytes(sdBytes)
+		require.NoError(t, sdErr)
 		spends = append(spends, &utxo.Spend{
-			TxID: parentHash,
-			Vout: uint32(vout),
+			TxID:         parentHash,
+			Vout:         uint32(vout),
+			SpendingData: sd,
 		})
 	}
 	rows.Close()

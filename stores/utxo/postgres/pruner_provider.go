@@ -43,22 +43,42 @@ type postgresPrunerService struct {
 	observers     []pruner.Observer
 	mu            sync.Mutex
 	cursorStarted bool
+	cursorCancel  context.CancelFunc
 }
 
 var _ pruner.Service = (*postgresPrunerService)(nil)
 
 // Start starts the pruner service and launches the continuous DAH cursor (Worker 2).
 // It is idempotent — subsequent calls are no-ops.
-func (s *postgresPrunerService) Start(ctx context.Context) {
+//
+// The background cursor runs under a store-owned context derived from
+// context.Background(), NOT the caller's ctx. The cursor is a long-lived worker
+// tied to the store's lifetime; binding it to a request- or startup-scoped ctx
+// would silently stop it (permanently, given the cursorStarted guard) when that
+// ctx is cancelled. It is stopped explicitly via stop() from Store.Stop/Close.
+func (s *postgresPrunerService) Start(_ context.Context) {
 	s.mu.Lock()
 	if s.cursorStarted {
 		s.mu.Unlock()
 		return
 	}
 	s.cursorStarted = true
+	cursorCtx, cancel := context.WithCancel(context.Background())
+	s.cursorCancel = cancel
 	s.mu.Unlock()
 	s.logger.Infof("[PostgresPrunerService] starting DAH cursor (Worker 2)")
-	go s.runDAHCursor(ctx)
+	go s.runDAHCursor(cursorCtx)
+}
+
+// stop cancels the background DAH cursor if it is running. Idempotent.
+func (s *postgresPrunerService) stop() {
+	s.mu.Lock()
+	cancel := s.cursorCancel
+	s.cursorCancel = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // AddObserver adds an observer to be notified when pruning completes.
@@ -204,9 +224,22 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	// spends and txs deleted in ONE statement, scoped to this partition's aligned
 	// leaves (same MODULUS). The data-modifying CTE always runs to completion; the
 	// top-level DELETE returns the txs parent row count.
+	//
+	// The DELETE re-checks delete_at_height at EXECUTION time (the `doomed` CTE)
+	// rather than trusting the earlier tombstone SELECT. Between that SELECT and
+	// this statement a concurrent reorg Unspend may have cleared delete_at_height
+	// on one of these hashes (the output was re-spent / the tx revived); the
+	// self-contained predicate excludes it so the pruner never deletes a tx whose
+	// stamp was withdrawn. Spend rows are deleted only for hashes that survive the
+	// re-check, so a revived tx keeps its spends.
 	cascadeSQL := fmt.Sprintf(`
-		WITH del_spends AS (DELETE FROM %s WHERE prev_tx_hash = ANY($1::bytea[]) RETURNING 1)
-		DELETE FROM %s WHERE hash = ANY($1::bytea[])`, spendsLeaf, txsLeaf)
+		WITH doomed AS (
+			SELECT hash FROM %[1]s
+			WHERE hash = ANY($1::bytea[])
+			  AND delete_at_height IS NOT NULL AND delete_at_height <= $2
+		),
+		del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1)
+		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf)
 
 	var deleted int64
 	for i := 0; i < len(hashes); i += pruneDeleteBatchSize {
@@ -221,7 +254,7 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		default:
 		}
 
-		tag, err := s.store.pool.Exec(ctx, cascadeSQL, hashes[i:end])
+		tag, err := s.store.pool.Exec(ctx, cascadeSQL, hashes[i:end], int64(blockHeight))
 		if err != nil {
 			return deleted, errors.NewStorageError("[pruner] cascade delete %s: %v", txsLeaf, err)
 		}

@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // GetCounterConflicting delegates to the store-agnostic implementation which
@@ -35,7 +36,8 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	// Compute delete_at_height when setting conflicting=true.
 	var deleteAtHeight *int64
 	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && setValue {
-		v := int64(s.blockHeight.Load() + 1 + s.settings.GetUtxoStoreBlockHeightRetention())
+		// Widen to int64 before adding so the sum cannot wrap in uint32 arithmetic.
+		v := int64(s.blockHeight.Load()) + 1 + int64(s.settings.GetUtxoStoreBlockHeightRetention())
 		deleteAtHeight = &v
 	}
 
@@ -66,9 +68,10 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		}
 
 		// Update txs: set conflicting flag + delete_at_height.
+		var tag pgconn.CommandTag
 		if setValue {
 			// When setting conflicting=true: set DAH only if not already set.
-			_, err = pgxTx.Exec(ctx, `
+			tag, err = pgxTx.Exec(ctx, `
 				UPDATE txs SET
 				  conflicting = $2,
 				  delete_at_height = COALESCE(delete_at_height, $3)
@@ -77,7 +80,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			)
 		} else {
 			// When clearing conflicting: clear DAH.
-			_, err = pgxTx.Exec(ctx, `
+			tag, err = pgxTx.Exec(ctx, `
 				UPDATE txs SET
 				  conflicting = $2,
 				  delete_at_height = $3
@@ -87,6 +90,13 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		}
 		if err != nil {
 			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", txHash, err)
+		}
+		// s.Get above read the row outside this transaction, so a concurrent prune
+		// could have deleted it between the read and this UPDATE. A 0-row update
+		// means the flag was never set — surface it rather than committing a no-op
+		// that the caller reads as a successful conflicting-mark.
+		if tag.RowsAffected() == 0 {
+			return nil, nil, errors.NewTxNotFoundError("[SetConflicting] transaction not found (concurrently removed?): %s", txHash)
 		}
 
 		// Append this tx as a conflicting child of each parent (array on txs).

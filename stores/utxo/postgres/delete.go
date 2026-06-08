@@ -85,7 +85,9 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	}
 
 	hasBlockIDs := len(blockIDs) > 0
-	newDAH := int64(s.blockHeight.Load() + 1 + retention)
+	// Widen to int64 BEFORE adding so the sum cannot wrap in uint32 arithmetic
+	// (blockHeight and retention are both uint32). Matches dah_sweep.go.
+	newDAH := int64(s.blockHeight.Load()) + 1 + int64(retention)
 
 	if allSpent && hasBlockIDs && onLongestChain {
 		// Set delete_at_height, but only bump forward (never decrease).
