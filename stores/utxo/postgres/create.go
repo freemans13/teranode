@@ -39,11 +39,11 @@ type batchCreateResult struct {
 // Array builders — pack transaction data into parallel arrays for UNNEST
 // ---------------------------------------------------------------------------
 
-// outputArrayParams holds parallel arrays for UNNEST output insertion.
+// outputArrayParams holds parallel arrays for txs array-column population.
+// locking_script and satoshis are recovered from raw_tx at read time (see
+// batchDecorateOutputs), so they are not stored separately here.
 type outputArrayParams struct {
 	idx                    []int64
-	lockingScript          [][]byte
-	satoshis               []int64
 	frozen                 []bool
 	utxoHash               [][]byte
 	coinbaseSpendingHeight []int64
@@ -64,8 +64,6 @@ func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blo
 
 	p := outputArrayParams{
 		idx:                    make([]int64, 0, count),
-		lockingScript:          make([][]byte, 0, count),
-		satoshis:               make([]int64, 0, count),
 		frozen:                 make([]bool, 0, count),
 		utxoHash:               make([][]byte, 0, count),
 		coinbaseSpendingHeight: make([]int64, 0, count),
@@ -84,26 +82,6 @@ func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blo
 			return outputArrayParams{}, err
 		}
 		p.idx = append(p.idx, int64(i))
-		// Coerce nil → empty []byte. The outputs.locking_script column is
-		// BYTEA NOT NULL; a zero-byte pkScript is legal on chain (BSV testnet
-		// has historical blocks with 1-sat anyone-can-spend outputs whose
-		// pkScript is genuinely 0 bytes — e.g. testnet block 50767 tx
-		// 38e6f72bc717d8a423e717f59c098b8f6f7adb2f0f85833ec02e4266bf3fad65,
-		// vout 0). Without this coercion the INSERT fails with
-		// "null value in column \"locking_script\" violates not-null
-		// constraint" and the block stalls forever in legacy catchup.
-		//
-		// nil arises because go-wire's arena.Alloc(0) returns nil, which
-		// propagates through bytes.Clone(nil) and []byte(*LockingScript).
-		// Empty []byte is valid bytea and round-trips correctly.
-		script := []byte{}
-		if output.LockingScript != nil {
-			if s := []byte(*output.LockingScript); s != nil {
-				script = s
-			}
-		}
-		p.lockingScript = append(p.lockingScript, script)
-		p.satoshis = append(p.satoshis, int64(output.Satoshis))
 		p.frozen = append(p.frozen, false)
 		p.utxoHash = append(p.utxoHash, utxoHash[:])
 		p.coinbaseSpendingHeight = append(p.coinbaseSpendingHeight, coinbaseSpendingHeight)
@@ -244,43 +222,52 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	}
 	defer conn.Release()
 
-	// Insert into txs.
+	// Build per-output txs arrays (parallel to outArrs; empty slice → NULL column).
+	// These are indexed 0-based in Go; Postgres 1-based subscripts are [i+1].
+	var txsUtxoHashes [][]byte
+	var txsOutSpendables []bool
+	var txsOutFrozens []bool
+	var txsCoinbaseSpendingHeights []int64
+	var txsSpendableIns []*int32 // pointer so nil elements become SQL NULL
+	if len(outArrs.idx) > 0 {
+		cnt := len(outArrs.idx)
+		txsUtxoHashes = make([][]byte, cnt)
+		txsOutSpendables = make([]bool, cnt)
+		txsOutFrozens = make([]bool, cnt)
+		txsCoinbaseSpendingHeights = make([]int64, cnt)
+		txsSpendableIns = make([]*int32, cnt)
+		for j := range outArrs.idx {
+			txsUtxoHashes[j] = outArrs.utxoHash[j]
+			txsOutSpendables[j] = outArrs.spendable[j]
+			txsOutFrozens[j] = outArrs.frozen[j]
+			txsCoinbaseSpendingHeights[j] = outArrs.coinbaseSpendingHeight[j]
+			// spendable_in is always 0 on initial create (ReAssignUTXO sets it later).
+			// Keep as nil (NULL element) — 0 would mean "spendable from genesis".
+		}
+	}
+
+	// Insert into txs (metadata + state + raw_tx + output arrays).
 	var insertedHash []byte
 	err = conn.QueryRow(ctx, `
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
-			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
+			utxo_hashes, out_spendables, out_frozens, coinbase_spending_heights, spendable_ins)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+		        $17, $18, $19, $20, $21)
 		ON CONFLICT (hash) DO NOTHING
 		RETURNING hash`,
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
 		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil), minedAtHeight,
+		txsUtxoHashes, txsOutSpendables, txsOutFrozens, txsCoinbaseSpendingHeights, txsSpendableIns,
 	).Scan(&insertedHash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
 		}
 		return nil, errors.NewStorageError("failed to create UTXO", err)
-	}
-
-	// Insert outputs via unnest.
-	if len(outArrs.idx) > 0 {
-		_, err = conn.Exec(ctx, `
-			INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height, spendable)
-			SELECT $1, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh, u.spendable
-			FROM UNNEST($2::bigint[], $3::bytea[], $4::bigint[],
-						$5::boolean[], $6::bytea[], $7::bigint[], $8::boolean[])
-				AS u(idx, locking_script, satoshis, frozen, utxo_hash, csh, spendable)
-			ON CONFLICT (tx_hash, idx) DO NOTHING`,
-			txHash[:],
-			outArrs.idx, outArrs.lockingScript, outArrs.satoshis,
-			outArrs.frozen, outArrs.utxoHash, outArrs.coinbaseSpendingHeight, outArrs.spendable,
-		)
-		if err != nil {
-			return nil, errors.NewStorageError("failed to insert outputs", err)
-		}
 	}
 
 	// Handle conflicting children (rare path).
@@ -368,14 +355,15 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	prepared := make([]preparedCreate, n)
 	valid := make([]bool, n)
 
-	var outTxHashes [][]byte
 	var outIdxs []int64
-	var outLockingScripts [][]byte
-	var outSatoshis []int64
 	var outFrozens []bool
 	var outUtxoHashes [][]byte
 	var outCoinbaseSpendingHeights []int64
 	var outSpendables []bool
+	// outBatchIdx is the 1-based position of the tx in the hashes/new_txs slice.
+	// Used by the out_arr aggregation CTE to join per-tx output arrays back to the
+	// tx row via UNNEST WITH ORDINALITY (ord = 1-based position).
+	var outBatchIdx []int32
 
 	for i, item := range batch {
 		txMeta, err := util.TxMetaDataFromTx(item.tx)
@@ -437,15 +425,18 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		blockHeights = append(blockHeights, bHeight)
 		subtreeIdxs = append(subtreeIdxs, sIdx)
 
+		// batchOrd is the 1-based ordinal position of this tx in the hashes slice.
+		// It is set AFTER the append above so it matches the UNNEST WITH ORDINALITY
+		// position (which is 1-based). We compute it here from len(hashes) after append.
+		batchOrd := int32(len(hashes)) // len after append = 1-based ordinal of this tx
+
 		for j := range outArrs.idx {
-			outTxHashes = append(outTxHashes, txHash[:])
 			outIdxs = append(outIdxs, outArrs.idx[j])
-			outLockingScripts = append(outLockingScripts, outArrs.lockingScript[j])
-			outSatoshis = append(outSatoshis, outArrs.satoshis[j])
 			outFrozens = append(outFrozens, outArrs.frozen[j])
 			outUtxoHashes = append(outUtxoHashes, outArrs.utxoHash[j])
 			outCoinbaseSpendingHeights = append(outCoinbaseSpendingHeights, outArrs.coinbaseSpendingHeight[j])
 			outSpendables = append(outSpendables, outArrs.spendable[j])
+			outBatchIdx = append(outBatchIdx, batchOrd)
 		}
 	}
 
@@ -464,42 +455,55 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	}
 	defer conn.Release()
 
-	pgxTx, err := conn.Begin(ctx)
-	if err != nil {
-		for i, item := range batch {
-			if valid[i] {
-				item.done <- batchCreateResult{Err: errors.NewStorageError("failed to begin transaction", err)}
-			}
-		}
-		return
-	}
-	defer pgxTx.Rollback(ctx) //nolint:errcheck
-
-	rows, err := pgxTx.Query(ctx, `
+	// Single autocommit CTE:
+	//   out_arr  — aggregates flat output rows back into per-tx parallel arrays
+	//              using the batch-index (outBatchIdx = 1-based ordinal of the tx
+	//              in the UNNEST); empty output arrays produce zero rows → harmless.
+	//   final INSERT into txs — metadata + state + raw_tx + output arrays.
+	rows, err := conn.Query(ctx, `
+		WITH out_arr AS (
+			SELECT bidx,
+			       array_agg(uh  ORDER BY oidx) AS utxo_hashes,
+			       array_agg(sp  ORDER BY oidx) AS out_spendables,
+			       array_agg(fr  ORDER BY oidx) AS out_frozens,
+			       array_agg(csh ORDER BY oidx) AS coinbase_spending_heights,
+			       array_agg(si  ORDER BY oidx) AS spendable_ins
+			FROM UNNEST($16::int[], $17::bigint[], $18::bytea[],
+			            $19::boolean[], $20::boolean[], $21::bigint[], $22::int[])
+			     AS o(bidx, oidx, uh, sp, fr, csh, si)
+			GROUP BY bidx
+		)
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-			locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height)
+			locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
+			utxo_hashes, out_spendables, out_frozens, coinbase_spending_heights, spendable_ins)
 		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
 		       u.locked, u.conflicting, u.frozen,
 		       CASE WHEN u.mined THEN NULL::bigint ELSE u.unmined_since END,
 		       CASE WHEN u.mined THEN ARRAY[u.block_id]::int[] ELSE NULL::int[] END,
 		       CASE WHEN u.mined THEN ARRAY[u.block_height]::int[] ELSE NULL::int[] END,
 		       CASE WHEN u.mined THEN ARRAY[u.subtree_idx]::int[] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN u.block_height::bigint ELSE NULL::bigint END
+		       CASE WHEN u.mined THEN u.block_height::bigint ELSE NULL::bigint END,
+		       oa.utxo_hashes, oa.out_spendables, oa.out_frozens, oa.coinbase_spending_heights, oa.spendable_ins
 		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
 		            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
 		            $11::bigint[], $12::boolean[], $13::bigint[], $14::bigint[], $15::bigint[])
-		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-		          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx)
+		     WITH ORDINALITY AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx, ord)
+		LEFT JOIN out_arr oa ON oa.bidx = u.ord
 		ON CONFLICT (hash) DO NOTHING
 		RETURNING hash`,
 		hashes, versions, lockTimes, fees, sizes, coinbases, rawTxs,
 		lockeds, conflictings, frozens, unminedSinces,
 		mineds, blockIDs, blockHeights, subtreeIdxs,
+		// out_arr params ($16..$22): bidx, oidx, uh, sp, fr, csh, si
+		// spendable_ins are all NULL on initial create (set by ReAssignUTXO later).
+		// A nil-element []*int32 slice causes array_agg to preserve NULL elements.
+		outBatchIdx, outIdxs, outUtxoHashes, outSpendables, outFrozens, outCoinbaseSpendingHeights, make([]*int32, len(outBatchIdx)),
 	)
 	if err != nil {
 		for i, item := range batch {
 			if valid[i] {
-				item.done <- batchCreateResult{Err: errors.NewStorageError("failed to INSERT txs via UNNEST", err)}
+				item.done <- batchCreateResult{Err: errors.NewStorageError("failed to INSERT create batch via CTE", err)}
 			}
 		}
 		return
@@ -521,37 +525,16 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		copy(h[:], hashBytes)
 		newHashSet[h] = struct{}{}
 	}
-	rows.Close()
-
-	if len(outTxHashes) > 0 {
-		_, err = pgxTx.Exec(ctx, `
-			INSERT INTO outputs (tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, coinbase_spending_height, spendable)
-			SELECT u.tx_hash, u.idx, u.locking_script, u.satoshis, u.frozen, u.utxo_hash, u.csh, u.spendable
-			FROM UNNEST($1::bytea[], $2::bigint[], $3::bytea[], $4::bigint[],
-			            $5::boolean[], $6::bytea[], $7::bigint[], $8::boolean[])
-			     AS u(tx_hash, idx, locking_script, satoshis, frozen, utxo_hash, csh, spendable)
-			ON CONFLICT (tx_hash, idx) DO NOTHING`,
-			outTxHashes, outIdxs, outLockingScripts, outSatoshis,
-			outFrozens, outUtxoHashes, outCoinbaseSpendingHeights, outSpendables,
-		)
-		if err != nil {
-			for i, item := range batch {
-				if valid[i] {
-					item.done <- batchCreateResult{Err: errors.NewStorageError("failed to INSERT outputs via UNNEST", err)}
-				}
-			}
-			return
-		}
-	}
-
-	if err := pgxTx.Commit(ctx); err != nil {
+	if err := rows.Err(); err != nil {
+		rows.Close()
 		for i, item := range batch {
 			if valid[i] {
-				item.done <- batchCreateResult{Err: errors.NewStorageError("failed to commit create batch", err)}
+				item.done <- batchCreateResult{Err: errors.NewStorageError("create batch rows error", err)}
 			}
 		}
 		return
 	}
+	rows.Close()
 
 	for i, item := range batch {
 		if !valid[i] {

@@ -42,7 +42,7 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 		DROP FUNCTION IF EXISTS process_delete_at_height(BIGINT) CASCADE;
 		DROP PROCEDURE IF EXISTS materialize_loop() CASCADE;
 		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
-			tx_state, transactions, txs, dah_watermark,
+			tx_state, transactions, txs, txs_raw, dah_watermark,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue,
 			batch_notifications CASCADE;
 	`)
@@ -84,15 +84,17 @@ func testExtendedTx(t *testing.T) *bt.Tx {
 func TestSchemaCreation(t *testing.T) {
 	store, ctx := setupTestStore(t)
 
-	// Verify all 3 tables exist by querying them.
-	tables := []string{"txs", "outputs", "spends"}
+	// Verify all tables exist by querying them (outputs table removed in Phase B —
+	// per-output data is now stored as parallel arrays on the txs row; raw_tx
+	// lives on the txs row).
+	tables := []string{"txs", "spends"}
 	for _, table := range tables {
 		var count int
 		err := store.pool.QueryRow(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count)
 		require.NoError(t, err, "table %s should exist", table)
 	}
 
-	// Verify partitions exist (16 per table = 48 total).
+	// Verify partitions exist (numPartitions per table).
 	for _, table := range tables {
 		var partCount int
 		err := store.pool.QueryRow(ctx, `
@@ -1299,9 +1301,10 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	err = store.FreezeUTXOs(ctx, spends, nil)
 	require.NoError(t, err)
 
-	// Verify frozen.
+	// Verify frozen via txs.out_frozens array (outputs table removed in Phase B).
 	var frozen bool
-	err = store.pool.QueryRow(ctx, `SELECT frozen FROM outputs WHERE tx_hash = $1 AND idx = 0`, txHash[:]).Scan(&frozen)
+	err = store.pool.QueryRow(ctx,
+		`SELECT COALESCE(out_frozens[1], false) FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozen)
 	require.NoError(t, err)
 	require.True(t, frozen)
 
@@ -1313,8 +1316,9 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	err = store.UnFreezeUTXOs(ctx, spends, nil)
 	require.NoError(t, err)
 
-	// Verify unfrozen.
-	err = store.pool.QueryRow(ctx, `SELECT frozen FROM outputs WHERE tx_hash = $1 AND idx = 0`, txHash[:]).Scan(&frozen)
+	// Verify unfrozen via txs.out_frozens array.
+	err = store.pool.QueryRow(ctx,
+		`SELECT COALESCE(out_frozens[1], false) FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozen)
 	require.NoError(t, err)
 	require.False(t, frozen)
 
@@ -1349,11 +1353,12 @@ func TestReAssignUTXO(t *testing.T) {
 	err = store.ReAssignUTXO(ctx, sourceSpend, newSpend, nil)
 	require.NoError(t, err)
 
-	// Verify: frozen should be false, utxo_hash should be updated.
+	// Verify: out_frozens[1] should be false, utxo_hashes[1] should be updated.
+	// Phase B: outputs table is gone; verify via txs array columns.
 	var outputFrozen bool
 	var storedUtxoHash []byte
 	err = store.pool.QueryRow(ctx,
-		`SELECT frozen, utxo_hash FROM outputs WHERE tx_hash = $1 AND idx = 0`,
+		`SELECT COALESCE(out_frozens[1], false), utxo_hashes[1] FROM txs WHERE hash = $1`,
 		txHash[:]).Scan(&outputFrozen, &storedUtxoHash)
 	require.NoError(t, err)
 	require.False(t, outputFrozen, "should be unfrozen after reassign")
@@ -1451,6 +1456,119 @@ func TestPrunerService(t *testing.T) {
 		`SELECT COUNT(*) FROM txs WHERE hash = $1`, txHash[:]).Scan(&txCount)
 	require.NoError(t, err)
 	require.Equal(t, 0, txCount, "transaction should be deleted by pruner")
+}
+
+// ---------------------------------------------------------------------------
+// TestArraySubscriptBoundary: verifies 0-based index → Postgres 1-based
+// array subscript correctness after folding outputs into txs arrays.
+// ---------------------------------------------------------------------------
+
+// makeThreeOutputTx returns a transaction with exactly 3 outputs:
+//
+//	vout0 — P2PKH (spendable)
+//	vout1 — OP_FALSE OP_RETURN data (unspendable, satoshis=0)
+//	vout2 — P2PKH (spendable)
+//
+// The tx is built around the canonical testExtendedTx input so it passes
+// validation (non-nil unlocking scripts).
+func makeThreeOutputTx(t *testing.T) *bt.Tx {
+	t.Helper()
+
+	base := testExtendedTx(t) // 2 P2PKH outputs
+
+	// Extract the two spendable outputs.
+	out0 := base.Outputs[0] // vout0
+	out1 := base.Outputs[1] // will become vout2
+
+	// Build an OP_FALSE OP_RETURN data output for vout1.
+	opReturnScript := bscript.NewFromBytes([]byte{0x00, 0x6a, 0x04, 0xba, 0xdc, 0x0f, 0xfe})
+
+	// Reconstruct tx with 3 outputs in order: P2PKH, OP_RETURN, P2PKH.
+	tx := bt.NewTx()
+	tx.Version = base.Version
+	tx.LockTime = base.LockTime
+	tx.Inputs = base.Inputs
+	tx.Outputs = []*bt.Output{
+		out0,
+		{Satoshis: 0, LockingScript: opReturnScript},
+		out1,
+	}
+	return tx
+}
+
+func TestArraySubscriptBoundary(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	blockHeight := uint32(100)
+	require.NoError(t, store.SetBlockHeight(blockHeight))
+
+	parentTx := makeThreeOutputTx(t)
+	parentHash := parentTx.TxIDChainHash()
+
+	_, err := store.Create(ctx, parentTx, blockHeight)
+	require.NoError(t, err)
+
+	// Verify the arrays are populated correctly in txs.
+	var utxoHashes [][]byte
+	var outSpendables []bool
+	err = store.pool.QueryRow(ctx,
+		`SELECT utxo_hashes, out_spendables FROM txs WHERE hash = $1`, parentHash[:],
+	).Scan(&utxoHashes, &outSpendables)
+	require.NoError(t, err)
+	require.Len(t, utxoHashes, 3, "3 outputs → 3-element utxo_hashes array")
+	require.Len(t, outSpendables, 3, "3 outputs → 3-element out_spendables array")
+	require.True(t, outSpendables[0], "vout0 (P2PKH) should be spendable")
+	require.False(t, outSpendables[1], "vout1 (OP_RETURN zero-value) should NOT be spendable")
+	require.True(t, outSpendables[2], "vout2 (P2PKH) should be spendable")
+
+	// Spend vout0 — must succeed.
+	spendTx0 := getSpendingTx(t, parentTx, 0)
+	_, err = store.Create(ctx, spendTx0, blockHeight)
+	require.NoError(t, err)
+	spends0, err := store.Spend(ctx, spendTx0, blockHeight+1)
+	require.NoError(t, err)
+	require.Len(t, spends0, 1, "spending vout0 should produce 1 spend")
+
+	// Spend vout2 — must succeed (catches off-by-one: existing tests only spend vout0).
+	spendTx2 := getSpendingTx(t, parentTx, 2)
+	_, err = store.Create(ctx, spendTx2, blockHeight)
+	require.NoError(t, err)
+	spends2, err := store.Spend(ctx, spendTx2, blockHeight+1)
+	require.NoError(t, err)
+	require.Len(t, spends2, 1, "spending vout2 should produce 1 spend (off-by-one check)")
+
+	// Attempt to spend vout3 (OOB) — must return a TxNotFound-class error.
+	utxoHashes3, err := utxo.GetUtxoHashes(parentTx, parentHash)
+	require.NoError(t, err)
+	// Use vout0's UTXO hash as a stand-in for the nonexistent vout3.
+	oobSpend := &utxo.Spend{
+		TxID:         parentHash,
+		Vout:         3,
+		UTXOHash:     utxoHashes3[0],
+		SpendingData: spends0[0].SpendingData,
+	}
+	oobSpendTx := bt.NewTx()
+	_ = oobSpendTx.From(parentHash.String(), 3, "76a91488ac", 1000)
+	_ = oobSpendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 500)
+	oobSpendTx.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x30, 0x44})
+
+	_, err = store.Spend(ctx, oobSpendTx, blockHeight+1)
+	require.Error(t, err, "spending OOB index vout3 must return an error")
+	require.True(t, errors.Is(err, errors.ErrTxNotFound),
+		"OOB spend should return ErrTxNotFound, got: %v", err)
+	_ = oobSpend // suppress unused warning
+
+	// Double-spend of vout0 with DIFFERENT spending data → ErrSpent.
+	spendTxDup := getSpendingTx(t, parentTx, 0)
+	_, err = store.Create(ctx, spendTxDup, blockHeight)
+	require.NoError(t, err)
+	_, err = store.Spend(ctx, spendTxDup, blockHeight+1)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrSpent),
+		"double-spend of vout0 with different spending data must return ErrSpent, got: %v", err)
+
+	// Idempotent re-spend of vout0 with SAME tx → success.
+	_, err = store.Spend(ctx, spendTx0, blockHeight+1)
+	require.NoError(t, err, "idempotent re-spend of vout0 with same spending data must succeed")
 }
 
 // Ensure unused imports are used.

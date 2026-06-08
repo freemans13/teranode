@@ -19,7 +19,6 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	// Delete in dependency order: children tables first, then parent table.
 	deleteStatements := []string{
 		`DELETE FROM spends WHERE prev_tx_hash = $1`,
-		`DELETE FROM outputs WHERE tx_hash = $1`,
 		`DELETE FROM txs WHERE hash = $1`,
 	}
 
@@ -54,14 +53,20 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 		return nil
 	}
 
-	// Check if all outputs are spent.
+	// Check if all spendable outputs are spent.
+	// v4: use txs.out_spendables array + spends table count (no outputs table query).
+	// A tx with no outputs (NULL or empty array) is never fully-spent.
 	var allSpent bool
 	err = s.pool.QueryRow(ctx, `
-		SELECT NOT EXISTS(
-			SELECT 1 FROM outputs o
-			WHERE o.tx_hash = $1 AND o.spendable
-			AND NOT EXISTS (SELECT 1 FROM spends sp WHERE sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx)
-		) AS all_spent`,
+		SELECT
+		    COALESCE(cardinality(array_positions(t.out_spendables, true)), 0) > 0
+		    AND COALESCE(cardinality(array_positions(t.out_spendables, true)), 0) = (
+		        SELECT count(*) FROM spends sp
+		        JOIN generate_series(0, cardinality(t.out_spendables)-1) AS g(i) ON sp.prev_output_idx = g.i
+		        WHERE sp.prev_tx_hash = t.hash
+		          AND t.out_spendables[g.i+1] = true
+		    ) AS all_spent
+		FROM txs t WHERE t.hash = $1`,
 		hash[:],
 	).Scan(&allSpent)
 	if err != nil {

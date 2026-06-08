@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/util"
+	"golang.org/x/sync/errgroup"
 )
 
 // Ensure Store implements the pruner.PrunerServiceProvider interface.
@@ -122,79 +124,110 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 	return deletedCount, nil
 }
 
-// deleteTombstoned finds transactions with delete_at_height <= blockHeight and
-// cascade-deletes them from all 3 tables.
+// deleteTombstoned cascade-deletes every tombstoned tx (delete_at_height <=
+// blockHeight) across all partitions IN PARALLEL — one goroutine per partition.
+//
+// The two tables hash-partition on the SAME tx hash with the SAME modulus, so
+// txs_pNN and spends_pNN are ALIGNED: a tx in txs_pNN has all of its
+// spend-markers in spends_pNN. That lets each goroutine scan and cascade-delete
+// entirely within one partition pair, so no two goroutines ever touch the same
+// heap/index pages — zero cross-worker lock/buffer contention. Crucially, the
+// per-partition tombstone scan is 1/numPartitions the size and rides its OWN
+// leaf index instead of fighting the concurrent-INSERT B-tree splits on the
+// shared partitioned-parent index, which is what collapsed concurrent reclaim
+// ~13x vs the isolated drain rate.
 func (s *postgresPrunerService) deleteTombstoned(ctx context.Context, blockHeight uint32) (int64, error) {
-	// Find tombstoned tx hashes.
-	rows, err := s.store.pool.Query(ctx, `
-		SELECT hash FROM txs
-		WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1
-	`, int64(blockHeight))
-	if err != nil {
-		return 0, errors.NewStorageError("failed to query tombstoned transactions", err)
+	var totalDeleted atomic.Int64
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(pruneDeleteWorkers)
+	for p := 0; p < numPartitions; p++ {
+		p := p
+		g.Go(func() error {
+			n, err := s.deleteTombstonedPartition(gctx, p, blockHeight)
+			totalDeleted.Add(n)
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return totalDeleted.Load(), err
 	}
 
-	var txHashes [][]byte
+	return totalDeleted.Load(), nil
+}
+
+// pruneDeleteWorkers / pruneDeleteBatchSize tune the partition-parallel cascade
+// delete. pruneDeleteWorkers caps concurrent partition goroutines (= numPartitions
+// when they match, leaving ample headroom in the 100-conn pool for the write
+// path); a 10000-hash batch keeps each set-based cascade one bounded leaf index
+// scan while minimising round trips.
+const (
+	pruneDeleteWorkers   = 8
+	pruneDeleteBatchSize = 10000
+)
+
+// deleteTombstonedPartition cascade-deletes the tombstoned txs of ONE partition.
+// It scans the concrete leaf (txs_pNN) for tombstoned hashes, then cascade-deletes
+// them from the ALIGNED spends_pNN → txs_pNN leaves in batched, single-statement
+// CTEs. One round-trip per batch, and the statement is implicitly atomic: a
+// mid-batch failure rolls back both table deletes together, so no orphans are
+// left behind. Returns the number of txs rows removed. Leaf table names are
+// derived from numPartitions (same package as the schema DDL), so the coupling
+// stays in lock-step with partition creation.
+func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, partIdx int, blockHeight uint32) (int64, error) {
+	txsLeaf := fmt.Sprintf("txs_p%02d", partIdx)
+	spendsLeaf := fmt.Sprintf("spends_p%02d", partIdx)
+
+	rows, err := s.store.pool.Query(ctx, fmt.Sprintf(
+		`SELECT hash FROM %s WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1`, txsLeaf),
+		int64(blockHeight))
+	if err != nil {
+		return 0, errors.NewStorageError("[pruner] query tombstoned %s: %v", txsLeaf, err)
+	}
+
+	var hashes [][]byte
 	for rows.Next() {
 		var hashBytes []byte
-		if err := rows.Scan(&hashBytes); err != nil {
+		if scanErr := rows.Scan(&hashBytes); scanErr != nil {
 			rows.Close()
-			return 0, errors.NewStorageError("failed to scan tombstoned tx hash", err)
+			return 0, errors.NewStorageError("[pruner] scan tombstoned %s: %v", txsLeaf, scanErr)
 		}
-		txHashes = append(txHashes, hashBytes)
+		hashes = append(hashes, hashBytes)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, errors.NewStorageError("error iterating tombstoned transactions", err)
+		return 0, errors.NewStorageError("[pruner] iterate tombstoned %s: %v", txsLeaf, err)
 	}
-
-	if len(txHashes) == 0 {
+	if len(hashes) == 0 {
 		return 0, nil
 	}
 
-	// Delete in batches of 500 within a single transaction per batch.
-	const batchSize = 500
-	var totalDeleted int64
+	// spends and txs deleted in ONE statement, scoped to this partition's aligned
+	// leaves (same MODULUS). The data-modifying CTE always runs to completion; the
+	// top-level DELETE returns the txs parent row count.
+	cascadeSQL := fmt.Sprintf(`
+		WITH del_spends AS (DELETE FROM %s WHERE prev_tx_hash = ANY($1::bytea[]) RETURNING 1)
+		DELETE FROM %s WHERE hash = ANY($1::bytea[])`, spendsLeaf, txsLeaf)
 
-	for i := 0; i < len(txHashes); i += batchSize {
-		end := i + batchSize
-		if end > len(txHashes) {
-			end = len(txHashes)
+	var deleted int64
+	for i := 0; i < len(hashes); i += pruneDeleteBatchSize {
+		end := i + pruneDeleteBatchSize
+		if end > len(hashes) {
+			end = len(hashes)
 		}
-		batch := txHashes[i:end]
 
 		select {
 		case <-ctx.Done():
-			return totalDeleted, ctx.Err()
+			return deleted, ctx.Err()
 		default:
 		}
 
-		pgxTx, err := s.store.pool.Begin(ctx)
+		tag, err := s.store.pool.Exec(ctx, cascadeSQL, hashes[i:end])
 		if err != nil {
-			return totalDeleted, errors.NewStorageError("[pruner] begin: %v", err)
+			return deleted, errors.NewStorageError("[pruner] cascade delete %s: %v", txsLeaf, err)
 		}
-
-		for _, hashBytes := range batch {
-			deleteStatements := []string{
-				`DELETE FROM spends WHERE prev_tx_hash = $1`,
-				`DELETE FROM outputs WHERE tx_hash = $1`,
-				`DELETE FROM txs WHERE hash = $1`,
-			}
-
-			for _, stmt := range deleteStatements {
-				if _, err := pgxTx.Exec(ctx, stmt, hashBytes); err != nil {
-					pgxTx.Rollback(ctx) //nolint:errcheck
-					return totalDeleted, errors.NewStorageError("[pruner] delete failed: %v", err)
-				}
-			}
-
-			totalDeleted++
-		}
-
-		if err := pgxTx.Commit(ctx); err != nil {
-			return totalDeleted, errors.NewStorageError("[pruner] commit: %v", err)
-		}
+		// Count txs actually removed (the canonical parent row), not input hashes.
+		deleted += tag.RowsAffected()
 	}
 
-	return totalDeleted, nil
+	return deleted, nil
 }

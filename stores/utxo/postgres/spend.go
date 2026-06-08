@@ -32,30 +32,28 @@ type batchSpendItem struct {
 
 // spendValidationSQL is the CTE used to validate a spend attempt and insert into
 // the append-only spends table. spent_at_height is recorded for deferred DAH
-// computation by Worker 2. Inline DAH stamping (dah_upd) has been removed.
+// computation by Worker 2.
 //
-// v3: the LEFT JOIN to spends in the validation CTE has been dropped.
-// ON CONFLICT DO NOTHING enforces the "spend-once" uniqueness atomically;
-// the caller detects "already spent" by seeing 0 RETURNING rows and then
-// invoking diagnoseSpendFailure (the rare path).
+// v4: reads from txs arrays instead of the outputs table. The WHERE clause
+// requires array_length(t.utxo_hashes, 1) >= $2::int + 1 (1-based Postgres
+// subscript for 0-based output index $2), so a missing tx OR an OOB index
+// both produce 0 RETURNING rows — diagnosed by diagnoseSpendFailure.
 const spendValidationSQL = `
 WITH validation AS (
-    SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
-           o.coinbase_spending_height,
-           t.locked AS tx_locked, t.conflicting AS tx_conflicting,
-           t.frozen AS tx_frozen
-    FROM outputs o
-    JOIN txs t ON t.hash = o.tx_hash
-    WHERE o.tx_hash = $1 AND o.idx = $2
+    SELECT
+        CASE WHEN array_length(t.utxo_hashes, 1) >= $2::int + 1 THEN t.utxo_hashes[$2::int + 1] END AS utxo_hash,
+        COALESCE(CASE WHEN array_length(t.out_frozens, 1) >= $2::int + 1 THEN t.out_frozens[$2::int + 1] END, false) AS output_frozen,
+        COALESCE(CASE WHEN array_length(t.coinbase_spending_heights, 1) >= $2::int + 1 THEN t.coinbase_spending_heights[$2::int + 1] END, 0) AS coinbase_spending_height,
+        CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END AS spendable_in,
+        t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
+    FROM txs t
+    WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
 ),
 inserted AS (
     INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height)
-    SELECT $1, $2, $3, $5
-    FROM validation v
-    WHERE v.utxo_hash = $4
-      AND NOT v.output_frozen AND NOT v.tx_frozen
-      AND ($6 OR NOT v.tx_locked)
-      AND ($7 OR NOT v.tx_conflicting)
+    SELECT $1, $2, $3, $5 FROM validation v
+    WHERE v.utxo_hash = $4 AND NOT v.output_frozen AND NOT v.tx_frozen
+      AND ($6 OR NOT v.tx_locked) AND ($7 OR NOT v.tx_conflicting)
       AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $5)
       AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $5 < COALESCE(v.spendable_in, 0))
     ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
@@ -64,18 +62,22 @@ inserted AS (
 SELECT 1 FROM inserted
 `
 
-// spendDiagnosticSQL re-queries the validation CTE when the INSERT returned
-// 0 rows, so we can determine the exact reason the spend failed.
+// spendDiagnosticSQL re-queries when the validation INSERT returned 0 rows so
+// we can determine the exact reason the spend failed.
+//
+// v4: reads from txs arrays instead of the outputs table. Returns NOT FOUND
+// (0 rows) when the tx is missing OR the index is OOB — both are TxNotFound.
 const spendDiagnosticSQL = `
-SELECT o.utxo_hash, o.frozen AS output_frozen, o.spendable_in,
-       o.coinbase_spending_height,
-       t.locked AS tx_locked, t.conflicting AS tx_conflicting,
-       t.frozen AS tx_frozen,
-       sp.spending_data AS existing_spend
-FROM outputs o
-JOIN txs t ON t.hash = o.tx_hash
-LEFT JOIN spends sp ON sp.prev_tx_hash = o.tx_hash AND sp.prev_output_idx = o.idx
-WHERE o.tx_hash = $1 AND o.idx = $2
+SELECT
+    CASE WHEN array_length(t.utxo_hashes, 1) >= $2::int + 1 THEN t.utxo_hashes[$2::int + 1] END AS utxo_hash,
+    COALESCE(CASE WHEN array_length(t.out_frozens, 1) >= $2::int + 1 THEN t.out_frozens[$2::int + 1] END, false) AS output_frozen,
+    CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END AS spendable_in,
+    COALESCE(CASE WHEN array_length(t.coinbase_spending_heights, 1) >= $2::int + 1 THEN t.coinbase_spending_heights[$2::int + 1] END, 0) AS coinbase_spending_height,
+    t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen,
+    sp.spending_data AS existing_spend
+FROM txs t
+LEFT JOIN spends sp ON sp.prev_tx_hash = t.hash AND sp.prev_output_idx = $2
+WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
 `
 
 // ---------------------------------------------------------------------------
@@ -382,6 +384,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		utxoHashMatch  bool
 		coinbaseBlock  bool
 		spendableBlock bool
+		slotExists     bool // true when the array subscript is in-bounds
 	}
 	resultMap := make(map[int]*bulkResult, len(batch))
 	for rows.Next() {
@@ -389,7 +392,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		r := &bulkResult{}
 		if err := rows.Scan(&bIdx, &r.inserted,
 			&r.outputFrozen, &r.txFrozen, &r.txLocked, &r.txConflicting,
-			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock); err != nil {
+			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock, &r.slotExists); err != nil {
 			rows.Close()
 			for _, item := range batch {
 				item.errCh <- errors.NewStorageError("[Spend] scan", err)
@@ -406,7 +409,13 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		r, found := resultMap[i]
 
 		if !found {
+			// Tx hash not found in txs table.
 			item.errCh <- errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+			continue
+		}
+		if !r.slotExists {
+			// Tx found but output index is OOB — treat as not found (no such output).
+			item.errCh <- errors.NewTxNotFoundError("output %s:%d not found (index OOB)", spend.TxID, spend.Vout)
 			continue
 		}
 		if r.inserted {
@@ -450,13 +459,13 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 // bulkSpendSQL processes an entire batch in ONE query: UNNEST → validate → INSERT → results.
 // spent_at_height is recorded per row for deferred DAH computation by Worker 2.
 //
-// v3: the LEFT JOIN to spends has been dropped from the validation CTE. The
-// ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING on the INSERT already
-// gives us "already-spent" semantics atomically — duplicate inserts are silently
-// skipped, and the RETURNING set tells us which inputs successfully inserted.
-// The rare "spent but with different spending_data" case (double-spend with a
-// different spender) is classified after the fact by diagnoseSpendFailure,
-// which still queries spends. This drops 1 JOIN per spend on the hot path.
+// v4: reads from txs arrays instead of the outputs table. A tx with a missing
+// hash produces no row in validated (JOIN miss → no result row for that batch_idx).
+// An OOB index produces a validated row but utxo_hash IS NULL (slot_exists=false).
+// The result dispatch handles these cases:
+//   - no row in resultMap → TxNotFound (tx missing)
+//   - row exists, slot_exists=false → TxNotFound (OOB index)
+//   - row exists, !utxo_match → UtxoHashMismatch (wrong UTXO hash)
 const bulkSpendSQL = `
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
@@ -469,24 +478,21 @@ WITH items AS (
            unnest($8::int[])     AS batch_idx
 ),
 validated AS (
-    SELECT i.batch_idx, i.prev_tx_hash, i.prev_idx, i.spending_data,
-           i.expected_utxo_hash, i.block_height, i.ign_locked, i.ign_conflicting,
-           o.utxo_hash, o.frozen AS out_frozen, o.spendable_in,
-           o.coinbase_spending_height,
+    SELECT i.batch_idx, i.prev_tx_hash, i.prev_idx, i.spending_data, i.expected_utxo_hash,
+           i.block_height, i.ign_locked, i.ign_conflicting,
+           CASE WHEN array_length(t.utxo_hashes,1) >= i.prev_idx::int+1 THEN t.utxo_hashes[i.prev_idx::int+1] END AS utxo_hash,
+           COALESCE(CASE WHEN array_length(t.out_frozens,1) >= i.prev_idx::int+1 THEN t.out_frozens[i.prev_idx::int+1] END, false) AS out_frozen,
+           CASE WHEN array_length(t.spendable_ins,1) >= i.prev_idx::int+1 THEN t.spendable_ins[i.prev_idx::int+1] END AS spendable_in,
+           COALESCE(CASE WHEN array_length(t.coinbase_spending_heights,1) >= i.prev_idx::int+1 THEN t.coinbase_spending_heights[i.prev_idx::int+1] END, 0) AS coinbase_spending_height,
            t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
-    FROM items i
-    JOIN outputs o ON o.tx_hash = i.prev_tx_hash AND o.idx = i.prev_idx
-    JOIN txs t ON t.hash = i.prev_tx_hash
+    FROM items i JOIN txs t ON t.hash = i.prev_tx_hash
 ),
 to_insert AS (
-    SELECT prev_tx_hash, prev_idx, spending_data, block_height, batch_idx
-    FROM validated
-    WHERE utxo_hash = expected_utxo_hash
-      AND NOT out_frozen AND NOT tx_frozen
-      AND (ign_locked OR NOT tx_locked)
-      AND (ign_conflicting OR NOT tx_conflicting)
+    SELECT prev_tx_hash, prev_idx, spending_data, block_height, batch_idx FROM validated
+    WHERE utxo_hash = expected_utxo_hash AND NOT out_frozen AND NOT tx_frozen
+      AND (ign_locked OR NOT tx_locked) AND (ign_conflicting OR NOT tx_conflicting)
       AND NOT (coinbase_spending_height > 0 AND coinbase_spending_height > block_height)
-      AND NOT (COALESCE(spendable_in, 0) > 0 AND block_height < COALESCE(spendable_in, 0))
+      AND NOT (COALESCE(spendable_in,0) > 0 AND block_height < COALESCE(spendable_in,0))
 ),
 inserted AS (
     INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height)
@@ -494,14 +500,13 @@ inserted AS (
     ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
     RETURNING prev_tx_hash, prev_output_idx
 )
-SELECT v.batch_idx,
-       (i.prev_tx_hash IS NOT NULL) AS inserted,
+SELECT v.batch_idx, (i.prev_tx_hash IS NOT NULL) AS inserted,
        v.out_frozen, v.tx_frozen, v.tx_locked, v.tx_conflicting,
-       (v.utxo_hash = v.expected_utxo_hash) AS utxo_match,
+       (v.utxo_hash IS NOT NULL AND v.utxo_hash = v.expected_utxo_hash) AS utxo_match,
        (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > v.block_height) AS coinbase_block,
-       (COALESCE(v.spendable_in, 0) > 0 AND v.block_height < COALESCE(v.spendable_in, 0)) AS spendable_block
-FROM validated v
-LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
+       (COALESCE(v.spendable_in,0) > 0 AND v.block_height < COALESCE(v.spendable_in,0)) AS spendable_block,
+       (v.utxo_hash IS NOT NULL) AS slot_exists
+FROM validated v LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
 ORDER BY v.batch_idx
 `
 

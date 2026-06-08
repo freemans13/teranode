@@ -203,7 +203,7 @@ func BenchmarkSweepRange(b *testing.B) {
 		_, err := store.pool.Exec(ctx, `UPDATE dah_watermark SET last_swept_height = 0 WHERE id = 1`)
 		require.NoError(b, err)
 
-		n, err := store.sweepDAHRange(ctx, 0, int64(tipHeight), M*2)
+		n, _, err := store.sweepDAHRange(ctx, 0, int64(tipHeight), M*2)
 		require.NoError(b, err)
 		// Ensure the compiler doesn't optimise away the call.
 		if n < 0 {

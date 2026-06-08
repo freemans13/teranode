@@ -8,50 +8,59 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// createSchema creates the v5 turbo UTXO tables in the connected PostgreSQL
-// database: 3 LOGGED hash-partitioned tables (txs, outputs, spends).
+// createSchema creates the v7 turbo UTXO tables in the connected PostgreSQL
+// database: 2 LOGGED hash-partitioned tables (txs, spends). The outputs
+// table has been folded into txs as parallel arrays (utxo_hashes, out_spendables,
+// out_frozens, coinbase_spending_heights, spendable_ins), eliminating the
+// per-tx outputs INSERT, the random-hash PK index, and the cascade-DELETE.
+// raw_tx lives on the txs row (immutable BYTEA blob).
 //
 // Schema design tradeoffs (vs. the standard stores/utxo/sql store):
 //
-//   - No foreign keys. Child rows (outputs, spends) reference txs by BYTEA
-//     hash rather than a surrogate id, and pruning explicitly cascades via
-//     DELETE FROM spends → outputs → txs inside one txn (see pruner_provider).
-//     Skips the FK check/maintenance cost on the write path but removes the
-//     DB-level safety net — any bug that deletes txs without the matching
-//     spends/outputs leaves orphans.
+//   - No foreign keys. Child rows (spends) reference txs by BYTEA hash rather
+//     than a surrogate id, and pruning explicitly cascades via
+//     DELETE FROM spends → txs inside one txn (see pruner_provider).
 //
 //   - "Is this output spent?" lives in the spends table as a row, not as a
-//     nullable spending_data column on outputs. Spends become pure INSERTs
-//     (no MVCC bloat on outputs) at the cost of needing a LEFT JOIN spends
-//     on every spend-validation query.
+//     nullable spending_data column. Spends become pure INSERTs (no MVCC
+//     bloat on txs output arrays).
 //
-//   - block_ids / block_heights / subtree_idxs / conflicting_children are
-//     INT[] / BYTEA[] arrays on txs instead of separate tables. Reads are
-//     one column on one row; appends (new block_id on mine) are cheap via
-//     `|| $N::int[]`. A full reorg that touches millions of rows still
-//     has to rewrite whole arrays — heavy-reorg cost > separate-table
-//     variant that just INSERTs/DELETEs rows.
+//   - block_ids / block_heights / subtree_idxs / conflicting_children AND all
+//     per-output UTXO fields are stored as arrays on txs. A single row lookup
+//     returns everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
 	return createSchemaWithPool(ctx, s.pool)
 }
 
-// partitionSpec defines a partitioned table and the fillfactor for its children.
+// partitionSpec defines a partitioned table, the fillfactor for its children,
+// and the autovacuum storage params for its children.
+//
+// autovacuum MUST be set on the leaf partitions: autovacuum operates on the
+// leaf relations, and storage params set on a partitioned PARENT are never
+// inherited by autovacuum on the leaves. (A parent-level ALTER TABLE txs SET
+// (autovacuum_*) silently does nothing for vacuum scheduling — it only affects
+// partitions created later via the parent's defaults, not the leaf's vacuum.)
 type partitionSpec struct {
 	name       string
 	fillfactor int
+	autovacuum string // SET-clause body applied per leaf partition
 }
 
-// numPartitions is the number of hash partitions per table. Local benchmarking
-// shows a single partition outperforms a higher partition count — the partition
-// machinery is kept so we can raise this if future profiling shows contention
-// at the PK level on larger deployments.
-const numPartitions = 1
+// numPartitions is the number of hash partitions per table. Burst benchmarks
+// favoured a single partition (no fan-out overhead). Under SUSTAINED high-churn
+// load that inverts: the txs `locked`-flag UPDATE produces ~1 dead tuple per tx,
+// and a single autovacuum worker on one large partition cannot reclaim at the
+// dead-tuple generation rate (measured: txs_dead grows unbounded to 24M+ at
+// 60K TPS). Splitting into N partitions lets up to autovacuum_max_workers leaves
+// be vacuumed concurrently, each a fraction of the size, so aggregate vacuum
+// throughput scales with the churn. 8 keeps vacuum ahead with the default 3
+// workers while bounding fan-out cost on reads.
+const numPartitions = 8
 
 // createSchemaWithPool executes all DDL statements using the provided pool.
 func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	ddlStatements := []string{
 		txsDDL,
-		outputsDDL,
 		spendsDDL,
 	}
 
@@ -61,18 +70,41 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
-	// Back-fill the spendable column on outputs tables created before it existed.
-	// ALTER on the partitioned parent cascades to existing partitions; the default
-	// TRUE is correct for legacy rows (which were all value/spendable outputs).
-	if _, err := pool.Exec(ctx, `ALTER TABLE outputs ADD COLUMN IF NOT EXISTS spendable BOOLEAN NOT NULL DEFAULT TRUE`); err != nil {
-		return errors.NewStorageError("outputs spendable column migration failed: %v", err)
-	}
-
-	// Create numPartitions hash partitions for each table with appropriate fillfactor.
+	// Create numPartitions hash partitions for each table with appropriate
+	// fillfactor and per-leaf autovacuum tuning.
+	//
+	// txs is the only high-churn table: the validator hot path UPDATEs the
+	// `locked` flag per tx (Create(WithLocked)+SetLocked), producing one dead
+	// tuple per tx. At scale_factor=0.05 on a multi-million-row partition that
+	// lets ~5% (≈1.7M) dead tuples accumulate before vacuum fires — observed as
+	// a 0.3M–1.9M dead-tuple oscillation that breaks HOT-chain reuse under load.
+	// 0.01 fires at ~1% (≈340K), and cost_delay=0 keeps the sweep from being
+	// throttled mid-run. spends is insert-only (no UPDATE churn), so the
+	// insert_scale_factor path (keeping the visibility map fresh for the
+	// deferred-DAH sweep's index-only counts) is what matters there — left at the
+	// gentler 0.05 so insert-triggered vacuums don't steal hot-path I/O.
+	const commonAV = "autovacuum_vacuum_insert_scale_factor = 0.02, "
 	tables := []partitionSpec{
-		{"txs", 70},      // HOT updates — reserve 30% for in-place updates
-		{"outputs", 100}, // immutable
-		{"spends", 100},  // append-only
+		// txs is the only UPDATE-churned table: SetLocked(false), the SetMinedMulti
+		// block_ids append, AND the DAH sweep's delete_at_height stamp each rewrite
+		// the row — up to ~3 updates/tx. fillfactor=50 leaves half the page free so
+		// those rewrites stay HOT (no new index entries, reclaimed cheaply by
+		// HOT-prune on the next page touch) instead of accumulating index-bloating
+		// dead tuples that only a full vacuum can reclaim. This bounds dead-tuple
+		// density at the SOURCE, so a gentle autovacuum config (which the DAH sweep
+		// needs — an aggressive one starves the sweep) is enough. cost_limit=8000
+		// (4x default) + cost_delay=0 keep what vacuum is still needed un-throttled;
+		// freeze_max_age is raised so no anti-wraparound vacuum stalls reclaim mid-run.
+		{"txs", 50, "autovacuum_vacuum_scale_factor = 0.01, " + commonAV +
+			"autovacuum_vacuum_cost_limit = 8000, " +
+			"autovacuum_freeze_max_age = 500000000, " +
+			"autovacuum_vacuum_cost_delay = 0, " +
+			"autovacuum_analyze_scale_factor = 0.005, " +
+			"autovacuum_vacuum_insert_threshold = 1000"},
+		{"spends", 100, "autovacuum_vacuum_scale_factor = 0.05, " + commonAV +
+			"autovacuum_vacuum_cost_limit = 2000, " +
+			"autovacuum_vacuum_cost_delay = 2, " +
+			"autovacuum_analyze_scale_factor = 0.05"},
 	}
 	for _, spec := range tables {
 		for i := 0; i < numPartitions; i++ {
@@ -84,24 +116,9 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 				return errors.NewStorageError("partition creation failed for %s_p%02d: %v", spec.name, i, err)
 			}
 
-			// Aggressive autovacuum for these high-churn tables (idempotent, so
-			// it also back-fills partitions created before this setting existed).
-			// insert_scale_factor is the important one: spends/outputs are
-			// append-only, so delete/update-driven vacuum never fires from
-			// inserts — but the visibility map must stay fresh or the deferred-DAH
-			// sweep's index-only count subqueries fall back to heap fetches.
-			// Insert-triggered autovacuum keeps the VM current. Cost limit/delay
-			// are sized to keep pace under legacy-sync write volume without
-			// starving the 2GB-budget instance.
-			av := fmt.Sprintf(
-				"ALTER TABLE %s_p%02d SET ("+
-					"autovacuum_vacuum_scale_factor = 0.05, "+
-					"autovacuum_vacuum_insert_scale_factor = 0.02, "+
-					"autovacuum_vacuum_cost_limit = 2000, "+
-					"autovacuum_vacuum_cost_delay = 2, "+
-					"autovacuum_analyze_scale_factor = 0.05)",
-				spec.name, i,
-			)
+			// Idempotent: also back-fills partitions created before these settings
+			// existed. Set on the leaf (autovacuum ignores parent-level params).
+			av := fmt.Sprintf("ALTER TABLE %s_p%02d SET (%s)", spec.name, i, spec.autovacuum)
 			if _, err := pool.Exec(ctx, av); err != nil {
 				return errors.NewStorageError("autovacuum tuning failed for %s_p%02d: %v", spec.name, i, err)
 			}
@@ -142,72 +159,66 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).
 	_, _ = pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET COMPRESSION lz4`)
 
-	// Playbook §9: aggressive autovacuum on hot-update table.
-	_, _ = pool.Exec(ctx, `ALTER TABLE txs SET (
-		autovacuum_vacuum_scale_factor = 0.01,
-		autovacuum_analyze_scale_factor = 0.005,
-		autovacuum_vacuum_cost_delay = 2,
-		autovacuum_vacuum_insert_threshold = 1000
-	)`)
+	// NOTE: autovacuum tuning lives on the leaf partitions (see partitionSpec
+	// above), not here. A parent-level ALTER TABLE txs SET (autovacuum_*) is a
+	// no-op for vacuum scheduling — autovacuum reads the leaf's reloptions — so
+	// the previous parent-level block was removed to avoid a false sense of
+	// safety. The effective per-partition values are the ones in the loop.
 
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Table DDL — 3 LOGGED hash-partitioned tables
+// Table DDL — 2 LOGGED hash-partitioned tables (txs + spends)
 // ---------------------------------------------------------------------------
 
-// txs: consolidated transaction metadata + state + inputs (raw_tx) + block_ids
-// (arrays) + conflicting_children (array). LOGGED — UTXO set is durable state.
+// txs: consolidated transaction metadata + state + raw_tx + block_ids (arrays) +
+// conflicting_children (array) + per-output UTXO arrays. LOGGED — UTXO set is
+// durable state.
+//
+// Output arrays (nullable, no default, no NOT NULL — NULL means legacy/no outputs;
+// array_length(NULL,1) and array_length('{}',1) both return NULL, relied upon by
+// spend validation):
+//
+//	utxo_hashes               — per-output UTXO hash (32 bytes each)
+//	out_spendables            — per-output spendable flag
+//	out_frozens               — per-output frozen flag
+//	coinbase_spending_heights — per-output coinbase maturity height (0 = non-coinbase)
+//	spendable_ins             — per-output spendable_in height (NULL element = no restriction)
+//
+// 0-based output index i → Postgres 1-based array subscript [i+1].
 const txsDDL = `
 CREATE TABLE IF NOT EXISTS txs (
-    hash                 BYTEA PRIMARY KEY,
-    version              BIGINT NOT NULL,
-    lock_time            BIGINT NOT NULL,
-    fee                  BIGINT NOT NULL,
-    size_in_bytes        BIGINT NOT NULL,
-    coinbase             BOOLEAN NOT NULL DEFAULT FALSE,
-    raw_tx               BYTEA,
-    locked               BOOLEAN NOT NULL DEFAULT FALSE,
-    conflicting          BOOLEAN NOT NULL DEFAULT FALSE,
-    frozen               BOOLEAN NOT NULL DEFAULT FALSE,
-    unmined_since        BIGINT,
-    delete_at_height     BIGINT,
-    preserve_until       BIGINT,
-    block_ids            INT[],
-    block_heights        INT[],
-    subtree_idxs         INT[],
-    conflicting_children BYTEA[],
-    inserted_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    mined_at_height      BIGINT
+    hash                      BYTEA PRIMARY KEY,
+    version                   BIGINT NOT NULL,
+    lock_time                 BIGINT NOT NULL,
+    fee                       BIGINT NOT NULL,
+    size_in_bytes             BIGINT NOT NULL,
+    coinbase                  BOOLEAN NOT NULL DEFAULT FALSE,
+    raw_tx                    BYTEA,
+    locked                    BOOLEAN NOT NULL DEFAULT FALSE,
+    conflicting               BOOLEAN NOT NULL DEFAULT FALSE,
+    frozen                    BOOLEAN NOT NULL DEFAULT FALSE,
+    unmined_since             BIGINT,
+    delete_at_height          BIGINT,
+    preserve_until            BIGINT,
+    block_ids                 INT[],
+    block_heights             INT[],
+    subtree_idxs              INT[],
+    conflicting_children      BYTEA[],
+    inserted_at               TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    mined_at_height           BIGINT,
+    utxo_hashes               BYTEA[],
+    out_spendables            BOOLEAN[],
+    out_frozens               BOOLEAN[],
+    coinbase_spending_heights BIGINT[],
+    spendable_ins             INT[]
 ) PARTITION BY HASH (hash);`
 
 // Partial indexes on txs.
 const txsIndexesDDL = `
 CREATE INDEX IF NOT EXISTS px_unmined_since ON txs (unmined_since) WHERE unmined_since IS NOT NULL;
 CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs (delete_at_height) WHERE delete_at_height IS NOT NULL;`
-
-// outputs: immutable transaction outputs. LOGGED. Spent-ness is tracked by
-// row-presence in the spends table rather than a nullable column here, so
-// these rows never have to be updated after Create.
-// spendable marks whether an output is a real, spendable UTXO. Zero-value
-// OP_RETURN / data-carrier outputs are stored (so the full output set can be
-// reconstructed) but flagged spendable=false: they can never be spent, so they
-// must be excluded from the "fully spent" pruning check, which otherwise would
-// never see a matching spends row for them and would keep the tx forever.
-const outputsDDL = `
-CREATE TABLE IF NOT EXISTS outputs (
-    tx_hash                 BYTEA   NOT NULL,
-    idx                     BIGINT  NOT NULL,
-    locking_script          BYTEA   NOT NULL,
-    satoshis                BIGINT  NOT NULL,
-    utxo_hash               BYTEA   NOT NULL,
-    coinbase_spending_height BIGINT NOT NULL DEFAULT 0,
-    frozen                  BOOLEAN DEFAULT FALSE,
-    spendable_in            INT,
-    spendable               BOOLEAN NOT NULL DEFAULT TRUE,
-    PRIMARY KEY (tx_hash, idx)
-) PARTITION BY HASH (tx_hash);`
 
 // spends: append-only spend records. LOGGED. A row here is the canonical
 // "this output was spent by that tx" marker; Unspend deletes the row, and
