@@ -4249,3 +4249,196 @@ func TestBlockValidation_InvalidBlock_PublishesToKafka(t *testing.T) {
 	// Use the thread-safe method to check if Publish was called
 	require.True(t, mockKafka.IsPublishCalled(), "Kafka Publish should be called for invalid block (duplicate transaction)")
 }
+
+func TestBlockValidation_SubtreeError_Classification(t *testing.T) {
+	initPrometheusMetrics()
+
+	tests := []struct {
+		name          string
+		subtreeErr    error
+		wantContains  string // substring expected in ValidateBlock's returned error
+		wantPersisted bool   // whether the block should end up stored (as invalid)
+	}{
+		{
+			name:          "missing parent is transient, not persisted",
+			subtreeErr:    errors.NewTxMissingParentError("parent tx not yet in store"),
+			wantContains:  "BLOCK_INCOMPLETE",
+			wantPersisted: false,
+		},
+		{
+			name:          "tx not found is transient, not persisted",
+			subtreeErr:    errors.NewTxNotFoundError("tx not yet in store"),
+			wantContains:  "BLOCK_INCOMPLETE",
+			wantPersisted: false,
+		},
+		{
+			name:          "tx invalid is a consensus violation, persisted",
+			subtreeErr:    errors.NewTxInvalidError("tx fails script validation"),
+			wantContains:  "BLOCK_INVALID",
+			wantPersisted: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			utxoStore, _, _, txStore, subtreeStore, deferFunc := setup(t)
+			defer deferFunc()
+
+			tSettings := test.CreateBaseTestSettings(t)
+			blockChainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, tSettings)
+			require.NoError(t, err)
+			blockchainClient, err := blockchain.NewLocalClient(ulogger.TestLogger{}, tSettings, blockChainStore, nil, nil)
+			require.NoError(t, err)
+
+			// Inject the subtree-validation error at the CheckBlockSubtrees boundary.
+			subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
+			subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return(tc.subtreeErr)
+
+			block := createValidBlock(t, tSettings, utxoStore, subtreeValidationClient, blockchainClient, txStore, subtreeStore)
+
+			blockValidation := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, blockchainClient, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
+
+			err = blockValidation.ValidateBlock(context.Background(), block, "http://localhost")
+			require.Error(t, err)
+			require.ErrorContains(t, err, tc.wantContains)
+
+			exists, existsErr := blockchainClient.GetBlockExists(context.Background(), block.Header.Hash())
+			require.NoError(t, existsErr)
+			require.Equal(t, tc.wantPersisted, exists,
+				"transient errors must NOT persist the block; consensus errors must")
+		})
+	}
+}
+
+// TestBlockValidation_BlockValidMissingParent_NotPersistedInvalid drives the synchronous
+// block.Valid path (OptimisticMining=false) with a block whose only non-coinbase tx spends
+// an EXTERNAL parent (the parentTx fixture) that is absent from the utxo store. block.Valid's
+// parent-existence check (getParentTxMetaBlockIDs) then hits ErrTxNotFound which Task 2 maps
+// to ErrBlockIncomplete — a transient catchup state, not a consensus violation. The
+// ValidateBlock consumer must surface BLOCK_INCOMPLETE and must NOT persist the block as
+// invalid. See issue #1031.
+//
+// Note: the child tx must spend an external parent (NOT the in-block coinbase). A tx whose
+// parent is in the same block is resolved via b.txMap and never reaches the store lookup, so
+// it would not exercise the ErrBlockIncomplete path.
+func TestBlockValidation_BlockValidMissingParent_NotPersistedInvalid(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	utxoStore, _, _, txStore, subtreeStore, deferFunc := setup(t)
+	defer deferFunc()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockValidation.OptimisticMining = false // force the synchronous block.Valid path
+
+	blockChainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+	blockchainClient, err := blockchain.NewLocalClient(ulogger.TestLogger{}, tSettings, blockChainStore, nil, nil)
+	require.NoError(t, err)
+
+	// Subtree validation succeeds — the failure must come from block.Valid's parent lookup.
+	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
+	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	// Coinbase paying exactly the block subsidy so checkBlockRewardAndFees passes.
+	privateKey, _ := bec.NewPrivateKey()
+	address, _ := bscript.NewAddressFromPublicKey(privateKey.PubKey(), true)
+	coinbaseTx := bt.NewTx()
+	_ = coinbaseTx.From("0000000000000000000000000000000000000000000000000000000000000000", 0xffffffff, "", 0)
+	coinbaseTx.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x03, 0x64, 0x00, 0x00, 0x00, '/', 'T', 'e', 's', 't'})
+	_ = coinbaseTx.AddP2PKHOutputFromAddress(address.AddressString, 50*100000000)
+	_, err = utxoStore.Create(context.Background(), coinbaseTx, 0)
+	require.NoError(t, err)
+
+	// Child tx that spends the EXTERNAL parentTx fixture. parentTx is deliberately NOT placed
+	// in the block and NOT in the utxo store, so block.Valid's parent lookup will miss it.
+	childTx := newTx(7, parentTx.TxIDChainHash())
+	_, err = utxoStore.Create(context.Background(), childTx, 0)
+	require.NoError(t, err)
+
+	// Subtree: coinbase + childTx.
+	subtree, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, subtree.AddCoinbaseNode())
+	require.NoError(t, subtree.AddNode(*childTx.TxIDChainHash(), 100, 0))
+
+	subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
+	require.NoError(t, subtreeMeta.SetTxInpointsFromTx(childTx))
+
+	nodeBytes, err := subtree.SerializeNodes()
+	require.NoError(t, err)
+	httpmock.RegisterResponder("GET", `=~^/subtree/[a-z0-9]+\z`, httpmock.NewBytesResponder(200, nodeBytes))
+
+	subtreeBytes, err := subtree.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
+
+	subtreeMetaBytes, err := subtreeMeta.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta, subtreeMetaBytes))
+
+	subtreeHashes := []*chainhash.Hash{subtree.RootHash()}
+
+	// Merkle root with coinbase swapped into the placeholder position.
+	replicatedSubtree := subtree.Duplicate()
+	replicatedSubtree.ReplaceRootNode(coinbaseTx.TxIDChainHash(), 0, uint64(coinbaseTx.Size())) //nolint:gosec
+	calculatedMerkleRootHash := replicatedSubtree.RootHash()
+
+	// Use the regtest expected target so the ValidateBlock difficulty gate (GetNextWorkRequired
+	// at genesis+1) accepts the block and we reach block.Valid.
+	nBits, _ := model.NewNBitFromString("207fffff")
+	blockHeader := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  tSettings.ChainCfgParams.GenesisHash,
+		HashMerkleRoot: calculatedMerkleRootHash,
+		Timestamp:      uint32(time.Now().Unix()), //nolint:gosec
+		Bits:           *nBits,
+		Nonce:          0,
+	}
+	for {
+		if ok, _, _ := blockHeader.HasMetTargetDifficulty(); ok {
+			break
+		}
+		blockHeader.Nonce++
+	}
+
+	block, err := model.NewBlock(
+		blockHeader,
+		coinbaseTx,
+		subtreeHashes,
+		uint64(subtree.Length()), //nolint:gosec
+		uint64(coinbaseTx.Size()+childTx.Size()), //nolint:gosec
+		100, 0,
+	)
+	require.NoError(t, err)
+
+	blockValidation := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, blockchainClient, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
+
+	err = blockValidation.ValidateBlock(context.Background(), block, "http://localhost")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "BLOCK_INCOMPLETE")
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid))
+
+	exists, existsErr := blockchainClient.GetBlockExists(context.Background(), block.Header.Hash())
+	require.NoError(t, existsErr)
+	require.False(t, exists, "transient missing-parent during block.Valid must not persist the block as invalid")
+}
+
+func TestCheckParentInvalid_CascadeIsIntentional(t *testing.T) {
+	bv := &BlockValidation{}
+
+	// A genuinely-invalid parent cascades to its child (intended; see issue #1031 site D).
+	require.True(t, bv.checkParentInvalid(&model.BlockHeaderMeta{Invalid: true}))
+
+	// A valid parent does not.
+	require.False(t, bv.checkParentInvalid(&model.BlockHeaderMeta{Invalid: false}))
+
+	// Unknown parent metadata is not treated as invalid.
+	require.False(t, bv.checkParentInvalid(nil))
+}

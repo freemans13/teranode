@@ -229,6 +229,45 @@ func (s *Store) Stop() {
 	}
 }
 
+// Close drains any in-flight batched writes and releases the connection pool,
+// honouring the supplied context as a deadline. It mirrors the SQL store's
+// contract (see utxo.Store): batchers are drained in dependency order with the
+// state-mutating writers (spend, create) last so they have the best chance of
+// committing before the deadline, and the pool is always closed once the drain
+// goroutine finishes so connections are not leaked even if ctx expired first.
+func (s *Store) Close(ctx context.Context) error {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		// Drain in dependency order: state-mutating writers last.
+		if s.unlockBatcher != nil {
+			s.unlockBatcher.Close()
+		}
+		if s.getBatcher != nil {
+			s.getBatcher.Close()
+		}
+		if s.spendBatcher != nil {
+			s.spendBatcher.Close()
+		}
+		if s.createBatcher != nil {
+			s.createBatcher.Close()
+		}
+		// Always close the pool after the batchers drain, even if ctx has
+		// already expired, so the connection pool is not leaked.
+		if s.pool != nil {
+			s.pool.Close()
+		}
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Health checks the database connection.
 func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 	var num int
