@@ -214,6 +214,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if tSettings.BatcherDrainMode {
 		s.spendBatcher.SetDrainMode(true)
 	}
+	// Tick interval applied after drain so go-batcher's drain-wins guard sees the
+	// final state (no-op + warning under drain). Default 0 = disabled.
+	if ms := tSettings.UtxoStore.SpendBatcherTickerIntervalMillis; ms > 0 {
+		s.spendBatcher.SetTickInterval(time.Duration(ms) * time.Millisecond)
+	}
 
 	// Initialize get batcher — mirrors aerospike/get.go batcher setup.
 	// Batches individual Get() calls into bulk SQL queries via BatchDecorate,
@@ -224,6 +229,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		s.getBatcher = batcher.NewWithPool(getBatchSize, getBatchDuration, s.sendGetBatch, true, batcherOpts("sql_get")...)
 		if tSettings.BatcherDrainMode {
 			s.getBatcher.SetDrainMode(true)
+		}
+		if ms := tSettings.UtxoStore.GetBatcherTickerIntervalMillis; ms > 0 {
+			s.getBatcher.SetTickInterval(time.Duration(ms) * time.Millisecond)
 		}
 	}
 
@@ -238,6 +246,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		if tSettings.BatcherDrainMode {
 			s.createBatcher.SetDrainMode(true)
 		}
+		if ms := tSettings.UtxoStore.StoreBatcherTickerIntervalMillis; ms > 0 {
+			s.createBatcher.SetTickInterval(time.Duration(ms) * time.Millisecond)
+		}
 	}
 
 	// Initialize unlock batcher for Postgres — batches single-hash SetLocked(false) calls.
@@ -247,6 +258,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		s.unlockBatcher = batcher.NewWithPool(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true, batcherOpts("sql_unlock")...)
 		if tSettings.BatcherDrainMode {
 			s.unlockBatcher.SetDrainMode(true)
+		}
+		if ms := tSettings.UtxoStore.LockedBatcherTickerIntervalMillis; ms > 0 {
+			s.unlockBatcher.SetTickInterval(time.Duration(ms) * time.Millisecond)
 		}
 	}
 
@@ -283,6 +297,65 @@ func (s *Store) GetBlockState() utxo.BlockState {
 	return utxo.BlockState{
 		Height:     s.blockHeight.Load(),
 		MedianTime: s.medianBlockTime.Load(),
+	}
+}
+
+// Close drains the batched-write workers and closes the underlying SQL
+// connection.
+//
+// The create/get/unlock batchers run in background=true mode — their Put
+// returns to the caller before the underlying SQL write commits, so a
+// SIGTERM mid-flight would silently lose queued writes without this drain.
+// The spend batcher runs in background=false mode: its Put already blocks
+// until the batch callback finishes, so no spend can be lost on the input
+// channel, but draining it here still flushes any partially filled batch
+// and releases its worker. Closing each batcher invokes go-batcher's
+// shutdown drain (see batcher.go:Close), which closes the input channel,
+// pulls any pending items out, and dispatches them through the registered
+// callback. Without this, a lost create/unlock write means the parent block
+// has already been acked elsewhere but the UTXO state never reaches the DB;
+// on restart, dependent blocks fail with missing-parent errors.
+//
+// The drain (and the subsequent db.Close) runs in a goroutine. The
+// underlying SQL connection is always closed once the batchers have
+// drained, even if ctx has already expired, so the connection pool is not
+// leaked. If the context expires before the drain completes, the function
+// returns ctx.Err() while the drain and db.Close continue best-effort; the
+// db.Close error is only surfaced when the drain finishes within the
+// deadline.
+func (s *Store) Close(ctx context.Context) error {
+	done := make(chan struct{})
+
+	var dbErr error
+
+	go func() {
+		defer close(done)
+		// Drain in dependency order: state-mutating writers last so they
+		// have the best chance of committing before the deadline.
+		if s.unlockBatcher != nil {
+			s.unlockBatcher.Close()
+		}
+		if s.getBatcher != nil {
+			s.getBatcher.Close()
+		}
+		if s.spendBatcher != nil {
+			s.spendBatcher.Close()
+		}
+		if s.createBatcher != nil {
+			s.createBatcher.Close()
+		}
+		// Always close the DB after the batchers drain, even if ctx has
+		// already expired, so the connection pool is not leaked.
+		if s.db != nil {
+			dbErr = s.db.Close()
+		}
+	}()
+
+	select {
+	case <-done:
+		return dbErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

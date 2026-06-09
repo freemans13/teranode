@@ -408,6 +408,62 @@ func setupQueueInvTests() (chan interface{}, chan *kafka.Message, *SyncManager, 
 	return msgChan, legacyKafkaInvCh, &sm, smPeer
 }
 
+func TestSendDuringShutdown(t *testing.T) {
+	t.Run("open channel delivers", func(t *testing.T) {
+		ch := make(chan int, 1)
+		require.True(t, sendDuringShutdown(ch, 7))
+		require.Equal(t, 7, <-ch)
+	})
+
+	t.Run("closed channel drops without panic", func(t *testing.T) {
+		ch := make(chan int)
+		close(ch)
+		require.NotPanics(t, func() {
+			require.False(t, sendDuringShutdown(ch, 1))
+		})
+	})
+}
+
+// TestQueueInv_NoPanicWhenChannelsClosedDuringShutdown reproduces the shutdown
+// race that previously crashed the process: inv delivery runs on a peer
+// goroutine (OnInv -> QueueInv) while teardown closes the target channels — the
+// kafka async producer closes legacyKafkaInvCh in its Stop(), and the block
+// handler stops draining msgChan. QueueInv's shutdown-flag check cannot make the
+// subsequent send atomic against that close, so a late inv hit a closed channel
+// and panicked. The send must now drop the inv instead.
+func TestQueueInv_NoPanicWhenChannelsClosedDuringShutdown(t *testing.T) {
+	t.Run("tx inv after legacyKafkaInvCh closed", func(t *testing.T) {
+		_, legacyKafkaInvCh, sm, smPeer := setupQueueInvTests()
+		close(legacyKafkaInvCh)
+
+		inv := &wire.MsgInv{}
+		require.NoError(t, inv.AddInvVect(&wire.InvVect{Type: wire.InvTypeTx, Hash: chainhash.Hash{}}))
+
+		require.NotPanics(t, func() { sm.QueueInv(inv, smPeer) })
+	})
+
+	t.Run("block inv after msgChan closed", func(t *testing.T) {
+		msgChan, _, sm, smPeer := setupQueueInvTests()
+		close(msgChan)
+
+		inv := &wire.MsgInv{}
+		require.NoError(t, inv.AddInvVect(&wire.InvVect{Type: wire.InvTypeBlock, Hash: chainhash.Hash{}}))
+
+		require.NotPanics(t, func() { sm.QueueInv(inv, smPeer) })
+	})
+
+	t.Run("non-kafka path after msgChan closed", func(t *testing.T) {
+		msgChan, _, sm, smPeer := setupQueueInvTests()
+		sm.legacyKafkaInvCh = nil // exercise the else branch
+		close(msgChan)
+
+		inv := &wire.MsgInv{}
+		require.NoError(t, inv.AddInvVect(&wire.InvVect{Type: wire.InvTypeTx, Hash: chainhash.Hash{}}))
+
+		require.NotPanics(t, func() { sm.QueueInv(inv, smPeer) })
+	})
+}
+
 // Test blockchain syncing protocol. SyncManager should request, processes, and
 // relay blocks to/from peers.
 // TODO: Test is timing out, needs to be fixed.
@@ -816,6 +872,128 @@ func TestHandleCheckSyncPeer_HeadersFirstMode(t *testing.T) {
 		// No violations, sync peer should still be set
 		assert.Equal(t, sp, sm.loadSyncPeer())
 	})
+
+	t.Run("headers-first mode keeps actively-downloading peer despite last-block-time", func(t *testing.T) {
+		sp := &peer.Peer{}
+		sps := &syncPeerState{
+			lastBlockTime:          time.Now().Add(-10 * time.Minute), // past maxLastBlockTime
+			ticks:                  1,
+			assocReadBytes:         10 * 1024 * 1024, // 10 MB pulled in over the last tick
+			assocReadBytesLastTick: 0,
+		}
+
+		sm := &SyncManager{
+			logger:                  ulogger.TestLogger{},
+			peerStates:              txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+			minSyncPeerNetworkSpeed: 51200,
+		}
+		sm.storeSyncPeer(sp, sps)
+		sm.headersFirstMode.Store(true)
+		sm.peerStates.Set(sp, &peerSyncState{})
+
+		// A large block is still streaming in (healthy association throughput),
+		// so the peer must NOT be rotated even though no block completed within
+		// maxLastBlockTime. If it rotated, the minimal SyncManager would panic.
+		require.NotPanics(t, func() { sm.handleCheckSyncPeer() })
+		assert.Equal(t, sp, sm.loadSyncPeer())
+	})
+
+	t.Run("rotates a slow-drip peer once past the wall-clock cap", func(t *testing.T) {
+		sp := &peer.Peer{}
+		sps := &syncPeerState{
+			// No completed block for longer than peer.MaxBlockDownloadTime.
+			lastBlockTime:          time.Now().Add(-peer.MaxBlockDownloadTime - time.Minute),
+			ticks:                  1,
+			assocReadBytes:         10 * 1024 * 1024, // still "healthy" throughput
+			assocReadBytesLastTick: 0,
+		}
+
+		sm := &SyncManager{
+			logger:                  ulogger.TestLogger{},
+			peerStates:              txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+			minSyncPeerNetworkSpeed: 51200,
+		}
+		sm.storeSyncPeer(sp, sps)
+		sm.headersFirstMode.Store(true)
+		sm.peerStates.Set(sp, &peerSyncState{})
+
+		// Past the cap, throughput no longer protects the peer — it is rotated
+		// (which panics in this minimal SyncManager).
+		assert.Panics(t, func() { sm.handleCheckSyncPeer() })
+	})
+}
+
+func TestHasHealthyDownloadThroughput(t *testing.T) {
+	const minSpeed = 51200 // 50 KiB/s, matches default minSyncPeerNetworkSpeed
+
+	t.Run("no prior sample", func(t *testing.T) {
+		sps := &syncPeerState{ticks: 0, assocReadBytes: 10 * 1024 * 1024}
+		require.False(t, sps.hasHealthyDownloadThroughput(minSpeed))
+	})
+
+	t.Run("no bytes moved is never healthy, even with zero threshold", func(t *testing.T) {
+		sps := &syncPeerState{ticks: 1, assocReadBytes: 100, assocReadBytesLastTick: 100}
+		require.False(t, sps.hasHealthyDownloadThroughput(0))
+	})
+
+	t.Run("chatter below threshold", func(t *testing.T) {
+		// ~33 B/s over a 30s tick — far below 50 KiB/s.
+		sps := &syncPeerState{ticks: 1, assocReadBytes: 1000, assocReadBytesLastTick: 0}
+		require.False(t, sps.hasHealthyDownloadThroughput(minSpeed))
+	})
+
+	t.Run("active download above threshold", func(t *testing.T) {
+		// 10 MB over the tick — well above 50 KiB/s.
+		sps := &syncPeerState{ticks: 1, assocReadBytes: 10 * 1024 * 1024, assocReadBytesLastTick: 0}
+		require.True(t, sps.hasHealthyDownloadThroughput(minSpeed))
+	})
+
+	t.Run("counter decrease (stream removed) is not healthy", func(t *testing.T) {
+		// A stream dropped between samples, so the association sum fell. The
+		// unsigned subtraction must not wrap to a huge "healthy" value.
+		sps := &syncPeerState{ticks: 2, assocReadBytes: 1000, assocReadBytesLastTick: 10 * 1024 * 1024}
+		require.False(t, sps.hasHealthyDownloadThroughput(minSpeed))
+	})
+}
+
+// TestSyncPeerStateFor verifies the last-block-time refresh matches not just the
+// sync peer itself but any stream of its association — under BlockPriority the
+// block is delivered on the DATA1 stream peer, not the GENERAL sync peer.
+func TestSyncPeerStateFor(t *testing.T) {
+	general := &peer.Peer{}
+	sps := &syncPeerState{lastBlockTime: time.Now()}
+
+	sm := &SyncManager{
+		logger:     ulogger.TestLogger{},
+		peerStates: txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+	}
+	sm.storeSyncPeer(general, sps)
+
+	assoc := peer.NewAssociation([]byte{0x01}, general)
+	general.SetAssociation(assoc)
+
+	// The DATA1 stream peer is a different Peer sharing the same association.
+	data1 := &peer.Peer{}
+	require.True(t, assoc.AddStream(wire.StreamTypeData1, data1))
+	data1.SetAssociation(assoc)
+
+	t.Run("sync peer itself matches", func(t *testing.T) {
+		got, ok := sm.syncPeerStateFor(general)
+		require.True(t, ok)
+		require.Equal(t, sps, got)
+	})
+
+	t.Run("association sibling (DATA1) matches", func(t *testing.T) {
+		got, ok := sm.syncPeerStateFor(data1)
+		require.True(t, ok)
+		require.Equal(t, sps, got)
+	})
+
+	t.Run("unrelated peer does not match", func(t *testing.T) {
+		other := &peer.Peer{}
+		_, ok := sm.syncPeerStateFor(other)
+		require.False(t, ok)
+	})
 }
 
 // TestHandleNewPeerMsg_NilFSMState exercises the path where the blockchain
@@ -839,7 +1017,17 @@ func TestHandleNewPeerMsg_NilFSMState(t *testing.T) {
 		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
 	}
 
-	smPeer := &peer.Peer{}
+	// Use a real connected peer: handleNewPeerMsg now refuses to register peers
+	// whose socket has been torn down by the time the newPeerMsg drains.
+	peerCfg := peer.Config{
+		Listeners:        peer.MessageListeners{},
+		UserAgentName:    "btcdtest",
+		UserAgentVersion: "1.0",
+		ChainParams:      chainParams,
+		Services:         0,
+	}
+	_, smPeer, err := MakeConnectedPeers(t, peerCfg, peerCfg, 99)
+	require.NoError(t, err)
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -851,4 +1039,34 @@ func TestHandleNewPeerMsg_NilFSMState(t *testing.T) {
 
 	require.True(t, sm.peerStates.Exists(smPeer), "peer must be registered even when FSM state is unavailable")
 	require.Equal(t, uint64(0), sm.currentFeeFilter.Load(), "fee filter must not be set when FSM state is unavailable")
+}
+
+// TestHandleNewPeerMsg_SkipsDisconnectedPeer verifies that a peer whose socket
+// was torn down before the queued newPeerMsg drained is not inserted into
+// peerStates. Pairs with the Connected() filter in startSync to prevent a dead
+// pointer from being elected as the sync peer.
+func TestHandleNewPeerMsg_SkipsDisconnectedPeer(t *testing.T) {
+	chainParams := &chaincfg.MainNetParams
+
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).
+		Return((*blockchain2.FSMStateType)(nil), errors.NewServiceError("transient gRPC error")).Maybe()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		settings:         test.CreateBaseTestSettings(t),
+		logger:           ulogger.TestLogger{},
+		chainParams:      chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+	}
+
+	// A zero-value Peer has connected=0, so Connected() returns false. This
+	// mirrors the state of a peer whose underlying socket has already closed
+	// by the time handleNewPeerMsg pulls its newPeerMsg off msgChan.
+	disconnectedPeer := &peer.Peer{}
+
+	sm.handleNewPeerMsg(disconnectedPeer)
+
+	require.False(t, sm.peerStates.Exists(disconnectedPeer), "disconnected peer must not be registered in peerStates")
 }

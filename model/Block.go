@@ -280,7 +280,10 @@ func readBlockFromReader(block *Block, buf io.Reader) (*Block, error) {
 		subtreeHash *chainhash.Hash
 	)
 
-	block.Subtrees = make([]*chainhash.Hash, 0, block.subtreeLength)
+	// subtreeLength is an untrusted varint from the wire. Cap the speculative
+	// pre-allocation and rely on the append below: a bogus count then errors on
+	// the first missing hash instead of forcing a multi-GB allocation up front.
+	block.Subtrees = make([]*chainhash.Hash, 0, min(block.subtreeLength, 1024))
 
 	for i := uint64(0); i < block.subtreeLength; i++ {
 		_, err = io.ReadFull(buf, hashBytes[:])
@@ -1123,14 +1126,20 @@ func getParentTxMetaBlockIDs(gCtx context.Context, txMetaStore utxo.Store, paren
 	parentTxMeta, err := txMetaStore.Get(gCtx, &parentTxStruct.parentTxHash, fields.BlockIDs)
 	if err != nil {
 		if errors.Is(err, errors.ErrTxNotFound) {
-			return nil, errors.NewBlockInvalidError("parent transaction %s of tx %s not found in txMetaStore", parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String())
+			// Parent tx is not in our store yet. During catchup this is a transient ordering
+			// state (we have not absorbed the parent's block), NOT a consensus violation.
+			// Return incomplete so callers retry instead of persisting the block as invalid.
+			// See issue #1031.
+			return nil, errors.NewBlockIncompleteError("parent transaction %s of tx %s not found in txMetaStore", parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String())
 		}
 
 		return nil, errors.NewStorageError("error getting parent transaction %s from txMetaStore", parentTxStruct.parentTxHash.String(), err)
 	}
 
 	if len(parentTxMeta.BlockIDs) == 0 {
-		return nil, errors.NewBlockInvalidError("parent transaction %s of tx %s has no block IDs", parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String())
+		// Parent tx exists but is not yet mined into a block we know about — also a
+		// catchup-ordering state, not a consensus violation. See issue #1031.
+		return nil, errors.NewBlockIncompleteError("parent transaction %s of tx %s has no block IDs", parentTxStruct.parentTxHash.String(), parentTxStruct.txHash.String())
 	}
 
 	return parentTxMeta, nil

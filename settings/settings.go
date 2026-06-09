@@ -96,6 +96,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockMaxSize:    int(blockMaxSize),
 			MaxTxSizePolicy: getInt("maxtxsizepolicy", 10485760, alternativeContext...), // 10MB
 			MinMiningTxFee:  getFloat64("minminingtxfee", 0.00000500, alternativeContext...),
+			MaxRawTxFee:     getUint64("maxrawtxfee", 10_000_000, alternativeContext...), // 0.1 BSV, matches bitcoin-sv DEFAULT_TRANSACTION_MAXFEE (COIN/10)
 			// MaxOrphanTxSize:                 getInt("maxorphantxsize", 1000000, alternativeContext...),
 			DataCarrierSize:              int64(getInt("datacarriersize", 1000000, alternativeContext...)),
 			MaxScriptSizePolicy:          getInt("maxscriptsizepolicy", 500000, alternativeContext...), // 500KB
@@ -267,6 +268,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SendBatchSize:                        getInt("blockassembly_sendBatchSize", 100, alternativeContext...),
 			SendBatchTimeout:                     getInt("blockassembly_sendBatchTimeout", 2, alternativeContext...),
 			SendBatchMaxConcurrent:               getInt("blockassembly_sendBatchMaxConcurrent", 0, alternativeContext...),
+			SendBatchTickerIntervalMillis:        getInt("blockassembly_sendBatchTickerIntervalMillis", 0, alternativeContext...),
 			SubtreeProcessorBatcherSize:          getInt("blockassembly_subtreeProcessorBatcherSize", 1000, alternativeContext...),
 			SubtreeProcessorConcurrentReads:      getInt("blockassembly_subtreeProcessorConcurrentReads", 375, alternativeContext...),
 			NewSubtreeChanBuffer:                 getInt("blockassembly_newSubtreeChanBuffer", 1_000, alternativeContext...),
@@ -384,32 +386,34 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CatchupParallelFetchWorkers: getInt("blockvalidation_catchup_parallel_fetch_workers", 3, alternativeContext...),
 		},
 		Validator: ValidatorSettings{
-			GRPCAddress:               getString("validator_grpcAddress", "localhost:8081", alternativeContext...),
-			GRPCListenAddress:         getString("validator_grpcListenAddress", ":8081", alternativeContext...),
-			KafkaWorkers:              getInt("validator_kafkaWorkers", 0, alternativeContext...),
-			SendBatchSize:             getInt("validator_sendBatchSize", 100, alternativeContext...),
-			SendBatchTimeout:          getInt("validator_sendBatchTimeout", 2, alternativeContext...),
-			SendBatchWorkers:          getInt("validator_sendBatchWorkers", 10, alternativeContext...),
-			BlockValidationDelay:      getInt("validator_blockvalidation_delay", 0, alternativeContext...),
-			BlockValidationMaxRetries: getInt("validator_blockvalidation_maxRetries", 5, alternativeContext...),
-			BlockValidationRetrySleep: getString("validator_blockvalidation_retrySleep", "2s", alternativeContext...),
-			VerboseDebug:              getBool("validator_verbose_debug", false, alternativeContext...),
-			HTTPListenAddress:         getString("validator_httpListenAddress", "", alternativeContext...),
-			HTTPAddress:               getURL("validator_httpAddress", "", alternativeContext...),
-			HTTPRateLimit:             getInt("validator_httpRateLimit", 1024, alternativeContext...),
-			HTTPBodyLimit:             getString("validator_httpBodyLimit", "100MB", alternativeContext...),
-			KafkaMaxMessageBytes:      getInt("validator_kafka_maxMessageBytes", 1024*1024, alternativeContext...), // Default 1MB
-			UseLocalValidator:         getBool("useLocalValidator", false, alternativeContext...),
-			TxMetaKafkaBatchSize:      getInt("validator_txmeta_kafka_batchSize", 1024, alternativeContext...),
-			TxMetaKafkaBatchTimeoutMs: getInt("validator_txmeta_kafka_batchTimeoutMs", 5, alternativeContext...),
-			TxLockedMaxRetries:        getInt("validator_txlocked_maxRetries", 3, alternativeContext...),
-			UseBatchValidation:        getBool("validator_useBatchValidation", false, alternativeContext...),
-			BatchMaxSize:              getInt("validator_batchMaxSize", 1024, alternativeContext...),
-			BatchMaxWait:              getDuration("validator_batchMaxWait", 5*time.Millisecond, alternativeContext...),
-			BatchMaxConcurrent:        getInt("validator_batchMaxConcurrent", 64, alternativeContext...),
-			BatchCoalescerDrainMode:   getBool("validator_batchCoalescerDrainMode", true, alternativeContext...),
-			TxMetaWireFormat:          getString("validator_txmeta_wireFormat", "v1", alternativeContext...),
-			TxMetaNumPartitions:       getInt("validator_txmeta_numPartitions", 32, alternativeContext...),
+			GRPCAddress:                          getString("validator_grpcAddress", "localhost:8081", alternativeContext...),
+			GRPCListenAddress:                    getString("validator_grpcListenAddress", ":8081", alternativeContext...),
+			KafkaWorkers:                         getInt("validator_kafkaWorkers", 0, alternativeContext...),
+			SendBatchSize:                        getInt("validator_sendBatchSize", 100, alternativeContext...),
+			SendBatchTimeout:                     getInt("validator_sendBatchTimeout", 2, alternativeContext...),
+			SendBatchTickerIntervalMillis:        getInt("validator_sendBatchTickerIntervalMillis", 0, alternativeContext...),
+			SendBatchWorkers:                     getInt("validator_sendBatchWorkers", 10, alternativeContext...),
+			BlockValidationDelay:                 getInt("validator_blockvalidation_delay", 0, alternativeContext...),
+			BlockValidationMaxRetries:            getInt("validator_blockvalidation_maxRetries", 5, alternativeContext...),
+			BlockValidationRetrySleep:            getString("validator_blockvalidation_retrySleep", "2s", alternativeContext...),
+			VerboseDebug:                         getBool("validator_verbose_debug", false, alternativeContext...),
+			HTTPListenAddress:                    getString("validator_httpListenAddress", "", alternativeContext...),
+			HTTPAddress:                          getURL("validator_httpAddress", "", alternativeContext...),
+			HTTPRateLimit:                        getInt("validator_httpRateLimit", 1024, alternativeContext...),
+			HTTPBodyLimit:                        getString("validator_httpBodyLimit", "100MB", alternativeContext...),
+			KafkaMaxMessageBytes:                 getInt("validator_kafka_maxMessageBytes", 1024*1024, alternativeContext...), // Default 1MB
+			UseLocalValidator:                    getBool("useLocalValidator", false, alternativeContext...),
+			TxMetaKafkaBatchSize:                 getInt("validator_txmeta_kafka_batchSize", 1024, alternativeContext...),
+			TxMetaKafkaBatchTimeoutMs:            getInt("validator_txmeta_kafka_batchTimeoutMs", 5, alternativeContext...),
+			TxMetaKafkaBatchTickerIntervalMillis: getInt("validator_txmeta_kafka_batchTickerIntervalMillis", 0, alternativeContext...),
+			TxLockedMaxRetries:                   getInt("validator_txlocked_maxRetries", 3, alternativeContext...),
+			UseBatchValidation:                   getBool("validator_useBatchValidation", false, alternativeContext...),
+			BatchMaxSize:                         getInt("validator_batchMaxSize", 1024, alternativeContext...),
+			BatchMaxWait:                         getDuration("validator_batchMaxWait", 5*time.Millisecond, alternativeContext...),
+			BatchMaxConcurrent:                   getInt("validator_batchMaxConcurrent", 64, alternativeContext...),
+			BatchCoalescerDrainMode:              getBool("validator_batchCoalescerDrainMode", true, alternativeContext...),
+			TxMetaWireFormat:                     getString("validator_txmeta_wireFormat", "v1", alternativeContext...),
+			TxMetaNumPartitions:                  getInt("validator_txmeta_numPartitions", 32, alternativeContext...),
 		},
 		Region: RegionSettings{
 			Name: getString("regionName", "defaultRegionName", alternativeContext...),
@@ -448,6 +452,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SpendBatcherDrainMode:                   getBool("utxostore_spendBatcherDrainMode", false, alternativeContext...),
 			StoreBatcherDrainMode:                   getBool("utxostore_storeBatcherDrainMode", false, alternativeContext...),
 			LockedBatcherDrainMode:                  getBool("utxostore_lockedBatcherDrainMode", false, alternativeContext...),
+			OutpointBatcherDrainMode:                getBool("utxostore_outpointBatcherDrainMode", false, alternativeContext...),
 			GetBatcherSize:                          getInt("utxostore_getBatcherSize", 1, alternativeContext...),
 			GetBatcherDurationMillis:                getInt("utxostore_getBatcherDurationMillis", 10, alternativeContext...),
 			DBTimeout:                               getDuration("utxostore_dbTimeoutDuration", 5*time.Second, alternativeContext...),
@@ -465,6 +470,13 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ReAssignedUtxoSpendableAfterBlocks:      getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
 			BatcherMaxConcurrent:                    getInt("utxostore_batcherMaxConcurrent", 64, alternativeContext...),
 			QueryIdleTimeoutSeconds:                 getInt("utxostore_queryIdleTimeoutSeconds", 60, alternativeContext...),
+			StoreBatcherTickerIntervalMillis:        getInt("utxostore_storeBatcherTickerIntervalMillis", 0, alternativeContext...),
+			GetBatcherTickerIntervalMillis:          getInt("utxostore_getBatcherTickerIntervalMillis", 0, alternativeContext...),
+			SpendBatcherTickerIntervalMillis:        getInt("utxostore_spendBatcherTickerIntervalMillis", 0, alternativeContext...),
+			OutpointBatcherTickerIntervalMillis:     getInt("utxostore_outpointBatcherTickerIntervalMillis", 0, alternativeContext...),
+			IncrementBatcherTickerIntervalMillis:    getInt("utxostore_incrementBatcherTickerIntervalMillis", 0, alternativeContext...),
+			SetDAHBatcherTickerIntervalMillis:       getInt("utxostore_setDAHBatcherTickerIntervalMillis", 0, alternativeContext...),
+			LockedBatcherTickerIntervalMillis:       getInt("utxostore_lockedBatcherTickerIntervalMillis", 0, alternativeContext...),
 		},
 		P2P: P2PSettings{
 			BlockTopic:         getString("p2p_block_topic", "", alternativeContext...),
@@ -552,6 +564,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SkipPreserveParents:            getBool("pruner_skipPreserveParents", false, alternativeContext...),                  // Skip Phase 1: preserve parents
 			SkipDeletions:                  getBool("pruner_skipDeletions", false, alternativeContext...),                        // Skip deletions for performance
 			MinBlockHeight:                 getUint32("pruner_min_block_height", 0, alternativeContext...),                       // Do not prune blocks at or below this height
+			UTXOPrunedSetMaxEntries:        getInt("pruner_utxoPrunedSetMaxEntries", 10_000_000, alternativeContext...),          // Soft cap on PrunedTxSet entries; 0 = use built-in 2B default (NOT unlimited)
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
@@ -583,6 +596,22 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CheckBlockSubtreesTimeout:                 getDuration("subtreevalidation_check_block_subtrees_timeout", 30*time.Minute, alternativeContext...),
 			MaxIncomingSubtreeBytes:                   int64(getInt("subtreevalidation_max_incoming_subtree_bytes", 128*1024*1024, alternativeContext...)),
 		},
+		// Adaptive subtreeData fetch gate. Defaults here mirror the struct
+		// tags in settings/adaptivefetch_settings.go (the operator-facing
+		// surface). Note these intentionally diverge from
+		// adaptivefetch.DefaultConfig(): the settings layer defaults
+		// BootstrapMode to "pessimistic" (safe by default), while
+		// adaptivefetch.DefaultConfig() keeps ModeAuto for direct package
+		// callers / tests. Defined once at the top level so ExportMetadata()
+		// emits each adaptive_fetch_* key exactly once. Both blockvalidation
+		// and subtreevalidation read from this single struct.
+		AdaptiveFetch: AdaptiveFetchSettings{
+			BootstrapMode:             getString("adaptive_fetch_bootstrap_mode", "pessimistic", alternativeContext...),
+			WindowSize:                getInt("adaptive_fetch_window_size", 10, alternativeContext...),
+			PessToOptHitRateThreshold: getFloat64("adaptive_fetch_pess_to_opt_hit_rate_threshold", 0.99, alternativeContext...),
+			OptToPessMissThreshold:    getInt("adaptive_fetch_opt_to_pess_miss_threshold", 100, alternativeContext...),
+			OptToPessAvgMissThreshold: getFloat64("adaptive_fetch_opt_to_pess_avg_miss_threshold", 10, alternativeContext...),
+		},
 		Legacy: LegacySettings{
 			WorkingDir:                       getString("legacy_workingDir", "../../data", alternativeContext...),
 			ListenAddresses:                  getMultiString("legacy_listen_addresses", "|", []string{}, alternativeContext...),
@@ -597,7 +626,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			OutpointBatcherConcurrency:       getInt("legacy_outpointBatcherConcurrency", 32, alternativeContext...),
 			PrintInvMessages:                 getBool("legacy_printInvMessages", false, alternativeContext...),
 			GRPCAddress:                      getString("legacy_grpcAddress", "", alternativeContext...),
-			AllowBlockPriority:               getBool("legacy_allowBlockPriority", false, alternativeContext...),
+			AllowBlockPriority:               getBool("legacy_allowBlockPriority", true, alternativeContext...),
 			GRPCListenAddress:                getString("legacy_grpcListenAddress", "", alternativeContext...),
 			SavePeers:                        getBool("legacy_savePeers", false, alternativeContext...), // by default we do not save the peers
 			AllowSyncCandidateFromLocalPeers: getBool("legacy_allowSyncCandidateFromLocalPeers", false, alternativeContext...),
