@@ -22,8 +22,8 @@ type batchLocked struct {
 }
 
 // waitForLockedResult waits for a single locked-batch item to complete, bounded
-// so a wedged lockedBatcher (including the same-pool child-record recursion in
-// setLockedBatch) can never pin the caller — or a dispatch worker — forever.
+// so a wedged lockedBatcher can never pin the caller — or a dispatch worker —
+// forever.
 func (s *Store) waitForLockedResult(ctx context.Context, errCh chan error) error {
 	if s.batcherWait <= 0 {
 		select {
@@ -72,7 +72,15 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	return g.Wait()
 }
 
-// setLockedBatch sets the locked flag on the given transactions in a batch
+// setLockedBatch sets the locked flag on the given transactions in a batch.
+//
+// Child/extra records of a multi-record (externalised) tx are written inline
+// here rather than re-queued into the lockedBatcher. Re-enqueuing from inside
+// the batcher's own callback panics ("send on closed channel") and deadlocks
+// during a draining Close — the worker that would service the re-queued item is
+// the very one shutting down. Handling children inline (one extra BatchOperate)
+// mirrors how the create path writes a tx's extra/external records, and keeps
+// the lockedBatcher free of self-referential edges so Close can drain it safely.
 func (s *Store) setLockedBatch(batch []*batchLocked) {
 	// go-batcher recovers panics in this fn; re-signal every errCh on panic so a
 	// crash (e.g. in ParseLuaMapResponse) cannot orphan the waiting submitters.
@@ -107,8 +115,6 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 			continue
 		}
 
-		// Now we need to get totalRecords and do all the child records if necessary...
-
 		batchRecords[idx] = aerospike.NewBatchUDF(
 			batchUDFPolicy,
 			key,
@@ -131,7 +137,16 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 		return
 	}
 
-	// Now we need to get totalRecords and do all the child records if necessary...
+	// Process master results. Items reporting child/extra records defer their
+	// errCh signal to the inline child pass below (tracked via childErr, one
+	// terminal result per item so each errCh is signalled exactly once).
+	childErr := make(map[int]error)
+
+	var (
+		childRecords []aerospike.BatchRecordIfc
+		childOwner   []int // childRecords[k] belongs to batch[childOwner[k]]
+	)
+
 	for idx, batchRecord := range batchRecords {
 		if handled[idx] {
 			continue
@@ -181,26 +196,68 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 			continue
 		}
 
-		// We need to do the child records...
-		g, _ := errgroup.WithContext(batch[idx].ctx)
+		// Collect this item's child records for the inline batch below.
+		childErr[idx] = nil
 
 		for i := 1; i <= extraRecords; i++ {
-			i := i
+			keySource := uaerospike.CalculateKeySourceInternal(&batch[idx].txHash, uint32(i)) // nolint:gosec
 
-			g.Go(func() error {
-				errCh := make(chan error, 1)
+			key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
+			if err != nil {
+				childErr[idx] = errors.NewProcessingError("could not create child key for locked flag", err)
+				break
+			}
 
-				s.lockedBatcher.PutCtx(batch[idx].ctx, &batchLocked{
-					txHash:     batch[idx].txHash,
-					childIndex: uint32(i), // nolint:gosec
-					setValue:   batch[idx].setValue,
-					errCh:      errCh,
-				})
-
-				return s.waitForLockedResult(batch[idx].ctx, errCh)
-			})
+			childRecords = append(childRecords, aerospike.NewBatchUDF(
+				batchUDFPolicy,
+				key,
+				LuaPackage,
+				"setLocked",
+				aerospike.NewValue(batch[idx].setValue),
+			))
+			childOwner = append(childOwner, idx)
 		}
+	}
 
-		trySignal(batch[idx].errCh, g.Wait())
+	// Write all collected child records inline (no batcher re-entry, so this is
+	// safe to run while the batcher is draining on Close). batchOperate shares the
+	// same retry/short-circuit handling as the master batch above.
+	if len(childRecords) > 0 {
+		if err := s.batchOperate(util.GetAerospikeBatchPolicy(s.settings), childRecords); err != nil {
+			for idx := range childErr {
+				if childErr[idx] == nil {
+					childErr[idx] = errors.NewProcessingError("could not batch write locked child records", err)
+				}
+			}
+		} else {
+			for k, childRecord := range childRecords {
+				idx := childOwner[k]
+				if childErr[idx] != nil {
+					continue // already errored for this item
+				}
+
+				if childRecord.BatchRec().Err != nil {
+					childErr[idx] = errors.NewProcessingError("could not write locked child record", childRecord.BatchRec().Err)
+					continue
+				}
+
+				resp := childRecord.BatchRec().Record
+				if resp == nil || resp.Bins == nil || resp.Bins[LuaSuccess.String()] == nil {
+					continue
+				}
+
+				cres, perr := s.ParseLuaMapResponse(resp.Bins[LuaSuccess.String()])
+				if perr != nil {
+					childErr[idx] = errors.NewProcessingError("could not parse child response", perr)
+				} else if cres.Status != LuaStatusOK {
+					childErr[idx] = errors.NewProcessingError("error from setLocked child: %s", cres.Message)
+				}
+			}
+		}
+	}
+
+	// Signal each child-bearing item exactly once with its terminal result.
+	for idx, e := range childErr {
+		trySignal(batch[idx].errCh, e)
 	}
 }

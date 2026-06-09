@@ -1403,13 +1403,24 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		ctxLogger.Infof("[ValidateBlock][%s] validating %d subtrees", block.Hash().String(), len(block.Subtrees))
 
 		if err = u.validateBlockSubtrees(ctx, block, opts.PeerID, baseURL); err != nil {
-			if errors.Is(err, errors.ErrTxInvalid) || errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxNotFound) {
+			// Genuine consensus violation — a transaction in the block is invalid. Persist invalid.
+			if errors.Is(err, errors.ErrTxInvalid) {
 				ctxLogger.Warnf("[ValidateBlock][%s] block contains invalid transactions, marking as invalid: %s", block.Hash().String(), err)
 				reason := fmt.Sprintf("block contains invalid transactions: %s", err.Error())
 				if !opts.IsRevalidation {
 					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
 				}
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block contains invalid transactions: %s", block.Hash().String(), err)
+			}
+
+			// Catchup-state errors: a parent transaction is not yet in our store because we
+			// have not yet absorbed the block that contains it. This is a transient ordering
+			// problem, NOT a consensus violation. Do NOT persist the block as invalid (that
+			// poisons the DB permanently and stalls sync); signal incomplete so catchup
+			// retries another peer. See issue #1031.
+			if errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxNotFound) {
+				ctxLogger.Warnf("[ValidateBlock][%s] transient missing-data during subtree validation, will retry: %s", block.Hash().String(), err)
+				return errors.NewBlockIncompleteError("[ValidateBlock][%s] transient missing-data during subtree validation: %s", block.Hash().String(), err)
 			}
 
 			return err
@@ -1620,6 +1631,13 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					return err
 				}
 
+				// Transient catchup-state surfaced from block.Valid (e.g. a parent transaction
+				// not yet in our store). Don't poison the DB; signal incomplete so catchup
+				// retries another peer. See issue #1031.
+				if errors.Is(err, errors.ErrBlockIncomplete) {
+					return errors.NewBlockIncompleteError("[ValidateBlock][%s] block validation hit transient missing-data state: %s", block.Hash().String(), err)
+				}
+
 				if !opts.IsRevalidation {
 					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
 				}
@@ -1767,6 +1785,14 @@ func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Bl
 
 // checkParentInvalid checks if the parent block is invalid. This is an optimization
 // to skip expensive validation when the parent is already invalid.
+//
+// NOTE (#1031): this deliberately cascades on the bare Invalid flag without inspecting
+// WHY the parent is invalid. That is correct because transient catchup-state errors no
+// longer persist invalid=true (see the validateBlockSubtrees and block.Valid handlers and
+// model.getParentTxMetaBlockIDs) — a parent marked invalid is invalid for a genuine
+// consensus reason, so a child built on it is genuinely invalid too. Reason-based
+// classification is not possible here anyway: BlockHeaderMeta carries no invalid-reason
+// field. Do not "fix" this to suppress cascades without first re-checking that invariant.
 //
 // Parameters:
 //   - parentMeta: Metadata of the parent block (can be nil)
@@ -2277,11 +2303,17 @@ func (u *BlockValidation) checkOldBlockIDsOffChainPrefetch(ctx context.Context,
 		u.logger.Infof("[checkOldBlockIDs][%s] off-chain-prefetch route: prefetched %d off-chain block IDs (maxBlockID=%d), checking %d old block ID entries", block.Hash().String(), len(offChain), maxBlockID, oldBlockIDsMap.Length())
 	}
 
-	// ANY-of, inverted, mirroring CheckBlockIsInCurrentChain exactly: a tx's
-	// parent set is on the main chain if at least one of its parent block IDs is
-	// (id <= maxBlockID) AND NOT in the off-chain set. IDs above maxBlockID
-	// cannot exist yet, so they are skipped here (not treated as on-chain) and
-	// fall through to the authoritative RPC — never short-circuited to accept.
+	// NOTE (Option C / consensus): this local fast path treats a candidate absent
+	// from the off-chain set as on-chain. That is UNSOUND for a non-existent
+	// (phantom / id-sequence gap) id <= maxBlockID, which is absent from the
+	// off-chain set yet has no on_main_chain row — the authoritative store route
+	// (CheckBlockIsInCurrentChain, now fixed) rejects it. This toggle-on
+	// optimization therefore still carries the latent split for dangling ids.
+	// Making it sound removes the positive short-circuit (every survivor would
+	// need an authoritative confirm), which obsoletes this profiled prefetch — a
+	// perf/design call left for the team. Phantom CREATION is already prevented by
+	// the idempotent AssignBlockID fix, so this is latent, not reachable in normal
+	// operation.
 	fastPath := func(blockIDs []uint32) bool {
 		for _, blockID := range blockIDs {
 			if blockID > maxBlockID {
