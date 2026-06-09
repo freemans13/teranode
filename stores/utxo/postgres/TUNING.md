@@ -1,26 +1,37 @@
 # PostgreSQL tuning for the high-throughput UTXO store
 
-Sustained validator-hot-path throughput (Get + Spend + Create + SetLocked per tx,
-10K concurrent chains) is bound by **write amplification of random-hash inserts**:
-every tx dirties random 8 KB leaf pages across the txs PK (32-byte hash) and the
-spends UNIQUE index (the outputs table was folded into txs arrays, removing its
-PK), so throughput is dominated by how well the index working set stays
-cache-resident and how smoothly dirty pages are flushed. The store code/schema
-changes below are in-repo; the server GUCs are deployment config.
+**Updated model (2026-06-09, measured):** with sane WAL/checkpoint GUCs the
+sustained workload is **PostgreSQL server-CPU-bound, not disk-bound** — under
+full load postgres consumes ~12 of 16 cores (client ~2, 0% idle), and
+stretching `checkpoint_timeout` 90s→30min cut full-page-image WAL ~20× with
+**zero** TPS change. The binding constraint on the *balanced* (create == reclaim,
+table bounded) rate is the **per-row reclaim pipeline's CPU**: DAH sweep
+enumerate + stamp UPDATE + doomed scan + cascade DELETE measured at ~25–30% of
+all server CPU (`pg_stat_statements`). The earlier "shared NVMe write budget"
+theory below this section is retained for history but was disproven on this
+host once `max_wal_size` (found at 1GB, with `min_wal_size`=2GB!) was restored
+to the playbook value.
 
-## Measured results (PostgreSQL 18.2, 64 GB Apple-Silicon macOS host, NVMe)
+## Measured results (PostgreSQL 18.2, M3 Max 16-core 64 GB macOS, NVMe, 10K workers)
 
 | scenario | result |
 |---|---|
-| **No-prune, 12 min, 10K workers** | **median ~92K TPS** (peaks ~130K), shared_buffers=24–32GB |
-| **Concurrent create+prune, 10K workers (table BOUNDED)** | **median ~52K TPS** (range 45–53K, CV ~17%), prune engaging, shared_buffers=8GB |
-| **Prune reclaim capacity (isolated drain)** | **~85K deletes/s = ~1.7× the achieved concurrent rate** (≥1.5× ✓) |
-| Unit tests | full `stores/utxo/postgres` suite passes, `-race` clean |
+| **No-prune hot-path ceiling (current code)** | **median ~112K TPS** (range 105–143K), shared_buffers=8GB |
+| **Concurrent create+prune, table gated ≤1.5M rows** | **~75K honest plateau; best stable runs 88.4K median CV 4.2%** |
+| Prune reclaim under load | ~86K/s when cache-resident; degrades to ~23–30K/s once the table outgrows the hot set (metastable — hence the table-size gate in the harness) |
+| Unit tests | full `stores/utxo/postgres` suite passes |
 
-> The concurrent (create **while pruner runs**, table bounded) rate is ~52K — the
-> genuine balanced rate where prune keeps pace. Create-side alone bursts to ~85–92K
-> but is not sustainable while pruning (prune+create share the NVMe write budget).
-> 100K sustained needs faster random-write storage (dedicated Linux host / NVMe).
+Progression of the sustained-with-prune median during the 2026-06-09 session:
+63.1K (GUC fix baseline) → 70.6K (BRIN/HOT indexes) → 75.7K (harness miner fix)
+→ 88.4K best / ~75K honest (two-step bounded sweep + interleaved prune +
+SetMinedMulti RETURNING + table gate).
+
+> **Route to ≥100K balanced on this host:** the gap between the 112K no-prune
+> ceiling and the ~75K balanced rate *is* the per-row reclaim pipeline.
+> Generational reclaim (sub-partition txs/spends by height bucket; prune =
+> relocate survivors + DETACH+DROP the aged bucket leaves; delete the whole
+> stamp/watermark machinery) removes that pipeline. See
+> `stores/utxo/throughput_designd_spike_test.go` for the Phase-4A instrument.
 
 ### Two TEST-HARNESS bugs that were silently corrupting measurements (fixed)
 
@@ -67,28 +78,25 @@ on `txs` to keep the per-tx UPDATEs HOT, and the GUCs below), concurrent
 create+prune is stable at **~65K TPS with the table bounded** (prune keeps pace;
 reclaim capacity is 5.38× in isolation).
 
-### ≥100K / 150K-with-prune feasibility (honest verdict)
+### ≥100K / 150K-with-prune feasibility (verdict revised 2026-06-09)
 
-The sustainable **balanced** rate (create == reclaim, table bounded) on this 64 GB
-Apple-Silicon (macOS) NVMe box is **~65–70K TPS** — real reclaim (sweep stamp +
-3-table cascade delete + autovacuum) competes with create for a shared I/O budget,
-and that budget is the wall. Create-side alone reaches ~85–90K (when not competing
-with reclaim), and no-prune reaches ~93K@24 GB, but `SIGBUS` (macOS shared-memory
-page-fault) caps usable `shared_buffers` under a heavy concurrent client. Neither
-100K nor 150K *with the pruner keeping the table bounded* is reachable here. The
-two routes that get there:
+SUPERSEDED: the earlier verdict ("~65–70K balanced is the wall; 100K needs a
+Linux host or the outputs fold") was measured under GUC drift (`max_wal_size`
+silently at 1GB) and with three since-fixed CPU sinks (HOT-blocking partial
+btrees, the `enable_nestloop=off` full-partition sweep joins, and a serialised
+sweep-then-delete prune cycle). With those fixed the no-prune ceiling on this
+same macOS box is **~112K** and the balanced rate ~75K honest / 88K best.
 
-- **Dedicated Linux host, `shared_buffers=20–32 GB`** (no macOS SHM ceiling): the
-  expert estimate is ~90–110K balanced.
-- **Schema change — fold `outputs` (and spend-state) into the `txs` row** (K/V
-  layout): cuts random-index writes and cascade-delete tables per tx, est.
-  ~110–130K; but it rewrites the bulk spend-validation CTE (which joins `outputs`
-  for per-output utxo_hash/spendable/frozen/coinbase) and is a large,
-  consensus-critical migration.
+The remaining gap to ≥100K balanced is the per-row reclaim pipeline itself
+(~25–30% of server CPU), not storage and not macOS: the route is **generational
+DROP-partition reclaim** (height-bucket sub-partitions; prune = survivor
+relocation + DETACH+DROP; the DAH stamp/watermark/doomed machinery is deleted
+outright). Stacked with hot-path byte-diet levers (INT4 narrowing, array
+packing) the projected balanced rate is ~110–125K on this host.
 
-Not pursued here: eager DAH stamping at mine time would lift the balanced rate, but
-it violates the deliberate "inline ops only tag heights; the deferred safe-tip
-sweep stamps" invariant (`TestSetMinedTagsHeightAndDoesNotStampInline`).
+Still true: eager inline DAH stamping remains rejected — it violates the
+"inline ops only tag heights" invariant (`TestSetMinedTagsHeightAndDoesNotStampInline`)
+and re-adds a row-locking UPDATE to the spend hot path.
 
 Reproduce:
 
@@ -116,11 +124,16 @@ PRUNE_DRAIN_TXS=1000000 PRUNE_DRAIN_WORKERS=200 \
 ALTER SYSTEM SET shared_buffers = '8GB';           -- restart (6-8GB pruned; 24GB no-prune)
 ALTER SYSTEM SET effective_cache_size = '24GB';
 
--- Smooth the writes: moderate pool + frequent SMALL checkpoints + continuous
--- background flushing, so dirty pages never pile into a multi-GB checkpoint storm.
+-- Long checkpoint cycles: every checkpoint re-arms a full-page image for every
+-- hot page on next touch, and the random-hash access pattern touches EVERY index
+-- leaf each cycle — 90s cycles produced ~20x the FPI WAL of 30min cycles
+-- (measured; TPS-neutral on NVMe but the WAL volume matters on lesser disks and
+-- for replication). checkpoint_completion_target=0.9 keeps the flush smooth.
+-- WARNING: min_wal_size must stay BELOW max_wal_size — this instance was found
+-- running max=1GB/min=2GB, which forced a checkpoint every ~10s under load.
 ALTER SYSTEM SET max_wal_size = '16GB';
 ALTER SYSTEM SET min_wal_size = '2GB';
-ALTER SYSTEM SET checkpoint_timeout = '90s';
+ALTER SYSTEM SET checkpoint_timeout = '30min';
 ALTER SYSTEM SET checkpoint_completion_target = 0.9;
 ALTER SYSTEM SET bgwriter_lru_maxpages = 1000;
 ALTER SYSTEM SET bgwriter_delay = '10ms';
