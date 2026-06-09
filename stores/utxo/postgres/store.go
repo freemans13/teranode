@@ -42,6 +42,9 @@ type Store struct {
 	// achieved batch-size instrumentation (items/batches per batcher).
 	batchStats batchSizeStats
 
+	// buckets tracks which generation-bucket leaf partitions exist (see bucket.go).
+	buckets bucketManager
+
 	// pruner service — lazily created per store instance (not a package global).
 	prunerService   pruner.Service
 	prunerServiceMu sync.Mutex

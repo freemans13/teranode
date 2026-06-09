@@ -41,9 +41,10 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	}
 
 	// Check preserve_until first: if set, don't touch DAH.
+	// Latest generation wins on cross-bucket duplicate hashes (see create.go).
 	var preserveUntil *int64
 	err := s.pool.QueryRow(ctx,
-		`SELECT preserve_until FROM txs WHERE hash = $1`,
+		`SELECT preserve_until FROM txs WHERE hash = $1 ORDER BY bucket DESC LIMIT 1`,
 		hash[:],
 	).Scan(&preserveUntil)
 	if err != nil {
@@ -66,7 +67,8 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 		        WHERE sp.prev_tx_hash = t.hash
 		          AND t.out_spendables[g.i+1] = true
 		    ) AS all_spent
-		FROM txs t WHERE t.hash = $1`,
+		FROM txs t WHERE t.hash = $1
+		ORDER BY t.bucket DESC LIMIT 1`,
 		hash[:],
 	).Scan(&allSpent)
 	if err != nil {
@@ -77,7 +79,7 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	var blockIDs []int32
 	var onLongestChain bool
 	err = s.pool.QueryRow(ctx,
-		`SELECT block_ids, (unmined_since IS NULL) FROM txs WHERE hash = $1`,
+		`SELECT block_ids, (unmined_since IS NULL) FROM txs WHERE hash = $1 ORDER BY bucket DESC LIMIT 1`,
 		hash[:],
 	).Scan(&blockIDs, &onLongestChain)
 	if err != nil {

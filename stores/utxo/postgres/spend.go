@@ -38,6 +38,13 @@ type batchSpendItem struct {
 // requires array_length(t.utxo_hashes, 1) >= $2::int + 1 (1-based Postgres
 // subscript for 0-based output index $2), so a missing tx OR an OOB index
 // both produce 0 RETURNING rows — diagnosed by diagnoseSpendFailure.
+//
+// Generation buckets: the parent row is selected with latest-generation-wins
+// (ORDER BY bucket DESC LIMIT 1 — cross-bucket duplicate parents are possible,
+// see create.go), and the spends row INHERITS the parent's bucket so parent +
+// spend markers live in the same generation leaf (droppable together in
+// increment 2). ON CONFLICT must name the full unique key, which now includes
+// bucket.
 const spendValidationSQL = `
 WITH validation AS (
     SELECT
@@ -45,18 +52,21 @@ WITH validation AS (
         COALESCE(CASE WHEN array_length(t.out_frozens, 1) >= $2::int + 1 THEN t.out_frozens[$2::int + 1] END, false) AS output_frozen,
         COALESCE(CASE WHEN array_length(t.coinbase_spending_heights, 1) >= $2::int + 1 THEN t.coinbase_spending_heights[$2::int + 1] END, 0) AS coinbase_spending_height,
         CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END AS spendable_in,
-        t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
+        t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen,
+        t.bucket AS bucket
     FROM txs t
     WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
+    ORDER BY t.bucket DESC
+    LIMIT 1
 ),
 inserted AS (
-    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height)
-    SELECT $1, $2, $3, $5 FROM validation v
+    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height, bucket)
+    SELECT $1, $2, $3, $5, v.bucket FROM validation v
     WHERE v.utxo_hash = $4 AND NOT v.output_frozen AND NOT v.tx_frozen
       AND ($6 OR NOT v.tx_locked) AND ($7 OR NOT v.tx_conflicting)
       AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $5)
       AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $5 < COALESCE(v.spendable_in, 0))
-    ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
+    ON CONFLICT (prev_tx_hash, prev_output_idx, bucket) DO NOTHING
     RETURNING prev_tx_hash
 )
 SELECT 1 FROM inserted
@@ -78,6 +88,8 @@ SELECT
 FROM txs t
 LEFT JOIN spends sp ON sp.prev_tx_hash = t.hash AND sp.prev_output_idx = $2
 WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
+ORDER BY t.bucket DESC
+LIMIT 1
 `
 
 // ---------------------------------------------------------------------------
@@ -466,6 +478,14 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 //   - no row in resultMap → TxNotFound (tx missing)
 //   - row exists, slot_exists=false → TxNotFound (OOB index)
 //   - row exists, !utxo_match → UtxoHashMismatch (wrong UTXO hash)
+//
+// Generation buckets: a cross-bucket duplicate parent (see create.go) makes
+// the items→txs join multi-row per item, so validated picks the LATEST
+// generation per batch item via DISTINCT ON (i.batch_idx) ... ORDER BY
+// i.batch_idx, t.bucket DESC. (DISTINCT ON the parent hash would be wrong:
+// two batch items can spend different vouts of the SAME parent and must each
+// keep their row.) The spends row inherits the parent's bucket, and
+// ON CONFLICT names the full (prev_tx_hash, prev_output_idx, bucket) key.
 const bulkSpendSQL = `
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
@@ -478,26 +498,29 @@ WITH items AS (
            unnest($8::int[])     AS batch_idx
 ),
 validated AS (
-    SELECT i.batch_idx, i.prev_tx_hash, i.prev_idx, i.spending_data, i.expected_utxo_hash,
+    SELECT DISTINCT ON (i.batch_idx)
+           i.batch_idx, i.prev_tx_hash, i.prev_idx, i.spending_data, i.expected_utxo_hash,
            i.block_height, i.ign_locked, i.ign_conflicting,
            CASE WHEN array_length(t.utxo_hashes,1) >= i.prev_idx::int+1 THEN t.utxo_hashes[i.prev_idx::int+1] END AS utxo_hash,
            COALESCE(CASE WHEN array_length(t.out_frozens,1) >= i.prev_idx::int+1 THEN t.out_frozens[i.prev_idx::int+1] END, false) AS out_frozen,
            CASE WHEN array_length(t.spendable_ins,1) >= i.prev_idx::int+1 THEN t.spendable_ins[i.prev_idx::int+1] END AS spendable_in,
            COALESCE(CASE WHEN array_length(t.coinbase_spending_heights,1) >= i.prev_idx::int+1 THEN t.coinbase_spending_heights[i.prev_idx::int+1] END, 0) AS coinbase_spending_height,
-           t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
+           t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen,
+           t.bucket AS bucket
     FROM items i JOIN txs t ON t.hash = i.prev_tx_hash
+    ORDER BY i.batch_idx, t.bucket DESC
 ),
 to_insert AS (
-    SELECT prev_tx_hash, prev_idx, spending_data, block_height, batch_idx FROM validated
+    SELECT prev_tx_hash, prev_idx, spending_data, block_height, batch_idx, bucket FROM validated
     WHERE utxo_hash = expected_utxo_hash AND NOT out_frozen AND NOT tx_frozen
       AND (ign_locked OR NOT tx_locked) AND (ign_conflicting OR NOT tx_conflicting)
       AND NOT (coinbase_spending_height > 0 AND coinbase_spending_height > block_height)
       AND NOT (COALESCE(spendable_in,0) > 0 AND block_height < COALESCE(spendable_in,0))
 ),
 inserted AS (
-    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height)
-    SELECT prev_tx_hash, prev_idx, spending_data, block_height FROM to_insert
-    ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
+    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height, bucket)
+    SELECT prev_tx_hash, prev_idx, spending_data, block_height, bucket FROM to_insert
+    ON CONFLICT (prev_tx_hash, prev_output_idx, bucket) DO NOTHING
     RETURNING prev_tx_hash, prev_output_idx
 )
 SELECT v.batch_idx, (i.prev_tx_hash IS NOT NULL) AS inserted,
@@ -647,6 +670,8 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		// Ownership-checked delete: the spending_data predicate ensures only this
 		// caller's spend row is removed. A mismatching (non-owning) caller deletes
 		// 0 rows — intentional — but still drives the parent's DAH housekeeping.
+		// No bucket predicate: the delete fans across the few live bucket leaves,
+		// which is fine for this cold reorg path.
 		if _, err := pgxTx.Exec(ctx,
 			`DELETE FROM spends WHERE prev_tx_hash = $1 AND prev_output_idx = $2 AND spending_data = $3`,
 			spend.TxID[:], spend.Vout, spend.SpendingData.Bytes(),

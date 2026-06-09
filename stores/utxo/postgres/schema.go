@@ -29,7 +29,18 @@ import (
 //     per-output UTXO fields are stored as arrays on txs. A single row lookup
 //     returns everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
-	return createSchemaWithPool(ctx, s.pool)
+	if err := createSchemaWithPool(ctx, s.pool); err != nil {
+		return err
+	}
+
+	// Pre-create the bucket-0 leaves plus the leaves for the current block
+	// height's bucket, so the first writes never pay the leaf-creation DDL.
+	// Later buckets are created lazily from the create path (see EnsureBucket).
+	if err := s.EnsureBucket(ctx, 0); err != nil {
+		return err
+	}
+
+	return s.EnsureBucket(ctx, bucketFor(s.blockHeight.Load()))
 }
 
 // partitionSpec defines a partitioned table, the fillfactor for its children,
@@ -57,6 +68,50 @@ type partitionSpec struct {
 // workers while bounding fan-out cost on reads.
 const numPartitions = 8
 
+// leafSpecs defines the per-table leaf-partition settings. They are applied to
+// the BUCKET LEAVES (txs_pNN_bBBBB), not the mid-level hash partitions: with
+// two-level partitioning (HASH (hash) → RANGE (bucket)) the mid-level txs_pNN
+// relations are themselves partitioned tables, which have no storage and accept
+// no storage parameters — fillfactor and autovacuum reloptions only take effect
+// on the concrete leaves (autovacuum reads the LEAF's reloptions; parent-level
+// params are ignored for vacuum scheduling).
+//
+// txs is the only high-churn table: the validator hot path UPDATEs the
+// `locked` flag per tx (Create(WithLocked)+SetLocked), producing one dead
+// tuple per tx. At scale_factor=0.05 on a multi-million-row partition that
+// lets ~5% (≈1.7M) dead tuples accumulate before vacuum fires — observed as
+// a 0.3M–1.9M dead-tuple oscillation that breaks HOT-chain reuse under load.
+// 0.01 fires at ~1% (≈340K), and cost_delay=0 keeps the sweep from being
+// throttled mid-run. spends is insert-only (no UPDATE churn), so the
+// insert_scale_factor path (keeping the visibility map fresh for the
+// deferred-DAH sweep's index-only counts) is what matters there — left at the
+// gentler 0.05 so insert-triggered vacuums don't steal hot-path I/O.
+//
+// txs fillfactor rationale: SetLocked(false), the SetMinedMulti block_ids
+// append, AND the DAH sweep's delete_at_height stamp each rewrite the row — up
+// to ~3 updates/tx. fillfactor=50 leaves half the page free so those rewrites
+// stay HOT (no new index entries, reclaimed cheaply by HOT-prune on the next
+// page touch) instead of accumulating index-bloating dead tuples that only a
+// full vacuum can reclaim. This bounds dead-tuple density at the SOURCE, so a
+// gentle autovacuum config (which the DAH sweep needs — an aggressive one
+// starves the sweep) is enough. cost_limit=8000 (4x default) + cost_delay=0
+// keep what vacuum is still needed un-throttled; freeze_max_age is raised so
+// no anti-wraparound vacuum stalls reclaim mid-run.
+var leafSpecs = []partitionSpec{
+	{"txs", 50, "autovacuum_vacuum_scale_factor = 0.01, " + commonAV +
+		"autovacuum_vacuum_cost_limit = 8000, " +
+		"autovacuum_freeze_max_age = 500000000, " +
+		"autovacuum_vacuum_cost_delay = 0, " +
+		"autovacuum_analyze_scale_factor = 0.005, " +
+		"autovacuum_vacuum_insert_threshold = 1000"},
+	{"spends", 100, "autovacuum_vacuum_scale_factor = 0.05, " + commonAV +
+		"autovacuum_vacuum_cost_limit = 2000, " +
+		"autovacuum_vacuum_cost_delay = 2, " +
+		"autovacuum_analyze_scale_factor = 0.05"},
+}
+
+const commonAV = "autovacuum_vacuum_insert_scale_factor = 0.02, "
+
 // createSchemaWithPool executes all DDL statements using the provided pool.
 func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	ddlStatements := []string{
@@ -70,57 +125,20 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
-	// Create numPartitions hash partitions for each table with appropriate
-	// fillfactor and per-leaf autovacuum tuning.
-	//
-	// txs is the only high-churn table: the validator hot path UPDATEs the
-	// `locked` flag per tx (Create(WithLocked)+SetLocked), producing one dead
-	// tuple per tx. At scale_factor=0.05 on a multi-million-row partition that
-	// lets ~5% (≈1.7M) dead tuples accumulate before vacuum fires — observed as
-	// a 0.3M–1.9M dead-tuple oscillation that breaks HOT-chain reuse under load.
-	// 0.01 fires at ~1% (≈340K), and cost_delay=0 keeps the sweep from being
-	// throttled mid-run. spends is insert-only (no UPDATE churn), so the
-	// insert_scale_factor path (keeping the visibility map fresh for the
-	// deferred-DAH sweep's index-only counts) is what matters there — left at the
-	// gentler 0.05 so insert-triggered vacuums don't steal hot-path I/O.
-	const commonAV = "autovacuum_vacuum_insert_scale_factor = 0.02, "
-	tables := []partitionSpec{
-		// txs is the only UPDATE-churned table: SetLocked(false), the SetMinedMulti
-		// block_ids append, AND the DAH sweep's delete_at_height stamp each rewrite
-		// the row — up to ~3 updates/tx. fillfactor=50 leaves half the page free so
-		// those rewrites stay HOT (no new index entries, reclaimed cheaply by
-		// HOT-prune on the next page touch) instead of accumulating index-bloating
-		// dead tuples that only a full vacuum can reclaim. This bounds dead-tuple
-		// density at the SOURCE, so a gentle autovacuum config (which the DAH sweep
-		// needs — an aggressive one starves the sweep) is enough. cost_limit=8000
-		// (4x default) + cost_delay=0 keep what vacuum is still needed un-throttled;
-		// freeze_max_age is raised so no anti-wraparound vacuum stalls reclaim mid-run.
-		{"txs", 50, "autovacuum_vacuum_scale_factor = 0.01, " + commonAV +
-			"autovacuum_vacuum_cost_limit = 8000, " +
-			"autovacuum_freeze_max_age = 500000000, " +
-			"autovacuum_vacuum_cost_delay = 0, " +
-			"autovacuum_analyze_scale_factor = 0.005, " +
-			"autovacuum_vacuum_insert_threshold = 1000"},
-		{"spends", 100, "autovacuum_vacuum_scale_factor = 0.05, " + commonAV +
-			"autovacuum_vacuum_cost_limit = 2000, " +
-			"autovacuum_vacuum_cost_delay = 2, " +
-			"autovacuum_analyze_scale_factor = 0.05"},
-	}
-	for _, spec := range tables {
+	// Create numPartitions hash partitions for each table. Each hash partition
+	// is itself sub-partitioned BY RANGE (bucket) — the generation dimension —
+	// so it is a partitioned table with no storage of its own: fillfactor and
+	// autovacuum settings live on the bucket leaves (see EnsureBucket), which
+	// hold the actual rows. INCREMENT 2: aged bucket leaves will be reclaimed
+	// via DETACH PARTITION + DROP TABLE instead of row deletes.
+	for _, spec := range leafSpecs {
 		for i := 0; i < numPartitions; i++ {
 			ddl := fmt.Sprintf(
-				"CREATE TABLE IF NOT EXISTS %s_p%02d PARTITION OF %s FOR VALUES WITH (MODULUS %d, REMAINDER %d) WITH (fillfactor = %d)",
-				spec.name, i, spec.name, numPartitions, i, spec.fillfactor,
+				"CREATE TABLE IF NOT EXISTS %s_p%02d PARTITION OF %s FOR VALUES WITH (MODULUS %d, REMAINDER %d) PARTITION BY RANGE (bucket)",
+				spec.name, i, spec.name, numPartitions, i,
 			)
 			if _, err := pool.Exec(ctx, ddl); err != nil {
 				return errors.NewStorageError("partition creation failed for %s_p%02d: %v", spec.name, i, err)
-			}
-
-			// Idempotent: also back-fills partitions created before these settings
-			// existed. Set on the leaf (autovacuum ignores parent-level params).
-			av := fmt.Sprintf("ALTER TABLE %s_p%02d SET (%s)", spec.name, i, spec.autovacuum)
-			if _, err := pool.Exec(ctx, av); err != nil {
-				return errors.NewStorageError("autovacuum tuning failed for %s_p%02d: %v", spec.name, i, err)
 			}
 		}
 	}
@@ -187,9 +205,20 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 //	spendable_ins             — per-output spendable_in height (NULL element = no restriction)
 //
 // 0-based output index i → Postgres 1-based array subscript [i+1].
+//
+// bucket is the GENERATION dimension (see bucket.go): bucket =
+// blockHeight / bucketHeights at create time. Each hash partition txs_pNN is
+// sub-partitioned BY RANGE (bucket) so increment 2 can reclaim aged
+// generations with DETACH+DROP of whole leaves instead of row deletes. The
+// PK is (hash, bucket) — Postgres requires every partition key column in a
+// unique constraint — which makes CROSS-BUCKET DUPLICATES of the same tx hash
+// possible (same tx re-created in a later generation). Readers resolve this
+// with latest-generation-wins (ORDER BY bucket DESC); see create.go for the
+// full duplicate-semantics contract.
 const txsDDL = `
 CREATE TABLE IF NOT EXISTS txs (
-    hash                      BYTEA PRIMARY KEY,
+    hash                      BYTEA NOT NULL,
+    bucket                    INT NOT NULL DEFAULT 0,
     version                   BIGINT NOT NULL,
     lock_time                 BIGINT NOT NULL,
     fee                       BIGINT NOT NULL,
@@ -212,7 +241,8 @@ CREATE TABLE IF NOT EXISTS txs (
     out_spendables            BOOLEAN[],
     out_frozens               BOOLEAN[],
     coinbase_spending_heights BIGINT[],
-    spendable_ins             INT[]
+    spendable_ins             INT[],
+    PRIMARY KEY (hash, bucket)
 ) PARTITION BY HASH (hash);`
 
 // Indexes on txs.
@@ -243,11 +273,21 @@ CREATE INDEX IF NOT EXISTS px_preserve_until ON txs (preserve_until) WHERE prese
 // spends: append-only spend records. LOGGED. A row here is the canonical
 // "this output was spent by that tx" marker; Unspend deletes the row, and
 // the pruner removes all rows for a parent_tx before removing the parent.
+//
+// bucket carries the PARENT tx's bucket (the spend INSERT selects it from the
+// validated parent row), so a parent and all of its spend markers live in the
+// SAME generation and increment 2 can drop them together. The outpoint
+// uniqueness guarantee is unchanged in practice: bucket is functionally
+// dependent on the parent tx, so UNIQUE (prev_tx_hash, prev_output_idx,
+// bucket) rejects a second spend of the same outpoint exactly as the old
+// two-column constraint did (the only theoretical leak is a cross-bucket
+// duplicate parent — see create.go).
 const spendsDDL = `
 CREATE TABLE IF NOT EXISTS spends (
     prev_tx_hash    BYTEA  NOT NULL,
     prev_output_idx BIGINT NOT NULL,
     spending_data   BYTEA  NOT NULL,
     spent_at_height BIGINT,
-    UNIQUE (prev_tx_hash, prev_output_idx)
+    bucket          INT NOT NULL DEFAULT 0,
+    UNIQUE (prev_tx_hash, prev_output_idx, bucket)
 ) PARTITION BY HASH (prev_tx_hash);`

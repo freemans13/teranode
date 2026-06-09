@@ -124,6 +124,19 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 		return 0, err
 	}
 
+	// Reclaim aged EMPTY bucket leaves (two-level partitioning): once the
+	// row-deleter has drained a generation, its attached-but-empty leaves still
+	// cost every hash-only statement a planner/executor fan-out. Detach+drop
+	// them so the attached-leaf count stays bounded. Best-effort: a failure here
+	// must not fail the Prune call (it is retried on a later call).
+	droppedLeaves, dropErr := s.store.dropEmptyAgedBucketLeaves(ctx, blockHeight)
+	if dropErr != nil {
+		s.logger.Infof("[pruner][%s:%d] empty bucket-leaf reclaim error (continuing): %v", blockHashStr, blockHeight, dropErr)
+	}
+	if droppedLeaves > 0 {
+		s.logger.Infof("[pruner][%s:%d] dropped %d empty aged bucket leaf pairs", blockHashStr, blockHeight, droppedLeaves)
+	}
+
 	elapsed := time.Since(startTime)
 	tps := float64(deletedCount) / elapsed.Seconds()
 
@@ -209,6 +222,16 @@ const (
 // derived from numPartitions (same package as the schema DDL), so the coupling
 // stays in lock-step with partition creation.
 func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, partIdx int, blockHeight uint32) (int64, error) {
+	// txs_pNN / spends_pNN are now partitioned parents (two-level partitioning:
+	// HASH (hash) → RANGE (bucket)); DML against them routes to the bucket
+	// leaves (txs_pNN_bBBBB), so this row-deleting cascade works unchanged.
+	//
+	// INCREMENT 2: replace this per-row cascade DELETE with DETACH PARTITION +
+	// DROP TABLE of bucket leaves whose whole generation has aged past
+	// retention (the row-deleter then only handles the partial, still-live
+	// buckets). That removes the doomed-scan + cascade-DELETE machinery from
+	// the reclaim cost entirely. Aged bucket leaves this deleter has EMPTIED
+	// are already detached+dropped by dropEmptyAgedBucketLeaves (see Prune).
 	txsLeaf := fmt.Sprintf("txs_p%02d", partIdx)
 	spendsLeaf := fmt.Sprintf("spends_p%02d", partIdx)
 

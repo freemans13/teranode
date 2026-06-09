@@ -286,7 +286,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 func (s *Store) fetchBlockIDs(ctx context.Context, hash *chainhash.Hash) ([]uint32, error) {
 	var blockIDs []int32
 	err := s.pool.QueryRow(ctx,
-		`SELECT block_ids FROM txs WHERE hash = $1`,
+		`SELECT block_ids FROM txs WHERE hash = $1 ORDER BY bucket DESC LIMIT 1`,
 		hash[:],
 	).Scan(&blockIDs)
 	if err != nil {

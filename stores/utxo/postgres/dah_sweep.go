@@ -114,6 +114,11 @@ func (s *Store) sweepDAHRange(ctx context.Context, fromH, toH int64, limit int) 
 // the exact candidate cardinality. The per-tx spendable output count is read
 // from the txs array column out_spendables (no outputs table on this path).
 func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, toH int64, limit int, retention int64) (stamped int, candidates int, err error) {
+	// With two-level partitioning the hash-partition children txs_pNN /
+	// spends_pNN are themselves partitioned parents (their concrete leaves are
+	// txs_pNN_bBBBB per generation bucket). DML against a partitioned table is
+	// valid Postgres — it routes to the bucket leaves — so these per-hash-
+	// partition queries are unchanged.
 	txsLeaf := fmt.Sprintf("txs_p%02d", partIdx)
 	spendsLeaf := fmt.Sprintf("spends_p%02d", partIdx)
 

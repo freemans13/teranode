@@ -96,7 +96,7 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 	}
 
 	rows, err := conn.Query(ctx, `
-		SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
+		SELECT hash, bucket, version, lock_time, fee, size_in_bytes, coinbase,
 		       locked, conflicting, frozen, unmined_since,
 		       block_ids, block_heights, subtree_idxs
 		FROM txs WHERE hash = ANY($1::bytea[])`,
@@ -109,17 +109,21 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 		return
 	}
 
-	// Dispatch by hash: a single query returns one row per DISTINCT hash, so a
-	// batch containing the same hash twice still maps both items to that row.
+	// Dispatch by hash: the query returns one row per (hash, bucket); a hash
+	// duplicated across generation buckets yields multiple rows, deduped here
+	// with latest-generation-wins (max bucket). A batch containing the same
+	// hash twice still maps both items to that winning row.
 	found := make(map[chainhash.Hash]*meta.Data, len(batch))
+	foundBucket := make(map[chainhash.Hash]int32, len(batch))
 	for rows.Next() {
 		data := &meta.Data{}
 		var hashBytes []byte
+		var bucket int32
 		var version, lockTime int64
 		var unminedSince *int64
 		var blockIDs, blockHeights, subtreeIdxs []int32
 
-		if scanErr := rows.Scan(&hashBytes, &version, &lockTime, &data.Fee, &data.SizeInBytes,
+		if scanErr := rows.Scan(&hashBytes, &bucket, &version, &lockTime, &data.Fee, &data.SizeInBytes,
 			&data.IsCoinbase, &data.Locked, &data.Conflicting, &data.Frozen,
 			&unminedSince, &blockIDs, &blockHeights, &subtreeIdxs); scanErr != nil {
 			rows.Close()
@@ -149,6 +153,10 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 
 		var h chainhash.Hash
 		copy(h[:], hashBytes)
+		if prev, ok := foundBucket[h]; ok && prev >= bucket {
+			continue // keep the later generation already scanned
+		}
+		foundBucket[h] = bucket
 		found[h] = data
 	}
 	if err := rows.Err(); err != nil {
@@ -200,12 +208,16 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		outFrozens          []bool
 	)
 
+	// A hash can match multiple rows (one per generation bucket — see the
+	// cross-bucket duplicate semantics in create.go); the latest generation wins.
 	err := s.pool.QueryRow(ctx, `
 		SELECT version, lock_time, fee, size_in_bytes, coinbase,
 		       locked, conflicting, frozen, unmined_since, raw_tx,
 		       block_ids, block_heights, subtree_idxs, conflicting_children,
 		       utxo_hashes, out_spendables, out_frozens
-		FROM txs WHERE hash = $1`,
+		FROM txs WHERE hash = $1
+		ORDER BY bucket DESC
+		LIMIT 1`,
 		hash[:],
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,
 		&data.Locked, &data.Conflicting, &data.Frozen, &unminedSince, &rawTx,
@@ -363,6 +375,8 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 
 	// Use array subscript ($2::int + 1 for 1-based Postgres indexing).
 	// Returns 0 rows when: tx is missing, OR output index is OOB (array_length < idx+1).
+	// ORDER BY t.bucket DESC LIMIT 1: latest generation wins on a cross-bucket
+	// duplicate parent (see create.go).
 	err := s.pool.QueryRow(ctx, `
 		SELECT
 		    CASE WHEN array_length(t.utxo_hashes, 1) >= $2::int + 1 THEN t.utxo_hashes[$2::int + 1] END,
@@ -373,7 +387,9 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 		    t.conflicting, t.locked
 		FROM txs t
 		LEFT JOIN spends sp ON sp.prev_tx_hash = t.hash AND sp.prev_output_idx = $2
-		WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1`,
+		WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
+		ORDER BY t.bucket DESC
+		LIMIT 1`,
 		spend.TxID[:], spend.Vout,
 	).Scan(&utxoHashBytes, &coinbaseSpendingHeight, &spendingDataBytes, &frozen, &spendableIn, &conflicting, &locked)
 	if err != nil {
@@ -475,7 +491,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	// Query 1: Bulk fetch from txs (metadata + state + raw_tx).
 	inClause, inArgs := buildINClauseLocal(hashes, 1)
 
-	q := `SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
+	q := `SELECT hash, bucket, version, lock_time, fee, size_in_bytes, coinbase,
 	             locked, conflicting, frozen, unmined_since, raw_tx,
 	             block_ids, block_heights, subtree_idxs
 	      FROM txs
@@ -487,10 +503,13 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	}
 
 	hashToTx := make(map[chainhash.Hash]*txRow, len(items))
+	// Latest-generation-wins on cross-bucket duplicate hashes (see create.go).
+	hashToBucket := make(map[chainhash.Hash]int32, len(items))
 
 	for rows.Next() {
 		var (
 			hashBytes    []byte
+			bucket       int32
 			unminedSince *int64
 			version      int64
 			lockTime     int64
@@ -500,7 +519,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 			subIdxs      []int32
 		)
 		row := &txRow{data: &meta.Data{}}
-		if err := rows.Scan(&hashBytes, &version, &lockTime, &row.data.Fee, &row.data.SizeInBytes, &row.data.IsCoinbase,
+		if err := rows.Scan(&hashBytes, &bucket, &version, &lockTime, &row.data.Fee, &row.data.SizeInBytes, &row.data.IsCoinbase,
 			&row.data.Locked, &row.data.Conflicting, &row.data.Frozen, &unminedSince, &rawTx,
 			&blockIDs, &blkHeights, &subIdxs); err != nil {
 			rows.Close()
@@ -528,6 +547,10 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 				}
 			}
 		}
+		if prev, ok := hashToBucket[row.hash]; ok && prev >= bucket {
+			continue // keep the later generation already scanned
+		}
+		hashToBucket[row.hash] = bucket
 		hashToTx[row.hash] = row
 	}
 	// Check rows.Err() BEFORE treating absent hashes as not-found: a mid-stream

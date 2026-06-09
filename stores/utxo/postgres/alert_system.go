@@ -73,6 +73,7 @@ func (s *Store) freezeRejectReason(ctx context.Context, spend *utxo.Spend) error
 		FROM txs t
 		LEFT JOIN spends sp ON sp.prev_tx_hash = t.hash AND sp.prev_output_idx = $2
 		WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
+		ORDER BY t.bucket DESC LIMIT 1
 	`, spend.TxID[:], spend.Vout).Scan(&outputFrozen, &spendingData)
 	if err != nil {
 		return errors.NewStorageError("[FreezeUTXOs] output lookup failed for %s:%d", spend.TxID, spend.Vout, err)
@@ -104,6 +105,7 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 			    CASE WHEN array_length(t.out_frozens, 1) >= $2::int + 1 THEN t.out_frozens[$2::int + 1] END,
 			    false)
 			FROM txs t WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
+			ORDER BY t.bucket DESC LIMIT 1
 		`, spend.TxID[:], spend.Vout).Scan(&outputFrozen)
 		if err != nil {
 			return errors.NewStorageError("[UnFreezeUTXOs] output lookup failed for %s:%d", spend.TxID, spend.Vout, err)
@@ -174,6 +176,7 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 		    CASE WHEN array_length(t.out_frozens, 1) >= $2::int + 1 THEN t.out_frozens[$2::int + 1] END,
 		    false)
 		FROM txs t WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
+		ORDER BY t.bucket DESC LIMIT 1
 	`, utxoSpend.TxID[:], utxoSpend.Vout).Scan(&outputFrozen)
 	if err != nil {
 		return errors.NewStorageError("[ReAssignUTXO] output lookup failed for %s:%d", utxoSpend.TxID, utxoSpend.Vout, err)

@@ -216,6 +216,19 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		return nil, err
 	}
 
+	// Generation bucket: derived from the height the tx enters the set at —
+	// the (earliest) mined block height for mined creates (legacy catch-up),
+	// otherwise the current block height. Ensure the bucket's leaf partitions
+	// exist before the INSERT (cached check, DDL only on first sighting).
+	bucketHeight := blockHeight
+	if minedAtHeight != nil {
+		bucketHeight = uint32(*minedAtHeight)
+	}
+	bucket := bucketFor(bucketHeight)
+	if err := s.EnsureBucket(ctx, bucket); err != nil {
+		return nil, err
+	}
+
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return nil, errors.NewStorageError("failed to acquire connection", err)
@@ -247,17 +260,28 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	}
 
 	// Insert into txs (metadata + state + raw_tx + output arrays).
+	//
+	// CROSS-BUCKET DUPLICATE SEMANTICS: the dedup target is (hash, bucket) —
+	// the PK, which must include the bucket partition key. A duplicate create
+	// in the SAME bucket (same generation, e.g. the oracle's same-height
+	// double-create) conflicts and returns TxExists exactly as before. A
+	// duplicate create in a LATER bucket (same tx re-created after the height
+	// has rolled into a new generation) now INSERTS A SECOND ROW instead of
+	// returning TxExists. Readers mitigate this by resolving hash lookups with
+	// latest-generation-wins (ORDER BY bucket DESC — see get.go/spend.go), so
+	// the newest generation's row is authoritative. This is the deliberate
+	// price of making generations independently droppable in increment 2.
 	var insertedHash []byte
 	err = conn.QueryRow(ctx, `
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		INSERT INTO txs (hash, bucket, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
 			utxo_hashes, out_spendables, out_frozens, coinbase_spending_heights, spendable_ins)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-		        $17, $18, $19, $20, $21)
-		ON CONFLICT (hash) DO NOTHING
+		        $17, $18, $19, $20, $21, $22)
+		ON CONFLICT (hash, bucket) DO NOTHING
 		RETURNING hash`,
-		txHash[:], int64(tx.Version), int64(tx.LockTime),
+		txHash[:], bucket, int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
 		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil), minedAtHeight,
@@ -351,6 +375,9 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	blockIDs := make([]int64, 0, n)
 	blockHeights := make([]int64, 0, n)
 	subtreeIdxs := make([]int64, 0, n)
+	// Generation bucket per row (see bucket.go): bucketFor(mined block height)
+	// for mined creates, bucketFor(blockHeight) otherwise — matches createDirect.
+	buckets := make([]int32, 0, n)
 
 	prepared := make([]preparedCreate, n)
 	valid := make([]bool, n)
@@ -417,13 +444,16 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		mined := len(item.options.MinedBlockInfos) == 1
 		mineds = append(mineds, mined)
 		var bID, bHeight, sIdx int64
+		bucketHeight := item.blockHeight
 		if mined {
 			info := item.options.MinedBlockInfos[0]
 			bID, bHeight, sIdx = int64(info.BlockID), int64(info.BlockHeight), int64(info.SubtreeIdx)
+			bucketHeight = info.BlockHeight
 		}
 		blockIDs = append(blockIDs, bID)
 		blockHeights = append(blockHeights, bHeight)
 		subtreeIdxs = append(subtreeIdxs, sIdx)
+		buckets = append(buckets, bucketFor(bucketHeight))
 
 		// batchOrd is the 1-based ordinal position of this tx in the hashes slice.
 		// It is set AFTER the append above so it matches the UNNEST WITH ORDINALITY
@@ -444,6 +474,24 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		return
 	}
 
+	// Ensure every distinct generation bucket in this batch has its leaf
+	// partitions (cached no-op once a bucket has been seen).
+	seenBuckets := make(map[int32]struct{}, 2)
+	for _, b := range buckets {
+		if _, ok := seenBuckets[b]; ok {
+			continue
+		}
+		seenBuckets[b] = struct{}{}
+		if err := s.EnsureBucket(ctx, b); err != nil {
+			for i, item := range batch {
+				if valid[i] {
+					item.done <- batchCreateResult{Err: err}
+				}
+			}
+			return
+		}
+	}
+
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		for i, item := range batch {
@@ -460,6 +508,9 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	//              using the batch-index (outBatchIdx = 1-based ordinal of the tx
 	//              in the UNNEST); empty output arrays produce zero rows → harmless.
 	//   final INSERT into txs — metadata + state + raw_tx + output arrays.
+	// Dedup semantics match createDirect: ON CONFLICT (hash, bucket) — see the
+	// cross-bucket duplicate comment there. Same-bucket duplicates conflict and
+	// surface as TxExists via the consumed newHashSet below.
 	rows, err := conn.Query(ctx, `
 		WITH out_arr AS (
 			SELECT bidx,
@@ -468,15 +519,15 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 			       array_agg(fr  ORDER BY oidx) AS out_frozens,
 			       array_agg(csh ORDER BY oidx) AS coinbase_spending_heights,
 			       array_agg(si  ORDER BY oidx) AS spendable_ins
-			FROM UNNEST($16::int[], $17::bigint[], $18::bytea[],
-			            $19::boolean[], $20::boolean[], $21::bigint[], $22::int[])
+			FROM UNNEST($17::int[], $18::bigint[], $19::bytea[],
+			            $20::boolean[], $21::boolean[], $22::bigint[], $23::int[])
 			     AS o(bidx, oidx, uh, sp, fr, csh, si)
 			GROUP BY bidx
 		)
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		INSERT INTO txs (hash, bucket, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
 			utxo_hashes, out_spendables, out_frozens, coinbase_spending_heights, spendable_ins)
-		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
+		SELECT u.hash, u.bucket, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
 		       u.locked, u.conflicting, u.frozen,
 		       CASE WHEN u.mined THEN NULL::bigint ELSE u.unmined_since END,
 		       CASE WHEN u.mined THEN ARRAY[u.block_id]::int[] ELSE NULL::int[] END,
@@ -486,16 +537,17 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		       oa.utxo_hashes, oa.out_spendables, oa.out_frozens, oa.coinbase_spending_heights, oa.spendable_ins
 		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
 		            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
-		            $11::bigint[], $12::boolean[], $13::bigint[], $14::bigint[], $15::bigint[])
+		            $11::bigint[], $12::boolean[], $13::bigint[], $14::bigint[], $15::bigint[],
+		            $16::int[])
 		     WITH ORDINALITY AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-		          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx, ord)
+		          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx, bucket, ord)
 		LEFT JOIN out_arr oa ON oa.bidx = u.ord
-		ON CONFLICT (hash) DO NOTHING
+		ON CONFLICT (hash, bucket) DO NOTHING
 		RETURNING hash`,
 		hashes, versions, lockTimes, fees, sizes, coinbases, rawTxs,
 		lockeds, conflictings, frozens, unminedSinces,
-		mineds, blockIDs, blockHeights, subtreeIdxs,
-		// out_arr params ($16..$22): bidx, oidx, uh, sp, fr, csh, si
+		mineds, blockIDs, blockHeights, subtreeIdxs, buckets,
+		// out_arr params ($17..$23): bidx, oidx, uh, sp, fr, csh, si
 		// spendable_ins are all NULL on initial create (set by ReAssignUTXO later).
 		// A nil-element []*int32 slice causes array_agg to preserve NULL elements.
 		outBatchIdx, outIdxs, outUtxoHashes, outSpendables, outFrozens, outCoinbaseSpendingHeights, make([]*int32, len(outBatchIdx)),
