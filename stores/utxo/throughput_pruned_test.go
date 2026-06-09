@@ -65,7 +65,11 @@ const (
 	// smaller per-height cohorts => tighter table bound.
 	prunedHeightTickMS = 250
 	// prunedMiners: concurrent miner goroutines draining the hash channel.
-	prunedMiners = 3
+	// Production drives SetMinedMulti through an errgroup with
+	// MaxMinedRoutines=128 concurrent batches and never gates the per-tx
+	// validator path on it; 3 serial drainers turned the channel hand-off into
+	// the measured bottleneck (3 × 4000 / ~200ms call ≈ the observed plateau).
+	prunedMiners = 12
 	// prunedMineBatch: hashes per SetMinedMulti call.
 	prunedMineBatch = 4000
 	// prunedMineChanCap: bounded in-flight unmined hashes; workers block when
@@ -73,6 +77,15 @@ const (
 	// (50K) so creation back-pressures BEFORE the table can outgrow shared_buffers,
 	// keeping the working set cache-resident and the throughput non-decaying.
 	prunedMineChanCap = 50000
+	// prunedTableCapRows: hard bound on live txs rows. The mine channel bounds
+	// create→mine lag but NOTHING bounds create→reclaim lag: when the reclaim
+	// pipeline (stamp+delete) falls behind, the table grows unboundedly, the
+	// working set leaves cache, reclaim degrades further, and the run lands in a
+	// self-reinforcing slow regime (observed bimodal 88K vs ~65K medians on
+	// identical code). Gating creation on live-table size converts that spiral
+	// into honest back-pressure: the reported TPS becomes "balanced throughput
+	// with the table bounded at <= cap", which is the claim that matters.
+	prunedTableCapRows = 1_500_000
 )
 
 // newPrunedQueueStore builds a fresh postgres queue store on a clean DB with a
@@ -126,6 +139,30 @@ func runPrunedValidator(t *testing.T, store *pgstore.Store, numWorkers int, cfg 
 	driverCtx, cancel := context.WithCancel(ctx)
 	var driverWG sync.WaitGroup
 	var totalMined, totalDeleted atomic.Int64
+
+	// TABLE-SIZE GATE: poll the live-row estimate and close the gate while the
+	// table exceeds prunedTableCapRows (see const). gateClosed is read by every
+	// worker each iteration; gatedNs accumulates total worker wait for telemetry.
+	var gateClosed atomic.Bool
+	var gatedPauses atomic.Int64
+	driverWG.Add(1)
+	go func() {
+		defer driverWG.Done()
+		tk := time.NewTicker(500 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-driverCtx.Done():
+				return
+			case <-tk.C:
+				var live int64
+				if err := statPool.QueryRow(driverCtx, `SELECT COALESCE(sum(n_live_tup),0)
+					FROM pg_stat_user_tables WHERE relname LIKE 'txs_p%'`).Scan(&live); err == nil {
+					gateClosed.Store(live > prunedTableCapRows)
+				}
+			}
+		}
+	}()
 
 	// HEIGHT: advance the chain independently of prune speed.
 	driverWG.Add(1)
@@ -232,6 +269,20 @@ func runPrunedValidator(t *testing.T, store *pgstore.Store, numWorkers int, cfg 
 				defer func() { parents[w] = parent }()
 
 				for time.Now().Before(deadline) {
+					// Honour the table-size gate: pause creation while the live
+					// table exceeds the cap so reclaim can catch up. The pause
+					// counts against measured TPS — that is the point.
+					for gateClosed.Load() {
+						gatedPauses.Add(1)
+						select {
+						case <-driverCtx.Done():
+							return
+						case <-time.After(5 * time.Millisecond):
+						}
+						if !time.Now().Before(deadline) {
+							return
+						}
+					}
 					h := uint32(curH.Load())
 					child := makeChildTx(parent)
 					parentHash := parent.TxIDChainHash()
@@ -283,9 +334,9 @@ func runPrunedValidator(t *testing.T, store *pgstore.Store, numWorkers int, cfg 
 		samples = append(samples, tps)
 		if cfg.verbose {
 			rows, dead, stamped := prunedTableStats(ctx, statPool)
-			t.Logf("[rep] %s workers=%d rep=%d/%d tps=%.0f txs_rows=%d txs_dead=%d stamped=%d height=%d mined=%d deleted=%d",
+			t.Logf("[rep] %s workers=%d rep=%d/%d tps=%.0f txs_rows=%d txs_dead=%d stamped=%d height=%d mined=%d deleted=%d mineCh=%d/%d gatedPauses=%d",
 				time.Now().Format("15:04:05"), numWorkers, r+1, cfg.reps, tps, rows, dead, stamped, curH.Load(),
-				totalMined.Load(), totalDeleted.Load())
+				totalMined.Load(), totalDeleted.Load(), len(mineCh), cap(mineCh), gatedPauses.Load())
 		}
 	}
 

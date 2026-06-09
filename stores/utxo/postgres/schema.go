@@ -215,10 +215,29 @@ CREATE TABLE IF NOT EXISTS txs (
     spendable_ins             INT[]
 ) PARTITION BY HASH (hash);`
 
-// Partial indexes on txs.
+// Indexes on txs.
+//
+// unmined_since is BRIN, not btree, and that choice is HOT-path-critical:
+// SetMinedMulti modifies unmined_since (-> NULL) on every mined tx, and an
+// UPDATE that modifies any column covered by a non-summarizing (btree) index
+// disqualifies the row from a HOT update — forcing a full row copy plus new
+// entries in EVERY index on the table, including the 32-byte random-hash PK.
+// Measured on the sustained-prune bench: with a partial btree here the txs HOT
+// ratio was 33.7%; BRIN is a summarizing AM (PG16+), so the mined update stays
+// HOT (83%+ measured). Its consumers (unmined iterators, old-unmined queries)
+// are background paths that tolerate bitmap-scan rechecks.
+//
+// delete_at_height is BRIN for the same HOT reason: the DAH sweep stamps it on
+// (almost) every tx once, and a btree here makes every stamp a non-HOT row
+// rewrite (measured: stamp cost 70ms -> 132ms per 5K-candidate sweep call with
+// the btree, the sweep saturating ~57-78K stamps/s and falling behind an ~88K
+// create rate). With BRIN the stamp stays HOT. The pruner's doomed-row scan
+// (delete_at_height <= H LIMIT N) tolerates BRIN's bitmap rechecks while the
+// table is bounded; both index choices were A/B'd under sustained load and
+// BRIN-everywhere is the best-known configuration (88K vs 65-71K medians).
 const txsIndexesDDL = `
-CREATE INDEX IF NOT EXISTS px_unmined_since ON txs (unmined_since) WHERE unmined_since IS NOT NULL;
-CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs (delete_at_height) WHERE delete_at_height IS NOT NULL;
+CREATE INDEX IF NOT EXISTS px_unmined_since ON txs USING brin (unmined_since) WITH (pages_per_range = 32, autosummarize = on);
+CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs USING brin (delete_at_height) WITH (pages_per_range = 32, autosummarize = on);
 CREATE INDEX IF NOT EXISTS px_preserve_until ON txs (preserve_until) WHERE preserve_until IS NOT NULL;`
 
 // spends: append-only spend records. LOGGED. A row here is the canonical

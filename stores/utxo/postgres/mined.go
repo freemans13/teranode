@@ -68,14 +68,16 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 				subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
 				locked = false, unmined_since = NULL,
 				mined_at_height = $5
-			WHERE hash = ANY($1)`
+			WHERE hash = ANY($1)
+			RETURNING hash, block_ids`
 	} else {
 		updateSQL = `UPDATE txs SET
 			block_ids = COALESCE(block_ids, '{}') || $2::int[],
 			block_heights = COALESCE(block_heights, '{}') || $3::int[],
 			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
 			locked = false
-		WHERE hash = ANY($1)`
+		WHERE hash = ANY($1)
+		RETURNING hash, block_ids`
 	}
 
 	numUpdateChunks := 0
@@ -103,55 +105,45 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		numUpdateChunks++
 	}
 
-	// Queue fetch query (one query for all hashes).
-	allHashBytes := make([][]byte, len(hashes))
-	for i, h := range hashes {
-		allHashBytes[i] = h[:]
-	}
-	batch.Queue(`SELECT hash, block_ids FROM txs WHERE hash = ANY($1)`, allHashBytes)
-
 	// Send entire batch in one network flush.
 	br := conn.SendBatch(ctx, batch)
 
-	// Drain UPDATE results.
+	// Drain each UPDATE chunk's RETURNING rows straight into the result map —
+	// the post-update block_ids come back on the UPDATE itself, so no separate
+	// verification SELECT (a second full = ANY probe pass over all partitions,
+	// measured as a top-10 CPU consumer) is needed.
 	for i := 0; i < numUpdateChunks; i++ {
-		if _, err := br.Exec(); err != nil {
+		rows, err := br.Query()
+		if err != nil {
 			br.Close()
 			return nil, errors.NewStorageError("[SetMinedMulti] UPDATE chunk %d: %v", i, err)
 		}
-	}
-
-	// Read fetch results.
-	rows, err := br.Query()
-	if err != nil {
-		br.Close()
-		return nil, errors.NewStorageError("[SetMinedMulti] bulk fetch block_ids: %v", err)
-	}
-	for rows.Next() {
-		var h []byte
-		var bids []int32
-		if err := rows.Scan(&h, &bids); err != nil {
+		for rows.Next() {
+			var h []byte
+			var bids []int32
+			if err := rows.Scan(&h, &bids); err != nil {
+				rows.Close()
+				br.Close()
+				return nil, errors.NewStorageError("[SetMinedMulti] scan block_ids chunk %d: %v", i, err)
+			}
+			var ch chainhash.Hash
+			copy(ch[:], h)
+			result := make([]uint32, len(bids))
+			for j, bid := range bids {
+				result[j] = uint32(bid)
+			}
+			resultMap[ch] = result
+		}
+		// A mid-stream failure (network reset, statement timeout) makes rows.Next()
+		// stop early with the error parked in rows.Err(); without this check a
+		// truncated resultMap would be returned as success.
+		if err := rows.Err(); err != nil {
 			rows.Close()
 			br.Close()
-			return nil, errors.NewStorageError("[SetMinedMulti] scan block_ids: %v", err)
+			return nil, errors.NewStorageError("[SetMinedMulti] iterate block_ids chunk %d: %v", i, err)
 		}
-		var ch chainhash.Hash
-		copy(ch[:], h)
-		result := make([]uint32, len(bids))
-		for i, bid := range bids {
-			result[i] = uint32(bid)
-		}
-		resultMap[ch] = result
-	}
-	// A mid-stream failure (network reset, statement timeout) makes rows.Next()
-	// stop early with the error parked in rows.Err(); without this check a
-	// truncated resultMap would be returned as success.
-	if err := rows.Err(); err != nil {
 		rows.Close()
-		br.Close()
-		return nil, errors.NewStorageError("[SetMinedMulti] iterate block_ids: %v", err)
 	}
-	rows.Close()
 	br.Close()
 
 	// Hard postcondition (interface contract, matches the aerospike store): every

@@ -99,15 +99,23 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 	s.logger.Infof("[pruner][%s:%d] starting cleanup scan (delete_at_height <= %d)",
 		blockHashStr, blockHeight, blockHeight)
 
-	// Catch-up DAH sweep up to a committed safe-tip before deleting. Worker 2
-	// normally keeps this current; this guarantees Prune never misses a tx that
-	// completed just before pruning. The stamped DAH is a FUTURE height
-	// (completion+retention), so it is disjoint from what this prune deletes.
+	// Bounded catch-up DAH sweep SLICE, not a sweep-to-tip monolith. A stamped
+	// DAH is always a FUTURE height (completion+1+retention), so Prune does not
+	// need the watermark at the tip before deleting — it needs stamping and
+	// deleting to make progress TOGETHER. The previous unconditional full sweep
+	// serialised the two phases: under load each Prune call became a 10-20s
+	// sweep followed by a multi-second drain, deletes arrived in rare bursts,
+	// the live table outgrew cache, and the run collapsed into a slow regime
+	// (bimodal ~88K vs ~65K TPS on identical code). A bounded step keeps each
+	// Prune call short so the caller's loop interleaves stamp slices with delete
+	// slices continuously; Worker 2's cursor still does the bulk stamping in
+	// parallel. For unit-test-sized datasets one 4096-height window covers the
+	// whole range, so a single Prune call still stamps+deletes everything.
 	lag := int64(s.store.settings.UtxoStore.PostgresDAHSweepLag)
 	if lag <= 0 {
 		lag = 2
 	}
-	if _, err := s.store.sweepDAHUpTo(ctx, s.store.dahSafeTip(lag), 100000); err != nil {
+	if _, err := s.store.sweepDAHStep(ctx, s.store.dahSafeTip(lag), 100000, 2); err != nil {
 		s.logger.Infof("[pruner][%s:%d] DAH catch-up sweep error (continuing): %v", blockHashStr, blockHeight, err)
 	}
 
@@ -183,6 +191,13 @@ func (s *postgresPrunerService) deleteTombstoned(ctx context.Context, blockHeigh
 const (
 	pruneDeleteWorkers   = 8
 	pruneDeleteBatchSize = 10000
+	// pruneDeleteMaxBatchesPerCall bounds one Prune call's delete work per
+	// partition, for the same reason the catch-up sweep is bounded (see Prune):
+	// a large stamped backlog must not turn one call into a multi-second drain
+	// that blocks the caller's loop from interleaving stamping. Callers loop, so
+	// the backlog still drains — in bounded slices. Unit-test datasets fit well
+	// inside one slice (8 x 10K x 8 partitions = 640K rows per call).
+	pruneDeleteMaxBatchesPerCall = 8
 )
 
 // deleteTombstonedPartition cascade-deletes the tombstoned txs of ONE partition.
@@ -219,7 +234,7 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf)
 
 	var deleted int64
-	for {
+	for batches := 0; batches < pruneDeleteMaxBatchesPerCall; batches++ {
 		select {
 		case <-ctx.Done():
 			return deleted, ctx.Err()
