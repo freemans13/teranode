@@ -13,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	pgstore "github.com/bsv-blockchain/teranode/stores/utxo/postgres"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -117,10 +118,18 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 	return s, func() { s.Stop() }
 }
 
+// prunedBenchStore is the slice of the store surface the pruned harness needs:
+// the full utxo.Store hot path plus access to the pruner service. Satisfied by
+// *pgstore.Store and by the 2-shard router in throughput_sharded_test.go.
+type prunedBenchStore interface {
+	utxo.Store
+	GetPrunerService() (pruner.Service, error)
+}
+
 // runPrunedValidator mirrors runStableValidator's hot path exactly but runs it
 // against a continuously-pruned store: a shared advancing block height plus
 // background miner + pruner goroutines. Returns per-rep TPS.
-func runPrunedValidator(t *testing.T, store *pgstore.Store, numWorkers int, cfg stableCfg, statPool *pgxpool.Pool) []float64 {
+func runPrunedValidator(t *testing.T, store prunedBenchStore, numWorkers int, cfg stableCfg, statPool *pgxpool.Pool) []float64 {
 	t.Helper()
 	ctx := context.Background()
 	const startHeight = int64(200)
