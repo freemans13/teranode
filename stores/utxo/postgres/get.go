@@ -294,6 +294,15 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 				return nil, err
 			}
 
+			// prev_output_idx is an unbounded BIGINT in the spends table; a corrupt,
+			// truncated, or orphaned spend row could carry an index beyond this tx's
+			// output count. Guard before using it to subscript data.SpendingDatas, or
+			// a malformed row turns a Get into an index-out-of-range panic reachable
+			// from any caller-supplied tx hash.
+			if idx < 0 || idx >= len(data.SpendingDatas) {
+				return nil, errors.NewProcessingError("[Get] spends row for %s has out-of-bounds output index %d (tx has %d outputs)", hash, idx, len(data.SpendingDatas))
+			}
+
 			// Check per-output frozen from array (Postgres 1-based [idx+1]).
 			outputFrozen := data.Frozen
 			if !outputFrozen && idx < len(outFrozens) {

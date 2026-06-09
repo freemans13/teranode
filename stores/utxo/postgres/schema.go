@@ -218,7 +218,8 @@ CREATE TABLE IF NOT EXISTS txs (
 // Partial indexes on txs.
 const txsIndexesDDL = `
 CREATE INDEX IF NOT EXISTS px_unmined_since ON txs (unmined_since) WHERE unmined_since IS NOT NULL;
-CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs (delete_at_height) WHERE delete_at_height IS NOT NULL;`
+CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs (delete_at_height) WHERE delete_at_height IS NOT NULL;
+CREATE INDEX IF NOT EXISTS px_preserve_until ON txs (preserve_until) WHERE preserve_until IS NOT NULL;`
 
 // spends: append-only spend records. LOGGED. A row here is the canonical
 // "this output was spent by that tx" marker; Unspend deletes the row, and

@@ -132,19 +132,31 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 			WHERE hash = $1
 		`, spend.TxID[:], spend.Vout)
 		if err != nil {
-			// Simpler fallback: set the element and recompute separately.
-			if _, err2 := s.pool.Exec(ctx, `
+			// Fallback: set the element and recompute frozen separately. Both steps
+			// run in ONE transaction so a concurrent Get/Spend never observes the torn
+			// state where out_frozens[idx]=false but txs.frozen still reflects the old
+			// value (which would wrongly reject a spend on the tx_frozen gate).
+			pgxTx, beginErr := s.pool.Begin(ctx)
+			if beginErr != nil {
+				return errors.NewStorageError("[UnFreezeUTXOs] begin fallback tx for %s:%d", spend.TxID, spend.Vout, beginErr)
+			}
+			if _, err2 := pgxTx.Exec(ctx, `
 				UPDATE txs SET out_frozens[$2::int + 1] = false WHERE hash = $1
 			`, spend.TxID[:], spend.Vout); err2 != nil {
+				_ = pgxTx.Rollback(ctx)
 				return errors.NewStorageError("[UnFreezeUTXOs] failed to unfreeze txs array for %s:%d", spend.TxID, spend.Vout, err2)
 			}
 			// Recompute txs.frozen from the updated array.
-			if _, err2 := s.pool.Exec(ctx, `
+			if _, err2 := pgxTx.Exec(ctx, `
 				UPDATE txs
 				SET frozen = COALESCE(cardinality(array_positions(out_frozens, true)) > 0, false)
 				WHERE hash = $1
 			`, spend.TxID[:]); err2 != nil {
+				_ = pgxTx.Rollback(ctx)
 				return errors.NewStorageError("[UnFreezeUTXOs] failed to recompute txs.frozen for %s", spend.TxID, err2)
+			}
+			if commitErr := pgxTx.Commit(ctx); commitErr != nil {
+				return errors.NewStorageError("[UnFreezeUTXOs] commit fallback tx for %s", spend.TxID, commitErr)
 			}
 		}
 	}
@@ -196,22 +208,33 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 		WHERE hash = $1
 	`, utxoSpend.TxID[:], utxoSpend.Vout, newUtxo.UTXOHash[:], si)
 	if err != nil {
-		// Simpler fallback: update each field separately.
-		if _, err2 := s.pool.Exec(ctx, `
+		// Fallback: update each field then recompute frozen. Both steps run in ONE
+		// transaction so a concurrent Get/Spend never observes the torn state where
+		// out_frozens[idx]=false but txs.frozen still reflects the old value.
+		pgxTx, beginErr := s.pool.Begin(ctx)
+		if beginErr != nil {
+			return errors.NewStorageError("[ReAssignUTXO] begin fallback tx for %s:%d", utxoSpend.TxID, utxoSpend.Vout, beginErr)
+		}
+		if _, err2 := pgxTx.Exec(ctx, `
 			UPDATE txs
 			SET utxo_hashes[$2::int + 1]   = $3,
 			    out_frozens[$2::int + 1]   = false,
 			    spendable_ins[$2::int + 1] = $4
 			WHERE hash = $1
 		`, utxoSpend.TxID[:], utxoSpend.Vout, newUtxo.UTXOHash[:], si); err2 != nil {
+			_ = pgxTx.Rollback(ctx)
 			return errors.NewStorageError("[ReAssignUTXO] failed to update txs arrays for %s:%d", utxoSpend.TxID, utxoSpend.Vout, err2)
 		}
-		if _, err2 := s.pool.Exec(ctx, `
+		if _, err2 := pgxTx.Exec(ctx, `
 			UPDATE txs
 			SET frozen = COALESCE(cardinality(array_positions(out_frozens, true)) > 0, false)
 			WHERE hash = $1
 		`, utxoSpend.TxID[:]); err2 != nil {
+			_ = pgxTx.Rollback(ctx)
 			return errors.NewStorageError("[ReAssignUTXO] failed to recompute txs.frozen for %s", utxoSpend.TxID, err2)
+		}
+		if commitErr := pgxTx.Commit(ctx); commitErr != nil {
+			return errors.NewStorageError("[ReAssignUTXO] commit fallback tx for %s", utxoSpend.TxID, commitErr)
 		}
 	}
 
