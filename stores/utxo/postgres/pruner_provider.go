@@ -197,69 +197,48 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	txsLeaf := fmt.Sprintf("txs_p%02d", partIdx)
 	spendsLeaf := fmt.Sprintf("spends_p%02d", partIdx)
 
-	rows, err := s.store.pool.Query(ctx, fmt.Sprintf(
-		`SELECT hash FROM %s WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1`, txsLeaf),
-		int64(blockHeight))
-	if err != nil {
-		return 0, errors.NewStorageError("[pruner] query tombstoned %s: %v", txsLeaf, err)
-	}
-
-	var hashes [][]byte
-	for rows.Next() {
-		var hashBytes []byte
-		if scanErr := rows.Scan(&hashBytes); scanErr != nil {
-			rows.Close()
-			return 0, errors.NewStorageError("[pruner] scan tombstoned %s: %v", txsLeaf, scanErr)
-		}
-		hashes = append(hashes, hashBytes)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, errors.NewStorageError("[pruner] iterate tombstoned %s: %v", txsLeaf, err)
-	}
-	if len(hashes) == 0 {
-		return 0, nil
-	}
-
-	// spends and txs deleted in ONE statement, scoped to this partition's aligned
-	// leaves (same MODULUS). The data-modifying CTE always runs to completion; the
-	// top-level DELETE returns the txs parent row count.
+	// Delete tombstoned txs in bounded batches WITHOUT first loading every matching
+	// hash into Go memory. A single statement selects up to pruneDeleteBatchSize
+	// doomed hashes and cascade-deletes them from the aligned spends/txs leaves
+	// (same MODULUS); we loop until a batch comes back short. Previously the initial
+	// SELECT accumulated EVERY tombstoned hash into a [][]byte before any delete —
+	// millions of rows per partition (×8 partitions) could OOM the node.
 	//
-	// The DELETE re-checks delete_at_height at EXECUTION time (the `doomed` CTE)
-	// rather than trusting the earlier tombstone SELECT. Between that SELECT and
-	// this statement a concurrent reorg Unspend may have cleared delete_at_height
-	// on one of these hashes (the output was re-spent / the tx revived); the
-	// self-contained predicate excludes it so the pruner never deletes a tx whose
-	// stamp was withdrawn. Spend rows are deleted only for hashes that survive the
-	// re-check, so a revived tx keeps its spends.
+	// The doomed CTE applies the delete_at_height predicate in the SAME statement
+	// and snapshot as the DELETE, so a concurrent reorg Unspend that clears the
+	// stamp is honoured: a revived tx is simply not selected and keeps its spends.
+	// Each loop iteration re-evaluates the predicate from scratch, so revived rows
+	// are naturally excluded from later batches.
 	cascadeSQL := fmt.Sprintf(`
 		WITH doomed AS (
 			SELECT hash FROM %[1]s
-			WHERE hash = ANY($1::bytea[])
-			  AND delete_at_height IS NOT NULL AND delete_at_height <= $2
+			WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1
+			LIMIT $2
 		),
 		del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1)
 		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf)
 
 	var deleted int64
-	for i := 0; i < len(hashes); i += pruneDeleteBatchSize {
-		end := i + pruneDeleteBatchSize
-		if end > len(hashes) {
-			end = len(hashes)
-		}
-
+	for {
 		select {
 		case <-ctx.Done():
 			return deleted, ctx.Err()
 		default:
 		}
 
-		tag, err := s.store.pool.Exec(ctx, cascadeSQL, hashes[i:end], int64(blockHeight))
+		tag, err := s.store.pool.Exec(ctx, cascadeSQL, int64(blockHeight), int64(pruneDeleteBatchSize))
 		if err != nil {
 			return deleted, errors.NewStorageError("[pruner] cascade delete %s: %v", txsLeaf, err)
 		}
-		// Count txs actually removed (the canonical parent row), not input hashes.
-		deleted += tag.RowsAffected()
+
+		// RowsAffected is the count of txs parent rows removed this batch, which
+		// equals the number of doomed hashes selected. A short batch means the
+		// partition is drained.
+		n := tag.RowsAffected()
+		deleted += n
+		if n < int64(pruneDeleteBatchSize) {
+			break
+		}
 	}
 
 	return deleted, nil
