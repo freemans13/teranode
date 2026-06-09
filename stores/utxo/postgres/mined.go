@@ -227,9 +227,16 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 					FROM unnest(t.block_ids, t.subtree_idxs) WITH ORDINALITY AS e(bid, si, ord)
 					WHERE e.bid <> $2
 				), '{}'::int[]),
+				-- Set unmined_since only when the tx is fully reorged out (no block_ids
+				-- remain). Otherwise PRESERVE the existing value: a tx still mined only
+				-- on non-longest-chain forks was legitimately unmined at creation and
+				-- must keep that marker so the DAH sweep's "unmined_since IS NOT NULL"
+				-- guard continues to protect it. Clobbering to NULL here would mis-classify
+				-- it as longest-chain-mined (matches aerospike teranode.lua:637-644 and
+				-- sql.go:3268-3308, which only write unmined_since when zero blocks remain).
 				unmined_since = CASE
 					WHEN COALESCE(array_length(array_remove(t.block_ids, $2), 1), 0) = 0
-					THEN $3::bigint ELSE NULL END,
+					THEN $3::bigint ELSE t.unmined_since END,
 				-- Clear the deferred-prune stamp when the tx falls off the longest
 				-- chain (no block_ids remain). It is no longer "mined and fully spent
 				-- on the longest chain", so it must not be pruned at the old stamp.
@@ -243,7 +250,14 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 		).Scan(&newBlockIDs)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return nil, errors.NewStorageError("[UnsetMined] tx not found for %s", hash)
+				// Per Interface.go:295-303, UnsetMined tolerates missing/empty entries:
+				// the call may no-op for transactions that no longer exist. A reorg
+				// unsets every tx in the reorged block, some of which may already have
+				// been pruned — that must not abort the whole reorg. Record an empty
+				// result and move on (matches aerospike set_mined.go:502-506 and
+				// sql.go:3162-3176).
+				resultMap[*hash] = []uint32{}
+				continue
 			}
 			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s: %v", hash, err)
 		}
