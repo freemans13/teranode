@@ -1692,6 +1692,12 @@ func TestSmokeTests(t *testing.T) {
 
 		tests.UnsetMinedPreservesUnminedSinceWhenNonLCBlocksRemain(t, store)
 	})
+
+	t.Run("unfreeze and reassign not frozen errors", func(t *testing.T) {
+		_ = store.Delete(ctx, tests.TXHash)
+
+		tests.UnfreezeAndReassignNotFrozenErr(t, store)
+	})
 }
 
 func TestCreateZeroSat(t *testing.T) {

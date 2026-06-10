@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/jackc/pgx/v5"
 )
 
 // FreezeUTXOs marks UTXOs as frozen, preventing them from being spent.
@@ -113,36 +114,27 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 		if _, err := voutToInt32(spend.Vout); err != nil {
 			return err
 		}
-		// Verify output is frozen (get_bit probe on the packed bitmap).
-		var outputFrozen bool
-		err := s.pool.QueryRow(ctx, `
-			SELECT (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1)
-			FROM txs t WHERE t.hash = $1 AND $2::int < t.out_count
-		`, spend.TxID[:], spend.Vout).Scan(&outputFrozen)
-		if err != nil {
-			return errors.NewStorageError("[UnFreezeUTXOs] output lookup failed for %s:%d", spend.TxID, spend.Vout, err)
-		}
-
-		if !outputFrozen {
-			return errors.NewUtxoFrozenError("transaction %s:%d is not frozen", spend.TxID, spend.Vout)
-		}
-
-		// Clear the bit and recompute txs.frozen in ONE statement, so a concurrent
-		// Get/Spend never observes the torn state where the bit is cleared but
-		// txs.frozen still reflects the old value (which would wrongly reject a
-		// spend on the tx_frozen gate). txs.frozen is true iff ANY bit remains
-		// set: compare the new bitmap against an all-zero bytea of the same
-		// length. Both set_bit calls see the OLD column value, so the comparison
-		// is consistent. The out_frozens IS NOT NULL guard keeps set_bit off a
-		// NULL bitmap (unreachable after the frozen check above, barring a race).
-		_, err = s.pool.Exec(ctx, `
+		// Clear the bit and recompute txs.frozen in ONE guarded statement. The WHERE
+		// requires the bit to be currently SET, making the UPDATE the sole source of
+		// truth: a 0-row result means the output is not frozen or the tx no longer
+		// exists. We surface that as a typed error rather than a silent no-op —
+		// matching aerospike's unfreeze UDF (which returns TX_NOT_FOUND /
+		// UTXO_NOT_FROZEN) and removing the prior TOCTOU between a separate
+		// frozen-check read and this write. txs.frozen is true iff any bit remains
+		// set; both set_bit calls read the OLD column value so the comparison is
+		// consistent.
+		tag, err := s.pool.Exec(ctx, `
 			UPDATE txs
 			SET out_frozens = set_bit(out_frozens, $2::int, 0),
 			    frozen = (set_bit(out_frozens, $2::int, 0) <> decode(repeat('00', length(out_frozens)), 'hex'))
-			WHERE hash = $1 AND out_frozens IS NOT NULL AND $2::int < out_count
+			WHERE hash = $1 AND $2::int < out_count
+			  AND out_frozens IS NOT NULL AND get_bit(out_frozens, $2::int) = 1
 		`, spend.TxID[:], spend.Vout)
 		if err != nil {
 			return errors.NewStorageError("[UnFreezeUTXOs] failed to unfreeze output %s:%d", spend.TxID, spend.Vout, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return s.frozenWriteRejectReason(ctx, spend, "UnFreezeUTXOs")
 		}
 	}
 
@@ -156,19 +148,9 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 	if _, err := voutToInt32(utxoSpend.Vout); err != nil {
 		return err
 	}
-	// Verify source UTXO is frozen (get_bit probe on the packed bitmap).
-	var outputFrozen bool
-	err := s.pool.QueryRow(ctx, `
-		SELECT (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1)
-		FROM txs t WHERE t.hash = $1 AND $2::int < t.out_count
-	`, utxoSpend.TxID[:], utxoSpend.Vout).Scan(&outputFrozen)
-	if err != nil {
-		return errors.NewStorageError("[ReAssignUTXO] output lookup failed for %s:%d", utxoSpend.TxID, utxoSpend.Vout, err)
-	}
-
-	if !outputFrozen {
-		return errors.NewUtxoFrozenError("transaction %s:%d is not frozen", utxoSpend.TxID, utxoSpend.Vout)
-	}
+	// The source UTXO must be frozen to be reassigned. That precondition is
+	// enforced by the guarded UPDATE below (get_bit = 1 in the WHERE), so there is
+	// no separate frozen-check read that could race with a concurrent unfreeze.
 
 	// Use configurable setting if provided, otherwise fall back to constant.
 	reassignBlocks := uint32(utxo.ReAssignedUtxoSpendableAfterBlocks)
@@ -184,17 +166,43 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 	// never observes a torn state. Reassignment does NOT mutate out_spendables,
 	// so spendable_count is intentionally left untouched.
 	si := int32(spendableIn)
-	_, err = s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE txs
 		SET utxo_hashes = overlay(utxo_hashes placing $3::bytea from $2::int * 32 + 1 for 32),
 		    out_frozens = set_bit(out_frozens, $2::int, 0),
 		    spendable_ins[$2::int + 1] = $4,
 		    frozen = (set_bit(out_frozens, $2::int, 0) <> decode(repeat('00', length(out_frozens)), 'hex'))
-		WHERE hash = $1 AND out_frozens IS NOT NULL AND $2::int < out_count
+		WHERE hash = $1 AND $2::int < out_count
+		  AND out_frozens IS NOT NULL AND get_bit(out_frozens, $2::int) = 1
 	`, utxoSpend.TxID[:], utxoSpend.Vout, newUtxo.UTXOHash[:], si)
 	if err != nil {
 		return errors.NewStorageError("[ReAssignUTXO] failed to update packed columns for %s:%d", utxoSpend.TxID, utxoSpend.Vout, err)
 	}
+	if tag.RowsAffected() == 0 {
+		return s.frozenWriteRejectReason(ctx, utxoSpend, "ReAssignUTXO")
+	}
 
 	return nil
+}
+
+// frozenWriteRejectReason explains why a guarded unfreeze/reassign UPDATE matched
+// no rows: the transaction no longer exists, or the output is not frozen. This
+// mirrors aerospike's unfreeze/reassign UDF, which returns TX_NOT_FOUND /
+// UTXO_NOT_FROZEN rather than silently succeeding. Called only on the (rare)
+// 0-row path, so the extra read never touches the success hot path.
+func (s *Store) frozenWriteRejectReason(ctx context.Context, spend *utxo.Spend, op string) error {
+	var frozen bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1)
+		FROM txs t WHERE t.hash = $1 AND $2::int < t.out_count
+	`, spend.TxID[:], spend.Vout).Scan(&frozen)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errors.NewTxNotFoundError("[%s] transaction not found %s:%d", op, spend.TxID, spend.Vout)
+	}
+	if err != nil {
+		return errors.NewStorageError("[%s] reject-reason lookup failed for %s:%d", op, spend.TxID, spend.Vout, err)
+	}
+	// Row present but the bit is clear → not frozen (or a concurrent unfreeze won
+	// the race). Either way the requested write did not apply.
+	return errors.NewUtxoFrozenError("transaction %s:%d is not frozen", spend.TxID, spend.Vout)
 }

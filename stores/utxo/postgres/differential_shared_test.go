@@ -41,3 +41,12 @@ func TestUnspendFlagAsLockedLocksParent_Postgres(t *testing.T) {
 	store, _ := setupTestStore(t)
 	tests.UnspendFlagAsLockedLocksParent(t, store)
 }
+
+// TestUnfreezeAndReassignNotFrozenErr_Postgres: UnFreezeUTXOs/ReAssignUTXO on a
+// non-frozen output must return a typed error (not a silent no-op), matching the
+// aerospike gold standard. Guards the guarded-UPDATE + RowsAffected diagnosis in
+// alert_system.go.
+func TestUnfreezeAndReassignNotFrozenErr_Postgres(t *testing.T) {
+	store, _ := setupTestStore(t)
+	tests.UnfreezeAndReassignNotFrozenErr(t, store)
+}

@@ -1106,6 +1106,38 @@ func UnsetMinedPreservesUnminedSinceWhenNonLCBlocksRemain(t *testing.T, db utxos
 		"UnminedSince must be preserved after UnsetMined when a non-longest-chain block entry remains")
 }
 
+// UnfreezeAndReassignNotFrozenErr verifies that UnFreezeUTXOs and ReAssignUTXO
+// on an output that is NOT frozen return an error rather than silently
+// succeeding. The gold-standard aerospike store enforces this atomically in its
+// unfreeze/reassign Lua UDFs (UTXO_NOT_FROZEN); every backend must agree, so a
+// caller is never told an unfreeze/reassign happened when it did not.
+func UnfreezeAndReassignNotFrozenErr(t *testing.T, db utxostore.Store) {
+	ctx := context.Background()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	require.NoError(t, db.SetBlockHeight(200))
+
+	tx := newTestTx(t, 8_675_309)
+	txHash := tx.TxIDChainHash()
+
+	_, err := db.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	defer func() { _ = db.Delete(ctx, txHash) }()
+
+	utxoHash, err := util.UTXOHashFromOutput(txHash, tx.Outputs[0], 0)
+	require.NoError(t, err)
+
+	notFrozen := &utxostore.Spend{TxID: txHash, Vout: 0, UTXOHash: utxoHash}
+
+	// The output was never frozen.
+	err = db.UnFreezeUTXOs(ctx, []*utxostore.Spend{notFrozen}, tSettings)
+	require.Error(t, err, "UnFreezeUTXOs on a non-frozen output must error, not silently succeed")
+
+	newHash := chainhash.HashH([]byte("reassign-target"))
+	err = db.ReAssignUTXO(ctx, notFrozen, &utxostore.Spend{TxID: txHash, Vout: 0, UTXOHash: &newHash}, tSettings)
+	require.Error(t, err, "ReAssignUTXO on a non-frozen output must error, not silently succeed")
+}
+
 // RemoveBlockIDsKeepsParallelArraysAligned verifies that removing one block ID
 // from a transaction mined in several blocks drops the matching entry from ALL
 // THREE parallel arrays (block_ids, block_heights, subtree_idxs), keeping them

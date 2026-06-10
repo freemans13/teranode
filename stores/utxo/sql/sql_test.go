@@ -967,6 +967,12 @@ func Test_SmokeTests(t *testing.T) {
 
 		tests.UnspendFlagAsLockedLocksParent(t, db)
 	})
+
+	t.Run("unfreeze and reassign not frozen errors", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		tests.UnfreezeAndReassignNotFrozenErr(t, db)
+	})
 }
 
 func TestSetTTL(t *testing.T) {
