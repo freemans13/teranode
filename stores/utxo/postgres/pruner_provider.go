@@ -241,7 +241,9 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		default:
 		}
 
-		tag, err := s.store.pool.Exec(ctx, cascadeSQL, int64(blockHeight), int64(pruneDeleteBatchSize))
+		// delete_at_height is INT4 — bind int32 so the doomed-scan predicate is
+		// a native int4 comparison on the BRIN-indexed column.
+		tag, err := s.store.pool.Exec(ctx, cascadeSQL, int32(blockHeight), int64(pruneDeleteBatchSize))
 		if err != nil {
 			return deleted, errors.NewStorageError("[pruner] cascade delete %s: %v", txsLeaf, err)
 		}

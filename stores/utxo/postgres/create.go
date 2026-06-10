@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -36,39 +37,79 @@ type batchCreateResult struct {
 }
 
 // ---------------------------------------------------------------------------
-// Array builders — pack transaction data into parallel arrays for UNNEST
+// Array packing — pack per-output data into flat byte forms for the txs row
 // ---------------------------------------------------------------------------
 
-// outputArrayParams holds parallel arrays for txs array-column population.
+// outputArrayParams holds the PACKED per-output columns for one txs row.
 // locking_script and satoshis are recovered from raw_tx at read time (see
 // batchDecorateOutputs), so they are not stored separately here.
+//
+// utxoHashes is a flat concatenation: output i at byte offset i*32 (read in
+// SQL via substr(utxo_hashes, i*32+1, 32) — substr is 1-based). spendableBits
+// is a bitmap whose encoding matches PostgreSQL get_bit(): bit i lives in byte
+// i/8 at the (i%8)-th LEAST significant position. out_frozens is NOT built at
+// create time — no output is frozen on create, and NULL means "none frozen".
 type outputArrayParams struct {
-	idx                    []int64
-	frozen                 []bool
-	utxoHash               [][]byte
-	coinbaseSpendingHeight []int64
-	spendable              []bool
+	utxoHashes             []byte // nil when no outputs
+	spendableBits          []byte // nil when no outputs
+	outCount               int32
+	spendableCount         int32
+	coinbaseSpendingHeight int32 // 0 = non-coinbase; same height for every output (column is INT4)
 }
 
-// buildOutputArrays packs transaction outputs into parallel arrays for UNNEST.
+// setPackedBit sets bit i in buf using the PostgreSQL get_bit()/set_bit()
+// encoding: byte i/8, least-significant-bit-first within the byte.
+func setPackedBit(buf []byte, i int) {
+	buf[i/8] |= 1 << (i % 8)
+}
+
+// getPackedBit reads bit i from buf using the same encoding (i must be within
+// len(buf)*8).
+func getPackedBit(buf []byte, i int) bool {
+	return buf[i/8]&(1<<(i%8)) != 0
+}
+
+// unpackBitmap expands a packed bitmap into count per-output booleans (the
+// read-time reconstruction of the old BOOLEAN[] form — the wire contract for
+// consumers is unchanged). A nil bitmap returns nil ("no flag set" common
+// case, e.g. out_frozens before any freeze). Bits beyond len(bitmap)*8 read
+// false, mirroring the old OOB-subscript-is-NULL behaviour.
+func unpackBitmap(bitmap []byte, count int) []bool {
+	if bitmap == nil || count <= 0 {
+		return nil
+	}
+	out := make([]bool, count)
+	for i := 0; i < count && i < len(bitmap)*8; i++ {
+		out[i] = getPackedBit(bitmap, i)
+	}
+	return out
+}
+
+// buildOutputArrays packs transaction outputs into the flat per-output columns.
+// Outputs are packed at their TRUE index i (a nil output — never produced by a
+// valid tx — leaves a zero 32-byte slot with spendable bit clear).
 func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blockHeight uint32, coinbaseMaturity int) (outputArrayParams, error) {
-	count := countNonNilOutputs(btTx)
-	if count == 0 {
+	if countNonNilOutputs(btTx) == 0 {
 		return outputArrayParams{}, nil
 	}
-
-	var coinbaseSpendingHeight int64
-	if isCoinbase {
-		coinbaseSpendingHeight = int64(blockHeight) + int64(coinbaseMaturity)
-	}
+	count := len(btTx.Outputs)
 
 	p := outputArrayParams{
-		idx:                    make([]int64, 0, count),
-		frozen:                 make([]bool, 0, count),
-		utxoHash:               make([][]byte, 0, count),
-		coinbaseSpendingHeight: make([]int64, 0, count),
-		spendable:              make([]bool, 0, count),
+		utxoHashes:    make([]byte, count*32),
+		spendableBits: make([]byte, (count+7)/8),
+		outCount:      int32(count),
 	}
+	if isCoinbase {
+		// coinbase_spending_height is INT4: heights stay far below 2^31, but
+		// guard the widened sum before narrowing so a corrupt input can never
+		// silently wrap.
+		h := int64(blockHeight) + int64(coinbaseMaturity)
+		if h > math.MaxInt32 {
+			return outputArrayParams{}, errors.NewProcessingError("coinbase spending height %d exceeds int32 range", h)
+		}
+		p.coinbaseSpendingHeight = int32(h)
+	}
+
 	for i, output := range btTx.Outputs {
 		if output == nil {
 			continue
@@ -81,16 +122,15 @@ func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blo
 		if err != nil {
 			return outputArrayParams{}, err
 		}
-		p.idx = append(p.idx, int64(i))
-		p.frozen = append(p.frozen, false)
-		p.utxoHash = append(p.utxoHash, utxoHash[:])
-		p.coinbaseSpendingHeight = append(p.coinbaseSpendingHeight, coinbaseSpendingHeight)
+		copy(p.utxoHashes[i*32:], utxoHash[:])
 		// A zero-value OP_RETURN / data-carrier output can never be spent, so it
 		// must not count toward the "fully spent" pruning check. Mirror the
 		// aerospike store's ShouldStoreOutputAsUTXO gate. (nil script → no deref,
 		// treated as spendable; non-nil zero-value scripts are inspected.)
-		spendable := output.LockingScript == nil || utxo.ShouldStoreOutputAsUTXO(isCoinbase, output, blockHeight)
-		p.spendable = append(p.spendable, spendable)
+		if output.LockingScript == nil || utxo.ShouldStoreOutputAsUTXO(isCoinbase, output, blockHeight) {
+			setPackedBit(p.spendableBits, i)
+			p.spendableCount++
+		}
 	}
 	return p, nil
 }
@@ -182,7 +222,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 
 	var unminedSince interface{}
 	if len(options.MinedBlockInfos) == 0 {
-		unminedSince = int64(blockHeight)
+		unminedSince = int32(blockHeight) // unmined_since is INT4; heights < 2^31
 	}
 
 	rawTx := tx.ExtendedBytes()
@@ -193,19 +233,19 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// mined (legacy catch-up) must record the height it was mined at, exactly as
 	// SetMinedMulti does, otherwise the sweep can never enumerate the
 	// fully-spent-then-mined case and it falls to the keyspace backstop. Use the
-	// lowest mined block height (earliest mining).
-	var minedAtHeight *int64
+	// lowest mined block height (earliest mining). INT4 column; heights < 2^31.
+	var minedAtHeight *int32
 	if len(options.MinedBlockInfos) > 0 {
 		blockIDs = make([]int32, len(options.MinedBlockInfos))
 		blkHeights = make([]int32, len(options.MinedBlockInfos))
 		subtreeIdxs = make([]int32, len(options.MinedBlockInfos))
-		minH := int64(options.MinedBlockInfos[0].BlockHeight)
+		minH := int32(options.MinedBlockInfos[0].BlockHeight)
 		for i, info := range options.MinedBlockInfos {
 			blockIDs[i] = int32(info.BlockID)
 			blkHeights[i] = int32(info.BlockHeight)
 			subtreeIdxs[i] = int32(info.SubtreeIdx)
-			if int64(info.BlockHeight) < minH {
-				minH = int64(info.BlockHeight)
+			if int32(info.BlockHeight) < minH {
+				minH = int32(info.BlockHeight)
 			}
 		}
 		minedAtHeight = &minH
@@ -222,37 +262,15 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	}
 	defer conn.Release()
 
-	// Build per-output txs arrays (parallel to outArrs; empty slice → NULL column).
-	// These are indexed 0-based in Go; Postgres 1-based subscripts are [i+1].
-	var txsUtxoHashes [][]byte
-	var txsOutSpendables []bool
-	var txsOutFrozens []bool
-	var txsCoinbaseSpendingHeights []int64
-	var txsSpendableIns []*int32 // pointer so nil elements become SQL NULL
-	if len(outArrs.idx) > 0 {
-		cnt := len(outArrs.idx)
-		txsUtxoHashes = make([][]byte, cnt)
-		txsOutSpendables = make([]bool, cnt)
-		txsOutFrozens = make([]bool, cnt)
-		txsCoinbaseSpendingHeights = make([]int64, cnt)
-		txsSpendableIns = make([]*int32, cnt)
-		for j := range outArrs.idx {
-			txsUtxoHashes[j] = outArrs.utxoHash[j]
-			txsOutSpendables[j] = outArrs.spendable[j]
-			txsOutFrozens[j] = outArrs.frozen[j]
-			txsCoinbaseSpendingHeights[j] = outArrs.coinbaseSpendingHeight[j]
-			// spendable_in is always 0 on initial create (ReAssignUTXO sets it later).
-			// Keep as nil (NULL element) — 0 would mean "spendable from genesis".
-		}
-	}
-
-	// Insert into txs (metadata + state + raw_tx + output arrays).
+	// Insert into txs (metadata + state + raw_tx + packed output columns).
+	// out_frozens is NULL on create (no output frozen — freeze materialises the
+	// bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
 	var insertedHash []byte
 	err = conn.QueryRow(ctx, `
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
-			utxo_hashes, out_spendables, out_frozens, coinbase_spending_heights, spendable_ins)
+			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
 		        $17, $18, $19, $20, $21)
 		ON CONFLICT (hash) DO NOTHING
@@ -261,7 +279,8 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
 		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil), minedAtHeight,
-		txsUtxoHashes, txsOutSpendables, txsOutFrozens, txsCoinbaseSpendingHeights, txsSpendableIns,
+		outArrs.utxoHashes, outArrs.outCount, outArrs.spendableCount,
+		outArrs.spendableBits, outArrs.coinbaseSpendingHeight,
 	).Scan(&insertedHash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -342,28 +361,29 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	lockeds := make([]bool, 0, n)
 	conflictings := make([]bool, 0, n)
 	frozens := make([]bool, 0, n)
-	unminedSinces := make([]int64, 0, n)
+	unminedSinces := make([]int32, 0, n) // unmined_since is INT4
 	// Mined-block columns. mined[i] discriminates: when true the row is mined in
 	// exactly one block and block_ids/heights/subtree_idxs are written as a
 	// single-element array with unmined_since NULL; when false the tx is unmined
 	// (block columns NULL, unmined_since = blockHeight). Matches createDirect.
+	// All three feed INT columns (and block_height also feeds the INT4
+	// mined_at_height), so they are bound as int4[].
 	mineds := make([]bool, 0, n)
-	blockIDs := make([]int64, 0, n)
-	blockHeights := make([]int64, 0, n)
-	subtreeIdxs := make([]int64, 0, n)
+	blockIDs := make([]int32, 0, n)
+	blockHeights := make([]int32, 0, n)
+	subtreeIdxs := make([]int32, 0, n)
 
 	prepared := make([]preparedCreate, n)
 	valid := make([]bool, n)
 
-	var outIdxs []int64
-	var outFrozens []bool
-	var outUtxoHashes [][]byte
-	var outCoinbaseSpendingHeights []int64
-	var outSpendables []bool
-	// outBatchIdx is the 1-based position of the tx in the hashes/new_txs slice.
-	// Used by the out_arr aggregation CTE to join per-tx output arrays back to the
-	// tx row via UNNEST WITH ORDINALITY (ord = 1-based position).
-	var outBatchIdx []int32
+	// Packed per-output columns — one element per tx row, carried directly in
+	// the per-tx UNNEST arrays (no flat per-output fan-out, no re-aggregation
+	// CTE). nil elements become SQL NULL (txs with no outputs).
+	packedUtxoHashes := make([][]byte, 0, n)
+	packedSpendableBits := make([][]byte, 0, n)
+	outCounts := make([]int32, 0, n)
+	spendableCounts := make([]int32, 0, n)
+	coinbaseSpendingHeights := make([]int32, 0, n) // coinbase_spending_height is INT4
 
 	for i, item := range batch {
 		txMeta, err := util.TxMetaDataFromTx(item.tx)
@@ -411,33 +431,25 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		lockeds = append(lockeds, item.options.Locked)
 		conflictings = append(conflictings, false) // conflicting items routed to createDirect
 		frozens = append(frozens, item.options.Frozen)
-		unminedSinces = append(unminedSinces, int64(item.blockHeight))
+		unminedSinces = append(unminedSinces, int32(item.blockHeight))
 
 		// sendCreateBatch guarantees len(MinedBlockInfos) <= 1 here.
 		mined := len(item.options.MinedBlockInfos) == 1
 		mineds = append(mineds, mined)
-		var bID, bHeight, sIdx int64
+		var bID, bHeight, sIdx int32
 		if mined {
 			info := item.options.MinedBlockInfos[0]
-			bID, bHeight, sIdx = int64(info.BlockID), int64(info.BlockHeight), int64(info.SubtreeIdx)
+			bID, bHeight, sIdx = int32(info.BlockID), int32(info.BlockHeight), int32(info.SubtreeIdx)
 		}
 		blockIDs = append(blockIDs, bID)
 		blockHeights = append(blockHeights, bHeight)
 		subtreeIdxs = append(subtreeIdxs, sIdx)
 
-		// batchOrd is the 1-based ordinal position of this tx in the hashes slice.
-		// It is set AFTER the append above so it matches the UNNEST WITH ORDINALITY
-		// position (which is 1-based). We compute it here from len(hashes) after append.
-		batchOrd := int32(len(hashes)) // len after append = 1-based ordinal of this tx
-
-		for j := range outArrs.idx {
-			outIdxs = append(outIdxs, outArrs.idx[j])
-			outFrozens = append(outFrozens, outArrs.frozen[j])
-			outUtxoHashes = append(outUtxoHashes, outArrs.utxoHash[j])
-			outCoinbaseSpendingHeights = append(outCoinbaseSpendingHeights, outArrs.coinbaseSpendingHeight[j])
-			outSpendables = append(outSpendables, outArrs.spendable[j])
-			outBatchIdx = append(outBatchIdx, batchOrd)
-		}
+		packedUtxoHashes = append(packedUtxoHashes, outArrs.utxoHashes)
+		packedSpendableBits = append(packedSpendableBits, outArrs.spendableBits)
+		outCounts = append(outCounts, outArrs.outCount)
+		spendableCounts = append(spendableCounts, outArrs.spendableCount)
+		coinbaseSpendingHeights = append(coinbaseSpendingHeights, outArrs.coinbaseSpendingHeight)
 	}
 
 	if len(hashes) == 0 {
@@ -455,50 +467,36 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	}
 	defer conn.Release()
 
-	// Single autocommit CTE:
-	//   out_arr  — aggregates flat output rows back into per-tx parallel arrays
-	//              using the batch-index (outBatchIdx = 1-based ordinal of the tx
-	//              in the UNNEST); empty output arrays produce zero rows → harmless.
-	//   final INSERT into txs — metadata + state + raw_tx + output arrays.
+	// Single autocommit UNNEST INSERT. Each tx row carries its packed per-output
+	// values directly in the per-tx arrays — no per-output row fan-out and no
+	// re-aggregation CTE (the old out_arr GROUP BY was a top-4 server-CPU
+	// consumer). out_frozens and spendable_ins are NULL on create (freeze /
+	// ReAssignUTXO materialise them later).
 	rows, err := conn.Query(ctx, `
-		WITH out_arr AS (
-			SELECT bidx,
-			       array_agg(uh  ORDER BY oidx) AS utxo_hashes,
-			       array_agg(sp  ORDER BY oidx) AS out_spendables,
-			       array_agg(fr  ORDER BY oidx) AS out_frozens,
-			       array_agg(csh ORDER BY oidx) AS coinbase_spending_heights,
-			       array_agg(si  ORDER BY oidx) AS spendable_ins
-			FROM UNNEST($16::int[], $17::bigint[], $18::bytea[],
-			            $19::boolean[], $20::boolean[], $21::bigint[], $22::int[])
-			     AS o(bidx, oidx, uh, sp, fr, csh, si)
-			GROUP BY bidx
-		)
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
-			utxo_hashes, out_spendables, out_frozens, coinbase_spending_heights, spendable_ins)
+			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
 		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
 		       u.locked, u.conflicting, u.frozen,
-		       CASE WHEN u.mined THEN NULL::bigint ELSE u.unmined_since END,
-		       CASE WHEN u.mined THEN ARRAY[u.block_id]::int[] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN ARRAY[u.block_height]::int[] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN ARRAY[u.subtree_idx]::int[] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN u.block_height::bigint ELSE NULL::bigint END,
-		       oa.utxo_hashes, oa.out_spendables, oa.out_frozens, oa.coinbase_spending_heights, oa.spendable_ins
+		       CASE WHEN u.mined THEN NULL::int ELSE u.unmined_since END,
+		       CASE WHEN u.mined THEN ARRAY[u.block_id] ELSE NULL::int[] END,
+		       CASE WHEN u.mined THEN ARRAY[u.block_height] ELSE NULL::int[] END,
+		       CASE WHEN u.mined THEN ARRAY[u.subtree_idx] ELSE NULL::int[] END,
+		       CASE WHEN u.mined THEN u.block_height ELSE NULL::int END,
+		       u.utxo_hashes, u.out_count, u.spendable_count, u.out_spendables, u.coinbase_spending_height
 		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
 		            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
-		            $11::bigint[], $12::boolean[], $13::bigint[], $14::bigint[], $15::bigint[])
-		     WITH ORDINALITY AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-		          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx, ord)
-		LEFT JOIN out_arr oa ON oa.bidx = u.ord
+		            $11::int[], $12::boolean[], $13::int[], $14::int[], $15::int[],
+		            $16::bytea[], $17::int[], $18::int[], $19::bytea[], $20::int[])
+		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx,
+		          utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
 		ON CONFLICT (hash) DO NOTHING
 		RETURNING hash`,
 		hashes, versions, lockTimes, fees, sizes, coinbases, rawTxs,
 		lockeds, conflictings, frozens, unminedSinces,
 		mineds, blockIDs, blockHeights, subtreeIdxs,
-		// out_arr params ($16..$22): bidx, oidx, uh, sp, fr, csh, si
-		// spendable_ins are all NULL on initial create (set by ReAssignUTXO later).
-		// A nil-element []*int32 slice causes array_agg to preserve NULL elements.
-		outBatchIdx, outIdxs, outUtxoHashes, outSpendables, outFrozens, outCoinbaseSpendingHeights, make([]*int32, len(outBatchIdx)),
+		packedUtxoHashes, outCounts, spendableCounts, packedSpendableBits, coinbaseSpendingHeights,
 	)
 	if err != nil {
 		for i, item := range batch {

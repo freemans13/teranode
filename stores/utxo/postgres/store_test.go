@@ -1301,10 +1301,10 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	err = store.FreezeUTXOs(ctx, spends, nil)
 	require.NoError(t, err)
 
-	// Verify frozen via txs.out_frozens array (outputs table removed in Phase B).
+	// Verify frozen via the txs.out_frozens packed bitmap (bit 0 = vout 0).
 	var frozen bool
 	err = store.pool.QueryRow(ctx,
-		`SELECT COALESCE(out_frozens[1], false) FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozen)
+		`SELECT out_frozens IS NOT NULL AND get_bit(out_frozens, 0) = 1 FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozen)
 	require.NoError(t, err)
 	require.True(t, frozen)
 
@@ -1316,9 +1316,9 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	err = store.UnFreezeUTXOs(ctx, spends, nil)
 	require.NoError(t, err)
 
-	// Verify unfrozen via txs.out_frozens array.
+	// Verify unfrozen via the txs.out_frozens packed bitmap.
 	err = store.pool.QueryRow(ctx,
-		`SELECT COALESCE(out_frozens[1], false) FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozen)
+		`SELECT out_frozens IS NOT NULL AND get_bit(out_frozens, 0) = 1 FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozen)
 	require.NoError(t, err)
 	require.False(t, frozen)
 
@@ -1353,12 +1353,12 @@ func TestReAssignUTXO(t *testing.T) {
 	err = store.ReAssignUTXO(ctx, sourceSpend, newSpend, nil)
 	require.NoError(t, err)
 
-	// Verify: out_frozens[1] should be false, utxo_hashes[1] should be updated.
-	// Phase B: outputs table is gone; verify via txs array columns.
+	// Verify: bit 0 of out_frozens should be clear, and the first 32-byte slot
+	// of the flat utxo_hashes should hold the new hash.
 	var outputFrozen bool
 	var storedUtxoHash []byte
 	err = store.pool.QueryRow(ctx,
-		`SELECT COALESCE(out_frozens[1], false), utxo_hashes[1] FROM txs WHERE hash = $1`,
+		`SELECT out_frozens IS NOT NULL AND get_bit(out_frozens, 0) = 1, substr(utxo_hashes, 1, 32) FROM txs WHERE hash = $1`,
 		txHash[:]).Scan(&outputFrozen, &storedUtxoHash)
 	require.NoError(t, err)
 	require.False(t, outputFrozen, "should be unfrozen after reassign")
@@ -1507,15 +1507,19 @@ func TestArraySubscriptBoundary(t *testing.T) {
 	_, err := store.Create(ctx, parentTx, blockHeight)
 	require.NoError(t, err)
 
-	// Verify the arrays are populated correctly in txs.
-	var utxoHashes [][]byte
-	var outSpendables []bool
+	// Verify the packed columns are populated correctly in txs.
+	var utxoHashes []byte
+	var spendableBits []byte
+	var outCount, spendableCount int32
 	err = store.pool.QueryRow(ctx,
-		`SELECT utxo_hashes, out_spendables FROM txs WHERE hash = $1`, parentHash[:],
-	).Scan(&utxoHashes, &outSpendables)
+		`SELECT utxo_hashes, out_spendables, out_count, spendable_count FROM txs WHERE hash = $1`, parentHash[:],
+	).Scan(&utxoHashes, &spendableBits, &outCount, &spendableCount)
 	require.NoError(t, err)
-	require.Len(t, utxoHashes, 3, "3 outputs → 3-element utxo_hashes array")
-	require.Len(t, outSpendables, 3, "3 outputs → 3-element out_spendables array")
+	require.Len(t, utxoHashes, 3*32, "3 outputs → 96-byte flat utxo_hashes")
+	require.Equal(t, int32(3), outCount, "3 outputs → out_count 3")
+	require.Equal(t, int32(2), spendableCount, "OP_RETURN excluded → spendable_count 2")
+	outSpendables := unpackBitmap(spendableBits, int(outCount))
+	require.Len(t, outSpendables, 3)
 	require.True(t, outSpendables[0], "vout0 (P2PKH) should be spendable")
 	require.False(t, outSpendables[1], "vout1 (OP_RETURN zero-value) should NOT be spendable")
 	require.True(t, outSpendables[2], "vout2 (P2PKH) should be spendable")

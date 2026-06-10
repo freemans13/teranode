@@ -34,10 +34,13 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	}
 
 	// Compute delete_at_height when setting conflicting=true.
-	var deleteAtHeight *int64
+	var deleteAtHeight *int32
 	if s.settings.GetUtxoStoreBlockHeightRetention() > 0 && setValue {
-		// Widen to int64 before adding so the sum cannot wrap in uint32 arithmetic.
-		v := int64(s.blockHeight.Load()) + 1 + int64(s.settings.GetUtxoStoreBlockHeightRetention())
+		// Widen to int64 before adding so the sum cannot wrap in uint32
+		// arithmetic, then narrow to int32 for the INT4 delete_at_height column
+		// (heights and retention are far below 2^31).
+		v64 := int64(s.blockHeight.Load()) + 1 + int64(s.settings.GetUtxoStoreBlockHeightRetention())
+		v := int32(v64)
 		deleteAtHeight = &v
 	}
 
@@ -328,7 +331,7 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		} else {
 			inClause, inArgs := buildINClauseLocal(chunk, 2)
 			q = fmt.Sprintf(`UPDATE txs SET unmined_since = $1 WHERE hash IN %s`, inClause)
-			args = append([]interface{}{int64(currentBlockHeight)}, inArgs...)
+			args = append([]interface{}{int32(currentBlockHeight)}, inArgs...) // unmined_since is INT4
 		}
 
 		result, err := s.pool.Exec(ctx, q, args...)

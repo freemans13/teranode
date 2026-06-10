@@ -185,7 +185,7 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
 	data := &meta.Data{}
 
-	// Single SELECT from txs — all metadata, state, raw_tx, and arrays.
+	// Single SELECT from txs — all metadata, state, raw_tx, and packed columns.
 	var (
 		version             int64
 		lockTime            int64
@@ -195,22 +195,21 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		blockHeights        []int32
 		subtreeIdxs         []int32
 		conflictingChildren [][]byte
-		utxoHashes          [][]byte
-		outSpendables       []bool
-		outFrozens          []bool
+		outCount            int32
+		outFrozensBitmap    []byte // nil = no output frozen
 	)
 
 	err := s.pool.QueryRow(ctx, `
 		SELECT version, lock_time, fee, size_in_bytes, coinbase,
 		       locked, conflicting, frozen, unmined_since, raw_tx,
 		       block_ids, block_heights, subtree_idxs, conflicting_children,
-		       utxo_hashes, out_spendables, out_frozens
+		       out_count, out_frozens
 		FROM txs WHERE hash = $1`,
 		hash[:],
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,
 		&data.Locked, &data.Conflicting, &data.Frozen, &unminedSince, &rawTx,
 		&blockIDs, &blockHeights, &subtreeIdxs, &conflictingChildren,
-		&utxoHashes, &outSpendables, &outFrozens)
+		&outCount, &outFrozensBitmap)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxNotFoundError("transaction %s not found", hash, err)
@@ -269,9 +268,10 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 	}
 
 	// Fetch UTXOs with spend status from spends table.
-	// Frozen flag per output is now read from out_frozens[i+1] (already scanned);
-	// no separate outputs-table query is needed for frozen.
+	// Frozen flag per output is unpacked from the out_frozens bitmap (already
+	// scanned); no separate outputs-table query is needed for frozen.
 	if contains(bins, fields.Utxos) {
+		outFrozens := unpackBitmap(outFrozensBitmap, int(outCount))
 		rows, err := s.pool.Query(ctx, `
 			SELECT prev_output_idx, spending_data
 			FROM spends
@@ -294,16 +294,16 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 				return nil, err
 			}
 
-			// prev_output_idx is an unbounded BIGINT in the spends table; a corrupt,
-			// truncated, or orphaned spend row could carry an index beyond this tx's
-			// output count. Guard before using it to subscript data.SpendingDatas, or
-			// a malformed row turns a Get into an index-out-of-range panic reachable
-			// from any caller-supplied tx hash.
+			// prev_output_idx is an INT with no CHECK constraint in the spends
+			// table; a corrupt, truncated, or orphaned spend row could carry an
+			// index beyond this tx's output count. Guard before using it to
+			// subscript data.SpendingDatas, or a malformed row turns a Get into an
+			// index-out-of-range panic reachable from any caller-supplied tx hash.
 			if idx < 0 || idx >= len(data.SpendingDatas) {
 				return nil, errors.NewProcessingError("[Get] spends row for %s has out-of-bounds output index %d (tx has %d outputs)", hash, idx, len(data.SpendingDatas))
 			}
 
-			// Check per-output frozen from array (Postgres 1-based [idx+1]).
+			// Check per-output frozen from the unpacked bitmap.
 			outputFrozen := data.Frozen
 			if !outputFrozen && idx < len(outFrozens) {
 				outputFrozen = outFrozens[idx]
@@ -349,8 +349,14 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 }
 
 // GetSpend retrieves the spend status for a specific UTXO.
-// v4: reads from txs arrays instead of the outputs table.
+// Packed form: reads the flat per-output columns on the txs row.
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
+	// prev_output_idx is INT4 — reject out-of-range vouts at this entry point.
+	voutInt32, err := voutToInt32(spend.Vout)
+	if err != nil {
+		return nil, err
+	}
+
 	var (
 		utxoHashBytes          []byte
 		coinbaseSpendingHeight int64 // scan as int64 to avoid uint32 truncation
@@ -361,20 +367,22 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 		locked                 bool
 	)
 
-	// Use array subscript ($2::int + 1 for 1-based Postgres indexing).
-	// Returns 0 rows when: tx is missing, OR output index is OOB (array_length < idx+1).
-	err := s.pool.QueryRow(ctx, `
+	// O(1) packed access: 32-byte substr stride + get_bit bitmap probe.
+	// Returns 0 rows when: tx is missing, OR output index is OOB ($2 >= out_count).
+	// get_bit is only reached when $2 < out_count (WHERE guard), so it cannot
+	// raise an out-of-range error.
+	err = s.pool.QueryRow(ctx, `
 		SELECT
-		    CASE WHEN array_length(t.utxo_hashes, 1) >= $2::int + 1 THEN t.utxo_hashes[$2::int + 1] END,
-		    COALESCE(CASE WHEN array_length(t.coinbase_spending_heights, 1) >= $2::int + 1 THEN t.coinbase_spending_heights[$2::int + 1] END, 0),
+		    substr(t.utxo_hashes, $2::int * 32 + 1, 32),
+		    t.coinbase_spending_height,
 		    sp.spending_data,
-		    COALESCE(CASE WHEN array_length(t.out_frozens, 1) >= $2::int + 1 THEN t.out_frozens[$2::int + 1] END, false) OR t.frozen,
+		    (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1) OR t.frozen,
 		    CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END,
 		    t.conflicting, t.locked
 		FROM txs t
 		LEFT JOIN spends sp ON sp.prev_tx_hash = t.hash AND sp.prev_output_idx = $2
-		WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1`,
-		spend.TxID[:], spend.Vout,
+		WHERE t.hash = $1 AND $2::int < t.out_count`,
+		spend.TxID[:], voutInt32,
 	).Scan(&utxoHashBytes, &coinbaseSpendingHeight, &spendingDataBytes, &frozen, &spendableIn, &conflicting, &locked)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

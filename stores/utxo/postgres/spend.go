@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"math"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -26,6 +27,18 @@ type batchSpendItem struct {
 	ignoreLocked      bool
 }
 
+// voutToInt32 guards the uint32 → INT4 narrowing at the point a vout enters a
+// SQL binding: spends.prev_output_idx is an INT4 column, and a protocol-valid
+// transaction can never carry 2^31 outputs, so a vout above math.MaxInt32 is
+// corrupt input and must be rejected with a typed error rather than failing
+// deep inside pgx parameter encoding.
+func voutToInt32(vout uint32) (int32, error) {
+	if vout > math.MaxInt32 {
+		return 0, errors.NewProcessingError("vout %d exceeds int32 range for INT prev_output_idx", vout)
+	}
+	return int32(vout), nil
+}
+
 // ---------------------------------------------------------------------------
 // Direct-mode SQL (used when batcher is not active)
 // ---------------------------------------------------------------------------
@@ -34,20 +47,23 @@ type batchSpendItem struct {
 // the append-only spends table. spent_at_height is recorded for deferred DAH
 // computation by Worker 2.
 //
-// v4: reads from txs arrays instead of the outputs table. The WHERE clause
-// requires array_length(t.utxo_hashes, 1) >= $2::int + 1 (1-based Postgres
-// subscript for 0-based output index $2), so a missing tx OR an OOB index
-// both produce 0 RETURNING rows — diagnosed by diagnoseSpendFailure.
+// Packed form: per-output access is O(1) byte arithmetic — utxo_hash is a
+// 32-byte substr at offset $2*32 (substr is 1-based), frozen/spendable flags
+// are get_bit() bitmap probes, coinbase_spending_height is a scalar. The WHERE
+// clause requires $2 < t.out_count, so a missing tx OR an OOB index both
+// produce 0 RETURNING rows — diagnosed by diagnoseSpendFailure. get_bit is
+// only reached when $2 < out_count (bitmap is sized to out_count bits rounded
+// up), so it can never raise an out-of-range error.
 const spendValidationSQL = `
 WITH validation AS (
     SELECT
-        CASE WHEN array_length(t.utxo_hashes, 1) >= $2::int + 1 THEN t.utxo_hashes[$2::int + 1] END AS utxo_hash,
-        COALESCE(CASE WHEN array_length(t.out_frozens, 1) >= $2::int + 1 THEN t.out_frozens[$2::int + 1] END, false) AS output_frozen,
-        COALESCE(CASE WHEN array_length(t.coinbase_spending_heights, 1) >= $2::int + 1 THEN t.coinbase_spending_heights[$2::int + 1] END, 0) AS coinbase_spending_height,
+        substr(t.utxo_hashes, $2::int * 32 + 1, 32) AS utxo_hash,
+        (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1) AS output_frozen,
+        t.coinbase_spending_height AS coinbase_spending_height,
         CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END AS spendable_in,
         t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
     FROM txs t
-    WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
+    WHERE t.hash = $1 AND $2::int < t.out_count
 ),
 inserted AS (
     INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height)
@@ -65,19 +81,19 @@ SELECT 1 FROM inserted
 // spendDiagnosticSQL re-queries when the validation INSERT returned 0 rows so
 // we can determine the exact reason the spend failed.
 //
-// v4: reads from txs arrays instead of the outputs table. Returns NOT FOUND
+// Packed form: reads the flat per-output columns on txs. Returns NOT FOUND
 // (0 rows) when the tx is missing OR the index is OOB — both are TxNotFound.
 const spendDiagnosticSQL = `
 SELECT
-    CASE WHEN array_length(t.utxo_hashes, 1) >= $2::int + 1 THEN t.utxo_hashes[$2::int + 1] END AS utxo_hash,
-    COALESCE(CASE WHEN array_length(t.out_frozens, 1) >= $2::int + 1 THEN t.out_frozens[$2::int + 1] END, false) AS output_frozen,
+    substr(t.utxo_hashes, $2::int * 32 + 1, 32) AS utxo_hash,
+    (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1) AS output_frozen,
     CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END AS spendable_in,
-    COALESCE(CASE WHEN array_length(t.coinbase_spending_heights, 1) >= $2::int + 1 THEN t.coinbase_spending_heights[$2::int + 1] END, 0) AS coinbase_spending_height,
+    t.coinbase_spending_height AS coinbase_spending_height,
     t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen,
     sp.spending_data AS existing_spend
 FROM txs t
 LEFT JOIN spends sp ON sp.prev_tx_hash = t.hash AND sp.prev_output_idx = $2
-WHERE t.hash = $1 AND array_length(t.utxo_hashes, 1) >= $2::int + 1
+WHERE t.hash = $1 AND $2::int < t.out_count
 `
 
 // ---------------------------------------------------------------------------
@@ -104,6 +120,17 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 	if len(spends) == 0 {
 		return nil, errors.NewProcessingError("No spends provided", nil)
+	}
+
+	// prev_output_idx is INT4 — reject out-of-range vouts before any spend is
+	// attempted, so a corrupt input can never partially apply a batch.
+	for _, spend := range spends {
+		if spend == nil {
+			continue
+		}
+		if _, err := voutToInt32(spend.Vout); err != nil {
+			return nil, err
+		}
 	}
 
 	if s.spendBatcher != nil {
@@ -204,10 +231,10 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 		var inserted int
 		err := s.pool.QueryRow(ctx, spendValidationSQL,
 			spend.TxID[:],      // $1 prev_tx_hash
-			spend.Vout,         // $2 prev_output_idx
+			int32(spend.Vout),  // $2 prev_output_idx (INT4; range-checked in Spend)
 			spendingDataBytes,  // $3 spending_data
 			spend.UTXOHash[:],  // $4 expected_utxo_hash
-			int64(blockHeight), // $5 blockHeight (also written to spent_at_height)
+			int32(blockHeight), // $5 blockHeight (also written to INT4 spent_at_height)
 			ignoreLocked,       // $6 ignoreLocked
 			ignoreConflicting,  // $7 ignoreConflicting
 		).Scan(&inserted)
@@ -309,9 +336,9 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		item := batch[0]
 		var inserted int
 		err := s.pool.QueryRow(ctx, spendValidationSQL,
-			item.spend.TxID[:], item.spend.Vout,
+			item.spend.TxID[:], int32(item.spend.Vout),
 			item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:],
-			int64(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
+			int32(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
 		).Scan(&inserted)
 		if err == nil {
 			item.errCh <- nil
@@ -344,20 +371,20 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	// INSERT valid spends → return per-item results with diagnostic flags.
 	// One parse/plan/execute for the entire batch (§6.1 multi-row INSERT).
 	prevTxHashes := make([][]byte, len(batch))
-	prevIdxs := make([]int64, len(batch))
+	prevIdxs := make([]int32, len(batch)) // prev_output_idx is INT4 (vout range-checked in Spend)
 	spendingDatas := make([][]byte, len(batch))
 	utxoHashes := make([][]byte, len(batch))
-	blockHeights := make([]int64, len(batch))
+	blockHeights := make([]int32, len(batch)) // spent_at_height is INT4
 	ignLockeds := make([]bool, len(batch))
 	ignConflictings := make([]bool, len(batch))
 	batchIdxs := make([]int32, len(batch))
 
 	for i, item := range batch {
 		prevTxHashes[i] = item.spend.TxID[:]
-		prevIdxs[i] = int64(item.spend.Vout)
+		prevIdxs[i] = int32(item.spend.Vout)
 		spendingDatas[i] = item.spend.SpendingData.Bytes()
 		utxoHashes[i] = item.spend.UTXOHash[:]
-		blockHeights[i] = int64(item.blockHeight)
+		blockHeights[i] = int32(item.blockHeight)
 		ignLockeds[i] = item.ignoreLocked
 		ignConflictings[i] = item.ignoreConflicting
 		batchIdxs[i] = int32(i)
@@ -459,20 +486,24 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 // bulkSpendSQL processes an entire batch in ONE query: UNNEST → validate → INSERT → results.
 // spent_at_height is recorded per row for deferred DAH computation by Worker 2.
 //
-// v4: reads from txs arrays instead of the outputs table. A tx with a missing
-// hash produces no row in validated (JOIN miss → no result row for that batch_idx).
-// An OOB index produces a validated row but utxo_hash IS NULL (slot_exists=false).
-// The result dispatch handles these cases:
+// Packed form: per-output access is O(1) byte arithmetic on the txs row. A tx
+// with a missing hash produces no row in validated (JOIN miss → no result row
+// for that batch_idx). An OOB index produces a validated row but utxo_hash IS
+// NULL (slot_exists=false). The CASE guards on prev_idx < out_count are
+// load-bearing: get_bit() ERRORS on an out-of-range bit index (unlike an array
+// subscript, which returns NULL), and substr() past the end returns an EMPTY
+// bytea (not NULL) which would corrupt the slot_exists classification. The
+// result dispatch handles these cases:
 //   - no row in resultMap → TxNotFound (tx missing)
 //   - row exists, slot_exists=false → TxNotFound (OOB index)
 //   - row exists, !utxo_match → UtxoHashMismatch (wrong UTXO hash)
 const bulkSpendSQL = `
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
-           unnest($2::bigint[])  AS prev_idx,
+           unnest($2::int[])     AS prev_idx,
            unnest($3::bytea[])   AS spending_data,
            unnest($4::bytea[])   AS expected_utxo_hash,
-           unnest($5::bigint[])  AS block_height,
+           unnest($5::int[])     AS block_height,
            unnest($6::boolean[]) AS ign_locked,
            unnest($7::boolean[]) AS ign_conflicting,
            unnest($8::int[])     AS batch_idx
@@ -480,10 +511,10 @@ WITH items AS (
 validated AS (
     SELECT i.batch_idx, i.prev_tx_hash, i.prev_idx, i.spending_data, i.expected_utxo_hash,
            i.block_height, i.ign_locked, i.ign_conflicting,
-           CASE WHEN array_length(t.utxo_hashes,1) >= i.prev_idx::int+1 THEN t.utxo_hashes[i.prev_idx::int+1] END AS utxo_hash,
-           COALESCE(CASE WHEN array_length(t.out_frozens,1) >= i.prev_idx::int+1 THEN t.out_frozens[i.prev_idx::int+1] END, false) AS out_frozen,
+           CASE WHEN i.prev_idx::int < t.out_count THEN substr(t.utxo_hashes, i.prev_idx::int * 32 + 1, 32) END AS utxo_hash,
+           CASE WHEN i.prev_idx::int < t.out_count AND t.out_frozens IS NOT NULL THEN get_bit(t.out_frozens, i.prev_idx::int) = 1 ELSE false END AS out_frozen,
            CASE WHEN array_length(t.spendable_ins,1) >= i.prev_idx::int+1 THEN t.spendable_ins[i.prev_idx::int+1] END AS spendable_in,
-           COALESCE(CASE WHEN array_length(t.coinbase_spending_heights,1) >= i.prev_idx::int+1 THEN t.coinbase_spending_heights[i.prev_idx::int+1] END, 0) AS coinbase_spending_height,
+           t.coinbase_spending_height AS coinbase_spending_height,
            t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
     FROM items i JOIN txs t ON t.hash = i.prev_tx_hash
 ),
@@ -527,8 +558,8 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 	)
 
 	err := s.pool.QueryRow(ctx, spendDiagnosticSQL,
-		spend.TxID[:], // $1
-		spend.Vout,    // $2
+		spend.TxID[:],     // $1
+		int32(spend.Vout), // $2 (INT4; range-checked at the Spend entry point)
 	).Scan(&utxoHashBytes, &outputFrozen, &spendableIn,
 		&coinbaseSpendingHeight, &txLocked, &txConflicting, &txFrozen, &existingSpendBytes)
 
@@ -622,13 +653,17 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 	}
 
 	// SpendingData is the ownership token — reject up front rather than risk
-	// deleting a spend we do not own.
+	// deleting a spend we do not own. Vout must also fit the INT4
+	// prev_output_idx column (separate entry point from Spend).
 	for _, spend := range spends {
 		if spend == nil {
 			continue
 		}
 		if spend.SpendingData == nil {
 			return errors.NewProcessingError("[Unspend] SpendingData (ownership token) required for %s:%d", spend.TxID, spend.Vout)
+		}
+		if _, err := voutToInt32(spend.Vout); err != nil {
+			return err
 		}
 	}
 
@@ -649,7 +684,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		// 0 rows — intentional — but still drives the parent's DAH housekeeping.
 		if _, err := pgxTx.Exec(ctx,
 			`DELETE FROM spends WHERE prev_tx_hash = $1 AND prev_output_idx = $2 AND spending_data = $3`,
-			spend.TxID[:], spend.Vout, spend.SpendingData.Bytes(),
+			spend.TxID[:], int32(spend.Vout), spend.SpendingData.Bytes(),
 		); err != nil {
 			return errors.NewStorageError("[Unspend] failed for %s:%d", spend.TxID, spend.Vout, err)
 		}

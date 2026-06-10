@@ -47,10 +47,10 @@ func TestFreezeUTXOsConcurrentSingleWinner(t *testing.T) {
 
 	require.Equal(t, int32(1), successes.Load(), "exactly one concurrent freeze should succeed")
 
-	// Phase B: outputs table removed; verify frozen state via txs.out_frozens array.
+	// Verify frozen state via the txs.out_frozens packed bitmap (bit 0 = vout 0).
 	var frozen bool
 	require.NoError(t, store.pool.QueryRow(ctx,
-		`SELECT COALESCE(out_frozens[1], false) FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozen))
+		`SELECT out_frozens IS NOT NULL AND get_bit(out_frozens, 0) = 1 FROM txs WHERE hash = $1`, txHash[:]).Scan(&frozen))
 	require.True(t, frozen, "the UTXO must end up frozen")
 }
 

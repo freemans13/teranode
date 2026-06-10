@@ -11,7 +11,10 @@ import (
 )
 
 // minedChunkSize is the maximum number of hashes per bulk UPDATE.
-// Larger chunks = fewer round trips. Simple array append keeps per-row cost constant.
+// Larger chunks = fewer round trips. Simple array append keeps per-row cost
+// constant. NOTE: 4000 was A/B'd (one statement per typical mined batch) and
+// REGRESSED the 2-shard balanced rate 95.7K -> 86K — the bigger statement
+// holds buffers/locks longer and breaks the create/reclaim interleaving.
 const minedChunkSize = 2000
 
 // SetMinedMulti updates the block ID for multiple transactions that have been mined.
@@ -98,8 +101,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 			[]int32{int32(minedBlockInfo.SubtreeIdx)},
 		}
 		if minedBlockInfo.OnLongestChain {
-			// $5: mined_at_height — the block height this tx is mined into.
-			args = append(args, int64(minedBlockInfo.BlockHeight))
+			// $5: mined_at_height — the block height this tx is mined into
+			// (INT4 column; heights < 2^31).
+			args = append(args, int32(minedBlockInfo.BlockHeight))
 		}
 		batch.Queue(updateSQL, args...)
 		numUpdateChunks++
@@ -182,7 +186,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, blockID uint32, blockHeight uint32) (map[chainhash.Hash][]uint32, error) {
 	resultMap := make(map[chainhash.Hash][]uint32, len(hashes))
 
-	currentBlockHeight := int64(s.blockHeight.Load())
+	currentBlockHeight := int32(s.blockHeight.Load()) // unmined_since is INT4; heights < 2^31
 
 	// One transaction for the whole set: a reorg that unsets a block_id from many
 	// txs commits all-or-nothing rather than leaving some rows updated on failure.
@@ -228,7 +232,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 				-- sql.go:3268-3308, which only write unmined_since when zero blocks remain).
 				unmined_since = CASE
 					WHEN COALESCE(array_length(array_remove(t.block_ids, $2), 1), 0) = 0
-					THEN $3::bigint ELSE t.unmined_since END,
+					THEN $3::int ELSE t.unmined_since END,
 				-- Clear the deferred-prune stamp when the tx falls off the longest
 				-- chain (no block_ids remain). It is no longer "mined and fully spent
 				-- on the longest chain", so it must not be pruned at the old stamp.

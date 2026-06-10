@@ -76,13 +76,13 @@ func spendAllOutputs(t *testing.T, store *Store, parentTx *bt.Tx, spendHeight ui
 	require.NoError(t, err)
 
 	// Self-check: the parent must now be fully spent.
-	// Phase B: outputs table removed; count spendable outputs via txs.out_spendables array.
+	// Spendable-output count is the stored txs.spendable_count scalar.
 	parentHash := parentTx.TxIDChainHash()[:]
 	var spendCount, outputCount int
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT count(*) FROM spends WHERE prev_tx_hash=$1`, parentHash).Scan(&spendCount))
 	require.NoError(t, store.pool.QueryRow(ctx,
-		`SELECT COALESCE(cardinality(array_positions(out_spendables, true)), 0) FROM txs WHERE hash=$1`,
+		`SELECT spendable_count FROM txs WHERE hash=$1`,
 		parentHash).Scan(&outputCount))
 	require.Equal(t, outputCount, spendCount,
 		"parent must be fully spent (count(spends) == count(spendable outputs))")
@@ -293,13 +293,11 @@ func TestSweepIgnoresUnspendableOpReturnOutputs(t *testing.T) {
 
 	parentHash := parent.TxIDChainHash()
 
-	// All three outputs are stored in txs arrays, but the OP_RETURN one is flagged unspendable.
-	// Phase B: query txs.out_spendables array directly (outputs table removed).
+	// All three outputs are stored on the txs row, but the OP_RETURN one is
+	// flagged unspendable (spendable_count excludes it).
 	var spendableCount, totalCount int
 	require.NoError(t, store.pool.QueryRow(ctx, `
-		SELECT
-		    COALESCE(cardinality(array_positions(out_spendables, true)), 0),
-		    COALESCE(cardinality(out_spendables), 0)
+		SELECT spendable_count, out_count
 		FROM txs WHERE hash=$1`, parentHash[:]).Scan(&spendableCount, &totalCount))
 	require.Equal(t, 3, totalCount, "all outputs must be stored")
 	require.Equal(t, 2, spendableCount, "the OP_RETURN output must be flagged spendable=false")

@@ -50,7 +50,7 @@ func newPrunableUnminedTxIterator(store *Store, cutoffBlockHeight uint32) (*unmi
 		ORDER BY hash
 	`
 
-	rows, err := store.pool.Query(context.Background(), q, int64(cutoffBlockHeight))
+	rows, err := store.pool.Query(context.Background(), q, int32(cutoffBlockHeight)) // unmined_since is INT4
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +245,7 @@ func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeig
 		SELECT hash FROM txs
 		WHERE unmined_since IS NOT NULL AND unmined_since <= $1
 		ORDER BY unmined_since LIMIT 1000
-	`, int64(cutoffBlockHeight))
+	`, int32(cutoffBlockHeight))
 	if err != nil {
 		return nil, errors.NewStorageError("failed to query old unmined transactions", err)
 	}

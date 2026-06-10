@@ -13,7 +13,7 @@ import (
 // by Get (returning a processing error) instead of triggering an
 // index-out-of-range panic when subscripting data.SpendingDatas.
 //
-// prev_output_idx is an unbounded BIGINT with no CHECK constraint, so a corrupt,
+// prev_output_idx is an INT with no CHECK constraint, so a corrupt,
 // truncated, or orphaned row can carry an out-of-range index. The guard added in
 // getInternal (get.go) turns that into an error rather than a process-killing
 // panic reachable from any caller-supplied tx hash.

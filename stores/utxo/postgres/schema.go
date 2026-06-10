@@ -10,9 +10,10 @@ import (
 
 // createSchema creates the v7 turbo UTXO tables in the connected PostgreSQL
 // database: 2 LOGGED hash-partitioned tables (txs, spends). The outputs
-// table has been folded into txs as parallel arrays (utxo_hashes, out_spendables,
-// out_frozens, coinbase_spending_heights, spendable_ins), eliminating the
-// per-tx outputs INSERT, the random-hash PK index, and the cascade-DELETE.
+// table has been folded into txs as PACKED per-output columns (utxo_hashes
+// flat bytea, out_spendables/out_frozens bitmaps, out_count/spendable_count
+// scalars, coinbase_spending_height scalar, spendable_ins array), eliminating
+// the per-tx outputs INSERT, the random-hash PK index, and the cascade-DELETE.
 // raw_tx lives on the txs row (immutable BYTEA blob).
 //
 // Schema design tradeoffs (vs. the standard stores/utxo/sql store):
@@ -25,9 +26,10 @@ import (
 //     nullable spending_data column. Spends become pure INSERTs (no MVCC
 //     bloat on txs output arrays).
 //
-//   - block_ids / block_heights / subtree_idxs / conflicting_children AND all
-//     per-output UTXO fields are stored as arrays on txs. A single row lookup
-//     returns everything needed for spend validation — zero extra table JOINs.
+//   - block_ids / block_heights / subtree_idxs / conflicting_children are
+//     arrays on txs, and all per-output UTXO fields are PACKED columns on txs
+//     (flat bytea + bitmaps + scalar counts). A single row lookup returns
+//     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
 	return createSchemaWithPool(ctx, s.pool)
 }
@@ -173,20 +175,42 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 // ---------------------------------------------------------------------------
 
 // txs: consolidated transaction metadata + state + raw_tx + block_ids (arrays) +
-// conflicting_children (array) + per-output UTXO arrays. LOGGED — UTXO set is
-// durable state.
+// conflicting_children (array) + PACKED per-output UTXO columns. LOGGED — UTXO
+// set is durable state.
 //
-// Output arrays (nullable, no default, no NOT NULL — NULL means legacy/no outputs;
-// array_length(NULL,1) and array_length('{}',1) both return NULL, relied upon by
-// spend validation):
+// Packed per-output encoding ("array packing", replaces the previous 5 parallel
+// per-output array columns — a hot-path CPU fix: bulk create no longer pays
+// per-row array_agg re-aggregation, and per-output access is O(1) byte
+// arithmetic instead of per-element array CASE/array_length evaluation):
 //
-//	utxo_hashes               — per-output UTXO hash (32 bytes each)
-//	out_spendables            — per-output spendable flag
-//	out_frozens               — per-output frozen flag
-//	coinbase_spending_heights — per-output coinbase maturity height (0 = non-coinbase)
-//	spendable_ins             — per-output spendable_in height (NULL element = no restriction)
+//	utxo_hashes              — flat concatenation, 32 bytes per output; output i
+//	                           lives at byte offset i*32 (substr(.., i*32+1, 32),
+//	                           substr is 1-based). NULL when no outputs.
+//	out_count                — number of outputs (slot_exists test: idx < out_count).
+//	spendable_count          — count of spendable outputs; the deferred-DAH
+//	                           "fully spent" comparand.
+//	out_spendables           — bitmap, bit i = output i is spendable. Encoding
+//	                           matches PostgreSQL get_bit(): bit n lives in byte
+//	                           n/8 at position n%8 counting from the LEAST
+//	                           significant bit (Go: buf[i/8] |= 1 << (i%8)).
+//	                           NULL when no outputs.
+//	out_frozens              — same bitmap encoding; NULL means "no output frozen"
+//	                           (the common case — freeze materialises it on demand,
+//	                           sized to (out_count+7)/8 bytes).
+//	coinbase_spending_height — scalar coinbase maturity height (0 = non-coinbase).
+//	                           The old per-output array was redundant: every output
+//	                           of a coinbase tx gets the SAME maturity height.
+//	spendable_ins            — per-output spendable_in height, kept as an INT[]
+//	                           (set only by rare ReAssignUTXO; NULL common case;
+//	                           NULL element = no restriction). 0-based output
+//	                           index i → Postgres 1-based subscript [i+1].
 //
-// 0-based output index i → Postgres 1-based array subscript [i+1].
+// MIGRATION NOTE: this packed layout replaces the v7 array columns
+// (utxo_hashes BYTEA[], out_spendables BOOLEAN[], out_frozens BOOLEAN[],
+// coinbase_spending_heights BIGINT[], spendable_ins kept as-is). No live
+// migration DDL is provided: bench databases are recreated from scratch and CI
+// creates fresh schemas. A pre-existing database with the array layout must be
+// dropped and re-synced.
 const txsDDL = `
 CREATE TABLE IF NOT EXISTS txs (
     hash                      BYTEA PRIMARY KEY,
@@ -199,19 +223,21 @@ CREATE TABLE IF NOT EXISTS txs (
     locked                    BOOLEAN NOT NULL DEFAULT FALSE,
     conflicting               BOOLEAN NOT NULL DEFAULT FALSE,
     frozen                    BOOLEAN NOT NULL DEFAULT FALSE,
-    unmined_since             BIGINT,
-    delete_at_height          BIGINT,
-    preserve_until            BIGINT,
+    unmined_since             INT,
+    delete_at_height          INT,
+    preserve_until            INT,
     block_ids                 INT[],
     block_heights             INT[],
     subtree_idxs              INT[],
     conflicting_children      BYTEA[],
     inserted_at               TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    mined_at_height           BIGINT,
-    utxo_hashes               BYTEA[],
-    out_spendables            BOOLEAN[],
-    out_frozens               BOOLEAN[],
-    coinbase_spending_heights BIGINT[],
+    mined_at_height           INT,
+    utxo_hashes               BYTEA,
+    out_count                 INT NOT NULL DEFAULT 0,
+    spendable_count           INT NOT NULL DEFAULT 0,
+    out_spendables            BYTEA,
+    out_frozens               BYTEA,
+    coinbase_spending_height  INT NOT NULL DEFAULT 0,
     spendable_ins             INT[]
 ) PARTITION BY HASH (hash);`
 
@@ -243,11 +269,20 @@ CREATE INDEX IF NOT EXISTS px_preserve_until ON txs (preserve_until) WHERE prese
 // spends: append-only spend records. LOGGED. A row here is the canonical
 // "this output was spent by that tx" marker; Unspend deletes the row, and
 // the pruner removes all rows for a parent_tx before removing the parent.
+//
+// prev_output_idx and spent_at_height are INT4, not BIGINT: a vout is a
+// uint32 that can never reach 2^31 in a protocol-valid tx (guarded at the Go
+// boundary — see voutToInt32), and block heights stay far below 2^31. The
+// narrowing shrinks every heap row by 8 bytes and every UNIQUE-index entry by
+// 4 — fewer bytes to copy/compare on each insert, probe, and reclaim delete
+// in this hottest of tables. The same reasoning narrows the txs height
+// columns above (unmined_since/delete_at_height/preserve_until/
+// mined_at_height/coinbase_spending_height).
 const spendsDDL = `
 CREATE TABLE IF NOT EXISTS spends (
-    prev_tx_hash    BYTEA  NOT NULL,
-    prev_output_idx BIGINT NOT NULL,
-    spending_data   BYTEA  NOT NULL,
-    spent_at_height BIGINT,
+    prev_tx_hash    BYTEA NOT NULL,
+    prev_output_idx INT   NOT NULL,
+    spending_data   BYTEA NOT NULL,
+    spent_at_height INT,
     UNIQUE (prev_tx_hash, prev_output_idx)
 ) PARTITION BY HASH (prev_tx_hash);`

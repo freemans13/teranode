@@ -111,8 +111,8 @@ func (s *Store) sweepDAHRange(ctx context.Context, fromH, toH int64, limit int) 
 // candidates of ONE partition's aligned leaves (txs_pNN / spends_pNN), in two
 // steps inside one transaction: enumerate candidate hashes (BRIN range scans),
 // then aggregate + stamp via a bytea[] parameter so the planner always knows
-// the exact candidate cardinality. The per-tx spendable output count is read
-// from the txs array column out_spendables (no outputs table on this path).
+// the exact candidate cardinality. The per-tx spendable output count is the
+// stored txs.spendable_count scalar (no outputs table on this path).
 func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, toH int64, limit int, retention int64) (stamped int, candidates int, err error) {
 	txsLeaf := fmt.Sprintf("txs_p%02d", partIdx)
 	spendsLeaf := fmt.Sprintf("spends_p%02d", partIdx)
@@ -150,6 +150,9 @@ func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, 
 	// (8 partitions x ~130ms x ~2 calls/s). With the candidates passed back in as
 	// a bytea[] parameter and a custom plan, the planner sees the exact array
 	// cardinality and probes the spends/txs indexes per candidate instead.
+	// spent_at_height / mined_at_height are INT4 — bind int32 so the planner
+	// sees an int4 = int4 comparison on the BRIN-indexed columns (heights are
+	// far below 2^31, so the narrowing is lossless).
 	rows, err := pgxTx.Query(ctx, fmt.Sprintf(`
         SELECT hash FROM (
             SELECT DISTINCT prev_tx_hash AS hash FROM %[1]s
@@ -158,7 +161,7 @@ func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, 
             SELECT hash FROM %[2]s
             WHERE mined_at_height > $1 AND mined_at_height <= $2
         ) c
-        LIMIT $3`, spendsLeaf, txsLeaf), fromH, toH, limit)
+        LIMIT $3`, spendsLeaf, txsLeaf), int32(fromH), int32(toH), limit)
 	if err != nil {
 		return 0, 0, errors.NewStorageError("[dahSweep] enumerate (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
 	}
@@ -186,15 +189,24 @@ func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, 
 	}
 
 	// Step 2: aggregate + bidirectionally stamp ONLY the candidate hashes.
-	// spent_count counts only spends of SPENDABLE outputs, so it is comparable to
-	// the spendable-output count computed inline in state. Counting all spend rows
-	// (including any recorded against a non-spendable output index) could
-	// spuriously satisfy the fully-spent test and stamp DAH while a spendable
-	// output is still unspent.
+	// spent_count counts only spends of SPENDABLE outputs (get_bit probe on the
+	// out_spendables bitmap), so it is comparable to t.spendable_count in state.
+	// Counting all spend rows (including any recorded against a non-spendable
+	// output index) could spuriously satisfy the fully-spent test and stamp DAH
+	// while a spendable output is still unspent. The CASE guard on
+	// prev_output_idx < out_count is load-bearing: get_bit ERRORS on an
+	// out-of-range bit index (an orphaned/corrupt spend row must filter to
+	// false, as the old NULL array subscript did, not abort the sweep).
+	//
+	// $2/$3 are bound as int32 (the height columns are INT4) and the stamp
+	// expression is cast ::int explicitly so every CASE branch resolves to int4
+	// — matching the INT4 delete_at_height with no per-row coercion. The sum
+	// cannot overflow int4: completion heights and retention are both far
+	// below 2^31.
 	tag, err := pgxTx.Exec(ctx, fmt.Sprintf(`
 WITH spend_agg AS (
     SELECT s.prev_tx_hash AS hash,
-           count(*) FILTER (WHERE t.out_spendables[s.prev_output_idx::int + 1] = true) AS spent_count,
+           count(*) FILTER (WHERE CASE WHEN s.prev_output_idx < t.out_count THEN get_bit(t.out_spendables, s.prev_output_idx) = 1 ELSE false END) AS spent_count,
            max(s.spent_at_height) AS max_spent
     FROM %[1]s s
     JOIN %[2]s t ON t.hash = s.prev_tx_hash
@@ -207,10 +219,10 @@ state AS (
                WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
                WHEN t.unmined_since IS NOT NULL THEN t.delete_at_height
                WHEN t.block_ids IS NULL OR array_length(t.block_ids, 1) IS NULL THEN t.delete_at_height
-               WHEN COALESCE(sa.spent_count, 0) = COALESCE(cardinality(array_positions(t.out_spendables, true)), 0)
-                    AND COALESCE(cardinality(t.out_spendables), 0) > 0
+               WHEN COALESCE(sa.spent_count, 0) = t.spendable_count
+                    AND t.out_count > 0
                     AND GREATEST(COALESCE(sa.max_spent, 0), COALESCE(t.mined_at_height, 0)) <= $2
-                   THEN GREATEST(COALESCE(sa.max_spent, 0), COALESCE(t.mined_at_height, 0)) + 1 + $3
+                   THEN (GREATEST(COALESCE(sa.max_spent, 0), COALESCE(t.mined_at_height, 0)) + 1 + $3)::int
                ELSE NULL
            END AS new_dah
     FROM %[2]s t
@@ -221,7 +233,7 @@ UPDATE %[2]s t SET delete_at_height = st.new_dah
 FROM state st
 WHERE t.hash = st.hash
   AND t.delete_at_height IS DISTINCT FROM st.new_dah`,
-		spendsLeaf, txsLeaf), candidateHashes, toH, retention)
+		spendsLeaf, txsLeaf), candidateHashes, int32(toH), int32(retention))
 	if err != nil {
 		return 0, 0, errors.NewStorageError("[dahSweep] stamp (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
 	}
@@ -453,13 +465,14 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 
 	// Same set-based aggregation as sweepDAHRange: take a bounded hash-range
 	// slice of stamp-candidates (cheap row predicates + LIMIT, riding the hash
-	// btree), aggregate spends over just that slice and compute spendable count
-	// from the txs.out_spendables array, then stamp the ones that are fully spent.
+	// btree), aggregate spends over just that slice using the stored
+	// out_count/spendable_count scalars + out_spendables bitmap, then stamp the
+	// ones that are fully spent.
 	tag, err := s.pool.Exec(ctx, `
 		WITH slice AS (
 			SELECT t.hash, t.mined_at_height, t.out_spendables,
-			       COALESCE(cardinality(t.out_spendables), 0) AS total_out,
-			       COALESCE(cardinality(array_positions(t.out_spendables, true)), 0) AS spendable_out
+			       t.out_count AS total_out,
+			       t.spendable_count AS spendable_out
 			FROM txs t
 			WHERE t.hash >= $1 AND t.hash < $2
 			  AND t.delete_at_height IS NULL
@@ -470,9 +483,10 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 		),
 		spend_agg AS (
 			-- Count only spends of SPENDABLE outputs (see sweepDAHRangePartition),
-			-- so spent_count is comparable to slice.spendable_out below.
+			-- so spent_count is comparable to slice.spendable_out below. The CASE
+			-- guard keeps get_bit in range (it errors on OOB, unlike a subscript).
 			SELECT s.prev_tx_hash AS hash,
-			       count(*) FILTER (WHERE sl.out_spendables[s.prev_output_idx::int + 1] = true) AS spent_count,
+			       count(*) FILTER (WHERE CASE WHEN s.prev_output_idx < sl.total_out THEN get_bit(sl.out_spendables, s.prev_output_idx) = 1 ELSE false END) AS spent_count,
 			       max(s.spent_at_height) AS max_spent
 			FROM spends s JOIN slice sl ON sl.hash = s.prev_tx_hash
 			GROUP BY s.prev_tx_hash
@@ -485,9 +499,9 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 			WHERE sl.total_out > 0
 			  AND sl.spendable_out = COALESCE(sa.spent_count, 0)
 		)
-		UPDATE txs t SET delete_at_height = e.completion_height + 1 + $4
+		UPDATE txs t SET delete_at_height = (e.completion_height + 1 + $4)::int
 		FROM eligible e WHERE t.hash = e.hash`,
-		lo, hi, limit, retention)
+		lo, hi, limit, int32(retention))
 	if err != nil {
 		return 0, errors.NewStorageError("[dahBackstop] [%d,%d]: %v", loByte, hiByte, err)
 	}

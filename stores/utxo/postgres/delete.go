@@ -54,17 +54,18 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 	}
 
 	// Check if all spendable outputs are spent.
-	// v4: use txs.out_spendables array + spends table count (no outputs table query).
-	// A tx with no outputs (NULL or empty array) is never fully-spent.
+	// Packed form: compare the stored spendable_count scalar against the count
+	// of spend rows recorded for SPENDABLE outputs (get_bit bitmap probe; the
+	// CASE guard keeps get_bit in range — it errors on OOB, unlike a subscript).
+	// A tx with no outputs (spendable_count = 0) is never fully-spent.
 	var allSpent bool
 	err = s.pool.QueryRow(ctx, `
 		SELECT
-		    COALESCE(cardinality(array_positions(t.out_spendables, true)), 0) > 0
-		    AND COALESCE(cardinality(array_positions(t.out_spendables, true)), 0) = (
+		    t.spendable_count > 0
+		    AND t.spendable_count = (
 		        SELECT count(*) FROM spends sp
-		        JOIN generate_series(0, cardinality(t.out_spendables)-1) AS g(i) ON sp.prev_output_idx = g.i
 		        WHERE sp.prev_tx_hash = t.hash
-		          AND t.out_spendables[g.i+1] = true
+		          AND CASE WHEN sp.prev_output_idx < t.out_count THEN get_bit(t.out_spendables, sp.prev_output_idx) = 1 ELSE false END
 		    ) AS all_spent
 		FROM txs t WHERE t.hash = $1`,
 		hash[:],
@@ -86,8 +87,9 @@ func (s *Store) setDAH(ctx context.Context, hash *chainhash.Hash) error {
 
 	hasBlockIDs := len(blockIDs) > 0
 	// Widen to int64 BEFORE adding so the sum cannot wrap in uint32 arithmetic
-	// (blockHeight and retention are both uint32). Matches dah_sweep.go.
-	newDAH := int64(s.blockHeight.Load()) + 1 + int64(retention)
+	// (blockHeight and retention are both uint32), then narrow to int32 for the
+	// INT4 delete_at_height column. Matches dah_sweep.go.
+	newDAH := int32(int64(s.blockHeight.Load()) + 1 + int64(retention))
 
 	if allSpent && hasBlockIDs && onLongestChain {
 		// Set delete_at_height, but only bump forward (never decrease).

@@ -75,6 +75,10 @@ func newPrunedQueueStoreAt(t *testing.T, dsn string) (*pgstore.Store, func()) {
 	tSettings.UtxoStore.StoreBatcherDurationMillis = 5
 	tSettings.UtxoStore.SpendBatcherSize = 500
 	tSettings.UtxoStore.StoreBatcherSize = 500
+	// NOTE: fixed 2ms batcher ticks were A/B'd here (each shard sees ~half the
+	// worker concurrency, the tier where ticks won in the single-instance
+	// sweep) and REGRESSED the 2-shard balanced rate 95.7K -> 88K — the extra
+	// flush cadence steals CPU from the reclaim pipeline. Lazy 5ms stays.
 	tSettings.GlobalBlockHeightRetention = prunedRetention
 	tSettings.UtxoStore.BlockHeightRetentionAdjustment = 0
 
