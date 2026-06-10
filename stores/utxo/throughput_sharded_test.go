@@ -40,6 +40,7 @@ import (
 // layer (no cross-shard tx splitting, no rebalancing, no 2PC).
 
 const throughputDSNShard2 = "postgres://teranode:teranode@localhost:5433/teranode_test"
+const throughputDSNShard3 = "postgres://teranode:teranode@localhost:5434/teranode_test"
 
 // cleanDBAt mirrors cleanDB for an arbitrary DSN.
 func cleanDBAt(t *testing.T, dsn string) {
@@ -96,22 +97,30 @@ func newPrunedQueueStoreAt(t *testing.T, dsn string) (*pgstore.Store, func()) {
 // only — acceptable ONLY because the pruned harness never calls them.
 type shardedStore struct {
 	*pgstore.Store // shard 0: default receiver for non-routed methods
-	shards         [2]*pgstore.Store
+	shards         []*pgstore.Store
 }
 
-func newShardedStore(s0, s1 *pgstore.Store) *shardedStore {
-	return &shardedStore{Store: s0, shards: [2]*pgstore.Store{s0, s1}}
+func newShardedStore(stores ...*pgstore.Store) *shardedStore {
+	return &shardedStore{Store: stores[0], shards: stores}
+}
+
+// shardIdx routes by txid first byte modulo shard count (uniform for random
+// txids; workerID-derived genesis hashes distribute fine too).
+func (s *shardedStore) shardIdx(h *chainhash.Hash) int {
+	return int(h[0]) % len(s.shards)
 }
 
 func (s *shardedStore) shardFor(h *chainhash.Hash) *pgstore.Store {
-	return s.shards[h[0]>>7]
+	return s.shards[s.shardIdx(h)]
 }
 
 func (s *shardedStore) SetBlockHeight(h uint32) error {
-	if err := s.shards[0].SetBlockHeight(h); err != nil {
-		return err
+	for _, sh := range s.shards {
+		if err := sh.SetBlockHeight(h); err != nil {
+			return err
+		}
 	}
-	return s.shards[1].SetBlockHeight(h)
+	return nil
 }
 
 func (s *shardedStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
@@ -130,9 +139,10 @@ func (s *shardedStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 }
 
 func (s *shardedStore) SetLocked(ctx context.Context, hashes []chainhash.Hash, value bool) error {
-	var byShard [2][]chainhash.Hash
+	byShard := make([][]chainhash.Hash, len(s.shards))
 	for _, h := range hashes {
-		idx := h[0] >> 7
+		hh := h
+		idx := s.shardIdx(&hh)
 		byShard[idx] = append(byShard[idx], h)
 	}
 	for i := range byShard {
@@ -147,17 +157,17 @@ func (s *shardedStore) SetLocked(ctx context.Context, hashes []chainhash.Hash, v
 }
 
 func (s *shardedStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
-	var byShard [2][]*chainhash.Hash
+	perShard := make([][]*chainhash.Hash, len(s.shards))
 	for _, h := range hashes {
-		idx := h[0] >> 7
-		byShard[idx] = append(byShard[idx], h)
+		idx := s.shardIdx(h)
+		perShard[idx] = append(perShard[idx], h)
 	}
 	out := make(map[chainhash.Hash][]uint32, len(hashes))
-	for i := range byShard {
-		if len(byShard[i]) == 0 {
+	for i := range perShard {
+		if len(perShard[i]) == 0 {
 			continue
 		}
-		m, err := s.shards[i].SetMinedMulti(ctx, byShard[i], info)
+		m, err := s.shards[i].SetMinedMulti(ctx, perShard[i], info)
 		if err != nil {
 			return nil, err
 		}
@@ -168,35 +178,36 @@ func (s *shardedStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Ha
 	return out, nil
 }
 
-// GetPrunerService returns a service that drives BOTH shards' pruners.
+// GetPrunerService returns a service that drives ALL shards' pruners.
 func (s *shardedStore) GetPrunerService() (pruner.Service, error) {
-	p0, err := s.shards[0].GetPrunerService()
-	if err != nil {
-		return nil, err
+	services := make([]pruner.Service, len(s.shards))
+	for i, sh := range s.shards {
+		svc, err := sh.GetPrunerService()
+		if err != nil {
+			return nil, err
+		}
+		services[i] = svc
 	}
-	p1, err := s.shards[1].GetPrunerService()
-	if err != nil {
-		return nil, err
-	}
-	return &shardedPruner{services: [2]pruner.Service{p0, p1}}, nil
+	return &shardedPruner{services: services}, nil
 }
 
 type shardedPruner struct {
-	services [2]pruner.Service
+	services []pruner.Service
 }
 
 func (p *shardedPruner) Start(ctx context.Context) {
-	p.services[0].Start(ctx)
-	p.services[1].Start(ctx)
+	for _, svc := range p.services {
+		svc.Start(ctx)
+	}
 }
 
-// Prune runs both shards' prune slices IN PARALLEL — each shard's Prune is
+// Prune runs every shard's prune slice IN PARALLEL — each shard's Prune is
 // already internally bounded (one sweep slice + bounded delete batches).
 func (p *shardedPruner) Prune(ctx context.Context, blockHeight uint32, blockHash string) (int64, error) {
 	var wg sync.WaitGroup
-	var totals [2]int64
-	var errs [2]error
-	for i := 0; i < 2; i++ {
+	totals := make([]int64, len(p.services))
+	errs := make([]error, len(p.services))
+	for i := range p.services {
 		i := i
 		wg.Add(1)
 		go func() {
@@ -205,15 +216,21 @@ func (p *shardedPruner) Prune(ctx context.Context, blockHeight uint32, blockHash
 		}()
 	}
 	wg.Wait()
-	if errs[0] != nil {
-		return totals[0] + totals[1], errs[0]
+	var total int64
+	var firstErr error
+	for i := range p.services {
+		total += totals[i]
+		if errs[i] != nil && firstErr == nil {
+			firstErr = errs[i]
+		}
 	}
-	return totals[0] + totals[1], errs[1]
+	return total, firstErr
 }
 
 func (p *shardedPruner) AddObserver(o pruner.Observer) {
-	p.services[0].AddObserver(o)
-	p.services[1].AddObserver(o)
+	for _, svc := range p.services {
+		svc.AddObserver(o)
+	}
 }
 
 // TestThroughput_QueueStorePruned2Shard runs the EXACT pruned harness against
@@ -249,6 +266,36 @@ func TestThroughput_QueueStorePruned2Shard(t *testing.T) {
 
 		st := summarize(samples)
 		t.Logf("[Pruned 2-Shard] workers=%-6d median=%9.0f mean=%9.0f CV=%5.1f%% range=[%.0f, %.0f] n=%d%s",
+			w, st.median, st.mean, st.cv, st.min, st.max, st.n, unstableFlag(st.cv, cfg.unstableCV))
+	}
+}
+
+// TestThroughput_QueueStorePruned3Shard: same harness across THREE local
+// instances (5432/5433/5434). Probes whether a third WAL stream/checkpointer
+// still buys contention relief or whether total CPU is already the wall.
+func TestThroughput_QueueStorePruned3Shard(t *testing.T) {
+	terminateOtherConnections(t)
+	cfg := defaultStableCfg()
+
+	statPool, err := pgxpool.New(context.Background(), throughputDSN)
+	if err != nil {
+		t.Skipf("no postgres: %v", err)
+	}
+	defer statPool.Close()
+
+	for _, w := range cfg.workers {
+		s0, stop0 := newPrunedQueueStoreAt(t, throughputDSN)
+		s1, stop1 := newPrunedQueueStoreAt(t, throughputDSNShard2)
+		s2, stop2 := newPrunedQueueStoreAt(t, throughputDSNShard3)
+		sharded := newShardedStore(s0, s1, s2)
+
+		samples := runPrunedValidator(t, sharded, w, cfg, statPool)
+		stop0()
+		stop1()
+		stop2()
+
+		st := summarize(samples)
+		t.Logf("[Pruned 3-Shard] workers=%-6d median=%9.0f mean=%9.0f CV=%5.1f%% range=[%.0f, %.0f] n=%d%s",
 			w, st.median, st.mean, st.cv, st.min, st.max, st.n, unstableFlag(st.cv, cfg.unstableCV))
 	}
 }
