@@ -139,6 +139,19 @@ func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, 
 	if _, err := pgxTx.Exec(ctx, `SET LOCAL plan_cache_mode = force_custom_plan`); err != nil {
 		return 0, 0, errors.NewStorageError("[dahSweep] set local plan_cache_mode: %v", err)
 	}
+	// Hard server-side ceiling on each per-partition sweep transaction. The client
+	// context already carries a deadline, but a cancelled context does not reliably
+	// abort a backend already deep in a disk-bound scan — on an undersized box
+	// (DB >> shared_buffers, slow single disk) a stuck sweep generation can grind for
+	// hours while the next interval stacks another on top, saturating the disk in a
+	// self-reinforcing loop. A LOCAL statement_timeout makes Postgres self-abort the
+	// sweep server-side so a pathological partition cannot run away. Healthy bounded
+	// sweeps finish in ~hundreds of ms; 120s only ever trips a true runaway, with
+	// headroom for the cold-cache window right after a reset (before autoanalyze has
+	// sampled the fast-growing partitions).
+	if _, err := pgxTx.Exec(ctx, `SET LOCAL statement_timeout = '120s'`); err != nil {
+		return 0, 0, errors.NewStorageError("[dahSweep] set local statement_timeout: %v", err)
+	}
 
 	// Step 1: enumerate candidates only (BRIN height-range scans, bounded by
 	// limit) and pull the hashes back to the client. Splitting enumeration from
