@@ -101,7 +101,7 @@ func TestLegacyUnconfirmedParent_RealValidatorIntegration(t *testing.T) {
 
 	// Real validator: TxValidator + GoBDK inside, no mocks.
 	realValidator, err := validator.New(ctx, logger, tSettings, utxoStore,
-		kafka.NewKafkaAsyncProducerMock(), kafka.NewKafkaAsyncProducerMock(), nil, blockchainClient)
+		kafka.NewKafkaAsyncProducerMock(), kafka.NewKafkaAsyncProducerMock(), nil, nil, blockchainClient)
 	require.NoError(t, err)
 
 	// Parent in the store, unmined — BlockHeights empty: the wedge
@@ -126,7 +126,7 @@ func TestLegacyUnconfirmedParent_RealValidatorIntegration(t *testing.T) {
 
 	nilConsumer := &kafka.KafkaConsumerGroup{}
 
-	server, err := New(ctx, logger, tSettings, subtreeStore, txStore, utxoStore, realValidator, blockchainClient, nilConsumer, nilConsumer, nil)
+	server, err := New(ctx, logger, tSettings, subtreeStore, txStore, utxoStore, realValidator, blockchainClient, nilConsumer, nilConsumer, nil, nil)
 	require.NoError(t, err)
 
 	response, err := server.CheckSubtreeFromBlock(ctx, &subtreevalidation_api.CheckSubtreeFromBlockRequest{
