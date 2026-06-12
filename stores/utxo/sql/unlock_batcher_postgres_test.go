@@ -52,6 +52,10 @@ func setupPostgresStore(t *testing.T) (*Store, context.Context) {
 	tSettings.BatcherDrainMode = true // batcher fires immediately in tests
 	tSettings.UtxoStore.LockedBatcherSize = 64
 	tSettings.UtxoStore.LockedBatcherDurationMillis = 5
+	// Pin pruning mode: TestMinedThenSpendAllPrunes asserts default-mode
+	// deletion and must not flip when a developer's settings_local.conf sets
+	// pruner_utxoDefensiveEnabled=true.
+	tSettings.Pruner.UTXODefensiveEnabled = false
 
 	store, err := New(ctx, ulogger.TestLogger{}, tSettings, dbURL)
 	require.NoError(t, err)

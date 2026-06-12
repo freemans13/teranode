@@ -5506,6 +5506,18 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 
 	conflictingNodesPerSubtree := make([][]chainhash.Hash, totalSubtreesInBlock)
 
+	// Single-writer-per-bucket insert pipeline: the subtree goroutines below
+	// only deserialize and submit; each bucket is written by exactly one
+	// inserter worker, so the per-bucket mutex is never contended (the old
+	// shape — every subtree goroutine spawning one goroutine per bucket —
+	// serialized on the 1024 bucket mutexes and plateaued at ~15M inserts/s
+	// on a 192-core node).
+	// GOMAXPROCS(0), not NumCPU(): the inserter workers are CPU-bound, so size
+	// the pool to runnable parallelism. Under a cgroup CPU quota (the normal
+	// container/k8s deployment) NumCPU() reports host cores and would
+	// oversubscribe. Matches map.go and the errgroup limit at line ~2292.
+	inserter := newBucketInserter(transactionMap, runtime.GOMAXPROCS(0))
+
 	g, ctx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(stp.logger, g, concurrentSubtreeReads)
 
@@ -5569,19 +5581,8 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 				return errors.NewProcessingError("error deserializing subtree: %s", st.String(), err)
 			}
 
-			bucketG := errgroup.Group{}
-
-			for bucket, hashes := range txHashBuckets {
-				bucket := bucket
-				hashes := hashes
-				// put the hashes into the transaction map in parallel, it has already been split into the correct buckets
-				bucketG.Go(func() error {
-					return transactionMap.PutMultiBucket(bucket, hashes)
-				})
-			}
-
-			if err = bucketG.Wait(); err != nil {
-				return errors.NewProcessingError("error putting hashes into transaction map", err)
+			if err = inserter.submit(txHashBuckets); err != nil {
+				return errors.NewProcessingError("error submitting hashes to transaction map inserter", err)
 			}
 
 			conflictingNodesPerSubtree[subtreeIdx] = conflictingNodes
@@ -5590,9 +5591,25 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 		})
 	}
 
-	if err := g.Wait(); err != nil {
+	// closeAndWait must run even when g.Wait() errors: the inserter workers
+	// hold open channels and must be joined before the pooled map is reused.
+	// All submitters have returned once g.Wait() returns, so closing is safe.
+	err := g.Wait()
+	insertErr := inserter.closeAndWait()
+
+	if err != nil {
 		return nil, nil, errors.NewProcessingError("error getting subtrees", err)
 	}
+
+	if insertErr != nil {
+		return nil, nil, errors.NewProcessingError("error putting hashes into transaction map", insertErr)
+	}
+
+	// The map is fully built and has no further writers until the next
+	// block's Clear(): freeze it so the ~hundreds of millions of Exists
+	// probes in processRemainderTxHashes and dequeueDuringBlockMovement
+	// skip the per-bucket read lock.
+	transactionMap.Freeze()
 
 	conflictingNodesPerSubtreeCount := 0
 	for _, subtreeConflictingNodes := range conflictingNodesPerSubtree {
