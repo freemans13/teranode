@@ -860,8 +860,9 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		// UTXO store with empty BlockHeights (SetMinedMulti only runs after
 		// block acceptance), and the consensus-mode sentinel would make BDK
 		// reject the legitimate block with bad-txns-unconfirmed-input-in-block.
-		// This wedged testnet sync twice: at 1730003 during LEGACYSYNCING
-		// (the first post-checkpoint block with an in-block tx chain), and at
+		// This wedged testnet sync twice: at 1730003 while in the legacy-sync
+		// FSM state (since removed; catch-up now runs under CATCHINGBLOCKS —
+		// the first post-checkpoint block with an in-block tx chain), and at
 		// 1740437 during RUNNING — a node restarts with its FSM restored to
 		// RUNNING and catches up a few blocks over the legacy bridge
 		// (handleBlockMsg → HandleBlockDirect runs in every FSM state), so
@@ -905,12 +906,11 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 			return false, errors.NewProcessingError("[CheckSubtree] Failed to get FSM current state", err)
 		}
 
-		// During legacy syncing or catching up, disable adding transactions
-		// to block assembly (upstream behaviour, unchanged): bulk-history
-		// txs do not belong in our template. In RUNNING, assembly stays
-		// enabled so txs from a legacy-bridge tip block survive in the
-		// mempool if the block loses a reorg — also upstream behaviour.
-		if *currentState == blockchain.FSMStateLEGACYSYNCING || *currentState == blockchain.FSMStateCATCHINGBLOCKS {
+		// While catching up blocks, disable adding transactions to block
+		// assembly: bulk-history txs do not belong in our template. In
+		// RUNNING, assembly stays enabled so txs from a legacy-bridge tip
+		// block survive in the mempool if the block loses a reorg.
+		if *currentState == blockchain.FSMStateCATCHINGBLOCKS {
 			validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
 		}
 
@@ -1015,7 +1015,7 @@ func (u *Server) publishInvalidSubtree(ctx context.Context, subtreeHash, peerURL
 			return
 		}
 
-		if *state == blockchain_api.FSMStateType_CATCHINGBLOCKS || *state == blockchain_api.FSMStateType_LEGACYSYNCING {
+		if *state == blockchain_api.FSMStateType_CATCHINGBLOCKS {
 			// ignore notifications while syncing or catching up
 			return
 		}
