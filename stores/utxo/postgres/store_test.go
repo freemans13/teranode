@@ -1425,7 +1425,9 @@ func TestProcessExpiredPreservations(t *testing.T) {
 func TestPrunerService(t *testing.T) {
 	store, ctx := setupTestStore(t)
 
-	// Create a tx and set delete_at_height.
+	// Create a tx and set delete_at_height. The pruner trusts the stamp (it does
+	// no eligibility re-check — keeping the delete path lightweight is critical to
+	// reclaim throughput), so a stamped tx is deleted at the prune height.
 	tx := testExtendedTx(t)
 	_, err := store.Create(ctx, tx, 100)
 	require.NoError(t, err)

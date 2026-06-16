@@ -44,6 +44,7 @@ type postgresPrunerService struct {
 	mu            sync.Mutex
 	cursorStarted bool
 	cursorCancel  context.CancelFunc
+	cursorWg      sync.WaitGroup // tracks runDAHCursor so stop() can wait it out
 }
 
 var _ pruner.Service = (*postgresPrunerService)(nil)
@@ -65,12 +66,16 @@ func (s *postgresPrunerService) Start(_ context.Context) {
 	s.cursorStarted = true
 	cursorCtx, cancel := context.WithCancel(context.Background())
 	s.cursorCancel = cancel
+	s.cursorWg.Add(1)
 	s.mu.Unlock()
 	s.logger.Infof("[PostgresPrunerService] starting DAH cursor (Worker 2)")
 	go s.runDAHCursor(cursorCtx)
 }
 
-// stop cancels the background DAH cursor if it is running. Idempotent.
+// stop cancels the background DAH cursor and WAITS for it to exit before
+// returning, so a subsequent pool.Close() (from Store.Stop/Close) cannot race an
+// in-flight sweep transaction into a use-after-close. Idempotent: a second call
+// finds a nil cancel and waits on an already-zero WaitGroup.
 func (s *postgresPrunerService) stop() {
 	s.mu.Lock()
 	cancel := s.cursorCancel
@@ -79,6 +84,7 @@ func (s *postgresPrunerService) stop() {
 	if cancel != nil {
 		cancel()
 	}
+	s.cursorWg.Wait()
 }
 
 // AddObserver adds an observer to be notified when pruning completes.
@@ -218,6 +224,14 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	// (same MODULUS); we loop until a batch comes back short. Previously the initial
 	// SELECT accumulated EVERY tombstoned hash into a [][]byte before any delete —
 	// millions of rows per partition (×8 partitions) could OOM the node.
+	//
+	// The pruner is intentionally LIGHTWEIGHT: it trusts delete_at_height and does
+	// no per-row re-validation. The stamp is authoritative — it is the DAH SETTERS'
+	// job to only ever set delete_at_height on a tx that is genuinely safe to drop
+	// (the sweep checks mined + fully-spent + on-longest-chain + not-preserved;
+	// MarkTransactionsOnLongestChain(false) and Unspend CLEAR the stamp when a tx
+	// leaves the longest chain or is revived). Keeping the delete path a plain
+	// index range delete is critical to reclaim throughput.
 	//
 	// The doomed CTE applies the delete_at_height predicate in the SAME statement
 	// and snapshot as the DELETE, so a concurrent reorg Unspend that clears the

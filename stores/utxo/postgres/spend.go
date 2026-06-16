@@ -431,6 +431,19 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	}
 	rows.Close()
 
+	// A mid-stream error (statement_timeout, server reset, network drop) makes
+	// rows.Next() stop early with the error parked in rows.Err(). Without this
+	// check the partially-filled resultMap would dispatch TxNotFound to every
+	// not-yet-received item — silently turning a transient DB failure into a false
+	// "output not found" success. Surface it as a storage error to all items
+	// instead (the caller decides whether to retry), matching the scan-error path.
+	if err := rows.Err(); err != nil {
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] bulk rows iteration", err)
+		}
+		return false
+	}
+
 	for i, item := range batch {
 		spend := item.spend
 		r, found := resultMap[i]

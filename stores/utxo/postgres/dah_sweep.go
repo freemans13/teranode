@@ -386,6 +386,7 @@ func (s *Store) dahSafeTip(lag int64) int64 {
 // rows are touched, then sleeps until the next tick. The loop exits cleanly
 // when ctx is cancelled.
 func (s *postgresPrunerService) runDAHCursor(ctx context.Context) {
+	defer s.cursorWg.Done() // let stop() wait for this goroutine to fully exit
 	cfg := s.store.settings.UtxoStore
 	batch := cfg.PostgresDAHSweepBatchSize
 	if batch <= 0 {
