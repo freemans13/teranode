@@ -125,8 +125,8 @@ type resetBlocks struct {
 	// responseCh receives the reset operation response
 	responseCh chan ResetResponse
 
-	// isLegacySync indicates whether this is a legacy synchronization operation
-	isLegacySync bool
+	// useFastForwardReset indicates whether to use fast-forward reset (coinbase-only UTXO processing) for checkpoint-trusted blocks
+	useFastForwardReset bool
 
 	// postProcess is an optional function to execute after the reset
 	postProcess func() error
@@ -828,7 +828,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					stp.setCurrentRunningState(StateResetBlocks)
 
 					err = stp.reset(resetBlocksMsg.blockHeader, resetBlocksMsg.moveBackBlocks, resetBlocksMsg.moveForwardBlocks,
-						resetBlocksMsg.isLegacySync, resetBlocksMsg.postProcess)
+						resetBlocksMsg.useFastForwardReset, resetBlocksMsg.postProcess)
 
 					if resetBlocksMsg.responseCh != nil {
 						resetBlocksMsg.responseCh <- ResetResponse{Err: err}
@@ -1186,26 +1186,26 @@ func (stp *SubtreeProcessor) GetCurrentLength() int {
 //   - blockHeader: New block header to reset to
 //   - moveBackBlocks: Blocks to move down in the chain
 //   - moveForwardBlocks: Blocks to move up in the chain
-//   - isLegacySync: Whether this is a legacy sync operation
+//   - useFastForwardReset: Whether to use fast-forward reset (coinbase-only UTXO processing) for checkpoint-trusted blocks
 //
 // Returns:
 //   - ResetResponse: Response containing any errors encountered
-func (stp *SubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool, postProcess func() error) ResetResponse {
+func (stp *SubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, useFastForwardReset bool, postProcess func() error) ResetResponse {
 	responseCh := make(chan ResetResponse)
 	stp.resetCh <- &resetBlocks{
-		blockHeader:       blockHeader,
-		moveBackBlocks:    moveBackBlocks,
-		moveForwardBlocks: moveForwardBlocks,
-		responseCh:        responseCh,
-		isLegacySync:      isLegacySync,
-		postProcess:       postProcess,
+		blockHeader:         blockHeader,
+		moveBackBlocks:      moveBackBlocks,
+		moveForwardBlocks:   moveForwardBlocks,
+		responseCh:          responseCh,
+		useFastForwardReset: useFastForwardReset,
+		postProcess:         postProcess,
 	}
 
 	return <-responseCh
 }
 
 func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block,
-	isLegacySync bool, postProcess func() error) error {
+	useFastForwardReset bool, postProcess func() error) error {
 	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(context.Background(), "reset",
 		tracing.WithParentStat(stp.stats),
 		tracing.WithHistogram(prometheusSubtreeProcessorReset),
@@ -1319,8 +1319,8 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		_ = g.Wait()
 	}
 
-	// optimized version for legacy sync
-	if isLegacySync {
+	// fast-forward reset: coinbase-only UTXO processing for checkpoint-trusted blocks
+	if useFastForwardReset {
 		coinbaseTxsAdded := sync.Map{}
 
 		g, gCtx := errgroup.WithContext(context.Background())
@@ -1354,7 +1354,11 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		// Mark processed_at for all blocks. For intermediate blocks use a lightweight
 		// direct SetBlockProcessedAt call to avoid running adjustSubtreeSize and
 		// updatePrecomputedMiningData on stale stats repeatedly during fast-forward.
-		// Only the final block gets full finalizeBlockProcessing.
+		// Only the final block gets full finalizeBlockProcessing. This is intentional
+		// and safe in the fast-forward path (callers gate it on checkpoint-trusted
+		// blocks): per-block precomputed-mining-data is irrelevant while catching up,
+		// only the resulting tip needs the full refresh. Do not "fix" by finalizing
+		// every block — that reintroduces the per-block cost this path avoids.
 		for i, block := range moveForwardBlocks {
 			if i < len(moveForwardBlocks)-1 {
 				if err := stp.blockchainClient.SetBlockProcessedAt(ctx, block.Header.Hash()); err != nil {
@@ -1426,8 +1430,11 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 
 		// Mark processed_at for all blocks. For intermediate blocks use a lightweight
 		// direct SetBlockProcessedAt call to avoid running adjustSubtreeSize and
-		// updatePrecomputedMiningData on stale stats repeatedly during fast-forward.
-		// Only the final block gets full finalizeBlockProcessing.
+		// updatePrecomputedMiningData on stale stats repeatedly while moving forward.
+		// Only the final block gets full finalizeBlockProcessing. This applies to all
+		// resets regardless of checkpoint trust: per-block precomputed-mining-data is
+		// irrelevant mid-reset, only the resulting tip needs the full refresh. Do not
+		// "fix" by finalizing every block — that reintroduces the per-block cost.
 		for i, block := range moveForwardBlocks {
 			if i < len(moveForwardBlocks)-1 {
 				if err := stp.blockchainClient.SetBlockProcessedAt(ctx, block.Header.Hash()); err != nil {

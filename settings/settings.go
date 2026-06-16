@@ -358,6 +358,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseCatchupWhenBehind:         getBool("blockvalidation_useCatchupWhenBehind", false, alternativeContext...),
 			CatchupConcurrency:           getInt("blockvalidation_catchupConcurrency", max(4, runtime.NumCPU()/2), alternativeContext...),
 			CatchupMaxRetries:            getInt("blockvalidation_catchup_max_retries", 3, alternativeContext...),
+			CatchupMaxAttemptsPerBlock:   getInt("blockvalidation_catchup_max_attempts_per_block", 5, alternativeContext...),
 			CatchupIterationTimeout:      getInt("blockvalidation_catchup_iteration_timeout", 30, alternativeContext...),
 			CatchupOperationTimeout:      getInt("blockvalidation_catchup_operation_timeout", 300, alternativeContext...),
 			CatchupMaxAccumulatedHeaders: getInt("blockvalidation_max_accumulated_headers", 100000, alternativeContext...),
