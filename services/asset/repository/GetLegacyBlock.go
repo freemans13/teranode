@@ -129,6 +129,14 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 							break
 						}
 
+						// Close the underlying reader before returning so the file-store
+						// read permit held by the semaphoreReadCloser is released, and
+						// close the pipe so the consumer's Read returns instead of
+						// hanging forever waiting for bytes that will never arrive.
+						_ = subtreeDataReader.Close()
+						_ = w.CloseWithError(io.ErrClosedPipe)
+						_ = r.CloseWithError(err)
+
 						return errors.NewProcessingError("error reading transaction: %s", err)
 					}
 
@@ -142,6 +150,9 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 
 					// Write the normal transaction bytes to the writer
 					if _, err = tx.WriteTo(w); err != nil {
+						// Close the underlying reader so the file-store read permit
+						// is released. The pipe close below already wakes the consumer.
+						_ = subtreeDataReader.Close()
 						_ = w.CloseWithError(io.ErrClosedPipe)
 						_ = r.CloseWithError(err)
 
@@ -353,7 +364,7 @@ func (repo *Repository) scheduleSubtreeChunkFetches(ctx context.Context, subtree
 	defer cancel()
 
 	g, gCtx := errgroup.WithContext(fetchCtx)
-	util.SafeSetLimit(g, concurrency)
+	util.SafeSetLimit(repo.logger, g, concurrency)
 
 	var readErr error
 	for chunkIdx, offset := 0, 0; offset < totalTxs; chunkIdx, offset = chunkIdx+1, offset+chunkSize {
@@ -503,7 +514,7 @@ func (repo *Repository) getTxs(ctx context.Context, txHashes []chainhash.Hash, t
 	processSubtreeConcurrency := repo.settings.BlockValidation.ProcessTxMetaUsingStoreConcurrency
 
 	g, gCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(g, processSubtreeConcurrency)
+	util.SafeSetLimit(repo.logger, g, processSubtreeConcurrency)
 
 	var missed atomic.Int32
 

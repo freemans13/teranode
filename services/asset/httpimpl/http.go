@@ -40,6 +40,7 @@ type HTTP struct {
 	logger              ulogger.Logger
 	settings            *settings.Settings
 	repository          repository.Interface
+	mainChainCache      *mainChainCache
 	blockAssemblyClient blockassembly.ClientI
 	e                   *echo.Echo
 	startTime           time.Time
@@ -268,6 +269,17 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 
 	if len(blockAssemblyClient) > 0 && blockAssemblyClient[0] != nil {
 		h.blockAssemblyClient = blockAssemblyClient[0]
+	}
+
+	// In-process cache for main-chain membership lookups. Avoids a gRPC
+	// round-trip on every /merkle_proof and /txmeta request: a window of the
+	// last GlobalBlockHeightRetention main-chain block IDs is rebuilt on each
+	// block notification and answers in-window lookups authoritatively; older
+	// blocks use a lazily-filled fallback. Falls back to direct gRPC at the
+	// call sites if the cache is nil (e.g. tests that construct HTTP without
+	// a blockchain client).
+	if repo != nil && repo.BlockchainClient != nil {
+		h.mainChainCache = newMainChainCache(repo.BlockchainClient, logger, tSettings.GlobalBlockHeightRetention)
 	}
 
 	// add the private key for signing responses
@@ -575,6 +587,15 @@ func (h *HTTP) Start(ctx context.Context, addr string) error {
 	for _, rl := range h.rateLimiters {
 		rl.StartCleanup(ctx)
 	}
+	if h.mainChainCache != nil {
+		if err := h.mainChainCache.Start(ctx); err != nil {
+			// Non-fatal: nil the cache so call sites fall back to direct gRPC.
+			// Leaving it non-nil would serve stale data forever — consume() never
+			// started, so no invalidation will ever fire.
+			h.logger.Warnf("[Asset] failed to start main-chain cache, falling back to direct gRPC: %v", err)
+			h.mainChainCache = nil
+		}
+	}
 
 	mode := "HTTPS"
 	if level := h.settings.SecurityLevelHTTP; level == 0 {
@@ -734,8 +755,19 @@ func accessLogMiddleware(logger ulogger.Logger) echo.MiddlewareFunc {
 			// RequestURI is intentionally omitted to keep query-string values out
 			// of the access log; any future endpoint adding sensitive query
 			// parameters won't accidentally leak them here.
-			logger.Infof("[Asset_http] %s %s client_ip=%s status=%d duration=%v size=%d tier=%s",
-				method, path, ip, status, duration, size, tier)
+			//
+			// Level is chosen by status so healthy traffic (2xx/3xx, including the
+			// high-frequency /health probes) stays at DEBUG and does not flood the
+			// logs; only client (4xx) and server (5xx) errors surface by default.
+			const logFmt = "[Asset_http] %s %s client_ip=%s status=%d duration=%v size=%d tier=%s"
+			switch {
+			case status >= 500:
+				logger.Errorf(logFmt, method, path, ip, status, duration, size, tier)
+			case status >= 400:
+				logger.Warnf(logFmt, method, path, ip, status, duration, size, tier)
+			default:
+				logger.Debugf(logFmt, method, path, ip, status, duration, size, tier)
+			}
 
 			return nil
 		}
