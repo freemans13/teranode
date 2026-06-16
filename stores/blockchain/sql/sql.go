@@ -476,6 +476,7 @@ var (
 		"idx_inserted_at",
 		"idx_invalid_height",
 		"idx_on_main_chain_height",
+		"idx_off_main_chain",
 	}
 )
 
@@ -806,6 +807,21 @@ func createPostgresSchemaUnlocked(db *usql.DB, withIndexes bool) error {
 			_ = db.Close()
 			return errors.NewStorageError("could not create idx_on_main_chain_height index", err)
 		}
+
+		// === OFF-CHAIN INDEX ===
+		// Partial index for the off-chain (fork/orphan) block lookup that rebuildOffChainSet's
+		// fast path runs: "SELECT id FROM blocks WHERE on_main_chain = false". Without an index
+		// for the false case (the existing idx_on_main_chain_height only covers true), that query
+		// is a full sequential scan of the entire blocks table. On a large, disk-bound node this
+		// is expensive and recurs on every fork/invalidation plus the periodic refresh — observed
+		// on testnet at ~627k blocks as a 634 MB seq scan that returns 0 rows and competes with
+		// block-validation reads. Scoping the index to on_main_chain = false keeps it tiny: it
+		// holds only the off-chain blocks (typically a few hundred across all of mainnet history,
+		// often zero), never the ~99% of rows that are on the main chain.
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_off_main_chain ON blocks (id) WHERE on_main_chain = false;`); err != nil {
+			_ = db.Close()
+			return errors.NewStorageError("could not create idx_off_main_chain index", err)
+		}
 	}
 
 	if _, err := db.Exec(`
@@ -1101,6 +1117,21 @@ func createSqliteSchema(db *usql.DB) error {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_on_main_chain_height ON blocks (height ASC) WHERE on_main_chain = true;`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not create idx_on_main_chain_height index", err)
+	}
+
+	// === OFF-CHAIN INDEX ===
+	// Partial index for the off-chain (fork/orphan) block lookup that rebuildOffChainSet's
+	// fast path runs: "SELECT id FROM blocks WHERE on_main_chain = false". Without an index
+	// for the false case (the existing idx_on_main_chain_height only covers true), that query
+	// is a full sequential scan of the entire blocks table. On a large, disk-bound node this
+	// is expensive and recurs on every fork/invalidation plus the periodic refresh — observed
+	// on testnet at ~627k blocks as a 634 MB seq scan that returns 0 rows and competes with
+	// block-validation reads. Scoping the index to on_main_chain = false keeps it tiny: it
+	// holds only the off-chain blocks (typically a few hundred across all of mainnet history,
+	// often zero), never the ~99% of rows that are on the main chain.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_off_main_chain ON blocks (id) WHERE on_main_chain = false;`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create idx_off_main_chain index", err)
 	}
 
 	if _, err := db.Exec(`
