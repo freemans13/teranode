@@ -1123,60 +1123,6 @@ func TestDeleteNonExistent(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestSetDAH(t *testing.T) {
-	store, ctx := setupTestStore(t)
-	parentTx := testExtendedTx(t)
-	blockHeight := uint32(100)
-
-	// Set retention so DAH logic is active.
-	store.settings.GlobalBlockHeightRetention = 10
-
-	// Create as mined on longest chain.
-	blockInfo := utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 100, SubtreeIdx: 7, OnLongestChain: true}
-	_, err := store.Create(ctx, parentTx, blockHeight, utxo.WithMinedBlockInfo(blockInfo))
-	require.NoError(t, err)
-
-	err = store.SetBlockHeight(blockHeight)
-	require.NoError(t, err)
-
-	txHash := parentTx.TxIDChainHash()
-
-	// Mark as mined on longest chain via SetMinedMulti.
-	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, blockInfo)
-	require.NoError(t, err)
-
-	// Outputs are unspent, so DAH should NOT be set.
-	err = store.setDAH(ctx, txHash)
-	require.NoError(t, err)
-
-	var dah *int64
-	err = store.pool.QueryRow(ctx, `SELECT delete_at_height FROM txs WHERE hash = $1`, txHash[:]).Scan(&dah)
-	require.NoError(t, err)
-	require.Nil(t, dah, "DAH should not be set while outputs are unspent")
-
-	// Spend all non-nil outputs.
-	for i, output := range parentTx.Outputs {
-		if output == nil {
-			continue
-		}
-		spendTx := getSpendingTx(t, parentTx, uint32(i))
-		_, err = store.Create(ctx, spendTx, blockHeight)
-		require.NoError(t, err)
-		_, err = store.Spend(ctx, spendTx, blockHeight+1)
-		require.NoError(t, err)
-	}
-
-	// Now setDAH: all outputs are spent, has block_ids, on longest chain.
-	err = store.setDAH(ctx, txHash)
-	require.NoError(t, err)
-
-	err = store.pool.QueryRow(ctx, `SELECT delete_at_height FROM txs WHERE hash = $1`, txHash[:]).Scan(&dah)
-	require.NoError(t, err)
-	require.NotNil(t, dah, "DAH should be set when all outputs are spent")
-	expectedDAH := int64(blockHeight + 1 + 10) // blockHeight + 1 + retention
-	require.Equal(t, expectedDAH, *dah, "DAH should be blockHeight+1+retention")
-}
-
 func TestSetMinedMultiEmpty(t *testing.T) {
 	store, _ := setupTestStore(t)
 

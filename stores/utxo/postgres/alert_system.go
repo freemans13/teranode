@@ -88,6 +88,12 @@ func (s *Store) freezeRejectReason(ctx context.Context, spend *utxo.Spend) error
 		WHERE t.hash = $1 AND $2::int < t.out_count
 	`, spend.TxID[:], spend.Vout).Scan(&outputFrozen, &spendingData)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No row means the tx does not exist, or the vout is out of range — either
+			// way the UTXO does not exist. Report TxNotFound (not an opaque storage
+			// error) so callers can distinguish "absent" from "storage failure".
+			return errors.NewTxNotFoundError("[FreezeUTXOs] output not found %s:%d", spend.TxID, spend.Vout)
+		}
 		return errors.NewStorageError("[FreezeUTXOs] output lookup failed for %s:%d", spend.TxID, spend.Vout, err)
 	}
 

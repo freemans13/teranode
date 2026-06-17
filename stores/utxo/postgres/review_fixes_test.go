@@ -140,3 +140,19 @@ func TestUnsetMinedClearsDAH(t *testing.T) {
 	require.Nil(t, dahAfter, "unset-mined must clear delete_at_height so the tx is not pruned")
 	require.NotNil(t, unminedSince, "unset-mined with no remaining block_ids must set unmined_since")
 }
+
+// TestFreezeUTXOsAbsentTxReturnsTxNotFound is a regression test: freezing an output of
+// a transaction that does not exist (or an out-of-range vout) must report ErrTxNotFound,
+// so callers can distinguish "the UTXO does not exist" from "the store failed", rather
+// than the opaque storage error returned before.
+func TestFreezeUTXOsAbsentTxReturnsTxNotFound(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	var txid, uh chainhash.Hash
+	txid[0] = 0xAB // a transaction that was never created
+	err := store.FreezeUTXOs(ctx, []*utxo.Spend{
+		{TxID: &txid, Vout: 0, UTXOHash: &uh},
+	}, nil)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "absent tx must yield ErrTxNotFound, got: %v", err)
+}
