@@ -1034,6 +1034,11 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 // ProcessExpiredPreservations handles transactions whose preservation period has expired.
 // For each transaction with PreserveUntil <= currentHeight, it sets an appropriate DeleteAtHeight
 // and clears the PreserveUntil field.
+//
+// PREREQUISITE: the range query below relies on a NUMERIC secondary index over the PreserveUntil
+// bin. The store does not create it (this method is not yet wired into the live pruner cycle), and
+// the test creates it explicitly. When this is wired in, that index MUST be created at startup —
+// otherwise the query fails or degrades to a full set scan. Track this on the wiring follow-up.
 func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
 	// Create a query to find records with expired PreserveUntil
 	stmt := aerospike.NewStatement(s.namespace, s.setName)

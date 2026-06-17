@@ -5336,6 +5336,11 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 
 	deleteAtHeight := currentHeight + retention
 
+	// The conflicting branch writes $1 unconditionally rather than preserving an existing DAH the
+	// way setDAH does (COALESCE). That is intentional and safe here, NOT a bug to "fix": every row
+	// matched by the WHERE clause has preserve_until set, and a preserved row always has a NULL
+	// delete_at_height (PreserveTransactions clears it at preserve time, and setDAH/the expression
+	// path both skip preserved rows), so there is never an existing conflicting DAH to keep.
 	query := `
 		UPDATE transactions
 		SET delete_at_height = CASE
