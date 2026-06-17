@@ -291,6 +291,23 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 						s.logger.Errorf("Failed to create unminedSinceIndex: %v", err)
 					}
 				}
+
+				// Required by ProcessExpiredPreservations' range query over PreserveUntil (pruner Phase 1b).
+				preserveUntilIndexName := "preserveUntilIndex"
+
+				exists, err = s.indexExists(preserveUntilIndexName)
+				if err != nil {
+					s.logger.Errorf("Failed to check preserveUntilIndex existence: %v", err)
+					return
+				}
+
+				if !exists {
+					// Only one process should try to create the index
+					err := s.CreateIndexIfNotExists(ctx, preserveUntilIndexName, fields.PreserveUntil.String(), aerospike.NUMERIC)
+					if err != nil {
+						s.logger.Errorf("Failed to create preserveUntilIndex: %v", err)
+					}
+				}
 			}
 		})
 	}

@@ -30,13 +30,9 @@ func TestProcessExpiredPreservations(t *testing.T) {
 	client, store, ctx, deferFn := initAerospike(t, tSettings, logger)
 	defer deferFn()
 
-	// ProcessExpiredPreservations selects expired records via a secondary index on preserveUntil.
-	// The store does not create this index itself (the method is not yet wired into the pruner
-	// cycle), so create it explicitly for the test.
-	writePolicy := aerospike.NewWritePolicy(0, 0)
-	_, err := client.CreateIndex(writePolicy, store.GetNamespace(), store.GetName(),
-		"test_preserveUntilIndex", fields.PreserveUntil.String(), aerospike.NUMERIC)
-	require.NoError(t, err)
+	// ProcessExpiredPreservations selects expired records via a NUMERIC secondary index on
+	// preserveUntil. The store creates this index at startup (see New's indexOnce block), built in
+	// the background — processExpiryUntilProcessed retries to absorb the index-build lag.
 
 	const currentHeight = uint32(200)
 	retention := tSettings.GetUtxoStoreBlockHeightRetention()
