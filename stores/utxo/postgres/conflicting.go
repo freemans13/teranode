@@ -332,10 +332,11 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 			// Leaving the longest chain: also CLEAR any deferred-prune stamp. The
 			// stamp was computed for the tx as mined-and-fully-spent ON THE OLD chain;
 			// it must not survive to let the pruner delete a tx that is no longer on
-			// the longest chain. The sweep re-stamps if/when it rejoins. (The pruner's
-			// eligibility gate also excludes unmined_since IS NOT NULL rows, so this
-			// is belt-and-braces — but clearing here avoids leaving stale stamps that
-			// the pruner would otherwise re-evaluate every cycle.)
+			// the longest chain. This clear is LOAD-BEARING, not belt-and-braces: the
+			// pruner trusts delete_at_height and does NOT re-check on-longest-chain at
+			// delete time (see the DESIGN CONTRACT in deleteTombstonedPartition), so a
+			// stale stamp left here would let a reorged-out tx be deleted. The sweep
+			// re-stamps if/when it rejoins the longest chain.
 			inClause, inArgs := buildINClauseLocal(chunk, 2)
 			q = fmt.Sprintf(`UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s`, inClause)
 			args = append([]interface{}{int32(currentBlockHeight)}, inArgs...) // unmined_since is INT4

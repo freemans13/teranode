@@ -1369,57 +1369,117 @@ func TestReAssignUTXO(t *testing.T) {
 // Task 11 tests: Preservation + Pruner
 // ---------------------------------------------------------------------------
 
+// TestPreserveTransactions verifies the prune-eligibility gate: PreserveTransactions
+// only preserves txs that are actually at risk of pruning — those already carrying a
+// delete_at_height stamp, or already preserved. A not-fully-spent tx (no DAH) is not at
+// risk and is skipped, keeping it out of the preservation/expiry path.
 func TestPreserveTransactions(t *testing.T) {
-	store, ctx := setupTestStore(t)
+	t.Run("eligible_stamped_tx_is_preserved", func(t *testing.T) {
+		store, ctx := setupTestStore(t)
 
-	tx := testExtendedTx(t)
-	_, err := store.Create(ctx, tx, 100)
-	require.NoError(t, err)
+		tx := testExtendedTx(t)
+		_, err := store.Create(ctx, tx, 100)
+		require.NoError(t, err)
+		hash := tx.TxIDChainHash()
 
-	txHash := *tx.TxIDChainHash()
+		// Simulate the sweep having stamped it (i.e. it is prune-eligible).
+		_, err = store.pool.Exec(ctx, `UPDATE txs SET delete_at_height = 999 WHERE hash = $1`, hash[:])
+		require.NoError(t, err)
 
-	// Preserve until height 500.
-	err = store.PreserveTransactions(ctx, []chainhash.Hash{txHash}, 500)
-	require.NoError(t, err)
+		require.NoError(t, store.PreserveTransactions(ctx, []chainhash.Hash{*hash}, 500))
 
-	// Verify.
-	var preserveUntil *int64
-	var dah *int64
-	err = store.pool.QueryRow(ctx,
-		`SELECT preserve_until, delete_at_height FROM txs WHERE hash = $1`,
-		txHash[:]).Scan(&preserveUntil, &dah)
-	require.NoError(t, err)
-	require.NotNil(t, preserveUntil)
-	require.Equal(t, int64(500), *preserveUntil)
-	require.Nil(t, dah, "delete_at_height should be cleared")
+		var preserveUntil, dah *int64
+		require.NoError(t, store.pool.QueryRow(ctx,
+			`SELECT preserve_until, delete_at_height FROM txs WHERE hash = $1`, hash[:]).Scan(&preserveUntil, &dah))
+		require.NotNil(t, preserveUntil)
+		require.Equal(t, int64(500), *preserveUntil)
+		require.Nil(t, dah, "delete_at_height should be cleared on preserve")
+	})
+
+	t.Run("ineligible_not_at_risk_tx_is_not_preserved", func(t *testing.T) {
+		store, ctx := setupTestStore(t)
+
+		tx := testExtendedTx(t)
+		_, err := store.Create(ctx, tx, 100) // unmined + unspent: no DAH, not at risk
+		require.NoError(t, err)
+		hash := tx.TxIDChainHash()
+
+		require.NoError(t, store.PreserveTransactions(ctx, []chainhash.Hash{*hash}, 500))
+
+		var preserveUntil, dah *int64
+		require.NoError(t, store.pool.QueryRow(ctx,
+			`SELECT preserve_until, delete_at_height FROM txs WHERE hash = $1`, hash[:]).Scan(&preserveUntil, &dah))
+		require.Nil(t, preserveUntil, "not-fully-spent tx (no DAH) must not be preserved")
+		require.Nil(t, dah)
+	})
 }
 
+// TestProcessExpiredPreservations verifies the invariant that delete_at_height is set
+// only when a tx is genuinely safe to drop (conflicting, or mined + fully-spent + on the
+// longest chain). On expiry preserve_until is always cleared; the DAH stamp is gated.
+// preserve_until is injected directly so the expiry logic is exercised in isolation from
+// PreserveTransactions' own gate.
 func TestProcessExpiredPreservations(t *testing.T) {
-	store, ctx := setupTestStore(t)
+	injectExpiredPreserve := func(ctx context.Context, t *testing.T, store *Store, hash []byte) {
+		t.Helper()
+		_, err := store.pool.Exec(ctx,
+			`UPDATE txs SET preserve_until = 50, delete_at_height = NULL WHERE hash = $1`, hash)
+		require.NoError(t, err)
+	}
+	read := func(ctx context.Context, t *testing.T, store *Store, hash []byte) (preserveUntil, dah *int64) {
+		t.Helper()
+		require.NoError(t, store.pool.QueryRow(ctx,
+			`SELECT preserve_until, delete_at_height FROM txs WHERE hash = $1`, hash).Scan(&preserveUntil, &dah))
+		return
+	}
 
-	tx := testExtendedTx(t)
-	_, err := store.Create(ctx, tx, 100)
-	require.NoError(t, err)
+	t.Run("ineligible_unmined_unspent_tx_is_not_stamped", func(t *testing.T) {
+		store, ctx := setupTestStore(t)
+		tx := testExtendedTx(t)
+		_, err := store.Create(ctx, tx, 100)
+		require.NoError(t, err)
+		hash := tx.TxIDChainHash()[:]
+		injectExpiredPreserve(ctx, t, store, hash)
 
-	txHash := *tx.TxIDChainHash()
+		require.NoError(t, store.ProcessExpiredPreservations(ctx, 100))
 
-	// Preserve until height 50.
-	err = store.PreserveTransactions(ctx, []chainhash.Hash{txHash}, 50)
-	require.NoError(t, err)
+		preserveUntil, dah := read(ctx, t, store, hash)
+		require.Nil(t, preserveUntil, "preserve_until must be cleared")
+		require.Nil(t, dah, "unmined/unspent tx must NOT be stamped for deletion")
+	})
 
-	// Process at height 100 -- should expire the preservation.
-	err = store.ProcessExpiredPreservations(ctx, 100)
-	require.NoError(t, err)
+	t.Run("eligible_mined_fully_spent_tx_is_stamped", func(t *testing.T) {
+		store, ctx := setupTestStore(t)
+		parent := newMinedSingleOutputTx(t, store, 100)
+		spendAllOutputs(t, store, parent, 101)
+		hash := parent.TxIDChainHash()[:]
+		injectExpiredPreserve(ctx, t, store, hash)
 
-	// Verify: preserve_until should be nil, delete_at_height should be set.
-	var preserveUntil *int64
-	var dah *int64
-	err = store.pool.QueryRow(ctx,
-		`SELECT preserve_until, delete_at_height FROM txs WHERE hash = $1`,
-		txHash[:]).Scan(&preserveUntil, &dah)
-	require.NoError(t, err)
-	require.Nil(t, preserveUntil, "preserve_until should be cleared")
-	require.NotNil(t, dah, "delete_at_height should be set")
+		require.NoError(t, store.ProcessExpiredPreservations(ctx, 100))
+
+		preserveUntil, dah := read(ctx, t, store, hash)
+		require.Nil(t, preserveUntil, "preserve_until must be cleared")
+		require.NotNil(t, dah, "eligible (mined + fully-spent) tx must be stamped for deletion")
+		require.Equal(t, int64(100)+int64(store.settings.GetUtxoStoreBlockHeightRetention()), *dah)
+	})
+
+	t.Run("conflicting_tx_is_stamped_without_being_mined", func(t *testing.T) {
+		store, ctx := setupTestStore(t)
+		tx := testExtendedTx(t)
+		_, err := store.Create(ctx, tx, 100) // unmined
+		require.NoError(t, err)
+		hash := tx.TxIDChainHash()[:]
+		_, err = store.pool.Exec(ctx, `UPDATE txs SET conflicting = true WHERE hash = $1`, hash)
+		require.NoError(t, err)
+		injectExpiredPreserve(ctx, t, store, hash)
+
+		require.NoError(t, store.ProcessExpiredPreservations(ctx, 100))
+
+		preserveUntil, dah := read(ctx, t, store, hash)
+		require.Nil(t, preserveUntil, "preserve_until must be cleared")
+		require.NotNil(t, dah, "conflicting tx must be stamped even without being mined")
+		require.Equal(t, int64(100)+int64(store.settings.GetUtxoStoreBlockHeightRetention()), *dah)
+	})
 }
 
 func TestPrunerService(t *testing.T) {

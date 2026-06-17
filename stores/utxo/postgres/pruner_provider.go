@@ -225,19 +225,41 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	// SELECT accumulated EVERY tombstoned hash into a [][]byte before any delete —
 	// millions of rows per partition (×8 partitions) could OOM the node.
 	//
-	// The pruner is intentionally LIGHTWEIGHT: it trusts delete_at_height and does
-	// no per-row re-validation. The stamp is authoritative — it is the DAH SETTERS'
-	// job to only ever set delete_at_height on a tx that is genuinely safe to drop
-	// (the sweep checks mined + fully-spent + on-longest-chain + not-preserved;
-	// MarkTransactionsOnLongestChain(false) and Unspend CLEAR the stamp when a tx
-	// leaves the longest chain or is revived). Keeping the delete path a plain
-	// index range delete is critical to reclaim throughput.
+	// ──────────────────────────────────────────────────────────────────────
+	// DESIGN CONTRACT — read before "fixing" this delete.
 	//
-	// The doomed CTE applies the delete_at_height predicate in the SAME statement
-	// and snapshot as the DELETE, so a concurrent reorg Unspend that clears the
-	// stamp is honoured: a revived tx is simply not selected and keeps its spends.
-	// Each loop iteration re-evaluates the predicate from scratch, so revived rows
-	// are naturally excluded from later batches.
+	// This is deliberately a DUMB, lightweight index range-delete: it removes every
+	// tx whose delete_at_height has been reached and does NOT re-check whether the
+	// tx is really mined / fully-spent / on-longest-chain / not-preserved. Reviewers
+	// (and static analysis) repeatedly flag the missing re-check as a data-loss bug
+	// and add a per-row eligibility gate here — that was tried and reverted. DO NOT
+	// re-add it. Re-counting each candidate's spends on the hottest reclaim path
+	// measurably cuts throughput, and the whole point of the deferred-DAH design is
+	// to keep the fully-spent test OFF the hot path. (delete_at_height is also always
+	// a FUTURE height = completion + 1 + retention, so a reached stamp means the tx
+	// settled `retention` blocks ago.)
+	//
+	// Correctness lives with the DAH SETTERS. Their invariant: set delete_at_height
+	// ONLY while a tx is genuinely safe to drop, and CLEAR it the instant it is not:
+	//   • dah_sweep.go — stamps only mined+fully-spent+on-longest-chain+not-preserved;
+	//     clears the stamp when a tx stops qualifying.
+	//   • Unspend (spend.go) — a reorg revives an output → clears the stamp.
+	//   • MarkTransactionsOnLongestChain(false) (conflicting.go) — a tx leaves the
+	//     longest chain → clears the stamp.
+	//   • PreserveTransactions / PreserveParentsOfOldUnminedTransactions — protect a
+	//     parent of an unmined child by setting preserve_until (which clears the
+	//     stamp), so it is not pruned while the child is unmined; PreserveTransactions
+	//     only preserves already-eligible txs.
+	//   • ProcessExpiredPreservations (preservation.go) — on expiry, re-stamps only
+	//     when still eligible (conflicting, or mined+fully-spent+on-longest-chain),
+	//     else clears preserve_until with the stamp left NULL.
+	// If you change any code that writes delete_at_height, THAT is where eligibility
+	// belongs — not here.
+	//
+	// Snapshot note: the doomed predicate runs in the SAME statement/snapshot as the
+	// DELETE, so a concurrent Unspend that clears the stamp is honoured (the revived
+	// tx is simply not selected); each loop iteration re-evaluates from scratch.
+	// ──────────────────────────────────────────────────────────────────────
 	cascadeSQL := fmt.Sprintf(`
 		WITH doomed AS (
 			SELECT hash FROM %[1]s
