@@ -5236,6 +5236,11 @@ func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeig
 // in ProcessExpiredPreservations remains the safety net for the case where a preserved (eligible)
 // tx is later un-spent by a reorg.
 //
+// The gate assumes preservation re-runs each pruner cycle for still-needed parents: a parent that
+// has no DAH when a cycle runs is skipped, but if it later becomes fully spent it gains a DAH via
+// the normal setDAH path and a subsequent cycle re-admits and re-protects it — well within the
+// retention window before the pruner would act.
+//
 // IDEMPOTENCY: This operation is safely re-runnable:
 // - SQL UPDATE returns 0 rows affected (not an error) if records already deleted
 // - Multiple preservation attempts with same preserveUntil are idempotent
@@ -5303,17 +5308,33 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 // output still live). Stamping such a parent for deletion would let the pruner — which deletes
 // purely on the delete_at_height stamp — remove a transaction that still has live UTXOs.
 //
-// The eligibility CASE mirrors setDAH exactly (the canonical setter):
+// The eligibility CASE mirrors setDAH's conditions (the canonical setter):
 //   - conflicting transactions get a DAH (they do not need to be mined); and
 //   - non-conflicting transactions get a DAH only when all outputs are spent AND the tx is in at
 //     least one block AND it is on the longest chain (unmined_since IS NULL).
+//
+// The stamped height (currentHeight+retention) is computed from the pruner's currentHeight rather
+// than setDAH's blockHeight.Load()+1, so it may differ by a block; this is immaterial against the
+// retention window and avoids depending on the store's async block-height counter here.
 //
 // An ineligible transaction simply has its preserve_until cleared with delete_at_height left
 // NULL; the store's normal DAH mechanism (setDAH on the next spend/mine) re-stamps it if and
 // when it actually becomes eligible. This runs once per pruner cycle over only the small set of
 // expiring preservations, so the correlated subqueries are off the hot delete path.
 func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
-	deleteAtHeight := currentHeight + s.settings.GetUtxoStoreBlockHeightRetention()
+	// Retention 0 disables pruning: no DAH is ever stamped (mirrors setDAH's early return), so
+	// clearing preserve_until is all that remains to do here.
+	retention := s.settings.GetUtxoStoreBlockHeightRetention()
+	if retention == 0 {
+		query := `UPDATE transactions SET preserve_until = NULL WHERE preserve_until IS NOT NULL AND preserve_until <= $1`
+		if _, err := s.db.ExecContext(ctx, query, currentHeight); err != nil {
+			return errors.NewStorageError("failed to process expired preservations", err)
+		}
+
+		return nil
+	}
+
+	deleteAtHeight := currentHeight + retention
 
 	query := `
 		UPDATE transactions

@@ -909,12 +909,18 @@ func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeig
 // This clears any existing DeleteAtHeight and sets PreserveUntil to the specified height.
 // Used to protect parent transactions when cleaning up unmined transactions.
 //
-// PRUNE-ELIGIBILITY GATE: only transactions that already carry a deleteAtHeight stamp are
-// preserved. A record with no stamp is not fully spent, so it is not at risk of pruning and needs
-// no protection; preserving it would be pointless work and would feed a not-fully-spent tx into
-// the expiry path. The gate is enforced in the Lua preserveUntil UDF (no-op when no DAH) and via a
-// FilterExpression in the expression path. ProcessExpiredPreservations remains the setter-side
-// safety net for an eligible tx that is later un-spent by a reorg.
+// PRUNE-ELIGIBILITY GATE: only transactions that already carry a deleteAtHeight stamp (eligible
+// now) or are already being preserved (so renewal still works) are preserved. A record with
+// neither is not fully spent, so it is not at risk of pruning and needs no protection; preserving
+// it would be pointless work and would feed a not-fully-spent tx into the expiry path. The gate is
+// enforced via a server-side FilterExpression in both the UDF path and the expression path (the
+// Lua UDF itself is unchanged). ProcessExpiredPreservations remains the setter-side safety net for
+// an eligible tx that is later un-spent by a reorg.
+//
+// The gate assumes preservation re-runs each pruner cycle for still-needed parents: a parent that
+// has no DAH when a cycle runs is skipped, but if it later becomes fully spent it gains a DAH via
+// the normal setDAH path and a subsequent cycle re-admits and re-protects it — well within the
+// retention window before the pruner would act.
 //
 // IDEMPOTENCY: This operation is safely re-runnable:
 // - Missing transactions (LuaErrorCodeTxNotFound) are logged as debug, not errors

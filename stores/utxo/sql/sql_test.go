@@ -1439,6 +1439,62 @@ func TestProcessExpiredPreservations(t *testing.T) {
 		expectedDAH := int64(currentHeight + store.settings.GetUtxoStoreBlockHeightRetention())
 		require.Equal(t, expectedDAH, dah.Int64)
 	})
+
+	t.Run("conflicting_tx_is_stamped_without_being_mined", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		store, tx := setup(ctx, t)
+
+		_, err := store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		id, _ := txIDAndDAH(ctx, t, store, tx.TxIDChainHash()[:])
+		// Conflicting txs get a DAH regardless of mined/spent state (the first CASE branch).
+		_, err = store.db.ExecContext(ctx,
+			"UPDATE transactions SET conflicting = true WHERE id = $1", id)
+		require.NoError(t, err)
+		setExpiredPreservation(ctx, t, store, id, currentHeight)
+
+		err = store.ProcessExpiredPreservations(ctx, currentHeight)
+		require.NoError(t, err)
+
+		var preserveUntil sql.NullInt64
+		var dah sql.NullInt64
+		err = store.db.QueryRowContext(ctx,
+			"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", id).Scan(&preserveUntil, &dah)
+		require.NoError(t, err)
+		require.False(t, preserveUntil.Valid, "preserve_until must be cleared")
+		require.True(t, dah.Valid, "conflicting tx must be stamped for deletion without being mined")
+		expectedDAH := int64(currentHeight + store.settings.GetUtxoStoreBlockHeightRetention())
+		require.Equal(t, expectedDAH, dah.Int64)
+	})
+
+	t.Run("retention_zero_clears_preservation_without_stamping", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		store, tx := setup(ctx, t)
+		store.settings.GlobalBlockHeightRetention = 0
+		store.settings.UtxoStore.BlockHeightRetentionAdjustment = 0
+
+		_, err := store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		id, _ := txIDAndDAH(ctx, t, store, tx.TxIDChainHash()[:])
+		// Eligible-looking (mined + fully spent), but retention 0 disables pruning entirely.
+		markMinedAndSpend(ctx, t, store, tx, id, nil)
+		setExpiredPreservation(ctx, t, store, id, currentHeight)
+
+		err = store.ProcessExpiredPreservations(ctx, currentHeight)
+		require.NoError(t, err)
+
+		var preserveUntil sql.NullInt64
+		var dah sql.NullInt64
+		err = store.db.QueryRowContext(ctx,
+			"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", id).Scan(&preserveUntil, &dah)
+		require.NoError(t, err)
+		require.False(t, preserveUntil.Valid, "preserve_until must be cleared")
+		require.False(t, dah.Valid, "retention 0 disables pruning — no DAH must be stamped")
+	})
 }
 
 // TestProcessExpiredPreservations_PartialSpendParentNotStamped is the regression

@@ -140,6 +140,30 @@ func TestProcessExpiredPreservations(t *testing.T) {
 		// preserve→reorg→expiry narrative is exercised end-to-end in the SQL store tests
 		// (TestProcessExpiredPreservations_ReorgUnspendDuringWindow).
 	})
+
+	t.Run("conflicting_tx_is_stamped_without_being_mined", func(t *testing.T) {
+		cleanDB(t, client)
+
+		_, err := store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		// Conflicting txs get a DAH regardless of mined/spent state (the isConflicting branch
+		// of the expression). Set the conflicting bin directly; markPreservedExpired clears the
+		// DAH so the "conflicting AND no existing DAH" condition holds.
+		wp := util.GetAerospikeWritePolicy(tSettings, 0)
+		wp.RecordExistsAction = aerospike.UPDATE
+		require.NoError(t, client.PutBins(wp, txKey, aerospike.NewBin(fields.Conflicting.String(), true)))
+
+		markPreservedExpired(t)
+
+		processExpiryUntilProcessed(t)
+
+		rec, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey)
+		require.NoError(t, err)
+		require.Nil(t, rec.Bins[fields.PreserveUntil.String()], "preserveUntil must be cleared")
+		require.Equal(t, int(currentHeight+retention), rec.Bins[fields.DeleteAtHeight.String()],
+			"conflicting tx must be stamped without being mined")
+	})
 }
 
 // TestPreserveTransactions_OnlyPreservesPruneEligible verifies the Phase-1 layer for Aerospike:
