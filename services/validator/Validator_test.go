@@ -603,7 +603,7 @@ func TestValidate_ConsensusAcceptsUnconfirmedParentAtCandidateHeight(t *testing.
 	// The flag is compatible with block assembly enabled (the legacy branch
 	// sets it in every FSM state, including RUNNING where assembly stays on);
 	// assembly is disabled here only because the test scenario mirrors the
-	// LEGACYSYNCING deployment state.
+	// catch-up (CATCHINGBLOCKS) deployment state.
 	txMetaData, err := v.Validate(t.Context(), tx, 257727,
 		WithSkipPolicyChecks(true),
 		WithUnconfirmedParentsAtCandidateHeight(true),

@@ -19,7 +19,7 @@ import (
 // fsmStateOverrideClient wraps a blockchain client and pins GetFSMCurrentState
 // to a fixed state. The LocalClient test double always reports RUNNING, but
 // the legacy branch's option pairing is FSM-gated on
-// LEGACYSYNCING/CATCHINGBLOCKS — tests need to drive both sides of that gate.
+// CATCHINGBLOCKS — tests need to drive both sides of that gate.
 type fsmStateOverrideClient struct {
 	blockchain.ClientI
 	state blockchain.FSMStateType
@@ -95,7 +95,7 @@ func TestCheckSubtreeFromBlockLegacyUnconfirmedParents(t *testing.T) {
 	}
 
 	newServer := func(t *testing.T, fixtures ...subtreeFixture) (*Server, *recordingValidatorClient) {
-		return newServerWithFSMState(t, blockchain.FSMStateLEGACYSYNCING, fixtures...)
+		return newServerWithFSMState(t, blockchain.FSMStateCATCHINGBLOCKS, fixtures...)
 	}
 
 	singleNodeSubtree := func(t *testing.T, hash *chainhash.Hash) *subtreepkg.Subtree {

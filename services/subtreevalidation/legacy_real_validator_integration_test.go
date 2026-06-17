@@ -97,7 +97,7 @@ func TestLegacyUnconfirmedParent_RealValidatorIntegration(t *testing.T) {
 
 	// The legacy branch's option pairing is FSM-gated; LocalClient always
 	// reports RUNNING, so pin the state this scenario lives in.
-	blockchainClient := &fsmStateOverrideClient{ClientI: localClient, state: blockchain.FSMStateLEGACYSYNCING}
+	blockchainClient := &fsmStateOverrideClient{ClientI: localClient, state: blockchain.FSMStateCATCHINGBLOCKS}
 
 	// Real validator: TxValidator + GoBDK inside, no mocks.
 	realValidator, err := validator.New(ctx, logger, tSettings, utxoStore,
