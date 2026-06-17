@@ -144,10 +144,33 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 // spendBatched — enqueue each input into the batcher
 // ---------------------------------------------------------------------------
 
+// spendBatched enqueues each input into the spend batcher and waits for the
+// per-input result. The batcher runs the DB write on context.Background() (see
+// sendSpendBatch), so cancelling the request ctx only stops US WAITING — a spend the
+// batcher has already committed stays committed. That is intentional and matches the
+// sql and aerospike stores: a committed spend is rolled back ONLY for a genuine
+// validation failure (see needsSpendRollback), never for cancellation or timeout,
+// because a spend is idempotent for the same spender — a retry re-issues the same
+// spending_data and the ON CONFLICT DO NOTHING in spendValidationSQL makes it a
+// no-op. Rolling back on cancellation would diverge from the other stores and break
+// that idempotent-retry contract.
+//
+// The wait is bounded by SpendWaitTimeout (parity with sql/aerospike) so a stalled
+// batcher cannot block a caller whose ctx carries no deadline.
 func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spend, blockHeight uint32, ignoreLocked, ignoreConflicting bool) ([]*utxo.Spend, error) {
 	spentSpends := make([]*utxo.Spend, 0, len(spends))
 
-	// Enqueue each spend into the batcher and wait for results.
+	// Bound the wait so a stalled batcher cannot hang a deadline-less caller. This
+	// bounds only OUR wait; the batch still completes on context.Background().
+	spendTimeout := s.settings.UtxoStore.SpendWaitTimeout
+	if spendTimeout <= 0 {
+		spendTimeout = 30 * time.Second
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, spendTimeout)
+	defer cancel()
+
+	// Enqueue each spend into the batcher and wait for results. PutCtx (not Put) links
+	// the request span onto the batch span for tracing, matching sql/aerospike.
 	errChs := make([]chan error, len(spends))
 	for idx, spend := range spends {
 		if spend == nil {
@@ -155,7 +178,7 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 		}
 		errCh := make(chan error, 1)
 		errChs[idx] = errCh
-		s.spendBatcher.Put(&batchSpendItem{
+		s.spendBatcher.PutCtx(ctx, &batchSpendItem{
 			spend:             spend,
 			blockHeight:       blockHeight,
 			errCh:             errCh,
@@ -169,8 +192,14 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 		var batchErr error
 		select {
 		case batchErr = <-errChs[idx]:
-		case <-ctx.Done():
-			spends[idx].Err = errors.NewContextCanceledError("[Spend] context cancelled for %s:%d", spend.TxID, spend.Vout)
+		case <-waitCtx.Done():
+			// Distinguish our timeout from an upstream cancellation, but in BOTH cases
+			// fall through without rolling back any already-committed spend (see doc).
+			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+				spends[idx].Err = errors.NewServiceUnavailableError("[Spend] batch operation timed out after %s for %s:%d", spendTimeout, spend.TxID, spend.Vout)
+			} else {
+				spends[idx].Err = errors.NewContextCanceledError("[Spend] context cancelled for %s:%d", spend.TxID, spend.Vout)
+			}
 			continue
 		}
 
@@ -190,6 +219,10 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 	}
 
 	if len(spends) != len(spentSpends) {
+		// Roll back already-committed spends ONLY for genuine validation failures.
+		// Cancellation/timeout errors deliberately fall through without a rollback —
+		// the committed spend is idempotent on retry (see the spendBatched doc). This
+		// matches the sql and aerospike stores.
 		if needsSpendRollback(spends) {
 			if unspendErr := s.Unspend(context.Background(), spentSpends); unspendErr != nil {
 				s.logger.Errorf("error in postgres unspend (rollback): %v", unspendErr)

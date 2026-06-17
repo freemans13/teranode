@@ -1,7 +1,9 @@
 package postgres
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -155,4 +157,49 @@ func TestFreezeUTXOsAbsentTxReturnsTxNotFound(t *testing.T) {
 	}, nil)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrTxNotFound), "absent tx must yield ErrTxNotFound, got: %v", err)
+}
+
+// TestSpendBatchedCancelDoesNotRollback locks in the cross-store consistency
+// contract for batched spends (parity with the sql and aerospike stores): the
+// batcher commits on a background context, so cancelling the request context only
+// aborts OUR wait — a spend the batcher already committed is NOT rolled back, because
+// it is idempotent for the same spender on retry. Rollback is reserved for genuine
+// validation failures (needsSpendRollback). This test cancels before waiting and
+// asserts (a) the call reports ErrContextCanceled, and (b) the spend still lands.
+func TestSpendBatchedCancelDoesNotRollback(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(100))
+
+	// Create the parent in direct (unbatched) mode for a reliable setup.
+	parentTx := makeThreeOutputTx(t) // vout0 spendable
+	_, err := store.Create(ctx, parentTx, 100)
+	require.NoError(t, err)
+	parentHash := parentTx.TxIDChainHash()
+
+	// Start() initialises the batchers, so the Spend below exercises spendBatched
+	// (the path under test) rather than the direct path.
+	store.Start(ctx)
+
+	spendingTx := getSpendingTx(t, parentTx, 0)
+
+	// Cancel before the batched spend gets a chance to wait for its result. The
+	// batcher commits on a store/background context, so the spend still lands.
+	cancelledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, err = store.Spend(cancelledCtx, spendingTx, 100)
+	require.Error(t, err, "a cancelled context must surface an error")
+	require.True(t, errors.Is(err, errors.ErrContextCanceled),
+		"cancellation must report ErrContextCanceled, got: %v", err)
+
+	// The batcher runs on context.Background(), so the spend still commits. It must
+	// NOT have been rolled back by the cancellation — matching sql/aerospike.
+	require.Eventually(t, func() bool {
+		var n int
+		qerr := store.pool.QueryRow(ctx,
+			`SELECT count(*) FROM spends WHERE prev_tx_hash = $1 AND prev_output_idx = 0`,
+			parentHash[:]).Scan(&n)
+		return qerr == nil && n == 1
+	}, 5*time.Second, 25*time.Millisecond,
+		"committed spend must remain after a cancelled request (no rollback on cancel)")
 }
