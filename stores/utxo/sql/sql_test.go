@@ -1318,39 +1318,161 @@ func TestRawDB(t *testing.T) {
 	assert.Equal(t, 1, result)
 }
 
+// setExpiredPreservation marks the given transaction as having an expired
+// preservation: it sets preserve_until to a height already passed and clears
+// delete_at_height (matching what PreserveTransactions does at preserve time).
+func setExpiredPreservation(ctx context.Context, t *testing.T, store *Store, transactionID int, currentHeight uint32) {
+	t.Helper()
+	_, err := store.db.ExecContext(ctx,
+		"UPDATE transactions SET preserve_until = $1, delete_at_height = NULL WHERE id = $2",
+		currentHeight-10, transactionID)
+	require.NoError(t, err)
+}
+
+// txIDAndDAH reads the row id and delete_at_height for a transaction by hash.
+func txIDAndDAH(ctx context.Context, t *testing.T, store *Store, hash []byte) (int, sql.NullInt64) {
+	t.Helper()
+	var (
+		id  int
+		dah sql.NullInt64
+	)
+	err := store.db.QueryRowContext(ctx,
+		"SELECT id, delete_at_height FROM transactions WHERE hash = $1", hash).Scan(&id, &dah)
+	require.NoError(t, err)
+	return id, dah
+}
+
+// markMinedAndSpend marks a transaction as mined and on the longest chain, then
+// spends the given output indices. Passing spendIdxs == nil spends every output.
+func markMinedAndSpend(ctx context.Context, t *testing.T, store *Store, tx *bt.Tx, transactionID int, spendIdxs []int) {
+	t.Helper()
+	_, err := store.db.ExecContext(ctx,
+		"INSERT INTO block_ids (transaction_id, block_id, block_height, subtree_idx) VALUES ($1, $2, $3, $4)",
+		transactionID, 100, 100, 0)
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx,
+		"UPDATE transactions SET unmined_since = NULL WHERE id = $1", transactionID)
+	require.NoError(t, err)
+
+	spendingData := spendpkg.NewSpendingData(tx.TxIDChainHash(), 1).Bytes()
+	if spendIdxs == nil {
+		_, err = store.db.ExecContext(ctx,
+			"UPDATE outputs SET spending_data = $1 WHERE transaction_id = $2", spendingData, transactionID)
+		require.NoError(t, err)
+		return
+	}
+	for _, idx := range spendIdxs {
+		_, err = store.db.ExecContext(ctx,
+			"UPDATE outputs SET spending_data = $1 WHERE transaction_id = $2 AND idx = $3", spendingData, transactionID, idx)
+		require.NoError(t, err)
+	}
+}
+
+// TestProcessExpiredPreservations verifies the invariant that delete_at_height
+// is only stamped at preservation expiry when the transaction is genuinely safe
+// to drop (mined, on the longest chain, AND fully spent). Stamping a DAH on a
+// transaction that still has live outputs would let the pruner delete a live
+// UTXO — the data-loss bug this test guards against.
 func TestProcessExpiredPreservations(t *testing.T) {
+	const currentHeight = uint32(100)
+
+	t.Run("no_expired_preservations_is_noop", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		store, tx := setup(ctx, t)
+
+		_, err := store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		err = store.ProcessExpiredPreservations(ctx, currentHeight)
+		require.NoError(t, err)
+
+		_, dah := txIDAndDAH(ctx, t, store, tx.TxIDChainHash()[:])
+		require.False(t, dah.Valid, "untouched tx must not be stamped")
+	})
+
+	t.Run("ineligible_unmined_unspent_tx_is_not_stamped", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		store, tx := setup(ctx, t)
+
+		_, err := store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		id, _ := txIDAndDAH(ctx, t, store, tx.TxIDChainHash()[:])
+		setExpiredPreservation(ctx, t, store, id, currentHeight)
+
+		err = store.ProcessExpiredPreservations(ctx, currentHeight)
+		require.NoError(t, err)
+
+		var preserveUntil sql.NullInt64
+		var dah sql.NullInt64
+		err = store.db.QueryRowContext(ctx,
+			"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", id).Scan(&preserveUntil, &dah)
+		require.NoError(t, err)
+		require.False(t, preserveUntil.Valid, "preserve_until must be cleared")
+		require.False(t, dah.Valid, "unmined/unspent tx must NOT be stamped for deletion")
+	})
+
+	t.Run("eligible_mined_fully_spent_tx_is_stamped", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		store, tx := setup(ctx, t)
+
+		_, err := store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		id, _ := txIDAndDAH(ctx, t, store, tx.TxIDChainHash()[:])
+		markMinedAndSpend(ctx, t, store, tx, id, nil) // spend all outputs
+		setExpiredPreservation(ctx, t, store, id, currentHeight)
+
+		err = store.ProcessExpiredPreservations(ctx, currentHeight)
+		require.NoError(t, err)
+
+		var preserveUntil sql.NullInt64
+		var dah sql.NullInt64
+		err = store.db.QueryRowContext(ctx,
+			"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", id).Scan(&preserveUntil, &dah)
+		require.NoError(t, err)
+		require.False(t, preserveUntil.Valid, "preserve_until must be cleared")
+		require.True(t, dah.Valid, "eligible tx must be stamped for deletion")
+		expectedDAH := int64(currentHeight + store.settings.GetUtxoStoreBlockHeightRetention())
+		require.Equal(t, expectedDAH, dah.Int64)
+	})
+}
+
+// TestProcessExpiredPreservations_PartialSpendParentNotStamped is the regression
+// test for the data-loss scenario: a parent P with outputs A and B, mined, where
+// an old unmined child spent A but B was never spent (P is NOT fully spent). P is
+// preserved, the child resolves, and the preservation expires. The expiry path
+// must NOT stamp a delete_at_height on P, because B is still a live UTXO and the
+// pruner deletes on the DAH stamp.
+func TestProcessExpiredPreservations_PartialSpendParentNotStamped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	store, tx := setup(ctx, t)
 
-	// Create a transaction to work with
+	const currentHeight = uint32(100)
+
 	_, err := store.Create(ctx, tx, 0)
 	require.NoError(t, err)
 
-	// Test ProcessExpiredPreservations with no expired preservations
-	currentHeight := uint32(100)
+	id, _ := txIDAndDAH(ctx, t, store, tx.TxIDChainHash()[:])
+
+	// Mined, on longest chain, but only output idx 0 spent — output(s) >0 remain live.
+	markMinedAndSpend(ctx, t, store, tx, id, []int{0})
+	setExpiredPreservation(ctx, t, store, id, currentHeight)
+
 	err = store.ProcessExpiredPreservations(ctx, currentHeight)
 	require.NoError(t, err)
 
-	// Manually set a preservation for testing
-	transactionID := 0
-	err = store.db.QueryRowContext(ctx, "SELECT id FROM transactions WHERE hash = $1", tx.TxIDChainHash()[:]).Scan(&transactionID)
+	var preserveUntil sql.NullInt64
+	var dah sql.NullInt64
+	err = store.db.QueryRowContext(ctx,
+		"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", id).Scan(&preserveUntil, &dah)
 	require.NoError(t, err)
-
-	preserveUntil := currentHeight - 10 // Set to expire
-	_, err = store.db.ExecContext(ctx, "UPDATE transactions SET preserve_until = $1 WHERE id = $2", preserveUntil, transactionID)
-	require.NoError(t, err)
-
-	// Test ProcessExpiredPreservations with expired preservation
-	err = store.ProcessExpiredPreservations(ctx, currentHeight)
-	require.NoError(t, err)
-
-	// Verify the preservation was processed (preserve_until should be NULL)
-	var preserveUntilResult sql.NullInt64
-	err = store.db.QueryRowContext(ctx, "SELECT preserve_until FROM transactions WHERE id = $1", transactionID).Scan(&preserveUntilResult)
-	require.NoError(t, err)
-	assert.False(t, preserveUntilResult.Valid) // Should be NULL
+	require.False(t, preserveUntil.Valid, "preserve_until must be cleared")
+	require.False(t, dah.Valid, "partially-spent parent must NOT be stamped — output B is a live UTXO")
 }
 
 func TestSetMinedMultiBatched(t *testing.T) {

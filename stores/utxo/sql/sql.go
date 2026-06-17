@@ -5279,14 +5279,38 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 }
 
 // ProcessExpiredPreservations handles transactions whose preservation period has expired.
-// For each transaction with PreserveUntil <= currentHeight, it sets an appropriate DeleteAtHeight
-// and clears the PreserveUntil field.
+// For each transaction with PreserveUntil <= currentHeight it clears PreserveUntil, and sets
+// delete_at_height ONLY when the transaction is genuinely safe to drop.
+//
+// Upholding the invariant "delete_at_height set ⟹ safe to delete": preservation can be
+// requested for ANY parent of an old unmined transaction, including parents that are not yet
+// fully spent (e.g. a parent with one output spent by a now-resolved mempool child and another
+// output still live). Stamping such a parent for deletion would let the pruner — which deletes
+// purely on the delete_at_height stamp — remove a transaction that still has live UTXOs.
+//
+// The eligibility CASE mirrors setDAH exactly (the canonical setter):
+//   - conflicting transactions get a DAH (they do not need to be mined); and
+//   - non-conflicting transactions get a DAH only when all outputs are spent AND the tx is in at
+//     least one block AND it is on the longest chain (unmined_since IS NULL).
+//
+// An ineligible transaction simply has its preserve_until cleared with delete_at_height left
+// NULL; the store's normal DAH mechanism (setDAH on the next spend/mine) re-stamps it if and
+// when it actually becomes eligible. This runs once per pruner cycle over only the small set of
+// expiring preservations, so the correlated subqueries are off the hot delete path.
 func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
 	deleteAtHeight := currentHeight + s.settings.GetUtxoStoreBlockHeightRetention()
 
 	query := `
 		UPDATE transactions
-		SET delete_at_height = $1, preserve_until = NULL
+		SET delete_at_height = CASE
+			WHEN conflicting THEN $1
+			WHEN unmined_since IS NULL
+			     AND EXISTS(SELECT 1 FROM block_ids b WHERE b.transaction_id = transactions.id)
+			     AND NOT EXISTS(SELECT 1 FROM outputs o WHERE o.transaction_id = transactions.id AND o.spending_data IS NULL)
+			THEN $1
+			ELSE NULL
+		END,
+		preserve_until = NULL
 		WHERE preserve_until IS NOT NULL AND preserve_until <= $2
 	`
 

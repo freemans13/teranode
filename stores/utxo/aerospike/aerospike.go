@@ -1059,15 +1059,36 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 			continue
 		}
 
-		// Calculate DeleteAtHeight based on retention policy
-		deleteAtHeight := currentHeight + s.settings.GetUtxoStoreBlockHeightRetention()
-
 		batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
 		batchWritePolicy.RecordExistsAction = aerospike.UPDATE
 
-		batch = append(batch, aerospike.NewBatchWrite(batchWritePolicy, key,
-			aerospike.PutOp(aerospike.NewBin(fields.DeleteAtHeight.String(), int(deleteAtHeight))),
-			aerospike.PutOp(aerospike.NewBin(fields.PreserveUntil.String(), nil))))
+		// Clear the preservation, then re-evaluate deleteAtHeight against the SAME
+		// eligibility rule as the canonical setDeleteAtHeight (mined + on the longest
+		// chain + fully spent, or conflicting). Writing the DAH bin directly here —
+		// as the previous implementation did — would stamp a transaction that still
+		// has live outputs (e.g. a parent whose now-resolved mempool child spent only
+		// some of its outputs), and the DAH pruner deletes purely on that stamp, so a
+		// live UTXO would be lost. The expression leaves the bin NULL for ineligible
+		// transactions; the store's normal DAH mechanism re-stamps them if and when
+		// they actually become eligible. This restores "DAH set ⟹ safe to delete".
+		ops := []*aerospike.Operation{
+			aerospike.PutOp(aerospike.NewBin(fields.PreserveUntil.String(), nil)),
+			// Reset to NULL first; the expression below sets it only when eligible.
+			aerospike.PutOp(aerospike.NewBin(fields.DeleteAtHeight.String(), nil)),
+		}
+
+		if blockHeightRetention := s.settings.GetUtxoStoreBlockHeightRetention(); blockHeightRetention > 0 {
+			// ignorePreserveUntil=true: preserveUntil is cleared in this same operate, but the
+			// expression reads the pre-operate record, so the guard must be bypassed here.
+			dahExp := s.buildDeleteAtHeightExpression(currentHeight, blockHeightRetention, false, true)
+			ops = append(ops, aerospike.ExpWriteOp(
+				fields.DeleteAtHeight.String(),
+				dahExp,
+				aerospike.ExpWriteFlagAllowDelete|aerospike.ExpWriteFlagEvalNoFail,
+			))
+		}
+
+		batch = append(batch, aerospike.NewBatchWrite(batchWritePolicy, key, ops...))
 
 		txIDs = append(txIDs, txHash)
 
