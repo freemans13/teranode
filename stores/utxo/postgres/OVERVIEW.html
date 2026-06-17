@@ -75,8 +75,9 @@
       <a href="#workers">8. The three workers</a>
       <a href="#safety">9. Staying correct (reorgs, crashes)</a>
       <a href="#partitions">10. Partitioning &amp; speed</a>
-      <a href="#limits">11. How big can a transaction be?</a>
-      <a href="#glossary">12. Glossary</a>
+      <a href="#fewtables">11. Why so few tables? (the performance story)</a>
+      <a href="#limits">12. How big can a transaction be?</a>
+      <a href="#glossary">13. Glossary</a>
     </nav>
   </div>
 
@@ -150,7 +151,7 @@
     <line x1="380" y1="150" x2="520" y2="150" stroke="#5cc8ff" stroke-width="2" marker-end="url(#arr)"/>
     <text x="402" y="140" fill="#9fb0cc" font-size="12">points back to</text>
   </svg>
-  <figcaption>The whole store is essentially these two tables, split into 8 shards each (see §10).</figcaption>
+  <figcaption>The whole store is essentially these two tables, split into 8 shards each (see <a href="#partitions">§10</a>).</figcaption>
   </figure>
 
   <div class="panel why">
@@ -160,6 +161,8 @@
     a transaction’s outputs <em>into the transaction’s own row</em>, validating a spend reads
     <strong>one row</strong> — no joins, no second index. The trade-off: this is tuned for ordinary
     transactions; transactions with enormous numbers of outputs are a known weak spot.
+    <br><span class="muted">(The full “why not normalise into many tables like the SQL store?” story is in
+    <a href="#fewtables">§11</a>.)</span>
   </div>
 
   <!-- ============================================================= -->
@@ -197,7 +200,7 @@
     <tr><td><code>unmined_since</code></td><td>Empty means “mined and on the main chain.” A value means “not on the main chain since height X” (still pending, or reorged out).</td></tr>
     <tr><td><code>mined_at_height</code>, <code>block_ids</code>, <code>block_heights</code>, <code>subtree_idxs</code></td><td>Which block(s) this transaction appears in. A transaction can be in more than one (e.g. across a reorg), so these are lists.</td></tr>
     <tr><td><code>preserve_until</code></td><td>“Do not delete before this height,” regardless of anything else.</td></tr>
-    <tr><td style="color:#ffcc66"><code>delete_at_height</code></td><td><strong>The star of the show.</strong> If set, it’s the block height at which this transaction becomes safe to delete. Usually empty. Filled in <em>later</em>, by a background worker — see §7.</td></tr>
+    <tr><td style="color:#ffcc66"><code>delete_at_height</code></td><td><strong>The star of the show.</strong> If set, it’s the block height at which this transaction becomes safe to delete. Usually empty. Filled in <em>later</em>, by a background worker — see <a href="#deferred">§7</a>.</td></tr>
   </table>
 
   <!-- ============================================================= -->
@@ -235,7 +238,7 @@
   <div class="step"><div class="n">1</div><div>Look up the parent transaction’s row by its hash — <strong>one read</strong>. Everything needed (the output’s ID, whether it’s spendable/frozen, coinbase maturity, whether the parent is locked/conflicting) is right there in that single row.</div></div>
   <div class="step"><div class="n">2</div><div>Check the rules: the output ID must match, it must not be frozen/locked/conflicting, coinbase money must be mature, etc.</div></div>
   <div class="step"><div class="n">3</div><div>If all good, <strong>insert a row into <code>spends</code></strong> recording the spend and the height. The unique constraint guarantees it can’t be double-spent.</div></div>
-  <div class="step"><div class="n">4</div><div><strong>That’s it.</strong> The store does <em>not</em> stop to figure out whether the parent is now fully spent and ready for deletion. That decision is deferred. ↓</div></div>
+  <div class="step"><div class="n">4</div><div><strong>That’s it.</strong> The store does <em>not</em> stop to figure out whether the parent is now fully spent and ready for deletion. That decision is deferred. <a href="#deferred">↓ (see §7)</a></div></div>
 
   <!-- ============================================================= -->
   <h2 id="deferred">7. The clever bit: deferred deletion ★</h2>
@@ -294,7 +297,7 @@
     <rect x="150" y="210" width="600" height="86" rx="12" fill="#161d2e" stroke="#2c3650"/>
     <text x="170" y="238" fill="#e8edf6" font-size="14" font-weight="700">A bookmark keeps the sweeper honest</text>
     <text x="170" y="262" fill="#9fb0cc" font-size="13">dah_watermark remembers the last height the sweeper finished. It resumes there after</text>
-    <text x="170" y="282" fill="#9fb0cc" font-size="13">a restart and never re-scans old ground. (It can also be rewound — see §9.)</text>
+    <a href="#safety"><text x="170" y="282" fill="#9fb0cc" font-size="13" style="cursor:pointer">a restart and never re-scans old ground. (It can also be rewound — see §9.)</text></a>
   </svg>
   <figcaption>Tag heights cheaply now → decide deletion calmly later → delete trivially.</figcaption>
   </figure>
@@ -397,7 +400,82 @@
   </div>
 
   <!-- ============================================================= -->
-  <h2 id="limits">11. How big can a transaction be? (size limits)</h2>
+  <h2 id="fewtables">11. Why so few tables? (the performance story)</h2>
+  <p class="lead">
+    If you’ve done database design before, the two-table layout probably looks <em>wrong</em>. The textbook
+    approach — and what Teranode’s older <strong>SQL UTXO store</strong> does — is to <strong>normalise</strong>:
+    a table for transactions, a table for outputs, a table for inputs, a table for block links, tied together
+    with foreign keys. That’s great for general-purpose databases. Here it’s the slow path. This section explains
+    why.
+  </p>
+
+  <div class="panel why">
+    <strong>The core insight:</strong> this store has exactly <em>one</em> demanding job — validate spends and
+    reclaim old coins, at tens of thousands of transactions per second, written durably to disk. At that speed the
+    thing that hurts most is <strong>how many random disk writes each transaction causes</strong>. Every extra
+    table, every extra index, and every “update a row in place” turns into more random writes. So the design works
+    backwards from that: <strong>do the fewest writes possible per transaction.</strong>
+  </div>
+
+  <h3>What a normalised design costs at high speed</h3>
+  <p>In a fully normalised schema, a single transaction with, say, 3 outputs and 2 inputs becomes
+  <strong>many rows across several tables</strong> (1 transaction + 3 outputs + 2 inputs + block links). Multiply by
+  tens of thousands of transactions per second and you get:</p>
+  <ul>
+    <li><strong>Row explosion → write amplification.</strong> Each of those rows is inserted into a table whose
+      index lives in a different place on disk, scattering the writes. The single biggest cost in this workload is
+      exactly this: random-position index inserts. More rows per transaction = proportionally more random writes.</li>
+    <li><strong>Every index is a tax on every write.</strong> A separate <code>outputs</code> table needs its own
+      big index keyed on a (random) hash — a second scattered B-tree to maintain on every insert. The SQL store
+      also keeps a special “is this output still unspent?” index that gets disturbed on <em>every spend</em> — a
+      known cause of multi-second disk stalls under load.</li>
+    <li><strong>“Mark as spent” rewrites a row.</strong> The normalised way to spend a coin is to <em>update</em>
+      the output row (fill in who spent it). Updating a row leaves a dead copy behind that the database must later
+      vacuum, and it disturbs that unspent-index. That’s churn on the busiest path in the system.</li>
+    <li><strong>Reads need JOINs.</strong> To validate a spend you’d join transactions ⋈ outputs (and maybe inputs).
+      JOINs mean touching multiple tables and indexes for one answer.</li>
+    <li><strong>Deletion is a multi-table cascade.</strong> Removing one old transaction means cascading deletes
+      across all those child tables via foreign keys.</li>
+    <li><strong>More bytes in the write-ahead log.</strong> Everything is written durably first to a log (the WAL).
+      More rows + in-place updates = more log bytes per transaction, and WAL volume is a first-class cost here.</li>
+  </ul>
+
+  <h3>How the folded, two-table design avoids each cost</h3>
+  <table>
+    <tr><th>Dimension</th><th>Normalised (SQL store)</th><th>This store (folded)</th></tr>
+    <tr><td>Rows per transaction</td><td>1 + one per output + one per input + block links</td><td><strong>1</strong> tx row (+ one <code>spends</code> row per <em>spent</em> output, later)</td></tr>
+    <tr><td>Big random-write indexes</td><td>transactions PK + outputs PK + “unspent” index + …</td><td><strong>just two</strong>: the <code>txs</code> primary key and the <code>spends</code> uniqueness index</td></tr>
+    <tr><td>Marking a coin spent</td><td>UPDATE the output row (rewrite + vacuum churn)</td><td><strong>INSERT</strong> a <code>spends</code> row (append-only, no rewrite)</td></tr>
+    <tr><td>Validating a spend</td><td>JOIN across tables</td><td><strong>one</strong> single-row read (outputs are folded in)</td></tr>
+    <tr><td>Deleting an old tx</td><td>foreign-key cascade across 4–5 tables</td><td>delete the tx row + its <code>spends</code> rows (two aligned shards)</td></tr>
+    <tr><td>“Is it spent?”</td><td>a nullable column + a partial index that churns</td><td>row present in <code>spends</code> = spent (no extra index churn)</td></tr>
+  </table>
+
+  <div class="panel tip">
+    <strong>“Folding” in one line:</strong> instead of a separate row per output, a transaction’s outputs are packed
+    into a few columns <em>on the transaction’s own row</em> (a flat blob of output IDs + small bitmaps + counts).
+    The result: one read returns everything needed to validate a spend, and creating a transaction writes one row
+    instead of many.
+  </div>
+
+  <h3>The payoff — and the price</h3>
+  <p>
+    Concretely (on a developer laptop, so treat as indicative, not production figures): the older normalised SQL
+    store handles on the order of <strong>~9,000</strong> transactions/second; this store reaches roughly
+    <strong>~90,000</strong>/second with no pruning, and a stable <strong>~75–88,000</strong>/second while the
+    pruner runs and keeps the table bounded. Most of that gap is simply <em>not</em> paying the row-explosion and
+    index-churn costs above.
+  </p>
+  <div class="panel why">
+    <strong>This is a deliberate trade, not a free win.</strong> Denormalising costs flexibility: you can’t easily
+    run ad-hoc relational queries (“show me all outputs over 1 BSV”), the layout is special-purpose, and packing
+    outputs into one row creates a ceiling for transactions with <em>huge</em> numbers of outputs
+    (see <a href="#limits">§12</a>). We accept those because this store isn’t a general-purpose database — it’s a
+    purpose-built engine for one hot loop (validate spends, prune coins) where raw write throughput is everything.
+  </div>
+
+  <!-- ============================================================= -->
+  <h2 id="limits">12. How big can a transaction be? (size limits)</h2>
   <p class="lead">
     This store is tuned for ordinary transactions. It will still accept unusually large ones — up to some hard
     ceilings — but performance falls off well before those ceilings. Here’s exactly what limits what, and why.
@@ -476,7 +554,7 @@
   </div>
 
   <!-- ============================================================= -->
-  <h2 id="glossary">12. Glossary</h2>
+  <h2 id="glossary">13. Glossary</h2>
   <table>
     <tr><th>Term</th><th>Plain meaning</th></tr>
     <tr><td><strong>UTXO</strong></td><td>An unspent coin — an output that hasn’t been used as an input yet.</td></tr>
