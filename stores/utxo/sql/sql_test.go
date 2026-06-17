@@ -1475,6 +1475,103 @@ func TestProcessExpiredPreservations_PartialSpendParentNotStamped(t *testing.T) 
 	require.False(t, dah.Valid, "partially-spent parent must NOT be stamped — output B is a live UTXO")
 }
 
+// TestPreserveTransactions_OnlyPreservesPruneEligible verifies the Phase-1 layer:
+// preservation only targets transactions that are actually prune-eligible (already
+// carry a delete_at_height stamp). A transaction with no stamp is not at risk of
+// pruning, so preserving it is pointless work — and it is exactly the not-fully-spent
+// input that the unconditional expiry path could later turn into a bad deletion stamp.
+func TestPreserveTransactions_OnlyPreservesPruneEligible(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, tx := setup(ctx, t)
+
+	// txEligible: stands in for a fully-spent + mined parent — it carries a DAH stamp.
+	_, err := store.Create(ctx, tx, 0)
+	require.NoError(t, err)
+	eligibleID, _ := txIDAndDAH(ctx, t, store, tx.TxIDChainHash()[:])
+	_, err = store.db.ExecContext(ctx,
+		"UPDATE transactions SET delete_at_height = $1 WHERE id = $2", 500, eligibleID)
+	require.NoError(t, err)
+
+	// txIneligible: not fully spent → no DAH stamp → not at risk of pruning.
+	txIneligible := tx.Clone()
+	txIneligible.Version++
+	_, err = store.Create(ctx, txIneligible, 0)
+	require.NoError(t, err)
+	ineligibleID, ineligibleDAH := txIDAndDAH(ctx, t, store, txIneligible.TxIDChainHash()[:])
+	require.False(t, ineligibleDAH.Valid)
+
+	const preserveUntilHeight = uint32(1000)
+	err = store.PreserveTransactions(ctx,
+		[]chainhash.Hash{*tx.TxIDChainHash(), *txIneligible.TxIDChainHash()}, preserveUntilHeight)
+	require.NoError(t, err)
+
+	// Eligible tx: preserved (preserve_until set, DAH cleared so it is held).
+	var pu, dah sql.NullInt64
+	err = store.db.QueryRowContext(ctx,
+		"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", eligibleID).Scan(&pu, &dah)
+	require.NoError(t, err)
+	require.True(t, pu.Valid, "prune-eligible tx must be preserved")
+	require.Equal(t, int64(preserveUntilHeight), pu.Int64)
+	require.False(t, dah.Valid, "preservation clears the DAH so the tx is held")
+
+	// Ineligible tx: untouched — no preserve_until, no DAH.
+	err = store.db.QueryRowContext(ctx,
+		"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", ineligibleID).Scan(&pu, &dah)
+	require.NoError(t, err)
+	require.False(t, pu.Valid, "tx with no DAH is not at risk and must not be preserved")
+	require.False(t, dah.Valid)
+}
+
+// TestProcessExpiredPreservations_ReorgUnspendDuringWindow proves the two layers work
+// together. A parent that is fully spent + mined (and therefore prune-eligible) is
+// preserved. A reorg then un-spends one of its outputs, so it is no longer fully spent
+// — but while it is preserved the normal stamping logic is frozen and never notices.
+// When the preservation expires the setter must re-check eligibility and refuse to
+// stamp, otherwise the now-live UTXO would be lost.
+func TestProcessExpiredPreservations_ReorgUnspendDuringWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, tx := setup(ctx, t)
+
+	const currentHeight = uint32(100)
+
+	_, err := store.Create(ctx, tx, 0)
+	require.NoError(t, err)
+	id, _ := txIDAndDAH(ctx, t, store, tx.TxIDChainHash()[:])
+
+	// Fully spent + mined + stamped → prune-eligible.
+	markMinedAndSpend(ctx, t, store, tx, id, nil) // spend all outputs
+	_, err = store.db.ExecContext(ctx,
+		"UPDATE transactions SET delete_at_height = $1 WHERE id = $2", 500, id)
+	require.NoError(t, err)
+
+	// Phase 1 preserves it (the gate sees the DAH stamp): preserve_until set, DAH cleared.
+	require.NoError(t, store.PreserveTransactions(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, currentHeight-10))
+
+	var pu, dah sql.NullInt64
+	err = store.db.QueryRowContext(ctx,
+		"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", id).Scan(&pu, &dah)
+	require.NoError(t, err)
+	require.True(t, pu.Valid, "eligible parent should have been preserved")
+	require.False(t, dah.Valid)
+
+	// Reorg: un-spend output 0. The parent now has a live UTXO again. While preserved,
+	// setDAH is frozen, so the DAH stays cleared and nothing notices the change.
+	_, err = store.db.ExecContext(ctx,
+		"UPDATE outputs SET spending_data = NULL WHERE transaction_id = $1 AND idx = 0", id)
+	require.NoError(t, err)
+
+	// Preservation expires → setter re-checks eligibility and must NOT stamp.
+	require.NoError(t, store.ProcessExpiredPreservations(ctx, currentHeight))
+
+	err = store.db.QueryRowContext(ctx,
+		"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", id).Scan(&pu, &dah)
+	require.NoError(t, err)
+	require.False(t, pu.Valid, "preserve_until must be cleared")
+	require.False(t, dah.Valid, "reorg un-spent an output — parent must NOT be re-stamped for deletion")
+}
+
 func TestSetMinedMultiBatched(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

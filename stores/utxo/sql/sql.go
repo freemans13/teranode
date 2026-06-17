@@ -5228,6 +5228,14 @@ func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeig
 // This clears any existing DeleteAtHeight and sets PreserveUntil to the specified height.
 // Used to protect parent transactions when cleaning up unmined transactions.
 //
+// PRUNE-ELIGIBILITY GATE: only transactions that already carry a delete_at_height stamp (eligible
+// now) or are already being preserved (preserve_until set, so renewal still works) are preserved.
+// A transaction with neither is not fully spent, so it is not at risk of pruning and there is
+// nothing to protect — preserving it would be pointless work, and it is exactly the not-fully-spent
+// input that the expiry path could otherwise turn into a bad deletion stamp. The setter-side check
+// in ProcessExpiredPreservations remains the safety net for the case where a preserved (eligible)
+// tx is later un-spent by a reorg.
+//
 // IDEMPOTENCY: This operation is safely re-runnable:
 // - SQL UPDATE returns 0 rows affected (not an error) if records already deleted
 // - Multiple preservation attempts with same preserveUntil are idempotent
@@ -5251,12 +5259,19 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 			chunk[j] = txID[:]
 		}
 
-		// preserveUntilHeight is $1, hashes start at $2
+		// preserveUntilHeight is $1, hashes start at $2.
+		// Only preserve prune-eligible txs: those that already carry a delete_at_height stamp
+		// (eligible now), OR are already preserved (preserve_until set — they were eligible and
+		// are being held; this lets a still-needed preservation be renewed/extended each cycle
+		// even though the first preservation cleared the DAH). A tx with neither is not fully
+		// spent, so it is not at risk of pruning and needs no protection — gating here avoids
+		// pointless writes and keeps not-fully-spent inputs out of the preservation/expiry path.
 		inClause, inArgs := buildINClause(chunk, 2)
 		query := fmt.Sprintf(`
 			UPDATE transactions
 			SET preserve_until = $1, delete_at_height = NULL
 			WHERE hash IN %s
+			AND (delete_at_height IS NOT NULL OR preserve_until IS NOT NULL)
 		`, inClause)
 		args := append([]interface{}{preserveUntilHeight}, inArgs...)
 

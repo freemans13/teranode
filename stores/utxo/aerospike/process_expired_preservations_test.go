@@ -14,12 +14,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestProcessExpiredPreservations verifies the invariant that delete_at_height is
-// only stamped at preservation expiry when the transaction is genuinely safe to
-// drop (mined, on the longest chain, AND fully spent). ProcessExpiredPreservations
-// writes the deleteAtHeight bin directly (bypassing the Lua setDeleteAtHeight
-// self-heal), so without an eligibility check it would stamp a transaction that
-// still has live outputs — and the DAH pruner deletes purely on that stamp.
+// TestProcessExpiredPreservations verifies the setter-side layer: delete_at_height is only
+// stamped at preservation expiry when the transaction is genuinely safe to drop (mined, on the
+// longest chain, AND fully spent). ProcessExpiredPreservations writes the deleteAtHeight bin
+// directly (bypassing the Lua setDeleteAtHeight self-heal), so without an eligibility check it
+// would stamp a transaction that still has live outputs — and the DAH pruner deletes purely on
+// that stamp. preserveUntil is set directly here (not via PreserveTransactions) so this exercises
+// the expiry path in isolation, independent of the Phase-1 prune-eligibility gate.
 func TestProcessExpiredPreservations(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
@@ -29,9 +30,9 @@ func TestProcessExpiredPreservations(t *testing.T) {
 	client, store, ctx, deferFn := initAerospike(t, tSettings, logger)
 	defer deferFn()
 
-	// ProcessExpiredPreservations selects expired records via a secondary index on
-	// preserveUntil. The store does not create this index itself (the method is not
-	// yet wired into the pruner cycle), so create it explicitly for the test.
+	// ProcessExpiredPreservations selects expired records via a secondary index on preserveUntil.
+	// The store does not create this index itself (the method is not yet wired into the pruner
+	// cycle), so create it explicitly for the test.
 	writePolicy := aerospike.NewWritePolicy(0, 0)
 	_, err := client.CreateIndex(writePolicy, store.GetNamespace(), store.GetName(),
 		"test_preserveUntilIndex", fields.PreserveUntil.String(), aerospike.NUMERIC)
@@ -39,14 +40,26 @@ func TestProcessExpiredPreservations(t *testing.T) {
 
 	const currentHeight = uint32(200)
 	retention := tSettings.GetUtxoStoreBlockHeightRetention()
-	expiredPreserveUntil := uint32(currentHeight - 10)
+	expiredPreserveUntil := int(currentHeight - 10)
 
 	txKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), tx.TxIDChainHash().CloneBytes())
 	require.NoError(t, err)
 
+	// markPreservedExpired writes an already-expired preserveUntil directly and clears
+	// deleteAtHeight, matching the record state left by a preservation (and bypassing the
+	// Phase-1 eligibility gate so the expiry path can be tested for any record state).
+	markPreservedExpired := func(t *testing.T) {
+		t.Helper()
+		wp := util.GetAerospikeWritePolicy(tSettings, 0)
+		wp.RecordExistsAction = aerospike.UPDATE
+		require.NoError(t, client.PutBins(wp, txKey,
+			aerospike.NewBin(fields.PreserveUntil.String(), expiredPreserveUntil),
+			aerospike.NewBin(fields.DeleteAtHeight.String(), nil)))
+	}
+
 	// processExpiryUntilProcessed runs ProcessExpiredPreservations, retrying to absorb
-	// secondary-index build lag, until the record's preserveUntil bin is cleared
-	// (proving the expired record was actually found and processed by the query).
+	// secondary-index build lag, until the record's preserveUntil bin is cleared (proving the
+	// expired record was actually found and processed by the query).
 	processExpiryUntilProcessed := func(t *testing.T) {
 		t.Helper()
 		require.Eventually(t, func() bool {
@@ -62,8 +75,7 @@ func TestProcessExpiredPreservations(t *testing.T) {
 
 		_, err := store.Create(ctx, tx, 0) // unmined, unspent
 		require.NoError(t, err)
-
-		require.NoError(t, store.PreserveTransactions(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, expiredPreserveUntil))
+		markPreservedExpired(t)
 
 		processExpiryUntilProcessed(t)
 
@@ -87,8 +99,7 @@ func TestProcessExpiredPreservations(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		// Preserve (clears the DAH set at mining time, sets preserveUntil).
-		require.NoError(t, store.PreserveTransactions(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, expiredPreserveUntil))
+		markPreservedExpired(t) // simulate the preserved state (DAH cleared, preserveUntil set)
 
 		processExpiryUntilProcessed(t)
 
@@ -105,8 +116,8 @@ func TestProcessExpiredPreservations(t *testing.T) {
 		_, err := store.Create(ctx, tx, 0)
 		require.NoError(t, err)
 
-		// Mine on the longest chain but spend only output 0 — the parent still has
-		// live outputs, so it is NOT fully spent and must not be stamped.
+		// Mine on the longest chain but spend only output 0 — the parent still has live
+		// outputs, so it is NOT fully spent and must not be stamped.
 		_, err = store.Spend(ctx, spendTx, 1)
 		require.NoError(t, err)
 		_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{
@@ -114,7 +125,7 @@ func TestProcessExpiredPreservations(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		require.NoError(t, store.PreserveTransactions(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, expiredPreserveUntil))
+		markPreservedExpired(t)
 
 		processExpiryUntilProcessed(t)
 
@@ -123,5 +134,57 @@ func TestProcessExpiredPreservations(t *testing.T) {
 		require.Nil(t, rec.Bins[fields.PreserveUntil.String()], "preserveUntil must be cleared")
 		require.Nil(t, rec.Bins[fields.DeleteAtHeight.String()],
 			"partially-spent parent must NOT be stamped — it still has live UTXOs")
+		// Note: the reorg-window scenario (a parent fully spent + preserved, then un-spent by a
+		// reorg) has the SAME end state as this case at expiry time — mined, not fully spent,
+		// preserveUntil set — so this subtest also covers the setter's behaviour there. The full
+		// preserve→reorg→expiry narrative is exercised end-to-end in the SQL store tests
+		// (TestProcessExpiredPreservations_ReorgUnspendDuringWindow).
 	})
+}
+
+// TestPreserveTransactions_OnlyPreservesPruneEligible verifies the Phase-1 layer for Aerospike:
+// PreserveTransactions only preserves transactions that already carry a deleteAtHeight stamp.
+// A transaction with no stamp is not at risk of pruning, so it must be left untouched rather than
+// pointlessly preserved (and dragged into the expiry path).
+func TestPreserveTransactions_OnlyPreservesPruneEligible(t *testing.T) {
+	run := func(t *testing.T, useExpressions bool) {
+		logger := ulogger.NewErrorTestLogger(t)
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.Aerospike.EnablePreserveFilterExpressions = useExpressions
+
+		client, store, ctx, deferFn := initAerospike(t, tSettings, logger)
+		defer deferFn()
+		cleanDB(t, client)
+
+		_, createErr := store.Create(ctx, tx, 0)
+		require.NoError(t, createErr)
+
+		txKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), tx.TxIDChainHash().CloneBytes())
+		require.NoError(t, err)
+
+		const preserveUntilHeight = uint32(1000)
+
+		// Ineligible: no deleteAtHeight stamp → must NOT be preserved.
+		require.NoError(t, store.PreserveTransactions(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, preserveUntilHeight))
+		rec, err := client.Get(util.GetAerospikeReadPolicy(tSettings), txKey)
+		require.NoError(t, err)
+		require.Nil(t, rec.Bins[fields.PreserveUntil.String()],
+			"tx with no DAH is not at risk and must not be preserved")
+
+		// Now give it a deleteAtHeight stamp (prune-eligible) and preserve again.
+		wp := util.GetAerospikeWritePolicy(tSettings, 0)
+		wp.RecordExistsAction = aerospike.UPDATE
+		require.NoError(t, client.PutBins(wp, txKey, aerospike.NewBin(fields.DeleteAtHeight.String(), 500)))
+
+		require.NoError(t, store.PreserveTransactions(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, preserveUntilHeight))
+		rec, err = client.Get(util.GetAerospikeReadPolicy(tSettings), txKey)
+		require.NoError(t, err)
+		require.Equal(t, int(preserveUntilHeight), rec.Bins[fields.PreserveUntil.String()],
+			"prune-eligible tx must be preserved")
+		require.Nil(t, rec.Bins[fields.DeleteAtHeight.String()],
+			"preservation clears the DAH so the tx is held")
+	}
+
+	t.Run("lua", func(t *testing.T) { run(t, false) })
+	t.Run("expressions", func(t *testing.T) { run(t, true) })
 }

@@ -68,6 +68,7 @@ import (
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	asl "github.com/bsv-blockchain/aerospike-client-go/v8/logger"
+	"github.com/bsv-blockchain/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-batcher/v2"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -908,6 +909,13 @@ func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeig
 // This clears any existing DeleteAtHeight and sets PreserveUntil to the specified height.
 // Used to protect parent transactions when cleaning up unmined transactions.
 //
+// PRUNE-ELIGIBILITY GATE: only transactions that already carry a deleteAtHeight stamp are
+// preserved. A record with no stamp is not fully spent, so it is not at risk of pruning and needs
+// no protection; preserving it would be pointless work and would feed a not-fully-spent tx into
+// the expiry path. The gate is enforced in the Lua preserveUntil UDF (no-op when no DAH) and via a
+// FilterExpression in the expression path. ProcessExpiredPreservations remains the setter-side
+// safety net for an eligible tx that is later un-spent by a reorg.
+//
 // IDEMPOTENCY: This operation is safely re-runnable:
 // - Missing transactions (LuaErrorCodeTxNotFound) are logged as debug, not errors
 // - Multiple preservation attempts with same preserveUntil are idempotent
@@ -925,6 +933,17 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	// Use batch operations for efficiency
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
+
+	// Prune-eligibility gate (see method doc): only run the preserveUntil UDF on records that
+	// already carry a deleteAtHeight stamp (eligible now) or are already being preserved
+	// (preserveUntil set, so renewal still works). Records with neither are not fully spent,
+	// not at risk of pruning, and return FILTERED_OUT — treated as a benign skip below. Done as
+	// a server-side filter (not a Lua change) so it applies without re-registering the UDF
+	// module, which is keyed by name and would otherwise need a version bump to update.
+	batchUDFPolicy.FilterExpression = aerospike.ExpOr(
+		aerospike.ExpBinExists(fields.DeleteAtHeight.String()),
+		aerospike.ExpBinExists(fields.PreserveUntil.String()),
+	)
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(txIDs))
 
@@ -959,9 +978,19 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	preservedCount := 0
 	var parseErrors, luaErrors, noResponseErrors int
 
+	var skippedCount int
+
 	for i, record := range batchRecords {
 		batchRecord := record.BatchRec()
 		if batchRecord.Err != nil {
+			// FILTERED_OUT: not prune-eligible (no deleteAtHeight and not already preserved) —
+			// a deliberate skip by the eligibility gate, not an error.
+			var aErr *aerospike.AerospikeError
+			if errors.As(batchRecord.Err, &aErr) && aErr.ResultCode == types.FILTERED_OUT {
+				skippedCount++
+				continue
+			}
+
 			s.logger.Warnf("[PreserveTransactions] Failed to preserve tx %s: %v", txIDs[i].String(), batchRecord.Err)
 			continue
 		}
@@ -991,7 +1020,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		s.logger.Errorf("[PreserveTransactions] Errors processing %d transactions: %d parse failures, %d lua errors, %d missing responses", len(txIDs), parseErrors, luaErrors, noResponseErrors)
 	}
 
-	s.logger.Debugf("[PreserveTransactions] Successfully preserved %d out of %d transactions", preservedCount, len(txIDs))
+	s.logger.Debugf("[PreserveTransactions] Successfully preserved %d out of %d transactions (%d skipped: not prune-eligible)", preservedCount, len(txIDs), skippedCount)
 
 	return nil
 }
