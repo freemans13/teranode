@@ -355,10 +355,20 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to serialize subtree", subtreeHash.String(), err)
 					}
 
-					// Store the subtreeToCheck for later processing
-					// we not set a DAH as this is part of a block and will be permanently stored anyway
+					// Store the subtreeToCheck marker for later processing, with a DAH of
+					// current block height + subtree-validation retention (set above).
 					if err = u.subtreeStore.Set(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes, options.WithDeleteAt(dah)); err != nil {
-						return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to store subtree", subtreeHash.String(), err)
+						// ErrBlobAlreadyExists is benign: the subtree filename is its content
+						// hash (verified above), so an existing file holds identical bytes. This
+						// happens when the same block is validated concurrently (announced by two
+						// peers) or retried after a partial attempt — racing on this content-
+						// addressed write must not fail the block. Mirrors the same handling for
+						// FileTypeSubtree/FileTypeSubtreeMeta in ValidateSubtreeInternal.
+						if errors.Is(err, errors.ErrBlobAlreadyExists) {
+							u.logger.Warnf("[CheckBlockSubtrees][%s] subtreeToCheck already exists in store", subtreeHash.String())
+						} else {
+							return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to store subtreeToCheck", subtreeHash.String(), err)
+						}
 					}
 				}
 
