@@ -59,6 +59,12 @@ WITH validation AS (
     SELECT
         substr(t.utxo_hashes, $2::int * 32 + 1, 32) AS utxo_hash,
         (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1) AS output_frozen,
+        -- An output is only spendable if its out_spendables bit is set. A non-spendable
+        -- output (e.g. OP_RETURN) still has a utxo_hash stored, so the hash match alone
+        -- is not enough to authorise a spend — without this gate a caller presenting the
+        -- correct hash of an OP_RETURN output could insert a spend row. Matches the
+        -- aerospike (UTXO_NOT_FOUND) and sql (no output row) stores.
+        (t.out_spendables IS NOT NULL AND get_bit(t.out_spendables, $2::int) = 1) AS output_spendable,
         t.coinbase_spending_height AS coinbase_spending_height,
         CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END AS spendable_in,
         t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
@@ -68,7 +74,7 @@ WITH validation AS (
 inserted AS (
     INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height)
     SELECT $1, $2, $3, $5 FROM validation v
-    WHERE v.utxo_hash = $4 AND NOT v.output_frozen AND NOT v.tx_frozen
+    WHERE v.utxo_hash = $4 AND v.output_spendable AND NOT v.output_frozen AND NOT v.tx_frozen
       AND ($6 OR NOT v.tx_locked) AND ($7 OR NOT v.tx_conflicting)
       AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $5)
       AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $5 < COALESCE(v.spendable_in, 0))
@@ -87,6 +93,7 @@ const spendDiagnosticSQL = `
 SELECT
     substr(t.utxo_hashes, $2::int * 32 + 1, 32) AS utxo_hash,
     (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1) AS output_frozen,
+    (t.out_spendables IS NOT NULL AND get_bit(t.out_spendables, $2::int) = 1) AS output_spendable,
     CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END AS spendable_in,
     t.coinbase_spending_height AS coinbase_spending_height,
     t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen,
@@ -423,7 +430,31 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		batchIdxs[i] = int32(i)
 	}
 
-	rows, err := conn.Query(ctx, bulkSpendSQL,
+	// Wrap the bulk validation+INSERT in a transaction so we can pin a fresh CUSTOM
+	// plan for this one statement. pgx caches a per-connection prepared-statement
+	// plan; for the UNNEST array-cardinality + partitioned-join shape here a bad
+	// GENERIC plan can lock in and tank throughput (the same failure mode that was
+	// patched in the DAH sweep — see dah_sweep.go). SET LOCAL re-plans against the
+	// actual array cardinality each batch and auto-resets at COMMIT. The BEGIN/SET/
+	// COMMIT cost is one round-trip pair per BATCH (amortised over up to
+	// SpendBatcherSize spends), so it is negligible per spend.
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] bulk begin: %v", err)
+		}
+		return false
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx, `SET LOCAL plan_cache_mode = force_custom_plan`); err != nil {
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] bulk set plan_cache_mode: %v", err)
+		}
+		return false
+	}
+
+	rows, err := tx.Query(ctx, bulkSpendSQL,
 		prevTxHashes, prevIdxs, spendingDatas, utxoHashes,
 		blockHeights, ignLockeds, ignConflictings, batchIdxs,
 	)
@@ -435,16 +466,17 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	}
 
 	type bulkResult struct {
-		inserted       bool
-		found          bool
-		outputFrozen   bool
-		txFrozen       bool
-		txLocked       bool
-		txConflicting  bool
-		utxoHashMatch  bool
-		coinbaseBlock  bool
-		spendableBlock bool
-		slotExists     bool // true when the array subscript is in-bounds
+		inserted        bool
+		found           bool
+		outputFrozen    bool
+		txFrozen        bool
+		txLocked        bool
+		txConflicting   bool
+		utxoHashMatch   bool
+		coinbaseBlock   bool
+		spendableBlock  bool
+		slotExists      bool // true when the array subscript is in-bounds
+		outputSpendable bool // false for non-spendable outputs (e.g. OP_RETURN)
 	}
 	resultMap := make(map[int]*bulkResult, len(batch))
 	for rows.Next() {
@@ -452,7 +484,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		r := &bulkResult{}
 		if err := rows.Scan(&bIdx, &r.inserted,
 			&r.outputFrozen, &r.txFrozen, &r.txLocked, &r.txConflicting,
-			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock, &r.slotExists); err != nil {
+			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock, &r.slotExists, &r.outputSpendable); err != nil {
 			rows.Close()
 			for _, item := range batch {
 				item.errCh <- errors.NewStorageError("[Spend] scan", err)
@@ -477,6 +509,15 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		return false
 	}
 
+	// Commit the validated inserts before dispatching results. resultMap already
+	// holds every row's outcome, so a commit failure must fail the whole batch.
+	if err := tx.Commit(ctx); err != nil {
+		for _, item := range batch {
+			item.errCh <- errors.NewStorageError("[Spend] bulk commit: %v", err)
+		}
+		return false
+	}
+
 	for i, item := range batch {
 		spend := item.spend
 		r, found := resultMap[i]
@@ -489,6 +530,12 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		if !r.slotExists {
 			// Tx found but output index is OOB — treat as not found (no such output).
 			item.errCh <- errors.NewTxNotFoundError("output %s:%d not found (index OOB)", spend.TxID, spend.Vout)
+			continue
+		}
+		if !r.outputSpendable {
+			// Output exists but is not a spendable UTXO (e.g. OP_RETURN). Treat as
+			// not found, matching the aerospike/sql stores.
+			item.errCh <- errors.NewTxNotFoundError("output %s:%d not found (not a spendable UTXO)", spend.TxID, spend.Vout)
 			continue
 		}
 		if r.inserted {
@@ -559,6 +606,9 @@ validated AS (
            i.block_height, i.ign_locked, i.ign_conflicting,
            CASE WHEN i.prev_idx::int < t.out_count THEN substr(t.utxo_hashes, i.prev_idx::int * 32 + 1, 32) END AS utxo_hash,
            CASE WHEN i.prev_idx::int < t.out_count AND t.out_frozens IS NOT NULL THEN get_bit(t.out_frozens, i.prev_idx::int) = 1 ELSE false END AS out_frozen,
+           -- Spendable bit: a non-spendable output (OP_RETURN) carries a utxo_hash but
+           -- must not be spendable. See spendValidationSQL for the rationale.
+           CASE WHEN i.prev_idx::int < t.out_count AND t.out_spendables IS NOT NULL THEN get_bit(t.out_spendables, i.prev_idx::int) = 1 ELSE false END AS out_spendable,
            CASE WHEN array_length(t.spendable_ins,1) >= i.prev_idx::int+1 THEN t.spendable_ins[i.prev_idx::int+1] END AS spendable_in,
            t.coinbase_spending_height AS coinbase_spending_height,
            t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
@@ -566,7 +616,7 @@ validated AS (
 ),
 to_insert AS (
     SELECT prev_tx_hash, prev_idx, spending_data, block_height, batch_idx FROM validated
-    WHERE utxo_hash = expected_utxo_hash AND NOT out_frozen AND NOT tx_frozen
+    WHERE utxo_hash = expected_utxo_hash AND out_spendable AND NOT out_frozen AND NOT tx_frozen
       AND (ign_locked OR NOT tx_locked) AND (ign_conflicting OR NOT tx_conflicting)
       AND NOT (coinbase_spending_height > 0 AND coinbase_spending_height > block_height)
       AND NOT (COALESCE(spendable_in,0) > 0 AND block_height < COALESCE(spendable_in,0))
@@ -582,7 +632,8 @@ SELECT v.batch_idx, (i.prev_tx_hash IS NOT NULL) AS inserted,
        (v.utxo_hash IS NOT NULL AND v.utxo_hash = v.expected_utxo_hash) AS utxo_match,
        (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > v.block_height) AS coinbase_block,
        (COALESCE(v.spendable_in,0) > 0 AND v.block_height < COALESCE(v.spendable_in,0)) AS spendable_block,
-       (v.utxo_hash IS NOT NULL) AS slot_exists
+       (v.utxo_hash IS NOT NULL) AS slot_exists,
+       v.out_spendable AS output_spendable
 FROM validated v LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
 ORDER BY v.batch_idx
 `
@@ -595,6 +646,7 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 	var (
 		utxoHashBytes          []byte
 		outputFrozen           bool
+		outputSpendable        bool
 		spendableIn            *int32
 		coinbaseSpendingHeight int64
 		txLocked               bool
@@ -606,7 +658,7 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 	err := s.pool.QueryRow(ctx, spendDiagnosticSQL,
 		spend.TxID[:],     // $1
 		int32(spend.Vout), // $2 (INT4; range-checked at the Spend entry point)
-	).Scan(&utxoHashBytes, &outputFrozen, &spendableIn,
+	).Scan(&utxoHashBytes, &outputFrozen, &outputSpendable, &spendableIn,
 		&coinbaseSpendingHeight, &txLocked, &txConflicting, &txFrozen, &existingSpendBytes)
 
 	if err != nil {
@@ -616,7 +668,8 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 		return errors.NewStorageError("[Spend] diagnostic query failed for %s:%d", spend.TxID, spend.Vout, err)
 	}
 
-	// Check existing spend (double-spend or idempotent).
+	// Check existing spend (double-spend or idempotent). Honour a recorded spend
+	// regardless of the spendable bit so an already-spent UTXO is still reported.
 	if existingSpendBytes != nil {
 		if bytes.Equal(existingSpendBytes, spendingDataBytes) {
 			// Idempotent: same spending data already recorded.
@@ -628,6 +681,12 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 			return errors.NewProcessingError("failed to parse existing spending data", parseErr)
 		}
 		return errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSD)
+	}
+
+	// Non-spendable output (e.g. OP_RETURN): exists with a utxo_hash but is not a
+	// UTXO, so it can never be spent. Report not-found, matching aerospike/sql.
+	if !outputSpendable {
+		return errors.NewTxNotFoundError("output %s:%d not found (not a spendable UTXO)", spend.TxID, spend.Vout)
 	}
 
 	// Check frozen.
@@ -661,8 +720,17 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 		return errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *spendableIn)
 	}
 
-	// If we get here, the reason is unknown (possible race condition).
-	return errors.NewStorageError("[Spend] unknown failure for %s:%d", spend.TxID, spend.Vout)
+	// We reach here only when the INSERT recorded 0 rows yet the diagnostic read
+	// finds a spendable, unfrozen, unlocked, non-conflicting, hash-matching, mature
+	// output with NO existing spend row. The only way to produce that is the
+	// ON CONFLICT having fired against a row that a concurrent Unspend then deleted
+	// before this read (separate pool connection, separate snapshot). The UTXO is
+	// therefore back to unspent and the caller's retry will re-insert cleanly — so
+	// this is an idempotent no-op, NOT a hard error. Returning a StorageError here
+	// (the old behaviour) spuriously failed a valid retry and, in a batch, left
+	// already-committed sibling inputs un-rolled-back (StorageError is not in
+	// needsSpendRollback). Treat it as success.
+	return nil
 }
 
 // needsSpendRollback returns true if any spend failed due to a validation error

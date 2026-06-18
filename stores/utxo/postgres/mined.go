@@ -233,12 +233,22 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 				unmined_since = CASE
 					WHEN COALESCE(array_length(array_remove(t.block_ids, $2), 1), 0) = 0
 					THEN $3::int ELSE t.unmined_since END,
-				-- Clear the deferred-prune stamp when the tx falls off the longest
-				-- chain (no block_ids remain). It is no longer "mined and fully spent
-				-- on the longest chain", so it must not be pruned at the old stamp.
-				delete_at_height = CASE
+				-- Clear the deferred-prune stamp UNCONDITIONALLY on any unset-mined.
+				-- Removing a block changes the tx's chain membership, so any existing
+				-- delete_at_height is no longer trustworthy. Clearing it always (not
+				-- only when the LAST block is removed) closes the partial-reorg window
+				-- where one block is removed but others — themselves later reorged out
+				-- in a separate call — leave a stale stamp the pruner would act on. The
+				-- DAH sweep re-stamps the tx for free once it is genuinely eligible
+				-- again; the cost is at most one extra sweep pass.
+				delete_at_height = NULL,
+				-- Clear mined_at_height when the tx is fully reorged out (no block_ids
+				-- remain) so the DAH sweep's mine-arm stops re-enumerating it as a
+				-- phantom candidate on every pass over the old mining height. Preserve
+				-- it on a partial reorg (still mined on a remaining block).
+				mined_at_height = CASE
 					WHEN COALESCE(array_length(array_remove(t.block_ids, $2), 1), 0) = 0
-					THEN NULL ELSE t.delete_at_height END,
+					THEN NULL ELSE t.mined_at_height END,
 				locked = false
 			WHERE t.hash = $1
 			RETURNING t.block_ids`,

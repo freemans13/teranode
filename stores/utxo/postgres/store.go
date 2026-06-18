@@ -207,23 +207,26 @@ func configureBatcher[T any](b *batcher.Batcher[T], maxConcurrent int, drain boo
 }
 
 // Stop closes batchers and database connections.
+//
+// It does NOT nil the batcher pointer fields. Those are written exactly once, in
+// Start(), which happens-before any Create/Spend/Get/SetLocked call — so the
+// unsynchronised nil-checks in those hot paths are race-free as long as nothing
+// writes the pointers again. Nilling them here (concurrently with an in-flight
+// operation reading them) was a data race; go-batcher Close is idempotent, so
+// closing without nilling is safe and matches the sql store's Stop().
 func (s *Store) Stop() {
 	s.stopPrunerCursor()
 	if s.createBatcher != nil {
 		s.createBatcher.Close()
-		s.createBatcher = nil
 	}
 	if s.spendBatcher != nil {
 		s.spendBatcher.Close()
-		s.spendBatcher = nil
 	}
 	if s.getBatcher != nil {
 		s.getBatcher.Close()
-		s.getBatcher = nil
 	}
 	if s.unlockBatcher != nil {
 		s.unlockBatcher.Close()
-		s.unlockBatcher = nil
 	}
 	if s.pool != nil {
 		s.pool.Close()
