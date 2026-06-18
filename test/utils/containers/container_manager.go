@@ -25,7 +25,7 @@ type UTXOStoreType string
 const (
 	// UTXOStoreAerospike uses Aerospike as the UTXO store backend
 	UTXOStoreAerospike UTXOStoreType = "aerospike"
-	// UTXOStorePostgres uses PostgreSQL as the UTXO store backend
+	// UTXOStorePostgres uses the optimized PostgreSQL UTXO store backend
 	UTXOStorePostgres UTXOStoreType = "postgres"
 	// UTXOStoreSQLite uses SQLite as the UTXO store backend (no container needed)
 	UTXOStoreSQLite UTXOStoreType = "sqlite"
