@@ -430,31 +430,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		batchIdxs[i] = int32(i)
 	}
 
-	// Wrap the bulk validation+INSERT in a transaction so we can pin a fresh CUSTOM
-	// plan for this one statement. pgx caches a per-connection prepared-statement
-	// plan; for the UNNEST array-cardinality + partitioned-join shape here a bad
-	// GENERIC plan can lock in and tank throughput (the same failure mode that was
-	// patched in the DAH sweep — see dah_sweep.go). SET LOCAL re-plans against the
-	// actual array cardinality each batch and auto-resets at COMMIT. The BEGIN/SET/
-	// COMMIT cost is one round-trip pair per BATCH (amortised over up to
-	// SpendBatcherSize spends), so it is negligible per spend.
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] bulk begin: %v", err)
-		}
-		return false
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	if _, err := tx.Exec(ctx, `SET LOCAL plan_cache_mode = force_custom_plan`); err != nil {
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] bulk set plan_cache_mode: %v", err)
-		}
-		return false
-	}
-
-	rows, err := tx.Query(ctx, bulkSpendSQL,
+	rows, err := conn.Query(ctx, bulkSpendSQL,
 		prevTxHashes, prevIdxs, spendingDatas, utxoHashes,
 		blockHeights, ignLockeds, ignConflictings, batchIdxs,
 	)
@@ -505,15 +481,6 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	if err := rows.Err(); err != nil {
 		for _, item := range batch {
 			item.errCh <- errors.NewStorageError("[Spend] bulk rows iteration", err)
-		}
-		return false
-	}
-
-	// Commit the validated inserts before dispatching results. resultMap already
-	// holds every row's outcome, so a commit failure must fail the whole batch.
-	if err := tx.Commit(ctx); err != nil {
-		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] bulk commit: %v", err)
 		}
 		return false
 	}
