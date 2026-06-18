@@ -293,6 +293,28 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 		return nil, errors.NewStorageError("failed to insert genesis transaction", err)
 	}
 
+	if useInMemory {
+		// Initialise maxBlockID synchronously, before any query can be served.
+		// maxBlockID is otherwise only set at the end of rebuildOffChainSet, which
+		// runs asynchronously below and can time out on a cold cache during catchup —
+		// leaving maxBlockID at 0 once the startup guard is released. A zero
+		// maxBlockID makes CheckBlockIsInCurrentChain's in-memory path drop every
+		// committed parent id as "above the highest id" and return a (false, nil)
+		// false negative that checkOldBlockIDs escalates into a PERMANENT block
+		// invalidation. This cheap MAX(id) query (an index-only scan, unlike the
+		// timeout-prone off-chain CTE) closes that startup window. Best-effort: on
+		// error the CTE fallback in CheckBlockIsInCurrentChain still keeps results
+		// correct, so do not fail startup over it.
+		maxIDCtx, maxIDCancel := s.shutdownAwareContext(rebuildOffChainSetTimeout)
+		var maxID uint32
+		if scanErr := s.db.QueryRowContext(maxIDCtx, `SELECT COALESCE(MAX(id), 0) FROM blocks`).Scan(&maxID); scanErr != nil {
+			s.logger.Warnf("startup: failed to initialise maxBlockID (will be set by first rebuild): %v", scanErr)
+		} else {
+			s.updateMaxBlockID(uint64(maxID))
+		}
+		maxIDCancel()
+	}
+
 	// Hold the rebuild guard synchronously until the background goroutine has started
 	// and incremented it itself. This ensures concurrent queries fall back to the CTE
 	// from the moment New() returns, even before the goroutine is scheduled — without
@@ -1656,6 +1678,21 @@ func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
 		err  error
 	)
 
+	// Refresh maxBlockID BEFORE the (potentially slow, timeout-prone) off-chain
+	// query below. maxBlockID is the authoritative upper bound consulted by
+	// CheckBlockIsInCurrentChain's in-memory path. The off-chain query can be a
+	// full-chain recursive CTE that times out on a cold cache during catchup; if
+	// it does, this function returns early. Doing the cheap MAX(id) query up front
+	// guarantees maxBlockID is still refreshed rather than left at a stale/zero
+	// value — a zero maxBlockID makes every committed parent id look "above the
+	// highest id", a false negative that checkOldBlockIDs escalates into a
+	// PERMANENT block invalidation.
+	var maxID uint32
+	if err = s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM blocks`).Scan(&maxID); err != nil {
+		return errors.NewStorageError("rebuildOffChainSet: failed to query max block ID", err)
+	}
+	s.updateMaxBlockID(uint64(maxID))
+
 	if s.mainChainRebuilding.Load() > 0 {
 		// on_main_chain flags may be mid-update — fall back to the authoritative CTE walk.
 		// Walk the main chain from bestBlockID backward to genesis via parent_id,
@@ -1701,15 +1738,6 @@ func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
 	s.offChainBlockIDsMu.Lock()
 	s.offChainBlockIDs = offChain
 	s.offChainBlockIDsMu.Unlock()
-
-	// Update maxBlockID from the database. This is the authoritative upper bound
-	// for block IDs — any ID above this cannot exist and should not be treated as
-	// on-chain by CheckBlockIsInCurrentChain.
-	var maxID uint32
-	if err = s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM blocks`).Scan(&maxID); err != nil {
-		return errors.NewStorageError("rebuildOffChainSet: failed to query max block ID", err)
-	}
-	s.updateMaxBlockID(uint64(maxID))
 
 	if len(offChain) > 0 {
 		s.logger.Infof("rebuildOffChainSet: %d off-chain block IDs, maxBlockID=%d", len(offChain), maxID)
