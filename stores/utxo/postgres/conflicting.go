@@ -344,6 +344,18 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 
 		result, err := s.pool.Exec(ctx, q, args...)
 		if err != nil {
+			// DO NOT "fix" this by wrapping the chunk loop in a single transaction
+			// and rolling back on error. The false branch above is a CLEAR
+			// (delete_at_height = NULL) that makes a reorged-out tx safe from the
+			// pruner, so for THIS operation partial application is SAFER than none:
+			// rolling back on a chunk failure would un-clear the chunks already made
+			// safe, enlarging the stale-stamp set from just the failed chunk to the
+			// ENTIRE batch. (Atomicity is the right property for a SET, where partial
+			// application is the hazard — not for a clear.) Instead we continue,
+			// clearing every remaining chunk, and return the joined error so the
+			// caller retries the whole, idempotent set. A failed chunk's stamp is a
+			// FUTURE height (completion + retention), so the pruner cannot act on it
+			// before a retry (or the next reorg pass) re-clears it.
 			errorCount += len(chunk)
 			if len(allErrors) < 10 {
 				s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
