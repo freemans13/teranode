@@ -214,7 +214,7 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxNotFoundError("transaction %s not found", hash, err)
 		}
-		return nil, err
+		return nil, errors.NewStorageError("[Get] query tx %s: %v", hash, err)
 	}
 
 	if unminedSince != nil {
@@ -280,7 +280,7 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 			hash[:],
 		)
 		if err != nil {
-			return nil, err
+			return nil, errors.NewStorageError("[Get] query spends for %s: %v", hash, err)
 		}
 		defer rows.Close()
 
@@ -291,7 +291,7 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 				spendingDataBytes []byte
 			)
 			if err := rows.Scan(&idx, &spendingDataBytes); err != nil {
-				return nil, err
+				return nil, errors.NewStorageError("[Get] scan spend row for %s: %v", hash, err)
 			}
 
 			// prev_output_idx is an INT with no CHECK constraint in the spends
@@ -320,7 +320,7 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 			}
 		}
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return nil, errors.NewStorageError("[Get] iterate spends for %s: %v", hash, err)
 		}
 
 		// Check frozen outputs not yet covered by a spends row (unspent but frozen).
@@ -390,7 +390,7 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 				Status: int(utxo.Status_NOT_FOUND),
 			}, nil
 		}
-		return nil, err
+		return nil, errors.NewStorageError("[GetSpend] query %s:%d: %v", spend.TxID, spend.Vout, err)
 	}
 
 	// Validate UTXO hash matches.
@@ -402,7 +402,7 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 	if len(spendingDataBytes) > 0 {
 		spendingData, err = spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
 		if err != nil {
-			return nil, err
+			return nil, errors.NewProcessingError("[GetSpend] parse spending data for %s:%d: %v", spend.TxID, spend.Vout, err)
 		}
 	}
 
@@ -480,18 +480,18 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		hashToItems[item.Hash] = append(hashToItems[item.Hash], item)
 	}
 
-	// Query 1: Bulk fetch from txs (metadata + state + raw_tx).
-	inClause, inArgs := buildINClauseLocal(hashes, 1)
-
-	q := `SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
+	// Query 1: Bulk fetch from txs (metadata + state + raw_tx). `= ANY($1::bytea[])`
+	// keeps a single stable prepared-plan entry regardless of batch size, unlike a
+	// generated IN-list whose arity changes the statement each time.
+	const q = `SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
 	             locked, conflicting, frozen, unmined_since, raw_tx,
 	             block_ids, block_heights, subtree_idxs
 	      FROM txs
-	      WHERE hash IN ` + inClause
+	      WHERE hash = ANY($1::bytea[])`
 
-	rows, err := s.pool.Query(ctx, q, inArgs...)
+	rows, err := s.pool.Query(ctx, q, hashes)
 	if err != nil {
-		return err
+		return errors.NewStorageError("[BatchDecorate] query txs: %v", err)
 	}
 
 	hashToTx := make(map[chainhash.Hash]*txRow, len(items))
@@ -512,7 +512,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 			&row.data.Locked, &row.data.Conflicting, &row.data.Frozen, &unminedSince, &rawTx,
 			&blockIDs, &blkHeights, &subIdxs); err != nil {
 			rows.Close()
-			return err
+			return errors.NewStorageError("[BatchDecorate] scan txs row: %v", err)
 		}
 		row.version = uint32(version)
 		row.lockTime = uint32(lockTime)
@@ -544,7 +544,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	// mark existing transactions as TxNotFound and the function would return nil.
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return errors.NewStorageError("[BatchDecorate] iterate txs: %v", err)
 	}
 	rows.Close()
 
@@ -557,13 +557,6 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 
 	if len(hashToTx) == 0 {
 		return nil
-	}
-
-	// Collect tx hashes for subsequent queries.
-	txHashes := make([][]byte, 0, len(hashToTx))
-	for h := range hashToTx {
-		hCopy := h
-		txHashes = append(txHashes, hCopy[:])
 	}
 
 	needInputs := contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)
@@ -586,7 +579,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 
 	// Query 3: Bulk fetch outputs.
 	if needOutputs {
-		if err := s.batchDecorateOutputs(ctx, txHashes, hashToTx); err != nil {
+		if err := s.batchDecorateOutputs(hashToTx); err != nil {
 			return err
 		}
 	}
@@ -634,7 +627,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 // txs (in Query 1 of batchDecorateChunk). locking_script and satoshis are
 // present in raw_tx via bt.NewTxFromBytes; nil/zero-byte locking scripts are
 // legal (e.g. testnet anyone-can-spend outputs) and are preserved as-is.
-func (s *Store) batchDecorateOutputs(_ context.Context, _ [][]byte, hashToTx map[chainhash.Hash]*txRow) error {
+func (s *Store) batchDecorateOutputs(hashToTx map[chainhash.Hash]*txRow) error {
 	for _, row := range hashToTx {
 		if row.rawTx == nil {
 			continue
@@ -748,12 +741,11 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 			}
 
 			// Fetch raw_tx from txs (contains all outputs: locking_script+satoshis).
-			inClause, args := buildINClauseLocal(chunk, 1)
-			q := `SELECT hash, raw_tx FROM txs WHERE hash IN ` + inClause
+			const q = `SELECT hash, raw_tx FROM txs WHERE hash = ANY($1::bytea[])`
 
-			rows, err := s.pool.Query(gCtx, q, args...)
+			rows, err := s.pool.Query(gCtx, q, chunk)
 			if err != nil {
-				return err
+				return errors.NewStorageError("[BatchPreviousOutputsDecorate] query txs: %v", err)
 			}
 			defer rows.Close()
 
@@ -769,7 +761,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 				var hashBytes []byte
 				var rawTx []byte
 				if err := rows.Scan(&hashBytes, &rawTx); err != nil {
-					return err
+					return errors.NewStorageError("[BatchPreviousOutputsDecorate] scan txs row: %v", err)
 				}
 				var h chainhash.Hash
 				copy(h[:], hashBytes)

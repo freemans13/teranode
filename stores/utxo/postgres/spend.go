@@ -76,6 +76,9 @@ inserted AS (
     SELECT $1, $2, $3, $5 FROM validation v
     WHERE v.utxo_hash = $4 AND v.output_spendable AND NOT v.output_frozen AND NOT v.tx_frozen
       AND ($6 OR NOT v.tx_locked) AND ($7 OR NOT v.tx_conflicting)
+      -- coinbase_spending_height is the FIRST height at which the coinbase output is
+      -- spendable (inclusive): a spend at exactly that height is allowed, so the
+      -- immaturity test is strictly greater-than. Do not change to >=.
       AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $5)
       AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $5 < COALESCE(v.spendable_in, 0))
     ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
@@ -585,6 +588,8 @@ to_insert AS (
     SELECT prev_tx_hash, prev_idx, spending_data, block_height, batch_idx FROM validated
     WHERE utxo_hash = expected_utxo_hash AND out_spendable AND NOT out_frozen AND NOT tx_frozen
       AND (ign_locked OR NOT tx_locked) AND (ign_conflicting OR NOT tx_conflicting)
+      -- coinbase_spending_height is the FIRST spendable height (inclusive): a spend
+      -- at exactly that height is valid, so immaturity is strictly >. Do not use >=.
       AND NOT (coinbase_spending_height > 0 AND coinbase_spending_height > block_height)
       AND NOT (COALESCE(spendable_in,0) > 0 AND block_height < COALESCE(spendable_in,0))
 ),

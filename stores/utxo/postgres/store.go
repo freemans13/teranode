@@ -151,7 +151,8 @@ func (s *Store) Start(_ context.Context) {
 	globalDrain := s.settings.BatcherDrainMode
 	maxConc := s.settings.UtxoStore.BatcherMaxConcurrent
 
-	// Create batcher — pipelines N creates via COPY to staging + INSERT...SELECT.
+	// Create batcher — pipelines N creates via a single INSERT…SELECT FROM UNNEST
+	// (see sendCreateBatchUNNEST; no COPY, no staging table).
 	storeBatchSize := s.settings.UtxoStore.StoreBatcherSize
 	if storeBatchSize <= 0 {
 		storeBatchSize = 100

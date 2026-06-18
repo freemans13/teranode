@@ -33,23 +33,21 @@ func (s *Store) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemo
 	// too long and silently misaligning every subsequent read. This mirrors the
 	// UNNEST WITH ORDINALITY re-aggregation used by unsetMinedMulti.
 	// Idempotent: a block ID that is absent matches nothing.
+	//
+	// The three arrays are decoded ONCE: a single correlated row-subquery unnests
+	// them together and re-aggregates the kept positions, assigned to all three
+	// columns via a multi-column SET — rather than re-running the same unnest three
+	// times, one per SET column, as before. (A FROM/LATERAL subquery cannot
+	// reference the UPDATE target, but a SET subquery can, so this stays one pass.)
 	const q = `
 		UPDATE txs t SET
-			block_ids = COALESCE((
-				SELECT array_agg(e.bid ORDER BY e.ord)
+			(block_ids, block_heights, subtree_idxs) = (
+				SELECT COALESCE(array_agg(e.bid ORDER BY e.ord), '{}'::int[]),
+				       COALESCE(array_agg(e.bh  ORDER BY e.ord), '{}'::int[]),
+				       COALESCE(array_agg(e.si  ORDER BY e.ord), '{}'::int[])
 				FROM unnest(t.block_ids, t.block_heights, t.subtree_idxs) WITH ORDINALITY AS e(bid, bh, si, ord)
 				WHERE e.bid <> ALL($1::int[])
-			), '{}'::int[]),
-			block_heights = COALESCE((
-				SELECT array_agg(e.bh ORDER BY e.ord)
-				FROM unnest(t.block_ids, t.block_heights, t.subtree_idxs) WITH ORDINALITY AS e(bid, bh, si, ord)
-				WHERE e.bid <> ALL($1::int[])
-			), '{}'::int[]),
-			subtree_idxs = COALESCE((
-				SELECT array_agg(e.si ORDER BY e.ord)
-				FROM unnest(t.block_ids, t.block_heights, t.subtree_idxs) WITH ORDINALITY AS e(bid, bh, si, ord)
-				WHERE e.bid <> ALL($1::int[])
-			), '{}'::int[])
+			)
 		WHERE t.hash = $2`
 
 	for _, r := range removals {
