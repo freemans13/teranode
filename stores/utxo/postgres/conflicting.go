@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -64,10 +66,22 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	for _, conflictingTxHash := range txHashes {
 		txHash := conflictingTxHash
 
-		// Get the full tx so we can identify parents and outputs.
-		txMeta, err := s.Get(ctx, &txHash)
+		// Read the tx's raw bytes INSIDE this transaction with FOR UPDATE so the
+		// read-then-write is atomic under one snapshot and the row is locked against a
+		// concurrent prune/modify. (Previously this read the row via s.Get on a
+		// separate pool connection — a TOCTOU window that was safe only because raw_tx
+		// is immutable.) raw_tx is an inline, immutable BYTEA column (never
+		// externalised), and we only need it to recover the tx's inputs/parents.
+		var rawTx []byte
+		if err := pgxTx.QueryRow(ctx, `SELECT raw_tx FROM txs WHERE hash = $1 FOR UPDATE`, txHash[:]).Scan(&rawTx); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, nil, errors.NewTxNotFoundError("[SetConflicting] transaction not found: %s", txHash)
+			}
+			return nil, nil, errors.NewStorageError("[SetConflicting] read tx %s: %v", txHash, err)
+		}
+		tx, err := bt.NewTxFromBytes(rawTx)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, errors.NewProcessingError("[SetConflicting] parse raw_tx for %s: %v", txHash, err)
 		}
 
 		// Update txs: set conflicting flag + delete_at_height.
@@ -94,10 +108,10 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		if err != nil {
 			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", txHash, err)
 		}
-		// s.Get above read the row outside this transaction, so a concurrent prune
-		// could have deleted it between the read and this UPDATE. A 0-row update
-		// means the flag was never set — surface it rather than committing a no-op
-		// that the caller reads as a successful conflicting-mark.
+		// Defensive: the FOR UPDATE read above holds this row's lock for the whole
+		// transaction, so a concurrent prune can no longer delete it between the read
+		// and this UPDATE. Kept as a guard — a 0-row update would still mean the flag
+		// was never set, which the caller must not read as success.
 		if tag.RowsAffected() == 0 {
 			return nil, nil, errors.NewTxNotFoundError("[SetConflicting] transaction not found (concurrently removed?): %s", txHash)
 		}
@@ -106,9 +120,9 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		// The @> guard makes the append idempotent: a replay/retry must not push a
 		// duplicate child hash into the parent's array (matches the sql store's
 		// ON CONFLICT DO NOTHING).
-		if txMeta.Tx != nil {
-			seen := make(map[chainhash.Hash]struct{}, len(txMeta.Tx.Inputs))
-			for _, input := range txMeta.Tx.Inputs {
+		if tx != nil {
+			seen := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
+			for _, input := range tx.Inputs {
 				parentHash := *input.PreviousTxIDChainHash()
 				if _, ok := seen[parentHash]; ok {
 					continue
@@ -128,8 +142,8 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		}
 
 		// Build affected parent spends (inputs of the conflicting tx).
-		if txMeta.Tx != nil {
-			for i, input := range txMeta.Tx.Inputs {
+		if tx != nil {
+			for i, input := range tx.Inputs {
 				utxoHash, hashErr := util.UTXOHashFromInput(input)
 				if hashErr != nil {
 					return nil, nil, hashErr
@@ -145,7 +159,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		}
 
 		// Find spending child transactions by querying the spends table directly.
-		if txMeta.Tx != nil {
+		if tx != nil {
 			rows, queryErr := pgxTx.Query(ctx, `
 				SELECT sp.spending_data
 				FROM spends sp
