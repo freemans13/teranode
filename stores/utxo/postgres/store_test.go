@@ -21,7 +21,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const testDSN = "postgresql://teranode:teranode@localhost:5432/teranode_test"
+// testDSN is the DSN setupTestStore connects to. It defaults to a local postgres
+// for fast developer iteration; TestMain (see main_test.go) overrides it with a
+// throwaway testcontainer when no local postgres is reachable, so the suite RUNS
+// in CI (where coverage is collected) rather than skipping.
+var testDSN = "postgresql://teranode:teranode@localhost:5432/teranode_test"
 
 func setupTestStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
