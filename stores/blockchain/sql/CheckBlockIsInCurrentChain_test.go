@@ -212,7 +212,7 @@ func TestCheckBlockIsInCurrentChain_InMemory_PhantomBelowMaxID(t *testing.T) {
 }
 
 // TestCheckBlockIsInCurrentChain_InMemory_UninitialisedMaxBlockID reproduces the
-// 2026-06-18 betfair-pc mainnet cascade. On a restart mid-catchup the startup
+// 2026-06-18 mainnet cascade. On a restart mid-catchup the startup
 // rebuildOffChainSet timed out on a cold cache and returned before setting
 // maxBlockID, leaving the atomic at 0 once the rebuild guard was released. With
 // maxID==0 the in-memory path dropped every committed parent id as "above the
