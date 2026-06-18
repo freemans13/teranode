@@ -255,7 +255,13 @@ func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeig
 	for rows.Next() {
 		var hashBytes []byte
 		if err := rows.Scan(&hashBytes); err != nil {
-			s.logger.Errorf("[QueryOldUnminedTransactions] error scanning row: %v", err)
+			// Best-effort by design: a per-row scan failure (near-impossible for a
+			// BYTEA hash column) drops only that one row, not the whole batch. The
+			// caller (pruner preserve/prune) re-runs every cycle, so a skipped old
+			// unmined tx is picked up next pass — failing the whole call here would be
+			// strictly worse (one bad row would stall preservation each cycle). A
+			// stream-level failure is still surfaced via rows.Err() below.
+			s.logger.Errorf("[QueryOldUnminedTransactions] error scanning row (skipped): %v", err)
 			continue
 		}
 		var txHash chainhash.Hash

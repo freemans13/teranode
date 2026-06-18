@@ -186,7 +186,15 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, blockID uint32, blockHeight uint32) (map[chainhash.Hash][]uint32, error) {
 	resultMap := make(map[chainhash.Hash][]uint32, len(hashes))
 
-	currentBlockHeight := int32(s.blockHeight.Load()) // unmined_since is INT4; heights < 2^31
+	// unmined_since is INT4 (heights < 2^31). Floor at 1: a stored unmined_since of 0
+	// is indistinguishable at the meta layer from "mined" — NULL (mined) and 0 both
+	// map to UnminedSince==0 in getInternal — so a reorg processed before the first
+	// SetBlockHeight (tip still 0) must not write 0, or a reorged-out tx would look
+	// mined (and be wrongly prune-eligible via unmined_since <= cutoff at any height).
+	currentBlockHeight := int32(s.blockHeight.Load())
+	if currentBlockHeight < 1 {
+		currentBlockHeight = 1
+	}
 
 	// One transaction for the whole set: a reorg that unsets a block_id from many
 	// txs commits all-or-nothing rather than leaving some rows updated on failure.
@@ -294,24 +302,6 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	}
 
 	return resultMap, nil
-}
-
-// fetchBlockIDs returns the list of block_ids for a transaction from the txs array.
-func (s *Store) fetchBlockIDs(ctx context.Context, hash *chainhash.Hash) ([]uint32, error) {
-	var blockIDs []int32
-	err := s.pool.QueryRow(ctx,
-		`SELECT block_ids FROM txs WHERE hash = $1`,
-		hash[:],
-	).Scan(&blockIDs)
-	if err != nil {
-		return nil, errors.NewStorageError("[fetchBlockIDs] query for %s: %v", hash, err)
-	}
-
-	result := make([]uint32, len(blockIDs))
-	for i, bid := range blockIDs {
-		result[i] = uint32(bid)
-	}
-	return result, nil
 }
 
 // MarkTransactionsOnLongestChain is implemented in conflicting.go.

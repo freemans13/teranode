@@ -193,18 +193,6 @@ func TestBatchDecorateOutputs(t *testing.T) {
 	require.Len(t, items[0].Data.Tx.Outputs, 3, "decorated tx must carry all 3 outputs")
 }
 
-// TestFetchBlockIDs covers the fetchBlockIDs helper directly (it has no production
-// caller yet) by reading back the block_ids of a mined transaction.
-func TestFetchBlockIDs(t *testing.T) {
-	store, ctx := setupTestStore(t)
-	require.NoError(t, store.SetBlockHeight(100))
-
-	mined := newMinedSingleOutputTx(t, store, 100) // mined into block_id 100
-	ids, err := store.fetchBlockIDs(ctx, mined.TxIDChainHash())
-	require.NoError(t, err)
-	require.Contains(t, ids, uint32(100), "fetchBlockIDs must return the block id the tx was mined into")
-}
-
 // TestGetFieldCombinations exercises the getInternal decoration branches
 // (needInputs / needOutputs / TxInpoints / Utxos) by requesting each field set.
 func TestGetFieldCombinations(t *testing.T) {
@@ -577,8 +565,6 @@ func TestOperationsOnClosedPoolReturnErrors(t *testing.T) {
 	requireErr("RemoveFromConflictingChildren", store.RemoveFromConflictingChildren(ctx,
 		[]utxo.ConflictingChildRemoval{{ParentHash: h, ChildHash: child.TxIDChainHash()}}))
 	requireErr("FreezeUTXOs", store.FreezeUTXOs(ctx, spends, nil))
-	_, err = store.fetchBlockIDs(ctx, h)
-	requireErr("fetchBlockIDs", err)
 	requireErr("BatchDecorate", store.BatchDecorate(ctx,
 		[]*utxo.UnresolvedMetaData{{Hash: *h, Fields: []fields.FieldName{fields.Tx}}}))
 	_, err = store.GetUnminedTxIterator()

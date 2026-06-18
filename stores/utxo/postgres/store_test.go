@@ -891,7 +891,7 @@ func TestSetMinedMultiIdempotent(t *testing.T) {
 	result2, err := store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, info)
 	require.NoError(t, err)
 	// With array append, the same block_id appears twice. This is acceptable
-	// because the fetchBlockIDs returns the raw array content.
+	// because SetMinedMulti returns the raw block_ids array content.
 	require.Contains(t, result2[*txHash], uint32(42))
 }
 

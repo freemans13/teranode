@@ -300,6 +300,16 @@ func (s *Store) sweepDAHStep(ctx context.Context, toH int64, limit, maxPasses in
 }
 
 func (s *Store) sweepDAH(ctx context.Context, toH int64, limit, maxPasses int) (int, error) {
+	// Only one sweep runs at a time in this process. The background cursor and Prune
+	// both call here; without this guard they can read the same watermark and re-scan
+	// the same window — idempotent (the forward-only watermark advance and the stamp's
+	// IS DISTINCT FROM guard make a re-sweep safe), but wasted CPU. The loser skips:
+	// the holder advances the watermark, so the skipped work is still covered.
+	if !s.sweepMu.TryLock() {
+		return 0, nil
+	}
+	defer s.sweepMu.Unlock()
+
 	var from int64
 	if err := s.pool.QueryRow(ctx, `SELECT last_swept_height FROM dah_watermark WHERE id = 1`).Scan(&from); err != nil {
 		return 0, errors.NewStorageError("[dahSweep] read watermark: %v", err)
