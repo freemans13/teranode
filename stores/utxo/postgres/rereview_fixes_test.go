@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"math"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -10,6 +11,15 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
+
+// TestBlockHeightInt32Guard covers the uint32→INT4 height guard: a height above
+// MaxInt32 must be rejected at the write entry points rather than silently wrapping.
+func TestBlockHeightInt32Guard(t *testing.T) {
+	store, _ := setupTestStore(t)
+
+	require.NoError(t, store.SetBlockHeight(uint32(math.MaxInt32)), "max int32 height is valid")
+	require.Error(t, store.SetBlockHeight(uint32(math.MaxInt32)+1), "height beyond int32 must be rejected")
+}
 
 // TestSpendOpReturnOutputRejected is the regression test for the out_spendables
 // spend-guard: a non-spendable output (OP_RETURN) carries a utxo_hash but must NOT

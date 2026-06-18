@@ -302,6 +302,11 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 }
 
 func (s *Store) SetBlockHeight(blockHeight uint32) error {
+	// Guard the tip at the single chokepoint so every downstream int32(height) cast
+	// (e.g. unmined_since in unsetMinedMulti) is provably safe. See blockHeightToInt32.
+	if _, err := blockHeightToInt32(blockHeight); err != nil {
+		return err
+	}
 	s.blockHeight.Store(blockHeight)
 	return nil
 }

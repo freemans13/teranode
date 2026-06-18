@@ -32,6 +32,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	if len(hashes) == 0 {
 		return make(map[chainhash.Hash][]uint32), nil
 	}
+	if _, err := blockHeightToInt32(minedBlockInfo.BlockHeight); err != nil {
+		return nil, err
+	}
 
 	if minedBlockInfo.UnsetMined {
 		return s.unsetMinedMulti(ctx, hashes, minedBlockInfo.BlockID, minedBlockInfo.BlockHeight)

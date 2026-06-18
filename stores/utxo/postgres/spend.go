@@ -39,6 +39,19 @@ func voutToInt32(vout uint32) (int32, error) {
 	return int32(vout), nil
 }
 
+// blockHeightToInt32 guards the uint32 → INT4 narrowing for block heights, mirroring
+// voutToInt32. Heights land in INT4 columns (spent_at_height, mined_at_height,
+// unmined_since, block_heights, delete_at_height); a height above MaxInt32 is far
+// beyond any real chain (millennia out) but must be rejected at the write entry
+// points rather than silently wrapping negative inside pgx encoding. Validating once
+// at the entry makes the downstream int32(height) casts provably safe.
+func blockHeightToInt32(height uint32) (int32, error) {
+	if height > math.MaxInt32 {
+		return 0, errors.NewProcessingError("blockHeight %d exceeds int32 range for INT height columns", height)
+	}
+	return int32(height), nil
+}
+
 // ---------------------------------------------------------------------------
 // Direct-mode SQL (used when batcher is not active)
 // ---------------------------------------------------------------------------
@@ -118,6 +131,9 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 	if blockHeight == 0 {
 		return nil, errors.NewProcessingError("blockHeight must be greater than zero")
+	}
+	if _, err := blockHeightToInt32(blockHeight); err != nil {
+		return nil, err
 	}
 
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting

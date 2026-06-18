@@ -510,3 +510,42 @@ func TestDAHParityBothCompletionOrders(t *testing.T) {
 		require.Equal(t, int64(160)+1+ret, *dah, "%s: DAH must be completion(160)+1+retention", name)
 	}
 }
+
+// TestSweepStampsAllOpReturnTx locks in DAH eligibility for a tx whose every output
+// is non-spendable (all OP_RETURN): spendable_count=0, out_count>0. Such a tx is
+// trivially "fully spent" (there are no spendable outputs to spend), so once mined on
+// the longest chain the sweep MUST stamp it via the mine-arm — there are no spends, so
+// the spend-arm never sees it. Guards against a future `spendable_count > 0` gate that
+// would silently leak these forever.
+func TestSweepStampsAllOpReturnTx(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(110))
+
+	tx := testExtendedTx(t)
+	opReturn := bscript.NewFromBytes([]byte{0x00, 0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef})
+	tx.Outputs = []*bt.Output{
+		{Satoshis: 0, LockingScript: opReturn},
+		{Satoshis: 0, LockingScript: opReturn},
+	}
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	var outCount, spendableCount int32
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT out_count, spendable_count FROM txs WHERE hash=$1`, h[:]).Scan(&outCount, &spendableCount))
+	require.Equal(t, int32(2), outCount, "both outputs stored")
+	require.Equal(t, int32(0), spendableCount, "no output is spendable")
+
+	// Mine on the longest chain (sets block_ids + mined_at_height for the mine-arm).
+	mineTx(t, store, tx, 100)
+
+	n, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, n, 1, "the all-OP_RETURN tx must be stamped")
+
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, h[:]).Scan(&dah))
+	require.NotNil(t, dah, "all-OP_RETURN tx (spendable_count=0, out_count>0) must be DAH-stamped once mined")
+}

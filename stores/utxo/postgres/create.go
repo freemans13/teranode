@@ -161,6 +161,10 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		}
 	}()
 
+	if _, err := blockHeightToInt32(blockHeight); err != nil {
+		return nil, err
+	}
+
 	options := &utxo.CreateOptions{}
 	for _, opt := range opts {
 		opt(options)
