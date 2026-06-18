@@ -7,6 +7,11 @@ validation operations.
 */
 package validator
 
+import (
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+)
+
 // Options defines the configuration options for validation operations
 type Options struct {
 	// SkipUtxoCreation determines whether UTXO creation should be skipped
@@ -155,6 +160,22 @@ type Options struct {
 	// runs after ValidateBlock's PoW checks). MUST NOT be set on peer-facing
 	// subtree handling or mempool-admission paths.
 	UnconfirmedParentsAtCandidateHeight bool
+
+	// PrefetchedParents supplies parent-transaction metadata already read in
+	// bulk by the caller (the per-level bulk reader on the catchup path), keyed
+	// by parent tx hash. When a parent is present here the validator uses it
+	// instead of issuing a per-parent utxoStore.Get, which deduplicates the
+	// many reads of a shared parent in fan-out blocks and batches the rest.
+	//
+	// It is a pure read-source swap: the entry must carry exactly what a Get
+	// would return for the requested fields (BlockIDs, BlockHeights, and Tx
+	// when the tx needs extending). The unconfirmed-parent sentinel logic is
+	// unchanged — an entry with empty BlockHeights still resolves to
+	// unconfirmedParentHeight. The validator falls back to a store Get for any
+	// parent absent from this map, or present but missing the Tx needed for
+	// extension, so the prefetch can never reduce correctness. nil = always
+	// read from the store (the non-catchup default).
+	PrefetchedParents map[chainhash.Hash]*meta.Data
 }
 
 // Option defines a function type for setting options

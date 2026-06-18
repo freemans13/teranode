@@ -20,6 +20,9 @@ import (
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
@@ -1086,6 +1089,22 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			}
 		}
 
+		// Bulk-read this level's distinct parent transactions once, so the
+		// validator resolves each input's height/outputs from the prefetch instead
+		// of issuing a per-parent Get for every child (the fan-out dedup win).
+		// Built per level AFTER the previous level's transactions were created, so
+		// an in-block parent from an earlier level is seen exactly as a per-parent
+		// Get would see it (empty BlockHeights → unconfirmed sentinel). Parents the
+		// store does not resolve are omitted, so the validator falls back to a Get
+		// and the existing missing-parent handling is preserved.
+		prefetchedParents, prefetchErr := u.prefetchLevelParents(ctx, levelTxs)
+		if prefetchErr != nil {
+			return prefetchErr
+		}
+
+		levelValidatorOptions := *processedValidatorOptions
+		levelValidatorOptions.PrefetchedParents = prefetchedParents
+
 		// Process all transactions at this level in parallel
 		g, gCtx := errgroup.WithContext(ctx)
 		util.SafeSetLimit(u.logger, g, u.settings.SubtreeValidation.SpendBatcherSize*2)
@@ -1110,7 +1129,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 			g.Go(func() error {
 				// Use existing blessMissingTransaction logic for validation
-				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
+				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, &levelValidatorOptions)
 				if err != nil {
 					u.logger.Debugf("[processTransactionsInLevels] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), err)
 
@@ -1188,6 +1207,118 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	txMetaSlice = nil //nolint:ineffassign // Intentional early GC hint
 
 	return nil
+}
+
+// prefetchParentBaseFields are the metadata fields a bulk parent read always
+// fetches to stand in for the validator's per-parent Get: block IDs/heights, for
+// the unconfirmed-parent sentinel + height resolution. The parent tx outputs
+// (fields.Tx) are appended only when the level has a non-extended tx — see
+// prefetchLevelParents.
+var prefetchParentBaseFields = []fields.FieldName{fields.BlockIDs, fields.BlockHeights}
+
+// prefetchLevelParents bulk-reads the distinct parent transactions referenced by
+// a level's transactions and returns them keyed by parent hash, for
+// validator.Options.PrefetchedParents.
+//
+// It deduplicates shared parents — a fan-out level (one funding tx, many
+// children) reads that parent ONCE instead of once per child — and batches the
+// reads. Parents the store reports as not-found (ErrTxNotFound) are omitted: the
+// validator falls back to a per-parent Get for them, which preserves the existing
+// missing-parent → deferred-revalidation handling. Any other per-item read error
+// — or a function-level error from BatchDecorate — aborts: the bulk read is an
+// optimization, never an authority, but a DB failure must halt, not be silently
+// downgraded to a fallback Get that masks it.
+func (u *Server) prefetchLevelParents(ctx context.Context, levelTxs []missingTx) (map[chainhash.Hash]*meta.Data, error) {
+	distinct := make(map[chainhash.Hash]struct{})
+
+	// Mirror the validator's per-tx `extend := !tx.IsExtended()` decision at the
+	// level grain: only fetch the parent tx outputs (fields.Tx) if at least one tx
+	// in this level still needs extending. A fully-extended level (e.g. all inputs
+	// extended via extendTxWithInBlockParents) resolves heights from
+	// BlockIDs/BlockHeights alone, so fetching Tx would force a needless
+	// external-store round-trip per distinct parent.
+	needTx := false
+
+	for _, mTx := range levelTxs {
+		if mTx.tx == nil {
+			continue
+		}
+
+		if !mTx.tx.IsExtended() {
+			needTx = true
+		}
+
+		for _, in := range mTx.tx.Inputs {
+			parentHash := *in.PreviousTxIDChainHash()
+			if parentHash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+				continue
+			}
+
+			distinct[parentHash] = struct{}{}
+		}
+	}
+
+	if len(distinct) == 0 {
+		return nil, nil
+	}
+
+	prefetchFields := prefetchParentBaseFields
+	if needTx {
+		prefetchFields = append(append([]fields.FieldName(nil), prefetchParentBaseFields...), fields.Tx)
+	}
+
+	items := make([]*utxostore.UnresolvedMetaData, 0, len(distinct))
+	for parentHash := range distinct {
+		parentHash := parentHash
+		items = append(items, &utxostore.UnresolvedMetaData{Hash: parentHash})
+	}
+
+	batchSize := u.settings.BlockValidation.ProcessTxMetaUsingStoreBatchSize
+	if batchSize <= 0 {
+		batchSize = 1024
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(u.logger, g, u.settings.BlockValidation.ProcessTxMetaUsingStoreConcurrency)
+
+	for i := 0; i < len(items); i += batchSize {
+		i := i
+
+		g.Go(func() error {
+			end := subtreepkg.Min(i+batchSize, len(items))
+			return u.utxoStore.BatchDecorate(gCtx, items[i:end], prefetchFields...)
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, errors.NewStorageError("[prefetchLevelParents] failed to bulk-read level parents", err)
+	}
+
+	result := make(map[chainhash.Hash]*meta.Data, len(items))
+
+	for _, item := range items {
+		if item.Err != nil {
+			// BatchDecorate reports per-record failures on item.Err while returning
+			// a nil function error (the Aerospike contract). A genuine not-found is
+			// expected — the parent lives in a later batch (cross-subtree) — so we
+			// omit it and let the validator fall back to a per-parent Get, preserving
+			// the missing-parent / deferred-revalidation path. Any OTHER per-item
+			// error (store timeout, external-store read failure, decode error) is a
+			// real DB failure: it must halt the level, never be silently downgraded
+			// to a fallback Get that would mask the failure and amplify reads.
+			if errors.Is(item.Err, errors.ErrTxNotFound) {
+				continue
+			}
+
+			return nil, errors.NewStorageError("[prefetchLevelParents] failed to read parent %s", item.Hash, item.Err)
+		}
+
+		if item.Data != nil {
+			result[item.Hash] = item.Data
+		}
+	}
+
+	return result, nil
 }
 
 // buildParentMapFromLevel builds a hash map of all transactions in a level for quick parent lookups.

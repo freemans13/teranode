@@ -715,6 +715,18 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 	ctxLogger.Debugf("[BlockAssembler] best block header according to blockchain: %d: %s", bestBlockchainBlockHeaderMeta.Height, bestBlockAccordingToBlockchain.Hash())
 	ctxLogger.Debugf("[BlockAssembler] best block header according to block assembly : %d: %s", bestBlockAccordingToBlockAssemblyHeight, bestBlockAccordingToBlockAssembly.Hash())
 
+	// Publish how far block assembly is behind the chain tip so a stall is alertable
+	// without a human watching external chain-tip monitoring (issue #980, Bug B). This
+	// is a pure height delta: it stays elevated while BA lags on a normal catch-up and
+	// is reset to zero on the successful-advance path at the end of this function. It
+	// reads 0 for an equal-height reorg stall (tip hash differs but height matches) —
+	// processing_stuck_total{reason} is the signal for that case.
+	if lag := int64(bestBlockchainBlockHeaderMeta.Height) - int64(bestBlockAccordingToBlockAssemblyHeight); lag > 0 {
+		prometheusBlockAssemblyTipLagBlocks.Set(float64(lag))
+	} else {
+		prometheusBlockAssemblyTipLagBlocks.Set(0)
+	}
+
 	switch {
 	case bestBlockAccordingToBlockchain.Hash().IsEqual(bestBlockAccordingToBlockAssembly.Hash()):
 		ctxLogger.Infof("[BlockAssembler][%s] best block header is the same as the current best block header: %s", bestBlockchainBlockHeader.Hash(), bestBlockAccordingToBlockAssembly.Hash())
@@ -724,6 +736,7 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 		moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, bestBlockchainBlockHeaderMeta.Height)
 		if err != nil {
 			ctxLogger.Errorf("[BlockAssembler][%s] error fetching blocks for reorg/catch-up decision: %v", bestBlockchainBlockHeader.Hash(), err)
+			prometheusBlockAssemblyProcessingStuck.WithLabelValues("reorg_blocks_fetch").Inc()
 			return
 		}
 
@@ -734,6 +747,7 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 
 			if err = b.handleCatchUp(ctx, moveForwardBlocksWithMeta); err != nil {
 				ctxLogger.Errorf("[BlockAssembler][%s] error catching up: %v", bestBlockchainBlockHeader.Hash(), err)
+				prometheusBlockAssemblyProcessingStuck.WithLabelValues("catchup").Inc()
 				return
 			}
 		} else {
@@ -746,6 +760,7 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 					ctxLogger.Warnf("[BlockAssembler][%s] error handling reorg: %v", bestBlockchainBlockHeader.Hash(), err)
 				} else {
 					ctxLogger.Errorf("[BlockAssembler][%s] error handling reorg: %v", bestBlockchainBlockHeader.Hash(), err)
+					prometheusBlockAssemblyProcessingStuck.WithLabelValues("reorg").Inc()
 				}
 
 				return
@@ -758,6 +773,7 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 
 		if block, err = b.blockchainClient.GetBlock(ctx, bestBlockchainBlockHeader.Hash()); err != nil {
 			ctxLogger.Errorf("[BlockAssembler][%s] error getting block from blockchain: %v", bestBlockchainBlockHeader.Hash(), err)
+			prometheusBlockAssemblyProcessingStuck.WithLabelValues("get_block").Inc()
 			return
 		}
 
@@ -765,11 +781,16 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 
 		if err = b.subtreeProcessor.MoveForwardBlock(block); err != nil {
 			ctxLogger.Errorf("[BlockAssembler][%s] error moveForwardBlock in subtree processor: %v", bestBlockchainBlockHeader.Hash(), err)
+			prometheusBlockAssemblyProcessingStuck.WithLabelValues("moveforward").Inc()
 			return
 		}
 	}
 
 	b.setBestBlockHeader(bestBlockchainBlockHeader, bestBlockchainBlockHeaderMeta.Height)
+
+	// Block assembly advanced to the chain tip we observed this round: it is no longer
+	// behind, so clear the lag gauge (issue #980, Bug B).
+	prometheusBlockAssemblyTipLagBlocks.Set(0)
 
 	_, height := b.CurrentBlock()
 	prometheusBlockAssemblyCurrentBlockHeight.Set(float64(height))
@@ -941,12 +962,26 @@ func (b *BlockAssembler) initState(ctx context.Context) error {
 			if err != nil {
 				// we must return an error here since we cannot continue without a best block header
 				return errors.NewProcessingError("[BlockAssembler] error getting best block header: %v", err)
-			} else {
-				hash, _ := b.CurrentBlock()
-				b.logger.Infof("[BlockAssembler] setting best block header from GetBestBlockHeader: %s", hash.Hash())
-				b.setBestBlockHeader(header, meta.Height)
-				b.subtreeProcessor.InitCurrentBlockHeader(header)
 			}
+
+			// No persisted checkpoint exists. Adopting the chain tip as the resume
+			// point only safely produces complete state when the chain is itself at
+			// genesis: block assembly is the sole writer of coinbase UTXOs (via
+			// processCoinbaseUtxos during moveForwardBlock), so jumping straight to a
+			// non-genesis tip skips that per-block work for every block below the tip,
+			// leaving permanent UTXO holes that surface as TX_NOT_FOUND ~100 blocks
+			// later (issue #980, Bug A). Refuse to start instead — partial state is
+			// worse than no progress. The operator must reseed the BlockAssembler
+			// state (e.g. via the rewindblockchain tool) or rebuild from scratch.
+			if meta.Height > 0 {
+				return errors.NewProcessingError("[BlockAssembler] refusing to start: no persisted BlockAssembler state but chain is at height %d (past genesis); adopting the tip would skip coinbase UTXO creation for blocks below it and corrupt the UTXO set — reseed BlockAssembler state or rebuild", meta.Height)
+			}
+
+			// Log the header we are adopting (genesis here). b.CurrentBlock() is still
+			// unset on this path, so logging it would nil-deref.
+			b.logger.Infof("[BlockAssembler] setting best block header from GetBestBlockHeader: %s", header.Hash())
+			b.setBestBlockHeader(header, meta.Height)
+			b.subtreeProcessor.InitCurrentBlockHeader(header)
 		}
 	}
 

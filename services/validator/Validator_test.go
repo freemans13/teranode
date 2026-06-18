@@ -1047,7 +1047,7 @@ func Test_getUtxoBlockHeights(t *testing.T) {
 			BlockHeights: make([]uint32, 0),
 		}, nil)
 
-		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, tx.TxID())
+		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, tx.TxID(), nil)
 		require.NoError(t, err)
 
 		// Fallback writes the unconfirmedParentHeight sentinel instead of
@@ -1088,7 +1088,7 @@ func Test_getUtxoBlockHeights(t *testing.T) {
 			BlockHeights: []uint32{768, 769},
 		}, nil).Once()
 
-		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, tx.TxID())
+		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, tx.TxID(), nil)
 		require.NoError(t, err)
 
 		// Middle slot is the unconfirmed-parent fallback: writes the sentinel
@@ -1157,7 +1157,7 @@ func Test_getUtxoBlockHeights(t *testing.T) {
 			},
 		}, nil).Once()
 
-		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, txNonExtended, txNonExtended.TxID())
+		utxoHashes, err := v.getUtxoBlockHeightsAndExtendTx(ctx, txNonExtended, txNonExtended.TxID(), nil)
 		require.NoError(t, err)
 
 		// Middle slot is the unconfirmed-parent fallback: writes the sentinel
@@ -1805,7 +1805,7 @@ func TestGetUtxoBlockHeightAndExtendForParentTx_RecordedHeightFromStore(t *testi
 	utxoHeights := make([]uint32, 1)
 
 	// A parent with recorded BlockHeights resolves to its real stored height.
-	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentTxHash, []int{0}, utxoHeights, tx, false)
+	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentTxHash, []int{0}, utxoHeights, tx, false, nil)
 
 	require.NoError(t, err)
 	assert.Equal(t, uint32(999), utxoHeights[0])
@@ -1839,7 +1839,7 @@ func TestGetUtxoBlockHeightAndExtendForParentTx_FallbackWritesUnconfirmedSentine
 	}
 
 	utxoHeights := make([]uint32, 1)
-	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentTxHash, []int{0}, utxoHeights, tx, false)
+	err := v.getUtxoBlockHeightAndExtendForParentTx(ctx, parentTxHash, []int{0}, utxoHeights, tx, false, nil)
 	require.NoError(t, err)
 	require.Equal(t, unconfirmedParentHeight, utxoHeights[0],
 		"fallback must write the teranode-internal sentinel, not blockState.Height+1")

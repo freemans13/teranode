@@ -937,7 +937,7 @@ func (v *Validator) getTransactionInputBlockHeightsAndExtendTx(ctx context.Conte
 	defer endSpan()
 
 	// get the utxo heights for each input
-	utxoHeights, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, txID)
+	utxoHeights, err := v.getUtxoBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions.PrefetchedParents)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -966,8 +966,10 @@ func (v *Validator) twoPhaseCommitTransaction(ctx context.Context, tx *bt.Tx, tx
 	return nil
 }
 
-// getUtxoBlockHeightsAndExtendTx returns the block heights for each input of the transaction
-func (v *Validator) getUtxoBlockHeightsAndExtendTx(ctx context.Context, tx *bt.Tx, txID string) ([]uint32, error) {
+// getUtxoBlockHeightsAndExtendTx returns the block heights for each input of the transaction.
+// prefetched, when non-nil, supplies parent metadata already read in bulk so per-parent
+// store Gets can be skipped (see Options.PrefetchedParents).
+func (v *Validator) getUtxoBlockHeightsAndExtendTx(ctx context.Context, tx *bt.Tx, txID string, prefetched map[chainhash.Hash]*meta.Data) ([]uint32, error) {
 	// get the block heights of the input transactions of the transaction
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(v.logger, g, v.settings.UtxoStore.GetBatcherSize)
@@ -992,7 +994,7 @@ func (v *Validator) getUtxoBlockHeightsAndExtendTx(ctx context.Context, tx *bt.T
 		inputIdxs := idxs
 
 		g.Go(func() error {
-			if err := v.getUtxoBlockHeightAndExtendForParentTx(gCtx, parentTxHash, inputIdxs, utxoHeights, tx, extend); err != nil {
+			if err := v.getUtxoBlockHeightAndExtendForParentTx(gCtx, parentTxHash, inputIdxs, utxoHeights, tx, extend, prefetched); err != nil {
 				if errors.Is(err, errors.ErrTxNotFound) {
 					return errors.NewTxMissingParentError("[Validate][%s] error getting parent transaction %s", txID, parentTxHash, err)
 				}
@@ -1028,7 +1030,7 @@ func (v *Validator) getUtxoBlockHeightsAndExtendTx(ctx context.Context, tx *bt.T
 //     (BDK rejects with bad-txns-unconfirmed-input-in-block) or the candidate
 //     height in policy mode.
 func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context, parentTxHash chainhash.Hash, idxs []int,
-	utxoHeights []uint32, tx *bt.Tx, extend bool) error {
+	utxoHeights []uint32, tx *bt.Tx, extend bool, prefetched map[chainhash.Hash]*meta.Data) error {
 	f := []fields.FieldName{fields.BlockIDs, fields.BlockHeights}
 
 	if extend {
@@ -1036,9 +1038,19 @@ func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context,
 		f = append(f, fields.Tx)
 	}
 
-	txMeta, err := v.utxoStore.Get(gCtx, &parentTxHash, f...)
-	if err != nil {
-		return err
+	// Use a bulk-prefetched parent if the caller supplied one that carries
+	// everything we need (the parent tx outputs too, when extending). This is a
+	// read-source swap only: the height/sentinel logic below is unchanged, and
+	// any parent not prefetched — or prefetched without the Tx needed for
+	// extension — falls back to a store Get, so correctness is never reduced.
+	var txMeta *meta.Data
+	if pf, ok := prefetched[parentTxHash]; ok && pf != nil && (!extend || pf.Tx != nil) {
+		txMeta = pf
+	} else {
+		var err error
+		if txMeta, err = v.utxoStore.Get(gCtx, &parentTxHash, f...); err != nil {
+			return err
+		}
 	}
 
 	if len(txMeta.BlockHeights) == 0 {
