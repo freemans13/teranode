@@ -31,7 +31,7 @@ func BenchmarkSweepRangeMineArm(b *testing.B) {
 		_, err := store.pool.Exec(ctx, `UPDATE dah_watermark SET last_swept_height = 0 WHERE id = 1`)
 		require.NoError(b, err)
 
-		n, _, err := store.sweepDAHRange(ctx, 0, int64(tipHeight), M*2)
+		n, _, _, err := store.sweepDAHRange(ctx, 0, int64(tipHeight), M*2)
 		require.NoError(b, err)
 		if n < 0 {
 			b.Fatal("unexpected negative count")
