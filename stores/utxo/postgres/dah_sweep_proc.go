@@ -13,7 +13,7 @@ import (
 // dahSweepProcVersion is bumped whenever dahSweepProcDDL changes. bootstrap
 // recreates the procedure whenever the version stored in dah_sweep_control
 // differs (in EITHER direction, so a binary rollback reinstalls the older body).
-const dahSweepProcVersion = 4
+const dahSweepProcVersion = 5
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaWithPool (plain DDL);
@@ -58,10 +58,8 @@ DECLARE
     v_per_part_cap   INT;
     v_enabled        BOOLEAN;
     v_n              BIGINT;
-    v_candidates     BIGINT;
     v_total_stamped  BIGINT := 0;
     v_windows        INT := 0;
-    v_truncated      BOOLEAN;
     v_t0             timestamptz;
     v_ms             double precision;
 BEGIN
@@ -95,11 +93,14 @@ BEGIN
         RETURN;
     END IF;
 
-    -- v_step is TIME-ADAPTIVE: it starts modest and shrinks when a window is slow
-    -- (cold cache / disk-bound) so each window COMMITS within ~1-2s and the
-    -- watermark advances incrementally, instead of one giant 4096-window that can
-    -- never finish in any client budget. It grows back on fast windows (warm cache).
-    v_step := 1024;
+    -- v_step is TIME-ADAPTIVE and is the SOLE governor of per-window cost: a slow
+    -- (dense) window halves it for the NEXT window, a fast (sparse) one doubles it.
+    -- There is no candidate cap and no shrink-retry — every window enumerates its
+    -- COMPLETE distinct-parent set in ONE pass, stamps, and advances the watermark, so
+    -- spends pages are never re-read for the same window. Seed small so the very first
+    -- window after a cold start / reorg surge is bounded; it doubles to 4096 within a
+    -- few fast windows on sparse history.
+    v_step := 256;
 
     WHILE v_from < p_safe_tip LOOP
         EXIT WHEN v_max_win > 0 AND v_windows >= v_max_win;
@@ -114,26 +115,24 @@ BEGIN
         SET LOCAL enable_seqscan = off;
         SET LOCAL lock_timeout = '5s';
 
-        v_to        := LEAST(v_from + v_step, p_safe_tip);
-        v_truncated := FALSE;
-        v_t0        := clock_timestamp();
+        v_to := LEAST(v_from + v_step, p_safe_tip);
+        v_t0 := clock_timestamp();
 
-        -- Step 1+2 for THIS partition: enumerate candidate parent hashes whose outputs
-        -- were spent in (v_from,v_to] — purely from the APPEND-ORDERED spends side, so
-        -- the BRIN on spent_at_height is correlated and cheap ("spends enumerate, txs
-        -- decides"). We deliberately do NOT also scan txs by mined_at_height (it is
-        -- uncorrelated → full-partition scan): the only txs that complete AT mine time
-        -- without a spend in a swept window (zero-spendable) are stamped inline in
-        -- SetMinedMulti, and the rarer spent-while-unmined case is caught by the by-hash
-        -- backstop. We then aggregate each candidate's FULL spend history (no height
-        -- bound on the JOIN → correct fully-spent counting) and bidirectionally stamp
-        -- delete_at_height. Exact DAH semantics (preserve_until/unmined_since/block_ids
-        -- guards, spendable get_bit, GREATEST+1+retention, IS DISTINCT FROM).
-        -- spent_in_window is a MATERIALIZED optimisation fence so the planner scans by
-        -- the spent_at_height BRIN (correlated → reads only the window's pages). Without
-        -- the fence, the DISTINCT+LIMIT lets the planner pick the prev_tx_hash PK index
-        -- and filter by height instead, scanning the whole index (measured: 300k blocks /
-        -- 12-27s per window vs 41k / 1.5s with the fence).
+        -- SINGLE PASS for THIS partition. Enumerate candidate parent hashes whose
+        -- outputs were spent in (v_from,v_to] purely from the APPEND-ORDERED spends side
+        -- ("spends enumerate, txs decides"); the spent_in_window MATERIALIZED fence
+        -- forces the correlated spent_at_height BRIN rather than the prev_tx_hash PK
+        -- index (measured: BRIN 41k blocks / 1.5s vs PK-scan 300k / 12-27s). No LIMIT:
+        -- candidates is the COMPLETE distinct-parent set of the window, so there is
+        -- nothing to truncate and no shrink-retry is needed. Aggregate each candidate's
+        -- FULL spend history (no height bound on the JOIN → correct fully-spent
+        -- counting), bidirectionally stamp delete_at_height with the exact DAH formula,
+        -- and COUNT the stamped rows from the SAME pass: the data-modifying upd CTE
+        -- runs once to completion and the outer SELECT counts its RETURNING, so spends is
+        -- BRIN-scanned ONCE per window (the old design re-scanned it a second time just
+        -- to size the shrink). Exact DAH semantics unchanged
+        -- (preserve_until/unmined_since/block_ids guards, spendable get_bit,
+        -- GREATEST+1+retention, IS DISTINCT FROM).
         EXECUTE format($q$
             WITH spent_in_window AS MATERIALIZED (
                 SELECT prev_tx_hash FROM spends_p%1$s
@@ -141,7 +140,6 @@ BEGIN
             ),
             candidates AS MATERIALIZED (
                 SELECT DISTINCT prev_tx_hash AS hash FROM spent_in_window
-                LIMIT $3
             ),
             spend_agg AS (
                 SELECT s.prev_tx_hash AS hash,
@@ -161,47 +159,29 @@ BEGIN
                            WHEN COALESCE(sa.spent_count, 0) = t.spendable_count
                                 AND t.out_count > 0
                                 AND GREATEST(COALESCE(sa.max_spent, 0), COALESCE(t.mined_at_height, 0)) <= $2
-                               THEN (GREATEST(COALESCE(sa.max_spent, 0), COALESCE(t.mined_at_height, 0)) + 1 + $4)::int
+                               THEN (GREATEST(COALESCE(sa.max_spent, 0), COALESCE(t.mined_at_height, 0)) + 1 + $3)::int
                            ELSE NULL
                        END AS new_dah
                 FROM txs_p%1$s t
                 LEFT JOIN spend_agg sa ON sa.hash = t.hash
                 WHERE t.hash IN (SELECT hash FROM candidates)
+            ),
+            upd AS (
+                UPDATE txs_p%1$s t
+                   SET delete_at_height = st.new_dah
+                  FROM state st
+                 WHERE t.hash = st.hash
+                   AND t.delete_at_height IS DISTINCT FROM st.new_dah
+                RETURNING 1
             )
-            UPDATE txs_p%1$s t
-               SET delete_at_height = st.new_dah
-              FROM state st
-             WHERE t.hash = st.hash
-               AND t.delete_at_height IS DISTINCT FROM st.new_dah
+            SELECT count(*) FROM upd
         $q$, v_leaf_suffix)
-        USING v_from, v_to, v_per_part_cap, p_retention;
+        USING v_from, v_to, p_retention
+        INTO v_n;
 
-        GET DIAGNOSTICS v_n = ROW_COUNT;
         v_total_stamped := v_total_stamped + v_n;
 
-        EXECUTE format($q$
-            SELECT count(*) FROM (
-                WITH spent_in_window AS MATERIALIZED (
-                    SELECT prev_tx_hash FROM spends_p%1$s
-                     WHERE spent_at_height > $1 AND spent_at_height <= $2
-                )
-                SELECT DISTINCT prev_tx_hash AS hash FROM spent_in_window
-                LIMIT $3
-            ) c
-        $q$, v_leaf_suffix)
-        USING v_from, v_to, v_per_part_cap
-        INTO v_candidates;
-
-        IF v_candidates >= v_per_part_cap AND (v_to - v_from) > 1 THEN
-            -- Window held more candidates than one pass covered: shrink and retry
-            -- the SAME window WITHOUT advancing (no-skip). Stamps already done are
-            -- committed (idempotent under IS DISTINCT FROM).
-            v_step := GREATEST(v_step / 2, 1);
-            COMMIT;
-            CONTINUE;
-        END IF;
-
-        -- Window fully drained: advance this partition's watermark and commit.
+        -- Window fully drained in one pass (no cap to clip it): advance unconditionally.
         UPDATE dah_part_watermark
            SET last_swept_height = v_to
          WHERE partition = p_partition AND last_swept_height < v_to;
@@ -210,8 +190,8 @@ BEGIN
         v_windows := v_windows + 1;
         v_from    := v_to;
 
-        -- TIME-ADAPTIVE step: shrink if the window was slow, grow if fast. Keeps
-        -- each window's COMMIT cadence bounded regardless of cache temperature.
+        -- TIME-ADAPTIVE step is the sole density regulator: a dense (slow) window
+        -- shrinks the NEXT window; a sparse (fast) one grows it.
         v_ms := extract(epoch FROM clock_timestamp() - v_t0) * 1000;
         IF v_ms > 2000 THEN
             v_step := GREATEST(v_step / 2, 1);
