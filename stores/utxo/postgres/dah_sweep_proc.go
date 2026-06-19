@@ -442,7 +442,7 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 	}
 
 	var before int64
-	_ = s.pool.QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before)
+	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before)
 
 	// Bound how many partitions sweep at once. Each CALL scans cold partition pages
 	// from disk; firing all 8 at once thrashes a single contended/cold disk and is
@@ -481,7 +481,7 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 			cctx, cancel := context.WithTimeout(ctx, callTimeout)
 			defer cancel()
 
-			if _, err := s.pool.Exec(cctx, `CALL dah_sweep_batch($1, $2, $3)`, p, safeTip, retention); err != nil {
+			if _, err := s.maint().Exec(cctx, `CALL dah_sweep_batch($1, $2, $3)`, p, safeTip, retention); err != nil {
 				if ctx.Err() == nil {
 					s.logger.Infof("[dahCursor] partition %d CALL error (retry next tick): %v", p, err)
 					prometheusDAHSweepErrors.Inc()
@@ -493,7 +493,7 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 	wg.Wait()
 
 	var after int64
-	_ = s.pool.QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&after)
+	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&after)
 
 	if after >= before {
 		return after - before
