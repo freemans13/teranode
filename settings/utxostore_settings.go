@@ -67,6 +67,13 @@ type UtxoStoreSettings struct {
 	// not a tight per-window limit. Each CALL commits per time-adaptive window, so a
 	// timeout loses at most one uncommitted window and resumes next pass.
 	PostgresDAHSweepCallTimeoutSeconds int `key:"utxostore_postgresDAHSweepCallTimeoutSeconds" desc:"Per-partition dah_sweep_batch CALL timeout in seconds (generous wedged-CALL backstop)" default:"120" category:"UtxoStore" usage:"Bounds a wedged CALL; not a per-window limit" type:"int"`
+	// Max partitions swept concurrently per pass. The 8 partition CALLs each scan
+	// cold partition pages from disk; firing all 8 at once thrashes a single
+	// contended/cold disk (measured on a cold box: 8-way ~3-4 heights/s aggregate vs
+	// ~16 heights/s for ONE sequential sweeper). Default 1 (sequential) is the
+	// measured-safe choice on cold/single-disk deployments; raise it on hosts with a
+	// warm cache or fast multi-queue storage that can absorb concurrent random reads.
+	PostgresDAHSweepConcurrency int `key:"utxostore_postgresDAHSweepConcurrency" desc:"Max partitions swept concurrently per DAH sweep pass" default:"1" category:"UtxoStore" usage:"1=sequential (cold-disk safe); up to numPartitions for warm/fast storage" type:"int"`
 
 	// Per-batcher tick interval (go-batcher SetTickInterval, fixed-cadence flushing).
 	// Default 0 = disabled (current behaviour: size + lazy timeout). Ignored when the
