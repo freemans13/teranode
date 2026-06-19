@@ -8,8 +8,30 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/usql"
+	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/sync/errgroup"
 )
+
+// isSweepBudgetExceeded reports whether err is the per-partition sweep hitting its
+// time budget rather than a hard failure: the server-side statement_timeout
+// (Postgres query_canceled, SQLSTATE 57014) set in sweepDAHRangePartition, or a
+// context deadline/cancellation. It means "this height window was too expensive to
+// finish in the budget" — so the caller shrinks the window and retries instead of
+// aborting the whole sweep (which, on a cold-cache box, otherwise retries the same
+// doomed full-size window forever and never advances the watermark).
+func isSweepBudgetExceeded(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == usql.PgErrQueryCanceled {
+		return true
+	}
+
+	return errors.IsContextError(err)
+}
 
 // dahSweepWorkers bounds the per-partition sweep fan-out. Matches the prune
 // delete fan-out and keeps the concurrent-transaction memory envelope modest
@@ -56,10 +78,10 @@ var dahSweepMaxCandidatesPerCall = dahSweepMaxCandidatesTotal / numPartitions
 // (matches zero rows yet scans the whole table). candidates is MATERIALIZED so
 // the bounded (<= limit) set drives a PK nested loop over txs rather than a
 // hash join that could re-introduce a txs seq scan.
-func (s *Store) sweepDAHRange(ctx context.Context, fromH, toH int64, limit int) (int, bool, error) {
+func (s *Store) sweepDAHRange(ctx context.Context, fromH, toH int64, limit int) (int, bool, bool, error) {
 	retention := int64(s.settings.GetUtxoStoreBlockHeightRetention())
 	if retention == 0 {
-		return 0, false, nil
+		return 0, false, false, nil
 	}
 
 	// Fan the range sweep across partitions IN PARALLEL — the analog of the
@@ -84,12 +106,13 @@ func (s *Store) sweepDAHRange(ctx context.Context, fromH, toH int64, limit int) 
 
 	var total atomic.Int64
 	var truncated atomic.Bool
+	var budgetExceeded atomic.Bool
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(dahSweepWorkers)
 	for p := 0; p < numPartitions; p++ {
 		p := p
 		g.Go(func() error {
-			stamped, candidates, err := s.sweepDAHRangePartition(gctx, p, fromH, toH, perPartLimit, retention)
+			stamped, candidates, overBudget, err := s.sweepDAHRangePartition(gctx, p, fromH, toH, perPartLimit, retention)
 			total.Add(int64(stamped))
 			// A partition that enumerated `perPartLimit` candidates may have MORE in
 			// this height window than it processed → the caller must not advance the
@@ -97,14 +120,20 @@ func (s *Store) sweepDAHRange(ctx context.Context, fromH, toH int64, limit int) 
 			if candidates >= perPartLimit {
 				truncated.Store(true)
 			}
+			// A partition whose transaction hit the per-partition time budget
+			// (statement_timeout) reports it WITHOUT a hard error — the caller shrinks
+			// the height window and retries, rather than aborting the whole sweep.
+			if overBudget {
+				budgetExceeded.Store(true)
+			}
 			return err
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return int(total.Load()), truncated.Load(), err
+		return int(total.Load()), truncated.Load(), budgetExceeded.Load(), err
 	}
 
-	return int(total.Load()), truncated.Load(), nil
+	return int(total.Load()), truncated.Load(), budgetExceeded.Load(), nil
 }
 
 // sweepDAHRangePartition runs the bidirectional DAH stamp/clear over the
@@ -113,18 +142,18 @@ func (s *Store) sweepDAHRange(ctx context.Context, fromH, toH int64, limit int) 
 // then aggregate + stamp via a bytea[] parameter so the planner always knows
 // the exact candidate cardinality. The per-tx spendable output count is the
 // stored txs.spendable_count scalar (no outputs table on this path).
-func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, toH int64, limit int, retention int64) (stamped int, candidates int, err error) {
+func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, toH int64, limit int, retention int64) (stamped int, candidates int, budgetExceeded bool, err error) {
 	txsLeaf := fmt.Sprintf("txs_p%02d", partIdx)
 	spendsLeaf := fmt.Sprintf("spends_p%02d", partIdx)
 
 	pgxTx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, 0, errors.NewStorageError("[dahSweep] begin %s: %v", txsLeaf, err)
+		return 0, 0, false, errors.NewStorageError("[dahSweep] begin %s: %v", txsLeaf, err)
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
 	if _, err := pgxTx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
-		return 0, 0, errors.NewStorageError("[dahSweep] set local enable_seqscan: %v", err)
+		return 0, 0, false, errors.NewStorageError("[dahSweep] set local enable_seqscan: %v", err)
 	}
 	// Force a fresh custom plan per sweep. pgx caches a prepared-statement plan
 	// per connection; for the candidate-enumeration query the planner can lock in a
@@ -137,7 +166,7 @@ func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, 
 	// query below plan against the ACTUAL candidate array (exact cardinality), so
 	// no enable_nestloop=off hack is needed to avoid the old CTE misestimate.
 	if _, err := pgxTx.Exec(ctx, `SET LOCAL plan_cache_mode = force_custom_plan`); err != nil {
-		return 0, 0, errors.NewStorageError("[dahSweep] set local plan_cache_mode: %v", err)
+		return 0, 0, false, errors.NewStorageError("[dahSweep] set local plan_cache_mode: %v", err)
 	}
 	// Hard server-side ceiling on each per-partition sweep transaction. The client
 	// context already carries a deadline, but a cancelled context does not reliably
@@ -150,7 +179,7 @@ func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, 
 	// headroom for the cold-cache window right after a reset (before autoanalyze has
 	// sampled the fast-growing partitions).
 	if _, err := pgxTx.Exec(ctx, `SET LOCAL statement_timeout = '120s'`); err != nil {
-		return 0, 0, errors.NewStorageError("[dahSweep] set local statement_timeout: %v", err)
+		return 0, 0, false, errors.NewStorageError("[dahSweep] set local statement_timeout: %v", err)
 	}
 
 	// Step 1: enumerate candidates only (BRIN height-range scans, bounded by
@@ -176,29 +205,38 @@ func (s *Store) sweepDAHRangePartition(ctx context.Context, partIdx int, fromH, 
         ) c
         LIMIT $3`, spendsLeaf, txsLeaf), int32(fromH), int32(toH), limit)
 	if err != nil {
-		return 0, 0, errors.NewStorageError("[dahSweep] enumerate (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
+		if isSweepBudgetExceeded(err) {
+			return 0, 0, true, nil
+		}
+		return 0, 0, false, errors.NewStorageError("[dahSweep] enumerate (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
 	}
 	candidateHashes := make([][]byte, 0, 1024)
 	for rows.Next() {
 		var h []byte
 		if scanErr := rows.Scan(&h); scanErr != nil {
 			rows.Close()
-			return 0, 0, errors.NewStorageError("[dahSweep] scan candidate %s: %v", txsLeaf, scanErr)
+			if isSweepBudgetExceeded(scanErr) {
+				return 0, 0, true, nil
+			}
+			return 0, 0, false, errors.NewStorageError("[dahSweep] scan candidate %s: %v", txsLeaf, scanErr)
 		}
 		candidateHashes = append(candidateHashes, h)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return 0, 0, errors.NewStorageError("[dahSweep] enumerate rows (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
+		if isSweepBudgetExceeded(err) {
+			return 0, 0, true, nil
+		}
+		return 0, 0, false, errors.NewStorageError("[dahSweep] enumerate rows (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
 	}
 	rows.Close()
 	candidates = len(candidateHashes)
 
 	if candidates == 0 {
 		if err := pgxTx.Commit(ctx); err != nil {
-			return 0, 0, errors.NewStorageError("[dahSweep] commit empty range (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
+			return 0, 0, false, errors.NewStorageError("[dahSweep] commit empty range (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
 		}
-		return 0, 0, nil
+		return 0, 0, false, nil
 	}
 
 	// Step 2: aggregate + bidirectionally stamp ONLY the candidate hashes.
@@ -248,15 +286,18 @@ WHERE t.hash = st.hash
   AND t.delete_at_height IS DISTINCT FROM st.new_dah`,
 		spendsLeaf, txsLeaf), candidateHashes, int32(toH), int32(retention))
 	if err != nil {
-		return 0, 0, errors.NewStorageError("[dahSweep] stamp (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
+		if isSweepBudgetExceeded(err) {
+			return 0, 0, true, nil
+		}
+		return 0, 0, false, errors.NewStorageError("[dahSweep] stamp (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
 	}
 	stamped = int(tag.RowsAffected())
 
 	if err := pgxTx.Commit(ctx); err != nil {
-		return 0, 0, errors.NewStorageError("[dahSweep] commit range (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
+		return 0, 0, false, errors.NewStorageError("[dahSweep] commit range (%d,%d] %s: %v", fromH, toH, txsLeaf, err)
 	}
 
-	return stamped, candidates, nil
+	return stamped, candidates, false, nil
 }
 
 // dahSweep height-step bounds for the ADAPTIVE walk in sweepDAHUpTo.
@@ -332,22 +373,32 @@ func (s *Store) sweepDAH(ctx context.Context, toH int64, limit, maxPasses int) (
 			stepTo = toH
 		}
 
-		n, truncated, err := s.sweepDAHRange(ctx, from, stepTo, limit)
+		n, truncated, budgetExceeded, err := s.sweepDAHRange(ctx, from, stepTo, limit)
 		if err != nil {
 			return total, err
 		}
 
-		// A multi-height window that truncated held more candidates than one pass
-		// covered — shrink and retry the SAME window WITHOUT advancing the watermark,
-		// so nothing is skipped. A single-height window cannot shrink further; it is
-		// advanced (one height with >limit-per-partition candidates is not a real
-		// workload, and the keyspace backstop is the last-resort safety net).
-		if truncated && (stepTo-from) > 1 {
+		// A multi-height window that truncated (held more candidates than one pass
+		// covered) OR exceeded the per-partition time budget (statement_timeout —
+		// the window was too expensive for the cold cache to scan in time) is shrunk
+		// and retried over the SAME window WITHOUT advancing the watermark, so
+		// nothing is skipped. Shrinking on a budget timeout is what lets an
+		// undersized/cold-cache box make incremental progress instead of retrying the
+		// identical doomed full-size window every tick forever (watermark frozen).
+		if (truncated || budgetExceeded) && (stepTo-from) > 1 {
 			step /= 4
 			if step < dahSweepMinHeightStep {
 				step = dahSweepMinHeightStep
 			}
 			continue
+		}
+
+		// A single-height window that still exceeds the time budget must NOT advance
+		// the watermark (that would skip its unstamped candidates, orphaning them to
+		// the slow keyspace backstop). Surface it so the next tick retries this
+		// height; a lone height timing out is pathological, not a normal workload.
+		if budgetExceeded {
+			return total, errors.NewStorageError("[dahSweep] single-height window (%d,%d] exceeded time budget; not advancing watermark", from, stepTo)
 		}
 
 		total += n
