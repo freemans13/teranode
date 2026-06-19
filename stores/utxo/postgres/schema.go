@@ -35,20 +35,12 @@ func (s *Store) createSchema(ctx context.Context) error {
 		return err
 	}
 
-	// Bootstrap the server-side DAH sweep procedure only when proc mode is
-	// selected. If the app role lacks CREATE privilege or postgres is too old,
-	// bootstrap reports it as unavailable (non-fatal) and the cursor falls back
-	// to the in-process Go sweep.
-	if s.settings.UtxoStore.PostgresDAHSweepMode == dahSweepModeProc {
-		unavailable, err := s.bootstrapDAHSweepProc(ctx)
-		if err != nil {
-			return err
-		}
-
-		s.dahProcUnavailable = unavailable
-		if unavailable {
-			s.logger.Warnf("[dahSweep] proc mode requested but the procedure could not be bootstrapped on this deployment; falling back to the in-process Go sweep")
-		}
+	// The server-side DAH sweep procedure is the only sweep mechanism (there is no
+	// in-process fallback), so bootstrapping it is mandatory: a failure (missing
+	// CREATE privilege, or postgres < 11) fails store startup and surfaces the
+	// deployment problem rather than silently never pruning.
+	if err := s.bootstrapDAHSweepProc(ctx); err != nil {
+		return err
 	}
 
 	return nil
@@ -176,7 +168,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	// dah_sweep_control: kill switch, tunable knobs, proc version, and the
 	// per-CALL outcome the proc-mode adaptive ticker reads (see dah_sweep_proc.go).
 	// Plain DDL, always created; the procedure itself is bootstrapped separately
-	// and only when PostgresDAHSweepMode = "proc".
+	// (bootstrapped separately in Store.createSchema).
 	if _, err := pool.Exec(ctx, dahSweepControlDDL); err != nil {
 		return errors.NewStorageError("dah_sweep_control creation failed: %v", err)
 	}

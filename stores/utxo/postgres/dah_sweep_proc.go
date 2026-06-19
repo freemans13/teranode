@@ -9,12 +9,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// DAH sweep driver modes (settings.UtxoStore.PostgresDAHSweepMode).
-const (
-	dahSweepModeGo   = "go"   // in-process Worker-2 Go sweep (runDAHCursorGoSweep)
-	dahSweepModeProc = "proc" // server-side dah_sweep_batch() procedure (runDAHCursorProc)
-)
-
 // dahSweepProcVersion is bumped whenever dahSweepProcDDL changes. bootstrap
 // recreates the procedure whenever the version stored in dah_sweep_control
 // differs (in EITHER direction, so a binary rollback reinstalls the older body).
@@ -315,21 +309,19 @@ $$;`
 
 // bootstrapDAHSweepProc seeds the control-row knobs from settings and installs
 // dah_sweep_batch() when the stored proc_version differs from dahSweepProcVersion.
-// It returns unavailable=true (NOT an error) when the procedure cannot be created
-// on this deployment — the app role lacks CREATE privilege (SQLSTATE 42501) or
-// postgres predates PG11 (COMMIT-inside-PROCEDURE) — so the caller falls back to
-// the in-process Go sweep instead of failing store startup. A genuine error
-// (connectivity, malformed DDL) is returned as err.
-func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (unavailable bool, err error) {
+// The procedure is the ONLY DAH sweep mechanism (there is no in-process fallback),
+// so it is mandatory: a missing CREATE privilege (SQLSTATE 42501) or a postgres
+// older than 11 (COMMIT-inside-PROCEDURE) is returned as an error and fails store
+// startup, surfacing the deployment problem instead of silently not pruning.
+func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 	// PG version guard: COMMIT inside a PROCEDURE requires PostgreSQL 11+.
 	var verNum int
 	if err = s.pool.QueryRow(ctx, `SELECT current_setting('server_version_num')::int`).Scan(&verNum); err != nil {
-		return false, errors.NewStorageError("[dahSweep] read server_version_num: %v", err)
+		return errors.NewStorageError("[dahSweep] read server_version_num: %v", err)
 	}
 
 	if verNum < 110000 {
-		s.logger.Warnf("[dahSweep] postgres server_version_num=%d < 110000; proc mode requires PG11+", verNum)
-		return true, nil
+		return errors.NewStorageError("[dahSweep] postgres server_version_num=%d < 110000; the DAH sweep procedure requires PostgreSQL 11+ (COMMIT inside a procedure)", verNum)
 	}
 
 	// Seed tunable knobs from settings into the control row so ops tuning flows
@@ -348,41 +340,38 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (unavailable bool, er
 		`UPDATE dah_sweep_control SET batch_rows = $1, max_windows_per_call = $2 WHERE id = 1`,
 		batchRows, maxWin,
 	); err != nil {
-		// A write privilege failure here is also a "can't use proc" signal.
 		if isInsufficientPrivilege(err) {
-			s.logger.Warnf("[dahSweep] cannot seed dah_sweep_control (42501); falling back to Go sweep")
-			return true, nil
+			return errors.NewStorageError("[dahSweep] app role lacks privilege to write dah_sweep_control (42501); grant it so the DAH sweep can run")
 		}
 
-		return false, errors.NewStorageError("[dahSweep] seed control knobs: %v", err)
+		return errors.NewStorageError("[dahSweep] seed control knobs: %v", err)
 	}
 
 	// Recreate the procedure only when the stored version differs (either direction).
 	var storedVersion int
 	if err = s.pool.QueryRow(ctx, `SELECT proc_version FROM dah_sweep_control WHERE id = 1`).Scan(&storedVersion); err != nil {
-		return false, errors.NewStorageError("[dahSweep] read proc_version: %v", err)
+		return errors.NewStorageError("[dahSweep] read proc_version: %v", err)
 	}
 
 	if storedVersion == dahSweepProcVersion {
-		return false, nil
+		return nil
 	}
 
 	if _, err = s.pool.Exec(ctx, dahSweepProcDDL); err != nil {
 		if isInsufficientPrivilege(err) {
-			s.logger.Warnf("[dahSweep] CREATE PROCEDURE dah_sweep_batch denied (42501); falling back to Go sweep")
-			return true, nil
+			return errors.NewStorageError("[dahSweep] app role lacks CREATE privilege for the dah_sweep_batch procedure (42501); grant CREATE so the DAH sweep can run")
 		}
 
-		return false, errors.NewStorageError("[dahSweep] create procedure: %v", err)
+		return errors.NewStorageError("[dahSweep] create procedure: %v", err)
 	}
 
 	if _, err = s.pool.Exec(ctx, `UPDATE dah_sweep_control SET proc_version = $1 WHERE id = 1`, dahSweepProcVersion); err != nil {
-		return false, errors.NewStorageError("[dahSweep] record proc_version: %v", err)
+		return errors.NewStorageError("[dahSweep] record proc_version: %v", err)
 	}
 
 	s.logger.Infof("[dahSweep] installed dah_sweep_batch procedure version %d", dahSweepProcVersion)
 
-	return false, nil
+	return nil
 }
 
 // isInsufficientPrivilege reports whether err is a postgres insufficient_privilege
@@ -440,29 +429,27 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	// Smoke CALL: verify COMMIT-inside-CALL is active. A negative safe_tip makes
 	// the proc return immediately (no-op). A wrapping transaction injected by pgx
 	// middleware would raise 2D000 (invalid transaction termination) on the proc's
-	// first COMMIT — detect it and fall back.
+	// first COMMIT. There is no Go fallback; log it loudly once so the per-tick
+	// CALL errors that follow have an obvious root cause (the keyspace backstop
+	// loop below still stamps via plain UPDATEs in the meantime).
 	smokeCtx, smokeCancel := context.WithTimeout(ctx, 5*time.Second)
 	_, smokeErr := s.store.pool.Exec(smokeCtx, `CALL dah_sweep_batch($1, $2)`, int64(-1), int32(0))
 	smokeCancel()
-
-	if smokeErr != nil && ctx.Err() == nil {
-		var pgErr *pgconn.PgError
-		if errors.As(smokeErr, &pgErr) && pgErr.Code == "2D000" {
-			s.store.logger.Warnf("[dahCursor] COMMIT-in-CALL blocked by middleware (2D000); falling back to Go sweep")
-		} else {
-			s.store.logger.Warnf("[dahCursor] proc smoke CALL failed (%v); falling back to Go sweep", smokeErr)
-		}
-
-		s.runDAHCursorGoSweep(ctx)
-
-		return
-	}
 
 	if ctx.Err() != nil {
 		return
 	}
 
-	s.logger.Infof("[dahCursor] mode=proc driver active (interval=%s idle=%s)", interval, idleInterval)
+	if smokeErr != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(smokeErr, &pgErr) && pgErr.Code == "2D000" {
+			s.store.logger.Errorf("[dahCursor] COMMIT-in-CALL blocked by middleware (2D000): the DAH sweep procedure cannot commit; the pgx connection must run CALL in autocommit (no wrapping transaction/tracer)")
+		} else {
+			s.store.logger.Errorf("[dahCursor] proc smoke CALL failed: %v", smokeErr)
+		}
+	}
+
+	s.logger.Infof("[dahCursor] proc driver active (interval=%s idle=%s)", interval, idleInterval)
 
 	sweepTimer := time.NewTimer(0) // fire the first sweep immediately
 	defer sweepTimer.Stop()

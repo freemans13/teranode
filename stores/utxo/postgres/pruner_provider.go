@@ -105,24 +105,20 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 	s.logger.Infof("[pruner][%s:%d] starting cleanup scan (delete_at_height <= %d)",
 		blockHashStr, blockHeight, blockHeight)
 
-	// Bounded catch-up DAH sweep SLICE, not a sweep-to-tip monolith. A stamped
-	// DAH is always a FUTURE height (completion+1+retention), so Prune does not
-	// need the watermark at the tip before deleting — it needs stamping and
-	// deleting to make progress TOGETHER. The previous unconditional full sweep
-	// serialised the two phases: under load each Prune call became a 10-20s
-	// sweep followed by a multi-second drain, deletes arrived in rare bursts,
-	// the live table outgrew cache, and the run collapsed into a slow regime
-	// (bimodal ~88K vs ~65K TPS on identical code). A bounded step keeps each
-	// Prune call short so the caller's loop interleaves stamp slices with delete
-	// slices continuously; Worker 2's cursor still does the bulk stamping in
-	// parallel. For unit-test-sized datasets one 4096-height window covers the
-	// whole range, so a single Prune call still stamps+deletes everything.
+	// Stamp a bounded catch-up slice before deleting so stamping and deleting make
+	// progress TOGETHER within each Prune call (the background Worker 2 cursor also
+	// stamps continuously; the procedure's transaction-level advisory lock makes
+	// concurrent callers safe — the loser no-ops). The Go sweep this used to call
+	// (sweepDAHStep) has been removed; Prune now drives the same server-side
+	// dah_sweep_batch() procedure the cursor uses, bounded by max_windows_per_call.
 	lag := int64(s.store.settings.UtxoStore.PostgresDAHSweepLag)
 	if lag <= 0 {
 		lag = 2
 	}
-	if _, err := s.store.sweepDAHStep(ctx, s.store.dahSafeTip(lag), 100000, 2); err != nil {
-		s.logger.Infof("[pruner][%s:%d] DAH catch-up sweep error (continuing): %v", blockHashStr, blockHeight, err)
+
+	retention := int32(s.store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
+	if _, err := s.store.pool.Exec(ctx, `CALL dah_sweep_batch($1, $2)`, s.store.dahSafeTip(lag), retention); err != nil {
+		s.logger.Infof("[pruner][%s:%d] DAH catch-up CALL error (continuing): %v", blockHashStr, blockHeight, err)
 	}
 
 	deletedCount, err := s.deleteTombstoned(ctx, blockHeight)

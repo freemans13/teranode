@@ -46,16 +46,6 @@ type Store struct {
 	prunerService   pruner.Service
 	prunerServiceMu sync.Mutex
 
-	// sweepMu serialises in-process DAH sweepers (the background cursor and Prune
-	// both call sweepDAH). A second concurrent sweep would re-scan the same window —
-	// idempotent but wasted work; the loser TryLocks and skips.
-	sweepMu sync.Mutex
-
-	// dahProcUnavailable is set during schema bootstrap when PostgresDAHSweepMode
-	// is "proc" but the dah_sweep_batch() procedure could not be installed (the app
-	// role lacks CREATE privilege, or postgres predates PG11). The DAH cursor then
-	// falls back to the in-process Go sweep. Set once at startup, read-only after.
-	dahProcUnavailable bool
 }
 
 // batchSizeStats accumulates the real (post-trigger) batch sizes each batcher

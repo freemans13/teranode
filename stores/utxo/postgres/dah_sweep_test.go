@@ -210,7 +210,7 @@ func TestSweepStampsFullySpentMinedParent(t *testing.T) {
 	parent := newMinedSingleOutputTx(t, store, 100) // pre-mined; 2 outputs
 	spendAllOutputs(t, store, parent, 101)          // fully spent at height 101
 
-	n, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	n, err := procSweepUpTo(store, ctx, 105)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, n, 1)
 
@@ -228,7 +228,7 @@ func TestSweepClearsDAHAfterUnspend(t *testing.T) {
 
 	parent := newMinedSingleOutputTx(t, store, 100)
 	spendAllOutputs(t, store, parent, 101)
-	_, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	_, err := procSweepUpTo(store, ctx, 105)
 	require.NoError(t, err)
 
 	// Sweep must have stamped the fully-spent + mined parent.
@@ -252,7 +252,7 @@ func TestUnspendClearsDAH(t *testing.T) {
 	parent := newMinedSingleOutputTx(t, store, 100) // pre-mined
 	spendAllOutputs(t, store, parent, 101)          // fully spent at 101
 
-	_, err := store.sweepDAHUpTo(ctx, 110, 100000)
+	_, err := procSweepUpTo(store, ctx, 110)
 	require.NoError(t, err)
 
 	var dah *int64
@@ -309,7 +309,7 @@ func TestSweepIgnoresUnspendableOpReturnOutputs(t *testing.T) {
 	_, err = store.Spend(ctx, child, 101)
 	require.NoError(t, err)
 
-	n, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	n, err := procSweepUpTo(store, ctx, 105)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, n, 1)
 
@@ -341,7 +341,7 @@ func TestSweepSkipsPartiallySpentAndUnmined(t *testing.T) {
 
 	parent := newMinedSingleOutputTx(t, store, 100) // 2 outputs
 	spendOneOutput(t, store, parent, 0, 101)        // only 1 of 2 spent
-	_, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	_, err := procSweepUpTo(store, ctx, 105)
 	require.NoError(t, err)
 
 	var dah *int64
@@ -357,7 +357,7 @@ func TestSweepDoesNotProcessAboveSafeTip(t *testing.T) {
 	parent := newMinedSingleOutputTx(t, store, 100)
 	spendAllOutputs(t, store, parent, 105) // fully spent at the tip
 
-	_, err := store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000) // safeTip=103 < 105
+	_, err := procSweepUpTo(store, ctx, store.dahSafeTip(2)) // safeTip=103 < 105
 	require.NoError(t, err)
 	var dah *int64
 	require.NoError(t, store.pool.QueryRow(ctx,
@@ -365,7 +365,7 @@ func TestSweepDoesNotProcessAboveSafeTip(t *testing.T) {
 	require.Nil(t, dah, "spends at the open tip must not be swept until below safe_tip")
 
 	require.NoError(t, store.SetBlockHeight(110)) // tip advances; spend at 105 now below safeTip=108
-	_, err = store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000)
+	_, err = procSweepUpTo(store, ctx, store.dahSafeTip(2))
 	require.NoError(t, err)
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT delete_at_height FROM txs WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&dah))
@@ -429,7 +429,7 @@ func TestBackstopRecoversMissedParent(t *testing.T) {
 	require.NoError(t, err)
 
 	// The normal sweep misses it now.
-	_, err = store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000)
+	_, err = procSweepUpTo(store, ctx, store.dahSafeTip(2))
 	require.NoError(t, err)
 	var dah *int64
 	require.NoError(t, store.pool.QueryRow(ctx, `SELECT delete_at_height FROM txs WHERE hash=$1`, p.TxIDChainHash()[:]).Scan(&dah))
@@ -471,7 +471,7 @@ func TestWatermarkResumeAfterRestart(t *testing.T) {
 
 	// "Restart": a fresh sweep resuming from the persisted watermark still finds
 	// and stamps the parent (the spent_at_height tag survived the simulated crash).
-	_, err := store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000)
+	_, err := procSweepUpTo(store, ctx, store.dahSafeTip(2))
 	require.NoError(t, err)
 
 	require.NoError(t, store.pool.QueryRow(ctx,
@@ -499,7 +499,7 @@ func TestDAHParityBothCompletionOrders(t *testing.T) {
 	// SetBlockHeight must come AFTER the final mineTx call (which itself calls
 	// store.SetBlockHeight internally) so the sweep sees height=200.
 	require.NoError(t, store.SetBlockHeight(200))
-	_, err := store.sweepDAHUpTo(ctx, store.dahSafeTip(2), 100000)
+	_, err := procSweepUpTo(store, ctx, store.dahSafeTip(2))
 	require.NoError(t, err)
 
 	for name, tx := range map[string]*bt.Tx{"order1-spend-completes": a, "order2-mine-completes": b} {
@@ -540,7 +540,7 @@ func TestSweepStampsAllOpReturnTx(t *testing.T) {
 	// Mine on the longest chain (sets block_ids + mined_at_height for the mine-arm).
 	mineTx(t, store, tx, 100)
 
-	n, err := store.sweepDAHUpTo(ctx, 105, 100000)
+	n, err := procSweepUpTo(store, ctx, 105)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, n, 1, "the all-OP_RETURN tx must be stamped")
 
@@ -548,4 +548,22 @@ func TestSweepStampsAllOpReturnTx(t *testing.T) {
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT delete_at_height FROM txs WHERE hash=$1`, h[:]).Scan(&dah))
 	require.NotNil(t, dah, "all-OP_RETURN tx (spendable_count=0, out_count>0) must be DAH-stamped once mined")
+}
+
+// procSweepUpTo drives one server-side DAH sweep up to toH via the dah_sweep_batch
+// procedure (installed by store.New -> createSchema) and returns the rows stamped,
+// matching the signature of the removed Go sweepDAHUpTo so the DAH behaviour tests
+// read unchanged. retention comes from settings, exactly as the procedure reads it.
+func procSweepUpTo(store *Store, ctx context.Context, toH int64) (int, error) {
+	retention := int32(store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
+	if _, err := store.pool.Exec(ctx, `CALL dah_sweep_batch($1, $2)`, toH, retention); err != nil {
+		return 0, err
+	}
+
+	var stamped int64
+	if err := store.pool.QueryRow(ctx, `SELECT last_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&stamped); err != nil {
+		return 0, err
+	}
+
+	return int(stamped), nil
 }
