@@ -115,8 +115,10 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 // guard last_swept_height > forkHeight ensures the watermark is never advanced
 // forward by this call (it only ever rewinds).
 func (s *Store) RewindDAHWatermark(ctx context.Context, forkHeight int64) error {
+	// Rewind every partition's watermark (forward-only guard per partition) so the
+	// re-swept range (forkHeight, tip] is re-evaluated on all 8 parallel sweepers.
 	if _, err := s.pool.Exec(ctx,
-		`UPDATE dah_watermark SET last_swept_height = $1 WHERE id = 1 AND last_swept_height > $1`,
+		`UPDATE dah_part_watermark SET last_swept_height = $1 WHERE last_swept_height > $1`,
 		forkHeight,
 	); err != nil {
 		return errors.NewStorageError("[dahSweep] rewind watermark to %d: %v", forkHeight, err)

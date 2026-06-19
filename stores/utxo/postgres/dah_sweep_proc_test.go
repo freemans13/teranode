@@ -51,8 +51,8 @@ func TestDAHSweepProcStampsExpectedDAH(t *testing.T) {
 
 	unmined := newUniqueUnminedTx(t, store) // unmined → NULL (unmined_since guard)
 
-	_, err := store.pool.Exec(ctx, `CALL dah_sweep_batch($1, $2)`, safeTip, int32(ret)) //nolint:gosec // small positive
-	require.NoError(t, err, "CALL dah_sweep_batch must succeed (COMMIT-in-CALL works in the test pool)")
+	// Drive all 8 partition CALLs in parallel (the production path).
+	store.sweepAllPartitionsOnce(ctx, safeTip, int32(ret)) //nolint:gosec // small positive
 
 	dahOf := func(tx *bt.Tx) *int64 {
 		var dah *int64
@@ -71,6 +71,6 @@ func TestDAHSweepProcStampsExpectedDAH(t *testing.T) {
 
 	var watermark int64
 	require.NoError(t, store.pool.QueryRow(ctx,
-		`SELECT last_swept_height FROM dah_watermark WHERE id = 1`).Scan(&watermark))
-	require.Equal(t, safeTip, watermark, "proc must advance the watermark to the safe tip")
+		`SELECT MIN(last_swept_height) FROM dah_part_watermark`).Scan(&watermark))
+	require.Equal(t, safeTip, watermark, "every partition's watermark must reach the safe tip")
 }

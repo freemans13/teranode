@@ -165,6 +165,26 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		return errors.NewStorageError("dah_watermark seed failed: %v", err)
 	}
 
+	// Per-partition DAH sweep watermark: one row per hash partition so the 8
+	// dah_sweep_batch() CALLs the cursor fans out in PARALLEL each track their own
+	// progress independently. Seeded from the legacy single-row dah_watermark so an
+	// existing deployment continues from where it had swept (no re-sweep from 0;
+	// re-sweeping would be idempotent but wasteful).
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS dah_part_watermark (
+			partition INT PRIMARY KEY CHECK (partition BETWEEN 0 AND %d),
+			last_swept_height BIGINT NOT NULL DEFAULT 0
+		)`, numPartitions-1)); err != nil {
+		return errors.NewStorageError("dah_part_watermark creation failed: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO dah_part_watermark (partition, last_swept_height)
+		SELECT g, COALESCE((SELECT last_swept_height FROM dah_watermark WHERE id = 1), 0)
+		FROM generate_series(0, %d) g
+		ON CONFLICT (partition) DO NOTHING`, numPartitions-1)); err != nil {
+		return errors.NewStorageError("dah_part_watermark seed failed: %v", err)
+	}
+
 	// dah_sweep_control: kill switch, tunable knobs, proc version, and the
 	// per-CALL outcome the proc-mode adaptive ticker reads (see dah_sweep_proc.go).
 	// Plain DDL, always created; the procedure itself is bootstrapped separately

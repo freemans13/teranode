@@ -42,8 +42,9 @@ func setupCreateBenchStore(b *testing.B) (*Store, context.Context) {
 		b.Skipf("Skipping: cannot connect to postgres (%s): %v", dsn, err)
 	}
 	_, _ = pool.Exec(ctx, `
+		DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT) CASCADE;
 		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
-			tx_state, transactions, txs, dah_watermark CASCADE;`)
+			tx_state, transactions, txs, dah_watermark, dah_part_watermark, dah_sweep_control CASCADE;`)
 	pool.Close()
 
 	storeURL, err := url.Parse(dsn)

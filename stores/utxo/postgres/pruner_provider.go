@@ -107,19 +107,16 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 
 	// Stamp a bounded catch-up slice before deleting so stamping and deleting make
 	// progress TOGETHER within each Prune call (the background Worker 2 cursor also
-	// stamps continuously; the procedure's transaction-level advisory lock makes
-	// concurrent callers safe — the loser no-ops). The Go sweep this used to call
-	// (sweepDAHStep) has been removed; Prune now drives the same server-side
-	// dah_sweep_batch() procedure the cursor uses, bounded by max_windows_per_call.
+	// stamps continuously; the procedure's per-partition advisory lock makes
+	// concurrent callers safe — the loser no-ops). Drives the same parallel
+	// per-partition dah_sweep_batch() procedure the cursor uses.
 	lag := int64(s.store.settings.UtxoStore.PostgresDAHSweepLag)
 	if lag <= 0 {
 		lag = 2
 	}
 
 	retention := int32(s.store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
-	if _, err := s.store.pool.Exec(ctx, `CALL dah_sweep_batch($1, $2)`, s.store.dahSafeTip(lag), retention); err != nil {
-		s.logger.Infof("[pruner][%s:%d] DAH catch-up CALL error (continuing): %v", blockHashStr, blockHeight, err)
-	}
+	s.store.sweepAllPartitionsOnce(ctx, s.store.dahSafeTip(lag), retention)
 
 	deletedCount, err := s.deleteTombstoned(ctx, blockHeight)
 	if err != nil {
