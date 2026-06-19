@@ -370,8 +370,11 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	sweepTimer := time.NewTimer(0) // fire the first sweep immediately
 	defer sweepTimer.Stop()
 
-	backstopTicker := time.NewTicker(backstopInterval)
-	defer backstopTicker.Stop()
+	// Adaptive backstop: a timer (not a fixed ticker) so the loop can drop to a
+	// fast cadence while it is actively recovering orphans and relax back to the
+	// idle cadence once the keyspace is clean. See runBackstopBurst.
+	backstopTimer := time.NewTimer(backstopInitialDelay)
+	defer backstopTimer.Stop()
 
 	var backstopByte int
 
@@ -380,15 +383,12 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 		case <-ctx.Done():
 			return
 
-		case <-backstopTicker.C:
-			b := backstopByte
-			backstopByte = (backstopByte + 1) & 0xff
-
-			if n, err := s.store.backstopReconcile(ctx, b, b, batch); err != nil {
-				s.logger.Infof("[dahBackstop] slice 0x%02x error (best-effort, continuing): %v", b, err)
-			} else if n > 0 {
-				s.logger.Infof("[dahBackstop] slice 0x%02x recovered %d missed tx(s)", b, n)
+		case <-backstopTimer.C:
+			next := s.runBackstopBurst(ctx, &backstopByte, batch)
+			if ctx.Err() != nil {
+				return
 			}
+			backstopTimer.Reset(next)
 
 		case <-sweepTimer.C:
 			safeTip := s.store.dahSafeTip(lag)
@@ -425,6 +425,62 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 			sweepTimer.Reset(next)
 		}
 	}
+}
+
+// runBackstopBurst runs the guarantee-of-last-resort orphan recovery and returns
+// the delay until it should fire again. It scans keyspace slices starting at
+// *byteCursor (rotating, mod 256).
+//
+// In the common (clean) case the first slice finds nothing and it returns
+// immediately with the idle interval — a cheap ~1/256 scan per idle tick. But the
+// forward-only spends-cursor structurally MISSES any parent that was spent BEFORE
+// it was mined (its spend-window was swept while it was still unmined, so it is
+// never re-enumerated). Those orphans can only be recovered here. So the moment a
+// slice stamps orphans this scans the WHOLE keyspace (all 256 slices) in one pass
+// and returns the fast interval, re-checking soon while a backlog may persist —
+// turning a multi-hour single-slice crawl into a seconds-long drain. Bounded to at
+// most one full keyspace pass per call so the cursor's select loop stays
+// responsive; runs on the maintenance pool so it never starves the validator.
+func (s *postgresPrunerService) runBackstopBurst(ctx context.Context, byteCursor *int, limit int) time.Duration {
+	recovered := false
+
+	for scanned := 0; scanned < 256; scanned++ {
+		if ctx.Err() != nil {
+			return backstopInterval
+		}
+
+		b := *byteCursor
+		*byteCursor = (*byteCursor + 1) & 0xff
+
+		n, err := s.store.backstopReconcile(ctx, b, b, limit)
+		if err != nil {
+			if ctx.Err() == nil {
+				s.logger.Infof("[dahBackstop] slice 0x%02x error (best-effort, continuing): %v", b, err)
+			}
+
+			break
+		}
+
+		if n > 0 {
+			s.logger.Infof("[dahBackstop] slice 0x%02x recovered %d missed tx(s)", b, n)
+			recovered = true
+
+			continue
+		}
+
+		// Clean crawl: nothing found this slice and nothing found all call →
+		// touch just one slice per idle tick. Once a slice HAS recovered orphans,
+		// recovered stays true so we keep going for the full pass.
+		if !recovered {
+			break
+		}
+	}
+
+	if recovered {
+		return backstopFastInterval
+	}
+
+	return backstopInterval
 }
 
 // sweepAllPartitionsOnce fires one dah_sweep_batch() CALL per partition IN

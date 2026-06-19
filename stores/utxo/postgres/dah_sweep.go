@@ -28,11 +28,27 @@ func (s *postgresPrunerService) runDAHCursor(ctx context.Context) {
 	s.runDAHCursorProc(ctx)
 }
 
-// backstopInterval is the period between keyspace-slice ticks in the backstop
-// reconciliation loop embedded in runDAHCursor (G5 guarantee-of-last-resort).
-// One byte-slice is processed per tick; the full 256-byte keyspace is covered
-// every 256 ticks (≈4.3 hours at the default 60s/tick).
+// backstopInterval is the IDLE period between keyspace-slice ticks in the
+// backstop reconciliation loop embedded in runDAHCursor (G5
+// guarantee-of-last-resort). When a slice finds orphans the loop SELF-ACCELERATES
+// (see runDAHCursorProc): it bursts through the remaining keyspace back-to-back so
+// a burst of missed txs is cleared in seconds rather than the ≈4.3 hours a pure
+// one-slice-per-60s crawl would take. It only relaxes back to this idle cadence
+// once a full pass finds nothing. In steady state (no orphans) it stays here,
+// touching ~1/256 of the table per tick — near-zero cost.
 const backstopInterval = 60 * time.Second
+
+// backstopFastInterval is the cadence the backstop drops to while it is actively
+// recovering orphans (a slice just stamped > 0). Short, so a persistent orphan
+// source (e.g. mining lagging spends under heavy load) is drained continuously
+// instead of waiting a full idle interval between passes.
+const backstopFastInterval = 1 * time.Second
+
+// backstopInitialDelay is when the FIRST backstop pass fires after startup. Short
+// so a store that starts with a pre-existing orphan backlog (or a synthetic load
+// that produces orphans immediately) begins recovering right away instead of
+// idling a full backstopInterval first.
+const backstopInitialDelay = 2 * time.Second
 
 // backstopReconcile stamps DAH for mined, fully-spent, un-stamped txs whose hash
 // leading byte is in [loByte, hiByte]. Keyspace-sliced so each run is bounded;
@@ -68,8 +84,9 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 	// slice of stamp-candidates (cheap row predicates + LIMIT, riding the hash
 	// btree), aggregate spends over just that slice using the stored
 	// out_count/spendable_count scalars + out_spendables bitmap, then stamp the
-	// ones that are fully spent.
-	tag, err := s.pool.Exec(ctx, `
+	// ones that are fully spent. Runs on the maintenance pool so its recovery
+	// scans never steal connections from the validator hot path.
+	tag, err := s.maint().Exec(ctx, `
 		WITH slice AS (
 			SELECT t.hash, t.mined_at_height, t.out_spendables,
 			       t.out_count AS total_out,
