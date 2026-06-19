@@ -113,7 +113,7 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 	// validator's batchers cannot starve reclaim under high worker counts (the cause
 	// of the bimodal collapse to 0 TPS), and sweep all 8 partitions in parallel on
 	// this cache-resident box so stamping keeps pace with a ~100K/s create rate.
-	tSettings.UtxoStore.PostgresMaintenancePoolConns = 24
+	tSettings.UtxoStore.PostgresMaintenancePoolConns = 64
 	tSettings.UtxoStore.PostgresDAHSweepConcurrency = 8
 
 	s, err := pgstore.New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
