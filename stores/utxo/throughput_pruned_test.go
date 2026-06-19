@@ -120,6 +120,23 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 	if err != nil {
 		t.Fatalf("pruned queue store: %v", err)
 	}
+
+	// HARNESS FIX (bench-only, safe here): seed the per-partition DAH watermark to
+	// startHeight-1 BEFORE the cursor starts. This harness begins at height 200 on a
+	// freshly-cleaned DB and never writes any tx/spend below 200, so advancing the
+	// watermark to 199 skips nothing — it just stops the cursor from wasting its first
+	// pass clearing the empty genesis→200 range and then idling 5s while creation
+	// floods (the dominant cause of the bimodal startup collapse). This is NOT done in
+	// production SetBlockHeight: there, lower-height spends can arrive after the tip is
+	// set, so a tip-seed would be a TOCTOU that skips real work.
+	{
+		seedPool, perr := pgxpool.New(ctx, throughputDSN)
+		if perr == nil {
+			_, _ = seedPool.Exec(ctx, `UPDATE dah_part_watermark SET last_swept_height = 199 WHERE last_swept_height < 199`)
+			seedPool.Close()
+		}
+	}
+
 	s.Start(ctx)
 	return s, func() { s.Stop() }
 }

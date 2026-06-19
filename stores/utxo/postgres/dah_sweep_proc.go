@@ -344,7 +344,7 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	// COMMIT-inside-CALL works. A wrapping transaction from pgx middleware raises
 	// 2D000. No Go fallback exists; log the root cause loudly.
 	smokeCtx, smokeCancel := context.WithTimeout(ctx, 5*time.Second)
-	_, smokeErr := s.store.pool.Exec(smokeCtx, `CALL dah_sweep_batch($1, $2, $3)`, 0, int64(-1), int32(0))
+	_, smokeErr := s.store.maint().Exec(smokeCtx, `CALL dah_sweep_batch($1, $2, $3)`, 0, int64(-1), int32(0))
 	smokeCancel()
 
 	if ctx.Err() != nil {
@@ -507,7 +507,7 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 // partitions have reached the safe tip).
 func (s *Store) dahWatermarkBacklog(ctx context.Context, safeTip int64) int64 {
 	var minWM int64
-	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MIN(last_swept_height), 0) FROM dah_part_watermark`).Scan(&minWM); err != nil {
+	if err := s.maint().QueryRow(ctx, `SELECT COALESCE(MIN(last_swept_height), 0) FROM dah_part_watermark`).Scan(&minWM); err != nil {
 		return 0
 	}
 
