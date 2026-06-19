@@ -13,7 +13,7 @@ import (
 // dahSweepProcVersion is bumped whenever dahSweepProcDDL changes. bootstrap
 // recreates the procedure whenever the version stored in dah_sweep_control
 // differs (in EITHER direction, so a binary rollback reinstalls the older body).
-const dahSweepProcVersion = 3
+const dahSweepProcVersion = 4
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaWithPool (plain DDL);
@@ -129,10 +129,18 @@ BEGIN
         -- bound on the JOIN → correct fully-spent counting) and bidirectionally stamp
         -- delete_at_height. Exact DAH semantics (preserve_until/unmined_since/block_ids
         -- guards, spendable get_bit, GREATEST+1+retention, IS DISTINCT FROM).
+        -- spent_in_window is a MATERIALIZED optimisation fence so the planner scans by
+        -- the spent_at_height BRIN (correlated → reads only the window's pages). Without
+        -- the fence, the DISTINCT+LIMIT lets the planner pick the prev_tx_hash PK index
+        -- and filter by height instead, scanning the whole index (measured: 300k blocks /
+        -- 12-27s per window vs 41k / 1.5s with the fence).
         EXECUTE format($q$
-            WITH candidates AS MATERIALIZED (
-                SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
+            WITH spent_in_window AS MATERIALIZED (
+                SELECT prev_tx_hash FROM spends_p%1$s
                  WHERE spent_at_height > $1 AND spent_at_height <= $2
+            ),
+            candidates AS MATERIALIZED (
+                SELECT DISTINCT prev_tx_hash AS hash FROM spent_in_window
                 LIMIT $3
             ),
             spend_agg AS (
@@ -173,8 +181,11 @@ BEGIN
 
         EXECUTE format($q$
             SELECT count(*) FROM (
-                SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
-                 WHERE spent_at_height > $1 AND spent_at_height <= $2
+                WITH spent_in_window AS MATERIALIZED (
+                    SELECT prev_tx_hash FROM spends_p%1$s
+                     WHERE spent_at_height > $1 AND spent_at_height <= $2
+                )
+                SELECT DISTINCT prev_tx_hash AS hash FROM spent_in_window
                 LIMIT $3
             ) c
         $q$, v_leaf_suffix)
