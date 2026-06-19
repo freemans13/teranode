@@ -40,6 +40,14 @@ func TestIsSweepBudgetExceeded(t *testing.T) {
 		require.True(t, isSweepBudgetExceeded(pgErr))
 	})
 
+	t.Run("flattened statement_timeout is a budget overrun via string fallback", func(t *testing.T) {
+		// pgx does not always preserve the typed *pgconn.PgError up the chain (it can
+		// arrive flattened through row-streaming / connection-state wrapping); the
+		// SQLSTATE + message text survive in the string and must still classify.
+		flattened := errors.NewStorageError("[dahSweep] stamp txs_p00: ERROR: canceling statement due to statement timeout (SQLSTATE 57014)")
+		require.True(t, isSweepBudgetExceeded(flattened))
+	})
+
 	t.Run("context deadline / cancellation is a budget overrun", func(t *testing.T) {
 		// A sibling partition's failure cancels the errgroup context; the raw
 		// context error must classify as a budget overrun, not a hard error.
