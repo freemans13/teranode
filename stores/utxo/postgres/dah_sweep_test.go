@@ -324,14 +324,14 @@ func TestSweepIgnoresUnspendableOpReturnOutputs(t *testing.T) {
 
 func TestRewindDAHWatermark(t *testing.T) {
 	store, ctx := setupTestStore(t)
-	_, err := store.pool.Exec(ctx, `UPDATE dah_watermark SET last_swept_height = 500 WHERE id = 1`)
+	_, err := store.pool.Exec(ctx, `UPDATE dah_part_watermark SET last_swept_height = 500`)
 	require.NoError(t, err)
 	require.NoError(t, store.RewindDAHWatermark(ctx, 480))
 	var h int64
-	require.NoError(t, store.pool.QueryRow(ctx, `SELECT last_swept_height FROM dah_watermark WHERE id=1`).Scan(&h))
+	require.NoError(t, store.pool.QueryRow(ctx, `SELECT MIN(last_swept_height) FROM dah_part_watermark`).Scan(&h))
 	require.Equal(t, int64(480), h)
 	require.NoError(t, store.RewindDAHWatermark(ctx, 600)) // must NOT advance
-	require.NoError(t, store.pool.QueryRow(ctx, `SELECT last_swept_height FROM dah_watermark WHERE id=1`).Scan(&h))
+	require.NoError(t, store.pool.QueryRow(ctx, `SELECT MIN(last_swept_height) FROM dah_part_watermark`).Scan(&h))
 	require.Equal(t, int64(480), h)
 }
 
@@ -461,7 +461,7 @@ func TestWatermarkResumeAfterRestart(t *testing.T) {
 	// Watermark is still at its seeded value; the height tags are durable.
 	var wm int64
 	require.NoError(t, store.pool.QueryRow(ctx,
-		`SELECT last_swept_height FROM dah_watermark WHERE id=1`).Scan(&wm))
+		`SELECT COALESCE(MIN(last_swept_height), 0) FROM dah_part_watermark`).Scan(&wm))
 	require.Equal(t, int64(0), wm, "no sweep ran yet")
 
 	var dah *int64
@@ -556,14 +556,5 @@ func TestSweepStampsAllOpReturnTx(t *testing.T) {
 // read unchanged. retention comes from settings, exactly as the procedure reads it.
 func procSweepUpTo(store *Store, ctx context.Context, toH int64) (int, error) {
 	retention := int32(store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
-	if _, err := store.pool.Exec(ctx, `CALL dah_sweep_batch($1, $2)`, toH, retention); err != nil {
-		return 0, err
-	}
-
-	var stamped int64
-	if err := store.pool.QueryRow(ctx, `SELECT last_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&stamped); err != nil {
-		return 0, err
-	}
-
-	return int(stamped), nil
+	return int(store.sweepAllPartitionsOnce(ctx, toH, retention)), nil
 }

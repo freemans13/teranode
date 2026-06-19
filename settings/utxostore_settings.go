@@ -61,12 +61,12 @@ type UtxoStoreSettings struct {
 	PostgresDAHSweepBatchRows int `key:"utxostore_postgresDAHSweepBatchRows" desc:"Per-partition candidate cap for the proc-mode DAH sweep" default:"5000" category:"UtxoStore" usage:"Matches dahSweepMaxCandidatesTotal/numPartitions" type:"int"`
 	// Max height windows drained per CALL before the proc returns (proc mode).
 	PostgresDAHSweepMaxWindowsPerCall int `key:"utxostore_postgresDAHSweepMaxWindowsPerCall" desc:"Max height windows drained per proc CALL" default:"32" category:"UtxoStore" usage:"Bounds work per CALL so it returns promptly" type:"int"`
-	// Idle poll cadence (ms) once the proc reports caught-up (proc mode).
+	// Idle poll cadence (ms) once all partitions have caught up to the safe tip.
 	PostgresDAHSweepIdleIntervalMillis int `key:"utxostore_postgresDAHSweepIdleIntervalMillis" desc:"Idle poll cadence (ms) when the DAH sweep is caught up" default:"5000" category:"UtxoStore" usage:"How often to re-check once caught up" type:"int"`
-	// Back-off (ms) when another sweeper holds the advisory lock; 0 = interval*5 (proc mode).
-	PostgresDAHSweepContendedBackoffMillis int `key:"utxostore_postgresDAHSweepContendedBackoffMillis" desc:"Back-off (ms) when the DAH sweep advisory lock is contended; 0 means interval*5" default:"0" category:"UtxoStore" usage:"Yield delay when another sweeper is active" type:"int"`
-	// Per-CALL context timeout as a multiple of the tick interval; bounds a wedged CALL (proc mode).
-	PostgresDAHSweepCallTimeoutMultiple int `key:"utxostore_postgresDAHSweepCallTimeoutMultiple" desc:"Per-CALL timeout as a multiple of the tick interval" default:"50" category:"UtxoStore" usage:"Bounds a disk-wedged CALL holding a pool connection" type:"int"`
+	// Per-partition CALL timeout (seconds) — a GENEROUS backstop for a wedged CALL,
+	// not a tight per-window limit. Each CALL commits per time-adaptive window, so a
+	// timeout loses at most one uncommitted window and resumes next pass.
+	PostgresDAHSweepCallTimeoutSeconds int `key:"utxostore_postgresDAHSweepCallTimeoutSeconds" desc:"Per-partition dah_sweep_batch CALL timeout in seconds (generous wedged-CALL backstop)" default:"120" category:"UtxoStore" usage:"Bounds a wedged CALL; not a per-window limit" type:"int"`
 
 	// Per-batcher tick interval (go-batcher SetTickInterval, fixed-cadence flushing).
 	// Default 0 = disabled (current behaviour: size + lazy timeout). Ignored when the
