@@ -116,7 +116,7 @@ func TestUnsetMinedClearsDAH(t *testing.T) {
 	parentHash := parent.TxIDChainHash()
 
 	// Sweep stamps DAH for the fully-spent mined parent.
-	_, err := store.sweepDAHUpTo(ctx, 110, 100000)
+	_, err := procSweepUpTo(store, ctx, 110)
 	require.NoError(t, err)
 
 	var dah *int64

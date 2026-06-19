@@ -9,4 +9,5 @@ const (
 	PgErrLockNotAvailable  = "55P03" // lock_not_available
 	PgErrCannotConnectNow  = "57P03" // cannot_connect_now
 	PgErrQueryCanceled     = "57014" // query_canceled (e.g. statement_timeout fired)
+	PgErrInsufficientPriv  = "42501" // insufficient_privilege (e.g. CREATE PROCEDURE denied)
 )

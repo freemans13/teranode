@@ -31,7 +31,19 @@ import (
 //     (flat bytea + bitmaps + scalar counts). A single row lookup returns
 //     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
-	return createSchemaWithPool(ctx, s.pool)
+	if err := createSchemaWithPool(ctx, s.pool); err != nil {
+		return err
+	}
+
+	// The server-side DAH sweep procedure is the only sweep mechanism (there is no
+	// in-process fallback), so bootstrapping it is mandatory: a failure (missing
+	// CREATE privilege, or postgres < 11) fails store startup and surfaces the
+	// deployment problem rather than silently never pruning.
+	if err := s.bootstrapDAHSweepProc(ctx); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // partitionSpec defines a partitioned table, the fillfactor for its children,
@@ -151,6 +163,17 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO dah_watermark (id, last_swept_height) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`); err != nil {
 		return errors.NewStorageError("dah_watermark seed failed: %v", err)
+	}
+
+	// dah_sweep_control: kill switch, tunable knobs, proc version, and the
+	// per-CALL outcome the proc-mode adaptive ticker reads (see dah_sweep_proc.go).
+	// Plain DDL, always created; the procedure itself is bootstrapped separately
+	// (bootstrapped separately in Store.createSchema).
+	if _, err := pool.Exec(ctx, dahSweepControlDDL); err != nil {
+		return errors.NewStorageError("dah_sweep_control creation failed: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO dah_sweep_control (id) VALUES (1) ON CONFLICT (id) DO NOTHING`); err != nil {
+		return errors.NewStorageError("dah_sweep_control seed failed: %v", err)
 	}
 
 	// Partial indexes on txs for iterator/pruner queries.

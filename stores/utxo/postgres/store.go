@@ -46,10 +46,6 @@ type Store struct {
 	prunerService   pruner.Service
 	prunerServiceMu sync.Mutex
 
-	// sweepMu serialises in-process DAH sweepers (the background cursor and Prune
-	// both call sweepDAH). A second concurrent sweep would re-scan the same window —
-	// idempotent but wasted work; the loser TryLocks and skips.
-	sweepMu sync.Mutex
 }
 
 // batchSizeStats accumulates the real (post-trigger) batch sizes each batcher
