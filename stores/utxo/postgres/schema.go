@@ -139,30 +139,43 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
-	// Height-column indexes. spends.spent_at_height is append-only and inserted in
+	// Height-column index. spends.spent_at_height is append-only and inserted in
 	// increasing height order → BRIN is near-free on insert (summary per heap range,
-	// no per-row entries) and selective for recent-height scans, because the column
-	// is physically correlated with heap order.
+	// no per-row entries) and selective for height-range scans, because the column is
+	// physically correlated with heap order. The DAH sweep enumerates candidates
+	// purely from this correlated spends side ("spends enumerate, txs decides").
 	//
-	// txs.mined_at_height is NOT correlated: a tx is inserted unmined and its
-	// mined_at_height is set by a later UPDATE, so equal heights are scattered across
-	// the whole partition. A BRIN there is useless — every page range overlaps every
-	// target height, so a height-range scan degenerates to a full-partition heap scan
-	// (measured: ~100k lossy heap blocks, 3.3s, for a SINGLE height). The DAH sweep's
-	// candidate enumeration scans by mined_at_height every window, so it needs a real
-	// ordered index. A partial btree (mined_at_height IS NOT NULL → excludes the
-	// unmined rows, which are never DAH candidates) makes that a 26-buffer index scan
-	// (measured: 28ms for the same window, 119x). Keep the BRIN too: it stays
-	// near-free and serves coarse scans without hurting the planner's btree choice.
+	// There is deliberately NO index on txs.mined_at_height. It is NOT correlated (a
+	// tx is inserted unmined and mined_at_height is set by a later UPDATE, so equal
+	// heights are scattered across the whole partition): a BRIN there is useless
+	// (every page range overlaps every height → full-partition scan) and a btree there
+	// adds write amplification + breaks HOT on the hot mine UPDATE. Instead the sweep
+	// never scans txs by mined_at_height — the only txs that become fully-spent AT mine
+	// time without a spend landing in a swept window (zero-spendable / all-OP_RETURN)
+	// are stamped inline in SetMinedMulti, and the rarer spent-while-unmined case is
+	// caught by the by-hash backstop. mined_at_height stays a plain column (read by
+	// hash in the sweep's per-candidate GREATEST(max_spent, mined_at_height) formula).
 	for i := 0; i < numPartitions; i++ {
 		idxStmts := []string{
 			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_spent_at_height_brin ON spends_p%02d USING brin (spent_at_height) WITH (pages_per_range = 32, autosummarize = on)`, i, i),
-			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS txs_p%02d_mined_at_height_brin ON txs_p%02d USING brin (mined_at_height) WITH (pages_per_range = 32, autosummarize = on)`, i, i),
-			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS txs_p%02d_mined_at_height_btree ON txs_p%02d USING btree (mined_at_height) WHERE mined_at_height IS NOT NULL`, i, i),
 		}
 		for _, ddl := range idxStmts {
 			if _, err := pool.Exec(ctx, ddl); err != nil {
 				return errors.NewStorageError("height index creation failed: %v", err)
+			}
+		}
+	}
+
+	// Drop legacy txs.mined_at_height indexes if a prior build created them. The sweep
+	// no longer scans txs by mined_at_height (see above), so these are dead weight: the
+	// BRIN was useless (uncorrelated) and the btree hurt the mine-path HOT ratio.
+	for i := 0; i < numPartitions; i++ {
+		for _, ddl := range []string{
+			fmt.Sprintf(`DROP INDEX IF EXISTS txs_p%02d_mined_at_height_btree`, i),
+			fmt.Sprintf(`DROP INDEX IF EXISTS txs_p%02d_mined_at_height_brin`, i),
+		} {
+			if _, err := pool.Exec(ctx, ddl); err != nil {
+				return errors.NewStorageError("legacy mined_at_height index drop failed: %v", err)
 			}
 		}
 	}

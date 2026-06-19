@@ -56,11 +56,20 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	// Simple array append — no idempotency check. Duplicates only occur on crash
 	// recovery (same block re-processed). UnsetMined removes all matching entries
 	// so duplicates are harmless.
+	retention := int32(s.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
+
 	var updateSQL string
 	if minedBlockInfo.OnLongestChain {
-		// Record mined_at_height for Worker 2 (deferred DAH sweep).
-		// DAH is no longer stamped inline here; Worker 2 handles the
-		// "fully-spent-then-mined" case by reading mined_at_height.
+		// Record mined_at_height for the deferred DAH sweep, and stamp DAH INLINE for
+		// the one subset the spends-driven sweep can never see: txs that are fully
+		// spent the instant they are mined with NO spend landing in a swept window —
+		// i.e. zero-spendable / all-OP_RETURN txs (spendable_count = 0, out_count > 0).
+		// For those, completion height = this mined height ($5), so
+		// delete_at_height = $5 + 1 + retention ($6). This is a single extra column on
+		// an UPDATE that already runs; delete_at_height is BRIN-indexed so it does NOT
+		// break HOT. preserve_until guards a preserved tx. The rarer spent-while-unmined
+		// case is left to the by-hash backstop. The sweep itself no longer scans txs by
+		// mined_at_height at all.
 		//
 		// mined_at_height is the height of the block this tx is mined into
 		// (minedBlockInfo.BlockHeight), bound as $5 — NOT the store's current
@@ -73,7 +82,12 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 				block_heights = COALESCE(block_heights, '{}') || $3::int[],
 				subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
 				locked = false, unmined_since = NULL,
-				mined_at_height = $5
+				mined_at_height = $5,
+				delete_at_height = CASE
+					WHEN spendable_count = 0 AND out_count > 0 AND preserve_until IS NULL
+					THEN $5 + 1 + $6
+					ELSE delete_at_height
+				END
 			WHERE hash = ANY($1)
 			RETURNING hash, block_ids`
 	} else {
@@ -105,8 +119,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		}
 		if minedBlockInfo.OnLongestChain {
 			// $5: mined_at_height — the block height this tx is mined into
-			// (INT4 column; heights < 2^31).
-			args = append(args, int32(minedBlockInfo.BlockHeight))
+			// (INT4 column; heights < 2^31). $6: retention, for the inline
+			// zero-spendable DAH stamp (delete_at_height = $5 + 1 + $6).
+			args = append(args, int32(minedBlockInfo.BlockHeight), retention)
 		}
 		batch.Queue(updateSQL, args...)
 		numUpdateChunks++

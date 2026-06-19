@@ -19,9 +19,13 @@ func TestDAHSchemaObjectsExist(t *testing.T) {
 
 	for _, q := range []struct{ name, sql string }{
 		{"spends.spent_at_height", `SELECT 1 FROM information_schema.columns WHERE table_name='spends_p00' AND column_name='spent_at_height'`},
+		// mined_at_height stays a plain column (read by hash in the sweep's GREATEST
+		// formula); it is deliberately NOT indexed (uncorrelated → see schema.go).
 		{"txs.mined_at_height", `SELECT 1 FROM information_schema.columns WHERE table_name='txs_p00' AND column_name='mined_at_height'`},
 		{"brin spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_spent_at_height_brin'`},
-		{"brin txs", `SELECT 1 FROM pg_indexes WHERE indexname='txs_p00_mined_at_height_brin'`},
+		// The spends-driven sweep no longer scans txs by mined_at_height, so there must
+		// be NO index on it (a btree would hurt the hot mine UPDATE's HOT ratio).
+		{"no txs mined_at_height index", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname LIKE 'txs_p00_mined_at_height%')`},
 		{"dah_watermark table", `SELECT 1 FROM information_schema.tables WHERE table_name='dah_watermark'`},
 		{"dah_watermark seed row", `SELECT last_swept_height FROM dah_watermark WHERE id = 1`},
 	} {
@@ -511,15 +515,17 @@ func TestDAHParityBothCompletionOrders(t *testing.T) {
 	}
 }
 
-// TestSweepStampsAllOpReturnTx locks in DAH eligibility for a tx whose every output
-// is non-spendable (all OP_RETURN): spendable_count=0, out_count>0. Such a tx is
-// trivially "fully spent" (there are no spendable outputs to spend), so once mined on
-// the longest chain the sweep MUST stamp it via the mine-arm — there are no spends, so
-// the spend-arm never sees it. Guards against a future `spendable_count > 0` gate that
-// would silently leak these forever.
-func TestSweepStampsAllOpReturnTx(t *testing.T) {
+// TestSetMinedStampsAllOpReturnTxInline locks in DAH eligibility for a tx whose every
+// output is non-spendable (all OP_RETURN): spendable_count=0, out_count>0. Such a tx is
+// trivially "fully spent" (there are no spendable outputs to spend) and has NO spends,
+// so the spends-driven sweep never sees it. It is therefore stamped INLINE at mine time
+// (SetMinedMulti), at completion = mined height. The sweep is a no-op for it. Guards
+// against a regression that would silently leak these forever now that the sweep no
+// longer scans txs by mined_at_height.
+func TestSetMinedStampsAllOpReturnTxInline(t *testing.T) {
 	store, ctx := setupTestStore(t)
 	require.NoError(t, store.SetBlockHeight(110))
+	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
 
 	tx := testExtendedTx(t)
 	opReturn := bscript.NewFromBytes([]byte{0x00, 0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef})
@@ -537,17 +543,29 @@ func TestSweepStampsAllOpReturnTx(t *testing.T) {
 	require.Equal(t, int32(2), outCount, "both outputs stored")
 	require.Equal(t, int32(0), spendableCount, "no output is spendable")
 
-	// Mine on the longest chain (sets block_ids + mined_at_height for the mine-arm).
-	mineTx(t, store, tx, 100)
+	// Before mining: not stamped.
+	var preDAH *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, h[:]).Scan(&preDAH))
+	require.Nil(t, preDAH, "unmined all-OP_RETURN tx must not be stamped")
 
-	n, err := procSweepUpTo(store, ctx, 105)
-	require.NoError(t, err)
-	require.GreaterOrEqual(t, n, 1, "the all-OP_RETURN tx must be stamped")
+	// Mine on the longest chain → SetMinedMulti stamps delete_at_height INLINE.
+	mineTx(t, store, tx, 100)
 
 	var dah *int64
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT delete_at_height FROM txs WHERE hash=$1`, h[:]).Scan(&dah))
-	require.NotNil(t, dah, "all-OP_RETURN tx (spendable_count=0, out_count>0) must be DAH-stamped once mined")
+	require.NotNil(t, dah, "all-OP_RETURN tx (spendable_count=0, out_count>0) must be DAH-stamped inline at mine")
+	require.Equal(t, int64(100)+1+ret, *dah, "inline DAH must be mined(100)+1+retention")
+
+	// The spends-driven sweep is a no-op for it (no spends → never a candidate); the
+	// stamp stays put.
+	_, err = procSweepUpTo(store, ctx, 105)
+	require.NoError(t, err)
+
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash=$1`, h[:]).Scan(&dah))
+	require.Equal(t, int64(100)+1+ret, *dah, "sweep must not change the inline stamp")
 }
 
 // procSweepUpTo drives one server-side DAH sweep up to toH via the dah_sweep_batch

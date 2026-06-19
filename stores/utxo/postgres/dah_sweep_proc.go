@@ -13,7 +13,7 @@ import (
 // dahSweepProcVersion is bumped whenever dahSweepProcDDL changes. bootstrap
 // recreates the procedure whenever the version stored in dah_sweep_control
 // differs (in EITHER direction, so a binary rollback reinstalls the older body).
-const dahSweepProcVersion = 2
+const dahSweepProcVersion = 3
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaWithPool (plain DDL);
@@ -118,20 +118,21 @@ BEGIN
         v_truncated := FALSE;
         v_t0        := clock_timestamp();
 
-        -- Step 1+2 for THIS partition: enumerate candidate hashes in (v_from,v_to],
-        -- aggregate their FULL spend history (no height bound on the JOIN → correct
-        -- fully-spent counting), and bidirectionally stamp delete_at_height. Exact
-        -- DAH semantics of the original sweep (preserve_until/unmined_since/block_ids
+        -- Step 1+2 for THIS partition: enumerate candidate parent hashes whose outputs
+        -- were spent in (v_from,v_to] — purely from the APPEND-ORDERED spends side, so
+        -- the BRIN on spent_at_height is correlated and cheap ("spends enumerate, txs
+        -- decides"). We deliberately do NOT also scan txs by mined_at_height (it is
+        -- uncorrelated → full-partition scan): the only txs that complete AT mine time
+        -- without a spend in a swept window (zero-spendable) are stamped inline in
+        -- SetMinedMulti, and the rarer spent-while-unmined case is caught by the by-hash
+        -- backstop. We then aggregate each candidate's FULL spend history (no height
+        -- bound on the JOIN → correct fully-spent counting) and bidirectionally stamp
+        -- delete_at_height. Exact DAH semantics (preserve_until/unmined_since/block_ids
         -- guards, spendable get_bit, GREATEST+1+retention, IS DISTINCT FROM).
         EXECUTE format($q$
             WITH candidates AS MATERIALIZED (
-                SELECT DISTINCT hash FROM (
-                    SELECT prev_tx_hash AS hash FROM spends_p%1$s
-                     WHERE spent_at_height > $1 AND spent_at_height <= $2
-                    UNION
-                    SELECT hash FROM txs_p%1$s
-                     WHERE mined_at_height > $1 AND mined_at_height <= $2
-                ) src
+                SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
+                 WHERE spent_at_height > $1 AND spent_at_height <= $2
                 LIMIT $3
             ),
             spend_agg AS (
@@ -172,13 +173,9 @@ BEGIN
 
         EXECUTE format($q$
             SELECT count(*) FROM (
-                SELECT DISTINCT hash FROM (
-                    SELECT prev_tx_hash AS hash FROM spends_p%1$s
-                     WHERE spent_at_height > $1 AND spent_at_height <= $2
-                    UNION
-                    SELECT hash FROM txs_p%1$s
-                     WHERE mined_at_height > $1 AND mined_at_height <= $2
-                ) src LIMIT $3
+                SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
+                 WHERE spent_at_height > $1 AND spent_at_height <= $2
+                LIMIT $3
             ) c
         $q$, v_leaf_suffix)
         USING v_from, v_to, v_per_part_cap
