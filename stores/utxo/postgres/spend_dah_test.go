@@ -1,7 +1,6 @@
 package postgres
 
 import (
-	"context"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
@@ -18,15 +17,16 @@ func TestMinedThenSpendAllPrunes_Postgres(t *testing.T) {
 	// gets its own — no global reset needed.
 	store, _ := setupTestStore(t)
 
-	// Use a cancellable ctx so the Worker 2 cursor goroutine exits when the test ends.
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
 	provider := any(store).(pruner.PrunerServiceProvider)
 	prunerSvc, err := provider.GetPrunerService()
 	require.NoError(t, err)
 	require.NotNil(t, prunerSvc)
-	prunerSvc.Start(ctx)
 
+	// Deliberately do NOT Start() the background Worker 2 cursor here: this test
+	// exercises Prune's own stamp+delete reclaim path synchronously and
+	// deterministically (on-demand mode, where Prune runs the inline catch-up sweep
+	// itself). When the cursor IS running it becomes the authoritative stamper and
+	// Prune skips the inline sweep — that path is covered by the throughput and
+	// integration suites, and is async (would race a synchronous assertion here).
 	tests.MinedThenSpendAllPrunes(t, store, prunerSvc)
 }

@@ -29,6 +29,12 @@ type Store struct {
 	// pgxpool for all pgx-native operations.
 	pool *pgxpool.Pool
 
+	// Small dedicated pool for background reclaim (DAH sweep CALLs + pruner cascade
+	// deletes), isolated from `pool` so the validator's batchers cannot starve
+	// stamping/deleting under load. nil ⇒ reclaim falls back to `pool` (legacy
+	// behaviour when PostgresMaintenancePoolConns <= 0).
+	maintPool *pgxpool.Pool
+
 	// block state
 	blockHeight     atomic.Uint32
 	medianBlockTime atomic.Uint32
@@ -109,13 +115,31 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, err
 	}
 
+	// Dedicated maintenance pool for background reclaim (DAH sweep CALLs + pruner
+	// cascade deletes), isolated from the validator write pool so reclaim is never
+	// starved under load. Inherits the same DSN/TLS/synchronous_commit via Copy().
+	// Default 0 ⇒ disabled (reclaim shares the main pool — legacy behaviour).
+	var maintPool *pgxpool.Pool
+	if mc := tSettings.UtxoStore.PostgresMaintenancePoolConns; mc > 0 {
+		maintConfig := pgxConfig.Copy()
+		maintConfig.MaxConns = int32(mc)            //nolint:gosec // small positive bound
+		maintConfig.MinConns = int32(numPartitions) // keep 8 warm so the fan-out CALLs/deletes never wait on a lazy dial
+
+		maintPool, err = pgxpool.NewWithConfig(ctx, maintConfig)
+		if err != nil {
+			pool.Close()
+			return nil, err
+		}
+	}
+
 	initPrometheusMetrics()
 
 	s := &Store{
-		logger:   logger,
-		settings: tSettings,
-		storeURL: storeURL,
-		pool:     pool,
+		logger:    logger,
+		settings:  tSettings,
+		storeURL:  storeURL,
+		pool:      pool,
+		maintPool: maintPool,
 	}
 
 	if err := s.createSchema(ctx); err != nil {
@@ -230,9 +254,25 @@ func (s *Store) Stop() {
 	if s.unlockBatcher != nil {
 		s.unlockBatcher.Close()
 	}
+	// Close the maintenance pool before the main pool: the cursor is already
+	// cancelled by stopPrunerCursor() above, so its in-flight CALL/delete drains first.
+	if s.maintPool != nil {
+		s.maintPool.Close()
+	}
 	if s.pool != nil {
 		s.pool.Close()
 	}
+}
+
+// maint returns the dedicated maintenance pool when configured, else the main
+// pool (legacy behaviour). Background reclaim (DAH sweep CALLs, pruner cascade
+// deletes) uses this so it is never starved by the validator batchers on `pool`.
+func (s *Store) maint() *pgxpool.Pool {
+	if s.maintPool != nil {
+		return s.maintPool
+	}
+
+	return s.pool
 }
 
 // Close drains any in-flight batched writes and releases the connection pool,
@@ -263,6 +303,9 @@ func (s *Store) Close(ctx context.Context) error {
 		}
 		// Always close the pool after the batchers drain, even if ctx has
 		// already expired, so the connection pool is not leaked.
+		if s.maintPool != nil {
+			s.maintPool.Close()
+		}
 		if s.pool != nil {
 			s.pool.Close()
 		}

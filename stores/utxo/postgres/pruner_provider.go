@@ -105,18 +105,28 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 	s.logger.Infof("[pruner][%s:%d] starting cleanup scan (delete_at_height <= %d)",
 		blockHashStr, blockHeight, blockHeight)
 
-	// Stamp a bounded catch-up slice before deleting so stamping and deleting make
-	// progress TOGETHER within each Prune call (the background Worker 2 cursor also
-	// stamps continuously; the procedure's per-partition advisory lock makes
-	// concurrent callers safe — the loser no-ops). Drives the same parallel
-	// per-partition dah_sweep_batch() procedure the cursor uses.
-	lag := int64(s.store.settings.UtxoStore.PostgresDAHSweepLag)
-	if lag <= 0 {
-		lag = 2
-	}
+	// Stamp a bounded catch-up slice before deleting — but ONLY when the background
+	// Worker 2 cursor is NOT running. When the cursor IS running it is the
+	// authoritative continuous stamper, so an inline catch-up sweep here is redundant
+	// and, on the dedicated maintenance pool, just steals the connections the cascade
+	// deletes need (measured: with both stamping AND this inline sweep on the maint
+	// pool, deletes starve to 0 and the table never reclaims). When no cursor drives
+	// (on-demand Prune callers) the inline sweep is required so stamping still makes
+	// progress before the delete. The per-partition advisory lock keeps concurrent
+	// callers safe either way.
+	s.mu.Lock()
+	cursorRunning := s.cursorStarted
+	s.mu.Unlock()
 
-	retention := int32(s.store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
-	s.store.sweepAllPartitionsOnce(ctx, s.store.dahSafeTip(lag), retention)
+	if !cursorRunning {
+		lag := int64(s.store.settings.UtxoStore.PostgresDAHSweepLag)
+		if lag <= 0 {
+			lag = 2
+		}
+
+		retention := int32(s.store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
+		s.store.sweepAllPartitionsOnce(ctx, s.store.dahSafeTip(lag), retention)
+	}
 
 	deletedCount, err := s.deleteTombstoned(ctx, blockHeight)
 	if err != nil {
@@ -272,7 +282,7 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 
 		// delete_at_height is INT4 — bind int32 so the doomed-scan predicate is
 		// a native int4 comparison on the BRIN-indexed column.
-		tag, err := s.store.pool.Exec(ctx, cascadeSQL, int32(blockHeight), int64(pruneDeleteBatchSize))
+		tag, err := s.store.maint().Exec(ctx, cascadeSQL, int32(blockHeight), int64(pruneDeleteBatchSize))
 		if err != nil {
 			return deleted, errors.NewStorageError("[pruner] cascade delete %s: %v", txsLeaf, err)
 		}

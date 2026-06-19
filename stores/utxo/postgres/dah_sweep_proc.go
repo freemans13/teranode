@@ -344,7 +344,7 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	// COMMIT-inside-CALL works. A wrapping transaction from pgx middleware raises
 	// 2D000. No Go fallback exists; log the root cause loudly.
 	smokeCtx, smokeCancel := context.WithTimeout(ctx, 5*time.Second)
-	_, smokeErr := s.store.pool.Exec(smokeCtx, `CALL dah_sweep_batch($1, $2, $3)`, 0, int64(-1), int32(0))
+	_, smokeErr := s.store.maint().Exec(smokeCtx, `CALL dah_sweep_batch($1, $2, $3)`, 0, int64(-1), int32(0))
 	smokeCancel()
 
 	if ctx.Err() != nil {
@@ -442,7 +442,7 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 	}
 
 	var before int64
-	_ = s.pool.QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before)
+	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before)
 
 	// Bound how many partitions sweep at once. Each CALL scans cold partition pages
 	// from disk; firing all 8 at once thrashes a single contended/cold disk and is
@@ -481,7 +481,7 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 			cctx, cancel := context.WithTimeout(ctx, callTimeout)
 			defer cancel()
 
-			if _, err := s.pool.Exec(cctx, `CALL dah_sweep_batch($1, $2, $3)`, p, safeTip, retention); err != nil {
+			if _, err := s.maint().Exec(cctx, `CALL dah_sweep_batch($1, $2, $3)`, p, safeTip, retention); err != nil {
 				if ctx.Err() == nil {
 					s.logger.Infof("[dahCursor] partition %d CALL error (retry next tick): %v", p, err)
 					prometheusDAHSweepErrors.Inc()
@@ -493,7 +493,7 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 	wg.Wait()
 
 	var after int64
-	_ = s.pool.QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&after)
+	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&after)
 
 	if after >= before {
 		return after - before
@@ -507,7 +507,7 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 // partitions have reached the safe tip).
 func (s *Store) dahWatermarkBacklog(ctx context.Context, safeTip int64) int64 {
 	var minWM int64
-	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MIN(last_swept_height), 0) FROM dah_part_watermark`).Scan(&minWM); err != nil {
+	if err := s.maint().QueryRow(ctx, `SELECT COALESCE(MIN(last_swept_height), 0) FROM dah_part_watermark`).Scan(&minWM); err != nil {
 		return 0
 	}
 

@@ -74,6 +74,11 @@ type UtxoStoreSettings struct {
 	// measured-safe choice on cold/single-disk deployments; raise it on hosts with a
 	// warm cache or fast multi-queue storage that can absorb concurrent random reads.
 	PostgresDAHSweepConcurrency int `key:"utxostore_postgresDAHSweepConcurrency" desc:"Max partitions swept concurrently per DAH sweep pass" default:"1" category:"UtxoStore" usage:"1=sequential (cold-disk safe); up to numPartitions for warm/fast storage" type:"int"`
+	// Dedicated maintenance pool size (PostgreSQL store only): connections reserved
+	// for the DAH sweep CALLs and pruner cascade deletes, isolated from the main
+	// write pool so background reclaim is never starved by the validator batchers
+	// under load. 0 disables (reclaim shares the main pool — legacy behaviour).
+	PostgresMaintenancePoolConns int `key:"utxostore_postgresMaintenancePoolConns" desc:"Dedicated maintenance pool size for DAH sweep + pruner deletes (0=share main pool)" default:"0" category:"UtxoStore" usage:"16 recommended; isolates reclaim conns from the write pool" type:"int"`
 
 	// Per-batcher tick interval (go-batcher SetTickInterval, fixed-cadence flushing).
 	// Default 0 = disabled (current behaviour: size + lazy timeout). Ignored when the

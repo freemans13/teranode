@@ -109,11 +109,34 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 	// Short retention so pruning actually reclaims rows during the run.
 	tSettings.GlobalBlockHeightRetention = prunedRetention
 	tSettings.UtxoStore.BlockHeightRetentionAdjustment = 0
+	// Isolate the DAH sweep CALLs + pruner deletes onto a dedicated pool so the
+	// validator's batchers cannot starve reclaim under high worker counts (the cause
+	// of the bimodal collapse to 0 TPS), and sweep all 8 partitions in parallel on
+	// this cache-resident box so stamping keeps pace with a ~100K/s create rate.
+	tSettings.UtxoStore.PostgresMaintenancePoolConns = 64
+	tSettings.UtxoStore.PostgresDAHSweepConcurrency = 8
 
 	s, err := pgstore.New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
 	if err != nil {
 		t.Fatalf("pruned queue store: %v", err)
 	}
+
+	// HARNESS FIX (bench-only, safe here): seed the per-partition DAH watermark to
+	// startHeight-1 BEFORE the cursor starts. This harness begins at height 200 on a
+	// freshly-cleaned DB and never writes any tx/spend below 200, so advancing the
+	// watermark to 199 skips nothing — it just stops the cursor from wasting its first
+	// pass clearing the empty genesis→200 range and then idling 5s while creation
+	// floods (the dominant cause of the bimodal startup collapse). This is NOT done in
+	// production SetBlockHeight: there, lower-height spends can arrive after the tip is
+	// set, so a tip-seed would be a TOCTOU that skips real work.
+	{
+		seedPool, perr := pgxpool.New(ctx, throughputDSN)
+		if perr == nil {
+			_, _ = seedPool.Exec(ctx, `UPDATE dah_part_watermark SET last_swept_height = 199 WHERE last_swept_height < 199`)
+			seedPool.Close()
+		}
+	}
+
 	s.Start(ctx)
 	return s, func() { s.Stop() }
 }
