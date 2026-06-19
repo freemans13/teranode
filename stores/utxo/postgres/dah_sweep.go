@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -30,7 +31,18 @@ func isSweepBudgetExceeded(err error) bool {
 		return true
 	}
 
-	return errors.IsContextError(err)
+	if errors.IsContextError(err) {
+		return true
+	}
+
+	// Fallback: pgx does not always surface the statement_timeout as a typed
+	// *pgconn.PgError that errors.As can reach (it can arrive flattened through row
+	// streaming / connection-state wrapping), but the SQLSTATE and the canonical
+	// message text survive in the error string. Matching them keeps the budget
+	// classification robust regardless of how the driver wraps the cancellation.
+	msg := err.Error()
+	return strings.Contains(msg, "SQLSTATE "+usql.PgErrQueryCanceled) ||
+		strings.Contains(msg, "statement timeout")
 }
 
 // dahSweepWorkers bounds the per-partition sweep fan-out. Matches the prune
@@ -363,6 +375,13 @@ func (s *Store) sweepDAH(ctx context.Context, toH int64, limit, maxPasses int) (
 	total := 0
 	passes := 0
 	step := int64(dahSweepMaxHeightStep)
+	// stepCeil caps grow-back. When a window times out on the per-partition budget,
+	// the ceiling drops below it so the adaptive grow-back never re-probes a size
+	// already proven too slow for this (cold) cache — otherwise the step would grow
+	// back to dahSweepMaxHeightStep, waste another full statement_timeout, shrink,
+	// and oscillate. It is per-call (next call starts fresh), so a warmed cache or
+	// sparser range later still gets the full max step.
+	stepCeil := int64(dahSweepMaxHeightStep)
 	for from < toH {
 		if maxPasses > 0 && passes >= maxPasses {
 			break
@@ -386,6 +405,12 @@ func (s *Store) sweepDAH(ctx context.Context, toH int64, limit, maxPasses int) (
 		// undersized/cold-cache box make incremental progress instead of retrying the
 		// identical doomed full-size window every tick forever (watermark frozen).
 		if (truncated || budgetExceeded) && (stepTo-from) > 1 {
+			if budgetExceeded {
+				// Don't let grow-back climb back to this too-slow size this call.
+				if stepCeil = step / 4; stepCeil < dahSweepMinHeightStep {
+					stepCeil = dahSweepMinHeightStep
+				}
+			}
 			step /= 4
 			if step < dahSweepMinHeightStep {
 				step = dahSweepMinHeightStep
@@ -414,12 +439,14 @@ func (s *Store) sweepDAH(ctx context.Context, toH int64, limit, maxPasses int) (
 		}
 		from = stepTo
 
-		// Grow back toward the max after a clean (non-truncated) pass so a long
-		// empty stretch ahead is skipped quickly.
-		if !truncated && step < dahSweepMaxHeightStep {
+		// Grow back toward stepCeil after a clean (non-truncated) pass so a long
+		// empty stretch ahead is skipped quickly — but never past a size already
+		// proven too slow this call (stepCeil), to avoid oscillating into repeated
+		// full-budget timeouts on a cold-cache box.
+		if !truncated && step < stepCeil {
 			step *= 2
-			if step > dahSweepMaxHeightStep {
-				step = dahSweepMaxHeightStep
+			if step > stepCeil {
+				step = stepCeil
 			}
 		}
 
