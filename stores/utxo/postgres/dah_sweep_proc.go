@@ -355,7 +355,12 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 		}
 	}
 
-	s.logger.Infof("[dahCursor] proc driver active (parallel %d-partition; interval=%s idle=%s)", numPartitions, interval, idleInterval)
+	sweepConcurrency := cfg.PostgresDAHSweepConcurrency
+	if sweepConcurrency <= 0 {
+		sweepConcurrency = 1
+	}
+
+	s.logger.Infof("[dahCursor] proc driver active (%d partitions, concurrency=%d; interval=%s idle=%s)", numPartitions, sweepConcurrency, interval, idleInterval)
 
 	sweepTimer := time.NewTimer(0) // fire the first sweep immediately
 	defer sweepTimer.Stop()
@@ -434,6 +439,22 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 	var before int64
 	_ = s.pool.QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before)
 
+	// Bound how many partitions sweep at once. Each CALL scans cold partition pages
+	// from disk; firing all 8 at once thrashes a single contended/cold disk and is
+	// SLOWER in aggregate than fewer sweepers (measured). A buffered channel acts as
+	// a semaphore; concurrency=1 → fully sequential, concurrency>=numPartitions → the
+	// original all-parallel behaviour.
+	concurrency := s.settings.UtxoStore.PostgresDAHSweepConcurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	if concurrency > numPartitions {
+		concurrency = numPartitions
+	}
+
+	sem := make(chan struct{}, concurrency)
+
 	var wg sync.WaitGroup
 
 	for p := 0; p < numPartitions; p++ {
@@ -443,6 +464,14 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 
 		go func() {
 			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Stop launching new CALLs once the parent context is done.
+			if ctx.Err() != nil {
+				return
+			}
 
 			cctx, cancel := context.WithTimeout(ctx, callTimeout)
 			defer cancel()
