@@ -469,12 +469,27 @@ func (s *Store) dahSafeTip(lag int64) int64 {
 	return h - lag
 }
 
-// runDAHCursor is the Worker 2 background loop: it wakes on a ticker, sweeps
-// sweepDAHUpTo(dahSafeTip(lag)) in a tight inner loop until fewer than batch
-// rows are touched, then sleeps until the next tick. The loop exits cleanly
-// when ctx is cancelled.
+// runDAHCursor is the Worker 2 background entry point. It dispatches to the
+// server-side procedure driver (proc mode, when the procedure bootstrapped) or
+// the in-process Go sweep (default / fallback), and owns the cursorWg lifetime
+// for whichever it runs.
 func (s *postgresPrunerService) runDAHCursor(ctx context.Context) {
 	defer s.cursorWg.Done() // let stop() wait for this goroutine to fully exit
+
+	if s.store.settings.UtxoStore.PostgresDAHSweepMode == dahSweepModeProc && !s.store.dahProcUnavailable {
+		s.runDAHCursorProc(ctx)
+		return
+	}
+
+	s.runDAHCursorGoSweep(ctx)
+}
+
+// runDAHCursorGoSweep is the original in-process Worker 2 loop: it wakes on a
+// ticker, sweeps sweepDAHUpTo(dahSafeTip(lag)) in a tight inner loop until fewer
+// than batch rows are touched, then sleeps until the next tick. It also runs the
+// keyspace backstop. The loop exits cleanly when ctx is cancelled. (cursorWg.Done
+// is owned by the runDAHCursor dispatcher.)
+func (s *postgresPrunerService) runDAHCursorGoSweep(ctx context.Context) {
 	cfg := s.store.settings.UtxoStore
 	batch := cfg.PostgresDAHSweepBatchSize
 	if batch <= 0 {
