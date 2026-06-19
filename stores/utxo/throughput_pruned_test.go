@@ -3,6 +3,7 @@ package utxo_test
 import (
 	"context"
 	"net/url"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -277,14 +278,45 @@ func runPrunedValidator(t *testing.T, store prunedBenchStore, numWorkers int, cf
 		}
 	}()
 
-	// Genesis tx per worker (untimed), created at the start height.
+	// Genesis tx per worker (untimed), created at the start height. Fanned out
+	// across all CPUs: serial Creates submitted one-at-a-time never fill the
+	// 500-row StoreBatcher, so they flush on the 5ms timer and the 10K-worker
+	// pre-creation dominated startup. Concurrent submission keeps the batcher full
+	// and saturates the create path the same way the measured phase does.
 	parents := make([]*bt.Tx, numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		g := makeGenesisTx(i)
-		if _, cErr := store.Create(ctx, g, uint32(startHeight)); cErr != nil {
-			t.Fatalf("genesis create worker %d: %v", i, cErr)
+	{
+		conc := runtime.GOMAXPROCS(0) * 16
+		if conc > numWorkers {
+			conc = numWorkers
 		}
-		parents[i] = g
+
+		var gwg sync.WaitGroup
+		var genErr atomic.Value
+		sem := make(chan struct{}, conc)
+
+		for i := 0; i < numWorkers; i++ {
+			i := i
+			sem <- struct{}{}
+			gwg.Add(1)
+
+			go func() {
+				defer gwg.Done()
+				defer func() { <-sem }()
+
+				g := makeGenesisTx(i)
+				if _, cErr := store.Create(ctx, g, uint32(startHeight)); cErr != nil {
+					genErr.Store(cErr)
+					return
+				}
+				parents[i] = g
+			}()
+		}
+
+		gwg.Wait()
+
+		if e := genErr.Load(); e != nil {
+			t.Fatalf("genesis create: %v", e.(error))
+		}
 	}
 
 	runPhase := func(dur time.Duration) int64 {
