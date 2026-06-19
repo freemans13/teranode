@@ -13,7 +13,7 @@ import (
 // dahSweepProcVersion is bumped whenever dahSweepProcDDL changes. bootstrap
 // recreates the procedure whenever the version stored in dah_sweep_control
 // differs (in EITHER direction, so a binary rollback reinstalls the older body).
-const dahSweepProcVersion = 5
+const dahSweepProcVersion = 6
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaWithPool (plain DDL);
@@ -120,26 +120,24 @@ BEGIN
 
         -- SINGLE PASS for THIS partition. Enumerate candidate parent hashes whose
         -- outputs were spent in (v_from,v_to] purely from the APPEND-ORDERED spends side
-        -- ("spends enumerate, txs decides"); the spent_in_window MATERIALIZED fence
-        -- forces the correlated spent_at_height BRIN rather than the prev_tx_hash PK
-        -- index (measured: BRIN 41k blocks / 1.5s vs PK-scan 300k / 12-27s). No LIMIT:
-        -- candidates is the COMPLETE distinct-parent set of the window, so there is
-        -- nothing to truncate and no shrink-retry is needed. Aggregate each candidate's
-        -- FULL spend history (no height bound on the JOIN → correct fully-spent
-        -- counting), bidirectionally stamp delete_at_height with the exact DAH formula,
-        -- and COUNT the stamped rows from the SAME pass: the data-modifying upd CTE
-        -- runs once to completion and the outer SELECT counts its RETURNING, so spends is
-        -- BRIN-scanned ONCE per window (the old design re-scanned it a second time just
-        -- to size the shrink). Exact DAH semantics unchanged
-        -- (preserve_until/unmined_since/block_ids guards, spendable get_bit,
-        -- GREATEST+1+retention, IS DISTINCT FROM).
+        -- ("spends enumerate, txs decides"). The composite btree (spent_at_height,
+        -- prev_tx_hash) serves this as an INDEX-ONLY range scan — it reads only the
+        -- window's index leaves, no heap, so the cost is proportional to the window's
+        -- spend rows and independent of accumulated chain size (measured on betfair:
+        -- 22,728 buffers/lossy-BRIN → ~520 index-only, 25s cold → ~0.1s). enable_seqscan
+        -- stays off so it never regresses to a seq scan. No LIMIT: candidates is the
+        -- COMPLETE distinct-parent set of the window, so there is nothing to truncate and
+        -- no shrink-retry is needed. Aggregate each candidate's FULL spend history (no
+        -- height bound on the JOIN → correct fully-spent counting), bidirectionally stamp
+        -- delete_at_height with the exact DAH formula, and COUNT the stamped rows from the
+        -- SAME pass: the data-modifying upd CTE runs once to completion and the outer
+        -- SELECT counts its RETURNING, so spends is scanned ONCE per window. Exact DAH
+        -- semantics unchanged (preserve_until/unmined_since/block_ids guards, spendable
+        -- get_bit, GREATEST+1+retention, IS DISTINCT FROM).
         EXECUTE format($q$
-            WITH spent_in_window AS MATERIALIZED (
-                SELECT prev_tx_hash FROM spends_p%1$s
+            WITH candidates AS MATERIALIZED (
+                SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
                  WHERE spent_at_height > $1 AND spent_at_height <= $2
-            ),
-            candidates AS MATERIALIZED (
-                SELECT DISTINCT prev_tx_hash AS hash FROM spent_in_window
             ),
             spend_agg AS (
                 SELECT s.prev_tx_hash AS hash,

@@ -23,6 +23,9 @@ func TestDAHSchemaObjectsExist(t *testing.T) {
 		// formula); it is deliberately NOT indexed (uncorrelated → see schema.go).
 		{"txs.mined_at_height", `SELECT 1 FROM information_schema.columns WHERE table_name='txs_p00' AND column_name='mined_at_height'`},
 		{"brin spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_spent_at_height_brin'`},
+		// Composite btree drives the Index-Only candidate enumeration (scales with
+		// window spend-rows, not chain size); see schema.go.
+		{"composite btree spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_h_hash_btree'`},
 		// The spends-driven sweep no longer scans txs by mined_at_height, so there must
 		// be NO index on it (a btree would hurt the hot mine UPDATE's HOT ratio).
 		{"no txs mined_at_height index", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname LIKE 'txs_p00_mined_at_height%')`},
