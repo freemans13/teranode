@@ -139,25 +139,35 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
-	// Height-column index. spends.spent_at_height is append-only and inserted in
-	// increasing height order → BRIN is near-free on insert (summary per heap range,
-	// no per-row entries) and selective for height-range scans, because the column is
-	// physically correlated with heap order. The DAH sweep enumerates candidates
-	// purely from this correlated spends side ("spends enumerate, txs decides").
+	// Height indexes on spends. The DAH sweep enumerates candidate parents purely from
+	// the spends side by height window ("spends enumerate, txs decides").
 	//
-	// There is deliberately NO index on txs.mined_at_height. It is NOT correlated (a
-	// tx is inserted unmined and mined_at_height is set by a later UPDATE, so equal
-	// heights are scattered across the whole partition): a BRIN there is useless
-	// (every page range overlaps every height → full-partition scan) and a btree there
-	// adds write amplification + breaks HOT on the hot mine UPDATE. Instead the sweep
-	// never scans txs by mined_at_height — the only txs that become fully-spent AT mine
-	// time without a spend landing in a swept window (zero-spendable / all-OP_RETURN)
-	// are stamped inline in SetMinedMulti, and the rarer spent-while-unmined case is
-	// caught by the by-hash backstop. mined_at_height stays a plain column (read by
-	// hash in the sweep's per-candidate GREATEST(max_spent, mined_at_height) formula).
+	// BRIN(spent_at_height): near-free on insert; kept as a planner fallback and used by
+	// the backstop. But spent_at_height is only LOOSELY correlated with heap order
+	// (concurrent block validation interleaves heights), so its bitmap goes LOSSY — a
+	// 1024-height window rechecks ~1.9M rows / ~28k heap pages to keep ~280k (measured),
+	// which does not scale and pins the cold disk during the sweep.
+	//
+	// Composite btree (spent_at_height, prev_tx_hash): makes the candidate enumeration an
+	// INDEX-ONLY range scan (the CTE needs only prev_tx_hash for a height range) — it
+	// reads only the window's index leaves, no heap (measured on betfair: 22,728 buffers
+	// → ~520, zero heap fetches). The cursor's per-window cost becomes proportional to
+	// that window's spend rows, NOT to accumulated chain size, so it scales and stays at
+	// the warm edge. spends is INSERT-ONLY so a btree does NOT break HOT (HOT is an
+	// UPDATE concern); spent_at_height is MONOTONIC (block height) so inserts land on the
+	// right-most leaf (cheap, hot-page append) and deduplicate_items collapses the long
+	// runs of identical heights into posting lists (index ~0.77× the random-hash PK
+	// btree already paid per spend). Measured spend-INSERT cost: ~+18%; create/mine path:
+	// 0% (it does not write spends).
+	//
+	// There is deliberately NO index on txs.mined_at_height (uncorrelated; a btree there
+	// would break HOT on the hot mine UPDATE). The only txs that become fully-spent AT
+	// mine time without a spend in a swept window (zero-spendable) are stamped inline in
+	// SetMinedMulti; the rarer spent-while-unmined case is caught by the backstop.
 	for i := 0; i < numPartitions; i++ {
 		idxStmts := []string{
 			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_spent_at_height_brin ON spends_p%02d USING brin (spent_at_height) WITH (pages_per_range = 32, autosummarize = on)`, i, i),
+			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_h_hash_btree ON spends_p%02d USING btree (spent_at_height, prev_tx_hash) WITH (fillfactor = 90, deduplicate_items = on)`, i, i),
 		}
 		for _, ddl := range idxStmts {
 			if _, err := pool.Exec(ctx, ddl); err != nil {
