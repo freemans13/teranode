@@ -13,7 +13,7 @@ import (
 // dahSweepProcVersion is bumped whenever dahSweepProcDDL changes. bootstrap
 // recreates the procedure whenever the version stored in dah_sweep_control
 // differs (in EITHER direction, so a binary rollback reinstalls the older body).
-const dahSweepProcVersion = 6
+const dahSweepProcVersion = 7
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaWithPool (plain DDL);
@@ -126,43 +126,62 @@ BEGIN
         -- spend rows and independent of accumulated chain size (measured on betfair:
         -- 22,728 buffers/lossy-BRIN → ~520 index-only, 25s cold → ~0.1s). enable_seqscan
         -- stays off so it never regresses to a seq scan. No LIMIT: candidates is the
-        -- COMPLETE distinct-parent set of the window, so there is nothing to truncate and
-        -- no shrink-retry is needed. Aggregate each candidate's FULL spend history (no
-        -- height bound on the JOIN → correct fully-spent counting), bidirectionally stamp
-        -- delete_at_height with the exact DAH formula, and COUNT the stamped rows from the
-        -- SAME pass: the data-modifying upd CTE runs once to completion and the outer
-        -- SELECT counts its RETURNING, so spends is scanned ONCE per window. Exact DAH
-        -- semantics unchanged (preserve_until/unmined_since/block_ids guards, spendable
-        -- get_bit, GREATEST+1+retention, IS DISTINCT FROM).
+        -- COMPLETE distinct-parent set of the window. PRUNE to UNSTAMPED eligible
+        -- parents (eligible CTE) before the expensive per-candidate spend-history read —
+        -- already-stamped parents are stable and re-verifying them is a no-op, so the
+        -- verification cost scales with NEW completions, not the mostly-already-stamped
+        -- backlog (measured: ~76% of a backlog window's candidates are already stamped).
+        -- Aggregate each ELIGIBLE candidate's FULL spend history (no height bound on the
+        -- JOIN → correct fully-spent counting), stamp delete_at_height with the exact DAH
+        -- formula, and COUNT the stamped rows from the SAME pass: the data-modifying upd
+        -- CTE runs once to completion and the outer SELECT counts its RETURNING. Exact DAH
+        -- semantics unchanged (spendable get_bit, GREATEST+1+retention, IS DISTINCT FROM);
+        -- the backstop stays the full unpruned safety net.
         EXECUTE format($q$
             WITH candidates AS MATERIALIZED (
                 SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
                  WHERE spent_at_height > $1 AND spent_at_height <= $2
             ),
+            eligible AS MATERIALIZED (
+                -- Prune to UNSTAMPED, mined, non-preserved parents — the only ones that
+                -- can transition NULL→stamped. An already-stamped parent is STABLE: a
+                -- stamp is only set when fully spent (no further spend is possible once
+                -- every spendable output is consumed, so max_spent is final), and it is
+                -- only cleared by Unspend on reorg — atomically. So re-verifying a
+                -- stamped parent is always a no-op; skip its expensive full-history
+                -- read. The by-hash backstop remains the full, UNPRUNED re-verification
+                -- safety net, so any inconsistency still self-heals. This makes the
+                -- cursor's verification cost scale with NEW completions, not with the
+                -- (mostly already-stamped) backlog. The guards (preserve_until/
+                -- unmined_since/block_ids) are folded in here: those rows are no-ops in
+                -- the stamp formula anyway, so excluding them is equivalent.
+                SELECT t.hash, t.out_count, t.out_spendables, t.spendable_count, t.mined_at_height
+                  FROM txs_p%1$s t
+                  JOIN candidates c ON c.hash = t.hash
+                 WHERE t.delete_at_height IS NULL
+                   AND t.preserve_until IS NULL
+                   AND t.unmined_since IS NULL
+                   AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) IS NOT NULL
+            ),
             spend_agg AS (
                 SELECT s.prev_tx_hash AS hash,
-                       count(*) FILTER (WHERE CASE WHEN s.prev_output_idx < t.out_count THEN get_bit(t.out_spendables, s.prev_output_idx) = 1 ELSE false END) AS spent_count,
+                       count(*) FILTER (WHERE CASE WHEN s.prev_output_idx < e.out_count THEN get_bit(e.out_spendables, s.prev_output_idx) = 1 ELSE false END) AS spent_count,
                        max(s.spent_at_height) AS max_spent
                 FROM spends_p%1$s s
-                JOIN txs_p%1$s    t ON t.hash = s.prev_tx_hash
-                WHERE s.prev_tx_hash IN (SELECT hash FROM candidates)
+                JOIN eligible e ON e.hash = s.prev_tx_hash
                 GROUP BY s.prev_tx_hash
             ),
             state AS (
-                SELECT t.hash,
+                SELECT e.hash,
                        CASE
-                           WHEN t.preserve_until IS NOT NULL THEN t.delete_at_height
-                           WHEN t.unmined_since IS NOT NULL THEN t.delete_at_height
-                           WHEN t.block_ids IS NULL OR array_length(t.block_ids, 1) IS NULL THEN t.delete_at_height
-                           WHEN COALESCE(sa.spent_count, 0) = t.spendable_count
-                                AND t.out_count > 0
-                                AND GREATEST(COALESCE(sa.max_spent, 0), COALESCE(t.mined_at_height, 0)) <= $2
-                               THEN (GREATEST(COALESCE(sa.max_spent, 0), COALESCE(t.mined_at_height, 0)) + 1 + $3)::int
+                           WHEN COALESCE(sa.spent_count, 0) = e.spendable_count
+                                AND e.out_count > 0
+                                AND GREATEST(COALESCE(sa.max_spent, 0), COALESCE(e.mined_at_height, 0)) <= $2
+                               THEN (GREATEST(COALESCE(sa.max_spent, 0), COALESCE(e.mined_at_height, 0)) + 1 + $3)::int
                            ELSE NULL
                        END AS new_dah
-                FROM txs_p%1$s t
-                LEFT JOIN spend_agg sa ON sa.hash = t.hash
-                WHERE t.hash IN (SELECT hash FROM candidates)
+                FROM eligible e
+                LEFT JOIN spend_agg sa ON sa.hash = e.hash
             ),
             upd AS (
                 UPDATE txs_p%1$s t
