@@ -233,7 +233,11 @@ func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
 		hashBytes[i] = item.hash[:]
 	}
 
-	_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false WHERE hash = ANY($1)`, hashBytes)
+	// AND locked = true: skip rows already unlocked so the UPDATE never writes a
+	// redundant row version (dead tuple) for a no-op unlock. The end state is
+	// identical (locked=false); this only avoids needless churn that competes with
+	// the reclaim path for autovacuum.
+	_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false WHERE hash = ANY($1) AND locked = true`, hashBytes)
 	if err != nil {
 		for _, item := range batch {
 			item.done <- errors.NewStorageError("[Unlock] bulk update: %v", err)
@@ -292,7 +296,7 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 			}
 		} else {
 			inClause, args := buildINClauseLocal(hashBytes, 1)
-			q := fmt.Sprintf(`UPDATE txs SET locked = false WHERE hash IN %s`, inClause)
+			q := fmt.Sprintf(`UPDATE txs SET locked = false WHERE hash IN %s AND locked = true`, inClause)
 			if _, err := s.pool.Exec(ctx, q, args...); err != nil {
 				return errors.NewStorageError("failed to clear locked flag", err)
 			}
