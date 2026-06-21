@@ -51,7 +51,6 @@ type Store struct {
 	// pruner service — lazily created per store instance (not a package global).
 	prunerService   pruner.Service
 	prunerServiceMu sync.Mutex
-
 }
 
 // batchSizeStats accumulates the real (post-trigger) batch sizes each batcher
@@ -96,9 +95,23 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	// Respect pool_max_conns from the connection URL when supplied; otherwise
-	// default to 100 (the batchers keep many connections busy under load).
+	// default to 80. Stock PostgreSQL ships max_connections=100; a higher default
+	// would claim the entire server budget and starve the maintenance pool, the
+	// superuser-reserved slots, and other consumers. pgxpool opens lazily, so this
+	// is only a ceiling. 80 stays >= the BatcherMaxConcurrent default (64) so the
+	// safety check below does not reject a stock default config.
 	if !pgxURL.Query().Has("pool_max_conns") {
-		pgxConfig.MaxConns = 100
+		pgxConfig.MaxConns = 80
+	}
+
+	// Guard against a batcher/pool concurrency mismatch that can deadlock the store —
+	// a single batcher exhausting the pool, every dispatch blocked on pgxpool.Acquire
+	// while PostgreSQL sits idle (the betfair-pc mainnet outage). Fail fast with an
+	// actionable message before opening any connection; warn on thin-but-workable headroom.
+	if warn, cerr := checkBatcherPoolConfig(pgxConfig.MaxConns, tSettings.UtxoStore.BatcherMaxConcurrent, numConnectionBatchers); cerr != nil {
+		return nil, cerr
+	} else if warn != "" {
+		logger.Warnf("%s", warn)
 	}
 
 	// Full durability — financial data requires synchronous_commit = on. Enforce it
