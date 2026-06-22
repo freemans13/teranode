@@ -12,6 +12,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// sqlPostgresDSN rewrites a postgres:// testcontainer DSN to the sqlpostgres://
+// scheme so the UTXO-store factory routes to the legacy SQL store (on Postgres)
+// rather than the native postgres store. Used by the *SqlPostgres test variants,
+// which otherwise pass the raw postgres:// DSN and silently exercise the native
+// store instead of the SQL store they are meant to cover.
+func sqlPostgresDSN(t *testing.T, connStr string) string {
+	t.Helper()
+	u, err := url.Parse(connStr)
+	require.NoError(t, err)
+	u.Scheme = "sqlpostgres"
+	return u.String()
+}
+
 // Critical Validation Tests for Duplicate Transaction Detection
 //
 // These tests cover critical security and correctness issues discovered during
@@ -314,7 +327,7 @@ func TestNilSubtreeStoreBypassSqlPostgres(t *testing.T) {
 	})
 
 	t.Run("sqlpostgres", func(t *testing.T) {
-		testNilSubtreeStoreBypass(t, pg.ConnectionString())
+		testNilSubtreeStoreBypass(t, sqlPostgresDSN(t, pg.ConnectionString()))
 	})
 }
 
@@ -326,7 +339,7 @@ func TestEmptySubtreeSlicesSqlPostgres(t *testing.T) {
 	})
 
 	t.Run("sqlpostgres", func(t *testing.T) {
-		testEmptySubtreeSlices(t, pg.ConnectionString())
+		testEmptySubtreeSlices(t, sqlPostgresDSN(t, pg.ConnectionString()))
 	})
 }
 
@@ -338,7 +351,7 @@ func TestConcurrencyConfigurationEdgeCasesSqlPostgres(t *testing.T) {
 	})
 
 	t.Run("sqlpostgres", func(t *testing.T) {
-		testConcurrencyConfigurationEdgeCases(t, pg.ConnectionString())
+		testConcurrencyConfigurationEdgeCases(t, sqlPostgresDSN(t, pg.ConnectionString()))
 	})
 }
 
@@ -352,6 +365,6 @@ func TestRaceDetectorDuplicateDetectionSqlPostgres(t *testing.T) {
 	})
 
 	t.Run("sqlpostgres", func(t *testing.T) {
-		testRaceDetectorDuplicateDetection(t, pg.ConnectionString())
+		testRaceDetectorDuplicateDetection(t, sqlPostgresDSN(t, pg.ConnectionString()))
 	})
 }

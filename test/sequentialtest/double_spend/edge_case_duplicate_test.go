@@ -297,7 +297,7 @@ func TestDuplicateAcrossSubtreeBoundarySqlPostgres(t *testing.T) {
 	})
 
 	t.Run("sqlpostgres", func(t *testing.T) {
-		testDuplicateAcrossSubtreeBoundary(t, pg.ConnectionString())
+		testDuplicateAcrossSubtreeBoundary(t, sqlPostgresDSN(t, pg.ConnectionString()))
 	})
 }
 
@@ -309,6 +309,6 @@ func TestDuplicateInLastIncompleteSubtreeSqlPostgres(t *testing.T) {
 	})
 
 	t.Run("sqlpostgres", func(t *testing.T) {
-		testDuplicateInLastIncompleteSubtree(t, pg.ConnectionString())
+		testDuplicateInLastIncompleteSubtree(t, sqlPostgresDSN(t, pg.ConnectionString()))
 	})
 }

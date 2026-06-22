@@ -198,7 +198,7 @@ func TestEarlyDuplicatePartiallySpentAndPrunedSqlPostgres(t *testing.T) {
 	})
 
 	t.Run("sqlpostgres", func(t *testing.T) {
-		testEarlyDuplicatePartiallySpentAndPruned(t, pg.ConnectionString())
+		testEarlyDuplicatePartiallySpentAndPruned(t, sqlPostgresDSN(t, pg.ConnectionString()))
 	})
 }
 
@@ -210,6 +210,6 @@ func TestEarlyDuplicateNotSpentSqlPostgres(t *testing.T) {
 	})
 
 	t.Run("sqlpostgres", func(t *testing.T) {
-		testEarlyDuplicateNotSpent(t, pg.ConnectionString())
+		testEarlyDuplicateNotSpent(t, sqlPostgresDSN(t, pg.ConnectionString()))
 	})
 }

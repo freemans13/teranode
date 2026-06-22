@@ -71,7 +71,10 @@ func newPrunedQueueStoreAt(t *testing.T, dsn string) (*pgstore.Store, func()) {
 	cleanDBAt(t, dsn)
 	ctx := context.Background()
 
-	storeURL, _ := url.Parse(dsn)
+	storeURL, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn %q: %v", dsn, err)
+	}
 	storeURL.Scheme = "postgres"
 
 	tSettings := test.CreateBaseTestSettings(t)
