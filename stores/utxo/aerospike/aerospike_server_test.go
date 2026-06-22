@@ -1649,6 +1649,21 @@ func TestSmokeTests(t *testing.T) {
 		tests.Conflicting(t, store)
 	})
 
+	t.Run("aerospike_conflict_WAL", func(t *testing.T) {
+		tests.ConflictWAL(t, store)
+	})
+
+	t.Run("aerospike_unspend_idempotent", func(t *testing.T) {
+		err := store.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.UnspendIdempotent(t, store)
+	})
+
+	t.Run("aerospike_conflict_WAL_crash_recovery", func(t *testing.T) {
+		tests.ConflictWALCrashRecovery(t, store)
+	})
+
 	t.Run("aerospike_mined_then_spend_all_prunes", func(t *testing.T) {
 		// Pruner service is a process-wide singleton. Reset at both ends so
 		// this subtest doesn't leak a started service into later aerospike

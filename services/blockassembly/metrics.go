@@ -70,6 +70,8 @@ var (
 	prometheusBlockAssemblerAddDirectlyTotal            prometheus.Counter
 	prometheusBlockAssemblerAddDirectlyBatchTime        prometheus.Histogram
 	prometheusBlockAssemblerSubtreeStoredHist           prometheus.Histogram
+	prometheusBlockAssemblerConflictIntentsPending      prometheus.Gauge
+	prometheusBlockAssemblerConflictIntentReplay        *prometheus.CounterVec
 )
 
 var (
@@ -170,6 +172,25 @@ func _initPrometheusMetrics() {
 			Help:      "Histogram of subtree stored duration in block assembler",
 			Buckets:   util.MetricsBucketsMilliSeconds,
 		},
+	)
+
+	prometheusBlockAssemblerConflictIntentsPending = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "conflict_intents_pending",
+			Help:      "Number of pending conflict-resolution WAL intents found at startup (interrupted ProcessConflicting/ReverseProcessConflicting operations awaiting replay)",
+		},
+	)
+
+	prometheusBlockAssemblerConflictIntentReplay = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "conflict_intent_replay_total",
+			Help:      "Total conflict-resolution WAL intent replays at startup, by result",
+		},
+		[]string{"result"},
 	)
 
 	prometheusBlockAssemblerTransactions = promauto.NewGauge(

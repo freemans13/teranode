@@ -229,6 +229,24 @@ func (m *MockUtxostore) SetLocked(ctx context.Context, txHashes []chainhash.Hash
 	return args.Error(0)
 }
 
+// BeginConflictIntent is a safe no-op on the mock: the conflict-resolution WAL
+// is exercised against a real store in dedicated tests, so the many mock-based
+// ProcessConflicting/ReverseProcessConflicting tests need not set expectations
+// for it. (Does not call m.Called, so unset expectations do not panic.)
+func (m *MockUtxostore) BeginConflictIntent(ctx context.Context, intent ConflictIntent) error {
+	return nil
+}
+
+// CompleteConflictIntent is a safe no-op on the mock (see BeginConflictIntent).
+func (m *MockUtxostore) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	return nil
+}
+
+// PendingConflictIntents is a safe no-op on the mock (see BeginConflictIntent).
+func (m *MockUtxostore) PendingConflictIntents(ctx context.Context) ([]ConflictIntent, error) {
+	return nil, nil
+}
+
 // MarkTransactionsOnLongestChain mocks the marking of transactions as being on the longest chain.
 // Returns the configured mock response for longest chain marking operations.
 func (m *MockUtxostore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {

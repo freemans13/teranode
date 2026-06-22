@@ -4882,6 +4882,26 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		return errors.NewStorageError("could not create px_outputs_unspent_by_parent index - [%+v]", err)
 	}
 
+	// conflict_intents is the conflict-resolution write-ahead log (#861). One row
+	// per in-flight ProcessConflicting / ReverseProcessConflicting operation,
+	// inserted before the operation's first state mutation and deleted once its
+	// terminal step commits. Rows that survive a restart drive replay. This table
+	// is intentionally NOT tied to transactions(id) — intents reference tx hashes,
+	// not row ids, and must outlive any individual transaction record.
+	if _, err := db.Exec(`
+      CREATE TABLE IF NOT EXISTS conflict_intents (
+         intent_id     BYTEA PRIMARY KEY
+        ,kind          TEXT NOT NULL
+        ,block_height  BIGINT NOT NULL
+        ,block_hash    BYTEA NOT NULL
+        ,tx_hashes     BYTEA NOT NULL
+        ,started_at    BIGINT NOT NULL
+	  );
+	`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create conflict_intents table - [%+v]", err)
+	}
+
 	return nil
 }
 
@@ -5177,6 +5197,22 @@ func createSqliteSchema(db *usql.DB) error {
 			_ = db.Close()
 			return errors.NewStorageError("could not add preserve_until column to transactions table - [%+v]", err)
 		}
+	}
+
+	// conflict_intents — conflict-resolution write-ahead log (#861). See the
+	// postgres schema for the rationale; SQLite mirror with BLOB columns.
+	if _, err := db.Exec(`
+      CREATE TABLE IF NOT EXISTS conflict_intents (
+         intent_id     BLOB PRIMARY KEY
+        ,kind          TEXT NOT NULL
+        ,block_height  BIGINT NOT NULL
+        ,block_hash    BLOB NOT NULL
+        ,tx_hashes     BLOB NOT NULL
+        ,started_at    BIGINT NOT NULL
+	  );
+	`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create conflict_intents table - [%+v]", err)
 	}
 
 	return nil
