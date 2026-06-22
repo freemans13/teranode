@@ -3,6 +3,7 @@ package utxo_test
 import (
 	"context"
 	"net/url"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -242,7 +243,19 @@ func (p *shardedPruner) AddObserver(o pruner.Observer) {
 // NOTE: the rep-line table telemetry (txs_rows/stamped) and the table-size gate
 // poll only shard 0's statPool, so the gate's effective TOTAL cap is ~2x the
 // single-instance run's — read absolute table numbers as per-shard.
+// requireThroughputEnabled skips the multi-instance sharded throughput harnesses
+// unless THROUGHPUT_ENABLE=1. They are deliberate, very expensive perf probes
+// (multiple local postgres instances, long runs) that should not fire on a plain
+// `go test ./...` just because a local postgres happens to be reachable.
+func requireThroughputEnabled(t *testing.T) {
+	t.Helper()
+	if os.Getenv("THROUGHPUT_ENABLE") != "1" {
+		t.Skip("sharded throughput harness disabled; set THROUGHPUT_ENABLE=1 to run")
+	}
+}
+
 func TestThroughput_QueueStorePruned2Shard(t *testing.T) {
+	requireThroughputEnabled(t)
 	terminateOtherConnections(t)
 	cfg := defaultStableCfg()
 
@@ -274,6 +287,7 @@ func TestThroughput_QueueStorePruned2Shard(t *testing.T) {
 // instances (5432/5433/5434). Probes whether a third WAL stream/checkpointer
 // still buys contention relief or whether total CPU is already the wall.
 func TestThroughput_QueueStorePruned3Shard(t *testing.T) {
+	requireThroughputEnabled(t)
 	terminateOtherConnections(t)
 	cfg := defaultStableCfg()
 

@@ -313,7 +313,7 @@ func TestNilSubtreeStoreBypassSqlQueue(t *testing.T) {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgres", func(t *testing.T) {
+	t.Run("postgressql", func(t *testing.T) {
 		testNilSubtreeStoreBypass(t, pg.ConnectionString())
 	})
 }
@@ -325,7 +325,7 @@ func TestEmptySubtreeSlicesSqlQueue(t *testing.T) {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgres", func(t *testing.T) {
+	t.Run("postgressql", func(t *testing.T) {
 		testEmptySubtreeSlices(t, pg.ConnectionString())
 	})
 }
@@ -337,7 +337,7 @@ func TestConcurrencyConfigurationEdgeCasesSqlQueue(t *testing.T) {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgres", func(t *testing.T) {
+	t.Run("postgressql", func(t *testing.T) {
 		testConcurrencyConfigurationEdgeCases(t, pg.ConnectionString())
 	})
 }
@@ -351,7 +351,7 @@ func TestRaceDetectorDuplicateDetectionSqlQueue(t *testing.T) {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgres", func(t *testing.T) {
+	t.Run("postgressql", func(t *testing.T) {
 		testRaceDetectorDuplicateDetection(t, pg.ConnectionString())
 	})
 }

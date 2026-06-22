@@ -184,6 +184,6 @@ func testSameChainGrandparentDoubleSpend(t *testing.T, utxoStore string) {
 
 func TestSameChainGrandparentDoubleSpendSqlQueue(t *testing.T) {
 	t.Run("same_chain_grandparent_double_spend", func(t *testing.T) {
-		testSameChainGrandparentDoubleSpend(t, "postgres")
+		testSameChainGrandparentDoubleSpend(t, "postgressql")
 	})
 }

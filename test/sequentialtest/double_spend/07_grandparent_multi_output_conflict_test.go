@@ -355,12 +355,12 @@ func testGrandparentChildWithParentDependency(t *testing.T, utxoStore string) {
 
 func TestGrandparentMultiOutputConflictSqlQueue(t *testing.T) {
 	t.Run("grandparent_multi_output_conflict", func(t *testing.T) {
-		testGrandparentMultiOutputConflict(t, "postgres")
+		testGrandparentMultiOutputConflict(t, "postgressql")
 	})
 }
 
 func TestGrandparentChildWithParentDependencySqlQueue(t *testing.T) {
 	t.Run("grandparent_child_with_parent_dependency", func(t *testing.T) {
-		testGrandparentChildWithParentDependency(t, "postgres")
+		testGrandparentChildWithParentDependency(t, "postgressql")
 	})
 }

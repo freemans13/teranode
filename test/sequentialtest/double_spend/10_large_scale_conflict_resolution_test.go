@@ -310,12 +310,12 @@ func testWideTreeConflictResolution(t *testing.T, utxoStore string) {
 
 func TestDeepChainConflictResolutionSqlQueue(t *testing.T) {
 	t.Run("deep_chain_conflict_resolution", func(t *testing.T) {
-		testDeepChainConflictResolution(t, "postgres")
+		testDeepChainConflictResolution(t, "postgressql")
 	})
 }
 
 func TestWideTreeConflictResolutionSqlQueue(t *testing.T) {
 	t.Run("wide_tree_conflict_resolution", func(t *testing.T) {
-		testWideTreeConflictResolution(t, "postgres")
+		testWideTreeConflictResolution(t, "postgressql")
 	})
 }

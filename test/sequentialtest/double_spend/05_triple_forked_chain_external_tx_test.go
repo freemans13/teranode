@@ -210,6 +210,6 @@ func testTripleForkedChainExternalTx(t *testing.T, utxoStore string) {
 
 func TestTripleForkedChainExternalTxSqlQueue(t *testing.T) {
 	t.Run("triple_forked_chain_external_tx", func(t *testing.T) {
-		testTripleForkedChainExternalTx(t, "postgres")
+		testTripleForkedChainExternalTx(t, "postgressql")
 	})
 }
