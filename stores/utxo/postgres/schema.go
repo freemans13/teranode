@@ -232,6 +232,24 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		return errors.NewStorageError("dah_sweep_control seed failed: %v", err)
 	}
 
+	// conflict_intents: write-ahead log for crash-safe ProcessConflicting /
+	// ReverseProcessConflicting (see #861). One row per in-flight conflict-
+	// resolution operation, recorded BEFORE its first state mutation and removed
+	// once its terminal step commits; rows that survive a restart drive replay.
+	// Intentionally NOT tied to txs — intents reference tx hashes, not row ids,
+	// and must outlive any individual transaction record.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS conflict_intents (
+			intent_id     BYTEA PRIMARY KEY,
+			kind          TEXT NOT NULL,
+			block_height  BIGINT NOT NULL,
+			block_hash    BYTEA NOT NULL,
+			tx_hashes     BYTEA NOT NULL,
+			started_at    BIGINT NOT NULL
+		)`); err != nil {
+		return errors.NewStorageError("conflict_intents creation failed: %v", err)
+	}
+
 	// Partial indexes on txs for iterator/pruner queries.
 	if _, err := pool.Exec(ctx, txsIndexesDDL); err != nil {
 		return errors.NewStorageError("index creation failed: %v", err)
