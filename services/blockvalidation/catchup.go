@@ -1004,6 +1004,17 @@ func (u *Server) recordMaliciousAttempt(peerID string, reason string) {
 // Returns:
 //   - error: If FSM state change fails
 func (u *Server) setFSMCatchingBlocks(ctx context.Context, catchupCtx *CatchupContext, size *atomic.Int64) error {
+	// If the node is already in CATCHINGBLOCKS (it booted directly into catch-up
+	// mode, or a previous catchup left us here), there is nothing to transition:
+	// the blockchain FSM only permits RUN out of CATCHINGBLOCKS, so re-firing
+	// CATCHUPBLOCKS would be rejected. Treat "already catching" as success.
+	if state, err := u.blockchainClient.GetFSMCurrentState(ctx); err == nil && state != nil &&
+		*state == blockchain.FSMStateCATCHINGBLOCKS {
+		u.logger.Infof("[catchup][%s] FSM already in CATCHINGBLOCKS, skipping transition for %d blocks",
+			catchupCtx.blockUpTo.Hash().String(), size.Load())
+		return nil
+	}
+
 	u.logger.Infof("[catchup][%s] Setting node to CATCHINGBLOCKS state for %d blocks", catchupCtx.blockUpTo.Hash().String(), size.Load())
 
 	if err := u.blockchainClient.CatchUpBlocks(ctx); err != nil {

@@ -3089,6 +3089,9 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 	// Mock CatchUpBlocks and Run for FSM transitions during catchup
 	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(nil).Maybe()
 	mockBlockchainClient.On("Run", mock.Anything, mock.Anything).Return(nil).Maybe()
+	// Default FSM state: RUNNING — allows setFSMCatchingBlocks to proceed normally
+	defaultFSMState := blockchain.FSMStateRUNNING
+	mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&defaultFSMState, nil).Maybe()
 	mockUTXOStore := &utxo.MockUtxostore{}
 
 	bv := &BlockValidation{
@@ -3197,6 +3200,9 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 	// Mock CatchUpBlocks and Run for FSM transitions during catchup
 	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(nil).Maybe()
 	mockBlockchainClient.On("Run", mock.Anything, mock.Anything).Return(nil).Maybe()
+	// Default FSM state: RUNNING — allows setFSMCatchingBlocks to proceed normally
+	defaultFSMStateWithConfig := blockchain.FSMStateRUNNING
+	mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&defaultFSMStateWithConfig, nil).Maybe()
 	mockUTXOStore := &utxo.MockUtxostore{}
 
 	bv := &BlockValidation{
@@ -3934,4 +3940,38 @@ func filterMockCalls(calls []*mock.Call, method string) []*mock.Call {
 		}
 	}
 	return filtered
+}
+
+func TestSetFSMCatchingBlocks_SkipsWhenAlreadyCatching(t *testing.T) {
+	mockBlockchainClient := &blockchain.Mock{}
+	catching := blockchain.FSMStateCATCHINGBLOCKS
+	mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catching, nil)
+	// Do NOT register CatchUpBlocks — it must not be called.
+
+	server := &Server{logger: ulogger.TestLogger{}, blockchainClient: mockBlockchainClient}
+	blk := createTestBlock(t)
+	cctx := &CatchupContext{blockUpTo: blk}
+	var size atomic.Int64
+	size.Store(5)
+
+	err := server.setFSMCatchingBlocks(context.Background(), cctx, &size)
+	require.NoError(t, err)
+	mockBlockchainClient.AssertNotCalled(t, "CatchUpBlocks", mock.Anything)
+}
+
+func TestSetFSMCatchingBlocks_TransitionsWhenRunning(t *testing.T) {
+	mockBlockchainClient := &blockchain.Mock{}
+	running := blockchain.FSMStateRUNNING
+	mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(nil).Once()
+
+	server := &Server{logger: ulogger.TestLogger{}, blockchainClient: mockBlockchainClient}
+	blk := createTestBlock(t)
+	cctx := &CatchupContext{blockUpTo: blk}
+	var size atomic.Int64
+	size.Store(5)
+
+	err := server.setFSMCatchingBlocks(context.Background(), cctx, &size)
+	require.NoError(t, err)
+	mockBlockchainClient.AssertCalled(t, "CatchUpBlocks", mock.Anything)
 }
