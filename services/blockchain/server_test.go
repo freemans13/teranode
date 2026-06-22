@@ -3719,7 +3719,7 @@ func Test_Idle(t *testing.T) {
 	}{
 		{
 			name:        "idle request",
-			expectError: false, // Should succeed or be idempotent
+			expectError: true, // Fresh node starts in CATCHINGBLOCKS; STOP event has no CATCHINGBLOCKS->IDLE edge
 		},
 	}
 
@@ -3755,7 +3755,7 @@ func Test_WaitUntilFSMTransitionFromIdleState(t *testing.T) {
 			name:                   "service with subscription ready but FSM might be IDLE",
 			setupSubscriptionReady: true,
 			timeout:                2 * time.Second,
-			expectError:            true, // FSM might still be in IDLE state
+			expectError:            false, // Fresh node boots into CATCHINGBLOCKS (not IDLE); with subscription ready, returns immediately
 		},
 		{
 			name:                   "context cancellation when not ready",
