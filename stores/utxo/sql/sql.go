@@ -166,7 +166,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, errors.NewStorageError("failed to init sql db", err)
 	}
 
-	switch storeURL.Scheme {
+	// "postgressql" is an alias for "postgres": the UTXO-store factory re-registered
+	// the SQL Postgres store under "postgressql" so the native postgres store could
+	// claim the bare "postgres" scheme. Normalise it here so schema creation and
+	// every downstream `s.engine == "postgres"` fast-path stay enabled.
+	engine := storeURL.Scheme
+	if engine == "postgressql" {
+		engine = "postgres"
+	}
+
+	switch engine {
 	case "postgres":
 		if err = createPostgresSchema(db); err != nil {
 			return nil, errors.NewStorageError("failed to create postgres schema", err)
@@ -186,7 +195,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		settings:        tSettings,
 		db:              db,
 		storeURL:        storeURL,
-		engine:          storeURL.Scheme,
+		engine:          engine,
 		blockHeight:     atomic.Uint32{},
 		medianBlockTime: atomic.Uint32{},
 		ctx:             ctx,

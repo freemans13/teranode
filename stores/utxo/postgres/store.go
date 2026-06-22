@@ -135,8 +135,15 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	var maintPool *pgxpool.Pool
 	if mc := tSettings.UtxoStore.PostgresMaintenancePoolConns; mc > 0 {
 		maintConfig := pgxConfig.Copy()
-		maintConfig.MaxConns = int32(mc)            //nolint:gosec // small positive bound
-		maintConfig.MinConns = int32(numPartitions) // keep 8 warm so the fan-out CALLs/deletes never wait on a lazy dial
+		maintConfig.MaxConns = int32(mc) //nolint:gosec // small positive bound
+		// Keep numPartitions (8) warm so the fan-out CALLs/deletes never wait on a
+		// lazy dial — but never exceed MaxConns: pgxpool rejects MinConns > MaxConns,
+		// so a small mc (1..7) must clamp MinConns down rather than fail startup.
+		minConns := numPartitions
+		if mc < minConns {
+			minConns = mc
+		}
+		maintConfig.MinConns = int32(minConns) //nolint:gosec // small positive bound
 
 		maintPool, err = pgxpool.NewWithConfig(ctx, maintConfig)
 		if err != nil {

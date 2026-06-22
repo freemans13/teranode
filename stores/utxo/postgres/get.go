@@ -393,8 +393,12 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 		return nil, errors.NewStorageError("[GetSpend] query %s:%d: %v", spend.TxID, spend.Vout, err)
 	}
 
-	// Validate UTXO hash matches.
-	if !bytes.Equal(utxoHashBytes, spend.UTXOHash[:]) {
+	// Validate UTXO hash matches — but only when the caller supplied one.
+	// spend.UTXOHash is legitimately nil for callers that locate a UTXO by
+	// (txid, vout) alone (e.g. the public /api/v1/utxos endpoint), so guard the
+	// dereference to match the SQL reference store (sql/sql.go) and avoid an
+	// externally-reachable nil-pointer panic.
+	if spend.UTXOHash != nil && !bytes.Equal(utxoHashBytes, spend.UTXOHash[:]) {
 		return nil, errors.NewUtxoHashMismatchError("utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 	}
 

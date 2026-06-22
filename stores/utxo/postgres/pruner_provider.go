@@ -259,9 +259,18 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	// If you change any code that writes delete_at_height, THAT is where eligibility
 	// belongs — not here.
 	//
-	// Snapshot note: the doomed predicate runs in the SAME statement/snapshot as the
-	// DELETE, so a concurrent Unspend that clears the stamp is honoured (the revived
-	// tx is simply not selected); each loop iteration re-evaluates from scratch.
+	// Reorg-safety note: the doomed CTE is materialised once under the statement's
+	// snapshot, so the SELECT side cannot see a concurrent Unspend that clears the
+	// stamp. But under READ COMMITTED the DELETEs lock each target row and, if it was
+	// updated+committed by a concurrent transaction after the snapshot, re-evaluate
+	// their OWN qualifier (EvalPlanQual) against the new row version. A qualifier of
+	// just `hash IN (doomed)` would still match a revived row (doomed is not
+	// recomputed) and delete it — destroying a reorg-revived UTXO. So the
+	// delete_at_height predicate is repeated in BOTH DELETEs' own WHERE clauses: on
+	// EPQ re-check a row whose stamp was cleared (NULL) now fails and is skipped.
+	// This re-checks one BRIN-indexed scalar column on a row already being locked —
+	// it does NOT re-count spends, so it does not put the fully-spent test back on
+	// the hot path (the thing the DESIGN CONTRACT above forbids).
 	// ──────────────────────────────────────────────────────────────────────
 	cascadeSQL := fmt.Sprintf(`
 		WITH doomed AS (
@@ -269,8 +278,15 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 			WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1
 			LIMIT $2
 		),
-		del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1)
-		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf)
+		del_spends AS (
+			DELETE FROM %[2]s WHERE prev_tx_hash IN (
+				SELECT d.hash FROM %[1]s d
+				WHERE d.hash IN (SELECT hash FROM doomed)
+				  AND d.delete_at_height IS NOT NULL AND d.delete_at_height <= $1
+			) RETURNING 1
+		)
+		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)
+		  AND delete_at_height IS NOT NULL AND delete_at_height <= $1`, txsLeaf, spendsLeaf)
 
 	var deleted int64
 	for batches := 0; batches < pruneDeleteMaxBatchesPerCall; batches++ {

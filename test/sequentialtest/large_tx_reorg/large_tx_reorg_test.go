@@ -784,26 +784,26 @@ func testMultipleReorgCycles(t *testing.T, utxoStoreType string) {
 
 func TestLargeTxReorgSqlQueue(t *testing.T) {
 	t.Run("1: simple large transaction reorg", func(t *testing.T) {
-		testSimpleLargeTransactionReorg(t, "postgres")
+		testSimpleLargeTransactionReorg(t, "postgressql")
 	})
 
 	t.Run("2: partial spend large transaction reorg", func(t *testing.T) {
-		testPartialSpendLargeTransactionReorg(t, "postgres")
+		testPartialSpendLargeTransactionReorg(t, "postgressql")
 	})
 
 	t.Run("3: multiple large transactions reorg", func(t *testing.T) {
-		testMultipleLargeTransactionsReorg(t, "postgres")
+		testMultipleLargeTransactionsReorg(t, "postgressql")
 	})
 
 	t.Run("4: large transaction chain dependency", func(t *testing.T) {
-		testLargeTransactionChainDependency(t, "postgres")
+		testLargeTransactionChainDependency(t, "postgressql")
 	})
 
 	t.Run("5: large transaction double spend", func(t *testing.T) {
-		testLargeTransactionDoubleSpend(t, "postgres")
+		testLargeTransactionDoubleSpend(t, "postgressql")
 	})
 
 	t.Run("6: multiple reorg cycles stress test", func(t *testing.T) {
-		testMultipleReorgCycles(t, "postgres")
+		testMultipleReorgCycles(t, "postgressql")
 	})
 }

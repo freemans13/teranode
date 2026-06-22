@@ -1328,13 +1328,15 @@ func MinedThenSpendAllPrunes(t *testing.T, db utxostore.Store, prunerSvc pruner.
 // Differential gold-standard tests.
 //
 // The following tests encode behaviour that the aerospike store (the
-// gold-standard reference) and the sql store implement correctly, but that the
-// PostgreSQL store currently gets wrong. They are written against the shared
-// utxo.Store interface so they run against every backend; they PASS on
-// aerospike + sql and FAIL on postgres, pinpointing the divergence.
+// gold-standard reference) and the sql store implement correctly. The
+// PostgreSQL store originally diverged on each of these, but the divergences
+// have since been fixed in PR #684, so the tests now serve as regression/parity
+// guards. They are written against the shared utxo.Store interface so they run
+// against every backend, and must PASS on aerospike, sql and postgres alike.
 //
 // Source: review of PR #684 (PostgreSQL-native UTXO store). Each test cites the
-// exact file:line of the gold-standard behaviour and the postgres divergence.
+// exact file:line of the gold-standard behaviour and the original postgres
+// divergence it guards against.
 // ---------------------------------------------------------------------------
 
 // SetMinedUnsetOnMissingTx verifies that SetMinedMulti with UnsetMined=true is a

@@ -993,10 +993,12 @@ func TestUnsetMined(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, result[*txHash], "should have no block_ids after unset")
 
-	// Verify unmined_since is set after all block_ids removed.
+	// Verify unmined_since is set after all block_ids removed. The gold-standard
+	// value is blockHeight+1 (151) — matching the aerospike Lua and the sql store
+	// (s.blockHeight.Load() + 1), not the bare tip.
 	got, err = store.Get(ctx, txHash)
 	require.NoError(t, err)
-	require.Equal(t, uint32(150), got.UnminedSince, "should be unmined at current block height")
+	require.Equal(t, uint32(151), got.UnminedSince, "should be unmined at current block height + 1")
 }
 
 func TestUnsetMinedPartial(t *testing.T) {
@@ -1277,6 +1279,59 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	// Double-unfreeze should error.
 	err = store.UnFreezeUTXOs(ctx, spends, nil)
 	require.Error(t, err)
+}
+
+// TestUnfreezeDoesNotSetTxLevelFrozen guards the per-output / whole-tx freeze
+// isolation. Freezing two outputs per-output must leave the tx-level `frozen`
+// gate false; unfreezing ONE of them must NOT flip `frozen` true just because
+// another output's bit is still set. The previous UnFreezeUTXOs recomputed
+// `frozen = (any out_frozens bit set)`, which spuriously froze the whole tx
+// (blocking every other, never-frozen output via the spend CTE's NOT tx_frozen).
+func TestUnfreezeDoesNotSetTxLevelFrozen(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// testExtendedTx has two outputs (vout 0 and 1).
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+	require.GreaterOrEqual(t, len(tx.Outputs), 2, "need a multi-output tx for this test")
+
+	hash0, err := util.UTXOHashFromOutput(txHash, tx.Outputs[0], 0)
+	require.NoError(t, err)
+	hash1, err := util.UTXOHashFromOutput(txHash, tx.Outputs[1], 1)
+	require.NoError(t, err)
+
+	// Freeze both outputs per-output.
+	require.NoError(t, store.FreezeUTXOs(ctx, []*utxo.Spend{
+		{TxID: txHash, Vout: 0, UTXOHash: hash0},
+		{TxID: txHash, Vout: 1, UTXOHash: hash1},
+	}, nil))
+
+	// tx-level frozen must remain false — FreezeUTXOs never touches it.
+	var txFrozen bool
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT frozen FROM txs WHERE hash = $1`, txHash[:]).Scan(&txFrozen))
+	require.False(t, txFrozen, "FreezeUTXOs must not set the whole-tx frozen gate")
+
+	// Unfreeze ONLY output 0; output 1's bit stays set.
+	require.NoError(t, store.UnFreezeUTXOs(ctx, []*utxo.Spend{
+		{TxID: txHash, Vout: 0, UTXOHash: hash0},
+	}, nil))
+
+	// The regression: tx-level frozen must STILL be false even though output 1's
+	// per-output bit remains set.
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT frozen FROM txs WHERE hash = $1`, txHash[:]).Scan(&txFrozen))
+	require.False(t, txFrozen, "unfreezing one output must not set the whole-tx frozen gate")
+
+	// Output 0's bit cleared, output 1's bit still set (per-output state intact).
+	var bit0, bit1 bool
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT get_bit(out_frozens, 0) = 1, get_bit(out_frozens, 1) = 1 FROM txs WHERE hash = $1`, txHash[:]).Scan(&bit0, &bit1))
+	require.False(t, bit0, "output 0 should be unfrozen")
+	require.True(t, bit1, "output 1 should remain frozen")
 }
 
 func TestReAssignUTXO(t *testing.T) {
