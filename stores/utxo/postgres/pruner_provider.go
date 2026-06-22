@@ -259,18 +259,25 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	// If you change any code that writes delete_at_height, THAT is where eligibility
 	// belongs — not here.
 	//
-	// Reorg-safety note: the doomed CTE is materialised once under the statement's
-	// snapshot, so the SELECT side cannot see a concurrent Unspend that clears the
-	// stamp. But under READ COMMITTED the DELETEs lock each target row and, if it was
-	// updated+committed by a concurrent transaction after the snapshot, re-evaluate
-	// their OWN qualifier (EvalPlanQual) against the new row version. A qualifier of
-	// just `hash IN (doomed)` would still match a revived row (doomed is not
-	// recomputed) and delete it — destroying a reorg-revived UTXO. So the
-	// delete_at_height predicate is repeated in BOTH DELETEs' own WHERE clauses: on
-	// EPQ re-check a row whose stamp was cleared (NULL) now fails and is skipped.
-	// This re-checks one BRIN-indexed scalar column on a row already being locked —
-	// it does NOT re-count spends, so it does not put the fully-spent test back on
-	// the hot path (the thing the DESIGN CONTRACT above forbids).
+	// Reorg vs prune — a known race we deliberately do NOT defend against here:
+	// In theory the pruner could delete a tx at the same instant a reorg Unspend
+	// revives it. In practice the two can never touch the same tx. A tx only becomes
+	// prune-eligible `retention` blocks after it settled (delete_at_height =
+	// completion + 1 + retention; see above), whereas a realistic reorg is 1–2 blocks
+	// deep — so a prune-eligible tx is hundreds of blocks older than the deepest block
+	// any reorg can reach. The prune-eligible set and the reorg-reachable set overlap
+	// ONLY if retention is configured below the reorg depth, i.e. a catastrophic
+	// misconfiguration. (Default retention is ~2 days of blocks.)
+	//
+	// We intentionally keep this simple rather than chase the window: a delete-time
+	// re-check of delete_at_height is only a one-sided half-guard (it does nothing
+	// when the DELETE wins the race and the later Unspend finds no row to revive), and
+	// truly serialising prune against reorg is real complexity for a state the
+	// retention margin already makes unreachable. The one invariant that keeps us safe:
+	//
+	//     retention MUST stay well above the deepest expected reorg.
+	//
+	// Hold that and this is a non-issue. Do NOT add per-row delete-time guards back.
 	// ──────────────────────────────────────────────────────────────────────
 	cascadeSQL := fmt.Sprintf(`
 		WITH doomed AS (
@@ -278,15 +285,8 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 			WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1
 			LIMIT $2
 		),
-		del_spends AS (
-			DELETE FROM %[2]s WHERE prev_tx_hash IN (
-				SELECT d.hash FROM %[1]s d
-				WHERE d.hash IN (SELECT hash FROM doomed)
-				  AND d.delete_at_height IS NOT NULL AND d.delete_at_height <= $1
-			) RETURNING 1
-		)
-		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)
-		  AND delete_at_height IS NOT NULL AND delete_at_height <= $1`, txsLeaf, spendsLeaf)
+		del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1)
+		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf)
 
 	var deleted int64
 	for batches := 0; batches < pruneDeleteMaxBatchesPerCall; batches++ {
