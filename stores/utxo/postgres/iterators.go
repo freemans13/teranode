@@ -65,6 +65,9 @@ func (it *unminedTxIterator) Next(ctx context.Context) ([]*utxo.UnminedTransacti
 
 	batch := make([]*utxo.UnminedTransaction, 0, iteratorBatchSize)
 	for i := 0; i < iteratorBatchSize; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		tx, err := it.readOne(ctx)
 		if err != nil {
 			return nil, err

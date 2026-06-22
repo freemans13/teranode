@@ -42,10 +42,13 @@ func cleanDB(t *testing.T) {
 	_, _ = pool.Exec(ctx, `SELECT cron.unschedule('materialize')`)
 	_, _ = pool.Exec(ctx, `
 		DROP PROCEDURE IF EXISTS materialize_loop() CASCADE;
+		DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT) CASCADE;
+		DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT) CASCADE;
 		DROP FUNCTION IF EXISTS process_batch(BIGINT) CASCADE;
 		DROP FUNCTION IF EXISTS process_delete_at_height(BIGINT) CASCADE;
 		DROP TABLE IF EXISTS batch_notifications, conflicting_children, block_ids, spends, outputs, inputs,
-			tx_state, transactions, txs, txs_raw, dah_watermark,
+			tx_state, transactions, txs, txs_raw,
+			dah_watermark, dah_part_watermark, dah_sweep_control,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue CASCADE;
 	`)
 }

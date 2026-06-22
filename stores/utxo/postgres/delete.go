@@ -28,5 +28,9 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 		}
 	}
 
-	return pgxTx.Commit(ctx)
+	if err = pgxTx.Commit(ctx); err != nil {
+		return errors.NewStorageError("[Delete] commit", err)
+	}
+
+	return nil
 }
