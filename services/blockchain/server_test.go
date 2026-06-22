@@ -3748,11 +3748,12 @@ func Test_WaitUntilFSMTransitionFromIdleState(t *testing.T) {
 	tests := []struct {
 		name                   string
 		setupSubscriptionReady bool
+		fsmStateOverride       string
 		timeout                time.Duration
 		expectError            bool
 	}{
 		{
-			name:                   "service with subscription ready but FSM might be IDLE",
+			name:                   "returns immediately when FSM is non-IDLE and subscription ready",
 			setupSubscriptionReady: true,
 			timeout:                2 * time.Second,
 			expectError:            false, // Fresh node boots into CATCHINGBLOCKS (not IDLE); with subscription ready, returns immediately
@@ -3763,12 +3764,24 @@ func Test_WaitUntilFSMTransitionFromIdleState(t *testing.T) {
 			timeout:                100 * time.Millisecond,
 			expectError:            true, // Should timeout
 		},
+		{
+			name:                   "times out when FSM stuck in IDLE",
+			setupSubscriptionReady: true,
+			fsmStateOverride:       blockchain_api.FSMStateType_IDLE.String(),
+			timeout:                200 * time.Millisecond,
+			expectError:            true, // FSM in IDLE; function waits for non-IDLE transition that never comes
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Set up subscription readiness
 			ctx.server.SetSubscriptionManagerReadyForTesting(tt.setupSubscriptionReady)
+
+			// Override FSM state if requested (forces the IDLE-wait path)
+			if tt.fsmStateOverride != "" {
+				ctx.server.finiteStateMachine.SetState(tt.fsmStateOverride)
+			}
 
 			testCtx, cancel := context.WithTimeout(context.Background(), tt.timeout)
 			defer cancel()
@@ -3786,6 +3799,9 @@ func Test_WaitUntilFSMTransitionFromIdleState(t *testing.T) {
 			}
 		})
 	}
+
+	// Restore FSM to a non-IDLE state so subsequent tests using the shared ctx are unaffected
+	ctx.server.finiteStateMachine.SetState(blockchain_api.FSMStateType_CATCHINGBLOCKS.String())
 }
 
 // Test_BroadcastHeartbeat verifies the heartbeat broadcasting functionality.
