@@ -58,7 +58,10 @@ func cleanDBAt(t *testing.T, dsn string) {
 	_, _ = pool.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid != pg_backend_pid()`)
 	_, _ = pool.Exec(ctx, `
 		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
-			tx_state, transactions, txs, txs_raw, dah_watermark CASCADE;
+			tx_state, transactions, txs, txs_raw,
+			dah_watermark, dah_part_watermark, dah_sweep_control CASCADE;
+		DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT) CASCADE;
+		DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT) CASCADE;
 	`)
 }
 
@@ -136,6 +139,9 @@ func (s *shardedStore) Get(ctx context.Context, hash *chainhash.Hash, f ...field
 // children spend outputs of exactly one parent; a production router would have
 // to split a tx's inputs across shards.
 func (s *shardedStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, flags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	if len(tx.Inputs) == 0 {
+		return s.shards[0].Spend(ctx, tx, blockHeight, flags...) // no inputs: pick a deterministic shard rather than panic
+	}
 	return s.shardFor(tx.Inputs[0].PreviousTxIDChainHash()).Spend(ctx, tx, blockHeight, flags...)
 }
 
