@@ -12,7 +12,7 @@ import (
 func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 	pgxTx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return errors.NewStorageError("[Delete] begin: %v", err)
+		return errors.NewStorageError("[Delete] begin", err)
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
@@ -24,7 +24,7 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 
 	for _, stmt := range deleteStatements {
 		if _, err = pgxTx.Exec(ctx, stmt, hash[:]); err != nil {
-			return errors.NewStorageError("[Delete] failed for %s: %v", hash, err)
+			return errors.NewStorageError("[Delete] failed for %s", hash, err)
 		}
 	}
 

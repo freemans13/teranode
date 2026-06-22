@@ -46,7 +46,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	// This eliminates per-chunk round-trip latency.
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, errors.NewStorageError("[SetMinedMulti] acquire connection: %v", err)
+		return nil, errors.NewStorageError("[SetMinedMulti] acquire connection", err)
 	}
 	defer conn.Release()
 
@@ -143,7 +143,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		rows, err := br.Query()
 		if err != nil {
 			br.Close()
-			return nil, errors.NewStorageError("[SetMinedMulti] UPDATE chunk %d: %v", i, err)
+			return nil, errors.NewStorageError("[SetMinedMulti] UPDATE chunk %d", i, err)
 		}
 		for rows.Next() {
 			var h []byte
@@ -151,7 +151,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 			if err := rows.Scan(&h, &bids); err != nil {
 				rows.Close()
 				br.Close()
-				return nil, errors.NewStorageError("[SetMinedMulti] scan block_ids chunk %d: %v", i, err)
+				return nil, errors.NewStorageError("[SetMinedMulti] scan block_ids chunk %d", i, err)
 			}
 			var ch chainhash.Hash
 			copy(ch[:], h)
@@ -167,7 +167,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		if err := rows.Err(); err != nil {
 			rows.Close()
 			br.Close()
-			return nil, errors.NewStorageError("[SetMinedMulti] iterate block_ids chunk %d: %v", i, err)
+			return nil, errors.NewStorageError("[SetMinedMulti] iterate block_ids chunk %d", i, err)
 		}
 		rows.Close()
 	}
@@ -227,7 +227,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	// txs commits all-or-nothing rather than leaving some rows updated on failure.
 	pgxTx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, errors.NewStorageError("[UnsetMined] begin: %v", err)
+		return nil, errors.NewStorageError("[UnsetMined] begin", err)
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
@@ -300,7 +300,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 				resultMap[*hash] = []uint32{}
 				continue
 			}
-			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s: %v", hash, err)
+			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s", hash, err)
 		}
 
 		// Build result.
@@ -312,7 +312,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	}
 
 	if err := pgxTx.Commit(ctx); err != nil {
-		return nil, errors.NewStorageError("[UnsetMined] commit: %v", err)
+		return nil, errors.NewStorageError("[UnsetMined] commit", err)
 	}
 
 	// Rewind the deferred-DAH sweep watermark to the reorged block's height so the

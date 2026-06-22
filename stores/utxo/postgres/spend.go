@@ -404,7 +404,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 			return false
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
-			item.errCh <- errors.NewStorageError("[Spend] query failed for %s:%d: %v", item.spend.TxID, item.spend.Vout, err)
+			item.errCh <- errors.NewStorageError("[Spend] query failed for %s:%d", item.spend.TxID, item.spend.Vout, err)
 			return false
 		}
 		diagErr := s.diagnoseSpendFailure(ctx, item.spend, item.spend.SpendingData.Bytes(),
@@ -455,7 +455,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	)
 	if err != nil {
 		for _, item := range batch {
-			item.errCh <- errors.NewStorageError("[Spend] bulk query failed: %v", err)
+			item.errCh <- errors.NewStorageError("[Spend] bulk query failed", err)
 		}
 		return false
 	}
@@ -771,7 +771,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 
 	pgxTx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return errors.NewStorageError("[Unspend] begin: %v", err)
+		return errors.NewStorageError("[Unspend] begin", err)
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
@@ -809,7 +809,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		if _, err := pgxTx.Exec(ctx,
 			`UPDATE txs SET delete_at_height = NULL WHERE hash = ANY($1)`, parentHashes,
 		); err != nil {
-			return errors.NewStorageError("[Unspend] failed to clear delete_at_height: %v", err)
+			return errors.NewStorageError("[Unspend] failed to clear delete_at_height", err)
 		}
 
 		// If requested, lock the parents within the same transaction. SetLocked(true)
@@ -819,13 +819,13 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 			if _, err := pgxTx.Exec(ctx,
 				`UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash = ANY($1)`, parentHashes,
 			); err != nil {
-				return errors.NewStorageError("[Unspend] failed to lock parent txs: %v", err)
+				return errors.NewStorageError("[Unspend] failed to lock parent txs", err)
 			}
 		}
 	}
 
 	if err := pgxTx.Commit(ctx); err != nil {
-		return errors.NewStorageError("[Unspend] commit: %v", err)
+		return errors.NewStorageError("[Unspend] commit", err)
 	}
 
 	return nil

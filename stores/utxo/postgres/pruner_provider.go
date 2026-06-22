@@ -300,7 +300,7 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		// a native int4 comparison on the BRIN-indexed column.
 		tag, err := s.store.maint().Exec(ctx, cascadeSQL, int32(blockHeight), int64(pruneDeleteBatchSize))
 		if err != nil {
-			return deleted, errors.NewStorageError("[pruner] cascade delete %s: %v", txsLeaf, err)
+			return deleted, errors.NewStorageError("[pruner] cascade delete %s", txsLeaf, err)
 		}
 
 		// RowsAffected is the count of txs parent rows removed this batch, which

@@ -59,7 +59,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	// mid-loop failure rolls the whole set back rather than leaving a torn state.
 	pgxTx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, nil, errors.NewStorageError("[SetConflicting] begin: %v", err)
+		return nil, nil, errors.NewStorageError("[SetConflicting] begin", err)
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
@@ -77,11 +77,11 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, nil, errors.NewTxNotFoundError("[SetConflicting] transaction not found: %s", txHash)
 			}
-			return nil, nil, errors.NewStorageError("[SetConflicting] read tx %s: %v", txHash, err)
+			return nil, nil, errors.NewStorageError("[SetConflicting] read tx %s", txHash, err)
 		}
 		tx, err := bt.NewTxFromBytes(rawTx)
 		if err != nil {
-			return nil, nil, errors.NewProcessingError("[SetConflicting] parse raw_tx for %s: %v", txHash, err)
+			return nil, nil, errors.NewProcessingError("[SetConflicting] parse raw_tx for %s", txHash, err)
 		}
 
 		// Update txs: set conflicting flag + delete_at_height.
@@ -198,7 +198,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	}
 
 	if err := pgxTx.Commit(ctx); err != nil {
-		return nil, nil, errors.NewStorageError("[SetConflicting] commit: %v", err)
+		return nil, nil, errors.NewStorageError("[SetConflicting] commit", err)
 	}
 
 	return affectedParentSpends, spendingTxHashes, nil
@@ -220,7 +220,7 @@ func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
 	if len(batch) == 1 {
 		_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false WHERE hash = $1`, batch[0].hash[:])
 		if err != nil {
-			batch[0].done <- errors.NewStorageError("[Unlock] update: %v", err)
+			batch[0].done <- errors.NewStorageError("[Unlock] update", err)
 		} else {
 			batch[0].done <- nil
 		}
@@ -240,7 +240,7 @@ func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
 	_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false WHERE hash = ANY($1) AND locked = true`, hashBytes)
 	if err != nil {
 		for _, item := range batch {
-			item.done <- errors.NewStorageError("[Unlock] bulk update: %v", err)
+			item.done <- errors.NewStorageError("[Unlock] bulk update", err)
 		}
 		return
 	}
@@ -377,7 +377,7 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 			errorCount += len(chunk)
 			if len(allErrors) < 10 {
 				s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
-				allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d: %v", i, end-1, err))
+				allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d", i, end-1, err))
 			}
 			continue
 		}
