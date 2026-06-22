@@ -306,43 +306,43 @@ func testRaceDetectorDuplicateDetection(t *testing.T, utxoStore string) {
 	t.Logf("Race detector will report any concurrency issues in duplicate detection")
 }
 
-func TestNilSubtreeStoreBypassSqlQueue(t *testing.T) {
+func TestNilSubtreeStoreBypassSqlPostgres(t *testing.T) {
 	pg, err := postgres.RunPostgresTestContainer(t.Context(), "nil_subtree_bypass_"+t.Name())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgressql", func(t *testing.T) {
+	t.Run("sqlpostgres", func(t *testing.T) {
 		testNilSubtreeStoreBypass(t, pg.ConnectionString())
 	})
 }
 
-func TestEmptySubtreeSlicesSqlQueue(t *testing.T) {
+func TestEmptySubtreeSlicesSqlPostgres(t *testing.T) {
 	pg, err := postgres.RunPostgresTestContainer(t.Context(), "empty_subtrees_"+t.Name())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgressql", func(t *testing.T) {
+	t.Run("sqlpostgres", func(t *testing.T) {
 		testEmptySubtreeSlices(t, pg.ConnectionString())
 	})
 }
 
-func TestConcurrencyConfigurationEdgeCasesSqlQueue(t *testing.T) {
+func TestConcurrencyConfigurationEdgeCasesSqlPostgres(t *testing.T) {
 	pg, err := postgres.RunPostgresTestContainer(t.Context(), "concurrency_config_"+t.Name())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgressql", func(t *testing.T) {
+	t.Run("sqlpostgres", func(t *testing.T) {
 		testConcurrencyConfigurationEdgeCases(t, pg.ConnectionString())
 	})
 }
 
-func TestRaceDetectorDuplicateDetectionSqlQueue(t *testing.T) {
+func TestRaceDetectorDuplicateDetectionSqlPostgres(t *testing.T) {
 	t.Skip("Skipping due to known data race in BlockValidation.setTxMinedStatus - see issue #296")
 
 	pg, err := postgres.RunPostgresTestContainer(t.Context(), "race_detector_"+t.Name())
@@ -351,7 +351,7 @@ func TestRaceDetectorDuplicateDetectionSqlQueue(t *testing.T) {
 		_ = pg.Terminate(t.Context())
 	})
 
-	t.Run("postgressql", func(t *testing.T) {
+	t.Run("sqlpostgres", func(t *testing.T) {
 		testRaceDetectorDuplicateDetection(t, pg.ConnectionString())
 	})
 }

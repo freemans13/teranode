@@ -27,10 +27,10 @@ const (
 	UTXOStoreAerospike UTXOStoreType = "aerospike"
 	// UTXOStorePostgres uses the optimized PostgreSQL UTXO store backend
 	UTXOStorePostgres UTXOStoreType = "postgres"
-	// UTXOStorePostgresSQL uses the legacy SQL UTXO store on PostgreSQL. It spins up
-	// the same PostgreSQL container as UTXOStorePostgres but returns a "postgressql://"
+	// UTXOStoreSqlPostgres uses the legacy SQL UTXO store on PostgreSQL. It spins up
+	// the same PostgreSQL container as UTXOStorePostgres but returns a "sqlpostgres://"
 	// URL so the factory selects the SQL store rather than the native postgres store.
-	UTXOStorePostgresSQL UTXOStoreType = "postgressql"
+	UTXOStoreSqlPostgres UTXOStoreType = "sqlpostgres"
 	// UTXOStoreSQLite uses SQLite as the UTXO store backend (no container needed)
 	UTXOStoreSQLite UTXOStoreType = "sqlite"
 )
@@ -73,14 +73,14 @@ func (cm *ContainerManager) Initialize(ctx context.Context) (*url.URL, error) {
 		return cm.initializeAerospike(ctx)
 	case UTXOStorePostgres:
 		return cm.initializePostgres(ctx)
-	case UTXOStorePostgresSQL:
+	case UTXOStoreSqlPostgres:
 		// Same PostgreSQL container as the native store, but rewrite the scheme to
-		// "postgressql" so the factory routes to the legacy SQL store instead.
+		// "sqlpostgres" so the factory routes to the legacy SQL store instead.
 		parsedURL, err := cm.initializePostgres(ctx)
 		if err != nil {
 			return nil, err
 		}
-		parsedURL.Scheme = "postgressql"
+		parsedURL.Scheme = "sqlpostgres"
 		cm.containerURL = parsedURL.String()
 		return parsedURL, nil
 	case UTXOStoreSQLite:

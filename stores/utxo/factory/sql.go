@@ -6,7 +6,7 @@
 // The following storage backends are available:
 //   - Aerospike (build tag: aerospike): "aerospike://host:port/namespace/set"
 //   - PostgreSQL (native store): "postgres://user:pass@host:port/dbname"
-//   - PostgreSQL (legacy SQL store): "postgressql://user:pass@host:port/dbname"
+//   - PostgreSQL (legacy SQL store): "sqlpostgres://user:pass@host:port/dbname"
 //   - SQLite: "sqlite://path/to/file.db"
 //   - SQLite Memory: "sqlitememory://"
 //   - In-Memory (build tag: memory): "memory://" (for testing)
@@ -44,7 +44,7 @@
 // Example URLs:
 //
 //	postgres://user:pass@localhost:5432/utxo?sslmode=disable&logging=true     (native PostgreSQL store)
-//	postgressql://user:pass@localhost:5432/utxo?sslmode=disable&logging=true  (legacy SQL store on PostgreSQL)
+//	sqlpostgres://user:pass@localhost:5432/utxo?sslmode=disable&logging=true  (legacy SQL store on PostgreSQL)
 //	aerospike://localhost:3000/test/utxos?logging=true
 //
 // # Block Height Management
@@ -75,7 +75,7 @@ import (
 )
 
 func init() {
-	availableDatabases["postgressql"] = func(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, url *url.URL) (utxo.Store, error) {
+	availableDatabases["sqlpostgres"] = func(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, url *url.URL) (utxo.Store, error) {
 		return sql.New(ctx, logger, tSettings, url)
 	}
 	availableDatabases["sqlitememory"] = func(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, url *url.URL) (utxo.Store, error) {

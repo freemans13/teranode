@@ -208,8 +208,8 @@ func testTripleForkedChainExternalTx(t *testing.T, utxoStore string) {
 	t.Log("Successfully verified triple forked chain with external transactions")
 }
 
-func TestTripleForkedChainExternalTxSqlQueue(t *testing.T) {
+func TestTripleForkedChainExternalTxSqlPostgres(t *testing.T) {
 	t.Run("triple_forked_chain_external_tx", func(t *testing.T) {
-		testTripleForkedChainExternalTx(t, "postgressql")
+		testTripleForkedChainExternalTx(t, "sqlpostgres")
 	})
 }

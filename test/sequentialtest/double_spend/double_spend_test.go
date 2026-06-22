@@ -1106,48 +1106,48 @@ func testSingleDoubleSpendNotMinedForLong(t *testing.T, utxoStore string) {
 	assert.Nil(t, txMeta)
 }
 
-func TestDoubleSpendSqlQueue(t *testing.T) {
+func TestDoubleSpendSqlPostgres(t *testing.T) {
 	// t.Skip()
 
 	t.Run("single_tx_with_one_conflicting_transaction", func(t *testing.T) {
-		testSingleDoubleSpend(t, "postgressql")
+		testSingleDoubleSpend(t, "sqlpostgres")
 	})
 	// t.Run("multiple conflicting txs in same block", func(t *testing.T) {
-	// 	testMarkAsConflictingMultipleSameBlock(t, "postgressql")
+	// 	testMarkAsConflictingMultipleSameBlock(t, "sqlpostgres")
 	// })
 	t.Run("multiple_conflicting_txs_in_different_blocks", func(t *testing.T) {
-		testMarkAsConflictingMultiple(t, "postgressql")
+		testMarkAsConflictingMultiple(t, "sqlpostgres")
 	})
 	t.Run("conflicting_transaction_chains", func(t *testing.T) {
-		testMarkAsConflictingChains(t, "postgressql")
+		testMarkAsConflictingChains(t, "sqlpostgres")
 	})
 	t.Run("double_spend_fork", func(t *testing.T) {
-		testDoubleSpendFork(t, "postgressql")
+		testDoubleSpendFork(t, "sqlpostgres")
 	})
 	// t.Run("double spend in subsequent block", func(t *testing.T) {
-	// 	testDoubleSpendInSubsequentBlock(t, "postgressql")
+	// 	testDoubleSpendInSubsequentBlock(t, "sqlpostgres")
 	// })
 	t.Run("triple_forked_chain", func(t *testing.T) {
-		testTripleForkedChain(t, "postgressql")
+		testTripleForkedChain(t, "sqlpostgres")
 	})
 	t.Run("test_non_conflicting_tx_after_reorg", func(t *testing.T) {
 		t.Skip()
-		testNonConflictingTxReorg(t, "postgressql")
+		testNonConflictingTxReorg(t, "sqlpostgres")
 	})
 	t.Run("test_conflicting_tx_processed_after_reorg", func(t *testing.T) {
-		testConflictingTxReorg(t, "postgressql")
+		testConflictingTxReorg(t, "sqlpostgres")
 	})
 	t.Run("test_non_conflicting_tx_after_block_assembly_reset", func(t *testing.T) {
-		testNonConflictingTxBlockAssemblyReset(t, "postgressql")
+		testNonConflictingTxBlockAssemblyReset(t, "sqlpostgres")
 	})
 	t.Run("test_double_spend_fork_with_nested_txs", func(t *testing.T) {
-		testDoubleSpendForkWithNestedTXs(t, "postgressql")
+		testDoubleSpendForkWithNestedTXs(t, "sqlpostgres")
 	})
 	t.Run("test_double_spend_with_frozen_tx", func(t *testing.T) {
-		testSingleDoubleSpendFrozenTx(t, "postgressql")
+		testSingleDoubleSpendFrozenTx(t, "sqlpostgres")
 	})
 	// this test is not working yet, waiting for #2853
 	// t.Run("test_double_spend_not_mined_for_long", func(t *testing.T) {
-	// 	testSingleDoubleSpendNotMinedForLong(t, "postgressql")
+	// 	testSingleDoubleSpendNotMinedForLong(t, "sqlpostgres")
 	// })
 }

@@ -166,12 +166,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, errors.NewStorageError("failed to init sql db", err)
 	}
 
-	// "postgressql" is an alias for "postgres": the UTXO-store factory re-registered
-	// the SQL Postgres store under "postgressql" so the native postgres store could
+	// "sqlpostgres" is an alias for "postgres": the UTXO-store factory re-registered
+	// the SQL Postgres store under "sqlpostgres" so the native postgres store could
 	// claim the bare "postgres" scheme. Normalise it here so schema creation and
 	// every downstream `s.engine == "postgres"` fast-path stay enabled.
 	engine := storeURL.Scheme
-	if engine == "postgressql" {
+	if engine == "sqlpostgres" {
 		engine = "postgres"
 	}
 

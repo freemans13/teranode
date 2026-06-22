@@ -782,28 +782,28 @@ func testMultipleReorgCycles(t *testing.T, utxoStoreType string) {
 	t.Logf("    Final state: spentExtraRecs=%d/%d (no cumulative counter inflation)", expectedSpent, expectedTotalExtraRecs)
 }
 
-func TestLargeTxReorgSqlQueue(t *testing.T) {
+func TestLargeTxReorgSqlPostgres(t *testing.T) {
 	t.Run("1: simple large transaction reorg", func(t *testing.T) {
-		testSimpleLargeTransactionReorg(t, "postgressql")
+		testSimpleLargeTransactionReorg(t, "sqlpostgres")
 	})
 
 	t.Run("2: partial spend large transaction reorg", func(t *testing.T) {
-		testPartialSpendLargeTransactionReorg(t, "postgressql")
+		testPartialSpendLargeTransactionReorg(t, "sqlpostgres")
 	})
 
 	t.Run("3: multiple large transactions reorg", func(t *testing.T) {
-		testMultipleLargeTransactionsReorg(t, "postgressql")
+		testMultipleLargeTransactionsReorg(t, "sqlpostgres")
 	})
 
 	t.Run("4: large transaction chain dependency", func(t *testing.T) {
-		testLargeTransactionChainDependency(t, "postgressql")
+		testLargeTransactionChainDependency(t, "sqlpostgres")
 	})
 
 	t.Run("5: large transaction double spend", func(t *testing.T) {
-		testLargeTransactionDoubleSpend(t, "postgressql")
+		testLargeTransactionDoubleSpend(t, "sqlpostgres")
 	})
 
 	t.Run("6: multiple reorg cycles stress test", func(t *testing.T) {
-		testMultipleReorgCycles(t, "postgressql")
+		testMultipleReorgCycles(t, "sqlpostgres")
 	})
 }
