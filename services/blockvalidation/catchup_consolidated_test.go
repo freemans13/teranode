@@ -427,6 +427,10 @@ func TestCatchup_FSMStateManagement(t *testing.T) {
 			},
 		}
 
+		// Clear the permissive GetFSMCurrentState expectation registered by
+		// setupTestCatchupServer so the error .Once() below is matched first.
+		mockBlockchainClient.ExpectedCalls = filterMockCalls(mockBlockchainClient.ExpectedCalls, "GetFSMCurrentState")
+
 		// Mock FSM state query failure
 		mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).
 			Return(nil, assert.AnError).Once()
@@ -435,7 +439,7 @@ func TestCatchup_FSMStateManagement(t *testing.T) {
 		server.restoreFSMState(ctx, catchupCtx)
 
 		// Should not attempt to change state if query fails
-		mockBlockchainClient.AssertNotCalled(t, "Run", mock.Anything, mock.Anything)
+		mockBlockchainClient.AssertNotCalled(t, "Run")
 	})
 }
 

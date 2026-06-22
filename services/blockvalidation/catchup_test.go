@@ -3956,7 +3956,7 @@ func TestSetFSMCatchingBlocks_SkipsWhenAlreadyCatching(t *testing.T) {
 
 	err := server.setFSMCatchingBlocks(context.Background(), cctx, &size)
 	require.NoError(t, err)
-	mockBlockchainClient.AssertNotCalled(t, "CatchUpBlocks", mock.Anything)
+	mockBlockchainClient.AssertNotCalled(t, "CatchUpBlocks")
 }
 
 func TestSetFSMCatchingBlocks_TransitionsWhenRunning(t *testing.T) {
