@@ -1372,6 +1372,43 @@ func TestReAssignUTXO(t *testing.T) {
 	require.Equal(t, newHash[:], storedUtxoHash)
 }
 
+// TestReAssignUTXOSpendableInAtVoutGE1 pins the reassign maturity gate for outputs
+// at vout >= 1. spendable_ins is NULL on create and written only by ReAssignUTXO;
+// a bare `spendable_ins[vout+1] = v` on a NULL array yields a length-1 array with
+// lower bound vout+1, so the reader guard `array_length(spendable_ins,1) >= vout+1`
+// is false for vout >= 1 and the spendable-after height is silently dropped —
+// making the reassigned UTXO immediately spendable instead of after the delay.
+func TestReAssignUTXOSpendableInAtVoutGE1(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	tx := testExtendedTx(t)
+	require.GreaterOrEqual(t, len(tx.Outputs), 2, "need a vout>=1 output to exercise the bug")
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	require.NoError(t, store.SetBlockHeight(200))
+
+	txHash := tx.TxIDChainHash()
+	const vout = uint32(1)
+	utxoHash, err := util.UTXOHashFromOutput(txHash, tx.Outputs[vout], vout)
+	require.NoError(t, err)
+	src := &utxo.Spend{TxID: txHash, Vout: vout, UTXOHash: utxoHash}
+
+	require.NoError(t, store.FreezeUTXOs(ctx, []*utxo.Spend{src}, nil))
+
+	newHash := chainhash.HashH([]byte("reassign-vout1"))
+	require.NoError(t, store.ReAssignUTXO(ctx, src, &utxo.Spend{UTXOHash: &newHash}, nil))
+
+	// Read spendable_in exactly as the spend/get path does (get.go:380).
+	var spendableIn *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT CASE WHEN array_length(spendable_ins, 1) >= $2::int + 1 THEN spendable_ins[$2::int + 1] END
+		   FROM txs WHERE hash = $1`, txHash[:], int32(vout)).Scan(&spendableIn))
+
+	want := int64(200 + utxo.ReAssignedUtxoSpendableAfterBlocks)
+	require.NotNil(t, spendableIn, "reassigned vout>=1 must record the spendable-after height, not NULL")
+	require.Equal(t, want, *spendableIn, "spendable_in must be block_height + ReAssignedUtxoSpendableAfterBlocks")
+}
+
 // ---------------------------------------------------------------------------
 // Task 11 tests: Preservation + Pruner
 // ---------------------------------------------------------------------------

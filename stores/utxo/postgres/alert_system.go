@@ -173,8 +173,13 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 
 	// Update the packed columns in ONE statement: splice the new 32-byte utxo
 	// hash into the flat utxo_hashes (overlay at byte offset vout*32, 1-based),
-	// clear the per-output frozen bit, and set spendable_in for this slot (kept as
-	// an INT[]) — so a concurrent Get/Spend never observes a torn state.
+	// clear the per-output frozen bit, and rebuild spendable_ins as a contiguous
+	// 1-based INT[] of length out_count with this slot set (preserving any prior
+	// reassignments) — so a concurrent Get/Spend never observes a torn state. The
+	// rebuild is required because a bare `spendable_ins[vout+1] = v` on the NULL
+	// create-time array yields a length-1 array at lower bound vout+1, which the
+	// readers' `array_length(spendable_ins,1) >= vout+1` guard then misses for
+	// vout >= 1 (dropping the maturity gate; see TestReAssignUTXOSpendableInAtVoutGE1).
 	// Reassignment does NOT mutate out_spendables, so spendable_count is
 	// intentionally left untouched. As in UnFreezeUTXOs, we DELIBERATELY do NOT
 	// recompute the tx-level `frozen` column from the bitmap: it is the create-time
@@ -185,7 +190,16 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 		UPDATE txs
 		SET utxo_hashes = overlay(utxo_hashes placing $3::bytea from $2::int * 32 + 1 for 32),
 		    out_frozens = set_bit(out_frozens, $2::int, 0),
-		    spendable_ins[$2::int + 1] = $4
+		    spendable_ins = (
+		        SELECT array_agg(
+		            CASE WHEN g = $2::int THEN $4::int
+		                 WHEN spendable_ins IS NOT NULL
+		                      AND g + 1 BETWEEN array_lower(spendable_ins, 1) AND array_upper(spendable_ins, 1)
+		                 THEN spendable_ins[g + 1]
+		                 ELSE NULL::int END
+		            ORDER BY g)
+		        FROM generate_series(0, out_count - 1) AS g
+		    )
 		WHERE hash = $1 AND $2::int < out_count
 		  AND out_frozens IS NOT NULL AND get_bit(out_frozens, $2::int) = 1
 	`, utxoSpend.TxID[:], utxoSpend.Vout, newUtxo.UTXOHash[:], si)
