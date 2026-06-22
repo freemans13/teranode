@@ -6,8 +6,10 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -387,4 +389,39 @@ func TestSyncCoordinator_CheckAndClearExpiredBackoff_StillInWindow(t *testing.T)
 	sc.enterBackoffMode()
 	require.True(t, sc.checkAndClearExpiredBackoff(),
 		"freshly entered backoff must still be in its window")
+}
+
+func newTestSyncCoordinatorWithFSM(t *testing.T, state blockchain_api.FSMStateType) (*SyncCoordinator, *blockchain.CentralizedPeerRegistry, *blockchain.Mock) {
+	t.Helper()
+	reg := blockchain.NewCentralizedPeerRegistry(blockchain.DefaultBanConfig())
+	client := blockchain.NewLocalPeerRegistryClient(reg)
+	tSettings := &settings.Settings{P2P: settings.P2PSettings{
+		AllowPrunedNodeFallback:                   true,
+		SyncCoordinatorPeriodicEvaluationInterval: 30 * time.Second,
+		HealthCheckEnabled:                        false, // test DataHubURL is unreachable; skip HTTP health check
+	}}
+	bcMock := &blockchain.Mock{}
+	st := state
+	bcMock.On("GetFSMCurrentState", mock.Anything).Return(&st, nil)
+
+	sc := NewSyncCoordinator(context.Background(), ulogger.TestLogger{}, tSettings, client,
+		NewPeerSelector(ulogger.TestLogger{}, tSettings), bcMock, nil)
+	sc.SetGetLocalHeightCallback(func() uint32 { return 0 })
+	return sc, reg, bcMock
+}
+
+func TestSyncCoordinator_ProactiveInCatchingBlocks(t *testing.T) {
+	sc, reg, _ := newTestSyncCoordinatorWithFSM(t, blockchain_api.FSMStateType_CATCHINGBLOCKS)
+
+	// Register a viable peer well ahead of local height 0 (mirror the idiom
+	// from TestSyncCoordinator_IsCaughtUp_AheadPeerMakesUsBehind):
+	reg.Register(&blockchain.PeerInfo{ID: "ahead", DataHubURL: "http://ahead", Height: 100})
+	for i := 0; i < 5; i++ {
+		reg.UpdateMetrics("ahead", 0, 0, 0, true, false, false, 100)
+	}
+
+	sc.checkFSMState(context.Background())
+
+	require.Equal(t, "ahead", sc.GetCurrentSyncPeer(),
+		"coordinator should proactively select a sync peer while in CATCHINGBLOCKS")
 }
