@@ -15,8 +15,15 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// pgxExecutor is the subset of the pgx API shared by *pgxpool.Conn and pgx.Tx,
+// letting insertConflictingChildrenDirect run either directly on a pooled
+// connection or inside the conflicting-create transaction.
+type pgxExecutor interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
 
 // ---------------------------------------------------------------------------
 // Batch types
@@ -266,11 +273,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	}
 	defer conn.Release()
 
-	// Insert into txs (metadata + state + raw_tx + packed output columns).
-	// out_frozens is NULL on create (no output frozen — freeze materialises the
-	// bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
-	var insertedHash []byte
-	err = conn.QueryRow(ctx, `
+	const insertSQL = `
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
@@ -278,26 +281,61 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
 		        $17, $18, $19, $20, $21)
 		ON CONFLICT (hash) DO NOTHING
-		RETURNING hash`,
+		RETURNING hash`
+	insertArgs := []interface{}{
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
 		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil), minedAtHeight,
 		outArrs.utxoHashes, outArrs.outCount, outArrs.spendableCount,
 		outArrs.spendableBits, outArrs.coinbaseSpendingHeight,
-	).Scan(&insertedHash)
-	if err != nil {
+	}
+
+	// Conflicting txs need the txs INSERT AND the N parent conflicting_children
+	// UPDATEs to be atomic: a failure (or disconnect) after the child row commits
+	// but before the parents are stamped would leave a torn write the early
+	// TxExistsError return on retry can never repair (ON CONFLICT DO NOTHING →
+	// pgx.ErrNoRows → return before the child UPDATEs re-run). Wrap both in one
+	// transaction for this rare path. The common, non-conflicting path stays a
+	// single auto-committing INSERT (no extra round-trip).
+	if txMeta.Conflicting {
+		txn, beginErr := conn.Begin(ctx)
+		if beginErr != nil {
+			return nil, errors.NewStorageError("failed to begin conflicting-create tx", beginErr)
+		}
+		defer func() { _ = txn.Rollback(ctx) }()
+
+		var insertedHash []byte
+		if err = txn.QueryRow(ctx, insertSQL, insertArgs...).Scan(&insertedHash); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
+			}
+			return nil, errors.NewStorageError("failed to create UTXO", err)
+		}
+
+		// insertConflictingChildrenDirect is idempotent (the @> guard), so a retry
+		// after a partial failure re-applies the missing parent stamps cleanly.
+		if err = s.insertConflictingChildrenDirect(ctx, txn, txHash, tx); err != nil {
+			return nil, err
+		}
+
+		if err = txn.Commit(ctx); err != nil {
+			return nil, errors.NewStorageError("failed to commit conflicting-create tx", err)
+		}
+
+		result := s.buildCreateMeta(txMeta, options, isCoinbase, blockHeight)
+		return result, nil
+	}
+
+	// Insert into txs (metadata + state + raw_tx + packed output columns).
+	// out_frozens is NULL on create (no output frozen — freeze materialises the
+	// bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
+	var insertedHash []byte
+	if err = conn.QueryRow(ctx, insertSQL, insertArgs...).Scan(&insertedHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
 		}
 		return nil, errors.NewStorageError("failed to create UTXO", err)
-	}
-
-	// Handle conflicting children (rare path).
-	if txMeta.Conflicting {
-		if err = s.insertConflictingChildrenDirect(ctx, conn, txHash, tx); err != nil {
-			return nil, err
-		}
 	}
 
 	result := s.buildCreateMeta(txMeta, options, isCoinbase, blockHeight)
@@ -351,7 +389,10 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 // plain validator-path creates and single-block mined creates (block_ids etc.
 // populated when the item carries exactly one MinedBlockInfo). Conflicting and
 // multi-block items are filtered out by sendCreateBatch and never reach here.
-// Atomicity is preserved by wrapping both INSERTs in a transaction.
+// It issues a SINGLE auto-committing INSERT for the whole batch, which is
+// implicitly atomic on its own — there is no second statement to coordinate (the
+// conflicting path, which does need a multi-statement transaction, runs in
+// createDirect, not here).
 // ---------------------------------------------------------------------------
 func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateItem) {
 	n := len(batch)
@@ -588,7 +629,7 @@ func (s *Store) buildCreateMeta(txMeta *meta.Data, options *utxo.CreateOptions, 
 
 // insertConflictingChildrenDirect updates the parent txs rows to append this child
 // to their conflicting_children array.
-func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpool.Conn, childTxHash *chainhash.Hash, tx *bt.Tx) error {
+func (s *Store) insertConflictingChildrenDirect(ctx context.Context, exec pgxExecutor, childTxHash *chainhash.Hash, tx *bt.Tx) error {
 	seen := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
 
 	for _, input := range tx.Inputs {
@@ -598,7 +639,7 @@ func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpo
 		}
 		seen[parentHash] = struct{}{}
 
-		_, err := conn.Exec(ctx, `
+		_, err := exec.Exec(ctx, `
 			UPDATE txs SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
 			WHERE hash = $1
 			  AND NOT (COALESCE(conflicting_children, '{}') @> $2::bytea[])`,
