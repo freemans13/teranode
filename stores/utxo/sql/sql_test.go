@@ -1495,6 +1495,36 @@ func TestProcessExpiredPreservations(t *testing.T) {
 		require.False(t, preserveUntil.Valid, "preserve_until must be cleared")
 		require.False(t, dah.Valid, "retention 0 disables pruning — no DAH must be stamped")
 	})
+
+	t.Run("mined_fully_spent_but_off_longest_chain_is_not_stamped", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		store, tx := setup(ctx, t)
+
+		_, err := store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		id, _ := txIDAndDAH(ctx, t, store, tx.TxIDChainHash()[:])
+		// Mined and fully spent, but NOT on the longest chain: unmined_since is set. The eligibility
+		// CASE keys on unmined_since IS NULL, so this must not be stamped — exercises the
+		// off-longest-chain dimension the reorg-window test does not (it never sets unmined_since).
+		markMinedAndSpend(ctx, t, store, tx, id, nil) // sets unmined_since = NULL
+		_, err = store.db.ExecContext(ctx,
+			"UPDATE transactions SET unmined_since = $1 WHERE id = $2", uint32(50), id)
+		require.NoError(t, err)
+		setExpiredPreservation(ctx, t, store, id, currentHeight)
+
+		err = store.ProcessExpiredPreservations(ctx, currentHeight)
+		require.NoError(t, err)
+
+		var preserveUntil sql.NullInt64
+		var dah sql.NullInt64
+		err = store.db.QueryRowContext(ctx,
+			"SELECT preserve_until, delete_at_height FROM transactions WHERE id = $1", id).Scan(&preserveUntil, &dah)
+		require.NoError(t, err)
+		require.False(t, preserveUntil.Valid, "preserve_until must be cleared")
+		require.False(t, dah.Valid, "off-longest-chain parent must NOT be stamped (unmined_since IS NOT NULL)")
+	})
 }
 
 // TestProcessExpiredPreservations_PartialSpendParentNotStamped is the regression

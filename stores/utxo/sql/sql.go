@@ -4203,14 +4203,23 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		}
 	}
 
-	// When setting conflicting=true: set DAH only if not already set (mirrors aerospike line 944-951).
+	// When setting conflicting=true: set DAH only if not already set (mirrors aerospike line 944-951),
+	// AND only when the row is not preserved. The preserve_until guard mirrors the Lua
+	// setDeleteAtHeight, which returns early when preserveUntil is set (teranode.lua:973) — without it
+	// a preserved parent marked conflicting would be stamped for deletion while still inside its
+	// preservation window, and the pruner deletes purely on the stamp. The conflicting flag itself is
+	// always applied; only the DAH is gated. ProcessExpiredPreservations later stamps the DAH once the
+	// preservation expires.
 	// When clearing conflicting: clear DAH (conditions for deletion no longer met).
 	var qUpdate string
 	if setValue {
 		qUpdate = `
 			UPDATE transactions SET
 			 conflicting = $2
-			,delete_at_height = COALESCE(delete_at_height, $3)
+			,delete_at_height = CASE
+			     WHEN preserve_until IS NOT NULL THEN delete_at_height
+			     ELSE COALESCE(delete_at_height, $3)
+			 END
 			WHERE hash = $1
 			RETURNING id
 		`
@@ -5339,8 +5348,9 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	// The conflicting branch writes $1 unconditionally rather than preserving an existing DAH the
 	// way setDAH does (COALESCE). That is intentional and safe here, NOT a bug to "fix": every row
 	// matched by the WHERE clause has preserve_until set, and a preserved row always has a NULL
-	// delete_at_height (PreserveTransactions clears it at preserve time, and setDAH/the expression
-	// path both skip preserved rows), so there is never an existing conflicting DAH to keep.
+	// delete_at_height — PreserveTransactions clears it at preserve time, and every DAH setter
+	// (setDAH, the SetMined CASE, and SetConflicting) leaves it untouched while preserve_until is
+	// set — so there is never an existing conflicting DAH to keep.
 	query := `
 		UPDATE transactions
 		SET delete_at_height = CASE

@@ -1050,12 +1050,12 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 
 // ProcessExpiredPreservations handles transactions whose preservation period has expired.
 // For each transaction with PreserveUntil <= currentHeight, it sets an appropriate DeleteAtHeight
-// and clears the PreserveUntil field.
+// and clears the PreserveUntil field. It is called from the live pruner cycle (worker.go, Phase 1b).
 //
-// PREREQUISITE: the range query below relies on a NUMERIC secondary index over the PreserveUntil
-// bin. The store does not create it (this method is not yet wired into the live pruner cycle), and
-// the test creates it explicitly. When this is wired in, that index MUST be created at startup —
-// otherwise the query fails or degrades to a full set scan. Track this on the wiring follow-up.
+// The range query below relies on a NUMERIC secondary index over the PreserveUntil bin. New()
+// creates it at startup in the indexOnce block, alongside the DeleteAtHeight and UnminedSince
+// indexes — but only when pruner.IndexName != "" (the same guard that gates the other two). If that
+// guard is empty the index is absent and this query degrades to a full set scan.
 func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
 	// Create a query to find records with expired PreserveUntil
 	stmt := aerospike.NewStatement(s.namespace, s.setName)
@@ -1117,7 +1117,9 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 		}
 
 		batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
-		batchWritePolicy.RecordExistsAction = aerospike.UPDATE
+		// UPDATE_ONLY, not UPDATE: a record deleted between the secondary-index query and this write
+		// must not be recreated as an empty phantom. Matches PreserveTransactionsWithExpressions.
+		batchWritePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
 
 		// Clear the preservation, then re-evaluate deleteAtHeight against the SAME
 		// eligibility rule as the canonical setDeleteAtHeight (mined + on the longest
@@ -1171,11 +1173,13 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 		}
 	}
 
-	if readErrors > 0 || keyErrors > 0 || batchErrors > 0 {
-		s.logger.Errorf("[ProcessExpiredPreservations] Errors at height %d: %d read failures, %d key failures, %d batch failures", currentHeight, readErrors, keyErrors, batchErrors)
-	}
-
 	s.logger.Infof("[ProcessExpiredPreservations] Processed %d expired preservations at height %d", processedCount, currentHeight)
+
+	// Surface partial failures to the caller so the pruner's error metric fires and the duration
+	// metric is not recorded as a clean success. processedCount still reflects what did succeed.
+	if readErrors > 0 || keyErrors > 0 || batchErrors > 0 {
+		return errors.NewStorageError("[ProcessExpiredPreservations] completed with errors at height %d: %d read failures, %d key failures, %d batch failures", currentHeight, readErrors, keyErrors, batchErrors)
+	}
 
 	return nil
 }
