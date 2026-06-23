@@ -288,7 +288,7 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, response)
 		// The error message will vary depending on network conditions, but it should be a processing error
-		assert.Contains(t, err.Error(), "CheckBlockSubtreesRequest")
+		assert.Contains(t, err.Error(), "failed to load subtree batch")
 	})
 
 	t.Run("SubtreeExistsError", func(t *testing.T) {
@@ -424,7 +424,7 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		response, err := server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
 		assert.Nil(t, response)
-		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
+		assert.Contains(t, err.Error(), "failed to load subtree transactions")
 	})
 }
 
@@ -924,7 +924,7 @@ func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
 		// from http://127.0.0.1:0, which fails deterministically because nothing listens there. The important thing is it detected missing via quorum.
 		_, err = server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
+		assert.Contains(t, err.Error(), "failed to load subtree transactions")
 	})
 
 	t.Run("QuorumTimeout_TreatsAsMissing", func(t *testing.T) {
@@ -998,7 +998,7 @@ func TestCheckBlockSubtrees_WithQuorum(t *testing.T) {
 		_, err = server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
 		// The error should be from the HTTP fetch, not from quorum timeout
-		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
+		assert.Contains(t, err.Error(), "failed to load subtree transactions")
 		assert.NotContains(t, err.Error(), "quorum lock")
 	})
 
