@@ -731,6 +731,50 @@ func TestSetConflicting(t *testing.T) {
 	require.False(t, got.Conflicting, "should not be conflicting after SetConflicting(false)")
 }
 
+// TestSetConflictingDoesNotStampPreservedRow verifies that marking a preserved tx conflicting does
+// NOT stamp delete_at_height while it is inside its preservation window (mirrors the DAH sweep's
+// preserve_until guard at dah_sweep.go:97 / dah_sweep_proc.go:162). The pruner deletes purely on the
+// stamp and never re-checks preserve_until (pruner_provider deleteTombstoned DESIGN CONTRACT), so
+// stamping a preserved row would tear it down before its preservation expires. The conflicting flag
+// is still applied; the DAH is deferred to ProcessExpiredPreservations. The control half confirms an
+// unpreserved conflicting tx is still stamped (the COALESCE/ELSE branch).
+func TestSetConflictingDoesNotStampPreservedRow(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	hash := tx.TxIDChainHash()[:]
+
+	readState := func() (conflicting bool, dah *int64) {
+		t.Helper()
+		require.NoError(t, store.pool.QueryRow(ctx,
+			`SELECT conflicting, delete_at_height FROM txs WHERE hash = $1`, hash).Scan(&conflicting, &dah))
+		return
+	}
+
+	// Preserved state: preserve_until set well into the future, delete_at_height cleared.
+	_, err = store.pool.Exec(ctx,
+		`UPDATE txs SET preserve_until = 1000000, delete_at_height = NULL WHERE hash = $1`, hash)
+	require.NoError(t, err)
+
+	_, _, err = store.SetConflicting(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true)
+	require.NoError(t, err)
+
+	conflicting, dah := readState()
+	require.True(t, conflicting, "conflicting flag must be set even while preserved")
+	require.Nil(t, dah, "preserved row must NOT be stamped with a delete_at_height when marked conflicting")
+
+	// Control: once the preservation is cleared, marking conflicting DOES stamp (ELSE/COALESCE branch).
+	_, err = store.pool.Exec(ctx, `UPDATE txs SET preserve_until = NULL WHERE hash = $1`, hash)
+	require.NoError(t, err)
+
+	_, _, err = store.SetConflicting(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true)
+	require.NoError(t, err)
+
+	_, dah = readState()
+	require.NotNil(t, dah, "unpreserved conflicting tx must be stamped for deletion")
+}
+
 func TestMarkTransactionsOnLongestChain(t *testing.T) {
 	store, ctx := setupTestStore(t)
 	parentTx := testExtendedTx(t)

@@ -87,11 +87,21 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		// Update txs: set conflicting flag + delete_at_height.
 		var tag pgconn.CommandTag
 		if setValue {
-			// When setting conflicting=true: set DAH only if not already set.
+			// When setting conflicting=true: set DAH only if not already set, AND only when the row
+			// is not preserved. The preserve_until guard mirrors the DAH sweep (dah_sweep.go:97,
+			// dah_sweep_proc.go:162), which skips preserved rows. Without it a preserved parent marked
+			// conflicting would be stamped for deletion while still inside its preservation window —
+			// violating the DAH-setter invariant in pruner_provider.deleteTombstonedPartition (the
+			// pruner deletes purely on the stamp and never re-checks preserve_until). The conflicting
+			// flag itself is always applied; only the DAH is gated. ProcessExpiredPreservations stamps
+			// the DAH (conflicting branch) once the preservation expires.
 			tag, err = pgxTx.Exec(ctx, `
 				UPDATE txs SET
 				  conflicting = $2,
-				  delete_at_height = COALESCE(delete_at_height, $3)
+				  delete_at_height = CASE
+				      WHEN preserve_until IS NOT NULL THEN delete_at_height
+				      ELSE COALESCE(delete_at_height, $3)
+				  END
 				WHERE hash = $1`,
 				txHash[:], setValue, deleteAtHeight,
 			)
