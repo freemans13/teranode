@@ -122,7 +122,7 @@
   <h2 id="bigidea">3. The big idea: two tables</h2>
   <p>
     Many designs use a separate row for every single output. This store does <strong>not</strong>. It uses just
-    <strong>two main tables</strong> plus one tiny bookmark table:
+    <strong>two data tables</strong> — plus a few small bookkeeping tables (described after the diagram):
   </p>
 
   <figure>
@@ -163,6 +163,23 @@
     transactions; transactions with enormous numbers of outputs are a known weak spot.
     <br><span class="muted">(The full “why not normalise into many tables like the SQL store?” story is in
     <a href="#fewtables">§11</a>.)</span>
+  </div>
+
+  <div class="panel">
+    <strong>The small bookkeeping tables.</strong> Besides <code>txs</code> and <code>spends</code>, a few
+    tiny tables keep the background machinery honest. None sit on the hot validation path, and all are
+    negligible in size:
+    <ul>
+      <li><code>dah_watermark</code> and <code>dah_part_watermark</code> — the deferred-deletion sweeper’s
+        “bookmark”: how far it has swept overall and per shard (see <a href="#deferred">§7</a>). One row total,
+        plus one row per shard. This is the bookmark referred to under crash-safety in <a href="#safety">§9</a>.</li>
+      <li><code>conflict_intents</code> — a small write-ahead log for conflicting-transaction handling
+        (marking a transaction conflicting, and reversing that during a reorg). An intent row is written
+        <em>before</em> the work begins and deleted when it completes, so a crash mid-operation is replayed
+        cleanly on restart instead of leaving a conflict half-applied.</li>
+    </ul>
+    The “two tables” framing is about where the UTXO data — and every hot-path read and write — actually
+    lives; these auxiliary tables are rarely touched and exist only to make the background workers crash-safe.
   </div>
 
   <!-- ============================================================= -->
