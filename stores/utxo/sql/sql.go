@@ -166,7 +166,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, errors.NewStorageError("failed to init sql db", err)
 	}
 
-	switch storeURL.Scheme {
+	// "sqlpostgres" is an alias for "postgres": the UTXO-store factory re-registered
+	// the SQL Postgres store under "sqlpostgres" so the native postgres store could
+	// claim the bare "postgres" scheme. Normalise it here so schema creation and
+	// every downstream `s.engine == "postgres"` fast-path stay enabled.
+	engine := storeURL.Scheme
+	if engine == "sqlpostgres" {
+		engine = "postgres"
+	}
+
+	switch engine {
 	case "postgres":
 		if err = createPostgresSchema(db); err != nil {
 			return nil, errors.NewStorageError("failed to create postgres schema", err)
@@ -186,7 +195,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		settings:        tSettings,
 		db:              db,
 		storeURL:        storeURL,
-		engine:          storeURL.Scheme,
+		engine:          engine,
 		blockHeight:     atomic.Uint32{},
 		medianBlockTime: atomic.Uint32{},
 		ctx:             ctx,
@@ -239,7 +248,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Batches individual Create() calls into a single pgx.SendBatch with N CTEs,
 	// reducing N network round-trips to 1. background=true because each CTE inserts
 	// a unique transaction hash — no row overlap, no deadlock risk between batches.
-	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.StoreBatcherSize > 1 {
+	if s.engine == "postgres" && tSettings.UtxoStore.StoreBatcherSize > 1 {
 		storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
 		storeBatchDuration := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
 		s.createBatcher = batcher.NewWithPool(storeBatchSize, storeBatchDuration, s.sendCreateBatch, true, batcherOpts("sql_create")...)
@@ -252,7 +261,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	// Initialize unlock batcher for Postgres — batches single-hash SetLocked(false) calls.
-	if storeURL.Scheme == "postgres" && tSettings.UtxoStore.LockedBatcherSize > 1 {
+	if s.engine == "postgres" && tSettings.UtxoStore.LockedBatcherSize > 1 {
 		unlockBatchSize := tSettings.UtxoStore.LockedBatcherSize
 		unlockBatchDuration := time.Duration(tSettings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
 		s.unlockBatcher = batcher.NewWithPool(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true, batcherOpts("sql_unlock")...)
@@ -479,7 +488,7 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 	// setMined, so it would otherwise never be assigned a delete_at_height and
 	// would be retained forever. Expire it after the retention window. NULL for
 	// any other transaction.
-	deleteAtHeight := s.unspendableMinedTxDAH(tx, blockHeight, options, isCoinbase)
+	deleteAtHeight := s.unspendableMinedTxDAH(tx, blockHeight, options)
 
 	// Insert the transaction row...
 	q := `
@@ -601,7 +610,7 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 // be expired at creation: unmined, conflicting (handled separately), retention
 // disabled, or having at least one spendable output (those are expired via the
 // spend path once their spendable outputs are gone).
-func (s *Store) unspendableMinedTxDAH(tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions, isCoinbase bool) interface{} {
+func (s *Store) unspendableMinedTxDAH(tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) interface{} {
 	if options.Conflicting || len(options.MinedBlockInfos) == 0 {
 		return nil
 	}
@@ -612,7 +621,7 @@ func (s *Store) unspendableMinedTxDAH(tx *bt.Tx, blockHeight uint32, options *ut
 	}
 
 	for _, output := range tx.Outputs {
-		if output != nil && utxo.ShouldStoreOutputAsUTXO(isCoinbase, output, blockHeight) {
+		if output != nil && utxo.ShouldStoreOutputAsUTXO(output, blockHeight, s.settings.ChainCfgParams.GenesisActivationHeight) {
 			return nil
 		}
 	}
@@ -815,7 +824,7 @@ func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, 
 			// $23-$25: block_id arrays
 			blkArrs.blockID, blkArrs.blockHeight, blkArrs.subtreeIdx,
 			// $26: delete_at_height for a mined tx with no spendable outputs
-			s.unspendableMinedTxDAH(btTx, blockHeight, options, isCoinbase),
+			s.unspendableMinedTxDAH(btTx, blockHeight, options),
 		)
 		if execErr != nil {
 			return execErr
@@ -1117,7 +1126,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 				p.blkArrs.blockID, p.blkArrs.blockHeight,
 				p.blkArrs.subtreeIdx,
 				// $26: delete_at_height for a mined tx with no spendable outputs
-				s.unspendableMinedTxDAH(item.tx, item.blockHeight, item.options, p.isCoinbase),
+				s.unspendableMinedTxDAH(item.tx, item.blockHeight, item.options),
 			)
 		}
 
@@ -4882,6 +4891,26 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		return errors.NewStorageError("could not create px_outputs_unspent_by_parent index - [%+v]", err)
 	}
 
+	// conflict_intents is the conflict-resolution write-ahead log (#861). One row
+	// per in-flight ProcessConflicting / ReverseProcessConflicting operation,
+	// inserted before the operation's first state mutation and deleted once its
+	// terminal step commits. Rows that survive a restart drive replay. This table
+	// is intentionally NOT tied to transactions(id) — intents reference tx hashes,
+	// not row ids, and must outlive any individual transaction record.
+	if _, err := db.Exec(`
+      CREATE TABLE IF NOT EXISTS conflict_intents (
+         intent_id     BYTEA PRIMARY KEY
+        ,kind          TEXT NOT NULL
+        ,block_height  BIGINT NOT NULL
+        ,block_hash    BYTEA NOT NULL
+        ,tx_hashes     BYTEA NOT NULL
+        ,started_at    BIGINT NOT NULL
+	  );
+	`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create conflict_intents table - [%+v]", err)
+	}
+
 	return nil
 }
 
@@ -5177,6 +5206,22 @@ func createSqliteSchema(db *usql.DB) error {
 			_ = db.Close()
 			return errors.NewStorageError("could not add preserve_until column to transactions table - [%+v]", err)
 		}
+	}
+
+	// conflict_intents — conflict-resolution write-ahead log (#861). See the
+	// postgres schema for the rationale; SQLite mirror with BLOB columns.
+	if _, err := db.Exec(`
+      CREATE TABLE IF NOT EXISTS conflict_intents (
+         intent_id     BLOB PRIMARY KEY
+        ,kind          TEXT NOT NULL
+        ,block_height  BIGINT NOT NULL
+        ,block_hash    BLOB NOT NULL
+        ,tx_hashes     BLOB NOT NULL
+        ,started_at    BIGINT NOT NULL
+	  );
+	`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create conflict_intents table - [%+v]", err)
 	}
 
 	return nil

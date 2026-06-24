@@ -236,7 +236,7 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 	// PG version guard: COMMIT inside a PROCEDURE requires PostgreSQL 11+.
 	var verNum int
 	if err = s.pool.QueryRow(ctx, `SELECT current_setting('server_version_num')::int`).Scan(&verNum); err != nil {
-		return errors.NewStorageError("[dahSweep] read server_version_num: %v", err)
+		return errors.NewStorageError("[dahSweep] read server_version_num", err)
 	}
 
 	if verNum < 110000 {
@@ -263,13 +263,13 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 			return errors.NewStorageError("[dahSweep] app role lacks privilege to write dah_sweep_control (42501); grant it so the DAH sweep can run")
 		}
 
-		return errors.NewStorageError("[dahSweep] seed control knobs: %v", err)
+		return errors.NewStorageError("[dahSweep] seed control knobs", err)
 	}
 
 	// Recreate the procedure only when the stored version differs (either direction).
 	var storedVersion int
 	if err = s.pool.QueryRow(ctx, `SELECT proc_version FROM dah_sweep_control WHERE id = 1`).Scan(&storedVersion); err != nil {
-		return errors.NewStorageError("[dahSweep] read proc_version: %v", err)
+		return errors.NewStorageError("[dahSweep] read proc_version", err)
 	}
 
 	if storedVersion == dahSweepProcVersion {
@@ -286,11 +286,11 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 			return errors.NewStorageError("[dahSweep] app role lacks CREATE privilege for the dah_sweep_batch procedure (42501); grant CREATE so the DAH sweep can run")
 		}
 
-		return errors.NewStorageError("[dahSweep] create procedure: %v", err)
+		return errors.NewStorageError("[dahSweep] create procedure", err)
 	}
 
 	if _, err = s.pool.Exec(ctx, `UPDATE dah_sweep_control SET proc_version = $1 WHERE id = 1`, dahSweepProcVersion); err != nil {
-		return errors.NewStorageError("[dahSweep] record proc_version: %v", err)
+		return errors.NewStorageError("[dahSweep] record proc_version", err)
 	}
 
 	s.logger.Infof("[dahSweep] installed dah_sweep_batch procedure version %d", dahSweepProcVersion)

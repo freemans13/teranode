@@ -51,7 +51,6 @@ type Store struct {
 	// pruner service — lazily created per store instance (not a package global).
 	prunerService   pruner.Service
 	prunerServiceMu sync.Mutex
-
 }
 
 // batchSizeStats accumulates the real (post-trigger) batch sizes each batcher
@@ -96,9 +95,23 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	// Respect pool_max_conns from the connection URL when supplied; otherwise
-	// default to 100 (the batchers keep many connections busy under load).
+	// default to 80. Stock PostgreSQL ships max_connections=100; a higher default
+	// would claim the entire server budget and starve the maintenance pool, the
+	// superuser-reserved slots, and other consumers. pgxpool opens lazily, so this
+	// is only a ceiling. 80 stays >= the BatcherMaxConcurrent default (64) so the
+	// safety check below does not reject a stock default config.
 	if !pgxURL.Query().Has("pool_max_conns") {
-		pgxConfig.MaxConns = 100
+		pgxConfig.MaxConns = 80
+	}
+
+	// Guard against a batcher/pool concurrency mismatch that can deadlock the store —
+	// a single batcher exhausting the pool, every dispatch blocked on pgxpool.Acquire
+	// while PostgreSQL sits idle (the betfair-pc mainnet outage). Fail fast with an
+	// actionable message before opening any connection; warn on thin-but-workable headroom.
+	if warn, cerr := checkBatcherPoolConfig(pgxConfig.MaxConns, tSettings.UtxoStore.BatcherMaxConcurrent, numConnectionBatchers); cerr != nil {
+		return nil, cerr
+	} else if warn != "" {
+		logger.Warnf("%s", warn)
 	}
 
 	// Full durability — financial data requires synchronous_commit = on. Enforce it
@@ -122,8 +135,15 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	var maintPool *pgxpool.Pool
 	if mc := tSettings.UtxoStore.PostgresMaintenancePoolConns; mc > 0 {
 		maintConfig := pgxConfig.Copy()
-		maintConfig.MaxConns = int32(mc)            //nolint:gosec // small positive bound
-		maintConfig.MinConns = int32(numPartitions) // keep 8 warm so the fan-out CALLs/deletes never wait on a lazy dial
+		maintConfig.MaxConns = int32(mc) //nolint:gosec // small positive bound
+		// Keep numPartitions (8) warm so the fan-out CALLs/deletes never wait on a
+		// lazy dial — but never exceed MaxConns: pgxpool rejects MinConns > MaxConns,
+		// so a small mc (1..7) must clamp MinConns down rather than fail startup.
+		minConns := numPartitions
+		if mc < minConns {
+			minConns = mc
+		}
+		maintConfig.MinConns = int32(minConns) //nolint:gosec // small positive bound
 
 		maintPool, err = pgxpool.NewWithConfig(ctx, maintConfig)
 		if err != nil {

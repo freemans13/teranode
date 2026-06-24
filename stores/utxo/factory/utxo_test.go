@@ -170,6 +170,18 @@ func (m *MockUTXOStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash
 	return nil
 }
 
+func (m *MockUTXOStore) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	return nil
+}
+
+func (m *MockUTXOStore) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	return nil
+}
+
+func (m *MockUTXOStore) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	return nil, nil
+}
+
 func (m *MockUTXOStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	args := m.Called(ctx, txHashes, onLongestChain)
 	return args.Error(0)

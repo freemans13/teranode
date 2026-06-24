@@ -335,6 +335,27 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	return err
 }
 
+func (s *Store) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	err := s.store.BeginConflictIntent(ctx, intent)
+	s.logger.Debugf("[UTXOStore][logger][BeginConflictIntent] kind %s height %d hashes %v err %v : %s", intent.Kind, intent.BlockHeight, intent.TxHashes, err, caller())
+
+	return err
+}
+
+func (s *Store) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	err := s.store.CompleteConflictIntent(ctx, intentID)
+	s.logger.Debugf("[UTXOStore][logger][CompleteConflictIntent] intentID %s err %v : %s", intentID, err, caller())
+
+	return err
+}
+
+func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	intents, err := s.store.PendingConflictIntents(ctx)
+	s.logger.Debugf("[UTXOStore][logger][PendingConflictIntents] count %d err %v : %s", len(intents), err, caller())
+
+	return intents, err
+}
+
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	err := s.store.MarkTransactionsOnLongestChain(ctx, txHashes, onLongestChain)
 	s.logger.Debugf("[UTXOStore][logger][MarkTransactionsOnLongestChain] txHashes %v onLongestChain %v err %v : %s", txHashes, onLongestChain, err, caller())

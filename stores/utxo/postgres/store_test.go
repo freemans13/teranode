@@ -731,6 +731,50 @@ func TestSetConflicting(t *testing.T) {
 	require.False(t, got.Conflicting, "should not be conflicting after SetConflicting(false)")
 }
 
+// TestSetConflictingDoesNotStampPreservedRow verifies that marking a preserved tx conflicting does
+// NOT stamp delete_at_height while it is inside its preservation window (mirrors the DAH sweep's
+// preserve_until guard at dah_sweep.go:97 / dah_sweep_proc.go:162). The pruner deletes purely on the
+// stamp and never re-checks preserve_until (pruner_provider deleteTombstoned DESIGN CONTRACT), so
+// stamping a preserved row would tear it down before its preservation expires. The conflicting flag
+// is still applied; the DAH is deferred to ProcessExpiredPreservations. The control half confirms an
+// unpreserved conflicting tx is still stamped (the COALESCE/ELSE branch).
+func TestSetConflictingDoesNotStampPreservedRow(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	hash := tx.TxIDChainHash()[:]
+
+	readState := func() (conflicting bool, dah *int64) {
+		t.Helper()
+		require.NoError(t, store.pool.QueryRow(ctx,
+			`SELECT conflicting, delete_at_height FROM txs WHERE hash = $1`, hash).Scan(&conflicting, &dah))
+		return
+	}
+
+	// Preserved state: preserve_until set well into the future, delete_at_height cleared.
+	_, err = store.pool.Exec(ctx,
+		`UPDATE txs SET preserve_until = 1000000, delete_at_height = NULL WHERE hash = $1`, hash)
+	require.NoError(t, err)
+
+	_, _, err = store.SetConflicting(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true)
+	require.NoError(t, err)
+
+	conflicting, dah := readState()
+	require.True(t, conflicting, "conflicting flag must be set even while preserved")
+	require.Nil(t, dah, "preserved row must NOT be stamped with a delete_at_height when marked conflicting")
+
+	// Control: once the preservation is cleared, marking conflicting DOES stamp (ELSE/COALESCE branch).
+	_, err = store.pool.Exec(ctx, `UPDATE txs SET preserve_until = NULL WHERE hash = $1`, hash)
+	require.NoError(t, err)
+
+	_, _, err = store.SetConflicting(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true)
+	require.NoError(t, err)
+
+	_, dah = readState()
+	require.NotNil(t, dah, "unpreserved conflicting tx must be stamped for deletion")
+}
+
 func TestMarkTransactionsOnLongestChain(t *testing.T) {
 	store, ctx := setupTestStore(t)
 	parentTx := testExtendedTx(t)
@@ -993,10 +1037,12 @@ func TestUnsetMined(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, result[*txHash], "should have no block_ids after unset")
 
-	// Verify unmined_since is set after all block_ids removed.
+	// Verify unmined_since is set after all block_ids removed. The gold-standard
+	// value is blockHeight+1 (151) — matching the aerospike Lua and the sql store
+	// (s.blockHeight.Load() + 1), not the bare tip.
 	got, err = store.Get(ctx, txHash)
 	require.NoError(t, err)
-	require.Equal(t, uint32(150), got.UnminedSince, "should be unmined at current block height")
+	require.Equal(t, uint32(151), got.UnminedSince, "should be unmined at current block height + 1")
 }
 
 func TestUnsetMinedPartial(t *testing.T) {
@@ -1279,6 +1325,59 @@ func TestFreezeAndUnfreezeUTXOs(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestUnfreezeDoesNotSetTxLevelFrozen guards the per-output / whole-tx freeze
+// isolation. Freezing two outputs per-output must leave the tx-level `frozen`
+// gate false; unfreezing ONE of them must NOT flip `frozen` true just because
+// another output's bit is still set. The previous UnFreezeUTXOs recomputed
+// `frozen = (any out_frozens bit set)`, which spuriously froze the whole tx
+// (blocking every other, never-frozen output via the spend CTE's NOT tx_frozen).
+func TestUnfreezeDoesNotSetTxLevelFrozen(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// testExtendedTx has two outputs (vout 0 and 1).
+	tx := testExtendedTx(t)
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+	require.GreaterOrEqual(t, len(tx.Outputs), 2, "need a multi-output tx for this test")
+
+	hash0, err := util.UTXOHashFromOutput(txHash, tx.Outputs[0], 0)
+	require.NoError(t, err)
+	hash1, err := util.UTXOHashFromOutput(txHash, tx.Outputs[1], 1)
+	require.NoError(t, err)
+
+	// Freeze both outputs per-output.
+	require.NoError(t, store.FreezeUTXOs(ctx, []*utxo.Spend{
+		{TxID: txHash, Vout: 0, UTXOHash: hash0},
+		{TxID: txHash, Vout: 1, UTXOHash: hash1},
+	}, nil))
+
+	// tx-level frozen must remain false — FreezeUTXOs never touches it.
+	var txFrozen bool
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT frozen FROM txs WHERE hash = $1`, txHash[:]).Scan(&txFrozen))
+	require.False(t, txFrozen, "FreezeUTXOs must not set the whole-tx frozen gate")
+
+	// Unfreeze ONLY output 0; output 1's bit stays set.
+	require.NoError(t, store.UnFreezeUTXOs(ctx, []*utxo.Spend{
+		{TxID: txHash, Vout: 0, UTXOHash: hash0},
+	}, nil))
+
+	// The regression: tx-level frozen must STILL be false even though output 1's
+	// per-output bit remains set.
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT frozen FROM txs WHERE hash = $1`, txHash[:]).Scan(&txFrozen))
+	require.False(t, txFrozen, "unfreezing one output must not set the whole-tx frozen gate")
+
+	// Output 0's bit cleared, output 1's bit still set (per-output state intact).
+	var bit0, bit1 bool
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT get_bit(out_frozens, 0) = 1, get_bit(out_frozens, 1) = 1 FROM txs WHERE hash = $1`, txHash[:]).Scan(&bit0, &bit1))
+	require.False(t, bit0, "output 0 should be unfrozen")
+	require.True(t, bit1, "output 1 should remain frozen")
+}
+
 func TestReAssignUTXO(t *testing.T) {
 	store, ctx := setupTestStore(t)
 
@@ -1315,6 +1414,43 @@ func TestReAssignUTXO(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, outputFrozen, "should be unfrozen after reassign")
 	require.Equal(t, newHash[:], storedUtxoHash)
+}
+
+// TestReAssignUTXOSpendableInAtVoutGE1 pins the reassign maturity gate for outputs
+// at vout >= 1. spendable_ins is NULL on create and written only by ReAssignUTXO;
+// a bare `spendable_ins[vout+1] = v` on a NULL array yields a length-1 array with
+// lower bound vout+1, so the reader guard `array_length(spendable_ins,1) >= vout+1`
+// is false for vout >= 1 and the spendable-after height is silently dropped —
+// making the reassigned UTXO immediately spendable instead of after the delay.
+func TestReAssignUTXOSpendableInAtVoutGE1(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	tx := testExtendedTx(t)
+	require.GreaterOrEqual(t, len(tx.Outputs), 2, "need a vout>=1 output to exercise the bug")
+	_, err := store.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	require.NoError(t, store.SetBlockHeight(200))
+
+	txHash := tx.TxIDChainHash()
+	const vout = uint32(1)
+	utxoHash, err := util.UTXOHashFromOutput(txHash, tx.Outputs[vout], vout)
+	require.NoError(t, err)
+	src := &utxo.Spend{TxID: txHash, Vout: vout, UTXOHash: utxoHash}
+
+	require.NoError(t, store.FreezeUTXOs(ctx, []*utxo.Spend{src}, nil))
+
+	newHash := chainhash.HashH([]byte("reassign-vout1"))
+	require.NoError(t, store.ReAssignUTXO(ctx, src, &utxo.Spend{UTXOHash: &newHash}, nil))
+
+	// Read spendable_in exactly as the spend/get path does (get.go:380).
+	var spendableIn *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT CASE WHEN array_length(spendable_ins, 1) >= $2::int + 1 THEN spendable_ins[$2::int + 1] END
+		   FROM txs WHERE hash = $1`, txHash[:], int32(vout)).Scan(&spendableIn))
+
+	want := int64(200 + utxo.ReAssignedUtxoSpendableAfterBlocks)
+	require.NotNil(t, spendableIn, "reassigned vout>=1 must record the spendable-after height, not NULL")
+	require.Equal(t, want, *spendableIn, "spendable_in must be block_height + ReAssignedUtxoSpendableAfterBlocks")
 }
 
 // ---------------------------------------------------------------------------

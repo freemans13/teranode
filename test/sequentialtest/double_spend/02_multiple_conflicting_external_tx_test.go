@@ -104,8 +104,8 @@ func testMarkAsConflictingMultipleExternalTx(t *testing.T, utxoStore string) {
 	t.Log("Successfully verified multiple conflicting external transactions in different blocks")
 }
 
-func TestMarkAsConflictingMultipleExternalTxSqlQueue(t *testing.T) {
+func TestMarkAsConflictingMultipleExternalTxSqlPostgres(t *testing.T) {
 	t.Run("multiple_conflicting_external_txs_in_different_blocks", func(t *testing.T) {
-		testMarkAsConflictingMultipleExternalTx(t, "postgres")
+		testMarkAsConflictingMultipleExternalTx(t, "sqlpostgres")
 	})
 }

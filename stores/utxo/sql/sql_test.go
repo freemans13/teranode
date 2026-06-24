@@ -949,6 +949,21 @@ func Test_SmokeTests(t *testing.T) {
 		tests.Conflicting(t, db)
 	})
 
+	t.Run("sql conflict WAL", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		tests.ConflictWAL(t, db)
+	})
+
+	t.Run("sql unspend idempotent", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.UnspendIdempotent(t, db)
+	})
+
 	t.Run("spend error types", func(t *testing.T) {
 		db, _ := setup(ctx, t)
 

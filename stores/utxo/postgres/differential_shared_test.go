@@ -7,9 +7,12 @@ import (
 )
 
 // These wire the shared gold-standard differential tests (defined in
-// stores/utxo/tests/tests.go) to the postgres backend. They are expected to
-// PASS on aerospike and sql and currently FAIL on postgres, pinpointing the
-// divergences found while reviewing PR #684.
+// stores/utxo/tests/tests.go) to the postgres backend. Each pins a divergence
+// found while reviewing PR #684 where the postgres store originally disagreed
+// with the aerospike/sql gold standard. Those divergences have since been fixed
+// in this PR, so these now act as regression/parity tests: they must PASS on
+// postgres exactly as they do on aerospike and sql. The per-test comments below
+// record the original postgres bug each one guards against.
 
 // TestSetMinedUnsetOnMissingTx_Postgres: SetMinedMulti(UnsetMined=true) on a
 // missing tx must be a tolerated no-op (Interface.go:295-303). Postgres returns

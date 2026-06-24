@@ -453,20 +453,20 @@ func testLongestChainInvalidateFork(t *testing.T, utxoStore string) {
 	td.VerifyOnLongestChainInUtxoStore(t, childTx3DS)
 }
 
-func TestLongestChainForkSqlQueue(t *testing.T) {
+func TestLongestChainForkSqlPostgres(t *testing.T) {
 	t.Run("fork different tx inclusion", func(t *testing.T) {
-		testLongestChainForkDifferentTxInclusion(t, "postgres")
+		testLongestChainForkDifferentTxInclusion(t, "sqlpostgres")
 	})
 
 	t.Run("transaction chain dependency", func(t *testing.T) {
-		testLongestChainTransactionChainDependency(t, "postgres")
+		testLongestChainTransactionChainDependency(t, "sqlpostgres")
 	})
 
 	t.Run("with double spend transaction", func(t *testing.T) {
-		testLongestChainWithDoubleSpendTransaction(t, "postgres")
+		testLongestChainWithDoubleSpendTransaction(t, "sqlpostgres")
 	})
 
 	// t.Run("invalidate fork", func(t *testing.T) {
-	// 	testLongestChainInvalidateFork(t, "postgres")
+	// 	testLongestChainInvalidateFork(t, "sqlpostgres")
 	// })
 }

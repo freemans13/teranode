@@ -191,6 +191,24 @@ func (m *MockStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, se
 	return args.Error(0)
 }
 
+func (m *MockStore) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	args := m.Called(ctx, intent)
+	return args.Error(0)
+}
+
+func (m *MockStore) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	args := m.Called(ctx, intentID)
+	return args.Error(0)
+}
+
+func (m *MockStore) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]utxo.ConflictIntent), args.Error(1)
+}
+
 func (m *MockStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	args := m.Called(ctx, txHashes, onLongestChain)
 	return args.Error(0)

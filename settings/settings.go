@@ -176,6 +176,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseSeparateUDFMinedModule:       getBool("aerospike_use_separate_udf_mined_module", false, alternativeContext...),
 			SeparateSpendUDFModuleCount:     getInt("aerospike_separate_udf_spend_module_count", 0, alternativeContext...),
 			SemaphoreMultiplier:             getFloat64("aerospike_semaphore_multiplier", 1.0, alternativeContext...),
+			OverloadRetryMaxElapsed:         getDuration("aerospike_overload_retry_max_elapsed", 2*time.Minute, alternativeContext...),
+			OverloadRetryBaseBackoff:        getDuration("aerospike_overload_retry_base_backoff", 50*time.Millisecond, alternativeContext...),
+			OverloadRetryMaxBackoff:         getDuration("aerospike_overload_retry_max_backoff", 5*time.Second, alternativeContext...),
 		},
 		Alert: AlertSettings{
 			GenesisKeys:   getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),
@@ -479,6 +482,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PostgresDAHSweepCallTimeoutSeconds:      getInt("utxostore_postgresDAHSweepCallTimeoutSeconds", 120, alternativeContext...),
 			PostgresDAHSweepConcurrency:             getInt("utxostore_postgresDAHSweepConcurrency", 1, alternativeContext...),
 			PostgresMaintenancePoolConns:            getInt("utxostore_postgresMaintenancePoolConns", 0, alternativeContext...),
+			PostgresCreateBatchMaxBytes:             getInt("utxostore_postgresCreateBatchMaxBytes", 536870912, alternativeContext...),
 			StoreBatcherTickerIntervalMillis:        getInt("utxostore_storeBatcherTickerIntervalMillis", 0, alternativeContext...),
 			GetBatcherTickerIntervalMillis:          getInt("utxostore_getBatcherTickerIntervalMillis", 0, alternativeContext...),
 			SpendBatcherTickerIntervalMillis:        getInt("utxostore_spendBatcherTickerIntervalMillis", 0, alternativeContext...),

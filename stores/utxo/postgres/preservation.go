@@ -56,7 +56,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		allArgs := append([]interface{}{int32(preserveUntilHeight)}, args...) // preserve_until is INT4
 		result, err := s.pool.Exec(ctx, q, allArgs...)
 		if err != nil {
-			return errors.NewStorageError("[PreserveTransactions] failed to preserve chunk: %v", err)
+			return errors.NewStorageError("[PreserveTransactions] failed to preserve chunk", err)
 		}
 
 		totalAffected += result.RowsAffected()

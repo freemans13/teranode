@@ -120,19 +120,25 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, _ *sett
 		if _, err := voutToInt32(spend.Vout); err != nil {
 			return err
 		}
-		// Clear the bit and recompute txs.frozen in ONE guarded statement. The WHERE
-		// requires the bit to be currently SET, making the UPDATE the sole source of
-		// truth: a 0-row result means the output is not frozen or the tx no longer
-		// exists. We surface that as a typed error rather than a silent no-op —
-		// matching aerospike's unfreeze UDF (which returns TX_NOT_FOUND /
-		// UTXO_NOT_FROZEN) and removing the prior TOCTOU between a separate
-		// frozen-check read and this write. txs.frozen is true iff any bit remains
-		// set; both set_bit calls read the OLD column value so the comparison is
-		// consistent.
+		// Clear the per-output bit in ONE guarded statement. The WHERE requires the
+		// bit to be currently SET, making the UPDATE the sole source of truth: a
+		// 0-row result means the output is not frozen or the tx no longer exists. We
+		// surface that as a typed error rather than a silent no-op — matching
+		// aerospike's unfreeze UDF (which returns TX_NOT_FOUND / UTXO_NOT_FROZEN) and
+		// removing the prior TOCTOU between a separate frozen-check read and this
+		// write.
+		//
+		// We DELIBERATELY do NOT touch the tx-level `frozen` column here, symmetric
+		// with FreezeUTXOs (see its comment). `frozen` is the whole-tx freeze gate,
+		// set only at create via WithFrozen, and is independent of the per-output
+		// out_frozens bitmap. Recomputing it from the bitmap conflated the two:
+		// unfreezing one output of a tx with another still-frozen output would flip
+		// the whole-tx gate true and block every (never-frozen) output — and would
+		// also silently drop a genuine create-time whole-tx freeze. Both aerospike
+		// and the sql store keep the two concepts fully separate.
 		tag, err := s.pool.Exec(ctx, `
 			UPDATE txs
-			SET out_frozens = set_bit(out_frozens, $2::int, 0),
-			    frozen = (set_bit(out_frozens, $2::int, 0) <> decode(repeat('00', length(out_frozens)), 'hex'))
+			SET out_frozens = set_bit(out_frozens, $2::int, 0)
 			WHERE hash = $1 AND $2::int < out_count
 			  AND out_frozens IS NOT NULL AND get_bit(out_frozens, $2::int) = 1
 		`, spend.TxID[:], spend.Vout)
@@ -167,17 +173,33 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 
 	// Update the packed columns in ONE statement: splice the new 32-byte utxo
 	// hash into the flat utxo_hashes (overlay at byte offset vout*32, 1-based),
-	// clear the frozen bit, set spendable_in for this slot (kept as an INT[]),
-	// and recompute txs.frozen from the new bitmap — so a concurrent Get/Spend
-	// never observes a torn state. Reassignment does NOT mutate out_spendables,
-	// so spendable_count is intentionally left untouched.
+	// clear the per-output frozen bit, and rebuild spendable_ins as a contiguous
+	// 1-based INT[] of length out_count with this slot set (preserving any prior
+	// reassignments) — so a concurrent Get/Spend never observes a torn state. The
+	// rebuild is required because a bare `spendable_ins[vout+1] = v` on the NULL
+	// create-time array yields a length-1 array at lower bound vout+1, which the
+	// readers' `array_length(spendable_ins,1) >= vout+1` guard then misses for
+	// vout >= 1 (dropping the maturity gate; see TestReAssignUTXOSpendableInAtVoutGE1).
+	// Reassignment does NOT mutate out_spendables, so spendable_count is
+	// intentionally left untouched. As in UnFreezeUTXOs, we DELIBERATELY do NOT
+	// recompute the tx-level `frozen` column from the bitmap: it is the create-time
+	// whole-tx gate and is independent of the per-output out_frozens (both aerospike
+	// and the sql store keep them separate).
 	si := int32(spendableIn)
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE txs
 		SET utxo_hashes = overlay(utxo_hashes placing $3::bytea from $2::int * 32 + 1 for 32),
 		    out_frozens = set_bit(out_frozens, $2::int, 0),
-		    spendable_ins[$2::int + 1] = $4,
-		    frozen = (set_bit(out_frozens, $2::int, 0) <> decode(repeat('00', length(out_frozens)), 'hex'))
+		    spendable_ins = (
+		        SELECT array_agg(
+		            CASE WHEN g = $2::int THEN $4::int
+		                 WHEN spendable_ins IS NOT NULL
+		                      AND g + 1 BETWEEN array_lower(spendable_ins, 1) AND array_upper(spendable_ins, 1)
+		                 THEN spendable_ins[g + 1]
+		                 ELSE NULL::int END
+		            ORDER BY g)
+		        FROM generate_series(0, out_count - 1) AS g
+		    )
 		WHERE hash = $1 AND $2::int < out_count
 		  AND out_frozens IS NOT NULL AND get_bit(out_frozens, $2::int) = 1
 	`, utxoSpend.TxID[:], utxoSpend.Vout, newUtxo.UTXOHash[:], si)

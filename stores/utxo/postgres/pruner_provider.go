@@ -259,9 +259,25 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	// If you change any code that writes delete_at_height, THAT is where eligibility
 	// belongs — not here.
 	//
-	// Snapshot note: the doomed predicate runs in the SAME statement/snapshot as the
-	// DELETE, so a concurrent Unspend that clears the stamp is honoured (the revived
-	// tx is simply not selected); each loop iteration re-evaluates from scratch.
+	// Reorg vs prune — a known race we deliberately do NOT defend against here:
+	// In theory the pruner could delete a tx at the same instant a reorg Unspend
+	// revives it. In practice the two can never touch the same tx. A tx only becomes
+	// prune-eligible `retention` blocks after it settled (delete_at_height =
+	// completion + 1 + retention; see above), whereas a realistic reorg is 1–2 blocks
+	// deep — so a prune-eligible tx is hundreds of blocks older than the deepest block
+	// any reorg can reach. The prune-eligible set and the reorg-reachable set overlap
+	// ONLY if retention is configured below the reorg depth, i.e. a catastrophic
+	// misconfiguration. (Default retention is ~2 days of blocks.)
+	//
+	// We intentionally keep this simple rather than chase the window: a delete-time
+	// re-check of delete_at_height is only a one-sided half-guard (it does nothing
+	// when the DELETE wins the race and the later Unspend finds no row to revive), and
+	// truly serialising prune against reorg is real complexity for a state the
+	// retention margin already makes unreachable. The one invariant that keeps us safe:
+	//
+	//     retention MUST stay well above the deepest expected reorg.
+	//
+	// Hold that and this is a non-issue. Do NOT add per-row delete-time guards back.
 	// ──────────────────────────────────────────────────────────────────────
 	cascadeSQL := fmt.Sprintf(`
 		WITH doomed AS (
@@ -284,7 +300,7 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		// a native int4 comparison on the BRIN-indexed column.
 		tag, err := s.store.maint().Exec(ctx, cascadeSQL, int32(blockHeight), int64(pruneDeleteBatchSize))
 		if err != nil {
-			return deleted, errors.NewStorageError("[pruner] cascade delete %s: %v", txsLeaf, err)
+			return deleted, errors.NewStorageError("[pruner] cascade delete %s", txsLeaf, err)
 		}
 
 		// RowsAffected is the count of txs parent rows removed this batch, which

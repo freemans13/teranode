@@ -254,8 +254,8 @@ func testComplexForkGrandparentConflict(t *testing.T, utxoStore string) {
 	td.VerifyInBlockAssembly(t, parentSibling)
 }
 
-func TestComplexForkGrandparentConflictSqlQueue(t *testing.T) {
+func TestComplexForkGrandparentConflictSqlPostgres(t *testing.T) {
 	t.Run("complex_fork_grandparent_conflict", func(t *testing.T) {
-		testComplexForkGrandparentConflict(t, "postgres")
+		testComplexForkGrandparentConflict(t, "sqlpostgres")
 	})
 }

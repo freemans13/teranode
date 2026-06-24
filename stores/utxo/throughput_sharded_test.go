@@ -3,6 +3,7 @@ package utxo_test
 import (
 	"context"
 	"net/url"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -57,7 +58,10 @@ func cleanDBAt(t *testing.T, dsn string) {
 	_, _ = pool.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid != pg_backend_pid()`)
 	_, _ = pool.Exec(ctx, `
 		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
-			tx_state, transactions, txs, txs_raw, dah_watermark CASCADE;
+			tx_state, transactions, txs, txs_raw,
+			dah_watermark, dah_part_watermark, dah_sweep_control CASCADE;
+		DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT) CASCADE;
+		DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT) CASCADE;
 	`)
 }
 
@@ -67,7 +71,10 @@ func newPrunedQueueStoreAt(t *testing.T, dsn string) (*pgstore.Store, func()) {
 	cleanDBAt(t, dsn)
 	ctx := context.Background()
 
-	storeURL, _ := url.Parse(dsn)
+	storeURL, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn %q: %v", dsn, err)
+	}
 	storeURL.Scheme = "postgres"
 
 	tSettings := test.CreateBaseTestSettings(t)
@@ -135,6 +142,9 @@ func (s *shardedStore) Get(ctx context.Context, hash *chainhash.Hash, f ...field
 // children spend outputs of exactly one parent; a production router would have
 // to split a tx's inputs across shards.
 func (s *shardedStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, flags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	if len(tx.Inputs) == 0 {
+		return s.shards[0].Spend(ctx, tx, blockHeight, flags...) // no inputs: pick a deterministic shard rather than panic
+	}
 	return s.shardFor(tx.Inputs[0].PreviousTxIDChainHash()).Spend(ctx, tx, blockHeight, flags...)
 }
 
@@ -242,7 +252,19 @@ func (p *shardedPruner) AddObserver(o pruner.Observer) {
 // NOTE: the rep-line table telemetry (txs_rows/stamped) and the table-size gate
 // poll only shard 0's statPool, so the gate's effective TOTAL cap is ~2x the
 // single-instance run's — read absolute table numbers as per-shard.
+// requireThroughputEnabled skips the multi-instance sharded throughput harnesses
+// unless THROUGHPUT_ENABLE=1. They are deliberate, very expensive perf probes
+// (multiple local postgres instances, long runs) that should not fire on a plain
+// `go test ./...` just because a local postgres happens to be reachable.
+func requireThroughputEnabled(t *testing.T) {
+	t.Helper()
+	if os.Getenv("THROUGHPUT_ENABLE") != "1" {
+		t.Skip("sharded throughput harness disabled; set THROUGHPUT_ENABLE=1 to run")
+	}
+}
+
 func TestThroughput_QueueStorePruned2Shard(t *testing.T) {
+	requireThroughputEnabled(t)
 	terminateOtherConnections(t)
 	cfg := defaultStableCfg()
 
@@ -274,6 +296,7 @@ func TestThroughput_QueueStorePruned2Shard(t *testing.T) {
 // instances (5432/5433/5434). Probes whether a third WAL stream/checkpointer
 // still buys contention relief or whether total CPU is already the wall.
 func TestThroughput_QueueStorePruned3Shard(t *testing.T) {
+	requireThroughputEnabled(t)
 	terminateOtherConnections(t)
 	cfg := defaultStableCfg()
 

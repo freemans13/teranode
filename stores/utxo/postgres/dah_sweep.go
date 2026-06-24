@@ -121,7 +121,7 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 		FROM eligible e WHERE t.hash = e.hash`,
 		lo, hi, limit, int32(retention))
 	if err != nil {
-		return 0, errors.NewStorageError("[dahBackstop] [%d,%d]: %v", loByte, hiByte, err)
+		return 0, errors.NewStorageError("[dahBackstop] [%d,%d]", loByte, hiByte, err)
 	}
 	return int(tag.RowsAffected()), nil
 }
@@ -138,7 +138,7 @@ func (s *Store) RewindDAHWatermark(ctx context.Context, forkHeight int64) error 
 		`UPDATE dah_part_watermark SET last_swept_height = $1 WHERE last_swept_height > $1`,
 		forkHeight,
 	); err != nil {
-		return errors.NewStorageError("[dahSweep] rewind watermark to %d: %v", forkHeight, err)
+		return errors.NewStorageError("[dahSweep] rewind watermark to %d", forkHeight, err)
 	}
 
 	return nil

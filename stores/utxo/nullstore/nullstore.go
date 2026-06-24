@@ -228,6 +228,18 @@ func (m *NullStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, se
 	return nil
 }
 
+func (m *NullStore) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	return nil
+}
+
+func (m *NullStore) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	return nil
+}
+
+func (m *NullStore) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	return nil, nil
+}
+
 func (m *NullStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	return nil
 }

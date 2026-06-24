@@ -35,7 +35,10 @@
 package utxo
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"sort"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -56,6 +59,75 @@ const ReAssignedUtxoSpendableAfterBlocks = 1_000
 type BlockState struct {
 	Height     uint32 // Current block height
 	MedianTime uint32 // Median time of recent blocks
+}
+
+// ConflictIntentKind identifies the direction of a conflict-resolution
+// operation recorded in the write-ahead log.
+type ConflictIntentKind string
+
+const (
+	// ConflictIntentForward records a ProcessConflicting invocation.
+	ConflictIntentForward ConflictIntentKind = "forward"
+
+	// ConflictIntentReverse records a ReverseProcessConflicting invocation.
+	ConflictIntentReverse ConflictIntentKind = "reverse"
+)
+
+// ConflictIntent is a write-ahead-log record describing one in-flight
+// conflict-resolution operation (ProcessConflicting or
+// ReverseProcessConflicting). It is persisted durably BEFORE the operation's
+// first state mutation and removed once the operation's terminal step
+// completes, so a process kill between any two steps can be detected and the
+// operation replayed on restart. See ProcessConflicting / ReverseProcessConflicting.
+type ConflictIntent struct {
+	// Kind is the operation direction: forward = ProcessConflicting,
+	// reverse = ReverseProcessConflicting.
+	Kind ConflictIntentKind
+
+	// BlockHeight is the block height the operation was invoked with.
+	BlockHeight uint32
+
+	// BlockHash is the hash of the block whose movement triggered the operation
+	// — the moved-forward block for a forward intent, the moved-back block for a
+	// reverse intent. Startup replay gates on this block's chain membership so a
+	// stale intent (whose block was reorged out from under it) is discarded rather
+	// than blindly re-applied, which would undo a later, valid reorg.
+	BlockHash chainhash.Hash
+
+	// TxHashes is the operation's input hash slice — conflictingTxHashes for
+	// forward, demotedTxHashes for reverse.
+	TxHashes []chainhash.Hash
+
+	// StartedAt is the unix-nanosecond timestamp the intent was recorded.
+	StartedAt int64
+}
+
+// IntentID derives a deterministic identifier for the intent from its kind,
+// block hash, block height and the (sorted) set of tx hashes. Two invocations
+// with the same (kind, block, height, hashes) yield the same id, which makes
+// BeginConflictIntent idempotent across a crash-retry of the same operation
+// and lets startup replay deduplicate naturally. The hash ordering is
+// normalised so callers need not pre-sort.
+func (ci ConflictIntent) IntentID() chainhash.Hash {
+	sorted := make([]chainhash.Hash, len(ci.TxHashes))
+	copy(sorted, ci.TxHashes)
+	sort.Slice(sorted, func(i, j int) bool {
+		return bytes.Compare(sorted[i][:], sorted[j][:]) < 0
+	})
+
+	buf := make([]byte, 0, len(ci.Kind)+chainhash.HashSize+4+len(sorted)*chainhash.HashSize)
+	buf = append(buf, []byte(ci.Kind)...)
+	buf = append(buf, ci.BlockHash[:]...)
+
+	var heightBytes [4]byte
+	binary.BigEndian.PutUint32(heightBytes[:], ci.BlockHeight)
+	buf = append(buf, heightBytes[:]...)
+
+	for i := range sorted {
+		buf = append(buf, sorted[i][:]...)
+	}
+
+	return chainhash.HashH(buf)
 }
 
 // Spend represents a UTXO spending operation, containing both the UTXO being spent
@@ -397,6 +469,27 @@ type Store interface {
 
 	// SetLocked marks transactions as locked for spending.
 	SetLocked(ctx context.Context, txHashes []chainhash.Hash, value bool) error
+
+	// conflict-resolution write-ahead log (crash safety for ProcessConflicting /
+	// ReverseProcessConflicting — see #861)
+
+	// BeginConflictIntent durably records a conflict-resolution intent BEFORE the
+	// operation's first state mutation. It MUST be committed durably before
+	// returning. Recording the same intent id more than once is idempotent (the
+	// id is deterministic over kind+height+hashes), so a crash-retry of the same
+	// operation does not create a duplicate. A non-nil error MUST abort the
+	// caller — the operation must not proceed without a durable intent record.
+	BeginConflictIntent(ctx context.Context, intent ConflictIntent) error
+
+	// CompleteConflictIntent deletes the intent record identified by intentID
+	// after the operation's terminal step has committed. Removing an
+	// already-absent intent is idempotent (no error).
+	CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error
+
+	// PendingConflictIntents returns every intent that was begun but not yet
+	// completed — i.e. operations that may have been interrupted by a crash.
+	// Called once at BlockAssembler startup to drive replay.
+	PendingConflictIntents(ctx context.Context) ([]ConflictIntent, error)
 
 	// MarkTransactionsOnLongestChain marks transactions as being on the longest chain or not.
 	// When onLongestChain is true, the unminedSince field is unset (transaction is mined).

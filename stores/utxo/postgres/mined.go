@@ -46,16 +46,21 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	// This eliminates per-chunk round-trip latency.
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, errors.NewStorageError("[SetMinedMulti] acquire connection: %v", err)
+		return nil, errors.NewStorageError("[SetMinedMulti] acquire connection", err)
 	}
 	defer conn.Release()
 
 	batch := &pgx.Batch{}
 
 	// Queue UPDATE chunks.
-	// Simple array append — no idempotency check. Duplicates only occur on crash
-	// recovery (same block re-processed). UnsetMined removes all matching entries
-	// so duplicates are harmless.
+	// Idempotent block append: a `block_ids @> $2` containment guard skips the
+	// append (on all three parallel arrays together, so they stay index-aligned)
+	// when this block id is already recorded. Re-processing the same block for the
+	// same tx (crash-recovery replay, retry, duplicate call) is then a no-op rather
+	// than appending a duplicate (block_id, block_height, subtree_idx) triple that
+	// Get/BatchDecorate would surface verbatim. Mirrors the aerospike (blockExists)
+	// and sql (ON CONFLICT DO NOTHING) stores, and the create.go conflicting-children
+	// @> pattern.
 	retention := int32(s.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
 
 	var updateSQL string
@@ -78,9 +83,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// concurrent SetBlockHeight, and (b) preserves a single prepared-plan
 		// cache entry across heights (a literal would re-plan per height).
 		updateSQL = `UPDATE txs SET
-				block_ids = COALESCE(block_ids, '{}') || $2::int[],
-				block_heights = COALESCE(block_heights, '{}') || $3::int[],
-				subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
+				block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
+				block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
+				subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
 				locked = false, unmined_since = NULL,
 				mined_at_height = $5,
 				delete_at_height = CASE
@@ -92,9 +97,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 			RETURNING hash, block_ids`
 	} else {
 		updateSQL = `UPDATE txs SET
-			block_ids = COALESCE(block_ids, '{}') || $2::int[],
-			block_heights = COALESCE(block_heights, '{}') || $3::int[],
-			subtree_idxs = COALESCE(subtree_idxs, '{}') || $4::int[],
+			block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
+			block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
+			subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
 			locked = false
 		WHERE hash = ANY($1)
 		RETURNING hash, block_ids`
@@ -138,7 +143,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		rows, err := br.Query()
 		if err != nil {
 			br.Close()
-			return nil, errors.NewStorageError("[SetMinedMulti] UPDATE chunk %d: %v", i, err)
+			return nil, errors.NewStorageError("[SetMinedMulti] UPDATE chunk %d", i, err)
 		}
 		for rows.Next() {
 			var h []byte
@@ -146,7 +151,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 			if err := rows.Scan(&h, &bids); err != nil {
 				rows.Close()
 				br.Close()
-				return nil, errors.NewStorageError("[SetMinedMulti] scan block_ids chunk %d: %v", i, err)
+				return nil, errors.NewStorageError("[SetMinedMulti] scan block_ids chunk %d", i, err)
 			}
 			var ch chainhash.Hash
 			copy(ch[:], h)
@@ -162,7 +167,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		if err := rows.Err(); err != nil {
 			rows.Close()
 			br.Close()
-			return nil, errors.NewStorageError("[SetMinedMulti] iterate block_ids chunk %d: %v", i, err)
+			return nil, errors.NewStorageError("[SetMinedMulti] iterate block_ids chunk %d", i, err)
 		}
 		rows.Close()
 	}
@@ -204,12 +209,16 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, blockID uint32, blockHeight uint32) (map[chainhash.Hash][]uint32, error) {
 	resultMap := make(map[chainhash.Hash][]uint32, len(hashes))
 
-	// unmined_since is INT4 (heights < 2^31). Floor at 1: a stored unmined_since of 0
-	// is indistinguishable at the meta layer from "mined" — NULL (mined) and 0 both
-	// map to UnminedSince==0 in getInternal — so a reorg processed before the first
-	// SetBlockHeight (tip still 0) must not write 0, or a reorged-out tx would look
-	// mined (and be wrongly prune-eligible via unmined_since <= cutoff at any height).
-	currentBlockHeight := int32(s.blockHeight.Load())
+	// unmined_since is INT4 (heights < 2^31). Use blockHeight + 1, matching the
+	// aerospike Lua (unmined_since = currentBlockHeight) and the sql store
+	// (sql.go: s.blockHeight.Load() + 1) so a reorged-out tx is classified
+	// identically across backends — a bare blockHeight.Load() made it one block low
+	// and thus prune-eligible one block earlier than the gold standard. Floor at 1:
+	// a stored unmined_since of 0 is indistinguishable at the meta layer from
+	// "mined" — NULL (mined) and 0 both map to UnminedSince==0 in getInternal — so
+	// the value must never be 0 (the +1 already guarantees this for tip >= 0, but
+	// keep the explicit floor as a guard).
+	currentBlockHeight := int32(s.blockHeight.Load()) + 1
 	if currentBlockHeight < 1 {
 		currentBlockHeight = 1
 	}
@@ -218,7 +227,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	// txs commits all-or-nothing rather than leaving some rows updated on failure.
 	pgxTx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, errors.NewStorageError("[UnsetMined] begin: %v", err)
+		return nil, errors.NewStorageError("[UnsetMined] begin", err)
 	}
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
@@ -291,7 +300,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 				resultMap[*hash] = []uint32{}
 				continue
 			}
-			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s: %v", hash, err)
+			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s", hash, err)
 		}
 
 		// Build result.
@@ -303,7 +312,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	}
 
 	if err := pgxTx.Commit(ctx); err != nil {
-		return nil, errors.NewStorageError("[UnsetMined] commit: %v", err)
+		return nil, errors.NewStorageError("[UnsetMined] commit", err)
 	}
 
 	// Rewind the deferred-DAH sweep watermark to the reorged block's height so the

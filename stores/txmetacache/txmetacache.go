@@ -1024,6 +1024,22 @@ func (t *TxMetaCache) SetLocked(ctx context.Context, txHashes []chainhash.Hash, 
 	return t.utxoStore.SetLocked(ctx, txHashes, setValue)
 }
 
+// BeginConflictIntent delegates to the wrapped store. The conflict-resolution
+// write-ahead log lives in the durable backend, not the in-memory cache.
+func (t *TxMetaCache) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	return t.utxoStore.BeginConflictIntent(ctx, intent)
+}
+
+// CompleteConflictIntent delegates to the wrapped store.
+func (t *TxMetaCache) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	return t.utxoStore.CompleteConflictIntent(ctx, intentID)
+}
+
+// PendingConflictIntents delegates to the wrapped store.
+func (t *TxMetaCache) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	return t.utxoStore.PendingConflictIntents(ctx)
+}
+
 // MarkTransactionsOnLongestChain marks transactions as being on the longest chain or not.
 //
 // Parameters:

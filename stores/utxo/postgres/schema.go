@@ -80,7 +80,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 
 	for _, ddl := range ddlStatements {
 		if _, err := pool.Exec(ctx, ddl); err != nil {
-			return errors.NewStorageError("schema creation failed: %v\nDDL: %s", err, ddl)
+			return errors.NewStorageError("schema creation failed\nDDL: %s", ddl, err)
 		}
 	}
 
@@ -127,14 +127,14 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 				spec.name, i, spec.name, numPartitions, i, spec.fillfactor,
 			)
 			if _, err := pool.Exec(ctx, ddl); err != nil {
-				return errors.NewStorageError("partition creation failed for %s_p%02d: %v", spec.name, i, err)
+				return errors.NewStorageError("partition creation failed for %s_p%02d", spec.name, i, err)
 			}
 
 			// Idempotent: also back-fills partitions created before these settings
 			// existed. Set on the leaf (autovacuum ignores parent-level params).
 			av := fmt.Sprintf("ALTER TABLE %s_p%02d SET (%s)", spec.name, i, spec.autovacuum)
 			if _, err := pool.Exec(ctx, av); err != nil {
-				return errors.NewStorageError("autovacuum tuning failed for %s_p%02d: %v", spec.name, i, err)
+				return errors.NewStorageError("autovacuum tuning failed for %s_p%02d", spec.name, i, err)
 			}
 		}
 	}
@@ -171,7 +171,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 		for _, ddl := range idxStmts {
 			if _, err := pool.Exec(ctx, ddl); err != nil {
-				return errors.NewStorageError("height index creation failed: %v", err)
+				return errors.NewStorageError("height index creation failed", err)
 			}
 		}
 	}
@@ -185,7 +185,7 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 			fmt.Sprintf(`DROP INDEX IF EXISTS txs_p%02d_mined_at_height_brin`, i),
 		} {
 			if _, err := pool.Exec(ctx, ddl); err != nil {
-				return errors.NewStorageError("legacy mined_at_height index drop failed: %v", err)
+				return errors.NewStorageError("legacy mined_at_height index drop failed", err)
 			}
 		}
 	}
@@ -195,10 +195,10 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 			id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 			last_swept_height BIGINT NOT NULL DEFAULT 0
 		)`); err != nil {
-		return errors.NewStorageError("dah_watermark creation failed: %v", err)
+		return errors.NewStorageError("dah_watermark creation failed", err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO dah_watermark (id, last_swept_height) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`); err != nil {
-		return errors.NewStorageError("dah_watermark seed failed: %v", err)
+		return errors.NewStorageError("dah_watermark seed failed", err)
 	}
 
 	// Per-partition DAH sweep watermark: one row per hash partition so the 8
@@ -211,14 +211,14 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 			partition INT PRIMARY KEY CHECK (partition BETWEEN 0 AND %d),
 			last_swept_height BIGINT NOT NULL DEFAULT 0
 		)`, numPartitions-1)); err != nil {
-		return errors.NewStorageError("dah_part_watermark creation failed: %v", err)
+		return errors.NewStorageError("dah_part_watermark creation failed", err)
 	}
 	if _, err := pool.Exec(ctx, fmt.Sprintf(`
 		INSERT INTO dah_part_watermark (partition, last_swept_height)
 		SELECT g, COALESCE((SELECT last_swept_height FROM dah_watermark WHERE id = 1), 0)
 		FROM generate_series(0, %d) g
 		ON CONFLICT (partition) DO NOTHING`, numPartitions-1)); err != nil {
-		return errors.NewStorageError("dah_part_watermark seed failed: %v", err)
+		return errors.NewStorageError("dah_part_watermark seed failed", err)
 	}
 
 	// dah_sweep_control: kill switch, tunable knobs, proc version, and the
@@ -226,15 +226,33 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 	// Plain DDL, always created; the procedure itself is bootstrapped separately
 	// (bootstrapped separately in Store.createSchema).
 	if _, err := pool.Exec(ctx, dahSweepControlDDL); err != nil {
-		return errors.NewStorageError("dah_sweep_control creation failed: %v", err)
+		return errors.NewStorageError("dah_sweep_control creation failed", err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO dah_sweep_control (id) VALUES (1) ON CONFLICT (id) DO NOTHING`); err != nil {
-		return errors.NewStorageError("dah_sweep_control seed failed: %v", err)
+		return errors.NewStorageError("dah_sweep_control seed failed", err)
+	}
+
+	// conflict_intents: write-ahead log for crash-safe ProcessConflicting /
+	// ReverseProcessConflicting (see #861). One row per in-flight conflict-
+	// resolution operation, recorded BEFORE its first state mutation and removed
+	// once its terminal step commits; rows that survive a restart drive replay.
+	// Intentionally NOT tied to txs — intents reference tx hashes, not row ids,
+	// and must outlive any individual transaction record.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS conflict_intents (
+			intent_id     BYTEA PRIMARY KEY,
+			kind          TEXT NOT NULL,
+			block_height  BIGINT NOT NULL,
+			block_hash    BYTEA NOT NULL,
+			tx_hashes     BYTEA NOT NULL,
+			started_at    BIGINT NOT NULL
+		)`); err != nil {
+		return errors.NewStorageError("conflict_intents creation failed", err)
 	}
 
 	// Partial indexes on txs for iterator/pruner queries.
 	if _, err := pool.Exec(ctx, txsIndexesDDL); err != nil {
-		return errors.NewStorageError("index creation failed: %v", err)
+		return errors.NewStorageError("index creation failed", err)
 	}
 
 	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).

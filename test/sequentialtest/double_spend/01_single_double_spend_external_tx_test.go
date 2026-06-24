@@ -121,8 +121,8 @@ func testSingleDoubleSpendExternalTx(t *testing.T, utxoStore string) {
 	t.Log("Successfully verified double spend handling with external transactions")
 }
 
-func TestSingleDoubleSpendExternalTxSqlQueue(t *testing.T) {
+func TestSingleDoubleSpendExternalTxSqlPostgres(t *testing.T) {
 	t.Run("single_external_tx_with_one_conflicting_transaction", func(t *testing.T) {
-		testSingleDoubleSpendExternalTx(t, "postgres")
+		testSingleDoubleSpendExternalTx(t, "sqlpostgres")
 	})
 }

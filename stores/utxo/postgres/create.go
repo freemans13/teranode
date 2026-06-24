@@ -15,8 +15,15 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// pgxExecutor is the subset of the pgx API shared by *pgxpool.Conn and pgx.Tx,
+// letting insertConflictingChildrenDirect run either directly on a pooled
+// connection or inside the conflicting-create transaction.
+type pgxExecutor interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
 
 // ---------------------------------------------------------------------------
 // Batch types
@@ -88,7 +95,7 @@ func unpackBitmap(bitmap []byte, count int) []bool {
 // buildOutputArrays packs transaction outputs into the flat per-output columns.
 // Outputs are packed at their TRUE index i (a nil output — never produced by a
 // valid tx — leaves a zero 32-byte slot with spendable bit clear).
-func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blockHeight uint32, coinbaseMaturity int) (outputArrayParams, error) {
+func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blockHeight uint32, coinbaseMaturity int, genesisActivationHeight uint32) (outputArrayParams, error) {
 	if countNonNilOutputs(btTx) == 0 {
 		return outputArrayParams{}, nil
 	}
@@ -127,7 +134,7 @@ func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blo
 		// must not count toward the "fully spent" pruning check. Mirror the
 		// aerospike store's ShouldStoreOutputAsUTXO gate. (nil script → no deref,
 		// treated as spendable; non-nil zero-value scripts are inspected.)
-		if output.LockingScript == nil || utxo.ShouldStoreOutputAsUTXO(isCoinbase, output, blockHeight) {
+		if output.LockingScript == nil || utxo.ShouldStoreOutputAsUTXO(output, blockHeight, genesisActivationHeight) {
 			setPackedBit(p.spendableBits, i)
 			p.spendableCount++
 		}
@@ -255,7 +262,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		minedAtHeight = &minH
 	}
 
-	outArrs, err := buildOutputArrays(txHash, tx, isCoinbase, blockHeight, int(s.settings.ChainCfgParams.CoinbaseMaturity))
+	outArrs, err := buildOutputArrays(txHash, tx, isCoinbase, blockHeight, int(s.settings.ChainCfgParams.CoinbaseMaturity), s.settings.ChainCfgParams.GenesisActivationHeight)
 	if err != nil {
 		return nil, err
 	}
@@ -266,11 +273,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	}
 	defer conn.Release()
 
-	// Insert into txs (metadata + state + raw_tx + packed output columns).
-	// out_frozens is NULL on create (no output frozen — freeze materialises the
-	// bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
-	var insertedHash []byte
-	err = conn.QueryRow(ctx, `
+	const insertSQL = `
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
@@ -278,26 +281,61 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
 		        $17, $18, $19, $20, $21)
 		ON CONFLICT (hash) DO NOTHING
-		RETURNING hash`,
+		RETURNING hash`
+	insertArgs := []interface{}{
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
 		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil), minedAtHeight,
 		outArrs.utxoHashes, outArrs.outCount, outArrs.spendableCount,
 		outArrs.spendableBits, outArrs.coinbaseSpendingHeight,
-	).Scan(&insertedHash)
-	if err != nil {
+	}
+
+	// Conflicting txs need the txs INSERT AND the N parent conflicting_children
+	// UPDATEs to be atomic: a failure (or disconnect) after the child row commits
+	// but before the parents are stamped would leave a torn write the early
+	// TxExistsError return on retry can never repair (ON CONFLICT DO NOTHING →
+	// pgx.ErrNoRows → return before the child UPDATEs re-run). Wrap both in one
+	// transaction for this rare path. The common, non-conflicting path stays a
+	// single auto-committing INSERT (no extra round-trip).
+	if txMeta.Conflicting {
+		txn, beginErr := conn.Begin(ctx)
+		if beginErr != nil {
+			return nil, errors.NewStorageError("failed to begin conflicting-create tx", beginErr)
+		}
+		defer func() { _ = txn.Rollback(ctx) }()
+
+		var insertedHash []byte
+		if err = txn.QueryRow(ctx, insertSQL, insertArgs...).Scan(&insertedHash); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
+			}
+			return nil, errors.NewStorageError("failed to create UTXO", err)
+		}
+
+		// insertConflictingChildrenDirect is idempotent (the @> guard), so a retry
+		// after a partial failure re-applies the missing parent stamps cleanly.
+		if err = s.insertConflictingChildrenDirect(ctx, txn, txHash, tx); err != nil {
+			return nil, err
+		}
+
+		if err = txn.Commit(ctx); err != nil {
+			return nil, errors.NewStorageError("failed to commit conflicting-create tx", err)
+		}
+
+		result := s.buildCreateMeta(txMeta, options, isCoinbase, blockHeight)
+		return result, nil
+	}
+
+	// Insert into txs (metadata + state + raw_tx + packed output columns).
+	// out_frozens is NULL on create (no output frozen — freeze materialises the
+	// bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
+	var insertedHash []byte
+	if err = conn.QueryRow(ctx, insertSQL, insertArgs...).Scan(&insertedHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
 		}
 		return nil, errors.NewStorageError("failed to create UTXO", err)
-	}
-
-	// Handle conflicting children (rare path).
-	if txMeta.Conflicting {
-		if err = s.insertConflictingChildrenDirect(ctx, conn, txHash, tx); err != nil {
-			return nil, err
-		}
 	}
 
 	result := s.buildCreateMeta(txMeta, options, isCoinbase, blockHeight)
@@ -351,8 +389,95 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 // plain validator-path creates and single-block mined creates (block_ids etc.
 // populated when the item carries exactly one MinedBlockInfo). Conflicting and
 // multi-block items are filtered out by sendCreateBatch and never reach here.
-// Atomicity is preserved by wrapping both INSERTs in a transaction.
+// It issues a SINGLE auto-committing INSERT for the whole batch, which is
+// implicitly atomic on its own — there is no second statement to coordinate (the
+// conflicting path, which does need a multi-statement transaction, runs in
+// createDirect, not here).
 // ---------------------------------------------------------------------------
+// defaultPostgresCreateBatchMaxBytes bounds the estimated wire size of a single
+// bulk-create INSERT. pgx rejects any wire message whose body reaches
+// maxMessageBodyLen (0x3fffffff-1 ≈ 1 GiB) with "message body too large"; a block
+// whose combined raw_tx payload exceeds that (e.g. testnet block 1512872 at
+// 1.386 GiB of ~17 MB txs) can otherwise never commit and freezes chain sync.
+// 512 MiB keeps a full 2x margin below the ceiling.
+const defaultPostgresCreateBatchMaxBytes = 512 << 20 // 536870912
+
+// pgxMaxMessageBodyLen mirrors pgproto3.maxMessageBodyLen — the hard ceiling on a
+// single pgx wire message body. A chunk's estimate must stay strictly below it.
+const pgxMaxMessageBodyLen int64 = 0x3fffffff - 1 // 1073741823
+
+// createBatchChunkOverhead upper-bounds the per-INSERT fixed wire framing (20
+// binary-array headers + the Bind/Execute envelope), charged once per chunk on
+// top of the per-row estimates.
+const createBatchChunkOverhead int64 = 1024
+
+// createBatchUNNESTSQL is the bulk create INSERT, hoisted to a package const so
+// the byte-bounded chunk driver can issue it once per chunk over array sub-slices.
+const createBatchUNNESTSQL = `
+		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+			locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
+			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
+		       u.locked, u.conflicting, u.frozen,
+		       CASE WHEN u.mined THEN NULL::int ELSE u.unmined_since END,
+		       CASE WHEN u.mined THEN ARRAY[u.block_id] ELSE NULL::int[] END,
+		       CASE WHEN u.mined THEN ARRAY[u.block_height] ELSE NULL::int[] END,
+		       CASE WHEN u.mined THEN ARRAY[u.subtree_idx] ELSE NULL::int[] END,
+		       CASE WHEN u.mined THEN u.block_height ELSE NULL::int END,
+		       u.utxo_hashes, u.out_count, u.spendable_count, u.out_spendables, u.coinbase_spending_height
+		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
+		            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
+		            $11::int[], $12::boolean[], $13::int[], $14::int[], $15::int[],
+		            $16::bytea[], $17::int[], $18::int[], $19::bytea[], $20::int[])
+		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+		          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx,
+		          utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+		ON CONFLICT (hash) DO NOTHING
+		RETURNING hash`
+
+// planCreateChunks partitions [0,len(rowBytes)) into contiguous, non-empty,
+// byte-bounded windows whose estimated wire size (chunkOverhead + Σ rowBytes in
+// the window) stays at or below threshold, so each window's INSERT is one pgx
+// message safely below maxMessageBodyLen. A row whose own estimate would reach
+// hardLimit cannot be sent in any INSERT; its index is returned in oversized and
+// excluded from every window. windows ∪ oversized cover [0,len) with no gap or
+// overlap, every window is non-empty, and chunkOverhead is charged once per
+// window (not per row). Pure and DB-free so it can be unit-tested directly.
+func planCreateChunks(rowBytes []int64, threshold, chunkOverhead, hardLimit int64) (windows [][2]int, oversized []int) {
+	chunkStart := 0
+	chunkSum := chunkOverhead
+	flush := func(end int) {
+		if chunkStart < end {
+			windows = append(windows, [2]int{chunkStart, end})
+		}
+		chunkStart = end
+		chunkSum = chunkOverhead
+	}
+	for k := 0; k < len(rowBytes); k++ {
+		// A single row that alone reaches the hard wire ceiling can never be
+		// sent. Flush the pending window, record it, and skip it.
+		if chunkOverhead+rowBytes[k] >= hardLimit {
+			flush(k)
+			oversized = append(oversized, k)
+			chunkStart = k + 1
+			chunkSum = chunkOverhead
+
+			continue
+		}
+		// Emit the pending window before a row that would push it over
+		// threshold. The chunkSum>chunkOverhead guard keeps every window
+		// non-empty (a lone over-threshold-but-sendable row becomes its own
+		// window, still < hardLimit because threshold ≤ hardLimit/2).
+		if chunkSum > chunkOverhead && chunkSum+rowBytes[k] > threshold {
+			flush(k)
+		}
+		chunkSum += rowBytes[k]
+	}
+	flush(len(rowBytes))
+
+	return windows, oversized
+}
+
 func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateItem) {
 	n := len(batch)
 	hashes := make([][]byte, 0, n)
@@ -379,6 +504,13 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 
 	prepared := make([]preparedCreate, n)
 	valid := make([]bool, n)
+
+	// Per-valid-row pgx wire-byte estimate and its batch index, used to split the
+	// INSERT into byte-bounded chunks (see planCreateChunks). Both are appended at
+	// the same point as the 20 column slices below, so slice index k stays aligned
+	// across all of them and maps back to the batch via kToBatchIdx[k].
+	rowBytes := make([]int64, 0, n)
+	kToBatchIdx := make([]int, 0, n)
 
 	// Packed per-output columns — one element per tx row, carried directly in
 	// the per-tx UNNEST arrays (no flat per-output fan-out, no re-aggregation
@@ -411,7 +543,7 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 			isCoinbase = *item.options.IsCoinbase
 		}
 
-		outArrs, err := buildOutputArrays(txHash, item.tx, isCoinbase, item.blockHeight, int(s.settings.ChainCfgParams.CoinbaseMaturity))
+		outArrs, err := buildOutputArrays(txHash, item.tx, isCoinbase, item.blockHeight, int(s.settings.ChainCfgParams.CoinbaseMaturity), s.settings.ChainCfgParams.GenesisActivationHeight)
 		if err != nil {
 			item.done <- batchCreateResult{Err: err}
 			continue
@@ -431,7 +563,8 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		fees = append(fees, int64(txMeta.Fee))
 		sizes = append(sizes, int64(txMeta.SizeInBytes))
 		coinbases = append(coinbases, isCoinbase)
-		rawTxs = append(rawTxs, item.tx.ExtendedBytes())
+		rawTx := item.tx.ExtendedBytes() // re-serializes on every call; capture once
+		rawTxs = append(rawTxs, rawTx)
 		lockeds = append(lockeds, item.options.Locked)
 		conflictings = append(conflictings, false) // conflicting items routed to createDirect
 		frozens = append(frozens, item.options.Frozen)
@@ -454,6 +587,14 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		outCounts = append(outCounts, outArrs.outCount)
 		spendableCounts = append(spendableCounts, outArrs.spendableCount)
 		coinbaseSpendingHeights = append(coinbaseSpendingHeights, outArrs.coinbaseSpendingHeight)
+
+		// Upper-biased per-row estimate: 177 fixed bytes (16 scalar columns'
+		// 4-byte length prefixes + bodies = 129, the always-present 32-byte hash
+		// + its prefix = 36, the three variable bytea length prefixes = 12) plus
+		// the three variable bytea bodies. Never under-counts the payload that
+		// actually overflows the pgx message limit.
+		rowBytes = append(rowBytes, 177+int64(len(rawTx))+int64(len(outArrs.utxoHashes))+int64(len(outArrs.spendableBits)))
+		kToBatchIdx = append(kToBatchIdx, i)
 	}
 
 	if len(hashes) == 0 {
@@ -471,72 +612,91 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	}
 	defer conn.Release()
 
-	// Single autocommit UNNEST INSERT. Each tx row carries its packed per-output
-	// values directly in the per-tx arrays — no per-output row fan-out and no
-	// re-aggregation CTE (the old out_arr GROUP BY was a top-4 server-CPU
-	// consumer). out_frozens and spendable_ins are NULL on create (freeze /
-	// ReAssignUTXO materialise them later).
-	rows, err := conn.Query(ctx, `
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-			locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
-			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
-		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
-		       u.locked, u.conflicting, u.frozen,
-		       CASE WHEN u.mined THEN NULL::int ELSE u.unmined_since END,
-		       CASE WHEN u.mined THEN ARRAY[u.block_id] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN ARRAY[u.block_height] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN ARRAY[u.subtree_idx] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN u.block_height ELSE NULL::int END,
-		       u.utxo_hashes, u.out_count, u.spendable_count, u.out_spendables, u.coinbase_spending_height
-		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
-		            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
-		            $11::int[], $12::boolean[], $13::int[], $14::int[], $15::int[],
-		            $16::bytea[], $17::int[], $18::int[], $19::bytea[], $20::int[])
-		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-		          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx,
-		          utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
-		ON CONFLICT (hash) DO NOTHING
-		RETURNING hash`,
-		hashes, versions, lockTimes, fees, sizes, coinbases, rawTxs,
-		lockeds, conflictings, frozens, unminedSinces,
-		mineds, blockIDs, blockHeights, subtreeIdxs,
-		packedUtxoHashes, outCounts, spendableCounts, packedSpendableBits, coinbaseSpendingHeights,
-	)
-	if err != nil {
-		for i, item := range batch {
-			if valid[i] {
-				item.done <- batchCreateResult{Err: errors.NewStorageError("failed to INSERT create batch via CTE", err)}
-			}
-		}
-		return
+	// Autocommit UNNEST INSERT, issued in byte-bounded chunks so no single pgx
+	// message reaches maxMessageBodyLen (~1 GiB). Each tx row carries its packed
+	// per-output values directly in the per-tx arrays — no per-output row fan-out
+	// and no re-aggregation CTE. out_frozens and spendable_ins are NULL on create
+	// (freeze / ReAssignUTXO materialise them later). The common case (a normal
+	// block) is a single chunk == a single INSERT, identical to before; only an
+	// oversized block (e.g. testnet 1512872 at 1.386 GiB) splits into several.
+	threshold := int64(s.settings.UtxoStore.PostgresCreateBatchMaxBytes)
+	if threshold <= 0 {
+		threshold = defaultPostgresCreateBatchMaxBytes
 	}
 
-	newHashSet := make(map[chainhash.Hash]struct{})
-	for rows.Next() {
-		var hashBytes []byte
-		if scanErr := rows.Scan(&hashBytes); scanErr != nil {
-			rows.Close()
-			for i, item := range batch {
-				if valid[i] {
-					item.done <- batchCreateResult{Err: errors.NewStorageError("failed to scan inserted hash", scanErr)}
-				}
-			}
-			return
-		}
-		var h chainhash.Hash
-		copy(h[:], hashBytes)
-		newHashSet[h] = struct{}{}
+	if threshold > pgxMaxMessageBodyLen/2 {
+		// Never let a chunk approach the wire ceiling, whatever the config says.
+		threshold = pgxMaxMessageBodyLen / 2
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
+
+	newHashSet := make(map[chainhash.Hash]struct{}, len(hashes))
+
+	runChunk := func(lo, hi int) error {
+		rows, err := conn.Query(ctx, createBatchUNNESTSQL,
+			hashes[lo:hi], versions[lo:hi], lockTimes[lo:hi], fees[lo:hi], sizes[lo:hi],
+			coinbases[lo:hi], rawTxs[lo:hi], lockeds[lo:hi], conflictings[lo:hi], frozens[lo:hi],
+			unminedSinces[lo:hi], mineds[lo:hi], blockIDs[lo:hi], blockHeights[lo:hi], subtreeIdxs[lo:hi],
+			packedUtxoHashes[lo:hi], outCounts[lo:hi], spendableCounts[lo:hi], packedSpendableBits[lo:hi], coinbaseSpendingHeights[lo:hi],
+		)
+		if err != nil {
+			return errors.NewStorageError("failed to INSERT create batch via CTE", err)
+		}
+		// Per-chunk defer drains/closes rows before the next chunk's Query on the
+		// same pooled conn (and before conn.Release()). Do not hoist this Close out.
+		defer rows.Close()
+
+		for rows.Next() {
+			var hashBytes []byte
+			if scanErr := rows.Scan(&hashBytes); scanErr != nil {
+				return errors.NewStorageError("failed to scan inserted hash", scanErr)
+			}
+
+			var h chainhash.Hash
+
+			copy(h[:], hashBytes)
+			newHashSet[h] = struct{}{}
+		}
+
+		if rowsErr := rows.Err(); rowsErr != nil {
+			return errors.NewStorageError("create batch rows error", rowsErr)
+		}
+
+		return nil
+	}
+
+	// signalAll reports err to every still-valid item exactly once. Oversized
+	// items (below) have already had valid[i] cleared, so they are never
+	// double-signalled — the done channel is buffered for one result and read
+	// once, so a second send would wedge the batcher worker.
+	signalAll := func(err error) {
 		for i, item := range batch {
 			if valid[i] {
-				item.done <- batchCreateResult{Err: errors.NewStorageError("create batch rows error", err)}
+				item.done <- batchCreateResult{Err: err}
 			}
 		}
-		return
 	}
-	rows.Close()
+
+	windows, oversized := planCreateChunks(rowBytes, threshold, createBatchChunkOverhead, pgxMaxMessageBodyLen)
+
+	// A single tx too large for any INSERT can never be stored inline. Report it
+	// to ONLY that item with an actionable error and drop it from the valid set
+	// so neither signalAll nor the completion loop touches it again. Not reachable
+	// for real BSV txs (policy/consensus max ≪ 1 GiB); insurance against exactly
+	// the failure class being fixed here.
+	for _, k := range oversized {
+		bi := kToBatchIdx[k]
+		batch[bi].done <- batchCreateResult{Err: errors.NewStorageError(
+			"create row for tx %s estimated %d wire bytes exceeds the postgres message limit %d",
+			batch[bi].tx.TxIDChainHash().String(), rowBytes[k], pgxMaxMessageBodyLen)}
+		valid[bi] = false
+	}
+
+	for _, w := range windows {
+		if err := runChunk(w[0], w[1]); err != nil {
+			signalAll(err)
+			return
+		}
+	}
 
 	for i, item := range batch {
 		if !valid[i] {
@@ -588,7 +748,7 @@ func (s *Store) buildCreateMeta(txMeta *meta.Data, options *utxo.CreateOptions, 
 
 // insertConflictingChildrenDirect updates the parent txs rows to append this child
 // to their conflicting_children array.
-func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpool.Conn, childTxHash *chainhash.Hash, tx *bt.Tx) error {
+func (s *Store) insertConflictingChildrenDirect(ctx context.Context, exec pgxExecutor, childTxHash *chainhash.Hash, tx *bt.Tx) error {
 	seen := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
 
 	for _, input := range tx.Inputs {
@@ -598,7 +758,7 @@ func (s *Store) insertConflictingChildrenDirect(ctx context.Context, conn *pgxpo
 		}
 		seen[parentHash] = struct{}{}
 
-		_, err := conn.Exec(ctx, `
+		_, err := exec.Exec(ctx, `
 			UPDATE txs SET conflicting_children = COALESCE(conflicting_children, '{}') || $2::bytea[]
 			WHERE hash = $1
 			  AND NOT (COALESCE(conflicting_children, '{}') @> $2::bytea[])`,
