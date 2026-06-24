@@ -126,6 +126,22 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			return nil, nil, errors.NewTxNotFoundError("[SetConflicting] transaction not found (concurrently removed?): %s", txHash)
 		}
 
+		// When the pending_deletes flag is ON and we just set conflicting=true, upsert
+		// the hash into pending_deletes if the row now has a delete_at_height. We use
+		// a SELECT-based INSERT (reading the current DAH from the row, inside the same
+		// transaction snapshot) so preserved rows — whose DAH was left NULL by the CASE
+		// above — are correctly excluded. This runs inside the existing pgxTx so the
+		// upsert is always atomic with the UPDATE above.
+		if s.settings.UtxoStore.PostgresUsePendingDeletesTable && setValue {
+			if _, err = pgxTx.Exec(ctx,
+				`INSERT INTO pending_deletes (hash, delete_at_height)
+				 SELECT $1, delete_at_height FROM txs WHERE hash = $1 AND delete_at_height IS NOT NULL
+				 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height`,
+				txHash[:]); err != nil {
+				return nil, nil, errors.NewStorageError("failed to upsert pending_deletes for %s", txHash, err)
+			}
+		}
+
 		// Append this tx as a conflicting child of each parent (array on txs).
 		// The @> guard makes the append idempotent: a replay/retry must not push a
 		// duplicate child hash into the parent's array (matches the sql store's

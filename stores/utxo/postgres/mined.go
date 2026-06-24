@@ -82,19 +82,48 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// consistent with the block_heights entry appended in $3 even under
 		// concurrent SetBlockHeight, and (b) preserves a single prepared-plan
 		// cache entry across heights (a literal would re-plan per height).
-		updateSQL = `UPDATE txs SET
-				block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-				block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-				subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
-				locked = false, unmined_since = NULL,
-				mined_at_height = $5,
-				delete_at_height = CASE
-					WHEN spendable_count = 0 AND out_count > 0 AND preserve_until IS NULL
-					THEN $5 + 1 + $6
-					ELSE delete_at_height
-				END
-			WHERE hash = ANY($1)
-			RETURNING hash, block_ids`
+		//
+		// When the pending_deletes flag is ON, the UPDATE is wrapped in a CTE so that
+		// any zero-spendable tx that gets an inline DAH stamp is also upserted into
+		// pending_deletes in the same statement. The outer SELECT returns hash, block_ids
+		// so the drain loop is unchanged.
+		if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
+			updateSQL = `WITH upd AS (
+				UPDATE txs SET
+					block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
+					block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
+					subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
+					locked = false, unmined_since = NULL,
+					mined_at_height = $5,
+					delete_at_height = CASE
+						WHEN spendable_count = 0 AND out_count > 0 AND preserve_until IS NULL
+						THEN $5 + 1 + $6
+						ELSE delete_at_height
+					END
+				WHERE hash = ANY($1)
+				RETURNING hash, block_ids, delete_at_height
+			),
+			_pd AS (
+				INSERT INTO pending_deletes (hash, delete_at_height)
+				SELECT hash, delete_at_height FROM upd WHERE delete_at_height IS NOT NULL
+				ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
+			)
+			SELECT hash, block_ids FROM upd`
+		} else {
+			updateSQL = `UPDATE txs SET
+					block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
+					block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
+					subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
+					locked = false, unmined_since = NULL,
+					mined_at_height = $5,
+					delete_at_height = CASE
+						WHEN spendable_count = 0 AND out_count > 0 AND preserve_until IS NULL
+						THEN $5 + 1 + $6
+						ELSE delete_at_height
+					END
+				WHERE hash = ANY($1)
+				RETURNING hash, block_ids`
+		}
 	} else {
 		updateSQL = `UPDATE txs SET
 			block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,

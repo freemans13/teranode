@@ -105,6 +105,53 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	// then narrow to int32 for the INT4 delete_at_height column.
 	deleteAtHeight := int32(int64(currentHeight) + int64(retention))
 
+	if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
+		// When the pending_deletes side-table is enabled, use a CTE so that:
+		//   - rows that get a DAH stamp are upserted into pending_deletes (ins),
+		//   - rows whose DAH is set to NULL are removed from pending_deletes (del),
+		// all in the same statement. A SELECT count(*) FROM upd returns the number of
+		// affected rows for logging, analogously to result.RowsAffected() below.
+		var rowsAffected int64
+		err := s.pool.QueryRow(ctx, `
+			WITH upd AS (
+				UPDATE txs SET
+					delete_at_height = CASE
+						WHEN conflicting THEN $1
+						WHEN unmined_since IS NULL
+						     AND block_ids IS NOT NULL AND array_length(block_ids, 1) IS NOT NULL
+						     AND out_count > 0
+						     AND spendable_count = (
+						         SELECT count(*) FROM spends s
+						         WHERE s.prev_tx_hash = txs.hash
+						           AND CASE WHEN s.prev_output_idx < txs.out_count
+						                    THEN get_bit(txs.out_spendables, s.prev_output_idx) = 1
+						                    ELSE false END
+						     )
+						THEN $1::int
+						ELSE NULL
+					END,
+					preserve_until = NULL
+				WHERE preserve_until IS NOT NULL AND preserve_until <= $2
+				RETURNING hash, delete_at_height
+			),
+			ins AS (
+				INSERT INTO pending_deletes (hash, delete_at_height)
+				SELECT hash, delete_at_height FROM upd WHERE delete_at_height IS NOT NULL
+				ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
+			),
+			del AS (
+				DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd WHERE delete_at_height IS NULL)
+			)
+			SELECT count(*) FROM upd
+		`, deleteAtHeight, int32(currentHeight)).Scan(&rowsAffected)
+		if err != nil {
+			return errors.NewStorageError("failed to process expired preservations", err)
+		}
+
+		s.logger.Infof("[ProcessExpiredPreservations] processed %d expired preservations at height %d", rowsAffected, currentHeight)
+		return nil
+	}
+
 	result, err := s.pool.Exec(ctx, `
 		UPDATE txs SET
 			delete_at_height = CASE

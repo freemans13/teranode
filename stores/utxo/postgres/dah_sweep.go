@@ -86,7 +86,13 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 	// out_count/spendable_count scalars + out_spendables bitmap, then stamp the
 	// ones that are fully spent. Runs on the maintenance pool so its recovery
 	// scans never steal connections from the validator hot path.
-	tag, err := s.maint().Exec(ctx, `
+	//
+	// When the pending_deletes flag is ON the UPDATE is wrapped in a CTE so that
+	// any newly-stamped row is also upserted into pending_deletes in the same
+	// statement. When the flag is OFF the plain UPDATE is used (no side-table).
+	var sql string
+	if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
+		sql = `
 		WITH slice AS (
 			SELECT t.hash, t.mined_at_height, t.out_spendables,
 			       t.out_count AS total_out,
@@ -100,9 +106,43 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 			LIMIT $3
 		),
 		spend_agg AS (
-			-- Count only spends of SPENDABLE outputs (see sweepDAHRangePartition),
-			-- so spent_count is comparable to slice.spendable_out below. The CASE
-			-- guard keeps get_bit in range (it errors on OOB, unlike a subscript).
+			SELECT s.prev_tx_hash AS hash,
+			       count(*) FILTER (WHERE CASE WHEN s.prev_output_idx < sl.total_out THEN get_bit(sl.out_spendables, s.prev_output_idx) = 1 ELSE false END) AS spent_count,
+			       max(s.spent_at_height) AS max_spent
+			FROM spends s JOIN slice sl ON sl.hash = s.prev_tx_hash
+			GROUP BY s.prev_tx_hash
+		),
+		eligible AS (
+			SELECT sl.hash,
+			       GREATEST(COALESCE(sa.max_spent, 0), COALESCE(sl.mined_at_height, 0)) AS completion_height
+			FROM slice sl
+			LEFT JOIN spend_agg sa ON sa.hash = sl.hash
+			WHERE sl.total_out > 0
+			  AND sl.spendable_out = COALESCE(sa.spent_count, 0)
+		),
+		upd AS (
+			UPDATE txs t SET delete_at_height = (e.completion_height + 1 + $4)::int
+			FROM eligible e WHERE t.hash = e.hash
+			RETURNING t.hash, t.delete_at_height
+		)
+		INSERT INTO pending_deletes (hash, delete_at_height)
+		SELECT hash, delete_at_height FROM upd WHERE delete_at_height IS NOT NULL
+		ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height`
+	} else {
+		sql = `
+		WITH slice AS (
+			SELECT t.hash, t.mined_at_height, t.out_spendables,
+			       t.out_count AS total_out,
+			       t.spendable_count AS spendable_out
+			FROM txs t
+			WHERE t.hash >= $1 AND t.hash < $2
+			  AND t.delete_at_height IS NULL
+			  AND t.preserve_until IS NULL
+			  AND t.unmined_since IS NULL
+			  AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) IS NOT NULL
+			LIMIT $3
+		),
+		spend_agg AS (
 			SELECT s.prev_tx_hash AS hash,
 			       count(*) FILTER (WHERE CASE WHEN s.prev_output_idx < sl.total_out THEN get_bit(sl.out_spendables, s.prev_output_idx) = 1 ELSE false END) AS spent_count,
 			       max(s.spent_at_height) AS max_spent
@@ -118,8 +158,10 @@ func (s *Store) backstopReconcile(ctx context.Context, loByte, hiByte int, limit
 			  AND sl.spendable_out = COALESCE(sa.spent_count, 0)
 		)
 		UPDATE txs t SET delete_at_height = (e.completion_height + 1 + $4)::int
-		FROM eligible e WHERE t.hash = e.hash`,
-		lo, hi, limit, int32(retention))
+		FROM eligible e WHERE t.hash = e.hash`
+	}
+
+	tag, err := s.maint().Exec(ctx, sql, lo, hi, limit, int32(retention))
 	if err != nil {
 		return 0, errors.NewStorageError("[dahBackstop] [%d,%d]", loByte, hiByte, err)
 	}
