@@ -67,7 +67,7 @@ func TestPackedOutputEncodingAgreesWithSQL(t *testing.T) {
 		}
 		txHash := tx.TxIDChainHash()
 
-		p, err := buildOutputArrays(txHash, tx, false, 100, 100)
+		p, err := buildOutputArrays(txHash, tx, false, 100, 100, 0)
 		require.NoError(t, err, "count=%d", count)
 
 		wantSpendable := count

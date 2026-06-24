@@ -79,6 +79,17 @@ type UtxoStoreSettings struct {
 	// write pool so background reclaim is never starved by the validator batchers
 	// under load. 0 disables (reclaim shares the main pool — legacy behaviour).
 	PostgresMaintenancePoolConns int `key:"utxostore_postgresMaintenancePoolConns" desc:"Dedicated maintenance pool size for DAH sweep + pruner deletes (0=share main pool)" default:"0" category:"UtxoStore" usage:"16 recommended; isolates reclaim conns from the write pool" type:"int"`
+	// Max estimated wire bytes per bulk-create INSERT (PostgreSQL store only). The
+	// pgx driver rejects any single wire message at or above maxMessageBodyLen
+	// (~1 GiB) with "message body too large", so a block whose combined raw_tx
+	// payload exceeds that (e.g. a 1.4 GiB block of large data txs) can otherwise
+	// never commit and freezes chain sync. This bounds the AGGREGATE per-INSERT
+	// payload; a create batch is split into multiple INSERTs to stay under it.
+	// Chunks are independent autocommit statements made safe by ON CONFLICT DO
+	// NOTHING idempotency and whole-block retry. Internally clamped to half the
+	// pgx limit, so a too-high value can never re-introduce the stuck-block bug.
+	// Default 512 MiB keeps a 2x margin below the ceiling.
+	PostgresCreateBatchMaxBytes int `key:"utxostore_postgresCreateBatchMaxBytes" desc:"Max estimated wire bytes per bulk-create INSERT before it is split (PostgreSQL store)" default:"536870912" category:"UtxoStore" usage:"512MiB default; bounds each create INSERT below pgx's ~1GiB message limit" type:"int"`
 
 	// Per-batcher tick interval (go-batcher SetTickInterval, fixed-cadence flushing).
 	// Default 0 = disabled (current behaviour: size + lazy timeout). Ignored when the
