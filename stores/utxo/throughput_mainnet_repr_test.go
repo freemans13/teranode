@@ -35,13 +35,18 @@ func TestCollectReprSample_ReturnsShape(t *testing.T) {
 
 type reprSample struct {
 	// atUnix is set by the caller (the Task 5 bench sets it to the block height); collectReprSample does not populate it.
-	atUnix            int64
-	liveRows          int64
-	txsBytes          int64
-	spendsBytes       int64
-	sliceMs, doomedMs float64
-	deleteMs          float64
-	bufHitPct         float64
+	atUnix      int64
+	liveRows    int64
+	txsBytes    int64
+	spendsBytes int64
+	sliceMs     float64
+	// doomedMs captures the single `WITH doomed … DELETE FROM spends … DELETE FROM txs` statement
+	// (scan + inline cascade delete combined; scan-dominated when deletions are sparse).
+	doomedMs float64
+	// deleteMs captures a separate standalone delete path that this store does not emit as a hot
+	// statement (the cascade delete is inline inside the doomed statement), so this is ~0 by construction.
+	deleteMs  float64
+	bufHitPct float64
 }
 
 func resetReprStats(ctx context.Context, pool *pgxpool.Pool) error {
@@ -63,7 +68,17 @@ func collectReprSample(ctx context.Context, pool *pgxpool.Pool) (reprSample, err
 	if err := row.Scan(&s.txsBytes, &s.spendsBytes, &s.liveRows); err != nil {
 		return s, err
 	}
-	// per-class exec time
+	// per-class exec time from pg_stat_statements.
+	//
+	// doomedMs: matches the single `WITH doomed … DELETE FROM spends … DELETE FROM txs`
+	// statement that the pruner emits. pg_stat_statements stores it as one entry, so this
+	// bucket captures the scan + inline cascade delete combined. When deletions are sparse
+	// (liveRows ≈ created), the scan dominates and doomedMs ≈ pure scan cost.
+	//
+	// deleteMs: matches a separate standalone delete path (`DELETE FROM txs…`, `DELETE FROM
+	// spends…`, `WITH del…`). This store does NOT emit such statements as hot entries — the
+	// cascade delete is inline inside the doomed statement above — so deleteMs is ~0 by
+	// construction (the filter matches nothing this store emits in the pruner hot path).
 	classRow := pool.QueryRow(ctx, `
 		SELECT
 		  COALESCE(SUM(total_exec_time) FILTER (WHERE query LIKE 'WITH slice%'),0),
@@ -108,7 +123,8 @@ func TestThroughput_MainnetRepr(t *testing.T) {
 	workers := envInt("MREPR_WORKERS", 128)
 
 	// --- store + pruner setup (matches newPrunedQueueStore pattern) ---
-	storeURL, _ := url.Parse(throughputDSN)
+	storeURL, err := url.Parse(throughputDSN)
+	require.NoError(t, err)
 	storeURL.Scheme = "postgres"
 
 	tSettings := test.CreateBaseTestSettings(t)
@@ -199,7 +215,7 @@ func TestThroughput_MainnetRepr(t *testing.T) {
 			require.NoError(t, sErr)
 			s.atUnix = int64(h)
 			samples = append(samples, s)
-			t.Logf("[mrepr] h=%d liveRows=%d txsMB=%d sliceMs=%.0f doomedMs=%.0f delMs=%.0f hit%%=%.1f created=%d",
+			t.Logf("[mrepr] h=%d liveRows=%d txsMB=%d sliceMs=%.0f cascadeMs=%.0f auxDelMs=%.0f hit%%=%.1f created=%d",
 				h, s.liveRows, s.txsBytes/(1<<20), s.sliceMs, s.doomedMs, s.deleteMs, s.bufHitPct, created.Load())
 			if s.liveRows >= int64(targetRows) {
 				break
