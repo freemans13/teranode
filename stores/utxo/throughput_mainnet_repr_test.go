@@ -24,6 +24,7 @@ func TestCollectReprSample_ReturnsShape(t *testing.T) {
 }
 
 type reprSample struct {
+	// atUnix is set by the caller (the Task 5 bench sets it to the block height); collectReprSample does not populate it.
 	atUnix            int64
 	liveRows          int64
 	txsBytes          int64
@@ -57,7 +58,8 @@ func collectReprSample(ctx context.Context, pool *pgxpool.Pool) (reprSample, err
 		SELECT
 		  COALESCE(SUM(total_exec_time) FILTER (WHERE query LIKE 'WITH slice%'),0),
 		  COALESCE(SUM(total_exec_time) FILTER (WHERE query LIKE '%doomed%'),0),
-		  COALESCE(SUM(total_exec_time) FILTER (WHERE query LIKE 'DELETE FROM %'
+		  COALESCE(SUM(total_exec_time) FILTER (WHERE query LIKE 'DELETE FROM txs%'
+		           OR query LIKE 'DELETE FROM spends%'
 		           OR query LIKE 'WITH del%'),0)
 		FROM pg_stat_statements`)
 	if err := classRow.Scan(&s.sliceMs, &s.doomedMs, &s.deleteMs); err != nil {
