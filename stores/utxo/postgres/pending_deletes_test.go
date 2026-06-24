@@ -275,6 +275,56 @@ func TestPendingDeletes_MarkOffLongestChainRemovesFromList(t *testing.T) {
 	require.False(t, exists, "reorged tx must be removed from pending_deletes (C3)")
 }
 
+// TestPendingDeletes_SetConflictingFalseRemovesFromList tests C1:
+// SetConflicting(false) clears delete_at_height and must also remove the hash
+// from pending_deletes so the pruner cannot wrongly select a revived tx.
+func TestPendingDeletes_SetConflictingFalseRemovesFromList(t *testing.T) {
+	st := newPendingDeletesTestStore(t)
+	ctx := context.Background()
+
+	// Stamp the tx into pending_deletes via the sweep (precondition).
+	h := createMinedFullySpentTx(t, st)
+	runOneSweep(t, st, h)
+
+	// Clear conflicting — this is the C1 clear site.
+	_, _, err := st.SetConflicting(ctx, []chainhash.Hash{h}, false)
+	require.NoError(t, err)
+
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_deletes WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "SetConflicting(false) must remove tx from pending_deletes (C1)")
+}
+
+// TestPendingDeletes_UnsetMinedRemovesFromList tests C5:
+// SetMinedMulti with UnsetMined=true clears delete_at_height and must also
+// remove the hash from pending_deletes so the pruner cannot wrongly select
+// a reorged-out tx.
+func TestPendingDeletes_UnsetMinedRemovesFromList(t *testing.T) {
+	st := newPendingDeletesTestStore(t)
+	ctx := context.Background()
+
+	// Stamp the tx into pending_deletes via the sweep (precondition).
+	// createMinedFullySpentTx mines the parent at blockID/blockHeight=100.
+	h := createMinedFullySpentTx(t, st)
+	runOneSweep(t, st, h)
+
+	// Advance block height before the unset-mined call (mirrors TestUnsetMined).
+	require.NoError(t, st.SetBlockHeight(150))
+
+	// Unset mined (reorg) — this is the C5 clear site.
+	_, err := st.SetMinedMulti(ctx, []*chainhash.Hash{&h}, utxo.MinedBlockInfo{
+		BlockID:    100,
+		UnsetMined: true,
+	})
+	require.NoError(t, err)
+
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_deletes WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "SetMinedMulti(UnsetMined=true) must remove tx from pending_deletes (C5)")
+}
+
 func TestSchema_PendingDeletes_FlagOff(t *testing.T) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, testDSN)

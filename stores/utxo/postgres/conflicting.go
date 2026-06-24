@@ -339,6 +339,10 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 			} else {
 				q = fmt.Sprintf(`UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash IN %s`, inClause)
 			}
+			// NOTE: when the pending_deletes flag is ON, the CTE above makes the
+			// outer statement a DELETE, so CommandTag.RowsAffected() reflects rows
+			// deleted from pending_deletes — NOT rows updated in txs. Do not add
+			// accounting logic here that relies on the returned row count.
 			if _, err := s.pool.Exec(ctx, q, args...); err != nil {
 				return errors.NewStorageError("failed to set locked flag", err)
 			}
@@ -412,14 +416,23 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 			inClause, inArgs := buildINClauseLocal(chunk, 2)
 			chunkArgs := append([]interface{}{int32(currentBlockHeight)}, inArgs...) // unmined_since is INT4
 
+			// DO NOT "fix" this by wrapping the chunk loop in a single transaction
+			// and rolling back on error. This branch is a CLEAR (delete_at_height = NULL)
+			// that makes a reorged-out tx safe from the pruner, so partial application is
+			// SAFER than none: rolling back on a chunk failure would un-clear the chunks
+			// already made safe, enlarging the stale-stamp set from just the failed chunk
+			// to the ENTIRE batch. (Atomicity is the right property for a SET, where partial
+			// application is the hazard — not for a clear.) Instead we continue, clearing
+			// every remaining chunk, and return the joined error so the caller retries the
+			// whole, idempotent set. A failed chunk's stamp is a FUTURE height
+			// (completion + retention), so the pruner cannot act on it before a retry
+			// (or the next reorg pass) re-clears it.
 			var rowsAffected int
 			if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
 				// C3: when the pending_deletes flag is ON, remove the hashes from
 				// pending_deletes in the SAME statement as the DAH clear via a CTE.
 				// SELECT count(*) FROM upd returns the txs-updated count (not the
 				// pending_deletes-deleted count) so totalUpdated accounting is correct.
-				// DO NOT wrap in a Go transaction — the comment below explains why
-				// partial application is SAFER than none for this clear operation.
 				q := fmt.Sprintf(`WITH upd AS (
 					UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s RETURNING hash
 				),
@@ -428,18 +441,6 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 				)
 				SELECT count(*) FROM upd`, inClause)
 				if err := s.pool.QueryRow(ctx, q, chunkArgs...).Scan(&rowsAffected); err != nil {
-					// DO NOT "fix" this by wrapping the chunk loop in a single transaction
-					// and rolling back on error. The false branch above is a CLEAR
-					// (delete_at_height = NULL) that makes a reorged-out tx safe from the
-					// pruner, so for THIS operation partial application is SAFER than none:
-					// rolling back on a chunk failure would un-clear the chunks already made
-					// safe, enlarging the stale-stamp set from just the failed chunk to the
-					// ENTIRE batch. (Atomicity is the right property for a SET, where partial
-					// application is the hazard — not for a clear.) Instead we continue,
-					// clearing every remaining chunk, and return the joined error so the
-					// caller retries the whole, idempotent set. A failed chunk's stamp is a
-					// FUTURE height (completion + retention), so the pruner cannot act on it
-					// before a retry (or the next reorg pass) re-clears it.
 					errorCount += len(chunk)
 					if len(allErrors) < 10 {
 						s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
@@ -451,7 +452,6 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 				q := fmt.Sprintf(`UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s`, inClause)
 				result, err := s.pool.Exec(ctx, q, chunkArgs...)
 				if err != nil {
-					// Same rationale as the flag-ON path above.
 					errorCount += len(chunk)
 					if len(allErrors) < 10 {
 						s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
