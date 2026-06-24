@@ -31,7 +31,7 @@ import (
 //     (flat bytea + bitmaps + scalar counts). A single row lookup returns
 //     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
-	if err := createSchemaWithPool(ctx, s.pool); err != nil {
+	if err := createSchemaWithPoolFlag(ctx, s.pool, s.settings.UtxoStore.PostgresUsePendingDeletesTable); err != nil {
 		return err
 	}
 
@@ -71,8 +71,18 @@ type partitionSpec struct {
 // workers while bounding fan-out cost on reads.
 const numPartitions = 8
 
-// createSchemaWithPool executes all DDL statements using the provided pool.
+// createSchemaWithPool executes all DDL statements using the provided pool
+// with the pending_deletes feature disabled (legacy default).
 func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
+	return createSchemaWithPoolFlag(ctx, pool, false)
+}
+
+// createSchemaWithPoolFlag executes all DDL statements using the provided pool.
+// When usePendingDeletes is true the pending_deletes partitioned side-table (8
+// leaves) is created and the px_delete_at_height BRIN index on txs is dropped
+// (the pruner reads from the side-table instead). When false the BRIN index is
+// created and no pending_deletes tables are created.
+func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, usePendingDeletes bool) error {
 	ddlStatements := []string{
 		txsDDL,
 		spendsDDL,
@@ -250,9 +260,49 @@ func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
 		return errors.NewStorageError("conflict_intents creation failed", err)
 	}
 
-	// Partial indexes on txs for iterator/pruner queries.
-	if _, err := pool.Exec(ctx, txsIndexesDDL); err != nil {
-		return errors.NewStorageError("index creation failed", err)
+	// Partial indexes on txs for iterator/pruner queries. The base indexes are
+	// always applied. The BRIN on delete_at_height is conditional: when the
+	// pending_deletes side-table is enabled the pruner reads from that table
+	// instead, so the BRIN is unnecessary overhead — drop it. When disabled
+	// (default), the pruner scans txs directly and the BRIN is required.
+	if _, err := pool.Exec(ctx, txsIndexesDDLBase); err != nil {
+		return errors.NewStorageError("txs base index creation failed", err)
+	}
+	if usePendingDeletes {
+		if _, err := pool.Exec(ctx, txsDAHBrinDropDDL); err != nil {
+			return errors.NewStorageError("px_delete_at_height drop failed", err)
+		}
+	} else {
+		if _, err := pool.Exec(ctx, txsDAHBrinDDL); err != nil {
+			return errors.NewStorageError("px_delete_at_height creation failed", err)
+		}
+	}
+
+	// pending_deletes side-table: when enabled, the pruner populates this
+	// table with (hash, delete_at_height) rows and reads from it directly
+	// rather than scanning txs via the BRIN index. Each hash partition gets
+	// its own leaf and a btree index on delete_at_height for efficient
+	// height-range scans by the pruner.
+	if usePendingDeletes {
+		if _, err := pool.Exec(ctx, pendingDeletesDDL); err != nil {
+			return errors.NewStorageError("pending_deletes creation failed", err)
+		}
+		for i := 0; i < numPartitions; i++ {
+			leafDDL := fmt.Sprintf(
+				"CREATE TABLE IF NOT EXISTS pending_deletes_p%02d PARTITION OF pending_deletes FOR VALUES WITH (MODULUS %d, REMAINDER %d)",
+				i, numPartitions, i,
+			)
+			if _, err := pool.Exec(ctx, leafDDL); err != nil {
+				return errors.NewStorageError("pending_deletes_p%02d creation failed", i, err)
+			}
+			idxDDL := fmt.Sprintf(
+				"CREATE INDEX IF NOT EXISTS px_pd_dah_p%02d ON pending_deletes_p%02d USING btree (delete_at_height)",
+				i, i,
+			)
+			if _, err := pool.Exec(ctx, idxDDL); err != nil {
+				return errors.NewStorageError("pending_deletes_p%02d index creation failed", i, err)
+			}
+		}
 	}
 
 	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).
@@ -358,10 +408,32 @@ CREATE TABLE IF NOT EXISTS txs (
 // (delete_at_height <= H LIMIT N) tolerates BRIN's bitmap rechecks while the
 // table is bounded; both index choices were A/B'd under sustained load and
 // BRIN-everywhere is the best-known configuration (88K vs 65-71K medians).
-const txsIndexesDDL = `
+// txsIndexesDDLBase contains the txs partial indexes that are always created
+// regardless of the pending_deletes flag.
+const txsIndexesDDLBase = `
 CREATE INDEX IF NOT EXISTS px_unmined_since ON txs USING brin (unmined_since) WITH (pages_per_range = 32, autosummarize = on);
-CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs USING brin (delete_at_height) WITH (pages_per_range = 32, autosummarize = on);
 CREATE INDEX IF NOT EXISTS px_preserve_until ON txs (preserve_until) WHERE preserve_until IS NOT NULL;`
+
+// txsDAHBrinDDL creates the BRIN index on txs.delete_at_height used by the
+// pruner when the pending_deletes side-table is NOT in use. See the comment on
+// delete_at_height in txsDDL for the HOT-chain rationale.
+const txsDAHBrinDDL = `CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs USING brin (delete_at_height) WITH (pages_per_range = 32, autosummarize = on);`
+
+// txsDAHBrinDropDDL drops the BRIN index when the pending_deletes side-table
+// IS in use. The pruner reads from pending_deletes directly, so the BRIN index
+// on txs is unnecessary overhead.
+const txsDAHBrinDropDDL = `DROP INDEX IF EXISTS px_delete_at_height;`
+
+// pendingDeletesDDL creates the pending_deletes partitioned parent table. Each
+// hash partition leaf is created separately in createSchemaWithPoolFlag.
+// The table stores (hash, delete_at_height) rows for the pruner to consume;
+// the stamp path populates it and the pruner clears it as rows are deleted.
+const pendingDeletesDDL = `
+CREATE TABLE IF NOT EXISTS pending_deletes (
+    hash             BYTEA NOT NULL,
+    delete_at_height INT   NOT NULL,
+    PRIMARY KEY (hash)
+) PARTITION BY HASH (hash);`
 
 // spends: append-only spend records. LOGGED. A row here is the canonical
 // "this output was spent by that tx" marker; Unspend deletes the row, and
