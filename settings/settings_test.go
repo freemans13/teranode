@@ -146,3 +146,8 @@ func TestMaxRawTxFee_EnvZeroDisables(t *testing.T) {
 	tSettings := NewSettings()
 	require.Equal(t, uint64(0), tSettings.Policy.MaxRawTxFee)
 }
+
+func TestPostgresUsePendingDeletesTable_DefaultsFalse(t *testing.T) {
+	s := NewSettings()
+	require.False(t, s.UtxoStore.PostgresUsePendingDeletesTable)
+}
