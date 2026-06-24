@@ -3,6 +3,7 @@ package utxo_test
 import (
 	"context"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -104,6 +105,7 @@ func TestThroughput_MainnetRepr(t *testing.T) {
 	targetRows := envInt("MREPR_GROWTH_TARGET_ROWS", 50000)
 	survivorPct := envInt("MREPR_SURVIVOR_PROB_PCT", 5)
 	sampleEveryTicks := envInt("MREPR_SAMPLE_TICKS", 20)
+	workers := envInt("MREPR_WORKERS", 128)
 
 	// --- store + pruner setup (matches newPrunedQueueStore pattern) ---
 	storeURL, _ := url.Parse(throughputDSN)
@@ -141,24 +143,48 @@ func TestThroughput_MainnetRepr(t *testing.T) {
 	var samples []reprSample
 
 	// --- main loop: NO gate. Advance height, create+spend, mine, prune, sample. ---
+	runStart := time.Now()
 	tick := time.NewTicker(time.Duration(heightTickMS) * time.Millisecond)
 	defer tick.Stop()
 	ticks := 0
+	minedHashes := make([]*chainhash.Hash, 0, txsPerTick)
 	for {
 		h := uint32(curH.Load())
 		_ = store.SetBlockHeight(h)
 
-		var minedHashes []*chainhash.Hash
+		// BUILD PHASE (single-threaded: scheduler + idToHash are not concurrency-safe)
+		jobs := make([]*bt.Tx, txsPerTick)
+		hasIn := make([]bool, txsPerTick)
 		for i := 0; i < txsPerTick; i++ {
 			id, oc, inputs := sched.createTx(int(h))
 			tx := buildReprTx(id, inputs, oc, idToHash)
-			hash := tx.TxIDChainHash()
-			idToHash[id] = hash
-			if len(inputs) > 0 {
-				_, _ = store.Spend(ctx, tx, h)
-			}
-			if _, createErr := store.Create(ctx, tx, h, utxo.WithLocked(true)); createErr == nil {
-				minedHashes = append(minedHashes, hash)
+			idToHash[id] = tx.TxIDChainHash()
+			jobs[i] = tx
+			hasIn[i] = len(inputs) > 0
+		}
+		// DRIVE PHASE (concurrent: store.Create/Spend are goroutine-safe and batch-coalesce)
+		hashes := make([]*chainhash.Hash, txsPerTick) // index-aligned; nil on failure -> no race (disjoint indices)
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, workers)
+		for i := range jobs {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if hasIn[i] {
+					_, _ = store.Spend(ctx, jobs[i], h)
+				}
+				if _, err := store.Create(ctx, jobs[i], h, utxo.WithLocked(true)); err == nil {
+					hashes[i] = jobs[i].TxIDChainHash()
+				}
+			}(i)
+		}
+		wg.Wait()
+		minedHashes = minedHashes[:0]
+		for _, hsh := range hashes {
+			if hsh != nil {
+				minedHashes = append(minedHashes, hsh)
 			}
 		}
 		if len(minedHashes) > 0 {
@@ -182,6 +208,11 @@ func TestThroughput_MainnetRepr(t *testing.T) {
 		curH.Add(1)
 		<-tick.C
 	}
+
+	elapsed := time.Since(runStart)
+	createRate := float64(created.Load()) / elapsed.Seconds()
+	t.Logf("[mrepr] DONE workers=%d txsPerTick=%d created=%d elapsed=%s createRate=%.0f tx/s",
+		workers, txsPerTick, created.Load(), elapsed.Round(time.Second), createRate)
 
 	require.NotEmpty(t, samples, "collected at least one sample")
 	last := samples[len(samples)-1]
