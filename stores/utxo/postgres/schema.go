@@ -260,29 +260,14 @@ func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, usePendin
 		return errors.NewStorageError("conflict_intents creation failed", err)
 	}
 
-	// Partial indexes on txs for iterator/pruner queries. The base indexes are
-	// always applied. The BRIN on delete_at_height is conditional: when the
-	// pending_deletes side-table is enabled the pruner reads from that table
-	// instead, so the BRIN is unnecessary overhead — drop it. When disabled
-	// (default), the pruner scans txs directly and the BRIN is required.
-	if _, err := pool.Exec(ctx, txsIndexesDDLBase); err != nil {
-		return errors.NewStorageError("txs base index creation failed", err)
-	}
-	if usePendingDeletes {
-		if _, err := pool.Exec(ctx, txsDAHBrinDropDDL); err != nil {
-			return errors.NewStorageError("px_delete_at_height drop failed", err)
-		}
-	} else {
-		if _, err := pool.Exec(ctx, txsDAHBrinDDL); err != nil {
-			return errors.NewStorageError("px_delete_at_height creation failed", err)
-		}
-	}
-
 	// pending_deletes side-table: when enabled, the pruner populates this
 	// table with (hash, delete_at_height) rows and reads from it directly
 	// rather than scanning txs via the BRIN index. Each hash partition gets
 	// its own leaf and a btree index on delete_at_height for efficient
 	// height-range scans by the pruner.
+	//
+	// This block is intentionally placed BEFORE the BRIN drop/backfill block
+	// below so that pending_deletes exists when the backfill INSERT runs.
 	if usePendingDeletes {
 		if _, err := pool.Exec(ctx, pendingDeletesDDL); err != nil {
 			return errors.NewStorageError("pending_deletes creation failed", err)
@@ -302,6 +287,28 @@ func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, usePendin
 			if _, err := pool.Exec(ctx, idxDDL); err != nil {
 				return errors.NewStorageError("pending_deletes_p%02d index creation failed", i, err)
 			}
+		}
+	}
+
+	// Partial indexes on txs for iterator/pruner queries. The base indexes are
+	// always applied. The BRIN on delete_at_height is conditional: when the
+	// pending_deletes side-table is enabled the pruner reads from that table
+	// instead, so the BRIN is unnecessary overhead — drop it (with a one-time
+	// backfill first). When disabled (default), the pruner scans txs directly
+	// and the BRIN is required.
+	//
+	// The pending_deletes table is created above (flag-ON path) so the backfill
+	// INSERT can run while the BRIN still exists for a fast index-assisted scan.
+	if _, err := pool.Exec(ctx, txsIndexesDDLBase); err != nil {
+		return errors.NewStorageError("txs base index creation failed", err)
+	}
+	if usePendingDeletes {
+		if _, err := pool.Exec(ctx, txsDAHBrinBackfillAndDropDDL); err != nil {
+			return errors.NewStorageError("px_delete_at_height backfill+drop failed", err)
+		}
+	} else {
+		if _, err := pool.Exec(ctx, txsDAHBrinDDL); err != nil {
+			return errors.NewStorageError("px_delete_at_height creation failed", err)
 		}
 	}
 
@@ -423,6 +430,31 @@ const txsDAHBrinDDL = `CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs USI
 // IS in use. The pruner reads from pending_deletes directly, so the BRIN index
 // on txs is unnecessary overhead.
 const txsDAHBrinDropDDL = `DROP INDEX IF EXISTS px_delete_at_height;`
+
+// txsDAHBrinBackfillAndDropDDL is the one-time migration used when the
+// pending_deletes flag is turned ON against an existing database.
+//
+// The gated DO block runs only when the BRIN index px_delete_at_height still
+// exists (i.e. the DB was previously running with flag OFF). In that case it
+// backfills pending_deletes from any txs rows that already carry a non-NULL
+// delete_at_height (orphaned rows the side-table pruner would otherwise never
+// see), then drops the BRIN. The INSERT runs BEFORE the DROP so it can use the
+// BRIN for a fast index-assisted scan rather than a full sequential scan.
+//
+// ON CONFLICT (hash) DO NOTHING makes the INSERT idempotent: rows already in
+// pending_deletes (e.g. from a partial earlier run) are skipped cleanly.
+//
+// On all subsequent flag-ON startups the BRIN is already gone so the IF EXISTS
+// guard is false — neither the INSERT nor the DROP executes, avoiding a seq-scan.
+const txsDAHBrinBackfillAndDropDDL = `
+DO $$ BEGIN
+  IF EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height') THEN
+    INSERT INTO pending_deletes (hash, delete_at_height)
+      SELECT hash, delete_at_height FROM txs WHERE delete_at_height IS NOT NULL
+      ON CONFLICT (hash) DO NOTHING;
+    DROP INDEX px_delete_at_height;
+  END IF;
+END $$;`
 
 // pendingDeletesDDL creates the pending_deletes partitioned parent table. Each
 // hash partition leaf is created separately in createSchemaWithPoolFlag.

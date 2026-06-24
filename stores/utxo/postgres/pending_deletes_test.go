@@ -535,3 +535,85 @@ func runWorkloadAndPrune(t *testing.T, flagOn bool) pruneResult {
 	}
 	return res
 }
+
+// TestPendingDeletes_BackfillOnEnable verifies the one-time backfill migration:
+// when the PostgresUsePendingDeletesTable flag is turned ON against an existing DB
+// that already has txs rows with non-NULL delete_at_height, those rows must be
+// copied into pending_deletes and the BRIN index must be dropped.
+//
+// Steps:
+//  1. Build a store with flag OFF (BRIN present, no pending_deletes).
+//  2. Insert a tx with a non-NULL delete_at_height via direct UPDATE (simulates
+//     a pre-existing stamp from an earlier run without the flag).
+//  3. Re-init the schema with flag ON (same pool via createSchemaWithPoolFlag).
+//  4. Assert: stamped hash is in pending_deletes with correct delete_at_height,
+//     and the BRIN px_delete_at_height is gone.
+//  5. Idempotency: call flag-ON init again; no error, no duplicate (PK),
+//     and the BRIN absence is stable.
+func TestPendingDeletes_BackfillOnEnable(t *testing.T) {
+	ctx := context.Background()
+
+	// Step 1: build a fresh store with flag OFF (BRIN present, no pending_deletes).
+	st := newTestStoreWithFlag(t, false)
+	pool := st.pool
+
+	// Confirm precondition: BRIN present, no pending_deletes.
+	var hasBrin bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
+	require.True(t, hasBrin, "precondition: BRIN must be present with flag OFF")
+
+	var hasPD bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='pending_deletes' AND relkind='p')`).Scan(&hasPD))
+	require.False(t, hasPD, "precondition: pending_deletes must not exist with flag OFF")
+
+	// Step 2: insert a tx row with a non-NULL delete_at_height (simulate pre-existing stamp).
+	// Use testExtendedTx to get a valid tx, Create it via the store (populates txs), then
+	// UPDATE its delete_at_height directly.
+	tx := testExtendedTx(t)
+	_, err := st.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	hashBytes := tx.TxIDChainHash()[:]
+	const stampedDAH = int32(500)
+	_, err = pool.Exec(ctx,
+		`UPDATE txs SET delete_at_height = $1 WHERE hash = $2`, stampedDAH, hashBytes)
+	require.NoError(t, err)
+
+	// Confirm the stamp is in txs.
+	var dah *int32
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash = $1`, hashBytes).Scan(&dah))
+	require.NotNil(t, dah, "precondition: tx must have delete_at_height stamped in txs")
+	require.Equal(t, stampedDAH, *dah)
+
+	// Step 3: re-init schema with flag ON. This must backfill pending_deletes
+	// (INSERT … SELECT from txs while BRIN still exists) then drop the BRIN.
+	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, true))
+
+	// Step 4a: stamped hash must be in pending_deletes with correct delete_at_height.
+	var pdDAH *int32
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM pending_deletes WHERE hash = $1`, hashBytes).Scan(&pdDAH))
+	require.NotNil(t, pdDAH, "stamped tx must be present in pending_deletes after backfill")
+	require.Equal(t, stampedDAH, *pdDAH, "delete_at_height in pending_deletes must match txs value")
+
+	// Step 4b: BRIN must be gone.
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
+	require.False(t, hasBrin, "BRIN px_delete_at_height must be dropped after flag-ON init")
+
+	// Step 5: idempotency — call flag-ON init again; must succeed, no duplicate error,
+	// and the hash is still present exactly once.
+	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, true), "second flag-ON init must be idempotent")
+
+	var count int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM pending_deletes WHERE hash = $1`, hashBytes).Scan(&count))
+	require.Equal(t, 1, count, "idempotent re-run must not duplicate the row in pending_deletes")
+
+	// BRIN must still be absent.
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
+	require.False(t, hasBrin, "BRIN must remain absent after second flag-ON init")
+}
