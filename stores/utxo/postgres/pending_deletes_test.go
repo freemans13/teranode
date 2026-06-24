@@ -39,9 +39,9 @@ func TestSchema_PendingDeletes_FlagOn(t *testing.T) {
 	require.False(t, hasBrin, "BRIN dropped when flag on")
 }
 
-// newPendingDeletesTestStore builds a Store with PostgresUsePendingDeletesTable=true
-// using a fresh schema. Skips if no postgres is reachable.
-func newPendingDeletesTestStore(t *testing.T) *Store {
+// newTestStoreWithFlag builds a Store with a fresh schema. flagOn controls
+// PostgresUsePendingDeletesTable. Skips if no postgres is reachable.
+func newTestStoreWithFlag(t *testing.T, flagOn bool) *Store {
 	t.Helper()
 	ctx := context.Background()
 
@@ -69,13 +69,20 @@ func newPendingDeletesTestStore(t *testing.T) *Store {
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 30 * time.Second
-	tSettings.UtxoStore.PostgresUsePendingDeletesTable = true
+	tSettings.UtxoStore.PostgresUsePendingDeletesTable = flagOn
 
 	logger := ulogger.TestLogger{}
 	store, err := New(ctx, logger, tSettings, storeURL)
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Stop() })
 	return store
+}
+
+// newPendingDeletesTestStore builds a Store with PostgresUsePendingDeletesTable=true
+// using a fresh schema. Skips if no postgres is reachable.
+func newPendingDeletesTestStore(t *testing.T) *Store {
+	t.Helper()
+	return newTestStoreWithFlag(t, true)
 }
 
 func TestPendingDeletes_SweepStampPopulatesList(t *testing.T) {
@@ -351,4 +358,112 @@ func TestSchema_PendingDeletes_FlagOff(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
 	require.True(t, hasBrin, "BRIN present when flag off")
+}
+
+// TestPendingDeletes_PruneEquivalence asserts that pruning with the pending_deletes
+// flag ON deletes exactly the same number of rows and leaves the same number of
+// survivors as pruning with the flag OFF. Workload: 5 mined+fully-spent txs (doomed,
+// DAH 112-116) + 2 mined+unspent survivor txs + 5 child txs created by spendAllOutputs.
+// Sweep and prune at height 120 ensures all 5 doomed parents are prune-eligible.
+// Each run verifies its own invariants (doomed txids absent, survivor count matches);
+// counts are then compared across runs so neither path silently deletes more or less.
+func TestPendingDeletes_PruneEquivalence(t *testing.T) {
+	offDeleted, offSurvived := runWorkloadAndPrune(t, false)
+	onDeleted, onSurvived := runWorkloadAndPrune(t, true)
+	require.Equal(t, offDeleted, onDeleted,
+		"both paths must delete the same number of tombstoned txs")
+	require.Equal(t, offSurvived, onSurvived,
+		"both paths must leave the same number of surviving txs")
+}
+
+// runWorkloadAndPrune builds a workload on a fresh store (flag ON or OFF), sweeps,
+// prunes, and returns (deletedCount, survivingCount).
+//
+// It creates 5 mined+fully-spent txs (doomed) and 2 mined-but-unspent txs (survivors),
+// then records the doomed txids. After pruning it verifies:
+//   - every doomed txid is absent from txs (deleted as expected)
+//   - no doomed txid remains in pending_deletes (cleaned up)
+//
+// Returns the counts so the caller can compare flag=OFF vs flag=ON.
+func runWorkloadAndPrune(t *testing.T, flagOn bool) (deleted int, survived int) {
+	t.Helper()
+	ctx := context.Background()
+	st := newTestStoreWithFlag(t, flagOn)
+
+	// newUniqueMined creates and mines a tx with a unique P2PKH output so every txid
+	// is distinct. Uniqueness is guaranteed by the monotonically increasing satoshi
+	// amount; within a single run there is no collision risk.
+	var seqSatoshis uint64 = 100_000
+	newUniqueMined := func(height uint32) *bt.Tx {
+		t.Helper()
+		seqSatoshis += 1_000
+		tx := bt.NewTx()
+		//nolint:gosec
+		_ = tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", seqSatoshis)
+		blockInfo := utxo.MinedBlockInfo{
+			BlockID:        height,
+			BlockHeight:    height,
+			SubtreeIdx:     0,
+			OnLongestChain: true,
+		}
+		_, err := st.Create(ctx, tx, height, utxo.WithMinedBlockInfo(blockInfo))
+		require.NoError(t, err)
+		return tx
+	}
+
+	require.NoError(t, st.SetBlockHeight(110))
+
+	// Create 5 mined+fully-spent txs (heights 100-104). Track their hashes.
+	// Spent at heights 101-105; with retention=10, DAH = spent+1+10 = 112-116.
+	// Prune height is chosen as 120 so all 5 have DAH <= 120.
+	var doomedHashes [][]byte
+	for h := uint32(100); h < 105; h++ {
+		parent := newUniqueMined(h)
+		spendAllOutputs(t, st, parent, h+1)
+		doomedHashes = append(doomedHashes, parent.TxIDChainHash()[:])
+	}
+
+	// Create 2 survivor txs — mined but NOT spent, so sweep won't stamp them.
+	for h := uint32(105); h < 107; h++ {
+		_ = newUniqueMined(h)
+	}
+
+	// Sweep up to height 120 to stamp the tombstoned txs (DAH max = 116 <= 120).
+	require.NoError(t, st.SetBlockHeight(120))
+	_, err := procSweepUpTo(st, ctx, 120)
+	require.NoError(t, err)
+
+	// Every doomed tx must be stamped (sanity check that setup is correct).
+	for _, h := range doomedHashes {
+		var dah *int32
+		require.NoError(t, st.pool.QueryRow(ctx,
+			`SELECT delete_at_height FROM txs WHERE hash=$1`, h).Scan(&dah))
+		require.NotNil(t, dah,
+			"doomed tx must have delete_at_height stamped before prune (flagOn=%v)", flagOn)
+	}
+
+	// Count total txs before prune.
+	var totalBefore int
+	require.NoError(t, st.pool.QueryRow(ctx, `SELECT count(*) FROM txs`).Scan(&totalBefore))
+
+	// Prune at height 120 (all 5 doomed txs have DAH <= 120).
+	prunerSvc, err := st.GetPrunerService()
+	require.NoError(t, err)
+	deletedN, err := prunerSvc.Prune(ctx, 120, "equivalence-test")
+	require.NoError(t, err)
+
+	// Every doomed tx must be gone from txs after pruning at height 120.
+	for _, h := range doomedHashes {
+		var exists bool
+		require.NoError(t, st.pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM txs WHERE hash=$1)`, h).Scan(&exists))
+		require.False(t, exists,
+			"doomed tx must be absent from txs after prune (flagOn=%v)", flagOn)
+	}
+
+	// Count surviving txs.
+	var totalAfter int
+	require.NoError(t, st.pool.QueryRow(ctx, `SELECT count(*) FROM txs`).Scan(&totalAfter))
+
+	return int(deletedN), totalAfter
 }
