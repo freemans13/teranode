@@ -2,8 +2,17 @@ package utxo_test
 
 import (
 	"context"
+	"net/url"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	pgstore "github.com/bsv-blockchain/teranode/stores/utxo/postgres"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
@@ -72,4 +81,131 @@ func collectReprSample(ctx context.Context, pool *pgxpool.Pool) (reprSample, err
 		return s, err
 	}
 	return s, nil
+}
+
+// TestThroughput_MainnetRepr drives the real postgres queue store + pruner with
+// a workload shaped to mainnet statistics (out-count, spend-age, survivor rate)
+// and no table-size gate. The live set grows until it reaches targetRows, at
+// which point the test asserts that samples were collected and the set is non-empty.
+//
+// Environment knobs (all optional; tiny smoke-test defaults):
+//
+//	MREPR_TXS_PER_TICK=500        # transactions created per height tick
+//	MREPR_HEIGHT_TICK=250         # ms between height advances
+//	MREPR_GROWTH_TARGET_ROWS=50000 # stop when liveRows >= this
+//	MREPR_SURVIVOR_PROB_PCT=5     # % outputs that are permanent survivors
+//	MREPR_SAMPLE_TICKS=20         # sample every N ticks
+func TestThroughput_MainnetRepr(t *testing.T) {
+	cleanDB(t) // skips if no postgres
+	ctx := context.Background()
+
+	txsPerTick := envInt("MREPR_TXS_PER_TICK", 2000)
+	heightTickMS := envInt("MREPR_HEIGHT_TICK", 250)
+	targetRows := envInt("MREPR_GROWTH_TARGET_ROWS", 50000)
+	survivorPct := envInt("MREPR_SURVIVOR_PROB_PCT", 5)
+	sampleEveryTicks := envInt("MREPR_SAMPLE_TICKS", 20)
+
+	// --- store + pruner setup (matches newPrunedQueueStore pattern) ---
+	storeURL, _ := url.Parse(throughputDSN)
+	storeURL.Scheme = "postgres"
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 60 * time.Second
+	tSettings.UtxoStore.SpendBatcherDurationMillis = 5
+	tSettings.UtxoStore.StoreBatcherDurationMillis = 5
+	tSettings.UtxoStore.SpendBatcherSize = 500
+	tSettings.UtxoStore.StoreBatcherSize = 500
+
+	store, err := pgstore.New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+	store.Start(ctx)
+	t.Cleanup(func() { store.Stop() })
+
+	svc, err := store.GetPrunerService()
+	require.NoError(t, err)
+	driverCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	svc.Start(driverCtx)
+
+	pool, err := pgxpool.New(ctx, throughputDSN)
+	require.NoError(t, err)
+	defer pool.Close()
+	require.NoError(t, resetReprStats(ctx, pool))
+
+	sched := newUTXOScheduler(99, float64(survivorPct)/100.0, 2)
+	idToHash := make(map[uint64]*chainhash.Hash)
+
+	var curH atomic.Int64
+	curH.Store(1)
+	var created atomic.Int64
+	var samples []reprSample
+
+	// --- main loop: NO gate. Advance height, create+spend, mine, prune, sample. ---
+	tick := time.NewTicker(time.Duration(heightTickMS) * time.Millisecond)
+	defer tick.Stop()
+	ticks := 0
+	for {
+		h := uint32(curH.Load())
+		_ = store.SetBlockHeight(h)
+
+		var minedHashes []*chainhash.Hash
+		for i := 0; i < txsPerTick; i++ {
+			id, oc, inputs := sched.createTx(int(h))
+			tx := buildReprTx(id, inputs, oc, idToHash)
+			hash := tx.TxIDChainHash()
+			idToHash[id] = hash
+			if len(inputs) > 0 {
+				_, _ = store.Spend(ctx, tx, h)
+			}
+			if _, createErr := store.Create(ctx, tx, h, utxo.WithLocked(true)); createErr == nil {
+				minedHashes = append(minedHashes, hash)
+			}
+		}
+		if len(minedHashes) > 0 {
+			_, _ = store.SetMinedMulti(ctx, minedHashes, utxo.MinedBlockInfo{BlockID: 1, BlockHeight: h, OnLongestChain: true})
+			created.Add(int64(len(minedHashes)))
+		}
+		_, _ = svc.Prune(driverCtx, h, "bench")
+
+		ticks++
+		if ticks%sampleEveryTicks == 0 {
+			s, sErr := collectReprSample(ctx, pool)
+			require.NoError(t, sErr)
+			s.atUnix = int64(h)
+			samples = append(samples, s)
+			t.Logf("[mrepr] h=%d liveRows=%d txsMB=%d sliceMs=%.0f doomedMs=%.0f delMs=%.0f hit%%=%.1f created=%d",
+				h, s.liveRows, s.txsBytes/(1<<20), s.sliceMs, s.doomedMs, s.deleteMs, s.bufHitPct, created.Load())
+			if s.liveRows >= int64(targetRows) {
+				break
+			}
+		}
+		curH.Add(1)
+		<-tick.C
+	}
+
+	require.NotEmpty(t, samples, "collected at least one sample")
+	last := samples[len(samples)-1]
+	require.Greater(t, last.liveRows, int64(0), "live set grew")
+}
+
+// buildReprTx constructs a *bt.Tx with outCount 1000-sat outputs and a P2PKH
+// locking script, spending the given parent outpoints. Uses LockTime to ensure
+// a unique txid even when inputs is empty (source txs).
+func buildReprTx(id uint64, inputs []outpoint, outCount int, idToHash map[uint64]*chainhash.Hash) *bt.Tx {
+	tx := bt.NewTx()
+	tx.Version = 1
+	lockScript := p2pkhScript()
+	for _, in := range inputs {
+		ph := idToHash[in.tx]
+		if ph == nil {
+			continue
+		}
+		_ = tx.From(ph.String(), in.vout, lockScript.String(), 1000)
+	}
+	for v := 0; v < outCount; v++ {
+		_ = tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000)
+	}
+	// Make txid unique even when there are no inputs (source tx with no parent):
+	tx.LockTime = uint32(id)
+	return tx
 }
