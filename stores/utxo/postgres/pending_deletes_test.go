@@ -617,3 +617,116 @@ func TestPendingDeletes_BackfillOnEnable(t *testing.T) {
 		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
 	require.False(t, hasBrin, "BRIN must remain absent after second flag-ON init")
 }
+
+// ---------------------------------------------------------------------------
+// Design-C: mine-time DAH completion stamp (S6) — Task 1 tests
+// ---------------------------------------------------------------------------
+
+// mineOnLongestChain calls SetMinedMulti(OnLongestChain=true) for the tx hash at the
+// given height. This is the S6 stamp trigger.
+func mineOnLongestChain(t *testing.T, st *Store, h chainhash.Hash, height uint32) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, st.SetBlockHeight(height))
+	_, err := st.SetMinedMulti(ctx, []*chainhash.Hash{&h}, utxo.MinedBlockInfo{
+		BlockID:        height,
+		BlockHeight:    height,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	})
+	require.NoError(t, err)
+}
+
+// hashInPendingDeletes returns true if the hash is present in the pending_deletes table.
+func hashInPendingDeletes(t *testing.T, st *Store, h chainhash.Hash) bool {
+	t.Helper()
+	ctx := context.Background()
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_deletes WHERE hash=$1)`, h[:]).Scan(&exists))
+	return exists
+}
+
+// pendingDeleteHeight returns the delete_at_height from pending_deletes for the hash.
+func pendingDeleteHeight(t *testing.T, st *Store, h chainhash.Hash) int32 {
+	t.Helper()
+	ctx := context.Background()
+	var dah int32
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM pending_deletes WHERE hash=$1`, h[:]).Scan(&dah))
+	return dah
+}
+
+// retentionForTest returns the block-height retention delta for the given store's settings.
+func retentionForTest(st *Store) int32 {
+	return int32(st.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec
+}
+
+// runSweepOnly drives one sweep cycle up to height 105 WITHOUT asserting anything about
+// the hash. Used to confirm the spends-driven sweep skips an unmined tx (the mined-gate).
+func runSweepOnly(t *testing.T, st *Store) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, st.SetBlockHeight(105))
+	_, err := procSweepUpTo(st, ctx, 105)
+	require.NoError(t, err)
+}
+
+// TestPendingDeletes_MineTimeStampClosesOrphan is the Design-C correctness gate (spec §7):
+// a parent whose outputs are all spent while unmined is skipped by the spends-driven sweep
+// (mined-gate). Once that parent is mined onto the longest chain (SetMinedMulti onLongestChain),
+// the mine-time stamp (S6) must stamp delete_at_height and upsert into pending_deletes —
+// closing the "spent-before-mined orphan" gap without any backstop.
+func TestPendingDeletes_MineTimeStampClosesOrphan(t *testing.T) {
+	st := newTestStoreWithFlag(t, true) // pending_deletes flag ON
+
+	pTx := newUnminedSingleOutputTx(t, st) // unmined, 2 spendable outputs
+	p := *pTx.TxIDChainHash()
+
+	spendAllOutputs(t, st, pTx, 50) // spend at height 50 while P unmined
+
+	runSweepOnly(t, st) // spends-driven sweep MUST skip P (mined-gate: block_ids IS NULL)
+
+	require.False(t, hashInPendingDeletes(t, st, p), "unmined P must NOT be stamped by the spends-driven sweep")
+
+	// Mine P onto the longest chain. S6 must stamp P now (mined + fully-spent).
+	mineOnLongestChain(t, st, p, 200)
+
+	require.True(t, hashInPendingDeletes(t, st, p), "mine-time stamp (S6) must stamp now-mined+fully-spent P into pending_deletes")
+}
+
+// TestPendingDeletes_MineTimeNotFullySpent verifies that a partially-spent tx (not all
+// spendable outputs spent) is NOT stamped at mine time.
+func TestPendingDeletes_MineTimeNotFullySpent(t *testing.T) {
+	st := newTestStoreWithFlag(t, true)
+
+	pTx := newUnminedSingleOutputTx(t, st) // 2 spendable outputs
+	p := *pTx.TxIDChainHash()
+
+	spendOneOutput(t, st, pTx, 0, 50) // spend ONLY output 0 — still partially spent
+
+	mineOnLongestChain(t, st, p, 200)
+
+	require.False(t, hashInPendingDeletes(t, st, p), "partially-spent tx must NOT be stamped at mine time")
+}
+
+// TestPendingDeletes_MineTimeCompletionHeightUsesGreatest verifies the DAH formula:
+// GREATEST(max(spent_at_height), minedHeight) + 1 + retention. When the tx is mined
+// much later than it was spent, DAH must derive from minedHeight (the larger value).
+func TestPendingDeletes_MineTimeCompletionHeightUsesGreatest(t *testing.T) {
+	st := newTestStoreWithFlag(t, true)
+
+	pTx := newUnminedSingleOutputTx(t, st) // 2 spendable outputs
+	p := *pTx.TxIDChainHash()
+
+	spendAllOutputs(t, st, pTx, 50) // spend at height 50
+
+	const minedHeight = uint32(5000) // mine much later than spend (GREATEST picks minedHeight)
+	mineOnLongestChain(t, st, p, minedHeight)
+
+	retention := retentionForTest(st)
+	dah := pendingDeleteHeight(t, st, p)
+	// GREATEST(50, 5000) = 5000; DAH = 5000 + 1 + retention
+	require.Equal(t, int32(minedHeight)+1+retention, dah, //nolint:gosec
+		"late mine: DAH must be derived from GREATEST(max_spent_height, minedHeight)")
+}

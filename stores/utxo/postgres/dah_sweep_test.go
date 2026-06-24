@@ -121,22 +121,28 @@ func mineTx(t *testing.T, store *Store, tx *bt.Tx, minedHeight uint32) {
 	require.NoError(t, err)
 }
 
-func TestSetMinedTagsHeightAndDoesNotStampInline(t *testing.T) {
+func TestSetMinedStampsFullySpentAndTagsHeight(t *testing.T) {
+	// Design-C (S6): when a tx is mined onto the longest chain and is already fully
+	// spent (spent-before-mined ordering), SetMinedMulti must stamp delete_at_height
+	// AND record mined_at_height. This replaces the old "DoesNotStampInline" assertion
+	// which documented pre-Design-C behaviour.
 	store, ctx := setupTestStore(t)
+	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
 
 	tx := newUnminedSingleOutputTx(t, store)
-	spendAllOutputs(t, store, tx, 50) // fully spent while unmined
-	mineTx(t, store, tx, 60)          // SetMinedMulti at height 60
+	spendAllOutputs(t, store, tx, 50) // fully spent at height 50 while unmined
+	mineTx(t, store, tx, 60)          // SetMinedMulti at height 60; GREATEST(50,60)=60
 
 	var dah *int64
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT delete_at_height FROM txs WHERE hash=$1`, tx.TxIDChainHash()[:]).Scan(&dah))
-	require.Nil(t, dah, "set-mined must not stamp delete_at_height inline")
+	require.NotNil(t, dah, "S6: set-mined must stamp delete_at_height for fully-spent tx")
+	require.Equal(t, int64(60)+1+ret, *dah, "DAH = GREATEST(spentHeight=50, minedHeight=60)+1+retention")
 
 	var mh *int64
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT mined_at_height FROM txs WHERE hash=$1`, tx.TxIDChainHash()[:]).Scan(&mh))
-	require.NotNil(t, mh, "set-mined must tag mined_at_height for Worker 2")
+	require.NotNil(t, mh, "set-mined must tag mined_at_height")
 }
 
 func TestSpendTagsHeightAndDoesNotStampInline(t *testing.T) {

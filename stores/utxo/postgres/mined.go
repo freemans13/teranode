@@ -66,15 +66,27 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	var updateSQL string
 	if minedBlockInfo.OnLongestChain {
 		// Record mined_at_height for the deferred DAH sweep, and stamp DAH INLINE for
-		// the one subset the spends-driven sweep can never see: txs that are fully
-		// spent the instant they are mined with NO spend landing in a swept window —
-		// i.e. zero-spendable / all-OP_RETURN txs (spendable_count = 0, out_count > 0).
-		// For those, completion height = this mined height ($5), so
-		// delete_at_height = $5 + 1 + retention ($6). This is a single extra column on
-		// an UPDATE that already runs; delete_at_height is BRIN-indexed so it does NOT
-		// break HOT. preserve_until guards a preserved tx. The rarer spent-while-unmined
-		// case is left to the by-hash backstop. The sweep itself no longer scans txs by
-		// mined_at_height at all.
+		// any tx that is now FULLY SPENT at the mine event (Design-C, stamp site S6).
+		// This generalizes the old zero-spendable inline stamp and closes the
+		// "spent-before-mined" orphan gap: a tx whose outputs are all spent while it is
+		// unmined is excluded by the spends-driven sweep's mined-gate, so without S6 it
+		// would only be caught by the O(table) backstop. S6 evaluates fully-spent right
+		// here, covering both orderings (mined-then-spent is covered by the sweep;
+		// spent-then-mined is covered here).
+		//
+		// The CASE predicate:
+		//   guard: preserve_until IS NULL AND out_count > 0
+		//   zero-spendable: spendable_count = 0 (cheap, no join — the old case)
+		//   OR fully-spent: EXISTS(spends for this tx) AND
+		//       spendable_count = count(spends where output IS spendable)
+		// The EXISTS pre-filter is REQUIRED: for freshly-mined txs whose outputs are NOT
+		// yet spent (the common case), EXISTS returns false immediately and the costlier
+		// count/max subqueries are never evaluated. Only the rare spent-before-mined
+		// orphans pay the join cost.
+		//
+		// Completion-height formula: GREATEST(max(spent_at_height), $5/*minedHeight*/)
+		// + 1 + $6/*retention*/ — matches the sweep and backstop so a late mine cannot
+		// schedule deletion too early. Cast to int to satisfy the INT4 column.
 		//
 		// mined_at_height is the height of the block this tx is mined into
 		// (minedBlockInfo.BlockHeight), bound as $5 — NOT the store's current
@@ -84,7 +96,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// cache entry across heights (a literal would re-plan per height).
 		//
 		// When the pending_deletes flag is ON, the UPDATE is wrapped in a CTE so that
-		// any zero-spendable tx that gets an inline DAH stamp is also upserted into
+		// any fully-spent tx that gets an inline DAH stamp is also upserted into
 		// pending_deletes in the same statement. The outer SELECT returns hash, block_ids
 		// so the drain loop is unchanged.
 		if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
@@ -96,8 +108,20 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 					locked = false, unmined_since = NULL,
 					mined_at_height = $5,
 					delete_at_height = CASE
-						WHEN spendable_count = 0 AND out_count > 0 AND preserve_until IS NULL
-						THEN $5 + 1 + $6
+						WHEN preserve_until IS NULL AND out_count > 0 AND (
+							spendable_count = 0
+							OR (
+								EXISTS (SELECT 1 FROM spends s WHERE s.prev_tx_hash = txs.hash)
+								AND spendable_count = (
+									SELECT count(*) FROM spends s
+									WHERE s.prev_tx_hash = txs.hash
+									  AND CASE WHEN s.prev_output_idx < txs.out_count
+									           THEN get_bit(txs.out_spendables, s.prev_output_idx) = 1
+									           ELSE false END)
+							))
+						THEN (GREATEST(
+								COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = txs.hash), 0),
+								$5) + 1 + $6)::int
 						ELSE delete_at_height
 					END
 				WHERE hash = ANY($1)
@@ -117,8 +141,20 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 					locked = false, unmined_since = NULL,
 					mined_at_height = $5,
 					delete_at_height = CASE
-						WHEN spendable_count = 0 AND out_count > 0 AND preserve_until IS NULL
-						THEN $5 + 1 + $6
+						WHEN preserve_until IS NULL AND out_count > 0 AND (
+							spendable_count = 0
+							OR (
+								EXISTS (SELECT 1 FROM spends s WHERE s.prev_tx_hash = txs.hash)
+								AND spendable_count = (
+									SELECT count(*) FROM spends s
+									WHERE s.prev_tx_hash = txs.hash
+									  AND CASE WHEN s.prev_output_idx < txs.out_count
+									           THEN get_bit(txs.out_spendables, s.prev_output_idx) = 1
+									           ELSE false END)
+							))
+						THEN (GREATEST(
+								COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = txs.hash), 0),
+								$5) + 1 + $6)::int
 						ELSE delete_at_height
 					END
 				WHERE hash = ANY($1)
