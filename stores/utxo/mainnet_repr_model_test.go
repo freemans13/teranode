@@ -104,26 +104,26 @@ func (s *spendAgeSampler) sample() int {
 	}
 }
 
-func TestUTXOScheduler_DueOnlyAtScheduledHeight(t *testing.T) {
-	// survivorProb 0 so every output is eventually spendable; 1 input/tx.
-	s := newUTXOScheduler(1, 0.0, 1)
-	// Create a batch of source txs at height 0; with no due outpoints yet,
-	// inputs must be empty.
-	for i := 0; i < 50; i++ {
-		_, oc, in := s.createTx(0)
-		require.GreaterOrEqual(t, oc, 1)
-		require.Empty(t, in, "no outpoints due at height 0 right after creation")
+func TestUTXOScheduler_SameBlockAndFutureSpends(t *testing.T) {
+	s := newUTXOScheduler(1, 0.0, 8) // no survivors, up to 8 inputs/tx
+	// First tx at height 0: nothing created yet => no inputs.
+	_, _, in0 := s.createTx(0)
+	require.Empty(t, in0, "first tx at height 0 has nothing to spend")
+	// More txs at height 0: age-0 (same-block, ~10%) outputs from earlier txs
+	// become due at height 0 under <= semantics and get consumed.
+	sameBlock := 0
+	for i := 0; i < 2000; i++ {
+		_, _, in := s.createTx(0)
+		sameBlock += len(in)
 	}
-	// Advancing far ahead, some outputs scheduled within range become due and
-	// are consumed as inputs by new txs.
-	var sawInput bool
-	for h := 1; h <= 7000 && !sawInput; h++ {
+	require.Positive(t, sameBlock, "same-block (age 0) spends must be consumable at creation height (<= semantics)")
+	// Advancing ahead, the longer-age cohort comes due and is consumed too.
+	future := 0
+	for h := 1; h <= 7000; h++ {
 		_, _, in := s.createTx(h)
-		if len(in) > 0 {
-			sawInput = true
-		}
+		future += len(in)
 	}
-	require.True(t, sawInput, "some scheduled outputs should come due and be spent")
+	require.Positive(t, future, "scheduled outputs come due at later heights")
 }
 
 func TestUTXOScheduler_SurvivorsNeverComplete(t *testing.T) {
@@ -194,7 +194,7 @@ func newUTXOScheduler(seed int64, survivorProb float64, inputsPerTx int) *utxoSc
 func (s *utxoScheduler) createTx(height int) (uint64, int, []outpoint) {
 	// Consume up to inputsPerTx already-due outpoints as this tx's inputs.
 	var inputs []outpoint
-	for len(inputs) < s.inputsPerTx && s.pending.Len() > 0 && s.pending[0].dueHeight < height {
+	for len(inputs) < s.inputsPerTx && s.pending.Len() > 0 && s.pending[0].dueHeight <= height {
 		ps := heap.Pop(&s.pending).(pendingSpend)
 		inputs = append(inputs, ps.op)
 		if r := s.remaining[ps.op.tx]; r > 0 {
