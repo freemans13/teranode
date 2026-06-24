@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -360,35 +361,88 @@ func TestSchema_PendingDeletes_FlagOff(t *testing.T) {
 	require.True(t, hasBrin, "BRIN present when flag off")
 }
 
-// TestPendingDeletes_PruneEquivalence asserts that pruning with the pending_deletes
-// flag ON deletes exactly the same number of rows and leaves the same number of
-// survivors as pruning with the flag OFF. Workload: 5 mined+fully-spent txs (doomed,
-// DAH 112-116) + 2 mined+unspent survivor txs + 5 child txs created by spendAllOutputs.
-// Sweep and prune at height 120 ensures all 5 doomed parents are prune-eligible.
-// Each run verifies its own invariants (doomed txids absent, survivor count matches);
-// counts are then compared across runs so neither path silently deletes more or less.
+// TestPendingDeletes_PruneEquivalence is the headline correctness gate for the whole
+// feature (spec §8): with the pending_deletes flag ON the pruner must delete EXACTLY
+// the same SET of tx hashes — the doomed (mined+fully-spent) parents — and leave EXACTLY
+// the same survivors as with the flag OFF. A count-only check would pass even if the ON
+// path pruned a different row than OFF (wrong set, same total), so the required assertion
+// is require.ElementsMatch on the actual hash SETS.
+//
+// Each run builds its workload on a truly fresh per-flag DB. The spending-child txs that
+// spendAllOutputs creates carry RANDOM txids (getSpendingTx uses rand.Uint64), so the raw
+// hashes are NOT reproducible across the two runs — comparing the two runs' survivor lists
+// directly would spuriously fail. Instead each run reports, against ITS OWN created hashes,
+// which were pruned and which survived; the gate then asserts:
+//   - in BOTH runs the pruned set equals exactly the doomed set (ElementsMatch) — i.e.
+//     every doomed parent removed and NO survivor removed (catches "wrong set, same count");
+//   - in BOTH runs the survivor set equals exactly created−doomed (ElementsMatch);
+//   - the two runs prune the same number of rows and the same number survive.
+//
+// This proves the side-table path prunes exactly what the BRIN path prunes, set-for-set,
+// and is non-vacuous (5 doomed parents removed, 7 non-doomed rows survive).
 func TestPendingDeletes_PruneEquivalence(t *testing.T) {
-	offDeleted, offSurvived := runWorkloadAndPrune(t, false)
-	onDeleted, onSurvived := runWorkloadAndPrune(t, true)
-	require.Equal(t, offDeleted, onDeleted,
-		"both paths must delete the same number of tombstoned txs")
-	require.Equal(t, offSurvived, onSurvived,
-		"both paths must leave the same number of surviving txs")
+	off := runWorkloadAndPrune(t, false)
+	on := runWorkloadAndPrune(t, true)
+
+	// Per-run set gate: pruned == doomed exactly, survivors == created−doomed exactly.
+	// (assertRoleSets runs these for each flag and fails loudly identifying the flag.)
+	off.assertRoleSets(t, false)
+	on.assertRoleSets(t, true)
+
+	// Cross-run equivalence: identical pruned-count and survivor-count. (The per-run
+	// role-set checks above already prove WHICH logical rows each path removes; the raw
+	// hashes differ only by the random child txids, so counts are the cross-run gate.)
+	require.Equal(t, len(off.prunedHashes), len(on.prunedHashes),
+		"flag ON must prune the same number of rows as flag OFF")
+	require.Equal(t, len(off.survivingHashes), len(on.survivingHashes),
+		"flag ON must leave the same number of survivors as flag OFF")
+}
+
+// pruneResult captures, for one workload run, the role-tagged hash sets (hex) so the
+// equivalence gate can assert SETS (not counts) of what was pruned vs. what survived.
+type pruneResult struct {
+	doomedHashes    []string // mined+fully-spent parents that MUST be pruned
+	createdHashes   []string // every tx this run inserted into txs (parents, survivors, children)
+	prunedHashes    []string // created hashes absent from txs after prune (read back from DB)
+	survivingHashes []string // created hashes still present in txs after prune (read back from DB)
+}
+
+// assertRoleSets is the spec §8 set assertion for a single run: the pruned set must equal
+// exactly the doomed set, and the survivor set must equal exactly created−doomed. Using
+// ElementsMatch (not counts) is what catches a "wrong set, same count" prune.
+func (r pruneResult) assertRoleSets(t *testing.T, flagOn bool) {
+	t.Helper()
+	require.ElementsMatch(t, r.doomedHashes, r.prunedHashes,
+		"flagOn=%v: pruner must delete exactly the doomed set (no survivor deleted, no doomed kept)", flagOn)
+
+	expectedSurvivors := make([]string, 0, len(r.createdHashes))
+	doomedSet := make(map[string]struct{}, len(r.doomedHashes))
+	for _, h := range r.doomedHashes {
+		doomedSet[h] = struct{}{}
+	}
+	for _, h := range r.createdHashes {
+		if _, isDoomed := doomedSet[h]; !isDoomed {
+			expectedSurvivors = append(expectedSurvivors, h)
+		}
+	}
+	require.ElementsMatch(t, expectedSurvivors, r.survivingHashes,
+		"flagOn=%v: survivors must be exactly created−doomed", flagOn)
+	require.NotEmpty(t, r.survivingHashes, "flagOn=%v: workload must leave survivors (non-vacuous)", flagOn)
+	require.NotEmpty(t, r.prunedHashes, "flagOn=%v: workload must prune something (non-vacuous)", flagOn)
 }
 
 // runWorkloadAndPrune builds a workload on a fresh store (flag ON or OFF), sweeps,
-// prunes, and returns (deletedCount, survivingCount).
+// prunes, and returns the role-tagged hash sets for the equivalence gate.
 //
-// It creates 5 mined+fully-spent txs (doomed) and 2 mined-but-unspent txs (survivors),
-// then records the doomed txids. After pruning it verifies:
-//   - every doomed txid is absent from txs (deleted as expected)
-//   - no doomed txid remains in pending_deletes (cleaned up)
-//
-// Returns the counts so the caller can compare flag=OFF vs flag=ON.
-func runWorkloadAndPrune(t *testing.T, flagOn bool) (deleted int, survived int) {
+// It creates 5 mined+fully-spent txs (doomed) + 5 spending children + 2 mined-but-unspent
+// survivor txs. After pruning it reads back, against the hashes this run created, which
+// were removed (pruned) and which remain (survived).
+func runWorkloadAndPrune(t *testing.T, flagOn bool) pruneResult {
 	t.Helper()
 	ctx := context.Background()
 	st := newTestStoreWithFlag(t, flagOn)
+
+	hexOf := func(b []byte) string { return fmt.Sprintf("%x", b) }
 
 	// newUniqueMined creates and mines a tx with a unique P2PKH output so every txid
 	// is distinct. Uniqueness is guaranteed by the monotonically increasing satoshi
@@ -413,14 +467,15 @@ func runWorkloadAndPrune(t *testing.T, flagOn bool) (deleted int, survived int) 
 
 	require.NoError(t, st.SetBlockHeight(110))
 
-	// Create 5 mined+fully-spent txs (heights 100-104). Track their hashes.
+	// Create 5 mined+fully-spent txs (heights 100-104). Track their hashes as doomed.
 	// Spent at heights 101-105; with retention=10, DAH = spent+1+10 = 112-116.
-	// Prune height is chosen as 120 so all 5 have DAH <= 120.
-	var doomedHashes [][]byte
+	// Prune height is chosen as 120 so all 5 have DAH <= 120. spendAllOutputs also
+	// inserts a spending child tx (random txid) — a non-doomed row that must survive.
+	var doomed [][]byte
 	for h := uint32(100); h < 105; h++ {
 		parent := newUniqueMined(h)
 		spendAllOutputs(t, st, parent, h+1)
-		doomedHashes = append(doomedHashes, parent.TxIDChainHash()[:])
+		doomed = append(doomed, parent.TxIDChainHash()[:])
 	}
 
 	// Create 2 survivor txs — mined but NOT spent, so sweep won't stamp them.
@@ -428,13 +483,27 @@ func runWorkloadAndPrune(t *testing.T, flagOn bool) (deleted int, survived int) 
 		_ = newUniqueMined(h)
 	}
 
+	// Snapshot EVERY hash now in txs as this run's created set (parents + survivors +
+	// the random-txid spending children). We read it from the DB rather than tracking
+	// return values because spendAllOutputs does not surface the child it inserts.
+	var created [][]byte
+	createdRows, err := st.pool.Query(ctx, `SELECT hash FROM txs`)
+	require.NoError(t, err)
+	for createdRows.Next() {
+		var h []byte
+		require.NoError(t, createdRows.Scan(&h))
+		created = append(created, h)
+	}
+	require.NoError(t, createdRows.Err())
+	createdRows.Close()
+
 	// Sweep up to height 120 to stamp the tombstoned txs (DAH max = 116 <= 120).
 	require.NoError(t, st.SetBlockHeight(120))
-	_, err := procSweepUpTo(st, ctx, 120)
+	_, err = procSweepUpTo(st, ctx, 120)
 	require.NoError(t, err)
 
 	// Every doomed tx must be stamped (sanity check that setup is correct).
-	for _, h := range doomedHashes {
+	for _, h := range doomed {
 		var dah *int32
 		require.NoError(t, st.pool.QueryRow(ctx,
 			`SELECT delete_at_height FROM txs WHERE hash=$1`, h).Scan(&dah))
@@ -442,28 +511,27 @@ func runWorkloadAndPrune(t *testing.T, flagOn bool) (deleted int, survived int) 
 			"doomed tx must have delete_at_height stamped before prune (flagOn=%v)", flagOn)
 	}
 
-	// Count total txs before prune.
-	var totalBefore int
-	require.NoError(t, st.pool.QueryRow(ctx, `SELECT count(*) FROM txs`).Scan(&totalBefore))
-
 	// Prune at height 120 (all 5 doomed txs have DAH <= 120).
 	prunerSvc, err := st.GetPrunerService()
 	require.NoError(t, err)
-	deletedN, err := prunerSvc.Prune(ctx, 120, "equivalence-test")
+	_, err = prunerSvc.Prune(ctx, 120, "equivalence-test")
 	require.NoError(t, err)
 
-	// Every doomed tx must be gone from txs after pruning at height 120.
-	for _, h := range doomedHashes {
+	// Read back, per created hash, whether it was pruned (absent) or survived (present).
+	res := pruneResult{}
+	for _, h := range doomed {
+		res.doomedHashes = append(res.doomedHashes, hexOf(h))
+	}
+	for _, h := range created {
+		res.createdHashes = append(res.createdHashes, hexOf(h))
 		var exists bool
 		require.NoError(t, st.pool.QueryRow(ctx,
 			`SELECT EXISTS(SELECT 1 FROM txs WHERE hash=$1)`, h).Scan(&exists))
-		require.False(t, exists,
-			"doomed tx must be absent from txs after prune (flagOn=%v)", flagOn)
+		if exists {
+			res.survivingHashes = append(res.survivingHashes, hexOf(h))
+		} else {
+			res.prunedHashes = append(res.prunedHashes, hexOf(h))
+		}
 	}
-
-	// Count surviving txs.
-	var totalAfter int
-	require.NoError(t, st.pool.QueryRow(ctx, `SELECT count(*) FROM txs`).Scan(&totalAfter))
-
-	return int(deletedN), totalAfter
+	return res
 }
