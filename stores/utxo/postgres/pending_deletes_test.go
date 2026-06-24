@@ -730,3 +730,93 @@ func TestPendingDeletes_MineTimeCompletionHeightUsesGreatest(t *testing.T) {
 	require.Equal(t, int32(minedHeight)+1+retention, dah, //nolint:gosec
 		"late mine: DAH must be derived from GREATEST(max_spent_height, minedHeight)")
 }
+
+// ---------------------------------------------------------------------------
+// Design-C Task 2: prune-equivalence without backstop
+// ---------------------------------------------------------------------------
+
+// TestPendingDeletes_PruneEquivalenceNoBackstop is the TDD gate for backstop deletion
+// (spec §7 "prune-equivalence"). It runs a deterministic workload that INCLUDES the
+// spent-before-mined (S6) path and asserts that the pruner removes exactly the doomed
+// set and leaves the live set — with NO backstop involved. This test must pass BEFORE
+// the backstop is deleted (proving S6 covers the orphan gap alone), and must continue
+// to pass AFTER the backstop is deleted.
+//
+// Workload:
+//   - 5 "doomed" parents: each is created unmined, all outputs are spent while still
+//     unmined (the S6 / spent-before-mined ordering), then the parent is mined onto
+//     the longest chain. S6 stamps delete_at_height at mine time.
+//   - 3 "live" parents: mined but NOT fully spent (one output spent, one kept) so
+//     they must NOT be pruned.
+//
+// After advancing height and calling Prune, the test asserts:
+//   - Every doomed parent is absent from txs (pruned).
+//   - Every live parent is still present in txs (survived).
+func TestPendingDeletes_PruneEquivalenceNoBackstop(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStoreWithFlag(t, true) // pending_deletes flag ON
+
+	const (
+		spendHeight = uint32(50)  // all outputs spent at this height (while parents unmined)
+		mineHeight  = uint32(200) // parents mined at this height (GREATEST picks mineHeight)
+	)
+
+	// Build 5 doomed parents: spent-while-unmined, then mined (S6 path).
+	// S6 stamps delete_at_height at mineHeight. DAH = mineHeight+1+retention <= pruneHeight.
+	var doomed [][]byte
+	for i := 0; i < 5; i++ {
+		pTx := newUniqueUnminedTx(t, st)
+		p := *pTx.TxIDChainHash()
+		spendAllOutputs(t, st, pTx, spendHeight) // spend all outputs while unmined
+		mineOnLongestChain(t, st, p, mineHeight) // S6 stamps DAH here
+		doomed = append(doomed, p[:])
+	}
+
+	// Build 3 live parents: mined but NOT fully spent (only one output spent).
+	// The sweep will never stamp them; they must survive prune.
+	var live [][]byte
+	for i := 0; i < 3; i++ {
+		pTx := newUniqueUnminedTx(t, st)
+		mineTx(t, st, pTx, mineHeight)
+		spendOneOutput(t, st, pTx, 0, mineHeight+1) // only output 0 spent → still partially spent
+		live = append(live, pTx.TxIDChainHash()[:])
+	}
+
+	// All 5 doomed parents must already be stamped by S6 (no sweep needed, no backstop).
+	for _, h := range doomed {
+		var dah *int32
+		require.NoError(t, st.pool.QueryRow(ctx,
+			`SELECT delete_at_height FROM txs WHERE hash=$1`, h).Scan(&dah))
+		require.NotNil(t, dah, "doomed parent must be S6-stamped before prune (no backstop)")
+	}
+
+	// Advance height and prune. 500 is well past all DAHs (mineHeight+1+retention <= ~210+10=221).
+	require.NoError(t, st.SetBlockHeight(500))
+	prunerSvc, err := st.GetPrunerService()
+	require.NoError(t, err)
+	_, err = prunerSvc.Prune(ctx, 500, "equivalence-no-backstop")
+	require.NoError(t, err)
+
+	// All doomed parents must be gone from txs.
+	doomedHex := make([]string, 0, len(doomed))
+	prunedHex := make([]string, 0, len(doomed))
+	for _, h := range doomed {
+		doomedHex = append(doomedHex, fmt.Sprintf("%x", h))
+		var exists bool
+		require.NoError(t, st.pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM txs WHERE hash=$1)`, h).Scan(&exists))
+		if !exists {
+			prunedHex = append(prunedHex, fmt.Sprintf("%x", h))
+		}
+	}
+	require.ElementsMatch(t, doomedHex, prunedHex,
+		"all spent-before-mined parents must be pruned by S6 alone (no backstop)")
+
+	// All live parents must still be present.
+	for _, h := range live {
+		var exists bool
+		require.NoError(t, st.pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM txs WHERE hash=$1)`, h).Scan(&exists))
+		require.True(t, exists, "partially-spent live parent must survive prune: %x", h)
+	}
+}

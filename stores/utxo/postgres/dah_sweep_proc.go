@@ -146,8 +146,8 @@ BEGIN
         -- JOIN → correct fully-spent counting), stamp delete_at_height with the exact DAH
         -- formula, and COUNT the stamped rows from the SAME pass: the data-modifying upd
         -- CTE runs once to completion and the outer SELECT counts its RETURNING. Exact DAH
-        -- semantics unchanged (spendable get_bit, GREATEST+1+retention, IS DISTINCT FROM);
-        -- the backstop stays the full unpruned safety net.
+        -- semantics unchanged (spendable get_bit, GREATEST+1+retention, IS DISTINCT FROM).
+        -- The spent-before-mined gap is closed by the mine-time stamp (S6) in SetMinedMulti.
         EXECUTE format($q$
             WITH candidates AS MATERIALIZED (
                 SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
@@ -160,12 +160,11 @@ BEGIN
                 -- every spendable output is consumed, so max_spent is final), and it is
                 -- only cleared by Unspend on reorg — atomically. So re-verifying a
                 -- stamped parent is always a no-op; skip its expensive full-history
-                -- read. The by-hash backstop remains the full, UNPRUNED re-verification
-                -- safety net, so any inconsistency still self-heals. This makes the
-                -- cursor's verification cost scale with NEW completions, not with the
-                -- (mostly already-stamped) backlog. The guards (preserve_until/
-                -- unmined_since/block_ids) are folded in here: those rows are no-ops in
-                -- the stamp formula anyway, so excluding them is equivalent.
+                -- read. This makes the cursor's verification cost scale with NEW
+                -- completions, not with the (mostly already-stamped) backlog.
+                -- The guards (preserve_until/unmined_since/block_ids) are folded in
+                -- here: those rows are no-ops in the stamp formula anyway, so
+                -- excluding them is equivalent.
                 SELECT t.hash, t.out_count, t.out_spendables, t.spendable_count, t.mined_at_height
                   FROM txs_p%1$s t
                   JOIN candidates c ON c.hash = t.hash
@@ -468,8 +467,11 @@ func isInsufficientPrivilege(err error) bool {
 // the parallelism a single sequential-8-partition CALL lost on a cold-cache disk)
 // via sweepAllPartitionsOnce; each CALL drains time-adaptive windows committing
 // per window. Cadence is driven by the real watermark lag (min across partitions):
-// backlog>0 → drain hard (call again immediately), else idle. The keyspace
-// backstop runs as a safety net.
+// backlog>0 → drain hard (call again immediately), else idle.
+//
+// The spent-before-mined orphan gap (previously covered by the O(table) keyspace
+// backstop) is now closed by the mine-time stamp (S6) in SetMinedMulti, so no
+// backstop timer is needed here.
 //
 // A startup smoke CALL verifies COMMIT-inside-CALL is not suppressed by pgx
 // middleware (2D000); there is no Go fallback, so it just logs the root cause.
@@ -489,11 +491,6 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	lag := int64(cfg.PostgresDAHSweepLag)
 	if lag <= 0 {
 		lag = 2
-	}
-
-	batch := cfg.PostgresDAHSweepBatchSize
-	if batch <= 0 {
-		batch = 50000
 	}
 
 	retention := int32(s.store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
@@ -528,25 +525,10 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	sweepTimer := time.NewTimer(0) // fire the first sweep immediately
 	defer sweepTimer.Stop()
 
-	// Adaptive backstop: a timer (not a fixed ticker) so the loop can drop to a
-	// fast cadence while it is actively recovering orphans and relax back to the
-	// idle cadence once the keyspace is clean. See runBackstopBurst.
-	backstopTimer := time.NewTimer(backstopInitialDelay)
-	defer backstopTimer.Stop()
-
-	var backstopByte int
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
-
-		case <-backstopTimer.C:
-			next := s.runBackstopBurst(ctx, &backstopByte, batch)
-			if ctx.Err() != nil {
-				return
-			}
-			backstopTimer.Reset(next)
 
 		case <-sweepTimer.C:
 			safeTip := s.store.dahSafeTip(lag)
@@ -583,62 +565,6 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 			sweepTimer.Reset(next)
 		}
 	}
-}
-
-// runBackstopBurst runs the guarantee-of-last-resort orphan recovery and returns
-// the delay until it should fire again. It scans keyspace slices starting at
-// *byteCursor (rotating, mod 256).
-//
-// In the common (clean) case the first slice finds nothing and it returns
-// immediately with the idle interval — a cheap ~1/256 scan per idle tick. But the
-// forward-only spends-cursor structurally MISSES any parent that was spent BEFORE
-// it was mined (its spend-window was swept while it was still unmined, so it is
-// never re-enumerated). Those orphans can only be recovered here. So the moment a
-// slice stamps orphans this scans the WHOLE keyspace (all 256 slices) in one pass
-// and returns the fast interval, re-checking soon while a backlog may persist —
-// turning a multi-hour single-slice crawl into a seconds-long drain. Bounded to at
-// most one full keyspace pass per call so the cursor's select loop stays
-// responsive; runs on the maintenance pool so it never starves the validator.
-func (s *postgresPrunerService) runBackstopBurst(ctx context.Context, byteCursor *int, limit int) time.Duration {
-	recovered := false
-
-	for scanned := 0; scanned < 256; scanned++ {
-		if ctx.Err() != nil {
-			return backstopInterval
-		}
-
-		b := *byteCursor
-		*byteCursor = (*byteCursor + 1) & 0xff
-
-		n, err := s.store.backstopReconcile(ctx, b, b, limit)
-		if err != nil {
-			if ctx.Err() == nil {
-				s.logger.Infof("[dahBackstop] slice 0x%02x error (best-effort, continuing): %v", b, err)
-			}
-
-			break
-		}
-
-		if n > 0 {
-			s.logger.Infof("[dahBackstop] slice 0x%02x recovered %d missed tx(s)", b, n)
-			recovered = true
-
-			continue
-		}
-
-		// Clean crawl: nothing found this slice and nothing found all call →
-		// touch just one slice per idle tick. Once a slice HAS recovered orphans,
-		// recovered stays true so we keep going for the full pass.
-		if !recovered {
-			break
-		}
-	}
-
-	if recovered {
-		return backstopFastInterval
-	}
-
-	return backstopInterval
 }
 
 // sweepAllPartitionsOnce fires one dah_sweep_batch() CALL per partition IN
