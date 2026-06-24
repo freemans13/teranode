@@ -52,3 +52,53 @@ func (s *outCountSampler) sample() int {
 		return 140 + s.rng.Intn(885) // 140-1024 tail
 	}
 }
+
+func TestSpendAgeSampler_MatchesMainnetShape(t *testing.T) {
+	s := newSpendAgeSampler(7)
+	const n = 200000
+	vals := make([]int, n)
+	var sameBlock, within6 int
+	for i := range vals {
+		v := s.sample()
+		require.GreaterOrEqual(t, v, 0)
+		if v == 0 {
+			sameBlock++
+		}
+		if v <= 6 {
+			within6++
+		}
+		vals[i] = v
+	}
+	sort.Ints(vals)
+	p50, p90 := vals[n/2], vals[n*90/100]
+	require.InDelta(t, 0.10, float64(sameBlock)/n, 0.03, "same-block frac")
+	require.InDelta(t, 0.25, float64(within6)/n, 0.04, "<=6 frac")
+	require.InDelta(t, 215, p50, 60, "p50")
+	require.InDelta(t, 6273, p90, 1200, "p90")
+}
+
+// spendAgeSampler draws heights-until-spent calibrated to mainnet
+// (same-block 10%, <=6 25%, p50 215, p90 6273, p99 47872, max ~154570).
+type spendAgeSampler struct{ rng *rand.Rand }
+
+func newSpendAgeSampler(seed int64) *spendAgeSampler {
+	return &spendAgeSampler{rng: rand.New(rand.NewSource(seed))}
+}
+
+func (s *spendAgeSampler) sample() int {
+	u := s.rng.Float64()
+	switch {
+	case u < 0.10:
+		return 0
+	case u < 0.25:
+		return 1 + s.rng.Intn(6) // 1-6
+	case u < 0.50:
+		return 7 + s.rng.Intn(209) // 7-215
+	case u < 0.90:
+		return 216 + s.rng.Intn(6058) // 216-6273
+	case u < 0.99:
+		return 6274 + s.rng.Intn(41599) // 6274-47872
+	default:
+		return 47873 + s.rng.Intn(106698) // tail to ~154570
+	}
+}
