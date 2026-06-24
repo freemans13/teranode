@@ -1,6 +1,7 @@
 package utxo_test
 
 import (
+	"container/heap"
 	"math/rand"
 	"sort"
 	"testing"
@@ -101,4 +102,146 @@ func (s *spendAgeSampler) sample() int {
 	default:
 		return 47873 + s.rng.Intn(106698) // tail to ~154570
 	}
+}
+
+func TestUTXOScheduler_DueOnlyAtScheduledHeight(t *testing.T) {
+	// survivorProb 0 so every output is eventually spendable; 1 input/tx.
+	s := newUTXOScheduler(1, 0.0, 1)
+	// Create a batch of source txs at height 0; with no due outpoints yet,
+	// inputs must be empty.
+	for i := 0; i < 50; i++ {
+		_, oc, in := s.createTx(0)
+		require.GreaterOrEqual(t, oc, 1)
+		require.Empty(t, in, "no outpoints due at height 0 right after creation")
+	}
+	// Advancing far ahead, some outputs scheduled within range become due and
+	// are consumed as inputs by new txs.
+	var sawInput bool
+	for h := 1; h <= 7000 && !sawInput; h++ {
+		_, _, in := s.createTx(h)
+		if len(in) > 0 {
+			sawInput = true
+		}
+	}
+	require.True(t, sawInput, "some scheduled outputs should come due and be spent")
+}
+
+func TestUTXOScheduler_SurvivorsNeverComplete(t *testing.T) {
+	// survivorProb 1.0: every output is a permanent survivor; no tx ever completes.
+	s := newUTXOScheduler(2, 1.0, 2)
+	for i := 0; i < 100; i++ {
+		s.createTx(0)
+	}
+	for h := 1; h <= 200000; h += 5000 {
+		s.createTx(h)
+	}
+	require.Empty(t, s.completedSince(), "survivor-only txs never become prunable")
+}
+
+type outpoint struct {
+	tx   uint64
+	vout uint32
+}
+
+// pendingSpend: an outpoint scheduled to be consumed at dueHeight.
+type pendingSpend struct {
+	op        outpoint
+	dueHeight int
+}
+
+type spendHeap []pendingSpend
+
+func (h spendHeap) Len() int           { return len(h) }
+func (h spendHeap) Less(i, j int) bool { return h[i].dueHeight < h[j].dueHeight }
+func (h spendHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *spendHeap) Push(x any)        { *h = append(*h, x.(pendingSpend)) }
+func (h *spendHeap) Pop() any {
+	old := *h
+	n := len(old)
+	it := old[n-1]
+	*h = old[:n-1]
+	return it
+}
+
+type utxoScheduler struct {
+	rng          *rand.Rand
+	outc         *outCountSampler
+	agec         *spendAgeSampler
+	survivorProb float64
+	inputsPerTx  int
+	nextTxID     uint64
+	pending      spendHeap
+	remaining    map[uint64]int // tx id -> scheduled (non-survivor) outputs not yet spent
+	hasSurvivor  map[uint64]bool
+	completed    []uint64
+}
+
+func newUTXOScheduler(seed int64, survivorProb float64, inputsPerTx int) *utxoScheduler {
+	r := rand.New(rand.NewSource(seed))
+	s := &utxoScheduler{
+		rng:          r,
+		outc:         &outCountSampler{rng: rand.New(rand.NewSource(seed + 1))},
+		agec:         &spendAgeSampler{rng: rand.New(rand.NewSource(seed + 2))},
+		survivorProb: survivorProb,
+		inputsPerTx:  inputsPerTx,
+		remaining:    make(map[uint64]int),
+		hasSurvivor:  make(map[uint64]bool),
+	}
+	heap.Init(&s.pending)
+	return s
+}
+
+func (s *utxoScheduler) createTx(height int) (uint64, int, []outpoint) {
+	// Consume up to inputsPerTx already-due outpoints as this tx's inputs.
+	var inputs []outpoint
+	for len(inputs) < s.inputsPerTx && s.pending.Len() > 0 && s.pending[0].dueHeight < height {
+		ps := heap.Pop(&s.pending).(pendingSpend)
+		inputs = append(inputs, ps.op)
+		if r := s.remaining[ps.op.tx]; r > 0 {
+			s.remaining[ps.op.tx] = r - 1
+			if s.remaining[ps.op.tx] == 0 && !s.hasSurvivor[ps.op.tx] {
+				s.completed = append(s.completed, ps.op.tx)
+				delete(s.remaining, ps.op.tx)
+			}
+		}
+	}
+	// Allocate this tx and schedule its outputs.
+	id := s.nextTxID
+	s.nextTxID++
+	oc := s.outc.sample()
+	scheduled := 0
+	for v := 0; v < oc; v++ {
+		if s.rng.Float64() < s.survivorProb {
+			s.hasSurvivor[id] = true
+			continue
+		}
+		age := s.agec.sample()
+		heap.Push(&s.pending, pendingSpend{op: outpoint{tx: id, vout: uint32(v)}, dueHeight: height + age})
+		scheduled++
+	}
+	if scheduled > 0 {
+		s.remaining[id] = scheduled
+	} else if !s.hasSurvivor[id] {
+		// zero spendable outputs scheduled and no survivor => immediately complete
+		s.completed = append(s.completed, id)
+	}
+	return id, oc, inputs
+}
+
+func (s *utxoScheduler) completedSince() []uint64 {
+	out := s.completed
+	s.completed = nil
+	return out
+}
+
+func (s *utxoScheduler) liveTxCount() int { return len(s.remaining) + countSurvivors(s.hasSurvivor) }
+
+func countSurvivors(m map[uint64]bool) int {
+	n := 0
+	for _, v := range m {
+		if v {
+			n++
+		}
+	}
+	return n
 }
