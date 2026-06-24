@@ -812,6 +812,19 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 			return errors.NewStorageError("[Unspend] failed to clear delete_at_height", err)
 		}
 
+		// C6: when pending_deletes is enabled, remove the parent hashes from the
+		// side-table in the same pgxTx so the clear is atomic with the DAH null above.
+		// A revived (unspent) parent is no longer a prune candidate; leaving it in the
+		// list would let the pruner wrongly delete it after the retention period.
+		// DELETE WHERE hash = ANY($1) is a harmless no-op for hashes not in the table.
+		if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
+			if _, err := pgxTx.Exec(ctx,
+				`DELETE FROM pending_deletes WHERE hash = ANY($1)`, parentHashes,
+			); err != nil {
+				return errors.NewStorageError("[Unspend] failed to delete pending_deletes (C6)", err)
+			}
+		}
+
 		// If requested, lock the parents within the same transaction. SetLocked(true)
 		// semantics also clear DAH (already cleared above); keeping it in-tx preserves
 		// all-or-nothing with the spend reversal.

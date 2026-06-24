@@ -332,6 +332,16 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s", hash, err)
 		}
 
+		// C5: when pending_deletes is enabled, remove the hash from the side-table in
+		// the same pgxTx so the clear is atomic with the DAH null above. Harmless no-op
+		// if the hash was never stamped (e.g. reorged before the sweep ran).
+		if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
+			if _, err := pgxTx.Exec(ctx,
+				`DELETE FROM pending_deletes WHERE hash = $1`, hash[:]); err != nil {
+				return nil, errors.NewStorageError("[UnsetMined] failed to delete pending_deletes for %s (C5)", hash, err)
+			}
+		}
+
 		// Build result.
 		result := make([]uint32, len(newBlockIDs))
 		for i, bid := range newBlockIDs {

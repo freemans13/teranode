@@ -47,19 +47,42 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		}
 
 		inClause, args := buildINClauseLocal(chunk, 2)
+		allArgs := append([]interface{}{int32(preserveUntilHeight)}, args...) // preserve_until is INT4
+
 		// Only preserve prune-eligible txs (see the gate rationale above): those that
 		// already carry a delete_at_height stamp, or are already preserved.
-		q := fmt.Sprintf(`UPDATE txs SET preserve_until = $1, delete_at_height = NULL
-			WHERE hash IN %s
-			  AND (delete_at_height IS NOT NULL OR preserve_until IS NOT NULL)`, inClause)
-
-		allArgs := append([]interface{}{int32(preserveUntilHeight)}, args...) // preserve_until is INT4
-		result, err := s.pool.Exec(ctx, q, allArgs...)
-		if err != nil {
-			return errors.NewStorageError("[PreserveTransactions] failed to preserve chunk", err)
+		//
+		// C4: when the pending_deletes flag is ON, remove the hashes from pending_deletes
+		// in the SAME statement as the DAH clear via a CTE. The DELETE is a harmless
+		// no-op for hashes not in the side-table. SELECT count(*) FROM upd returns the
+		// txs-updated count so totalAffected accounting is correct.
+		var rowsAffected int64
+		if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
+			q := fmt.Sprintf(`WITH upd AS (
+				UPDATE txs SET preserve_until = $1, delete_at_height = NULL
+				WHERE hash IN %s
+				  AND (delete_at_height IS NOT NULL OR preserve_until IS NOT NULL)
+				RETURNING hash
+			),
+			_del AS (
+				DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)
+			)
+			SELECT count(*) FROM upd`, inClause)
+			if err := s.pool.QueryRow(ctx, q, allArgs...).Scan(&rowsAffected); err != nil {
+				return errors.NewStorageError("[PreserveTransactions] failed to preserve chunk", err)
+			}
+		} else {
+			q := fmt.Sprintf(`UPDATE txs SET preserve_until = $1, delete_at_height = NULL
+				WHERE hash IN %s
+				  AND (delete_at_height IS NOT NULL OR preserve_until IS NOT NULL)`, inClause)
+			result, err := s.pool.Exec(ctx, q, allArgs...)
+			if err != nil {
+				return errors.NewStorageError("[PreserveTransactions] failed to preserve chunk", err)
+			}
+			rowsAffected = result.RowsAffected()
 		}
 
-		totalAffected += result.RowsAffected()
+		totalAffected += rowsAffected
 	}
 
 	s.logger.Debugf("[PreserveTransactions] preserved %d out of %d transactions", totalAffected, len(txIDs))

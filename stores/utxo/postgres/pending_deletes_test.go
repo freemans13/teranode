@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -161,6 +162,117 @@ func TestPendingDeletes_ConflictingStamp(t *testing.T) {
 		`SELECT delete_at_height FROM pending_deletes WHERE hash=$1`,
 		h[:]).Scan(&dah))
 	require.NotNil(t, dah, "conflicting tx must be in pending_deletes after SetConflicting(true) (S4)")
+}
+
+// createMinedFullySpentTx creates a mined, fully-spent parent tx and returns its
+// chain hash. The sweep will stamp it with delete_at_height once runOneSweep is called.
+func createMinedFullySpentTx(t *testing.T, st *Store) chainhash.Hash {
+	t.Helper()
+	require.NoError(t, st.SetBlockHeight(100))
+	parent := newMinedSingleOutputTx(t, st, 100)
+	spendAllOutputs(t, st, parent, 101)
+	return *parent.TxIDChainHash()
+}
+
+// runOneSweep drives one sweep cycle up to height 105 and asserts the given hash
+// was stamped into pending_deletes.
+func runOneSweep(t *testing.T, st *Store, h chainhash.Hash) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, st.SetBlockHeight(105))
+	_, err := procSweepUpTo(st, ctx, 105)
+	require.NoError(t, err)
+
+	var dah *int32
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM pending_deletes WHERE hash=$1`, h[:]).Scan(&dah))
+	require.NotNil(t, dah, "setup: hash must be stamped in pending_deletes before reorg test")
+}
+
+// unspendTx reverses all spends for the outputs of the tx identified by h.
+// It queries the spends table to reconstruct the []*utxo.Spend slice needed by Unspend.
+func unspendTx(t *testing.T, st *Store, h chainhash.Hash) {
+	t.Helper()
+	ctx := context.Background()
+
+	rows, err := st.pool.Query(ctx,
+		`SELECT prev_output_idx, spending_data FROM spends WHERE prev_tx_hash = $1`, h[:])
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var spends []*utxo.Spend
+	for rows.Next() {
+		var vout int32
+		var sdBytes []byte
+		require.NoError(t, rows.Scan(&vout, &sdBytes))
+		sd, err := spendpkg.NewSpendingDataFromBytes(sdBytes)
+		require.NoError(t, err)
+		hCopy := h
+		spends = append(spends, &utxo.Spend{
+			TxID:         &hCopy,
+			Vout:         uint32(vout),
+			SpendingData: sd,
+		})
+	}
+	require.NoError(t, rows.Err())
+	require.NotEmpty(t, spends, "setup: parent tx must have at least one spend row before Unspend")
+
+	require.NoError(t, st.Unspend(ctx, spends))
+}
+
+// TestPendingDeletes_UnspendRemovesFromList is the reorg test for C6:
+// after a tx is stamped into pending_deletes by the sweep, Unspend must
+// remove it so the pruner can never wrongly select it.
+func TestPendingDeletes_UnspendRemovesFromList(t *testing.T) {
+	st := newPendingDeletesTestStore(t)
+	ctx := context.Background()
+
+	h := createMinedFullySpentTx(t, st)
+	runOneSweep(t, st, h)
+
+	// Reorg: reverse the spend.
+	unspendTx(t, st, h)
+
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_deletes WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "revived tx must be removed from pending_deletes (no wrong-delete)")
+}
+
+// TestPendingDeletes_SetLockedRemovesFromList tests C2: SetLocked(true) clears DAH
+// and must also remove the hash from pending_deletes.
+func TestPendingDeletes_SetLockedRemovesFromList(t *testing.T) {
+	st := newPendingDeletesTestStore(t)
+	ctx := context.Background()
+
+	h := createMinedFullySpentTx(t, st)
+	runOneSweep(t, st, h)
+
+	// Lock the tx — SetLocked(true) clears delete_at_height.
+	require.NoError(t, st.SetLocked(ctx, []chainhash.Hash{h}, true))
+
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_deletes WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "locked tx must be removed from pending_deletes (C2)")
+}
+
+// TestPendingDeletes_MarkOffLongestChainRemovesFromList tests C3:
+// MarkTransactionsOnLongestChain(false) clears DAH and must remove from pending_deletes.
+func TestPendingDeletes_MarkOffLongestChainRemovesFromList(t *testing.T) {
+	st := newPendingDeletesTestStore(t)
+	ctx := context.Background()
+
+	h := createMinedFullySpentTx(t, st)
+	runOneSweep(t, st, h)
+
+	// Reorg: mark the tx as off the longest chain.
+	require.NoError(t, st.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{h}, false))
+
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_deletes WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "reorged tx must be removed from pending_deletes (C3)")
 }
 
 func TestSchema_PendingDeletes_FlagOff(t *testing.T) {
