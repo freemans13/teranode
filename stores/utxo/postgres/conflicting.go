@@ -137,18 +137,45 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			}
 		}
 
-		// U4: delete from pending_unmined for BOTH setValue=true and setValue=false.
+		// U4: maintain pending_unmined invariant for both setValue directions.
 		//   - setValue=true (unmined→conflicting): the tx leaves the set
 		//     {unmined AND NOT conflicting}, so its pending_unmined row must be removed.
-		//     This fixes the Task 4 finding: Create() inserts a row into pending_unmined,
-		//     and without this DELETE the row would remain stale after SetConflicting(true).
-		//   - setValue=false (clearing conflicting): any prior pending_unmined row
-		//     (e.g., from an earlier reorg-out) must be cleared — the tx's unmined state
-		//     will be re-evaluated by the caller if needed.
-		// pending_unmined is ALWAYS-ON (no flag gate). DELETE is a no-op if absent.
-		if _, err = pgxTx.Exec(ctx,
-			`DELETE FROM pending_unmined WHERE hash = $1`, txHash[:]); err != nil {
-			return nil, nil, errors.NewStorageError("failed to delete pending_unmined for %s (U4)", txHash, err)
+		//     DELETE is correct here.
+		//   - setValue=false (clearing conflicting): the tx may now re-enter the set.
+		//     If txs.unmined_since IS NOT NULL (tx is still unmined), INSERT/UPSERT into
+		//     pending_unmined so the invariant == {unmined AND NOT conflicting} holds.
+		//     If txs.unmined_since IS NULL (tx is mined), it must NOT be in pending_unmined
+		//     — DELETE any stale row.
+		// pending_unmined is ALWAYS-ON (no flag gate).
+		if setValue {
+			// setValue=true: tx becomes conflicting → remove from pending_unmined.
+			if _, err = pgxTx.Exec(ctx,
+				`DELETE FROM pending_unmined WHERE hash = $1`, txHash[:]); err != nil {
+				return nil, nil, errors.NewStorageError("failed to delete pending_unmined for %s (U4-true)", txHash, err)
+			}
+		} else {
+			// setValue=false: tx is no longer conflicting.
+			// Read unmined_since from the same transaction (already updated above).
+			// If unmined_since IS NOT NULL → INSERT/UPSERT into pending_unmined.
+			// If unmined_since IS NULL (mined) → DELETE any stale row.
+			if _, err = pgxTx.Exec(ctx, `
+				WITH cur AS (
+					SELECT unmined_since FROM txs WHERE hash = $1
+				)
+				INSERT INTO pending_unmined (hash, unmined_since)
+				SELECT $1, cur.unmined_since FROM cur WHERE cur.unmined_since IS NOT NULL
+				ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`, txHash[:]); err != nil {
+				return nil, nil, errors.NewStorageError("failed to upsert pending_unmined for %s (U4-false)", txHash, err)
+			}
+			// Also remove the row if the tx is mined (unmined_since IS NULL); the INSERT
+			// above skips that case, so a stale row from a previous reorg must be removed.
+			if _, err = pgxTx.Exec(ctx, `
+				DELETE FROM pending_unmined
+				WHERE hash = $1
+				  AND NOT EXISTS (SELECT 1 FROM txs WHERE hash = $1 AND unmined_since IS NOT NULL)`,
+				txHash[:]); err != nil {
+				return nil, nil, errors.NewStorageError("failed to delete stale pending_unmined for %s (U4-false mined)", txHash, err)
+			}
 		}
 
 		// When the pending_deletes flag is ON and we just set conflicting=true, upsert
@@ -453,18 +480,24 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 			var rowsAffected int
 			if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
 				// C3 + U3: when the pending_deletes flag is ON, remove the hashes from
-				// pending_deletes AND pending_unmined in the SAME statement as the DAH
-				// clear via CTEs. SELECT count(*) FROM upd returns the txs-updated count
-				// (not the delete counts) so totalUpdated accounting is correct.
-				// pending_unmined is ALWAYS-ON (no flag), so _pu is always included here.
+				// pending_deletes in the SAME statement as the DAH clear via CTEs.
+				// U3 (into-set direction): this call sets txs.unmined_since = $1 (non-NULL)
+				// and the tx is NOT conflicting, so per the == invariant it must be PRESENT
+				// in pending_unmined. INSERT/UPSERT atomically with the UPDATE.
+				// SELECT count(*) FROM upd returns the txs-updated count so totalUpdated
+				// accounting is correct. pending_unmined is ALWAYS-ON (no flag).
 				q := fmt.Sprintf(`WITH upd AS (
-					UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s RETURNING hash
+					UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s RETURNING hash, unmined_since
 				),
 				_del AS (
 					DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)
 				),
 				_pu AS (
-					DELETE FROM pending_unmined WHERE hash IN (SELECT hash FROM upd)
+					INSERT INTO pending_unmined (hash, unmined_since)
+					SELECT hash, unmined_since FROM upd WHERE NOT EXISTS (
+						SELECT 1 FROM txs WHERE txs.hash = upd.hash AND txs.conflicting
+					)
+					ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since
 				)
 				SELECT count(*) FROM upd`, inClause)
 				if err := s.pool.QueryRow(ctx, q, chunkArgs...).Scan(&rowsAffected); err != nil {
@@ -476,13 +509,20 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 					continue
 				}
 			} else {
-				// U3 (flag OFF): pending_unmined is ALWAYS-ON, so add _pu CTE even
-				// without _del. SELECT count(*) FROM upd for correct totalUpdated.
+				// U3 (flag OFF): pending_unmined is ALWAYS-ON.
+				// U3 (into-set direction): this call sets txs.unmined_since = $1 (non-NULL)
+				// and the tx is NOT conflicting, so per the == invariant it must be PRESENT
+				// in pending_unmined. INSERT/UPSERT atomically with the UPDATE.
+				// SELECT count(*) FROM upd for correct totalUpdated.
 				q := fmt.Sprintf(`WITH upd AS (
-					UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s RETURNING hash
+					UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s RETURNING hash, unmined_since
 				),
 				_pu AS (
-					DELETE FROM pending_unmined WHERE hash IN (SELECT hash FROM upd)
+					INSERT INTO pending_unmined (hash, unmined_since)
+					SELECT hash, unmined_since FROM upd WHERE NOT EXISTS (
+						SELECT 1 FROM txs WHERE txs.hash = upd.hash AND txs.conflicting
+					)
+					ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since
 				)
 				SELECT count(*) FROM upd`, inClause)
 				if err := s.pool.QueryRow(ctx, q, chunkArgs...).Scan(&rowsAffected); err != nil {
