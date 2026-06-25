@@ -1236,6 +1236,16 @@ func TestGetPrunableUnminedTxIterator(t *testing.T) {
 	_, err := store.Create(ctx, tx, 10)
 	require.NoError(t, err)
 
+	// GetPrunableUnminedTxIterator drives from pending_unmined (Task 3). The
+	// write path (Task N) will populate it inline on Create; until then we seed
+	// it manually here so the iterator can find the row.
+	txHash := tx.TxIDChainHash()
+	_, err = store.pool.Exec(ctx,
+		`INSERT INTO pending_unmined (hash, unmined_since) VALUES ($1, 10)
+		 ON CONFLICT (hash) DO NOTHING`,
+		txHash[:])
+	require.NoError(t, err)
+
 	// Cutoff 5 -- too low, should not find the tx.
 	iter, err := store.GetPrunableUnminedTxIterator(5)
 	require.NoError(t, err)
