@@ -60,7 +60,7 @@ type UtxoStoreSettings struct {
 	// Per-partition candidate cap seeded into dah_sweep_control.batch_rows (proc mode).
 	PostgresDAHSweepBatchRows int `key:"utxostore_postgresDAHSweepBatchRows" desc:"Per-partition candidate cap for the proc-mode DAH sweep" default:"5000" category:"UtxoStore" usage:"Matches dahSweepMaxCandidatesTotal/numPartitions" type:"int"`
 	// Max height windows drained per CALL before the proc returns (proc mode).
-	PostgresDAHSweepMaxWindowsPerCall int `key:"utxostore_postgresDAHSweepMaxWindowsPerCall" desc:"Max height windows drained per proc CALL" default:"32" category:"UtxoStore" usage:"Bounds work per CALL so it returns promptly" type:"int"`
+	PostgresDAHSweepMaxWindowsPerCall int `key:"utxostore_postgresDAHSweepMaxWindowsPerCall" desc:"Max height windows drained per proc CALL" default:"8" category:"UtxoStore" usage:"Bounds work per CALL so each sweep commits and re-fires fast, keeping pending_deletes continuously fed" type:"int"`
 	// Idle poll cadence (ms) once all partitions have caught up to the safe tip.
 	PostgresDAHSweepIdleIntervalMillis int `key:"utxostore_postgresDAHSweepIdleIntervalMillis" desc:"Idle poll cadence (ms) when the DAH sweep is caught up" default:"5000" category:"UtxoStore" usage:"How often to re-check once caught up" type:"int"`
 	// Per-partition CALL timeout (seconds) — a GENEROUS backstop for a wedged CALL,
