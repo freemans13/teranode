@@ -129,16 +129,10 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 				INSERT INTO pending_deletes (hash, delete_at_height)
 				SELECT hash, delete_at_height FROM upd WHERE delete_at_height IS NOT NULL
 				ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
-			),
-			_pu AS (
-				DELETE FROM pending_unmined WHERE hash = ANY($1)
 			)
 			SELECT hash, block_ids FROM upd`
 	} else {
-		updateSQL = `WITH _pu AS (
-			DELETE FROM pending_unmined WHERE hash = ANY($1)
-		)
-		UPDATE txs SET
+		updateSQL = `UPDATE txs SET
 			block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
 			block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
 			subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,

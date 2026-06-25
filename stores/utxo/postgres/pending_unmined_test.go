@@ -756,10 +756,13 @@ func TestPendingUnmined_MultipleHooksCoexist(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// After mine: NOT in pending_unmined.
+	// After mine (lever 1): row LINGERS in pending_unmined — the hot-path DELETE was
+	// removed from SetMinedMulti. The lazy cleanup (GetPrunableUnminedTxIterator) will
+	// remove it on the next pruner cycle. The invariant is maintained by the read-filter
+	// (AND t.unmined_since IS NOT NULL) on the pruner iterator.
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
-	require.False(t, exists, "step 1: mined tx must NOT be in pending_unmined")
+	require.True(t, exists, "step 1: mined tx's pending_unmined row LINGERS (lever 1: hot-path DELETE removed)")
 
 	// Reorg: unset mined (U1 inserts into pending_unmined).
 	require.NoError(t, st.SetBlockHeight(250))
