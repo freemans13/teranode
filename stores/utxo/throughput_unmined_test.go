@@ -268,7 +268,7 @@ func TestThroughput_UnminedPreserve(t *testing.T) {
 	numWorkers := envInt("UNMINED_WORKERS", 100)
 	reps := envInt("UNMINED_REPS", 5)
 	verbose := envInt("UNMINED_VERBOSE", 0) != 0
-	unstableCV := 0.25 // 25% is acceptable for a scan-cost bench (I/O variance)
+	unstableCV := 25.0 // 25% acceptable for a scan-cost bench (I/O + pool-growth variance)
 
 	store, stop := newUnminedBenchStore(t)
 	defer stop()
