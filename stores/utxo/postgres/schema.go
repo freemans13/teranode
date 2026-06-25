@@ -297,6 +297,37 @@ func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, usePendin
 		}
 	}
 
+	// pending_unmined side-table: ALWAYS-ON (no flag). Stores (hash, unmined_since)
+	// rows for efficient old-unmined-tx queries by the iterator and pruner.
+	// Each hash partition gets its own leaf and a btree index on unmined_since for
+	// height-range scans. The backfill is guarded by a marker index so it runs only
+	// once (on first startup with this schema version) rather than on every restart.
+	if _, err := pool.Exec(ctx, pendingUnminedDDL); err != nil {
+		return errors.NewStorageError("pending_unmined creation failed", err)
+	}
+	for i := 0; i < numPartitions; i++ {
+		leafDDL := fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS pending_unmined_p%02d PARTITION OF pending_unmined FOR VALUES WITH (MODULUS %d, REMAINDER %d)",
+			i, numPartitions, i,
+		)
+		if _, err := pool.Exec(ctx, leafDDL); err != nil {
+			return errors.NewStorageError("pending_unmined_p%02d creation failed", i, err)
+		}
+		idxDDL := fmt.Sprintf(
+			"CREATE INDEX IF NOT EXISTS px_pu_since_p%02d ON pending_unmined_p%02d USING btree (unmined_since)",
+			i, i,
+		)
+		if _, err := pool.Exec(ctx, idxDDL); err != nil {
+			return errors.NewStorageError("pending_unmined_p%02d index creation failed", i, err)
+		}
+	}
+	// One-time idempotent backfill: copies existing unmined non-conflicting txs
+	// into pending_unmined. Guarded by px_pu_backfill_marker so it does not
+	// re-run on every startup (see pendingUnminedBackfillDDL for details).
+	if _, err := pool.Exec(ctx, pendingUnminedBackfillDDL); err != nil {
+		return errors.NewStorageError("pending_unmined backfill failed", err)
+	}
+
 	// Partial indexes on txs for iterator/pruner queries. The base indexes are
 	// always applied. The BRIN on delete_at_height is conditional: when the
 	// pending_deletes side-table is enabled the pruner reads from that table
@@ -473,6 +504,48 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
     delete_at_height INT   NOT NULL,
     PRIMARY KEY (hash)
 ) PARTITION BY HASH (hash);`
+
+// pendingUnminedDDL creates the pending_unmined partitioned parent table. Each
+// hash partition leaf is created separately in createSchemaWithPoolFlag.
+// The table stores (hash, unmined_since) rows for the iterator and pruner to
+// consume; the projection invariant maintains it in line with txs mutations.
+// ALWAYS-ON: no feature flag guards this table — it is created unconditionally.
+const pendingUnminedDDL = `
+CREATE TABLE IF NOT EXISTS pending_unmined (
+    hash           BYTEA NOT NULL,
+    unmined_since  INT   NOT NULL,
+    PRIMARY KEY (hash)
+) PARTITION BY HASH (hash);`
+
+// pendingUnminedBackfillDDL is the one-time idempotent backfill executed at
+// store startup. It runs only once, guarded by the marker index
+// px_pu_backfill_marker:
+//
+//   - If the marker does NOT exist (first run), all non-conflicting unmined txs
+//     are copied from txs into pending_unmined, then the marker is created so
+//     subsequent startups skip the INSERT.
+//   - If the marker exists (re-run), the block body is skipped entirely — no
+//     seq-scan, no INSERT.
+//
+// ON CONFLICT (hash) DO NOTHING makes the INSERT idempotent: rows already in
+// pending_unmined (e.g. from a partial earlier run before the marker was
+// written) are skipped cleanly.
+//
+// The marker is a partial index on leaf partition pending_unmined_p00. Creating
+// it on a concrete leaf (not the partitioned parent) sidesteps the PostgreSQL
+// restriction that unique indexes on partitioned tables must include all
+// partition key columns. The marker is never used for query planning — its sole
+// purpose is a named sentinel readable via pg_class.
+const pendingUnminedBackfillDDL = `
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_pu_backfill_marker') THEN
+    INSERT INTO pending_unmined (hash, unmined_since)
+      SELECT hash, unmined_since FROM txs
+      WHERE unmined_since IS NOT NULL AND conflicting = false
+      ON CONFLICT (hash) DO NOTHING;
+    CREATE INDEX px_pu_backfill_marker ON pending_unmined_p00 (unmined_since) WHERE (false);
+  END IF;
+END $$;`
 
 // spends: append-only spend records. LOGGED. A row here is the canonical
 // "this output was spent by that tx" marker; Unspend deletes the row, and
