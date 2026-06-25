@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
 
@@ -236,6 +237,7 @@ func TestPrunableUnminedTxIterator_ExplainShowsIndexScan(t *testing.T) {
 	require.NoError(t, err)
 
 	// EXPLAIN the production JOIN query (TEXT format for readability in logs).
+	// Must match the query in newPrunableUnminedTxIterator exactly.
 	q := `
 		EXPLAIN (FORMAT TEXT)
 		SELECT t.hash, t.fee, t.size_in_bytes, t.inserted_at, t.coinbase,
@@ -244,6 +246,7 @@ func TestPrunableUnminedTxIterator_ExplainShowsIndexScan(t *testing.T) {
 		JOIN txs t ON t.hash = pu.hash
 		WHERE pu.unmined_since <= $1
 		  AND t.conflicting = false
+		  AND t.unmined_since IS NOT NULL
 		ORDER BY t.hash
 	`
 
@@ -272,4 +275,91 @@ func TestPrunableUnminedTxIterator_ExplainShowsIndexScan(t *testing.T) {
 		strings.Contains(plan, "Merge Join")
 	require.True(t, hasJoinOrIndex,
 		"plan should use an index/join strategy on pending_unmined, got:\n%s", plan)
+}
+
+// TestPrunableUnminedTxIterator_Lever1_UnminedReturnedMinedCleanedNotReturned is the
+// combined lever-1 correctness test:
+//
+//   - A genuinely-unmined tx (unmined_since <= cutoff, not conflicting) IS returned
+//     by the pruner read and its pending_unmined row is NOT removed by lazy cleanup.
+//   - A mined tx whose pending_unmined row LINGERS (stale, lever-1 hot-path removed)
+//     IS cleaned by lazy cleanup and is NOT returned by the pruner read.
+func TestPrunableUnminedTxIterator_Lever1_UnminedReturnedMinedCleanedNotReturned(t *testing.T) {
+	st := newTestStoreWithFlag(t, true)
+	ctx := context.Background()
+	cleanPendingUnmined(t, st)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create a genuinely-unmined tx at unmined_since=50.
+	unminedTx := testExtendedTx(t)
+	unminedTx.LockTime = 800
+	_, err := st.Create(ctx, unminedTx, 100)
+	require.NoError(t, err)
+	unminedHash := unminedTx.TxIDChainHash()
+	// Backfill pending_unmined to the test cutoff height.
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO pending_unmined (hash, unmined_since) VALUES ($1, 50)
+		 ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`,
+		unminedHash[:])
+	require.NoError(t, err)
+
+	// Create a tx, then mine it (OnLongestChain=true → unmined_since=NULL in txs).
+	// After mine the pending_unmined row LINGERS (lever-1: hot-path DELETE removed).
+	minedTx := testExtendedTx(t)
+	minedTx.LockTime = 801
+	_, err = st.Create(ctx, minedTx, 100)
+	require.NoError(t, err)
+	minedHash := minedTx.TxIDChainHash()
+	_, err = st.SetMinedMulti(ctx, []*chainhash.Hash{minedHash}, utxo.MinedBlockInfo{
+		BlockID: 42, BlockHeight: 100, SubtreeIdx: 0, OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
+	// Precondition: mined tx's row lingered.
+	var minedRowExists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, minedHash[:]).Scan(&minedRowExists))
+	require.True(t, minedRowExists, "precondition: mined tx's pending_unmined row must linger before pruner call")
+
+	// Call GetPrunableUnminedTxIterator with cutoff=200 (covers both rows).
+	iter, err := st.GetPrunableUnminedTxIterator(200)
+	require.NoError(t, err)
+
+	var foundUnmined, foundMined bool
+	for {
+		batch, batchErr := iter.Next(ctx)
+		require.NoError(t, batchErr)
+		if len(batch) == 0 {
+			break
+		}
+		for _, utx := range batch {
+			if utx.Skip || utx.Node == nil {
+				continue
+			}
+			if utx.Node.Hash == *unminedHash {
+				foundUnmined = true
+			}
+			if utx.Node.Hash == *minedHash {
+				foundMined = true
+			}
+		}
+	}
+	require.NoError(t, iter.Close())
+
+	// Genuinely-unmined tx IS returned.
+	require.True(t, foundUnmined, "genuinely-unmined tx must be returned by pruner read")
+	// Mined tx is NOT returned (read-filter: t.unmined_since IS NOT NULL).
+	require.False(t, foundMined, "mined tx must NOT be returned by pruner read (read-filter)")
+
+	// After the pruner call: stale mined-tx row must be removed by lazy cleanup.
+	var minedRowAfter bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, minedHash[:]).Scan(&minedRowAfter))
+	require.False(t, minedRowAfter, "stale pending_unmined row for mined tx must be removed by lazy cleanup")
+
+	// Genuinely-unmined tx's row must NOT be removed (it IS still unmined).
+	var unminedRowAfter bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, unminedHash[:]).Scan(&unminedRowAfter))
+	require.True(t, unminedRowAfter, "genuinely-unmined tx's pending_unmined row must NOT be removed by lazy cleanup")
 }

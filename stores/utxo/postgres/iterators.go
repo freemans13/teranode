@@ -40,6 +40,36 @@ func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 }
 
 func newPrunableUnminedTxIterator(store *Store, cutoffBlockHeight uint32) (*unminedTxIterator, error) {
+	ctx := context.Background()
+	cutoff := int32(cutoffBlockHeight) // unmined_since is INT4
+
+	// Lazy cleanup (bounding): remove stale pending_unmined rows AT OR BELOW the cutoff
+	// that are no longer truly unmined (mined, conflicting, or pruned). This only
+	// reclaims STALE rows AT OR BELOW the cutoff; stale rows ABOVE the cutoff
+	// (mined/conflicting txs more recent than the cutoff) are deliberately left for a
+	// future pruner cycle when the cutoff advances to reach them — they cost nothing
+	// because the read filter (t.unmined_since IS NOT NULL) already excludes them from
+	// results. This is best-effort — a failure here must not abort the pruner read.
+	// The mine-path DELETE was removed from SetMinedMulti (lever 1), so stale rows
+	// accumulate and are reclaimed here once per pruner cycle (infrequent, off the hot path).
+	_, cleanErr := store.pool.Exec(ctx, `
+		DELETE FROM pending_unmined pu
+		WHERE pu.unmined_since <= $1
+		  AND NOT EXISTS (
+		      SELECT 1 FROM txs t
+		      WHERE t.hash = pu.hash
+		        AND t.unmined_since IS NOT NULL
+		        AND NOT t.conflicting
+		  )
+	`, cutoff)
+	if cleanErr != nil {
+		store.logger.Warnf("[GetPrunableUnminedTxIterator] lazy cleanup failed (continuing): %v", cleanErr)
+	}
+
+	// Read filter (correctness): AND t.unmined_since IS NOT NULL ensures that any
+	// stale row that survived the cleanup above (e.g. written after the cleanup ran
+	// but before the read) is silently excluded. The invariant is preserved: only
+	// { unmined_since IS NOT NULL AND NOT conflicting } rows are returned.
 	q := `
 		SELECT t.hash, t.fee, t.size_in_bytes, t.inserted_at, t.coinbase,
 		       t.locked, pu.unmined_since, t.raw_tx, t.block_ids
@@ -47,10 +77,11 @@ func newPrunableUnminedTxIterator(store *Store, cutoffBlockHeight uint32) (*unmi
 		JOIN txs t ON t.hash = pu.hash
 		WHERE pu.unmined_since <= $1
 		  AND t.conflicting = false
+		  AND t.unmined_since IS NOT NULL
 		ORDER BY t.hash
 	`
 
-	rows, err := store.pool.Query(context.Background(), q, int32(cutoffBlockHeight)) // unmined_since is INT4
+	rows, err := store.pool.Query(ctx, q, cutoff)
 	if err != nil {
 		return nil, err
 	}
