@@ -387,6 +387,23 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 			}
 		}
 
+		// U1: when fully reorged out (block_ids is now empty), insert into pending_unmined.
+		// pending_unmined is ALWAYS-ON (no flag). We derive whether the tx is now fully
+		// unmined from the post-update block_ids array returned by RETURNING above.
+		// unmined_since is currentBlockHeight (= s.blockHeight.Load()+1), matching the
+		// CASE expression in the UPDATE above — COPY-FROM-RETURNING semantics without
+		// re-reading the row. Harmless ON CONFLICT DO UPDATE if the hash was already
+		// in pending_unmined from a prior reorg (idempotent).
+		if len(newBlockIDs) == 0 {
+			if _, err := pgxTx.Exec(ctx,
+				`INSERT INTO pending_unmined (hash, unmined_since)
+				 VALUES ($1, $2)
+				 ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`,
+				hash[:], currentBlockHeight); err != nil {
+				return nil, errors.NewStorageError("[UnsetMined] failed to insert pending_unmined for %s (U1)", hash, err)
+			}
+		}
+
 		// Build result.
 		result := make([]uint32, len(newBlockIDs))
 		for i, bid := range newBlockIDs {

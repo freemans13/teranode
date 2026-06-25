@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -391,4 +392,328 @@ func TestCreateWriteHook_MinedTx_BatchPath(t *testing.T) {
 		).Scan(&exists))
 		require.False(t, exists, "mined batch item %d must NOT be in pending_unmined", i)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: Write hook tests — reorg + conflicting transitions
+// ---------------------------------------------------------------------------
+
+// TestPendingUnmined_ReorgOutInsertsHash verifies that when a tx is fully
+// reorged out (unsetMinedMulti removes its only block_id, leaving block_ids
+// empty), a row is inserted into pending_unmined with the correct unmined_since
+// (blockHeight+1 from the store's current block height at the time of the reorg).
+func TestPendingUnmined_ReorgOutInsertsHash(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create a tx, then mine it at blockID=100.
+	tx := testExtendedTx(t)
+	blockInfo := utxo.MinedBlockInfo{
+		BlockID:        100,
+		BlockHeight:    100,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	}
+	_, err := st.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(blockInfo))
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// Precondition: tx is mined, unmined_since must be NULL, and NOT in pending_unmined.
+	var unminedSince *int32
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT unmined_since FROM txs WHERE hash=$1`, h[:]).Scan(&unminedSince))
+	require.Nil(t, unminedSince, "precondition: mined tx must have unmined_since=NULL")
+
+	var existsBefore bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&existsBefore))
+	require.False(t, existsBefore, "precondition: mined tx must NOT be in pending_unmined")
+
+	// Advance block height before unset-mined (matches unsetMinedMulti: currentBlockHeight = Load()+1).
+	require.NoError(t, st.SetBlockHeight(150))
+
+	// Reorg: unset mined (removes blockID=100 from block_ids, array becomes empty).
+	_, err = st.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
+		BlockID:    100,
+		UnsetMined: true,
+	})
+	require.NoError(t, err)
+
+	// Assert hash is in pending_unmined with correct unmined_since.
+	// unsetMinedMulti uses currentBlockHeight = s.blockHeight.Load() + 1 = 150 + 1 = 151.
+	var us int32
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT unmined_since FROM pending_unmined WHERE hash=$1`, h[:]).Scan(&us))
+	require.Equal(t, int32(151), us, "reorged-out tx must be in pending_unmined with unmined_since=blockHeight+1")
+}
+
+// TestPendingUnmined_ReorgOutPartialDoesNotInsert verifies that when a reorg
+// only removes ONE of multiple block_ids (partial reorg, block_ids non-empty),
+// the tx is NOT inserted into pending_unmined (it is still mined on another chain).
+func TestPendingUnmined_ReorgOutPartialDoesNotInsert(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create a tx and mine it on two blocks.
+	tx := testExtendedTx(t)
+	blockInfo1 := utxo.MinedBlockInfo{
+		BlockID:        100,
+		BlockHeight:    100,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	}
+	_, err := st.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(blockInfo1))
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// Mine on a second block.
+	blockInfo2 := utxo.MinedBlockInfo{
+		BlockID:        101,
+		BlockHeight:    101,
+		SubtreeIdx:     0,
+		OnLongestChain: false,
+	}
+	_, err = st.SetMinedMulti(ctx, []*chainhash.Hash{h}, blockInfo2)
+	require.NoError(t, err)
+
+	// Reorg only blockID=100 (blockID=101 remains → block_ids still non-empty).
+	require.NoError(t, st.SetBlockHeight(150))
+	_, err = st.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
+		BlockID:    100,
+		UnsetMined: true,
+	})
+	require.NoError(t, err)
+
+	// tx still has block_ids=[101] — must NOT be in pending_unmined.
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "partially-reorged tx must NOT be in pending_unmined (still mined on blockID=101)")
+}
+
+// TestPendingUnmined_MarkOnLongestChainTrueDeletes verifies that
+// MarkTransactionsOnLongestChain(true) removes a tx hash from pending_unmined
+// atomically (U2 site). This simulates a reorg-out followed by re-mine on longest chain.
+func TestPendingUnmined_MarkOnLongestChainTrueDeletes(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create an unmined tx so it's in pending_unmined.
+	tx := testExtendedTx(t)
+	_, err := st.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// Precondition: hash is in pending_unmined (Task 4 write hook).
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.True(t, exists, "precondition: hash must be in pending_unmined after Create (Task 4)")
+
+	// MarkTransactionsOnLongestChain(true): tx is now mined on the longest chain.
+	require.NoError(t, st.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*h}, true))
+
+	// Assert hash is deleted from pending_unmined.
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "MarkTransactionsOnLongestChain(true) must delete from pending_unmined (U2)")
+
+	// Assert unmined_since is NULL in txs.
+	var us *int32
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT unmined_since FROM txs WHERE hash=$1`, h[:]).Scan(&us))
+	require.Nil(t, us, "txs.unmined_since must be NULL after MarkTransactionsOnLongestChain(true)")
+}
+
+// TestPendingUnmined_MarkOnLongestChainFalseDeletes verifies that
+// MarkTransactionsOnLongestChain(false) removes a tx hash from pending_unmined
+// (U3 site, cleanup of any stale pending_unmined row).
+// This is a no-op if the hash was never in pending_unmined, but must delete if present.
+func TestPendingUnmined_MarkOnLongestChainFalseDeletes(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create + mine a tx (on longest chain).
+	tx := testExtendedTx(t)
+	blockInfo := utxo.MinedBlockInfo{
+		BlockID:        100,
+		BlockHeight:    100,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	}
+	_, err := st.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(blockInfo))
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// Manually insert into pending_unmined (simulating an edge case: tx was
+	// previously reorged out and re-mined but the pending_unmined was not cleaned).
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO pending_unmined (hash, unmined_since) VALUES ($1, $2)`,
+		h[:], int32(50))
+	require.NoError(t, err)
+
+	// Precondition: hash is in pending_unmined.
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.True(t, exists, "precondition: hash must be in pending_unmined")
+
+	// MarkTransactionsOnLongestChain(false): tx is leaving the longest chain.
+	require.NoError(t, st.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*h}, false))
+
+	// Assert hash is deleted from pending_unmined (U3 cleanup).
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "MarkTransactionsOnLongestChain(false) must delete from pending_unmined (U3)")
+}
+
+// TestPendingUnmined_MarkOnLongestChainFalseNoOp verifies that
+// MarkTransactionsOnLongestChain(false) is a safe no-op when the hash is NOT
+// in pending_unmined (the common steady-state case for a freshly-mined tx).
+func TestPendingUnmined_MarkOnLongestChainFalseNoOp(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create + mine a tx (on longest chain) — no pending_unmined row.
+	tx := testExtendedTx(t)
+	blockInfo := utxo.MinedBlockInfo{
+		BlockID:        100,
+		BlockHeight:    100,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	}
+	_, err := st.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(blockInfo))
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// Precondition: NOT in pending_unmined.
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "precondition: mined tx must NOT be in pending_unmined")
+
+	// MarkTransactionsOnLongestChain(false): no-op on pending_unmined, must not error.
+	require.NoError(t, st.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*h}, false),
+		"MarkTransactionsOnLongestChain(false) must not error when hash absent from pending_unmined (U3 no-op)")
+
+	// Still not in pending_unmined.
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "hash must still not be in pending_unmined after no-op U3")
+}
+
+// TestPendingUnmined_SetConflictingTrueDeletes verifies that SetConflicting(true)
+// removes a tx hash from pending_unmined. This covers the unmined→conflicting transition
+// identified in the Task 4 findings: an unmined tx that is marked conflicting must be
+// removed from pending_unmined (it no longer satisfies the invariant).
+func TestPendingUnmined_SetConflictingTrueDeletes(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create an unmined tx — Task 4 hook inserts it into pending_unmined.
+	tx := testExtendedTx(t)
+	_, err := st.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// Precondition: hash is in pending_unmined.
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.True(t, exists, "precondition: unmined tx must be in pending_unmined (Task 4)")
+
+	// Mark as conflicting (unmined→conflicting transition).
+	_, _, err = st.SetConflicting(ctx, []chainhash.Hash{*h}, true)
+	require.NoError(t, err)
+
+	// Assert hash is deleted from pending_unmined (invariant: conflicting txs not in set).
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "SetConflicting(true) must delete from pending_unmined (unmined→conflicting transition)")
+}
+
+// TestPendingUnmined_SetConflictingFalseDeletesStaleRow verifies that SetConflicting(false)
+// removes any stale pending_unmined row. This covers the case where a conflicting tx
+// had a prior pending_unmined entry (from an earlier reorg-out) that was never cleaned up.
+func TestPendingUnmined_SetConflictingFalseDeletesStaleRow(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create an unmined tx.
+	tx := testExtendedTx(t)
+	_, err := st.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// Simulate a stale pending_unmined row for this tx (e.g., prior reorg).
+	// The row already exists from Create (Task 4), so we can use it directly.
+	// Precondition: in pending_unmined.
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.True(t, exists, "precondition: hash must be in pending_unmined")
+
+	// SetConflicting(false) to clear the conflicting flag. Must remove from pending_unmined.
+	_, _, err = st.SetConflicting(ctx, []chainhash.Hash{*h}, false)
+	require.NoError(t, err)
+
+	// Assert hash is deleted from pending_unmined.
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "SetConflicting(false) must delete from pending_unmined (stale row cleanup)")
+}
+
+// TestPendingUnmined_MultipleHooksCoexist verifies that pending_unmined is
+// maintained consistently across multiple sequential state transitions on a
+// single tx: create unmined → mine → reorg out → mark on longest chain again.
+func TestPendingUnmined_MultipleHooksCoexist(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	tx := testExtendedTx(t)
+	_, err := st.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// After Create (unmined): must be in pending_unmined.
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.True(t, exists, "step 0: unmined tx must be in pending_unmined after Create")
+
+	// Mine at blockID=200.
+	require.NoError(t, st.SetBlockHeight(200))
+	_, err = st.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
+		BlockID:        200,
+		BlockHeight:    200,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
+	// After mine: NOT in pending_unmined.
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "step 1: mined tx must NOT be in pending_unmined")
+
+	// Reorg: unset mined (U1 inserts into pending_unmined).
+	require.NoError(t, st.SetBlockHeight(250))
+	_, err = st.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
+		BlockID:    200,
+		UnsetMined: true,
+	})
+	require.NoError(t, err)
+
+	// After reorg: back in pending_unmined.
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.True(t, exists, "step 2: reorged-out tx must be back in pending_unmined (U1)")
+
+	// MarkTransactionsOnLongestChain(true): re-mine on longest chain (U2 deletes).
+	require.NoError(t, st.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*h}, true))
+
+	// After MarkOnLongestChain(true): NOT in pending_unmined.
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
+	require.False(t, exists, "step 3: MarkTransactionsOnLongestChain(true) must delete from pending_unmined (U2)")
 }
