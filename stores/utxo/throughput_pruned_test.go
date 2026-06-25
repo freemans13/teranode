@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-batcher/v2"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -33,9 +34,15 @@ import (
 //
 // This harness closes that gap WITHOUT standing up block validation / block
 // persister: it drives pruning directly from the test. The validator hot path
-// is unchanged (Get+Spend+Create+SetLocked, identical to TestThroughput_*Stable
-// so the number is comparable). Background goroutines play the role of block
-// assembly + the pruner:
+// is Get + PreviousOutputsDecorate + Spend + Create + SetLocked. Decorate (the
+// per-input read of the parent output to extend an un-extended incoming tx) was
+// added because it is ~48% of real IBD DB time and the previous harness skipped
+// it, making it blind to the single largest cost and unfair to any schema that
+// changes how parent outputs are read. NOTE: adding decorate lowers the absolute
+// TPS versus the older decorate-blind runs (and TestThroughput_*Stable, which
+// still omit it) — it is a NEW, fairer baseline, comparable only to other runs
+// that also decorate. Background goroutines play the role of block assembly +
+// the pruner:
 //
 //   - HEIGHT goroutine: advances the shared block height on a fast ticker so
 //     each height-cohort of new txs is small (independent of prune speed).
@@ -89,6 +96,14 @@ const (
 	// with the table bounded at <= cap", which is the claim that matters.
 	prunedTableCapRows = 1_500_000
 )
+
+// decorateReq is one worker's request to extend a tx's inputs from the store.
+// errCh is buffered (cap 1) so the batcher's flush callback never blocks
+// signalling the result, and is signalled exactly once per request.
+type decorateReq struct {
+	tx    *bt.Tx
+	errCh chan error
+}
 
 // newPrunedQueueStore builds a fresh postgres queue store on a clean DB with a
 // short DAH retention, and returns the concrete *Store (so the pruner service is
@@ -174,6 +189,25 @@ func runPrunedValidator(t *testing.T, store prunedBenchStore, numWorkers int, cf
 	driverCtx, cancel := context.WithCancel(ctx)
 	var driverWG sync.WaitGroup
 	var totalMined, totalDeleted atomic.Int64
+
+	// DECORATE BATCHER: coalesce the concurrent per-worker decorate requests into
+	// block-wide BatchPreviousOutputsDecorate calls, mirroring legacy IBD where the
+	// whole block's cross-block parents are decorated in ONE batched call the store
+	// chunks internally (handle_block.go extendTransactions phase 2) — never one DB
+	// lookup per tx. Size/duration match the spend+store batchers (500 / 5ms) so
+	// decorate is coalesced exactly the way Spend/Create already are in this harness.
+	// One error from the batch call is reported to every submitter in that batch
+	// (the whole BatchPreviousOutputsDecorate fails or succeeds together).
+	decorateBatcher := batcher.NewWithPool[decorateReq](500, 5*time.Millisecond, func(b []*decorateReq) {
+		dtxs := make([]*bt.Tx, len(b))
+		for i, r := range b {
+			dtxs[i] = r.tx
+		}
+		derr := store.BatchPreviousOutputsDecorate(driverCtx, dtxs)
+		for _, r := range b {
+			r.errCh <- derr
+		}
+	}, true)
 
 	// TABLE-SIZE GATE: poll the live-row estimate and close the gate while the
 	// table exceeds prunedTableCapRows (see const). gateClosed is read by every
@@ -353,7 +387,33 @@ func runPrunedValidator(t *testing.T, store prunedBenchStore, numWorkers int, cf
 					child := makeChildTx(parent)
 					parentHash := parent.TxIDChainHash()
 
+					// Real IBD txs arrive UN-extended: an input carries only the
+					// outpoint (parent hash + idx), not the parent's script/satoshis.
+					// The validator must read each input's previous output to extend
+					// it BEFORE the inputs can be validated and spent. makeChildTx
+					// pre-fills the input from the in-memory parent, so null it here
+					// to force the real store read — the ~48%-of-DB-time "decorate"
+					// path the harness previously skipped entirely. Omitting it made
+					// the bench an unfair arbiter, blind to the single largest IBD
+					// cost and to schemas that change how parent outputs are read.
+					child.Inputs[0].PreviousTxScript = nil
+					child.Inputs[0].PreviousTxSatoshis = 0
+
 					if _, err := store.Get(ctx, parentHash, fields.BlockIDs, fields.BlockHeights); err != nil {
+						return
+					}
+					// Decorate via the BATCHED path, exactly like legacy IBD: the
+					// block validator collects the whole block's un-extended txs and
+					// issues ONE BatchPreviousOutputsDecorate the store chunks
+					// internally (handle_block.go extendTransactions phase 2), NOT a
+					// DB lookup per tx. The decorateBatcher coalesces the concurrent
+					// per-worker calls the same way the store's own spend/store
+					// batchers coalesce Spend/Create in this harness. Decorate
+					// repopulates PreviousTxScript + PreviousTxSatoshis, so the
+					// subsequent Spend is unchanged.
+					dreq := decorateReq{tx: child, errCh: make(chan error, 1)}
+					decorateBatcher.Put(&dreq)
+					if err := <-dreq.errCh; err != nil {
 						return
 					}
 					if _, err := store.Spend(ctx, child, h); err != nil {

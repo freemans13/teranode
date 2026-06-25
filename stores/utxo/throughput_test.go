@@ -61,6 +61,38 @@ func p2pkhScript() *bscript.Script {
 	return &s
 }
 
+// reprTxOutputs controls how many outputs each generated tx carries. The default
+// (1) is the original tiny 1-in/1-out tx. Set THROUGHPUT_TX_OUTPUTS>1 to make
+// raw_tx representative of real mainnet parent txs so the decorate path's
+// de-TOAST + bt.NewTxFromBytes parse cost is actually exercised — the tiny
+// default makes that cost ~free, which understates decorate (≈48% of live
+// mainnet DB time) and any schema that changes how parent outputs are read.
+var reprTxOutputs = envInt("THROUGHPUT_TX_OUTPUTS", 1)
+
+// reprSeed gives every padding output unique bytes so raw_tx does not LZ4-compress
+// away to nothing (real locking scripts carry distinct 20-byte hashes; identical
+// padding would compress and hide the de-TOAST size).
+var reprSeed atomic.Uint64
+
+// padReprOutputs appends (reprTxOutputs-1) non-spendable OP_FALSE OP_RETURN data
+// outputs. They are provably unspendable (ShouldStoreOutputAsUTXO=false), so
+// spendable_count stays 1 and the fully-spent / prune model is unchanged: output
+// 0 remains the only spendable chain output. They DO inflate out_count, the
+// packed utxo_hashes, and raw_tx — the representative cost create and decorate
+// pay on real txs.
+func padReprOutputs(tx *bt.Tx) {
+	for i := 1; i < reprTxOutputs; i++ {
+		const n = 30 // ~ a P2PKH-sized output payload
+		b := make([]byte, 0, 3+n)
+		b = append(b, bscript.OpFALSE, bscript.OpRETURN, byte(n))
+		s := reprSeed.Add(1)
+		for j := 0; j < n; j++ {
+			b = append(b, byte(s>>(uint(j%8)*8))^byte(j*7+i))
+		}
+		tx.Outputs = append(tx.Outputs, &bt.Output{Satoshis: 0, LockingScript: bscript.NewFromBytes(b)})
+	}
+}
+
 // makeGenesisTx creates a unique genesis tx for a worker.
 func makeGenesisTx(workerID int) *bt.Tx {
 	tx := bt.NewTx()
@@ -75,6 +107,7 @@ func makeGenesisTx(workerID int) *bt.Tx {
 	_ = tx.From(prev.String(), 0, p2pkhScript().String(), 100_000_000)
 	tx.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x00})
 	_ = tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 50_000_000)
+	padReprOutputs(tx)
 	return tx
 }
 
@@ -93,6 +126,7 @@ func makeChildTx(parent *bt.Tx) *bt.Tx {
 		outVal = 1
 	}
 	_ = tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", outVal)
+	padReprOutputs(tx)
 	return tx
 }
 
