@@ -121,7 +121,6 @@ func TestThroughput_MainnetRepr(t *testing.T) {
 	survivorPct := envInt("MREPR_SURVIVOR_PROB_PCT", 5)
 	sampleEveryTicks := envInt("MREPR_SAMPLE_TICKS", 20)
 	workers := envInt("MREPR_WORKERS", 128)
-	usePendingDeletes := envInt("MREPR_USE_PENDING_DELETES", 0) != 0
 
 	// --- store + pruner setup (matches newPrunedQueueStore pattern) ---
 	storeURL, err := url.Parse(throughputDSN)
@@ -134,12 +133,11 @@ func TestThroughput_MainnetRepr(t *testing.T) {
 	tSettings.UtxoStore.StoreBatcherDurationMillis = 5
 	tSettings.UtxoStore.SpendBatcherSize = 500
 	tSettings.UtxoStore.StoreBatcherSize = 500
-	tSettings.UtxoStore.PostgresUsePendingDeletesTable = usePendingDeletes
 
 	store, err := pgstore.New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
 	require.NoError(t, err)
 	store.Start(ctx)
-	t.Logf("[mrepr] PostgresUsePendingDeletesTable=%v", usePendingDeletes)
+	t.Logf("[mrepr] pending_deletes always enabled (unconditional)")
 	t.Cleanup(func() { store.Stop() })
 
 	svc, err := store.GetPrunerService()

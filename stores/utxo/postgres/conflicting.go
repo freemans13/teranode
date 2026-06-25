@@ -130,20 +130,61 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		// pending_deletes — the tx is no longer a prune candidate. Harmless no-op
 		// if the hash was never stamped (DELETE on a missing row returns 0 rows affected).
 		// Runs inside the existing pgxTx so it is atomic with the UPDATE above.
-		if s.settings.UtxoStore.PostgresUsePendingDeletesTable && !setValue {
+		if !setValue {
 			if _, err = pgxTx.Exec(ctx,
 				`DELETE FROM pending_deletes WHERE hash = $1`, txHash[:]); err != nil {
 				return nil, nil, errors.NewStorageError("failed to delete pending_deletes for %s (C1)", txHash, err)
 			}
 		}
 
-		// When the pending_deletes flag is ON and we just set conflicting=true, upsert
-		// the hash into pending_deletes if the row now has a delete_at_height. We use
-		// a SELECT-based INSERT (reading the current DAH from the row, inside the same
-		// transaction snapshot) so preserved rows — whose DAH was left NULL by the CASE
-		// above — are correctly excluded. This runs inside the existing pgxTx so the
-		// upsert is always atomic with the UPDATE above.
-		if s.settings.UtxoStore.PostgresUsePendingDeletesTable && setValue {
+		// U4: maintain pending_unmined invariant for both setValue directions.
+		//   - setValue=true (unmined→conflicting): the tx leaves the set
+		//     {unmined AND NOT conflicting}, so its pending_unmined row must be removed.
+		//     DELETE is correct here.
+		//   - setValue=false (clearing conflicting): the tx may now re-enter the set.
+		//     If txs.unmined_since IS NOT NULL (tx is still unmined), INSERT/UPSERT into
+		//     pending_unmined so the invariant == {unmined AND NOT conflicting} holds.
+		//     If txs.unmined_since IS NULL (tx is mined), it must NOT be in pending_unmined
+		//     — DELETE any stale row.
+		// pending_unmined is ALWAYS-ON (no flag gate).
+		if setValue {
+			// setValue=true: tx becomes conflicting → remove from pending_unmined.
+			if _, err = pgxTx.Exec(ctx,
+				`DELETE FROM pending_unmined WHERE hash = $1`, txHash[:]); err != nil {
+				return nil, nil, errors.NewStorageError("failed to delete pending_unmined for %s (U4-true)", txHash, err)
+			}
+		} else {
+			// setValue=false: tx is no longer conflicting.
+			// Read unmined_since from the same transaction (already updated above).
+			// If unmined_since IS NOT NULL → INSERT/UPSERT into pending_unmined.
+			// If unmined_since IS NULL (mined) → DELETE any stale row.
+			if _, err = pgxTx.Exec(ctx, `
+				WITH cur AS (
+					SELECT unmined_since FROM txs WHERE hash = $1
+				)
+				INSERT INTO pending_unmined (hash, unmined_since)
+				SELECT $1, cur.unmined_since FROM cur WHERE cur.unmined_since IS NOT NULL
+				ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`, txHash[:]); err != nil {
+				return nil, nil, errors.NewStorageError("failed to upsert pending_unmined for %s (U4-false)", txHash, err)
+			}
+			// Also remove the row if the tx is mined (unmined_since IS NULL); the INSERT
+			// above skips that case, so a stale row from a previous reorg must be removed.
+			if _, err = pgxTx.Exec(ctx, `
+				DELETE FROM pending_unmined
+				WHERE hash = $1
+				  AND NOT EXISTS (SELECT 1 FROM txs WHERE hash = $1 AND unmined_since IS NOT NULL)`,
+				txHash[:]); err != nil {
+				return nil, nil, errors.NewStorageError("failed to delete stale pending_unmined for %s (U4-false mined)", txHash, err)
+			}
+		}
+
+		// When we just set conflicting=true, upsert the hash into pending_deletes if
+		// the row now has a delete_at_height. We use a SELECT-based INSERT (reading the
+		// current DAH from the row, inside the same transaction snapshot) so preserved
+		// rows — whose DAH was left NULL by the CASE above — are correctly excluded.
+		// This runs inside the existing pgxTx so the upsert is always atomic with the
+		// UPDATE above.
+		if setValue {
 			if _, err = pgxTx.Exec(ctx,
 				`INSERT INTO pending_deletes (hash, delete_at_height)
 				 SELECT $1, delete_at_height FROM txs WHERE hash = $1 AND delete_at_height IS NOT NULL
@@ -329,20 +370,15 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 			inClause, args := buildINClauseLocal(hashBytes, 1)
 			// C2: when locking (delete_at_height cleared), also remove the hashes from
 			// pending_deletes in the same statement via a CTE. The DELETE is a harmless
-			// no-op for hashes that were never stamped. Only applied when the flag is ON.
-			var q string
-			if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
-				q = fmt.Sprintf(`WITH upd AS (
-					UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash IN %s RETURNING hash
-				)
-				DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)`, inClause)
-			} else {
-				q = fmt.Sprintf(`UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash IN %s`, inClause)
-			}
-			// NOTE: when the pending_deletes flag is ON, the CTE above makes the
-			// outer statement a DELETE, so CommandTag.RowsAffected() reflects rows
-			// deleted from pending_deletes — NOT rows updated in txs. Do not add
-			// accounting logic here that relies on the returned row count.
+			// no-op for hashes that were never stamped.
+			q := fmt.Sprintf(`WITH upd AS (
+				UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash IN %s RETURNING hash
+			)
+			DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)`, inClause)
+			// NOTE: the CTE above makes the outer statement a DELETE, so
+			// CommandTag.RowsAffected() reflects rows deleted from pending_deletes —
+			// NOT rows updated in txs. Do not add accounting logic here that relies on
+			// the returned row count.
 			if _, err := s.pool.Exec(ctx, q, args...); err != nil {
 				return errors.NewStorageError("failed to set locked flag", err)
 			}
@@ -393,9 +429,18 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 
 		if onLongestChain {
 			inClause, inArgs := buildINClauseLocal(chunk, 1)
-			q := fmt.Sprintf(`UPDATE txs SET unmined_since = NULL WHERE hash IN %s`, inClause)
-			result, err := s.pool.Exec(ctx, q, inArgs...)
-			if err != nil {
+			// U2: delete from pending_unmined atomically with the unmined_since NULL
+			// clear. pending_unmined is ALWAYS-ON (no flag). SELECT count(*) FROM upd
+			// returns the txs-updated count so totalUpdated accounting is correct.
+			q := fmt.Sprintf(`WITH upd AS (
+				UPDATE txs SET unmined_since = NULL WHERE hash IN %s RETURNING hash
+			),
+			_pu AS (
+				DELETE FROM pending_unmined WHERE hash IN (SELECT hash FROM upd)
+			)
+			SELECT count(*) FROM upd`, inClause)
+			var rowsAffected int
+			if err := s.pool.QueryRow(ctx, q, inArgs...).Scan(&rowsAffected); err != nil {
 				errorCount += len(chunk)
 				if len(allErrors) < 10 {
 					s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
@@ -403,7 +448,7 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 				}
 				continue
 			}
-			totalUpdated += int(result.RowsAffected())
+			totalUpdated += rowsAffected
 		} else {
 			// Leaving the longest chain: also CLEAR any deferred-prune stamp. The
 			// stamp was computed for the tx as mined-and-fully-spent ON THE OLD chain;
@@ -428,38 +473,34 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 			// (completion + retention), so the pruner cannot act on it before a retry
 			// (or the next reorg pass) re-clears it.
 			var rowsAffected int
-			if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
-				// C3: when the pending_deletes flag is ON, remove the hashes from
-				// pending_deletes in the SAME statement as the DAH clear via a CTE.
-				// SELECT count(*) FROM upd returns the txs-updated count (not the
-				// pending_deletes-deleted count) so totalUpdated accounting is correct.
-				q := fmt.Sprintf(`WITH upd AS (
-					UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s RETURNING hash
-				),
-				_del AS (
-					DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)
+			// C3 + U3: remove the hashes from pending_deletes in the SAME statement as
+			// the DAH clear via CTEs.
+			// U3 (into-set direction): this call sets txs.unmined_since = $1 (non-NULL)
+			// and the tx is NOT conflicting, so per the == invariant it must be PRESENT
+			// in pending_unmined. INSERT/UPSERT atomically with the UPDATE.
+			// SELECT count(*) FROM upd returns the txs-updated count so totalUpdated
+			// accounting is correct. pending_unmined is ALWAYS-ON (no flag).
+			q := fmt.Sprintf(`WITH upd AS (
+				UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s RETURNING hash, unmined_since
+			),
+			_del AS (
+				DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)
+			),
+			_pu AS (
+				INSERT INTO pending_unmined (hash, unmined_since)
+				SELECT hash, unmined_since FROM upd WHERE NOT EXISTS (
+					SELECT 1 FROM txs WHERE txs.hash = upd.hash AND txs.conflicting
 				)
-				SELECT count(*) FROM upd`, inClause)
-				if err := s.pool.QueryRow(ctx, q, chunkArgs...).Scan(&rowsAffected); err != nil {
-					errorCount += len(chunk)
-					if len(allErrors) < 10 {
-						s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
-						allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d", i, end-1, err))
-					}
-					continue
+				ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since
+			)
+			SELECT count(*) FROM upd`, inClause)
+			if err := s.pool.QueryRow(ctx, q, chunkArgs...).Scan(&rowsAffected); err != nil {
+				errorCount += len(chunk)
+				if len(allErrors) < 10 {
+					s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
+					allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d", i, end-1, err))
 				}
-			} else {
-				q := fmt.Sprintf(`UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s`, inClause)
-				result, err := s.pool.Exec(ctx, q, chunkArgs...)
-				if err != nil {
-					errorCount += len(chunk)
-					if len(allErrors) < 10 {
-						s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
-						allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d", i, end-1, err))
-					}
-					continue
-				}
-				rowsAffected = int(result.RowsAffected())
+				continue
 			}
 			totalUpdated += rowsAffected
 		}

@@ -279,24 +279,16 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	//
 	// Hold that and this is a non-issue. Do NOT add per-row delete-time guards back.
 	// ──────────────────────────────────────────────────────────────────────
-	var cascadeSQL string
-	if s.store.settings.UtxoStore.PostgresUsePendingDeletesTable {
-		pdLeaf := fmt.Sprintf("pending_deletes_p%02d", partIdx)
-		cascadeSQL = fmt.Sprintf(`
-			WITH doomed AS (SELECT hash FROM %[3]s WHERE delete_at_height <= $1 LIMIT $2),
-			del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1),
-			del_pd     AS (DELETE FROM %[3]s WHERE hash IN (SELECT hash FROM doomed))
-			DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf, pdLeaf)
-	} else {
-		cascadeSQL = fmt.Sprintf(`
-			WITH doomed AS (
-				SELECT hash FROM %[1]s
-				WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1
-				LIMIT $2
-			),
-			del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1)
-			DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf)
-	}
+	// Doomed candidates are enumerated from the pending_deletes side-table (the only
+	// pruner path): a tiny, append-only table indexed by delete_at_height, so the
+	// candidate scan stays proportional to the doomed set rather than to the live txs
+	// table. The cascade deletes spends and the pending_deletes rows, then the txs rows.
+	pdLeaf := fmt.Sprintf("pending_deletes_p%02d", partIdx)
+	cascadeSQL := fmt.Sprintf(`
+		WITH doomed AS (SELECT hash FROM %[3]s WHERE delete_at_height <= $1 LIMIT $2),
+		del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1),
+		del_pd     AS (DELETE FROM %[3]s WHERE hash IN (SELECT hash FROM doomed))
+		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf, pdLeaf)
 
 	var deleted int64
 	for batches := 0; batches < pruneDeleteMaxBatchesPerCall; batches++ {
@@ -307,7 +299,7 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		}
 
 		// delete_at_height is INT4 — bind int32 so the doomed-scan predicate is
-		// a native int4 comparison on the BRIN-indexed column.
+		// a native int4 comparison on the pending_deletes btree-indexed column.
 		tag, err := s.store.maint().Exec(ctx, cascadeSQL, int32(blockHeight), int64(pruneDeleteBatchSize))
 		if err != nil {
 			return deleted, errors.NewStorageError("[pruner] cascade delete %s", txsLeaf, err)

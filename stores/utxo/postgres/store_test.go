@@ -51,6 +51,8 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 			tx_state, transactions, txs, txs_raw, dah_watermark, dah_part_watermark, dah_sweep_control,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue,
 			batch_notifications CASCADE;
+		DROP TABLE IF EXISTS pending_unmined CASCADE;
+		DROP INDEX IF EXISTS px_pu_backfill_marker;
 	`)
 	pool.Close()
 
@@ -113,15 +115,23 @@ func TestSchemaCreation(t *testing.T) {
 		require.Equal(t, numPartitions, partCount, "table %s should have %d partitions", table, numPartitions)
 	}
 
-	// Verify txs partial indexes exist.
+	// Verify the txs unmined_since BRIN exists. The legacy px_delete_at_height BRIN is
+	// no longer created: pending_deletes is the only pruner path, so it is always
+	// backfilled into the side-table and dropped.
 	var idxCount int
 	err := store.pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM pg_indexes
-		WHERE indexname IN ('px_unmined_since', 'px_delete_at_height')
+		WHERE indexname = 'px_unmined_since'
 	`).Scan(&idxCount)
 	require.NoError(t, err)
-	require.Equal(t, 2, idxCount, "txs should have 2 partial indexes")
+	require.Equal(t, 1, idxCount, "txs should have the px_unmined_since BRIN")
+
+	var hasDAHBrin bool
+	err = store.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasDAHBrin)
+	require.NoError(t, err)
+	require.False(t, hasDAHBrin, "px_delete_at_height BRIN must not exist (pending_deletes is the only path)")
 }
 
 func TestHealth(t *testing.T) {
@@ -1236,6 +1246,16 @@ func TestGetPrunableUnminedTxIterator(t *testing.T) {
 	_, err := store.Create(ctx, tx, 10)
 	require.NoError(t, err)
 
+	// GetPrunableUnminedTxIterator drives from pending_unmined (Task 3). The
+	// write path (Task N) will populate it inline on Create; until then we seed
+	// it manually here so the iterator can find the row.
+	txHash := tx.TxIDChainHash()
+	_, err = store.pool.Exec(ctx,
+		`INSERT INTO pending_unmined (hash, unmined_since) VALUES ($1, 10)
+		 ON CONFLICT (hash) DO NOTHING`,
+		txHash[:])
+	require.NoError(t, err)
+
 	// Cutoff 5 -- too low, should not find the tx.
 	iter, err := store.GetPrunableUnminedTxIterator(5)
 	require.NoError(t, err)
@@ -1582,9 +1602,18 @@ func TestPrunerService(t *testing.T) {
 
 	txHash := tx.TxIDChainHash()
 
-	// Set delete_at_height = 50.
+	// Stamp delete_at_height = 50 on both txs and the pending_deletes side-table.
+	// The pruner enumerates doomed candidates from pending_deletes (the only path),
+	// so a stamp that lives only on txs would never be seen — the real stamp paths
+	// (SetMinedMulti S6, the DAH sweep proc, ProcessExpiredPreservations) always write
+	// the side-table alongside the txs column, which this direct stamp mirrors.
 	_, err = store.pool.Exec(ctx,
 		`UPDATE txs SET delete_at_height = 50 WHERE hash = $1`,
+		txHash[:])
+	require.NoError(t, err)
+	_, err = store.pool.Exec(ctx,
+		`INSERT INTO pending_deletes (hash, delete_at_height) VALUES ($1, 50)
+		 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height`,
 		txHash[:])
 	require.NoError(t, err)
 

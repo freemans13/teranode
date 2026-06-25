@@ -95,12 +95,10 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// concurrent SetBlockHeight, and (b) preserves a single prepared-plan
 		// cache entry across heights (a literal would re-plan per height).
 		//
-		// When the pending_deletes flag is ON, the UPDATE is wrapped in a CTE so that
-		// any fully-spent tx that gets an inline DAH stamp is also upserted into
-		// pending_deletes in the same statement. The outer SELECT returns hash, block_ids
-		// so the drain loop is unchanged.
-		if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
-			updateSQL = `WITH upd AS (
+		// The UPDATE is wrapped in a CTE so that any fully-spent tx that gets an inline
+		// DAH stamp is also upserted into pending_deletes in the same statement. The
+		// outer SELECT returns hash, block_ids so the drain loop is unchanged.
+		updateSQL = `WITH upd AS (
 				UPDATE txs SET
 					block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
 					block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
@@ -131,37 +129,16 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 				INSERT INTO pending_deletes (hash, delete_at_height)
 				SELECT hash, delete_at_height FROM upd WHERE delete_at_height IS NOT NULL
 				ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
+			),
+			_pu AS (
+				DELETE FROM pending_unmined WHERE hash = ANY($1)
 			)
 			SELECT hash, block_ids FROM upd`
-		} else {
-			updateSQL = `UPDATE txs SET
-					block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-					block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-					subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
-					locked = false, unmined_since = NULL,
-					mined_at_height = $5,
-					delete_at_height = CASE
-						WHEN preserve_until IS NULL AND out_count > 0 AND (
-							spendable_count = 0
-							OR (
-								EXISTS (SELECT 1 FROM spends s WHERE s.prev_tx_hash = txs.hash)
-								AND spendable_count = (
-									SELECT count(*) FROM spends s
-									WHERE s.prev_tx_hash = txs.hash
-									  AND CASE WHEN s.prev_output_idx < txs.out_count
-									           THEN get_bit(txs.out_spendables, s.prev_output_idx) = 1
-									           ELSE false END)
-							))
-						THEN (GREATEST(
-								COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = txs.hash), 0),
-								$5) + 1 + $6)::int
-						ELSE delete_at_height
-					END
-				WHERE hash = ANY($1)
-				RETURNING hash, block_ids`
-		}
 	} else {
-		updateSQL = `UPDATE txs SET
+		updateSQL = `WITH _pu AS (
+			DELETE FROM pending_unmined WHERE hash = ANY($1)
+		)
+		UPDATE txs SET
 			block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
 			block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
 			subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
@@ -368,13 +345,36 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s", hash, err)
 		}
 
-		// C5: when pending_deletes is enabled, remove the hash from the side-table in
-		// the same pgxTx so the clear is atomic with the DAH null above. Harmless no-op
-		// if the hash was never stamped (e.g. reorged before the sweep ran).
-		if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
+		// C5: remove the hash from the pending_deletes side-table in the same pgxTx so
+		// the clear is atomic with the DAH null above. Harmless no-op if the hash was
+		// never stamped (e.g. reorged before the sweep ran).
+		if _, err := pgxTx.Exec(ctx,
+			`DELETE FROM pending_deletes WHERE hash = $1`, hash[:]); err != nil {
+			return nil, errors.NewStorageError("[UnsetMined] failed to delete pending_deletes for %s (C5)", hash, err)
+		}
+
+		// U1: when fully reorged out (block_ids is now empty), insert into pending_unmined.
+		// pending_unmined is ALWAYS-ON (no flag). We derive whether the tx is now fully
+		// unmined from the post-update block_ids array returned by RETURNING above.
+		// unmined_since is currentBlockHeight (= s.blockHeight.Load()+1), matching the
+		// CASE expression in the UPDATE above — COPY-FROM-RETURNING semantics without
+		// re-reading the row. Harmless ON CONFLICT DO UPDATE if the hash was already
+		// in pending_unmined from a prior reorg (idempotent).
+		//
+		// Guard: only insert when the tx is NOT conflicting (mirrors U3 in conflicting.go:491-493).
+		// A conflicting tx reorged out must NOT enter pending_unmined — conflicting txs are
+		// outside the invariant set {unmined AND NOT conflicting}. The NOT EXISTS subquery
+		// reads the txs row just updated (same pgxTx, row is locked), so the check is
+		// atomic with the UPDATE above.
+		if len(newBlockIDs) == 0 {
 			if _, err := pgxTx.Exec(ctx,
-				`DELETE FROM pending_deletes WHERE hash = $1`, hash[:]); err != nil {
-				return nil, errors.NewStorageError("[UnsetMined] failed to delete pending_deletes for %s (C5)", hash, err)
+				`INSERT INTO pending_unmined (hash, unmined_since)
+				 SELECT $1, $2 WHERE NOT EXISTS (
+				 	SELECT 1 FROM txs WHERE hash = $1 AND conflicting
+				 )
+				 ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`,
+				hash[:], currentBlockHeight); err != nil {
+				return nil, errors.NewStorageError("[UnsetMined] failed to insert pending_unmined for %s (U1)", hash, err)
 			}
 		}
 

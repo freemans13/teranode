@@ -18,7 +18,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSchema_PendingDeletes_FlagOn(t *testing.T) {
+// TestSchema_PendingDeletes_AlwaysCreated verifies that pending_deletes is always
+// created (the only pruner path) and the legacy px_delete_at_height BRIN is always
+// dropped. The flag parameter to createSchemaWithPoolFlag is now ignored.
+func TestSchema_PendingDeletes_AlwaysCreated(t *testing.T) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, testDSN)
 	if err != nil || pool.Ping(ctx) != nil {
@@ -27,22 +30,24 @@ func TestSchema_PendingDeletes_FlagOn(t *testing.T) {
 	defer pool.Close()
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS pending_deletes CASCADE`)
-	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, true)) // flag ON
+	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, true)) // flag parameter ignored, always creates
 
 	var n int
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT count(*) FROM pg_class WHERE relname LIKE 'pending_deletes_p%' AND relkind='r'`).Scan(&n))
-	require.Equal(t, 8, n, "8 pending_deletes leaves")
+	require.Equal(t, 8, n, "8 pending_deletes leaves always created")
 
 	var hasBrin bool
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
-	require.False(t, hasBrin, "BRIN dropped when flag on")
+	require.False(t, hasBrin, "BRIN always dropped (pending_deletes is the only path)")
 }
 
-// newTestStoreWithFlag builds a Store with a fresh schema. flagOn controls
-// PostgresUsePendingDeletesTable. Skips if no postgres is reachable.
-func newTestStoreWithFlag(t *testing.T, flagOn bool) *Store {
+// newTestStoreWithFlag builds a Store with a fresh schema. The flagOn parameter
+// is retained for backward compatibility with existing call sites but is now
+// ignored: pending_deletes is the only pruner path, so it is always created.
+// Skips if no postgres is reachable.
+func newTestStoreWithFlag(t *testing.T, _ bool) *Store {
 	t.Helper()
 	ctx := context.Background()
 
@@ -57,6 +62,8 @@ func newTestStoreWithFlag(t *testing.T, flagOn bool) *Store {
 		DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT) CASCADE;
 		DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT) CASCADE;
 		DROP TABLE IF EXISTS pending_deletes CASCADE;
+		DROP TABLE IF EXISTS pending_unmined CASCADE;
+		DROP INDEX IF EXISTS px_pu_backfill_marker;
 		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
 			tx_state, transactions, txs, txs_raw, dah_watermark, dah_part_watermark, dah_sweep_control,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue,
@@ -70,7 +77,6 @@ func newTestStoreWithFlag(t *testing.T, flagOn bool) *Store {
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 30 * time.Second
-	tSettings.UtxoStore.PostgresUsePendingDeletesTable = flagOn
 
 	logger := ulogger.TestLogger{}
 	store, err := New(ctx, logger, tSettings, storeURL)
@@ -79,8 +85,8 @@ func newTestStoreWithFlag(t *testing.T, flagOn bool) *Store {
 	return store
 }
 
-// newPendingDeletesTestStore builds a Store with PostgresUsePendingDeletesTable=true
-// using a fresh schema. Skips if no postgres is reachable.
+// newPendingDeletesTestStore builds a Store with a fresh schema (pending_deletes is
+// the only pruner path, always created). Skips if no postgres is reachable.
 func newPendingDeletesTestStore(t *testing.T) *Store {
 	t.Helper()
 	return newTestStoreWithFlag(t, true)
@@ -333,40 +339,13 @@ func TestPendingDeletes_UnsetMinedRemovesFromList(t *testing.T) {
 	require.False(t, exists, "SetMinedMulti(UnsetMined=true) must remove tx from pending_deletes (C5)")
 }
 
-func TestSchema_PendingDeletes_FlagOff(t *testing.T) {
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, testDSN)
-	if err != nil || pool.Ping(ctx) != nil {
-		t.Skip("no postgres")
-	}
-	defer pool.Close()
-
-	// Ensure clean slate: drop pending_deletes if a prior FlagOn test left it.
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS pending_deletes CASCADE`)
-	// Ensure BRIN is absent so we can confirm creation.
-	_, _ = pool.Exec(ctx, `DROP INDEX IF EXISTS px_delete_at_height`)
-
-	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, false)) // flag OFF
-
-	// No pending_deletes leaves should exist.
-	var n int
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT count(*) FROM pg_class WHERE relname LIKE 'pending_deletes_p%' AND relkind='r'`).Scan(&n))
-	require.Equal(t, 0, n, "no pending_deletes leaves when flag off")
-
-	// BRIN index must be present.
-	var hasBrin bool
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
-	require.True(t, hasBrin, "BRIN present when flag off")
-}
-
 // TestPendingDeletes_PruneEquivalence is the headline correctness gate for the whole
-// feature (spec §8): with the pending_deletes flag ON the pruner must delete EXACTLY
-// the same SET of tx hashes — the doomed (mined+fully-spent) parents — and leave EXACTLY
-// the same survivors as with the flag OFF. A count-only check would pass even if the ON
-// path pruned a different row than OFF (wrong set, same total), so the required assertion
-// is require.ElementsMatch on the actual hash SETS.
+// feature (spec §8): the pruner must delete EXACTLY the doomed (mined+fully-spent)
+// parents and leave EXACTLY the expected survivors. The flag parameter is now ignored
+// (pending_deletes is the only path), so both runs exercise the same path; the run is
+// kept as a robust per-run set check (pruned == doomed, survivors == created−doomed).
+// A count-only check would pass even if the path pruned a different row (wrong set,
+// same total), so the required assertion is require.ElementsMatch on the actual hash SETS.
 //
 // Each run builds its workload on a truly fresh per-flag DB. The spending-child txs that
 // spendAllOutputs creates carry RANDOM txids (getSpendingTx uses rand.Uint64), so the raw
@@ -536,41 +515,30 @@ func runWorkloadAndPrune(t *testing.T, flagOn bool) pruneResult {
 	return res
 }
 
-// TestPendingDeletes_BackfillOnEnable verifies the one-time backfill migration:
-// when the PostgresUsePendingDeletesTable flag is turned ON against an existing DB
-// that already has txs rows with non-NULL delete_at_height, those rows must be
-// copied into pending_deletes and the BRIN index must be dropped.
+// TestPendingDeletes_BackfillOnEnable verifies the one-time backfill migration that
+// retires the legacy px_delete_at_height BRIN. pending_deletes is now the only pruner
+// path, so the migration runs unconditionally on startup: any txs row that already
+// carries a non-NULL delete_at_height (e.g. stamped by an older binary that used the
+// inline-delete path) must be copied into pending_deletes and the BRIN must be dropped.
 //
 // Steps:
-//  1. Build a store with flag OFF (BRIN present, no pending_deletes).
-//  2. Insert a tx with a non-NULL delete_at_height via direct UPDATE (simulates
-//     a pre-existing stamp from an earlier run without the flag).
-//  3. Re-init the schema with flag ON (same pool via createSchemaWithPoolFlag).
-//  4. Assert: stamped hash is in pending_deletes with correct delete_at_height,
-//     and the BRIN px_delete_at_height is gone.
-//  5. Idempotency: call flag-ON init again; no error, no duplicate (PK),
-//     and the BRIN absence is stable.
+//  1. Build a fresh store (always-on schema).
+//  2. Simulate a legacy DB: recreate the px_delete_at_height BRIN and delete the
+//     stamped tx's pending_deletes row, so the row exists ONLY as a txs stamp under a
+//     present BRIN (exactly the state an older inline-delete binary would leave).
+//  3. Re-init the schema. This must backfill pending_deletes (INSERT … SELECT from
+//     txs while the BRIN still exists) then drop the BRIN.
+//  4. Assert: stamped hash is in pending_deletes with correct delete_at_height, and
+//     the BRIN px_delete_at_height is gone.
+//  5. Idempotency: call init again; no error, no duplicate (PK), BRIN stays absent.
 func TestPendingDeletes_BackfillOnEnable(t *testing.T) {
 	ctx := context.Background()
 
-	// Step 1: build a fresh store with flag OFF (BRIN present, no pending_deletes).
-	st := newTestStoreWithFlag(t, false)
+	// Step 1: build a fresh store (always-on schema: pending_deletes present, BRIN gone).
+	st := newTestStoreWithFlag(t, true)
 	pool := st.pool
 
-	// Confirm precondition: BRIN present, no pending_deletes.
-	var hasBrin bool
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
-	require.True(t, hasBrin, "precondition: BRIN must be present with flag OFF")
-
-	var hasPD bool
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='pending_deletes' AND relkind='p')`).Scan(&hasPD))
-	require.False(t, hasPD, "precondition: pending_deletes must not exist with flag OFF")
-
-	// Step 2: insert a tx row with a non-NULL delete_at_height (simulate pre-existing stamp).
-	// Use testExtendedTx to get a valid tx, Create it via the store (populates txs), then
-	// UPDATE its delete_at_height directly.
+	// Insert a tx row with a non-NULL delete_at_height (simulate a pre-existing stamp).
 	tx := testExtendedTx(t)
 	_, err := st.Create(ctx, tx, 100)
 	require.NoError(t, err)
@@ -587,7 +555,21 @@ func TestPendingDeletes_BackfillOnEnable(t *testing.T) {
 	require.NotNil(t, dah, "precondition: tx must have delete_at_height stamped in txs")
 	require.Equal(t, stampedDAH, *dah)
 
-	// Step 3: re-init schema with flag ON. This must backfill pending_deletes
+	// Step 2: simulate a legacy DB. Recreate the BRIN and remove the row from
+	// pending_deletes so the only record of this DAH is the txs stamp under the BRIN —
+	// exactly what an older inline-delete binary would have left behind.
+	_, err = pool.Exec(ctx,
+		`CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs USING brin (delete_at_height) WITH (pages_per_range = 32, autosummarize = on)`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `DELETE FROM pending_deletes WHERE hash = $1`, hashBytes)
+	require.NoError(t, err)
+
+	var hasBrin bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
+	require.True(t, hasBrin, "precondition: legacy BRIN must be present before migration")
+
+	// Step 3: re-init schema. The unconditional migration must backfill pending_deletes
 	// (INSERT … SELECT from txs while BRIN still exists) then drop the BRIN.
 	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, true))
 
@@ -601,11 +583,11 @@ func TestPendingDeletes_BackfillOnEnable(t *testing.T) {
 	// Step 4b: BRIN must be gone.
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
-	require.False(t, hasBrin, "BRIN px_delete_at_height must be dropped after flag-ON init")
+	require.False(t, hasBrin, "BRIN px_delete_at_height must be dropped after migration")
 
-	// Step 5: idempotency — call flag-ON init again; must succeed, no duplicate error,
+	// Step 5: idempotency — call init again; must succeed, no duplicate error,
 	// and the hash is still present exactly once.
-	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, true), "second flag-ON init must be idempotent")
+	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, true), "second init must be idempotent")
 
 	var count int
 	require.NoError(t, pool.QueryRow(ctx,
@@ -615,7 +597,7 @@ func TestPendingDeletes_BackfillOnEnable(t *testing.T) {
 	// BRIN must still be absent.
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`).Scan(&hasBrin))
-	require.False(t, hasBrin, "BRIN must remain absent after second flag-ON init")
+	require.False(t, hasBrin, "BRIN must remain absent after second init")
 }
 
 // ---------------------------------------------------------------------------

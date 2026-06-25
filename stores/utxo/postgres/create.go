@@ -327,11 +327,37 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		return result, nil
 	}
 
-	// Insert into txs (metadata + state + raw_tx + packed output columns).
-	// out_frozens is NULL on create (no output frozen — freeze materialises the
-	// bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
+	// Insert into txs atomically with the pending_unmined projection using a CTE,
+	// mirroring the batched path (createBatchUNNESTSQL). COPY-FROM-RETURNING:
+	// unmined_since is sourced from the ins CTE RETURNING, never recomputed.
+	// ON CONFLICT upsert in _pu handles idempotent re-creates. Non-conflicting
+	// path only — conflicting items are excluded from the invariant (pruner skips
+	// them). out_frozens is NULL on create (no output frozen — freeze materialises
+	// the bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
+	// The outer SELECT returns ins.hash so the ON CONFLICT DO NOTHING / no-row case
+	// is detectable via pgx.ErrNoRows (same contract as the plain INSERT before).
+	const insertDirectSQL = `
+		WITH ins AS (
+			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+				locked, conflicting, frozen, unmined_since,
+				block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
+				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			        $17, $18, $19, $20, $21)
+			ON CONFLICT (hash) DO NOTHING
+			RETURNING hash, unmined_since
+		),
+		_pu AS (
+			INSERT INTO pending_unmined (hash, unmined_since)
+			SELECT ins.hash, ins.unmined_since
+			FROM ins
+			WHERE ins.unmined_since IS NOT NULL
+			ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since
+		)
+		SELECT ins.hash FROM ins`
+
 	var insertedHash []byte
-	if err = conn.QueryRow(ctx, insertSQL, insertArgs...).Scan(&insertedHash); err != nil {
+	if err = conn.QueryRow(ctx, insertDirectSQL, insertArgs...).Scan(&insertedHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
 		}
@@ -413,27 +439,46 @@ const createBatchChunkOverhead int64 = 1024
 
 // createBatchUNNESTSQL is the bulk create INSERT, hoisted to a package const so
 // the byte-bounded chunk driver can issue it once per chunk over array sub-slices.
+//
+// The CTE wraps the txs INSERT so the _pu arm can atomically upsert unmined rows
+// into pending_unmined in the same statement. COPY-FROM-RETURNING: unmined_since
+// is sourced from the ins CTE RETURNING, never recomputed. The conflicting column
+// is always false here (conflicting items are routed to createDirect by
+// sendCreateBatch before reaching this path), so the WHERE clause needs only
+// check unmined_since IS NOT NULL. ON CONFLICT upsert handles idempotent re-creates.
+// The outer SELECT returns only ins.hash to preserve the existing scan contract in
+// runChunk (rows.Scan(&hashBytes)).
 const createBatchUNNESTSQL = `
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-			locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
-			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
-		SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
-		       u.locked, u.conflicting, u.frozen,
-		       CASE WHEN u.mined THEN NULL::int ELSE u.unmined_since END,
-		       CASE WHEN u.mined THEN ARRAY[u.block_id] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN ARRAY[u.block_height] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN ARRAY[u.subtree_idx] ELSE NULL::int[] END,
-		       CASE WHEN u.mined THEN u.block_height ELSE NULL::int END,
-		       u.utxo_hashes, u.out_count, u.spendable_count, u.out_spendables, u.coinbase_spending_height
-		FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
-		            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
-		            $11::int[], $12::boolean[], $13::int[], $14::int[], $15::int[],
-		            $16::bytea[], $17::int[], $18::int[], $19::bytea[], $20::int[])
-		     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-		          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx,
-		          utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
-		ON CONFLICT (hash) DO NOTHING
-		RETURNING hash`
+		WITH ins AS (
+			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+				locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
+				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+			SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
+			       u.locked, u.conflicting, u.frozen,
+			       CASE WHEN u.mined THEN NULL::int ELSE u.unmined_since END,
+			       CASE WHEN u.mined THEN ARRAY[u.block_id] ELSE NULL::int[] END,
+			       CASE WHEN u.mined THEN ARRAY[u.block_height] ELSE NULL::int[] END,
+			       CASE WHEN u.mined THEN ARRAY[u.subtree_idx] ELSE NULL::int[] END,
+			       CASE WHEN u.mined THEN u.block_height ELSE NULL::int END,
+			       u.utxo_hashes, u.out_count, u.spendable_count, u.out_spendables, u.coinbase_spending_height
+			FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
+			            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
+			            $11::int[], $12::boolean[], $13::int[], $14::int[], $15::int[],
+			            $16::bytea[], $17::int[], $18::int[], $19::bytea[], $20::int[])
+			     AS u(hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+			          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx,
+			          utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+			ON CONFLICT (hash) DO NOTHING
+			RETURNING hash, unmined_since
+		),
+		_pu AS (
+			INSERT INTO pending_unmined (hash, unmined_since)
+			SELECT ins.hash, ins.unmined_since
+			FROM ins
+			WHERE ins.unmined_since IS NOT NULL
+			ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since
+		)
+		SELECT ins.hash FROM ins`
 
 // planCreateChunks partitions [0,len(rowBytes)) into contiguous, non-empty,
 // byte-bounded windows whose estimated wire size (chunkOverhead + Σ rowBytes in

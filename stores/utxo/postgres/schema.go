@@ -31,7 +31,7 @@ import (
 //     (flat bytea + bitmaps + scalar counts). A single row lookup returns
 //     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
-	if err := createSchemaWithPoolFlag(ctx, s.pool, s.settings.UtxoStore.PostgresUsePendingDeletesTable); err != nil {
+	if err := createSchemaInternal(ctx, s.pool); err != nil {
 		return err
 	}
 
@@ -71,18 +71,20 @@ type partitionSpec struct {
 // workers while bounding fan-out cost on reads.
 const numPartitions = 8
 
-// createSchemaWithPool executes all DDL statements using the provided pool
-// with the pending_deletes feature disabled (legacy default).
-func createSchemaWithPool(ctx context.Context, pool *pgxpool.Pool) error {
-	return createSchemaWithPoolFlag(ctx, pool, false)
+// createSchemaWithPoolFlag executes all DDL statements using the provided pool.
+// The usePendingDeletes parameter is retained for backward compatibility with
+// existing test call sites but is now ignored: the pending_deletes side-table
+// is the only pruner path, so it is always created and the px_delete_at_height
+// BRIN index on txs is always backfilled into pending_deletes and dropped.
+func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, _ bool) error {
+	return createSchemaInternal(ctx, pool)
 }
 
-// createSchemaWithPoolFlag executes all DDL statements using the provided pool.
-// When usePendingDeletes is true the pending_deletes partitioned side-table (8
-// leaves) is created and the px_delete_at_height BRIN index on txs is dropped
-// (the pruner reads from the side-table instead). When false the BRIN index is
-// created and no pending_deletes tables are created.
-func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, usePendingDeletes bool) error {
+// createSchemaInternal executes all DDL statements using the provided pool. It
+// always creates the pending_deletes side-table (8 leaves + per-leaf btree on
+// delete_at_height) and unconditionally backfills+drops the legacy
+// px_delete_at_height BRIN index on txs — pending_deletes is the only pruner path.
+func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool) error {
 	ddlStatements := []string{
 		txsDDL,
 		spendsDDL,
@@ -267,56 +269,77 @@ func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, usePendin
 		return errors.NewStorageError("conflict_intents creation failed", err)
 	}
 
-	// pending_deletes side-table: when enabled, the pruner populates this
-	// table with (hash, delete_at_height) rows and reads from it directly
-	// rather than scanning txs via the BRIN index. Each hash partition gets
-	// its own leaf and a btree index on delete_at_height for efficient
-	// height-range scans by the pruner.
+	// pending_deletes side-table: ALWAYS-ON (no flag). The pruner populates this
+	// table with (hash, delete_at_height) rows and reads from it directly rather
+	// than scanning txs via a BRIN index. Each hash partition gets its own leaf
+	// and a btree index on delete_at_height for efficient height-range scans by
+	// the pruner.
 	//
 	// This block is intentionally placed BEFORE the BRIN drop/backfill block
 	// below so that pending_deletes exists when the backfill INSERT runs.
-	if usePendingDeletes {
-		if _, err := pool.Exec(ctx, pendingDeletesDDL); err != nil {
-			return errors.NewStorageError("pending_deletes creation failed", err)
+	if _, err := pool.Exec(ctx, pendingDeletesDDL); err != nil {
+		return errors.NewStorageError("pending_deletes creation failed", err)
+	}
+	for i := 0; i < numPartitions; i++ {
+		leafDDL := fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS pending_deletes_p%02d PARTITION OF pending_deletes FOR VALUES WITH (MODULUS %d, REMAINDER %d)",
+			i, numPartitions, i,
+		)
+		if _, err := pool.Exec(ctx, leafDDL); err != nil {
+			return errors.NewStorageError("pending_deletes_p%02d creation failed", i, err)
 		}
-		for i := 0; i < numPartitions; i++ {
-			leafDDL := fmt.Sprintf(
-				"CREATE TABLE IF NOT EXISTS pending_deletes_p%02d PARTITION OF pending_deletes FOR VALUES WITH (MODULUS %d, REMAINDER %d)",
-				i, numPartitions, i,
-			)
-			if _, err := pool.Exec(ctx, leafDDL); err != nil {
-				return errors.NewStorageError("pending_deletes_p%02d creation failed", i, err)
-			}
-			idxDDL := fmt.Sprintf(
-				"CREATE INDEX IF NOT EXISTS px_pd_dah_p%02d ON pending_deletes_p%02d USING btree (delete_at_height)",
-				i, i,
-			)
-			if _, err := pool.Exec(ctx, idxDDL); err != nil {
-				return errors.NewStorageError("pending_deletes_p%02d index creation failed", i, err)
-			}
+		idxDDL := fmt.Sprintf(
+			"CREATE INDEX IF NOT EXISTS px_pd_dah_p%02d ON pending_deletes_p%02d USING btree (delete_at_height)",
+			i, i,
+		)
+		if _, err := pool.Exec(ctx, idxDDL); err != nil {
+			return errors.NewStorageError("pending_deletes_p%02d index creation failed", i, err)
 		}
 	}
 
+	// pending_unmined side-table: ALWAYS-ON (no flag). Stores (hash, unmined_since)
+	// rows for efficient old-unmined-tx queries by the iterator and pruner.
+	// Each hash partition gets its own leaf and a btree index on unmined_since for
+	// height-range scans. The backfill is guarded by a marker index so it runs only
+	// once (on first startup with this schema version) rather than on every restart.
+	if _, err := pool.Exec(ctx, pendingUnminedDDL); err != nil {
+		return errors.NewStorageError("pending_unmined creation failed", err)
+	}
+	for i := 0; i < numPartitions; i++ {
+		leafDDL := fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS pending_unmined_p%02d PARTITION OF pending_unmined FOR VALUES WITH (MODULUS %d, REMAINDER %d)",
+			i, numPartitions, i,
+		)
+		if _, err := pool.Exec(ctx, leafDDL); err != nil {
+			return errors.NewStorageError("pending_unmined_p%02d creation failed", i, err)
+		}
+		idxDDL := fmt.Sprintf(
+			"CREATE INDEX IF NOT EXISTS px_pu_since_p%02d ON pending_unmined_p%02d USING btree (unmined_since)",
+			i, i,
+		)
+		if _, err := pool.Exec(ctx, idxDDL); err != nil {
+			return errors.NewStorageError("pending_unmined_p%02d index creation failed", i, err)
+		}
+	}
+	// One-time idempotent backfill: copies existing unmined non-conflicting txs
+	// into pending_unmined. Guarded by px_pu_backfill_marker so it does not
+	// re-run on every startup (see pendingUnminedBackfillDDL for details).
+	if _, err := pool.Exec(ctx, pendingUnminedBackfillDDL); err != nil {
+		return errors.NewStorageError("pending_unmined backfill failed", err)
+	}
+
 	// Partial indexes on txs for iterator/pruner queries. The base indexes are
-	// always applied. The BRIN on delete_at_height is conditional: when the
-	// pending_deletes side-table is enabled the pruner reads from that table
-	// instead, so the BRIN is unnecessary overhead — drop it (with a one-time
-	// backfill first). When disabled (default), the pruner scans txs directly
-	// and the BRIN is required.
-	//
-	// The pending_deletes table is created above (flag-ON path) so the backfill
-	// INSERT can run while the BRIN still exists for a fast index-assisted scan.
+	// always applied. The legacy px_delete_at_height BRIN on txs is no longer
+	// used: pending_deletes is the only pruner path, so the BRIN is
+	// unconditionally backfilled into pending_deletes (for any orphaned rows on
+	// an existing DB) and dropped. The pending_deletes table is created above so
+	// the backfill INSERT can run while the BRIN still exists (if present) for a
+	// fast index-assisted scan.
 	if _, err := pool.Exec(ctx, txsIndexesDDLBase); err != nil {
 		return errors.NewStorageError("txs base index creation failed", err)
 	}
-	if usePendingDeletes {
-		if _, err := pool.Exec(ctx, txsDAHBrinBackfillAndDropDDL); err != nil {
-			return errors.NewStorageError("px_delete_at_height backfill+drop failed", err)
-		}
-	} else {
-		if _, err := pool.Exec(ctx, txsDAHBrinDDL); err != nil {
-			return errors.NewStorageError("px_delete_at_height creation failed", err)
-		}
+	if _, err := pool.Exec(ctx, txsDAHBrinBackfillAndDropDDL); err != nil {
+		return errors.NewStorageError("px_delete_at_height backfill+drop failed", err)
 	}
 
 	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).
@@ -414,45 +437,31 @@ CREATE TABLE IF NOT EXISTS txs (
 // HOT (83%+ measured). Its consumers (unmined iterators, old-unmined queries)
 // are background paths that tolerate bitmap-scan rechecks.
 //
-// delete_at_height is BRIN for the same HOT reason: the DAH sweep stamps it on
-// (almost) every tx once, and a btree here makes every stamp a non-HOT row
-// rewrite (measured: stamp cost 70ms -> 132ms per 5K-candidate sweep call with
-// the btree, the sweep saturating ~57-78K stamps/s and falling behind an ~88K
-// create rate). With BRIN the stamp stays HOT. The pruner's doomed-row scan
-// (delete_at_height <= H LIMIT N) tolerates BRIN's bitmap rechecks while the
-// table is bounded; both index choices were A/B'd under sustained load and
-// BRIN-everywhere is the best-known configuration (88K vs 65-71K medians).
-// txsIndexesDDLBase contains the txs partial indexes that are always created
-// regardless of the pending_deletes flag.
+// delete_at_height no longer has an index on txs: the BRIN was retired by
+// txsDAHBrinBackfillAndDropDDL. The pruner now reads the pending_deletes
+// btree side-table exclusively; delete_at_height on txs is a stamp-only column
+// used by the DAH sweep worker and read back only on restart recovery.
+// txsIndexesDDLBase contains the txs partial indexes that are always created.
 const txsIndexesDDLBase = `
 CREATE INDEX IF NOT EXISTS px_unmined_since ON txs USING brin (unmined_since) WITH (pages_per_range = 32, autosummarize = on);
 CREATE INDEX IF NOT EXISTS px_preserve_until ON txs (preserve_until) WHERE preserve_until IS NOT NULL;`
 
-// txsDAHBrinDDL creates the BRIN index on txs.delete_at_height used by the
-// pruner when the pending_deletes side-table is NOT in use. See the comment on
-// delete_at_height in txsDDL for the HOT-chain rationale.
-const txsDAHBrinDDL = `CREATE INDEX IF NOT EXISTS px_delete_at_height ON txs USING brin (delete_at_height) WITH (pages_per_range = 32, autosummarize = on);`
-
-// txsDAHBrinDropDDL drops the BRIN index when the pending_deletes side-table
-// IS in use. The pruner reads from pending_deletes directly, so the BRIN index
-// on txs is unnecessary overhead.
-const txsDAHBrinDropDDL = `DROP INDEX IF EXISTS px_delete_at_height;`
-
-// txsDAHBrinBackfillAndDropDDL is the one-time migration used when the
-// pending_deletes flag is turned ON against an existing database.
+// txsDAHBrinBackfillAndDropDDL is the one-time migration that retires the legacy
+// px_delete_at_height BRIN index on txs now that pending_deletes is the only
+// pruner path. It runs unconditionally on every startup.
 //
 // The gated DO block runs only when the BRIN index px_delete_at_height still
-// exists (i.e. the DB was previously running with flag OFF). In that case it
-// backfills pending_deletes from any txs rows that already carry a non-NULL
-// delete_at_height (orphaned rows the side-table pruner would otherwise never
-// see), then drops the BRIN. The INSERT runs BEFORE the DROP so it can use the
-// BRIN for a fast index-assisted scan rather than a full sequential scan.
+// exists (i.e. the DB was previously running the old inline-delete path). In
+// that case it backfills pending_deletes from any txs rows that already carry a
+// non-NULL delete_at_height (orphaned rows the side-table pruner would otherwise
+// never see), then drops the BRIN. The INSERT runs BEFORE the DROP so it can use
+// the BRIN for a fast index-assisted scan rather than a full sequential scan.
 //
 // ON CONFLICT (hash) DO NOTHING makes the INSERT idempotent: rows already in
 // pending_deletes (e.g. from a partial earlier run) are skipped cleanly.
 //
-// On all subsequent flag-ON startups the BRIN is already gone so the IF EXISTS
-// guard is false — neither the INSERT nor the DROP executes, avoiding a seq-scan.
+// On all subsequent startups the BRIN is already gone so the IF EXISTS guard is
+// false — neither the INSERT nor the DROP executes, avoiding a seq-scan.
 const txsDAHBrinBackfillAndDropDDL = `
 DO $$ BEGIN
   IF EXISTS(SELECT 1 FROM pg_class WHERE relname='px_delete_at_height') THEN
@@ -473,6 +482,48 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
     delete_at_height INT   NOT NULL,
     PRIMARY KEY (hash)
 ) PARTITION BY HASH (hash);`
+
+// pendingUnminedDDL creates the pending_unmined partitioned parent table. Each
+// hash partition leaf is created separately in createSchemaWithPoolFlag.
+// The table stores (hash, unmined_since) rows for the iterator and pruner to
+// consume; the projection invariant maintains it in line with txs mutations.
+// ALWAYS-ON: no feature flag guards this table — it is created unconditionally.
+const pendingUnminedDDL = `
+CREATE TABLE IF NOT EXISTS pending_unmined (
+    hash           BYTEA NOT NULL,
+    unmined_since  INT   NOT NULL,
+    PRIMARY KEY (hash)
+) PARTITION BY HASH (hash);`
+
+// pendingUnminedBackfillDDL is the one-time idempotent backfill executed at
+// store startup. It runs only once, guarded by the marker index
+// px_pu_backfill_marker:
+//
+//   - If the marker does NOT exist (first run), all non-conflicting unmined txs
+//     are copied from txs into pending_unmined, then the marker is created so
+//     subsequent startups skip the INSERT.
+//   - If the marker exists (re-run), the block body is skipped entirely — no
+//     seq-scan, no INSERT.
+//
+// ON CONFLICT (hash) DO NOTHING makes the INSERT idempotent: rows already in
+// pending_unmined (e.g. from a partial earlier run before the marker was
+// written) are skipped cleanly.
+//
+// The marker is a partial index on leaf partition pending_unmined_p00. Creating
+// it on a concrete leaf (not the partitioned parent) sidesteps the PostgreSQL
+// restriction that unique indexes on partitioned tables must include all
+// partition key columns. The marker is never used for query planning — its sole
+// purpose is a named sentinel readable via pg_class.
+const pendingUnminedBackfillDDL = `
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_pu_backfill_marker') THEN
+    INSERT INTO pending_unmined (hash, unmined_since)
+      SELECT hash, unmined_since FROM txs
+      WHERE unmined_since IS NOT NULL AND conflicting = false
+      ON CONFLICT (hash) DO NOTHING;
+    CREATE INDEX px_pu_backfill_marker ON pending_unmined_p00 (unmined_since) WHERE (false);
+  END IF;
+END $$;`
 
 // spends: append-only spend records. LOGGED. A row here is the canonical
 // "this output was spent by that tx" marker; Unspend deletes the row, and
