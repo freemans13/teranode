@@ -43,11 +43,15 @@ func newPrunableUnminedTxIterator(store *Store, cutoffBlockHeight uint32) (*unmi
 	ctx := context.Background()
 	cutoff := int32(cutoffBlockHeight) // unmined_since is INT4
 
-	// Lazy cleanup (bounding): remove stale pending_unmined rows at/below the cutoff
-	// that are no longer truly unmined (mined, conflicting, or pruned). This is
-	// best-effort — a failure here must not abort the pruner read. The mine-path DELETE
-	// was removed from SetMinedMulti (lever 1), so stale rows accumulate and are
-	// reclaimed here once per pruner cycle (infrequent, off the hot path).
+	// Lazy cleanup (bounding): remove stale pending_unmined rows AT OR BELOW the cutoff
+	// that are no longer truly unmined (mined, conflicting, or pruned). This only
+	// reclaims STALE rows AT OR BELOW the cutoff; stale rows ABOVE the cutoff
+	// (mined/conflicting txs more recent than the cutoff) are deliberately left for a
+	// future pruner cycle when the cutoff advances to reach them — they cost nothing
+	// because the read filter (t.unmined_since IS NOT NULL) already excludes them from
+	// results. This is best-effort — a failure here must not abort the pruner read.
+	// The mine-path DELETE was removed from SetMinedMulti (lever 1), so stale rows
+	// accumulate and are reclaimed here once per pruner cycle (infrequent, off the hot path).
 	_, cleanErr := store.pool.Exec(ctx, `
 		DELETE FROM pending_unmined pu
 		WHERE pu.unmined_since <= $1

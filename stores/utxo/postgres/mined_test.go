@@ -100,8 +100,11 @@ func TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_CTEBranch(t *testing
 
 // TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_PlainBranch verifies the
 // lever-1 behaviour for the plain (OnLongestChain=false) branch of SetMinedMulti:
-// the row lingers after mine, is excluded by the pruner read-filter, and is cleaned
-// by the lazy-cleanup on the next GetPrunableUnminedTxIterator call.
+// the plain branch is OnLongestChain=false (mined on a NON-longest chain), which does
+// NOT null txs.unmined_since, so the tx remains legitimately unmined-on-main; therefore
+// its pending_unmined row is correctly RETAINED. The lazy cleanup does NOT remove it
+// (because txs.unmined_since IS NOT NULL), and the pruner read DOES return it (its
+// parents should be preserved for reorg re-processing). This is correct, not a gap.
 func TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_PlainBranch(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStoreWithFlag(t, false)
@@ -166,7 +169,6 @@ func TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_PlainBranch(t *testi
 	// still technically "unmined" from the store's perspective (it may be re-unmined
 	// on reorg). The linger test for the plain branch simply confirms no deletion happened.
 	// Full lazy-cleanup semantics are verified by the CTE branch test above.
-	_ = hashBytes // used above
 }
 
 // TestSetMinedMulti_PendingUnminedLingers_NonLongestChain verifies that the
