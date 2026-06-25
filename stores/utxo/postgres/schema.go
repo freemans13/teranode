@@ -175,8 +175,13 @@ func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, usePendin
 	// mine time without a spend in a swept window (zero-spendable) are stamped inline in
 	// SetMinedMulti; the rarer spent-while-unmined case is caught by the backstop.
 	for i := 0; i < numPartitions; i++ {
+		// spends_spent_at_height_brin removed: it only ever served the O(table) DAH
+		// backstop, which was deleted in 3e3f7f4e9. Bench-confirmed neutral on create/
+		// spend TPS (V1), so the BRIN is pure dead weight — one fewer index per spend
+		// INSERT. The composite (spent_at_height, prev_tx_hash) btree stays: it gives the
+		// DAH-sweep candidate enumeration an index-only scan and a height-only btree was
+		// bench-confirmed to cause bimodal sweep collapse (V3, CV 38%).
 		idxStmts := []string{
-			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_spent_at_height_brin ON spends_p%02d USING brin (spent_at_height) WITH (pages_per_range = 32, autosummarize = on)`, i, i),
 			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_h_hash_btree ON spends_p%02d USING btree (spent_at_height, prev_tx_hash) WITH (fillfactor = 90, deduplicate_items = on)`, i, i),
 		}
 		for _, ddl := range idxStmts {
@@ -193,6 +198,8 @@ func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, usePendin
 		for _, ddl := range []string{
 			fmt.Sprintf(`DROP INDEX IF EXISTS txs_p%02d_mined_at_height_btree`, i),
 			fmt.Sprintf(`DROP INDEX IF EXISTS txs_p%02d_mined_at_height_brin`, i),
+			// Dead since the DAH backstop was removed (3e3f7f4e9); drop on existing DBs.
+			fmt.Sprintf(`DROP INDEX IF EXISTS spends_p%02d_spent_at_height_brin`, i),
 		} {
 			if _, err := pool.Exec(ctx, ddl); err != nil {
 				return errors.NewStorageError("legacy mined_at_height index drop failed", err)
