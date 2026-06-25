@@ -28,7 +28,7 @@ func TestPrunableUnminedTxIterator_RequiresPendingUnmined(t *testing.T) {
 	ctx := context.Background()
 	cleanPendingUnmined(t, st)
 
-	// Create a tx that has unmined_since set in txs but is NOT in pending_unmined.
+	// Create an unmined tx. The write hook inserts it into pending_unmined.
 	tx := testExtendedTx(t)
 	tx.LockTime = 400
 	_, err := st.Create(ctx, tx, 100)
@@ -37,6 +37,12 @@ func TestPrunableUnminedTxIterator_RequiresPendingUnmined(t *testing.T) {
 
 	_, err = st.pool.Exec(ctx,
 		`UPDATE txs SET unmined_since = 1000 WHERE hash = $1`, h[:])
+	require.NoError(t, err)
+
+	// Manually remove the tx from pending_unmined to simulate the "absent" state.
+	// The contract under test: a tx in txs with unmined_since IS NOT NULL but
+	// absent from pending_unmined must NOT appear in the iterator result.
+	_, err = st.pool.Exec(ctx, `DELETE FROM pending_unmined WHERE hash = $1`, h[:])
 	require.NoError(t, err)
 
 	// Confirm the tx is in txs with unmined_since set (sanity check).
@@ -48,7 +54,7 @@ func TestPrunableUnminedTxIterator_RequiresPendingUnmined(t *testing.T) {
 	// pending_unmined is intentionally empty — the JOIN must yield 0 results.
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT count(*) FROM pending_unmined`).Scan(&count))
-	require.Equal(t, 0, count, "precondition: pending_unmined must be empty")
+	require.Equal(t, 0, count, "precondition: pending_unmined must be empty after manual DELETE")
 
 	// New JOIN query → must return 0 (tx absent from pending_unmined).
 	// Old seq-scan query → would have returned 1 (reads from txs directly).
@@ -101,12 +107,13 @@ func TestPrunableUnminedTxIterator_JoinsPendingUnmined(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Populate pending_unmined — normally done inline by the write path (a later
-	// task); here we seed it explicitly so the iterator can find rows.
+	// Update pending_unmined to the staggered heights used by this test. The
+	// write hook already inserted each tx at unmined_since=100 (the create
+	// blockHeight). Use UPSERT to set the staggered values the iterator checks.
 	for i, h := range hashes {
 		_, err := st.pool.Exec(ctx,
 			`INSERT INTO pending_unmined (hash, unmined_since) VALUES ($1, $2)
-			 ON CONFLICT (hash) DO NOTHING`,
+			 ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`,
 			h, int32(1001+i))
 		require.NoError(t, err)
 	}
@@ -162,9 +169,11 @@ func TestPrunableUnminedTxIterator_SkipConflicting(t *testing.T) {
 	_, err = st.pool.Exec(ctx, `UPDATE txs SET unmined_since = 1001 WHERE hash = $1`, h2[:])
 	require.NoError(t, err)
 
-	// Seed both into pending_unmined.
+	// Upsert both into pending_unmined with the staggered height used by this test.
+	// The write hook already inserted at unmined_since=100; update to 1001.
 	_, err = st.pool.Exec(ctx,
-		`INSERT INTO pending_unmined (hash, unmined_since) VALUES ($1, 1001), ($2, 1001)`,
+		`INSERT INTO pending_unmined (hash, unmined_since) VALUES ($1, 1001), ($2, 1001)
+		 ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`,
 		h1[:], h2[:])
 	require.NoError(t, err)
 
@@ -218,8 +227,11 @@ func TestPrunableUnminedTxIterator_ExplainShowsIndexScan(t *testing.T) {
 	_, err = st.pool.Exec(ctx, `UPDATE txs SET unmined_since = 1001 WHERE hash = $1`, h[:])
 	require.NoError(t, err)
 
+	// Upsert into pending_unmined with the target height. Write hook already
+	// inserted at unmined_since=100 (the create blockHeight); update to 1001.
 	_, err = st.pool.Exec(ctx,
-		`INSERT INTO pending_unmined (hash, unmined_since) VALUES ($1, 1001)`,
+		`INSERT INTO pending_unmined (hash, unmined_since) VALUES ($1, 1001)
+		 ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`,
 		h[:])
 	require.NoError(t, err)
 

@@ -51,6 +51,8 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 			tx_state, transactions, txs, txs_raw, dah_watermark, dah_part_watermark, dah_sweep_control,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue,
 			batch_notifications CASCADE;
+		DROP TABLE IF EXISTS pending_unmined CASCADE;
+		DROP INDEX IF EXISTS px_pu_backfill_marker;
 	`)
 	pool.Close()
 

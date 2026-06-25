@@ -3,8 +3,10 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
@@ -200,4 +202,193 @@ func TestSchema_PendingUnmined_BackfillIdempotency(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT count(*) FROM pg_class WHERE relname='px_pu_backfill_marker'`).Scan(&markerCount))
 	require.Equal(t, 1, markerCount, "idempotent re-init must not duplicate the marker")
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: Write hook tests — pending_unmined is populated on Create()
+// ---------------------------------------------------------------------------
+
+// TestCreateWriteHook_UnminedTx_SinglePath verifies that creating an unmined tx
+// via the single/direct path (createDirect) inserts a row into pending_unmined
+// with the correct unmined_since value.
+func TestCreateWriteHook_UnminedTx_SinglePath(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	tx := testExtendedTx(t)
+	txHash := tx.TxIDChainHash()
+
+	// Create unmined — no MinedBlockInfos → createDirect writes pending_unmined.
+	md, err := st.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	require.NotNil(t, md)
+	require.Equal(t, uint32(100), md.UnminedSince, "metadata UnminedSince must equal blockHeight")
+
+	// Assert the tx is in pending_unmined with matching unmined_since.
+	var storedUnminedSince int32
+	err = st.pool.QueryRow(ctx,
+		`SELECT unmined_since FROM pending_unmined WHERE hash=$1`,
+		txHash[:],
+	).Scan(&storedUnminedSince)
+	require.NoError(t, err, "unmined tx must be inserted into pending_unmined")
+	require.Equal(t, int32(100), storedUnminedSince, "pending_unmined.unmined_since must equal blockHeight")
+}
+
+// TestCreateWriteHook_MinedTx_SinglePath verifies that creating a MINED tx via
+// createDirect does NOT insert a row into pending_unmined.
+func TestCreateWriteHook_MinedTx_SinglePath(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	tx := testExtendedTx(t)
+	txHash := tx.TxIDChainHash()
+
+	// Create mined — MinedBlockInfos present → unmined_since = NULL in txs,
+	// so no row should appear in pending_unmined.
+	blockInfo := utxo.MinedBlockInfo{
+		BlockID:        42,
+		BlockHeight:    100,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	}
+	md, err := st.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(blockInfo))
+	require.NoError(t, err)
+	require.NotNil(t, md)
+	require.Equal(t, uint32(0), md.UnminedSince, "mined tx must have zero UnminedSince")
+
+	// Assert the tx is NOT in pending_unmined.
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`,
+		txHash[:],
+	).Scan(&exists))
+	require.False(t, exists, "mined tx must NOT be inserted into pending_unmined")
+}
+
+// TestCreateWriteHook_ConflictingTx_NoPendingUnmined verifies that a conflicting
+// unmined tx is NOT inserted into pending_unmined (conflicting txs are excluded
+// from the projection invariant by the pruner).
+func TestCreateWriteHook_ConflictingTx_NoPendingUnmined(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// First create a parent tx (non-conflicting) so it exists in the store.
+	parent := testExtendedTx(t)
+	_, err := st.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	// Create a conflicting child tx (same inputs, different outputs).
+	child := makeBenchCreateTx() // unique tx, no shared inputs with parent; mark conflicting via option.
+	childHash := child.TxIDChainHash()
+	_, err = st.Create(ctx, child, 100, utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	// Assert conflicting tx is NOT in pending_unmined.
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`,
+		childHash[:],
+	).Scan(&exists))
+	require.False(t, exists, "conflicting tx must NOT be inserted into pending_unmined")
+}
+
+// TestCreateWriteHook_UnminedTx_BatchPath verifies that an unmined tx processed
+// via the UNNEST bulk path (sendCreateBatchUNNEST, 2+ items) is also inserted
+// into pending_unmined with the correct unmined_since.
+func TestCreateWriteHook_UnminedTx_BatchPath(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(200))
+
+	const blockHeight = uint32(200)
+
+	// Build a 2-item batch: both unmined. 2 items forces sendCreateBatchUNNEST.
+	items := []*batchCreateItem{
+		{
+			tx:          makeBenchCreateTx(),
+			blockHeight: blockHeight,
+			options:     &utxo.CreateOptions{},
+			done:        make(chan batchCreateResult, 1),
+		},
+		{
+			tx:          makeBenchCreateTx(),
+			blockHeight: blockHeight,
+			options:     &utxo.CreateOptions{},
+			done:        make(chan batchCreateResult, 1),
+		},
+	}
+
+	// Drive via sendCreateBatch (not sendCreateBatchUNNEST directly) so we exercise
+	// the same dispatch path as production. With 2 non-conflicting, non-multi-block
+	// items, sendCreateBatch routes both to sendCreateBatchUNNEST.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		st.sendCreateBatch(items)
+	}()
+	wg.Wait()
+
+	for i, item := range items {
+		res := <-item.done
+		require.NoError(t, res.Err, "batch item %d create must succeed", i)
+		require.NotNil(t, res.Data, "batch item %d data must not be nil", i)
+		require.Equal(t, blockHeight, res.Data.UnminedSince, "batch item %d UnminedSince", i)
+
+		txHash := item.tx.TxIDChainHash()
+		var storedUnminedSince int32
+		err := st.pool.QueryRow(ctx,
+			`SELECT unmined_since FROM pending_unmined WHERE hash=$1`,
+			txHash[:],
+		).Scan(&storedUnminedSince)
+		require.NoError(t, err, "batch item %d must be in pending_unmined", i)
+		require.Equal(t, int32(blockHeight), storedUnminedSince, "batch item %d unmined_since mismatch", i)
+	}
+}
+
+// TestCreateWriteHook_MinedTx_BatchPath verifies that mined txs processed via
+// the UNNEST bulk path produce NO rows in pending_unmined.
+func TestCreateWriteHook_MinedTx_BatchPath(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(200))
+
+	const blockHeight = uint32(200)
+	blockInfo := utxo.MinedBlockInfo{
+		BlockID: 42, BlockHeight: blockHeight, SubtreeIdx: 0, OnLongestChain: true,
+	}
+
+	items := []*batchCreateItem{
+		{
+			tx:          makeBenchCreateTx(),
+			blockHeight: blockHeight,
+			options:     &utxo.CreateOptions{MinedBlockInfos: []utxo.MinedBlockInfo{blockInfo}},
+			done:        make(chan batchCreateResult, 1),
+		},
+		{
+			tx:          makeBenchCreateTx(),
+			blockHeight: blockHeight,
+			options:     &utxo.CreateOptions{MinedBlockInfos: []utxo.MinedBlockInfo{blockInfo}},
+			done:        make(chan batchCreateResult, 1),
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		st.sendCreateBatch(items)
+	}()
+	wg.Wait()
+
+	for i, item := range items {
+		res := <-item.done
+		require.NoError(t, res.Err, "batch item %d create must succeed", i)
+
+		txHash := item.tx.TxIDChainHash()
+		var exists bool
+		require.NoError(t, st.pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`,
+			txHash[:],
+		).Scan(&exists))
+		require.False(t, exists, "mined batch item %d must NOT be in pending_unmined", i)
+	}
 }

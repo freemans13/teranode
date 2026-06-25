@@ -57,6 +57,8 @@ func newTestStoreWithFlag(t *testing.T, flagOn bool) *Store {
 		DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT) CASCADE;
 		DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT) CASCADE;
 		DROP TABLE IF EXISTS pending_deletes CASCADE;
+		DROP TABLE IF EXISTS pending_unmined CASCADE;
+		DROP INDEX IF EXISTS px_pu_backfill_marker;
 		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
 			tx_state, transactions, txs, txs_raw, dah_watermark, dah_part_watermark, dah_sweep_control,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue,
