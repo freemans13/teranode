@@ -121,22 +121,28 @@ func mineTx(t *testing.T, store *Store, tx *bt.Tx, minedHeight uint32) {
 	require.NoError(t, err)
 }
 
-func TestSetMinedTagsHeightAndDoesNotStampInline(t *testing.T) {
+func TestSetMinedStampsFullySpentAndTagsHeight(t *testing.T) {
+	// Design-C (S6): when a tx is mined onto the longest chain and is already fully
+	// spent (spent-before-mined ordering), SetMinedMulti must stamp delete_at_height
+	// AND record mined_at_height. This replaces the old "DoesNotStampInline" assertion
+	// which documented pre-Design-C behaviour.
 	store, ctx := setupTestStore(t)
+	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
 
 	tx := newUnminedSingleOutputTx(t, store)
-	spendAllOutputs(t, store, tx, 50) // fully spent while unmined
-	mineTx(t, store, tx, 60)          // SetMinedMulti at height 60
+	spendAllOutputs(t, store, tx, 50) // fully spent at height 50 while unmined
+	mineTx(t, store, tx, 60)          // SetMinedMulti at height 60; GREATEST(50,60)=60
 
 	var dah *int64
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT delete_at_height FROM txs WHERE hash=$1`, tx.TxIDChainHash()[:]).Scan(&dah))
-	require.Nil(t, dah, "set-mined must not stamp delete_at_height inline")
+	require.NotNil(t, dah, "S6: set-mined must stamp delete_at_height for fully-spent tx")
+	require.Equal(t, int64(60)+1+ret, *dah, "DAH = GREATEST(spentHeight=50, minedHeight=60)+1+retention")
 
 	var mh *int64
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT mined_at_height FROM txs WHERE hash=$1`, tx.TxIDChainHash()[:]).Scan(&mh))
-	require.NotNil(t, mh, "set-mined must tag mined_at_height for Worker 2")
+	require.NotNil(t, mh, "set-mined must tag mined_at_height")
 }
 
 func TestSpendTagsHeightAndDoesNotStampInline(t *testing.T) {
@@ -420,34 +426,6 @@ func TestWorker2LoopStampsBacklog(t *testing.T) {
 			`SELECT count(*) FROM txs WHERE delete_at_height IS NOT NULL`).Scan(&n)
 		return n == N
 	}, 10*time.Second, 100*time.Millisecond, "Worker 2 loop must stamp the backlog")
-}
-
-func TestBackstopRecoversMissedParent(t *testing.T) {
-	store, ctx := setupTestStore(t)
-	require.NoError(t, store.SetBlockHeight(110))
-
-	p := newMinedSingleOutputTx(t, store, 100)
-	spendAllOutputs(t, store, p, 101)
-	// Simulate a missed enumeration: null the height tags so the height-range
-	// sweep can no longer find it.
-	_, err := store.pool.Exec(ctx, `UPDATE spends SET spent_at_height = NULL WHERE prev_tx_hash=$1`, p.TxIDChainHash()[:])
-	require.NoError(t, err)
-	_, err = store.pool.Exec(ctx, `UPDATE txs SET mined_at_height = NULL WHERE hash=$1`, p.TxIDChainHash()[:])
-	require.NoError(t, err)
-
-	// The normal sweep misses it now.
-	_, err = procSweepUpTo(store, ctx, store.dahSafeTip(2))
-	require.NoError(t, err)
-	var dah *int64
-	require.NoError(t, store.pool.QueryRow(ctx, `SELECT delete_at_height FROM txs WHERE hash=$1`, p.TxIDChainHash()[:]).Scan(&dah))
-	require.Nil(t, dah, "height-range sweep cannot find a tag-less tx")
-
-	// Backstop over the full keyspace recovers it.
-	n, err := store.backstopReconcile(ctx, 0x00, 0xff, 100000)
-	require.NoError(t, err)
-	require.GreaterOrEqual(t, n, 1)
-	require.NoError(t, store.pool.QueryRow(ctx, `SELECT delete_at_height FROM txs WHERE hash=$1`, p.TxIDChainHash()[:]).Scan(&dah))
-	require.NotNil(t, dah, "backstop must stamp the missed parent")
 }
 
 // TestWatermarkResumeAfterRestart documents and guards the crash-safety property

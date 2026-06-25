@@ -279,14 +279,24 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	//
 	// Hold that and this is a non-issue. Do NOT add per-row delete-time guards back.
 	// ──────────────────────────────────────────────────────────────────────
-	cascadeSQL := fmt.Sprintf(`
-		WITH doomed AS (
-			SELECT hash FROM %[1]s
-			WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1
-			LIMIT $2
-		),
-		del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1)
-		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf)
+	var cascadeSQL string
+	if s.store.settings.UtxoStore.PostgresUsePendingDeletesTable {
+		pdLeaf := fmt.Sprintf("pending_deletes_p%02d", partIdx)
+		cascadeSQL = fmt.Sprintf(`
+			WITH doomed AS (SELECT hash FROM %[3]s WHERE delete_at_height <= $1 LIMIT $2),
+			del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1),
+			del_pd     AS (DELETE FROM %[3]s WHERE hash IN (SELECT hash FROM doomed))
+			DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf, pdLeaf)
+	} else {
+		cascadeSQL = fmt.Sprintf(`
+			WITH doomed AS (
+				SELECT hash FROM %[1]s
+				WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1
+				LIMIT $2
+			),
+			del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1)
+			DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf)
+	}
 
 	var deleted int64
 	for batches := 0; batches < pruneDeleteMaxBatchesPerCall; batches++ {

@@ -13,7 +13,7 @@ import (
 // dahSweepProcVersion is bumped whenever dahSweepProcDDL changes. bootstrap
 // recreates the procedure whenever the version stored in dah_sweep_control
 // differs (in EITHER direction, so a binary rollback reinstalls the older body).
-const dahSweepProcVersion = 7
+const dahSweepProcVersion = 8
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaWithPool (plain DDL);
@@ -37,12 +37,23 @@ CREATE TABLE IF NOT EXISTS dah_sweep_control (
     last_error           TEXT
 )`
 
-// dahSweepProcDDL is the server-side self-committing DAH stamp procedure. It
-// reproduces the exact DAH semantics of the in-process Go sweep
+// dahSweepProcDDL returns the server-side self-committing DAH stamp procedure DDL.
+// It reproduces the exact DAH semantics of the in-process Go sweep
 // (sweepDAHRangePartition) but commits per fully-drained height window, needs no
 // statement_timeout, and is driven by a thin adaptive ticker via CALL. See
 // docs/superpowers/dah-stored-proc-proposal.md for the full design.
-const dahSweepProcDDL = `CREATE OR REPLACE PROCEDURE dah_sweep_batch(
+//
+// When usePendingDeletes is true the procedure also upserts each stamped row's
+// (hash, delete_at_height) into the per-leaf pending_deletes_pNN table inside the
+// same EXECUTE block, keeping the side-table in sync without extra round-trips.
+func dahSweepProcDDL(usePendingDeletes bool) string {
+	if usePendingDeletes {
+		return dahSweepProcDDLWithPendingDeletes
+	}
+	return dahSweepProcDDLPlain
+}
+
+const dahSweepProcDDLPlain = `CREATE OR REPLACE PROCEDURE dah_sweep_batch(
     p_partition  INT,
     p_safe_tip   BIGINT,
     p_retention  INT
@@ -135,8 +146,8 @@ BEGIN
         -- JOIN → correct fully-spent counting), stamp delete_at_height with the exact DAH
         -- formula, and COUNT the stamped rows from the SAME pass: the data-modifying upd
         -- CTE runs once to completion and the outer SELECT counts its RETURNING. Exact DAH
-        -- semantics unchanged (spendable get_bit, GREATEST+1+retention, IS DISTINCT FROM);
-        -- the backstop stays the full unpruned safety net.
+        -- semantics unchanged (spendable get_bit, GREATEST+1+retention, IS DISTINCT FROM).
+        -- The spent-before-mined gap is closed by the mine-time stamp (S6) in SetMinedMulti.
         EXECUTE format($q$
             WITH candidates AS MATERIALIZED (
                 SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
@@ -149,12 +160,11 @@ BEGIN
                 -- every spendable output is consumed, so max_spent is final), and it is
                 -- only cleared by Unspend on reorg — atomically. So re-verifying a
                 -- stamped parent is always a no-op; skip its expensive full-history
-                -- read. The by-hash backstop remains the full, UNPRUNED re-verification
-                -- safety net, so any inconsistency still self-heals. This makes the
-                -- cursor's verification cost scale with NEW completions, not with the
-                -- (mostly already-stamped) backlog. The guards (preserve_until/
-                -- unmined_since/block_ids) are folded in here: those rows are no-ops in
-                -- the stamp formula anyway, so excluding them is equivalent.
+                -- read. This makes the cursor's verification cost scale with NEW
+                -- completions, not with the (mostly already-stamped) backlog.
+                -- The guards (preserve_until/unmined_since/block_ids) are folded in
+                -- here: those rows are no-ops in the stamp formula anyway, so
+                -- excluding them is equivalent.
                 SELECT t.hash, t.out_count, t.out_spendables, t.spendable_count, t.mined_at_height
                   FROM txs_p%1$s t
                   JOIN candidates c ON c.hash = t.hash
@@ -209,6 +219,153 @@ BEGIN
 
         -- TIME-ADAPTIVE step is the sole density regulator: a dense (slow) window
         -- shrinks the NEXT window; a sparse (fast) one grows it.
+        v_ms := extract(epoch FROM clock_timestamp() - v_t0) * 1000;
+        IF v_ms > 2000 THEN
+            v_step := GREATEST(v_step / 2, 1);
+        ELSIF v_ms < 500 THEN
+            v_step := LEAST(v_step * 2, 4096);
+        END IF;
+    END LOOP;
+
+    -- Best-effort observability (additive across the 8 partitions).
+    UPDATE dah_sweep_control
+       SET last_called_at = now(),
+           total_rows_stamped = total_rows_stamped + v_total_stamped
+     WHERE id = 1;
+    COMMIT;
+END;
+$$;`
+
+// dahSweepProcDDLWithPendingDeletes is the variant of the DAH sweep procedure
+// that also upserts each newly-stamped row into the per-leaf pending_deletes_pNN
+// table inside the same EXECUTE block. The upd CTE returns (hash, delete_at_height)
+// instead of just 1 so the ins CTE can populate the side-table, and the outer
+// SELECT count(*) FROM upd still counts stamped rows for the watermark logic.
+const dahSweepProcDDLWithPendingDeletes = `CREATE OR REPLACE PROCEDURE dah_sweep_batch(
+    p_partition  INT,
+    p_safe_tip   BIGINT,
+    p_retention  INT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_leaf_suffix    TEXT := lpad(p_partition::text, 2, '0');
+    v_from           BIGINT;
+    v_to             BIGINT;
+    v_step           BIGINT;
+    v_max_win        INT;
+    v_per_part_cap   INT;
+    v_enabled        BOOLEAN;
+    v_n              BIGINT;
+    v_total_stamped  BIGINT := 0;
+    v_windows        INT := 0;
+    v_t0             timestamptz;
+    v_ms             double precision;
+BEGIN
+    SELECT enabled, batch_rows, max_windows_per_call
+      INTO v_enabled, v_per_part_cap, v_max_win
+      FROM dah_sweep_control WHERE id = 1;
+
+    IF NOT v_enabled THEN
+        RETURN;
+    END IF;
+
+    IF current_setting('server_version_num')::int < 110000 THEN
+        RAISE EXCEPTION 'dah_sweep_batch requires PostgreSQL 11+';
+    END IF;
+
+    IF NOT pg_try_advisory_xact_lock(20240684 + p_partition) THEN
+        RETURN;
+    END IF;
+
+    SELECT last_swept_height INTO v_from
+      FROM dah_part_watermark WHERE partition = p_partition;
+
+    IF v_from IS NULL OR v_from >= p_safe_tip THEN
+        COMMIT;
+        RETURN;
+    END IF;
+
+    v_step := 256;
+
+    WHILE v_from < p_safe_tip LOOP
+        EXIT WHEN v_max_win > 0 AND v_windows >= v_max_win;
+
+        SELECT enabled INTO v_enabled FROM dah_sweep_control WHERE id = 1;
+        EXIT WHEN NOT v_enabled;
+
+        IF NOT pg_try_advisory_xact_lock(20240684 + p_partition) THEN
+            EXIT;
+        END IF;
+
+        SET LOCAL enable_seqscan = off;
+        SET LOCAL lock_timeout = '5s';
+
+        v_to := LEAST(v_from + v_step, p_safe_tip);
+        v_t0 := clock_timestamp();
+
+        EXECUTE format($q$
+            WITH candidates AS MATERIALIZED (
+                SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
+                 WHERE spent_at_height > $1 AND spent_at_height <= $2
+            ),
+            eligible AS MATERIALIZED (
+                SELECT t.hash, t.out_count, t.out_spendables, t.spendable_count, t.mined_at_height
+                  FROM txs_p%1$s t
+                  JOIN candidates c ON c.hash = t.hash
+                 WHERE t.delete_at_height IS NULL
+                   AND t.preserve_until IS NULL
+                   AND t.unmined_since IS NULL
+                   AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) IS NOT NULL
+            ),
+            spend_agg AS (
+                SELECT s.prev_tx_hash AS hash,
+                       count(*) FILTER (WHERE CASE WHEN s.prev_output_idx < e.out_count THEN get_bit(e.out_spendables, s.prev_output_idx) = 1 ELSE false END) AS spent_count,
+                       max(s.spent_at_height) AS max_spent
+                FROM spends_p%1$s s
+                JOIN eligible e ON e.hash = s.prev_tx_hash
+                GROUP BY s.prev_tx_hash
+            ),
+            state AS (
+                SELECT e.hash,
+                       CASE
+                           WHEN COALESCE(sa.spent_count, 0) = e.spendable_count
+                                AND e.out_count > 0
+                                AND GREATEST(COALESCE(sa.max_spent, 0), COALESCE(e.mined_at_height, 0)) <= $2
+                               THEN (GREATEST(COALESCE(sa.max_spent, 0), COALESCE(e.mined_at_height, 0)) + 1 + $3)::int
+                           ELSE NULL
+                       END AS new_dah
+                FROM eligible e
+                LEFT JOIN spend_agg sa ON sa.hash = e.hash
+            ),
+            upd AS (
+                UPDATE txs_p%1$s t
+                   SET delete_at_height = st.new_dah
+                  FROM state st
+                 WHERE t.hash = st.hash
+                   AND t.delete_at_height IS DISTINCT FROM st.new_dah
+                RETURNING t.hash, st.new_dah AS delete_at_height
+            ),
+            ins AS (
+                INSERT INTO pending_deletes_p%1$s (hash, delete_at_height)
+                SELECT hash, delete_at_height FROM upd WHERE delete_at_height IS NOT NULL
+                ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
+            )
+            SELECT count(*) FROM upd
+        $q$, v_leaf_suffix)
+        USING v_from, v_to, p_retention
+        INTO v_n;
+
+        v_total_stamped := v_total_stamped + v_n;
+
+        UPDATE dah_part_watermark
+           SET last_swept_height = v_to
+         WHERE partition = p_partition AND last_swept_height < v_to;
+        COMMIT;
+
+        v_windows := v_windows + 1;
+        v_from    := v_to;
+
         v_ms := extract(epoch FROM clock_timestamp() - v_t0) * 1000;
         IF v_ms > 2000 THEN
             v_step := GREATEST(v_step / 2, 1);
@@ -281,7 +438,7 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 	// would otherwise leave the old overload behind, unused. Best-effort.
 	_, _ = s.pool.Exec(ctx, `DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT)`)
 
-	if _, err = s.pool.Exec(ctx, dahSweepProcDDL); err != nil {
+	if _, err = s.pool.Exec(ctx, dahSweepProcDDL(s.settings.UtxoStore.PostgresUsePendingDeletesTable)); err != nil {
 		if isInsufficientPrivilege(err) {
 			return errors.NewStorageError("[dahSweep] app role lacks CREATE privilege for the dah_sweep_batch procedure (42501); grant CREATE so the DAH sweep can run")
 		}
@@ -310,8 +467,11 @@ func isInsufficientPrivilege(err error) bool {
 // the parallelism a single sequential-8-partition CALL lost on a cold-cache disk)
 // via sweepAllPartitionsOnce; each CALL drains time-adaptive windows committing
 // per window. Cadence is driven by the real watermark lag (min across partitions):
-// backlog>0 → drain hard (call again immediately), else idle. The keyspace
-// backstop runs as a safety net.
+// backlog>0 → drain hard (call again immediately), else idle.
+//
+// The spent-before-mined orphan gap (previously covered by the O(table) keyspace
+// backstop) is now closed by the mine-time stamp (S6) in SetMinedMulti, so no
+// backstop timer is needed here.
 //
 // A startup smoke CALL verifies COMMIT-inside-CALL is not suppressed by pgx
 // middleware (2D000); there is no Go fallback, so it just logs the root cause.
@@ -331,11 +491,6 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	lag := int64(cfg.PostgresDAHSweepLag)
 	if lag <= 0 {
 		lag = 2
-	}
-
-	batch := cfg.PostgresDAHSweepBatchSize
-	if batch <= 0 {
-		batch = 50000
 	}
 
 	retention := int32(s.store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
@@ -370,25 +525,10 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	sweepTimer := time.NewTimer(0) // fire the first sweep immediately
 	defer sweepTimer.Stop()
 
-	// Adaptive backstop: a timer (not a fixed ticker) so the loop can drop to a
-	// fast cadence while it is actively recovering orphans and relax back to the
-	// idle cadence once the keyspace is clean. See runBackstopBurst.
-	backstopTimer := time.NewTimer(backstopInitialDelay)
-	defer backstopTimer.Stop()
-
-	var backstopByte int
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
-
-		case <-backstopTimer.C:
-			next := s.runBackstopBurst(ctx, &backstopByte, batch)
-			if ctx.Err() != nil {
-				return
-			}
-			backstopTimer.Reset(next)
 
 		case <-sweepTimer.C:
 			safeTip := s.store.dahSafeTip(lag)
@@ -425,62 +565,6 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 			sweepTimer.Reset(next)
 		}
 	}
-}
-
-// runBackstopBurst runs the guarantee-of-last-resort orphan recovery and returns
-// the delay until it should fire again. It scans keyspace slices starting at
-// *byteCursor (rotating, mod 256).
-//
-// In the common (clean) case the first slice finds nothing and it returns
-// immediately with the idle interval — a cheap ~1/256 scan per idle tick. But the
-// forward-only spends-cursor structurally MISSES any parent that was spent BEFORE
-// it was mined (its spend-window was swept while it was still unmined, so it is
-// never re-enumerated). Those orphans can only be recovered here. So the moment a
-// slice stamps orphans this scans the WHOLE keyspace (all 256 slices) in one pass
-// and returns the fast interval, re-checking soon while a backlog may persist —
-// turning a multi-hour single-slice crawl into a seconds-long drain. Bounded to at
-// most one full keyspace pass per call so the cursor's select loop stays
-// responsive; runs on the maintenance pool so it never starves the validator.
-func (s *postgresPrunerService) runBackstopBurst(ctx context.Context, byteCursor *int, limit int) time.Duration {
-	recovered := false
-
-	for scanned := 0; scanned < 256; scanned++ {
-		if ctx.Err() != nil {
-			return backstopInterval
-		}
-
-		b := *byteCursor
-		*byteCursor = (*byteCursor + 1) & 0xff
-
-		n, err := s.store.backstopReconcile(ctx, b, b, limit)
-		if err != nil {
-			if ctx.Err() == nil {
-				s.logger.Infof("[dahBackstop] slice 0x%02x error (best-effort, continuing): %v", b, err)
-			}
-
-			break
-		}
-
-		if n > 0 {
-			s.logger.Infof("[dahBackstop] slice 0x%02x recovered %d missed tx(s)", b, n)
-			recovered = true
-
-			continue
-		}
-
-		// Clean crawl: nothing found this slice and nothing found all call →
-		// touch just one slice per idle tick. Once a slice HAS recovered orphans,
-		// recovered stays true so we keep going for the full pass.
-		if !recovered {
-			break
-		}
-	}
-
-	if recovered {
-		return backstopFastInterval
-	}
-
-	return backstopInterval
 }
 
 // sweepAllPartitionsOnce fires one dah_sweep_batch() CALL per partition IN

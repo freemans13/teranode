@@ -126,6 +126,33 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			return nil, nil, errors.NewTxNotFoundError("[SetConflicting] transaction not found (concurrently removed?): %s", txHash)
 		}
 
+		// C1: when clearing conflicting (setValue=false), remove the hash from
+		// pending_deletes — the tx is no longer a prune candidate. Harmless no-op
+		// if the hash was never stamped (DELETE on a missing row returns 0 rows affected).
+		// Runs inside the existing pgxTx so it is atomic with the UPDATE above.
+		if s.settings.UtxoStore.PostgresUsePendingDeletesTable && !setValue {
+			if _, err = pgxTx.Exec(ctx,
+				`DELETE FROM pending_deletes WHERE hash = $1`, txHash[:]); err != nil {
+				return nil, nil, errors.NewStorageError("failed to delete pending_deletes for %s (C1)", txHash, err)
+			}
+		}
+
+		// When the pending_deletes flag is ON and we just set conflicting=true, upsert
+		// the hash into pending_deletes if the row now has a delete_at_height. We use
+		// a SELECT-based INSERT (reading the current DAH from the row, inside the same
+		// transaction snapshot) so preserved rows — whose DAH was left NULL by the CASE
+		// above — are correctly excluded. This runs inside the existing pgxTx so the
+		// upsert is always atomic with the UPDATE above.
+		if s.settings.UtxoStore.PostgresUsePendingDeletesTable && setValue {
+			if _, err = pgxTx.Exec(ctx,
+				`INSERT INTO pending_deletes (hash, delete_at_height)
+				 SELECT $1, delete_at_height FROM txs WHERE hash = $1 AND delete_at_height IS NOT NULL
+				 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height`,
+				txHash[:]); err != nil {
+				return nil, nil, errors.NewStorageError("failed to upsert pending_deletes for %s", txHash, err)
+			}
+		}
+
 		// Append this tx as a conflicting child of each parent (array on txs).
 		// The @> guard makes the append idempotent: a replay/retry must not push a
 		// duplicate child hash into the parent's array (matches the sql store's
@@ -300,7 +327,22 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 
 		if setValue {
 			inClause, args := buildINClauseLocal(hashBytes, 1)
-			q := fmt.Sprintf(`UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash IN %s`, inClause)
+			// C2: when locking (delete_at_height cleared), also remove the hashes from
+			// pending_deletes in the same statement via a CTE. The DELETE is a harmless
+			// no-op for hashes that were never stamped. Only applied when the flag is ON.
+			var q string
+			if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
+				q = fmt.Sprintf(`WITH upd AS (
+					UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash IN %s RETURNING hash
+				)
+				DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)`, inClause)
+			} else {
+				q = fmt.Sprintf(`UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash IN %s`, inClause)
+			}
+			// NOTE: when the pending_deletes flag is ON, the CTE above makes the
+			// outer statement a DELETE, so CommandTag.RowsAffected() reflects rows
+			// deleted from pending_deletes — NOT rows updated in txs. Do not add
+			// accounting logic here that relies on the returned row count.
 			if _, err := s.pool.Exec(ctx, q, args...); err != nil {
 				return errors.NewStorageError("failed to set locked flag", err)
 			}
@@ -349,13 +391,19 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		default:
 		}
 
-		var q string
-		var args []interface{}
-
 		if onLongestChain {
 			inClause, inArgs := buildINClauseLocal(chunk, 1)
-			q = fmt.Sprintf(`UPDATE txs SET unmined_since = NULL WHERE hash IN %s`, inClause)
-			args = inArgs
+			q := fmt.Sprintf(`UPDATE txs SET unmined_since = NULL WHERE hash IN %s`, inClause)
+			result, err := s.pool.Exec(ctx, q, inArgs...)
+			if err != nil {
+				errorCount += len(chunk)
+				if len(allErrors) < 10 {
+					s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
+					allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d", i, end-1, err))
+				}
+				continue
+			}
+			totalUpdated += int(result.RowsAffected())
 		} else {
 			// Leaving the longest chain: also CLEAR any deferred-prune stamp. The
 			// stamp was computed for the tx as mined-and-fully-spent ON THE OLD chain;
@@ -366,33 +414,55 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 			// stale stamp left here would let a reorged-out tx be deleted. The sweep
 			// re-stamps if/when it rejoins the longest chain.
 			inClause, inArgs := buildINClauseLocal(chunk, 2)
-			q = fmt.Sprintf(`UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s`, inClause)
-			args = append([]interface{}{int32(currentBlockHeight)}, inArgs...) // unmined_since is INT4
-		}
+			chunkArgs := append([]interface{}{int32(currentBlockHeight)}, inArgs...) // unmined_since is INT4
 
-		result, err := s.pool.Exec(ctx, q, args...)
-		if err != nil {
 			// DO NOT "fix" this by wrapping the chunk loop in a single transaction
-			// and rolling back on error. The false branch above is a CLEAR
-			// (delete_at_height = NULL) that makes a reorged-out tx safe from the
-			// pruner, so for THIS operation partial application is SAFER than none:
-			// rolling back on a chunk failure would un-clear the chunks already made
-			// safe, enlarging the stale-stamp set from just the failed chunk to the
-			// ENTIRE batch. (Atomicity is the right property for a SET, where partial
-			// application is the hazard — not for a clear.) Instead we continue,
-			// clearing every remaining chunk, and return the joined error so the
-			// caller retries the whole, idempotent set. A failed chunk's stamp is a
-			// FUTURE height (completion + retention), so the pruner cannot act on it
-			// before a retry (or the next reorg pass) re-clears it.
-			errorCount += len(chunk)
-			if len(allErrors) < 10 {
-				s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
-				allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d", i, end-1, err))
+			// and rolling back on error. This branch is a CLEAR (delete_at_height = NULL)
+			// that makes a reorged-out tx safe from the pruner, so partial application is
+			// SAFER than none: rolling back on a chunk failure would un-clear the chunks
+			// already made safe, enlarging the stale-stamp set from just the failed chunk
+			// to the ENTIRE batch. (Atomicity is the right property for a SET, where partial
+			// application is the hazard — not for a clear.) Instead we continue, clearing
+			// every remaining chunk, and return the joined error so the caller retries the
+			// whole, idempotent set. A failed chunk's stamp is a FUTURE height
+			// (completion + retention), so the pruner cannot act on it before a retry
+			// (or the next reorg pass) re-clears it.
+			var rowsAffected int
+			if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
+				// C3: when the pending_deletes flag is ON, remove the hashes from
+				// pending_deletes in the SAME statement as the DAH clear via a CTE.
+				// SELECT count(*) FROM upd returns the txs-updated count (not the
+				// pending_deletes-deleted count) so totalUpdated accounting is correct.
+				q := fmt.Sprintf(`WITH upd AS (
+					UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s RETURNING hash
+				),
+				_del AS (
+					DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)
+				)
+				SELECT count(*) FROM upd`, inClause)
+				if err := s.pool.QueryRow(ctx, q, chunkArgs...).Scan(&rowsAffected); err != nil {
+					errorCount += len(chunk)
+					if len(allErrors) < 10 {
+						s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
+						allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d", i, end-1, err))
+					}
+					continue
+				}
+			} else {
+				q := fmt.Sprintf(`UPDATE txs SET unmined_since = $1, delete_at_height = NULL WHERE hash IN %s`, inClause)
+				result, err := s.pool.Exec(ctx, q, chunkArgs...)
+				if err != nil {
+					errorCount += len(chunk)
+					if len(allErrors) < 10 {
+						s.logger.Errorf("[MarkTransactionsOnLongestChain] chunk %d-%d error: %v", i, end-1, err)
+						allErrors = append(allErrors, errors.NewStorageError("failed to mark chunk %d-%d", i, end-1, err))
+					}
+					continue
+				}
+				rowsAffected = int(result.RowsAffected())
 			}
-			continue
+			totalUpdated += rowsAffected
 		}
-
-		totalUpdated += int(result.RowsAffected())
 	}
 
 	if errorCount > 0 {
