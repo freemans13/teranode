@@ -437,16 +437,11 @@ CREATE TABLE IF NOT EXISTS txs (
 // HOT (83%+ measured). Its consumers (unmined iterators, old-unmined queries)
 // are background paths that tolerate bitmap-scan rechecks.
 //
-// delete_at_height is BRIN for the same HOT reason: the DAH sweep stamps it on
-// (almost) every tx once, and a btree here makes every stamp a non-HOT row
-// rewrite (measured: stamp cost 70ms -> 132ms per 5K-candidate sweep call with
-// the btree, the sweep saturating ~57-78K stamps/s and falling behind an ~88K
-// create rate). With BRIN the stamp stays HOT. The pruner's doomed-row scan
-// (delete_at_height <= H LIMIT N) tolerates BRIN's bitmap rechecks while the
-// table is bounded; both index choices were A/B'd under sustained load and
-// BRIN-everywhere is the best-known configuration (88K vs 65-71K medians).
-// txsIndexesDDLBase contains the txs partial indexes that are always created
-// regardless of the pending_deletes flag.
+// delete_at_height no longer has an index on txs: the BRIN was retired by
+// txsDAHBrinBackfillAndDropDDL. The pruner now reads the pending_deletes
+// btree side-table exclusively; delete_at_height on txs is a stamp-only column
+// used by the DAH sweep worker and read back only on restart recovery.
+// txsIndexesDDLBase contains the txs partial indexes that are always created.
 const txsIndexesDDLBase = `
 CREATE INDEX IF NOT EXISTS px_unmined_since ON txs USING brin (unmined_since) WITH (pages_per_range = 32, autosummarize = on);
 CREATE INDEX IF NOT EXISTS px_preserve_until ON txs (preserve_until) WHERE preserve_until IS NOT NULL;`

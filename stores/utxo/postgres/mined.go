@@ -360,10 +360,18 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 		// CASE expression in the UPDATE above — COPY-FROM-RETURNING semantics without
 		// re-reading the row. Harmless ON CONFLICT DO UPDATE if the hash was already
 		// in pending_unmined from a prior reorg (idempotent).
+		//
+		// Guard: only insert when the tx is NOT conflicting (mirrors U3 in conflicting.go:491-493).
+		// A conflicting tx reorged out must NOT enter pending_unmined — conflicting txs are
+		// outside the invariant set {unmined AND NOT conflicting}. The NOT EXISTS subquery
+		// reads the txs row just updated (same pgxTx, row is locked), so the check is
+		// atomic with the UPDATE above.
 		if len(newBlockIDs) == 0 {
 			if _, err := pgxTx.Exec(ctx,
 				`INSERT INTO pending_unmined (hash, unmined_since)
-				 VALUES ($1, $2)
+				 SELECT $1, $2 WHERE NOT EXISTS (
+				 	SELECT 1 FROM txs WHERE hash = $1 AND conflicting
+				 )
 				 ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`,
 				hash[:], currentBlockHeight); err != nil {
 				return nil, errors.NewStorageError("[UnsetMined] failed to insert pending_unmined for %s (U1)", hash, err)

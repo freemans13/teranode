@@ -795,3 +795,93 @@ func TestPendingUnmined_MultipleHooksCoexist(t *testing.T) {
 	require.Equal(t, int32(300), storedUnminedSince,
 		"step 4 (M1): MarkTransactionsOnLongestChain(false) on unmined tx must INSERT into pending_unmined (U3)")
 }
+
+// ---------------------------------------------------------------------------
+// Task 7 (U1 conflicting guard): reorg of a conflicting tx must NOT insert
+// into pending_unmined; reorg of a non-conflicting tx still must.
+// ---------------------------------------------------------------------------
+
+// TestPendingUnmined_ReorgOutConflicting_NoRow asserts the U1 invariant guard:
+// a tx that is CONFLICTING when fully reorged out (block_ids → empty) must NOT
+// be inserted into pending_unmined.  The invariant is
+//
+//	pending_unmined == { (hash, unmined_since) : unmined_since IS NOT NULL AND NOT conflicting }
+//
+// Before this fix the U1 INSERT was unconditional, so conflicting reorged txs
+// would silently diverge from the invariant.
+func TestPendingUnmined_ReorgOutConflicting_NoRow(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create a tx and mine it at blockID=100 so unmined_since becomes NULL.
+	tx := testExtendedTx(t)
+	blockInfo := utxo.MinedBlockInfo{
+		BlockID:        100,
+		BlockHeight:    100,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	}
+	_, err := st.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(blockInfo))
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// Mark the tx as conflicting while it is still mined.
+	_, _, err = st.SetConflicting(ctx, []chainhash.Hash{*h}, true)
+	require.NoError(t, err)
+
+	// Precondition: tx is conflicting AND mined (unmined_since IS NULL) — must NOT be in pending_unmined.
+	var existsBefore bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&existsBefore))
+	require.False(t, existsBefore, "precondition: conflicting mined tx must NOT be in pending_unmined")
+
+	// Fully reorg the tx out (block_ids → empty).
+	require.NoError(t, st.SetBlockHeight(150))
+	_, err = st.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
+		BlockID:    100,
+		UnsetMined: true,
+	})
+	require.NoError(t, err)
+
+	// U1 guard: conflicting tx must NOT appear in pending_unmined even though block_ids is now empty.
+	var existsAfter bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&existsAfter))
+	require.False(t, existsAfter,
+		"U1 guard: conflicting tx reorged out must NOT be inserted into pending_unmined")
+}
+
+// TestPendingUnmined_ReorgOutNonConflicting_StillInserts confirms that a
+// NON-conflicting tx reorged out still gets its pending_unmined row (U1
+// happy-path is unaffected by the guard).
+func TestPendingUnmined_ReorgOutNonConflicting_StillInserts(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Create and mine a non-conflicting tx.
+	tx := testExtendedTx(t)
+	blockInfo := utxo.MinedBlockInfo{
+		BlockID:        100,
+		BlockHeight:    100,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	}
+	_, err := st.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(blockInfo))
+	require.NoError(t, err)
+	h := tx.TxIDChainHash()
+
+	// Fully reorg out.
+	require.NoError(t, st.SetBlockHeight(150))
+	_, err = st.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
+		BlockID:    100,
+		UnsetMined: true,
+	})
+	require.NoError(t, err)
+
+	// Non-conflicting reorged tx MUST be in pending_unmined with unmined_since=151.
+	var us int32
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT unmined_since FROM pending_unmined WHERE hash=$1`, h[:]).Scan(&us))
+	require.Equal(t, int32(151), us,
+		"U1: non-conflicting reorged tx must be inserted into pending_unmined with unmined_since=blockHeight+1")
+}
