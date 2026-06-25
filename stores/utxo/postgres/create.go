@@ -327,30 +327,41 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		return result, nil
 	}
 
-	// Insert into txs (metadata + state + raw_tx + packed output columns).
-	// out_frozens is NULL on create (no output frozen — freeze materialises the
-	// bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
+	// Insert into txs atomically with the pending_unmined projection using a CTE,
+	// mirroring the batched path (createBatchUNNESTSQL). COPY-FROM-RETURNING:
+	// unmined_since is sourced from the ins CTE RETURNING, never recomputed.
+	// ON CONFLICT upsert in _pu handles idempotent re-creates. Non-conflicting
+	// path only — conflicting items are excluded from the invariant (pruner skips
+	// them). out_frozens is NULL on create (no output frozen — freeze materialises
+	// the bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
+	// The outer SELECT returns ins.hash so the ON CONFLICT DO NOTHING / no-row case
+	// is detectable via pgx.ErrNoRows (same contract as the plain INSERT before).
+	const insertDirectSQL = `
+		WITH ins AS (
+			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+				locked, conflicting, frozen, unmined_since,
+				block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
+				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			        $17, $18, $19, $20, $21)
+			ON CONFLICT (hash) DO NOTHING
+			RETURNING hash, unmined_since
+		),
+		_pu AS (
+			INSERT INTO pending_unmined (hash, unmined_since)
+			SELECT ins.hash, ins.unmined_since
+			FROM ins
+			WHERE ins.unmined_since IS NOT NULL
+			ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since
+		)
+		SELECT ins.hash FROM ins`
+
 	var insertedHash []byte
-	if err = conn.QueryRow(ctx, insertSQL, insertArgs...).Scan(&insertedHash); err != nil {
+	if err = conn.QueryRow(ctx, insertDirectSQL, insertArgs...).Scan(&insertedHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
 		}
 		return nil, errors.NewStorageError("failed to create UTXO", err)
-	}
-
-	// Maintain the pending_unmined projection: INSERT when the tx is unmined
-	// (unminedSince != nil). Non-conflicting path only — conflicting items
-	// are excluded from the invariant (pruner skips them). Uses the same
-	// unminedSince value already passed to the txs INSERT (COPY-FROM-RETURNING:
-	// no recomputation). ON CONFLICT upsert handles idempotent re-creates.
-	if unminedSince != nil {
-		const pendingUnminedSQL = `
-			INSERT INTO pending_unmined (hash, unmined_since)
-			VALUES ($1, $2)
-			ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since`
-		if _, err = conn.Exec(ctx, pendingUnminedSQL, txHash[:], unminedSince); err != nil {
-			return nil, errors.NewStorageError("failed to insert into pending_unmined", err)
-		}
 	}
 
 	result := s.buildCreateMeta(txMeta, options, isCoinbase, blockHeight)
