@@ -22,13 +22,23 @@ func TestDAHSchemaObjectsExist(t *testing.T) {
 		// mined_at_height stays a plain column (read by hash in the sweep's GREATEST
 		// formula); it is deliberately NOT indexed (uncorrelated → see schema.go).
 		{"txs.mined_at_height", `SELECT 1 FROM information_schema.columns WHERE table_name='txs_p00' AND column_name='mined_at_height'`},
-		{"brin spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_spent_at_height_brin'`},
+		// The dead spends spent_at_height BRIN was dropped (commit ecdc43b4f): it only
+		// served the removed O(table) backstop, so there must be NO such index.
+		{"no spends spent_at_height brin", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_spent_at_height_brin')`},
 		// Composite btree drives the Index-Only candidate enumeration (scales with
 		// window spend-rows, not chain size); see schema.go.
 		{"composite btree spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_h_hash_btree'`},
 		// The spends-driven sweep no longer scans txs by mined_at_height, so there must
 		// be NO index on it (a btree would hurt the hot mine UPDATE's HOT ratio).
 		{"no txs mined_at_height index", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname LIKE 'txs_p00_mined_at_height%')`},
+		// pending_deletes is now the only pruner path (always-on): the txs
+		// px_delete_at_height BRIN is always backfilled into it and dropped.
+		{"no txs px_delete_at_height brin", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_class WHERE relname='px_delete_at_height')`},
+		{"pending_deletes leaf", `SELECT 1 FROM pg_class WHERE relname='pending_deletes_p00' AND relkind='r'`},
+		{"pending_deletes dah btree", `SELECT 1 FROM pg_indexes WHERE indexname='px_pd_dah_p00'`},
+		// pending_unmined side-table is also always-on (maintained by the projection).
+		{"pending_unmined leaf", `SELECT 1 FROM pg_class WHERE relname='pending_unmined_p00' AND relkind='r'`},
+		{"pending_unmined since btree", `SELECT 1 FROM pg_indexes WHERE indexname='px_pu_since_p00'`},
 		{"dah_watermark table", `SELECT 1 FROM information_schema.tables WHERE table_name='dah_watermark'`},
 		{"dah_watermark seed row", `SELECT last_swept_height FROM dah_watermark WHERE id = 1`},
 	} {

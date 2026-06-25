@@ -116,9 +116,8 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 	// this cache-resident box so stamping keeps pace with a ~100K/s create rate.
 	tSettings.UtxoStore.PostgresMaintenancePoolConns = 64
 	tSettings.UtxoStore.PostgresDAHSweepConcurrency = 8
-	// A/B knob: THROUGHPUT_USE_PENDING_DELETES=1 routes pruning through the
-	// pending_deletes side-table (and drops the txs BRIN) instead of the BRIN scan.
-	tSettings.UtxoStore.PostgresUsePendingDeletesTable = envInt("THROUGHPUT_USE_PENDING_DELETES", 0) != 0
+	// Pruning always routes through the pending_deletes side-table (the only path);
+	// the txs delete_at_height BRIN is always backfilled and dropped.
 
 	s, err := pgstore.New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
 	if err != nil {

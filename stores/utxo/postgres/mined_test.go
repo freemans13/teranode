@@ -9,15 +9,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSetMinedMulti_DeletesPendingUnmined_CTEBranch verifies that when the
-// PostgresUsePendingDeletesTable flag is ON (CTE branch), SetMinedMulti removes
-// the tx hash from pending_unmined atomically with the txs UPDATE.
+// TestSetMinedMulti_DeletesPendingUnmined_CTEBranch verifies that SetMinedMulti
+// (OnLongestChain=true) removes the tx hash from pending_unmined atomically with the
+// txs UPDATE. pending_deletes is the only pruner path, so this always exercises the
+// CTE branch (the flag parameter is ignored).
 //
 // Precondition: Task 4 must be complete — Create() inserts an unmined tx into
 // pending_unmined. If that row is absent the test fails loudly.
 func TestSetMinedMulti_DeletesPendingUnmined_CTEBranch(t *testing.T) {
 	ctx := context.Background()
-	// flag=true forces the CTE branch in SetMinedMulti (pending_deletes flag ON).
 	st := newTestStoreWithFlag(t, true)
 	require.NoError(t, st.SetBlockHeight(100))
 
@@ -68,12 +68,11 @@ func TestSetMinedMulti_DeletesPendingUnmined_CTEBranch(t *testing.T) {
 	require.Nil(t, unminedSinceAfter, "unmined_since must be NULL in txs after mine")
 }
 
-// TestSetMinedMulti_DeletesPendingUnmined_PlainBranch verifies that when the
-// PostgresUsePendingDeletesTable flag is OFF (plain UPDATE branch), SetMinedMulti
-// also removes the tx hash from pending_unmined.
+// TestSetMinedMulti_DeletesPendingUnmined_PlainBranch verifies that SetMinedMulti
+// removes the tx hash from pending_unmined. The OFF code path was removed (pending_deletes
+// is the only path); this retains a second SetMinedMulti pending_unmined-removal check.
 func TestSetMinedMulti_DeletesPendingUnmined_PlainBranch(t *testing.T) {
 	ctx := context.Background()
-	// flag=false forces the plain branch in SetMinedMulti.
 	st := newTestStoreWithFlag(t, false)
 	require.NoError(t, st.SetBlockHeight(100))
 

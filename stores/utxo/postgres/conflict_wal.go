@@ -11,7 +11,7 @@ import (
 // This file implements the conflict-resolution write-ahead log (WAL) for the
 // postgres backend — crash safety for ProcessConflicting /
 // ReverseProcessConflicting (see #861). Intents live in the conflict_intents
-// table (DDL created in createSchemaWithPool).
+// table (DDL created in createSchemaInternal).
 
 // encodeIntentHashes flattens the intent's tx hashes into a single byte slice
 // (32 bytes each) for storage in the tx_hashes column.

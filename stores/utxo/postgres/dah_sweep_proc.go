@@ -13,10 +13,14 @@ import (
 // dahSweepProcVersion is bumped whenever dahSweepProcDDL changes. bootstrap
 // recreates the procedure whenever the version stored in dah_sweep_control
 // differs (in EITHER direction, so a binary rollback reinstalls the older body).
-const dahSweepProcVersion = 8
+//
+// Bumped 8→9: the pending_deletes side-table is now the only pruner path, so the
+// proc body is always the pending_deletes variant. The bump forces a recompile of
+// any procedure installed by an earlier (flag-gated) binary.
+const dahSweepProcVersion = 9
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
-// outcome table. Created unconditionally in createSchemaWithPool (plain DDL);
+// outcome table. Created unconditionally in createSchemaInternal (plain DDL);
 // the procedure itself is bootstrapped separately and only in proc mode.
 const dahSweepControlDDL = `
 CREATE TABLE IF NOT EXISTS dah_sweep_control (
@@ -43,198 +47,12 @@ CREATE TABLE IF NOT EXISTS dah_sweep_control (
 // statement_timeout, and is driven by a thin adaptive ticker via CALL. See
 // docs/superpowers/dah-stored-proc-proposal.md for the full design.
 //
-// When usePendingDeletes is true the procedure also upserts each stamped row's
-// (hash, delete_at_height) into the per-leaf pending_deletes_pNN table inside the
-// same EXECUTE block, keeping the side-table in sync without extra round-trips.
-func dahSweepProcDDL(usePendingDeletes bool) string {
-	if usePendingDeletes {
-		return dahSweepProcDDLWithPendingDeletes
-	}
-	return dahSweepProcDDLPlain
+// The procedure always upserts each stamped row's (hash, delete_at_height) into the
+// per-leaf pending_deletes_pNN table inside the same EXECUTE block, keeping the
+// side-table — the only pruner path — in sync without extra round-trips.
+func dahSweepProcDDL() string {
+	return dahSweepProcDDLWithPendingDeletes
 }
-
-const dahSweepProcDDLPlain = `CREATE OR REPLACE PROCEDURE dah_sweep_batch(
-    p_partition  INT,
-    p_safe_tip   BIGINT,
-    p_retention  INT
-)
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_leaf_suffix    TEXT := lpad(p_partition::text, 2, '0');
-    v_from           BIGINT;
-    v_to             BIGINT;
-    v_step           BIGINT;
-    v_max_win        INT;
-    v_per_part_cap   INT;
-    v_enabled        BOOLEAN;
-    v_n              BIGINT;
-    v_total_stamped  BIGINT := 0;
-    v_windows        INT := 0;
-    v_t0             timestamptz;
-    v_ms             double precision;
-BEGIN
-    -- One partition per CALL; the Go cursor fans 8 CALLs across the partitions in
-    -- PARALLEL (recovering the parallelism the old Go errgroup sweep had, which a
-    -- single sequential-8-partition CALL lost on a cold-cache disk).
-    SELECT enabled, batch_rows, max_windows_per_call
-      INTO v_enabled, v_per_part_cap, v_max_win
-      FROM dah_sweep_control WHERE id = 1;
-
-    IF NOT v_enabled THEN
-        RETURN;
-    END IF;
-
-    IF current_setting('server_version_num')::int < 110000 THEN
-        RAISE EXCEPTION 'dah_sweep_batch requires PostgreSQL 11+';
-    END IF;
-
-    -- Per-partition advisory lock so the 8 parallel CALLs (and Prune) never
-    -- contend across partitions; within a partition it serialises sweepers.
-    -- Transaction-level → auto-released on COMMIT/ROLLBACK (no pooled-conn leak).
-    IF NOT pg_try_advisory_xact_lock(20240684 + p_partition) THEN
-        RETURN;
-    END IF;
-
-    SELECT last_swept_height INTO v_from
-      FROM dah_part_watermark WHERE partition = p_partition;
-
-    IF v_from IS NULL OR v_from >= p_safe_tip THEN
-        COMMIT;
-        RETURN;
-    END IF;
-
-    -- v_step is TIME-ADAPTIVE and is the SOLE governor of per-window cost: a slow
-    -- (dense) window halves it for the NEXT window, a fast (sparse) one doubles it.
-    -- There is no candidate cap and no shrink-retry — every window enumerates its
-    -- COMPLETE distinct-parent set in ONE pass, stamps, and advances the watermark, so
-    -- spends pages are never re-read for the same window. Seed small so the very first
-    -- window after a cold start / reorg surge is bounded; it doubles to 4096 within a
-    -- few fast windows on sparse history.
-    v_step := 256;
-
-    WHILE v_from < p_safe_tip LOOP
-        EXIT WHEN v_max_win > 0 AND v_windows >= v_max_win;
-
-        SELECT enabled INTO v_enabled FROM dah_sweep_control WHERE id = 1;
-        EXIT WHEN NOT v_enabled;
-
-        IF NOT pg_try_advisory_xact_lock(20240684 + p_partition) THEN
-            EXIT;
-        END IF;
-
-        SET LOCAL enable_seqscan = off;
-        SET LOCAL lock_timeout = '5s';
-
-        v_to := LEAST(v_from + v_step, p_safe_tip);
-        v_t0 := clock_timestamp();
-
-        -- SINGLE PASS for THIS partition. Enumerate candidate parent hashes whose
-        -- outputs were spent in (v_from,v_to] purely from the APPEND-ORDERED spends side
-        -- ("spends enumerate, txs decides"). The composite btree (spent_at_height,
-        -- prev_tx_hash) serves this as an INDEX-ONLY range scan — it reads only the
-        -- window's index leaves, no heap, so the cost is proportional to the window's
-        -- spend rows and independent of accumulated chain size (measured on betfair:
-        -- 22,728 buffers/lossy-BRIN → ~520 index-only, 25s cold → ~0.1s). enable_seqscan
-        -- stays off so it never regresses to a seq scan. No LIMIT: candidates is the
-        -- COMPLETE distinct-parent set of the window. PRUNE to UNSTAMPED eligible
-        -- parents (eligible CTE) before the expensive per-candidate spend-history read —
-        -- already-stamped parents are stable and re-verifying them is a no-op, so the
-        -- verification cost scales with NEW completions, not the mostly-already-stamped
-        -- backlog (measured: ~76% of a backlog window's candidates are already stamped).
-        -- Aggregate each ELIGIBLE candidate's FULL spend history (no height bound on the
-        -- JOIN → correct fully-spent counting), stamp delete_at_height with the exact DAH
-        -- formula, and COUNT the stamped rows from the SAME pass: the data-modifying upd
-        -- CTE runs once to completion and the outer SELECT counts its RETURNING. Exact DAH
-        -- semantics unchanged (spendable get_bit, GREATEST+1+retention, IS DISTINCT FROM).
-        -- The spent-before-mined gap is closed by the mine-time stamp (S6) in SetMinedMulti.
-        EXECUTE format($q$
-            WITH candidates AS MATERIALIZED (
-                SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
-                 WHERE spent_at_height > $1 AND spent_at_height <= $2
-            ),
-            eligible AS MATERIALIZED (
-                -- Prune to UNSTAMPED, mined, non-preserved parents — the only ones that
-                -- can transition NULL→stamped. An already-stamped parent is STABLE: a
-                -- stamp is only set when fully spent (no further spend is possible once
-                -- every spendable output is consumed, so max_spent is final), and it is
-                -- only cleared by Unspend on reorg — atomically. So re-verifying a
-                -- stamped parent is always a no-op; skip its expensive full-history
-                -- read. This makes the cursor's verification cost scale with NEW
-                -- completions, not with the (mostly already-stamped) backlog.
-                -- The guards (preserve_until/unmined_since/block_ids) are folded in
-                -- here: those rows are no-ops in the stamp formula anyway, so
-                -- excluding them is equivalent.
-                SELECT t.hash, t.out_count, t.out_spendables, t.spendable_count, t.mined_at_height
-                  FROM txs_p%1$s t
-                  JOIN candidates c ON c.hash = t.hash
-                 WHERE t.delete_at_height IS NULL
-                   AND t.preserve_until IS NULL
-                   AND t.unmined_since IS NULL
-                   AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) IS NOT NULL
-            ),
-            spend_agg AS (
-                SELECT s.prev_tx_hash AS hash,
-                       count(*) FILTER (WHERE CASE WHEN s.prev_output_idx < e.out_count THEN get_bit(e.out_spendables, s.prev_output_idx) = 1 ELSE false END) AS spent_count,
-                       max(s.spent_at_height) AS max_spent
-                FROM spends_p%1$s s
-                JOIN eligible e ON e.hash = s.prev_tx_hash
-                GROUP BY s.prev_tx_hash
-            ),
-            state AS (
-                SELECT e.hash,
-                       CASE
-                           WHEN COALESCE(sa.spent_count, 0) = e.spendable_count
-                                AND e.out_count > 0
-                                AND GREATEST(COALESCE(sa.max_spent, 0), COALESCE(e.mined_at_height, 0)) <= $2
-                               THEN (GREATEST(COALESCE(sa.max_spent, 0), COALESCE(e.mined_at_height, 0)) + 1 + $3)::int
-                           ELSE NULL
-                       END AS new_dah
-                FROM eligible e
-                LEFT JOIN spend_agg sa ON sa.hash = e.hash
-            ),
-            upd AS (
-                UPDATE txs_p%1$s t
-                   SET delete_at_height = st.new_dah
-                  FROM state st
-                 WHERE t.hash = st.hash
-                   AND t.delete_at_height IS DISTINCT FROM st.new_dah
-                RETURNING 1
-            )
-            SELECT count(*) FROM upd
-        $q$, v_leaf_suffix)
-        USING v_from, v_to, p_retention
-        INTO v_n;
-
-        v_total_stamped := v_total_stamped + v_n;
-
-        -- Window fully drained in one pass (no cap to clip it): advance unconditionally.
-        UPDATE dah_part_watermark
-           SET last_swept_height = v_to
-         WHERE partition = p_partition AND last_swept_height < v_to;
-        COMMIT;
-
-        v_windows := v_windows + 1;
-        v_from    := v_to;
-
-        -- TIME-ADAPTIVE step is the sole density regulator: a dense (slow) window
-        -- shrinks the NEXT window; a sparse (fast) one grows it.
-        v_ms := extract(epoch FROM clock_timestamp() - v_t0) * 1000;
-        IF v_ms > 2000 THEN
-            v_step := GREATEST(v_step / 2, 1);
-        ELSIF v_ms < 500 THEN
-            v_step := LEAST(v_step * 2, 4096);
-        END IF;
-    END LOOP;
-
-    -- Best-effort observability (additive across the 8 partitions).
-    UPDATE dah_sweep_control
-       SET last_called_at = now(),
-           total_rows_stamped = total_rows_stamped + v_total_stamped
-     WHERE id = 1;
-    COMMIT;
-END;
-$$;`
 
 // dahSweepProcDDLWithPendingDeletes is the variant of the DAH sweep procedure
 // that also upserts each newly-stamped row into the per-leaf pending_deletes_pNN
@@ -438,7 +256,7 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 	// would otherwise leave the old overload behind, unused. Best-effort.
 	_, _ = s.pool.Exec(ctx, `DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT)`)
 
-	if _, err = s.pool.Exec(ctx, dahSweepProcDDL(s.settings.UtxoStore.PostgresUsePendingDeletesTable)); err != nil {
+	if _, err = s.pool.Exec(ctx, dahSweepProcDDL()); err != nil {
 		if isInsufficientPrivilege(err) {
 			return errors.NewStorageError("[dahSweep] app role lacks CREATE privilege for the dah_sweep_batch procedure (42501); grant CREATE so the DAH sweep can run")
 		}

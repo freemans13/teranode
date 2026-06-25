@@ -476,7 +476,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PostgresDAHSweepBatchSize:               getInt("utxostore_postgresDAHSweepBatchSize", 50000, alternativeContext...),
 			PostgresDAHSweepIntervalMillis:          getInt("utxostore_postgresDAHSweepIntervalMillis", 200, alternativeContext...),
 			PostgresDAHSweepLag:                     getInt("utxostore_postgresDAHSweepLag", 2, alternativeContext...),
-			PostgresUsePendingDeletesTable:          getBool("utxostore_postgresUsePendingDeletesTable", false, alternativeContext...),
 			PostgresDAHSweepBatchRows:               getInt("utxostore_postgresDAHSweepBatchRows", 5000, alternativeContext...),
 			PostgresDAHSweepMaxWindowsPerCall:       getInt("utxostore_postgresDAHSweepMaxWindowsPerCall", 32, alternativeContext...),
 			PostgresDAHSweepIdleIntervalMillis:      getInt("utxostore_postgresDAHSweepIdleIntervalMillis", 5000, alternativeContext...),

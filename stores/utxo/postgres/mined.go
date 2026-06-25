@@ -95,12 +95,10 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// concurrent SetBlockHeight, and (b) preserves a single prepared-plan
 		// cache entry across heights (a literal would re-plan per height).
 		//
-		// When the pending_deletes flag is ON, the UPDATE is wrapped in a CTE so that
-		// any fully-spent tx that gets an inline DAH stamp is also upserted into
-		// pending_deletes in the same statement. The outer SELECT returns hash, block_ids
-		// so the drain loop is unchanged.
-		if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
-			updateSQL = `WITH upd AS (
+		// The UPDATE is wrapped in a CTE so that any fully-spent tx that gets an inline
+		// DAH stamp is also upserted into pending_deletes in the same statement. The
+		// outer SELECT returns hash, block_ids so the drain loop is unchanged.
+		updateSQL = `WITH upd AS (
 				UPDATE txs SET
 					block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
 					block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
@@ -136,36 +134,6 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 				DELETE FROM pending_unmined WHERE hash = ANY($1)
 			)
 			SELECT hash, block_ids FROM upd`
-		} else {
-			updateSQL = `WITH _pu AS (
-				DELETE FROM pending_unmined WHERE hash = ANY($1)
-			)
-			UPDATE txs SET
-					block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-					block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-					subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
-					locked = false, unmined_since = NULL,
-					mined_at_height = $5,
-					delete_at_height = CASE
-						WHEN preserve_until IS NULL AND out_count > 0 AND (
-							spendable_count = 0
-							OR (
-								EXISTS (SELECT 1 FROM spends s WHERE s.prev_tx_hash = txs.hash)
-								AND spendable_count = (
-									SELECT count(*) FROM spends s
-									WHERE s.prev_tx_hash = txs.hash
-									  AND CASE WHEN s.prev_output_idx < txs.out_count
-									           THEN get_bit(txs.out_spendables, s.prev_output_idx) = 1
-									           ELSE false END)
-							))
-						THEN (GREATEST(
-								COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = txs.hash), 0),
-								$5) + 1 + $6)::int
-						ELSE delete_at_height
-					END
-				WHERE hash = ANY($1)
-				RETURNING hash, block_ids`
-		}
 	} else {
 		updateSQL = `WITH _pu AS (
 			DELETE FROM pending_unmined WHERE hash = ANY($1)
@@ -377,14 +345,12 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s", hash, err)
 		}
 
-		// C5: when pending_deletes is enabled, remove the hash from the side-table in
-		// the same pgxTx so the clear is atomic with the DAH null above. Harmless no-op
-		// if the hash was never stamped (e.g. reorged before the sweep ran).
-		if s.settings.UtxoStore.PostgresUsePendingDeletesTable {
-			if _, err := pgxTx.Exec(ctx,
-				`DELETE FROM pending_deletes WHERE hash = $1`, hash[:]); err != nil {
-				return nil, errors.NewStorageError("[UnsetMined] failed to delete pending_deletes for %s (C5)", hash, err)
-			}
+		// C5: remove the hash from the pending_deletes side-table in the same pgxTx so
+		// the clear is atomic with the DAH null above. Harmless no-op if the hash was
+		// never stamped (e.g. reorged before the sweep ran).
+		if _, err := pgxTx.Exec(ctx,
+			`DELETE FROM pending_deletes WHERE hash = $1`, hash[:]); err != nil {
+			return nil, errors.NewStorageError("[UnsetMined] failed to delete pending_deletes for %s (C5)", hash, err)
 		}
 
 		// U1: when fully reorged out (block_ids is now empty), insert into pending_unmined.
