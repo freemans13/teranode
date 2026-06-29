@@ -199,6 +199,10 @@ func (s *Spend) Clone() *Spend {
 type IgnoreFlags struct {
 	IgnoreConflicting bool
 	IgnoreLocked      bool
+	// SkipUTXOHashCheck disables the per-input utxo-hash integrity comparison during Spend.
+	// Set ONLY on the gated below-checkpoint outpoint-only path (spec §3.2 Seam 1). Default
+	// false — above-checkpoint and steady-state spends always enforce the hash.
+	SkipUTXOHashCheck bool
 }
 
 // ConflictingChildRemoval identifies one (parent, child) pair that should be
