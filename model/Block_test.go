@@ -2263,7 +2263,11 @@ func TestBlock_CheckRewardAndFees_WithHeight(t *testing.T) {
 		coinbase, err := bt.NewTxFromString(CoinbaseHex)
 		require.NoError(t, err)
 
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 800000, 0)
+		// Height must be ABOVE the highest hardcoded mainnet checkpoint: checkBlockRewardAndFees
+		// now skips the reward/no-inflation check at or below the highest checkpoint (the chain
+		// prefix is already certified by the pinned hash). 10_000_000 is safely above any mainnet
+		// checkpoint, so the reward-calculation logic still runs here.
+		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 10_000_000, 800000, 0)
 		require.NoError(t, err)
 
 		// Test with a height that triggers the reward calculation logic
