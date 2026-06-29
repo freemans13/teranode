@@ -2058,6 +2058,19 @@ func (u *BlockValidation) quickValidateSkipsUtxoLock(block *model.Block) bool {
 	return block.Height <= blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)
 }
 
+// quickValidateOutpointOnly reports whether this block may use the below-checkpoint
+// outpoint-only fast path: skip decorate, zero fees, minimal create, and spend with
+// the UTXO-hash checksum disabled. Gated by the BlockValidation.OutpointOnlyBelowCheckpoint
+// setting (default off) AND restricted to blocks at or below the highest HARDCODED
+// checkpoint. Uses the standard chain-config checkpoints (not the catchup override) so it
+// fails safe — never engaging above the real checkpoint (spec §2.2, invariant I2).
+func (u *BlockValidation) quickValidateOutpointOnly(block *model.Block) bool {
+	if !u.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
+		return false
+	}
+	return block.Height <= blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)
+}
+
 // updateSubtreesDAH marks block subtrees as properly set in the blockchain.
 // Subtrees retain their finite DAH from assembly/validation — the block persister
 // will promote them to permanent (DAH=0) when the block is confirmed on the main chain.

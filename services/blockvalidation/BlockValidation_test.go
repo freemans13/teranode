@@ -4586,3 +4586,17 @@ func TestBlockValidation_FloaterPersistedInvalidWhenCaughtUp(t *testing.T) {
 	require.NoError(t, existsErr)
 	require.True(t, exists, "caught-up floater must be persisted as invalid (storeInvalidBlock)")
 }
+
+func TestQuickValidateOutpointOnly_GateBounds(t *testing.T) {
+	u := &BlockValidation{settings: test.CreateBaseTestSettings(t)}
+	// Two hardcoded checkpoints; highest is height 200.
+	u.settings.ChainCfgParams = &chaincfg.Params{Checkpoints: []chaincfg.Checkpoint{{Height: 100}, {Height: 200}}}
+
+	u.settings.BlockValidation.OutpointOnlyBelowCheckpoint = false
+	require.False(t, u.quickValidateOutpointOnly(&model.Block{Height: 150}), "off by default")
+
+	u.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	require.True(t, u.quickValidateOutpointOnly(&model.Block{Height: 150}), "on, below highest checkpoint")
+	require.True(t, u.quickValidateOutpointOnly(&model.Block{Height: 200}), "on, at highest checkpoint")
+	require.False(t, u.quickValidateOutpointOnly(&model.Block{Height: 201}), "on, above highest checkpoint")
+}
