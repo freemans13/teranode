@@ -2059,11 +2059,14 @@ func (u *BlockValidation) quickValidateSkipsUtxoLock(block *model.Block) bool {
 }
 
 // isSQLUtxoStore reports whether s is configured for a SQL-backed UTXO store.
-// An empty or nil URL defaults to Aerospike, so it returns false.
+// A nil settings pointer, a nil URL, or an empty/non-SQL scheme all return false.
 // Only schemes in the explicit allowlist (postgres, postgresql, sqlite, sqlitememory)
 // return true. Everything else — including aerospike and unknown schemes — is treated
 // as non-SQL and returns false (fail-safe: wrong answer = fast path stays OFF, not ON).
 func isSQLUtxoStore(s *settings.Settings) bool {
+	if s == nil {
+		return false
+	}
 	u := s.UtxoStore.UtxoStore
 	if u == nil {
 		return false

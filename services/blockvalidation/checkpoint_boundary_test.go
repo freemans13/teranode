@@ -96,17 +96,21 @@ func TestQuickValidateOutpointOnly_SQLStoreGuard(t *testing.T) {
 	const checkpointHeight = uint32(1000)
 	const belowCheckpoint = uint32(500)
 
+	const aboveCheckpoint = uint32(1500)
+
 	tests := []struct {
-		name      string
-		storeURL  string // empty string = nil URL (Aerospike default)
-		wantBelow bool
+		name     string
+		storeURL string // empty string = nil URL (Aerospike default)
+		height   uint32
+		want     bool
 	}{
-		{name: "nil URL (Aerospike default)", storeURL: "", wantBelow: false},
-		{name: "aerospike scheme", storeURL: "aerospike://host:3000/ns/set", wantBelow: false},
-		{name: "postgres scheme", storeURL: "postgres://user:pass@host/db", wantBelow: true},
-		{name: "postgresql scheme", storeURL: "postgresql://user:pass@host/db", wantBelow: true},
-		{name: "sqlite scheme", storeURL: "sqlite:///tmp/test.db", wantBelow: true},
-		{name: "sqlitememory scheme", storeURL: "sqlitememory://test", wantBelow: true},
+		{name: "nil URL (Aerospike default)", storeURL: "", height: belowCheckpoint, want: false},
+		{name: "aerospike scheme", storeURL: "aerospike://host:3000/ns/set", height: belowCheckpoint, want: false},
+		{name: "postgres scheme", storeURL: "postgres://user:pass@host/db", height: belowCheckpoint, want: true},
+		{name: "postgresql scheme", storeURL: "postgresql://user:pass@host/db", height: belowCheckpoint, want: true},
+		{name: "sqlite scheme", storeURL: "sqlite:///tmp/test.db", height: belowCheckpoint, want: true},
+		{name: "sqlitememory scheme", storeURL: "sqlitememory://test", height: belowCheckpoint, want: true},
+		{name: "postgres above checkpoint", storeURL: "postgres://user:pass@host/db", height: aboveCheckpoint, want: false},
 	}
 
 	for _, tt := range tests {
@@ -125,11 +129,11 @@ func TestQuickValidateOutpointOnly_SQLStoreGuard(t *testing.T) {
 				suite.Server.blockValidation.settings.UtxoStore.UtxoStore = nil
 			}
 
-			block := &model.Block{Height: belowCheckpoint}
+			block := &model.Block{Height: tt.height}
 			got := suite.Server.blockValidation.quickValidateOutpointOnly(block)
-			require.Equal(t, tt.wantBelow, got,
+			require.Equal(t, tt.want, got,
 				"quickValidateOutpointOnly: store=%q, height=%d: want %v got %v",
-				tt.storeURL, belowCheckpoint, tt.wantBelow, got)
+				tt.storeURL, tt.height, tt.want, got)
 		})
 	}
 }
