@@ -90,6 +90,7 @@ type batchSpend struct {
 	errCh             chan error  // Channel for completion notification
 	ignoreConflicting bool
 	ignoreLocked      bool
+	skipUTXOHashCheck bool
 }
 
 // Store implements the UTXO store interface using a SQL database backend.
@@ -1849,8 +1850,13 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
 	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
+	useSkipUTXOHashCheck := len(ignoreFlags) > 0 && ignoreFlags[0].SkipUTXOHashCheck
 
-	spends, err = utxo.GetSpends(tx)
+	if useSkipUTXOHashCheck {
+		spends, err = utxo.GetSpendsOutpointOnly(tx)
+	} else {
+		spends, err = utxo.GetSpends(tx)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1901,6 +1907,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 				errCh:             errCh,
 				ignoreConflicting: useIgnoreConflicting,
 				ignoreLocked:      useIgnoreLocked,
+				skipUTXOHashCheck: useSkipUTXOHashCheck,
 			})
 
 			// Wait for batch response with timeout to prevent indefinite blocking
@@ -2242,7 +2249,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			continue
 		}
 
-		if !bytes.Equal(r.utxoHash, spend.UTXOHash[:]) {
+		if !item.skipUTXOHashCheck && !bytes.Equal(r.utxoHash, spend.UTXOHash[:]) {
 			validationErrors[i] = errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 			continue
 		}
@@ -2740,7 +2747,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 		}
 
 		// Check UTXO hash matches
-		if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
+		if !item.skipUTXOHashCheck && !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
 			validationErrors[i] = errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 			continue
 		}

@@ -3073,6 +3073,16 @@ func newExtendedSpendingTx(t *testing.T, parent *bt.Tx, vOut uint32) *bt.Tx {
 	return tx
 }
 
+// corruptPreviousScript replaces the PreviousTxScript on input 0 of tx with a
+// different script so that UTXOHashFromInput computes a hash that will not match
+// what was stored when the parent was created. Used only in hash-enforcement tests.
+func corruptPreviousScript(t *testing.T, tx *bt.Tx) {
+	t.Helper()
+	badScript, err := bscript.NewP2PKHFromAddress("1CounterpartyXXXXXXXXXXXXXXXUWLpVr")
+	require.NoError(t, err)
+	tx.Inputs[0].PreviousTxScript = badScript
+}
+
 // addOutputs appends n P2PKH outputs to tx.
 func addOutputs(t *testing.T, tx *bt.Tx, n int) {
 	t.Helper()
@@ -3196,4 +3206,54 @@ func TestMinimalCreate_ForcesZero_AllInputPaths(t *testing.T) {
 			require.Equal(t, int32(child.Inputs[0].PreviousTxOutIndex), prevIdx, "outpoint idx retained")
 		})
 	}
+}
+
+// TestOutpointOnlySpend_SkipsHashCheck proves that SkipUTXOHashCheck=true allows spending
+// an undecorated child (no PreviousTxScript) without a hash-mismatch or locking-script error,
+// while double-spend protection (spending_data IS NULL guard) still rejects a second spender.
+func TestOutpointOnlySpend_SkipsHashCheck(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	// Parent: extended (so its utxo_hash is stored). Child: NOT extended (no PreviousTxScript).
+	parent := newExtendedTxWithOutputs(t, 1)
+	_, err := store.Create(ctx, parent, 1)
+	require.NoError(t, err)
+
+	child := newSpendingTx(t, parent, 0) // no PreviousTxScript — GetSpends would fail on this
+	_, err = store.Create(ctx, child, 2, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err)
+
+	// Outpoint-only spend: hash check skipped, must succeed.
+	_, err = store.Spend(ctx, child, 2, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
+	require.NoError(t, err)
+
+	// Double-spend by a genuinely different tx (different txid via extra output) must still be rejected.
+	doubleSpender := newSpendingTx(t, parent, 0)
+	addOutputs(t, doubleSpender, 1) // distinct txid from child
+	_, err = store.Spend(ctx, doubleSpender, 2, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
+	require.Error(t, err)
+}
+
+// TestSpend_FlagOff_StillEnforcesHash proves that when SkipUTXOHashCheck=false (the default),
+// the hash comparison is still enforced: a spending tx whose claimed parent script differs from
+// what was stored at create time must be rejected with a hash-mismatch error.
+func TestSpend_FlagOff_StillEnforcesHash(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	// Create parent with real decoration so utxo_hash is anchored to a specific script+satoshis.
+	parent := newExtendedTxWithOutputs(t, 1)
+	_, err := store.Create(ctx, parent, 1)
+	require.NoError(t, err)
+
+	// Child is fully decorated (same script/sats) — would normally succeed the hash check.
+	child := newExtendedSpendingTx(t, parent, 0)
+
+	// Corrupt the claimed parent script so UTXOHashFromInput computes a different hash.
+	corruptPreviousScript(t, child)
+
+	// Flag OFF: hash must be enforced and mismatch must be rejected.
+	_, err = store.Spend(ctx, child, 2, utxo.IgnoreFlags{IgnoreLocked: true})
+	require.Error(t, err, "hash mismatch must still be rejected when flag is off")
 }
