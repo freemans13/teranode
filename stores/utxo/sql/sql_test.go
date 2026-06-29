@@ -3257,3 +3257,219 @@ func TestSpend_FlagOff_StillEnforcesHash(t *testing.T) {
 	_, err = store.Spend(ctx, child, 2, utxo.IgnoreFlags{IgnoreLocked: true})
 	require.Error(t, err, "hash mismatch must still be rejected when flag is off")
 }
+
+// newTestStoreNamed creates a fresh in-memory SQLite store with the given unique name.
+// Use distinct names when two stores must coexist in the same test (e.g. equivalence tests).
+func newTestStoreNamed(t *testing.T, name string) (*Store, *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 30 * time.Second
+	tSettings.UtxoStore.BatchSQLOperations = true
+	tSettings.BatcherDrainMode = true
+	tSettings.Pruner.UTXODefensiveEnabled = false
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///" + name)
+	require.NoError(t, err)
+
+	store, err := New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	return store, store.db.DB
+}
+
+// outputRowFields holds the per-output columns we compare for UTXO-set equivalence.
+type outputRowFields struct {
+	utxoHash               []byte
+	lockingScript          []byte
+	satoshis               int64
+	coinbaseSpendingHeight int64
+	spendingData           []byte
+}
+
+// queryAllOutputRows reads every output row from the store (ordered by transaction hash then idx)
+// and returns a map keyed by "txhex:idx" for stable cross-store comparison.
+func queryAllOutputRows(t *testing.T, db *sql.DB) map[string]outputRowFields {
+	t.Helper()
+	rows, err := db.Query(`
+		SELECT hex(t.hash), o.idx, o.utxo_hash, o.locking_script, o.satoshis,
+		       o.coinbase_spending_height, o.spending_data
+		FROM outputs o
+		JOIN transactions tx ON tx.id = o.transaction_id
+		JOIN transactions t ON t.id = o.transaction_id
+		ORDER BY t.hash, o.idx`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	result := make(map[string]outputRowFields)
+	for rows.Next() {
+		var txHex string
+		var idx int64
+		var f outputRowFields
+		require.NoError(t, rows.Scan(&txHex, &idx, &f.utxoHash, &f.lockingScript, &f.satoshis,
+			&f.coinbaseSpendingHeight, &f.spendingData))
+		key := fmt.Sprintf("%s:%d", txHex, idx)
+		result[key] = f
+	}
+	require.NoError(t, rows.Err())
+	return result
+}
+
+// TestInBlockParentChild_OutpointOnly (T-U5): verifies that an in-block parent→child spend
+// under the minimal-create + outpoint-only path succeeds. The parent is minimal-created (no
+// extended inputs), and the child that spends the parent's output is also minimal-created;
+// the subsequent outpoint-only spend of the child must succeed.
+//
+// This exercises the §4.3 invariant: within a below-checkpoint block, all parents created in
+// the same block have their outputs persisted-and-visible before any in-block child Spend runs.
+func TestInBlockParentChild_OutpointOnly(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	// Parent: minimal create (no extended inputs, fee=0).
+	parent := newExtendedTxWithOutputs(t, 1)
+	_, err := store.Create(ctx, parent, 500, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err, "minimal create of in-block parent must succeed")
+
+	// Child: spends parent's output 0; minimal create too.
+	child := newSpendingTx(t, parent, 0)
+	addOutputs(t, child, 1)
+	_, err = store.Create(ctx, child, 500, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err, "minimal create of in-block child must succeed")
+
+	// Outpoint-only spend of the child tx (spending one of child's own outputs).
+	// child spends parent's output 0; we now spend child's output 0.
+	grandchild := newSpendingTx(t, child, 0)
+	addOutputs(t, grandchild, 1)
+	_, err = store.Create(ctx, grandchild, 500, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err, "minimal create of grandchild must succeed")
+
+	_, err = store.Spend(ctx, grandchild, 500, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
+	require.NoError(t, err, "outpoint-only spend of in-block grandchild must succeed")
+
+	// Also exercise spending the original child (its inputs were spent by grandchild above; spend child outputs).
+	_, err = store.Spend(ctx, child, 500, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
+	require.NoError(t, err, "outpoint-only spend of in-block child must succeed")
+}
+
+// TestUTXOSetEquivalence_OutputsByteIdentical (T-I1 — decisive correctness test): processes the
+// SAME sequence of create+spend operations into two fresh stores — control (flags OFF) and
+// treatment (WithSkipExtendedInputs + SkipUTXOHashCheck) — and asserts that every output's
+// per-output columns are BYTE-IDENTICAL between the two stores. The only permitted differences
+// are the per-input previous_tx_satoshis (0 in treatment) and previous_tx_script (empty in
+// treatment); output utxo_hash, locking_script, satoshis, coinbase_spending_height, and
+// spending_data MUST match exactly. The test MUST fail if any output utxo_hash differs.
+//
+// Includes a tx chain (parent→child) so some outputs are spent, exercising the spend path.
+// A sequence-locked tx (SequenceNumber != 0xFFFFFFFF) is included per spec §4.5 / §6 T-I1.
+func TestUTXOSetEquivalence_OutputsByteIdentical(t *testing.T) {
+	ctx := context.Background()
+
+	storeA, dbA := newTestStoreNamed(t, "equivalence_control")
+	storeB, dbB := newTestStoreNamed(t, "equivalence_treatment")
+
+	const height = uint32(500)
+
+	// Build a set of transactions:
+	//   tx1: standalone — two outputs, no spend (remains unspent).
+	//   tx2: parent in a chain — one output, to be spent by tx3.
+	//   tx3: spends tx2:0 — one new output, decorated (real PreviousTxSatoshis so
+	//        the control store's GetFees call succeeds). PreviousTxSatoshis does NOT
+	//        affect the txid (txid uses Bytes() not ExtendedBytes()), so both stores
+	//        see the same transaction hash and the same output utxo_hash.
+	//   tx4: sequence-locked tx (non-0xFFFFFFFF sequence number) per spec §4.5.
+	tx1 := newExtendedTxWithOutputs(t, 2)
+
+	tx2 := newExtendedTxWithOutputs(t, 1)
+
+	// tx3: decorated (real satoshis so control-store GetFees doesn't error); same txid
+	// as an undecorated variant because txid = hash(non-extended bytes).
+	tx3 := newExtendedSpendingTx(t, tx2, 0)
+	addOutputs(t, tx3, 1)
+
+	// tx4: sequence-locked (BIP68-style, non-final sequence). Extended input so the
+	// control store can compute fees; treatment store will zero the satoshis.
+	tx4 := bt.NewTx()
+	lockScript4, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	require.NoError(t, err)
+	seqLockedInput := &bt.Input{
+		PreviousTxOutIndex: 0,
+		SequenceNumber:     0x00000001, // non-final, sequence-locked — exercises §4.5
+		UnlockingScript:    func() *bscript.Script { s := bscript.Script{}; return &s }(),
+		PreviousTxSatoshis: tx1.Outputs[0].Satoshis + 5000, // surplus so fees >= 0
+		PreviousTxScript:   lockScript4,
+	}
+	require.NoError(t, seqLockedInput.PreviousTxIDAdd(tx1.TxIDChainHash()))
+	tx4.Inputs = append(tx4.Inputs, seqLockedInput)
+	addOutputs(t, tx4, 1)
+
+	// ---- control store A: all flags OFF (normal path) ----
+	// tx1, tx2, tx4: extended inputs — GetFees succeeds.
+	// tx3: decorated input (real PreviousTxSatoshis) — GetFees succeeds.
+	_, err = storeA.Create(ctx, tx1, height)
+	require.NoError(t, err)
+	_, err = storeA.Create(ctx, tx2, height)
+	require.NoError(t, err)
+	_, err = storeA.Create(ctx, tx3, height)
+	require.NoError(t, err)
+	_, err = storeA.Create(ctx, tx4, height)
+	require.NoError(t, err)
+
+	// Spend tx3's output:0 from store A. Use SkipUTXOHashCheck on BOTH stores for
+	// consistency — the decisive correctness assertion is output-hash equality at create
+	// time, not the spend hash path. The output utxo_hash is set at Create and never
+	// changed by Spend.
+	tx3Spender := newExtendedSpendingTx(t, tx3, 0)
+	_, err = storeA.Spend(ctx, tx3Spender, height, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
+	require.NoError(t, err)
+
+	// ---- treatment store B: flags ON (minimal create, outpoint-only spend) ----
+	_, err = storeB.Create(ctx, tx1, height, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err)
+	_, err = storeB.Create(ctx, tx2, height, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err)
+	_, err = storeB.Create(ctx, tx3, height, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err)
+	_, err = storeB.Create(ctx, tx4, height, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err)
+
+	tx3SpenderB := newSpendingTx(t, tx3, 0)
+	_, err = storeB.Spend(ctx, tx3SpenderB, height, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
+	require.NoError(t, err)
+
+	// ---- compare output rows ----
+	rowsA := queryAllOutputRows(t, dbA)
+	rowsB := queryAllOutputRows(t, dbB)
+
+	require.Equal(t, len(rowsA), len(rowsB),
+		"control and treatment stores must have the same number of output rows; got A=%d B=%d", len(rowsA), len(rowsB))
+
+	for key, fa := range rowsA {
+		fb, ok := rowsB[key]
+		require.True(t, ok, "output %s present in control but missing in treatment", key)
+
+		// The decisive assertion: output utxo_hash MUST be byte-identical.
+		// This fails the test if the fast path corrupts or omits the own-output hash.
+		require.Equal(t, fa.utxoHash, fb.utxoHash,
+			"output %s: utxo_hash MUST be byte-identical between control and treatment (spec §1.4 T-I1)", key)
+
+		require.Equal(t, fa.lockingScript, fb.lockingScript,
+			"output %s: locking_script must be byte-identical", key)
+		require.Equal(t, fa.satoshis, fb.satoshis,
+			"output %s: satoshis must be identical", key)
+		require.Equal(t, fa.coinbaseSpendingHeight, fb.coinbaseSpendingHeight,
+			"output %s: coinbase_spending_height must be identical", key)
+		require.Equal(t, fa.spendingData, fb.spendingData,
+			"output %s: spending_data must be identical", key)
+	}
+
+	// Verify treatment store contains no keys absent from control (catch phantom rows).
+	for key := range rowsB {
+		_, ok := rowsA[key]
+		require.True(t, ok, "output %s present in treatment but missing in control", key)
+	}
+
+	// Sanity: we must have observed at least 4 outputs (tx1×2 + tx2×1 + tx4×1; tx3×1 is spent).
+	require.GreaterOrEqual(t, len(rowsA), 4, "expected at least 4 output rows in control store")
+}
