@@ -2058,14 +2058,36 @@ func (u *BlockValidation) quickValidateSkipsUtxoLock(block *model.Block) bool {
 	return block.Height <= blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)
 }
 
+// isSQLUtxoStore reports whether s is configured for a SQL-backed UTXO store.
+// An empty or nil URL defaults to Aerospike, so it returns false.
+// Only schemes in the explicit allowlist (postgres, postgresql, sqlite, sqlitememory)
+// return true. Everything else — including aerospike and unknown schemes — is treated
+// as non-SQL and returns false (fail-safe: wrong answer = fast path stays OFF, not ON).
+func isSQLUtxoStore(s *settings.Settings) bool {
+	u := s.UtxoStore.UtxoStore
+	if u == nil {
+		return false
+	}
+	switch u.Scheme {
+	case "postgres", "postgresql", "sqlite", "sqlitememory":
+		return true
+	default:
+		return false
+	}
+}
+
 // quickValidateOutpointOnly reports whether this block may use the below-checkpoint
 // outpoint-only fast path: skip decorate, zero fees, minimal create, and spend with
 // the UTXO-hash checksum disabled. Gated by the BlockValidation.OutpointOnlyBelowCheckpoint
-// setting (default off) AND restricted to blocks at or below the highest HARDCODED
-// checkpoint. Uses the standard chain-config checkpoints (not the catchup override) so it
-// fails safe — never engaging above the real checkpoint (spec §2.2, invariant I2).
+// setting (default off), restricted to SQL-backed UTXO stores (Stage A; Aerospike deferred
+// to Stage B), and restricted to blocks at or below the highest HARDCODED checkpoint.
+// Uses the standard chain-config checkpoints (not the catchup override) so it fails safe —
+// never engaging above the real checkpoint (spec §2.2, invariant I2).
 func (u *BlockValidation) quickValidateOutpointOnly(block *model.Block) bool {
 	if !u.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
+		return false
+	}
+	if !isSQLUtxoStore(u.settings) { // Stage A is SQL-only; Aerospike (incl. empty default) deferred to Stage B
 		return false
 	}
 	return block.Height <= blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)

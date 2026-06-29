@@ -12,6 +12,7 @@ package blockvalidation
 // both model and services/blockchain, making it the closest clean cross-import site.
 
 import (
+	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -53,6 +54,11 @@ func TestOperatorOverrideFence(t *testing.T) {
 	suite := NewCatchupTestSuite(t)
 	defer suite.Cleanup()
 
+	// Stage A is SQL-only; set a SQL store URL so the guard permits engagement.
+	sqlURL, err := url.Parse("sqlitememory://test")
+	require.NoError(t, err)
+	suite.Server.blockValidation.settings.UtxoStore.UtxoStore = sqlURL
+
 	// Enable the outpoint-only fast path.
 	suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 
@@ -79,6 +85,53 @@ func TestOperatorOverrideFence(t *testing.T) {
 	require.True(t, gotBelow,
 		"quickValidateOutpointOnly must return true for height %d at or below hardcoded checkpoint %d",
 		blockBelow.Height, hardcodedCheckpointHeight)
+}
+
+// TestQuickValidateOutpointOnly_SQLStoreGuard (Task 9 — Stage A SQL-only guard):
+// asserts that quickValidateOutpointOnly returns TRUE only when the UTXO store is
+// SQL-backed (postgres, postgresql, sqlite, sqlitememory). On an Aerospike node, or
+// when the URL is nil/empty (the Aerospike default), it must return FALSE to avoid
+// passing un-decorated inputs to aerospike.Store.Spend, which errors on nil locking scripts.
+func TestQuickValidateOutpointOnly_SQLStoreGuard(t *testing.T) {
+	const checkpointHeight = uint32(1000)
+	const belowCheckpoint = uint32(500)
+
+	tests := []struct {
+		name      string
+		storeURL  string // empty string = nil URL (Aerospike default)
+		wantBelow bool
+	}{
+		{name: "nil URL (Aerospike default)", storeURL: "", wantBelow: false},
+		{name: "aerospike scheme", storeURL: "aerospike://host:3000/ns/set", wantBelow: false},
+		{name: "postgres scheme", storeURL: "postgres://user:pass@host/db", wantBelow: true},
+		{name: "postgresql scheme", storeURL: "postgresql://user:pass@host/db", wantBelow: true},
+		{name: "sqlite scheme", storeURL: "sqlite:///tmp/test.db", wantBelow: true},
+		{name: "sqlitememory scheme", storeURL: "sqlitememory://test", wantBelow: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			suite := NewCatchupTestSuite(t)
+			defer suite.Cleanup()
+
+			suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+			setCheckpoints(t, suite, checkpointHeight)
+
+			if tt.storeURL != "" {
+				u, err := url.Parse(tt.storeURL)
+				require.NoError(t, err)
+				suite.Server.blockValidation.settings.UtxoStore.UtxoStore = u
+			} else {
+				suite.Server.blockValidation.settings.UtxoStore.UtxoStore = nil
+			}
+
+			block := &model.Block{Height: belowCheckpoint}
+			got := suite.Server.blockValidation.quickValidateOutpointOnly(block)
+			require.Equal(t, tt.wantBelow, got,
+				"quickValidateOutpointOnly: store=%q, height=%d: want %v got %v",
+				tt.storeURL, belowCheckpoint, tt.wantBelow, got)
+		})
+	}
 }
 
 // TestCheckpointBoundary_B1_Deferred is a placeholder for T-B1 (spec §6):
