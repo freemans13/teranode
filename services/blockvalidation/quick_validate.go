@@ -1189,6 +1189,11 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		return errors.NewProcessingError("[createAndSpendUTXOsForBatch] invariant I4 violated: outpoint-only active above checkpoint at height %d", block.Height)
 	}
 
+	// Increment once per block when the outpoint-only fast path is active.
+	if outpointOnly {
+		prometheusBlockValidationOutpointOnlyBlocks.Inc()
+	}
+
 	lockUTXOs := !u.quickValidateSkipsUtxoLock(block)
 
 	// Phase 1: Create UTXOs in parallel, collecting any that already exist

@@ -16,6 +16,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
+	prometheustestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -789,5 +790,49 @@ func TestQuickValidateBlockAsync_UtxoLockGating(t *testing.T) {
 
 		assertCreatedLocked(t, suite.MockUTXOStore, true)
 		suite.MockUTXOStore.AssertCalled(t, "SetLocked", mock.Anything, mock.Anything, false)
+	})
+}
+
+// TestOutpointOnly_MetricIncrementsBelowOnly verifies that the
+// prometheusBlockValidationOutpointOnlyBlocks counter increments by exactly 1
+// when quickValidateBlock processes a below-checkpoint block with the
+// OutpointOnlyBelowCheckpoint setting on, and does NOT increment when the
+// setting is off.
+func TestOutpointOnly_MetricIncrementsBelowOnly(t *testing.T) {
+	initPrometheusMetrics()
+
+	t.Run("setting on, below checkpoint: counter increments by 1", func(t *testing.T) {
+		suite := NewCatchupTestSuite(t)
+		defer suite.Cleanup()
+
+		suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+		suite.Server.blockValidation.settings.BlockValidation.QuickValidateSkipUtxoLock = true
+		setCheckpoints(t, suite, 1000)
+		setupQuickValidateMocks(suite)
+		suite.MockUTXOStore.ExpectedCalls = filterCalls(suite.MockUTXOStore.ExpectedCalls, "Spend")
+		suite.MockUTXOStore.On("Spend", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, nil).Maybe()
+
+		block := buildOneSubtreeBlock(t, suite, 500)
+
+		before := prometheustestutil.ToFloat64(prometheusBlockValidationOutpointOnlyBlocks)
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
+		require.NoError(t, err)
+		require.Equal(t, before+1, prometheustestutil.ToFloat64(prometheusBlockValidationOutpointOnlyBlocks))
+	})
+
+	t.Run("setting off: counter does not increment", func(t *testing.T) {
+		suite := NewCatchupTestSuite(t)
+		defer suite.Cleanup()
+
+		suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = false
+		setCheckpoints(t, suite, 1000)
+		setupQuickValidateMocks(suite)
+
+		block := buildOneSubtreeBlock(t, suite, 500)
+
+		before := prometheustestutil.ToFloat64(prometheusBlockValidationOutpointOnlyBlocks)
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
+		require.NoError(t, err)
+		require.Equal(t, before, prometheustestutil.ToFloat64(prometheusBlockValidationOutpointOnlyBlocks))
 	})
 }
