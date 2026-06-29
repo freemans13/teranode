@@ -556,7 +556,7 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 
 	// Insert inputs, outputs, and block_ids — use batched or per-row depending on setting
 	if s.settings.UtxoStore.BatchSQLOperations {
-		if err = s.createInputsBatched(ctx, txn, transactionID, tx); err != nil {
+		if err = s.createInputsBatched(ctx, txn, transactionID, tx, options.SkipExtendedInputs); err != nil {
 			return nil, err
 		}
 		if err = s.createOutputsBatched(ctx, txn, transactionID, txHash, tx, isCoinbase, blockHeight); err != nil {
@@ -627,7 +627,9 @@ func (s *Store) unspendableMinedTxDAH(tx *bt.Tx, blockHeight uint32, options *ut
 }
 
 // createInputsBatched inserts all transaction inputs in chunked multi-value INSERTs.
-func (s *Store) createInputsBatched(ctx context.Context, txn *sql.Tx, transactionID int, tx *bt.Tx) error {
+// When skipExtended is true, previous_tx_satoshis is written as 0 and previous_tx_script as nil,
+// while the outpoint columns (previous_transaction_hash, previous_tx_idx) are always retained.
+func (s *Store) createInputsBatched(ctx context.Context, txn *sql.Tx, transactionID int, tx *bt.Tx, skipExtended bool) error {
 	if len(tx.Inputs) == 0 {
 		return nil
 	}
@@ -647,13 +649,19 @@ func (s *Store) createInputsBatched(ctx context.Context, txn *sql.Tx, transactio
 		args := make([]interface{}, 0, chunkSize*colsPerRow)
 		for i := chunkStart; i < chunkEnd; i++ {
 			input := tx.Inputs[i]
+			var prevSats uint64
+			var prevScript *bscript.Script
+			if !skipExtended {
+				prevSats = input.PreviousTxSatoshis
+				prevScript = input.PreviousTxScript
+			}
 			args = append(args,
 				transactionID,
 				i,
 				input.PreviousTxIDChainHash()[:],
 				input.PreviousTxOutIndex,
-				input.PreviousTxSatoshis,
-				input.PreviousTxScript,
+				prevSats,
+				prevScript,
 				input.UnlockingScript,
 				input.SequenceNumber,
 			)

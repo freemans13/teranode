@@ -2968,16 +2968,30 @@ func TestBuildCompositeValuesPairs(t *testing.T) {
 }
 
 // newTestStore creates a fresh in-memory SQLite store for minimal-create tests.
+// Uses the default BatchSQLOperations setting (true → createInputsBatched path on SQLite).
 func newTestStore(t *testing.T) (*Store, *sql.DB) {
+	t.Helper()
+	return newTestStoreBatch(t, true)
+}
+
+// newTestStoreBatch creates a fresh in-memory SQLite store with BatchSQLOperations forced.
+// On SQLite, batchSQL=true exercises createInputsBatched; batchSQL=false exercises createInputsPerRow.
+// (The createCTE / buildInputArrays path is postgres-only and unreachable from this harness.)
+func newTestStoreBatch(t *testing.T, batchSQL bool) (*Store, *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.UtxoStore.DBTimeout = 30 * time.Second
+	tSettings.UtxoStore.BatchSQLOperations = batchSQL
 	tSettings.BatcherDrainMode = true
 	tSettings.Pruner.UTXODefensiveEnabled = false
 
-	utxoStoreURL, err := url.Parse("sqlitememory:///minimal_create_test")
+	dbName := "minimal_create_test_batched"
+	if !batchSQL {
+		dbName = "minimal_create_test_perrow"
+	}
+	utxoStoreURL, err := url.Parse("sqlitememory:///" + dbName)
 	require.NoError(t, err)
 
 	store, err := New(ctx, logger, tSettings, utxoStoreURL)
@@ -3033,6 +3047,26 @@ func newSpendingTx(t *testing.T, parent *bt.Tx, vOut uint32) *bt.Tx {
 		SequenceNumber:     0xFFFFFFFF,
 		UnlockingScript:    &emptyUnlocking,
 		// PreviousTxSatoshis defaults to 0, PreviousTxScript defaults to nil.
+	}
+	require.NoError(t, input.PreviousTxIDAdd(parent.TxIDChainHash()))
+	tx.Inputs = append(tx.Inputs, input)
+	return tx
+}
+
+// newExtendedSpendingTx builds a transaction spending parent's vOut with the input FULLY
+// decorated (PreviousTxSatoshis and PreviousTxScript populated). Used to prove that the
+// SkipExtendedInputs flag FORCES the columns to zero even when the input carries real values.
+func newExtendedSpendingTx(t *testing.T, parent *bt.Tx, vOut uint32) *bt.Tx {
+	t.Helper()
+	tx := bt.NewTx()
+
+	emptyUnlocking := bscript.Script{}
+	input := &bt.Input{
+		PreviousTxOutIndex: vOut,
+		SequenceNumber:     0xFFFFFFFF,
+		UnlockingScript:    &emptyUnlocking,
+		PreviousTxSatoshis: parent.Outputs[vOut].Satoshis,
+		PreviousTxScript:   parent.Outputs[vOut].LockingScript,
 	}
 	require.NoError(t, input.PreviousTxIDAdd(parent.TxIDChainHash()))
 	tx.Inputs = append(tx.Inputs, input)
@@ -3122,4 +3156,44 @@ func TestCreate_FlagOff_ByteIdentical(t *testing.T) {
 	sats, script, _, _ := queryInputRow(t, db, tx.TxIDChainHash(), 0)
 	require.Equal(t, int64(tx.Inputs[0].PreviousTxSatoshis), sats, "flag off persists real satoshis")
 	require.NotEmpty(t, script, "flag off persists the parent script")
+}
+
+// TestMinimalCreate_ForcesZero_AllInputPaths proves that SkipExtendedInputs FORCES the parent
+// columns to zero even when the child input carries REAL (decorated) satoshis/script — across
+// both SQLite input-insertion paths: createInputsBatched (BatchSQLOperations=true, the default)
+// and createInputsPerRow (BatchSQLOperations=false). This is the meaningful flag test: an
+// un-decorated input would round-trip zeros regardless of the flag, so here we decorate the
+// input and assert the flag still zeroes the columns while retaining the outpoint.
+func TestMinimalCreate_ForcesZero_AllInputPaths(t *testing.T) {
+	cases := []struct {
+		name     string
+		batchSQL bool
+	}{
+		{"batched (createInputsBatched)", true},
+		{"perRow (createInputsPerRow)", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, db := newTestStoreBatch(t, tc.batchSQL)
+			ctx := context.Background()
+
+			parent := newExtendedTxWithOutputs(t, 2)
+			_, err := store.Create(ctx, parent, 1)
+			require.NoError(t, err)
+
+			// Child IS decorated (real parent satoshis + script) — the flag must override it.
+			child := newExtendedSpendingTx(t, parent, 0)
+			require.NotZero(t, child.Inputs[0].PreviousTxSatoshis, "precondition: input is decorated")
+			require.NotNil(t, child.Inputs[0].PreviousTxScript, "precondition: input is decorated")
+
+			_, err = store.Create(ctx, child, 2, utxo.WithSkipExtendedInputs(true))
+			require.NoError(t, err)
+
+			sats, script, prevHash, prevIdx := queryInputRow(t, db, child.TxIDChainHash(), 0)
+			require.Equal(t, int64(0), sats, "flag forces satoshis to zero even when input is decorated")
+			require.Empty(t, script, "flag forces script to nil even when input is decorated")
+			require.Equal(t, child.Inputs[0].PreviousTxIDChainHash()[:], prevHash, "outpoint retained")
+			require.Equal(t, int32(child.Inputs[0].PreviousTxOutIndex), prevIdx, "outpoint idx retained")
+		})
+	}
 }
