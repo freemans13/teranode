@@ -204,6 +204,11 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 		return errors.NewBlockIncompleteError("[quickValidateBlock][%s] coinbase tx is nil or has no inputs, peer may not have full block data", block.Hash().String())
 	}
 
+	// Count fast-path blocks once per block (not per batch).
+	if u.quickValidateOutpointOnly(block) {
+		prometheusBlockValidationOutpointOnlyBlocks.Inc()
+	}
+
 	var (
 		err error
 		id  uint64
@@ -291,6 +296,11 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 	// Reject blocks without a valid coinbase (e.g. from seeded peers that don't have full block data)
 	if block.CoinbaseTx == nil || len(block.CoinbaseTx.Inputs) == 0 {
 		return errors.NewBlockIncompleteError("[quickValidateBlockAsync][%s] coinbase tx is nil or has no inputs, peer may not have full block data", block.Hash().String())
+	}
+
+	// Count fast-path blocks once per block (not per batch).
+	if u.quickValidateOutpointOnly(block) {
+		prometheusBlockValidationOutpointOnlyBlocks.Inc()
 	}
 
 	var (
@@ -1187,11 +1197,6 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	outpointOnly := u.quickValidateOutpointOnly(block)
 	if outpointOnly && block.Height > blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints) {
 		return errors.NewProcessingError("[createAndSpendUTXOsForBatch] invariant I4 violated: outpoint-only active above checkpoint at height %d", block.Height)
-	}
-
-	// Increment once per block when the outpoint-only fast path is active.
-	if outpointOnly {
-		prometheusBlockValidationOutpointOnlyBlocks.Inc()
 	}
 
 	lockUTXOs := !u.quickValidateSkipsUtxoLock(block)

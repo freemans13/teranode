@@ -795,9 +795,16 @@ func TestQuickValidateBlockAsync_UtxoLockGating(t *testing.T) {
 
 // TestOutpointOnly_MetricIncrementsBelowOnly verifies that the
 // prometheusBlockValidationOutpointOnlyBlocks counter increments by exactly 1
-// when quickValidateBlock processes a below-checkpoint block with the
-// OutpointOnlyBelowCheckpoint setting on, and does NOT increment when the
-// setting is off.
+// per block (not per subtree batch) when quickValidateBlock processes a
+// below-checkpoint block with OutpointOnlyBelowCheckpoint on, and does NOT
+// increment when the setting is off.
+//
+// Per-block counting is guaranteed by the Inc() placement at the top of
+// quickValidateBlock (and quickValidateBlockAsync), before any batch loop.
+// A multi-subtree block cannot be constructed with the current CatchupTestSuite
+// harness without rewriting subtree+merkle wiring, so the per-block assertion
+// relies on the code relocation: the counter is no longer inside
+// createAndSpendUTXOsForBatch, which runs once per batch.
 func TestOutpointOnly_MetricIncrementsBelowOnly(t *testing.T) {
 	initPrometheusMetrics()
 
