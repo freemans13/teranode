@@ -50,6 +50,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -2964,4 +2965,161 @@ func TestBuildCompositeValuesPairs(t *testing.T) {
 		require.Equal(t, "", clause)
 		require.Nil(t, args)
 	})
+}
+
+// newTestStore creates a fresh in-memory SQLite store for minimal-create tests.
+func newTestStore(t *testing.T) (*Store, *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 30 * time.Second
+	tSettings.BatcherDrainMode = true
+	tSettings.Pruner.UTXODefensiveEnabled = false
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///minimal_create_test")
+	require.NoError(t, err)
+
+	store, err := New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	return store, store.db.DB
+}
+
+// newExtendedTxWithOutputs builds a transaction with n outputs and a fully-decorated
+// (extended) input whose PreviousTxSatoshis and PreviousTxScript are populated.
+// The unlocking_script column is NOT NULL in the schema so an empty script is provided.
+func newExtendedTxWithOutputs(t *testing.T, n int) *bt.Tx {
+	t.Helper()
+	tx := bt.NewTx()
+
+	// Use a deterministic prev hash so the tx is reproducible.
+	prevHashBytes := make([]byte, 32)
+	prevHashBytes[0] = 0xDE
+	prevHash, err := chainhash.NewHash(prevHashBytes)
+	require.NoError(t, err)
+
+	lockScript, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	require.NoError(t, err)
+
+	// Build a decorated input. Use PreviousTxIDAdd to properly initialise the internal hash field.
+	emptyUnlocking := bscript.Script{}
+	input := &bt.Input{
+		PreviousTxOutIndex: 0,
+		SequenceNumber:     0xFFFFFFFF,
+		PreviousTxSatoshis: 100_000,
+		PreviousTxScript:   lockScript,
+		UnlockingScript:    &emptyUnlocking,
+	}
+	require.NoError(t, input.PreviousTxIDAdd(prevHash))
+	tx.Inputs = append(tx.Inputs, input)
+
+	for i := 0; i < n; i++ {
+		require.NoError(t, tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", uint64(10_000)))
+	}
+	return tx
+}
+
+// newSpendingTx builds a transaction spending vOut from parent without decorating the input
+// (PreviousTxSatoshis=0, PreviousTxScript=nil) to simulate the below-checkpoint path.
+// An empty unlocking script satisfies the NOT NULL constraint on inputs.unlocking_script.
+func newSpendingTx(t *testing.T, parent *bt.Tx, vOut uint32) *bt.Tx {
+	t.Helper()
+	tx := bt.NewTx()
+
+	emptyUnlocking := bscript.Script{}
+	input := &bt.Input{
+		PreviousTxOutIndex: vOut,
+		SequenceNumber:     0xFFFFFFFF,
+		UnlockingScript:    &emptyUnlocking,
+		// PreviousTxSatoshis defaults to 0, PreviousTxScript defaults to nil.
+	}
+	require.NoError(t, input.PreviousTxIDAdd(parent.TxIDChainHash()))
+	tx.Inputs = append(tx.Inputs, input)
+	return tx
+}
+
+// addOutputs appends n P2PKH outputs to tx.
+func addOutputs(t *testing.T, tx *bt.Tx, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		require.NoError(t, tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", uint64(5_000)))
+	}
+}
+
+// queryOutputUTXOHash reads utxo_hash for a specific output (txHash, vout) from the DB.
+func queryOutputUTXOHash(t *testing.T, db *sql.DB, txHash *chainhash.Hash, vout int) []byte {
+	t.Helper()
+	row := db.QueryRow(`
+		SELECT o.utxo_hash
+		FROM outputs o
+		JOIN transactions tx ON tx.id = o.transaction_id
+		WHERE tx.hash = ? AND o.idx = ?`, txHash[:], vout)
+	var h []byte
+	require.NoError(t, row.Scan(&h))
+	return h
+}
+
+// queryInputRow reads the input row columns we care about for testing.
+// Returns (previous_tx_satoshis, previous_tx_script, previous_transaction_hash, previous_tx_idx).
+func queryInputRow(t *testing.T, db *sql.DB, txHash *chainhash.Hash, idx int) (int64, []byte, []byte, int32) {
+	t.Helper()
+	row := db.QueryRow(`
+		SELECT i.previous_tx_satoshis, i.previous_tx_script, i.previous_transaction_hash, i.previous_tx_idx
+		FROM inputs i
+		JOIN transactions tx ON tx.id = i.transaction_id
+		WHERE tx.hash = ? AND i.idx = ?`, txHash[:], idx)
+	var sats int64
+	var script []byte
+	var prevHash []byte
+	var prevIdx int32
+	require.NoError(t, row.Scan(&sats, &script, &prevHash, &prevIdx))
+	return sats, script, prevHash, prevIdx
+}
+
+// TestMinimalCreate_FeeZero_OutputsIntact verifies that WithSkipExtendedInputs(true):
+// - does not call GetFees (so an un-decorated tx is accepted without error)
+// - returns Fee=0 in meta
+// - fully persists the output (utxo_hash matches)
+// - zeroes previous_tx_satoshis and previous_tx_script in the inputs row
+// - retains the outpoint (previous_transaction_hash, previous_tx_idx)
+func TestMinimalCreate_FeeZero_OutputsIntact(t *testing.T) {
+	store, db := newTestStore(t)
+	ctx := context.Background()
+
+	// Extended parent so we have a real output to spend; child is NOT extended.
+	parent := newExtendedTxWithOutputs(t, 2)
+	_, err := store.Create(ctx, parent, 1)
+	require.NoError(t, err)
+
+	child := newSpendingTx(t, parent, 0) // not extended
+	addOutputs(t, child, 1)              // one new output
+	txMeta, err := store.Create(ctx, child, 2, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err, "minimal create must not call GetFees on an un-decorated tx")
+	require.Equal(t, uint64(0), txMeta.Fee, "fee is zero below checkpoint")
+
+	// Output fully persisted with its OWN utxo_hash (parent-independent).
+	wantHash, err := util.UTXOHashFromOutput(child.TxIDChainHash(), child.Outputs[0], 0)
+	require.NoError(t, err)
+	gotHash := queryOutputUTXOHash(t, db, child.TxIDChainHash(), 0)
+	require.Equal(t, wantHash[:], gotHash)
+
+	// Per-input parent columns are zeroed/empty, but the outpoint is retained.
+	sats, script, prevHash, prevIdx := queryInputRow(t, db, child.TxIDChainHash(), 0)
+	require.Equal(t, int64(0), sats)
+	require.Empty(t, script)
+	require.Equal(t, child.Inputs[0].PreviousTxIDChainHash()[:], prevHash, "outpoint retained for pruner")
+	require.Equal(t, int32(child.Inputs[0].PreviousTxOutIndex), prevIdx)
+}
+
+// TestCreate_FlagOff_ByteIdentical verifies that when WithSkipExtendedInputs is NOT set (default),
+// the extended satoshis and script are persisted unchanged — flag-off is byte-identical to prior behaviour.
+func TestCreate_FlagOff_ByteIdentical(t *testing.T) {
+	store, db := newTestStore(t)
+	tx := newExtendedTxWithOutputs(t, 2)
+	_, err := store.Create(context.Background(), tx, 1) // no options
+	require.NoError(t, err)
+	sats, script, _, _ := queryInputRow(t, db, tx.TxIDChainHash(), 0)
+	require.Equal(t, int64(tx.Inputs[0].PreviousTxSatoshis), sats, "flag off persists real satoshis")
+	require.NotEmpty(t, script, "flag off persists the parent script")
 }

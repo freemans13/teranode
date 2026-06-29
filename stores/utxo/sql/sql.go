@@ -439,7 +439,13 @@ func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32
 }
 
 func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
-	txMeta, err := util.TxMetaDataFromTx(tx)
+	var txMeta *meta.Data
+	var err error
+	if options.SkipExtendedInputs {
+		txMeta, err = util.TxMetaDataFromTxNoFee(tx)
+	} else {
+		txMeta, err = util.TxMetaDataFromTx(tx)
+	}
 	if err != nil {
 		return nil, errors.NewProcessingError("failed to get tx meta data", err)
 	}
@@ -562,7 +568,7 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 			}
 		}
 	} else {
-		if err = s.createInputsPerRow(ctx, txn, transactionID, tx); err != nil {
+		if err = s.createInputsPerRow(ctx, txn, transactionID, tx, options.SkipExtendedInputs); err != nil {
 			return nil, err
 		}
 		if err = s.createOutputsPerRow(ctx, txn, transactionID, txHash, tx, isCoinbase, blockHeight); err != nil {
@@ -784,7 +790,7 @@ SELECT id FROM new_tx
 // No explicit transaction needed — a single statement is auto-atomic.
 func (s *Store) createCTE(ctx context.Context, btTx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions, txHash *chainhash.Hash, txMeta *meta.Data, isCoinbase bool, unminedSince interface{}) (*meta.Data, error) {
 	// Build array parameters for UNNEST
-	inpArrs := buildInputArrays(btTx)
+	inpArrs := buildInputArrays(btTx, options.SkipExtendedInputs)
 	outArrs, err := buildOutputArrays(s.settings, txHash, btTx, isCoinbase, blockHeight)
 	if err != nil {
 		return nil, err
@@ -853,7 +859,9 @@ type inputArrayParams struct {
 }
 
 // buildInputArrays packs transaction inputs into parallel arrays for UNNEST.
-func buildInputArrays(btTx *bt.Tx) inputArrayParams {
+// When skipExtended is true, prevSatoshis is written as 0 and prevScript as nil,
+// while the outpoint columns (prevHash, prevIdx) are always retained.
+func buildInputArrays(btTx *bt.Tx, skipExtended bool) inputArrayParams {
 	n := len(btTx.Inputs)
 	if n == 0 {
 		return inputArrayParams{}
@@ -869,11 +877,13 @@ func buildInputArrays(btTx *bt.Tx) inputArrayParams {
 	}
 	for i, input := range btTx.Inputs {
 		p.idx[i] = int32(i)
-		p.prevHash[i] = input.PreviousTxIDChainHash()[:]
+		p.prevHash[i] = input.PreviousTxIDChainHash()[:] // outpoint always retained
 		p.prevIdx[i] = int32(input.PreviousTxOutIndex)
-		p.prevSatoshis[i] = int64(input.PreviousTxSatoshis)
-		if input.PreviousTxScript != nil {
-			p.prevScript[i] = []byte(*input.PreviousTxScript)
+		if !skipExtended {
+			p.prevSatoshis[i] = int64(input.PreviousTxSatoshis)
+			if input.PreviousTxScript != nil {
+				p.prevScript[i] = []byte(*input.PreviousTxScript)
+			}
 		}
 		if input.UnlockingScript != nil {
 			p.unlockScript[i] = []byte(*input.UnlockingScript)
@@ -1022,7 +1032,13 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 	// Phase 1: Pre-compute all array parameters (CPU only, no DB)
 	prepared := make([]preparedCreate, len(batch))
 	for i, item := range batch {
-		txMeta, err := util.TxMetaDataFromTx(item.tx)
+		var txMeta *meta.Data
+		var err error
+		if item.options.SkipExtendedInputs {
+			txMeta, err = util.TxMetaDataFromTxNoFee(item.tx)
+		} else {
+			txMeta, err = util.TxMetaDataFromTx(item.tx)
+		}
 		if err != nil {
 			item.done <- batchCreateResult{Err: errors.NewProcessingError("failed to get tx meta data", err)}
 			continue
@@ -1052,7 +1068,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 			isCoinbase = *item.options.IsCoinbase
 		}
 
-		inpArrs := buildInputArrays(item.tx)
+		inpArrs := buildInputArrays(item.tx, item.options.SkipExtendedInputs)
 		outArrs, err := buildOutputArrays(s.settings, txHash, item.tx, isCoinbase, item.blockHeight)
 		if err != nil {
 			item.done <- batchCreateResult{Err: err}
@@ -1214,7 +1230,9 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 }
 
 // createInputsPerRow inserts transaction inputs one row at a time (original behavior).
-func (s *Store) createInputsPerRow(ctx context.Context, txn *sql.Tx, transactionID int, tx *bt.Tx) error {
+// When skipExtended is true, previous_tx_satoshis is written as 0 and previous_tx_script as nil,
+// while the outpoint columns (previous_transaction_hash, previous_tx_idx) are always retained.
+func (s *Store) createInputsPerRow(ctx context.Context, txn *sql.Tx, transactionID int, tx *bt.Tx, skipExtended bool) error {
 	q := `
 		INSERT INTO inputs (
 		 transaction_id
@@ -1237,13 +1255,19 @@ func (s *Store) createInputsPerRow(ctx context.Context, txn *sql.Tx, transaction
 		)
 	`
 	for i, input := range tx.Inputs {
+		var prevSats uint64
+		var prevScript *bscript.Script
+		if !skipExtended {
+			prevSats = input.PreviousTxSatoshis
+			prevScript = input.PreviousTxScript
+		}
 		_, err := txn.ExecContext(
 			ctx, q,
 			transactionID, i,
 			input.PreviousTxIDChainHash()[:],
 			input.PreviousTxOutIndex,
-			input.PreviousTxSatoshis,
-			input.PreviousTxScript,
+			prevSats,
+			prevScript,
 			input.UnlockingScript,
 			input.SequenceNumber,
 		)
