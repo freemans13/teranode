@@ -13,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -137,15 +138,20 @@ func (u *BlockValidation) buildSubtreeAndQueueWrite(ctx context.Context, block *
 		}
 	}
 
+	outpointOnly := u.quickValidateOutpointOnly(block)
 	for _, tx := range txs {
-		fee, err := util.GetFees(tx)
-		if err != nil {
-			return nil, errors.NewProcessingError("[buildSubtreeAndQueueWrite][%s] failed to get fee for tx %s in subtree %s", block.Hash().String(), tx.TxIDChainHash().String(), subtreeHash.String(), err)
+		var fee uint64
+		if !outpointOnly {
+			var err error
+			fee, err = util.GetFees(tx)
+			if err != nil {
+				return nil, errors.NewProcessingError("[buildSubtreeAndQueueWrite][%s] failed to get fee for tx %s in subtree %s", block.Hash().String(), tx.TxIDChainHash().String(), subtreeHash.String(), err)
+			}
 		}
 
 		sizeInBytes := uint64(tx.Size())
 
-		if err = fullSubtree.AddNode(*tx.TxIDChainHash(), fee, sizeInBytes); err != nil {
+		if err := fullSubtree.AddNode(*tx.TxIDChainHash(), fee, sizeInBytes); err != nil {
 			return nil, errors.NewProcessingError("[buildSubtreeAndQueueWrite][%s] failed to add tx node %s to full subtree %s", block.Hash().String(), tx.TxIDChainHash().String(), subtreeHash.String(), err)
 		}
 	}
@@ -865,17 +871,23 @@ func (u *BlockValidation) writeSubtreeFilesFromTxs(ctx context.Context, block *m
 			}
 		}
 
+		outpointOnly := u.quickValidateOutpointOnly(block)
 		for _, tx := range txs {
 			// Get fee and size directly instead of using TxMetaDataFromTx which also
-			// computes TxInpoints (only needed for subtreeMeta, which we skip during quick validation)
-			fee, err := util.GetFees(tx)
-			if err != nil {
-				return errors.NewProcessingError("[writeSubtreeFilesFromTxs][%s] failed to get fee for tx %s in subtree %s", block.Hash().String(), tx.TxIDChainHash().String(), subtreeHash.String(), err)
+			// computes TxInpoints (only needed for subtreeMeta, which we skip during quick validation).
+			// On the outpoint-only fast path, skip GetFees (inputs are un-decorated; fee is 0).
+			var fee uint64
+			if !outpointOnly {
+				var err error
+				fee, err = util.GetFees(tx)
+				if err != nil {
+					return errors.NewProcessingError("[writeSubtreeFilesFromTxs][%s] failed to get fee for tx %s in subtree %s", block.Hash().String(), tx.TxIDChainHash().String(), subtreeHash.String(), err)
+				}
 			}
 
 			sizeInBytes := uint64(tx.Size())
 
-			if err = fullSubtree.AddNode(*tx.TxIDChainHash(), fee, sizeInBytes); err != nil {
+			if err := fullSubtree.AddNode(*tx.TxIDChainHash(), fee, sizeInBytes); err != nil {
 				return errors.NewProcessingError("[writeSubtreeFilesFromTxs][%s] failed to add tx node %s to full subtree %s", block.Hash().String(), tx.TxIDChainHash().String(), subtreeHash.String(), err)
 			}
 		}
@@ -1139,8 +1151,11 @@ func (u *BlockValidation) processSubtreeBatch(
 		batch.txRanges[i] = [2]int{startIdx, len(batch.batchTxs)}
 	}
 
-	// Phase 3: Extend remaining transactions using bulk UTXO store lookup
-	if len(txsNeedingExtension) > 0 {
+	// Phase 3: Extend remaining transactions using bulk UTXO store lookup.
+	// Skipped on the outpoint-only fast path: below-checkpoint blocks are certified
+	// valid and parent satoshis/scripts are not needed for UTXO create/spend.
+	outpointOnly := u.quickValidateOutpointOnly(block)
+	if !outpointOnly && len(txsNeedingExtension) > 0 {
 		if err := u.utxoStore.BatchPreviousOutputsDecorate(ctx, txsNeedingExtension); err != nil {
 			cancelReaders()
 			return nil, errors.NewProcessingError("[processSubtreeBatch][%s] failed to extend transactions: %v", block.Hash().String(), err)
@@ -1164,6 +1179,14 @@ func (u *BlockValidation) processSubtreeBatch(
 func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block *model.Block, batch *SubtreeProcessingBatch) error {
 	if len(batch.batchTxs) == 0 {
 		return nil
+	}
+
+	// Invariant I4: outpoint-only mode must never be applied above the highest hardcoded
+	// checkpoint. quickValidateOutpointOnly already enforces this, but we add an explicit
+	// guard here as a defence-in-depth measure.
+	outpointOnly := u.quickValidateOutpointOnly(block)
+	if outpointOnly && block.Height > blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints) {
+		return errors.NewProcessingError("[createAndSpendUTXOsForBatch] invariant I4 violated: outpoint-only active above checkpoint at height %d", block.Height)
 	}
 
 	lockUTXOs := !u.quickValidateSkipsUtxoLock(block)
@@ -1196,7 +1219,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 					BlockID:     block.ID,
 					BlockHeight: block.Height,
 					SubtreeIdx:  sIdx,
-				}), utxo.WithLocked(lockUTXOs))
+				}), utxo.WithLocked(lockUTXOs), utxo.WithSkipExtendedInputs(outpointOnly))
 				if err != nil {
 					if errors.Is(err, errors.ErrTxExists) {
 						// Transaction already exists - collect it for mined info update
@@ -1232,7 +1255,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	for _, tx := range batch.batchTxs {
 		tx := tx
 		spendG.Go(func() error {
-			if _, err := u.utxoStore.Spend(spendCtx, tx, block.Height, utxo.IgnoreFlags{IgnoreLocked: true}); err != nil {
+			if _, err := u.utxoStore.Spend(spendCtx, tx, block.Height, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: outpointOnly}); err != nil {
 				return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to spend tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
 			}
 			return nil
@@ -1479,8 +1502,9 @@ func (u *BlockValidation) extendBatch(
 		batch.txRanges[i] = [2]int{startIdx, len(batch.batchTxs)}
 	}
 
-	// Extend remaining transactions using bulk UTXO store lookup
-	if len(txsNeedingExtension) > 0 {
+	// Extend remaining transactions using bulk UTXO store lookup.
+	// Skipped on the outpoint-only fast path (see processSubtreeBatch Phase 3 comment).
+	if !u.quickValidateOutpointOnly(block) && len(txsNeedingExtension) > 0 {
 		if err := u.utxoStore.BatchPreviousOutputsDecorate(ctx, txsNeedingExtension); err != nil {
 			return errors.NewProcessingError("[extendBatch][%s] failed to extend transactions: %v", block.Hash().String(), err)
 		}

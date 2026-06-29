@@ -600,6 +600,51 @@ func TestQuickValidateBlock_UtxoLockGating(t *testing.T) {
 	})
 }
 
+// TestQuickValidate_OutpointOnly_NoDecorate_ZeroFees verifies the outpoint-only fast path:
+// - BatchPreviousOutputsDecorate is never called (no mock expectation ⇒ panic if called)
+// - Subtree fees are written as 0 (GetFees is skipped)
+//
+// The block uses the same one-subtree construction as other quick-validate tests. The
+// transactions from CreateTestTransactionChainWithCount are already extended (FromUTXOs
+// populates PreviousTxSatoshis), so they would normally have non-zero fees. With
+// outpoint-only enabled, fees must always be 0 regardless of the tx content.
+func TestQuickValidate_OutpointOnly_NoDecorate_ZeroFees(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	defer suite.Cleanup()
+
+	// Enable the outpoint-only fast path and skip UTXO locking (belt-and-suspenders: we
+	// don't want SetLocked expectations to complicate the assertion).
+	suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	suite.Server.blockValidation.settings.BlockValidation.QuickValidateSkipUtxoLock = true
+	// Place a high checkpoint so height 500 is firmly below it.
+	setCheckpoints(t, suite, 1_000_000)
+
+	setupQuickValidateMocks(suite)
+	// Remove the Spend default added by setupMocks (arg-count mismatch with strict match
+	// below) and register a permissive replacement.
+	suite.MockUTXOStore.ExpectedCalls = filterCalls(suite.MockUTXOStore.ExpectedCalls, "Spend")
+	suite.MockUTXOStore.On("Spend", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, nil).Maybe()
+
+	block := buildOneSubtreeBlock(t, suite, 500)
+
+	err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
+	require.NoError(t, err)
+
+	// BatchPreviousOutputsDecorate must not have been called (no mock expectation registered
+	// for it; any call would panic via testify/mock's unexpected-call path).
+	suite.MockUTXOStore.AssertNotCalled(t, "BatchPreviousOutputsDecorate", mock.Anything, mock.Anything)
+
+	// Every non-nil subtree slice must have Fees == 0.
+	// buildOneSubtreeBlock creates extended txs with real satoshi values; without
+	// outpoint-only the fee would be non-zero, so a zero value here proves GetFees was skipped.
+	for i, st := range block.SubtreeSlices {
+		if st == nil {
+			continue
+		}
+		require.Equal(t, uint64(0), st.Fees, "subtree %d: expected zero fees on outpoint-only path", i)
+	}
+}
+
 func TestQuickValidateBlockAsync_UtxoLockGating(t *testing.T) {
 	t.Run("setting off: UTXOs locked then unlocked", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
