@@ -25,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
 	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -505,6 +506,33 @@ func (sm *SyncManager) quickValidationAllowed(blockHeight uint32) bool {
 	return blockHeight <= highest
 }
 
+// legacyOutpointOnly reports whether this block may use the below-checkpoint
+// outpoint-only fast path on the legacy netsync route: skip the bulk decorate,
+// stamp subtree fees as 0, do a minimal (inputs-only) UTXO create, and spend
+// using the validator's outpoint-only mode. Default OFF — every conjunct must
+// hold for the path to engage, so when the setting is off, the store is not
+// SQL-backed, or the block is above the highest hard-coded checkpoint, the
+// legacy path behaves exactly as before (byte-identical, invariant I2).
+func (sm *SyncManager) legacyOutpointOnly(height uint32) bool {
+	if sm.settings == nil || !sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
+		return false
+	}
+
+	if !settings.IsSQLUtxoStore(sm.settings) {
+		return false
+	}
+
+	if !sm.quickValidationAllowed(height) {
+		return false
+	}
+
+	if sm.chainParams == nil {
+		return false
+	}
+
+	return height <= blockchain.HighestCheckpointHeight(sm.chainParams.Checkpoints)
+}
+
 func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, bi blockIdent, subtree *subtreepkg.Subtree) error {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "checkSubtreeFromBlock",
 		tracing.WithLogMessage(sm.logger, "[checkSubtreeFromBlock][%s] checking subtree for block %s height %d", subtree.RootHash().String(), bi.hash.String(), bi.height),
@@ -950,6 +978,17 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 
 	blockHeightUint32 := bi.height
 
+	// Below-checkpoint outpoint-only fast path: do a minimal create (compute meta
+	// with fee=0, persist per-input parent script/satoshis as empty/zero) while
+	// still retaining every output and per-input outpoint. Inputs were never
+	// decorated on the gated path, so a full create would store empty parent data
+	// anyway; WithSkipExtendedInputs makes that explicit and skips the fee/GetFees
+	// work. Default OFF: when closed, baseOpts is empty and create is unchanged.
+	var baseOpts []utxo.CreateOption
+	if sm.legacyOutpointOnly(blockHeightUint32) {
+		baseOpts = append(baseOpts, utxo.WithSkipExtendedInputs(true))
+	}
+
 	// Track txs that already exist in the store so we can merge our blockID into their
 	// BlockIDs after the Create pass. The quickValidation fast path skips the async
 	// setTxMinedStatus step entirely (AddBlock with MinedSet=true), so any tx that
@@ -971,11 +1010,13 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 				return errors.NewProcessingError("transaction %s not found in txMap", txHash.String())
 			}
 
-			if _, err := sm.utxoStore.Create(gCtx, txWrapper.Tx, blockHeightUint32, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+			createOpts := append(baseOpts[:len(baseOpts):len(baseOpts)], utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
 				BlockID:     blockID,
 				BlockHeight: blockHeightUint32,
 				SubtreeIdx:  0, // legacy path produces a single subtree at index 0
-			})); err != nil {
+			}))
+
+			if _, err := sm.utxoStore.Create(gCtx, txWrapper.Tx, blockHeightUint32, createOpts...); err != nil {
 				if errors.Is(err, errors.ErrTxExists) {
 					existingTxsMu.Lock()
 					existingTxHashes = append(existingTxHashes, &txHash)
@@ -1123,6 +1164,13 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 		return err
 	}
 
+	// Below-checkpoint outpoint-only fast path: validate spends by outpoint only,
+	// without decorated inputs. WithOutpointOnlySpend requires WithSkipScriptValidation
+	// (already set unconditionally below for this checkpoint-covered path), satisfying
+	// the validator's C1 precondition. Default OFF: when closed the spend path is
+	// unchanged (full UTXO-hash-checked spend with whatever decoration was applied).
+	outpointOnly := sm.legacyOutpointOnly(blockHeight)
+
 	// These transactions arrive as part of a block, so they should be treated as valid
 	// transactions that all need to be processed. If one fails (e.g. transient Aerospike
 	// DEVICE_OVERLOAD), rolling back or cancelling all other independent transactions
@@ -1173,9 +1221,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					return nil
 				}
 
-				if _, validateErr := sm.validationClient.Validate(ctx,
-					txWrapper.Tx,
-					blockHeight,
+				validateOpts := []validator.Option{
 					validator.WithSkipUtxoCreation(true),
 					validator.WithAddTXToBlockAssembly(false),
 					validator.WithSkipPolicyChecks(true),
@@ -1190,6 +1236,15 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					validator.WithSkipScriptValidation(true),
 					validator.WithCandidateBlockTime(candidateBlockTime),
 					validator.WithCandidateParentMedianTime(candidateParentMedianTime),
+				}
+				if outpointOnly {
+					validateOpts = append(validateOpts, validator.WithOutpointOnlySpend(true))
+				}
+
+				if _, validateErr := sm.validationClient.Validate(ctx,
+					txWrapper.Tx,
+					blockHeight,
+					validateOpts...,
 				); validateErr != nil {
 					// ErrTxConflicting is expected during legacy catchup when the UTXO store
 					// has stale spending data. The block is confirmed, so its transactions
@@ -1421,6 +1476,18 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, bi blockIdent, tx
 	// most likely cause is a parent that's been pruned (DAH'd) because the child
 	// already had a prior processing pass. Fall back to per-tx decoration so the
 	// existing recovery path (utxoStore.Get on the child itself) can still kick in.
+	//
+	// Below-checkpoint outpoint-only fast path: the dominant DB cost of legacy IBD
+	// is this bulk decorate (one chunked round-trip set per block to fetch parent
+	// scripts/satoshis). On the gated path the spend uses outpoint-only validation
+	// and the create is minimal (inputs-only), so parent scripts/satoshis are never
+	// needed — skip the decorate and its per-tx fallback entirely. Phase 1's in-block
+	// extension above still runs (no DB reads); out-of-block inputs are simply left
+	// undecorated. Default OFF: when the gate is closed this is the unchanged path.
+	if sm.legacyOutpointOnly(bi.height) {
+		return nil
+	}
+
 	if batchErr := sm.utxoStore.BatchPreviousOutputsDecorate(ctx, txs); batchErr != nil {
 		if errors.Is(batchErr, errors.ErrProcessing) || errors.Is(batchErr, errors.ErrTxNotFound) {
 			return sm.extendPerTxFallback(ctx, txs)
@@ -1562,6 +1629,13 @@ func (sm *SyncManager) createSubtrees(ctx context.Context, bi blockIdent, txOrde
 
 	currentSubtreeIdx := 0
 
+	// Below-checkpoint outpoint-only fast path: inputs are never decorated on the
+	// gated path, so calculateTransactionFee (which requires extended inputs) would
+	// fail. Subtree fees are not consensus-checked below the highest hard-coded
+	// checkpoint, so stamp 0 and skip the fee calculation entirely. Default OFF:
+	// when the gate is closed the real fee is computed exactly as before.
+	outpointOnly := sm.legacyOutpointOnly(bi.height)
+
 	for _, txHash := range txOrder {
 		// the coinbase transaction is not part of the txMap
 		txWrapper, found := txMap.Get(txHash)
@@ -1589,9 +1663,12 @@ func (sm *SyncManager) createSubtrees(ctx context.Context, bi blockIdent, txOrde
 			return err
 		}
 
-		fee, err := calculateTransactionFee(tx)
-		if err != nil {
-			return err
+		var fee uint64
+		if !outpointOnly {
+			fee, err = calculateTransactionFee(tx)
+			if err != nil {
+				return err
+			}
 		}
 
 		if err = subtree.AddNode(txHash, fee, txSize); err != nil {

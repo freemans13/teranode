@@ -199,6 +199,10 @@ func (s *Spend) Clone() *Spend {
 type IgnoreFlags struct {
 	IgnoreConflicting bool
 	IgnoreLocked      bool
+	// SkipUTXOHashCheck disables the per-input utxo-hash integrity comparison during Spend.
+	// Set ONLY on the gated below-checkpoint outpoint-only path (spec §3.2 Seam 1). Default
+	// false — above-checkpoint and steady-state spends always enforce the hash.
+	SkipUTXOHashCheck bool
 }
 
 // ConflictingChildRemoval identifies one (parent, child) pair that should be
@@ -248,12 +252,13 @@ type CreateOption func(*CreateOptions)
 
 // CreateOptions holds optional parameters for UTXO creation.
 type CreateOptions struct {
-	MinedBlockInfos []MinedBlockInfo
-	TxID            *chainhash.Hash
-	IsCoinbase      *bool
-	Frozen          bool
-	Conflicting     bool
-	Locked          bool
+	MinedBlockInfos    []MinedBlockInfo
+	TxID               *chainhash.Hash
+	IsCoinbase         *bool
+	Frozen             bool
+	Conflicting        bool
+	Locked             bool
+	SkipExtendedInputs bool
 }
 
 // WithMinedBlockInfo returns a CreateOption that sets the block IDs for a UTXO.
@@ -300,6 +305,15 @@ func WithConflicting(b bool) CreateOption {
 func WithLocked(b bool) CreateOption {
 	return func(o *CreateOptions) {
 		o.Locked = b
+	}
+}
+
+// WithSkipExtendedInputs marks a create as minimal: compute meta with fee=0 (no GetFees) and
+// persist per-input parent script/satoshis as empty/zero, while ALWAYS retaining the per-input
+// outpoint and every output. Set ONLY on the gated below-checkpoint path (spec §3.2 Seam 3, §3.3).
+func WithSkipExtendedInputs(b bool) CreateOption {
+	return func(o *CreateOptions) {
+		o.SkipExtendedInputs = b
 	}
 }
 

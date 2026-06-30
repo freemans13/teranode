@@ -639,6 +639,26 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params) error {
 		return nil // Skip this check
 	}
 
+	// Below the highest HARDCODED checkpoint the no-inflation property is already
+	// certified by the pinned block hash, and the outpoint-only fast path writes
+	// subtree fees as 0 (spec §4.1). Skip the fee<=reward check so a
+	// reconsiderblock/revalidate of a below-checkpoint block does not wrongly reject
+	// it as BLOCK_INVALID. Height is computed inline because model cannot import
+	// services/blockchain (import cycle, §2.3); the loop is byte-equivalent to
+	// blockchain.HighestCheckpointHeight over the same params.Checkpoints (invariant I3).
+	var highestCheckpoint uint32
+	for _, cp := range params.Checkpoints {
+		if cp.Height < 0 {
+			continue
+		}
+		if h := uint32(cp.Height); h > highestCheckpoint {
+			highestCheckpoint = h
+		}
+	}
+	if b.Height <= highestCheckpoint {
+		return nil
+	}
+
 	coinbaseOutputSatoshis := uint64(0)
 	for _, tx := range b.CoinbaseTx.Outputs {
 		coinbaseOutputSatoshis += tx.Satoshis

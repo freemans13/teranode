@@ -1723,6 +1723,106 @@ func TestBlock_CheckBlockRewardAndFees(t *testing.T) {
 	})
 }
 
+// newBlockWithCoinbaseRewardAndZeroSubtreeFees builds a Block at the given height
+// whose coinbase claims the full block subsidy (no fees) and whose SubtreeSlices
+// carry Fees=0. This mirrors the below-checkpoint fast-path write side which stores
+// zero fees in subtree data (spec §4.1); it is used to prove that
+// checkBlockRewardAndFees skips the check below the highest hardcoded checkpoint.
+func newBlockWithCoinbaseRewardAndZeroSubtreeFees(t *testing.T, height uint32, params *chaincfg.Params) *Block {
+	t.Helper()
+
+	// Compute the block subsidy at this height so the coinbase claims exactly
+	// the right amount (no fee top-up), ensuring the check would fire on an
+	// above-checkpoint block where subtree fees remain 0.
+	coinbaseReward := util.GetBlockSubsidyForHeight(height, params)
+
+	// Build a minimal coinbase tx whose single output spends the full reward.
+	// Use a raw P2PKH locking script (OP_DUP OP_HASH160 <20 zero bytes> OP_EQUALVERIFY OP_CHECKSIG).
+	lockingScript, err := bscript.NewFromHexString("76a914000000000000000000000000000000000000000088ac")
+	require.NoError(t, err)
+	coinbaseTx := bt.NewTx()
+	coinbaseTx.Inputs = append(coinbaseTx.Inputs, &bt.Input{})
+	coinbaseTx.Outputs = append(coinbaseTx.Outputs, &bt.Output{
+		Satoshis:      coinbaseReward,
+		LockingScript: lockingScript,
+	})
+
+	// A single subtree with Fees=0 (the zero value is the default — no AddNode
+	// calls means Fees stays at zero, which matches the fast-path write side).
+	subtree, sErr := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, sErr)
+
+	b := &Block{
+		Header:        newTestBlockHeader(t),
+		CoinbaseTx:    coinbaseTx,
+		Height:        height,
+		Subtrees:      []*chainhash.Hash{subtree.RootHash()},
+		SubtreeSlices: []*subtreepkg.Subtree{subtree},
+	}
+	return b
+}
+
+// TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint verifies that
+// checkBlockRewardAndFees is a no-op for blocks at or below the highest hardcoded
+// checkpoint height (fee=0 safety for the below-checkpoint outpoint-only fast path),
+// and that the check is still enforced above the checkpoint.
+func TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint(t *testing.T) {
+	params := &chaincfg.Params{
+		SubsidyReductionInterval: 210000,
+		Checkpoints: []chaincfg.Checkpoint{
+			{Height: 100},
+			{Height: 500},
+		},
+	}
+
+	// Height 300 is between the two checkpoints but still at or below the
+	// highest checkpoint (500). The subtrees carry Fees=0, which would normally
+	// make the check fire (coinbase > 0 + reward is impossible when fee=0 and
+	// coinbase == reward, but the check fires when coinbase > subtreeFees+reward).
+	// Here coinbase == reward, so the check would pass anyway — but we want to
+	// confirm the skip fires BEFORE reaching the arithmetic. We use height 501
+	// (above checkpoint) with fee=0 subtrees to prove the check IS enforced
+	// above the checkpoint (coinbase == reward so no error for above, but the
+	// skip path must not be taken). To provably distinguish the two paths we
+	// inflate the coinbase output so it exceeds reward alone.
+	//
+	// Approach: build a block where coinbaseOutputSatoshis = reward+1. Below
+	// checkpoint the check is skipped → nil. Above checkpoint the check runs →
+	// error (output > fees+reward since fees=0 and output=reward+1).
+
+	// Build a coinbase that claims one satoshi more than the block subsidy.
+	buildInflatedBlock := func(height uint32) *Block {
+		t.Helper()
+		coinbaseReward := util.GetBlockSubsidyForHeight(height, params)
+
+		lockingScript, sErr := bscript.NewFromHexString("76a914000000000000000000000000000000000000000088ac")
+		require.NoError(t, sErr)
+		coinbaseTx := bt.NewTx()
+		coinbaseTx.Inputs = append(coinbaseTx.Inputs, &bt.Input{})
+		coinbaseTx.Outputs = append(coinbaseTx.Outputs, &bt.Output{
+			Satoshis:      coinbaseReward + 1, // inflated by 1 satoshi
+			LockingScript: lockingScript,
+		})
+
+		subtree, sErr := subtreepkg.NewTreeByLeafCount(2)
+		require.NoError(t, sErr)
+
+		return &Block{
+			Header:        newTestBlockHeader(t),
+			CoinbaseTx:    coinbaseTx,
+			Height:        height,
+			Subtrees:      []*chainhash.Hash{subtree.RootHash()},
+			SubtreeSlices: []*subtreepkg.Subtree{subtree},
+		}
+	}
+
+	bBelow := buildInflatedBlock(300) // below highest checkpoint (500)
+	require.NoError(t, bBelow.checkBlockRewardAndFees(params), "below checkpoint: fee check must be skipped")
+
+	bAbove := buildInflatedBlock(501) // above highest checkpoint (500)
+	require.Error(t, bAbove.checkBlockRewardAndFees(params), "above checkpoint: fee check must still be enforced")
+}
+
 func TestBlock_CheckDuplicateTransactionsInSubtree(t *testing.T) {
 	t.Run("no duplicates", func(t *testing.T) {
 		blockHeaderBytes, _ := hex.DecodeString(block1Header)
@@ -2163,7 +2263,11 @@ func TestBlock_CheckRewardAndFees_WithHeight(t *testing.T) {
 		coinbase, err := bt.NewTxFromString(CoinbaseHex)
 		require.NoError(t, err)
 
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 800000, 0)
+		// blockHeight (6th arg) must be ABOVE the highest hardcoded mainnet checkpoint:
+		// checkBlockRewardAndFees now skips the reward/no-inflation check at or below the highest
+		// checkpoint (the chain prefix is already certified by the pinned hash). 10_000_000 is safely
+		// above any mainnet checkpoint, so the reward-calculation logic still runs here.
+		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 10_000_000, 0)
 		require.NoError(t, err)
 
 		// Test with a height that triggers the reward calculation logic
