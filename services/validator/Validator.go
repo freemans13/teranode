@@ -729,9 +729,10 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 
 	var utxoHeights []uint32
 
-	// OutpointOnlySpend: skip parent reads entirely. utxoHeights stays nil —
-	// safe because SkipScriptValidation is required on this path, which short-
-	// circuits before BDK/BIP68 consume heights (see TxValidator.go ~151-167).
+	// OutpointOnlySpend: skip parent reads entirely. utxoHeights stays nil.
+	// Safe because (a) SkipScriptValidation short-circuits BDK before it indexes
+	// utxoHeights, and (b) the OutpointOnlySpend guard in validateTransaction's
+	// phase-2 explicitly skips BIP68 (the only remaining utxoHeights consumer).
 	if !validationOptions.OutpointOnlySpend {
 		// check whether the transaction is extended, extend it if not
 		// we also get the block heights of the inputs of the transaction since we are doing a DB lookup
@@ -1750,7 +1751,11 @@ func (v *Validator) validateTransaction(ctx context.Context, tx *bt.Tx, blockHei
 	//    EnsureMTPLoaded call across an entire block of txs validated
 	//    concurrently; policy mode would have to either pay that cost
 	//    per-tx or keep the MTP cache always warm regardless of need.
-	if !validationOptions.SkipPolicyChecks || v.blockchainClient == nil || blockHeight < uint32(v.settings.ChainCfgParams.CSVHeight) {
+	// OutpointOnlySpend (below-checkpoint fast path): BIP68 is a consensus validity
+	// check already certified by the pinned hardcoded checkpoint, and validateInternal
+	// intentionally left utxoHeights empty — so skip BIP68 here (its only consumer of
+	// utxoHeights). Same basis as skipping script validation below checkpoint.
+	if validationOptions.OutpointOnlySpend || !validationOptions.SkipPolicyChecks || v.blockchainClient == nil || blockHeight < uint32(v.settings.ChainCfgParams.CSVHeight) {
 		return nil
 	}
 
