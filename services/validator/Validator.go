@@ -1674,7 +1674,14 @@ func (v *Validator) validateTransaction(ctx context.Context, tx *bt.Tx, blockHei
 
 	// 0) Check whether we have a complete transaction in extended format, with all input information
 	//    we cannot check the satoshi input, OP_RETURN is allowed 0 satoshis
-	if !tx.IsExtended() {
+	//
+	// OutpointOnlySpend (below-checkpoint fast path): the tx is intentionally left
+	// un-extended — validateInternal deliberately skipped the parent read (see ~735).
+	// Do NOT re-extend here: OutpointOnlySpend requires SkipScriptValidation, so BDK
+	// never consumes the extension, BIP68 reads parent heights (not scripts), and the
+	// spend is outpoint-only. Without this guard validateTransaction re-issues the exact
+	// per-parent PreviousOutputsDecorate reads the fast path exists to eliminate.
+	if !validationOptions.OutpointOnlySpend && !tx.IsExtended() {
 		if err := v.extendTransaction(ctx, tx); err != nil {
 			// error is already wrapped in our errors package
 			span.RecordError(err)
