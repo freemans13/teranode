@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -150,7 +151,7 @@ func TestDAHSweepProcDenseHeightMultiPass(t *testing.T) {
 	var minWM int64
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT MIN(last_swept_height) FROM dah_part_watermark`).Scan(&minWM))
-	require.Equal(t, safeTip, minWM)
+	require.Equal(t, safeTip, minWM, "watermark must reach safe tip after dense-height multipass")
 }
 
 // TestDAHSweepProcIdempotentRerun verifies a second sweep over the same range
@@ -202,7 +203,7 @@ func TestDAHSweepProcSkipsWatermarkOnLockContention(t *testing.T) {
 	require.NoError(t, err)
 	holderTx, err := holder.Begin(ctx)
 	require.NoError(t, err)
-	_, err = holderTx.Exec(ctx, `SELECT pg_advisory_xact_lock(20240684 + g) FROM generate_series(0,7) g`)
+	_, err = holderTx.Exec(ctx, fmt.Sprintf(`SELECT pg_advisory_xact_lock(20240684 + g) FROM generate_series(0,%d) g`, numPartitions-1))
 	require.NoError(t, err)
 
 	store.sweepAllPartitionsOnce(ctx, safeTip, ret)

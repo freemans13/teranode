@@ -276,9 +276,9 @@ func isInsufficientPrivilege(err error) bool {
 // runDAHCursorProc drives the server-side dah_sweep_batch() procedure. Each tick
 // it fans one CALL per partition across the 8 partitions IN PARALLEL (recovering
 // the parallelism a single sequential-8-partition CALL lost on a cold-cache disk)
-// via sweepAllPartitionsOnce; each CALL drains time-adaptive windows committing
-// per window. Cadence is driven by the real watermark lag (min across partitions):
-// backlog>0 → drain hard (call again immediately), else idle.
+// via sweepAllPartitionsOnce; each CALL drains row-bounded batches (up to batch_rows
+// stamps per pass), committing per pass. Cadence is driven by the real watermark lag
+// (min across partitions): backlog>0 → drain hard (call again immediately), else idle.
 //
 // The spent-before-mined orphan gap (previously covered by the O(table) keyspace
 // backstop) is now closed by the mine-time stamp (S6) in SetMinedMulti, so no
@@ -380,12 +380,14 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 
 // sweepAllPartitionsOnce fires one dah_sweep_batch() CALL per partition IN
 // PARALLEL and returns the rows stamped this pass (delta of the control row's
-// cumulative counter). Each CALL drains up to max_windows_per_call time-adaptive
-// windows, committing per window, under a generous per-CALL timeout
-// (PostgresDAHSweepCallTimeoutSeconds, default 120s — NOT a tight interval
-// multiple): a cancelled CALL loses at most one uncommitted window and resumes
-// from the per-partition watermark next pass. Per-partition errors are logged, not
-// fatal. Shared by the background cursor and Prune.
+// cumulative counter). Each CALL drains row-bounded batches (up to batch_rows
+// stamps per pass), committing per pass, looping until a pass stamps fewer than
+// batch_rows; a cancelled CALL loses at most one uncommitted pass and resumes
+// from the per-partition watermark next pass — the watermark only advances when
+// the range fully drains. Per-CALL timeout is a generous backstop
+// (PostgresDAHSweepCallTimeoutSeconds, default 120s — NOT a tight per-pass
+// limit). Per-partition errors are logged, not fatal. Shared by the background
+// cursor and Prune.
 func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, retention int32) int64 {
 	callTimeout := time.Duration(s.settings.UtxoStore.PostgresDAHSweepCallTimeoutSeconds) * time.Second
 	if callTimeout <= 0 {
