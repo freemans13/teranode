@@ -14,10 +14,9 @@ import (
 // recreates the procedure whenever the version stored in dah_sweep_control
 // differs (in EITHER direction, so a binary rollback reinstalls the older body).
 //
-// Bumped 8→9: the pending_deletes side-table is now the only pruner path, so the
-// proc body is always the pending_deletes variant. The bump forces a recompile of
-// any procedure installed by an earlier (flag-gated) binary.
-const dahSweepProcVersion = 9
+// Bumped 9→10: row-targeted batching (LIMIT batch_rows on the stamped set,
+// loop-until-short-pass, single watermark advance) replaces the v_step height-window loop.
+const dahSweepProcVersion = 10
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaInternal (plain DDL);
@@ -69,31 +68,25 @@ AS $$
 DECLARE
     v_leaf_suffix    TEXT := lpad(p_partition::text, 2, '0');
     v_from           BIGINT;
-    v_to             BIGINT;
-    v_step           BIGINT;
-    v_max_win        INT;
-    v_per_part_cap   INT;
+    v_max_rows       INT;
     v_enabled        BOOLEAN;
     v_n              BIGINT;
     v_total_stamped  BIGINT := 0;
-    v_windows        INT := 0;
-    v_t0             timestamptz;
-    v_ms             double precision;
+    v_drained        BOOLEAN := false;
 BEGIN
-    SELECT enabled, batch_rows, max_windows_per_call
-      INTO v_enabled, v_per_part_cap, v_max_win
+    SELECT enabled, batch_rows INTO v_enabled, v_max_rows
       FROM dah_sweep_control WHERE id = 1;
 
     IF NOT v_enabled THEN
         RETURN;
     END IF;
 
-    IF current_setting('server_version_num')::int < 110000 THEN
-        RAISE EXCEPTION 'dah_sweep_batch requires PostgreSQL 11+';
+    IF v_max_rows IS NULL OR v_max_rows <= 0 THEN
+        v_max_rows := 5000;
     END IF;
 
-    IF NOT pg_try_advisory_xact_lock(20240684 + p_partition) THEN
-        RETURN;
+    IF current_setting('server_version_num')::int < 110000 THEN
+        RAISE EXCEPTION 'dah_sweep_batch requires PostgreSQL 11+';
     END IF;
 
     SELECT last_swept_height INTO v_from
@@ -104,11 +97,11 @@ BEGIN
         RETURN;
     END IF;
 
-    v_step := 256;
-
-    WHILE v_from < p_safe_tip LOOP
-        EXIT WHEN v_max_win > 0 AND v_windows >= v_max_win;
-
+    -- Row-targeted batches: each pass stamps up to v_max_rows fully-spent-unstamped
+    -- parents over the WHOLE (v_from, p_safe_tip] range. Stamped rows drop out via the
+    -- delete_at_height IS NULL filter, so the qualifying set strictly shrinks each pass.
+    -- The watermark stays at v_from during the loop and advances once at the end.
+    LOOP
         SELECT enabled INTO v_enabled FROM dah_sweep_control WHERE id = 1;
         EXIT WHEN NOT v_enabled;
 
@@ -118,9 +111,6 @@ BEGIN
 
         SET LOCAL enable_seqscan = off;
         SET LOCAL lock_timeout = '5s';
-
-        v_to := LEAST(v_from + v_step, p_safe_tip);
-        v_t0 := clock_timestamp();
 
         EXECUTE format($q$
             WITH candidates AS MATERIALIZED (
@@ -156,13 +146,16 @@ BEGIN
                 FROM eligible e
                 LEFT JOIN spend_agg sa ON sa.hash = e.hash
             ),
+            to_stamp AS MATERIALIZED (
+                SELECT hash, new_dah FROM state WHERE new_dah IS NOT NULL LIMIT $4
+            ),
             upd AS (
                 UPDATE txs_p%1$s t
-                   SET delete_at_height = st.new_dah
-                  FROM state st
-                 WHERE t.hash = st.hash
-                   AND t.delete_at_height IS DISTINCT FROM st.new_dah
-                RETURNING t.hash, st.new_dah AS delete_at_height
+                   SET delete_at_height = ts.new_dah
+                  FROM to_stamp ts
+                 WHERE t.hash = ts.hash
+                   AND t.delete_at_height IS DISTINCT FROM ts.new_dah
+                RETURNING t.hash, ts.new_dah AS delete_at_height
             ),
             ins AS (
                 INSERT INTO pending_deletes_p%1$s (hash, delete_at_height)
@@ -171,31 +164,31 @@ BEGIN
             )
             SELECT count(*) FROM upd
         $q$, v_leaf_suffix)
-        USING v_from, v_to, p_retention
+        USING v_from, p_safe_tip, p_retention, v_max_rows
         INTO v_n;
 
         v_total_stamped := v_total_stamped + v_n;
-
-        UPDATE dah_part_watermark
-           SET last_swept_height = v_to
-         WHERE partition = p_partition AND last_swept_height < v_to;
         COMMIT;
 
-        v_windows := v_windows + 1;
-        v_from    := v_to;
-
-        v_ms := extract(epoch FROM clock_timestamp() - v_t0) * 1000;
-        IF v_ms > 2000 THEN
-            v_step := GREATEST(v_step / 2, 1);
-        ELSIF v_ms < 500 THEN
-            v_step := LEAST(v_step * 2, 4096);
+        IF v_n < v_max_rows THEN
+            v_drained := true;
+            EXIT;
         END IF;
     END LOOP;
 
-    -- Best-effort observability (additive across the 8 partitions).
+    -- Advance the watermark only when the range was genuinely drained (not on
+    -- advisory-lock-miss or kill-switch exit). An empty range still sets v_drained
+    -- (v_n=0 < v_max_rows) so a caught-up partition still marks itself swept.
+    IF v_drained THEN
+        UPDATE dah_part_watermark
+           SET last_swept_height = p_safe_tip
+         WHERE partition = p_partition AND last_swept_height < p_safe_tip;
+    END IF;
+
     UPDATE dah_sweep_control
        SET last_called_at = now(),
-           total_rows_stamped = total_rows_stamped + v_total_stamped
+           total_rows_stamped = total_rows_stamped + v_total_stamped,
+           last_rows_stamped = v_total_stamped
      WHERE id = 1;
     COMMIT;
 END;
@@ -283,9 +276,9 @@ func isInsufficientPrivilege(err error) bool {
 // runDAHCursorProc drives the server-side dah_sweep_batch() procedure. Each tick
 // it fans one CALL per partition across the 8 partitions IN PARALLEL (recovering
 // the parallelism a single sequential-8-partition CALL lost on a cold-cache disk)
-// via sweepAllPartitionsOnce; each CALL drains time-adaptive windows committing
-// per window. Cadence is driven by the real watermark lag (min across partitions):
-// backlog>0 → drain hard (call again immediately), else idle.
+// via sweepAllPartitionsOnce; each CALL drains row-bounded batches (up to batch_rows
+// stamps per pass), committing per pass. Cadence is driven by the real watermark lag
+// (min across partitions): backlog>0 → drain hard (call again immediately), else idle.
 //
 // The spent-before-mined orphan gap (previously covered by the O(table) keyspace
 // backstop) is now closed by the mine-time stamp (S6) in SetMinedMulti, so no
@@ -387,12 +380,14 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 
 // sweepAllPartitionsOnce fires one dah_sweep_batch() CALL per partition IN
 // PARALLEL and returns the rows stamped this pass (delta of the control row's
-// cumulative counter). Each CALL drains up to max_windows_per_call time-adaptive
-// windows, committing per window, under a generous per-CALL timeout
-// (PostgresDAHSweepCallTimeoutSeconds, default 120s — NOT a tight interval
-// multiple): a cancelled CALL loses at most one uncommitted window and resumes
-// from the per-partition watermark next pass. Per-partition errors are logged, not
-// fatal. Shared by the background cursor and Prune.
+// cumulative counter). Each CALL drains row-bounded batches (up to batch_rows
+// stamps per pass), committing per pass, looping until a pass stamps fewer than
+// batch_rows; a cancelled CALL loses at most one uncommitted pass and resumes
+// from the per-partition watermark next pass — the watermark only advances when
+// the range fully drains. Per-CALL timeout is a generous backstop
+// (PostgresDAHSweepCallTimeoutSeconds, default 120s — NOT a tight per-pass
+// limit). Per-partition errors are logged, not fatal. Shared by the background
+// cursor and Prune.
 func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, retention int32) int64 {
 	callTimeout := time.Duration(s.settings.UtxoStore.PostgresDAHSweepCallTimeoutSeconds) * time.Second
 	if callTimeout <= 0 {
