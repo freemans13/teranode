@@ -125,3 +125,59 @@ func TestValidate_OutpointOnlySpend(t *testing.T) {
 	})
 	require.Error(t, err, "competing spender must be rejected after outpoint-only spend committed the first spender")
 }
+
+// TestValidate_OutpointOnlySpend_RequiresSkipScriptValidation verifies that
+// setting OutpointOnlySpend=true without SkipScriptValidation=true returns a
+// clear misconfiguration error before any extend/parent-read work is attempted.
+func TestValidate_OutpointOnlySpend_RequiresSkipScriptValidation(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_misconfig")
+	require.NoError(t, err)
+
+	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+	require.NoError(t, store.SetBlockHeight(500))
+	require.NoError(t, store.SetMedianBlockTime(1700000000))
+
+	// Minimal child tx — contents don't matter; the guard fires before any store access.
+	childTx := bt.NewTx()
+	coinbaseScript, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	require.NoError(t, err)
+	childInput := &bt.Input{
+		PreviousTxOutIndex: 0,
+		SequenceNumber:     0xfffffffe,
+		UnlockingScript:    bscript.NewFromBytes([]byte{0x00}),
+	}
+	zeroHash := new(chainhash.Hash)
+	err = childInput.PreviousTxIDAdd(zeroHash)
+	require.NoError(t, err)
+	childTx.Inputs = append(childTx.Inputs, childInput)
+	childTx.Outputs = append(childTx.Outputs, &bt.Output{
+		Satoshis:      400,
+		LockingScript: coinbaseScript,
+	})
+
+	v := &Validator{
+		logger:      logger,
+		utxoStore:   store,
+		settings:    tSettings,
+		txValidator: NewTxValidator(logger, tSettings),
+		stats:       gocore.NewStat("validator"),
+	}
+
+	// OutpointOnlySpend=true but SkipScriptValidation is left false — misconfiguration.
+	opts := &Options{
+		SkipUtxoCreation:  true,
+		OutpointOnlySpend: true,
+		// SkipScriptValidation intentionally omitted (false)
+	}
+
+	_, err = v.ValidateWithOptions(ctx, childTx, 500, opts)
+	require.Error(t, err, "OutpointOnlySpend without SkipScriptValidation must return an error")
+	require.Contains(t, err.Error(), "OutpointOnlySpend requires SkipScriptValidation")
+}
