@@ -128,6 +128,30 @@ func getIntSlice(key string, defaultValue []int, alternativeContext ...string) [
 	return result
 }
 
+// IsSQLUtxoStore reports whether s is configured for a SQL-backed UTXO store.
+// A nil settings pointer, a nil store URL, or an empty/non-SQL scheme all return false.
+// Only schemes in the explicit allowlist (postgres, postgresql, sqlite, sqlitememory)
+// return true. Everything else — including aerospike and unknown schemes — is treated
+// as non-SQL and returns false (fail-safe: a wrong answer leaves any SQL-gated fast
+// path OFF, not ON). Single source of truth shared by blockvalidation and netsync.
+func IsSQLUtxoStore(s *Settings) bool {
+	if s == nil {
+		return false
+	}
+
+	u := s.UtxoStore.UtxoStore
+	if u == nil {
+		return false
+	}
+
+	switch u.Scheme {
+	case "postgres", "postgresql", "sqlite", "sqlitememory":
+		return true
+	default:
+		return false
+	}
+}
+
 // getPostgresPoolSettings reads service-specific PostgreSQL pool settings.
 // Returns nil if no service-specific settings are configured (will use global defaults).
 // Only returns a PostgresSettings pointer if at least one setting is explicitly configured.
