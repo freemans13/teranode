@@ -115,6 +115,73 @@ func TestDAHSweepProcDrainsWideRangeInOneCall(t *testing.T) {
 	require.Equal(t, safeTip, minWM, "watermark must reach safe tip in one CALL across the wide range")
 }
 
+// TestDAHSweepProcDenseHeightMultiPass pins that a single height holding more
+// fully-spent parents than batch_rows is fully drained by repeated bounded passes
+// within one CALL, and the watermark advances to safe_tip.
+func TestDAHSweepProcDenseHeightMultiPass(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	_, err := store.pool.Exec(ctx, `UPDATE dah_sweep_control SET batch_rows = 2 WHERE id = 1`)
+	require.NoError(t, err)
+
+	const safeTip = int64(110)
+	require.NoError(t, store.SetBlockHeight(uint32(safeTip)))
+	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
+
+	// 7 fully-spent mined parents ALL at the same spend height (105) — well over batch_rows=2.
+	txs := make([]*bt.Tx, 0, 7)
+	for i := 0; i < 7; i++ {
+		tx := newUniqueUnminedTx(t, store)
+		mineTx(t, store, tx, 104)
+		spendAllOutputs(t, store, tx, 105)
+		txs = append(txs, tx)
+	}
+
+	store.sweepAllPartitionsOnce(ctx, safeTip, int32(ret)) //nolint:gosec
+
+	for _, tx := range txs {
+		var dah *int64
+		require.NoError(t, store.pool.QueryRow(ctx,
+			`SELECT delete_at_height FROM txs WHERE hash = $1`, tx.TxIDChainHash()[:]).Scan(&dah))
+		require.NotNil(t, dah, "every fully-spent parent at the dense height must be stamped")
+		require.Equal(t, int64(105)+1+ret, *dah)
+	}
+
+	var minWM int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT MIN(last_swept_height) FROM dah_part_watermark`).Scan(&minWM))
+	require.Equal(t, safeTip, minWM)
+}
+
+// TestDAHSweepProcIdempotentRerun verifies a second sweep over the same range
+// stamps nothing new (already-stamped parents are excluded by delete_at_height IS NULL).
+func TestDAHSweepProcIdempotentRerun(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(uint32(110)))
+	const safeTip = int64(110)
+	ret := int32(store.settings.GetUtxoStoreBlockHeightRetention())
+
+	tx := newUniqueUnminedTx(t, store)
+	mineTx(t, store, tx, 104)
+	spendAllOutputs(t, store, tx, 105)
+
+	store.sweepAllPartitionsOnce(ctx, safeTip, ret)
+
+	var firstTotal int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&firstTotal))
+	require.Positive(t, firstTotal)
+
+	// Rewind the watermark so the same range is re-swept, then sweep again.
+	require.NoError(t, store.RewindDAHWatermark(ctx, 0))
+	store.sweepAllPartitionsOnce(ctx, safeTip, ret)
+
+	var secondTotal int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&secondTotal))
+	require.Equal(t, firstTotal, secondTotal, "re-sweep must stamp nothing new (idempotent)")
+}
+
 // TestDAHSweepProcSkipsWatermarkOnLockContention verifies that when the per-partition
 // advisory lock is held elsewhere, the CALL does NOT advance the watermark (which would
 // silently skip the unswept range). It then releases the lock and confirms a normal sweep
