@@ -114,3 +114,50 @@ func TestDAHSweepProcDrainsWideRangeInOneCall(t *testing.T) {
 		`SELECT MIN(last_swept_height) FROM dah_part_watermark`).Scan(&minWM))
 	require.Equal(t, safeTip, minWM, "watermark must reach safe tip in one CALL across the wide range")
 }
+
+// TestDAHSweepProcSkipsWatermarkOnLockContention verifies that when the per-partition
+// advisory lock is held elsewhere, the CALL does NOT advance the watermark (which would
+// silently skip the unswept range). It then releases the lock and confirms a normal sweep
+// drains and advances.
+func TestDAHSweepProcSkipsWatermarkOnLockContention(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(110))
+	const safeTip = int64(110)
+	ret := int32(store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
+
+	tx := newUniqueUnminedTx(t, store)
+	mineTx(t, store, tx, 104)
+	spendAllOutputs(t, store, tx, 105)
+
+	// Hold all 8 partition advisory locks in a separate connection's open transaction
+	// so every dah_sweep_batch CALL misses pg_try_advisory_xact_lock.
+	holder, err := store.pool.Acquire(ctx)
+	require.NoError(t, err)
+	holderTx, err := holder.Begin(ctx)
+	require.NoError(t, err)
+	_, err = holderTx.Exec(ctx, `SELECT pg_advisory_xact_lock(20240684 + g) FROM generate_series(0,7) g`)
+	require.NoError(t, err)
+
+	store.sweepAllPartitionsOnce(ctx, safeTip, ret)
+
+	var wmDuringContention int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT MAX(last_swept_height) FROM dah_part_watermark`).Scan(&wmDuringContention))
+	require.Equal(t, int64(0), wmDuringContention, "watermark must NOT advance while the lock is held elsewhere")
+
+	// Release the locks, sweep again: now it drains and advances.
+	require.NoError(t, holderTx.Rollback(ctx))
+	holder.Release()
+
+	store.sweepAllPartitionsOnce(ctx, safeTip, ret)
+
+	var dah *int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT delete_at_height FROM txs WHERE hash = $1`, tx.TxIDChainHash()[:]).Scan(&dah))
+	require.NotNil(t, dah, "after lock release the fully-spent parent must be stamped")
+
+	var wmAfter int64
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT MIN(last_swept_height) FROM dah_part_watermark`).Scan(&wmAfter))
+	require.Equal(t, safeTip, wmAfter, "after lock release the watermark must reach safe tip")
+}

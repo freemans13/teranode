@@ -72,6 +72,7 @@ DECLARE
     v_enabled        BOOLEAN;
     v_n              BIGINT;
     v_total_stamped  BIGINT := 0;
+    v_drained        BOOLEAN := false;
 BEGIN
     SELECT enabled, batch_rows INTO v_enabled, v_max_rows
       FROM dah_sweep_control WHERE id = 1;
@@ -169,13 +170,20 @@ BEGIN
         v_total_stamped := v_total_stamped + v_n;
         COMMIT;
 
-        EXIT WHEN v_n < v_max_rows;
+        IF v_n < v_max_rows THEN
+            v_drained := true;
+            EXIT;
+        END IF;
     END LOOP;
 
-    -- Range fully drained: advance the watermark once.
-    UPDATE dah_part_watermark
-       SET last_swept_height = p_safe_tip
-     WHERE partition = p_partition AND last_swept_height < p_safe_tip;
+    -- Advance the watermark only when the range was genuinely drained (not on
+    -- advisory-lock-miss or kill-switch exit). An empty range still sets v_drained
+    -- (v_n=0 < v_max_rows) so a caught-up partition still marks itself swept.
+    IF v_drained THEN
+        UPDATE dah_part_watermark
+           SET last_swept_height = p_safe_tip
+         WHERE partition = p_partition AND last_swept_height < p_safe_tip;
+    END IF;
 
     UPDATE dah_sweep_control
        SET last_called_at = now(),
