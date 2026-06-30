@@ -25,6 +25,7 @@ type batchSpendItem struct {
 	errCh             chan error
 	ignoreConflicting bool
 	ignoreLocked      bool
+	skipUTXOHashCheck bool
 }
 
 // voutToInt32 guards the uint32 → INT4 narrowing at the point a vout enters a
@@ -100,6 +101,38 @@ inserted AS (
 SELECT 1 FROM inserted
 `
 
+// spendValidationSQLNoHash is identical to spendValidationSQL except the
+// utxo_hash comparison predicate ("v.utxo_hash = $4 AND") is omitted and
+// parameters are renumbered accordingly: $4=blockHeight, $5=ignoreLocked,
+// $6=ignoreConflicting. Used for the below-checkpoint outpoint-only fast path
+// (IgnoreFlags.SkipUTXOHashCheck=true) where the caller has no parent scripts
+// to derive the UTXO hash from. Every other guard — output_spendable, frozen,
+// locked, conflicting, coinbase maturity, spendable_in, and the ON CONFLICT
+// double-spend barrier — is kept intact.
+const spendValidationSQLNoHash = `
+WITH validation AS (
+    SELECT
+        (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1) AS output_frozen,
+        (t.out_spendables IS NOT NULL AND get_bit(t.out_spendables, $2::int) = 1) AS output_spendable,
+        t.coinbase_spending_height AS coinbase_spending_height,
+        CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END AS spendable_in,
+        t.locked AS tx_locked, t.conflicting AS tx_conflicting, t.frozen AS tx_frozen
+    FROM txs t
+    WHERE t.hash = $1 AND $2::int < t.out_count
+),
+inserted AS (
+    INSERT INTO spends (prev_tx_hash, prev_output_idx, spending_data, spent_at_height)
+    SELECT $1, $2, $3, $4 FROM validation v
+    WHERE v.output_spendable AND NOT v.output_frozen AND NOT v.tx_frozen
+      AND ($5 OR NOT v.tx_locked) AND ($6 OR NOT v.tx_conflicting)
+      AND NOT (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > $4)
+      AND NOT (COALESCE(v.spendable_in, 0) > 0 AND $4 < COALESCE(v.spendable_in, 0))
+    ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING
+    RETURNING prev_tx_hash
+)
+SELECT 1 FROM inserted
+`
+
 // spendDiagnosticSQL re-queries when the validation INSERT returned 0 rows so
 // we can determine the exact reason the spend failed.
 //
@@ -138,8 +171,15 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
 	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
+	useSkip := len(ignoreFlags) > 0 && ignoreFlags[0].SkipUTXOHashCheck
 
-	spends, err := utxo.GetSpends(tx)
+	var spends []*utxo.Spend
+	var err error
+	if useSkip {
+		spends, err = utxo.GetSpendsOutpointOnly(tx)
+	} else {
+		spends, err = utxo.GetSpends(tx)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -160,10 +200,10 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	}
 
 	if s.spendBatcher != nil {
-		return s.spendBatched(ctx, tx, spends, blockHeight, useIgnoreLocked, useIgnoreConflicting)
+		return s.spendBatched(ctx, tx, spends, blockHeight, useIgnoreLocked, useIgnoreConflicting, useSkip)
 	}
 
-	return s.spendDirect(ctx, spends, blockHeight, useIgnoreLocked, useIgnoreConflicting)
+	return s.spendDirect(ctx, spends, blockHeight, useIgnoreLocked, useIgnoreConflicting, useSkip)
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +223,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 //
 // The wait is bounded by SpendWaitTimeout (parity with sql/aerospike) so a stalled
 // batcher cannot block a caller whose ctx carries no deadline.
-func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spend, blockHeight uint32, ignoreLocked, ignoreConflicting bool) ([]*utxo.Spend, error) {
+func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spend, blockHeight uint32, ignoreLocked, ignoreConflicting, skipUTXOHashCheck bool) ([]*utxo.Spend, error) {
 	spentSpends := make([]*utxo.Spend, 0, len(spends))
 
 	// Bound the wait so a stalled batcher cannot hang a deadline-less caller. This
@@ -210,6 +250,7 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 			errCh:             errCh,
 			ignoreConflicting: ignoreConflicting,
 			ignoreLocked:      ignoreLocked,
+			skipUTXOHashCheck: skipUTXOHashCheck,
 		})
 	}
 
@@ -275,7 +316,7 @@ func (s *Store) spendBatched(ctx context.Context, tx *bt.Tx, spends []*utxo.Spen
 // spendDirect — per-input validation CTE (no batcher)
 // ---------------------------------------------------------------------------
 
-func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeight uint32, ignoreLocked, ignoreConflicting bool) ([]*utxo.Spend, error) {
+func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeight uint32, ignoreLocked, ignoreConflicting, skipUTXOHashCheck bool) ([]*utxo.Spend, error) {
 	spentSpends := make([]*utxo.Spend, 0, len(spends))
 
 	for idx, spend := range spends {
@@ -287,16 +328,31 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 		inputStart := time.Now()
 
 		// Try the atomic INSERT with validation CTE.
+		// When skipUTXOHashCheck is set, use the NoHash variant which omits the
+		// utxo_hash predicate and uses renumbered parameters ($4=blockHeight,
+		// $5=ignoreLocked, $6=ignoreConflicting).
 		var inserted int
-		err := s.pool.QueryRow(ctx, spendValidationSQL,
-			spend.TxID[:],      // $1 prev_tx_hash
-			int32(spend.Vout),  // $2 prev_output_idx (INT4; range-checked in Spend)
-			spendingDataBytes,  // $3 spending_data
-			spend.UTXOHash[:],  // $4 expected_utxo_hash
-			int32(blockHeight), // $5 blockHeight (also written to INT4 spent_at_height)
-			ignoreLocked,       // $6 ignoreLocked
-			ignoreConflicting,  // $7 ignoreConflicting
-		).Scan(&inserted)
+		var err error
+		if skipUTXOHashCheck {
+			err = s.pool.QueryRow(ctx, spendValidationSQLNoHash,
+				spend.TxID[:],      // $1 prev_tx_hash
+				int32(spend.Vout),  // $2 prev_output_idx (INT4; range-checked in Spend)
+				spendingDataBytes,  // $3 spending_data
+				int32(blockHeight), // $4 blockHeight (also written to INT4 spent_at_height)
+				ignoreLocked,       // $5 ignoreLocked
+				ignoreConflicting,  // $6 ignoreConflicting
+			).Scan(&inserted)
+		} else {
+			err = s.pool.QueryRow(ctx, spendValidationSQL,
+				spend.TxID[:],      // $1 prev_tx_hash
+				int32(spend.Vout),  // $2 prev_output_idx (INT4; range-checked in Spend)
+				spendingDataBytes,  // $3 spending_data
+				spend.UTXOHash[:],  // $4 expected_utxo_hash
+				int32(blockHeight), // $5 blockHeight (also written to INT4 spent_at_height)
+				ignoreLocked,       // $6 ignoreLocked
+				ignoreConflicting,  // $7 ignoreConflicting
+			).Scan(&inserted)
+		}
 
 		if prometheusDirectSpendDuration != nil {
 			prometheusDirectSpendDuration.Observe(time.Since(inputStart).Seconds())
@@ -313,7 +369,7 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 		}
 
 		// INSERT returned 0 rows — run diagnostic query.
-		diagErr := s.diagnoseSpendFailure(ctx, spend, spendingDataBytes, blockHeight, ignoreLocked, ignoreConflicting)
+		diagErr := s.diagnoseSpendFailure(ctx, spend, spendingDataBytes, blockHeight, ignoreLocked, ignoreConflicting, skipUTXOHashCheck)
 		if diagErr == nil {
 			spentSpends = append(spentSpends, spend)
 			continue
@@ -394,11 +450,20 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	if len(batch) == 1 {
 		item := batch[0]
 		var inserted int
-		err := s.pool.QueryRow(ctx, spendValidationSQL,
-			item.spend.TxID[:], int32(item.spend.Vout),
-			item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:],
-			int32(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
-		).Scan(&inserted)
+		var err error
+		if item.skipUTXOHashCheck {
+			err = s.pool.QueryRow(ctx, spendValidationSQLNoHash,
+				item.spend.TxID[:], int32(item.spend.Vout),
+				item.spend.SpendingData.Bytes(),
+				int32(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
+			).Scan(&inserted)
+		} else {
+			err = s.pool.QueryRow(ctx, spendValidationSQL,
+				item.spend.TxID[:], int32(item.spend.Vout),
+				item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:],
+				int32(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
+			).Scan(&inserted)
+		}
 		if err == nil {
 			item.errCh <- nil
 			return false
@@ -408,7 +473,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 			return false
 		}
 		diagErr := s.diagnoseSpendFailure(ctx, item.spend, item.spend.SpendingData.Bytes(),
-			item.blockHeight, item.ignoreLocked, item.ignoreConflicting)
+			item.blockHeight, item.ignoreLocked, item.ignoreConflicting, item.skipUTXOHashCheck)
 		if diagErr == nil {
 			item.errCh <- nil
 		} else {
@@ -437,6 +502,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 	ignLockeds := make([]bool, len(batch))
 	ignConflictings := make([]bool, len(batch))
 	batchIdxs := make([]int32, len(batch))
+	skipHashChecks := make([]bool, len(batch)) // per-row SkipUTXOHashCheck flag ($9)
 
 	for i, item := range batch {
 		prevTxHashes[i] = item.spend.TxID[:]
@@ -447,11 +513,12 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		ignLockeds[i] = item.ignoreLocked
 		ignConflictings[i] = item.ignoreConflicting
 		batchIdxs[i] = int32(i)
+		skipHashChecks[i] = item.skipUTXOHashCheck
 	}
 
 	rows, err := conn.Query(ctx, bulkSpendSQL,
 		prevTxHashes, prevIdxs, spendingDatas, utxoHashes,
-		blockHeights, ignLockeds, ignConflictings, batchIdxs,
+		blockHeights, ignLockeds, ignConflictings, batchIdxs, skipHashChecks,
 	)
 	if err != nil {
 		for _, item := range batch {
@@ -550,7 +617,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 			// existing spending_data to differentiate idempotent retry vs
 			// double-spend with a different spender.
 			diagErr := s.diagnoseSpendFailure(ctx, item.spend, item.spend.SpendingData.Bytes(),
-				item.blockHeight, item.ignoreLocked, item.ignoreConflicting)
+				item.blockHeight, item.ignoreLocked, item.ignoreConflicting, item.skipUTXOHashCheck)
 			if diagErr == nil {
 				item.errCh <- nil // idempotent retry — same spender
 			} else {
@@ -576,6 +643,12 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 //   - no row in resultMap → TxNotFound (tx missing)
 //   - row exists, slot_exists=false → TxNotFound (OOB index)
 //   - row exists, !utxo_match → UtxoHashMismatch (wrong UTXO hash)
+//
+// $9 (skip_hash[]) carries the per-row IgnoreFlags.SkipUTXOHashCheck flag.
+// When skip_hash is true for a row the utxo_hash = expected_utxo_hash predicate
+// is bypassed in to_insert and utxo_match is reported as true; all other guards
+// (double-spend ON CONFLICT, output_spendable, frozen, locked, conflicting,
+// coinbase maturity) remain enforced regardless.
 const bulkSpendSQL = `
 WITH items AS (
     SELECT unnest($1::bytea[])   AS prev_tx_hash,
@@ -585,11 +658,12 @@ WITH items AS (
            unnest($5::int[])     AS block_height,
            unnest($6::boolean[]) AS ign_locked,
            unnest($7::boolean[]) AS ign_conflicting,
-           unnest($8::int[])     AS batch_idx
+           unnest($8::int[])     AS batch_idx,
+           unnest($9::boolean[]) AS skip_hash
 ),
 validated AS (
     SELECT i.batch_idx, i.prev_tx_hash, i.prev_idx, i.spending_data, i.expected_utxo_hash,
-           i.block_height, i.ign_locked, i.ign_conflicting,
+           i.block_height, i.ign_locked, i.ign_conflicting, i.skip_hash,
            CASE WHEN i.prev_idx::int < t.out_count THEN substr(t.utxo_hashes, i.prev_idx::int * 32 + 1, 32) END AS utxo_hash,
            CASE WHEN i.prev_idx::int < t.out_count AND t.out_frozens IS NOT NULL THEN get_bit(t.out_frozens, i.prev_idx::int) = 1 ELSE false END AS out_frozen,
            -- Spendable bit: a non-spendable output (OP_RETURN) carries a utxo_hash but
@@ -602,7 +676,7 @@ validated AS (
 ),
 to_insert AS (
     SELECT prev_tx_hash, prev_idx, spending_data, block_height, batch_idx FROM validated
-    WHERE utxo_hash = expected_utxo_hash AND out_spendable AND NOT out_frozen AND NOT tx_frozen
+    WHERE (skip_hash OR utxo_hash = expected_utxo_hash) AND out_spendable AND NOT out_frozen AND NOT tx_frozen
       AND (ign_locked OR NOT tx_locked) AND (ign_conflicting OR NOT tx_conflicting)
       -- coinbase_spending_height is the FIRST spendable height (inclusive): a spend
       -- at exactly that height is valid, so immaturity is strictly >. Do not use >=.
@@ -617,7 +691,7 @@ inserted AS (
 )
 SELECT v.batch_idx, (i.prev_tx_hash IS NOT NULL) AS inserted,
        v.out_frozen, v.tx_frozen, v.tx_locked, v.tx_conflicting,
-       (v.utxo_hash IS NOT NULL AND v.utxo_hash = v.expected_utxo_hash) AS utxo_match,
+       (v.skip_hash OR (v.utxo_hash IS NOT NULL AND v.utxo_hash = v.expected_utxo_hash)) AS utxo_match,
        (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > v.block_height) AS coinbase_block,
        (COALESCE(v.spendable_in,0) > 0 AND v.block_height < COALESCE(v.spendable_in,0)) AS spendable_block,
        (v.utxo_hash IS NOT NULL) AS slot_exists,
@@ -627,9 +701,10 @@ ORDER BY v.batch_idx
 `
 
 // diagnoseSpendFailure queries the output + txs + spends to determine
-// why a spend INSERT failed.
+// why a spend INSERT failed. skipUTXOHashCheck suppresses the hash mismatch
+// check for the below-checkpoint outpoint-only fast path.
 func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spendingDataBytes []byte,
-	blockHeight uint32, ignoreLocked, ignoreConflicting bool) error {
+	blockHeight uint32, ignoreLocked, ignoreConflicting, skipUTXOHashCheck bool) error {
 
 	var (
 		utxoHashBytes          []byte
@@ -692,8 +767,8 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 		return errors.NewTxConflictingError("[Spend] tx is conflicting for %s:%d", spend.TxID, spend.Vout)
 	}
 
-	// Check UTXO hash mismatch.
-	if !bytes.Equal(utxoHashBytes, spend.UTXOHash[:]) {
+	// Check UTXO hash mismatch (skipped on below-checkpoint outpoint-only path).
+	if !skipUTXOHashCheck && !bytes.Equal(utxoHashBytes, spend.UTXOHash[:]) {
 		return errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 	}
 
