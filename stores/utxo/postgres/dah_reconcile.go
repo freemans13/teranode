@@ -144,15 +144,17 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 			ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
 		)
 		SELECT (SELECT count(*) FROM upd),
+		       (SELECT min(hash) FROM upd),
 		       (SELECT max(hash) FROM slice_txs),
 		       (SELECT count(*) FROM slice_txs)
 	`, suffix)
 
 	var corrected int64
+	var sampleCorrectedHash []byte
 	var maxHash []byte
 	var seen int64
 	if err := s.maint().QueryRow(ctx, query, cursor, slice, safeTip, retention).
-		Scan(&corrected, &maxHash, &seen); err != nil {
+		Scan(&corrected, &sampleCorrectedHash, &maxHash, &seen); err != nil {
 		return 0, errors.NewStorageError("[dahReconcile] partition %d audit pass", partition, err)
 	}
 
@@ -172,11 +174,11 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 	}
 
 	if corrected > 0 {
-		// Log the drift with a small sample (first corrected hash) so a persistent
+		// Log the drift with a small sample (one actually-corrected hash) so a persistent
 		// counter bug is visible in ops without dumping every row.
 		sample := ""
-		if maxHash != nil {
-			sample = hex.EncodeToString(maxHash)
+		if sampleCorrectedHash != nil {
+			sample = hex.EncodeToString(sampleCorrectedHash)
 		}
 		s.logger.Warnf("[dahReconcile] partition %d corrected %d drifted spent_progress row(s) (slice=%d, sample hash≈%s)",
 			partition, corrected, slice, sample)
