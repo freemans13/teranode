@@ -29,6 +29,8 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -728,4 +730,148 @@ func TestRunAgedFanoutLag_Wiring(t *testing.T) {
 
 	res := runAgedFanoutLag(t, store, envInt("THROUGHPUT_WORKERS", 1000), cfg, statPool)
 	require.NotEmpty(t, res.Samples, "sampler must record at least one backlog sample")
+}
+
+// ---------------------------------------------------------------------------
+// assertDiskBound: guard that the Postgres cluster is the disk-bound instance
+// (shared_buffers=256MB on :5439). The lag bench only diverges on the current
+// design when the working set exceeds shared_buffers — so running against a
+// 16GB-buffered cluster produces misleading PASS results.
+// ---------------------------------------------------------------------------
+
+// assertDiskBound fails the test if the connected Postgres instance has
+// shared_buffers > 512MB. This guards against accidentally running the lag
+// assertion test against a large-buffer cluster where the current design
+// doesn't diverge (working set fits in cache so sweep keeps pace).
+func assertDiskBound(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, throughputDSN)
+	if err != nil {
+		t.Skipf("assertDiskBound: no postgres: %v", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Skipf("assertDiskBound: no postgres: %v", err)
+	}
+
+	var sharedBuffers string
+	if err := pool.QueryRow(ctx, `SHOW shared_buffers`).Scan(&sharedBuffers); err != nil {
+		t.Fatalf("assertDiskBound: SHOW shared_buffers: %v", err)
+	}
+
+	// Parse "256MB", "512MB", "1GB", "2GB", etc. into bytes.
+	parsed := parsePostgresMem(sharedBuffers)
+	const limit512MB = 512 * 1024 * 1024
+	if parsed > limit512MB {
+		t.Fatalf("assertDiskBound: shared_buffers=%s (%d bytes) > 512MB — "+
+			"run against the disk-bound cluster (THROUGHPUT_DSN=postgres://teranode:teranode@localhost:5439/teranode_test); "+
+			"a large-buffer cluster masks the DAH-set lag divergence",
+			sharedBuffers, parsed)
+	}
+	t.Logf("assertDiskBound: shared_buffers=%s (OK, <= 512MB)", sharedBuffers)
+}
+
+// parsePostgresMem parses a Postgres GUC memory value (e.g. "256MB", "1GB",
+// "512kB") into bytes. Returns 0 for unrecognised formats (caller checks > 0).
+func parsePostgresMem(s string) int64 {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 {
+		return 0
+	}
+	// suffix detection: last two chars (kB, MB, GB, TB) or single char (B)
+	switch {
+	case strings.HasSuffix(s, "TB"):
+		n, _ := strconv.ParseInt(strings.TrimSuffix(s, "TB"), 10, 64)
+		return n * 1024 * 1024 * 1024 * 1024
+	case strings.HasSuffix(s, "GB"):
+		n, _ := strconv.ParseInt(strings.TrimSuffix(s, "GB"), 10, 64)
+		return n * 1024 * 1024 * 1024
+	case strings.HasSuffix(s, "MB"):
+		n, _ := strconv.ParseInt(strings.TrimSuffix(s, "MB"), 10, 64)
+		return n * 1024 * 1024
+	case strings.HasSuffix(s, "kB"):
+		n, _ := strconv.ParseInt(strings.TrimSuffix(s, "kB"), 10, 64)
+		return n * 1024
+	case strings.HasSuffix(s, "B"):
+		n, _ := strconv.ParseInt(strings.TrimSuffix(s, "B"), 10, 64)
+		return n
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// TestThroughput_QueueStoreAgedFanoutLag — the RED gate
+// ---------------------------------------------------------------------------
+//
+// INTENT: prove that the CURRENT (unfixed) deferred-DAH design fails to keep
+// up with un-throttled aged-fan-out ingestion. This test is expected to FAIL
+// on today's code. It will be turned green by a later task (Setter C/B) that
+// replaces the per-tx re-aggregation with a bounded design.
+//
+// REPRODUCTION CONFIG (confirmed RED, 2026-07-01, two runs):
+//
+//	THROUGHPUT_DSN=postgres://teranode:teranode@localhost:5439/teranode_test
+//	THROUGHPUT_WORKERS=2000
+//	AGED_PARENTS=5000
+//	AGE_SPAN=3000
+//	BACKLOG_BOUND=2000       # default
+//	AGED_FANOUT_K=64         # default
+//
+//	Command:
+//	  THROUGHPUT_WORKERS=2000 THROUGHPUT_DSN=postgres://teranode:teranode@localhost:5439/teranode_test \
+//	    AGED_PARENTS=5000 AGE_SPAN=3000 \
+//	    go test ./stores/utxo/ -run TestThroughput_QueueStoreAgedFanoutLag -v -timeout 40m
+//
+//	Seed phase: ~76s (5000 parents x 64 outputs x 62 historical spends = 310K spends)
+//	Total runtime: ~106s (seed 76s + measure 30s)
+//
+// OBSERVED FAILING NUMBERS (two runs, both consistent):
+//
+//		Run 1: maxBacklog=2918 startBacklog=2906 endBacklog=4 medStampRate=0 medCreateRate=27663
+//		Run 2: maxBacklog=2918 startBacklog=2906 endBacklog=3  medStampRate=0 medCreateRate=27802
+//
+//	  - maxBacklog=2918 (> bound of 2000): backlog diverges during timed phase
+//	  - startBacklog=2906: already high when miners drain seeded txs at tipStart
+//	  - endBacklog=3-4: sweep eventually catches up but only after blowing past the bound
+//	  - medStampRate=0: sweep stamps nothing at the measurement window median
+//	  - medCreateRate=27663-27802: workers create at ~27K ops/s; sweep cannot keep pace
+//
+// WHY THE MECHANISM WORKS: seeded parents have k-2=62 historical spends each.
+// When the timed phase spends vout k-2 or k-1, the deferred-DAH proc must
+// re-aggregate ALL 62 historical spends + the new one per parent. At 2000
+// workers across a 5000-parent pool, the sweep cursor processes each parent's
+// full spend history on every pass — O(k * activeParents) cost per sweep cycle.
+//
+// ASSERTIONS THAT FAIL:
+//  1. res.MaxBacklog (2918) <= backlogBound (2000) — trips first
+//  3. res.MedStampRate (0) >= res.MedCreateRate (27663-27802) — also fails
+//
+// PG SETUP:
+//   - Port :5439
+//   - shared_buffers=256MB  (disk-bound cluster; larger buffer masks the failure)
+//   - No extra tuning beyond stock Postgres defaults
+//
+// This test is committed RED intentionally. CI skips it (THROUGHPUT_WORKERS unset).
+func TestThroughput_QueueStoreAgedFanoutLag(t *testing.T) {
+	if os.Getenv("THROUGHPUT_WORKERS") == "" {
+		t.Skip("set THROUGHPUT_WORKERS to run")
+	}
+
+	assertDiskBound(t)
+
+	store, done := newPrunedQueueStore(t)
+	defer done()
+
+	statPool := mustStatPool(t)
+
+	res := runAgedFanoutLag(t, store, envInt("THROUGHPUT_WORKERS", 5000), stableCfg{}, statPool)
+
+	t.Logf("maxBacklog=%d start=%d end=%d medStamp=%.0f medCreate=%.0f",
+		res.MaxBacklog, res.StartBacklog, res.EndBacklog, res.MedStampRate, res.MedCreateRate)
+
+	require.LessOrEqual(t, res.MaxBacklog, int64(backlogBound), "DAH-set lag must stay bounded")
+	require.LessOrEqual(t, res.EndBacklog, res.StartBacklog, "backlog must not grow monotonically")
+	require.GreaterOrEqual(t, res.MedStampRate, res.MedCreateRate, "setter must keep pace with creation")
+	require.Positive(t, res.MedStampRate, "must actually be stamping (guards a no-op false pass)")
 }
