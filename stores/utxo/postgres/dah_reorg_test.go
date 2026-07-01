@@ -122,10 +122,14 @@ func TestUnspendDecrementsSpentProgressExactlyOne(t *testing.T) {
 // TestUnspendNonOwningDoesNotDecrement pins that a non-owning (mismatched
 // SpendingData) Unspend deletes 0 rows and therefore does NOT decrement
 // spent_progress — the live spend row and its counter contribution are untouched.
-// Over-decrement here would cause premature pruning (live-UTXO loss).
+// Over-decrement here would cause premature pruning (live-UTXO loss). However,
+// the parent's delete_at_height MUST STILL BE CLEARED by the non-owning call,
+// consistent with the DAH housekeeping that unconditionally clears the stamp for
+// all affected parents (even if the spend deletion was a no-op).
 func TestUnspendNonOwningDoesNotDecrement(t *testing.T) {
 	store, ctx := setupTestStore(t)
 	require.NoError(t, store.SetBlockHeight(110))
+	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
 
 	parent := newMinedSingleOutputTx(t, store, 100)
 	_ = spendVoutOwned(t, store, parent, 0, 101)
@@ -134,6 +138,9 @@ func TestUnspendNonOwningDoesNotDecrement(t *testing.T) {
 	_, err := procSweepUpTo(store, ctx, 110)
 	require.NoError(t, err)
 	require.Equal(t, 2, spentProgressOfTx(t, store, ctx, parent))
+	dah := dahOfTx(t, store, ctx, parent)
+	require.NotNil(t, dah, "fully-spent mined parent must be stamped before non-owning Unspend")
+	require.Equal(t, int64(101)+1+ret, *dah)
 
 	// A non-owning Unspend: correct outpoint but WRONG spending_data token. It must
 	// delete 0 rows and leave spent_progress at 2.
@@ -150,6 +157,15 @@ func TestUnspendNonOwningDoesNotDecrement(t *testing.T) {
 		`SELECT count(*) FROM spends WHERE prev_tx_hash=$1 AND prev_output_idx=0`,
 		parent.TxIDChainHash()[:]).Scan(&stillThere))
 	require.Equal(t, 1, stillThere, "the live owned spend row must survive a non-owning Unspend")
+
+	// However, the parent's delete_at_height MUST be cleared by the non-owning call.
+	// The DAH housekeeping in Unspend (line 839-856 of spend.go) runs for EVERY
+	// affected parent, including non-owning no-op deletes, so any stale stamp is
+	// cleared in the same transaction as the spend deletion. A future regression
+	// (making the clear conditional on owning rows) would leave a live tx carrying
+	// a prunable stamp — live-UTXO loss — and should be caught here.
+	require.Nil(t, dahOfTx(t, store, ctx, parent),
+		"non-owning Unspend must still clear delete_at_height (DAH housekeeping is unconditional)")
 }
 
 // TestUnspendSingleSpendableDecrementsByOne asserts the single-output happy path:
