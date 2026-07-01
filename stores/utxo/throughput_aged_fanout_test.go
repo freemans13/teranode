@@ -434,7 +434,8 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 				ph := parent.TxIDChainHash()
 				select {
 				case mineCh <- *ph:
-				case <-ctx.Done():
+				case <-driverCtx.Done():
+					return
 				}
 
 				// Spend k-2 of the k outputs at heights scattered across
@@ -454,7 +455,8 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 					ch := child.TxIDChainHash()
 					select {
 					case mineCh <- *ch:
-					case <-ctx.Done():
+					case <-driverCtx.Done():
+						return
 					}
 				}
 			}()
@@ -516,18 +518,16 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 
 					// (b) Spend one of the two remaining unspent vouts of a seeded parent.
 					// Round-robin across seededParents so all are exercised.
-					idx := int(seededIdx.Add(1)) % nParents
+					n := seededIdx.Add(1)
+					idx := int(n) % nParents
 					sParent := seededParents[idx]
 					if sParent == nil {
 						continue
 					}
 					vouts := seededUnspentVouts[idx]
 					// Alternate between the two remaining vouts per parent
-					// (use the low bit of seededIdx to pick vout 0 or 1).
-					vout := vouts[0]
-					if seededIdx.Load()%2 == 0 {
-						vout = vouts[1]
-					}
+					// (use the low bit of the atomically-incremented counter to pick vout 0 or 1).
+					vout := vouts[n%2]
 					spendChild := makeSpendOfVout(sParent, vout)
 					if _, sErr := store.Spend(ctx, spendChild, h); sErr != nil {
 						// Duplicate spend or already spent — skip quietly.
@@ -554,6 +554,7 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 	// -----------------------------------------------------------------------
 	var samples []lagSample
 	var samplesMu sync.Mutex
+	samplerResetCh := make(chan struct{}, 1)
 
 	samplerCtx, stopSampler := context.WithCancel(driverCtx)
 	var samplerWG sync.WaitGroup
@@ -572,6 +573,10 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 			select {
 			case <-samplerCtx.Done():
 				return
+			case <-samplerResetCh:
+				// Reset baselines at warmup→measured transition.
+				_ = statPool.QueryRow(samplerCtx, `SELECT COALESCE(total_rows_stamped,0) FROM dah_sweep_control WHERE id = 1`).Scan(&prevStamped)
+				prevCreated = createdOps.Load()
 			case now := <-tk.C:
 				tip := curH.Load()
 
@@ -607,9 +612,16 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 		runTimedPhase(cfg.warmup)
 	}
 	// Clear samples collected during warmup so result only covers the measured phase.
+	// Also reset the sampler's baseline counters so the first measured sample has a
+	// correct delta from the warmup→measured boundary.
 	samplesMu.Lock()
 	samples = samples[:0]
 	samplesMu.Unlock()
+	// Signal sampler to reset its baselines (via a channel in samplerResetCh).
+	select {
+	case samplerResetCh <- struct{}{}:
+	case <-driverCtx.Done():
+	}
 
 	// Measured phase.
 	if cfg.measure > 0 {
