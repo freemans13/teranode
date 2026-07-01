@@ -784,10 +784,51 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		// Ownership-checked delete: the spending_data predicate ensures only this
 		// caller's spend row is removed. A mismatching (non-owning) caller deletes
 		// 0 rows — intentional — but still drives the parent's DAH housekeeping.
-		if _, err := pgxTx.Exec(ctx,
-			`DELETE FROM spends WHERE prev_tx_hash = $1 AND prev_output_idx = $2 AND spending_data = $3`,
+		//
+		// Setter-C reconcile (Task 7): the delete must DECREMENT the parent's
+		// spent_progress counter by exactly the number of OWNED, SPENDABLE spend
+		// rows it actually removed. The DELETE ... RETURNING yields (prev_tx_hash,
+		// prev_output_idx) for the row(s) removed (0 rows for a non-owning no-op, so
+		// no decrement — over-decrement would cause premature pruning / live-UTXO
+		// loss). The removed outpoint is joined back to txs.out_count / out_spendables
+		// so ONLY a spendable output contributes to the decrement, mirroring EXACTLY
+		// the spendable-output filter the fold-forward sweep proc (dah_sweep_proc.go)
+		// used when it INCREMENTED the counter. A non-spendable outpoint (never
+		// folded) therefore never decrements — under-decrement (leak) is likewise
+		// avoided. GREATEST(spent_progress - n, 0) floors at 0 defensively so a
+		// double-Unspend can never drive the counter negative.
+		//
+		// last_spend_height is deliberately LEFT UNCHANGED here (see the Unspend doc
+		// comment): it only ever raises the completion height, the stamp is re-gated
+		// by spent_progress = spendable_count, so a stale-high value on a
+		// no-longer-fully-spent tx is harmless (delete_at_height is cleared below and
+		// cannot re-stamp until the counter re-completes, at which point the fold
+		// re-advances last_spend_height via GREATEST to the new spend height).
+		var n int
+		err := pgxTx.QueryRow(ctx, `
+			WITH del AS (
+				DELETE FROM spends
+				WHERE prev_tx_hash = $1 AND prev_output_idx = $2 AND spending_data = $3
+				RETURNING prev_tx_hash, prev_output_idx
+			),
+			spendable AS (
+				SELECT count(*) AS n
+				FROM del d
+				JOIN txs t ON t.hash = d.prev_tx_hash
+				WHERE d.prev_output_idx < t.out_count
+				  AND t.out_spendables IS NOT NULL
+				  AND get_bit(t.out_spendables, d.prev_output_idx) = 1
+			),
+			upd AS (
+				UPDATE txs t
+				   SET spent_progress = GREATEST(t.spent_progress - (SELECT n FROM spendable), 0)
+				  FROM spendable s
+				 WHERE t.hash = $1 AND s.n > 0
+			)
+			SELECT COALESCE((SELECT n FROM spendable), 0)`,
 			spend.TxID[:], int32(spend.Vout), spend.SpendingData.Bytes(),
-		); err != nil {
+		).Scan(&n)
+		if err != nil {
 			return errors.NewStorageError("[Unspend] failed for %s:%d", spend.TxID, spend.Vout, err)
 		}
 		if spend.TxID != nil {
@@ -799,7 +840,9 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 	// carry is now invalid. Clear it in the SAME transaction as the spend deletion
 	// (the reorg-clear) so the pruner can never see a deleted-spend / stale-DAH
 	// torn state. Housekeeping runs for every affected parent, including the
-	// non-owning no-op deletes above.
+	// non-owning no-op deletes above. (The spent_progress decrement above is
+	// per-spend; this DAH clear is per-parent — a parent with a partly-decremented
+	// counter is no longer fully spent, so clearing its stamp is always correct.)
 	if len(parentSet) > 0 {
 		parentHashes := make([][]byte, 0, len(parentSet))
 		for h := range parentSet {
