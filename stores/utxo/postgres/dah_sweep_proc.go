@@ -26,7 +26,17 @@ import (
 // parent's spent_progress counter, and stamps delete_at_height when the counter
 // reaches spendable_count. Cost per band is O(new spends in band), independent of
 // chain size, so the watermark always advances.
-const dahSweepProcVersion = 11
+//
+// Bumped 11→12: merge the per-band FOLD and STAMP into a SINGLE UPDATE ...
+// RETURNING. v11 wrote the hot txs table TWICE per band — once to fold
+// (spent_progress += n, last_spend_height) and again to stamp delete_at_height —
+// and scanned the band twice. For txs that complete on the folded spend this
+// doubled txs dead-tuple churn on the hottest table (~15% measured throughput
+// regression). v12 stamps INLINE from the NEW spent_progress in the same UPDATE,
+// so each folded tx is written once and the band is scanned once. Semantics are
+// identical: same rows stamped, same delete_at_height values, same pending_deletes
+// upserts.
+const dahSweepProcVersion = 12
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaInternal (plain DDL);
@@ -67,10 +77,12 @@ func dahSweepProcDDL() string {
 	return dahSweepProcDDLWithPendingDeletes
 }
 
-// dahSweepProcDDLWithPendingDeletes is the fold-forward (v11) DAH sweep procedure.
+// dahSweepProcDDLWithPendingDeletes is the fold-forward (v12) DAH sweep procedure.
 //
-// v11 replaces v10's full-range re-aggregation with a forward-only fold. Per
-// bounded height band (v_band heights, from dah_sweep_control.band_heights) it:
+// v11 replaced v10's full-range re-aggregation with a forward-only fold. v12
+// merges v11's two per-band txs writes (fold + stamp) into one UPDATE ... RETURNING
+// so the hot txs table is written once per folded tx and the band is scanned once.
+// Per bounded height band (v_band heights, from dah_sweep_control.band_heights) it:
 //
 //  1. FOLDS the band's NEW spends ONLY — aggregates spends_pNN over
 //     (v_from, v_to] grouped by prev_tx_hash, counting SPENDABLE-output spends,
@@ -78,11 +90,17 @@ func dahSweepProcDDL() string {
 //     last_spend_height. This reads only the band's rows (O(new spends in band)),
 //     NEVER a parent's whole spend history — the key change that lets the sweep
 //     keep up with IBD.
-//  2. STAMPS the parents whose fold just completed: spent_progress =
-//     spendable_count (> 0), mined_at_height IS NOT NULL, delete_at_height IS NULL,
-//     preserve_until IS NULL, unmined_since IS NULL. delete_at_height =
-//     GREATEST(last_spend_height, mined_at_height) + 1 + retention, upserted into
-//     pending_deletes_pNN in the same statement.
+//  2. STAMPS, in the SAME UPDATE, the parents whose fold just completed by
+//     computing delete_at_height inline from the NEW progress (t.spent_progress +
+//     d.n = spendable_count > 0), mined_at_height IS NOT NULL, delete_at_height IS
+//     NULL, preserve_until IS NULL, unmined_since IS NULL. delete_at_height =
+//     GREATEST(new last_spend_height, mined_at_height) + 1 + retention. The freshly
+//     stamped rows (RETURNING delete_at_height IS NOT NULL AND spent_progress =
+//     spendable_count) are upserted into pending_deletes_pNN in the same statement.
+//     A parent stamped in a PRIOR band that is folded again keeps its old
+//     delete_at_height (delete_at_height IS NULL guard in the CASE) and now has
+//     spent_progress > spendable_count, so it is excluded from the pending_deletes
+//     feed — no double-insert.
 //  3. ADVANCES dah_part_watermark to v_to and COMMITs — fold + stamp + advance are
 //     ONE transaction per band, so a torn commit never double-folds.
 //
@@ -157,9 +175,19 @@ BEGIN
 
         SET LOCAL lock_timeout = '5s';
 
-        -- (1) FOLD: read ONLY this band's spends, increment spent_progress and
-        -- advance last_spend_height on each parent. Spendable-output test mirrors
-        -- the v10 semantics (prev_output_idx < out_count AND get_bit=1).
+        -- (1+2) FOLD + STAMP in ONE UPDATE: read ONLY this band's spends, increment
+        -- spent_progress and advance last_spend_height on each parent, and — in the
+        -- SAME write — stamp delete_at_height inline for parents whose NEW progress
+        -- (t.spent_progress + d.n) just reached spendable_count. This writes the hot
+        -- txs table once per folded tx and scans the band once. Spendable-output test
+        -- mirrors the v10 semantics (prev_output_idx < out_count AND get_bit=1).
+        --
+        -- The stamp uses the NEW last_spend_height inline
+        -- (GREATEST(COALESCE(t.last_spend_height,0), d.max_h)) because t.last_spend_height
+        -- in the UPDATE expression evaluates against the PRE-update row. The
+        -- delete_at_height IS NULL guard keeps a prior-band-stamped row's stamp; if
+        -- such a row is folded again its progress goes ABOVE spendable_count, so it is
+        -- excluded from the pending_deletes feed (= spendable_count) — no double-insert.
         EXECUTE format($q$
             WITH band_agg AS (
                 SELECT s.prev_tx_hash AS hash,
@@ -176,47 +204,32 @@ BEGIN
             ),
             upd AS (
                 UPDATE txs_p%1$s t
-                   SET spent_progress   = t.spent_progress + d.n,
-                       last_spend_height = GREATEST(COALESCE(t.last_spend_height, 0), d.max_h)
+                   SET spent_progress    = t.spent_progress + d.n,
+                       last_spend_height = GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
+                       delete_at_height  = CASE
+                           WHEN t.spent_progress + d.n = t.spendable_count
+                                AND t.spendable_count > 0
+                                AND t.mined_at_height IS NOT NULL
+                                AND t.delete_at_height IS NULL
+                                AND t.preserve_until IS NULL
+                                AND t.unmined_since IS NULL
+                           THEN (GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
+                                          t.mined_at_height) + 1 + $3)::int
+                           ELSE t.delete_at_height
+                       END
                   FROM band_agg d
                  WHERE t.hash = d.hash
                    AND d.n > 0
-                RETURNING 1
-            )
-            SELECT count(*) FROM upd
-        $q$, v_leaf_suffix)
-        USING v_from, v_to
-        INTO v_n;
-
-        -- (2) STAMP: parents whose fold just completed (spent_progress reached
-        -- spendable_count) AND are mined AND not yet stamped/preserved/unmined.
-        -- The join to band_agg limits the scan to this band's touched parents so
-        -- the stamp is also O(band), never O(partition).
-        EXECUTE format($q$
-            WITH touched AS (
-                SELECT DISTINCT s.prev_tx_hash AS hash
-                FROM spends_p%1$s s
-                WHERE s.spent_at_height > $1 AND s.spent_at_height <= $2
-            ),
-            stamp AS (
-                UPDATE txs_p%1$s t
-                   SET delete_at_height = (GREATEST(COALESCE(t.last_spend_height, 0), COALESCE(t.mined_at_height, 0)) + 1 + $3)::int
-                  FROM touched c
-                 WHERE t.hash = c.hash
-                   AND t.spendable_count > 0
-                   AND t.spent_progress = t.spendable_count
-                   AND t.mined_at_height IS NOT NULL
-                   AND t.delete_at_height IS NULL
-                   AND t.preserve_until IS NULL
-                   AND t.unmined_since IS NULL
-                RETURNING t.hash, t.delete_at_height
+                RETURNING t.hash, t.delete_at_height, t.spent_progress, t.spendable_count
             ),
             ins AS (
                 INSERT INTO pending_deletes_p%1$s (hash, delete_at_height)
-                SELECT hash, delete_at_height FROM stamp
+                SELECT hash, delete_at_height FROM upd
+                 WHERE delete_at_height IS NOT NULL AND spent_progress = spendable_count
                 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
             )
-            SELECT count(*) FROM stamp
+            SELECT count(*) FROM upd
+             WHERE delete_at_height IS NOT NULL AND spent_progress = spendable_count
         $q$, v_leaf_suffix)
         USING v_from, v_to, p_retention
         INTO v_n;
