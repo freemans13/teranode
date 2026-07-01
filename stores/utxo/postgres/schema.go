@@ -251,6 +251,12 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool) error {
 		return errors.NewStorageError("dah_sweep_control seed failed", err)
 	}
 
+	// dah_reconcile_cursor: per-partition rotating cursor for the bounded
+	// spent_progress reconciliation backstop (Task 8). See dah_reconcile.go.
+	if _, err := pool.Exec(ctx, dahReconcileCursorDDL); err != nil {
+		return errors.NewStorageError("dah_reconcile_cursor creation failed", err)
+	}
+
 	// conflict_intents: write-ahead log for crash-safe ProcessConflicting /
 	// ReverseProcessConflicting (see #861). One row per in-flight conflict-
 	// resolution operation, recorded BEFORE its first state mutation and removed

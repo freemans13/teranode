@@ -48,7 +48,7 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 		DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT) CASCADE;
 		DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT) CASCADE;
 		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
-			tx_state, transactions, txs, txs_raw, dah_watermark, dah_part_watermark, dah_sweep_control,
+			tx_state, transactions, txs, txs_raw, dah_watermark, dah_part_watermark, dah_sweep_control, dah_reconcile_cursor,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue,
 			batch_notifications CASCADE;
 		DROP TABLE IF EXISTS pending_unmined CASCADE;

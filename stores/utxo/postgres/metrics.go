@@ -21,6 +21,9 @@ var (
 	prometheusDAHSweepWatermarkLag prometheus.Gauge
 	prometheusDAHSweepErrors       prometheus.Counter
 
+	// reconciliation backstop (runDAHReconcile)
+	prometheusDAHReconcileCorrected prometheus.Counter
+
 	prometheusMetricsInitOnce sync.Once
 )
 
@@ -101,5 +104,12 @@ func doInitPrometheusMetrics() {
 		Subsystem: "postgres_utxo",
 		Name:      "dah_sweep_errors_total",
 		Help:      "Total proc-mode DAH sweep CALL errors",
+	})
+
+	prometheusDAHReconcileCorrected = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "postgres_utxo",
+		Name:      "dah_reconcile_corrected_total",
+		Help:      "Total spent_progress rows corrected by the reconciliation backstop",
 	})
 }

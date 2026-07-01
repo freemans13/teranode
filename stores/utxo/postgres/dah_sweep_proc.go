@@ -111,9 +111,13 @@ func dahSweepProcDDL() string {
 // Division of labour: a tx spent-before-mined has its spent_progress folded here
 // but is NOT stamped (mined gate) — the mine path (SetMinedMulti) stamps it on
 // mine, evaluating fully-spent directly from spends. The sweep only stamps the
-// mined-then-spent completion. A late reorg-driven re-fold is handled by
-// RewindDAHWatermark, which also resets spent_progress/last_spend_height for the
-// re-swept range (Task 8).
+// mined-then-spent completion. A reorg that rewinds the watermark
+// (RewindDAHWatermark) BELOW already-folded heights makes this forward-only fold
+// RE-PROCESS still-present spends → spent_progress double-counts. That drift (and
+// any arithmetic/lost-update drift) is healed by the bounded reconciliation
+// backstop (dah_reconcile.go, Task 8), which is authoritative for the counter:
+// it recomputes the true spent_progress/last_spend_height from the spends table
+// over a rotating bounded slice per partition and corrects any divergence.
 const dahSweepProcDDLWithPendingDeletes = `CREATE OR REPLACE PROCEDURE dah_sweep_batch(
     p_partition  INT,
     p_safe_tip   BIGINT,
