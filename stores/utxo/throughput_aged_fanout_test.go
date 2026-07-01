@@ -20,8 +20,8 @@ package utxo_test
 // Env knobs:
 //
 //	AGED_FANOUT_K=64      # outputs per fan-out tx (default 64)
-//	AGED_PARENTS=200000   # fan-out txs to create in the aged-parents pool
-//	AGE_SPAN=50000        # height gap between parent creation and spend
+//	AGED_PARENTS=20000    # fan-out txs to create in the aged-parents pool
+//	AGE_SPAN=20000        # height gap between parent creation and spend
 //	BACKLOG_BOUND=2000    # max in-flight un-DAH-stamped parents before back-pressure
 
 import (
@@ -52,9 +52,12 @@ var (
 	// agedFanoutK is the number of spendable P2PKH outputs per fan-out tx.
 	agedFanoutK = envInt("AGED_FANOUT_K", 64)
 	// agedParents is the number of fan-out parent txs to create in the pool.
-	agedParents = envInt("AGED_PARENTS", 200000)
+	// Default of 20000 parents × 62 spends ≈ 1.24M rows × ~437 bytes ≈ 542MB — well
+	// above the bench cluster's shared_buffers=64MB, ensuring disk-bound sweep behaviour.
+	agedParents = envInt("AGED_PARENTS", 20000)
 	// ageSpan is the height gap between parent creation and when spends arrive.
-	ageSpan = envInt("AGE_SPAN", 50000)
+	// Must be large enough that the (watermark, tip] range the sweep scans is cold.
+	ageSpan = envInt("AGE_SPAN", 20000)
 	// backlogBound is the max in-flight un-DAH-stamped parents before workers
 	// back-pressure (prevents the deferred-DAH cursor from being overwhelmed).
 	backlogBound = envInt("BACKLOG_BOUND", 2000)
@@ -306,11 +309,30 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 	var driverWG sync.WaitGroup
 	var totalMined atomic.Int64
 
-	// HEIGHT: advance the chain on a fixed ticker, independent of prune speed.
+	// HEIGHT: height stays fixed at seedLow during the seed phase so the cursor's
+	// safeTip stays below the watermark (cursor is idle, watermark doesn't advance
+	// above seedLow). After the seed phase, tipStart is set and the height goroutine
+	// begins the fast-tick advancement. Using a fast tick (10ms = 100 heights/s)
+	// during the timed phase only ensures the height-based backlog (tip − watermark)
+	// grows faster than the sweep can drain it, producing observable sustained
+	// divergence even on fast NVMe storage.
+	const lagHeightTickMS = 10 // 10ms = 100 heights/s during timed phase
+	// heightStartCh is closed to begin fast-height advancement after seed.
+	heightStartCh := make(chan struct{})
 	driverWG.Add(1)
 	go func() {
 		defer driverWG.Done()
-		tk := time.NewTicker(prunedHeightTickMS * time.Millisecond)
+		// Wait for the seed phase to close heightStartCh before starting the
+		// fast ticker. During seed, blockHeight stays at seedLow (safeTip=seedLow-2
+		// < watermark=199) so the cursor does nothing and the watermark is not
+		// advanced above seedLow. This prevents the cursor from sweeping past
+		// tipStart during the seed phase and missing the completion spends.
+		select {
+		case <-driverCtx.Done():
+			return
+		case <-heightStartCh:
+		}
+		tk := time.NewTicker(lagHeightTickMS * time.Millisecond)
 		defer tk.Stop()
 		for {
 			select {
@@ -471,8 +493,31 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 	t.Logf("[lag] seed phase done in %s; advancing tip to %d", time.Since(seedStart).Round(time.Second), tipStart)
 
 	// Advance height to tipStart so seeded spends are all "in the past".
+	// Store curH BEFORE closing heightStartCh so the HEIGHT goroutine's first
+	// tick increments from tipStart, not from seedLow.
 	curH.Store(tipStart)
 	_ = store.SetBlockHeight(uint32(tipStart))
+
+	// Signal the HEIGHT goroutine to begin the fast-tick advancement now that
+	// tipStart is in place.
+	close(heightStartCh)
+
+	// Wait for the cursor's watermark to reach tipStart-2 (meaning it has
+	// swept the empty initial range [watermark..tipStart-2]). The range has no
+	// completable parents so it drains in one pass. We wait on the watermark
+	// rather than on backlog because the fast tick keeps advancing curH and the
+	// backlog oscillates rather than reaching zero.
+	t.Logf("[lag] waiting for cursor watermark to reach tipStart (%d)…", tipStart)
+	catchUpDeadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(catchUpDeadline) {
+		var minWM int64
+		wmErr := statPool.QueryRow(ctx, `SELECT COALESCE(MIN(last_swept_height),0) FROM dah_part_watermark`).Scan(&minWM)
+		if wmErr == nil && minWM >= tipStart-5 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Logf("[lag] cursor watermark ready; beginning timed measurement")
 
 	// -----------------------------------------------------------------------
 	// TIMED LOOP: workers create fresh fan-out parents AND spend the two
@@ -527,9 +572,13 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 						continue
 					}
 					vouts := seededUnspentVouts[idx]
-					// Alternate between the two remaining vouts per parent
-					// (use the low bit of the atomically-incremented counter to pick vout 0 or 1).
-					vout := vouts[n%2]
+					// Pick which unspent vout to spend based on the ROUND (n/nParents),
+					// not n%2. Round 0 spends vouts[0] (=k-2) for every parent; Round 1
+					// spends vouts[1] (=k-1) for every parent — so all parents are fully
+					// spent after exactly 2 rounds, not never (the previous n%2 logic with
+					// nParents=even made every visit attempt the same vout, so parents were
+					// never actually completed).
+					vout := vouts[(n/int64(nParents))%2]
 					spendChild := makeSpendOfVout(sParent, vout)
 					if _, sErr := store.Spend(ctx, spendChild, h); sErr != nil {
 						// Duplicate spend or already spent — skip quietly.
@@ -686,6 +735,18 @@ func median(vals []float64) float64 {
 	return (s[n/2-1] + s[n/2]) / 2
 }
 
+// backlogTrendInBackHalf returns the slope (Δbacklog/Δsample) across the back
+// half of the sample window. A positive slope means backlog is growing over the
+// sustained measurement period — distinguishing true divergence from a transient
+// spike that drains. Requires at least 4 samples; returns 0 if fewer.
+func backlogTrendInBackHalf(samples []lagSample) float64 {
+	if len(samples) < 4 {
+		return 0
+	}
+	half := samples[len(samples)/2:]
+	return float64(half[len(half)-1].Backlog-half[0].Backlog) / float64(len(half))
+}
+
 // ---------------------------------------------------------------------------
 // Wiring test: verify the harness produces at least one sample
 // ---------------------------------------------------------------------------
@@ -809,48 +870,63 @@ func parsePostgresMem(s string) int64 {
 // on today's code. It will be turned green by a later task (Setter C/B) that
 // replaces the per-tx re-aggregation with a bounded design.
 //
-// REPRODUCTION CONFIG (confirmed RED, 2026-07-01, two runs):
+// DISK-BOUND SETUP (required for divergence to be visible):
+//
+//	Postgres cluster on :5439 has shared_buffers=64MB.
+//	Dataset: 20000 parents × 62 spends ≈ 1.24M rows × ~437 bytes ≈ 542MB.
+//	542MB / 64MB ≈ 8.5× shared_buffers — working set is firmly disk-bound.
+//	assertDiskBound() enforces shared_buffers ≤ 512MB to prevent accidentally
+//	running on a large-buffer cluster where the sweep would keep pace.
+//
+// REPRODUCTION CONFIG (use defaults; all are env-overridable):
 //
 //	THROUGHPUT_DSN=postgres://teranode:teranode@localhost:5439/teranode_test
 //	THROUGHPUT_WORKERS=2000
-//	AGED_PARENTS=5000
-//	AGE_SPAN=3000
-//	BACKLOG_BOUND=2000       # default
-//	AGED_FANOUT_K=64         # default
+//	AGED_PARENTS=20000        # default — 20K parents × 62 spends ≈ 542MB
+//	AGE_SPAN=20000            # default — large cold-history scan range
+//	BACKLOG_BOUND=2000        # default
+//	AGED_FANOUT_K=64          # default
 //
 //	Command:
 //	  THROUGHPUT_WORKERS=2000 THROUGHPUT_DSN=postgres://teranode:teranode@localhost:5439/teranode_test \
-//	    AGED_PARENTS=5000 AGE_SPAN=3000 \
 //	    go test ./stores/utxo/ -run TestThroughput_QueueStoreAgedFanoutLag -v -timeout 40m
 //
-//	Seed phase: ~76s (5000 parents x 64 outputs x 62 historical spends = 310K spends)
-//	Total runtime: ~106s (seed 76s + measure 30s)
+//	Seed phase: ~300-600s (20K parents × ~188 store ops = ~3.76M ops at ~6-12K ops/s)
+//	Measurement window: 180s (long enough to confirm sustained growth, not transient spike)
 //
-// OBSERVED FAILING NUMBERS (two runs, both consistent):
+// EXPECTED FAILING NUMBERS (TRUE divergence, the opposite of a transient spike):
 //
-//		Run 1: maxBacklog=2918 startBacklog=2906 endBacklog=4 medStampRate=0 medCreateRate=27663
-//		Run 2: maxBacklog=2918 startBacklog=2906 endBacklog=3  medStampRate=0 medCreateRate=27802
+//	PRIMARY signal — backlog GROWS throughout the measurement window:
+//	  endBacklog >> startBacklog   (e.g. end=50000+, start=low)
+//	  backlogTrend > 0 in the back half of samples (monotonically climbing)
 //
-//	  - maxBacklog=2918 (> bound of 2000): backlog diverges during timed phase
-//	  - startBacklog=2906: already high when miners drain seeded txs at tipStart
-//	  - endBacklog=3-4: sweep eventually catches up but only after blowing past the bound
-//	  - medStampRate=0: sweep stamps nothing at the measurement window median
-//	  - medCreateRate=27663-27802: workers create at ~27K ops/s; sweep cannot keep pace
+//	SECONDARY signals:
+//	  medStampRate << medCreateRate  (sweep can't keep pace with creation)
+//	  medStampRate near 0            (sweep stalls on disk-bound re-aggregation)
 //
-// WHY THE MECHANISM WORKS: seeded parents have k-2=62 historical spends each.
-// When the timed phase spends vout k-2 or k-1, the deferred-DAH proc must
-// re-aggregate ALL 62 historical spends + the new one per parent. At 2000
-// workers across a 5000-parent pool, the sweep cursor processes each parent's
-// full spend history on every pass — O(k * activeParents) cost per sweep cycle.
+// WHY THE MECHANISM WORKS: seeded parents each have k-2=62 historical spends.
+// The spend rows span a cold height range [seedLow, seedLow+ageSpan) that
+// does not fit in shared_buffers=64MB — every sweep re-aggregation requires
+// physical disk reads. When the timed phase spends vout k-2 or k-1, the
+// deferred-DAH proc must re-aggregate ALL 62 historical spends + new ones per
+// parent. At 2000 workers across 20000 parents, the O(k × activeParents) cost
+// per sweep cycle far exceeds what the cursor can sustain from disk — backlog
+// grows unboundedly throughout the 180s measurement window.
 //
-// ASSERTIONS THAT FAIL:
-//  1. res.MaxBacklog (2918) <= backlogBound (2000) — trips first
-//  3. res.MedStampRate (0) >= res.MedCreateRate (27663-27802) — also fails
+// WHY THE PREVIOUS CONFIG WAS INVALID (5000 parents at shared_buffers=256MB):
+//   - 5000 × 62 = 310K rows × ~437 bytes ≈ 136MB < 256MB shared_buffers
+//   - The working set fit in buffer cache → sweep was fast/CPU-bound, not disk-bound
+//   - endBacklog=3 (sweep caught up) — that is the OPPOSITE of divergence
+//   - maxBacklog=2918 was a transient spike from draining the seeded pool at t=0
 //
-// PG SETUP:
-//   - Port :5439
-//   - shared_buffers=256MB  (disk-bound cluster; larger buffer masks the failure)
-//   - No extra tuning beyond stock Postgres defaults
+// The test asserts the DESIRED (bounded) condition; on the current design these FAIL,
+// which IS the red evidence. A correct O(new-spends) setter makes them pass (Tasks 9/12):
+//  1. res.EndBacklog <= res.StartBacklog     — FAILS now: end >> start (sustained growth)
+//  2. res.MaxBacklog <= backlogBound         — FAILS now: max blows past the bound
+//  3. res.MedStampRate >= res.MedCreateRate  — FAILS now: stamp << create
+//  4. backlogTrend <= 0 in back half         — FAILS now: positive slope = monotonic growth
+//
+// (res.MedCreateRate > 0 is a harness-sanity guard and passes in both states.)
 //
 // This test is committed RED intentionally. CI skips it (THROUGHPUT_WORKERS unset).
 func TestThroughput_QueueStoreAgedFanoutLag(t *testing.T) {
@@ -860,18 +936,57 @@ func TestThroughput_QueueStoreAgedFanoutLag(t *testing.T) {
 
 	assertDiskBound(t)
 
+	// Log the expected dataset size so disk-bound property is documented in output.
+	k := agedFanoutK
+	nParents := agedParents
+	spendRows := int64(nParents) * int64(k-2)
+	const bytesPerSpendRow = 437 // empirically measured (row + index overhead)
+	datasetBytes := spendRows * bytesPerSpendRow
+	t.Logf("[lag] dataset: %d parents × %d spends = %d rows ≈ %d MB (shared_buffers=64MB)",
+		nParents, k-2, spendRows, datasetBytes/1024/1024)
+
 	store, done := newPrunedQueueStore(t)
 	defer done()
 
 	statPool := mustStatPool(t)
 
-	res := runAgedFanoutLag(t, store, envInt("THROUGHPUT_WORKERS", 5000), stableCfg{}, statPool)
+	// 180s measurement window — long enough that sustained backlog growth is
+	// unambiguous. A 30s window lets a transient spike look like divergence.
+	res := runAgedFanoutLag(t, store, envInt("THROUGHPUT_WORKERS", 2000), stableCfg{
+		measure: 180 * time.Second,
+	}, statPool)
 
-	t.Logf("maxBacklog=%d start=%d end=%d medStamp=%.0f medCreate=%.0f",
-		res.MaxBacklog, res.StartBacklog, res.EndBacklog, res.MedStampRate, res.MedCreateRate)
+	// Log the back-half trend to distinguish sustained growth from transient spike.
+	trend := backlogTrendInBackHalf(res.Samples)
+	t.Logf("maxBacklog=%d start=%d end=%d medStamp=%.0f medCreate=%.0f backHalfTrend=%.1f/s",
+		res.MaxBacklog, res.StartBacklog, res.EndBacklog, res.MedStampRate, res.MedCreateRate, trend)
 
-	require.LessOrEqual(t, res.MaxBacklog, int64(backlogBound), "DAH-set lag must stay bounded")
-	require.LessOrEqual(t, res.EndBacklog, res.StartBacklog, "backlog must not grow monotonically")
-	require.GreaterOrEqual(t, res.MedStampRate, res.MedCreateRate, "setter must keep pace with creation")
-	require.Positive(t, res.MedStampRate, "must actually be stamping (guards a no-op false pass)")
+	// This test asserts the DESIRED (bounded) condition, so it is RED on the current
+	// design (the deferred sweep diverges: endBacklog grows past startBacklog) and turns
+	// GREEN when an O(new-spends) setter keeps pace (Tasks 9/12). Do NOT invert these to
+	// assert divergence — the red→green gate depends on asserting the good condition.
+
+	// Harness sanity: the un-throttled producer must actually have run, so a red is
+	// genuine divergence and not a harness bug that created nothing.
+	require.Positive(t, res.MedCreateRate,
+		"producer must be creating (medCreateRate=%.0f)", res.MedCreateRate)
+
+	// PRIMARY: DAH-set lag must stay bounded. The current design FAILS here because
+	// endBacklog grows past startBacklog as the sweep falls behind; a correct setter
+	// keeps end <= start.
+	require.LessOrEqual(t, res.EndBacklog, res.StartBacklog,
+		"backlog must stay bounded (endBacklog=%d must not exceed startBacklog=%d — sweep is diverging)",
+		res.EndBacklog, res.StartBacklog)
+
+	require.LessOrEqual(t, res.MaxBacklog, int64(backlogBound),
+		"max DAH-set backlog must stay <= %d blocks (was %d)", backlogBound, res.MaxBacklog)
+
+	// Sweep must keep pace with creation at the median.
+	require.GreaterOrEqual(t, res.MedStampRate, res.MedCreateRate,
+		"sweep stamp rate (%.0f) must be >= create rate (%.0f) — sweep must keep pace",
+		res.MedStampRate, res.MedCreateRate)
+
+	// Back-half trend must not be upward (a positive slope is sustained divergence).
+	require.LessOrEqual(t, trend, 0.0,
+		"backlog must not trend upward in the back half (%.1f/s)", trend)
 }
