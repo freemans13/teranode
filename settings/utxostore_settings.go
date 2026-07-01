@@ -74,6 +74,12 @@ type UtxoStoreSettings struct {
 	// measured-safe choice on cold/single-disk deployments; raise it on hosts with a
 	// warm cache or fast multi-queue storage that can absorb concurrent random reads.
 	PostgresDAHSweepConcurrency int `key:"utxostore_postgresDAHSweepConcurrency" desc:"Max partitions swept concurrently per DAH sweep pass" default:"1" category:"UtxoStore" usage:"1=sequential (cold-disk safe); up to numPartitions for warm/fast storage" type:"int"`
+	// Height band width for the fold-forward DAH sweep proc (v11). Each proc CALL
+	// advances the watermark in bounded bands of this many heights, folding ONLY
+	// that band's new spends (cost O(new spends in band), independent of chain
+	// size). Bounded per-band work is what lets the sweep keep up with IBD instead
+	// of freezing on an O(lifetime-spends) full-range re-aggregation.
+	PostgresDAHSweepBandHeights int `key:"utxostore_postgresDAHSweepBandHeights" desc:"Height band width per fold-forward DAH sweep step (proc v11)" default:"5000" category:"UtxoStore" usage:"Bounded heights folded per band; keeps per-CALL work O(new spends)" type:"int"`
 	// Dedicated maintenance pool size (PostgreSQL store only): connections reserved
 	// for the DAH sweep CALLs and pruner cascade deletes, isolated from the main
 	// write pool so background reclaim is never starved by the validator batchers
