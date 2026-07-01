@@ -342,6 +342,15 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool) error {
 		return errors.NewStorageError("px_delete_at_height backfill+drop failed", err)
 	}
 
+	// Setter-C counter columns: add to existing DBs idempotently. Both columns
+	// are deliberately UNINDEXED — indexing either would disqualify HOT updates
+	// on txs (measured: HOT ratio collapses from 83%+ to 33% when a btree covers
+	// a column touched by the sweep UPDATE). The migration is a no-op if the
+	// columns already exist (ALTER TABLE ... ADD COLUMN IF NOT EXISTS).
+	if _, err := pool.Exec(ctx, txsSetterCMigrationDDL); err != nil {
+		return errors.NewStorageError("setter-c counter column migration failed", err)
+	}
+
 	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).
 	_, _ = pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET COMPRESSION lz4`)
 
@@ -422,7 +431,9 @@ CREATE TABLE IF NOT EXISTS txs (
     out_spendables            BYTEA,
     out_frozens               BYTEA,
     coinbase_spending_height  INT NOT NULL DEFAULT 0,
-    spendable_ins             INT[]
+    spendable_ins             INT[],
+    spent_progress            INT NOT NULL DEFAULT 0,
+    last_spend_height         INT
 ) PARTITION BY HASH (hash);`
 
 // Indexes on txs.
@@ -471,6 +482,30 @@ DO $$ BEGIN
     DROP INDEX px_delete_at_height;
   END IF;
 END $$;`
+
+// txsSetterCMigrationDDL adds the two Setter-C counter columns to existing txs
+// tables on DB startup. Both use ADD COLUMN IF NOT EXISTS so the statement is
+// safe to re-run on every startup.
+//
+// spent_progress INT NOT NULL DEFAULT 0 — count of distinct spendable outputs
+//
+//	the background sweep consumer has folded for this tx. The DAH stamp fires
+//	when spent_progress = spendable_count (all outputs fully spent). Initialised
+//	to 0, not spendable_count: the consumer folds forward-only from scratch;
+//	a live-DB backfill is a deferred decision handled by a separate migration.
+//
+// last_spend_height INT (nullable) — running max spent_at_height across all
+//
+//	spendable outputs folded so far. NULL until the first spendable spend is
+//	folded. Used by the sweep to stamp delete_at_height = last_spend_height.
+//
+// NEITHER column is indexed. An UPDATE touching any btree-indexed column on txs
+// disqualifies the row from a HOT update (forcing a full row copy + index
+// maintenance on the 32-byte random-hash PK), collapsing the HOT ratio from
+// 83%+ to ~34% (measured). delete_at_height is the canonical unindexed precedent.
+const txsSetterCMigrationDDL = `
+ALTER TABLE txs ADD COLUMN IF NOT EXISTS spent_progress    INT NOT NULL DEFAULT 0;
+ALTER TABLE txs ADD COLUMN IF NOT EXISTS last_spend_height INT;`
 
 // pendingDeletesDDL creates the pending_deletes partitioned parent table. Each
 // hash partition leaf is created separately in createSchemaWithPoolFlag.
