@@ -693,8 +693,13 @@ func TestPendingDeletes_MineTimeNotFullySpent(t *testing.T) {
 }
 
 // TestPendingDeletes_MineTimeCompletionHeightUsesGreatest verifies the DAH formula:
-// GREATEST(max(spent_at_height), minedHeight) + 1 + retention. When the tx is mined
+// GREATEST(last_spend_height, minedHeight) + 1 + retention. When the tx is mined
 // much later than it was spent, DAH must derive from minedHeight (the larger value).
+//
+// Setter-C reconcile (Task 7): the mine-time stamp reads the maintained spent_progress
+// counter (folded by the sweep), so the spends must be folded first — runSweepOnly does
+// that while the tx is unmined (proc folds but does not stamp — mined gate). The mine
+// then stamps via the counter at GREATEST(last_spend_height, minedHeight)+1+retention.
 func TestPendingDeletes_MineTimeCompletionHeightUsesGreatest(t *testing.T) {
 	st := newTestStoreWithFlag(t, true)
 
@@ -702,6 +707,7 @@ func TestPendingDeletes_MineTimeCompletionHeightUsesGreatest(t *testing.T) {
 	p := *pTx.TxIDChainHash()
 
 	spendAllOutputs(t, st, pTx, 50) // spend at height 50
+	runSweepOnly(t, st)             // fold spent_progress -> spendable_count while unmined
 
 	const minedHeight = uint32(5000) // mine much later than spend (GREATEST picks minedHeight)
 	mineOnLongestChain(t, st, p, minedHeight)
@@ -744,14 +750,31 @@ func TestPendingDeletes_PruneEquivalenceNoBackstop(t *testing.T) {
 	)
 
 	// Build 5 doomed parents: spent-while-unmined, then mined (S6 path).
-	// S6 stamps delete_at_height at mineHeight. DAH = mineHeight+1+retention <= pruneHeight.
+	// Setter-C reconcile (Task 7): the mine-time stamp reads the maintained
+	// spent_progress counter, so the spends are folded by a sweep (while the parents
+	// are still unmined — proc folds but does not stamp, mined gate) BEFORE mining.
+	// The mine then stamps each doomed parent via the counter at
+	// GREATEST(last_spend_height, mineHeight)+1+retention <= pruneHeight. No backstop.
+	doomedTxs := make([]*bt.Tx, 0, 5)
 	var doomed [][]byte
 	for i := 0; i < 5; i++ {
 		pTx := newUniqueUnminedTx(t, st)
 		p := *pTx.TxIDChainHash()
 		spendAllOutputs(t, st, pTx, spendHeight) // spend all outputs while unmined
-		mineOnLongestChain(t, st, p, mineHeight) // S6 stamps DAH here
+		doomedTxs = append(doomedTxs, pTx)
 		doomed = append(doomed, p[:])
+	}
+
+	// Fold spent_progress for all doomed parents via one sweep (they are still unmined,
+	// so the proc folds the counter but stamps nothing — the mined gate holds).
+	require.NoError(t, st.SetBlockHeight(spendHeight+5))
+	_, err := procSweepUpTo(st, ctx, int64(spendHeight+5))
+	require.NoError(t, err)
+
+	// Now mine each doomed parent onto the longest chain; the counter is complete, so
+	// SetMinedMulti (S6) stamps DAH at mine time from the counter.
+	for _, pTx := range doomedTxs {
+		mineOnLongestChain(t, st, *pTx.TxIDChainHash(), mineHeight)
 	}
 
 	// Build 3 live parents: mined but NOT fully spent (only one output spent).

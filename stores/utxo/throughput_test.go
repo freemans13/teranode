@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,7 +24,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const throughputDSN = "postgres://teranode:teranode@localhost:5432/teranode_test"
+// throughputDSN is the postgres DSN used by all throughput tests.
+// Override with THROUGHPUT_DSN to point at a different cluster (e.g. the disk-bound
+// instance on :5439 used by the deferred-DAH lag bench).
+var throughputDSN = func() string {
+	if v := os.Getenv("THROUGHPUT_DSN"); v != "" {
+		return v
+	}
+	return "postgres://teranode:teranode@localhost:5432/teranode_test"
+}()
 
 func cleanDB(t *testing.T) {
 	t.Helper()

@@ -132,22 +132,33 @@ func mineTx(t *testing.T, store *Store, tx *bt.Tx, minedHeight uint32) {
 }
 
 func TestSetMinedStampsFullySpentAndTagsHeight(t *testing.T) {
-	// Design-C (S6): when a tx is mined onto the longest chain and is already fully
-	// spent (spent-before-mined ordering), SetMinedMulti must stamp delete_at_height
-	// AND record mined_at_height. This replaces the old "DoesNotStampInline" assertion
-	// which documented pre-Design-C behaviour.
+	// Design-C (S6), Setter-C reconcile (Task 7): when a tx is mined onto the longest
+	// chain and is already fully spent (spent-before-mined ordering) — as evidenced by
+	// the MAINTAINED spent_progress counter (folded by the background sweep) — then
+	// SetMinedMulti must stamp delete_at_height directly from the counter AND record
+	// mined_at_height. The mine path now reads spent_progress = spendable_count rather
+	// than re-aggregating the spends table, so the counter must be folded first (via the
+	// sweep) — this is the new division of labour: the sweep owns fully-spent detection,
+	// the mine path only stamps a tx the counter already shows complete.
 	store, ctx := setupTestStore(t)
 	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
 
 	tx := newUnminedSingleOutputTx(t, store)
 	spendAllOutputs(t, store, tx, 50) // fully spent at height 50 while unmined
-	mineTx(t, store, tx, 60)          // SetMinedMulti at height 60; GREATEST(50,60)=60
+
+	// Fold the spends via the sweep so spent_progress reaches spendable_count while the
+	// tx is still unmined (the proc folds but does not stamp — mined gate).
+	require.NoError(t, store.SetBlockHeight(55))
+	_, err := procSweepUpTo(store, ctx, 55)
+	require.NoError(t, err)
+
+	mineTx(t, store, tx, 60) // SetMinedMulti at height 60; GREATEST(lsh=50,60)=60
 
 	var dah *int64
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT delete_at_height FROM txs WHERE hash=$1`, tx.TxIDChainHash()[:]).Scan(&dah))
-	require.NotNil(t, dah, "S6: set-mined must stamp delete_at_height for fully-spent tx")
-	require.Equal(t, int64(60)+1+ret, *dah, "DAH = GREATEST(spentHeight=50, minedHeight=60)+1+retention")
+	require.NotNil(t, dah, "S6: set-mined must stamp delete_at_height for a fully-spent (counter-complete) tx")
+	require.Equal(t, int64(60)+1+ret, *dah, "DAH = GREATEST(lastSpendHeight=50, minedHeight=60)+1+retention")
 
 	var mh *int64
 	require.NoError(t, store.pool.QueryRow(ctx,

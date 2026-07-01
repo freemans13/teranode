@@ -74,6 +74,19 @@ type UtxoStoreSettings struct {
 	// measured-safe choice on cold/single-disk deployments; raise it on hosts with a
 	// warm cache or fast multi-queue storage that can absorb concurrent random reads.
 	PostgresDAHSweepConcurrency int `key:"utxostore_postgresDAHSweepConcurrency" desc:"Max partitions swept concurrently per DAH sweep pass" default:"1" category:"UtxoStore" usage:"1=sequential (cold-disk safe); up to numPartitions for warm/fast storage" type:"int"`
+	// Height band width for the fold-forward DAH sweep proc (v11). Each proc CALL
+	// advances the watermark in bounded bands of this many heights, folding ONLY
+	// that band's new spends (cost O(new spends in band), independent of chain
+	// size). Bounded per-band work is what lets the sweep keep up with IBD instead
+	// of freezing on an O(lifetime-spends) full-range re-aggregation.
+	PostgresDAHSweepBandHeights int `key:"utxostore_postgresDAHSweepBandHeights" desc:"Height band width per fold-forward DAH sweep step (proc v11)" default:"5000" category:"UtxoStore" usage:"Bounded heights folded per band; keeps per-CALL work O(new spends)" type:"int"`
+	// Reconciliation backstop (Task 8): the fold maintains spent_progress rather than
+	// re-deriving it, so it can drift (arithmetic bug, lost update, or a reorg rewind
+	// re-fold that double-counts still-present spends) and never self-correct. A slow
+	// background pass recomputes the true counter from the spends table over a bounded
+	// rotating slice per partition, correcting drift and stamping missed completions.
+	PostgresDAHReconcileSlice          int `key:"utxostore_postgresDAHReconcileSlice" desc:"Txs audited per partition per reconciliation pass (bounded, rotating cursor)" default:"1000" category:"UtxoStore" usage:"Bounds reconcile cost; never O(all history) in one pass" type:"int"`
+	PostgresDAHReconcileIntervalMillis int `key:"utxostore_postgresDAHReconcileIntervalMillis" desc:"Tick interval for the background spent_progress reconciliation backstop in milliseconds" default:"60000" category:"UtxoStore" usage:"How often the slow drift-audit backstop runs one bounded slice per partition" type:"int"`
 	// Dedicated maintenance pool size (PostgreSQL store only): connections reserved
 	// for the DAH sweep CALLs and pruner cascade deletes, isolated from the main
 	// write pool so background reclaim is never starved by the validator batchers

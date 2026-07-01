@@ -48,7 +48,7 @@ func setupTestStore(t *testing.T) (*Store, context.Context) {
 		DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT) CASCADE;
 		DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT) CASCADE;
 		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
-			tx_state, transactions, txs, txs_raw, dah_watermark, dah_part_watermark, dah_sweep_control,
+			tx_state, transactions, txs, txs_raw, dah_watermark, dah_part_watermark, dah_sweep_control, dah_reconcile_cursor,
 			create_queue, input_queue, output_queue, spend_queue, mined_queue,
 			batch_notifications CASCADE;
 		DROP TABLE IF EXISTS pending_unmined CASCADE;
@@ -1557,18 +1557,47 @@ func TestProcessExpiredPreservations(t *testing.T) {
 	})
 
 	t.Run("eligible_mined_fully_spent_tx_is_stamped", func(t *testing.T) {
+		// Setter-C reconcile (Task 7): eligibility is now decided from the maintained
+		// spent_progress counter, so the sweep must have folded the spends first (the
+		// counter = spendable_count). Fold via a sweep, then expire the preservation.
 		store, ctx := setupTestStore(t)
+		ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
 		parent := newMinedSingleOutputTx(t, store, 100)
 		spendAllOutputs(t, store, parent, 101)
 		hash := parent.TxIDChainHash()[:]
+
+		require.NoError(t, store.SetBlockHeight(105))
+		_, err := procSweepUpTo(store, ctx, 105) // folds spent_progress -> spendable_count
+		require.NoError(t, err)
+		// The sweep already stamped it; clear that + inject an expired preservation so we
+		// exercise the expiry path's own stamp decision in isolation.
 		injectExpiredPreserve(ctx, t, store, hash)
 
 		require.NoError(t, store.ProcessExpiredPreservations(ctx, 100))
 
 		preserveUntil, dah := read(ctx, t, store, hash)
 		require.Nil(t, preserveUntil, "preserve_until must be cleared")
-		require.NotNil(t, dah, "eligible (mined + fully-spent) tx must be stamped for deletion")
-		require.Equal(t, int64(100)+int64(store.settings.GetUtxoStoreBlockHeightRetention()), *dah)
+		require.NotNil(t, dah, "eligible (mined + counter-complete) tx must be stamped for deletion")
+		// completion = GREATEST(last_spend_height=101, mined_at_height=NULL->0)+1+retention.
+		require.Equal(t, int64(101)+1+ret, *dah)
+	})
+
+	t.Run("lagging_counter_fully_spent_tx_is_NOT_stamped_early", func(t *testing.T) {
+		// Setter-C reconcile (Task 7) lagging-counter rule: a tx is fully spent on the
+		// chain but the background fold has NOT yet advanced spent_progress. The expiry
+		// path must NOT stamp it (avoids stamping off a lagging/incomplete counter); it
+		// just clears preserve_until and leaves DAH NULL. The sweep stamps it later.
+		store, ctx := setupTestStore(t)
+		parent := newMinedSingleOutputTx(t, store, 100)
+		spendAllOutputs(t, store, parent, 101) // fully spent, but NO sweep → counter still 0
+		hash := parent.TxIDChainHash()[:]
+		injectExpiredPreserve(ctx, t, store, hash)
+
+		require.NoError(t, store.ProcessExpiredPreservations(ctx, 100))
+
+		preserveUntil, dah := read(ctx, t, store, hash)
+		require.Nil(t, preserveUntil, "preserve_until must be cleared even when not stamped")
+		require.Nil(t, dah, "must NOT stamp early off a lagging counter; the sweep stamps it later")
 	})
 
 	t.Run("conflicting_tx_is_stamped_without_being_mined", func(t *testing.T) {

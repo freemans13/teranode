@@ -93,12 +93,29 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 // The eligibility CASE mirrors the sweep's conditions (the canonical DAH setter):
 //   - conflicting txs get a DAH (they need not be mined); else
 //   - on the longest chain (unmined_since IS NULL) AND mined (has block_ids) AND fully
-//     spent (every spendable output has a spend row).
+//     spent.
+//
+// Setter-C reconcile (Task 7): fully-spentness is decided from the MAINTAINED
+// spent_progress counter (spent_progress = spendable_count AND spendable_count > 0),
+// NOT from a per-row count(*) re-aggregation over the spends table. This matches the
+// sweep proc (dah_sweep_proc.go) and SetMinedMulti (mined.go), so all three DAH setters
+// agree on "fully spent".
+//
+// LAGGING-COUNTER RULE: the counter is folded forward-only by the BACKGROUND sweep,
+// which lags the tip by dahSafeTip's lag. A parent that just became fully spent may
+// still show spent_progress < spendable_count when its preservation expires (the sweep
+// has not yet folded its last spend). In that case this path deliberately does NOT
+// stamp — it clears preserve_until and leaves delete_at_height NULL. That is SAFE: an
+// unstamped tx is never pruned, and the sweep stamps it (completion+1+retention, a
+// FUTURE height) once the fold catches up. Stamping "early" off a lagging counter would
+// risk a wrong height; not stamping only defers reclaim by at most a sweep cycle. This
+// upholds the invariant "delete_at_height set ⟹ genuinely fully spent" without ever
+// leaving a not-yet-fully-spent tx stamped.
 //
 // An ineligible tx just has preserve_until cleared, delete_at_height left NULL; the
 // sweep re-stamps it if/when it actually becomes eligible. This runs once per pruner
 // cycle over only the small set of expiring preservations (gated by px_preserve_until),
-// so the per-row fully-spent subquery is off the hot delete path.
+// so it reads only two scalar columns per row (no spends join) off the hot delete path.
 func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
 	// Retention 0 disables pruning: never stamp a DAH (mirrors the sweep's early
 	// return); just clear the expired preservations.
@@ -114,14 +131,25 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	}
 
 	// Widen to int64 before adding so the sum cannot wrap in uint32 arithmetic,
-	// then narrow to int32 for the INT4 delete_at_height column.
+	// then narrow to int32 for the INT4 delete_at_height column. This is the
+	// conflicting-branch DAH (conflicting txs have no meaningful spend-completion
+	// height, so a currentHeight-relative future height is correct for them).
 	deleteAtHeight := int32(int64(currentHeight) + int64(retention))
+	retention32 := int32(retention) //nolint:gosec // retention is a small positive delta
 
 	// Use a CTE so that:
 	//   - rows that get a DAH stamp are upserted into pending_deletes (ins),
 	//   - rows whose DAH is set to NULL are removed from pending_deletes (del),
 	// all in the same statement. A SELECT count(*) FROM upd returns the number of
 	// affected rows for logging.
+	//
+	// Setter-C reconcile (Task 7): the fully-spent branch reads the maintained counter
+	// (spent_progress = spendable_count AND spendable_count > 0) instead of the old
+	// count(*) re-aggregation over spends. A tx whose counter has NOT yet caught up (the
+	// background fold lags) fails this predicate → delete_at_height stays NULL and the
+	// sweep stamps it later. The fully-spent branch stamps at the sweep-consistent
+	// completion height GREATEST(last_spend_height, mined_at_height)+1+retention ($3), so
+	// this safety-net path and the sweep never disagree on the DAH of the same tx.
 	var rowsAffected int64
 	err := s.pool.QueryRow(ctx, `
 		WITH upd AS (
@@ -131,14 +159,9 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 					WHEN unmined_since IS NULL
 					     AND block_ids IS NOT NULL AND array_length(block_ids, 1) IS NOT NULL
 					     AND out_count > 0
-					     AND spendable_count = (
-					         SELECT count(*) FROM spends s
-					         WHERE s.prev_tx_hash = txs.hash
-					           AND CASE WHEN s.prev_output_idx < txs.out_count
-					                    THEN get_bit(txs.out_spendables, s.prev_output_idx) = 1
-					                    ELSE false END
-					     )
-					THEN $1::int
+					     AND spendable_count > 0
+					     AND spent_progress = spendable_count
+					THEN (GREATEST(COALESCE(last_spend_height, 0), COALESCE(mined_at_height, 0)) + 1 + $3)::int
 					ELSE NULL
 				END,
 				preserve_until = NULL
@@ -154,7 +177,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 			DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd WHERE delete_at_height IS NULL)
 		)
 		SELECT count(*) FROM upd
-	`, deleteAtHeight, int32(currentHeight)).Scan(&rowsAffected)
+	`, deleteAtHeight, int32(currentHeight), retention32).Scan(&rowsAffected)
 	if err != nil {
 		return errors.NewStorageError("failed to process expired preservations", err)
 	}

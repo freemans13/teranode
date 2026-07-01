@@ -74,19 +74,27 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// here, covering both orderings (mined-then-spent is covered by the sweep;
 		// spent-then-mined is covered here).
 		//
+		// Setter-C reconcile (Task 7): fully-spentness is now read from the MAINTAINED
+		// spent_progress counter (folded forward-only by the sweep proc — see
+		// dah_sweep_proc.go), NOT from an O(history) re-aggregation over the spends
+		// table. This both fixes the mine-after-already-fully-spent ordering AND removes
+		// the O(lifetime-spends) EXISTS/count(*) cost from the mine hot path.
+		//
 		// The CASE predicate:
 		//   guard: preserve_until IS NULL AND out_count > 0
-		//   zero-spendable: spendable_count = 0 (cheap, no join — the old case)
-		//   OR fully-spent: EXISTS(spends for this tx) AND
-		//       spendable_count = count(spends where output IS spendable)
-		// The EXISTS pre-filter is REQUIRED: for freshly-mined txs whose outputs are NOT
-		// yet spent (the common case), EXISTS returns false immediately and the costlier
-		// count/max subqueries are never evaluated. Only the rare spent-before-mined
-		// orphans pay the join cost.
+		//   zero-spendable: spendable_count = 0 (cheap scalar — immediately prune-eligible
+		//     once mined; handled explicitly so it never depends on the counter equality,
+		//     which for a 0=0 case would be ambiguous with a not-yet-folded tx)
+		//   OR fully-spent: spent_progress = spendable_count AND spendable_count > 0
+		//     (the counter reached the spendable-output total — every spendable output
+		//     has been folded). Reads two scalar columns already on the row; no join.
 		//
-		// Completion-height formula: GREATEST(max(spent_at_height), $5/*minedHeight*/)
-		// + 1 + $6/*retention*/ — matches the sweep and backstop so a late mine cannot
-		// schedule deletion too early. Cast to int to satisfy the INT4 column.
+		// Completion-height formula: GREATEST(last_spend_height, $5/*minedHeight*/)
+		// + 1 + $6/*retention*/ — matches the sweep proc's stamp (which also uses
+		// last_spend_height) so both stamp sites agree, and a late mine cannot schedule
+		// deletion too early. COALESCE(last_spend_height, 0) guards the zero-spendable
+		// case where the counter never folded a spend (last_spend_height IS NULL) →
+		// completion falls back to the mined height. Cast to int for the INT4 column.
 		//
 		// mined_at_height is the height of the block this tx is mined into
 		// (minedBlockInfo.BlockHeight), bound as $5 — NOT the store's current
@@ -108,18 +116,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 					delete_at_height = CASE
 						WHEN preserve_until IS NULL AND out_count > 0 AND (
 							spendable_count = 0
-							OR (
-								EXISTS (SELECT 1 FROM spends s WHERE s.prev_tx_hash = txs.hash)
-								AND spendable_count = (
-									SELECT count(*) FROM spends s
-									WHERE s.prev_tx_hash = txs.hash
-									  AND CASE WHEN s.prev_output_idx < txs.out_count
-									           THEN get_bit(txs.out_spendables, s.prev_output_idx) = 1
-									           ELSE false END)
-							))
-						THEN (GREATEST(
-								COALESCE((SELECT max(s.spent_at_height) FROM spends s WHERE s.prev_tx_hash = txs.hash), 0),
-								$5) + 1 + $6)::int
+							OR (spendable_count > 0 AND spent_progress = spendable_count)
+						)
+						THEN (GREATEST(COALESCE(last_spend_height, 0), $5) + 1 + $6)::int
 						ELSE delete_at_height
 					END
 				WHERE hash = ANY($1)

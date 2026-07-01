@@ -44,7 +44,7 @@ type postgresPrunerService struct {
 	mu            sync.Mutex
 	cursorStarted bool
 	cursorCancel  context.CancelFunc
-	cursorWg      sync.WaitGroup // tracks runDAHCursor so stop() can wait it out
+	cursorWg      sync.WaitGroup // tracks runDAHCursor + runDAHReconcile so stop() can wait them out
 }
 
 var _ pruner.Service = (*postgresPrunerService)(nil)
@@ -66,10 +66,18 @@ func (s *postgresPrunerService) Start(_ context.Context) {
 	s.cursorStarted = true
 	cursorCtx, cancel := context.WithCancel(context.Background())
 	s.cursorCancel = cancel
-	s.cursorWg.Add(1)
+	s.cursorWg.Add(2)
 	s.mu.Unlock()
-	s.logger.Infof("[PostgresPrunerService] starting DAH cursor (Worker 2)")
+	s.logger.Infof("[PostgresPrunerService] starting DAH cursor (Worker 2) + reconciliation backstop")
 	go s.runDAHCursor(cursorCtx)
+
+	// The reconciliation backstop shares the cursor lifetime/cancel/WaitGroup: it is
+	// the slow audit that restores the self-healing the maintained spent_progress
+	// counter otherwise lacks (Task 8). It runs off the hot path on a long interval.
+	go func() {
+		defer s.cursorWg.Done()
+		s.runDAHReconcile(cursorCtx)
+	}()
 }
 
 // stop cancels the background DAH cursor and WAITS for it to exit before

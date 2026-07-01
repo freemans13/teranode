@@ -16,7 +16,27 @@ import (
 //
 // Bumped 9→10: row-targeted batching (LIMIT batch_rows on the stamped set,
 // loop-until-short-pass, single watermark advance) replaces the v_step height-window loop.
-const dahSweepProcVersion = 10
+//
+// Bumped 10→11: fold-forward consumer. v10's fatal flaw was that every CALL
+// re-aggregated each candidate parent's ENTIRE spend history (the spend_agg CTE
+// joined spends_pNN over the whole (watermark, safe_tip] range) — O(lifetime
+// spends), which grows unbounded with the chain and cannot keep up with IBD,
+// freezing the watermark. v11 folds only NEW spends, once, forward-only: per
+// bounded height band it aggregates ONLY that band's spends, increments each
+// parent's spent_progress counter, and stamps delete_at_height when the counter
+// reaches spendable_count. Cost per band is O(new spends in band), independent of
+// chain size, so the watermark always advances.
+//
+// Bumped 11→12: merge the per-band FOLD and STAMP into a SINGLE UPDATE ...
+// RETURNING. v11 wrote the hot txs table TWICE per band — once to fold
+// (spent_progress += n, last_spend_height) and again to stamp delete_at_height —
+// and scanned the band twice. For txs that complete on the folded spend this
+// doubled txs dead-tuple churn on the hottest table (~15% measured throughput
+// regression). v12 stamps INLINE from the NEW spent_progress in the same UPDATE,
+// so each folded tx is written once and the band is scanned once. Semantics are
+// identical: same rows stamped, same delete_at_height values, same pending_deletes
+// upserts.
+const dahSweepProcVersion = 12
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaInternal (plain DDL);
@@ -28,6 +48,7 @@ CREATE TABLE IF NOT EXISTS dah_sweep_control (
     proc_version         INT         NOT NULL DEFAULT 0,
     batch_rows           INT         NOT NULL DEFAULT 5000,
     max_windows_per_call INT         NOT NULL DEFAULT 32,
+    band_heights         INT         NOT NULL DEFAULT 5000,
     last_called_at       TIMESTAMPTZ,
     last_rows_stamped    BIGINT      NOT NULL DEFAULT 0,
     last_candidates_seen BIGINT      NOT NULL DEFAULT 0,
@@ -38,7 +59,10 @@ CREATE TABLE IF NOT EXISTS dah_sweep_control (
     last_hit_budget      BOOL        NOT NULL DEFAULT FALSE,
     last_lock_contended  BOOL        NOT NULL DEFAULT FALSE,
     last_error           TEXT
-)`
+);
+-- band_heights was added in proc v11 (fold-forward). Idempotent ALTER so existing
+-- DBs get the column without a manual migration.
+ALTER TABLE dah_sweep_control ADD COLUMN IF NOT EXISTS band_heights INT NOT NULL DEFAULT 5000;`
 
 // dahSweepProcDDL returns the server-side self-committing DAH stamp procedure DDL.
 // It reproduces the exact DAH semantics of the in-process Go sweep
@@ -53,11 +77,47 @@ func dahSweepProcDDL() string {
 	return dahSweepProcDDLWithPendingDeletes
 }
 
-// dahSweepProcDDLWithPendingDeletes is the variant of the DAH sweep procedure
-// that also upserts each newly-stamped row into the per-leaf pending_deletes_pNN
-// table inside the same EXECUTE block. The upd CTE returns (hash, delete_at_height)
-// instead of just 1 so the ins CTE can populate the side-table, and the outer
-// SELECT count(*) FROM upd still counts stamped rows for the watermark logic.
+// dahSweepProcDDLWithPendingDeletes is the fold-forward (v12) DAH sweep procedure.
+//
+// v11 replaced v10's full-range re-aggregation with a forward-only fold. v12
+// merges v11's two per-band txs writes (fold + stamp) into one UPDATE ... RETURNING
+// so the hot txs table is written once per folded tx and the band is scanned once.
+// Per bounded height band (v_band heights, from dah_sweep_control.band_heights) it:
+//
+//  1. FOLDS the band's NEW spends ONLY — aggregates spends_pNN over
+//     (v_from, v_to] grouped by prev_tx_hash, counting SPENDABLE-output spends,
+//     and increments each parent's spent_progress by that count and advances
+//     last_spend_height. This reads only the band's rows (O(new spends in band)),
+//     NEVER a parent's whole spend history — the key change that lets the sweep
+//     keep up with IBD.
+//  2. STAMPS, in the SAME UPDATE, the parents whose fold just completed by
+//     computing delete_at_height inline from the NEW progress (t.spent_progress +
+//     d.n = spendable_count > 0), mined_at_height IS NOT NULL, delete_at_height IS
+//     NULL, preserve_until IS NULL, unmined_since IS NULL. delete_at_height =
+//     GREATEST(new last_spend_height, mined_at_height) + 1 + retention. The freshly
+//     stamped rows (RETURNING delete_at_height IS NOT NULL AND spent_progress =
+//     spendable_count) are upserted into pending_deletes_pNN in the same statement.
+//     A parent stamped in a PRIOR band that is folded again keeps its old
+//     delete_at_height (delete_at_height IS NULL guard in the CASE) and now has
+//     spent_progress > spendable_count, so it is excluded from the pending_deletes
+//     feed — no double-insert.
+//  3. ADVANCES dah_part_watermark to v_to and COMMITs — fold + stamp + advance are
+//     ONE transaction per band, so a torn commit never double-folds.
+//
+// The loop runs at most v_max_bands (dah_sweep_control.max_windows_per_call) bands
+// per CALL, so per-CALL work is bounded; the background driver re-fires while the
+// backlog is positive.
+//
+// Division of labour: a tx spent-before-mined has its spent_progress folded here
+// but is NOT stamped (mined gate) — the mine path (SetMinedMulti) stamps it on
+// mine, evaluating fully-spent directly from spends. The sweep only stamps the
+// mined-then-spent completion. A reorg that rewinds the watermark
+// (RewindDAHWatermark) BELOW already-folded heights makes this forward-only fold
+// RE-PROCESS still-present spends → spent_progress double-counts. That drift (and
+// any arithmetic/lost-update drift) is healed by the bounded reconciliation
+// backstop (dah_reconcile.go, Task 8), which is authoritative for the counter:
+// it recomputes the true spent_progress/last_spend_height from the spends table
+// over a rotating bounded slice per partition and corrects any divergence.
 const dahSweepProcDDLWithPendingDeletes = `CREATE OR REPLACE PROCEDURE dah_sweep_batch(
     p_partition  INT,
     p_safe_tip   BIGINT,
@@ -68,21 +128,28 @@ AS $$
 DECLARE
     v_leaf_suffix    TEXT := lpad(p_partition::text, 2, '0');
     v_from           BIGINT;
-    v_max_rows       INT;
+    v_to             BIGINT;
+    v_band           INT;
+    v_max_bands      INT;
     v_enabled        BOOLEAN;
     v_n              BIGINT;
     v_total_stamped  BIGINT := 0;
-    v_drained        BOOLEAN := false;
+    v_bands_done     INT := 0;
 BEGIN
-    SELECT enabled, batch_rows INTO v_enabled, v_max_rows
+    SELECT enabled, band_heights, max_windows_per_call
+      INTO v_enabled, v_band, v_max_bands
       FROM dah_sweep_control WHERE id = 1;
 
     IF NOT v_enabled THEN
         RETURN;
     END IF;
 
-    IF v_max_rows IS NULL OR v_max_rows <= 0 THEN
-        v_max_rows := 5000;
+    IF v_band IS NULL OR v_band <= 0 THEN
+        v_band := 5000;
+    END IF;
+
+    IF v_max_bands IS NULL OR v_max_bands <= 0 THEN
+        v_max_bands := 8;
     END IF;
 
     IF current_setting('server_version_num')::int < 110000 THEN
@@ -97,11 +164,10 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Row-targeted batches: each pass stamps up to v_max_rows fully-spent-unstamped
-    -- parents over the WHOLE (v_from, p_safe_tip] range. Stamped rows drop out via the
-    -- delete_at_height IS NULL filter, so the qualifying set strictly shrinks each pass.
-    -- The watermark stays at v_from during the loop and advances once at the end.
-    LOOP
+    -- Fold forward one bounded band at a time. Each iteration processes ONLY the
+    -- band's new spends (O(new spends in band)) and commits atomically, so the
+    -- watermark always advances and per-CALL work is capped at v_max_bands bands.
+    WHILE v_from < p_safe_tip AND v_bands_done < v_max_bands LOOP
         SELECT enabled INTO v_enabled FROM dah_sweep_control WHERE id = 1;
         EXIT WHEN NOT v_enabled;
 
@@ -109,81 +175,81 @@ BEGIN
             EXIT;
         END IF;
 
-        SET LOCAL enable_seqscan = off;
+        v_to := LEAST(v_from + v_band, p_safe_tip);
+
         SET LOCAL lock_timeout = '5s';
 
+        -- (1+2) FOLD + STAMP in ONE UPDATE: read ONLY this band's spends, increment
+        -- spent_progress and advance last_spend_height on each parent, and — in the
+        -- SAME write — stamp delete_at_height inline for parents whose NEW progress
+        -- (t.spent_progress + d.n) just reached spendable_count. This writes the hot
+        -- txs table once per folded tx and scans the band once. Spendable-output test
+        -- mirrors the v10 semantics (prev_output_idx < out_count AND get_bit=1).
+        --
+        -- The stamp uses the NEW last_spend_height inline
+        -- (GREATEST(COALESCE(t.last_spend_height,0), d.max_h)) because t.last_spend_height
+        -- in the UPDATE expression evaluates against the PRE-update row. The
+        -- delete_at_height IS NULL guard keeps a prior-band-stamped row's stamp; if
+        -- such a row is folded again its progress goes ABOVE spendable_count, so it is
+        -- excluded from the pending_deletes feed (= spendable_count) — no double-insert.
         EXECUTE format($q$
-            WITH candidates AS MATERIALIZED (
-                SELECT DISTINCT prev_tx_hash AS hash FROM spends_p%1$s
-                 WHERE spent_at_height > $1 AND spent_at_height <= $2
-            ),
-            eligible AS MATERIALIZED (
-                SELECT t.hash, t.out_count, t.out_spendables, t.spendable_count, t.mined_at_height
-                  FROM txs_p%1$s t
-                  JOIN candidates c ON c.hash = t.hash
-                 WHERE t.delete_at_height IS NULL
-                   AND t.preserve_until IS NULL
-                   AND t.unmined_since IS NULL
-                   AND t.block_ids IS NOT NULL AND array_length(t.block_ids, 1) IS NOT NULL
-            ),
-            spend_agg AS (
+            WITH band_agg AS (
                 SELECT s.prev_tx_hash AS hash,
-                       count(*) FILTER (WHERE CASE WHEN s.prev_output_idx < e.out_count THEN get_bit(e.out_spendables, s.prev_output_idx) = 1 ELSE false END) AS spent_count,
-                       max(s.spent_at_height) AS max_spent
+                       count(*) FILTER (
+                           WHERE CASE WHEN s.prev_output_idx < t.out_count
+                                      THEN get_bit(t.out_spendables, s.prev_output_idx) = 1
+                                      ELSE false END
+                       ) AS n,
+                       max(s.spent_at_height) AS max_h
                 FROM spends_p%1$s s
-                JOIN eligible e ON e.hash = s.prev_tx_hash
+                JOIN txs_p%1$s t ON t.hash = s.prev_tx_hash
+                WHERE s.spent_at_height > $1 AND s.spent_at_height <= $2
                 GROUP BY s.prev_tx_hash
-            ),
-            state AS (
-                SELECT e.hash,
-                       CASE
-                           WHEN COALESCE(sa.spent_count, 0) = e.spendable_count
-                                AND e.out_count > 0
-                                AND GREATEST(COALESCE(sa.max_spent, 0), COALESCE(e.mined_at_height, 0)) <= $2
-                               THEN (GREATEST(COALESCE(sa.max_spent, 0), COALESCE(e.mined_at_height, 0)) + 1 + $3)::int
-                           ELSE NULL
-                       END AS new_dah
-                FROM eligible e
-                LEFT JOIN spend_agg sa ON sa.hash = e.hash
-            ),
-            to_stamp AS MATERIALIZED (
-                SELECT hash, new_dah FROM state WHERE new_dah IS NOT NULL LIMIT $4
             ),
             upd AS (
                 UPDATE txs_p%1$s t
-                   SET delete_at_height = ts.new_dah
-                  FROM to_stamp ts
-                 WHERE t.hash = ts.hash
-                   AND t.delete_at_height IS DISTINCT FROM ts.new_dah
-                RETURNING t.hash, ts.new_dah AS delete_at_height
+                   SET spent_progress    = t.spent_progress + d.n,
+                       last_spend_height = GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
+                       delete_at_height  = CASE
+                           WHEN t.spent_progress + d.n = t.spendable_count
+                                AND t.spendable_count > 0
+                                AND t.mined_at_height IS NOT NULL
+                                AND t.delete_at_height IS NULL
+                                AND t.preserve_until IS NULL
+                                AND t.unmined_since IS NULL
+                           THEN (GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
+                                          t.mined_at_height) + 1 + $3)::int
+                           ELSE t.delete_at_height
+                       END
+                  FROM band_agg d
+                 WHERE t.hash = d.hash
+                   AND d.n > 0
+                RETURNING t.hash, t.delete_at_height, t.spent_progress, t.spendable_count
             ),
             ins AS (
                 INSERT INTO pending_deletes_p%1$s (hash, delete_at_height)
-                SELECT hash, delete_at_height FROM upd WHERE delete_at_height IS NOT NULL
+                SELECT hash, delete_at_height FROM upd
+                 WHERE delete_at_height IS NOT NULL AND spent_progress = spendable_count
                 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
             )
             SELECT count(*) FROM upd
+             WHERE delete_at_height IS NOT NULL AND spent_progress = spendable_count
         $q$, v_leaf_suffix)
-        USING v_from, p_safe_tip, p_retention, v_max_rows
+        USING v_from, v_to, p_retention
         INTO v_n;
+
+        -- (3) ADVANCE the watermark to the band end (forward-only guard), then
+        -- COMMIT: fold + stamp + advance are one transaction for this band.
+        UPDATE dah_part_watermark
+           SET last_swept_height = v_to
+         WHERE partition = p_partition AND last_swept_height < v_to;
 
         v_total_stamped := v_total_stamped + v_n;
         COMMIT;
 
-        IF v_n < v_max_rows THEN
-            v_drained := true;
-            EXIT;
-        END IF;
+        v_from := v_to;
+        v_bands_done := v_bands_done + 1;
     END LOOP;
-
-    -- Advance the watermark only when the range was genuinely drained (not on
-    -- advisory-lock-miss or kill-switch exit). An empty range still sets v_drained
-    -- (v_n=0 < v_max_rows) so a caught-up partition still marks itself swept.
-    IF v_drained THEN
-        UPDATE dah_part_watermark
-           SET last_swept_height = p_safe_tip
-         WHERE partition = p_partition AND last_swept_height < p_safe_tip;
-    END IF;
 
     UPDATE dah_sweep_control
        SET last_called_at = now(),
@@ -223,9 +289,16 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 		maxWin = 32
 	}
 
+	// band_heights bounds the per-band fold width (proc v11). Seeded from settings
+	// so ops tuning flows through the same single source of truth as the other knobs.
+	bandHeights := s.settings.UtxoStore.PostgresDAHSweepBandHeights
+	if bandHeights <= 0 {
+		bandHeights = 5000
+	}
+
 	if _, err = s.pool.Exec(ctx,
-		`UPDATE dah_sweep_control SET batch_rows = $1, max_windows_per_call = $2 WHERE id = 1`,
-		batchRows, maxWin,
+		`UPDATE dah_sweep_control SET batch_rows = $1, max_windows_per_call = $2, band_heights = $3 WHERE id = 1`,
+		batchRows, maxWin, bandHeights,
 	); err != nil {
 		if isInsufficientPrivilege(err) {
 			return errors.NewStorageError("[dahSweep] app role lacks privilege to write dah_sweep_control (42501); grant it so the DAH sweep can run")
