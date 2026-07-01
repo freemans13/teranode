@@ -65,6 +65,7 @@ func makeAgedFanoutTx(workerID, seq, k int) *bt.Tx {
 
 	// Synthetic previous outpoint: unique per (workerID, seq) so txid is unique.
 	// Mirrors makeGenesisTx's approach of encoding identity into the prev-hash bytes.
+	// p2pkhScript is defined in throughput_test.go (same package).
 	var h [32]byte
 	h[0] = byte(workerID)
 	h[1] = byte(workerID >> 8)
@@ -153,7 +154,7 @@ func makeSpendOfVout(parent *bt.Tx, vout uint32) *bt.Tx {
 	if outVal == 0 {
 		outVal = 1
 	}
-	_ = tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", outVal)
+	tx.AddOutput(&bt.Output{Satoshis: outVal, LockingScript: p2pkhScript()})
 	return tx
 }
 
