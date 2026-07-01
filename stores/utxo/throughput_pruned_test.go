@@ -159,7 +159,25 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 	{
 		seedPool, perr := pgxpool.New(ctx, throughputDSN)
 		if perr == nil {
-			_, _ = seedPool.Exec(ctx, `UPDATE dah_part_watermark SET last_swept_height = 199 WHERE last_swept_height < 199`)
+			// Watermark pre-seed height (env-tunable). The linear pruned bench writes
+			// nothing below 200, so seeding to 199 skips only the empty genesis range.
+			// The aged-fanout bench writes spends as low as the parent mined-height
+			// (< 199), so it MUST pre-seed to 0 (DAH_WM_SEED=0) — otherwise the fold's
+			// `spent_at_height > watermark` permanently skips those low spends and parents
+			// never reach spendable_count.
+			// Unconditional set (bench seed on a fresh DB): the aged-fanout bench needs to
+			// LOWER the watermark to 0 to cover sub-200 spends, which a forward-only
+			// `WHERE last_swept_height < $1` guard would prevent.
+			wmSeed := int32(envInt("DAH_WM_SEED", 199))
+			_, _ = seedPool.Exec(ctx, `UPDATE dah_part_watermark SET last_swept_height = $1`, wmSeed)
+			// Bench-only (no effect unless DAH_BAND_HEIGHTS is set): shrink the v11 fold-
+			// forward proc's per-band height span so each band's cold fold commits well under
+			// the tight bench per-CALL timeout, letting the O(new-spends) setter drain the
+			// backlog. The fixed default band (5000) is too large for the bench's dense
+			// seeded spend distribution; production band sizing should be adaptive/row-bounded.
+			if bh := envInt("DAH_BAND_HEIGHTS", 0); bh > 0 {
+				_, _ = seedPool.Exec(ctx, `UPDATE dah_sweep_control SET band_heights = $1 WHERE id = 1`, bh)
+			}
 			seedPool.Close()
 		}
 	}
