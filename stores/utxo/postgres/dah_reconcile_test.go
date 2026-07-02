@@ -329,13 +329,14 @@ func TestReconcileKeepsConflictingStamp(t *testing.T) {
 	require.Equal(t, bad, *dah)
 }
 
-// TestRewindThenRefoldFullySpentReDerivesTrueCount is the reorg-rewind safety proof
-// for a FULLY-spent tx (companion to TestRewindPastSurvivingSpendDoesNotDoubleCount,
-// which covers the partial case). RewindDAHWatermark resets each affected tx's counter
-// to its <= forkHeight baseline before the re-sweep, so re-folding a range whose spends
-// SURVIVED the reorg re-derives the TRUE count instead of double-counting to 4 (the old
-// forward-only fold's permanent leak). The reconcile backstop then finds nothing to heal.
-func TestRewindThenRefoldFullySpentReDerivesTrueCount(t *testing.T) {
+// TestFullySpentStaysStampedDespiteCounterDrift is the companion to
+// TestFoldStampRefusesDriftedCounter for a GENUINELY fully-spent tx: a reorg rewind +
+// re-fold drifts the forward-only counter above spendable_count (double-count), but the
+// tx really is fully spent, so it must remain correctly stamped for deletion. This
+// guards that the ground-truth stamp gate does not REGRESS legitimate pruning (which
+// would let the table grow unbounded during IBD). The reconcile backstop then corrects
+// the drifted counter back to the true count without disturbing the (correct) stamp.
+func TestFullySpentStaysStampedDespiteCounterDrift(t *testing.T) {
 	store, ctx := setupTestStore(t)
 	require.NoError(t, store.SetBlockHeight(110))
 	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
@@ -344,32 +345,27 @@ func TestRewindThenRefoldFullySpentReDerivesTrueCount(t *testing.T) {
 	_ = spendVoutOwned(t, store, parent, 0, 101)
 	_ = spendVoutOwned(t, store, parent, 1, 101) // fully spent@101 → true count = 2
 
-	// Fold + stamp normally.
+	// Fold + stamp normally (ground truth = 2 = spendable_count → stamped).
 	_, err := procSweepUpTo(store, ctx, 110)
 	require.NoError(t, err)
 	require.Equal(t, 2, spentProgressOfTx(t, store, ctx, parent))
-	require.NotNil(t, dahOfTx(t, store, ctx, parent))
+	dah := dahOfTx(t, store, ctx, parent)
+	require.NotNil(t, dah, "genuinely fully-spent mined tx is stamped")
+	require.Equal(t, int64(101)+1+ret, *dah)
 
-	// Reorg: rewind the watermark BELOW the surviving spends' heights. The spends
-	// themselves survive (this models a reorg that re-swept the range but where the
-	// spends were re-applied at the same heights). The rewind resets the counter to its
-	// <=100 baseline (0), then the re-fold re-derives it to the TRUE count 2 — NOT 4.
+	// Reorg rewind below both surviving spends + re-fold: the forward-only fold
+	// double-counts, drifting the counter above spendable_count. The tx is still genuinely
+	// fully spent, so the stamp must persist (the delete_at_height IS NULL guard keeps the
+	// existing correct stamp; ground truth would re-confirm it anyway).
 	require.NoError(t, store.RewindDAHWatermark(ctx, 100))
 	_, err = procSweepUpTo(store, ctx, 110)
 	require.NoError(t, err)
-	require.Equal(t, 2, spentProgressOfTx(t, store, ctx, parent),
-		"rewind+re-fold must re-derive the true count, not double-count the surviving spends")
-	dah := dahOfTx(t, store, ctx, parent)
-	require.NotNil(t, dah, "the fully-spent mined tx must be re-stamped after rewind+re-fold")
-	require.Equal(t, int64(101)+1+ret, *dah)
+	require.NotNil(t, dahOfTx(t, store, ctx, parent), "genuinely fully-spent tx stays stamped")
+	require.Equal(t, int64(101)+1+ret, *dahOfTx(t, store, ctx, parent))
 
-	// Reconcile is authoritative for the rewound range: with the source fix it finds no
-	// drift and leaves the true count and stamp intact.
+	// Reconcile corrects the drifted counter back to the true count (2) and leaves the stamp.
 	reconcileAllPartitions(t, store, ctx, 110, 10000)
-
 	require.Equal(t, 2, spentProgressOfTx(t, store, ctx, parent),
-		"reconcile leaves the correctly re-derived count intact")
-	dah2 := dahOfTx(t, store, ctx, parent)
-	require.NotNil(t, dah2, "stamp remains after reconcile")
-	require.Equal(t, int64(101)+1+ret, *dah2)
+		"reconcile heals the counter drift back to the true spendable-spend count")
+	require.NotNil(t, dahOfTx(t, store, ctx, parent), "correct stamp survives reconcile")
 }

@@ -36,7 +36,20 @@ import (
 // so each folded tx is written once and the band is scanned once. Semantics are
 // identical: same rows stamped, same delete_at_height values, same pending_deletes
 // upserts.
-const dahSweepProcVersion = 12
+//
+// Bumped 12→13: authorise the stamp from GROUND TRUTH, not the counter. The
+// maintained spent_progress can drift UPWARD — a reorg rewinds the watermark and the
+// forward-only fold re-counts still-present spends (also plain arithmetic/lost-update
+// drift). Trusting the counter stamped, and the pruner then irreversibly cascade-
+// deleted, a tx whose output was still an unspent UTXO (the IBD data-loss wedge,
+// mainnet h63266 / testnet …5e5ea, 2026-07-02). v13 keeps the counter as a cheap gate
+// (spent_progress + d.n >= spendable_count) but confirms full-spend with a bounded
+// recount of the tx's spendable spends (up to the band ceiling) before stamping, so a
+// drifted counter can no longer schedule a live UTXO for deletion. The pending_deletes
+// feed now keys off delete_at_height IS NOT NULL alone (the old spent_progress =
+// spendable_count filter would wrongly drop a row the recount stamped after an
+// overshoot). The counter itself is healed by the reconcile backstop.
+const dahSweepProcVersion = 13
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaInternal (plain DDL);
@@ -77,11 +90,13 @@ func dahSweepProcDDL() string {
 	return dahSweepProcDDLWithPendingDeletes
 }
 
-// dahSweepProcDDLWithPendingDeletes is the fold-forward (v12) DAH sweep procedure.
+// dahSweepProcDDLWithPendingDeletes is the fold-forward (v13) DAH sweep procedure.
 //
 // v11 replaced v10's full-range re-aggregation with a forward-only fold. v12
 // merges v11's two per-band txs writes (fold + stamp) into one UPDATE ... RETURNING
 // so the hot txs table is written once per folded tx and the band is scanned once.
+// v13 authorises the stamp from a ground-truth spends recount rather than the
+// (drift-prone) counter — see the version-history note above.
 // Per bounded height band (v_band heights, from dah_sweep_control.band_heights) it:
 //
 //  1. FOLDS the band's NEW spends ONLY — aggregates spends_pNN over
@@ -90,17 +105,18 @@ func dahSweepProcDDL() string {
 //     last_spend_height. This reads only the band's rows (O(new spends in band)),
 //     NEVER a parent's whole spend history — the key change that lets the sweep
 //     keep up with IBD.
-//  2. STAMPS, in the SAME UPDATE, the parents whose fold just completed by
-//     computing delete_at_height inline from the NEW progress (t.spent_progress +
-//     d.n = spendable_count > 0), mined_at_height IS NOT NULL, delete_at_height IS
-//     NULL, preserve_until IS NULL, unmined_since IS NULL. delete_at_height =
-//     GREATEST(new last_spend_height, mined_at_height) + 1 + retention. The freshly
-//     stamped rows (RETURNING delete_at_height IS NOT NULL AND spent_progress =
-//     spendable_count) are upserted into pending_deletes_pNN in the same statement.
-//     A parent stamped in a PRIOR band that is folded again keeps its old
-//     delete_at_height (delete_at_height IS NULL guard in the CASE) and now has
-//     spent_progress > spendable_count, so it is excluded from the pending_deletes
-//     feed — no double-insert.
+//  2. STAMPS, in the SAME UPDATE, the parents whose fold just completed. The counter
+//     gate (t.spent_progress + d.n >= spendable_count > 0), mined_at_height IS NOT
+//     NULL, delete_at_height IS NULL, preserve_until IS NULL, unmined_since IS NULL
+//     short-circuits a GROUND-TRUTH recount of the tx's spendable spends (bounded by
+//     the band ceiling); delete_at_height is stamped ONLY when that recount equals
+//     spendable_count, so a counter drifted above spendable_count can never stamp a
+//     not-fully-spent tx. delete_at_height = GREATEST(new last_spend_height,
+//     mined_at_height) + 1 + retention. Every freshly stamped row (RETURNING
+//     delete_at_height IS NOT NULL) is upserted into pending_deletes_pNN in the same
+//     statement. A parent stamped in a PRIOR band that is folded again keeps its old
+//     delete_at_height (delete_at_height IS NULL guard in the CASE); the ON CONFLICT
+//     upsert then just re-writes the unchanged value — harmless.
 //  3. ADVANCES dah_part_watermark to v_to and COMMITs — fold + stamp + advance are
 //     ONE transaction per band, so a torn commit never double-folds.
 //
@@ -210,13 +226,27 @@ BEGIN
                 UPDATE txs_p%1$s t
                    SET spent_progress    = t.spent_progress + d.n,
                        last_spend_height = GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
+                       -- Stamp delete_at_height only when GROUND TRUTH (a recount of the
+                       -- tx's spendable spends up to the band ceiling) confirms full-spend.
+                       -- The maintained spent_progress counter can drift UPWARD (reorg
+                       -- re-fold, lost update); trusting it here would stamp — and the
+                       -- pruner would irreversibly cascade-delete — a tx whose output is
+                       -- still an unspent UTXO (the IBD data-loss wedge). The cheap counter
+                       -- gate (>= spendable_count) short-circuits the recount so it runs
+                       -- ONLY for near-complete candidates; the recount is authoritative.
+                       -- ">=" (not "=") also re-checks a counter that overshot spendable_count.
                        delete_at_height  = CASE
-                           WHEN t.spent_progress + d.n = t.spendable_count
+                           WHEN t.spent_progress + d.n >= t.spendable_count
                                 AND t.spendable_count > 0
                                 AND t.mined_at_height IS NOT NULL
                                 AND t.delete_at_height IS NULL
                                 AND t.preserve_until IS NULL
                                 AND t.unmined_since IS NULL
+                                AND (SELECT count(*) FROM spends_p%1$s gs
+                                       WHERE gs.prev_tx_hash = t.hash
+                                         AND gs.prev_output_idx < t.out_count
+                                         AND get_bit(t.out_spendables, gs.prev_output_idx) = 1
+                                         AND gs.spent_at_height <= $2) = t.spendable_count
                            THEN (GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
                                           t.mined_at_height) + 1 + $3)::int
                            ELSE t.delete_at_height
@@ -224,16 +254,16 @@ BEGIN
                   FROM band_agg d
                  WHERE t.hash = d.hash
                    AND d.n > 0
-                RETURNING t.hash, t.delete_at_height, t.spent_progress, t.spendable_count
+                RETURNING t.hash, t.delete_at_height
             ),
             ins AS (
                 INSERT INTO pending_deletes_p%1$s (hash, delete_at_height)
                 SELECT hash, delete_at_height FROM upd
-                 WHERE delete_at_height IS NOT NULL AND spent_progress = spendable_count
+                 WHERE delete_at_height IS NOT NULL
                 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
             )
             SELECT count(*) FROM upd
-             WHERE delete_at_height IS NOT NULL AND spent_progress = spendable_count
+             WHERE delete_at_height IS NOT NULL
         $q$, v_leaf_suffix)
         USING v_from, v_to, p_retention
         INTO v_n;
