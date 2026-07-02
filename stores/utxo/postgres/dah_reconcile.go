@@ -50,6 +50,14 @@ CREATE TABLE IF NOT EXISTS dah_reconcile_cursor (
 // respects the same mined/preserve/unmined gates as the fold, so an unmined
 // fully-spent tx is corrected but left unstamped (the mine path owns that stamp).
 //
+// It also UN-STAMPS in the reverse direction (defense-in-depth): a tx carrying a
+// delete_at_height while it is NOT actually fully spent (true_progress <
+// spendable_count) has that premature/stale stamp CLEARED and is removed from
+// pending_deletes — otherwise the pruner (which deletes purely on the stamp) would
+// delete a tx with a live UTXO. Legitimate not-fully-spent stamps are preserved:
+// conflicting (double-spend loser) and preserved (preserve_until) txs are excluded,
+// as is the zero-spendable case (spendable_count = 0).
+//
 // It is authoritative for the reorg-rewind range: because it RECOMPUTES from the
 // spends table rather than adding a delta, a doubled counter is set back to the
 // true count in one pass regardless of how the drift arose.
@@ -88,7 +96,7 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 		WITH slice_txs AS (
 			SELECT hash, spendable_count, mined_at_height, delete_at_height,
 			       spent_progress, last_spend_height, preserve_until, unmined_since,
-			       out_count, out_spendables
+			       out_count, out_spendables, conflicting
 			  FROM txs_p%[1]s
 			 WHERE ($1::bytea IS NULL OR hash > $1::bytea)
 			 ORDER BY hash
@@ -112,12 +120,24 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 		),
 		drift AS (
 			SELECT c.hash, c.spendable_count, c.mined_at_height, c.delete_at_height,
-			       c.preserve_until, c.unmined_since,
+			       c.preserve_until, c.unmined_since, c.conflicting,
 			       t.true_progress, t.true_last_spend
 			  FROM slice_txs c
 			  JOIN truth t ON t.hash = c.hash
 			 WHERE c.spent_progress IS DISTINCT FROM t.true_progress
 			    OR c.last_spend_height IS DISTINCT FROM t.true_last_spend
+			    -- Stamped-but-not-fully-spent: a premature/stale delete_at_height left
+			    -- behind by residual drift (a stamp taken from a transiently-inflated
+			    -- counter that was later corrected down). The counter may already be
+			    -- correct, so this is NOT caught by the drift predicates above. Exclude
+			    -- the legitimate not-fully-spent stamps: conflicting losers and preserved
+			    -- txs. Zero-spendable (spendable_count = 0) is excluded by the > 0 guard.
+			    OR (c.delete_at_height IS NOT NULL
+			        AND t.true_progress < c.spendable_count
+			        AND c.spendable_count > 0
+			        AND NOT c.conflicting
+			        AND c.preserve_until IS NULL
+			        AND c.unmined_since IS NULL)
 		),
 		upd AS (
 			UPDATE txs_p%[1]s t
@@ -131,6 +151,16 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 			                AND d.preserve_until IS NULL
 			                AND d.unmined_since IS NULL
 			           THEN (GREATEST(COALESCE(d.true_last_spend, 0), d.mined_at_height) + 1 + $4)::int
+			           -- Un-stamp a premature/stale stamp on a genuinely not-fully-spent,
+			           -- non-conflicting, unpreserved, mined tx (defense-in-depth). Leaving
+			           -- it would let the pruner delete a tx with a live UTXO.
+			           WHEN d.delete_at_height IS NOT NULL
+			                AND d.true_progress < d.spendable_count
+			                AND d.spendable_count > 0
+			                AND NOT d.conflicting
+			                AND d.preserve_until IS NULL
+			                AND d.unmined_since IS NULL
+			           THEN NULL
 			           ELSE d.delete_at_height
 			       END
 			  FROM drift d
@@ -142,6 +172,11 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 			SELECT hash, delete_at_height FROM upd
 			 WHERE delete_at_height IS NOT NULL AND spent_progress = spendable_count
 			ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
+		),
+		del AS (
+			DELETE FROM pending_deletes_p%[1]s pd
+			 USING upd u
+			 WHERE pd.hash = u.hash AND u.delete_at_height IS NULL
 		)
 		SELECT (SELECT count(*) FROM upd),
 		       (SELECT min(hash) FROM upd),

@@ -119,6 +119,47 @@ func TestUnspendDecrementsSpentProgressExactlyOne(t *testing.T) {
 		"re-stamp uses the new completion height (max folded spend)")
 }
 
+// TestRewindPastSurvivingSpendDoesNotDoubleCount reproduces the IBD data-loss wedge
+// observed on Hetzner mainnet (h63266) and testnet (block …5e5ea) on 2026-07-02.
+//
+// A reorg calls RewindDAHWatermark(forkHeight) so the fold re-sweeps (forkHeight, tip].
+// If a spend in that range is STILL PRESENT (on the surviving chain, never Unspent),
+// the pure forward-only fold does spent_progress += n a SECOND time over it. For a
+// partially-spent mined tx (vout0 spent, vout1 still a live UTXO) this pushes the
+// counter 1 -> 2 = spendable_count, which stamps delete_at_height and makes the pruner
+// delete a tx whose vout1 is unspent. A later block spending vout1 then hits
+// TX_NOT_FOUND — the parent is gone.
+//
+// The re-fold MUST be idempotent for surviving spends: re-sweeping a range must not
+// count a spend already reflected in the counter. spent_progress must stay 1 and the
+// tx must stay unstamped.
+func TestRewindPastSurvivingSpendDoesNotDoubleCount(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(110))
+
+	parent := newMinedSingleOutputTx(t, store, 100) // pre-mined, exactly 2 spendable outputs
+	_ = spendVoutOwned(t, store, parent, 0, 101)    // PARTIAL: only vout0 spent; vout1 stays a live UTXO
+
+	// First fold: counter reaches 1 (one spendable output spent), NOT stamped (partial).
+	_, err := procSweepUpTo(store, ctx, 110)
+	require.NoError(t, err)
+	require.Equal(t, 1, spentProgressOfTx(t, store, ctx, parent), "one spendable output folded")
+	require.Nil(t, dahOfTx(t, store, ctx, parent), "partially-spent tx must not be stamped")
+
+	// Reorg: rewind the watermark BELOW the surviving vout0 spend (height 101). The spend
+	// is NOT unspent (it lives on the surviving chain) — only the watermark moves back, so
+	// the re-sweep re-examines a range whose spend row is still present.
+	require.NoError(t, store.RewindDAHWatermark(ctx, 100))
+	_, err = procSweepUpTo(store, ctx, 110)
+	require.NoError(t, err)
+
+	// The re-fold must NOT double-count the surviving vout0 spend.
+	require.Equal(t, 1, spentProgressOfTx(t, store, ctx, parent),
+		"re-sweeping a range with a surviving spend must not double-count it")
+	require.Nil(t, dahOfTx(t, store, ctx, parent),
+		"vout1 is still an unspent UTXO — the tx must NOT be stamped for deletion")
+}
+
 // TestUnspendNonOwningDoesNotDecrement pins that a non-owning (mismatched
 // SpendingData) Unspend deletes 0 rows and therefore does NOT decrement
 // spent_progress — the live spend row and its counter contribution are untouched.

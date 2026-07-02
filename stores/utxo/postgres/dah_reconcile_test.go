@@ -261,13 +261,81 @@ func TestReconcileBounded(t *testing.T) {
 	require.Zero(t, stillDrifted, "repeated bounded passes eventually heal all drift")
 }
 
-// TestReconcileHealsReorgDoubleFold is the reorg-rewind safety proof. It folds a
-// range, then RewindDAHWatermark below a SURVIVING spend, re-folds (the pure
-// forward-only fold DOUBLE-COUNTS the surviving spend, overshooting
-// spendable_count so the completion gate never fires again — permanent leak),
-// then reconciles and asserts spent_progress equals the TRUE count (not doubled)
-// and the completion stamp is (re)applied correctly.
-func TestReconcileHealsReorgDoubleFold(t *testing.T) {
+// TestReconcileUnstampsStaleStampOnNotFullySpent proves fix 2: the reconcile backstop
+// must CLEAR a delete_at_height stamp on a mined, non-conflicting, non-preserved tx that
+// is NOT actually fully spent (true_progress < spendable_count), and remove it from
+// pending_deletes. This is the defense-in-depth against a premature stamp left behind by
+// any residual drift source (a stamp taken from a transiently-inflated counter that was
+// later corrected down): the counter can already be correct, so the stamp would otherwise
+// survive and the pruner would delete a tx with a live UTXO. Without the fix the reconcile
+// only ever SETS delete_at_height and never clears one, so the stale stamp persists.
+func TestReconcileUnstampsStaleStampOnNotFullySpent(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(110))
+
+	parent := newMinedSingleOutputTx(t, store, 100) // mined, 2 spendable outputs
+	_ = spendVoutOwned(t, store, parent, 0, 101)    // PARTIAL: vout1 stays a live UTXO
+
+	_, err := procSweepUpTo(store, ctx, 110)
+	require.NoError(t, err)
+	require.Equal(t, 1, spentProgressOfTx(t, store, ctx, parent), "counter is correct at 1")
+	require.Nil(t, dahOfTx(t, store, ctx, parent))
+
+	// Simulate a premature stamp left behind by residual drift: counter is already the
+	// TRUE value (1), but delete_at_height + pending_deletes carry a stale stamp.
+	bad := int64(999)
+	setDAHRaw(t, store, ctx, parent, &bad)
+	_, err = store.pool.Exec(ctx,
+		`INSERT INTO pending_deletes (hash, delete_at_height) VALUES ($1, $2)
+		 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height`,
+		parent.TxIDChainHash()[:], bad)
+	require.NoError(t, err)
+
+	reconcileAllPartitions(t, store, ctx, 110, 10000)
+
+	require.Nil(t, dahOfTx(t, store, ctx, parent),
+		"reconcile must un-stamp a not-fully-spent tx (vout1 is a live UTXO)")
+	var pd int
+	require.NoError(t, store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM pending_deletes WHERE hash=$1`, parent.TxIDChainHash()[:]).Scan(&pd))
+	require.Zero(t, pd, "reconcile must remove the un-stamped tx from pending_deletes")
+	require.Equal(t, 1, spentProgressOfTx(t, store, ctx, parent), "counter stays at the true value")
+}
+
+// TestReconcileKeepsConflictingStamp guards fix 2: the un-stamp must NOT clear a
+// legitimate delete_at_height on a CONFLICTING (double-spend loser) tx, which is stamped
+// for deletion regardless of spent-ness. Clearing it would resurrect a losing tx.
+func TestReconcileKeepsConflictingStamp(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	require.NoError(t, store.SetBlockHeight(110))
+
+	parent := newMinedSingleOutputTx(t, store, 100)
+	_ = spendVoutOwned(t, store, parent, 0, 101) // partially spent
+
+	_, err := procSweepUpTo(store, ctx, 110)
+	require.NoError(t, err)
+
+	// Mark it conflicting and stamp it for deletion (the conflicting-loser path).
+	bad := int64(999)
+	_, err = store.pool.Exec(ctx,
+		`UPDATE txs SET conflicting = true, delete_at_height = $2 WHERE hash = $1`,
+		parent.TxIDChainHash()[:], bad)
+	require.NoError(t, err)
+
+	reconcileAllPartitions(t, store, ctx, 110, 10000)
+
+	dah := dahOfTx(t, store, ctx, parent)
+	require.NotNil(t, dah, "reconcile must NOT clear a conflicting tx's deletion stamp")
+	require.Equal(t, bad, *dah)
+}
+
+// TestRewindThenRefoldFullySpentReDerivesTrueCount is the reorg-rewind safety proof
+// for a FULLY-spent tx (companion to TestRewindPastSurvivingSpendDoesNotDoubleCount,
+// which covers the partial case). RewindDAHWatermark resets each affected tx's counter
+// to its <= forkHeight baseline before the re-sweep, so re-folding a range whose spends
+// SURVIVED the reorg re-derives the TRUE count instead of double-counting to 4 (the old
+// forward-only fold's permanent leak). The reconcile backstop then finds nothing to heal.
+func TestRewindThenRefoldFullySpentReDerivesTrueCount(t *testing.T) {
 	store, ctx := setupTestStore(t)
 	require.NoError(t, store.SetBlockHeight(110))
 	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
@@ -284,21 +352,24 @@ func TestReconcileHealsReorgDoubleFold(t *testing.T) {
 
 	// Reorg: rewind the watermark BELOW the surviving spends' heights. The spends
 	// themselves survive (this models a reorg that re-swept the range but where the
-	// spends were re-applied at the same heights). Re-folding now RE-PROCESSES those
-	// still-present spends → spent_progress double-counts to 4.
+	// spends were re-applied at the same heights). The rewind resets the counter to its
+	// <=100 baseline (0), then the re-fold re-derives it to the TRUE count 2 — NOT 4.
 	require.NoError(t, store.RewindDAHWatermark(ctx, 100))
 	_, err = procSweepUpTo(store, ctx, 110)
 	require.NoError(t, err)
-	require.Equal(t, 4, spentProgressOfTx(t, store, ctx, parent),
-		"precondition: pure forward-only re-fold double-counts the surviving spends")
+	require.Equal(t, 2, spentProgressOfTx(t, store, ctx, parent),
+		"rewind+re-fold must re-derive the true count, not double-count the surviving spends")
+	dah := dahOfTx(t, store, ctx, parent)
+	require.NotNil(t, dah, "the fully-spent mined tx must be re-stamped after rewind+re-fold")
+	require.Equal(t, int64(101)+1+ret, *dah)
 
-	// Reconcile is authoritative for the rewound range: recompute from the spends
-	// table → true count 2 (not 4), and the completion stamp survives / is corrected.
+	// Reconcile is authoritative for the rewound range: with the source fix it finds no
+	// drift and leaves the true count and stamp intact.
 	reconcileAllPartitions(t, store, ctx, 110, 10000)
 
 	require.Equal(t, 2, spentProgressOfTx(t, store, ctx, parent),
-		"reconcile must heal the reorg double-fold back to the true count")
-	dah := dahOfTx(t, store, ctx, parent)
-	require.NotNil(t, dah, "the fully-spent mined tx must remain/again be stamped after heal")
-	require.Equal(t, int64(101)+1+ret, *dah)
+		"reconcile leaves the correctly re-derived count intact")
+	dah2 := dahOfTx(t, store, ctx, parent)
+	require.NotNil(t, dah2, "stamp remains after reconcile")
+	require.Equal(t, int64(101)+1+ret, *dah2)
 }
