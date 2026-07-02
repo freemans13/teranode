@@ -328,9 +328,14 @@ func TestDAHSweepProcDenseHeightMultiPass(t *testing.T) {
 	require.Equal(t, safeTip, minWM, "watermark must reach safe tip after dense-height multipass")
 }
 
-// TestDAHSweepProcIdempotentRerun verifies a second sweep over the same range
-// stamps nothing new (already-stamped parents are excluded by delete_at_height IS NULL).
-func TestDAHSweepProcIdempotentRerun(t *testing.T) {
+// TestDAHSweepProcRewindRerunIsResultIdempotent verifies that rewinding the watermark
+// and re-sweeping the same range leaves the SAME final state: the rewind resets each
+// affected tx's counter to its <= forkHeight baseline and the re-fold re-derives the
+// identical spent_progress and delete_at_height. (The rewind now re-derives affected
+// txs from scratch — the cumulative dah_sweep_control stamp counter therefore does
+// increment on the re-stamp; the invariant that matters is the per-tx RESULT, which is
+// unchanged, not the running counter.)
+func TestDAHSweepProcRewindRerunIsResultIdempotent(t *testing.T) {
 	store, ctx := setupTestStore(t)
 	require.NoError(t, store.SetBlockHeight(uint32(110)))
 	const safeTip = int64(110)
@@ -342,19 +347,20 @@ func TestDAHSweepProcIdempotentRerun(t *testing.T) {
 
 	store.sweepAllPartitionsOnce(ctx, safeTip, ret)
 
-	var firstTotal int64
-	require.NoError(t, store.pool.QueryRow(ctx,
-		`SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&firstTotal))
-	require.Positive(t, firstTotal)
+	firstProgress := spentProgressOfTx(t, store, ctx, tx)
+	firstDAH := dahOfTx(t, store, ctx, tx)
+	require.Positive(t, firstProgress, "fully-spent parent folded on first sweep")
+	require.NotNil(t, firstDAH, "fully-spent mined parent stamped on first sweep")
 
-	// Rewind the watermark so the same range is re-swept, then sweep again.
+	// Rewind the watermark so the same (surviving) range is re-swept, then sweep again.
 	require.NoError(t, store.RewindDAHWatermark(ctx, 0))
 	store.sweepAllPartitionsOnce(ctx, safeTip, ret)
 
-	var secondTotal int64
-	require.NoError(t, store.pool.QueryRow(ctx,
-		`SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&secondTotal))
-	require.Equal(t, firstTotal, secondTotal, "re-sweep must stamp nothing new (idempotent)")
+	require.Equal(t, firstProgress, spentProgressOfTx(t, store, ctx, tx),
+		"rewind+re-sweep must re-derive the SAME spent_progress (no double-count)")
+	secondDAH := dahOfTx(t, store, ctx, tx)
+	require.NotNil(t, secondDAH, "re-derived fully-spent parent must be re-stamped")
+	require.Equal(t, *firstDAH, *secondDAH, "rewind+re-sweep must yield the identical delete_at_height")
 }
 
 // TestDAHSweepProcSkipsWatermarkOnLockContention verifies that when the per-partition
