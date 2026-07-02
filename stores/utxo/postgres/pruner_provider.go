@@ -205,17 +205,14 @@ func (s *postgresPrunerService) deleteTombstoned(ctx context.Context, blockHeigh
 // when they match, leaving ample headroom in the 100-conn pool for the write
 // path); a 10000-hash batch keeps each set-based cascade one bounded leaf index
 // scan while minimising round trips.
-const (
-	pruneDeleteWorkers   = 8
-	pruneDeleteBatchSize = 10000
-	// pruneDeleteMaxBatchesPerCall bounds one Prune call's delete work per
-	// partition, for the same reason the catch-up sweep is bounded (see Prune):
-	// a large stamped backlog must not turn one call into a multi-second drain
-	// that blocks the caller's loop from interleaving stamping. Callers loop, so
-	// the backlog still drains — in bounded slices. Unit-test datasets fit well
-	// inside one slice (8 x 10K x 8 partitions = 640K rows per call).
-	pruneDeleteMaxBatchesPerCall = 8
-)
+const pruneDeleteWorkers = 8
+
+// pruneDeleteBatchSize bounds each cascade DELETE to one bounded leaf-index range
+// scan, and — because each batch is a separate statement — releases the maintenance
+// pool connection between batches so stamping and other maintenance work interleave.
+// A var (not const) so tests can shrink it to exercise multi-batch draining without
+// inserting hundreds of thousands of rows.
+var pruneDeleteBatchSize = 10000
 
 // deleteTombstonedPartition cascade-deletes the tombstoned txs of ONE partition.
 // It scans the concrete leaf (txs_pNN) for tombstoned hashes, then cascade-deletes
@@ -298,8 +295,20 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		del_pd     AS (DELETE FROM %[3]s WHERE hash IN (SELECT hash FROM doomed))
 		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf, pdLeaf)
 
+	// Loop until a batch comes back short (fewer than pruneDeleteBatchSize rows) — that
+	// IS the drain signal: no more eligible tombstones remain in this partition. There is
+	// deliberately NO per-call cap. An earlier version stopped after a fixed number of
+	// batches per call, on the assumption that the caller loops and re-invokes so the
+	// backlog still drains "in slices". The real caller (the pruner worker) only fires on
+	// a new-block notification, so a bounded call left the rest of an eligible backlog
+	// undrained until the NEXT block — and on a caught-up / sparse-block node that meant a
+	// stamped backlog older than retention effectively never drained (observed live on
+	// teratestnet: ~9.5M eligible rows sitting, oldest overdue ~20k blocks). The work must
+	// be done regardless, so we do it now. Each batch is its own atomic statement that
+	// releases the maintenance-pool connection, so a long drain still interleaves with
+	// stamping and is interruptible at batch boundaries via ctx.
 	var deleted int64
-	for batches := 0; batches < pruneDeleteMaxBatchesPerCall; batches++ {
+	for {
 		select {
 		case <-ctx.Done():
 			return deleted, ctx.Err()
