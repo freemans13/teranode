@@ -116,7 +116,15 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 					delete_at_height = CASE
 						WHEN preserve_until IS NULL AND out_count > 0 AND (
 							spendable_count = 0
-							OR (spendable_count > 0 AND spent_progress = spendable_count)
+							OR (spendable_count > 0 AND spent_progress = spendable_count
+								-- GROUND-TRUTH gate: the maintained spent_progress counter can
+								-- drift up, so confirm via a spends recount before authorising the
+								-- (irreversible) prune stamp. Short-circuited by the counter test,
+								-- so the recount runs only for the rare spent-before-mined tx.
+								AND (SELECT count(*) FROM spends gs
+									   WHERE gs.prev_tx_hash = txs.hash
+										 AND gs.prev_output_idx < txs.out_count
+										 AND get_bit(txs.out_spendables, gs.prev_output_idx) = 1) = spendable_count)
 						)
 						THEN (GREATEST(COALESCE(last_spend_height, 0), $5) + 1 + $6)::int
 						ELSE delete_at_height
