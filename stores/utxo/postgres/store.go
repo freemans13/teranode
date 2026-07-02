@@ -51,6 +51,15 @@ type Store struct {
 	// pruner service — lazily created per store instance (not a package global).
 	prunerService   pruner.Service
 	prunerServiceMu sync.Mutex
+
+	// pending_unmined write-behind projector (see pending_unmined_projector.go).
+	// puOnce lazily starts the writer on first enqueue; channels are nil until then.
+	puOnce sync.Once
+	puMu   sync.Mutex
+	puBuf  []puEntry
+	puKick chan struct{}
+	puStop chan struct{}
+	puDone chan struct{}
 }
 
 // batchSizeStats accumulates the real (post-trigger) batch sizes each batcher
@@ -262,6 +271,7 @@ func configureBatcher[T any](b *batcher.Batcher[T], maxConcurrent int, drain boo
 // closing without nilling is safe and matches the sql store's Stop().
 func (s *Store) Stop() {
 	s.stopPrunerCursor()
+	s.stopPendingUnminedProjector()
 	if s.createBatcher != nil {
 		s.createBatcher.Close()
 	}

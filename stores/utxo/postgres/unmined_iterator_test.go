@@ -315,7 +315,8 @@ func TestPrunableUnminedTxIterator_Lever1_UnminedReturnedMinedCleanedNotReturned
 	})
 	require.NoError(t, err)
 
-	// Precondition: mined tx's row lingered.
+	// Precondition: mined tx's row lingered (drain projector first).
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var minedRowExists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, minedHash[:]).Scan(&minedRowExists))
@@ -352,12 +353,14 @@ func TestPrunableUnminedTxIterator_Lever1_UnminedReturnedMinedCleanedNotReturned
 	require.False(t, foundMined, "mined tx must NOT be returned by pruner read (read-filter)")
 
 	// After the pruner call: stale mined-tx row must be removed by lazy cleanup.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var minedRowAfter bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, minedHash[:]).Scan(&minedRowAfter))
 	require.False(t, minedRowAfter, "stale pending_unmined row for mined tx must be removed by lazy cleanup")
 
 	// Genuinely-unmined tx's row must NOT be removed (it IS still unmined).
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var unminedRowAfter bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, unminedHash[:]).Scan(&unminedRowAfter))

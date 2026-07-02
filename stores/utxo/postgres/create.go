@@ -327,34 +327,22 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		return result, nil
 	}
 
-	// Insert into txs atomically with the pending_unmined projection using a CTE,
-	// mirroring the batched path (createBatchUNNESTSQL). COPY-FROM-RETURNING:
-	// unmined_since is sourced from the ins CTE RETURNING, never recomputed.
-	// ON CONFLICT upsert in _pu handles idempotent re-creates. Non-conflicting
-	// path only — conflicting items are excluded from the invariant (pruner skips
-	// them). out_frozens is NULL on create (no output frozen — freeze materialises
-	// the bitmap on demand); spendable_ins is NULL on create (set by ReAssignUTXO).
-	// The outer SELECT returns ins.hash so the ON CONFLICT DO NOTHING / no-row case
-	// is detectable via pgx.ErrNoRows (same contract as the plain INSERT before).
+	// The pending_unmined projection is write-behind (see
+	// pending_unmined_projector.go): the synchronous _pu CTE arm was removed so
+	// creates no longer pay a second heap insert + random-hash PK btree insert
+	// into the side table. out_frozens is NULL on create (no output frozen —
+	// freeze materialises the bitmap on demand); spendable_ins is NULL on create
+	// (set by ReAssignUTXO). RETURNING hash makes the ON CONFLICT DO NOTHING /
+	// no-row case detectable via pgx.ErrNoRows.
 	const insertDirectSQL = `
-		WITH ins AS (
-			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-				locked, conflicting, frozen, unmined_since,
-				block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
-				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-			        $17, $18, $19, $20, $21)
-			ON CONFLICT (hash) DO NOTHING
-			RETURNING hash, unmined_since
-		),
-		_pu AS (
-			INSERT INTO pending_unmined (hash, unmined_since)
-			SELECT ins.hash, ins.unmined_since
-			FROM ins
-			WHERE ins.unmined_since IS NOT NULL
-			ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since
-		)
-		SELECT ins.hash FROM ins`
+		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+			locked, conflicting, frozen, unmined_since,
+			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
+			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+		        $17, $18, $19, $20, $21)
+		ON CONFLICT (hash) DO NOTHING
+		RETURNING hash`
 
 	var insertedHash []byte
 	if err = conn.QueryRow(ctx, insertDirectSQL, insertArgs...).Scan(&insertedHash); err != nil {
@@ -362,6 +350,12 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 			return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
 		}
 		return nil, errors.NewStorageError("failed to create UTXO", err)
+	}
+
+	// Write-behind projection into pending_unmined (was the _pu CTE arm). Only
+	// unmined, non-conflicting rows belong to the invariant set.
+	if unminedSince != nil && !options.Conflicting {
+		s.enqueuePendingUnmined(insertedHash, int32(blockHeight))
 	}
 
 	result := s.buildCreateMeta(txMeta, options, isCoinbase, blockHeight)
@@ -440,16 +434,11 @@ const createBatchChunkOverhead int64 = 1024
 // createBatchUNNESTSQL is the bulk create INSERT, hoisted to a package const so
 // the byte-bounded chunk driver can issue it once per chunk over array sub-slices.
 //
-// The CTE wraps the txs INSERT so the _pu arm can atomically upsert unmined rows
-// into pending_unmined in the same statement. COPY-FROM-RETURNING: unmined_since
-// is sourced from the ins CTE RETURNING, never recomputed. The conflicting column
-// is always false here (conflicting items are routed to createDirect by
-// sendCreateBatch before reaching this path), so the WHERE clause needs only
-// check unmined_since IS NOT NULL. ON CONFLICT upsert handles idempotent re-creates.
-// The outer SELECT returns only ins.hash to preserve the existing scan contract in
+// The pending_unmined projection is write-behind (see
+// pending_unmined_projector.go); the synchronous _pu CTE arm was removed from
+// this statement. RETURNING hash preserves the existing scan contract in
 // runChunk (rows.Scan(&hashBytes)).
 const createBatchUNNESTSQL = `
-		WITH ins AS (
 			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 				locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
 				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
@@ -469,16 +458,7 @@ const createBatchUNNESTSQL = `
 			          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx,
 			          utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
 			ON CONFLICT (hash) DO NOTHING
-			RETURNING hash, unmined_since
-		),
-		_pu AS (
-			INSERT INTO pending_unmined (hash, unmined_since)
-			SELECT ins.hash, ins.unmined_since
-			FROM ins
-			WHERE ins.unmined_since IS NOT NULL
-			ON CONFLICT (hash) DO UPDATE SET unmined_since = EXCLUDED.unmined_since
-		)
-		SELECT ins.hash FROM ins`
+			RETURNING hash`
 
 // planCreateChunks partitions [0,len(rowBytes)) into contiguous, non-empty,
 // byte-bounded windows whose estimated wire size (chunkOverhead + Σ rowBytes in
@@ -740,6 +720,20 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		if err := runChunk(w[0], w[1]); err != nil {
 			signalAll(err)
 			return
+		}
+	}
+
+	// Write-behind projection into pending_unmined (was the _pu CTE arm on the
+	// bulk INSERT). All chunks committed; enqueue every unmined row. Conflicting
+	// items never reach this path (routed to createDirect), but keep the guard.
+	// Oversized rows (valid cleared above) were never inserted into txs, so they
+	// must not be projected.
+	for k := range hashes {
+		if !valid[kToBatchIdx[k]] {
+			continue
+		}
+		if !mineds[k] && !conflictings[k] {
+			s.enqueuePendingUnmined(hashes[k], unminedSinces[k])
 		}
 	}
 

@@ -536,35 +536,20 @@ CREATE TABLE IF NOT EXISTS pending_unmined (
     PRIMARY KEY (hash)
 ) PARTITION BY HASH (hash);`
 
-// pendingUnminedBackfillDDL is the one-time idempotent backfill executed at
-// store startup. It runs only once, guarded by the marker index
-// px_pu_backfill_marker:
-//
-//   - If the marker does NOT exist (first run), all non-conflicting unmined txs
-//     are copied from txs into pending_unmined, then the marker is created so
-//     subsequent startups skip the INSERT.
-//   - If the marker exists (re-run), the block body is skipped entirely — no
-//     seq-scan, no INSERT.
-//
-// ON CONFLICT (hash) DO NOTHING makes the INSERT idempotent: rows already in
-// pending_unmined (e.g. from a partial earlier run before the marker was
-// written) are skipped cleanly.
-//
-// The marker is a partial index on leaf partition pending_unmined_p00. Creating
-// it on a concrete leaf (not the partitioned parent) sidesteps the PostgreSQL
-// restriction that unique indexes on partitioned tables must include all
-// partition key columns. The marker is never used for query planning — its sole
-// purpose is a named sentinel readable via pg_class.
+// pendingUnminedBackfillDDL is the idempotent reconciliation backfill executed
+// on EVERY store startup. The create hot path no longer writes pending_unmined
+// synchronously — rows are projected by the in-process write-behind projector
+// (see pending_unmined_projector.go) — so a crash can lose the projector's
+// not-yet-flushed buffer. This startup INSERT..SELECT repairs any such gap by
+// copying every non-conflicting unmined tx from txs (one seq scan, startup
+// only). ON CONFLICT (hash) DO NOTHING makes re-runs free for rows already
+// present. The legacy one-shot marker index px_pu_backfill_marker is dropped.
 const pendingUnminedBackfillDDL = `
-DO $$ BEGIN
-  IF NOT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_pu_backfill_marker') THEN
-    INSERT INTO pending_unmined (hash, unmined_since)
-      SELECT hash, unmined_since FROM txs
-      WHERE unmined_since IS NOT NULL AND conflicting = false
-      ON CONFLICT (hash) DO NOTHING;
-    CREATE INDEX px_pu_backfill_marker ON pending_unmined_p00 (unmined_since) WHERE (false);
-  END IF;
-END $$;`
+DROP INDEX IF EXISTS px_pu_backfill_marker;
+INSERT INTO pending_unmined (hash, unmined_since)
+  SELECT hash, unmined_since FROM txs
+  WHERE unmined_since IS NOT NULL AND conflicting = false
+  ON CONFLICT (hash) DO NOTHING;`
 
 // spends: append-only spend records. LOGGED. A row here is the canonical
 // "this output was spent by that tx" marker; Unspend deletes the row, and
