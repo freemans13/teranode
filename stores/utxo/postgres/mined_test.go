@@ -31,6 +31,7 @@ func TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_CTEBranch(t *testing
 
 	// Precondition: pending_unmined row must exist (Task 4 wrote it).
 	var unminedSince int32
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	err = st.pool.QueryRow(ctx,
 		`SELECT unmined_since FROM pending_unmined WHERE hash=$1`, hashBytes).Scan(&unminedSince)
 	require.NoError(t, err, "pending_unmined row must exist after Create (Task 4 precondition)")
@@ -119,6 +120,7 @@ func TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_PlainBranch(t *testi
 
 	// Precondition: pending_unmined must have the row (Task 4).
 	var unminedSince int32
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	err = st.pool.QueryRow(ctx,
 		`SELECT unmined_since FROM pending_unmined WHERE hash=$1`, hashBytes).Scan(&unminedSince)
 	require.NoError(t, err, "pending_unmined row must exist after Create (Task 4 precondition)")
@@ -188,6 +190,9 @@ func TestSetMinedMulti_PendingUnminedLingers_NonLongestChain(t *testing.T) {
 	h := tx.TxIDChainHash()
 	hashBytes := h[:]
 
+	// Drain the write-behind projector so the precondition is deterministic.
+	require.NoError(t, st.flushPendingUnmined(ctx))
+
 	// Precondition: pending_unmined row must exist.
 	var exists bool
 	err = st.pool.QueryRow(ctx,
@@ -235,6 +240,9 @@ func TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_Batch(t *testing.T) 
 		hashes = append(hashes, h)
 		allHashBytes = append(allHashBytes, h[:])
 	}
+
+	// Drain the write-behind projector so the precondition is deterministic.
+	require.NoError(t, st.flushPendingUnmined(ctx))
 
 	// Verify all 3 are in pending_unmined before mine.
 	var countBefore int

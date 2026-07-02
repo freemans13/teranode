@@ -43,11 +43,12 @@ func TestSchema_PendingUnmined_CreationAndBackfill(t *testing.T) {
 		`SELECT count(*) FROM pg_class WHERE relname LIKE 'px_pu_since_p%' AND relkind='i'`).Scan(&n))
 	require.Equal(t, 8, n, "8 per-leaf btree indexes on unmined_since must be created")
 
-	// Assert: backfill marker index exists (proof backfill ran).
+	// The backfill now runs on EVERY startup (crash reconciliation for the
+	// write-behind projector); the one-shot marker index is retired and dropped.
 	var hasMarker bool
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_pu_backfill_marker')`).Scan(&hasMarker))
-	require.True(t, hasMarker, "backfill marker index must exist after first schema creation")
+	require.False(t, hasMarker, "legacy one-shot backfill marker must be dropped (backfill runs every startup)")
 }
 
 // TestSchema_PendingUnmined_BackfillExistingUnminedTx verifies that an existing unmined
@@ -174,8 +175,8 @@ func TestSchema_PendingUnmined_BackfillSkipsConflicting(t *testing.T) {
 }
 
 // TestSchema_PendingUnmined_BackfillIdempotency verifies that calling createSchemaWithPoolFlag
-// a second time is safe: the marker prevents the backfill from re-running and no duplicates
-// are created.
+// a second time is safe: the every-startup backfill is idempotent (ON CONFLICT DO NOTHING),
+// so re-running creates no duplicates and no error.
 func TestSchema_PendingUnmined_BackfillIdempotency(t *testing.T) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, testDSN)
@@ -190,19 +191,14 @@ func TestSchema_PendingUnmined_BackfillIdempotency(t *testing.T) {
 	// First init: backfill runs, marker created.
 	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, false))
 
-	var markerExists bool
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname='px_pu_backfill_marker')`).Scan(&markerExists))
-	require.True(t, markerExists, "marker must exist after first init")
-
-	// Second init: must succeed without error; backfill is skipped (marker already exists).
+	// Second init: must succeed without error; the backfill re-runs idempotently.
 	require.NoError(t, createSchemaWithPoolFlag(ctx, pool, false))
 
-	// Assert marker still exists exactly once (no duplication).
+	// The retired one-shot marker must not exist.
 	var markerCount int
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT count(*) FROM pg_class WHERE relname='px_pu_backfill_marker'`).Scan(&markerCount))
-	require.Equal(t, 1, markerCount, "idempotent re-init must not duplicate the marker")
+	require.Equal(t, 0, markerCount, "legacy backfill marker must not be recreated")
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +221,11 @@ func TestCreateWriteHook_UnminedTx_SinglePath(t *testing.T) {
 	require.NotNil(t, md)
 	require.Equal(t, uint32(100), md.UnminedSince, "metadata UnminedSince must equal blockHeight")
 
+	// Drain the write-behind projector so the assertion is deterministic.
+	require.NoError(t, st.flushPendingUnmined(ctx))
+
 	// Assert the tx is in pending_unmined with matching unmined_since.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var storedUnminedSince int32
 	err = st.pool.QueryRow(ctx,
 		`SELECT unmined_since FROM pending_unmined WHERE hash=$1`,
@@ -258,6 +258,7 @@ func TestCreateWriteHook_MinedTx_SinglePath(t *testing.T) {
 	require.Equal(t, uint32(0), md.UnminedSince, "mined tx must have zero UnminedSince")
 
 	// Assert the tx is NOT in pending_unmined.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var exists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`,
@@ -284,7 +285,11 @@ func TestCreateWriteHook_ConflictingTx_NoPendingUnmined(t *testing.T) {
 	_, err = st.Create(ctx, child, 100, utxo.WithConflicting(true))
 	require.NoError(t, err)
 
+	// Drain the write-behind projector so the assertion is deterministic.
+	require.NoError(t, st.flushPendingUnmined(ctx))
+
 	// Assert conflicting tx is NOT in pending_unmined.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var exists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`,
@@ -328,6 +333,9 @@ func TestCreateWriteHook_UnminedTx_BatchPath(t *testing.T) {
 		st.sendCreateBatch(items)
 	}()
 	wg.Wait()
+
+	// Drain the write-behind projector so the assertions are deterministic.
+	require.NoError(t, st.flushPendingUnmined(ctx))
 
 	for i, item := range items {
 		res := <-item.done
@@ -379,6 +387,9 @@ func TestCreateWriteHook_MinedTx_BatchPath(t *testing.T) {
 		st.sendCreateBatch(items)
 	}()
 	wg.Wait()
+
+	// Drain the write-behind projector so the negative assertion is meaningful.
+	require.NoError(t, st.flushPendingUnmined(ctx))
 
 	for i, item := range items {
 		res := <-item.done
@@ -485,6 +496,7 @@ func TestPendingUnmined_ReorgOutPartialDoesNotInsert(t *testing.T) {
 	require.NoError(t, err)
 
 	// tx still has block_ids=[101] — must NOT be in pending_unmined.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var exists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
@@ -505,6 +517,7 @@ func TestPendingUnmined_MarkOnLongestChainTrueDeletes(t *testing.T) {
 	h := tx.TxIDChainHash()
 
 	// Precondition: hash is in pending_unmined (Task 4 write hook).
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var exists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
@@ -547,6 +560,7 @@ func TestPendingUnmined_MarkOnLongestChainFalseInsertsUnmined(t *testing.T) {
 	h := tx.TxIDChainHash()
 
 	// Precondition: mined tx is NOT in pending_unmined.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var exists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
@@ -595,6 +609,7 @@ func TestPendingUnmined_MarkOnLongestChainFalseInsertsFromMined(t *testing.T) {
 	h := tx.TxIDChainHash()
 
 	// Precondition: NOT in pending_unmined.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var exists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
@@ -628,6 +643,7 @@ func TestPendingUnmined_SetConflictingTrueDeletes(t *testing.T) {
 	h := tx.TxIDChainHash()
 
 	// Precondition: hash is in pending_unmined.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var exists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
@@ -651,11 +667,16 @@ func TestPendingUnmined_SetConflictingFalseInsertsUnmined(t *testing.T) {
 	st, ctx := setupTestStore(t)
 	require.NoError(t, st.SetBlockHeight(100))
 
-	// Create an unmined tx — Task 4 hook inserts it into pending_unmined.
+	// Create an unmined tx and DRAIN the projector before the conflicting
+	// transition, so the U4-true DELETE sees the row (write-behind ordering:
+	// an unflushed create re-inserted after the DELETE would linger — harmless
+	// in production because the read filter excludes conflicting rows and lazy
+	// cleanup reclaims them, but this test pins the synchronous U4 semantics).
 	tx := testExtendedTx(t)
 	_, err := st.Create(ctx, tx, 100)
 	require.NoError(t, err)
 	h := tx.TxIDChainHash()
+	require.NoError(t, st.flushPendingUnmined(ctx))
 
 	// First mark it conflicting — this removes it from pending_unmined (U4-true).
 	_, _, err = st.SetConflicting(ctx, []chainhash.Hash{*h}, true)
@@ -713,6 +734,7 @@ func TestPendingUnmined_SetConflictingFalseMined_NoRow(t *testing.T) {
 	require.NoError(t, err)
 
 	// Precondition: stale row is present.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var exists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
@@ -741,6 +763,7 @@ func TestPendingUnmined_MultipleHooksCoexist(t *testing.T) {
 	h := tx.TxIDChainHash()
 
 	// After Create (unmined): must be in pending_unmined.
+	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
 	var exists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, h[:]).Scan(&exists))
