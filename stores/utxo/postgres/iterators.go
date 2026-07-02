@@ -43,6 +43,22 @@ func newPrunableUnminedTxIterator(store *Store, cutoffBlockHeight uint32) (*unmi
 	ctx := context.Background()
 	cutoff := int32(cutoffBlockHeight) // unmined_since is INT4
 
+	// Fast path: during IBD pending_unmined is typically empty, yet the cleanup
+	// DELETE and the partition-wise JOIN below still cost ~50ms per call in
+	// planning + parallel-worker startup alone (measured ~10% of mainnet DB time
+	// while returning zero rows). A sub-ms EXISTS probe skips both when there is
+	// nothing to do. No WHERE clause: probing on the unindexed unmined_since
+	// could seq-scan a populated table, while bare EXISTS stops at the first row.
+	var hasRows bool
+	if err := store.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pending_unmined)`).Scan(&hasRows); err != nil {
+		return nil, err
+	}
+
+	if !hasRows {
+		return &unminedTxIterator{store: store, done: true}, nil
+	}
+
 	// Lazy cleanup (bounding): remove stale pending_unmined rows AT OR BELOW the cutoff
 	// that are no longer truly unmined (mined, conflicting, or pruned). This only
 	// reclaims STALE rows AT OR BELOW the cutoff; stale rows ABOVE the cutoff
