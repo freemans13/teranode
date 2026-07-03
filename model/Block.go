@@ -630,18 +630,26 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 
 	// 12. Check that all transactions are in the valid order and blessed
 	//     Can only be done with a valid texMetaStore passed in
+	//     Skipped below the hardcoded checkpoint on the outpoint-only fast path:
+	//     the checkpoint-anchored chain already certifies order/blessing, and the
+	//     integrity floor (PoW, CheckMerkleRoot, checkDuplicateTransactions)
+	//     still runs above.
 	if txMetaStore != nil {
-		deps := &validationDependencies{
-			txMetaStore:           txMetaStore,
-			subtreeStore:          subtreeStore,
-			currentChain:          currentChain,
-			currentBlockHeaderIDs: currentBlockHeaderIDs,
-			oldBlockIDsMap:        oldBlockIDsMap,
-			metaRegenerator:       metaRegenerator,
-		}
-		err = b.validOrderAndBlessed(ctx, logger, deps, settings.Block.ValidOrderAndBlessedConcurrency, settings.Block.DiskMapDirs, settings.Block.ParentSpendsCapacityMultiplier)
-		if err != nil {
-			return false, err
+		if b.skipOrderAndBlessedBelowCheckpoint(settings) {
+			logger.Debugf("[Block:Valid][%s] skipping validOrderAndBlessed for block at height %d at or below hardcoded checkpoint (outpoint-only fast path)", b.String(), b.Height)
+		} else {
+			deps := &validationDependencies{
+				txMetaStore:           txMetaStore,
+				subtreeStore:          subtreeStore,
+				currentChain:          currentChain,
+				currentBlockHeaderIDs: currentBlockHeaderIDs,
+				oldBlockIDsMap:        oldBlockIDsMap,
+				metaRegenerator:       metaRegenerator,
+			}
+			err = b.validOrderAndBlessed(ctx, logger, deps, settings.Block.ValidOrderAndBlessedConcurrency, settings.Block.DiskMapDirs, settings.Block.ParentSpendsCapacityMultiplier)
+			if err != nil {
+				return false, err
+			}
 		}
 	}
 
@@ -675,6 +683,37 @@ func (b *Block) releaseTxMap() {
 	}
 
 	b.txMap = nil
+}
+
+// skipOrderAndBlessedBelowCheckpoint reports whether validOrderAndBlessed may be
+// skipped for this block. True only when the operator has opted into the
+// below-checkpoint outpoint-only fast path (OutpointOnlyBelowCheckpoint), the
+// UTXO store is SQL-backed (same restriction as every other gate on that path),
+// the network defines a hardcoded checkpoint, and 0 < b.Height <= that
+// checkpoint. Below a hardcoded checkpoint the pinned block hash already
+// certifies transaction order, uniqueness and blessing: a block whose
+// transactions differed in any way would produce a different merkle root and
+// could not carry the checkpoint-anchored header chain. PoW, CheckMerkleRoot
+// and checkDuplicateTransactions (CVE-2012-2459) still run unconditionally —
+// they bind the local bytes to that certified chain. This mirrors the native
+// catchup path (quickValidateBlock), which never runs Valid() below the
+// checkpoint at all.
+func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings) bool {
+	if tSettings == nil || !tSettings.BlockValidation.OutpointOnlyBelowCheckpoint {
+		return false
+	}
+
+	if !settings.IsSQLUtxoStore(tSettings) {
+		return false
+	}
+
+	if tSettings.ChainCfgParams == nil {
+		return false
+	}
+
+	highest := HighestCheckpointHeight(tSettings.ChainCfgParams.Checkpoints)
+
+	return highest > 0 && b.Height > 0 && b.Height <= highest
 }
 
 // https://en.bitcoin.it/wiki/BIP_0034
