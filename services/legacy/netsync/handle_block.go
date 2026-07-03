@@ -131,7 +131,9 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// Wait for the previous block's setTxMined to complete before validating
 	// this block's transactions. Ensures BIP68 sequence lock validation can
 	// correctly look up parent transaction BlockHeights in the UTXO store.
-	if blockHeight > 1 {
+	// Skipped on the below-checkpoint outpoint-only fast path — see
+	// needsParentMinedWait for the redundancy argument.
+	if sm.needsParentMinedWait(blockHeight) {
 		if err = sm.waitForPreviousBlockMined(ctx, &block.MsgBlock().Header.PrevBlock, blockHeight); err != nil {
 			return err
 		}
@@ -529,6 +531,19 @@ func (sm *SyncManager) legacyOutpointOnly(height uint32) bool {
 	}
 
 	return height <= blockchain.HighestCheckpointHeight(sm.chainParams.Checkpoints)
+}
+
+// needsParentMinedWait reports whether HandleBlockDirect must block on the
+// parent's mined_set before processing a block at this height. Heights 0 and 1
+// never wait (pre-existing behaviour). On the below-checkpoint outpoint-only
+// fast path the wait is redundant three ways: (1) its documented purpose is
+// BIP68 parent-height lookup, and BIP68 is skipped below the checkpoint;
+// (2) block dispatch is a single serial blockHandler, so the parent's UTXOs
+// are committed before this block starts; (3) the legacy path AddBlocks with
+// MinedSet=true synchronously, so GetBlockIsMined is always instantly true and
+// only costs a gRPC round-trip per block.
+func (sm *SyncManager) needsParentMinedWait(height uint32) bool {
+	return height > 1 && !sm.legacyOutpointOnly(height)
 }
 
 func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, bi blockIdent, subtree *subtreepkg.Subtree) error {

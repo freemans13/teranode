@@ -250,6 +250,49 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 	})
 }
 
+// TestSyncManager_needsParentMinedWait: the parent-mined wait is skipped exactly
+// when the outpoint-only fast path is engaged (flag on AND SQL store AND at/below
+// the hardcoded checkpoint). It is redundant there three ways: (1) its documented
+// purpose is BIP68 parent-height lookup and BIP68 is skipped below the
+// checkpoint; (2) the single serial blockHandler commits the parent's UTXOs
+// before this block starts; (3) the legacy path AddBlocks with MinedSet=true
+// synchronously, so the check is always instantly true. Heights 0 and 1 never
+// wait (pre-existing behaviour).
+func TestSyncManager_needsParentMinedWait(t *testing.T) {
+	const checkpointHeight = int32(1000)
+
+	tests := []struct {
+		name     string
+		enabled  bool
+		sqlStore bool
+		height   uint32
+		want     bool
+	}{
+		{name: "height 0 never waits", enabled: false, sqlStore: true, height: 0, want: false},
+		{name: "height 1 never waits", enabled: false, sqlStore: true, height: 1, want: false},
+		{name: "flag off, below checkpoint: waits", enabled: false, sqlStore: true, height: 500, want: true},
+		{name: "flag on, non-SQL, below checkpoint: waits", enabled: true, sqlStore: false, height: 500, want: true},
+		{name: "flag on, SQL, below checkpoint: skips", enabled: true, sqlStore: true, height: 500, want: false},
+		{name: "flag on, SQL, at checkpoint: skips", enabled: true, sqlStore: true, height: 1000, want: false},
+		{name: "flag on, SQL, above checkpoint: waits", enabled: true, sqlStore: true, height: 1500, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tSettings, params := newOutpointOnlySettings(t, tt.enabled, tt.sqlStore, checkpointHeight)
+
+			sm := &SyncManager{
+				settings:    tSettings,
+				chainParams: params,
+				logger:      ulogger.TestLogger{},
+			}
+
+			require.Equal(t, tt.want, sm.needsParentMinedWait(tt.height),
+				"needsParentMinedWait(%d) enabled=%v sql=%v", tt.height, tt.enabled, tt.sqlStore)
+		})
+	}
+}
+
 // TestSyncManager_extendTransactions_OutpointOnlySkipsDecorate is the paired ON/OFF
 // decorate test: with the gate ON BatchPreviousOutputsDecorate is never called;
 // with the gate OFF it is called exactly once (the bulk Phase-2 decorate).
