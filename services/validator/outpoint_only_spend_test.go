@@ -9,6 +9,7 @@ import (
 	bt "github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
@@ -55,6 +56,9 @@ func TestValidate_OutpointOnlySpend(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
+	// OutpointOnlySpend is only legitimate at or below a checkpoint; model a checkpoint
+	// above the test height so the validator's below-checkpoint guard permits the fast path.
+	tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_spend")
 	require.NoError(t, err)
@@ -156,6 +160,9 @@ func TestValidate_OutpointOnlySpend_RequiresSkipScriptValidation(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
+	// OutpointOnlySpend is only legitimate at or below a checkpoint; model a checkpoint
+	// above the test height so the validator's below-checkpoint guard permits the fast path.
+	tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_misconfig")
 	require.NoError(t, err)
@@ -203,6 +210,61 @@ func TestValidate_OutpointOnlySpend_RequiresSkipScriptValidation(t *testing.T) {
 	require.Contains(t, err.Error(), "OutpointOnlySpend requires SkipScriptValidation")
 }
 
+// TestValidate_OutpointOnlySpend_RejectedAboveCheckpoint verifies the validator's
+// defence-in-depth height guard: even a correctly-paired OutpointOnlySpend +
+// SkipScriptValidation request must be rejected when the block height is above the
+// highest hardcoded checkpoint, independently of the caller. This closes the gap where
+// only blockvalidation (not the validator) enforced the checkpoint bound.
+func TestValidate_OutpointOnlySpend_RejectedAboveCheckpoint(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	// Checkpoint is BELOW the validation height — the fast path must not engage here.
+	tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 100}}
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_abovecp")
+	require.NoError(t, err)
+	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+	require.NoError(t, store.SetBlockHeight(500))
+	require.NoError(t, store.SetMedianBlockTime(1700000000))
+
+	// Minimal child tx — the guard fires before any store access.
+	childTx := bt.NewTx()
+	coinbaseScript, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	require.NoError(t, err)
+	childInput := &bt.Input{
+		PreviousTxOutIndex: 0,
+		SequenceNumber:     0xfffffffe,
+		UnlockingScript:    bscript.NewFromBytes([]byte{0x00}),
+	}
+	require.NoError(t, childInput.PreviousTxIDAdd(new(chainhash.Hash)))
+	childTx.Inputs = append(childTx.Inputs, childInput)
+	childTx.Outputs = append(childTx.Outputs, &bt.Output{Satoshis: 400, LockingScript: coinbaseScript})
+
+	v := &Validator{
+		logger:      logger,
+		utxoStore:   store,
+		settings:    tSettings,
+		txValidator: NewTxValidator(logger, tSettings),
+		stats:       gocore.NewStat("validator"),
+	}
+
+	// Correctly paired, but height 500 > checkpoint 100 → must be rejected by the guard.
+	opts := &Options{
+		SkipUtxoCreation:     true,
+		SkipScriptValidation: true,
+		OutpointOnlySpend:    true,
+		IgnoreLocked:         true,
+	}
+
+	_, err = v.ValidateWithOptions(ctx, childTx, 500, opts)
+	require.Error(t, err, "OutpointOnlySpend above the highest checkpoint must be rejected")
+	require.Contains(t, err.Error(), "must not be used above the highest checkpoint")
+}
+
 // TestValidate_OutpointOnlySpend_NoParentRead is the TDD regression guard for the bug
 // where validateTransaction (~line 1677) contained an ungated re-extend block:
 //
@@ -229,6 +291,9 @@ func TestValidate_OutpointOnlySpend_NoParentRead(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
+	// OutpointOnlySpend is only legitimate at or below a checkpoint; model a checkpoint
+	// above the test height so the validator's below-checkpoint guard permits the fast path.
+	tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_noparentread")
 	require.NoError(t, err)
@@ -330,6 +395,9 @@ func TestValidate_OutpointOnlySpend_BIP68HeightSkipped(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
+	// OutpointOnlySpend is only legitimate at or below a checkpoint; model a checkpoint
+	// above the test height so the validator's below-checkpoint guard permits the fast path.
+	tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
 
 	// CSVHeight=1 ensures BIP68 is active at any practical blockHeight.
 	tSettings.ChainCfgParams.CSVHeight = 1

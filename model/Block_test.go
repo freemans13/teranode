@@ -1823,6 +1823,63 @@ func TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint(t *testing.T) {
 	require.Error(t, bAbove.checkBlockRewardAndFees(params), "above checkpoint: fee check must still be enforced")
 }
 
+// TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight pins the real
+// production function's skip boundary to model.HighestCheckpointHeight — the single
+// source of truth (invariant I3). Unlike TestCheckpointHeight_WriteReadAgree (which
+// compares two symbols), this exercises the compiled checkBlockRewardAndFees itself
+// at exactly the boundary, so a future edit that stops using HighestCheckpointHeight
+// (or introduces an off-by-one) fails here rather than silently shipping a fee=0
+// block that revalidation would reject.
+func TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight(t *testing.T) {
+	params := &chaincfg.Params{
+		SubsidyReductionInterval: 210000,
+		Checkpoints: []chaincfg.Checkpoint{
+			{Height: 100},
+			{Height: -1}, // negative must be ignored by the single-source function
+			{Height: 777},
+			{Height: 400},
+		},
+	}
+
+	hc := HighestCheckpointHeight(params.Checkpoints)
+	require.Equal(t, uint32(777), hc, "sanity: highest checkpoint height")
+
+	// Build a coinbase claiming one satoshi more than the subsidy, so the check
+	// fires whenever it is NOT skipped.
+	buildInflatedBlock := func(height uint32) *Block {
+		t.Helper()
+		coinbaseReward := util.GetBlockSubsidyForHeight(height, params)
+
+		lockingScript, sErr := bscript.NewFromHexString("76a914000000000000000000000000000000000000000088ac")
+		require.NoError(t, sErr)
+		coinbaseTx := bt.NewTx()
+		coinbaseTx.Inputs = append(coinbaseTx.Inputs, &bt.Input{})
+		coinbaseTx.Outputs = append(coinbaseTx.Outputs, &bt.Output{
+			Satoshis:      coinbaseReward + 1,
+			LockingScript: lockingScript,
+		})
+
+		subtree, sErr := subtreepkg.NewTreeByLeafCount(2)
+		require.NoError(t, sErr)
+
+		return &Block{
+			Header:        newTestBlockHeader(t),
+			CoinbaseTx:    coinbaseTx,
+			Height:        height,
+			Subtrees:      []*chainhash.Hash{subtree.RootHash()},
+			SubtreeSlices: []*subtreepkg.Subtree{subtree},
+		}
+	}
+
+	// Exactly at the boundary (height == hc): skipped.
+	require.NoError(t, buildInflatedBlock(hc).checkBlockRewardAndFees(params),
+		"at height == HighestCheckpointHeight the check must be skipped")
+
+	// One above the boundary: enforced (inflated coinbase → error).
+	require.Error(t, buildInflatedBlock(hc+1).checkBlockRewardAndFees(params),
+		"at height == HighestCheckpointHeight+1 the check must be enforced")
+}
+
 func TestBlock_CheckDuplicateTransactionsInSubtree(t *testing.T) {
 	t.Run("no duplicates", func(t *testing.T) {
 		blockHeaderBytes, _ := hex.DecodeString(block1Header)

@@ -643,19 +643,17 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params) error {
 	// certified by the pinned block hash, and the outpoint-only fast path writes
 	// subtree fees as 0 (spec §4.1). Skip the fee<=reward check so a
 	// reconsiderblock/revalidate of a below-checkpoint block does not wrongly reject
-	// it as BLOCK_INVALID. Height is computed inline because model cannot import
-	// services/blockchain (import cycle, §2.3); the loop is byte-equivalent to
-	// blockchain.HighestCheckpointHeight over the same params.Checkpoints (invariant I3).
-	var highestCheckpoint uint32
-	for _, cp := range params.Checkpoints {
-		if cp.Height < 0 {
-			continue
-		}
-		if h := uint32(cp.Height); h > highestCheckpoint {
-			highestCheckpoint = h
-		}
-	}
-	if b.Height <= highestCheckpoint {
+	// it as BLOCK_INVALID. HighestCheckpointHeight is the single source of truth
+	// shared with the fast-path write side (invariant I3); see model/checkpoint.go.
+	//
+	// NOTE: this skip is intentionally NOT gated on OutpointOnlyBelowCheckpoint — it
+	// must also hold when the flag is off so that a below-checkpoint block whose
+	// subtrees were written with fee=0 while the flag was on still revalidates after
+	// the operator turns the flag off. This is safe on any node: a below-checkpoint
+	// fork cannot be accepted (it must chain to the pinned checkpoint hash), so the
+	// no-inflation arithmetic is redundant here — the same reasoning the quick-
+	// validation path already relies on.
+	if b.Height <= HighestCheckpointHeight(params.Checkpoints) {
 		return nil
 	}
 

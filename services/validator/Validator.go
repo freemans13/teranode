@@ -709,6 +709,19 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		return nil, err
 	}
 
+	// Defence-in-depth: OutpointOnlySpend is only ever legitimate at or below the
+	// highest hardcoded checkpoint (the callers gate on this). Reject it above the
+	// checkpoint independently of the caller so a buggy or misconfigured caller
+	// cannot spend-by-outpoint (hash check off, BIP68 skipped) on a steady-state
+	// block. Mirrors the blockvalidation I4 guard; uses the same single-source
+	// HighestCheckpointHeight so the bound cannot drift.
+	if validationOptions.OutpointOnlySpend && blockHeight > blockchain.HighestCheckpointHeight(v.settings.ChainCfgParams.Checkpoints) {
+		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend must not be used above the highest checkpoint (height %d)", txID, blockHeight)
+		span.RecordError(err)
+
+		return nil, err
+	}
+
 	comparisonTime, skipFinality, finalityErr := selectFinalityComparisonTime(validationOptions, blockHeight, uint32(v.settings.ChainCfgParams.CSVHeight), blockState)
 	if finalityErr != nil {
 		err = finalityErr

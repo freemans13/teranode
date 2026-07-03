@@ -1,15 +1,16 @@
 package blockvalidation
 
-// TestCheckpointHeight_WriteReadAgree asserts invariant I3: the inline loop in
-// model.Block.checkBlockRewardAndFees (the "read side") produces the same highest
-// checkpoint height as blockchain.HighestCheckpointHeight (the "write side") for
-// the same params.Checkpoints. The two functions must agree so that the fast-path
-// fee=0 write and the revalidation read both skip at the same boundary.
+// TestCheckpointHeight_WriteReadAgree asserts invariant I3: the write side
+// (blockchain.HighestCheckpointHeight, used by the fast-path fee=0 write) and the
+// read side (model.HighestCheckpointHeight, used by checkBlockRewardAndFees on
+// revalidation) return the same boundary for the same params.Checkpoints. Since
+// blockchain.HighestCheckpointHeight now delegates to model.HighestCheckpointHeight
+// there is a single implementation; this test guards that the delegation stays wired
+// (a reintroduced divergent copy in either package would fail here) across several
+// real and edge-case checkpoint sets.
 //
-// Placement: this file lives in services/blockvalidation (package blockvalidation,
-// white-box test) because model cannot import services/blockchain without creating
-// an import cycle (model → blockchain → model). blockvalidation already imports
-// both model and services/blockchain, making it the closest clean cross-import site.
+// This file lives in services/blockvalidation (which imports both model and
+// services/blockchain) because model cannot import services/blockchain (import cycle).
 
 import (
 	"net/url"
@@ -22,22 +23,24 @@ import (
 )
 
 func TestCheckpointHeight_WriteReadAgree(t *testing.T) {
-	params := &chaincfg.MainNetParams
-
-	writeSide := blockchain.HighestCheckpointHeight(params.Checkpoints)
-
-	// Inline loop — byte-equivalent to the one in model.Block.checkBlockRewardAndFees.
-	var readSide uint32
-	for _, cp := range params.Checkpoints {
-		if cp.Height < 0 {
-			continue
-		}
-		if h := uint32(cp.Height); h > readSide {
-			readSide = h
-		}
+	cases := map[string][]chaincfg.Checkpoint{
+		"mainnet":        chaincfg.MainNetParams.Checkpoints,
+		"testnet":        chaincfg.TestNetParams.Checkpoints,
+		"empty":          nil,
+		"negative-only":  {{Height: -1}},
+		"unordered":      {{Height: 500}, {Height: 100}, {Height: -1}, {Height: 300}},
+		"single":         {{Height: 42}},
+		"trailing-lower": {{Height: 1000}, {Height: 10}},
 	}
 
-	require.Equal(t, writeSide, readSide, "fee write/read checkpoint height must be identical (I3)")
+	for name, cps := range cases {
+		t.Run(name, func(t *testing.T) {
+			writeSide := blockchain.HighestCheckpointHeight(cps)
+			readSide := model.HighestCheckpointHeight(cps)
+			require.Equal(t, readSide, writeSide,
+				"fee write/read checkpoint height must be identical (I3) for %s", name)
+		})
+	}
 }
 
 // TestOperatorOverrideFence (T-B5 — invariant I2): asserts that quickValidateOutpointOnly
@@ -138,14 +141,17 @@ func TestQuickValidateOutpointOnly_SQLStoreGuard(t *testing.T) {
 	}
 }
 
-// TestCheckpointBoundary_B1_Deferred is a placeholder for T-B1 (spec §6):
+// TestCheckpointBoundary_B1_Deferred is a placeholder for the FULL T-B1 (spec §6):
 // spend at checkpoint+1 of an output created at checkpoint−1, including a coinbase
-// output for coinbase maturity. This test requires a real multi-block cross-checkpoint
-// sync flow (two blocks, real catchup or real block-validation pipeline with persisted
-// subtree data) that cannot be honestly expressed with the CatchupTestSuite mock store.
-// Deferred to e2e/smoketest: see spec §6 T-B1.
+// output for coinbase maturity. The full multi-block cross-checkpoint sync flow (two
+// blocks, real catchup or block-validation pipeline with persisted subtree data)
+// cannot be honestly expressed with the CatchupTestSuite mock store and stays deferred
+// to e2e/smoketest. The CONSENSUS CORE of T-B1 — a coinbase minimally-created below the
+// checkpoint still enforces coinbase maturity when spent outpoint-only — is now covered
+// executably at the store layer by TestMinimalCreate_CoinbaseMaturity_OutpointOnlySpend
+// (stores/utxo/sql). See spec §6 T-B1.
 func TestCheckpointBoundary_B1_Deferred(t *testing.T) {
-	t.Skip("deferred to e2e/smoketest: T-B1 requires multi-block cross-checkpoint flow with real persisted outputs; see spec §6 T-B1")
+	t.Skip("full multi-block flow deferred to e2e/smoketest; consensus core covered by stores/utxo/sql.TestMinimalCreate_CoinbaseMaturity_OutpointOnlySpend; see spec §6 T-B1")
 }
 
 // TestCheckpointBoundary_B3_Deferred is a placeholder for T-B3 (spec §6):
