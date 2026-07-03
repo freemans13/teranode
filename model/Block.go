@@ -700,15 +700,19 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params) error {
 	//     reject a genuinely-valid, checkpoint-pinned block as BLOCK_INVALID. The read side
 	//     cannot distinguish a fast-path fee=0 block from a default one, so the skip cannot
 	//     depend on live config.
-	//  2. Safety: below a hardcoded checkpoint the no-inflation property is already
-	//     certified by the pinned block hash — the checkpoint commits transitively to every
-	//     ancestor's coinbase via the header/merkle chain. Any block that reaches Block.Valid
-	//     at height <= the highest checkpoint is on the checkpoint-connected chain (checkpoint
-	//     enforcement in the header/catchup path rejects a below-checkpoint block that does
-	//     not descend to the pinned hash before full validation runs), so the arithmetic here
-	//     is redundant. A forward/optimistic checkpoint (configured above the validated tip)
-	//     does not weaken this: such a block is still only fully validated once it connects to
-	//     the pinned hash.
+	//  2. Safety: below a hardcoded checkpoint the no-inflation property is enforced by chain
+	//     ADOPTION, not by this per-block arithmetic. Block.Valid can run on a below-checkpoint
+	//     block whose ancestry to the pinned hash is not yet established (native catchup's
+	//     standard path, initial sync before the checkpoint is reached, a forward/optimistic
+	//     checkpoint, or reconsiderblock on a stored fork block), so this is a deliberate
+	//     defence-in-depth reduction on those transient paths. It is safe because such a block
+	//     cannot become the chain a node actually adopts: native catchup (services/blockvalidation
+	//     /catchup.go) and legacy headers-first (services/legacy/netsync/manager.go) refuse a
+	//     header chain whose in-range checkpoint hash mismatches the pinned hash, and the FSM
+	//     cannot enter RUNNING until the tip reaches the highest checkpoint
+	//     (blockchain.guardRunBelowHighestCheckpoint) — forcing a reorg onto the checkpoint-
+	//     connected, inflation-free chain. The pinned checkpoint thus commits transitively to
+	//     every adopted ancestor's coinbase, making this check redundant for any adopted chain.
 	//
 	// HighestCheckpointHeight is the single source of truth shared with the fast-path write
 	// side, so the fee-write boundary and this fee-skip boundary cannot diverge (invariant
