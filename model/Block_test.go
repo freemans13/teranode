@@ -1934,10 +1934,11 @@ func TestBlock_CheckBlockRewardAndFees(t *testing.T) {
 		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 1, 0)
 		require.NoError(t, err)
 
-		// With OutpointOnlyBelowCheckpoint OFF the no-inflation check is NOT skipped
-		// below the checkpoint, so this genuinely exercises the reward arithmetic: the
-		// height-1 coinbase claims exactly the 50 BTC subsidy, so the block is valid.
-		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams, false)
+		// Use params with NO checkpoints so height 1 is ABOVE the highest checkpoint (0)
+		// and the below-checkpoint skip does not fire — this genuinely exercises the reward
+		// arithmetic: the height-1 coinbase claims exactly the 50 BTC subsidy, so it is valid.
+		params := &chaincfg.Params{SubsidyReductionInterval: 210000}
+		err = block.checkBlockRewardAndFees(params)
 		require.NoError(t, err)
 	})
 }
@@ -2036,13 +2037,10 @@ func TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint(t *testing.T) {
 	}
 
 	bBelow := buildInflatedBlock(300) // below highest checkpoint (500)
-	require.NoError(t, bBelow.checkBlockRewardAndFees(params, true), "below checkpoint, fast path ON: fee check must be skipped")
-	// Gate: with the fast path OFF, the check is NOT skipped below the checkpoint and
-	// the inflated coinbase is rejected — a non-participating node keeps full enforcement.
-	require.Error(t, bBelow.checkBlockRewardAndFees(params, false), "below checkpoint, fast path OFF: fee check must still run")
+	require.NoError(t, bBelow.checkBlockRewardAndFees(params), "below checkpoint: fee check must be skipped (unconditional, checkpoint-pinned)")
 
 	bAbove := buildInflatedBlock(501) // above highest checkpoint (500)
-	require.Error(t, bAbove.checkBlockRewardAndFees(params, true), "above checkpoint: fee check must still be enforced")
+	require.Error(t, bAbove.checkBlockRewardAndFees(params), "above checkpoint: fee check must still be enforced")
 }
 
 // TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight pins the real
@@ -2094,11 +2092,11 @@ func TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight(t *testi
 	}
 
 	// Exactly at the boundary (height == hc): skipped.
-	require.NoError(t, buildInflatedBlock(hc).checkBlockRewardAndFees(params, true),
+	require.NoError(t, buildInflatedBlock(hc).checkBlockRewardAndFees(params),
 		"at height == HighestCheckpointHeight the check must be skipped (fast path on)")
 
 	// One above the boundary: enforced (inflated coinbase → error).
-	require.Error(t, buildInflatedBlock(hc+1).checkBlockRewardAndFees(params, true),
+	require.Error(t, buildInflatedBlock(hc+1).checkBlockRewardAndFees(params),
 		"at height == HighestCheckpointHeight+1 the check must be enforced")
 }
 
@@ -2551,7 +2549,7 @@ func TestBlock_CheckRewardAndFees_WithHeight(t *testing.T) {
 
 		// Test with a height that triggers the reward calculation logic
 		// This should error because coinbase output is too high
-		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams, true)
+		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "coinbase output")
 	})

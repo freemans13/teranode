@@ -1191,14 +1191,17 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		return nil
 	}
 
-	// Invariant I4: outpoint-only mode must never be applied above the highest hardcoded
-	// checkpoint. This re-asserts the height bound that quickValidateOutpointOnly already
-	// applied — it is redundant today (not an independent signal), kept as a cheap
-	// fail-closed check so a future refactor that loosens the gate cannot silently spend
-	// by outpoint above the checkpoint at the point of no return (create+spend).
 	outpointOnly := u.quickValidateOutpointOnly(block)
-	if outpointOnly && block.Height > blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints) {
-		return errors.NewProcessingError("[createAndSpendUTXOsForBatch] invariant I4 violated: outpoint-only active above checkpoint at height %d", block.Height)
+
+	// Invariant I4 (fail-closed): outpoint-only create+spend must never run above the highest
+	// hardcoded checkpoint. Derived INDEPENDENTLY of quickValidateOutpointOnly's result — from
+	// the raw enabling inputs (setting + store support) plus the height bound — so that if a
+	// future refactor drops the height clause from quickValidateOutpointOnly, this guard still
+	// fires (whereas testing `outpointOnly && height > checkpoint` would be a tautological
+	// contradiction, since outpointOnly already implies height <= checkpoint).
+	fastPathEnabled := u.settings.BlockValidation.OutpointOnlyBelowCheckpoint && u.utxoStore.SupportsOutpointOnlySpend()
+	if fastPathEnabled && block.Height > blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints) {
+		return errors.NewProcessingError("[createAndSpendUTXOsForBatch] invariant I4 violated: outpoint-only fast path enabled above checkpoint at height %d", block.Height)
 	}
 
 	lockUTXOs := !u.quickValidateSkipsUtxoLock(block)

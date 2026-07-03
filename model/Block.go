@@ -580,7 +580,7 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	// 9. Check that the total fees of the block are less than or equal to the block reward.
 	// 10. Check that the coinbase transaction includes the correct block reward.
 	if b.Height > 0 {
-		err = b.checkBlockRewardAndFees(settings.ChainCfgParams, settings.BlockValidation.OutpointOnlyBelowCheckpoint)
+		err = b.checkBlockRewardAndFees(settings.ChainCfgParams)
 		if err != nil {
 			return false, err
 		}
@@ -684,31 +684,36 @@ func (b *Block) releaseTxMap() {
 // height of the block we are checking for.
 
 // TODO - do this another way, if necessary
-func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, skipBelowCheckpoint bool) error {
+func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params) error {
 	if b.Height == 0 {
 		return nil // Skip this check
 	}
 
-	// The outpoint-only fast path writes subtree fees as 0 below the highest hardcoded
-	// checkpoint (spec §4.1); a later reconsiderblock/revalidate of such a block would
-	// otherwise trip this fee<=reward check and wrongly reject it as BLOCK_INVALID.
-	// Skip the check at or below the highest checkpoint so those fee=0 blocks revalidate.
+	// Skip the coinbase no-inflation check (coinbaseOutput <= subsidy + fees) at or below
+	// the highest HARDCODED checkpoint. This is UNCONDITIONAL — not gated on the
+	// OutpointOnlyBelowCheckpoint setting or the store — for two reasons:
 	//
-	// GATED on skipBelowCheckpoint (the OutpointOnlyBelowCheckpoint setting): a node that
-	// never enabled the fast path can never have fee=0 below-checkpoint subtrees, so it
-	// keeps the full no-inflation check on the Block.Valid() path. This deliberately does
-	// NOT remove the check for non-participating nodes, and avoids relying on transitive
-	// checkpoint pinning holding for every caller of Block.Valid() — e.g. a network that
-	// configures a checkpoint ABOVE the current validated tip (forward/optimistic
-	// checkpoint) has height <= HighestCheckpointHeight true while pinning does not yet
-	// hold; there, gating keeps the inflation check active. HighestCheckpointHeight is the
-	// single source of truth shared with the write side (invariant I3); see checkpoint.go.
+	//  1. Correctness: the outpoint-only fast path persists subtree fees as 0. A block
+	//     synced that way must still revalidate on reconsiderblock/RevalidateBlock even
+	//     after the operator restores the default (flag off) — a flag-gated skip would
+	//     recompute coinbaseOutput (subsidy+realFees) > subtreeFees(0)+subsidy and wrongly
+	//     reject a genuinely-valid, checkpoint-pinned block as BLOCK_INVALID. The read side
+	//     cannot distinguish a fast-path fee=0 block from a default one, so the skip cannot
+	//     depend on live config.
+	//  2. Safety: below a hardcoded checkpoint the no-inflation property is already
+	//     certified by the pinned block hash — the checkpoint commits transitively to every
+	//     ancestor's coinbase via the header/merkle chain. Any block that reaches Block.Valid
+	//     at height <= the highest checkpoint is on the checkpoint-connected chain (checkpoint
+	//     enforcement in the header/catchup path rejects a below-checkpoint block that does
+	//     not descend to the pinned hash before full validation runs), so the arithmetic here
+	//     is redundant. A forward/optimistic checkpoint (configured above the validated tip)
+	//     does not weaken this: such a block is still only fully validated once it connects to
+	//     the pinned hash.
 	//
-	// Trade-off: a node that ran the fast path (flag on), then turns the flag OFF and
-	// reconsiders a below-checkpoint block, would re-run this check against fee=0 subtrees
-	// and could reject it. That is a rare deliberate operator sequence; keeping the check
-	// active for the default (flag-off) population is the safer default.
-	if skipBelowCheckpoint && b.Height <= HighestCheckpointHeight(params.Checkpoints) {
+	// HighestCheckpointHeight is the single source of truth shared with the fast-path write
+	// side, so the fee-write boundary and this fee-skip boundary cannot diverge (invariant
+	// I3); see model/checkpoint.go.
+	if b.Height <= HighestCheckpointHeight(params.Checkpoints) {
 		return nil
 	}
 
