@@ -330,7 +330,7 @@ func setup(t *testing.T) (utxostore.Store, subtreevalidation.Interface, blockcha
 	txStore := blobmemory.New()
 	subtreeStore := blobmemory.New()
 
-	validatorClient := &validator.MockValidatorClient{UtxoStore: utxoStore}
+	validatorClient := &validator.MockValidator{UtxoStore: utxoStore}
 
 	blockChainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, tSettings)
 	if err != nil {
