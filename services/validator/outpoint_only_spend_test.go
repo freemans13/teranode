@@ -63,6 +63,7 @@ func TestValidate_OutpointOnlySpend(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_spend")
 	require.NoError(t, err)
 
+	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, store.SetBlockHeight(500))
@@ -167,6 +168,7 @@ func TestValidate_OutpointOnlySpend_RequiresSkipScriptValidation(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_misconfig")
 	require.NoError(t, err)
 
+	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, store.SetBlockHeight(500))
@@ -226,6 +228,7 @@ func TestValidate_OutpointOnlySpend_RejectedAboveCheckpoint(t *testing.T) {
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_abovecp")
 	require.NoError(t, err)
+	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, store.SetBlockHeight(500))
@@ -265,6 +268,65 @@ func TestValidate_OutpointOnlySpend_RejectedAboveCheckpoint(t *testing.T) {
 	require.Contains(t, err.Error(), "must not be used above the highest checkpoint")
 }
 
+// TestValidate_OutpointOnlySpend_RejectedOnNonSQLStore verifies the validator's
+// fail-closed store-type guard: a correctly-paired, below-checkpoint OutpointOnlySpend
+// request is still rejected when the configured UTXO store is not SQL-backed. Aerospike
+// ignores SkipUTXOHashCheck/SkipExtendedInputs and would hard-error on the un-decorated
+// inputs; the guard rejects before any store access so a misconfigured caller cannot
+// stall IBD.
+func TestValidate_OutpointOnlySpend_RejectedOnNonSQLStore(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	// Checkpoint well above the height so the height guard passes; the STORE guard fires.
+	tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
+
+	// The store the validator actually uses is irrelevant — the guard fires before any
+	// store access. Point settings at a non-SQL (aerospike) scheme so IsSQLUtxoStore is false.
+	sqlURL, err := url.Parse("sqlitememory:///outpointonly_nonsql")
+	require.NoError(t, err)
+	store, err := sql.New(ctx, logger, tSettings, sqlURL)
+	require.NoError(t, err)
+	require.NoError(t, store.SetBlockHeight(500))
+	require.NoError(t, store.SetMedianBlockTime(1700000000))
+	aeroURL, err := url.Parse("aerospike://host:3000/ns/set")
+	require.NoError(t, err)
+	tSettings.UtxoStore.UtxoStore = aeroURL // non-SQL → fast path must be refused
+
+	childTx := bt.NewTx()
+	coinbaseScript, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	require.NoError(t, err)
+	childInput := &bt.Input{
+		PreviousTxOutIndex: 0,
+		SequenceNumber:     0xfffffffe,
+		UnlockingScript:    bscript.NewFromBytes([]byte{0x00}),
+	}
+	require.NoError(t, childInput.PreviousTxIDAdd(new(chainhash.Hash)))
+	childTx.Inputs = append(childTx.Inputs, childInput)
+	childTx.Outputs = append(childTx.Outputs, &bt.Output{Satoshis: 400, LockingScript: coinbaseScript})
+
+	v := &Validator{
+		logger:      logger,
+		utxoStore:   store,
+		settings:    tSettings,
+		txValidator: NewTxValidator(logger, tSettings),
+		stats:       gocore.NewStat("validator"),
+	}
+
+	opts := &Options{
+		SkipUtxoCreation:     true,
+		SkipScriptValidation: true,
+		OutpointOnlySpend:    true,
+		IgnoreLocked:         true,
+	}
+
+	_, err = v.ValidateWithOptions(ctx, childTx, 500, opts)
+	require.Error(t, err, "OutpointOnlySpend on a non-SQL store must be rejected")
+	require.Contains(t, err.Error(), "requires a SQL-backed UTXO store")
+}
+
 // TestValidate_OutpointOnlySpend_NoParentRead is the TDD regression guard for the bug
 // where validateTransaction (~line 1677) contained an ungated re-extend block:
 //
@@ -298,6 +360,7 @@ func TestValidate_OutpointOnlySpend_NoParentRead(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_noparentread")
 	require.NoError(t, err)
 
+	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	realStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, realStore.SetBlockHeight(500))
@@ -405,6 +468,7 @@ func TestValidate_OutpointOnlySpend_BIP68HeightSkipped(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_bip68height")
 	require.NoError(t, err)
 
+	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, store.SetBlockHeight(1000))
