@@ -1,7 +1,6 @@
 package blockvalidation
 
 import (
-	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -542,16 +541,12 @@ func buildOneSubtreeBlock(t *testing.T, s *CatchupTestSuite, height uint32) *mod
 	return block
 }
 
-// setupQuickValidateMocks registers the common UTXO/blockchain/validator mock
-// expectations needed to run quickValidateBlock for a one-subtree block.
-// setSQLUtxoStoreURL sets the UTXO store URL to sqlitememory so that
-// quickValidateOutpointOnly's SQL-only guard (Stage A) is satisfied. Call this on any
-// test suite where OutpointOnlyBelowCheckpoint=true is expected to engage.
-func setSQLUtxoStoreURL(t *testing.T, s *CatchupTestSuite) {
+// enableOutpointOnlyFastPath makes the suite's mock UTXO store report fast-path
+// support, so quickValidateOutpointOnly's store-capability guard is satisfied. Call
+// this on any test suite where OutpointOnlyBelowCheckpoint=true is expected to engage.
+func enableOutpointOnlyFastPath(t *testing.T, s *CatchupTestSuite) {
 	t.Helper()
-	u, err := url.Parse("sqlitememory://test")
-	require.NoError(t, err)
-	s.Server.blockValidation.settings.UtxoStore.UtxoStore = u
+	s.MockUTXOStore.SupportsOutpointOnlySpendResult = true
 }
 
 func setupQuickValidateMocks(s *CatchupTestSuite) {
@@ -706,7 +701,7 @@ func TestQuickValidate_OutpointOnly_NoDecorate_ZeroFees(t *testing.T) {
 		defer suite.Cleanup()
 
 		suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
-		setSQLUtxoStoreURL(t, suite) // Stage A is SQL-only; guard must see SQL scheme to engage
+		enableOutpointOnlyFastPath(t, suite) // make the mock store report fast-path support
 		block := buildOneSubtreeBlockWithExternalParentTx(t, suite, 500)
 
 		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
@@ -825,7 +820,7 @@ func TestOutpointOnly_MetricIncrementsBelowOnly(t *testing.T) {
 		defer suite.Cleanup()
 
 		suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
-		setSQLUtxoStoreURL(t, suite) // Stage A is SQL-only; guard must see SQL scheme to engage
+		enableOutpointOnlyFastPath(t, suite) // make the mock store report fast-path support
 		suite.Server.blockValidation.settings.BlockValidation.QuickValidateSkipUtxoLock = true
 		setCheckpoints(t, suite, 1000)
 		setupQuickValidateMocks(suite)

@@ -35,6 +35,10 @@ func (s *outpointOnlySpyStore) BatchPreviousOutputsDecorate(ctx context.Context,
 	return s.NullStore.BatchPreviousOutputsDecorate(ctx, txs)
 }
 
+// SupportsOutpointOnlySpend overrides the embedded NullStore to model a store that
+// honours the fast path, so legacyOutpointOnly can engage in these tests.
+func (s *outpointOnlySpyStore) SupportsOutpointOnlySpend() bool { return true }
+
 // newOutpointOnlySettings returns settings configured so legacyOutpointOnly can
 // return true: the feature flag on, a SQL-backed (sqlitememory) UTXO store URL,
 // and a single hard-coded checkpoint at checkpointHeight on the chain params.
@@ -98,6 +102,15 @@ func TestSyncManager_legacyOutpointOnly(t *testing.T) {
 				settings:    tSettings,
 				chainParams: params,
 				logger:      ulogger.TestLogger{},
+			}
+
+			// The gate now asks the store, not the settings URL: a supporting store
+			// (spy over NullStore) for the SQL case, a plain NullStore (reports false)
+			// otherwise.
+			if tt.sqlStore {
+				sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
+			} else {
+				sm.utxoStore = &nullstore.NullStore{}
 			}
 
 			if tt.nilChain {
@@ -214,7 +227,8 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 		tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
 		block, txMap, txOrder := buildExtendedSubtreeBlock(t, blockHeight, 5)
 
-		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{}}
+		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{},
+			utxoStore: &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}}
 		require.True(t, sm.legacyOutpointOnly(uint32(blockHeight)), "gate must be ON for this case")
 
 		slices, datas, metas := makeSubtreeSlices(t, len(block.Transactions()))

@@ -722,14 +722,14 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		return nil, err
 	}
 
-	// Fail closed on a non-SQL store: OutpointOnlySpend relies on SkipUTXOHashCheck /
-	// SkipExtendedInputs, which only the SQL store honours. Aerospike ignores them and
-	// calls GetSpends/TxMetaDataFromTx, hard-erroring on the un-decorated inputs and
-	// stalling IBD. All in-tree callers already gate on settings.IsSQLUtxoStore; this
-	// mirrors that fence at the validator so a misconfigured caller cannot reach a
-	// non-SQL store on the fast path. Same allowlist, single source (settings.helpers).
-	if validationOptions.OutpointOnlySpend && !settings.IsSQLUtxoStore(v.settings) {
-		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend requires a SQL-backed UTXO store", txID)
+	// Fail closed on a store that does not support the fast path: OutpointOnlySpend
+	// relies on SkipUTXOHashCheck / SkipExtendedInputs, which such a store ignores —
+	// it would then derive the UTXO hash from absent parent data and hard-error on the
+	// un-decorated inputs, stalling IBD. Ask the store directly (the capability lives on
+	// the store, not a settings scheme guess) so a misconfigured caller cannot reach an
+	// unsupported store on the fast path.
+	if validationOptions.OutpointOnlySpend && !v.utxoStore.SupportsOutpointOnlySpend() {
+		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend requires a UTXO store that supports it", txID)
 		span.RecordError(err)
 
 		return nil, err

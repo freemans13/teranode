@@ -13,7 +13,6 @@ package blockvalidation
 // services/blockchain) because model cannot import services/blockchain (import cycle).
 
 import (
-	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -57,10 +56,9 @@ func TestOperatorOverrideFence(t *testing.T) {
 	suite := NewCatchupTestSuite(t)
 	defer suite.Cleanup()
 
-	// Stage A is SQL-only; set a SQL store URL so the guard permits engagement.
-	sqlURL, err := url.Parse("sqlitememory://test")
-	require.NoError(t, err)
-	suite.Server.blockValidation.settings.UtxoStore.UtxoStore = sqlURL
+	// The store must report fast-path support so the gate turns on the store capability
+	// (the mock defaults to false); this test is about the checkpoint/override fence.
+	suite.MockUTXOStore.SupportsOutpointOnlySpendResult = true
 
 	// Enable the outpoint-only fast path.
 	suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
@@ -90,30 +88,27 @@ func TestOperatorOverrideFence(t *testing.T) {
 		blockBelow.Height, hardcodedCheckpointHeight)
 }
 
-// TestQuickValidateOutpointOnly_SQLStoreGuard (Task 9 — Stage A SQL-only guard):
-// asserts that quickValidateOutpointOnly returns TRUE only when the UTXO store is
-// SQL-backed (postgres, postgresql, sqlite, sqlitememory). On an Aerospike node, or
-// when the URL is nil/empty (the Aerospike default), it must return FALSE to avoid
-// passing un-decorated inputs to aerospike.Store.Spend, which errors on nil locking scripts.
-func TestQuickValidateOutpointOnly_SQLStoreGuard(t *testing.T) {
+// TestQuickValidateOutpointOnly_StoreCapabilityGate asserts that quickValidateOutpointOnly
+// engages only when the UTXO store itself reports fast-path support
+// (store.SupportsOutpointOnlySpend()) — not by sniffing a URL scheme. A store that does
+// not support it (e.g. Aerospike, pending Stage B) keeps the fast path OFF so un-decorated
+// inputs are never handed to a store that would hard-error on them. Above the checkpoint it
+// is off regardless of store capability.
+func TestQuickValidateOutpointOnly_StoreCapabilityGate(t *testing.T) {
 	const checkpointHeight = uint32(1000)
 	const belowCheckpoint = uint32(500)
-
 	const aboveCheckpoint = uint32(1500)
 
 	tests := []struct {
-		name     string
-		storeURL string // empty string = nil URL (Aerospike default)
-		height   uint32
-		want     bool
+		name          string
+		storeSupports bool
+		height        uint32
+		want          bool
 	}{
-		{name: "nil URL (Aerospike default)", storeURL: "", height: belowCheckpoint, want: false},
-		{name: "aerospike scheme", storeURL: "aerospike://host:3000/ns/set", height: belowCheckpoint, want: false},
-		{name: "postgres scheme", storeURL: "postgres://user:pass@host/db", height: belowCheckpoint, want: true},
-		{name: "postgresql scheme", storeURL: "postgresql://user:pass@host/db", height: belowCheckpoint, want: true},
-		{name: "sqlite scheme", storeURL: "sqlite:///tmp/test.db", height: belowCheckpoint, want: true},
-		{name: "sqlitememory scheme", storeURL: "sqlitememory://test", height: belowCheckpoint, want: true},
-		{name: "postgres above checkpoint", storeURL: "postgres://user:pass@host/db", height: aboveCheckpoint, want: false},
+		{name: "store supports, below checkpoint", storeSupports: true, height: belowCheckpoint, want: true},
+		{name: "store does not support, below checkpoint", storeSupports: false, height: belowCheckpoint, want: false},
+		{name: "store supports, above checkpoint", storeSupports: true, height: aboveCheckpoint, want: false},
+		{name: "store does not support, above checkpoint", storeSupports: false, height: aboveCheckpoint, want: false},
 	}
 
 	for _, tt := range tests {
@@ -123,20 +118,13 @@ func TestQuickValidateOutpointOnly_SQLStoreGuard(t *testing.T) {
 
 			suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 			setCheckpoints(t, suite, checkpointHeight)
-
-			if tt.storeURL != "" {
-				u, err := url.Parse(tt.storeURL)
-				require.NoError(t, err)
-				suite.Server.blockValidation.settings.UtxoStore.UtxoStore = u
-			} else {
-				suite.Server.blockValidation.settings.UtxoStore.UtxoStore = nil
-			}
+			suite.MockUTXOStore.SupportsOutpointOnlySpendResult = tt.storeSupports
 
 			block := &model.Block{Height: tt.height}
 			got := suite.Server.blockValidation.quickValidateOutpointOnly(block)
 			require.Equal(t, tt.want, got,
-				"quickValidateOutpointOnly: store=%q, height=%d: want %v got %v",
-				tt.storeURL, tt.height, tt.want, got)
+				"quickValidateOutpointOnly: storeSupports=%v, height=%d: want %v got %v",
+				tt.storeSupports, tt.height, tt.want, got)
 		})
 	}
 }

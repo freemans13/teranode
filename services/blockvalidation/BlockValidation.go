@@ -2166,25 +2166,19 @@ func (u *BlockValidation) quickValidateSkipsUtxoLock(block *model.Block) bool {
 	return block.Height <= blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)
 }
 
-// isSQLUtxoStore reports whether s is configured for a SQL-backed UTXO store.
-// Delegates to settings.IsSQLUtxoStore so the allowlist (postgres, postgresql,
-// sqlite, sqlitememory) lives in a single source shared with the legacy netsync path.
-func isSQLUtxoStore(s *settings.Settings) bool {
-	return settings.IsSQLUtxoStore(s)
-}
-
 // quickValidateOutpointOnly reports whether this block may use the below-checkpoint
 // outpoint-only fast path: skip decorate, zero fees, minimal create, and spend with
 // the UTXO-hash checksum disabled. Gated by the BlockValidation.OutpointOnlyBelowCheckpoint
-// setting (default off), restricted to SQL-backed UTXO stores (Stage A; Aerospike deferred
-// to Stage B), and restricted to blocks at or below the highest HARDCODED checkpoint.
-// Uses the standard chain-config checkpoints (not the catchup override) so it fails safe —
-// never engaging above the real checkpoint (spec §2.2, invariant I2).
+// setting (default off), restricted to stores that honour the fast path (u.utxoStore
+// .SupportsOutpointOnlySpend() — SQL today; Aerospike deferred to Stage B), and restricted
+// to blocks at or below the highest HARDCODED checkpoint. Uses the standard chain-config
+// checkpoints (not the catchup override) so it fails safe — never engaging above the real
+// checkpoint (spec §2.2, invariant I2).
 func (u *BlockValidation) quickValidateOutpointOnly(block *model.Block) bool {
 	if !u.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
 		return false
 	}
-	if !isSQLUtxoStore(u.settings) { // Stage A is SQL-only; Aerospike (incl. empty default) deferred to Stage B
+	if !u.utxoStore.SupportsOutpointOnlySpend() { // Stage A is SQL-only; Aerospike deferred to Stage B
 		return false
 	}
 	return block.Height <= blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)

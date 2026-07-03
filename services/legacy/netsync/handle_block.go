@@ -23,7 +23,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
 	"github.com/bsv-blockchain/teranode/services/validator"
-	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -508,15 +507,15 @@ func (sm *SyncManager) quickValidationAllowed(blockHeight uint32) bool {
 // outpoint-only fast path on the legacy netsync route: skip the bulk decorate,
 // stamp subtree fees as 0, do a minimal (inputs-only) UTXO create, and spend
 // using the validator's outpoint-only mode. Default OFF — every conjunct must
-// hold for the path to engage, so when the setting is off, the store is not
-// SQL-backed, or the block is above the highest hard-coded checkpoint, the
-// legacy path behaves exactly as before (byte-identical, invariant I2).
+// hold for the path to engage, so when the setting is off, the store does not
+// support the fast path, or the block is above the highest hard-coded checkpoint,
+// the legacy path behaves exactly as before (byte-identical, invariant I2).
 func (sm *SyncManager) legacyOutpointOnly(height uint32) bool {
 	if sm.settings == nil || !sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
 		return false
 	}
 
-	if !settings.IsSQLUtxoStore(sm.settings) {
+	if !sm.utxoStore.SupportsOutpointOnlySpend() {
 		return false
 	}
 

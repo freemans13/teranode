@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -63,7 +64,6 @@ func TestValidate_OutpointOnlySpend(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_spend")
 	require.NoError(t, err)
 
-	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, store.SetBlockHeight(500))
@@ -168,7 +168,6 @@ func TestValidate_OutpointOnlySpend_RequiresSkipScriptValidation(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_misconfig")
 	require.NoError(t, err)
 
-	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, store.SetBlockHeight(500))
@@ -228,7 +227,6 @@ func TestValidate_OutpointOnlySpend_RejectedAboveCheckpoint(t *testing.T) {
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_abovecp")
 	require.NoError(t, err)
-	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, store.SetBlockHeight(500))
@@ -268,13 +266,13 @@ func TestValidate_OutpointOnlySpend_RejectedAboveCheckpoint(t *testing.T) {
 	require.Contains(t, err.Error(), "must not be used above the highest checkpoint")
 }
 
-// TestValidate_OutpointOnlySpend_RejectedOnNonSQLStore verifies the validator's
-// fail-closed store-type guard: a correctly-paired, below-checkpoint OutpointOnlySpend
-// request is still rejected when the configured UTXO store is not SQL-backed. Aerospike
-// ignores SkipUTXOHashCheck/SkipExtendedInputs and would hard-error on the un-decorated
-// inputs; the guard rejects before any store access so a misconfigured caller cannot
-// stall IBD.
-func TestValidate_OutpointOnlySpend_RejectedOnNonSQLStore(t *testing.T) {
+// TestValidate_OutpointOnlySpend_RejectedOnUnsupportingStore verifies the validator's
+// fail-closed store-capability guard: a correctly-paired, below-checkpoint OutpointOnlySpend
+// request is still rejected when the UTXO store reports it does not support the fast path.
+// Such a store ignores SkipUTXOHashCheck/SkipExtendedInputs and would hard-error on the
+// un-decorated inputs; the guard rejects before any store access so a misconfigured caller
+// cannot stall IBD. Uses a NullStore (SupportsOutpointOnlySpend() == false).
+func TestValidate_OutpointOnlySpend_RejectedOnUnsupportingStore(t *testing.T) {
 	tracing.SetupMockTracer()
 
 	ctx := context.Background()
@@ -283,17 +281,10 @@ func TestValidate_OutpointOnlySpend_RejectedOnNonSQLStore(t *testing.T) {
 	// Checkpoint well above the height so the height guard passes; the STORE guard fires.
 	tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
 
-	// The store the validator actually uses is irrelevant — the guard fires before any
-	// store access. Point settings at a non-SQL (aerospike) scheme so IsSQLUtxoStore is false.
-	sqlURL, err := url.Parse("sqlitememory:///outpointonly_nonsql")
+	// A store that reports no fast-path support — the guard must reject before touching it.
+	store, err := nullstore.NewNullStore()
 	require.NoError(t, err)
-	store, err := sql.New(ctx, logger, tSettings, sqlURL)
-	require.NoError(t, err)
-	require.NoError(t, store.SetBlockHeight(500))
-	require.NoError(t, store.SetMedianBlockTime(1700000000))
-	aeroURL, err := url.Parse("aerospike://host:3000/ns/set")
-	require.NoError(t, err)
-	tSettings.UtxoStore.UtxoStore = aeroURL // non-SQL → fast path must be refused
+	require.False(t, store.SupportsOutpointOnlySpend(), "precondition: store does not support the fast path")
 
 	childTx := bt.NewTx()
 	coinbaseScript, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
@@ -323,8 +314,8 @@ func TestValidate_OutpointOnlySpend_RejectedOnNonSQLStore(t *testing.T) {
 	}
 
 	_, err = v.ValidateWithOptions(ctx, childTx, 500, opts)
-	require.Error(t, err, "OutpointOnlySpend on a non-SQL store must be rejected")
-	require.Contains(t, err.Error(), "requires a SQL-backed UTXO store")
+	require.Error(t, err, "OutpointOnlySpend on a store that does not support it must be rejected")
+	require.Contains(t, err.Error(), "requires a UTXO store that supports it")
 }
 
 // TestValidate_OutpointOnlySpend_NoParentRead is the TDD regression guard for the bug
@@ -360,7 +351,6 @@ func TestValidate_OutpointOnlySpend_NoParentRead(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_noparentread")
 	require.NoError(t, err)
 
-	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	realStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, realStore.SetBlockHeight(500))
@@ -468,7 +458,6 @@ func TestValidate_OutpointOnlySpend_BIP68HeightSkipped(t *testing.T) {
 	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_bip68height")
 	require.NoError(t, err)
 
-	tSettings.UtxoStore.UtxoStore = utxoStoreURL // satisfy the validator's SQL-store fast-path guard
 	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 	require.NoError(t, store.SetBlockHeight(1000))
