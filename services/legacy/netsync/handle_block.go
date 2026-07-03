@@ -538,10 +538,12 @@ func (sm *SyncManager) legacyOutpointOnly(height uint32) bool {
 // never wait (pre-existing behaviour). On the below-checkpoint outpoint-only
 // fast path the wait is redundant three ways: (1) its documented purpose is
 // BIP68 parent-height lookup, and BIP68 is skipped below the checkpoint;
-// (2) block dispatch is a single serial blockHandler, so the parent's UTXOs
-// are committed before this block starts; (3) the legacy path AddBlocks with
-// MinedSet=true synchronously, so GetBlockIsMined is always instantly true and
-// only costs a gRPC round-trip per block.
+// (2) block dispatch is serial — blockHandler in manager.go is the single
+// goroutine consuming blockQueue, so the parent's UTXOs are committed before
+// this block starts; (3) the legacy path calls AddBlock with WithMinedSet(true)
+// (see buildAddBlockOpts in services/blockvalidation/BlockValidation.go), so
+// GetBlockIsMined is always instantly true and only costs a gRPC round-trip
+// per block.
 func (sm *SyncManager) needsParentMinedWait(height uint32) bool {
 	return height > 1 && !sm.legacyOutpointOnly(height)
 }

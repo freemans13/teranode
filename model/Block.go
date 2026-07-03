@@ -633,7 +633,7 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	//     Skipped below the hardcoded checkpoint on the outpoint-only fast path:
 	//     the checkpoint-anchored chain already certifies order/blessing, and the
 	//     integrity floor (PoW, CheckMerkleRoot, checkDuplicateTransactions)
-	//     still runs above.
+	//     still runs earlier in this function (steps 1-11).
 	if txMetaStore != nil {
 		if b.skipOrderAndBlessedBelowCheckpoint(settings) {
 			logger.Debugf("[Block:Valid][%s] skipping validOrderAndBlessed for block at height %d at or below hardcoded checkpoint (outpoint-only fast path)", b.String(), b.Height)
