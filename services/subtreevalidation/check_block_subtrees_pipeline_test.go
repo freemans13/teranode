@@ -112,7 +112,7 @@ func TestCheckBlockSubtrees_MultiBatch_BalancesArenas(t *testing.T) {
 
 	wireMultiBatchMocks(server)
 
-	mockValidator := server.validatorClient.(*validator.MockValidatorClient)
+	mockValidator := server.validatorClient.(*validator.MockValidator)
 	mockValidator.UtxoStore = server.utxoStore
 
 	const numSubtrees = 5
@@ -153,7 +153,7 @@ func TestCheckBlockSubtrees_MultiBatch_ProcessErrorBalancesArenas(t *testing.T) 
 
 	wireMultiBatchMocks(server)
 
-	mockValidator := server.validatorClient.(*validator.MockValidatorClient)
+	mockValidator := server.validatorClient.(*validator.MockValidator)
 	mockValidator.UtxoStore = server.utxoStore
 	// Fail the very first transaction validated, forcing an early batch's
 	// processTransactionsInLevels to error while later batches are in flight.

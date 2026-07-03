@@ -1331,7 +1331,6 @@ func (u *BlockValidation) buildSubtreeJobsForBatch(ctx context.Context, block *m
 
 	batchSize := batch.batchEnd - batch.batchStart
 	jobs := make([]*SubtreeWriteJob, batchSize)
-	var jobsMu sync.Mutex
 
 	for i := 0; i < batchSize; i++ {
 		globalIdx := batch.batchStart + i
@@ -1347,9 +1346,9 @@ func (u *BlockValidation) buildSubtreeJobsForBatch(ctx context.Context, block *m
 			if err != nil {
 				return err
 			}
-			jobsMu.Lock()
+			// Each goroutine writes a distinct index; buildG.Wait() below
+			// provides the happens-before that makes these writes visible.
 			jobs[localIdx] = job
-			jobsMu.Unlock()
 			return nil
 		})
 	}
