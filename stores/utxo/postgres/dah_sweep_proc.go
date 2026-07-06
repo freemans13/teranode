@@ -485,16 +485,11 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 // stamps per pass), committing per pass, looping until a pass stamps fewer than
 // batch_rows; a cancelled CALL loses at most one uncommitted pass and resumes
 // from the per-partition watermark next pass — the watermark only advances when
-// the range fully drains. Per-CALL timeout is a generous backstop
-// (PostgresDAHSweepCallTimeoutSeconds, default 120s — NOT a tight per-pass
-// limit). Per-partition errors are logged, not fatal. Shared by the background
-// cursor and Prune.
+// the range fully drains. CALLs have no deadline; work is bounded by unit size
+// (max_windows_per_call bands of band_heights heights), never by wall-clock.
+// Stall visibility is the stagnation monitor's responsibility. Per-partition
+// errors are logged, not fatal. Shared by the background cursor and Prune.
 func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, retention int32) int64 {
-	callTimeout := time.Duration(s.settings.UtxoStore.PostgresDAHSweepCallTimeoutSeconds) * time.Second
-	if callTimeout <= 0 {
-		callTimeout = 120 * time.Second
-	}
-
 	var before int64
 	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before)
 
@@ -532,12 +527,9 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 				return
 			}
 
-			cctx, cancel := context.WithTimeout(ctx, callTimeout)
-			defer cancel()
-
-			if _, err := s.maint().Exec(cctx, `CALL dah_sweep_batch($1, $2, $3)`, p, safeTip, retention); err != nil {
+			if err := s.sweepOnePartition(ctx, p, safeTip, retention); err != nil {
 				if ctx.Err() == nil {
-					s.logger.Infof("[dahCursor] partition %d CALL error (retry next tick): %v", p, err)
+					s.logger.Warnf("[dahSweep] partition %d CALL error (SQLSTATE %s; retry next pass): %v", p, pgSQLState(err), err)
 					prometheusDAHSweepErrors.Inc()
 				}
 			}
@@ -554,6 +546,31 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 	}
 
 	return 0
+}
+
+// sweepOnePartition fires one dah_sweep_batch() CALL for a single partition with
+// NO deadline: work is bounded by unit size (max_windows_per_call bands of
+// band_heights heights), never by wall-clock. A 45-minute dense band runs for 45
+// minutes and commits. The CALL runs on the store lifetime ctx only, so shutdown
+// still cancels it cleanly; stall visibility is the stagnation monitor's job.
+func (s *Store) sweepOnePartition(ctx context.Context, partition int, safeTip int64, retention int32) error {
+	start := time.Now()
+	_, err := s.maint().Exec(ctx, `CALL dah_sweep_batch($1, $2, $3)`, partition, safeTip, retention)
+	prometheusDAHSweepCallDuration.Observe(time.Since(start).Seconds())
+
+	return err
+}
+
+// pgSQLState returns the postgres SQLSTATE code carried by err, or "" when err
+// is nil or not a postgres error. Used to make error logs classifiable (40P01
+// deadlock vs 55P03 lock timeout vs everything else) without changing behavior.
+func pgSQLState(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+
+	return ""
 }
 
 // dahWatermarkBacklog returns safeTip minus the lowest per-partition watermark —

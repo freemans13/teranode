@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 )
 
@@ -421,4 +423,22 @@ func TestBootstrapInstallsV14WithoutLockTimeout(t *testing.T) {
 		`SELECT prosrc FROM pg_proc WHERE proname = 'dah_sweep_batch'`).Scan(&src)
 	require.NoError(t, err)
 	require.NotContains(t, src, "lock_timeout")
+}
+
+func TestSweepOnePartitionRunsWithoutDeadline(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// safeTip=-1 is the documented no-op smoke value: the CALL returns immediately.
+	// The contract under test: sweepOnePartition exists, takes NO timeout, and
+	// surfaces the CALL error verbatim (nil here).
+	err := store.sweepOnePartition(ctx, 0, -1, 0)
+	require.NoError(t, err)
+}
+
+func TestPgSQLStateExtractsCode(t *testing.T) {
+	require.Equal(t, "", pgSQLState(nil))
+	require.Equal(t, "", pgSQLState(errors.NewProcessingError("not a pg error")))
+
+	pgErr := &pgconn.PgError{Code: "40P01"}
+	require.Equal(t, "40P01", pgSQLState(pgErr))
 }
