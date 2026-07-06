@@ -89,6 +89,54 @@ func (t *stagnationTracker) observe(p int, wm, backlog int64, now time.Time, thr
 	return classifyStall(sinceProgress, backlog, threshold), sinceProgress
 }
 
+// zeroTipTracker tracks how long the block-height source has reported a
+// non-positive safe tip — the "tip source broken" cause explicitly called out
+// in the stagnation contract, which the plain watermark-vs-backlog tracker
+// above cannot see because a zero safeTip skips the watermark probe entirely.
+// It reuses classifyStall with a backlog=1 sentinel: while the tip is
+// unknown, backlog cannot be ruled out, so the ONE stagnation rule (frozen +
+// backlog escalates on wall-clock time) still applies.
+type zeroTipTracker struct {
+	since  time.Time
+	warned bool
+}
+
+// observe records one tick where safeTip <= 0 and returns the stall level for
+// that instant, how long the tip has been non-positive, and whether an
+// escalation message should be emitted now. Cadence is deliberately different
+// from the per-partition alarm: Warnf fires ONCE on the transition into
+// stallWarn (the threshold/2..threshold window can span many ticks, and this
+// is a single "starting to worry" heads-up, not a per-tick page), while
+// Errorf fires EVERY tick once in stallError, matching a persistent alarm
+// for a genuinely broken tip source that needs action.
+func (z *zeroTipTracker) observe(now time.Time, threshold time.Duration) (level stallLevel, since time.Duration, shouldLog bool) {
+	if z.since.IsZero() {
+		z.since = now
+	}
+
+	since = now.Sub(z.since)
+	level = classifyStall(since, 1, threshold)
+
+	switch level {
+	case stallWarn:
+		shouldLog = !z.warned
+		z.warned = true
+
+	case stallError:
+		shouldLog = true
+	}
+
+	return level, since, shouldLog
+}
+
+// reset clears the zero-tip clock once safeTip recovers above 0, so a later
+// zero-tip episode starts counting from scratch rather than reading as a
+// continuation of the old one.
+func (z *zeroTipTracker) reset() {
+	z.since = time.Time{}
+	z.warned = false
+}
+
 // runDAHStagnationMonitor is the sweep's ONLY remaining "timeout", and it
 // cancels nothing: a 60s ticker, independent of every CALL (a CALL blocked in
 // Exec can never blind it), reading all partition watermarks in one query on
@@ -107,6 +155,7 @@ func (s *postgresPrunerService) runDAHStagnationMonitor(ctx context.Context) {
 
 	var (
 		tracker     stagnationTracker
+		zeroTip     zeroTipTracker
 		lastStamped int64
 	)
 
@@ -121,8 +170,26 @@ func (s *postgresPrunerService) runDAHStagnationMonitor(ctx context.Context) {
 		case <-ticker.C:
 			safeTip := s.store.dahSafeTip(lag)
 			if safeTip <= 0 {
+				// No watermark probe here — with the tip unknown, a lag
+				// number would be meaningless. But this must not go silent:
+				// "broken/zero safeTip" is an explicitly named stall cause,
+				// and a node whose block-height source never initializes
+				// must still alarm even though no partition has anything to
+				// report.
+				level, since, shouldLog := zeroTip.observe(time.Now(), threshold)
+				if shouldLog {
+					switch level {
+					case stallWarn:
+						s.store.logger.Warnf("[dahStagnation] safeTip has been <= 0 for %s — block height source may not be advancing", since.Truncate(time.Second))
+					case stallError:
+						s.store.logger.Errorf("[dahStagnation] safeTip is 0 for %s — block height source is not advancing; sweep cannot run on any partition", since.Truncate(time.Second))
+					}
+				}
+
 				continue
 			}
+
+			zeroTip.reset() // safeTip recovered; clear the zero-tip clock
 
 			rows, err := s.store.pool.Query(ctx,
 				`SELECT partition, last_swept_height FROM dah_part_watermark ORDER BY partition`)
