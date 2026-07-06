@@ -23,9 +23,14 @@ import (
 // trails the tip by far more than that.
 //
 // Crash safety: a crash loses only the un-flushed buffer. Startup repairs any
-// gap — pendingUnminedBackfillDDL now runs on EVERY startup, copying all
-// non-conflicting unmined txs from txs into pending_unmined (idempotent
-// ON CONFLICT DO NOTHING; one startup-only seq scan).
+// gap — pendingUnminedBackfillDDL copies all non-conflicting unmined txs from
+// txs into pending_unmined (idempotent ON CONFLICT DO NOTHING). That seq scan
+// is gated by the store_clean_shutdown marker (see resolvePendingUnminedBackfill
+// in schema.go): a graceful Store.Stop()/Close() already drains this
+// projector's buffer via stopPendingUnminedProjector(), making pending_unmined
+// complete on its own, so the backfill is skipped after a clean shutdown and
+// only runs to recover from an unclean one (crash, or a missing/unreadable
+// marker on an older database).
 //
 // A partial btree on txs(unmined_since) was considered and REJECTED: PG16+
 // BRIN is a summarizing AM so SetMinedMulti's unmined_since→NULL UPDATE stays
