@@ -21,6 +21,10 @@ var (
 	prometheusDAHSweepWatermarkLag prometheus.Gauge
 	prometheusDAHSweepErrors       prometheus.Counter
 
+	// stagnation monitor (runDAHStagnationMonitor) — the sweep's only
+	// remaining "timeout"; it alarms, it never cancels.
+	prometheusDAHSweepStalled *prometheus.GaugeVec
+
 	// reconciliation backstop (runDAHReconcile)
 	prometheusDAHReconcileCorrected prometheus.Counter
 
@@ -105,6 +109,13 @@ func doInitPrometheusMetrics() {
 		Name:      "dah_sweep_errors_total",
 		Help:      "Total proc-mode DAH sweep CALL errors",
 	})
+
+	prometheusDAHSweepStalled = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "teranode",
+		Subsystem: "postgres_utxo",
+		Name:      "dah_sweep_stalled",
+		Help:      "1 when the partition's DAH sweep watermark has been frozen past the stall threshold with backlog present",
+	}, []string{"partition"})
 
 	prometheusDAHReconcileCorrected = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "teranode",
