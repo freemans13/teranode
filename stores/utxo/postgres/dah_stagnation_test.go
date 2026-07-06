@@ -151,6 +151,83 @@ func TestStagnationTrackerNoBacklogNeverEscalates(t *testing.T) {
 	require.Equal(t, stallNone, level)
 }
 
+// TestZeroTipTrackerEscalation walks a persistently zero/negative safeTip
+// through the same None -> Warn -> Error decision table as the per-partition
+// tracker (via classifyStall's backlog=1 sentinel: tip unknown means backlog
+// cannot be ruled out), but with a different logging cadence: Warnf must fire
+// once on the transition into Warn, and Errorf must repeat every tick once in
+// Error — this is the escalation clock for "broken/zero safeTip", the exact
+// silent-stall class the monitor exists to kill.
+func TestZeroTipTrackerEscalation(t *testing.T) {
+	threshold := 900 * time.Second
+	start := time.Unix(1_000_000, 0)
+
+	var z zeroTipTracker
+
+	level, since, shouldLog := z.observe(start, threshold)
+	require.Equal(t, stallNone, level)
+	require.Equal(t, time.Duration(0), since)
+	require.False(t, shouldLog)
+
+	level, since, shouldLog = z.observe(start.Add(450*time.Second), threshold)
+	require.Equal(t, stallWarn, level)
+	require.Equal(t, 450*time.Second, since)
+	require.True(t, shouldLog, "first tick crossing into Warn must log")
+
+	// Still in the Warn window a tick later: must NOT log again.
+	level, _, shouldLog = z.observe(start.Add(480*time.Second), threshold)
+	require.Equal(t, stallWarn, level)
+	require.False(t, shouldLog, "Warn only logs once on the transition, not every tick")
+
+	// At threshold: Error, and it logs.
+	level, since, shouldLog = z.observe(start.Add(900*time.Second), threshold)
+	require.Equal(t, stallError, level)
+	require.Equal(t, 900*time.Second, since)
+	require.True(t, shouldLog)
+
+	// Past threshold, still Error: logs EVERY tick, unlike Warn.
+	level, _, shouldLog = z.observe(start.Add(960*time.Second), threshold)
+	require.Equal(t, stallError, level)
+	require.True(t, shouldLog, "Error alarm must repeat every tick")
+}
+
+// TestZeroTipTrackerResetOnRecovery: once safeTip goes positive again, reset()
+// must clear the clock so a later zero-tip episode starts counting from zero
+// rather than reading as still-stalled from the old episode.
+func TestZeroTipTrackerResetOnRecovery(t *testing.T) {
+	threshold := 900 * time.Second
+	start := time.Unix(1_000_000, 0)
+
+	var z zeroTipTracker
+
+	level, _, _ := z.observe(start, threshold)
+	require.Equal(t, stallNone, level)
+
+	level, _, _ = z.observe(start.Add(900*time.Second), threshold)
+	require.Equal(t, stallError, level)
+
+	// safeTip recovers above 0.
+	z.reset()
+
+	// A fresh zero-tip episode must NOT be treated as still stalled.
+	level, since, shouldLog := z.observe(start.Add(910*time.Second), threshold)
+	require.Equal(t, stallNone, level)
+	require.Equal(t, time.Duration(0), since)
+	require.False(t, shouldLog)
+}
+
+// TestZeroTipTrackerDisabledThreshold: threshold<=0 stays fully silent even
+// after a long zero-tip stretch, consistent with classifyStall's disabled path.
+func TestZeroTipTrackerDisabledThreshold(t *testing.T) {
+	start := time.Unix(1_000_000, 0)
+
+	var z zeroTipTracker
+
+	level, _, shouldLog := z.observe(start.Add(24*time.Hour), 0)
+	require.Equal(t, stallNone, level)
+	require.False(t, shouldLog)
+}
+
 // TestStagnationTrackerPrimeIsIdempotent: prime() only baselines once; later
 // calls (the monitor calls it every tick) must not reset a frozen clock.
 func TestStagnationTrackerPrimeIsIdempotent(t *testing.T) {
