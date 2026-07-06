@@ -123,7 +123,7 @@ func TestCheckBlockSubtrees_MultiBatch_BalancesArenas(t *testing.T) {
 
 	// arenaGets/arenaPuts are package-global; the pre/post delta is only valid
 	// because subtreevalidation tests run sequentially (no t.Parallel, per
-	// .claude/rules/testing.md). A concurrent test touching the pool would
+	// the Testing section in AGENTS.md). A concurrent test touching the pool would
 	// perturb these deltas.
 	gets0, puts0 := arenaGets.Load(), arenaPuts.Load()
 
