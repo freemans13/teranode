@@ -924,6 +924,15 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 
 	if !validationOptions.SkipUtxoCreation {
 		// store the transaction in the UTXO store, marking it as locked if we are going to add it to the block assembly
+		//
+		// CONTRACT (below-checkpoint outpoint-only fast path): when OutpointOnlySpend is
+		// set the tx is deliberately un-decorated (no parent satoshis/scripts), so EVERY
+		// UTXO-store Create reachable on this path MUST thread WithSkipExtendedInputs(true)
+		// — otherwise store.Create runs GetFees over zero parent satoshis and hard-fails the
+		// block. This coupling is NOT enforced by a runtime guard (unlike the
+		// OutpointOnlySpend => SkipScriptValidation precondition checked earlier), so any new
+		// create seam added on this path must repeat it. The conflicting-fallback create
+		// above threads the same option for this reason.
 		var createExtraOpts []utxo.CreateOption
 		if validationOptions.OutpointOnlySpend {
 			createExtraOpts = append(createExtraOpts, utxo.WithSkipExtendedInputs(true))
