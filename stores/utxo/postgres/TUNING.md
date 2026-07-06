@@ -188,3 +188,68 @@ bounded and need far less cache.
   reclaiming >200K tx/s.
 - **`dah_sweep.go`**: DAH sweep + backstop use pre-aggregated `JOIN`s instead of
   per-candidate correlated subqueries.
+
+## Execution model (v14): no clocks on healthy work
+
+The DAH sweep must handle ANY number of records per band. Its work is bounded by
+unit size — `band_heights` heights per band, `max_windows_per_call` bands per
+CALL — and never by wall-clock. There is deliberately no CALL timeout, no
+statement_timeout, and no lock_timeout on this path. History showed why: every
+wall-clock bound eventually crossed a legitimate work size and turned into an
+infinite retry treadmill (cancel mid-band → rollback → retry the same band),
+which is strictly worse than slow progress — three production incidents,
+including a 36-hour silent stall that filled a 400GB disk and crashed postgres.
+
+Safety comes from structure instead:
+
+- **Interruption-proof progress:** each band commits fold + stamp + watermark
+  advance atomically inside the procedure. Crash, cancel, deploy, or connection
+  loss costs at most the in-flight band.
+- **No deadlocks between DAH writers:** the sweep fold and the reconciler both
+  take `pg_try_advisory_xact_lock(20240684 + partition)`, so they are mutually
+  exclusive per partition. The reconciler skips (without advancing its rotation
+  cursor) when the sweep holds the partition.
+- **Clock immunity:** the maintenance pool pins `statement_timeout=0`,
+  `lock_timeout=0`, `idle_in_transaction_session_timeout=0` at connect time, so
+  a server/role-level ops default can never kill a healthy band mid-fold.
+- **Errors back off, never spin:** any CALL or probe error sleeps
+  `PostgresDAHSweepIdleIntervalMillis` before retrying and logs at Warnf with
+  the SQLSTATE. A postgres outage produces a handful of quiet retries per
+  minute, not a log flood.
+
+### The stagnation alarm (the only "timeout" left — it kills nothing)
+
+`dah_stagnation.go` runs a 60s ticker, independent of every CALL, on the MAIN
+pool (so a saturated maintenance pool cannot blind it). One rule, no exceptions:
+**watermark frozen + backlog > 0** escalates on wall-clock time since that
+partition last advanced — Warnf at `PostgresDAHSweepStallAlertSeconds/2`,
+Errorf every tick past the threshold plus the
+`teranode_postgres_utxo_dah_sweep_stalled{partition}` gauge. It is deliberately blind to WHY
+progress stopped, so every cause lands in the same loud place: wedged backend,
+`dah_sweep_control.enabled=false` left off after maintenance, broken tip
+source, orphaned advisory lock after a kill -9, plan regression, IO stall.
+
+**Runbook when it fires:**
+
+1. Is a CALL in flight and doing work? `SELECT pid, state, wait_event_type,
+   wait_event, now()-query_start FROM pg_stat_activity WHERE query LIKE 'CALL
+   dah_sweep_batch%';` — `IO/DataFileRead` = healthy giant band, leave it alone.
+2. Waiting on a lock? `SELECT pg_blocking_pids(<pid>);` then look the blocker
+   up in pg_stat_activity. Decide manually — nothing auto-cancels by design.
+3. No CALL at all? Check `SELECT enabled FROM dah_sweep_control;` (a forgotten
+   kill switch) and that the node's block height source is advancing.
+4. CALLs erroring? The `[dahCursor]` Warnf lines carry the SQLSTATE.
+
+### Tuning for chain density
+
+`band_heights` (control table, live — the proc re-reads it every CALL) is the
+work-quantum knob: it bounds how much one band folds and therefore how much a
+single interruption can cost. 5000 is fine for sparse eras; the 2018-19
+stress-test region needed 500 (~215K spends/partition/band). If bands start
+taking hours, shrink it — never add a timeout.
+
+Considered and deferred (2026-07-06): a pg_stat_activity wait-event sampler
+that classifies WHY a stall happened ("wedged on lock held by pid X" vs
+"healthy IO grind") in the alert itself. Deferred because every real incident
+so far was caused by the timeouts, not by lock wedges; revisit if a genuine
+wedge ever pages (runbook step 2 covers it manually meanwhile).

@@ -50,9 +50,34 @@ import (
 // spendable_count filter would wrongly drop a row the recount stamped after an
 // overshoot). The counter itself is healed by the reconcile backstop.
 //
-// Bumped 13→14: drop in-proc lock_timeout. Background work waits for locks
-// indefinitely by design; stall visibility is the Go-side stagnation monitor's job
-// (Task 5). Also drop dead batch_rows seeding (no longer written after Task 6).
+// Bumped 13→14: delete the in-proc lock_timeout; work is bounded by units, never
+// clocks. Three production incidents (2026-07-01, 07-02, 07-04→06) traced to the
+// same execution-model flaw: wall-clock limits on healthy work. At dense chain
+// regions one band's fold legitimately runs for many minutes; the Go client's
+// 120s CALL timeout cancelled every CALL inside its first band → rollback →
+// retry the SAME band forever → 36h zero-progress treadmill at INFO level →
+// 343GB of unpruned rows → disk full → postgres crash. Raising the timeout then
+// exposed the next clock: lock_timeout='5s' aborts an entire band (minutes of
+// disk-bound work) because ONE row was contended for five seconds — and the
+// contended rows were the reconciler's, whose whole job is touching the same
+// drifted parents the fold re-touches (deadlock class 40P01). v14's position:
+//   - A band takes as long as it takes. Interruption safety comes from the
+//     per-band atomic COMMIT (fold+stamp+watermark), not from deadlines — any
+//     interruption costs at most one band.
+//   - Row-lock waits are waited out: hot-path writers hold row locks for
+//     milliseconds; anything longer is a wedge, and a wedge is an ALERTING
+//     problem (the Go-side stagnation monitor), not a transaction-abort problem.
+//   - The DAH writers themselves never contend: the reconciler takes this
+//     procedure's per-partition advisory lock (gate CTE), so fold and audit are
+//     mutually exclusive per partition by construction.
+//
+// The Go driver mirrors this: no per-CALL context timeout (deleted), per-
+// partition loops with idle-interval backoff on errors, and clock-immunity GUCs
+// (statement_timeout=0 etc.) pinned on the maintenance pool — a server-level
+// statement_timeout armed at CALL start cannot be defused by SET LOCAL inside
+// the procedure. The only remaining "timeout" is the stagnation monitor
+// (dah_stagnation.go): watermark frozen + backlog > 0 → Warnf → Errorf + gauge.
+// It cancels nothing; a human decides. See TUNING.md "Execution model (v14)".
 const dahSweepProcVersion = 14
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
