@@ -286,6 +286,11 @@ func configureBatcher[T any](b *batcher.Batcher[T], maxConcurrent int, drain boo
 func (s *Store) Stop() {
 	s.stopPrunerCursor()
 	s.stopPendingUnminedProjector()
+	// stopPendingUnminedProjector's final drain (above) is what makes
+	// pending_unmined complete and correct, so the clean-shutdown marker can
+	// only be stamped true AFTER it returns. Stamp it here, while s.pool is
+	// still open, so the next startup can skip the reconciliation backfill.
+	s.markCleanShutdown(context.Background())
 	if s.createBatcher != nil {
 		s.createBatcher.Close()
 	}
@@ -327,6 +332,13 @@ func (s *Store) maint() *pgxpool.Pool {
 // goroutine finishes so connections are not leaked even if ctx expired first.
 func (s *Store) Close(ctx context.Context) error {
 	s.stopPrunerCursor()
+	// stopPendingUnminedProjector is Once-latched and idempotent (see
+	// pending_unmined_projector.go), so calling it here is safe even if Stop()
+	// already called it. Its final drain is what makes pending_unmined
+	// complete and correct, so it must run — and the clean-shutdown marker
+	// must be stamped — before the pool closes below.
+	s.stopPendingUnminedProjector()
+	s.markCleanShutdown(ctx)
 
 	done := make(chan struct{})
 
@@ -371,6 +383,26 @@ func (s *Store) stopPrunerCursor() {
 	s.prunerServiceMu.Unlock()
 	if pgps, ok := ps.(*postgresPrunerService); ok {
 		pgps.stop()
+	}
+}
+
+// markCleanShutdown stamps store_clean_shutdown.clean = true, signalling to the
+// next startup that pending_unmined is complete — stopPendingUnminedProjector's
+// final drain must already have run — so the seq-scan reconciliation backfill
+// can be skipped (see resolvePendingUnminedBackfill in schema.go). Must be
+// called while s.pool is still open (before pool.Close()/maintPool.Close()).
+//
+// Best-effort: a failed UPDATE (e.g. the pool is already draining, or ctx has
+// a very short deadline) only costs one extra backfill on the next startup —
+// never a correctness problem — so it is logged and swallowed rather than
+// propagated, and it never blocks shutdown.
+func (s *Store) markCleanShutdown(ctx context.Context) {
+	if s.pool == nil {
+		return
+	}
+
+	if _, err := s.pool.Exec(ctx, `UPDATE store_clean_shutdown SET clean = true, stamped_at = now() WHERE id = 1`); err != nil {
+		s.logger.Warnf("[markCleanShutdown] failed to stamp clean-shutdown marker, next startup will run a full pending_unmined backfill: %v", err)
 	}
 }
 

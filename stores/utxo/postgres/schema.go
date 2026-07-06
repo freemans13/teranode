@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -31,7 +32,7 @@ import (
 //     (flat bytea + bitmaps + scalar counts). A single row lookup returns
 //     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
-	if err := createSchemaInternal(ctx, s.pool); err != nil {
+	if err := createSchemaInternal(ctx, s.pool, s.logger); err != nil {
 		return err
 	}
 
@@ -77,14 +78,14 @@ const numPartitions = 8
 // is the only pruner path, so it is always created and the px_delete_at_height
 // BRIN index on txs is always backfilled into pending_deletes and dropped.
 func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, _ bool) error {
-	return createSchemaInternal(ctx, pool)
+	return createSchemaInternal(ctx, pool, ulogger.TestLogger{})
 }
 
 // createSchemaInternal executes all DDL statements using the provided pool. It
 // always creates the pending_deletes side-table (8 leaves + per-leaf btree on
 // delete_at_height) and unconditionally backfills+drops the legacy
 // px_delete_at_height BRIN index on txs — pending_deletes is the only pruner path.
-func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool) error {
+func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, logger ulogger.Logger) error {
 	ddlStatements := []string{
 		txsDDL,
 		spendsDDL,
@@ -327,11 +328,16 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool) error {
 			return errors.NewStorageError("pending_unmined_p%02d index creation failed", i, err)
 		}
 	}
-	// One-time idempotent backfill: copies existing unmined non-conflicting txs
-	// into pending_unmined. Guarded by px_pu_backfill_marker so it does not
-	// re-run on every startup (see pendingUnminedBackfillDDL for details).
-	if _, err := pool.Exec(ctx, pendingUnminedBackfillDDL); err != nil {
-		return errors.NewStorageError("pending_unmined backfill failed", err)
+	// Retire the legacy one-shot backfill marker index unconditionally, on every
+	// startup (cheap no-op once already dropped) — see pendingUnminedBackfillDDL.
+	if _, err := pool.Exec(ctx, pendingUnminedBackfillDropLegacyMarkerDDL); err != nil {
+		return errors.NewStorageError("legacy pending_unmined backfill marker drop failed", err)
+	}
+	// Clean-shutdown-gated reconciliation backfill: skips the txs seq scan when
+	// the previous shutdown was clean (see resolvePendingUnminedBackfill and
+	// pendingUnminedBackfillDDL for details).
+	if err := resolvePendingUnminedBackfill(ctx, pool, logger); err != nil {
+		return err
 	}
 
 	// Partial indexes on txs for iterator/pruner queries. The base indexes are
@@ -536,20 +542,100 @@ CREATE TABLE IF NOT EXISTS pending_unmined (
     PRIMARY KEY (hash)
 ) PARTITION BY HASH (hash);`
 
-// pendingUnminedBackfillDDL is the idempotent reconciliation backfill executed
-// on EVERY store startup. The create hot path no longer writes pending_unmined
-// synchronously — rows are projected by the in-process write-behind projector
-// (see pending_unmined_projector.go) — so a crash can lose the projector's
-// not-yet-flushed buffer. This startup INSERT..SELECT repairs any such gap by
-// copying every non-conflicting unmined tx from txs (one seq scan, startup
-// only). ON CONFLICT (hash) DO NOTHING makes re-runs free for rows already
-// present. The legacy one-shot marker index px_pu_backfill_marker is dropped.
+// pendingUnminedBackfillDropLegacyMarkerDDL drops the retired one-shot backfill
+// marker index. It runs unconditionally on every startup (a cheap no-op once
+// the index is already gone) — unlike pendingUnminedBackfillDDL below, this
+// statement carries no seq-scan cost, so it does not need the clean-shutdown
+// gate.
+const pendingUnminedBackfillDropLegacyMarkerDDL = `
+DROP INDEX IF EXISTS px_pu_backfill_marker;`
+
+// pendingUnminedBackfillDDL is the idempotent reconciliation backfill that
+// repairs pending_unmined from txs. The create hot path no longer writes
+// pending_unmined synchronously — rows are projected by the in-process
+// write-behind projector (see pending_unmined_projector.go) — so an UNCLEAN
+// stop (crash) can lose the projector's not-yet-flushed buffer. This
+// INSERT..SELECT repairs any such gap by copying every non-conflicting unmined
+// tx from txs (one seq scan). ON CONFLICT (hash) DO NOTHING makes re-runs free
+// for rows already present.
+//
+// It is now gated by the store_clean_shutdown marker (see
+// resolvePendingUnminedBackfill): a graceful Store.Stop()/Close() already
+// performs a final drain of the write-behind buffer via
+// stopPendingUnminedProjector(), which makes pending_unmined complete and
+// correct on its own — so after a CLEAN shutdown this seq scan is redundant
+// and is skipped. On a production mainnet database (hundreds of millions of
+// txs rows) that seq scan costs minutes; skipping it on the common clean-
+// restart path removes that cost entirely. It still runs whenever the marker
+// says the previous shutdown was unclean, is missing, or fails to read — the
+// fail-safe direction that preserves today's behaviour for crash recovery.
 const pendingUnminedBackfillDDL = `
-DROP INDEX IF EXISTS px_pu_backfill_marker;
 INSERT INTO pending_unmined (hash, unmined_since)
   SELECT hash, unmined_since FROM txs
   WHERE unmined_since IS NOT NULL AND conflicting = false
   ON CONFLICT (hash) DO NOTHING;`
+
+// storeCleanShutdownDDL creates the single-row marker table that records
+// whether the store's previous run shut down cleanly. Additive/idempotent:
+// CREATE TABLE IF NOT EXISTS plus a seeding INSERT that is a no-op once the row
+// exists, so it is safe to run unconditionally on every startup — including
+// against a pre-existing database that predates this table, which naturally
+// seeds clean=false and so falls into the fail-safe backfill branch on its
+// first startup with this schema version.
+//
+// id=1 is the only row ever used; there is exactly one store per database.
+const storeCleanShutdownDDL = `
+CREATE TABLE IF NOT EXISTS store_clean_shutdown (
+    id INT PRIMARY KEY,
+    clean BOOLEAN NOT NULL,
+    stamped_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO store_clean_shutdown (id, clean, stamped_at) VALUES (1, false, now()) ON CONFLICT (id) DO NOTHING;`
+
+// resolvePendingUnminedBackfill gates the pending_unmined reconciliation
+// backfill (pendingUnminedBackfillDDL) on the store_clean_shutdown marker.
+//
+// It first ensures the marker table exists (idempotent, safe every startup),
+// then reads the id=1 row's clean value:
+//   - clean == true:  the previous shutdown already drained the write-behind
+//     projector (Store.Stop/Close → stopPendingUnminedProjector), so
+//     pending_unmined is already complete. The backfill seq scan is skipped.
+//   - clean == false, the row is missing, or the read errors for any reason:
+//     the fail-safe direction — run the full backfill, exactly as before this
+//     gate existed.
+//
+// In both branches the marker is then stamped clean=false: the store is now
+// running, so any crash from this point forward must be treated as unclean on
+// the next startup.
+func resolvePendingUnminedBackfill(ctx context.Context, pool *pgxpool.Pool, logger ulogger.Logger) error {
+	if _, err := pool.Exec(ctx, storeCleanShutdownDDL); err != nil {
+		return errors.NewStorageError("store_clean_shutdown marker table creation failed", err)
+	}
+
+	var clean bool
+
+	queryErr := pool.QueryRow(ctx, `SELECT clean FROM store_clean_shutdown WHERE id = 1`).Scan(&clean)
+
+	if queryErr == nil && clean {
+		logger.Infof("[pendingUnminedBackfill] skipped: previous shutdown was clean, pending_unmined is already reconciled")
+	} else {
+		if queryErr != nil {
+			logger.Infof("[pendingUnminedBackfill] running full backfill: store_clean_shutdown marker missing or unreadable (%v)", queryErr)
+		} else {
+			logger.Infof("[pendingUnminedBackfill] running full backfill: previous shutdown was unclean")
+		}
+
+		if _, err := pool.Exec(ctx, pendingUnminedBackfillDDL); err != nil {
+			return errors.NewStorageError("pending_unmined backfill failed", err)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE store_clean_shutdown SET clean = false, stamped_at = now() WHERE id = 1`); err != nil {
+		return errors.NewStorageError("store_clean_shutdown marker update failed", err)
+	}
+
+	return nil
+}
 
 // spends: append-only spend records. LOGGED. A row here is the canonical
 // "this output was spent by that tx" marker; Unspend deletes the row, and
