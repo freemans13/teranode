@@ -232,7 +232,7 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 		require.True(t, sm.legacyOutpointOnly(uint32(blockHeight)), "gate must be ON for this case")
 
 		slices, datas, metas := makeSubtreeSlices(t, len(block.Transactions()))
-		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas))
+		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas, true))
 
 		for _, st := range slices {
 			for _, node := range st.Nodes {
@@ -250,7 +250,7 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 		require.False(t, sm.legacyOutpointOnly(uint32(blockHeight)), "gate must be OFF for this case")
 
 		slices, datas, metas := makeSubtreeSlices(t, len(block.Transactions()))
-		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas))
+		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas, false))
 
 		var nonZeroFees int
 		for _, st := range slices {
@@ -288,7 +288,7 @@ func TestSyncManager_extendTransactions_OutpointOnlySkipsDecorate(t *testing.T) 
 		block, txMap, txOrder := buildExtendedSubtreeBlock(t, blockHeight, 5)
 		require.Equal(t, enabled, sm.legacyOutpointOnly(uint32(blockHeight)))
 
-		err := sm.extendTransactions(context.Background(), testBlockIdent(block), txOrder, txMap)
+		err := sm.extendTransactions(context.Background(), testBlockIdent(block), txOrder, txMap, enabled)
 		require.NoError(t, err)
 
 		return spy.decorateCalls.Load()

@@ -188,8 +188,8 @@ func TestProcessBlockSubtrees(t *testing.T) {
 			Subtrees:         []*chainhash.Hash{}, // Empty subtrees
 		}
 
-		// Execute processBlockSubtrees
-		_, err := suite.Server.blockValidation.processBlockSubtrees(suite.Ctx, block)
+		// Execute processBlockSubtrees (outpointOnly irrelevant here — errors on no subtrees)
+		_, err := suite.Server.blockValidation.processBlockSubtrees(suite.Ctx, block, false)
 
 		// Verify error
 		assert.Error(t, err, "Should fail when block has no subtrees")
