@@ -39,6 +39,56 @@ func classifyStall(sinceProgress time.Duration, backlog int64, threshold time.Du
 	return stallNone
 }
 
+// stagnationTracker holds the per-partition progress bookkeeping for the
+// stagnation monitor: the PREVIOUS tick's raw observed watermark and the
+// wall-clock instant each partition last advanced. It deliberately does NOT
+// keep a running maximum — RewindDAHWatermark moves watermarks BACKWARD on a
+// reorg, and the post-rewind re-sweep (950 -> 960 -> 970, all below the old
+// peak) is healthy forward progress that must refresh the advance clock, not
+// read as a stall until the old peak is re-passed.
+type stagnationTracker struct {
+	prevWM      [numPartitions]int64
+	lastAdvance [numPartitions]time.Time
+	primed      bool
+}
+
+// prime baselines every partition's clock at now on the FIRST successful probe
+// (later calls are no-ops), so a process restart with an old, real backlog does
+// not instantly page — the frozen clock starts only once the monitor has
+// actually observed the watermark fail to move.
+func (t *stagnationTracker) prime(wm [numPartitions]int64, now time.Time) {
+	if t.primed {
+		return
+	}
+
+	for p := 0; p < numPartitions; p++ {
+		t.prevWM[p] = wm[p]
+		t.lastAdvance[p] = now
+	}
+
+	t.primed = true
+}
+
+// observe records one tick's raw watermark for a partition and returns the
+// stall level plus how long the partition has gone without an advance. Any
+// increase over the previous tick's value is an advance (clock refreshed,
+// stallNone); a decrease (reorg rewind) is NOT an advance but still moves the
+// baseline down so the subsequent re-sweep registers as progress.
+func (t *stagnationTracker) observe(p int, wm, backlog int64, now time.Time, threshold time.Duration) (stallLevel, time.Duration) {
+	if wm > t.prevWM[p] {
+		t.prevWM[p] = wm
+		t.lastAdvance[p] = now
+
+		return stallNone, 0
+	}
+
+	t.prevWM[p] = wm // a rewind moves the baseline DOWN; unchanged is a no-op
+
+	sinceProgress := now.Sub(t.lastAdvance[p])
+
+	return classifyStall(sinceProgress, backlog, threshold), sinceProgress
+}
+
 // runDAHStagnationMonitor is the sweep's ONLY remaining "timeout", and it
 // cancels nothing: a 60s ticker, independent of every CALL (a CALL blocked in
 // Exec can never blind it), reading all partition watermarks in one query on
@@ -56,10 +106,8 @@ func (s *postgresPrunerService) runDAHStagnationMonitor(ctx context.Context) {
 	}
 
 	var (
-		lastWM      [numPartitions]int64
-		lastAdvance [numPartitions]time.Time
+		tracker     stagnationTracker
 		lastStamped int64
-		primed      bool
 	)
 
 	ticker := time.NewTicker(60 * time.Second)
@@ -88,13 +136,12 @@ func (s *postgresPrunerService) runDAHStagnationMonitor(ctx context.Context) {
 
 			var wm [numPartitions]int64
 
-			ok := true
+			var scanErr error
 
 			for rows.Next() {
 				var p int
 				var h int64
-				if scanErr := rows.Scan(&p, &h); scanErr != nil {
-					ok = false
+				if scanErr = rows.Scan(&p, &h); scanErr != nil {
 					break
 				}
 
@@ -104,23 +151,18 @@ func (s *postgresPrunerService) runDAHStagnationMonitor(ctx context.Context) {
 			}
 			rows.Close()
 
-			if !ok || rows.Err() != nil {
-				s.store.logger.Warnf("[dahStagnation] watermark scan error (retry next tick): %v", rows.Err())
+			if scanErr == nil {
+				scanErr = rows.Err()
+			}
+
+			if scanErr != nil {
+				s.store.logger.Warnf("[dahStagnation] watermark scan error (retry next tick): %v", scanErr)
 				continue
 			}
 
 			now := time.Now()
 
-			if !primed {
-				// First successful probe: baseline everything at "now" so a
-				// process restart does not instantly page on an old backlog.
-				for p := 0; p < numPartitions; p++ {
-					lastWM[p] = wm[p]
-					lastAdvance[p] = now
-				}
-
-				primed = true
-			}
+			tracker.prime(wm, now) // no-op after the first successful probe
 
 			var maxBacklog int64
 
@@ -134,20 +176,17 @@ func (s *postgresPrunerService) runDAHStagnationMonitor(ctx context.Context) {
 					maxBacklog = backlog
 				}
 
-				if wm[p] > lastWM[p] {
-					lastWM[p] = wm[p]
-					lastAdvance[p] = now
+				level, frozenFor := tracker.observe(p, wm[p], backlog, now, threshold)
+
+				// Explicit gauge decision table: only stallError raises the
+				// stalled gauge; advance, stallNone AND stallWarn all clear it.
+				switch level {
+				case stallWarn:
+					s.store.logger.Warnf("[dahStagnation] partition %d watermark %d frozen for %s with backlog %d (safeTip %d)", p, wm[p], frozenFor.Truncate(time.Second), backlog, safeTip)
 					prometheusDAHSweepStalled.WithLabelValues(partitionLabel(p)).Set(0)
 
-					continue
-				}
-
-				switch classifyStall(now.Sub(lastAdvance[p]), backlog, threshold) {
-				case stallWarn:
-					s.store.logger.Warnf("[dahStagnation] partition %d watermark %d frozen for %s with backlog %d (safeTip %d)", p, wm[p], now.Sub(lastAdvance[p]).Truncate(time.Second), backlog, safeTip)
-
 				case stallError:
-					s.store.logger.Errorf("[dahStagnation] partition %d STALLED: watermark %d frozen for %s with backlog %d (safeTip %d) — sweep is not progressing; check pg_blocking_pids on the CALL backend, dah_sweep_control.enabled, and the tip source", p, wm[p], now.Sub(lastAdvance[p]).Truncate(time.Second), backlog, safeTip)
+					s.store.logger.Errorf("[dahStagnation] partition %d STALLED: watermark %d frozen for %s with backlog %d (safeTip %d) — sweep is not progressing; check pg_blocking_pids on the CALL backend, dah_sweep_control.enabled, and the tip source", p, wm[p], frozenFor.Truncate(time.Second), backlog, safeTip)
 					prometheusDAHSweepStalled.WithLabelValues(partitionLabel(p)).Set(1)
 
 				case stallNone:
