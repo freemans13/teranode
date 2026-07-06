@@ -442,3 +442,24 @@ func TestPgSQLStateExtractsCode(t *testing.T) {
 	pgErr := &pgconn.PgError{Code: "40P01"}
 	require.Equal(t, "40P01", pgSQLState(pgErr))
 }
+
+func TestDAHPartitionBacklog(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	_, err := store.pool.Exec(ctx,
+		`UPDATE dah_part_watermark SET last_swept_height = 100 WHERE partition = 2`)
+	require.NoError(t, err)
+
+	backlog, err := store.dahPartitionBacklog(ctx, 2, 150)
+	require.NoError(t, err)
+	require.Equal(t, int64(50), backlog)
+
+	backlog, err = store.dahPartitionBacklog(ctx, 2, 100)
+	require.NoError(t, err)
+	require.Zero(t, backlog)
+
+	// Missing watermark row must be an ERROR (not silently "caught up") — the
+	// old dahWatermarkBacklog returned 0 on any error, which idled the drain.
+	_, err = store.dahPartitionBacklog(ctx, 99, 150)
+	require.Error(t, err)
+}

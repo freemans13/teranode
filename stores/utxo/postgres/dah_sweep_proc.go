@@ -374,12 +374,15 @@ func isInsufficientPrivilege(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == usql.PgErrInsufficientPriv
 }
 
-// runDAHCursorProc drives the server-side dah_sweep_batch() procedure. Each tick
-// it fans one CALL per partition across the 8 partitions IN PARALLEL (recovering
-// the parallelism a single sequential-8-partition CALL lost on a cold-cache disk)
-// via sweepAllPartitionsOnce; each CALL drains row-bounded batches (up to batch_rows
-// stamps per pass), committing per pass. Cadence is driven by the real watermark lag
-// (min across partitions): backlog>0 → drain hard (call again immediately), else idle.
+// runDAHCursorProc drives the server-side dah_sweep_batch() procedure with one
+// independent, forever-running loop PER PARTITION (runPartitionSweepLoop): each
+// loop CALLs its own partition with NO per-CALL deadline, refires immediately
+// while that partition has backlog, and idles otherwise. A shared semaphore
+// bounds how many CALLs run concurrently (PostgresDAHSweepConcurrency) so a
+// cold/contended disk is not thrashed by all partitions firing at once. One
+// wedged partition stalls only itself (and whoever is waiting on the shared
+// semaphore); the stagnation monitor (Task 5) is the thing that notices and
+// names a stalled partition — this driver never times out a CALL.
 //
 // The spent-before-mined orphan gap (previously covered by the O(table) keyspace
 // backstop) is now closed by the mine-time stamp (S6) in SetMinedMulti, so no
@@ -389,11 +392,6 @@ func isInsufficientPrivilege(err error) bool {
 // middleware (2D000); there is no Go fallback, so it just logs the root cause.
 func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	cfg := s.store.settings.UtxoStore
-
-	interval := time.Duration(cfg.PostgresDAHSweepIntervalMillis) * time.Millisecond
-	if interval <= 0 {
-		interval = 200 * time.Millisecond
-	}
 
 	idleInterval := time.Duration(cfg.PostgresDAHSweepIdleIntervalMillis) * time.Millisecond
 	if idleInterval <= 0 {
@@ -432,63 +430,101 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 		sweepConcurrency = 1
 	}
 
-	s.logger.Infof("[dahCursor] proc driver active (%d partitions, concurrency=%d; interval=%s idle=%s)", numPartitions, sweepConcurrency, interval, idleInterval)
+	s.logger.Infof("[dahCursor] proc driver active (%d partitions, concurrency=%d, idle=%s, no per-CALL deadline)", numPartitions, sweepConcurrency, idleInterval)
 
-	sweepTimer := time.NewTimer(0) // fire the first sweep immediately
-	defer sweepTimer.Stop()
+	if s.store.maintPool == nil {
+		s.store.logger.Warnf("[dahCursor] no maintenance pool configured (utxostore_postgresMaintenancePoolConns=0): sweep CALLs share the main pool and are NOT immune to server-level statement_timeout")
+	}
+
+	sem := make(chan struct{}, sweepConcurrency)
+
+	var wg sync.WaitGroup
+
+	for p := 0; p < numPartitions; p++ {
+		wg.Add(1)
+
+		go func(partition int) {
+			defer wg.Done()
+			s.runPartitionSweepLoop(ctx, partition, sem, lag, retention, idleInterval)
+		}(p)
+	}
+
+	wg.Wait()
+}
+
+// runPartitionSweepLoop drives one partition's sweep forever: CALL (no deadline)
+// → refire immediately while that partition has backlog, else idle poll. ANY
+// error path sleeps the idle interval before retrying — never hot-spin: during a
+// postgres outage this loop must produce 1 quiet retry per idle interval, not a
+// millisecond-cadence log flood. One wedged partition stalls only itself (plus
+// whoever waits on the shared concurrency semaphore — the stagnation monitor
+// names every starved partition independently).
+func (s *postgresPrunerService) runPartitionSweepLoop(ctx context.Context, partition int, sem chan struct{}, lag int64, retention int32, idleInterval time.Duration) {
+	timer := time.NewTimer(0) // first pass immediately
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-timer.C:
+		}
 
-		case <-sweepTimer.C:
-			safeTip := s.store.dahSafeTip(lag)
-			if safeTip <= 0 {
-				sweepTimer.Reset(idleInterval)
-				continue
+		safeTip := s.store.dahSafeTip(lag)
+		if safeTip <= 0 {
+			timer.Reset(idleInterval)
+			continue
+		}
+
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+
+		err := s.store.sweepOnePartition(ctx, partition, safeTip, retention)
+		<-sem
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		if err != nil {
+			s.store.logger.Warnf("[dahCursor] partition %d CALL error (SQLSTATE %s; retry in %s): %v", partition, pgSQLState(err), idleInterval, err)
+			prometheusDAHSweepErrors.Inc()
+			timer.Reset(idleInterval)
+
+			continue
+		}
+
+		backlog, berr := s.store.dahPartitionBacklog(ctx, partition, safeTip)
+		if berr != nil {
+			if ctx.Err() == nil {
+				s.store.logger.Warnf("[dahCursor] partition %d backlog probe error (retry in %s): %v", partition, idleInterval, berr)
 			}
 
-			start := time.Now()
-			stamped := s.store.sweepAllPartitionsOnce(ctx, safeTip, retention)
-			elapsed := time.Since(start)
+			timer.Reset(idleInterval)
 
-			if ctx.Err() != nil {
-				return
-			}
+			continue
+		}
 
-			// Cadence from the real watermark lag (min across partitions), not a
-			// per-CALL flag: backlog>0 → drain hard immediately, else idle poll.
-			backlog := s.store.dahWatermarkBacklog(ctx, safeTip)
-			prometheusDAHSweepCallDuration.Observe(elapsed.Seconds())
-			prometheusDAHSweepRowsStamped.Add(float64(stamped))
-			prometheusDAHSweepWatermarkLag.Set(float64(backlog))
-
-			next := idleInterval
-			if backlog > 0 {
-				next = 0
-			}
-
-			if stamped > 0 || backlog > 0 {
-				s.logger.Infof("[dahCursor] proc stamped=%d backlog=%d next=%s elapsed=%s",
-					stamped, backlog, next.Truncate(time.Millisecond), elapsed.Truncate(time.Millisecond))
-			}
-
-			sweepTimer.Reset(next)
+		if backlog > 0 {
+			timer.Reset(0)
+		} else {
+			timer.Reset(idleInterval)
 		}
 	}
 }
 
 // sweepAllPartitionsOnce fires one dah_sweep_batch() CALL per partition IN
 // PARALLEL and returns the rows stamped this pass (delta of the control row's
-// cumulative counter). Each CALL drains row-bounded batches (up to batch_rows
-// stamps per pass), committing per pass, looping until a pass stamps fewer than
-// batch_rows; a cancelled CALL loses at most one uncommitted pass and resumes
-// from the per-partition watermark next pass — the watermark only advances when
-// the range fully drains. CALLs have no deadline; work is bounded by unit size
-// (max_windows_per_call bands of band_heights heights), never by wall-clock.
-// Stall visibility is the stagnation monitor's responsibility. Per-partition
-// errors are logged, not fatal. Shared by the background cursor and Prune.
+// cumulative counter). Each CALL drains up to max_windows_per_call bands of
+// band_heights heights, committing per band; a cancelled CALL loses at most one
+// uncommitted band and resumes from the per-partition watermark next pass — the
+// watermark only advances when a band fully drains. CALLs have no deadline; work
+// is bounded by unit size (bands per CALL), never by wall-clock. Stall
+// visibility is the stagnation monitor's responsibility. Per-partition errors
+// are logged, not fatal. Shared by the background cursor and Prune.
 func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, retention int32) int64 {
 	var before int64
 	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before)
@@ -573,18 +609,19 @@ func pgSQLState(err error) string {
 	return ""
 }
 
-// dahWatermarkBacklog returns safeTip minus the lowest per-partition watermark —
-// the number of heights still unswept on the furthest-behind partition (0 when all
-// partitions have reached the safe tip).
-func (s *Store) dahWatermarkBacklog(ctx context.Context, safeTip int64) int64 {
-	var minWM int64
-	if err := s.maint().QueryRow(ctx, `SELECT COALESCE(MIN(last_swept_height), 0) FROM dah_part_watermark`).Scan(&minWM); err != nil {
-		return 0
+// dahPartitionBacklog returns safeTip minus this partition's watermark (0 when
+// caught up). Unlike the old aggregate dahWatermarkBacklog it returns errors
+// instead of a silent 0, so a failed probe can never masquerade as "caught up".
+func (s *Store) dahPartitionBacklog(ctx context.Context, partition int, safeTip int64) (int64, error) {
+	var wm int64
+	if err := s.maint().QueryRow(ctx,
+		`SELECT last_swept_height FROM dah_part_watermark WHERE partition = $1`, partition).Scan(&wm); err != nil {
+		return 0, errors.NewStorageError("[dahSweep] read watermark for partition %d", partition, err)
 	}
 
-	if safeTip > minWM {
-		return safeTip - minWM
+	if safeTip > wm {
+		return safeTip - wm, nil
 	}
 
-	return 0
+	return 0, nil
 }
