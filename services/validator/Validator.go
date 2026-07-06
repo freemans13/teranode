@@ -842,7 +842,18 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			}
 
 			if saveAsConflicting {
-				if txMetaData, utxoMapErr = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, true, false); utxoMapErr != nil {
+				// On the outpoint-only fast path the tx is deliberately un-decorated, so a full
+				// create would call GetFees on zero parent satoshis and error. Thread the same
+				// minimal-create option the primary create below uses, so the conflicting
+				// fallback (reached during legacy below-checkpoint catchup on a stale/double
+				// spend — see handle_block.go PreValidateTransactions, which sets both
+				// CreateConflicting and OutpointOnlySpend) does not hard-fail the block.
+				var conflictingCreateOpts []utxo.CreateOption
+				if validationOptions.OutpointOnlySpend {
+					conflictingCreateOpts = append(conflictingCreateOpts, utxo.WithSkipExtendedInputs(true))
+				}
+
+				if txMetaData, utxoMapErr = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, true, false, conflictingCreateOpts...); utxoMapErr != nil {
 					if errors.Is(utxoMapErr, errors.ErrTxExists) {
 						txMetaData = &meta.Data{}
 						if err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); err != nil {

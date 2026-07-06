@@ -198,65 +198,11 @@ func TestProcessBlockSubtrees(t *testing.T) {
 }
 
 // TestQuickValidationDecisionLogic tests the core validation decision logic
-func TestQuickValidationDecisionLogic(t *testing.T) {
-	t.Run("HeightBasedValidation", func(t *testing.T) {
-		// Test the simplified logic: useQuickValidation && block.Height <= highestCheckpointHeight
-
-		testCases := []struct {
-			name                    string
-			blockHeight             uint32
-			highestCheckpointHeight uint32
-			useQuickValidation      bool
-			expected                bool
-		}{
-			{
-				name:                    "BlockBelowCheckpoint",
-				blockHeight:             50,
-				highestCheckpointHeight: 100,
-				useQuickValidation:      true,
-				expected:                true,
-			},
-			{
-				name:                    "BlockAtCheckpoint",
-				blockHeight:             100,
-				highestCheckpointHeight: 100,
-				useQuickValidation:      true,
-				expected:                true,
-			},
-			{
-				name:                    "BlockAboveCheckpoint",
-				blockHeight:             150,
-				highestCheckpointHeight: 100,
-				useQuickValidation:      true,
-				expected:                false,
-			},
-			{
-				name:                    "QuickValidationDisabled",
-				blockHeight:             50,
-				highestCheckpointHeight: 100,
-				useQuickValidation:      false,
-				expected:                false,
-			},
-			{
-				name:                    "NoCheckpoints",
-				blockHeight:             50,
-				highestCheckpointHeight: 0,
-				useQuickValidation:      true,
-				expected:                false,
-			},
-		}
-
-		for _, tc := range testCases {
-			t.Run(tc.name, func(t *testing.T) {
-				// This is the exact logic from validateBlocksOnChannel
-				canUseQuickValidation := tc.useQuickValidation && tc.blockHeight <= tc.highestCheckpointHeight
-
-				assert.Equal(t, tc.expected, canUseQuickValidation,
-					"Quick validation decision should match expected result for %s", tc.name)
-			})
-		}
-	})
-}
+// (Removed TestQuickValidationDecisionLogic/HeightBasedValidation: it recomputed the gate
+// expression inline and asserted it against hand-authored constants, invoking no production
+// code. The real gate — useQuickValidation && height <= highestCheckpointHeight in
+// tryQuickValidation — is exercised through production calls in
+// catchup_quickvalidation_test.go:TestTryQuickValidation.)
 
 // TestCreateAndSpendUTXOsForBatch_UpdatesExistingTransactions tests that existing transactions
 // have their mined info updated when ErrTxExists is returned during quick validation.
@@ -503,6 +449,47 @@ func assertCreatedLocked(t *testing.T, m *utxo.MockUtxostore, wantLocked bool) {
 	require.True(t, found, "expected at least one Create call")
 }
 
+// assertCreatedSkipExtended asserts every Create call carried WithSkipExtendedInputs(want).
+// Pins the outpoint-only mode threaded into createAndSpendUTXOsForBatch's Create so a
+// refactor that drops the flag (re-triggering GetFees on un-decorated txs) fails here.
+func assertCreatedSkipExtended(t *testing.T, m *utxo.MockUtxostore, want bool) {
+	t.Helper()
+	found := false
+	for _, c := range m.Calls {
+		if c.Method != "Create" {
+			continue
+		}
+		opts, ok := c.Arguments.Get(3).([]utxo.CreateOption)
+		require.True(t, ok, "Create 4th arg should be []utxo.CreateOption")
+		o := &utxo.CreateOptions{}
+		for _, opt := range opts {
+			opt(o)
+		}
+		require.Equal(t, want, o.SkipExtendedInputs, "Create WithSkipExtendedInputs flag mismatch")
+		found = true
+	}
+	require.True(t, found, "expected at least one Create call")
+}
+
+// assertSpentSkipUTXOHashCheck asserts every Spend call carried IgnoreFlags.SkipUTXOHashCheck(want).
+// Pins the outpoint-only mode threaded into createAndSpendUTXOsForBatch's Spend so a refactor
+// that drops the flag (re-enabling the hash check on un-decorated spends) fails here.
+func assertSpentSkipUTXOHashCheck(t *testing.T, m *utxo.MockUtxostore, want bool) {
+	t.Helper()
+	found := false
+	for _, c := range m.Calls {
+		if c.Method != "Spend" {
+			continue
+		}
+		flags, ok := c.Arguments.Get(3).([]utxo.IgnoreFlags)
+		require.True(t, ok, "Spend 4th arg should be []utxo.IgnoreFlags")
+		require.NotEmpty(t, flags, "Spend should carry an IgnoreFlags")
+		require.Equal(t, want, flags[0].SkipUTXOHashCheck, "Spend SkipUTXOHashCheck flag mismatch")
+		found = true
+	}
+	require.True(t, found, "expected at least one Spend call")
+}
+
 // buildOneSubtreeBlock builds a block with one subtree (coinbase + 2 txs) and stores its
 // subtree + subtree-data files in the suite's subtree store. Mirrors the existing
 // "block with 1 subtree and 2 txs" setup in TestQuickValidateBlock.
@@ -709,6 +696,11 @@ func TestQuickValidate_OutpointOnly_NoDecorate_ZeroFees(t *testing.T) {
 
 		// Gate suppresses the call — no expectation registered, any call would panic.
 		suite.MockUTXOStore.AssertNotCalled(t, "BatchPreviousOutputsDecorate", mock.Anything, mock.Anything)
+
+		// All four seams must agree for one block: decorate skipped (above), fees zero
+		// (below), AND Create/Spend carry the outpoint-only flags (the threaded mode).
+		assertCreatedSkipExtended(t, suite.MockUTXOStore, true)
+		assertSpentSkipUTXOHashCheck(t, suite.MockUTXOStore, true)
 
 		for i, st := range block.SubtreeSlices {
 			if st == nil {

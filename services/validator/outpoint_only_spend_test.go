@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
@@ -150,6 +151,84 @@ func TestValidate_OutpointOnlySpend(t *testing.T) {
 		SkipUTXOHashCheck: true,
 	})
 	require.Error(t, err, "competing spender must be rejected after outpoint-only spend committed the first spender")
+}
+
+// TestValidate_OutpointOnlySpend_ConflictingFallbackMinimalCreate is the regression
+// guard for the conflicting-spend fallback on the outpoint-only fast path. When a
+// below-checkpoint tx hits already-spent state with CreateConflicting set (the legacy
+// PreValidateTransactions option set), the validator saves it as conflicting via
+// CreateInUtxoStore. That fallback create must use the SAME minimal-create option as the
+// primary create — otherwise it calls GetFees on the deliberately un-decorated tx and
+// returns a processing error, which the legacy path treats as a hard failure and stalls
+// catchup. With the fix the fallback returns ErrTxConflicting (benign for legacy catchup).
+func TestValidate_OutpointOnlySpend_ConflictingFallbackMinimalCreate(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///outpointonly_conflicting")
+	require.NoError(t, err)
+	tSettings.UtxoStore.UtxoStore = utxoStoreURL
+	store, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+	require.NoError(t, store.SetBlockHeight(500))
+	require.NoError(t, store.SetMedianBlockTime(1700000000))
+
+	coinbaseScript, err := bscript.NewP2PKHFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	require.NoError(t, err)
+
+	// Parent stored minimal (un-decorated), one output.
+	parentTx := bt.NewTx()
+	cbIn := &bt.Input{PreviousTxOutIndex: 0xffffffff, SequenceNumber: 0xffffffff, UnlockingScript: bscript.NewFromBytes([]byte{0x00})}
+	require.NoError(t, cbIn.PreviousTxIDAdd(new(chainhash.Hash)))
+	parentTx.Inputs = append(parentTx.Inputs, cbIn)
+	parentTx.Outputs = append(parentTx.Outputs, &bt.Output{Satoshis: 500, LockingScript: coinbaseScript})
+	_, err = store.Create(ctx, parentTx, 499, utxostore.WithSkipExtendedInputs(true))
+	require.NoError(t, err)
+
+	// First spender consumes parent:0 (outpoint-only), marking it spent.
+	firstTx := bt.NewTx()
+	firstIn := &bt.Input{PreviousTxOutIndex: 0, SequenceNumber: 0xfffffffe, UnlockingScript: bscript.NewFromBytes([]byte{0x00})}
+	require.NoError(t, firstIn.PreviousTxIDAdd(parentTx.TxIDChainHash()))
+	firstTx.Inputs = append(firstTx.Inputs, firstIn)
+	firstTx.Outputs = append(firstTx.Outputs, &bt.Output{Satoshis: 400, LockingScript: coinbaseScript})
+	_, err = store.Create(ctx, firstTx, 500, utxostore.WithSkipExtendedInputs(true))
+	require.NoError(t, err)
+	_, err = store.Spend(ctx, firstTx, 500, utxostore.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
+	require.NoError(t, err)
+
+	// Competing tx: also spends parent:0, un-decorated, distinct txid.
+	competingTx := bt.NewTx()
+	compIn := &bt.Input{PreviousTxOutIndex: 0, SequenceNumber: 0xfffffffe, UnlockingScript: bscript.NewFromBytes([]byte{0x01})}
+	require.NoError(t, compIn.PreviousTxIDAdd(parentTx.TxIDChainHash()))
+	competingTx.Inputs = append(competingTx.Inputs, compIn)
+	competingTx.Outputs = append(competingTx.Outputs, &bt.Output{Satoshis: 300, LockingScript: coinbaseScript})
+
+	v := &Validator{
+		logger:      logger,
+		utxoStore:   store,
+		settings:    tSettings,
+		txValidator: NewTxValidator(logger, tSettings),
+		stats:       gocore.NewStat("validator"),
+	}
+
+	// The legacy below-checkpoint fast-path option set.
+	opts := &Options{
+		SkipUtxoCreation:     true,
+		SkipScriptValidation: true,
+		SkipPolicyChecks:     true,
+		CreateConflicting:    true,
+		OutpointOnlySpend:    true,
+		IgnoreLocked:         true,
+	}
+
+	_, err = v.ValidateWithOptions(ctx, competingTx, 500, opts)
+	require.Error(t, err, "competing spender must be rejected")
+	require.True(t, errors.Is(err, errors.ErrTxConflicting),
+		"conflicting fallback on the outpoint-only path must return ErrTxConflicting (via minimal create), not a GetFees processing error; got: %v", err)
 }
 
 // TestValidate_OutpointOnlySpend_RequiresSkipScriptValidation verifies that

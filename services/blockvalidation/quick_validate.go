@@ -1203,14 +1203,17 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	outpointOnly := batch.outpointOnly
 
 	// Invariant I4 (fail-closed): outpoint-only create+spend must never run above the highest
-	// hardcoded checkpoint. Derived INDEPENDENTLY of quickValidateOutpointOnly's result — from
-	// the raw enabling inputs (setting + store support) plus the height bound — so that if a
-	// future refactor drops the height clause from quickValidateOutpointOnly, this guard still
-	// fires (whereas testing `outpointOnly && height > checkpoint` would be a tautological
-	// contradiction, since outpointOnly already implies height <= checkpoint).
-	fastPathEnabled := u.settings.BlockValidation.OutpointOnlyBelowCheckpoint && u.utxoStore.SupportsOutpointOnlySpend()
-	if fastPathEnabled && block.Height > blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints) {
-		return errors.NewProcessingError("[createAndSpendUTXOsForBatch] invariant I4 violated: outpoint-only fast path enabled above checkpoint at height %d", block.Height)
+	// hardcoded checkpoint. Key the guard on the ACTUAL per-block mode (batch.outpointOnly, the
+	// same value that drives create/spend below) rather than on the raw setting+store: under a
+	// catchup-checkpoint override, blocks in (hardcodedCheckpoint, overrideHeight] legitimately
+	// enter quick validation in NORMAL mode (batch.outpointOnly == false, no fast-path op), and
+	// gating on setting+store alone would wrongly trip on them. This is not a tautology: if a
+	// future change makes quickValidateOutpointOnly return true above the hardcoded checkpoint,
+	// batch.outpointOnly would be true there and this guard fires — catching exactly that bug,
+	// while never rejecting a valid normal-mode block. HighestCheckpointHeight uses the hardcoded
+	// checkpoints (never the operator override).
+	if outpointOnly && block.Height > blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints) {
+		return errors.NewProcessingError("[createAndSpendUTXOsForBatch] invariant I4 violated: outpoint-only mode active above checkpoint at height %d", block.Height)
 	}
 
 	lockUTXOs := !u.quickValidateSkipsUtxoLock(block)
