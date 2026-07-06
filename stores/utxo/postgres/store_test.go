@@ -1786,3 +1786,106 @@ func TestArraySubscriptBoundary(t *testing.T) {
 // Ensure unused imports are used.
 var _ = meta.Data{}
 var _ = rand.Uint64
+
+// ---------------------------------------------------------------------------
+// Task 6: Clock-immunity GUCs on maintenance pool
+// ---------------------------------------------------------------------------
+
+// newTestStoreWithMaintPool creates a store with a maintenance pool enabled
+// (PostgresMaintenancePoolConns = 2), used to test maintenance pool GUC pinning.
+func newTestStoreWithMaintPool(t *testing.T) *Store {
+	t.Helper()
+
+	ctx := context.Background()
+
+	// Clean slate -- drop all tables
+	pool, err := pgxpool.New(ctx, testDSN)
+	if err != nil {
+		t.Skipf("Skipping: cannot connect to postgres: %v", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		t.Skipf("Skipping: cannot connect to postgres: %v", err)
+	}
+	_, _ = pool.Exec(ctx, `
+		DROP FUNCTION IF EXISTS process_batch(BIGINT) CASCADE;
+		DROP FUNCTION IF EXISTS process_delete_at_height(BIGINT) CASCADE;
+		DROP PROCEDURE IF EXISTS materialize_loop() CASCADE;
+		DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT) CASCADE;
+		DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT) CASCADE;
+		DROP TABLE IF EXISTS conflicting_children, block_ids, spends, outputs, inputs,
+			tx_state, transactions, txs, txs_raw, dah_watermark, dah_part_watermark, dah_sweep_control, dah_reconcile_cursor,
+			create_queue, input_queue, output_queue, spend_queue, mined_queue,
+			batch_notifications CASCADE;
+		DROP TABLE IF EXISTS pending_unmined CASCADE;
+		DROP INDEX IF EXISTS px_pu_backfill_marker;
+	`)
+	pool.Close()
+
+	storeURL, err := url.Parse(testDSN)
+	require.NoError(t, err)
+	storeURL.Scheme = "postgres"
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.UtxoStore.DBTimeout = 30 * time.Second
+	tSettings.UtxoStore.PostgresMaintenancePoolConns = 2 // Enable maintenance pool for this test
+
+	logger := ulogger.TestLogger{}
+	store, err := New(ctx, logger, tSettings, storeURL)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		store.Stop()
+	})
+
+	return store
+}
+
+// storeMainPoolRuntimeParam returns the value of a RuntimeParam on the main pool,
+// or (_, false) if not set.
+func storeMainPoolRuntimeParam(s *Store, key string) (string, bool) {
+	if s.pool == nil || s.pool.Config() == nil || s.pool.Config().ConnConfig.RuntimeParams == nil {
+		return "", false
+	}
+	val, ok := s.pool.Config().ConnConfig.RuntimeParams[key]
+	return val, ok
+}
+
+func TestMaintPoolPinsClockImmunityGUCs(t *testing.T) {
+	store := newTestStoreWithMaintPool(t)
+	ctx := context.Background()
+
+	// Verify maintenance pool has statement_timeout = 0
+	var v string
+	err := store.maint().QueryRow(ctx, `SHOW statement_timeout`).Scan(&v)
+	require.NoError(t, err)
+	require.Equal(t, "0", v, "maintenance pool should have statement_timeout = 0")
+
+	// Verify maintenance pool has lock_timeout = 0
+	err = store.maint().QueryRow(ctx, `SHOW lock_timeout`).Scan(&v)
+	require.NoError(t, err)
+	require.Equal(t, "0", v, "maintenance pool should have lock_timeout = 0")
+
+	// Verify maintenance pool has idle_in_transaction_session_timeout = 0
+	err = store.maint().QueryRow(ctx, `SHOW idle_in_transaction_session_timeout`).Scan(&v)
+	require.NoError(t, err)
+	require.Equal(t, "0", v, "maintenance pool should have idle_in_transaction_session_timeout = 0")
+
+	// Verify that the RuntimeParams are actually set (present in the map) on the maintenance pool config.
+	maintConfig := store.maintPool.Config()
+	runtimeParams := maintConfig.ConnConfig.RuntimeParams
+	require.NotNil(t, runtimeParams, "RuntimeParams should exist on maintenance pool")
+
+	_, hasStatement := runtimeParams["statement_timeout"]
+	require.True(t, hasStatement, "statement_timeout must be present in maintenance pool RuntimeParams")
+
+	_, hasLock := runtimeParams["lock_timeout"]
+	require.True(t, hasLock, "lock_timeout must be present in maintenance pool RuntimeParams")
+
+	_, hasIdle := runtimeParams["idle_in_transaction_session_timeout"]
+	require.True(t, hasIdle, "idle_in_transaction_session_timeout must be present in maintenance pool RuntimeParams")
+
+	// Verify main pool does NOT have statement_timeout pinned (only synchronous_commit is set).
+	_, mainHasIt := storeMainPoolRuntimeParam(store, "statement_timeout")
+	require.False(t, mainHasIt, "main pool must NOT have statement_timeout pinned")
+}

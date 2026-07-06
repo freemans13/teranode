@@ -21,9 +21,23 @@ func (s *Store) dahSafeTip(lag int64) int64 {
 // dah_sweep_batch() procedure (runDAHCursorProc) and owns the cursorWg lifetime.
 // The procedure is bootstrapped during schema creation (store.New fails if it
 // cannot be installed), so the cursor can always assume it is present.
+//
+// It also launches the stagnation monitor alongside the cursor proc, sharing
+// the same ctx, and waits for the monitor to fully exit before returning so
+// stop()'s cursorWg.Wait() cannot race a monitor goroutine still reading
+// s.store.pool into a subsequent pool.Close().
 func (s *postgresPrunerService) runDAHCursor(ctx context.Context) {
 	defer s.cursorWg.Done() // let stop() wait for this goroutine to fully exit
+
+	monitorDone := make(chan struct{})
+
+	go func() {
+		defer close(monitorDone)
+		s.runDAHStagnationMonitor(ctx)
+	}()
+
 	s.runDAHCursorProc(ctx)
+	<-monitorDone
 }
 
 // RewindDAHWatermark moves the sweep watermark BACK to forkHeight so that a reorg

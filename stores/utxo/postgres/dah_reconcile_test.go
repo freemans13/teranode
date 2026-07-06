@@ -35,7 +35,7 @@ func reconcileAllPartitions(t *testing.T, store *Store, ctx context.Context, saf
 	ret := int32(store.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive
 	var total int64
 	for p := 0; p < numPartitions; p++ {
-		n, err := store.reconcileSpentProgressPartition(ctx, p, safeTip, ret, slice)
+		n, _, err := store.reconcileSpentProgressPartition(ctx, p, safeTip, ret, slice)
 		require.NoError(t, err)
 		total += n
 	}
@@ -234,7 +234,7 @@ func TestReconcileBounded(t *testing.T) {
 	// in fewer partitions. Assert it did NOT correct all of them in one pass.
 	corrected := int64(0)
 	for p := 0; p < numPartitions; p++ {
-		c, cerr := store.reconcileSpentProgressPartition(ctx, p, 110, ret, 1)
+		c, _, cerr := store.reconcileSpentProgressPartition(ctx, p, 110, ret, 1)
 		require.NoError(t, cerr)
 		require.LessOrEqual(t, c, int64(1), "slice=1 must bound corrections to 1 per partition per pass")
 		corrected += c
@@ -251,7 +251,7 @@ func TestReconcileBounded(t *testing.T) {
 			break
 		}
 		for p := 0; p < numPartitions; p++ {
-			_, cerr := store.reconcileSpentProgressPartition(ctx, p, 110, ret, 1)
+			_, _, cerr := store.reconcileSpentProgressPartition(ctx, p, 110, ret, 1)
 			require.NoError(t, cerr)
 		}
 	}
@@ -327,6 +327,53 @@ func TestReconcileKeepsConflictingStamp(t *testing.T) {
 	dah := dahOfTx(t, store, ctx, parent)
 	require.NotNil(t, dah, "reconcile must NOT clear a conflicting tx's deletion stamp")
 	require.Equal(t, bad, *dah)
+}
+
+// TestReconcileSkipsWhenPartitionAdvisoryLockHeld pins the deadlock-avoidance gate:
+// when the sweep proc holds this partition's advisory xact lock
+// (20240684 + partition, the same key the sweep takes per band), the reconcile
+// audit statement must skip the partition entirely rather than block on it —
+// no error, skipped=true, zero rows corrected, and (critically) the rotating
+// cursor left UNTOUCHED so the next tick retries the same slice instead of
+// mistaking the skip for "partition exhausted" and wrapping to the head.
+func TestReconcileSkipsWhenPartitionAdvisoryLockHeld(t *testing.T) {
+	store, ctx := setupTestStore(t)
+	const partition = 3
+
+	// Seed a distinct cursor value so we can assert it is untouched on skip.
+	_, err := store.pool.Exec(ctx,
+		`INSERT INTO dah_reconcile_cursor (partition, last_hash) VALUES ($1, $2)
+		 ON CONFLICT (partition) DO UPDATE SET last_hash = EXCLUDED.last_hash`,
+		partition, []byte{0xAA, 0xBB})
+	require.NoError(t, err)
+
+	// Hold the partition's advisory xact lock from a second session.
+	holder, err := store.pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer holder.Release()
+	tx, err := holder.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(20240684 + $1)`, partition)
+	require.NoError(t, err)
+
+	// Reconcile must skip: no error, skipped=true, cursor untouched.
+	corrected, skipped, err := store.reconcileSpentProgressPartition(ctx, partition, 1000, 1, 100)
+	require.NoError(t, err)
+	require.True(t, skipped)
+	require.Zero(t, corrected)
+
+	var cursor []byte
+	err = store.pool.QueryRow(ctx,
+		`SELECT last_hash FROM dah_reconcile_cursor WHERE partition = $1`, partition).Scan(&cursor)
+	require.NoError(t, err)
+	require.Equal(t, []byte{0xAA, 0xBB}, cursor)
+
+	// Release the lock; reconcile must run (skipped=false) and manage the cursor normally.
+	require.NoError(t, tx.Rollback(ctx))
+	_, skipped, err = store.reconcileSpentProgressPartition(ctx, partition, 1000, 1, 100)
+	require.NoError(t, err)
+	require.False(t, skipped)
 }
 
 // TestFullySpentStaysStampedDespiteCounterDrift is the companion to

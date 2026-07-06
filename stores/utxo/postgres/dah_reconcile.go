@@ -67,7 +67,21 @@ CREATE TABLE IF NOT EXISTS dah_reconcile_cursor (
 // retention the fold uses. Returns the number of rows whose stored values were
 // corrected (drift found). The pass runs in one autocommit statement per
 // partition; it is a background/maintenance path (never on the hot path).
-func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition int, safeTip int64, retention int32, slice int) (int64, error) {
+//
+// Serialization against the sweep: the audit statement opens with a `gate` CTE
+// that takes pg_try_advisory_xact_lock(20240684 + partition) — the SAME key the
+// sweep proc takes per band. Because the query is one autocommit statement, the
+// lock is held for exactly its duration, so the reconciler and the sweep can
+// never hold intersecting locks on the same partition's txs rows (the deadlock
+// this closes). When the sweep already holds the partition the gate is closed,
+// every data-modifying CTE downstream (which all derive from the now-empty
+// `slice_txs`) becomes a no-op, and the call returns skipped=true with
+// corrected=0 WITHOUT advancing or wrapping the rotating cursor: a naive skip
+// that returned seen=0 would look identical to "partition exhausted" to the
+// wrap logic below and would reset the rotation to the head on every contended
+// tick, starving the tail of the partition forever. Skipping the cursor update
+// entirely means the next tick simply retries the same slice.
+func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition int, safeTip int64, retention int32, slice int) (int64, bool, error) {
 	if slice <= 0 {
 		slice = 1000
 	}
@@ -93,12 +107,16 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 	// The spendable predicate mirrors the fold exactly. max_h is NULL when a tx has
 	// no spendable spends → true_last_spend stays NULL and true_progress = 0.
 	query := fmt.Sprintf(`
-		WITH slice_txs AS (
+		WITH gate AS (
+			SELECT pg_try_advisory_xact_lock(20240684 + $5::int) AS ok
+		),
+		slice_txs AS (
 			SELECT hash, spendable_count, mined_at_height, delete_at_height,
 			       spent_progress, last_spend_height, preserve_until, unmined_since,
 			       out_count, out_spendables, conflicting
 			  FROM txs_p%[1]s
-			 WHERE ($1::bytea IS NULL OR hash > $1::bytea)
+			 WHERE (SELECT ok FROM gate)
+			   AND ($1::bytea IS NULL OR hash > $1::bytea)
 			 ORDER BY hash
 			 LIMIT $2
 		),
@@ -178,19 +196,28 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 			 USING upd u
 			 WHERE pd.hash = u.hash AND u.delete_at_height IS NULL
 		)
-		SELECT (SELECT count(*) FROM upd),
+		SELECT (SELECT ok FROM gate),
+		       (SELECT count(*) FROM upd),
 		       (SELECT min(hash) FROM upd),
 		       (SELECT max(hash) FROM slice_txs),
 		       (SELECT count(*) FROM slice_txs)
 	`, suffix)
 
+	var locked bool
 	var corrected int64
 	var sampleCorrectedHash []byte
 	var maxHash []byte
 	var seen int64
-	if err := s.maint().QueryRow(ctx, query, cursor, slice, safeTip, retention).
-		Scan(&corrected, &sampleCorrectedHash, &maxHash, &seen); err != nil {
-		return 0, errors.NewStorageError("[dahReconcile] partition %d audit pass", partition, err)
+	if err := s.maint().QueryRow(ctx, query, cursor, slice, safeTip, retention, partition).
+		Scan(&locked, &corrected, &sampleCorrectedHash, &maxHash, &seen); err != nil {
+		return 0, false, errors.NewStorageError("[dahReconcile] partition %d audit pass", partition, err)
+	}
+
+	// Sweep holds this partition right now: skip WITHOUT touching the rotation
+	// cursor (a naive skip returns seen=0, which the wrap logic below would treat
+	// as "partition exhausted" and reset the rotation to the head forever).
+	if !locked {
+		return 0, true, nil
 	}
 
 	// Advance the cursor. If fewer than `slice` rows were seen the partition is
@@ -205,7 +232,7 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 		 ON CONFLICT (partition) DO UPDATE SET last_hash = EXCLUDED.last_hash`,
 		partition, next,
 	); err != nil {
-		return corrected, errors.NewStorageError("[dahReconcile] partition %d advance cursor", partition, err)
+		return corrected, false, errors.NewStorageError("[dahReconcile] partition %d advance cursor", partition, err)
 	}
 
 	if corrected > 0 {
@@ -220,7 +247,7 @@ func (s *Store) reconcileSpentProgressPartition(ctx context.Context, partition i
 		prometheusDAHReconcileCorrected.Add(float64(corrected))
 	}
 
-	return corrected, nil
+	return corrected, false, nil
 }
 
 // reconcileAllPartitionsOnce runs one bounded reconciliation pass across every
@@ -235,13 +262,17 @@ func (s *Store) reconcileAllPartitionsOnce(ctx context.Context, safeTip int64, r
 			return total
 		}
 
-		n, err := s.reconcileSpentProgressPartition(ctx, p, safeTip, retention, slice)
+		n, skipped, err := s.reconcileSpentProgressPartition(ctx, p, safeTip, retention, slice)
 		if err != nil {
 			if ctx.Err() == nil {
-				s.logger.Infof("[dahReconcile] partition %d pass error (retry next tick): %v", p, err)
+				s.logger.Warnf("[dahReconcile] partition %d pass error (retry next tick): %v", p, err)
 			}
 
 			continue
+		}
+
+		if skipped {
+			continue // sweep holds the partition; retry same slice next tick
 		}
 
 		total += n

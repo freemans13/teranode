@@ -154,6 +154,20 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		}
 		maintConfig.MinConns = int32(minConns) //nolint:gosec // small positive bound
 
+		// Clock immunity: background maintenance work (DAH sweep CALLs, pruner
+		// deletes) is bounded by unit-of-work, never wall-clock. Pin the three
+		// session GUCs that a server/database/role-level ops default could
+		// otherwise use to kill a healthy multi-minute band mid-fold (a
+		// statement_timeout armed at CALL start is NOT defusable by SET LOCAL
+		// inside the procedure). Applies to the maintenance pool only — the
+		// main pool keeps server defaults.
+		if maintConfig.ConnConfig.RuntimeParams == nil {
+			maintConfig.ConnConfig.RuntimeParams = map[string]string{}
+		}
+		maintConfig.ConnConfig.RuntimeParams["statement_timeout"] = "0"
+		maintConfig.ConnConfig.RuntimeParams["lock_timeout"] = "0"
+		maintConfig.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "0"
+
 		maintPool, err = pgxpool.NewWithConfig(ctx, maintConfig)
 		if err != nil {
 			pool.Close()

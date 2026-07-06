@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 )
 
@@ -403,4 +405,61 @@ func TestDAHSweepProcSkipsWatermarkOnLockContention(t *testing.T) {
 	require.NoError(t, store.pool.QueryRow(ctx,
 		`SELECT MIN(last_swept_height) FROM dah_part_watermark`).Scan(&wmAfter))
 	require.Equal(t, safeTip, wmAfter, "after lock release the watermark must reach safe tip")
+}
+
+// TestBootstrapInstallsV14WithoutLockTimeout verifies that the bootstrapped
+// procedure has version 14 and does not contain the lock_timeout setting.
+func TestBootstrapInstallsV14WithoutLockTimeout(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	var version int
+	err := store.pool.QueryRow(ctx,
+		`SELECT proc_version FROM dah_sweep_control WHERE id = 1`).Scan(&version)
+	require.NoError(t, err)
+	require.Equal(t, 14, version)
+
+	var src string
+	err = store.pool.QueryRow(ctx,
+		`SELECT prosrc FROM pg_proc WHERE proname = 'dah_sweep_batch'`).Scan(&src)
+	require.NoError(t, err)
+	require.NotContains(t, src, "lock_timeout")
+}
+
+func TestSweepOnePartitionRunsWithoutDeadline(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	// safeTip=-1 is the documented no-op smoke value: the CALL returns immediately.
+	// The contract under test: sweepOnePartition exists, takes NO timeout, and
+	// surfaces the CALL error verbatim (nil here).
+	err := store.sweepOnePartition(ctx, 0, -1, 0)
+	require.NoError(t, err)
+}
+
+func TestPgSQLStateExtractsCode(t *testing.T) {
+	require.Equal(t, "", pgSQLState(nil))
+	require.Equal(t, "", pgSQLState(errors.NewProcessingError("not a pg error")))
+
+	pgErr := &pgconn.PgError{Code: "40P01"}
+	require.Equal(t, "40P01", pgSQLState(pgErr))
+}
+
+func TestDAHPartitionBacklog(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	_, err := store.pool.Exec(ctx,
+		`UPDATE dah_part_watermark SET last_swept_height = 100 WHERE partition = 2`)
+	require.NoError(t, err)
+
+	backlog, err := store.dahPartitionBacklog(ctx, 2, 150)
+	require.NoError(t, err)
+	require.Equal(t, int64(50), backlog)
+
+	backlog, err = store.dahPartitionBacklog(ctx, 2, 100)
+	require.NoError(t, err)
+	require.Zero(t, backlog)
+
+	// Missing watermark row must be an ERROR (not silently "caught up") — the
+	// old dahWatermarkBacklog returned 0 on any error, which idled the drain.
+	_, err = store.dahPartitionBacklog(ctx, 99, 150)
+	require.Error(t, err)
 }

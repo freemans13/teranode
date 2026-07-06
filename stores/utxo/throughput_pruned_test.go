@@ -133,15 +133,6 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 	tSettings.UtxoStore.PostgresDAHSweepConcurrency = 8
 	// Pruning always routes through the pending_deletes side-table (the only path);
 	// the txs delete_at_height BRIN is always backfilled and dropped.
-	// Bench-only lever (no effect unless DAH_CALL_TIMEOUT_SEC is set): force a tight
-	// per-CALL dah_sweep_batch timeout so the current (v10) proc's cold, disk-bound
-	// O(history) re-aggregation trips "context deadline exceeded" and the watermark
-	// freezes — faithfully reproducing the mainnet freeze at bench scale in minutes
-	// instead of a multi-hour seed. A correct O(new-spends) setter does bounded
-	// per-call work and won't trip a sane timeout, so red→green still holds.
-	if to := envInt("DAH_CALL_TIMEOUT_SEC", 0); to > 0 {
-		tSettings.UtxoStore.PostgresDAHSweepCallTimeoutSeconds = to
-	}
 
 	s, err := pgstore.New(ctx, ulogger.TestLogger{}, tSettings, storeURL)
 	if err != nil {
