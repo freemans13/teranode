@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -182,4 +184,78 @@ func TestBackfillRunsAfterUncleanShutdown(t *testing.T) {
 
 	require.True(t, pendingUnminedHasHash(t, ctx, trapHash),
 		"backfill must have run after an unclean shutdown — trap row must be in pending_unmined")
+}
+
+// TestCleanShutdown_CreateBatcherDrainedBeforeMarkerStamped guards the
+// false-clean teardown race: items still QUEUED in the create batcher's
+// channel at the moment Stop() is called must be fully drained — and their
+// enqueuePendingUnmined side effect flushed into pending_unmined — BEFORE the
+// clean-shutdown marker is stamped true.
+//
+// Before the fix, Stop() called stopPendingUnminedProjector() (the write-behind
+// projector's final drain, and permanent exit of its writer goroutine) BEFORE
+// closing the create batcher. go-batcher's Close() blocks until every queued
+// item has been handed to its callback (sendCreateBatch), which calls
+// enqueuePendingUnmined — so any item still sitting in the batcher's channel
+// at Stop() time was hashed into puBuf by sendCreateBatch AFTER the projector
+// had already done its final flush and exited, with no consumer left to ever
+// write it to pending_unmined. Meanwhile markCleanShutdown() had already
+// stamped clean=true, so the next startup would (wrongly) skip the repair
+// backfill — permanently losing visibility of that tx to the pruner/iterator.
+//
+// This test enqueues items directly into the batcher's channel via
+// createBatcher.Put (bypassing the blocking Create() wrapper, so the test
+// does not wait for them to be processed) with a batch size/duration large
+// enough that nothing triggers a flush on its own — the items can only be
+// processed by the drain Close() performs. It then calls Stop() immediately.
+// This is deterministic (no sleep, no timing race): every item is guaranteed
+// to still be queued, unprocessed, at the moment Stop() begins.
+func TestCleanShutdown_CreateBatcherDrainedBeforeMarkerStamped(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	// Large size + long duration: with 500 queued items and a 10,000-item size
+	// cap / 60s timer, nothing here can trigger a natural flush during the
+	// test. The only thing that will ever process these items is the drain
+	// Close() performs during Stop().
+	st.settings.UtxoStore.StoreBatcherSize = 10_000
+	st.settings.UtxoStore.StoreBatcherDurationMillis = 60_000
+	st.Start(ctx)
+
+	const n = 500
+
+	hashes := make([]*chainhash.Hash, n)
+	for i := 0; i < n; i++ {
+		tx := makeBenchCreateTx()
+		hashes[i] = tx.TxIDChainHash()
+
+		// Put directly into the batcher's channel — fire-and-forget. Going
+		// through Create() would block this goroutine on <-done until the
+		// batch is dispatched, which never happens naturally here (that's
+		// the point): we need the item QUEUED, not delivered, when Stop()
+		// runs below.
+		st.createBatcher.Put(&batchCreateItem{
+			tx:          tx,
+			blockHeight: 100,
+			options:     &utxo.CreateOptions{},
+			done:        make(chan batchCreateResult, 1),
+		})
+	}
+
+	// Stop immediately: no waiting for the batch to flush naturally. Stop()
+	// itself must force the create batcher to drain (handing every queued
+	// item to sendCreateBatch) BEFORE the pending_unmined projector's final
+	// drain runs and BEFORE the clean-shutdown marker is stamped.
+	st.Stop()
+
+	require.True(t, queryCleanShutdownMarker(t, ctx),
+		"marker must be clean=true after Stop()")
+
+	for i, h := range hashes {
+		require.True(t, pendingUnminedHasHash(t, ctx, h[:]),
+			"tx %d enqueued just before Stop() must be in pending_unmined — proves the "+
+				"create batcher was drained (its queued item handed to sendCreateBatch, "+
+				"which calls enqueuePendingUnmined) before the projector's final flush "+
+				"and the clean-shutdown marker were stamped", i)
+	}
 }

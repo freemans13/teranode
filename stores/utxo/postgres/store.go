@@ -285,15 +285,21 @@ func configureBatcher[T any](b *batcher.Batcher[T], maxConcurrent int, drain boo
 // closing without nilling is safe and matches the sql store's Stop().
 func (s *Store) Stop() {
 	s.stopPrunerCursor()
+	// createBatcher MUST close (and fully drain) before stopPendingUnminedProjector:
+	// go-batcher's Close() blocks until every queued create has been handed to
+	// sendCreateBatch (create.go), whose callback calls enqueuePendingUnmined. If
+	// the projector's final drain ran first, any create batch dispatched by
+	// Close() afterwards would append to puBuf with no consumer left to flush
+	// it — silently lost, while the marker below would still claim "clean".
+	if s.createBatcher != nil {
+		s.createBatcher.Close()
+	}
 	s.stopPendingUnminedProjector()
 	// stopPendingUnminedProjector's final drain (above) is what makes
 	// pending_unmined complete and correct, so the clean-shutdown marker can
 	// only be stamped true AFTER it returns. Stamp it here, while s.pool is
 	// still open, so the next startup can skip the reconciliation backfill.
 	s.markCleanShutdown(context.Background())
-	if s.createBatcher != nil {
-		s.createBatcher.Close()
-	}
 	if s.spendBatcher != nil {
 		s.spendBatcher.Close()
 	}
@@ -330,21 +336,25 @@ func (s *Store) maint() *pgxpool.Pool {
 // state-mutating writers (spend, create) last so they have the best chance of
 // committing before the deadline, and the pool is always closed once the drain
 // goroutine finishes so connections are not leaked even if ctx expired first.
+// createBatcher's drain must complete before stopPendingUnminedProjector's
+// final drain and the clean-shutdown marker write — see markCleanShutdown's
+// doc comment for the full precondition chain.
 func (s *Store) Close(ctx context.Context) error {
 	s.stopPrunerCursor()
-	// stopPendingUnminedProjector is Once-latched and idempotent (see
-	// pending_unmined_projector.go), so calling it here is safe even if Stop()
-	// already called it. Its final drain is what makes pending_unmined
-	// complete and correct, so it must run — and the clean-shutdown marker
-	// must be stamped — before the pool closes below.
-	s.stopPendingUnminedProjector()
-	s.markCleanShutdown(ctx)
 
 	done := make(chan struct{})
 
 	go func() {
 		defer close(done)
-		// Drain in dependency order: state-mutating writers last.
+		// Drain in dependency order: state-mutating writers last, EXCEPT
+		// createBatcher — it must close (and fully drain) BEFORE
+		// stopPendingUnminedProjector's final drain below. go-batcher's
+		// Close() blocks until every queued create has been handed to
+		// sendCreateBatch (create.go), whose callback calls
+		// enqueuePendingUnmined; running the projector's final drain first
+		// would let a create batch dispatched here land in puBuf with no
+		// consumer left to flush it — silently lost, while the marker would
+		// still claim "clean".
 		if s.unlockBatcher != nil {
 			s.unlockBatcher.Close()
 		}
@@ -357,6 +367,14 @@ func (s *Store) Close(ctx context.Context) error {
 		if s.createBatcher != nil {
 			s.createBatcher.Close()
 		}
+		// stopPendingUnminedProjector is Once-latched and idempotent (see
+		// pending_unmined_projector.go), so calling it here is safe even if
+		// Stop() already called it. Its final drain is what makes
+		// pending_unmined complete and correct — now that createBatcher above
+		// has fully drained — so it must run, and the clean-shutdown marker
+		// must be stamped, before the pool closes below.
+		s.stopPendingUnminedProjector()
+		s.markCleanShutdown(ctx)
 		// Always close the pool after the batchers drain, even if ctx has
 		// already expired, so the connection pool is not leaked.
 		if s.maintPool != nil {
@@ -387,10 +405,23 @@ func (s *Store) stopPrunerCursor() {
 }
 
 // markCleanShutdown stamps store_clean_shutdown.clean = true, signalling to the
-// next startup that pending_unmined is complete — stopPendingUnminedProjector's
-// final drain must already have run — so the seq-scan reconciliation backfill
-// can be skipped (see resolvePendingUnminedBackfill in schema.go). Must be
-// called while s.pool is still open (before pool.Close()/maintPool.Close()).
+// next startup that pending_unmined is complete, so the seq-scan reconciliation
+// backfill can be skipped (see resolvePendingUnminedBackfill in schema.go).
+// "Complete" is only true once this exact precondition chain has run, in
+// order, on both the Stop() and Close() teardown paths:
+//
+//  1. s.createBatcher.Close() — go-batcher's Close() blocks until every
+//     already-queued create has been handed to sendCreateBatch (create.go),
+//     whose callback calls enqueuePendingUnmined. Closing any other batcher
+//     first is fine; createBatcher specifically MUST close before step 2,
+//     otherwise a create batch dispatched by its Close() would append to the
+//     projector's puBuf with nothing left to flush it.
+//  2. s.stopPendingUnminedProjector() — the writer's final drain flushes
+//     whatever createBatcher just enqueued (plus anything already buffered)
+//     into pending_unmined, making the table genuinely complete.
+//  3. markCleanShutdown (this function) — only now can "clean" be stamped
+//     true. Must run while s.pool is still open (before
+//     pool.Close()/maintPool.Close()).
 //
 // Best-effort: a failed UPDATE (e.g. the pool is already draining, or ctx has
 // a very short deadline) only costs one extra backfill on the next startup —
