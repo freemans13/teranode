@@ -404,3 +404,21 @@ func TestDAHSweepProcSkipsWatermarkOnLockContention(t *testing.T) {
 		`SELECT MIN(last_swept_height) FROM dah_part_watermark`).Scan(&wmAfter))
 	require.Equal(t, safeTip, wmAfter, "after lock release the watermark must reach safe tip")
 }
+
+// TestBootstrapInstallsV14WithoutLockTimeout verifies that the bootstrapped
+// procedure has version 14 and does not contain the lock_timeout setting.
+func TestBootstrapInstallsV14WithoutLockTimeout(t *testing.T) {
+	store, ctx := setupTestStore(t)
+
+	var version int
+	err := store.pool.QueryRow(ctx,
+		`SELECT proc_version FROM dah_sweep_control WHERE id = 1`).Scan(&version)
+	require.NoError(t, err)
+	require.Equal(t, 14, version)
+
+	var src string
+	err = store.pool.QueryRow(ctx,
+		`SELECT prosrc FROM pg_proc WHERE proname = 'dah_sweep_batch'`).Scan(&src)
+	require.NoError(t, err)
+	require.NotContains(t, src, "lock_timeout")
+}

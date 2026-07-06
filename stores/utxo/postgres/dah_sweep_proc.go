@@ -49,7 +49,11 @@ import (
 // feed now keys off delete_at_height IS NOT NULL alone (the old spent_progress =
 // spendable_count filter would wrongly drop a row the recount stamped after an
 // overshoot). The counter itself is healed by the reconcile backstop.
-const dahSweepProcVersion = 13
+//
+// Bumped 13→14: drop in-proc lock_timeout. Background work waits for locks
+// indefinitely by design; stall visibility is the Go-side stagnation monitor's job
+// (Task 5). Also drop dead batch_rows seeding (no longer written after Task 6).
+const dahSweepProcVersion = 14
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaInternal (plain DDL);
@@ -90,13 +94,14 @@ func dahSweepProcDDL() string {
 	return dahSweepProcDDLWithPendingDeletes
 }
 
-// dahSweepProcDDLWithPendingDeletes is the fold-forward (v13) DAH sweep procedure.
+// dahSweepProcDDLWithPendingDeletes is the fold-forward (v14) DAH sweep procedure.
 //
 // v11 replaced v10's full-range re-aggregation with a forward-only fold. v12
 // merges v11's two per-band txs writes (fold + stamp) into one UPDATE ... RETURNING
 // so the hot txs table is written once per folded tx and the band is scanned once.
 // v13 authorises the stamp from a ground-truth spends recount rather than the
-// (drift-prone) counter — see the version-history note above.
+// (drift-prone) counter. v14 drops in-proc lock_timeout; locks are waited on
+// indefinitely by design (stall visibility is the Go-side stagnation monitor's job).
 // Per bounded height band (v_band heights, from dah_sweep_control.band_heights) it:
 //
 //  1. FOLDS the band's NEW spends ONLY — aggregates spends_pNN over
@@ -192,8 +197,6 @@ BEGIN
         END IF;
 
         v_to := LEAST(v_from + v_band, p_safe_tip);
-
-        SET LOCAL lock_timeout = '5s';
 
         -- (1+2) FOLD + STAMP in ONE UPDATE: read ONLY this band's spends, increment
         -- spent_progress and advance last_spend_height on each parent, and — in the
@@ -309,14 +312,9 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 
 	// Seed tunable knobs from settings into the control row so ops tuning flows
 	// through settings and the proc reads a single source of truth.
-	batchRows := s.settings.UtxoStore.PostgresDAHSweepBatchRows
-	if batchRows <= 0 {
-		batchRows = 5000
-	}
-
 	maxWin := s.settings.UtxoStore.PostgresDAHSweepMaxWindowsPerCall
 	if maxWin <= 0 {
-		maxWin = 32
+		maxWin = 8
 	}
 
 	// band_heights bounds the per-band fold width (proc v11). Seeded from settings
@@ -327,8 +325,8 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 	}
 
 	if _, err = s.pool.Exec(ctx,
-		`UPDATE dah_sweep_control SET batch_rows = $1, max_windows_per_call = $2, band_heights = $3 WHERE id = 1`,
-		batchRows, maxWin, bandHeights,
+		`UPDATE dah_sweep_control SET max_windows_per_call = $1, band_heights = $2 WHERE id = 1`,
+		maxWin, bandHeights,
 	); err != nil {
 		if isInsufficientPrivilege(err) {
 			return errors.NewStorageError("[dahSweep] app role lacks privilege to write dah_sweep_control (42501); grant it so the DAH sweep can run")
