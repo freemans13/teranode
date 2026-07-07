@@ -131,6 +131,16 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 	// this cache-resident box so stamping keeps pace with a ~100K/s create rate.
 	tSettings.UtxoStore.PostgresMaintenancePoolConns = 64
 	tSettings.UtxoStore.PostgresDAHSweepConcurrency = 8
+	// Env-gated sweep-lag override (bench-only). The lag exists to cover
+	// in-flight spend commits: a spend stamped at height h must commit before
+	// the watermark passes h. Production lag=2 BLOCKS dwarfs commit latency,
+	// but the lag bench ticks the height every 10ms, so 2 ticks = 20ms —
+	// slower-than-20ms commits land below the watermark and are silently never
+	// folded (observed: ~10% of paced completions missed). Fast-clock tests
+	// scale the lag to their tick rate via DAH_SWEEP_LAG.
+	if lagOverride := envInt("DAH_SWEEP_LAG", 0); lagOverride > 0 {
+		tSettings.UtxoStore.PostgresDAHSweepLag = lagOverride
+	}
 	// Pruning always routes through the pending_deletes side-table (the only path);
 	// the txs delete_at_height BRIN is always backfilled and dropped.
 

@@ -991,6 +991,22 @@ func TestThroughput_QueueStoreAgedFanoutLag(t *testing.T) {
 
 	assertDiskBound(t)
 
+	// The seeded spends go as low as seedLow(100), BELOW the pruned harness's
+	// default watermark pre-seed (199) — the fold's spent_at_height > watermark
+	// guard would skip those spends FOREVER, so no parent could ever reach
+	// full-spent and the bench measured zero stamps on every setter design (the
+	// long-standing "seed/height-lag artifact"; newPrunedQueueStore's own
+	// comment says this bench MUST pre-seed to 0, which was never wired).
+	if os.Getenv("DAH_WM_SEED") == "" {
+		t.Setenv("DAH_WM_SEED", "0")
+	}
+	// The bench clock ticks 10ms/height (~600x mainnet block cadence);
+	// production's lag=2 blocks covers in-flight spend commits, so scale it:
+	// 300 heights = 3s of commit slack at this tick rate.
+	if os.Getenv("DAH_SWEEP_LAG") == "" {
+		t.Setenv("DAH_SWEEP_LAG", "300")
+	}
+
 	// Log the expected dataset size so disk-bound property is documented in output.
 	k := agedFanoutK
 	nParents := agedParents
