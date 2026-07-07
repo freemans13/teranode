@@ -2071,6 +2071,14 @@ func (u *BlockValidation) ReValidateBlock(block *model.Block, baseURL string) {
 // reconsiderblock). Fail-safe: any lookup error or ambiguity yields false, so the
 // no-inflation check runs — correct, because non-fast-path blocks carry real fees.
 func (u *BlockValidation) checkpointConfirmedAncestor(ctx context.Context, b *model.Block) bool {
+	// The below-checkpoint no-inflation skip requires store fast-path support too, so the
+	// ancestry predicate cannot change the outcome on a store that never produces fee=0
+	// blocks. Short-circuit before any blockchain lookup on such stores (Aerospike, the
+	// unconfigured default, and most unit-test mocks).
+	if u.utxoStore == nil || !u.utxoStore.SupportsOutpointOnlySpend() {
+		return false
+	}
+
 	checkpoints := u.settings.ChainCfgParams.Checkpoints
 
 	highest := model.HighestCheckpointHeight(checkpoints)
