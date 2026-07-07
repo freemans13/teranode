@@ -3,7 +3,9 @@ package blockvalidation
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jarcoal/httpmock"
@@ -627,6 +630,14 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 		ancestorHeader.Bits = *nBits
 		testhelpers.MineHeader(ancestorHeader)
 
+		// Cumulative work of each chain tip, proportional to its height, so the secret-mining
+		// work gate sees the local chain (currentHeight blocks) as heavier than the peer's short
+		// fork (ancestorHeight + a few fork blocks). Without this the mock's zero chainwork would
+		// make any offered fork look heavier and bypass the check.
+		perBlockWork := work.CalcBlockWork(binary.LittleEndian.Uint32(nBits.CloneBytes()))
+		ancestorChainWork := new(big.Int).Mul(perBlockWork, big.NewInt(int64(ancestorHeight)))
+		localChainWork := new(big.Int).Mul(perBlockWork, big.NewInt(int64(currentHeight)))
+
 		// Peer's fork: a few blocks built on top of the common ancestor.
 		forkHeaders := testhelpers.CreateSyntheticChainFrom(ancestorHeader, 5)
 		targetBlock := &model.Block{
@@ -642,13 +653,13 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 
 		// Metadata for the common ancestor.
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, ancestorHeader.Hash()).
-			Return(ancestorHeader, &model.BlockHeaderMeta{Height: ancestorHeight, ID: 1}, nil).Maybe()
+			Return(ancestorHeader, &model.BlockHeaderMeta{Height: ancestorHeight, ID: 1, ChainWork: ancestorChainWork.Bytes()}, nil).Maybe()
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
-			Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Height: ancestorHeight}, nil).Maybe()
+			Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Height: ancestorHeight, ChainWork: ancestorChainWork.Bytes()}, nil).Maybe()
 
 		// Header-fetch plumbing.
 		mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).
-			Return(ancestorHeader, &model.BlockHeaderMeta{Height: currentHeight}, nil).Maybe()
+			Return(ancestorHeader, &model.BlockHeaderMeta{Height: currentHeight, ChainWork: localChainWork.Bytes()}, nil).Maybe()
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*chainhash.Hash{ancestorHeader.Hash()}, nil).Maybe()
 		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
