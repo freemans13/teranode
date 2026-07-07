@@ -996,9 +996,12 @@ func TestThroughput_QueueStoreAgedFanoutLag(t *testing.T) {
 	// guard would skip those spends FOREVER, so no parent could ever reach
 	// full-spent and the bench measured zero stamps on every setter design (the
 	// long-standing "seed/height-lag artifact"; newPrunedQueueStore's own
-	// comment says this bench MUST pre-seed to 0, which was never wired).
+	// comment says this bench MUST pre-seed to 0 — but envInt REJECTS 0
+	// (n > 0 guard), so DAH_WM_SEED=0 silently fell back to 199 and the
+	// instruction was never satisfiable). 99 = seedLow-1 is expressible and
+	// covers every seeded spend (lowest is at seedLow=100).
 	if os.Getenv("DAH_WM_SEED") == "" {
-		t.Setenv("DAH_WM_SEED", "0")
+		t.Setenv("DAH_WM_SEED", "99")
 	}
 	// The bench clock ticks 10ms/height (~600x mainnet block cadence);
 	// production's lag=2 blocks covers in-flight spend commits, so scale it:
