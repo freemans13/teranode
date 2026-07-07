@@ -247,7 +247,12 @@ type lagResult struct {
 	EndBacklog    int64
 	MedStampRate  float64
 	MedCreateRate float64
-	Samples       []lagSample
+	// OfferedCompletionRate is the paced rate (completions/s) at which the timed
+	// phase offered seeded-parent completion spends — the demand the stamp path
+	// must keep up with. MedStampRate is compared against THIS, not MedCreateRate
+	// (fresh parents are never spent, so create rate is the wrong denominator).
+	OfferedCompletionRate float64
+	Samples               []lagSample
 }
 
 // sampleBacklog returns tip − COALESCE(min(last_swept_height), 0) from
@@ -539,6 +544,30 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 	// createdOps tracks total created ops for the sampler's create-rate computation.
 	var createdOps atomic.Int64
 
+	// Completion pacing: spread the 2*nParents remaining seeded spends across
+	// the WHOLE timed window instead of burning them in the first seconds. The
+	// old burst (2000 workers round-robin over 20000 parents completed every
+	// parent within seconds) made medStampRate=0 a sampling artifact — all the
+	// stamp demand landed before most samples — so the bench could not see the
+	// stamp path at all. A steady completion stream is the demand the keep-up
+	// assertions measure the setter against.
+	windowSecs := (cfg.warmup + cfg.measure).Seconds()
+	if cfg.measure <= 0 {
+		windowSecs = (cfg.warmup + 30*time.Second).Seconds()
+	}
+
+	completionRate := float64(envInt("COMPLETIONS_PER_SEC", 0))
+	if completionRate <= 0 {
+		completionRate = float64(2*nParents) / windowSecs
+		if completionRate < 1 {
+			completionRate = 1
+		}
+	}
+
+	pacerStart := time.Now()
+
+	var completionsIssued atomic.Int64
+
 	runTimedPhase := func(dur time.Duration) {
 		var wg sync.WaitGroup
 		wg.Add(numWorkers)
@@ -567,7 +596,15 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 						return
 					}
 
-					// (b) Spend one of the two remaining unspent vouts of a seeded parent.
+					// (b) Spend one of the two remaining unspent vouts of a seeded parent —
+					// PACED to completionRate so completions (and the stamps they demand)
+					// are a steady stream over the whole window, not a t=0 burst. When the
+					// bucket is empty this instant, fresh-parent ingest (a) continues alone.
+					if float64(completionsIssued.Load()) >= time.Since(pacerStart).Seconds()*completionRate {
+						continue
+					}
+					completionsIssued.Add(1)
+
 					// Round-robin across seededParents so all are exercised.
 					n := seededIdx.Add(1)
 					idx := int(n) % nParents
@@ -719,9 +756,11 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 	}
 	res.MedStampRate = median(stampRates)
 	res.MedCreateRate = median(createRates)
+	res.OfferedCompletionRate = completionRate
 
-	t.Logf("[lag] maxBacklog=%d startBacklog=%d endBacklog=%d medStampRate=%.0f medCreateRate=%.0f samples=%d",
-		res.MaxBacklog, res.StartBacklog, res.EndBacklog, res.MedStampRate, res.MedCreateRate, len(res.Samples))
+	t.Logf("[lag] maxBacklog=%d startBacklog=%d endBacklog=%d medStampRate=%.0f medCreateRate=%.0f offeredCompletions=%.0f/s issued=%d samples=%d",
+		res.MaxBacklog, res.StartBacklog, res.EndBacklog, res.MedStampRate, res.MedCreateRate,
+		res.OfferedCompletionRate, completionsIssued.Load(), len(res.Samples))
 	return res
 }
 
@@ -994,6 +1033,15 @@ func TestThroughput_QueueStoreAgedFanoutLag(t *testing.T) {
 	require.Positive(t, res.MedStampRate,
 		"sweep must be stamping completions (medStampRate=%.0f) — 0 means the setter is frozen",
 		res.MedStampRate)
+
+	// KEEP-UP: the median stamp rate must track the offered completion rate —
+	// completions are paced steadily across the window, so a healthy setter's
+	// stamp stream matches the demand (small fold-lag slack allowed). A setter
+	// paying O(history) per completion (cold recount per completing parent on a
+	// disk-bound table) falls off this immediately; an O(1)-stamp setter holds it.
+	require.GreaterOrEqual(t, res.MedStampRate, 0.9*res.OfferedCompletionRate,
+		"stamp rate must keep up with offered completions (medStamp=%.0f/s vs offered=%.0f/s)",
+		res.MedStampRate, res.OfferedCompletionRate)
 
 	// Back-half trend must not be upward (a positive slope is sustained divergence).
 	require.LessOrEqual(t, trend, 0.0,
