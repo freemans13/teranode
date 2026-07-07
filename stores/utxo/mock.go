@@ -29,6 +29,10 @@ import (
 //	mockStore.AssertExpectations(t)
 type MockUtxostore struct {
 	mock.Mock
+
+	// SupportsOutpointOnlySpendResult is what SupportsOutpointOnlySpend returns.
+	// Defaults to false; set true in tests that exercise the below-checkpoint fast path.
+	SupportsOutpointOnlySpendResult bool
 }
 
 // Health mocks the health check functionality of the UTXO store.
@@ -43,6 +47,11 @@ func (m *MockUtxostore) Close(ctx context.Context) error {
 	args := m.Called(ctx)
 	return args.Error(0)
 }
+
+// SupportsOutpointOnlySpend returns the configurable SupportsOutpointOnlySpendResult
+// (default false). Reading a field rather than m.Called() keeps the mock usable in
+// tests that have not set an expectation for this capability query.
+func (m *MockUtxostore) SupportsOutpointOnlySpend() bool { return m.SupportsOutpointOnlySpendResult }
 
 // Create mocks the creation of transaction metadata in the UTXO store.
 // Returns the configured mock response for transaction creation operations.
@@ -227,6 +236,24 @@ func (m *MockUtxostore) SetConflicting(ctx context.Context, txHashes []chainhash
 func (m *MockUtxostore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value bool) error {
 	args := m.Called(ctx, txHashes, value)
 	return args.Error(0)
+}
+
+// BeginConflictIntent is a safe no-op on the mock: the conflict-resolution WAL
+// is exercised against a real store in dedicated tests, so the many mock-based
+// ProcessConflicting/ReverseProcessConflicting tests need not set expectations
+// for it. (Does not call m.Called, so unset expectations do not panic.)
+func (m *MockUtxostore) BeginConflictIntent(ctx context.Context, intent ConflictIntent) error {
+	return nil
+}
+
+// CompleteConflictIntent is a safe no-op on the mock (see BeginConflictIntent).
+func (m *MockUtxostore) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	return nil
+}
+
+// PendingConflictIntents is a safe no-op on the mock (see BeginConflictIntent).
+func (m *MockUtxostore) PendingConflictIntents(ctx context.Context) ([]ConflictIntent, error) {
+	return nil, nil
 }
 
 // MarkTransactionsOnLongestChain mocks the marking of transactions as being on the longest chain.

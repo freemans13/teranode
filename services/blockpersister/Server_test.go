@@ -972,6 +972,8 @@ func (m *MockUTXOStore) Health(ctx context.Context, checkLiveness bool) (int, st
 func (m *MockUTXOStore) Close(context.Context) error { return nil }
 
 // Required interface methods for utxo.Store
+func (m *MockUTXOStore) SupportsOutpointOnlySpend() bool { return false }
+
 func (m *MockUTXOStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
 	return nil, nil
 }
@@ -1046,6 +1048,15 @@ func (m *MockUTXOStore) SetConflicting(ctx context.Context, txHashes []chainhash
 }
 func (m *MockUTXOStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
 	return nil
+}
+func (m *MockUTXOStore) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	return nil
+}
+func (m *MockUTXOStore) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	return nil
+}
+func (m *MockUTXOStore) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	return nil, nil
 }
 func (m *MockUTXOStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	return nil

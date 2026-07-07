@@ -609,11 +609,11 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 // either for normal shutdown or in response to system signals.
 //
 // Parameters:
-//   - ctx: Context for cancellation and tracing (unused in current implementation)
+//   - ctx: Context bounding the shutdown; the invalid-subtree producer stop is raced against it so a wedged broker can't stall shutdown
 //
 // Returns:
 //   - error: Any error encountered during shutdown
-func (u *Server) Stop(_ context.Context) error {
+func (u *Server) Stop(ctx context.Context) error {
 	// close the kafka consumers gracefully
 	if u.subtreeConsumerClient != nil {
 		if err := u.subtreeConsumerClient.Close(); err != nil {
@@ -627,11 +627,10 @@ func (u *Server) Stop(_ context.Context) error {
 		}
 	}
 
-	if u.invalidSubtreeKafkaProducer != nil {
-		if err := u.invalidSubtreeKafkaProducer.Stop(); err != nil {
-			u.logger.Errorf("[BlockValidation] failed to stop invalid subtree kafka producer gracefully: %v", err)
-		}
-	}
+	// Stop the async invalid-subtree producer, raced against ctx so a wedged broker
+	// flush can't block past the bounded Stop() window — the outstanding Stop()
+	// finishes the flush later if it can.
+	kafka.StopProducerCtx(ctx, u.logger, "subtreevalidation invalid-subtree", u.invalidSubtreeKafkaProducer)
 
 	if u.policyRejectedTxConsumerClient != nil {
 		if err := u.policyRejectedTxConsumerClient.Close(); err != nil {
@@ -730,6 +729,14 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 
 	if request.BaseUrl == "" {
 		return false, errors.NewInvalidArgumentError("[CheckSubtree] Missing base URL in request")
+	}
+
+	// BaseUrl is peer-supplied; reject obvious SSRF targets early for a clean error.
+	// The "legacy" sentinel has no http/https scheme, so ValidateURL returns nil for it
+	// (only http/https URLs are inspected) and the legacy path is unaffected. The dial-time
+	// guard in util.ssrfDialContext remains the backstop for DNS-resolved private addresses.
+	if err := util.ValidateURL(request.BaseUrl); err != nil {
+		return false, errors.NewInvalidArgumentError("[CheckSubtree] invalid base URL", err)
 	}
 
 	var (
@@ -976,6 +983,8 @@ func resolveTxMetaCacheBucketType(logger ulogger.Logger, raw string) txmetacache
 		return txmetacache.Trimmed
 	case "native":
 		return txmetacache.Native
+	case "pointer":
+		return txmetacache.Pointer
 	default:
 		logger.Warnf("[SubtreeValidation] unknown txMetaCacheBucketType %q; falling back to unallocated", raw)
 		return txmetacache.Unallocated

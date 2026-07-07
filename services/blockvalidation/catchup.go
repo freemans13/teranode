@@ -28,6 +28,11 @@ const (
 	// maxCatchupIterations was the old iteration limit, kept for reference but no longer used
 	// since we now make a single request for headers
 	maxCatchupIterations = 1000
+
+	// catchupReputationReportTimeout bounds the best-effort peer-reputation gRPC calls
+	// made when releasing the catchup lock, so a slow or hung P2P service cannot stall
+	// catchup teardown or detach the calls from shutdown.
+	catchupReputationReportTimeout = 5 * time.Second
 )
 
 // CatchupContext holds all the state needed during a catchup operation
@@ -177,7 +182,20 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 		return err
 	}
 
-	// Step 3.5: If fork detected, reset mined_set on old blocks for transaction state consistency
+	// Step 4: Validate fork depth against coinbase maturity
+	if err = u.validateForkDepth(catchupCtx); err != nil {
+		return err
+	}
+
+	// Step 5: Check for secret mining attempts
+	if err = u.checkSecretMining(ctx, catchupCtx); err != nil {
+		return err
+	}
+
+	// Step 5.5: If fork detected, reset mined_set on old blocks for transaction state consistency.
+	// This must run only AFTER the fork-depth and secret-mining safety checks pass; otherwise a peer
+	// merely announcing a deep or secretly-mined fork would un-stamp this node's own still-canonical
+	// txs for a fork that is then rejected, churning honest tx-mined state for no reorg (issue #1145).
 	if catchupCtx.forkDepth > 0 {
 		u.logger.Infof("[catchup][%s] Fork detected (depth %d), clearing mined_set on old blocks",
 			catchupCtx.blockUpTo.Hash().String(), catchupCtx.forkDepth)
@@ -212,16 +230,6 @@ func (u *Server) catchup(ctx context.Context, blockUpTo *model.Block, peerID, ba
 			u.logger.Infof("[catchup][%s] Cleared mined_set on %d fork blocks and sent notifications",
 				catchupCtx.blockUpTo.Hash().String(), len(headers))
 		}
-	}
-
-	// Step 4: Validate fork depth against coinbase maturity
-	if err = u.validateForkDepth(catchupCtx); err != nil {
-		return err
-	}
-
-	// Step 5: Check for secret mining attempts
-	if err = u.checkSecretMining(ctx, catchupCtx); err != nil {
-		return err
 	}
 
 	// Step 6: Filter headers to only those we need to catchup
@@ -333,20 +341,32 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 		prometheusCatchupActive.Set(0)
 	}
 
+	// Reputation reporting decisions captured under the lock, executed after release.
+	// We must NOT make gRPC calls while holding activeCatchupCtxMu: a slow or hung P2P
+	// service would block the lock indefinitely, which in turn blocks GetCatchupStatus
+	// (it RLocks the same mutex) and prevents the active catchup context from clearing.
+	var (
+		reportMalicious bool
+		reportPeerErr   bool
+		peerID          string
+		errorMsg        string
+	)
+
 	// Capture failure details for dashboard before clearing context
 	u.activeCatchupCtxMu.Lock()
 	if *err != nil && ctx != nil {
 		// Determine error type based on error characteristics
 		errorType := "unknown_error"
-		errorMsg := (*err).Error()
+		errorMsg = (*err).Error()
+		peerID = ctx.peerID
 		isPeerError := true // Track if this is a peer-related error
 
 		// TODO: all of these should be using error types, and not checking the strings (!)
 		switch {
 		case errors.Is(*err, errors.ErrBlockInvalid) || errors.Is(*err, errors.ErrTxInvalid):
 			errorType = "validation_failure"
-			// Mark peer as malicious for validation failure
-			u.reportCatchupMalicious(context.Background(), ctx.peerID, "validation_failure")
+			// Mark peer as malicious for validation failure (reported after unlock)
+			reportMalicious = true
 		case errors.IsNetworkError(*err):
 			errorType = "network_error"
 		case strings.Contains(errorMsg, "secret mining") || strings.Contains(errorMsg, "secretly mined"):
@@ -386,7 +406,7 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 		// Only store the error in the peer registry if it's a peer-related error
 		// Local system errors (like block assembly being behind) should not affect peer reputation
 		if isPeerError {
-			u.reportCatchupError(context.Background(), ctx.peerID, errorMsg)
+			reportPeerErr = true
 		} else {
 			u.logger.Infof("[catchup][%s] Skipping peer error report for local system error: %s", ctx.blockUpTo.Hash().String(), errorType)
 		}
@@ -395,6 +415,22 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 	// Clear the active catchup context
 	u.activeCatchupCtx = nil
 	u.activeCatchupCtxMu.Unlock()
+
+	// Make the fire-and-forget reputation gRPC calls outside the lock with a bounded
+	// context, so a stalled P2P service can neither hold activeCatchupCtxMu nor outlive
+	// shutdown. These are best-effort; failures are logged inside the helpers.
+	if reportMalicious || reportPeerErr {
+		rpcCtx, cancel := context.WithTimeout(context.Background(), catchupReputationReportTimeout)
+		defer cancel()
+
+		if reportMalicious {
+			u.reportCatchupMalicious(rpcCtx, peerID, "validation_failure")
+		}
+
+		if reportPeerErr {
+			u.reportCatchupError(rpcCtx, peerID, errorMsg)
+		}
+	}
 
 	// Update catchup tracking for health checks
 	u.catchupStatsMu.Lock()

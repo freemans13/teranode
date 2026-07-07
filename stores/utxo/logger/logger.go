@@ -123,6 +123,11 @@ func (s *Store) GetBlockState() utxo.BlockState {
 	return blockState
 }
 
+// SupportsOutpointOnlySpend delegates to the wrapped store.
+func (s *Store) SupportsOutpointOnlySpend() bool {
+	return s.store.SupportsOutpointOnlySpend()
+}
+
 func (s *Store) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	s.logger.Debugf("[UTXOStore][logger][Health] : %s", caller())
 	return s.store.Health(ctx, checkLiveness)
@@ -201,7 +206,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 }
 
 func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) error {
-	err := s.store.Unspend(ctx, spends, false)
+	err := s.store.Unspend(ctx, spends, flagAsLocked...)
 	spendDetails := make([]string, len(spends))
 
 	for i, spend := range spends {
@@ -333,6 +338,27 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	s.logger.Debugf("[UTXOStore][logger][SetLocked] txHashes %v setValue %v err %v : %s", txHashes, setValue, err, caller())
 
 	return err
+}
+
+func (s *Store) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	err := s.store.BeginConflictIntent(ctx, intent)
+	s.logger.Debugf("[UTXOStore][logger][BeginConflictIntent] kind %s height %d hashes %v err %v : %s", intent.Kind, intent.BlockHeight, intent.TxHashes, err, caller())
+
+	return err
+}
+
+func (s *Store) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	err := s.store.CompleteConflictIntent(ctx, intentID)
+	s.logger.Debugf("[UTXOStore][logger][CompleteConflictIntent] intentID %s err %v : %s", intentID, err, caller())
+
+	return err
+}
+
+func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	intents, err := s.store.PendingConflictIntents(ctx)
+	s.logger.Debugf("[UTXOStore][logger][PendingConflictIntents] count %d err %v : %s", len(intents), err, caller())
+
+	return intents, err
 }
 
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {

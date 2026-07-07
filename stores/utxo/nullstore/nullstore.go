@@ -68,6 +68,9 @@ func (m *NullStore) GetBlockState() utxo.BlockState {
 	}
 }
 
+// SupportsOutpointOnlySpend reports false: the null store performs no real UTXO work.
+func (m *NullStore) SupportsOutpointOnlySpend() bool { return false }
+
 func (m *NullStore) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	return http.StatusOK, "NullStore Store available", nil
 }
@@ -226,6 +229,18 @@ func (m *NullStore) SetConflicting(ctx context.Context, txHashes []chainhash.Has
 
 func (m *NullStore) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
 	return nil
+}
+
+func (m *NullStore) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	return nil
+}
+
+func (m *NullStore) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	return nil
+}
+
+func (m *NullStore) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	return nil, nil
 }
 
 func (m *NullStore) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {

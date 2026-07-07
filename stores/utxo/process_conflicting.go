@@ -69,11 +69,41 @@ var step5RetryDelays = []time.Duration{0, 50 * time.Millisecond, 200 * time.Mill
 //     (notably block assembly) need this superset to populate a conflictingMap
 //     so the queue→subtree dequeue path can reject children of conflicting
 //     parents that arrive after the cascade has run.
-func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, conflictingTxHashes []chainhash.Hash,
+func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockHash chainhash.Hash, conflictingTxHashes []chainhash.Hash,
 	processedConflictingHashesMap map[chainhash.Hash]struct{}) (losingTxHashesMap txmap.TxMap, allMarkedConflicting []chainhash.Hash, err error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "ProcessConflicting")
 
 	defer deferFn()
+
+	// Crash-safety write-ahead log (#861): record the intent durably BEFORE any
+	// state mutation, and remove it once the operation completes successfully. A
+	// SIGKILL between steps (which bypasses the in-process rollback below) leaves
+	// the intent behind for BlockAssembler startup replay. An in-process failure
+	// also leaves it — the deferred rollback unwinds the partial state and a
+	// restart re-attempts the (idempotent) operation from the restored precondition.
+	// A failed Begin aborts before mutating anything: without a durable intent we
+	// cannot guarantee crash recovery, so the operation must not proceed.
+	walIntent := ConflictIntent{
+		Kind:        ConflictIntentForward,
+		BlockHeight: blockHeight,
+		BlockHash:   blockHash,
+		TxHashes:    conflictingTxHashes,
+		StartedAt:   time.Now().UnixNano(),
+	}
+	if beginErr := s.BeginConflictIntent(ctx, walIntent); beginErr != nil {
+		return nil, nil, errors.NewProcessingError("[ProcessConflicting] failed to record WAL intent before processing", beginErr)
+	}
+
+	// Registered before the rollback defer below, so it runs AFTER it (LIFO) and
+	// observes the final err (including a rollback-failure escalation). Only a
+	// genuinely successful operation removes the intent; otherwise it persists for
+	// replay. Completion is best-effort: a failed delete just leaves an intent
+	// that replays idempotently on the next restart.
+	defer func() {
+		if err == nil {
+			_ = s.CompleteConflictIntent(ctx, walIntent.IntentID())
+		}
+	}()
 
 	// State for the deferred compensating rollback. Each commit phase flips a flag; the
 	// deferred block reads them on the way out and undoes whatever happened — see #4561.
@@ -137,6 +167,18 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 			txMeta, err := s.Get(gCtx, &txHash, fields.Tx, fields.BlockIDs, fields.Conflicting)
 			if err != nil {
 				return errors.NewProcessingError("[ProcessConflicting][%s] error getting tx", txHash.String(), err)
+			}
+
+			// A missing record surfaces as (nil, nil) on some backends (e.g. Aerospike
+			// get returns nil for a not-found tx). Guard before dereferencing txMeta —
+			// WAL replay can feed a winner hash whose tx was pruned between crash and
+			// restart, and a clean error there is logged+counted by the replay path
+			// rather than panicking node startup. Mirrors the nil guard in
+			// ReverseProcessConflicting. Note: only a nil meta means "not found"; a
+			// non-nil meta with a nil Tx is left to the existing flow (callers may
+			// supply only the fields they need).
+			if txMeta == nil {
+				return errors.NewTxNotFoundError("[ProcessConflicting][%s] winning tx not found", txHash.String())
 			}
 
 			// the transaction should be marked as conflicting, otherwise it shouldn't be in this process
@@ -294,13 +336,34 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 //     feed this into processedConflictingHashesMap so the subsequent
 //     moveForwardBlock pass skips ProcessConflicting on these hashes —
 //     re-running it would double-apply the UTXO swap and fail.
-func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32, demotedTxHashes []chainhash.Hash) (cascadedToConflicting []chainhash.Hash, allTouched []chainhash.Hash, err error) {
+func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockHash chainhash.Hash, demotedTxHashes []chainhash.Hash) (cascadedToConflicting []chainhash.Hash, allTouched []chainhash.Hash, err error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "ReverseProcessConflicting")
 	defer deferFn()
 
 	if len(demotedTxHashes) == 0 {
 		return nil, nil, nil
 	}
+
+	// Crash-safety write-ahead log (#861): record the reverse intent before any
+	// state mutation and remove it on successful completion. See ProcessConflicting
+	// for the full rationale. ReverseProcessConflicting self-heals partial state via
+	// the isReverseFullyApplied guard, so replay from any step boundary is safe.
+	walIntent := ConflictIntent{
+		Kind:        ConflictIntentReverse,
+		BlockHeight: blockHeight,
+		BlockHash:   blockHash,
+		TxHashes:    demotedTxHashes,
+		StartedAt:   time.Now().UnixNano(),
+	}
+	if beginErr := s.BeginConflictIntent(ctx, walIntent); beginErr != nil {
+		return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting] failed to record WAL intent before processing", beginErr)
+	}
+
+	defer func() {
+		if err == nil {
+			_ = s.CompleteConflictIntent(ctx, walIntent.IntentID())
+		}
+	}()
 
 	demotedSet := make(map[chainhash.Hash]struct{}, len(demotedTxHashes))
 	for _, h := range demotedTxHashes {
@@ -423,22 +486,26 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 }
 
 // isReverseFullyApplied returns true iff every input of the demoted tx D has
-// parent.SpendingDatas[vout] populated with a non-nil spender that is not D
-// itself. Used as the post-D.Conflicting=true guard to distinguish a fully
-// applied reverse from a partial one (Mark/Unspend done but Spend(C) failed
-// last time around).
+// parent.SpendingDatas[vout] populated with a non-nil spender C that is not D
+// itself AND C is no longer flagged Conflicting. Used as the post-D.Conflicting=true
+// guard to distinguish a fully applied reverse from a partial one.
 //
 // Returns false (no error) on:
 //   - any input whose parent.SpendingDatas[vout] is nil (post-Unspend, pre-Spend
-//     state)
+//     state — Spend(C) failed last time around)
 //   - any input whose parent.SpendingDatas[vout].TxID equals demotedHash
 //     (Unspend never ran successfully for that input)
-//   - any input whose parent has no SpendingDatas slice or is shorter than vout
-//     (defensive: a parent that's been pruned / never existed shouldn't block
-//     retry, but it also shouldn't be claimed as fully reversed)
+//   - any input whose recorded spender C is still Conflicting=true — this is the
+//     crash-between-Spend(C)-and-Unmark(C) state (#861): parent[vout] already
+//     points at C, but the final UnmarkConflictingRecursively(C) never ran, so
+//     C is wrongly still conflicting. Returning false re-runs the steps, whose
+//     Mark(D)/Unspend(D)/Spend(C) are idempotent and whose Unmark(C) finishes the job.
+//   - any input whose parent has no SpendingDatas slice or is shorter than vout,
+//     or whose recorded spender record is missing (defensive: cannot confirm full
+//     application, so retry rather than claim done)
 //
-// Returns true only when ALL inputs unambiguously have a non-D spender. An
-// error is surfaced for any Get failure on a parent — that's a store-level
+// Returns true only when ALL inputs unambiguously have a non-D, non-conflicting
+// spender. An error is surfaced for any Get failure — that's a store-level
 // problem, not a state question, and the caller must abort the reverse rather
 // than make assumptions.
 func isReverseFullyApplied(ctx context.Context, s Store, demotedTx *bt.Tx, demotedHash chainhash.Hash) (bool, error) {
@@ -465,6 +532,18 @@ func isReverseFullyApplied(ctx context.Context, s Store, demotedTx *bt.Tx, demot
 		}
 
 		if sd.TxID.IsEqual(&demotedHash) {
+			return false, nil
+		}
+
+		// The recorded spender C must also be non-conflicting. A crash between
+		// Spend(C) and UnmarkConflictingRecursively(C) leaves parent[vout]->C
+		// with C still Conflicting=true; that is NOT a fully-applied reverse.
+		spenderMeta, err := s.Get(ctx, sd.TxID, fields.Conflicting)
+		if err != nil {
+			return false, errors.NewProcessingError("[isReverseFullyApplied][%s] error getting recorded spender %s meta", demotedHash.String(), sd.TxID.String(), err)
+		}
+
+		if spenderMeta == nil || spenderMeta.Conflicting {
 			return false, nil
 		}
 	}

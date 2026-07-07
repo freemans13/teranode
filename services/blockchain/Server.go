@@ -116,6 +116,7 @@ type Blockchain struct {
 	kafkaChan                     chan *kafka.Message                  // Channel for Kafka messages
 	stats                         *gocore.Stat                         // Statistics tracking
 	finiteStateMachine            *fsm.FSM                             // FSM for blockchain state
+	fsmMu                         sync.Mutex                           // Serialises SendFSMEvent transitions (FSM read-modify-write + stateChangeTimestamp)
 	stateChangeTimestamp          time.Time                            // Timestamp of last state change
 	AppCtx                        context.Context                      // Application context
 	localTestStartState           string                               // Initial state for testing
@@ -958,11 +959,17 @@ func (b *Blockchain) sendInitialNotification(sub subscriber) {
 // - Releasing acquired resources
 //
 // Parameters:
-// - _: Context for the shutdown operation (currently unused)
+// - ctx: Context bounding the shutdown; the final-blocks producer stop is raced against it so a wedged broker can't stall shutdown
 //
 // Returns:
 // - Error if shutdown encounters issues, nil on successful shutdown
 func (b *Blockchain) Stop(ctx context.Context) error {
+	// DC11: stop the async final-blocks producer first — before the peer-registry
+	// save below, which can early-return on failure. The Stop() is raced against
+	// ctx so a wedged broker flush can't block past the bounded Stop() window; the
+	// outstanding Stop() finishes the flush later if it can. Guarded and non-fatal.
+	kafka.StopProducerCtx(ctx, b.logger, "blockchain final-blocks", b.blocksFinalKafkaAsyncProducer)
+
 	// Drain background goroutines (ban decay loop, cleanup loop) before saving
 	// so we can't race a write against the final Save snapshot. Close is
 	// idempotent and safe to call even if StartBanDecay never ran.
@@ -2744,22 +2751,6 @@ func (b *Blockchain) GetFSMCurrentState(_ context.Context, _ *emptypb.Empty) (*b
 	}, nil
 }
 
-// WaitForFSMtoTransitionToGivenState waits for the FSM to reach a specific state.
-func (b *Blockchain) WaitForFSMtoTransitionToGivenState(ctx context.Context, targetState blockchain_api.FSMStateType) error {
-	for b.finiteStateMachine.Current() != targetState.String() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		b.logger.Debugf("Waiting 1 second for FSM to transition to %v state, currently at: %v", targetState.String(), b.finiteStateMachine.Current())
-		time.Sleep(1 * time.Second) // Wait and check again in 1 second
-	}
-
-	return nil
-}
-
 // WaitUntilFSMTransitionFromIdleState waits for the FSM to transition from the IDLE state.
 func (b *Blockchain) WaitUntilFSMTransitionFromIdleState(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
 	// Wait until:
@@ -2810,6 +2801,15 @@ func (b *Blockchain) IsFullyReady(ctx context.Context) (bool, error) {
 
 // SendFSMEvent sends an event to the finite state machine.
 func (b *Blockchain) SendFSMEvent(ctx context.Context, eventReq *blockchain_api.SendFSMEventRequest) (*blockchain_api.GetFSMStateResponse, error) {
+	// Serialise FSM transitions. SendFSMEvent performs a read-modify-write across
+	// the FSM (prior-state checks -> Event -> stateChangeTimestamp update) that
+	// must be atomic; concurrent callers (e.g. Run and CatchUpBlocks arriving as
+	// separate gRPC requests) would otherwise race on stateChangeTimestamp and
+	// interleave transitions. The only FSM callback (enter_state -> SendNotification)
+	// does not re-enter SendFSMEvent, so holding this lock cannot deadlock.
+	b.fsmMu.Lock()
+	defer b.fsmMu.Unlock()
+
 	b.logger.Infof("[Blockchain Server] Received FSM event req: %v, will send event to the FSM", eventReq)
 
 	priorState := b.finiteStateMachine.Current()
@@ -2923,21 +2923,11 @@ func (b *Blockchain) guardRunBelowHighestCheckpoint(ctx context.Context) error {
 }
 
 // HighestCheckpointHeight returns the largest Height in the supplied
-// checkpoint list, or 0 if the list is empty. Exported so callers in
-// other packages (e.g. blockvalidation) can share the same definition
-// rather than maintaining a parallel copy.
+// checkpoint list, or 0 if the list is empty. Retained for the many callers
+// in this and other packages; delegates to model.HighestCheckpointHeight so
+// there is a single definition (invariant I3) rather than a parallel copy.
 func HighestCheckpointHeight(checkpoints []chaincfg.Checkpoint) uint32 {
-	var highest uint32
-	for _, cp := range checkpoints {
-		if cp.Height < 0 {
-			continue
-		}
-		h := uint32(cp.Height)
-		if h > highest {
-			highest = h
-		}
-	}
-	return highest
+	return model.HighestCheckpointHeight(checkpoints)
 }
 
 // Run transitions the blockchain service to the running state.

@@ -87,6 +87,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 		GlobalBlockHeightRetention: globalBlockHeightRetention,
 		BatcherDrainMode:           getBool("batcher_drainMode", false, alternativeContext...),
 		BatcherBackground:          getBool("batcher_background", true, alternativeContext...),
+		// Keep this default in sync with servicemanager.DefaultStopTimeout (30s).
+		// It cannot reference that constant directly: util/servicemanager
+		// transitively imports settings, so importing it here would create an
+		// import cycle. The struct-tag default ("30s") mirrors this for docs.
+		ServiceManagerStopTimeout: getDuration("service_manager_stopTimeout", 30*time.Second, alternativeContext...),
 
 		ChainCfgParams: params,
 		Policy: &PolicySettings{
@@ -176,6 +181,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseSeparateUDFMinedModule:       getBool("aerospike_use_separate_udf_mined_module", false, alternativeContext...),
 			SeparateSpendUDFModuleCount:     getInt("aerospike_separate_udf_spend_module_count", 0, alternativeContext...),
 			SemaphoreMultiplier:             getFloat64("aerospike_semaphore_multiplier", 1.0, alternativeContext...),
+			OverloadRetryMaxElapsed:         getDuration("aerospike_overload_retry_max_elapsed", 2*time.Minute, alternativeContext...),
+			OverloadRetryBaseBackoff:        getDuration("aerospike_overload_retry_base_backoff", 50*time.Millisecond, alternativeContext...),
+			OverloadRetryMaxBackoff:         getDuration("aerospike_overload_retry_max_backoff", 5*time.Second, alternativeContext...),
 		},
 		Alert: AlertSettings{
 			GenesisKeys:   getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),
@@ -364,7 +372,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			CatchupMaxAccumulatedHeaders: getInt("blockvalidation_max_accumulated_headers", 100000, alternativeContext...),
 			CatchupCheckpointHash:        getString("blockvalidation_catchup_checkpoint_hash", "", alternativeContext...),
 			CatchupCheckpointHeight:      getInt32("blockvalidation_catchup_checkpoint_height", 0, alternativeContext...),
+			QuickValidateSkipUtxoLock:    getBool("blockvalidation_quick_validate_skip_utxo_lock", false, alternativeContext...),
 			CatchupAllowQuickValidation:  getBool("blockvalidation_catchup_allow_quick_validation", true, alternativeContext...),
+			OutpointOnlyBelowCheckpoint:  getBool("blockvalidation_outpoint_only_below_checkpoint", false, alternativeContext...),
 			// Catchup circuit breaker configuration
 			CircuitBreakerFailureThreshold: getInt("blockvalidation_circuit_breaker_failure_threshold", 5, alternativeContext...),
 			CircuitBreakerSuccessThreshold: getInt("blockvalidation_circuit_breaker_success_threshold", 2, alternativeContext...),
@@ -457,6 +467,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			StoreBatcherDrainMode:                   getBool("utxostore_storeBatcherDrainMode", false, alternativeContext...),
 			LockedBatcherDrainMode:                  getBool("utxostore_lockedBatcherDrainMode", false, alternativeContext...),
 			OutpointBatcherDrainMode:                getBool("utxostore_outpointBatcherDrainMode", false, alternativeContext...),
+			GetBatcherGreedyAccumulate:              getBool("utxostore_getBatcherGreedyAccumulate", false, alternativeContext...),
+			SpendBatcherGreedyAccumulate:            getBool("utxostore_spendBatcherGreedyAccumulate", false, alternativeContext...),
+			StoreBatcherGreedyAccumulate:            getBool("utxostore_storeBatcherGreedyAccumulate", false, alternativeContext...),
+			LockedBatcherGreedyAccumulate:           getBool("utxostore_lockedBatcherGreedyAccumulate", false, alternativeContext...),
+			OutpointBatcherGreedyAccumulate:         getBool("utxostore_outpointBatcherGreedyAccumulate", false, alternativeContext...),
 			GetBatcherSize:                          getInt("utxostore_getBatcherSize", 1, alternativeContext...),
 			GetBatcherDurationMillis:                getInt("utxostore_getBatcherDurationMillis", 10, alternativeContext...),
 			DBTimeout:                               getDuration("utxostore_dbTimeoutDuration", 5*time.Second, alternativeContext...),

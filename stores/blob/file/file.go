@@ -513,9 +513,16 @@ func newStore(logger ulogger.Logger, storeURL *url.URL, opts ...options.StoreOpt
 	}
 
 	if storeOpts.BlockHeightCh != nil {
+		// Range exits cleanly when the producer closes the channel. The
+		// previous bare `for { <-ch }` had two failure modes: if the channel
+		// was never closed, this goroutine waited forever (leak per store
+		// instance, which matters in tests that build many stores); and if
+		// the channel was closed, the receive returns zero immediately and
+		// the for-loop spins SetCurrentBlockHeight(0) at full CPU. Range
+		// handles both correctly.
 		go func() {
-			for {
-				fileStore.SetCurrentBlockHeight(<-storeOpts.BlockHeightCh)
+			for height := range storeOpts.BlockHeightCh {
+				fileStore.SetCurrentBlockHeight(height)
 			}
 		}()
 	}
@@ -595,7 +602,7 @@ func (s *File) Health(ctx context.Context, _ bool) (int, string, error) {
 		return http.StatusInternalServerError, "File Store: Unable to check disk space", err
 	}
 
-	availableBytes := stat.Bavail * uint64(stat.Bsize)
+	availableBytes := uint64(stat.Bavail) * uint64(stat.Bsize)
 	totalBytes := stat.Blocks * uint64(stat.Bsize)
 
 	const minAvailableBytes = 1 << 30 // 1 GiB

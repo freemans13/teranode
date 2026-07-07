@@ -893,11 +893,6 @@ func TestGenerateBlocks_NegativeCount(t *testing.T) {
 	})
 }
 
-// MockBlockchainClientForCoverage provides targeted mock functionality for coverage tests
-type MockBlockchainClientForCoverage struct {
-	*blockchain.Mock
-}
-
 // TestNewIntensive tests the New function with comprehensive scenarios
 func TestNewIntensive(t *testing.T) {
 	t.Run("New function creates valid instance", func(t *testing.T) {
@@ -1786,8 +1781,9 @@ func TestRunBackgroundProcessors(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 
-		// Start the listener
-		go server.runBlockSubmissionListener(ctx)
+		// Start the listener with its own done channel so it doesn't interfere
+		// with the listener already started by setupServer's Init.
+		go server.runBlockSubmissionListener(ctx, make(chan struct{}))
 
 		// Give it time to start
 		time.Sleep(10 * time.Millisecond)

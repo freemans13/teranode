@@ -438,6 +438,88 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 	})
 }
 
+// TestBlock_Valid_CoinbaseScriptSigLength pins the coinbase scriptSig length check in Block.Valid.
+// Parity with bitcoin-sv CheckCoinbase (bad-cb-length): valid iff 2 <= size <= MaxCoinbaseScriptSigSize,
+// inclusive. See GitHub issue #1141.
+func TestBlock_Valid_CoinbaseScriptSigLength(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	maxLen := int(tSettings.ChainCfgParams.MaxCoinbaseScriptSigSize)
+
+	// buildBlock returns a coinbase-only, otherwise-valid block whose coinbase scriptSig is
+	// either a controlled byte length (setNil == false) or a nil UnlockingScript (setNil == true).
+	// Height 0 skips BIP-34 and the reward/fee checks; nil subtreeStore/txMetaStore skip the
+	// subtree and order/blessed checks; empty currentChain skips the median-time-past check.
+	buildBlock := func(t *testing.T, n int, setNil bool) *Block {
+		t.Helper()
+
+		blockHeaderBytes, err := hex.DecodeString(block1Header)
+		require.NoError(t, err)
+
+		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+		require.NoError(t, err)
+
+		coinbase, err := bt.NewTxFromString(CoinbaseHex)
+		require.NoError(t, err)
+
+		if setNil {
+			coinbase.Inputs[0].UnlockingScript = nil
+		} else {
+			coinbase.Inputs[0].UnlockingScript = bscript.NewFromBytes(make([]byte, n))
+		}
+
+		// The swapped coinbase must still be recognised as a coinbase for step 4b to fire.
+		require.True(t, coinbase.IsCoinbase())
+
+		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
+		require.NoError(t, err)
+
+		return block
+	}
+
+	callValid := func(t *testing.T, block *Block) (bool, error) {
+		t.Helper()
+
+		return block.Valid(context.Background(), ulogger.TestLogger{}, nil, nil,
+			txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil)
+	}
+
+	t.Run("too short (length 1) is rejected", func(t *testing.T) {
+		valid, err := callValid(t, buildBlock(t, 1, false))
+		require.False(t, valid)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "bad coinbase length")
+		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
+	})
+
+	t.Run("too long (length Max+1) is rejected", func(t *testing.T) {
+		valid, err := callValid(t, buildBlock(t, maxLen+1, false))
+		require.False(t, valid)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "bad coinbase length")
+		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
+	})
+
+	t.Run("boundary low (length exactly 2) passes", func(t *testing.T) {
+		valid, err := callValid(t, buildBlock(t, 2, false))
+		require.NoError(t, err)
+		require.True(t, valid)
+	})
+
+	t.Run("boundary high (length exactly Max) passes", func(t *testing.T) {
+		valid, err := callValid(t, buildBlock(t, maxLen, false))
+		require.NoError(t, err)
+		require.True(t, valid)
+	})
+
+	t.Run("nil unlocking script is rejected", func(t *testing.T) {
+		valid, err := callValid(t, buildBlock(t, 0, true))
+		require.False(t, valid)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "bad coinbase length")
+		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
+	})
+}
+
 // TestBlock_NewBlockFromMsgBlock_ComprehensiveCoverage tests various paths in NewBlockFromMsgBlock
 func TestBlock_NewBlockFromMsgBlock_ComprehensiveCoverage(t *testing.T) {
 	t.Run("nil msgBlock error", func(t *testing.T) {
@@ -1554,6 +1636,223 @@ func TestNewBlockFromMsgBlock(t *testing.T) {
 	})
 }
 
+func TestNewBlockFromMsgBlock_MultiTransactionSubtree(t *testing.T) {
+	// A coinbase plus one ordinary transaction. Two leaves is a power of two, so the
+	// single subtree the constructor builds is full and its root equals the canonical
+	// Bitcoin merkle root DSHA(coinbaseHash || txHash) with no padding involved.
+	coinbaseTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{}, Index: 0xffffffff},
+			SignatureScript:  []byte{0x03, 0x01, 0x02, 0x03},
+			Sequence:         0xffffffff,
+		}},
+		TxOut: []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x51}}},
+	}
+
+	spendTx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: chainhash.DoubleHashH([]byte{0x01}), Index: 0},
+			SignatureScript:  []byte{0x47, 0x30, 0x44},
+			Sequence:         0xfffffffe,
+		}},
+		TxOut: []*wire.TxOut{{Value: 4999990000, PkScript: []byte{0x76, 0xa9, 0x14}}},
+	}
+
+	coinbaseHash := coinbaseTx.TxHash()
+	spendHash := spendTx.TxHash()
+
+	// Canonical merkle root for two leaves, computed independently of the subtree package.
+	buf := make([]byte, 0, 2*chainhash.HashSize)
+	buf = append(buf, coinbaseHash[:]...)
+	buf = append(buf, spendHash[:]...)
+	merkleRoot := chainhash.DoubleHashH(buf)
+
+	msgBlock := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    2,
+			PrevBlock:  chainhash.Hash{},
+			MerkleRoot: merkleRoot,
+			Timestamp:  time.Unix(1640995200, 0),
+			Bits:       0x1d00ffff,
+			Nonce:      42,
+		},
+		Transactions: []*wire.MsgTx{coinbaseTx, spendTx},
+	}
+
+	block, err := NewBlockFromMsgBlock(msgBlock, nil)
+	require.NoError(t, err)
+	require.NotNil(t, block)
+
+	// transaction count includes the coinbase
+	require.Equal(t, uint64(2), block.TransactionCount)
+
+	// exactly one subtree root is recorded and the in-memory slice is populated
+	require.Len(t, block.Subtrees, 1)
+	require.Len(t, block.SubtreeSlices, 1)
+	require.NotNil(t, block.SubtreeSlices[0])
+
+	// node 0 is the coinbase placeholder, node 1 is the non-coinbase tx hash in block order
+	subtree := block.SubtreeSlices[0]
+	require.Equal(t, 2, len(subtree.Nodes))
+	require.True(t, subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue))
+	require.Equal(t, spendHash, subtree.Nodes[1].Hash)
+
+	// the recorded root matches the subtree's own root
+	require.Equal(t, *subtree.RootHash(), *block.Subtrees[0])
+
+	// the single-subtree representation reconciles to the header merkle root
+	require.NoError(t, block.CheckMerkleRoot(context.Background()))
+}
+
+// canonicalBlockMerkleRoot computes the Bitcoin merkle root for the given leaves
+// (coinbase first, then transactions in block order) using the duplicate-when-odd
+// rule applied at every level. It is deliberately independent of the subtree
+// package so it can serve as an oracle for CheckMerkleRoot.
+func canonicalBlockMerkleRoot(leaves []chainhash.Hash) chainhash.Hash {
+	level := make([]chainhash.Hash, len(leaves))
+	copy(level, leaves)
+
+	for len(level) > 1 {
+		if len(level)%2 != 0 {
+			level = append(level, level[len(level)-1])
+		}
+
+		next := make([]chainhash.Hash, 0, len(level)/2)
+
+		for i := 0; i < len(level); i += 2 {
+			buf := make([]byte, 0, 2*chainhash.HashSize)
+			buf = append(buf, level[i][:]...)
+			buf = append(buf, level[i+1][:]...)
+			next = append(next, chainhash.DoubleHashH(buf))
+		}
+
+		level = next
+	}
+
+	return level[0]
+}
+
+func TestNewBlockFromMsgBlock_OddNonCoinbaseSubtree(t *testing.T) {
+	// A coinbase plus two ordinary transactions: three leaves. Three is not a power
+	// of two, so building the single subtree's root exercises the duplicate-when-odd
+	// merkle path (the last leaf is hashed against itself), which the coinbase-plus-one
+	// case never reaches.
+	coinbaseTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{}, Index: 0xffffffff},
+			SignatureScript:  []byte{0x03, 0x01, 0x02, 0x03},
+			Sequence:         0xffffffff,
+		}},
+		TxOut: []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x51}}},
+	}
+
+	spendTx1 := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: chainhash.DoubleHashH([]byte{0x01}), Index: 0},
+			SignatureScript:  []byte{0x47, 0x30, 0x44},
+			Sequence:         0xfffffffe,
+		}},
+		TxOut: []*wire.TxOut{{Value: 4999990000, PkScript: []byte{0x76, 0xa9, 0x14}}},
+	}
+
+	spendTx2 := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: chainhash.DoubleHashH([]byte{0x02}), Index: 1},
+			SignatureScript:  []byte{0x47, 0x30, 0x45},
+			Sequence:         0xfffffffd,
+		}},
+		TxOut: []*wire.TxOut{{Value: 4999980000, PkScript: []byte{0x76, 0xa9, 0x15}}},
+	}
+
+	coinbaseHash := coinbaseTx.TxHash()
+	spendHash1 := spendTx1.TxHash()
+	spendHash2 := spendTx2.TxHash()
+
+	merkleRoot := canonicalBlockMerkleRoot([]chainhash.Hash{coinbaseHash, spendHash1, spendHash2})
+
+	msgBlock := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    2,
+			PrevBlock:  chainhash.Hash{},
+			MerkleRoot: merkleRoot,
+			Timestamp:  time.Unix(1640995200, 0),
+			Bits:       0x1d00ffff,
+			Nonce:      7,
+		},
+		Transactions: []*wire.MsgTx{coinbaseTx, spendTx1, spendTx2},
+	}
+
+	block, err := NewBlockFromMsgBlock(msgBlock, nil)
+	require.NoError(t, err)
+	require.NotNil(t, block)
+
+	// transaction count includes the coinbase
+	require.Equal(t, uint64(3), block.TransactionCount)
+
+	// exactly one subtree root is recorded and the in-memory slice is populated
+	require.Len(t, block.Subtrees, 1)
+	require.Len(t, block.SubtreeSlices, 1)
+	require.NotNil(t, block.SubtreeSlices[0])
+
+	// node 0 is the coinbase placeholder; nodes 1 and 2 are the non-coinbase txs in block order
+	subtree := block.SubtreeSlices[0]
+	require.Equal(t, 3, len(subtree.Nodes))
+	require.True(t, subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue))
+	require.Equal(t, spendHash1, subtree.Nodes[1].Hash)
+	require.Equal(t, spendHash2, subtree.Nodes[2].Hash)
+
+	// the recorded root matches the subtree's own root
+	require.Equal(t, *subtree.RootHash(), *block.Subtrees[0])
+
+	// the odd-leaf single-subtree representation reconciles to the canonical merkle root
+	require.NoError(t, block.CheckMerkleRoot(context.Background()))
+}
+
+func TestNewBlockFromMsgBlock_CoinbaseOnlyNoSubtree(t *testing.T) {
+	// A coinbase-only block (genesis-like) must keep an empty subtree list and an
+	// empty in-memory subtree slice, so block validation skips the per-transaction
+	// pass exactly as it did before non-coinbase transactions were threaded in.
+	coinbaseTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{}, Index: 0xffffffff},
+			SignatureScript:  []byte{0x04, 0xff, 0xff, 0x00, 0x1d, 0x01, 0x04},
+			Sequence:         0xffffffff,
+		}},
+		TxOut: []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x51}}},
+	}
+
+	coinbaseHash := coinbaseTx.TxHash()
+
+	msgBlock := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    1,
+			PrevBlock:  chainhash.Hash{},
+			MerkleRoot: coinbaseHash,
+			Timestamp:  time.Unix(1231006505, 0),
+			Bits:       0x1d00ffff,
+			Nonce:      2083236893,
+		},
+		Transactions: []*wire.MsgTx{coinbaseTx},
+	}
+
+	block, err := NewBlockFromMsgBlock(msgBlock, nil)
+	require.NoError(t, err)
+	require.NotNil(t, block)
+
+	require.Equal(t, uint64(1), block.TransactionCount)
+	require.Empty(t, block.Subtrees)
+	require.Empty(t, block.SubtreeSlices)
+
+	// with a single transaction the merkle root is the coinbase hash itself
+	require.NoError(t, block.CheckMerkleRoot(context.Background()))
+}
+
 func TestNewBlockFromMsgBlockAndModelBlock(t *testing.T) {
 	blockHeaderBytes, err := hex.DecodeString(block1Header)
 	require.NoError(t, err)
@@ -1717,10 +2016,174 @@ func TestBlock_CheckBlockRewardAndFees(t *testing.T) {
 		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 1, 0)
 		require.NoError(t, err)
 
-		// Test the function exists and handles basic input
-		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams)
+		// Use params with NO checkpoints so height 1 is ABOVE the highest checkpoint (0)
+		// and the below-checkpoint skip does not fire — this genuinely exercises the reward
+		// arithmetic: the height-1 coinbase claims exactly the 50 BTC subsidy, so it is valid.
+		params := &chaincfg.Params{SubsidyReductionInterval: 210000}
+		err = block.checkBlockRewardAndFees(params, true, true)
 		require.NoError(t, err)
 	})
+}
+
+// newBlockWithCoinbaseRewardAndZeroSubtreeFees builds a Block at the given height
+// whose coinbase claims the full block subsidy (no fees) and whose SubtreeSlices
+// carry Fees=0. This mirrors the below-checkpoint fast-path write side which stores
+// zero fees in subtree data (spec §4.1); it is used to prove that
+// checkBlockRewardAndFees skips the check below the highest hardcoded checkpoint.
+func newBlockWithCoinbaseRewardAndZeroSubtreeFees(t *testing.T, height uint32, params *chaincfg.Params) *Block {
+	t.Helper()
+
+	// Compute the block subsidy at this height so the coinbase claims exactly
+	// the right amount (no fee top-up), ensuring the check would fire on an
+	// above-checkpoint block where subtree fees remain 0.
+	coinbaseReward := util.GetBlockSubsidyForHeight(height, params)
+
+	// Build a minimal coinbase tx whose single output spends the full reward.
+	// Use a raw P2PKH locking script (OP_DUP OP_HASH160 <20 zero bytes> OP_EQUALVERIFY OP_CHECKSIG).
+	lockingScript, err := bscript.NewFromHexString("76a914000000000000000000000000000000000000000088ac")
+	require.NoError(t, err)
+	coinbaseTx := bt.NewTx()
+	coinbaseTx.Inputs = append(coinbaseTx.Inputs, &bt.Input{})
+	coinbaseTx.Outputs = append(coinbaseTx.Outputs, &bt.Output{
+		Satoshis:      coinbaseReward,
+		LockingScript: lockingScript,
+	})
+
+	// A single subtree with Fees=0 (the zero value is the default — no AddNode
+	// calls means Fees stays at zero, which matches the fast-path write side).
+	subtree, sErr := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, sErr)
+
+	b := &Block{
+		Header:        newTestBlockHeader(t),
+		CoinbaseTx:    coinbaseTx,
+		Height:        height,
+		Subtrees:      []*chainhash.Hash{subtree.RootHash()},
+		SubtreeSlices: []*subtreepkg.Subtree{subtree},
+	}
+	return b
+}
+
+// TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint verifies that
+// checkBlockRewardAndFees is a no-op for blocks at or below the highest hardcoded
+// checkpoint height ONLY when the store can produce fee=0 fast-path blocks AND the
+// block is a confirmed checkpoint ancestor. Without fast-path store support, without
+// confirmed ancestry (forward-sync / detached fork), or above the checkpoint on any
+// store, the no-inflation check is still enforced.
+func TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint(t *testing.T) {
+	params := &chaincfg.Params{
+		SubsidyReductionInterval: 210000,
+		Checkpoints: []chaincfg.Checkpoint{
+			{Height: 100},
+			{Height: 500},
+		},
+	}
+
+	// Height 300 is between the two checkpoints but still at or below the
+	// highest checkpoint (500). The subtrees carry Fees=0, which would normally
+	// make the check fire (coinbase > 0 + reward is impossible when fee=0 and
+	// coinbase == reward, but the check fires when coinbase > subtreeFees+reward).
+	// Here coinbase == reward, so the check would pass anyway — but we want to
+	// confirm the skip fires BEFORE reaching the arithmetic. We use height 501
+	// (above checkpoint) with fee=0 subtrees to prove the check IS enforced
+	// above the checkpoint (coinbase == reward so no error for above, but the
+	// skip path must not be taken). To provably distinguish the two paths we
+	// inflate the coinbase output so it exceeds reward alone.
+	//
+	// Approach: build a block where coinbaseOutputSatoshis = reward+1. Below
+	// checkpoint the check is skipped → nil. Above checkpoint the check runs →
+	// error (output > fees+reward since fees=0 and output=reward+1).
+
+	// Build a coinbase that claims one satoshi more than the block subsidy.
+	buildInflatedBlock := func(height uint32) *Block {
+		t.Helper()
+		coinbaseReward := util.GetBlockSubsidyForHeight(height, params)
+
+		lockingScript, sErr := bscript.NewFromHexString("76a914000000000000000000000000000000000000000088ac")
+		require.NoError(t, sErr)
+		coinbaseTx := bt.NewTx()
+		coinbaseTx.Inputs = append(coinbaseTx.Inputs, &bt.Input{})
+		coinbaseTx.Outputs = append(coinbaseTx.Outputs, &bt.Output{
+			Satoshis:      coinbaseReward + 1, // inflated by 1 satoshi
+			LockingScript: lockingScript,
+		})
+
+		subtree, sErr := subtreepkg.NewTreeByLeafCount(2)
+		require.NoError(t, sErr)
+
+		return &Block{
+			Header:        newTestBlockHeader(t),
+			CoinbaseTx:    coinbaseTx,
+			Height:        height,
+			Subtrees:      []*chainhash.Hash{subtree.RootHash()},
+			SubtreeSlices: []*subtreepkg.Subtree{subtree},
+		}
+	}
+
+	bBelow := buildInflatedBlock(300) // below highest checkpoint (500)
+	require.NoError(t, bBelow.checkBlockRewardAndFees(params, true, true), "below checkpoint, fast-path store, confirmed checkpoint ancestor: fee check must be skipped")
+	require.Error(t, bBelow.checkBlockRewardAndFees(params, false, true), "below checkpoint but store lacks fast-path support: no-inflation must still be enforced")
+	require.Error(t, bBelow.checkBlockRewardAndFees(params, true, false), "below checkpoint, fast-path store, but NOT a confirmed checkpoint ancestor (forward-sync / detached fork): no-inflation must still be enforced")
+
+	bAbove := buildInflatedBlock(501) // above highest checkpoint (500)
+	require.Error(t, bAbove.checkBlockRewardAndFees(params, true, true), "above checkpoint: fee check must still be enforced regardless of store support / ancestry")
+}
+
+// TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight pins the real
+// production function's skip boundary to model.HighestCheckpointHeight — the single
+// source of truth (invariant I3). Unlike TestCheckpointHeight_WriteReadAgree (which
+// compares two symbols), this exercises the compiled checkBlockRewardAndFees itself
+// at exactly the boundary, so a future edit that stops using HighestCheckpointHeight
+// (or introduces an off-by-one) fails here rather than silently shipping a fee=0
+// block that revalidation would reject.
+func TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight(t *testing.T) {
+	params := &chaincfg.Params{
+		SubsidyReductionInterval: 210000,
+		Checkpoints: []chaincfg.Checkpoint{
+			{Height: 100},
+			{Height: -1}, // negative must be ignored by the single-source function
+			{Height: 777},
+			{Height: 400},
+		},
+	}
+
+	hc := HighestCheckpointHeight(params.Checkpoints)
+	require.Equal(t, uint32(777), hc, "sanity: highest checkpoint height")
+
+	// Build a coinbase claiming one satoshi more than the subsidy, so the check
+	// fires whenever it is NOT skipped.
+	buildInflatedBlock := func(height uint32) *Block {
+		t.Helper()
+		coinbaseReward := util.GetBlockSubsidyForHeight(height, params)
+
+		lockingScript, sErr := bscript.NewFromHexString("76a914000000000000000000000000000000000000000088ac")
+		require.NoError(t, sErr)
+		coinbaseTx := bt.NewTx()
+		coinbaseTx.Inputs = append(coinbaseTx.Inputs, &bt.Input{})
+		coinbaseTx.Outputs = append(coinbaseTx.Outputs, &bt.Output{
+			Satoshis:      coinbaseReward + 1,
+			LockingScript: lockingScript,
+		})
+
+		subtree, sErr := subtreepkg.NewTreeByLeafCount(2)
+		require.NoError(t, sErr)
+
+		return &Block{
+			Header:        newTestBlockHeader(t),
+			CoinbaseTx:    coinbaseTx,
+			Height:        height,
+			Subtrees:      []*chainhash.Hash{subtree.RootHash()},
+			SubtreeSlices: []*subtreepkg.Subtree{subtree},
+		}
+	}
+
+	// Exactly at the boundary (height == hc), fast-path store, confirmed ancestor: skipped.
+	require.NoError(t, buildInflatedBlock(hc).checkBlockRewardAndFees(params, true, true),
+		"at height == HighestCheckpointHeight the check must be skipped (fast-path store, confirmed ancestor)")
+
+	// One above the boundary: enforced (inflated coinbase → error).
+	require.Error(t, buildInflatedBlock(hc+1).checkBlockRewardAndFees(params, true, true),
+		"at height == HighestCheckpointHeight+1 the check must be enforced")
 }
 
 func TestBlock_CheckDuplicateTransactionsInSubtree(t *testing.T) {
@@ -2163,12 +2626,16 @@ func TestBlock_CheckRewardAndFees_WithHeight(t *testing.T) {
 		coinbase, err := bt.NewTxFromString(CoinbaseHex)
 		require.NoError(t, err)
 
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 800000, 0)
+		// blockHeight (6th arg) must be ABOVE the highest hardcoded mainnet checkpoint:
+		// checkBlockRewardAndFees now skips the reward/no-inflation check at or below the highest
+		// checkpoint (the chain prefix is already certified by the pinned hash). 10_000_000 is safely
+		// above any mainnet checkpoint, so the reward-calculation logic still runs here.
+		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 10_000_000, 0)
 		require.NoError(t, err)
 
 		// Test with a height that triggers the reward calculation logic
 		// This should error because coinbase output is too high
-		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams)
+		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams, true, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "coinbase output")
 	})
@@ -4813,6 +5280,64 @@ func TestBlock_Valid_DupTxDetected_DiskMapDirs(t *testing.T) {
 			require.Error(t, err)
 			require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected ErrBlockInvalid, got %v", err)
 			require.Contains(t, err.Error(), "duplicate transaction")
+		})
+	}
+}
+
+// TestBlock_EmptyBlock_DiskMapDirs verifies a coinbase-only block — whose
+// TransactionCount is 0, since GetAndValidateSubtrees derives it from subtree
+// lengths and an empty block has no subtrees — passes checkDuplicateTransactions
+// and validOrderAndBlessed when block_diskMapDirs is set. The mmap-backed maps
+// reject FilterCapacity == 0, so the call sites must clamp the derived capacity
+// to a floor of 1; without the clamp every empty block fails validation on
+// nodes configured with disk-backed maps.
+func TestBlock_EmptyBlock_DiskMapDirs(t *testing.T) {
+	cases := []struct {
+		name string
+		dirs func(t *testing.T) []string
+	}{
+		{"in_memory", func(*testing.T) []string { return nil }},
+		{"single_disk", func(t *testing.T) []string { return []string{t.TempDir()} }},
+		{"multi_disk", func(t *testing.T) []string { return []string{t.TempDir(), t.TempDir()} }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tSettings := test.CreateBaseTestSettings(t)
+
+			blockHeaderBytes, _ := hex.DecodeString(block1Header)
+			blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+			require.NoError(t, err)
+
+			coinbase, err := bt.NewTxFromString(CoinbaseHex)
+			require.NoError(t, err)
+
+			block, err := NewBlock(blockHeader, coinbase, nil, 0, 123, 0, 0)
+			require.NoError(t, err)
+			require.Zero(t, block.TransactionCount)
+
+			// checkDuplicateTransactions allocates block.txMap (mmap-backed
+			// DiskTxMapUint64 when dirs are set); release it on all paths so
+			// the mmap files/fds are freed and TempDir cleanup stays reliable.
+			defer block.releaseTxMap()
+
+			ctx := context.Background()
+			logger := ulogger.TestLogger{}
+			dirs := tc.dirs(t)
+
+			err = block.checkDuplicateTransactions(ctx, logger, tSettings.Block.CheckDuplicateTransactionsConcurrency, dirs)
+			require.NoError(t, err)
+
+			deps := &validationDependencies{
+				txMetaStore:           createTestUTXOStore(t),
+				subtreeStore:          &mockSubtreeStore{shouldError: true},
+				currentChain:          []*BlockHeader{},
+				currentBlockHeaderIDs: []uint32{},
+				oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			}
+
+			err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, dirs, tSettings.Block.ParentSpendsCapacityMultiplier)
+			require.NoError(t, err)
 		})
 	}
 }

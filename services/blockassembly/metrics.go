@@ -49,6 +49,8 @@ var (
 	prometheusBlockAssemblerUpdateBestBlock             prometheus.Histogram
 	prometheusBlockAssemblyBestBlockHeight              prometheus.Gauge
 	prometheusBlockAssemblyCurrentBlockHeight           prometheus.Gauge
+	prometheusBlockAssemblyTipLagBlocks                 prometheus.Gauge
+	prometheusBlockAssemblyProcessingStuck              *prometheus.CounterVec
 	prometheusBlockAssemblerCurrentState                prometheus.Gauge
 	prometheusBlockAssemblerStateTransitions            *prometheus.CounterVec
 	prometheusBlockAssemblerStateDuration               *prometheus.HistogramVec
@@ -68,6 +70,8 @@ var (
 	prometheusBlockAssemblerAddDirectlyTotal            prometheus.Counter
 	prometheusBlockAssemblerAddDirectlyBatchTime        prometheus.Histogram
 	prometheusBlockAssemblerSubtreeStoredHist           prometheus.Histogram
+	prometheusBlockAssemblerConflictIntentsPending      prometheus.Gauge
+	prometheusBlockAssemblerConflictIntentReplay        *prometheus.CounterVec
 )
 
 var (
@@ -168,6 +172,25 @@ func _initPrometheusMetrics() {
 			Help:      "Histogram of subtree stored duration in block assembler",
 			Buckets:   util.MetricsBucketsMilliSeconds,
 		},
+	)
+
+	prometheusBlockAssemblerConflictIntentsPending = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "conflict_intents_pending",
+			Help:      "Number of pending conflict-resolution WAL intents found at startup (interrupted ProcessConflicting/ReverseProcessConflicting operations awaiting replay)",
+		},
+	)
+
+	prometheusBlockAssemblerConflictIntentReplay = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "conflict_intent_replay_total",
+			Help:      "Total conflict-resolution WAL intent replays at startup, by result",
+		},
+		[]string{"result"},
 	)
 
 	prometheusBlockAssemblerTransactions = promauto.NewGauge(
@@ -271,6 +294,25 @@ func _initPrometheusMetrics() {
 			Name:      "current_block_height",
 			Help:      "Current block height in block assembly",
 		},
+	)
+
+	prometheusBlockAssemblyTipLagBlocks = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "tip_lag_blocks",
+			Help:      "Number of blocks block assembly is behind the blockchain tip (0 when caught up). Sustained non-zero values indicate block assembly is stuck (issue #980).",
+		},
+	)
+
+	prometheusBlockAssemblyProcessingStuck = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "processing_stuck_total",
+			Help:      "Count of block assembly catch-up/reorg/move-forward failures that left the assembler behind the tip, labelled by reason (issue #980).",
+		},
+		[]string{"reason"},
 	)
 
 	prometheusBlockAssemblerCurrentState = promauto.NewGauge(

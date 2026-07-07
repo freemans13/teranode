@@ -130,6 +130,10 @@ type TestOptions struct {
 	// Log format: [TestName:serviceName] LEVEL: message
 	// This provides consistent formatting and ensures all logs are captured by go test.
 	UseUnifiedLogger bool
+	// WaitForHealthReadiness waits for the readiness endpoint after daemon startup.
+	// By default tests only wait for liveness because some narrow daemon configurations
+	// intentionally start without every readiness dependency.
+	WaitForHealthReadiness bool
 }
 
 // JSONError represents a JSON error response from the RPC server.
@@ -148,6 +152,13 @@ var testDaemonCounter uint64
 
 // NewTestDaemon creates a new TestDaemon instance with the provided options.
 func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
+	// Test daemons run multiple nodes in-process on the same host, so peers advertise
+	// and fetch from each other over localhost (e.g. http://localhost:<assetPort>). The
+	// production SSRF dial guard blocks loopback, which would make catchup block/subtree
+	// fetches fail. These nodes are trusted, so disable SSRF protection for the test
+	// process. Production (cmd/teranode) never calls this and keeps protection enabled.
+	util.SetSSRFProtection(false)
+
 	ctx, cancel := context.WithCancel(t.Context())
 
 	var (
@@ -516,7 +527,11 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	}
 
 	ports := []int{getPortFromString(appSettings.HealthCheckHTTPListenAddress)}
-	require.NoError(t, WaitForHealthLiveness(ports, 10*time.Second))
+	if opts.WaitForHealthReadiness {
+		require.NoError(t, WaitForHealthReadiness(ports, 10*time.Second))
+	} else {
+		require.NoError(t, WaitForHealthLiveness(ports, 10*time.Second))
+	}
 
 	// If using Aerospike, add a brief delay to allow it to stabilize after daemon services connect
 	// Aerospike may accept connections but still reject operations immediately after multiple
@@ -1697,7 +1712,7 @@ func createAndSaveSubtrees(ctx context.Context, subtreeStore blob.Store, txs []*
 		}
 	}
 
-	if err = storeSubtreeFiles(ctx, subtreeStore, subtree, subtreeData, subtreeMeta); err != nil {
+	if err = storeSubtreeFiles(ctx, subtreeStore, subtree, subtreeData, subtreeMeta, 100); err != nil {
 		return nil, err
 	}
 
@@ -1705,7 +1720,7 @@ func createAndSaveSubtrees(ctx context.Context, subtreeStore blob.Store, txs []*
 }
 
 // storeSubtreeFiles serializes and stores the subtree, subtree data, and subtree meta in the provided subtree store.
-func storeSubtreeFiles(ctx context.Context, subtreeStore blob.Store, subtree *subtreepkg.Subtree, subtreeData *subtreepkg.Data, subtreeMeta *subtreepkg.Meta) error {
+func storeSubtreeFiles(ctx context.Context, subtreeStore blob.Store, subtree *subtreepkg.Subtree, subtreeData *subtreepkg.Data, subtreeMeta *subtreepkg.Meta, deleteAtHeight uint32) error {
 	subtreeBytes, err := subtree.Serialize()
 	if err != nil {
 		return err
@@ -1716,7 +1731,7 @@ func storeSubtreeFiles(ctx context.Context, subtreeStore blob.Store, subtree *su
 		subtree.RootHash()[:],
 		fileformat.FileTypeSubtreeToCheck, // this needs to be FileTypeSubtreeToCheck for tx processing to occur
 		subtreeBytes,
-		options.WithDeleteAt(100),
+		options.WithDeleteAt(deleteAtHeight),
 		options.WithAllowOverwrite(true),
 	)
 	if err != nil {
@@ -1733,7 +1748,7 @@ func storeSubtreeFiles(ctx context.Context, subtreeStore blob.Store, subtree *su
 		subtreeData.RootHash()[:],
 		fileformat.FileTypeSubtreeData,
 		subtreeDataBytes,
-		options.WithDeleteAt(100),
+		options.WithDeleteAt(deleteAtHeight),
 		options.WithAllowOverwrite(true),
 	)
 	if err != nil {
@@ -1750,7 +1765,7 @@ func storeSubtreeFiles(ctx context.Context, subtreeStore blob.Store, subtree *su
 		subtree.RootHash()[:],
 		fileformat.FileTypeSubtreeMeta,
 		subtreeMetaBytes,
-		options.WithDeleteAt(100),
+		options.WithDeleteAt(deleteAtHeight),
 		options.WithAllowOverwrite(true),
 	)
 	if err != nil {
@@ -1758,6 +1773,49 @@ func storeSubtreeFiles(ctx context.Context, subtreeStore blob.Store, subtree *su
 	}
 
 	return nil
+}
+
+// StoreSubtreeForBlock builds the single subtree for a block whose only
+// non-coinbase transactions are those given (a coinbase placeholder followed by
+// the supplied transactions, in order), then persists the subtree, its data and
+// its meta to the subtree store. This makes the transactions locally available
+// to the block-validation subtree pass, which fetches the subtree data and
+// consensus-validates every non-coinbase transaction.
+//
+// It is the test-side complement to model.NewBlockFromMsgBlock: that constructor
+// records the subtree root on the block, but the transaction bodies (carried only
+// in the original wire block) are not part of the serialised block and must be
+// supplied to the store separately for validation to reach them.
+//
+// deleteAtHeight controls blob retention and must be above the height of the
+// block being validated so the subtree is not pruned before validation runs.
+// The returned root hash matches block.Subtrees[0] for a block built from the
+// same coinbase-plus-transactions set.
+func (td *TestDaemon) StoreSubtreeForBlock(t *testing.T, txs []*bt.Tx, deleteAtHeight uint32) *chainhash.Hash {
+	subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(len(txs) + 1)
+	require.NoError(t, err)
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
+
+	require.NoError(t, subtree.AddCoinbaseNode())
+
+	for i, tx := range txs {
+		require.NoError(t, subtree.AddNode(*tx.TxIDChainHash(), 0, uint64(tx.Size()))) //nolint:gosec
+		// node index is i+1 because index 0 is the coinbase placeholder
+		require.NoError(t, subtreeData.AddTx(tx, i+1))
+		require.NoError(t, subtreeMeta.SetTxInpointsFromTx(tx))
+	}
+
+	rootHash := subtree.RootHash()
+
+	// Delegate the persist path to storeSubtreeFiles. subtreeData.RootHash() equals
+	// subtree.RootHash() for a NewSubtreeData(subtree), so the stored keys are unchanged.
+	// FileTypeSubtreeToCheck (set by storeSubtreeFiles) is required so the
+	// subtree-validation pass treats the transactions as pending and validates them.
+	require.NoError(t, storeSubtreeFiles(td.Ctx, td.SubtreeStore, subtree, subtreeData, subtreeMeta, deleteAtHeight))
+
+	return rootHash
 }
 
 // ResetServiceManagerContext resets the ServiceManager context to allow for a fresh start.
@@ -1784,14 +1842,24 @@ func (td *TestDaemon) GetTxStore() (blob.Store, error) {
 	return td.d.daemonStores.GetTxStore(td.Ctx, td.Logger, td.Settings)
 }
 
-// WaitForHealthLiveness waits for the health readiness endpoint of the given ports to respond within the specified timeout.
+// WaitForHealthLiveness waits for the health liveness endpoint of the given ports to respond within the specified timeout.
 func WaitForHealthLiveness(ports []int, timeout time.Duration) error {
+	return waitForHealthEndpoint(ports, timeout, "/health/liveness")
+}
+
+// WaitForHealthReadiness waits for the health readiness endpoint of the given ports to respond within the specified timeout.
+func WaitForHealthReadiness(ports []int, timeout time.Duration) error {
+	return waitForHealthEndpoint(ports, timeout, "/health/readiness")
+}
+
+func waitForHealthEndpoint(ports []int, timeout time.Duration, path string) error {
 	timeoutElapsed := time.After(timeout)
+	localHealthClient := &http.Client{Timeout: time.Second}
 
 	var err error
 
 	for _, port := range ports {
-		healthReadinessEndpoint := fmt.Sprintf("http://localhost:%d/health/readiness", port)
+		healthEndpoint := fmt.Sprintf("http://localhost:%d%s", port, path)
 
 	out:
 		for {
@@ -1799,8 +1867,18 @@ func WaitForHealthLiveness(ports []int, timeout time.Duration) error {
 			case <-timeoutElapsed:
 				return errors.NewError("health check failed for port %d after timeout: %v", port, timeout, err)
 			default:
-				_, err = util.DoHTTPRequest(context.Background(), healthReadinessEndpoint, nil)
-				if err != nil {
+				resp, requestErr := localHealthClient.Get(healthEndpoint)
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				if requestErr != nil {
+					err = requestErr
+					time.Sleep(100 * time.Millisecond)
+
+					continue
+				}
+				if resp.StatusCode != http.StatusOK {
+					err = errors.NewError("health check returned status code %d", resp.StatusCode)
 					time.Sleep(100 * time.Millisecond)
 
 					continue

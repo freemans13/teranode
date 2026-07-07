@@ -401,6 +401,12 @@ func getAerospikeClient(logger ulogger.Logger, url *url.URL, tSettings *settings
 	// util/uaerospike.WithSemaphoreMultiplier for the precise contract.
 	clientOpts := []uaerospike.ClientOption{
 		uaerospike.WithSemaphoreMultiplier(tSettings.Aerospike.SemaphoreMultiplier),
+		uaerospike.WithOverloadRetry(
+			tSettings.Aerospike.OverloadRetryMaxElapsed,
+			tSettings.Aerospike.OverloadRetryBaseBackoff,
+			tSettings.Aerospike.OverloadRetryMaxBackoff,
+		),
+		uaerospike.WithLogger(logger),
 	}
 
 	// policy = aerospike.NewClientPolicy()

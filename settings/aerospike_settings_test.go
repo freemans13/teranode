@@ -2,6 +2,7 @@ package settings
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -24,4 +25,18 @@ func TestAerospikeSemaphoreMultiplier_Default(t *testing.T) {
 			`getFloat64("aerospike_semaphore_multiplier", 1.0, alternativeContext...)`+
 			" entry and the in-process semaphore is silently disabled in prod.",
 		tSettings.Aerospike.SemaphoreMultiplier)
+}
+
+// TestAerospikeOverloadRetry_Defaults guards the same loader-vs-struct-tag
+// class of bug for the overload-retry settings. A missing loader entry would
+// leave OverloadRetryMaxElapsed at 0, silently disabling the uaerospike
+// overload-retry mitigation in every deployment.
+func TestAerospikeOverloadRetry_Defaults(t *testing.T) {
+	tSettings := NewSettings()
+
+	require.NotNil(t, tSettings)
+	require.Equal(t, 2*time.Minute, tSettings.Aerospike.OverloadRetryMaxElapsed,
+		"default OverloadRetryMaxElapsed must be 2m; a zero value disables overload retry in prod")
+	require.Equal(t, 50*time.Millisecond, tSettings.Aerospike.OverloadRetryBaseBackoff)
+	require.Equal(t, 5*time.Second, tSettings.Aerospike.OverloadRetryMaxBackoff)
 }

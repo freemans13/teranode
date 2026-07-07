@@ -402,6 +402,46 @@ func TestNewWebsocketHandler(t *testing.T) {
 	})
 }
 
+// TestWebsocketHandler_SubprotocolNegotiation verifies the handler advertises
+// the centrifuge-protobuf subprotocol so a protobuf client negotiates it (rather
+// than being silently served JSON and disconnected with "bad request"), while a
+// client that requests no subprotocol still gets JSON (empty negotiated value).
+func TestWebsocketHandler_SubprotocolNegotiation(t *testing.T) {
+	node, err := centrifuge.New(centrifuge.Config{})
+	require.NoError(t, err)
+
+	node.OnConnecting(func(_ context.Context, _ centrifuge.ConnectEvent) (centrifuge.ConnectReply, error) {
+		return centrifuge.ConnectReply{}, nil
+	})
+
+	require.NoError(t, node.Run())
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	// Permissive origin check: this test exercises subprotocol negotiation, not
+	// the same-host origin guard (which would otherwise reject the test dialer).
+	srv := httptest.NewServer(NewWebsocketHandler(node, WebsocketConfig{
+		CheckOrigin: func(*http.Request) bool { return true },
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	t.Run("protobuf requested is negotiated", func(t *testing.T) {
+		d := websocket.Dialer{Subprotocols: []string{"centrifuge-protobuf"}}
+		conn, _, derr := d.Dial(wsURL, nil)
+		require.NoError(t, derr)
+		defer conn.Close()
+		require.Equal(t, "centrifuge-protobuf", conn.Subprotocol())
+	})
+
+	t.Run("no subprotocol stays JSON", func(t *testing.T) {
+		conn, _, derr := websocket.DefaultDialer.Dial(wsURL, nil)
+		require.NoError(t, derr)
+		defer conn.Close()
+		require.Equal(t, "", conn.Subprotocol())
+	})
+}
+
 func TestCheckSameHost(t *testing.T) {
 	tests := []struct {
 		name      string
