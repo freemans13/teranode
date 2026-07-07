@@ -435,6 +435,15 @@ type SyncManager struct {
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
+	// headerFirstRequestedBlocks tracks block hashes requested by fetchHeaderBlocks
+	// (the headers-first getdata path), separately from the shared requestedBlocks
+	// map that also covers normal inv-driven getdata requests. Membership here, at
+	// delivery time and combined with headersFirstMode still being true, is the
+	// in-process proof that a block arrived through a headers-first segment whose
+	// terminal header was link-verified and matched a hardcoded checkpoint hash
+	// (see handleHeadersMsg) — see checkpointCertifiedForBlock.
+	headerFirstRequestedBlocks *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
+
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64
@@ -1349,6 +1358,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	state.requestedBlocks.Delete(bmsg.blockHash)
 	sm.requestedBlocks.Delete(bmsg.blockHash)
 
+	// A block delivered through a verified headers-first segment is checkpoint-
+	// certified: this in-process proof is threaded down to blockvalidation so the
+	// below-checkpoint coinbase no-inflation skip can engage safely (see
+	// checkpointCertifiedForBlock and HandleBlockDirect).
+	checkpointCertified := sm.checkpointCertifiedForBlock(bmsg.blockHash)
+
 	// Track block size for dynamic in-flight adjustment during headers-first mode.
 	// This allows us to start aggressive (20 blocks) and automatically reduce
 	// to 1 block when encountering large (>2GB) blocks on mainnet.
@@ -1380,7 +1395,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// Process the block directly. A missing-parent error (ErrBlockNotFound)
 	// always triggers a getblocks request from our best block so block
 	// validation can proceed in order — see the orphan-continuation note below.
-	if err = sm.HandleBlockDirect(sm.ctx, bmsg.peer, bmsg.blockHash, msgBlock); err != nil {
+	if err = sm.HandleBlockDirect(sm.ctx, bmsg.peer, bmsg.blockHash, msgBlock, checkpointCertified); err != nil {
 		if errors.Is(err, errors.ErrBlockNotFound) {
 			// We don't have the parent of this block. While catching blocks
 			// this is typically the peer announcing its tip while we are
@@ -1643,6 +1658,12 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 			peerState, _ := sm.peerStates.Get(sp)
 			peerState.requestedBlocks.Set(*node.hash, struct{}{})
 
+			// Mark this hash as requested via the headers-first path specifically,
+			// so handleBlockMsg can later prove (checkpointCertifiedForBlock) that
+			// the delivered block came from a header segment verified against a
+			// hardcoded checkpoint, rather than the shared getblocks/inv path.
+			sm.headerFirstRequestedBlocks.Set(*node.hash, struct{}{})
+
 			numRequested++
 		}
 
@@ -1657,6 +1678,31 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	if len(getDataMessage.InvList) > 0 {
 		sp.QueueMessage(getDataMessage, nil)
 	}
+}
+
+// checkpointCertifiedForBlock reports whether blockHash was delivered through the
+// current headers-first segment: requested by fetchHeaderBlocks after its header
+// chain was link-verified and its terminal header matched a hardcoded checkpoint
+// hash (handleHeadersMsg disconnects the peer on any mismatch instead of fetching
+// bodies). That in-process proof is what lets blockvalidation skip the below-
+// checkpoint coinbase no-inflation check even while the checkpoint header does not
+// yet exist in the blockchain store (headers-only IBD from genesis).
+//
+// Consumes (deletes) the tracking entry so it cannot be reused for a later,
+// differently-sourced delivery of the same hash. Requires headersFirstMode to
+// still be true at call time so a race with the final-checkpoint mode flip (normal
+// mode) cannot certify a getblocks-fallback block. Conservative by construction:
+// an unrequested hash, a hash requested outside fetchHeaderBlocks, or headers-
+// first mode having already ended all yield false — matching pre-fix behaviour.
+func (sm *SyncManager) checkpointCertifiedForBlock(blockHash chainhash.Hash) bool {
+	if sm.headerFirstRequestedBlocks == nil {
+		return false
+	}
+
+	_, wasHeaderFirstRequested := sm.headerFirstRequestedBlocks.Get(blockHash)
+	sm.headerFirstRequestedBlocks.Delete(blockHash)
+
+	return sm.headersFirstMode.Load() && wasHeaderFirstRequested
 }
 
 // handleHeadersMsg handles block header messages from all peers.  Headers are
@@ -2388,6 +2434,7 @@ func (sm *SyncManager) Stop() error {
 	sm.orphanTxs.Stop()
 	sm.requestedTxns.Stop()
 	sm.requestedBlocks.Stop()
+	sm.headerFirstRequestedBlocks.Stop()
 
 	// DC15 / review C1: quiesce Put then drain the tx-announce batcher before
 	// tearing down transports.
@@ -2483,7 +2530,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		rejectedTxns:    txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns), // limit map size to maxRejectedTxns
 		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),   // give peers 10 seconds to respond
 		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](60 * time.Second),   // give peers 60 seconds to respond
-		peerStates:      txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
+		// Same 60s window as requestedBlocks: both are populated together by
+		// fetchHeaderBlocks for every headers-first getdata request.
+		headerFirstRequestedBlocks: expiringmap.New[chainhash.Hash, struct{}](60 * time.Second),
+		peerStates:                 txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		headerList:       list.New(),

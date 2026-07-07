@@ -37,7 +37,11 @@ type Interface interface {
 
 	// ProcessBlock validates and processes a complete block at the specified height.
 	// blockID is the pre-assigned block ID from the caller (0 = not pre-assigned, blockchain will auto-assign).
-	ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32) error
+	// checkpointCertified is an optional trust signal (default false, matching pre-existing
+	// behaviour): set only by the in-process legacy netsync when the block was delivered
+	// through a headers-first segment whose terminal header matched a hardcoded checkpoint.
+	// Trusted at the same level as peerID — this API is service-mesh internal.
+	ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32, checkpointCertified ...bool) error
 
 	// ValidateBlock validates a block using the provided request, but does not update any state or database tables.
 	// This is useful for validating blocks without committing them to the database.
@@ -64,7 +68,7 @@ func (mv *MockBlockValidation) BlockFound(ctx context.Context, blockHash *chainh
 	return nil
 }
 
-func (mv *MockBlockValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32) error {
+func (mv *MockBlockValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32, checkpointCertified ...bool) error {
 	return nil
 }
 

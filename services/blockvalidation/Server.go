@@ -1327,7 +1327,7 @@ func (u *Server) ProcessBlock(ctx context.Context, request *blockvalidation_api.
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("invalid base URL", err))
 	}
 
-	if err = u.processBlockFound(ctx, block.Header.Hash(), request.PeerId, baseURL, block); err != nil {
+	if err = u.processBlockFound(ctx, block.Header.Hash(), request.PeerId, baseURL, request.CheckpointCertified, block); err != nil {
 		// error from processBlockFound is already wrapped
 		return nil, errors.WrapGRPC(err)
 	}
@@ -1384,7 +1384,9 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 
 	// Create meta regenerator for potential meta file recovery (no peer URL for gRPC, local store only)
 	metaRegenerator := u.blockValidation.createMetaRegenerator(nil)
-	block.SetCheckpointConfirmedAncestor(u.blockValidation.checkpointConfirmedAncestor(ctx, block))
+	// The ValidateBlockRequest RPC (direct/testing path) carries no checkpoint-certified
+	// trust signal — only ProcessBlockRequest (legacy netsync) does.
+	block.SetCheckpointConfirmedAncestor(u.blockValidation.checkpointConfirmedAncestor(ctx, block, false))
 	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 		// Transient catchup-state (e.g. parent tx not yet in our store) must not be
 		// reported as a consensus failure to the caller. See issue #1031.
@@ -1412,10 +1414,13 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 //   - ctx: Context for tracing and operation management
 //   - hash: Hash of the block to process
 //   - baseURL: Base URL for block retrieval operations
+//   - checkpointCertified: the in-process legacy netsync trust signal (from
+//     ProcessBlockRequest.CheckpointCertified); false for every other caller of this
+//     method (BlockFound / catchup retries have no such signal)
 //   - useBlock: Optional pre-loaded block to avoid retrieval (variadic parameter)
 //
 // Returns an error if block processing, validation, or dependency management fails
-func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, peerID, baseURL string, useBlock ...*model.Block) error {
+func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, peerID, baseURL string, checkpointCertified bool, useBlock ...*model.Block) error {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "processBlockFound",
 		tracing.WithParentStat(u.stats),
 		tracing.WithHistogram(prometheusBlockValidationProcessBlockFound),
@@ -1491,6 +1496,7 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 		DisableOptimisticMining: baseURL == "legacy",
 		IsRevalidation:          false, // processBlockFound is for new blocks, not revalidation
 		PeerID:                  peerID,
+		CheckpointCertified:     checkpointCertified,
 	}
 
 	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, baseURL, opts)
@@ -2152,8 +2158,10 @@ func (u *Server) processBlockWithPriority(ctx context.Context, blockFound proces
 		}
 	}
 
-	// Try to process with the primary source
-	err := u.processBlockFound(ctx, blockFound.hash, blockFound.peerID, blockFound.baseURL)
+	// Try to process with the primary source. This is the BlockFound (p2p-announced)
+	// flow, not the legacy netsync ProcessBlock RPC, so there is no checkpoint-certified
+	// trust signal to carry here.
+	err := u.processBlockFound(ctx, blockFound.hash, blockFound.peerID, blockFound.baseURL, false)
 
 	// If fetch failed and it's not a validation error, try alternative sources
 	if err != nil && (errors.IsNetworkError(err) || errors.IsMaliciousResponseError(err)) {
@@ -2170,7 +2178,7 @@ func (u *Server) processBlockWithPriority(ctx context.Context, blockFound proces
 			u.logger.Infof("[processBlockWithPriority] Trying alternative source for block %s from %s (peer: %s)", blockFound.hash.String(), alternative.baseURL, alternative.peerID)
 
 			// Try with alternative source
-			altErr := u.processBlockFound(ctx, alternative.hash, alternative.peerID, alternative.baseURL)
+			altErr := u.processBlockFound(ctx, alternative.hash, alternative.peerID, alternative.baseURL, false)
 			if altErr == nil {
 				// Success with alternative source
 				return nil

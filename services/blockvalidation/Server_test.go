@@ -418,7 +418,7 @@ func Test_Server_processBlockFound(t *testing.T) {
 	s := New(ulogger.TestLogger{}, tSettings, nil, txStore, utxoStore, nil, blockchainClient, kafkaConsumerClient, nil, nil)
 	s.blockValidation = NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, blockchainClient, subtreeStore, txStore, utxoStore, nil, nil)
 
-	err = s.processBlockFound(context.Background(), block.Hash(), "", "legacy", block)
+	err = s.processBlockFound(context.Background(), block.Hash(), "", "legacy", false, block)
 	require.NoError(t, err)
 }
 

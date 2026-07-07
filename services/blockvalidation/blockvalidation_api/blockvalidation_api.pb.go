@@ -191,14 +191,19 @@ func (x *BlockFoundRequest) GetPeerId() string {
 
 // swagger:model ProcessBlockRequest
 type ProcessBlockRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Block         []byte                 `protobuf:"bytes,1,opt,name=block,proto3" json:"block,omitempty"`
-	Height        uint32                 `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
-	BaseUrl       string                 `protobuf:"bytes,3,opt,name=base_url,json=baseUrl,proto3" json:"base_url,omitempty"`
-	PeerId        string                 `protobuf:"bytes,4,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`     // P2P peer identifier for peer tracking via P2P service
-	BlockId       uint32                 `protobuf:"varint,5,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"` // Pre-assigned block ID from legacy netsync (0 = not pre-assigned, blockchain will auto-assign)
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Block   []byte                 `protobuf:"bytes,1,opt,name=block,proto3" json:"block,omitempty"`
+	Height  uint32                 `protobuf:"varint,2,opt,name=height,proto3" json:"height,omitempty"`
+	BaseUrl string                 `protobuf:"bytes,3,opt,name=base_url,json=baseUrl,proto3" json:"base_url,omitempty"`
+	PeerId  string                 `protobuf:"bytes,4,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`     // P2P peer identifier for peer tracking via P2P service
+	BlockId uint32                 `protobuf:"varint,5,opt,name=block_id,json=blockId,proto3" json:"block_id,omitempty"` // Pre-assigned block ID from legacy netsync (0 = not pre-assigned, blockchain will auto-assign)
+	// Set only by the in-process legacy netsync when the block was delivered through a
+	// headers-first segment whose terminal header matched a hardcoded checkpoint (peer
+	// disconnected otherwise). Trusted at the same level as peer_id — this API is
+	// service-mesh internal.
+	CheckpointCertified bool `protobuf:"varint,6,opt,name=checkpoint_certified,json=checkpointCertified,proto3" json:"checkpoint_certified,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ProcessBlockRequest) Reset() {
@@ -264,6 +269,13 @@ func (x *ProcessBlockRequest) GetBlockId() uint32 {
 		return x.BlockId
 	}
 	return 0
+}
+
+func (x *ProcessBlockRequest) GetCheckpointCertified() bool {
+	if x != nil {
+		return x.CheckpointCertified
+	}
+	return false
 }
 
 // swagger:model ValidateBlockRequest
@@ -705,13 +717,14 @@ const file_services_blockvalidation_blockvalidation_api_blockvalidation_api_prot
 	"\x04hash\x18\x01 \x01(\fR\x04hash\x12\x19\n" +
 	"\bbase_url\x18\x02 \x01(\tR\abaseUrl\x12(\n" +
 	"\x10wait_to_complete\x18\x03 \x01(\bR\x0ewaitToComplete\x12\x17\n" +
-	"\apeer_id\x18\x04 \x01(\tR\x06peerId\"\x92\x01\n" +
+	"\apeer_id\x18\x04 \x01(\tR\x06peerId\"\xc5\x01\n" +
 	"\x13ProcessBlockRequest\x12\x14\n" +
 	"\x05block\x18\x01 \x01(\fR\x05block\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\rR\x06height\x12\x19\n" +
 	"\bbase_url\x18\x03 \x01(\tR\abaseUrl\x12\x17\n" +
 	"\apeer_id\x18\x04 \x01(\tR\x06peerId\x12\x19\n" +
-	"\bblock_id\x18\x05 \x01(\rR\ablockId\"m\n" +
+	"\bblock_id\x18\x05 \x01(\rR\ablockId\x121\n" +
+	"\x14checkpoint_certified\x18\x06 \x01(\bR\x13checkpointCertified\"m\n" +
 	"\x14ValidateBlockRequest\x12\x14\n" +
 	"\x05block\x18\x01 \x01(\fR\x05block\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\rR\x06height\x12'\n" +

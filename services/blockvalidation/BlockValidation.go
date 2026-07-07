@@ -77,6 +77,13 @@ type ValidateBlockOptions struct {
 	// PeerID is the P2P peer identifier used for reputation tracking.
 	// This is used to track peer behavior during subtree validation.
 	PeerID string
+
+	// CheckpointCertified carries the in-process legacy netsync trust signal (from
+	// ProcessBlockRequest.CheckpointCertified) into the checkpointConfirmedAncestor
+	// predicate that gates the below-checkpoint coinbase no-inflation skip. Default
+	// false everywhere except the legacy ProcessBlock RPC handler; see
+	// BlockValidation.checkpointConfirmedAncestor.
+	CheckpointCertified bool
 }
 
 // validationResult holds the result of a block validation for sharing between goroutines
@@ -1645,7 +1652,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 				// Create meta regenerator with peer URL for potential meta file recovery
 				metaRegenerator := u.createMetaRegenerator([]string{baseURL})
-				block.SetCheckpointConfirmedAncestor(u.checkpointConfirmedAncestor(decoupledCtx, block))
+				block.SetCheckpointConfirmedAncestor(u.checkpointConfirmedAncestor(decoupledCtx, block, opts.CheckpointCertified))
 				if ok, err := block.Valid(decoupledCtx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 					u.logger.Errorf("[ValidateBlock][%s] InvalidateBlock block is not valid in background: %v", block.String(), err)
 
@@ -1744,7 +1751,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 			// Create meta regenerator with peer URL for potential meta file recovery
 			metaRegenerator := u.createMetaRegenerator([]string{baseURL})
-			block.SetCheckpointConfirmedAncestor(u.checkpointConfirmedAncestor(ctx, block))
+			block.SetCheckpointConfirmedAncestor(u.checkpointConfirmedAncestor(ctx, block, opts.CheckpointCertified))
 			if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 				reason := "unknown"
 				if err != nil {
@@ -2066,13 +2073,28 @@ func (u *BlockValidation) ReValidateBlock(block *model.Block, baseURL string) {
 // the main-chain block at its own height (a detached fork reconsidered via
 // reconsiderblock). Fail-safe: any lookup error or ambiguity yields false, so the
 // no-inflation check runs — correct, because non-fast-path blocks carry real fees.
-func (u *BlockValidation) checkpointConfirmedAncestor(ctx context.Context, b *model.Block) bool {
+//
+// certified is the in-process legacy netsync trust signal (ValidateBlockOptions.
+// CheckpointCertified, ultimately ProcessBlockRequest.CheckpointCertified): when true
+// it short-circuits the blockchain-state lookups below and returns true directly,
+// because netsync's headers-first proof (terminal header matched a hardcoded
+// checkpoint) already establishes ancestry without needing the checkpoint HEADER to
+// exist in the blockchain store yet — the gap that made this predicate otherwise
+// unsatisfiable during from-genesis legacy IBD. It is always subject to the same
+// store-support gate as the non-certified path (checked first, below).
+func (u *BlockValidation) checkpointConfirmedAncestor(ctx context.Context, b *model.Block, certified bool) bool {
 	// The below-checkpoint no-inflation skip requires store fast-path support too, so the
 	// ancestry predicate cannot change the outcome on a store that never produces fee=0
 	// blocks. Short-circuit before any blockchain lookup on such stores (Aerospike, the
-	// unconfigured default, and most unit-test mocks).
+	// unconfigured default, and most unit-test mocks). This also gates the certified
+	// fast-path immediately below: an uncertified caller and a certified one on an
+	// unsupported store both get full enforcement.
 	if u.utxoStore == nil || !u.utxoStore.SupportsOutpointOnlySpend() {
 		return false
+	}
+
+	if certified {
+		return true
 	}
 
 	checkpoints := u.settings.ChainCfgParams.Checkpoints
@@ -2180,7 +2202,9 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 
 	// Create meta regenerator with peer URL for potential meta file recovery during revalidation
 	metaRegenerator := u.createMetaRegenerator([]string{blockData.baseURL})
-	blockData.block.SetCheckpointConfirmedAncestor(u.checkpointConfirmedAncestor(ctx, blockData.block))
+	// reValidateBlock has no ValidateBlockOptions / ProcessBlockRequest to carry a
+	// checkpoint-certified trust signal, so it is never certified here.
+	blockData.block.SetCheckpointConfirmedAncestor(u.checkpointConfirmedAncestor(ctx, blockData.block, false))
 	if ok, err := blockData.block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 		u.logger.Errorf("[ReValidateBlock][%s] InvalidateBlock block is not valid in background: %v", blockData.block.String(), err)
 

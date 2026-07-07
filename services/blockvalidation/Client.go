@@ -162,20 +162,26 @@ func (s *Client) BlockFound(ctx context.Context, blockHash *chainhash.Hash, base
 //   - ctx: Context for the processing operation
 //   - block: Complete block data to validate
 //   - blockHeight: Expected chain height for the block
+//   - checkpointCertified: optional (default false); set only by the in-process legacy
+//     netsync when the block was delivered through a headers-first segment whose terminal
+//     header matched a hardcoded checkpoint. Trusted at the same level as peerID.
 //
 // Returns an error if block processing fails
-func (s *Client) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32) error {
+func (s *Client) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32, checkpointCertified ...bool) error {
 	blockBytes, err := block.Bytes()
 	if err != nil {
 		return err
 	}
 
+	certified := len(checkpointCertified) > 0 && checkpointCertified[0]
+
 	req := &blockvalidation_api.ProcessBlockRequest{
-		Block:   blockBytes,
-		Height:  blockHeight,
-		PeerId:  peerID,
-		BaseUrl: baseURL,
-		BlockId: blockID,
+		Block:               blockBytes,
+		Height:              blockHeight,
+		PeerId:              peerID,
+		BaseUrl:             baseURL,
+		BlockId:             blockID,
+		CheckpointCertified: certified,
 	}
 
 	_, err = s.apiClient.ProcessBlock(ctx, req)
