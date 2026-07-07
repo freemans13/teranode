@@ -738,10 +738,13 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 	return false
 }
 
-// Unspend reverses a previous spend by deleting the owning spend rows and clearing
-// the now-invalid deferred-prune stamp on the affected parents — all in ONE
-// transaction so a reorg never observes a torn state (some outputs unspent while the
-// parent still carries a stale delete_at_height the pruner could act on).
+// Unspend reverses a previous spend by deleting the owning spend rows, clearing the
+// corresponding spent_bits bits and the now-invalid deferred-prune stamp on the
+// affected parents, and enqueueing those parents onto the dah_dirty_parents heal
+// queue — all in ONE transaction so a reorg never observes a torn state (some
+// outputs unspent while the parent still carries a stale delete_at_height the
+// pruner could act on, or a cleared bit with no queued heal for the fold's
+// stale-snapshot race).
 //
 // Ownership (matches the aerospike and sql stores): a spend row is removed only when
 // the caller's SpendingData token equals the stored spender. A non-owning caller — a
@@ -777,62 +780,113 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 
 	parentSet := make(map[chainhash.Hash]struct{}, len(spends))
 
+	// One bulk statement for the whole batch: a batch touching the same parent
+	// folds all its clears into a SINGLE per-parent mask (GROUP BY parent), so
+	// the txs row is written once instead of once per input.
+	prevTxHashes := make([][]byte, 0, len(spends))
+	prevIdxs := make([]int32, 0, len(spends))
+	spendingDatas := make([][]byte, 0, len(spends))
+
 	for _, spend := range spends {
 		if spend == nil {
 			continue
 		}
-		// Ownership-checked delete: the spending_data predicate ensures only this
-		// caller's spend row is removed. A mismatching (non-owning) caller deletes
-		// 0 rows — intentional — but still drives the parent's DAH housekeeping.
-		//
-		// Setter-C reconcile (Task 7): the delete must DECREMENT the parent's
-		// spent_progress counter by exactly the number of OWNED, SPENDABLE spend
-		// rows it actually removed. The DELETE ... RETURNING yields (prev_tx_hash,
-		// prev_output_idx) for the row(s) removed (0 rows for a non-owning no-op, so
-		// no decrement — over-decrement would cause premature pruning / live-UTXO
-		// loss). The removed outpoint is joined back to txs.out_count / out_spendables
-		// so ONLY a spendable output contributes to the decrement, mirroring EXACTLY
-		// the spendable-output filter the fold-forward sweep proc (dah_sweep_proc.go)
-		// used when it INCREMENTED the counter. A non-spendable outpoint (never
-		// folded) therefore never decrements — under-decrement (leak) is likewise
-		// avoided. GREATEST(spent_progress - n, 0) floors at 0 defensively so a
-		// double-Unspend can never drive the counter negative.
-		//
-		// last_spend_height is deliberately LEFT UNCHANGED here (see the Unspend doc
-		// comment): it only ever raises the completion height, the stamp is re-gated
-		// by spent_progress = spendable_count, so a stale-high value on a
-		// no-longer-fully-spent tx is harmless (delete_at_height is cleared below and
-		// cannot re-stamp until the counter re-completes, at which point the fold
-		// re-advances last_spend_height via GREATEST to the new spend height).
-		var n int
-		err := pgxTx.QueryRow(ctx, `
-			WITH del AS (
-				DELETE FROM spends
-				WHERE prev_tx_hash = $1 AND prev_output_idx = $2 AND spending_data = $3
-				RETURNING prev_tx_hash, prev_output_idx
-			),
-			spendable AS (
-				SELECT count(*) AS n
-				FROM del d
-				JOIN txs t ON t.hash = d.prev_tx_hash
-				WHERE d.prev_output_idx < t.out_count
-				  AND t.out_spendables IS NOT NULL
-				  AND get_bit(t.out_spendables, d.prev_output_idx) = 1
-			),
-			upd AS (
-				UPDATE txs t
-				   SET spent_progress = GREATEST(t.spent_progress - (SELECT n FROM spendable), 0)
-				  FROM spendable s
-				 WHERE t.hash = $1 AND s.n > 0
-			)
-			SELECT COALESCE((SELECT n FROM spendable), 0)`,
-			spend.TxID[:], int32(spend.Vout), spend.SpendingData.Bytes(),
-		).Scan(&n)
-		if err != nil {
-			return errors.NewStorageError("[Unspend] failed for %s:%d", spend.TxID, spend.Vout, err)
-		}
+		prevTxHashes = append(prevTxHashes, spend.TxID[:])
+		prevIdxs = append(prevIdxs, int32(spend.Vout)) // INT4; range-checked above
+		spendingDatas = append(spendingDatas, spend.SpendingData.Bytes())
 		if spend.TxID != nil {
 			parentSet[*spend.TxID] = struct{}{}
+		}
+	}
+
+	// Ownership-checked delete + bitmap clear: the spending_data predicate ensures
+	// only this caller's spend rows are removed. A mismatching (non-owning) caller
+	// deletes 0 rows — intentional — but its parent still drives the DAH
+	// housekeeping below.
+	//
+	// Setter-C reconcile (spent-bitmap, proc v15): the delete must CLEAR the
+	// parent's spent_bits bits for exactly the OWNED, SPENDABLE spend rows it
+	// actually removed — the inverse of the fold's OR. The DELETE ... RETURNING
+	// yields (prev_tx_hash, prev_output_idx) per removed row (0 rows for a
+	// non-owning no-op, so no clear); the outpoint is joined back to
+	// txs.out_count / out_spendables so ONLY a spendable output contributes,
+	// mirroring EXACTLY the spendable filter the fold-forward sweep proc
+	// (dah_sweep_proc.go) applies when it SETS bits. That keeps the subset
+	// invariant (spent_bits ⊆ out_spendables) in both directions. Unlike the old
+	// arithmetic counter this needs no defensive floor: clearing a bit that was
+	// never set (spend never folded, or a double-Unspend replay) is naturally a
+	// no-op — AND NOT of a zero bit changes nothing, by construction.
+	//
+	// Mask build is byte-wise and SET-WISE (PG has no |/& on bytea): byte_agg
+	// bit_or's per (parent, byte index) with the LSB-first get_bit encoding
+	// (byte i/8, bit 1<<(i%8) — same as out_spendables); mask_agg zero-fills gap
+	// bytes via LATERAL generate_series + LEFT JOIN (never a correlated subquery
+	// per parent). The clear ANDs the complement in over the parent's OWN
+	// spent_bits width — a mask byte beyond that width can only cover never-set
+	// bits, so ignoring it is the required no-op; the mask get_byte is
+	// bounds-guarded (mask may be narrower too) and COALESCE keeps spent_bits
+	// unchanged when the series is empty (octet_length 0) so the NOT NULL column
+	// can never be written NULL.
+	//
+	// last_spend_height is deliberately LEFT UNCHANGED (see the Unspend doc
+	// comment): it only ever raises the completion height and the stamp is
+	// re-gated by bit_count(spent_bits) = spendable_count, so a stale-high value
+	// on a no-longer-fully-spent tx is harmless (delete_at_height is cleared
+	// below and cannot re-stamp until the bitmap re-completes, at which point
+	// the fold re-advances last_spend_height via GREATEST).
+	if len(prevTxHashes) > 0 {
+		if _, err := pgxTx.Exec(ctx, `
+			WITH items AS (
+				SELECT unnest($1::bytea[]) AS prev_tx_hash,
+				       unnest($2::int[])   AS prev_idx,
+				       unnest($3::bytea[]) AS spending_data
+			),
+			del AS (
+				DELETE FROM spends s
+				 USING items i
+				 WHERE s.prev_tx_hash = i.prev_tx_hash
+				   AND s.prev_output_idx = i.prev_idx
+				   AND s.spending_data = i.spending_data
+				RETURNING s.prev_tx_hash, s.prev_output_idx
+			),
+			spendable AS (
+				SELECT d.prev_tx_hash AS hash, d.prev_output_idx AS idx
+				  FROM del d
+				  JOIN txs t ON t.hash = d.prev_tx_hash
+				 WHERE d.prev_output_idx < t.out_count
+				   AND t.out_spendables IS NOT NULL
+				   AND get_bit(t.out_spendables, d.prev_output_idx) = 1
+			),
+			byte_agg AS (
+				SELECT hash, idx / 8 AS byte_idx, bit_or(1 << (idx % 8)) AS byte_val
+				  FROM spendable
+				 GROUP BY hash, idx / 8
+			),
+			mask_agg AS (
+				SELECT hb.hash,
+				       decode(string_agg(lpad(to_hex(COALESCE(ba.byte_val, 0)), 2, '0'), '' ORDER BY gs.i), 'hex') AS mask
+				  FROM (SELECT hash, max(byte_idx) AS max_byte FROM byte_agg GROUP BY hash) hb
+				 CROSS JOIN LATERAL generate_series(0, hb.max_byte) gs(i)
+				  LEFT JOIN byte_agg ba ON ba.hash = hb.hash AND ba.byte_idx = gs.i
+				 GROUP BY hb.hash
+			)
+			UPDATE txs t
+			   SET spent_bits = COALESCE((
+			       -- spent_bits AND NOT mask, byte-wise. The series spans t.spent_bits'
+			       -- own width, so its get_byte is in-bounds by construction; 255 # x
+			       -- complements within the byte. Empty series → NULL → COALESCE keeps
+			       -- the current value.
+			       SELECT decode(string_agg(lpad(to_hex(
+			                  get_byte(t.spent_bits, gi.i)
+			                & (255 # CASE WHEN gi.i < octet_length(m.mask) THEN get_byte(m.mask, gi.i) ELSE 0 END)
+			              ), 2, '0'), '' ORDER BY gi.i), 'hex')
+			         FROM generate_series(0, octet_length(t.spent_bits) - 1) gi(i)
+			       ), t.spent_bits)
+			  FROM mask_agg m
+			 WHERE t.hash = m.hash`,
+			prevTxHashes, prevIdxs, spendingDatas,
+		); err != nil {
+			return errors.NewStorageError("[Unspend] bulk delete+clear failed", err)
 		}
 	}
 
@@ -840,9 +894,9 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 	// carry is now invalid. Clear it in the SAME transaction as the spend deletion
 	// (the reorg-clear) so the pruner can never see a deleted-spend / stale-DAH
 	// torn state. Housekeeping runs for every affected parent, including the
-	// non-owning no-op deletes above. (The spent_progress decrement above is
-	// per-spend; this DAH clear is per-parent — a parent with a partly-decremented
-	// counter is no longer fully spent, so clearing its stamp is always correct.)
+	// non-owning no-op deletes above. (The spent_bits clear above is per removed
+	// spend row; this DAH clear is per-parent — a parent with a partly-cleared
+	// bitmap is no longer fully spent, so clearing its stamp is always correct.)
 	if len(parentSet) > 0 {
 		parentHashes := make([][]byte, 0, len(parentSet))
 		for h := range parentSet {
@@ -864,6 +918,27 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 			`DELETE FROM pending_deletes WHERE hash = ANY($1)`, parentHashes,
 		); err != nil {
 			return errors.NewStorageError("[Unspend] failed to delete pending_deletes (C6)", err)
+		}
+
+		// Dirty-parents heal queue: a concurrent fold whose band snapshot predates
+		// this transaction's commit can re-set a just-cleared bit from that stale
+		// snapshot (the one residual v15 hazard — see dah_sweep_proc.go). Enqueue
+		// every affected parent IN THE SAME TRANSACTION so the reconciler
+		// (dah_reconcile.go) recomputes spent_bits from spends with a fresh
+		// snapshot within ~one tick. The partition number is the txs_pNN leaf the
+		// row lives in — PG's hash routing is not reproducible client-side, so it
+		// is recovered from the row's tableoid (leaf name suffix, same lpad-2
+		// naming as the sweep proc). A parent with no txs row has nothing to heal
+		// and drops out of the join; ON CONFLICT DO NOTHING keeps re-enqueues of a
+		// still-queued parent idempotent.
+		if _, err := pgxTx.Exec(ctx, `
+			INSERT INTO dah_dirty_parents (hash, partition)
+			SELECT t.hash, right(t.tableoid::regclass::text, 2)::int
+			  FROM txs t
+			 WHERE t.hash = ANY($1)
+			ON CONFLICT (hash) DO NOTHING`, parentHashes,
+		); err != nil {
+			return errors.NewStorageError("[Unspend] failed to enqueue dah_dirty_parents", err)
 		}
 
 		// If requested, lock the parents within the same transaction. SetLocked(true)

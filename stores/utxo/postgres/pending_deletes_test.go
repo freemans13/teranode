@@ -696,10 +696,10 @@ func TestPendingDeletes_MineTimeNotFullySpent(t *testing.T) {
 // GREATEST(last_spend_height, minedHeight) + 1 + retention. When the tx is mined
 // much later than it was spent, DAH must derive from minedHeight (the larger value).
 //
-// Setter-C reconcile (Task 7): the mine-time stamp reads the maintained spent_progress
-// counter (folded by the sweep), so the spends must be folded first — runSweepOnly does
+// Setter-C reconcile (proc v15): the mine-time stamp reads the maintained spent_bits
+// bitmap (folded by the sweep), so the spends must be folded first — runSweepOnly does
 // that while the tx is unmined (proc folds but does not stamp — mined gate). The mine
-// then stamps via the counter at GREATEST(last_spend_height, minedHeight)+1+retention.
+// then stamps via the bitmap at GREATEST(last_spend_height, minedHeight)+1+retention.
 func TestPendingDeletes_MineTimeCompletionHeightUsesGreatest(t *testing.T) {
 	st := newTestStoreWithFlag(t, true)
 
@@ -707,7 +707,7 @@ func TestPendingDeletes_MineTimeCompletionHeightUsesGreatest(t *testing.T) {
 	p := *pTx.TxIDChainHash()
 
 	spendAllOutputs(t, st, pTx, 50) // spend at height 50
-	runSweepOnly(t, st)             // fold spent_progress -> spendable_count while unmined
+	runSweepOnly(t, st)             // fold spent_bits to the full bitmap while unmined
 
 	const minedHeight = uint32(5000) // mine much later than spend (GREATEST picks minedHeight)
 	mineOnLongestChain(t, st, p, minedHeight)
@@ -750,10 +750,10 @@ func TestPendingDeletes_PruneEquivalenceNoBackstop(t *testing.T) {
 	)
 
 	// Build 5 doomed parents: spent-while-unmined, then mined (S6 path).
-	// Setter-C reconcile (Task 7): the mine-time stamp reads the maintained
-	// spent_progress counter, so the spends are folded by a sweep (while the parents
+	// Setter-C reconcile (proc v15): the mine-time stamp reads the maintained
+	// spent_bits bitmap, so the spends are folded by a sweep (while the parents
 	// are still unmined — proc folds but does not stamp, mined gate) BEFORE mining.
-	// The mine then stamps each doomed parent via the counter at
+	// The mine then stamps each doomed parent via the bitmap at
 	// GREATEST(last_spend_height, mineHeight)+1+retention <= pruneHeight. No backstop.
 	doomedTxs := make([]*bt.Tx, 0, 5)
 	var doomed [][]byte
@@ -765,8 +765,8 @@ func TestPendingDeletes_PruneEquivalenceNoBackstop(t *testing.T) {
 		doomed = append(doomed, p[:])
 	}
 
-	// Fold spent_progress for all doomed parents via one sweep (they are still unmined,
-	// so the proc folds the counter but stamps nothing — the mined gate holds).
+	// Fold spent_bits for all doomed parents via one sweep (they are still unmined,
+	// so the proc folds the bitmap but stamps nothing — the mined gate holds).
 	require.NoError(t, st.SetBlockHeight(spendHeight+5))
 	_, err := procSweepUpTo(st, ctx, int64(spendHeight+5))
 	require.NoError(t, err)
