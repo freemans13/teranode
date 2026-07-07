@@ -78,7 +78,38 @@ import (
 // the procedure. The only remaining "timeout" is the stagnation monitor
 // (dah_stagnation.go): watermark frozen + backlog > 0 → Warnf → Errorf + gauge.
 // It cancels nothing; a human decides. See TUNING.md "Execution model (v14)".
-const dahSweepProcVersion = 14
+//
+// Bumped 14→15: idempotent spent-bitmap fold; the stamp-time ground-truth
+// recount is DELETED. v13's recount was the O(lifetime-spends) cost class
+// reintroduced at stamp time: ~K random COLD heap reads per completing parent
+// (spends are append-ordered by time while prev_tx_hash is random — a parent
+// spent over years has K rows on ~K distinct pages), re-fired on EVERY later
+// band for counter-overshoot parents. On mainnet it could not keep pace with
+// IBD (2026-07-07 disk-full incident: watermarks froze hours BEFORE the disk
+// filled). The recount existed only because the arithmetic spent_progress
+// counter drifts; v15 replaces the counter with a per-output spent bitmap
+// (txs.spent_bits) whose fold is idempotent by construction — OR-ing the same
+// spend's bit twice is a no-op, so every counter-drift class (reorg
+// watermark-rewind re-fold, reconciler double-cover, Unspend of never-folded
+// spends) is structurally harmless — and the stamp gate becomes a single-row
+// check: bit_count(spent_bits) = spendable_count. No spends-history read
+// exists anywhere in the stamp path. The one residual hazard (a fold statement
+// whose band snapshot predates a concurrent Unspend commit can re-set a
+// just-cleared bit) is healed within ~one reconcile tick via the
+// dah_dirty_parents queue Unspend populates transactionally.
+//
+// v15 also re-quantises bands by WORK, not heights: the fold source is capped
+// at band_rows spends (ORDER BY spent_at_height LIMIT band_rows) and the
+// watermark advances to the last FULLY-covered height (max_h - 1), re-folding
+// the boundary height next band — legal only because duplicate ORs are free.
+// A single height holding >= band_rows spends alone is full-drained as one
+// band (bounded overshoot of one block). This kills the dense-region
+// multi-hour, temp-spilling folds (band_heights=5000 could mean millions of
+// rows); work_mem for the fold is pinned per band from the work_mem_mb knob.
+// The watermark advance is a CAS (WHERE last_swept_height = v_from): a
+// concurrent reorg rewind mid-CALL rolls the band back and ends the CALL so
+// the rewound range is always re-folded.
+const dahSweepProcVersion = 15
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaInternal (plain DDL);
@@ -104,7 +135,16 @@ CREATE TABLE IF NOT EXISTS dah_sweep_control (
 );
 -- band_heights was added in proc v11 (fold-forward). Idempotent ALTER so existing
 -- DBs get the column without a manual migration.
-ALTER TABLE dah_sweep_control ADD COLUMN IF NOT EXISTS band_heights INT NOT NULL DEFAULT 5000;`
+ALTER TABLE dah_sweep_control ADD COLUMN IF NOT EXISTS band_heights INT NOT NULL DEFAULT 5000;
+-- band_rows (v15): the band work quantum in SPEND ROWS — the fold source is
+-- capped at this many spends per band regardless of chain density. band_heights
+-- becomes the max-heights cap for sparse regions.
+ALTER TABLE dah_sweep_control ADD COLUMN IF NOT EXISTS band_rows INT NOT NULL DEFAULT 200000;
+-- work_mem_mb (v15): per-band SET LOCAL work_mem for the fold aggregation, so a
+-- band sorts/hashes in memory instead of spilling to pgsql_tmp (the first
+-- ENOSPC casualty in the 2026-07-01 and 07-07 incidents). Safe to raise: the
+-- maintenance pool bounds how many CALLs run concurrently.
+ALTER TABLE dah_sweep_control ADD COLUMN IF NOT EXISTS work_mem_mb INT NOT NULL DEFAULT 256;`
 
 // dahSweepProcDDL returns the server-side self-committing DAH stamp procedure DDL.
 // It reproduces the exact DAH semantics of the in-process Go sweep
@@ -119,51 +159,53 @@ func dahSweepProcDDL() string {
 	return dahSweepProcDDLWithPendingDeletes
 }
 
-// dahSweepProcDDLWithPendingDeletes is the fold-forward (v14) DAH sweep procedure.
+// dahSweepProcDDLWithPendingDeletes is the spent-bitmap fold (v15) DAH sweep
+// procedure.
 //
 // v11 replaced v10's full-range re-aggregation with a forward-only fold. v12
-// merges v11's two per-band txs writes (fold + stamp) into one UPDATE ... RETURNING
-// so the hot txs table is written once per folded tx and the band is scanned once.
-// v13 authorises the stamp from a ground-truth spends recount rather than the
-// (drift-prone) counter. v14 drops in-proc lock_timeout; locks are waited on
-// indefinitely by design (stall visibility is the Go-side stagnation monitor's job).
-// Per bounded height band (v_band heights, from dah_sweep_control.band_heights) it:
+// merged fold + stamp into one UPDATE ... RETURNING. v13 added a stamp-time
+// ground-truth recount (drift-prone counter). v14 dropped in-proc lock_timeout.
+// v15 replaces the counter with the idempotent spent_bits bitmap and DELETES the
+// recount — no spends-history read exists anywhere in this procedure. Per band:
 //
-//  1. FOLDS the band's NEW spends ONLY — aggregates spends_pNN over
-//     (v_from, v_to] grouped by prev_tx_hash, counting SPENDABLE-output spends,
-//     and increments each parent's spent_progress by that count and advances
-//     last_spend_height. This reads only the band's rows (O(new spends in band)),
-//     NEVER a parent's whole spend history — the key change that lets the sweep
-//     keep up with IBD.
-//  2. STAMPS, in the SAME UPDATE, the parents whose fold just completed. The counter
-//     gate (t.spent_progress + d.n >= spendable_count > 0), mined_at_height IS NOT
-//     NULL, delete_at_height IS NULL, preserve_until IS NULL, unmined_since IS NULL
-//     short-circuits a GROUND-TRUTH recount of the tx's spendable spends (bounded by
-//     the band ceiling); delete_at_height is stamped ONLY when that recount equals
-//     spendable_count, so a counter drifted above spendable_count can never stamp a
-//     not-fully-spent tx. delete_at_height = GREATEST(new last_spend_height,
-//     mined_at_height) + 1 + retention. Every freshly stamped row (RETURNING
-//     delete_at_height IS NOT NULL) is upserted into pending_deletes_pNN in the same
-//     statement. A parent stamped in a PRIOR band that is folded again keeps its old
-//     delete_at_height (delete_at_height IS NULL guard in the CASE); the ON CONFLICT
-//     upsert then just re-writes the unchanged value — harmless.
-//  3. ADVANCES dah_part_watermark to v_to and COMMITs — fold + stamp + advance are
-//     ONE transaction per band, so a torn commit never double-folds.
+//  1. BAND SOURCE (work-quantised): the band is the next band_rows spends above
+//     the watermark (ORDER BY spent_at_height LIMIT band_rows), capped at
+//     band_heights heights for sparse regions. O(new spends in band) with a
+//     row-bounded constant, regardless of chain density.
+//  2. FOLD + STAMP in ONE UPDATE: aggregate the band's SPENDABLE spends into a
+//     per-parent byte mask (byte i/8 gets bit 1<<(i%8) — the same LSB-first
+//     encoding as out_spendables/get_bit), OR it into txs.spent_bits with a
+//     multi-column SET row-subquery (the OR is evaluated once), advance
+//     last_spend_height, and stamp delete_at_height inline when
+//     bit_count(new_bits) = spendable_count AND mined_at_height IS NOT NULL AND
+//     delete_at_height IS NULL AND preserve_until IS NULL AND unmined_since IS
+//     NULL. delete_at_height = GREATEST(new last_spend_height, mined_at_height)
+//     + 1 + retention. Every freshly stamped row is upserted into
+//     pending_deletes_pNN in the same statement. A parent stamped in a PRIOR
+//     band keeps its stamp (delete_at_height IS NULL guard); its pending_deletes
+//     re-upsert rewrites the unchanged value — harmless. Duplicate folds are
+//     no-ops by construction (OR), so re-processing after a watermark rewind or
+//     a boundary-height re-fold cannot drift anything.
+//  3. ADVANCE the watermark with a CAS (WHERE last_swept_height = v_from): if
+//     the band was row-truncated the advance target is max_h - 1 (the boundary
+//     height re-folds next band); a single height holding >= band_rows spends
+//     alone is re-run as one full height (bounded overshoot of one block). A
+//     CAS miss means a reorg rewound the watermark mid-CALL: the band ROLLS
+//     BACK and the CALL exits so the next CALL restarts from the rewound
+//     height. Fold + stamp + advance are ONE transaction per band.
 //
-// The loop runs at most v_max_bands (dah_sweep_control.max_windows_per_call) bands
-// per CALL, so per-CALL work is bounded; the background driver re-fires while the
-// backlog is positive.
+// The loop runs at most v_max_bands (dah_sweep_control.max_windows_per_call)
+// bands per CALL; work_mem is pinned per band from work_mem_mb so the fold
+// aggregation does not spill to pgsql_tmp at sane band sizes.
 //
-// Division of labour: a tx spent-before-mined has its spent_progress folded here
-// but is NOT stamped (mined gate) — the mine path (SetMinedMulti) stamps it on
-// mine, evaluating fully-spent directly from spends. The sweep only stamps the
-// mined-then-spent completion. A reorg that rewinds the watermark
-// (RewindDAHWatermark) BELOW already-folded heights makes this forward-only fold
-// RE-PROCESS still-present spends → spent_progress double-counts. That drift (and
-// any arithmetic/lost-update drift) is healed by the bounded reconciliation
-// backstop (dah_reconcile.go, Task 8), which is authoritative for the counter:
-// it recomputes the true spent_progress/last_spend_height from the spends table
-// over a rotating bounded slice per partition and corrects any divergence.
+// Division of labour: a tx spent-before-mined has its bits folded here but is
+// NOT stamped (mined gate) — the mine path (SetMinedMulti) stamps it at mine
+// from the same single-row bitmap gate. The sweep only stamps the
+// mined-then-spent completion. The dirty-parents queue (dah_dirty_parents,
+// populated transactionally by Unspend) plus the rotating rotating-slice audit
+// (dah_reconcile.go) heal the one residual stale-snapshot hazard and any
+// unforeseen bit corruption; the reconciler recomputes spent_bits from spends
+// over bounded slices and un-stamps wrong stamps.
 const dahSweepProcDDLWithPendingDeletes = `CREATE OR REPLACE PROCEDURE dah_sweep_batch(
     p_partition  INT,
     p_safe_tip   BIGINT,
@@ -174,16 +216,23 @@ AS $$
 DECLARE
     v_leaf_suffix    TEXT := lpad(p_partition::text, 2, '0');
     v_from           BIGINT;
+    v_cap            BIGINT;
     v_to             BIGINT;
     v_band           INT;
+    v_band_rows      INT;
+    v_work_mem_mb    INT;
     v_max_bands      INT;
     v_enabled        BOOLEAN;
     v_n              BIGINT;
+    v_rows           BIGINT;
+    v_max_h          BIGINT;
+    v_nolimit        INT := NULL;
     v_total_stamped  BIGINT := 0;
     v_bands_done     INT := 0;
+    v_sql            TEXT;
 BEGIN
-    SELECT enabled, band_heights, max_windows_per_call
-      INTO v_enabled, v_band, v_max_bands
+    SELECT enabled, band_heights, band_rows, work_mem_mb, max_windows_per_call
+      INTO v_enabled, v_band, v_band_rows, v_work_mem_mb, v_max_bands
       FROM dah_sweep_control WHERE id = 1;
 
     IF NOT v_enabled THEN
@@ -194,12 +243,16 @@ BEGIN
         v_band := 5000;
     END IF;
 
+    IF v_band_rows IS NULL OR v_band_rows <= 0 THEN
+        v_band_rows := 200000;
+    END IF;
+
     IF v_max_bands IS NULL OR v_max_bands <= 0 THEN
         v_max_bands := 8;
     END IF;
 
-    IF current_setting('server_version_num')::int < 110000 THEN
-        RAISE EXCEPTION 'dah_sweep_batch requires PostgreSQL 11+';
+    IF current_setting('server_version_num')::int < 140000 THEN
+        RAISE EXCEPTION 'dah_sweep_batch v15 requires PostgreSQL 14+ (bit_count on bytea)';
     END IF;
 
     SELECT last_swept_height INTO v_from
@@ -210,78 +263,67 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Fold forward one bounded band at a time. Each iteration processes ONLY the
-    -- band's new spends (O(new spends in band)) and commits atomically, so the
-    -- watermark always advances and per-CALL work is capped at v_max_bands bands.
-    WHILE v_from < p_safe_tip AND v_bands_done < v_max_bands LOOP
-        SELECT enabled INTO v_enabled FROM dah_sweep_control WHERE id = 1;
-        EXIT WHEN NOT v_enabled;
-
-        IF NOT pg_try_advisory_xact_lock(20240684 + p_partition) THEN
-            EXIT;
-        END IF;
-
-        v_to := LEAST(v_from + v_band, p_safe_tip);
-
-        -- (1+2) FOLD + STAMP in ONE UPDATE: read ONLY this band's spends, increment
-        -- spent_progress and advance last_spend_height on each parent, and — in the
-        -- SAME write — stamp delete_at_height inline for parents whose NEW progress
-        -- (t.spent_progress + d.n) just reached spendable_count. This writes the hot
-        -- txs table once per folded tx and scans the band once. Spendable-output test
-        -- mirrors the v10 semantics (prev_output_idx < out_count AND get_bit=1).
-        --
-        -- The stamp uses the NEW last_spend_height inline
-        -- (GREATEST(COALESCE(t.last_spend_height,0), d.max_h)) because t.last_spend_height
-        -- in the UPDATE expression evaluates against the PRE-update row. The
-        -- delete_at_height IS NULL guard keeps a prior-band-stamped row's stamp; if
-        -- such a row is folded again its progress goes ABOVE spendable_count, so it is
-        -- excluded from the pending_deletes feed (= spendable_count) — no double-insert.
-        EXECUTE format($q$
-            WITH band_agg AS (
-                SELECT s.prev_tx_hash AS hash,
-                       count(*) FILTER (
-                           WHERE CASE WHEN s.prev_output_idx < t.out_count
-                                      THEN get_bit(t.out_spendables, s.prev_output_idx) = 1
-                                      ELSE false END
-                       ) AS n,
-                       max(s.spent_at_height) AS max_h
-                FROM spends_p%1$s s
-                JOIN txs_p%1$s t ON t.hash = s.prev_tx_hash
-                WHERE s.spent_at_height > $1 AND s.spent_at_height <= $2
-                GROUP BY s.prev_tx_hash
+    -- The fold+stamp statement, built once per CALL (the leaf suffix is fixed);
+    -- both the row-capped band pass and the single-height full-drain pass
+    -- EXECUTE it. See the in-loop comment for the CTE-by-CTE walkthrough.
+    v_sql := format($q$
+            WITH band AS (
+                SELECT s.prev_tx_hash, s.prev_output_idx, s.spent_at_height
+                  FROM spends_p%1$s s
+                 WHERE s.spent_at_height > $1 AND s.spent_at_height <= $2
+                 ORDER BY s.spent_at_height
+                 LIMIT $4
+            ),
+            band_stats AS (
+                SELECT count(*) AS n_rows, max(spent_at_height) AS max_h FROM band
+            ),
+            byte_agg AS (
+                SELECT b.prev_tx_hash AS hash,
+                       b.prev_output_idx / 8 AS byte_idx,
+                       bit_or(1 << (b.prev_output_idx %% 8)) AS byte_val,
+                       max(b.spent_at_height) AS max_h
+                  FROM band b
+                  JOIN txs_p%1$s t ON t.hash = b.prev_tx_hash
+                 WHERE CASE WHEN b.prev_output_idx < t.out_count
+                            THEN get_bit(t.out_spendables, b.prev_output_idx) = 1
+                            ELSE false END
+                 GROUP BY b.prev_tx_hash, b.prev_output_idx / 8
+            ),
+            mask_agg AS (
+                SELECT hb.hash,
+                       decode(string_agg(lpad(to_hex(COALESCE(ba.byte_val, 0)), 2, '0'), '' ORDER BY gs.i), 'hex') AS mask,
+                       hb.max_h
+                  FROM (SELECT hash, max(byte_idx) AS max_byte, max(max_h) AS max_h
+                          FROM byte_agg GROUP BY hash) hb
+                 CROSS JOIN LATERAL generate_series(0, hb.max_byte) gs(i)
+                  LEFT JOIN byte_agg ba ON ba.hash = hb.hash AND ba.byte_idx = gs.i
+                 GROUP BY hb.hash, hb.max_h
             ),
             upd AS (
                 UPDATE txs_p%1$s t
-                   SET spent_progress    = t.spent_progress + d.n,
-                       last_spend_height = GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
-                       -- Stamp delete_at_height only when GROUND TRUTH (a recount of the
-                       -- tx's spendable spends up to the band ceiling) confirms full-spend.
-                       -- The maintained spent_progress counter can drift UPWARD (reorg
-                       -- re-fold, lost update); trusting it here would stamp — and the
-                       -- pruner would irreversibly cascade-delete — a tx whose output is
-                       -- still an unspent UTXO (the IBD data-loss wedge). The cheap counter
-                       -- gate (>= spendable_count) short-circuits the recount so it runs
-                       -- ONLY for near-complete candidates; the recount is authoritative.
-                       -- ">=" (not "=") also re-checks a counter that overshot spendable_count.
-                       delete_at_height  = CASE
-                           WHEN t.spent_progress + d.n >= t.spendable_count
-                                AND t.spendable_count > 0
-                                AND t.mined_at_height IS NOT NULL
-                                AND t.delete_at_height IS NULL
-                                AND t.preserve_until IS NULL
-                                AND t.unmined_since IS NULL
-                                AND (SELECT count(*) FROM spends_p%1$s gs
-                                       WHERE gs.prev_tx_hash = t.hash
-                                         AND gs.prev_output_idx < t.out_count
-                                         AND get_bit(t.out_spendables, gs.prev_output_idx) = 1
-                                         AND gs.spent_at_height <= $2) = t.spendable_count
-                           THEN (GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
-                                          t.mined_at_height) + 1 + $3)::int
-                           ELSE t.delete_at_height
-                       END
-                  FROM band_agg d
+                   SET (spent_bits, last_spend_height, delete_at_height) = (
+                       SELECT COALESCE(x.nb, t.spent_bits),
+                              GREATEST(COALESCE(t.last_spend_height, 0), d.max_h)::int,
+                              CASE
+                                  WHEN bit_count(COALESCE(x.nb, t.spent_bits)) = t.spendable_count
+                                       AND t.spendable_count > 0
+                                       AND t.mined_at_height IS NOT NULL
+                                       AND t.delete_at_height IS NULL
+                                       AND t.preserve_until IS NULL
+                                       AND t.unmined_since IS NULL
+                                  THEN (GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
+                                                 t.mined_at_height) + 1 + $3)::int
+                                  ELSE t.delete_at_height
+                              END
+                         FROM (SELECT (SELECT decode(string_agg(lpad(to_hex(
+                                          CASE WHEN gi.i < octet_length(t.spent_bits) THEN get_byte(t.spent_bits, gi.i) ELSE 0 END
+                                        | CASE WHEN gi.i < octet_length(d.mask)       THEN get_byte(d.mask, gi.i)       ELSE 0 END
+                                       ), 2, '0'), '' ORDER BY gi.i), 'hex')
+                                  FROM generate_series(0, GREATEST(octet_length(t.spent_bits), octet_length(d.mask)) - 1) gi(i)
+                               ) AS nb) x
+                   )
+                  FROM mask_agg d
                  WHERE t.hash = d.hash
-                   AND d.n > 0
                 RETURNING t.hash, t.delete_at_height
             ),
             ins AS (
@@ -290,17 +332,90 @@ BEGIN
                  WHERE delete_at_height IS NOT NULL
                 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
             )
-            SELECT count(*) FROM upd
-             WHERE delete_at_height IS NOT NULL
-        $q$, v_leaf_suffix)
-        USING v_from, v_to, p_retention
-        INTO v_n;
+            SELECT (SELECT count(*) FROM upd WHERE delete_at_height IS NOT NULL),
+                   (SELECT n_rows FROM band_stats),
+                   (SELECT max_h  FROM band_stats)
+    $q$, v_leaf_suffix);
 
-        -- (3) ADVANCE the watermark to the band end (forward-only guard), then
-        -- COMMIT: fold + stamp + advance are one transaction for this band.
+    -- Fold forward one row-bounded band at a time. Each iteration processes at
+    -- most band_rows spends and commits atomically, so per-band work is a fixed
+    -- quantum regardless of chain density and per-CALL work is capped at
+    -- v_max_bands bands.
+    WHILE v_from < p_safe_tip AND v_bands_done < v_max_bands LOOP
+        SELECT enabled INTO v_enabled FROM dah_sweep_control WHERE id = 1;
+        EXIT WHEN NOT v_enabled;
+
+        IF NOT pg_try_advisory_xact_lock(20240684 + p_partition) THEN
+            EXIT;
+        END IF;
+
+        -- Pin the fold's sort/hash memory for THIS band's transaction so the
+        -- aggregation stays in memory instead of spilling to pgsql_tmp (the
+        -- first ENOSPC casualty in the 2026-07-01/07-07 incidents). Safe: the
+        -- maintenance pool bounds concurrent CALLs.
+        IF v_work_mem_mb IS NOT NULL AND v_work_mem_mb > 0 THEN
+            EXECUTE format('SET LOCAL work_mem = %L', v_work_mem_mb::text || 'MB');
+        END IF;
+
+        v_cap := LEAST(v_from + v_band, p_safe_tip);
+
+        -- (1+2) FOLD + STAMP in ONE UPDATE, no history read anywhere:
+        --   band      — the next band_rows spends above the watermark (LIMIT NULL
+        --               = no cap, used by the single-height full-drain re-run).
+        --   byte_agg  — per (parent, byte index) integer bit mask of the band's
+        --               SPENDABLE spends: byte i/8 gets bit 1<<(i%%8), matching the
+        --               LSB-first get_bit encoding of out_spendables. Spendability
+        --               test mirrors v10-v14 (prev_output_idx < out_count AND
+        --               get_bit(out_spendables, idx) = 1).
+        --   mask_agg  — per-parent BYTEA mask, gap bytes zero-filled set-wise
+        --               (LATERAL series + LEFT JOIN — NOT a correlated subquery,
+        --               which would rescan byte_agg per parent).
+        --   upd       — OR the mask into spent_bits (bounds-guarded get_byte over
+        --               the wider of the two; widths normally equal — create
+        --               pre-sizes spent_bits to (out_count+7)/8), advance
+        --               last_spend_height, and stamp inline when
+        --               bit_count(new_bits) = spendable_count. The multi-column
+        --               SET row-subquery evaluates the OR exactly once. The
+        --               delete_at_height IS NULL guard keeps a prior band's stamp.
+        --               Duplicate folds (watermark rewind, boundary re-fold) re-OR
+        --               the same bits — no drift, by construction.
+        --   ins       — freshly stamped rows feed pending_deletes, same statement.
+        -- Returns (stamped, band rows scanned, max height covered).
+        EXECUTE v_sql
+        USING v_from, v_cap, p_retention, v_band_rows
+        INTO v_n, v_rows, v_max_h;
+
+        -- Band ceiling: if the row cap truncated the band, only heights strictly
+        -- below max_h are fully covered — advance to max_h - 1 and re-fold the
+        -- boundary height next band (duplicate ORs are no-ops). If a SINGLE
+        -- height alone holds >= band_rows spends (max_h - 1 = v_from), re-run
+        -- exactly that height with no row cap: bounded overshoot of one block.
+        IF v_rows < v_band_rows THEN
+            v_to := v_cap;
+        ELSIF v_max_h - 1 > v_from THEN
+            v_to := v_max_h - 1;
+        ELSE
+            EXECUTE v_sql
+            USING v_from, v_max_h, p_retention, v_nolimit
+            INTO v_n, v_rows, v_max_h;
+
+            v_to := v_max_h;
+        END IF;
+
+        -- (3) CAS-ADVANCE the watermark, then COMMIT: fold + stamp + advance are
+        -- one transaction for this band. A CAS miss means a reorg rewound the
+        -- watermark mid-CALL (RewindDAHWatermark): roll the band back and end
+        -- the CALL so the next CALL restarts from the rewound height and
+        -- re-folds the new chain's spends (idempotent, so the surviving range
+        -- re-ORs harmlessly).
         UPDATE dah_part_watermark
            SET last_swept_height = v_to
-         WHERE partition = p_partition AND last_swept_height < v_to;
+         WHERE partition = p_partition AND last_swept_height = v_from;
+
+        IF NOT FOUND THEN
+            ROLLBACK;
+            EXIT;
+        END IF;
 
         v_total_stamped := v_total_stamped + v_n;
         COMMIT;
@@ -325,14 +440,34 @@ $$;`
 // older than 11 (COMMIT-inside-PROCEDURE) is returned as an error and fails store
 // startup, surfacing the deployment problem instead of silently not pruning.
 func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
-	// PG version guard: COMMIT inside a PROCEDURE requires PostgreSQL 11+.
+	// PG version guard: COMMIT inside a PROCEDURE requires PostgreSQL 11+;
+	// v15's stamp gate additionally requires bit_count(bytea) (PostgreSQL 14+).
 	var verNum int
 	if err = s.pool.QueryRow(ctx, `SELECT current_setting('server_version_num')::int`).Scan(&verNum); err != nil {
 		return errors.NewStorageError("[dahSweep] read server_version_num", err)
 	}
 
-	if verNum < 110000 {
-		return errors.NewStorageError("[dahSweep] postgres server_version_num=%d < 110000; the DAH sweep procedure requires PostgreSQL 11+ (COMMIT inside a procedure)", verNum)
+	if verNum < 140000 {
+		return errors.NewStorageError("[dahSweep] postgres server_version_num=%d < 140000; the v15 DAH sweep procedure requires PostgreSQL 14+ (bit_count on bytea)", verNum)
+	}
+
+	// Fresh-sync guard: v15 replaced the spent_progress counter with the
+	// spent_bits bitmap and there is deliberately NO migration — populating
+	// spent_bits below the sweep watermark would need the O(all-history) pass
+	// the fold design exists to avoid. A pre-v15 database (spent_progress
+	// column present) must be dropped and re-synced; proc_version alone cannot
+	// detect this (CREATE OR REPLACE would happily install v15 over a counter
+	// schema and silently never stamp anything below the watermark).
+	var hasCounterColumn bool
+	if err = s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.columns
+		  WHERE table_schema = current_schema() AND table_name = 'txs' AND column_name = 'spent_progress')`,
+	).Scan(&hasCounterColumn); err != nil {
+		return errors.NewStorageError("[dahSweep] detect pre-v15 schema", err)
+	}
+
+	if hasCounterColumn {
+		return errors.NewStorageError("[dahSweep] pre-v15 schema detected (txs.spent_progress exists): the v15 spent-bitmap store has no migration path; drop the database and re-sync")
 	}
 
 	// Seed tunable knobs from settings into the control row so ops tuning flows
@@ -342,16 +477,22 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 		maxWin = 8
 	}
 
-	// band_heights bounds the per-band fold width (proc v11). Seeded from settings
-	// so ops tuning flows through the same single source of truth as the other knobs.
+	// band_heights caps the per-band fold width in HEIGHTS for sparse regions
+	// (proc v11); band_rows is the v15 work quantum in SPEND ROWS. Both seeded
+	// from settings so ops tuning flows through one source of truth.
 	bandHeights := s.settings.UtxoStore.PostgresDAHSweepBandHeights
 	if bandHeights <= 0 {
 		bandHeights = 5000
 	}
 
+	bandRows := s.settings.UtxoStore.PostgresDAHSweepBandRows
+	if bandRows <= 0 {
+		bandRows = 200000
+	}
+
 	if _, err = s.pool.Exec(ctx,
-		`UPDATE dah_sweep_control SET max_windows_per_call = $1, band_heights = $2 WHERE id = 1`,
-		maxWin, bandHeights,
+		`UPDATE dah_sweep_control SET max_windows_per_call = $1, band_heights = $2, band_rows = $3 WHERE id = 1`,
+		maxWin, bandHeights, bandRows,
 	); err != nil {
 		if isInsufficientPrivilege(err) {
 			return errors.NewStorageError("[dahSweep] app role lacks privilege to write dah_sweep_control (42501); grant it so the DAH sweep can run")

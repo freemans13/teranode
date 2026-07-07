@@ -76,6 +76,7 @@ type UtxoStoreSettings struct {
 	// size). Bounded per-band work is what lets the sweep keep up with IBD instead
 	// of freezing on an O(lifetime-spends) full-range re-aggregation.
 	PostgresDAHSweepBandHeights int `key:"utxostore_postgresDAHSweepBandHeights" desc:"Height band width per fold-forward DAH sweep step (proc v11)" default:"5000" category:"UtxoStore" usage:"Bounded heights folded per band; keeps per-CALL work O(new spends)" type:"int"`
+	PostgresDAHSweepBandRows    int `key:"utxostore_postgresDAHSweepBandRows" desc:"Spend-row work quantum per DAH sweep band (proc v15)" default:"200000" category:"UtxoStore" usage:"Caps the spends folded per band regardless of chain density; band_heights becomes the sparse-region max" type:"int"`
 	// Reconciliation backstop (Task 8): the fold maintains spent_progress rather than
 	// re-deriving it, so it can drift (arithmetic bug, lost update, or a reorg rewind
 	// re-fold that double-counts still-present spends) and never self-correct. A slow
