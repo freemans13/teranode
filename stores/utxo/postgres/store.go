@@ -447,6 +447,13 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 	return 200, "Postgres UTXO Store", nil
 }
 
+// SupportsOutpointOnlySpend reports whether this store honours the below-checkpoint
+// outpoint-only fast path. The Postgres store does not act on the
+// CreateOptions.SkipExtendedInputs / IgnoreFlags.SkipUTXOHashCheck flags, so it must
+// return false — otherwise callers would hand it un-decorated inputs and it would
+// hard-error deriving UTXO hashes from absent parent data.
+func (s *Store) SupportsOutpointOnlySpend() bool { return false }
+
 func (s *Store) SetBlockHeight(blockHeight uint32) error {
 	// Guard the tip at the single chokepoint so every downstream int32(height) cast
 	// (e.g. unmined_since in unsetMinedMulti) is provably safe. See blockHeightToInt32.
