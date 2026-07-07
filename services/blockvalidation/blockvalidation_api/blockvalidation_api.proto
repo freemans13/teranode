@@ -41,6 +41,11 @@ message ProcessBlockRequest {
   string base_url = 3;
   string peer_id = 4; // P2P peer identifier for peer tracking via P2P service
   uint32 block_id = 5; // Pre-assigned block ID from legacy netsync (0 = not pre-assigned, blockchain will auto-assign)
+  // Set only by the in-process legacy netsync when the block was delivered through a
+  // headers-first segment whose terminal header matched a hardcoded checkpoint (peer
+  // disconnected otherwise). Trusted at the same level as peer_id — this API is
+  // service-mesh internal.
+  bool checkpoint_certified = 6;
 }
 
 // swagger:model ValidateBlockRequest

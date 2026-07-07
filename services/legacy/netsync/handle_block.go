@@ -34,7 +34,15 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, msgBlock *wire.MsgBlock) (err error) {
+// checkpointCertified must be true only when the caller (legacy netsync) has
+// in-process proof that this exact block was delivered through a headers-first
+// segment whose terminal header was link-verified and matched a hardcoded
+// checkpoint hash (see SyncManager.checkpointCertifiedForBlock). It is threaded
+// through to blockvalidation's ProcessBlock RPC and, symmetrically, gates the
+// below-checkpoint outpoint-only fast path here (legacyOutpointOnly) so fee=0
+// UTXO rows are only ever created for blocks whose validation-side no-inflation
+// skip is guaranteed to also engage.
+func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, msgBlock *wire.MsgBlock, checkpointCertified bool) (err error) {
 	sm.logger.Debugf("[HandleBlockDirect][%s] starting handling block", blockHash.String())
 
 	// Make sure we have the correct height for this block before continuing
@@ -193,7 +201,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// NOTE: last use of `block` — from here down only scalars and tx hash
 	// copies are referenced, so the decode arena is collectable as soon as
 	// createTxMap inside prepareSubtrees returns.
-	subtrees, blockID, err := sm.prepareSubtrees(ctx, block)
+	subtrees, blockID, err := sm.prepareSubtrees(ctx, block, checkpointCertified)
 	if err != nil {
 		return err
 	}
@@ -210,7 +218,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	}
 
 	// call the process block wrapper, which will add tracing and logging
-	err = sm.ProcessBlock(ctx, teranodeBlock)
+	err = sm.ProcessBlock(ctx, teranodeBlock, checkpointCertified)
 	if err != nil {
 		return err
 	}
@@ -261,7 +269,7 @@ func (sm *SyncManager) waitForPreviousBlockMined(ctx context.Context, prevBlockH
 	return err
 }
 
-func (sm *SyncManager) ProcessBlock(ctx context.Context, teranodeBlock *model.Block) (err error) {
+func (sm *SyncManager) ProcessBlock(ctx context.Context, teranodeBlock *model.Block, checkpointCertified bool) (err error) {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "SyncManager:processBlock",
 		tracing.WithLogMessage(
 			sm.logger,
@@ -280,7 +288,9 @@ func (sm *SyncManager) ProcessBlock(ctx context.Context, teranodeBlock *model.Bl
 	// teranodeBlock.ID was set by model.NewBlock from the pre-assigned ID returned by prepareSubtrees.
 	// Read it from the struct here — avoids duplicating it as a parameter. It still has to travel as
 	// a separate proto field in the gRPC request because block.Bytes() does not serialize ID.
-	if err = sm.blockValidation.ProcessBlock(ctx, teranodeBlock, teranodeBlock.Height, "", "legacy", teranodeBlock.ID); err != nil {
+	// checkpointCertified is trusted at the same level as peerID (the blockvalidation
+	// API is service-mesh internal) — see HandleBlockDirect's doc comment.
+	if err = sm.blockValidation.ProcessBlock(ctx, teranodeBlock, teranodeBlock.Height, "", "legacy", teranodeBlock.ID, checkpointCertified); err != nil {
 		if errors.Is(err, errors.ErrBlockExists) {
 			sm.logger.Infof("[SyncManager:processBlock][%s %d] block already exists", teranodeBlock.Hash().String(), teranodeBlock.Height)
 			return nil
@@ -313,7 +323,7 @@ type blockIdent struct {
 	timestamp time.Time
 }
 
-func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block) (subtrees []*chainhash.Hash, blockID uint32, err error) {
+func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block, checkpointCertified bool) (subtrees []*chainhash.Hash, blockID uint32, err error) {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "prepareSubtrees",
 		tracing.WithLogMessage(
 			sm.logger,
@@ -414,7 +424,10 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 
 	// Compute the below-checkpoint fast-path mode ONCE for this block and thread it into
 	// the phases (extend, create-subtrees) so decorate-skip and fee=0 cannot disagree.
-	outpointOnly := sm.legacyOutpointOnly(bi.height)
+	// checkpointCertified (from the netsync handoff) additionally gates this: fee=0 rows
+	// are only ever created for a block whose validation-side no-inflation skip is
+	// guaranteed to also engage (gate symmetry — see legacyOutpointOnly).
+	outpointOnly := sm.legacyOutpointOnly(bi.height, checkpointCertified)
 
 	if err = sm.extendTransactions(ctx, bi, txOrder, txMap, outpointOnly); err != nil {
 		return nil, 0, err
@@ -458,7 +471,7 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 
 		// in quickValidationMode, we can process transactions in a block in parallel, but in reverse order
 		// first we create all the utxos, then we spend them
-		if err = sm.ValidateTransactionsLegacyMode(ctx, txMap, bi, blockID); err != nil {
+		if err = sm.ValidateTransactionsLegacyMode(ctx, txMap, bi, blockID, checkpointCertified); err != nil {
 			return nil, 0, err
 		}
 	}
@@ -512,14 +525,26 @@ func (sm *SyncManager) quickValidationAllowed(blockHeight uint32) bool {
 // stamp subtree fees as 0, do a minimal (inputs-only) UTXO create, and spend
 // using the validator's outpoint-only mode. Default OFF — every conjunct must
 // hold for the path to engage, so when the setting is off, the store does not
-// support the fast path, or the block is above the highest hard-coded checkpoint,
-// the legacy path behaves exactly as before (byte-identical, invariant I2).
-func (sm *SyncManager) legacyOutpointOnly(height uint32) bool {
+// support the fast path, the block is above the highest hard-coded checkpoint,
+// or the block is not checkpoint-certified, the legacy path behaves exactly as
+// before (byte-identical, invariant I2).
+//
+// checkpointCertified must come from the netsync handoff (HandleBlockDirect,
+// ultimately SyncManager.checkpointCertifiedForBlock) and gates this in lockstep
+// with the validation-side skip (BlockValidation.checkpointConfirmedAncestor):
+// both require the same in-process proof, so fee=0 rows are only ever written
+// for a block whose validation-side no-inflation check is guaranteed to also be
+// skipped (gate symmetry).
+func (sm *SyncManager) legacyOutpointOnly(height uint32, checkpointCertified bool) bool {
 	if sm.settings == nil || !sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
 		return false
 	}
 
 	if !sm.utxoStore.SupportsOutpointOnlySpend() {
+		return false
+	}
+
+	if !checkpointCertified {
 		return false
 	}
 
@@ -719,7 +744,7 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 }
 
 func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
-	bi blockIdent, blockID uint32) (err error) {
+	bi blockIdent, blockID uint32, checkpointCertified bool) (err error) {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "validateTransactionsLegacyMode",
 		tracing.WithHistogram(prometheusLegacyNetsyncValidateTransactionsLegacyMode),
 		tracing.WithLogMessage(sm.logger, "[validateTransactionsLegacyMode] called for block %s, height %d", bi.hash, bi.height),
@@ -731,7 +756,7 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 
 	// Compute the below-checkpoint fast-path mode ONCE for this block and thread it into
 	// the phases (minimal create, outpoint-only pre-validate) so they cannot disagree.
-	outpointOnly := sm.legacyOutpointOnly(bi.height)
+	outpointOnly := sm.legacyOutpointOnly(bi.height, checkpointCertified)
 
 	if err = sm.createUtxos(ctx, txMap, bi, blockID, outpointOnly); err != nil {
 		return err

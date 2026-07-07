@@ -67,8 +67,9 @@ func newOutpointOnlySettings(t *testing.T, enabled bool, sqlStore bool, checkpoi
 }
 
 // TestSyncManager_legacyOutpointOnly is the full truth table for the gate helper.
-// Every conjunct must hold (flag on AND SQL store AND at/below the highest hard-coded
-// checkpoint) for the fast path to engage; any one missing keeps it OFF (fail-safe).
+// Every conjunct must hold (flag on AND SQL store AND checkpoint-certified AND
+// at/below the highest hard-coded checkpoint) for the fast path to engage; any one
+// missing keeps it OFF (fail-safe).
 func TestSyncManager_legacyOutpointOnly(t *testing.T) {
 	const checkpointHeight = int32(1000)
 	const below = uint32(500)
@@ -79,19 +80,25 @@ func TestSyncManager_legacyOutpointOnly(t *testing.T) {
 		name       string
 		enabled    bool
 		sqlStore   bool
+		certified  bool
 		nilChain   bool
 		noCheckpts bool
 		height     uint32
 		want       bool
 	}{
-		{name: "flag off, SQL, below", enabled: false, sqlStore: true, height: below, want: false},
-		{name: "flag on, non-SQL (aerospike), below", enabled: true, sqlStore: false, height: below, want: false},
-		{name: "flag on, SQL, below checkpoint", enabled: true, sqlStore: true, height: below, want: true},
-		{name: "flag on, SQL, at checkpoint", enabled: true, sqlStore: true, height: atCheckpoint, want: true},
-		{name: "flag on, SQL, above checkpoint", enabled: true, sqlStore: true, height: above, want: false},
-		{name: "flag on, SQL, height 0", enabled: true, sqlStore: true, height: 0, want: true},
-		{name: "flag on, SQL, nil chain params", enabled: true, sqlStore: true, nilChain: true, height: below, want: false},
-		{name: "flag on, SQL, no checkpoints", enabled: true, sqlStore: true, noCheckpts: true, height: below, want: false},
+		{name: "flag off, SQL, certified, below", enabled: false, sqlStore: true, certified: true, height: below, want: false},
+		{name: "flag on, non-SQL (aerospike), certified, below", enabled: true, sqlStore: false, certified: true, height: below, want: false},
+		{name: "flag on, SQL, certified, below checkpoint", enabled: true, sqlStore: true, certified: true, height: below, want: true},
+		{name: "flag on, SQL, certified, at checkpoint", enabled: true, sqlStore: true, certified: true, height: atCheckpoint, want: true},
+		{name: "flag on, SQL, certified, above checkpoint", enabled: true, sqlStore: true, certified: true, height: above, want: false},
+		{name: "flag on, SQL, certified, height 0", enabled: true, sqlStore: true, certified: true, height: 0, want: true},
+		{name: "flag on, SQL, certified, nil chain params", enabled: true, sqlStore: true, certified: true, nilChain: true, height: below, want: false},
+		{name: "flag on, SQL, certified, no checkpoints", enabled: true, sqlStore: true, certified: true, noCheckpts: true, height: below, want: false},
+		// Certification gate: everything else engaged, but the block was NOT delivered
+		// through a verified headers-first segment (e.g. normal getblocks mode) — the
+		// fast path must stay off (invariant I2 / gate symmetry with the validation skip).
+		{name: "flag on, SQL, NOT certified, below checkpoint", enabled: true, sqlStore: true, certified: false, height: below, want: false},
+		{name: "flag on, SQL, NOT certified, at checkpoint", enabled: true, sqlStore: true, certified: false, height: atCheckpoint, want: false},
 	}
 
 	for _, tt := range tests {
@@ -125,8 +132,8 @@ func TestSyncManager_legacyOutpointOnly(t *testing.T) {
 				sm.settings.ChainCfgParams = &noCp
 			}
 
-			require.Equal(t, tt.want, sm.legacyOutpointOnly(tt.height),
-				"legacyOutpointOnly(%d) enabled=%v sql=%v", tt.height, tt.enabled, tt.sqlStore)
+			require.Equal(t, tt.want, sm.legacyOutpointOnly(tt.height, tt.certified),
+				"legacyOutpointOnly(%d, certified=%v) enabled=%v sql=%v", tt.height, tt.certified, tt.enabled, tt.sqlStore)
 		})
 	}
 }
@@ -229,7 +236,7 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 
 		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{},
 			utxoStore: &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}}
-		require.True(t, sm.legacyOutpointOnly(uint32(blockHeight)), "gate must be ON for this case")
+		require.True(t, sm.legacyOutpointOnly(uint32(blockHeight), true), "gate must be ON for this case")
 
 		slices, datas, metas := makeSubtreeSlices(t, len(block.Transactions()))
 		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas, true))
@@ -247,7 +254,7 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 		block, txMap, txOrder := buildExtendedSubtreeBlock(t, blockHeight, 5)
 
 		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{}}
-		require.False(t, sm.legacyOutpointOnly(uint32(blockHeight)), "gate must be OFF for this case")
+		require.False(t, sm.legacyOutpointOnly(uint32(blockHeight), true), "gate must be OFF for this case")
 
 		slices, datas, metas := makeSubtreeSlices(t, len(block.Transactions()))
 		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas, false))
@@ -286,7 +293,7 @@ func TestSyncManager_extendTransactions_OutpointOnlySkipsDecorate(t *testing.T) 
 		}
 
 		block, txMap, txOrder := buildExtendedSubtreeBlock(t, blockHeight, 5)
-		require.Equal(t, enabled, sm.legacyOutpointOnly(uint32(blockHeight)))
+		require.Equal(t, enabled, sm.legacyOutpointOnly(uint32(blockHeight), true))
 
 		err := sm.extendTransactions(context.Background(), testBlockIdent(block), txOrder, txMap, enabled)
 		require.NoError(t, err)

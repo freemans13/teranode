@@ -103,7 +103,7 @@ func TestSyncManager_HandleBlockDirect(t *testing.T) {
 	err = msgBlock.Deserialize(bytes.NewReader(blockBytes))
 	require.NoError(t, err)
 
-	err = sm.HandleBlockDirect(t.Context(), &peer.Peer{}, *blockHash, msgBlock)
+	err = sm.HandleBlockDirect(t.Context(), &peer.Peer{}, *blockHash, msgBlock, false)
 	require.NoError(t, err)
 }
 
@@ -518,7 +518,7 @@ func TestSyncManager_prepareSubtrees(t *testing.T) {
 	}
 
 	// For single transaction blocks, prepareSubtrees returns empty
-	subtrees, blockID, err := sm.prepareSubtrees(context.Background(), block)
+	subtrees, blockID, err := sm.prepareSubtrees(context.Background(), block, false)
 	assert.NoError(t, err)
 	assert.NotNil(t, subtrees)
 	assert.Equal(t, uint32(0), blockID) // single-tx block exits early, IsFSMCurrentState=false → blockID stays 0
