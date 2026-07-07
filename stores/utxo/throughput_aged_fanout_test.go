@@ -252,7 +252,14 @@ type lagResult struct {
 	// must keep up with. MedStampRate is compared against THIS, not MedCreateRate
 	// (fresh parents are never spent, so create rate is the wrong denominator).
 	OfferedCompletionRate float64
-	Samples               []lagSample
+	// CompletionsIssued / TotalStamped are WINDOW TOTALS. Keep-up is asserted on
+	// totals, not per-second medians: the sweep folds in bands spanning many
+	// heights, so stamps legitimately arrive in large bursts separated by tens of
+	// seconds — the median of 1s deltas is 0 for a perfectly healthy band-
+	// quantized setter. (MedStampRate is retained as informational output only.)
+	CompletionsIssued int64
+	TotalStamped      int64
+	Samples           []lagSample
 }
 
 // sampleBacklog returns tip − COALESCE(min(last_swept_height), 0) from
@@ -757,10 +764,15 @@ func runAgedFanoutLag(t *testing.T, store prunedBenchStore, numWorkers int, cfg 
 	res.MedStampRate = median(stampRates)
 	res.MedCreateRate = median(createRates)
 	res.OfferedCompletionRate = completionRate
+	res.CompletionsIssued = completionsIssued.Load()
 
-	t.Logf("[lag] maxBacklog=%d startBacklog=%d endBacklog=%d medStampRate=%.0f medCreateRate=%.0f offeredCompletions=%.0f/s issued=%d samples=%d",
-		res.MaxBacklog, res.StartBacklog, res.EndBacklog, res.MedStampRate, res.MedCreateRate,
-		res.OfferedCompletionRate, completionsIssued.Load(), len(res.Samples))
+	for _, s := range finalSamples {
+		res.TotalStamped += s.StampRate
+	}
+
+	t.Logf("[lag] maxBacklog=%d startBacklog=%d endBacklog=%d totalStamped=%d issued=%d medStampRate=%.0f medCreateRate=%.0f offeredCompletions=%.0f/s samples=%d",
+		res.MaxBacklog, res.StartBacklog, res.EndBacklog, res.TotalStamped, res.CompletionsIssued,
+		res.MedStampRate, res.MedCreateRate, res.OfferedCompletionRate, len(res.Samples))
 	return res
 }
 
@@ -1030,18 +1042,25 @@ func TestThroughput_QueueStoreAgedFanoutLag(t *testing.T) {
 	// parent, so stamp rate is structurally far below create rate even when perfectly
 	// healthy. The real keep-up signal is the bounded, non-growing backlog asserted above;
 	// this guards only that the setter is issuing stamps (the frozen v10 sweep stamps 0).
-	require.Positive(t, res.MedStampRate,
-		"sweep must be stamping completions (medStampRate=%.0f) — 0 means the setter is frozen",
-		res.MedStampRate)
+	// Sweep must be actively STAMPING — not frozen. Asserted on the window TOTAL,
+	// not a per-second median: stamps arrive in band-sized bursts (a band spans
+	// many heights), so most 1s samples are legitimately 0 even when healthy.
+	require.Positive(t, res.TotalStamped,
+		"sweep must be stamping completions (totalStamped=%d) — 0 means the setter is frozen",
+		res.TotalStamped)
 
-	// KEEP-UP: the median stamp rate must track the offered completion rate —
-	// completions are paced steadily across the window, so a healthy setter's
-	// stamp stream matches the demand (small fold-lag slack allowed). A setter
-	// paying O(history) per completion (cold recount per completing parent on a
-	// disk-bound table) falls off this immediately; an O(1)-stamp setter holds it.
-	require.GreaterOrEqual(t, res.MedStampRate, 0.9*res.OfferedCompletionRate,
-		"stamp rate must keep up with offered completions (medStamp=%.0f/s vs offered=%.0f/s)",
-		res.MedStampRate, res.OfferedCompletionRate)
+	// KEEP-UP: total stamps in the window must track the parents completed —
+	// each parent stamps ONCE, on its SECOND remaining-vout spend (round 0
+	// spends vout k-2 across all parents, round 1 completes them), so the stamp
+	// demand is issued/2. Completions are paced steadily, so a healthy setter
+	// clears the demand within the window (0.9 slack covers the fold-lag tail:
+	// the last seconds' completions stamp just after the window closes). A
+	// setter paying O(history) per completion (cold recount per completing
+	// parent on a disk-bound table) falls far below this; an O(1)-stamp setter
+	// holds it.
+	require.GreaterOrEqual(t, float64(res.TotalStamped), 0.9*float64(res.CompletionsIssued)/2,
+		"stamps must keep up with completed parents (totalStamped=%d vs issued/2=%d)",
+		res.TotalStamped, res.CompletionsIssued/2)
 
 	// Back-half trend must not be upward (a positive slope is sustained divergence).
 	require.LessOrEqual(t, trend, 0.0,
