@@ -42,8 +42,14 @@ import (
 // the state change they mirror.
 
 const (
-	// puFlushInterval is the projector's idle flush cadence.
-	puFlushInterval = 20 * time.Millisecond
+	// puFlushInterval is the projector's idle flush cadence. 1s (was 20ms):
+	// paired with the mined-aware flush filter below, a longer lag means most
+	// short-lived hashes are ALREADY mined by flush time and are filtered out
+	// entirely — measured on the pruned bench the projector was 15% of ALL WAL
+	// (582MB, ~4 WAL records per 36-byte logical row) for rows nothing read or
+	// deleted in-window. The wider crash window is covered by the same
+	// unclean-shutdown backfill that covered the 20ms one.
+	puFlushInterval = 1 * time.Second
 	// puFlushKickLen wakes the writer early when the buffer passes this length.
 	puFlushKickLen = 8192
 	// puBufHardCap bounds buffer growth if postgres stalls: beyond this the
@@ -156,9 +162,18 @@ func (s *Store) flushPendingUnmined(ctx context.Context) error {
 		sinces[i] = e.since
 	}
 
+	// Mined-aware filter: only project rows whose tx is STILL unmined at flush
+	// time (txs.unmined_since IS NOT NULL). A tx that mined inside the flush lag
+	// never needed the row (SetMinedMulti clears unmined_since; the row would sit
+	// unread until lazy cleanup), and a tx already pruned must not resurrect one.
+	// The join costs one pkey probe per buffered row once per flush and replaces
+	// a heap insert + random-hash PK btree insert + ~326B WAL for every filtered
+	// row. unnest-JOIN (not = ANY) so each probe prunes to one leaf.
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO pending_unmined (hash, unmined_since)
-		SELECT * FROM UNNEST($1::bytea[], $2::int[])
+		SELECT u.h, u.s FROM UNNEST($1::bytea[], $2::int[]) AS u(h, s)
+		JOIN txs t ON t.hash = u.h
+		WHERE t.unmined_since IS NOT NULL
 		ON CONFLICT (hash) DO NOTHING`, hashes, sinces); err != nil {
 		// Re-queue in front so ordering is roughly preserved; hard cap bounds it.
 		s.puMu.Lock()

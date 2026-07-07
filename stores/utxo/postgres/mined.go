@@ -74,20 +74,26 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// here, covering both orderings (mined-then-spent is covered by the sweep;
 		// spent-then-mined is covered here).
 		//
-		// Setter-C reconcile (Task 7): fully-spentness is now read from the MAINTAINED
-		// spent_progress counter (folded forward-only by the sweep proc — see
-		// dah_sweep_proc.go), NOT from an O(history) re-aggregation over the spends
-		// table. This both fixes the mine-after-already-fully-spent ordering AND removes
-		// the O(lifetime-spends) EXISTS/count(*) cost from the mine hot path.
+		// Setter-C reconcile (proc v15): fully-spentness is now read from the MAINTAINED
+		// spent_bits bitmap (folded by the sweep proc — see dah_sweep_proc.go), NOT
+		// from an O(history) re-aggregation over the spends table. The bitmap OR is
+		// idempotent, so the v13 counter-drift classes — and the ground-truth spends
+		// recount they forced onto this path — are structurally gone: bit_count can
+		// never overshoot spendable_count. The mine path is now strictly cheaper: one
+		// scalar bit_count over a row-local column, no spends probe. The residual
+		// stale-snapshot race (a concurrent fold re-setting a bit Unspend just
+		// cleared) is healed by the reconciler via dah_dirty_parents, not here.
 		//
 		// The CASE predicate:
 		//   guard: preserve_until IS NULL AND out_count > 0
 		//   zero-spendable: spendable_count = 0 (cheap scalar — immediately prune-eligible
-		//     once mined; handled explicitly so it never depends on the counter equality,
-		//     which for a 0=0 case would be ambiguous with a not-yet-folded tx)
-		//   OR fully-spent: spent_progress = spendable_count AND spendable_count > 0
-		//     (the counter reached the spendable-output total — every spendable output
-		//     has been folded). Reads two scalar columns already on the row; no join.
+		//     once mined; handled explicitly so it never relies on a vacuous bitmap
+		//     equality — out_spendables is NULLable, so the 0-spendable case must not
+		//     depend on bitmap state at all)
+		//   OR fully-spent: spendable_count > 0 AND bit_count(spent_bits) = spendable_count
+		//     (every spendable output's bit has been folded — spent_bits ⊆
+		//     out_spendables, so equality means fully spent). Reads two row-local
+		//     columns; no join.
 		//
 		// Completion-height formula: GREATEST(last_spend_height, $5/*minedHeight*/)
 		// + 1 + $6/*retention*/ — matches the sweep proc's stamp (which also uses
@@ -106,6 +112,12 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// The UPDATE is wrapped in a CTE so that any fully-spent tx that gets an inline
 		// DAH stamp is also upserted into pending_deletes in the same statement. The
 		// outer SELECT returns hash, block_ids so the drain loop is unchanged.
+		//
+		// FROM unnest(...) JOIN instead of WHERE hash = ANY(...): with = ANY on the
+		// hash-partitioned parent every probe descended ALL 8 leaf pkey btrees
+		// (measured: ~4.9 index descents per looked-up row across the hot path);
+		// the unnest nested-loop join drives per-row runtime partition pruning, so
+		// each hash descends exactly its own leaf.
 		updateSQL = `WITH upd AS (
 				UPDATE txs SET
 					block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
@@ -116,21 +128,14 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 					delete_at_height = CASE
 						WHEN preserve_until IS NULL AND out_count > 0 AND (
 							spendable_count = 0
-							OR (spendable_count > 0 AND spent_progress = spendable_count
-								-- GROUND-TRUTH gate: the maintained spent_progress counter can
-								-- drift up, so confirm via a spends recount before authorising the
-								-- (irreversible) prune stamp. Short-circuited by the counter test,
-								-- so the recount runs only for the rare spent-before-mined tx.
-								AND (SELECT count(*) FROM spends gs
-									   WHERE gs.prev_tx_hash = txs.hash
-										 AND gs.prev_output_idx < txs.out_count
-										 AND get_bit(txs.out_spendables, gs.prev_output_idx) = 1) = spendable_count)
+							OR (spendable_count > 0 AND bit_count(spent_bits) = spendable_count)
 						)
 						THEN (GREATEST(COALESCE(last_spend_height, 0), $5) + 1 + $6)::int
 						ELSE delete_at_height
 					END
-				WHERE hash = ANY($1)
-				RETURNING hash, block_ids, delete_at_height
+				FROM unnest($1::bytea[]) AS h(v)
+				WHERE txs.hash = h.v
+				RETURNING txs.hash, block_ids, delete_at_height
 			),
 			_pd AS (
 				INSERT INTO pending_deletes (hash, delete_at_height)
@@ -144,8 +149,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 			block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
 			subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
 			locked = false
-		WHERE hash = ANY($1)
-		RETURNING hash, block_ids`
+		FROM unnest($1::bytea[]) AS h(v)
+		WHERE txs.hash = h.v
+		RETURNING txs.hash, block_ids`
 	}
 
 	numUpdateChunks := 0
@@ -393,14 +399,17 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 
 	// Rewind the deferred-DAH sweep watermark to the reorged block's height so the
 	// new chain's spends in (blockHeight, tip] — tagged at heights the cursor may
-	// already have passed — get re-evaluated for DAH eligibility rather than waiting
-	// for the slow keyspace backstop. Best-effort: correctness already holds via the
-	// inline DAH clear above and Unspend; this only restores timely re-stamping.
+	// already have passed — get folded into spent_bits rather than skipped.
+	// Best-effort (no retry/abort — the reorg itself has already committed), but
+	// under v15 a LOST rewind is a silent unbounded disk leak, not mere counter
+	// drift: new-chain spends below the watermark never fold, their parents never
+	// reach bit_count(spent_bits) = spendable_count, and they sit unstamped
+	// (unpruned) until the reconciler's slow rotation happens to reach them.
 	// RewindDAHWatermark only ever moves the watermark backward (guarded), so a
 	// spurious call cannot skip heights.
 	if blockHeight > 0 {
 		if err := s.RewindDAHWatermark(ctx, int64(blockHeight)); err != nil {
-			s.logger.Infof("[UnsetMined] rewind DAH watermark to %d failed (continuing): %v", blockHeight, err)
+			s.logger.Errorf("[UnsetMined] rewind DAH watermark to %d failed — spends below the watermark will never fold, their parents stay unstamped/unpruned until the reconciler rotation reaches them (disk leak): %v", blockHeight, err)
 		}
 	}
 

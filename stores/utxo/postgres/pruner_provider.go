@@ -110,6 +110,27 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 
 	startTime := time.Now()
 
+	// Early-exit on empty backlog: the bench/production drivers retry Prune on a
+	// tight loop when it returns 0, which without this probe costs a full 8-way
+	// cascade-statement fan-out per empty call on the maintenance pool. One
+	// btree-probe EXISTS answers it. pending_deletes is the ONLY pruner feed
+	// (design contract below), so EXISTS=false genuinely means nothing to do.
+	// Skipped while the background cursor is not running: the inline catch-up
+	// sweep below may stamp new rows this call must then delete.
+	s.mu.Lock()
+	cursorOn := s.cursorStarted
+	s.mu.Unlock()
+
+	if cursorOn {
+		var hasWork bool
+		if err := s.store.pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM pending_deletes WHERE delete_at_height <= $1)`,
+			int64(blockHeight),
+		).Scan(&hasWork); err == nil && !hasWork {
+			return 0, nil
+		}
+	}
+
 	s.logger.Infof("[pruner][%s:%d] starting cleanup scan (delete_at_height <= %d)",
 		blockHashStr, blockHeight, blockHeight)
 

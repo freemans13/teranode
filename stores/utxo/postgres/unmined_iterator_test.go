@@ -310,13 +310,17 @@ func TestPrunableUnminedTxIterator_Lever1_UnminedReturnedMinedCleanedNotReturned
 	_, err = st.Create(ctx, minedTx, 100)
 	require.NoError(t, err)
 	minedHash := minedTx.TxIDChainHash()
+	// Flush the projector BEFORE mining: the flush is mined-aware (it skips
+	// hashes whose tx is no longer unmined), so the lingering-row state this
+	// test exercises only arises when the projection lands while the tx is
+	// still unmined and the tx mines AFTERWARDS — project first, then mine.
+	require.NoError(t, st.flushPendingUnmined(ctx))
 	_, err = st.SetMinedMulti(ctx, []*chainhash.Hash{minedHash}, utxo.MinedBlockInfo{
 		BlockID: 42, BlockHeight: 100, SubtreeIdx: 0, OnLongestChain: true,
 	})
 	require.NoError(t, err)
 
-	// Precondition: mined tx's row lingered (drain projector first).
-	require.NoError(t, st.flushPendingUnmined(ctx)) // drain write-behind projector
+	// Precondition: mined tx's row lingered.
 	var minedRowExists bool
 	require.NoError(t, st.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pending_unmined WHERE hash=$1)`, minedHash[:]).Scan(&minedRowExists))

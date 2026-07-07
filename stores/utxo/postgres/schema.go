@@ -354,13 +354,19 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, logger ulogge
 		return errors.NewStorageError("px_delete_at_height backfill+drop failed", err)
 	}
 
-	// Setter-C counter columns: add to existing DBs idempotently. Both columns
-	// are deliberately UNINDEXED — indexing either would disqualify HOT updates
-	// on txs (measured: HOT ratio collapses from 83%+ to 33% when a btree covers
-	// a column touched by the sweep UPDATE). The migration is a no-op if the
-	// columns already exist (ALTER TABLE ... ADD COLUMN IF NOT EXISTS).
+	// Spent-bitmap fold columns (proc v15): add to v15 DBs idempotently. Both
+	// columns are deliberately UNINDEXED — indexing either would disqualify HOT
+	// updates on txs (measured: HOT ratio collapses from 83%+ to 33% when a
+	// btree covers a column touched by the sweep UPDATE). The migration is a
+	// no-op if the columns already exist; pre-v15 (spent_progress) databases are
+	// rejected at bootstrapDAHSweepProc, not migrated.
 	if _, err := pool.Exec(ctx, txsSetterCMigrationDDL); err != nil {
-		return errors.NewStorageError("setter-c counter column migration failed", err)
+		return errors.NewStorageError("spent-bitmap column migration failed", err)
+	}
+
+	// Dirty-parents heal queue for the fold-vs-Unspend stale-snapshot race.
+	if _, err := pool.Exec(ctx, dahDirtyParentsDDL); err != nil {
+		return errors.NewStorageError("dah_dirty_parents creation failed", err)
 	}
 
 	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).
@@ -444,7 +450,7 @@ CREATE TABLE IF NOT EXISTS txs (
     out_frozens               BYTEA,
     coinbase_spending_height  INT NOT NULL DEFAULT 0,
     spendable_ins             INT[],
-    spent_progress            INT NOT NULL DEFAULT 0,
+    spent_bits                BYTEA NOT NULL DEFAULT '\x'::bytea,
     last_spend_height         INT
 ) PARTITION BY HASH (hash);`
 
@@ -495,29 +501,62 @@ DO $$ BEGIN
   END IF;
 END $$;`
 
-// txsSetterCMigrationDDL adds the two Setter-C counter columns to existing txs
-// tables on DB startup. Both use ADD COLUMN IF NOT EXISTS so the statement is
-// safe to re-run on every startup.
+// txsSetterCMigrationDDL adds the spent-bitmap fold columns (proc v15) to txs
+// tables on DB startup. ADD COLUMN IF NOT EXISTS so the statement is safe to
+// re-run on every startup. It deliberately does NOT migrate a pre-v15
+// (spent_progress counter) database: no backfill can populate spent_bits below
+// the sweep watermark without the O(all-history) pass the fold design exists to
+// avoid, so bootstrapDAHSweepProc refuses to arm when spent_progress is present
+// and the DB must be dropped and re-synced (same precedent as the packed-layout
+// migration note above).
 //
-// spent_progress INT NOT NULL DEFAULT 0 — count of distinct spendable outputs
+// spent_bits BYTEA NOT NULL — one bit per output (LSB-first per byte, matching
 //
-//	the background sweep consumer has folded for this tx. The DAH stamp fires
-//	when spent_progress = spendable_count (all outputs fully spent). Initialised
-//	to 0, not spendable_count: the consumer folds forward-only from scratch;
-//	a live-DB backfill is a deferred decision handled by a separate migration.
+//	the Go get_bit encoding buf[i/8] |= 1<<(i%8) used by out_spendables). Bit i
+//	is set once the sweep has folded a spend of vout i. The create path
+//	pre-sizes it to (out_count+7)/8 zero bytes so every later fold is a
+//	same-size in-place overwrite; the '\x' DEFAULT only backstops rows from
+//	paths that omit the column. The fold ORs band masks in (idempotent: reorg
+//	watermark rewinds re-set the same bits, so the v13 counter-drift classes
+//	are structurally gone); Unspend clears exactly the bits of the spend rows
+//	it deletes. The DAH stamp fires when bit_count(spent_bits) =
+//	spendable_count — a single-row check with no spends-history recount.
+//	Invariant: spent_bits ⊆ out_spendables (the fold and the reconciler only
+//	set bits that pass the out_spendables filter; Unspend only clears).
+//	STORAGE MAIN keeps the (low-entropy, compressible) bitmap inline; only
+//	>~16K-output outliers go out-of-line.
 //
 // last_spend_height INT (nullable) — running max spent_at_height across all
 //
 //	spendable outputs folded so far. NULL until the first spendable spend is
 //	folded. Used by the sweep to stamp delete_at_height = last_spend_height.
+//	Never lowered by Unspend (stale-high is safe: it feeds only
+//	GREATEST(last_spend_height, mined_at_height), pushing deletion later).
 //
 // NEITHER column is indexed. An UPDATE touching any btree-indexed column on txs
 // disqualifies the row from a HOT update (forcing a full row copy + index
 // maintenance on the 32-byte random-hash PK), collapsing the HOT ratio from
 // 83%+ to ~34% (measured). delete_at_height is the canonical unindexed precedent.
 const txsSetterCMigrationDDL = `
-ALTER TABLE txs ADD COLUMN IF NOT EXISTS spent_progress    INT NOT NULL DEFAULT 0;
-ALTER TABLE txs ADD COLUMN IF NOT EXISTS last_spend_height INT;`
+ALTER TABLE txs ADD COLUMN IF NOT EXISTS spent_bits        BYTEA NOT NULL DEFAULT '\x'::bytea;
+ALTER TABLE txs ADD COLUMN IF NOT EXISTS last_spend_height INT;
+ALTER TABLE txs ALTER COLUMN spent_bits SET STORAGE MAIN;`
+
+// dahDirtyParentsDDL creates the dirty-parents heal queue. Unspend inserts the
+// affected parent hashes here IN THE SAME TRANSACTION as the spend-row delete +
+// bit clear; the reconciler drains this queue FIRST each tick with a fresh
+// snapshot, recomputing spent_bits/last_spend_height from spends and un-stamping
+// (+ purging pending_deletes) if a concurrent fold re-set a just-cleared bit
+// from a stale statement snapshot. The queue is bounded by Unspend volume
+// (≈ zero outside reorgs), so the heal arrives within ~one reconcile tick —
+// unlike the rotating-slice audit, whose full rotation is weeks at mainnet
+// scale and therefore can NOT be the safety story for wrongly-full bits.
+const dahDirtyParentsDDL = `
+CREATE TABLE IF NOT EXISTS dah_dirty_parents (
+    hash        BYTEA PRIMARY KEY,
+    partition   INT NOT NULL,
+    enqueued_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);`
 
 // pendingDeletesDDL creates the pending_deletes partitioned parent table. Each
 // hash partition leaf is created separately in createSchemaWithPoolFlag.

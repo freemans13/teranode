@@ -26,7 +26,8 @@ var (
 	prometheusDAHSweepStalled *prometheus.GaugeVec
 
 	// reconciliation backstop (runDAHReconcile)
-	prometheusDAHReconcileCorrected prometheus.Counter
+	prometheusDAHReconcileCorrected  prometheus.Counter
+	prometheusDAHDirtyParentsDrained prometheus.Counter
 
 	prometheusMetricsInitOnce sync.Once
 )
@@ -121,6 +122,13 @@ func doInitPrometheusMetrics() {
 		Namespace: "teranode",
 		Subsystem: "postgres_utxo",
 		Name:      "dah_reconcile_corrected_total",
-		Help:      "Total spent_progress rows corrected by the reconciliation backstop",
+		Help:      "Total txs rows whose spent_bits/last_spend_height were corrected by the reconciliation backstop",
+	})
+
+	prometheusDAHDirtyParentsDrained = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "postgres_utxo",
+		Name:      "dah_dirty_parents_drained_total",
+		Help:      "Total dirty-parent heal-queue rows drained by the reconciliation backstop",
 	})
 }

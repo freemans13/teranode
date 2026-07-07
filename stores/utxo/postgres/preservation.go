@@ -95,19 +95,20 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 //   - on the longest chain (unmined_since IS NULL) AND mined (has block_ids) AND fully
 //     spent.
 //
-// Setter-C reconcile (Task 7): fully-spentness is decided from the MAINTAINED
-// spent_progress counter (spent_progress = spendable_count AND spendable_count > 0),
+// Setter-C reconcile (proc v15): fully-spentness is decided from the MAINTAINED
+// spent_bits bitmap (spendable_count > 0 AND bit_count(spent_bits) = spendable_count),
 // NOT from a per-row count(*) re-aggregation over the spends table. This matches the
 // sweep proc (dah_sweep_proc.go) and SetMinedMulti (mined.go), so all three DAH setters
-// agree on "fully spent".
+// agree on "fully spent". The bitmap OR is idempotent, so bit_count can never overshoot
+// spendable_count — no ground-truth recount is needed to trust the gate.
 //
-// LAGGING-COUNTER RULE: the counter is folded forward-only by the BACKGROUND sweep,
-// which lags the tip by dahSafeTip's lag. A parent that just became fully spent may
-// still show spent_progress < spendable_count when its preservation expires (the sweep
+// LAGGING-BITMAP RULE: the bitmap is folded by the BACKGROUND sweep, which lags the
+// tip by dahSafeTip's lag. A parent that just became fully spent may still show
+// bit_count(spent_bits) < spendable_count when its preservation expires (the sweep
 // has not yet folded its last spend). In that case this path deliberately does NOT
 // stamp — it clears preserve_until and leaves delete_at_height NULL. That is SAFE: an
 // unstamped tx is never pruned, and the sweep stamps it (completion+1+retention, a
-// FUTURE height) once the fold catches up. Stamping "early" off a lagging counter would
+// FUTURE height) once the fold catches up. Stamping "early" off a lagging bitmap would
 // risk a wrong height; not stamping only defers reclaim by at most a sweep cycle. This
 // upholds the invariant "delete_at_height set ⟹ genuinely fully spent" without ever
 // leaving a not-yet-fully-spent tx stamped.
@@ -115,7 +116,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 // An ineligible tx just has preserve_until cleared, delete_at_height left NULL; the
 // sweep re-stamps it if/when it actually becomes eligible. This runs once per pruner
 // cycle over only the small set of expiring preservations (gated by px_preserve_until),
-// so it reads only two scalar columns per row (no spends join) off the hot delete path.
+// so it reads only two row-local columns (no spends join) off the hot delete path.
 func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) error {
 	// Retention 0 disables pruning: never stamp a DAH (mirrors the sweep's early
 	// return); just clear the expired preservations.
@@ -143,11 +144,11 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	// all in the same statement. A SELECT count(*) FROM upd returns the number of
 	// affected rows for logging.
 	//
-	// Setter-C reconcile (Task 7): the fully-spent branch reads the maintained counter
-	// (spent_progress = spendable_count AND spendable_count > 0) instead of the old
-	// count(*) re-aggregation over spends. A tx whose counter has NOT yet caught up (the
-	// background fold lags) fails this predicate → delete_at_height stays NULL and the
-	// sweep stamps it later. The fully-spent branch stamps at the sweep-consistent
+	// Setter-C reconcile (proc v15): the fully-spent branch reads the maintained bitmap
+	// (spendable_count > 0 AND bit_count(spent_bits) = spendable_count) instead of the
+	// old count(*) re-aggregation over spends. A tx whose bits have NOT all folded yet
+	// (the background fold lags) fails this predicate → delete_at_height stays NULL and
+	// the sweep stamps it later. The fully-spent branch stamps at the sweep-consistent
 	// completion height GREATEST(last_spend_height, mined_at_height)+1+retention ($3), so
 	// this safety-net path and the sweep never disagree on the DAH of the same tx.
 	var rowsAffected int64
@@ -160,7 +161,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 					     AND block_ids IS NOT NULL AND array_length(block_ids, 1) IS NOT NULL
 					     AND out_count > 0
 					     AND spendable_count > 0
-					     AND spent_progress = spendable_count
+					     AND bit_count(spent_bits) = spendable_count
 					THEN (GREATEST(COALESCE(last_spend_height, 0), COALESCE(mined_at_height, 0)) + 1 + $3)::int
 					ELSE NULL
 				END,
