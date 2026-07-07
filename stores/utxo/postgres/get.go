@@ -99,7 +99,7 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 		SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
 		       locked, conflicting, frozen, unmined_since,
 		       block_ids, block_heights, subtree_idxs
-		FROM txs WHERE hash = ANY($1::bytea[])`,
+		FROM unnest($1::bytea[]) AS h(v) JOIN txs ON txs.hash = h.v`,
 		hashes,
 	)
 	if err != nil {
@@ -484,14 +484,16 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		hashToItems[item.Hash] = append(hashToItems[item.Hash], item)
 	}
 
-	// Query 1: Bulk fetch from txs (metadata + state + raw_tx). `= ANY($1::bytea[])`
-	// keeps a single stable prepared-plan entry regardless of batch size, unlike a
-	// generated IN-list whose arity changes the statement each time.
+	// Query 1: Bulk fetch from txs (metadata + state + raw_tx). unnest-JOIN keeps a
+	// single stable prepared-plan entry regardless of batch size (like = ANY, unlike
+	// a generated IN-list) AND drives per-row runtime partition pruning: = ANY on the
+	// hash-partitioned parent descended ALL 8 leaf pkey btrees per probe (measured
+	// ~4.9 descents per looked-up row); the nested-loop join descends exactly one.
 	const q = `SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
 	             locked, conflicting, frozen, unmined_since, raw_tx,
 	             block_ids, block_heights, subtree_idxs
-	      FROM txs
-	      WHERE hash = ANY($1::bytea[])`
+	      FROM unnest($1::bytea[]) AS h(v)
+	      JOIN txs ON txs.hash = h.v`
 
 	rows, err := s.pool.Query(ctx, q, hashes)
 	if err != nil {
@@ -745,7 +747,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 			}
 
 			// Fetch raw_tx from txs (contains all outputs: locking_script+satoshis).
-			const q = `SELECT hash, raw_tx FROM txs WHERE hash = ANY($1::bytea[])`
+			const q = `SELECT hash, raw_tx FROM unnest($1::bytea[]) AS h(v) JOIN txs ON txs.hash = h.v`
 
 			rows, err := s.pool.Query(gCtx, q, chunk)
 			if err != nil {

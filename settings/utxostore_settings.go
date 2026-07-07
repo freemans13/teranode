@@ -67,7 +67,7 @@ type UtxoStoreSettings struct {
 	// procedure commits and re-fires fast instead of running one huge unbounded pass.
 	PostgresDAHSweepMaxWindowsPerCall int `key:"utxostore_postgresDAHSweepMaxWindowsPerCall" desc:"Max height bands drained per dah_sweep_batch proc CALL" default:"8" category:"UtxoStore" usage:"Bounds work per CALL so each sweep commits and re-fires fast, keeping pending_deletes continuously fed" type:"int"`
 	// Idle poll cadence (ms) once all partitions have caught up to the safe tip.
-	PostgresDAHSweepIdleIntervalMillis int `key:"utxostore_postgresDAHSweepIdleIntervalMillis" desc:"Idle poll cadence (ms) when the DAH sweep is caught up" default:"5000" category:"UtxoStore" usage:"How often to re-check once caught up" type:"int"`
+	PostgresDAHSweepIdleIntervalMillis int `key:"utxostore_postgresDAHSweepIdleIntervalMillis" desc:"Idle poll cadence (ms) when the DAH sweep is caught up" default:"1000" category:"UtxoStore" usage:"How often to re-check once caught up; 1s keeps bands small and smooths fold bursts" type:"int"`
 	// Max partitions swept concurrently per pass. The 8 partition CALLs each scan
 	// cold partition pages from disk; firing all 8 at once thrashes a single
 	// contended/cold disk (measured on a cold box: 8-way ~3-4 heights/s aggregate vs
@@ -81,6 +81,7 @@ type UtxoStoreSettings struct {
 	// size). Bounded per-band work is what lets the sweep keep up with IBD instead
 	// of freezing on an O(lifetime-spends) full-range re-aggregation.
 	PostgresDAHSweepBandHeights int `key:"utxostore_postgresDAHSweepBandHeights" desc:"Height band width per fold-forward DAH sweep step (proc v11)" default:"5000" category:"UtxoStore" usage:"Bounded heights folded per band; keeps per-CALL work O(new spends)" type:"int"`
+	PostgresDAHSweepBandRows    int `key:"utxostore_postgresDAHSweepBandRows" desc:"Spend-row work quantum per DAH sweep band (proc v15)" default:"200000" category:"UtxoStore" usage:"Caps the spends folded per band regardless of chain density; band_heights becomes the sparse-region max" type:"int"`
 	// Reconciliation backstop (Task 8): the fold maintains spent_progress rather than
 	// re-deriving it, so it can drift (arithmetic bug, lost update, or a reorg rewind
 	// re-fold that double-counts still-present spends) and never self-correct. A slow

@@ -281,13 +281,17 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	}
 	defer conn.Release()
 
+	// spent_bits is pre-sized to (out_count+7)/8 zero bytes so every later fold is
+	// a same-size in-place overwrite (see the schema.go spent_bits contract).
 	const insertSQL = `
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
-			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
+			spent_bits)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-		        $17, $18, $19, $20, $21)
+		        $17, $18, $19, $20, $21,
+		        decode(repeat('00', ($18 + 7) / 8), 'hex'))
 		ON CONFLICT (hash) DO NOTHING
 		RETURNING hash`
 	insertArgs := []interface{}{
@@ -341,14 +345,18 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// into the side table. out_frozens is NULL on create (no output frozen —
 	// freeze materialises the bitmap on demand); spendable_ins is NULL on create
 	// (set by ReAssignUTXO). RETURNING hash makes the ON CONFLICT DO NOTHING /
-	// no-row case detectable via pgx.ErrNoRows.
+	// no-row case detectable via pgx.ErrNoRows. spent_bits is pre-sized to
+	// (out_count+7)/8 zero bytes so every later fold is a same-size in-place
+	// overwrite (see the schema.go spent_bits contract).
 	const insertDirectSQL = `
 		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 			locked, conflicting, frozen, unmined_since,
 			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
-			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
+			spent_bits)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-		        $17, $18, $19, $20, $21)
+		        $17, $18, $19, $20, $21,
+		        decode(repeat('00', ($18 + 7) / 8), 'hex'))
 		ON CONFLICT (hash) DO NOTHING
 		RETURNING hash`
 
@@ -445,11 +453,14 @@ const createBatchChunkOverhead int64 = 1024
 // The pending_unmined projection is write-behind (see
 // pending_unmined_projector.go); the synchronous _pu CTE arm was removed from
 // this statement. RETURNING hash preserves the existing scan contract in
-// runChunk (rows.Scan(&hashBytes)).
+// runChunk (rows.Scan(&hashBytes)). spent_bits is pre-sized to (out_count+7)/8
+// zero bytes so every later fold is a same-size in-place overwrite (see the
+// schema.go spent_bits contract).
 const createBatchUNNESTSQL = `
 			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 				locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
-				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
+				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
+				spent_bits)
 			SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
 			       u.locked, u.conflicting, u.frozen,
 			       CASE WHEN u.mined THEN NULL::int ELSE u.unmined_since END,
@@ -457,7 +468,8 @@ const createBatchUNNESTSQL = `
 			       CASE WHEN u.mined THEN ARRAY[u.block_height] ELSE NULL::int[] END,
 			       CASE WHEN u.mined THEN ARRAY[u.subtree_idx] ELSE NULL::int[] END,
 			       CASE WHEN u.mined THEN u.block_height ELSE NULL::int END,
-			       u.utxo_hashes, u.out_count, u.spendable_count, u.out_spendables, u.coinbase_spending_height
+			       u.utxo_hashes, u.out_count, u.spendable_count, u.out_spendables, u.coinbase_spending_height,
+			       decode(repeat('00', (u.out_count + 7) / 8), 'hex')
 			FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
 			            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
 			            $11::int[], $12::boolean[], $13::int[], $14::int[], $15::int[],

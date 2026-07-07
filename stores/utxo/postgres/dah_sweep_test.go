@@ -132,22 +132,22 @@ func mineTx(t *testing.T, store *Store, tx *bt.Tx, minedHeight uint32) {
 }
 
 func TestSetMinedStampsFullySpentAndTagsHeight(t *testing.T) {
-	// Design-C (S6), Setter-C reconcile (Task 7): when a tx is mined onto the longest
+	// Design-C (S6), Setter-C reconcile (proc v15): when a tx is mined onto the longest
 	// chain and is already fully spent (spent-before-mined ordering) — as evidenced by
-	// the MAINTAINED spent_progress counter (folded by the background sweep) — then
-	// SetMinedMulti must stamp delete_at_height directly from the counter AND record
-	// mined_at_height. The mine path now reads spent_progress = spendable_count rather
-	// than re-aggregating the spends table, so the counter must be folded first (via the
-	// sweep) — this is the new division of labour: the sweep owns fully-spent detection,
-	// the mine path only stamps a tx the counter already shows complete.
+	// the MAINTAINED spent_bits bitmap (folded by the background sweep) — then
+	// SetMinedMulti must stamp delete_at_height directly from the bitmap AND record
+	// mined_at_height. The mine path reads bit_count(spent_bits) = spendable_count rather
+	// than re-aggregating the spends table, so the bitmap must be folded first (via the
+	// sweep) — this is the division of labour: the sweep owns fully-spent detection,
+	// the mine path only stamps a tx the bitmap already shows complete.
 	store, ctx := setupTestStore(t)
 	ret := int64(store.settings.GetUtxoStoreBlockHeightRetention())
 
 	tx := newUnminedSingleOutputTx(t, store)
 	spendAllOutputs(t, store, tx, 50) // fully spent at height 50 while unmined
 
-	// Fold the spends via the sweep so spent_progress reaches spendable_count while the
-	// tx is still unmined (the proc folds but does not stamp — mined gate).
+	// Fold the spends via the sweep so bit_count(spent_bits) reaches spendable_count
+	// while the tx is still unmined (the proc folds but does not stamp — mined gate).
 	require.NoError(t, store.SetBlockHeight(55))
 	_, err := procSweepUpTo(store, ctx, 55)
 	require.NoError(t, err)
