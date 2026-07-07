@@ -166,9 +166,6 @@ type BlockValidation struct {
 	// subtreeValidationClient manages subtree validation processes
 	subtreeValidationClient subtreevalidation.Interface
 
-	// subtreeDeDuplicator prevents duplicate processing of subtrees
-	subtreeDeDuplicator *DeDuplicator
-
 	// lastValidatedBlocks caches recently validated blocks for 2 minutes
 	lastValidatedBlocks *expiringmap.ExpiringMap[chainhash.Hash, *model.Block]
 
@@ -338,7 +335,6 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		utxoStore:                   utxoStore,
 		validatorClient:             validatorClient,
 		subtreeValidationClient:     subtreeValidationClient,
-		subtreeDeDuplicator:         NewDeDuplicator(tSettings.GetSubtreeValidationBlockHeightRetention()),
 		lastValidatedBlocks: expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute).
 			WithEvictionFunction(func(_ chainhash.Hash, block *model.Block) bool {
 				// Return pooled []Node backing slices to the per-class pool
@@ -1649,6 +1645,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 				// Create meta regenerator with peer URL for potential meta file recovery
 				metaRegenerator := u.createMetaRegenerator([]string{baseURL})
+				block.SetCheckpointConfirmedAncestor(u.checkpointConfirmedAncestor(decoupledCtx, block))
 				if ok, err := block.Valid(decoupledCtx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 					u.logger.Errorf("[ValidateBlock][%s] InvalidateBlock block is not valid in background: %v", block.String(), err)
 
@@ -1747,6 +1744,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 			// Create meta regenerator with peer URL for potential meta file recovery
 			metaRegenerator := u.createMetaRegenerator([]string{baseURL})
+			block.SetCheckpointConfirmedAncestor(u.checkpointConfirmedAncestor(ctx, block))
 			if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 				reason := "unknown"
 				if err != nil {
@@ -2055,6 +2053,55 @@ func (u *BlockValidation) ReValidateBlock(block *model.Block, baseURL string) {
 	}
 }
 
+// checkpointConfirmedAncestor reports whether block b is provably part of the main
+// chain that has already reached and matched the highest hardcoded checkpoint hash. It
+// is the ancestry predicate gating the below-checkpoint coinbase no-inflation skip in
+// model.checkBlockRewardAndFees (threaded via Block.SetCheckpointConfirmedAncestor):
+// only a confirmed checkpoint ancestor may skip, because the pinned checkpoint then
+// transitively commits its coinbase.
+//
+// It returns false — forcing full no-inflation enforcement — for any block above the
+// checkpoint (the skip cannot fire there anyway), while the main chain has not yet
+// reached the checkpoint (the forward/optimistic-checkpoint window), or when b is not
+// the main-chain block at its own height (a detached fork reconsidered via
+// reconsiderblock). Fail-safe: any lookup error or ambiguity yields false, so the
+// no-inflation check runs — correct, because non-fast-path blocks carry real fees.
+func (u *BlockValidation) checkpointConfirmedAncestor(ctx context.Context, b *model.Block) bool {
+	// The below-checkpoint no-inflation skip requires store fast-path support too, so the
+	// ancestry predicate cannot change the outcome on a store that never produces fee=0
+	// blocks. Short-circuit before any blockchain lookup on such stores (Aerospike, the
+	// unconfigured default, and most unit-test mocks).
+	if u.utxoStore == nil || !u.utxoStore.SupportsOutpointOnlySpend() {
+		return false
+	}
+
+	checkpoints := u.settings.ChainCfgParams.Checkpoints
+
+	highest := model.HighestCheckpointHeight(checkpoints)
+	if highest == 0 || b.Height > highest {
+		return false
+	}
+
+	pinned := model.HighestCheckpointHash(checkpoints)
+	if pinned == nil {
+		return false
+	}
+
+	// 1. The main chain must have reached the highest checkpoint height with the pinned hash.
+	cpHeaders, _, err := u.blockchainClient.GetBlockHeadersFromHeight(ctx, highest, 1)
+	if err != nil || len(cpHeaders) == 0 || !cpHeaders[0].Hash().IsEqual(pinned) {
+		return false
+	}
+
+	// 2. b must be the main-chain block at its own height (i.e. an ancestor of the checkpoint).
+	bHeaders, _, err := u.blockchainClient.GetBlockHeadersFromHeight(ctx, b.Height, 1)
+	if err != nil || len(bHeaders) == 0 {
+		return false
+	}
+
+	return bHeaders[0].Hash().IsEqual(b.Header.Hash())
+}
+
 // reValidateBlock performs a full block revalidation.
 // This method handles blocks that failed initial validation or need reverification.
 //
@@ -2133,6 +2180,7 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 
 	// Create meta regenerator with peer URL for potential meta file recovery during revalidation
 	metaRegenerator := u.createMetaRegenerator([]string{blockData.baseURL})
+	blockData.block.SetCheckpointConfirmedAncestor(u.checkpointConfirmedAncestor(ctx, blockData.block))
 	if ok, err := blockData.block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 		u.logger.Errorf("[ReValidateBlock][%s] InvalidateBlock block is not valid in background: %v", blockData.block.String(), err)
 
@@ -2161,6 +2209,24 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 // real checkpoint. See issue #1103.
 func (u *BlockValidation) quickValidateSkipsUtxoLock(block *model.Block) bool {
 	if !u.settings.BlockValidation.QuickValidateSkipUtxoLock {
+		return false
+	}
+	return block.Height <= blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)
+}
+
+// quickValidateOutpointOnly reports whether this block may use the below-checkpoint
+// outpoint-only fast path: skip decorate, zero fees, minimal create, and spend with
+// the UTXO-hash checksum disabled. Gated by the BlockValidation.OutpointOnlyBelowCheckpoint
+// setting (default off), restricted to stores that honour the fast path (u.utxoStore
+// .SupportsOutpointOnlySpend() — SQL today; Aerospike deferred to Stage B), and restricted
+// to blocks at or below the highest HARDCODED checkpoint. Uses the standard chain-config
+// checkpoints (not the catchup override) so it fails safe — never engaging above the real
+// checkpoint (spec §2.2, invariant I2).
+func (u *BlockValidation) quickValidateOutpointOnly(block *model.Block) bool {
+	if !u.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
+		return false
+	}
+	if !u.utxoStore.SupportsOutpointOnlySpend() { // Stage A is SQL-only; Aerospike deferred to Stage B
 		return false
 	}
 	return block.Height <= blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)
