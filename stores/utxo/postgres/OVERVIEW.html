@@ -170,9 +170,19 @@
     tiny tables keep the background machinery honest. None sit on the hot validation path, and all are
     negligible in size:
     <ul>
-      <li><code>dah_watermark</code> and <code>dah_part_watermark</code> — the deferred-deletion sweeper’s
-        “bookmark”: how far it has swept overall and per shard (see <a href="#deferred">§7</a>). One row total,
-        plus one row per shard. This is the bookmark referred to under crash-safety in <a href="#safety">§9</a>.</li>
+      <li><code>dah_part_watermark</code> — the deferred-deletion sweeper’s “bookmark”: how far each shard’s
+        sweep has progressed (one row per shard; see <a href="#deferred">§7</a>). This is the bookmark referred
+        to under crash-safety in <a href="#safety">§9</a>. <code>dah_sweep_control</code> next to it holds the
+        kill switch and tuning knobs, so operations can adjust the sweeper with a plain SQL update.</li>
+      <li><code>pending_deletes</code> — the pruner’s to-do list: (transaction, delete-at-height) pairs written
+        the moment a sticky note is stamped, and removed by whoever clears a note. The pruner reads <em>only</em>
+        this list — it never scans the big tables looking for work.</li>
+      <li><code>pending_unmined</code> — a small “not mined yet” listing kept up to date by a background writer
+        (with a filter so transactions that mine within a second or two never touch it at all), used by cleanup
+        jobs that expire long-unmined transactions.</li>
+      <li><code>dah_dirty_parents</code> — a tiny “please re-check these” queue: when a reorg un-spends a coin,
+        the affected parent transactions are queued here in the same database transaction, and the safety-net
+        worker re-derives their state from the ground truth soon after (see <a href="#safety">§9</a>).</li>
       <li><code>conflict_intents</code> — a small write-ahead log for conflicting-transaction handling
         (marking a transaction conflicting, and reversing that during a reorg). An intent row is written
         <em>before</em> the work begins and deleted when it completes, so a crash mid-operation is replayed
@@ -217,6 +227,8 @@
     <tr><td><code>unmined_since</code></td><td>Empty means “mined and on the main chain.” A value means “not on the main chain since height X” (still pending, or reorged out).</td></tr>
     <tr><td><code>mined_at_height</code>, <code>block_ids</code>, <code>block_heights</code>, <code>subtree_idxs</code></td><td>Which block(s) this transaction appears in. A transaction can be in more than one (e.g. across a reorg), so these are lists.</td></tr>
     <tr><td><code>preserve_until</code></td><td>“Do not delete before this height,” regardless of anything else.</td></tr>
+    <tr><td><code>spent_bits</code></td><td>A tiny bitmap — one bit per output — maintained by the background sweeper: bit #N set means “output #N has been spent.” When every spendable output’s bit is set, the transaction is fully spent. This is how the store knows a transaction is finished <em>without ever re-counting its spend rows</em> (see <a href="#deferred">§7</a>).</td></tr>
+    <tr><td><code>last_spend_height</code></td><td>The highest block height at which one of this transaction’s outputs was spent — one half of the “when did it finish?” answer.</td></tr>
     <tr><td style="color:#ffcc66"><code>delete_at_height</code></td><td><strong>The star of the show.</strong> If set, it’s the block height at which this transaction becomes safe to delete. Usually empty. Filled in <em>later</em>, by a background worker — see <a href="#deferred">§7</a>.</td></tr>
   </table>
 
@@ -313,18 +325,32 @@
 
     <rect x="150" y="210" width="600" height="86" rx="12" fill="#161d2e" stroke="#2c3650"/>
     <text x="170" y="238" fill="#e8edf6" font-size="14" font-weight="700">A bookmark keeps the sweeper honest</text>
-    <text x="170" y="262" fill="#9fb0cc" font-size="13">dah_watermark remembers the last height the sweeper finished. It resumes there after</text>
+    <text x="170" y="262" fill="#9fb0cc" font-size="13">dah_part_watermark remembers each shard's last swept height. The sweeper resumes there after</text>
     <a href="#safety"><text x="170" y="282" fill="#9fb0cc" font-size="13" style="cursor:pointer">a restart and never re-scans old ground. (It can also be rewound — see §9.)</text></a>
   </svg>
   <figcaption>Tag heights cheaply now → decide deletion calmly later → delete trivially.</figcaption>
   </figure>
 
-  <h3>What the sweeper actually decides</h3>
+  <h3>What the sweeper actually does: fold, don’t recount</h3>
+  <p>
+    The sweeper walks the new <code>spends</code> rows in height order, and for each one flips the matching
+    bit in the parent transaction’s <code>spent_bits</code> bitmap. That’s the whole trick: the answer to
+    “is this transaction fully spent?” is <em>carried forward on the transaction’s own row</em>, one cheap bit
+    at a time, instead of being re-derived by re-reading its whole spend history. Earlier versions of this store
+    re-counted a transaction’s spend rows at stamping time — for an old transaction spent over years, those rows
+    are scattered across cold disk, and that re-reading is exactly what fell behind on real networks. It is gone:
+    <strong>no stage of stamping ever re-reads spend history.</strong>
+  </p>
+  <p>
+    Flipping a bit twice is harmless (it’s already set) — so if a reorg forces the sweeper to re-process a height
+    range, nothing drifts and nothing double-counts. That one property (idempotence) is what makes the whole
+    scheme safe to re-run at any time.
+  </p>
   <p>For a transaction to get a <code>delete_at_height</code> sticky note, <strong>all</strong> of these must be true:</p>
   <ul>
     <li><strong>It’s mined</strong> (it’s in at least one block).</li>
     <li><strong>It’s on the main chain</strong> (<code>unmined_since</code> is empty).</li>
-    <li><strong>It’s fully spent</strong> — the number of spend rows for it equals its <code>spendable_count</code>.</li>
+    <li><strong>It’s fully spent</strong> — every spendable output’s bit is set (<code>bit_count(spent_bits) = spendable_count</code>) — a single-row check.</li>
     <li><strong>It isn’t preserved</strong> (<code>preserve_until</code> is empty).</li>
   </ul>
   <p>If so, the note is set to:</p>
@@ -337,15 +363,20 @@
 
   <h3>How the sweeper finds work without scanning everything</h3>
   <p>
-    The <code>spent_at_height</code> and <code>mined_at_height</code> values are written in roughly increasing order,
-    so they’re indexed with <strong>BRIN</strong> indexes — a tiny index type perfect for “values that climb over time.”
-    The sweeper walks forward in <strong>height windows</strong>, sized adaptively: big jumps over empty stretches,
-    smaller steps when a window is busy, so it never bites off more than it can chew and never skips anything.
+    Spend rows are written in roughly increasing height order, and an index on
+    <code>(spent_at_height, …)</code> lets the sweeper read them back in exactly that order. It works in
+    <strong>bands sized by row count</strong> (200,000 spends at a time by default), not by height: a band is a
+    fixed amount of work whether the chain is sparse or one block carries millions of spends — a single dense
+    block is simply drained as one band of its own. Each band’s sorting memory is pinned so the work never spills
+    to temporary files, and each band commits atomically (fold + stamp + bookmark advance in one transaction), so
+    an interruption costs at most one band.
   </p>
   <div class="panel tip">
-    <strong>A safety net underneath:</strong> a slow “backstop” loop rotates through the key-space a slice at a time
-    and re-checks for any fully-spent transaction the height sweep might somehow have missed. It normally finds
-    nothing — it exists so that “we’ll get to it eventually” is a guarantee, not a hope.
+    <strong>A safety net underneath:</strong> a “reconciler” loop re-derives <code>spent_bits</code> from the
+    actual <code>spends</code> rows for a bounded slice of transactions at a time — and it drains the
+    <code>dah_dirty_parents</code> queue <em>first</em>, so anything a reorg touched is re-checked within seconds
+    rather than whenever the slow rotation happens to arrive. It normally finds nothing — it exists so that
+    “we’ll get to it eventually” is a guarantee, not a hope.
   </div>
 
   <div class="panel why">
@@ -363,11 +394,14 @@
       Create, Spend, mark-as-mined, lock/unlock. Runs constantly, batched for speed. Only ever <em>tags heights</em>;
       never computes delete-ability.</div>
     <div class="panel"><span class="tag bg">BACKGROUND</span><h3 style="margin-top:8px">The DAH sweeper (“Worker 2”)</h3>
-      Wakes on a timer, sweeps recent height windows, stamps/clears <code>delete_at_height</code>, advances the
-      bookmark. Plus the slow key-space backstop.</div>
+      One loop per shard: folds each new spend into the parent’s <code>spent_bits</code> bitmap in row-bounded
+      bands, stamps <code>delete_at_height</code> the moment a mined transaction’s bitmap is full, feeds
+      <code>pending_deletes</code>, and advances its bookmark — all in one atomic step per band. Plus the
+      reconciler safety net.</div>
     <div class="panel"><span class="tag bg">BACKGROUND</span><h3 style="margin-top:8px">The pruner</h3>
-      Deletes transactions whose <code>delete_at_height</code> has arrived, removing their <code>spends</code> rows
-      alongside them, in bounded batches. Intentionally simple so it’s fast.</div>
+      Reads its to-do list (<code>pending_deletes</code>) and deletes every transaction whose
+      <code>delete_at_height</code> has arrived, removing its <code>spends</code> rows alongside it, in bounded
+      set-based batches, all shards in parallel. Intentionally simple so it’s fast.</div>
     <div class="panel"><span class="tag">DESIGN</span><h3 style="margin-top:8px">The contract between them</h3>
       The pruner <strong>trusts</strong> the sticky note. So the responsibility for “only set the note when it’s
       truly safe” lives with the sweeper and the height-tagging steps — not the pruner.</div>
@@ -379,9 +413,9 @@
   <h3>Chain reorganisations (a block gets undone)</h3>
   <p>If history changes, a transaction that looked finished might become un-spent or fall off the main chain. The store handles this:</p>
   <ul>
-    <li><strong>Un-spend</strong> removes a <code>spends</code> row and <strong>clears</strong> the transaction’s <code>delete_at_height</code> — it’s no longer fully spent, so it must not be deleted.</li>
-    <li><strong>Falling off the main chain</strong> sets <code>unmined_since</code> and <strong>clears</strong> <code>delete_at_height</code> — a transaction that’s no longer on the main chain must not be pruned at its old note.</li>
-    <li><strong>Rewinding the bookmark</strong>: after a reorg the watermark is moved back so the affected height range gets swept again with fresh facts.</li>
+    <li><strong>Un-spend</strong> removes the <code>spends</code> rows, <strong>clears exactly those bits</strong> in the parent’s <code>spent_bits</code>, <strong>clears</strong> <code>delete_at_height</code>, removes the parent from <code>pending_deletes</code> — and queues the parent in <code>dah_dirty_parents</code>, all in one database transaction, so the safety net re-verifies it from ground truth within seconds.</li>
+    <li><strong>Falling off the main chain</strong> sets <code>unmined_since</code> and <strong>clears</strong> <code>delete_at_height</code> (and the <code>pending_deletes</code> entry) — a transaction that’s no longer on the main chain must not be pruned at its old note.</li>
+    <li><strong>Rewinding the bookmark</strong>: after a reorg the watermark is moved back so the affected height range gets swept again with fresh facts. Because folding is idempotent (setting a set bit changes nothing), re-sweeping the surviving history is completely harmless — this used to be a genuine drift hazard in the counter-based design, and the bitmap removed it by construction. The sweeper’s bookmark advance is also a compare-and-swap, so a rewind that lands mid-band makes the band roll back and re-run rather than being silently overwritten.</li>
   </ul>
   <div class="panel tip">This is the key rule that keeps the “dumb, fast pruner” safe: whenever a transaction stops being eligible, the <em>setters</em> clear its note. The pruner never has to second-guess.</div>
 
@@ -407,7 +441,12 @@
     <li><strong>Batching:</strong> creates, spends, reads and unlocks are grouped and sent to the database in bulk (fewer round-trips, bigger set-based queries).</li>
     <li><strong>One-row reads:</strong> validating a spend reads a single row (thanks to the folded outputs).</li>
     <li><strong>Append-only spends:</strong> spending never rewrites the transaction row.</li>
-    <li><strong>BRIN indexes</strong> on the climbing height columns are tiny and nearly free to maintain.</li>
+    <li><strong>Shard-exact lookups:</strong> batch statements address the sharded tables through a join that
+      lets PostgreSQL route each hash to exactly its own shard’s index — the naive form probed all 8 shard
+      indexes per lookup (measured: ~5 index descents per row where 1 suffices).</li>
+    <li><strong>No index on anything the background writers update:</strong> the fold/stamp columns are
+      deliberately unindexed so those updates stay cheap in-page operations (an index there measurably
+      collapsed update performance).</li>
   </ul>
 
   <div class="panel key">
@@ -478,10 +517,11 @@
   <h3>The payoff — and the price</h3>
   <p>
     Concretely (on a developer laptop, so treat as indicative, not production figures): the older normalised SQL
-    store handles on the order of <strong>~9,000</strong> transactions/second; this store reaches roughly
-    <strong>~90,000</strong>/second with no pruning, and a stable <strong>~75–88,000</strong>/second while the
-    pruner runs and keeps the table bounded. Most of that gap is simply <em>not</em> paying the row-explosion and
-    index-churn costs above.
+    store handles on the order of <strong>~9,000</strong> transactions/second; this store sustains roughly
+    <strong>~99,000</strong>/second <em>while the sweeper and pruner run continuously and hold the table
+    bounded</em> — creation, spending, mining, stamping and reclaim all at once. Most of that gap is simply
+    <em>not</em> paying the row-explosion and index-churn costs above; the rest came from measuring where the
+    database spent its time (write-ahead-log volume per transaction, wasted shard probes) and removing each cost.
   </p>
   <div class="panel why">
     <strong>This is a deliberate trade, not a free win.</strong> Denormalising costs flexibility: you can’t easily
@@ -580,8 +620,9 @@
     <tr><td><strong>Deferred</strong></td><td>Done later, on purpose — the delete-ability decision is moved off the busy path to a background worker.</td></tr>
     <tr><td><strong>retention</strong></td><td>A safety buffer of blocks kept beyond completion, so nothing is deleted before a reorg could realistically undo it.</td></tr>
     <tr><td><strong>completion_height</strong></td><td>The latest height among a transaction’s spends and its mined height — when it truly “finished.”</td></tr>
-    <tr><td><strong>watermark</strong></td><td>The bookmark (<code>dah_watermark</code>) recording how far the sweeper has processed.</td></tr>
-    <tr><td><strong>backstop</strong></td><td>A slow last-resort scan of the whole key-space to catch anything the height sweep missed.</td></tr>
+    <tr><td><strong>watermark</strong></td><td>The bookmark (<code>dah_part_watermark</code>, one per shard) recording how far the sweeper has processed.</td></tr>
+    <tr><td><strong>fold / <code>spent_bits</code></strong></td><td>The sweeper “folds” each new spend into a per-output bitmap on the parent transaction’s row. Full bitmap = fully spent — decided without ever re-reading the spend history.</td></tr>
+    <tr><td><strong>reconciler</strong></td><td>The safety-net loop that re-derives <code>spent_bits</code> from the actual spend rows (dirty-queue first, then a slow rotation) and un-stamps anything wrong.</td></tr>
     <tr><td><strong>reorg</strong></td><td>A chain reorganisation: recent blocks are undone and replaced, so some transactions change status.</td></tr>
     <tr><td><strong>mined / on the main chain</strong></td><td>“Mined” = included in a block. “On the main chain” = on the agreed-upon longest history (tracked by <code>unmined_since</code> being empty).</td></tr>
     <tr><td><strong>coinbase maturity</strong></td><td>Block-reward coins can’t be spent until a number of blocks have passed.</td></tr>
@@ -594,8 +635,9 @@
   <p class="muted" style="font-size:13px">
     This is a conceptual overview of the <code>stores/utxo/postgres</code> package. The authoritative source is the
     code itself — start with <code>schema.go</code> (the tables), <code>spend.go</code> / <code>create.go</code> /
-    <code>get.go</code> (the hot path), <code>dah_sweep.go</code> (the deferred sweeper) and
-    <code>pruner_provider.go</code> (the pruner). Tuning notes live in <code>TUNING.md</code>.
+    <code>get.go</code> (the hot path), <code>dah_sweep_proc.go</code> (the fold/stamp sweeper),
+    <code>dah_reconcile.go</code> (the safety net) and <code>pruner_provider.go</code> (the pruner).
+    Tuning notes live in <code>TUNING.md</code>. Requires PostgreSQL 14+.
   </p>
 
 </div>
