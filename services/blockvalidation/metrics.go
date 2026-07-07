@@ -260,15 +260,6 @@ func _initPrometheusMetrics() {
 		},
 	)
 
-	prometheusBlockValidationOutpointOnlyBlocks = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: "teranode",
-			Subsystem: "blockvalidation",
-			Name:      "outpoint_only_blocks_total",
-			Help:      "Total number of blocks processed via the below-checkpoint outpoint-only fast path (OutpointOnlyBelowCheckpoint setting on, height at or below highest checkpoint). A rising rate during IBD indicates the fast path is active.",
-		},
-	)
-
 	// Initialize catchup operation metrics
 	prometheusCatchupDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
