@@ -632,8 +632,10 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	//     Can only be done with a valid texMetaStore passed in
 	//     Skipped below the hardcoded checkpoint on the outpoint-only fast path:
 	//     the checkpoint-anchored chain already certifies order/blessing, and the
-	//     integrity floor (PoW, CheckMerkleRoot, checkDuplicateTransactions)
-	//     still runs earlier in this function (steps 1-11).
+	//     integrity floor still runs earlier in this function (steps 1-11): PoW
+	//     and checkDuplicateTransactions unconditionally, and CheckMerkleRoot
+	//     whenever a subtree store is present — which every caller that reaches
+	//     this skip passes (see skipOrderAndBlessedBelowCheckpoint).
 	if txMetaStore != nil {
 		if b.skipOrderAndBlessedBelowCheckpoint(settings) {
 			logger.Debugf("[Block:Valid][%s] skipping validOrderAndBlessed for block at height %d at or below hardcoded checkpoint (outpoint-only fast path)", b.String(), b.Height)
@@ -693,11 +695,12 @@ func (b *Block) releaseTxMap() {
 // checkpoint. Below a hardcoded checkpoint the pinned block hash already
 // certifies transaction order, uniqueness and blessing: a block whose
 // transactions differed in any way would produce a different merkle root and
-// could not carry the checkpoint-anchored header chain. PoW, CheckMerkleRoot
-// and checkDuplicateTransactions (CVE-2012-2459) still run unconditionally —
-// they bind the local bytes to that certified chain. This mirrors the native
-// catchup path (quickValidateBlock), which never runs Valid() below the
-// checkpoint at all.
+// could not carry the checkpoint-anchored header chain. PoW and
+// checkDuplicateTransactions (CVE-2012-2459) still run unconditionally, and
+// CheckMerkleRoot runs whenever a subtree store is present (step 8) — which
+// every caller reaching this skip passes, so the local bytes are bound to that
+// certified chain. This mirrors the native catchup path (quickValidateBlock),
+// which never runs Valid() below the checkpoint at all.
 func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings) bool {
 	if tSettings == nil || !tSettings.BlockValidation.OutpointOnlyBelowCheckpoint {
 		return false
