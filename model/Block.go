@@ -580,7 +580,13 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	// 9. Check that the total fees of the block are less than or equal to the block reward.
 	// 10. Check that the coinbase transaction includes the correct block reward.
 	if b.Height > 0 {
-		err = b.checkBlockRewardAndFees(settings.ChainCfgParams)
+		// The below-checkpoint fee=0 skip is only tolerated on a store that can actually
+		// produce those blocks (the outpoint-only fast path); every other store keeps full
+		// no-inflation enforcement below the checkpoint. Computed here because model cannot
+		// see the store type directly.
+		storeSupportsOutpointOnly := txMetaStore != nil && txMetaStore.SupportsOutpointOnlySpend()
+
+		err = b.checkBlockRewardAndFees(settings.ChainCfgParams, storeSupportsOutpointOnly)
 		if err != nil {
 			return false, err
 		}
@@ -684,40 +690,49 @@ func (b *Block) releaseTxMap() {
 // height of the block we are checking for.
 
 // TODO - do this another way, if necessary
-func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params) error {
+func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOutpointOnly bool) error {
 	if b.Height == 0 {
 		return nil // Skip this check
 	}
 
-	// Skip the coinbase no-inflation check (coinbaseOutput <= subsidy + fees) at or below
-	// the highest HARDCODED checkpoint. This is UNCONDITIONAL — not gated on the
-	// OutpointOnlyBelowCheckpoint setting or the store — for two reasons:
+	// Skip the coinbase no-inflation check (coinbaseOutput <= subsidy + fees) at or below the
+	// highest HARDCODED checkpoint, but ONLY on a store that can actually produce the fee=0
+	// subtrees this skip exists to tolerate (storeSupportsOutpointOnly). The two conditions
+	// answer two distinct review concerns:
 	//
-	//  1. Correctness: the outpoint-only fast path persists subtree fees as 0. A block
-	//     synced that way must still revalidate on reconsiderblock/RevalidateBlock even
-	//     after the operator restores the default (flag off) — a flag-gated skip would
-	//     recompute coinbaseOutput (subsidy+realFees) > subtreeFees(0)+subsidy and wrongly
-	//     reject a genuinely-valid, checkpoint-pinned block as BLOCK_INVALID. The read side
-	//     cannot distinguish a fast-path fee=0 block from a default one, so the skip cannot
-	//     depend on live config.
-	//  2. Safety: below a hardcoded checkpoint the no-inflation property is enforced by chain
-	//     ADOPTION, not by this per-block arithmetic. Block.Valid can run on a below-checkpoint
-	//     block whose ancestry to the pinned hash is not yet established (native catchup's
-	//     standard path, initial sync before the checkpoint is reached, a forward/optimistic
-	//     checkpoint, or reconsiderblock on a stored fork block), so this is a deliberate
-	//     defence-in-depth reduction on those transient paths. It is safe because such a block
-	//     cannot become the chain a node actually adopts: native catchup (services/blockvalidation
-	//     /catchup.go) and legacy headers-first (services/legacy/netsync/manager.go) refuse a
-	//     header chain whose in-range checkpoint hash mismatches the pinned hash, and the FSM
-	//     cannot enter RUNNING until the tip reaches the highest checkpoint
-	//     (blockchain.guardRunBelowHighestCheckpoint) — forcing a reorg onto the checkpoint-
-	//     connected, inflation-free chain. The pinned checkpoint thus commits transitively to
-	//     every adopted ancestor's coinbase, making this check redundant for any adopted chain.
+	//  1. NOT gated on the OutpointOnlyBelowCheckpoint setting. The outpoint-only fast path
+	//     persists subtree fees as 0. A block synced that way must still revalidate on
+	//     reconsiderblock/RevalidateBlock even after the operator restores the default (flag
+	//     off) — a flag-gated skip would recompute coinbaseOutput (subsidy+realFees) >
+	//     subtreeFees(0)+subsidy and wrongly reject a genuinely-valid, checkpoint-pinned block
+	//     as BLOCK_INVALID. The read side cannot distinguish a fast-path fee=0 block from a
+	//     default one, so the skip cannot depend on live config.
+	//  2. GATED on store support. On a store that cannot run the fast path (Aerospike, or the
+	//     unconfigured default) real fees are always written, no fee=0 block can exist, and there
+	//     is nothing to tolerate — so full no-inflation enforcement is retained below the
+	//     checkpoint exactly as before this feature. Without this gate the skip would silently
+	//     disable the coinbase no-inflation check on every node, including ones where the feature
+	//     is a documented no-op. storeSupportsOutpointOnly is computed at the Block.Valid call
+	//     site (which holds the store); model cannot see the store type directly.
+	//
+	// Safety of the residual skip (supported store, at/below checkpoint): below a hardcoded
+	// checkpoint the no-inflation property is enforced by chain ADOPTION, not by this per-block
+	// arithmetic. Block.Valid can run on a below-checkpoint block whose ancestry to the pinned
+	// hash is not yet established (native catchup's standard path, initial sync before the
+	// checkpoint is reached, a forward/optimistic checkpoint, or reconsiderblock on a stored fork
+	// block). Such a block cannot become the chain a node actually adopts: native catchup
+	// (services/blockvalidation/catchup.go) and legacy headers-first (services/legacy/netsync
+	// /manager.go) refuse a header chain whose in-range checkpoint hash mismatches the pinned
+	// hash, and the FSM cannot enter RUNNING until the tip reaches the highest checkpoint
+	// (blockchain.guardRunBelowHighestCheckpoint, regression-tested by TestGuardRunBelowHighest
+	// Checkpoint) — forcing a reorg onto the checkpoint-connected, inflation-free chain. The
+	// pinned checkpoint thus commits transitively to every adopted ancestor's coinbase, making
+	// this check redundant for any adopted chain.
 	//
 	// HighestCheckpointHeight is the single source of truth shared with the fast-path write
 	// side, so the fee-write boundary and this fee-skip boundary cannot diverge (invariant
 	// I3); see model/checkpoint.go.
-	if b.Height <= HighestCheckpointHeight(params.Checkpoints) {
+	if storeSupportsOutpointOnly && b.Height <= HighestCheckpointHeight(params.Checkpoints) {
 		return nil
 	}
 
