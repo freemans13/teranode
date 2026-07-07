@@ -112,6 +112,12 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// The UPDATE is wrapped in a CTE so that any fully-spent tx that gets an inline
 		// DAH stamp is also upserted into pending_deletes in the same statement. The
 		// outer SELECT returns hash, block_ids so the drain loop is unchanged.
+		//
+		// FROM unnest(...) JOIN instead of WHERE hash = ANY(...): with = ANY on the
+		// hash-partitioned parent every probe descended ALL 8 leaf pkey btrees
+		// (measured: ~4.9 index descents per looked-up row across the hot path);
+		// the unnest nested-loop join drives per-row runtime partition pruning, so
+		// each hash descends exactly its own leaf.
 		updateSQL = `WITH upd AS (
 				UPDATE txs SET
 					block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
@@ -127,8 +133,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 						THEN (GREATEST(COALESCE(last_spend_height, 0), $5) + 1 + $6)::int
 						ELSE delete_at_height
 					END
-				WHERE hash = ANY($1)
-				RETURNING hash, block_ids, delete_at_height
+				FROM unnest($1::bytea[]) AS h(v)
+				WHERE txs.hash = h.v
+				RETURNING txs.hash, block_ids, delete_at_height
 			),
 			_pd AS (
 				INSERT INTO pending_deletes (hash, delete_at_height)
@@ -142,8 +149,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 			block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
 			subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
 			locked = false
-		WHERE hash = ANY($1)
-		RETURNING hash, block_ids`
+		FROM unnest($1::bytea[]) AS h(v)
+		WHERE txs.hash = h.v
+		RETURNING txs.hash, block_ids`
 	}
 
 	numUpdateChunks := 0

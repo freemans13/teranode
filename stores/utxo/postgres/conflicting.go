@@ -315,7 +315,7 @@ func (s *Store) sendUnlockBatch(batch []*batchUnlockItem) {
 	// redundant row version (dead tuple) for a no-op unlock. The end state is
 	// identical (locked=false); this only avoids needless churn that competes with
 	// the reclaim path for autovacuum.
-	_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false WHERE hash = ANY($1) AND locked = true`, hashBytes)
+	_, err := s.pool.Exec(ctx, `UPDATE txs SET locked = false FROM unnest($1::bytea[]) AS h(v) WHERE txs.hash = h.v AND locked = true`, hashBytes)
 	if err != nil {
 		for _, item := range batch {
 			item.done <- errors.NewStorageError("[Unlock] bulk update", err)
@@ -366,26 +366,29 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 			hashBytes[j] = chunk[j][:]
 		}
 
+		// unnest-JOIN instead of a generated IN-list: one stable prepared plan for
+		// every batch size (an IN-list re-plans per arity) and per-row runtime
+		// partition pruning (an IN/= ANY probe descends all 8 leaf pkey btrees).
 		if setValue {
-			inClause, args := buildINClauseLocal(hashBytes, 1)
 			// C2: when locking (delete_at_height cleared), also remove the hashes from
 			// pending_deletes in the same statement via a CTE. The DELETE is a harmless
 			// no-op for hashes that were never stamped.
-			q := fmt.Sprintf(`WITH upd AS (
-				UPDATE txs SET locked = true, delete_at_height = NULL WHERE hash IN %s RETURNING hash
+			const q = `WITH upd AS (
+				UPDATE txs SET locked = true, delete_at_height = NULL
+				  FROM unnest($1::bytea[]) AS h(v) WHERE txs.hash = h.v
+				RETURNING txs.hash
 			)
-			DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)`, inClause)
+			DELETE FROM pending_deletes WHERE hash IN (SELECT hash FROM upd)`
 			// NOTE: the CTE above makes the outer statement a DELETE, so
 			// CommandTag.RowsAffected() reflects rows deleted from pending_deletes —
 			// NOT rows updated in txs. Do not add accounting logic here that relies on
 			// the returned row count.
-			if _, err := s.pool.Exec(ctx, q, args...); err != nil {
+			if _, err := s.pool.Exec(ctx, q, hashBytes); err != nil {
 				return errors.NewStorageError("failed to set locked flag", err)
 			}
 		} else {
-			inClause, args := buildINClauseLocal(hashBytes, 1)
-			q := fmt.Sprintf(`UPDATE txs SET locked = false WHERE hash IN %s AND locked = true`, inClause)
-			if _, err := s.pool.Exec(ctx, q, args...); err != nil {
+			const q = `UPDATE txs SET locked = false FROM unnest($1::bytea[]) AS h(v) WHERE txs.hash = h.v AND locked = true`
+			if _, err := s.pool.Exec(ctx, q, hashBytes); err != nil {
 				return errors.NewStorageError("failed to clear locked flag", err)
 			}
 		}

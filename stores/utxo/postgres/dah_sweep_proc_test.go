@@ -446,11 +446,11 @@ func TestDAHSweepProcSkipsWatermarkOnLockContention(t *testing.T) {
 	require.Equal(t, safeTip, wmAfter, "after lock release the watermark must reach safe tip")
 }
 
-// TestBootstrapInstallsV15SpentBitmapProc verifies that the bootstrapped
-// procedure is the v15 spent-bitmap fold: version recorded as 15, stamp gate on
+// TestBootstrapInstallsV16SpentBitmapProc verifies that the bootstrapped
+// procedure is the v16 spent-bitmap fold: version recorded as 16, stamp gate on
 // bit_count(spent_bits), no spent_progress counter reference anywhere, and (kept
 // from v14) no in-proc lock_timeout.
-func TestBootstrapInstallsV15SpentBitmapProc(t *testing.T) {
+func TestBootstrapInstallsV16SpentBitmapProc(t *testing.T) {
 	store, ctx := setupTestStore(t)
 
 	var version int
@@ -458,7 +458,7 @@ func TestBootstrapInstallsV15SpentBitmapProc(t *testing.T) {
 		`SELECT proc_version FROM dah_sweep_control WHERE id = 1`).Scan(&version)
 	require.NoError(t, err)
 	require.Equal(t, dahSweepProcVersion, version)
-	require.Equal(t, 15, version)
+	require.Equal(t, 16, version)
 
 	var src string
 	err = store.pool.QueryRow(ctx,

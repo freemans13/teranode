@@ -109,7 +109,16 @@ import (
 // The watermark advance is a CAS (WHERE last_swept_height = v_from): a
 // concurrent reorg rewind mid-CALL rolls the band back and ends the CALL so
 // the rewound range is always re-folded.
-const dahSweepProcVersion = 15
+//
+// Bumped 15→16: single-byte fast path in the fold. Profiling the pruned bench
+// showed the CALL at 12.3% of DB time while ~100% of its parents' band spends
+// land in ONE mask byte (any <=8-output tx, any single-spend fold). Those
+// parents now take an in-place set_byte OR (upd_fast) and skip the gap-filled
+// string_agg/LATERAL mask machinery entirely; multi-byte parents keep the
+// general path (upd_slow). Semantics identical — OR is idempotent and
+// position-exact — and a width-guard routes any short spent_bits row to
+// "unchanged, no stamp" (reconciler heals) instead of a band-aborting error.
+const dahSweepProcVersion = 16
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaInternal (plain DDL);
@@ -289,17 +298,58 @@ BEGIN
                             ELSE false END
                  GROUP BY b.prev_tx_hash, b.prev_output_idx / 8
             ),
+            fanout AS (
+                SELECT hash, count(*) AS n_bytes, min(byte_idx) AS b_idx, max(max_h) AS max_h
+                  FROM byte_agg GROUP BY hash
+            ),
+            -- FAST PATH (v16): a parent whose band spends all land in ONE mask byte
+            -- (every <=8-output tx, and any single-spend fold — the overwhelming
+            -- majority) needs no gap-filled mask at all: OR the one byte in place
+            -- with set_byte. Semantically identical to the general path because OR
+            -- is idempotent and position-exact. The width guard routes a (should-
+            -- not-exist) short spent_bits row to "unchanged bits, no stamp", which
+            -- the reconciler heals — never an error that aborts the band.
+            upd_fast AS (
+                UPDATE txs_p%1$s t
+                   SET (spent_bits, last_spend_height, delete_at_height) = (
+                       SELECT x.nb,
+                              GREATEST(COALESCE(t.last_spend_height, 0), f.max_h)::int,
+                              CASE
+                                  WHEN bit_count(x.nb) = t.spendable_count
+                                       AND t.spendable_count > 0
+                                       AND t.mined_at_height IS NOT NULL
+                                       AND t.delete_at_height IS NULL
+                                       AND t.preserve_until IS NULL
+                                       AND t.unmined_since IS NULL
+                                  THEN (GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), f.max_h),
+                                                 t.mined_at_height) + 1 + $3)::int
+                                  ELSE t.delete_at_height
+                              END
+                         FROM (SELECT CASE WHEN f.b_idx < octet_length(t.spent_bits)
+                                           THEN set_byte(t.spent_bits, f.b_idx,
+                                                         get_byte(t.spent_bits, f.b_idx) | ba.byte_val)
+                                           ELSE t.spent_bits
+                                      END AS nb) x
+                   )
+                  FROM fanout f
+                  JOIN byte_agg ba ON ba.hash = f.hash AND ba.byte_idx = f.b_idx
+                 WHERE t.hash = f.hash
+                   AND f.n_bytes = 1
+                RETURNING t.hash, t.delete_at_height
+            ),
             mask_agg AS (
                 SELECT hb.hash,
                        decode(string_agg(lpad(to_hex(COALESCE(ba.byte_val, 0)), 2, '0'), '' ORDER BY gs.i), 'hex') AS mask,
                        hb.max_h
-                  FROM (SELECT hash, max(byte_idx) AS max_byte, max(max_h) AS max_h
-                          FROM byte_agg GROUP BY hash) hb
+                  FROM (SELECT ba2.hash, max(ba2.byte_idx) AS max_byte, max(ba2.max_h) AS max_h
+                          FROM byte_agg ba2
+                          JOIN fanout f2 ON f2.hash = ba2.hash AND f2.n_bytes > 1
+                         GROUP BY ba2.hash) hb
                  CROSS JOIN LATERAL generate_series(0, hb.max_byte) gs(i)
                   LEFT JOIN byte_agg ba ON ba.hash = hb.hash AND ba.byte_idx = gs.i
                  GROUP BY hb.hash, hb.max_h
             ),
-            upd AS (
+            upd_slow AS (
                 UPDATE txs_p%1$s t
                    SET (spent_bits, last_spend_height, delete_at_height) = (
                        SELECT COALESCE(x.nb, t.spent_bits),
@@ -325,6 +375,11 @@ BEGIN
                   FROM mask_agg d
                  WHERE t.hash = d.hash
                 RETURNING t.hash, t.delete_at_height
+            ),
+            upd AS (
+                SELECT hash, delete_at_height FROM upd_fast
+                UNION ALL
+                SELECT hash, delete_at_height FROM upd_slow
             ),
             ins AS (
                 INSERT INTO pending_deletes_p%1$s (hash, delete_at_height)

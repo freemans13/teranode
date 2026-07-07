@@ -62,7 +62,7 @@ type UtxoStoreSettings struct {
 	// procedure commits and re-fires fast instead of running one huge unbounded pass.
 	PostgresDAHSweepMaxWindowsPerCall int `key:"utxostore_postgresDAHSweepMaxWindowsPerCall" desc:"Max height bands drained per dah_sweep_batch proc CALL" default:"8" category:"UtxoStore" usage:"Bounds work per CALL so each sweep commits and re-fires fast, keeping pending_deletes continuously fed" type:"int"`
 	// Idle poll cadence (ms) once all partitions have caught up to the safe tip.
-	PostgresDAHSweepIdleIntervalMillis int `key:"utxostore_postgresDAHSweepIdleIntervalMillis" desc:"Idle poll cadence (ms) when the DAH sweep is caught up" default:"5000" category:"UtxoStore" usage:"How often to re-check once caught up" type:"int"`
+	PostgresDAHSweepIdleIntervalMillis int `key:"utxostore_postgresDAHSweepIdleIntervalMillis" desc:"Idle poll cadence (ms) when the DAH sweep is caught up" default:"1000" category:"UtxoStore" usage:"How often to re-check once caught up; 1s keeps bands small and smooths fold bursts" type:"int"`
 	// Max partitions swept concurrently per pass. The 8 partition CALLs each scan
 	// cold partition pages from disk; firing all 8 at once thrashes a single
 	// contended/cold disk (measured on a cold box: 8-way ~3-4 heights/s aggregate vs
