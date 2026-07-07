@@ -360,6 +360,10 @@ func (s *Store) Close(ctx context.Context) error {
 	}
 }
 
+// SupportsOutpointOnlySpend reports true: the SQL store honours the below-checkpoint
+// outpoint-only fast path (SkipExtendedInputs on Create, SkipUTXOHashCheck on Spend).
+func (s *Store) SupportsOutpointOnlySpend() bool { return true }
+
 // Health checks the database connection and returns status information.
 func (s *Store) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	details := fmt.Sprintf("SQL Engine is %s", s.engine)

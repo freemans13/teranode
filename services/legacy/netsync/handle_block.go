@@ -23,7 +23,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
 	"github.com/bsv-blockchain/teranode/services/validator"
-	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -415,11 +414,15 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	// is the intended guard since nothing should mutate it past this point.
 	txMap.Freeze()
 
-	if err = sm.extendTransactions(ctx, bi, txOrder, txMap); err != nil {
+	// Compute the below-checkpoint fast-path mode ONCE for this block and thread it into
+	// the phases (extend, create-subtrees) so decorate-skip and fee=0 cannot disagree.
+	outpointOnly := sm.legacyOutpointOnly(bi.height)
+
+	if err = sm.extendTransactions(ctx, bi, txOrder, txMap, outpointOnly); err != nil {
 		return nil, 0, err
 	}
 
-	if err = sm.createSubtrees(ctx, bi, txOrder, txMap, subtreeSlices, subtreeDatas, subtreeMetas); err != nil {
+	if err = sm.createSubtrees(ctx, bi, txOrder, txMap, subtreeSlices, subtreeDatas, subtreeMetas, outpointOnly); err != nil {
 		return nil, 0, err
 	}
 
@@ -510,15 +513,15 @@ func (sm *SyncManager) quickValidationAllowed(blockHeight uint32) bool {
 // outpoint-only fast path on the legacy netsync route: skip the bulk decorate,
 // stamp subtree fees as 0, do a minimal (inputs-only) UTXO create, and spend
 // using the validator's outpoint-only mode. Default OFF — every conjunct must
-// hold for the path to engage, so when the setting is off, the store is not
-// SQL-backed, or the block is above the highest hard-coded checkpoint, the
-// legacy path behaves exactly as before (byte-identical, invariant I2).
+// hold for the path to engage, so when the setting is off, the store does not
+// support the fast path, or the block is above the highest hard-coded checkpoint,
+// the legacy path behaves exactly as before (byte-identical, invariant I2).
 func (sm *SyncManager) legacyOutpointOnly(height uint32) bool {
 	if sm.settings == nil || !sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
 		return false
 	}
 
-	if !settings.IsSQLUtxoStore(sm.settings) {
+	if !sm.utxoStore.SupportsOutpointOnlySpend() {
 		return false
 	}
 
@@ -743,7 +746,11 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 		deferFn(err)
 	}()
 
-	if err = sm.createUtxos(ctx, txMap, bi, blockID); err != nil {
+	// Compute the below-checkpoint fast-path mode ONCE for this block and thread it into
+	// the phases (minimal create, outpoint-only pre-validate) so they cannot disagree.
+	outpointOnly := sm.legacyOutpointOnly(bi.height)
+
+	if err = sm.createUtxos(ctx, txMap, bi, blockID, outpointOnly); err != nil {
 		return err
 	}
 
@@ -754,7 +761,7 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to select finality time sources", err)
 	}
 
-	if err = sm.PreValidateTransactions(ctx, txMap, bi.hash, bi.height, candidateBlockTime, candidateParentMedianTime); err != nil {
+	if err = sm.PreValidateTransactions(ctx, txMap, bi.hash, bi.height, candidateBlockTime, candidateParentMedianTime, outpointOnly); err != nil {
 		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to pre-validate transactions", err)
 	}
 
@@ -971,7 +978,7 @@ func candidateParentMedianTimeFromHeaders(parentHash *chainhash.Hash, headers []
 // createUtxos creates all the utxos for the transactions in the block in parallel
 // before any spending is done. This only occurs in legacy mode when we assume the
 // block is valid.
-func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper], bi blockIdent, blockID uint32) (err error) {
+func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper], bi blockIdent, blockID uint32, outpointOnly bool) (err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "createUtxos",
 		tracing.WithLogMessage(sm.logger, "[createUtxos] called for block %s / height %d", bi.hash, bi.height),
 		tracing.WithHistogram(prometheusLegacyNetsyncCreateUtxos),
@@ -1000,7 +1007,7 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	// anyway; WithSkipExtendedInputs makes that explicit and skips the fee/GetFees
 	// work. Default OFF: when closed, baseOpts is empty and create is unchanged.
 	var baseOpts []utxo.CreateOption
-	if sm.legacyOutpointOnly(blockHeightUint32) {
+	if outpointOnly {
 		baseOpts = append(baseOpts, utxo.WithSkipExtendedInputs(true))
 	}
 
@@ -1155,7 +1162,7 @@ func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, bi blockIdent, 
 // src/validation.cpp:6001). The caller passes the one matching this block's
 // era and zeroes the other.
 func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
-	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32) (err error) {
+	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32, outpointOnly bool) (err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "PreValidateTransactions",
 		tracing.WithLogMessage(sm.logger, "[PreValidateTransactions] called for block %s / height %d", blockHash, blockHeight),
 		tracing.WithHistogram(prometheusLegacyNetsyncPreValidateTransactions),
@@ -1184,7 +1191,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 	// (already set unconditionally below for this checkpoint-covered path), satisfying
 	// the validator's C1 precondition. Default OFF: when closed the spend path is
 	// unchanged (full UTXO-hash-checked spend with whatever decoration was applied).
-	outpointOnly := sm.legacyOutpointOnly(blockHeight)
+	// outpointOnly is computed once per block by the caller and threaded in.
 
 	// These transactions arrive as part of a block, so they should be treated as valid
 	// transactions that all need to be processed. If one fails (e.g. transient Aerospike
@@ -1422,7 +1429,7 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 	return nil
 }
 
-func (sm *SyncManager) extendTransactions(ctx context.Context, bi blockIdent, txOrder []chainhash.Hash, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) (err error) {
+func (sm *SyncManager) extendTransactions(ctx context.Context, bi blockIdent, txOrder []chainhash.Hash, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper], outpointOnly bool) (err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "extendTransactions",
 		tracing.WithLogMessage(sm.logger, "[extendTransactions] called for block %s / height %d", bi.hash, bi.height),
 		tracing.WithHistogram(prometheusLegacyNetsyncExtendTransactions),
@@ -1499,7 +1506,7 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, bi blockIdent, tx
 	// needed — skip the decorate and its per-tx fallback entirely. Phase 1's in-block
 	// extension above still runs (no DB reads); out-of-block inputs are simply left
 	// undecorated. Default OFF: when the gate is closed this is the unchanged path.
-	if sm.legacyOutpointOnly(bi.height) {
+	if outpointOnly {
 		return nil
 	}
 
@@ -1629,7 +1636,7 @@ func (sm *SyncManager) extendPerTxFallback(ctx context.Context, txs []*bt.Tx) er
 // subtree 0 and subtreeSize for subsequent subtrees (subject to the final
 // subtree's smaller capacity).
 func (sm *SyncManager) createSubtrees(ctx context.Context, bi blockIdent, txOrder []chainhash.Hash, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
-	subtreeSlices []*subtreepkg.Subtree, subtreeDatas []*subtreepkg.Data, subtreeMetas []*subtreepkg.Meta) (err error) {
+	subtreeSlices []*subtreepkg.Subtree, subtreeDatas []*subtreepkg.Data, subtreeMetas []*subtreepkg.Meta, outpointOnly bool) (err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "createSubtrees",
 		tracing.WithLogMessage(sm.logger, "[createSubtrees] called for block %s / height %d", bi.hash, bi.height),
 	)
@@ -1649,7 +1656,7 @@ func (sm *SyncManager) createSubtrees(ctx context.Context, bi blockIdent, txOrde
 	// fail. Subtree fees are not consensus-checked below the highest hard-coded
 	// checkpoint, so stamp 0 and skip the fee calculation entirely. Default OFF:
 	// when the gate is closed the real fee is computed exactly as before.
-	outpointOnly := sm.legacyOutpointOnly(bi.height)
+	// outpointOnly is computed once per block by the caller and threaded in.
 
 	for _, txHash := range txOrder {
 		// the coinbase transaction is not part of the txMap

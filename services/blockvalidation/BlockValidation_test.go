@@ -3255,7 +3255,6 @@ func TestBlockValidation_RevalidateIsCalledOnHeaderError(t *testing.T) {
 		txStore:                       txStore,
 		utxoStore:                     utxoStore,
 		subtreeValidationClient:       subtreeValidationClient,
-		subtreeDeDuplicator:           NewDeDuplicator(0),
 		lastValidatedBlocks:           expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 		subtreeExistsCache:            expiringmap.New[chainhash.Hash, bool](10 * time.Minute),
@@ -3357,7 +3356,6 @@ func setupRevalidateBlockTest(t *testing.T) (*BlockValidation, *model.Block, *bl
 		txStore:                       txStore,
 		utxoStore:                     txMetaStore,
 		subtreeValidationClient:       subtreeValidationClient,
-		subtreeDeDuplicator:           NewDeDuplicator(0),
 		lastValidatedBlocks:           expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 		subtreeExistsCache:            expiringmap.New[chainhash.Hash, bool](10 * time.Minute),
@@ -4263,7 +4261,6 @@ func TestBlockValidation_InvalidBlock_PublishesToKafka(t *testing.T) {
 		txStore:                       txStore,
 		utxoStore:                     txMetaStore,
 		subtreeValidationClient:       subtreeValidationClient,
-		subtreeDeDuplicator:           NewDeDuplicator(0),
 		lastValidatedBlocks:           expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
 		invalidBlockKafkaProducer:     mockKafka,
@@ -4588,7 +4585,11 @@ func TestBlockValidation_FloaterPersistedInvalidWhenCaughtUp(t *testing.T) {
 }
 
 func TestQuickValidateOutpointOnly_GateBounds(t *testing.T) {
-	u := &BlockValidation{settings: test.CreateBaseTestSettings(t)}
+	// A store that reports fast-path support; the gate now asks the store, not settings.
+	u := &BlockValidation{
+		settings:  test.CreateBaseTestSettings(t),
+		utxoStore: &utxostore.MockUtxostore{SupportsOutpointOnlySpendResult: true},
+	}
 	// Two hardcoded checkpoints; highest is height 200.
 	u.settings.ChainCfgParams = &chaincfg.Params{Checkpoints: []chaincfg.Checkpoint{{Height: 100}, {Height: 200}}}
 
@@ -4599,4 +4600,9 @@ func TestQuickValidateOutpointOnly_GateBounds(t *testing.T) {
 	require.True(t, u.quickValidateOutpointOnly(&model.Block{Height: 150}), "on, below highest checkpoint")
 	require.True(t, u.quickValidateOutpointOnly(&model.Block{Height: 200}), "on, at highest checkpoint")
 	require.False(t, u.quickValidateOutpointOnly(&model.Block{Height: 201}), "on, above highest checkpoint")
+
+	// Store-capability dimension: a store that does not support the fast path keeps it off
+	// even below the checkpoint with the flag on.
+	u.utxoStore = &utxostore.MockUtxostore{SupportsOutpointOnlySpendResult: false}
+	require.False(t, u.quickValidateOutpointOnly(&model.Block{Height: 150}), "unsupported store keeps it off")
 }

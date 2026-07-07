@@ -85,6 +85,14 @@ type Block struct {
 	// blockvalidation service sets this (via SetNodeAllocator); model-internal
 	// callers leave it nil and behaviour matches legacy make() allocation.
 	nodeAllocator subtreepkg.NodeAllocator
+	// checkpointConfirmedAncestor records whether this block is provably on the main
+	// chain that has already reached and matched the highest hardcoded checkpoint. It is
+	// the caller-supplied ancestry predicate that, together with store fast-path support,
+	// gates the below-checkpoint coinbase no-inflation skip in checkBlockRewardAndFees.
+	// Only the blockvalidation service sets it (via SetCheckpointConfirmedAncestor); it
+	// defaults false so any caller that does not set it gets full no-inflation enforcement
+	// (fail-safe).
+	checkpointConfirmedAncestor bool
 }
 
 // SetNodeAllocator installs a caller-supplied allocator that
@@ -103,6 +111,16 @@ func (b *Block) NodeAllocator() subtreepkg.NodeAllocator {
 	b.subtreeSlicesMu.RLock()
 	defer b.subtreeSlicesMu.RUnlock()
 	return b.nodeAllocator
+}
+
+// SetCheckpointConfirmedAncestor records whether this block is provably part of the
+// main chain that has already reached and matched the highest hardcoded checkpoint.
+// Only the blockvalidation service sets this (from BlockValidation.checkpointConfirmed-
+// Ancestor); it is the caller-supplied ancestry predicate that gates the below-checkpoint
+// coinbase no-inflation skip in checkBlockRewardAndFees. Leaving it unset (false) forces
+// full no-inflation enforcement. Safe to call before any goroutine reads the block.
+func (b *Block) SetCheckpointConfirmedAncestor(v bool) {
+	b.checkpointConfirmedAncestor = v
 }
 
 func NewBlock(header *BlockHeader, coinbase *bt.Tx, subtrees []*chainhash.Hash, transactionCount uint64, sizeInBytes uint64, blockHeight uint32, id uint32) (*Block, error) {
@@ -580,7 +598,15 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	// 9. Check that the total fees of the block are less than or equal to the block reward.
 	// 10. Check that the coinbase transaction includes the correct block reward.
 	if b.Height > 0 {
-		err = b.checkBlockRewardAndFees(settings.ChainCfgParams)
+		// The below-checkpoint fee=0 skip is only tolerated on a store that can actually
+		// produce those blocks (the outpoint-only fast path); every other store keeps full
+		// no-inflation enforcement below the checkpoint. Computed here because model cannot
+		// see the store type directly. checkpointConfirmedAncestor is the caller-supplied
+		// ancestry predicate (SetCheckpointConfirmedAncestor); it defaults false, so a caller
+		// that does not set it gets full enforcement.
+		storeSupportsOutpointOnly := txMetaStore != nil && txMetaStore.SupportsOutpointOnlySpend()
+
+		err = b.checkBlockRewardAndFees(settings.ChainCfgParams, storeSupportsOutpointOnly, b.checkpointConfirmedAncestor)
 		if err != nil {
 			return false, err
 		}
@@ -630,14 +656,15 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 
 	// 12. Check that all transactions are in the valid order and blessed
 	//     Can only be done with a valid texMetaStore passed in
-	//     Skipped below the hardcoded checkpoint on the outpoint-only fast path:
-	//     the checkpoint-anchored chain already certifies order/blessing, and the
-	//     integrity floor still runs earlier in this function (steps 1-11): PoW
-	//     and checkDuplicateTransactions unconditionally, and CheckMerkleRoot
-	//     whenever a subtree store is present — which every caller that reaches
-	//     this skip passes (see skipOrderAndBlessedBelowCheckpoint).
+	//     Skipped for a confirmed-ancestor block below the hardcoded checkpoint on
+	//     the outpoint-only fast path: the checkpoint-anchored chain already
+	//     certifies order/blessing, and the integrity floor still runs earlier in
+	//     this function (steps 1-11): PoW and checkDuplicateTransactions
+	//     unconditionally, and CheckMerkleRoot whenever a subtree store is present —
+	//     which every caller that reaches this skip passes (see
+	//     skipOrderAndBlessedBelowCheckpoint, gated identically to the fee skip).
 	if txMetaStore != nil {
-		if b.skipOrderAndBlessedBelowCheckpoint(settings) {
+		if b.skipOrderAndBlessedBelowCheckpoint(settings, txMetaStore) {
 			logger.Debugf("[Block:Valid][%s] skipping validOrderAndBlessed for block at height %d at or below hardcoded checkpoint (outpoint-only fast path)", b.String(), b.Height)
 		} else {
 			deps := &validationDependencies{
@@ -688,25 +715,42 @@ func (b *Block) releaseTxMap() {
 }
 
 // skipOrderAndBlessedBelowCheckpoint reports whether validOrderAndBlessed may be
-// skipped for this block. True only when the operator has opted into the
-// below-checkpoint outpoint-only fast path (OutpointOnlyBelowCheckpoint), the
-// UTXO store is SQL-backed (same restriction as every other gate on that path),
-// the network defines a hardcoded checkpoint, and 0 < b.Height <= that
-// checkpoint. Below a hardcoded checkpoint the pinned block hash already
-// certifies transaction order, uniqueness and blessing: a block whose
-// transactions differed in any way would produce a different merkle root and
-// could not carry the checkpoint-anchored header chain. PoW and
+// skipped for this block. It is governed by the same safety contract as the
+// below-checkpoint fee skip in checkBlockRewardAndFees, so both skips engage on
+// exactly the same blocks. True only when ALL of the following hold:
+//
+//   - the operator has opted into the below-checkpoint outpoint-only fast path
+//     (OutpointOnlyBelowCheckpoint);
+//   - the UTXO store can actually run that fast path
+//     (txMetaStore.SupportsOutpointOnlySpend()) — the capability check that
+//     replaced the old SQL-store restriction;
+//   - the block is a confirmed ancestor of the pinned checkpoint
+//     (b.checkpointConfirmedAncestor, set only by the blockvalidation service via
+//     SetCheckpointConfirmedAncestor; defaults false). This closes the forward /
+//     optimistic-checkpoint window and the detached-fork-reconsider window that a
+//     height-only gate would leave open;
+//   - the network defines a hardcoded checkpoint and 0 < b.Height <= that
+//     checkpoint.
+//
+// On a confirmed-ancestor block below a hardcoded checkpoint the pinned block
+// hash already certifies transaction order, uniqueness and blessing: a block
+// whose transactions differed in any way would produce a different merkle root
+// and could not carry the checkpoint-anchored header chain. PoW and
 // checkDuplicateTransactions (CVE-2012-2459) still run unconditionally, and
 // CheckMerkleRoot runs whenever a subtree store is present (step 8) — which
 // every caller reaching this skip passes, so the local bytes are bound to that
 // certified chain. This mirrors the native catchup path (quickValidateBlock),
 // which never runs Valid() below the checkpoint at all.
-func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings) bool {
+func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings, txMetaStore utxo.Store) bool {
 	if tSettings == nil || !tSettings.BlockValidation.OutpointOnlyBelowCheckpoint {
 		return false
 	}
 
-	if !settings.IsSQLUtxoStore(tSettings) {
+	if txMetaStore == nil || !txMetaStore.SupportsOutpointOnlySpend() {
+		return false
+	}
+
+	if !b.checkpointConfirmedAncestor {
 		return false
 	}
 
@@ -726,26 +770,45 @@ func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings)
 // height of the block we are checking for.
 
 // TODO - do this another way, if necessary
-func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params) error {
+func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOutpointOnly, checkpointConfirmedAncestor bool) error {
 	if b.Height == 0 {
 		return nil // Skip this check
 	}
 
-	// Below the highest HARDCODED checkpoint the no-inflation property is already
-	// certified by the pinned block hash, and the outpoint-only fast path writes
-	// subtree fees as 0 (spec §4.1). Skip the fee<=reward check so a
-	// reconsiderblock/revalidate of a below-checkpoint block does not wrongly reject
-	// it as BLOCK_INVALID. HighestCheckpointHeight is the single source of truth
-	// shared with the fast-path write side (invariant I3); see model/checkpoint.go.
+	// Skip the coinbase no-inflation check (coinbaseOutput <= subsidy + fees) only when ALL
+	// THREE conditions hold: the block is at/below the highest HARDCODED checkpoint, the store
+	// can actually produce the fee=0 subtrees this skip exists to tolerate, and the block is a
+	// confirmed ancestor of the pinned checkpoint. Each condition answers a distinct concern:
 	//
-	// NOTE: this skip is intentionally NOT gated on OutpointOnlyBelowCheckpoint — it
-	// must also hold when the flag is off so that a below-checkpoint block whose
-	// subtrees were written with fee=0 while the flag was on still revalidates after
-	// the operator turns the flag off. This is safe on any node: a below-checkpoint
-	// fork cannot be accepted (it must chain to the pinned checkpoint hash), so the
-	// no-inflation arithmetic is redundant here — the same reasoning the quick-
-	// validation path already relies on.
-	if b.Height <= HighestCheckpointHeight(params.Checkpoints) {
+	//  1. NOT gated on the OutpointOnlyBelowCheckpoint setting. The outpoint-only fast path
+	//     persists subtree fees as 0. A block synced that way must still revalidate on
+	//     reconsiderblock/RevalidateBlock even after the operator restores the default (flag
+	//     off) — a flag-gated skip would recompute coinbaseOutput (subsidy+realFees) >
+	//     subtreeFees(0)+subsidy and wrongly reject a genuinely-valid, checkpoint-pinned block
+	//     as BLOCK_INVALID. The read side cannot distinguish a fast-path fee=0 block from a
+	//     default one, so the skip cannot depend on live config.
+	//  2. GATED on store support (storeSupportsOutpointOnly). On a store that cannot run the
+	//     fast path (Aerospike, or the unconfigured default) real fees are always written, no
+	//     fee=0 block can exist, and there is nothing to tolerate — so full no-inflation
+	//     enforcement is retained. Without this gate the skip would silently disable the check
+	//     on nodes where the feature is a documented no-op. Computed at the Block.Valid call
+	//     site, which holds the store; model cannot see the store type directly.
+	//  3. GATED on confirmed ancestry (checkpointConfirmedAncestor). The skip fires only for a
+	//     block PROVEN to be on the main chain that has already reached and matched the pinned
+	//     checkpoint hash — so the checkpoint transitively commits its coinbase, making the
+	//     arithmetic redundant. This closes the two windows a height-only skip leaves open:
+	//     (a) the forward/optimistic-checkpoint window (a below-checkpoint block validated
+	//     before the chain has reached the pinned hash) and (b) a detached fork block below the
+	//     checkpoint reconsidered via reconsiderblock. In both the predicate is false, so the
+	//     check runs — correctly, because non-fast-path blocks carry real fees. The predicate is
+	//     caller-supplied (BlockValidation.checkpointConfirmedAncestor, threaded via
+	//     SetCheckpointConfirmedAncestor) because it needs blockchain state model cannot see; it
+	//     is fail-safe (any lookup error or ambiguity yields false → the check runs).
+	//
+	// HighestCheckpointHeight is the single source of truth shared with the fast-path write
+	// side, so the fee-write boundary and this fee-skip boundary cannot diverge (invariant
+	// I3); see model/checkpoint.go.
+	if storeSupportsOutpointOnly && checkpointConfirmedAncestor && b.Height <= HighestCheckpointHeight(params.Checkpoints) {
 		return nil
 	}
 

@@ -35,6 +35,10 @@ func (s *outpointOnlySpyStore) BatchPreviousOutputsDecorate(ctx context.Context,
 	return s.NullStore.BatchPreviousOutputsDecorate(ctx, txs)
 }
 
+// SupportsOutpointOnlySpend overrides the embedded NullStore to model a store that
+// honours the fast path, so legacyOutpointOnly can engage in these tests.
+func (s *outpointOnlySpyStore) SupportsOutpointOnlySpend() bool { return true }
+
 // newOutpointOnlySettings returns settings configured so legacyOutpointOnly can
 // return true: the feature flag on, a SQL-backed (sqlitememory) UTXO store URL,
 // and a single hard-coded checkpoint at checkpointHeight on the chain params.
@@ -98,6 +102,15 @@ func TestSyncManager_legacyOutpointOnly(t *testing.T) {
 				settings:    tSettings,
 				chainParams: params,
 				logger:      ulogger.TestLogger{},
+			}
+
+			// The gate now asks the store, not the settings URL: a supporting store
+			// (spy over NullStore) for the SQL case, a plain NullStore (reports false)
+			// otherwise.
+			if tt.sqlStore {
+				sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
+			} else {
+				sm.utxoStore = &nullstore.NullStore{}
 			}
 
 			if tt.nilChain {
@@ -214,11 +227,12 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 		tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
 		block, txMap, txOrder := buildExtendedSubtreeBlock(t, blockHeight, 5)
 
-		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{}}
+		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{},
+			utxoStore: &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}}
 		require.True(t, sm.legacyOutpointOnly(uint32(blockHeight)), "gate must be ON for this case")
 
 		slices, datas, metas := makeSubtreeSlices(t, len(block.Transactions()))
-		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas))
+		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas, true))
 
 		for _, st := range slices {
 			for _, node := range st.Nodes {
@@ -236,7 +250,7 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 		require.False(t, sm.legacyOutpointOnly(uint32(blockHeight)), "gate must be OFF for this case")
 
 		slices, datas, metas := makeSubtreeSlices(t, len(block.Transactions()))
-		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas))
+		require.NoError(t, sm.createSubtrees(context.Background(), testBlockIdent(block), txOrder, txMap, slices, datas, metas, false))
 
 		var nonZeroFees int
 		for _, st := range slices {
@@ -248,49 +262,6 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 		}
 		require.Positive(t, nonZeroFees, "default-off path must compute real (non-zero) fees")
 	})
-}
-
-// TestSyncManager_needsParentMinedWait: the parent-mined wait is skipped exactly
-// when the outpoint-only fast path is engaged (flag on AND SQL store AND at/below
-// the hardcoded checkpoint). It is redundant there three ways: (1) its documented
-// purpose is BIP68 parent-height lookup and BIP68 is skipped below the
-// checkpoint; (2) the single serial blockHandler commits the parent's UTXOs
-// before this block starts; (3) the legacy path AddBlocks with MinedSet=true
-// synchronously, so the check is always instantly true. Heights 0 and 1 never
-// wait (pre-existing behaviour).
-func TestSyncManager_needsParentMinedWait(t *testing.T) {
-	const checkpointHeight = int32(1000)
-
-	tests := []struct {
-		name     string
-		enabled  bool
-		sqlStore bool
-		height   uint32
-		want     bool
-	}{
-		{name: "height 0 never waits", enabled: false, sqlStore: true, height: 0, want: false},
-		{name: "height 1 never waits", enabled: false, sqlStore: true, height: 1, want: false},
-		{name: "flag off, below checkpoint: waits", enabled: false, sqlStore: true, height: 500, want: true},
-		{name: "flag on, non-SQL, below checkpoint: waits", enabled: true, sqlStore: false, height: 500, want: true},
-		{name: "flag on, SQL, below checkpoint: skips", enabled: true, sqlStore: true, height: 500, want: false},
-		{name: "flag on, SQL, at checkpoint: skips", enabled: true, sqlStore: true, height: 1000, want: false},
-		{name: "flag on, SQL, above checkpoint: waits", enabled: true, sqlStore: true, height: 1500, want: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tSettings, params := newOutpointOnlySettings(t, tt.enabled, tt.sqlStore, checkpointHeight)
-
-			sm := &SyncManager{
-				settings:    tSettings,
-				chainParams: params,
-				logger:      ulogger.TestLogger{},
-			}
-
-			require.Equal(t, tt.want, sm.needsParentMinedWait(tt.height),
-				"needsParentMinedWait(%d) enabled=%v sql=%v", tt.height, tt.enabled, tt.sqlStore)
-		})
-	}
 }
 
 // TestSyncManager_extendTransactions_OutpointOnlySkipsDecorate is the paired ON/OFF
@@ -317,7 +288,7 @@ func TestSyncManager_extendTransactions_OutpointOnlySkipsDecorate(t *testing.T) 
 		block, txMap, txOrder := buildExtendedSubtreeBlock(t, blockHeight, 5)
 		require.Equal(t, enabled, sm.legacyOutpointOnly(uint32(blockHeight)))
 
-		err := sm.extendTransactions(context.Background(), testBlockIdent(block), txOrder, txMap)
+		err := sm.extendTransactions(context.Background(), testBlockIdent(block), txOrder, txMap, enabled)
 		require.NoError(t, err)
 
 		return spy.decorateCalls.Load()
@@ -330,4 +301,49 @@ func TestSyncManager_extendTransactions_OutpointOnlySkipsDecorate(t *testing.T) 
 	t.Run("gate OFF => decorate called", func(t *testing.T) {
 		require.Equal(t, int32(1), run(t, false), "default-off path must call BatchPreviousOutputsDecorate once")
 	})
+}
+
+// TestSyncManager_needsParentMinedWait verifies the parent-mined wait is skipped
+// only on the below-checkpoint outpoint-only fast path. It reuses the same
+// store-capability harness as TestSyncManager_legacyOutpointOnly: a supporting
+// store (spy over NullStore) for the "SQL" cases, a plain NullStore otherwise.
+func TestSyncManager_needsParentMinedWait(t *testing.T) {
+	const checkpointHeight = int32(1000)
+
+	tests := []struct {
+		name     string
+		enabled  bool
+		sqlStore bool
+		height   uint32
+		want     bool
+	}{
+		{name: "height 0 never waits", enabled: false, sqlStore: true, height: 0, want: false},
+		{name: "height 1 never waits", enabled: false, sqlStore: true, height: 1, want: false},
+		{name: "flag off, below checkpoint: waits", enabled: false, sqlStore: true, height: 500, want: true},
+		{name: "flag on, non-supporting store, below checkpoint: waits", enabled: true, sqlStore: false, height: 500, want: true},
+		{name: "flag on, supporting store, below checkpoint: skips", enabled: true, sqlStore: true, height: 500, want: false},
+		{name: "flag on, supporting store, at checkpoint: skips", enabled: true, sqlStore: true, height: 1000, want: false},
+		{name: "flag on, supporting store, above checkpoint: waits", enabled: true, sqlStore: true, height: 1500, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tSettings, params := newOutpointOnlySettings(t, tt.enabled, tt.sqlStore, checkpointHeight)
+
+			sm := &SyncManager{
+				settings:    tSettings,
+				chainParams: params,
+				logger:      ulogger.TestLogger{},
+			}
+
+			if tt.sqlStore {
+				sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
+			} else {
+				sm.utxoStore = &nullstore.NullStore{}
+			}
+
+			require.Equal(t, tt.want, sm.needsParentMinedWait(tt.height),
+				"needsParentMinedWait(%d) enabled=%v store=%v", tt.height, tt.enabled, tt.sqlStore)
+		})
+	}
 }

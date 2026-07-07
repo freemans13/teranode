@@ -1934,8 +1934,11 @@ func TestBlock_CheckBlockRewardAndFees(t *testing.T) {
 		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 1, 0)
 		require.NoError(t, err)
 
-		// Test the function exists and handles basic input
-		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams)
+		// Use params with NO checkpoints so height 1 is ABOVE the highest checkpoint (0)
+		// and the below-checkpoint skip does not fire — this genuinely exercises the reward
+		// arithmetic: the height-1 coinbase claims exactly the 50 BTC subsidy, so it is valid.
+		params := &chaincfg.Params{SubsidyReductionInterval: 210000}
+		err = block.checkBlockRewardAndFees(params, true, true)
 		require.NoError(t, err)
 	})
 }
@@ -1981,8 +1984,10 @@ func newBlockWithCoinbaseRewardAndZeroSubtreeFees(t *testing.T, height uint32, p
 
 // TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint verifies that
 // checkBlockRewardAndFees is a no-op for blocks at or below the highest hardcoded
-// checkpoint height (fee=0 safety for the below-checkpoint outpoint-only fast path),
-// and that the check is still enforced above the checkpoint.
+// checkpoint height ONLY when the store can produce fee=0 fast-path blocks AND the
+// block is a confirmed checkpoint ancestor. Without fast-path store support, without
+// confirmed ancestry (forward-sync / detached fork), or above the checkpoint on any
+// store, the no-inflation check is still enforced.
 func TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint(t *testing.T) {
 	params := &chaincfg.Params{
 		SubsidyReductionInterval: 210000,
@@ -2034,10 +2039,12 @@ func TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint(t *testing.T) {
 	}
 
 	bBelow := buildInflatedBlock(300) // below highest checkpoint (500)
-	require.NoError(t, bBelow.checkBlockRewardAndFees(params), "below checkpoint: fee check must be skipped")
+	require.NoError(t, bBelow.checkBlockRewardAndFees(params, true, true), "below checkpoint, fast-path store, confirmed checkpoint ancestor: fee check must be skipped")
+	require.Error(t, bBelow.checkBlockRewardAndFees(params, false, true), "below checkpoint but store lacks fast-path support: no-inflation must still be enforced")
+	require.Error(t, bBelow.checkBlockRewardAndFees(params, true, false), "below checkpoint, fast-path store, but NOT a confirmed checkpoint ancestor (forward-sync / detached fork): no-inflation must still be enforced")
 
 	bAbove := buildInflatedBlock(501) // above highest checkpoint (500)
-	require.Error(t, bAbove.checkBlockRewardAndFees(params), "above checkpoint: fee check must still be enforced")
+	require.Error(t, bAbove.checkBlockRewardAndFees(params, true, true), "above checkpoint: fee check must still be enforced regardless of store support / ancestry")
 }
 
 // TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight pins the real
@@ -2088,12 +2095,12 @@ func TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight(t *testi
 		}
 	}
 
-	// Exactly at the boundary (height == hc): skipped.
-	require.NoError(t, buildInflatedBlock(hc).checkBlockRewardAndFees(params),
-		"at height == HighestCheckpointHeight the check must be skipped")
+	// Exactly at the boundary (height == hc), fast-path store, confirmed ancestor: skipped.
+	require.NoError(t, buildInflatedBlock(hc).checkBlockRewardAndFees(params, true, true),
+		"at height == HighestCheckpointHeight the check must be skipped (fast-path store, confirmed ancestor)")
 
 	// One above the boundary: enforced (inflated coinbase → error).
-	require.Error(t, buildInflatedBlock(hc+1).checkBlockRewardAndFees(params),
+	require.Error(t, buildInflatedBlock(hc+1).checkBlockRewardAndFees(params, true, true),
 		"at height == HighestCheckpointHeight+1 the check must be enforced")
 }
 
@@ -2546,7 +2553,7 @@ func TestBlock_CheckRewardAndFees_WithHeight(t *testing.T) {
 
 		// Test with a height that triggers the reward calculation logic
 		// This should error because coinbase output is too high
-		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams)
+		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams, true, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "coinbase output")
 	})

@@ -15,21 +15,28 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
-// panicTxMetaStore is a utxo.Store whose every method panics (nil embedded
-// interface). Passing it to Valid proves validOrderAndBlessed never touched
-// the store: any access would nil-pointer panic and fail the test.
+// panicTxMetaStore is a utxo.Store whose data methods panic (nil embedded
+// interface), but which reports SupportsOutpointOnlySpend()==true. Passing it
+// to Valid proves validOrderAndBlessed never touched the store: any real access
+// would nil-pointer panic and fail the test. The capability query is safe to
+// answer (Valid calls it for the fee/order-blessed skip gates) and does not
+// count as touching UTXO data.
 type panicTxMetaStore struct {
 	utxo.Store
 }
 
+// SupportsOutpointOnlySpend models a store that can run the outpoint-only fast
+// path (like the SQL store), so the below-checkpoint skips are eligible.
+func (s *panicTxMetaStore) SupportsOutpointOnlySpend() bool { return true }
+
 // newSkipTestSettings returns settings with the outpoint-only flag set as given,
-// a sqlitememory (SQL-backed) UTXO store URL, and one hardcoded checkpoint at
-// checkpointHeight — the same three conjuncts legacyOutpointOnly requires.
+// a sqlitememory UTXO store URL, and one hardcoded checkpoint at checkpointHeight.
 func newSkipTestSettings(t *testing.T, enabled bool, checkpointHeight int32) *settings.Settings {
 	t.Helper()
 
@@ -48,39 +55,38 @@ func newSkipTestSettings(t *testing.T, enabled bool, checkpointHeight int32) *se
 }
 
 // TestBlock_SkipOrderAndBlessedBelowCheckpoint_Predicate is the full truth table:
-// every conjunct (flag on AND SQL store AND checkpoint exists AND 0 < height <=
-// checkpoint) must hold; any one missing keeps the skip OFF (fail-safe).
+// every conjunct (flag on AND a store that supports the fast path AND the block
+// is a confirmed checkpoint ancestor AND a checkpoint exists AND 0 < height <=
+// checkpoint) must hold; any one missing keeps the skip OFF (fail-safe). The
+// store-support and confirmed-ancestor gates mirror the sibling fee skip in
+// checkBlockRewardAndFees so both skips engage on exactly the same blocks.
 func TestBlock_SkipOrderAndBlessedBelowCheckpoint_Predicate(t *testing.T) {
 	const checkpointHeight = int32(2000)
 
 	tests := []struct {
-		name       string
-		enabled    bool
-		sqlStore   bool
-		noCheckpts bool
-		nilParams  bool
-		height     uint32
-		want       bool
+		name          string
+		enabled       bool
+		supportsStore bool
+		confirmed     bool
+		noCheckpts    bool
+		nilParams     bool
+		height        uint32
+		want          bool
 	}{
-		{name: "flag off, below", enabled: false, sqlStore: true, height: 1000, want: false},
-		{name: "flag on, non-SQL store, below", enabled: true, sqlStore: false, height: 1000, want: false},
-		{name: "flag on, SQL, below checkpoint", enabled: true, sqlStore: true, height: 1000, want: true},
-		{name: "flag on, SQL, at checkpoint", enabled: true, sqlStore: true, height: 2000, want: true},
-		{name: "flag on, SQL, above checkpoint", enabled: true, sqlStore: true, height: 2001, want: false},
-		{name: "flag on, SQL, height 0", enabled: true, sqlStore: true, height: 0, want: false},
-		{name: "flag on, SQL, no checkpoints", enabled: true, sqlStore: true, noCheckpts: true, height: 1000, want: false},
-		{name: "flag on, SQL, nil chain params", enabled: true, sqlStore: true, nilParams: true, height: 1000, want: false},
+		{name: "flag off, below", enabled: false, supportsStore: true, confirmed: true, height: 1000, want: false},
+		{name: "flag on, non-supporting store, below", enabled: true, supportsStore: false, confirmed: true, height: 1000, want: false},
+		{name: "flag on, supporting, not confirmed ancestor, below", enabled: true, supportsStore: true, confirmed: false, height: 1000, want: false},
+		{name: "flag on, supporting, confirmed, below checkpoint", enabled: true, supportsStore: true, confirmed: true, height: 1000, want: true},
+		{name: "flag on, supporting, confirmed, at checkpoint", enabled: true, supportsStore: true, confirmed: true, height: 2000, want: true},
+		{name: "flag on, supporting, confirmed, above checkpoint", enabled: true, supportsStore: true, confirmed: true, height: 2001, want: false},
+		{name: "flag on, supporting, confirmed, height 0", enabled: true, supportsStore: true, confirmed: true, height: 0, want: false},
+		{name: "flag on, supporting, confirmed, no checkpoints", enabled: true, supportsStore: true, confirmed: true, noCheckpts: true, height: 1000, want: false},
+		{name: "flag on, supporting, confirmed, nil chain params", enabled: true, supportsStore: true, confirmed: true, nilParams: true, height: 1000, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tSettings := newSkipTestSettings(t, tt.enabled, checkpointHeight)
-
-			if !tt.sqlStore {
-				u, err := url.Parse("aerospike://host:3000/ns/set")
-				require.NoError(t, err)
-				tSettings.UtxoStore.UtxoStore = u
-			}
 
 			if tt.noCheckpts {
 				noCp := chaincfg.RegressionNetParams
@@ -92,15 +98,32 @@ func TestBlock_SkipOrderAndBlessedBelowCheckpoint_Predicate(t *testing.T) {
 				tSettings.ChainCfgParams = nil
 			}
 
+			// Store capability replaces the old settings-URL check: a supporting
+			// store (panicTxMetaStore reports true) vs a NullStore (reports false).
+			var store utxo.Store = &nullstore.NullStore{}
+			if tt.supportsStore {
+				store = &panicTxMetaStore{}
+			}
+
 			b := &Block{Height: tt.height}
-			require.Equal(t, tt.want, b.skipOrderAndBlessedBelowCheckpoint(tSettings),
+			b.SetCheckpointConfirmedAncestor(tt.confirmed)
+
+			require.Equal(t, tt.want, b.skipOrderAndBlessedBelowCheckpoint(tSettings, store),
 				"skipOrderAndBlessedBelowCheckpoint height=%d", tt.height)
 		})
 	}
 
 	t.Run("nil settings", func(t *testing.T) {
 		b := &Block{Height: 1000}
-		require.False(t, b.skipOrderAndBlessedBelowCheckpoint(nil))
+		b.SetCheckpointConfirmedAncestor(true)
+		require.False(t, b.skipOrderAndBlessedBelowCheckpoint(nil, &panicTxMetaStore{}))
+	})
+
+	t.Run("nil store", func(t *testing.T) {
+		tSettings := newSkipTestSettings(t, true, checkpointHeight)
+		b := &Block{Height: 1000}
+		b.SetCheckpointConfirmedAncestor(true)
+		require.False(t, b.skipOrderAndBlessedBelowCheckpoint(tSettings, nil))
 	})
 }
 
@@ -143,6 +166,10 @@ func TestBlock_Valid_SkipsValidOrderAndBlessedBelowCheckpoint(t *testing.T) {
 	// height 1000 <= checkpoint 2000. blockID 0.
 	block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{rootHash}, 2, 123, 1000, 0)
 	require.NoError(t, err)
+
+	// Confirmed checkpoint ancestor: the blockvalidation service sets this below
+	// the checkpoint; the skip (like the sibling fee skip) requires it.
+	block.SetCheckpointConfirmedAncestor(true)
 
 	// Pre-populate slices and pass a nil subtreeStore so Valid() takes its
 	// existing internal-block path (skips GetAndValidateSubtrees/merkle steps,
@@ -273,6 +300,7 @@ func TestBlock_MerkleFloor_RejectsTamperingWhileSkipIsActive(t *testing.T) {
 		subtreeRootHash := st.RootHash()
 		block, err := NewBlock(hdr, coinbase, []*chainhash.Hash{subtreeRootHash}, 2, 123, blockHeight, 0)
 		require.NoError(t, err)
+		block.SetCheckpointConfirmedAncestor(true)
 
 		blobStore := blobmemory.New()
 		storeSubtree(t, blobStore, st)
@@ -294,6 +322,7 @@ func TestBlock_MerkleFloor_RejectsTamperingWhileSkipIsActive(t *testing.T) {
 		subtreeRootHash := st.RootHash()
 		block, err := NewBlock(hdr, coinbase, []*chainhash.Hash{subtreeRootHash}, 2, 123, blockHeight, 0)
 		require.NoError(t, err)
+		block.SetCheckpointConfirmedAncestor(true)
 
 		blobStore := blobmemory.New()
 		storeSubtree(t, blobStore, st)

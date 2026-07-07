@@ -333,6 +333,17 @@ type Store interface {
 	// Returns status code, status message and any error encountered.
 	Health(ctx context.Context, checkLiveness bool) (int, string, error)
 
+	// SupportsOutpointOnlySpend reports whether this store correctly honours the
+	// below-checkpoint outpoint-only fast path — i.e. whether it acts on the
+	// CreateOptions.SkipExtendedInputs and IgnoreFlags.SkipUTXOHashCheck flags rather
+	// than silently ignoring them. Callers that intend to skip decorate (and hence
+	// hand un-decorated inputs to Create/Spend) MUST consult this first: a store that
+	// returns false would still try to derive the UTXO hash from absent parent data
+	// and hard-error on every transaction. SQL stores return true; stores without
+	// fast-path support (e.g. Aerospike, pending Stage B) return false. Decorators
+	// delegate to the wrapped store.
+	SupportsOutpointOnlySpend() bool
+
 	// Close drains any in-flight batched writes (Create, Spend, Get, Unlock,
 	// or any other batched operations the implementation owns) and releases
 	// backing resources (connection pools, file handles, batcher workers).

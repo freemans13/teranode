@@ -722,6 +722,19 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		return nil, err
 	}
 
+	// Fail closed on a store that does not support the fast path: OutpointOnlySpend
+	// relies on SkipUTXOHashCheck / SkipExtendedInputs, which such a store ignores —
+	// it would then derive the UTXO hash from absent parent data and hard-error on the
+	// un-decorated inputs, stalling IBD. Ask the store directly (the capability lives on
+	// the store, not a settings scheme guess) so a misconfigured caller cannot reach an
+	// unsupported store on the fast path.
+	if validationOptions.OutpointOnlySpend && !v.utxoStore.SupportsOutpointOnlySpend() {
+		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend requires a UTXO store that supports it", txID)
+		span.RecordError(err)
+
+		return nil, err
+	}
+
 	comparisonTime, skipFinality, finalityErr := selectFinalityComparisonTime(validationOptions, blockHeight, uint32(v.settings.ChainCfgParams.CSVHeight), blockState)
 	if finalityErr != nil {
 		err = finalityErr
@@ -829,7 +842,18 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			}
 
 			if saveAsConflicting {
-				if txMetaData, utxoMapErr = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, true, false); utxoMapErr != nil {
+				// On the outpoint-only fast path the tx is deliberately un-decorated, so a full
+				// create would call GetFees on zero parent satoshis and error. Thread the same
+				// minimal-create option the primary create below uses, so the conflicting
+				// fallback (reached during legacy below-checkpoint catchup on a stale/double
+				// spend — see handle_block.go PreValidateTransactions, which sets both
+				// CreateConflicting and OutpointOnlySpend) does not hard-fail the block.
+				var conflictingCreateOpts []utxo.CreateOption
+				if validationOptions.OutpointOnlySpend {
+					conflictingCreateOpts = append(conflictingCreateOpts, utxo.WithSkipExtendedInputs(true))
+				}
+
+				if txMetaData, utxoMapErr = v.CreateInUtxoStore(decoupledCtx, tx, blockHeight, true, false, conflictingCreateOpts...); utxoMapErr != nil {
 					if errors.Is(utxoMapErr, errors.ErrTxExists) {
 						txMetaData = &meta.Data{}
 						if err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); err != nil {
@@ -900,6 +924,15 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 
 	if !validationOptions.SkipUtxoCreation {
 		// store the transaction in the UTXO store, marking it as locked if we are going to add it to the block assembly
+		//
+		// CONTRACT (below-checkpoint outpoint-only fast path): when OutpointOnlySpend is
+		// set the tx is deliberately un-decorated (no parent satoshis/scripts), so EVERY
+		// UTXO-store Create reachable on this path MUST thread WithSkipExtendedInputs(true)
+		// — otherwise store.Create runs GetFees over zero parent satoshis and hard-fails the
+		// block. This coupling is NOT enforced by a runtime guard (unlike the
+		// OutpointOnlySpend => SkipScriptValidation precondition checked earlier), so any new
+		// create seam added on this path must repeat it. The conflicting-fallback create
+		// above threads the same option for this reason.
 		var createExtraOpts []utxo.CreateOption
 		if validationOptions.OutpointOnlySpend {
 			createExtraOpts = append(createExtraOpts, utxo.WithSkipExtendedInputs(true))
