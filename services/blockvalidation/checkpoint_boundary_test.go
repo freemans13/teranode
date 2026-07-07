@@ -1,18 +1,18 @@
 package blockvalidation
 
-// TestCheckpointHeight_WriteReadAgree asserts invariant I3: the inline loop in
-// model.Block.checkBlockRewardAndFees (the "read side") produces the same highest
-// checkpoint height as blockchain.HighestCheckpointHeight (the "write side") for
-// the same params.Checkpoints. The two functions must agree so that the fast-path
-// fee=0 write and the revalidation read both skip at the same boundary.
+// TestCheckpointHeight_WriteReadAgree asserts invariant I3: the write side
+// (blockchain.HighestCheckpointHeight, used by the fast-path fee=0 write) and the
+// read side (model.HighestCheckpointHeight, used by checkBlockRewardAndFees on
+// revalidation) return the same boundary for the same params.Checkpoints. Since
+// blockchain.HighestCheckpointHeight now delegates to model.HighestCheckpointHeight
+// there is a single implementation; this test guards that the delegation stays wired
+// (a reintroduced divergent copy in either package would fail here) across several
+// real and edge-case checkpoint sets.
 //
-// Placement: this file lives in services/blockvalidation (package blockvalidation,
-// white-box test) because model cannot import services/blockchain without creating
-// an import cycle (model → blockchain → model). blockvalidation already imports
-// both model and services/blockchain, making it the closest clean cross-import site.
+// This file lives in services/blockvalidation (which imports both model and
+// services/blockchain) because model cannot import services/blockchain (import cycle).
 
 import (
-	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -22,22 +22,24 @@ import (
 )
 
 func TestCheckpointHeight_WriteReadAgree(t *testing.T) {
-	params := &chaincfg.MainNetParams
-
-	writeSide := blockchain.HighestCheckpointHeight(params.Checkpoints)
-
-	// Inline loop — byte-equivalent to the one in model.Block.checkBlockRewardAndFees.
-	var readSide uint32
-	for _, cp := range params.Checkpoints {
-		if cp.Height < 0 {
-			continue
-		}
-		if h := uint32(cp.Height); h > readSide {
-			readSide = h
-		}
+	cases := map[string][]chaincfg.Checkpoint{
+		"mainnet":        chaincfg.MainNetParams.Checkpoints,
+		"testnet":        chaincfg.TestNetParams.Checkpoints,
+		"empty":          nil,
+		"negative-only":  {{Height: -1}},
+		"unordered":      {{Height: 500}, {Height: 100}, {Height: -1}, {Height: 300}},
+		"single":         {{Height: 42}},
+		"trailing-lower": {{Height: 1000}, {Height: 10}},
 	}
 
-	require.Equal(t, writeSide, readSide, "fee write/read checkpoint height must be identical (I3)")
+	for name, cps := range cases {
+		t.Run(name, func(t *testing.T) {
+			writeSide := blockchain.HighestCheckpointHeight(cps)
+			readSide := model.HighestCheckpointHeight(cps)
+			require.Equal(t, readSide, writeSide,
+				"fee write/read checkpoint height must be identical (I3) for %s", name)
+		})
+	}
 }
 
 // TestOperatorOverrideFence (T-B5 — invariant I2): asserts that quickValidateOutpointOnly
@@ -54,10 +56,9 @@ func TestOperatorOverrideFence(t *testing.T) {
 	suite := NewCatchupTestSuite(t)
 	defer suite.Cleanup()
 
-	// Stage A is SQL-only; set a SQL store URL so the guard permits engagement.
-	sqlURL, err := url.Parse("sqlitememory://test")
-	require.NoError(t, err)
-	suite.Server.blockValidation.settings.UtxoStore.UtxoStore = sqlURL
+	// The store must report fast-path support so the gate turns on the store capability
+	// (the mock defaults to false); this test is about the checkpoint/override fence.
+	suite.MockUTXOStore.SupportsOutpointOnlySpendResult = true
 
 	// Enable the outpoint-only fast path.
 	suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
@@ -87,30 +88,27 @@ func TestOperatorOverrideFence(t *testing.T) {
 		blockBelow.Height, hardcodedCheckpointHeight)
 }
 
-// TestQuickValidateOutpointOnly_SQLStoreGuard (Task 9 — Stage A SQL-only guard):
-// asserts that quickValidateOutpointOnly returns TRUE only when the UTXO store is
-// SQL-backed (postgres, postgresql, sqlite, sqlitememory). On an Aerospike node, or
-// when the URL is nil/empty (the Aerospike default), it must return FALSE to avoid
-// passing un-decorated inputs to aerospike.Store.Spend, which errors on nil locking scripts.
-func TestQuickValidateOutpointOnly_SQLStoreGuard(t *testing.T) {
+// TestQuickValidateOutpointOnly_StoreCapabilityGate asserts that quickValidateOutpointOnly
+// engages only when the UTXO store itself reports fast-path support
+// (store.SupportsOutpointOnlySpend()) — not by sniffing a URL scheme. A store that does
+// not support it (e.g. Aerospike, pending Stage B) keeps the fast path OFF so un-decorated
+// inputs are never handed to a store that would hard-error on them. Above the checkpoint it
+// is off regardless of store capability.
+func TestQuickValidateOutpointOnly_StoreCapabilityGate(t *testing.T) {
 	const checkpointHeight = uint32(1000)
 	const belowCheckpoint = uint32(500)
-
 	const aboveCheckpoint = uint32(1500)
 
 	tests := []struct {
-		name     string
-		storeURL string // empty string = nil URL (Aerospike default)
-		height   uint32
-		want     bool
+		name          string
+		storeSupports bool
+		height        uint32
+		want          bool
 	}{
-		{name: "nil URL (Aerospike default)", storeURL: "", height: belowCheckpoint, want: false},
-		{name: "aerospike scheme", storeURL: "aerospike://host:3000/ns/set", height: belowCheckpoint, want: false},
-		{name: "postgres scheme", storeURL: "postgres://user:pass@host/db", height: belowCheckpoint, want: true},
-		{name: "postgresql scheme", storeURL: "postgresql://user:pass@host/db", height: belowCheckpoint, want: true},
-		{name: "sqlite scheme", storeURL: "sqlite:///tmp/test.db", height: belowCheckpoint, want: true},
-		{name: "sqlitememory scheme", storeURL: "sqlitememory://test", height: belowCheckpoint, want: true},
-		{name: "postgres above checkpoint", storeURL: "postgres://user:pass@host/db", height: aboveCheckpoint, want: false},
+		{name: "store supports, below checkpoint", storeSupports: true, height: belowCheckpoint, want: true},
+		{name: "store does not support, below checkpoint", storeSupports: false, height: belowCheckpoint, want: false},
+		{name: "store supports, above checkpoint", storeSupports: true, height: aboveCheckpoint, want: false},
+		{name: "store does not support, above checkpoint", storeSupports: false, height: aboveCheckpoint, want: false},
 	}
 
 	for _, tt := range tests {
@@ -120,32 +118,28 @@ func TestQuickValidateOutpointOnly_SQLStoreGuard(t *testing.T) {
 
 			suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 			setCheckpoints(t, suite, checkpointHeight)
-
-			if tt.storeURL != "" {
-				u, err := url.Parse(tt.storeURL)
-				require.NoError(t, err)
-				suite.Server.blockValidation.settings.UtxoStore.UtxoStore = u
-			} else {
-				suite.Server.blockValidation.settings.UtxoStore.UtxoStore = nil
-			}
+			suite.MockUTXOStore.SupportsOutpointOnlySpendResult = tt.storeSupports
 
 			block := &model.Block{Height: tt.height}
 			got := suite.Server.blockValidation.quickValidateOutpointOnly(block)
 			require.Equal(t, tt.want, got,
-				"quickValidateOutpointOnly: store=%q, height=%d: want %v got %v",
-				tt.storeURL, tt.height, tt.want, got)
+				"quickValidateOutpointOnly: storeSupports=%v, height=%d: want %v got %v",
+				tt.storeSupports, tt.height, tt.want, got)
 		})
 	}
 }
 
-// TestCheckpointBoundary_B1_Deferred is a placeholder for T-B1 (spec §6):
+// TestCheckpointBoundary_B1_Deferred is a placeholder for the FULL T-B1 (spec §6):
 // spend at checkpoint+1 of an output created at checkpoint−1, including a coinbase
-// output for coinbase maturity. This test requires a real multi-block cross-checkpoint
-// sync flow (two blocks, real catchup or real block-validation pipeline with persisted
-// subtree data) that cannot be honestly expressed with the CatchupTestSuite mock store.
-// Deferred to e2e/smoketest: see spec §6 T-B1.
+// output for coinbase maturity. The full multi-block cross-checkpoint sync flow (two
+// blocks, real catchup or block-validation pipeline with persisted subtree data)
+// cannot be honestly expressed with the CatchupTestSuite mock store and stays deferred
+// to e2e/smoketest. The CONSENSUS CORE of T-B1 — a coinbase minimally-created below the
+// checkpoint still enforces coinbase maturity when spent outpoint-only — is now covered
+// executably at the store layer by TestMinimalCreate_CoinbaseMaturity_OutpointOnlySpend
+// (stores/utxo/sql). See spec §6 T-B1.
 func TestCheckpointBoundary_B1_Deferred(t *testing.T) {
-	t.Skip("deferred to e2e/smoketest: T-B1 requires multi-block cross-checkpoint flow with real persisted outputs; see spec §6 T-B1")
+	t.Skip("full multi-block flow deferred to e2e/smoketest; consensus core covered by stores/utxo/sql.TestMinimalCreate_CoinbaseMaturity_OutpointOnlySpend; see spec §6 T-B1")
 }
 
 // TestCheckpointBoundary_B3_Deferred is a placeholder for T-B3 (spec §6):

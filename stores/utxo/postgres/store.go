@@ -437,6 +437,12 @@ func (s *Store) markCleanShutdown(ctx context.Context) {
 	}
 }
 
+// SupportsOutpointOnlySpend reports that this store honours outpoint-only
+// spends: the spend SQL keys purely on (prev_tx_hash, prev_output_idx), so a
+// SkipUTXOHashCheck spend built via utxo.GetSpendsOutpointOnly (no parent
+// decoration, no UTXO hash) is applied exactly, not silently ignored.
+func (s *Store) SupportsOutpointOnlySpend() bool { return true }
+
 // Health checks the database connection.
 func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 	var num int

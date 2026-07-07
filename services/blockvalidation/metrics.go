@@ -242,6 +242,15 @@ func _initPrometheusMetrics() {
 		},
 	)
 
+	prometheusBlockValidationOutpointOnlyBlocks = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "outpoint_only_blocks_total",
+			Help:      "Total number of blocks that entered the below-checkpoint outpoint-only fast path (OutpointOnlyBelowCheckpoint setting on, height at or below highest checkpoint). Counted once on entry; a block that later falls back to normal validation is still counted. A rising rate during IBD indicates the fast path is active.",
+		},
+	)
+
 	prometheusBlockValidationSetMinedEnqueueOverflow = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "teranode",

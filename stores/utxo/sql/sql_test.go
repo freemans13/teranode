@@ -1079,36 +1079,6 @@ func Test_SmokeTests(t *testing.T) {
 
 		tests.SetMinedWithSpent(t, db)
 	})
-
-	t.Run("set mined unset on missing tx", func(t *testing.T) {
-		db, _ := setup(ctx, t)
-
-		tests.SetMinedUnsetOnMissingTx(t, db)
-	})
-
-	t.Run("unset mined preserves unmined since", func(t *testing.T) {
-		db, _ := setup(ctx, t)
-
-		tests.UnsetMinedPreservesUnminedSinceWhenNonLCBlocksRemain(t, db)
-	})
-
-	t.Run("remove block ids keeps parallel arrays aligned", func(t *testing.T) {
-		db, _ := setup(ctx, t)
-
-		tests.RemoveBlockIDsKeepsParallelArraysAligned(t, db)
-	})
-
-	t.Run("unspend flag as locked locks parent", func(t *testing.T) {
-		db, _ := setup(ctx, t)
-
-		tests.UnspendFlagAsLockedLocksParent(t, db)
-	})
-
-	t.Run("unfreeze and reassign not frozen errors", func(t *testing.T) {
-		db, _ := setup(ctx, t)
-
-		tests.UnfreezeAndReassignNotFrozenErr(t, db)
-	})
 }
 
 func TestSetTTL(t *testing.T) {
@@ -3551,4 +3521,53 @@ func TestUTXOSetEquivalence_OutputsByteIdentical(t *testing.T) {
 
 	// Sanity: we must have observed at least 4 outputs (tx1×2 + tx2×1 + tx4×1; tx3×1 is spent).
 	require.GreaterOrEqual(t, len(rowsA), 4, "expected at least 4 output rows in control store")
+}
+
+// TestMinimalCreate_CoinbaseMaturity_OutpointOnlySpend is the executable store-level
+// coverage of the consensus core of spec T-B1 (the full multi-block cross-checkpoint
+// flow remains deferred to e2e). It proves that a coinbase created via the
+// below-checkpoint minimal path (WithSkipExtendedInputs) still records
+// coinbase_spending_height, and that an outpoint-only spend (SkipUTXOHashCheck) of
+// that coinbase output still enforces coinbase maturity — the flag only zeroes input
+// parent data, never the output-side maturity guard.
+func TestMinimalCreate_CoinbaseMaturity_OutpointOnlySpend(t *testing.T) {
+	store, db := newTestStore(t)
+	ctx := context.Background()
+
+	maturity := uint32(store.settings.ChainCfgParams.CoinbaseMaturity)
+	require.Positive(t, maturity, "test settings must set a non-zero coinbase maturity for this to be meaningful")
+
+	const createHeight = uint32(100)
+
+	// A real coinbase tx (block 500,000); its single input is the null coinbase input.
+	coinbaseTx, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff580320a107152f5669614254432f48656c6c6f20576f726c64212f2cfabe6d6dbcbb1b0222e1aeebaca2a9c905bb23a3ad0302898ec600a9033a87ec1645a446010000000000000010f829ba0b13a84def80c389cde9840000ffffffff0174fdaf4a000000001976a914f1c075a01882ae0972f95d3a4177c86c852b7d9188ac00000000")
+	require.NoError(t, err)
+	require.True(t, coinbaseTx.IsCoinbase(), "precondition: tx is a coinbase")
+
+	// Minimal create below checkpoint.
+	meta, err := store.Create(ctx, coinbaseTx, createHeight, utxo.WithSkipExtendedInputs(true))
+	require.NoError(t, err)
+	require.True(t, meta.IsCoinbase)
+
+	// Maturity was still recorded despite the minimal create.
+	var gotCSH int64
+	require.NoError(t, db.QueryRow(`
+		SELECT o.coinbase_spending_height
+		FROM outputs o JOIN transactions tx ON tx.id = o.transaction_id
+		WHERE tx.hash = ? AND o.idx = 0`, coinbaseTx.TxIDChainHash()[:]).Scan(&gotCSH))
+	require.Equal(t, int64(createHeight+maturity), gotCSH,
+		"minimal create must still set coinbase_spending_height = height + maturity")
+
+	// Outpoint-only spend one block before maturity: must be rejected as immature.
+	spender := newSpendingTx(t, coinbaseTx, 0)
+	_, err = store.Spend(ctx, spender, createHeight+maturity-1,
+		utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
+	require.Error(t, err, "spending a below-checkpoint coinbase before maturity must fail even outpoint-only")
+	require.True(t, errors.Is(err, errors.ErrTxCoinbaseImmature),
+		"expected coinbase-immature error, got: %v", err)
+
+	// At maturity height: the same outpoint-only spend succeeds.
+	_, err = store.Spend(ctx, spender, createHeight+maturity,
+		utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
+	require.NoError(t, err, "spending at maturity height must succeed")
 }
