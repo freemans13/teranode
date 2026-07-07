@@ -437,6 +437,12 @@ func (s *Store) markCleanShutdown(ctx context.Context) {
 	}
 }
 
+// SupportsOutpointOnlySpend reports that this store honours outpoint-only
+// spends: the spend SQL keys purely on (prev_tx_hash, prev_output_idx), so a
+// SkipUTXOHashCheck spend built via utxo.GetSpendsOutpointOnly (no parent
+// decoration, no UTXO hash) is applied exactly, not silently ignored.
+func (s *Store) SupportsOutpointOnlySpend() bool { return true }
+
 // Health checks the database connection.
 func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 	var num int
@@ -446,13 +452,6 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 	}
 	return 200, "Postgres UTXO Store", nil
 }
-
-// SupportsOutpointOnlySpend reports whether this store honours the below-checkpoint
-// outpoint-only fast path. The Postgres store does not act on the
-// CreateOptions.SkipExtendedInputs / IgnoreFlags.SkipUTXOHashCheck flags, so it must
-// return false — otherwise callers would hand it un-decorated inputs and it would
-// hard-error deriving UTXO hashes from absent parent data.
-func (s *Store) SupportsOutpointOnlySpend() bool { return false }
 
 func (s *Store) SetBlockHeight(blockHeight uint32) error {
 	// Guard the tip at the single chokepoint so every downstream int32(height) cast

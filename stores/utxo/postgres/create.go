@@ -207,7 +207,15 @@ func (s *Store) createBatched(ctx context.Context, tx *bt.Tx, blockHeight uint32
 
 // createDirect executes the INSERT directly for a single transaction.
 func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptions) (*meta.Data, error) {
-	txMeta, err := util.TxMetaDataFromTx(tx)
+	var txMeta *meta.Data
+	var err error
+	if options.SkipExtendedInputs {
+		// Below-checkpoint fast path: inputs are not decorated, so GetFees would error.
+		// Use the no-fee variant — fee is set to 0, TxInpoints still computed.
+		txMeta, err = util.TxMetaDataFromTxNoFee(tx)
+	} else {
+		txMeta, err = util.TxMetaDataFromTx(tx)
+	}
 	if err != nil {
 		return nil, errors.NewProcessingError("failed to get tx meta data", err)
 	}
@@ -547,7 +555,15 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	coinbaseSpendingHeights := make([]int32, 0, n) // coinbase_spending_height is INT4
 
 	for i, item := range batch {
-		txMeta, err := util.TxMetaDataFromTx(item.tx)
+		var txMeta *meta.Data
+		var err error
+		if item.options.SkipExtendedInputs {
+			// Below-checkpoint fast path: inputs not decorated, fee computation would
+			// fail. Use the no-fee variant — fee=0, TxInpoints still computed.
+			txMeta, err = util.TxMetaDataFromTxNoFee(item.tx)
+		} else {
+			txMeta, err = util.TxMetaDataFromTx(item.tx)
+		}
 		if err != nil {
 			item.done <- batchCreateResult{Err: errors.NewProcessingError("failed to get tx meta data", err)}
 			continue
