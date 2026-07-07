@@ -252,8 +252,11 @@ func (s *Store) reconcileSpentBitsPartition(ctx context.Context, partition int, 
 		),`+dahReconcileAuditChain+`
 		SELECT (SELECT ok FROM gate),
 		       (SELECT count(*) FROM upd),
-		       (SELECT min(hash) FROM upd),
-		       (SELECT max(hash) FROM slice_txs),
+		       -- ORDER BY + LIMIT, not min()/max(): min/max over bytea only exist in
+		       -- PostgreSQL 17+, and this store's floor is 14 (CI runs 16). Same
+		       -- semantics incl. NULL on empty.
+		       (SELECT hash FROM upd ORDER BY hash LIMIT 1),
+		       (SELECT hash FROM slice_txs ORDER BY hash DESC LIMIT 1),
 		       (SELECT count(*) FROM slice_txs)
 	`, suffix, "$3", "$4")
 
