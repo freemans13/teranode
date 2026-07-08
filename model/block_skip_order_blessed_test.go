@@ -15,6 +15,8 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -34,6 +36,27 @@ type panicTxMetaStore struct {
 // SupportsOutpointOnlySpend models a store that can run the outpoint-only fast
 // path (like the SQL store), so the below-checkpoint skips are eligible.
 func (s *panicTxMetaStore) SupportsOutpointOnlySpend() bool { return true }
+
+// minedParentTxMetaStore reports every queried tx as already mined in one fixed
+// block (minedParentBlockID). It models the store state a fast-path-synced node
+// persists for a below-checkpoint block's parents: order/blessing metadata is
+// intact, only fees are zeroed. validOrderAndBlessed resolves parents through
+// Get and never reads fees, so it passes against this store even for a fee=0
+// (flag-off revalidation) block. Embeds NullStore for the unused methods; only
+// Get is exercised on the happy path.
+type minedParentTxMetaStore struct {
+	*nullstore.NullStore
+}
+
+const minedParentBlockID = uint32(7)
+
+func (s *minedParentTxMetaStore) SupportsOutpointOnlySpend() bool { return true }
+
+func (s *minedParentTxMetaStore) Get(_ context.Context, _ *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
+	// Fee left 0 on purpose: the outpoint-only fast path persists fee=0, and this
+	// test proves validOrderAndBlessed tolerates that (unlike the fee check).
+	return &meta.Data{BlockIDs: []uint32{minedParentBlockID}}, nil
+}
 
 // newSkipTestSettings returns settings with the outpoint-only flag set as given,
 // a sqlitememory UTXO store URL, and one hardcoded checkpoint at checkpointHeight.
@@ -233,6 +256,25 @@ func storeSubtree(t *testing.T, blobStore *blobmemory.Memory, st *subtreepkg.Sub
 	require.NoError(t, err)
 }
 
+// storeSubtreeMeta serializes st's metadata and writes it into blobStore under
+// the subtree root hash with file type FileTypeSubtreeMeta, mimicking what the
+// subtree validator/block persister writes before Valid() runs
+// validOrderAndBlessed with a real subtree store.
+func storeSubtreeMeta(t *testing.T, blobStore *blobmemory.Memory, st *subtreepkg.Subtree, stMeta *subtreepkg.Meta) {
+	t.Helper()
+
+	metaBytes, err := stMeta.Serialize()
+	require.NoError(t, err)
+
+	err = blobStore.Set(
+		context.Background(),
+		st.RootHash()[:],
+		fileformat.FileTypeSubtreeMeta,
+		metaBytes,
+	)
+	require.NoError(t, err)
+}
+
 // minedHeader builds a BlockHeader with nBits=207fffff and the given merkle
 // root, then increments Nonce until HasMetTargetDifficulty passes.
 // Version is kept at 1 to bypass BIP-34 coinbase-height extraction.
@@ -339,4 +381,83 @@ func TestBlock_MerkleFloor_RejectsTamperingWhileSkipIsActive(t *testing.T) {
 		require.NoError(t, valErr)
 		require.True(t, valid, "expected valid=true: correct merkle, skip active, store floor exercised")
 	})
+}
+
+// TestBlock_Valid_OrderAndBlessedPassesOnFlagOffRevalidation is the regression
+// guard for the safe asymmetry between the two below-checkpoint skips.
+//
+// The sibling fee skip (checkBlockRewardAndFees) is deliberately NOT gated on
+// the OutpointOnlyBelowCheckpoint flag: a fast-path-synced block persists
+// subtree fees as 0, so a flag-gated fee skip would recompute
+// coinbaseOutput(subsidy+realFees) > subtreeFees(0)+subsidy on later
+// revalidation and wrongly reject a genuinely-valid, checkpoint-pinned block.
+//
+// The order-blessed skip IS additionally gated on the flag, which is only safe
+// because validOrderAndBlessed has no equivalent fee=0 hazard: it reads
+// persisted subtree meta (parent tx hashes / inpoints) and parent existence on
+// chain, never fees. This test proves that — with the flag OFF so the skip is
+// disabled and validOrderAndBlessed actually runs — a fast-path-shaped block
+// (subtree Fees == 0, parents already mined) still validates.
+func TestBlock_Valid_OrderAndBlessedPassesOnFlagOffRevalidation(t *testing.T) {
+	const checkpointHeight = int32(2000)
+	const blockHeight = uint32(1000) // <= checkpoint
+
+	// Flag OFF: the skip is disabled, so validOrderAndBlessed runs in full.
+	tSettings := newSkipTestSettings(t, false, checkpointHeight)
+
+	coinbase, err := bt.NewTxFromString(CoinbaseHex)
+	require.NoError(t, err)
+
+	txHash, err := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
+	require.NoError(t, err)
+
+	// The block's single non-coinbase tx spends a parent that is not in this
+	// block; minedParentTxMetaStore reports that parent as already mined in a
+	// recent block, which we advertise via currentBlockHeaderIDs.
+	parentHash, err := chainhash.NewHashFromStr("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+	require.NoError(t, err)
+
+	// One subtree: coinbase placeholder at index 0, one tx at index 1 with fee 0
+	// (exactly what the outpoint-only fast path persists).
+	st, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, st.AddCoinbaseNode())
+	require.NoError(t, st.AddNode(*txHash, 0, 100))
+	require.Equal(t, uint64(0), st.Fees, "fast-path-shaped: subtree fees must be 0")
+
+	// Subtree meta records the tx's parent inpoint so validOrderAndBlessed can
+	// resolve the parent on chain.
+	stMeta := subtreepkg.NewSubtreeMeta(st)
+	parentInput := &bt.Input{PreviousTxOutIndex: 0}
+	require.NoError(t, parentInput.PreviousTxIDAdd(parentHash))
+	txInpoints, err := subtreepkg.NewTxInpointsFromInputs([]*bt.Input{parentInput})
+	require.NoError(t, err)
+	require.NoError(t, stMeta.SetTxInpoints(1, txInpoints))
+
+	// Correct merkle root, computed the way CheckMerkleRoot does.
+	merkleRoot, err := st.RootHashWithReplaceRootNode(coinbase.TxIDChainHash(), 0, uint64(coinbase.Size())) // nolint: gosec
+	require.NoError(t, err)
+
+	hdr := minedHeader(t, merkleRoot)
+
+	subtreeRootHash := st.RootHash()
+	block, err := NewBlock(hdr, coinbase, []*chainhash.Hash{subtreeRootHash}, 2, 123, blockHeight, 0)
+	require.NoError(t, err)
+	block.SetCheckpointConfirmedAncestor(true)
+
+	// Real subtree store stocked with both the subtree and its meta.
+	blobStore := blobmemory.New()
+	storeSubtree(t, blobStore, st)
+	storeSubtreeMeta(t, blobStore, st, stMeta)
+
+	oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
+
+	// currentBlockHeaderIDs advertises the parent's mined block as on our chain,
+	// so checkParentExistsOnChain resolves it to exactly one recent block.
+	valid, err := block.Valid(
+		context.Background(), ulogger.TestLogger{}, blobStore,
+		&minedParentTxMetaStore{}, oldBlockIDs, []*BlockHeader{}, []uint32{minedParentBlockID}, tSettings, nil,
+	)
+	require.NoError(t, err, "validOrderAndBlessed must pass on a fee=0 flag-off revalidation")
+	require.True(t, valid)
 }
