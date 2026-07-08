@@ -248,11 +248,12 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 
 	// Build block_id arrays.
 	var blockIDs, blkHeights, subtreeIdxs []int32
-	// minedAtHeight feeds Worker 2's deferred-DAH mine-arm: a tx created already
-	// mined (legacy catch-up) must record the height it was mined at, exactly as
-	// SetMinedMulti does, otherwise the sweep can never enumerate the
-	// fully-spent-then-mined case and it falls to the keyspace backstop. Use the
-	// lowest mined block height (earliest mining). INT4 column; heights < 2^31.
+	// minedAtHeight records the height a tx created ALREADY mined (below-checkpoint
+	// quick validation / legacy catch-up) was mined at, exactly as SetMinedMulti
+	// does. The DAH fold stamps delete_at_height only when mined_at_height IS NOT
+	// NULL, so without it a later fully-spent completion could never stamp the row
+	// and it would never prune. Use the lowest mined block height (earliest
+	// mining). INT4 column; heights < 2^31.
 	var minedAtHeight *int32
 	if len(options.MinedBlockInfos) > 0 {
 		blockIDs = make([]int32, len(options.MinedBlockInfos))
