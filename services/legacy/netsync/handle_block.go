@@ -1043,24 +1043,10 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	// Merge our blockID into any tx that already existed. Without this, those txs
 	// keep their stale (or empty) BlockIDs and the next block's validOrderAndBlessed
 	// check fails in model/Block.go getParentTxMetaBlockIDs.
-	//
-	// Chunk the merge across a worker pool (#936). A single SetMinedMulti call with
-	// every existing tx in the block overruns the aerospike client connection pool
-	// on fat blocks (e.g. mainnet 755880 = 2.87M txs). Pattern mirrors
-	// stores/utxo/aerospike/longest_chain.go:MarkTransactionsOnLongestChain.
+	// Chunked via the shared helper (issue 936): a single SetMinedMulti call with every
+	// existing tx in the block overruns the aerospike client connection pool on fat
+	// blocks (e.g. mainnet 755880 = 2.87M txs).
 	if len(existingTxHashes) > 0 {
-		sm.logger.Debugf("[createUtxos] merging blockID %d into %d pre-existing tx(s)", blockID, len(existingTxHashes))
-
-		batchSize := sm.settings.UtxoStore.MaxMinedBatchSize
-		if batchSize < 1 {
-			batchSize = 1
-		}
-		numChunks := (len(existingTxHashes) + batchSize - 1) / batchSize
-		numWorkers := min(sm.settings.UtxoStore.MaxMinedRoutines, numChunks)
-		if numWorkers < 1 {
-			numWorkers = 1
-		}
-
 		minedBlockInfo := utxo.MinedBlockInfo{
 			BlockID:        blockID,
 			BlockHeight:    blockHeightUint32,
@@ -1068,32 +1054,9 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 			OnLongestChain: true,
 		}
 
-		rangeSize := (len(existingTxHashes) + numWorkers - 1) / numWorkers
-
-		mergeG, mergeCtx := errgroup.WithContext(ctx)
-
-		for w := 0; w < numWorkers && w*rangeSize < len(existingTxHashes); w++ {
-			workerStart := w * rangeSize
-			workerEnd := min(workerStart+rangeSize, len(existingTxHashes))
-			workerHashes := existingTxHashes[workerStart:workerEnd]
-
-			mergeG.Go(func() error {
-				for i := 0; i < len(workerHashes); i += batchSize {
-					if mergeCtx.Err() != nil {
-						return mergeCtx.Err()
-					}
-					chunkEnd := min(i+batchSize, len(workerHashes))
-					chunk := workerHashes[i:chunkEnd]
-					if _, err := sm.utxoStore.SetMinedMulti(mergeCtx, chunk, minedBlockInfo); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-		}
-
-		if err = mergeG.Wait(); err != nil {
-			return errors.NewProcessingError("failed to merge blockID into %d pre-existing txs", len(existingTxHashes), err)
+		if err = utxo.SetMinedMultiChunked(ctx, sm.logger, sm.utxoStore, existingTxHashes, minedBlockInfo,
+			sm.settings.UtxoStore.MaxMinedBatchSize, sm.settings.UtxoStore.MaxMinedRoutines); err != nil {
+			return err
 		}
 	}
 

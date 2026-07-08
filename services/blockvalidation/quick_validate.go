@@ -1284,9 +1284,13 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	}
 
 	// Phase 1.5: Update mined info for transactions that already existed
-	// This handles the case where a previous attempt created UTXOs with a different block ID
+	// This handles the case where a previous attempt created UTXOs with a different
+	// block ID. Chunked via the shared helper (issue 936): on a fat-batch retry every tx
+	// in the batch already exists, and a single unchunked SetMinedMulti call would
+	// overrun the aerospike client connection pool.
 	if len(existingTxHashes) > 0 {
-		if _, err := u.utxoStore.SetMinedMulti(ctx, existingTxHashes, minedBlockInfo); err != nil {
+		if err := utxo.SetMinedMultiChunked(ctx, u.logger, u.utxoStore, existingTxHashes, minedBlockInfo,
+			u.settings.UtxoStore.MaxMinedBatchSize, u.settings.UtxoStore.MaxMinedRoutines); err != nil {
 			return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to update mined info for %d existing txs", block.Hash().String(), len(existingTxHashes), err)
 		}
 	}
