@@ -7,6 +7,15 @@ directly against a fresh sqlitememory store (without constructing a real
 BlockValidation, whose unexported fields cannot be set from this package).
 Full system parity — flag-off node vs flag-on node producing identical block
 hashes, heights, and UTXO counts — is verified by the Step-4 live soak.
+
+Known fidelity gaps in Run B (deferred to Step-4 live soak):
+  - WithLocked is omitted: the real createAndSpendUTXOsForBatch creates UTXOs
+    locked by default (quickValidateSkipsUtxoLock=false path); Run B calls
+    Create without utxo.WithLocked, so locked-UTXO behaviour is not exercised.
+  - SubtreeIdx per-slot is not exercised: Run B uses a single flat blockID per
+    block and does not thread per-slot subtree indices through Create.
+  - Subtree-file parity is not compared: Run B writes no subtree files; the
+    two runs differ in what is written to the blob store.
 */
 
 import (
@@ -44,6 +53,9 @@ type parityCorpus struct {
 	// spentByLaterTx is the subset of nonCBHashes whose outputs are consumed by
 	// a later transaction (tx_a, tx_b, tx_c).
 	spentByLaterTx map[chainhash.Hash]bool
+	// spenderOf maps each spent tx hash to the expected spender tx hash.
+	// Used in cross-run spender-identity assertions.
+	spenderOf map[chainhash.Hash]chainhash.Hash
 }
 
 // buildParityCorpus constructs the 3-block corpus:
@@ -128,6 +140,11 @@ func buildParityCorpus(t *testing.T) *parityCorpus {
 			txAHash: true, // consumed by tx_c in block 2
 			txBHash: true, // consumed by tx_e in block 3
 			txCHash: true, // consumed by tx_d in same block 2
+		},
+		spenderOf: map[chainhash.Hash]chainhash.Hash{
+			txAHash: txCHash, // tx_c spends tx_a[0]
+			txBHash: txEHash, // tx_e spends tx_b[0]
+			txCHash: txDHash, // tx_d spends tx_c[0]
 		},
 	}
 	return corpus
@@ -310,6 +327,73 @@ func compareStores(
 		require.NotNil(t, mB, "Run B: nil meta for spent tx %s", h)
 		require.NotEmpty(t, mB.SpendingDatas, "Run B: spent tx %s must have SpendingDatas", h)
 		require.NotNil(t, mB.SpendingDatas[0], "Run B: SpendingDatas[0] nil for spent tx %s", h)
+	}
+
+	// 4. CROSS-RUN: block-group parity.
+	//
+	// Build a tx-hash → block-group-index map for each run by normalising each
+	// run's numeric BlockIDs to their first-seen rank (0, 1, 2). The two maps
+	// must be identical: the same set of tx hashes must land in group 0, 1, and
+	// 2 in both runs. A unified route that groups txs into different blocks than
+	// the inline route will fail here even if both passes internal consistency.
+	blockGroupMap := func(runName string, store utxo.Store) map[chainhash.Hash]int {
+		t.Helper()
+		rankOf := make(map[uint32]int) // numeric BlockID → normalised rank
+		result := make(map[chainhash.Hash]int, len(corpus.nonCBHashes))
+		for _, h := range corpus.nonCBHashes {
+			h := h
+			m, err := store.Get(ctx, &h, fields.BlockIDs)
+			require.NoError(t, err, "%s: Get(BlockIDs) failed for tx %s", runName, h)
+			require.NotNil(t, m, "%s: nil meta for tx %s", runName, h)
+			require.NotEmpty(t, m.BlockIDs, "%s: tx %s has no BlockIDs", runName, h)
+			bid := m.BlockIDs[0]
+			if _, seen := rankOf[bid]; !seen {
+				rankOf[bid] = len(rankOf)
+			}
+			result[h] = rankOf[bid]
+		}
+		return result
+	}
+
+	groupA := blockGroupMap("Run A", storeA)
+	groupB := blockGroupMap("Run B", storeB)
+	require.Equal(t, groupA, groupB,
+		"cross-run block-group mismatch: Run A and Run B assigned tx hashes to different block groups")
+
+	// 5. CROSS-RUN: spender-identity parity.
+	//
+	// For each spent output, read SpendingDatas[0].TxID from both stores and
+	// require that the spender tx-hash matches. The spender hashes are determined
+	// by wire tx bytes (same input script, same outpoints → same txid) and are
+	// therefore identical across runs despite differing numeric BlockIDs.
+	// This catches wrong-spender attribution independent of block assignment.
+	for spentHash, expectedSpender := range corpus.spenderOf {
+		spentHash := spentHash             // capture
+		expectedSpender := expectedSpender // capture
+
+		mA, err := storeA.Get(ctx, &spentHash, fields.Utxos)
+		require.NoError(t, err, "cross-run: Run A Get(Utxos) failed for spent tx %s", spentHash)
+		require.NotNil(t, mA, "cross-run: Run A nil meta for spent tx %s", spentHash)
+		require.GreaterOrEqual(t, len(mA.SpendingDatas), 1,
+			"cross-run: Run A SpendingDatas empty for spent tx %s", spentHash)
+		require.NotNil(t, mA.SpendingDatas[0], "cross-run: Run A SpendingDatas[0] nil for spent tx %s", spentHash)
+		require.NotNil(t, mA.SpendingDatas[0].TxID, "cross-run: Run A SpendingDatas[0].TxID nil for spent tx %s", spentHash)
+
+		mB, err := storeB.Get(ctx, &spentHash, fields.Utxos)
+		require.NoError(t, err, "cross-run: Run B Get(Utxos) failed for spent tx %s", spentHash)
+		require.NotNil(t, mB, "cross-run: Run B nil meta for spent tx %s", spentHash)
+		require.GreaterOrEqual(t, len(mB.SpendingDatas), 1,
+			"cross-run: Run B SpendingDatas empty for spent tx %s", spentHash)
+		require.NotNil(t, mB.SpendingDatas[0], "cross-run: Run B SpendingDatas[0] nil for spent tx %s", spentHash)
+		require.NotNil(t, mB.SpendingDatas[0].TxID, "cross-run: Run B SpendingDatas[0].TxID nil for spent tx %s", spentHash)
+
+		require.Equal(t, expectedSpender, *mA.SpendingDatas[0].TxID,
+			"cross-run: Run A wrong spender for tx %s (expected %s)", spentHash, expectedSpender)
+		require.Equal(t, expectedSpender, *mB.SpendingDatas[0].TxID,
+			"cross-run: Run B wrong spender for tx %s (expected %s)", spentHash, expectedSpender)
+		require.Equal(t, *mA.SpendingDatas[0].TxID, *mB.SpendingDatas[0].TxID,
+			"cross-run: spender mismatch for spent tx %s: Run A=%s Run B=%s",
+			spentHash, mA.SpendingDatas[0].TxID, mB.SpendingDatas[0].TxID)
 	}
 }
 
