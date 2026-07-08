@@ -2,7 +2,6 @@ package model
 
 import (
 	"context"
-	"encoding/hex"
 	"net/url"
 	"testing"
 
@@ -150,66 +149,84 @@ func TestBlock_SkipOrderAndBlessedBelowCheckpoint_Predicate(t *testing.T) {
 	})
 }
 
-// TestBlock_Valid_SkipsValidOrderAndBlessedBelowCheckpoint proves the gate is
-// honoured end-to-end: with the flag ON and a block at/below the checkpoint,
-// Valid() must succeed WITHOUT touching the txMetaStore at all (the store
-// panics on any use). Before the gate existed this test panicked inside
-// validOrderAndBlessed (RED); with the gate it passes (GREEN). All other
-// Valid() checks (PoW, timestamp, coinbase, dedup) still run.
+// TestBlock_Valid_SkipRefusedWhenMerkleRootNotChecked is the ChiR3 regression
+// guard. The below-checkpoint skip of validOrderAndBlessed is honoured ONLY when
+// CheckMerkleRoot (step 8) actually ran and bound the block body to the
+// checkpoint-certified header — Block.Valid tracks that as merkleRootChecked.
+// When the merkle block did not run (forced here with an empty b.Subtrees, the
+// same merkleRootChecked == false state a nil-subtreeStore internal-block caller
+// reaches) the skip must be REFUSED even though every policy conjunct holds
+// (flag on, supporting store, confirmed ancestor, height below the checkpoint).
 //
-// Note: a nil subtreeStore is a test convenience that bypasses
-// GetAndValidateSubtrees and the CheckMerkleRoot call that follows it.
-// The guarantee that CheckMerkleRoot still runs and rejects tampered blocks
-// while the skip is active is covered by
-// TestBlock_MerkleFloor_RejectsTamperingWhileSkipIsActive.
-func TestBlock_Valid_SkipsValidOrderAndBlessedBelowCheckpoint(t *testing.T) {
-	tSettings := newSkipTestSettings(t, true, 2000)
+// The "skip taken once the merkle root has been checked" path is proven by
+// TestBlock_MerkleFloor_RejectsTamperingWhileSkipIsActive (Case B). Here we prove
+// the opposite: with no merkle check, validOrderAndBlessed genuinely runs. We
+// observe that by the side effect only it produces — populating oldBlockIDsMap
+// with the tx's parent block reference. A taken skip never runs
+// validOrderAndBlessed, so that map would stay empty (exactly what the pre-fix
+// code did here: silently skip without ever binding the body to the header).
+func TestBlock_Valid_SkipRefusedWhenMerkleRootNotChecked(t *testing.T) {
+	const checkpointHeight = int32(2000)
+	const blockHeight = uint32(1000) // <= checkpoint
 
-	blockHeaderBytes, err := hex.DecodeString(block1Header)
-	require.NoError(t, err)
-	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-	require.NoError(t, err)
+	// Flag ON and all policy conjuncts satisfied: only the missing merkle check
+	// should keep the skip from engaging.
+	tSettings := newSkipTestSettings(t, true, checkpointHeight)
 
 	coinbase, err := bt.NewTxFromString(CoinbaseHex)
 	require.NoError(t, err)
 
-	// One subtree: coinbase placeholder + one regular tx that is unknown to any
-	// store — if validOrderAndBlessed ran, resolving this tx would hit the
-	// panicTxMetaStore.
+	txHash, err := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
+	require.NoError(t, err)
+	parentHash, err := chainhash.NewHashFromStr("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+	require.NoError(t, err)
+
+	// One subtree: coinbase placeholder + one tx whose parent is resolved on chain.
 	st, err := subtreepkg.NewTreeByLeafCount(2)
 	require.NoError(t, err)
 	require.NoError(t, st.AddCoinbaseNode())
+	require.NoError(t, st.AddNode(*txHash, 0, 100))
 
-	txHash, err := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
+	stMeta := subtreepkg.NewSubtreeMeta(st)
+	parentInput := &bt.Input{PreviousTxOutIndex: 0}
+	require.NoError(t, parentInput.PreviousTxIDAdd(parentHash))
+	txInpoints, err := subtreepkg.NewTxInpointsFromInputs([]*bt.Input{parentInput})
 	require.NoError(t, err)
-	require.NoError(t, st.AddNode(*txHash, 1, 100))
+	require.NoError(t, stMeta.SetTxInpoints(1, txInpoints))
 
-	rootHash := st.RootHash()
-
-	// height 1000 <= checkpoint 2000. blockID 0.
-	block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{rootHash}, 2, 123, 1000, 0)
+	hdr := minedHeader(t, st.RootHash())
+	block, err := NewBlock(hdr, coinbase, []*chainhash.Hash{st.RootHash()}, 2, 123, blockHeight, 0)
 	require.NoError(t, err)
-
-	// Confirmed checkpoint ancestor: the blockvalidation service sets this below
-	// the checkpoint; the skip (like the sibling fee skip) requires it.
 	block.SetCheckpointConfirmedAncestor(true)
 
-	// Pre-populate slices and pass a nil subtreeStore so Valid() takes its
-	// existing internal-block path (skips GetAndValidateSubtrees/merkle steps,
-	// which need a stocked blob store) while checkDuplicateTransactions and the
-	// step-12 gate still execute against the slices.
+	// Force merkleRootChecked == false: with b.Subtrees emptied, Valid's
+	// "subtreeStore != nil && len(b.Subtrees) > 0" block (which runs CheckMerkleRoot)
+	// is skipped, exactly as it is for a nil-subtreeStore internal-block caller.
+	// SubtreeSlices stays populated so checkDuplicateTransactions and
+	// validOrderAndBlessed still have a body to work on.
+	block.Subtrees = nil
 	block.SubtreeSlices = []*subtreepkg.Subtree{st}
+
+	// Real (non-nil) subtree store stocked with the meta so validOrderAndBlessed
+	// resolves the tx's parent cleanly rather than dereferencing a nil store.
+	blobStore := blobmemory.New()
+	storeSubtreeMeta(t, blobStore, st, stMeta)
 
 	oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
-	valid, err := block.Valid(context.Background(), ulogger.TestLogger{}, nil,
-		&panicTxMetaStore{}, oldBlockIDs, []*BlockHeader{}, []uint32{}, tSettings, nil)
+	// Empty currentBlockHeaderIDs: the parent's reported block (minedParentBlockID)
+	// is not among them, so checkParentExistsOnChain returns it as an old-block
+	// reference — the observable proof that validOrderAndBlessed actually ran.
+	valid, err := block.Valid(
+		context.Background(), ulogger.TestLogger{}, blobStore,
+		&minedParentTxMetaStore{}, oldBlockIDs, []*BlockHeader{}, []uint32{}, tSettings, nil,
+	)
 	require.NoError(t, err)
 	require.True(t, valid)
 
-	// The skip must not have recorded any old-block references.
 	_, hasTransactionsReferencingOldBlocks := txmap.ConvertSyncedMapToUint32Slice(oldBlockIDs)
-	require.False(t, hasTransactionsReferencingOldBlocks)
+	require.True(t, hasTransactionsReferencingOldBlocks,
+		"validOrderAndBlessed must have run (skip refused) because CheckMerkleRoot did not run")
 }
 
 // buildSubtreeAndMerkleRoot constructs a one-subtree block body and returns:

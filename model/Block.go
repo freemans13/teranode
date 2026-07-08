@@ -583,6 +583,13 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		}
 	}
 
+	// merkleRootChecked records that CheckMerkleRoot (step 8) actually ran and bound
+	// the block body to the header. Block.Valid enforces this as a precondition for
+	// skipping validOrderAndBlessed below the checkpoint (step 12): the skip's safety
+	// rests entirely on that binding, so a caller that did not run it (nil
+	// subtreeStore, or no subtrees) must never take the skip.
+	merkleRootChecked := false
+
 	// only do the subtree checks if we have a subtree store
 	// missing the subtreeStore should only happen when we are validating an internal block
 	if subtreeStore != nil && len(b.Subtrees) > 0 {
@@ -606,6 +613,8 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		if err = b.CheckMerkleRoot(ctx); err != nil {
 			return false, err
 		}
+
+		merkleRootChecked = true
 	}
 
 	// 9. Check that the total fees of the block are less than or equal to the block reward.
@@ -671,15 +680,17 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	//     Can only be done with a valid texMetaStore passed in
 	//     Skipped for a confirmed-ancestor block below the hardcoded checkpoint on
 	//     the outpoint-only fast path: the checkpoint-anchored chain already
-	//     certifies order/blessing, and the integrity floor still runs earlier in
-	//     this function (steps 1-11): PoW and checkDuplicateTransactions
-	//     unconditionally, and CheckMerkleRoot whenever a subtree store is present —
-	//     which every caller that reaches this skip passes (see
-	//     skipOrderAndBlessedBelowCheckpoint, which shares the fee skip's safety
-	//     contract but additionally requires the OutpointOnlyBelowCheckpoint
-	//     opt-in, so it engages on a subset of the fee-skip blocks).
+	//     certifies order/blessing. The integrity floor still runs earlier in this
+	//     function (steps 1-11): PoW and checkDuplicateTransactions unconditionally.
+	//     The skip additionally REQUIRES merkleRootChecked — CheckMerkleRoot (step 8)
+	//     must have run and bound the body to the checkpoint-certified header — so it
+	//     is never taken on a nil-subtreeStore / no-subtree caller where that binding
+	//     is absent (see skipOrderAndBlessedBelowCheckpoint, which shares the fee
+	//     skip's safety contract but additionally requires the
+	//     OutpointOnlyBelowCheckpoint opt-in, so it engages on a subset of the
+	//     fee-skip blocks).
 	if txMetaStore != nil {
-		if b.skipOrderAndBlessedBelowCheckpoint(settings, txMetaStore) {
+		if merkleRootChecked && b.skipOrderAndBlessedBelowCheckpoint(settings, txMetaStore) {
 			logger.Debugf("[Block:Valid][%s] skipping validOrderAndBlessed for block at height %d at or below hardcoded checkpoint (outpoint-only fast path)", b.String(), b.Height)
 		} else {
 			deps := &validationDependencies{
@@ -757,11 +768,13 @@ func (b *Block) releaseTxMap() {
 // hash already certifies transaction order, uniqueness and blessing: a block
 // whose transactions differed in any way would produce a different merkle root
 // and could not carry the checkpoint-anchored header chain. PoW and
-// checkDuplicateTransactions (CVE-2012-2459) still run unconditionally, and
-// CheckMerkleRoot runs whenever a subtree store is present (step 8) — which
-// every caller reaching this skip passes, so the local bytes are bound to that
-// certified chain. This mirrors the native catchup path (quickValidateBlock),
-// which never runs Valid() below the checkpoint at all.
+// checkDuplicateTransactions (CVE-2012-2459) run unconditionally. CheckMerkleRoot
+// (step 8) runs only when a subtree store and subtrees are present, so it is NOT
+// unconditional — Block.Valid therefore enforces "CheckMerkleRoot ran"
+// (merkleRootChecked) as a precondition of taking this skip, and never skips
+// validOrderAndBlessed unless the local bytes have been bound to the certified
+// chain. This mirrors the native catchup path (quickValidateBlock), which never
+// runs Valid() below the checkpoint at all.
 func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings, txMetaStore utxo.Store) bool {
 	if tSettings == nil || !tSettings.BlockValidation.OutpointOnlyBelowCheckpoint {
 		return false
@@ -781,6 +794,12 @@ func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings,
 
 	highest := HighestCheckpointHeight(tSettings.ChainCfgParams.Checkpoints)
 
+	// b.Height > 0 excludes genesis: it carries only a coinbase, so
+	// validOrderAndBlessed is trivial there and cheap to run in full. This matches
+	// the sibling fee skip, which also special-cases height 0 (checkBlockRewardAndFees
+	// returns early at b.Height == 0). The legacy/quick-validate gates instead return
+	// true at height 0; the divergence is immaterial (genesis has no spends to order)
+	// and the model side simply runs the trivial check rather than skipping it.
 	return highest > 0 && b.Height > 0 && b.Height <= highest
 }
 
