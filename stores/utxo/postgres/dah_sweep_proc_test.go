@@ -60,7 +60,7 @@ func partitionOfTx(t *testing.T, store *Store, ctx context.Context, tx *bt.Tx) i
 	t.Helper()
 	var p int
 	require.NoError(t, store.pool.QueryRow(ctx,
-		`SELECT right(tableoid::regclass::text, 2)::int FROM txs WHERE hash = $1`,
+		`SELECT substring(tableoid::regclass::text from '(\d+)$')::int FROM txs WHERE hash = $1`,
 		tx.TxIDChainHash()[:]).Scan(&p))
 	return p
 }

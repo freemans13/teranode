@@ -1002,13 +1002,13 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		// (dah_reconcile.go) recomputes spent_bits from spends with a fresh
 		// snapshot within ~one tick. The partition number is the txs_pNN leaf the
 		// row lives in — PG's hash routing is not reproducible client-side, so it
-		// is recovered from the row's tableoid (leaf name suffix, same lpad-2
-		// naming as the sweep proc). A parent with no txs row has nothing to heal
+		// is recovered from the row's tableoid (the trailing digit run of the
+		// txs_pNN leaf name, width-agnostic so it holds beyond 99 partitions). A parent with no txs row has nothing to heal
 		// and drops out of the join; ON CONFLICT DO NOTHING keeps re-enqueues of a
 		// still-queued parent idempotent.
 		if _, err := pgxTx.Exec(ctx, `
 			INSERT INTO dah_dirty_parents (hash, partition)
-			SELECT t.hash, right(t.tableoid::regclass::text, 2)::int
+			SELECT t.hash, substring(t.tableoid::regclass::text from '(\d+)$')::int
 			  FROM txs t
 			 WHERE t.hash = ANY($1)
 			ON CONFLICT (hash) DO NOTHING`, parentHashes,

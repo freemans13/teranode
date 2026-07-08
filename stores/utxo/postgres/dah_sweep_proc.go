@@ -168,8 +168,8 @@ func dahSweepProcDDL() string {
 	return dahSweepProcDDLWithPendingDeletes
 }
 
-// dahSweepProcDDLWithPendingDeletes is the spent-bitmap fold (v15) DAH sweep
-// procedure.
+// dahSweepProcDDLWithPendingDeletes is the spent-bitmap fold DAH sweep procedure
+// (installed at proc version dahSweepProcVersion).
 //
 // v11 replaced v10's full-range re-aggregation with a forward-only fold. v12
 // merged fold + stamp into one UPDATE ... RETURNING. v13 added a stamp-time
@@ -261,7 +261,7 @@ BEGIN
     END IF;
 
     IF current_setting('server_version_num')::int < 140000 THEN
-        RAISE EXCEPTION 'dah_sweep_batch v15 requires PostgreSQL 14+ (bit_count on bytea)';
+        RAISE EXCEPTION 'dah_sweep_batch requires PostgreSQL 14+ (bit_count on bytea)';
     END IF;
 
     SELECT last_swept_height INTO v_from
@@ -496,14 +496,14 @@ $$;`
 // startup, surfacing the deployment problem instead of silently not pruning.
 func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 	// PG version guard: COMMIT inside a PROCEDURE requires PostgreSQL 11+;
-	// v15's stamp gate additionally requires bit_count(bytea) (PostgreSQL 14+).
+	// the spent-bitmap stamp gate additionally requires bit_count(bytea) (PostgreSQL 14+).
 	var verNum int
 	if err = s.pool.QueryRow(ctx, `SELECT current_setting('server_version_num')::int`).Scan(&verNum); err != nil {
 		return errors.NewStorageError("[dahSweep] read server_version_num", err)
 	}
 
 	if verNum < 140000 {
-		return errors.NewStorageError("[dahSweep] postgres server_version_num=%d < 140000; the v15 DAH sweep procedure requires PostgreSQL 14+ (bit_count on bytea)", verNum)
+		return errors.NewStorageError("[dahSweep] postgres server_version_num=%d < 140000; the spent-bitmap DAH sweep procedure requires PostgreSQL 14+ (bit_count on bytea)", verNum)
 	}
 
 	// Fresh-sync guard: v15 replaced the spent_progress counter with the

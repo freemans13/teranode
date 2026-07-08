@@ -374,7 +374,7 @@ func TestUnspendEnqueuesDirtyParentAndDrainHeals(t *testing.T) {
 	// The partition the parent's txs row lives in (same NN as the queue row must carry).
 	var parentPartition int
 	require.NoError(t, store.pool.QueryRow(ctx,
-		`SELECT right(tableoid::regclass::text, 2)::int FROM txs WHERE hash = $1`,
+		`SELECT substring(tableoid::regclass::text from '(\d+)$')::int FROM txs WHERE hash = $1`,
 		parent.TxIDChainHash()[:]).Scan(&parentPartition))
 
 	// (1) Unspend enqueues the parent transactionally.

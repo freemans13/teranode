@@ -46,12 +46,12 @@ func (s *postgresPrunerService) runDAHCursor(ctx context.Context) {
 // guard last_swept_height > forkHeight ensures the watermark is never advanced
 // forward by this call (it only ever rewinds).
 //
-// The forward-only fold maintains spent_progress by ADDING each band's spends, so a
-// re-sweep after a rewind can double-count spends that survived the reorg, inflating
-// the counter. That over-count is NO LONGER able to cause data loss: the DAH stamp
-// (both the sweep fold and the mine path) is authorised by a GROUND-TRUTH recount of
-// the tx's spends, not by the counter, so a drifted counter can never stamp a
-// not-fully-spent tx for deletion. The reconcile backstop corrects the counter itself.
+// A re-sweep after a rewind re-folds spends that survived the reorg, but the fold is
+// idempotent: it OR-s each spend's bit into txs.spent_bits, so folding the same spend
+// twice is a no-op. There is no counter to inflate and no ground-truth recount to
+// protect — the DAH stamp gate is the single-row check bit_count(spent_bits) =
+// spendable_count, which a duplicate fold cannot move. The reconcile backstop
+// recomputes spent_bits from spends over bounded slices and un-stamps any wrong stamp.
 func (s *Store) RewindDAHWatermark(ctx context.Context, forkHeight int64) error {
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE dah_part_watermark SET last_swept_height = $1 WHERE last_swept_height > $1`,
