@@ -275,6 +275,20 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		return nil, err
 	}
 
+	// Zero-spendable txs (e.g. all-OP_RETURN data carriers) own no UTXO a spend can
+	// ever complete, so the fold and reconciler — both gated on spendable_count > 0 —
+	// never stamp them. SetMinedMulti stamps this case inline at mine time, but a tx
+	// created ALREADY mined (legacy catch-up / below-checkpoint quick validation)
+	// bypasses SetMinedMulti entirely, so without this stamp it would never become
+	// prune-eligible and leak forever. Mirror mined.go: delete_at_height = mined + 1 +
+	// retention and feed pending_deletes (the only pruner path) in the same statement.
+	// spent_bits is all-zero at create, so only the zero-spendable case can complete
+	// here; the fully-spent branch is unreachable at create time.
+	var deleteAtHeight interface{}
+	if minedAtHeight != nil && outArrs.outCount > 0 && outArrs.spendableCount == 0 {
+		deleteAtHeight = *minedAtHeight + 1 + int32(s.settings.GetUtxoStoreBlockHeightRetention())
+	}
+
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return nil, errors.NewStorageError("failed to acquire connection", err)
@@ -284,16 +298,24 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// spent_bits is pre-sized to (out_count+7)/8 zero bytes so every later fold is
 	// a same-size in-place overwrite (see the schema.go spent_bits contract).
 	const insertSQL = `
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-			locked, conflicting, frozen, unmined_since,
-			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
-			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
-			spent_bits)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-		        $17, $18, $19, $20, $21,
-		        decode(repeat('00', ($18 + 7) / 8), 'hex'))
-		ON CONFLICT (hash) DO NOTHING
-		RETURNING hash`
+		WITH ins AS (
+			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+				locked, conflicting, frozen, unmined_since,
+				block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
+				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
+				delete_at_height, spent_bits)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			        $17, $18, $19, $20, $21, $22,
+			        decode(repeat('00', ($18 + 7) / 8), 'hex'))
+			ON CONFLICT (hash) DO NOTHING
+			RETURNING hash, delete_at_height
+		),
+		_pd AS (
+			INSERT INTO pending_deletes (hash, delete_at_height)
+			SELECT hash, delete_at_height FROM ins WHERE delete_at_height IS NOT NULL
+			ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
+		)
+		SELECT hash FROM ins`
 	insertArgs := []interface{}{
 		txHash[:], int64(tx.Version), int64(tx.LockTime),
 		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
@@ -301,6 +323,7 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil), minedAtHeight,
 		outArrs.utxoHashes, outArrs.outCount, outArrs.spendableCount,
 		outArrs.spendableBits, outArrs.coinbaseSpendingHeight,
+		deleteAtHeight,
 	}
 
 	// Conflicting txs need the txs INSERT AND the N parent conflicting_children
@@ -349,16 +372,24 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// (out_count+7)/8 zero bytes so every later fold is a same-size in-place
 	// overwrite (see the schema.go spent_bits contract).
 	const insertDirectSQL = `
-		INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-			locked, conflicting, frozen, unmined_since,
-			block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
-			utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
-			spent_bits)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-		        $17, $18, $19, $20, $21,
-		        decode(repeat('00', ($18 + 7) / 8), 'hex'))
-		ON CONFLICT (hash) DO NOTHING
-		RETURNING hash`
+		WITH ins AS (
+			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
+				locked, conflicting, frozen, unmined_since,
+				block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
+				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
+				delete_at_height, spent_bits)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			        $17, $18, $19, $20, $21, $22,
+			        decode(repeat('00', ($18 + 7) / 8), 'hex'))
+			ON CONFLICT (hash) DO NOTHING
+			RETURNING hash, delete_at_height
+		),
+		_pd AS (
+			INSERT INTO pending_deletes (hash, delete_at_height)
+			SELECT hash, delete_at_height FROM ins WHERE delete_at_height IS NOT NULL
+			ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
+		)
+		SELECT hash FROM ins`
 
 	var insertedHash []byte
 	if err = conn.QueryRow(ctx, insertDirectSQL, insertArgs...).Scan(&insertedHash); err != nil {
@@ -452,15 +483,23 @@ const createBatchChunkOverhead int64 = 1024
 //
 // The pending_unmined projection is write-behind (see
 // pending_unmined_projector.go); the synchronous _pu CTE arm was removed from
-// this statement. RETURNING hash preserves the existing scan contract in
-// runChunk (rows.Scan(&hashBytes)). spent_bits is pre-sized to (out_count+7)/8
-// zero bytes so every later fold is a same-size in-place overwrite (see the
-// schema.go spent_bits contract).
+// this statement. The outer SELECT still RETURNs only hash, preserving the scan
+// contract in runChunk (rows.Scan(&hashBytes)). spent_bits is pre-sized to
+// (out_count+7)/8 zero bytes so every later fold is a same-size in-place
+// overwrite (see the schema.go spent_bits contract).
+//
+// A zero-spendable row created already mined (u.mined AND out_count > 0 AND
+// spendable_count = 0) is stamped delete_at_height = block_height + 1 + $21
+// (retention) and fed into pending_deletes here — the fold/reconciler skip
+// spendable_count = 0 and this path bypasses SetMinedMulti's inline stamp, so
+// without it the row would never become prune-eligible (mirrors createDirect
+// and mined.go).
 const createBatchUNNESTSQL = `
+			WITH ins AS (
 			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 				locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
 				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
-				spent_bits)
+				delete_at_height, spent_bits)
 			SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
 			       u.locked, u.conflicting, u.frozen,
 			       CASE WHEN u.mined THEN NULL::int ELSE u.unmined_since END,
@@ -469,6 +508,8 @@ const createBatchUNNESTSQL = `
 			       CASE WHEN u.mined THEN ARRAY[u.subtree_idx] ELSE NULL::int[] END,
 			       CASE WHEN u.mined THEN u.block_height ELSE NULL::int END,
 			       u.utxo_hashes, u.out_count, u.spendable_count, u.out_spendables, u.coinbase_spending_height,
+			       CASE WHEN u.mined AND u.out_count > 0 AND u.spendable_count = 0
+			            THEN (u.block_height + 1 + $21)::int ELSE NULL::int END,
 			       decode(repeat('00', (u.out_count + 7) / 8), 'hex')
 			FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
 			            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
@@ -478,7 +519,14 @@ const createBatchUNNESTSQL = `
 			          locked, conflicting, frozen, unmined_since, mined, block_id, block_height, subtree_idx,
 			          utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height)
 			ON CONFLICT (hash) DO NOTHING
-			RETURNING hash`
+			RETURNING hash, delete_at_height
+			),
+			_pd AS (
+			INSERT INTO pending_deletes (hash, delete_at_height)
+			SELECT hash, delete_at_height FROM ins WHERE delete_at_height IS NOT NULL
+			ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
+			)
+			SELECT hash FROM ins`
 
 // planCreateChunks partitions [0,len(rowBytes)) into contiguous, non-empty,
 // byte-bounded windows whose estimated wire size (chunkOverhead + Σ rowBytes in
@@ -684,12 +732,17 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 
 	newHashSet := make(map[chainhash.Hash]struct{}, len(hashes))
 
+	// $21: retention added to a zero-spendable mined row's completion height when
+	// stamping delete_at_height inline (see createBatchUNNESTSQL).
+	retention := int32(s.settings.GetUtxoStoreBlockHeightRetention())
+
 	runChunk := func(lo, hi int) error {
 		rows, err := conn.Query(ctx, createBatchUNNESTSQL,
 			hashes[lo:hi], versions[lo:hi], lockTimes[lo:hi], fees[lo:hi], sizes[lo:hi],
 			coinbases[lo:hi], rawTxs[lo:hi], lockeds[lo:hi], conflictings[lo:hi], frozens[lo:hi],
 			unminedSinces[lo:hi], mineds[lo:hi], blockIDs[lo:hi], blockHeights[lo:hi], subtreeIdxs[lo:hi],
 			packedUtxoHashes[lo:hi], outCounts[lo:hi], spendableCounts[lo:hi], packedSpendableBits[lo:hi], coinbaseSpendingHeights[lo:hi],
+			retention,
 		)
 		if err != nil {
 			return errors.NewStorageError("failed to INSERT create batch via CTE", err)
