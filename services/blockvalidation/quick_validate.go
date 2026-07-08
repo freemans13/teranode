@@ -1295,21 +1295,99 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		}
 	}
 
-	// Phase 2: Spend all transactions in parallel
-	spendG, spendCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(u.logger, spendG, u.settings.UtxoStore.SpendBatcherSize*u.settings.UtxoStore.SpendBatcherConcurrency*2)
+	// Phase 2: Spend all transactions, with the same hardening the legacy path has
+	// (services/legacy/netsync PreValidateTransactions): tolerate ErrTxConflicting
+	// (the block is checkpoint-certified, so its txs take precedence and conflicts
+	// are resolved at block acceptance), retry transient store errors with backoff
+	// and progress detection, hard-fail everything else.
+	return u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly)
+}
 
-	for _, tx := range batch.batchTxs {
-		tx := tx
-		spendG.Go(func() error {
-			if _, err := u.utxoStore.Spend(spendCtx, tx, block.Height, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: outpointOnly}); err != nil {
-				return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to spend tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
-			}
-			return nil
-		})
+// spendRetryBackoffDefault is the pause between spend retry attempts. Matches the
+// legacy path's retryBackoff (services/legacy/netsync PreValidateTransactions).
+const spendRetryBackoffDefault = 2 * time.Second
+
+// spendBatchWithRetry spends txs in parallel with bounded retries. Per attempt:
+// ErrTxConflicting is tolerated (block txs take precedence below checkpoint-certified
+// blocks; resolution happens at block acceptance), retryable errors (transient store
+// overload) queue the tx for the next attempt, anything else fails hard immediately.
+// Gives up early when an attempt makes no progress. Mirrors the legacy path's
+// PreValidateTransactions retry semantics (maxRetries=10, 2s backoff) so both
+// below-checkpoint implementations converge identically after dirty restarts.
+func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.Block, txs []*bt.Tx, outpointOnly bool) error {
+	const maxRetries = 10
+
+	backoff := u.spendRetryBackoff
+	if backoff <= 0 {
+		backoff = spendRetryBackoffDefault
 	}
 
-	return spendG.Wait()
+	pending := txs
+	total := len(txs)
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return errors.NewProcessingError("[spendBatchWithRetry][%s] context cancelled", block.Hash().String())
+		}
+
+		if attempt > 0 {
+			u.logger.Infof("[spendBatchWithRetry][%s] retry %d/%d: %d of %d transactions remaining", block.Hash().String(), attempt, maxRetries, len(pending), total)
+			time.Sleep(backoff)
+		}
+
+		spendG, spendCtx := errgroup.WithContext(ctx)
+		util.SafeSetLimit(u.logger, spendG, u.settings.UtxoStore.SpendBatcherSize*u.settings.UtxoStore.SpendBatcherConcurrency*2)
+
+		var (
+			mu        sync.Mutex
+			retryable []*bt.Tx
+			lastErr   error
+			hardFail  error
+		)
+
+		for _, tx := range pending {
+			tx := tx
+			spendG.Go(func() error {
+				if _, err := u.utxoStore.Spend(spendCtx, tx, block.Height, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: outpointOnly}); err != nil {
+					if errors.Is(err, errors.ErrTxConflicting) {
+						return nil
+					}
+					if errors.IsRetryableError(err) {
+						mu.Lock()
+						retryable = append(retryable, tx)
+						lastErr = err
+						mu.Unlock()
+						return nil
+					}
+					mu.Lock()
+					hardFail = errors.NewProcessingError("[spendBatchWithRetry][%s] failed to spend tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
+					mu.Unlock()
+				}
+				return nil
+			})
+		}
+
+		_ = spendG.Wait()
+
+		if hardFail != nil {
+			return hardFail
+		}
+
+		if len(retryable) == 0 {
+			if attempt > 0 {
+				u.logger.Infof("[spendBatchWithRetry][%s] all spends succeeded after %d retries", block.Hash().String(), attempt)
+			}
+			return nil
+		}
+
+		if attempt > 0 && len(retryable) >= len(pending) {
+			return errors.NewProcessingError("[spendBatchWithRetry][%s] %d of %d spends failed with no progress, giving up", block.Hash().String(), len(retryable), total, lastErr)
+		}
+
+		pending = retryable
+	}
+
+	return errors.NewProcessingError("[spendBatchWithRetry][%s] %d of %d spends still failing after %d retries", block.Hash().String(), len(pending), total, maxRetries)
 }
 
 // writeSubtreeFilesForBatch writes the full subtree files (.subtree) for a batch.

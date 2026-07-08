@@ -241,6 +241,10 @@ type BlockValidation struct {
 
 	// mmapDir, when non-empty, enables mmap-backed subtree loading.
 	mmapDir string
+
+	// spendRetryBackoff overrides the pause between quick-validate spend retry
+	// attempts; zero means spendRetryBackoffDefault. Settable in tests.
+	spendRetryBackoff time.Duration
 }
 
 // subtreeFromBytesWithMmap creates a subtree from bytes, using mmap if dir is non-empty.
