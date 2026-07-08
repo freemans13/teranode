@@ -405,17 +405,28 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		return nil
 	}
 
+	// Deduplicate the input. The accounting below compares rows-updated against
+	// attempted, but a SQL IN (...) clause collapses duplicate hashes to a single
+	// match, so a caller passing the same hash twice would otherwise trip the
+	// spurious "N/M transactions not found" error even though every tx updated.
+	seen := make(map[chainhash.Hash]struct{}, len(txHashes))
+	allHashBytes := make([][]byte, 0, len(txHashes))
+
+	for i := range txHashes {
+		if _, dup := seen[txHashes[i]]; dup {
+			continue
+		}
+
+		seen[txHashes[i]] = struct{}{}
+		allHashBytes = append(allHashBytes, txHashes[i][:])
+	}
+
 	currentBlockHeight := s.GetBlockHeight()
 
-	attempted := len(txHashes)
+	attempted := len(allHashBytes)
 	totalUpdated := 0
 	allErrors := make([]error, 0, 10)
 	errorCount := 0
-
-	allHashBytes := make([][]byte, len(txHashes))
-	for i := range txHashes {
-		allHashBytes[i] = txHashes[i][:]
-	}
 
 	for i := 0; i < len(allHashBytes); i += maxINClauseSize {
 		end := i + maxINClauseSize

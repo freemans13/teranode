@@ -107,6 +107,19 @@ const dahReconcileAuditChain = `
 			        AND NOT c.conflicting
 			        AND c.preserve_until IS NULL
 			        AND c.unmined_since IS NULL)
+			    -- Fully-spent-but-not-stamped: a mined, fully-spent tx that LOST its
+			    -- delete_at_height (e.g. a non-owning Unspend cleared the stamp of a
+			    -- still-fully-spent parent — spend.go — leaving the bitmap complete, so
+			    -- the drift predicates above do NOT fire). Without admitting it here the
+			    -- upd re-stamp branch never runs and the tx is never re-stamped or pruned
+			    -- (disk leak). Mirrors the exact conditions of that stamp branch.
+			    OR (c.delete_at_height IS NULL
+			        AND bit_count(t.true_bits) = c.spendable_count
+			        AND c.spendable_count > 0
+			        AND c.mined_at_height IS NOT NULL
+			        AND NOT c.conflicting
+			        AND c.preserve_until IS NULL
+			        AND c.unmined_since IS NULL)
 		),
 		upd AS (
 			UPDATE txs_p%[1]s t

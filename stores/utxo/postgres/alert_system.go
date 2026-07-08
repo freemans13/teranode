@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -102,7 +103,15 @@ func (s *Store) freezeRejectReason(ctx context.Context, spend *utxo.Spend) error
 		if parseErr != nil {
 			return errors.NewProcessingError("failed to create spending data from bytes", parseErr)
 		}
-		return errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, sd)
+		// spend.UTXOHash is legitimately nil for callers that locate a UTXO by
+		// (txid, vout) alone; guard the deref to match GetSpend (get.go) and avoid
+		// an externally-reachable nil-pointer panic.
+		var utxoHash chainhash.Hash
+		if spend.UTXOHash != nil {
+			utxoHash = *spend.UTXOHash
+		}
+
+		return errors.NewUtxoSpentError(*spend.TxID, spend.Vout, utxoHash, sd)
 	}
 
 	if outputFrozen {

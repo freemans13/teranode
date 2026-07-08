@@ -372,28 +372,11 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// no-row case detectable via pgx.ErrNoRows. spent_bits is pre-sized to
 	// (out_count+7)/8 zero bytes so every later fold is a same-size in-place
 	// overwrite (see the schema.go spent_bits contract).
-	const insertDirectSQL = `
-		WITH ins AS (
-			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-				locked, conflicting, frozen, unmined_since,
-				block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
-				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
-				delete_at_height, spent_bits)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-			        $17, $18, $19, $20, $21, $22,
-			        decode(repeat('00', ($18 + 7) / 8), 'hex'))
-			ON CONFLICT (hash) DO NOTHING
-			RETURNING hash, delete_at_height
-		),
-		_pd AS (
-			INSERT INTO pending_deletes (hash, delete_at_height)
-			SELECT hash, delete_at_height FROM ins WHERE delete_at_height IS NOT NULL
-			ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
-		)
-		SELECT hash FROM ins`
+	// The non-conflicting direct path shares the identical INSERT — reuse
+	// insertSQL (declared above) rather than a byte-for-byte duplicate.
 
 	var insertedHash []byte
-	if err = conn.QueryRow(ctx, insertDirectSQL, insertArgs...).Scan(&insertedHash); err != nil {
+	if err = conn.QueryRow(ctx, insertSQL, insertArgs...).Scan(&insertedHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.NewTxExistsError("transaction already exists (coinbase=%v):", isCoinbase)
 		}
@@ -771,18 +754,6 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		return nil
 	}
 
-	// signalAll reports err to every still-valid item exactly once. Oversized
-	// items (below) have already had valid[i] cleared, so they are never
-	// double-signalled — the done channel is buffered for one result and read
-	// once, so a second send would wedge the batcher worker.
-	signalAll := func(err error) {
-		for i, item := range batch {
-			if valid[i] {
-				item.done <- batchCreateResult{Err: err}
-			}
-		}
-	}
-
 	windows, oversized := planCreateChunks(rowBytes, threshold, createBatchChunkOverhead, pgxMaxMessageBodyLen)
 
 	// A single tx too large for any INSERT can never be stored inline. Report it
@@ -798,18 +769,36 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		valid[bi] = false
 	}
 
-	for _, w := range windows {
+	// Chunks autocommit independently, so on a mid-batch failure the rows from
+	// earlier chunks are already durable. Report the error ONLY to the failed
+	// chunk and the chunks that never ran — clearing valid[bi] so neither the
+	// projection nor the completion loop below double-touches them (the done
+	// channel is buffered for one result and read once) — and let the committed
+	// chunks flow through to pending_unmined projection + success/TxExists exactly
+	// as if the whole batch had succeeded. Signalling the error to EVERY item
+	// would wrongly fail txs already in the DB and skip their projection.
+	for wi, w := range windows {
 		if err := runChunk(w[0], w[1]); err != nil {
-			signalAll(err)
-			return
+			for _, ww := range windows[wi:] {
+				for k := ww[0]; k < ww[1]; k++ {
+					bi := kToBatchIdx[k]
+					if valid[bi] {
+						batch[bi].done <- batchCreateResult{Err: err}
+						valid[bi] = false
+					}
+				}
+			}
+
+			break
 		}
 	}
 
 	// Write-behind projection into pending_unmined (was the _pu CTE arm on the
-	// bulk INSERT). All chunks committed; enqueue every unmined row. Conflicting
-	// items never reach this path (routed to createDirect), but keep the guard.
-	// Oversized rows (valid cleared above) were never inserted into txs, so they
-	// must not be projected.
+	// bulk INSERT). Enqueue every committed unmined row; items in a failed or
+	// unrun chunk had valid cleared above and are skipped. Conflicting items never
+	// reach this path (routed to createDirect), but keep the guard. Oversized rows
+	// (valid cleared earlier) were never inserted into txs, so they must not be
+	// projected.
 	for k := range hashes {
 		if !valid[kToBatchIdx[k]] {
 			continue

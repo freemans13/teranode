@@ -72,8 +72,8 @@ func (s *postgresPrunerService) Start(_ context.Context) {
 	go s.runDAHCursor(cursorCtx)
 
 	// The reconciliation backstop shares the cursor lifetime/cancel/WaitGroup: it is
-	// the slow audit that restores the self-healing the maintained spent_progress
-	// counter otherwise lacks (Task 8). It runs off the hot path on a long interval.
+	// the slow audit that restores the self-healing the spent-bitmap fold
+	// otherwise lacks (Task 8). It runs off the hot path on a long interval.
 	go func() {
 		defer s.cursorWg.Done()
 		s.runDAHReconcile(cursorCtx)

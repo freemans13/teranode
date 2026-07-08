@@ -88,7 +88,7 @@ type UtxoStoreSettings struct {
 	// background pass recomputes the true counter from the spends table over a bounded
 	// rotating slice per partition, correcting drift and stamping missed completions.
 	PostgresDAHReconcileSlice          int `key:"utxostore_postgresDAHReconcileSlice" desc:"Txs audited per partition per reconciliation pass (bounded, rotating cursor)" default:"1000" category:"UtxoStore" usage:"Bounds reconcile cost; never O(all history) in one pass" type:"int"`
-	PostgresDAHReconcileIntervalMillis int `key:"utxostore_postgresDAHReconcileIntervalMillis" desc:"Tick interval for the background spent_progress reconciliation backstop in milliseconds" default:"60000" category:"UtxoStore" usage:"How often the slow drift-audit backstop runs one bounded slice per partition" type:"int"`
+	PostgresDAHReconcileIntervalMillis int `key:"utxostore_postgresDAHReconcileIntervalMillis" desc:"Tick interval for the background spent-bitmap reconciliation backstop in milliseconds" default:"60000" category:"UtxoStore" usage:"How often the slow drift-audit backstop runs one bounded slice per partition" type:"int"`
 	// Dedicated maintenance pool size (PostgreSQL store only): connections reserved
 	// for the DAH sweep CALLs and pruner cascade deletes, isolated from the main
 	// write pool so background reclaim is never starved by the validator batchers

@@ -167,6 +167,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		maintConfig.ConnConfig.RuntimeParams["statement_timeout"] = "0"
 		maintConfig.ConnConfig.RuntimeParams["lock_timeout"] = "0"
 		maintConfig.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "0"
+		// The DAH reconciler's lost-re-dirty correctness (dah_reconcile.go) relies
+		// on each statement taking its OWN snapshot — i.e. READ COMMITTED — so a
+		// recompute sees a spend that committed after its DELETE. Pin it here so a
+		// server/database/role default of REPEATABLE READ (both statements sharing
+		// one pre-DELETE snapshot) can't silently break the invariant.
+		maintConfig.ConnConfig.RuntimeParams["default_transaction_isolation"] = "read committed"
 
 		maintPool, err = pgxpool.NewWithConfig(ctx, maintConfig)
 		if err != nil {
@@ -187,6 +193,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	if err := s.createSchema(ctx); err != nil {
 		pool.Close()
+		if maintPool != nil {
+			maintPool.Close()
+		}
 		return nil, err
 	}
 

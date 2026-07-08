@@ -684,6 +684,13 @@ func (s *postgresPrunerService) runPartitionSweepLoop(ctx context.Context, parti
 	timer := time.NewTimer(0) // first pass immediately
 	defer timer.Stop()
 
+	// Last observed partition watermark. Refiring immediately on backlog alone
+	// hot-spins whenever a CALL returns cleanly WITHOUT advancing the watermark —
+	// the sweep is disabled (dah_sweep_control.enabled=false) or the band lock is
+	// held by the reconciler. Only refire at zero delay when the watermark
+	// actually moved; otherwise back off to the idle interval.
+	prevWm := int64(-1)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -729,11 +736,20 @@ func (s *postgresPrunerService) runPartitionSweepLoop(ctx context.Context, parti
 			continue
 		}
 
-		if backlog > 0 {
+		// backlog is measured AFTER the CALL, so wm is this partition's true
+		// watermark (safeTip movement cancels out). Refire immediately only when
+		// there is remaining backlog AND the last CALL advanced the watermark
+		// (partial drain of a large backlog). A non-zero backlog with an unmoved
+		// watermark means the CALL did nothing (disabled / lock-contended) — back
+		// off instead of spinning.
+		wm := safeTip - backlog
+		if backlog > 0 && wm > prevWm {
 			timer.Reset(0)
 		} else {
 			timer.Reset(idleInterval)
 		}
+
+		prevWm = wm
 	}
 }
 

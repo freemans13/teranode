@@ -48,9 +48,12 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, requestedFields .
 		bins = requestedFields
 	}
 
-	// Use batcher for simple metadata-only gets (BlockIDs, BlockHeights — no Tx body).
+	// Use the batcher only for fields the batch SELECT actually populates. Any
+	// field needing a column the batch query omits (Tx body, ConflictingChildren)
+	// must fall through to getInternal or it comes back silently zero-valued.
 	if s.getBatcher != nil && !contains(bins, fields.Tx) && !contains(bins, fields.Outputs) &&
-		!contains(bins, fields.Utxos) && !contains(bins, fields.TxInpoints) && !contains(bins, fields.Inputs) {
+		!contains(bins, fields.Utxos) && !contains(bins, fields.TxInpoints) && !contains(bins, fields.Inputs) &&
+		!contains(bins, fields.ConflictingChildren) {
 		done := make(chan batchGetResult, 1)
 		s.getBatcher.Put(&batchGetItem{hash: hash, bins: bins, done: done})
 		select {

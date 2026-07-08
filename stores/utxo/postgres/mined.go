@@ -409,6 +409,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	// spurious call cannot skip heights.
 	if blockHeight > 0 {
 		if err := s.RewindDAHWatermark(ctx, int64(blockHeight)); err != nil {
+			prometheusDAHWatermarkRewindFailures.Inc()
 			s.logger.Errorf("[UnsetMined] rewind DAH watermark to %d failed — spends below the watermark will never fold, their parents stay unstamped/unpruned until the reconciler rotation reaches them (disk leak): %v", blockHeight, err)
 		}
 	}

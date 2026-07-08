@@ -29,6 +29,10 @@ var (
 	prometheusDAHReconcileCorrected  prometheus.Counter
 	prometheusDAHDirtyParentsDrained prometheus.Counter
 
+	// best-effort watermark rewind on reorg (unsetMinedMulti); a non-zero value
+	// flags the acknowledged disk-leak risk of a lost rewind (see mined.go).
+	prometheusDAHWatermarkRewindFailures prometheus.Counter
+
 	prometheusMetricsInitOnce sync.Once
 )
 
@@ -130,5 +134,12 @@ func doInitPrometheusMetrics() {
 		Subsystem: "postgres_utxo",
 		Name:      "dah_dirty_parents_drained_total",
 		Help:      "Total dirty-parent heal-queue rows drained by the reconciliation backstop",
+	})
+
+	prometheusDAHWatermarkRewindFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "postgres_utxo",
+		Name:      "dah_watermark_rewind_failures_total",
+		Help:      "Total best-effort DAH watermark rewinds that failed on reorg (lost rewind = disk-leak risk until the reconciler rotation heals it)",
 	})
 }

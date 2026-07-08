@@ -113,6 +113,16 @@ func (it *unminedTxIterator) Next(ctx context.Context) ([]*utxo.UnminedTransacti
 	batch := make([]*utxo.UnminedTransaction, 0, iteratorBatchSize)
 	for i := 0; i < iteratorBatchSize; i++ {
 		if err := ctx.Err(); err != nil {
+			// Cancelled mid-iteration: the rows were opened on context.Background(),
+			// so cancelling ctx does NOT release the pinned pool connection. Close it
+			// here and latch the error so a caller that stops on this error without
+			// also calling Close() cannot leak the connection.
+			if cerr := it.Close(); cerr != nil {
+				it.store.logger.Warnf("failed to close iterator: %v", cerr)
+			}
+
+			it.err = err
+
 			return nil, err
 		}
 		tx, err := it.readOne(ctx)
