@@ -496,17 +496,14 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 // Returns false when the network defines no checkpoints (regtest) or when the
 // block height is above the highest checkpoint — those blocks must follow the
 // regular validation path.
+//
+// Boundary and eligibility live in model.BelowCheckpoint / model.OutpointOnlyEligible — one definition for every path.
 func (sm *SyncManager) quickValidationAllowed(blockHeight uint32) bool {
 	if sm.chainParams == nil {
 		return false
 	}
 
-	highest := blockchain.HighestCheckpointHeight(sm.chainParams.Checkpoints)
-	if highest == 0 {
-		return false
-	}
-
-	return blockHeight <= highest
+	return model.BelowCheckpoint(sm.chainParams.Checkpoints, blockHeight)
 }
 
 // legacyOutpointOnly reports whether this block may use the below-checkpoint
@@ -516,24 +513,14 @@ func (sm *SyncManager) quickValidationAllowed(blockHeight uint32) bool {
 // hold for the path to engage, so when the setting is off, the store does not
 // support the fast path, or the block is above the highest hard-coded checkpoint,
 // the legacy path behaves exactly as before (byte-identical, invariant I2).
+//
+// Boundary and eligibility live in model.BelowCheckpoint / model.OutpointOnlyEligible — one definition for every path.
 func (sm *SyncManager) legacyOutpointOnly(height uint32) bool {
-	if sm.settings == nil || !sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
+	if sm.settings == nil {
 		return false
 	}
 
-	if !sm.utxoStore.SupportsOutpointOnlySpend() {
-		return false
-	}
-
-	if !sm.quickValidationAllowed(height) {
-		return false
-	}
-
-	if sm.chainParams == nil {
-		return false
-	}
-
-	return height <= blockchain.HighestCheckpointHeight(sm.chainParams.Checkpoints)
+	return model.OutpointOnlyEligible(sm.settings, sm.utxoStore, sm.chainParams, height)
 }
 
 // needsParentMinedWait reports whether HandleBlockDirect must block on the
@@ -588,7 +575,10 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 			return errors.NewStorageError("[writeSubtree][%s] failed to serialize subtree", subtree.RootHash().String(), err)
 		}
 
-		dah := bi.height + sm.settings.GlobalBlockHeightRetention
+		// Subtree files use the subtree-validation retention (global + adjustment),
+		// matching quick_validate.go and get_blocks.go — one retention source for
+		// subtree files on every path.
+		dah := bi.height + sm.settings.GetSubtreeValidationBlockHeightRetention()
 
 		storer, err := filestorer.NewFileStorer(
 			gCtx,
@@ -631,7 +621,10 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 	})
 
 	g.Go(func() error {
-		dah := bi.height + sm.settings.GlobalBlockHeightRetention
+		// Subtree files use the subtree-validation retention (global + adjustment),
+		// matching quick_validate.go and get_blocks.go — one retention source for
+		// subtree files on every path.
+		dah := bi.height + sm.settings.GetSubtreeValidationBlockHeightRetention()
 
 		storer, err := filestorer.NewFileStorer(
 			gCtx,
@@ -690,7 +683,10 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 			return errors.NewStorageError("[writeSubtree][%s] failed to serialize subtree data", subtree.RootHash().String(), err)
 		}
 
-		dah := bi.height + sm.settings.GlobalBlockHeightRetention
+		// Subtree files use the subtree-validation retention (global + adjustment),
+		// matching quick_validate.go and get_blocks.go — one retention source for
+		// subtree files on every path.
+		dah := bi.height + sm.settings.GetSubtreeValidationBlockHeightRetention()
 
 		storer, err := filestorer.NewFileStorer(
 			gCtx,

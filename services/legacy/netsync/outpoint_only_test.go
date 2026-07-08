@@ -89,7 +89,11 @@ func TestSyncManager_legacyOutpointOnly(t *testing.T) {
 		{name: "flag on, SQL, below checkpoint", enabled: true, sqlStore: true, height: below, want: true},
 		{name: "flag on, SQL, at checkpoint", enabled: true, sqlStore: true, height: atCheckpoint, want: true},
 		{name: "flag on, SQL, above checkpoint", enabled: true, sqlStore: true, height: above, want: false},
-		{name: "flag on, SQL, height 0", enabled: true, sqlStore: true, height: 0, want: true},
+		// Height 0 is fail-closed since the gates collapsed onto
+		// model.BelowCheckpoint: genesis carries only a coinbase and never flows
+		// through the legacy fast path, so excluding it costs nothing and keeps
+		// one boundary definition everywhere.
+		{name: "flag on, SQL, height 0 fail-closed", enabled: true, sqlStore: true, height: 0, want: false},
 		{name: "flag on, SQL, nil chain params", enabled: true, sqlStore: true, nilChain: true, height: below, want: false},
 		{name: "flag on, SQL, no checkpoints", enabled: true, sqlStore: true, noCheckpts: true, height: below, want: false},
 	}
