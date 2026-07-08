@@ -239,37 +239,7 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 		}
 	}
 
-	// add block directly to blockchain
-	if err = u.blockchainClient.AddBlock(ctx,
-		block,
-		peerID,
-		options.WithSubtreesSet(true),
-		options.WithMinedSet(true),
-		options.WithID(uint64(block.ID)),
-	); err != nil {
-		return errors.NewProcessingError("[quickValidateBlock][%s] failed to add block to blockchain", block.Hash().String(), err)
-	}
-
-	// Unlock all UTXOs - final commit point (no-op when the lock was never taken; #1103).
-	if err = u.unlockSubtreeTransactionsIfNeeded(ctx, block, "quickValidateBlock"); err != nil {
-		return err
-	}
-
-	// Update subtrees DAH and send BlockSubtreesSet notification
-	// This matches the normal validation flow and ensures:
-	// 1. Subtree retention periods are properly managed
-	// 2. BlockSubtreesSet notification is sent to trigger setMinedChan
-	// 3. Transactions are marked as mined in the UTXO store
-	if err = u.updateSubtreesDAH(ctx, block); err != nil {
-		return errors.NewProcessingError("[quickValidateBlock][%s] failed to update subtrees DAH", block.Hash().String(), err)
-	}
-
-	// Mark block as existing in cache
-	if err = u.SetBlockExists(block.Hash()); err != nil {
-		u.logger.Errorf("[ValidateBlock][%s] failed to set block exists cache: %s", block.Hash().String(), err)
-	}
-
-	return nil
+	return u.commitBlock(ctx, block, peerID, "quickValidateBlock")
 }
 
 // quickValidateBlockAsync performs optimized validation with async file writes.
@@ -335,30 +305,41 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 		}
 	}
 
+	return u.commitBlock(ctx, block, peerID, "quickValidateBlockAsync")
+}
+
+// commitBlock performs the shared final commit for the quick-validation path:
+// add the block to the blockchain (subtrees + mined already set), unlock any
+// locked UTXOs, update subtree DAH (which fires BlockSubtreesSet), and mark the
+// block present in cache. Extracted verbatim from quickValidateBlock /
+// quickValidateBlockAsync so both share one commit tail; it is also the per-block
+// commit unit the Step-8 parallel window's ordered committer calls in height order.
+// caller labels logs to preserve each call site's existing text.
+func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, peerID, caller string) error {
 	// add block directly to blockchain
-	if err = u.blockchainClient.AddBlock(ctx,
+	if err := u.blockchainClient.AddBlock(ctx,
 		block,
 		peerID,
 		options.WithSubtreesSet(true),
 		options.WithMinedSet(true),
 		options.WithID(uint64(block.ID)),
 	); err != nil {
-		return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to add block to blockchain", block.Hash().String(), err)
+		return errors.NewProcessingError("[%s][%s] failed to add block to blockchain", caller, block.Hash().String(), err)
 	}
 
 	// Unlock all UTXOs - final commit point (no-op when the lock was never taken; #1103).
-	if err = u.unlockSubtreeTransactionsIfNeeded(ctx, block, "quickValidateBlockAsync"); err != nil {
+	if err := u.unlockSubtreeTransactionsIfNeeded(ctx, block, caller); err != nil {
 		return err
 	}
 
-	// Update subtrees DAH and send BlockSubtreesSet notification
-	if err = u.updateSubtreesDAH(ctx, block); err != nil {
-		return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to update subtrees DAH", block.Hash().String(), err)
+	// Update subtrees DAH and send BlockSubtreesSet notification.
+	if err := u.updateSubtreesDAH(ctx, block); err != nil {
+		return errors.NewProcessingError("[%s][%s] failed to update subtrees DAH", caller, block.Hash().String(), err)
 	}
 
-	// Mark block as existing in cache
-	if err = u.SetBlockExists(block.Hash()); err != nil {
-		u.logger.Errorf("[quickValidateBlockAsync][%s] failed to set block exists cache: %s", block.Hash().String(), err)
+	// Mark block as existing in cache.
+	if err := u.SetBlockExists(block.Hash()); err != nil {
+		u.logger.Errorf("[%s][%s] failed to set block exists cache: %s", caller, block.Hash().String(), err)
 	}
 
 	return nil
