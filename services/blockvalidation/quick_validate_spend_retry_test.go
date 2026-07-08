@@ -87,7 +87,7 @@ func TestSpendBatchWithRetry(t *testing.T) {
 		require.Equal(t, int64(4), spy.spendCalls.Load())
 	})
 
-	t.Run("conflicting spend tolerated, never retried", func(t *testing.T) {
+	t.Run("conflicting spend fails hard, never retried", func(t *testing.T) {
 		spy := &spendRetrySpyStore{failuresLeft: map[chainhash.Hash]int{}, failErr: map[chainhash.Hash]error{}}
 		u, block, txs := newSpendRetryHarness(t, spy)
 
@@ -95,8 +95,10 @@ func TestSpendBatchWithRetry(t *testing.T) {
 		spy.failuresLeft[h] = 999
 		spy.failErr[h] = errors.NewTxConflictingError("conflicting")
 
-		require.NoError(t, u.spendBatchWithRetry(context.Background(), block, txs, false))
-		require.Equal(t, int64(3), spy.spendCalls.Load()) // no retry for the conflicting tx
+		err := u.spendBatchWithRetry(context.Background(), block, txs, false)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrTxConflicting) || errors.Is(err, errors.ErrProcessing), "hard fail must surface the conflict")
+		require.Equal(t, int64(3), spy.spendCalls.Load()) // first attempt only — never retried
 	})
 
 	t.Run("non-retryable error fails hard on first attempt", func(t *testing.T) {

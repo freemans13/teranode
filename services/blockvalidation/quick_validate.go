@@ -1295,11 +1295,15 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		}
 	}
 
-	// Phase 2: Spend all transactions, with the same hardening the legacy path has
-	// (services/legacy/netsync PreValidateTransactions): tolerate ErrTxConflicting
-	// (the block is checkpoint-certified, so its txs take precedence and conflicts
-	// are resolved at block acceptance), retry transient store errors with backoff
-	// and progress detection, hard-fail everything else.
+	// Phase 2: Spend all transactions, retrying transient store errors the way the
+	// legacy path does (services/legacy/netsync PreValidateTransactions). Unlike
+	// legacy, conflicts are NOT tolerated here: legacy runs the validator with
+	// WithCreateConflicting so block assembly's ProcessConflicting later reconciles
+	// the loser, but the quick path never writes conflicting subtree nodes and has
+	// no such resolver — tolerating ErrTxConflicting would leave an output's spend
+	// permanently attributed to a non-canonical tx. Hard-fail instead (fail-closed).
+	// Dirty-restart replay does not need conflict tolerance: re-spending an output
+	// with the same spender is the store's idempotent success path.
 	return u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly)
 }
 
@@ -1308,12 +1312,13 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 const spendRetryBackoffDefault = 2 * time.Second
 
 // spendBatchWithRetry spends txs in parallel with bounded retries. Per attempt:
-// ErrTxConflicting is tolerated (block txs take precedence below checkpoint-certified
-// blocks; resolution happens at block acceptance), retryable errors (transient store
-// overload) queue the tx for the next attempt, anything else fails hard immediately.
-// Gives up early when an attempt makes no progress. Mirrors the legacy path's
-// PreValidateTransactions retry semantics (maxRetries=10, 2s backoff) so both
-// below-checkpoint implementations converge identically after dirty restarts.
+// retryable errors (transient store overload) queue the tx for the next attempt;
+// anything else — including ErrTxConflicting and ErrSpent — fails hard immediately
+// (fail-closed: the quick path has no ProcessConflicting pipeline to reconcile a
+// tolerated conflict; see the phase-2 call site). Gives up early when an attempt
+// makes no progress. Retry cadence mirrors the legacy path's PreValidateTransactions
+// (maxRetries=10, 2s backoff) so both below-checkpoint implementations converge
+// identically after dirty restarts.
 func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.Block, txs []*bt.Tx, outpointOnly bool) error {
 	const maxRetries = 10
 
@@ -1349,9 +1354,6 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 			tx := tx
 			spendG.Go(func() error {
 				if _, err := u.utxoStore.Spend(spendCtx, tx, block.Height, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: outpointOnly}); err != nil {
-					if errors.Is(err, errors.ErrTxConflicting) {
-						return nil
-					}
 					if errors.IsRetryableError(err) {
 						mu.Lock()
 						retryable = append(retryable, tx)
