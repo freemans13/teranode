@@ -217,10 +217,20 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// subtrees itself from the wire block. Verify the merkle root here so a
 	// corrupt or tampered wire block can never reach the UTXO store. PoW was
 	// checked above; header linkage was checked on receipt.
+	//
+	// CheckMerkleRoot alone is NOT sufficient: a CVE-2012-2459 duplicate-tx
+	// mutation preserves the merkle root via the duplicate-last-when-odd rule,
+	// so it passes the merkle check while still containing a repeated hash.
+	// CheckSubtreeSlicesForDuplicateTxs is the explicit dedup floor that closes
+	// this gap; it must run while SubtreeSlices is still populated, before the
+	// nil-out below.
 	if preparedSubtreeSlices != nil {
 		teranodeBlock.SubtreeSlices = preparedSubtreeSlices
 		if err = teranodeBlock.CheckMerkleRoot(ctx); err != nil {
 			return errors.NewBlockInvalidError("[HandleBlockDirect][%s %d] merkle root mismatch on unified route", blockHashStr, blockHeight, err)
+		}
+		if err = model.CheckSubtreeSlicesForDuplicateTxs(preparedSubtreeSlices); err != nil {
+			return errors.NewBlockInvalidError("[HandleBlockDirect][%s %d] duplicate transaction on unified route", blockHashStr, blockHeight, err)
 		}
 		teranodeBlock.SubtreeSlices = nil
 	}
