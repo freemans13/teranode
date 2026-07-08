@@ -518,7 +518,7 @@ func TestSyncManager_prepareSubtrees(t *testing.T) {
 	}
 
 	// For single transaction blocks, prepareSubtrees returns empty
-	subtrees, blockID, err := sm.prepareSubtrees(context.Background(), block)
+	subtrees, _, blockID, err := sm.prepareSubtrees(context.Background(), block)
 	assert.NoError(t, err)
 	assert.NotNil(t, subtrees)
 	assert.Equal(t, uint32(0), blockID) // single-tx block exits early, IsFSMCurrentState=false → blockID stays 0
@@ -1384,10 +1384,14 @@ func TestSyncManager_quickValidationAllowed(t *testing.T) {
 			want:        false,
 		},
 		{
-			name:        "mainnet height 0 is covered",
+			// Height 0 is fail-closed since the gates collapsed onto
+			// model.BelowCheckpoint: genesis carries only a coinbase and never flows
+			// through the legacy fast path, so excluding it costs nothing and keeps
+			// one boundary definition everywhere.
+			name:        "mainnet height 0 fail-closed",
 			chainParams: &chaincfg.MainNetParams,
 			height:      0,
-			want:        true,
+			want:        false,
 		},
 		{
 			name:        "mainnet height equal to highest checkpoint is covered",

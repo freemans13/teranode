@@ -130,7 +130,9 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// Wait for the previous block's setTxMined to complete before validating
 	// this block's transactions. Ensures BIP68 sequence lock validation can
 	// correctly look up parent transaction BlockHeights in the UTXO store.
-	if blockHeight > 1 {
+	// Skipped on the below-checkpoint outpoint-only fast path — see
+	// needsParentMinedWait for the redundancy argument.
+	if sm.needsParentMinedWait(blockHeight) {
 		if err = sm.waitForPreviousBlockMined(ctx, &block.MsgBlock().Header.PrevBlock, blockHeight); err != nil {
 			return err
 		}
@@ -193,7 +195,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// NOTE: last use of `block` — from here down only scalars and tx hash
 	// copies are referenced, so the decode arena is collectable as soon as
 	// createTxMap inside prepareSubtrees returns.
-	subtrees, blockID, err := sm.prepareSubtrees(ctx, block)
+	subtrees, preparedSubtreeSlices, blockID, err := sm.prepareSubtrees(ctx, block)
 	if err != nil {
 		return err
 	}
@@ -207,6 +209,30 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	headerValid, _, err := teranodeBlock.Header.HasMetTargetDifficulty()
 	if !headerValid {
 		return errors.NewBlockInvalidError("invalid block header: %s", teranodeBlock.Header.Hash().String(), err)
+	}
+
+	// Unified route integrity floor: block.Valid (and its CheckMerkleRoot) no
+	// longer runs server-side on this route, and unlike catchup — whose subtree
+	// lists arrive bound to checkpoint-verified headers — legacy builds these
+	// subtrees itself from the wire block. Verify the merkle root here so a
+	// corrupt or tampered wire block can never reach the UTXO store. PoW was
+	// checked above; header linkage was checked on receipt.
+	//
+	// CheckMerkleRoot alone is NOT sufficient: a CVE-2012-2459 duplicate-tx
+	// mutation preserves the merkle root via the duplicate-last-when-odd rule,
+	// so it passes the merkle check while still containing a repeated hash.
+	// CheckSubtreeSlicesForDuplicateTxs is the explicit dedup floor that closes
+	// this gap; it must run while SubtreeSlices is still populated, before the
+	// nil-out below.
+	if preparedSubtreeSlices != nil {
+		teranodeBlock.SubtreeSlices = preparedSubtreeSlices
+		if err = teranodeBlock.CheckMerkleRoot(ctx); err != nil {
+			return errors.NewBlockInvalidError("[HandleBlockDirect][%s %d] merkle root mismatch on unified route", blockHashStr, blockHeight, err)
+		}
+		if err = model.CheckSubtreeSlicesForDuplicateTxs(preparedSubtreeSlices); err != nil {
+			return errors.NewBlockInvalidError("[HandleBlockDirect][%s %d] duplicate transaction on unified route", blockHashStr, blockHeight, err)
+		}
+		teranodeBlock.SubtreeSlices = nil
 	}
 
 	// call the process block wrapper, which will add tracing and logging
@@ -313,7 +339,7 @@ type blockIdent struct {
 	timestamp time.Time
 }
 
-func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block) (subtrees []*chainhash.Hash, blockID uint32, err error) {
+func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block) (subtrees []*chainhash.Hash, subtreeSlices []*subtreepkg.Subtree, blockID uint32, err error) {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "prepareSubtrees",
 		tracing.WithLogMessage(
 			sm.logger,
@@ -336,7 +362,7 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 
 	txCount := len(block.Transactions())
 	if txCount <= 1 {
-		return subtrees, blockID, nil
+		return subtrees, nil, blockID, nil
 	}
 
 	// Partition the block's transactions into K subtrees so each non-final subtree
@@ -352,10 +378,10 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 
 	subtreeSize, numSubtrees, finalLeafCount, err := partitionLegacyBlock(txCount, maxItems)
 	if err != nil {
-		return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to partition block", err)
+		return nil, nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to partition block", err)
 	}
 
-	subtreeSlices := make([]*subtreepkg.Subtree, numSubtrees)
+	slices := make([]*subtreepkg.Subtree, numSubtrees)
 	subtreeDatas := make([]*subtreepkg.Data, numSubtrees)
 	subtreeMetas := make([]*subtreepkg.Meta, numSubtrees)
 
@@ -367,23 +393,23 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 
 		st, terr := subtreepkg.NewIncompleteTreeByLeafCount(capacity)
 		if terr != nil {
-			return nil, 0, errors.NewSubtreeError("[prepareSubtrees] failed to create subtree %d", i, terr)
+			return nil, nil, 0, errors.NewSubtreeError("[prepareSubtrees] failed to create subtree %d", i, terr)
 		}
 
 		if i == 0 {
 			if err = st.AddCoinbaseNode(); err != nil {
-				return nil, 0, errors.NewSubtreeError("[prepareSubtrees] failed to add coinbase placeholder", err)
+				return nil, nil, 0, errors.NewSubtreeError("[prepareSubtrees] failed to add coinbase placeholder", err)
 			}
 		}
 
-		subtreeSlices[i] = st
+		slices[i] = st
 		subtreeDatas[i] = subtreepkg.NewSubtreeData(st)
 		subtreeMetas[i] = subtreepkg.NewSubtreeMeta(st)
 	}
 
 	blockHeight32, convErr := safeconversion.Int32ToUint32(block.Height())
 	if convErr != nil {
-		return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to convert block height", convErr)
+		return nil, nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to convert block height", convErr)
 	}
 
 	// Scalar identity for every stage below createTxMap — see blockIdent.
@@ -401,7 +427,7 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	// block is unreferenced and its decode arena can be GC'd.
 	txOrder, err := sm.createTxMap(ctx, block, txMap)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 
 	// createTxMap is the only writer of txMap and it runs single-threaded; every
@@ -417,11 +443,11 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	outpointOnly := sm.legacyOutpointOnly(bi.height)
 
 	if err = sm.extendTransactions(ctx, bi, txOrder, txMap, outpointOnly); err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 
-	if err = sm.createSubtrees(ctx, bi, txOrder, txMap, subtreeSlices, subtreeDatas, subtreeMetas, outpointOnly); err != nil {
-		return nil, 0, err
+	if err = sm.createSubtrees(ctx, bi, txOrder, txMap, slices, subtreeDatas, subtreeMetas, outpointOnly); err != nil {
+		return nil, nil, 0, err
 	}
 
 	// Quick validation is safe whenever the block sits at/below the highest hard-coded
@@ -432,40 +458,47 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	quickValidationMode := sm.quickValidationAllowed(bi.height)
 
 	if quickValidationMode {
-		// Fetch block ID upfront so UTXOs carry mined info from creation. This ID is
-		// threaded through to blockvalidation via ProcessBlock so it can call
-		// AddBlock(WithID, WithMinedSet(true)) and cause the setMinedChan worker to
-		// skip setTxMinedStatus (MinedSet guard in BlockValidation.go).
-		//
-		// Restart-safety + cross-path consistency: if this block's transactions were
-		// already created in a prior attempt (or by the blockvalidation catchup path),
-		// reuse the block id recorded in the UTXO store so the committed block matches
-		// the existing UTXO mined-info. Otherwise fall back to the idempotent per-hash
-		// AssignBlockID. Both paths converging on one id is what prevents orphaned
-		// (phantom) block ids that wedge sync in checkOldBlockIDs.
-		if reused, ok := sm.reuseBlockIDFromUTXO(ctx, bi, txOrder); ok {
-			blockID = reused
+		if sm.legacyUnified(bi.height) {
+			// Unified route: block ID assignment and UTXO create+spend happen
+			// server-side in quickValidateBlock (blockID 0 = "assign server-side",
+			// Server.ProcessBlock skips pre-assignment when the wire field is 0).
+			sm.logger.Debugf("[prepareSubtrees][%s] unified route: deferring blockID and UTXO ops to quick validation", bi.hash.String())
 		} else {
-			id, idErr := sm.blockchainClient.AssignBlockID(ctx, &bi.hash)
-			if idErr != nil {
-				return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to assign block ID", idErr)
+			// Fetch block ID upfront so UTXOs carry mined info from creation. This ID is
+			// threaded through to blockvalidation via ProcessBlock so it can call
+			// AddBlock(WithID, WithMinedSet(true)) and cause the setMinedChan worker to
+			// skip setTxMinedStatus (MinedSet guard in BlockValidation.go).
+			//
+			// Restart-safety + cross-path consistency: if this block's transactions were
+			// already created in a prior attempt (or by the blockvalidation catchup path),
+			// reuse the block id recorded in the UTXO store so the committed block matches
+			// the existing UTXO mined-info. Otherwise fall back to the idempotent per-hash
+			// AssignBlockID. Both paths converging on one id is what prevents orphaned
+			// (phantom) block ids that wedge sync in checkOldBlockIDs.
+			if reused, ok := sm.reuseBlockIDFromUTXO(ctx, bi, txOrder); ok {
+				blockID = reused
+			} else {
+				id, idErr := sm.blockchainClient.AssignBlockID(ctx, &bi.hash)
+				if idErr != nil {
+					return nil, nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to assign block ID", idErr)
+				}
+				blockID, idErr = safeconversion.Uint64ToUint32(id)
+				if idErr != nil {
+					return nil, nil, 0, errors.NewProcessingError("[prepareSubtrees] assigned block id %d exceeds uint32", id, idErr)
+				}
 			}
-			blockID, idErr = safeconversion.Uint64ToUint32(id)
-			if idErr != nil {
-				return nil, 0, errors.NewProcessingError("[prepareSubtrees] assigned block id %d exceeds uint32", id, idErr)
-			}
-		}
 
-		// in quickValidationMode, we can process transactions in a block in parallel, but in reverse order
-		// first we create all the utxos, then we spend them
-		if err = sm.ValidateTransactionsLegacyMode(ctx, txMap, bi, blockID); err != nil {
-			return nil, 0, err
+			// in quickValidationMode, we can process transactions in a block in parallel, but in reverse order
+			// first we create all the utxos, then we spend them
+			if err = sm.ValidateTransactionsLegacyMode(ctx, txMap, bi, blockID); err != nil {
+				return nil, nil, 0, err
+			}
 		}
 	}
 
 	for i := 0; i < numSubtrees; i++ {
-		if err = sm.writeSubtree(ctx, bi, subtreeSlices[i], subtreeDatas[i], subtreeMetas[i], quickValidationMode); err != nil {
-			return nil, 0, err
+		if err = sm.writeSubtree(ctx, bi, slices[i], subtreeDatas[i], subtreeMetas[i], quickValidationMode); err != nil {
+			return nil, nil, 0, err
 		}
 	}
 
@@ -473,17 +506,24 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	// produced locally, so we can skip the round-trip through subtreeValidation.
 	if !quickValidationMode {
 		for i := 0; i < numSubtrees; i++ {
-			if err = sm.checkSubtreeFromBlock(ctx, bi, subtreeSlices[i]); err != nil {
-				return nil, 0, err
+			if err = sm.checkSubtreeFromBlock(ctx, bi, slices[i]); err != nil {
+				return nil, nil, 0, err
 			}
 		}
 	}
 
 	for i := 0; i < numSubtrees; i++ {
-		subtrees = append(subtrees, subtreeSlices[i].RootHash())
+		subtrees = append(subtrees, slices[i].RootHash())
 	}
 
-	return subtrees, blockID, nil
+	// Unified route: return the in-memory slices for the merkle check in HandleBlockDirect.
+	// The caller sets them on the model.Block, verifies CheckMerkleRoot, then nils the field
+	// so the block heads to gRPC without pinning the slices.
+	if sm.legacyUnified(bi.height) {
+		subtreeSlices = slices
+	}
+
+	return subtrees, subtreeSlices, blockID, nil
 }
 
 // quickValidationAllowed reports whether the given block height is covered by a
@@ -494,17 +534,14 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 // Returns false when the network defines no checkpoints (regtest) or when the
 // block height is above the highest checkpoint — those blocks must follow the
 // regular validation path.
+//
+// Boundary and eligibility live in model.BelowCheckpoint / model.OutpointOnlyEligible — one definition for every path.
 func (sm *SyncManager) quickValidationAllowed(blockHeight uint32) bool {
 	if sm.chainParams == nil {
 		return false
 	}
 
-	highest := blockchain.HighestCheckpointHeight(sm.chainParams.Checkpoints)
-	if highest == 0 {
-		return false
-	}
-
-	return blockHeight <= highest
+	return model.BelowCheckpoint(sm.chainParams.Checkpoints, blockHeight)
 }
 
 // legacyOutpointOnly reports whether this block may use the below-checkpoint
@@ -514,24 +551,44 @@ func (sm *SyncManager) quickValidationAllowed(blockHeight uint32) bool {
 // hold for the path to engage, so when the setting is off, the store does not
 // support the fast path, or the block is above the highest hard-coded checkpoint,
 // the legacy path behaves exactly as before (byte-identical, invariant I2).
+//
+// Boundary and eligibility live in model.BelowCheckpoint / model.OutpointOnlyEligible — one definition for every path.
 func (sm *SyncManager) legacyOutpointOnly(height uint32) bool {
-	if sm.settings == nil || !sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint {
+	if sm.settings == nil {
 		return false
 	}
 
-	if !sm.utxoStore.SupportsOutpointOnlySpend() {
-		return false
-	}
+	return model.OutpointOnlyEligible(sm.settings, sm.utxoStore, sm.chainParams, height)
+}
 
-	if !sm.quickValidationAllowed(height) {
-		return false
-	}
+// legacyUnified reports whether this block takes the unified below-checkpoint
+// route: the operator enabled blockvalidation_legacy_unified_below_checkpoint
+// AND the full outpoint-only gate holds. When true, prepareSubtrees becomes a
+// protocol adapter — it still partitions the wire block, builds the txMap,
+// extends in-block parents, creates and writes the subtree files, and
+// HandleBlockDirect verifies the merkle root — but UTXO create+spend and block
+// ID assignment move server-side into quickValidateBlock (the same machinery
+// native catchup uses). Default off; with the flag off the inline pipeline is
+// byte-identical.
+func (sm *SyncManager) legacyUnified(height uint32) bool {
+	return sm.settings != nil &&
+		sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint &&
+		sm.legacyOutpointOnly(height)
+}
 
-	if sm.chainParams == nil {
-		return false
-	}
-
-	return height <= blockchain.HighestCheckpointHeight(sm.chainParams.Checkpoints)
+// needsParentMinedWait reports whether HandleBlockDirect must block on the
+// parent's mined_set before processing a block at this height. Heights 0 and 1
+// never wait (pre-existing behaviour). On the below-checkpoint outpoint-only
+// fast path the wait is redundant three ways: (1) its documented purpose is
+// BIP68 parent-height lookup, and BIP68 is skipped below the checkpoint;
+// (2) block dispatch is serial — blockHandler in manager.go is the single
+// goroutine consuming blockQueue, so the parent's UTXOs are committed before
+// this block starts; (3) the legacy path calls AddBlock with WithMinedSet(true)
+// (see buildAddBlockOpts in services/blockvalidation/BlockValidation.go), so
+// GetBlockIsMined is always instantly true and only costs a gRPC round-trip
+// per block.
+func (sm *SyncManager) needsParentMinedWait(height uint32) bool {
+	return height > 1 && !sm.legacyOutpointOnly(height)
 }
 
 func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, bi blockIdent, subtree *subtreepkg.Subtree) error {
@@ -571,7 +628,10 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 			return errors.NewStorageError("[writeSubtree][%s] failed to serialize subtree", subtree.RootHash().String(), err)
 		}
 
-		dah := bi.height + sm.settings.GlobalBlockHeightRetention
+		// Subtree files use the subtree-validation retention (global + adjustment),
+		// matching quick_validate.go and get_blocks.go — one retention source for
+		// subtree files on every path.
+		dah := bi.height + sm.settings.GetSubtreeValidationBlockHeightRetention()
 
 		storer, err := filestorer.NewFileStorer(
 			gCtx,
@@ -614,7 +674,10 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 	})
 
 	g.Go(func() error {
-		dah := bi.height + sm.settings.GlobalBlockHeightRetention
+		// Subtree files use the subtree-validation retention (global + adjustment),
+		// matching quick_validate.go and get_blocks.go — one retention source for
+		// subtree files on every path.
+		dah := bi.height + sm.settings.GetSubtreeValidationBlockHeightRetention()
 
 		storer, err := filestorer.NewFileStorer(
 			gCtx,
@@ -673,7 +736,10 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 			return errors.NewStorageError("[writeSubtree][%s] failed to serialize subtree data", subtree.RootHash().String(), err)
 		}
 
-		dah := bi.height + sm.settings.GlobalBlockHeightRetention
+		// Subtree files use the subtree-validation retention (global + adjustment),
+		// matching quick_validate.go and get_blocks.go — one retention source for
+		// subtree files on every path.
+		dah := bi.height + sm.settings.GetSubtreeValidationBlockHeightRetention()
 
 		storer, err := filestorer.NewFileStorer(
 			gCtx,
