@@ -1,0 +1,260 @@
+package blockvalidation
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/util"
+	"golang.org/x/sync/errgroup"
+)
+
+// windowSpend captures the outpoint and spending side of one input, snapshotted from
+// a batch before batch.Close() frees the bt.Tx objects. The ~72 bytes per input are
+// the only data retained across batches in the de-interleaved window pipeline.
+//
+// Fields mirror the parameters of GetSpendsOutpointOnly in stores/utxo/utils.go:
+//
+//	Spend{TxID: parentTxHash, Vout: vout, UTXOHash: &zero, SpendingData: spend.NewSpendingData(spendingTxHash, vin)}
+type windowSpend struct {
+	parentTxHash   chainhash.Hash // creating tx (= input.PreviousTxIDChainHash())
+	vout           uint32         // output index within the parent tx
+	spendingTxHash chainhash.Hash // tx that spends the output
+	vin            uint32         // index of this input in the spending tx
+}
+
+// createBlockUTXOs is the CREATE-only pass for the de-interleaved window pipeline.
+// It runs the full 3-stage prefetch→extend→process pipeline for a below-checkpoint
+// block, creating UTXOs for every non-coinbase tx, writing subtree files, and
+// returning a snapshot of every input outpoint so the caller can drive the SPEND
+// pass independently once the window is ready.
+//
+// Constraints:
+//   - Only valid for the outpoint-only fast path; returns an error if outpointOnly is false.
+//   - Does NOT call Spend — that is the responsibility of spendBlockUTXOs (Task 2).
+//   - batch.Close() is called after snapshotting, so bt.Tx objects are not retained.
+//
+// Parameters:
+//   - ctx: Context for cancellation and deadlines
+//   - block: Block to process (must have Subtrees populated and a valid CoinbaseTx)
+//   - outpointOnly: Must be true; guards the fast path invariant
+//
+// Returns:
+//   - []windowSpend: one entry per non-coinbase input across all batches
+//   - error: on any failure
+func (u *BlockValidation) createBlockUTXOs(ctx context.Context, block *model.Block, outpointOnly bool) ([]windowSpend, error) {
+	if !outpointOnly {
+		return nil, errors.NewProcessingError("[createBlockUTXOs][%s] createBlockUTXOs called on non-outpoint-only block", block.Hash().String())
+	}
+
+	// Invariant I4 (fail-closed): mirror the guard in createAndSpendUTXOsForBatch.
+	if block.Height > blockchain.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints) {
+		return nil, errors.NewProcessingError("[createBlockUTXOs] invariant I4 violated: outpoint-only mode active above checkpoint at height %d", block.Height)
+	}
+
+	numSubtrees := len(block.Subtrees)
+	if numSubtrees == 0 {
+		return nil, errors.NewProcessingError("[createBlockUTXOs][%s] block has no subtrees", block.Hash().String())
+	}
+
+	block.SubtreeSlices = make([]*subtreepkg.Subtree, numSubtrees)
+	var existingBlockID uint64
+	blockIDSet := false
+
+	prefetchDepth := u.settings.BlockValidation.SubtreeBatchPrefetchDepth
+	if prefetchDepth <= 0 {
+		prefetchDepth = 2
+	}
+
+	// Channel for prefetched batches (subtrees read from disk).
+	prefetchChan := make(chan *SubtreeProcessingBatch, prefetchDepth)
+	// Channel for extended batches (txs extended, ready for UTXO ops).
+	extendedChan := make(chan *SubtreeProcessingBatch, prefetchDepth)
+
+	// allSpends accumulates the outpoint snapshots from every batch.
+	// Written only by stage 3 (a single goroutine), read by the caller after g.Wait().
+	// No mutex needed: g.Wait() provides the happens-before edge.
+	var allSpends []windowSpend
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	// Drain channels on error to prevent goroutine leaks from large batches stuck in buffers.
+	defer func() {
+		for range prefetchChan {
+		}
+		for range extendedChan {
+		}
+	}()
+
+	// Stage 1: Reader — prefetch batches from disk.
+	g.Go(func() error {
+		defer close(prefetchChan)
+		subtreeBatchSize := u.settings.BlockValidation.SubtreeBatchSize
+		for batchStart := 0; batchStart < numSubtrees; batchStart += subtreeBatchSize {
+			batchEnd := batchStart + subtreeBatchSize
+			if batchEnd > numSubtrees {
+				batchEnd = numSubtrees
+			}
+
+			start := time.Now()
+			batch, err := u.prefetchSubtreeBatch(gCtx, block, batchStart, batchEnd, outpointOnly)
+			if err != nil {
+				return err
+			}
+			u.logger.Debugf("[createBlockUTXOs:prefetch][%s] batch %d-%d prefetched in %v", block.Hash().String(), batchStart, batchEnd, time.Since(start))
+
+			select {
+			case prefetchChan <- batch:
+			case <-gCtx.Done():
+				return gCtx.Err()
+			}
+		}
+		return nil
+	})
+
+	// Stage 2: Extender — extend transactions (sequential to maintain extendedTxs map).
+	g.Go(func() error {
+		defer close(extendedChan)
+		extendedTxs := make(map[chainhash.Hash]*bt.Tx)
+		for batch := range prefetchChan {
+			start := time.Now()
+			if err := u.extendBatch(gCtx, block, batch, extendedTxs); err != nil {
+				return err
+			}
+			u.logger.Debugf("[createBlockUTXOs:extend][%s] batch %d-%d extended (%d txs) in %v", block.Hash().String(), batch.batchStart, batch.batchEnd, len(batch.batchTxs), time.Since(start))
+
+			select {
+			case extendedChan <- batch:
+			case <-gCtx.Done():
+				return gCtx.Err()
+			}
+		}
+		return nil
+	})
+
+	// Stage 3: Processor — CREATE UTXOs, write subtree files, snapshot outpoints, free batch.
+	g.Go(func() error {
+		for batch := range extendedChan {
+			// (a) Block ID assignment on first batch (idempotent retry-safe).
+			if !blockIDSet && len(batch.batchTxs) > 0 {
+				existingMeta, err := u.utxoStore.Get(gCtx, batch.batchTxs[0].TxIDChainHash(), fields.BlockIDs)
+				if err == nil && existingMeta != nil && len(existingMeta.BlockIDs) > 0 {
+					existingBlockID = uint64(existingMeta.BlockIDs[0])
+					block.ID = existingMeta.BlockIDs[0]
+					u.logger.Debugf("[createBlockUTXOs][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
+				} else if block.ID == 0 {
+					id, err := u.blockchainClient.AssignBlockID(gCtx, block.Hash())
+					if err != nil {
+						return errors.NewProcessingError("[createBlockUTXOs][%s] failed to assign block ID", block.Hash().String(), err)
+					}
+					block.ID, err = blockIDToUint32(id, block.Hash().String())
+					if err != nil {
+						return err
+					}
+				}
+				blockIDSet = true
+			}
+
+			// (b) CREATE UTXOs for all txs in the batch (goroutine fan-out, same as createAndSpendUTXOsForBatch Phase 1).
+			createG, createCtx := errgroup.WithContext(gCtx)
+			util.SafeSetLimit(u.logger, createG, u.settings.UtxoStore.StoreBatcherSize*8)
+
+			var existingTxsMu sync.Mutex
+			var existingTxHashes []*chainhash.Hash
+
+			minedBlockInfo := utxo.MinedBlockInfo{
+				BlockID:     block.ID,
+				BlockHeight: block.Height,
+			}
+
+			lockUTXOs := !u.quickValidateSkipsUtxoLock(block)
+
+			batchSize := batch.batchEnd - batch.batchStart
+			for i := 0; i < batchSize; i++ {
+				globalSubtreeIdx := batch.batchStart + i
+				txRange := batch.txRanges[i]
+				for txIdx := txRange[0]; txIdx < txRange[1]; txIdx++ {
+					tx := batch.batchTxs[txIdx]
+					sIdx := globalSubtreeIdx
+					createG.Go(func() error {
+						_, err := u.utxoStore.Create(createCtx, tx, block.Height, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+							BlockID:     block.ID,
+							BlockHeight: block.Height,
+							SubtreeIdx:  sIdx,
+						}), utxo.WithLocked(lockUTXOs), utxo.WithSkipExtendedInputs(outpointOnly))
+						if err != nil {
+							if errors.Is(err, errors.ErrTxExists) {
+								txHash := tx.TxIDChainHash()
+								existingTxsMu.Lock()
+								existingTxHashes = append(existingTxHashes, txHash)
+								existingTxsMu.Unlock()
+								return nil
+							}
+							return errors.NewProcessingError("[createBlockUTXOs][%s] failed to create UTXO for tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
+						}
+						return nil
+					})
+				}
+			}
+
+			if err := createG.Wait(); err != nil {
+				batch.Close()
+				return err
+			}
+
+			// (c) Phase 1.5: SetMinedMulti for any ErrTxExists (per batch, same as createAndSpendUTXOsForBatch).
+			if len(existingTxHashes) > 0 {
+				if err := utxo.SetMinedMultiChunked(gCtx, u.logger, u.utxoStore, existingTxHashes, minedBlockInfo,
+					u.settings.UtxoStore.MaxMinedBatchSize, u.settings.UtxoStore.MaxMinedRoutines); err != nil {
+					batch.Close()
+					return errors.NewProcessingError("[createBlockUTXOs][%s] failed to update mined info for %d existing txs", block.Hash().String(), len(existingTxHashes), err)
+				}
+			}
+
+			// (d) Write subtree files (sync variant).
+			if err := u.writeSubtreeFilesForBatch(gCtx, block, batch); err != nil {
+				batch.Close()
+				return err
+			}
+
+			// (e) Snapshot outpoints: iterate every tx's inputs before freeing the batch.
+			var batchSpends []windowSpend
+			for _, tx := range batch.batchTxs {
+				txHash := *tx.TxIDChainHash()
+				for j, input := range tx.Inputs {
+					batchSpends = append(batchSpends, windowSpend{
+						parentTxHash:   *input.PreviousTxIDChainHash(),
+						vout:           input.PreviousTxOutIndex,
+						spendingTxHash: txHash,
+						vin:            uint32(j), //nolint:gosec
+					})
+				}
+			}
+
+			allSpends = append(allSpends, batchSpends...)
+
+			// (f) Free mmap resources — MUST happen after snapshotting.
+			batch.Close()
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// validateSubtrees checks merkle root and subtree sizes; mirrors processBlockSubtreesPipeline.
+	if _, err := u.validateSubtrees(ctx, block, existingBlockID); err != nil {
+		return nil, err
+	}
+
+	return allSpends, nil
+}
