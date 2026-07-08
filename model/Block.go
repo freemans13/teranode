@@ -662,7 +662,9 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	//     this function (steps 1-11): PoW and checkDuplicateTransactions
 	//     unconditionally, and CheckMerkleRoot whenever a subtree store is present —
 	//     which every caller that reaches this skip passes (see
-	//     skipOrderAndBlessedBelowCheckpoint, gated identically to the fee skip).
+	//     skipOrderAndBlessedBelowCheckpoint, which shares the fee skip's safety
+	//     contract but additionally requires the OutpointOnlyBelowCheckpoint
+	//     opt-in, so it engages on a subset of the fee-skip blocks).
 	if txMetaStore != nil {
 		if b.skipOrderAndBlessedBelowCheckpoint(settings, txMetaStore) {
 			logger.Debugf("[Block:Valid][%s] skipping validOrderAndBlessed for block at height %d at or below hardcoded checkpoint (outpoint-only fast path)", b.String(), b.Height)
@@ -715,9 +717,15 @@ func (b *Block) releaseTxMap() {
 }
 
 // skipOrderAndBlessedBelowCheckpoint reports whether validOrderAndBlessed may be
-// skipped for this block. It is governed by the same safety contract as the
-// below-checkpoint fee skip in checkBlockRewardAndFees, so both skips engage on
-// exactly the same blocks. True only when ALL of the following hold:
+// skipped for this block. It shares the same checkpoint safety contract as the
+// below-checkpoint fee skip in checkBlockRewardAndFees, but adds one conjunct the
+// fee skip deliberately omits — the OutpointOnlyBelowCheckpoint opt-in — so this
+// skip engages on a strict subset of the fee-skip blocks (flag-on only). The fee
+// skip cannot depend on the flag because a fast-path block persists fee=0 and would
+// be wrongly rejected on flag-off revalidation; validOrderAndBlessed has no such
+// hazard (it reads persisted subtree meta and parent existence, not fees), so
+// gating it on the opt-in is safe and strictly more conservative. True only when
+// ALL of the following hold:
 //
 //   - the operator has opted into the below-checkpoint outpoint-only fast path
 //     (OutpointOnlyBelowCheckpoint);
