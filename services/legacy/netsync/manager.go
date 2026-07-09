@@ -91,6 +91,13 @@ const (
 	// syncPeerTickerInterval is how often we check the current
 	// syncPeer. Set to 30 seconds.
 	syncPeerTickerInterval = 30 * time.Second
+
+	// blockAssemblyHeightPollInterval is how often the background poller
+	// refreshes the cached block-assembly height. The per-block coinbase-maturity
+	// check reads this cache atomically instead of doing a gRPC round-trip on the
+	// serial drain path. 250ms is far tighter than the 100-block maturity window,
+	// so the cache can never fall stale enough to matter.
+	blockAssemblyHeightPollInterval = 250 * time.Millisecond
 )
 
 // zeroHash is the zero-value hash (all zeros).  It is defined as a convenience.
@@ -421,7 +428,16 @@ type SyncManager struct {
 	subtreeValidation subtreevalidation.Interface
 	blockValidation   blockvalidation.Interface
 	blockAssembly     blockassembly.ClientI
-	legacyKafkaInvCh  chan *kafka.Message
+	// cachedBlockAssemblyHeight holds the block-assembly CurrentHeight most
+	// recently observed by the background poller (blockAssemblyHeightPoller).
+	// The per-block coinbase-maturity check reads it atomically on the serial
+	// drain path so the common case needs no gRPC round-trip. Zero means "not
+	// yet polled" and forces the slow (fresh-gRPC) path. Because block-assembly
+	// height is monotonic below the checkpoint (no reorg), this cached value is
+	// always a stale-LOW-or-equal lower bound on the true height, so a fast-path
+	// pass on the cache implies the true bound also holds.
+	cachedBlockAssemblyHeight atomic.Uint32
+	legacyKafkaInvCh          chan *kafka.Message
 	// legacyKafkaInvProducer is retained (DC11) so SyncManager.Stop() can stop it
 	// synchronously; without a field there is no handle to flush it on shutdown.
 	legacyKafkaInvProducer kafka.KafkaAsyncProducerI
@@ -1791,7 +1807,7 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	// dropped it. Only the window-add path needs this — the direct/checkpoint
 	// branch above already goes through HandleBlockDirect, which waits itself.
 	// On error we return it (addedToWindow=false), matching HandleBlockDirect.
-	if waitErr := blockassemblyutil.WaitForBlockAssemblyReady(sm.ctx, sm.logger, sm.blockAssembly, blockHeightUint32, sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly); waitErr != nil {
+	if waitErr := sm.waitForBlockAssemblyReadyCached(sm.ctx, blockHeightUint32); waitErr != nil {
 		return false, waitErr
 	}
 
@@ -3230,6 +3246,74 @@ func (sm *SyncManager) DonePeer(peer *peerpkg.Peer, done chan struct{}) {
 	sm.msgChan <- &donePeerMsg{peer: peer, reply: done}
 }
 
+// waitForBlockAssemblyReadyCached enforces the coinbase-maturity back-pressure
+// bound (block-assembly must be within MaxBlocksBehindBlockAssembly of blockHeight)
+// without paying a per-block gRPC round-trip on the serial drain path in the
+// common case.
+//
+// FAST PATH: if the cached block-assembly height (refreshed in the background by
+// blockAssemblyHeightPoller) already satisfies cached+maxBehind >= blockHeight,
+// return nil with no gRPC. This is safe: below the checkpoint block-assembly
+// height is monotonic (no reorg), so the cached value is a stale-LOW-or-equal
+// lower bound on the true height. If the lower bound already clears the bound,
+// the true (>=) height clears it too — the fast path can never wrongly pass.
+//
+// SLOW PATH: cache unpolled (0) or at/near the bound — fall through to the real
+// fresh-gRPC retry loop, whose behaviour (and overflow guard) is unchanged.
+func (sm *SyncManager) waitForBlockAssemblyReadyCached(ctx context.Context, blockHeight uint32) error {
+	maxBehind := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
+
+	// Fast path only when maxBehind is a valid positive window; a non-positive
+	// value defers entirely to the slow path, which validates/guards it.
+	if maxBehind > 0 {
+		cached := sm.cachedBlockAssemblyHeight.Load()
+		// Guard the uint32 addition against wraparound exactly as the slow-path
+		// helper does; on possible overflow, skip the fast path.
+		if cached > 0 && cached <= math.MaxUint32-uint32(maxBehind) && cached+uint32(maxBehind) >= blockHeight {
+			return nil
+		}
+	}
+
+	// Slow path: unchanged fresh-gRPC wait (retry loop + overflow guard).
+	return blockassemblyutil.WaitForBlockAssemblyReady(ctx, sm.logger, sm.blockAssembly, blockHeight, maxBehind)
+}
+
+// blockAssemblyHeightPoller periodically refreshes cachedBlockAssemblyHeight
+// from the block-assembly service so waitForBlockAssemblyReadyCached can serve
+// the per-block maturity check as an atomic read. It runs until sm.quit closes
+// or ctx is cancelled. On a poll error it logs a single line and keeps the last
+// cached value (never zeroes it). A nil blockAssembly (test setups) is handled
+// by the caller not starting the poller.
+func (sm *SyncManager) blockAssemblyHeightPoller(ctx context.Context) {
+	ticker := time.NewTicker(blockAssemblyHeightPollInterval)
+	defer ticker.Stop()
+
+	poll := func() {
+		state, err := sm.blockAssembly.GetBlockAssemblyState(ctx)
+		if err != nil {
+			sm.logger.Warnf("[blockAssemblyHeightPoller] failed to get block assembly state, keeping last cached height %d: %v", sm.cachedBlockAssemblyHeight.Load(), err)
+			return
+		}
+
+		sm.cachedBlockAssemblyHeight.Store(state.CurrentHeight)
+	}
+
+	// Prime the cache immediately so the fast path is armed without waiting a
+	// full interval after start.
+	poll()
+
+	for {
+		select {
+		case <-sm.quit:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			poll()
+		}
+	}
+}
+
 // Start begins the core block handler which processes block and inv messages.
 func (sm *SyncManager) Start() {
 	// Already started?
@@ -3238,6 +3322,15 @@ func (sm *SyncManager) Start() {
 	}
 
 	sm.logger.Infof("Starting sync manager")
+
+	// Start the background block-assembly height poller alongside the drain
+	// goroutine so the per-block maturity check reads a cached height instead
+	// of doing a gRPC round-trip. Skip when there is no block-assembly client
+	// (test setups); the cached check then always takes its slow path, which
+	// no-ops on a nil client exactly as before.
+	if sm.blockAssembly != nil {
+		go sm.blockAssemblyHeightPoller(sm.ctx)
+	}
 
 	go sm.blockHandler()
 }
