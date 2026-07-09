@@ -2505,32 +2505,31 @@ func (wa *windowAccumulator) empty() bool {
 	return len(wa.entries) == 0
 }
 
-// flush submits all accumulated blocks to ProcessBlockWindow. On error it runs
-// a bounded infra-retry over the per-block idempotent ProcessBlock loop
-// (recoverWindowCommit); if that ultimately fails it escalates by disconnecting
-// the current sync peer so the pipeline rotates and re-requests the uncommitted
-// suffix from our committed best-block. Entries are processed in ascending
-// height order so each AddBlock call can locate its parent.
-// ProcessBlockWindow is called under a context deadline: PeerProcessingTimeout
-// scaled by the batch size (min 3 minutes) so a hung call cannot block the
-// drain goroutine indefinitely.
-// flush never acks and never sends on any reply channel: the drain goroutine
-// sends every windowed block's reply at accept-time (see ackWindowedBlock), so
-// once here the blocks are already early-acked. flush therefore only commits
-// or, on unrecoverable failure, disconnects the sync peer — it never rejects a
-// block to the peer and never advances best-block/progress on the fatal path.
-func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
+// windowFlushJob is a drained, ascending-sorted window ready to commit. It is
+// produced on the drain goroutine (drainJob) and consumed either synchronously
+// (flush → commitWindowJob) or, in pipeline mode, by the single flush worker
+// (flushWorker → commitWindowJob).
+type windowFlushJob struct {
+	blocks []*model.Block
+}
+
+// drainJob drains and resets the accumulator, sorts the drained blocks ascending
+// by height, and returns them as a windowFlushJob. It returns ok=false (and an
+// empty job) when the accumulator holds no blocks. It runs on the drain
+// goroutine and performs no I/O — the commit itself lives in commitWindowJob.
+//
+// Entries are sorted ascending before any processing so the per-block fallback
+// loop (recoverWindowCommit) can satisfy AddBlock's parent-availability
+// requirement even if the window accumulated out-of-order arrivals.
+func (wa *windowAccumulator) drainJob() (windowFlushJob, bool) {
 	if wa.empty() {
-		return
+		return windowFlushJob{}, false
 	}
 
 	entries := wa.entries
 	wa.entries = make([]windowEntry, 0, 8)
 	wa.bytesAccum = 0
 
-	// Sort entries ascending by block height before any processing so the
-	// per-block fallback loop can satisfy AddBlock's parent-availability
-	// requirement even if the window accumulated out-of-order arrivals.
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].block.Height < entries[j].block.Height
 	})
@@ -2540,12 +2539,39 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 		blocks[i] = e.block
 	}
 
+	return windowFlushJob{blocks: blocks}, true
+}
+
+// commitWindowJob submits a drained window to ProcessBlockWindow. On error it
+// runs a bounded infra-retry over the per-block idempotent ProcessBlock loop
+// (recoverWindowCommit); if that ultimately fails it escalates by disconnecting
+// the current sync peer so the pipeline rotates and re-requests the uncommitted
+// suffix from our committed best-block. It returns true iff it escalated to a
+// fatal disconnect, so the pipeline worker can poison itself and commit no
+// later window after the resulting gap.
+//
+// ProcessBlockWindow is called under a context deadline: PeerProcessingTimeout
+// scaled by the batch size (min 3 minutes) so a hung call cannot block the
+// caller indefinitely.
+//
+// commitWindowJob never acks and never sends on any reply channel: the drain
+// goroutine sends every windowed block's reply at accept-time (see
+// ackWindowedBlock), so once here the blocks are already early-acked. It
+// therefore only commits or, on unrecoverable failure, disconnects the sync
+// peer — it never rejects a block to the peer and never advances
+// best-block/progress on the fatal path.
+func (sm *SyncManager) commitWindowJob(ctx context.Context, job windowFlushJob) bool {
+	blocks := job.blocks
+	if len(blocks) == 0 {
+		return false
+	}
+
 	sm.logger.Debugf("[windowAccumulator] flushing window of %d blocks to ProcessBlockWindow", len(blocks))
 
-	// Derive a deadline from PeerProcessingTimeout × batch size so the single
-	// drain goroutine cannot be blocked indefinitely by a slow ProcessBlockWindow.
-	// The minimum is the raw PeerProcessingTimeout (covers a batch of one) and
-	// the parent ctx is also respected (e.g. sm.ctx cancellation on shutdown).
+	// Derive a deadline from PeerProcessingTimeout × batch size so the caller
+	// cannot be blocked indefinitely by a slow ProcessBlockWindow. The minimum is
+	// the raw PeerProcessingTimeout (covers a batch of one) and the parent ctx is
+	// also respected (e.g. sm.ctx cancellation on shutdown).
 	perBlock := sm.settings.Legacy.PeerProcessingTimeout
 	if perBlock <= 0 {
 		perBlock = 3 * time.Minute
@@ -2557,14 +2583,14 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 	err := sm.blockValidation.ProcessBlockWindow(flushCtx, blocks, "", "legacy")
 	if err == nil {
 		// Success: acks were already sent at accept-time, nothing to do here.
-		return
+		return false
 	}
 
 	// Post-ack obligation: these blocks were already early-acked at accept-time,
 	// so they can no longer be rejected to the peer. On a commit failure the only
 	// remaining outcomes are (a) recover the commit idempotently, or (b) escalate
 	// by disconnecting the sync peer so the pipeline rotates and re-requests the
-	// uncommitted suffix from our committed best-block. flush never touches a
+	// uncommitted suffix from our committed best-block. This never touches a
 	// reply channel and never advances best-block/progress on the fatal path.
 	sm.logger.Warnf("[windowAccumulator] ProcessBlockWindow error, entering bounded recovery: %v", err)
 
@@ -2574,6 +2600,62 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 
 		if sp := sm.loadSyncPeer(); sp != nil {
 			sp.DisconnectWithWarning(reason)
+		}
+
+		return true
+	}
+
+	return false
+}
+
+// flush is the synchronous (pipeline-off) path: it drains the accumulator and
+// commits the resulting window inline on the calling (drain) goroutine. It is
+// byte-identical to the pre-pipeline behaviour — drainJob + commitWindowJob are
+// the exact two halves of the original flush. In pipeline mode the drain
+// goroutine calls drainJob directly and hands the job to flushWorker instead.
+func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
+	if j, ok := wa.drainJob(); ok {
+		sm.commitWindowJob(ctx, j)
+	}
+}
+
+// flushWorker is the single FIFO flush-worker goroutine used in pipeline mode.
+// It commits each handed-off window in strict produced (ascending, contiguous)
+// order so window W fully commits before W+1 — the chain is sequential, so W's
+// blocks are W+1's parents.
+//
+// Consensus-critical: after a commitWindowJob escalates to a fatal disconnect,
+// the worker sets poisoned=true and thereafter DRAINS the remaining queued jobs
+// WITHOUT committing any of them. Because the worker is the only committer and
+// processes strictly FIFO, this guarantees no later window is committed after a
+// gap (a committed gap would be a consensus bug). It also honours ctx.Done() for
+// prompt shutdown. Only the drain goroutine ever sends on or closes jobs.
+func (sm *SyncManager) flushWorker(ctx context.Context, jobs <-chan windowFlushJob) {
+	poisoned := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Prompt shutdown: drain any buffered jobs so the drain goroutine's
+			// pending send (if any) does not block, then exit once closed.
+			for range jobs {
+			}
+
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+
+			if poisoned {
+				// A prior window hit a fatal gap; commit no later window.
+				sm.logger.Warnf("[flushWorker] poisoned after fatal window commit, discarding queued window of %d blocks", len(job.blocks))
+				continue
+			}
+
+			if sm.commitWindowJob(ctx, job) {
+				poisoned = true
+			}
 		}
 	}
 }
@@ -2731,8 +2813,16 @@ func (sm *SyncManager) blockHandler() {
 		windowFraction := sm.settings.Legacy.ParallelWindowMemoryFraction
 		windowEnabled := windowFraction > 0
 
+		// Pipeline mode: when the window is enabled AND the pipeline sub-flag is
+		// set, window commits run on a single dedicated FIFO flush worker so the
+		// next window fills while the current one commits. Bounded to two windows
+		// in flight (channel depth 1 + the one the worker holds). Only this drain
+		// goroutine ever sends on or closes jobs.
+		pipelineEnabled := windowEnabled && sm.settings.Legacy.ParallelWindowPipeline
+
 		var wa *windowAccumulator
 		var flushTimer *time.Timer
+		var jobs chan windowFlushJob
 
 		if windowEnabled {
 			budget := windowBudgetBytes(windowFraction)
@@ -2742,9 +2832,22 @@ func (sm *SyncManager) blockHandler() {
 			flushTimer.Stop() // don't fire until we have blocks
 		}
 
+		if pipelineEnabled {
+			jobs = make(chan windowFlushJob, 1)
+			go sm.flushWorker(sm.ctx, jobs)
+		}
+
 		flushWindow := func() {
 			if wa != nil && !wa.empty() {
-				wa.flush(sm.ctx, sm)
+				if pipelineEnabled {
+					// Hand the drained window to the worker. The blocking send is
+					// the depth-1 back-pressure that bounds in-flight windows.
+					if j, ok := wa.drainJob(); ok {
+						jobs <- j
+					}
+				} else {
+					wa.flush(sm.ctx, sm)
+				}
 			}
 
 			if flushTimer != nil {
@@ -2784,7 +2887,15 @@ func (sm *SyncManager) blockHandler() {
 		for {
 			select {
 			case <-sm.quit:
+				// Hand off the pending partial window FIRST (back-pressure send),
+				// then close jobs so the worker finishes. Only the drain goroutine
+				// closes jobs, so there is no send-on-closed race.
 				flushWindow()
+
+				if jobs != nil {
+					close(jobs)
+				}
+
 				return
 			case <-timerC:
 				sm.logger.Debugf("[blockHandler] window flush timer fired")
