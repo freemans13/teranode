@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -257,4 +258,85 @@ func (u *BlockValidation) createBlockUTXOs(ctx context.Context, block *model.Blo
 	}
 
 	return allSpends, nil
+}
+
+// spendBlockUTXOs is the SPEND-only pass for the de-interleaved window pipeline.
+// It replays the windowSpend snapshots returned by createBlockUTXOs through the same
+// hardened spend semantics as spendBatchWithRetry: transient-retry with progress-check,
+// fail-closed on ErrTxConflicting / ErrSpent / any non-retryable error.
+//
+// Implementation: the snapshots are grouped by spendingTxHash and each group is
+// assembled into a minimal *bt.Tx (hash pre-set; inputs ordered by vin) so that
+// the existing spendBatchWithRetry loop can be reused without duplication.
+// The store's outpoint-only spend path (utxo.IgnoreFlags{IgnoreLocked, SkipUTXOHashCheck})
+// is engaged via outpointOnly — identical to createAndSpendUTXOsForBatch phase 2.
+//
+// Parameters:
+//   - ctx: Context for cancellation and deadlines
+//   - block: Block whose UTXOs are being spent (provides Height for the spend call)
+//   - spends: Snapshots from createBlockUTXOs; empty slice is a no-op
+//   - outpointOnly: Must be true (guards the fast-path invariant; mirrors createBlockUTXOs)
+func (u *BlockValidation) spendBlockUTXOs(ctx context.Context, block *model.Block, spends []windowSpend, outpointOnly bool) error {
+	if len(spends) == 0 {
+		return nil
+	}
+
+	txs := windowSpendsToTxs(spends)
+	return u.spendBatchWithRetry(ctx, block, txs, outpointOnly)
+}
+
+// windowSpendsToTxs converts a flat []windowSpend into a []*bt.Tx suitable for
+// spendBatchWithRetry. Each unique spendingTxHash becomes one minimal *bt.Tx:
+//   - TxIDChainHash() returns spendingTxHash (set via SetTxHash — no serialisation).
+//   - Inputs are ordered by ascending vin so that GetSpendsOutpointOnly builds
+//     SpendingData.Vin values that match the original transaction's input indices.
+//
+// The resulting txs carry NO outputs and NO scripts — only the fields the
+// outpoint-only spend path reads (PreviousTxIDChainHash, PreviousTxOutIndex, TxIDChainHash).
+func windowSpendsToTxs(spends []windowSpend) []*bt.Tx {
+	// Group by spendingTxHash preserving vin order within each group.
+	type group struct {
+		hash   chainhash.Hash
+		inputs []windowSpend
+	}
+
+	seen := make(map[chainhash.Hash]int) // hash → index in groups
+	var groups []group
+
+	for _, ws := range spends {
+		idx, ok := seen[ws.spendingTxHash]
+		if !ok {
+			idx = len(groups)
+			seen[ws.spendingTxHash] = idx
+			groups = append(groups, group{hash: ws.spendingTxHash})
+		}
+		groups[idx].inputs = append(groups[idx].inputs, ws)
+	}
+
+	txs := make([]*bt.Tx, len(groups))
+	for i, g := range groups {
+		txs[i] = buildMinimalSpendTx(g.hash, g.inputs)
+	}
+	return txs
+}
+
+// buildMinimalSpendTx assembles a minimal *bt.Tx for a single spendingTxHash from its
+// windowSpend entries. The inputs are sorted by vin so GetSpendsOutpointOnly produces
+// SpendingData.Vin values that match the original indices.
+func buildMinimalSpendTx(spendingTxHash chainhash.Hash, inputs []windowSpend) *bt.Tx {
+	// Sort by vin to preserve original input ordering.
+	sort.Slice(inputs, func(i, j int) bool { return inputs[i].vin < inputs[j].vin })
+
+	tx := bt.NewTx()
+	h := spendingTxHash
+	tx.SetTxHash(&h)
+
+	for _, ws := range inputs {
+		parentH := ws.parentTxHash
+		in := &bt.Input{PreviousTxOutIndex: ws.vout}
+		_ = in.PreviousTxIDAdd(&parentH) // only fails on zero-hash; outpoints in real txs are non-zero
+		tx.Inputs = append(tx.Inputs, in)
+	}
+
+	return tx
 }

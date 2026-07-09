@@ -216,11 +216,25 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 	)
 
 	if len(block.Subtrees) > 0 {
-		// Process all subtrees in streaming fashion - creates UTXOs, spends, writes files
-		// This function waits for all processing to complete before returning, ensuring block.ID is set
-		_, err = u.processBlockSubtrees(ctx, block, outpointOnly)
-		if err != nil {
-			return errors.NewProcessingError("[quickValidateBlock][%s] failed to process block subtrees", block.Hash().String(), err)
+		if outpointOnly {
+			// De-interleaved path: create-all then spend-all, for the below-checkpoint
+			// outpoint-only fast path. This is the Step-8 Increment-2a separation that
+			// the window pipeline (Increment-2b) will exploit for concurrency.
+			var spends []windowSpend
+			spends, err = u.createBlockUTXOs(ctx, block, outpointOnly)
+			if err != nil {
+				return errors.NewProcessingError("[quickValidateBlock][%s] failed to create block UTXOs", block.Hash().String(), err)
+			}
+			if err = u.spendBlockUTXOs(ctx, block, spends, outpointOnly); err != nil {
+				return errors.NewProcessingError("[quickValidateBlock][%s] failed to spend block UTXOs", block.Hash().String(), err)
+			}
+		} else {
+			// Interleaved path: kept for non-outpointOnly blocks (need PreviousTxScript
+			// for UTXO-hash check; not de-interleaved — out of scope for Increment-2a).
+			_, err = u.processBlockSubtrees(ctx, block, outpointOnly)
+			if err != nil {
+				return errors.NewProcessingError("[quickValidateBlock][%s] failed to process block subtrees", block.Hash().String(), err)
+			}
 		}
 
 		// Verify block ID was assigned during processing (sanity check)
@@ -282,7 +296,12 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 	)
 
 	if len(block.Subtrees) > 0 {
-		// Process subtrees with async file writes
+		// NOTE (Increment-2a): quickValidateBlockAsync intentionally keeps the interleaved
+		// processBlockSubtreesPipelineAsync path for ALL blocks (outpointOnly or not).
+		// De-interleaving the async variant requires threading the writeJobsChan into
+		// createBlockUTXOs, which is deferred to Increment-2b (the window concurrency work)
+		// to avoid breaking the catchup pipeline now. quickValidateBlock (sync) is fully
+		// de-interleaved above and provides the parity-tested path.
 		prefetchDepth := u.settings.BlockValidation.SubtreeBatchPrefetchDepth
 		if prefetchDepth <= 0 {
 			prefetchDepth = 2 // Default for async mode
