@@ -1298,16 +1298,23 @@ func (sm *SyncManager) current() bool {
 // headersFirstMode (safe from any goroutine).
 //
 // On success it returns the resolved peer, its peerSyncState, the
-// catchingBlocks flag, and the isCheckpointBlock flag.
+// catchingBlocks flag, the isCheckpointBlock flag, and the block's
+// headers-first chain height (headerHeight, or -1 when not resolvable from
+// the header list). The header-list height is the authoritative,
+// PoW-verified, parent-independent height and is the correct source for
+// windowed blocks, which are streamed ahead of commit (so a parent lookup
+// would race the commit).
 // On failure it returns a non-nil error; the caller must propagate it.
 func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 	resolvedPeer *peerpkg.Peer,
 	state *peerSyncState,
 	catchingBlocks bool,
 	isCheckpointBlock bool,
+	headerHeight int32,
 	err error,
 ) {
 	resolvedPeer = bmsg.peer
+	headerHeight = -1
 
 	state, exists := sm.peerStates.Get(resolvedPeer)
 	if !exists {
@@ -1368,6 +1375,12 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 			firstNode := firstNodeEl.Value.(*headerNode)
 
 			if bmsg.blockHash.IsEqual(firstNode.hash) {
+				// The header-list node carries the authoritative,
+				// PoW-verified, parent-independent height. Surface it for
+				// both the checkpoint-match and non-checkpoint-match cases —
+				// only the removal differs between them.
+				headerHeight = firstNode.height
+
 				if firstNode.hash.IsEqual(sm.nextCheckpoint.Hash) {
 					isCheckpointBlock = true
 				} else {
@@ -1403,7 +1416,9 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	sm.logger.Debugf("[handleBlockMsg][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 
-	peer, state, catchingBlocks, isCheckpointBlock, err := sm.handleBlockPreamble("handleBlockMsg", bmsg)
+	// The direct path derives height inside HandleBlockDirect, so the
+	// header-list height from the preamble is unused here.
+	peer, state, catchingBlocks, isCheckpointBlock, _, err := sm.handleBlockPreamble("handleBlockMsg", bmsg)
 	if err != nil {
 		return err
 	}
@@ -1641,7 +1656,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator) (addedToWindow bool, err error) {
 	sm.logger.Debugf("[handleBlockMsgWithWindow][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 
-	peer, state, catchingBlocks, isCheckpointBlock, preambleErr := sm.handleBlockPreamble("handleBlockMsgWithWindow", bmsg)
+	peer, state, catchingBlocks, isCheckpointBlock, headerHeight, preambleErr := sm.handleBlockPreamble("handleBlockMsgWithWindow", bmsg)
 	if preambleErr != nil {
 		return false, preambleErr
 	}
@@ -1651,22 +1666,42 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] block message carries no block", bmsg.blockHash)
 	}
 
-	// Determine block height by querying the blockchain for the prev block header.
-	// This mirrors the height-resolution logic in HandleBlockDirect.
+	// Determine block height. The authoritative source is the headers-first
+	// header chain (headerHeight from the preamble): it is PoW-verified and
+	// parent-independent. This matters because the window streams blocks
+	// ahead of commit (early-ack), so block N+1 can be processed before N is
+	// committed — a parent (prev-block-header) lookup would then race the
+	// commit and fail with BLOCK_NOT_FOUND, wedging the node. Below the
+	// hardcoded checkpoint IBD is always in headers-first mode, so
+	// headerHeight is populated for every normal windowed block.
+	//
+	// The block.Height()/parent-lookup path is retained ONLY as a fallback
+	// for edge cases outside headers-first mode (headerHeight <= 0), where
+	// no parent race exists.
 	prevBlockHash := msgBlock.Header.PrevBlock
 	bmsg.block = nil
 
 	block := bsvutil.NewBlock(msgBlock)
 
 	var blockHeightUint32 uint32
-	if block.Height() > 0 {
+
+	switch {
+	case headerHeight > 0:
+		h, convErr := safeconversion.Int32ToUint32(headerHeight)
+		if convErr != nil {
+			return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to convert header-chain height", bmsg.blockHash, convErr)
+		}
+
+		blockHeightUint32 = h
+		block.SetHeight(headerHeight)
+	case block.Height() > 0:
 		h, convErr := safeconversion.Int32ToUint32(block.Height())
 		if convErr != nil {
 			return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to convert block height", bmsg.blockHash, convErr)
 		}
 
 		blockHeightUint32 = h
-	} else {
+	default:
 		_, prevMeta, headerErr := sm.blockchainClient.GetBlockHeader(sm.ctx, &prevBlockHash)
 		if headerErr != nil {
 			return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to get prev block header for height determination", bmsg.blockHash, headerErr)
