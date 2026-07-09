@@ -2422,17 +2422,20 @@ func (wa *windowAccumulator) empty() bool {
 	return len(wa.entries) == 0
 }
 
-// flush submits all accumulated blocks to ProcessBlockWindow. On error it
-// falls back to per-block ProcessBlock for every entry (creates are idempotent
-// so re-processing committed blocks is safe). The fallback loop processes
-// entries in ascending height order so that each AddBlock call can locate its
-// parent without a height-ordering mismatch.
+// flush submits all accumulated blocks to ProcessBlockWindow. On error it runs
+// a bounded infra-retry over the per-block idempotent ProcessBlock loop
+// (recoverWindowCommit); if that ultimately fails it escalates by disconnecting
+// the current sync peer so the pipeline rotates and re-requests the uncommitted
+// suffix from our committed best-block. Entries are processed in ascending
+// height order so each AddBlock call can locate its parent.
 // ProcessBlockWindow is called under a context deadline: PeerProcessingTimeout
 // scaled by the batch size (min 3 minutes) so a hung call cannot block the
 // drain goroutine indefinitely.
-// flush never acks: the drain goroutine sends every windowed block's reply at
-// accept-time (see ackWindowedBlock), so flush only commits and, on error,
-// runs the idempotent per-block fallback.
+// flush never acks and never sends on any reply channel: the drain goroutine
+// sends every windowed block's reply at accept-time (see ackWindowedBlock), so
+// once here the blocks are already early-acked. flush therefore only commits
+// or, on unrecoverable failure, disconnects the sync peer — it never rejects a
+// block to the peer and never advances best-block/progress on the fatal path.
 func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 	if wa.empty() {
 		return
@@ -2474,17 +2477,81 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 		return
 	}
 
-	// On any error from ProcessBlockWindow, fall back to per-block ProcessBlock
-	// for all entries (creates are idempotent so re-processing committed blocks is safe).
-	// The peer was already acked at accept-time, so the fallback never touches a
-	// reply channel; it only re-drives the commit for each block idempotently.
-	sm.logger.Warnf("[windowAccumulator] ProcessBlockWindow error, falling back to per-block: %v", err)
+	// Post-ack obligation: these blocks were already early-acked at accept-time,
+	// so they can no longer be rejected to the peer. On a commit failure the only
+	// remaining outcomes are (a) recover the commit idempotently, or (b) escalate
+	// by disconnecting the sync peer so the pipeline rotates and re-requests the
+	// uncommitted suffix from our committed best-block. flush never touches a
+	// reply channel and never advances best-block/progress on the fatal path.
+	sm.logger.Warnf("[windowAccumulator] ProcessBlockWindow error, entering bounded recovery: %v", err)
 
-	for _, e := range entries {
-		if fallbackErr := sm.ProcessBlock(ctx, e.block); fallbackErr != nil {
-			sm.logger.Warnf("[windowAccumulator] per-block fallback failed for height %d: %v", e.block.Height, fallbackErr)
+	if recErr := sm.recoverWindowCommit(ctx, blocks); recErr != nil {
+		reason := fmt.Sprintf("post-ack window commit unrecoverable after %d attempts, disconnecting to trigger sync peer rotation: %v", windowCommitRetryCap, recErr)
+		sm.logger.Errorf("[windowAccumulator] %s", reason)
+
+		if sp := sm.loadSyncPeer(); sp != nil {
+			sp.DisconnectWithWarning(reason)
 		}
 	}
+}
+
+// windowCommitRetryCap bounds the number of recovery passes flush makes over the
+// per-block idempotent ProcessBlock loop after a ProcessBlockWindow failure. It
+// is small because recovery only helps for transient infra errors; a fatal error
+// escalates immediately without consuming the cap.
+const windowCommitRetryCap = 3
+
+// windowCommitRetryBackoff is the short pause between bounded recovery passes so
+// a transient infra dependency has a moment to settle without stalling the drain
+// goroutine for long.
+const windowCommitRetryBackoff = 250 * time.Millisecond
+
+// recoverWindowCommit re-drives the commit for an already-early-acked window via
+// the per-block idempotent ProcessBlock loop (creates are idempotent so
+// re-processing a committed block is safe). Blocks must already be sorted
+// ascending by height so each AddBlock can locate its parent.
+//
+// Classification uses the SAME predicate as the peer path (peer_server.go): an
+// ErrServiceError/ErrStorageError is infra/transient (retryable up to the cap
+// with a short backoff); anything else is fatal and escalates immediately. It
+// returns nil once the whole window commits, or the escalating error when the
+// retry cap is exhausted on an infra error or a fatal error is hit.
+func (sm *SyncManager) recoverWindowCommit(ctx context.Context, blocks []*model.Block) error {
+	var lastErr error
+
+	for attempt := 1; attempt <= windowCommitRetryCap; attempt++ {
+		lastErr = nil
+
+		for _, block := range blocks {
+			if err := sm.ProcessBlock(ctx, block); err != nil {
+				lastErr = err
+
+				// Fatal (non-infra) errors cannot be recovered by retrying; escalate now.
+				if !errors.Is(err, errors.ErrServiceError) && !errors.Is(err, errors.ErrStorageError) {
+					sm.logger.Errorf("[windowAccumulator] recovery hit fatal error for height %d, escalating: %v", block.Height, err)
+					return err
+				}
+
+				sm.logger.Warnf("[windowAccumulator] recovery infra error for height %d (attempt %d/%d): %v", block.Height, attempt, windowCommitRetryCap, err)
+
+				break
+			}
+		}
+
+		if lastErr == nil {
+			return nil
+		}
+
+		if attempt < windowCommitRetryCap {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(windowCommitRetryBackoff):
+			}
+		}
+	}
+
+	return lastErr
 }
 
 // ackWindowedBlock sends the accept-time ack for a block that has just been
