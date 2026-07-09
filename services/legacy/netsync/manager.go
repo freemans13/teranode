@@ -3251,21 +3251,29 @@ func (sm *SyncManager) DonePeer(peer *peerpkg.Peer, done chan struct{}) {
 // without paying a per-block gRPC round-trip on the serial drain path in the
 // common case.
 //
-// FAST PATH: if the cached block-assembly height (refreshed in the background by
-// blockAssemblyHeightPoller) already satisfies cached+maxBehind >= blockHeight,
-// return nil with no gRPC. This is safe: below the checkpoint block-assembly
-// height is monotonic (no reorg), so the cached value is a stale-LOW-or-equal
-// lower bound on the true height. If the lower bound already clears the bound,
-// the true (>=) height clears it too — the fast path can never wrongly pass.
+// FAST PATH: engaged ONLY for blocks at or below the highest hardcoded checkpoint
+// (model.BelowCheckpoint). In that certified prefix the chain is pinned — no reorg
+// can occur — so block-assembly height is monotonic and the cached height
+// (refreshed in the background by blockAssemblyHeightPoller) is a stale-LOW-or-equal
+// lower bound on the true height. If that lower bound already satisfies
+// cached+maxBehind >= blockHeight, the true (>=) height satisfies it too, so the
+// fast path can never wrongly pass, and it returns nil with no gRPC.
 //
-// SLOW PATH: cache unpolled (0) or at/near the bound — fall through to the real
-// fresh-gRPC retry loop, whose behaviour (and overflow guard) is unchanged.
+// SLOW PATH: taken for every block ABOVE the checkpoint (reorg-possible, where a
+// reorg could LOWER block-assembly height and leave a stale-HIGH cache), and for a
+// below-checkpoint block whose cache is unpolled (0), overflowing, or at/near the
+// bound. It falls through to the real fresh-gRPC retry loop, whose behaviour (and
+// overflow guard) is unchanged. Restricting the fast path to below the checkpoint
+// makes correctness independent of MaxBlocksBehindBlockAssembly staying below the
+// coinbase-maturity window: above the checkpoint the fresh gRPC is always used.
 func (sm *SyncManager) waitForBlockAssemblyReadyCached(ctx context.Context, blockHeight uint32) error {
 	maxBehind := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
 
-	// Fast path only when maxBehind is a valid positive window; a non-positive
-	// value defers entirely to the slow path, which validates/guards it.
-	if maxBehind > 0 {
+	// Fast path only below the highest hardcoded checkpoint (reorg-safe) and only
+	// when maxBehind is a valid positive window; a non-positive value or an
+	// above-checkpoint block defers entirely to the slow path, which validates and
+	// guards the bound with a fresh gRPC read.
+	if maxBehind > 0 && sm.chainParams != nil && model.BelowCheckpoint(sm.chainParams.Checkpoints, blockHeight) {
 		cached := sm.cachedBlockAssemblyHeight.Load()
 		// Guard the uint32 addition against wraparound exactly as the slow-path
 		// helper does; on possible overflow, skip the fast path.

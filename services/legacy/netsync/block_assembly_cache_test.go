@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
@@ -13,6 +14,12 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
+
+// cacheTestCheckpointHeight is the highest hardcoded checkpoint used by the
+// cache-test SyncManager: blocks at or below it are inside the reorg-safe prefix
+// where the cached-height fast path is allowed; blocks above it must always take
+// the fresh-gRPC slow path.
+const cacheTestCheckpointHeight = 100_000
 
 // stateSpy is a minimal blockassembly.ClientI that counts GetBlockAssemblyState
 // calls and returns a configurable height/error. All other interface methods are
@@ -44,10 +51,18 @@ func newCacheTestManager(t *testing.T, ba blockassembly.ClientI, maxBehind int) 
 	s := &settings.Settings{}
 	s.BlockValidation.MaxBlocksBehindBlockAssembly = maxBehind
 
+	// A single hardcoded checkpoint so model.BelowCheckpoint has a real boundary:
+	// heights at or below cacheTestCheckpointHeight are in the reorg-safe prefix
+	// where the fast path may engage; heights above it must take the slow path.
+	params := &chaincfg.Params{
+		Checkpoints: []chaincfg.Checkpoint{{Height: cacheTestCheckpointHeight}},
+	}
+
 	return &SyncManager{
 		ctx:           context.Background(),
 		logger:        ulogger.TestLogger{},
 		settings:      s,
+		chainParams:   params,
 		blockAssembly: ba,
 		quit:          make(chan struct{}),
 	}
@@ -112,6 +127,43 @@ func TestWaitForBlockAssemblyReadyCached_StaleLowSafe(t *testing.T) {
 	err := sm.waitForBlockAssemblyReadyCached(context.Background(), 1500)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, spy.calls.Load(), int64(1), "stale-low cache must defer to the fresh gRPC")
+}
+
+// TestWaitForBlockAssemblyReadyCached_AboveCheckpointForcesSlowPath proves the
+// reorg-safety restriction: for a block ABOVE the highest hardcoded checkpoint
+// the fast path must NOT engage even when the cached height would satisfy the
+// bound, because a reorg could lower block-assembly height and leave a stale-HIGH
+// cache. The check must defer to the fresh gRPC (GetBlockAssemblyState is called).
+func TestWaitForBlockAssemblyReadyCached_AboveCheckpointForcesSlowPath(t *testing.T) {
+	spy := &stateSpy{}
+	spy.height.Store(cacheTestCheckpointHeight + 10) // fresh gRPC clears the bound
+	sm := newCacheTestManager(t, spy, 100)
+
+	// Cache would satisfy the bound if the fast path were allowed:
+	// cached+maxBehind = (above-cp+5)+100 >= (above-cp+1). But the block is above
+	// the checkpoint, so the fast path is skipped regardless.
+	aboveCP := uint32(cacheTestCheckpointHeight + 1)
+	sm.cachedBlockAssemblyHeight.Store(cacheTestCheckpointHeight + 5)
+
+	err := sm.waitForBlockAssemblyReadyCached(context.Background(), aboveCP)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, spy.calls.Load(), int64(1), "above-checkpoint block must take the fresh-gRPC slow path")
+}
+
+// TestWaitForBlockAssemblyReadyCached_BelowCheckpointTakesFastPath is the
+// counterpart: an at/below-checkpoint block with a satisfying cache takes the
+// fast path (no GetBlockAssemblyState call).
+func TestWaitForBlockAssemblyReadyCached_BelowCheckpointTakesFastPath(t *testing.T) {
+	spy := &stateSpy{}
+	sm := newCacheTestManager(t, spy, 100)
+
+	// blockHeight == checkpoint height (inclusive boundary); cache clears the bound.
+	belowCP := uint32(cacheTestCheckpointHeight)
+	sm.cachedBlockAssemblyHeight.Store(cacheTestCheckpointHeight)
+
+	err := sm.waitForBlockAssemblyReadyCached(context.Background(), belowCP)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), spy.calls.Load(), "below-checkpoint block with satisfying cache must take the fast path")
 }
 
 // TestBlockAssemblyHeightPoller_PopulatesAndRefreshes proves the poller fills
