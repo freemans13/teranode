@@ -11,9 +11,10 @@ package blockvalidation
 //     K=all, on separate sqlitememory stores → identical UTXO state (existence,
 //     BlockID grouping, spender-identity) + identical committed chain tip.
 //
-//  2. BARRIER PROPERTY — a spy UTXO store records the global phase (create vs spend)
-//     with timestamps; asserts max(create.at) < min(spend.at) across the full window.
-//     This is fence C1→C2: the test genuinely proves the barrier rather than assuming it.
+//  2. BARRIER PROPERTY — a spy UTXO store holds each Create goroutine open for 1 ms
+//     then increments a completion counter; each Spend asserts at call time that ALL
+//     creates have already completed. This is a guaranteed discriminator: a barrier-free
+//     implementation would observe an incomplete create set on the first Spend.
 //
 //  3. COMMIT ORDER — spy blockchain client recording block heights at AddBlock;
 //     asserts strictly ascending order for all K commits.
@@ -379,60 +380,106 @@ func TestProcessBlockWindow_ParityWithSerial(t *testing.T) {
 // Test 2: BARRIER PROPERTY
 // ---------------------------------------------------------------------------
 
-// barrierSpyStore wraps NullStore, returning true for SupportsOutpointOnlySpend,
-// and records the wall-clock time of every Create and Spend call. After the
-// window completes the test asserts max(create.at) <= min(spend.at).
+// barrierSpyStore wraps NullStore and provides a guaranteed discriminator for
+// the C1→C2 barrier property. The key design requirement is that the test must
+// RELIABLY FAIL when the barrier is removed — not just probabilistically.
+//
+// Mechanism (staggered-delay gate):
+//
+//  1. totalExpectedCreates is the exact count of Create calls the window will issue
+//     (K blocks × 1 non-coinbase tx each).
+//
+//  2. Each Create claims a monotonically increasing slot index via createIndex.
+//     It then sleeps for (slotIndex+1) × slotDelay (5ms, 10ms, 15ms for slots 0,1,2).
+//     Staggered delays ensure that Create-0 finishes 5ms before Create-1 and 10ms
+//     before Create-2. After sleeping, it increments completedCreates.
+//
+//  3. Each Spend immediately asserts completedCreates == totalExpectedCreates.
+//     If not, a violation is recorded via t.Errorf (non-fatal so all spends fire).
+//
+// Why staggered delays guarantee discrimination:
+//
+// In the real (barrier) implementation all K creates run and c1g.Wait() blocks
+// until Create-2 (the slowest, 15ms) finishes. completedCreates = K when any
+// Spend fires → no violation.
+//
+// In a barrier-free implementation (e.g. per-block: create→spend per goroutine,
+// all K goroutines concurrent) block-0's goroutine finishes Create-0 (5ms) and
+// immediately fires Spend-0. At t=5ms, Creates 1 and 2 are still sleeping
+// (10ms and 15ms), so completedCreates = 1 ≠ 3 → VIOLATION recorded.
+//
+// The staggered delays remove any ambiguity about whether "all creates happened
+// to finish before the first spend by scheduling luck": Create-0 is guaranteed to
+// complete a full slotDelay (5ms) before Create-1, so block-0's Spend will always
+// fire before Create-1 and Create-2 complete in a barrier-free impl.
 type barrierSpyStore struct {
 	*nullstore.NullStore
-	mu     sync.Mutex
-	events []phaseEvent
+	t                    *testing.T
+	totalExpectedCreates int64
+	createIndex          atomic.Int64 // slot counter (0, 1, 2, …)
+	completedCreates     atomic.Int64
+	slotDelay            time.Duration
+	violationRecorded    atomic.Bool
 }
 
-type phaseEvent struct {
-	phase string
-	at    time.Time
-}
-
-func newBarrierSpyStore(t *testing.T) *barrierSpyStore {
+func newBarrierSpyStore(t *testing.T, totalExpectedCreates int64) *barrierSpyStore {
 	t.Helper()
 	ns, err := nullstore.NewNullStore()
 	require.NoError(t, err)
-	return &barrierSpyStore{NullStore: ns}
+	return &barrierSpyStore{
+		NullStore:            ns,
+		t:                    t,
+		totalExpectedCreates: totalExpectedCreates,
+		slotDelay:            5 * time.Millisecond,
+	}
 }
 
 func (s *barrierSpyStore) SupportsOutpointOnlySpend() bool { return true }
 
 func (s *barrierSpyStore) Create(_ context.Context, _ *bt.Tx, _ uint32, _ ...utxo.CreateOption) (*utxometa.Data, error) {
-	s.mu.Lock()
-	s.events = append(s.events, phaseEvent{phase: "create", at: time.Now()})
-	s.mu.Unlock()
+	// Claim a slot (0, 1, 2, …). Slot i sleeps for (i+1) * slotDelay so that
+	// each create completes strictly later than the previous one. This guarantees
+	// that in a barrier-free implementation the first block's Spend fires while
+	// the remaining creates are still sleeping.
+	slot := s.createIndex.Add(1) - 1
+	time.Sleep(time.Duration(slot+1) * s.slotDelay)
+	s.completedCreates.Add(1)
 	return nil, nil
 }
 
 func (s *barrierSpyStore) Spend(_ context.Context, _ *bt.Tx, _ uint32, _ ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
-	s.mu.Lock()
-	s.events = append(s.events, phaseEvent{phase: "spend", at: time.Now()})
-	s.mu.Unlock()
+	// Assert the barrier invariant at spend time: EVERY Create must have completed.
+	// If completedCreates < totalExpectedCreates here, the C1→C2 barrier is not
+	// being enforced — a Spend is running while creates are still in flight.
+	completed := s.completedCreates.Load()
+	if completed != s.totalExpectedCreates {
+		s.violationRecorded.Store(true)
+		s.t.Errorf(
+			"BARRIER VIOLATION at Spend time: completedCreates=%d want %d — C1→C2 fence not enforced",
+			completed, s.totalExpectedCreates,
+		)
+	}
 	return nil, nil
 }
 
-func (s *barrierSpyStore) copyEvents() []phaseEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]phaseEvent, len(s.events))
-	copy(out, s.events)
-	return out
-}
-
-// TestProcessBlockWindow_BarrierProperty proves the C1→C2 barrier.
+// TestProcessBlockWindow_BarrierProperty proves the C1→C2 barrier is a GUARANTEED
+// discriminator, not a probabilistic one.
 //
-// Technique: run ProcessBlockWindow with a barrierSpyStore that records
-// timestamps for every Create and Spend call. After the window completes
-// assert that max(create.at) <= min(spend.at) — i.e. the last create call
-// completed no later than the first spend call began.
+// Technique: barrierSpyStore assigns each Create a slot (0..K-1) and sleeps for
+// (slot+1)×5ms before recording completion. Slot-0 finishes at 5ms, slot-1 at 10ms,
+// slot-2 at 15ms — staggered so they cannot complete "simultaneously". Each Spend
+// asserts AT CALL TIME that ALL K creates have already completed.
 //
-// The spy store does not persist UTXO data, so this test isolates the
-// barrier ordering guarantee from data correctness (covered by Test 1).
+// With the real barrier (c1g.Wait after all creates): the barrier holds until 15ms,
+// then all K spends fire with completedCreates == K → PASS.
+//
+// Without the barrier (per-block sequential: create+spend in one goroutine per block,
+// all K goroutines concurrent): block-0's Create finishes at 5ms and its Spend fires
+// immediately. At 5ms, creates 1 and 2 are still sleeping (10ms, 15ms), so
+// completedCreates = 1 ≠ 3 → FAIL.
+//
+// The spy store does not persist UTXO data, so this test isolates the barrier
+// ordering guarantee from data correctness (covered by Test 1).
 func TestProcessBlockWindow_BarrierProperty(t *testing.T) {
 	const k = 3
 
@@ -448,7 +495,12 @@ func TestProcessBlockWindow_BarrierProperty(t *testing.T) {
 	params.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
 	tSettings.ChainCfgParams = &params
 
-	spy := newBarrierSpyStore(t)
+	// Each block has 1 non-coinbase tx → k total Create calls.
+	// createBlockUTXOs calls Create once per non-coinbase tx in the block.
+	const txPerBlock = 1
+	totalExpectedCreates := int64(k * txPerBlock)
+
+	spy := newBarrierSpyStore(t, totalExpectedCreates)
 
 	blockChainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
 	require.NoError(t, err)
@@ -477,38 +529,14 @@ func TestProcessBlockWindow_BarrierProperty(t *testing.T) {
 
 	require.NoError(t, bv.ProcessBlockWindow(ctx, blocks, "barrier-test-peer"))
 
-	events := spy.copyEvents()
-	require.NotEmpty(t, events, "spy must record at least one event")
+	// Final sanity: all creates must have been called (catches miscounted totalExpectedCreates).
+	finalCompleted := spy.completedCreates.Load()
+	require.Equal(t, totalExpectedCreates, finalCompleted,
+		"BARRIER: expected %d Create calls, got %d — txPerBlock constant may need updating",
+		totalExpectedCreates, finalCompleted)
 
-	var creates, spends []phaseEvent
-	for _, e := range events {
-		switch e.phase {
-		case "create":
-			creates = append(creates, e)
-		case "spend":
-			spends = append(spends, e)
-		}
-	}
-
-	require.NotEmpty(t, creates, "BARRIER: no Create calls recorded")
-	require.NotEmpty(t, spends, "BARRIER: no Spend calls recorded")
-
-	var maxCreate time.Time
-	for _, e := range creates {
-		if e.at.After(maxCreate) {
-			maxCreate = e.at
-		}
-	}
-	var minSpend time.Time
-	for _, e := range spends {
-		if minSpend.IsZero() || e.at.Before(minSpend) {
-			minSpend = e.at
-		}
-	}
-
-	require.True(t, !maxCreate.After(minSpend),
-		"BARRIER VIOLATION: last Create at %v is after first Spend at %v — C1→C2 fence not enforced",
-		maxCreate, minSpend)
+	require.False(t, spy.violationRecorded.Load(),
+		"BARRIER: one or more Spend calls observed incomplete creates — see t.Errorf above")
 }
 
 // buildBarrierBlocks builds k independent single-tx blocks for the barrier test.

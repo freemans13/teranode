@@ -405,9 +405,10 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 
 	c1g, c1ctx := errgroup.WithContext(ctx)
 	// Concurrency cap: each block's create already fans out internally using
-	// StoreBatcherSize*8 goroutines. Limit the window-level concurrency to k
-	// (one goroutine per block) — the intra-block fan-out is the real batcher load.
-	// SafeSetLimit uses StoreBatcherSize as the floor; k is typically small (≤20).
+	// StoreBatcherSize*8 goroutines; the batcher — not this errgroup — is the real
+	// DB-pool gate. The window-level limit is StoreBatcherSize so that a
+	// misconfigured k does not spawn an unbounded number of concurrent intra-block
+	// fan-outs. SafeSetLimit clamps to runtime.NumCPU() when StoreBatcherSize < 1.
 	util.SafeSetLimit(u.logger, c1g, u.settings.UtxoStore.StoreBatcherSize)
 	var mu sync.Mutex
 	for i := range k {
