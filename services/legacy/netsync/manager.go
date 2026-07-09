@@ -2619,6 +2619,39 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 	}
 }
 
+// shutdownFlushHandoff performs the prompt, non-blocking pipeline shutdown
+// hand-off. It attempts a single non-blocking send of the pending partial
+// window to the flush worker, then closes jobs so the worker drains and exits.
+//
+// A blocking hand-off could stall shutdown for up to a full per-block commit
+// deadline (PeerProcessingTimeout x batchSize, minutes) if the worker is
+// mid-commit and the depth-1 slot is already full. So when the slot is full we
+// ABANDON the pending window rather than block. This is safe: an uncommitted
+// window advances no persistent state — the worker touches no reply channel and
+// the chain tip only moves for committed windows — so on restart sync resumes
+// from the committed best-block header and re-fetches the abandoned blocks.
+//
+// Only the single drain goroutine ever calls this or otherwise sends on/closes
+// jobs, so neither the select-send nor the close can race a concurrent sender.
+// jobs is nil when the pipeline sub-flag is off; then there is nothing to do.
+func (sm *SyncManager) shutdownFlushHandoff(wa *windowAccumulator, jobs chan windowFlushJob) {
+	if jobs == nil {
+		return
+	}
+
+	if wa != nil && !wa.empty() {
+		if j, ok := wa.drainJob(); ok {
+			select {
+			case jobs <- j:
+			default:
+				sm.logger.Warnf("[blockHandler] shutdown: abandoning pending window of %d blocks (worker busy); it will be re-synced from the committed best-block on restart", len(j.blocks))
+			}
+		}
+	}
+
+	close(jobs)
+}
+
 // flushWorker is the single FIFO flush-worker goroutine used in pipeline mode.
 // It commits each handed-off window in strict produced (ascending, contiguous)
 // order so window W fully commits before W+1 — the chain is sequential, so W's
@@ -2628,16 +2661,25 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 // the worker sets poisoned=true and thereafter DRAINS the remaining queued jobs
 // WITHOUT committing any of them. Because the worker is the only committer and
 // processes strictly FIFO, this guarantees no later window is committed after a
-// gap (a committed gap would be a consensus bug). It also honours ctx.Done() for
-// prompt shutdown. Only the drain goroutine ever sends on or closes jobs.
+// gap (a committed gap would be a consensus bug). Only the drain goroutine ever
+// sends on or closes jobs.
+//
+// Shutdown: the normal shutdown path is the drain goroutine closing jobs (see
+// blockHandler's sm.quit branch); the worker then finishes committing whatever
+// is already queued (unless poisoned) and returns when the range over jobs
+// ends. Stop() closes sm.quit but does NOT cancel sm.ctx, so the ctx.Done()
+// branch below does not fire on a normal Stop(); it only fires if the context
+// this worker was started with is cancelled elsewhere, in which case the worker
+// drains the channel WITHOUT committing any further window and exits.
 func (sm *SyncManager) flushWorker(ctx context.Context, jobs <-chan windowFlushJob) {
 	poisoned := false
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Prompt shutdown: drain any buffered jobs so the drain goroutine's
-			// pending send (if any) does not block, then exit once closed.
+			// Context cancelled: exit without committing further. Drain any
+			// buffered jobs (committing none) so the drain goroutine's pending
+			// send, if any, does not block, then return once the channel closes.
 			for range jobs {
 			}
 
@@ -2887,14 +2929,10 @@ func (sm *SyncManager) blockHandler() {
 		for {
 			select {
 			case <-sm.quit:
-				// Hand off the pending partial window FIRST (back-pressure send),
-				// then close jobs so the worker finishes. Only the drain goroutine
-				// closes jobs, so there is no send-on-closed race.
-				flushWindow()
-
-				if jobs != nil {
-					close(jobs)
-				}
+				// Prompt, non-blocking shutdown hand-off of the pending window,
+				// then close jobs so the worker exits. Only the drain goroutine
+				// (this goroutine) sends on or closes jobs.
+				sm.shutdownFlushHandoff(wa, jobs)
 
 				return
 			case <-timerC:

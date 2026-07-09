@@ -357,52 +357,173 @@ func TestPipeline_FatalDiscardsQueuedNoGap(t *testing.T) {
 	require.Empty(t, committed, "no window may commit once a fatal gap occurs")
 }
 
-// TestPipeline_ShutdownCtxDone proves the worker honours ctx cancellation for
-// prompt shutdown and does not leak: a cancelled ctx while gated must let the
-// worker exit once the channel closes without committing further windows.
-func TestPipeline_ShutdownCtxDone(t *testing.T) {
+// TestPipeline_ShutdownCtxDone_NoCommitOfBuffered isolates the flushWorker's
+// ctx.Done() branch (distinct from the channel-close path): when the worker's
+// ctx is cancelled and a later window is subsequently buffered in jobs, the
+// worker must DRAIN and DISCARD that buffered window WITHOUT committing it, then
+// exit on channel close. Under a normal Stop() this branch never fires (Stop
+// closes sm.quit, not sm.ctx); this test drives the branch directly.
+//
+// To isolate the ctx.Done() branch deterministically we make jobs EMPTY at the
+// top-of-loop select at the moment of cancellation: window 1 is gated inside its
+// commit (worker not in the select), we cancel, release window 1 so the worker
+// returns to the select with an empty channel and a done ctx (ctx.Done() is then
+// the sole ready case), and only THEN buffer window 2 for the drain loop to
+// discard.
+func TestPipeline_ShutdownCtxDone_NoCommitOfBuffered(t *testing.T) {
 	before := runtime.NumGoroutine()
 
-	spy := &pipelineSpyBlockValidation{}
-	tSettings, params := newOutpointOnlySettings(t, true, true, int32(1000))
-	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
+	spy := &pipelineSpyBlockValidation{
+		gate:    make(chan struct{}),
+		entered: make(chan uint32, 4),
+	}
+	sm := newAckTestSyncManager(t, spy)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	sm := &SyncManager{
-		ctx:             ctx,
-		settings:        tSettings,
-		chainParams:     params,
-		logger:          newAckTestSyncManager(t, spy).logger,
-		utxoStore:       newAckTestSyncManager(t, spy).utxoStore,
-		blockValidation: spy,
-	}
 
 	jobs := make(chan windowFlushJob, 1)
 
 	done := make(chan struct{})
 	go func() {
-		sm.flushWorker(sm.ctx, jobs)
+		sm.flushWorker(ctx, jobs)
 		close(done)
 	}()
 
-	// Hand off one window, let it commit.
+	// Window 1 -> worker enters its commit and blocks on the gate (it is now
+	// inside ProcessBlockWindow, NOT in the top-of-loop select).
 	jobs <- buildWindowJob(t, 500, 2)
+	select {
+	case first := <-spy.entered:
+		require.Equal(t, uint32(500), first, "worker must be mid-commit on window 1")
+	case <-time.After(pipelineTestTimeout):
+		t.Fatal("worker did not enter window 1 commit")
+	}
 
-	// Cancel the ctx and close the channel (shutdown handoff order in blockHandler
-	// hands off the pending window then closes jobs).
+	// Cancel while the worker is parked in the gated commit (jobs is empty).
 	cancel()
+
+	// Release window 1: its commit completes and is recorded, then the worker
+	// returns to the top-of-loop select where jobs is empty and ctx is done, so
+	// it deterministically takes the ctx.Done() branch and enters the range-drain.
+	spy.gate <- struct{}{}
+
+	// Wait until window 1's commit is recorded: the worker has now left the
+	// commit and, with jobs empty and ctx done, takes ctx.Done() and parks in the
+	// range-drain loop. Only after that do we buffer window 2, so it is delivered
+	// straight to the drain loop (read+discarded), never to a competing select.
+	require.Eventually(t, func() bool {
+		return len(spy.committedOrder()) == 1
+	}, pipelineTestTimeout, time.Millisecond, "window 1 commit must record before we buffer window 2")
+
+	// Buffer window 2 for the ctx.Done() drain loop to read and DISCARD (never
+	// commit), then close so the drain loop terminates and the worker returns.
+	jobs <- buildWindowJob(t, 600, 2)
 	close(jobs)
 
 	select {
 	case <-done:
 	case <-time.After(pipelineTestTimeout):
-		t.Fatal("worker did not exit on shutdown")
+		t.Fatal("worker did not exit after ctx cancel + channel close")
 	}
 
-	// Allow the scheduler to reclaim the exited goroutine.
+	// Window 1 (accepted before cancel) commits; window 2, buffered after cancel,
+	// is drained and discarded WITHOUT committing on the ctx.Done() path.
+	committed := spy.committedOrder()
+	require.Equal(t, []uint32{500}, committed,
+		"ctx.Done() must drain the later-buffered window WITHOUT committing it")
+	require.NotContains(t, committed, uint32(600),
+		"buffered window must never be committed on the ctx.Done() shutdown path")
+
 	require.Eventually(t, func() bool {
 		return runtime.NumGoroutine() <= before+1
-	}, pipelineTestTimeout, 10*time.Millisecond, "worker goroutine leaked after shutdown")
+	}, pipelineTestTimeout, 10*time.Millisecond, "worker goroutine leaked after ctx-cancel shutdown")
+}
+
+// TestPipeline_PromptShutdown_AbandonsPendingWindow proves the fix: when
+// shutdown lands while the single worker is mid-commit (window 1) AND the
+// depth-1 slot is already occupied (window 2), the drain goroutine's shutdown
+// hand-off (shutdownFlushHandoff) must NOT block on the full slot. It abandons
+// the pending window, closes jobs, and returns promptly; the worker then exits
+// cleanly once its in-flight commit completes and the channel is drained. The
+// abandoned window is never committed.
+//
+// Against the old blocking hand-off (jobs <- j) this would block for up to a
+// full per-block commit deadline, so this test times out RED before the fix.
+func TestPipeline_PromptShutdown_AbandonsPendingWindow(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	spy := &pipelineSpyBlockValidation{
+		gate:    make(chan struct{}),
+		entered: make(chan uint32, 4),
+	}
+	sm := newAckTestSyncManager(t, spy)
+
+	jobs := make(chan windowFlushJob, 1)
+
+	workerDone := make(chan struct{})
+	go func() {
+		sm.flushWorker(sm.ctx, jobs)
+		close(workerDone)
+	}()
+
+	// Window 1 -> worker picks it up and blocks mid-commit on the gate.
+	jobs <- buildWindowJob(t, 500, 2)
+	select {
+	case first := <-spy.entered:
+		require.Equal(t, uint32(500), first, "worker must be mid-commit on window 1")
+	case <-time.After(pipelineTestTimeout):
+		t.Fatal("worker did not enter window 1 commit")
+	}
+
+	// Window 2 -> occupies the single buffered slot. The slot is now FULL while
+	// the worker is still committing window 1.
+	jobs <- buildWindowJob(t, 600, 2)
+
+	// A pending window 3 sits in the accumulator at shutdown time. The slot is
+	// full and the worker is busy, so the hand-off must abandon it, not block.
+	wa := newWindowAccumulator(1<<40, 20)
+	wa.add(newMinimalModelBlock(t, 700))
+	wa.add(newMinimalModelBlock(t, 701))
+
+	// Drive the REAL production shutdown path and assert it returns PROMPTLY
+	// (does not block on the full slot for the per-block commit deadline).
+	handoffReturned := make(chan struct{})
+	go func() {
+		sm.shutdownFlushHandoff(wa, jobs)
+		close(handoffReturned)
+	}()
+
+	select {
+	case <-handoffReturned:
+		// prompt: the hand-off abandoned the pending window instead of blocking.
+	case <-time.After(pipelineTestTimeout):
+		t.Fatal("shutdown hand-off blocked on the full worker slot (not prompt)")
+	}
+
+	// The pending window 3 was abandoned (dropped), so the accumulator drained it.
+	require.True(t, wa.empty(), "shutdown hand-off must drain the pending window from the accumulator")
+
+	// Let the worker finish window 1 and then commit the already-queued window 2,
+	// then exit on the (now closed) channel. No panic on send-after-close because
+	// only the drain path closes jobs and it has already returned.
+	spy.gate <- struct{}{} // release window 1
+	spy.gate <- struct{}{} // release window 2
+
+	select {
+	case <-workerDone:
+	case <-time.After(pipelineTestTimeout):
+		t.Fatal("worker did not exit cleanly after in-flight commit + channel close")
+	}
+
+	// Windows 1 and 2 were already in the pipeline and commit normally; the
+	// ABANDONED window 3 must never be committed.
+	committed := spy.committedOrder()
+	require.NotContains(t, committed, uint32(700),
+		"abandoned pending window must never be committed (it is re-synced on restart)")
+
+	require.Eventually(t, func() bool {
+		return runtime.NumGoroutine() <= before+1
+	}, pipelineTestTimeout, 10*time.Millisecond, "worker goroutine leaked after prompt shutdown")
 }
 
 // TestPipeline_FlagOff_SynchronousFlush proves the pipeline sub-flag default
