@@ -39,6 +39,11 @@ type Interface interface {
 	// blockID is the pre-assigned block ID from the caller (0 = not pre-assigned, blockchain will auto-assign).
 	ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32) error
 
+	// ProcessBlockWindow processes a window of K below-checkpoint blocks via the three-fence phased pipeline
+	// (C1 parallel creates → C2 parallel spends → C3 serial commits in ascending height order).
+	// blocks must be sorted ascending by height; all must be below the hardcoded checkpoint and outpoint-only eligible.
+	ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error
+
 	// ValidateBlock validates a block using the provided request, but does not update any state or database tables.
 	// This is useful for validating blocks without committing them to the database.
 	// The options parameter allows control over validation behavior, including revalidation of invalid blocks.
@@ -65,6 +70,10 @@ func (mv *MockBlockValidation) BlockFound(ctx context.Context, blockHash *chainh
 }
 
 func (mv *MockBlockValidation) ProcessBlock(ctx context.Context, block *model.Block, blockHeight uint32, peerID, baseURL string, blockID uint32) error {
+	return nil
+}
+
+func (mv *MockBlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
 	return nil
 }
 

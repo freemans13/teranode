@@ -4787,6 +4787,10 @@ func (m *mockBlockValidationClient) GetCatchupStatus(ctx context.Context) (*bloc
 	return &blockvalidation.CatchupStatus{IsCatchingUp: false}, nil
 }
 
+func (m *mockBlockValidationClient) ProcessBlockWindow(_ context.Context, _ []*model.Block, _, _ string) error {
+	return nil
+}
+
 // TestHandleFreezeComprehensive tests the handleFreeze handler
 func TestHandleFreezeComprehensive(t *testing.T) {
 	logger := mocklogger.NewTestLogger()

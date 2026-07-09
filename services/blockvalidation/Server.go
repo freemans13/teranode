@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1331,6 +1332,65 @@ func (u *Server) ProcessBlock(ctx context.Context, request *blockvalidation_api.
 
 	if err = u.processBlockFound(ctx, block.Header.Hash(), request.PeerId, baseURL, block); err != nil {
 		// error from processBlockFound is already wrapped
+		return nil, errors.WrapGRPC(err)
+	}
+
+	return &blockvalidation_api.EmptyMessage{}, nil
+}
+
+// ProcessBlockWindow handles concurrent processing of a window of K below-checkpoint
+// blocks via the three-fence phased pipeline (C1 parallel creates → C2 parallel
+// spends → C3 serial commits). It deserialises each block from the request's index-
+// aligned arrays (block[i], height[i], block_id[i]), sorts them ascending by height,
+// then delegates to the BlockValidation engine.
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - request: Index-aligned arrays of block bytes, heights, and block IDs; peer_id and base_url
+//
+// Returns an EmptyMessage on success or an error if any phase fails.
+func (u *Server) ProcessBlockWindow(ctx context.Context, request *blockvalidation_api.ProcessBlockWindowRequest) (*blockvalidation_api.EmptyMessage, error) {
+	blockBytes := request.GetBlock()
+	heights := request.GetHeight()
+	blockIDs := request.GetBlockId()
+
+	if len(blockBytes) == 0 {
+		return &blockvalidation_api.EmptyMessage{}, nil
+	}
+
+	if len(heights) != len(blockBytes) || len(blockIDs) != len(blockBytes) {
+		return nil, errors.WrapGRPC(errors.NewProcessingError(
+			"[ProcessBlockWindow] mismatched array lengths: blocks=%d heights=%d block_ids=%d",
+			len(blockBytes), len(heights), len(blockIDs),
+		))
+	}
+
+	blocks := make([]*model.Block, len(blockBytes))
+	for i, b := range blockBytes {
+		blk, err := model.NewBlockFromBytes(b)
+		if err != nil {
+			return nil, errors.WrapGRPC(errors.NewProcessingError("[ProcessBlockWindow] failed to deserialise block %d", i, err))
+		}
+		blk.Height = heights[i]
+		if blockIDs[i] != 0 {
+			blk.ID = blockIDs[i]
+		}
+		blocks[i] = blk
+	}
+
+	// Sort ascending by height — the engine requires this order for C3 serial commits.
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Height < blocks[j].Height })
+
+	baseURL := request.GetBaseUrl()
+	if baseURL == "" {
+		baseURL = "legacy"
+	}
+
+	if err := util.ValidateURL(baseURL); err != nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("invalid base URL", err))
+	}
+
+	if err := u.blockValidation.ProcessBlockWindow(ctx, blocks, request.GetPeerId()); err != nil {
 		return nil, errors.WrapGRPC(err)
 	}
 

@@ -11,6 +11,7 @@ service BlockValidationAPI {
   rpc HealthGRPC (EmptyMessage) returns (HealthResponse) {}
   rpc BlockFound (BlockFoundRequest) returns (EmptyMessage) {}
   rpc ProcessBlock (ProcessBlockRequest) returns (EmptyMessage) {}
+  rpc ProcessBlockWindow (ProcessBlockWindowRequest) returns (EmptyMessage) {}
   rpc ValidateBlock (ValidateBlockRequest) returns (ValidateBlockResponse) {}
   rpc RevalidateBlock (RevalidateBlockRequest) returns (EmptyMessage) {}
   rpc GetCatchupStatus (EmptyMessage) returns (CatchupStatusResponse) {}
@@ -54,6 +55,17 @@ message ValidateBlockRequest {
 message ValidateBlockResponse {
   bool ok = 1;
   string message = 2;
+}
+
+// swagger:model ProcessBlockWindowRequest
+message ProcessBlockWindowRequest {
+  // block[i], height[i], and block_id[i] describe the i-th block in the window.
+  // All three repeated arrays must have the same length.
+  repeated bytes block = 1;
+  repeated uint32 height = 2;
+  repeated uint32 block_id = 3; // Pre-assigned block IDs (0 = not pre-assigned)
+  string peer_id = 4; // P2P peer identifier for peer tracking via P2P service
+  string base_url = 5; // Peer base URL; defaults to "legacy" if empty
 }
 
 // swagger:model RevalidateBlockRequest

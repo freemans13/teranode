@@ -186,6 +186,50 @@ func (s *Client) ProcessBlock(ctx context.Context, block *model.Block, blockHeig
 	return nil
 }
 
+// ProcessBlockWindow submits a window of K below-checkpoint blocks for concurrent
+// processing via the three-fence phased pipeline (C1 parallel creates → C2 parallel
+// spends → C3 serial commits). The blocks slice must be sorted ascending by height
+// and all blocks must be below the hardcoded checkpoint with outpoint-only eligibility.
+//
+// Parameters:
+//   - ctx: Context for the processing operation
+//   - blocks: Slice of blocks to process; must be ascending by height
+//   - peerID: P2P peer identifier for peer tracking
+//   - baseURL: Peer base URL; pass empty string for the "legacy" default
+//
+// Returns an error if window processing fails (including partial-commit errors that
+// name the last successfully committed height).
+func (s *Client) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
+	blockSlices := make([][]byte, len(blocks))
+	heights := make([]uint32, len(blocks))
+	blockIDs := make([]uint32, len(blocks))
+
+	for i, blk := range blocks {
+		b, err := blk.Bytes()
+		if err != nil {
+			return err
+		}
+		blockSlices[i] = b
+		heights[i] = blk.Height
+		blockIDs[i] = blk.ID
+	}
+
+	req := &blockvalidation_api.ProcessBlockWindowRequest{
+		Block:   blockSlices,
+		Height:  heights,
+		BlockId: blockIDs,
+		PeerId:  peerID,
+		BaseUrl: baseURL,
+	}
+
+	_, err := s.apiClient.ProcessBlockWindow(ctx, req)
+	if err != nil {
+		return errors.UnwrapGRPC(err)
+	}
+
+	return nil
+}
+
 // ValidateBlock performs comprehensive validation of a block using the validation service.
 // It submits the complete block data for validation including transaction verification,
 // consensus rule checking, and integration with the current blockchain state.

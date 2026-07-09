@@ -45,6 +45,12 @@ func (m *Mock) ProcessBlock(ctx context.Context, block *model.Block, blockHeight
 	return args.Error(0)
 }
 
+// ProcessBlockWindow performs a mock window processing of K blocks.
+func (m *Mock) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
+	args := m.Called(ctx, blocks, peerID, baseURL)
+	return args.Error(0)
+}
+
 // ValidateBlock performs a mock block validation.
 func (m *Mock) ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error {
 	args := m.Called(ctx, block, options)
