@@ -374,6 +374,11 @@ func buildMinimalSpendTx(spendingTxHash chainhash.Hash, inputs []windowSpend) *b
 //
 // blocks must be sorted ascending by Height and all below the highest hardcoded
 // checkpoint with outpointOnly eligibility. An empty slice is a no-op.
+//
+// Coinbase-only (0-subtree) blocks: a block with no subtrees has no UTXOs to
+// create and no spends to record. Such a block skips createBlockUTXOs entirely
+// in C1 — it only assigns its block ID idempotently (mirroring quickValidateBlock's
+// no-subtree path) — records no spends (C2 no-op), and commits ZERO subtrees in C3.
 func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID string) error {
 	if len(blocks) == 0 {
 		return nil
@@ -415,6 +420,25 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		blockIdx := i
 		blk := blocks[i]
 		c1g.Go(func() error {
+			// Coinbase-only (0-subtree) blocks have no UTXOs to create and no spends
+			// to record. Mirror quickValidateBlock's no-subtree path exactly: assign
+			// the block ID idempotently (AssignBlockID is concurrency-safe) and commit
+			// ZERO subtrees in C3 — no synthesised placeholder subtree. This matches
+			// every coinbase-only block already on disk (common on early testnet/mainnet).
+			// The I4 checkpoint guard is enforced for ALL blocks by the pre-C1 gate above.
+			if len(blk.Subtrees) == 0 {
+				id, err := u.blockchainClient.AssignBlockID(c1ctx, blk.Hash())
+				if err != nil {
+					return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] failed to assign block ID for coinbase-only block", blk.Hash().String(), err)
+				}
+				blk.ID, err = blockIDToUint32(id, blk.Hash().String())
+				if err != nil {
+					return err
+				}
+				// No spends recorded → C2 spendBlockUTXOs is a no-op for this block.
+				return nil
+			}
+
 			ws, err := u.createBlockUTXOs(c1ctx, blk, true /* outpointOnly */)
 			if err != nil {
 				return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)

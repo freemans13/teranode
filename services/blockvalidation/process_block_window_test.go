@@ -20,8 +20,8 @@ package blockvalidation
 //     asserts strictly ascending order for all K commits.
 //
 //  4. FAIL-CLOSED — (a) window with an above-checkpoint block rejected before any
-//     creates run; (b) C1 hard-fail (block with no subtrees) aborts before any C3
-//     commit (AddBlock never called).
+//     creates run; (b) C1 hard-fail (block with a subtree whose file is missing)
+//     aborts before any C3 commit (AddBlock never called).
 
 import (
 	"context"
@@ -725,7 +725,7 @@ func (s *addBlockCountSpy) AddBlock(ctx context.Context, block *model.Block, pee
 // TestProcessBlockWindow_FailClosed verifies:
 //
 // (a) A window with any above-checkpoint block is rejected before any creates.
-// (b) A C1 hard-fail (block with no subtrees) aborts before C3 (no AddBlock call).
+// (b) A C1 hard-fail (block with a subtree whose file is missing) aborts before C3 (no AddBlock call).
 func TestProcessBlockWindow_FailClosed(t *testing.T) {
 	t.Run("above-checkpoint block rejected before creates", func(t *testing.T) {
 		bv, ctx, cancel := newProcessWindowHarness(t, "failclosed_above")
@@ -792,17 +792,22 @@ func TestProcessBlockWindow_FailClosed(t *testing.T) {
 		nBits, err := model.NewNBitFromString("207fffff")
 		require.NoError(t, err)
 
-		var ph, zeroMerkle chainhash.Hash
-		// Block with no subtrees → createBlockUTXOs returns "block has no subtrees" error.
+		var ph, zeroMerkle, missingSubtree chainhash.Hash
+		missingSubtree[0] = 0xAB // subtree file that does not exist in the (empty) subtree store
+		// Block WITH a subtree whose file is absent → createBlockUTXOs fails in its
+		// prefetch stage (a genuine C1 hard-fail). A 0-subtree block no longer fails
+		// C1 (it commits like quickValidateBlock), so this test uses a missing-subtree
+		// block to exercise the C1→C3 abort path.
 		badBlock := &model.Block{
 			Header: &model.BlockHeader{
 				Version: 1, HashPrevBlock: &ph,
 				HashMerkleRoot: &zeroMerkle,
 				Timestamp:      1_000_000, Bits: *nBits,
 			},
-			Height:     100,
-			CoinbaseTx: bt.NewTx(),
-			Subtrees:   nil, // empty subtrees → createBlockUTXOs returns error
+			Height:           100,
+			CoinbaseTx:       bt.NewTx(),
+			Subtrees:         []*chainhash.Hash{&missingSubtree}, // subtree file absent → C1 prefetch error
+			TransactionCount: 2,
 		}
 
 		err = bv.ProcessBlockWindow(ctx, []*model.Block{badBlock}, "fail-closed-peer")
