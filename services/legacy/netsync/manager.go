@@ -1731,7 +1731,7 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	// Eligible for window: prepare the block synchronously on the drain goroutine
 	// (prepareBlockForWindow does not mutate any SyncManager state that isn't
 	// read-only after startup).
-	prepared, prepErr := sm.prepareBlockForWindow(sm.ctx, peer, bmsg.blockHash, msgBlock)
+	prepared, prepErr := sm.prepareBlockForWindow(sm.ctx, peer, bmsg.blockHash, msgBlock, blockHeightUint32)
 	if prepErr != nil {
 		if errors.Is(prepErr, context.Canceled) || errors.IsContextError(prepErr) {
 			return false, nil

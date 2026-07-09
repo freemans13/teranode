@@ -267,16 +267,23 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 // for submission to ProcessBlockWindow. Safe to call concurrently — it does not
 // touch any SyncManager state that isn't read-only after startup.
 //
+// A freshly-wrapped bsvutil.Block from a raw wire.MsgBlock has height -1 (the
+// wire message carries no height field), so the caller must derive the height
+// and pass it in via blockHeight; we stamp it onto the wrapper here so that
+// prepareSubtrees (which reads block.Height()) sees the correct value too.
+//
 // The caller is responsible for:
-//   - setting block height before calling (via bsvutil.Block.SetHeight)
+//   - deriving the block height and passing it as blockHeight
 //   - only calling when legacyUnified(height) is true
-func (sm *SyncManager) prepareBlockForWindow(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, msgBlock *wire.MsgBlock) (*model.Block, error) {
+func (sm *SyncManager) prepareBlockForWindow(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, msgBlock *wire.MsgBlock, blockHeight uint32) (*model.Block, error) {
 	block := bsvutil.NewBlock(msgBlock)
 
-	blockHeight, err := safeconversion.Int32ToUint32(block.Height())
+	blockHeightInt32, err := safeconversion.Uint32ToInt32(blockHeight)
 	if err != nil {
 		return nil, errors.NewProcessingError("[prepareBlockForWindow][%s] failed to convert block height", blockHash.String(), err)
 	}
+
+	block.SetHeight(blockHeightInt32)
 
 	// Serialize the block header into a Teranode-compatible model.
 	var headerBytes bytes.Buffer
