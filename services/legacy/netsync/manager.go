@@ -1625,10 +1625,10 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 // instead of calling HandleBlockDirect.
 //
 // Returns (addedToWindow bool, err error).
-// When addedToWindow=true the caller must NOT send a reply yet — the
-// windowAccumulator owns the reply channel and sends it on flush.
+// When addedToWindow=true the block was added to the window; the caller (the
+// drain goroutine) sends the accept-time ack via ackWindowedBlock.
 // When addedToWindow=false the block was processed directly (or failed); err
-// carries the outcome.
+// carries the outcome and the caller sends it as the reply.
 //
 // Post-processing (peer height update, FSM RUN, header pipeline advance) only
 // runs on the direct path (addedToWindow=false) because ProcessBlockWindow
@@ -1746,7 +1746,7 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		return false, prepErr
 	}
 
-	wa.add(prepared, bmsg.reply)
+	wa.add(prepared)
 
 	// Advance the headers-first pipeline pump for every windowed block.
 	// The peer-height-update and FSM-RUN blocks are intentionally omitted here:
@@ -2379,12 +2379,12 @@ type blockQueueMsg struct {
 	reply       chan error
 }
 
-// windowEntry holds a prepared block ready for ProcessBlockWindow along with
-// the reply channel from the original queue message (so the drain loop can
-// surface any error back to the caller after the batch completes).
+// windowEntry holds a prepared block ready for ProcessBlockWindow. The
+// accumulator no longer owns the peer's reply channel: the drain goroutine
+// sends every windowed block's ack at accept-time (see ackWindowedBlock), so
+// flush never touches a reply.
 type windowEntry struct {
 	block *model.Block
-	reply chan error
 }
 
 // windowAccumulator is a drain-goroutine-local accumulator for the
@@ -2407,8 +2407,8 @@ func newWindowAccumulator(windowBudget int64, maxBlocks int) *windowAccumulator 
 }
 
 // add appends a prepared block to the window and tracks its byte size.
-func (wa *windowAccumulator) add(block *model.Block, reply chan error) {
-	wa.entries = append(wa.entries, windowEntry{block: block, reply: reply})
+func (wa *windowAccumulator) add(block *model.Block) {
+	wa.entries = append(wa.entries, windowEntry{block: block})
 	wa.bytesAccum += int64(block.SizeInBytes) //nolint:gosec
 }
 
@@ -2422,15 +2422,17 @@ func (wa *windowAccumulator) empty() bool {
 	return len(wa.entries) == 0
 }
 
-// flush submits all accumulated blocks to ProcessBlockWindow and sends
-// replies. On error it falls back to per-block ProcessBlock for every entry
-// (creates are idempotent so re-processing committed blocks is safe).
-// The fallback loop processes entries in ascending height order so that each
-// AddBlock call can locate its parent without a height-ordering mismatch.
+// flush submits all accumulated blocks to ProcessBlockWindow. On error it
+// falls back to per-block ProcessBlock for every entry (creates are idempotent
+// so re-processing committed blocks is safe). The fallback loop processes
+// entries in ascending height order so that each AddBlock call can locate its
+// parent without a height-ordering mismatch.
 // ProcessBlockWindow is called under a context deadline: PeerProcessingTimeout
 // scaled by the batch size (min 3 minutes) so a hung call cannot block the
-// drain goroutine indefinitely.  Each peer's reply channel is always sent,
-// even on timeout, to prevent the peer from wedging.
+// drain goroutine indefinitely.
+// flush never acks: the drain goroutine sends every windowed block's reply at
+// accept-time (see ackWindowedBlock), so flush only commits and, on error,
+// runs the idempotent per-block fallback.
 func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 	if wa.empty() {
 		return
@@ -2468,26 +2470,57 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 
 	err := sm.blockValidation.ProcessBlockWindow(flushCtx, blocks, "", "legacy")
 	if err == nil {
-		// Success: ack all replies nil.
-		for _, e := range entries {
-			if e.reply != nil {
-				e.reply <- nil
-			}
-		}
-
+		// Success: acks were already sent at accept-time, nothing to do here.
 		return
 	}
 
 	// On any error from ProcessBlockWindow, fall back to per-block ProcessBlock
 	// for all entries (creates are idempotent so re-processing committed blocks is safe).
+	// The peer was already acked at accept-time, so the fallback never touches a
+	// reply channel; it only re-drives the commit for each block idempotently.
 	sm.logger.Warnf("[windowAccumulator] ProcessBlockWindow error, falling back to per-block: %v", err)
 
 	for _, e := range entries {
-		fallbackErr := sm.ProcessBlock(ctx, e.block)
-		if e.reply != nil {
-			e.reply <- fallbackErr
+		if fallbackErr := sm.ProcessBlock(ctx, e.block); fallbackErr != nil {
+			sm.logger.Warnf("[windowAccumulator] per-block fallback failed for height %d: %v", e.block.Height, fallbackErr)
 		}
 	}
+}
+
+// ackWindowedBlock sends the accept-time ack for a block that has just been
+// added to the window, applying withhold-on-full back-pressure. It runs on the
+// single drain goroutine after wa.add.
+//
+//   - Not full: ack immediately (release the peer to stream the next block) and
+//     arm/re-arm the flush timer. The window keeps filling.
+//   - Full: flush FIRST (commit the batch while the peer is still parked on this
+//     block's ack — this is the back-pressure), THEN ack, THEN stop the timer.
+//     Acking before the flush would drop the back-pressure and let the peer race
+//     ahead of the commit.
+//
+// The timer manipulation is delegated to the caller's closures so the timer
+// state stays owned by the drain goroutine.
+func (sm *SyncManager) ackWindowedBlock(reply chan error, wa *windowAccumulator, flushWindow, armTimer, stopTimer func()) {
+	if wa.full() {
+		sm.logger.Debugf("[blockHandler] window budget exhausted, flushing before ack (back-pressure)")
+		flushWindow()
+
+		if reply != nil {
+			reply <- nil
+		}
+
+		stopTimer()
+
+		return
+	}
+
+	// Not full: early-ack releases the peer to stream the next block so the
+	// window can keep filling, then arm the flush timer.
+	if reply != nil {
+		reply <- nil
+	}
+
+	armTimer()
 }
 
 // effectiveGOMEMLIMIT reads the current GOMEMLIMIT without modifying it.
@@ -2512,6 +2545,11 @@ func windowBudgetBytes(fraction float64) int64 {
 
 	return int64(float64(effectiveGOMEMLIMIT()) * fraction)
 }
+
+// windowFlushTimerInterval is the idle timeout after which a partially-filled
+// window is flushed. It bounds how long the last few blocks of a window wait
+// for a budget-filling block that never arrives (e.g. at the tail of a sync).
+const windowFlushTimerInterval = 200 * time.Millisecond
 
 // blockHandler is the main handler for the sync manager.  It must be run as a
 // goroutine.  It processes block and inv messages in a separate goroutine
@@ -2550,7 +2588,7 @@ func (sm *SyncManager) blockHandler() {
 			budget := windowBudgetBytes(windowFraction)
 			maxBlocks := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
 			wa = newWindowAccumulator(budget, maxBlocks)
-			flushTimer = time.NewTimer(200 * time.Millisecond)
+			flushTimer = time.NewTimer(windowFlushTimerInterval)
 			flushTimer.Stop() // don't fire until we have blocks
 		}
 
@@ -2559,6 +2597,30 @@ func (sm *SyncManager) blockHandler() {
 				wa.flush(sm.ctx, sm)
 			}
 
+			if flushTimer != nil {
+				flushTimer.Stop()
+			}
+		}
+
+		// armTimer (re-)starts the idle flush timer using the stop-drain-reset
+		// idiom: Stop returns false when the timer has already fired, in which
+		// case the channel may hold a value that must be drained before Reset —
+		// otherwise the select picks up a stale expiry and triggers a spurious
+		// empty flush on the next iteration.
+		armTimer := func() {
+			if flushTimer != nil {
+				if !flushTimer.Stop() {
+					select {
+					case <-flushTimer.C:
+					default:
+					}
+				}
+
+				flushTimer.Reset(windowFlushTimerInterval)
+			}
+		}
+
+		stopTimer := func() {
 			if flushTimer != nil {
 				flushTimer.Stop()
 			}
@@ -2595,11 +2657,10 @@ func (sm *SyncManager) blockHandler() {
 				added, err := sm.handleBlockMsgWithWindow(msg, wa)
 				if !added {
 					// Block was processed directly (or failed).
+					// handleBlockMsgWithWindow does not send the reply on the
+					// direct path — we send the outcome here.
 					sm.blockBacklog.Add(-1)
-					// reply was already sent by handleBlockMsgWithWindow for the
-					// error path; for the success path send nil.
-					// Actually handleBlockMsgWithWindow does NOT send the reply
-					// for the direct path — we do it here.
+
 					if msg.reply != nil {
 						msg.reply <- err
 					}
@@ -2607,30 +2668,11 @@ func (sm *SyncManager) blockHandler() {
 					// Flush any pending window now that an ineligible block arrived.
 					flushWindow()
 				} else {
-					// Block was added to the window accumulator.
-					// The reply channel is now owned by the accumulator.
+					// Block was added to the window accumulator. Send the ack at
+					// accept-time (or, when the window is now full, after the
+					// full-flush commit — withhold-on-full back-pressure).
 					sm.blockBacklog.Add(-1)
-
-					// Arm (or re-arm) the flush timer with the correct stop-drain-reset
-					// idiom: Stop returns false when the timer has already fired, in
-					// which case the channel may hold a value that we must drain before
-					// Reset — otherwise the select picks up a stale expiry on the next
-					// iteration and triggers a spurious empty flush.
-					if flushTimer != nil {
-						if !flushTimer.Stop() {
-							select {
-							case <-flushTimer.C:
-							default:
-							}
-						}
-						flushTimer.Reset(200 * time.Millisecond)
-					}
-
-					// Flush if budget is exhausted.
-					if wa.full() {
-						sm.logger.Debugf("[blockHandler] window budget exhausted, flushing")
-						flushWindow()
-					}
+					sm.ackWindowedBlock(msg.reply, wa, flushWindow, armTimer, stopTimer)
 				}
 			}
 		}

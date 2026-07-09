@@ -101,7 +101,7 @@ func TestWindowAdmission_EligibilityGating(t *testing.T) {
 	require.True(t, wa.empty(), "accumulator must start empty")
 
 	// Add the below-checkpoint block (eligible).
-	wa.add(belowBlock, nil)
+	wa.add(belowBlock)
 	require.False(t, wa.empty(), "accumulator must hold the added block")
 
 	// Flush — submits the window to ProcessBlockWindow via the spy.
@@ -212,7 +212,7 @@ func TestWindowAdmission_CheckpointBlockBypassesWindow(t *testing.T) {
 	// Simulate the drain goroutine: add one eligible (non-checkpoint) block to the
 	// window first, so the window is non-empty when the checkpoint block arrives.
 	belowBlock := newMinimalModelBlock(t, belowBlockHeight)
-	wa.add(belowBlock, nil)
+	wa.add(belowBlock)
 	require.False(t, wa.empty(), "window must hold the pre-checkpoint eligible block")
 
 	// The checkpoint block is routed to the direct path (ineligible). In the real
