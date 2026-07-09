@@ -1804,6 +1804,19 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 
 	wa.add(prepared)
 
+	// Refresh the sync peer's last-block time on the accept path, mirroring the
+	// non-window path (handleBlockMsg -> HandleBlockDirect, see the same call in
+	// handleBlockMsg). Windowed blocks never reach that refresh, so without this
+	// lastBlockTime goes stale during a sustained window run even though blocks
+	// are being accepted and committed. When blockBacklog later drains to 0 the
+	// stall detector (handleCheckSyncPeer) would then see a large time-since-last-
+	// block and could falsely rotate a healthy sync peer. Only runs on the accept
+	// (addedToWindow=true) outcome; the ineligible/checkpoint/reject branches go
+	// through HandleBlockDirect, which already refreshes it.
+	if sps, ok := sm.syncPeerStateFor(peer); ok {
+		sps.updateLastBlockTime()
+	}
+
 	// Advance the headers-first pipeline pump for every windowed block.
 	// The peer-height-update and FSM-RUN blocks are intentionally omitted here:
 	// those are guarded by sm.current() and windowed blocks are all below the
