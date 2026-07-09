@@ -1723,13 +1723,24 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		// Not eligible for window — process directly using the full HandleBlockDirect flow.
 		// We already extracted prevBlockHash and cleared bmsg.block above.
 		//
-		// Flush the already-accumulated window prefix (heights N..N+k) BEFORE
-		// handling this block directly: HandleBlockDirect commits synchronously,
-		// so committing this ineligible/checkpoint block ahead of the pending
-		// prefix would leave a height gap in the committed chain. Flushing first
-		// keeps the committed chain contiguous and ascending. (The drain loop
-		// also flushes on the !added return, but that is too late — it runs
-		// after HandleBlockDirect has already committed.)
+		// In pipeline mode flushWindow() is a non-blocking hand-off to the flush
+		// worker, so the pending window commits asynchronously and this direct
+		// call to HandleBlockDirect may race it. That race is safe and cannot
+		// gap or reorder the committed chain. Windowed blocks commit only via
+		// ProcessBlockWindow→AddBlock/StoreBlock (a single atomic row in the
+		// blocks table; there is no header-ahead table), so a window block's row
+		// exists only after its full commit. If the in-flight window parent has
+		// not yet committed when HandleBlockDirect runs, its pre-flight
+		// GetBlockHeader(prev) (handle_block.go:71) queries that same blocks
+		// table and returns ErrBlockNotFound. NewProcessingError wraps it but
+		// preserves the inner code, so errors.Is(directErr, ErrBlockNotFound)
+		// is true. The ErrBlockNotFound branch immediately below then
+		// issues PushGetBlocksMsg and returns (false, nil) — no disconnect, no
+		// reject, tip not advanced — and the block is simply re-requested once
+		// the window has committed. The committed tip only ever advances via the
+		// FIFO worker's contiguous ascending commit sequence.
+		// (The drain loop also flushes on the !added return, but that is too
+		// late — it runs after HandleBlockDirect has already returned.)
 		flushWindow()
 
 		directErr := sm.HandleBlockDirect(sm.ctx, peer, bmsg.blockHash, msgBlock)
@@ -2659,7 +2670,11 @@ func (sm *SyncManager) shutdownFlushHandoff(wa *windowAccumulator, jobs chan win
 //
 // Consensus-critical: after a commitWindowJob escalates to a fatal disconnect,
 // the worker sets poisoned=true and thereafter DRAINS the remaining queued jobs
-// WITHOUT committing any of them. Because the worker is the only committer and
+// WITHOUT committing any of them. The worker is the only committer of windowed
+// blocks; ineligible/checkpoint blocks commit synchronously on the drain path
+// via HandleBlockDirect, and those two paths are reconciled fail-closed by
+// HandleBlockDirect's pre-flight GetBlockHeader(prev) → ErrBlockNotFound →
+// re-request as described in handleBlockMsgWithWindow above. Because the worker
 // processes strictly FIFO, this guarantees no later window is committed after a
 // gap (a committed gap would be a consensus bug). Only the drain goroutine ever
 // sends on or closes jobs.
