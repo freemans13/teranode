@@ -48,6 +48,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/batchermetrics"
+	"github.com/bsv-blockchain/teranode/util/blockassemblyutil"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
@@ -1653,7 +1654,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 // (the sync peer's LastBlock() far exceeds our best height); those branches
 // would also be skipped on the normal handleBlockMsg path for the same reason.
 // There is no behaviour divergence.
-func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator) (addedToWindow bool, err error) {
+func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator, flushWindow func()) (addedToWindow bool, err error) {
 	sm.logger.Debugf("[handleBlockMsgWithWindow][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 
 	peer, state, catchingBlocks, isCheckpointBlock, headerHeight, preambleErr := sm.handleBlockPreamble("handleBlockMsgWithWindow", bmsg)
@@ -1721,6 +1722,16 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	if !sm.legacyUnified(blockHeightUint32) || isCheckpointBlock {
 		// Not eligible for window — process directly using the full HandleBlockDirect flow.
 		// We already extracted prevBlockHash and cleared bmsg.block above.
+		//
+		// Flush the already-accumulated window prefix (heights N..N+k) BEFORE
+		// handling this block directly: HandleBlockDirect commits synchronously,
+		// so committing this ineligible/checkpoint block ahead of the pending
+		// prefix would leave a height gap in the committed chain. Flushing first
+		// keeps the committed chain contiguous and ascending. (The drain loop
+		// also flushes on the !added return, but that is too late — it runs
+		// after HandleBlockDirect has already committed.)
+		flushWindow()
+
 		directErr := sm.HandleBlockDirect(sm.ctx, peer, bmsg.blockHash, msgBlock)
 		if directErr != nil {
 			if errors.Is(directErr, errors.ErrBlockNotFound) {
@@ -1761,6 +1772,16 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 
 		sm.runPostBlockProcessing(peer, state, bmsg, isCheckpointBlock)
 		return false, nil
+	}
+
+	// Restore block-assembly back-pressure parity with HandleBlockDirect: stop
+	// netsync outrunning block assembly by more than MaxBlocksBehindBlockAssembly.
+	// The proven direct path waits here (handle_block.go); the window path had
+	// dropped it. Only the window-add path needs this — the direct/checkpoint
+	// branch above already goes through HandleBlockDirect, which waits itself.
+	// On error we return it (addedToWindow=false), matching HandleBlockDirect.
+	if waitErr := blockassemblyutil.WaitForBlockAssemblyReady(sm.ctx, sm.logger, sm.blockAssembly, blockHeightUint32, sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly); waitErr != nil {
+		return false, waitErr
 	}
 
 	// Eligible for window: prepare the block synchronously on the drain goroutine
@@ -2447,9 +2468,23 @@ func (wa *windowAccumulator) add(block *model.Block) {
 	wa.bytesAccum += int64(block.SizeInBytes) //nolint:gosec
 }
 
-// full reports whether the window has hit its byte budget.
+// full reports whether the window has hit either its byte budget or its
+// block-count cap. The block-count cap (maxBlocks, set from
+// MaxBlocksBehindBlockAssembly) bounds how far the window can run ahead of
+// block assembly regardless of block size: without it a stream of tiny blocks
+// could grow the window to thousands of entries before the byte budget fills.
+// A maxBlocks <= 0 disables the count cap (matching calculateWindowK), leaving
+// the byte budget as the sole limit.
 func (wa *windowAccumulator) full() bool {
-	return len(wa.entries) > 0 && wa.bytesAccum >= wa.windowBudget
+	if len(wa.entries) == 0 {
+		return false
+	}
+
+	if wa.bytesAccum >= wa.windowBudget {
+		return true
+	}
+
+	return wa.maxBlocks > 0 && len(wa.entries) >= wa.maxBlocks
 }
 
 // empty reports whether there are no blocks in the window.
@@ -2756,7 +2791,7 @@ func (sm *SyncManager) blockHandler() {
 				}
 
 				// Window path: call handleBlockMsgWithWindow.
-				added, err := sm.handleBlockMsgWithWindow(msg, wa)
+				added, err := sm.handleBlockMsgWithWindow(msg, wa, flushWindow)
 				if !added {
 					// Block was processed directly (or failed).
 					// handleBlockMsgWithWindow does not send the reply on the
