@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/url"
 	"runtime/debug"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1676,7 +1677,13 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	}
 
 	// Check window eligibility. An ineligible block is processed directly.
-	if !sm.legacyUnified(blockHeightUint32) {
+	// Checkpoint blocks are always ineligible: windowed blocks skip
+	// runPostBlockProcessing, which for a checkpoint block advances
+	// sm.nextCheckpoint, sends PushGetHeadersMsg, and clears headersFirstMode.
+	// Allowing a checkpoint block into the window would permanently stall the
+	// header pipeline.  Flush any pending window first (ordering/parent-
+	// availability guarantee) and then process the checkpoint normally.
+	if !sm.legacyUnified(blockHeightUint32) || isCheckpointBlock {
 		// Not eligible for window — process directly using the full HandleBlockDirect flow.
 		// We already extracted prevBlockHash and cleared bmsg.block above.
 		directErr := sm.HandleBlockDirect(sm.ctx, peer, bmsg.blockHash, msgBlock)
@@ -1721,8 +1728,9 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		return false, nil
 	}
 
-	// Eligible for window: prepare the block concurrently (safe — prepareBlockForWindow
-	// does not mutate any SyncManager state that isn't read-only after startup).
+	// Eligible for window: prepare the block synchronously on the drain goroutine
+	// (prepareBlockForWindow does not mutate any SyncManager state that isn't
+	// read-only after startup).
 	prepared, prepErr := sm.prepareBlockForWindow(sm.ctx, peer, bmsg.blockHash, msgBlock)
 	if prepErr != nil {
 		if errors.Is(prepErr, context.Canceled) || errors.IsContextError(prepErr) {
@@ -2415,9 +2423,14 @@ func (wa *windowAccumulator) empty() bool {
 }
 
 // flush submits all accumulated blocks to ProcessBlockWindow and sends
-// replies. On a partial-commit error that names the last committed height
-// h, it falls back to per-block ProcessBlock for blocks above h.
-// Creates from ProcessBlockWindow are idempotent so re-processing is safe.
+// replies. On error it falls back to per-block ProcessBlock for every entry
+// (creates are idempotent so re-processing committed blocks is safe).
+// The fallback loop processes entries in ascending height order so that each
+// AddBlock call can locate its parent without a height-ordering mismatch.
+// ProcessBlockWindow is called under a context deadline: PeerProcessingTimeout
+// scaled by the batch size (min 3 minutes) so a hung call cannot block the
+// drain goroutine indefinitely.  Each peer's reply channel is always sent,
+// even on timeout, to prevent the peer from wedging.
 func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 	if wa.empty() {
 		return
@@ -2427,6 +2440,13 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 	wa.entries = make([]windowEntry, 0, 8)
 	wa.bytesAccum = 0
 
+	// Sort entries ascending by block height before any processing so the
+	// per-block fallback loop can satisfy AddBlock's parent-availability
+	// requirement even if the window accumulated out-of-order arrivals.
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].block.Height < entries[j].block.Height
+	})
+
 	blocks := make([]*model.Block, len(entries))
 	for i, e := range entries {
 		blocks[i] = e.block
@@ -2434,7 +2454,19 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 
 	sm.logger.Debugf("[windowAccumulator] flushing window of %d blocks to ProcessBlockWindow", len(blocks))
 
-	err := sm.blockValidation.ProcessBlockWindow(ctx, blocks, "", "legacy")
+	// Derive a deadline from PeerProcessingTimeout × batch size so the single
+	// drain goroutine cannot be blocked indefinitely by a slow ProcessBlockWindow.
+	// The minimum is the raw PeerProcessingTimeout (covers a batch of one) and
+	// the parent ctx is also respected (e.g. sm.ctx cancellation on shutdown).
+	perBlock := sm.settings.Legacy.PeerProcessingTimeout
+	if perBlock <= 0 {
+		perBlock = 3 * time.Minute
+	}
+	deadline := perBlock * time.Duration(len(blocks)) //nolint:gosec
+	flushCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	err := sm.blockValidation.ProcessBlockWindow(flushCtx, blocks, "", "legacy")
 	if err == nil {
 		// Success: ack all replies nil.
 		for _, e := range entries {
@@ -2447,7 +2479,7 @@ func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
 	}
 
 	// On any error from ProcessBlockWindow, fall back to per-block ProcessBlock
-	// for all blocks (creates are idempotent so re-processing committed blocks is safe).
+	// for all entries (creates are idempotent so re-processing committed blocks is safe).
 	sm.logger.Warnf("[windowAccumulator] ProcessBlockWindow error, falling back to per-block: %v", err)
 
 	for _, e := range entries {
