@@ -260,6 +260,91 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	return nil
 }
 
+// prepareBlockForWindow runs the PREPARE phase for a below-checkpoint block:
+// partitions/builds txMap/extends/createSubtrees/writeSubtree files then checks
+// PoW (HasMetTargetDifficulty), merkle root, and CVE-2012-2459 dedup.
+// Returns a prepared *model.Block with block.ID=0 (server assigns it), ready
+// for submission to ProcessBlockWindow. Safe to call concurrently — it does not
+// touch any SyncManager state that isn't read-only after startup.
+//
+// The caller is responsible for:
+//   - setting block height before calling (via bsvutil.Block.SetHeight)
+//   - only calling when legacyUnified(height) is true
+func (sm *SyncManager) prepareBlockForWindow(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, msgBlock *wire.MsgBlock) (*model.Block, error) {
+	block := bsvutil.NewBlock(msgBlock)
+
+	blockHeight, err := safeconversion.Int32ToUint32(block.Height())
+	if err != nil {
+		return nil, errors.NewProcessingError("[prepareBlockForWindow][%s] failed to convert block height", blockHash.String(), err)
+	}
+
+	// Serialize the block header into a Teranode-compatible model.
+	var headerBytes bytes.Buffer
+	if err = block.MsgBlock().Header.Serialize(&headerBytes); err != nil {
+		return nil, errors.NewProcessingError("[prepareBlockForWindow][%s] failed to serialize header", blockHash.String(), err)
+	}
+
+	header, err := model.NewBlockHeaderFromBytes(headerBytes.Bytes())
+	if err != nil {
+		return nil, errors.NewProcessingError("[prepareBlockForWindow][%s] failed to create block header from bytes", blockHash.String(), err)
+	}
+
+	var coinbase bytes.Buffer
+	if err = block.Transactions()[0].MsgTx().Serialize(&coinbase); err != nil {
+		return nil, errors.NewProcessingError("[prepareBlockForWindow][%s] failed to serialize coinbase", blockHash.String(), err)
+	}
+
+	coinbaseTx, err := bt.NewTxFromBytes(coinbase.Bytes())
+	if err != nil {
+		return nil, errors.NewProcessingError("[prepareBlockForWindow][%s] failed to create bt.Tx for coinbase", blockHash.String(), err)
+	}
+
+	blockSize := block.MsgBlock().SerializeSize()
+
+	blockSizeUint64, err := safeconversion.IntToUint64(blockSize)
+	if err != nil {
+		return nil, err
+	}
+
+	txCount := uint64(len(block.Transactions()))
+
+	// prepareSubtrees partitions txs, builds txMap, extends, creates+writes subtree
+	// files, runs UTXO ops on non-unified paths (unified path defers to server).
+	// blockID is 0 on the unified path — server assigns it.
+	subtrees, preparedSubtreeSlices, blockID, err := sm.prepareSubtrees(ctx, block)
+	if err != nil {
+		return nil, err
+	}
+
+	teranodeBlock, err := model.NewBlock(header, coinbaseTx, subtrees, txCount, blockSizeUint64, blockHeight, blockID)
+	if err != nil {
+		return nil, errors.NewProcessingError("[prepareBlockForWindow][%s] failed to create model.NewBlock", blockHash.String(), err)
+	}
+
+	// Precondition 1: PoW check (HasMetTargetDifficulty).
+	headerValid, _, err := teranodeBlock.Header.HasMetTargetDifficulty()
+	if !headerValid {
+		return nil, errors.NewBlockInvalidError("[prepareBlockForWindow][%s] invalid block header PoW", blockHash.String(), err)
+	}
+
+	// Preconditions 2+3: merkle root + CVE-2012-2459 dedup.
+	// These must run while SubtreeSlices is still populated.
+	if preparedSubtreeSlices != nil {
+		teranodeBlock.SubtreeSlices = preparedSubtreeSlices
+		if err = teranodeBlock.CheckMerkleRoot(ctx); err != nil {
+			return nil, errors.NewBlockInvalidError("[prepareBlockForWindow][%s %d] merkle root mismatch", blockHash.String(), blockHeight, err)
+		}
+		if err = model.CheckSubtreeSlicesForDuplicateTxs(preparedSubtreeSlices); err != nil {
+			return nil, errors.NewBlockInvalidError("[prepareBlockForWindow][%s %d] duplicate transaction in block", blockHash.String(), blockHeight, err)
+		}
+		teranodeBlock.SubtreeSlices = nil
+	}
+
+	sm.logger.Debugf("[prepareBlockForWindow][%s %d] prepare complete, peer %s", blockHash.String(), blockHeight, peer.String())
+
+	return teranodeBlock, nil
+}
+
 // waitForPreviousBlockMined waits for the previous block to have mined_set=true.
 // This ensures setTxMined has completed for the previous block before we validate
 // the next block's transactions, which is critical for BIP68 sequence lock validation

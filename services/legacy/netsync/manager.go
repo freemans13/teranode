@@ -12,9 +12,11 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/url"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -367,6 +369,28 @@ func (bst *blockSizeTracker) calculateMaxInFlightBlocks() int {
 	default:
 		return 20 // small blocks: default aggressive
 	}
+}
+
+// calculateWindowK returns the number of blocks to admit in one window batch.
+// windowBudget is derived from effectiveGOMEMLIMIT × fraction.
+// Admit-one floor: result is always >= 1.
+// Clamped to maxBlocks (MaxBlocksBehindBlockAssembly).
+func (bst *blockSizeTracker) calculateWindowK(windowBudget int64, maxBlocks int) int {
+	avg := bst.getAverageSize()
+	if avg <= 0 {
+		return 1
+	}
+
+	k := int(windowBudget / avg)
+	if k < 1 {
+		k = 1
+	}
+
+	if maxBlocks > 0 && k > maxBlocks {
+		k = maxBlocks
+	}
+
+	return k
 }
 
 // SyncManager is used to communicate block related messages with peers. The
@@ -1264,38 +1288,51 @@ func (sm *SyncManager) current() bool {
 	return true
 }
 
-// handleBlockMsg handles block messages from all peers.
-func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
-	sm.logger.Debugf("[handleBlockMsg][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
-	peer := bmsg.peer
+// handleBlockPreamble is the shared serial preamble that BOTH handleBlockMsg
+// and handleBlockMsgWithWindow run before any block-processing work.
+//
+// It must execute on the single blockHandler drain goroutine. All state it
+// touches (peerStates, headerList, requestedBlocks, blockSizeTracker,
+// startHeader) is drain-goroutine-only; the only atomic load is
+// headersFirstMode (safe from any goroutine).
+//
+// On success it returns the resolved peer, its peerSyncState, the
+// catchingBlocks flag, and the isCheckpointBlock flag.
+// On failure it returns a non-nil error; the caller must propagate it.
+func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
+	resolvedPeer *peerpkg.Peer,
+	state *peerSyncState,
+	catchingBlocks bool,
+	isCheckpointBlock bool,
+	err error,
+) {
+	resolvedPeer = bmsg.peer
 
-	state, exists := sm.peerStates.Get(peer)
+	state, exists := sm.peerStates.Get(resolvedPeer)
 	if !exists {
 		// Stream peers (e.g. BlockPriority) are not registered in peerStates
 		// directly - look up via their association's primary peer instead.
-		if assoc := peer.AssociationRef(); assoc != nil {
+		if assoc := resolvedPeer.AssociationRef(); assoc != nil {
 			primary := assoc.PrimaryPeer()
 			if primary != nil {
 				state, exists = sm.peerStates.Get(primary)
 				if exists {
-					sm.logger.Debugf("[handleBlockMsg][%s] resolved stream peer %s to primary peer %s", bmsg.blockHash, peer, primary)
-					peer = primary
+					sm.logger.Debugf("[%s][%s] resolved stream peer %s to primary peer %s", caller, bmsg.blockHash, resolvedPeer, primary)
+					resolvedPeer = primary
 				}
 			}
 		}
 		if !exists {
-			sm.logger.Errorf("[handleBlockMsg][%s] Received block message from unknown peer %s", bmsg.blockHash, peer)
-			return errors.NewServiceError("[handleBlockMsg] Received block message from unknown peer %s", peer)
+			sm.logger.Errorf("[%s][%s] Received block message from unknown peer %s", caller, bmsg.blockHash, resolvedPeer)
+			err = errors.NewServiceError("[%s] Received block message from unknown peer %s", caller, resolvedPeer)
+			return
 		}
 	}
 
-	catchingBlocks := false
-
-	sm.logger.Debugf("[handleBlockMsg][%s] checking current FSM state", bmsg.blockHash)
-
-	fsmState, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
-	if err != nil {
-		return errors.NewProcessingError("[handleBlockMsg] failed to get current FSM state", err)
+	fsmState, fsmErr := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
+	if fsmErr != nil {
+		err = errors.NewProcessingError("[%s] failed to get current FSM state", caller, fsmErr)
+		return
 	}
 
 	if fsmState != nil && *fsmState == teranodeblockchain.FSMStateCATCHINGBLOCKS {
@@ -1303,7 +1340,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	}
 
 	// If we didn't ask for this block then the peer is misbehaving.
-	if _, exists = state.requestedBlocks.Get(bmsg.blockHash); !exists {
+	if _, reqExists := state.requestedBlocks.Get(bmsg.blockHash); !reqExists {
 		// The regression test intentionally sends some blocks twice
 		// to test duplicate block insertion fails.  Don't disconnect
 		// the peer or ignore the block when we're in regression test
@@ -1311,9 +1348,9 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		// duplicate blocks.
 		if sm.chainParams != &chaincfg.RegressionNetParams {
 			reason := fmt.Sprintf("Got unrequested block %v", bmsg.blockHash)
-			peer.DisconnectWithWarning(reason)
-
-			return errors.NewServiceError("Got unrequested block %v", bmsg.blockHash)
+			resolvedPeer.DisconnectWithWarning(reason)
+			err = errors.NewServiceError("Got unrequested block %v", bmsg.blockHash)
+			return
 		}
 	}
 
@@ -1324,11 +1361,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// Also, remove the list entry for all blocks except the checkpoint
 	// since it is needed to verify the next round of headers links
 	// properly.
-	isCheckpointBlock := false
-
 	if sm.headersFirstMode.Load() {
-		sm.logger.Debugf("[handleBlockMsg][%s] headers-first mode, checking block", bmsg.blockHash)
-
 		firstNodeEl := sm.headerList.Front()
 		if firstNodeEl != nil {
 			firstNode := firstNodeEl.Value.(*headerNode)
@@ -1358,8 +1391,20 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 
 		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 		avgSize := sm.blockSizeTracker.getAverageSize()
-		sm.logger.Debugf("[handleBlockMsg][%s] Block size: %d bytes, avg: %d bytes, dynamic max in-flight: %d",
-			bmsg.blockHash, blockSize, avgSize, dynamicMax)
+		sm.logger.Debugf("[%s][%s] Block size: %d bytes, avg: %d bytes, dynamic max in-flight: %d",
+			caller, bmsg.blockHash, blockSize, avgSize, dynamicMax)
+	}
+
+	return
+}
+
+// handleBlockMsg handles block messages from all peers.
+func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
+	sm.logger.Debugf("[handleBlockMsg][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
+
+	peer, state, catchingBlocks, isCheckpointBlock, err := sm.handleBlockPreamble("handleBlockMsg", bmsg)
+	if err != nil {
+		return err
 	}
 
 	sm.logger.Debugf("[handleBlockMsg][%s] calling HandleBlockDirect", bmsg.blockHash)
@@ -1570,6 +1615,255 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	}
 
 	return nil
+}
+
+// handleBlockMsgWithWindow is the window-enabled variant of handleBlockMsg.
+// It delegates the shared serial preamble to handleBlockPreamble, then — when
+// the block is eligible for the window path (legacyUnified returns true) —
+// prepares the block via prepareBlockForWindow and adds it to the accumulator
+// instead of calling HandleBlockDirect.
+//
+// Returns (addedToWindow bool, err error).
+// When addedToWindow=true the caller must NOT send a reply yet — the
+// windowAccumulator owns the reply channel and sends it on flush.
+// When addedToWindow=false the block was processed directly (or failed); err
+// carries the outcome.
+//
+// Post-processing (peer height update, FSM RUN, header pipeline advance) only
+// runs on the direct path (addedToWindow=false) because ProcessBlockWindow
+// does it server-side for windowed blocks. The peer-height-update and FSM-RUN
+// branches inside runPostBlockProcessing are guarded by sm.current(). Windowed
+// blocks are below the hardcoded checkpoint, so !sm.current() is guaranteed
+// (the sync peer's LastBlock() far exceeds our best height); those branches
+// would also be skipped on the normal handleBlockMsg path for the same reason.
+// There is no behaviour divergence.
+func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator) (addedToWindow bool, err error) {
+	sm.logger.Debugf("[handleBlockMsgWithWindow][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
+
+	peer, state, catchingBlocks, isCheckpointBlock, preambleErr := sm.handleBlockPreamble("handleBlockMsgWithWindow", bmsg)
+	if preambleErr != nil {
+		return false, preambleErr
+	}
+
+	msgBlock := bmsg.block
+	if msgBlock == nil {
+		return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] block message carries no block", bmsg.blockHash)
+	}
+
+	// Determine block height by querying the blockchain for the prev block header.
+	// This mirrors the height-resolution logic in HandleBlockDirect.
+	prevBlockHash := msgBlock.Header.PrevBlock
+	bmsg.block = nil
+
+	block := bsvutil.NewBlock(msgBlock)
+
+	var blockHeightUint32 uint32
+	if block.Height() > 0 {
+		h, convErr := safeconversion.Int32ToUint32(block.Height())
+		if convErr != nil {
+			return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to convert block height", bmsg.blockHash, convErr)
+		}
+
+		blockHeightUint32 = h
+	} else {
+		_, prevMeta, headerErr := sm.blockchainClient.GetBlockHeader(sm.ctx, &prevBlockHash)
+		if headerErr != nil {
+			return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to get prev block header for height determination", bmsg.blockHash, headerErr)
+		}
+
+		blockHeightUint32 = prevMeta.Height + 1
+		block.SetHeight(int32(blockHeightUint32)) //nolint:gosec
+	}
+
+	// Check window eligibility. An ineligible block is processed directly.
+	if !sm.legacyUnified(blockHeightUint32) {
+		// Not eligible for window — process directly using the full HandleBlockDirect flow.
+		// We already extracted prevBlockHash and cleared bmsg.block above.
+		directErr := sm.HandleBlockDirect(sm.ctx, peer, bmsg.blockHash, msgBlock)
+		if directErr != nil {
+			if errors.Is(directErr, errors.ErrBlockNotFound) {
+				sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks", bmsg.blockHash, prevBlockHash)
+
+				bestBlockHeader, bestBlockHeaderMeta, getErr := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+				if getErr != nil {
+					sm.logger.Errorf("Failed to get best block header: %v", getErr)
+					return false, nil
+				}
+
+				locator, locErr := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
+				if locErr != nil {
+					sm.logger.Errorf("Failed to get block locator for the block hash %s: %v", bmsg.blockHash, locErr)
+					return false, nil
+				}
+
+				zeroHash := chainhash.Hash{}
+				if pushErr := peer.PushGetBlocksMsg(locator, &zeroHash); pushErr != nil {
+					sm.logger.Errorf("Failed to send getblocks message: %v", pushErr)
+				}
+
+				return false, nil
+			}
+
+			if errors.Is(directErr, context.Canceled) || errors.IsContextError(directErr) {
+				return false, nil
+			}
+
+			serviceError := errors.Is(directErr, errors.ErrServiceError) || errors.Is(directErr, errors.ErrStorageError)
+			if !catchingBlocks && !serviceError {
+				peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &bmsg.blockHash, false)
+			}
+
+			sm.logger.Errorf("Failed to process new block in service blockQueueMsg %v: %v", bmsg.blockHash, directErr)
+			return false, directErr
+		}
+
+		sm.runPostBlockProcessing(peer, state, bmsg, isCheckpointBlock)
+		return false, nil
+	}
+
+	// Eligible for window: prepare the block concurrently (safe — prepareBlockForWindow
+	// does not mutate any SyncManager state that isn't read-only after startup).
+	prepared, prepErr := sm.prepareBlockForWindow(sm.ctx, peer, bmsg.blockHash, msgBlock)
+	if prepErr != nil {
+		if errors.Is(prepErr, context.Canceled) || errors.IsContextError(prepErr) {
+			return false, nil
+		}
+
+		serviceError := errors.Is(prepErr, errors.ErrServiceError) || errors.Is(prepErr, errors.ErrStorageError)
+		if !catchingBlocks && !serviceError {
+			peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &bmsg.blockHash, false)
+		}
+
+		sm.logger.Errorf("[handleBlockMsgWithWindow][%s] prepareBlockForWindow failed: %v", bmsg.blockHash, prepErr)
+		return false, prepErr
+	}
+
+	wa.add(prepared, bmsg.reply)
+
+	// Advance the headers-first pipeline pump for every windowed block.
+	// The peer-height-update and FSM-RUN blocks are intentionally omitted here:
+	// those are guarded by sm.current() and windowed blocks are all below the
+	// hardcoded checkpoint (not current), so they would never fire. fetchHeaderBlocks
+	// MUST run so the sync peer keeps being asked for more blocks while the window
+	// accumulates — without it the in-flight count falls to zero after requestedBlocks
+	// deletion in the preamble and the pipeline stalls until the window flushes.
+	// All state touched here (headerList, startHeader, requestedBlocks) is
+	// drain-goroutine-only; this call is safe because we are still on that goroutine.
+	if !isCheckpointBlock {
+		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+		if sm.startHeader != nil && state.requestedBlocks.Len() < dynamicMax {
+			sm.fetchHeaderBlocks()
+		} else if !sm.current() && state.requestedBlocks.Len() == 0 {
+			sm.logger.Debugf("[handleBlockMsgWithWindow][%s] no in-flight blocks, requesting more from peer", bmsg.blockHash)
+
+			latestBlockHeader, _, getBestErr := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+			if getBestErr != nil {
+				sm.logger.Errorf("[handleBlockMsgWithWindow] Failed to get best block header: %v", getBestErr)
+			} else {
+				locator := blockchain.BlockLocator([]*chainhash.Hash{latestBlockHeader.Hash()})
+				if pushErr := peer.PushGetBlocksMsg(locator, &zeroHash); pushErr != nil {
+					sm.logger.Errorf("[handleBlockMsgWithWindow] Failed to send getblocks message to peer %s: %v", peer.String(), pushErr)
+				}
+			}
+		}
+	}
+
+	return true, nil
+}
+
+// runPostBlockProcessing handles the peer-state and header-pipeline updates that
+// must happen after a block is successfully processed. Called by handleBlockMsgWithWindow
+// on the direct (non-windowed) path.
+func (sm *SyncManager) runPostBlockProcessing(peer *peerpkg.Peer, state *peerSyncState, bmsg *blockQueueMsg, isCheckpointBlock bool) {
+	if sps, ok := sm.syncPeerStateFor(peer); ok {
+		sps.updateLastBlockTime()
+	}
+
+	heightUpdate := bmsg.blockHeight
+	blkHashUpdate := &bmsg.blockHash
+
+	if heightUpdate <= 0 {
+		_, blockHeaderMeta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &bmsg.blockHash)
+		if err != nil {
+			sm.logger.Errorf("Failed to get block header for block %v: %v", bmsg.blockHash, err)
+		} else {
+			blockHeightInt32, err := safeconversion.Uint32ToInt32(blockHeaderMeta.Height)
+			if err != nil {
+				sm.logger.Errorf("failed to convert block height to int32: %v", err)
+			}
+
+			heightUpdate = blockHeightInt32
+		}
+	}
+
+	sm.logger.Infof("accepted block %v at height %d", bmsg.blockHash, heightUpdate)
+	sm.rejectedTxns.Clear()
+
+	if heightUpdate != 0 {
+		peer.UpdateLastBlockHeight(heightUpdate)
+		sm.logger.Debugf("peer %s reports new best height %d, current %v", peer.String(), peer.LastBlock(), sm.current())
+
+		if sm.current() {
+			go sm.peerNotifier.UpdatePeerHeights(blkHashUpdate, heightUpdate, peer)
+
+			if err := sm.blockchainClient.Run(sm.ctx, "legacy/netsync/manager/handleBlockMsg"); err != nil {
+				sm.logger.Errorf("[Sync Manager] failed to send FSM RUN event %v", err)
+			}
+
+			sm.resetFeeFilterToDefault()
+		}
+	}
+
+	if !isCheckpointBlock {
+		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+		if sm.startHeader != nil && state.requestedBlocks.Len() < dynamicMax {
+			sm.fetchHeaderBlocks()
+		} else if !sm.current() && state.requestedBlocks.Len() == 0 {
+			sm.logger.Debugf("Not current, and no headers to sync to, fetching more headers")
+
+			latestBlockHeader, _, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+			if err != nil {
+				sm.logger.Errorf("Failed to get best block header: %v", err)
+				return
+			}
+
+			locator := blockchain.BlockLocator([]*chainhash.Hash{latestBlockHeader.Hash()})
+			if err = peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
+				sm.logger.Errorf("Failed to send getblocks message to peer %s: %v", peer.String(), err)
+			}
+		}
+
+		return
+	}
+
+	prevHeight := sm.nextCheckpoint.Height
+	prevHash := sm.nextCheckpoint.Hash
+
+	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
+	if sm.nextCheckpoint != nil {
+		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
+
+		if err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash); err != nil {
+			sm.logger.Errorf("failed to send getheaders message to peer %s: %v", peer.String(), err)
+			return
+		}
+
+		if sp := sm.loadSyncPeer(); sp != nil {
+			sm.logger.Infof("handleBlockMsg - Downloading headers for blocks %d to %d from peer %s",
+				prevHeight+1, sm.nextCheckpoint.Height, sp.String())
+		}
+
+		return
+	}
+
+	sm.headersFirstMode.Store(false)
+	sm.headerList.Init()
+	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
+
+	locator := blockchain.BlockLocator([]*chainhash.Hash{&bmsg.blockHash})
+	if err := peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
+		sm.logger.Errorf("Failed to send getblocks message to peer %s: %v", peer.String(), err)
+	}
 }
 
 // fetchHeaderBlocks creates and sends a request to the syncPeer for the next
@@ -2077,6 +2371,116 @@ type blockQueueMsg struct {
 	reply       chan error
 }
 
+// windowEntry holds a prepared block ready for ProcessBlockWindow along with
+// the reply channel from the original queue message (so the drain loop can
+// surface any error back to the caller after the batch completes).
+type windowEntry struct {
+	block *model.Block
+	reply chan error
+}
+
+// windowAccumulator is a drain-goroutine-local accumulator for the
+// byte-budgeted window admission path. It is NOT safe for concurrent use;
+// only the single blockQueue drain goroutine ever touches it.
+type windowAccumulator struct {
+	entries      []windowEntry
+	bytesAccum   int64 // sum of block sizes already in the window
+	windowBudget int64 // derived from GOMEMLIMIT × fraction at flush time
+	maxBlocks    int   // upper bound on K (MaxBlocksBehindBlockAssembly)
+}
+
+// newWindowAccumulator returns an accumulator with the given budget and cap.
+func newWindowAccumulator(windowBudget int64, maxBlocks int) *windowAccumulator {
+	return &windowAccumulator{
+		entries:      make([]windowEntry, 0, 8),
+		windowBudget: windowBudget,
+		maxBlocks:    maxBlocks,
+	}
+}
+
+// add appends a prepared block to the window and tracks its byte size.
+func (wa *windowAccumulator) add(block *model.Block, reply chan error) {
+	wa.entries = append(wa.entries, windowEntry{block: block, reply: reply})
+	wa.bytesAccum += int64(block.SizeInBytes) //nolint:gosec
+}
+
+// full reports whether the window has hit its byte budget.
+func (wa *windowAccumulator) full() bool {
+	return len(wa.entries) > 0 && wa.bytesAccum >= wa.windowBudget
+}
+
+// empty reports whether there are no blocks in the window.
+func (wa *windowAccumulator) empty() bool {
+	return len(wa.entries) == 0
+}
+
+// flush submits all accumulated blocks to ProcessBlockWindow and sends
+// replies. On a partial-commit error that names the last committed height
+// h, it falls back to per-block ProcessBlock for blocks above h.
+// Creates from ProcessBlockWindow are idempotent so re-processing is safe.
+func (wa *windowAccumulator) flush(ctx context.Context, sm *SyncManager) {
+	if wa.empty() {
+		return
+	}
+
+	entries := wa.entries
+	wa.entries = make([]windowEntry, 0, 8)
+	wa.bytesAccum = 0
+
+	blocks := make([]*model.Block, len(entries))
+	for i, e := range entries {
+		blocks[i] = e.block
+	}
+
+	sm.logger.Debugf("[windowAccumulator] flushing window of %d blocks to ProcessBlockWindow", len(blocks))
+
+	err := sm.blockValidation.ProcessBlockWindow(ctx, blocks, "", "legacy")
+	if err == nil {
+		// Success: ack all replies nil.
+		for _, e := range entries {
+			if e.reply != nil {
+				e.reply <- nil
+			}
+		}
+
+		return
+	}
+
+	// On any error from ProcessBlockWindow, fall back to per-block ProcessBlock
+	// for all blocks (creates are idempotent so re-processing committed blocks is safe).
+	sm.logger.Warnf("[windowAccumulator] ProcessBlockWindow error, falling back to per-block: %v", err)
+
+	for _, e := range entries {
+		fallbackErr := sm.ProcessBlock(ctx, e.block)
+		if e.reply != nil {
+			e.reply <- fallbackErr
+		}
+	}
+}
+
+// effectiveGOMEMLIMIT reads the current GOMEMLIMIT without modifying it.
+// Returns a 6 GB fallback when the limit is unset (math.MaxInt64) or <= 0.
+func effectiveGOMEMLIMIT() int64 {
+	const fallback = 6 * 1024 * 1024 * 1024 // 6 GB
+
+	limit := debug.SetMemoryLimit(-1)
+	if limit <= 0 || limit == math.MaxInt64 {
+		return fallback
+	}
+
+	return limit
+}
+
+// windowBudgetBytes converts the GOMEMLIMIT fraction to a byte budget.
+// Returns 0 when fraction <= 0 (window path disabled).
+func windowBudgetBytes(fraction float64) int64 {
+	if fraction <= 0 {
+		return 0
+	}
+
+	return int64(float64(effectiveGOMEMLIMIT()) * fraction)
+}
+
 // blockHandler is the main handler for the sync manager.  It must be run as a
 // goroutine.  It processes block and inv messages in a separate goroutine
 // from the peer handlers so the block (MsgBlock) messages are handled by a
@@ -2104,19 +2508,97 @@ func (sm *SyncManager) blockHandler() {
 
 	// start the block queue handler
 	go func() {
+		windowFraction := sm.settings.Legacy.ParallelWindowMemoryFraction
+		windowEnabled := windowFraction > 0
+
+		var wa *windowAccumulator
+		var flushTimer *time.Timer
+
+		if windowEnabled {
+			budget := windowBudgetBytes(windowFraction)
+			maxBlocks := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
+			wa = newWindowAccumulator(budget, maxBlocks)
+			flushTimer = time.NewTimer(200 * time.Millisecond)
+			flushTimer.Stop() // don't fire until we have blocks
+		}
+
+		flushWindow := func() {
+			if wa != nil && !wa.empty() {
+				wa.flush(sm.ctx, sm)
+			}
+
+			if flushTimer != nil {
+				flushTimer.Stop()
+			}
+		}
+
+		var timerC <-chan time.Time
+		if flushTimer != nil {
+			timerC = flushTimer.C
+		}
+
 		for {
 			select {
 			case <-sm.quit:
+				flushWindow()
 				return
+			case <-timerC:
+				sm.logger.Debugf("[blockHandler] window flush timer fired")
+				flushWindow()
 			case msg := <-blockQueue:
 				sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
 
-				err := sm.handleBlockMsg(msg)
+				if !windowEnabled {
+					err := sm.handleBlockMsg(msg)
+					sm.blockBacklog.Add(-1)
 
-				sm.blockBacklog.Add(-1)
+					if msg.reply != nil {
+						msg.reply <- err
+					}
 
-				if msg.reply != nil {
-					msg.reply <- err
+					continue
+				}
+
+				// Window path: call handleBlockMsgWithWindow.
+				added, err := sm.handleBlockMsgWithWindow(msg, wa)
+				if !added {
+					// Block was processed directly (or failed).
+					sm.blockBacklog.Add(-1)
+					// reply was already sent by handleBlockMsgWithWindow for the
+					// error path; for the success path send nil.
+					// Actually handleBlockMsgWithWindow does NOT send the reply
+					// for the direct path — we do it here.
+					if msg.reply != nil {
+						msg.reply <- err
+					}
+
+					// Flush any pending window now that an ineligible block arrived.
+					flushWindow()
+				} else {
+					// Block was added to the window accumulator.
+					// The reply channel is now owned by the accumulator.
+					sm.blockBacklog.Add(-1)
+
+					// Arm (or re-arm) the flush timer with the correct stop-drain-reset
+					// idiom: Stop returns false when the timer has already fired, in
+					// which case the channel may hold a value that we must drain before
+					// Reset — otherwise the select picks up a stale expiry on the next
+					// iteration and triggers a spurious empty flush.
+					if flushTimer != nil {
+						if !flushTimer.Stop() {
+							select {
+							case <-flushTimer.C:
+							default:
+							}
+						}
+						flushTimer.Reset(200 * time.Millisecond)
+					}
+
+					// Flush if budget is exhausted.
+					if wa.full() {
+						sm.logger.Debugf("[blockHandler] window budget exhausted, flushing")
+						flushWindow()
+					}
 				}
 			}
 		}
