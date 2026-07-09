@@ -277,6 +277,14 @@ func (u *BlockValidation) createBlockUTXOs(ctx context.Context, block *model.Blo
 //   - spends: Snapshots from createBlockUTXOs; empty slice is a no-op
 //   - outpointOnly: Must be true (guards the fast-path invariant; mirrors createBlockUTXOs)
 func (u *BlockValidation) spendBlockUTXOs(ctx context.Context, block *model.Block, spends []windowSpend, outpointOnly bool) error {
+	// spendBlockUTXOs is exclusively a below-checkpoint outpoint-only operation.
+	// The UTXO-hash path requires parent satoshi values read inline during extend,
+	// which the de-interleaved pipeline does not retain across the barrier.
+	// Fail-closed rather than silently producing wrong spend records.
+	if !outpointOnly {
+		return errors.NewProcessingError("[spendBlockUTXOs][%s] spendBlockUTXOs called on non-outpoint-only block", block.Hash().String())
+	}
+
 	if len(spends) == 0 {
 		return nil
 	}
@@ -339,4 +347,126 @@ func buildMinimalSpendTx(spendingTxHash chainhash.Hash, inputs []windowSpend) *b
 	}
 
 	return tx
+}
+
+// ProcessBlockWindow processes a batch of K below-checkpoint blocks concurrently
+// using the three-fence phased pipeline:
+//
+//	C1 (parallel): createBlockUTXOs for all K blocks → barrier (g.Wait)
+//	C2 (parallel): spendBlockUTXOs for all K blocks → barrier (g.Wait)
+//	C3 (serial):   commitBlock for each block in ascending height order
+//
+// Correctness invariants:
+//   - Every block must be below the hardcoded checkpoint AND outpoint-only eligible;
+//     if any block fails this guard the window is rejected fail-closed before C1.
+//   - C1→C2 barrier: no spend may run until ALL K creates are committed (the
+//     g.Wait() call is the only synchronisation point; there is no other path).
+//   - Spend order is unordered (safe below checkpoint: disjoint outpoints, no
+//     double-spends, CVE-2012-2459 dedup enforced in PREPARE before hand-off).
+//   - C3 commits in strict ascending height order via commitBlock; moveForwardBlock
+//     inside AddBlock rejects out-of-order commits at the FSM level.
+//
+// Failure handling:
+//   - C1 or C2 error: return immediately; no C3 commits run; creates are
+//     idempotent (ErrTxExists→SetMinedMultiChunked) so the caller may retry.
+//   - C3 error at height h: return an error that names the last successfully
+//     committed height so the caller can resume after that block.
+//
+// blocks must be sorted ascending by Height and all below the highest hardcoded
+// checkpoint with outpointOnly eligibility. An empty slice is a no-op.
+func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID string) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	// --- Gate: every block must be below the hardcoded checkpoint + outpoint-only. ---
+	// Fail-closed: a single above-checkpoint block must never enter the concurrent path.
+	highest := model.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)
+	for _, blk := range blocks {
+		if !model.BelowCheckpoint(u.settings.ChainCfgParams.Checkpoints, blk.Height) {
+			return errors.NewProcessingError(
+				"[ProcessBlockWindow] block at height %d is not below the hardcoded checkpoint (highest=%d); window rejected fail-closed",
+				blk.Height, highest,
+			)
+		}
+		if !u.quickValidateOutpointOnly(blk) {
+			return errors.NewProcessingError(
+				"[ProcessBlockWindow] block at height %d is not outpoint-only eligible; window rejected fail-closed",
+				blk.Height,
+			)
+		}
+	}
+
+	k := len(blocks)
+
+	// --- C1: parallel creates. ---
+	// spends[i] holds the windowSpend snapshots from createBlockUTXOs for blocks[i].
+	spends := make([][]windowSpend, k)
+
+	c1g, c1ctx := errgroup.WithContext(ctx)
+	// Concurrency cap: each block's create already fans out internally using
+	// StoreBatcherSize*8 goroutines. Limit the window-level concurrency to k
+	// (one goroutine per block) — the intra-block fan-out is the real batcher load.
+	// SafeSetLimit uses StoreBatcherSize as the floor; k is typically small (≤20).
+	util.SafeSetLimit(u.logger, c1g, u.settings.UtxoStore.StoreBatcherSize)
+	var mu sync.Mutex
+	for i := range k {
+		blockIdx := i
+		blk := blocks[i]
+		c1g.Go(func() error {
+			ws, err := u.createBlockUTXOs(c1ctx, blk, true /* outpointOnly */)
+			if err != nil {
+				return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)
+			}
+			mu.Lock()
+			spends[blockIdx] = ws
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	// BARRIER C1→C2: all creates committed before any spend begins.
+	if err := c1g.Wait(); err != nil {
+		return err
+	}
+
+	// --- C2: parallel spends. ---
+	c2g, c2ctx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(u.logger, c2g, u.settings.UtxoStore.SpendBatcherSize)
+	for i := range k {
+		blk := blocks[i]
+		ws := spends[i]
+		c2g.Go(func() error {
+			if err := u.spendBlockUTXOs(c2ctx, blk, ws, true /* outpointOnly */); err != nil {
+				return errors.NewProcessingError("[ProcessBlockWindow][C2][%s] spendBlockUTXOs failed", blk.Hash().String(), err)
+			}
+			return nil
+		})
+	}
+
+	// BARRIER C2→C3: all spends done before any commit runs.
+	if err := c2g.Wait(); err != nil {
+		return err
+	}
+
+	// --- C3: serial commits in ascending height order. ---
+	// blocks is already sorted ascending by Height (caller contract).
+	// commitBlock calls AddBlock+moveForwardBlock which enforces HashPrevBlock==tip,
+	// so out-of-order delivery would be rejected by the FSM — C3 serialises this.
+	var lastCommittedHeight uint32
+	for _, blk := range blocks {
+		if err := u.commitBlock(ctx, blk, peerID, "ProcessBlockWindow"); err != nil {
+			if lastCommittedHeight > 0 {
+				return errors.NewProcessingError(
+					"[ProcessBlockWindow][C3][%s] commitBlock failed; last committed height=%d",
+					blk.Hash().String(), lastCommittedHeight, err,
+				)
+			}
+			return errors.NewProcessingError("[ProcessBlockWindow][C3][%s] commitBlock failed (no blocks committed yet)", blk.Hash().String(), err)
+		}
+		lastCommittedHeight = blk.Height
+	}
+
+	u.logger.Debugf("[ProcessBlockWindow] completed window of %d blocks (heights %d–%d)", k, blocks[0].Height, blocks[k-1].Height)
+	return nil
 }
