@@ -1701,6 +1701,20 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 
 	if blockExists {
 		sm.logger.Warnf("[handleBlockMsgWithWindow][%s] block already exists, skipping", bmsg.blockHash)
+
+		// Skipping is not standing still. The preamble already deleted this block
+		// from state.requestedBlocks, so if we returned here without pumping, a peer
+		// re-delivering an already-committed range (e.g. after a mid-chain restart)
+		// would drain the in-flight count to zero with no new request ever issued —
+		// the peer keeps re-sending the same committed range forever, the node never
+		// reaches blocks past our tip, and block assembly stays wedged. Run the same
+		// next-block-request pump the accept path runs so a skipped block advances
+		// sync exactly like an accepted one (mirroring the direct path, which pumps by
+		// fall-through after HandleBlockDirect's own already-exists guard). Pure
+		// sync-request plumbing: no validation, UTXO write, or commit-order change.
+		// peer/state/isCheckpointBlock were all resolved by the preamble above.
+		sm.pumpBlockRequests(peer, state, isCheckpointBlock, bmsg.blockHash)
+
 		return false, nil
 	}
 
@@ -1879,26 +1893,44 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	// deletion in the preamble and the pipeline stalls until the window flushes.
 	// All state touched here (headerList, startHeader, requestedBlocks) is
 	// drain-goroutine-only; this call is safe because we are still on that goroutine.
-	if !isCheckpointBlock {
-		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
-		if sm.startHeader != nil && state.requestedBlocks.Len() < dynamicMax {
-			sm.fetchHeaderBlocks()
-		} else if !sm.current() && state.requestedBlocks.Len() == 0 {
-			sm.logger.Debugf("[handleBlockMsgWithWindow][%s] no in-flight blocks, requesting more from peer", bmsg.blockHash)
+	sm.pumpBlockRequests(peer, state, isCheckpointBlock, bmsg.blockHash)
 
-			latestBlockHeader, _, getBestErr := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
-			if getBestErr != nil {
-				sm.logger.Errorf("[handleBlockMsgWithWindow] Failed to get best block header: %v", getBestErr)
-			} else {
-				locator := blockchain.BlockLocator([]*chainhash.Hash{latestBlockHeader.Hash()})
-				if pushErr := peer.PushGetBlocksMsg(locator, &zeroHash); pushErr != nil {
-					sm.logger.Errorf("[handleBlockMsgWithWindow] Failed to send getblocks message to peer %s: %v", peer.String(), pushErr)
-				}
+	return true, nil
+}
+
+// pumpBlockRequests advances the headers-first block-download pipeline: it either
+// refills the in-flight window from the pending header list (fetchHeaderBlocks) or,
+// when the header list is exhausted and nothing is in flight and we are not yet
+// current, sends a getblocks from our best block so the peer keeps delivering the
+// next range. This is the same pump the direct path (handleBlockMsg) runs by
+// fall-through after processing a block; extracting it lets both the window
+// accept path and the window already-committed skip path drive sync forward
+// identically. A checkpoint block is a no-op here (checkpoint handling advances
+// the header pipeline separately via runPostBlockProcessing / HandleBlockDirect).
+//
+// All state touched (headerList, startHeader, requestedBlocks) is
+// drain-goroutine-only; callers must invoke this on the drain goroutine.
+func (sm *SyncManager) pumpBlockRequests(peer *peerpkg.Peer, state *peerSyncState, isCheckpointBlock bool, blockHash chainhash.Hash) {
+	if isCheckpointBlock {
+		return
+	}
+
+	dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	if sm.startHeader != nil && state.requestedBlocks.Len() < dynamicMax {
+		sm.fetchHeaderBlocks()
+	} else if !sm.current() && state.requestedBlocks.Len() == 0 {
+		sm.logger.Debugf("[pumpBlockRequests][%s] no in-flight blocks, requesting more from peer", blockHash)
+
+		latestBlockHeader, _, getBestErr := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+		if getBestErr != nil {
+			sm.logger.Errorf("[pumpBlockRequests] Failed to get best block header: %v", getBestErr)
+		} else {
+			locator := blockchain.BlockLocator([]*chainhash.Hash{latestBlockHeader.Hash()})
+			if pushErr := peer.PushGetBlocksMsg(locator, &zeroHash); pushErr != nil {
+				sm.logger.Errorf("[pumpBlockRequests] Failed to send getblocks message to peer %s: %v", peer.String(), pushErr)
 			}
 		}
 	}
-
-	return true, nil
 }
 
 // runPostBlockProcessing handles the peer-state and header-pipeline updates that

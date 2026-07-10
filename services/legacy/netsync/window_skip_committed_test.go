@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
@@ -107,6 +108,16 @@ func TestHandleBlockMsgWithWindow_SkipsAlreadyCommittedBlock(t *testing.T) {
 	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil)
 	// The block is ALREADY committed to our chain (peer re-delivered an old block).
 	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
+	// After skipping, the fix runs the sync-request pump, whose sm.current() check
+	// reads the best header. No sync peer is registered here, so sm.current() sees
+	// no sync peer and returns true, and the pump issues no getblocks — but the best
+	// header read still happens, so it must be stubbed.
+	bestHeader := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+	}
+	blockchainClient.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 400}, nil)
 	// GetBlockHeader is deliberately NOT mocked: if the guard fails and the block
 	// proceeds past it, the height-determination fallback would call GetBlockHeader
 	// and the mock would panic on the unexpected call — an extra safety net that
@@ -132,6 +143,75 @@ func TestHandleBlockMsgWithWindow_SkipsAlreadyCommittedBlock(t *testing.T) {
 	require.Equal(t, int32(0), store.decorateCalls.Load(),
 		"no subtree/UTXO work (BatchPreviousOutputsDecorate) may run for an already-committed block")
 	blockchainClient.AssertCalled(t, "GetBlockExists", mock.Anything, mock.Anything)
+}
+
+// TestHandleBlockMsgWithWindow_SkipAdvancesSyncPump is the regression test for the
+// no-forward-progress bug introduced alongside the already-committed guard. The
+// guard correctly skips a re-delivered committed block, but the original guard
+// returned (false, nil) BEFORE the next-block-request pump the accept path runs.
+// The preamble deletes the block from state.requestedBlocks, so a skip with no pump
+// drains the in-flight count to zero and never re-requests — the peer keeps
+// re-sending the same committed range forever and the node makes no progress past
+// its tip. The fix runs pumpBlockRequests on the skip path too.
+//
+// Observable signal: in this harness sm.startHeader is nil and sm.current() is
+// false (best height < sync peer LastBlock), so the pump takes the getblocks
+// branch, which calls GetBestBlockHeader to build the locator. On the SKIP path
+// GetBestBlockHeader is otherwise never called, so its invocation is a clean proxy
+// for "the pump ran".
+//
+// RED before the fix: the skip returns before pumping, GetBestBlockHeader is never
+// called, and AssertCalled fails. GREEN after: the skip pumps and it is called.
+func TestHandleBlockMsgWithWindow_SkipAdvancesSyncPump(t *testing.T) {
+	initPrometheusMetrics()
+
+	const headerChainHeight = int32(500)
+	const checkpointHeight = int32(1000)
+
+	msgBlock, blockHash := buildWindowBlockMsg(t)
+
+	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil)
+	// The block is ALREADY committed — the guard must skip it.
+	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
+	// Best header lookup used by both sm.current() and the getblocks-branch locator.
+	// Height 400 (< the sync peer's LastBlock below) keeps sm.current() false so the
+	// pump reaches the getblocks branch.
+	bestHeader := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+	}
+	blockchainClient.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 400}, nil)
+
+	sm, store, testPeer, _ := newSkipCommittedSyncManager(t, blockHash, headerChainHeight, checkpointHeight, blockchainClient)
+
+	// Register testPeer as the sync peer with LastBlock far ahead so sm.current()
+	// returns false and the pump issues a getblocks request.
+	testPeer.UpdateLastBlockHeight(headerChainHeight)
+	sm.storeSyncPeer(testPeer, &syncPeerState{lastBlockTime: time.Now()})
+
+	wa := newWindowAccumulator(100*1024*1024, 20)
+
+	bmsg := &blockQueueMsg{
+		block:       msgBlock,
+		blockHash:   blockHash,
+		blockHeight: -1,
+		peer:        testPeer,
+	}
+
+	addedToWindow, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {})
+
+	// (a) Still skipped: no error, not added, no subtree/UTXO work.
+	require.NoError(t, err, "an already-committed block must be skipped cleanly")
+	require.False(t, addedToWindow, "an already-committed block must not be added to the window")
+	require.Empty(t, wa.entries, "no block may be added to the window on the skip path")
+	require.Equal(t, int32(0), store.decorateCalls.Load(),
+		"no subtree/UTXO work may run for an already-committed block")
+
+	// (b) But the skip must have driven the sync-request pump forward.
+	blockchainClient.AssertCalled(t, "GetBestBlockHeader", mock.Anything)
 }
 
 // TestHandleBlockMsgWithWindow_ProcessesNotYetExistingBlock proves the guard does
