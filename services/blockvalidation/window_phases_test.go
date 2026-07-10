@@ -160,7 +160,7 @@ func TestCreateBlockUTXOs_CreateHalf(t *testing.T) {
 
 	block, regularTxs := buildWindowPhasesBlock(t, bv, ctx)
 
-	spends, err := bv.createBlockUTXOs(ctx, block, true /* outpointOnly */)
+	spends, err := bv.createBlockUTXOs(ctx, block, true /* outpointOnly */, nil)
 	require.NoError(t, err)
 
 	// 1. block.ID must be non-zero.
@@ -197,7 +197,7 @@ func TestCreateBlockUTXOs_RejectsNonOutpointOnly(t *testing.T) {
 
 	block := &model.Block{Height: 100}
 
-	_, err := bv.createBlockUTXOs(ctx, block, false /* outpointOnly=false should error */)
+	_, err := bv.createBlockUTXOs(ctx, block, false /* outpointOnly=false should error */, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "createBlockUTXOs called on non-outpoint-only block")
 }
@@ -415,10 +415,10 @@ func TestSpendBlockUTXOs_FullParityWithProcessBlockSubtrees(t *testing.T) {
 	for i, blk := range blocksB {
 		prepareBlockInStore(t, bvB, ctx, blk, blk.CoinbaseTx, txsPerBlock[i])
 
-		spends, err := bvB.createBlockUTXOs(ctx, blk, true /* outpointOnly */)
+		spends, err := bvB.createBlockUTXOs(ctx, blk, true /* outpointOnly */, nil)
 		require.NoError(t, err, "Path B: createBlockUTXOs failed for block %d", i+1)
 
-		err = bvB.spendBlockUTXOs(ctx, blk, spends, true /* outpointOnly */)
+		err = bvB.spendBlockUTXOs(ctx, blk, spends, true /* outpointOnly */, nil)
 		require.NoError(t, err, "Path B: spendBlockUTXOs failed for block %d", i+1)
 	}
 
@@ -510,7 +510,7 @@ func TestSpendBlockUTXOs_FailClosed(t *testing.T) {
 			{parentTxHash: fakeparent, vout: 0, spendingTxHash: fakespender, vin: 0},
 		}
 
-		err := bv.spendBlockUTXOs(ctx, block, spends, true /* outpointOnly */)
+		err := bv.spendBlockUTXOs(ctx, block, spends, true /* outpointOnly */, nil)
 		require.Error(t, err, "spendBlockUTXOs must error when parent tx does not exist")
 	})
 
@@ -553,7 +553,7 @@ func TestSpendBlockUTXOs_FailClosed(t *testing.T) {
 		block := &model.Block{Height: 100, Header: model.GenesisBlockHeader, ID: 1}
 		spends := []windowSpend{{parentTxHash: parentH, vout: 0, spendingTxHash: spenderH, vin: 0}}
 
-		err := bv.spendBlockUTXOs(context.Background(), block, spends, true)
+		err := bv.spendBlockUTXOs(context.Background(), block, spends, true, nil)
 		require.Error(t, err, "conflicting spend must hard-fail")
 		require.Equal(t, int64(1), spy.spendCalls.Load(), "conflicting spend must not be retried")
 	})

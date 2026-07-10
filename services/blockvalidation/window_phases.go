@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/util"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 // windowSpend captures the outpoint and spending side of one input, snapshotted from
@@ -47,11 +49,20 @@ type windowSpend struct {
 //   - ctx: Context for cancellation and deadlines
 //   - block: Block to process (must have Subtrees populated and a valid CoinbaseTx)
 //   - outpointOnly: Must be true; guards the fast path invariant
+//   - storeSem: OPTIONAL cross-block goroutine limiter. When non-nil (the parallel
+//     ProcessBlockWindow path) it is a SHARED semaphore acquired before each per-tx
+//     Create goroutine is spawned and released inside it, so the total number of
+//     concurrently-alive create goroutines across the whole window is bounded by the
+//     semaphore size — independent of window size K and per-block tx count. In that
+//     mode the per-block errgroup SafeSetLimit is NOT applied (the semaphore is the
+//     bound). When nil (the single-block quickValidateBlock path) TODAY'S behaviour is
+//     preserved byte-for-byte: the per-block SafeSetLimit(StoreBatcherSize*8) applies
+//     and no semaphore gating occurs.
 //
 // Returns:
 //   - []windowSpend: one entry per non-coinbase input across all batches
 //   - error: on any failure
-func (u *BlockValidation) createBlockUTXOs(ctx context.Context, block *model.Block, outpointOnly bool) ([]windowSpend, error) {
+func (u *BlockValidation) createBlockUTXOs(ctx context.Context, block *model.Block, outpointOnly bool, storeSem *semaphore.Weighted) ([]windowSpend, error) {
 	if !outpointOnly {
 		return nil, errors.NewProcessingError("[createBlockUTXOs][%s] createBlockUTXOs called on non-outpoint-only block", block.Hash().String())
 	}
@@ -166,7 +177,14 @@ func (u *BlockValidation) createBlockUTXOs(ctx context.Context, block *model.Blo
 
 			// (b) CREATE UTXOs for all txs in the batch (goroutine fan-out, same as createAndSpendUTXOsForBatch Phase 1).
 			createG, createCtx := errgroup.WithContext(gCtx)
-			util.SafeSetLimit(u.logger, createG, u.settings.UtxoStore.StoreBatcherSize*8)
+			// storeSem (the shared cross-block window limiter) is the goroutine bound
+			// when set; in that mode the per-block SafeSetLimit is deliberately omitted
+			// so the semaphore alone caps total live create goroutines across the window.
+			// When storeSem is nil (single-block quickValidateBlock path) keep the proven
+			// per-block cap exactly as before.
+			if storeSem == nil {
+				util.SafeSetLimit(u.logger, createG, u.settings.UtxoStore.StoreBatcherSize*8)
+			}
 
 			var existingTxsMu sync.Mutex
 			var existingTxHashes []*chainhash.Hash
@@ -185,7 +203,22 @@ func (u *BlockValidation) createBlockUTXOs(ctx context.Context, block *model.Blo
 				for txIdx := txRange[0]; txIdx < txRange[1]; txIdx++ {
 					tx := batch.batchTxs[txIdx]
 					sIdx := globalSubtreeIdx
+
+					// Acquire BEFORE spawning so the loop (not a live goroutine + stack)
+					// blocks when the window limit is reached; this is what bounds off-heap
+					// stack memory. Context-aware so cancellation propagates without leaking.
+					if storeSem != nil {
+						if err := storeSem.Acquire(createCtx, 1); err != nil {
+							batch.Close()
+							_ = createG.Wait()
+							return errors.NewProcessingError("[createBlockUTXOs][%s] acquire window store slot for create", block.Hash().String(), err)
+						}
+					}
+
 					createG.Go(func() error {
+						if storeSem != nil {
+							defer storeSem.Release(1)
+						}
 						_, err := u.utxoStore.Create(createCtx, tx, block.Height, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
 							BlockID:     block.ID,
 							BlockHeight: block.Height,
@@ -276,7 +309,11 @@ func (u *BlockValidation) createBlockUTXOs(ctx context.Context, block *model.Blo
 //   - block: Block whose UTXOs are being spent (provides Height for the spend call)
 //   - spends: Snapshots from createBlockUTXOs; empty slice is a no-op
 //   - outpointOnly: Must be true (guards the fast-path invariant; mirrors createBlockUTXOs)
-func (u *BlockValidation) spendBlockUTXOs(ctx context.Context, block *model.Block, spends []windowSpend, outpointOnly bool) error {
+//   - storeSem: OPTIONAL shared cross-block goroutine limiter, forwarded to
+//     spendBatchWithRetry. Non-nil on the parallel ProcessBlockWindow path (bounds total
+//     live spend goroutines across the window); nil on the single-block path (per-block
+//     SafeSetLimit preserved unchanged).
+func (u *BlockValidation) spendBlockUTXOs(ctx context.Context, block *model.Block, spends []windowSpend, outpointOnly bool, storeSem *semaphore.Weighted) error {
 	// spendBlockUTXOs is exclusively a below-checkpoint outpoint-only operation.
 	// The UTXO-hash path requires parent satoshi values read inline during extend,
 	// which the de-interleaved pipeline does not retain across the barrier.
@@ -290,7 +327,7 @@ func (u *BlockValidation) spendBlockUTXOs(ctx context.Context, block *model.Bloc
 	}
 
 	txs := windowSpendsToTxs(spends)
-	return u.spendBatchWithRetry(ctx, block, txs, outpointOnly)
+	return u.spendBatchWithRetry(ctx, block, txs, outpointOnly, storeSem)
 }
 
 // windowSpendsToTxs converts a flat []windowSpend into a []*bt.Tx suitable for
@@ -404,16 +441,26 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 
 	k := len(blocks)
 
+	// --- Shared cross-block goroutine limiter (off-heap stack memory control). ---
+	// ONE semaphore for the whole window, shared by C1 (create) and C2 (spend), sizes
+	// the TOTAL number of concurrently-alive per-tx create/spend goroutines regardless
+	// of k or per-block tx count. Each such goroutine pins a tx + its OFF-HEAP stack
+	// until its store op completes, and off-heap stacks are NOT bounded by GOMEMLIMIT —
+	// so without this the window fan-out ((concurrent blocks) x (per-block tx count))
+	// blows the memory ceiling on fat blocks. The semaphore is acquired at SPAWN time
+	// inside createBlockUTXOs / spendBatchWithRetry so the spawning loop — not a live
+	// goroutine — blocks at the limit.
+	storeSem := semaphore.NewWeighted(int64(u.effectiveWindowStoreConcurrency()))
+
 	// --- C1: parallel creates. ---
 	// spends[i] holds the windowSpend snapshots from createBlockUTXOs for blocks[i].
 	spends := make([][]windowSpend, k)
 
 	c1g, c1ctx := errgroup.WithContext(ctx)
-	// Concurrency cap: each block's create already fans out internally using
-	// StoreBatcherSize*8 goroutines; the batcher — not this errgroup — is the real
-	// DB-pool gate. The window-level limit is StoreBatcherSize so that a
-	// misconfigured k does not spawn an unbounded number of concurrent intra-block
-	// fan-outs. SafeSetLimit clamps to runtime.NumCPU() when StoreBatcherSize < 1.
+	// Per-block concurrency across the K blocks. The real goroutine bound is now the
+	// shared storeSem inside each createBlockUTXOs; this errgroup only limits how many
+	// blocks' pipelines run at once. SafeSetLimit clamps to runtime.NumCPU() when
+	// StoreBatcherSize < 1.
 	util.SafeSetLimit(u.logger, c1g, u.settings.UtxoStore.StoreBatcherSize)
 	var mu sync.Mutex
 	for i := range k {
@@ -439,7 +486,7 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 				return nil
 			}
 
-			ws, err := u.createBlockUTXOs(c1ctx, blk, true /* outpointOnly */)
+			ws, err := u.createBlockUTXOs(c1ctx, blk, true /* outpointOnly */, storeSem)
 			if err != nil {
 				return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)
 			}
@@ -462,7 +509,7 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		blk := blocks[i]
 		ws := spends[i]
 		c2g.Go(func() error {
-			if err := u.spendBlockUTXOs(c2ctx, blk, ws, true /* outpointOnly */); err != nil {
+			if err := u.spendBlockUTXOs(c2ctx, blk, ws, true /* outpointOnly */, storeSem); err != nil {
 				return errors.NewProcessingError("[ProcessBlockWindow][C2][%s] spendBlockUTXOs failed", blk.Hash().String(), err)
 			}
 			return nil
@@ -494,4 +541,31 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 
 	u.logger.Debugf("[ProcessBlockWindow] completed window of %d blocks (heights %d–%d)", k, blocks[0].Height, blocks[k-1].Height)
 	return nil
+}
+
+// effectiveWindowStoreConcurrency resolves the size of the shared cross-block
+// create/spend goroutine limiter for one ProcessBlockWindow call.
+//
+//   - BlockValidation.WindowStoreConcurrency > 0: use it verbatim.
+//   - 0 (default): auto-derive the single-block batcher-feeding budget
+//     UtxoStore.SpendBatcherSize * UtxoStore.SpendBatcherConcurrency. This keeps the
+//     shared batcher fed WITHOUT multiplying by the window size K, so the window's
+//     peak off-heap stack footprint matches one block's, not K blocks'.
+//   - Any resolved value <= 0 (misconfigured batcher settings): fall back to a sane
+//     positive cap of runtime.NumCPU(); NEVER unlimited (a zero-weight semaphore would
+//     deadlock every Acquire, and an unbounded one defeats the whole memory bound).
+func (u *BlockValidation) effectiveWindowStoreConcurrency() int {
+	n := u.settings.BlockValidation.WindowStoreConcurrency
+	if n <= 0 {
+		n = u.settings.UtxoStore.SpendBatcherSize * u.settings.UtxoStore.SpendBatcherConcurrency
+	}
+
+	if n <= 0 {
+		def := runtime.NumCPU()
+		u.logger.Warnf("[effectiveWindowStoreConcurrency] resolved window store concurrency %d <= 0, clamping to runtime.NumCPU()=%d", n, def)
+
+		n = def
+	}
+
+	return n
 }

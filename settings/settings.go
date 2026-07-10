@@ -395,6 +395,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// Pipeline processing settings
 			SubtreeBatchPrefetchDepth:    getInt("blockvalidation_subtree_batch_prefetch_depth", 2, alternativeContext...),
 			SubtreeBatchWriteConcurrency: getInt("blockvalidation_subtree_batch_write_concurrency", 64, alternativeContext...),
+			// 0 = auto-derive at runtime from UtxoStore.SpendBatcherSize*SpendBatcherConcurrency
+			// (see WindowStoreConcurrency doc and ProcessBlockWindow's effectiveWindowStoreConcurrency).
+			WindowStoreConcurrency: getInt("blockvalidation_windowStoreConcurrency", 0, alternativeContext...),
 			// Dynamic peer switching and parallel fetching
 			CatchupMinThroughputKBps:    getInt("blockvalidation_catchup_min_throughput_kbps", 100, alternativeContext...),
 			CatchupParallelFetchEnabled: getBool("blockvalidation_catchup_parallel_fetch_enabled", true, alternativeContext...),

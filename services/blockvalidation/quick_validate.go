@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 // bufioReaderPool reduces GC pressure by reusing bufio.Reader instances.
@@ -220,12 +221,13 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 			// De-interleaved path: create-all then spend-all, for the below-checkpoint
 			// outpoint-only fast path. This is the Step-8 Increment-2a separation that
 			// the window pipeline (Increment-2b) will exploit for concurrency.
+			// nil limiter: single-block path keeps its proven per-block SafeSetLimit unchanged.
 			var spends []windowSpend
-			spends, err = u.createBlockUTXOs(ctx, block, outpointOnly)
+			spends, err = u.createBlockUTXOs(ctx, block, outpointOnly, nil)
 			if err != nil {
 				return errors.NewProcessingError("[quickValidateBlock][%s] failed to create block UTXOs", block.Hash().String(), err)
 			}
-			if err = u.spendBlockUTXOs(ctx, block, spends, outpointOnly); err != nil {
+			if err = u.spendBlockUTXOs(ctx, block, spends, outpointOnly, nil); err != nil {
 				return errors.NewProcessingError("[quickValidateBlock][%s] failed to spend block UTXOs", block.Hash().String(), err)
 			}
 		} else {
@@ -1304,7 +1306,8 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// permanently attributed to a non-canonical tx. Hard-fail instead (fail-closed).
 	// Dirty-restart replay does not need conflict tolerance: re-spending an output
 	// with the same spender is the store's idempotent success path.
-	return u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly)
+	// nil limiter: single-block path keeps its proven per-block SafeSetLimit unchanged.
+	return u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly, nil)
 }
 
 // spendRetryBackoffDefault is the pause between spend retry attempts. Matches the
@@ -1319,7 +1322,15 @@ const spendRetryBackoffDefault = 2 * time.Second
 // makes no progress. Retry cadence mirrors the legacy path's PreValidateTransactions
 // (maxRetries=10, 2s backoff) so both below-checkpoint implementations converge
 // identically after dirty restarts.
-func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.Block, txs []*bt.Tx, outpointOnly bool) error {
+//
+// storeSem is the OPTIONAL shared cross-block goroutine limiter. When non-nil (the
+// parallel ProcessBlockWindow path) it is acquired before each per-tx Spend goroutine
+// is spawned and released inside it, bounding total live spend goroutines across the
+// whole window regardless of block size; in that mode the per-block SafeSetLimit is NOT
+// applied. When nil (the single-block quickValidateBlock path) TODAY'S behaviour is
+// preserved byte-for-byte: SafeSetLimit(SpendBatcherSize*SpendBatcherConcurrency*2)
+// applies and no semaphore gating occurs.
+func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.Block, txs []*bt.Tx, outpointOnly bool, storeSem *semaphore.Weighted) error {
 	const maxRetries = 10
 
 	backoff := u.spendRetryBackoff
@@ -1341,7 +1352,13 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 		}
 
 		spendG, spendCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(u.logger, spendG, u.settings.UtxoStore.SpendBatcherSize*u.settings.UtxoStore.SpendBatcherConcurrency*2)
+		// storeSem (the shared cross-block window limiter) is the goroutine bound when
+		// set; in that mode the per-block SafeSetLimit is deliberately omitted so the
+		// semaphore alone caps total live spend goroutines across the window. When nil
+		// (single-block quickValidateBlock path) keep the proven per-block cap exactly.
+		if storeSem == nil {
+			util.SafeSetLimit(u.logger, spendG, u.settings.UtxoStore.SpendBatcherSize*u.settings.UtxoStore.SpendBatcherConcurrency*2)
+		}
 
 		var (
 			mu        sync.Mutex
@@ -1352,7 +1369,20 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 
 		for _, tx := range pending {
 			tx := tx
+
+			// Acquire BEFORE spawning so the loop (not a live goroutine + stack) blocks
+			// at the window limit; context-aware so cancellation propagates without leak.
+			if storeSem != nil {
+				if err := storeSem.Acquire(spendCtx, 1); err != nil {
+					_ = spendG.Wait()
+					return errors.NewProcessingError("[spendBatchWithRetry][%s] acquire window store slot for spend", block.Hash().String(), err)
+				}
+			}
+
 			spendG.Go(func() error {
+				if storeSem != nil {
+					defer storeSem.Release(1)
+				}
 				if _, err := u.utxoStore.Spend(spendCtx, tx, block.Height, utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: outpointOnly}); err != nil {
 					if errors.IsRetryableError(err) {
 						mu.Lock()

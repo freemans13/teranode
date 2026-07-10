@@ -303,9 +303,9 @@ func TestProcessBlockWindow_ParityWithSerial(t *testing.T) {
 	// Using the phase methods directly avoids the Prometheus metrics init dependency
 	// that quickValidateBlock carries; behavior is identical for the outpoint-only path.
 	for _, blk := range chain.blocks {
-		ws, err := bvA.createBlockUTXOs(ctxA, blk, true)
+		ws, err := bvA.createBlockUTXOs(ctxA, blk, true, nil)
 		require.NoError(t, err, "Path A: createBlockUTXOs failed at height %d", blk.Height)
-		require.NoError(t, bvA.spendBlockUTXOs(ctxA, blk, ws, true), "Path A: spendBlockUTXOs failed at height %d", blk.Height)
+		require.NoError(t, bvA.spendBlockUTXOs(ctxA, blk, ws, true, nil), "Path A: spendBlockUTXOs failed at height %d", blk.Height)
 		require.NoError(t, bvA.commitBlock(ctxA, blk, "test-peer", "TestProcessBlockWindow_ParityWithSerial"), "Path A: commitBlock failed at height %d", blk.Height)
 	}
 
