@@ -474,6 +474,23 @@ type SyncManager struct {
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
 	headerList       *list.List
 	startHeader      *list.Element
+	// headerListSeed is the current leading "seed" node at the front of the
+	// header list: a node whose block is NOT pending a fetch and is kept only so
+	// the next interval's first header can prove it links onto the chain. There
+	// are exactly two kinds:
+	//   1. The DB-best node pushed by resetHeaderState (the block already in our
+	//      chain that the very first downloaded header links onto). No block
+	//      message ever arrives for it.
+	//   2. A checkpoint node whose block has already been processed. The block
+	//      handler keeps it after its block commits so the NEXT interval's
+	//      headers can link onto it, then it becomes the new seed.
+	// A seed has no pending block, so the block-commit front-removal never
+	// matches it directly and it would otherwise sit at Front() forever, blocking
+	// removal (and header-height sourcing) of the next interval's real blocks.
+	// handleBlockPreamble therefore drops the leading seed the moment the block
+	// that follows it commits — removal tied to block-fetch progress, never to a
+	// header-download event, so no un-fetched node is ever stranded.
+	headerListSeed *list.Element
 	// nextCheckpoint is the BLOCK-level checkpoint tracker: the next checkpoint
 	// whose full block we still expect to process. handleBlockPreamble uses its
 	// Hash to recognise (and keep in the header list) the checkpoint block, and
@@ -550,6 +567,7 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
 	sm.startHeader = nil
+	sm.headerListSeed = nil
 
 	// Re-align the header-request look-ahead cursor with the block-level
 	// checkpoint tracker on a fresh sync/recovery. From here they may diverge
@@ -558,10 +576,12 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 
 	// When there is a next checkpoint, add an entry for the latest known
 	// block into the header pool.  This allows the next downloaded header
-	// to prove it links to the chain properly.
+	// to prove it links to the chain properly. Track it as the leading seed so
+	// it is removed exactly once when the first real block commits (it has no
+	// block of its own to fetch); see headerListSeed.
 	if sm.nextCheckpoint != nil {
 		node := headerNode{height: newestHeight, hash: newestHash}
-		sm.headerList.PushBack(&node)
+		sm.headerListSeed = sm.headerList.PushBack(&node)
 	}
 }
 
@@ -1408,49 +1428,80 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 	}
 
 	// When in headers-first mode, recognise the checkpoint block by its HASH
-	// directly, independent of the header list's front position. This is the
-	// C-NEW fix: header pipelining removes the checkpoint-N anchor node from the
-	// list as soon as interval N+1's headers arrive (remove-by-identity in
-	// handleHeadersMsg), which by the pipeline's design routinely happens BEFORE
-	// checkpoint-N's block is processed. So by the time this checkpoint block
-	// arrives its node may no longer be at Front() — or may be gone entirely.
-	// Recognising by hash decouples checkpoint recognition from the list
-	// position that pipelining disturbs, so nextCheckpoint still advances (and
-	// the final checkpoint still clears headers-first mode). The checkpoint hash
-	// is unique, so this is equivalent-or-better than the old position proxy.
+	// directly, independent of the header list's front position (the C-NEW fix).
+	// With continuous pipelining the checkpoint block can arrive while a leading
+	// seed node still sits ahead of it at the front, so a plain Front()-position
+	// check is not a reliable proxy. Recognising by hash decouples checkpoint
+	// recognition from list position, so nextCheckpoint still advances (and the
+	// final checkpoint still clears headers-first mode) regardless of where the
+	// checkpoint node currently sits. The checkpoint hash is unique, so this is
+	// equivalent-or-better than the old position proxy.
 	//
-	// Independently of checkpoint recognition, keep maintaining the header list:
-	// when the block that just arrived IS the current front-of-list header AND
-	// it is NOT the checkpoint, remove it, since only checkpoint nodes are kept
-	// to verify the next round of headers links properly. The height is sourced
-	// from whichever list node matches (front for non-checkpoint blocks), as it
-	// carries the authoritative, PoW-verified, parent-independent height.
+	// Independently of checkpoint recognition, maintain the header list by
+	// consuming it from the OLDEST (front) end as blocks commit — the only place
+	// nodes are removed, so removal is always tied to block-fetch progress and
+	// never to a header-download event. Two node kinds sit at the front:
+	//   - a leading SEED node (headerListSeed): the DB-best node, or a previous
+	//     checkpoint node kept for the next interval's linkage. Its block is
+	//     already accounted for, so no block message matches it; it must be
+	//     dropped the moment the block that follows it commits, otherwise it
+	//     wedges the front and starves the next block's height sourcing.
+	//   - real block nodes, which arrive and commit in header (front) order.
+	// The loop below drops a leading seed if the arriving block is not it, then
+	// matches the arriving block at the (new) front, sources its authoritative
+	// PoW-verified height, and removes it — unless it is the checkpoint, which is
+	// retained as the new seed so the next interval's headers can link onto it.
 	if sm.headersFirstMode.Load() {
 		if sm.nextCheckpoint != nil && bmsg.blockHash.IsEqual(sm.nextCheckpoint.Hash) {
 			isCheckpointBlock = true
 			// The checkpoint carries the same authoritative, PoW-verified,
-			// parent-independent height as its header-list node did. Surface it
-			// here so the window path keeps the correct height even in the
-			// pipelined case where the checkpoint's node was already removed
-			// from the list (so the Front() match below no longer fires for it).
+			// parent-independent height as its header-list node. Surface it here
+			// so the window path keeps the correct height even if the checkpoint
+			// node is not the current front (e.g. a leading seed still ahead of
+			// it, dropped by the loop below).
 			headerHeight = sm.nextCheckpoint.Height
 		}
 
-		firstNodeEl := sm.headerList.Front()
-		if firstNodeEl != nil {
+		for {
+			firstNodeEl := sm.headerList.Front()
+			if firstNodeEl == nil {
+				break
+			}
+
 			firstNode := firstNodeEl.Value.(*headerNode)
 
 			if bmsg.blockHash.IsEqual(firstNode.hash) {
-				// The header-list node carries the authoritative,
-				// PoW-verified, parent-independent height.
+				// The header-list node carries the authoritative, PoW-verified,
+				// parent-independent height.
 				headerHeight = firstNode.height
 
-				// Only remove non-checkpoint front nodes; a checkpoint node is
-				// still needed to verify the next round of headers links.
-				if !isCheckpointBlock {
+				if isCheckpointBlock {
+					// Retain the checkpoint node as the new leading seed: the next
+					// interval's first header must prove it links onto it. It is
+					// dropped later, when the block that follows it commits.
+					sm.headerListSeed = firstNodeEl
+				} else {
 					sm.headerList.Remove(firstNodeEl)
 				}
+
+				break
 			}
+
+			// The arriving block is not the front node. If the front is the stale
+			// leading seed (its block is already accounted for), drop it and
+			// re-check the new front — this is where a committed checkpoint/DB-best
+			// seed is finally removed, tied to the commit of the block after it.
+			// Otherwise the front is a real node whose block has not committed yet
+			// (blocks commit in front order, so this should not normally happen);
+			// leave the list untouched.
+			if firstNodeEl == sm.headerListSeed {
+				sm.headerList.Remove(firstNodeEl)
+				sm.headerListSeed = nil
+
+				continue
+			}
+
+			break
 		}
 	}
 
@@ -1672,6 +1723,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// from the block after this one up to the end of the chain (zero hash).
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
+	sm.headerListSeed = nil
 	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
 
 	locator := blockchain.BlockLocator([]*chainhash.Hash{&bmsg.blockHash})
@@ -2046,6 +2098,7 @@ func (sm *SyncManager) runPostBlockProcessing(peer *peerpkg.Peer, state *peerSyn
 
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
+	sm.headerListSeed = nil
 	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
 
 	locator := blockchain.BlockLocator([]*chainhash.Hash{&bmsg.blockHash})
@@ -2221,16 +2274,19 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	// C2: capture the current back of the list as the anchor for THIS header
-	// round — the element the first new header links onto. Once this interval's
-	// headers are fully received it is the stale anchor to drop before block
-	// fetching. With pipelining the list's Front() may now be a live header of
-	// an earlier interval whose block is still in flight, so removing Front()
-	// blindly could strand a needed node and stall an in-flight request; we
-	// remove this exact anchor element by identity instead. In the
-	// single-interval (non-pipelined) case the anchor IS Front(), so behaviour
-	// is unchanged.
-	anchorEl := sm.headerList.Back()
+	// Header-list nodes are removed ONLY on block-fetch progress, never on a
+	// header-download event. A checkpoint interval on mainnet spans many
+	// getheaders messages (MaxBlockHeadersPerMsg = 2000; an interval is 30-50k
+	// blocks), and intervals overlap block fetching. So Back()-at-message-start
+	// is NOT necessarily the stale DB-best seed — on any non-first message of an
+	// interval it is a real header ~2000 blocks below the checkpoint tip whose
+	// block has not been requested yet (block fetch is bounded to
+	// calculateMaxInFlightBlocks, 1-20). Removing it here would splice out a node
+	// whose block is still pending, so fetchHeaderBlocks' Next() walk would skip
+	// it and its block would never be fetched — a header-list gap that wedges the
+	// sync. The DB-best seed is instead dropped exactly once in fetchHeaderBlocks
+	// (headerListDummy), and every real node is removed from the front by
+	// handleBlockPreamble only after its block is processed.
 
 	// Process all the received headers ensuring each one connects to the
 	// previous and that checkpoints match.
@@ -2303,16 +2359,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// checkpoint BLOCK was processed, so block fetching idled at each boundary
 	// while headers-first had nothing to fetch.
 	if receivedCheckpoint {
-		// Remove the stale anchor node for this round (the element the first
-		// header of this batch linked onto) before fetching blocks. Removing
-		// by identity — not Front() — is required once intervals overlap: with
-		// pipelining Front() can be a live earlier-interval header whose block
-		// is still being fetched, and dropping it would strand a needed node
-		// and leave an in-flight block request with no matching list entry.
-		// list.Remove is a safe no-op if the element is no longer in the list.
-		if anchorEl != nil {
-			sm.headerList.Remove(anchorEl)
-		}
+		// No list surgery here: node removal is tied to block-fetch progress, not
+		// to this header-download event (see the note above where the anchor
+		// capture used to be). fetchHeaderBlocks drops the DB-best seed once and
+		// requests the pending blocks; the block-commit front-removal in
+		// handleBlockPreamble consumes the list from the oldest end as blocks are
+		// processed. This is safe across the multi-message continuous model
+		// because it never removes a node whose block is still pending.
 		sm.logger.Infof("Received %v block headers: Fetching blocks", sm.headerList.Len())
 		sm.fetchHeaderBlocks()
 

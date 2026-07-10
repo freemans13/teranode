@@ -1733,28 +1733,32 @@ func TestHandleHeadersMsg_ConcurrentPipelineIsRaceFree(t *testing.T) {
 	<-sm.handlerDone
 }
 
-// TestHandleHeadersMsg_RemovesStaleAnchorByIdentity is the deterministic C2
-// test. Once intervals overlap, the front of the header list can be a LIVE
-// earlier-interval header whose block is still being fetched, while the stale
-// anchor the current batch links onto sits at the BACK. The old code removed
-// Front() blindly at the checkpoint boundary, dropping the live header and
-// stranding its in-flight block request. The fix removes the anchor by
-// identity, so the live header survives and the anchor is gone.
-func TestHandleHeadersMsg_RemovesStaleAnchorByIdentity(t *testing.T) {
-	// liveHash: an interval-N header whose block is still in flight (must NOT be
-	// removed). anchorHash: interval-N's checkpoint node, the parent the new
-	// batch links onto (the stale anchor that SHOULD be removed this round).
-	liveHash := chainhash.Hash{0x11}
-	anchorHash := chainhash.Hash{0x22}
+// TestHeaderList_NodesRemovedOnBlockFetchProgressNotHeaderEvents is the
+// block-fetch-progress lifecycle test (replaces the old C2 anchor-by-identity
+// test, whose header-event removal is exactly the stranding bug that has been
+// removed). It asserts the corrected invariant directly:
+//
+//   - a header-download event (handleHeadersMsg, even at a checkpoint boundary)
+//     removes NOTHING from the list — every downloaded node survives; and
+//   - a leading seed node (the DB-best dummy, then a retained checkpoint node)
+//     is removed only when the block that FOLLOWS it commits, i.e. tied to
+//     block-fetch progress in handleBlockPreamble.
+//
+// This is the guarantee that no un-fetched near-tip node can be stranded.
+func TestHeaderList_NodesRemovedOnBlockFetchProgressNotHeaderEvents(t *testing.T) {
+	base := chainhash.Hash{0x11}
 
-	// Interval N+1 links onto the anchor and ends at its checkpoint.
-	interval, hashes := buildHeaderChain(anchorHash, 5, 7000)
-	cpHeight := int32(20) // anchor sits at height 15, batch runs 16..20
+	// One interval: base(dummy) -> h1..h4 -> cp (height 5). A second checkpoint
+	// sits further on so cp is NOT the final checkpoint — its block commit
+	// retains cp's node as the next interval's seed instead of clearing the list.
+	interval, hashes := buildHeaderChain(base, 5, 7000)
+	cpHeight := int32(5)
 	cpHash := hashes[len(hashes)-1]
 
 	chainParams := chaincfg.MainNetParams
 	chainParams.Checkpoints = []chaincfg.Checkpoint{
 		{Height: cpHeight, Hash: &cpHash},
+		{Height: 10, Hash: &chainhash.Hash{0x99}},
 	}
 
 	syncPeerCfg := peer.Config{
@@ -1771,7 +1775,18 @@ func TestHandleHeadersMsg_RemovesStaleAnchorByIdentity(t *testing.T) {
 	require.NoError(t, err)
 	defer syncPeer.DisconnectWithInfo("test done")
 
+	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
+	bestHeader := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+	}
 	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil).Maybe()
+	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil).Maybe()
+	blockchainClient.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 1}, nil).Maybe()
+	blockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{bestHeader.Hash()}, nil).Maybe()
 	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
 
@@ -1789,6 +1804,7 @@ func TestHandleHeadersMsg_RemovesStaleAnchorByIdentity(t *testing.T) {
 		blockchainClient: blockchainClient,
 		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
 		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
 		headerList:       list.New(),
 		blockSizeTracker: newBlockSizeTracker(20),
 	}
@@ -1800,37 +1816,71 @@ func TestHandleHeadersMsg_RemovesStaleAnchorByIdentity(t *testing.T) {
 	sm.nextCheckpoint = &chainParams.Checkpoints[0]
 	sm.headerCheckpoint = &chainParams.Checkpoints[0]
 
-	// Seed the list so Front() is the live header and Back() is the anchor the
-	// new batch will link onto — the overlapping-interval situation.
-	liveEl := sm.headerList.PushBack(&headerNode{height: 14, hash: &liveHash})
-	anchorEl := sm.headerList.PushBack(&headerNode{height: 15, hash: &anchorHash})
+	// Seed the DB-best dummy exactly as resetHeaderState does, tracking it as the
+	// leading seed.
+	dummyEl := sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	sm.headerListSeed = dummyEl
 
-	require.Same(t, liveEl, sm.headerList.Front(), "precondition: live header is at the front")
-	require.Same(t, anchorEl, sm.headerList.Back(), "precondition: anchor is at the back")
+	countNodes := func() int { return sm.headerList.Len() }
+	inList := func(h *chainhash.Hash) bool {
+		for e := sm.headerList.Front(); e != nil; e = e.Next() {
+			if e.Value.(*headerNode).hash.IsEqual(h) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Deliver the interval's headers (ends at the checkpoint). This is a
+	// header-download event: it must ADD nodes and REMOVE none.
+	require.Equal(t, 1, countNodes(), "precondition: only the DB-best dummy is seeded")
 
 	msg := wire.NewMsgHeaders()
 	for _, h := range interval {
 		require.NoError(t, msg.AddBlockHeader(h))
 	}
-
 	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+	require.True(t, syncPeer.Connected(), "peer stays connected on a matching checkpoint")
 
-	require.True(t, syncPeer.Connected(), "peer must stay connected on a matching checkpoint")
+	// INVARIANT (a): the header event removed nothing — dummy + 5 headers = 6.
+	require.Equal(t, 6, countNodes(), "a header-download event must not remove any node (dummy + 5 headers)")
+	require.Same(t, dummyEl, sm.headerListSeed, "the DB-best dummy is still the leading seed after the header event")
+	require.True(t, inList(&base), "dummy survives the header event")
+	require.True(t, inList(&cpHash), "checkpoint node survives the header event")
 
-	// C2: the live header must NOT have been dropped; the stale anchor must be gone.
-	var liveFound, anchorFound bool
-	for e := sm.headerList.Front(); e != nil; e = e.Next() {
-		n := e.Value.(*headerNode)
-		if n.hash.IsEqual(&liveHash) {
-			liveFound = true
-		}
-		if n.hash.IsEqual(&anchorHash) {
-			anchorFound = true
-		}
+	processBlock := func(h *wire.BlockHeader, height int32) {
+		msgBlock := wire.NewMsgBlock(h)
+		hash := msgBlock.Header.BlockHash()
+		state.requestedBlocks.Set(hash, struct{}{})
+		sm.requestedBlocks.Set(hash, struct{}{})
+		require.NoError(t, sm.handleBlockMsg(&blockQueueMsg{
+			block: msgBlock, blockHash: hash, blockHeight: height, peer: syncPeer,
+		}))
 	}
 
-	require.True(t, liveFound, "live earlier-interval header must survive the checkpoint boundary (not dropped by a blind Front() removal)")
-	require.False(t, anchorFound, "the stale anchor node must have been removed by identity")
+	// INVARIANT (b): committing h1 (the block AFTER the dummy) drops the dummy
+	// seed AND h1's node — a block-fetch-progress removal, not a header event.
+	processBlock(interval[0], 1)
+	require.False(t, inList(&base), "dummy seed is removed when the block that follows it (h1) commits")
+	require.False(t, inList(&hashes[0]), "h1's own node is removed on its commit")
+	require.Nil(t, sm.headerListSeed, "seed cleared once the dummy is dropped")
+	require.Equal(t, 4, countNodes(), "after h1: h2,h3,h4,cp remain")
+
+	// Commit h2..h4: each removed from the front on its own commit.
+	for i := 1; i < 4; i++ {
+		processBlock(interval[i], int32(i+1))
+		require.False(t, inList(&hashes[i]), "h%d removed on commit", i+1)
+	}
+	require.Equal(t, 1, countNodes(), "only the checkpoint node remains before its block commits")
+	require.True(t, inList(&cpHash), "checkpoint node still present until its block commits")
+
+	// Commit the checkpoint block: its node is RETAINED as the new leading seed
+	// (for the next interval's linkage), not removed.
+	processBlock(interval[4], cpHeight)
+	require.True(t, inList(&cpHash), "checkpoint node is retained as the new leading seed after its block commits")
+	require.NotNil(t, sm.headerListSeed, "checkpoint node becomes the new leading seed")
+	require.True(t, sm.headerListSeed.Value.(*headerNode).hash.IsEqual(&cpHash),
+		"the retained seed is the checkpoint node")
 }
 
 // TestHandleHeadersMsg_NoPanicPastFinalCheckpoint is the deterministic C3 test.
@@ -2037,9 +2087,12 @@ func TestHandleBlockMsg_CheckpointRecognizedByHashAfterPipelineRanAhead(t *testi
 	require.True(t, syncPeer.Connected(), "peer must stay connected after interval 1")
 
 	// Step 2: process interval-2 headers BEFORE cp1's block. This is the crux of
-	// the pipeline: interval-2's anchor is cp1's node, so receivedCheckpoint
-	// removes cp1's node from the header list by identity — while cp1's BLOCK has
-	// not been processed yet.
+	// the pipeline: interval-2's headers link onto cp1's node while cp1's BLOCK
+	// has not been processed yet. Under the block-fetch-progress lifecycle cp1's
+	// node is RETAINED as the leading seed for interval 2's linkage (it is only
+	// dropped when interval-2's first block commits), and nothing is removed on
+	// this header-download event — so recognition must not depend on cp1 being at
+	// Front().
 	msg2 := wire.NewMsgHeaders()
 	for _, h := range interval2 {
 		require.NoError(t, msg2.AddBlockHeader(h))
@@ -2047,16 +2100,19 @@ func TestHandleBlockMsg_CheckpointRecognizedByHashAfterPipelineRanAhead(t *testi
 	sm.handleHeadersMsg(&headersMsg{headers: msg2, peer: syncPeer})
 	require.True(t, syncPeer.Connected(), "peer must stay connected after interval 2")
 
-	// Confirm the interleaving precondition: cp1's node is gone from the header
-	// list even though cp1's block has not been processed. This is exactly what
-	// broke position-based recognition.
+	// Confirm the interleaving precondition: cp1's node is still in the list
+	// (retained as the seed) but interval-2's headers have already been pushed
+	// PAST it, so cp1 is no longer at Front(). Position-based recognition would
+	// therefore fail to recognise cp1's block; hash-based recognition still works.
 	cp1StillInList := false
 	for e := sm.headerList.Front(); e != nil; e = e.Next() {
 		if e.Value.(*headerNode).hash.IsEqual(&cp1Hash) {
 			cp1StillInList = true
 		}
 	}
-	require.False(t, cp1StillInList, "precondition: cp1's anchor node must already be removed by the pipeline before cp1's block is processed")
+	require.True(t, cp1StillInList, "cp1's node is retained as the leading seed until interval-2's first block commits")
+	require.False(t, sm.headerList.Front().Value.(*headerNode).hash.IsEqual(&cp1Hash),
+		"cp1 is no longer at Front() (interval-2 headers were pushed past it), so recognition must be by hash not position")
 
 	// Step 3: now process interval-1's blocks in order — the non-checkpoint ones
 	// (h1..h4) then cp1's block. Real block processing, interleaved after the
@@ -2088,4 +2144,253 @@ func TestHandleBlockMsg_CheckpointRecognizedByHashAfterPipelineRanAhead(t *testi
 	require.False(t, sm.headersFirstMode.Load(),
 		"final-checkpoint block must clear headers-first mode and switch to normal mode")
 	require.True(t, syncPeer.Connected(), "peer must survive the whole interleaved run")
+}
+
+// TestHeadersFirst_MultiMessageInterval_NoStrandedBlock is the mainnet-regime
+// regression test for the header-list stranded-block wedge. It reproduces the
+// REAL production shape the earlier tests missed: a single checkpoint interval
+// that spans TWO headers messages (on mainnet an interval is 30-50k blocks and
+// go-wire caps a message at MaxBlockHeadersPerMsg = 2000, so ~25 messages per
+// interval), with the in-flight block bound SMALLER than the interval so block
+// fetching genuinely lags header download.
+//
+// RED against a3e9c3914: at the start of the LAST message of the interval,
+// Back() is a real, un-fetched header ~2000 blocks below the checkpoint tip
+// (here: the last header of message A). The old receivedCheckpoint code removed
+// that Back()-captured anchor from the list, so fetchHeaderBlocks' Next() walk
+// skipped it and its block was never requested — a permanent header-list gap.
+// The subtest with the checkpoint alone in the final message strands the block
+// immediately below the checkpoint, wedging the interval.
+//
+// GREEN after the fix: nodes are removed only on block-fetch progress, never on
+// a header event, so the anchor survives and every block in the interval —
+// including the checkpoint block — is requested; nextCheckpoint advances and
+// (at the final checkpoint) headersFirstMode clears. No wedge.
+func TestHeadersFirst_MultiMessageInterval_NoStrandedBlock(t *testing.T) {
+	// splitAt controls how the 8-header interval (h1..h7 -> cp8) is divided
+	// across the two messages. splitAt=5 puts h1..h5 in message A and h6,h7,cp8
+	// in message B (anchor = h5, mid-interval). splitAt=7 puts h1..h7 in message
+	// A and ONLY cp8 in message B (anchor = h7, the block immediately below the
+	// checkpoint) — the wedge-the-checkpoint case.
+	for _, tc := range []struct {
+		name    string
+		splitAt int
+	}{
+		{"anchor mid-interval", 5},
+		{"final message carries only the checkpoint", 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := chainhash.Hash{0x5a, byte(tc.splitAt)}
+
+			// Interval: base(dummy) -> h1..h7 -> cp8. Two checkpoints so cp8 is
+			// not final for the intermediate advance, plus a final one so the
+			// mode transition is exercised too.
+			const intervalLen = 8
+			interval, hashes := buildHeaderChain(base, intervalLen, 3000+uint32(tc.splitAt)*100)
+			cpHeight := int32(intervalLen)
+			cpHash := hashes[len(hashes)-1]
+
+			// A trailing final checkpoint so the mode clears when we drive cp8's
+			// successor interval to completion further below.
+			interval2, hashes2 := buildHeaderChain(cpHash, 3, 6000+uint32(tc.splitAt)*100)
+			cp2Height := int32(intervalLen + 3)
+			cp2Hash := hashes2[len(hashes2)-1]
+
+			chainParams := chaincfg.MainNetParams
+			chainParams.Checkpoints = []chaincfg.Checkpoint{
+				{Height: cpHeight, Hash: &cpHash},
+				{Height: cp2Height, Hash: &cp2Hash},
+			}
+
+			// Capture every block hash the sync peer requests via getdata,
+			// accumulated across all fetch rounds.
+			var mu sync.Mutex
+			requested := make(map[chainhash.Hash]struct{})
+			counterpartCfg := peer.Config{
+				Listeners: peer.MessageListeners{
+					OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {},
+					OnGetData: func(_ *peer.Peer, msg *wire.MsgGetData) {
+						mu.Lock()
+						for _, iv := range msg.InvList {
+							requested[iv.Hash] = struct{}{}
+						}
+						mu.Unlock()
+					},
+				},
+				UserAgentName:    "netsynctest",
+				UserAgentVersion: "1.0",
+				ChainParams:      &chainParams,
+				Services:         wire.SFNodeNetwork,
+			}
+			syncPeerCfg := peer.Config{
+				Listeners: peer.MessageListeners{
+					OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {},
+					OnGetData:    func(_ *peer.Peer, _ *wire.MsgGetData) {},
+				},
+				UserAgentName:    "netsynctest",
+				UserAgentVersion: "1.0",
+				ChainParams:      &chainParams,
+				Services:         wire.SFNodeNetwork,
+			}
+			_, syncPeer, err := MakeConnectedPeers(t, counterpartCfg, syncPeerCfg, 6)
+			require.NoError(t, err)
+			defer syncPeer.DisconnectWithInfo("test done")
+
+			isRequested := func(h *chainhash.Hash) bool {
+				mu.Lock()
+				defer mu.Unlock()
+				_, ok := requested[*h]
+				return ok
+			}
+
+			catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
+			bestHeader := &model.BlockHeader{
+				HashPrevBlock:  &chainhash.Hash{},
+				HashMerkleRoot: &chainhash.Hash{},
+			}
+			blockchainClient := &blockchain2.Mock{}
+			blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil).Maybe()
+			blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil).Maybe()
+			blockchainClient.On("GetBestBlockHeader", mock.Anything).
+				Return(bestHeader, &model.BlockHeaderMeta{Height: 1}, nil).Maybe()
+			blockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+				Return([]*chainhash.Hash{bestHeader.Hash()}, nil).Maybe()
+			// haveInventory: not-found so fetchHeaderBlocks requests every block.
+			blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+				Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+
+			state := &peerSyncState{
+				requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+				requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+			}
+			defer state.requestedTxns.Stop()
+			defer state.requestedBlocks.Stop()
+
+			sm := &SyncManager{
+				ctx:              context.Background(),
+				logger:           ulogger.TestLogger{},
+				chainParams:      &chainParams,
+				blockchainClient: blockchainClient,
+				peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+				requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+				rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
+				headerList:       list.New(),
+				// maxSamples 4, preloaded below with ~1.5 GB samples so
+				// calculateMaxInFlightBlocks returns 2 — an in-flight bound far
+				// SMALLER than the 8-block interval, forcing multiple bounded
+				// fetch rounds interleaved with commits (the real regime).
+				blockSizeTracker: newBlockSizeTracker(4),
+			}
+			defer sm.requestedBlocks.Stop()
+
+			const oneAndHalfGB = int64(1536) * 1024 * 1024
+			for i := 0; i < 4; i++ {
+				sm.blockSizeTracker.addBlockSize(oneAndHalfGB)
+			}
+			require.Equal(t, 2, sm.blockSizeTracker.calculateMaxInFlightBlocks(),
+				"precondition: in-flight bound must be smaller than the interval")
+
+			sm.peerStates.Set(syncPeer, state)
+			sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+			sm.headersFirstMode.Store(true)
+			sm.nextCheckpoint = &chainParams.Checkpoints[0]
+			sm.headerCheckpoint = &chainParams.Checkpoints[0]
+			sm.headerListSeed = sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+
+			// Deliver the interval across TWO messages. Message A carries the
+			// first splitAt headers (no checkpoint); message B carries the rest,
+			// ending at the checkpoint. This is the multi-message regime: at the
+			// start of message B, Back() is interval[splitAt-1] — a real header
+			// whose block is NOT fetched yet (fetchHeaderBlocks has not run).
+			msgA := wire.NewMsgHeaders()
+			for _, h := range interval[:tc.splitAt] {
+				require.NoError(t, msgA.AddBlockHeader(h))
+			}
+			sm.handleHeadersMsg(&headersMsg{headers: msgA, peer: syncPeer})
+			require.True(t, syncPeer.Connected(), "peer stays connected after message A")
+
+			msgB := wire.NewMsgHeaders()
+			for _, h := range interval[tc.splitAt:] {
+				require.NoError(t, msgB.AddBlockHeader(h))
+			}
+			sm.handleHeadersMsg(&headersMsg{headers: msgB, peer: syncPeer})
+			require.True(t, syncPeer.Connected(), "peer stays connected after message B (checkpoint matched)")
+
+			// INVARIANT (b): message B removed nothing — every interval node plus
+			// the DB-best dummy is still present. On a3e9c3914 the Back()-anchor
+			// (interval[splitAt-1]) was spliced out here.
+			for i, h := range hashes {
+				hCopy := h
+				require.True(t, nodeInList(sm.headerList, &hCopy),
+					"interval header h%d must survive the multi-message boundary (node not stranded by a header event)", i+1)
+			}
+
+			processBlock := func(h *wire.BlockHeader, height int32) {
+				msgBlock := wire.NewMsgBlock(h)
+				hash := msgBlock.Header.BlockHash()
+				state.requestedBlocks.Set(hash, struct{}{})
+				sm.requestedBlocks.Set(hash, struct{}{})
+				require.NoError(t, sm.handleBlockMsg(&blockQueueMsg{
+					block: msgBlock, blockHash: hash, blockHeight: height, peer: syncPeer,
+				}))
+			}
+
+			// Drive bounded fetch + commit rounds: fetchHeaderBlocks already ran
+			// at receivedCheckpoint (requesting the first 2), so commit the
+			// interval's blocks in order; each commit's pumpBlockRequests refills
+			// the bounded in-flight window from the list, requesting the next
+			// blocks. This interleaves real block processing with the header list.
+			for i := 0; i < intervalLen; i++ {
+				processBlock(interval[i], int32(i+1))
+			}
+
+			// INVARIANT (a): EVERY block in the interval was requested via getdata,
+			// including the checkpoint block. On a3e9c3914 the stranded node's
+			// hash never appears here. Poll to let the last getdata cross the pipe.
+			for i, h := range hashes {
+				hCopy := h
+				requestedIt := WaitUntil(func() bool { return isRequested(&hCopy) }, 3*time.Second)
+				require.True(t, requestedIt,
+					"block for interval header h%d (height %d) must be requested — no stranded/skipped node", i+1, i+1)
+			}
+
+			// INVARIANT (c): nextCheckpoint advanced past cp8 once its block
+			// committed (recognised by hash), and headers-first mode is still on
+			// because cp8 is not the final checkpoint.
+			require.NotNil(t, sm.nextCheckpoint, "nextCheckpoint must advance after the checkpoint block commits")
+			require.Equal(t, cp2Height, sm.nextCheckpoint.Height, "nextCheckpoint advances to the next checkpoint")
+			require.True(t, sm.headersFirstMode.Load(), "still headers-first: cp8 is not the final checkpoint")
+
+			// Drive the trailing final interval to prove the mode transition still
+			// happens (no wedge): deliver its headers, then commit its blocks.
+			msgFinal := wire.NewMsgHeaders()
+			for _, h := range interval2 {
+				require.NoError(t, msgFinal.AddBlockHeader(h))
+			}
+			sm.handleHeadersMsg(&headersMsg{headers: msgFinal, peer: syncPeer})
+			require.True(t, syncPeer.Connected(), "peer stays connected after the final interval headers")
+
+			for i := 0; i < len(interval2); i++ {
+				processBlock(interval2[i], int32(intervalLen+1+i))
+			}
+
+			// INVARIANT (d): the final checkpoint block cleared headers-first mode
+			// — the interval completed with no wedge.
+			require.False(t, sm.headersFirstMode.Load(),
+				"final checkpoint must clear headers-first mode: the multi-message interval completed without wedging")
+			require.True(t, syncPeer.Connected(), "peer survives the whole run")
+		})
+	}
+}
+
+// nodeInList reports whether a header node with the given hash is present in the
+// header list.
+func nodeInList(l *list.List, h *chainhash.Hash) bool {
+	for e := l.Front(); e != nil; e = e.Next() {
+		if e.Value.(*headerNode).hash.IsEqual(h) {
+			return true
+		}
+	}
+
+	return false
 }
