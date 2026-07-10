@@ -83,18 +83,23 @@ func TestWaitForBlockAssemblyReadyCached_FastPath(t *testing.T) {
 	require.Equal(t, int64(0), spy.calls.Load(), "fast path must not call GetBlockAssemblyState")
 }
 
-// TestWaitForBlockAssemblyReadyCached_SlowPath proves that when the cached
-// height does NOT satisfy the bound, the check falls through to the fresh-gRPC
-// wait (GetBlockAssemblyState is called) and surfaces that path's result.
+// TestWaitForBlockAssemblyReadyCached_SlowPath proves that a block on the
+// genuine remaining fresh-gRPC slow path (here ABOVE the checkpoint, where a
+// reorg could leave a stale-HIGH cache so the cache is never trusted) still
+// calls GetBlockAssemblyState and surfaces that path's result. Below-checkpoint
+// blocks with a usable-but-behind cache no longer take this path — they use the
+// fixed-interval cache-poll loop with no gRPC (see the _BelowCP_ tests).
 func TestWaitForBlockAssemblyReadyCached_SlowPath(t *testing.T) {
 	spy := &stateSpy{}
-	spy.height.Store(2000) // fresh gRPC reports a height that clears the bound
+	spy.height.Store(cacheTestCheckpointHeight + 2000) // fresh gRPC clears the bound
 	sm := newCacheTestManager(t, spy, 100)
 
-	// cached(1000) + maxBehind(100) = 1100 < blockHeight(1500): fast path fails.
-	sm.cachedBlockAssemblyHeight.Store(1000)
+	// Above-checkpoint block: cache is bypassed regardless of its value, so the
+	// fresh gRPC is used and reports a satisfying height.
+	aboveCP := uint32(cacheTestCheckpointHeight + 1500)
+	sm.cachedBlockAssemblyHeight.Store(cacheTestCheckpointHeight + 1000)
 
-	err := sm.waitForBlockAssemblyReadyCached(context.Background(), 1500)
+	err := sm.waitForBlockAssemblyReadyCached(context.Background(), aboveCP)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, spy.calls.Load(), int64(1), "slow path must call GetBlockAssemblyState")
 }
@@ -112,21 +117,30 @@ func TestWaitForBlockAssemblyReadyCached_UnpolledFallsThrough(t *testing.T) {
 	require.GreaterOrEqual(t, spy.calls.Load(), int64(1), "unpolled cache must take the slow path")
 }
 
-// TestWaitForBlockAssemblyReadyCached_StaleLowSafe proves the safety invariant:
-// a stale-LOW cache (cached < true height) that does not itself clear the bound
-// must still fall through to the fresh gRPC — the fast path only passes when the
-// cached lower-bound already satisfies the bound, so it can never wrongly pass.
+// TestWaitForBlockAssemblyReadyCached_StaleLowSafe proves the safety invariant is
+// preserved by the cache-poll path: a stale-LOW cache (cached < true height) that
+// does not itself clear the bound must NOT pass immediately — the gate only passes
+// when the cached lower bound satisfies cached+maxBehind >= blockHeight. Below the
+// checkpoint the wait now polls the (monotonic, stale-low) cache instead of the
+// fresh gRPC, so it must NOT call GetBlockAssemblyState and must release only once
+// the cache itself advances past the bound.
 func TestWaitForBlockAssemblyReadyCached_StaleLowSafe(t *testing.T) {
 	spy := &stateSpy{}
-	spy.height.Store(1490) // true height clears the bound (1490+100=1590 >= 1500)
+	spy.height.Store(1490) // true height clears the bound, but the gRPC must be unused
 	sm := newCacheTestManager(t, spy, 100)
 
-	// Stale-low cache: 900+100 = 1000 < 1500, so fast path must NOT pass.
+	// Stale-low cache: 900+100 = 1000 < 1500, so the gate must NOT pass yet.
 	sm.cachedBlockAssemblyHeight.Store(900)
+
+	// Simulate the poller catching the cache up to the true height mid-wait.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		sm.cachedBlockAssemblyHeight.Store(1490) // 1490+100 = 1590 >= 1500
+	}()
 
 	err := sm.waitForBlockAssemblyReadyCached(context.Background(), 1500)
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, spy.calls.Load(), int64(1), "stale-low cache must defer to the fresh gRPC")
+	require.Equal(t, int64(0), spy.calls.Load(), "stale-low cache below checkpoint must poll the cache, not the fresh gRPC")
 }
 
 // TestWaitForBlockAssemblyReadyCached_AboveCheckpointForcesSlowPath proves the

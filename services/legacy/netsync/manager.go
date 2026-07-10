@@ -98,6 +98,25 @@ const (
 	// serial drain path. 250ms is far tighter than the 100-block maturity window,
 	// so the cache can never fall stale enough to matter.
 	blockAssemblyHeightPollInterval = 250 * time.Millisecond
+
+	// windowMaturityRecheckInterval is how often the below-checkpoint maturity
+	// wait re-reads the poller-refreshed cached block-assembly height while it is
+	// behind the bound. A short fixed interval (no gRPC in the loop — the
+	// blockAssemblyHeightPoller does that in the background) lets the parallel
+	// window re-engage within one interval of block assembly advancing, instead
+	// of the coarse 20ms->80ms->...->5s exponential backoff of the fresh-gRPC
+	// WaitForBlockAssemblyReady, which produced a bursty "+100 blocks every ~5s"
+	// lockstep rather than a smooth release at block-assembly's rate.
+	windowMaturityRecheckInterval = 200 * time.Millisecond
+
+	// windowMaturityMaxWait bounds the below-checkpoint cache-poll recheck loop so
+	// a GENUINE block-assembly stall (the cache never advances) is still detected
+	// and escalated instead of looping forever. On expiry the wait returns an
+	// error so the caller's existing recover/escalation path fires, preserving the
+	// stall-detection semantics of the old exponential path (which capped at 100
+	// retries). 30s is far longer than any legitimate block-assembly catch-up
+	// within the 100-block maturity window, yet escalates a true stall promptly.
+	windowMaturityMaxWait = 30 * time.Second
 )
 
 // zeroHash is the zero-value hash (all zeros).  It is defined as a convenience.
@@ -3494,21 +3513,86 @@ func (sm *SyncManager) DonePeer(peer *peerpkg.Peer, done chan struct{}) {
 func (sm *SyncManager) waitForBlockAssemblyReadyCached(ctx context.Context, blockHeight uint32) error {
 	maxBehind := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
 
-	// Fast path only below the highest hardcoded checkpoint (reorg-safe) and only
-	// when maxBehind is a valid positive window; a non-positive value or an
+	// Fast/cache path only below the highest hardcoded checkpoint (reorg-safe) and
+	// only when maxBehind is a valid positive window; a non-positive value or an
 	// above-checkpoint block defers entirely to the slow path, which validates and
 	// guards the bound with a fresh gRPC read.
+	//
+	// Below the checkpoint the cached height (refreshed every
+	// blockAssemblyHeightPollInterval by blockAssemblyHeightPoller) is a
+	// stale-LOW-or-equal lower bound on the true block-assembly height: the chain
+	// is pinned so the true height is monotonic and can only be >= cached. So if
+	// cached+maxBehind >= blockHeight, the true height also satisfies the bound and
+	// the maturity guarantee is preserved without any gRPC.
 	if maxBehind > 0 && sm.chainParams != nil && model.BelowCheckpoint(sm.chainParams.Checkpoints, blockHeight) {
-		cached := sm.cachedBlockAssemblyHeight.Load()
 		// Guard the uint32 addition against wraparound exactly as the slow-path
-		// helper does; on possible overflow, skip the fast path.
-		if cached > 0 && cached <= math.MaxUint32-uint32(maxBehind) && cached+uint32(maxBehind) >= blockHeight {
-			return nil
+		// helper does; on possible overflow, defer to the slow path.
+		if cached := sm.cachedBlockAssemblyHeight.Load(); cached > 0 && cached <= math.MaxUint32-uint32(maxBehind) {
+			if cached+uint32(maxBehind) >= blockHeight {
+				return nil
+			}
+
+			// Cache is usable (polled, non-overflow) but behind the bound. Instead of
+			// the coarse exponential-backoff fresh-gRPC wait (20ms,80ms,...,5s steps
+			// that leave the parallel window idle in ~5s bursts), re-check the
+			// poller-refreshed cache at a short fixed interval so the window
+			// re-engages within one interval of block assembly advancing — a smooth,
+			// steady release at block-assembly's rate. No gRPC in this loop; the
+			// background poller does that. The loop is bounded by windowMaturityMaxWait
+			// so a genuine block-assembly stall (cache never advances) is still
+			// detected and escalated with an error, preserving the stall-detection
+			// semantics of the old 100-retry exponential path.
+			return sm.waitForBlockAssemblyCachePoll(ctx, blockHeight, maxBehind)
 		}
 	}
 
-	// Slow path: unchanged fresh-gRPC wait (retry loop + overflow guard).
+	// Slow path: unchanged fresh-gRPC wait (retry loop + overflow guard). Taken for
+	// above-checkpoint blocks, a non-positive window, or a below-checkpoint block
+	// whose cache is unpolled (0) or would overflow the uint32 addition.
 	return blockassemblyutil.WaitForBlockAssemblyReady(ctx, sm.logger, sm.blockAssembly, blockHeight, maxBehind)
+}
+
+// waitForBlockAssemblyCachePoll re-checks the poller-refreshed cached
+// block-assembly height at windowMaturityRecheckInterval until it satisfies the
+// coinbase-maturity bound (cached+maxBehind >= blockHeight), returning nil as
+// soon as it does. It does NO gRPC — the background blockAssemblyHeightPoller
+// keeps the cache fresh — so the parallel window re-engages within one interval
+// of block assembly advancing rather than on the old exponential backoff.
+//
+// The loop is bounded by windowMaturityMaxWait: on expiry it returns an error so
+// the caller's existing recover/escalation path fires (a genuine block-assembly
+// stall is never masked as forever-waiting). It also returns promptly on ctx
+// cancellation or sm.quit (shutdown). The maturity guarantee is unchanged: the
+// gate condition is identical to the fast path, only the re-check cadence differs
+// (fixed-interval cache read instead of exponential fresh gRPC); the stale-LOW
+// cache makes a pass imply the true height also clears the bound.
+func (sm *SyncManager) waitForBlockAssemblyCachePoll(ctx context.Context, blockHeight uint32, maxBehind int) error {
+	deadline := time.NewTimer(windowMaturityMaxWait)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(windowMaturityRecheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.quit:
+			return errors.NewProcessingError("[waitForBlockAssemblyCachePoll] shutting down while waiting for block assembly to reach block height %d (cached height %d)", blockHeight, sm.cachedBlockAssemblyHeight.Load())
+		case <-ctx.Done():
+			return errors.NewProcessingError("[waitForBlockAssemblyCachePoll] context cancelled while waiting for block assembly to reach block height %d (cached height %d)", blockHeight, sm.cachedBlockAssemblyHeight.Load(), ctx.Err())
+		case <-deadline.C:
+			// Bounded escalation: block assembly did not advance within the max wait,
+			// so treat it as a stall and surface an error to the caller's recovery
+			// path, matching the old exponential path's retry-exhaustion behaviour.
+			return errors.NewProcessingError("[waitForBlockAssemblyCachePoll] block assembly is behind, block height %d, cached block assembly height %d, gave up after %s", blockHeight, sm.cachedBlockAssemblyHeight.Load(), windowMaturityMaxWait)
+		case <-ticker.C:
+			cached := sm.cachedBlockAssemblyHeight.Load()
+			// Re-apply the same overflow-guarded bound as the fast path; the cache is
+			// monotonic below the checkpoint so it stays usable once it was.
+			if cached > 0 && cached <= math.MaxUint32-uint32(maxBehind) && cached+uint32(maxBehind) >= blockHeight {
+				return nil
+			}
+		}
+	}
 }
 
 // blockAssemblyHeightPoller periodically refreshes cachedBlockAssemblyHeight
