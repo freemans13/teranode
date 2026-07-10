@@ -1906,3 +1906,186 @@ func TestHandleHeadersMsg_NoPanicPastFinalCheckpoint(t *testing.T) {
 
 	require.True(t, syncPeer.Connected(), "a headers message past the final checkpoint must be ignored, not fatal")
 }
+
+// TestHandleBlockMsg_CheckpointRecognizedByHashAfterPipelineRanAhead is the
+// C-NEW regression test. It interleaves REAL block processing (handleBlockMsg ->
+// handleBlockPreamble -> HandleBlockDirect) with header pipelining, in the exact
+// order the pipeline produces in production: interval N+1's headers are fully
+// processed FIRST — which removes checkpoint-N's anchor node from the header
+// list by identity — and only THEN is checkpoint-N's block processed.
+//
+// On acafe3725 (position-based recognition) this wedges: once cp1's node is
+// gone from the list, handleBlockPreamble's Front() no longer matches cp1's
+// hash, isCheckpointBlock stays false, and nextCheckpoint never advances past
+// cp1 — so headersFirstMode is never cleared and the node stays in headers-first
+// mode forever. That is the RED failure this test asserts against.
+//
+// After the fix (recognition by hash against nextCheckpoint) cp1 is recognised
+// even though its node was already removed, nextCheckpoint advances to cp2, and
+// once cp2's block is processed (the final checkpoint) headersFirstMode is
+// cleared and the node transitions to normal mode. That is the GREEN behaviour.
+//
+// HandleBlockDirect is exercised for real; GetBlockExists returns true so it
+// takes its clean early-return path (block already in our chain) instead of the
+// heavyweight validate/store stack — the recognition + advance logic under test
+// runs identically either way.
+func TestHandleBlockMsg_CheckpointRecognizedByHashAfterPipelineRanAhead(t *testing.T) {
+	base := chainhash.Hash{0xf0, 0x0d}
+
+	// Interval 1: base -> h1..h4 -> cp1 (height 5).
+	interval1, hashes1 := buildHeaderChain(base, 5, 1000)
+	cp1Height := int32(5)
+	cp1Hash := hashes1[len(hashes1)-1]
+
+	// Interval 2: cp1 -> h6..h9 -> cp2 (height 10).
+	interval2, hashes2 := buildHeaderChain(cp1Hash, 5, 2000)
+	cp2Height := int32(10)
+	cp2Hash := hashes2[len(hashes2)-1]
+
+	chainParams := chaincfg.MainNetParams
+	chainParams.Checkpoints = []chaincfg.Checkpoint{
+		{Height: cp1Height, Hash: &cp1Hash},
+		{Height: cp2Height, Hash: &cp2Hash},
+	}
+
+	syncPeerCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {},
+			OnGetData:    func(_ *peer.Peer, _ *wire.MsgGetData) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	_, syncPeer, err := MakeConnectedPeers(t, syncPeerCfg, syncPeerCfg, 5)
+	require.NoError(t, err)
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
+
+	// Best block sits below the final checkpoint, so current() is false and the
+	// FSM RUN branch in handleBlockMsg is skipped — keeps the test focused on
+	// checkpoint recognition / nextCheckpoint advance.
+	bestHeader := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+	}
+
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil).Maybe()
+	// HandleBlockDirect: block already exists -> clean early nil return.
+	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil).Maybe()
+	blockchainClient.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 1}, nil).Maybe()
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+	blockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{bestHeader.Hash()}, nil).Maybe()
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+	sm.nextCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+
+	// processBlock feeds a header through the REAL block path. requestedBlocks is
+	// seeded first so the preamble's unrequested-block guard passes.
+	processBlock := func(h *wire.BlockHeader, height int32) error {
+		msgBlock := wire.NewMsgBlock(h)
+		hash := msgBlock.Header.BlockHash()
+		state.requestedBlocks.Set(hash, struct{}{})
+		sm.requestedBlocks.Set(hash, struct{}{})
+
+		return sm.handleBlockMsg(&blockQueueMsg{
+			block:       msgBlock,
+			blockHash:   hash,
+			blockHeight: height,
+			peer:        syncPeer,
+		})
+	}
+
+	// Step 1: process interval-1 headers. This removes the base anchor, fetches
+	// interval-1 blocks and pipelines interval-2's getheaders ahead.
+	msg1 := wire.NewMsgHeaders()
+	for _, h := range interval1 {
+		require.NoError(t, msg1.AddBlockHeader(h))
+	}
+	sm.handleHeadersMsg(&headersMsg{headers: msg1, peer: syncPeer})
+	require.True(t, sm.headersFirstMode.Load(), "headers-first mode must stay on after interval 1")
+	require.True(t, syncPeer.Connected(), "peer must stay connected after interval 1")
+
+	// Step 2: process interval-2 headers BEFORE cp1's block. This is the crux of
+	// the pipeline: interval-2's anchor is cp1's node, so receivedCheckpoint
+	// removes cp1's node from the header list by identity — while cp1's BLOCK has
+	// not been processed yet.
+	msg2 := wire.NewMsgHeaders()
+	for _, h := range interval2 {
+		require.NoError(t, msg2.AddBlockHeader(h))
+	}
+	sm.handleHeadersMsg(&headersMsg{headers: msg2, peer: syncPeer})
+	require.True(t, syncPeer.Connected(), "peer must stay connected after interval 2")
+
+	// Confirm the interleaving precondition: cp1's node is gone from the header
+	// list even though cp1's block has not been processed. This is exactly what
+	// broke position-based recognition.
+	cp1StillInList := false
+	for e := sm.headerList.Front(); e != nil; e = e.Next() {
+		if e.Value.(*headerNode).hash.IsEqual(&cp1Hash) {
+			cp1StillInList = true
+		}
+	}
+	require.False(t, cp1StillInList, "precondition: cp1's anchor node must already be removed by the pipeline before cp1's block is processed")
+
+	// Step 3: now process interval-1's blocks in order — the non-checkpoint ones
+	// (h1..h4) then cp1's block. Real block processing, interleaved after the
+	// headers ran ahead.
+	for i := 0; i < 4; i++ {
+		require.NoError(t, processBlock(interval1[i], int32(i+1)))
+	}
+
+	require.NoError(t, processBlock(interval1[4], cp1Height))
+
+	// CORE ASSERTION (RED on acafe3725): nextCheckpoint must have advanced from
+	// cp1 to cp2. On the old code it is stuck at cp1 because Front() no longer
+	// matched cp1's hash.
+	require.NotNil(t, sm.nextCheckpoint, "nextCheckpoint must not be nil after cp1's block")
+	require.Equal(t, cp2Height, sm.nextCheckpoint.Height,
+		"nextCheckpoint must advance to cp2 after cp1's block, recognised by hash despite its node being removed from the list")
+	require.True(t, sm.headersFirstMode.Load(), "still headers-first: cp2 is not the final checkpoint block yet")
+
+	// Step 4: process interval-2's blocks then cp2's block (the final checkpoint).
+	for i := 0; i < 4; i++ {
+		require.NoError(t, processBlock(interval2[i], int32(i+6)))
+	}
+
+	require.NoError(t, processBlock(interval2[4], cp2Height))
+
+	// FINAL-CHECKPOINT TRANSITION: after the last checkpoint block,
+	// findNextHeaderCheckpoint returns nil, so headers-first mode is cleared and
+	// the node switches to normal mode.
+	require.False(t, sm.headersFirstMode.Load(),
+		"final-checkpoint block must clear headers-first mode and switch to normal mode")
+	require.True(t, syncPeer.Connected(), "peer must survive the whole interleaved run")
+}

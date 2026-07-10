@@ -1407,28 +1407,47 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 		}
 	}
 
-	// When in headers-first mode, if the block matches the hash of the
-	// first header in the list of headers that are being fetched, it's
-	// eligible for less validation since the headers have already been
-	// verified to link together and are valid up to the next checkpoint.
-	// Also, remove the list entry for all blocks except the checkpoint
-	// since it is needed to verify the next round of headers links
-	// properly.
+	// When in headers-first mode, recognise the checkpoint block by its HASH
+	// directly, independent of the header list's front position. This is the
+	// C-NEW fix: header pipelining removes the checkpoint-N anchor node from the
+	// list as soon as interval N+1's headers arrive (remove-by-identity in
+	// handleHeadersMsg), which by the pipeline's design routinely happens BEFORE
+	// checkpoint-N's block is processed. So by the time this checkpoint block
+	// arrives its node may no longer be at Front() — or may be gone entirely.
+	// Recognising by hash decouples checkpoint recognition from the list
+	// position that pipelining disturbs, so nextCheckpoint still advances (and
+	// the final checkpoint still clears headers-first mode). The checkpoint hash
+	// is unique, so this is equivalent-or-better than the old position proxy.
+	//
+	// Independently of checkpoint recognition, keep maintaining the header list:
+	// when the block that just arrived IS the current front-of-list header AND
+	// it is NOT the checkpoint, remove it, since only checkpoint nodes are kept
+	// to verify the next round of headers links properly. The height is sourced
+	// from whichever list node matches (front for non-checkpoint blocks), as it
+	// carries the authoritative, PoW-verified, parent-independent height.
 	if sm.headersFirstMode.Load() {
+		if sm.nextCheckpoint != nil && bmsg.blockHash.IsEqual(sm.nextCheckpoint.Hash) {
+			isCheckpointBlock = true
+			// The checkpoint carries the same authoritative, PoW-verified,
+			// parent-independent height as its header-list node did. Surface it
+			// here so the window path keeps the correct height even in the
+			// pipelined case where the checkpoint's node was already removed
+			// from the list (so the Front() match below no longer fires for it).
+			headerHeight = sm.nextCheckpoint.Height
+		}
+
 		firstNodeEl := sm.headerList.Front()
 		if firstNodeEl != nil {
 			firstNode := firstNodeEl.Value.(*headerNode)
 
 			if bmsg.blockHash.IsEqual(firstNode.hash) {
 				// The header-list node carries the authoritative,
-				// PoW-verified, parent-independent height. Surface it for
-				// both the checkpoint-match and non-checkpoint-match cases —
-				// only the removal differs between them.
+				// PoW-verified, parent-independent height.
 				headerHeight = firstNode.height
 
-				if firstNode.hash.IsEqual(sm.nextCheckpoint.Hash) {
-					isCheckpointBlock = true
-				} else {
+				// Only remove non-checkpoint front nodes; a checkpoint node is
+				// still needed to verify the next round of headers links.
+				if !isCheckpointBlock {
 					sm.headerList.Remove(firstNodeEl)
 				}
 			}
