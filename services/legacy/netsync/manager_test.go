@@ -2275,17 +2275,20 @@ func TestHeadersFirst_MultiMessageInterval_NoStrandedBlock(t *testing.T) {
 				requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 				rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
 				headerList:       list.New(),
-				// maxSamples 4, preloaded below with ~1.5 GB samples so
+				// maxSamples 4, preloaded below with ~1.5 GB / high-tx samples so
 				// calculateMaxInFlightBlocks returns 2 — an in-flight bound far
 				// SMALLER than the 8-block interval, forcing multiple bounded
-				// fetch rounds interleaved with commits (the real regime).
-				blockSizeTracker: newBlockSizeTracker(4),
+				// fetch rounds interleaved with commits (the real regime). The
+				// 3 GB byte budget with 1.5 GB blocks makes the byte-safety
+				// clamp bind at 2; a large tx budget keeps the tx-bound out of
+				// the way so the clamp is what limits us.
+				blockSizeTracker: newBlockSizeTrackerWithBudgets(4, 1<<30, 3*1024*1024*1024),
 			}
 			defer sm.requestedBlocks.Stop()
 
 			const oneAndHalfGB = int64(1536) * 1024 * 1024
 			for i := 0; i < 4; i++ {
-				sm.blockSizeTracker.addBlockSize(oneAndHalfGB)
+				sm.blockSizeTracker.addBlockStats(oneAndHalfGB, 2500)
 			}
 			require.Equal(t, 2, sm.blockSizeTracker.calculateMaxInFlightBlocks(),
 				"precondition: in-flight bound must be smaller than the interval")

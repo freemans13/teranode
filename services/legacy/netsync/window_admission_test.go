@@ -263,7 +263,7 @@ func TestWindowAdmission_CheckpointBlockBypassesWindow(t *testing.T) {
 func TestWindowAdmission_ByteBudget(t *testing.T) {
 	t.Run("normal case: 10 MB budget / 1 MB avg = K=10", func(t *testing.T) {
 		bst := newBlockSizeTracker(10)
-		bst.addBlockSize(1 * 1024 * 1024)
+		bst.addBlockStats(1*1024*1024, 0)
 
 		k := bst.calculateWindowK(10*1024*1024, 100)
 		require.Equal(t, 10, k)
@@ -271,7 +271,7 @@ func TestWindowAdmission_ByteBudget(t *testing.T) {
 
 	t.Run("admit-one floor: avg larger than budget → K=1", func(t *testing.T) {
 		bst := newBlockSizeTracker(10)
-		bst.addBlockSize(5 * 1024 * 1024 * 1024) // 5 GB average
+		bst.addBlockStats(5*1024*1024*1024, 0) // 5 GB average
 
 		k := bst.calculateWindowK(1*1024*1024*1024, 100) // 1 GB budget
 		require.Equal(t, 1, k, "huge avg block must clamp to admit-one floor K=1")
@@ -279,7 +279,7 @@ func TestWindowAdmission_ByteBudget(t *testing.T) {
 
 	t.Run("clamped to maxBlocks", func(t *testing.T) {
 		bst := newBlockSizeTracker(10)
-		bst.addBlockSize(1024) // 1 KB average → raw K=102400 for 100 MB budget
+		bst.addBlockStats(1024, 0) // 1 KB average → raw K=102400 for 100 MB budget
 
 		k := bst.calculateWindowK(100*1024*1024, 20)
 		require.Equal(t, 20, k, "K must be clamped to maxBlocks=20")
@@ -287,7 +287,7 @@ func TestWindowAdmission_ByteBudget(t *testing.T) {
 
 	t.Run("zero average → K=1 (admit-one floor)", func(t *testing.T) {
 		bst := newBlockSizeTracker(10)
-		// No addBlockSize call → avgSize=0.
+		// No addBlockStats call → avgSize=0.
 
 		k := bst.calculateWindowK(10*1024*1024, 100)
 		require.Equal(t, 1, k, "zero average size must yield K=1 (admit-one floor)")
@@ -295,7 +295,7 @@ func TestWindowAdmission_ByteBudget(t *testing.T) {
 
 	t.Run("maxBlocks=0 means no clamping", func(t *testing.T) {
 		bst := newBlockSizeTracker(10)
-		bst.addBlockSize(1 * 1024 * 1024)
+		bst.addBlockStats(1*1024*1024, 0)
 
 		k := bst.calculateWindowK(50*1024*1024, 0)
 		require.Equal(t, 50, k, "maxBlocks=0 must not clamp")

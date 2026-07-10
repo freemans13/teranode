@@ -328,75 +328,184 @@ type TxHashAndFee struct {
 	Size   uint64
 }
 
-// blockSizeTracker tracks recent block sizes and dynamically adjusts the
-// maximum number of in-flight blocks to avoid memory issues with large blocks.
+// Default in-flight fetch budgets used when the tracker is constructed without
+// explicit budgets (e.g. via newBlockSizeTracker in tests). Production wires
+// these from settings via newBlockSizeTrackerWithBudgets.
+const (
+	// defaultInFlightTxBudget bounds in-flight WORK by transaction count. Sized
+	// in the tens-of-thousands so tiny (1-2 tx) blocks stream many-in-flight and
+	// keep the sync peer's feed busy, while fat (~2500 tx) blocks resolve to a
+	// small handful in flight. 50k tx ≈ 20 blocks of ~2500 tx.
+	defaultInFlightTxBudget = 50000
+
+	// defaultInFlightByteBudgetFraction is the fraction of GOMEMLIMIT allowed as
+	// in-flight fetch bytes. 0.25 keeps in-flight memory to a quarter of the
+	// process budget even when tx counts under-represent memory (few huge txs),
+	// leaving headroom for validation, the window path, and the runtime.
+	defaultInFlightByteBudgetFraction = 0.25
+
+	// maxInFlightBlocksCap is the hard upper bound on in-flight blocks. It stops
+	// tiny (1-tx) blocks from producing an absurd request count regardless of
+	// the tx budget.
+	maxInFlightBlocksCap = 1024
+
+	// noSampleInFlightDefault is the safe fallback used before any block sample
+	// has been observed (avgTxCount == 0). Matches the previous "small blocks"
+	// aggressive default so cold-start behaviour is unchanged.
+	noSampleInFlightDefault = 20
+)
+
+// blockSizeTracker tracks recent block sizes and transaction counts, and
+// dynamically bounds the number of in-flight block fetches by a transaction
+// WORK budget (with a byte-budget safety clamp), rather than a fixed block
+// count. This lets tiny blocks stream many-in-flight (eliminating feed-idle
+// gaps) while fat blocks stay few-in-flight to bound memory.
 type blockSizeTracker struct {
-	mu          sync.RWMutex
-	recentSizes []int64 // last N block sizes in bytes
-	avgSize     int64   // rolling average block size
-	maxSamples  int     // number of samples to track
+	mu             sync.RWMutex
+	recentSizes    []int64 // last N block sizes in bytes
+	recentTxCounts []int64 // last N block transaction counts
+	avgSize        int64   // rolling average block size (bytes)
+	avgTxCount     int64   // rolling average transaction count per block
+	maxSamples     int     // number of samples to track
+
+	// inFlightTxBudget bounds in-flight blocks by total average transactions.
+	inFlightTxBudget int
+	// inFlightByteBudget bounds in-flight blocks by total average bytes.
+	inFlightByteBudget int64
 }
 
-// newBlockSizeTracker creates a new block size tracker.
+// newBlockSizeTracker creates a new block size tracker with default budgets.
+// Used by tests and any caller that does not need settings-derived budgets.
 func newBlockSizeTracker(maxSamples int) *blockSizeTracker {
+	return newBlockSizeTrackerWithBudgets(maxSamples, defaultInFlightTxBudget,
+		int64(float64(effectiveGOMEMLIMIT())*defaultInFlightByteBudgetFraction))
+}
+
+// newBlockSizeTrackerWithBudgets creates a tracker with explicit in-flight
+// budgets. A non-positive budget falls back to its default so a mis-set value
+// can never disable the bound entirely.
+func newBlockSizeTrackerWithBudgets(maxSamples, txBudget int, byteBudget int64) *blockSizeTracker {
+	if txBudget <= 0 {
+		txBudget = defaultInFlightTxBudget
+	}
+
+	if byteBudget <= 0 {
+		byteBudget = int64(float64(effectiveGOMEMLIMIT()) * defaultInFlightByteBudgetFraction)
+	}
+
 	return &blockSizeTracker{
-		recentSizes: make([]int64, 0, maxSamples),
-		maxSamples:  maxSamples,
-		avgSize:     0,
+		recentSizes:        make([]int64, 0, maxSamples),
+		recentTxCounts:     make([]int64, 0, maxSamples),
+		maxSamples:         maxSamples,
+		avgSize:            0,
+		avgTxCount:         0,
+		inFlightTxBudget:   txBudget,
+		inFlightByteBudget: byteBudget,
 	}
 }
 
-// addBlockSize records a new block size and updates the rolling average.
-func (bst *blockSizeTracker) addBlockSize(size int64) {
+// addBlockStats records a new block's size (bytes) and transaction count,
+// updating both rolling averages. Called on the serial block-drain goroutine.
+func (bst *blockSizeTracker) addBlockStats(size, txCount int64) {
 	bst.mu.Lock()
 	defer bst.mu.Unlock()
 
 	bst.recentSizes = append(bst.recentSizes, size)
+	bst.recentTxCounts = append(bst.recentTxCounts, txCount)
+
 	if len(bst.recentSizes) > bst.maxSamples {
 		bst.recentSizes = bst.recentSizes[1:] // keep last maxSamples
 	}
 
-	// Calculate rolling average
-	var sum int64
-	for _, s := range bst.recentSizes {
-		sum += s
+	if len(bst.recentTxCounts) > bst.maxSamples {
+		bst.recentTxCounts = bst.recentTxCounts[1:] // keep last maxSamples
 	}
+
+	// Rolling average block size.
+	var sizeSum int64
+	for _, s := range bst.recentSizes {
+		sizeSum += s
+	}
+
 	if len(bst.recentSizes) > 0 {
-		bst.avgSize = sum / int64(len(bst.recentSizes))
+		bst.avgSize = sizeSum / int64(len(bst.recentSizes))
+	}
+
+	// Rolling average transaction count.
+	var txSum int64
+	for _, c := range bst.recentTxCounts {
+		txSum += c
+	}
+
+	if len(bst.recentTxCounts) > 0 {
+		bst.avgTxCount = txSum / int64(len(bst.recentTxCounts))
 	}
 }
 
-// getAverageSize returns the current rolling average block size.
+// getAverageSize returns the current rolling average block size in bytes.
 func (bst *blockSizeTracker) getAverageSize() int64 {
 	bst.mu.RLock()
 	defer bst.mu.RUnlock()
 	return bst.avgSize
 }
 
-// calculateMaxInFlightBlocks returns the recommended max in-flight blocks
-// based on average block size. Scales from 20 (small blocks) down to 1 (huge blocks).
+// getAverageTxCount returns the current rolling average transactions per block.
+func (bst *blockSizeTracker) getAverageTxCount() int64 {
+	bst.mu.RLock()
+	defer bst.mu.RUnlock()
+	return bst.avgTxCount
+}
+
+// calculateMaxInFlightBlocks returns the recommended max in-flight block
+// fetches, bounding by a transaction WORK budget with a byte-budget safety
+// clamp:
+//
+//   - txBound   = inFlightTxBudget / max(avgTxCount, 1)
+//   - byteBound = inFlightByteBudget / max(avgSize, 1)
+//   - result    = clamp(min(txBound, byteBound), 1, maxInFlightBlocksCap)
+//
+// The byte clamp keeps in-flight memory bounded even when the tx count is
+// misleading (few but huge transactions). Before any sample exists
+// (avgTxCount == 0) it returns a safe default and never divides by zero.
 func (bst *blockSizeTracker) calculateMaxInFlightBlocks() int {
-	avgSize := bst.getAverageSize()
+	bst.mu.RLock()
+	avgTxCount := bst.avgTxCount
+	avgSize := bst.avgSize
+	txBudget := bst.inFlightTxBudget
+	byteBudget := bst.inFlightByteBudget
+	bst.mu.RUnlock()
 
-	const (
-		MB = 1024 * 1024
-		GB = 1024 * MB
-	)
-
-	switch {
-	case avgSize >= 2*GB:
-		return 1 // huge blocks: only 1 in flight
-	case avgSize >= 1*GB:
-		return 2 // very large blocks
-	case avgSize >= 500*MB:
-		return 3 // large blocks
-	case avgSize >= 200*MB:
-		return 5 // medium blocks
-	case avgSize >= 100*MB:
-		return 10 // smallish blocks
-	default:
-		return 20 // small blocks: default aggressive
+	// No samples yet: fall back to a safe default (no divide-by-zero).
+	if avgTxCount <= 0 {
+		return noSampleInFlightDefault
 	}
+
+	// Transaction WORK budget: how many average-sized (in txs) blocks fit.
+	txBound := txBudget / int(avgTxCount)
+
+	// Byte safety clamp: also cap so in-flight bytes stay within the budget,
+	// even when tx count under-represents memory. Only binds when we have a
+	// size sample.
+	result := txBound
+
+	if avgSize > 0 {
+		byteBound := int(byteBudget / avgSize)
+		if byteBound < result {
+			result = byteBound
+		}
+	}
+
+	// Always at least 1 in flight.
+	if result < 1 {
+		result = 1
+	}
+
+	// Hard cap so tiny (1-tx) blocks don't produce an absurd count.
+	if result > maxInFlightBlocksCap {
+		result = maxInFlightBlocksCap
+	}
+
+	return result
 }
 
 // calculateWindowK returns the number of blocks to admit in one window batch.
@@ -1530,17 +1639,21 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 	state.requestedBlocks.Delete(bmsg.blockHash)
 	sm.requestedBlocks.Delete(bmsg.blockHash)
 
-	// Track block size for dynamic in-flight adjustment during headers-first mode.
-	// This allows us to start aggressive (20 blocks) and automatically reduce
-	// to 1 block when encountering large (>2GB) blocks on mainnet.
+	// Track block size AND transaction count for dynamic in-flight adjustment
+	// during headers-first mode. The in-flight bound is now a transaction WORK
+	// budget (with a byte-budget safety clamp): tiny blocks stream
+	// many-in-flight to keep the peer busy, fat blocks stay few-in-flight to
+	// bound memory. See calculateMaxInFlightBlocks.
 	if sm.headersFirstMode.Load() && bmsg.block != nil {
 		blockSize := int64(bmsg.block.SerializeSize())
-		sm.blockSizeTracker.addBlockSize(blockSize)
+		txCount := int64(len(bmsg.block.Transactions))
+		sm.blockSizeTracker.addBlockStats(blockSize, txCount)
 
 		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 		avgSize := sm.blockSizeTracker.getAverageSize()
-		sm.logger.Debugf("[%s][%s] Block size: %d bytes, avg: %d bytes, dynamic max in-flight: %d",
-			caller, bmsg.blockHash, blockSize, avgSize, dynamicMax)
+		avgTxCount := sm.blockSizeTracker.getAverageTxCount()
+		sm.logger.Debugf("[%s][%s] Block size: %d bytes (%d txs), avg: %d bytes / %d txs, dynamic max in-flight: %d",
+			caller, bmsg.blockHash, blockSize, txCount, avgSize, avgTxCount, dynamicMax)
 	}
 
 	return
@@ -3767,7 +3880,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		headerList:       list.New(),
-		blockSizeTracker: newBlockSizeTracker(10), // track last 10 blocks for rolling average
+		blockSizeTracker: newBlockSizeTrackerWithBudgets(10, // track last 10 blocks for rolling average
+			tSettings.Legacy.InFlightTxBudget, tSettings.Legacy.InFlightByteBudget),
 		quit:             make(chan struct{}),
 		// feeEstimator:            config.FeeEstimator,
 		minSyncPeerNetworkSpeed: config.MinSyncPeerNetworkSpeed,

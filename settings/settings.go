@@ -666,6 +666,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PeerProcessingTimeout:            getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
 			ParallelWindowMemoryFraction:     getFloat64("legacy_parallelWindowMemoryFraction", 0.0, alternativeContext...),
 			ParallelWindowPipeline:           getBool("legacy_parallelWindowPipeline", false, alternativeContext...),
+			InFlightTxBudget:                 getInt("legacy_inFlightTxBudget", 50000, alternativeContext...),
+			InFlightByteBudget:               int64(getInt("legacy_inFlightByteBudget", 0, alternativeContext...)),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),
