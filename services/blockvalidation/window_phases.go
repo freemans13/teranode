@@ -441,6 +441,31 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 
 	k := len(blocks)
 
+	// --- Serial block-ID pre-pass (ascending height order). ---
+	// AssignBlockID burns a fresh nextval per new hash, so the ID a block receives is
+	// determined by the ORDER of the AssignBlockID calls. Assigning inside the parallel
+	// C1 work made that order depend on goroutine scheduling — a random permutation of
+	// height→ID — which breaks StoreBlock's fast-path CAS (maxBlockID+1 == newBlockID)
+	// and spuriously demotes IBD blocks off-chain (there are no real forks below the
+	// checkpoint). Assign IDs serially here, iterating in the caller-guaranteed ascending
+	// height order, so the block at height h gets a smaller, CONTIGUOUS id than height h+1.
+	// C3 then commits in that same ascending order, so at commit time each block's id is
+	// exactly maxBlockID+1 and StoreBlock keeps it on the main chain — matching the legacy
+	// serial path's invariant. AssignBlockID is idempotent per hash, so an idempotent
+	// re-run returns each block's existing id (a prior buggy run's wrong-order ids persist
+	// and need a separate main-chain reconcile — out of scope here). block.ID set here is
+	// read by C1 (createBlockUTXOs' WithMinedBlockInfo) and by C3 (commitBlock's WithID).
+	for _, blk := range blocks {
+		id, err := u.blockchainClient.AssignBlockID(ctx, blk.Hash())
+		if err != nil {
+			return errors.NewProcessingError("[ProcessBlockWindow][%s] failed to assign block ID at height %d", blk.Hash().String(), blk.Height, err)
+		}
+		blk.ID, err = blockIDToUint32(id, blk.Hash().String())
+		if err != nil {
+			return err
+		}
+	}
+
 	// --- Shared cross-block goroutine limiter (off-heap stack memory control). ---
 	// ONE semaphore for the whole window, shared by C1 (create) and C2 (spend), sizes
 	// the TOTAL number of concurrently-alive per-tx create/spend goroutines regardless
@@ -468,20 +493,13 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		blk := blocks[i]
 		c1g.Go(func() error {
 			// Coinbase-only (0-subtree) blocks have no UTXOs to create and no spends
-			// to record. Mirror quickValidateBlock's no-subtree path exactly: assign
-			// the block ID idempotently (AssignBlockID is concurrency-safe) and commit
-			// ZERO subtrees in C3 — no synthesised placeholder subtree. This matches
-			// every coinbase-only block already on disk (common on early testnet/mainnet).
-			// The I4 checkpoint guard is enforced for ALL blocks by the pre-C1 gate above.
+			// to record. Mirror quickValidateBlock's no-subtree path exactly: the block
+			// ID was already assigned by the serial height-ordered pre-pass above, so
+			// there is nothing to create here — commit ZERO subtrees in C3, no synthesised
+			// placeholder subtree. This matches every coinbase-only block already on disk
+			// (common on early testnet/mainnet). The I4 checkpoint guard is enforced for
+			// ALL blocks by the pre-C1 gate above.
 			if len(blk.Subtrees) == 0 {
-				id, err := u.blockchainClient.AssignBlockID(c1ctx, blk.Hash())
-				if err != nil {
-					return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] failed to assign block ID for coinbase-only block", blk.Hash().String(), err)
-				}
-				blk.ID, err = blockIDToUint32(id, blk.Hash().String())
-				if err != nil {
-					return err
-				}
 				// No spends recorded → C2 spendBlockUTXOs is a no-op for this block.
 				return nil
 			}

@@ -701,6 +701,144 @@ func TestProcessBlockWindow_CommitOrder(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Test 5: BLOCK-ID ORDERING
+// ---------------------------------------------------------------------------
+
+// assignIDOrderSpyClient wraps a real LocalClient and, before delegating to the
+// real AssignBlockID, sleeps for a delay that DECREASES with block height. This
+// makes the ordering bug deterministic: under the old parallel-assignment code
+// (AssignBlockID called inside the C1 create goroutines, one per block, running
+// concurrently) the HIGHEST-height block sleeps the least, reaches AssignBlockID
+// first, and burns the FIRST (lowest) nextval — so the ID→height mapping comes out
+// reversed. Under the serial height-ordered pre-pass the sleeps cannot reorder the
+// calls (they run one after another in ascending-height order on a single
+// goroutine), so IDs come out contiguous and ascending with height.
+//
+// The spy records the (hash → assigned ID) so the test can read back each block's
+// ID by hash independent of goroutine scheduling.
+type assignIDOrderSpyClient struct {
+	blockchain.ClientI
+	mu sync.Mutex
+	// delayForHash is seeded by the test after blocks are built so the spy can apply
+	// a height-inverse delay per block hash without knowing heights itself.
+	delayForHash map[chainhash.Hash]time.Duration
+	assigned     map[chainhash.Hash]uint64
+}
+
+func (s *assignIDOrderSpyClient) AssignBlockID(ctx context.Context, blockHash *chainhash.Hash) (uint64, error) {
+	// Delay inversely proportional to height: taller blocks reach the real
+	// AssignBlockID sooner. Under the buggy parallel path this inverts ID order.
+	s.mu.Lock()
+	d := s.delayForHash[*blockHash]
+	s.mu.Unlock()
+	if d > 0 {
+		time.Sleep(d)
+	}
+
+	id, err := s.ClientI.AssignBlockID(ctx, blockHash)
+	if err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	if s.assigned == nil {
+		s.assigned = make(map[chainhash.Hash]uint64)
+	}
+	s.assigned[*blockHash] = id
+	s.mu.Unlock()
+	return id, nil
+}
+
+// TestProcessBlockWindow_BlockIDsAscendingWithHeight is the ordering regression
+// guard. It runs ProcessBlockWindow over a window of several independent
+// below-checkpoint blocks and asserts the assigned block IDs are MONOTONICALLY
+// INCREASING with height and contiguous (id[height h+1] == id[height h] + 1).
+//
+// RED (pre-fix): AssignBlockID runs inside the parallel C1 create goroutines, so
+// the ID a block receives depends on which goroutine reaches AssignBlockID first.
+// The height-inverse delay in the spy forces the tallest block to grab the lowest
+// nextval → IDs are reversed vs height → assertion fails.
+//
+// GREEN (post-fix): a serial pre-pass assigns IDs in ascending-height order before
+// C1, so IDs are contiguous and ascending regardless of the create-goroutine
+// scheduling → assertion holds.
+func TestProcessBlockWindow_BlockIDsAscendingWithHeight(t *testing.T) {
+	const k = 5
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	logger := ulogger.TestLogger{}
+	tSettings := testutil.CreateBaseTestSettings(t)
+	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
+
+	params := *tSettings.ChainCfgParams
+	params.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
+	tSettings.ChainCfgParams = &params
+
+	utxoStoreURL, err := url.Parse(fmt.Sprintf("sqlitememory:///window_idorder_%s", t.Name()))
+	require.NoError(t, err)
+	utxoStore, err := utxosql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	blockChainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+	realClient, err := blockchain.NewLocalClient(logger, tSettings, blockChainStore, nil, nil)
+	require.NoError(t, err)
+
+	spy := &assignIDOrderSpyClient{
+		ClientI:     realClient,
+		delayForHash: make(map[chainhash.Hash]time.Duration),
+	}
+
+	bv := &BlockValidation{
+		logger:                        logger,
+		settings:                      tSettings,
+		blockchainClient:              spy,
+		utxoStore:                     utxoStore,
+		subtreeStore:                  blobmemory.New(),
+		blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+		lastValidatedBlocks:           expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute),
+	}
+	t.Cleanup(func() {
+		bv.blockExistsCache.Stop()
+		bv.lastValidatedBlocks.Stop()
+	})
+
+	// Independent single-tx blocks (no cross-block deps), heights 100..104.
+	blocks := buildBarrierBlocks(t, bv, ctx, bv.settings.ChainCfgParams.GenesisHash, 100, k)
+
+	// Seed a height-inverse delay per block hash: tallest sleeps least. Under the
+	// buggy parallel assign this makes the tallest block grab the lowest ID first.
+	const step = 8 * time.Millisecond
+	spy.mu.Lock()
+	for i, blk := range blocks {
+		// i=0 is the lowest height → longest delay; last index → zero delay.
+		spy.delayForHash[*blk.Hash()] = time.Duration(k-1-i) * step
+	}
+	spy.mu.Unlock()
+
+	require.NoError(t, bv.ProcessBlockWindow(ctx, blocks, "idorder-test-peer"))
+
+	// Read back each block's assigned ID by hash and assert ascending + contiguous.
+	spy.mu.Lock()
+	ids := make([]uint64, k)
+	for i, blk := range blocks {
+		id, ok := spy.assigned[*blk.Hash()]
+		require.True(t, ok, "no AssignBlockID recorded for block at height %d", blk.Height)
+		ids[i] = id
+	}
+	spy.mu.Unlock()
+
+	for i := 1; i < k; i++ {
+		require.Equal(t, ids[i-1]+1, ids[i],
+			"BLOCK-ID ORDER VIOLATION: ids not contiguous ascending with height: ids[%d]=%d ids[%d]=%d (heights %d,%d)",
+			i-1, ids[i-1], i, ids[i], blocks[i-1].Height, blocks[i].Height)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Test 4: FAIL-CLOSED
 // ---------------------------------------------------------------------------
 
