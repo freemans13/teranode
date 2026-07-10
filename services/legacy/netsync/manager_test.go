@@ -6,6 +6,7 @@ package netsync
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/binary"
 	"net/url"
@@ -1330,4 +1331,227 @@ func TestHandleNewPeerMsg_SkipsDisconnectedPeer(t *testing.T) {
 	sm.handleNewPeerMsg(disconnectedPeer)
 
 	require.False(t, sm.peerStates.Exists(disconnectedPeer), "disconnected peer must not be registered in peerStates")
+}
+
+// buildHeaderChain constructs a synthetic, properly-linked chain of block
+// headers starting from prevHash. Each header's PrevBlock is set to the
+// previous header's real BlockHash(), so the chain links exactly as the
+// headers-first state machine's PrevBlock check requires. It returns the
+// headers together with their computed hashes so the test can build
+// checkpoints whose Hash fields match the real header hashes at the chosen
+// heights. The nonce seeds each header uniquely so hashes differ.
+func buildHeaderChain(prevHash chainhash.Hash, count int, startNonce uint32) ([]*wire.BlockHeader, []chainhash.Hash) {
+	headers := make([]*wire.BlockHeader, 0, count)
+	hashes := make([]chainhash.Hash, 0, count)
+
+	prev := prevHash
+
+	for i := 0; i < count; i++ {
+		h := wire.NewBlockHeader(1, &prev, &chainhash.Hash{}, 0, startNonce+uint32(i)) //nolint:gosec
+		hash := h.BlockHash()
+		headers = append(headers, h)
+		hashes = append(hashes, hash)
+		prev = hash
+	}
+
+	return headers, hashes
+}
+
+// TestHandleHeadersMsg_PipelinesNextIntervalHeaders is the core pipelining
+// test. It drives the headers-first state machine across a checkpoint boundary
+// and asserts that the NEXT interval's getheaders request is issued as soon as
+// the current interval's headers are fully received (at receivedCheckpoint) —
+// WITHOUT waiting for the checkpoint block to be processed.
+//
+// RED against pre-pipelining code: at receivedCheckpoint the old code only
+// called fetchHeaderBlocks() and returned; the next-interval getheaders was
+// deferred until the checkpoint BLOCK arrived in the block handler. So no
+// getheaders reaches the peer here and the assertion times out.
+//
+// GREEN after the change: handleHeadersMsg advances the header-request cursor
+// and issues the next-interval getheaders immediately, so the peer observes it.
+//
+// The sync peer is a real, connected peer (via MakeConnectedPeers). When
+// handleHeadersMsg calls PushGetHeadersMsg on it, the message travels the pipe
+// to the counterpart peer, whose OnGetHeaders callback records the actual
+// locator/stop-hash — a faithful observation of the real request.
+func TestHandleHeadersMsg_PipelinesNextIntervalHeaders(t *testing.T) {
+	// Base (genesis-equivalent) block already in our chain; the first header
+	// batch links to it.
+	base := chainhash.Hash{0xaa}
+
+	// Interval 1: base -> ... -> checkpoint1 (5 headers).
+	interval1, hashes1 := buildHeaderChain(base, 5, 1000)
+	cp1Height := int32(5)
+	cp1Hash := hashes1[len(hashes1)-1]
+
+	// Interval 2 starts at checkpoint1's hash; checkpoint2 sits a few headers
+	// further on. We only need its hash to build the checkpoint entry.
+	_, hashes2 := buildHeaderChain(cp1Hash, 5, 2000)
+	cp2Height := int32(10)
+	cp2Hash := hashes2[len(hashes2)-1]
+
+	chainParams := chaincfg.MainNetParams
+	chainParams.Checkpoints = []chaincfg.Checkpoint{
+		{Height: cp1Height, Hash: &cp1Hash},
+		{Height: cp2Height, Hash: &cp2Hash},
+	}
+
+	// Capture getheaders that the sync peer sends to its counterpart.
+	captured := make(chan *wire.MsgGetHeaders, 4)
+	counterpartCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetHeaders: func(_ *peer.Peer, msg *wire.MsgGetHeaders) {
+				captured <- msg
+			},
+			// getdata is emitted by fetchHeaderBlocks; drain it so the peer's
+			// output pipeline never blocks.
+			OnGetData: func(_ *peer.Peer, _ *wire.MsgGetData) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	syncPeerCfg := peer.Config{
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+
+	// counterpart sees the sync peer's outbound getheaders.
+	_, syncPeer, err := MakeConnectedPeers(t, counterpartCfg, syncPeerCfg, 0)
+	require.NoError(t, err)
+
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	// haveInventory (called by fetchHeaderBlocks) queries GetBlockHeader; return
+	// not-found so blocks are requested (getdata), which is harmless here.
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+
+	// Point the block-level checkpoint tracker at checkpoint 1 and seed the
+	// header list with the base block (the "dummy" anchor) exactly as
+	// resetHeaderState does.
+	sm.nextCheckpoint = &chainParams.Checkpoints[0]
+	// The header-request cursor starts aligned with the block-level tracker,
+	// exactly as startSync/resetHeaderState initialise it.
+	sm.headerCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+
+	// Deliver interval-1 headers, the last of which is checkpoint 1.
+	msg := wire.NewMsgHeaders()
+	for _, h := range interval1 {
+		require.NoError(t, msg.AddBlockHeader(h))
+	}
+
+	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+
+	// The checkpoint was verified, so headers-first mode must remain on and the
+	// peer must not have been disconnected.
+	require.True(t, sm.headersFirstMode.Load(), "headers-first mode must stay on after a verified checkpoint")
+	require.True(t, syncPeer.Connected(), "sync peer must not be disconnected on a matching checkpoint")
+
+	// Core assertion: the next interval's getheaders must fire NOW, toward
+	// checkpoint 2, without waiting for the checkpoint block. Its stop hash is
+	// checkpoint 2's hash and its locator begins at checkpoint 1's hash.
+	select {
+	case got := <-captured:
+		require.True(t, got.HashStop.IsEqual(&cp2Hash),
+			"next-interval getheaders must stop at checkpoint 2 hash, got %s", got.HashStop)
+		require.NotEmpty(t, got.BlockLocatorHashes, "getheaders must carry a locator")
+		require.True(t, got.BlockLocatorHashes[0].IsEqual(&cp1Hash),
+			"next-interval getheaders locator must begin at checkpoint 1 hash, got %s", got.BlockLocatorHashes[0])
+	case <-time.After(3 * time.Second):
+		t.Fatal("next-interval getheaders was NOT issued at receivedCheckpoint (boundary stall)")
+	}
+}
+
+// TestHandleHeadersMsg_CheckpointMismatchDisconnects verifies the checkpoint
+// verification invariant is preserved: a header at the checkpoint height whose
+// hash does NOT match the expected checkpoint hash disconnects the peer and
+// does not advance the pipeline.
+func TestHandleHeadersMsg_CheckpointMismatchDisconnects(t *testing.T) {
+	base := chainhash.Hash{0xbb}
+
+	// Build a properly-linked interval so linkage passes and the ONLY failure
+	// is the checkpoint-hash mismatch at the checkpoint height.
+	interval1, hashes1 := buildHeaderChain(base, 5, 5000)
+
+	// The checkpoint expects a DIFFERENT hash than the real header at height 5.
+	wrongHash := chainhash.Hash{0xde, 0xad}
+	require.False(t, hashes1[len(hashes1)-1].IsEqual(&wrongHash))
+
+	chainParams := chaincfg.MainNetParams
+	chainParams.Checkpoints = []chaincfg.Checkpoint{
+		{Height: 5, Hash: &wrongHash},
+		{Height: 10, Hash: &chainhash.Hash{0xee}},
+	}
+
+	syncPeerCfg := peer.Config{
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	counterpartCfg := syncPeerCfg
+
+	_, syncPeer, err := MakeConnectedPeers(t, counterpartCfg, syncPeerCfg, 1)
+	require.NoError(t, err)
+
+	sm := &SyncManager{
+		ctx:             context.Background(),
+		logger:          ulogger.TestLogger{},
+		chainParams:     &chainParams,
+		peerStates:      txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:      list.New(),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	})
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+	sm.nextCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+
+	msg := wire.NewMsgHeaders()
+	for _, h := range interval1 {
+		require.NoError(t, msg.AddBlockHeader(h))
+	}
+
+	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+
+	// The mismatch must have disconnected the peer.
+	disconnected := WaitUntil(func() bool { return !syncPeer.Connected() }, 3*time.Second)
+	require.True(t, disconnected, "checkpoint-mismatched header must disconnect the peer")
 }

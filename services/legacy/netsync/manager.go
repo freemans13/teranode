@@ -474,7 +474,21 @@ type SyncManager struct {
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
 	headerList       *list.List
 	startHeader      *list.Element
-	nextCheckpoint   *chaincfg.Checkpoint
+	// nextCheckpoint is the BLOCK-level checkpoint tracker: the next checkpoint
+	// whose full block we still expect to process. handleBlockPreamble uses its
+	// Hash to recognise (and keep in the header list) the checkpoint block, and
+	// the block handler advances it as each checkpoint block is committed.
+	nextCheckpoint *chaincfg.Checkpoint
+	// headerCheckpoint is the HEADER-request look-ahead cursor: the checkpoint
+	// the currently-outstanding getheaders request is heading toward. It is
+	// decoupled from nextCheckpoint so header download can run ahead of block
+	// fetching. handleHeadersMsg verifies each checkpoint-height header against
+	// it and, on reaching it, advances the cursor and requests the next
+	// interval's headers immediately — eliminating the checkpoint-boundary
+	// stall where block fetching idles while the next headers download. Both
+	// cursors start equal (set together wherever nextCheckpoint is initialised)
+	// and headerCheckpoint only ever runs ahead of nextCheckpoint.
+	headerCheckpoint *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
 	// An optional fee estimator.
@@ -536,6 +550,11 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
 	sm.startHeader = nil
+
+	// Re-align the header-request look-ahead cursor with the block-level
+	// checkpoint tracker on a fresh sync/recovery. From here they may diverge
+	// again as handleHeadersMsg pipelines headers ahead of block fetching.
+	sm.headerCheckpoint = sm.nextCheckpoint
 
 	// When there is a next checkpoint, add an entry for the latest known
 	// block into the header pool.  This allows the next downloaded header
@@ -735,7 +754,11 @@ func (sm *SyncManager) startSync() {
 	if sm.nextCheckpoint != nil &&
 		bestBlockHeightInt32 < sm.nextCheckpoint.Height &&
 		sm.chainParams != &chaincfg.RegressionNetParams {
-		if err = bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash); err != nil {
+		// The header-request cursor starts aligned with the block-level
+		// checkpoint tracker; the first getheaders heads toward it.
+		sm.headerCheckpoint = sm.nextCheckpoint
+
+		if err = bestPeer.PushGetHeadersMsg(locator, sm.headerCheckpoint.Hash); err != nil {
 			sm.logger.Warnf("[startSync] Failed to send getheaders message to peer %s: %v", bestPeer.String(), err)
 
 			return
@@ -743,7 +766,7 @@ func (sm *SyncManager) startSync() {
 
 		sm.headersFirstMode.Store(true)
 
-		sm.logger.Infof("[startSync] Downloading headers for blocks %d to %d from peer %s", bestBlockHeaderMeta.Height+1, sm.nextCheckpoint.Height, bestPeer.String())
+		sm.logger.Infof("[startSync] Downloading headers for blocks %d to %d from peer %s", bestBlockHeaderMeta.Height+1, sm.headerCheckpoint.Height, bestPeer.String())
 	} else {
 		if err = bestPeer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
 			sm.logger.Warnf("[startSync] Failed to send getblocks message to peer %s: %v", bestPeer.String(), err)
@@ -1607,31 +1630,16 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		return nil
 	}
 
-	// This is headers-first mode and the block is a checkpoint.  When
-	// there is a next checkpoint, get the next round of headers by asking
-	// for headers starting from the block after this one up to the next
-	// checkpoint.
+	// This is headers-first mode and the block is a checkpoint. Advance the
+	// block-level checkpoint tracker only. The next interval's headers are NOT
+	// requested here anymore — handleHeadersMsg already pipelined them ahead
+	// when it reached this checkpoint's headers, so requesting again would be a
+	// redundant, duplicate getheaders. When there is no further checkpoint we
+	// switch to normal mode below.
 	prevHeight := sm.nextCheckpoint.Height
-	prevHash := sm.nextCheckpoint.Hash
 
 	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
 	if sm.nextCheckpoint != nil {
-		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
-
-		err = peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
-		if err != nil {
-			return errors.NewServiceError("failed to send getheaders message to peer %s", peer.String(), err)
-		}
-
-		if sp := sm.loadSyncPeer(); sp != nil {
-			sm.logger.Infof(
-				"handleBlockMsg - Downloading headers for blocks %d to %d from peer %s",
-				prevHeight+1,
-				sm.nextCheckpoint.Height,
-				sp.String(),
-			)
-		}
-
 		return nil
 	}
 
@@ -1998,23 +2006,17 @@ func (sm *SyncManager) runPostBlockProcessing(peer *peerpkg.Peer, state *peerSyn
 		return
 	}
 
+	// Advance the block-level checkpoint tracker now that this checkpoint's
+	// block has committed. The next interval's headers are NOT requested here
+	// anymore — handleHeadersMsg already pipelined them ahead when it reached
+	// this checkpoint's headers, so requesting again would be a redundant,
+	// duplicate getheaders. We only advance nextCheckpoint (so the next
+	// checkpoint block is recognised and kept in the header list) and, at the
+	// final checkpoint, switch to normal mode.
 	prevHeight := sm.nextCheckpoint.Height
-	prevHash := sm.nextCheckpoint.Hash
 
 	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
 	if sm.nextCheckpoint != nil {
-		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
-
-		if err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash); err != nil {
-			sm.logger.Errorf("failed to send getheaders message to peer %s: %v", peer.String(), err)
-			return
-		}
-
-		if sp := sm.loadSyncPeer(); sp != nil {
-			sm.logger.Infof("handleBlockMsg - Downloading headers for blocks %d to %d from peer %s",
-				prevHeight+1, sm.nextCheckpoint.Height, sp.String())
-		}
-
 		return
 	}
 
@@ -2219,9 +2221,14 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			return
 		}
 
-		// Verify the header at the next checkpoint height matches.
-		if node.height == sm.nextCheckpoint.Height {
-			if node.hash.IsEqual(sm.nextCheckpoint.Hash) {
+		// Verify the header at the header-request checkpoint height matches.
+		// headerCheckpoint (not nextCheckpoint) is the checkpoint this batch
+		// heads toward: after a boundary it runs ahead of the block-level
+		// nextCheckpoint. Every checkpoint-height header is still fully
+		// verified here and a mismatch still disconnects — advancing the
+		// cursor never skips a checkpoint's verification.
+		if node.height == sm.headerCheckpoint.Height {
+			if node.hash.IsEqual(sm.headerCheckpoint.Hash) {
 				receivedCheckpoint = true
 
 				sm.logger.Infof("Verified downloaded block "+
@@ -2231,7 +2238,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 				reason := fmt.Sprintf("Block header at height %d/hash "+
 					"%s does NOT match expected checkpoint hash of %s",
 					node.height, node.hash,
-					sm.nextCheckpoint.Hash)
+					sm.headerCheckpoint.Hash)
 				peer.DisconnectWithWarning(reason)
 
 				return
@@ -2242,7 +2249,12 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	}
 
 	// When this header is a checkpoint, switch to fetching the blocks for
-	// all the headers since the last checkpoint.
+	// all the headers since the last checkpoint AND, to keep the header list
+	// ahead of block fetching, immediately request the NEXT interval's headers
+	// so they download concurrently. This eliminates the checkpoint-boundary
+	// stall: previously the next-interval getheaders was deferred until the
+	// checkpoint BLOCK was processed, so block fetching idled at each boundary
+	// while headers-first had nothing to fetch.
 	if receivedCheckpoint {
 		// Since the first entry of the list is always the final block
 		// that is already in the database and is only used to ensure
@@ -2252,15 +2264,38 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		sm.logger.Infof("Received %v block headers: Fetching blocks", sm.headerList.Len())
 		sm.fetchHeaderBlocks()
 
+		// Advance the header-request cursor to the next checkpoint and request
+		// that interval's headers now. The block-level nextCheckpoint is left
+		// untouched (the block handler still advances it as the checkpoint
+		// block commits) — only the header look-ahead runs ahead. When there is
+		// no further checkpoint we simply stop requesting headers here; the
+		// switch to normal/getblocks mode still happens in the block handler
+		// once the final checkpoint block is processed (findNextHeaderCheckpoint
+		// returns nil there), so we never request headers past the final
+		// checkpoint.
+		reachedHash := finalHash
+		sm.headerCheckpoint = sm.findNextHeaderCheckpoint(sm.headerCheckpoint.Height)
+
+		if sm.headerCheckpoint != nil {
+			locator := blockchain.BlockLocator([]*chainhash.Hash{reachedHash})
+
+			if err := peer.PushGetHeadersMsg(locator, sm.headerCheckpoint.Hash); err != nil {
+				sm.logger.Warnf("Failed to send pipelined getheaders message to peer %s: %v", peer.String(), err)
+			} else {
+				sm.logger.Infof("handleHeadersMsg - Pipelining headers ahead to checkpoint height %d from peer %s",
+					sm.headerCheckpoint.Height, peer.String())
+			}
+		}
+
 		return
 	}
 
 	// This header is not a checkpoint, so request the next batch of
 	// headers starting from the latest known header and ending with the
-	// next checkpoint.
+	// header-request checkpoint.
 	locator := blockchain.BlockLocator([]*chainhash.Hash{finalHash})
 
-	if err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash); err != nil {
+	if err := peer.PushGetHeadersMsg(locator, sm.headerCheckpoint.Hash); err != nil {
 		sm.logger.Warnf("Failed to send getheaders message to peer %s: %v", peer.String(), err)
 	}
 }
@@ -3588,8 +3623,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 			sm.logger.Errorf("failed to convert block height to int32: %v", err)
 		}
 
-		// Initialize the next checkpoint based on the current height.
+		// Initialize the next checkpoint based on the current height. Both the
+		// block-level tracker and the header-request look-ahead cursor start
+		// aligned; resetHeaderState re-affirms the alignment.
 		sm.nextCheckpoint = sm.findNextHeaderCheckpoint(bestBlockHeightInt32)
+		sm.headerCheckpoint = sm.nextCheckpoint
+
 		if sm.nextCheckpoint != nil {
 			sm.resetHeaderState(bestBlockHeader.Hash(), bestBlockHeightInt32)
 		}
