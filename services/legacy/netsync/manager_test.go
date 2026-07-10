@@ -1555,3 +1555,354 @@ func TestHandleHeadersMsg_CheckpointMismatchDisconnects(t *testing.T) {
 	disconnected := WaitUntil(func() bool { return !syncPeer.Connected() }, 3*time.Second)
 	require.True(t, disconnected, "checkpoint-mismatched header must disconnect the peer")
 }
+
+// TestHandleHeadersMsg_ConcurrentPipelineIsRaceFree drives the REAL production
+// dispatch (QueueHeaders -> msgChan -> blockHandler) and delivers several
+// intervals' header batches back-to-back. Before the fix the block handler ran
+// each headers message on its OWN goroutine (`go sm.handleHeadersMsg(msg)`), so
+// with the pipeline delivering the next interval before the previous one
+// finished, multiple handleHeadersMsg goroutines mutated the shared
+// headers-first state (headerList, startHeader, headerCheckpoint) at the same
+// time. That is a genuine data race, and `go test -race` on 2ea50d9c4 flags it.
+//
+// After the fix headers are serialised onto the same single drain goroutine as
+// blocks, so the batches are processed one at a time and no shared state is
+// touched concurrently. This test therefore RED-fails under -race on the old
+// code and passes on the new code. It runs the real concurrent path: the drain
+// goroutine and the outer msgChan dispatch goroutine are both live, exactly as
+// in production.
+func TestHandleHeadersMsg_ConcurrentPipelineIsRaceFree(t *testing.T) {
+	const intervals = 8
+
+	// Build one continuous header chain of `intervals` segments of 5 headers
+	// each; a checkpoint sits at the last header of every segment. Segment i's
+	// first header links onto segment i-1's checkpoint, so when delivered in
+	// order the pipeline advances cleanly through every checkpoint.
+	base := chainhash.Hash{0xc0, 0x1d}
+
+	segments := make([][]*wire.BlockHeader, 0, intervals)
+	checkpoints := make([]chaincfg.Checkpoint, 0, intervals)
+
+	prev := base
+	for i := 0; i < intervals; i++ {
+		hdrs, hashes := buildHeaderChain(prev, 5, uint32(1000*(i+1)))
+		segments = append(segments, hdrs)
+
+		cpHeight := int32(5 * (i + 1))
+		cpHash := hashes[len(hashes)-1]
+		checkpoints = append(checkpoints, chaincfg.Checkpoint{Height: cpHeight, Hash: &cpHash})
+
+		prev = hashes[len(hashes)-1]
+	}
+
+	chainParams := chaincfg.MainNetParams
+	chainParams.Checkpoints = checkpoints
+
+	// The counterpart records every outbound getheaders the sync peer sends.
+	// Each processed interval fires exactly one pipelined getheaders, so
+	// counting them is a progress signal that touches no shared header state
+	// from the test goroutine (which would otherwise be its own data race).
+	captured := make(chan struct{}, 4*intervals)
+	counterpartCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {
+				select {
+				case captured <- struct{}{}:
+				default:
+				}
+			},
+			OnGetData: func(_ *peer.Peer, _ *wire.MsgGetData) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	syncPeerCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {},
+			OnGetData:    func(_ *peer.Peer, _ *wire.MsgGetData) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+
+	_, syncPeer, err := MakeConnectedPeers(t, counterpartCfg, syncPeerCfg, 2)
+	require.NoError(t, err)
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	// FSM returns RUNNING so blockHandler's msgChan branch skips the expensive
+	// current() call. haveInventory (via fetchHeaderBlocks) gets not-found so
+	// blocks are "requested" harmlessly.
+	running := blockchain2.FSMStateRUNNING
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&running, nil).Maybe()
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	// ParallelWindowMemoryFraction stays 0 so the drain goroutine uses the
+	// simple (non-window) block path; we never enqueue blocks here anyway.
+	tSettings := test.CreateBaseTestSettings(t)
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+		msgChan:          make(chan interface{}, 256),
+		quit:             make(chan struct{}),
+		handlerDone:      make(chan struct{}),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+	sm.nextCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+
+	// Run the real block handler (spawns the inner drain goroutine too). Shut it
+	// down cleanly at the end and wait for it to fully stop BEFORE any assertion
+	// that reads shared header state, so the test goroutine never races the
+	// handler over that state.
+	go sm.blockHandler()
+
+	// Fire every interval's headers batch as fast as possible. On the old code
+	// these produce overlapping handleHeadersMsg goroutines racing on the
+	// shared header state; on the new code they queue behind one another on the
+	// single drain goroutine.
+	for i := 0; i < intervals; i++ {
+		msg := wire.NewMsgHeaders()
+		for _, h := range segments[i] {
+			require.NoError(t, msg.AddBlockHeader(h))
+		}
+		sm.QueueHeaders(msg, syncPeer)
+	}
+
+	// Also deliver a batch AFTER the final checkpoint has been reached, i.e.
+	// once headerCheckpoint has advanced to nil. This exercises the C3 nil-guard
+	// on the concurrent path: it must be ignored, not panic.
+	trailing := wire.NewMsgHeaders()
+	for _, h := range segments[intervals-1] {
+		require.NoError(t, trailing.AddBlockHeader(h))
+	}
+	sm.QueueHeaders(trailing, syncPeer)
+
+	// Every one of the `intervals` batches that is NOT the final checkpoint
+	// fires one pipelined getheaders; the final one advances the cursor to nil
+	// and fires none. So expect at least intervals-1 getheaders. Waiting on this
+	// observable (not on shared state) confirms all batches were processed.
+	for got := 0; got < intervals-1; {
+		select {
+		case <-captured:
+			got++
+		case <-time.After(5 * time.Second):
+			t.Fatalf("pipeline stalled: only %d/%d pipelined getheaders observed", got, intervals-1)
+		}
+	}
+
+	// Peer must survive: every delivered header links and matches its
+	// checkpoint, so there is never a disconnect. Under -race the primary
+	// assertion of this test is implicit: NO data race is reported while the
+	// intervals are processed concurrently with the trailing (post-final)
+	// batch. On 2ea50d9c4 the per-message `go handleHeadersMsg` produced
+	// overlapping mutations of headerList/startHeader/headerCheckpoint and the
+	// detector fired here; serialised onto the drain goroutine it is clean.
+	require.True(t, syncPeer.Connected(), "sync peer must not be disconnected: all headers link and match their checkpoints")
+
+	// Stop the outer handler. We deliberately do NOT read shared header state
+	// (e.g. headerCheckpoint) from the test goroutine: handlerDone is closed by
+	// the outer loop and does not synchronise with the inner drain goroutine,
+	// so such a read would itself be a data race independent of the fix.
+	close(sm.quit)
+	<-sm.handlerDone
+}
+
+// TestHandleHeadersMsg_RemovesStaleAnchorByIdentity is the deterministic C2
+// test. Once intervals overlap, the front of the header list can be a LIVE
+// earlier-interval header whose block is still being fetched, while the stale
+// anchor the current batch links onto sits at the BACK. The old code removed
+// Front() blindly at the checkpoint boundary, dropping the live header and
+// stranding its in-flight block request. The fix removes the anchor by
+// identity, so the live header survives and the anchor is gone.
+func TestHandleHeadersMsg_RemovesStaleAnchorByIdentity(t *testing.T) {
+	// liveHash: an interval-N header whose block is still in flight (must NOT be
+	// removed). anchorHash: interval-N's checkpoint node, the parent the new
+	// batch links onto (the stale anchor that SHOULD be removed this round).
+	liveHash := chainhash.Hash{0x11}
+	anchorHash := chainhash.Hash{0x22}
+
+	// Interval N+1 links onto the anchor and ends at its checkpoint.
+	interval, hashes := buildHeaderChain(anchorHash, 5, 7000)
+	cpHeight := int32(20) // anchor sits at height 15, batch runs 16..20
+	cpHash := hashes[len(hashes)-1]
+
+	chainParams := chaincfg.MainNetParams
+	chainParams.Checkpoints = []chaincfg.Checkpoint{
+		{Height: cpHeight, Hash: &cpHash},
+	}
+
+	syncPeerCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {},
+			OnGetData:    func(_ *peer.Peer, _ *wire.MsgGetData) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	_, syncPeer, err := MakeConnectedPeers(t, syncPeerCfg, syncPeerCfg, 3)
+	require.NoError(t, err)
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+	sm.nextCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerCheckpoint = &chainParams.Checkpoints[0]
+
+	// Seed the list so Front() is the live header and Back() is the anchor the
+	// new batch will link onto — the overlapping-interval situation.
+	liveEl := sm.headerList.PushBack(&headerNode{height: 14, hash: &liveHash})
+	anchorEl := sm.headerList.PushBack(&headerNode{height: 15, hash: &anchorHash})
+
+	require.Same(t, liveEl, sm.headerList.Front(), "precondition: live header is at the front")
+	require.Same(t, anchorEl, sm.headerList.Back(), "precondition: anchor is at the back")
+
+	msg := wire.NewMsgHeaders()
+	for _, h := range interval {
+		require.NoError(t, msg.AddBlockHeader(h))
+	}
+
+	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+
+	require.True(t, syncPeer.Connected(), "peer must stay connected on a matching checkpoint")
+
+	// C2: the live header must NOT have been dropped; the stale anchor must be gone.
+	var liveFound, anchorFound bool
+	for e := sm.headerList.Front(); e != nil; e = e.Next() {
+		n := e.Value.(*headerNode)
+		if n.hash.IsEqual(&liveHash) {
+			liveFound = true
+		}
+		if n.hash.IsEqual(&anchorHash) {
+			anchorFound = true
+		}
+	}
+
+	require.True(t, liveFound, "live earlier-interval header must survive the checkpoint boundary (not dropped by a blind Front() removal)")
+	require.False(t, anchorFound, "the stale anchor node must have been removed by identity")
+}
+
+// TestHandleHeadersMsg_NoPanicPastFinalCheckpoint is the deterministic C3 test.
+// After the final checkpoint headerCheckpoint is nil but headersFirstMode is
+// still on (it is cleared later by the block handler). A headers message
+// arriving in that window must be ignored, not dereference a nil cursor.
+func TestHandleHeadersMsg_NoPanicPastFinalCheckpoint(t *testing.T) {
+	base := chainhash.Hash{0x33}
+	interval, _ := buildHeaderChain(base, 3, 9000)
+
+	chainParams := chaincfg.MainNetParams
+	// One checkpoint far above the delivered headers so the loop would reach
+	// the nil deref site if unguarded.
+	chainParams.Checkpoints = []chaincfg.Checkpoint{{Height: 100, Hash: &chainhash.Hash{0x44}}}
+
+	syncPeerCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {},
+			OnGetData:    func(_ *peer.Peer, _ *wire.MsgGetData) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	_, syncPeer, err := MakeConnectedPeers(t, syncPeerCfg, syncPeerCfg, 4)
+	require.NoError(t, err)
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+
+	// Simulate the post-final-checkpoint window: cursor is nil but headers-first
+	// mode is still on.
+	sm.nextCheckpoint = nil
+	sm.headerCheckpoint = nil
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+
+	msg := wire.NewMsgHeaders()
+	for _, h := range interval {
+		require.NoError(t, msg.AddBlockHeader(h))
+	}
+
+	// Must not panic (the fix returns early on a nil cursor). Without the guard
+	// this dereferences sm.headerCheckpoint.Height and panics.
+	require.NotPanics(t, func() {
+		sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+	})
+
+	require.True(t, syncPeer.Connected(), "a headers message past the final checkpoint must be ignored, not fatal")
+}

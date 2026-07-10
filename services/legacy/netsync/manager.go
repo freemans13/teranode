@@ -1335,7 +1335,12 @@ func (sm *SyncManager) current() bool {
 // It must execute on the single blockHandler drain goroutine. All state it
 // touches (peerStates, headerList, requestedBlocks, blockSizeTracker,
 // startHeader) is drain-goroutine-only; the only atomic load is
-// headersFirstMode (safe from any goroutine).
+// headersFirstMode (safe from any goroutine). NOTE: handleHeadersMsg mutates
+// the same header state (headerList/startHeader/nextCheckpoint/headerCheckpoint)
+// and is therefore ALSO dispatched onto this one drain goroutine (via
+// headersQueue in blockHandler) — never `go handleHeadersMsg`. Do not
+// reintroduce a separate goroutine for it: with the headers-first pipeline the
+// two overlap in time and would race this state.
 //
 // On success it returns the resolved peer, its peerSyncState, the
 // catchingBlocks flag, the isCheckpointBlock flag, and the block's
@@ -2185,6 +2190,29 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		}
 	}
 
+	// C3: past the final checkpoint headerCheckpoint is nil (cleared in the
+	// receivedCheckpoint branch below when findNextHeaderCheckpoint returns
+	// nil), but headersFirstMode is only cleared later by the block handler.
+	// A headers message arriving in that window must not deref a nil cursor
+	// (node.height == sm.headerCheckpoint.Height and the trailing getheaders
+	// both would panic): there is nothing left to verify or request, so mirror
+	// the final-checkpoint path and stop here without requesting more headers.
+	if sm.headerCheckpoint == nil {
+		sm.logger.Debugf("[handleHeadersMsg] ignoring headers past the final checkpoint from %s", peer)
+		return
+	}
+
+	// C2: capture the current back of the list as the anchor for THIS header
+	// round — the element the first new header links onto. Once this interval's
+	// headers are fully received it is the stale anchor to drop before block
+	// fetching. With pipelining the list's Front() may now be a live header of
+	// an earlier interval whose block is still in flight, so removing Front()
+	// blindly could strand a needed node and stall an in-flight request; we
+	// remove this exact anchor element by identity instead. In the
+	// single-interval (non-pipelined) case the anchor IS Front(), so behaviour
+	// is unchanged.
+	anchorEl := sm.headerList.Back()
+
 	// Process all the received headers ensuring each one connects to the
 	// previous and that checkpoints match.
 	receivedCheckpoint := false
@@ -2256,11 +2284,16 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// checkpoint BLOCK was processed, so block fetching idled at each boundary
 	// while headers-first had nothing to fetch.
 	if receivedCheckpoint {
-		// Since the first entry of the list is always the final block
-		// that is already in the database and is only used to ensure
-		// the next header links properly, it must be removed before
-		// fetching the blocks.
-		sm.headerList.Remove(sm.headerList.Front())
+		// Remove the stale anchor node for this round (the element the first
+		// header of this batch linked onto) before fetching blocks. Removing
+		// by identity — not Front() — is required once intervals overlap: with
+		// pipelining Front() can be a live earlier-interval header whose block
+		// is still being fetched, and dropping it would strand a needed node
+		// and leave an in-flight block request with no matching list entry.
+		// list.Remove is a safe no-op if the element is no longer in the list.
+		if anchorEl != nil {
+			sm.headerList.Remove(anchorEl)
+		}
 		sm.logger.Infof("Received %v block headers: Fetching blocks", sm.headerList.Len())
 		sm.fetchHeaderBlocks()
 
@@ -2974,6 +3007,19 @@ func (sm *SyncManager) blockHandler() {
 	// create a block queue to handle block messages in a separate goroutine, in order
 	blockQueue := make(chan *blockQueueMsg, maxBlockQueue)
 
+	// headersQueue delivers headers messages to the SAME single drain goroutine
+	// that processes blockQueue. Header processing mutates the shared
+	// headers-first state (headerList, startHeader, nextCheckpoint,
+	// headerCheckpoint) that block processing also mutates, so both must run on
+	// one goroutine to stay race-free. The headers-first pipeline lets interval
+	// N+1's headers arrive while interval N's blocks are still in flight, so
+	// running handleHeadersMsg on its own goroutine (as it used to) races with
+	// block processing; serialising it here removes that race by construction
+	// while keeping the early-getheaders latency win (the pipelined getheaders
+	// still fires from this goroutine). Header batches are infrequent (one per
+	// interval), so a small buffer suffices.
+	headersQueue := make(chan *headersMsg, maxBlockQueue)
+
 	// start the block queue handler
 	go func() {
 		windowFraction := sm.settings.Legacy.ParallelWindowMemoryFraction
@@ -3062,6 +3108,14 @@ func (sm *SyncManager) blockHandler() {
 			case <-timerC:
 				sm.logger.Debugf("[blockHandler] window flush timer fired")
 				flushWindow()
+			case hmsg := <-headersQueue:
+				// Runs on the SAME goroutine as block processing, so the shared
+				// headers-first state is never touched concurrently.
+				// handleHeadersMsg links, verifies, appends and (at a
+				// checkpoint) fires the pipelined getheaders — all cheap and
+				// non-blocking, interleaved with block processing rather than
+				// racing it.
+				sm.handleHeadersMsg(hmsg)
 			case msg := <-blockQueue:
 				sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
 
@@ -3159,7 +3213,13 @@ out:
 				go sm.handleInvMsg(msg)
 
 			case *headersMsg:
-				go sm.handleHeadersMsg(msg)
+				// Serialise header processing onto the single drain goroutine
+				// (the same consumer as blocks) so it never races block
+				// processing over the shared headers-first state. Like the
+				// blockQueue send above, this send is only reached from this
+				// outer loop, which also watches sm.quit, so it cannot block
+				// indefinitely after shutdown.
+				headersQueue <- msg
 
 			case *donePeerMsg:
 				sm.handleDonePeerMsg(msg.peer)
