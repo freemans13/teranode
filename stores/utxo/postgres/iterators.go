@@ -22,16 +22,53 @@ type unminedTxIterator struct {
 
 const iteratorBatchSize = 1024
 
+// newUnminedTxIterator returns every unmined, non-conflicting tx for block
+// assembly's reload on (re)start. It drives from the pending_unmined side-table
+// via a JOIN to txs — NOT a direct scan of txs — because txs is PARTITION BY
+// HASH with only a BRIN on unmined_since (a btree there is HOT-path-forbidden,
+// see the txsIndexesDDLBase comment in schema.go), so a WHERE unmined_since IS
+// NOT NULL over txs is a full seq scan of every partition. That scan is slow
+// enough on a mid-IBD restart to deadlock against validation's coinbase-maturity
+// wait. Reading from pending_unmined avoids it entirely.
+//
+// This mirrors newPrunableUnminedTxIterator MINUS the cutoff: a reload has no
+// height bound, so there is no $1 param, no pu.unmined_since <= $1 clause, and
+// NO lazy-cleanup DELETE (a reload must not mutate the side-table — cleanup of
+// stale pending_unmined rows is left to the pruner path exclusively).
 func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
+	ctx := context.Background()
+
+	// Fast path: during IBD pending_unmined is typically empty, yet the
+	// partition-wise JOIN below still costs planning + parallel-worker startup
+	// while returning zero rows. A sub-ms EXISTS probe skips it when there is
+	// nothing to reload. No WHERE clause: probing on the unindexed unmined_since
+	// could seq-scan a populated table, while bare EXISTS stops at the first row.
+	var hasRows bool
+	if err := store.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pending_unmined)`).Scan(&hasRows); err != nil {
+		return nil, err
+	}
+
+	if !hasRows {
+		return &unminedTxIterator{store: store, done: true}, nil
+	}
+
+	// Read filter (correctness): AND t.unmined_since IS NOT NULL excludes any
+	// stale pending_unmined row whose tx has since been mined or pruned but whose
+	// side-table row has not yet been reclaimed by the pruner. t.conflicting =
+	// false excludes conflicting txs. The row shape and ORDER BY t.hash match
+	// newPrunableUnminedTxIterator exactly so readOne's Scan is byte-identical.
 	q := `
-		SELECT hash, fee, size_in_bytes, inserted_at, coinbase,
-		       locked, unmined_since, raw_tx, block_ids
-		FROM txs
-		WHERE unmined_since IS NOT NULL AND conflicting = false
-		ORDER BY hash
+		SELECT t.hash, t.fee, t.size_in_bytes, t.inserted_at, t.coinbase,
+		       t.locked, pu.unmined_since, t.raw_tx, t.block_ids
+		FROM pending_unmined pu
+		JOIN txs t ON t.hash = pu.hash
+		WHERE t.conflicting = false
+		  AND t.unmined_since IS NOT NULL
+		ORDER BY t.hash
 	`
 
-	rows, err := store.pool.Query(context.Background(), q)
+	rows, err := store.pool.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}

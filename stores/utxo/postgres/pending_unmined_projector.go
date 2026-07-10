@@ -72,10 +72,15 @@ func (s *Store) enqueuePendingUnmined(hash []byte, since int32) {
 
 	s.puMu.Lock()
 	if len(s.puBuf) >= puBufHardCap {
-		// Drop-oldest under pathology (DB stalled for a long time). The startup
-		// backfill reconciles; losing projection lag never loses tx data.
+		// Drop-oldest under pathology (DB stalled for a long time). Losing
+		// projection lag never loses tx data, but a dropped row followed by a
+		// CLEAN shutdown would skip the reconciliation backfill and omit a
+		// genuinely-unmined tx from the block-assembly reload. Latch puDropped so
+		// markCleanShutdown records this shutdown as UNCLEAN, forcing the next
+		// startup to run the fail-safe backfill from txs.
 		s.puBuf = s.puBuf[len(s.puBuf)/2:]
-		s.logger.Warnf("[pendingUnminedProjector] buffer hit hard cap %d — dropped oldest half (startup backfill reconciles)", puBufHardCap)
+		s.puDropped.Store(true)
+		s.logger.Warnf("[pendingUnminedProjector] buffer hit hard cap %d — dropped oldest half (next shutdown forced unclean, startup backfill reconciles)", puBufHardCap)
 	}
 	s.puBuf = append(s.puBuf, puEntry{hash: hash, since: since})
 	n := len(s.puBuf)

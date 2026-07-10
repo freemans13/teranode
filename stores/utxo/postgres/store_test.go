@@ -1208,6 +1208,12 @@ func TestGetUnminedTxIterator(t *testing.T) {
 	_, err := store.Create(ctx, tx, blockHeight)
 	require.NoError(t, err)
 
+	// GetUnminedTxIterator now reads from the pending_unmined side-table (not a
+	// direct txs scan), populated by the write-behind projector. Flush it so the
+	// just-created tx is projected before the reload read — mirroring production,
+	// where the reload runs after the projector has drained / the backfill ran.
+	require.NoError(t, store.flushPendingUnmined(ctx))
+
 	// Get the iterator.
 	iter, err := store.GetUnminedTxIterator()
 	require.NoError(t, err)

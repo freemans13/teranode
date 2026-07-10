@@ -133,6 +133,27 @@ func TestCleanShutdownMarkerLifecycle(t *testing.T) {
 	require.True(t, queryCleanShutdownMarker(t, ctx), "marker must be clean=true immediately after a clean Stop()")
 }
 
+// TestProjectorDropForcesUncleanShutdown verifies Change 3: if the write-behind
+// projector ever drops buffered entries at its hard cap (puDropped latched),
+// then even a graceful Stop() must record the shutdown as UNCLEAN (clean=false)
+// so the next startup runs the fail-safe backfill and re-projects any dropped
+// genuinely-unmined tx. Without the fix, Stop() would stamp clean=true and the
+// next startup would trust an incomplete pending_unmined.
+func TestProjectorDropForcesUncleanShutdown(t *testing.T) {
+	ctx := context.Background()
+	wipeCleanShutdownTestDB(t, ctx)
+
+	store := newCleanShutdownTestStore(t, ctx)
+
+	// Simulate the projector having dropped entries at its hard cap this run.
+	store.puDropped.Store(true)
+
+	store.Stop()
+
+	require.False(t, queryCleanShutdownMarker(t, ctx),
+		"a projector drop must force the shutdown marker to clean=false, even on a graceful Stop()")
+}
+
 // TestBackfillSkippedAfterCleanShutdown verifies that after a clean Stop(), a
 // second store startup SKIPS the pending_unmined seq-scan backfill: a trap row
 // inserted directly into txs (bypassing the projector) must NOT appear in

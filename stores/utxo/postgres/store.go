@@ -60,6 +60,13 @@ type Store struct {
 	puKick chan struct{}
 	puStop chan struct{}
 	puDone chan struct{}
+
+	// puDropped latches true if the projector ever drops buffered entries at its
+	// hard cap (a silent projection loss). Once set, markCleanShutdown records the
+	// shutdown as UNCLEAN so the next startup runs the fail-safe backfill from txs
+	// and re-projects any genuinely-unmined tx whose row was dropped. See
+	// pending_unmined_projector.go enqueuePendingUnmined and markCleanShutdown.
+	puDropped atomic.Bool
 }
 
 // batchSizeStats accumulates the real (post-trigger) batch sizes each batcher
@@ -438,6 +445,21 @@ func (s *Store) stopPrunerCursor() {
 // propagated, and it never blocks shutdown.
 func (s *Store) markCleanShutdown(ctx context.Context) {
 	if s.pool == nil {
+		return
+	}
+
+	// If the projector ever dropped buffered entries at its hard cap, the final
+	// drain cannot have re-projected them — pending_unmined may be missing a
+	// genuinely-unmined tx. Stamp UNCLEAN so the next startup runs the fail-safe
+	// backfill from txs and repairs the gap, rather than trusting an incomplete
+	// side-table on the clean-restart fast path.
+	if s.puDropped.Load() {
+		if _, err := s.pool.Exec(ctx, `UPDATE store_clean_shutdown SET clean = false, stamped_at = now() WHERE id = 1`); err != nil {
+			s.logger.Warnf("[markCleanShutdown] failed to stamp unclean-shutdown marker after projector drop: %v", err)
+		} else {
+			s.logger.Infof("[markCleanShutdown] projector dropped entries this run — recording shutdown as unclean to force next-startup pending_unmined backfill")
+		}
+
 		return
 	}
 

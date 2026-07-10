@@ -126,6 +126,11 @@ func TestUnminedIteratorAndScan(t *testing.T) {
 
 	unmined := newUnminedSingleOutputTx(t, store)
 
+	// GetUnminedTxIterator reads from the pending_unmined side-table populated by
+	// the write-behind projector; flush it so the created tx is projected before
+	// the reload read.
+	require.NoError(t, store.flushPendingUnmined(ctx))
+
 	it, err := store.GetUnminedTxIterator()
 	require.NoError(t, err)
 	require.NotNil(t, it)
