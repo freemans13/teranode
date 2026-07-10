@@ -98,6 +98,9 @@ func TestHandleBlockMsgWithWindow_HeightFromHeaderChain_ParentAbsent(t *testing.
 	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
 	blockchainClient := &blockchain2.Mock{}
 	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil)
+	// The block is streamed ahead of commit and does not yet exist — the
+	// already-committed guard must see false and let it into the window.
+	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Return(nil, nil, errors.NewBlockNotFoundError("parent not committed yet (streamed ahead of commit)"))
 	// After the block is admitted to the window, the pump asks for the best

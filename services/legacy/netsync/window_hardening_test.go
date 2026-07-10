@@ -126,6 +126,9 @@ func TestHandleBlockMsgWithWindow_BackPressureBeforeAdd(t *testing.T) {
 	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
 	blockchainClient := &blockchain2.Mock{}
 	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil)
+	// The block does not yet exist — the already-committed guard must let it
+	// proceed to the window-add path where back-pressure is asserted.
+	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Return(nil, nil, errors.NewBlockNotFoundError("parent not committed yet"))
 

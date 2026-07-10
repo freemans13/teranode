@@ -1678,6 +1678,32 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		return false, preambleErr
 	}
 
+	// Already-committed guard (mirrors HandleBlockDirect, handle_block.go). A peer
+	// can re-deliver a block that is already committed to our chain — observed on
+	// mainnet when an old block (hundreds below the tip) is re-sent. Without this
+	// check the window path re-runs prepareBlockForWindow/createBlockUTXOs, which
+	// re-reads the block's subtree data from the blob store; but an old block's
+	// subtree has been DAH-pruned (retention ≪ the gap), so the read fails
+	// "subtree not found locally", bounded recovery loops forever, and the window
+	// never advances — deadlocking block assembly behind it.
+	//
+	// Placed before any prepare/window-admission/subtree work and before the
+	// legacyUnified/checkpoint branch, so it guards both the window-add and the
+	// direct-fallback branches whether or not the window is enabled-and-below-
+	// checkpoint. On skip we return (false, nil): the caller (blockHandler) then
+	// decrements blockBacklog and acks the peer via reply <- nil exactly as for a
+	// normal not-added block — no double-ack, no backlog leak.
+	blockExists, existsErr := sm.blockchainClient.GetBlockExists(sm.ctx, &bmsg.blockHash)
+	if existsErr != nil {
+		sm.logger.Errorf("[handleBlockMsgWithWindow][%s] failed to check if block exists: %s", bmsg.blockHash, existsErr)
+		return false, errors.NewProcessingError("failed to check if block exists", existsErr)
+	}
+
+	if blockExists {
+		sm.logger.Warnf("[handleBlockMsgWithWindow][%s] block already exists, skipping", bmsg.blockHash)
+		return false, nil
+	}
+
 	msgBlock := bmsg.block
 	if msgBlock == nil {
 		return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] block message carries no block", bmsg.blockHash)

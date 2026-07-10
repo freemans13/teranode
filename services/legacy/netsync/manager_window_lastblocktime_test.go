@@ -87,6 +87,10 @@ func TestHandleBlockMsgWithWindow_RefreshesLastBlockTimeOnAccept(t *testing.T) {
 
 	blockchainClient := &blockchain.Mock{}
 	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil)
+	// The block is being freshly accepted, so it does not yet exist — the
+	// already-committed guard in handleBlockMsgWithWindow must see false and let it
+	// proceed to the accept path.
+	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, prevMeta, nil)
 	// After wa.add the post-accept pump asks for more blocks (startHeader is nil,
 	// not current) and needs the best header.
