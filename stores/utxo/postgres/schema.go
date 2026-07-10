@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -32,7 +33,7 @@ import (
 //     (flat bytea + bitmaps + scalar counts). A single row lookup returns
 //     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
-	if err := createSchemaInternal(ctx, s.pool, s.logger); err != nil {
+	if err := createSchemaInternal(ctx, s.pool, s.maintPool, s.logger); err != nil {
 		return err
 	}
 
@@ -78,14 +79,16 @@ const numPartitions = 8
 // is the only pruner path, so it is always created and the px_delete_at_height
 // BRIN index on txs is always backfilled into pending_deletes and dropped.
 func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, _ bool) error {
-	return createSchemaInternal(ctx, pool, ulogger.TestLogger{})
+	// No maintenance pool in the test/compat path: the backfill (if it runs)
+	// falls back to the main pool.
+	return createSchemaInternal(ctx, pool, nil, ulogger.TestLogger{})
 }
 
 // createSchemaInternal executes all DDL statements using the provided pool. It
 // always creates the pending_deletes side-table (8 leaves + per-leaf btree on
 // delete_at_height) and unconditionally backfills+drops the legacy
 // px_delete_at_height BRIN index on txs — pending_deletes is the only pruner path.
-func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, logger ulogger.Logger) error {
+func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pgxpool.Pool, logger ulogger.Logger) error {
 	ddlStatements := []string{
 		txsDDL,
 		spendsDDL,
@@ -335,8 +338,10 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, logger ulogge
 	}
 	// Clean-shutdown-gated reconciliation backfill: skips the txs seq scan when
 	// the previous shutdown was clean (see resolvePendingUnminedBackfill and
-	// pendingUnminedBackfillDDL for details).
-	if err := resolvePendingUnminedBackfill(ctx, pool, logger); err != nil {
+	// pendingUnminedBackfillDDL for details). The full-scan INSERT runs on the
+	// maintenance pool (statement_timeout=0) when available so an operator's
+	// server/role statement_timeout cannot abort it mid-startup.
+	if err := resolvePendingUnminedBackfill(ctx, pool, maintPool, logger); err != nil {
 		return err
 	}
 
@@ -646,7 +651,14 @@ INSERT INTO store_clean_shutdown (id, clean, stamped_at) VALUES (1, false, now()
 // In both branches the marker is then stamped clean=false: the store is now
 // running, so any crash from this point forward must be treated as unclean on
 // the next startup.
-func resolvePendingUnminedBackfill(ctx context.Context, pool *pgxpool.Pool, logger ulogger.Logger) error {
+//
+// The full-scan backfill INSERT runs on backfillPool when maintPool is non-nil,
+// and on the main pool otherwise. The maintenance pool pins statement_timeout=0
+// (see New in store.go), so a server/database/role statement_timeout that an
+// operator armed cannot abort this one-time seq scan mid-startup. The maintenance
+// pool is optional (PostgresMaintenancePoolConns defaults to 0), hence the
+// fallback. The cheap marker table create/read/stamp always use the main pool.
+func resolvePendingUnminedBackfill(ctx context.Context, pool *pgxpool.Pool, maintPool *pgxpool.Pool, logger ulogger.Logger) error {
 	if _, err := pool.Exec(ctx, storeCleanShutdownDDL); err != nil {
 		return errors.NewStorageError("store_clean_shutdown marker table creation failed", err)
 	}
@@ -664,9 +676,23 @@ func resolvePendingUnminedBackfill(ctx context.Context, pool *pgxpool.Pool, logg
 			logger.Infof("[pendingUnminedBackfill] running full backfill: previous shutdown was unclean")
 		}
 
-		if _, err := pool.Exec(ctx, pendingUnminedBackfillDDL); err != nil {
+		// Run the seq-scan INSERT on the maintenance pool (statement_timeout=0)
+		// when configured, falling back to the main pool otherwise.
+		backfillPool := pool
+		if maintPool != nil {
+			backfillPool = maintPool
+		}
+
+		logger.Infof("[pendingUnminedBackfill] backfilling pending_unmined from txs (one-time, unclean restart)")
+
+		start := time.Now()
+
+		tag, err := backfillPool.Exec(ctx, pendingUnminedBackfillDDL)
+		if err != nil {
 			return errors.NewStorageError("pending_unmined backfill failed", err)
 		}
+
+		logger.Infof("[pendingUnminedBackfill] backfill complete: %d rows inserted in %s", tag.RowsAffected(), time.Since(start))
 	}
 
 	if _, err := pool.Exec(ctx, `UPDATE store_clean_shutdown SET clean = false, stamped_at = now() WHERE id = 1`); err != nil {
