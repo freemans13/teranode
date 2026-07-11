@@ -345,7 +345,16 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 		options.WithMinedSet(true),
 		options.WithID(uint64(block.ID)),
 	); err != nil {
-		return errors.NewProcessingError("[%s][%s] failed to add block to blockchain", caller, block.Hash().String(), err)
+		// Idempotent restart heal: below the checkpoint the chain is final, so a block
+		// already durably committed (e.g. before a mid-window restart) is never
+		// re-committed. Treat ErrBlockExists as success and fall through to the
+		// remaining steps — C1/C2 this run may have taken tx locks that
+		// unlockSubtreeTransactionsIfNeeded must still release; returning early would
+		// leak them. Only the AddBlock error itself is swallowed.
+		if !errors.Is(err, errors.ErrBlockExists) {
+			return errors.NewProcessingError("[%s][%s] failed to add block to blockchain", caller, block.Hash().String(), err)
+		}
+		u.logger.Infof("[%s][%s] block already committed (idempotent skip of AddBlock)", caller, block.Hash().String())
 	}
 
 	// Unlock all UTXOs - final commit point (no-op when the lock was never taken; #1103).

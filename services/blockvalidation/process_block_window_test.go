@@ -38,6 +38,7 @@ import (
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -952,4 +953,161 @@ func TestProcessBlockWindow_FailClosed(t *testing.T) {
 		require.Error(t, err, "C1 hard-fail must cause ProcessBlockWindow to return an error")
 		require.Equal(t, int64(0), addBlockCalls.Load(), "C3 AddBlock must not be called when C1 fails")
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: C3 COMMIT IDEMPOTENCE (restart recovery)
+// ---------------------------------------------------------------------------
+
+// blockExistsSpyClient wraps a real LocalClient. For one designated block hash it
+// FIRST commits the block for real (so the chain genuinely advances and later
+// blocks' prev==tip checks pass) and THEN returns a fresh ErrBlockExists to the
+// caller — faithfully simulating a block that was durably committed in a prior life
+// and, after a mid-window restart, is re-processed and hits the unique-constraint
+// exists error. Optionally, for a designated block it can instead return a
+// non-exists error (NewStorageError) to prove only ErrBlockExists is swallowed.
+type blockExistsSpyClient struct {
+	blockchain.ClientI
+	mu sync.Mutex
+	// existsForHash: block hashes that should be committed for real then reported as
+	// already-existing to the caller (simulating a prior-life commit).
+	existsForHash map[chainhash.Hash]bool
+	// storageErrForHash: block hashes whose AddBlock returns a non-exists error and
+	// is NOT committed for real (proves genuine failures still propagate).
+	storageErrForHash map[chainhash.Hash]bool
+	addBlockCount     int
+}
+
+func (s *blockExistsSpyClient) AddBlock(ctx context.Context, block *model.Block, peerID string, opts ...storoptions.StoreBlockOption) error {
+	s.mu.Lock()
+	s.addBlockCount++
+	wantExists := s.existsForHash[*block.Hash()]
+	wantStorageErr := s.storageErrForHash[*block.Hash()]
+	s.mu.Unlock()
+
+	if wantStorageErr {
+		// Genuine failure — do NOT commit; return a non-exists error.
+		return errors.NewStorageError("injected storage failure for %s", block.Hash().String())
+	}
+
+	if wantExists {
+		// Commit for real so the chain genuinely advances (prior-life commit), then
+		// report the block as already existing, exactly as a restart re-run would see.
+		if err := s.ClientI.AddBlock(ctx, block, peerID, opts...); err != nil {
+			return err
+		}
+		return errors.NewBlockExistsError("block already exists in the database: %s", block.Hash().String())
+	}
+
+	return s.ClientI.AddBlock(ctx, block, peerID, opts...)
+}
+
+// newBlockExistsSpyHarness builds a ProcessBlockWindow harness whose blockchain
+// client is a blockExistsSpyClient wrapping a real LocalClient, and returns the
+// harness, the spy, and the built + stored window chain.
+func newBlockExistsSpyHarness(t *testing.T, urlSuffix string) (*BlockValidation, context.Context, context.CancelFunc, *blockExistsSpyClient, *windowChainData) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+	logger := ulogger.TestLogger{}
+	tSettings := testutil.CreateBaseTestSettings(t)
+	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
+	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
+
+	params := *tSettings.ChainCfgParams
+	params.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
+	tSettings.ChainCfgParams = &params
+
+	utxoStoreURL, err := url.Parse(fmt.Sprintf("sqlitememory:///window_exists_%s_%s", urlSuffix, t.Name()))
+	require.NoError(t, err)
+	utxoStore, err := utxosql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	blockChainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+	realClient, err := blockchain.NewLocalClient(logger, tSettings, blockChainStore, nil, nil)
+	require.NoError(t, err)
+
+	spy := &blockExistsSpyClient{
+		ClientI:           realClient,
+		existsForHash:     make(map[chainhash.Hash]bool),
+		storageErrForHash: make(map[chainhash.Hash]bool),
+	}
+
+	bv := &BlockValidation{
+		logger:                        logger,
+		settings:                      tSettings,
+		blockchainClient:              spy,
+		utxoStore:                     utxoStore,
+		subtreeStore:                  blobmemory.New(),
+		blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+		lastValidatedBlocks:           expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute),
+	}
+	t.Cleanup(func() {
+		bv.blockExistsCache.Stop()
+		bv.lastValidatedBlocks.Stop()
+	})
+
+	chain := buildWindowChainData(t, bv.settings.ChainCfgParams.GenesisHash)
+	writeWindowChainToStore(t, ctx, bv, chain)
+
+	return bv, ctx, cancel, spy, chain
+}
+
+// TestProcessBlockWindow_CommitIdempotent asserts that when C3's AddBlock reports a
+// block as already committed (ErrBlockExists) — as happens when a mid-window restart
+// re-processes blocks that were durably committed in a prior life — ProcessBlockWindow
+// treats it as an idempotent success and commits the rest of the window, rather than
+// failing the whole window into slow bounded recovery.
+//
+// RED (pre-fix): commitBlock wraps the AddBlock error unconditionally; ProcessBlockWindow
+// returns it and the window fails.
+// GREEN (post-fix): commitBlock swallows only ErrBlockExists, falls through to the
+// remaining commit steps, and ProcessBlockWindow succeeds.
+func TestProcessBlockWindow_CommitIdempotent(t *testing.T) {
+	bv, ctx, cancel, spy, chain := newBlockExistsSpyHarness(t, "idempotent")
+	defer cancel()
+
+	// Designate the FIRST block (lowest height, parent == genesis tip) as
+	// already-committed-in-a-prior-life. The spy commits it for real then reports
+	// ErrBlockExists, so the later blocks' prev==tip checks still pass.
+	already := chain.blocks[0]
+	spy.mu.Lock()
+	spy.existsForHash[*already.Hash()] = true
+	spy.mu.Unlock()
+
+	err := bv.ProcessBlockWindow(ctx, chain.blocks, "idempotent-peer")
+	require.NoError(t, err, "ErrBlockExists on an already-committed block must NOT fail the window")
+
+	// All K blocks must be present (the already-exists one plus the genuinely committed rest).
+	for _, blk := range chain.blocks {
+		exists, gerr := bv.blockchainClient.GetBlockExists(ctx, blk.Hash())
+		require.NoError(t, gerr)
+		require.True(t, exists, "block at height %d must be committed", blk.Height)
+	}
+
+	// The chain tip must be the highest block in the window.
+	bestHeader, _, gerr := bv.blockchainClient.GetBestBlockHeader(ctx)
+	require.NoError(t, gerr)
+	top := chain.blocks[len(chain.blocks)-1]
+	require.Equal(t, top.Hash().String(), bestHeader.Hash().String(), "chain tip must be the top window block")
+}
+
+// TestProcessBlockWindow_CommitNonExistsErrorStillFails proves the swallow is narrow:
+// a NON-ErrBlockExists AddBlock error (a genuine storage failure) must STILL fail
+// ProcessBlockWindow so real problems propagate to recovery.
+func TestProcessBlockWindow_CommitNonExistsErrorStillFails(t *testing.T) {
+	bv, ctx, cancel, spy, chain := newBlockExistsSpyHarness(t, "nonexists")
+	defer cancel()
+
+	// Inject a non-exists storage error on the first block.
+	spy.mu.Lock()
+	spy.storageErrForHash[*chain.blocks[0].Hash()] = true
+	spy.mu.Unlock()
+
+	err := bv.ProcessBlockWindow(ctx, chain.blocks, "nonexists-peer")
+	require.Error(t, err, "a non-ErrBlockExists AddBlock error must still fail the window")
+	require.False(t, errors.Is(err, errors.ErrBlockExists), "the propagated error must not be an exists error")
 }
