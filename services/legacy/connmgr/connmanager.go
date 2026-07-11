@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
@@ -627,22 +626,39 @@ func (cm *ConnManager) Start() {
 			case <-cm.quit:
 				return
 			case <-ticker.C:
-				// try to connect to new address every minute, we might have disconnected or have new addresses
-				connsLengthUint32, err := safeconversion.IntToUint32(cm.conns.Length())
-				if err != nil {
-					cm.logger.Errorf("could not convert conns length to uint32: %v", err)
-					continue
-				}
+				// Periodically replenish outbound connections. We might have disconnected
+				// or learned of new addresses since the last tick. cm.conns counts a ConnReq
+				// from the moment its TCP connection is established (handleConnected), before
+				// the bitcoin handshake completes, so in-flight dials already count against the
+				// deficit here. That keeps this backstop from dialing the same slots repeatedly.
+				connectionsOpen := cm.conns.Length()
+				deficit := replenishDeficit(connectionsOpen, int(cm.cfg.TargetOutbound))
 
-				connectionsOpen := connsLengthUint32
-				cm.logger.Debugf("checking active connections: %d", connectionsOpen)
+				cm.logger.Infof("[connmgr] replenish check: conns=%d pending=%d target=%d dialing=%d",
+					connectionsOpen, cm.pending.Length(), cm.cfg.TargetOutbound, deficit)
 
-				for i := atomic.LoadUint64(&cm.connReqCount); i < uint64(cm.cfg.TargetOutbound-connectionsOpen); i++ {
+				// deficit is guaranteed non-negative and bounded to at most TargetOutbound.
+				for i := 0; i < deficit; i++ {
 					go cm.NewConnReq()
 				}
 			}
 		}
 	}()
+}
+
+// replenishDeficit returns the number of new outbound dials the periodic
+// replenishment ticker should launch, given the number of currently open (or
+// in-flight) connections and the target outbound count. It returns max(0,
+// target-open): never negative, and never more than target. This guards against
+// the uint32 underflow of the original code, where open > target wrapped the
+// subtraction to ~4 billion, and replaces the broken monotonic-counter loop bound
+// that stopped the ticker dialing at all after startup.
+func replenishDeficit(open, target int) int {
+	if open >= target {
+		return 0
+	}
+
+	return target - open
 }
 
 // Wait blocks until the connection manager halts gracefully.
