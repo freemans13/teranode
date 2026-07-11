@@ -2684,7 +2684,13 @@ out:
 			// non-stream peers (see handleAddPeerMsg); reading its length here
 			// is safe as this goroutine owns state and the map is synchronised.
 			realCount := state.outboundPeers.Length()
-			if dialed := replenishOutboundDials(realCount, target, s.connManager.NewConnReq); dialed > 0 {
+			// Fire the dials OFF this goroutine: connmgr.Connect runs the TCP
+			// dial inline, and peerHandler is the sole drainer of donePeers/
+			// banPeers/query/etc. Dialing synchronously here would let a batch
+			// of dead addresses (up to the full deficit × connect-timeout) head-
+			// of-line-block all peer lifecycle handling. `go` matches the
+			// connmgr's own internal replenish pattern (go cm.NewConnReq()).
+			if dialed := replenishOutboundDials(realCount, target, func() { go s.connManager.NewConnReq() }); dialed > 0 {
 				s.logger.Infof("[Peer Handler] peer watchdog: %d/%d outbound, dialing %d more", realCount, target, dialed)
 			}
 
