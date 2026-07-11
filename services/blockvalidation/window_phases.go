@@ -400,8 +400,14 @@ func buildMinimalSpendTx(spendingTxHash chainhash.Hash, inputs []windowSpend) *b
 //     g.Wait() call is the only synchronisation point; there is no other path).
 //   - Spend order is unordered (safe below checkpoint: disjoint outpoints, no
 //     double-spends, CVE-2012-2459 dedup enforced in PREPARE before hand-off).
-//   - C3 commits in strict ascending height order via commitBlock; moveForwardBlock
-//     inside AddBlock rejects out-of-order commits at the FSM level.
+//   - C3 commits in strict ascending height order via commitBlock. There is no
+//     FSM/out-of-order rejection inside AddBlock (it is a thin wrapper over
+//     StoreBlock); main-chain membership is decided in StoreBlock by
+//     onMainChain = (HashPrevBlock == current best). Ascending-height commit plus
+//     the contiguous block ids from the serial pre-pass keep each block's parent
+//     equal to the tip at commit time, so the onMainChain fast-path stays true and
+//     the chain advances in order. A genuine parent gap would store the child
+//     off-chain (tip stalls), not raise an FSM error.
 //
 // Failure handling:
 //   - C1 or C2 error: return immediately; no C3 commits run; creates are
@@ -541,8 +547,13 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 
 	// --- C3: serial commits in ascending height order. ---
 	// blocks is already sorted ascending by Height (caller contract).
-	// commitBlock calls AddBlock+moveForwardBlock which enforces HashPrevBlock==tip,
-	// so out-of-order delivery would be rejected by the FSM — C3 serialises this.
+	// commitBlock calls AddBlock (a thin wrapper over StoreBlock); there is no
+	// FSM/out-of-order rejection there. Committing in ascending height order keeps
+	// each block's HashPrevBlock equal to the current best, so StoreBlock classifies
+	// it on-main-chain and the tip advances in order — C3 serialises to preserve
+	// that ordering. commitBlock is idempotent to ErrBlockExists (a block already
+	// committed in a prior life is skipped, not re-added), so a mid-window restart
+	// re-delivering committed blocks heals here instead of failing the window.
 	var lastCommittedHeight uint32
 	for _, blk := range blocks {
 		if err := u.commitBlock(ctx, blk, peerID, "ProcessBlockWindow"); err != nil {
