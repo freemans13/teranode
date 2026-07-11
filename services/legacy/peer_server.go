@@ -283,12 +283,10 @@ type cfHeaderKV struct {
 	filterHeader chainhash.Hash
 }
 
-// server provides a bitcoin server for handling communications to and from
-// bitcoin peers.
 // connManagerI is the subset of *connmgr.ConnManager that the server uses. It
-// exists so the outbound-peer replenishment watchdog and the disconnect
-// notification path can be exercised in tests with a lightweight spy wrapping
-// the real behaviour, without driving the full manager's goroutines.
+// exists so the disconnect notification path can be exercised in tests with a
+// lightweight spy wrapping the real behaviour, without driving the full
+// manager's goroutines.
 type connManagerI interface {
 	Start()
 	Stop()
@@ -297,6 +295,8 @@ type connManagerI interface {
 	NewConnReq()
 }
 
+// server provides a bitcoin server for handling communications to and from
+// bitcoin peers.
 type server struct {
 	ctx      context.Context
 	settings *settings.Settings
@@ -2581,34 +2581,6 @@ func (s *server) peerDoneHandler(sp *serverPeer) {
 	close(sp.quit)
 }
 
-// replenishOutboundDials forces (target - realCount) outbound dials via the
-// supplied newConnReq callback and returns how many it requested. It is the
-// pure core of the peer-replenishment watchdog: given the REAL count of live
-// outbound peers and the desired target, it bridges any deficit by asking the
-// connection manager to dial, regardless of the connmgr's own (potentially
-// stale) internal count. It never disconnects: at or above target it is a
-// no-op. A non-positive target is treated as "no target" and dials nothing.
-func replenishOutboundDials(realCount, target int, newConnReq func()) int {
-	if target <= 0 || realCount >= target {
-		return 0
-	}
-
-	deficit := target - realCount
-	for i := 0; i < deficit; i++ {
-		newConnReq()
-	}
-
-	return deficit
-}
-
-// watchdogEnabled reports whether the outbound-peer replenishment watchdog
-// should run. It is off when the interval is non-positive (explicitly
-// disabled) and off in connect-only mode, where outbound peers are pinned to
-// the configured set and must not be topped up with extra dials.
-func watchdogEnabled(interval time.Duration, connectPeers int) bool {
-	return interval > 0 && connectPeers == 0
-}
-
 // peerHandler is used to handle peer operations such as adding and removing
 // peers to and from the server, banning peers, and broadcasting messages to
 // peers.  It must be run in a goroutine.
@@ -2648,51 +2620,12 @@ func (s *server) peerHandler() {
 
 	go s.connManager.Start()
 
-	// Self-healing outbound-peer replenishment watchdog. The bsvd-style
-	// connection manager only re-dials when its own internal connection count
-	// drops below target; if a dropped outbound peer ever fails to decrement
-	// that count, the manager can permanently believe it is full and stop
-	// dialing while real peers bleed to zero. This watchdog counts the REAL
-	// live outbound peers each tick and forces the deficit to be dialed,
-	// regardless of the manager's (possibly stale) internal count. It is
-	// disabled when the interval is 0 and skipped in connect-only mode, where
-	// outbound peers are pinned. A nil channel means the case never fires.
-	var watchdogC <-chan time.Time
-
-	if watchdogEnabled(s.settings.Legacy.PeerReplenishInterval, len(cfg.ConnectPeers)) {
-		watchdogTicker := time.NewTicker(s.settings.Legacy.PeerReplenishInterval)
-		defer watchdogTicker.Stop()
-
-		watchdogC = watchdogTicker.C
-	}
-
 out:
 	for {
 		select {
 		// New peers connected to the server.
 		case p := <-s.newPeers:
 			s.handleAddPeerMsg(state, p)
-
-		// Periodic outbound-peer replenishment.
-		case <-watchdogC:
-			target := int(cfg.TargetOutboundPeers)
-			if cfg.MaxPeers < target {
-				target = cfg.MaxPeers
-			}
-
-			// outboundPeers holds exactly the non-inbound, non-persistent,
-			// non-stream peers (see handleAddPeerMsg); reading its length here
-			// is safe as this goroutine owns state and the map is synchronised.
-			realCount := state.outboundPeers.Length()
-			// Fire the dials OFF this goroutine: connmgr.Connect runs the TCP
-			// dial inline, and peerHandler is the sole drainer of donePeers/
-			// banPeers/query/etc. Dialing synchronously here would let a batch
-			// of dead addresses (up to the full deficit × connect-timeout) head-
-			// of-line-block all peer lifecycle handling. `go` matches the
-			// connmgr's own internal replenish pattern (go cm.NewConnReq()).
-			if dialed := replenishOutboundDials(realCount, target, func() { go s.connManager.NewConnReq() }); dialed > 0 {
-				s.logger.Infof("[Peer Handler] peer watchdog: %d/%d outbound, dialing %d more", realCount, target, dialed)
-			}
 
 		// Disconnected peers.
 		case p := <-s.donePeers:
