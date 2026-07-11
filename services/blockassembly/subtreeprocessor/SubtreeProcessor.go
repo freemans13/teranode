@@ -4619,20 +4619,32 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		return nil, nil, nil
 	}
 
-	// IBD fast-path: when the mempool and the pending-tx queue are both empty
-	// there is nothing to reconcile against.  If the block was already fully
-	// validated by block-validation (MinedSet=true) the subtree-data read and
-	// transaction-map build are pure waste; skip them and do only the
-	// consensus-required work: reset the current subtree state and write the
-	// coinbase UTXO.  Callers advance currentBlockHeader (via
-	// finalizeBlockProcessing or an explicit Store) after we return, so we must
-	// NOT store it here — mirroring the empty-block branch above.
-	if stp.currentTxMap.Length() == 0 && stp.queue.length() == 0 {
+	// IBD fast-path: when the mempool, the pending-tx queue, and the removal
+	// map are all empty there is nothing to reconcile against.  The removal map
+	// is included as defence-in-depth: a stale entry there signals a pending
+	// eviction that the full path would honour via processOwnBlockNodes; skipping
+	// it would silently drop the eviction.
+	//
+	// The block must also be within the below-checkpoint range.  Above the
+	// highest hardcoded checkpoint, block-validation can produce conflicting
+	// subtree nodes; processConflictingTransactions (in the full path) is the
+	// only place that resolution is applied to the UTXO store.  Skipping it
+	// above-checkpoint would silently lose conflict resolution.
+	//
+	// If the block passes those guards and GetBlockHeader confirms MinedSet=true
+	// (block-validation already created/spent all UTXOs and detected all
+	// double-spends), the subtree-data read and transaction-map build are pure
+	// waste; skip them and do only the consensus-required work: reset the current
+	// subtree state and write the coinbase UTXO.  Callers advance
+	// currentBlockHeader (via finalizeBlockProcessing or an explicit Store) after
+	// we return, so we must NOT store it here — mirroring the empty-block branch.
+	if stp.currentTxMap.Length() == 0 && stp.queue.length() == 0 && stp.removeMap.Length() == 0 &&
+		stp.settings.ChainCfgParams != nil && model.BelowCheckpoint(stp.settings.ChainCfgParams.Checkpoints, block.Height) {
 		_, meta, ghErr := stp.blockchainClient.GetBlockHeader(ctx, block.Hash())
 		if ghErr != nil {
 			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: GetBlockHeader error, falling back to full path: %v", block.String(), ghErr)
 		} else if meta.MinedSet {
-			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: empty mempool + MinedSet, skipping reconciliation", block.String())
+			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: empty mempool + MinedSet + below checkpoint, skipping reconciliation", block.String())
 
 			if err = stp.resetSubtreeState(createProperlySizedSubtrees); err != nil {
 				return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] IBD fast-path: error resetting subtree state", block.String(), err)
