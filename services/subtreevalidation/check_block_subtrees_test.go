@@ -80,6 +80,8 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		response, err := server.CheckBlockSubtrees(context.Background(), request)
 		require.NoError(t, err)
 		assert.True(t, response.Blessed)
+		// No subtrees to validate ⇒ nothing was re-validated (blessed-without-revalidation).
+		assert.False(t, response.RevalidatedSubtrees)
 	})
 
 	t.Run("WithSubtrees", func(t *testing.T) {
@@ -158,6 +160,9 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		response, err := server.CheckBlockSubtrees(context.Background(), request)
 		require.NoError(t, err)
 		assert.True(t, response.Blessed)
+		// Every subtree was pre-present (FileTypeSubtree marker) ⇒ the call short-circuited
+		// to blessed WITHOUT running any WithCreateConflicting validator pass.
+		assert.False(t, response.RevalidatedSubtrees)
 	})
 
 	t.Run("InvalidBlockData", func(t *testing.T) {

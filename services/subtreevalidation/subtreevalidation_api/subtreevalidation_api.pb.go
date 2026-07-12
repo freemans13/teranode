@@ -319,9 +319,17 @@ func (x *CheckBlockSubtreesRequest) GetPeerId() string {
 type CheckBlockSubtreesResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// blessed indicates if all subtrees in the block pass validation
-	Blessed       bool `protobuf:"varint,1,opt,name=blessed,proto3" json:"blessed,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Blessed bool `protobuf:"varint,1,opt,name=blessed,proto3" json:"blessed,omitempty"`
+	// revalidated_subtrees is true when one or more subtrees were missing
+	// server-side and had to be re-validated (a pass that can write conflicting
+	// subtree nodes via WithCreateConflicting). It is false only when every
+	// subtree already existed and the call short-circuited to blessed without
+	// running any validator pass. The QuickValidated stamp is gated on this being
+	// false so a block carrying QuickValidated=true provably wrote zero
+	// conflicting nodes.
+	RevalidatedSubtrees bool `protobuf:"varint,2,opt,name=revalidated_subtrees,json=revalidatedSubtrees,proto3" json:"revalidated_subtrees,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *CheckBlockSubtreesResponse) Reset() {
@@ -361,6 +369,13 @@ func (x *CheckBlockSubtreesResponse) GetBlessed() bool {
 	return false
 }
 
+func (x *CheckBlockSubtreesResponse) GetRevalidatedSubtrees() bool {
+	if x != nil {
+		return x.RevalidatedSubtrees
+	}
+	return false
+}
+
 var File_services_subtreevalidation_subtreevalidation_api_subtreevalidation_api_proto protoreflect.FileDescriptor
 
 const file_services_subtreevalidation_subtreevalidation_api_subtreevalidation_api_proto_rawDesc = "" +
@@ -383,9 +398,10 @@ const file_services_subtreevalidation_subtreevalidation_api_subtreevalidation_ap
 	"\x19CheckBlockSubtreesRequest\x12\x14\n" +
 	"\x05block\x18\x01 \x01(\fR\x05block\x12\x19\n" +
 	"\bbase_url\x18\x02 \x01(\tR\abaseUrl\x12\x17\n" +
-	"\apeer_id\x18\x03 \x01(\tR\x06peerId\"6\n" +
+	"\apeer_id\x18\x03 \x01(\tR\x06peerId\"i\n" +
 	"\x1aCheckBlockSubtreesResponse\x12\x18\n" +
-	"\ablessed\x18\x01 \x01(\bR\ablessed2\xf6\x02\n" +
+	"\ablessed\x18\x01 \x01(\bR\ablessed\x121\n" +
+	"\x14revalidated_subtrees\x18\x02 \x01(\bR\x13revalidatedSubtrees2\xf6\x02\n" +
 	"\x14SubtreeValidationAPI\x12Z\n" +
 	"\n" +
 	"HealthGRPC\x12#.subtreevalidation_api.EmptyMessage\x1a%.subtreevalidation_api.HealthResponse\"\x00\x12\x84\x01\n" +

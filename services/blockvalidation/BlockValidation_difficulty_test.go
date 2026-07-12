@@ -461,7 +461,7 @@ type countingSubtreeValidationClient struct {
 	checkBlockSubtreesCalls atomic.Int32
 }
 
-func (c *countingSubtreeValidationClient) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) error {
+func (c *countingSubtreeValidationClient) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) (bool, error) {
 	c.checkBlockSubtreesCalls.Add(1)
 	return c.Interface.CheckBlockSubtrees(ctx, block, peerID, baseURL)
 }

@@ -69,4 +69,12 @@ message CheckBlockSubtreesRequest {
 message CheckBlockSubtreesResponse {
   // blessed indicates if all subtrees in the block pass validation
   bool blessed = 1;
+  // revalidated_subtrees is true when one or more subtrees were missing
+  // server-side and had to be re-validated (a pass that can write conflicting
+  // subtree nodes via WithCreateConflicting). It is false only when every
+  // subtree already existed and the call short-circuited to blessed without
+  // running any validator pass. The QuickValidated stamp is gated on this being
+  // false so a block carrying QuickValidated=true provably wrote zero
+  // conflicting nodes.
+  bool revalidated_subtrees = 2;
 }

@@ -96,8 +96,13 @@ type Interface interface {
 	//   - baseURL: URL to fetch missing transactions from if needed
 	//
 	// Returns:
+	//   - blessedWithoutRevalidation: true only when every subtree already existed
+	//     server-side and the call short-circuited to blessed without running any
+	//     validator pass (so no conflicting subtree node could have been written).
+	//     False when one or more subtrees had to be re-validated server-side. The
+	//     QuickValidated stamp is gated on this being true.
 	//   - error: Any error encountered during validation, nil if successful
-	CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) error
+	CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) (bool, error)
 }
 
 var _ Interface = &MockSubtreeValidation{}
@@ -124,7 +129,7 @@ func (mv *MockSubtreeValidation) CheckSubtreeFromBlock(ctx context.Context, hash
 	return args.Error(0)
 }
 
-func (mv *MockSubtreeValidation) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) error {
+func (mv *MockSubtreeValidation) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) (bool, error) {
 	args := mv.Called(ctx, block, peerID, baseURL)
-	return args.Error(0)
+	return args.Bool(0), args.Error(1)
 }

@@ -270,10 +270,10 @@ func (m *MockSubtreeValidationClient) CheckSubtreeFromBlock(ctx context.Context,
 	return nil
 }
 
-func (m *MockSubtreeValidationClient) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) error {
+func (m *MockSubtreeValidationClient) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) (bool, error) {
 	blockBytes, err := block.Bytes()
 	if err != nil {
-		return errors.NewServiceError("failed to serialize block for subtree validation", err)
+		return false, errors.NewServiceError("failed to serialize block for subtree validation", err)
 	}
 
 	request := subtreevalidation_api.CheckBlockSubtreesRequest{
@@ -282,12 +282,15 @@ func (m *MockSubtreeValidationClient) CheckBlockSubtrees(ctx context.Context, bl
 		PeerId:  peerID,
 	}
 
-	_, err = m.server.CheckBlockSubtrees(ctx, &request)
+	resp, err := m.server.CheckBlockSubtrees(ctx, &request)
 	if err != nil {
-		return errors.UnwrapGRPC(err)
+		return false, errors.UnwrapGRPC(err)
 	}
 
-	return nil
+	// Mirror the real Client: blessed-without-revalidation is the inverse of
+	// RevalidatedSubtrees, so the QuickValidated stamp is exercised end-to-end
+	// through the same signal that crosses the gRPC boundary in production.
+	return !resp.RevalidatedSubtrees, nil
 }
 
 // setup prepares a test environment with necessary components for block validation
@@ -1704,7 +1707,7 @@ func Test_validateBlockSubtrees(t *testing.T) {
 		defer deferFunc()
 
 		subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-		subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 		blockValidation := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, nil, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
 
@@ -1713,7 +1716,7 @@ func Test_validateBlockSubtrees(t *testing.T) {
 			Subtrees: make([]*chainhash.Hash, 0),
 		}
 
-		err = blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000")
+		_, err = blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000")
 		require.NoError(t, err)
 	})
 
@@ -1723,7 +1726,7 @@ func Test_validateBlockSubtrees(t *testing.T) {
 
 		subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
 		subtreeValidationClient.Mock.On("CheckSubtreeFromBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-		subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 		blockValidation := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, nil, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
 
@@ -1738,7 +1741,8 @@ func Test_validateBlockSubtrees(t *testing.T) {
 			},
 		}
 
-		require.NoError(t, blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000"))
+		_, err = blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000")
+		require.NoError(t, err)
 	})
 
 	t.Run("fallback to series", func(t *testing.T) {
@@ -1748,7 +1752,7 @@ func Test_validateBlockSubtrees(t *testing.T) {
 		subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
 		// First call - for subtree1 - success
 		subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(nil).
+			Return(true, nil).
 			Once().
 			Run(func(args mock.Arguments) {
 				// subtree was validated properly, let's add it to our subtree store so it doesn't get checked again
@@ -1771,7 +1775,8 @@ func Test_validateBlockSubtrees(t *testing.T) {
 			},
 		}
 
-		require.NoError(t, blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000"))
+		_, err = blockValidation.validateBlockSubtrees(t.Context(), block, "", "http://localhost:8000")
+		require.NoError(t, err)
 
 		// check that the subtree validation was called 3 times
 		assert.Len(t, subtreeValidationClient.Calls, 1)
@@ -4584,7 +4589,7 @@ func TestBlockValidation_SubtreeError_Classification(t *testing.T) {
 			// Inject the subtree-validation error at the CheckBlockSubtrees boundary.
 			subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
 			subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return(tc.subtreeErr)
+				Return(true, tc.subtreeErr)
 
 			block := createValidBlock(t, tSettings, utxoStore, subtreeValidationClient, blockchainClient, txStore, subtreeStore)
 
@@ -4639,7 +4644,7 @@ func TestBlockValidation_BlockValidMissingParent_NotPersistedInvalid(t *testing.
 
 	// Subtree validation succeeds — the failure must come from block.Valid's parent lookup.
 	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 	// Coinbase paying exactly the block subsidy so checkBlockRewardAndFees passes.
 	privateKey, _ := bec.NewPrivateKey()
@@ -4757,7 +4762,7 @@ func TestBlockValidation_FloaterPersistedInvalidWhenCaughtUp(t *testing.T) {
 
 	// Subtree validation succeeds — the failure must come from block.Valid's parent lookup.
 	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 	// Coinbase paying exactly the block subsidy so checkBlockRewardAndFees passes.
 	privateKey, _ := bec.NewPrivateKey()

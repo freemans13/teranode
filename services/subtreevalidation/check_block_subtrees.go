@@ -457,7 +457,10 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}
 
-	// Early return if all subtrees already exist - no need for pause logic
+	// Early return if all subtrees already exist - no need for pause logic.
+	// RevalidatedSubtrees stays false: no validator pass runs, so no
+	// WithCreateConflicting node can be written. This is the blessed-without-
+	// revalidation outcome the QuickValidated stamp is gated on.
 	if len(missingSubtrees) == 0 {
 		return &subtreevalidation_api.CheckBlockSubtreesResponse{
 			Blessed: true,
@@ -682,8 +685,13 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		return nil, errors.WrapGRPC(err)
 	}
 
+	// RevalidatedSubtrees is true: at least one subtree was missing server-side
+	// and re-validated above under WithCreateConflicting(true), which could have
+	// written a conflicting subtree node. The caller must withhold the
+	// QuickValidated stamp on this outcome so block assembly reconciles.
 	return &subtreevalidation_api.CheckBlockSubtreesResponse{
-		Blessed: true,
+		Blessed:             true,
+		RevalidatedSubtrees: true,
 	}, nil
 }
 

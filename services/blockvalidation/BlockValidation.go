@@ -1405,14 +1405,30 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 //
 // For any block arriving without a pre-assigned ID (block.ID == 0), this function returns nil
 // and AddBlock behaves exactly as before — setTxMinedStatus runs normally.
-func (u *BlockValidation) buildAddBlockOpts(block *model.Block) []blockchainoptions.StoreBlockOption {
+//
+// When quickValidatedEligible is true, it additionally sets quick_validated=true so block
+// assembly's IBD fast-path can skip conflict reconciliation for this block. This is a strict
+// AND on top of the block.ID gate — it NEVER widens the MinedSet behavior. The caller
+// (ValidateBlockWithOptions) computes quickValidatedEligible via u.quickValidatedEligible,
+// which is only true when the block took the legacy below-checkpoint fail-closed path AND
+// CheckBlockSubtrees blessed it WITHOUT re-validating any subtree. Those two facts together
+// prove the block wrote zero conflicting subtree nodes (see the invariant proof: netsync
+// dropped WithCreateConflicting on the fail-closed inline spend, createUtxos never marks
+// conflicting, and a blessed-without-revalidation CheckBlockSubtrees ran no
+// WithCreateConflicting pass). If a subtree had to be re-validated server-side, the flag is
+// withheld and block assembly safely falls back to full reconciliation (fail-safe).
+func (u *BlockValidation) buildAddBlockOpts(block *model.Block, quickValidatedEligible bool) []blockchainoptions.StoreBlockOption {
 	if block.ID == 0 {
 		return nil
 	}
-	return []blockchainoptions.StoreBlockOption{
+	opts := []blockchainoptions.StoreBlockOption{
 		blockchainoptions.WithID(uint64(block.ID)),
 		blockchainoptions.WithMinedSet(true),
 	}
+	if quickValidatedEligible {
+		opts = append(opts, blockchainoptions.WithQuickValidated(true))
+	}
+	return opts
 }
 
 func (u *BlockValidation) ValidateBlock(ctx context.Context, block *model.Block, baseURL string, disableOptimisticMining ...bool) error {
@@ -1657,7 +1673,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// validate all the subtrees in the block
 		ctxLogger.Infof("[ValidateBlock][%s] validating %d subtrees", block.Hash().String(), len(block.Subtrees))
 
-		if err = u.validateBlockSubtrees(ctx, block, opts.PeerID, baseURL); err != nil {
+		blessedWithoutRevalidation, err := u.validateBlockSubtrees(ctx, block, opts.PeerID, baseURL)
+		if err != nil {
 			// Genuine consensus violation — a transaction in the block is invalid. Persist invalid.
 			if errors.Is(err, errors.ErrTxInvalid) {
 				ctxLogger.Warnf("[ValidateBlock][%s] block contains invalid transactions, marking as invalid: %s", block.Hash().String(), err)
@@ -1683,6 +1700,13 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 		ctxLogger.Infof("[ValidateBlock][%s] validating %d subtrees DONE", block.Hash().String(), len(block.Subtrees))
 
+		// Derive QuickValidated eligibility server-side (no ProcessBlock proto field):
+		// stamp only when this is the legacy below-checkpoint fail-closed path AND the
+		// subtrees were all pre-present so CheckBlockSubtrees blessed the block WITHOUT
+		// running any WithCreateConflicting pass. See buildAddBlockOpts for the invariant
+		// this protects (QuickValidated=true ⇒ zero conflicting subtree nodes).
+		quickValidatedEligible := u.quickValidatedEligible(block, baseURL, blessedWithoutRevalidation)
+
 		useOptimisticMining := u.settings.BlockValidation.OptimisticMining
 		if opts.DisableOptimisticMining {
 			// if the disableOptimisticMining is set to true, then we don't use optimistic mining, even if it is enabled
@@ -1706,7 +1730,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				ctxLogger.Warnf("[ValidateBlock][%s] failed to compute coinbase BUMP: %v", block.Hash().String(), err)
 			}
 
-			addBlockOpts := u.buildAddBlockOpts(block)
+			addBlockOpts := u.buildAddBlockOpts(block, quickValidatedEligible)
 			if err = u.blockchainClient.AddBlock(ctx, block, opts.PeerID, addBlockOpts...); err != nil {
 				return errors.NewServiceError("[ValidateBlock][%s] failed to store block", block.Hash().String(), err)
 			}
@@ -1931,7 +1955,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					u.logger.Warnf("[ValidateBlock][%s] failed to compute coinbase BUMP: %v", block.Hash().String(), err)
 				}
 
-				addBlockOpts := u.buildAddBlockOpts(block)
+				addBlockOpts := u.buildAddBlockOpts(block, quickValidatedEligible)
 				if err = u.blockchainClient.AddBlock(storeCtx, block, opts.PeerID, addBlockOpts...); err != nil {
 					releaseBlockNodes(block)
 					return errors.NewServiceError("[ValidateBlock][%s] failed to store block", block.Hash().String(), err)
@@ -2266,7 +2290,9 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 	// validate all the subtrees in the block
 	u.logger.Infof("[ReValidateBlock][%s] validating %d subtrees", blockData.block.Hash().String(), len(blockData.block.Subtrees))
 
-	if err = u.validateBlockSubtrees(ctx, blockData.block, "", blockData.baseURL); err != nil {
+	// Revalidation never stamps QuickValidated (block.ID is already assigned and the
+	// row exists), so the blessed-without-revalidation signal is discarded here.
+	if _, err = u.validateBlockSubtrees(ctx, blockData.block, "", blockData.baseURL); err != nil {
 		return err
 	}
 
@@ -2331,6 +2357,48 @@ func (u *BlockValidation) quickValidateOutpointOnly(block *model.Block) bool {
 	return model.OutpointOnlyEligible(u.settings, u.utxoStore, u.settings.ChainCfgParams, block.Height)
 }
 
+// quickValidatedEligible reports whether this block may be stamped QuickValidated=true
+// so block assembly's IBD fast-path can skip conflict reconciliation. It is a strict AND
+// of every condition that proves the block wrote zero conflicting subtree nodes:
+//
+//   - baseURL == "legacy": the block came from the legacy netsync path (the only path
+//     that engages the fail-closed inline spend that drops WithCreateConflicting).
+//   - LegacyBelowCheckpointFailClosed: the operator opted into the fail-closed inline
+//     lever (default off). Off ⇒ the inline spend still writes conflicting nodes, so no
+//     stamp. This mirrors the server-side legacyUnifiedRoute derivation and needs no new
+//     ProcessBlock proto field — baseURL and block.ID both reach here.
+//   - model.OutpointOnlyEligible: the shared below-checkpoint / store-capability gate
+//     (hardcoded checkpoint boundary, never the operator catchup override).
+//   - blessedWithoutRevalidation: CheckBlockSubtrees blessed the block WITHOUT running any
+//     WithCreateConflicting validator pass (every subtree was pre-present server-side). If
+//     a subtree was missing and re-validated, this is false and the stamp is withheld so
+//     block assembly falls back to reconciliation (fail-safe).
+//   - block.ID != 0: a pre-assigned ID is required for buildAddBlockOpts to emit any option
+//     at all; without it the block takes the plain AddBlock path and the flag would be
+//     dropped anyway. Gating on it here keeps the intent explicit.
+//
+// If ANY condition is false the block is not stamped and block assembly reconciles as
+// before — the fail-safe default.
+func (u *BlockValidation) quickValidatedEligible(block *model.Block, baseURL string, blessedWithoutRevalidation bool) bool {
+	if !u.settings.BlockValidation.LegacyBelowCheckpointFailClosed {
+		return false
+	}
+
+	if baseURL != "legacy" {
+		return false
+	}
+
+	if !blessedWithoutRevalidation {
+		return false
+	}
+
+	if block.ID == 0 {
+		return false
+	}
+
+	return model.OutpointOnlyEligible(u.settings, u.utxoStore, u.settings.ChainCfgParams, block.Height)
+}
+
 // updateSubtreesDAH marks block subtrees as properly set in the blockchain.
 // Subtrees retain their finite DAH from assembly/validation — the block persister
 // will promote them to permanent (DAH=0) when the block is confirmed on the main chain.
@@ -2371,10 +2439,16 @@ func (u *BlockValidation) updateSubtreesDAH(ctx context.Context, block *model.Bl
 //   - peerID: P2P peer identifier for reputation tracking
 //   - baseURL: Source URL for missing subtree retrieval
 //
-// Returns an error if subtree validation fails.
-func (u *BlockValidation) validateBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) error {
+// Returns:
+//   - blessedWithoutRevalidation: true only when every subtree already existed
+//     server-side, so CheckBlockSubtrees short-circuited to blessed without running
+//     any WithCreateConflicting validator pass. This is the precondition the
+//     QuickValidated stamp is gated on. A block with zero subtrees is trivially
+//     blessed-without-revalidation (no pass could run).
+//   - error: non-nil if subtree validation fails.
+func (u *BlockValidation) validateBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) (bool, error) {
 	if len(block.Subtrees) == 0 {
-		return nil
+		return true, nil
 	}
 
 	return u.subtreeValidationClient.CheckBlockSubtrees(ctx, block, peerID, baseURL)

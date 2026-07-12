@@ -331,6 +331,12 @@ func TestCheckBlockSubtrees_AssembledPath_SkipLevelAndMixedParent(t *testing.T) 
 	require.NoError(t, err, "assembled path must accept a valid skip-level + mixed-parent block")
 	require.NotNil(t, resp)
 	require.True(t, resp.Blessed, "response must mark the block as blessed once all subtrees validate")
+	// The subtree was present only as FileTypeSubtreeToCheck, so it was re-validated
+	// server-side under WithCreateConflicting(true). RevalidatedSubtrees must therefore be
+	// true — this is the corruption-preventing signal that makes block validation withhold
+	// the QuickValidated stamp so block assembly reconciles instead of trusting the fast path.
+	require.True(t, resp.RevalidatedSubtrees,
+		"a re-validated subtree must set RevalidatedSubtrees=true so the QuickValidated stamp is withheld")
 
 	// --- ASSEMBLED-PATH ASSERTIONS ---------------------------------------
 	//

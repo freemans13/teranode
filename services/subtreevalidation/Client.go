@@ -151,10 +151,10 @@ func (s *Client) CheckSubtreeFromBlock(ctx context.Context, subtreeHash chainhas
 	return nil
 }
 
-func (s *Client) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) error {
+func (s *Client) CheckBlockSubtrees(ctx context.Context, block *model.Block, peerID, baseURL string) (bool, error) {
 	blockBytes, err := block.Bytes()
 	if err != nil {
-		return errors.NewProcessingError("failed to serialize block for subtree validation", err)
+		return false, errors.NewProcessingError("failed to serialize block for subtree validation", err)
 	}
 
 	// Apply timeout to prevent hanging on stale gRPC connections
@@ -164,13 +164,17 @@ func (s *Client) CheckBlockSubtrees(ctx context.Context, block *model.Block, pee
 		defer cancel()
 	}
 
-	if _, err = s.apiClient.CheckBlockSubtrees(ctx, &subtreevalidation_api.CheckBlockSubtreesRequest{
+	resp, err := s.apiClient.CheckBlockSubtrees(ctx, &subtreevalidation_api.CheckBlockSubtreesRequest{
 		Block:   blockBytes,
 		BaseUrl: baseURL,
 		PeerId:  peerID,
-	}); err != nil {
-		return errors.UnwrapGRPC(err)
+	})
+	if err != nil {
+		return false, errors.UnwrapGRPC(err)
 	}
 
-	return nil
+	// Return blessed-without-revalidation: true only when every subtree already
+	// existed server-side (no WithCreateConflicting pass ran). The
+	// QuickValidated stamp is gated on this.
+	return !resp.RevalidatedSubtrees, nil
 }

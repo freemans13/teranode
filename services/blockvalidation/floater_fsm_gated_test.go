@@ -173,7 +173,7 @@ func TestBlockValidation_OptimisticFloaterInvalidatedWhenCaughtUp(t *testing.T) 
 	// Subtree validation succeeds — the only failure must come from block.Valid's
 	// parent-existence check in the background goroutine.
 	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 	block, _ := buildFloaterBlock(t, utxoStore, subtreeStore)
 
@@ -239,7 +239,7 @@ func TestBlockValidation_OptimisticFloaterRetriedDuringCatchup(t *testing.T) {
 	tracker := newTrackingBlockchainClient(localClient).withFSMState(blockchain.FSMStateCATCHINGBLOCKS)
 
 	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 	block, _ := buildFloaterBlock(t, utxoStore, subtreeStore)
 
@@ -301,7 +301,7 @@ func TestBlockValidation_NonOptimisticFloaterInvalidatedWhenCaughtUp(t *testing.
 	require.NoError(t, err)
 
 	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 	block, _ := buildFloaterBlock(t, utxoStore, subtreeStore)
 
@@ -342,7 +342,7 @@ func TestBlockValidation_NonOptimisticFloaterRetriedDuringCatchup(t *testing.T) 
 	tracker := newTrackingBlockchainClient(localClient).withFSMState(blockchain.FSMStateCATCHINGBLOCKS)
 
 	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 	block, _ := buildFloaterBlock(t, utxoStore, subtreeStore)
 
@@ -383,7 +383,7 @@ func TestBlockValidation_NonOptimisticFloaterFSMErrorFailsSafe(t *testing.T) {
 	tracker := newTrackingBlockchainClient(localClient).withFSMError(errors.NewServiceError("fsm unavailable"))
 
 	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 	block, _ := buildFloaterBlock(t, utxoStore, subtreeStore)
 

@@ -1654,7 +1654,7 @@ func TestServer_ValidateBlock_TransientMissingParent_ReturnsIncomplete(t *testin
 
 	// Subtree validation succeeds — the failure must come from block.Valid's parent lookup.
 	subtreeValidationClient := &subtreevalidation.MockSubtreeValidation{}
-	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	subtreeValidationClient.Mock.On("CheckBlockSubtrees", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
 
 	// Coinbase paying exactly the block subsidy so checkBlockRewardAndFees passes.
 	privateKey, _ := bec.NewPrivateKey()
