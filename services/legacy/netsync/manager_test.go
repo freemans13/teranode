@@ -2038,6 +2038,179 @@ func TestFetchHeaderBlocks_OutputQueueFull_DoesNotBlockAndDoesNotLeakLedger(t *t
 		"per-peer requestedBlocks ledger must be unchanged when getdata is dropped")
 }
 
+// TestMaintainInFlightWindow_TopsUpToCapWithoutExceeding drives the continuous-
+// refill top-up (Task 3). With headers-first mode on, a populated header list, a
+// connected sync peer, and requestedBlocks starting below the dynamic cap, a
+// single maintainInFlightWindow() call must fill the in-flight ledger to exactly
+// the cap (dynamicMax). A SECOND call must be idempotent: still exactly the cap,
+// never exceeding it (the walk skips already-requested hashes and never rewinds).
+func TestMaintainInFlightWindow_TopsUpToCapWithoutExceeding(t *testing.T) {
+	base := chainhash.Hash{0xd0}
+
+	// Build more headers than the cap so a single top-up can reach the cap.
+	// newBlockSizeTracker(20) has no samples, so calculateMaxInFlightBlocks()
+	// returns noSampleInFlightDefault (20).
+	const headerCount = 30
+	_, hashes := buildHeaderChain(base, headerCount, 4000)
+
+	chainParams := chaincfg.MainNetParams
+
+	// A real, connected sync peer so the getdata send succeeds (its OnGetData
+	// callback drains it), letting the ledger actually fill.
+	syncPeerCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetData: func(_ *peer.Peer, _ *wire.MsgGetData) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+
+	_, syncPeer, err := MakeConnectedPeers(t, syncPeerCfg, syncPeerCfg, 5)
+	require.NoError(t, err)
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	// haveInventory queries GetBlockHeader; return not-found so every header is
+	// treated as needing a fetch.
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+
+	// Seed the header list (dummy seed + the built headers) and set startHeader
+	// exactly as handleHeadersMsg / resetHeaderState would.
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	for i := range hashes {
+		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &hashes[i]})
+	}
+	sm.startHeader = sm.headerList.Front().Next()
+
+	dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	require.Greater(t, dynamicMax, 0, "sanity: dynamic cap must be positive")
+	require.Less(t, dynamicMax, headerCount, "sanity: runway must exceed the cap")
+	require.Zero(t, state.requestedBlocks.Len(), "precondition: nothing in flight yet")
+
+	// First call tops the window up to exactly the cap.
+	sm.maintainInFlightWindow()
+	require.Equal(t, dynamicMax, state.requestedBlocks.Len(),
+		"first refill must top the in-flight window up to the dynamic cap")
+
+	// Second call is idempotent: already at the cap, so it requests nothing more
+	// and must never exceed the cap.
+	sm.maintainInFlightWindow()
+	require.Equal(t, dynamicMax, state.requestedBlocks.Len(),
+		"second refill must not exceed the dynamic cap (idempotent)")
+}
+
+// TestMaintainInFlightWindow_NoopWhenNotHeadersFirst asserts the refill is a
+// pure no-op outside headers-first IBD: with headersFirstMode false, no getdata
+// is issued and the in-flight ledger is untouched (the 20ms tick must cost
+// nothing post-sync).
+func TestMaintainInFlightWindow_NoopWhenNotHeadersFirst(t *testing.T) {
+	base := chainhash.Hash{0xe0}
+	_, hashes := buildHeaderChain(base, 30, 5000)
+
+	chainParams := chaincfg.MainNetParams
+
+	getDataSeen := make(chan struct{}, 1)
+	syncPeerCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetData: func(_ *peer.Peer, _ *wire.MsgGetData) {
+				select {
+				case getDataSeen <- struct{}{}:
+				default:
+				}
+			},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+
+	_, syncPeer, err := MakeConnectedPeers(t, syncPeerCfg, syncPeerCfg, 6)
+	require.NoError(t, err)
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+
+	// NOT headers-first: refill must do nothing.
+	sm.headersFirstMode.Store(false)
+
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	for i := range hashes {
+		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &hashes[i]})
+	}
+	sm.startHeader = sm.headerList.Front().Next()
+
+	before := state.requestedBlocks.Len()
+
+	sm.maintainInFlightWindow()
+
+	require.Equal(t, before, state.requestedBlocks.Len(),
+		"refill must not touch the in-flight ledger when not in headers-first mode")
+
+	select {
+	case <-getDataSeen:
+		t.Fatal("refill issued a getdata when not in headers-first mode")
+	case <-time.After(100 * time.Millisecond):
+		// No getdata observed — correct.
+	}
+}
+
 // TestHeaderList_NodesRemovedOnBlockFetchProgressNotHeaderEvents is the
 // block-fetch-progress lifecycle test (replaces the old C2 anchor-by-identity
 // test, whose header-event removal is exactly the stranding bug that has been

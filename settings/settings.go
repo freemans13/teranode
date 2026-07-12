@@ -668,6 +668,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ParallelWindowPipeline:           getBool("legacy_parallelWindowPipeline", false, alternativeContext...),
 			InFlightTxBudget:                 getInt("legacy_inFlightTxBudget", 50000, alternativeContext...),
 			InFlightByteBudget:               int64(getInt("legacy_inFlightByteBudget", 0, alternativeContext...)),
+			InFlightRefillInterval:           getDuration("legacy_inFlightRefillInterval", 20*time.Millisecond, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

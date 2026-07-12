@@ -2460,6 +2460,79 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	}
 }
 
+// maintainInFlightWindow tops the in-flight block-fetch window back up to the
+// memory-aware cap (calculateMaxInFlightBlocks), independently of block
+// processing. It is the continuous-refill driver: the refill ticker in
+// blockHandler fires it on the SAME single drain goroutine that reads
+// blockQueue/headersQueue, so it never runs concurrently with block or header
+// processing on that goroutine. It touches ONLY the fetch/request side —
+// fetchHeaderBlocks — and never wa.add / ProcessBlockWindow / the accumulator,
+// so the K-block coinbase-maturity gate is untouched.
+//
+// Without it the fetch window is only topped up as a side effect of processing a
+// block (pumpBlockRequests / runPostBlockProcessing). A slot frees the instant a
+// block arrives — requestedBlocks is deleted in handleBlockPreamble before the
+// block is processed — then sits empty until that block finishes processing,
+// collapsing a nominally deep window into depth-1 request/response ping-pong and
+// starving the peer feed (the RX=0 gap). Firing this on a short ticker keeps the
+// window continuously at the cap.
+//
+// GETDATA TOP-UP ONLY — no getheaders re-arm. handleHeadersMsg already keeps
+// exactly one getheaders outstanding at all times (manager.go non-checkpoint and
+// checkpoint-boundary branches), both toward the same headerCheckpoint.Hash. A
+// proactive re-arm would re-send an identical locator; the peer answers both and
+// the second fails the linkage check, triggering a self-inflicted disconnect in
+// precisely the RX=0 window this change exists to fix. So when the header runway
+// is exhausted (startHeader == nil) this returns silently and relies on the
+// already-outstanding getheaders (recovery of a lost one falls to the 30s
+// watchdog rotation).
+//
+// MUST be called on the drain goroutine only.
+func (sm *SyncManager) maintainInFlightWindow() {
+	if !sm.headersFirstMode.Load() {
+		// Continuous refill is a headers-first IBD concern only. Cheap atomic
+		// load + return so the tick costs nothing once IBD completes.
+		return
+	}
+
+	sp := sm.loadSyncPeer()
+	if sp == nil {
+		sm.logger.Debugf("[maintainInFlightWindow] no sync peer, skipping refill")
+		return
+	}
+
+	// Snapshot whether there is header runway under headerMu, then RELEASE the
+	// lock before calling fetchHeaderBlocks (which re-takes headerMu itself and
+	// must never be called with it held — the lock is non-reentrant).
+	sm.headerMu.Lock()
+	hasRunway := sm.startHeader != nil
+	sm.headerMu.Unlock()
+
+	if !hasRunway {
+		// Runway exhausted: a getheaders is already outstanding from
+		// handleHeadersMsg. Do NOT re-arm — that self-disconnects. Return
+		// silently and let the existing request repopulate the runway.
+		sm.logger.Debugf("[maintainInFlightWindow] no header runway, deferring to outstanding getheaders")
+		return
+	}
+
+	peerState, exists := sm.peerStates.Get(sp)
+	if !exists {
+		sm.logger.Debugf("[maintainInFlightWindow] sync peer state not found, skipping refill")
+		return
+	}
+
+	// Only top up when below the dynamic cap. fetchHeaderBlocks requests exactly
+	// cap-currentInFlight, skips already-requested hashes and never rewinds
+	// startHeader, so calling it more often can neither exceed the cap nor
+	// double-request. The non-blocking getdata send (Task 2) means a write-stalled
+	// peer cannot wedge this drain goroutine — a dropped top-up self-heals on the
+	// next tick.
+	if peerState.requestedBlocks.Len() < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
+		sm.fetchHeaderBlocks()
+	}
+}
+
 // handleHeadersMsg handles block header messages from all peers.  Headers are
 // requested when performing a headers-first sync.
 func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
@@ -3436,6 +3509,20 @@ func (sm *SyncManager) blockHandler() {
 			go sm.flushWorker(sm.ctx, jobs)
 		}
 
+		// Continuous-refill ticker: fires maintainInFlightWindow on THIS drain
+		// goroutine to keep the in-flight block-fetch window at the cap between
+		// block completions (getdata top-up only, non-blocking). Disabled when the
+		// interval is <= 0. maintainInFlightWindow is a cheap no-op outside
+		// headers-first IBD, so the tick costs nothing post-sync.
+		var refillC <-chan time.Time
+
+		if sm.settings.Legacy.InFlightRefillInterval > 0 {
+			refillTicker := time.NewTicker(sm.settings.Legacy.InFlightRefillInterval)
+			defer refillTicker.Stop()
+
+			refillC = refillTicker.C
+		}
+
 		flushWindow := func() {
 			if wa != nil && !wa.empty() {
 				if pipelineEnabled {
@@ -3495,6 +3582,10 @@ func (sm *SyncManager) blockHandler() {
 			case <-timerC:
 				sm.logger.Debugf("[blockHandler] window flush timer fired")
 				flushWindow()
+			case <-refillC:
+				// Continuous-refill top-up on the drain goroutine. No-op unless in
+				// headers-first IBD; getdata top-up only, never getheaders re-arm.
+				sm.maintainInFlightWindow()
 			case hmsg := <-headersQueue:
 				// Runs on the SAME goroutine as block processing, so the shared
 				// headers-first state is never touched concurrently.
