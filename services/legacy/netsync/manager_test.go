@@ -3036,6 +3036,22 @@ func TestHeadersFirst_MultiMessageInterval_NoStrandedBlock(t *testing.T) {
 // (the parking block's reply has NOT been sent) at the moment the rotation
 // completes, so the test cannot pass trivially: it proves the rotation happened
 // concurrently with an actively-blocked drain, not after it drained.
+//
+// PRODUCTION-REALISM CAVEAT — read before trusting the scenario literally: the
+// property this test proves is GOROUTINE SEPARATION — that handleCheckSyncPeer
+// runs to completion (reaching DisconnectWithInfo) on a goroutine independent of
+// the parked drain — which is exactly the anti-hole-#1 guarantee. It is NOT a
+// claim that a real maturity-parked block gets its sync peer rotated. In
+// production the drain only reaches the maturity wait while servicing a block, so
+// the park always co-occurs with blockBacklog >= 1, and the blockBacklog guard
+// (handleCheckSyncPeer, "backlog > 0 => return") INTENTIONALLY defers rotation
+// while a block is mid-processing (zero throughput then measures our own
+// validation speed, not the peer's health). This test parks with blockBacklog == 0
+// so the guard does not mask the machinery under test; that backlog state is a
+// test construction, not a production state. The watchdog's real job is to rotate
+// a peer that is silent BETWEEN blocks (backlog == 0, drain idle in its select),
+// where the guard does not apply and rotation fires immediately; the bounded (30s
+// maturity-cap) deferral while genuinely busy is by design, not a regression.
 func TestPeerRotation_FiresWhileDrainBlockedOnMaturity(t *testing.T) {
 	// The block handlers touch package prometheus gauges (e.g.
 	// prometheusLegacyNetsyncBlockHeight in HandleBlockDirect's defer). New()
