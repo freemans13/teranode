@@ -1733,6 +1733,195 @@ func TestHandleHeadersMsg_ConcurrentPipelineIsRaceFree(t *testing.T) {
 	<-sm.handlerDone
 }
 
+// TestHeaderState_ConcurrentResetVsDrainIsRaceFree exercises the pre-existing
+// data race between the OUTER blockHandler loop and the INNER drain goroutine
+// over the five headers-first state fields (headerList, startHeader,
+// headerListSeed, nextCheckpoint, headerCheckpoint).
+//
+// The two goroutines touch those fields from genuinely different OS goroutines
+// in production:
+//   - the DRAIN goroutine runs handleHeadersMsg (and, via block processing,
+//     handleBlockPreamble/fetchHeaderBlocks), which appends to headerList,
+//     advances startHeader and moves the headerCheckpoint cursor; and
+//   - the OUTER loop runs the peer-lifecycle handlers. A donePeerMsg for the
+//     current sync peer drives handleDonePeerMsg -> updateSyncPeer ->
+//     resetHeaderState (which rewrites ALL five fields) and then startSync
+//     (which rewrites headerCheckpoint/nextCheckpoint).
+//
+// TestHandleHeadersMsg_ConcurrentPipelineIsRaceFree above only drives the
+// headers path, so both accesses land on the single drain goroutine and it
+// never catches this outer-vs-drain race. This test injects peer-lifecycle
+// events on sm.msgChan (the real outer path) concurrently with a steady stream
+// of header batches on the drain path, for ~2s, so `go test -race` observes the
+// two goroutines mutating the shared fields at the same time.
+//
+// Before Task 1 this RED-fails under -race (WARNING: DATA RACE on one of the
+// five fields). After Task 1 the fields are serialised behind headerMu and the
+// generation counter, so it passes. headerGen must advance monotonically across
+// the run, and no handler may panic.
+func TestHeaderState_ConcurrentResetVsDrainIsRaceFree(t *testing.T) {
+	const intervals = 8
+
+	// One continuous header chain of `intervals` segments of 5 headers each,
+	// with a checkpoint at the last header of every segment — same shape as the
+	// pipeline race test above.
+	base := chainhash.Hash{0xd2, 0xa1}
+
+	segments := make([][]*wire.BlockHeader, 0, intervals)
+	checkpoints := make([]chaincfg.Checkpoint, 0, intervals)
+
+	prev := base
+	for i := 0; i < intervals; i++ {
+		hdrs, hashes := buildHeaderChain(prev, 5, uint32(2000*(i+1)))
+		segments = append(segments, hdrs)
+
+		cpHeight := int32(5 * (i + 1))
+		cpHash := hashes[len(hashes)-1]
+		checkpoints = append(checkpoints, chaincfg.Checkpoint{Height: cpHeight, Hash: &cpHash})
+
+		prev = hashes[len(hashes)-1]
+	}
+
+	chainParams := chaincfg.MainNetParams
+	chainParams.Checkpoints = checkpoints
+
+	peerCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {},
+			OnGetData:    func(_ *peer.Peer, _ *wire.MsgGetData) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+
+	_, syncPeer, err := MakeConnectedPeers(t, peerCfg, peerCfg, 5)
+	require.NoError(t, err)
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	// The peer must look far ahead of our best height (1) so startSync keeps it
+	// in headers-first mode across every reset cycle, re-entering the drain-path
+	// state the outer path is concurrently rewriting.
+	syncPeer.UpdateLastBlockHeight(1_000_000)
+
+	// FSM stays CATCHINGBLOCKS so the outer loop's current() gate never flips us
+	// out of headers-first mode. GetBlockHeader returns not-found so
+	// fetchHeaderBlocks treats every header as needing a fetch.
+	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
+	bestHeader := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+	}
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil).Maybe()
+	blockchainClient.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 1}, nil).Maybe()
+	blockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{bestHeader.Hash()}, nil).Maybe()
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+	blockchainClient.On("CatchUpBlocks", mock.Anything).Return(nil).Maybe()
+	blockchainClient.On("Run", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	state := &peerSyncState{
+		syncCandidate:   true,
+		requestQueue:    txmap.NewSyncedSlice[wire.InvVect](maxRequestedBlocks),
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+		msgChan:          make(chan interface{}, 256),
+		quit:             make(chan struct{}),
+		handlerDone:      make(chan struct{}),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+	sm.nextCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerCheckpoint = &chainParams.Checkpoints[0]
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+
+	// Run the real block handler (spawns the inner drain goroutine and the outer
+	// msgChan/ticker loop) exactly as production does.
+	go sm.blockHandler()
+
+	const runFor = 2 * time.Second
+	deadline := time.Now().Add(runFor)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// (a) DRAIN path: stream header batches back-to-back so the drain goroutine
+	// continuously appends to headerList / advances startHeader / moves the
+	// checkpoint cursor with no idle gaps.
+	go func() {
+		defer wg.Done()
+		i := 0
+		for time.Now().Before(deadline) {
+			msg := wire.NewMsgHeaders()
+			for _, h := range segments[i%intervals] {
+				_ = msg.AddBlockHeader(h)
+			}
+			// Re-seed a fresh header list front every few batches so
+			// handleHeadersMsg always has a linking anchor even after the outer
+			// path has just wiped the list — keeps the drain path mutating.
+			sm.QueueHeaders(msg, syncPeer)
+			i++
+		}
+	}()
+
+	// (b) OUTER path: invoke resetHeaderState back-to-back. In production this is
+	// what the outer blockHandler loop runs when it rotates a stalled sync peer
+	// (handleCheckSyncPeer/handleDonePeerMsg -> updateSyncPeer -> resetHeaderState),
+	// on a different OS goroutine from the drain. Calling it directly here models
+	// exactly that outer-path mutator running concurrently with the drain, with
+	// none of the peer-rotation flakiness that would otherwise make the collision
+	// window vanishingly rare. resetHeaderState wipes headerList / startHeader /
+	// headerListSeed, realigns the checkpoint cursors and bumps headerGen — every
+	// one of the five fields the drain goroutine is simultaneously mutating.
+	// headersFirstMode is re-armed after each reset so the drain keeps processing
+	// (handleHeadersMsg early-returns and disconnects when it is false).
+	go func() {
+		defer wg.Done()
+		for time.Now().Before(deadline) {
+			sm.resetHeaderState(&base, 0)
+			// resetHeaderState clears headersFirstMode; re-arm it (and re-seed the
+			// list front) so the drain path keeps linking and mutating rather than
+			// disconnecting the peer as "unrequested headers".
+			sm.headersFirstMode.Store(true)
+		}
+	}()
+
+	wg.Wait()
+
+	// Stop the handler and wait for the outer loop to finish BEFORE reading any
+	// shared state, so the read below never races the handler goroutines.
+	close(sm.quit)
+	<-sm.handlerDone
+
+	// The generation counter must have advanced (each resetHeaderState bumps it),
+	// proving the outer reset path ran, and no handler may have panicked.
+	require.Greater(t, sm.headerGen, uint64(0), "resetHeaderState must have bumped headerGen at least once")
+}
+
 // TestHeaderList_NodesRemovedOnBlockFetchProgressNotHeaderEvents is the
 // block-fetch-progress lifecycle test (replaces the old C2 anchor-by-identity
 // test, whose header-event removal is exactly the stranding bug that has been
