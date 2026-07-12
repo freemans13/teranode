@@ -1068,6 +1068,9 @@ func (b *Blockchain) AddBlock(ctx context.Context, request *blockchain_api.AddBl
 	if request.OptionID != 0 {
 		storeBlockOptions = append(storeBlockOptions, blockchainoptions.WithID(request.OptionID))
 	}
+	if request.OptionQuickValidated {
+		storeBlockOptions = append(storeBlockOptions, blockchainoptions.WithQuickValidated(request.OptionQuickValidated))
+	}
 
 	ID, height, err := b.store.StoreBlock(ctx, block, request.PeerId, storeBlockOptions...)
 	if err != nil {
@@ -1521,6 +1524,7 @@ func (b *Blockchain) GetLatestBlockHeaderFromBlockLocatorRequest(ctx context.Con
 		BlockTime:      meta.BlockTime,
 		Timestamp:      meta.Timestamp,
 		MedianTimePast: meta.MedianTimePast,
+		QuickValidated: meta.QuickValidated,
 	}, nil
 }
 
@@ -1609,6 +1613,7 @@ func (b *Blockchain) GetBestBlockHeader(ctx context.Context, empty *emptypb.Empt
 		Timestamp:      meta.Timestamp,
 		ChainWork:      meta.ChainWork,
 		MedianTimePast: meta.MedianTimePast,
+		QuickValidated: meta.QuickValidated,
 	}, nil
 }
 
@@ -1711,6 +1716,7 @@ func (b *Blockchain) GetBlockHeader(ctx context.Context, req *blockchain_api.Get
 		Invalid:        meta.Invalid,
 		ProcessedAt:    processedAt,
 		MedianTimePast: meta.MedianTimePast,
+		QuickValidated: meta.QuickValidated,
 	}, nil
 }
 

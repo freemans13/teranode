@@ -236,21 +236,22 @@ func (x *HealthResponse) GetTimestamp() *timestamppb.Timestamp {
 
 // AddBlockRequest contains data for adding a new block to the blockchain.
 type AddBlockRequest struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	Header            []byte                 `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`                                              // Block header
-	SubtreeHashes     [][]byte               `protobuf:"bytes,2,rep,name=subtree_hashes,json=subtreeHashes,proto3" json:"subtree_hashes,omitempty"`           // Merkle tree hashes
-	CoinbaseTx        []byte                 `protobuf:"bytes,3,opt,name=coinbase_tx,json=coinbaseTx,proto3" json:"coinbase_tx,omitempty"`                    // Coinbase transaction
-	TransactionCount  uint64                 `protobuf:"varint,4,opt,name=transaction_count,json=transactionCount,proto3" json:"transaction_count,omitempty"` // Number of transactions
-	SizeInBytes       uint64                 `protobuf:"varint,5,opt,name=size_in_bytes,json=sizeInBytes,proto3" json:"size_in_bytes,omitempty"`              // Block size
-	External          bool                   `protobuf:"varint,6,opt,name=external,proto3" json:"external,omitempty"`                                         // External block flag
-	PeerId            string                 `protobuf:"bytes,7,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                                // Peer identifier
-	OptionMinedSet    bool                   `protobuf:"varint,8,opt,name=optionMinedSet,proto3" json:"optionMinedSet,omitempty"`                             // Option to mark block as mined
-	OptionSubtreesSet bool                   `protobuf:"varint,9,opt,name=optionSubtreesSet,proto3" json:"optionSubtreesSet,omitempty"`                       // Option to mark subtrees as set
-	OptionInvalid     bool                   `protobuf:"varint,10,opt,name=optionInvalid,proto3" json:"optionInvalid,omitempty"`                              // Option to invalidate block when adding
-	OptionID          uint64                 `protobuf:"varint,11,opt,name=optionID,proto3" json:"optionID,omitempty"`                                        // Optional block ID
-	CoinbaseBump      []byte                 `protobuf:"bytes,12,opt,name=coinbase_bump,json=coinbaseBump,proto3" json:"coinbase_bump,omitempty"`             // Coinbase BUMP (BRC-74 merkle proof)
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Header               []byte                 `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`                                              // Block header
+	SubtreeHashes        [][]byte               `protobuf:"bytes,2,rep,name=subtree_hashes,json=subtreeHashes,proto3" json:"subtree_hashes,omitempty"`           // Merkle tree hashes
+	CoinbaseTx           []byte                 `protobuf:"bytes,3,opt,name=coinbase_tx,json=coinbaseTx,proto3" json:"coinbase_tx,omitempty"`                    // Coinbase transaction
+	TransactionCount     uint64                 `protobuf:"varint,4,opt,name=transaction_count,json=transactionCount,proto3" json:"transaction_count,omitempty"` // Number of transactions
+	SizeInBytes          uint64                 `protobuf:"varint,5,opt,name=size_in_bytes,json=sizeInBytes,proto3" json:"size_in_bytes,omitempty"`              // Block size
+	External             bool                   `protobuf:"varint,6,opt,name=external,proto3" json:"external,omitempty"`                                         // External block flag
+	PeerId               string                 `protobuf:"bytes,7,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                                // Peer identifier
+	OptionMinedSet       bool                   `protobuf:"varint,8,opt,name=optionMinedSet,proto3" json:"optionMinedSet,omitempty"`                             // Option to mark block as mined
+	OptionSubtreesSet    bool                   `protobuf:"varint,9,opt,name=optionSubtreesSet,proto3" json:"optionSubtreesSet,omitempty"`                       // Option to mark subtrees as set
+	OptionInvalid        bool                   `protobuf:"varint,10,opt,name=optionInvalid,proto3" json:"optionInvalid,omitempty"`                              // Option to invalidate block when adding
+	OptionID             uint64                 `protobuf:"varint,11,opt,name=optionID,proto3" json:"optionID,omitempty"`                                        // Optional block ID
+	CoinbaseBump         []byte                 `protobuf:"bytes,12,opt,name=coinbase_bump,json=coinbaseBump,proto3" json:"coinbase_bump,omitempty"`             // Coinbase BUMP (BRC-74 merkle proof)
+	OptionQuickValidated bool                   `protobuf:"varint,13,opt,name=optionQuickValidated,proto3" json:"optionQuickValidated,omitempty"`                // Option to mark block as quick-validated (fail-closed, no conflicting nodes)
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *AddBlockRequest) Reset() {
@@ -365,6 +366,13 @@ func (x *AddBlockRequest) GetCoinbaseBump() []byte {
 		return x.CoinbaseBump
 	}
 	return nil
+}
+
+func (x *AddBlockRequest) GetOptionQuickValidated() bool {
+	if x != nil {
+		return x.OptionQuickValidated
+	}
+	return false
 }
 
 // GetBlockRequest represents a request to retrieve a block by its hash.
@@ -2181,6 +2189,7 @@ type GetBlockHeaderResponse struct {
 	Invalid        bool                   `protobuf:"varint,13,opt,name=invalid,proto3" json:"invalid,omitempty"`                                       // Validity status
 	ProcessedAt    *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=processed_at,json=processedAt,proto3" json:"processed_at,omitempty"`             // Timestamp when block was processed
 	MedianTimePast uint32                 `protobuf:"varint,15,opt,name=median_time_past,json=medianTimePast,proto3" json:"median_time_past,omitempty"` // Median Time Past (MTP) - median of last 11 block timestamps (BIP113)
+	QuickValidated bool                   `protobuf:"varint,16,opt,name=quick_validated,json=quickValidated,proto3" json:"quick_validated,omitempty"`   // Whether the block was committed via the quick-validate path (fail-closed, no conflicting nodes)
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -2318,6 +2327,13 @@ func (x *GetBlockHeaderResponse) GetMedianTimePast() uint32 {
 		return x.MedianTimePast
 	}
 	return 0
+}
+
+func (x *GetBlockHeaderResponse) GetQuickValidated() bool {
+	if x != nil {
+		return x.QuickValidated
+	}
+	return false
 }
 
 // CheckBlockIsCurrentChainResponse indicates if blocks are in the main chain.
@@ -6976,7 +6992,7 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\x0eHealthResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
 	"\adetails\x18\x02 \x01(\tR\adetails\x128\n" +
-	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\xb4\x03\n" +
+	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\xe8\x03\n" +
 	"\x0fAddBlockRequest\x12\x16\n" +
 	"\x06header\x18\x01 \x01(\fR\x06header\x12%\n" +
 	"\x0esubtree_hashes\x18\x02 \x03(\fR\rsubtreeHashes\x12\x1f\n" +
@@ -6991,7 +7007,8 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\roptionInvalid\x18\n" +
 	" \x01(\bR\roptionInvalid\x12\x1a\n" +
 	"\boptionID\x18\v \x01(\x04R\boptionID\x12#\n" +
-	"\rcoinbase_bump\x18\f \x01(\fR\fcoinbaseBump\"%\n" +
+	"\rcoinbase_bump\x18\f \x01(\fR\fcoinbaseBump\x122\n" +
+	"\x14optionQuickValidated\x18\r \x01(\bR\x14optionQuickValidated\"%\n" +
 	"\x0fGetBlockRequest\x12\x12\n" +
 	"\x04hash\x18\x01 \x01(\fR\x04hash\"<\n" +
 	"\x10GetBlocksRequest\x12\x12\n" +
@@ -7097,7 +7114,7 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\x17InvalidateBlockResponse\x12,\n" +
 	"\x11invalidatedBlocks\x18\x01 \x03(\fR\x11invalidatedBlocks\"6\n" +
 	"\x16RevalidateBlockRequest\x12\x1c\n" +
-	"\tblockHash\x18\x01 \x01(\fR\tblockHash\"\xef\x03\n" +
+	"\tblockHash\x18\x01 \x01(\fR\tblockHash\"\x98\x04\n" +
 	"\x16GetBlockHeaderResponse\x12 \n" +
 	"\vblockHeader\x18\x01 \x01(\fR\vblockHeader\x12\x0e\n" +
 	"\x02id\x18\x02 \x01(\rR\x02id\x12\x16\n" +
@@ -7116,7 +7133,8 @@ const file_services_blockchain_blockchain_api_blockchain_api_proto_rawDesc = "" 
 	"\fsubtrees_set\x18\f \x01(\bR\vsubtreesSet\x12\x18\n" +
 	"\ainvalid\x18\r \x01(\bR\ainvalid\x12=\n" +
 	"\fprocessed_at\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\vprocessedAt\x12(\n" +
-	"\x10median_time_past\x18\x0f \x01(\rR\x0emedianTimePast\"V\n" +
+	"\x10median_time_past\x18\x0f \x01(\rR\x0emedianTimePast\x12'\n" +
+	"\x0fquick_validated\x18\x10 \x01(\bR\x0equickValidated\"V\n" +
 	" CheckBlockIsCurrentChainResponse\x122\n" +
 	"\x14isPartOfCurrentChain\x18\x01 \x01(\bR\x14isPartOfCurrentChain\"^\n" +
 	"\"CheckBlockIsAncestorOfBlockRequest\x12\x1a\n" +

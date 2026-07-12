@@ -320,18 +320,19 @@ func (c *Client) AddBlock(ctx context.Context, block *model.Block, peerID string
 
 	external := peerID != ""
 	req := &blockchain_api.AddBlockRequest{
-		Header:            block.Header.Bytes(),
-		CoinbaseTx:        block.CoinbaseTx.Bytes(),
-		SubtreeHashes:     make([][]byte, 0, len(block.Subtrees)),
-		TransactionCount:  block.TransactionCount,
-		SizeInBytes:       block.SizeInBytes,
-		External:          external,
-		PeerId:            peerID,
-		OptionMinedSet:    storeBlockOptions.MinedSet,
-		OptionSubtreesSet: storeBlockOptions.SubtreesSet,
-		OptionInvalid:     storeBlockOptions.Invalid,
-		OptionID:          storeBlockOptions.ID,
-		CoinbaseBump:      block.CoinbaseBUMP,
+		Header:               block.Header.Bytes(),
+		CoinbaseTx:           block.CoinbaseTx.Bytes(),
+		SubtreeHashes:        make([][]byte, 0, len(block.Subtrees)),
+		TransactionCount:     block.TransactionCount,
+		SizeInBytes:          block.SizeInBytes,
+		External:             external,
+		PeerId:               peerID,
+		OptionMinedSet:       storeBlockOptions.MinedSet,
+		OptionSubtreesSet:    storeBlockOptions.SubtreesSet,
+		OptionInvalid:        storeBlockOptions.Invalid,
+		OptionID:             storeBlockOptions.ID,
+		OptionQuickValidated: storeBlockOptions.QuickValidated,
+		CoinbaseBump:         block.CoinbaseBUMP,
 	}
 
 	for _, subtreeHash := range block.Subtrees {
@@ -652,12 +653,13 @@ func (c *Client) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, bestB
 	}
 
 	meta := &model.BlockHeaderMeta{
-		Height:      resp.Height,
-		TxCount:     resp.TxCount,
-		SizeInBytes: resp.SizeInBytes,
-		Miner:       resp.Miner,
-		BlockTime:   resp.BlockTime,
-		Timestamp:   resp.Timestamp,
+		Height:         resp.Height,
+		TxCount:        resp.TxCount,
+		SizeInBytes:    resp.SizeInBytes,
+		Miner:          resp.Miner,
+		BlockTime:      resp.BlockTime,
+		Timestamp:      resp.Timestamp,
+		QuickValidated: resp.QuickValidated,
 	}
 
 	return header, meta, nil
@@ -729,6 +731,7 @@ func (c *Client) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *m
 		Timestamp:      resp.Timestamp,
 		ChainWork:      resp.ChainWork,
 		MedianTimePast: resp.MedianTimePast,
+		QuickValidated: resp.QuickValidated,
 	}
 
 	return header, meta, nil
@@ -819,6 +822,7 @@ func (c *Client) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) 
 		SubtreesSet:    resp.SubtreesSet,
 		Invalid:        resp.Invalid,
 		MedianTimePast: resp.MedianTimePast,
+		QuickValidated: resp.QuickValidated,
 	}
 
 	if resp.ProcessedAt != nil {
