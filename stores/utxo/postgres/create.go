@@ -177,17 +177,17 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		opt(options)
 	}
 
-	// If batcher is active, enqueue and wait — EXCEPT for the coinbase. The
-	// coinbase is a single latency-sensitive row on block assembly's
-	// move_forward critical path (exactly one per block). Batching it only adds
-	// the flush-window latency and, under catchup, queues it behind
-	// block-validation's large create batches. Route it straight to
-	// createDirect. This is a store-internal decision — the maturity stamp and
-	// ErrTxExists idempotency are identical on both paths (both build their
-	// output arrays via buildOutputArrays, so coinbase_spending_height =
-	// blockHeight + CoinbaseMaturity is computed the same way, and both map an
-	// ON CONFLICT no-row into ErrTxExists), so callers see no behavioural change.
-	if s.createBatcher != nil && !tx.IsCoinbase() {
+	// If batcher is active, enqueue and wait.
+	//
+	// NOTE: the coinbase is NOT special-cased to a direct insert here. That was
+	// tried and reverted: with synchronous_commit=on (enforced, financial-data
+	// durability — never off), the batched path issues one multi-row UNNEST
+	// INSERT and so amortises a single WAL fsync across the whole batch, whereas
+	// a lone direct coinbase insert pays a full fsync by itself (~9ms vs ~4ms
+	// batched at steady state). Keeping the coinbase batched lets it share the
+	// fsync. Reducing move_forward further requires taking the coinbase write
+	// off the synchronous critical path, not routing it around the batcher.
+	if s.createBatcher != nil {
 		return s.createBatched(ctx, tx, blockHeight, options)
 	}
 
