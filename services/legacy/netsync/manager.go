@@ -3318,11 +3318,36 @@ func (sm *SyncManager) flushWorker(ctx context.Context, jobs <-chan windowFlushJ
 				continue
 			}
 
-			if sm.commitWindowJob(ctx, job) {
+			if sm.commitWindowJobRecovered(ctx, job) {
 				poisoned = true
 			}
 		}
 	}
+}
+
+// commitWindowJobRecovered wraps commitWindowJob so a panic in the commit path
+// (ProcessBlockWindow / recovery) is converted into the SAME fatal-poison
+// outcome as an unrecoverable commit error, instead of killing the flushWorker
+// goroutine. A dead worker would never drain jobs, so the drain goroutine's
+// blocking `jobs <- j` send would wedge forever — a silent permanent IBD stall.
+//
+// On panic it returns true (poison): the worker keeps draining and discarding
+// queued windows WITHOUT committing any (no committed gap — semantically
+// identical to commitWindowJob's fatal-disconnect escalation), and the drain
+// goroutine's sends still complete. The panic is not a normal commit failure,
+// so we do not attempt bounded recovery or a peer disconnect here; poisoning
+// halts all further commits, and the uncommitted suffix re-syncs from the
+// committed best-block on the next restart / peer rotation.
+func (sm *SyncManager) commitWindowJobRecovered(ctx context.Context, job windowFlushJob) (poison bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			poison = true
+
+			sm.logger.Errorf("[flushWorker] recovered panic in window commit, poisoning worker (no further windows committed): %v", r)
+		}
+	}()
+
+	return sm.commitWindowJob(ctx, job)
 }
 
 // windowCommitRetryCap bounds the number of recovery passes flush makes over the

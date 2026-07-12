@@ -58,6 +58,11 @@ type pipelineSpyBlockValidation struct {
 	// that height fail unrecoverably (fatal on ProcessBlockWindow and recovery).
 	fatalFirstHeight uint32
 
+	// panicFirstHeight, when non-zero, makes the window whose first block is at
+	// that height PANIC inside ProcessBlockWindow (before recording it), to
+	// exercise the flushWorker recover-and-poison path.
+	panicFirstHeight uint32
+
 	processWindowCalls atomic.Int32
 }
 
@@ -78,6 +83,10 @@ func (s *pipelineSpyBlockValidation) ProcessBlockWindow(_ context.Context, block
 
 	if s.gate != nil {
 		<-s.gate
+	}
+
+	if s.panicFirstHeight != 0 && first == s.panicFirstHeight {
+		panic("pipeline panic window commit")
 	}
 
 	if s.fatalFirstHeight != 0 && first == s.fatalFirstHeight {
@@ -724,4 +733,80 @@ func TestPipeline_FlagOff_SynchronousFlush(t *testing.T) {
 	require.Equal(t, int32(1), spy.processWindowCalls.Load(),
 		"synchronous flush must commit exactly one window inline")
 	require.Equal(t, []uint32{500}, spy.committedOrder())
+}
+
+// TestFlushWorker_PanicPoisonsAndDrains proves the flushWorker's recover path:
+// when a window's commit PANICS (rather than returning an error), the worker
+// must NOT die/leak. It recovers, poisons itself (semantically identical to a
+// fatal commit error), keeps draining its queued jobs (discarding them without
+// committing, so no committed gap), and a subsequent producer send on jobs must
+// still complete rather than block forever on a dead worker.
+//
+// Every blocking step is bounded so a hang (the pre-fix behaviour: the worker
+// goroutine dies on the panic, jobs is never drained, and jobs <- j blocks
+// forever) surfaces as a clear test failure rather than a wedged run.
+func TestFlushWorker_PanicPoisonsAndDrains(t *testing.T) {
+	const panicFirst = uint32(500)
+
+	spy := &pipelineSpyBlockValidation{
+		gate:             make(chan struct{}),
+		entered:          make(chan uint32, 4),
+		panicFirstHeight: panicFirst,
+	}
+	sm := newAckTestSyncManager(t, spy)
+
+	jobs := make(chan windowFlushJob, 1)
+
+	done := make(chan struct{})
+	go func() {
+		sm.flushWorker(sm.ctx, jobs)
+		close(done)
+	}()
+
+	// Window W (panics) -> worker enters and blocks on the gate.
+	jobs <- buildWindowJob(t, panicFirst, 2)
+	select {
+	case first := <-spy.entered:
+		require.Equal(t, panicFirst, first)
+	case <-time.After(pipelineTestTimeout):
+		t.Fatal("worker did not enter panicking window commit")
+	}
+
+	// Release the panicking commit. The worker must recover, poison itself, and
+	// return to the top-of-loop select rather than dying.
+	spy.gate <- struct{}{}
+
+	// A subsequent producer send MUST complete: a dead worker (pre-fix) never
+	// drains jobs, so this send would block forever. The buffered slot (depth 1)
+	// plus a live, draining worker guarantees it lands within the deadline.
+	select {
+	case jobs <- buildWindowJob(t, 600, 2):
+	case <-time.After(pipelineTestTimeout):
+		t.Fatal("producer send blocked: worker died on panic and is not draining jobs")
+	}
+
+	// The queued window W+1 must NOT enter ProcessBlockWindow — the worker is
+	// poisoned and drains it without committing.
+	select {
+	case first := <-spy.entered:
+		t.Fatalf("poisoned worker committed queued window (first height %d) after a panic", first)
+	case <-time.After(200 * time.Millisecond):
+		// expected: W+1 discarded, not committed
+	}
+
+	// Close jobs; the recovered worker must finish draining and exit cleanly.
+	// The <-done receive is the authoritative no-leak proof: it fires only if
+	// the worker goroutine returned after recovering the panic (a dead goroutine
+	// never closes done, and the deadline then fails the test).
+	close(jobs)
+	select {
+	case <-done:
+	case <-time.After(pipelineTestTimeout):
+		t.Fatal("worker did not exit after channel close (panic killed the goroutine)")
+	}
+
+	committed := spy.committedOrder()
+	require.NotContains(t, committed, panicFirst, "panicking window W must not be recorded as committed")
+	require.NotContains(t, committed, uint32(600), "queued window W+1 must not be committed after a panic gap")
+	require.Empty(t, committed, "no window may commit once a panic poisons the worker")
 }
