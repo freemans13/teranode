@@ -4353,7 +4353,14 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 // who captured a pointer before reset need to read from. The shadow is
 // Clear()ed at moveForwardBlock commit, after readers are guaranteed to have
 // finished — see swapCurrentTxMapBack for the rollback inverse.
-func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool) (err error) {
+// allowSubtreeReuse enables the IBD reuse fast-path (see below): when the
+// current subtree carries no block transactions it is reset and reused in place
+// rather than reallocated. It is safe ONLY for the IBD fast-path caller, which
+// neither captures the pre-reset subtree pointer for a remainder handoff nor
+// relies on the rollback contract restoring a distinct pre-reset object. The
+// full moveForwardBlock path and the reorg paths must pass false so their
+// originalCurrentSubtree capture stays an independent object.
+func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees, allowSubtreeReuse bool) (err error) {
 	// Track whether the in-memory pool swap has already been performed in this
 	// call. If a later step fails (notably stp.newSubtree below) we must roll
 	// the swap back here, atomically, because moveForwardBlock's own rollback
@@ -4391,7 +4398,42 @@ func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool)
 		subtreeSize = 1024 * 1024
 	}
 
-	if cs := stp.currentSubtree.Load(); cs != nil {
+	// IBD reuse fast-path: during catch-up the block-assembly mempool is empty,
+	// so the current subtree holds only the coinbase placeholder (Length()==1) or
+	// is empty — nothing was mined into it since the last reset. Allocating a
+	// fresh currentItemsPerFile-capacity subtree (1M leaves × 48 bytes ≈ 48 MB,
+	// zeroed) every move_forward is then pure waste plus GC pressure. Reuse the
+	// existing object in place instead.
+	//
+	// Reuse is safe ONLY when the current subtree carries no block transactions
+	// (Length() <= 1): an empty subtree has nothing a captured pointer needs to
+	// read back, so the full path's originalCurrentSubtree handoff is unaffected
+	// (that path only matters when txs were mined, i.e. Length() > 1). It must
+	// also be heap-backed and already the right capacity, so we never touch the
+	// mmap file lifecycle or hand mining a wrongly-sized subtree. We reset via
+	// exported API only — RemoveNodeAtIndex(0) clears the coinbase node's
+	// nodeIndex entry, Fees, SizeInBytes and rootHash — then the shared
+	// AddCoinbaseNode() below re-establishes the placeholder, leaving the object
+	// byte-identical to a freshly allocated one.
+	cs := stp.currentSubtree.Load()
+	if allowSubtreeReuse && cs != nil && cs.Length() <= 1 && !cs.IsMmapBacked() && cs.Size() == subtreeSize {
+		for cs.Length() > 0 {
+			if remErr := cs.RemoveNodeAtIndex(0); remErr != nil {
+				return errors.NewProcessingError("resetSubtreeState: failed to clear reused subtree", remErr)
+			}
+		}
+		cs.ConflictingNodes = nil
+		// currentSubtree already stores cs; no swap needed.
+
+		stp.closeChainedSubtrees()
+
+		// Add first coinbase placeholder transaction
+		_ = cs.AddCoinbaseNode()
+
+		return nil
+	}
+
+	if cs != nil {
 		cs.Close()
 	}
 	newSubtree, err := stp.newSubtree(subtreeSize)
@@ -4654,7 +4696,12 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		} else if meta.MinedSet && meta.QuickValidated {
 			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: empty mempool + MinedSet + QuickValidated + below checkpoint, skipping reconciliation", block.String())
 
-			if err = stp.resetSubtreeState(createProperlySizedSubtrees); err != nil {
+			// Fast-path: no pre-reset subtree pointer is captured for a remainder
+			// handoff and there is no rollback here, so the empty current subtree
+			// can be reset and reused in place (allowSubtreeReuse=true), skipping
+			// the ~48 MB currentItemsPerFile allocation this branch would otherwise
+			// throw away every block during IBD.
+			if err = stp.resetSubtreeState(createProperlySizedSubtrees, true); err != nil {
 				return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] IBD fast-path: error resetting subtree state", block.String(), err)
 			}
 
@@ -4704,7 +4751,12 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	// originalCurrentTxMap captured just above). If any subsequent step
 	// fails, we must swap them back so callers see the pre-reset state and
 	// the double-buffer invariant (current=active, shadow=empty) is restored.
-	if err = stp.resetSubtreeState(createProperlySizedSubtrees); err != nil {
+	//
+	// allowSubtreeReuse=false: the full path captured originalCurrentSubtree
+	// above and hands it to processRemainderTransactionsAndDequeue, and the
+	// rollback contract restores it — both require it to stay a distinct object,
+	// so the in-place reuse must not fire here.
+	if err = stp.resetSubtreeState(createProperlySizedSubtrees, false); err != nil {
 		return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error resetting subtree state", block.String(), err)
 	}
 

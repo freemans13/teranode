@@ -239,7 +239,7 @@ func TestResetSubtreeState_RollsBackSwapOnNewSubtreeFailure(t *testing.T) {
 	// two leaf count makes subtreepkg.NewTreeByLeafCount return ErrNotPowerOfTwo.
 	stp.currentItemsPerFile.Store(3)
 
-	err = stp.resetSubtreeState(true)
+	err = stp.resetSubtreeState(true, false)
 	require.Error(t, err, "resetSubtreeState must surface the newSubtree failure")
 
 	// Rollback assertions: the swap must have been undone so the prior-block

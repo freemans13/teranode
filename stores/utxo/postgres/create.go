@@ -177,12 +177,22 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		opt(options)
 	}
 
-	// If batcher is active, enqueue and wait.
-	if s.createBatcher != nil {
+	// If batcher is active, enqueue and wait — EXCEPT for the coinbase. The
+	// coinbase is a single latency-sensitive row on block assembly's
+	// move_forward critical path (exactly one per block). Batching it only adds
+	// the flush-window latency and, under catchup, queues it behind
+	// block-validation's large create batches. Route it straight to
+	// createDirect. This is a store-internal decision — the maturity stamp and
+	// ErrTxExists idempotency are identical on both paths (both build their
+	// output arrays via buildOutputArrays, so coinbase_spending_height =
+	// blockHeight + CoinbaseMaturity is computed the same way, and both map an
+	// ON CONFLICT no-row into ErrTxExists), so callers see no behavioural change.
+	if s.createBatcher != nil && !tx.IsCoinbase() {
 		return s.createBatched(ctx, tx, blockHeight, options)
 	}
 
-	// No batcher — execute INSERT directly (single-item path).
+	// No batcher (single-item test path) or a coinbase bypassing the batcher —
+	// execute the INSERT directly.
 	return s.createDirect(ctx, tx, blockHeight, options)
 }
 
