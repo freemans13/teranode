@@ -2991,6 +2991,411 @@ func TestHeadersFirst_MultiMessageInterval_NoStrandedBlock(t *testing.T) {
 	}
 }
 
+// TestPeerRotation_FiresWhileDrainBlockedOnMaturity is the liveness regression
+// test for CRITICAL deadlock hole #1 (the one that killed the rejected
+// "move the peer-lifecycle handlers onto the drain goroutine" designs): the
+// stall watchdog MUST be able to rotate a wedged sync peer WHILE the drain
+// goroutine is blocked — otherwise the rescue is queued behind the very stall it
+// exists to break.
+//
+// The chosen design keeps handleCheckSyncPeer -> updateSyncPeer ->
+// DisconnectWithInfo on the OUTER blockHandler loop, a different OS goroutine
+// from the drain (which runs handleBlockMsg / handleHeadersMsg). This test models
+// exactly that split:
+//
+//   - DRAIN goroutine: a background goroutine calls handleBlockMsg on a block
+//     whose height is below the hardcoded checkpoint. handleBlockMsg ->
+//     HandleBlockDirect reaches waitForBlockAssemblyReadyCached ->
+//     waitForBlockAssemblyCachePoll, which spins on its 200ms recheck ticker
+//     against a cached block-assembly height that is pinned far behind the
+//     bound and never advances (no poller is started). The drain is therefore
+//     genuinely PARKED inside the maturity wait for up to windowMaturityMaxWait
+//     (30s). We inject the cached height directly rather than sleeping, so the
+//     park is sub-millisecond to set up and deterministic.
+//   - OUTER path: the test goroutine calls handleCheckSyncPeer directly — this
+//     is precisely what the outer blockHandler loop runs on its 30s ticker
+//     (calling it directly avoids the real 30s wait while faithfully modelling
+//     the outer-loop mutator, mirroring how
+//     TestHeaderState_ConcurrentResetVsDrainIsRaceFree calls resetHeaderState
+//     directly to model the outer path).
+//
+// The sync peer has a stale lastBlockTime (older than maxLastBlockTime) and
+// zero throughput samples, so handleCheckSyncPeer classifies it as a
+// last-block-time stall and rotates it. The parking block is delivered by a
+// SEPARATE peer (not the sync peer, and not sharing its association), so
+// HandleBlockDirect's receipt-time updateLastBlockTime refresh (which keys off
+// syncPeerStateFor) does NOT touch the sync peer's stale timestamp and cannot
+// mask the stall.
+//
+// TEETH — why this fails under the rejected drain-owned-handlers design and
+// passes here: under that design handleCheckSyncPeer would run on the SAME
+// goroutine that is parked in waitForBlockAssemblyCachePoll, so it could not be
+// dispatched until the maturity wait returned (up to 30s later) — the sync peer
+// would stay connected for the whole park and the require.Eventually below would
+// time out. The assertions below deliberately confirm the drain is STILL parked
+// (the parking block's reply has NOT been sent) at the moment the rotation
+// completes, so the test cannot pass trivially: it proves the rotation happened
+// concurrently with an actively-blocked drain, not after it drained.
+func TestPeerRotation_FiresWhileDrainBlockedOnMaturity(t *testing.T) {
+	// The block handlers touch package prometheus gauges (e.g.
+	// prometheusLegacyNetsyncBlockHeight in HandleBlockDirect's defer). New()
+	// normally initialises them; this test builds the SyncManager directly, so
+	// initialise them here (idempotent via sync.Once).
+	initPrometheusMetrics()
+
+	chainParams := chaincfg.MainNetParams
+	// A checkpoint far above the parking block's height so BelowCheckpoint is
+	// true and waitForBlockAssemblyReadyCached takes the cache-poll fast path.
+	cpHash := chainhash.Hash{0xcc}
+	chainParams.Checkpoints = []chaincfg.Checkpoint{{Height: 100_000, Hash: &cpHash}}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	// Keep the cache-poll path armed: a positive maturity window is required for
+	// the fast path, and it is the default, but assert it so the test's premise
+	// is explicit.
+	require.Greater(t, tSettings.BlockValidation.MaxBlocksBehindBlockAssembly, 0,
+		"premise: a positive maturity window engages the cache-poll fast path")
+
+	// FSM stays CATCHINGBLOCKS. The parking block's prev header resolves to
+	// height 4999, so the block is height 5000 — well below the 100_000
+	// checkpoint. GetBlockExists=false so HandleBlockDirect proceeds to the
+	// maturity wait rather than short-circuiting.
+	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
+	prevMeta := &model.BlockHeaderMeta{Height: 4999}
+	bestHeader := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+	}
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil).Maybe()
+	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(&model.BlockHeader{}, prevMeta, nil).Maybe()
+	blockchainClient.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 1}, nil).Maybe()
+	blockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*chainhash.Hash{bestHeader.Hash()}, nil).Maybe()
+
+	// The block that parks the drain, delivered by a peer distinct from the sync
+	// peer so its receipt refreshes only its own (unused) lastBlockTime.
+	blockPeerCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetData:    func(_ *peer.Peer, _ *wire.MsgGetData) {},
+			OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	_, blockPeer, err := MakeConnectedPeers(t, blockPeerCfg, blockPeerCfg, 10)
+	require.NoError(t, err)
+	defer blockPeer.DisconnectWithInfo("test done")
+
+	// The stalled sync peer, connected via a real pipe so DisconnectWithInfo has
+	// an observable effect (Connected() flips to false).
+	syncPeerCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetData:    func(_ *peer.Peer, _ *wire.MsgGetData) {},
+			OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	_, syncPeer, err := MakeConnectedPeers(t, syncPeerCfg, syncPeerCfg, 11)
+	require.NoError(t, err)
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	blockPeerState := &peerSyncState{
+		syncCandidate:   false,
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer blockPeerState.requestedTxns.Stop()
+	defer blockPeerState.requestedBlocks.Stop()
+
+	syncPeerPeerState := &peerSyncState{
+		// Not a sync candidate, so after rotation startSync re-elects nobody and
+		// the disconnect is the sole observable outcome.
+		syncCandidate:   false,
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer syncPeerPeerState.requestedTxns.Stop()
+	defer syncPeerPeerState.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+		quit:             make(chan struct{}),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(blockPeer, blockPeerState)
+	sm.peerStates.Set(syncPeer, syncPeerPeerState)
+	sm.headersFirstMode.Store(true)
+
+	// Store the STALLED sync peer with a lastBlockTime far past maxLastBlockTime
+	// and no network samples (ticks == 0). In headers-first mode the network
+	// speed check is skipped, so the last-block-time violation alone drives the
+	// rotation; ticks == 0 also disables the healthy-download throttle.
+	sps := &syncPeerState{lastBlockTime: time.Now().Add(-2 * maxLastBlockTime)}
+	sm.storeSyncPeer(syncPeer, sps)
+
+	// Pin the cached block-assembly height far below the bound so the cache-poll
+	// wait can never satisfy cached+maxBehind >= 5000 and stays parked. No poller
+	// runs (we never call Start), so this value is stable for the whole test.
+	sm.cachedBlockAssemblyHeight.Store(1)
+
+	// Build a minimal wire block: HandleBlockDirect reaches the maturity wait
+	// after only reading the header and the prev-header height, so no coinbase or
+	// transactions are needed to park the drain.
+	prevHash := chainhash.Hash{0xab, 0xcd}
+	msgBlock := wire.NewMsgBlock(wire.NewBlockHeader(1, &prevHash, &chainhash.Hash{}, 0, 7777))
+	block := bsvutil.NewBlock(msgBlock)
+	blockHash := *block.Hash()
+
+	// The parking block must be a requested block for handleBlockPreamble to
+	// accept it (an unrequested block would disconnect blockPeer and return
+	// early, never reaching the maturity wait).
+	blockPeerState.requestedBlocks.Set(blockHash, struct{}{})
+	sm.requestedBlocks.Set(blockHash, struct{}{})
+
+	// DRAIN goroutine: park inside the maturity wait. handleBlockMsg is exactly
+	// what the drain goroutine runs for a block; calling it on its own goroutine
+	// models the drain being parked there, and (unlike routing through the
+	// blockHandler select) leaves blockBacklog at 0 so the watchdog evaluates the
+	// stall normally rather than deferring on a pending-processing backlog.
+	drainReturned := make(chan struct{})
+	go func() {
+		defer close(drainReturned)
+		_ = sm.handleBlockMsg(&blockQueueMsg{
+			block:       msgBlock,
+			blockHash:   blockHash,
+			blockHeight: 5000,
+			peer:        blockPeer,
+		})
+	}()
+
+	// Confirm the drain is genuinely parked in the maturity wait before asserting
+	// on rotation: it must NOT have returned. If it returned quickly the maturity
+	// wait was not actually engaged and the test would have no teeth.
+	select {
+	case <-drainReturned:
+		t.Fatal("drain returned before entering the maturity wait — the park was not engaged, test has no teeth")
+	case <-time.After(300 * time.Millisecond):
+		// Still parked (as expected): the cache-poll wait is spinning on its 200ms
+		// recheck ticker against a cached height that never advances.
+	}
+
+	// OUTER path: rotation must fire while the drain is parked. handleCheckSyncPeer
+	// runs on the outer loop in production; invoking it directly here models the
+	// outer-loop ticker. Under the rejected drain-owned-handlers design this call
+	// would be queued behind the parked handleBlockMsg on the same goroutine and
+	// could not run, so the peer would stay connected and this Eventually would
+	// time out.
+	require.Eventually(t, func() bool {
+		sm.handleCheckSyncPeer()
+		return !syncPeer.Connected()
+	}, 5*time.Second, 20*time.Millisecond,
+		"stalled sync peer must be rotated (disconnected) while the drain is blocked in the maturity wait")
+
+	// TEETH: at the moment rotation completed the drain must STILL be parked — the
+	// parking block's processing has not returned. This proves the rotation ran
+	// concurrently with an actively-blocked drain rather than after it unblocked.
+	select {
+	case <-drainReturned:
+		t.Fatal("drain unblocked before/at rotation — rotation was not proven to fire while the drain was parked")
+	default:
+		// Drain still parked while rotation fired — hole #1 does not exist.
+	}
+
+	// Release the parked drain deterministically: closing quit makes
+	// waitForBlockAssemblyCachePoll return promptly on its sm.quit case.
+	close(sm.quit)
+	select {
+	case <-drainReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked drain did not release on shutdown")
+	}
+}
+
+// TestRefillTick_DoesNotBlockDrain_WhenOutputQueueFull is the liveness
+// regression test for CRITICAL deadlock hole #2: a blocking peer send on the
+// refill path would wedge the drain goroutine itself. The refill tick fires
+// maintainInFlightWindow -> fetchHeaderBlocks on the drain, and fetchHeaderBlocks
+// issues getdata via the sync peer's output queue. If that send were the old
+// unconditional blocking QueueMessage, a connected-but-write-stalled peer with a
+// full 5000-deep output queue would block the drain forever, and every block and
+// headers message queued behind it would never be processed.
+//
+// The chosen design makes the refill getdata send non-blocking (Task 2's
+// TryQueueMessage) so a backed-up peer can never wedge the drain — a dropped
+// getdata self-heals on the next tick. This test proves the drain keeps
+// servicing blockQueue while the refill ticker fires repeatedly against a
+// deliberately full output queue:
+//
+//   - the sync peer is force-marked connected and its output queue is filled to
+//     capacity (reusing Task 2's TstMarkConnected / TstFillOutputQueue), and no
+//     I/O goroutine drains it, so every refill getdata send observes a full queue;
+//   - the real blockHandler runs with a short refill interval, so the refill tick
+//     fires maintainInFlightWindow -> fetchHeaderBlocks many times per second, each
+//     hitting the full-queue try-send path;
+//   - a block is then queued whose GetBlockExists returns true, so
+//     HandleBlockDirect returns nil promptly, and its reply must arrive within a
+//     deadline.
+//
+// TEETH — why this fails under a blocking-send design and passes here: with the
+// pre-Task-2 blocking QueueMessage, the very first refill tick would block the
+// drain on the full output queue and never return, so the block's reply would
+// never be sent and the deadline below would elapse. The block completing while
+// the refill ticker is provably firing against the full queue is the proof that
+// the refill send is non-blocking and the drain stays live.
+func TestRefillTick_DoesNotBlockDrain_WhenOutputQueueFull(t *testing.T) {
+	base := chainhash.Hash{0xba}
+	// Enough header runway that maintainInFlightWindow keeps calling
+	// fetchHeaderBlocks (startHeader stays non-nil) on every tick.
+	const headerCount = 50
+	_, hashes := buildHeaderChain(base, headerCount, 9000)
+
+	chainParams := chaincfg.MainNetParams
+
+	// Count refill-driven getdata attempts observed at the peer layer. The queue
+	// is full so TryQueueMessage returns false and nothing reaches a counterpart;
+	// instead we prove the refill is firing by observing fetchHeaderBlocks run
+	// (via a hook on GetBlockHeader, which haveInventory calls for each header).
+	// The block handlers touch package prometheus gauges; New() normally
+	// initialises them but this test builds the SyncManager directly.
+	initPrometheusMetrics()
+
+	var getBlockHeaderCalls atomic.Int64
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { getBlockHeaderCalls.Add(1) }).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+	// The probe block already exists, so HandleBlockDirect returns nil promptly.
+	blockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil).Maybe()
+	// FSM RUNNING so the outer loop's per-message current() gate is not exercised
+	// (this test is about refill/drain liveness, not the FSM RUN transition).
+	running := blockchain2.FSMStateRUNNING
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&running, nil).Maybe()
+	blockchainClient.On("GetBestBlockHeader", mock.Anything).
+		Return(&model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}},
+			&model.BlockHeaderMeta{Height: 1}, nil).Maybe()
+
+	// Sync peer with a full output queue and no draining I/O goroutine.
+	syncPeerCfg := peer.Config{
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	tSettings := test.CreateBaseTestSettings(t)
+
+	syncPeer, err := peer.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &syncPeerCfg, "10.8.8.8:8333")
+	require.NoError(t, err)
+	syncPeer.TstMarkConnected()
+	syncPeer.TstFillOutputQueue()
+
+	// Short refill interval so the ticker fires many times per second.
+	tSettings.Legacy.InFlightRefillInterval = 5 * time.Millisecond
+	// Disable the parallel window so blockQueue is drained via handleBlockMsg ->
+	// HandleBlockDirect (a clean, prompt reply on the already-exists path).
+	tSettings.Legacy.ParallelWindowMemoryFraction = 0
+
+	state := &peerSyncState{
+		syncCandidate:   true,
+		requestQueue:    txmap.NewSyncedSlice[wire.InvVect](maxRequestedBlocks),
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+		msgChan:          make(chan interface{}, 256),
+		quit:             make(chan struct{}),
+		handlerDone:      make(chan struct{}),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+
+	// Populate the header list with runway so maintainInFlightWindow reaches
+	// fetchHeaderBlocks (below the dynamic cap, startHeader non-nil).
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	for i := range hashes {
+		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &hashes[i]})
+	}
+	sm.startHeader = sm.headerList.Front().Next()
+
+	// Run the real block handler: outer loop + drain goroutine + refill ticker.
+	go sm.blockHandler()
+	defer func() {
+		close(sm.quit)
+		<-sm.handlerDone
+	}()
+
+	// Wait until the refill ticker has provably fired against the full output
+	// queue at least a few times (fetchHeaderBlocks -> haveInventory ->
+	// GetBlockHeader). This confirms hole #2's precondition is active: the drain
+	// is repeatedly attempting refill getdata sends on a full queue.
+	require.Eventually(t, func() bool {
+		return getBlockHeaderCalls.Load() >= 3
+	}, 3*time.Second, 10*time.Millisecond,
+		"refill ticker must be firing fetchHeaderBlocks against the full output queue")
+
+	// Now queue a block whose reply must arrive promptly. If the refill's getdata
+	// send were blocking, the drain would be wedged on the full queue and this
+	// reply would never come.
+	probeBlock := bsvutil.NewBlock(wire.NewMsgBlock(
+		wire.NewBlockHeader(1, &chainhash.Hash{0x01}, &chainhash.Hash{}, 0, 4242)))
+	// Register the probe as a requested block so handleBlockPreamble accepts it
+	// (an unrequested block is treated as peer misbehaviour and disconnected).
+	// It then hits HandleBlockDirect's already-exists early return (GetBlockExists
+	// is mocked true) and replies nil promptly.
+	probeHash := *probeBlock.Hash()
+	state.requestedBlocks.Set(probeHash, struct{}{})
+	sm.requestedBlocks.Set(probeHash, struct{}{})
+
+	reply := make(chan error, 1)
+	sm.QueueBlock(probeBlock, syncPeer, reply)
+
+	select {
+	case err := <-reply:
+		require.NoError(t, err, "probe block (already-exists) should process cleanly")
+	case <-time.After(3 * time.Second):
+		t.Fatal("drain did not process a queued block while the refill tick fired against a full output queue (refill send is blocking)")
+	}
+
+	// Sanity: the refill was still firing throughout — the drain serviced the
+	// block WHILE the refill ticker kept hitting the full queue, not after it
+	// stopped.
+	require.Greater(t, getBlockHeaderCalls.Load(), int64(3),
+		"refill must remain active across the block-processing window")
+}
+
 // nodeInList reports whether a header node with the given hash is present in the
 // header list.
 func nodeInList(l *list.List, h *chainhash.Hash) bool {
