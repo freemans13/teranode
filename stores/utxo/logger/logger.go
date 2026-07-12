@@ -128,6 +128,11 @@ func (s *Store) SupportsOutpointOnlySpend() bool {
 	return s.store.SupportsOutpointOnlySpend()
 }
 
+// PoolMaxConns delegates to the wrapped store.
+func (s *Store) PoolMaxConns() int {
+	return s.store.PoolMaxConns()
+}
+
 func (s *Store) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	s.logger.Debugf("[UTXOStore][logger][Health] : %s", caller())
 	return s.store.Health(ctx, checkLiveness)

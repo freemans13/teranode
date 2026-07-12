@@ -474,6 +474,14 @@ func (s *Store) markCleanShutdown(ctx context.Context) {
 // decoration, no UTXO hash) is applied exactly, not silently ignored.
 func (s *Store) SupportsOutpointOnlySpend() bool { return true }
 
+// PoolMaxConns returns the configured ceiling of the main pgxpool — the value
+// set from pool_max_conns (or the default 80) in New. This is the connection
+// budget that peak concurrent in-flight demand must not exceed; callers use it
+// to fail closed when a concurrency setting would starve the pool (see the
+// window-barrier-collapse guard in block validation). A pooled store never
+// returns the 0 sentinel.
+func (s *Store) PoolMaxConns() int { return int(s.pool.Config().MaxConns) }
+
 // Health checks the database connection.
 func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 	var num int

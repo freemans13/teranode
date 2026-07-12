@@ -427,6 +427,15 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		return nil
 	}
 
+	// --- Pool-budget fail-closed guard (only when the barrier-collapse flag is ON). ---
+	// Collapsing the C1->C2 barrier makes the create AND spend batchers hot at the same
+	// time, so peak in-flight pool demand becomes ~2*BatcherMaxConcurrent. If that exceeds
+	// the store's pool AND the maintenance pool is disabled, the pruner starves and the
+	// disk fills (the betfair deadlock shape). When the flag is OFF this is a no-op.
+	if err := u.guardWindowPoolBudget(); err != nil {
+		return err
+	}
+
 	// --- Gate: every block must be below the hardcoded checkpoint + outpoint-only. ---
 	// Fail-closed: a single above-checkpoint block must never enter the concurrent path.
 	highest := model.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)
@@ -569,6 +578,64 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 	}
 
 	u.logger.Debugf("[ProcessBlockWindow] completed window of %d blocks (heights %d–%d)", k, blocks[0].Height, blocks[k-1].Height)
+	return nil
+}
+
+// windowPoolBudgetHeadroom is the number of connections reserved above the
+// overlap's peak in-flight demand (2*BatcherMaxConcurrent) for the store's own
+// housekeeping (health checks, block-state reads, the odd direct query) so the
+// hot batchers can never claim the entire pool.
+const windowPoolBudgetHeadroom = 4
+
+// guardWindowPoolBudget fails the window closed when the barrier-collapse flag is
+// ON but the connection-pool budget cannot safely absorb overlapping creates and
+// spends. It is a no-op when the flag is OFF (zero behaviour change on the phased
+// path). See checkWindowPoolBudget for the budget rule.
+func (u *BlockValidation) guardWindowPoolBudget() error {
+	if !u.settings.BlockValidation.WindowBarrierCollapse {
+		return nil
+	}
+
+	return checkWindowPoolBudget(
+		u.utxoStore,
+		u.settings.UtxoStore.BatcherMaxConcurrent,
+		u.settings.UtxoStore.PostgresMaintenancePoolConns,
+	)
+}
+
+// checkWindowPoolBudget is the pure budget rule for the barrier-collapse overlap.
+//
+// When the store is pool-bound (PoolMaxConns() > 0) it requires:
+//   - poolMax >= 2*batcherMaxConcurrent + windowPoolBudgetHeadroom, so the create
+//     and spend batchers running hot together cannot exhaust the pool; and
+//   - maintPoolConns > 0, so background reclaim (DAH sweep + pruner deletes) has a
+//     dedicated pool and cannot be starved by the write pool — otherwise the disk
+//     fills and the node deadlocks.
+//
+// A non-pool-bound store (PoolMaxConns() == 0) is not subject to the check.
+// A violation returns a teranode/errors configuration error naming the required
+// values, aborting the window before any create runs.
+func checkWindowPoolBudget(store utxo.Store, batcherMaxConcurrent, maintPoolConns int) error {
+	poolMax := store.PoolMaxConns()
+	if poolMax <= 0 {
+		return nil // not pool-bound (in-memory / Aerospike / no own pool) — skip
+	}
+
+	required := 2*batcherMaxConcurrent + windowPoolBudgetHeadroom
+	if poolMax < required {
+		return errors.NewConfigurationError(
+			"[ProcessBlockWindow] WindowBarrierCollapse requires pool_max_conns >= %d (2*BatcherMaxConcurrent(%d) + headroom(%d)) but store pool is %d; raise pool_max_conns or lower utxostore_batcherMaxConcurrent",
+			required, batcherMaxConcurrent, windowPoolBudgetHeadroom, poolMax,
+		)
+	}
+
+	if maintPoolConns <= 0 {
+		return errors.NewConfigurationError(
+			"[ProcessBlockWindow] WindowBarrierCollapse requires utxostore_postgresMaintenancePoolConns > 0 (got %d) so the pruner is not starved when creates and spends overlap; set it to 16",
+			maintPoolConns,
+		)
+	}
+
 	return nil
 }
 

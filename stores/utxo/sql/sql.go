@@ -373,6 +373,12 @@ func (s *Store) Close(ctx context.Context) error {
 // outpoint-only fast path (SkipExtendedInputs on Create, SkipUTXOHashCheck on Spend).
 func (s *Store) SupportsOutpointOnlySpend() bool { return true }
 
+// PoolMaxConns returns 0 — the pgxpool-based budget guard does not apply to the
+// SQL store. This store manages its database/sql pool internally and is not the
+// pgxpool-backed store the window-barrier-collapse budget check targets, so it
+// reports the "not pool-bound — skip" sentinel.
+func (s *Store) PoolMaxConns() int { return 0 }
+
 // Health checks the database connection and returns status information.
 func (s *Store) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	details := fmt.Sprintf("SQL Engine is %s", s.engine)
