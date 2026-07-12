@@ -2478,14 +2478,20 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 // window continuously at the cap.
 //
 // GETDATA TOP-UP ONLY — no getheaders re-arm. handleHeadersMsg already keeps
-// exactly one getheaders outstanding at all times (manager.go non-checkpoint and
-// checkpoint-boundary branches), both toward the same headerCheckpoint.Hash. A
-// proactive re-arm would re-send an identical locator; the peer answers both and
-// the second fails the linkage check, triggering a self-inflicted disconnect in
-// precisely the RX=0 window this change exists to fix. So when the header runway
-// is exhausted (startHeader == nil) this returns silently and relies on the
-// already-outstanding getheaders (recovery of a lost one falls to the 30s
-// watchdog rotation).
+// exactly one getheaders outstanding at all times: the checkpoint-boundary
+// pipeline send (PushGetHeadersMsg toward headerCheckpoint.Hash) and the
+// non-checkpoint continuation send (PushGetHeadersMsg toward the same
+// headerCheckpoint.Hash) — see the two sends in handleHeadersMsg's
+// receivedCheckpoint and trailing branches below. A proactive re-arm from here
+// would re-send an identical locator toward the same headerCheckpoint.Hash; the
+// peer answers both, and the second, overlapping response fails the header
+// linkage check in handleHeadersMsg ("Received block header that does not
+// properly connect to the chain") and triggers DisconnectWithWarning — a self-
+// inflicted disconnect loop in precisely the RX=0 window this change exists to
+// fix. So when the header runway is exhausted (startHeader == nil) this returns
+// silently and relies on the already-outstanding getheaders (recovery of a lost
+// one falls to the 30s watchdog rotation). This omission is locked in by
+// TestRunwayExhaustion_NoDuplicateGetheaders.
 //
 // MUST be called on the drain goroutine only.
 func (sm *SyncManager) maintainInFlightWindow() {

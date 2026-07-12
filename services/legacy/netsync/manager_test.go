@@ -2211,6 +2211,133 @@ func TestMaintainInFlightWindow_NoopWhenNotHeadersFirst(t *testing.T) {
 	}
 }
 
+// TestRunwayExhaustion_NoDuplicateGetheaders is the lock-in / regression test for
+// Task 4: it enforces that maintainInFlightWindow NEVER issues a getheaders when
+// the header runway is exhausted (startHeader == nil) while a checkpoint is still
+// pending (headerCheckpoint != nil).
+//
+// This is the exact RX=0 window the feed-starvation fix targets: the last header
+// node has been walked into getdata, so startHeader is nil, but the sync is not
+// finished — there is a checkpoint still ahead and a getheaders for the next batch
+// is already outstanding from handleHeadersMsg (manager.go PushGetHeadersMsg at the
+// checkpoint-boundary pipeline path, line 2771, and the non-checkpoint path, line
+// 2791, both toward headerCheckpoint.Hash). A proactive re-arm from the refill path
+// would re-send an identical locator; the peer answers both and the second overlaps
+// the first, so its headers fail the "does not properly connect to the chain"
+// linkage check (manager.go line 2684) and trigger DisconnectWithWarning — a self-
+// inflicted disconnect loop precisely in the RX=0 window.
+//
+// The test drives that state directly and fires maintainInFlightWindow(), asserting
+// the refill path contributes ZERO getheaders. It PASSES on current code because
+// Task 3 deliberately omits the re-arm; adding any PushGetHeadersMsg to the refill
+// path makes it FAIL. The only getheaders in the system come from handleHeadersMsg,
+// never from refill.
+func TestRunwayExhaustion_NoDuplicateGetheaders(t *testing.T) {
+	base := chainhash.Hash{0xf0}
+
+	// A full interval of headers, all already walked into getdata (startHeader nil).
+	const headerCount = 30
+	_, hashes := buildHeaderChain(base, headerCount, 8000)
+
+	chainParams := chaincfg.MainNetParams
+	// A checkpoint still ahead so headerCheckpoint stays non-nil (sync not done).
+	cpHash := chainhash.Hash{0x99}
+	chainParams.Checkpoints = []chaincfg.Checkpoint{
+		{Height: int32(headerCount + 10), Hash: &cpHash},
+	}
+
+	// Count getheaders the sync peer sends to its counterpart. Any refill-issued
+	// re-arm would travel the pipe and be observed here.
+	getHeadersSeen := make(chan struct{}, 4)
+	counterpartCfg := peer.Config{
+		Listeners: peer.MessageListeners{
+			OnGetHeaders: func(_ *peer.Peer, _ *wire.MsgGetHeaders) {
+				select {
+				case getHeadersSeen <- struct{}{}:
+				default:
+				}
+			},
+			// getdata would be emitted only if runway were present; drain it so the
+			// peer pipeline never blocks. It must not fire here (runway exhausted).
+			OnGetData: func(_ *peer.Peer, _ *wire.MsgGetData) {},
+		},
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	syncPeerCfg := peer.Config{
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+
+	// counterpart observes the sync peer's outbound getheaders.
+	_, syncPeer, err := MakeConnectedPeers(t, counterpartCfg, syncPeerCfg, 7)
+	require.NoError(t, err)
+	defer syncPeer.DisconnectWithInfo("test done")
+
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+
+	// Seed the full header list, then set startHeader = nil to model runway
+	// exhaustion: every node has already been requested via getdata and the cursor
+	// has walked off the end. headerCheckpoint stays non-nil so this is the
+	// mid-sync RX=0 window, not the finished-sync case.
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	for i := range hashes {
+		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &hashes[i]})
+	}
+	sm.startHeader = nil
+	sm.headerCheckpoint = &chainParams.Checkpoints[0]
+
+	// Preconditions: runway exhausted but a checkpoint is still pending.
+	sm.headerMu.Lock()
+	require.Nil(t, sm.startHeader, "precondition: header runway must be exhausted")
+	require.NotNil(t, sm.headerCheckpoint, "precondition: a checkpoint must still be pending")
+	sm.headerMu.Unlock()
+
+	// Fire the refill in the exact runway-exhaustion state.
+	sm.maintainInFlightWindow()
+
+	// The refill must NOT re-arm getheaders — the outstanding one from
+	// handleHeadersMsg is the only getheaders in the system.
+	select {
+	case <-getHeadersSeen:
+		t.Fatal("refill issued a getheaders on runway exhaustion — self-inflicted disconnect risk")
+	case <-time.After(200 * time.Millisecond):
+		// No getheaders observed — correct.
+	}
+}
+
 // TestHeaderList_NodesRemovedOnBlockFetchProgressNotHeaderEvents is the
 // block-fetch-progress lifecycle test (replaces the old C2 anchor-by-identity
 // test, whose header-event removal is exactly the stranding bug that has been
