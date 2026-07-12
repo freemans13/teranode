@@ -4644,8 +4644,10 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	// current subtree state and write the coinbase UTXO.  Callers advance
 	// currentBlockHeader (via finalizeBlockProcessing or an explicit Store) after
 	// we return, so we must NOT store it here — mirroring the empty-block branch.
-	if stp.currentTxMap.Length() == 0 && stp.queue.length() == 0 && stp.removeMap.Length() == 0 &&
-		stp.settings.ChainCfgParams != nil && model.BelowCheckpoint(stp.settings.ChainCfgParams.Checkpoints, block.Height) {
+	emptyMaps := stp.currentTxMap.Length() == 0 && stp.queue.length() == 0 && stp.removeMap.Length() == 0
+	belowCheckpoint := stp.settings.ChainCfgParams != nil && model.BelowCheckpoint(stp.settings.ChainCfgParams.Checkpoints, block.Height)
+
+	if emptyMaps && belowCheckpoint {
 		_, meta, ghErr := stp.blockchainClient.GetBlockHeader(ctx, block.Hash())
 		if ghErr != nil {
 			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: GetBlockHeader error, falling back to full path: %v", block.String(), ghErr)
@@ -4661,7 +4663,17 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 			}
 
 			return nil, nil, nil
+		} else {
+			// Fast-path gate reached the header read but the flags were not both set.
+			// Report the observed flags so operators can tell "flag not armed" from
+			// "maps not empty yet" during A/B measurement. minedSet/quickValidated are
+			// the values just read over gRPC.
+			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path NOT taken: emptyMaps=%v belowCheckpoint=%v minedSet=%v quickValidated=%v", block.String(), emptyMaps, belowCheckpoint, meta.MinedSet, meta.QuickValidated)
 		}
+	} else {
+		// Fast-path gate failed before the header read, so the block's MinedSet/
+		// QuickValidated flags were never fetched; report them as false (not read).
+		stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path NOT taken: emptyMaps=%v belowCheckpoint=%v minedSet=%v quickValidated=%v", block.String(), emptyMaps, belowCheckpoint, false, false)
 	}
 
 	stp.logger.Debugf("[moveForwardBlock][%s] resetting subtrees: %v", block.String(), block.Subtrees)
