@@ -2426,6 +2426,47 @@ func (p *Peer) QueueMessageWithEncoding(msg wire.Message, doneChan chan<- struct
 	p.outputQueue <- outMsg{msg: msg, encoding: encoding, doneChan: doneChan}
 }
 
+// TryQueueMessage is a non-blocking variant of QueueMessageWithEncoding. It
+// attempts to enqueue the message on the output queue and returns true if it
+// was accepted, or false if the peer is not connected or the output queue is
+// full. It never blocks, so a write-stalled peer can never wedge the caller.
+//
+// This function is safe for concurrent access.
+func (p *Peer) TryQueueMessage(msg wire.Message) bool {
+	// Avoid risk of deadlock if goroutine already exited.  The goroutine
+	// we will be sending to hangs around until it knows for a fact that
+	// it is marked as disconnected and *then* it drains the channels.
+	if !p.Connected() {
+		return false
+	}
+
+	select {
+	case p.outputQueue <- outMsg{msg: msg, encoding: wire.BaseEncoding, doneChan: nil}:
+		return true
+	default:
+		return false
+	}
+}
+
+// TstMarkConnected marks the peer as connected without an underlying
+// connection. It is only intended for tests that need Connected() to report
+// true on a peer whose I/O goroutines are not running.
+func (p *Peer) TstMarkConnected() {
+	atomic.StoreInt32(&p.connected, 1)
+	atomic.StoreInt32(&p.disconnect, 0)
+}
+
+// TstFillOutputQueue fills the peer's output queue to its buffer capacity so
+// that a subsequent non-blocking send observes a full queue. It is only
+// intended for tests. It assumes no queue-handler goroutine is draining the
+// queue (i.e. the peer was constructed but its connection was never
+// associated).
+func (p *Peer) TstFillOutputQueue() {
+	for i := 0; i < outputBufferSize; i++ {
+		p.outputQueue <- outMsg{msg: wire.NewMsgPing(0), encoding: wire.BaseEncoding}
+	}
+}
+
 // QueueInventory adds the passed inventory to the inventory send queue which
 // might not be sent right away, rather it is trickled to the peer in batches.
 // Inventory that the peer is already known to have is ignored.

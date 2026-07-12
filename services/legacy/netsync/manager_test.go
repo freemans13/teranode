@@ -1922,6 +1922,122 @@ func TestHeaderState_ConcurrentResetVsDrainIsRaceFree(t *testing.T) {
 	require.Greater(t, sm.headerGen, uint64(0), "resetHeaderState must have bumped headerGen at least once")
 }
 
+// TestFetchHeaderBlocks_OutputQueueFull_DoesNotBlockAndDoesNotLeakLedger is the
+// drain-safety precondition for the continuous-refill ticker (Task 3). When the
+// sync peer's output queue is full (a connected-but-write-stalled peer),
+// fetchHeaderBlocks' getdata send MUST NOT block the drain goroutine, and a
+// dropped getdata MUST NOT leave phantom in-flight entries in either ledger.
+//
+// The sync peer here is constructed but never has a connection associated, so
+// no queue-handler goroutine drains its output queue. It is force-marked
+// connected (so the non-blocking send is actually attempted rather than
+// short-circuited by the not-connected guard) and its output queue is filled to
+// capacity. fetchHeaderBlocks is then invoked in a background goroutine.
+//
+// RED against pre-Task-2 code: fetchHeaderBlocks used sp.QueueMessage, an
+// unconditional blocking send on the full 5000-deep buffer, so the goroutine
+// never returns and the 100ms deadline elapses. It also Set the hashes into
+// both ledgers before the send, so even had it returned the ledgers would carry
+// phantom in-flight entries for a getdata that never went out.
+//
+// GREEN after Task 2: the send is a non-blocking TryQueueMessage that returns
+// false on the full queue (the call returns immediately, no block), and the
+// ledger Set is deferred until after a successful send, so a dropped batch
+// leaves both ledgers untouched.
+func TestFetchHeaderBlocks_OutputQueueFull_DoesNotBlockAndDoesNotLeakLedger(t *testing.T) {
+	base := chainhash.Hash{0xf0}
+
+	// Two headers past the base so the walk has real work to do.
+	_, hashes := buildHeaderChain(base, 2, 3000)
+
+	chainParams := chaincfg.MainNetParams
+
+	// A peer that is NOT associated with a connection: its I/O goroutines never
+	// start, so nothing drains its output queue and the fill below stays full.
+	syncPeerCfg := peer.Config{
+		UserAgentName:    "netsynctest",
+		UserAgentVersion: "1.0",
+		ChainParams:      &chainParams,
+		Services:         wire.SFNodeNetwork,
+	}
+	tSettings := test.CreateBaseTestSettings(t)
+
+	syncPeer, err := peer.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &syncPeerCfg, "10.9.9.9:8333")
+	require.NoError(t, err)
+
+	// Make the peer report connected so the non-blocking send is attempted, then
+	// fill the output queue to capacity so any send observes a full queue.
+	syncPeer.TstMarkConnected()
+	syncPeer.TstFillOutputQueue()
+
+	// haveInventory queries GetBlockHeader; return not-found so every header is
+	// treated as needing a fetch (getdata carries entries to attempt to send).
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	defer state.requestedTxns.Stop()
+	defer state.requestedBlocks.Stop()
+
+	sm := &SyncManager{
+		ctx:              context.Background(),
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		chainParams:      &chainParams,
+		blockchainClient: blockchainClient,
+		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:       list.New(),
+		blockSizeTracker: newBlockSizeTracker(20),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	sm.peerStates.Set(syncPeer, state)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
+	sm.headersFirstMode.Store(true)
+
+	// Seed the header list exactly as resetHeaderState does, then append the two
+	// headers so fetchHeaderBlocks has a non-empty walk with startHeader set.
+	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	for i, h := range hashes {
+		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &h})
+	}
+	// startHeader is the first block to fetch (the element after the dummy seed),
+	// mirroring how handleHeadersMsg initialises it.
+	sm.startHeader = sm.headerList.Front().Next()
+
+	// Record the in-flight ledger sizes before the call. A dropped getdata must
+	// leave them unchanged.
+	beforeGlobal := sm.requestedBlocks.Len()
+	beforePeer := state.requestedBlocks.Len()
+
+	// (a) fetchHeaderBlocks must return promptly — it must not block on the full
+	// output queue. Run it in a goroutine and fail if it has not returned within
+	// a tight deadline.
+	done := make(chan struct{})
+	go func() {
+		sm.fetchHeaderBlocks()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("fetchHeaderBlocks blocked on a full output queue (getdata send is not non-blocking)")
+	}
+
+	// (b) The dropped getdata must not have leaked phantom in-flight entries into
+	// either ledger.
+	require.Equal(t, beforeGlobal, sm.requestedBlocks.Len(),
+		"global requestedBlocks ledger must be unchanged when getdata is dropped")
+	require.Equal(t, beforePeer, state.requestedBlocks.Len(),
+		"per-peer requestedBlocks ledger must be unchanged when getdata is dropped")
+}
+
 // TestHeaderList_NodesRemovedOnBlockFetchProgressNotHeaderEvents is the
 // block-fetch-progress lifecycle test (replaces the old C2 anchor-by-identity
 // test, whose header-event removal is exactly the stranding bug that has been

@@ -2375,6 +2375,12 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	getDataMessage := wire.NewMsgGetDataSizeHint(uint(maxBlocks)) // nolint:gosec
 	numRequested := 0
 
+	// Collect the hashes added to this getdata batch. They are recorded into the
+	// in-flight ledgers ONLY AFTER a successful non-blocking send below; a
+	// dropped getdata must not leave phantom in-flight entries the window never
+	// re-tops.
+	pendingHashes := make([]*chainhash.Hash, 0, maxBlocks)
+
 	for e != nil {
 		// Read the current node's hash and the next element under the lock,
 		// re-checking the generation first. All *list.Element pointer traversal
@@ -2413,8 +2419,7 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 				break
 			}
 
-			sm.requestedBlocks.Set(*node.hash, struct{}{})
-			peerState.requestedBlocks.Set(*node.hash, struct{}{})
+			pendingHashes = append(pendingHashes, node.hash)
 
 			numRequested++
 		}
@@ -2439,7 +2444,19 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	}
 
 	if len(getDataMessage.InvList) > 0 {
-		sp.QueueMessage(getDataMessage, nil)
+		// Non-blocking send: a write-stalled peer must never wedge the drain
+		// goroutine (the refill tick calls this every InFlightRefillInterval).
+		if !sp.TryQueueMessage(getDataMessage) {
+			sm.logger.Debugf("[fetchHeaderBlocks] outputQueue full for peer %s, deferring getdata to next tick", sp.String())
+			return
+		}
+
+		// Record the in-flight entries only after the getdata actually went out,
+		// so a dropped batch leaves no phantom entries the window never re-tops.
+		for _, h := range pendingHashes {
+			sm.requestedBlocks.Set(*h, struct{}{})
+			peerState.requestedBlocks.Set(*h, struct{}{})
+		}
 	}
 }
 
