@@ -1546,6 +1546,19 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, bi blockIdent, tx
 		deferFn(err)
 	}()
 
+	// Below-checkpoint outpoint-only fast path: a full no-op. Nothing consumes
+	// extended parent fields (PreviousTxScript/PreviousTxSatoshis) on this path —
+	// createSubtrees stamps fee 0 (calculateTransactionFee is gated !outpointOnly),
+	// createUtxos is inputs-only, PreValidateTransactions uses WithOutpointOnlySpend,
+	// and subtreeData reads outpoints (inherent from wire-parse, not extension). Phase 2
+	// (out-of-block decorate) is already skipped below checkpoint in shipped code, so
+	// consumers already tolerate un-extended inputs. Extension never touches
+	// txids/merkle roots, so skipping it entirely is consensus-neutral — one
+	// outpointOnly decision instead of a half-gated function, and CPU back on fat blocks.
+	if outpointOnly {
+		return nil
+	}
+
 	outpointBatcherSize := sm.settings.Legacy.OutpointBatcherSize
 
 	// Phase 1: populate inputs whose parents are same-block transactions. These are
@@ -1601,18 +1614,6 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, bi blockIdent, tx
 	// most likely cause is a parent that's been pruned (DAH'd) because the child
 	// already had a prior processing pass. Fall back to per-tx decoration so the
 	// existing recovery path (utxoStore.Get on the child itself) can still kick in.
-	//
-	// Below-checkpoint outpoint-only fast path: the dominant DB cost of legacy IBD
-	// is this bulk decorate (one chunked round-trip set per block to fetch parent
-	// scripts/satoshis). On the gated path the spend uses outpoint-only validation
-	// and the create is minimal (inputs-only), so parent scripts/satoshis are never
-	// needed — skip the decorate and its per-tx fallback entirely. Phase 1's in-block
-	// extension above still runs (no DB reads); out-of-block inputs are simply left
-	// undecorated. Default OFF: when the gate is closed this is the unchanged path.
-	if outpointOnly {
-		return nil
-	}
-
 	if batchErr := sm.utxoStore.BatchPreviousOutputsDecorate(ctx, txs); batchErr != nil {
 		if errors.Is(batchErr, errors.ErrProcessing) || errors.Is(batchErr, errors.ErrTxNotFound) {
 			return sm.extendPerTxFallback(ctx, txs)
