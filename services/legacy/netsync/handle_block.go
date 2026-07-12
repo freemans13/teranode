@@ -220,9 +220,11 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// CheckMerkleRoot alone is NOT sufficient: a CVE-2012-2459 duplicate-tx
 	// mutation preserves the merkle root via the duplicate-last-when-odd rule,
 	// so it passes the merkle check while still containing a repeated hash.
-	// CheckSubtreeSlicesForDuplicateTxs is the explicit dedup floor that closes
-	// this gap; it must run while SubtreeSlices is still populated, before the
-	// nil-out below.
+	// The CVE-2012-2459 dedup floor now runs unconditionally inside prepareSubtrees
+	// (on the locally-built slices, for every route), so it is already enforced
+	// before we get here — the second call below is a defensive belt-and-braces on
+	// the unified route's returned slices and is kept in sync with unified_dedup_test.go.
+	// It must run while SubtreeSlices is still populated, before the nil-out below.
 	if preparedSubtreeSlices != nil {
 		teranodeBlock.SubtreeSlices = preparedSubtreeSlices
 		if err = teranodeBlock.CheckMerkleRoot(ctx); err != nil {
@@ -539,6 +541,22 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 
 	if err = sm.createSubtrees(ctx, bi, txOrder, txMap, slices, subtreeDatas, subtreeMetas, outpointOnly); err != nil {
 		return nil, nil, 0, err
+	}
+
+	// CVE-2012-2459 dedup floor for EVERY route (inline, unified, non-quick).
+	// createTxMap uses txMap.Set, which silently overwrites a duplicated txid, so
+	// the map cannot catch it; but createSubtrees replays the block-order txOrder
+	// (which retains both copies) and AddNodes the duplicate into `slices` twice.
+	// Run the explicit dedup scan here, on the locally-built slices, before any
+	// UTXO create/spend or subtree write — regardless of which slices are later
+	// returned to the caller. The unified route's HandleBlockDirect /
+	// prepareBlockForWindow guard was gated on preparedSubtreeSlices != nil (only
+	// non-nil on the unified route), so the inline route never ran the check; this
+	// single call closes that gap for all paths. A CVE-2012-2459 duplicate-tx
+	// mutation preserves the merkle root via the duplicate-last-when-odd rule, so
+	// CheckMerkleRoot alone would pass — this is the only thing that catches it.
+	if err = model.CheckSubtreeSlicesForDuplicateTxs(slices); err != nil {
+		return nil, nil, 0, errors.NewBlockInvalidError("[prepareSubtrees][%s %d] duplicate transaction in block (CVE-2012-2459)", bi.hash.String(), bi.height, err)
 	}
 
 	// Quick validation is safe whenever the block sits at/below the highest hard-coded
