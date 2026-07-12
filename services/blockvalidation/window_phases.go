@@ -492,66 +492,165 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 	// goroutine — blocks at the limit.
 	storeSem := semaphore.NewWeighted(int64(u.effectiveWindowStoreConcurrency()))
 
-	// --- C1: parallel creates. ---
+	// --- C1/C2: create & spend the whole window. ---
 	// spends[i] holds the windowSpend snapshots from createBlockUTXOs for blocks[i].
+	// This slice is shared prep: allocated OUTSIDE the flag branch, written by the
+	// create side and read by the spend side of whichever path runs below.
 	spends := make([][]windowSpend, k)
 
-	c1g, c1ctx := errgroup.WithContext(ctx)
-	// Per-block concurrency across the K blocks. The real goroutine bound is now the
-	// shared storeSem inside each createBlockUTXOs; this errgroup only limits how many
-	// blocks' pipelines run at once. SafeSetLimit clamps to runtime.NumCPU() when
-	// StoreBatcherSize < 1.
-	util.SafeSetLimit(u.logger, c1g, u.settings.UtxoStore.StoreBatcherSize)
-	var mu sync.Mutex
-	for i := range k {
-		blockIdx := i
-		blk := blocks[i]
-		c1g.Go(func() error {
-			// Coinbase-only (0-subtree) blocks have no UTXOs to create and no spends
-			// to record. Mirror quickValidateBlock's no-subtree path exactly: the block
-			// ID was already assigned by the serial height-ordered pre-pass above, so
-			// there is nothing to create here — commit ZERO subtrees in C3, no synthesised
-			// placeholder subtree. This matches every coinbase-only block already on disk
-			// (common on early testnet/mainnet). The I4 checkpoint guard is enforced for
-			// ALL blocks by the pre-C1 gate above.
-			if len(blk.Subtrees) == 0 {
-				// No spends recorded → C2 spendBlockUTXOs is a no-op for this block.
+	if !u.settings.BlockValidation.WindowBarrierCollapse {
+		// -----------------------------------------------------------------------
+		// PHASED path (default): C1 all creates -> hard barrier -> C2 all spends.
+		// Byte-identical to the pre-flag behaviour.
+		// -----------------------------------------------------------------------
+
+		// --- C1: parallel creates. ---
+		c1g, c1ctx := errgroup.WithContext(ctx)
+		// Per-block concurrency across the K blocks. The real goroutine bound is now the
+		// shared storeSem inside each createBlockUTXOs; this errgroup only limits how many
+		// blocks' pipelines run at once. SafeSetLimit clamps to runtime.NumCPU() when
+		// StoreBatcherSize < 1.
+		util.SafeSetLimit(u.logger, c1g, u.settings.UtxoStore.StoreBatcherSize)
+		var mu sync.Mutex
+		for i := range k {
+			blockIdx := i
+			blk := blocks[i]
+			c1g.Go(func() error {
+				// Coinbase-only (0-subtree) blocks have no UTXOs to create and no spends
+				// to record. Mirror quickValidateBlock's no-subtree path exactly: the block
+				// ID was already assigned by the serial height-ordered pre-pass above, so
+				// there is nothing to create here — commit ZERO subtrees in C3, no synthesised
+				// placeholder subtree. This matches every coinbase-only block already on disk
+				// (common on early testnet/mainnet). The I4 checkpoint guard is enforced for
+				// ALL blocks by the pre-C1 gate above.
+				if len(blk.Subtrees) == 0 {
+					// No spends recorded → C2 spendBlockUTXOs is a no-op for this block.
+					return nil
+				}
+
+				ws, err := u.createBlockUTXOs(c1ctx, blk, true /* outpointOnly */, storeSem)
+				if err != nil {
+					return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)
+				}
+				mu.Lock()
+				spends[blockIdx] = ws
+				mu.Unlock()
 				return nil
-			}
+			})
+		}
 
-			ws, err := u.createBlockUTXOs(c1ctx, blk, true /* outpointOnly */, storeSem)
-			if err != nil {
-				return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)
-			}
-			mu.Lock()
-			spends[blockIdx] = ws
-			mu.Unlock()
-			return nil
-		})
-	}
+		// BARRIER C1→C2: all creates committed before any spend begins.
+		if err := c1g.Wait(); err != nil {
+			return err
+		}
 
-	// BARRIER C1→C2: all creates committed before any spend begins.
-	if err := c1g.Wait(); err != nil {
-		return err
-	}
+		// --- C2: parallel spends. ---
+		c2g, c2ctx := errgroup.WithContext(ctx)
+		util.SafeSetLimit(u.logger, c2g, u.settings.UtxoStore.SpendBatcherSize)
+		for i := range k {
+			blk := blocks[i]
+			ws := spends[i]
+			c2g.Go(func() error {
+				if err := u.spendBlockUTXOs(c2ctx, blk, ws, true /* outpointOnly */, storeSem); err != nil {
+					return errors.NewProcessingError("[ProcessBlockWindow][C2][%s] spendBlockUTXOs failed", blk.Hash().String(), err)
+				}
+				return nil
+			})
+		}
 
-	// --- C2: parallel spends. ---
-	c2g, c2ctx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(u.logger, c2g, u.settings.UtxoStore.SpendBatcherSize)
-	for i := range k {
-		blk := blocks[i]
-		ws := spends[i]
-		c2g.Go(func() error {
-			if err := u.spendBlockUTXOs(c2ctx, blk, ws, true /* outpointOnly */, storeSem); err != nil {
-				return errors.NewProcessingError("[ProcessBlockWindow][C2][%s] spendBlockUTXOs failed", blk.Hash().String(), err)
-			}
-			return nil
-		})
-	}
+		// BARRIER C2→C3: all spends done before any commit runs.
+		if err := c2g.Wait(); err != nil {
+			return err
+		}
+	} else {
+		// -----------------------------------------------------------------------
+		// OVERLAP path (WindowBarrierCollapse=true): collapse the C1→C2 barrier so
+		// block i's SPEND runs as soon as the creates for blocks 0..i have RETURNED,
+		// deepening the postgres read queue instead of forcing all creates first.
+		//
+		// Correctness rests on the ASCENDING-PREFIX WAIT: below-checkpoint blocks
+		// carry cross-block-within-window tx chains, and a spend resolves its
+		// same-window parents via JOIN txs on COMMITTED state. createBlockUTXOs
+		// returning ≡ committed & visible, so spend i must wait creates 0..i (the full
+		// ascending prefix), not just create i; a missing parent would be a
+		// non-retryable TxNotFound (hard fail).
+		//
+		// ONE shared errgroup context drives BOTH creates and spends, so a create
+		// failure cancels the spends' prefix waits (via gctx). The completion signal is
+		// a per-block closed channel composed with <-gctx.Done() in a select — NOT a
+		// sync.Cond (which is deaf to context cancellation and would lose wakeups).
+		//
+		// This errgroup is deliberately UNLIMITED: the true fan-out bound is the shared
+		// storeSem inside createBlockUTXOs/spendBatchWithRetry. A SafeSetLimit < 2*k
+		// would DEADLOCK admission — spend legs hold group slots while blocked on the
+		// creates they depend on, so the group must admit all 2*k legs.
+		g, gctx := errgroup.WithContext(ctx)
 
-	// BARRIER C2→C3: all spends done before any commit runs.
-	if err := c2g.Wait(); err != nil {
-		return err
+		// createDone[i] is CLOSED exactly once, when block i's create leg exits by ANY
+		// path (success, coinbase-only early-return, or error). Closing (not sending)
+		// makes the signal level-triggered and re-readable, so no waiting spend can miss it.
+		createDone := make([]chan struct{}, k)
+		for i := range k {
+			createDone[i] = make(chan struct{})
+		}
+
+		for i := range k {
+			blockIdx := i
+			blk := blocks[i]
+
+			// CREATE leg.
+			g.Go(func() error {
+				// close(createDone) MUST be the first deferred statement so it fires on
+				// EVERY exit — success, error, or the coinbase-only early return below —
+				// otherwise a dependent spend's prefix wait would hang forever.
+				defer close(createDone[blockIdx])
+
+				// Coinbase-only (0-subtree) block: nothing to create, no spends recorded
+				// (its spend leg is a no-op). Mirrors the phased path and quickValidateBlock.
+				if len(blk.Subtrees) == 0 {
+					return nil
+				}
+
+				ws, err := u.createBlockUTXOs(gctx, blk, true /* outpointOnly */, storeSem)
+				if err != nil {
+					return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)
+				}
+				// spends[blockIdx] is written here and read only by this block's spend
+				// leg AFTER it waits createDone[blockIdx]; close() is the happens-before edge.
+				spends[blockIdx] = ws
+				return nil
+			})
+
+			// SPEND leg.
+			g.Go(func() error {
+				// Ascending-prefix wait: block i's spend may only run after creates 0..i
+				// have RETURNED. gctx cancellation (a failed create anywhere) aborts the
+				// wait; returning nil lets g.Wait() surface the real create error.
+				for j := 0; j <= blockIdx; j++ {
+					select {
+					case <-createDone[j]:
+					case <-gctx.Done():
+						return nil
+					}
+				}
+
+				// Re-check after the wait: if the shared context was cancelled (e.g. a
+				// prefix create failed after its channel closed), do not spend.
+				if gctx.Err() != nil {
+					return nil
+				}
+
+				if err := u.spendBlockUTXOs(gctx, blk, spends[blockIdx], true /* outpointOnly */, storeSem); err != nil {
+					return errors.NewProcessingError("[ProcessBlockWindow][C2][%s] spendBlockUTXOs failed", blk.Hash().String(), err)
+				}
+				return nil
+			})
+		}
+
+		// BARRIER →C3: all creates and overlapped spends done before any commit runs.
+		if err := g.Wait(); err != nil {
+			return err
+		}
 	}
 
 	// --- C3: serial commits in ascending height order. ---
