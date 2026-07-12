@@ -130,6 +130,7 @@ func (s *SQL) GetBlockHeadersFromOldest(ctx context.Context, chainTipHash, targe
 			,b.invalid
 			,b.processed_at
 			,b.median_time_past
+			,b.quick_validated
 			,b.coinbase_tx
 		FROM blocks b
 		JOIN ChainBlocks cb ON b.id = cb.id

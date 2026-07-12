@@ -343,6 +343,7 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 		peerID,
 		options.WithSubtreesSet(true),
 		options.WithMinedSet(true),
+		options.WithQuickValidated(true),
 		options.WithID(uint64(block.ID)),
 	); err != nil {
 		// Idempotent restart heal: below the checkpoint the chain is final, so a block

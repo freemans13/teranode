@@ -4625,17 +4625,23 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	// eviction that the full path would honour via processOwnBlockNodes; skipping
 	// it would silently drop the eviction.
 	//
-	// The block must also be within the below-checkpoint range.  Above the
-	// highest hardcoded checkpoint, block-validation can produce conflicting
-	// subtree nodes; processConflictingTransactions (in the full path) is the
-	// only place that resolution is applied to the UTXO store.  Skipping it
-	// above-checkpoint would silently lose conflict resolution.
+	// The load-bearing invariant is QuickValidated=true: the quick-validate path
+	// is fail-closed and writes zero conflicting subtree nodes, so skipping
+	// processConflictingTransactions is safe.  Full validation (even below the
+	// checkpoint, e.g. during a reorg, when CatchupAllowQuickValidation is off,
+	// or via processBlockFound) CAN write conflicting nodes; those would be
+	// silently lost if we took the fast-path.  MinedSet alone is NOT sufficient:
+	// a fully-validated block below the checkpoint also has MinedSet=true.
 	//
-	// If the block passes those guards and GetBlockHeader confirms MinedSet=true
-	// (block-validation already created/spent all UTXOs and detected all
-	// double-spends), the subtree-data read and transaction-map build are pure
-	// waste; skip them and do only the consensus-required work: reset the current
-	// subtree state and write the coinbase UTXO.  Callers advance
+	// BelowCheckpoint is kept as a cheap belt-and-braces guard: QuickValidated
+	// implies below-checkpoint (quick-validate only runs below the checkpoint),
+	// but the extra check costs nothing and makes the invariant explicit.
+	//
+	// If the block passes those guards and GetBlockHeader confirms QuickValidated=true
+	// and MinedSet=true (block-validation already created/spent all UTXOs and
+	// detected all double-spends), the subtree-data read and transaction-map build
+	// are pure waste; skip them and do only the consensus-required work: reset the
+	// current subtree state and write the coinbase UTXO.  Callers advance
 	// currentBlockHeader (via finalizeBlockProcessing or an explicit Store) after
 	// we return, so we must NOT store it here — mirroring the empty-block branch.
 	if stp.currentTxMap.Length() == 0 && stp.queue.length() == 0 && stp.removeMap.Length() == 0 &&
@@ -4643,8 +4649,8 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		_, meta, ghErr := stp.blockchainClient.GetBlockHeader(ctx, block.Hash())
 		if ghErr != nil {
 			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: GetBlockHeader error, falling back to full path: %v", block.String(), ghErr)
-		} else if meta.MinedSet {
-			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: empty mempool + MinedSet + below checkpoint, skipping reconciliation", block.String())
+		} else if meta.MinedSet && meta.QuickValidated {
+			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: empty mempool + MinedSet + QuickValidated + below checkpoint, skipping reconciliation", block.String())
 
 			if err = stp.resetSubtreeState(createProperlySizedSubtrees); err != nil {
 				return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] IBD fast-path: error resetting subtree state", block.String(), err)

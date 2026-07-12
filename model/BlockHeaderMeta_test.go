@@ -55,6 +55,30 @@ func TestNewBlockHeaderMetaFromBytes(t *testing.T) {
 		require.Equal(t, b, meta.Bytes())
 	})
 
+	t.Run("QuickValidated round-trip", func(t *testing.T) {
+		bhm := &BlockHeaderMeta{
+			ID:             1,
+			Height:         2,
+			TxCount:        3,
+			SizeInBytes:    4,
+			Miner:          "qv_miner",
+			PeerID:         "qv_peer",
+			BlockTime:      5,
+			Timestamp:      6,
+			ChainWork:      []byte{1, 2},
+			MinedSet:       true,
+			SubtreesSet:    true,
+			QuickValidated: true,
+		}
+
+		b := bhm.Bytes()
+
+		meta, err := NewBlockHeaderMetaFromBytes(b)
+		require.NoError(t, err)
+		require.Equal(t, true, meta.QuickValidated, "QuickValidated must survive Bytes()/NewBlockHeaderMetaFromBytes()")
+		require.Equal(t, b, meta.Bytes(), "re-serialisation must be identical")
+	})
+
 	t.Run("no chainwork", func(t *testing.T) {
 		bhm := &BlockHeaderMeta{
 			ID:          1,

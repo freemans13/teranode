@@ -167,7 +167,8 @@ func (s *SQL) buildGetBlockHeadersQuery(ctx context.Context, blockHashFrom *chai
 			,b.subtrees_set
 			,b.invalid
 			,b.processed_at
-			,b.median_time_past`
+			,b.median_time_past
+			,b.quick_validated`
 
 	if s.mainChainRebuilding.Load() == 0 {
 		var (
@@ -257,6 +258,7 @@ func (s *SQL) processBlockHeadersRows(rows *sql.Rows, numberOfHeaders uint64, ha
 			&blockHeaderMeta.Invalid,
 			&processedAt,
 			&blockHeaderMeta.MedianTimePast,
+			&blockHeaderMeta.QuickValidated,
 		}
 
 		// Add coinbase_tx if it's in the query

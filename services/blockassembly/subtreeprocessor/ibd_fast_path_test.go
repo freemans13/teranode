@@ -22,11 +22,14 @@ package subtreeprocessor
 // and moveForwardBlock returns nil,nil,nil.
 //
 // Test index:
-//  1. TestIBDFastPath_EmptyMempoolMinedSet          — fast-path fires (all conditions met)
-//  2. TestIBDFastPath_FullPath_NonEmptyMempool       — mempool non-empty → full path
-//  3. TestIBDFastPath_FullPath_NotMinedSet           — MinedSet=false → full path
-//  4. TestIBDFastPath_FullPath_AboveCheckpoint       — block above checkpoint → full path (RED before checkpoint gate)
-//  5. TestIBDFastPath_FullPath_ReorgPopulatedMempool — post-moveBack mempool → full path (reorg guard)
+//  1. TestIBDFastPath_EmptyMempoolMinedSet                        — fast-path fires (all conditions met)
+//  2. TestIBDFastPath_FullPath_NonEmptyMempool                    — mempool non-empty → full path
+//  3. TestIBDFastPath_FullPath_NotMinedSet                        — MinedSet=false → full path
+//  4. TestIBDFastPath_FullPath_AboveCheckpoint                    — block above checkpoint → full path (RED before checkpoint gate)
+//  5. TestIBDFastPath_FullPath_ReorgPopulatedMempool              — post-moveBack mempool → full path (reorg guard)
+//  6. TestIBDFastPath_QuickValidated_FiresFastPath                — QuickValidated=true → fast-path fires (the positive case for the new gate)
+//  7. TestIBDFastPath_FullPath_FullValidatedBelowCheckpoint       — QuickValidated=false + MinedSet=true + below-checkpoint → full path
+//                                                                    (the regression: old BelowCheckpoint gate would fire; new gate must not)
 
 import (
 	"context"
@@ -123,9 +126,10 @@ func ibdBlock(prevHeader *model.BlockHeader, height uint32, subtrees []*chainhas
 
 // TestIBDFastPath_EmptyMempoolMinedSet is the primary fast-path test.
 //
-// All five conditions hold: empty mempool, empty queue, empty removeMap,
-// block below checkpoint, MinedSet=true.  The block carries a fake subtree
-// hash not in the store; the fast-path skips the store read entirely.
+// All conditions hold: empty mempool, empty queue, empty removeMap,
+// block below checkpoint, MinedSet=true, QuickValidated=true.  The block
+// carries a fake subtree hash not in the store; the fast-path skips the
+// store read entirely.
 //
 // RED (before implementation): full path runs, CreateTransactionMap errors.
 // GREEN (after implementation): fast-path fires, nil,nil,nil returned.
@@ -137,7 +141,7 @@ func TestIBDFastPath_EmptyMempoolMinedSet(t *testing.T) {
 	fakeSubtreeHash := chainhash.HashH([]byte("nonexistent-subtree-for-ibd-fast-path-test"))
 
 	bcMock.On("GetBlockHeader", mock.Anything, mock.Anything).
-		Return(prevBlockHeader, &model.BlockHeaderMeta{MinedSet: true}, nil)
+		Return(prevBlockHeader, &model.BlockHeaderMeta{MinedSet: true, QuickValidated: true}, nil)
 
 	block := ibdBlock(prevBlockHeader, ibdTestBlockHeight, []*chainhash.Hash{&fakeSubtreeHash})
 
@@ -145,7 +149,7 @@ func TestIBDFastPath_EmptyMempoolMinedSet(t *testing.T) {
 		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
 	)
 
-	require.NoError(t, err, "IBD fast-path must not error on MinedSet block with empty mempool below checkpoint")
+	require.NoError(t, err, "IBD fast-path must not error on QuickValidated+MinedSet block with empty mempool below checkpoint")
 	require.Nil(t, txMap, "IBD fast-path must return nil transactionMap")
 	require.Nil(t, losingMap, "IBD fast-path must return nil losingTxHashesMap")
 
@@ -284,4 +288,84 @@ func TestIBDFastPath_FullPath_ReorgPopulatedMempool(t *testing.T) {
 	// Full path ran → fake-subtree read errored; the fast-path did not fire.
 	require.Error(t, err, "full path must run when currentTxMap is non-empty (reorg scenario)")
 	bcMock.AssertNotCalled(t, "GetBlockHeader")
+}
+
+// TestIBDFastPath_QuickValidated_FiresFastPath verifies that the fast-path fires
+// when QuickValidated=true (and MinedSet=true, empty mempool, below checkpoint).
+// This is the positive case for the new QuickValidated gate.
+//
+// The discriminator: fake subtree not in store; fast-path skips the store read;
+// no error.
+//
+// RED (before implementation): field does not exist, compile failure.
+// GREEN (after implementation): fast-path fires, nil,nil,nil returned.
+func TestIBDFastPath_QuickValidated_FiresFastPath(t *testing.T) {
+	stp, bcMock := buildIBDFastPathSTP(t)
+
+	stp.InitCurrentBlockHeader(prevBlockHeader)
+
+	fakeSubtreeHash := chainhash.HashH([]byte("nonexistent-subtree-quick-validated"))
+
+	bcMock.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(prevBlockHeader, &model.BlockHeaderMeta{MinedSet: true, QuickValidated: true}, nil)
+
+	block := ibdBlock(prevBlockHeader, ibdTestBlockHeight, []*chainhash.Hash{&fakeSubtreeHash})
+
+	txMap, losingMap, err := stp.moveForwardBlock(
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+	)
+
+	require.NoError(t, err, "IBD fast-path must not error when QuickValidated=true + MinedSet=true + empty mempool below checkpoint")
+	require.Nil(t, txMap, "IBD fast-path must return nil transactionMap")
+	require.Nil(t, losingMap, "IBD fast-path must return nil losingTxHashesMap")
+	bcMock.AssertNumberOfCalls(t, "GetBlockHeader", 1)
+
+	// processCoinbaseUtxos must have run.
+	cbHash := coinbaseTx.TxIDChainHash()
+	_, utxoErr := stp.utxoStore.Get(context.Background(), cbHash)
+	require.NoError(t, utxoErr, "processCoinbaseUtxos must have been called: coinbase UTXO must exist in store")
+}
+
+// TestIBDFastPath_FullPath_FullValidatedBelowCheckpoint is the critical regression
+// test that proves the fix.
+//
+// A block that is:
+//   - below checkpoint (would pass the old BelowCheckpoint gate),
+//   - MinedSet=true (would pass the old MinedSet check),
+//   - empty mempool, empty queue, empty removeMap,
+//
+// but was FULLY validated (QuickValidated=false) MUST NOT take the fast-path.
+// Full validation can write conflicting subtree nodes; skipping
+// processConflictingTransactions would silently drop conflict resolution.
+//
+// RED (before the fix): BelowCheckpoint+MinedSet gate fires → fast-path → no error
+// → test FAILS because we require an error.
+// GREEN (after the fix): QuickValidated=false blocks the fast-path → full path runs
+// → fake-subtree read errors.
+func TestIBDFastPath_FullPath_FullValidatedBelowCheckpoint(t *testing.T) {
+	stp, bcMock := buildIBDFastPathSTP(t)
+
+	stp.InitCurrentBlockHeader(prevBlockHeader)
+
+	require.Equal(t, 0, stp.currentTxMap.Length(), "precondition: mempool must be empty")
+	require.Equal(t, int64(0), stp.queue.length(), "precondition: queue must be empty")
+	require.Zero(t, stp.removeMap.Length(), "precondition: removeMap must be empty")
+
+	fakeSubtreeHash := chainhash.HashH([]byte("nonexistent-subtree-full-validated-below-cp"))
+
+	// MinedSet=true but QuickValidated=false: this block went through full validation.
+	// Below checkpoint + MinedSet=true is the OLD (buggy) condition that would fire
+	// the fast-path; QuickValidated=false is what the new gate must catch.
+	bcMock.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(prevBlockHeader, &model.BlockHeaderMeta{MinedSet: true, QuickValidated: false}, nil)
+
+	// Block height is BELOW the checkpoint (ibdTestBlockHeight=500 < ibdTestCheckpointHeight=1000).
+	block := ibdBlock(prevBlockHeader, ibdTestBlockHeight, []*chainhash.Hash{&fakeSubtreeHash})
+
+	_, _, err := stp.moveForwardBlock(
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+	)
+
+	// Full path must run → fake-subtree read errors.
+	require.Error(t, err, "full path must run for fully-validated below-checkpoint block even with empty mempool and MinedSet=true")
 }

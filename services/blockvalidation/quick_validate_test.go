@@ -50,7 +50,7 @@ func TestQuickValidateBlock(t *testing.T) {
 		assert.Equal(t, "test", peerID, "Peer ID should match")
 
 		storeBlockOptions := arguments.Get(3).([]options.StoreBlockOption)
-		assert.Len(t, storeBlockOptions, 3, "Should have one store block option")
+		assert.Len(t, storeBlockOptions, 4, "Should have four store block options: WithSubtreesSet, WithMinedSet, WithQuickValidated, and WithID")
 
 		sbo := options.StoreBlockOptions{}
 		for _, opt := range storeBlockOptions {
@@ -58,6 +58,7 @@ func TestQuickValidateBlock(t *testing.T) {
 		}
 		assert.True(t, sbo.MinedSet, "MinedSetting option should be true")
 		assert.True(t, sbo.SubtreesSet, "SubtreesSetting option should be false")
+		assert.True(t, sbo.QuickValidated, "QuickValidated option should be true on the quick-validate commit path")
 		assert.False(t, sbo.Invalid, "SkipValidation option should be true")
 	})
 
@@ -155,7 +156,7 @@ func TestQuickValidateBlock(t *testing.T) {
 		assert.Equal(t, "test", peerID, "Peer ID should match")
 
 		storeBlockOptions := arguments.Get(3).([]options.StoreBlockOption)
-		assert.Len(t, storeBlockOptions, 3, "Should have three store block options: WithSubtreesSet, WithMinedSet, and WithID")
+		assert.Len(t, storeBlockOptions, 4, "Should have four store block options: WithSubtreesSet, WithMinedSet, WithQuickValidated, and WithID")
 
 		sbo := options.StoreBlockOptions{}
 		for _, opt := range storeBlockOptions {
@@ -163,6 +164,7 @@ func TestQuickValidateBlock(t *testing.T) {
 		}
 		assert.True(t, sbo.MinedSet, "MinedSetting option should be true")
 		assert.True(t, sbo.SubtreesSet, "SubtreesSetting option should be true")
+		assert.True(t, sbo.QuickValidated, "QuickValidated option should be true on the quick-validate commit path")
 		assert.Equal(t, uint64(1), sbo.ID, "ID option should be set to 1")
 	})
 }

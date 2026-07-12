@@ -440,7 +440,8 @@ INSERT INTO blocks (
 	,persisted_at
 	,coinbase_bump
 	,on_main_chain
-) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+	,quick_validated
+) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 RETURNING id
 			`
 		} else {
@@ -470,7 +471,8 @@ INSERT INTO blocks (
 	,persisted_at
 	,coinbase_bump
 	,on_main_chain
-) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+	,quick_validated
+) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 RETURNING id
 			`
 		}
@@ -503,7 +505,8 @@ INSERT INTO blocks (
 	,persisted_at
 	,coinbase_bump
 	,on_main_chain
-) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+	,quick_validated
+) VALUES ($1, $2, $3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 RETURNING id
 			`
 		} else {
@@ -533,7 +536,8 @@ INSERT INTO blocks (
 	,persisted_at
 	,coinbase_bump
 	,on_main_chain
-) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+	,quick_validated
+) VALUES ($1, $2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 RETURNING id
 			`
 		}
@@ -609,6 +613,7 @@ RETURNING id
 			persistedAt,
 			coinbaseBump,
 			onMainChain,
+			storeBlockOptions.QuickValidated,
 		)
 	} else {
 		// When using auto-increment, no ID parameter is needed
@@ -636,6 +641,7 @@ RETURNING id
 			persistedAt,
 			coinbaseBump,
 			onMainChain,
+			storeBlockOptions.QuickValidated,
 		)
 	}
 

@@ -87,6 +87,42 @@ func TestGetBlockHeader(t *testing.T) {
 	})
 }
 
+func TestGetBlockHeader_QuickValidated(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+
+	t.Run("QuickValidated false by default", func(t *testing.T) {
+		storeURL, err := url.Parse("sqlitememory:///")
+		require.NoError(t, err)
+
+		s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
+		require.NoError(t, err)
+
+		_, _, err = s.StoreBlock(t.Context(), block1, "test_peer")
+		require.NoError(t, err)
+
+		_, meta, err := s.GetBlockHeader(t.Context(), block1.Hash())
+		require.NoError(t, err)
+		require.NotNil(t, meta)
+		assert.Equal(t, false, meta.QuickValidated, "QuickValidated must default to false")
+	})
+
+	t.Run("QuickValidated persisted when set true", func(t *testing.T) {
+		storeURL, err := url.Parse("sqlitememory:///")
+		require.NoError(t, err)
+
+		s, err := New(ulogger.TestLogger{}, storeURL, tSettings)
+		require.NoError(t, err)
+
+		_, _, err = s.StoreBlock(t.Context(), block1, "test_peer", options.WithQuickValidated(true))
+		require.NoError(t, err)
+
+		_, meta, err := s.GetBlockHeader(t.Context(), block1.Hash())
+		require.NoError(t, err)
+		require.NotNil(t, meta)
+		assert.Equal(t, true, meta.QuickValidated, "QuickValidated must survive store write + read")
+	})
+}
+
 // func TestGetBlockHeaderProcessedAt(t *testing.T) {
 // 	tSettings := test.CreateBaseTestSettings(t)
 // 	tSettings.ChainCfgParams = &chaincfg.TeraTestNetParams

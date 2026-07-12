@@ -23,6 +23,8 @@ type StoreBlockOptions struct {
 	PersistedAt bool
 	// Invalid indicates whether the block is marked as invalid
 	Invalid bool
+	// QuickValidated indicates whether the block was committed via the quick-validate path
+	QuickValidated bool
 	// ID is an optional identifier for the block, instead of incrementing the last known block ID
 	ID uint64
 }
@@ -101,6 +103,22 @@ func WithPersistedAt() StoreBlockOption {
 func WithInvalid(b bool) StoreBlockOption {
 	return func(opts *StoreBlockOptions) {
 		opts.Invalid = b
+	}
+}
+
+// WithQuickValidated creates an option that sets the QuickValidated flag.
+// This option records that a block was committed via the quick-validate path,
+// which is fail-closed and writes zero conflicting subtree nodes.  Only the
+// quick-validate path sets this; full validation must leave it false.
+//
+// Parameters:
+//   - b: Boolean value to set for QuickValidated flag
+//
+// Returns:
+//   - StoreBlockOption: Function that applies the configuration
+func WithQuickValidated(b bool) StoreBlockOption {
+	return func(opts *StoreBlockOptions) {
+		opts.QuickValidated = b
 	}
 }
 

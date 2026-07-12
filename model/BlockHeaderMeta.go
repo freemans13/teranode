@@ -22,6 +22,7 @@ type BlockHeaderMeta struct {
 	MinedSet       bool       `json:"mined_set"`        // Whether the block is in the mined set.
 	SubtreesSet    bool       `json:"subtrees_set"`     // Whether the block has its subtrees set.
 	Invalid        bool       `json:"invalid"`          // Whether the block is marked as invalid.
+	QuickValidated bool       `json:"quick_validated"`  // Whether the block was committed via the quick-validate path (fail-closed, no conflicting nodes).
 	ProcessedAt    *time.Time `json:"processed_at"`     // Timestamp when the block was processed (nullable).
 }
 
@@ -32,7 +33,7 @@ func (m *BlockHeaderMeta) Bytes() []byte {
 	}
 	b := make([]byte, 0, capacity)
 
-	// write the flags (minedSet, subtreesSet, invalid, processedAt) as the first byte
+	// write the flags (minedSet, subtreesSet, invalid, processedAt, quickValidated) as the first byte
 	flags := byte(0)
 	if m.MinedSet {
 		flags |= 1 << 0
@@ -45,6 +46,9 @@ func (m *BlockHeaderMeta) Bytes() []byte {
 	}
 	if m.ProcessedAt != nil {
 		flags |= 1 << 3
+	}
+	if m.QuickValidated {
+		flags |= 1 << 4
 	}
 
 	b = append(b, flags)
@@ -111,6 +115,7 @@ func NewBlockHeaderMetaFromBytes(b []byte) (*BlockHeaderMeta, error) {
 	m.SubtreesSet = (flags & (1 << 1)) != 0
 	m.Invalid = (flags & (1 << 2)) != 0
 	hasProcessedAt := (flags & (1 << 3)) != 0
+	m.QuickValidated = (flags & (1 << 4)) != 0
 
 	// remove the flags byte from the slice
 	b = b[1:]
