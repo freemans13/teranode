@@ -258,3 +258,87 @@ func TestAssignBlocks_RefetchAndForwardWalkCompose(t *testing.T) {
 		require.Equal(t, 1, n, "hash %v must be assigned to exactly one peer (disjoint)", h)
 	}
 }
+
+// TestReconcileLostAssignments_TTLExpiredOrphanRefetched covers the third orphan
+// trigger: the global requestedBlocks ledger has a 60s TTL but assignedTo has
+// none, so a block re-fetched to a peer that stays connected yet never delivers
+// it has its requestedBlocks entry expire, stranding it in assignedTo below the
+// cursor. reconcileLostAssignments must move any such hash into refetchBlocks
+// while leaving still-tracked assignments untouched.
+func TestReconcileLostAssignments_TTLExpiredOrphanRefetched(t *testing.T) {
+	chainParams := chaincfg.MainNetParams
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.ParallelFetchPeers = 3
+
+	sm := &SyncManager{
+		ctx:             context.Background(),
+		logger:          ulogger.TestLogger{},
+		settings:        tSettings,
+		chainParams:     &chainParams,
+		peerStates:      txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		assignedTo:      make(map[chainhash.Hash]*peer.Peer),
+		assignedAt:      make(map[chainhash.Hash]time.Time),
+		refetchBlocks:   make(map[chainhash.Hash]struct{}),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	// identity-only peer value; reconcile never dereferences it.
+	p := &peer.Peer{}
+
+	// Orphan: assigned + recorded, then its requestedBlocks ledger entry expires
+	// (modelled by never/no-longer being in requestedBlocks) while assignedTo lingers.
+	orphan := chainhash.Hash{0x77}
+	sm.assignedTo[orphan] = p
+	sm.assignedAt[orphan] = time.Now().Add(-90 * time.Second)
+
+	// Still-tracked block: present in BOTH maps; must be left alone.
+	live := chainhash.Hash{0x88}
+	sm.assignedTo[live] = p
+	sm.assignedAt[live] = time.Now()
+	sm.requestedBlocks.Set(live, struct{}{})
+
+	sm.reconcileLostAssignments()
+
+	_, queued := sm.refetchBlocks[orphan]
+	require.True(t, queued, "TTL-expired orphan must be re-enqueued for re-fetch")
+	_, stillAssigned := sm.assignedTo[orphan]
+	require.False(t, stillAssigned, "TTL-expired orphan must be dropped from assignedTo")
+
+	_, liveQueued := sm.refetchBlocks[live]
+	require.False(t, liveQueued, "a still-tracked block must NOT be re-enqueued")
+	_, liveAssigned := sm.assignedTo[live]
+	require.True(t, liveAssigned, "a still-tracked block must remain assigned")
+}
+
+// TestReconcileLostAssignments_FlagOffNoop asserts the reconcile is a no-op with
+// ParallelFetchPeers <= 1, so the single-peer path is untouched.
+func TestReconcileLostAssignments_FlagOffNoop(t *testing.T) {
+	chainParams := chaincfg.MainNetParams
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.ParallelFetchPeers = 1
+
+	sm := &SyncManager{
+		ctx:             context.Background(),
+		logger:          ulogger.TestLogger{},
+		settings:        tSettings,
+		chainParams:     &chainParams,
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		assignedTo:      make(map[chainhash.Hash]*peer.Peer),
+		assignedAt:      make(map[chainhash.Hash]time.Time),
+		refetchBlocks:   make(map[chainhash.Hash]struct{}),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	orphan := chainhash.Hash{0x77}
+	sm.assignedTo[orphan] = &peer.Peer{}
+	sm.assignedAt[orphan] = time.Now().Add(-90 * time.Second)
+
+	sm.reconcileLostAssignments()
+
+	require.Empty(t, sm.refetchBlocks, "flag-off: reconcile must not enqueue anything")
+	_, stillAssigned := sm.assignedTo[orphan]
+	require.True(t, stillAssigned, "flag-off: reconcile must leave assignedTo untouched")
+}

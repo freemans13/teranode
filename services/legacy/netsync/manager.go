@@ -613,9 +613,12 @@ type SyncManager struct {
 	// wedging the whole download (height frozen, drain idle). assignBlocksAcrossPeers
 	// drains this set FIRST each pass (orphans are the lowest, commit-blocking
 	// blocks), re-requesting each from an eligible peer via the normal getdata
-	// path. Entries are removed on successful re-send or on receipt. Guarded by
-	// assignedMu (same leaf lock as assignedTo/assignedAt); bounded by the total
-	// in-flight cap, so it cannot grow unbounded.
+	// path. Entries are removed on successful re-send, on receipt, and on a fresh
+	// sync generation; blocks whose requestedBlocks ledger entry expires (60s TTL)
+	// while still assigned are re-enqueued here by reconcileLostAssignments, so no
+	// orphan trigger is left unhandled. Guarded by assignedMu (same leaf lock as
+	// assignedTo/assignedAt); bounded by the total in-flight cap, so it cannot
+	// grow unbounded.
 	refetchBlocks map[chainhash.Hash]struct{}
 	syncPeerMu    sync.RWMutex // protects syncPeer and syncPeerState
 	syncPeer      *peerpkg.Peer
@@ -2619,6 +2622,14 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	// frees that peer's assignments for reassignment on this same or the next tick.
 	sm.checkHeadStall(time.Now())
 
+	// checkHeadStall only recovers the HEAD orphan. A NON-head block can also be
+	// stranded: the global requestedBlocks ledger has a 60s TTL, but assignedTo
+	// has none, so if a re-fetched block's requestedBlocks entry expires while its
+	// peer stays connected yet never delivers it, the block is left in assignedTo,
+	// below the cursor, outstanding to nobody — the same orphan class, via a
+	// different trigger. Reconcile catches these each tick and re-enqueues them.
+	sm.reconcileLostAssignments()
+
 	// Snapshot whether there is header runway under headerMu, then RELEASE the
 	// lock before calling fetchHeaderBlocks (which re-takes headerMu itself and
 	// must never be called with it held — the lock is non-reentrant).
@@ -3076,6 +3087,45 @@ func (sm *SyncManager) eligibleFetchPeers(exclude *peerpkg.Peer, max int) []*pee
 // peer's requestedBlocks and the global ledger, so haveInventory still reports
 // them missing and they are re-requested next tick; a late block arriving from
 // the disconnected peer is a harmless GetBlockExists no-op.
+// reconcileLostAssignments re-enqueues blocks that lost their in-flight status
+// silently. The global requestedBlocks ledger is an expiringmap with a 60s TTL
+// and no eviction callback, while assignedTo/assignedAt have no TTL. So a block
+// re-fetched to a peer that stays connected but never delivers it will have its
+// requestedBlocks entry expire, leaving it stranded in assignedTo — below the
+// monotonic cursor, outstanding to nobody: the exact orphan class the re-fetch
+// set exists to prevent, reached via TTL expiry rather than a free or a dropped
+// send. checkHeadStall only rescues the lowest-height (head) such block; this
+// rescues the rest. Runs each scheduler tick (a cheap in-memory scan bounded by
+// the in-flight cap). Drain-goroutine only; assignedMu is a leaf lock held here
+// only across in-memory map reads — never a gRPC or a send. It reads
+// requestedBlocks (its own internal lock) while holding assignedMu, which is
+// safe because requestedBlocks has no eviction callback, so nothing takes
+// assignedMu from under the requestedBlocks lock (no inversion).
+func (sm *SyncManager) reconcileLostAssignments() {
+	if sm.settings.Legacy.ParallelFetchPeers <= 1 {
+		return
+	}
+
+	sm.assignedMu.Lock()
+	defer sm.assignedMu.Unlock()
+
+	for h := range sm.assignedTo {
+		if _, stillTracked := sm.requestedBlocks.Get(h); stillTracked {
+			continue
+		}
+
+		// requestedBlocks entry gone (TTL expiry) but the assignment lingers: the
+		// block is outstanding to nobody. Re-enqueue it and drop the stale
+		// assignment. delete during range is safe in Go.
+		if sm.refetchBlocks == nil {
+			sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+		}
+		sm.refetchBlocks[h] = struct{}{}
+		delete(sm.assignedTo, h)
+		delete(sm.assignedAt, h)
+	}
+}
+
 func (sm *SyncManager) checkHeadStall(now time.Time) {
 	if sm.settings.Legacy.ParallelFetchPeers <= 1 {
 		return
