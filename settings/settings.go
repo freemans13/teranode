@@ -307,6 +307,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SplitMapBuckets:                      getInt("blockassembly_splitMapBuckets", 16*1024, alternativeContext...),
 			StoreTxInpointsForSubtreeMeta:        getBool("blockassembly_storeTxInpointsForSubtreeMeta", true, alternativeContext...),
 			IdleSleepDuration:                    getDuration("blockassembly_idle_sleep_duration", 10*time.Millisecond, alternativeContext...),
+			ReuseBlockMetaInMoveForward:          getBool("blockassembly_reuseBlockMetaInMoveForward", false, alternativeContext...),
 		},
 
 		BlockChain: BlockChainSettings{

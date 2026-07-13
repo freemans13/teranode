@@ -146,3 +146,7 @@ func TestMaxRawTxFee_EnvZeroDisables(t *testing.T) {
 	tSettings := NewSettings()
 	require.Equal(t, uint64(0), tSettings.Policy.MaxRawTxFee)
 }
+
+func TestReuseBlockMetaInMoveForwardDefaultOff(t *testing.T) {
+	require.False(t, NewSettings().BlockAssembly.ReuseBlockMetaInMoveForward)
+}
