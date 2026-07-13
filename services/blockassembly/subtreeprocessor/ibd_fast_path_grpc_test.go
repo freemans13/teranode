@@ -254,7 +254,7 @@ func TestIBDFastPath_GRPC_QuickValidatedFires(t *testing.T) {
 	require.NoError(t, err, "AddBlock over gRPC must succeed")
 
 	txMap, losingMap, err := f.stp.moveForwardBlock(
-		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true, nil,
 	)
 
 	require.NoError(t, err, "fast-path must fire end-to-end: QuickValidated+MinedSet survived gRPC, so no subtree read/full-path error")
@@ -305,7 +305,7 @@ func TestIBDFastPath_GRPC_NotQuickValidated_FullPath(t *testing.T) {
 	require.NoError(t, err, "AddBlock over gRPC must succeed")
 
 	_, _, err = f.stp.moveForwardBlock(
-		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true, nil,
 	)
 
 	require.Error(t, err, "full path must run when QuickValidated=false: the fake subtree read must error")

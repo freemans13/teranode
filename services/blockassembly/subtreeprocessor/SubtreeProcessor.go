@@ -845,7 +845,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						// create empty map for processed conflicting hashes
 						processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
-						_, _, mfErr := stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true)
+						_, _, mfErr := stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true, nil)
 						if mfErr != nil {
 							rollback()
 							return mfErr
@@ -3259,7 +3259,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			// skip dequeue if not the last block
 			skipNotificationsAndDequeue := idx != len(moveForwardBlocks)-1
 
-			if _, _, err = stp.moveForwardBlock(ctx, block, skipNotificationsAndDequeue, processedConflictingHashesMap, skipNotificationsAndDequeue, true); err != nil {
+			if _, _, err = stp.moveForwardBlock(ctx, block, skipNotificationsAndDequeue, processedConflictingHashesMap, skipNotificationsAndDequeue, true, nil); err != nil {
 				rollback()
 				return err
 			}
@@ -3515,7 +3515,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		lastMoveForwardBlock := blockIdx == len(moveForwardBlocks)-1
 		// we skip the notifications for now and do them all at the end
 		// transactionMap is returned so we can check which transactions need to be marked as on the longest chain
-		if transactionMap, losingTxHashesMap, err = stp.moveForwardBlock(ctx, block, true, processedConflictingHashesMap, !lastMoveForwardBlock, lastMoveForwardBlock); err != nil {
+		if transactionMap, losingTxHashesMap, err = stp.moveForwardBlock(ctx, block, true, processedConflictingHashesMap, !lastMoveForwardBlock, lastMoveForwardBlock, nil); err != nil {
 			return err
 		}
 
@@ -4627,7 +4627,8 @@ func (stp *SubtreeProcessor) finalizeBlockProcessing(ctx context.Context, block 
 // moveForwardBlock cleans out all transactions that are in the current subtrees and also in the block
 // given. It is akin to moving up the blockchain to the next block.
 func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.Block, skipNotification bool,
-	processedConflictingHashesMap map[chainhash.Hash]struct{}, skipDequeue bool, createProperlySizedSubtrees bool) (transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, err error) {
+	processedConflictingHashesMap map[chainhash.Hash]struct{}, skipDequeue bool, createProperlySizedSubtrees bool,
+	blockMeta *model.BlockHeaderMeta) (transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, err error) {
 	if block == nil {
 		return nil, nil, errors.NewProcessingError("[moveForwardBlock] you must pass in a block to moveForwardBlock")
 	}
@@ -4690,10 +4691,18 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	belowCheckpoint := stp.settings.ChainCfgParams != nil && model.BelowCheckpoint(stp.settings.ChainCfgParams.Checkpoints, block.Height)
 
 	if emptyMaps && belowCheckpoint {
-		_, meta, ghErr := stp.blockchainClient.GetBlockHeader(ctx, block.Hash())
-		if ghErr != nil {
-			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: GetBlockHeader error, falling back to full path: %v", block.String(), ghErr)
-		} else if meta.MinedSet && meta.QuickValidated {
+		var meta *model.BlockHeaderMeta
+		if blockMeta != nil {
+			meta = blockMeta
+		} else {
+			var ghErr error
+			_, meta, ghErr = stp.blockchainClient.GetBlockHeader(ctx, block.Hash())
+			if ghErr != nil {
+				stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: GetBlockHeader error, falling back to full path: %v", block.String(), ghErr)
+				meta = nil
+			}
+		}
+		if meta != nil && meta.MinedSet && meta.QuickValidated {
 			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path: empty mempool + MinedSet + QuickValidated + below checkpoint, skipping reconciliation", block.String())
 
 			// Fast-path: no pre-reset subtree pointer is captured for a remainder
@@ -4710,13 +4719,17 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 			}
 
 			return nil, nil, nil
-		} else {
-			// Fast-path gate reached the header read but the flags were not both set.
-			// Report the observed flags so operators can tell "flag not armed" from
-			// "maps not empty yet" during A/B measurement. minedSet/quickValidated are
-			// the values just read over gRPC.
-			stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path NOT taken: emptyMaps=%v belowCheckpoint=%v minedSet=%v quickValidated=%v", block.String(), emptyMaps, belowCheckpoint, meta.MinedSet, meta.QuickValidated)
 		}
+		// Fast-path gate reached the header read but the flags were not both set (or meta
+		// is nil due to a GetBlockHeader error above). Report the observed flags so operators
+		// can tell "flag not armed" from "maps not empty yet" during A/B measurement.
+		// minedSet/quickValidated are the values just read (false if meta is nil).
+		var minedSet, quickValidated bool
+		if meta != nil {
+			minedSet = meta.MinedSet
+			quickValidated = meta.QuickValidated
+		}
+		stp.logger.Infof("[moveForwardBlock][%s] IBD fast-path NOT taken: emptyMaps=%v belowCheckpoint=%v minedSet=%v quickValidated=%v", block.String(), emptyMaps, belowCheckpoint, minedSet, quickValidated)
 	} else {
 		// Fast-path gate failed before the header read, so the block's MinedSet/
 		// QuickValidated flags were never fetched; report them as false (not read).

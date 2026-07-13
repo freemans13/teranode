@@ -164,7 +164,7 @@ func TestMoveForwardBlockDrainLoss_BatchesLostOnPostDrainError(t *testing.T) {
 	// would race against our enqueue. Calling the unexported method here
 	// keeps the test deterministic.
 	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
-	_, _, mfbErr := stp.moveForwardBlock(ctx, block, false, processedConflictingHashesMap, false, true)
+	_, _, mfbErr := stp.moveForwardBlock(ctx, block, false, processedConflictingHashesMap, false, true, nil)
 	require.Error(t, mfbErr, "moveForwardBlock must surface the Create failure injected by the wrapper")
 	require.ErrorIs(t, mfbErr, sentinelErr, "the error chain must mention the sentinel from errOnCreateUtxoStore")
 

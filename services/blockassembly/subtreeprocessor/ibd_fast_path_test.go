@@ -146,7 +146,7 @@ func TestIBDFastPath_EmptyMempoolMinedSet(t *testing.T) {
 	block := ibdBlock(prevBlockHeader, ibdTestBlockHeight, []*chainhash.Hash{&fakeSubtreeHash})
 
 	txMap, losingMap, err := stp.moveForwardBlock(
-		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true, nil,
 	)
 
 	require.NoError(t, err, "IBD fast-path must not error on QuickValidated+MinedSet block with empty mempool below checkpoint")
@@ -184,7 +184,7 @@ func TestIBDFastPath_FullPath_NonEmptyMempool(t *testing.T) {
 	block := ibdBlock(prevBlockHeader, ibdTestBlockHeight, []*chainhash.Hash{&fakeSubtreeHash})
 
 	_, _, err := stp.moveForwardBlock(
-		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true, nil,
 	)
 
 	require.Error(t, err, "full path must error when the fake subtree hash is not in the store")
@@ -211,7 +211,7 @@ func TestIBDFastPath_FullPath_NotMinedSet(t *testing.T) {
 	block := ibdBlock(prevBlockHeader, ibdTestBlockHeight, []*chainhash.Hash{&fakeSubtreeHash})
 
 	_, _, err := stp.moveForwardBlock(
-		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true, nil,
 	)
 
 	require.Error(t, err, "full path must error when MinedSet=false and fake subtree not in store")
@@ -245,7 +245,7 @@ func TestIBDFastPath_FullPath_AboveCheckpoint(t *testing.T) {
 	block := ibdBlock(prevBlockHeader, ibdTestBlockHeightAboveCP, []*chainhash.Hash{&fakeSubtreeHash})
 
 	_, _, err := stp.moveForwardBlock(
-		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true, nil,
 	)
 
 	// Full path must run → fake-subtree read errors.
@@ -282,7 +282,7 @@ func TestIBDFastPath_FullPath_ReorgPopulatedMempool(t *testing.T) {
 	block := ibdBlock(prevBlockHeader, ibdTestBlockHeight, []*chainhash.Hash{&fakeSubtreeHash})
 
 	_, _, err := stp.moveForwardBlock(
-		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true, nil,
 	)
 
 	// Full path ran → fake-subtree read errored; the fast-path did not fire.
@@ -312,7 +312,7 @@ func TestIBDFastPath_QuickValidated_FiresFastPath(t *testing.T) {
 	block := ibdBlock(prevBlockHeader, ibdTestBlockHeight, []*chainhash.Hash{&fakeSubtreeHash})
 
 	txMap, losingMap, err := stp.moveForwardBlock(
-		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true, nil,
 	)
 
 	require.NoError(t, err, "IBD fast-path must not error when QuickValidated=true + MinedSet=true + empty mempool below checkpoint")
@@ -363,7 +363,7 @@ func TestIBDFastPath_FullPath_FullValidatedBelowCheckpoint(t *testing.T) {
 	block := ibdBlock(prevBlockHeader, ibdTestBlockHeight, []*chainhash.Hash{&fakeSubtreeHash})
 
 	_, _, err := stp.moveForwardBlock(
-		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true,
+		context.Background(), block, false, map[chainhash.Hash]struct{}{}, false, true, nil,
 	)
 
 	// Full path must run → fake-subtree read errors.
