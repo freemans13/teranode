@@ -1934,7 +1934,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		sm.headerMu.Unlock()
 
 		if hasStartHeader && state.requestedBlocks.Len() < dynamicMax {
-			sm.fetchHeaderBlocks()
+			sm.topUpBlockFetch()
 		} else if !sm.current() && state.requestedBlocks.Len() == 0 {
 			sm.logger.Debugf("Not current, and no headers to sync to, fetching more headers")
 
@@ -2259,7 +2259,7 @@ func (sm *SyncManager) pumpBlockRequests(peer *peerpkg.Peer, state *peerSyncStat
 	sm.headerMu.Unlock()
 
 	if hasStartHeader && state.requestedBlocks.Len() < dynamicMax {
-		sm.fetchHeaderBlocks()
+		sm.topUpBlockFetch()
 	} else if !sm.current() && state.requestedBlocks.Len() == 0 {
 		sm.logger.Debugf("[pumpBlockRequests][%s] no in-flight blocks, requesting more from peer", blockHash)
 
@@ -2328,7 +2328,7 @@ func (sm *SyncManager) runPostBlockProcessing(peer *peerpkg.Peer, state *peerSyn
 		sm.headerMu.Unlock()
 
 		if hasStartHeader && state.requestedBlocks.Len() < dynamicMax {
-			sm.fetchHeaderBlocks()
+			sm.topUpBlockFetch()
 		} else if !sm.current() && state.requestedBlocks.Len() == 0 {
 			sm.logger.Debugf("Not current, and no headers to sync to, fetching more headers")
 
@@ -2374,6 +2374,25 @@ func (sm *SyncManager) runPostBlockProcessing(peer *peerpkg.Peer, state *peerSyn
 	if err := peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
 		sm.logger.Errorf("Failed to send getblocks message to peer %s: %v", peer.String(), err)
 	}
+}
+
+// topUpBlockFetch tops up the in-flight block-fetch window. When the
+// multi-peer flag is enabled (ParallelFetchPeers > 1) it routes to the
+// disjoint multi-peer scheduler (assignBlocksAcrossPeers), distributing new
+// blocks across all eligible peers rather than the sync peer alone. When the
+// flag is off (<=1) it calls fetchHeaderBlocks directly — byte-identical to the
+// pre-feature single-peer behaviour.
+//
+// Drain-goroutine only: both callees touch drain-goroutine-only state
+// (headerList, startHeader, requestedBlocks per peer). Call this only from the
+// blockHandler drain goroutine (handleBlockMsg, runPostBlockProcessing,
+// pumpBlockRequests).
+func (sm *SyncManager) topUpBlockFetch() {
+	if sm.settings != nil && sm.settings.Legacy.ParallelFetchPeers > 1 {
+		sm.assignBlocksAcrossPeers()
+		return
+	}
+	sm.fetchHeaderBlocks()
 }
 
 // fetchHeaderBlocks creates and sends a request to the syncPeer for the next
