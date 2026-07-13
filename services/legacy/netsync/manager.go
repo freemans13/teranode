@@ -602,16 +602,23 @@ type SyncManager struct {
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
 	// headerMu guards the five headers-first fields below (headerList,
 	// startHeader, headerListSeed, nextCheckpoint, headerCheckpoint) AND
-	// headerGen. It serialises the outer blockHandler loop (updateSyncPeer /
-	// resetHeaderState / startSync, reached from the peer-lifecycle handlers)
-	// against the drain goroutine (handleHeadersMsg / handleBlockPreamble /
-	// handleBlockMsg / fetchHeaderBlocks). It is NEVER held across a peer send, a
-	// gRPC, or block validation — fetchHeaderBlocks snapshots headerGen under the
-	// lock, releases it for the I/O, then re-takes it and aborts the walk if the
-	// generation changed.
-	headerMu    sync.Mutex
-	headerGen   uint64 // bumped by resetHeaderState; guarded by headerMu
-	headerList  *list.List
+	// headerGen and headerHeightIndex. It serialises the outer blockHandler loop
+	// (updateSyncPeer / resetHeaderState / startSync, reached from the
+	// peer-lifecycle handlers) against the drain goroutine (handleHeadersMsg /
+	// handleBlockPreamble / handleBlockMsg / fetchHeaderBlocks). It is NEVER held
+	// across a peer send, a gRPC, or block validation — fetchHeaderBlocks
+	// snapshots headerGen under the lock, releases it for the I/O, then re-takes
+	// it and aborts the walk if the generation changed.
+	headerMu  sync.Mutex
+	headerGen uint64 // bumped by resetHeaderState; guarded by headerMu
+	// headerHeightIndex maps each headerNode's block hash to its authoritative
+	// PoW-verified height. It allows handleBlockPreamble to resolve the height of
+	// blocks that arrive out of order (not at headerList.Front()), which happens
+	// under multi-peer parallel download. Guarded by headerMu; populated wherever
+	// headerList.PushBack is called; cleared in resetHeaderState; entry deleted
+	// when the corresponding headerList node is removed in handleBlockPreamble.
+	headerHeightIndex map[chainhash.Hash]int32
+	headerList        *list.List
 	startHeader *list.Element
 	// headerListSeed is the current leading "seed" node at the front of the
 	// header list: a node whose block is NOT pending a fetch and is kept only so
@@ -714,6 +721,9 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 	sm.startHeader = nil
 	sm.headerListSeed = nil
 
+	// Clear the index before rebuilding; this bounds its memory across resets.
+	clear(sm.headerHeightIndex)
+
 	// Re-align the header-request look-ahead cursor with the block-level
 	// checkpoint tracker on a fresh sync/recovery. From here they may diverge
 	// again as handleHeadersMsg pipelines headers ahead of block fetching.
@@ -727,6 +737,7 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 	if sm.nextCheckpoint != nil {
 		node := headerNode{height: newestHeight, hash: newestHash}
 		sm.headerListSeed = sm.headerList.PushBack(&node)
+		sm.headerHeightIndex[*node.hash] = node.height
 	}
 }
 
@@ -1652,8 +1663,11 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 					// interval's first header must prove it links onto it. It is
 					// dropped later, when the block that follows it commits.
 					sm.headerListSeed = firstNodeEl
+					// Keep the index entry: the seed stays in the list and its
+					// hash must remain resolvable until the seed itself is removed.
 				} else {
 					sm.headerList.Remove(firstNodeEl)
+					delete(sm.headerHeightIndex, *firstNode.hash)
 				}
 
 				break
@@ -1668,12 +1682,23 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 			// leave the list untouched.
 			if firstNodeEl == sm.headerListSeed {
 				sm.headerList.Remove(firstNodeEl)
+				delete(sm.headerHeightIndex, *firstNode.hash)
 				sm.headerListSeed = nil
 
 				continue
 			}
 
 			break
+		}
+
+		// For blocks that arrive out of order (not at Front() — the multi-peer
+		// parallel download case), the loop above exits without setting headerHeight.
+		// Fall back to the index, which maps every known hash to its authoritative
+		// PoW-verified height regardless of list position.
+		if headerHeight == -1 {
+			if h, ok := sm.headerHeightIndex[bmsg.blockHash]; ok {
+				headerHeight = h
+			}
 		}
 
 		sm.headerMu.Unlock()
@@ -2792,6 +2817,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		if prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
 			node.height = prevNode.height + 1
 			e := sm.headerList.PushBack(&node)
+			sm.headerHeightIndex[*node.hash] = node.height
 
 			if sm.startHeader == nil {
 				sm.startHeader = e
@@ -4294,8 +4320,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](60 * time.Second),   // give peers 60 seconds to respond
 		peerStates:      txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		// progressLogger:  newBlockProgressLogger("Processed", log),
-		msgChan:    make(chan interface{}, maxMsgQueueSize),
-		headerList: list.New(),
+		msgChan:           make(chan interface{}, maxMsgQueueSize),
+		headerList:        list.New(),
+		headerHeightIndex: make(map[chainhash.Hash]int32),
 		blockSizeTracker: newBlockSizeTrackerWithBudgets(10, // track last 10 blocks for rolling average
 			tSettings.Legacy.InFlightTxBudget, tSettings.Legacy.InFlightByteBudget),
 		quit: make(chan struct{}),
