@@ -68,6 +68,8 @@ func (m *MockStore) Close(ctx context.Context) error {
 
 func (m *MockStore) SupportsOutpointOnlySpend() bool { return m.SupportsOutpointOnlySpendResult }
 
+func (m *MockStore) PoolMaxConns() int { return 0 }
+
 // TestSupportsOutpointOnlySpend_Delegates verifies the logger decorator forwards the
 // wrapped store's fast-path capability in both directions (so a SQL store wrapped by the
 // logger still reports true, and the gates that query through the decorator engage).
