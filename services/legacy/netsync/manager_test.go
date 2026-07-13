@@ -1440,14 +1440,15 @@ func TestHandleHeadersMsg_PipelinesNextIntervalHeaders(t *testing.T) {
 	defer state.requestedBlocks.Stop()
 
 	sm := &SyncManager{
-		ctx:              context.Background(),
-		logger:           ulogger.TestLogger{},
-		chainParams:      &chainParams,
-		blockchainClient: blockchainClient,
-		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		headerList:       list.New(),
-		blockSizeTracker: newBlockSizeTracker(20),
+		ctx:               context.Background(),
+		logger:            ulogger.TestLogger{},
+		chainParams:       &chainParams,
+		blockchainClient:  blockchainClient,
+		peerStates:        txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:        list.New(),
+		blockSizeTracker:  newBlockSizeTracker(20),
+		headerHeightIndex: make(map[chainhash.Hash]int32),
 	}
 	defer sm.requestedBlocks.Stop()
 
@@ -1525,12 +1526,13 @@ func TestHandleHeadersMsg_CheckpointMismatchDisconnects(t *testing.T) {
 	require.NoError(t, err)
 
 	sm := &SyncManager{
-		ctx:             context.Background(),
-		logger:          ulogger.TestLogger{},
-		chainParams:     &chainParams,
-		peerStates:      txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		headerList:      list.New(),
+		ctx:               context.Background(),
+		logger:            ulogger.TestLogger{},
+		chainParams:       &chainParams,
+		peerStates:        txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:        list.New(),
+		headerHeightIndex: make(map[chainhash.Hash]int32),
 	}
 	defer sm.requestedBlocks.Stop()
 
@@ -1654,18 +1656,19 @@ func TestHandleHeadersMsg_ConcurrentPipelineIsRaceFree(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 
 	sm := &SyncManager{
-		ctx:              context.Background(),
-		logger:           ulogger.TestLogger{},
-		settings:         tSettings,
-		chainParams:      &chainParams,
-		blockchainClient: blockchainClient,
-		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		headerList:       list.New(),
-		blockSizeTracker: newBlockSizeTracker(20),
-		msgChan:          make(chan interface{}, 256),
-		quit:             make(chan struct{}),
-		handlerDone:      make(chan struct{}),
+		ctx:               context.Background(),
+		logger:            ulogger.TestLogger{},
+		settings:          tSettings,
+		chainParams:       &chainParams,
+		blockchainClient:  blockchainClient,
+		peerStates:        txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		headerList:        list.New(),
+		blockSizeTracker:  newBlockSizeTracker(20),
+		msgChan:           make(chan interface{}, 256),
+		quit:              make(chan struct{}),
+		handlerDone:       make(chan struct{}),
+		headerHeightIndex: make(map[chainhash.Hash]int32),
 	}
 	defer sm.requestedBlocks.Stop()
 
@@ -1836,19 +1839,20 @@ func TestHeaderState_ConcurrentResetVsDrainIsRaceFree(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 
 	sm := &SyncManager{
-		ctx:              context.Background(),
-		logger:           ulogger.TestLogger{},
-		settings:         tSettings,
-		chainParams:      &chainParams,
-		blockchainClient: blockchainClient,
-		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
-		headerList:       list.New(),
-		blockSizeTracker: newBlockSizeTracker(20),
-		msgChan:          make(chan interface{}, 256),
-		quit:             make(chan struct{}),
-		handlerDone:      make(chan struct{}),
+		ctx:               context.Background(),
+		logger:            ulogger.TestLogger{},
+		settings:          tSettings,
+		chainParams:       &chainParams,
+		blockchainClient:  blockchainClient,
+		peerStates:        txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		rejectedTxns:      txmap.NewSyncedMap[chainhash.Hash, struct{}](),
+		headerList:        list.New(),
+		blockSizeTracker:  newBlockSizeTracker(20),
+		msgChan:           make(chan interface{}, 256),
+		quit:              make(chan struct{}),
+		handlerDone:       make(chan struct{}),
+		headerHeightIndex: make(map[chainhash.Hash]int32),
 	}
 	defer sm.requestedBlocks.Stop()
 
@@ -2403,15 +2407,16 @@ func TestHeaderList_NodesRemovedOnBlockFetchProgressNotHeaderEvents(t *testing.T
 	defer state.requestedBlocks.Stop()
 
 	sm := &SyncManager{
-		ctx:              context.Background(),
-		logger:           ulogger.TestLogger{},
-		chainParams:      &chainParams,
-		blockchainClient: blockchainClient,
-		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
-		headerList:       list.New(),
-		blockSizeTracker: newBlockSizeTracker(20),
+		ctx:               context.Background(),
+		logger:            ulogger.TestLogger{},
+		chainParams:       &chainParams,
+		blockchainClient:  blockchainClient,
+		peerStates:        txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		rejectedTxns:      txmap.NewSyncedMap[chainhash.Hash, struct{}](),
+		headerList:        list.New(),
+		blockSizeTracker:  newBlockSizeTracker(20),
+		headerHeightIndex: make(map[chainhash.Hash]int32),
 	}
 	defer sm.requestedBlocks.Stop()
 
@@ -2646,15 +2651,16 @@ func TestHandleBlockMsg_CheckpointRecognizedByHashAfterPipelineRanAhead(t *testi
 	defer state.requestedBlocks.Stop()
 
 	sm := &SyncManager{
-		ctx:              context.Background(),
-		logger:           ulogger.TestLogger{},
-		chainParams:      &chainParams,
-		blockchainClient: blockchainClient,
-		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
-		headerList:       list.New(),
-		blockSizeTracker: newBlockSizeTracker(20),
+		ctx:               context.Background(),
+		logger:            ulogger.TestLogger{},
+		chainParams:       &chainParams,
+		blockchainClient:  blockchainClient,
+		peerStates:        txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		rejectedTxns:      txmap.NewSyncedMap[chainhash.Hash, struct{}](),
+		headerList:        list.New(),
+		blockSizeTracker:  newBlockSizeTracker(20),
+		headerHeightIndex: make(map[chainhash.Hash]int32),
 	}
 	defer sm.requestedBlocks.Stop()
 
@@ -2887,7 +2893,8 @@ func TestHeadersFirst_MultiMessageInterval_NoStrandedBlock(t *testing.T) {
 				// 3 GB byte budget with 1.5 GB blocks makes the byte-safety
 				// clamp bind at 2; a large tx budget keeps the tx-bound out of
 				// the way so the clamp is what limits us.
-				blockSizeTracker: newBlockSizeTrackerWithBudgets(4, 1<<30, 3*1024*1024*1024),
+				blockSizeTracker:  newBlockSizeTrackerWithBudgets(4, 1<<30, 3*1024*1024*1024),
+				headerHeightIndex: make(map[chainhash.Hash]int32),
 			}
 			defer sm.requestedBlocks.Stop()
 
