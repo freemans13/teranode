@@ -154,3 +154,9 @@ func TestReuseBlockMetaInMoveForwardDefaultOff(t *testing.T) {
 func TestParallelFetchPeersDefaultOne(t *testing.T) {
 	require.Equal(t, 1, NewSettings().Legacy.ParallelFetchPeers)
 }
+
+func TestBlockDownloadWindowDefaults(t *testing.T) {
+	s := NewSettings()
+	require.Equal(t, 1024, s.Legacy.BlockDownloadWindow)
+	require.Equal(t, 16, s.Legacy.MaxBlocksInTransitPerPeer)
+}
