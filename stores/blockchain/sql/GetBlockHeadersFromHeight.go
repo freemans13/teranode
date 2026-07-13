@@ -114,6 +114,8 @@ func (s *SQL) GetBlockHeadersFromHeight(ctx context.Context, height, limit uint3
 		    ,b.block_time
 		    ,b.inserted_at
 		    ,b.median_time_past
+		    ,b.mined_set
+		    ,b.quick_validated
 		FROM blocks b
 		WHERE height >= $1 AND height < $2
 		ORDER BY height DESC
@@ -156,6 +158,8 @@ func (s *SQL) GetBlockHeadersFromHeight(ctx context.Context, height, limit uint3
 			&blockHeaderMeta.BlockTime,
 			&insertedAt,
 			&blockHeaderMeta.MedianTimePast,
+			&blockHeaderMeta.MinedSet,
+			&blockHeaderMeta.QuickValidated,
 		); err != nil {
 			return nil, nil, errors.NewStorageError("failed to scan row", err)
 		}

@@ -134,6 +134,8 @@ func (s *SQL) GetBlockHeadersFromTill(ctx context.Context, blockHashFrom *chainh
 			,b.block_time
 			,b.inserted_at
 			,b.median_time_past
+			,b.mined_set
+			,b.quick_validated
 		FROM blocks b
 		JOIN ChainBlocks cb ON b.id = cb.id
 		ORDER BY b.height DESC
@@ -177,6 +179,8 @@ func (s *SQL) GetBlockHeadersFromTill(ctx context.Context, blockHashFrom *chainh
 			&blockHeaderMeta.BlockTime,
 			&insertedAt,
 			&blockHeaderMeta.MedianTimePast,
+			&blockHeaderMeta.MinedSet,
+			&blockHeaderMeta.QuickValidated,
 		); err != nil {
 			return nil, nil, errors.NewStorageError("failed to scan row", err)
 		}

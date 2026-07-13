@@ -660,6 +660,7 @@ func (c *Client) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, bestB
 		BlockTime:      resp.BlockTime,
 		Timestamp:      resp.Timestamp,
 		QuickValidated: resp.QuickValidated,
+		MinedSet:       resp.MinedSet,
 	}
 
 	return header, meta, nil

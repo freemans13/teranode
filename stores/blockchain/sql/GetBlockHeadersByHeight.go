@@ -122,6 +122,8 @@ func (s *SQL) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHeigh
 		,b.block_time
 		,b.inserted_at
 		,b.median_time_past
+		,b.mined_set
+		,b.quick_validated
 		FROM blocks b
 		JOIN ChainBlocks cb ON b.id = cb.id
 		WHERE cb.height >= $1 AND cb.height <= $2
@@ -144,6 +146,8 @@ func (s *SQL) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHeigh
 		,b.block_time
 		,b.inserted_at
 		,b.median_time_past
+		,b.mined_set
+		,b.quick_validated
 		FROM blocks b
 		WHERE b.on_main_chain = true
 		  AND b.height >= $1
@@ -188,6 +192,8 @@ func (s *SQL) GetBlockHeadersByHeight(ctx context.Context, startHeight, endHeigh
 			&blockHeaderMeta.BlockTime,
 			&insertedAt,
 			&blockHeaderMeta.MedianTimePast,
+			&blockHeaderMeta.MinedSet,
+			&blockHeaderMeta.QuickValidated,
 		); err != nil {
 			return nil, nil, errors.NewStorageError("failed to scan row", err)
 		}

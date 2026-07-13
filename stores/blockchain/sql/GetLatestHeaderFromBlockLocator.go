@@ -147,6 +147,8 @@ func (s *SQL) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, bestBloc
 		,b.tx_count
 		,b.chain_work
 		,b.median_time_past
+		,b.mined_set
+		,b.quick_validated
 		FROM blocks b
 		JOIN ChainBlocks cb ON b.id = cb.id`
 
@@ -195,6 +197,8 @@ func (s *SQL) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, bestBloc
 		,b.tx_count
 		,b.chain_work
 		,b.median_time_past
+		,b.mined_set
+		,b.quick_validated
 		FROM blocks b
 		WHERE b.on_main_chain = true
 		  AND b.height <= (SELECT height FROM blocks WHERE hash = $1 LIMIT 1)`
@@ -249,6 +253,8 @@ func (s *SQL) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, bestBloc
 		&blockHeaderMeta.TxCount,
 		&blockHeaderMeta.ChainWork,
 		&blockHeaderMeta.MedianTimePast,
+		&blockHeaderMeta.MinedSet,
+		&blockHeaderMeta.QuickValidated,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, errors.NewBlockNotFoundError("error in GetBlockHeader", errors.ErrNotFound)

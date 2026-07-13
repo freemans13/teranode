@@ -1525,6 +1525,7 @@ func (b *Blockchain) GetLatestBlockHeaderFromBlockLocatorRequest(ctx context.Con
 		Timestamp:      meta.Timestamp,
 		MedianTimePast: meta.MedianTimePast,
 		QuickValidated: meta.QuickValidated,
+		MinedSet:       meta.MinedSet,
 	}, nil
 }
 
