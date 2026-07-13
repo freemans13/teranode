@@ -211,7 +211,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 // Start initializes the create and spend batchers for throughput optimization.
 // Without calling Start(), Create() and Spend() work in direct (unbatched) mode.
-func (s *Store) Start(_ context.Context) {
+func (s *Store) Start(ctx context.Context) {
 	// Instrument batchers like the SQL store so batch size / duration / dispatch
 	// reasons are exported via teranode_batcher_* metrics (label batcher="postgres_*").
 	otelTracer := tracing.Tracer("utxo").OTelTracer()
@@ -273,6 +273,38 @@ func (s *Store) Start(_ context.Context) {
 	unlockBatchDuration := storeBatchDuration
 	s.unlockBatcher = batcher.NewWithPool(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true, batcherOpts("postgres_unlock")...)
 	configureBatcher(s.unlockBatcher, maxConc, globalDrain || s.settings.UtxoStore.LockedBatcherDrainMode, s.settings.UtxoStore.LockedBatcherTickerIntervalMillis)
+
+	// Launch the DAH sweep (Worker 2) here, from the store's own Start(), which the
+	// factory (stores/utxo/factory/postgres.go) calls immediately AFTER New() — so
+	// createSchema (including the spent-bitmap migration) has already completed.
+	// Launching it here, rather than from the external pruner Server (which only
+	// gates on the FSM leaving IDLE, NOT on schema/migrations), guarantees the
+	// sweep never issues partition-locking CALLs while a startup ALTER still holds
+	// ACCESS EXCLUSIVE on txs — the deadlock that took mainnet down.
+	//
+	// The sweep starting now (during IBD, FSM=CATCHINGBLOCKS) rather than after
+	// FSM-from-IDLE is fine: it only needs the schema, which is ready, and stamping
+	// DAH during IBD is correct. postgresPrunerService.Start is idempotent
+	// (cursorStarted guard), so the external pruner Server's later
+	// GetPrunerService().Start() call — on this same cached instance — is a no-op.
+	s.startPrunerSweep(ctx)
+}
+
+// startPrunerSweep launches this store's DAH sweep cursor via its own pruner
+// service. It resolves the SAME cached postgresPrunerService the external pruner
+// Server obtains through GetPrunerService(), whose Start is idempotent — so the
+// sweep is launched exactly once regardless of call order or a double external
+// Start. A GetPrunerService() error is logged and startup continues (the pruner
+// Server would surface the same failure); a nil service is a defensive no-op.
+func (s *Store) startPrunerSweep(ctx context.Context) {
+	svc, err := s.GetPrunerService()
+	if err != nil {
+		s.logger.Errorf("[postgres] could not start DAH sweep from store.Start: %v", err)
+		return
+	}
+	if svc != nil {
+		svc.Start(ctx)
+	}
 }
 
 // configureBatcher applies the optional max-concurrency cap, drain mode, and tick
