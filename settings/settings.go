@@ -675,6 +675,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ParallelFetchPeers:               getInt("legacy_parallelFetchPeers", 1, alternativeContext...),
 			BlockDownloadWindow:              getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
 			MaxBlocksInTransitPerPeer:        getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
+			BlockStallTimeout:                getDuration("legacy_blockStallTimeout", 2*time.Second, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

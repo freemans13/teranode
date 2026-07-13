@@ -585,10 +585,27 @@ type SyncManager struct {
 	rejectedTxns    *txmap.SyncedMap[chainhash.Hash, struct{}]
 	requestedTxns   *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 	requestedBlocks *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
-	syncPeerMu      sync.RWMutex // protects syncPeer and syncPeerState
-	syncPeer        *peerpkg.Peer
-	syncPeerState   *syncPeerState
-	peerStates      *txmap.SyncedMap[*peerpkg.Peer, *peerSyncState]
+	// assignedTo/assignedAt track, per outstanding block, which peer it was
+	// assigned to and when (Task 2.4, the head-of-line stalling timeout). They
+	// are populated in assignBlocksAcrossPeers alongside the requestedBlocks
+	// record (post-send), deleted when the block ARRIVES (handleBlockPreamble,
+	// the same site the requestedBlocks entries are removed) and when the
+	// assigned peer disconnects (handleDonePeerMsg). They are therefore kept in
+	// exact one-to-one correspondence with the global requestedBlocks ledger so
+	// they cannot leak.
+	//
+	// Almost all of that traffic (assign, arrival-delete, checkHeadStall) is on
+	// the single drain goroutine, but handleDonePeerMsg runs on the OTHER
+	// (outer) blockHandler goroutine — so a plain map would race. assignedMu
+	// guards both maps; it is a leaf lock, never held across a peer send, gRPC,
+	// or headerMu.
+	assignedMu    sync.Mutex
+	assignedTo    map[chainhash.Hash]*peerpkg.Peer
+	assignedAt    map[chainhash.Hash]time.Time
+	syncPeerMu    sync.RWMutex // protects syncPeer and syncPeerState
+	syncPeer      *peerpkg.Peer
+	syncPeerState *syncPeerState
+	peerStates    *txmap.SyncedMap[*peerpkg.Peer, *peerSyncState]
 
 	// blockBacklog counts blocks sitting in the local processing pipeline:
 	// queued in blockHandler's blockQueue plus the one inside handleBlockMsg.
@@ -1225,6 +1242,13 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 	// Cleanup state of requested items.
 	sm.clearRequestedState(state)
 
+	// Drop this peer's entries from the stall-detector tracking maps (Task 2.4)
+	// so they cannot outlive the peer. clearRequestedState stops the peer's own
+	// requestedBlocks map above; the global requestedBlocks entries for those
+	// hashes are left for handleBlockPreamble / re-request to clear, but the
+	// tracking maps key on hash + peer, so a departed peer's stamps must go now.
+	sm.freePeerAssignments(peer)
+
 	// Fetch a new sync peer if this is the sync peer.
 	if peer == sm.loadSyncPeer() {
 		sm.updateSyncPeer(state)
@@ -1709,6 +1733,13 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 	// will fail the insert, and thus we'll retry next time we get an inv.
 	state.requestedBlocks.Delete(bmsg.blockHash)
 	sm.requestedBlocks.Delete(bmsg.blockHash)
+	// Keep the stall-detector tracking maps (Task 2.4) in lock-step with the
+	// global requestedBlocks ledger: the block has arrived, so its assignment is
+	// no longer outstanding.
+	sm.assignedMu.Lock()
+	delete(sm.assignedTo, bmsg.blockHash)
+	delete(sm.assignedAt, bmsg.blockHash)
+	sm.assignedMu.Unlock()
 
 	// Count this accepted block against the delivering peer for observability.
 	// The delivering peer is bmsg.peer (before any stream-peer resolution) for
@@ -2538,6 +2569,13 @@ func (sm *SyncManager) maintainInFlightWindow() {
 		return
 	}
 
+	// Head-of-line stall check (Task 2.4) runs BEFORE the runway guard: a stalled
+	// head peer is most dangerous exactly when the window is full and the runway is
+	// exhausted (nothing new to assign, ordered commit paused on the missing head).
+	// It is an internal no-op unless ParallelFetchPeers > 1. Any disconnect it does
+	// frees that peer's assignments for reassignment on this same or the next tick.
+	sm.checkHeadStall(time.Now())
+
 	// Snapshot whether there is header runway under headerMu, then RELEASE the
 	// lock before calling fetchHeaderBlocks (which re-takes headerMu itself and
 	// must never be called with it held — the lock is non-reentrant).
@@ -2786,11 +2824,27 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 
 		// Record into THIS peer's requestedBlocks (and the global ledger) only after
 		// the getdata actually went out, so the auth gate at handleBlockPreamble
-		// accepts delivery from this specific peer.
+		// accepts delivery from this specific peer. Track the assignment (peer +
+		// time) for the head-of-line stall detector (Task 2.4); these maps stay in
+		// one-to-one correspondence with the global requestedBlocks ledger.
+		assignAt := time.Now()
+		sm.assignedMu.Lock()
+		// Lazy-init: production sets these in New, but the maps may be nil in a
+		// minimal test-constructed SyncManager. A nil-map WRITE panics (delete /
+		// range on nil are safe), so guard the only write site.
+		if sm.assignedTo == nil {
+			sm.assignedTo = make(map[chainhash.Hash]*peerpkg.Peer)
+		}
+		if sm.assignedAt == nil {
+			sm.assignedAt = make(map[chainhash.Hash]time.Time)
+		}
 		for _, h := range tgt.pending {
 			sm.requestedBlocks.Set(*h, struct{}{})
 			tgt.state.requestedBlocks.Set(*h, struct{}{})
+			sm.assignedTo[*h] = tgt.peer
+			sm.assignedAt[*h] = assignAt
 		}
+		sm.assignedMu.Unlock()
 
 		sm.logger.Debugf("[assignBlocksAcrossPeers] assigned %d block(s) to peer %s", len(tgt.pending), tgt.peer.String())
 	}
@@ -2863,6 +2917,141 @@ func (sm *SyncManager) eligibleFetchPeers(exclude *peerpkg.Peer, max int) []*pee
 	}
 
 	return result
+}
+
+// checkHeadStall is the head-of-line stalling-timeout (Task 2.4, the Bitcoin
+// Core BLOCK_STALLING_TIMEOUT model). Under disjoint multi-peer download blocks
+// commit in ascending height order, so a stalled peer holding the lowest-height
+// (next-needed) outstanding block pauses the ordered commit even while higher
+// blocks pile up behind it. This finds that HEAD block, and if its assigned peer
+// has held it longer than BlockStallTimeout, disconnects ONLY that peer and
+// frees ALL of its assignments so the next assignBlocksAcrossPeers tick
+// reassigns them to other peers.
+//
+// It is a no-op unless multi-peer download is enabled (ParallelFetchPeers > 1),
+// so the single-peer path is byte-identical to before the feature.
+//
+// now is injected so tests control the clock. Called on the drain goroutine
+// (from maintainInFlightWindow, before assignBlocksAcrossPeers); the tracking
+// maps are guarded by assignedMu because handleDonePeerMsg mutates them from the
+// other blockHandler goroutine.
+//
+// No block is lost by freeing: the head's hashes are removed from the assigned
+// peer's requestedBlocks and the global ledger, so haveInventory still reports
+// them missing and they are re-requested next tick; a late block arriving from
+// the disconnected peer is a harmless GetBlockExists no-op.
+func (sm *SyncManager) checkHeadStall(now time.Time) {
+	if sm.settings.Legacy.ParallelFetchPeers <= 1 {
+		return
+	}
+
+	timeout := sm.settings.Legacy.BlockStallTimeout
+	if timeout <= 0 {
+		return
+	}
+
+	// Find the HEAD = lowest-height outstanding block, and read its assignment,
+	// all under assignedMu (a cheap in-memory scan; no I/O). headerHeightIndex is
+	// guarded by headerMu, so take that too for the height lookups. Lock order is
+	// headerMu -> assignedMu; both are leaf locks released before any peer send.
+	sm.headerMu.Lock()
+	sm.assignedMu.Lock()
+
+	var (
+		headHash   chainhash.Hash
+		headPeer   *peerpkg.Peer
+		headAt     time.Time
+		headHeight int32 = -1
+		haveHead   bool
+	)
+
+	for h, p := range sm.assignedTo {
+		height, ok := sm.headerHeightIndex[h]
+		if !ok {
+			// No authoritative height for this hash (e.g. its header-list node was
+			// already consumed). It cannot be the head we order commits on; skip it.
+			continue
+		}
+
+		if !haveHead || height < headHeight {
+			haveHead = true
+			headHeight = height
+			headHash = h
+			headPeer = p
+			headAt = sm.assignedAt[h]
+		}
+	}
+
+	sm.assignedMu.Unlock()
+	sm.headerMu.Unlock()
+
+	if !haveHead || headPeer == nil {
+		return
+	}
+
+	if now.Sub(headAt) <= timeout {
+		// The next-needed block's peer is still within its grace period. Do NOT
+		// touch it — disconnecting an honest, not-yet-timed-out peer is forbidden.
+		return
+	}
+
+	sm.logger.Warnf("[checkHeadStall] head block %s (height %d) stalled %s past %s timeout on peer %s; disconnecting and freeing its assignments",
+		headHash, headHeight, now.Sub(headAt), timeout, headPeer)
+
+	// Disconnect ONLY the single head peer (never mass-disconnect).
+	headPeer.DisconnectWithWarning("head-of-line block-stalling timeout: next-needed block not delivered in time")
+
+	// Free that peer's assignments so they are re-eligible next tick. This mirrors
+	// what handleDonePeerMsg will also do once the disconnect propagates, but doing
+	// it here makes the reassignment immediate rather than waiting for the
+	// done-peer message.
+	sm.freePeerAssignments(headPeer)
+}
+
+// freePeerAssignments removes every block currently assigned to peer from the
+// stall-detector tracking maps AND from the global requestedBlocks ledger, so
+// those blocks are re-eligible for assignment to another peer on the next
+// scheduler tick (haveInventory will still report them missing). It is safe to
+// call from either blockHandler goroutine (it takes assignedMu) and is a cheap
+// scan over the small in-flight set. It never disconnects — callers decide that.
+func (sm *SyncManager) freePeerAssignments(peer *peerpkg.Peer) {
+	if peer == nil {
+		return
+	}
+
+	sm.assignedMu.Lock()
+
+	freed := make([]chainhash.Hash, 0)
+	for h, p := range sm.assignedTo {
+		if p == peer {
+			freed = append(freed, h)
+		}
+	}
+
+	for _, h := range freed {
+		delete(sm.assignedTo, h)
+		delete(sm.assignedAt, h)
+	}
+
+	sm.assignedMu.Unlock()
+
+	// Drop the global ledger entries outside assignedMu (the ledger is
+	// independently locked) so the freed blocks are immediately re-requestable.
+	// Also clear them from the peer's OWN requestedBlocks map when it is still in
+	// peerStates: on the stall path the peer is disconnected but its done-peer
+	// message (which would clearRequestedState) has not arrived yet, so without
+	// this the stale per-peer entries would linger until then.
+	peerState, hasState := sm.peerStates.Get(peer)
+	for _, h := range freed {
+		sm.requestedBlocks.Delete(h)
+		if hasState {
+			peerState.requestedBlocks.Delete(h)
+		}
+	}
+
+	if len(freed) > 0 {
+		sm.logger.Debugf("[freePeerAssignments] freed %d block assignment(s) from peer %s for reassignment", len(freed), peer)
+	}
 }
 
 // handleHeadersMsg handles block header messages from all peers.  Headers are
@@ -4513,6 +4702,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		msgChan:           make(chan interface{}, maxMsgQueueSize),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
+		assignedTo:        make(map[chainhash.Hash]*peerpkg.Peer),
+		assignedAt:        make(map[chainhash.Hash]time.Time),
 		blockSizeTracker: newBlockSizeTrackerWithBudgets(10, // track last 10 blocks for rolling average
 			tSettings.Legacy.InFlightTxBudget, tSettings.Legacy.InFlightByteBudget),
 		quit: make(chan struct{}),
