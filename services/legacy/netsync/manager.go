@@ -2543,6 +2543,111 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	if peerState.requestedBlocks.Len() < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
 		sm.fetchHeaderBlocks()
 	}
+
+	// Hedge dispatch (Task 1.3): when ParallelFetchPeers > 1, duplicate the sync
+	// peer's currently-outstanding in-flight block hashes to up to
+	// (ParallelFetchPeers-1) other eligible peers.
+	//
+	// This is a DUPLICATE request — not a fresh header-runway walk — so it does
+	// NOT advance startHeader and cannot create gaps for the sync peer's fetch.
+	// The loser's entry is NOT removed on first-arrival (the auth gate at ~1584
+	// will find it and pass; HandleBlockDirect's GetBlockExists no-ops duplicates).
+	if sm.settings.Legacy.ParallelFetchPeers > 1 {
+		sm.hedgeOutstandingBlocks(sp, peerState)
+	}
+}
+
+// hedgeOutstandingBlocks duplicates the sync peer's outstanding in-flight block
+// hashes to up to (ParallelFetchPeers-1) other eligible peers.  It is called on
+// the drain goroutine only, with headerMu NOT held.
+//
+// The hedge snapshots the sync peer's requestedBlocks, finds eligible non-sync
+// peers, records each outstanding hash into the target peer's requestedBlocks
+// BEFORE sending (so the auth gate passes when the block arrives), then sends a
+// single MsgGetData via a non-blocking TryQueueMessage.  A dropped send leaves the
+// recorded entries in place; they will expire naturally or be re-hedged on the
+// next tick (the expiry window is 60 min, matching normal in-flight entries).
+func (sm *SyncManager) hedgeOutstandingBlocks(sp *peerpkg.Peer, syncPeerState *peerSyncState) {
+	// Snapshot the sync peer's outstanding hashes without holding any other lock.
+	// Items() takes an RLock internally and returns a copy of the map.
+	outstanding := syncPeerState.requestedBlocks.Items()
+	if len(outstanding) == 0 {
+		return
+	}
+
+	wantPeers := sm.settings.Legacy.ParallelFetchPeers - 1
+	targets := sm.eligibleFetchPeers(sp, wantPeers)
+	if len(targets) == 0 {
+		sm.logger.Debugf("[hedgeOutstandingBlocks] no eligible peers for hedge (outstanding=%d)", len(outstanding))
+		return
+	}
+
+	for _, target := range targets {
+		targetState, exists := sm.peerStates.Get(target)
+		if !exists {
+			continue
+		}
+
+		getDataMsg := wire.NewMsgGetDataSizeHint(uint(len(outstanding))) //nolint:gosec
+
+		for h := range outstanding {
+			// Record into target peer's requestedBlocks BEFORE send so the auth
+			// gate at handleBlockPreamble passes when the block arrives.
+			targetState.requestedBlocks.Set(h, struct{}{})
+
+			iv := wire.NewInvVect(wire.InvTypeBlock, &h)
+			if err := getDataMsg.AddInvVect(iv); err != nil {
+				sm.logger.Warnf("[hedgeOutstandingBlocks] failed to add inv to hedge getdata for peer %s: %v", target, err)
+				break
+			}
+		}
+
+		if len(getDataMsg.InvList) == 0 {
+			continue
+		}
+
+		if !target.TryQueueMessage(getDataMsg) {
+			sm.logger.Debugf("[hedgeOutstandingBlocks] outputQueue full for hedge peer %s, deferring to next tick", target.String())
+			// Hashes are already recorded in targetState.requestedBlocks; they
+			// will expire naturally if the block never arrives from this peer.
+		} else {
+			sm.logger.Debugf("[hedgeOutstandingBlocks] hedged %d block(s) to peer %s", len(getDataMsg.InvList), target.String())
+		}
+	}
+}
+
+// eligibleFetchPeers returns up to max peers from peerStates that are sync
+// candidates, connected, and not the excluded sync peer.  The returned slice
+// order is map-iteration order (non-deterministic) — the caller uses them in
+// order and stops at max.
+func (sm *SyncManager) eligibleFetchPeers(exclude *peerpkg.Peer, max int) []*peerpkg.Peer {
+	if max <= 0 {
+		return nil
+	}
+
+	result := make([]*peerpkg.Peer, 0, max)
+
+	for p, state := range sm.peerStates.Range() {
+		if p == exclude {
+			continue
+		}
+
+		if !state.syncCandidate {
+			continue
+		}
+
+		if !p.Connected() {
+			continue
+		}
+
+		result = append(result, p)
+
+		if len(result) >= max {
+			break
+		}
+	}
+
+	return result
 }
 
 // handleHeadersMsg handles block header messages from all peers.  Headers are
