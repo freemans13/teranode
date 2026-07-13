@@ -619,7 +619,7 @@ type SyncManager struct {
 	// when the corresponding headerList node is removed in handleBlockPreamble.
 	headerHeightIndex map[chainhash.Hash]int32
 	headerList        *list.List
-	startHeader *list.Element
+	startHeader       *list.Element
 	// headerListSeed is the current leading "seed" node at the front of the
 	// header list: a node whose block is NOT pending a fetch and is kept only so
 	// the next interval's first header can prove it links onto the chain. There
@@ -2553,6 +2553,21 @@ func (sm *SyncManager) maintainInFlightWindow() {
 		return
 	}
 
+	// Multi-peer disjoint scheduler (Task 2.3): when ParallelFetchPeers > 1,
+	// distribute the header-runway walk across up to ParallelFetchPeers eligible
+	// peers (the sync peer plus others), assigning each walked block to exactly
+	// ONE peer. This supersedes the single-peer fetchHeaderBlocks top-up (the sync
+	// peer is one of the N fetch peers). assignBlocksAcrossPeers falls back to
+	// fetchHeaderBlocks internally when fewer than 2 targets are eligible.
+	//
+	// When ParallelFetchPeers <= 1 (flag-off) the path is byte-identical to the
+	// pre-feature single-peer behaviour: no eligibleFetchPeers call, no new alloc,
+	// exactly the fetchHeaderBlocks top-up.
+	if sm.settings.Legacy.ParallelFetchPeers > 1 {
+		sm.assignBlocksAcrossPeers()
+		return
+	}
+
 	peerState, exists := sm.peerStates.Get(sp)
 	if !exists {
 		sm.logger.Debugf("[maintainInFlightWindow] sync peer state not found, skipping refill")
@@ -2568,77 +2583,252 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	if peerState.requestedBlocks.Len() < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
 		sm.fetchHeaderBlocks()
 	}
+}
 
-	// Hedge dispatch (Task 1.3): when ParallelFetchPeers > 1, duplicate the sync
-	// peer's currently-outstanding in-flight block hashes to up to
-	// (ParallelFetchPeers-1) other eligible peers.
-	//
-	// This is a DUPLICATE request — not a fresh header-runway walk — so it does
-	// NOT advance startHeader and cannot create gaps for the sync peer's fetch.
-	// The loser's entry is NOT removed on first-arrival (the auth gate at ~1584
-	// will find it and pass; HandleBlockDirect's GetBlockExists no-ops duplicates).
-	if sm.settings.Legacy.ParallelFetchPeers > 1 {
-		sm.hedgeOutstandingBlocks(sp, peerState)
+// fetchTarget is one peer participating in a multi-peer disjoint assignment
+// pass. spare is the peer's remaining per-peer capacity (K minus its current
+// in-flight); it decrements as blocks are assigned. batch accumulates the
+// getdata InvList and pending accumulates the same hashes for post-send
+// recording into THIS peer's requestedBlocks.
+type fetchTarget struct {
+	peer    *peerpkg.Peer
+	state   *peerSyncState
+	spare   int
+	batch   *wire.MsgGetData
+	pending []*chainhash.Hash
+}
+
+// assignBlocksAcrossPeers is the multi-peer disjoint-range block scheduler
+// (Task 2.3). It generalizes fetchHeaderBlocks: instead of walking the header
+// runway and requesting every un-have block from the single sync peer, it
+// distributes that same walk across up to ParallelFetchPeers eligible peers
+// (the sync peer plus eligibleFetchPeers), assigning each walked block to
+// EXACTLY ONE peer.
+//
+// It preserves fetchHeaderBlocks' headerGen protocol exactly: snapshot headerGen
+// + startHeader under headerMu; per node re-check headerGen and read
+// hash/next under the lock, then RELEASE the lock across haveInventory (gRPC);
+// re-take, re-check, advance startHeader once per assigned block; abort the walk
+// on any headerGen change. headerMu is NEVER held across haveInventory or
+// TryQueueMessage. Drain-goroutine only.
+//
+// Invariants:
+//   - DISJOINT: startHeader is the shared cursor, advanced exactly once per
+//     assigned block regardless of which peer got it, so no hash goes to two peers.
+//   - Per-peer bounded by K (MaxBlocksInTransitPerPeer): a peer's running spare.
+//   - Total bounded by Budget = min(BlockDownloadWindow, dynamic byte cap) minus
+//     the current total in-flight across ALL peers — NOT per-peer×N.
+//   - Record each assigned hash into its ASSIGNED peer's requestedBlocks only
+//     AFTER that peer's getdata send succeeds (phantom-free, like
+//     fetchHeaderBlocks). A dropped send leaves no in-flight entry.
+//
+// Falls back to the single-peer fetchHeaderBlocks when fewer than 2 targets are
+// assignable, so the byte-identical single-peer path is preserved whenever
+// parallelism cannot actually be exercised.
+func (sm *SyncManager) assignBlocksAcrossPeers() {
+	sp := sm.loadSyncPeer()
+	if sp == nil {
+		sm.logger.Warnf("[assignBlocksAcrossPeers] called with no sync peer")
+		return
+	}
+
+	syncState, exists := sm.peerStates.Get(sp)
+	if !exists {
+		sm.logger.Warnf("[assignBlocksAcrossPeers] sync peer state not found")
+		return
+	}
+
+	// Build the fetch-peer set: the sync peer PLUS up to (ParallelFetchPeers-1)
+	// other eligible peers. The sync peer is one of the N fetch peers now.
+	k := sm.settings.Legacy.MaxBlocksInTransitPerPeer
+
+	targets := make([]*fetchTarget, 0, sm.settings.Legacy.ParallelFetchPeers)
+	appendTarget := func(p *peerpkg.Peer, st *peerSyncState) {
+		spare := k - st.requestedBlocks.Len()
+		if spare <= 0 {
+			// A peer at/over its per-peer cap contributes no spare this pass, but
+			// still counts toward total in-flight (accounted separately below).
+			return
+		}
+		targets = append(targets, &fetchTarget{peer: p, state: st, spare: spare})
+	}
+
+	appendTarget(sp, syncState)
+	for _, p := range sm.eligibleFetchPeers(sp, sm.settings.Legacy.ParallelFetchPeers-1) {
+		st, ok := sm.peerStates.Get(p)
+		if !ok {
+			continue
+		}
+		appendTarget(p, st)
+	}
+
+	// Fall back to the single-peer path when parallelism cannot be exercised
+	// (fewer than 2 peers with spare capacity). This keeps behaviour identical to
+	// the pre-multi-peer top-up when only one peer is usable.
+	if len(targets) < 2 {
+		if syncState.requestedBlocks.Len() < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
+			sm.fetchHeaderBlocks()
+		}
+		return
+	}
+
+	// Total in-flight = sum over ALL peerStates of requestedBlocks.Len() (every
+	// peer, not just the fetch targets — a non-target peer's outstanding blocks
+	// still consume the shared window budget).
+	totalInFlight := 0
+	for _, st := range sm.peerStates.Range() {
+		totalInFlight += st.requestedBlocks.Len()
+	}
+
+	// Budget = min(BlockDownloadWindow, dynamic byte cap). toAssign is how many
+	// more blocks the shared window can absorb this pass.
+	budget := sm.settings.Legacy.BlockDownloadWindow
+	if dynamicCap := sm.blockSizeTracker.calculateMaxInFlightBlocks(); dynamicCap < budget {
+		budget = dynamicCap
+	}
+
+	toAssign := budget - totalInFlight
+	if toAssign <= 0 {
+		sm.logger.Debugf("[assignBlocksAcrossPeers] window full (in-flight %d >= budget %d), nothing to assign", totalInFlight, budget)
+		return
+	}
+
+	// Snapshot headerGen + startHeader under the lock — identical protocol to
+	// fetchHeaderBlocks. A headerGen change at any later re-take means the list was
+	// reset out from under us and the walk must stop.
+	sm.headerMu.Lock()
+	gen := sm.headerGen
+	e := sm.startHeader
+	sm.headerMu.Unlock()
+
+	if e == nil {
+		sm.logger.Debugf("[assignBlocksAcrossPeers] no start header, nothing to assign")
+		return
+	}
+
+	assigned := 0
+
+	for e != nil && toAssign > 0 {
+		// Re-check generation and read the current node + next under the lock. All
+		// *list.Element traversal happens here.
+		sm.headerMu.Lock()
+		if sm.headerGen != gen {
+			sm.headerMu.Unlock()
+			sm.logger.Debugf("[assignBlocksAcrossPeers] header state reset mid-walk, aborting")
+			break
+		}
+
+		node, ok := e.Value.(*headerNode)
+		next := e.Next()
+		sm.headerMu.Unlock()
+
+		if !ok {
+			sm.logger.Warnf("[assignBlocksAcrossPeers] header list node type is not a headerNode")
+			e = next
+			continue
+		}
+
+		iv := wire.NewInvVect(wire.InvTypeBlock, node.hash)
+
+		// haveInventory issues a gRPC — must run with headerMu released.
+		haveInv, err := sm.haveInventory(iv)
+		if err != nil {
+			sm.logger.Warnf("[assignBlocksAcrossPeers] unexpected failure checking inventory during header block fetch: %v", err)
+		}
+
+		if !haveInv {
+			// Pick the assignable target with the MOST spare capacity. If none has
+			// spare left, the per-peer caps are exhausted for this pass; stop.
+			best := pickMaxSpareTarget(targets)
+			if best == nil {
+				sm.logger.Debugf("[assignBlocksAcrossPeers] all peers at per-peer cap, stopping (assigned %d)", assigned)
+				break
+			}
+
+			if err = best.batchAdd(iv, node.hash); err != nil {
+				sm.logger.Warnf("[assignBlocksAcrossPeers] failed to add inv to getdata for peer %s: %v", best.peer, err)
+				break
+			}
+
+			best.spare--
+			toAssign--
+			assigned++
+		}
+
+		// Advance the shared cursor once per WALKED node (matching
+		// fetchHeaderBlocks, which advances past have-inventory nodes too so it
+		// never re-walks them). Re-take the lock, abort on reset.
+		sm.headerMu.Lock()
+		if sm.headerGen != gen {
+			sm.headerMu.Unlock()
+			sm.logger.Debugf("[assignBlocksAcrossPeers] header state reset mid-walk, aborting")
+			break
+		}
+		sm.startHeader = next
+		sm.headerMu.Unlock()
+
+		e = next
+	}
+
+	// Send each target's batch and record its hashes only on a successful send.
+	for _, tgt := range targets {
+		if tgt.batch == nil || len(tgt.batch.InvList) == 0 {
+			continue
+		}
+
+		if !tgt.peer.TryQueueMessage(tgt.batch) {
+			sm.logger.Debugf("[assignBlocksAcrossPeers] outputQueue full for peer %s, deferring %d block(s) to next tick", tgt.peer.String(), len(tgt.batch.InvList))
+			// Not recorded: a dropped getdata must leave no phantom in-flight entry.
+			// Those blocks re-walk on the next tick (startHeader already advanced, so
+			// haveInventory will still report them missing and they get reassigned).
+			continue
+		}
+
+		// Record into THIS peer's requestedBlocks (and the global ledger) only after
+		// the getdata actually went out, so the auth gate at handleBlockPreamble
+		// accepts delivery from this specific peer.
+		for _, h := range tgt.pending {
+			sm.requestedBlocks.Set(*h, struct{}{})
+			tgt.state.requestedBlocks.Set(*h, struct{}{})
+		}
+
+		sm.logger.Debugf("[assignBlocksAcrossPeers] assigned %d block(s) to peer %s", len(tgt.pending), tgt.peer.String())
 	}
 }
 
-// hedgeOutstandingBlocks duplicates the sync peer's outstanding in-flight block
-// hashes to up to (ParallelFetchPeers-1) other eligible peers.  It is called on
-// the drain goroutine only, with headerMu NOT held.
-//
-// The hedge snapshots the sync peer's requestedBlocks, finds eligible non-sync
-// peers, records each outstanding hash into the target peer's requestedBlocks
-// BEFORE sending (so the auth gate passes when the block arrives), then sends a
-// single MsgGetData via a non-blocking TryQueueMessage.  A dropped send leaves the
-// recorded entries in place; they will expire naturally or be re-hedged on the
-// next tick (the expiry window is 60 min, matching normal in-flight entries).
-func (sm *SyncManager) hedgeOutstandingBlocks(sp *peerpkg.Peer, syncPeerState *peerSyncState) {
-	// Snapshot the sync peer's outstanding hashes without holding any other lock.
-	// Items() takes an RLock internally and returns a copy of the map.
-	outstanding := syncPeerState.requestedBlocks.Items()
-	if len(outstanding) == 0 {
-		return
-	}
-
-	wantPeers := sm.settings.Legacy.ParallelFetchPeers - 1
-	targets := sm.eligibleFetchPeers(sp, wantPeers)
-	if len(targets) == 0 {
-		sm.logger.Debugf("[hedgeOutstandingBlocks] no eligible peers for hedge (outstanding=%d)", len(outstanding))
-		return
-	}
-
-	for _, target := range targets {
-		targetState, exists := sm.peerStates.Get(target)
-		if !exists {
+// pickMaxSpareTarget returns the fetchTarget with the greatest remaining spare
+// capacity (>0), or nil if none has spare left. Ties are broken by slice order
+// (the sync peer is first), which keeps assignment deterministic given a fixed
+// target set.
+func pickMaxSpareTarget(targets []*fetchTarget) *fetchTarget {
+	var best *fetchTarget
+	for _, t := range targets {
+		if t.spare <= 0 {
 			continue
 		}
-
-		getDataMsg := wire.NewMsgGetDataSizeHint(uint(len(outstanding))) //nolint:gosec
-
-		for h := range outstanding {
-			// Record into target peer's requestedBlocks BEFORE send so the auth
-			// gate at handleBlockPreamble passes when the block arrives.
-			targetState.requestedBlocks.Set(h, struct{}{})
-
-			iv := wire.NewInvVect(wire.InvTypeBlock, &h)
-			if err := getDataMsg.AddInvVect(iv); err != nil {
-				sm.logger.Warnf("[hedgeOutstandingBlocks] failed to add inv to hedge getdata for peer %s: %v", target, err)
-				break
-			}
-		}
-
-		if len(getDataMsg.InvList) == 0 {
-			continue
-		}
-
-		if !target.TryQueueMessage(getDataMsg) {
-			sm.logger.Debugf("[hedgeOutstandingBlocks] outputQueue full for hedge peer %s, deferring to next tick", target.String())
-			// Hashes are already recorded in targetState.requestedBlocks; they
-			// will expire naturally if the block never arrives from this peer.
-		} else {
-			sm.logger.Debugf("[hedgeOutstandingBlocks] hedged %d block(s) to peer %s", len(getDataMsg.InvList), target.String())
+		if best == nil || t.spare > best.spare {
+			best = t
 		}
 	}
+	return best
+}
+
+// batchAdd lazily allocates the target's getdata message and appends one inv,
+// tracking the hash in pending for post-send recording.
+func (t *fetchTarget) batchAdd(iv *wire.InvVect, hash *chainhash.Hash) error {
+	if t.batch == nil {
+		// Size the hint to the peer's spare capacity — the most it can be assigned.
+		t.batch = wire.NewMsgGetDataSizeHint(uint(t.spare)) //nolint:gosec
+		t.pending = make([]*chainhash.Hash, 0, t.spare)
+	}
+
+	if err := t.batch.AddInvVect(iv); err != nil {
+		return err
+	}
+
+	t.pending = append(t.pending, hash)
+
+	return nil
 }
 
 // eligibleFetchPeers returns up to max peers from peerStates that are sync
