@@ -219,7 +219,7 @@ func checkMoveBlockProcessing(t *testing.T, stp *subtreeprocessor.SubtreeProcess
 	require.NoError(t, stp.CheckSubtreeProcessor())
 
 	// move back the block and make sure all the transactions are put back
-	require.NoError(t, stp.Reorg([]*model.Block{block}, []*model.Block{block2}))
+	require.NoError(t, stp.Reorg([]*model.Block{block}, []*model.Block{block2}, nil))
 
 	assert.Equal(t, uint64(nrTransactions)+1, stp.TxCount(), "Expected tx count to be + 1 for the new coinbase tx") //nolint:gosec
 
@@ -229,7 +229,7 @@ func checkMoveBlockProcessing(t *testing.T, stp *subtreeprocessor.SubtreeProcess
 	require.NoError(t, stp.CheckSubtreeProcessor())
 
 	// move back again and make sure all the transactions are processed
-	require.NoError(t, stp.Reorg([]*model.Block{block2}, []*model.Block{block}))
+	require.NoError(t, stp.Reorg([]*model.Block{block2}, []*model.Block{block}, nil))
 
 	assert.Equal(t, uint64(expectedTransactionsInSubtreeProcessor)+1, stp.TxCount(), "Expected tx count to be + 1 for the new coinbase tx") //nolint:gosec
 

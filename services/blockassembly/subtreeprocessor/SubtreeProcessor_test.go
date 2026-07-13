@@ -2049,7 +2049,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}
 
 		// Test subtree creation failure
-		err = stp.reorgBlocks(context.Background(), []*model.Block{emptyBlock}, []*model.Block{})
+		err = stp.reorgBlocks(context.Background(), []*model.Block{emptyBlock}, []*model.Block{}, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "error creating new subtree")
 

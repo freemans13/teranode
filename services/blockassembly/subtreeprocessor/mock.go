@@ -203,8 +203,8 @@ func (m *MockSubtreeProcessor) MoveForwardBlock(block *model.Block, blockMeta *m
 }
 
 // Reorg implements Interface.Reorg
-func (m *MockSubtreeProcessor) Reorg(moveBackBlocks []*model.Block, modeUpBlocks []*model.Block) error {
-	args := m.Called(moveBackBlocks, modeUpBlocks)
+func (m *MockSubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta) error {
+	args := m.Called(moveBackBlocks, moveForwardBlocks, moveForwardMetas)
 	return args.Error(0)
 }
 

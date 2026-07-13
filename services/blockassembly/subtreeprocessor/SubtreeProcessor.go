@@ -109,6 +109,11 @@ type reorgBlocksRequest struct {
 	// moveForwardBlocks contains blocks that need to be added to form the new chain
 	moveForwardBlocks []*model.Block
 
+	// moveForwardMetas carries pre-fetched BlockHeaderMeta for each moveForwardBlock.
+	// When non-nil, reorgBlocks passes metas[idx] into moveForwardBlock so the IBD
+	// fast-path can skip the GetBlockHeader gRPC call. Nil means fall back to gRPC per block.
+	moveForwardMetas []*model.BlockHeaderMeta
+
 	// errChan receives any error encountered during reorganization
 	errChan chan error
 }
@@ -794,7 +799,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						stp.setCurrentRunningState(StateReorg)
 						logger.Infof("[SubtreeProcessor] reorgReq subtree processor: %d, %d", len(reorgReq.moveBackBlocks), len(reorgReq.moveForwardBlocks))
 
-						reorgErr := stp.reorgBlocks(processorCtx, reorgReq.moveBackBlocks, reorgReq.moveForwardBlocks)
+						reorgErr := stp.reorgBlocks(processorCtx, reorgReq.moveBackBlocks, reorgReq.moveForwardBlocks, reorgReq.moveForwardMetas)
 
 						logger.Infof("[SubtreeProcessor] reorgReq subtree processor DONE: %d, %d", len(reorgReq.moveBackBlocks), len(reorgReq.moveForwardBlocks))
 						return reorgErr
@@ -3131,16 +3136,20 @@ func (stp *SubtreeProcessor) MoveForwardBlock(block *model.Block, blockMeta *mod
 // Parameters:
 //   - moveBackBlocks: Blocks to move down in the chain
 //   - moveForwardBlocks: Blocks to move up in the chain
+//   - moveForwardMetas: Optional pre-fetched BlockHeaderMeta for each moveForwardBlock.
+//     When non-nil, reorgBlocks passes metas[idx] into moveForwardBlock so the IBD
+//     fast-path can skip the GetBlockHeader gRPC call. Nil falls back to gRPC per block.
 //
 // Returns:
 //   - error: Any error encountered during reorganization
-func (stp *SubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block) error {
+func (stp *SubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta) error {
 	ctx := stp.processorContext()
 
 	errChan := make(chan error, 1)
 	req := reorgBlocksRequest{
 		moveBackBlocks:    moveBackBlocks,
 		moveForwardBlocks: moveForwardBlocks,
+		moveForwardMetas:  moveForwardMetas,
 		errChan:           errChan,
 	}
 
@@ -3187,10 +3196,13 @@ func (stp *SubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlo
 //   - ctx: Context for cancellation
 //   - moveBackBlocks: Blocks being removed from main chain (now on side chain)
 //   - moveForwardBlocks: Blocks being added to main chain (new longest chain)
+//   - moveForwardMetas: Optional pre-fetched BlockHeaderMeta for each moveForwardBlock.
+//     When non-nil, the per-block meta is passed directly into moveForwardBlock so that
+//     the IBD fast-path can skip the GetBlockHeader gRPC call. Nil means fallback to gRPC.
 //
 // Returns:
 //   - error: Any error encountered during reorg (triggers fallback to reset())
-func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block) (err error) {
+func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta) (err error) {
 	// reorgBlocks captures originalCurrentTxMap once and expects the pointer
 	// to remain valid (pointing at unchanged pre-reorg data) for the entire
 	// loop so that rollback can restore it. The double-buffer swap pattern
@@ -3265,7 +3277,11 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			// skip dequeue if not the last block
 			skipNotificationsAndDequeue := idx != len(moveForwardBlocks)-1
 
-			if _, _, err = stp.moveForwardBlock(ctx, block, skipNotificationsAndDequeue, processedConflictingHashesMap, skipNotificationsAndDequeue, true, nil); err != nil {
+			var bm *model.BlockHeaderMeta
+			if moveForwardMetas != nil && idx < len(moveForwardMetas) {
+				bm = moveForwardMetas[idx]
+			}
+			if _, _, err = stp.moveForwardBlock(ctx, block, skipNotificationsAndDequeue, processedConflictingHashesMap, skipNotificationsAndDequeue, true, bm); err != nil {
 				rollback()
 				return err
 			}

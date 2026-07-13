@@ -32,7 +32,7 @@ func TestShutdown_Reorg_DoesNotHang(t *testing.T) {
 	stp := newStoppedSubtreeProcessor(t)
 
 	done := make(chan error, 1)
-	go func() { done <- stp.Reorg(nil, nil) }()
+	go func() { done <- stp.Reorg(nil, nil, nil) }()
 
 	requireErrorBeforeTimeout(t, done, "Reorg")
 }
@@ -105,7 +105,7 @@ func TestShutdown_PanicExit_DoesNotHang(t *testing.T) {
 	// Confirm the entry-point caller now unblocks on processorContext().Done()
 	// even though Stop() was never called.
 	done := make(chan error, 1)
-	go func() { done <- stp.Reorg(nil, nil) }()
+	go func() { done <- stp.Reorg(nil, nil, nil) }()
 	requireErrorBeforeTimeout(t, done, "Reorg-after-panic-exit")
 }
 

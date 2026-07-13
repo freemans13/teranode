@@ -1681,7 +1681,7 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 	reorgFailed := false
 
 	// now do the reorg in the subtree processor
-	if err = b.subtreeProcessor.Reorg(moveBackBlocks, moveForwardBlocks); err != nil {
+	if err = b.subtreeProcessor.Reorg(moveBackBlocks, moveForwardBlocks, nil); err != nil {
 		b.logger.Warnf("[BlockAssembler] error doing reorg, will reset instead: %v", err)
 		// fallback to full reset
 		reset = true
@@ -1734,9 +1734,18 @@ func (b *BlockAssembler) handleCatchUp(_ context.Context, moveForward []blockWit
 	for i, bwm := range moveForward {
 		blocks[i] = bwm.block
 	}
+
+	var metas []*model.BlockHeaderMeta
+	if b.settings.BlockAssembly.ReuseBlockMetaInMoveForward {
+		metas = make([]*model.BlockHeaderMeta, len(moveForward))
+		for i, bwm := range moveForward {
+			metas[i] = bwm.meta
+		}
+	}
+
 	// MUST be non-nil empty slice — reorgBlocks rejects nil (SubtreeProcessor.go:2778)
 	// but takes the fast path at len(moveBackBlocks)==0 (SubtreeProcessor.go:2794).
-	return b.subtreeProcessor.Reorg([]*model.Block{}, blocks)
+	return b.subtreeProcessor.Reorg([]*model.Block{}, blocks, metas)
 }
 
 // getReorgBlocks retrieves blocks involved in reorganization.

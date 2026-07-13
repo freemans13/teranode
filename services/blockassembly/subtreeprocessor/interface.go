@@ -124,11 +124,14 @@ type Interface interface {
 	//
 	// Parameters:
 	//   - moveBackBlocks: Blocks to be removed from the chain
-	//   - modeUpBlocks: Blocks to be added to the chain
+	//   - moveForwardBlocks: Blocks to be added to the chain
+	//   - moveForwardMetas: Optional pre-fetched BlockHeaderMeta for each moveForwardBlock.
+	//     When non-nil, reorgBlocks passes metas[idx] into moveForwardBlock so the IBD
+	//     fast-path can skip the GetBlockHeader gRPC call. Nil falls back to gRPC per block.
 	//
 	// Returns:
 	//   - error: Any error encountered during reorganization
-	Reorg(moveBackBlocks []*model.Block, modeUpBlocks []*model.Block) error
+	Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta) error
 
 	// Reset performs a complete reset of the processor state to a specific block.
 	// This is used during major reorganizations or when recovering from errors.
