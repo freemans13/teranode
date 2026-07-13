@@ -602,6 +602,21 @@ type SyncManager struct {
 	assignedMu    sync.Mutex
 	assignedTo    map[chainhash.Hash]*peerpkg.Peer
 	assignedAt    map[chainhash.Hash]time.Time
+	// refetchBlocks holds hashes that were assigned, had their shared-cursor
+	// (startHeader) position advanced past them, and then lost their in-flight
+	// status WITHOUT being received — either freed by the head-of-line stall
+	// detector (freePeerAssignments) or dropped when a peer's send queue was
+	// full. Because startHeader is monotonic-forward and never rewound, the
+	// forward walk in assignBlocksAcrossPeers can never re-reach a block below
+	// the cursor, so without this set such a block would be orphaned forever:
+	// outstanding to nobody, blocking the strictly-ascending window commit and
+	// wedging the whole download (height frozen, drain idle). assignBlocksAcrossPeers
+	// drains this set FIRST each pass (orphans are the lowest, commit-blocking
+	// blocks), re-requesting each from an eligible peer via the normal getdata
+	// path. Entries are removed on successful re-send or on receipt. Guarded by
+	// assignedMu (same leaf lock as assignedTo/assignedAt); bounded by the total
+	// in-flight cap, so it cannot grow unbounded.
+	refetchBlocks map[chainhash.Hash]struct{}
 	syncPeerMu    sync.RWMutex // protects syncPeer and syncPeerState
 	syncPeer      *peerpkg.Peer
 	syncPeerState *syncPeerState
@@ -740,6 +755,13 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 
 	// Clear the index before rebuilding; this bounds its memory across resets.
 	clear(sm.headerHeightIndex)
+
+	// A fresh sync generation invalidates any pending re-fetch requests: their
+	// hashes belong to the header list we are discarding. headerMu -> assignedMu
+	// is the established lock order (see checkHeadStall). clear on nil is a no-op.
+	sm.assignedMu.Lock()
+	clear(sm.refetchBlocks)
+	sm.assignedMu.Unlock()
 
 	// Re-align the header-request look-ahead cursor with the block-level
 	// checkpoint tracker on a fresh sync/recovery. From here they may diverge
@@ -1739,6 +1761,8 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 	sm.assignedMu.Lock()
 	delete(sm.assignedTo, bmsg.blockHash)
 	delete(sm.assignedAt, bmsg.blockHash)
+	// The block has arrived; it is no longer an orphan awaiting re-fetch.
+	delete(sm.refetchBlocks, bmsg.blockHash)
 	sm.assignedMu.Unlock()
 
 	// Count this accepted block against the delivering peer for observability.
@@ -2750,6 +2774,12 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 		return
 	}
 
+	// Re-fetch orphaned blocks FIRST. Blocks freed by the head-of-line stall
+	// detector, or dropped on a full send queue, sit BELOW the monotonic cursor,
+	// so the forward walk below can never re-reach them. They are also the lowest
+	// (commit-blocking) blocks, so they get first claim on this pass's budget.
+	toAssign = sm.drainRefetchBlocks(targets, toAssign)
+
 	// Snapshot headerGen + startHeader under the lock — identical protocol to
 	// fetchHeaderBlocks. A headerGen change at any later re-take means the list was
 	// reset out from under us and the walk must stop.
@@ -2759,8 +2789,9 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 	sm.headerMu.Unlock()
 
 	if e == nil {
-		sm.logger.Debugf("[assignBlocksAcrossPeers] no start header, nothing to assign")
-		return
+		// No forward runway. Do NOT return: any re-fetch batches queued above still
+		// need to be sent by the send loop below.
+		sm.logger.Debugf("[assignBlocksAcrossPeers] no forward runway; sending re-fetch batches only")
 	}
 
 	assigned := 0
@@ -2836,8 +2867,17 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 		if !tgt.peer.TryQueueMessage(tgt.batch) {
 			sm.logger.Debugf("[assignBlocksAcrossPeers] outputQueue full for peer %s, deferring %d block(s) to next tick", tgt.peer.String(), len(tgt.batch.InvList))
 			// Not recorded: a dropped getdata must leave no phantom in-flight entry.
-			// Those blocks re-walk on the next tick (startHeader already advanced, so
-			// haveInventory will still report them missing and they get reassigned).
+			// The cursor has already advanced past these blocks, so the forward walk
+			// can never re-reach them — re-queue them for the next pass's re-fetch
+			// drain instead of relying on a re-walk that cannot happen.
+			sm.assignedMu.Lock()
+			if sm.refetchBlocks == nil {
+				sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+			}
+			for _, h := range tgt.pending {
+				sm.refetchBlocks[*h] = struct{}{}
+			}
+			sm.assignedMu.Unlock()
 			continue
 		}
 
@@ -2862,11 +2902,88 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 			tgt.state.requestedBlocks.Set(*h, struct{}{})
 			sm.assignedTo[*h] = tgt.peer
 			sm.assignedAt[*h] = assignAt
+			// A re-fetch that actually went out is no longer orphaned; drop it from
+			// the set. delete on a nil map is a safe no-op.
+			delete(sm.refetchBlocks, *h)
 		}
 		sm.assignedMu.Unlock()
 
 		sm.logger.Debugf("[assignBlocksAcrossPeers] assigned %d block(s) to peer %s", len(tgt.pending), tgt.peer.String())
 	}
+}
+
+// drainRefetchBlocks re-requests orphaned blocks (freed by the head-of-line
+// stall detector or dropped on a full send queue) BEFORE the forward walk.
+// Those blocks sit below the monotonic startHeader cursor, which is never
+// rewound, so the forward walk can never re-reach them; and because the window
+// commits strictly ascending, a single such orphan pins the committed tip and
+// wedges the whole download. Draining them first also gives the lowest,
+// commit-blocking blocks first claim on the pass's budget.
+//
+// For each still-orphaned hash it batchAdds an inv to the eligible target with
+// the most spare capacity, decrementing toAssign and the target's spare, and
+// drops from the set any block we already have. Recording into requestedBlocks
+// (and removal from the set) happens in the shared send loop of
+// assignBlocksAcrossPeers, so an orphan stays queued until its getdata actually
+// goes out — a dropped send simply retries next pass. Returns the remaining
+// toAssign budget. Drain-goroutine only; assignedMu is never held across the
+// haveInventory gRPC.
+func (sm *SyncManager) drainRefetchBlocks(targets []*fetchTarget, toAssign int) int {
+	sm.assignedMu.Lock()
+	if len(sm.refetchBlocks) == 0 {
+		sm.assignedMu.Unlock()
+		return toAssign
+	}
+
+	pending := make([]chainhash.Hash, 0, len(sm.refetchBlocks))
+	for h := range sm.refetchBlocks {
+		pending = append(pending, h)
+	}
+	sm.assignedMu.Unlock()
+
+	for _, h := range pending {
+		if toAssign <= 0 {
+			break
+		}
+
+		// Already re-assigned and recorded on a prior pass — skip (no double-request).
+		if _, inFlight := sm.requestedBlocks.Get(h); inFlight {
+			continue
+		}
+
+		hh := h // stable address for the pointer stored in the target's pending list
+		iv := wire.NewInvVect(wire.InvTypeBlock, &hh)
+
+		haveInv, err := sm.haveInventory(iv)
+		if err != nil {
+			sm.logger.Warnf("[drainRefetchBlocks] inventory check failed for %s: %v", hh, err)
+		}
+
+		if haveInv {
+			// We already have it after all; it is no longer an orphan.
+			sm.assignedMu.Lock()
+			delete(sm.refetchBlocks, hh)
+			sm.assignedMu.Unlock()
+
+			continue
+		}
+
+		best := pickMaxSpareTarget(targets)
+		if best == nil {
+			// No spare capacity this pass; leave the rest queued for next tick.
+			break
+		}
+
+		if err = best.batchAdd(iv, &hh); err != nil {
+			sm.logger.Warnf("[drainRefetchBlocks] failed to add inv to getdata for peer %s: %v", best.peer, err)
+			break
+		}
+
+		best.spare--
+		toAssign--
+	}
+
+	return toAssign
 }
 
 // pickMaxSpareTarget returns the fetchTarget with the greatest remaining spare
@@ -3050,6 +3167,13 @@ func (sm *SyncManager) freePeerAssignments(peer *peerpkg.Peer) {
 	for _, h := range freed {
 		delete(sm.assignedTo, h)
 		delete(sm.assignedAt, h)
+		// Enqueue for re-fetch. The shared cursor has already advanced past these
+		// blocks, so the forward walk can never re-reach them; without this they
+		// would be orphaned below the cursor and wedge the ascending commit.
+		if sm.refetchBlocks == nil {
+			sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+		}
+		sm.refetchBlocks[h] = struct{}{}
 	}
 
 	sm.assignedMu.Unlock()
@@ -4723,6 +4847,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		headerHeightIndex: make(map[chainhash.Hash]int32),
 		assignedTo:        make(map[chainhash.Hash]*peerpkg.Peer),
 		assignedAt:        make(map[chainhash.Hash]time.Time),
+		refetchBlocks:     make(map[chainhash.Hash]struct{}),
 		blockSizeTracker: newBlockSizeTrackerWithBudgets(10, // track last 10 blocks for rolling average
 			tSettings.Legacy.InFlightTxBudget, tSettings.Legacy.InFlightByteBudget),
 		quit: make(chan struct{}),
