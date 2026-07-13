@@ -146,7 +146,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 		addChain(t, items, chain)
 
 		mockStp := &subtreeprocessor.MockSubtreeProcessor{}
-		mockStp.On("MoveForwardBlock", mock.Anything).Return(nil)
+		mockStp.On("MoveForwardBlock", mock.Anything, mock.Anything).Return(nil)
 		injectMockStp(t, items, mockStp)
 
 		// BA is at genesis; blockchain tip is chain[0] → gap=1 (default branch).
@@ -154,7 +154,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 
 		items.blockAssembler.processNewBlockAnnouncement(t.Context())
 
-		mockStp.AssertCalled(t, "MoveForwardBlock", mock.Anything)
+		mockStp.AssertCalled(t, "MoveForwardBlock", mock.Anything, mock.Anything)
 		mockStp.AssertNotCalled(t, "Reorg", mock.Anything, mock.Anything)
 	})
 

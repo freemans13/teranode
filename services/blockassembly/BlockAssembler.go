@@ -799,7 +799,13 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 
 		b.setCurrentRunningState(StateMovingUp)
 
-		if err = b.subtreeProcessor.MoveForwardBlock(block); err != nil {
+		var mm *model.BlockHeaderMeta
+		if b.settings.BlockAssembly.ReuseBlockMetaInMoveForward {
+			// bestBlockchainBlockHeaderMeta is the meta of this exact block: the tip
+			// is exactly one ahead of BA in this (default) switch case.
+			mm = bestBlockchainBlockHeaderMeta
+		}
+		if err = b.subtreeProcessor.MoveForwardBlock(block, mm); err != nil {
 			ctxLogger.Errorf("[BlockAssembler][%s] error moveForwardBlock in subtree processor: %v", bestBlockchainBlockHeader.Hash(), err)
 			prometheusBlockAssemblyProcessingStuck.WithLabelValues("moveforward").Inc()
 			return

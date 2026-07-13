@@ -204,7 +204,7 @@ func checkMoveBlockProcessing(t *testing.T, stp *subtreeprocessor.SubtreeProcess
 		Subtrees:   []*chainhash.Hash{},
 	}
 
-	err := stp.MoveForwardBlock(block)
+	err := stp.MoveForwardBlock(block, nil)
 	require.NoError(t, err)
 
 	waitForSubtreeProcessorQueueToEmpty(t, stp)

@@ -111,10 +111,13 @@ type Interface interface {
 	//
 	// Parameters:
 	//   - block: The new block being added to the blockchain
+	//   - blockMeta: Optional pre-fetched block header meta. When non-nil the IBD
+	//     fast-path gate reuses it and skips the GetBlockHeader gRPC call. Pass nil
+	//     to use the existing fallback behaviour (one GetBlockHeader RPC).
 	//
 	// Returns:
 	//   - error: Any error encountered during block processing
-	MoveForwardBlock(block *model.Block) error
+	MoveForwardBlock(block *model.Block, blockMeta *model.BlockHeaderMeta) error
 
 	// Reorg handles blockchain reorganization by processing blocks that need
 	// to be removed and added during the reorganization process.

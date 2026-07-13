@@ -1,18 +1,23 @@
 package subtreeprocessor
 
-// Tests for Task 2: moveForwardBlock accepts an optional blockMeta param.
+// Tests for Task 2 and Task 3: moveForwardBlock / MoveForwardBlock blockMeta threading.
+//
+// Task 2: the internal moveForwardBlock accepts an optional blockMeta param.
+// Task 3: the exported MoveForwardBlock threads the param from caller → channel
+//         request → internal moveForwardBlock.
 //
 // When a non-nil blockMeta is supplied by the caller, the IBD fast-path gate
 // must reuse it and skip the GetBlockHeader gRPC call entirely.
 // When nil is passed, the gate must fall back to the existing GetBlockHeader call
-// (exactly one RPC, same behaviour as before Task 2).
+// (exactly one RPC, same behaviour as before Task 2/3).
 //
 // These tests use the existing buildIBDFastPathSTP / blockchain.Mock harness so
-// they can precisely count GetBlockHeader invocations via mock.AssertNumberOfCalls.
+// they can precisely count GetBlockHeader invocations via mock assertions.
 //
 // Test index:
-//  1. TestMoveForwardBlock_UsesPassedMetaSkipsGetBlockHeader — non-nil meta → 0 gRPC calls
-//  2. TestMoveForwardBlock_NilMetaFallsBackToGetBlockHeader  — nil meta     → 1 gRPC call
+//  1. TestMoveForwardBlock_UsesPassedMetaSkipsGetBlockHeader    — non-nil meta → 0 gRPC calls (internal)
+//  2. TestMoveForwardBlock_NilMetaFallsBackToGetBlockHeader     — nil meta     → 1 gRPC call  (internal)
+//  3. TestExportedMoveForwardBlock_ThreadsMetaToFastPath        — exported path + non-nil meta → 0 gRPC calls
 
 import (
 	"context"
@@ -90,4 +95,27 @@ func TestMoveForwardBlock_NilMetaFallsBackToGetBlockHeader(t *testing.T) {
 
 	// GetBlockHeader must have been called exactly once — the nil-meta fallback path.
 	bcMock.AssertNumberOfCalls(t, "GetBlockHeader", 1)
+}
+
+// TestExportedMoveForwardBlock_ThreadsMetaToFastPath verifies that the exported
+// MoveForwardBlock(block, meta) correctly threads the meta through the channel
+// request to the internal moveForwardBlock, allowing the IBD fast-path to fire
+// without issuing a GetBlockHeader gRPC call.
+//
+// RED  (before Task 3): compile error — MoveForwardBlock(block) takes 1 arg, not 2.
+// GREEN (after Task 3): 0 GetBlockHeader calls; fast-path fires; no error returned.
+func TestExportedMoveForwardBlock_ThreadsMetaToFastPath(t *testing.T) {
+	stp, bcMock := buildIBDFastPathSTP(t)
+	stp.InitCurrentBlockHeader(prevBlockHeader)
+	stp.Start(t.Context())
+
+	block := buildBelowCpFastPathBlock(t, stp)
+	meta := &model.BlockHeaderMeta{MinedSet: true, QuickValidated: true}
+
+	require.NoError(t, stp.MoveForwardBlock(block, meta),
+		"exported MoveForwardBlock must succeed when caller passes MinedSet+QuickValidated meta")
+
+	// GetBlockHeader must NOT have been called — the meta threaded through the
+	// channel request short-circuits the gRPC call entirely.
+	bcMock.AssertNotCalled(t, "GetBlockHeader")
 }

@@ -197,8 +197,8 @@ func (m *MockSubtreeProcessor) CheckSubtreeProcessor() error {
 }
 
 // MoveForwardBlock implements Interface.MoveForwardBlock
-func (m *MockSubtreeProcessor) MoveForwardBlock(block *model.Block) error {
-	args := m.Called(block)
+func (m *MockSubtreeProcessor) MoveForwardBlock(block *model.Block, blockMeta *model.BlockHeaderMeta) error {
+	args := m.Called(block, blockMeta)
 	return args.Error(0)
 }
 

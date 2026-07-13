@@ -41,7 +41,7 @@ func TestShutdown_MoveForwardBlock_DoesNotHang(t *testing.T) {
 	stp := newStoppedSubtreeProcessor(t)
 
 	done := make(chan error, 1)
-	go func() { done <- stp.MoveForwardBlock(&model.Block{Header: model.GenesisBlockHeader}) }()
+	go func() { done <- stp.MoveForwardBlock(&model.Block{Header: model.GenesisBlockHeader}, nil) }()
 
 	requireErrorBeforeTimeout(t, done, "MoveForwardBlock")
 }

@@ -96,8 +96,9 @@ type NewSubtreeRequest struct {
 
 // moveBlockRequest represents a request to move a block in the chain.
 type moveBlockRequest struct {
-	block   *model.Block // The block to move
-	errChan chan error   // Channel for error reporting
+	block     *model.Block           // The block to move
+	blockMeta *model.BlockHeaderMeta // Optional pre-fetched meta; nil means fall back to GetBlockHeader
+	errChan   chan error             // Channel for error reporting
 }
 
 // reorgBlocksRequest represents a request to reorganize blocks in the chain.
@@ -845,7 +846,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						// create empty map for processed conflicting hashes
 						processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
-						_, _, mfErr := stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true, nil)
+						_, _, mfErr := stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true, moveForwardReq.blockMeta)
 						if mfErr != nil {
 							rollback()
 							return mfErr
@@ -3094,16 +3095,21 @@ func (stp *SubtreeProcessor) runHandlerWithRecover(name string, fn func() error)
 //
 // Parameters:
 //   - block: Block to process
+//   - blockMeta: Optional pre-fetched block header meta. When non-nil the IBD
+//     fast-path gate reuses it and skips the GetBlockHeader gRPC call. Pass nil
+//     to use the existing fallback (one GetBlockHeader RPC, identical to the
+//     pre-Task-3 behaviour).
 //
 // Returns:
 //   - error: Any error encountered during processing
-func (stp *SubtreeProcessor) MoveForwardBlock(block *model.Block) error {
+func (stp *SubtreeProcessor) MoveForwardBlock(block *model.Block, blockMeta *model.BlockHeaderMeta) error {
 	ctx := stp.processorContext()
 
 	errChan := make(chan error, 1)
 	req := moveBlockRequest{
-		block:   block,
-		errChan: errChan,
+		block:     block,
+		blockMeta: blockMeta,
+		errChan:   errChan,
 	}
 
 	select {

@@ -155,7 +155,7 @@ func TestMoveForwardBlockLarge(t *testing.T) {
 			stp.GetChainedSubtrees()[1].RootHash(),
 		},
 		CoinbaseTx: coinbaseTx,
-	})
+	}, nil)
 
 	wg.Wait()
 	fmt.Printf("moveForwardBlock took %s\n", time.Since(timeStart))

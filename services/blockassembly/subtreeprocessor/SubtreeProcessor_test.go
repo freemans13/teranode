@@ -717,7 +717,7 @@ func TestMoveForwardBlock(t *testing.T) {
 			stp.chainedSubtrees[1].RootHash(),
 		},
 		CoinbaseTx: coinbaseTx,
-	})
+	}, nil)
 	require.NoError(t, err)
 	// wg.Wait()
 
@@ -783,7 +783,7 @@ func TestMoveForwardBlock_LeftInQueue(t *testing.T) {
 
 	block.Header.HashPrevBlock = subtreeProcessor.currentBlockHeader.Load().Hash()
 
-	err = subtreeProcessor.MoveForwardBlock(block)
+	err = subtreeProcessor.MoveForwardBlock(block, nil)
 	require.NoError(t, err)
 
 	assert.Len(t, subtreeProcessor.chainedSubtrees, 0)
@@ -883,7 +883,7 @@ func TestIncompleteSubtreeMoveForwardBlock(t *testing.T) {
 			stp.chainedSubtrees[1].RootHash(),
 		},
 		CoinbaseTx: coinbaseTx,
-	})
+	}, nil)
 	require.NoError(t, err)
 
 	wg.Wait()
@@ -985,7 +985,7 @@ func TestSubtreeMoveForwardBlockNewCurrent(t *testing.T) {
 			stp.chainedSubtrees[1].RootHash(),
 		},
 		CoinbaseTx: coinbaseTx,
-	})
+	}, nil)
 
 	wg.Wait()
 	require.NoError(t, err)

@@ -63,7 +63,7 @@ func TestMoveForwardBlock_PanicSurfacesAsError(t *testing.T) {
 	go func() {
 		// Passing a nil block triggers a nil-deref inside the
 		// dispatcher's moveForward case (logger.Infof with block.String()).
-		done <- stp.MoveForwardBlock(nil)
+		done <- stp.MoveForwardBlock(nil, nil)
 	}()
 
 	select {
