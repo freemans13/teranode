@@ -672,6 +672,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			InFlightTxBudget:                 getInt("legacy_inFlightTxBudget", 50000, alternativeContext...),
 			InFlightByteBudget:               int64(getInt("legacy_inFlightByteBudget", 0, alternativeContext...)),
 			InFlightRefillInterval:           getDuration("legacy_inFlightRefillInterval", 20*time.Millisecond, alternativeContext...),
+			ParallelFetchPeers:               getInt("legacy_parallelFetchPeers", 1, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

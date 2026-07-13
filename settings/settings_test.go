@@ -150,3 +150,7 @@ func TestMaxRawTxFee_EnvZeroDisables(t *testing.T) {
 func TestReuseBlockMetaInMoveForwardDefaultOff(t *testing.T) {
 	require.False(t, NewSettings().BlockAssembly.ReuseBlockMetaInMoveForward)
 }
+
+func TestParallelFetchPeersDefaultOne(t *testing.T) {
+	require.Equal(t, 1, NewSettings().Legacy.ParallelFetchPeers)
+}
