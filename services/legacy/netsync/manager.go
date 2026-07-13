@@ -1685,6 +1685,12 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 	state.requestedBlocks.Delete(bmsg.blockHash)
 	sm.requestedBlocks.Delete(bmsg.blockHash)
 
+	// Count this accepted block against the delivering peer for observability.
+	// The delivering peer is bmsg.peer (before any stream-peer resolution) for
+	// address labelling, because resolvedPeer may have been remapped to the
+	// primary in the stream-peer case above.
+	prometheusLegacyNetsyncBlocksReceived.WithLabelValues(bmsg.peer.Addr()).Inc()
+
 	// Track block size AND transaction count for dynamic in-flight adjustment
 	// during headers-first mode. The in-flight bound is now a transaction WORK
 	// budget (with a byte-budget safety clamp): tiny blocks stream

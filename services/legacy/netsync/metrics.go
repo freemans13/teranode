@@ -35,6 +35,12 @@ var (
 	// Class labels: tx_invalid, service, processing, policy, other.
 	prometheusLegacyNetsyncPrewarmErrors *prometheus.CounterVec
 
+	// prometheusLegacyNetsyncBlocksReceived counts blocks accepted from each peer
+	// after passing the requestedBlocks auth gate in handleBlockPreamble. It is
+	// labelled by delivering peer address and is the instrument used by the live
+	// gate to observe whether a non-sync peer is actively serving blocks.
+	prometheusLegacyNetsyncBlocksReceived *prometheus.CounterVec
+
 	prometheusMetricsInitOnce sync.Once
 )
 
@@ -210,4 +216,12 @@ func _initPrometheusMetrics() {
 		Help:      "Number of validator errors observed during the pre-warm path in validateTransactions, by class",
 	}, []string{"class"})
 	prometheus.MustRegister(prometheusLegacyNetsyncPrewarmErrors)
+
+	prometheusLegacyNetsyncBlocksReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "legacy_netsync",
+		Name:      "blocks_received_total",
+		Help:      "Blocks received from a peer that passed the requestedBlocks auth gate",
+	}, []string{"peer"})
+	prometheus.MustRegister(prometheusLegacyNetsyncBlocksReceived)
 }
