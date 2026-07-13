@@ -1613,6 +1613,7 @@ func (b *Blockchain) GetBestBlockHeader(ctx context.Context, empty *emptypb.Empt
 		Timestamp:      meta.Timestamp,
 		ChainWork:      meta.ChainWork,
 		MedianTimePast: meta.MedianTimePast,
+		MinedSet:       meta.MinedSet,
 		QuickValidated: meta.QuickValidated,
 	}, nil
 }

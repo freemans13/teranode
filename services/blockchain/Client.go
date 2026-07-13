@@ -731,6 +731,7 @@ func (c *Client) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *m
 		Timestamp:      resp.Timestamp,
 		ChainWork:      resp.ChainWork,
 		MedianTimePast: resp.MedianTimePast,
+		MinedSet:       resp.MinedSet,
 		QuickValidated: resp.QuickValidated,
 	}
 

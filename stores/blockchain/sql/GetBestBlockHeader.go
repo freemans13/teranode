@@ -130,6 +130,8 @@ func (s *SQL) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *mode
 		,b.invalid
 		,b.processed_at
 		,b.median_time_past
+		,b.mined_set
+		,b.quick_validated
 		FROM blocks b
 		WHERE invalid = false
 		ORDER BY chain_work DESC, peer_id ASC, id ASC
@@ -166,6 +168,8 @@ func (s *SQL) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *mode
 		&blockHeaderMeta.Invalid,
 		&processedAt,
 		&blockHeaderMeta.MedianTimePast,
+		&blockHeaderMeta.MinedSet,
+		&blockHeaderMeta.QuickValidated,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, errors.NewBlockNotFoundError("error in GetBestBlockHeader", err)

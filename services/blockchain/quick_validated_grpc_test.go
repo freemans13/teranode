@@ -112,3 +112,53 @@ func Test_QuickValidated_gRPC_False(t *testing.T) {
 
 	require.False(t, meta.QuickValidated, "QuickValidated must read back false when stored false")
 }
+
+// Test_MinedSet_GetBestBlockHeader_gRPC_RoundTrip proves that MinedSet survives the
+// GetBestBlockHeader gRPC hop. This path was previously broken: the server handler
+// set QuickValidated but omitted MinedSet, and the client deserializer did the same.
+// The block added here becomes the chain tip, so GetBestBlockHeader returns it.
+func Test_MinedSet_GetBestBlockHeader_gRPC_RoundTrip(t *testing.T) {
+	tctx := setup(t)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	grpcServer := grpc.NewServer()
+	blockchain_api.RegisterBlockchainAPIServer(grpcServer, tctx.server)
+
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+	defer grpcServer.Stop()
+
+	logger := ulogger.NewErrorTestLogger(t)
+
+	tSettings := tctx.server.settings
+	tSettings.BlockChain.GRPCAddress = lis.Addr().String()
+	tSettings.BlockChain.MaxRetries = 1
+	tSettings.BlockChain.RetrySleep = 10
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	clientI, err := NewClientWithAddress(ctx, logger, tSettings, lis.Addr().String(), "mined-set-best-test")
+	require.NoError(t, err)
+
+	client := clientI.(*Client)
+
+	block := mockBlock(tctx, t)
+
+	err = client.AddBlock(ctx, block, "",
+		blockchainoptions.WithMinedSet(true),
+		blockchainoptions.WithQuickValidated(true),
+		blockchainoptions.WithID(uint64(block.ID)),
+	)
+	require.NoError(t, err)
+
+	_, meta, err := client.GetBestBlockHeader(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+
+	require.True(t, meta.MinedSet, "MinedSet must survive the gRPC AddBlock->GetBestBlockHeader round-trip")
+	require.True(t, meta.QuickValidated, "QuickValidated must survive the gRPC AddBlock->GetBestBlockHeader round-trip (control)")
+}
