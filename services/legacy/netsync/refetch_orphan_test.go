@@ -293,13 +293,13 @@ func TestReconcileLostAssignments_TTLExpiredOrphanRefetched(t *testing.T) {
 	sm.assignedTo[orphan] = p
 	sm.assignedAt[orphan] = time.Now().Add(-90 * time.Second)
 
-	// Still-tracked block: present in BOTH maps; must be left alone.
+	// Still-tracked, freshly-assigned block: present in BOTH maps; must be left alone.
 	live := chainhash.Hash{0x88}
 	sm.assignedTo[live] = p
 	sm.assignedAt[live] = time.Now()
 	sm.requestedBlocks.Set(live, struct{}{})
 
-	sm.reconcileLostAssignments()
+	sm.reconcileLostAssignments(time.Now())
 
 	_, queued := sm.refetchBlocks[orphan]
 	require.True(t, queued, "TTL-expired orphan must be re-enqueued for re-fetch")
@@ -310,6 +310,71 @@ func TestReconcileLostAssignments_TTLExpiredOrphanRefetched(t *testing.T) {
 	require.False(t, liveQueued, "a still-tracked block must NOT be re-enqueued")
 	_, liveAssigned := sm.assignedTo[live]
 	require.True(t, liveAssigned, "a still-tracked block must remain assigned")
+}
+
+// TestReconcileLostAssignments_StaleBlockFreed covers the per-block download
+// timeout (BlockInFlightTimeout): a block still tracked in requestedBlocks but
+// outstanding to its peer longer than the timeout must be freed for re-fetch and
+// dropped from both the global ledger and the peer's own requestedBlocks (so the
+// peer's spare capacity recovers), while a freshly-assigned block is untouched.
+func TestReconcileLostAssignments_StaleBlockFreed(t *testing.T) {
+	chainParams := chaincfg.MainNetParams
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.ParallelFetchPeers = 3
+	tSettings.Legacy.BlockInFlightTimeout = 10 * time.Second
+
+	st := newEligiblePeerState()
+	defer st.requestedBlocks.Stop()
+	defer st.requestedTxns.Stop()
+
+	sm := &SyncManager{
+		ctx:             context.Background(),
+		logger:          ulogger.TestLogger{},
+		settings:        tSettings,
+		chainParams:     &chainParams,
+		peerStates:      txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		assignedTo:      make(map[chainhash.Hash]*peer.Peer),
+		assignedAt:      make(map[chainhash.Hash]time.Time),
+		refetchBlocks:   make(map[chainhash.Hash]struct{}),
+	}
+	defer sm.requestedBlocks.Stop()
+
+	p := captureGetDataPeer(t, &chainParams, 66, &sync.Mutex{}, &[]*wire.MsgGetData{})
+	sm.peerStates.Set(p, st)
+
+	// Stale block: tracked in both ledgers, but assigned 30s ago (> 10s timeout).
+	stale := chainhash.Hash{0x91}
+	sm.assignedTo[stale] = p
+	sm.assignedAt[stale] = time.Now().Add(-30 * time.Second)
+	sm.requestedBlocks.Set(stale, struct{}{})
+	st.requestedBlocks.Set(stale, struct{}{})
+
+	// Fresh block: assigned just now, within the timeout — must be left alone.
+	fresh := chainhash.Hash{0x92}
+	sm.assignedTo[fresh] = p
+	sm.assignedAt[fresh] = time.Now()
+	sm.requestedBlocks.Set(fresh, struct{}{})
+	st.requestedBlocks.Set(fresh, struct{}{})
+
+	sm.reconcileLostAssignments(time.Now())
+
+	// Stale block freed everywhere and queued for re-fetch.
+	_, queued := sm.refetchBlocks[stale]
+	require.True(t, queued, "stale block must be re-enqueued for re-fetch")
+	_, inAssigned := sm.assignedTo[stale]
+	require.False(t, inAssigned, "stale block must be dropped from assignedTo")
+	_, inGlobal := sm.requestedBlocks.Get(stale)
+	require.False(t, inGlobal, "stale block must be dropped from the global ledger")
+	_, inPeer := st.requestedBlocks.Get(stale)
+	require.False(t, inPeer, "stale block must be dropped from the peer's requestedBlocks (spare frees)")
+
+	// Fresh block untouched.
+	_, freshQueued := sm.refetchBlocks[fresh]
+	require.False(t, freshQueued, "fresh block must NOT be re-enqueued")
+	_, freshAssigned := sm.assignedTo[fresh]
+	require.True(t, freshAssigned, "fresh block must remain assigned")
 }
 
 // TestReconcileLostAssignments_FlagOffNoop asserts the reconcile is a no-op with
@@ -336,7 +401,7 @@ func TestReconcileLostAssignments_FlagOffNoop(t *testing.T) {
 	sm.assignedTo[orphan] = &peer.Peer{}
 	sm.assignedAt[orphan] = time.Now().Add(-90 * time.Second)
 
-	sm.reconcileLostAssignments()
+	sm.reconcileLostAssignments(time.Now())
 
 	require.Empty(t, sm.refetchBlocks, "flag-off: reconcile must not enqueue anything")
 	_, stillAssigned := sm.assignedTo[orphan]

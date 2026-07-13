@@ -2628,7 +2628,7 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	// peer stays connected yet never delivers it, the block is left in assignedTo,
 	// below the cursor, outstanding to nobody — the same orphan class, via a
 	// different trigger. Reconcile catches these each tick and re-enqueues them.
-	sm.reconcileLostAssignments()
+	sm.reconcileLostAssignments(time.Now())
 
 	// Snapshot whether there is header runway under headerMu, then RELEASE the
 	// lock before calling fetchHeaderBlocks (which re-takes headerMu itself and
@@ -3087,42 +3087,64 @@ func (sm *SyncManager) eligibleFetchPeers(exclude *peerpkg.Peer, max int) []*pee
 // peer's requestedBlocks and the global ledger, so haveInventory still reports
 // them missing and they are re-requested next tick; a late block arriving from
 // the disconnected peer is a harmless GetBlockExists no-op.
-// reconcileLostAssignments re-enqueues blocks that lost their in-flight status
-// silently. The global requestedBlocks ledger is an expiringmap with a 60s TTL
-// and no eviction callback, while assignedTo/assignedAt have no TTL. So a block
-// re-fetched to a peer that stays connected but never delivers it will have its
-// requestedBlocks entry expire, leaving it stranded in assignedTo — below the
-// monotonic cursor, outstanding to nobody: the exact orphan class the re-fetch
-// set exists to prevent, reached via TTL expiry rather than a free or a dropped
-// send. checkHeadStall only rescues the lowest-height (head) such block; this
-// rescues the rest. Runs each scheduler tick (a cheap in-memory scan bounded by
-// the in-flight cap). Drain-goroutine only; assignedMu is a leaf lock held here
-// only across in-memory map reads — never a gRPC or a send. It reads
-// requestedBlocks (its own internal lock) while holding assignedMu, which is
-// safe because requestedBlocks has no eviction callback, so nothing takes
-// assignedMu from under the requestedBlocks lock (no inversion).
-func (sm *SyncManager) reconcileLostAssignments() {
+// reconcileLostAssignments re-enqueues blocks whose in-flight assignment must be
+// abandoned, for either of two reasons:
+//
+//  1. LOST: the global requestedBlocks ledger is an expiringmap with a 60s TTL
+//     and no eviction callback, while assignedTo/assignedAt have no TTL. A block
+//     re-fetched to a peer that stays connected but never delivers it will have
+//     its requestedBlocks entry expire, leaving it stranded in assignedTo —
+//     outstanding to nobody, below the monotonic cursor.
+//  2. STALE: a block outstanding to its assigned peer longer than
+//     BlockInFlightTimeout. checkHeadStall only rescues the single HEAD block;
+//     non-head blocks assigned to peers that accept the getdata but never
+//     deliver would otherwise pin the shared in-flight budget until their 60s
+//     TTL, so toAssign goes <= 0, the head re-fetch cannot drain, and the whole
+//     download freezes for up to a minute. Freeing stale blocks bounds that
+//     freeze to BlockInFlightTimeout. This is the Bitcoin Core BLOCK_DOWNLOAD_
+//     TIMEOUT analog; unlike checkHeadStall it does NOT disconnect the peer, so
+//     a merely-slow peer is not churned — only the individual stuck block moves.
+//
+// Freed blocks re-enter the re-fetch set and are re-requested next tick. Runs
+// each scheduler tick (a cheap in-memory scan bounded by the in-flight cap).
+// Drain-goroutine only; assignedMu is a leaf lock held here only across in-memory
+// map operations — never a gRPC or a send. It reads/deletes requestedBlocks (its
+// own internal lock) while holding assignedMu, which is safe because
+// requestedBlocks has no eviction callback, so nothing takes assignedMu from
+// under the requestedBlocks lock (no inversion).
+func (sm *SyncManager) reconcileLostAssignments(now time.Time) {
 	if sm.settings.Legacy.ParallelFetchPeers <= 1 {
 		return
 	}
 
+	timeout := sm.settings.Legacy.BlockInFlightTimeout
+
 	sm.assignedMu.Lock()
 	defer sm.assignedMu.Unlock()
 
-	for h := range sm.assignedTo {
-		if _, stillTracked := sm.requestedBlocks.Get(h); stillTracked {
+	for h, p := range sm.assignedTo {
+		_, tracked := sm.requestedBlocks.Get(h)
+		stale := timeout > 0 && now.Sub(sm.assignedAt[h]) > timeout
+
+		if tracked && !stale {
 			continue
 		}
 
-		// requestedBlocks entry gone (TTL expiry) but the assignment lingers: the
-		// block is outstanding to nobody. Re-enqueue it and drop the stale
-		// assignment. delete during range is safe in Go.
+		// Abandon this assignment and re-enqueue the block. delete during range is
+		// safe in Go.
 		if sm.refetchBlocks == nil {
 			sm.refetchBlocks = make(map[chainhash.Hash]struct{})
 		}
 		sm.refetchBlocks[h] = struct{}{}
 		delete(sm.assignedTo, h)
 		delete(sm.assignedAt, h)
+
+		// Drop the ledger entries so the block is immediately re-requestable and
+		// the peer's spare capacity frees (no-op if the entry already expired).
+		sm.requestedBlocks.Delete(h)
+		if st, ok := sm.peerStates.Get(p); ok {
+			st.requestedBlocks.Delete(h)
+		}
 	}
 }
 
