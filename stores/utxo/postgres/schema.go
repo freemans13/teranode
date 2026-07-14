@@ -377,7 +377,13 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pg
 	// btree covers a column touched by the sweep UPDATE). The migration is a
 	// no-op if the columns already exist; pre-v15 (spent_progress) databases are
 	// rejected at bootstrapDAHSweepProc, not migrated.
-	if _, err := pool.Exec(ctx, txsSetterCMigrationDDL); err != nil {
+	//
+	// Skip-if-applied: `ADD COLUMN IF NOT EXISTS` is idempotent, but the ALTER
+	// still takes an ACCESS EXCLUSIVE lock on txs even when it does nothing. On an
+	// already-migrated DB that lock could deadlock against the DAH sweep's
+	// per-partition locks at startup. An information_schema existence check first
+	// skips the ALTER entirely once both columns are present.
+	if _, err := applySpentBitmapMigration(ctx, pool); err != nil {
 		return errors.NewStorageError("spent-bitmap column migration failed", err)
 	}
 
@@ -566,6 +572,38 @@ const txsSetterCMigrationDDL = `
 ALTER TABLE txs ADD COLUMN IF NOT EXISTS spent_bits        BYTEA NOT NULL DEFAULT '\x'::bytea;
 ALTER TABLE txs ADD COLUMN IF NOT EXISTS last_spend_height INT;
 ALTER TABLE txs ALTER COLUMN spent_bits SET STORAGE MAIN;`
+
+// applySpentBitmapMigration runs txsSetterCMigrationDDL only when the two fold
+// columns are not already present, and reports whether it ran the ALTER.
+//
+// The ALTER is idempotent (ADD COLUMN IF NOT EXISTS) but still acquires an
+// ACCESS EXCLUSIVE lock on txs on every startup even when it is a no-op. On an
+// already-migrated production DB that redundant lock can deadlock against the
+// DAH sweep's per-partition locks (observed SQLSTATE 40P01). A cheap
+// information_schema probe first skips the ALTER once both columns exist, so a
+// migrated DB never re-acquires the lock. Fresh/pre-v15 DBs still run the DDL.
+func applySpentBitmapMigration(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+	var existing int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM information_schema.columns
+		WHERE table_name = 'txs'
+		  AND column_name IN ('spent_bits', 'last_spend_height')`).Scan(&existing); err != nil {
+		return false, err
+	}
+
+	// Both columns already present: nothing to do, and — importantly — do NOT take
+	// the ACCESS EXCLUSIVE lock the ALTER would.
+	if existing == 2 {
+		return false, nil
+	}
+
+	if _, err := pool.Exec(ctx, txsSetterCMigrationDDL); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
 
 // dahDirtyParentsDDL creates the dirty-parents heal queue. Unspend inserts the
 // affected parent hashes here IN THE SAME TRANSACTION as the spend-row delete +

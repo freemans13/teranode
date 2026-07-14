@@ -178,11 +178,21 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	}
 
 	// If batcher is active, enqueue and wait.
+	//
+	// NOTE: the coinbase is NOT special-cased to a direct insert here. That was
+	// tried and reverted: with synchronous_commit=on (enforced, financial-data
+	// durability — never off), the batched path issues one multi-row UNNEST
+	// INSERT and so amortises a single WAL fsync across the whole batch, whereas
+	// a lone direct coinbase insert pays a full fsync by itself (~9ms vs ~4ms
+	// batched at steady state). Keeping the coinbase batched lets it share the
+	// fsync. Reducing move_forward further requires taking the coinbase write
+	// off the synchronous critical path, not routing it around the batcher.
 	if s.createBatcher != nil {
 		return s.createBatched(ctx, tx, blockHeight, options)
 	}
 
-	// No batcher — execute INSERT directly (single-item path).
+	// No batcher (single-item test path) or a coinbase bypassing the batcher —
+	// execute the INSERT directly.
 	return s.createDirect(ctx, tx, blockHeight, options)
 }
 
