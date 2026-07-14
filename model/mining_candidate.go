@@ -14,6 +14,16 @@ import (
 // p2pk is an optional parameter to specify if the coinbase output should be a pay to public key
 // instead of a pay to public key hash
 func (mc *MiningCandidate) CreateCoinbaseTxCandidate(tSettings *settings.Settings, p2pk ...bool) (*bt.Tx, error) {
+	// Explicit nil-guard preserving the documented (and tested) panic contract.
+	// Relying on the implicit nil-dereference stopped working when the Settings
+	// struct grew past 4KB: the field offset now lies beyond the runtime's nil
+	// guard page, so the dereference becomes an UNRECOVERABLE fault ("unexpected
+	// fault address") instead of a recoverable panic — killing the whole process
+	// rather than unwinding to the caller's recover.
+	if tSettings == nil {
+		panic("CreateCoinbaseTxCandidate: nil settings")
+	}
+
 	// Create a new coinbase transaction
 	arbitraryText := tSettings.Coinbase.ArbitraryText
 

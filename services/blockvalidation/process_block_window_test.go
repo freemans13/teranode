@@ -788,7 +788,7 @@ func TestProcessBlockWindow_BlockIDsAscendingWithHeight(t *testing.T) {
 	require.NoError(t, err)
 
 	spy := &assignIDOrderSpyClient{
-		ClientI:     realClient,
+		ClientI:      realClient,
 		delayForHash: make(map[chainhash.Hash]time.Duration),
 	}
 

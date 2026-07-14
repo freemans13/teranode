@@ -121,9 +121,9 @@ func newCommitBlockHarness(t *testing.T) (*BlockValidation, *model.Block, contex
 // AddBlock stores the block with MinedSet+SubtreesSet+ID, and SetBlockExists
 // records it. Uses the same in-memory harness as the quick-validate tests.
 func TestCommitBlock_AddsBlockAndSetsExists(t *testing.T) {
-	// Build u (*BlockValidation) + a valid below-checkpoint block with block.ID set
-	// and its subtree(s) in the subtree store, mirroring the setup in
-	// quick_validate_test.go's happy-path test. (Implementer: reuse that harness.)
+	// Build a *BlockValidation and a valid below-checkpoint block (no subtrees)
+	// with block.ID already assigned, mirroring the state processBlockSubtrees
+	// leaves before commitBlock runs.
 	u, block, ctx := newCommitBlockHarness(t)
 
 	require.NoError(t, u.commitBlock(ctx, block, "test-peer", "commitBlock"))
