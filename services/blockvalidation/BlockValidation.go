@@ -241,6 +241,10 @@ type BlockValidation struct {
 
 	// mmapDir, when non-empty, enables mmap-backed subtree loading.
 	mmapDir string
+
+	// spendRetryBackoff overrides the pause between quick-validate spend retry
+	// attempts; zero means spendRetryBackoffDefault. Settable in tests.
+	spendRetryBackoff time.Duration
 }
 
 // subtreeFromBytesWithMmap creates a subtree from bytes, using mmap if dir is non-empty.
@@ -1671,7 +1675,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// retries another peer. See issue #1031.
 			if errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxNotFound) {
 				ctxLogger.Warnf("[ValidateBlock][%s] transient missing-data during subtree validation, will retry: %s", block.Hash().String(), err)
-				return errors.NewBlockIncompleteError("[ValidateBlock][%s] transient missing-data during subtree validation: %s", block.Hash().String(), err)
+				// Transient LOCAL ordering gap, not the serving peer's fault: mark it so the
+				// catchup penalty path does not demote an honest (possibly sole-source) peer.
+				return errors.NewBlockIncompleteTransientError("[ValidateBlock][%s] transient missing-data during subtree validation: %s", block.Hash().String(), err)
 			}
 
 			return err
@@ -1873,7 +1879,10 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 						return errors.NewBlockInvalidError("[ValidateBlock][%s] block contains a floater (unconfirmed parent not in block): %s", block.Hash().String(), err)
 					}
 
-					return errors.NewBlockIncompleteError("[ValidateBlock][%s] block validation hit transient missing-data state: %s", block.Hash().String(), err)
+					// Transient LOCAL catchup-ordering gap (unabsorbed parent, issue 1031), not
+					// the serving peer's fault: mark it so the catchup penalty path does not
+					// demote an honest (possibly sole-source) ahead peer.
+					return errors.NewBlockIncompleteTransientError("[ValidateBlock][%s] block validation hit transient missing-data state: %s", block.Hash().String(), err)
 				}
 
 				if !opts.IsRevalidation {
