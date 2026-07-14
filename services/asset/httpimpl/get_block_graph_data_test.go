@@ -99,7 +99,7 @@ func TestAggregateDataPoints_UnsortedInput(t *testing.T) {
 		DataPoints: []*model.DataPoint{
 			{Timestamp: base + 3600, TxCount: 7}, // second bucket, given first
 			{Timestamp: base + 300, TxCount: 5},  // first bucket
-			{Timestamp: base, TxCount: 10},        // first bucket
+			{Timestamp: base, TxCount: 10},       // first bucket
 		},
 	}
 	out := aggregateDataPoints(in, bucket1h)
@@ -278,8 +278,8 @@ func TestGetBlockGraphData(t *testing.T) {
 		mockRepo.On("GetBlockGraphData", mock.Anything, mock.Anything).Return(&model.BlockDataPoints{
 			DataPoints: []*model.DataPoint{
 				{Timestamp: base, TxCount: 10},
-				{Timestamp: base + 1800, TxCount: 5},   // same 1h bucket as base
-				{Timestamp: base + 7200, TxCount: 20},  // 2h later, different bucket
+				{Timestamp: base + 1800, TxCount: 5},    // same 1h bucket as base
+				{Timestamp: base + 7200, TxCount: 20},   // 2h later, different bucket
 				{Timestamp: base + 86400*3, TxCount: 3}, // 3 days later, different bucket
 			},
 		}, nil)
