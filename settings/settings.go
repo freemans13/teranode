@@ -494,6 +494,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PostgresDAHReconcileSlice:               getInt("utxostore_postgresDAHReconcileSlice", 1000, alternativeContext...),
 			PostgresDAHReconcileIntervalMillis:      getInt("utxostore_postgresDAHReconcileIntervalMillis", 60000, alternativeContext...),
 			PostgresMaintenancePoolConns:            getInt("utxostore_postgresMaintenancePoolConns", 0, alternativeContext...),
+			PostgresTxsFillfactor:                   getInt("utxostore_postgresTxsFillfactor", 50, alternativeContext...),
 			PostgresCreateBatchMaxBytes:             getInt("utxostore_postgresCreateBatchMaxBytes", 536870912, alternativeContext...),
 			StoreBatcherTickerIntervalMillis:        getInt("utxostore_storeBatcherTickerIntervalMillis", 0, alternativeContext...),
 			GetBatcherTickerIntervalMillis:          getInt("utxostore_getBatcherTickerIntervalMillis", 0, alternativeContext...),

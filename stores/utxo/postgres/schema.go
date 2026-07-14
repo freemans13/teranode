@@ -33,7 +33,7 @@ import (
 //     (flat bytea + bitmaps + scalar counts). A single row lookup returns
 //     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
-	if err := createSchemaInternal(ctx, s.pool, s.maintPool, s.logger); err != nil {
+	if err := createSchemaInternalFF(ctx, s.pool, s.maintPool, s.logger, s.settings.UtxoStore.PostgresTxsFillfactor); err != nil {
 		return err
 	}
 
@@ -89,6 +89,18 @@ func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, _ bool) e
 // delete_at_height) and unconditionally backfills+drops the legacy
 // px_delete_at_height BRIN index on txs — pending_deletes is the only pruner path.
 func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pgxpool.Pool, logger ulogger.Logger) error {
+	return createSchemaInternalFF(ctx, pool, maintPool, logger, 0)
+}
+
+// createSchemaInternalFF is createSchemaInternal with an explicit txs
+// fillfactor (utxostore_postgresTxsFillfactor). Applied only at CREATE TABLE —
+// an existing deployment keeps the fillfactor its leaves were built with.
+// Out-of-range values (including the 0 the compat wrappers pass) fall back to
+// the HOT-safe default of 50; see the partitionSpec comment for the trade.
+func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *pgxpool.Pool, logger ulogger.Logger, txsFillfactor int) error {
+	if txsFillfactor < 10 || txsFillfactor > 100 {
+		txsFillfactor = 50
+	}
 	ddlStatements := []string{
 		txsDDL,
 		spendsDDL,
@@ -125,7 +137,7 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pg
 		// needs — an aggressive one starves the sweep) is enough. cost_limit=8000
 		// (4x default) + cost_delay=0 keep what vacuum is still needed un-throttled;
 		// freeze_max_age is raised so no anti-wraparound vacuum stalls reclaim mid-run.
-		{"txs", 50, "autovacuum_vacuum_scale_factor = 0.01, " + commonAV +
+		{"txs", txsFillfactor, "autovacuum_vacuum_scale_factor = 0.01, " + commonAV +
 			"autovacuum_vacuum_cost_limit = 8000, " +
 			"autovacuum_freeze_max_age = 500000000, " +
 			"autovacuum_vacuum_cost_delay = 0, " +

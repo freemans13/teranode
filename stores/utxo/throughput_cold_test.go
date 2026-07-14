@@ -399,6 +399,7 @@ type coldSnap struct {
 	blksRead, blksHit  int64
 	walRecords, walFPI int64
 	walBytes           int64
+	hotUpd, totUpd     int64            // txs partitions: HOT vs total updates (the fillfactor gate)
 	relRead            map[string]int64 // per-relation heap+idx+toast read blocks
 	takenAt            time.Time
 }
@@ -410,6 +411,10 @@ func takeColdSnap(ctx context.Context, pool *pgxpool.Pool) coldSnap {
 	// pg_stat_wal: present PG14+; ignore errors so the harness degrades gracefully.
 	_ = pool.QueryRow(ctx, `SELECT wal_records, wal_fpi, wal_bytes FROM pg_stat_wal`).
 		Scan(&s.walRecords, &s.walFPI, &s.walBytes)
+	// HOT-update ratio on the txs partitions: the gate for any fillfactor raise
+	// (a dense page that overflows on rewrite loses HOT and bloats indexes).
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(sum(n_tup_hot_upd),0), COALESCE(sum(n_tup_upd),0)
+		FROM pg_stat_user_tables WHERE relname LIKE 'txs_p%'`).Scan(&s.hotUpd, &s.totUpd)
 	rows, err := pool.Query(ctx, `SELECT relname,
 			COALESCE(heap_blks_read,0)+COALESCE(idx_blks_read,0)+COALESCE(toast_blks_read,0)+COALESCE(tidx_blks_read,0)
 		FROM pg_statio_user_tables`)
@@ -458,9 +463,13 @@ func coldWindow(t *testing.T, before, after coldSnap, ops int64) (hitPct float64
 	for _, e := range top {
 		topStr += fmt.Sprintf(" %s=%d", e.rel, e.n)
 	}
-	t.Logf("[cold-io] bufHit=%.2f%% blksRead=%d (%.1f/tx) walBytes=%d (%.0f/tx) walFPI=%d (%.2f/tx) topReadRels:%s",
+	hotPct := float64(0)
+	if d := after.totUpd - before.totUpd; d > 0 {
+		hotPct = 100 * float64(after.hotUpd-before.hotUpd) / float64(d)
+	}
+	t.Logf("[cold-io] bufHit=%.2f%% blksRead=%d (%.1f/tx) walBytes=%d (%.0f/tx) walFPI=%d (%.2f/tx) txsHotUpd=%.1f%% topReadRels:%s",
 		hitPct, read, perTx(read), after.walBytes-before.walBytes, perTx(after.walBytes-before.walBytes),
-		after.walFPI-before.walFPI, perTx(after.walFPI-before.walFPI), topStr)
+		after.walFPI-before.walFPI, perTx(after.walFPI-before.walFPI), hotPct, topStr)
 	return hitPct
 }
 
