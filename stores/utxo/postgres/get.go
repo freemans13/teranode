@@ -202,13 +202,25 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		outFrozensBitmap    []byte // nil = no output frozen
 	)
 
+	// Fetch raw_tx / conflicting_children only when a requested field consumes
+	// them. The CASE is evaluated lazily per row, so when the flag is false the
+	// column reference never runs and a TOASTed raw_tx is NOT detoasted — a
+	// metadata-only Get of a wide tx previously dragged the whole out-of-line
+	// blob (many TOAST chunk pages) off disk to throw it away.
+	needRawTx := contains(bins, fields.Tx) || contains(bins, fields.Inputs) ||
+		contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos) ||
+		contains(bins, fields.Outputs)
+	needConflictingChildren := contains(bins, fields.ConflictingChildren)
+
 	err := s.pool.QueryRow(ctx, `
 		SELECT version, lock_time, fee, size_in_bytes, coinbase,
-		       locked, conflicting, frozen, unmined_since, raw_tx,
-		       block_ids, block_heights, subtree_idxs, conflicting_children,
+		       locked, conflicting, frozen, unmined_since,
+		       CASE WHEN $2 THEN raw_tx END,
+		       block_ids, block_heights, subtree_idxs,
+		       CASE WHEN $3 THEN conflicting_children END,
 		       out_count, out_frozens
 		FROM txs WHERE hash = $1`,
-		hash[:],
+		hash[:], needRawTx, needConflictingChildren,
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,
 		&data.Locked, &data.Conflicting, &data.Frozen, &unminedSince, &rawTx,
 		&blockIDs, &blockHeights, &subtreeIdxs, &conflictingChildren,
@@ -224,10 +236,8 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		data.UnminedSince = uint32(*unminedSince)
 	}
 
-	// Deserialize raw_tx for Tx/Inputs/TxInpoints/Outputs/Utxos fields.
-	needRawTx := contains(bins, fields.Tx) || contains(bins, fields.Inputs) ||
-		contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos) ||
-		contains(bins, fields.Outputs)
+	// Deserialize raw_tx for Tx/Inputs/TxInpoints/Outputs/Utxos fields
+	// (needRawTx computed above; rawTx is NULL when it was not requested).
 	var tx *bt.Tx
 	if rawTx != nil && needRawTx {
 		tx, err = bt.NewTxFromBytes(rawTx)
@@ -571,25 +581,33 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	needInputs := contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)
 	needOutputs := contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos)
 
-	// Query 2: Deserialize raw_tx for inputs (raw_tx already fetched from txs in Query 1).
-	if needInputs {
+	// Deserialize raw_tx ONCE per row for both inputs and outputs (raw_tx was
+	// already fetched from txs in Query 1). This path previously parsed the
+	// same blob twice when both were requested — pure CPU waste on the hottest
+	// read path. Error behaviour is preserved per consumer: the outputs path
+	// fails hard on a corrupt raw_tx (as batchDecorateOutputs did), while the
+	// inputs-only path skips the row (as the old inline loop did).
+	if needInputs || needOutputs {
 		for _, row := range hashToTx {
-			if row.rawTx != nil {
-				parsedTx, parseErr := bt.NewTxFromBytes(row.rawTx)
-				if parseErr == nil {
-					if row.data.Tx == nil {
-						row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
-					}
-					row.data.Tx.Inputs = parsedTx.Inputs
-				}
+			if row.rawTx == nil {
+				continue
 			}
-		}
-	}
-
-	// Query 3: Bulk fetch outputs.
-	if needOutputs {
-		if err := s.batchDecorateOutputs(hashToTx); err != nil {
-			return err
+			parsedTx, parseErr := bt.NewTxFromBytes(row.rawTx)
+			if parseErr != nil {
+				if needOutputs {
+					return errors.NewProcessingError("batchDecorate: failed to deserialize raw_tx for %s", row.hash, parseErr)
+				}
+				continue
+			}
+			if row.data.Tx == nil {
+				row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
+			}
+			if needInputs {
+				row.data.Tx.Inputs = parsedTx.Inputs
+			}
+			if needOutputs {
+				row.data.Tx.Outputs = parsedTx.Outputs
+			}
 		}
 	}
 
@@ -629,27 +647,6 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		}
 	}
 
-	return nil
-}
-
-// batchDecorateOutputs reconstructs outputs from raw_tx already fetched from
-// txs (in Query 1 of batchDecorateChunk). locking_script and satoshis are
-// present in raw_tx via bt.NewTxFromBytes; nil/zero-byte locking scripts are
-// legal (e.g. testnet anyone-can-spend outputs) and are preserved as-is.
-func (s *Store) batchDecorateOutputs(hashToTx map[chainhash.Hash]*txRow) error {
-	for _, row := range hashToTx {
-		if row.rawTx == nil {
-			continue
-		}
-		parsed, err := bt.NewTxFromBytes(row.rawTx)
-		if err != nil {
-			return errors.NewProcessingError("batchDecorateOutputs: failed to deserialize raw_tx for %s", row.hash, err)
-		}
-		if row.data.Tx == nil {
-			row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
-		}
-		row.data.Tx.Outputs = parsed.Outputs
-	}
 	return nil
 }
 
