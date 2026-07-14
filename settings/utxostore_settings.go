@@ -94,6 +94,15 @@ type UtxoStoreSettings struct {
 	// write pool so background reclaim is never starved by the validator batchers
 	// under load. 0 disables (reclaim shares the main pool — legacy behaviour).
 	PostgresMaintenancePoolConns int `key:"utxostore_postgresMaintenancePoolConns" desc:"Dedicated maintenance pool size for DAH sweep + pruner deletes (0=share main pool)" default:"0" category:"UtxoStore" usage:"16 recommended; isolates reclaim conns from the write pool" type:"int"`
+	// Fillfactor for the txs leaf partitions (applied at CREATE TABLE; existing
+	// deployments keep their built value — this only affects fresh schemas).
+	// 50 (default) reserves half of every page for the row's later in-place
+	// rewrites (unlock, mine-stamp, sweep-fold) so they stay HOT; higher values
+	// pack more rows per page (better cold-read density: ~29% fewer heap pages
+	// at 70) at the risk of rewrites overflowing the page and losing HOT. Only
+	// raise with the HOT-rate gate watched (n_tup_hot_upd/n_tup_upd >= 75%
+	// during sustained load; revert on breach).
+	PostgresTxsFillfactor int `key:"utxostore_postgresTxsFillfactor" desc:"fillfactor for txs leaf partitions (fresh schemas only)" default:"50" category:"UtxoStore" usage:"50=HOT-safe default; 60-70 = denser pages for cold reads, gate on HOT rate" type:"int"`
 	// Max estimated wire bytes per bulk-create INSERT (PostgreSQL store only). The
 	// pgx driver rejects any single wire message at or above maxMessageBodyLen
 	// (~1 GiB) with "message body too large", so a block whose combined raw_tx

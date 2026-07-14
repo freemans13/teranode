@@ -131,6 +131,16 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 	// this cache-resident box so stamping keeps pace with a ~100K/s create rate.
 	tSettings.UtxoStore.PostgresMaintenancePoolConns = 64
 	tSettings.UtxoStore.PostgresDAHSweepConcurrency = 8
+	// Bench A/B knobs (warm/cold benches tune these via env, no code changes):
+	// TXS_FILLFACTOR overrides the txs leaf fillfactor on the fresh schema
+	// (50 = shipped default; 60/70 = denser pages, watch the HOT rate);
+	// DECORATE_CONC overrides decorate chunk-query parallelism (default 4).
+	if ff := envInt("TXS_FILLFACTOR", 0); ff > 0 {
+		tSettings.UtxoStore.PostgresTxsFillfactor = ff
+	}
+	if dc := envInt("DECORATE_CONC", 0); dc > 0 {
+		tSettings.UtxoStore.BatchPreviousOutputsDecorateConcurrency = dc
+	}
 	// Pruning always routes through the pending_deletes side-table (the only path);
 	// the txs delete_at_height BRIN is always backfilled and dropped.
 
@@ -554,6 +564,13 @@ func TestThroughput_PruneDrainCapacity(t *testing.T) {
 	}
 	defer pool.Close()
 
+	// This test measures ISOLATED reclaim capacity, so pause the background DAH
+	// sweep cursor (started by Store.Start since the sweep-lifecycle change):
+	// left running it (a) contaminates the isolated measurement and (b) its
+	// band folds deadlock (40P01, reproducible) against the bulk backlog-stamp
+	// UPDATE below. The proc checks dah_sweep_control.enabled per band.
+	_, _ = pool.Exec(ctx, `UPDATE dah_sweep_control SET enabled = false WHERE id = 1`)
+
 	// --- Populate: build chains (create+spend) at startHeight, timing creates. ---
 	parents := make([]*bt.Tx, nw)
 	for i := 0; i < nw; i++ {
@@ -631,6 +648,16 @@ func TestThroughput_PruneDrainCapacity(t *testing.T) {
 		WHERE block_ids IS NOT NULL
 		  AND EXISTS (SELECT 1 FROM spends s WHERE s.prev_tx_hash = t.hash)`); sErr != nil {
 		t.Fatalf("stamp backlog: %v", sErr)
+	}
+	// Mirror what every real stamp site does: feed pending_deletes, the pruner's
+	// ONLY enumeration path. Previously this test leaned on Prune()'s inline
+	// catch-up sweep to do the feeding, but that inline sweep is skipped now that
+	// the background cursor exists (sweep-lifecycle change) — and the cursor is
+	// paused above for isolation — so without this the drain deletes nothing.
+	if _, sErr := pool.Exec(ctx, `INSERT INTO pending_deletes (hash, delete_at_height)
+		SELECT hash, delete_at_height FROM txs WHERE delete_at_height IS NOT NULL
+		ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height`); sErr != nil {
+		t.Fatalf("feed pending_deletes: %v", sErr)
 	}
 	var eligible int64
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM txs WHERE delete_at_height IS NOT NULL AND delete_at_height <= $1`, int64(pruneHeight)).Scan(&eligible)

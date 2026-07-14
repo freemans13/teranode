@@ -33,7 +33,7 @@ import (
 //     (flat bytea + bitmaps + scalar counts). A single row lookup returns
 //     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
-	if err := createSchemaInternal(ctx, s.pool, s.maintPool, s.logger); err != nil {
+	if err := createSchemaInternalFF(ctx, s.pool, s.maintPool, s.logger, s.settings.UtxoStore.PostgresTxsFillfactor); err != nil {
 		return err
 	}
 
@@ -89,6 +89,18 @@ func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, _ bool) e
 // delete_at_height) and unconditionally backfills+drops the legacy
 // px_delete_at_height BRIN index on txs — pending_deletes is the only pruner path.
 func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pgxpool.Pool, logger ulogger.Logger) error {
+	return createSchemaInternalFF(ctx, pool, maintPool, logger, 0)
+}
+
+// createSchemaInternalFF is createSchemaInternal with an explicit txs
+// fillfactor (utxostore_postgresTxsFillfactor). Applied only at CREATE TABLE —
+// an existing deployment keeps the fillfactor its leaves were built with.
+// Out-of-range values (including the 0 the compat wrappers pass) fall back to
+// the HOT-safe default of 50; see the partitionSpec comment for the trade.
+func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *pgxpool.Pool, logger ulogger.Logger, txsFillfactor int) error {
+	if txsFillfactor < 10 || txsFillfactor > 100 {
+		txsFillfactor = 50
+	}
 	ddlStatements := []string{
 		txsDDL,
 		spendsDDL,
@@ -125,7 +137,7 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pg
 		// needs — an aggressive one starves the sweep) is enough. cost_limit=8000
 		// (4x default) + cost_delay=0 keep what vacuum is still needed un-throttled;
 		// freeze_max_age is raised so no anti-wraparound vacuum stalls reclaim mid-run.
-		{"txs", 50, "autovacuum_vacuum_scale_factor = 0.01, " + commonAV +
+		{"txs", txsFillfactor, "autovacuum_vacuum_scale_factor = 0.01, " + commonAV +
 			"autovacuum_vacuum_cost_limit = 8000, " +
 			"autovacuum_freeze_max_age = 500000000, " +
 			"autovacuum_vacuum_cost_delay = 0, " +
@@ -164,17 +176,26 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pg
 	// 1024-height window rechecks ~1.9M rows / ~28k heap pages to keep ~280k (measured),
 	// which does not scale and pins the cold disk during the sweep.
 	//
-	// Composite btree (spent_at_height, prev_tx_hash): makes the candidate enumeration an
-	// INDEX-ONLY range scan (the CTE needs only prev_tx_hash for a height range) — it
-	// reads only the window's index leaves, no heap (measured on betfair: 22,728 buffers
-	// → ~520, zero heap fetches). The cursor's per-window cost becomes proportional to
-	// that window's spend rows, NOT to accumulated chain size, so it scales and stays at
-	// the warm edge. spends is INSERT-ONLY so a btree does NOT break HOT (HOT is an
-	// UPDATE concern); spent_at_height is MONOTONIC (block height) so inserts land on the
-	// right-most leaf (cheap, hot-page append) and deduplicate_items collapses the long
-	// runs of identical heights into posting lists (index ~0.77× the random-hash PK
-	// btree already paid per spend). Measured spend-INSERT cost: ~+18%; create/mine path:
-	// 0% (it does not write spends).
+	// Composite btree (spent_at_height, prev_tx_hash) INCLUDE (prev_output_idx): makes
+	// the candidate enumeration an INDEX-ONLY range scan — it reads only the window's
+	// index leaves, no heap. The v15 band CTE selects prev_output_idx (for the
+	// spent-bitmap fold), so the column MUST live in the index: without it the scan
+	// silently degrades to a plain index scan with one heap visit per band row
+	// (EXPLAIN-verified on a 200K-row band: 201,858 buffers vs 1,881 index-only —
+	// the earlier two-column index had the index-only property measured on betfair
+	// as 22,728 buffers → ~520, and the v15 select list regressed it). The cursor's
+	// per-window cost stays proportional to that window's spend rows, NOT to
+	// accumulated chain size. spends is INSERT-ONLY so a btree does NOT break HOT
+	// (HOT is an UPDATE concern); spent_at_height is MONOTONIC (block height) so
+	// inserts land on the right-most leaf (cheap, hot-page append). NOTE: INCLUDE
+	// forfeits deduplicate_items (postgres never deduplicates indexes with INCLUDE
+	// columns), so this index is somewhat larger than the two-column form — the
+	// price of restoring zero heap fetches. Measured spend-INSERT cost of the
+	// two-column form was ~+18%; create/mine path: 0% (it does not write spends).
+	//
+	// LIVE-MIGRATION NOTE: on an existing large deployment the DROP+CREATE below
+	// blocks writes for the build duration; pre-create the new index with CREATE
+	// INDEX CONCURRENTLY (per leaf, then drop the old one) before deploying.
 	//
 	// There is deliberately NO index on txs.mined_at_height (uncorrelated; a btree there
 	// would break HOT on the hot mine UPDATE). The only txs that become fully-spent AT
@@ -188,7 +209,10 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pg
 		// DAH-sweep candidate enumeration an index-only scan and a height-only btree was
 		// bench-confirmed to cause bimodal sweep collapse (V3, CV 38%).
 		idxStmts := []string{
-			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_h_hash_btree ON spends_p%02d USING btree (spent_at_height, prev_tx_hash) WITH (fillfactor = 90, deduplicate_items = on)`, i, i),
+			// Old two-column form: superseded by the INCLUDE form below (the v15
+			// band CTE needs prev_output_idx index-resident; see comment above).
+			fmt.Sprintf(`DROP INDEX IF EXISTS spends_p%02d_h_hash_btree`, i),
+			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_h_hash_oidx_btree ON spends_p%02d USING btree (spent_at_height, prev_tx_hash) INCLUDE (prev_output_idx) WITH (fillfactor = 90)`, i, i),
 		}
 		for _, ddl := range idxStmts {
 			if _, err := pool.Exec(ctx, ddl); err != nil {
@@ -382,6 +406,14 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pg
 
 	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).
 	_, _ = pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET COMPRESSION lz4`)
+
+	// Pin utxo_hashes to EXTERNAL (never compressed; out-of-line only when the
+	// row is wide). The spend path's O(1) sliced substr() detoast on wide
+	// parents currently works because compression happens to FAIL on random
+	// 32-byte hashes (postgres discards non-shrinking results) — nothing pins
+	// that. EXTERNAL makes the slice guarantee explicit and skips the futile
+	// create-time compression attempt on this column.
+	_, _ = pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN utxo_hashes SET STORAGE EXTERNAL`)
 
 	// NOTE: autovacuum tuning lives on the leaf partitions (see partitionSpec
 	// above), not here. A parent-level ALTER TABLE txs SET (autovacuum_*) is a

@@ -25,9 +25,12 @@ func TestDAHSchemaObjectsExist(t *testing.T) {
 		// The dead spends spent_at_height BRIN was dropped (commit ecdc43b4f): it only
 		// served the removed O(table) backstop, so there must be NO such index.
 		{"no spends spent_at_height brin", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_spent_at_height_brin')`},
-		// Composite btree drives the Index-Only candidate enumeration (scales with
-		// window spend-rows, not chain size); see schema.go.
-		{"composite btree spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_h_hash_btree'`},
+		// Composite btree (with INCLUDE (prev_output_idx)) drives the Index-Only
+		// candidate enumeration (scales with window spend-rows, not chain size);
+		// the old two-column form must be gone — the v15 band CTE selects
+		// prev_output_idx, which regressed it to a heap-visiting scan. See schema.go.
+		{"composite btree spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_h_hash_oidx_btree'`},
+		{"no old two-column spends btree", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_h_hash_btree')`},
 		// The spends-driven sweep no longer scans txs by mined_at_height, so there must
 		// be NO index on it (a btree would hurt the hot mine UPDATE's HOT ratio).
 		{"no txs mined_at_height index", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname LIKE 'txs_p00_mined_at_height%')`},

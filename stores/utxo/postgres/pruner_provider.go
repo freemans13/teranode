@@ -228,12 +228,14 @@ func (s *postgresPrunerService) deleteTombstoned(ctx context.Context, blockHeigh
 // scan while minimising round trips.
 const pruneDeleteWorkers = 8
 
-// pruneDeleteBatchSize bounds each cascade DELETE to one bounded leaf-index range
-// scan, and — because each batch is a separate statement — releases the maintenance
-// pool connection between batches so stamping and other maintenance work interleave.
-// A var (not const) so tests can shrink it to exercise multi-batch draining without
-// inserting hundreds of thousands of rows.
-var pruneDeleteBatchSize = 10000
+// pruneDeleteBatchSize bounds each cascade batch (one short transaction), which
+// releases the maintenance pool connection between batches so stamping and other
+// maintenance work interleave. Raised 10K -> 50K with the page-ordered cascade:
+// a bigger batch means more co-doomed spends rows per heap page in the bitmap
+// sweep, which is what makes each page visit pay (the clustering win grows with
+// batch size). A var (not const) so tests can shrink it to exercise multi-batch
+// draining without inserting hundreds of thousands of rows.
+var pruneDeleteBatchSize = 50000
 
 // deleteTombstonedPartition cascade-deletes the tombstoned txs of ONE partition.
 // It scans the concrete leaf (txs_pNN) for tombstoned hashes, then cascade-deletes
@@ -310,11 +312,42 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	// candidate scan stays proportional to the doomed set rather than to the live txs
 	// table. The cascade deletes spends and the pending_deletes rows, then the txs rows.
 	pdLeaf := fmt.Sprintf("pending_deletes_p%02d", partIdx)
+
+	// PAGE-ORDERED CASCADE (two statements, one transaction per batch).
+	//
+	// The old single-statement form fed the doomed hashes to the spends delete
+	// through a CTE join, which the planner can only execute as per-hash index
+	// probes: the heap is visited in HASH order — random pages, one ~60B row
+	// per cold 8KB fetch, K scattered fetches per K-output parent. But spends
+	// of co-doomed parents CLUSTER physically (the heap is append-ordered by
+	// spend time, and parents doomed together were fully spent together), so
+	// the same rows can be reached with far fewer page visits IF the plan
+	// sorts victim row-locations by physical page first — a Bitmap Index Scan
+	// → Bitmap Heap Scan. Postgres can only build one bitmap over ALL victims
+	// when the hashes arrive as a single = ANY(array) scan key, not a join;
+	// hence phase 1 SELECTs the batch into an array and phase 2 deletes by it.
+	// Measured ceiling for this change (del_spends removed outright): drain
+	// 694,580 -> 1,504,282 rows/s (2.17x) at the MOST favourable baseline
+	// (warm, 1-output chains); the gap widens with fan-out and cold pages.
+	//
+	// FOR UPDATE in phase 1 pins the batch's pending_deletes rows for the
+	// transaction, so a concurrent Unspend revival (which removes the pd row)
+	// serialises against this batch instead of racing the two phases — a
+	// strictly SMALLER window than the old single statement (whose READ
+	// COMMITTED re-check would delete a row revived mid-statement anyway; see
+	// the retention-margin contract above, which remains the real guarantee).
+	//
+	// SET LOCAL enable_indexscan/enable_seqscan = off pins the DELETE's plan:
+	// bitmap is the only access path left, so a planner cost blip can never
+	// silently regress this back to random per-hash hops (or a full seqscan of
+	// a multi-billion-row partition). Phase 1 keeps default settings — its
+	// LIMIT must stop the index scan early, which a bitmap plan cannot do.
+	doomedSQL := fmt.Sprintf(
+		`SELECT hash FROM %s WHERE delete_at_height <= $1 LIMIT $2 FOR UPDATE`, pdLeaf)
 	cascadeSQL := fmt.Sprintf(`
-		WITH doomed AS (SELECT hash FROM %[3]s WHERE delete_at_height <= $1 LIMIT $2),
-		del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash IN (SELECT hash FROM doomed) RETURNING 1),
-		del_pd     AS (DELETE FROM %[3]s WHERE hash IN (SELECT hash FROM doomed))
-		DELETE FROM %[1]s WHERE hash IN (SELECT hash FROM doomed)`, txsLeaf, spendsLeaf, pdLeaf)
+		WITH del_spends AS (DELETE FROM %[2]s WHERE prev_tx_hash = ANY($1::bytea[]) RETURNING 1),
+		del_pd     AS (DELETE FROM %[3]s WHERE hash = ANY($1::bytea[]))
+		DELETE FROM %[1]s WHERE hash = ANY($1::bytea[])`, txsLeaf, spendsLeaf, pdLeaf)
 
 	// Loop until a batch comes back short (fewer than pruneDeleteBatchSize rows) — that
 	// IS the drain signal: no more eligible tombstones remain in this partition. There is
@@ -336,22 +369,65 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		default:
 		}
 
-		// delete_at_height is INT4 — bind int32 so the doomed-scan predicate is
-		// a native int4 comparison on the pending_deletes btree-indexed column.
-		tag, err := s.store.maint().Exec(ctx, cascadeSQL, int32(blockHeight), int64(pruneDeleteBatchSize))
+		n, err := s.deleteTombstonedBatch(ctx, doomedSQL, cascadeSQL, blockHeight)
 		if err != nil {
 			return deleted, errors.NewStorageError("[pruner] cascade delete %s", txsLeaf, err)
 		}
-
-		// RowsAffected is the count of txs parent rows removed this batch, which
-		// equals the number of doomed hashes selected. A short batch means the
-		// partition is drained.
-		n := tag.RowsAffected()
 		deleted += n
+		// A short batch means the partition is drained.
 		if n < int64(pruneDeleteBatchSize) {
 			break
 		}
 	}
 
 	return deleted, nil
+}
+
+// deleteTombstonedBatch runs one page-ordered cascade batch in its own short
+// transaction: SELECT ... FOR UPDATE the doomed hashes, then one array-driven
+// DELETE statement whose plan is pinned to bitmap scans (see the comment at
+// the SQL construction). Returns the number of doomed hashes processed.
+func (s *postgresPrunerService) deleteTombstonedBatch(ctx context.Context, doomedSQL, cascadeSQL string, blockHeight uint32) (int64, error) {
+	pgxTx, err := s.store.maint().Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer pgxTx.Rollback(ctx) //nolint:errcheck
+
+	// delete_at_height is INT4 — bind int32 so the doomed-scan predicate is
+	// a native int4 comparison on the pending_deletes btree-indexed column.
+	rows, err := pgxTx.Query(ctx, doomedSQL, int32(blockHeight), int64(pruneDeleteBatchSize)) //nolint:gosec // height < 2^31 validated at entry
+	if err != nil {
+		return 0, err
+	}
+	hashes := make([][]byte, 0, pruneDeleteBatchSize)
+	for rows.Next() {
+		var h []byte
+		if scanErr := rows.Scan(&h); scanErr != nil {
+			rows.Close()
+			return 0, scanErr
+		}
+		hashes = append(hashes, h)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(hashes) == 0 {
+		return 0, pgxTx.Commit(ctx)
+	}
+
+	if _, err = pgxTx.Exec(ctx, `SET LOCAL enable_indexscan = off`); err != nil {
+		return 0, err
+	}
+	if _, err = pgxTx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		return 0, err
+	}
+	if _, err = pgxTx.Exec(ctx, cascadeSQL, hashes); err != nil {
+		return 0, err
+	}
+	if err = pgxTx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int64(len(hashes)), nil
 }

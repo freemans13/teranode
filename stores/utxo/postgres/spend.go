@@ -537,8 +537,9 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		utxoHashMatch   bool
 		coinbaseBlock   bool
 		spendableBlock  bool
-		slotExists      bool // true when the array subscript is in-bounds
-		outputSpendable bool // false for non-spendable outputs (e.g. OP_RETURN)
+		slotExists      bool   // true when the array subscript is in-bounds
+		outputSpendable bool   // false for non-spendable outputs (e.g. OP_RETURN)
+		existingSpend   []byte // conflicting row's spending_data (nil if none visible)
 	}
 	resultMap := make(map[int]*bulkResult, len(batch))
 	for rows.Next() {
@@ -546,7 +547,8 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		r := &bulkResult{}
 		if err := rows.Scan(&bIdx, &r.inserted,
 			&r.outputFrozen, &r.txFrozen, &r.txLocked, &r.txConflicting,
-			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock, &r.slotExists, &r.outputSpendable); err != nil {
+			&r.utxoHashMatch, &r.coinbaseBlock, &r.spendableBlock, &r.slotExists, &r.outputSpendable,
+			&r.existingSpend); err != nil {
 			rows.Close()
 			for _, item := range batch {
 				item.errCh <- errors.NewStorageError("[Spend] scan", err)
@@ -612,10 +614,24 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 			item.errCh <- errors.NewTxCoinbaseImmatureError("[Spend] coinbase utxo not ready for %s:%d", spend.TxID, spend.Vout)
 		} else if r.spendableBlock {
 			item.errCh <- errors.NewTxLockedError("[Spend] utxo %s:%d is not spendable yet", spend.TxID, spend.Vout)
+		} else if r.existingSpend != nil {
+			// All validation passed and the conflicting spends row is visible in
+			// the bulk statement's snapshot: classify idempotent-vs-double-spend
+			// right here, saving diagnoseSpendFailure's second full-parent fetch.
+			// This is the dominant duplicate path under IBD replay.
+			if bytes.Equal(r.existingSpend, item.spend.SpendingData.Bytes()) {
+				item.errCh <- nil // idempotent retry — same spender
+			} else if existingSD, parseErr := spendpkg.NewSpendingDataFromBytes(r.existingSpend); parseErr != nil {
+				item.errCh <- errors.NewProcessingError("failed to parse existing spending data", parseErr)
+			} else {
+				item.errCh <- errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSD)
+			}
 		} else {
-			// All validation passed → must be an already-spent row. Look up the
-			// existing spending_data to differentiate idempotent retry vs
-			// double-spend with a different spender.
+			// All validation passed, INSERT skipped, yet no existing row is
+			// visible to the bulk statement's snapshot: a concurrent writer or a
+			// concurrent Unspend. Only the fresh-snapshot diagnosis can classify
+			// this safely — never assume success here, or a concurrently
+			// committed double-spend would be reported as spent-OK.
 			diagErr := s.diagnoseSpendFailure(ctx, item.spend, item.spend.SpendingData.Bytes(),
 				item.blockHeight, item.ignoreLocked, item.ignoreConflicting, item.skipUTXOHashCheck)
 			if diagErr == nil {
@@ -664,7 +680,12 @@ WITH items AS (
 validated AS (
     SELECT i.batch_idx, i.prev_tx_hash, i.prev_idx, i.spending_data, i.expected_utxo_hash,
            i.block_height, i.ign_locked, i.ign_conflicting, i.skip_hash,
-           CASE WHEN i.prev_idx::int < t.out_count THEN substr(t.utxo_hashes, i.prev_idx::int * 32 + 1, 32) END AS utxo_hash,
+           -- utxo_hash is computed ONLY when the row actually compares it: with
+           -- skip_hash the 32-byte slice (and its detoast on wide parents) is
+           -- dead work on every below-checkpoint spend. Bounds classification
+           -- moved to slot_in_bounds so this can be NULL without ambiguity.
+           CASE WHEN NOT i.skip_hash AND i.prev_idx::int < t.out_count THEN substr(t.utxo_hashes, i.prev_idx::int * 32 + 1, 32) END AS utxo_hash,
+           (i.prev_idx::int < t.out_count AND t.utxo_hashes IS NOT NULL) AS slot_in_bounds,
            CASE WHEN i.prev_idx::int < t.out_count AND t.out_frozens IS NOT NULL THEN get_bit(t.out_frozens, i.prev_idx::int) = 1 ELSE false END AS out_frozen,
            -- Spendable bit: a non-spendable output (OP_RETURN) carries a utxo_hash but
            -- must not be spendable. See spendValidationSQL for the rationale.
@@ -694,8 +715,20 @@ SELECT v.batch_idx, (i.prev_tx_hash IS NOT NULL) AS inserted,
        (v.skip_hash OR (v.utxo_hash IS NOT NULL AND v.utxo_hash = v.expected_utxo_hash)) AS utxo_match,
        (v.coinbase_spending_height > 0 AND v.coinbase_spending_height > v.block_height) AS coinbase_block,
        (COALESCE(v.spendable_in,0) > 0 AND v.block_height < COALESCE(v.spendable_in,0)) AS spendable_block,
-       (v.utxo_hash IS NOT NULL) AS slot_exists,
-       v.out_spendable AS output_spendable
+       v.slot_in_bounds AS slot_exists,
+       v.out_spendable AS output_spendable,
+       -- For rows the INSERT skipped, fetch the existing spender IN this
+       -- statement (CASE is lazy: the subquery runs only for skipped rows, and
+       -- its index probe hits the leaf the conflict check just warmed). This
+       -- classifies the dominant already-spent case (idempotent IBD-replay
+       -- retry vs double-spend) without diagnoseSpendFailure's second
+       -- full-parent fetch. NULL when the conflicting row is not visible to
+       -- this statement's snapshot (concurrent writer/Unspend) — the dispatcher
+       -- MUST fall back to the fresh-snapshot diagnosis then, never assume.
+       CASE WHEN i.prev_tx_hash IS NULL THEN
+            (SELECT s2.spending_data FROM spends s2
+              WHERE s2.prev_tx_hash = v.prev_tx_hash AND s2.prev_output_idx = v.prev_idx)
+       END AS existing_spending_data
 FROM validated v LEFT JOIN inserted i ON i.prev_tx_hash = v.prev_tx_hash AND i.prev_output_idx = v.prev_idx
 ORDER BY v.batch_idx
 `
