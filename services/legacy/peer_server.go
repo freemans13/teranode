@@ -1194,14 +1194,19 @@ func preAdmitTimedOut(preAdmitCtx context.Context) bool {
 	return errors.Is(preAdmitCtx.Err(), context.DeadlineExceeded)
 }
 
-// shouldDisconnectOnBlockErr reports whether a block-processing error should
-// rotate the sync peer. Block validation failures disconnect the peer; local
-// infrastructure errors (database, Kafka, etc.) must not, since they would only
-// cause unnecessary sync-peer churn.
+// shouldDisconnectOnBlockErr reports whether a failed block justifies
+// disconnecting the delivering peer. It is now an ALLOWLIST: disconnect ONLY
+// when the error proves the peer sent invalid bytes (a consensus-invalid
+// block). Every other failure — the block-assembly maturity gate timing out,
+// storage/service hiccups, transient local errors — is a LOCAL condition that
+// the peer is not responsible for; the block is requeued for re-fetch on the
+// drain goroutine and the peer is kept. The classification is single-sourced in
+// netsync.BlockProcessingErrorIsPeerFault (see its comment for why: the old
+// blocklist form — disconnect on everything except Service/Storage errors —
+// executed the sync peer on a false block-assembly gate timeout and froze
+// mainnet IBD to zero peers on 2026-07-15).
 func shouldDisconnectOnBlockErr(err error) bool {
-	return err != nil &&
-		!errors.Is(err, errors.ErrServiceError) &&
-		!errors.Is(err, errors.ErrStorageError)
+	return netsync.BlockProcessingErrorIsPeerFault(err)
 }
 
 // disconnectMisbehaving evicts a peer's whole association for misbehaviour. It

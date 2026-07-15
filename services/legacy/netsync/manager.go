@@ -159,6 +159,47 @@ var zeroHash chainhash.Hash
 // unambiguous there.
 var ErrDuplicateBlockInFlight = errors.NewServiceError("duplicate block already in flight")
 
+// BlockProcessingErrorIsPeerFault reports whether a block-processing error
+// proves the DELIVERING PEER sent invalid bytes — the ONLY class of failure
+// that justifies disconnecting it. Consensus-invalid blocks (bad proof-of-work,
+// bad merkle root, the CVE-2012-2459 duplicate-transaction mutation, height /
+// checkpoint mismatch) all surface as errors.ErrBlockInvalid, so that single
+// check is the allowlist.
+//
+// Everything else — the block-assembly maturity gate timing out
+// (waitForBlockAssemblyCachePoll, a ProcessingError), storage/service hiccups,
+// transient parent-not-yet-committed retries — is a LOCAL condition. The peer
+// did nothing wrong, so the correct response is to KEEP the peer and re-fetch
+// the block (see requeueFailedBlock), never to execute the peer. Blaming the
+// peer for local backpressure is exactly the failure that froze mainnet IBD for
+// ~3.5h on 2026-07-15: a false gate timeout disconnected the sync peer, rotation
+// found no replacement, and the node starved to zero peers.
+//
+// This predicate is the SINGLE SOURCE for that classification, shared by the
+// disconnect decision (legacy.shouldDisconnectOnBlockErr) and the requeue
+// decision (the block-handler drain loop), so the two can never drift.
+func BlockProcessingErrorIsPeerFault(err error) bool {
+	return err != nil && errors.Is(err, errors.ErrBlockInvalid)
+}
+
+// requeueFailedBlock puts a block hash back into the re-fetch set after a
+// TOLERATED (non-peer-fault) processing failure, so the download pipeline
+// re-requests it instead of silently dropping it. handleBlockPreamble removes
+// an arriving block from ALL in-flight tracking (requestedBlocks, assignedTo,
+// assignedAt, refetchBlocks) BEFORE processing, and the monotonic startHeader
+// cursor never rewinds, so without this requeue a tolerated failure leaves the
+// block permanently un-fetched — a silent wedge of the strictly-ascending
+// commit pipeline. Safe from any goroutine: refetchBlocks is guarded by
+// assignedMu, and drainRefetchBlocks consumes the set on the next fetch pass.
+func (sm *SyncManager) requeueFailedBlock(blockHash chainhash.Hash) {
+	sm.assignedMu.Lock()
+	defer sm.assignedMu.Unlock()
+	if sm.refetchBlocks == nil {
+		sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+	}
+	sm.refetchBlocks[blockHash] = struct{}{}
+}
+
 // newPeerMsg signifies a newly connected peer to the block handler.
 type newPeerMsg struct {
 	peer  *peerpkg.Peer
@@ -4516,13 +4557,21 @@ func (sm *SyncManager) blockHandler() {
 
 				if !windowEnabled {
 					err := sm.handleBlockMsg(msg)
-					sm.blockBacklog.Add(-1)
 
 					// A completion advances the backlog: stamp it so the stall check
 					// treats the pipeline as live for another window (see
 					// noteBacklogProgress / localReadBackpressured).
 					sm.blockBacklog.Add(-1)
 					sm.noteBacklogProgress()
+
+					// Tolerated (non-peer-fault) failure: re-fetch the block instead
+					// of dropping it. handleBlockPreamble already cleared it from all
+					// in-flight tracking on arrival, so without this it is lost and the
+					// ascending commit pipeline wedges. A peer-fault (consensus-invalid)
+					// block is NOT requeued — the peer is disconnected in OnBlock.
+					if err != nil && !BlockProcessingErrorIsPeerFault(err) {
+						sm.requeueFailedBlock(msg.blockHash)
+					}
 
 					if msg.reply != nil {
 						msg.reply <- err
@@ -4538,6 +4587,13 @@ func (sm *SyncManager) blockHandler() {
 					// handleBlockMsgWithWindow does not send the reply on the
 					// direct path — we send the outcome here.
 					sm.blockBacklog.Add(-1)
+
+					// Requeue a tolerated direct-path failure (see the non-window
+					// branch above for why); peer-fault blocks are left for OnBlock
+					// to disconnect on.
+					if err != nil && !BlockProcessingErrorIsPeerFault(err) {
+						sm.requeueFailedBlock(msg.blockHash)
+					}
 
 					if msg.reply != nil {
 						msg.reply <- err

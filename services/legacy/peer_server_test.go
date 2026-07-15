@@ -1159,7 +1159,11 @@ func TestMergeCheckpointsFunc(t *testing.T) {
 
 // TestShouldDisconnectOnBlockErr verifies the block-processing error policy that
 // both the synchronous and the async-prefetch ingestion paths in OnBlock share:
-// validation failures rotate the sync peer, local infrastructure errors do not.
+// ONLY a consensus-invalid block rotates the sync peer; every local condition
+// (infrastructure errors AND transient processing errors like the block-assembly
+// maturity gate timing out) keeps the peer. The full wrapped-error taxonomy is
+// pinned in netsync.TestBlockProcessingErrorIsPeerFault_Taxonomy; this test
+// guards the OnBlock-layer entry point.
 func TestShouldDisconnectOnBlockErr(t *testing.T) {
 	// No error: nothing to disconnect for.
 	require.False(t, shouldDisconnectOnBlockErr(nil))
@@ -1168,8 +1172,16 @@ func TestShouldDisconnectOnBlockErr(t *testing.T) {
 	require.False(t, shouldDisconnectOnBlockErr(errors.NewServiceError("grpc down")))
 	require.False(t, shouldDisconnectOnBlockErr(errors.NewStorageError("db unavailable")))
 
-	// A genuine block validation failure rotates the peer.
+	// The 2026-07-15 mainnet freeze: a local block-assembly gate timeout is a
+	// ProcessingError. Under the old blocklist this returned true and executed
+	// the sync peer; under the allowlist it must NOT disconnect.
+	require.False(t, shouldDisconnectOnBlockErr(errors.NewProcessingError(
+		"[waitForBlockAssemblyCachePoll] block assembly is behind, gave up after 30s")))
+
+	// A genuine block validation failure rotates the peer — even wrapped.
 	require.True(t, shouldDisconnectOnBlockErr(errors.NewBlockInvalidError("bad merkle root")))
+	require.True(t, shouldDisconnectOnBlockErr(errors.NewProcessingError(
+		"prepareSubtrees", errors.NewBlockInvalidError("duplicate tx CVE-2012-2459"))))
 }
 
 // TestCheckBannedBounded verifies the bounded ban-check round-trip extracted from
