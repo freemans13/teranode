@@ -4634,3 +4634,38 @@ func TestNewSubtreeChanContextCancellation(t *testing.T) {
 		})
 	})
 }
+
+func TestRemoveCoinbaseUtxos_NilCoinbase_ReturnsErrorNotPanic(t *testing.T) {
+	initPrometheusMetrics()
+	ctx := context.Background()
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, test.CreateBaseTestSettings(t), utxoStoreURL)
+	require.NoError(t, err)
+
+	require.NoError(t, utxoStore.SetBlockHeight(4))
+
+	blobStore := blob_memory.New()
+	settings := test.CreateBaseTestSettings(t)
+
+	newSubtreeChan := make(chan NewSubtreeRequest, 10)
+	go func() {
+		for req := range newSubtreeChan {
+			if req.ErrChan != nil {
+				req.ErrChan <- nil
+			}
+		}
+	}()
+	defer close(newSubtreeChan)
+
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, nil, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+	stp.Start(ctx)
+
+	// Test with nil CoinbaseTx
+	err = stp.removeCoinbaseUtxos(ctx, &model.Block{Header: &model.BlockHeader{}, CoinbaseTx: nil})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "coinbase")
+}

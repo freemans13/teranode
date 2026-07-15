@@ -4054,11 +4054,14 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 // Parameters:
 //   - ctx: Context for cancellation
 //   - block: Block containing the coinbase transaction
-//   - subtreeHash: Hash of the subtree containing the coinbase
 //
 // Returns:
 //   - error: Any error encountered during removal
 func (stp *SubtreeProcessor) removeCoinbaseUtxos(ctx context.Context, block *model.Block) error {
+	if block == nil || block.CoinbaseTx == nil {
+		return errors.NewProcessingError("[SubtreeProcessor][removeCoinbaseUtxos] block or coinbase transaction is nil")
+	}
+
 	// get all child spends of the coinbase, this will lock them in the utxo store
 	// so they cannot be spent while we are processing the reorg
 	childSpendHashes, err := utxostore.GetAndLockChildren(ctx, stp.utxoStore, *block.CoinbaseTx.TxIDChainHash())
