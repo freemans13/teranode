@@ -1,13 +1,12 @@
 package netsync
 
-// Task 8 — CVE-2012-2459 duplicate-transaction dedup floor on the INLINE
-// (non-unified) below-checkpoint path.
+// CVE-2012-2459 duplicate-transaction dedup floor on the INLINE (non-unified)
+// below-checkpoint path.
 //
 // Background: CheckSubtreeSlicesForDuplicateTxs is the explicit dedup guard for
 // any path that holds the block's subtree slices in memory without running the
 // full Block.Valid duplicate-tx scan. Before this task it ran only inside the
-// `if preparedSubtreeSlices != nil` block in HandleBlockDirect (and in
-// prepareBlockForWindow) — and prepareSubtrees only returns non-nil
+// `if preparedSubtreeSlices != nil` block in HandleBlockDirect  — and prepareSubtrees only returns non-nil
 // preparedSubtreeSlices on the UNIFIED route (see the `if sm.legacyUnified(...)`
 // guard at the bottom of prepareSubtrees). On the inline route the returned
 // slices are nil, so HandleBlockDirect's guard is skipped and the CVE check
@@ -77,12 +76,12 @@ func makeDuplicateTxidBlock(height int32) *bsvutil.Block {
 	return block
 }
 
-// TestLegacyInline_DuplicateTxid_Rejected proves that with the fail-closed flag
-// ON, a below-checkpoint block routed through the INLINE path (prepareSubtrees,
-// LegacyUnifiedBelowCheckpoint=false) that carries a duplicated txid is rejected
-// with a BlockInvalidError before any UTXO commit. Before Task 8 this block
-// would slip past the dedup guard (which only fired on the unified route) and
-// reach ValidateTransactionsLegacyMode.
+// TestLegacyInline_DuplicateTxid_Rejected proves that a below-checkpoint block
+// routed through the INLINE path (prepareSubtrees,
+// LegacyUnifiedBelowCheckpoint=false) carrying a duplicated txid is rejected
+// with a BlockInvalidError before any UTXO commit. Previously this block would
+// slip past the dedup guard (which only fired on the unified route) and reach
+// ValidateTransactionsLegacyMode.
 func TestLegacyInline_DuplicateTxid_Rejected(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -93,7 +92,6 @@ func TestLegacyInline_DuplicateTxid_Rejected(t *testing.T) {
 	const height = int32(500)
 
 	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyBelowCheckpointFailClosed = true
 	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = false
 
 	logger := ulogger.TestLogger{}
@@ -118,8 +116,8 @@ func TestLegacyInline_DuplicateTxid_Rejected(t *testing.T) {
 		ctx:              ctx,
 	}
 
-	// Sanity: the inline fail-closed gate engages for this block.
-	require.True(t, sm.legacyFailClosed(uint32(height)), "inline fail-closed path must engage for the test block")
+	// Sanity: the below-checkpoint inline gate engages for this block.
+	require.True(t, sm.legacyOutpointOnly(uint32(height)), "below-checkpoint outpoint-only gate must engage for the test block")
 	require.False(t, sm.legacyUnified(uint32(height)), "test must exercise the inline (non-unified) route")
 
 	block := makeDuplicateTxidBlock(height)
