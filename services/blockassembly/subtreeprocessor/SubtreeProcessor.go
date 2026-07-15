@@ -114,6 +114,9 @@ type reorgBlocksRequest struct {
 	// fast-path can skip the GetBlockHeader gRPC call. Nil means fall back to gRPC per block.
 	moveForwardMetas []*model.BlockHeaderMeta
 
+	// moveForwardHeights drives ONLY the per-block catch-up height signal; see Reorg.
+	moveForwardHeights []uint32
+
 	// errChan receives any error encountered during reorganization
 	errChan chan error
 }
@@ -271,6 +274,17 @@ type SubtreeProcessor struct {
 
 	// currentBlockHeader stores the current block header being processed (atomic for thread-safe access)
 	currentBlockHeader atomic.Pointer[model.BlockHeader]
+
+	// catchupHeight publishes how far a multi-block catch-up (reorgBlocks with no
+	// move-back) has advanced, updated per block the instant its moveForwardBlock
+	// completes — i.e. once its coinbase UTXO exists, so the value is always a
+	// true LOWER BOUND on the height block assembly has genuinely processed.
+	// BlockAssembler.setBestBlockHeader resets it to 0 once the batch commits, so
+	// it is non-zero only DURING an active catch-up batch. It exists so the
+	// block-assembly height the legacy sync gate polls advances per block instead
+	// of jumping once per batch — a batch-frozen height read ~900 blocks stale and
+	// caused a false maturity-gate timeout that froze mainnet IBD on 2026-07-15.
+	catchupHeight atomic.Uint32
 
 	// txCount tracks the total number of transactions processed
 	txCount atomic.Uint64
@@ -799,7 +813,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						stp.setCurrentRunningState(StateReorg)
 						logger.Infof("[SubtreeProcessor] reorgReq subtree processor: %d, %d", len(reorgReq.moveBackBlocks), len(reorgReq.moveForwardBlocks))
 
-						reorgErr := stp.reorgBlocks(processorCtx, reorgReq.moveBackBlocks, reorgReq.moveForwardBlocks, reorgReq.moveForwardMetas)
+						reorgErr := stp.reorgBlocks(processorCtx, reorgReq.moveBackBlocks, reorgReq.moveForwardBlocks, reorgReq.moveForwardMetas, reorgReq.moveForwardHeights)
 
 						logger.Infof("[SubtreeProcessor] reorgReq subtree processor DONE: %d, %d", len(reorgReq.moveBackBlocks), len(reorgReq.moveForwardBlocks))
 						return reorgErr
@@ -1625,6 +1639,21 @@ func (stp *SubtreeProcessor) GetCurrentBlockHeader() *model.BlockHeader {
 //   - blockHeader: New block header to set
 func (stp *SubtreeProcessor) SetCurrentBlockHeader(blockHeader *model.BlockHeader) {
 	stp.currentBlockHeader.Store(blockHeader)
+}
+
+// CatchupHeight returns the height the in-progress catch-up has reached (0 when
+// no catch-up is active). See the catchupHeight field: it is a true lower bound
+// on block assembly's processed height and is consumed only as a freshness hint
+// for the legacy sync maturity gate. Safe for concurrent access.
+func (stp *SubtreeProcessor) CatchupHeight() uint32 {
+	return stp.catchupHeight.Load()
+}
+
+// ResetCatchupHeight clears the catch-up progress hint, called once a catch-up
+// batch commits so the authoritative committed height takes over. Safe for
+// concurrent access.
+func (stp *SubtreeProcessor) ResetCatchupHeight() {
+	stp.catchupHeight.Store(0)
 }
 
 // GetCurrentSubtree returns the subtree currently being built.
@@ -3139,18 +3168,22 @@ func (stp *SubtreeProcessor) MoveForwardBlock(block *model.Block, blockMeta *mod
 //   - moveForwardMetas: Optional pre-fetched BlockHeaderMeta for each moveForwardBlock.
 //     When non-nil, reorgBlocks passes metas[idx] into moveForwardBlock so the IBD
 //     fast-path can skip the GetBlockHeader gRPC call. Nil falls back to gRPC per block.
+//   - moveForwardHeights: Optional per-block heights driving ONLY the per-block
+//     catch-up height signal (CatchupHeight); independent of moveForwardMetas and
+//     never fed to moveForwardBlock. Nil disables the signal (height unchanged).
 //
 // Returns:
 //   - error: Any error encountered during reorganization
-func (stp *SubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta) error {
+func (stp *SubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta, moveForwardHeights []uint32) error {
 	ctx := stp.processorContext()
 
 	errChan := make(chan error, 1)
 	req := reorgBlocksRequest{
-		moveBackBlocks:    moveBackBlocks,
-		moveForwardBlocks: moveForwardBlocks,
-		moveForwardMetas:  moveForwardMetas,
-		errChan:           errChan,
+		moveBackBlocks:     moveBackBlocks,
+		moveForwardBlocks:  moveForwardBlocks,
+		moveForwardMetas:   moveForwardMetas,
+		moveForwardHeights: moveForwardHeights,
+		errChan:            errChan,
 	}
 
 	select {
@@ -3202,7 +3235,7 @@ func (stp *SubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlo
 //
 // Returns:
 //   - error: Any error encountered during reorg (triggers fallback to reset())
-func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta) (err error) {
+func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta, moveForwardHeights []uint32) (err error) {
 	// reorgBlocks captures originalCurrentTxMap once and expects the pointer
 	// to remain valid (pointing at unchanged pre-reorg data) for the entire
 	// loop so that rollback can restore it. The double-buffer swap pattern
@@ -3291,6 +3324,17 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			stp.finalizeBlockProcessing(ctx, block)
 
 			stp.currentBlockHeader.Store(block.Header)
+
+			// Publish per-block catch-up progress the instant this block's
+			// moveForwardBlock has completed (its coinbase UTXO now exists), so the
+			// height the legacy sync gate polls advances block-by-block instead of
+			// jumping once when the whole batch commits. A true lower bound; reset to
+			// 0 by setBestBlockHeader once the batch commits. moveForwardHeights is a
+			// dedicated signal INDEPENDENT of moveForwardMetas' bm-feeding role, so it
+			// never affects moveForwardBlock's fast-path behaviour.
+			if moveForwardHeights != nil && idx < len(moveForwardHeights) {
+				stp.catchupHeight.Store(moveForwardHeights[idx])
+			}
 		}
 
 		catchupCommitted = true

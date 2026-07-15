@@ -123,7 +123,7 @@ func TestReorgCatchup_UsesPerBlockMetaSkipsGetBlockHeader(t *testing.T) {
 		{MinedSet: true, QuickValidated: true},
 	}
 
-	require.NoError(t, stp.Reorg([]*model.Block{}, blocks, metas))
+	require.NoError(t, stp.Reorg([]*model.Block{}, blocks, metas, nil))
 	bcMock.AssertNotCalled(t, "GetBlockHeader")
 }
 
@@ -144,6 +144,6 @@ func TestReorgCatchup_NilMetaFallsBackToGetBlockHeader(t *testing.T) {
 	bcMock.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Return(prevBlockHeader, &model.BlockHeaderMeta{MinedSet: true, QuickValidated: true}, nil)
 
-	require.NoError(t, stp.Reorg([]*model.Block{}, blocks, nil))
+	require.NoError(t, stp.Reorg([]*model.Block{}, blocks, nil, nil))
 	bcMock.AssertNumberOfCalls(t, "GetBlockHeader", 3)
 }

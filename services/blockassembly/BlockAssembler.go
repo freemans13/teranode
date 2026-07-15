@@ -849,6 +849,15 @@ func (b *BlockAssembler) setBestBlockHeader(bestBlockchainBlockHeader *model.Blo
 		Height: height,
 	})
 
+	// The committed height is now authoritative; clear the per-block catch-up
+	// progress hint so BestHeight() reports this committed height (the hint is
+	// only meaningful DURING an in-flight catch-up batch). Nil-guarded: some unit
+	// tests construct a BlockAssembler without a subtree processor and call this
+	// directly.
+	if b.subtreeProcessor != nil {
+		b.subtreeProcessor.ResetCatchupHeight()
+	}
+
 	// Send state change notification if a listener is registered
 	b.stateChangeMu.RLock()
 	stateChangeCh := b.stateChangeCh
@@ -1335,6 +1344,28 @@ func (b *BlockAssembler) CurrentBlock() (*model.BlockHeader, uint32) {
 	return info.Header, info.Height
 }
 
+// BestHeight returns the freshest lower bound on the height block assembly has
+// processed: the committed best-block height, or the in-progress catch-up height
+// when a multi-block catch-up batch is mid-flight and has advanced past the last
+// commit. Unlike CurrentBlock (whose header+height pair stays consistent for
+// correctness-sensitive callers), this is a height-only freshness signal for the
+// legacy sync maturity gate, which needs a per-block-advancing value rather than
+// one that jumps once per catch-up batch. Both inputs are monotonic lower bounds
+// below the checkpoint (where the gate uses it), so the max is always safe — it
+// can only ever make the gate wait longer, never admit a block early.
+func (b *BlockAssembler) BestHeight() uint32 {
+	_, committed := b.CurrentBlock()
+	// Nil-guarded for unit tests that construct a BlockAssembler without a
+	// subtree processor.
+	if b.subtreeProcessor == nil {
+		return committed
+	}
+	if catchup := b.subtreeProcessor.CatchupHeight(); catchup > committed {
+		return catchup
+	}
+	return committed
+}
+
 // AddTxBatch adds a batch of transactions to the block assembler.
 //
 // Parameters:
@@ -1681,7 +1712,7 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 	reorgFailed := false
 
 	// now do the reorg in the subtree processor
-	if err = b.subtreeProcessor.Reorg(moveBackBlocks, moveForwardBlocks, nil); err != nil {
+	if err = b.subtreeProcessor.Reorg(moveBackBlocks, moveForwardBlocks, nil, nil); err != nil {
 		b.logger.Warnf("[BlockAssembler] error doing reorg, will reset instead: %v", err)
 		// fallback to full reset
 		reset = true
@@ -1743,9 +1774,20 @@ func (b *BlockAssembler) handleCatchUp(_ context.Context, moveForward []blockWit
 		}
 	}
 
+	// heights is ALWAYS supplied and drives ONLY the per-block catch-up height
+	// signal (the truthful value the legacy sync gate polls). It is independent
+	// of metas/ReuseBlockMetaInMoveForward, so moveForwardBlock's fast-path
+	// behaviour is unchanged whether or not metas are fed.
+	heights := make([]uint32, len(moveForward))
+	for i, bwm := range moveForward {
+		if bwm.meta != nil {
+			heights[i] = bwm.meta.Height
+		}
+	}
+
 	// MUST be non-nil empty slice — reorgBlocks rejects nil (SubtreeProcessor.go:2778)
 	// but takes the fast path at len(moveBackBlocks)==0 (SubtreeProcessor.go:2794).
-	return b.subtreeProcessor.Reorg([]*model.Block{}, blocks, metas)
+	return b.subtreeProcessor.Reorg([]*model.Block{}, blocks, metas, heights)
 }
 
 // getReorgBlocks retrieves blocks involved in reorganization.
