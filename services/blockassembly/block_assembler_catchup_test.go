@@ -75,7 +75,7 @@ func TestProcessNewBlockAnnouncement_StuckMetrics(t *testing.T) {
 
 		mockStp := &subtreeprocessor.MockSubtreeProcessor{}
 		// Catch-up delegates to Reorg(empty, blocks, metas); make it fail like ProcessConflicting did.
-		mockStp.On("Reorg", mock.Anything, mock.Anything, mock.Anything).
+		mockStp.On("Reorg", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 			Return(errors.NewProcessingError("tx is not conflicting"))
 		injectMockStp(t, items, mockStp)
 
@@ -102,7 +102,7 @@ func TestProcessNewBlockAnnouncement_StuckMetrics(t *testing.T) {
 		addChain(t, items, chain)
 
 		mockStp := &subtreeprocessor.MockSubtreeProcessor{}
-		mockStp.On("Reorg", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		mockStp.On("Reorg", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		injectMockStp(t, items, mockStp)
 
 		items.blockAssembler.setBestBlockHeader(genesis, 0)
@@ -134,7 +134,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 		items.blockAssembler.processNewBlockAnnouncement(t.Context())
 
 		mockStp.AssertNotCalled(t, "MoveForwardBlock", mock.Anything)
-		mockStp.AssertNotCalled(t, "Reorg", mock.Anything, mock.Anything, mock.Anything)
+		mockStp.AssertNotCalled(t, "Reorg", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	})
 
 	// gap=1: default branch — single MoveForwardBlock, not the catch-up or reorg helpers.
@@ -155,7 +155,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 		items.blockAssembler.processNewBlockAnnouncement(t.Context())
 
 		mockStp.AssertCalled(t, "MoveForwardBlock", mock.Anything, mock.Anything)
-		mockStp.AssertNotCalled(t, "Reorg", mock.Anything, mock.Anything, mock.Anything)
+		mockStp.AssertNotCalled(t, "Reorg", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	})
 
 	// gap=2, moveBack=0: pure catch-up — delegates to Reorg(empty, [chain0, chain1]) via the
@@ -174,7 +174,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 		}), mock.MatchedBy(func(fwd []*model.Block) bool {
 			capturedForward = fwd
 			return true
-		}), mock.Anything).Return(nil)
+		}), mock.Anything, mock.Anything).Return(nil)
 		injectMockStp(t, items, mockStp)
 
 		// BA is at genesis; tip is chain[1] → gap=2, moveBack=0.
@@ -182,7 +182,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 
 		items.blockAssembler.processNewBlockAnnouncement(t.Context())
 
-		mockStp.AssertCalled(t, "Reorg", mock.Anything, mock.Anything, mock.Anything)
+		mockStp.AssertCalled(t, "Reorg", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 		mockStp.AssertNotCalled(t, "MoveForwardBlock", mock.Anything)
 		require.Len(t, capturedForward, 2, "Reorg must receive both catch-up blocks")
 		require.Equal(t, chain[0].Hash().String(), capturedForward[0].Header.Hash().String(), "blocks must be in order")
@@ -206,7 +206,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 		}), mock.MatchedBy(func(fwd []*model.Block) bool {
 			capturedForward = fwd
 			return true
-		}), mock.Anything).Return(nil)
+		}), mock.Anything, mock.Anything).Return(nil)
 		mockStp.On("Reset", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 			Return(subtreeprocessor.ResetResponse{}).
 			Run(func(_ mock.Arguments) { resetCalled = true })
@@ -247,7 +247,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 		require.NoError(t, items.addBlock(t.Context(), b2)) // b2 becomes best (more chainwork)
 
 		mockStp := &subtreeprocessor.MockSubtreeProcessor{}
-		mockStp.On("Reorg", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		mockStp.On("Reorg", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 		injectMockStp(t, items, mockStp)
 
 		// BA is at a1 (height 1); blockchain tip is b2 (height 2).
@@ -255,7 +255,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 
 		items.blockAssembler.processNewBlockAnnouncement(t.Context())
 
-		mockStp.AssertCalled(t, "Reorg", mock.Anything, mock.Anything, mock.Anything)
+		mockStp.AssertCalled(t, "Reorg", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 		mockStp.AssertNotCalled(t, "MoveForwardBlock", mock.Anything)
 	})
 
@@ -301,7 +301,7 @@ func TestProcessNewBlockAnnouncement_CatchupVsReorg(t *testing.T) {
 		addChain(t, items, chain)
 
 		mockStp := &subtreeprocessor.MockSubtreeProcessor{}
-		mockStp.On("Reorg", mock.Anything, mock.Anything, mock.Anything).
+		mockStp.On("Reorg", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 			Return(errors.NewProcessingError("simulated mid-catchup error"))
 		injectMockStp(t, items, mockStp)
 

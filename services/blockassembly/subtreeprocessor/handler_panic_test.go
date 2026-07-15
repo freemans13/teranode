@@ -34,7 +34,7 @@ func TestReorg_PanicSurfacesAsError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- stp.Reorg(moveBackBlocks, moveForwardBlocks, nil)
+		done <- stp.Reorg(moveBackBlocks, moveForwardBlocks, nil, nil)
 	}()
 
 	select {

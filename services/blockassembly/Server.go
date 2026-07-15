@@ -1968,7 +1968,13 @@ func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockasse
 		return nil, errors.NewProcessingError("[GetBlockAssemblyState] error converting remove map length", err)
 	}
 
-	currentHeader, currentHeight := ba.blockAssembler.CurrentBlock()
+	currentHeader, _ := ba.blockAssembler.CurrentBlock()
+	// Report the freshest processed-height lower bound (BestHeight), which advances
+	// per block during a catch-up batch instead of jumping once at batch commit.
+	// The legacy sync maturity gate polls this; a batch-frozen value read ~900
+	// blocks stale and froze mainnet IBD on 2026-07-15. CurrentHash stays paired
+	// with the committed header (consistent for hash consumers).
+	currentHeight := ba.blockAssembler.BestHeight()
 
 	subtreeSize, err := safeconversion.IntToUint32(ba.blockAssembler.subtreeProcessor.GetCurrentSubtreeSize())
 	if err != nil {

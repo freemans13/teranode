@@ -638,7 +638,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		stp.Start(ctx)
 
 		// Test reorg with no blocks - should fail with expected error
-		err = stp.Reorg(nil, nil, nil)
+		err = stp.Reorg(nil, nil, nil, nil)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "you must pass in blocks to move down the chain")
 	})
@@ -685,7 +685,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		}()
 
 		// Test reorg with only blocks to move back
-		err = stp.Reorg([]*model.Block{block1}, nil, nil)
+		err = stp.Reorg([]*model.Block{block1}, nil, nil, nil)
 		// We don't assert on the error because it depends on internal state
 		// The goal is to ensure the method is callable and test coverage
 		_ = err
@@ -719,7 +719,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		stp.currentBlockHeader.Store(blockHeader)
 
 		// Test reorg with only blocks to move forward - should fail
-		err = stp.Reorg(nil, []*model.Block{block2}, nil)
+		err = stp.Reorg(nil, []*model.Block{block2}, nil, nil)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "you must pass in blocks to move down the chain")
 	})
@@ -762,12 +762,12 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		}
 
 		// Test 1: moveForwardBlocks is nil (should fail in reorgBlocks)
-		err = stp.Reorg([]*model.Block{blockToMoveBack}, nil, nil)
+		err = stp.Reorg([]*model.Block{blockToMoveBack}, nil, nil, nil)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "you must pass in blocks to move up the chain")
 
 		// Test 2: moveBackBlocks is nil (should fail earlier in reorgBlocks validation)
-		err = stp.Reorg(nil, []*model.Block{blockToMoveBack}, nil)
+		err = stp.Reorg(nil, []*model.Block{blockToMoveBack}, nil, nil)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "you must pass in blocks to move down the chain")
 	})
@@ -876,7 +876,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		}()
 
 		// Perform reorg: remove block2, add block3
-		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward}, nil)
+		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward}, nil, nil)
 
 		require.NoError(t, err, "reorg must succeed")
 
@@ -1065,7 +1065,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		moveBackBlocks := []*model.Block{block3, block2}
 		moveForwardBlocks := []*model.Block{blockNew}
 
-		err = stp.Reorg(moveBackBlocks, moveForwardBlocks, nil)
+		err = stp.Reorg(moveBackBlocks, moveForwardBlocks, nil, nil)
 		require.NoError(t, err, "reorg must succeed")
 
 		// Verify the reorg processed transactions correctly
@@ -1222,7 +1222,7 @@ func TestSubtreeProcessor_Reorg(t *testing.T) {
 		}()
 
 		// Perform reorg: move back old block, move forward new block
-		err = stp.Reorg([]*model.Block{oldBlock}, []*model.Block{newBlock}, nil)
+		err = stp.Reorg([]*model.Block{oldBlock}, []*model.Block{newBlock}, nil, nil)
 
 		// Check final state
 		finalTxMap := stp.GetCurrentTxMap()
@@ -1453,7 +1453,7 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 			}
 		}()
 
-		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward}, nil)
+		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward}, nil, nil)
 		require.NoError(t, err, "reorg through a real subtree must succeed")
 
 		finalHeader := stp.GetCurrentBlockHeader()
@@ -1546,7 +1546,7 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 			}
 		}()
 
-		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward}, nil)
+		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward}, nil, nil)
 		require.NoError(t, err, "reorg with a competing spend across the switch must succeed")
 
 		finalHeader := stp.GetCurrentBlockHeader()

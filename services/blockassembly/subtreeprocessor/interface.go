@@ -131,7 +131,7 @@ type Interface interface {
 	//
 	// Returns:
 	//   - error: Any error encountered during reorganization
-	Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta) error
+	Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta, moveForwardHeights []uint32) error
 
 	// Reset performs a complete reset of the processor state to a specific block.
 	// This is used during major reorganizations or when recovering from errors.
@@ -188,6 +188,13 @@ type Interface interface {
 	// Returns:
 	//   - *model.BlockHeader: Current block header
 	GetCurrentBlockHeader() *model.BlockHeader
+
+	// CatchupHeight returns the height an in-progress catch-up batch has reached
+	// (0 when none is active) — a freshness hint for the legacy sync maturity gate.
+	CatchupHeight() uint32
+
+	// ResetCatchupHeight clears the catch-up progress hint once a batch commits.
+	ResetCatchupHeight()
 
 	// SetCurrentBlockHeader sets the current block header in the processor.
 	// This is used to update the processor's view of the blockchain tip.

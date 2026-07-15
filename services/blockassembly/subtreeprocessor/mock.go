@@ -80,6 +80,18 @@ func (m *MockSubtreeProcessor) SetCurrentBlockHeader(blockHeader *model.BlockHea
 	m.Called(blockHeader)
 }
 
+// CatchupHeight and ResetCatchupHeight are non-behavioral height HINTS (the
+// per-block catch-up progress signal for the legacy sync gate). They are
+// deliberately NOT routed through testify m.Called(): no test asserts on them,
+// and setBestBlockHeader/BestHeight invoke them on paths exercised by many
+// existing tests — routing them through the mock would force every one of those
+// setups to register an expectation for zero behavioural gain. The real
+// SubtreeProcessor is used where the signal's behaviour is under test
+// (catchup_height_test.go).
+func (m *MockSubtreeProcessor) CatchupHeight() uint32 { return 0 }
+
+func (m *MockSubtreeProcessor) ResetCatchupHeight() {}
+
 func (m *MockSubtreeProcessor) GetCurrentSubtree() *subtree.Subtree {
 	args := m.Called()
 	if args.Get(0) == nil {
@@ -203,8 +215,8 @@ func (m *MockSubtreeProcessor) MoveForwardBlock(block *model.Block, blockMeta *m
 }
 
 // Reorg implements Interface.Reorg
-func (m *MockSubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta) error {
-	args := m.Called(moveBackBlocks, moveForwardBlocks, moveForwardMetas)
+func (m *MockSubtreeProcessor) Reorg(moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, moveForwardMetas []*model.BlockHeaderMeta, moveForwardHeights []uint32) error {
+	args := m.Called(moveBackBlocks, moveForwardBlocks, moveForwardMetas, moveForwardHeights)
 	return args.Error(0)
 }
 
