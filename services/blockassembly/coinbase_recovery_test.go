@@ -225,3 +225,66 @@ func TestScopeCoinbaseGap_ContiguousAndHoled(t *testing.T) {
 		require.Nil(t, gap)
 	})
 }
+
+// TestRecoverCoinbaseDivergence_RepairsGapNoConflicts exercises the full
+// staged orchestration end to end against a real sqlitememory UTXO store and
+// blockchain client, and the SubtreeProcessor's own goroutine (via
+// ReconcileCoinbases). A gap of three missing coinbases (heights 2,3,4) sits
+// above a proven-good floor (height 1); since the test-helper-built blocks
+// carry no subtrees (see addCanonicalBlockWithCoinbase), HasConflictingNodes
+// finds nothing to conflict on, so Stage 1 auto-repair must succeed on the
+// first attempt and recoverCoinbaseDivergence must return nil.
+func TestRecoverCoinbaseDivergence_RepairsGapNoConflicts(t *testing.T) {
+	initPrometheusMetrics()
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t)
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	headers := buildCanonicalChain(ctx, t, items, 4)
+	seedCoinbase(ctx, t, items, headers, 1) // floor good; 2,3,4 missing
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	require.NoError(t, items.blockAssembler.recoverCoinbaseDivergence(ctx, 4))
+
+	for h := uint32(2); h <= 4; h++ {
+		present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, h)
+		require.NoError(t, err)
+		require.True(t, present, "coinbase at height %d must be repaired", h)
+	}
+}
+
+// TestRecoverCoinbaseDivergence_GapTooLarge_Escalates covers the escalation
+// path when scopeCoinbaseGap itself refuses to scope the divergence (gap
+// exceeds CoinbaseRecoveryMaxGapBlocks). recoverCoinbaseDivergence must not
+// attempt any repair in this case and must return an error naming the need
+// for operator intervention.
+func TestRecoverCoinbaseDivergence_GapTooLarge_Escalates(t *testing.T) {
+	initPrometheusMetrics()
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t)
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// heights 1..6: only height 1 present, 2..6 all missing -- a gap of 5
+	// exceeds the cap of 1 and must escalate rather than repair.
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	seedCoinbase(ctx, t, items, headers, 1)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	err := items.blockAssembler.recoverCoinbaseDivergence(ctx, 6)
+	require.Error(t, err)
+
+	// The gap was never repaired -- heights 2..6 must still be absent.
+	for h := uint32(2); h <= 6; h++ {
+		present, _, presErr := items.blockAssembler.canonicalCoinbaseAt(ctx, h)
+		require.NoError(t, presErr)
+		require.False(t, present, "coinbase at height %d must remain unrepaired after escalation", h)
+	}
+}

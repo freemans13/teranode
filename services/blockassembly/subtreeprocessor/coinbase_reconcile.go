@@ -68,6 +68,30 @@ func (stp *SubtreeProcessor) ReconcileCoinbases(ctx context.Context, gapBlocks [
 	}
 }
 
+// HasConflictingNodes reports whether the given block's subtrees carry any
+// conflicting transactions, wrapping the existing getConflictingNodes probe.
+// The staged coinbase-divergence recovery orchestration (recoverCoinbaseDivergence)
+// uses this as a guard before attempting a coinbase-only repair: coinbase-only
+// repair is only sufficient when the gap carries no double-spend conflicts to
+// resolve, so any conflicting node found here must escalate to operator
+// intervention rather than being auto-repaired.
+//
+// Parameters:
+//   - ctx: Context for cancellation of the underlying subtree-store reads
+//   - block: Canonical block whose subtrees are checked for conflicting nodes
+//
+// Returns:
+//   - bool: true if at least one conflicting node was found
+//   - error: Any error encountered reading or deserializing a subtree
+func (stp *SubtreeProcessor) HasConflictingNodes(ctx context.Context, block *model.Block) (bool, error) {
+	nodes, err := stp.getConflictingNodes(ctx, block)
+	if err != nil {
+		return false, err
+	}
+
+	return len(nodes) > 0, nil
+}
+
 // reconcileCoinbases is the unexported worker invoked on the processor
 // goroutine. It only ever calls processCoinbaseUtxos - one coinbase per
 // block - and never touches per-transaction state; that is the scale

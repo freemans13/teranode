@@ -101,3 +101,86 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 
 	return gap, nil
 }
+
+// recoverCoinbaseDivergence is the staged orchestration for a detected
+// coinbase divergence at triggerHeight. It scopes the gap (scopeCoinbaseGap),
+// guards each gap block against double-spend conflicts (HasConflictingNodes),
+// and -- only when the gap is conflict-free -- attempts a coinbase-only
+// repair (subtreeProcessor.ReconcileCoinbases), retrying up to
+// CoinbaseRecoveryMaxAttempts times.
+//
+// Any scoping failure (gap too large, or a canonicalCoinbaseAt error while
+// walking back) is treated identically to a conflict: both mean coinbase-only
+// repair cannot safely proceed, so both escalate to Stage 2 (halt + alarm)
+// rather than being distinguished and handled differently.
+//
+// On successful repair this returns nil and increments the "repaired" metric
+// outcome. On exhaustion of attempts, an over-large gap, or conflicting
+// nodes in the gap, it increments "escalated", logs a single loud
+// operator-facing line naming resetblockassembly, and returns an error --
+// the caller must not advance past triggerHeight until an operator
+// intervenes.
+func (b *BlockAssembler) recoverCoinbaseDivergence(ctx context.Context, triggerHeight uint32) error {
+	prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected").Inc()
+
+	maxAttempts := b.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		gap, err := b.scopeCoinbaseGap(ctx, triggerHeight)
+		if err != nil {
+			// Gap too large, or a canonicalCoinbaseAt failure during the
+			// walk-back -- either way, coinbase-only repair cannot safely
+			// proceed, so escalate rather than retry.
+			lastErr = err
+			break
+		}
+
+		if len(gap) == 0 {
+			return nil // nothing to do (already consistent)
+		}
+
+		// Conflict-aware guard: coinbase-only repair is only sufficient when
+		// the gap carries no double-spend conflicts to resolve.
+		conflicted := false
+
+		for _, blk := range gap {
+			has, cErr := b.subtreeProcessor.HasConflictingNodes(ctx, blk)
+			if cErr != nil {
+				lastErr = cErr
+				conflicted = true
+
+				break
+			}
+
+			if has {
+				lastErr = errors.NewProcessingError("[coinbaseRecovery] gap block %s has conflicting txs; coinbase-only repair insufficient", blk.String())
+				conflicted = true
+
+				break
+			}
+		}
+
+		if conflicted {
+			break // escalate
+		}
+
+		if err := b.subtreeProcessor.ReconcileCoinbases(ctx, gap); err != nil {
+			lastErr = err
+			b.logger.Warnf("[coinbaseRecovery] attempt %d/%d failed: %v", attempt, maxAttempts, err)
+
+			continue
+		}
+
+		b.logger.Infof("[coinbaseRecovery] repaired %d coinbase(s) up to height %d on attempt %d", len(gap), triggerHeight, attempt)
+		prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired").Inc()
+
+		return nil
+	}
+
+	// Stage 2: halt + alarm. Do not advance; surface a single loud operator signal.
+	prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated").Inc()
+	b.logger.Errorf("[coinbaseRecovery] MANUAL INTERVENTION REQUIRED: coinbase divergence at/below height %d could not be auto-repaired after %d attempts (%v); run resetblockassembly", triggerHeight, maxAttempts, lastErr)
+
+	return errors.NewProcessingError("[coinbaseRecovery] unrecoverable coinbase divergence at height %d", triggerHeight, lastErr)
+}
