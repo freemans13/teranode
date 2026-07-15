@@ -955,6 +955,16 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	// Start SubtreeProcessor goroutine after loading unmined transactions to avoid race conditions
 	b.subtreeProcessor.Start(ctx)
 
+	// Detect and repair a coinbase divergence left by a prior unclean shutdown
+	// (e.g. crash mid fast-forward create loop) before the node begins
+	// advancing. Must run after subtreeProcessor.Start, since a repair uses
+	// subtreeProcessor.ReconcileCoinbases, and before startChannelListeners,
+	// so no new block/subtree notifications are processed against a diverged
+	// tip.
+	if err = b.checkCoinbaseDivergenceOnStart(ctx); err != nil {
+		return errors.NewProcessingError("[Start] coinbase divergence unrecoverable on startup", err)
+	}
+
 	if err = b.startChannelListeners(ctx); err != nil {
 		return errors.NewProcessingError("[BlockAssembler] failed to start channel listeners: %v", err)
 	}

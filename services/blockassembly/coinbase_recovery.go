@@ -184,3 +184,29 @@ func (b *BlockAssembler) recoverCoinbaseDivergence(ctx context.Context, triggerH
 
 	return errors.NewProcessingError("[coinbaseRecovery] unrecoverable coinbase divergence at height %d", triggerHeight, lastErr)
 }
+
+// checkCoinbaseDivergenceOnStart verifies the persisted tip's canonical coinbase
+// exists in the store and repairs the gap if not. Called once during Start,
+// before block-notification listeners begin, so a divergence created by a prior
+// unclean shutdown is healed before the node advances.
+func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) error {
+	header, height := b.CurrentBlock()
+	if header == nil || height == 0 {
+		return nil // genesis / unset — nothing to check
+	}
+
+	present, _, err := b.canonicalCoinbaseAt(ctx, height)
+	if err != nil {
+		// Non-fatal: log and continue; runtime detection remains as a backstop.
+		b.logger.Warnf("[coinbaseRecovery] startup divergence check failed at height %d: %v", height, err)
+		return nil
+	}
+
+	if present {
+		return nil
+	}
+
+	b.logger.Warnf("[coinbaseRecovery] startup: canonical coinbase missing at tip height %d; running recovery", height)
+
+	return b.recoverCoinbaseDivergence(ctx, height)
+}
