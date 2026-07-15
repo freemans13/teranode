@@ -324,7 +324,7 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 					blockIDsMap, err := txMetaStore.SetMinedMulti(gCtx, hashes, minedBlockInfo)
 					if err != nil {
 						// Log error, increment counter, and continue processing all transactions
-						logger.Warnf("[UpdateTxMinedStatus][%s] error setting mined tx for batch %d/%d: %v", block.Hash().String(), batchNr, batchTotal, err)
+						logger.Warnf("[UpdateTxMinedStatus][TX_CREATE_GAP][%s] height %d: error setting mined tx for batch %d/%d (block tx missing from utxo store — block cannot reach mined_set): %v", block.Hash().String(), block.Height, batchNr, batchTotal, err)
 						setMinedErrorCount.Add(1)
 					} else {
 						checkBatchResults(hashes, blockIDsMap)
@@ -347,7 +347,7 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 				blockIDsMap, err := txMetaStore.SetMinedMulti(gCtx, hashes, minedBlockInfo)
 				if err != nil {
 					// Log error, increment counter, and continue processing all transactions
-					logger.Warnf("[UpdateTxMinedStatus][%s] error setting mined tx for remainder batch: %v", block.Hash().String(), err)
+					logger.Warnf("[UpdateTxMinedStatus][TX_CREATE_GAP][%s] height %d: error setting mined tx for remainder batch (block tx missing from utxo store — block cannot reach mined_set): %v", block.Hash().String(), block.Height, err)
 					setMinedErrorCount.Add(1)
 				} else {
 					checkBatchResults(hashes, blockIDsMap)
