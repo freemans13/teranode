@@ -137,12 +137,13 @@ func TestHandleBlockMsgWithWindow_RefreshesLastBlockTimeOnAccept(t *testing.T) {
 
 	beforeCall := time.Now()
 
-	addedToWindow, err := sm.handleBlockMsgWithWindow(&blockQueueMsg{
+	outcome, err := sm.handleBlockMsgWithWindow(&blockQueueMsg{
 		block:       msgBlock,
 		blockHash:   blockHash,
 		blockHeight: int32(blockHeight),
 		peer:        p,
-	}, wa, flushWindow)
+	}, wa, flushWindow, nil)
+	addedToWindow := outcome == blockAdmitWindowed
 
 	require.NoError(t, err, "windowed accept must not error")
 	require.True(t, addedToWindow, "block must be accepted into the window (accept path)")
