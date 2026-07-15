@@ -643,7 +643,14 @@ type SyncManager struct {
 	// always a stale-LOW-or-equal lower bound on the true height, so a fast-path
 	// pass on the cache implies the true bound also holds.
 	cachedBlockAssemblyHeight atomic.Uint32
-	legacyKafkaInvCh          chan *kafka.Message
+	// parkAheadActive is set once, when the drain loop creates the park store
+	// (park-ahead enabled + refill tick present). It gates the headers-first fetch
+	// runway cap (fetchRunwayHorizon): only when parking is live must the fetch
+	// frontier be bounded to the parkable horizon so the park cannot saturate.
+	// Off (the zero value) leaves the forward walk uncapped — byte-identical to the
+	// pre-park behaviour.
+	parkAheadActive  atomic.Bool
+	legacyKafkaInvCh chan *kafka.Message
 	// legacyKafkaInvProducer is retained (DC11) so SyncManager.Stop() can stop it
 	// synchronously; without a field there is no handle to flush it on shutdown.
 	legacyKafkaInvProducer kafka.KafkaAsyncProducerI
@@ -2730,6 +2737,14 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 			continue
 		}
 
+		// Runway cap (see fetchRunwayHorizon): pause the walk at the parkable horizon
+		// so the fetch cursor cannot outrun block assembly. Break before advancing
+		// startHeader so the walk resumes here once the horizon slides up.
+		if horizon, capped := sm.fetchRunwayHorizon(); capped && node.height >= 0 && uint32(node.height) > horizon {
+			sm.logger.Debugf("[fetchHeaderBlocks] runway horizon %d reached at height %d; pausing walk", horizon, node.height)
+			break
+		}
+
 		iv := wire.NewInvVect(wire.InvTypeBlock, node.hash)
 
 		// haveInventory issues a gRPC — must run with headerMu released.
@@ -3046,6 +3061,15 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 			continue
 		}
 
+		// Runway cap: stop the walk once the frontier reaches the parkable horizon
+		// so the fetch cursor cannot climb unboundedly ahead of block assembly and
+		// saturate the park. Break BEFORE advancing startHeader so the cursor stays
+		// on this node and the walk resumes here as the horizon slides up.
+		if horizon, capped := sm.fetchRunwayHorizon(); capped && node.height >= 0 && uint32(node.height) > horizon {
+			sm.logger.Debugf("[assignBlocksAcrossPeers] runway horizon %d reached at height %d; pausing walk (assigned %d)", horizon, node.height, assigned)
+			break
+		}
+
 		iv := wire.NewInvVect(wire.InvTypeBlock, node.hash)
 
 		// haveInventory issues a gRPC — must run with headerMu released.
@@ -3171,6 +3195,29 @@ func (sm *SyncManager) drainRefetchBlocks(targets []*fetchTarget, toAssign int) 
 	}
 	sm.assignedMu.Unlock()
 
+	// Re-fetch the LOWEST heights first. The contiguous committed-tip+1 block (and
+	// the rest of the in-gate range) is the only work that advances block assembly
+	// and drains the park; it must win the pass's small budget over any far-ahead
+	// orphans. Go map-range order is random, so under parallelFetchPeers>1 tip+1
+	// would otherwise lose the race to higher-height hashes and the tip would stall.
+	// Height comes from headerHeightIndex (guarded by headerMu); an unknown height
+	// (hash not currently in the header index) sorts last.
+	heights := make(map[chainhash.Hash]int32, len(pending))
+
+	sm.headerMu.Lock()
+	for _, h := range pending {
+		if ht, ok := sm.headerHeightIndex[h]; ok {
+			heights[h] = ht
+		} else {
+			heights[h] = math.MaxInt32
+		}
+	}
+	sm.headerMu.Unlock()
+
+	sort.Slice(pending, func(i, j int) bool {
+		return heights[pending[i]] < heights[pending[j]]
+	})
+
 	for _, h := range pending {
 		if toAssign <= 0 {
 			break
@@ -3231,6 +3278,59 @@ func pickMaxSpareTarget(targets []*fetchTarget) *fetchTarget {
 		}
 	}
 	return best
+}
+
+// fetchRunwayHorizon returns the highest block height the headers-first fetch
+// scheduler may request this pass, and whether that cap is active.
+//
+// When park-ahead is live the fetch frontier MUST be bounded to
+// cachedBA + maxBehind + parkCap. The park buffer, by construction, only ever holds
+// beyond-gate blocks (height > cachedBA + maxBehind), so bounding the frontier to
+// parkCap above the gate means at most parkCap beyond-gate blocks can ever be in the
+// park at once — it can never saturate. Without this cap the monotonic fetch cursor
+// climbs unboundedly ahead of a lagging block assembly (an ~10k-height span was
+// observed on mainnet against a 20-block gate and 1024-slot park), overflowing the
+// park; each overflow reject is requeued into refetchBlocks and re-requested, a
+// positive-feedback churn that starves the one contiguous tip+1 block that would
+// advance block assembly — a permanent livelock under parallelFetchPeers>1.
+//
+// The cap is gated exactly like the non-blocking maturity gate
+// (blockAssemblyGateAdmitsCached): active only when parking is live, maxBehind and
+// parkCap are positive, the BA cache has been polled (cached>0), and we are in the
+// below-checkpoint prefix where parking actually happens. When inactive it returns
+// (0,false) and the forward walk runs uncapped — byte-identical to the pre-park path.
+// Drain-goroutine only (reads cachedBlockAssemblyHeight atomically).
+func (sm *SyncManager) fetchRunwayHorizon() (uint32, bool) {
+	if !sm.parkAheadActive.Load() {
+		return 0, false
+	}
+
+	maxBehind := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
+	parkCap := sm.settings.Legacy.ParallelWindowMaxParkedBlocks
+
+	if maxBehind <= 0 || parkCap <= 0 || sm.chainParams == nil {
+		return 0, false
+	}
+
+	cached := sm.cachedBlockAssemblyHeight.Load()
+	if cached == 0 {
+		// BA cache not yet polled; capping now would wrongly clamp the frontier to
+		// ~parkCap. Leave the walk uncapped until the poller sets a real height.
+		return 0, false
+	}
+
+	if !model.BelowCheckpoint(sm.chainParams.Checkpoints, cached) {
+		// Above the checkpoint the gate uses the blocking slow path and never parks,
+		// so there is no park to saturate — no cap needed.
+		return 0, false
+	}
+
+	span := uint32(maxBehind) + uint32(parkCap) //nolint:gosec // both guarded > 0 above
+	if cached > math.MaxUint32-span {
+		return 0, false
+	}
+
+	return cached + span, true
 }
 
 // batchAdd lazily allocates the target's getdata message and appends one inv,
@@ -4670,6 +4770,7 @@ func (sm *SyncManager) blockHandler() {
 			} else {
 				parkBudget := windowBudgetBytes(sm.settings.Legacy.ParallelWindowParkedMemoryFraction)
 				park = newParkStore(parkBudget, sm.settings.Legacy.ParallelWindowMaxParkedBlocks)
+				sm.parkAheadActive.Store(true)
 			}
 		}
 
