@@ -245,9 +245,3 @@ func (m *MockSubtreeProcessor) ReconcileCoinbases(ctx context.Context, gapBlocks
 	args := m.Called(ctx, gapBlocks)
 	return args.Error(0)
 }
-
-// HasConflictingNodes implements Interface.HasConflictingNodes
-func (m *MockSubtreeProcessor) HasConflictingNodes(ctx context.Context, block *model.Block) (bool, error) {
-	args := m.Called(ctx, block)
-	return args.Bool(0), args.Error(1)
-}

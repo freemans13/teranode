@@ -352,21 +352,6 @@ type Interface interface {
 	// Returns:
 	//   - error: The first error encountered creating a gap block's coinbase, if any
 	ReconcileCoinbases(ctx context.Context, gapBlocks []*model.Block) error
-
-	// HasConflictingNodes reports whether the given block's subtrees carry any
-	// conflicting transactions. Used as a guard before coinbase-only repair:
-	// coinbase-only repair is insufficient when double-spend conflicts remain
-	// to be resolved, so callers should escalate rather than auto-repair when
-	// this returns true.
-	//
-	// Parameters:
-	//   - ctx: Context for cancellation of the underlying subtree-store reads
-	//   - block: Canonical block whose subtrees are checked for conflicting nodes
-	//
-	// Returns:
-	//   - bool: true if at least one conflicting node was found
-	//   - error: Any error encountered reading or deserializing a subtree
-	HasConflictingNodes(ctx context.Context, block *model.Block) (bool, error)
 }
 
 // TxInpointsMap defines the interface for transaction inpoints storage with hash keys.

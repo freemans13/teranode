@@ -103,23 +103,26 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 }
 
 // recoverCoinbaseDivergence is the staged orchestration for a detected
-// coinbase divergence at triggerHeight. It scopes the gap (scopeCoinbaseGap),
-// guards each gap block against double-spend conflicts (HasConflictingNodes),
-// and -- only when the gap is conflict-free -- attempts a coinbase-only
-// repair (subtreeProcessor.ReconcileCoinbases), retrying up to
-// CoinbaseRecoveryMaxAttempts times.
+// coinbase divergence at triggerHeight. It is coinbase-only and O(blocks in
+// the gap): it scopes the gap (scopeCoinbaseGap) and, when non-empty,
+// attempts a coinbase-only repair (subtreeProcessor.ReconcileCoinbases),
+// retrying up to CoinbaseRecoveryMaxAttempts times. It never inspects
+// per-transaction state, which is what keeps its cost independent of mempool
+// or subtree size.
+//
+// Boundary: this repairs missing canonical coinbases only. Reconciling
+// ordinary-transaction double-spend/conflict state for a genuine competing-fork
+// reorg is out of scope here -- that state is owned by block validation.
 //
 // Any scoping failure (gap too large, or a canonicalCoinbaseAt error while
-// walking back) is treated identically to a conflict: both mean coinbase-only
-// repair cannot safely proceed, so both escalate to Stage 2 (halt + alarm)
-// rather than being distinguished and handled differently.
+// walking back) escalates to Stage 2 (halt + alarm) rather than being
+// retried, since it means the gap itself cannot be safely determined.
 //
 // On successful repair this returns nil and increments the "repaired" metric
-// outcome. On exhaustion of attempts, an over-large gap, or conflicting
-// nodes in the gap, it increments "escalated", logs a single loud
-// operator-facing line naming resetblockassembly, and returns an error --
-// the caller must not advance past triggerHeight until an operator
-// intervenes.
+// outcome. On exhaustion of attempts or an over-large gap, it increments
+// "escalated", logs a single loud operator-facing line naming
+// resetblockassembly, and returns an error -- the caller must not advance
+// past triggerHeight until an operator intervenes.
 func (b *BlockAssembler) recoverCoinbaseDivergence(ctx context.Context, triggerHeight uint32) error {
 	prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected").Inc()
 
@@ -130,39 +133,14 @@ func (b *BlockAssembler) recoverCoinbaseDivergence(ctx context.Context, triggerH
 		gap, err := b.scopeCoinbaseGap(ctx, triggerHeight)
 		if err != nil {
 			// Gap too large, or a canonicalCoinbaseAt failure during the
-			// walk-back -- either way, coinbase-only repair cannot safely
-			// proceed, so escalate rather than retry.
+			// walk-back -- either way, the gap cannot be safely determined,
+			// so escalate rather than retry.
 			lastErr = err
 			break
 		}
 
 		if len(gap) == 0 {
 			return nil // nothing to do (already consistent)
-		}
-
-		// Conflict-aware guard: coinbase-only repair is only sufficient when
-		// the gap carries no double-spend conflicts to resolve.
-		conflicted := false
-
-		for _, blk := range gap {
-			has, cErr := b.subtreeProcessor.HasConflictingNodes(ctx, blk)
-			if cErr != nil {
-				lastErr = cErr
-				conflicted = true
-
-				break
-			}
-
-			if has {
-				lastErr = errors.NewProcessingError("[coinbaseRecovery] gap block %s has conflicting txs; coinbase-only repair insufficient", blk.String())
-				conflicted = true
-
-				break
-			}
-		}
-
-		if conflicted {
-			break // escalate
 		}
 
 		if err := b.subtreeProcessor.ReconcileCoinbases(ctx, gap); err != nil {
@@ -178,6 +156,12 @@ func (b *BlockAssembler) recoverCoinbaseDivergence(ctx context.Context, triggerH
 		return nil
 	}
 
+	// maxAttempts < 1 means the loop above never ran, so lastErr is still
+	// nil here; give a clear reason rather than wrapping a nil error.
+	if lastErr == nil {
+		lastErr = errors.NewProcessingError("[coinbaseRecovery] CoinbaseRecoveryMaxAttempts=%d, no repair attempt was made", maxAttempts)
+	}
+
 	// Stage 2: halt + alarm. Do not advance; surface a single loud operator signal.
 	prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated").Inc()
 	b.logger.Errorf("[coinbaseRecovery] MANUAL INTERVENTION REQUIRED: coinbase divergence at/below height %d could not be auto-repaired after %d attempts (%v); run resetblockassembly", triggerHeight, maxAttempts, lastErr)
@@ -189,6 +173,17 @@ func (b *BlockAssembler) recoverCoinbaseDivergence(ctx context.Context, triggerH
 // exists in the store and repairs the gap if not. Called once during Start,
 // before block-notification listeners begin, so a divergence created by a prior
 // unclean shutdown is healed before the node advances.
+//
+// This always returns nil. A recovery give-up is deliberately non-fatal:
+// recoverCoinbaseDivergence has already logged the loud operator-facing alert
+// and incremented the "escalated" metric internally before returning its
+// error, so there is nothing left to surface here except the fact that
+// startup could not repair it. Returning an error here would fail Start and
+// crash-loop the process, which does not help an operator -- a running node
+// they can inspect is strictly better than one stuck restarting. The
+// backstop today is the next restart's startup check running this same
+// probe again; a runtime (mid-operation) point-of-pain detector is future
+// work, not something this branch implements.
 func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) error {
 	header, height := b.CurrentBlock()
 	if header == nil || height == 0 {
@@ -197,7 +192,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 
 	present, _, err := b.canonicalCoinbaseAt(ctx, height)
 	if err != nil {
-		// Non-fatal: log and continue; runtime detection remains as a backstop.
+		// Non-fatal: log and continue; see the function-level comment above.
 		b.logger.Warnf("[coinbaseRecovery] startup divergence check failed at height %d: %v", height, err)
 		return nil
 	}
@@ -208,5 +203,13 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 
 	b.logger.Warnf("[coinbaseRecovery] startup: canonical coinbase missing at tip height %d; running recovery", height)
 
-	return b.recoverCoinbaseDivergence(ctx, height)
+	if err := b.recoverCoinbaseDivergence(ctx, height); err != nil {
+		// Non-fatal: see the function-level comment above. recoverCoinbaseDivergence
+		// has already logged the loud MANUAL INTERVENTION alert and incremented
+		// the "escalated" metric; log that startup recovery failed and let the
+		// node boot so an operator can inspect and act.
+		b.logger.Errorf("[coinbaseRecovery] startup recovery failed at height %d: %v; manual intervention required (run resetblockassembly)", height, err)
+	}
+
+	return nil
 }

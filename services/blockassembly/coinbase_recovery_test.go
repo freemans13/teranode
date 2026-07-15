@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -230,10 +231,9 @@ func TestScopeCoinbaseGap_ContiguousAndHoled(t *testing.T) {
 // staged orchestration end to end against a real sqlitememory UTXO store and
 // blockchain client, and the SubtreeProcessor's own goroutine (via
 // ReconcileCoinbases). A gap of three missing coinbases (heights 2,3,4) sits
-// above a proven-good floor (height 1); since the test-helper-built blocks
-// carry no subtrees (see addCanonicalBlockWithCoinbase), HasConflictingNodes
-// finds nothing to conflict on, so Stage 1 auto-repair must succeed on the
-// first attempt and recoverCoinbaseDivergence must return nil.
+// above a proven-good floor (height 1); recovery is coinbase-only (it never
+// inspects subtree/transaction conflict state), so Stage 1 auto-repair must
+// succeed on the first attempt and recoverCoinbaseDivergence must return nil.
 func TestRecoverCoinbaseDivergence_RepairsGapNoConflicts(t *testing.T) {
 	initPrometheusMetrics()
 	ctx := t.Context()
@@ -248,6 +248,8 @@ func TestRecoverCoinbaseDivergence_RepairsGapNoConflicts(t *testing.T) {
 	items.blockAssembler.subtreeProcessor.Start(ctx)
 	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
 
+	repairedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired"))
+
 	require.NoError(t, items.blockAssembler.recoverCoinbaseDivergence(ctx, 4))
 
 	for h := uint32(2); h <= 4; h++ {
@@ -255,6 +257,10 @@ func TestRecoverCoinbaseDivergence_RepairsGapNoConflicts(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, present, "coinbase at height %d must be repaired", h)
 	}
+
+	repairedAfter := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired"))
+	require.Equal(t, float64(1), repairedAfter-repairedBefore,
+		"repaired counter must increment exactly once on a successful auto-repair")
 }
 
 // TestStartupCoinbaseDivergenceCheck_Repairs exercises the startup hook
@@ -308,6 +314,8 @@ func TestRecoverCoinbaseDivergence_GapTooLarge_Escalates(t *testing.T) {
 	items.blockAssembler.subtreeProcessor.Start(ctx)
 	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
 
+	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+
 	err := items.blockAssembler.recoverCoinbaseDivergence(ctx, 6)
 	require.Error(t, err)
 
@@ -317,4 +325,8 @@ func TestRecoverCoinbaseDivergence_GapTooLarge_Escalates(t *testing.T) {
 		require.NoError(t, presErr)
 		require.False(t, present, "coinbase at height %d must remain unrepaired after escalation", h)
 	}
+
+	escalatedAfter := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+	require.Equal(t, float64(1), escalatedAfter-escalatedBefore,
+		"escalated counter must increment exactly once when the gap exceeds the cap")
 }
