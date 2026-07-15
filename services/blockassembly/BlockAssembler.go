@@ -611,7 +611,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 		return nil
 	}
 
-	baBestBlockHeader, _ := b.CurrentBlock()
+	baBestBlockHeader, baHeight := b.CurrentBlock()
 
 	// Update the internal best block reference before SubtreeProcessor.Reset runs the
 	// postProcessFn (which calls loadUnminedTransactions). Without this, CurrentBlock()
@@ -635,6 +635,14 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 
 		_, bestBlockchainBlockHeaderMeta, err := b.blockchainClient.GetBlockHeader(ctx, bestBlockchainBlockHeader.Hash())
 		if err != nil {
+			// Reset failed and we cannot resolve the fallback height. The optimistic
+			// write at the top of reset() left b.bestBlock on the *new* tip; if we
+			// returned now the chain pointer would sit ahead of the coinbase state and
+			// the next reconcile would short-circuit on the "tips equal" branch,
+			// stranding the coinbase permanently. Restore the pre-reset tip (the
+			// known-consistent state that matched the coinbases before this attempt)
+			// so the next reconcile retries a genuine divergence.
+			b.setBestBlockHeader(baBestBlockHeader, baHeight)
 			return errors.NewProcessingError("[Reset] error getting best block header meta", err)
 		}
 
