@@ -2217,7 +2217,7 @@ const (
 // (the sync peer's LastBlock() far exceeds our best height); those branches
 // would also be skipped on the normal handleBlockMsg path for the same reason.
 // There is no behaviour divergence.
-func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator, flushWindow func(), park *parkStore) (blockAdmitOutcome, error) {
+func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator, flushWindow, flushWindowSync func(), park *parkStore) (blockAdmitOutcome, error) {
 	sm.logger.Debugf("[handleBlockMsgWithWindow][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 
 	peer, state, catchingBlocks, isCheckpointBlock, headerHeight, preambleErr := sm.handleBlockPreamble("handleBlockMsgWithWindow", bmsg)
@@ -2344,7 +2344,19 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		// FIFO worker's contiguous ascending commit sequence.
 		// (The drain loop also flushes on the !added return, but that is too
 		// late — it runs after HandleBlockDirect has already returned.)
-		flushWindow()
+		//
+		// For the CHECKPOINT block the async hand-off is not enough: its parent may
+		// still be committing in the window worker, so HandleBlockDirect's pre-flight
+		// parent check races the worker and fails (ErrBlockNotFound), then only the
+		// slow re-request path recovers — the deterministic checkpoint-boundary
+		// cold-start stall. flushWindowSync blocks until the pending window has
+		// actually committed, making the parent-availability guarantee real. Other
+		// (non-checkpoint) direct blocks keep the cheaper async hand-off.
+		if isCheckpointBlock {
+			flushWindowSync()
+		} else {
+			flushWindow()
+		}
 
 		directErr := sm.HandleBlockDirect(sm.ctx, peer, bmsg.blockHash, msgBlock)
 		if directErr != nil {
@@ -4099,6 +4111,15 @@ func (ps *parkStore) len() int { return len(ps.entries) }
 // (flushWorker → commitWindowJob).
 type windowFlushJob struct {
 	blocks []*model.Block
+
+	// done, when non-nil, is closed by the flush worker AFTER it has finished
+	// handling this job (committed, or skipped because poisoned/shutdown). It
+	// turns an otherwise fire-and-forget hand-off into a synchronous barrier: the
+	// drain goroutine can hand off a job and wait for the worker to quiesce,
+	// guaranteeing every earlier in-flight window has committed. Normal (async)
+	// jobs leave it nil. Used by flushWindowSync for the direct/checkpoint path,
+	// whose HandleBlockDirect requires its parent block already committed.
+	done chan struct{}
 }
 
 // drainJob drains and resets the accumulator, sorts the drained blocks ascending
@@ -4272,7 +4293,12 @@ func (sm *SyncManager) flushWorker(ctx context.Context, jobs <-chan windowFlushJ
 			// Context cancelled: exit without committing further. Drain any
 			// buffered jobs (committing none) so the drain goroutine's pending
 			// send, if any, does not block, then return once the channel closes.
-			for range jobs {
+			// Release any barrier waiter on each drained job so flushWindowSync
+			// cannot hang on shutdown.
+			for job := range jobs {
+				if job.done != nil {
+					close(job.done)
+				}
 			}
 
 			return
@@ -4284,11 +4310,17 @@ func (sm *SyncManager) flushWorker(ctx context.Context, jobs <-chan windowFlushJ
 			if poisoned {
 				// A prior window hit a fatal gap; commit no later window.
 				sm.logger.Warnf("[flushWorker] poisoned after fatal window commit, discarding queued window of %d blocks", len(job.blocks))
-				continue
+			} else if sm.commitWindowJobRecovered(ctx, job) {
+				poisoned = true
 			}
 
-			if sm.commitWindowJobRecovered(ctx, job) {
-				poisoned = true
+			// Release any barrier waiter AFTER the job has been fully handled
+			// (committed, or skipped when poisoned). A synchronous flusher
+			// (flushWindowSync) blocks on this so it observes the commit. Closed
+			// even when poisoned so the waiter never hangs — HandleBlockDirect's
+			// own parent-availability check then handles the (rare) poisoned case.
+			if job.done != nil {
+				close(job.done)
 			}
 		}
 	}
@@ -4659,6 +4691,50 @@ func (sm *SyncManager) blockHandler() {
 			}
 		}
 
+		// flushWindowSync is the synchronous variant of flushWindow used before a
+		// direct/checkpoint commit (see handleBlockMsgWithWindow). In pipeline mode
+		// it hands a barrier job (the pending window, possibly empty) to the flush
+		// worker and BLOCKS until the worker signals it finished committing — FIFO
+		// ordering means every earlier in-flight window has committed too, so a
+		// following HandleBlockDirect is guaranteed to find its parent already in the
+		// blockchain. Without this the async hand-off lets the direct commit race the
+		// worker and fail its parent check, stalling at the checkpoint boundary until
+		// the slow re-request path recovers. Only the drain goroutine calls this, so
+		// it never races another sender on jobs.
+		flushWindowSync := func() {
+			if wa == nil || !pipelineEnabled {
+				// Pipeline off: flushWindow already commits inline on this goroutine.
+				flushWindow()
+				return
+			}
+
+			done := make(chan struct{})
+
+			// drainJob yields ok=false (empty job) when nothing is pending; an empty
+			// job is still a valid barrier — it commits nothing but, being FIFO after
+			// any in-flight window, its completion proves that window committed.
+			j, _ := wa.drainJob()
+			j.done = done
+
+			select {
+			case jobs <- j:
+			case <-sm.quit:
+				return
+			case <-sm.ctx.Done():
+				return
+			}
+
+			select {
+			case <-done:
+			case <-sm.quit:
+			case <-sm.ctx.Done():
+			}
+
+			if flushTimer != nil {
+				flushTimer.Stop()
+			}
+		}
+
 		// armTimer (re-)starts the idle flush timer using the stop-drain-reset
 		// idiom: Stop returns false when the timer has already fired, in which
 		// case the channel may hold a value that must be drained before Reset —
@@ -4783,7 +4859,7 @@ func (sm *SyncManager) blockHandler() {
 				}
 
 				// Window path: call handleBlockMsgWithWindow.
-				outcome, err := sm.handleBlockMsgWithWindow(msg, wa, flushWindow, park)
+				outcome, err := sm.handleBlockMsgWithWindow(msg, wa, flushWindow, flushWindowSync, park)
 				switch outcome {
 				case blockAdmitParked:
 					// Parked ahead of block assembly. Decrement the backlog and

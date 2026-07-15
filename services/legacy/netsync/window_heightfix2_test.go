@@ -153,7 +153,7 @@ func TestHandleBlockMsgWithWindow_HeightFromHeaderChain_ParentAbsent(t *testing.
 		peer:        testPeer,
 	}
 
-	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, nil)
+	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, func() {}, nil)
 	addedToWindow := outcome == blockAdmitWindowed
 
 	// The core assertion: no parent-not-found failure. Before the fix this

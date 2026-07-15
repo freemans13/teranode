@@ -188,7 +188,7 @@ func TestHandleBlockMsgWithWindow_BackPressureBeforeAdd(t *testing.T) {
 		cancel()
 	}()
 
-	outcome, _ := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, nil)
+	outcome, _ := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, func() {}, nil)
 	addedToWindow := outcome == blockAdmitWindowed
 
 	require.Greater(t, ba.calls, 0,
@@ -298,7 +298,7 @@ func TestHandleBlockMsgWithWindow_FlushPrefixBeforeReject(t *testing.T) {
 		peer:        testPeer,
 	}
 
-	outcome, _ := sm.handleBlockMsgWithWindow(bmsg, wa, flushSpy, nil)
+	outcome, _ := sm.handleBlockMsgWithWindow(bmsg, wa, flushSpy, flushSpy, nil)
 	addedToWindow := outcome == blockAdmitWindowed
 
 	require.False(t, addedToWindow, "above-checkpoint block must take the direct path")

@@ -134,7 +134,7 @@ func TestHandleBlockMsgWithWindow_SkipsAlreadyCommittedBlock(t *testing.T) {
 		peer:        testPeer,
 	}
 
-	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, nil)
+	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, func() {}, nil)
 	addedToWindow := outcome == blockAdmitWindowed
 
 	require.NoError(t, err, "an already-committed block must be skipped cleanly (no error)")
@@ -202,7 +202,7 @@ func TestHandleBlockMsgWithWindow_SkipAdvancesSyncPump(t *testing.T) {
 		peer:        testPeer,
 	}
 
-	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, nil)
+	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, func() {}, nil)
 	addedToWindow := outcome == blockAdmitWindowed
 
 	// (a) Still skipped: no error, not added, no subtree/UTXO work.
@@ -259,7 +259,7 @@ func TestHandleBlockMsgWithWindow_ProcessesNotYetExistingBlock(t *testing.T) {
 		cancel()
 	}()
 
-	outcome, _ := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, nil)
+	outcome, _ := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, func() {}, nil)
 	addedToWindow := outcome == blockAdmitWindowed
 
 	require.Greater(t, ba.calls, 0,

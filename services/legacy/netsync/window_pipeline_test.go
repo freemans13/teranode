@@ -690,7 +690,7 @@ func TestPipeline_DirectPath_ParentUncommitted_ReRequestSafe(t *testing.T) {
 		peer:        testPeer,
 	}
 
-	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, flushWindow, nil)
+	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, flushWindow, flushWindow, nil)
 	addedToWindow := outcome == blockAdmitWindowed
 
 	// Core safety assertions:

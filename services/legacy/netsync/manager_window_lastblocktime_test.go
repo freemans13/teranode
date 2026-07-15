@@ -142,7 +142,7 @@ func TestHandleBlockMsgWithWindow_RefreshesLastBlockTimeOnAccept(t *testing.T) {
 		blockHash:   blockHash,
 		blockHeight: int32(blockHeight),
 		peer:        p,
-	}, wa, flushWindow, nil)
+	}, wa, flushWindow, flushWindow, nil)
 	addedToWindow := outcome == blockAdmitWindowed
 
 	require.NoError(t, err, "windowed accept must not error")
