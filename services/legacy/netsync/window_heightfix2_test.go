@@ -153,7 +153,8 @@ func TestHandleBlockMsgWithWindow_HeightFromHeaderChain_ParentAbsent(t *testing.
 		peer:        testPeer,
 	}
 
-	addedToWindow, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {})
+	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, nil)
+	addedToWindow := outcome == blockAdmitWindowed
 
 	// The core assertion: no parent-not-found failure. Before the fix this
 	// returned the BLOCK_NOT_FOUND / "failed to get prev block header" error.

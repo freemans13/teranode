@@ -2184,6 +2184,19 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	return nil
 }
 
+// blockAdmitOutcome is the result of handleBlockMsgWithWindow: whether the block
+// was processed directly / not added (Direct — the legacy !added semantics),
+// added to the window accumulator (Windowed — the legacy added semantics), or
+// parked ahead of the block-assembly maturity gate (Parked). The three outcomes
+// drive distinct backlog/ack/requeue accounting in the drain loop.
+type blockAdmitOutcome int
+
+const (
+	blockAdmitDirect   blockAdmitOutcome = iota // processed directly or not added
+	blockAdmitWindowed                          // added to the window accumulator
+	blockAdmitParked                            // parked ahead of block assembly; early-acked, released later
+)
+
 // handleBlockMsgWithWindow is the window-enabled variant of handleBlockMsg.
 // It delegates the shared serial preamble to handleBlockPreamble, then — when
 // the block is eligible for the window path (legacyUnified returns true) —
@@ -2204,12 +2217,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 // (the sync peer's LastBlock() far exceeds our best height); those branches
 // would also be skipped on the normal handleBlockMsg path for the same reason.
 // There is no behaviour divergence.
-func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator, flushWindow func()) (addedToWindow bool, err error) {
+func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator, flushWindow func(), park *parkStore) (blockAdmitOutcome, error) {
 	sm.logger.Debugf("[handleBlockMsgWithWindow][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 
 	peer, state, catchingBlocks, isCheckpointBlock, headerHeight, preambleErr := sm.handleBlockPreamble("handleBlockMsgWithWindow", bmsg)
 	if preambleErr != nil {
-		return false, preambleErr
+		return blockAdmitDirect, preambleErr
 	}
 
 	// Already-committed guard (mirrors HandleBlockDirect, handle_block.go). A peer
@@ -2230,7 +2243,7 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	blockExists, existsErr := sm.blockchainClient.GetBlockExists(sm.ctx, &bmsg.blockHash)
 	if existsErr != nil {
 		sm.logger.Errorf("[handleBlockMsgWithWindow][%s] failed to check if block exists: %s", bmsg.blockHash, existsErr)
-		return false, errors.NewProcessingError("failed to check if block exists", existsErr)
+		return blockAdmitDirect, errors.NewProcessingError("failed to check if block exists", existsErr)
 	}
 
 	if blockExists {
@@ -2249,12 +2262,12 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		// peer/state/isCheckpointBlock were all resolved by the preamble above.
 		sm.pumpBlockRequests(peer, state, isCheckpointBlock, bmsg.blockHash)
 
-		return false, nil
+		return blockAdmitDirect, nil
 	}
 
 	msgBlock := bmsg.block
 	if msgBlock == nil {
-		return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] block message carries no block", bmsg.blockHash)
+		return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] block message carries no block", bmsg.blockHash)
 	}
 
 	// Determine block height. The authoritative source is the headers-first
@@ -2280,7 +2293,7 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	case headerHeight > 0:
 		h, convErr := safeconversion.Int32ToUint32(headerHeight)
 		if convErr != nil {
-			return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to convert header-chain height", bmsg.blockHash, convErr)
+			return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to convert header-chain height", bmsg.blockHash, convErr)
 		}
 
 		blockHeightUint32 = h
@@ -2288,14 +2301,14 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	case block.Height() > 0:
 		h, convErr := safeconversion.Int32ToUint32(block.Height())
 		if convErr != nil {
-			return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to convert block height", bmsg.blockHash, convErr)
+			return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to convert block height", bmsg.blockHash, convErr)
 		}
 
 		blockHeightUint32 = h
 	default:
 		_, prevMeta, headerErr := sm.blockchainClient.GetBlockHeader(sm.ctx, &prevBlockHash)
 		if headerErr != nil {
-			return false, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to get prev block header for height determination", bmsg.blockHash, headerErr)
+			return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] failed to get prev block header for height determination", bmsg.blockHash, headerErr)
 		}
 
 		blockHeightUint32 = prevMeta.Height + 1
@@ -2341,13 +2354,13 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 				bestBlockHeader, bestBlockHeaderMeta, getErr := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
 				if getErr != nil {
 					sm.logger.Errorf("Failed to get best block header: %v", getErr)
-					return false, nil
+					return blockAdmitDirect, nil
 				}
 
 				locator, locErr := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
 				if locErr != nil {
 					sm.logger.Errorf("Failed to get block locator for the block hash %s: %v", bmsg.blockHash, locErr)
-					return false, nil
+					return blockAdmitDirect, nil
 				}
 
 				zeroHash := chainhash.Hash{}
@@ -2355,11 +2368,11 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 					sm.logger.Errorf("Failed to send getblocks message: %v", pushErr)
 				}
 
-				return false, nil
+				return blockAdmitDirect, nil
 			}
 
 			if errors.Is(directErr, context.Canceled) || errors.IsContextError(directErr) {
-				return false, nil
+				return blockAdmitDirect, nil
 			}
 
 			serviceError := errors.Is(directErr, errors.ErrServiceError) || errors.Is(directErr, errors.ErrStorageError)
@@ -2368,30 +2381,55 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 			}
 
 			sm.logger.Errorf("Failed to process new block in service blockQueueMsg %v: %v", bmsg.blockHash, directErr)
-			return false, directErr
+			return blockAdmitDirect, directErr
 		}
 
 		sm.runPostBlockProcessing(peer, state, bmsg, isCheckpointBlock)
-		return false, nil
+		return blockAdmitDirect, nil
 	}
 
-	// Restore block-assembly back-pressure parity with HandleBlockDirect: stop
-	// netsync outrunning block assembly by more than MaxBlocksBehindBlockAssembly.
-	// The proven direct path waits here (handle_block.go); the window path had
-	// dropped it. Only the window-add path needs this — the direct/checkpoint
-	// branch above already goes through HandleBlockDirect, which waits itself.
-	// On error we return it (addedToWindow=false), matching HandleBlockDirect.
-	if waitErr := sm.waitForBlockAssemblyReadyCached(sm.ctx, blockHeightUint32); waitErr != nil {
-		return false, waitErr
+	// Block-assembly back-pressure gate (coinbase-maturity ceiling), parity with
+	// HandleBlockDirect (handle_block.go). When parking is enabled and the cache is
+	// evaluable we classify NON-BLOCKINGLY instead of freezing the drain goroutine
+	// for up to windowMaturityMaxWait: a block within the gate is prepared and
+	// admitted now; a block beyond the gate is prepared, early-acked and PARKED, so
+	// the drain loop returns immediately and can refetch the low block and flush.
+	// Parked blocks are released back into the window ascending as block assembly
+	// advances (releaseParkedBlocks, on the refill tick). When parking is disabled
+	// or the cache is not yet evaluable we keep the original blocking wait —
+	// byte-identical to today.
+	parkThisBlock := false
+
+	if park != nil {
+		admit, evaluable := sm.blockAssemblyGateAdmitsCached(blockHeightUint32)
+		switch {
+		case !evaluable:
+			if waitErr := sm.waitForBlockAssemblyReadyCached(sm.ctx, blockHeightUint32); waitErr != nil {
+				return blockAdmitDirect, waitErr
+			}
+		case admit:
+			// Within the gate: admit now (fall through to prepare + wa.add).
+		default:
+			// Beyond the gate: park after preparing. Cheap count-cap check first so a
+			// full buffer never pays a wasted prepareBlockForWindow; on overflow the
+			// block is requeued via the tolerated-error direct path (self-correcting).
+			if park.countFull() {
+				return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] park buffer full (count) at height %d; will re-fetch", bmsg.blockHash, blockHeightUint32)
+			}
+
+			parkThisBlock = true
+		}
+	} else {
+		if waitErr := sm.waitForBlockAssemblyReadyCached(sm.ctx, blockHeightUint32); waitErr != nil {
+			return blockAdmitDirect, waitErr
+		}
 	}
 
-	// Eligible for window: prepare the block synchronously on the drain goroutine
-	// (prepareBlockForWindow does not mutate any SyncManager state that isn't
-	// read-only after startup).
+	// Prepare exactly once: both the admit and the park paths need a prepared block.
 	prepared, prepErr := sm.prepareBlockForWindow(sm.ctx, peer, bmsg.blockHash, msgBlock, blockHeightUint32)
 	if prepErr != nil {
 		if errors.Is(prepErr, context.Canceled) || errors.IsContextError(prepErr) {
-			return false, nil
+			return blockAdmitDirect, nil
 		}
 
 		serviceError := errors.Is(prepErr, errors.ErrServiceError) || errors.Is(prepErr, errors.ErrStorageError)
@@ -2400,36 +2438,33 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		}
 
 		sm.logger.Errorf("[handleBlockMsgWithWindow][%s] prepareBlockForWindow failed: %v", bmsg.blockHash, prepErr)
-		return false, prepErr
+
+		return blockAdmitDirect, prepErr
+	}
+
+	if parkThisBlock {
+		if park.full(int64(prepared.SizeInBytes)) { //nolint:gosec
+			return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] park buffer full (bytes) at height %d; will re-fetch", bmsg.blockHash, blockHeightUint32)
+		}
+
+		park.add(prepared)
+		sm.logger.Debugf("[handleBlockMsgWithWindow][%s] parked block height %d ahead of block assembly; %d parked", bmsg.blockHash, blockHeightUint32, park.len())
+
+		return blockAdmitParked, nil
 	}
 
 	wa.add(prepared)
 
-	// Refresh the sync peer's last-block time on the accept path, mirroring the
-	// non-window path (handleBlockMsg -> HandleBlockDirect, see the same call in
-	// handleBlockMsg). Windowed blocks never reach that refresh, so without this
-	// lastBlockTime goes stale during a sustained window run even though blocks
-	// are being accepted and committed. When blockBacklog later drains to 0 the
-	// stall detector (handleCheckSyncPeer) would then see a large time-since-last-
-	// block and could falsely rotate a healthy sync peer. Only runs on the accept
-	// (addedToWindow=true) outcome; the ineligible/checkpoint/reject branches go
-	// through HandleBlockDirect, which already refreshes it.
+	// Refresh the sync peer's last-block time on the accept path (mirrors the
+	// non-window path; prevents a false sync-peer rotation when blockBacklog drains).
 	if sps, ok := sm.syncPeerStateFor(peer); ok {
 		sps.updateLastBlockTime()
 	}
 
-	// Advance the headers-first pipeline pump for every windowed block.
-	// The peer-height-update and FSM-RUN blocks are intentionally omitted here:
-	// those are guarded by sm.current() and windowed blocks are all below the
-	// hardcoded checkpoint (not current), so they would never fire. fetchHeaderBlocks
-	// MUST run so the sync peer keeps being asked for more blocks while the window
-	// accumulates — without it the in-flight count falls to zero after requestedBlocks
-	// deletion in the preamble and the pipeline stalls until the window flushes.
-	// All state touched here (headerList, startHeader, requestedBlocks) is
-	// drain-goroutine-only; this call is safe because we are still on that goroutine.
+	// Advance the headers-first block-download pump for every windowed block.
 	sm.pumpBlockRequests(peer, state, isCheckpointBlock, bmsg.blockHash)
 
-	return true, nil
+	return blockAdmitWindowed, nil
 }
 
 // pumpBlockRequests advances the headers-first block-download pipeline: it either
@@ -4011,6 +4046,53 @@ func (wa *windowAccumulator) empty() bool {
 	return len(wa.entries) == 0
 }
 
+// parkStore holds prepared, early-acked blocks that are beyond the block-assembly
+// maturity gate (more than MaxBlocksBehindBlockAssembly ahead of block assembly).
+// They are released back into the window accumulator, ascending and contiguous
+// with the committed tip, as block assembly advances (see releaseParkedBlocks,
+// run on the continuous-refill tick).
+//
+// Drain-goroutine-local: only the single blockQueue drain goroutine ever touches
+// it, so it needs no lock — same single-owner discipline as windowAccumulator.
+//
+// A parked block is already early-acked (its prefetch-budget reservation has been
+// released) and its subtrees are already flushed to the blob store, so its heap
+// cost is the same KB-scale header/coinbase/subtree-list as a block sitting in the
+// window accumulator. The bound is therefore primarily the count cap (maxBlocks)
+// with the GOMEMLIMIT-fraction byte budget as a secondary ceiling.
+type parkStore struct {
+	entries    []windowEntry
+	bytesAccum int64
+	budget     int64 // GOMEMLIMIT × ParallelWindowParkedMemoryFraction; 0 disables the byte cap
+	maxBlocks  int   // hard count cap (ParallelWindowMaxParkedBlocks); primary bound
+}
+
+func newParkStore(budget int64, maxBlocks int) *parkStore {
+	return &parkStore{entries: make([]windowEntry, 0, 16), budget: budget, maxBlocks: maxBlocks}
+}
+
+// countFull reports whether the count cap is hit (checkable before prepare so a
+// full buffer never pays a wasted prepareBlockForWindow).
+func (ps *parkStore) countFull() bool {
+	return ps.maxBlocks > 0 && len(ps.entries) >= ps.maxBlocks
+}
+
+// full reports whether adding a block of `next` bytes would breach either cap.
+func (ps *parkStore) full(next int64) bool {
+	if ps.countFull() {
+		return true
+	}
+
+	return ps.budget > 0 && ps.bytesAccum+next > ps.budget
+}
+
+func (ps *parkStore) add(b *model.Block) {
+	ps.entries = append(ps.entries, windowEntry{block: b})
+	ps.bytesAccum += int64(b.SizeInBytes) //nolint:gosec
+}
+
+func (ps *parkStore) len() int { return len(ps.entries) }
+
 // windowFlushJob is a drained, ascending-sorted window ready to commit. It is
 // produced on the drain goroutine (drainJob) and consumed either synchronously
 // (flush → commitWindowJob) or, in pipeline mode, by the single flush worker
@@ -4332,6 +4414,97 @@ func (sm *SyncManager) ackWindowedBlock(reply chan error, wa *windowAccumulator,
 	armTimer()
 }
 
+// releaseParkedBlocks moves parked far-ahead blocks that block assembly has now
+// matured past back into the window accumulator. It runs on the drain goroutine
+// (the continuous-refill tick), so it needs no lock. Two invariants make it safe:
+//
+//   - CONTIGUITY: it releases ONLY the ascending run that is contiguous with the
+//     committed tip — the first released height must equal cached+1 and each
+//     subsequent height must be exactly one higher. A gap stops the run. This
+//     guarantees a released block's parent is already committed (<= cached) or was
+//     released earlier in the same ascending run, so a flush can never present
+//     ProcessBlockWindow with a missing parent (recoverWindowCommit would treat
+//     that as fatal and escalate to a sync-peer disconnect + pipeline poison).
+//   - CEILING: it never releases past cached+maxBehind, the exact coinbase-maturity
+//     inequality of the admission gate, so parking never admits a block early and a
+//     single pass releases at most maxBehind blocks (so a large block-assembly jump
+//     cannot monopolise the drain goroutine in one iteration).
+func (sm *SyncManager) releaseParkedBlocks(park *parkStore, wa *windowAccumulator, flushWindow, armTimer func()) {
+	if park == nil || park.len() == 0 {
+		return
+	}
+
+	maxBehind := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
+	if maxBehind <= 0 {
+		return
+	}
+
+	cached := sm.cachedBlockAssemblyHeight.Load()
+	if cached == 0 || cached > math.MaxUint32-uint32(maxBehind) {
+		return
+	}
+
+	ceiling := cached + uint32(maxBehind)
+
+	sort.Slice(park.entries, func(i, j int) bool {
+		return park.entries[i].block.Height < park.entries[j].block.Height
+	})
+
+	next := cached + 1 // required height for contiguity with the committed tip
+	survivors := make([]windowEntry, 0, park.len())
+	released := 0
+
+	for i := range park.entries {
+		b := park.entries[i].block
+		h := b.Height
+
+		switch {
+		case h <= cached:
+			// At/below the committed tip. A parked eligible below-checkpoint block is
+			// not committed by any other path, so this is defensive; it was already
+			// early-acked, so just drop it (do not re-add — this is why the release
+			// path needs no GetBlockExists re-check).
+			park.bytesAccum -= int64(b.SizeInBytes) //nolint:gosec
+			sm.logger.Debugf("[releaseParkedBlocks] dropping parked block height %d at/below committed tip %d", h, cached)
+		case h == next && h <= ceiling:
+			wa.add(b)
+			park.bytesAccum -= int64(b.SizeInBytes) //nolint:gosec
+			next++
+			released++
+
+			if wa.full() {
+				flushWindow()
+			}
+		default:
+			// Gap (h != next) or beyond the ceiling. Sorted ascending, so this and
+			// every higher parked block must stay. Keep the remainder and stop.
+			survivors = append(survivors, park.entries[i:]...)
+
+			park.entries = survivors
+			if released > 0 {
+				if !wa.empty() {
+					armTimer()
+				}
+
+				sm.logger.Debugf("[releaseParkedBlocks] released %d parked blocks into window (cached %d, ceiling %d, %d still parked)", released, cached, ceiling, park.len())
+			}
+
+			return
+		}
+	}
+
+	// Fell off the end: every remaining parked block was dropped or released.
+	park.entries = survivors
+
+	if released > 0 {
+		if !wa.empty() {
+			armTimer()
+		}
+
+		sm.logger.Debugf("[releaseParkedBlocks] released %d parked blocks into window (cached %d, ceiling %d, %d still parked)", released, cached, ceiling, park.len())
+	}
+}
+
 // effectiveGOMEMLIMIT reads the current GOMEMLIMIT without modifying it.
 // Returns a 6 GB fallback when the limit is unset (math.MaxInt64) or <= 0.
 func effectiveGOMEMLIMIT() int64 {
@@ -4454,6 +4627,20 @@ func (sm *SyncManager) blockHandler() {
 			refillC = refillTicker.C
 		}
 
+		// Park store for far-ahead blocks (non-blocking maturity gate). Requires the
+		// window path AND the refill tick (its release trigger); if parking is
+		// requested without the refill tick we warn and leave park nil, so the gate
+		// falls back to the original blocking wait (a no-op, never a wedge).
+		var park *parkStore
+		if windowEnabled && sm.settings.Legacy.ParallelWindowParkAhead {
+			if refillC == nil {
+				sm.logger.Warnf("[blockHandler] parallelWindowParkAhead requires inFlightRefillInterval>0 for the release trigger; parking disabled")
+			} else {
+				parkBudget := windowBudgetBytes(sm.settings.Legacy.ParallelWindowParkedMemoryFraction)
+				park = newParkStore(parkBudget, sm.settings.Legacy.ParallelWindowMaxParkedBlocks)
+			}
+		}
+
 		flushWindow := func() {
 			if wa != nil && !wa.empty() {
 				if pipelineEnabled {
@@ -4509,6 +4696,16 @@ func (sm *SyncManager) blockHandler() {
 				// (this goroutine) sends on or closes jobs.
 				sm.shutdownFlushHandoff(wa, jobs)
 
+				// Parked blocks were already early-acked and backlog-decremented at
+				// park time, and their data lives in the blob store; on shutdown they
+				// are simply discarded and re-synced from the committed best-block on
+				// restart. No reply or backlog action is owed here.
+				if park != nil && park.len() > 0 {
+					sm.logger.Warnf("[blockHandler] shutdown: discarding %d parked blocks; will re-sync from committed best-block on restart", park.len())
+					park.entries = nil
+					park.bytesAccum = 0
+				}
+
 				// Best-effort drain of already-queued blocks with an error reply
 				// before exiting. Under prefetch each queued block has an
 				// awaitBlockResult goroutine holding budget and waiting on its
@@ -4543,7 +4740,12 @@ func (sm *SyncManager) blockHandler() {
 			case <-refillC:
 				// Continuous-refill top-up on the drain goroutine. No-op unless in
 				// headers-first IBD; getdata top-up only, never getheaders re-arm.
+				// maintainInFlightWindow runs FIRST so the low (tip+1) block keeps
+				// priority on the refetch budget, then release any parked far-ahead
+				// blocks that block assembly has now matured past. No-op when parking
+				// is disabled (park is nil).
 				sm.maintainInFlightWindow()
+				sm.releaseParkedBlocks(park, wa, flushWindow, armTimer)
 			case hmsg := <-headersQueue:
 				// Runs on the SAME goroutine as block processing, so the shared
 				// headers-first state is never touched concurrently.
@@ -4581,8 +4783,28 @@ func (sm *SyncManager) blockHandler() {
 				}
 
 				// Window path: call handleBlockMsgWithWindow.
-				added, err := sm.handleBlockMsgWithWindow(msg, wa, flushWindow)
-				if !added {
+				outcome, err := sm.handleBlockMsgWithWindow(msg, wa, flushWindow, park)
+				switch outcome {
+				case blockAdmitParked:
+					// Parked ahead of block assembly. Decrement the backlog and
+					// early-ack now (releasing the prefetch-budget reservation) exactly
+					// as for an admitted block: a parked block is prepared, its subtrees
+					// are in the blob store, and it is held in the drain-owned park
+					// buffer (its own memory budget) until releaseParkedBlocks admits it.
+					// No requeue, no flush, no timer — releaseParkedBlocks arms the timer
+					// when it admits.
+					sm.blockBacklog.Add(-1)
+
+					if msg.reply != nil {
+						msg.reply <- nil
+					}
+				case blockAdmitWindowed:
+					// Block was added to the window accumulator. Send the ack at
+					// accept-time (or, when the window is now full, after the
+					// full-flush commit — withhold-on-full back-pressure).
+					sm.blockBacklog.Add(-1)
+					sm.ackWindowedBlock(msg.reply, wa, flushWindow, armTimer, stopTimer)
+				default: // blockAdmitDirect (incl. park-overflow tolerated error)
 					// Block was processed directly (or failed).
 					// handleBlockMsgWithWindow does not send the reply on the
 					// direct path — we send the outcome here.
@@ -4601,12 +4823,6 @@ func (sm *SyncManager) blockHandler() {
 
 					// Flush any pending window now that an ineligible block arrived.
 					flushWindow()
-				} else {
-					// Block was added to the window accumulator. Send the ack at
-					// accept-time (or, when the window is now full, after the
-					// full-flush commit — withhold-on-full back-pressure).
-					sm.blockBacklog.Add(-1)
-					sm.ackWindowedBlock(msg.reply, wa, flushWindow, armTimer, stopTimer)
 				}
 			}
 		}
@@ -5126,6 +5342,25 @@ func (sm *SyncManager) DonePeer(peer *peerpkg.Peer, done chan struct{}) {
 	sm.msgChan <- &donePeerMsg{peer: peer, reply: done}
 }
 
+// blockAssemblyGateAdmitsCached is the non-blocking form of the maturity gate. It
+// returns (admit, evaluable): `evaluable` is true only when the cached fast path
+// applies (positive maxBehind, below-checkpoint, cache polled and non-overflow);
+// when evaluable, `admit` is the exact coinbase-maturity inequality used by the
+// blocking fast path (cached+maxBehind >= blockHeight over the stale-LOW cache),
+// so it can never wrongly admit. When !evaluable the caller must fall back to the
+// blocking wait. This is the single source of truth for the gate predicate;
+// waitForBlockAssemblyReadyCached calls it so the two can never drift.
+func (sm *SyncManager) blockAssemblyGateAdmitsCached(blockHeight uint32) (admit, evaluable bool) {
+	maxBehind := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
+	if maxBehind > 0 && sm.chainParams != nil && model.BelowCheckpoint(sm.chainParams.Checkpoints, blockHeight) {
+		if cached := sm.cachedBlockAssemblyHeight.Load(); cached > 0 && cached <= math.MaxUint32-uint32(maxBehind) {
+			return cached+uint32(maxBehind) >= blockHeight, true
+		}
+	}
+
+	return false, false
+}
+
 // waitForBlockAssemblyReadyCached enforces the coinbase-maturity back-pressure
 // bound (block-assembly must be within MaxBlocksBehindBlockAssembly of blockHeight)
 // without paying a per-block gRPC round-trip on the serial drain path in the
@@ -5160,26 +5395,22 @@ func (sm *SyncManager) waitForBlockAssemblyReadyCached(ctx context.Context, bloc
 	// is pinned so the true height is monotonic and can only be >= cached. So if
 	// cached+maxBehind >= blockHeight, the true height also satisfies the bound and
 	// the maturity guarantee is preserved without any gRPC.
-	if maxBehind > 0 && sm.chainParams != nil && model.BelowCheckpoint(sm.chainParams.Checkpoints, blockHeight) {
-		// Guard the uint32 addition against wraparound exactly as the slow-path
-		// helper does; on possible overflow, defer to the slow path.
-		if cached := sm.cachedBlockAssemblyHeight.Load(); cached > 0 && cached <= math.MaxUint32-uint32(maxBehind) {
-			if cached+uint32(maxBehind) >= blockHeight {
-				return nil
-			}
-
-			// Cache is usable (polled, non-overflow) but behind the bound. Instead of
-			// the coarse exponential-backoff fresh-gRPC wait (20ms,80ms,...,5s steps
-			// that leave the parallel window idle in ~5s bursts), re-check the
-			// poller-refreshed cache at a short fixed interval so the window
-			// re-engages within one interval of block assembly advancing — a smooth,
-			// steady release at block-assembly's rate. No gRPC in this loop; the
-			// background poller does that. The loop is bounded by windowMaturityMaxWait
-			// so a genuine block-assembly stall (cache never advances) is still
-			// detected and escalated with an error, preserving the stall-detection
-			// semantics of the old 100-retry exponential path.
-			return sm.waitForBlockAssemblyCachePoll(ctx, blockHeight, maxBehind)
+	if admit, evaluable := sm.blockAssemblyGateAdmitsCached(blockHeight); evaluable {
+		if admit {
+			return nil
 		}
+
+		// Cache is usable (polled, non-overflow) but behind the bound. Instead of
+		// the coarse exponential-backoff fresh-gRPC wait (20ms,80ms,...,5s steps
+		// that leave the parallel window idle in ~5s bursts), re-check the
+		// poller-refreshed cache at a short fixed interval so the window
+		// re-engages within one interval of block assembly advancing — a smooth,
+		// steady release at block-assembly's rate. No gRPC in this loop; the
+		// background poller does that. The loop is bounded by windowMaturityMaxWait
+		// so a genuine block-assembly stall (cache never advances) is still
+		// detected and escalated with an error, preserving the stall-detection
+		// semantics of the old 100-retry exponential path.
+		return sm.waitForBlockAssemblyCachePoll(ctx, blockHeight, maxBehind)
 	}
 
 	// Slow path: unchanged fresh-gRPC wait (retry loop + overflow guard). Taken for

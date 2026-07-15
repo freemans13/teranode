@@ -134,7 +134,8 @@ func TestHandleBlockMsgWithWindow_SkipsAlreadyCommittedBlock(t *testing.T) {
 		peer:        testPeer,
 	}
 
-	addedToWindow, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {})
+	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, nil)
+	addedToWindow := outcome == blockAdmitWindowed
 
 	require.NoError(t, err, "an already-committed block must be skipped cleanly (no error)")
 	require.False(t, addedToWindow,
@@ -201,7 +202,8 @@ func TestHandleBlockMsgWithWindow_SkipAdvancesSyncPump(t *testing.T) {
 		peer:        testPeer,
 	}
 
-	addedToWindow, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {})
+	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, nil)
+	addedToWindow := outcome == blockAdmitWindowed
 
 	// (a) Still skipped: no error, not added, no subtree/UTXO work.
 	require.NoError(t, err, "an already-committed block must be skipped cleanly")
@@ -257,7 +259,8 @@ func TestHandleBlockMsgWithWindow_ProcessesNotYetExistingBlock(t *testing.T) {
 		cancel()
 	}()
 
-	addedToWindow, _ := sm.handleBlockMsgWithWindow(bmsg, wa, func() {})
+	outcome, _ := sm.handleBlockMsgWithWindow(bmsg, wa, func() {}, nil)
+	addedToWindow := outcome == blockAdmitWindowed
 
 	require.Greater(t, ba.calls, 0,
 		"a not-yet-existing block must flow PAST the guard into the window path (reaching WaitForBlockAssemblyReady)")

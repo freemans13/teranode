@@ -690,7 +690,8 @@ func TestPipeline_DirectPath_ParentUncommitted_ReRequestSafe(t *testing.T) {
 		peer:        testPeer,
 	}
 
-	addedToWindow, err := sm.handleBlockMsgWithWindow(bmsg, wa, flushWindow)
+	outcome, err := sm.handleBlockMsgWithWindow(bmsg, wa, flushWindow, nil)
+	addedToWindow := outcome == blockAdmitWindowed
 
 	// Core safety assertions:
 	// 1. No error propagated — the ErrBlockNotFound re-request branch consumed it
