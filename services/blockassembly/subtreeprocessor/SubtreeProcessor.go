@@ -244,6 +244,10 @@ type SubtreeProcessor struct {
 	// resetCh handles requests to reset the processor state
 	resetCh chan *resetBlocks
 
+	// reconcileCoinbasesCh handles requests to create canonical coinbase UTXOs
+	// for a set of gap blocks, without touching any other in-memory state
+	reconcileCoinbasesCh chan reconcileCoinbasesMsg
+
 	// removeTxCh receives transactions to be removed
 	removeTxCh chan chainhash.Hash
 
@@ -541,6 +545,7 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 		moveForwardBlockChan:         make(chan moveBlockRequest),
 		reorgBlockChan:               make(chan reorgBlocksRequest),
 		resetCh:                      make(chan *resetBlocks),
+		reconcileCoinbasesCh:         make(chan reconcileCoinbasesMsg),
 		removeTxCh:                   make(chan chainhash.Hash, 100),
 		lengthCh:                     make(chan chan int),
 		checkSubtreeProcessorCh:      make(chan chan error),
@@ -895,6 +900,18 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					}
 
 					stp.setCurrentRunningState(StateRunning)
+
+				case reconcileMsg := <-stp.reconcileCoinbasesCh:
+					// Panic-safe like the reset/checkSubtreeProcessor handlers above -
+					// without runHandlerWithRecover, a panic here would kill the processor
+					// goroutine (recovered only by the top-level goroutine recover, which
+					// just logs and exits) and leave the caller of ReconcileCoinbases
+					// blocked forever on responseCh.
+					reconcileErr := stp.runHandlerWithRecover("reconcileCoinbases", func() error {
+						return stp.reconcileCoinbases(reconcileMsg.ctx, reconcileMsg.gapBlocks)
+					})
+
+					reconcileMsg.responseCh <- reconcileErr
 
 				case removeTxHash := <-stp.removeTxCh:
 					// remove the given transaction from the subtrees.
@@ -4120,11 +4137,14 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 // Parameters:
 //   - ctx: Context for cancellation
 //   - block: Block containing the coinbase transaction
-//   - subtreeHash: Hash of the subtree containing the coinbase
 //
 // Returns:
 //   - error: Any error encountered during removal
 func (stp *SubtreeProcessor) removeCoinbaseUtxos(ctx context.Context, block *model.Block) error {
+	if block == nil || block.CoinbaseTx == nil {
+		return errors.NewProcessingError("[SubtreeProcessor][removeCoinbaseUtxos] block or coinbase transaction is nil")
+	}
+
 	// get all child spends of the coinbase, this will lock them in the utxo store
 	// so they cannot be spent while we are processing the reorg
 	childSpendHashes, err := utxostore.GetAndLockChildren(ctx, stp.utxoStore, *block.CoinbaseTx.TxIDChainHash())

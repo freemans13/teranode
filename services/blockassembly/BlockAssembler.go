@@ -611,7 +611,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 		return nil
 	}
 
-	baBestBlockHeader, _ := b.CurrentBlock()
+	baBestBlockHeader, baHeight := b.CurrentBlock()
 
 	// Update the internal best block reference before SubtreeProcessor.Reset runs the
 	// postProcessFn (which calls loadUnminedTransactions). Without this, CurrentBlock()
@@ -635,6 +635,14 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 
 		_, bestBlockchainBlockHeaderMeta, err := b.blockchainClient.GetBlockHeader(ctx, bestBlockchainBlockHeader.Hash())
 		if err != nil {
+			// Reset failed and we cannot resolve the fallback height. The optimistic
+			// write at the top of reset() left b.bestBlock on the *new* tip; if we
+			// returned now the chain pointer would sit ahead of the coinbase state and
+			// the next reconcile would short-circuit on the "tips equal" branch,
+			// stranding the coinbase permanently. Restore the pre-reset tip (the
+			// known-consistent state that matched the coinbases before this attempt)
+			// so the next reconcile retries a genuine divergence.
+			b.setBestBlockHeader(baBestBlockHeader, baHeight)
 			return errors.NewProcessingError("[Reset] error getting best block header meta", err)
 		}
 
@@ -961,6 +969,19 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 
 	// Start SubtreeProcessor goroutine after loading unmined transactions to avoid race conditions
 	b.subtreeProcessor.Start(ctx)
+
+	// Detect and repair a coinbase divergence left by a prior unclean shutdown
+	// (e.g. crash mid fast-forward create loop) before the node begins
+	// advancing. Must run after subtreeProcessor.Start, since a repair uses
+	// subtreeProcessor.ReconcileCoinbases, and before startChannelListeners,
+	// so no new block/subtree notifications are processed against a diverged
+	// tip. The return value is always nil: an unrecoverable divergence is
+	// logged loudly (and surfaced via the "escalated" metric) rather than
+	// failing Start, since crash-looping the process would not help an
+	// operator. Discarded explicitly (rather than changing the signature)
+	// so the direct-call test (checkCoinbaseDivergenceOnStart) keeps its
+	// require.NoError(...) call shape.
+	_ = b.checkCoinbaseDivergenceOnStart(ctx)
 
 	if err = b.startChannelListeners(ctx); err != nil {
 		return errors.NewProcessingError("[BlockAssembler] failed to start channel listeners: %v", err)

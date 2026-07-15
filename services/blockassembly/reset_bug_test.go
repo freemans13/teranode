@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -213,4 +214,54 @@ func TestHandleReorg_FallbackReset_ReturnsNilInsteadOfResetError(t *testing.T) {
 	require.Error(t, err, "BUG: handleReorg should return an error after fallback reset to prevent caller from overwriting best block")
 	require.True(t, errors.Is(err, errors.ErrBlockAssemblyReset),
 		"handleReorg should return ErrBlockAssemblyReset after fallback reset, got: %v", err)
+}
+
+// TestReset_FallbackHeaderFailure_RestoresPreResetTip covers a bug where reset()
+// optimistically writes the chain pointer (b.bestBlock) to the new tip before
+// running subtreeProcessor.Reset. Normally the realign after Reset corrects this,
+// but when Reset fails AND the fallback GetBlockHeader (looking up the subtree
+// processor's own current header) also fails, reset() used to return immediately,
+// leaving the chain pointer parked on the optimistic new tip while the coinbase
+// state (tracked by the subtree processor) never moved. That divergence between
+// the chain pointer and the coinbase state is exactly what this feature's recovery
+// logic exists to fix — so reset() must not itself introduce it.
+//
+// This test would have failed before the fix: CurrentBlock() would have returned
+// the optimistic new tip instead of the pre-reset tip.
+func TestReset_FallbackHeaderFailure_RestoresPreResetTip(t *testing.T) {
+	initPrometheusMetrics()
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t)
+	require.NotNil(t, items)
+
+	// Blockchain has block1 -> block2. BA is parked behind, at block1 (height 1),
+	// so reset() must move it forward to block2 (height 2) — this is the "optimistic
+	// new tip" that reset() writes before subtreeProcessor.Reset runs. Without this
+	// genuine gap between the pre-reset tip and the optimistic new tip, the bug this
+	// test targets (the optimistic write never getting rolled back) can't be observed.
+	addBlockWithMinedSet(ctx, t, items, blockHeader1)
+	addBlockWithMinedSet(ctx, t, items, blockHeader2)
+	items.blockAssembler.setBestBlockHeader(blockHeader1, 1)
+	items.blockAssembler.subtreeProcessor.InitCurrentBlockHeader(blockHeader1)
+
+	// Inject an STP whose Reset fails and whose GetCurrentBlockHeader returns a
+	// header the blockchain store does not know, so the fallback GetBlockHeader errors.
+	mockStp := &subtreeprocessor.MockSubtreeProcessor{}
+	unknown := &model.BlockHeader{Version: 1, HashPrevBlock: blockHeader2.Hash(), HashMerkleRoot: &chainhash.Hash{}, Nonce: 99999, Bits: *bits}
+	mockStp.On("WaitForPendingBlocks", mock.Anything).Return(nil)
+	mockStp.On("Reset", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(subtreeprocessor.ResetResponse{Err: errors.NewProcessingError("boom")})
+	mockStp.On("GetCurrentBlockHeader").Return(unknown)
+	injectMockStp(t, items, mockStp)
+
+	preHeader, preHeight := items.blockAssembler.CurrentBlock()
+	require.True(t, preHeader.Hash().IsEqual(blockHeader1.Hash()))
+	require.Equal(t, uint32(1), preHeight)
+
+	err := items.blockAssembler.reset(ctx)
+	require.Error(t, err) // fallback header fetch fails, reset still returns error
+
+	gotHeader, gotHeight := items.blockAssembler.CurrentBlock()
+	require.Equal(t, preHeight, gotHeight, "pointer height must not advance past a failed reset")
+	require.True(t, gotHeader.Hash().IsEqual(preHeader.Hash()), "pointer must be restored to pre-reset tip")
 }
