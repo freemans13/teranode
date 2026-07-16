@@ -1077,10 +1077,22 @@ func newTestSyncCoordinatorWithFSM(t *testing.T, state blockchain_api.FSMStateTy
 		AllowPrunedNodeFallback:                   true,
 		SyncCoordinatorPeriodicEvaluationInterval: 30 * time.Second,
 		HealthCheckEnabled:                        false, // test DataHubURL is unreachable; skip HTTP health check
+		// Production defaults for the unproven-peer probe hardening (upstream
+		// #1201); a zero probe budget would make unproven peers unselectable.
+		MaxUnvalidatedAdvertisedHeightLead:    10_000,
+		MaxUnprovenSyncProbesPerBackoffWindow: 3,
+		FullDeliveryFreshnessWindow:           24 * time.Hour,
 	}}
 	bcMock := &blockchain.Mock{}
 	st := state
 	bcMock.On("GetFSMCurrentState", mock.Anything).Return(&st, nil)
+	// checkFSMState refreshes the unproven-probe budget from the local tip
+	// (upstream #1201), which reads the best block header from the client.
+	bcMock.On("GetBestBlockHeader", mock.Anything).Return(
+		&model.BlockHeader{},
+		&model.BlockHeaderMeta{Height: 0, ChainWork: []byte{0x01}},
+		nil,
+	)
 
 	sc := NewSyncCoordinator(context.Background(), ulogger.TestLogger{}, tSettings, client,
 		NewPeerSelector(ulogger.TestLogger{}, tSettings), bcMock, nil)
@@ -1093,7 +1105,8 @@ func TestSyncCoordinator_ProactiveInCatchingBlocks(t *testing.T) {
 
 	// Register a viable peer well ahead of local height 0 (mirror the idiom
 	// from TestSyncCoordinator_IsCaughtUp_AheadPeerMakesUsBehind):
-	reg.Register(&blockchain.PeerInfo{ID: "ahead", DataHubURL: "http://ahead", Height: 100})
+	reg.Register(&blockchain.PeerInfo{ID: "ahead", DataHubURL: "http://ahead", Height: 100,
+		BlockHash: syncCoordinatorTestHash(t)})
 	for i := 0; i < 5; i++ {
 		reg.UpdateMetrics("ahead", 0, 0, 0, true, false, false, 100)
 	}
