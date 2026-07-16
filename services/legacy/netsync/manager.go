@@ -730,7 +730,24 @@ type SyncManager struct {
 	// fatal rotation); a job starting more than one above it sits beyond a lost
 	// range and is parked instead of handed (the stall-burst defect).
 	lastHandedWindowEnd uint32
-	legacyKafkaInvCh    chan *kafka.Message
+	// deferredCheckpoint is the one-slot holding cell for a checkpoint block
+	// whose first delivery arrived before its parent committed (the fresh-sync
+	// norm: the fetch frontier runs ~1000+ blocks ahead, so checkpoint-1 is
+	// still parked behind the BA gate — measured 11-31s behind in every live
+	// episode). Previously that delivery was DROPPED: the ErrBlockNotFound arm
+	// returned nil (no requeue), the preamble had already wiped every fetch
+	// ledger, the cursor never rewinds, and headers-first mode discards the
+	// getblocks fallback's inv — so nothing could ever re-request the block and
+	// the tip froze until the 3-minute sync-peer rotation re-walked the
+	// interval. Deferring the delivery and retrying on the refill tick commits
+	// it within ~one tick of the parent landing. Drain-goroutine only.
+	deferredCheckpoint *deferredCheckpointBlock
+	// deferBarredCheckpoint is the one-shot cap: after a deferral hits its
+	// deadline (parent never committed — a double-fault), that hash may not
+	// re-defer; its next delivery takes the old arm verbatim, so the rotation
+	// backstop can never be indefinitely re-armed away. Drain-goroutine only.
+	deferBarredCheckpoint chainhash.Hash
+	legacyKafkaInvCh      chan *kafka.Message
 	// legacyKafkaInvProducer is retained (DC11) so SyncManager.Stop() can stop it
 	// synchronously; without a field there is no handle to flush it on shutdown.
 	legacyKafkaInvProducer kafka.KafkaAsyncProducerI
@@ -2554,6 +2571,31 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		directErr := sm.HandleBlockDirect(sm.ctx, peer, bmsg.blockHash, msgBlock)
 		if directErr != nil {
 			if errors.Is(directErr, errors.ErrBlockNotFound) {
+				// Checkpoint deferral (checkpoint-boundary stall elimination). On a
+				// fresh sync the checkpoint's parent is structurally uncommitted at
+				// first delivery, and dropping the block here loses it forever: the
+				// preamble wiped every fetch ledger on arrival, this arm returns nil
+				// so the requeue gate never fires, the header cursor never rewinds,
+				// and the getblocks fallback below is dead in headers-first mode
+				// (processInvMsg discards all inv). The only recovery was the
+				// 3-minute sync-peer rotation — the entire observed pause. Keep the
+				// delivery instead and retry from the refill tick once the parent
+				// lands; the rotation stays the guaranteed backstop via the deferral
+				// deadline and the one-shot re-defer bar.
+				if isCheckpointBlock && sm.settings.Legacy.InFlightRefillInterval > 0 && sm.deferBarredCheckpoint != bmsg.blockHash {
+					sm.deferredCheckpoint = &deferredCheckpointBlock{
+						msgBlock:   msgBlock,
+						bmsg:       &blockQueueMsg{blockHash: bmsg.blockHash, blockHeight: bmsg.blockHeight, peer: bmsg.peer},
+						peer:       peer,
+						state:      state,
+						prevHash:   prevBlockHash,
+						deferredAt: time.Now(),
+					}
+					sm.logger.Infof("[handleBlockMsgWithWindow][%s] deferring checkpoint block height %d until parent %s commits (retried on the refill tick)", bmsg.blockHash, blockHeightUint32, prevBlockHash)
+
+					return blockAdmitDirect, nil
+				}
+
 				sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks", bmsg.blockHash, prevBlockHash)
 
 				bestBlockHeader, bestBlockHeaderMeta, getErr := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
@@ -4607,6 +4649,77 @@ func (sm *SyncManager) parkStrayWindowBlock(park *parkStore, b *model.Block) {
 	park.add(b)
 }
 
+// deferredCheckpointBlock holds a checkpoint block's first delivery while its
+// parent finishes committing (see the deferredCheckpoint field doc).
+type deferredCheckpointBlock struct {
+	msgBlock   *wire.MsgBlock
+	bmsg       *blockQueueMsg // copy with reply nil: already acked at drop time
+	peer       *peerpkg.Peer
+	state      *peerSyncState
+	prevHash   chainhash.Hash
+	deferredAt time.Time
+}
+
+// deferredCheckpointMaxWait bounds how long a deferred checkpoint block may
+// wait for its parent before the deferral gives up, requeues the hash for
+// re-fetch, and bars re-deferral — guaranteeing the sync-peer rotation backstop
+// still fires if the parent never commits (a double-fault this fix must not mask).
+const deferredCheckpointMaxWait = 3 * time.Minute
+
+// retryDeferredCheckpoint drives the deferred checkpoint block to commit once
+// its parent lands. Runs on the drain goroutine's refill tick (20ms default),
+// so the commit happens within ~one tick of the parent instead of after the
+// 3-minute rotation. All slot access is drain-goroutine-only.
+func (sm *SyncManager) retryDeferredCheckpoint() {
+	d := sm.deferredCheckpoint
+	if d == nil {
+		return
+	}
+
+	// Committed elsewhere (a rotation's re-delivery raced the deferral): done.
+	if exists, err := sm.blockchainClient.GetBlockExists(sm.ctx, &d.bmsg.blockHash); err == nil && exists {
+		sm.deferredCheckpoint = nil
+		return
+	}
+
+	// Deadline: the parent never committed — something else is wrong. Requeue
+	// the hash for a normal re-fetch, bar re-deferral so the next delivery takes
+	// the old arm verbatim, and let the rotation backstop do its job.
+	if time.Since(d.deferredAt) > deferredCheckpointMaxWait {
+		sm.deferredCheckpoint = nil
+		sm.deferBarredCheckpoint = d.bmsg.blockHash
+		sm.requeueFailedBlock(d.bmsg.blockHash)
+		sm.logger.Warnf("[retryDeferredCheckpoint][%s] parent %s still uncommitted after %s; requeuing checkpoint block and disabling further deferral for it", d.bmsg.blockHash, d.prevHash, deferredCheckpointMaxWait)
+
+		return
+	}
+
+	// Parent gate: cheap existence probe before re-driving the full commit.
+	if _, _, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &d.prevHash); err != nil {
+		return // parent still committing; try again next tick
+	}
+
+	if err := sm.HandleBlockDirect(sm.ctx, d.peer, d.bmsg.blockHash, d.msgBlock); err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) {
+			return // lost the race with the parent's commit finalisation; next tick
+		}
+
+		// Any other failure: the deferred bytes are unvalidated (a bad block from
+		// a misbehaving peer escapes the usual reject path by design here — the
+		// hash IS the hardcoded checkpoint, so the content that matters is pinned).
+		// Clear the slot and requeue so the block is re-fetched from another peer.
+		sm.deferredCheckpoint = nil
+		sm.requeueFailedBlock(d.bmsg.blockHash)
+		sm.logger.Warnf("[retryDeferredCheckpoint][%s] deferred commit failed (%v); requeuing for re-fetch", d.bmsg.blockHash, err)
+
+		return
+	}
+
+	sm.runPostBlockProcessing(d.peer, d.state, d.bmsg, true)
+	sm.deferredCheckpoint = nil
+	sm.logger.Infof("[retryDeferredCheckpoint][%s] deferred checkpoint block committed after parent %s arrived", d.bmsg.blockHash, d.prevHash)
+}
+
 // releaseWindowBlocks releases ownership of every block in a handled flush job.
 func (sm *SyncManager) releaseWindowBlocks(blocks []*model.Block) {
 	if sm.windowOwnedBlocks == nil {
@@ -5429,6 +5542,7 @@ func (sm *SyncManager) blockHandler() {
 				// is disabled (park is nil).
 				sm.maintainInFlightWindow()
 				sm.releaseParkedBlocks(park, wa, flushWindow, armTimer)
+				sm.retryDeferredCheckpoint()
 			case hmsg := <-headersQueue:
 				// Runs on the SAME goroutine as block processing, so the shared
 				// headers-first state is never touched concurrently.
