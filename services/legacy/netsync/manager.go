@@ -677,7 +677,15 @@ type SyncManager struct {
 	// Value is the block height (diagnostics only). SyncedMap: the flushWorker
 	// releases concurrently with the drain goroutine's claims/reads.
 	windowOwnedBlocks *txmap.SyncedMap[chainhash.Hash, uint32]
-	legacyKafkaInvCh  chan *kafka.Message
+	// lastHandedWindowEnd is the height of the last block handed to the window
+	// committer (gateContiguousWindow). Drain-goroutine only — read and written
+	// exclusively inside flushWindow/flushWindowSync, so no synchronization.
+	// Zero means "nothing handed yet" (seeds from the first flushed job). A job
+	// starting at/below this value re-seeds it (idempotent re-sync after a
+	// fatal rotation); a job starting more than one above it sits beyond a lost
+	// range and is parked instead of handed (the stall-burst defect).
+	lastHandedWindowEnd uint32
+	legacyKafkaInvCh    chan *kafka.Message
 	// legacyKafkaInvProducer is retained (DC11) so SyncManager.Stop() can stop it
 	// synchronously; without a field there is no handle to flush it on shutdown.
 	legacyKafkaInvProducer kafka.KafkaAsyncProducerI
@@ -4400,6 +4408,91 @@ func (sm *SyncManager) releaseWindowBlock(hash chainhash.Hash) {
 	sm.windowOwnedBlocks.Delete(hash)
 }
 
+// gateContiguousWindow enforces the committed-chain contiguity invariant on a
+// drained window job before it is handed to the committer. It runs on the
+// drain goroutine (inside flushWindow/flushWindowSync), which owns park and
+// lastHandedWindowEnd, so it needs no locking.
+//
+// Why: the direct window path admits gate-eligible blocks in ARRIVAL order.
+// When peer churn loses a range before admission (mainnet 609471-609480),
+// every window flushed afterwards starts above the hole; ProcessBlockWindow
+// then fails "previous block not found", burns the serial bounded-recovery
+// passes, and escalates to a sync-peer rotation — the only thing that
+// re-fetched the hole. Result: multi-minute stalls between commit bursts.
+// The park path already has the needed invariant (releaseParkedBlocks feeds
+// only the contiguous run from the committed tip); this applies the same rule
+// at flush time: hand the contiguous ascending run that continues
+// lastHandedWindowEnd, and route post-gap strays into the park, where the
+// release machinery feeds them back in order once the hole fills. The hole
+// itself is re-fetched by the existing head-stall/reconcile machinery (the
+// strays stay OWNED while parked, so only the truly missing range is re-bought).
+//
+// Seed/re-seed: tracker 0 (nothing handed yet) or a job starting at/below the
+// tracker accepts the job's own start (idempotent re-commit after a fatal
+// rotation re-syncs from the committed best-block) — the gate can therefore
+// never wedge on a stale high-water mark. With park == nil (parking disabled)
+// there is nowhere to hold strays, so the gate is a pass-through and the old
+// recovery semantics apply unchanged.
+func (sm *SyncManager) gateContiguousWindow(job windowFlushJob, park *parkStore) windowFlushJob {
+	blocks := job.blocks
+	if len(blocks) == 0 {
+		return job
+	}
+
+	if park == nil {
+		sm.lastHandedWindowEnd = blocks[len(blocks)-1].Height
+		return job
+	}
+
+	// Wholly beyond a hole: hand nothing, park everything.
+	if sm.lastHandedWindowEnd != 0 && blocks[0].Height > sm.lastHandedWindowEnd+1 {
+		sm.logger.Warnf("[gateContiguousWindow] window %d-%d starts beyond lost range after %d; parking %d blocks until the gap fills", blocks[0].Height, blocks[len(blocks)-1].Height, sm.lastHandedWindowEnd, len(blocks))
+
+		for _, b := range blocks {
+			sm.parkStrayWindowBlock(park, b)
+		}
+
+		job.blocks = nil
+
+		return job
+	}
+
+	// Hand the ascending run up to the first internal hole; park the rest.
+	// drainJob has already sorted ascending and deduped by height.
+	end := 1
+	for end < len(blocks) && blocks[end].Height == blocks[end-1].Height+1 {
+		end++
+	}
+
+	if end < len(blocks) {
+		sm.logger.Warnf("[gateContiguousWindow] window has internal gap after %d; handing %d blocks, parking %d until the gap fills", blocks[end-1].Height, end, len(blocks)-end)
+
+		for _, b := range blocks[end:] {
+			sm.parkStrayWindowBlock(park, b)
+		}
+	}
+
+	job.blocks = blocks[:end]
+	sm.lastHandedWindowEnd = blocks[end-1].Height
+
+	return job
+}
+
+// parkStrayWindowBlock parks a post-gap stray for ordered re-release. If the
+// park cannot take it (caps), the block is dropped and its ownership released
+// so the refetch machinery can re-buy it — a full park must never wedge the
+// gap-fill (the block was already early-acked, so dropping owes nothing).
+func (sm *SyncManager) parkStrayWindowBlock(park *parkStore, b *model.Block) {
+	if park.full(int64(b.SizeInBytes)) { //nolint:gosec
+		sm.releaseWindowBlock(*b.Hash())
+		sm.logger.Warnf("[gateContiguousWindow] park full; dropping stray block height %d for re-fetch", b.Height)
+
+		return
+	}
+
+	park.add(b)
+}
+
 // releaseWindowBlocks releases ownership of every block in a handled flush job.
 func (sm *SyncManager) releaseWindowBlocks(blocks []*model.Block) {
 	if sm.windowOwnedBlocks == nil {
@@ -5058,14 +5151,21 @@ func (sm *SyncManager) blockHandler() {
 
 		flushWindow := func() {
 			if wa != nil && !wa.empty() {
-				if pipelineEnabled {
-					// Hand the drained window to the worker. The blocking send is
-					// the depth-1 back-pressure that bounds in-flight windows.
-					if j, ok := wa.drainJob(); ok {
-						jobs <- j
+				// Contiguity gate (stall-burst fix): hand only the run continuing
+				// the last handed height; post-gap strays go to the park for
+				// ordered re-release. A gate that empties the job hands nothing.
+				if j, ok := wa.drainJob(); ok {
+					j = sm.gateContiguousWindow(j, park)
+
+					if len(j.blocks) > 0 {
+						if pipelineEnabled {
+							// Hand the drained window to the worker. The blocking send is
+							// the depth-1 back-pressure that bounds in-flight windows.
+							jobs <- j
+						} else {
+							sm.commitWindowJob(sm.ctx, j)
+						}
 					}
-				} else {
-					wa.flush(sm.ctx, sm)
 				}
 			}
 
@@ -5096,7 +5196,10 @@ func (sm *SyncManager) blockHandler() {
 			// drainJob yields ok=false (empty job) when nothing is pending; an empty
 			// job is still a valid barrier — it commits nothing but, being FIFO after
 			// any in-flight window, its completion proves that window committed.
+			// The contiguity gate applies here too: strays are parked and the
+			// (possibly emptied) job is still handed — an empty barrier is valid.
 			j, _ := wa.drainJob()
+			j = sm.gateContiguousWindow(j, park)
 			j.done = done
 
 			select {
