@@ -122,6 +122,32 @@ func TestGateContiguousWindow_ReseedAtOrBelowLastHanded(t *testing.T) {
 	require.Equal(t, 0, park.len())
 }
 
+// TestGateContiguousWindow_TrackerBehindCommittedTip is the live-mainnet
+// livelock regression (2026-07-16 22:00Z, wedged at 33333): block 33333 was
+// committed by a path that bypasses the gate (rotation recovery re-drive /
+// direct commit), leaving lastHandedWindowEnd stale-LOW at 33332. The next
+// window 33334-33433 — perfectly contiguous with the COMMITTED tip — was
+// misjudged as beyond-gap by one, parked into a full park, dropped for
+// re-fetch, and re-misjudged forever. The gate must consult reality (block
+// assembly's polled height) before declaring a window beyond a gap: a window
+// starting at cached+1 is contiguous with the committed chain no matter what
+// the tracker says.
+func TestGateContiguousWindow_TrackerBehindCommittedTip(t *testing.T) {
+	sm := newGateTestManager()
+	sm.lastHandedWindowEnd = 33332 // stale: 33333 committed via a bypass path
+	sm.baHeightPolled.Store(true)
+	sm.cachedBlockAssemblyHeight.Store(33333) // reality: chain is at 33333
+	park := newParkStore(0, 1024)
+
+	blocks := ownedGateBlocks(t, sm, 33334, 33335, 33336)
+	out := sm.gateContiguousWindow(windowFlushJob{blocks: blocks}, park)
+
+	require.Len(t, out.blocks, 3,
+		"a window contiguous with the COMMITTED tip must be handed even when the tracker is stale-low")
+	require.Equal(t, uint32(33336), sm.lastHandedWindowEnd, "tracker re-seeds from the handed run")
+	require.Equal(t, 0, park.len(), "nothing may be parked for a reality-contiguous window")
+}
+
 // TestGateContiguousWindow_FirstFlushSeeds: with no prior hand-off (tracker 0)
 // the first job seeds the tracker and is handed whole.
 func TestGateContiguousWindow_FirstFlushSeeds(t *testing.T) {

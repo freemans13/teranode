@@ -4455,9 +4455,24 @@ func (sm *SyncManager) gateContiguousWindow(job windowFlushJob, park *parkStore)
 		return job
 	}
 
-	// Wholly beyond a hole: hand nothing, park everything.
-	if sm.lastHandedWindowEnd != 0 && blocks[0].Height > sm.lastHandedWindowEnd+1 {
-		sm.logger.Warnf("[gateContiguousWindow] window %d-%d starts beyond lost range after %d; parking %d blocks until the gap fills", blocks[0].Height, blocks[len(blocks)-1].Height, sm.lastHandedWindowEnd, len(blocks))
+	// Wholly beyond a hole: hand nothing, park everything. The tracker alone is
+	// NOT sufficient evidence of a hole — commits that bypass this gate (the
+	// rotation recovery re-drive, direct/checkpoint commits) advance the chain
+	// without advancing lastHandedWindowEnd, leaving it stale-LOW. A window
+	// starting at or below cached+1 is contiguous with the COMMITTED chain
+	// (cached is a stale-low-or-equal lower bound once polled), so it must be
+	// handed regardless of the tracker; misjudging it parked a perfectly
+	// contiguous window into a full park and livelocked the fresh mainnet sync
+	// at 33333 (drop -> re-fetch -> same misjudgment).
+	frontier := sm.lastHandedWindowEnd
+	if sm.baHeightPolled.Load() {
+		if cached := sm.cachedBlockAssemblyHeight.Load(); cached > frontier {
+			frontier = cached
+		}
+	}
+
+	if sm.lastHandedWindowEnd != 0 && blocks[0].Height > frontier+1 {
+		sm.logger.Warnf("[gateContiguousWindow] window %d-%d starts beyond lost range after frontier %d (handed %d); parking %d blocks until the gap fills", blocks[0].Height, blocks[len(blocks)-1].Height, frontier, sm.lastHandedWindowEnd, len(blocks))
 
 		for _, b := range blocks {
 			sm.parkStrayWindowBlock(park, b)
