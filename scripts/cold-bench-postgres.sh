@@ -11,14 +11,15 @@
 #   ./scripts/cold-bench-postgres.sh          # start (or restart) the cluster
 #   ./scripts/cold-bench-postgres.sh stop     # stop + remove container and data
 #
-# Then:
-#   export THROUGHPUT_DSN=postgres://teranode:teranode@localhost:5440/teranode_test
+# Then export THROUGHPUT_DSN as printed by the script on startup.
 
 set -eu
 
 NAME=teranode-cold-pg
 PORT="${COLD_PG_PORT:-5440}"
 MEM="${COLD_PG_MEM:-2g}"
+# Local throwaway bench container only — override for anything shared.
+PASSWORD="${COLD_PG_PASSWORD:-teranode}"
 # Postgres-syntax view of the cap for the planner (docker's "2g" is not valid
 # postgres units). Keep slightly below the cap: the planner should not assume
 # more cache than the cgroup allows.
@@ -42,7 +43,7 @@ docker run -d --name "$NAME" \
     --shm-size=1g \
     -p "$PORT":5432 \
     -e POSTGRES_USER=teranode \
-    -e POSTGRES_PASSWORD=teranode \
+    -e POSTGRES_PASSWORD="$PASSWORD" \
     -e POSTGRES_DB=teranode_test \
     "$IMAGE" \
     -c shared_buffers="$SHARED_BUFFERS" \
@@ -69,4 +70,4 @@ done
 echo ' ready'
 
 echo "cluster : $NAME ($IMAGE), memory cap $MEM, shared_buffers $SHARED_BUFFERS, port $PORT"
-echo "export THROUGHPUT_DSN=postgres://teranode:teranode@localhost:$PORT/teranode_test"
+echo "export THROUGHPUT_DSN=postgres://teranode:$PASSWORD@localhost:$PORT/teranode_test"
