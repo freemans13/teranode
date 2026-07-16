@@ -3123,7 +3123,21 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 			sm.logger.Warnf("[assignBlocksAcrossPeers] unexpected failure checking inventory during header block fetch: %v", err)
 		}
 
-		if !haveInv {
+		// Skip a block that is already IN FLIGHT (requested and outstanding). This is
+		// the source fix for the duplicate-admission → create-vs-create deadlock:
+		// resetHeaderState rewinds this cursor on every sync-peer rotation but does NOT
+		// clear the in-flight ledger, so without this guard the re-walk re-requests
+		// still-outstanding blocks to a SECOND peer — both copies then arrive and one
+		// is admitted to the window twice, colliding on the txs unique index (40P01).
+		// haveInventory only covers COMMITTED blocks; sm.requestedBlocks is the
+		// in-flight set the refetch drain already trusts (drainRefetchBlocks). Safe on
+		// this MULTI-PEER walk only: a genuinely lost in-flight block is recovered by
+		// checkHeadStall / reconcileLostAssignments → refetchBlocks, so skipping it here
+		// cannot strand it. The single-peer fetchHeaderBlocks walk is deliberately NOT
+		// changed — it has no such recovery and relies on the re-walk to re-request.
+		_, inFlight := sm.requestedBlocks.Get(*node.hash)
+
+		if !haveInv && !inFlight {
 			// Pick the assignable target with the MOST spare capacity. If none has
 			// spare left, the per-peer caps are exhausted for this pass; stop.
 			best := pickMaxSpareTarget(targets)
