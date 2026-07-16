@@ -649,7 +649,16 @@ type SyncManager struct {
 	// frontier be bounded to the parkable horizon so the park cannot saturate.
 	// Off (the zero value) leaves the forward walk uncapped — byte-identical to the
 	// pre-park behaviour.
-	parkAheadActive  atomic.Bool
+	parkAheadActive atomic.Bool
+	// parkRef publishes the drain goroutine's park store to the drain-only fetch
+	// scheduler (fetchRunwayHorizon / drainRefetchBlocks) so the runway can shrink to
+	// the maturity gate while the park is count-full — stopping both the forward walk
+	// and the refetch drain from pulling un-parkable far-ahead blocks that would only
+	// be park-rejected and requeued, churning the budget and starving the in-gate
+	// tip+1. Stored once at drain-loop setup; nil when parking is off. Only the drain
+	// goroutine reads/writes park, so this pointer is atomic solely for safe setup
+	// publication (no cross-goroutine park mutation).
+	parkRef          atomic.Pointer[parkStore]
 	legacyKafkaInvCh chan *kafka.Message
 	// legacyKafkaInvProducer is retained (DC11) so SyncManager.Stop() can stop it
 	// synchronously; without a field there is no handle to flush it on shutdown.
@@ -3254,9 +3263,27 @@ func (sm *SyncManager) drainRefetchBlocks(targets []*fetchTarget, toAssign int) 
 		return heights[pending[i]] < heights[pending[j]]
 	})
 
+	// While the park is count-full, fetchRunwayHorizon clamps to the maturity gate.
+	// Skip re-sending any orphan KNOWN to be beyond that horizon: it would only earn
+	// another park-full reject and re-queue, churning the pass budget and starving the
+	// in-gate tip+1. Skipping (continue) — NOT breaking — preserves toAssign for the
+	// in-gate work and leaves the far-ahead orphan queued in refetchBlocks for a later
+	// pass (re-sent the instant releaseParkedBlocks frees a park slot or it falls within
+	// the sliding gate — no strand). Unknown-height orphans (sorted last, MaxInt32) are
+	// NEVER skipped, so an in-gate block whose header-index entry was consumed stays
+	// eligible. capped is false off-path (parking off / above checkpoint / cache
+	// unpolled / park not full) → no skip, byte-identical to today.
+	horizon, capped := sm.fetchRunwayHorizon()
+
 	for _, h := range pending {
 		if toAssign <= 0 {
 			break
+		}
+
+		if capped {
+			if ht := heights[h]; ht >= 0 && ht != math.MaxInt32 && uint32(ht) > horizon { //nolint:gosec // ht guarded >= 0
+				continue
+			}
 		}
 
 		// Already re-assigned and recorded on a prior pass — skip (no double-request).
@@ -3362,6 +3389,21 @@ func (sm *SyncManager) fetchRunwayHorizon() (uint32, bool) {
 	}
 
 	span := uint32(maxBehind) + uint32(parkCap) //nolint:gosec // both guarded > 0 above
+
+	// Park-full backpressure: while the park cannot accept another beyond-gate block,
+	// drop the parkCap runway and clamp the frontier to the maturity gate, so neither
+	// the forward walk nor the refetch drain pulls un-parkable far-ahead blocks (which
+	// would only be park-rejected and requeued, churning the budget and starving the
+	// in-gate tip+1). Binary, not proportional: full → gate, otherwise → the full
+	// static cap, so a non-full park keeps the whole prefetch runway (no steady-state
+	// under-utilisation) and this is byte-identical whenever the park is not full. The
+	// drain goroutine is the sole reader and writer of park, so countFull is race-free
+	// here. Self-clearing: releaseParkedBlocks freeing a slot flips countFull→false and
+	// the runway springs back to the static cap on the next tick.
+	if park := sm.parkRef.Load(); park != nil && park.countFull() {
+		span = uint32(maxBehind) //nolint:gosec // guarded > 0 above
+	}
+
 	if cached > math.MaxUint32-span {
 		return 0, false
 	}
@@ -4807,6 +4849,7 @@ func (sm *SyncManager) blockHandler() {
 				parkBudget := windowBudgetBytes(sm.settings.Legacy.ParallelWindowParkedMemoryFraction)
 				park = newParkStore(parkBudget, sm.settings.Legacy.ParallelWindowMaxParkedBlocks)
 				sm.parkAheadActive.Store(true)
+				sm.parkRef.Store(park)
 			}
 		}
 
