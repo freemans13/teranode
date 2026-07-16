@@ -70,6 +70,19 @@ const (
 	// number of retries such that there is a retry backoff.
 	connectionRetryInterval = time.Second * 5
 
+	// connReconcileInterval is how often peerHandler audits the connection
+	// manager's open-connection book against the live outbound peer set
+	// (reconcileConnAccounting). One minute keeps the worst-case starvation
+	// window to a few minutes while making the audit cost negligible.
+	connReconcileInterval = time.Minute
+
+	// connPhantomStrikes is how many consecutive audit passes an id tracked
+	// as open must go without a backing live peer before it is evicted as a
+	// phantom. Three one-minute strikes sit far beyond the ~30s dial+handshake
+	// window, so a legitimately mid-handshake connection can never be falsely
+	// evicted; mis-accounting can only ever over-connect, never starve.
+	connPhantomStrikes = 3
+
 	// maxKnownAddresses is the maximum number of known addresses to
 	// store in the peer.
 	maxKnownAddresses = 10000
@@ -293,6 +306,7 @@ type connManagerI interface {
 	Connect(c *connmgr.ConnReq)
 	Disconnect(id uint64)
 	NewConnReq()
+	OpenConnIDs() []uint64
 }
 
 // server provides a bitcoin server for handling communications to and from
@@ -358,7 +372,11 @@ type server struct {
 	blockAssembly     *blockassembly.Client
 	assetHTTPAddress  string
 	banList           *p2p.BanList
-	banChan           chan p2p.BanEvent
+	// targetOutbound mirrors the connection manager's TargetOutbound so the
+	// accounting audit can recognise the starvation signature (few live peers
+	// while the book reads at-target) without reaching into connmgr config.
+	targetOutbound uint32
+	banChan        chan p2p.BanEvent
 
 	// multistream association tracking
 	associationMgr *peer.AssociationManager
@@ -2857,6 +2875,15 @@ func (s *server) outboundPeerConnected(c *connmgr.ConnReq, conn net.Conn) {
 		s.logger.Infof("Rejecting banned outbound peer %s", addr)
 		conn.Close()
 
+		// Release the connmgr slot: handleConnected stored this ConnReq in
+		// cm.conns BEFORE OnConnection fired, and no peer/doneHandler will ever
+		// exist to remove it. Without this, every banned-peer rejection leaves a
+		// permanent phantom that counts toward TargetOutbound — seven of these
+		// starved mainnet down to a single real peer while the replenish check
+		// saw conns=8/target=8 (2026-07-16). Mirrors the NewOutboundPeer error
+		// branch below; the double conn.Close is benign.
+		s.connManager.Disconnect(c.ID())
+
 		return
 	}
 
@@ -2908,6 +2935,65 @@ func (s *server) peerDoneHandler(sp *serverPeer) {
 	close(sp.quit)
 }
 
+// reconcileConnAccounting audits the connection manager's open-connection
+// book against the live outbound peer set. It is the backstop beneath the
+// source fixes for the mainnet phantom-connection starvation: if ANY future
+// bookkeeping bug leaks an entry into the manager's conns map with no backing
+// peer, this detects and evicts it instead of letting it permanently count
+// toward TargetOutbound (the failure mode where the node sat at one real peer
+// while the replenish check saw conns=8/target=8 and stopped dialing).
+//
+// Strike-based to make false eviction unreachable: an id must be unbacked for
+// connPhantomStrikes consecutive passes (minutes) before eviction, far beyond
+// the dial+handshake window in which a connection legitimately exists without
+// a serverPeer yet. Eviction rides the stock Disconnect path, which also
+// correctly re-pends Permanent requests. Runs on the peerHandler goroutine —
+// the goroutine that owns state and already calls connManager.Disconnect
+// inline — so it adds no new concurrency.
+func (s *server) reconcileConnAccounting(state *peerState, strikes map[uint64]int) {
+	live := make(map[uint64]struct{})
+
+	state.forAllOutboundPeers(func(sp *serverPeer) {
+		if sp.connReq != nil {
+			live[sp.connReq.ID()] = struct{}{}
+		}
+	})
+
+	open := s.connManager.OpenConnIDs()
+	openSet := make(map[uint64]struct{}, len(open))
+
+	for _, id := range open {
+		openSet[id] = struct{}{}
+
+		if _, ok := live[id]; ok {
+			delete(strikes, id)
+			continue
+		}
+
+		strikes[id]++
+
+		if strikes[id] >= connPhantomStrikes {
+			s.logger.Warnf("[connmgr-audit] evicting phantom connection id %d: tracked as open but backed by no live outbound peer for %d consecutive checks", id, strikes[id])
+			delete(strikes, id)
+			s.connManager.Disconnect(id)
+		}
+	}
+
+	// Forget strikes for ids the manager no longer tracks (disconnected
+	// through the normal path between audits).
+	for id := range strikes {
+		if _, ok := openSet[id]; !ok {
+			delete(strikes, id)
+		}
+	}
+
+	// The starvation signature itself, in case a future leak evades even the
+	// strike audit: few live peers while the book reads at-target.
+	if target := int(s.targetOutbound); target > 0 && len(live) < (target+1)/2 && len(open) >= target {
+		s.logger.Warnf("[connmgr-audit] starvation signature: %d live outbound peers but connection book reads %d open of target %d", len(live), len(open), target)
+	}
+}
+
 // peerHandler is used to handle peer operations such as adding and removing
 // peers to and from the server, banning peers, and broadcasting messages to
 // peers.  It must be run in a goroutine.
@@ -2944,6 +3030,13 @@ func (s *server) peerHandler() {
 				s.addrManager.AddAddresses(addrs, addrs[0])
 			})
 	}
+
+	// Connection-accounting audit (see reconcileConnAccounting): a periodic
+	// backstop so no bookkeeping leak can silently starve the node again.
+	reconcileTicker := time.NewTicker(connReconcileInterval)
+	defer reconcileTicker.Stop()
+
+	phantomStrikes := make(map[uint64]int)
 
 	go s.connManager.Start()
 
@@ -2984,6 +3077,9 @@ out:
 
 		case qmsg := <-s.query:
 			s.handleQuery(state, qmsg)
+
+		case <-reconcileTicker.C:
+			s.reconcileConnAccounting(state, phantomStrikes)
 
 		case <-s.quit:
 			// Disconnect all peers on server shutdown.
@@ -3696,6 +3792,16 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 
 				addrString := addrmgr.NetAddressKey(addr.NetAddress())
 
+				// Never hand the connection manager a banned address: dialing it
+				// succeeds at TCP level, then outboundPeerConnected rejects it —
+				// a pointless dial/reject cycle against popular banned peers that
+				// the addrmanager keeps serving (the churn behind the mainnet
+				// phantom-connection storm). Skipping here stops the cycle at the
+				// source; the loop simply tries the next candidate.
+				if s.banList.IsBanned(addrString) {
+					continue
+				}
+
 				return addrStringToNetAddr(addrString)
 			}
 
@@ -3723,6 +3829,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	}
 
 	s.connManager = cmgr
+	s.targetOutbound = targetOutbound
 
 	// Start up persistent peers.
 	permanentPeers := cfg.ConnectPeers

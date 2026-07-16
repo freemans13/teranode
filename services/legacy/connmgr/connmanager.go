@@ -453,6 +453,13 @@ func (cm *ConnManager) NewConnReq() {
 		})
 
 		if existingConns {
+			// Release the registration made above: this entry has no address and
+			// never dials, so none of the dial-lifecycle handlers can ever reap
+			// it — without this delete it sits in cm.pending forever (mainnet
+			// accumulated 22 such entries, each also silently ending its
+			// replacement-dial chain).
+			cm.pending.Delete(c.id)
+
 			return
 		}
 
@@ -474,6 +481,10 @@ func (cm *ConnManager) NewConnReq() {
 		})
 
 		if existingPendingTx {
+			// Same abandoned-registration release as the already-connected
+			// return above.
+			cm.pending.Delete(c.id)
+
 			return
 		}
 	}
@@ -567,6 +578,16 @@ func (cm *ConnManager) Remove(id uint64) {
 	case cm.requests <- handleDisconnected{id, false}:
 	case <-cm.quit:
 	}
+}
+
+// OpenConnIDs returns the ids of every outbound connection the manager
+// currently counts as open. It deliberately exposes the manager's BOOKS (not
+// kernel truth): the server audits these ids against its live outbound peer
+// set (reconcileConnAccounting) so any entry that leaks into the book without
+// a backing peer — the mainnet phantom-connection starvation — is detected
+// and evicted instead of permanently counting toward TargetOutbound.
+func (cm *ConnManager) OpenConnIDs() []uint64 {
+	return cm.conns.Keys()
 }
 
 // listenHandler accepts incoming connections on a given listener.  It must be

@@ -19,6 +19,7 @@ import (
 // the subset the server uses, so the spy is behaviourally faithful.
 type connMgrSpy struct {
 	disconnectIDs []uint64
+	openIDs       []uint64
 }
 
 func (s *connMgrSpy) Start()                     {}
@@ -26,6 +27,7 @@ func (s *connMgrSpy) Stop()                      {}
 func (s *connMgrSpy) Connect(_ *connmgr.ConnReq) {}
 func (s *connMgrSpy) NewConnReq()                {}
 func (s *connMgrSpy) Disconnect(id uint64)       { s.disconnectIDs = append(s.disconnectIDs, id) }
+func (s *connMgrSpy) OpenConnIDs() []uint64      { return s.openIDs }
 
 // TestHandleDonePeerMsg_NotifiesConnMgr is the Part-2 regression test: a
 // dropped outbound peer that carries a connReq must notify the connection
