@@ -239,7 +239,7 @@ func newFixture(ctx context.Context, cfg fixtureConfig) *fixture {
 	}
 	aeroStore.SetExternalStore(memory.New())
 
-	vIface, err := validator.New(ctx, logger, tSettings, aeroStore, nil, nil, nil, nil)
+	vIface, err := validator.New(ctx, logger, tSettings, aeroStore, nil, nil, nil, nil, nil)
 	if err != nil {
 		log.Fatalf("fixture: validator: %v", err)
 	}

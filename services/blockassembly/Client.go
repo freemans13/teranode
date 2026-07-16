@@ -502,29 +502,34 @@ func (s *Client) StoreBatch(ctx context.Context, items []BatchItem) error {
 		return err
 	}
 
-	// sendBatchToBlockAssembly signals results via item.done channels.
-	// Allocate buffered channels so the goroutine never blocks waiting for us.
-	errs := make([]chan error, len(internal))
-	for i, it := range internal {
-		ch := make(chan error, 1)
-		it.done = ch
-		errs[i] = ch
+	// Attach one shared completion group covering the whole batch; the send
+	// path calls complete exactly once per item (CAS-guarded), writing each
+	// item's terminal error into its result slot and signalling the group.
+	group := completion.NewGroup(int32(len(internal)))
+	for _, it := range internal {
+		it.group = group
 	}
 
 	s.sendBatchToBlockAssembly(ctx, internal)
 
+	// group.Wait(context.Background(), 0): 0 timeout allocates no timer and a
+	// background context never cancels, so this blocks purely on the send path
+	// completing every item (same pattern as Store). It can only return nil,
+	// so the result slots are safe to read afterwards.
+	_ = group.Wait(context.Background(), 0)
+
 	// Collect the first non-nil error (whole-batch failure propagated to all items).
-	for _, ch := range errs {
-		if e := <-ch; e != nil {
-			return e
+	for _, it := range internal {
+		if it.result != nil {
+			return it.result
 		}
 	}
 	return nil
 }
 
 // batchItemsFromPublic converts a []BatchItem into the internal []*batchItem
-// slice, serialising TxInpoints as required by the gRPC request. The done
-// channels are left nil; callers must set them before invoking
+// slice, serialising TxInpoints as required by the gRPC request. The
+// completion groups are left nil; callers must set them before invoking
 // sendBatchToBlockAssembly.
 func batchItemsFromPublic(items []BatchItem) ([]*batchItem, error) {
 	out := make([]*batchItem, len(items))

@@ -30,7 +30,7 @@ func newValidatorForTest(t testing.TB) *Validator {
 	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 
-	iface, err := New(ctx, logger, tSettings, utxoStore, nil, nil, nil, nil)
+	iface, err := New(ctx, logger, tSettings, utxoStore, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 
 	return iface.(*Validator)
