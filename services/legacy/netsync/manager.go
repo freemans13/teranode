@@ -658,8 +658,26 @@ type SyncManager struct {
 	// tip+1. Stored once at drain-loop setup; nil when parking is off. Only the drain
 	// goroutine reads/writes park, so this pointer is atomic solely for safe setup
 	// publication (no cross-goroutine park mutation).
-	parkRef          atomic.Pointer[parkStore]
-	legacyKafkaInvCh chan *kafka.Message
+	parkRef atomic.Pointer[parkStore]
+	// windowOwnedBlocks is the hash-keyed ownership ledger for blocks the window
+	// pipeline holds between admission and commit: parked (parkStore), accumulated
+	// (windowAccumulator), or inside an in-flight windowFlushJob. Such a block is
+	// invisible to GetBlockExists (not committed yet) and to requestedBlocks
+	// (wiped by handleBlockPreamble when the block first ARRIVES), so without this
+	// ledger rotation-driven re-walks re-request it and the re-delivery is fully
+	// re-prepared and parked as a TWIN of the same height — releaseParkedBlocks
+	// then splits the twins across two successive flush jobs and the FIFO worker
+	// commits the same block twice (the mainnet blocks_pkey duplicate storm).
+	// Claimed on park.add/wa.add (drain goroutine); consulted by the admission
+	// guard (drain goroutine) and the multi-peer walk; released on EVERY job exit
+	// (commitWindowJob defer — success, fatal and panic unwind — plus the
+	// poisoned-discard and ctx-drain branches of flushWorker, the shutdown
+	// abandon, and the park drop-arm/shutdown discards). A leaked claim would
+	// make its block unfetchable until restart, so every exit must release.
+	// Value is the block height (diagnostics only). SyncedMap: the flushWorker
+	// releases concurrently with the drain goroutine's claims/reads.
+	windowOwnedBlocks *txmap.SyncedMap[chainhash.Hash, uint32]
+	legacyKafkaInvCh  chan *kafka.Message
 	// legacyKafkaInvProducer is retained (DC11) so SyncManager.Stop() can stop it
 	// synchronously; without a field there is no handle to flush it on shutdown.
 	legacyKafkaInvProducer kafka.KafkaAsyncProducerI
@@ -2292,6 +2310,24 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	// checkpoint. On skip we return (false, nil): the caller (blockHandler) then
 	// decrements blockBacklog and acks the peer via reply <- nil exactly as for a
 	// normal not-added block — no double-ack, no backlog leak.
+	// Window-ownership guard (the parked-twin double-commit). A block the window
+	// pipeline already owns — parked, accumulated, or inside an in-flight flush
+	// job — is not yet committed, so the GetBlockExists guard below cannot see
+	// it, and it is no longer in requestedBlocks (wiped by the preamble on its
+	// FIRST arrival), so rotation-driven re-walks re-request it and the copy is
+	// re-delivered here minutes later. Without this check the re-delivery pays
+	// the full prepare pass again and parks a TWIN of the same height, which
+	// releaseParkedBlocks then splits across two successive flush jobs — the
+	// FIFO worker commits the same block twice, one job apart. Skip BEFORE the
+	// GetBlockExists round-trip; pump exactly like the already-committed skip
+	// below so a skipped re-delivery still advances sync.
+	if sm.windowBlockOwned(bmsg.blockHash) {
+		sm.logger.Infof("[handleBlockMsgWithWindow][%s] block already owned by the window pipeline (parked or committing), skipping re-delivery", bmsg.blockHash)
+		sm.pumpBlockRequests(peer, state, isCheckpointBlock, bmsg.blockHash)
+
+		return blockAdmitDirect, nil
+	}
+
 	blockExists, existsErr := sm.blockchainClient.GetBlockExists(sm.ctx, &bmsg.blockHash)
 	if existsErr != nil {
 		sm.logger.Errorf("[handleBlockMsgWithWindow][%s] failed to check if block exists: %s", bmsg.blockHash, existsErr)
@@ -2474,11 +2510,19 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		case admit:
 			// Within the gate: admit now (fall through to prepare + wa.add).
 		default:
-			// Beyond the gate: park after preparing. Cheap count-cap check first so a
-			// full buffer never pays a wasted prepareBlockForWindow; on overflow the
-			// block is requeued via the tolerated-error direct path (self-correcting).
+			// Beyond the gate: park after preparing. BOTH park caps are checked before
+			// prepareBlockForWindow so a full buffer never pays the full prepare pass
+			// (subtree build + blob writes) for a block that will only be rejected and
+			// requeued via the tolerated-error direct path (self-correcting). The byte
+			// pre-check is exact, not an estimate: the prepared block's SizeInBytes is
+			// literally MsgBlock().SerializeSize() (prepareBlockForWindow). The
+			// post-prepare byte check below stays as defence in depth.
 			if park.countFull() {
 				return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] park buffer full (count) at height %d; will re-fetch", bmsg.blockHash, blockHeightUint32)
+			}
+
+			if park.full(int64(msgBlock.SerializeSize())) {
+				return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] park buffer full (bytes) at height %d; will re-fetch", bmsg.blockHash, blockHeightUint32)
 			}
 
 			parkThisBlock = true
@@ -2512,12 +2556,14 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 		}
 
 		park.add(prepared)
+		sm.claimWindowBlock(bmsg.blockHash, blockHeightUint32)
 		sm.logger.Debugf("[handleBlockMsgWithWindow][%s] parked block height %d ahead of block assembly; %d parked", bmsg.blockHash, blockHeightUint32, park.len())
 
 		return blockAdmitParked, nil
 	}
 
 	wa.add(prepared)
+	sm.claimWindowBlock(bmsg.blockHash, blockHeightUint32)
 
 	// Refresh the sync peer's last-block time on the accept path (mirrors the
 	// non-window path; prevents a false sync-peer rotation when blockBacklog drains).
@@ -3137,7 +3183,15 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 		// changed — it has no such recovery and relies on the re-walk to re-request.
 		_, inFlight := sm.requestedBlocks.Get(*node.hash)
 
-		if !haveInv && !inFlight {
+		// Also skip a block the window pipeline OWNS (parked or in an in-flight
+		// flush job). requestedBlocks cannot cover this: the preamble wipes it when
+		// the block ARRIVES, but the block then lives on in the park for minutes,
+		// invisible to haveInventory (uncommitted). Re-buying it here is what
+		// manufactured the parked twins behind the mainnet duplicate-commit storm
+		// (same recovery reasoning as the in-flight skip above: a genuinely lost
+		// owned block has its ownership released on every job/park exit, so
+		// skipping it here cannot strand it).
+		if !haveInv && !inFlight && !sm.windowBlockOwned(*node.hash) {
 			// Pick the assignable target with the MOST spare capacity. If none has
 			// spare left, the per-peer caps are exhausted for this pass; stop.
 			best := pickMaxSpareTarget(targets)
@@ -3414,7 +3468,7 @@ func (sm *SyncManager) fetchRunwayHorizon() (uint32, bool) {
 	// drain goroutine is the sole reader and writer of park, so countFull is race-free
 	// here. Self-clearing: releaseParkedBlocks freeing a slot flips countFull→false and
 	// the runway springs back to the static cap on the next tick.
-	if park := sm.parkRef.Load(); park != nil && park.countFull() {
+	if park := sm.parkRef.Load(); park != nil && park.atCapacity() {
 		span = uint32(maxBehind) //nolint:gosec // guarded > 0 above
 	}
 
@@ -4290,12 +4344,74 @@ func (ps *parkStore) full(next int64) bool {
 	return ps.budget > 0 && ps.bytesAccum+next > ps.budget
 }
 
+// atCapacity reports whether the park can no longer accept a further beyond-gate
+// block — the count cap is hit, OR adding another block of the current AVERAGE
+// parked size would breach the byte budget. The fetch runway clamp
+// (fetchRunwayHorizon) uses this rather than countFull() alone so a park that
+// fills by BYTES (large blocks, e.g. the fat 2019 mainnet range) triggers the
+// clamp just as a count-full park does; without the byte arm the clamp never
+// engages under large blocks, the forward walk keeps pulling un-parkable
+// far-ahead blocks, and IBD churns on "park buffer full (bytes)". The average is
+// self-calibrating to the actual parked block sizes and avoids needing the next
+// block's size (which the clamp does not have). Drain-goroutine only.
+func (ps *parkStore) atCapacity() bool {
+	if ps.countFull() {
+		return true
+	}
+
+	if ps.budget <= 0 || len(ps.entries) == 0 {
+		return false
+	}
+
+	avg := ps.bytesAccum / int64(len(ps.entries))
+
+	return ps.bytesAccum+avg > ps.budget
+}
+
 func (ps *parkStore) add(b *model.Block) {
 	ps.entries = append(ps.entries, windowEntry{block: b})
 	ps.bytesAccum += int64(b.SizeInBytes) //nolint:gosec
 }
 
 func (ps *parkStore) len() int { return len(ps.entries) }
+
+// claimWindowBlock records that the window pipeline owns this block (parked,
+// accumulated, or in an in-flight flush job). Nil-map-safe: ownership is a
+// window-path feature and many callers/tests construct a SyncManager without it.
+func (sm *SyncManager) claimWindowBlock(hash chainhash.Hash, height uint32) {
+	if sm.windowOwnedBlocks == nil {
+		return
+	}
+
+	sm.windowOwnedBlocks.Set(hash, height)
+}
+
+// windowBlockOwned reports whether the window pipeline currently owns the block.
+func (sm *SyncManager) windowBlockOwned(hash chainhash.Hash) bool {
+	return sm.windowOwnedBlocks != nil && sm.windowOwnedBlocks.Exists(hash)
+}
+
+// releaseWindowBlock releases ownership of a single block.
+func (sm *SyncManager) releaseWindowBlock(hash chainhash.Hash) {
+	if sm.windowOwnedBlocks == nil {
+		return
+	}
+
+	sm.windowOwnedBlocks.Delete(hash)
+}
+
+// releaseWindowBlocks releases ownership of every block in a handled flush job.
+func (sm *SyncManager) releaseWindowBlocks(blocks []*model.Block) {
+	if sm.windowOwnedBlocks == nil {
+		return
+	}
+
+	for _, b := range blocks {
+		if b != nil {
+			sm.windowOwnedBlocks.Delete(*b.Hash())
+		}
+	}
+}
 
 // windowFlushJob is a drained, ascending-sorted window ready to commit. It is
 // produced on the drain goroutine (drainJob) and consumed either synchronously
@@ -4382,6 +4498,14 @@ func (sm *SyncManager) commitWindowJob(ctx context.Context, job windowFlushJob) 
 		return false
 	}
 
+	// Ownership release: whatever happens to this job — committed, fatal
+	// escalation, or a panic unwinding through commitWindowJobRecovered — these
+	// blocks leave the pipeline here. On the failure paths they re-sync via peer
+	// rotation from the committed best-block, and the admission guard must not
+	// skip that re-delivery, so a leaked claim is never acceptable. Deferred so
+	// the panic path releases too.
+	defer sm.releaseWindowBlocks(blocks)
+
 	sm.logger.Debugf("[windowAccumulator] flushing window of %d blocks to ProcessBlockWindow", len(blocks))
 
 	// Derive a deadline from PeerProcessingTimeout × batch size so the caller
@@ -4460,6 +4584,7 @@ func (sm *SyncManager) shutdownFlushHandoff(wa *windowAccumulator, jobs chan win
 			select {
 			case jobs <- j:
 			default:
+				sm.releaseWindowBlocks(j.blocks)
 				sm.logger.Warnf("[blockHandler] shutdown: abandoning pending window of %d blocks (worker busy); it will be re-synced from the committed best-block on restart", len(j.blocks))
 			}
 		}
@@ -4524,8 +4649,11 @@ func (sm *SyncManager) flushWorker(ctx context.Context, jobs <-chan windowFlushJ
 			// buffered jobs (committing none) so the drain goroutine's pending
 			// send, if any, does not block, then return once the channel closes.
 			// Release any barrier waiter on each drained job so flushWindowSync
-			// cannot hang on shutdown.
+			// cannot hang on shutdown, and release block ownership so nothing
+			// stays claimed by a job that will never commit.
 			for job := range jobs {
+				sm.releaseWindowBlocks(job.blocks)
+
 				if job.done != nil {
 					close(job.done)
 				}
@@ -4553,8 +4681,11 @@ func (sm *SyncManager) flushWorker(ctx context.Context, jobs <-chan windowFlushJ
 			}
 
 			if poisoned {
-				// A prior window hit a fatal gap; commit no later window.
+				// A prior window hit a fatal gap; commit no later window. The
+				// discarded blocks re-sync after rotation/restart, so their
+				// ownership must be released or the re-delivery is skipped forever.
 				sm.logger.Warnf("[flushWorker] poisoned after fatal window commit, discarding queued window of %d blocks", len(job.blocks))
+				sm.releaseWindowBlocks(job.blocks)
 			} else if sm.commitWindowJobRecovered(ctx, job) {
 				poisoned = true
 			}
@@ -4737,11 +4868,16 @@ func (sm *SyncManager) releaseParkedBlocks(park *parkStore, wa *windowAccumulato
 
 		switch {
 		case h <= cached:
-			// At/below the committed tip. A parked eligible below-checkpoint block is
-			// not committed by any other path, so this is defensive; it was already
-			// early-acked, so just drop it (do not re-add — this is why the release
-			// path needs no GetBlockExists re-check).
+			// At/below the committed tip. This DOES happen: before the ownership
+			// ledger, a re-fetched copy of an already-parked block became a parked
+			// TWIN, and once the first copy committed the twin surfaced here (the
+			// mainnet duplicate-commit storm proved the old "not committed by any
+			// other path" assumption false — the other path is a second copy of
+			// itself). The block was already early-acked, so just drop it (do not
+			// re-add) and release its ownership so a legitimate future re-delivery
+			// is not skipped forever.
 			park.bytesAccum -= int64(b.SizeInBytes) //nolint:gosec
+			sm.releaseWindowBlock(*b.Hash())
 			sm.logger.Debugf("[releaseParkedBlocks] dropping parked block height %d at/below committed tip %d", h, cached)
 		case h == next && h <= ceiling:
 			wa.add(b)
@@ -5025,6 +5161,11 @@ func (sm *SyncManager) blockHandler() {
 				// restart. No reply or backlog action is owed here.
 				if park != nil && park.len() > 0 {
 					sm.logger.Warnf("[blockHandler] shutdown: discarding %d parked blocks; will re-sync from committed best-block on restart", park.len())
+
+					for i := range park.entries {
+						sm.releaseWindowBlock(*park.entries[i].block.Hash())
+					}
+
 					park.entries = nil
 					park.bytesAccum = 0
 				}
@@ -5954,6 +6095,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),   // give peers 10 seconds to respond
 		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](60 * time.Second),   // give peers 60 seconds to respond
 		peerStates:      txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
+		// Hash-keyed ownership ledger for blocks between window admission and
+		// commit (see the field doc): prevents the parked-twin double-commit.
+		windowOwnedBlocks: txmap.NewSyncedMap[chainhash.Hash, uint32](),
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:           make(chan interface{}, maxMsgQueueSize),
 		headerList:        list.New(),

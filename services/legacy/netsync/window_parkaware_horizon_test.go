@@ -130,3 +130,44 @@ func TestDrainRefetchBlocks_ParkFullSkipsBeyondGateOrphan(t *testing.T) {
 	sm.assignedMu.Unlock()
 	require.True(t, stillQueued, "skipped beyond-gate orphan must remain in refetchBlocks (re-sent when the park drains)")
 }
+
+// TestParkStore_AtCapacity: the runway clamp predicate must fire on the BYTE cap
+// too, not just the count cap — otherwise large 2019 blocks fill the park by bytes
+// (count-free), the clamp never engages, and IBD churns on "park buffer full (bytes)".
+func TestParkStore_AtCapacity(t *testing.T) {
+	// Count-full (maxBlocks hit): atCapacity via the count arm.
+	require.True(t, (&parkStore{entries: make([]windowEntry, 1), maxBlocks: 1, budget: 1 << 30}).atCapacity(),
+		"count-full park is at capacity")
+
+	// Byte-full but NOT count-full: 3 entries, avg 266B, budget 1000B → adding
+	// another average block (1066) breaches the budget → at capacity.
+	require.True(t, (&parkStore{entries: make([]windowEntry, 3), bytesAccum: 800, budget: 1000, maxBlocks: 1000}).atCapacity(),
+		"byte-full (cannot fit another average block) park is at capacity — this is the gap that stalled IBD")
+
+	// Neither: room by count AND bytes.
+	require.False(t, (&parkStore{entries: make([]windowEntry, 3), bytesAccum: 100, budget: 1 << 30, maxBlocks: 1000}).atCapacity(),
+		"a park with ample count and byte room is not at capacity")
+
+	// Empty park with a budget is never at capacity.
+	require.False(t, (&parkStore{entries: nil, budget: 1000, maxBlocks: 1000}).atCapacity(),
+		"empty park is not at capacity")
+}
+
+// TestFetchRunwayHorizon_ByteFullClampsToGate: a park that is byte-full (but not
+// count-full) must still clamp the runway to the gate.
+func TestFetchRunwayHorizon_ByteFullClampsToGate(t *testing.T) {
+	chainParams := chaincfg.MainNetParams
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockValidation.MaxBlocksBehindBlockAssembly = 20
+	tSettings.Legacy.ParallelWindowMaxParkedBlocks = 1024
+
+	sm := &SyncManager{logger: ulogger.TestLogger{}, settings: tSettings, chainParams: &chainParams}
+	sm.parkAheadActive.Store(true)
+	sm.cachedBlockAssemblyHeight.Store(585737)
+	// Byte-full park: count-free (3 of 1024) but no room for another average block.
+	sm.parkRef.Store(&parkStore{entries: make([]windowEntry, 3), bytesAccum: 800, budget: 1000, maxBlocks: 1024})
+
+	horizon, capped := sm.fetchRunwayHorizon()
+	require.True(t, capped)
+	require.Equal(t, uint32(585737+20), horizon, "byte-full park must clamp the frontier to the gate, not the parkCap horizon")
+}
