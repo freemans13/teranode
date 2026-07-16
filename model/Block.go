@@ -774,33 +774,19 @@ func (b *Block) releaseTxMap() {
 // (merkleRootChecked) as a precondition of taking this skip, and never skips
 // validOrderAndBlessed unless the local bytes have been bound to the certified
 // chain. This mirrors the native catchup path (quickValidateBlock), which never
-// runs Valid() below the checkpoint at all.
+// runs Valid() below the checkpoint at all. All below-checkpoint gates now share
+// OutpointOnlyEligible/BelowCheckpoint, which excludes height 0 everywhere.
 func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings, txMetaStore utxo.Store) bool {
-	if tSettings == nil || !tSettings.BlockValidation.OutpointOnlyBelowCheckpoint {
-		return false
-	}
-
-	if txMetaStore == nil || !txMetaStore.SupportsOutpointOnlySpend() {
-		return false
-	}
-
 	if !b.checkpointConfirmedAncestor {
 		return false
 	}
 
-	if tSettings.ChainCfgParams == nil {
-		return false
+	var params *chaincfg.Params
+	if tSettings != nil {
+		params = tSettings.ChainCfgParams
 	}
 
-	highest := HighestCheckpointHeight(tSettings.ChainCfgParams.Checkpoints)
-
-	// b.Height > 0 excludes genesis: it carries only a coinbase, so
-	// validOrderAndBlessed is trivial there and cheap to run in full. This matches
-	// the sibling fee skip, which also special-cases height 0 (checkBlockRewardAndFees
-	// returns early at b.Height == 0). The legacy/quick-validate gates instead return
-	// true at height 0; the divergence is immaterial (genesis has no spends to order)
-	// and the model side simply runs the trivial check rather than skipping it.
-	return highest > 0 && b.Height > 0 && b.Height <= highest
+	return OutpointOnlyEligible(tSettings, txMetaStore, params, b.Height)
 }
 
 // https://en.bitcoin.it/wiki/BIP_0034
@@ -852,22 +838,45 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOu
 		return nil
 	}
 
+	// Accumulate with overflow detection. A uint64 wraparound in any of these
+	// sums could make the no-inflation comparison below pass on a block that is
+	// actually inflating supply, so a sum that overflows is itself invalid.
+	// These overflows cannot occur in a valid block (total value is far below
+	// 2^64 satoshis), so this only rejects impossible values and does not change
+	// the result for any real block.
 	coinbaseOutputSatoshis := uint64(0)
+
 	for _, tx := range b.CoinbaseTx.Outputs {
-		coinbaseOutputSatoshis += tx.Satoshis
+		sum := coinbaseOutputSatoshis + tx.Satoshis
+		if sum < coinbaseOutputSatoshis {
+			return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] coinbase output satoshis overflow uint64", b.String())
+		}
+
+		coinbaseOutputSatoshis = sum
 	}
 
 	subtreeFees := uint64(0)
 
 	for i := 0; i < len(b.SubtreeSlices); i++ {
 		subtree := b.SubtreeSlices[i]
-		subtreeFees += subtree.Fees
+
+		sum := subtreeFees + subtree.Fees
+		if sum < subtreeFees {
+			return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] subtree fees overflow uint64", b.String())
+		}
+
+		subtreeFees = sum
 	}
 
 	coinbaseReward := util.GetBlockSubsidyForHeight(b.Height, params)
 
-	if coinbaseOutputSatoshis > subtreeFees+coinbaseReward {
-		return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] coinbase output (%d) is greater than the fees + block subsidy (%d)", b.String(), coinbaseOutputSatoshis, subtreeFees+coinbaseReward)
+	allowedReward := subtreeFees + coinbaseReward
+	if allowedReward < subtreeFees {
+		return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] fees + block subsidy overflow uint64", b.String())
+	}
+
+	if coinbaseOutputSatoshis > allowedReward {
+		return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] coinbase output (%d) is greater than the fees + block subsidy (%d)", b.String(), coinbaseOutputSatoshis, allowedReward)
 	}
 
 	return nil

@@ -55,6 +55,11 @@ import (
 const (
 	banActionAdd = "add" // Action constant for adding a ban
 
+	// banSweepInterval is how often connected peers are re-checked against the
+	// IP ban list. Without a libp2p connection gater banned peers can redial at
+	// will, so the sweep re-disconnects them at the application layer.
+	banSweepInterval = 1 * time.Minute
+
 	// Default values for peer map cleanup (reduced to prevent memory exhaustion)
 	defaultPeerMapMaxSize         = 10000            // Maximum entries in peer maps (reduced from 100k)
 	defaultPeerMapTTL             = 10 * time.Minute // Time-to-live for peer map entries (reduced from 30min)
@@ -141,6 +146,9 @@ type Server struct {
 
 	invalidPolicyWarnOnce sync.Once // Emits the invalid-fee-policy warning at most once per process to avoid log spam
 
+	// ipBanCache is a short-lived cache of "is this peer's IP banned" lookups
+	// used by shouldSkipBannedPeer, avoiding a GetPeers scan per gossip message.
+	ipBanCache sync.Map // peerID string -> ipBanCacheEntry
 	// reputationCache is a short-lived cache of peer reputation scores used by
 	// shouldSkipUnhealthyPeer to avoid a gRPC round-trip per pubsub message.
 	// Entries expire after reputationCacheTTL; misses fall back to the registry.
@@ -843,9 +851,11 @@ func (s *Server) rejectedTxHandler(ctx context.Context) func(msg *kafka.KafkaMes
 }
 
 func (s *Server) disconnectPreExistingBannedPeers(ctx context.Context) {
-	for _, banned := range s.banList.ListBanned() {
-		s.handleBanEvent(ctx, BanEvent{Action: banActionAdd, IP: banned})
-	}
+	// Stored bans are IPs/subnets with no PeerID, so match them against the
+	// addresses of currently connected peers instead of replaying per-entry
+	// events. Peers that connect later are caught by the periodic sweep in
+	// listenForBanEvents.
+	s.disconnectPeersOnBanList(ctx, "banned before startup")
 }
 
 func generateRandomKey() (string, error) {
@@ -946,10 +956,22 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID strin
 	// Check if this is our own message
 	isSelf := peerID == s.P2PClient.GetID()
 
+	notificationBestHeight := nodeStatusMessage.BestHeight
+	notificationBestBlockHash := nodeStatusMessage.BestBlockHash
+	sanitizedBestHeight := nodeStatusMessage.BestHeight
+	var sanitizedBestBlockHash *chainhash.Hash
+	sanitizedTipOK := false
+
 	// Check that sender ID matches the claimed peer ID
 	if peerID != nodeStatusMessage.PeerID {
 		s.logger.Errorf("[handleNodeStatusTopic] peer ID spoofing detected: from=%s claimed=%s", peerID, nodeStatusMessage.PeerID)
 		s.applyBanScore(peerID, ReasonProtocolViolation)
+		return
+	}
+
+	// Drop messages from banned peers before any registration, WebSocket
+	// forwarding, or further processing.
+	if !isSelf && s.shouldSkipBannedPeer(peerID, "handleNodeStatusTopic") {
 		return
 	}
 
@@ -959,6 +981,19 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID strin
 			s.logger.Errorf("[handleNodeStatusTopic] invalid BaseURL from peer %s: %v", peerID, err)
 			s.applyBanScore(peerID, ReasonProtocolViolation)
 			return
+		}
+	}
+
+	if !isSelf && nodeStatusMessage.BestHeight > 0 && nodeStatusMessage.PeerID != "" {
+		var ok bool
+		sanitizedBestHeight, sanitizedBestBlockHash, ok = s.sanitizeAdvertisedTip(nodeStatusMessage.PeerID, nodeStatusMessage.BestHeight, nodeStatusMessage.BestBlockHash, s.getLocalHeight())
+		if ok {
+			sanitizedTipOK = true
+			notificationBestHeight = sanitizedBestHeight
+			notificationBestBlockHash = sanitizedBestBlockHash.String()
+		} else {
+			notificationBestHeight = 0
+			notificationBestBlockHash = ""
 		}
 	}
 
@@ -992,8 +1027,8 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID strin
 		PeerID:              nodeStatusMessage.PeerID,
 		Version:             nodeStatusMessage.Version,
 		CommitHash:          nodeStatusMessage.CommitHash,
-		BestBlockHash:       nodeStatusMessage.BestBlockHash,
-		BestHeight:          nodeStatusMessage.BestHeight,
+		BestBlockHash:       notificationBestBlockHash,
+		BestHeight:          notificationBestHeight,
 		TxCount:             nodeStatusMessage.TxCount,
 		SubtreeCount:        nodeStatusMessage.SubtreeCount,
 		FSMState:            nodeStatusMessage.FSMState,
@@ -1018,20 +1053,18 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID strin
 
 	// Update peer height if provided (but not for our own messages)
 	if !isSelf && nodeStatusMessage.BestHeight > 0 && nodeStatusMessage.PeerID != "" {
+		if !sanitizedTipOK {
+			return
+		}
+
 		peerID, err := peer.Decode(nodeStatusMessage.PeerID)
 		if err != nil {
 			s.logger.Errorf("[handleNodeStatusTopic] failed to decode peer ID %s: %v", nodeStatusMessage.PeerID, err)
 			return
 		}
 
-		hash, err := chainhash.NewHashFromStr(nodeStatusMessage.BestBlockHash)
-		if err != nil {
-			s.logger.Warnf("[handleNodeStatusTopic] failed to create hash from best block hash %s: %v", nodeStatusMessage.BestBlockHash, err)
-			return
-		}
-
-		s.addPeer(peerID, nodeStatusMessage.ClientName, nodeStatusMessage.BestHeight, hash, nodeStatusMessage.BaseURL)
-		s.logger.Debugf("[handleNodeStatusTopic] Updated block hash %s for peer %s", nodeStatusMessage.BestBlockHash, peerID)
+		s.addPeer(peerID, nodeStatusMessage.ClientName, sanitizedBestHeight, sanitizedBestBlockHash, nodeStatusMessage.BaseURL)
+		s.logger.Debugf("[handleNodeStatusTopic] Updated block hash %s for peer %s", notificationBestBlockHash, peerID)
 
 		// Update storage mode if provided
 		// Store whether the peer is a full node or pruned node
@@ -1797,6 +1830,45 @@ func (s *Server) UnbanPeer(ctx context.Context, peer *p2p_api.UnbanPeerRequest) 
 	return &p2p_api.UnbanPeerResponse{Ok: true}, nil
 }
 
+// ConnectPeer connects the P2P client to the peer at the given multiaddr.
+// Banned addresses are refused.
+func (s *Server) ConnectPeer(ctx context.Context, req *p2p_api.ConnectPeerRequest) (*p2p_api.ConnectPeerResponse, error) {
+	if s.P2PClient == nil {
+		return &p2p_api.ConnectPeerResponse{Success: false, Error: "P2P client is not initialised"}, nil
+	}
+
+	// Fail closed: if the ban status of the target cannot be determined (bad
+	// multiaddr, DNS resolution failure), refuse the dial.
+	banned, err := s.checkMultiaddrBanned(ctx, req.PeerAddress)
+	if err != nil {
+		return &p2p_api.ConnectPeerResponse{Success: false, Error: err.Error()}, nil
+	}
+	if banned {
+		return &p2p_api.ConnectPeerResponse{Success: false, Error: "address is banned"}, nil
+	}
+
+	if err := s.P2PClient.Connect(ctx, req.PeerAddress); err != nil {
+		return &p2p_api.ConnectPeerResponse{Success: false, Error: err.Error()}, nil
+	}
+
+	return &p2p_api.ConnectPeerResponse{Success: true}, nil
+}
+
+// DisconnectPeer disconnects a peer by ID: it is removed from the peer
+// registry and sync coordinator, and the libp2p connection is closed when the
+// P2P client supports it (go-p2p-message-bus does not yet expose a network
+// disconnect; see networkDisconnector).
+func (s *Server) DisconnectPeer(ctx context.Context, req *p2p_api.DisconnectPeerRequest) (*p2p_api.DisconnectPeerResponse, error) {
+	pid, err := peer.Decode(req.PeerId)
+	if err != nil {
+		return &p2p_api.DisconnectPeerResponse{Success: false, Error: fmt.Sprintf("invalid peer ID %s: %v", req.PeerId, err)}, nil
+	}
+
+	s.disconnectBannedPeerByID(ctx, pid, "operator disconnect request")
+
+	return &p2p_api.DisconnectPeerResponse{Success: true}, nil
+}
+
 func (s *Server) IsBanned(ctx context.Context, req *p2p_api.IsBannedRequest) (*p2p_api.IsBannedResponse, error) {
 	// IP-based ban (banList) takes precedence; if not, check the centralized
 	// peer registry's score-based ban as well.
@@ -1884,24 +1956,33 @@ func (s *Server) onPeerBanned(peerID, reason string) {
 		return
 	}
 
-	if s.P2PClient != nil {
-		var ids []string
+	// Ban the peer's addresses by literal IP: the ban list stores IPs/subnets,
+	// so multiaddr strings ("/ip4/1.2.3.4/tcp/9905/p2p/...") must be reduced to
+	// their IP component or they would never match a lookup.
+	if s.P2PClient != nil && s.banList != nil {
+		seen := make(map[string]struct{})
 		for _, p := range s.P2PClient.GetPeers() {
-			if p.ID == pid.String() {
-				ids = append(ids, p.Addrs...)
-				break
+			if p.ID != pid.String() {
+				continue
 			}
-		}
-		for _, id := range ids {
-			if s.banList != nil {
-				if err := s.banList.Add(context.Background(), id, until); err != nil {
-					s.logger.Errorf("[onPeerBanned] failed to add %s to ban list: %v", id, err)
+			for _, addr := range p.Addrs {
+				ip := extractIPFromMultiaddr(addr)
+				if ip == "" {
+					continue
+				}
+				if _, dup := seen[ip]; dup {
+					continue
+				}
+				seen[ip] = struct{}{}
+				if err := s.banList.Add(context.Background(), ip, until); err != nil {
+					s.logger.Errorf("[onPeerBanned] failed to add %s to ban list: %v", ip, err)
 				}
 			}
+			break
 		}
 	}
 
-	s.removePeer(pid)
+	s.disconnectBannedPeerByID(s.gCtx, pid, reason)
 }
 
 // RecordBytesDownloaded records the number of bytes downloaded via HTTP from a peer.
@@ -2030,45 +2111,6 @@ func (s *Server) ReportInvalidSubtree(ctx context.Context, subtreeHash string, p
 	s.subtreePeerMap.Delete(subtreeHash)
 
 	return nil
-}
-
-// myBanEventHandler implements BanEventHandler for the Server.
-type myBanEventHandler struct {
-	server *Server
-}
-
-// OnPeerBanned is called when a peer is banned.
-func (h *myBanEventHandler) OnPeerBanned(peerID string, until time.Time, reason string) {
-	h.server.logger.Infof("Peer %s banned until %s for reason: %s", peerID, until.Format(time.RFC3339), reason)
-	// get the ip for the peer id
-	pid, err := peer.Decode(peerID)
-	if err != nil {
-		h.server.logger.Errorf("Failed to decode peer ID %s: %v", peerID, err)
-		return
-	}
-
-	var ids []string
-	allPeers := h.server.P2PClient.GetPeers()
-	for _, p := range allPeers {
-		if p.ID == pid.String() {
-			h.server.logger.Infof("Found connected peer %s for banning", peerID)
-			ids = append(ids, p.Addrs...)
-			break
-		}
-	}
-
-	// add to ban list
-	for _, id := range ids {
-		if h.server.banList != nil {
-			if err := h.server.banList.Add(context.Background(), id, until); err != nil {
-				h.server.logger.Errorf("Failed to add peer %s to ban list: %v", id, err)
-			}
-		}
-	}
-
-	// Remove peer from SyncCoordinator before disconnecting
-	// Remove peer from registry
-	h.server.removePeer(pid)
 }
 
 // peerInfoToP2PProto converts a centralized blockchain.PeerInfo into the
