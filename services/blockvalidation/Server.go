@@ -1102,9 +1102,11 @@ func (u *Server) Stop(ctx context.Context) error {
 		u.blockCatchupAttempts.Stop()
 	}
 
-	// Wait for all background tasks in BlockValidation to complete
+	// Wait for all background tasks in BlockValidation to complete, bounded by the
+	// caller's stop deadline (ctx) so a worker whose Init ctx was not cancelled first
+	// cannot hang shutdown indefinitely.
 	if u.blockValidation != nil {
-		u.blockValidation.Wait()
+		u.blockValidation.Wait(ctx)
 		u.blockValidation.StopCaches()
 
 		// DC11: drain the BlockValidation-owned invalid-block kafka producer via
@@ -1483,6 +1485,13 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 		return err
 	}
 
+	// Unified below-checkpoint route: legacy blocks go through the same
+	// quick-validation machinery as native catchup (default off).
+	if u.legacyUnifiedRoute(block, baseURL) {
+		u.logger.Debugf("[processBlockFound][%s] unified route: quick-validating legacy block at height %d", block.Hash().String(), block.Height)
+		return u.blockValidation.quickValidateBlock(ctx, block, peerID, baseURL)
+	}
+
 	// validate the block
 	u.logger.Infof("[processBlockFound][%s] validate block from %s", hash.String(), baseURL)
 
@@ -1499,6 +1508,28 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	}
 
 	return nil
+}
+
+// legacyUnifiedRoute reports whether this block should take the unified
+// below-checkpoint route: legacy-sourced, operator opted into both the
+// outpoint-only fast path and the unified route, and the shared eligibility
+// gate holds (store capability + hardcoded checkpoint boundary via
+// model.OutpointOnlyEligible — never the operator catchup override). When true,
+// processBlockFound hands the block to quickValidateBlock — the same machinery
+// the native catchup path uses below checkpoints — instead of full validation.
+// Netsync has already written the subtree files, verified PoW and the merkle
+// root, and waited for block assembly; quickValidateBlock does UTXO
+// create+spend, AddBlock(MinedSet+SubtreesSet) and DAH.
+func (u *Server) legacyUnifiedRoute(block *model.Block, baseURL string) bool {
+	if !u.settings.BlockValidation.LegacyUnifiedBelowCheckpoint {
+		return false
+	}
+
+	if baseURL != "legacy" {
+		return false
+	}
+
+	return model.OutpointOnlyEligible(u.settings, u.utxoStore, u.settings.ChainCfgParams, block.Height)
 }
 
 // checkParentProcessingComplete ensures that a block's parent has completed validation
@@ -1525,43 +1556,51 @@ func (u *Server) checkParentProcessingComplete(ctx context.Context, block *model
 	delay := 10 * time.Millisecond
 	maxDelay := 10 * time.Second
 
-	// check if the parent block is being validated, then wait for it to finish.
-	blockBeingFinalized := u.blockValidation.blockHashesCurrentlyValidated.Exists(*block.Header.HashPrevBlock)
+	parentHash := block.Header.HashPrevBlock
 
-	if blockBeingFinalized {
-		u.logger.Infof("[processBlockFound][%s] parent block is being validated (hash: %s), waiting for it to finish: validated %v",
-			block.Hash().String(),
-			block.Header.HashPrevBlock.String(),
-			u.blockValidation.blockHashesCurrentlyValidated.Exists(*block.Header.HashPrevBlock),
-		)
+	// Wait while the parent is still finalizing - either actively being processed by the
+	// setMined worker, or waiting out a setTxMined retry backoff. Consulting
+	// setMinedRetryPending (via isParentFinalizing) keeps the child blocked across the
+	// parent's whole retry window; the backoff is now off-loaded and releases the
+	// blockHashesCurrentlyValidated claim immediately, so without this the child would
+	// fall straight through to the bounded parent-mined wait and give up (block-found
+	// churn) while a transiently-failing parent is still retrying.
+	if !u.blockValidation.isParentFinalizing(parentHash) {
+		return
+	}
 
-		retries := 0
+	u.logger.Infof("[processBlockFound][%s] parent block is being finalized (hash: %s), waiting for it to finish",
+		block.Hash().String(),
+		parentHash.String(),
+	)
 
-		for {
-			blockBeingFinalized = u.blockValidation.blockHashesCurrentlyValidated.Exists(*block.Header.HashPrevBlock)
+	retries := 0
 
-			if !blockBeingFinalized {
-				break
-			}
-
-			if (retries % 10) == 0 {
-				u.logger.Infof("[processBlockFound][%s] parent block is still (%d) being validated (hash: %s), waiting for it to finish: validated %v",
-					block.Hash().String(),
-					retries,
-					block.Header.HashPrevBlock.String(),
-					u.blockValidation.blockHashesCurrentlyValidated.Exists(*block.Header.HashPrevBlock),
-				)
-			}
-
-			time.Sleep(delay)
-
-			delay *= 2
-			if delay > maxDelay {
-				delay = maxDelay
-			}
-
-			retries++
+	for u.blockValidation.isParentFinalizing(parentHash) {
+		if (retries % 10) == 0 {
+			u.logger.Infof("[processBlockFound][%s] parent block is still (%d) being finalized (hash: %s), waiting for it to finish",
+				block.Hash().String(),
+				retries,
+				parentHash.String(),
+			)
 		}
+
+		// Honour shutdown: the parent's retry window can be long (worst case ~111s), so a
+		// bare sleep here would keep this goroutine alive well past a stop request.
+		select {
+		case <-ctx.Done():
+			u.logger.Warnf("[processBlockFound][%s] context cancelled while waiting for parent %s to finalize: %s",
+				block.Hash().String(), parentHash.String(), ctx.Err())
+			return
+		case <-time.After(delay):
+		}
+
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+
+		retries++
 	}
 }
 
@@ -1790,8 +1829,8 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 			return
 		}
 
-		// Report catchup failure to P2P service
-		u.reportCatchupFailure(ctx, c.peerID)
+		// Report catchup failure to P2P service.
+		u.reportCatchupFailureForError(ctx, c.peerID, err)
 
 		u.logger.Errorf("[Init] failed to process catchup signal for block [%s] from peer %s: %v", c.block.Hash().String(), c.peerID, err)
 
@@ -1861,7 +1900,7 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 					break
 				} else {
 					u.logger.Warnf("[catchup] Alternative peer %s also failed for block %s: %v", alt.peerID, blockHash.String(), altErr)
-					u.reportCatchupFailure(ctx, alt.peerID)
+					u.reportCatchupFailureForError(ctx, alt.peerID, altErr)
 				}
 			}
 		} else {
