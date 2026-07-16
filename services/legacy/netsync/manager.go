@@ -287,6 +287,15 @@ type syncPeerState struct {
 	lastBlockTime          time.Time
 	violations             int
 	ticks                  uint64
+	// silentTicks counts consecutive 30s samples in which the association
+	// moved ZERO bytes. During headers-first IBD the sync peer always owes us
+	// data (headers or blocks), so sustained total silence means it is stalled
+	// — but the only detector was the 3-minute last-block-time window, which
+	// is the dominant dead-air cost at checkpoint-block stalls (the direct
+	// path's sole recovery is rotation). Reset on any byte movement, so a peer
+	// streaming the post-rotation header replay (~160KB/batch) or a fat block
+	// can never accrue silent ticks — thrash-proof by construction.
+	silentTicks int
 }
 
 // validNetworkSpeed checks if the peer is slow and
@@ -334,6 +343,33 @@ func (sps *syncPeerState) updateNetwork(syncPeer *peerpkg.Peer) {
 
 	sps.assocReadBytesLastTick = sps.assocReadBytes
 	sps.assocReadBytes = syncPeer.AssociationReadBytes()
+
+	// Silence accounting: a tick with zero forward byte movement on the whole
+	// association (a shrink means a stream died — also not progress). Needs one
+	// prior sample so a fresh sync peer is never counted silent on its first tick.
+	if sps.ticks > 1 && sps.assocReadBytes <= sps.assocReadBytesLastTick {
+		sps.silentTicks++
+	} else {
+		sps.silentTicks = 0
+	}
+}
+
+// silentTickCount returns the current consecutive-silent-tick count.
+func (sps *syncPeerState) silentTickCount() int {
+	sps.mu.RLock()
+	defer sps.mu.RUnlock()
+
+	return sps.silentTicks
+}
+
+// resetSilentTicks clears silence accounting. Used while the node is
+// self-backpressured: zero throughput then measures our own validation speed,
+// not the peer's health, and must not accrue toward rotation.
+func (sps *syncPeerState) resetSilentTicks() {
+	sps.mu.Lock()
+	defer sps.mu.Unlock()
+
+	sps.silentTicks = 0
 }
 
 // hasHealthyDownloadThroughput reports whether the sync peer's association
@@ -1351,7 +1387,13 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// queue, the backlog drains, and the check resumes — so this delays, but does
 	// not prevent, rotation of a truly stalled peer.
 	if sm.localReadBackpressured() {
+		// Self-backpressure: silence here measures our validation speed, not the
+		// peer. Clear the silence counter so it cannot fire spuriously the moment
+		// backpressure lifts (the deferred updateNetwork may still add one tick
+		// after this reset, which stays safely below any limit >= 2).
+		sps.resetSilentTicks()
 		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check skipped: read-loop backpressured by local block processing", sp.String())
+
 		return
 	}
 
@@ -1390,16 +1432,40 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 		isLastBlockTimeViolation = false
 	}
 
+	// Silent sync-peer detector (headers-first only). During IBD the sync peer
+	// always owes us data — headers below the final checkpoint or requested
+	// blocks — so N consecutive 30s samples of literally ZERO association bytes
+	// mean it is stalled. This fires in ~N*30s instead of the 3-minute
+	// last-block-time window, which was the dominant dead-air cost at
+	// checkpoint-block stalls (the direct path's only recovery is rotation).
+	// Restricted to headers-first mode: post-IBD, quiet is normal (blocks are
+	// minutes apart) and the network-speed check above is active instead. A
+	// peer moving ANY bytes (header replay, fat-block streaming) never accrues
+	// silent ticks, so this cannot churn a slow-but-alive peer.
+	isSilenceViolation := false
+
+	if limit := sm.syncPeerSilentTickLimit(); headersFirst && limit > 0 {
+		if st := sps.silentTickCount(); st >= limit {
+			isSilenceViolation = true
+
+			sm.logger.Infof("[CheckSyncPeer] sync peer %s silent for %d consecutive ticks during headers-first sync (limit %d)", sp.String(), st, limit)
+		}
+	}
+
 	// If no violations detected, the sync peer is healthy — nothing to do.
-	if !isNetworkSpeedViolation && !isLastBlockTimeViolation {
+	if !isNetworkSpeedViolation && !isLastBlockTimeViolation && !isSilenceViolation {
 		return
 	}
 
 	var reason string
-	if isNetworkSpeedViolation {
+
+	switch {
+	case isNetworkSpeedViolation:
 		reason = "network speed violation"
-	} else if isLastBlockTimeViolation {
+	case isLastBlockTimeViolation:
 		reason = "last block time out of range"
+	case isSilenceViolation:
+		reason = "silent sync peer during headers-first sync"
 	}
 	sm.logger.Debugf("[CheckSyncPeer] sync peer %s is stalled due to %s, updating sync peer", sp.String(), reason)
 
@@ -1412,6 +1478,28 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 
 	sm.clearRequestedState(state)
 	sm.updateSyncPeer(state)
+}
+
+// syncPeerSilentTickLimit resolves the silent-tick rotation threshold:
+// 0 disables the detector entirely (byte-identical rollback lever); any other
+// configured value is clamped to a minimum of 2, because the first silent
+// sample after backpressure or a fresh peer is legitimate settling time.
+// A SyncManager without settings (unit-test constructions) is disabled.
+func (sm *SyncManager) syncPeerSilentTickLimit() int {
+	if sm.settings == nil {
+		return 0
+	}
+
+	limit := sm.settings.Legacy.SyncPeerSilentTicks
+	if limit <= 0 {
+		return 0
+	}
+
+	if limit < 2 {
+		return 2
+	}
+
+	return limit
 }
 
 // topBlock returns the best chains top block height
