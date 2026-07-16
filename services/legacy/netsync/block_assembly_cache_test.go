@@ -58,7 +58,7 @@ func newCacheTestManager(t *testing.T, ba blockassembly.ClientI, maxBehind int) 
 		Checkpoints: []chaincfg.Checkpoint{{Height: cacheTestCheckpointHeight}},
 	}
 
-	return &SyncManager{
+	sm := &SyncManager{
 		ctx:           context.Background(),
 		logger:        ulogger.TestLogger{},
 		settings:      s,
@@ -66,6 +66,13 @@ func newCacheTestManager(t *testing.T, ba blockassembly.ClientI, maxBehind int) 
 		blockAssembly: ba,
 		quit:          make(chan struct{}),
 	}
+
+	// Model a poller that has reported (the common case). Tests exercising the
+	// pre-poll state clear this explicitly — a cached height of 0 is a REAL
+	// height (fresh node at genesis), not an unpolled sentinel.
+	sm.baHeightPolled.Store(true)
+
+	return sm
 }
 
 // TestWaitForBlockAssemblyReadyCached_FastPath proves that when the cached
@@ -111,7 +118,10 @@ func TestWaitForBlockAssemblyReadyCached_UnpolledFallsThrough(t *testing.T) {
 	spy.height.Store(5000)
 	sm := newCacheTestManager(t, spy, 100)
 
-	// cache left at zero.
+	// Never polled: modelled by the flag (a zero HEIGHT with a reported poller
+	// is a real genesis height and legitimately serves the fast path).
+	sm.baHeightPolled.Store(false)
+
 	err := sm.waitForBlockAssemblyReadyCached(context.Background(), 100)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, spy.calls.Load(), int64(1), "unpolled cache must take the slow path")

@@ -31,9 +31,14 @@ func TestBlockAssemblyGateAdmitsCached(t *testing.T) {
 	require.False(t, admit)
 
 	// Unpolled cache -> not evaluable (caller falls back to blocking wait).
+	// Modelled by the poller-reported flag, NOT a zero height: height 0 is a
+	// real height on a fresh node and must arm the gate once polled.
+	sm.baHeightPolled.Store(false)
 	sm.cachedBlockAssemblyHeight.Store(0)
 	_, evaluable = sm.blockAssemblyGateAdmitsCached(1200)
 	require.False(t, evaluable)
+
+	sm.baHeightPolled.Store(true)
 
 	// Above the checkpoint -> never evaluable (fresh-gRPC slow path).
 	sm.cachedBlockAssemblyHeight.Store(1000)

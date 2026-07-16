@@ -31,12 +31,14 @@ func TestWaitForBlockAssemblyReadyCached_BelowCP_ReleasesOnCacheAdvance(t *testi
 	const blockHeight = uint32(1500)
 	// Initially behind: cached(1000) + maxBehind(100) = 1100 < 1500.
 	sm.cachedBlockAssemblyHeight.Store(1000)
+	sm.baHeightPolled.Store(true)
 
 	// Simulate the background poller advancing the cache past the bound after a
 	// short delay (well under the old 5s exponential step).
 	go func() {
 		time.Sleep(150 * time.Millisecond)
 		sm.cachedBlockAssemblyHeight.Store(1400) // 1400 + 100 = 1500 >= 1500
+		sm.baHeightPolled.Store(true)
 	}()
 
 	start := time.Now()
@@ -68,6 +70,7 @@ func TestWaitForBlockAssemblyReadyCached_BelowCP_BoundedEscalation(t *testing.T)
 	const blockHeight = uint32(1500)
 	// Behind and never advances.
 	sm.cachedBlockAssemblyHeight.Store(1000)
+	sm.baHeightPolled.Store(true)
 
 	done := make(chan error, 1)
 	go func() {
@@ -94,6 +97,7 @@ func TestWaitForBlockAssemblyReadyCached_BelowCP_CtxCancelReturns(t *testing.T) 
 
 	const blockHeight = uint32(1500)
 	sm.cachedBlockAssemblyHeight.Store(1000)
+	sm.baHeightPolled.Store(true)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -122,6 +126,7 @@ func TestWaitForBlockAssemblyReadyCached_BelowCP_QuitReturns(t *testing.T) {
 
 	const blockHeight = uint32(1500)
 	sm.cachedBlockAssemblyHeight.Store(1000)
+	sm.baHeightPolled.Store(true)
 
 	done := make(chan error, 1)
 	go func() {

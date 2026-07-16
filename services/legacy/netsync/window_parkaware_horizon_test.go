@@ -46,6 +46,7 @@ func TestFetchRunwayHorizon_ParkFullClampsToGate(t *testing.T) {
 		sm := &SyncManager{logger: ulogger.TestLogger{}, settings: tSettings, chainParams: &chainParams}
 		sm.parkAheadActive.Store(true)
 		sm.cachedBlockAssemblyHeight.Store(585737) // below checkpoint 600000
+		sm.baHeightPolled.Store(true)
 		return sm
 	}
 
@@ -103,6 +104,7 @@ func TestDrainRefetchBlocks_ParkFullSkipsBeyondGateOrphan(t *testing.T) {
 	// Park-ahead live, below checkpoint, cache polled, park COUNT-FULL → horizon = gate = 585757.
 	sm.parkAheadActive.Store(true)
 	sm.cachedBlockAssemblyHeight.Store(585737)
+	sm.baHeightPolled.Store(true)
 	sm.parkRef.Store(fullPark())
 
 	inGate := chainhash.Hash{0x01}   // 585738 <= gate 585757 → must be fetched
@@ -164,6 +166,7 @@ func TestFetchRunwayHorizon_ByteFullClampsToGate(t *testing.T) {
 	sm := &SyncManager{logger: ulogger.TestLogger{}, settings: tSettings, chainParams: &chainParams}
 	sm.parkAheadActive.Store(true)
 	sm.cachedBlockAssemblyHeight.Store(585737)
+	sm.baHeightPolled.Store(true)
 	// Byte-full park: count-free (3 of 1024) but no room for another average block.
 	sm.parkRef.Store(&parkStore{entries: make([]windowEntry, 3), bytesAccum: 800, budget: 1000, maxBlocks: 1024})
 

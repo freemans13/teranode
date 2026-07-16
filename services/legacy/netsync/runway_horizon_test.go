@@ -50,6 +50,7 @@ func TestFetchRunwayHorizon(t *testing.T) {
 	t.Run("inactive when park-ahead off", func(t *testing.T) {
 		sm := newSM()
 		sm.cachedBlockAssemblyHeight.Store(500000)
+		sm.baHeightPolled.Store(true)
 		// parkAheadActive left false.
 		_, capped := sm.fetchRunwayHorizon()
 		require.False(t, capped, "cap must be inactive when park-ahead is not live")
@@ -59,6 +60,7 @@ func TestFetchRunwayHorizon(t *testing.T) {
 		sm := newSM()
 		sm.parkAheadActive.Store(true)
 		sm.cachedBlockAssemblyHeight.Store(500000)
+		sm.baHeightPolled.Store(true)
 
 		horizon, capped := sm.fetchRunwayHorizon()
 		require.True(t, capped, "cap must be active below the checkpoint with a polled cache")
@@ -77,6 +79,7 @@ func TestFetchRunwayHorizon(t *testing.T) {
 		sm := newSM()
 		sm.parkAheadActive.Store(true)
 		sm.cachedBlockAssemblyHeight.Store(1_000_000_000) // above every mainnet checkpoint
+		sm.baHeightPolled.Store(true)
 
 		_, capped := sm.fetchRunwayHorizon()
 		require.False(t, capped, "above the checkpoint parking is off, so no cap")
@@ -87,6 +90,7 @@ func TestFetchRunwayHorizon(t *testing.T) {
 		sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly = 0
 		sm.parkAheadActive.Store(true)
 		sm.cachedBlockAssemblyHeight.Store(500000)
+		sm.baHeightPolled.Store(true)
 
 		_, capped := sm.fetchRunwayHorizon()
 		require.False(t, capped, "a non-positive maturity window disables the cap")

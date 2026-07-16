@@ -107,6 +107,7 @@ func TestHandleBlockMsgWithWindow_ToleratedRequeueRestoresHeightIndex(t *testing
 	// Block assembly is far behind (100), so a height-500 block is BEYOND the
 	// maturity gate (100+20) and takes the park branch.
 	sm.cachedBlockAssemblyHeight.Store(100)
+	sm.baHeightPolled.Store(true)
 
 	sm.headersFirstMode.Store(true)
 	sm.headerList = list.New()

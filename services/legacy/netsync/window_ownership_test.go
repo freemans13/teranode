@@ -137,6 +137,7 @@ func newOwnershipSyncManager(t *testing.T, blockchainClient *blockchain2.Mock) (
 	sm.peerStates.Set(p, state)
 	sm.headersFirstMode.Store(false)
 	sm.cachedBlockAssemblyHeight.Store(100)
+	sm.baHeightPolled.Store(true)
 
 	return sm, p, state
 }

@@ -643,6 +643,15 @@ type SyncManager struct {
 	// always a stale-LOW-or-equal lower bound on the true height, so a fast-path
 	// pass on the cache implies the true bound also holds.
 	cachedBlockAssemblyHeight atomic.Uint32
+	// baHeightPolled records that blockAssemblyHeightPoller has successfully
+	// reported at least once. It exists because a cached height of ZERO is
+	// ambiguous: it is both the unpolled zero value AND block assembly's real
+	// height on a fresh node. Consumers must use THIS flag (not cached > 0) to
+	// decide whether the cache is trustworthy — treating 0 as "unpolled" on a
+	// from-scratch sync disabled parking entirely, so an out-of-order far-ahead
+	// delivery put the drain goroutine into the blocking maturity wait and the
+	// node wedged at exactly the gate width above genesis (mainnet, height 100).
+	baHeightPolled atomic.Bool
 	// parkAheadActive is set once, when the drain loop creates the park store
 	// (park-ahead enabled + refill tick present). It gates the headers-first fetch
 	// runway cap (fetchRunwayHorizon): only when parking is live must the fetch
@@ -3452,9 +3461,11 @@ func (sm *SyncManager) fetchRunwayHorizon() (uint32, bool) {
 	}
 
 	cached := sm.cachedBlockAssemblyHeight.Load()
-	if cached == 0 {
+	if !sm.baHeightPolled.Load() {
 		// BA cache not yet polled; capping now would wrongly clamp the frontier to
-		// ~parkCap. Leave the walk uncapped until the poller sets a real height.
+		// ~parkCap. Leave the walk uncapped until the poller reports. (A REAL
+		// height of 0 — fresh node — must cap normally, hence the flag, not
+		// cached == 0.)
 		return 0, false
 	}
 
@@ -4941,7 +4952,9 @@ func (sm *SyncManager) releaseParkedBlocks(park *parkStore, wa *windowAccumulato
 	}
 
 	cached := sm.cachedBlockAssemblyHeight.Load()
-	if cached == 0 || cached > math.MaxUint32-uint32(maxBehind) {
+	// Trust the cache once the poller has reported — a genuine height of 0
+	// (fresh node) must release the run 1..maxBehind, not freeze the park.
+	if !sm.baHeightPolled.Load() || cached > math.MaxUint32-uint32(maxBehind) {
 		return
 	}
 
@@ -5920,7 +5933,10 @@ func (sm *SyncManager) DonePeer(peer *peerpkg.Peer, done chan struct{}) {
 func (sm *SyncManager) blockAssemblyGateAdmitsCached(blockHeight uint32) (admit, evaluable bool) {
 	maxBehind := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
 	if maxBehind > 0 && sm.chainParams != nil && model.BelowCheckpoint(sm.chainParams.Checkpoints, blockHeight) {
-		if cached := sm.cachedBlockAssemblyHeight.Load(); cached > 0 && cached <= math.MaxUint32-uint32(maxBehind) {
+		// baHeightPolled (not cached > 0) decides trustworthiness: a genuine
+		// height of 0 on a fresh node must arm the gate, or far-ahead blocks
+		// fall into the blocking wait and wedge the drain at genesis+maxBehind.
+		if cached := sm.cachedBlockAssemblyHeight.Load(); sm.baHeightPolled.Load() && cached <= math.MaxUint32-uint32(maxBehind) {
 			return cached+uint32(maxBehind) >= blockHeight, true
 		}
 	}
@@ -6021,8 +6037,10 @@ func (sm *SyncManager) waitForBlockAssemblyCachePoll(ctx context.Context, blockH
 		case <-ticker.C:
 			cached := sm.cachedBlockAssemblyHeight.Load()
 			// Re-apply the same overflow-guarded bound as the fast path; the cache is
-			// monotonic below the checkpoint so it stays usable once it was.
-			if cached > 0 && cached <= math.MaxUint32-uint32(maxBehind) && cached+uint32(maxBehind) >= blockHeight {
+			// monotonic below the checkpoint so it stays usable once it was. Gated on
+			// the poller having reported (not cached > 0): a genuine height of 0 on a
+			// fresh node satisfies the bound for early blocks and must release them.
+			if sm.baHeightPolled.Load() && cached <= math.MaxUint32-uint32(maxBehind) && cached+uint32(maxBehind) >= blockHeight {
 				return nil
 			}
 		}
@@ -6047,6 +6065,10 @@ func (sm *SyncManager) blockAssemblyHeightPoller(ctx context.Context) {
 		}
 
 		sm.cachedBlockAssemblyHeight.Store(state.CurrentHeight)
+		// Order matters for the fresh-node case: publish the height before
+		// declaring the cache trustworthy, so a reader that sees the flag also
+		// sees a real (possibly zero) height, never the unpolled zero.
+		sm.baHeightPolled.Store(true)
 	}
 
 	// Prime the cache immediately so the fast path is armed without waiting a

@@ -3180,6 +3180,7 @@ func TestPeerRotation_FiresWhileDrainBlockedOnMaturity(t *testing.T) {
 	// wait can never satisfy cached+maxBehind >= 5000 and stays parked. No poller
 	// runs (we never call Start), so this value is stable for the whole test.
 	sm.cachedBlockAssemblyHeight.Store(1)
+	sm.baHeightPolled.Store(true)
 
 	// Build a minimal wire block: HandleBlockDirect reaches the maturity wait
 	// after only reading the header and the prev-header height, so no coinbase or
