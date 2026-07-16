@@ -2224,13 +2224,49 @@ const (
 // (the sync peer's LastBlock() far exceeds our best height); those branches
 // would also be skipped on the normal handleBlockMsg path for the same reason.
 // There is no behaviour divergence.
-func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator, flushWindow, flushWindowSync func(), park *parkStore) (blockAdmitOutcome, error) {
+func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowAccumulator, flushWindow, flushWindowSync func(), park *parkStore) (outcome blockAdmitOutcome, retErr error) {
 	sm.logger.Debugf("[handleBlockMsgWithWindow][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 
 	peer, state, catchingBlocks, isCheckpointBlock, headerHeight, preambleErr := sm.handleBlockPreamble("handleBlockMsgWithWindow", bmsg)
 	if preambleErr != nil {
 		return blockAdmitDirect, preambleErr
 	}
+
+	// headerHeightIndex lifecycle across a tolerated-failure requeue.
+	// handleBlockPreamble CONSUMES this block's index entry at early-ack admission
+	// (front-removal, see the delete near "headerList.Remove" above) BEFORE this
+	// function decides the block's fate. On a tolerated (non-peer-fault) error the
+	// drain loop requeues the block (requeueFailedBlock); with the entry already
+	// gone, the re-fetched OUT-OF-ORDER arrival resolves headerHeight=-1, falls into
+	// the default parent-lookup arm, fails BLOCK_NOT_FOUND for a not-yet-committed
+	// parent — itself a tolerated error — and requeues again, spinning forever.
+	// Restore the authoritative PoW-verified height on exactly the drain loop's
+	// requeue condition (tolerated error) so the re-fetch stays height-resolvable
+	// and re-enters the normal window/park path; delete it on any other exit
+	// (committed, parked, or peer-fault — not requeued). This bounds the index to
+	// the header-list frontier plus the live refetch set. Guarded by
+	// headersFirstMode so it is a no-op post-checkpoint and on the single-peer /
+	// pre-park direct path. No return point below holds headerMu (handleBlockPreamble
+	// releases it; pumpBlockRequests takes/releases it internally), so this cannot
+	// deadlock.
+	defer func() {
+		if !sm.headersFirstMode.Load() || headerHeight <= 0 {
+			return
+		}
+
+		sm.headerMu.Lock()
+		// Production always initialises headerHeightIndex in New(); guard the write
+		// so a minimally-constructed test SyncManager with a nil map is a no-op,
+		// matching the nil-safe read/delete used elsewhere in the header path.
+		if sm.headerHeightIndex != nil {
+			if retErr != nil && !BlockProcessingErrorIsPeerFault(retErr) {
+				sm.headerHeightIndex[bmsg.blockHash] = headerHeight
+			} else {
+				delete(sm.headerHeightIndex, bmsg.blockHash)
+			}
+		}
+		sm.headerMu.Unlock()
+	}()
 
 	// Already-committed guard (mirrors HandleBlockDirect, handle_block.go). A peer
 	// can re-deliver a block that is already committed to our chain — observed on
