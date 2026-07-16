@@ -4321,9 +4321,24 @@ func (wa *windowAccumulator) drainJob() (windowFlushJob, bool) {
 		return entries[i].block.Height < entries[j].block.Height
 	})
 
-	blocks := make([]*model.Block, len(entries))
+	// De-duplicate by height. Under refetch/park churn the SAME block can be added
+	// to the accumulator more than once (a re-delivery arriving while the original
+	// is still queued — window add() does not dedupe). Committing a block twice makes
+	// ProcessBlockWindow create that block's txs concurrently, which collides on the
+	// partitioned txs unique index and deadlocks Postgres (40P01) — the root cause of
+	// the create-vs-create deadlock that (via the flushWorker poison latch) was
+	// freezing IBD. The window path is below-checkpoint only, where the chain is
+	// pinned to exactly one block per height, so a repeated height IS the same block;
+	// keep the first occurrence. The slice is already ascending by height, so
+	// duplicates are adjacent and strict-ascending commit order is preserved.
+	blocks := make([]*model.Block, 0, len(entries))
+
 	for i, e := range entries {
-		blocks[i] = e.block
+		if i > 0 && e.block.Height == entries[i-1].block.Height {
+			continue
+		}
+
+		blocks = append(blocks, e.block)
 	}
 
 	return windowFlushJob{blocks: blocks}, true
@@ -4462,6 +4477,29 @@ func (sm *SyncManager) shutdownFlushHandoff(wa *windowAccumulator, jobs chan win
 // branch below does not fire on a normal Stop(); it only fires if the context
 // this worker was started with is cancelled elsewhere, in which case the worker
 // drains the channel WITHOUT committing any further window and exits.
+// windowRelinksAfterPoison reports whether a window arriving at a poisoned
+// flushWorker is contiguous with the committed chain — its lowest block is at or
+// below committedBest+1. After a fatal commit the sync peer is disconnected and the
+// pipeline re-requests the uncommitted suffix from our committed best-block, so a
+// re-delivered window starts at committedBest+1; clearing the poison latch for such
+// a window lets the (idempotent) commit be retried instead of discarded forever. A
+// window starting ABOVE committedBest+1 is a real gap and must stay poisoned.
+// Best-effort: on a best-block lookup error (or empty window) it returns false so
+// the worker stays safely poisoned. Called only while poisoned (rare).
+func (sm *SyncManager) windowRelinksAfterPoison(ctx context.Context, job windowFlushJob) bool {
+	if len(job.blocks) == 0 || sm.blockchainClient == nil {
+		return false
+	}
+
+	_, meta, err := sm.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil || meta == nil {
+		sm.logger.Warnf("[flushWorker] poison-recovery best-block lookup failed, staying poisoned: %v", err)
+		return false
+	}
+
+	return job.blocks[0].Height <= meta.Height+1
+}
+
 func (sm *SyncManager) flushWorker(ctx context.Context, jobs <-chan windowFlushJob) {
 	poisoned := false
 
@@ -4483,6 +4521,21 @@ func (sm *SyncManager) flushWorker(ctx context.Context, jobs <-chan windowFlushJ
 		case job, ok := <-jobs:
 			if !ok {
 				return
+			}
+
+			// Recover from a prior fatal commit once a fresh, tip-aligned window
+			// arrives. A fatal commit disconnects the sync peer (commitWindowJob),
+			// which rotates and re-requests the uncommitted suffix from our committed
+			// best-block, so the re-delivered window starts at committedBest+1.
+			// Clearing the latch for such a contiguous window (NOT for one that starts
+			// beyond committedBest+1 — a genuine gap) converts what was a permanent,
+			// restart-only wedge into an idempotent re-commit. Without this the poison
+			// flag (a goroutine-lifetime local) never resets and a single transient
+			// commit failure — e.g. a Postgres 40P01 deadlock in the UTXO create
+			// batcher — freezes the tip until the process restarts.
+			if poisoned && sm.windowRelinksAfterPoison(ctx, job) {
+				sm.logger.Warnf("[flushWorker] tip-aligned window (first height %d) arrived after poison; clearing latch and retrying commit", job.blocks[0].Height)
+				poisoned = false
 			}
 
 			if poisoned {

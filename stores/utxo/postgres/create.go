@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -730,7 +731,14 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	// stamping delete_at_height inline (see createBatchUNNESTSQL).
 	retention := int32(s.settings.GetUtxoStoreBlockHeightRetention())
 
-	runChunk := func(lo, hi int) error {
+	// attemptChunk runs one INSERT of rows [lo,hi) and drains its RETURNING hashes
+	// into newHashSet. Returns the RAW error (unwrapped) so the caller can classify
+	// a Postgres deadlock. The INSERT is ON CONFLICT DO NOTHING and autocommits, so
+	// a failed attempt rolls back entirely and a re-run re-inserts idempotently —
+	// re-confirming the same RETURNING hashes (a set, so partial entries from a
+	// failed attempt are harmless: a successful retry re-adds them, and on total
+	// failure the chunk's items are marked invalid and never consult newHashSet).
+	attemptChunk := func(lo, hi int) error {
 		rows, err := conn.Query(ctx, createBatchUNNESTSQL,
 			hashes[lo:hi], versions[lo:hi], lockTimes[lo:hi], fees[lo:hi], sizes[lo:hi],
 			coinbases[lo:hi], rawTxs[lo:hi], lockeds[lo:hi], conflictings[lo:hi], frozens[lo:hi],
@@ -739,16 +747,16 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 			retention,
 		)
 		if err != nil {
-			return errors.NewStorageError("failed to INSERT create batch via CTE", err)
+			return err
 		}
-		// Per-chunk defer drains/closes rows before the next chunk's Query on the
-		// same pooled conn (and before conn.Release()). Do not hoist this Close out.
+		// Drain/close rows before the next Query on the same pooled conn (and before
+		// conn.Release()). Do not hoist this Close out.
 		defer rows.Close()
 
 		for rows.Next() {
 			var hashBytes []byte
 			if scanErr := rows.Scan(&hashBytes); scanErr != nil {
-				return errors.NewStorageError("failed to scan inserted hash", scanErr)
+				return scanErr
 			}
 
 			var h chainhash.Hash
@@ -757,11 +765,38 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 			newHashSet[h] = struct{}{}
 		}
 
-		if rowsErr := rows.Err(); rowsErr != nil {
-			return errors.NewStorageError("create batch rows error", rowsErr)
-		}
+		return rows.Err()
+	}
 
-		return nil
+	// runChunk wraps attemptChunk with a bounded, jittered retry on a Postgres
+	// deadlock (SQLSTATE 40P01). Concurrent create batchers can deadlock on the UTXO
+	// insert; Postgres aborts one side (rolled back) while the other commits, so a
+	// retry that lands AFTER the winner succeeds — the standard deadlock remedy. The
+	// jitter desynchronises multiple deadlocked batchers so they do not re-collide in
+	// lockstep. Without this, a deterministic concurrent pattern re-deadlocks on every
+	// immediate window-level retry, which upstream permanently poisons the legacy
+	// window committer (flushWorker) and freezes IBD until a process restart.
+	runChunk := func(lo, hi int) error {
+		for attempt := 0; ; attempt++ {
+			err := attemptChunk(lo, hi)
+			if err == nil {
+				return nil
+			}
+
+			if attempt < createBatchDeadlockRetries && isPgDeadlock(err) {
+				backoff := deadlockRetryBackoff(attempt)
+				s.logger.Warnf("[createBatched] postgres deadlock (40P01) on create-batch INSERT of %d rows, retry %d/%d after %s", hi-lo, attempt+1, createBatchDeadlockRetries, backoff)
+
+				select {
+				case <-time.After(backoff):
+					continue
+				case <-ctx.Done():
+					return errors.NewStorageError("create batch rows error", ctx.Err())
+				}
+			}
+
+			return errors.NewStorageError("create batch rows error", err)
+		}
 	}
 
 	windows, oversized := planCreateChunks(rowBytes, threshold, createBatchChunkOverhead, pgxMaxMessageBodyLen)
@@ -845,6 +880,37 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// createBatchDeadlockRetries bounds how many times a create-batch INSERT is
+// retried after a Postgres deadlock (40P01) before the error propagates. This is
+// defence-in-depth: the create-vs-create deadlock's ROOT cause (the same block
+// committed twice in one window → its txs created concurrently) is fixed upstream
+// by de-duplicating the window (windowAccumulator.drainJob). The retry remains for
+// any residual concurrent same-key insert.
+const createBatchDeadlockRetries = 5
+
+// isPgDeadlock reports whether err is (or wraps) a Postgres deadlock, SQLSTATE
+// 40P01. Mirrors the pgconn.PgError code check used elsewhere in this store.
+func isPgDeadlock(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "40P01"
+}
+
+// deadlockRetryBackoff is an exponential backoff with full jitter for deadlock
+// retries: attempt 0 → up to 10ms, doubling per attempt, capped at 500ms. The
+// jitter desynchronises multiple deadlocked batchers so their retries do not
+// re-collide in lockstep (a fixed backoff would just re-deadlock together).
+func deadlockRetryBackoff(attempt int) time.Duration {
+	const base = 10 * time.Millisecond
+	const maxBackoff = 500 * time.Millisecond
+
+	window := base << attempt //nolint:gosec // attempt is bounded by createBatchDeadlockRetries
+	if window > maxBackoff || window <= 0 {
+		window = maxBackoff
+	}
+
+	return time.Duration(rand.Int64N(int64(window)) + 1)
+}
 
 // buildCreateMeta populates the meta.Data from computed values.
 func (s *Store) buildCreateMeta(txMeta *meta.Data, options *utxo.CreateOptions, isCoinbase bool, blockHeight uint32) *meta.Data {
