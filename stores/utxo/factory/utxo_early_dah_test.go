@@ -1,12 +1,11 @@
 package factory
 
-// Tests for maybeLatchEarlyDAHBoundary — the helper that publishes the highest
-// hardcoded checkpoint height to a store's early-DAH boundary once the main chain's
-// header at that height matches the pinned checkpoint hash. Fail-safe: any error,
-// missing header, or hash mismatch must leave the boundary unset and return false so
-// the caller probes again on a later block notification; a matched hash publishes the
-// boundary once and returns true so the caller stops probing for the rest of the
-// process lifetime.
+// Tests for earlyDAHRatchet — the climber that publishes the highest CONFIRMED
+// hardcoded checkpoint height to a store's early-DAH boundary as the header
+// chain grows. Fail-safe: probe errors and missing headers leave the boundary
+// at the last confirmed checkpoint and retry later; a hash mismatch at a
+// checkpoint height stops the ratchet permanently WITHOUT advancing (the
+// already-published boundary, proven by its own checkpoint, remains).
 
 import (
 	"context"
@@ -24,21 +23,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// earlyDAHSetterStub records whether SetEarlyDAHBoundary was called and with what
-// height, without pulling in a full store implementation.
+// earlyDAHSetterStub records every SetEarlyDAHBoundary call so tests can
+// assert the ratchet's publish sequence, not just its final value.
 type earlyDAHSetterStub struct {
-	called bool
-	height uint32
+	heights []uint32
 }
 
 func (s *earlyDAHSetterStub) SetEarlyDAHBoundary(h uint32) {
-	s.called = true
-	s.height = h
+	s.heights = append(s.heights, h)
 }
 
-func TestMaybeLatchEarlyDAHBoundary(t *testing.T) {
-	const checkpointHeight = uint32(1000)
+func (s *earlyDAHSetterStub) last() uint32 {
+	if len(s.heights) == 0 {
+		return 0
+	}
 
+	return s.heights[len(s.heights)-1]
+}
+
+func TestEarlyDAHRatchet(t *testing.T) {
 	nBits := model.NBit{0xff, 0xff, 0x00, 0x1d}
 	zeroHash := &chainhash.Hash{}
 
@@ -53,11 +56,14 @@ func TestMaybeLatchEarlyDAHBoundary(t *testing.T) {
 		}
 	}
 
-	cpHeader := newHeader(1000)   // the pinned checkpoint block
-	otherHeader := newHeader(999) // a different block at the checkpoint height
-
-	pinnedHash := cpHeader.Hash()
-	checkpoints := []chaincfg.Checkpoint{{Height: int32(checkpointHeight), Hash: pinnedHash}}
+	// Three checkpoints at 100 < 200 < 300, deliberately supplied unsorted to
+	// prove the ratchet sorts.
+	h100, h200, h300 := newHeader(100), newHeader(200), newHeader(300)
+	checkpoints := []chaincfg.Checkpoint{
+		{Height: 300, Hash: h300.Hash()},
+		{Height: 100, Hash: h100.Hash()},
+		{Height: 200, Hash: h200.Hash()},
+	}
 
 	settingsWith := func(cps []chaincfg.Checkpoint, enabled bool) *settings.Settings {
 		s := &settings.Settings{ChainCfgParams: &chaincfg.Params{Checkpoints: cps}}
@@ -66,103 +72,110 @@ func TestMaybeLatchEarlyDAHBoundary(t *testing.T) {
 		return s
 	}
 
-	t.Run("header matches pinned hash: setter called with highest, returns true", func(t *testing.T) {
+	headersAt := func(mockBC *blockchain.Mock, height uint32, hdr *model.BlockHeader) {
+		if hdr == nil {
+			mockBC.On("GetBlockHeadersFromHeight", mock.Anything, height, uint32(1)).
+				Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil)
+			return
+		}
+
+		mockBC.On("GetBlockHeadersFromHeight", mock.Anything, height, uint32(1)).
+			Return([]*model.BlockHeader{hdr}, []*model.BlockHeaderMeta{{}}, nil)
+	}
+
+	t.Run("climbs every already-covered checkpoint in one probe, done at top", func(t *testing.T) {
 		mockBC := &blockchain.Mock{}
-		mockBC.On("GetBlockHeadersFromHeight", mock.Anything, checkpointHeight, uint32(1)).
-			Return([]*model.BlockHeader{cpHeader}, []*model.BlockHeaderMeta{{}}, nil)
+		headersAt(mockBC, 100, h100)
+		headersAt(mockBC, 200, h200)
+		headersAt(mockBC, 300, h300)
 
 		store := &earlyDAHSetterStub{}
-		tSettings := settingsWith(checkpoints, true)
+		r := newEarlyDAHRatchet(settingsWith(checkpoints, true), store)
+		r.probe(context.Background(), ulogger.TestLogger{}, mockBC)
 
-		latched := maybeLatchEarlyDAHBoundary(context.Background(), ulogger.TestLogger{}, tSettings, mockBC, store)
-
-		require.True(t, latched)
-		require.True(t, store.called)
-		require.Equal(t, checkpointHeight, store.height)
+		require.Equal(t, []uint32{100, 200, 300}, store.heights, "publishes ascending, sorted despite unsorted input")
+		require.True(t, r.done)
 	})
 
-	t.Run("header missing: setter not called, returns false", func(t *testing.T) {
+	t.Run("partial header coverage: boundary stops at last confirmed, resumes later", func(t *testing.T) {
 		mockBC := &blockchain.Mock{}
-		mockBC.On("GetBlockHeadersFromHeight", mock.Anything, checkpointHeight, uint32(1)).
-			Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil)
+		headersAt(mockBC, 100, h100)
+		headersAt(mockBC, 200, h200)
+		headersAt(mockBC, 300, nil) // header chain not there yet
 
 		store := &earlyDAHSetterStub{}
-		tSettings := settingsWith(checkpoints, true)
+		r := newEarlyDAHRatchet(settingsWith(checkpoints, true), store)
+		r.probe(context.Background(), ulogger.TestLogger{}, mockBC)
 
-		latched := maybeLatchEarlyDAHBoundary(context.Background(), ulogger.TestLogger{}, tSettings, mockBC, store)
+		require.Equal(t, uint32(200), store.last())
+		require.False(t, r.done, "must keep probing for 300 on later notifications")
 
-		require.False(t, latched)
-		require.False(t, store.called)
+		// Headers advance past 300 — the next probe finishes the climb.
+		mockBC2 := &blockchain.Mock{}
+		headersAt(mockBC2, 300, h300)
+		r.probe(context.Background(), ulogger.TestLogger{}, mockBC2)
+
+		require.Equal(t, uint32(300), store.last())
+		require.True(t, r.done)
 	})
 
-	t.Run("header lookup error: setter not called, returns false", func(t *testing.T) {
+	t.Run("lookup error: boundary keeps last confirmed, retries later", func(t *testing.T) {
 		mockBC := &blockchain.Mock{}
-		mockBC.On("GetBlockHeadersFromHeight", mock.Anything, checkpointHeight, uint32(1)).
+		headersAt(mockBC, 100, h100)
+		mockBC.On("GetBlockHeadersFromHeight", mock.Anything, uint32(200), uint32(1)).
 			Return([]*model.BlockHeader(nil), []*model.BlockHeaderMeta(nil), errors.NewServiceError("boom"))
 
 		store := &earlyDAHSetterStub{}
-		tSettings := settingsWith(checkpoints, true)
+		r := newEarlyDAHRatchet(settingsWith(checkpoints, true), store)
+		r.probe(context.Background(), ulogger.TestLogger{}, mockBC)
 
-		latched := maybeLatchEarlyDAHBoundary(context.Background(), ulogger.TestLogger{}, tSettings, mockBC, store)
-
-		require.False(t, latched)
-		require.False(t, store.called)
+		require.Equal(t, uint32(100), store.last())
+		require.False(t, r.done)
 	})
 
-	t.Run("hash mismatch: setter not called, returns false", func(t *testing.T) {
+	t.Run("hash mismatch: stops permanently at last confirmed boundary", func(t *testing.T) {
 		mockBC := &blockchain.Mock{}
-		mockBC.On("GetBlockHeadersFromHeight", mock.Anything, checkpointHeight, uint32(1)).
-			Return([]*model.BlockHeader{otherHeader}, []*model.BlockHeaderMeta{{}}, nil)
+		headersAt(mockBC, 100, h100)
+		headersAt(mockBC, 200, h300) // wrong header at checkpoint 200
 
 		store := &earlyDAHSetterStub{}
-		tSettings := settingsWith(checkpoints, true)
+		r := newEarlyDAHRatchet(settingsWith(checkpoints, true), store)
+		r.probe(context.Background(), ulogger.TestLogger{}, mockBC)
 
-		latched := maybeLatchEarlyDAHBoundary(context.Background(), ulogger.TestLogger{}, tSettings, mockBC, store)
+		require.Equal(t, uint32(100), store.last(), "boundary must not advance past the contradiction")
+		require.True(t, r.done, "mismatch stops the ratchet permanently")
 
-		require.False(t, latched)
-		require.False(t, store.called)
+		// A later probe must be a no-op: no further RPCs, no further publishes.
+		published := len(store.heights)
+		mockBC2 := &blockchain.Mock{}
+		r.probe(context.Background(), ulogger.TestLogger{}, mockBC2)
+		require.Len(t, store.heights, published)
+		mockBC2.AssertNotCalled(t, "GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything)
 	})
 
-	t.Run("feature flag off: setter not called, returns true without any blockchain query", func(t *testing.T) {
+	t.Run("feature flag off: done immediately, no queries, no publishes", func(t *testing.T) {
 		mockBC := &blockchain.Mock{}
-		mockBC.On("GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything).
-			Return([]*model.BlockHeader{cpHeader}, []*model.BlockHeaderMeta{{}}, nil).Maybe()
-
 		store := &earlyDAHSetterStub{}
-		tSettings := settingsWith(checkpoints, false)
+		r := newEarlyDAHRatchet(settingsWith(checkpoints, false), store)
 
-		latched := maybeLatchEarlyDAHBoundary(context.Background(), ulogger.TestLogger{}, tSettings, mockBC, store)
-
-		require.True(t, latched)
-		require.False(t, store.called)
+		require.True(t, r.done)
+		r.probe(context.Background(), ulogger.TestLogger{}, mockBC)
+		require.Empty(t, store.heights)
 		mockBC.AssertNotCalled(t, "GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything)
 	})
 
-	t.Run("no checkpoints configured: setter not called, returns true without any blockchain query", func(t *testing.T) {
-		mockBC := &blockchain.Mock{}
-		mockBC.On("GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything).
-			Return([]*model.BlockHeader{cpHeader}, []*model.BlockHeaderMeta{{}}, nil).Maybe()
-
+	t.Run("no checkpoints configured: done immediately", func(t *testing.T) {
 		store := &earlyDAHSetterStub{}
-		tSettings := settingsWith(nil, true)
-
-		latched := maybeLatchEarlyDAHBoundary(context.Background(), ulogger.TestLogger{}, tSettings, mockBC, store)
-
-		require.True(t, latched)
-		require.False(t, store.called)
-		mockBC.AssertNotCalled(t, "GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything)
+		r := newEarlyDAHRatchet(settingsWith(nil, true), store)
+		require.True(t, r.done)
 	})
 
-	t.Run("store does not implement the setter interface: returns true without any blockchain query", func(t *testing.T) {
+	t.Run("store does not implement the setter interface: done immediately", func(t *testing.T) {
 		mockBC := &blockchain.Mock{}
-		mockBC.On("GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything).
-			Return([]*model.BlockHeader{cpHeader}, []*model.BlockHeaderMeta{{}}, nil).Maybe()
+		r := newEarlyDAHRatchet(settingsWith(checkpoints, true), struct{}{})
 
-		tSettings := settingsWith(checkpoints, true)
-
-		latched := maybeLatchEarlyDAHBoundary(context.Background(), ulogger.TestLogger{}, tSettings, mockBC, struct{}{})
-
-		require.True(t, latched)
+		require.True(t, r.done)
+		r.probe(context.Background(), ulogger.TestLogger{}, mockBC)
 		mockBC.AssertNotCalled(t, "GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything)
 	})
 }
