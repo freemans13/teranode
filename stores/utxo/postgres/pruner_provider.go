@@ -416,9 +416,9 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		default:
 		}
 
-		n, err := s.deleteTombstonedBatch(ctx, doomedSQL, cascadeSQL, blockHeight)
+		n, err := s.deleteTombstonedBatchWithRetry(ctx, doomedSQL, cascadeSQL, blockHeight, txsLeaf)
 		if err != nil {
-			return deleted, errors.NewStorageError("[pruner] cascade delete %s", txsLeaf, err)
+			return deleted, err
 		}
 		deleted += n
 		// A short batch means the partition is drained.
@@ -428,6 +428,42 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	}
 
 	return deleted, nil
+}
+
+// deleteTombstonedBatchWithRetry wraps deleteTombstonedBatch with a bounded,
+// jittered retry on a Postgres deadlock (SQLSTATE 40P01). Concurrent cascade-delete
+// workers across partitions (and a concurrent Unspend/reconcile touching the same
+// spends/txs rows) can deadlock; Postgres aborts one side and rolls its transaction
+// back entirely, so a retry that lands after the winner commits succeeds — the same
+// remedy as the create-batch and SetMinedMulti retry sites (deadlock.go).
+//
+// Retrying the WHOLE batch (not a sub-piece of it) is the only sound option here,
+// and it is safe: deleteTombstonedBatch is one pgx transaction (BEGIN..COMMIT) that
+// is entirely rolled back on any error (the deferred Rollback fires; Commit is never
+// reached), so a deadlocked attempt persists nothing — there is no partial state to
+// reconcile. A retry re-runs phase 1's `SELECT ... FOR UPDATE` from scratch, which
+// re-authorises the batch against CURRENT ground truth: the FOR UPDATE lock means a
+// concurrent Unspend revival (which deletes the pending_deletes row before the
+// pruner's SELECT can lock it) is either fully visible to the retry's fresh SELECT
+// (the hash is simply absent, so it is not re-deleted) or was blocked behind the
+// prior attempt's row lock and is resolved one way or the other before the retry's
+// SELECT runs. Either way the retry authorises its delete against a fresh read, the
+// same authority a first attempt would have had — never a stale, already-rolled-back
+// candidate list.
+func (s *postgresPrunerService) deleteTombstonedBatchWithRetry(ctx context.Context, doomedSQL, cascadeSQL string, blockHeight uint32, txsLeaf string) (int64, error) {
+	n, err := retryOnPgDeadlock(ctx,
+		func() (int64, error) {
+			return s.deleteTombstonedBatch(ctx, doomedSQL, cascadeSQL, blockHeight)
+		},
+		func(attemptNum int, backoff time.Duration) {
+			s.store.logger.Warnf("[pruner] postgres deadlock (40P01) on cascade delete batch %s, retry %d/%d after %s", txsLeaf, attemptNum, pgDeadlockMaxRetries, backoff)
+		},
+	)
+	if err != nil {
+		return 0, errors.NewStorageError("[pruner] cascade delete %s", txsLeaf, err)
+	}
+
+	return n, nil
 }
 
 // deleteTombstonedBatch runs one page-ordered cascade batch in its own short
