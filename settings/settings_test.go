@@ -162,6 +162,15 @@ func TestBlockDownloadWindowDefaults(t *testing.T) {
 	require.Equal(t, 16, s.Legacy.MaxBlocksInTransitPerPeer)
 }
 
+// TestParallelWindowMaxParkedBlocksDefault pins the raised count cap. The byte
+// budget (ParallelWindowParkedMemoryFraction) is the real memory guard; the count
+// cap is a sanity ceiling. It was 1024, which tiny blocks (216 bytes on fast IBD)
+// hit at sub-MB memory long before the byte budget, triggering a park-refusal
+// storm; 16384 lets the byte budget bind instead.
+func TestParallelWindowMaxParkedBlocksDefault(t *testing.T) {
+	require.Equal(t, 16384, NewSettings().Legacy.ParallelWindowMaxParkedBlocks)
+}
+
 // Pin Phase C settings defaults: EarlyDAHBelowCheckpoint and PruneDeleteMarginBlocks
 func TestUtxoStore_PhaseC_Defaults(t *testing.T) {
 	tSettings := NewSettings()

@@ -984,6 +984,26 @@ func (sm *SyncManager) syncPeerStateFor(p *peerpkg.Peer) (*syncPeerState, bool) 
 	return nil, false
 }
 
+// noteSyncPeerBlockDelivery refreshes the sync peer's last-block time when a
+// windowed block ARRIVES from the peer but we do not commit it now — either we
+// park it ahead of block assembly, or the park buffer is full so we requeue it for
+// re-fetch. A block landing that we defer or refuse is proof the peer is alive and
+// feeding us data at capacity; the refusal is our OWN backpressure, not a stalled
+// peer. Only the real accept paths stamp lastBlockTime, so without this a park
+// refusal storm (fast IBD, tiny blocks fill the park's count cap at sub-MB memory)
+// leaves lastBlockTime frozen while blocks keep arriving. handleCheckSyncPeer's
+// last-block-time violation then fires and rotates our best data source, which
+// clears requestedBlocks and resets header state — serialising ALL fetch behind a
+// fresh getheaders round-trip (the observed multi-minute all-peer silence). A
+// genuinely dead peer delivers no bytes and is still rotated: that is covered by
+// the bytes-based silence detector and the backlog-stale checks, which this does
+// not touch.
+func (sm *SyncManager) noteSyncPeerBlockDelivery(peer *peerpkg.Peer) {
+	if sps, ok := sm.syncPeerStateFor(peer); ok {
+		sps.updateLastBlockTime()
+	}
+}
+
 // storeSyncPeer sets the sync peer and its state, safe for concurrent access.
 func (sm *SyncManager) storeSyncPeer(peer *peerpkg.Peer, state *syncPeerState) {
 	sm.syncPeerMu.Lock()
@@ -2776,10 +2796,16 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 			// literally MsgBlock().SerializeSize() (prepareBlockForWindow). The
 			// post-prepare byte check below stays as defence in depth.
 			if park.countFull() {
+				// The peer just delivered this block; we refuse it (park full),
+				// which is self-backpressure, not a dead peer. Stamp lastBlockTime
+				// so the stall detector does not rotate our best data source
+				// mid-refusal-storm. See noteSyncPeerBlockDelivery.
+				sm.noteSyncPeerBlockDelivery(peer)
 				return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] park buffer full (count) at height %d; will re-fetch", bmsg.blockHash, blockHeightUint32)
 			}
 
 			if park.full(int64(msgBlock.SerializeSize())) {
+				sm.noteSyncPeerBlockDelivery(peer)
 				return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] park buffer full (bytes) at height %d; will re-fetch", bmsg.blockHash, blockHeightUint32)
 			}
 
@@ -2810,12 +2836,18 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 
 	if parkThisBlock {
 		if park.full(int64(prepared.SizeInBytes)) { //nolint:gosec
+			sm.noteSyncPeerBlockDelivery(peer)
 			return blockAdmitDirect, errors.NewProcessingError("[handleBlockMsgWithWindow][%s] park buffer full (bytes) at height %d; will re-fetch", bmsg.blockHash, blockHeightUint32)
 		}
 
 		park.add(prepared)
 		sm.claimWindowBlock(bmsg.blockHash, blockHeightUint32)
 		sm.logger.Debugf("[handleBlockMsgWithWindow][%s] parked block height %d ahead of block assembly; %d parked", bmsg.blockHash, blockHeightUint32, park.len())
+
+		// A parked block arrived from the peer — proof it is alive even though we
+		// defer committing it. Stamp lastBlockTime so a long park run does not look
+		// like a stall. See noteSyncPeerBlockDelivery.
+		sm.noteSyncPeerBlockDelivery(peer)
 
 		return blockAdmitParked, nil
 	}
