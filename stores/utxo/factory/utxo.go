@@ -65,8 +65,10 @@ package factory
 import (
 	"context"
 	"net/url"
+	"sort"
 	"strconv"
 
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -89,38 +91,96 @@ var availableDatabases = map[string]func(ctx context.Context, logger ulogger.Log
 // disarm the feature.
 type earlyDAHBoundarySetter interface{ SetEarlyDAHBoundary(uint32) }
 
-// maybeLatchEarlyDAHBoundary returns true (latched) when the main chain's
-// header at the highest hardcoded checkpoint height matches the pinned hash,
-// after publishing that height to the store. Fail-safe: any error, missing
-// header, or hash mismatch leaves the boundary unset and returns false —
-// full retention everywhere, identical to today.
-func maybeLatchEarlyDAHBoundary(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, client blockchain.ClientI, store any) bool {
+// earlyDAHRatchet climbs the hardcoded checkpoint list as the header chain
+// grows, publishing the highest CONFIRMED checkpoint height to the store as
+// the early-DAH boundary. During legacy IBD headers are downloaded in windows
+// just ahead of the block tip, so a single latch on only the highest
+// checkpoint (mainnet: 945,000) would stay closed for nearly the whole sync —
+// the ratchet instead opens at the first checkpoint (546) within moments and
+// climbs from there. Safety is per-checkpoint: once the header chain reaches
+// and matches checkpoint N, validation rejects any chain not passing through
+// it, so every block at-or-below N is reorg-protected regardless of the
+// checkpoints above N.
+//
+// Fail-safe: probe errors and missing headers leave the boundary at the last
+// confirmed checkpoint (or unset) and retry on a later notification. A HASH
+// MISMATCH at a checkpoint height is different — the header chain contradicts
+// a hardcoded checkpoint, which validation should make impossible — so the
+// ratchet logs it and stops permanently without advancing (the already
+// published boundary, proven by its own checkpoint, remains).
+type earlyDAHRatchet struct {
+	done   bool                  // fully climbed, feature off, or store can't use it
+	next   int                   // index into cps of the next unconfirmed checkpoint
+	cps    []chaincfg.Checkpoint // ascending by height
+	setter earlyDAHBoundarySetter
+}
+
+// newEarlyDAHRatchet builds the ratchet, resolving the applicability checks
+// once. done==true from the start when the feature is off, the store cannot
+// accept a boundary, or the chain has no checkpoints (e.g. teratestnet).
+func newEarlyDAHRatchet(tSettings *settings.Settings, store any) *earlyDAHRatchet {
+	r := &earlyDAHRatchet{}
+
 	if !tSettings.UtxoStore.EarlyDAHBelowCheckpoint {
-		return true // feature off: latch permanently closed, stop probing
+		r.done = true
+		return r
 	}
 
 	setter, ok := store.(earlyDAHBoundarySetter)
 	if !ok {
-		return true // store cannot use it, stop probing
+		r.done = true
+		return r
 	}
 
-	checkpoints := tSettings.ChainCfgParams.Checkpoints
-	highest := model.HighestCheckpointHeight(checkpoints)
-	pinned := model.HighestCheckpointHash(checkpoints)
-
-	if highest == 0 || pinned == nil {
-		return true // chain has no checkpoints (e.g. teratestnet): stop probing
+	cps := tSettings.ChainCfgParams.Checkpoints
+	if len(cps) == 0 {
+		r.done = true
+		return r
 	}
 
-	headers, _, err := client.GetBlockHeadersFromHeight(ctx, highest, 1)
-	if err != nil || len(headers) == 0 || !headers[0].Hash().IsEqual(pinned) {
-		return false // not confirmed yet — probe again on a later notification
+	r.setter = setter
+	r.cps = make([]chaincfg.Checkpoint, len(cps))
+	copy(r.cps, cps)
+	sort.Slice(r.cps, func(i, j int) bool { return r.cps[i].Height < r.cps[j].Height })
+
+	return r
+}
+
+// probe advances the ratchet as far as the current header chain allows. Each
+// confirmed checkpoint costs one header lookup; the loop stops at the first
+// checkpoint whose header is not yet available, so steady-state cost is one
+// RPC per block notification until the top checkpoint confirms, then zero.
+func (r *earlyDAHRatchet) probe(ctx context.Context, logger ulogger.Logger, client blockchain.ClientI) {
+	for !r.done {
+		cp := r.cps[r.next]
+		if cp.Hash == nil {
+			logger.Warnf("[UTXOStore] early-DAH ratchet: checkpoint at height %d has no hash, stopping", cp.Height)
+			r.done = true
+
+			return
+		}
+
+		headers, _, err := client.GetBlockHeadersFromHeight(ctx, uint32(cp.Height), 1) //nolint:gosec
+		if err != nil || len(headers) == 0 {
+			return // header chain not there yet (or transient error) — retry on a later notification
+		}
+
+		if !headers[0].Hash().IsEqual(cp.Hash) {
+			logger.Warnf("[UTXOStore] early-DAH ratchet: header at checkpoint height %d does not match pinned hash, stopping at last confirmed boundary", cp.Height)
+			r.done = true
+
+			return
+		}
+
+		r.setter.SetEarlyDAHBoundary(uint32(cp.Height)) //nolint:gosec
+		logger.Infof("[UTXOStore] early-DAH boundary ratcheted to checkpoint height %d", cp.Height)
+
+		r.next++
+		if r.next >= len(r.cps) {
+			logger.Infof("[UTXOStore] early-DAH boundary fully latched at highest checkpoint height %d", cp.Height)
+			r.done = true
+		}
 	}
-
-	setter.SetEarlyDAHBoundary(highest)
-	logger.Infof("[UTXOStore] early-DAH boundary latched at checkpoint height %d", highest)
-
-	return true
 }
 
 // NewStore creates a new UTXO store implementation based on the settings.
@@ -202,7 +262,8 @@ func NewStore(ctx context.Context, logger ulogger.Logger, tSettings *settings.Se
 				logger.Infof("[UTXOStore] skipping block height initialization for %s (height is 0)", source)
 			}
 
-			earlyDAHLatched := maybeLatchEarlyDAHBoundary(ctx, logger, tSettings, blockchainClient, utxoStore)
+			earlyDAH := newEarlyDAHRatchet(tSettings, utxoStore)
+			earlyDAH.probe(ctx, logger, blockchainClient)
 
 			logger.Infof("[UTXOStore] starting block height subscription for: %s", source)
 
@@ -235,9 +296,7 @@ func NewStore(ctx context.Context, logger ulogger.Logger, tSettings *settings.Se
 								logger.Infof("[UTXOStore] skipping block height update for %s (height is 0)", source)
 							}
 
-							if !earlyDAHLatched {
-								earlyDAHLatched = maybeLatchEarlyDAHBoundary(ctx, logger, tSettings, blockchainClient, utxoStore)
-							}
+							earlyDAH.probe(ctx, logger, blockchainClient)
 						}
 					}
 				}
