@@ -764,7 +764,14 @@ func (s *postgresPrunerService) runPartitionSweepLoop(ctx context.Context, parti
 // are logged, not fatal. Shared by the background cursor and Prune.
 func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, retention int32) int64 {
 	var before int64
-	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before)
+	baselineOK := true
+	if err := s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before); err != nil {
+		// Without a valid baseline the delta is meaningless (a successful "after"
+		// read would report the entire cumulative counter as this pass's work). Log
+		// and report 0 for this pass rather than an inflated figure.
+		s.logger.Warnf("[dahSweep] could not read total_rows_stamped baseline; this pass's stamped count will report 0: %v", err)
+		baselineOK = false
+	}
 
 	// Bound how many partitions sweep at once. Each CALL scans cold partition pages
 	// from disk; firing all 8 at once thrashes a single contended/cold disk and is
@@ -812,9 +819,12 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 	wg.Wait()
 
 	var after int64
-	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&after)
+	if err := s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&after); err != nil {
+		s.logger.Warnf("[dahSweep] could not read total_rows_stamped after sweep; stamped count reported as 0: %v", err)
+		return 0
+	}
 
-	if after >= before {
+	if baselineOK && after >= before {
 		return after - before
 	}
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5"
 )
 
 // dahReconcileCursorDDL is the per-partition rotating cursor for the bounded
@@ -237,9 +238,15 @@ func (s *Store) reconcileSpentBitsPartition(ctx context.Context, partition int, 
 	suffix := fmt.Sprintf("%02d", partition)
 
 	// Resume from the per-partition cursor (NULL/absent → start of partition).
+	// pgx.ErrNoRows is the expected "no cursor yet" case and leaves cursor nil; a
+	// real DB error is logged (it silently discards rotation progress and restarts
+	// the slice from the top otherwise, wasting a pass with no explanation).
 	var cursor []byte
-	_ = s.maint().QueryRow(ctx,
-		`SELECT last_hash FROM dah_reconcile_cursor WHERE partition = $1`, partition).Scan(&cursor)
+	if err := s.maint().QueryRow(ctx,
+		`SELECT last_hash FROM dah_reconcile_cursor WHERE partition = $1`, partition).Scan(&cursor); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		s.logger.Warnf("[dahReconcile] partition %d cursor read failed; restarting slice from partition start: %v", partition, err)
+		cursor = nil
+	}
 
 	// One statement:
 	//  1. `slice_txs` picks up to `slice` candidate txs from THIS partition,
