@@ -44,6 +44,19 @@ import (
 type pruneSignal struct {
 	blockHeight uint32
 	blockHash   chainhash.Hash
+	// force marks a signal as originating from the fallback ticker rather than a
+	// blockchain notification. prunerProcessor's already-processed guard
+	// (blockHeight <= lastProcessedHeight) exists to skip stale/duplicate
+	// notifications, but it also means a plain re-send of the last known height
+	// can never reach Prune again. That matters because the underlying DAH sweep
+	// keeps stamping rows with delete_at_height <= that height even while the
+	// trigger height itself is frozen (a stalled block persister, or a missed
+	// notification) — those newly-due rows need a RE-RUN at the SAME height to
+	// be collected, not a higher one. force lets the ticker's re-send bypass
+	// only that one guard; every other check (min height, catchup, mined-set
+	// wait, block-assembly safety, the store's own cheap idle-tick EXISTS probe)
+	// still applies exactly as it does for a real notification.
+	force bool
 }
 
 // BlobDeletionObserver is an optional callback interface for testing.
@@ -301,6 +314,16 @@ func (s *Server) notificationWorker(ctx context.Context, subscriptionCh chan *bl
 // fireFallbackTick re-fires the last known pruneSignal on the fallback ticker
 // interval, reusing state rather than inventing new values.
 //
+// The signal is marked force: true so it bypasses prunerProcessor's
+// already-processed guard (see the pruneSignal.force doc comment). Without
+// that, resending the same height the processor already completed would
+// always be a no-op — which would defeat the whole point of the ticker for
+// the incident it exists to guard against: the DAH sweep keeps stamping rows
+// due at or below the trigger height even while that height itself is frozen
+// (stalled persister / missed notification), so recovering them requires a
+// genuine RE-RUN of Prune at the SAME height, not just a resent signal that
+// gets dropped before reaching the store.
+//
 // A real, previously-captured block hash is required in BOTH trigger modes before
 // this will fire anything: prunerProcessor's waitForBlockMinedStatus runs whenever
 // blockAssemblyClient is configured (see worker.go), and that check applies "both
@@ -327,7 +350,7 @@ func (s *Server) fireFallbackTick() {
 		return // no real hash captured yet — see comment above
 	}
 
-	sig := pruneSignal{blockHeight: h, blockHash: *hash}
+	sig := pruneSignal{blockHeight: h, blockHash: *hash, force: true}
 
 	// Drain old signal (if any) and replace with latest — same idiom the
 	// notification path uses.

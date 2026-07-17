@@ -2,15 +2,43 @@ package pruner
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
+
+// fakePrunerService is a minimal stub implementing pruner.Service. It records
+// every height passed to Prune so tests can distinguish "the processor
+// reached the store" from "the already-processed guard dropped the signal
+// before Phase 2."
+type fakePrunerService struct {
+	mu    sync.Mutex
+	calls []uint32
+}
+
+func (f *fakePrunerService) Start(ctx context.Context) {}
+
+func (f *fakePrunerService) Prune(ctx context.Context, height uint32, blockHashStr string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, height)
+	return 0, nil
+}
+
+func (f *fakePrunerService) AddObserver(observer pruner.Observer) {}
+
+func (f *fakePrunerService) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
 
 // TestFallbackTickerFiresWithoutNotifications verifies that with
 // pruner_fallbackTickerSeconds set, notificationWorker re-fires a pruneSignal
@@ -133,4 +161,109 @@ func TestFallbackTickerDisabledWhenZero(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("notificationWorker did not exit after context cancellation")
 	}
+}
+
+// TestForceSignalBypassesAlreadyProcessedGuard verifies prunerProcessor's
+// core guard-bypass contract directly: a plain (non-force) signal at a
+// height that has already been processed is dropped by the
+// blockHeight <= lastProcessedHeight guard, exactly as before this change,
+// but a force signal at that SAME height bypasses only that guard and
+// reaches Prune again. This is the fix for the strand scenario the fallback
+// ticker exists for: the underlying DAH sweep keeps stamping rows due at or
+// below a frozen trigger height even while no new (higher) notification
+// arrives, so recovering them requires Prune to actually re-run at the same
+// height rather than being silently dropped as "already done."
+func TestForceSignalBypassesAlreadyProcessedGuard(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fakeSvc := &fakePrunerService{}
+
+	s := &Server{
+		ctx:           ctx,
+		logger:        ulogger.New("test"),
+		pruneNotify:   make(chan pruneSignal, 1),
+		blobNotify:    make(chan pruneSignal, 1),
+		prunerService: fakeSvc,
+		settings: &settings.Settings{
+			Pruner: settings.PrunerSettings{
+				SkipPreserveParents:             true,
+				SkipProcessExpiredPreservations: true,
+			},
+		},
+	}
+
+	go s.prunerProcessor(ctx)
+
+	// First signal at height 500 processes normally and reaches the store.
+	s.pruneNotify <- pruneSignal{blockHeight: 500, blockHash: chainhash.Hash{0x01}}
+	require.Eventually(t, func() bool { return fakeSvc.callCount() == 1 }, 2*time.Second, 10*time.Millisecond,
+		"first signal at height 500 should have reached Prune")
+	require.Equal(t, uint32(500), s.lastProcessedHeight.Load())
+
+	// A non-force duplicate at the same height must still be dropped by the
+	// guard — this path is unchanged by the fix.
+	s.pruneNotify <- pruneSignal{blockHeight: 500, blockHash: chainhash.Hash{0x01}}
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, 1, fakeSvc.callCount(), "non-force duplicate at an already-processed height must still be dropped")
+
+	// A force signal at the same height (what fireFallbackTick sends) must
+	// bypass the guard and re-run Prune.
+	s.pruneNotify <- pruneSignal{blockHeight: 500, blockHash: chainhash.Hash{0x01}, force: true}
+	require.Eventually(t, func() bool { return fakeSvc.callCount() == 2 }, 2*time.Second, 10*time.Millisecond,
+		"force signal at an already-processed height should bypass the guard and reach Prune")
+}
+
+// TestFallbackTickerReRunsAtSameHeightAfterProcessing is the end-to-end
+// version of the guard-bypass fix: it wires the real notificationWorker
+// ticker together with the real prunerProcessor (no manually-constructed
+// force signal), with no blockchain notifications ever delivered, and
+// asserts that Prune is called more than once at the frozen height. This is
+// exactly the incident scenario: lastPersistedHeight is frozen (as it would
+// be with a stalled block persister), yet the ticker must still cause a
+// second real pass over the same height.
+func TestFallbackTickerReRunsAtSameHeightAfterProcessing(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	fakeSvc := &fakePrunerService{}
+
+	s := &Server{
+		ctx:           ctx,
+		logger:        ulogger.New("test"),
+		pruneNotify:   make(chan pruneSignal, 1),
+		blobNotify:    make(chan pruneSignal, 1),
+		prunerService: fakeSvc,
+		settings: &settings.Settings{
+			Pruner: settings.PrunerSettings{
+				FallbackTickerSeconds:           1,
+				BlockTrigger:                    settings.PrunerBlockTriggerOnBlockPersisted,
+				SkipPreserveParents:             true,
+				SkipProcessExpiredPreservations: true,
+			},
+		},
+	}
+	s.lastPersistedHeight.Store(500)
+	seedHash := chainhash.Hash{0xCC}
+	s.lastBlockHash.Store(&seedHash)
+
+	go s.prunerProcessor(ctx)
+
+	subscriptionCh := make(chan *blockchain_api.Notification) // never written to
+	go s.notificationWorker(ctx, subscriptionCh)
+
+	// The first tick processes height 500 for real.
+	require.Eventually(t, func() bool { return fakeSvc.callCount() >= 1 }, 3*time.Second, 10*time.Millisecond,
+		"expected the fallback ticker to trigger an initial pass at height 500")
+	require.Equal(t, uint32(500), s.lastProcessedHeight.Load())
+
+	// lastPersistedHeight is still frozen at 500 (no notification ever
+	// arrives to change it). A second tick must still reach Prune again,
+	// not be dropped as a duplicate of an already-processed height.
+	require.Eventually(t, func() bool { return fakeSvc.callCount() >= 2 }, 3*time.Second, 10*time.Millisecond,
+		"fallback ticker signal did not bypass the already-processed guard on a second tick")
 }
