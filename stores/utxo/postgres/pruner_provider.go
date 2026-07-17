@@ -108,6 +108,19 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 		return 0, errors.NewProcessingError("cannot prune at block height 0")
 	}
 
+	// Crash-replay moat (2026-07-17 RAM-footprint design, Task 7): only rows
+	// whose DAH is at least margin blocks below the trigger are deleted, so no
+	// pipeline replaying work near the trigger watermark can reference a
+	// deleted parent. Applies uniformly to retention-stamped and early-stamped
+	// rows. blockHeight is adjusted ONCE, here, at the top of Prune — every
+	// downstream height use (the EXISTS probe, deleteTombstoned, the batch
+	// fetch) reads this same parameter, so the margin applies everywhere.
+	margin := uint32(s.store.settings.UtxoStore.PruneDeleteMarginBlocks) //nolint:gosec // small positive height delta
+	if blockHeight <= margin {
+		return 0, nil // nothing can be old enough yet
+	}
+	blockHeight -= margin
+
 	startTime := time.Now()
 
 	// Early-exit on empty backlog: the bench/production drivers retry Prune on a

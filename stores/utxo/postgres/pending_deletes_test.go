@@ -490,10 +490,14 @@ func runWorkloadAndPrune(t *testing.T, flagOn bool) pruneResult {
 			"doomed tx must have delete_at_height stamped before prune (flagOn=%v)", flagOn)
 	}
 
-	// Prune at height 120 (all 5 doomed txs have DAH <= 120).
+	// Prune at height 120 + margin (all 5 doomed txs have DAH <= 120, and the
+	// delete-side crash-replay margin — Task 7 — only deletes rows whose DAH is
+	// at least `margin` blocks below the trigger, so the trigger must clear the
+	// highest DAH by that much).
 	prunerSvc, err := st.GetPrunerService()
 	require.NoError(t, err)
-	_, err = prunerSvc.Prune(ctx, 120, "equivalence-test")
+	margin := uint32(st.settings.UtxoStore.PruneDeleteMarginBlocks) //nolint:gosec
+	_, err = prunerSvc.Prune(ctx, 120+margin, "equivalence-test")
 	require.NoError(t, err)
 
 	// Read back, per created hash, whether it was pruned (absent) or survived (present).
