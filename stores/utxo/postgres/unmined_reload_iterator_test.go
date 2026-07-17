@@ -177,3 +177,27 @@ func TestGetUnminedTxIterator_ReloadEmptyFastPath(t *testing.T) {
 
 	require.NoError(t, iter.Close())
 }
+
+// TestGetUnminedTxIterator_ReloadSeesUnflushedProjectorBuffer pins the
+// read-your-writes barrier: GetUnminedTxIterator must itself drain the
+// write-behind projector, so a reload issued immediately after Create returned
+// sees the tx even though the projector's ticker (puFlushInterval) has not
+// fired yet. No explicit flushPendingUnmined call here — that is the point.
+// This FAILS against an implementation without the barrier (the EXISTS fast
+// path short-circuits to an empty iterator) and is the in-package twin of
+// stores/utxo/tests TestUnminedTxIteratorPostgres/mixed_mined-unmined, which
+// cannot reach the unexported flush hook.
+func TestGetUnminedTxIterator_ReloadSeesUnflushedProjectorBuffer(t *testing.T) {
+	st := newTestStoreWithFlag(t, true)
+	ctx := context.Background()
+	cleanPendingUnmined(t, st)
+	require.NoError(t, st.SetBlockHeight(100))
+
+	tx := testExtendedTx(t)
+	tx.LockTime = 920
+	_, err := st.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	got := collectUnminedReload(t, st)
+	require.Contains(t, got, *tx.TxIDChainHash(), "reload must see a create that returned before the projector ticker fired")
+}
