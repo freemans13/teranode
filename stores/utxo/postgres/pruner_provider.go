@@ -123,12 +123,24 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 	// true forever, so Prune would no-op on every call — silently disabling the
 	// pruner (the exact failure class that has filled a disk in production
 	// before). Clamp to 0 instead and say so once per call, loud enough to find.
+	//
+	// A huge POSITIVE setting is the mirror-image failure: it needs no integer
+	// wrap to cause the exact same silent-no-op-forever outcome, since
+	// blockHeight <= margin is simply true until the chain grows past the
+	// misconfigured value (e.g. margin=100000 on a chain at height 50000 never
+	// deletes anything). Clamp to maxPruneDeleteMarginBlocks and say so, same as
+	// the negative case, so deletes resume once the chain clears a sane bound
+	// instead of staying disabled for the life of the chain.
 	marginSetting := s.store.settings.UtxoStore.PruneDeleteMarginBlocks
-	if marginSetting < 0 {
+	switch {
+	case marginSetting < 0:
 		s.logger.Infof("[pruner] WARNING: PruneDeleteMarginBlocks is negative (%d); clamping to 0 -- a negative value would otherwise wrap to a huge margin and silently stop all deletes", marginSetting)
 		marginSetting = 0
+	case marginSetting > maxPruneDeleteMarginBlocks:
+		s.logger.Infof("[pruner] WARNING: PruneDeleteMarginBlocks (%d) exceeds the maximum of %d; clamping -- an excessive margin would otherwise make blockHeight <= margin true for the life of the chain, silently stopping all deletes", marginSetting, maxPruneDeleteMarginBlocks)
+		marginSetting = maxPruneDeleteMarginBlocks
 	}
-	margin := uint32(marginSetting) //nolint:gosec // clamped non-negative above
+	margin := uint32(marginSetting) //nolint:gosec // clamped non-negative and bounded above
 	if blockHeight <= margin {
 		return 0, nil // nothing can be old enough yet
 	}
@@ -253,6 +265,15 @@ func (s *postgresPrunerService) deleteTombstoned(ctx context.Context, blockHeigh
 // path); a 10000-hash batch keeps each set-based cascade one bounded leaf index
 // scan while minimising round trips.
 const pruneDeleteWorkers = 8
+
+// maxPruneDeleteMarginBlocks upper-bounds PruneDeleteMarginBlocks. Without a
+// cap, a misconfigured huge positive margin makes `blockHeight <= margin` true
+// for the life of the chain, silently disabling every delete -- the same
+// "pruner silently stops, disk fills" incident class as the negative-margin
+// wrap, just approached from the other sign. 1000 is a generous multiple of
+// the production default (32) while still guaranteeing deletes resume well
+// before the chain grows enough for the misconfiguration to matter.
+const maxPruneDeleteMarginBlocks = 1000
 
 // pruneDeleteBatchSize bounds each cascade batch (one short transaction), which
 // releases the maintenance pool connection between batches so stamping and other

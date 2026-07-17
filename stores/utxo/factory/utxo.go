@@ -79,8 +79,14 @@ import (
 var availableDatabases = map[string]func(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, url *url.URL) (utxo.Store, error){}
 
 // earlyDAHBoundarySetter is implemented by stores supporting below-checkpoint
-// early-DAH (currently the postgres store). Optional-interface pattern, same
-// as SupportsOutpointOnlySpend.
+// early-DAH (currently the postgres store). This is a genuine optional
+// interface, checked via type assertion below — unlike SupportsOutpointOnlySpend,
+// which is a required method on the utxo.Store interface itself (always
+// present, never asserted for). A store that doesn't implement
+// earlyDAHBoundarySetter simply leaves the boundary unset; a store wrapped by
+// stores/utxo/logger.Store gets this forwarded to the wrapped store (see that
+// package's SetEarlyDAHBoundary), so logging wrapping does not by itself
+// disarm the feature.
 type earlyDAHBoundarySetter interface{ SetEarlyDAHBoundary(uint32) }
 
 // maybeLatchEarlyDAHBoundary returns true (latched) when the main chain's

@@ -130,3 +130,56 @@ func TestPruneDeleteMargin_NegativeSettingClampsToZero(t *testing.T) {
 	require.False(t, exists,
 		"a negative PruneDeleteMarginBlocks must clamp to 0, not wrap to a huge margin that silently stops all deletes")
 }
+
+// TestPruneDeleteMargin_ExcessivePositiveSettingClamps guards the mirror-image
+// failure mode from final review Important issue 2: an absurdly large
+// positive PruneDeleteMarginBlocks makes blockHeight <= margin true for the
+// entire foreseeable life of the chain, silently disabling every delete
+// forever -- the identical "pruner silently stops, disk fills" incident class
+// the negative-clamp test above guards against, just approached from the
+// other sign. A misconfigured huge positive margin must clamp to a sane upper
+// bound (maxPruneDeleteMarginBlocks) rather than pass through unbounded.
+func TestPruneDeleteMargin_ExcessivePositiveSettingClamps(t *testing.T) {
+	st := newTestStoreWithFlag(t, true)
+	ctx := context.Background()
+
+	// Misconfigure the margin absurdly high -- without the upper clamp this
+	// would make Prune a permanent no-op until the chain reached height
+	// 1,000,000.
+	st.settings.UtxoStore.PruneDeleteMarginBlocks = 1_000_000
+
+	tx := testExtendedTx(t)
+	_, err := st.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	const dah = int32(1000)
+	_, err = st.pool.Exec(ctx,
+		`UPDATE txs SET delete_at_height = $1 WHERE hash = $2`,
+		dah, txHash[:])
+	require.NoError(t, err)
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO pending_deletes (hash, delete_at_height) VALUES ($1, $2)
+		 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height`,
+		txHash[:], dah)
+	require.NoError(t, err)
+
+	svc, err := st.GetPrunerService()
+	require.NoError(t, err)
+	svc.Start(ctx)
+
+	// Trigger height comfortably above the clamped margin (1000) but nowhere
+	// near the misconfigured raw value (1,000,000): with the clamp working,
+	// 2000 - 1000(clamped) = 1000 >= dah(1000), so the row is deleted. If the
+	// clamp were missing, 2000 <= 1,000,000 would early-return 0 and the row
+	// (and every row, until the chain reached height 1,000,000) would survive.
+	_, err = svc.Prune(ctx, 2000, "margin-test-positive-clamp")
+	require.NoError(t, err)
+
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM txs WHERE hash = $1)`, txHash[:]).Scan(&exists))
+	require.False(t, exists,
+		"an excessive positive PruneDeleteMarginBlocks must clamp to a sane upper bound, not pass through and silently stop all deletes for the life of the chain")
+}
