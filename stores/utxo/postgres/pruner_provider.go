@@ -102,7 +102,9 @@ func (s *postgresPrunerService) AddObserver(observer pruner.Observer) {
 	s.observers = append(s.observers, observer)
 }
 
-// Prune removes transactions marked for deletion at or before the specified height.
+// Prune deletes rows with delete_at_height at or below the trigger height minus
+// PruneDeleteMarginBlocks (the crash-replay margin — see below); it does not
+// delete everything at or before the raw trigger height.
 func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, blockHashStr string) (int64, error) {
 	if blockHeight == 0 {
 		return 0, errors.NewProcessingError("cannot prune at block height 0")
@@ -115,7 +117,18 @@ func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, b
 	// rows. blockHeight is adjusted ONCE, here, at the top of Prune — every
 	// downstream height use (the EXISTS probe, deleteTombstoned, the batch
 	// fetch) reads this same parameter, so the margin applies everywhere.
-	margin := uint32(s.store.settings.UtxoStore.PruneDeleteMarginBlocks) //nolint:gosec // small positive height delta
+	//
+	// A negative setting is a misconfiguration, not a "no margin" request: cast
+	// straight to uint32 it wraps to a huge value, making blockHeight <= margin
+	// true forever, so Prune would no-op on every call — silently disabling the
+	// pruner (the exact failure class that has filled a disk in production
+	// before). Clamp to 0 instead and say so once per call, loud enough to find.
+	marginSetting := s.store.settings.UtxoStore.PruneDeleteMarginBlocks
+	if marginSetting < 0 {
+		s.logger.Infof("[pruner] WARNING: PruneDeleteMarginBlocks is negative (%d); clamping to 0 -- a negative value would otherwise wrap to a huge margin and silently stop all deletes", marginSetting)
+		marginSetting = 0
+	}
+	margin := uint32(marginSetting) //nolint:gosec // clamped non-negative above
 	if blockHeight <= margin {
 		return 0, nil // nothing can be old enough yet
 	}

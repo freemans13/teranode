@@ -79,3 +79,54 @@ func TestPruneDeleteMargin(t *testing.T) {
 	require.False(t, rowExists(),
 		"Prune(132) MUST delete a DAH-100 row under margin 32 (132-32=100 >= 100)")
 }
+
+// TestPruneDeleteMargin_NegativeSettingClampsToZero guards the must-fix from
+// review: PruneDeleteMarginBlocks is a signed int32 setting. Cast blindly to
+// uint32, a negative misconfiguration wraps to a huge value, making
+// blockHeight <= margin true on every call -- Prune would silently no-op
+// forever, which is the same failure class ("pruner silently stops, disk
+// fills") as a past production incident. A negative setting must instead be
+// clamped to 0 (i.e. behave as if no margin were configured), so a bad config
+// degrades to the OLD at-or-below-trigger semantics rather than disabling the
+// pruner outright.
+func TestPruneDeleteMargin_NegativeSettingClampsToZero(t *testing.T) {
+	st := newTestStoreWithFlag(t, true)
+	ctx := context.Background()
+
+	// Misconfigure the margin negative.
+	st.settings.UtxoStore.PruneDeleteMarginBlocks = -5
+
+	tx := testExtendedTx(t)
+	_, err := st.Create(ctx, tx, 100)
+	require.NoError(t, err)
+
+	txHash := tx.TxIDChainHash()
+
+	const dah = int32(100)
+	_, err = st.pool.Exec(ctx,
+		`UPDATE txs SET delete_at_height = $1 WHERE hash = $2`,
+		dah, txHash[:])
+	require.NoError(t, err)
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO pending_deletes (hash, delete_at_height) VALUES ($1, $2)
+		 ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height`,
+		txHash[:], dah)
+	require.NoError(t, err)
+
+	svc, err := st.GetPrunerService()
+	require.NoError(t, err)
+	svc.Start(ctx)
+
+	// Trigger == DAH, clamped margin == 0: with the clamp working, the pruner
+	// falls back to the pre-margin "at or below trigger" rule and deletes the
+	// row. If the clamp were missing/broken, margin would wrap to ~2^32-5 and
+	// this row (and every row, forever) would survive.
+	_, err = svc.Prune(ctx, 100, "margin-test-negative-clamp")
+	require.NoError(t, err)
+
+	var exists bool
+	require.NoError(t, st.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM txs WHERE hash = $1)`, txHash[:]).Scan(&exists))
+	require.False(t, exists,
+		"a negative PruneDeleteMarginBlocks must clamp to 0, not wrap to a huge margin that silently stops all deletes")
+}
