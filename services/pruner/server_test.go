@@ -330,6 +330,48 @@ func TestSeedLastBlockHashArmsTickerAfterRestart(t *testing.T) {
 	}
 }
 
+// TestSeedLastBlockHashDoesNotClobberLiveValue covers the ordering hazard
+// raised in re-review: Init starts notificationWorker BEFORE calling
+// seedLastBlockHash, and GetBlockHeadersFromHeight is a network round trip,
+// so a real notification can race ahead and Store a fresher hash while the
+// seed call is still in flight. If the seed then did an unconditional
+// Store, its later-arriving-but-older hash would silently clobber the
+// live one -- benign in most cases (both are usually close together and
+// waitForBlockMinedStatus tolerates some slop), but still a plain ordering
+// bug. seedLastBlockHash now uses CompareAndSwap(nil, seeded), so it must
+// never overwrite a value that's already been set.
+//
+// This simulates the race deterministically: store a "live" hash first (as
+// if a notification had already won the race), then call seedLastBlockHash
+// with a mocked blockchainClient that would return a *different* hash, and
+// assert the live value survives untouched.
+func TestSeedLastBlockHashDoesNotClobberLiveValue(t *testing.T) {
+	liveHash := chainhash.Hash{0xEE}
+
+	seedHeader := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{0x03},
+		HashMerkleRoot: &chainhash.Hash{0x04},
+	}
+	require.False(t, seedHeader.Hash().IsEqual(&liveHash), "test fixture sanity check: seed and live hashes must differ")
+
+	blockchainMock := &blockchain.Mock{}
+	blockchainMock.On("GetBlockHeadersFromHeight", mock.Anything, uint32(500), uint32(1)).
+		Return([]*model.BlockHeader{seedHeader}, []*model.BlockHeaderMeta{{}}, nil)
+
+	s := &Server{
+		logger:           ulogger.New("test"),
+		blockchainClient: blockchainMock,
+	}
+
+	// A live notification has already won the race and claimed lastBlockHash
+	// before the (slower, in-flight) seed call returns.
+	s.lastBlockHash.Store(&liveHash)
+
+	s.seedLastBlockHash(context.Background(), 500)
+
+	require.Equal(t, liveHash, *s.lastBlockHash.Load(), "seedLastBlockHash must not clobber a hash a live notification already set")
+}
+
 // TestBlockNotificationReArmsHashWithoutSignalInOnBlockPersistedMode verifies
 // part 1 of the restart-gap fix: in OnBlockPersisted mode, a Block
 // notification -- which must not itself drive pruning in that mode -- still

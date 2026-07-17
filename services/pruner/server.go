@@ -196,6 +196,14 @@ func (s *Server) Init(ctx context.Context) error {
 // Best-effort: any error is logged as a single-line warning and
 // lastBlockHash is left unset (nil); a subsequent notification will still
 // re-arm it per the usual paths.
+//
+// Init starts notificationWorker before calling this, and
+// GetBlockHeadersFromHeight is a network round trip, so a live notification
+// can race ahead and Store a fresher hash while this seed is still in
+// flight. The store below is therefore a CompareAndSwap(nil, seeded), not an
+// unconditional Store: it only fills lastBlockHash if nothing has claimed it
+// yet, so the worker's live value always wins over the seed and a
+// slower-but-stale seed can never clobber a faster-but-fresh notification.
 func (s *Server) seedLastBlockHash(ctx context.Context, height uint32) {
 	headers, _, err := s.blockchainClient.GetBlockHeadersFromHeight(ctx, height, 1)
 	if err != nil || len(headers) == 0 {
@@ -203,7 +211,7 @@ func (s *Server) seedLastBlockHash(ctx context.Context, height uint32) {
 		return
 	}
 
-	s.lastBlockHash.Store(headers[0].Hash())
+	s.lastBlockHash.CompareAndSwap(nil, headers[0].Hash())
 }
 
 // notificationWorker consumes blockchain notifications and translates them into
