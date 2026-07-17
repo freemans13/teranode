@@ -7,10 +7,10 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
-// RemoveBlockIDs trims the supplied block IDs from each transaction's
-// block_ids array column, dropping the matching positions from the parallel
-// block_heights and subtree_idxs arrays so all three stay index-aligned.
-// Idempotent: a block ID that is absent matches nothing.
+// RemoveBlockIDs trims the supplied block IDs from each transaction's packed
+// mined_info bytea, dropping the whole 12-byte record (block_id, height,
+// subtree_idx) for every matching block ID so the three fields can never
+// misalign. Idempotent: a block ID that is absent matches nothing.
 func (s *Store) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemoval) error {
 	if len(removals) == 0 {
 		return nil
@@ -25,29 +25,22 @@ func (s *Store) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemo
 		_ = txn.Rollback(ctx)
 	}()
 
-	// Trim the supplied block IDs from the parallel block_ids / block_heights /
-	// subtree_idxs arrays in a SINGLE atomic UPDATE, dropping the SAME positions
-	// from all three arrays so they stay index-aligned. A Get zips these three
-	// arrays by position (get.go:139); the previous array_remove(block_ids, ...)
-	// touched only block_ids, leaving block_heights and subtree_idxs one element
-	// too long and silently misaligning every subsequent read. This mirrors the
-	// UNNEST WITH ORDINALITY re-aggregation used by unsetMinedMulti.
-	// Idempotent: a block ID that is absent matches nothing.
-	//
-	// The three arrays are decoded ONCE: a single correlated row-subquery unnests
-	// them together and re-aggregates the kept positions, assigned to all three
-	// columns via a multi-column SET — rather than re-running the same unnest three
-	// times, one per SET column, as before. (A FROM/LATERAL subquery cannot
-	// reference the UPDATE target, but a SET subquery can, so this stays one pass.)
+	// Trim the supplied block IDs from the packed mined_info bytea in a SINGLE
+	// atomic UPDATE, re-aggregating every stride-aligned 12-byte record whose
+	// block_id (the first 4 bytes, int4send-encoded) is NOT in the removal set.
+	// Because the whole record drops together, the block_id/height/subtree_idx
+	// triple can never misalign — the class of bug the parallel-array form once had
+	// (array_remove touching only block_ids). Idempotent: a block ID that is absent
+	// matches nothing. The removal set is compared as 4-byte big-endian slices so
+	// the match is exact and stride-aligned (offsets 0,12,24,...), never a bare
+	// substring that could straddle two records.
 	const q = `
 		UPDATE txs t SET
-			(block_ids, block_heights, subtree_idxs) = (
-				SELECT COALESCE(array_agg(e.bid ORDER BY e.ord), '{}'::int[]),
-				       COALESCE(array_agg(e.bh  ORDER BY e.ord), '{}'::int[]),
-				       COALESCE(array_agg(e.si  ORDER BY e.ord), '{}'::int[])
-				FROM unnest(t.block_ids, t.block_heights, t.subtree_idxs) WITH ORDINALITY AS e(bid, bh, si, ord)
-				WHERE e.bid <> ALL($1::int[])
-			)
+			mined_info = COALESCE((
+				SELECT string_agg(substr(t.mined_info, g.i * 12 + 1, 12), ''::bytea ORDER BY g.i)
+				FROM generate_series(0, octet_length(t.mined_info) / 12 - 1) AS g(i)
+				WHERE substr(t.mined_info, g.i * 12 + 1, 4) <> ALL(ARRAY(SELECT int4send(x) FROM unnest($1::int[]) AS x))
+			), ''::bytea)
 		WHERE t.hash = $2`
 
 	for _, r := range removals {

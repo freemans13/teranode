@@ -101,7 +101,7 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 	rows, err := conn.Query(ctx, `
 		SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
 		       locked, conflicting, frozen, unmined_since,
-		       block_ids, block_heights, subtree_idxs
+		       mined_info
 		FROM unnest($1::bytea[]) AS h(v) JOIN txs ON txs.hash = h.v`,
 		hashes,
 	)
@@ -120,11 +120,11 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 		var hashBytes []byte
 		var version, lockTime int64
 		var unminedSince *int64
-		var blockIDs, blockHeights, subtreeIdxs []int32
+		var minedInfo []byte
 
 		if scanErr := rows.Scan(&hashBytes, &version, &lockTime, &data.Fee, &data.SizeInBytes,
 			&data.IsCoinbase, &data.Locked, &data.Conflicting, &data.Frozen,
-			&unminedSince, &blockIDs, &blockHeights, &subtreeIdxs); scanErr != nil {
+			&unminedSince, &minedInfo); scanErr != nil {
 			rows.Close()
 			for _, item := range batch {
 				item.done <- batchGetResult{Err: errors.NewStorageError("[Get] batch scan", scanErr)}
@@ -135,20 +135,7 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 		if unminedSince != nil {
 			data.UnminedSince = uint32(*unminedSince)
 		}
-		if len(blockIDs) > 0 {
-			data.BlockIDs = make([]uint32, len(blockIDs))
-			data.BlockHeights = make([]uint32, len(blockHeights))
-			data.SubtreeIdxs = make([]int, len(subtreeIdxs))
-			for i := range blockIDs {
-				data.BlockIDs[i] = uint32(blockIDs[i])
-				if i < len(blockHeights) {
-					data.BlockHeights[i] = uint32(blockHeights[i])
-				}
-				if i < len(subtreeIdxs) {
-					data.SubtreeIdxs[i] = int(subtreeIdxs[i])
-				}
-			}
-		}
+		data.BlockIDs, data.BlockHeights, data.SubtreeIdxs = decodeMinedInfo(minedInfo)
 
 		var h chainhash.Hash
 		copy(h[:], hashBytes)
@@ -194,9 +181,7 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		lockTime            int64
 		unminedSince        *int64
 		rawTx               []byte
-		blockIDs            []int32
-		blockHeights        []int32
-		subtreeIdxs         []int32
+		minedInfo           []byte
 		conflictingChildren [][]byte
 		outCount            int32
 		outFrozensBitmap    []byte // nil = no output frozen
@@ -216,14 +201,14 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 		SELECT version, lock_time, fee, size_in_bytes, coinbase,
 		       locked, conflicting, frozen, unmined_since,
 		       CASE WHEN $2 THEN raw_tx END,
-		       block_ids, block_heights, subtree_idxs,
+		       mined_info,
 		       CASE WHEN $3 THEN conflicting_children END,
 		       out_count, out_frozens
 		FROM txs WHERE hash = $1`,
 		hash[:], needRawTx, needConflictingChildren,
 	).Scan(&version, &lockTime, &data.Fee, &data.SizeInBytes, &data.IsCoinbase,
 		&data.Locked, &data.Conflicting, &data.Frozen, &unminedSince, &rawTx,
-		&blockIDs, &blockHeights, &subtreeIdxs, &conflictingChildren,
+		&minedInfo, &conflictingChildren,
 		&outCount, &outFrozensBitmap)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -254,20 +239,9 @@ func (s *Store) getInternal(ctx context.Context, hash *chainhash.Hash, bins []fi
 	// raw_tx contains locking_script + satoshis for every output; no
 	// separate outputs-table query is needed.
 
-	// Fetch block_ids from arrays.
-	if contains(bins, fields.BlockIDs) && len(blockIDs) > 0 {
-		data.BlockIDs = make([]uint32, len(blockIDs))
-		data.BlockHeights = make([]uint32, len(blockHeights))
-		data.SubtreeIdxs = make([]int, len(subtreeIdxs))
-		for i := range blockIDs {
-			data.BlockIDs[i] = uint32(blockIDs[i])
-			if i < len(blockHeights) {
-				data.BlockHeights[i] = uint32(blockHeights[i])
-			}
-			if i < len(subtreeIdxs) {
-				data.SubtreeIdxs[i] = int(subtreeIdxs[i])
-			}
-		}
+	// Decode block info from the packed mined_info bytea.
+	if contains(bins, fields.BlockIDs) {
+		data.BlockIDs, data.BlockHeights, data.SubtreeIdxs = decodeMinedInfo(minedInfo)
 	}
 
 	// Fetch conflicting children from array.
@@ -380,13 +354,13 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 		locked                 bool
 	)
 
-	// O(1) packed access: 32-byte substr stride + get_bit bitmap probe.
+	// O(1) packed access: 16-byte substr stride + get_bit bitmap probe.
 	// Returns 0 rows when: tx is missing, OR output index is OOB ($2 >= out_count).
 	// get_bit is only reached when $2 < out_count (WHERE guard), so it cannot
 	// raise an out-of-range error.
 	err = s.pool.QueryRow(ctx, `
 		SELECT
-		    substr(t.utxo_hashes, $2::int * 32 + 1, 32),
+		    substr(t.utxo_hashes, $2::int * 16 + 1, 16),
 		    t.coinbase_spending_height,
 		    sp.spending_data,
 		    (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1) OR t.frozen,
@@ -410,8 +384,9 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 	// spend.UTXOHash is legitimately nil for callers that locate a UTXO by
 	// (txid, vout) alone (e.g. the public /api/v1/utxos endpoint), so guard the
 	// dereference to match the SQL reference store (sql/sql.go) and avoid an
-	// externally-reachable nil-pointer panic.
-	if spend.UTXOHash != nil && !bytes.Equal(utxoHashBytes, spend.UTXOHash[:]) {
+	// externally-reachable nil-pointer panic. utxo_hashes stores a 16-byte prefix,
+	// so compare against the caller hash's first 16 bytes.
+	if spend.UTXOHash != nil && !bytes.Equal(utxoHashBytes, spend.UTXOHash[:16]) {
 		return nil, errors.NewUtxoHashMismatchError("utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 	}
 
@@ -504,7 +479,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 	// ~4.9 descents per looked-up row); the nested-loop join descends exactly one.
 	const q = `SELECT hash, version, lock_time, fee, size_in_bytes, coinbase,
 	             locked, conflicting, frozen, unmined_since, raw_tx,
-	             block_ids, block_heights, subtree_idxs
+	             mined_info
 	      FROM unnest($1::bytea[]) AS h(v)
 	      JOIN txs ON txs.hash = h.v`
 
@@ -522,14 +497,12 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 			version      int64
 			lockTime     int64
 			rawTx        []byte
-			blockIDs     []int32
-			blkHeights   []int32
-			subIdxs      []int32
+			minedInfo    []byte
 		)
 		row := &txRow{data: &meta.Data{}}
 		if err := rows.Scan(&hashBytes, &version, &lockTime, &row.data.Fee, &row.data.SizeInBytes, &row.data.IsCoinbase,
 			&row.data.Locked, &row.data.Conflicting, &row.data.Frozen, &unminedSince, &rawTx,
-			&blockIDs, &blkHeights, &subIdxs); err != nil {
+			&minedInfo); err != nil {
 			rows.Close()
 			return errors.NewStorageError("[BatchDecorate] scan txs row", err)
 		}
@@ -540,21 +513,8 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		if unminedSince != nil {
 			row.data.UnminedSince = uint32(*unminedSince)
 		}
-		// Store block_ids on the data object.
-		if len(blockIDs) > 0 {
-			row.data.BlockIDs = make([]uint32, len(blockIDs))
-			row.data.BlockHeights = make([]uint32, len(blkHeights))
-			row.data.SubtreeIdxs = make([]int, len(subIdxs))
-			for i := range blockIDs {
-				row.data.BlockIDs[i] = uint32(blockIDs[i])
-				if i < len(blkHeights) {
-					row.data.BlockHeights[i] = uint32(blkHeights[i])
-				}
-				if i < len(subIdxs) {
-					row.data.SubtreeIdxs[i] = int(subIdxs[i])
-				}
-			}
-		}
+		// Decode block info from the packed mined_info bytea onto the data object.
+		row.data.BlockIDs, row.data.BlockHeights, row.data.SubtreeIdxs = decodeMinedInfo(minedInfo)
 		hashToTx[row.hash] = row
 	}
 	// Check rows.Err() BEFORE treating absent hashes as not-found: a mid-stream

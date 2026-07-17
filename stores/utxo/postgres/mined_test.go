@@ -53,13 +53,14 @@ func TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_CTEBranch(t *testing
 	require.NoError(t, err)
 	require.True(t, existsAfterMine, "pending_unmined row must LINGER after SetMinedMulti (lever 1: hot-path DELETE removed)")
 
-	// txs row must survive with block_ids updated and unmined_since=NULL.
-	var blockIDs []int32
+	// txs row must survive with mined_info updated and unmined_since=NULL.
+	var minedInfo []byte
 	err = st.pool.QueryRow(ctx,
-		`SELECT block_ids FROM txs WHERE hash=$1`, hashBytes).Scan(&blockIDs)
+		`SELECT mined_info FROM txs WHERE hash=$1`, hashBytes).Scan(&minedInfo)
 	require.NoError(t, err, "txs row must still exist after mine")
+	blockIDs := decodeMinedBlockIDs(minedInfo)
 	require.Equal(t, 1, len(blockIDs))
-	require.Equal(t, int32(100), blockIDs[0])
+	require.Equal(t, uint32(100), blockIDs[0])
 
 	var unminedSinceAfter *int32
 	err = st.pool.QueryRow(ctx,
@@ -144,13 +145,14 @@ func TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_PlainBranch(t *testi
 
 	// unmined_since must be NULL in txs after mine (the UPDATE still NULLs it on longest chain
 	// only; plain branch does not NULL unmined_since — that's OK: the read filter catches it).
-	// Just assert the mine took effect (block_ids updated).
-	var blockIDs []int32
+	// Just assert the mine took effect (mined_info updated).
+	var minedInfo []byte
 	err = st.pool.QueryRow(ctx,
-		`SELECT block_ids FROM txs WHERE hash=$1`, hashBytes).Scan(&blockIDs)
+		`SELECT mined_info FROM txs WHERE hash=$1`, hashBytes).Scan(&minedInfo)
 	require.NoError(t, err, "txs row must still exist after mine")
+	blockIDs := decodeMinedBlockIDs(minedInfo)
 	require.Equal(t, 1, len(blockIDs))
-	require.Equal(t, int32(100), blockIDs[0])
+	require.Equal(t, uint32(100), blockIDs[0])
 
 	// (b) Pruner read-filter excludes the stale row: the plain branch does NOT set
 	// unmined_since=NULL (only the CTE/OnLongestChain branch does), so we check
@@ -270,9 +272,9 @@ func TestSetMinedMulti_PendingUnminedLingersThenLazyCleaned_Batch(t *testing.T) 
 	// All 3 must still be in txs with block_ids populated and unmined_since=NULL.
 	var minedCount int
 	err = st.pool.QueryRow(ctx,
-		`SELECT count(*) FROM txs WHERE hash = ANY($1::bytea[]) AND block_ids IS NOT NULL`, allHashBytes).Scan(&minedCount)
+		`SELECT count(*) FROM txs WHERE hash = ANY($1::bytea[]) AND mined_info IS NOT NULL`, allHashBytes).Scan(&minedCount)
 	require.NoError(t, err)
-	require.Equal(t, 3, minedCount, "all 3 txs must be mined (block_ids not NULL)")
+	require.Equal(t, 3, minedCount, "all 3 txs must be mined (mined_info not NULL)")
 
 	// (b) Pruner read does NOT return any of the 3 mined txs (read-filter: unmined_since IS NOT NULL).
 	iter, err := st.GetPrunableUnminedTxIterator(200)

@@ -92,7 +92,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 //
 // The eligibility CASE mirrors the sweep's conditions (the canonical DAH setter):
 //   - conflicting txs get a DAH (they need not be mined); else
-//   - on the longest chain (unmined_since IS NULL) AND mined (has block_ids) AND fully
+//   - on the longest chain (unmined_since IS NULL) AND mined (mined_info non-empty) AND fully
 //     spent.
 //
 // Setter-C reconcile (proc v15): fully-spentness is decided from the MAINTAINED
@@ -158,7 +158,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 				delete_at_height = CASE
 					WHEN conflicting THEN $1
 					WHEN unmined_since IS NULL
-					     AND block_ids IS NOT NULL AND array_length(block_ids, 1) IS NOT NULL
+					     AND mined_info IS NOT NULL AND octet_length(mined_info) > 0
 					     AND out_count > 0
 					     AND spendable_count > 0
 					     AND bit_count(spent_bits) = spendable_count

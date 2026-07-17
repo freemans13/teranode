@@ -73,7 +73,7 @@ func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 	// newPrunableUnminedTxIterator exactly so readOne's Scan is byte-identical.
 	q := `
 		SELECT t.hash, t.fee, t.size_in_bytes, t.inserted_at, t.coinbase,
-		       t.locked, pu.unmined_since, t.raw_tx, t.block_ids
+		       t.locked, pu.unmined_since, t.raw_tx, t.mined_info
 		FROM pending_unmined pu
 		JOIN txs t ON t.hash = pu.hash
 		WHERE t.conflicting = false
@@ -138,7 +138,7 @@ func newPrunableUnminedTxIterator(store *Store, cutoffBlockHeight uint32) (*unmi
 	// { unmined_since IS NOT NULL AND NOT conflicting } rows are returned.
 	q := `
 		SELECT t.hash, t.fee, t.size_in_bytes, t.inserted_at, t.coinbase,
-		       t.locked, pu.unmined_since, t.raw_tx, t.block_ids
+		       t.locked, pu.unmined_since, t.raw_tx, t.mined_info
 		FROM pending_unmined pu
 		JOIN txs t ON t.hash = pu.hash
 		WHERE pu.unmined_since <= $1
@@ -222,11 +222,11 @@ func (it *unminedTxIterator) readOne(_ context.Context) (*utxo.UnminedTransactio
 		locked       bool
 		unminedSince *int64 // nullable: conflicting txs may have unmined_since = NULL
 		rawTx        []byte
-		blockIDs     []int32
+		minedInfo    []byte
 	)
 
 	if err := it.rows.Scan(&txHashBytes, &fee, &sizeInBytes, &insertedAt, &isCoinbase,
-		&locked, &unminedSince, &rawTx, &blockIDs); err != nil {
+		&locked, &unminedSince, &rawTx, &minedInfo); err != nil {
 		if closeErr := it.Close(); closeErr != nil {
 			it.store.logger.Warnf("failed to close iterator: %v", closeErr)
 		}
@@ -270,11 +270,8 @@ func (it *unminedTxIterator) readOne(_ context.Context) (*utxo.UnminedTransactio
 		return nil, it.err
 	}
 
-	// Convert block_ids from []int32 to []uint32.
-	bidResult := make([]uint32, len(blockIDs))
-	for i, bid := range blockIDs {
-		bidResult[i] = uint32(bid)
-	}
+	// Decode block IDs from the packed mined_info bytea.
+	bidResult := decodeMinedBlockIDs(minedInfo)
 
 	var unminedSinceVal int
 	if unminedSince != nil {
@@ -322,7 +319,7 @@ func (s *Store) GetConflictingTxIterator() (utxo.UnminedTxIterator, error) {
 func newConflictingTxIterator(store *Store) (*unminedTxIterator, error) {
 	q := `
 		SELECT hash, fee, size_in_bytes, inserted_at, coinbase,
-		       locked, unmined_since, raw_tx, block_ids
+		       locked, unmined_since, raw_tx, mined_info
 		FROM txs
 		WHERE conflicting = true
 		ORDER BY hash

@@ -19,11 +19,11 @@ import (
 // batch (verified empirically — see the comment above the retry call in
 // SetMinedMulti), the correct retry unit is the whole batch, not one chunk. That is
 // only safe if re-running the whole batch for a block already recorded is a no-op.
-// It is: the UPDATE's `block_ids @> $2` containment guard skips the append when the
-// block is already present. This test simulates "attempt 1 actually committed, but
-// the caller only observed an error and retried" by calling SetMinedMulti twice with
-// an IDENTICAL MinedBlockInfo and asserting the second call does not duplicate the
-// block_ids/block_heights/subtree_idxs entry.
+// It is: the UPDATE's stride-aligned mined_info containment guard skips the append
+// when the block is already present. This test simulates "attempt 1 actually
+// committed, but the caller only observed an error and retried" by calling
+// SetMinedMulti twice with an IDENTICAL MinedBlockInfo and asserting the second call
+// does not duplicate the 12-byte mined_info record.
 func TestSetMinedMulti_ReRunSameBlockIsIdempotent(t *testing.T) {
 	st := newTestStoreWithFlag(t, true)
 	ctx := context.Background()
@@ -46,13 +46,14 @@ func TestSetMinedMulti_ReRunSameBlockIsIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []uint32{7}, res2[*h], "re-running the same block append must not duplicate the entry")
 
-	var blockIDs, blockHeights, subtreeIdxs []int32
+	var minedInfo []byte
 	require.NoError(t, st.pool.QueryRow(ctx,
-		`SELECT block_ids, block_heights, subtree_idxs FROM txs WHERE hash=$1`, h[:]).
-		Scan(&blockIDs, &blockHeights, &subtreeIdxs))
-	require.Equal(t, []int32{7}, blockIDs, "block_ids must not grow on re-run")
-	require.Equal(t, []int32{100}, blockHeights, "block_heights must stay aligned with block_ids")
-	require.Equal(t, []int32{3}, subtreeIdxs, "subtree_idxs must stay aligned with block_ids")
+		`SELECT mined_info FROM txs WHERE hash=$1`, h[:]).Scan(&minedInfo))
+	require.Len(t, minedInfo, minedRecordSize, "exactly one 12-byte record after idempotent re-mine")
+	bids, heights, sidxs := decodeMinedInfo(minedInfo)
+	require.Equal(t, []uint32{7}, bids, "block_id must not grow on re-run")
+	require.Equal(t, []uint32{100}, heights, "height must stay aligned with block_id")
+	require.Equal(t, []int{3}, sidxs, "subtree_idx must stay aligned with block_id")
 }
 
 // TestAttemptSetMinedUpdateBatch_NonDeadlockErrorSurfacesImmediately exercises the
