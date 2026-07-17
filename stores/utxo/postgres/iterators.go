@@ -38,6 +38,19 @@ const iteratorBatchSize = 1024
 func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 	ctx := context.Background()
 
+	// Read-your-writes barrier: pending_unmined is populated by the write-behind
+	// projector (see pending_unmined_projector.go) with up to puFlushInterval of
+	// lag, so a reload issued shortly after Create calls returned would miss
+	// those txs entirely (the EXISTS probe below would even short-circuit to an
+	// empty iterator). Drain the projector buffer synchronously first — the
+	// reload path is cold (block-assembly (re)start), so one batched INSERT is
+	// negligible, and a flush failure must surface as an error rather than a
+	// silently incomplete reload (flushPendingUnmined re-queues the buffer, so
+	// the caller can retry).
+	if err := store.flushPendingUnmined(ctx); err != nil {
+		return nil, errors.NewStorageError("failed to flush pending_unmined projector before unmined reload", err)
+	}
+
 	// Fast path: during IBD pending_unmined is typically empty, yet the
 	// partition-wise JOIN below still costs planning + parallel-worker startup
 	// while returning zero rows. A sub-ms EXISTS probe skips it when there is

@@ -1662,8 +1662,12 @@ func TestPrunerService(t *testing.T) {
 
 	svc.Start(ctx)
 
-	// Prune at height 50 should delete the tx.
-	count, err := svc.Prune(ctx, 50, "test-hash")
+	// Prune at height 50 + margin should delete the tx. The delete-side
+	// crash-replay margin (Task 7) only deletes rows whose delete_at_height is
+	// at least `margin` blocks below the trigger, so the trigger height must
+	// clear the stamp by that much.
+	margin := uint32(store.settings.UtxoStore.PruneDeleteMarginBlocks) //nolint:gosec
+	count, err := svc.Prune(ctx, 50+margin, "test-hash")
 	require.NoError(t, err)
 	require.Equal(t, int64(1), count)
 

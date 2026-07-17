@@ -329,6 +329,21 @@ func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *
 		if _, err := pool.Exec(ctx, idxDDL); err != nil {
 			return errors.NewStorageError("pending_deletes_p%02d index creation failed", i, err)
 		}
+
+		// Idempotent, mirrors the txs/spends per-leaf pattern: autovacuum ignores
+		// parent-level params, so set on each leaf. Gentle spends-style profile —
+		// pd is insert-then-delete churn; an aggressive profile would steal I/O
+		// from the sweep and pruner (see CLAUDE.md).
+		av := fmt.Sprintf(
+			"ALTER TABLE pending_deletes_p%02d SET ("+
+				"autovacuum_vacuum_scale_factor = 0.05, "+
+				"autovacuum_vacuum_insert_scale_factor = 0.02, "+
+				"autovacuum_vacuum_cost_limit = 2000, "+
+				"autovacuum_vacuum_cost_delay = 2, "+
+				"autovacuum_analyze_scale_factor = 0.05)", i)
+		if _, err := pool.Exec(ctx, av); err != nil {
+			return errors.NewStorageError("autovacuum tuning failed for pending_deletes_p%02d", i, err)
+		}
 	}
 
 	// pending_unmined side-table: ALWAYS-ON (no flag). Stores (hash, unmined_since)
@@ -404,16 +419,15 @@ func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *
 		return errors.NewStorageError("dah_dirty_parents creation failed", err)
 	}
 
-	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz).
-	_, _ = pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET COMPRESSION lz4`)
-
-	// Pin utxo_hashes to EXTERNAL (never compressed; out-of-line only when the
-	// row is wide). The spend path's O(1) sliced substr() detoast on wide
-	// parents currently works because compression happens to FAIL on random
-	// 32-byte hashes (postgres discards non-shrinking results) — nothing pins
-	// that. EXTERNAL makes the slice guarantee explicit and skips the futile
-	// create-time compression attempt on this column.
-	_, _ = pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN utxo_hashes SET STORAGE EXTERNAL`)
+	// Playbook §4: LZ4 compression on raw_tx (faster than default pglz), and pin
+	// utxo_hashes to EXTERNAL (never compressed; out-of-line only when the row is
+	// wide — the spend path's O(1) sliced substr() detoast on wide parents relies
+	// on it). Both are pre-checked against pg_attribute and skipped once applied,
+	// for the same reason applySpentBitmapMigration is pre-checked above: the ALTER
+	// takes an ACCESS EXCLUSIVE lock on txs even when the change is a no-op, and
+	// that redundant lock can deadlock against the DAH sweep's per-partition locks
+	// at startup.
+	applyTxsColumnStorageTuning(ctx, pool, logger)
 
 	// NOTE: autovacuum tuning lives on the leaf partitions (see partitionSpec
 	// above), not here. A parent-level ALTER TABLE txs SET (autovacuum_*) is a
@@ -615,6 +629,41 @@ func applySpentBitmapMigration(ctx context.Context, pool *pgxpool.Pool) (bool, e
 	}
 
 	return true, nil
+}
+
+// applyTxsColumnStorageTuning applies the two per-column storage tunings on txs
+// (raw_tx → LZ4 compression, utxo_hashes → EXTERNAL storage). Each is pre-checked
+// against pg_attribute so an already-tuned database never re-issues the ALTER: the
+// ALTER takes an ACCESS EXCLUSIVE lock on txs even when the change is a no-op, and
+// that redundant lock can deadlock at startup against the DAH sweep's per-partition
+// locks (the same hazard applySpentBitmapMigration guards). The tunings are
+// non-fatal (performance only), but failures are logged — a missing ALTER privilege
+// or a Postgres build without liblz4 support would otherwise vanish silently.
+func applyTxsColumnStorageTuning(ctx context.Context, pool *pgxpool.Pool, logger ulogger.Logger) {
+	// raw_tx → LZ4 compression. attcompression is 'l' once set; the default
+	// (unset) renders as an empty string and 'p' is pglz — either means "apply it".
+	var compression string
+	if err := pool.QueryRow(ctx, `
+		SELECT attcompression::text FROM pg_attribute
+		WHERE attrelid = 'txs'::regclass AND attname = 'raw_tx'`).Scan(&compression); err != nil {
+		logger.Warnf("[schema] could not read raw_tx compression, skipping LZ4 tuning: %v", err)
+	} else if compression != "l" {
+		if _, err := pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET COMPRESSION lz4`); err != nil {
+			logger.Warnf("[schema] ALTER txs.raw_tx SET COMPRESSION lz4 failed (tuning skipped): %v", err)
+		}
+	}
+
+	// utxo_hashes → EXTERNAL storage. attstorage is 'e' once set.
+	var storage string
+	if err := pool.QueryRow(ctx, `
+		SELECT attstorage::text FROM pg_attribute
+		WHERE attrelid = 'txs'::regclass AND attname = 'utxo_hashes'`).Scan(&storage); err != nil {
+		logger.Warnf("[schema] could not read utxo_hashes storage, skipping EXTERNAL tuning: %v", err)
+	} else if storage != "e" {
+		if _, err := pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN utxo_hashes SET STORAGE EXTERNAL`); err != nil {
+			logger.Warnf("[schema] ALTER txs.utxo_hashes SET STORAGE EXTERNAL failed (tuning skipped): %v", err)
+		}
+	}
 }
 
 // dahDirtyParentsDDL creates the dirty-parents heal queue. Unspend inserts the

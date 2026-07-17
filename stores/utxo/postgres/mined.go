@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // minedChunkSize is the maximum number of hashes per bulk UPDATE.
@@ -40,8 +41,6 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		return s.unsetMinedMulti(ctx, hashes, minedBlockInfo.BlockID, minedBlockInfo.BlockHeight)
 	}
 
-	resultMap := make(map[chainhash.Hash][]uint32, len(hashes))
-
 	// Pipeline all UPDATE chunks + fetch queries via SendBatch.
 	// This eliminates per-chunk round-trip latency.
 	conn, err := s.pool.Acquire(ctx)
@@ -49,8 +48,6 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		return nil, errors.NewStorageError("[SetMinedMulti] acquire connection", err)
 	}
 	defer conn.Release()
-
-	batch := &pgx.Batch{}
 
 	// Queue UPDATE chunks.
 	// Idempotent block append: a `block_ids @> $2` containment guard skips the
@@ -154,7 +151,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		RETURNING txs.hash, block_ids`
 	}
 
-	numUpdateChunks := 0
+	chunkArgsList := make([][]interface{}, 0, (len(hashes)+minedChunkSize-1)/minedChunkSize)
 	for i := 0; i < len(hashes); i += minedChunkSize {
 		end := i + minedChunkSize
 		if end > len(hashes) {
@@ -177,50 +174,37 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 			// zero-spendable DAH stamp (delete_at_height = $5 + 1 + $6).
 			args = append(args, int32(minedBlockInfo.BlockHeight), retention)
 		}
-		batch.Queue(updateSQL, args...)
-		numUpdateChunks++
+		chunkArgsList = append(chunkArgsList, args)
 	}
 
-	// Send entire batch in one network flush.
-	br := conn.SendBatch(ctx, batch)
-
-	// Drain each UPDATE chunk's RETURNING rows straight into the result map —
-	// the post-update block_ids come back on the UPDATE itself, so no separate
-	// verification SELECT (a second full = ANY probe pass over all partitions,
-	// measured as a top-10 CPU consumer) is needed.
-	for i := 0; i < numUpdateChunks; i++ {
-		rows, err := br.Query()
-		if err != nil {
-			br.Close()
-			return nil, errors.NewStorageError("[SetMinedMulti] UPDATE chunk %d", i, err)
-		}
-		for rows.Next() {
-			var h []byte
-			var bids []int32
-			if err := rows.Scan(&h, &bids); err != nil {
-				rows.Close()
-				br.Close()
-				return nil, errors.NewStorageError("[SetMinedMulti] scan block_ids chunk %d", i, err)
-			}
-			var ch chainhash.Hash
-			copy(ch[:], h)
-			result := make([]uint32, len(bids))
-			for j, bid := range bids {
-				result[j] = uint32(bid)
-			}
-			resultMap[ch] = result
-		}
-		// A mid-stream failure (network reset, statement timeout) makes rows.Next()
-		// stop early with the error parked in rows.Err(); without this check a
-		// truncated resultMap would be returned as success.
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			br.Close()
-			return nil, errors.NewStorageError("[SetMinedMulti] iterate block_ids chunk %d", i, err)
-		}
-		rows.Close()
+	// Deadlock-retry note (verified empirically, not assumed — see the throwaway
+	// pgx.Batch repro this comment is based on): every chunk is queued into ONE
+	// pgx.Batch and sent as ONE SendBatch, which pgx pipelines behind a SINGLE
+	// terminal Sync. Per the Postgres extended-query protocol, a run of commands
+	// between two Sync messages with no explicit BEGIN is an IMPLICIT transaction:
+	// an error on ANY queued statement rolls back EVERY statement sent since the
+	// last Sync, INCLUDING ones that had already reported success. (Confirmed with
+	// a 3-statement batch: a forced error on statement 2 rolled back statement 1's
+	// already-"successful" UPDATE — the row was unchanged after Close().) So on a
+	// 40P01 the whole chunk batch is atomically a no-op, not a partial one; the
+	// correct retry unit is the WHOLE batch, not a single chunk within it, and there
+	// is nothing partial to reconcile. Retrying is safe: each UPDATE is idempotent
+	// via the `block_ids @> $2` containment guard (see the comment above updateSQL)
+	// — re-appending the same (block_id, block_height, subtree_idx) triple is a
+	// no-op, so re-running the full set of chunks from scratch reproduces the same
+	// end state whether this is attempt 1 or attempt N.
+	batchRes, err := retryOnPgDeadlock(ctx,
+		func() (minedUpdateBatchResult, error) {
+			return s.attemptSetMinedUpdateBatch(ctx, conn, updateSQL, chunkArgsList)
+		},
+		func(attemptNum int, backoff time.Duration) {
+			s.logger.Warnf("[SetMinedMulti] postgres deadlock (40P01) on UPDATE batch (%d chunks), retry %d/%d after %s", len(chunkArgsList), attemptNum, pgDeadlockMaxRetries, backoff)
+		},
+	)
+	if err != nil {
+		return nil, errors.NewStorageError("[SetMinedMulti] "+batchRes.stage, batchRes.failedChunk, err)
 	}
-	br.Close()
+	resultMap := batchRes.resultMap
 
 	// Hard postcondition (interface contract, matches the aerospike store): every
 	// input hash MUST appear in the result map and its block_ids MUST contain the
@@ -246,6 +230,77 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	}
 
 	return resultMap, nil
+}
+
+// minedUpdateBatchResult carries attemptSetMinedUpdateBatch's outcome through
+// retryOnPgDeadlock's generic T. On success resultMap is populated and stage is
+// empty; on failure resultMap is nil and failedChunk/stage identify which chunk and
+// stage failed, so a final (post-retry) error message can still name them even if
+// the loop exits via ctx cancellation rather than a fresh attempt.
+type minedUpdateBatchResult struct {
+	resultMap   map[chainhash.Hash][]uint32
+	failedChunk int
+	stage       string
+}
+
+// attemptSetMinedUpdateBatch runs every UPDATE chunk in chunkArgsList as ONE
+// pipelined SendBatch and drains their RETURNING rows into a fresh map. On success
+// stage is "" (failedChunk is meaningless). On failure it returns the RAW/unwrapped
+// error alongside the chunk index and a message template naming the failing stage,
+// so the caller can (a) classify a Postgres deadlock via isPgDeadlock on the raw
+// error and (b) reconstruct a precise wrapped error once retries are exhausted or
+// the error is not a deadlock. See the deadlock-retry note in SetMinedMulti for why
+// retrying this whole batch (not one chunk) is the correct and safe unit.
+func (s *Store) attemptSetMinedUpdateBatch(ctx context.Context, conn *pgxpool.Conn, updateSQL string, chunkArgsList [][]interface{}) (minedUpdateBatchResult, error) {
+	resultMap := make(map[chainhash.Hash][]uint32, len(chunkArgsList)*minedChunkSize)
+
+	batch := &pgx.Batch{}
+	for _, args := range chunkArgsList {
+		batch.Queue(updateSQL, args...)
+	}
+
+	// Send entire batch in one network flush.
+	br := conn.SendBatch(ctx, batch)
+
+	// Drain each UPDATE chunk's RETURNING rows straight into the result map —
+	// the post-update block_ids come back on the UPDATE itself, so no separate
+	// verification SELECT (a second full = ANY probe pass over all partitions,
+	// measured as a top-10 CPU consumer) is needed.
+	for i := range chunkArgsList {
+		rows, err := br.Query()
+		if err != nil {
+			br.Close()
+			return minedUpdateBatchResult{failedChunk: i, stage: "UPDATE chunk %d"}, err
+		}
+		for rows.Next() {
+			var h []byte
+			var bids []int32
+			if err := rows.Scan(&h, &bids); err != nil {
+				rows.Close()
+				br.Close()
+				return minedUpdateBatchResult{failedChunk: i, stage: "scan block_ids chunk %d"}, err
+			}
+			var ch chainhash.Hash
+			copy(ch[:], h)
+			result := make([]uint32, len(bids))
+			for j, bid := range bids {
+				result[j] = uint32(bid)
+			}
+			resultMap[ch] = result
+		}
+		// A mid-stream failure (network reset, statement timeout) makes rows.Next()
+		// stop early with the error parked in rows.Err(); without this check a
+		// truncated resultMap would be returned as success.
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			br.Close()
+			return minedUpdateBatchResult{failedChunk: i, stage: "iterate block_ids chunk %d"}, err
+		}
+		rows.Close()
+	}
+	br.Close()
+
+	return minedUpdateBatchResult{resultMap: resultMap}, nil
 }
 
 // unsetMinedMulti handles the reorg path: remove a block_id from the arrays.

@@ -39,6 +39,13 @@ type Store struct {
 	blockHeight     atomic.Uint32
 	medianBlockTime atomic.Uint32
 
+	// earlyDAHBoundary is the highest block height at or below which a fully-spent
+	// tx may be stamped with an immediate delete-at-height (no retention wait). It
+	// is published by the factory wiring (Task 6) once the main chain has confirmed
+	// the pinned checkpoint hash; the DAH sweep reads it per CALL. 0 = off (the
+	// EarlyDAHBelowCheckpoint setting also gates it — see earlyDAHSweepBoundary).
+	earlyDAHBoundary atomic.Uint32
+
 	// batchers — nil until Start() is called.
 	createBatcher *batcher.Batcher[batchCreateItem]
 	spendBatcher  *batcher.Batcher[batchSpendItem]
@@ -98,6 +105,10 @@ func (s *Store) BatchSizeSnapshot() map[string]float64 {
 		"unlock": avg(&s.batchStats.unlockItems, &s.batchStats.unlockBatches),
 	}
 }
+
+// SetEarlyDAHBoundary publishes the highest checkpoint height once the main
+// chain has confirmed the pinned checkpoint hash (see factory wiring). 0 = off.
+func (s *Store) SetEarlyDAHBoundary(h uint32) { s.earlyDAHBoundary.Store(h) }
 
 // New creates a new direct-write UTXO store.
 // The storeURL scheme should be "postgres".

@@ -162,6 +162,15 @@ func TestBlockDownloadWindowDefaults(t *testing.T) {
 	require.Equal(t, 16, s.Legacy.MaxBlocksInTransitPerPeer)
 }
 
+// Pin Phase C settings defaults: EarlyDAHBelowCheckpoint and PruneDeleteMarginBlocks
+func TestUtxoStore_PhaseC_Defaults(t *testing.T) {
+	tSettings := NewSettings()
+	require.Equal(t, false, tSettings.UtxoStore.EarlyDAHBelowCheckpoint,
+		"EarlyDAHBelowCheckpoint default must be false")
+	require.Equal(t, int32(32), tSettings.UtxoStore.PruneDeleteMarginBlocks,
+		"PruneDeleteMarginBlocks default must be 32")
+}
+
 func TestP2PSyncHardeningDefaultsAreLoaded(t *testing.T) {
 	tSettings := NewSettings()
 	require.NotNil(t, tSettings)

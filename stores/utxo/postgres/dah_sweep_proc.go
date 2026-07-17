@@ -118,7 +118,20 @@ import (
 // general path (upd_slow). Semantics identical — OR is idempotent and
 // position-exact — and a width-guard routes any short spent_bits row to
 // "unchanged, no stamp" (reconciler heals) instead of a band-aborting error.
-const dahSweepProcVersion = 16
+//
+// Bumped 16→17: below-checkpoint early DAH. A new p_checkpoint BIGINT parameter
+// (0 = off) lets the stamp skip the retention wait for a tx whose mined height AND
+// every folded spend height are at-or-below a hardcoded consensus checkpoint,
+// where a reorg is impossible by rule. Both stamp sites (upd_fast/upd_slow) gate
+// the retention term on the SAME GREATEST(last_spend, folded max_h, mined) the
+// stamp uses: delete_at_height = GREATEST(..) + 1 + CASE WHEN GREATEST(..) <=
+// p_checkpoint THEN 0 ELSE retention END. Keying the CASE on the same GREATEST is
+// the load-bearing safety invariant — a row qualifies for the immediate stamp only
+// when nothing about it (mine or any spend) sits above the boundary. The idempotent
+// bitmap fold is untouched. The sanctioned zero-spendable inline stamp in mined.go
+// is deliberately NOT changed: it keeps full retention (it never runs the sweep's
+// per-band boundary logic and its all-OP_RETURN txs are cheap to retain).
+const dahSweepProcVersion = 17
 
 // dahSweepControlDDL is the kill-switch / tunables / proc-version / per-CALL
 // outcome table. Created unconditionally in createSchemaInternal (plain DDL);
@@ -218,7 +231,8 @@ func dahSweepProcDDL() string {
 const dahSweepProcDDLWithPendingDeletes = `CREATE OR REPLACE PROCEDURE dah_sweep_batch(
     p_partition  INT,
     p_safe_tip   BIGINT,
-    p_retention  INT
+    p_retention  INT,
+    p_checkpoint BIGINT DEFAULT 0
 )
 LANGUAGE plpgsql
 AS $$
@@ -322,7 +336,10 @@ BEGIN
                                        AND t.preserve_until IS NULL
                                        AND t.unmined_since IS NULL
                                   THEN (GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), f.max_h),
-                                                 t.mined_at_height) + 1 + $3)::int
+                                                 t.mined_at_height) + 1
+                                        + CASE WHEN GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), f.max_h),
+                                                             t.mined_at_height) <= $5
+                                               THEN 0 ELSE $3 END)::int
                                   ELSE t.delete_at_height
                               END
                          FROM (SELECT CASE WHEN f.b_idx < octet_length(t.spent_bits)
@@ -362,7 +379,10 @@ BEGIN
                                        AND t.preserve_until IS NULL
                                        AND t.unmined_since IS NULL
                                   THEN (GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
-                                                 t.mined_at_height) + 1 + $3)::int
+                                                 t.mined_at_height) + 1
+                                        + CASE WHEN GREATEST(GREATEST(COALESCE(t.last_spend_height, 0), d.max_h),
+                                                             t.mined_at_height) <= $5
+                                               THEN 0 ELSE $3 END)::int
                                   ELSE t.delete_at_height
                               END
                          FROM (SELECT (SELECT decode(string_agg(lpad(to_hex(
@@ -437,7 +457,7 @@ BEGIN
         --   ins       — freshly stamped rows feed pending_deletes, same statement.
         -- Returns (stamped, band rows scanned, max height covered).
         EXECUTE v_sql
-        USING v_from, v_cap, p_retention, v_band_rows
+        USING v_from, v_cap, p_retention, v_band_rows, p_checkpoint
         INTO v_n, v_rows, v_max_h;
 
         -- Band ceiling: if the row cap truncated the band, only heights strictly
@@ -451,7 +471,7 @@ BEGIN
             v_to := v_max_h - 1;
         ELSE
             EXECUTE v_sql
-            USING v_from, v_max_h, p_retention, v_nolimit
+            USING v_from, v_max_h, p_retention, v_nolimit, p_checkpoint
             INTO v_n, v_rows, v_max_h;
 
             v_to := v_max_h;
@@ -571,6 +591,11 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 	// would otherwise leave the old overload behind, unused. Best-effort.
 	_, _ = s.pool.Exec(ctx, `DROP PROCEDURE IF EXISTS dah_sweep_batch(BIGINT, INT)`)
 
+	// Drop the v16 three-arg signature (INT, BIGINT, INT). v17 adds p_checkpoint
+	// with a DEFAULT, so leaving the old overload behind would make a 3-arg CALL
+	// ambiguous. All callers now pass 4 args; best-effort.
+	_, _ = s.pool.Exec(ctx, `DROP PROCEDURE IF EXISTS dah_sweep_batch(INT, BIGINT, INT)`)
+
 	if _, err = s.pool.Exec(ctx, dahSweepProcDDL()); err != nil {
 		if isInsufficientPrivilege(err) {
 			return errors.NewStorageError("[dahSweep] app role lacks CREATE privilege for the dah_sweep_batch procedure (42501); grant CREATE so the DAH sweep can run")
@@ -630,7 +655,7 @@ func (s *postgresPrunerService) runDAHCursorProc(ctx context.Context) {
 	// COMMIT-inside-CALL works. A wrapping transaction from pgx middleware raises
 	// 2D000. No Go fallback exists; log the root cause loudly.
 	smokeCtx, smokeCancel := context.WithTimeout(ctx, 5*time.Second)
-	_, smokeErr := s.store.maint().Exec(smokeCtx, `CALL dah_sweep_batch($1, $2, $3)`, 0, int64(-1), int32(0))
+	_, smokeErr := s.store.maint().Exec(smokeCtx, `CALL dah_sweep_batch($1, $2, $3, $4)`, 0, int64(-1), int32(0), int64(0))
 	smokeCancel()
 
 	if ctx.Err() != nil {
@@ -710,7 +735,7 @@ func (s *postgresPrunerService) runPartitionSweepLoop(ctx context.Context, parti
 			return
 		}
 
-		err := s.store.sweepOnePartition(ctx, partition, safeTip, retention)
+		err := s.store.sweepOnePartition(ctx, partition, safeTip, retention, s.store.earlyDAHSweepBoundary())
 		<-sem
 
 		if ctx.Err() != nil {
@@ -764,7 +789,14 @@ func (s *postgresPrunerService) runPartitionSweepLoop(ctx context.Context, parti
 // are logged, not fatal. Shared by the background cursor and Prune.
 func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, retention int32) int64 {
 	var before int64
-	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before)
+	baselineOK := true
+	if err := s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&before); err != nil {
+		// Without a valid baseline the delta is meaningless (a successful "after"
+		// read would report the entire cumulative counter as this pass's work). Log
+		// and report 0 for this pass rather than an inflated figure.
+		s.logger.Warnf("[dahSweep] could not read total_rows_stamped baseline; this pass's stamped count will report 0: %v", err)
+		baselineOK = false
+	}
 
 	// Bound how many partitions sweep at once. Each CALL scans cold partition pages
 	// from disk; firing all 8 at once thrashes a single contended/cold disk and is
@@ -781,6 +813,10 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 	}
 
 	sem := make(chan struct{}, concurrency)
+
+	// Read the early-DAH boundary once for this pass so every partition CALL uses
+	// a single consistent value (0 when the feature is off).
+	boundary := s.earlyDAHSweepBoundary()
 
 	var wg sync.WaitGroup
 
@@ -800,7 +836,7 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 				return
 			}
 
-			if err := s.sweepOnePartition(ctx, p, safeTip, retention); err != nil {
+			if err := s.sweepOnePartition(ctx, p, safeTip, retention, boundary); err != nil {
 				if ctx.Err() == nil {
 					s.logger.Warnf("[dahSweep] partition %d CALL error (SQLSTATE %s; retry next pass): %v", p, pgSQLState(err), err)
 					prometheusDAHSweepErrors.Inc()
@@ -812,9 +848,12 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 	wg.Wait()
 
 	var after int64
-	_ = s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&after)
+	if err := s.maint().QueryRow(ctx, `SELECT total_rows_stamped FROM dah_sweep_control WHERE id = 1`).Scan(&after); err != nil {
+		s.logger.Warnf("[dahSweep] could not read total_rows_stamped after sweep; stamped count reported as 0: %v", err)
+		return 0
+	}
 
-	if after >= before {
+	if baselineOK && after >= before {
 		return after - before
 	}
 
@@ -826,12 +865,24 @@ func (s *Store) sweepAllPartitionsOnce(ctx context.Context, safeTip int64, reten
 // band_heights heights), never by wall-clock. A 45-minute dense band runs for 45
 // minutes and commits. The CALL runs on the store lifetime ctx only, so shutdown
 // still cancels it cleanly; stall visibility is the stagnation monitor's job.
-func (s *Store) sweepOnePartition(ctx context.Context, partition int, safeTip int64, retention int32) error {
+func (s *Store) sweepOnePartition(ctx context.Context, partition int, safeTip int64, retention int32, boundary int64) error {
 	start := time.Now()
-	_, err := s.maint().Exec(ctx, `CALL dah_sweep_batch($1, $2, $3)`, partition, safeTip, retention)
+	_, err := s.maint().Exec(ctx, `CALL dah_sweep_batch($1, $2, $3, $4)`, partition, safeTip, retention, boundary)
 	prometheusDAHSweepCallDuration.Observe(time.Since(start).Seconds())
 
 	return err
+}
+
+// earlyDAHSweepBoundary returns the checkpoint boundary to pass to dah_sweep_batch:
+// the published early-DAH boundary when the EarlyDAHBelowCheckpoint feature is
+// enabled, else 0. A boundary of 0 makes the procedure stamp full retention for
+// every row — identical to v16 behaviour.
+func (s *Store) earlyDAHSweepBoundary() int64 {
+	if s.settings.UtxoStore.EarlyDAHBelowCheckpoint {
+		return int64(s.earlyDAHBoundary.Load())
+	}
+
+	return 0
 }
 
 // pgSQLState returns the postgres SQLSTATE code carried by err, or "" when err

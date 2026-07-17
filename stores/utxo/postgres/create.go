@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -783,9 +782,9 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 				return nil
 			}
 
-			if attempt < createBatchDeadlockRetries && isPgDeadlock(err) {
+			if attempt < pgDeadlockMaxRetries && isPgDeadlock(err) {
 				backoff := deadlockRetryBackoff(attempt)
-				s.logger.Warnf("[createBatched] postgres deadlock (40P01) on create-batch INSERT of %d rows, retry %d/%d after %s", hi-lo, attempt+1, createBatchDeadlockRetries, backoff)
+				s.logger.Warnf("[createBatched] postgres deadlock (40P01) on create-batch INSERT of %d rows, retry %d/%d after %s", hi-lo, attempt+1, pgDeadlockMaxRetries, backoff)
 
 				select {
 				case <-time.After(backoff):
@@ -880,37 +879,6 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// createBatchDeadlockRetries bounds how many times a create-batch INSERT is
-// retried after a Postgres deadlock (40P01) before the error propagates. This is
-// defence-in-depth: the create-vs-create deadlock's ROOT cause (the same block
-// committed twice in one window → its txs created concurrently) is fixed upstream
-// by de-duplicating the window (windowAccumulator.drainJob). The retry remains for
-// any residual concurrent same-key insert.
-const createBatchDeadlockRetries = 5
-
-// isPgDeadlock reports whether err is (or wraps) a Postgres deadlock, SQLSTATE
-// 40P01. Mirrors the pgconn.PgError code check used elsewhere in this store.
-func isPgDeadlock(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "40P01"
-}
-
-// deadlockRetryBackoff is an exponential backoff with full jitter for deadlock
-// retries: attempt 0 → up to 10ms, doubling per attempt, capped at 500ms. The
-// jitter desynchronises multiple deadlocked batchers so their retries do not
-// re-collide in lockstep (a fixed backoff would just re-deadlock together).
-func deadlockRetryBackoff(attempt int) time.Duration {
-	const base = 10 * time.Millisecond
-	const maxBackoff = 500 * time.Millisecond
-
-	window := base << attempt //nolint:gosec // attempt is bounded by createBatchDeadlockRetries
-	if window > maxBackoff || window <= 0 {
-		window = maxBackoff
-	}
-
-	return time.Duration(rand.Int64N(int64(window)) + 1)
-}
 
 // buildCreateMeta populates the meta.Data from computed values.
 func (s *Store) buildCreateMeta(txMeta *meta.Data, options *utxo.CreateOptions, isCoinbase bool, blockHeight uint32) *meta.Data {

@@ -102,11 +102,49 @@ func (s *postgresPrunerService) AddObserver(observer pruner.Observer) {
 	s.observers = append(s.observers, observer)
 }
 
-// Prune removes transactions marked for deletion at or before the specified height.
+// Prune deletes rows with delete_at_height at or below the trigger height minus
+// PruneDeleteMarginBlocks (the crash-replay margin — see below); it does not
+// delete everything at or before the raw trigger height.
 func (s *postgresPrunerService) Prune(ctx context.Context, blockHeight uint32, blockHashStr string) (int64, error) {
 	if blockHeight == 0 {
 		return 0, errors.NewProcessingError("cannot prune at block height 0")
 	}
+
+	// Crash-replay moat (2026-07-17 RAM-footprint design, Task 7): only rows
+	// whose DAH is at least margin blocks below the trigger are deleted, so no
+	// pipeline replaying work near the trigger watermark can reference a
+	// deleted parent. Applies uniformly to retention-stamped and early-stamped
+	// rows. blockHeight is adjusted ONCE, here, at the top of Prune — every
+	// downstream height use (the EXISTS probe, deleteTombstoned, the batch
+	// fetch) reads this same parameter, so the margin applies everywhere.
+	//
+	// A negative setting is a misconfiguration, not a "no margin" request: cast
+	// straight to uint32 it wraps to a huge value, making blockHeight <= margin
+	// true forever, so Prune would no-op on every call — silently disabling the
+	// pruner (the exact failure class that has filled a disk in production
+	// before). Clamp to 0 instead and say so once per call, loud enough to find.
+	//
+	// A huge POSITIVE setting is the mirror-image failure: it needs no integer
+	// wrap to cause the exact same silent-no-op-forever outcome, since
+	// blockHeight <= margin is simply true until the chain grows past the
+	// misconfigured value (e.g. margin=100000 on a chain at height 50000 never
+	// deletes anything). Clamp to maxPruneDeleteMarginBlocks and say so, same as
+	// the negative case, so deletes resume once the chain clears a sane bound
+	// instead of staying disabled for the life of the chain.
+	marginSetting := s.store.settings.UtxoStore.PruneDeleteMarginBlocks
+	switch {
+	case marginSetting < 0:
+		s.logger.Infof("[pruner] WARNING: PruneDeleteMarginBlocks is negative (%d); clamping to 0 -- a negative value would otherwise wrap to a huge margin and silently stop all deletes", marginSetting)
+		marginSetting = 0
+	case marginSetting > maxPruneDeleteMarginBlocks:
+		s.logger.Infof("[pruner] WARNING: PruneDeleteMarginBlocks (%d) exceeds the maximum of %d; clamping -- an excessive margin would otherwise make blockHeight <= margin true for the life of the chain, silently stopping all deletes", marginSetting, maxPruneDeleteMarginBlocks)
+		marginSetting = maxPruneDeleteMarginBlocks
+	}
+	margin := uint32(marginSetting) //nolint:gosec // clamped non-negative and bounded above
+	if blockHeight <= margin {
+		return 0, nil // nothing can be old enough yet
+	}
+	blockHeight -= margin
 
 	startTime := time.Now()
 
@@ -227,6 +265,15 @@ func (s *postgresPrunerService) deleteTombstoned(ctx context.Context, blockHeigh
 // path); a 10000-hash batch keeps each set-based cascade one bounded leaf index
 // scan while minimising round trips.
 const pruneDeleteWorkers = 8
+
+// maxPruneDeleteMarginBlocks upper-bounds PruneDeleteMarginBlocks. Without a
+// cap, a misconfigured huge positive margin makes `blockHeight <= margin` true
+// for the life of the chain, silently disabling every delete -- the same
+// "pruner silently stops, disk fills" incident class as the negative-margin
+// wrap, just approached from the other sign. 1000 is a generous multiple of
+// the production default (32) while still guaranteeing deletes resume well
+// before the chain grows enough for the misconfiguration to matter.
+const maxPruneDeleteMarginBlocks = 1000
 
 // pruneDeleteBatchSize bounds each cascade batch (one short transaction), which
 // releases the maintenance pool connection between batches so stamping and other
@@ -369,9 +416,9 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 		default:
 		}
 
-		n, err := s.deleteTombstonedBatch(ctx, doomedSQL, cascadeSQL, blockHeight)
+		n, err := s.deleteTombstonedBatchWithRetry(ctx, doomedSQL, cascadeSQL, blockHeight, txsLeaf)
 		if err != nil {
-			return deleted, errors.NewStorageError("[pruner] cascade delete %s", txsLeaf, err)
+			return deleted, err
 		}
 		deleted += n
 		// A short batch means the partition is drained.
@@ -381,6 +428,42 @@ func (s *postgresPrunerService) deleteTombstonedPartition(ctx context.Context, p
 	}
 
 	return deleted, nil
+}
+
+// deleteTombstonedBatchWithRetry wraps deleteTombstonedBatch with a bounded,
+// jittered retry on a Postgres deadlock (SQLSTATE 40P01). Concurrent cascade-delete
+// workers across partitions (and a concurrent Unspend/reconcile touching the same
+// spends/txs rows) can deadlock; Postgres aborts one side and rolls its transaction
+// back entirely, so a retry that lands after the winner commits succeeds — the same
+// remedy as the create-batch and SetMinedMulti retry sites (deadlock.go).
+//
+// Retrying the WHOLE batch (not a sub-piece of it) is the only sound option here,
+// and it is safe: deleteTombstonedBatch is one pgx transaction (BEGIN..COMMIT) that
+// is entirely rolled back on any error (the deferred Rollback fires; Commit is never
+// reached), so a deadlocked attempt persists nothing — there is no partial state to
+// reconcile. A retry re-runs phase 1's `SELECT ... FOR UPDATE` from scratch, which
+// re-authorises the batch against CURRENT ground truth: the FOR UPDATE lock means a
+// concurrent Unspend revival (which deletes the pending_deletes row before the
+// pruner's SELECT can lock it) is either fully visible to the retry's fresh SELECT
+// (the hash is simply absent, so it is not re-deleted) or was blocked behind the
+// prior attempt's row lock and is resolved one way or the other before the retry's
+// SELECT runs. Either way the retry authorises its delete against a fresh read, the
+// same authority a first attempt would have had — never a stale, already-rolled-back
+// candidate list.
+func (s *postgresPrunerService) deleteTombstonedBatchWithRetry(ctx context.Context, doomedSQL, cascadeSQL string, blockHeight uint32, txsLeaf string) (int64, error) {
+	n, err := retryOnPgDeadlock(ctx,
+		func() (int64, error) {
+			return s.deleteTombstonedBatch(ctx, doomedSQL, cascadeSQL, blockHeight)
+		},
+		func(attemptNum int, backoff time.Duration) {
+			s.store.logger.Warnf("[pruner] postgres deadlock (40P01) on cascade delete batch %s, retry %d/%d after %s", txsLeaf, attemptNum, pgDeadlockMaxRetries, backoff)
+		},
+	)
+	if err != nil {
+		return 0, errors.NewStorageError("[pruner] cascade delete %s", txsLeaf, err)
+	}
+
+	return n, nil
 }
 
 // deleteTombstonedBatch runs one page-ordered cascade batch in its own short

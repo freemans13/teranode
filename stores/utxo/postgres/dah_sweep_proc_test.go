@@ -446,11 +446,12 @@ func TestDAHSweepProcSkipsWatermarkOnLockContention(t *testing.T) {
 	require.Equal(t, safeTip, wmAfter, "after lock release the watermark must reach safe tip")
 }
 
-// TestBootstrapInstallsV16SpentBitmapProc verifies that the bootstrapped
-// procedure is the v16 spent-bitmap fold: version recorded as 16, stamp gate on
+// TestBootstrapInstallsV17SpentBitmapProc verifies that the bootstrapped
+// procedure is the v17 spent-bitmap fold: version recorded as 17, stamp gate on
 // bit_count(spent_bits), no spent_progress counter reference anywhere, and (kept
-// from v14) no in-proc lock_timeout.
-func TestBootstrapInstallsV16SpentBitmapProc(t *testing.T) {
+// from v14) no in-proc lock_timeout. v17 adds the p_checkpoint boundary parameter
+// (below-checkpoint immediate DAH) without touching the bitmap fold.
+func TestBootstrapInstallsV17SpentBitmapProc(t *testing.T) {
 	store, ctx := setupTestStore(t)
 
 	var version int
@@ -458,7 +459,7 @@ func TestBootstrapInstallsV16SpentBitmapProc(t *testing.T) {
 		`SELECT proc_version FROM dah_sweep_control WHERE id = 1`).Scan(&version)
 	require.NoError(t, err)
 	require.Equal(t, dahSweepProcVersion, version)
-	require.Equal(t, 16, version)
+	require.Equal(t, 17, version)
 
 	var src string
 	err = store.pool.QueryRow(ctx,
@@ -475,7 +476,7 @@ func TestSweepOnePartitionRunsWithoutDeadline(t *testing.T) {
 	// safeTip=-1 is the documented no-op smoke value: the CALL returns immediately.
 	// The contract under test: sweepOnePartition exists, takes NO timeout, and
 	// surfaces the CALL error verbatim (nil here).
-	err := store.sweepOnePartition(ctx, 0, -1, 0)
+	err := store.sweepOnePartition(ctx, 0, -1, 0, 0)
 	require.NoError(t, err)
 }
 
@@ -518,7 +519,7 @@ func TestDAHProc_RowBoundedBandBoundary(t *testing.T) {
 
 	// Band 1: 4 of the 5 spends (3@100 + one of the two @101) → row-truncated.
 	// Watermark must land at max_h - 1 = 100, NOT at the band cap.
-	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret))
+	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret, 0))
 	require.Equal(t, int64(100), watermarkOfPartition(t, store, ctx, part),
 		"row-truncated band must advance the watermark to max_h - 1 (boundary height re-folds next band)")
 	require.Equal(t, 4, spentBitCountOfTx(t, store, ctx, parent), "4 of 5 bits folded in band 1")
@@ -526,7 +527,7 @@ func TestDAHProc_RowBoundedBandBoundary(t *testing.T) {
 
 	// Band 2: re-folds the boundary height 101 (2 spends, one a duplicate OR) →
 	// converges with no drift and no missed spend, and drains to the safe tip.
-	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret))
+	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret, 0))
 	require.Equal(t, safeTip, watermarkOfPartition(t, store, ctx, part),
 		"boundary re-fold band must reach the safe tip")
 	require.Equal(t, buildSpentBits(5, 0, 1, 2, 3, 4), spentBitsOfTx(t, store, ctx, parent),
@@ -565,14 +566,14 @@ func TestDAHProc_SingleHeightFullDrain(t *testing.T) {
 	part := partitionOfTx(t, store, ctx, parent)
 
 	// CALL 1: row-truncated at max_h=100 → watermark advances to max_h-1 = 99.
-	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret))
+	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret, 0))
 	require.Equal(t, int64(99), watermarkOfPartition(t, store, ctx, part))
 	require.Nil(t, dahOfTx(t, store, ctx, parent))
 
 	// CALL 2: the dense height is now the boundary (max_h-1 = watermark) → full
 	// drain of height 100 in ONE band, watermark = that height, bitmap complete,
 	// stamp fires.
-	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret))
+	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret, 0))
 	require.Equal(t, int64(100), watermarkOfPartition(t, store, ctx, part),
 		"single dense height must be full-drained as one band with the watermark landing on it")
 	require.Equal(t, buildSpentBits(5, 0, 1, 2, 3, 4), spentBitsOfTx(t, store, ctx, parent),
@@ -583,7 +584,7 @@ func TestDAHProc_SingleHeightFullDrain(t *testing.T) {
 	require.Equal(t, int64(100)+1+int64(ret), *dah)
 
 	// CALL 3: the remaining empty range drains to the safe tip.
-	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret))
+	require.NoError(t, store.sweepOnePartition(ctx, part, safeTip, ret, 0))
 	require.Equal(t, safeTip, watermarkOfPartition(t, store, ctx, part))
 }
 

@@ -78,6 +78,51 @@ import (
 
 var availableDatabases = map[string]func(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, url *url.URL) (utxo.Store, error){}
 
+// earlyDAHBoundarySetter is implemented by stores supporting below-checkpoint
+// early-DAH (currently the postgres store). This is a genuine optional
+// interface, checked via type assertion below — unlike SupportsOutpointOnlySpend,
+// which is a required method on the utxo.Store interface itself (always
+// present, never asserted for). A store that doesn't implement
+// earlyDAHBoundarySetter simply leaves the boundary unset; a store wrapped by
+// stores/utxo/logger.Store gets this forwarded to the wrapped store (see that
+// package's SetEarlyDAHBoundary), so logging wrapping does not by itself
+// disarm the feature.
+type earlyDAHBoundarySetter interface{ SetEarlyDAHBoundary(uint32) }
+
+// maybeLatchEarlyDAHBoundary returns true (latched) when the main chain's
+// header at the highest hardcoded checkpoint height matches the pinned hash,
+// after publishing that height to the store. Fail-safe: any error, missing
+// header, or hash mismatch leaves the boundary unset and returns false —
+// full retention everywhere, identical to today.
+func maybeLatchEarlyDAHBoundary(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, client blockchain.ClientI, store any) bool {
+	if !tSettings.UtxoStore.EarlyDAHBelowCheckpoint {
+		return true // feature off: latch permanently closed, stop probing
+	}
+
+	setter, ok := store.(earlyDAHBoundarySetter)
+	if !ok {
+		return true // store cannot use it, stop probing
+	}
+
+	checkpoints := tSettings.ChainCfgParams.Checkpoints
+	highest := model.HighestCheckpointHeight(checkpoints)
+	pinned := model.HighestCheckpointHash(checkpoints)
+
+	if highest == 0 || pinned == nil {
+		return true // chain has no checkpoints (e.g. teratestnet): stop probing
+	}
+
+	headers, _, err := client.GetBlockHeadersFromHeight(ctx, highest, 1)
+	if err != nil || len(headers) == 0 || !headers[0].Hash().IsEqual(pinned) {
+		return false // not confirmed yet — probe again on a later notification
+	}
+
+	setter.SetEarlyDAHBoundary(highest)
+	logger.Infof("[UTXOStore] early-DAH boundary latched at checkpoint height %d", highest)
+
+	return true
+}
+
 // NewStore creates a new UTXO store implementation based on the settings.
 // The source parameter is used for logging purposes.
 // The startBlockchainListener parameter controls whether to set up automatic
@@ -157,6 +202,8 @@ func NewStore(ctx context.Context, logger ulogger.Logger, tSettings *settings.Se
 				logger.Infof("[UTXOStore] skipping block height initialization for %s (height is 0)", source)
 			}
 
+			earlyDAHLatched := maybeLatchEarlyDAHBoundary(ctx, logger, tSettings, blockchainClient, utxoStore)
+
 			logger.Infof("[UTXOStore] starting block height subscription for: %s", source)
 
 			go func() {
@@ -186,6 +233,10 @@ func NewStore(ctx context.Context, logger ulogger.Logger, tSettings *settings.Se
 								}
 							} else {
 								logger.Infof("[UTXOStore] skipping block height update for %s (height is 0)", source)
+							}
+
+							if !earlyDAHLatched {
+								earlyDAHLatched = maybeLatchEarlyDAHBoundary(ctx, logger, tSettings, blockchainClient, utxoStore)
 							}
 						}
 					}

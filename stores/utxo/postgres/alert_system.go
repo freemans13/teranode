@@ -169,6 +169,16 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 	if _, err := voutToInt32(utxoSpend.Vout); err != nil {
 		return err
 	}
+	// utxoSpend.TxID and newUtxo.UTXOHash are dereferenced ([:]) in the UPDATE
+	// below; guard them so a malformed caller yields InvalidArgument rather than an
+	// externally-reachable nil-pointer panic (matching the guards in freezeReject
+	// and GetSpend).
+	if utxoSpend.TxID == nil {
+		return errors.NewInvalidArgumentError("[ReAssignUTXO] utxoSpend.TxID must not be nil")
+	}
+	if newUtxo == nil || newUtxo.UTXOHash == nil {
+		return errors.NewInvalidArgumentError("[ReAssignUTXO] newUtxo.UTXOHash must not be nil")
+	}
 	// The source UTXO must be frozen to be reassigned. That precondition is
 	// enforced by the guarded UPDATE below (get_bit = 1 in the WHERE), so there is
 	// no separate frozen-check read that could race with a concurrent unfreeze.
