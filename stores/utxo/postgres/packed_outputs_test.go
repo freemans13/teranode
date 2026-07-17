@@ -76,22 +76,23 @@ func TestPackedOutputEncodingAgreesWithSQL(t *testing.T) {
 		}
 		require.Equal(t, int32(count), p.outCount, "count=%d", count)
 		require.Equal(t, int32(wantSpendable), p.spendableCount, "count=%d", count)
-		require.Len(t, p.utxoHashes, count*32, "count=%d: 32-byte stride", count)
+		require.Len(t, p.utxoHashes, count*16, "count=%d: 16-byte stride", count)
 		require.Len(t, p.spendableBits, (count+7)/8, "count=%d: bytes rounded up", count)
 
 		for i := 0; i < count; i++ {
-			// 32-byte stride: SQL substr (1-based) must return exactly the
-			// utxo hash Go packed at offset i*32 — and both must equal the
-			// independently computed per-output UTXO hash.
+			// 16-byte stride: SQL substr (1-based) must return exactly the
+			// 16-byte utxo-hash prefix Go packed at offset i*16 — and both must
+			// equal the first 16 bytes of the independently computed per-output
+			// UTXO hash (utxo_hashes stores a 128-bit prefix, not the full hash).
 			expected, err := util.UTXOHashFromOutput(txHash, tx.Outputs[i], uint32(i))
 			require.NoError(t, err)
 
 			var sqlHash []byte
 			require.NoError(t, pool.QueryRow(ctx,
-				`SELECT substr($1::bytea, $2::int * 32 + 1, 32)`,
+				`SELECT substr($1::bytea, $2::int * 16 + 1, 16)`,
 				p.utxoHashes, i).Scan(&sqlHash))
-			require.Equal(t, expected[:], sqlHash, "count=%d vout=%d: substr stride mismatch", count, i)
-			require.Equal(t, expected[:], p.utxoHashes[i*32:(i+1)*32], "count=%d vout=%d: Go slice stride mismatch", count, i)
+			require.Equal(t, expected[:16], sqlHash, "count=%d vout=%d: substr stride mismatch", count, i)
+			require.Equal(t, expected[:16], p.utxoHashes[i*16:(i+1)*16], "count=%d vout=%d: Go slice stride mismatch", count, i)
 
 			// Bitmap: SQL get_bit must agree with the intended flag and with
 			// Go's getPackedBit reader.

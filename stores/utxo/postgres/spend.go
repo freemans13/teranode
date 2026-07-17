@@ -62,7 +62,8 @@ func blockHeightToInt32(height uint32) (int32, error) {
 // computation by Worker 2.
 //
 // Packed form: per-output access is O(1) byte arithmetic — utxo_hash is a
-// 32-byte substr at offset $2*32 (substr is 1-based), frozen/spendable flags
+// 16-byte substr at offset $2*16 (substr is 1-based; the stored 128-bit prefix
+// is compared against the caller hash's first 16 bytes), frozen/spendable flags
 // are get_bit() bitmap probes, coinbase_spending_height is a scalar. The WHERE
 // clause requires $2 < t.out_count, so a missing tx OR an OOB index both
 // produce 0 RETURNING rows — diagnosed by diagnoseSpendFailure. get_bit is
@@ -71,7 +72,7 @@ func blockHeightToInt32(height uint32) (int32, error) {
 const spendValidationSQL = `
 WITH validation AS (
     SELECT
-        substr(t.utxo_hashes, $2::int * 32 + 1, 32) AS utxo_hash,
+        substr(t.utxo_hashes, $2::int * 16 + 1, 16) AS utxo_hash,
         (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1) AS output_frozen,
         -- An output is only spendable if its out_spendables bit is set. A non-spendable
         -- output (e.g. OP_RETURN) still has a utxo_hash stored, so the hash match alone
@@ -140,7 +141,7 @@ SELECT 1 FROM inserted
 // (0 rows) when the tx is missing OR the index is OOB — both are TxNotFound.
 const spendDiagnosticSQL = `
 SELECT
-    substr(t.utxo_hashes, $2::int * 32 + 1, 32) AS utxo_hash,
+    substr(t.utxo_hashes, $2::int * 16 + 1, 16) AS utxo_hash,
     (t.out_frozens IS NOT NULL AND get_bit(t.out_frozens, $2::int) = 1) AS output_frozen,
     (t.out_spendables IS NOT NULL AND get_bit(t.out_spendables, $2::int) = 1) AS output_spendable,
     CASE WHEN array_length(t.spendable_ins, 1) >= $2::int + 1 THEN t.spendable_ins[$2::int + 1] END AS spendable_in,
@@ -344,13 +345,13 @@ func (s *Store) spendDirect(ctx context.Context, spends []*utxo.Spend, blockHeig
 			).Scan(&inserted)
 		} else {
 			err = s.pool.QueryRow(ctx, spendValidationSQL,
-				spend.TxID[:],      // $1 prev_tx_hash
-				int32(spend.Vout),  // $2 prev_output_idx (INT4; range-checked in Spend)
-				spendingDataBytes,  // $3 spending_data
-				spend.UTXOHash[:],  // $4 expected_utxo_hash
-				int32(blockHeight), // $5 blockHeight (also written to INT4 spent_at_height)
-				ignoreLocked,       // $6 ignoreLocked
-				ignoreConflicting,  // $7 ignoreConflicting
+				spend.TxID[:],       // $1 prev_tx_hash
+				int32(spend.Vout),   // $2 prev_output_idx (INT4; range-checked in Spend)
+				spendingDataBytes,   // $3 spending_data
+				spend.UTXOHash[:16], // $4 expected_utxo_hash (16-byte prefix — utxo_hashes stores 16)
+				int32(blockHeight),  // $5 blockHeight (also written to INT4 spent_at_height)
+				ignoreLocked,        // $6 ignoreLocked
+				ignoreConflicting,   // $7 ignoreConflicting
 			).Scan(&inserted)
 		}
 
@@ -460,7 +461,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		} else {
 			err = s.pool.QueryRow(ctx, spendValidationSQL,
 				item.spend.TxID[:], int32(item.spend.Vout),
-				item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:],
+				item.spend.SpendingData.Bytes(), item.spend.UTXOHash[:16],
 				int32(item.blockHeight), item.ignoreLocked, item.ignoreConflicting,
 			).Scan(&inserted)
 		}
@@ -508,7 +509,7 @@ func (s *Store) trySendSpendBatch(batch []*batchSpendItem) (retryable bool) {
 		prevTxHashes[i] = item.spend.TxID[:]
 		prevIdxs[i] = int32(item.spend.Vout)
 		spendingDatas[i] = item.spend.SpendingData.Bytes()
-		utxoHashes[i] = item.spend.UTXOHash[:]
+		utxoHashes[i] = item.spend.UTXOHash[:16] // utxo_hashes stores a 16-byte prefix
 		blockHeights[i] = int32(item.blockHeight)
 		ignLockeds[i] = item.ignoreLocked
 		ignConflictings[i] = item.ignoreConflicting
@@ -681,10 +682,10 @@ validated AS (
     SELECT i.batch_idx, i.prev_tx_hash, i.prev_idx, i.spending_data, i.expected_utxo_hash,
            i.block_height, i.ign_locked, i.ign_conflicting, i.skip_hash,
            -- utxo_hash is computed ONLY when the row actually compares it: with
-           -- skip_hash the 32-byte slice (and its detoast on wide parents) is
+           -- skip_hash the 16-byte slice (and its detoast on wide parents) is
            -- dead work on every below-checkpoint spend. Bounds classification
            -- moved to slot_in_bounds so this can be NULL without ambiguity.
-           CASE WHEN NOT i.skip_hash AND i.prev_idx::int < t.out_count THEN substr(t.utxo_hashes, i.prev_idx::int * 32 + 1, 32) END AS utxo_hash,
+           CASE WHEN NOT i.skip_hash AND i.prev_idx::int < t.out_count THEN substr(t.utxo_hashes, i.prev_idx::int * 16 + 1, 16) END AS utxo_hash,
            (i.prev_idx::int < t.out_count AND t.utxo_hashes IS NOT NULL) AS slot_in_bounds,
            CASE WHEN i.prev_idx::int < t.out_count AND t.out_frozens IS NOT NULL THEN get_bit(t.out_frozens, i.prev_idx::int) = 1 ELSE false END AS out_frozen,
            -- Spendable bit: a non-spendable output (OP_RETURN) carries a utxo_hash but
@@ -801,7 +802,8 @@ func (s *Store) diagnoseSpendFailure(ctx context.Context, spend *utxo.Spend, spe
 	}
 
 	// Check UTXO hash mismatch (skipped on below-checkpoint outpoint-only path).
-	if !skipUTXOHashCheck && !bytes.Equal(utxoHashBytes, spend.UTXOHash[:]) {
+	// utxo_hashes stores a 16-byte prefix, so compare the caller hash's first 16.
+	if !skipUTXOHashCheck && !bytes.Equal(utxoHashBytes, spend.UTXOHash[:16]) {
 		return errors.NewUtxoHashMismatchError("[Spend] utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 	}
 

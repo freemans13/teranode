@@ -241,7 +241,7 @@ func TestPrunableUnminedTxIterator_ExplainShowsIndexScan(t *testing.T) {
 	q := `
 		EXPLAIN (FORMAT TEXT)
 		SELECT t.hash, t.fee, t.size_in_bytes, t.inserted_at, t.coinbase,
-		       t.locked, pu.unmined_since, t.raw_tx, t.block_ids
+		       t.locked, pu.unmined_since, t.raw_tx, t.mined_info
 		FROM pending_unmined pu
 		JOIN txs t ON t.hash = pu.hash
 		WHERE pu.unmined_since <= $1

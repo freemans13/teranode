@@ -108,7 +108,7 @@ func TestUnsetMinedClearsDAHOnPartialReorg(t *testing.T) {
 		nBlocks int
 	)
 	require.NoError(t, store.pool.QueryRow(ctx,
-		`SELECT delete_at_height, COALESCE(array_length(block_ids, 1), 0) FROM txs WHERE hash = $1`,
+		`SELECT delete_at_height, COALESCE(octet_length(mined_info), 0) / 12 FROM txs WHERE hash = $1`,
 		h[:]).Scan(&dah, &nBlocks))
 	require.Equal(t, 1, nBlocks, "one block should remain (partial reorg)")
 	require.Nil(t, dah, "partial reorg must clear delete_at_height unconditionally")

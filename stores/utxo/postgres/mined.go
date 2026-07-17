@@ -19,9 +19,9 @@ import (
 const minedChunkSize = 2000
 
 // SetMinedMulti updates the block ID for multiple transactions that have been mined.
-// Normal path: single UPDATE on txs with array append.
-// UnsetMined path (reorg): read arrays, remove entry in Go, write back.
-// Returns a map of each hash to its list of block_ids.
+// Normal path: single UPDATE on txs appending one 12-byte mined_info record.
+// UnsetMined path (reorg): a single atomic UPDATE re-aggregates mined_info minus
+// the removed record. Returns a map of each hash to its list of block IDs.
 func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	startTime := time.Now()
 	defer func() {
@@ -50,14 +50,16 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	defer conn.Release()
 
 	// Queue UPDATE chunks.
-	// Idempotent block append: a `block_ids @> $2` containment guard skips the
-	// append (on all three parallel arrays together, so they stay index-aligned)
-	// when this block id is already recorded. Re-processing the same block for the
-	// same tx (crash-recovery replay, retry, duplicate call) is then a no-op rather
-	// than appending a duplicate (block_id, block_height, subtree_idx) triple that
-	// Get/BatchDecorate would surface verbatim. Mirrors the aerospike (blockExists)
-	// and sql (ON CONFLICT DO NOTHING) stores, and the create.go conflicting-children
-	// @> pattern.
+	// Idempotent block append: a STRIDE-ALIGNED containment guard skips the append
+	// when this block id is already recorded. mined_info is a flat bytea of fixed
+	// 12-byte records (block_id||height||subtree_idx, each int4 big-endian), so the
+	// guard matches int4send($2) only at record-aligned offsets (0,12,24,...) via
+	// generate_series — NEVER a bare position()/strpos, which could false-match a
+	// block-id byte pattern that straddles two adjacent records. Re-processing the
+	// same block for the same tx (crash-recovery replay, retry, duplicate call) is
+	// then a no-op rather than appending a duplicate record that Get/BatchDecorate
+	// would surface verbatim. Mirrors the aerospike (blockExists) and sql (ON CONFLICT
+	// DO NOTHING) stores, and the create.go conflicting-children @> pattern.
 	retention := int32(s.settings.GetUtxoStoreBlockHeightRetention()) //nolint:gosec // small positive height delta
 
 	var updateSQL string
@@ -102,24 +104,34 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		// mined_at_height is the height of the block this tx is mined into
 		// (minedBlockInfo.BlockHeight), bound as $5 — NOT the store's current
 		// chain tip. Binding it as a parameter (a) keeps mined_at_height
-		// consistent with the block_heights entry appended in $3 even under
-		// concurrent SetBlockHeight, and (b) preserves a single prepared-plan
+		// consistent with the height packed into the mined_info record ($3) even
+		// under concurrent SetBlockHeight, and (b) preserves a single prepared-plan
 		// cache entry across heights (a literal would re-plan per height).
 		//
 		// The UPDATE is wrapped in a CTE so that any fully-spent tx that gets an inline
 		// DAH stamp is also upserted into pending_deletes in the same statement. The
-		// outer SELECT returns hash, block_ids so the drain loop is unchanged.
+		// outer SELECT returns hash, mined_info so the drain loop is unchanged.
 		//
 		// FROM unnest(...) JOIN instead of WHERE hash = ANY(...): with = ANY on the
 		// hash-partitioned parent every probe descended ALL 8 leaf pkey btrees
 		// (measured: ~4.9 index descents per looked-up row across the hot path);
 		// the unnest nested-loop join drives per-row runtime partition pruning, so
 		// each hash descends exactly its own leaf.
+		//
+		// $2/$3/$4 are the scalar block_id/height/subtree_idx; the append builds one
+		// 12-byte record int4send($2)||int4send($3)||int4send($4). The dedupe guard
+		// scans record-aligned 4-byte block-id slices (offsets 0,12,24,...) so a
+		// value straddling two records can never false-match (see the comment above).
 		updateSQL = `WITH upd AS (
 				UPDATE txs SET
-					block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-					block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-					subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
+					mined_info = CASE
+						WHEN COALESCE(octet_length(mined_info), 0) > 0 AND EXISTS (
+							SELECT 1 FROM generate_series(0, octet_length(mined_info) / 12 - 1) AS g(i)
+							WHERE substr(mined_info, g.i * 12 + 1, 4) = int4send($2)
+						)
+						THEN mined_info
+						ELSE COALESCE(mined_info, ''::bytea) || int4send($2) || int4send($3) || int4send($4)
+					END,
 					locked = false, unmined_since = NULL,
 					mined_at_height = $5,
 					delete_at_height = CASE
@@ -132,23 +144,28 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 					END
 				FROM unnest($1::bytea[]) AS h(v)
 				WHERE txs.hash = h.v
-				RETURNING txs.hash, block_ids, delete_at_height
+				RETURNING txs.hash, mined_info, delete_at_height
 			),
 			_pd AS (
 				INSERT INTO pending_deletes (hash, delete_at_height)
 				SELECT hash, delete_at_height FROM upd WHERE delete_at_height IS NOT NULL
 				ON CONFLICT (hash) DO UPDATE SET delete_at_height = EXCLUDED.delete_at_height
 			)
-			SELECT hash, block_ids FROM upd`
+			SELECT hash, mined_info FROM upd`
 	} else {
 		updateSQL = `UPDATE txs SET
-			block_ids = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_ids ELSE COALESCE(block_ids, '{}') || $2::int[] END,
-			block_heights = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN block_heights ELSE COALESCE(block_heights, '{}') || $3::int[] END,
-			subtree_idxs = CASE WHEN COALESCE(block_ids, '{}') @> $2::int[] THEN subtree_idxs ELSE COALESCE(subtree_idxs, '{}') || $4::int[] END,
+			mined_info = CASE
+				WHEN COALESCE(octet_length(mined_info), 0) > 0 AND EXISTS (
+					SELECT 1 FROM generate_series(0, octet_length(mined_info) / 12 - 1) AS g(i)
+					WHERE substr(mined_info, g.i * 12 + 1, 4) = int4send($2)
+				)
+				THEN mined_info
+				ELSE COALESCE(mined_info, ''::bytea) || int4send($2) || int4send($3) || int4send($4)
+			END,
 			locked = false
 		FROM unnest($1::bytea[]) AS h(v)
 		WHERE txs.hash = h.v
-		RETURNING txs.hash, block_ids`
+		RETURNING txs.hash, mined_info`
 	}
 
 	chunkArgsList := make([][]interface{}, 0, (len(hashes)+minedChunkSize-1)/minedChunkSize)
@@ -164,9 +181,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		}
 		args := []interface{}{
 			hashBytes,
-			[]int32{int32(minedBlockInfo.BlockID)},
-			[]int32{int32(minedBlockInfo.BlockHeight)},
-			[]int32{int32(minedBlockInfo.SubtreeIdx)},
+			int32(minedBlockInfo.BlockID),     // $2 block_id (packed via int4send)
+			int32(minedBlockInfo.BlockHeight), // $3 height
+			int32(minedBlockInfo.SubtreeIdx),  // $4 subtree_idx
 		}
 		if minedBlockInfo.OnLongestChain {
 			// $5: mined_at_height — the block height this tx is mined into
@@ -189,10 +206,10 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	// 40P01 the whole chunk batch is atomically a no-op, not a partial one; the
 	// correct retry unit is the WHOLE batch, not a single chunk within it, and there
 	// is nothing partial to reconcile. Retrying is safe: each UPDATE is idempotent
-	// via the `block_ids @> $2` containment guard (see the comment above updateSQL)
-	// — re-appending the same (block_id, block_height, subtree_idx) triple is a
-	// no-op, so re-running the full set of chunks from scratch reproduces the same
-	// end state whether this is attempt 1 or attempt N.
+	// via the stride-aligned mined_info containment guard (see the comment above
+	// updateSQL) — re-appending the same 12-byte (block_id, height, subtree_idx)
+	// record is a no-op, so re-running the full set of chunks from scratch reproduces
+	// the same end state whether this is attempt 1 or attempt N.
 	batchRes, err := retryOnPgDeadlock(ctx,
 		func() (minedUpdateBatchResult, error) {
 			return s.attemptSetMinedUpdateBatch(ctx, conn, updateSQL, chunkArgsList)
@@ -263,9 +280,10 @@ func (s *Store) attemptSetMinedUpdateBatch(ctx context.Context, conn *pgxpool.Co
 	br := conn.SendBatch(ctx, batch)
 
 	// Drain each UPDATE chunk's RETURNING rows straight into the result map —
-	// the post-update block_ids come back on the UPDATE itself, so no separate
-	// verification SELECT (a second full = ANY probe pass over all partitions,
-	// measured as a top-10 CPU consumer) is needed.
+	// the post-update mined_info bytea comes back on the UPDATE itself (decoded to
+	// the block-id list here), so no separate verification SELECT (a second full
+	// = ANY probe pass over all partitions, measured as a top-10 CPU consumer) is
+	// needed.
 	for i := range chunkArgsList {
 		rows, err := br.Query()
 		if err != nil {
@@ -274,19 +292,15 @@ func (s *Store) attemptSetMinedUpdateBatch(ctx context.Context, conn *pgxpool.Co
 		}
 		for rows.Next() {
 			var h []byte
-			var bids []int32
-			if err := rows.Scan(&h, &bids); err != nil {
+			var minedInfo []byte
+			if err := rows.Scan(&h, &minedInfo); err != nil {
 				rows.Close()
 				br.Close()
-				return minedUpdateBatchResult{failedChunk: i, stage: "scan block_ids chunk %d"}, err
+				return minedUpdateBatchResult{failedChunk: i, stage: "scan mined_info chunk %d"}, err
 			}
 			var ch chainhash.Hash
 			copy(ch[:], h)
-			result := make([]uint32, len(bids))
-			for j, bid := range bids {
-				result[j] = uint32(bid)
-			}
-			resultMap[ch] = result
+			resultMap[ch] = decodeMinedBlockIDs(minedInfo)
 		}
 		// A mid-stream failure (network reset, statement timeout) makes rows.Next()
 		// stop early with the error parked in rows.Err(); without this check a
@@ -294,7 +308,7 @@ func (s *Store) attemptSetMinedUpdateBatch(ctx context.Context, conn *pgxpool.Co
 		if err := rows.Err(); err != nil {
 			rows.Close()
 			br.Close()
-			return minedUpdateBatchResult{failedChunk: i, stage: "iterate block_ids chunk %d"}, err
+			return minedUpdateBatchResult{failedChunk: i, stage: "iterate mined_info chunk %d"}, err
 		}
 		rows.Close()
 	}
@@ -336,33 +350,29 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 	defer pgxTx.Rollback(ctx) //nolint:errcheck
 
 	for _, hash := range hashes {
-		// Remove the entry for blockID from the parallel block_ids / block_heights /
-		// subtree_idxs arrays in a SINGLE atomic UPDATE. The previous SELECT-then-
-		// UPDATE left a window where a concurrent SetMinedMulti could append a block
-		// entry between the read and the write-back, silently dropping it on reorg.
+		// Remove the matching 12-byte record from the packed mined_info bytea in a
+		// SINGLE atomic UPDATE. The previous SELECT-then-UPDATE left a window where a
+		// concurrent SetMinedMulti could append a block entry between the read and the
+		// write-back, silently dropping it on reorg.
 		//
-		// block_ids removal is array_remove by value; the parallel arrays must drop
-		// the SAME positions, done by unnesting block_ids alongside each parallel
-		// array WITH ORDINALITY and re-aggregating the rows whose block_id != blockID.
-		// All SET expressions read the row's pre-update arrays, and a single UPDATE
-		// statement re-evaluates them against the locked (latest) row version, so a
-		// concurrent append is preserved rather than clobbered. RETURNING yields the
-		// post-update block_ids for the result map.
-		var newBlockIDs []int32
+		// Removal re-aggregates every record whose block_id (the first 4 bytes,
+		// int4send-encoded) does NOT equal blockID, keeping the record boundaries by
+		// walking stride-aligned offsets (g.i*12+1) — the block_id/height/subtree_idx
+		// triple always drops together, so the three fields can never misalign (the
+		// class of bug the array form once had). "Fully reorged out" is NOT EXISTS a
+		// surviving record. All SET expressions read the row's pre-update mined_info,
+		// and a single UPDATE statement re-evaluates them against the locked (latest)
+		// row version, so a concurrent append is preserved rather than clobbered.
+		// RETURNING yields the post-update mined_info for the result map.
+		var newMinedInfo []byte
 		err := pgxTx.QueryRow(ctx, `
 			UPDATE txs t SET
-				block_ids = array_remove(t.block_ids, $2),
-				block_heights = COALESCE((
-					SELECT array_agg(e.bh ORDER BY e.ord)
-					FROM unnest(t.block_ids, t.block_heights) WITH ORDINALITY AS e(bid, bh, ord)
-					WHERE e.bid <> $2
-				), '{}'::int[]),
-				subtree_idxs = COALESCE((
-					SELECT array_agg(e.si ORDER BY e.ord)
-					FROM unnest(t.block_ids, t.subtree_idxs) WITH ORDINALITY AS e(bid, si, ord)
-					WHERE e.bid <> $2
-				), '{}'::int[]),
-				-- Set unmined_since only when the tx is fully reorged out (no block_ids
+				mined_info = COALESCE((
+					SELECT string_agg(substr(t.mined_info, g.i * 12 + 1, 12), ''::bytea ORDER BY g.i)
+					FROM generate_series(0, octet_length(t.mined_info) / 12 - 1) AS g(i)
+					WHERE substr(t.mined_info, g.i * 12 + 1, 4) <> int4send($2)
+				), ''::bytea),
+				-- Set unmined_since only when the tx is fully reorged out (no records
 				-- remain). Otherwise PRESERVE the existing value: a tx still mined only
 				-- on non-longest-chain forks was legitimately unmined at creation and
 				-- must keep that marker so the DAH sweep's "unmined_since IS NOT NULL"
@@ -370,7 +380,10 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 				-- it as longest-chain-mined (matches aerospike teranode.lua:637-644 and
 				-- sql.go:3268-3308, which only write unmined_since when zero blocks remain).
 				unmined_since = CASE
-					WHEN COALESCE(array_length(array_remove(t.block_ids, $2), 1), 0) = 0
+					WHEN NOT EXISTS (
+						SELECT 1 FROM generate_series(0, octet_length(t.mined_info) / 12 - 1) AS g(i)
+						WHERE substr(t.mined_info, g.i * 12 + 1, 4) <> int4send($2)
+					)
 					THEN $3::int ELSE t.unmined_since END,
 				-- Clear the deferred-prune stamp UNCONDITIONALLY on any unset-mined.
 				-- Removing a block changes the tx's chain membership, so any existing
@@ -381,18 +394,21 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 				-- DAH sweep re-stamps the tx for free once it is genuinely eligible
 				-- again; the cost is at most one extra sweep pass.
 				delete_at_height = NULL,
-				-- Clear mined_at_height when the tx is fully reorged out (no block_ids
+				-- Clear mined_at_height when the tx is fully reorged out (no records
 				-- remain) so the DAH sweep's mine-arm stops re-enumerating it as a
 				-- phantom candidate on every pass over the old mining height. Preserve
 				-- it on a partial reorg (still mined on a remaining block).
 				mined_at_height = CASE
-					WHEN COALESCE(array_length(array_remove(t.block_ids, $2), 1), 0) = 0
+					WHEN NOT EXISTS (
+						SELECT 1 FROM generate_series(0, octet_length(t.mined_info) / 12 - 1) AS g(i)
+						WHERE substr(t.mined_info, g.i * 12 + 1, 4) <> int4send($2)
+					)
 					THEN NULL ELSE t.mined_at_height END,
 				locked = false
 			WHERE t.hash = $1
-			RETURNING t.block_ids`,
+			RETURNING t.mined_info`,
 			hash[:], int32(blockID), currentBlockHeight,
-		).Scan(&newBlockIDs)
+		).Scan(&newMinedInfo)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				// Per Interface.go:295-303, UnsetMined tolerates missing/empty entries:
@@ -404,8 +420,12 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 				resultMap[*hash] = []uint32{}
 				continue
 			}
-			return nil, errors.NewStorageError("[UnsetMined] update arrays for %s", hash, err)
+			return nil, errors.NewStorageError("[UnsetMined] update mined_info for %s", hash, err)
 		}
+
+		// Decode the post-update mined_info to the surviving block-id list (the Go
+		// result surface is unchanged) and to derive fully-reorged-out below.
+		newBlockIDs := decodeMinedBlockIDs(newMinedInfo)
 
 		// C5: remove the hash from the pending_deletes side-table in the same pgxTx so
 		// the clear is atomic with the DAH null above. Harmless no-op if the hash was
@@ -415,9 +435,9 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 			return nil, errors.NewStorageError("[UnsetMined] failed to delete pending_deletes for %s (C5)", hash, err)
 		}
 
-		// U1: when fully reorged out (block_ids is now empty), insert into pending_unmined.
+		// U1: when fully reorged out (no records remain), insert into pending_unmined.
 		// pending_unmined is ALWAYS-ON (no flag). We derive whether the tx is now fully
-		// unmined from the post-update block_ids array returned by RETURNING above.
+		// unmined from the post-update mined_info returned by RETURNING above.
 		// unmined_since is currentBlockHeight (= s.blockHeight.Load()+1), matching the
 		// CASE expression in the UPDATE above — COPY-FROM-RETURNING semantics without
 		// re-reading the row. Harmless ON CONFLICT DO UPDATE if the hash was already

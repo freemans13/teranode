@@ -545,6 +545,28 @@ func (s *Store) bootstrapDAHSweepProc(ctx context.Context) (err error) {
 		return errors.NewStorageError("[dahSweep] pre-v15 schema detected (txs.spent_progress exists): the v15 spent-bitmap store has no migration path; drop the database and re-sync")
 	}
 
+	// Fresh-sync guard (Phase B row diet): the mined-block info moved from three
+	// parallel INT[] columns (block_ids/block_heights/subtree_idxs) into one
+	// mined_info BYTEA of fixed 12-byte records, utxo_hashes narrowed to a 16-byte
+	// prefix per output, and version/size_in_bytes narrowed to INTEGER — all in one
+	// fresh-schema revision with deliberately NO in-place migration (re-packing every
+	// row's arrays and halving every packed hash is an O(all-history) rewrite this
+	// store avoids). CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so an
+	// old-layout database still carries block_ids and would silently mis-read every
+	// mined_info access. Detect the old layout by the block_ids column and refuse to
+	// start (same precedent as the pre-v15 guard above): drop and re-sync.
+	var hasBlockIDsColumn bool
+	if err = s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.columns
+		  WHERE table_schema = current_schema() AND table_name = 'txs' AND column_name = 'block_ids')`,
+	).Scan(&hasBlockIDsColumn); err != nil {
+		return errors.NewStorageError("[dahSweep] detect pre-Phase-B schema", err)
+	}
+
+	if hasBlockIDsColumn {
+		return errors.NewStorageError("[dahSweep] pre-Phase-B schema detected (txs.block_ids exists): the packed mined_info / 16-byte utxo_hashes layout has no migration path; drop the database and re-sync")
+	}
+
 	// Seed tunable knobs from settings into the control row so ops tuning flows
 	// through settings and the proc reads a single source of truth.
 	maxWin := s.settings.UtxoStore.PostgresDAHSweepMaxWindowsPerCall

@@ -1431,16 +1431,16 @@ func TestReAssignUTXO(t *testing.T) {
 	err = store.ReAssignUTXO(ctx, sourceSpend, newSpend, nil)
 	require.NoError(t, err)
 
-	// Verify: bit 0 of out_frozens should be clear, and the first 32-byte slot
-	// of the flat utxo_hashes should hold the new hash.
+	// Verify: bit 0 of out_frozens should be clear, and the first 16-byte slot
+	// of the flat utxo_hashes should hold the new hash's 128-bit prefix.
 	var outputFrozen bool
 	var storedUtxoHash []byte
 	err = store.pool.QueryRow(ctx,
-		`SELECT out_frozens IS NOT NULL AND get_bit(out_frozens, 0) = 1, substr(utxo_hashes, 1, 32) FROM txs WHERE hash = $1`,
+		`SELECT out_frozens IS NOT NULL AND get_bit(out_frozens, 0) = 1, substr(utxo_hashes, 1, 16) FROM txs WHERE hash = $1`,
 		txHash[:]).Scan(&outputFrozen, &storedUtxoHash)
 	require.NoError(t, err)
 	require.False(t, outputFrozen, "should be unfrozen after reassign")
-	require.Equal(t, newHash[:], storedUtxoHash)
+	require.Equal(t, newHash[:16], storedUtxoHash)
 }
 
 // TestReAssignUTXOSpendableInAtVoutGE1 pins the reassign maturity gate for outputs
@@ -1736,7 +1736,7 @@ func TestArraySubscriptBoundary(t *testing.T) {
 		`SELECT utxo_hashes, out_spendables, out_count, spendable_count FROM txs WHERE hash = $1`, parentHash[:],
 	).Scan(&utxoHashes, &spendableBits, &outCount, &spendableCount)
 	require.NoError(t, err)
-	require.Len(t, utxoHashes, 3*32, "3 outputs → 96-byte flat utxo_hashes")
+	require.Len(t, utxoHashes, 3*16, "3 outputs → 48-byte flat utxo_hashes (16-byte prefix stride)")
 	require.Equal(t, int32(3), outCount, "3 outputs → out_count 3")
 	require.Equal(t, int32(2), spendableCount, "OP_RETURN excluded → spendable_count 2")
 	outSpendables := unpackBitmap(spendableBits, int(outCount))

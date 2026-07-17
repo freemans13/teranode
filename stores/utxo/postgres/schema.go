@@ -28,8 +28,9 @@ import (
 //     nullable spending_data column. Spends become pure INSERTs (no MVCC
 //     bloat on txs output arrays).
 //
-//   - block_ids / block_heights / subtree_idxs / conflicting_children are
-//     arrays on txs, and all per-output UTXO fields are PACKED columns on txs
+//   - mined-block info (block_id/height/subtree_idx) is packed into ONE
+//     mined_info bytea (fixed 12-byte records) and conflicting_children is an
+//     array on txs; all per-output UTXO fields are PACKED columns on txs
 //     (flat bytea + bitmaps + scalar counts). A single row lookup returns
 //     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
@@ -442,18 +443,22 @@ func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *
 // Table DDL — 2 LOGGED hash-partitioned tables (txs + spends)
 // ---------------------------------------------------------------------------
 
-// txs: consolidated transaction metadata + state + raw_tx + block_ids (arrays) +
-// conflicting_children (array) + PACKED per-output UTXO columns. LOGGED — UTXO
-// set is durable state.
+// txs: consolidated transaction metadata + state + raw_tx + mined_info (packed
+// 12-byte records) + conflicting_children (array) + PACKED per-output UTXO
+// columns. LOGGED — UTXO set is durable state.
 //
 // Packed per-output encoding ("array packing", replaces the previous 5 parallel
 // per-output array columns — a hot-path CPU fix: bulk create no longer pays
 // per-row array_agg re-aggregation, and per-output access is O(1) byte
 // arithmetic instead of per-element array CASE/array_length evaluation):
 //
-//	utxo_hashes              — flat concatenation, 32 bytes per output; output i
-//	                           lives at byte offset i*32 (substr(.., i*32+1, 32),
-//	                           substr is 1-based). NULL when no outputs.
+//	utxo_hashes              — flat concatenation, 16 bytes per output (the first
+//	                           16 bytes / 128-bit prefix of each output's UTXO
+//	                           hash); output i lives at byte offset i*16
+//	                           (substr(.., i*16+1, 16), substr is 1-based). NULL
+//	                           when no outputs. The column is a pure equality
+//	                           guard on spend — never read back as data — so a
+//	                           128-bit prefix is ample for a fail-closed check.
 //	out_count                — number of outputs (slot_exists test: idx < out_count).
 //	spendable_count          — count of spendable outputs; the deferred-DAH
 //	                           "fully spent" comparand.
@@ -479,36 +484,51 @@ func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *
 // migration DDL is provided: bench databases are recreated from scratch and CI
 // creates fresh schemas. A pre-existing database with the array layout must be
 // dropped and re-synced.
+//
+// Column order is alignment-aware (Phase B row diet): 8-byte fixed columns first,
+// then 4-byte fixed, then 1-byte bools, then variable-length (bytea/array). This
+// minimises inter-column alignment padding on the heap tuple. All INSERT/SELECT
+// statements reference columns BY NAME, so the physical order is free to change.
+//
+// version and size_in_bytes are INTEGER (int4), not BIGINT: version is a
+// consensus uint32 stored via an int32 bit-cast (decoded uint32(int32(v))), and
+// size_in_bytes is bounded by the ~1 GiB bytea payload cap — 4 fewer bytes each
+// per row. lock_time and fee stay BIGINT (fee is satoshis, potentially large).
+//
+// mined_info replaces the three parallel INT[] columns (block_ids /
+// block_heights / subtree_idxs) with one BYTEA of fixed 12-byte records
+// (block_id int4 BE, height int4 BE, subtree_idx int4 BE): 13 B for the
+// 1-element common case versus ~75 B for three single-element arrays. See
+// packed_mined.go for the Go codec. The column is UNINDEXED (mine-path UPDATE
+// stays HOT).
 const txsDDL = `
 CREATE TABLE IF NOT EXISTS txs (
     hash                      BYTEA PRIMARY KEY,
-    version                   BIGINT NOT NULL,
     lock_time                 BIGINT NOT NULL,
     fee                       BIGINT NOT NULL,
-    size_in_bytes             BIGINT NOT NULL,
-    coinbase                  BOOLEAN NOT NULL DEFAULT FALSE,
-    raw_tx                    BYTEA,
-    locked                    BOOLEAN NOT NULL DEFAULT FALSE,
-    conflicting               BOOLEAN NOT NULL DEFAULT FALSE,
-    frozen                    BOOLEAN NOT NULL DEFAULT FALSE,
+    inserted_at               TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version                   INTEGER NOT NULL,
+    size_in_bytes             INTEGER NOT NULL,
     unmined_since             INT,
     delete_at_height          INT,
     preserve_until            INT,
-    block_ids                 INT[],
-    block_heights             INT[],
-    subtree_idxs              INT[],
-    conflicting_children      BYTEA[],
-    inserted_at               TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     mined_at_height           INT,
-    utxo_hashes               BYTEA,
     out_count                 INT NOT NULL DEFAULT 0,
     spendable_count           INT NOT NULL DEFAULT 0,
+    coinbase_spending_height  INT NOT NULL DEFAULT 0,
+    last_spend_height         INT,
+    coinbase                  BOOLEAN NOT NULL DEFAULT FALSE,
+    locked                    BOOLEAN NOT NULL DEFAULT FALSE,
+    conflicting               BOOLEAN NOT NULL DEFAULT FALSE,
+    frozen                    BOOLEAN NOT NULL DEFAULT FALSE,
+    raw_tx                    BYTEA,
+    conflicting_children      BYTEA[],
+    mined_info                BYTEA,
+    utxo_hashes               BYTEA,
     out_spendables            BYTEA,
     out_frozens               BYTEA,
-    coinbase_spending_height  INT NOT NULL DEFAULT 0,
     spendable_ins             INT[],
-    spent_bits                BYTEA NOT NULL DEFAULT '\x'::bytea,
-    last_spend_height         INT
+    spent_bits                BYTEA NOT NULL DEFAULT '\x'::bytea
 ) PARTITION BY HASH (hash);`
 
 // Indexes on txs.

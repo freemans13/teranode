@@ -51,8 +51,9 @@ type batchCreateResult struct {
 // locking_script and satoshis are recovered from raw_tx at read time (see
 // batchDecorateOutputs), so they are not stored separately here.
 //
-// utxoHashes is a flat concatenation: output i at byte offset i*32 (read in
-// SQL via substr(utxo_hashes, i*32+1, 32) — substr is 1-based). spendableBits
+// utxoHashes is a flat concatenation: output i at byte offset i*16 — the first
+// 16 bytes (128-bit prefix) of each output's UTXO hash (read in SQL via
+// substr(utxo_hashes, i*16+1, 16) — substr is 1-based). spendableBits
 // is a bitmap whose encoding matches PostgreSQL get_bit(): bit i lives in byte
 // i/8 at the (i%8)-th LEAST significant position. out_frozens is NOT built at
 // create time — no output is frozen on create, and NULL means "none frozen".
@@ -102,7 +103,7 @@ func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blo
 	count := len(btTx.Outputs)
 
 	p := outputArrayParams{
-		utxoHashes:    make([]byte, count*32),
+		utxoHashes:    make([]byte, count*16),
 		spendableBits: make([]byte, (count+7)/8),
 		outCount:      int32(count),
 	}
@@ -129,7 +130,7 @@ func buildOutputArrays(txHash *chainhash.Hash, btTx *bt.Tx, isCoinbase bool, blo
 		if err != nil {
 			return outputArrayParams{}, err
 		}
-		copy(p.utxoHashes[i*32:], utxoHash[:])
+		copy(p.utxoHashes[i*16:], utxoHash[:16])
 		// A zero-value OP_RETURN / data-carrier output can never be spent, so it
 		// must not count toward the "fully spent" pruning check. Mirror the
 		// aerospike store's ShouldStoreOutputAsUTXO gate. (nil script → no deref,
@@ -256,8 +257,10 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 
 	rawTx := tx.ExtendedBytes()
 
-	// Build block_id arrays.
-	var blockIDs, blkHeights, subtreeIdxs []int32
+	// Build the packed mined_info bytea (fixed 12-byte records) from any mined-block
+	// infos — the on-row replacement for the old block_ids/block_heights/subtree_idxs
+	// arrays. packMinedInfo returns nil (→ SQL NULL) for the unmined common case.
+	var minedInfo []byte
 	// minedAtHeight records the height a tx created ALREADY mined (below-checkpoint
 	// quick validation / legacy catch-up) was mined at, exactly as SetMinedMulti
 	// does. The DAH fold stamps delete_at_height only when mined_at_height IS NOT
@@ -266,18 +269,19 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	// mining). INT4 column; heights < 2^31.
 	var minedAtHeight *int32
 	if len(options.MinedBlockInfos) > 0 {
-		blockIDs = make([]int32, len(options.MinedBlockInfos))
-		blkHeights = make([]int32, len(options.MinedBlockInfos))
-		subtreeIdxs = make([]int32, len(options.MinedBlockInfos))
+		bids := make([]uint32, len(options.MinedBlockInfos))
+		bhs := make([]uint32, len(options.MinedBlockInfos))
+		sis := make([]int, len(options.MinedBlockInfos))
 		minH := int32(options.MinedBlockInfos[0].BlockHeight)
 		for i, info := range options.MinedBlockInfos {
-			blockIDs[i] = int32(info.BlockID)
-			blkHeights[i] = int32(info.BlockHeight)
-			subtreeIdxs[i] = int32(info.SubtreeIdx)
+			bids[i] = info.BlockID
+			bhs[i] = info.BlockHeight
+			sis[i] = info.SubtreeIdx
 			if int32(info.BlockHeight) < minH {
 				minH = int32(info.BlockHeight)
 			}
 		}
+		minedInfo = packMinedInfo(bids, bhs, sis)
 		minedAtHeight = &minH
 	}
 
@@ -312,12 +316,12 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		WITH ins AS (
 			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
 				locked, conflicting, frozen, unmined_since,
-				block_ids, block_heights, subtree_idxs, conflicting_children, mined_at_height,
+				mined_info, conflicting_children, mined_at_height,
 				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
 				delete_at_height, spent_bits)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-			        $17, $18, $19, $20, $21, $22,
-			        decode(repeat('00', ($18 + 7) / 8), 'hex'))
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+			        $15, $16, $17, $18, $19, $20,
+			        decode(repeat('00', ($16 + 7) / 8), 'hex'))
 			ON CONFLICT (hash) DO NOTHING
 			RETURNING hash, delete_at_height
 		),
@@ -328,10 +332,10 @@ func (s *Store) createDirect(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 		)
 		SELECT hash FROM ins`
 	insertArgs := []interface{}{
-		txHash[:], int64(tx.Version), int64(tx.LockTime),
-		int64(txMeta.Fee), int64(txMeta.SizeInBytes), isCoinbase, rawTx,
+		txHash[:], int32(tx.Version), int64(tx.LockTime),
+		int64(txMeta.Fee), int32(txMeta.SizeInBytes), isCoinbase, rawTx,
 		options.Locked, options.Conflicting, options.Frozen, unminedSince,
-		blockIDs, blkHeights, subtreeIdxs, [][]byte(nil), minedAtHeight,
+		minedInfo, [][]byte(nil), minedAtHeight,
 		outArrs.utxoHashes, outArrs.outCount, outArrs.spendableCount,
 		outArrs.spendableBits, outArrs.coinbaseSpendingHeight,
 		deleteAtHeight,
@@ -447,7 +451,7 @@ func (s *Store) sendCreateBatch(batch []*batchCreateItem) {
 // ---------------------------------------------------------------------------
 // sendCreateBatchUNNEST — direct INSERT…SELECT FROM UNNEST. The single bulk
 // create path: no staging tables, no COPY protocol, no merge step. Handles
-// plain validator-path creates and single-block mined creates (block_ids etc.
+// plain validator-path creates and single-block mined creates (mined_info
 // populated when the item carries exactly one MinedBlockInfo). Conflicting and
 // multi-block items are filtered out by sendCreateBatch and never reach here.
 // It issues a SINGLE auto-committing INSERT for the whole batch, which is
@@ -491,21 +495,21 @@ const createBatchChunkOverhead int64 = 1024
 const createBatchUNNESTSQL = `
 			WITH ins AS (
 			INSERT INTO txs (hash, version, lock_time, fee, size_in_bytes, coinbase, raw_tx,
-				locked, conflicting, frozen, unmined_since, block_ids, block_heights, subtree_idxs, mined_at_height,
+				locked, conflicting, frozen, unmined_since, mined_info, mined_at_height,
 				utxo_hashes, out_count, spendable_count, out_spendables, coinbase_spending_height,
 				delete_at_height, spent_bits)
 			SELECT u.hash, u.version, u.lock_time, u.fee, u.size_in_bytes, u.coinbase, u.raw_tx,
 			       u.locked, u.conflicting, u.frozen,
 			       CASE WHEN u.mined THEN NULL::int ELSE u.unmined_since END,
-			       CASE WHEN u.mined THEN ARRAY[u.block_id] ELSE NULL::int[] END,
-			       CASE WHEN u.mined THEN ARRAY[u.block_height] ELSE NULL::int[] END,
-			       CASE WHEN u.mined THEN ARRAY[u.subtree_idx] ELSE NULL::int[] END,
+			       -- Packed mined_info: one 12-byte record (block_id||height||subtree_idx,
+			       -- each int4 big-endian via int4send) for a mined create, NULL otherwise.
+			       CASE WHEN u.mined THEN int4send(u.block_id) || int4send(u.block_height) || int4send(u.subtree_idx) ELSE NULL::bytea END,
 			       CASE WHEN u.mined THEN u.block_height ELSE NULL::int END,
 			       u.utxo_hashes, u.out_count, u.spendable_count, u.out_spendables, u.coinbase_spending_height,
 			       CASE WHEN u.mined AND u.out_count > 0 AND u.spendable_count = 0
 			            THEN (u.block_height + 1 + $21)::int ELSE NULL::int END,
 			       decode(repeat('00', (u.out_count + 7) / 8), 'hex')
-			FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[],
+			FROM UNNEST($1::bytea[], $2::int[], $3::bigint[], $4::bigint[], $5::int[],
 			            $6::boolean[], $7::bytea[], $8::boolean[], $9::boolean[], $10::boolean[],
 			            $11::int[], $12::boolean[], $13::int[], $14::int[], $15::int[],
 			            $16::bytea[], $17::int[], $18::int[], $19::bytea[], $20::int[])
@@ -568,10 +572,10 @@ func planCreateChunks(rowBytes []int64, threshold, chunkOverhead, hardLimit int6
 func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateItem) {
 	n := len(batch)
 	hashes := make([][]byte, 0, n)
-	versions := make([]int64, 0, n)
+	versions := make([]int32, 0, n) // version is INT4 (consensus uint32 via int32 bit-cast)
 	lockTimes := make([]int64, 0, n)
 	fees := make([]int64, 0, n)
-	sizes := make([]int64, 0, n)
+	sizes := make([]int32, 0, n) // size_in_bytes is INT4 (bounded by the ~1 GiB bytea cap)
 	coinbases := make([]bool, 0, n)
 	rawTxs := make([][]byte, 0, n)
 	lockeds := make([]bool, 0, n)
@@ -579,11 +583,11 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 	frozens := make([]bool, 0, n)
 	unminedSinces := make([]int32, 0, n) // unmined_since is INT4
 	// Mined-block columns. mined[i] discriminates: when true the row is mined in
-	// exactly one block and block_ids/heights/subtree_idxs are written as a
-	// single-element array with unmined_since NULL; when false the tx is unmined
-	// (block columns NULL, unmined_since = blockHeight). Matches createDirect.
-	// All three feed INT columns (and block_height also feeds the INT4
-	// mined_at_height), so they are bound as int4[].
+	// exactly one block and block_id/height/subtree_idx are packed into a single
+	// 12-byte mined_info record (built in SQL via int4send) with unmined_since NULL;
+	// when false the tx is unmined (mined_info NULL, unmined_since = blockHeight).
+	// Matches createDirect. All three feed the packed record (and block_height also
+	// feeds the INT4 mined_at_height), so they are bound as int4[].
 	mineds := make([]bool, 0, n)
 	blockIDs := make([]int32, 0, n)
 	blockHeights := make([]int32, 0, n)
@@ -653,10 +657,10 @@ func (s *Store) sendCreateBatchUNNEST(ctx context.Context, batch []*batchCreateI
 		valid[i] = true
 
 		hashes = append(hashes, txHash[:])
-		versions = append(versions, int64(item.tx.Version))
+		versions = append(versions, int32(item.tx.Version))
 		lockTimes = append(lockTimes, int64(item.tx.LockTime))
 		fees = append(fees, int64(txMeta.Fee))
-		sizes = append(sizes, int64(txMeta.SizeInBytes))
+		sizes = append(sizes, int32(txMeta.SizeInBytes))
 		coinbases = append(coinbases, isCoinbase)
 		rawTx := item.tx.ExtendedBytes() // re-serializes on every call; capture once
 		rawTxs = append(rawTxs, rawTx)

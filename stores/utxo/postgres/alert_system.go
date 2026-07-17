@@ -190,8 +190,8 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 	}
 	spendableIn := s.GetBlockHeight() + reassignBlocks
 
-	// Update the packed columns in ONE statement: splice the new 32-byte utxo
-	// hash into the flat utxo_hashes (overlay at byte offset vout*32, 1-based),
+	// Update the packed columns in ONE statement: splice the new utxo hash's
+	// 16-byte prefix into the flat utxo_hashes (overlay at byte offset vout*16, 1-based),
 	// clear the per-output frozen bit, and rebuild spendable_ins as a contiguous
 	// 1-based INT[] of length out_count with this slot set (preserving any prior
 	// reassignments) — so a concurrent Get/Spend never observes a torn state. The
@@ -207,7 +207,7 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 	si := int32(spendableIn)
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE txs
-		SET utxo_hashes = overlay(utxo_hashes placing $3::bytea from $2::int * 32 + 1 for 32),
+		SET utxo_hashes = overlay(utxo_hashes placing $3::bytea from $2::int * 16 + 1 for 16),
 		    out_frozens = set_bit(out_frozens, $2::int, 0),
 		    spendable_ins = (
 		        SELECT array_agg(
@@ -221,7 +221,7 @@ func (s *Store) ReAssignUTXO(ctx context.Context, utxoSpend *utxo.Spend, newUtxo
 		    )
 		WHERE hash = $1 AND $2::int < out_count
 		  AND out_frozens IS NOT NULL AND get_bit(out_frozens, $2::int) = 1
-	`, utxoSpend.TxID[:], utxoSpend.Vout, newUtxo.UTXOHash[:], si)
+	`, utxoSpend.TxID[:], utxoSpend.Vout, newUtxo.UTXOHash[:16], si)
 	if err != nil {
 		return errors.NewStorageError("[ReAssignUTXO] failed to update packed columns for %s:%d", utxoSpend.TxID, utxoSpend.Vout, err)
 	}
