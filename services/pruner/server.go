@@ -172,9 +172,38 @@ func (s *Server) Init(ctx context.Context) error {
 		height := binary.LittleEndian.Uint32(state)
 		s.lastPersistedHeight.Store(height)
 		s.logger.Infof("Loaded initial block persister height: %d", height)
+
+		s.seedLastBlockHash(ctx, height)
 	}
 
 	return nil
+}
+
+// seedLastBlockHash fetches the block hash at height (the same
+// GetBlockHeadersFromHeight(ctx, height, 1) call used elsewhere, e.g.
+// blockvalidation) and caches it as the initial lastBlockHash, so the
+// fallback ticker is armed immediately on startup rather than waiting for a
+// future notification.
+//
+// This closes a restart gap: if the block persister is already stalled when
+// the pruner (re)starts, no BlockPersisted notification will ever arrive to
+// populate lastBlockHash, and the Block-notification capture in
+// notificationWorker only helps once a NEW notification shows up after this
+// point -- without this seed step, the ticker would stay permanently
+// disarmed for exactly the stalled-persister incident it exists to guard
+// against.
+//
+// Best-effort: any error is logged as a single-line warning and
+// lastBlockHash is left unset (nil); a subsequent notification will still
+// re-arm it per the usual paths.
+func (s *Server) seedLastBlockHash(ctx context.Context, height uint32) {
+	headers, _, err := s.blockchainClient.GetBlockHeadersFromHeight(ctx, height, 1)
+	if err != nil || len(headers) == 0 {
+		s.logger.Warnf("[pruner] failed to seed initial block hash at height %d for fallback ticker: %v", height, err)
+		return
+	}
+
+	s.lastBlockHash.Store(headers[0].Hash())
 }
 
 // notificationWorker consumes blockchain notifications and translates them into
@@ -256,13 +285,23 @@ func (s *Server) notificationWorker(ctx context.Context, subscriptionCh chan *bl
 				}
 
 			case model.NotificationType_Block:
-				// Skip if using OnBlockPersisted trigger mode
-				if s.settings.Pruner.BlockTrigger == settings.PrunerBlockTriggerOnBlockPersisted {
-					s.logger.Debugf("Block notification received but pruner configured for BlockPersisted trigger")
-					continue
-				}
-
-				// Extract block hash (required for mined_set wait in processor)
+				// Extract and cache the block hash BEFORE the trigger-mode filter below,
+				// for every Block notification regardless of mode. This is what re-arms
+				// the fallback ticker in OnBlockPersisted mode when the block persister
+				// itself is stalled: Block notifications come from block validation, not
+				// the persister, so they keep arriving as the chain moves even while
+				// BlockPersisted notifications have stopped. Without this, a pruner that
+				// restarts while the persister is already stalled would never observe a
+				// single BlockPersisted notification, lastBlockHash would stay nil
+				// forever, and the fallback ticker -- the exact mechanism meant to
+				// survive a stalled persister -- would be permanently disarmed.
+				//
+				// Deliberately NOT updating any height atomic here: lastPersistedHeight
+				// means "the block persister confirmed up to this height," and this
+				// notification carries no such confirmation (in OnBlockPersisted mode
+				// especially, that would be actively wrong while the persister is
+				// stalled); lastProcessedHeight is owned exclusively by prunerProcessor.
+				// So this is hash-only, on purpose.
 				if notification.Hash == nil {
 					s.logger.Debugf("Block notification missing hash, skipping")
 					continue
@@ -274,8 +313,15 @@ func (s *Server) notificationWorker(ctx context.Context, subscriptionCh chan *bl
 					continue
 				}
 
-				// Cache the hash for fireFallbackTick (see field doc comment).
 				s.lastBlockHash.Store(blockHash)
+
+				// Skip triggering a prune signal if using OnBlockPersisted trigger mode --
+				// the hash above is still cached to re-arm the fallback ticker, but this
+				// notification type must not itself drive pruning in that mode.
+				if s.settings.Pruner.BlockTrigger == settings.PrunerBlockTriggerOnBlockPersisted {
+					s.logger.Debugf("Block notification received but pruner configured for BlockPersisted trigger")
+					continue
+				}
 
 				// Get height from blockchain client using the block hash
 				// This is the authoritative source and avoids race conditions with Block Assembly state updates

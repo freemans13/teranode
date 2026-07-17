@@ -7,10 +7,13 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -266,4 +269,106 @@ func TestFallbackTickerReRunsAtSameHeightAfterProcessing(t *testing.T) {
 	// not be dropped as a duplicate of an already-processed height.
 	require.Eventually(t, func() bool { return fakeSvc.callCount() >= 2 }, 3*time.Second, 10*time.Millisecond,
 		"fallback ticker signal did not bypass the already-processed guard on a second tick")
+}
+
+// TestSeedLastBlockHashArmsTickerAfterRestart covers the restart gap raised
+// in review: a pruner that (re)starts while the block persister is already
+// stalled loads lastPersistedHeight from blockchain state (as Init does via
+// GetState) but never receives a single notification afterward, since the
+// persister that would send BlockPersisted notifications is the very thing
+// that's stalled. Without seedLastBlockHash, lastBlockHash would stay nil
+// forever and fireFallbackTick would return early on every tick, permanently
+// disarming the exact mechanism meant to survive this scenario.
+//
+// This drives seedLastBlockHash directly -- the same call Init makes, right
+// after loading lastPersistedHeight -- against a mocked blockchainClient,
+// then confirms the ticker fires from that seeded state alone with zero
+// notifications ever delivered.
+func TestSeedLastBlockHashArmsTickerAfterRestart(t *testing.T) {
+	seedHeader := &model.BlockHeader{
+		HashPrevBlock:  &chainhash.Hash{0x01},
+		HashMerkleRoot: &chainhash.Hash{0x02},
+	}
+
+	blockchainMock := &blockchain.Mock{}
+	blockchainMock.On("GetBlockHeadersFromHeight", mock.Anything, uint32(500), uint32(1)).
+		Return([]*model.BlockHeader{seedHeader}, []*model.BlockHeaderMeta{{}}, nil)
+
+	s := &Server{
+		logger:           ulogger.New("test"),
+		blockchainClient: blockchainMock,
+		pruneNotify:      make(chan pruneSignal, 1),
+		settings: &settings.Settings{
+			Pruner: settings.PrunerSettings{
+				FallbackTickerSeconds: 1,
+				BlockTrigger:          settings.PrunerBlockTriggerOnBlockPersisted,
+			},
+		},
+	}
+	// Mimics what Init does before calling seedLastBlockHash: lastPersistedHeight
+	// is already loaded from GetState.
+	s.lastPersistedHeight.Store(500)
+
+	s.seedLastBlockHash(context.Background(), 500)
+	require.NotNil(t, s.lastBlockHash.Load(), "seedLastBlockHash should have populated lastBlockHash")
+	require.True(t, seedHeader.Hash().IsEqual(s.lastBlockHash.Load()), "seeded hash should match the header returned by GetBlockHeadersFromHeight")
+
+	// No notifications ever arrive (the persister is stalled) -- the seeded
+	// state alone must be enough to arm the ticker.
+	subscriptionCh := make(chan *blockchain_api.Notification)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go s.notificationWorker(ctx, subscriptionCh)
+
+	select {
+	case sig := <-s.pruneNotify:
+		require.Equal(t, uint32(500), sig.blockHeight)
+		require.True(t, sig.force)
+	case <-ctx.Done():
+		t.Fatal("fallback ticker never fired from restart-style seeded state")
+	}
+}
+
+// TestBlockNotificationReArmsHashWithoutSignalInOnBlockPersistedMode verifies
+// part 1 of the restart-gap fix: in OnBlockPersisted mode, a Block
+// notification -- which must not itself drive pruning in that mode -- still
+// updates lastBlockHash, without ever enqueueing a pruneSignal. This is what
+// keeps the ticker re-armed while the chain keeps moving even if the block
+// persister itself has stalled and stopped sending BlockPersisted
+// notifications.
+func TestBlockNotificationReArmsHashWithoutSignalInOnBlockPersistedMode(t *testing.T) {
+	s := &Server{
+		logger:      ulogger.New("test"),
+		pruneNotify: make(chan pruneSignal, 1),
+		settings: &settings.Settings{
+			Pruner: settings.PrunerSettings{
+				BlockTrigger: settings.PrunerBlockTriggerOnBlockPersisted,
+			},
+		},
+	}
+
+	subscriptionCh := make(chan *blockchain_api.Notification, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go s.notificationWorker(ctx, subscriptionCh)
+
+	blockHash := chainhash.Hash{0xDD}
+	subscriptionCh <- &blockchain_api.Notification{
+		Type: model.NotificationType_Block,
+		Hash: blockHash[:],
+	}
+
+	require.Eventually(t, func() bool {
+		h := s.lastBlockHash.Load()
+		return h != nil && *h == blockHash
+	}, time.Second, 10*time.Millisecond, "Block notification should update lastBlockHash even in OnBlockPersisted mode")
+
+	select {
+	case sig := <-s.pruneNotify:
+		t.Fatalf("Block notification must not enqueue a pruneSignal in OnBlockPersisted mode: %+v", sig)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no signal enqueued.
+	}
 }
