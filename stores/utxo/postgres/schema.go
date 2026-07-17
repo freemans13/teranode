@@ -329,6 +329,21 @@ func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *
 		if _, err := pool.Exec(ctx, idxDDL); err != nil {
 			return errors.NewStorageError("pending_deletes_p%02d index creation failed", i, err)
 		}
+
+		// Idempotent, mirrors the txs/spends per-leaf pattern: autovacuum ignores
+		// parent-level params, so set on each leaf. Gentle spends-style profile —
+		// pd is insert-then-delete churn; an aggressive profile would steal I/O
+		// from the sweep and pruner (see CLAUDE.md).
+		av := fmt.Sprintf(
+			"ALTER TABLE pending_deletes_p%02d SET ("+
+				"autovacuum_vacuum_scale_factor = 0.05, "+
+				"autovacuum_vacuum_insert_scale_factor = 0.02, "+
+				"autovacuum_vacuum_cost_limit = 2000, "+
+				"autovacuum_vacuum_cost_delay = 2, "+
+				"autovacuum_analyze_scale_factor = 0.05)", i)
+		if _, err := pool.Exec(ctx, av); err != nil {
+			return errors.NewStorageError("autovacuum tuning failed for pending_deletes_p%02d", i, err)
+		}
 	}
 
 	// pending_unmined side-table: ALWAYS-ON (no flag). Stores (hash, unmined_since)
