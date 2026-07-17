@@ -259,6 +259,15 @@ type Config struct {
 	// set when an external IP is used.
 	AddrMe *wire.NetAddress
 
+	// ReadBackpressured, when non-nil and returning true, indicates the LOCAL
+	// node is throttling its own network reads (block processing behind). The
+	// idle timer must not execute a peer for silence the node itself caused:
+	// with read loops parked, healthy peers deliver nothing for minutes and
+	// the 125s idle timeout was mass-disconnecting them (the largest single
+	// class in the measured sync-peer rotation cascades). Dead peers still die
+	// at the normal timeout whenever the node is not self-backpressured.
+	ReadBackpressured func() bool
+
 	// NewestBlock specifies a callback which provides the newest block
 	// details to the peer as needed.  This can be nil in which case the
 	// peer will report a block height of 0, however it is good practice for
@@ -1880,6 +1889,14 @@ func (p *Peer) inHandler() {
 				return
 			}
 		}
+
+		// Local read backpressure: the silence is OURS, not the peer's. Re-arm
+		// and re-check next interval (see Config.ReadBackpressured).
+		if p.cfg.ReadBackpressured != nil && p.cfg.ReadBackpressured() {
+			idleTimer.Reset(p.settings.Legacy.PeerIdleTimeout)
+			return
+		}
+
 		reason := fmt.Sprintf("No answer from peer for %s", p.settings.Legacy.PeerIdleTimeout)
 		p.DisconnectWithInfo(reason)
 	})

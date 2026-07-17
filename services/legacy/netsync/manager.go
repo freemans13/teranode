@@ -876,6 +876,26 @@ type SyncManager struct {
 	// it and aborts the walk if the generation changed.
 	headerMu  sync.Mutex
 	headerGen uint64 // bumped by resetHeaderState; guarded by headerMu
+	// recentlyNeededUntil carries block hashes across resetHeaderState (guarded
+	// by headerMu, TTL-bounded). A rotation clears headerHeightIndex and every
+	// fetch ledger, so blocks legitimately requested BEFORE the rotation arrive
+	// afterwards looking "unrequested" — the old response was to disconnect the
+	// delivering peer, which cascaded (measured live: 8 peers executed within
+	// one second, 4s after a rotation) and produced the multi-minute fetch
+	// wedges behind the bursty sync. Entries are folded in from the outgoing
+	// index at reset, expire after recentlyNeededTTL, and are deleted at the
+	// same commit/prune sites that delete headerHeightIndex entries.
+	recentlyNeededUntil map[chainhash.Hash]time.Time
+	// lastHeaderResetAt (guarded by headerMu) stamps resetHeaderState so the
+	// header-linkage check can give a short grace after a reset: a successor
+	// sync peer's first batch legitimately fails to connect to the rebuilt
+	// list's seed and was being chain-killed for it (19 kills measured).
+	lastHeaderResetAt time.Time
+	// headStallSuppressedAt (drain goroutine only — checkHeadStall runs from the
+	// refill tick via maintainInFlightWindow) records when the head-stall check
+	// last declined to fire because the node was throttling its own reads. The
+	// 2s BlockStallTimeout must not execute a peer for OUR backpressure.
+	headStallSuppressedAt time.Time
 	// headerHeightIndex maps each headerNode's block hash to its authoritative
 	// PoW-verified height. It allows handleBlockPreamble to resolve the height of
 	// blocks that arrive out of order (not at headerList.Front()), which happens
@@ -986,6 +1006,28 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 	sm.startHeader = nil
 	sm.headerListSeed = nil
 
+	// Fold the outgoing index into the TTL carryover BEFORE clearing, so blocks
+	// requested under the old generation can still be recognised as needed when
+	// they arrive after the reset (see recentlyNeededUntil). Expired entries are
+	// swept in the same pass to bound the map.
+	if sm.recentlyNeededUntil == nil {
+		sm.recentlyNeededUntil = make(map[chainhash.Hash]time.Time)
+	}
+
+	now := time.Now()
+	for h, until := range sm.recentlyNeededUntil {
+		if now.After(until) {
+			delete(sm.recentlyNeededUntil, h)
+		}
+	}
+
+	deadline := now.Add(recentlyNeededTTL)
+	for h := range sm.headerHeightIndex {
+		sm.recentlyNeededUntil[h] = deadline
+	}
+
+	sm.lastHeaderResetAt = now
+
 	// Clear the index before rebuilding; this bounds its memory across resets.
 	clear(sm.headerHeightIndex)
 
@@ -1011,6 +1053,39 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 		sm.headerListSeed = sm.headerList.PushBack(&node)
 		sm.headerHeightIndex[*node.hash] = node.height
 	}
+}
+
+// recentlyNeededTTL bounds how long a hash carried across resetHeaderState is
+// still treated as needed. Long enough to cover post-rotation redelivery of
+// everything that was in flight (60s requestedBlocks TTL + delivery latency),
+// short enough that the unrequested-block spam guard re-arms promptly.
+const recentlyNeededTTL = 90 * time.Second
+
+// blockStillNeeded reports whether a delivered block is one the node genuinely
+// wants right now: present in the live header index, or carried across a recent
+// resetHeaderState and not yet expired. Used to stop the unrequested-block
+// disconnect punishing peers for deliveries WE requested before a rotation
+// cleared the ledgers (the measured disconnect-cascade trigger). Expired
+// carryover entries are deleted on read.
+func (sm *SyncManager) blockStillNeeded(h chainhash.Hash) bool {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if _, ok := sm.headerHeightIndex[h]; ok {
+		return true
+	}
+
+	until, ok := sm.recentlyNeededUntil[h]
+	if !ok {
+		return false
+	}
+
+	if time.Now().After(until) {
+		delete(sm.recentlyNeededUntil, h)
+		return false
+	}
+
+	return true
 }
 
 // findNextHeaderCheckpoint returns the next checkpoint after the passed height.
@@ -1494,7 +1569,7 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	sm.logger.Debugf("[CheckSyncPeer] removing sync peer %s", sp.String())
 
 	sm.clearRequestedState(state)
-	sm.updateSyncPeer(state)
+	sm.updateSyncPeer(state, reason)
 }
 
 // syncPeerSilentTickLimit resolves the silent-tick rotation threshold:
@@ -1563,7 +1638,7 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 
 	// Fetch a new sync peer if this is the sync peer.
 	if peer == sm.loadSyncPeer() {
-		sm.updateSyncPeer(state)
+		sm.updateSyncPeer(state, "sync peer disconnected")
 	}
 }
 
@@ -1579,10 +1654,13 @@ func (sm *SyncManager) clearRequestedState(state *peerSyncState) {
 	state.requestedBlocks.Stop()
 }
 
-// updateSyncPeer picks a new peer to sync from.
-func (sm *SyncManager) updateSyncPeer(_ *peerSyncState) {
+// updateSyncPeer picks a new peer to sync from. reason is logged so rotation
+// storms are attributable from the INFO log (previously the trigger was only
+// visible at debug level, which made live cascade forensics needlessly hard).
+func (sm *SyncManager) updateSyncPeer(_ *peerSyncState, reason string) {
 	sp, sps := sm.loadSyncPeerAndState()
-	sm.logger.Infof("Updating sync peer, last block: %v, violations: %v, headers-first mode: %v",
+	sm.logger.Infof("Updating sync peer (%s), last block: %v, violations: %v, headers-first mode: %v",
+		reason,
 		sps.getLastBlockTime(),
 		sps.getViolations(),
 		sm.headersFirstMode.Load())
@@ -1976,10 +2054,21 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 		// mode, in this case, so the chain code is actually fed the
 		// duplicate blocks.
 		if sm.chainParams != &chaincfg.RegressionNetParams {
-			reason := fmt.Sprintf("Got unrequested block %v", bmsg.blockHash)
-			resolvedPeer.DisconnectWithWarning(reason)
-			err = errors.NewServiceError("Got unrequested block %v", bmsg.blockHash)
-			return
+			// Tolerate deliveries of blocks the node still NEEDS: a rotation's
+			// clearRequestedState/resetHeaderState (and the 60s ledger TTL)
+			// orphan in-flight deliveries we genuinely asked for, and executing
+			// the deliverers cascaded into peer-set collapse (measured: 8 peers
+			// disconnected within one second, 4s after a rotation). Only a hash
+			// that is neither in the live header index nor in the reset
+			// carryover is treated as spam and disconnects.
+			if sm.blockStillNeeded(bmsg.blockHash) {
+				sm.logger.Debugf("[%s] block %v not in the per-peer ledger but still needed (post-rotation redelivery); processing", caller, bmsg.blockHash)
+			} else {
+				reason := fmt.Sprintf("Got unrequested block %v", bmsg.blockHash)
+				resolvedPeer.DisconnectWithWarning(reason)
+				err = errors.NewServiceError("Got unrequested block %v", bmsg.blockHash)
+				return
+			}
 		}
 	}
 
@@ -2045,6 +2134,7 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 				} else {
 					sm.headerList.Remove(firstNodeEl)
 					delete(sm.headerHeightIndex, *firstNode.hash)
+					delete(sm.recentlyNeededUntil, *firstNode.hash)
 				}
 
 				break
@@ -2060,6 +2150,7 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 			if firstNodeEl == sm.headerListSeed {
 				sm.headerList.Remove(firstNodeEl)
 				delete(sm.headerHeightIndex, *firstNode.hash)
+				delete(sm.recentlyNeededUntil, *firstNode.hash)
 				sm.headerListSeed = nil
 
 				continue
@@ -2412,6 +2503,7 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 				sm.headerHeightIndex[bmsg.blockHash] = headerHeight
 			} else {
 				delete(sm.headerHeightIndex, bmsg.blockHash)
+				delete(sm.recentlyNeededUntil, bmsg.blockHash)
 			}
 		}
 		sm.headerMu.Unlock()
@@ -3772,6 +3864,23 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 		return
 	}
 
+	// Never execute a peer for OUR OWN backpressure: while the node throttles
+	// its reads because local validation is behind, the head block ages without
+	// any peer fault. Suppress, stamp, and require a full clean timeout window
+	// AFTER suppression ends before firing — measured live, unconditional 2s
+	// fires during self-backpressure seeded ~a third of the rotation-cascade
+	// storms. A genuinely hung pipeline un-suppresses itself via the
+	// stale-backlog escape in localReadBackpressured, so this cannot mask a
+	// real stall indefinitely.
+	if sm.localReadBackpressured() {
+		sm.headStallSuppressedAt = now
+		return
+	}
+
+	if !sm.headStallSuppressedAt.IsZero() && now.Sub(sm.headStallSuppressedAt) <= timeout {
+		return
+	}
+
 	// Find the HEAD = lowest-height outstanding block, and read its assignment,
 	// all under assignedMu (a cheap in-memory scan; no I/O). headerHeightIndex is
 	// guarded by headerMu, so take that too for the height lookups. Lock order is
@@ -4023,7 +4132,20 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 				sm.startHeader = e
 			}
 		} else {
+			// Post-reset grace: right after resetHeaderState a successor sync
+			// peer's first in-flight batch legitimately fails to connect to the
+			// rebuilt list's seed. Chain-killing those peers extended the
+			// measured rotation cascades (19 kills in one window). Within the
+			// grace window drop the batch quietly; the peer re-serves from the
+			// fresh locator on the next getheaders.
+			recentReset := !sm.lastHeaderResetAt.IsZero() && time.Since(sm.lastHeaderResetAt) < 60*time.Second
 			sm.headerMu.Unlock()
+
+			if recentReset {
+				sm.logger.Debugf("dropping non-connecting header batch from %s within the post-reset grace window", peer)
+				return
+			}
+
 			peer.DisconnectWithWarning("Received block header that does not properly connect to the chain")
 
 			return
@@ -5830,8 +5952,13 @@ func (sm *SyncManager) BlockRequested(peer *peerpkg.Peer, blockHash *chainhash.H
 	}
 
 	_, requested := state.requestedBlocks.Get(*blockHash)
+	if requested {
+		return true
+	}
 
-	return requested
+	// Same tolerance as handleBlockMsg: a still-needed block whose ledger entry
+	// was cleared by a rotation (or expired) is not an offense.
+	return sm.blockStillNeeded(*blockHash)
 }
 
 // AcquireBlockPrefetch reserves prefetch budget for a block of the given
@@ -5997,6 +6124,16 @@ func (sm *SyncManager) blockProcessingStallTimeout() time.Duration {
 // would rotate a healthy sync peer on a legitimately slow block. The
 // progress-aware timeout applies only under prefetch, where that watchdog is
 // disarmed for blocks and this is the compensating liveness signal.
+// ReadBackpressured reports whether the node is currently throttling its own
+// network reads because local block processing is behind. Exported for the
+// peer layer's idle-timer gate: while WE are the reason no bytes flow, peers
+// must not be executed for idleness (the 125s PeerIdleTimeout was the largest
+// disconnect class in the measured rotation cascades). Atomics only —
+// safe from any goroutine.
+func (sm *SyncManager) ReadBackpressured() bool {
+	return sm.localReadBackpressured()
+}
+
 func (sm *SyncManager) localReadBackpressured() bool {
 	// A non-empty local backlog means blocks are queued or mid-validation, so a
 	// stale last-block-time and zero throughput normally reflect our own

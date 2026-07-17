@@ -2819,6 +2819,7 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 			OnStreamAck:    sp.OnStreamAck,
 		},
 		AddrMe:             addrMe,
+		ReadBackpressured:  sp.server.syncManager.ReadBackpressured,
 		NewestBlock:        sp.newestBlock,
 		HostToNetAddress:   sp.server.addrManager.HostToNetAddress,
 		Proxy:              cfg.Proxy,
