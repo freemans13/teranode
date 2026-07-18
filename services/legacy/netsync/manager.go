@@ -927,6 +927,11 @@ type SyncManager struct {
 	// Hash to recognise (and keep in the header list) the checkpoint block, and
 	// the block handler advances it as each checkpoint block is committed.
 	nextCheckpoint *chaincfg.Checkpoint
+	// checkpointsDisabled records config.DisableCheckpoints so that
+	// realignCheckpointCursor can never resurrect a cursor on a node started
+	// with checkpoints off (chainParams still lists them). Written once in
+	// New() before any goroutine starts; read-only afterwards.
+	checkpointsDisabled bool
 	// headerCheckpoint is the HEADER-request look-ahead cursor: the checkpoint
 	// the currently-outstanding getheaders request is heading toward. It is
 	// decoupled from nextCheckpoint so header download can run ahead of block
@@ -1139,6 +1144,70 @@ func (sm *SyncManager) findNextHeaderCheckpoint(height int32) *chaincfg.Checkpoi
 	return nextCheckpoint
 }
 
+// realignCheckpointCursor re-derives nextCheckpoint from the committed best
+// height and heals it when the stored value has gone stale, returning whether
+// it did. It exists because the cursor is a cache of "next checkpoint after
+// tip" that only the direct block path maintains (handleBlockMsg /
+// runPostBlockProcessing): the window pipeline commits checkpoint blocks
+// without advancing it — recognition matches only the current cursor hash, so
+// a checkpoint block fetched by the park-ahead before the cursor reaches it is
+// admitted as an ordinary block, and the re-delivery that WOULD be recognised
+// is discarded by the window-ownership guard before checkpoint handling runs.
+// Once stranded, the startSync headers-first gate (tip < cursor height)
+// evaluates false forever, and the first header-state reset past that point
+// latches the node into getblocks mode where no delivered block can resolve a
+// height: the mainnet wedge of 2026-07-17 (one committed block per 120-second
+// sync-peer rotation, ~1400 BLOCK_NOT_FOUND rejections per cycle, healed only
+// by restart — because New() runs exactly this derivation). Re-deriving at
+// every sync start removes the gate's dependency on incremental bookkeeping
+// entirely, whatever desynchronised it.
+//
+// Callers must NOT hold headerMu: on the stale path this calls
+// resetHeaderState, which takes headerMu for its whole body. startSync is
+// only ever invoked from the blockHandler event loop, so the brief window
+// between releasing headerMu and resetHeaderState re-taking it cannot race
+// another startSync.
+func (sm *SyncManager) realignCheckpointCursor(bestHash *chainhash.Hash, bestHeight int32) bool {
+	if sm.checkpointsDisabled {
+		return false
+	}
+
+	recomputed := sm.findNextHeaderCheckpoint(bestHeight)
+
+	sm.headerMu.Lock()
+
+	stored := sm.nextCheckpoint
+	stale := (stored == nil) != (recomputed == nil) ||
+		(stored != nil && recomputed != nil && stored.Height != recomputed.Height)
+
+	if stale {
+		sm.nextCheckpoint = recomputed
+	}
+
+	sm.headerMu.Unlock()
+
+	if !stale {
+		return false
+	}
+
+	formatCheckpoint := func(c *chaincfg.Checkpoint) string {
+		if c == nil {
+			return "nil"
+		}
+
+		return fmt.Sprintf("%d", c.Height)
+	}
+
+	sm.logger.Warnf("[startSync] checkpoint cursor stale (stored height %s, tip %d): realigned to %s, resetting header state",
+		formatCheckpoint(stored), bestHeight, formatCheckpoint(recomputed))
+
+	// Realign headerCheckpoint to the fresh cursor and reseed the header list
+	// from the committed tip so the next getheaders can link onto the chain.
+	sm.resetHeaderState(bestHash, bestHeight)
+
+	return true
+}
+
 // startSync will choose the best peer among the available candidate peers to
 // download/sync the blockchain from.  When syncing is already running, it
 // simply returns.  It also examines the candidates for any which are no longer
@@ -1294,6 +1363,10 @@ func (sm *SyncManager) startSync() {
 	// and fully validate them.  Finally, regression test mode does
 	// not support the headers-first approach so do normal block
 	// downloads when in regression test mode.
+	// Heal a stale checkpoint cursor before the gate below reads it — see
+	// realignCheckpointCursor for the strand mechanism this defends against.
+	sm.realignCheckpointCursor(bestBlockHeader.Hash(), bestBlockHeightInt32)
+
 	// Read the checkpoint cursors under headerMu and, in the headers-first
 	// branch, realign headerCheckpoint before releasing the lock. The
 	// PushGetHeadersMsg peer send must NOT be held under headerMu, so capture the
@@ -6737,6 +6810,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if err != nil {
 		return nil, err
 	}
+
+	sm.checkpointsDisabled = config.DisableCheckpoints
 
 	if !config.DisableCheckpoints {
 		bestBlockHeightInt32, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)
