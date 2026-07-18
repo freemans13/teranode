@@ -171,6 +171,14 @@ func TestParallelWindowMaxParkedBlocksDefault(t *testing.T) {
 	require.Equal(t, 16384, NewSettings().Legacy.ParallelWindowMaxParkedBlocks)
 }
 
+// TestWindowMaxBlocksDefault pins the decoupled commit-window count cap to 0,
+// which means "fall back to MaxBlocksBehindBlockAssembly" — byte-identical to the
+// pre-decoupling behaviour. A positive value below the maturity ceiling shrinks
+// the commit window so ParallelWindowPipeline can overlap two windows in flight.
+func TestWindowMaxBlocksDefault(t *testing.T) {
+	require.Equal(t, 0, NewSettings().Legacy.WindowMaxBlocks)
+}
+
 // Pin Phase C settings defaults: EarlyDAHBelowCheckpoint and PruneDeleteMarginBlocks
 func TestUtxoStore_PhaseC_Defaults(t *testing.T) {
 	tSettings := NewSettings()

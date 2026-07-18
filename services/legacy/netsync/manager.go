@@ -5603,7 +5603,17 @@ func (sm *SyncManager) blockHandler() {
 
 		if windowEnabled {
 			budget := windowBudgetBytes(windowFraction)
+			// The window's block-count cap can be set BELOW the maturity ceiling
+			// (MaxBlocksBehindBlockAssembly) so the pipeline flush worker commits a
+			// small window while the drain fills the next one from the remaining
+			// runway — overlapping CPU-side prep with disk-side commit instead of
+			// alternating (the IBD commit sawtooth). WindowMaxBlocks == 0 (or >= the
+			// ceiling) falls back to the ceiling, byte-identical to before. The
+			// maturity ceiling itself (releaseParkedBlocks) is unchanged.
 			maxBlocks := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
+			if wmb := sm.settings.Legacy.WindowMaxBlocks; wmb > 0 && wmb < maxBlocks {
+				maxBlocks = wmb
+			}
 			wa = newWindowAccumulator(budget, maxBlocks)
 			flushTimer = time.NewTimer(windowFlushTimerInterval)
 			flushTimer.Stop() // don't fire until we have blocks
