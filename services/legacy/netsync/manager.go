@@ -3988,27 +3988,18 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 		return
 	}
 
-	// Never execute a peer for OUR OWN backpressure: while the node throttles
-	// its reads because local validation is behind, the head block ages without
-	// any peer fault. Suppress, stamp, and require a full clean timeout window
-	// AFTER suppression ends before firing — measured live, unconditional 2s
-	// fires during self-backpressure seeded ~a third of the rotation-cascade
-	// storms. A genuinely hung pipeline un-suppresses itself via the
-	// stale-backlog escape in localReadBackpressured, so this cannot mask a
-	// real stall indefinitely.
-	if sm.localReadBackpressured() {
-		sm.headStallSuppressedAt = now
-		return
-	}
-
-	if !sm.headStallSuppressedAt.IsZero() && now.Sub(sm.headStallSuppressedAt) <= timeout {
-		return
-	}
-
 	// Find the HEAD = lowest-height outstanding block, and read its assignment,
 	// all under assignedMu (a cheap in-memory scan; no I/O). headerHeightIndex is
 	// guarded by headerMu, so take that too for the height lookups. Lock order is
 	// headerMu -> assignedMu; both are leaf locks released before any peer send.
+	//
+	// This scan runs BEFORE the backpressure suppression below so we can tell
+	// whether the outstanding head is the exact block the committer is blocked
+	// on (see frontierStalled). Under park-ahead, localReadBackpressured() is
+	// almost always true during IBD, so a blanket suppression here lets a silent
+	// frontier peer age all the way to the coarse 60s-TTL / rotation recovery
+	// (measured: 53-170s pipeline-idle stalls). Carving the frontier out of the
+	// suppression restores the ~2s fast peer-swap for exactly that case.
 	sm.headerMu.Lock()
 	sm.assignedMu.Lock()
 
@@ -4042,6 +4033,35 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 
 	if !haveHead || headPeer == nil {
 		return
+	}
+
+	// frontierStalled is true when the lowest outstanding (assigned-but-not-yet-
+	// delivered) block is exactly the one block the committer needs next:
+	// releaseParkedBlocks admits only height == cachedBlockAssemblyHeight+1, so
+	// when the head equals that, every higher parked block is held hostage and
+	// the whole commit pipeline is genuinely idle — the opposite of local
+	// read-backpressure. In that case we must NOT suppress: the silent frontier
+	// peer is the real fault and needs the fast swap.
+	cached := sm.cachedBlockAssemblyHeight.Load()
+	frontierStalled := sm.baHeightPolled.Load() && int64(headHeight) == int64(cached)+1
+
+	if !frontierStalled {
+		// Never execute a peer for OUR OWN backpressure: while the node throttles
+		// its reads because local validation is behind, the head block ages without
+		// any peer fault. Suppress, stamp, and require a full clean timeout window
+		// AFTER suppression ends before firing — measured live, unconditional 2s
+		// fires during self-backpressure seeded ~a third of the rotation-cascade
+		// storms. A genuinely hung pipeline un-suppresses itself via the
+		// stale-backlog escape in localReadBackpressured, so this cannot mask a
+		// real stall indefinitely.
+		if sm.localReadBackpressured() {
+			sm.headStallSuppressedAt = now
+			return
+		}
+
+		if !sm.headStallSuppressedAt.IsZero() && now.Sub(sm.headStallSuppressedAt) <= timeout {
+			return
+		}
 	}
 
 	if now.Sub(headAt) <= timeout {
