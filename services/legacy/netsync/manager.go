@@ -3823,17 +3823,51 @@ func (sm *SyncManager) fetchRunwayHorizon() (uint32, bool) {
 
 	span := uint32(maxBehind) + uint32(parkCap) //nolint:gosec // both guarded > 0 above
 
-	// Park-full backpressure: while the park cannot accept another beyond-gate block,
-	// drop the parkCap runway and clamp the frontier to the maturity gate, so neither
-	// the forward walk nor the refetch drain pulls un-parkable far-ahead blocks (which
-	// would only be park-rejected and requeued, churning the budget and starving the
-	// in-gate tip+1). Binary, not proportional: full → gate, otherwise → the full
-	// static cap, so a non-full park keeps the whole prefetch runway (no steady-state
-	// under-utilisation) and this is byte-identical whenever the park is not full. The
-	// drain goroutine is the sole reader and writer of park, so countFull is race-free
-	// here. Self-clearing: releaseParkedBlocks freeing a slot flips countFull→false and
-	// the runway springs back to the static cap on the next tick.
-	if park := sm.parkRef.Load(); park != nil && park.atCapacity() {
+	park := sm.parkRef.Load()
+
+	if sm.settings.Legacy.ParkRunwayByteSized {
+		// Byte-sized runway: instead of the binary full→gate / else→full-static-cap
+		// clamp below, size the beyond-gate runway N from the park's REMAINING byte
+		// room at the current average block size, so the horizon retreats SMOOTHLY as
+		// the park fills and springs back as releaseParkedBlocks frees bytes. This
+		// removes the fat-block span flap (full→gate→full) that pulls un-parkable
+		// far-ahead blocks into the refetch churn and starves the in-gate tip+1.
+		// N = clamp(remainingBytes/avgSize, 1, parkCap):
+		//   - floor 1 keeps the horizon strictly above the maturity gate, so the
+		//     frontier is always requestable (strictly better than the old binary
+		//     collapse to exactly the gate, which could push a stale-cache frontier
+		//     one height above the horizon).
+		//   - the park byte budget (park.budget) and blockSizeTracker average are the
+		//     SAME signals the park itself and calculateWindowK already use.
+		// Fall back to the full static cap (byte-identical to the flag-off path) when
+		// there is no park, the byte budget is disabled (ParallelWindowParkedMemoryFraction=0,
+		// budget<=0 — count-only mode), or no size samples exist yet (avg<=0, cold start).
+		if park != nil && park.budget > 0 {
+			if avg := sm.blockSizeTracker.getAverageSize(); avg > 0 {
+				remaining := park.budget - park.bytesAccum
+
+				var n int64
+				switch {
+				case remaining < avg:
+					n = 1
+				case remaining/avg > int64(parkCap):
+					n = int64(parkCap)
+				default:
+					n = remaining / avg
+				}
+
+				span = uint32(maxBehind) + uint32(n) //nolint:gosec // maxBehind>0, 1<=n<=parkCap
+			}
+		}
+	} else if park != nil && park.atCapacity() {
+		// Legacy binary park-full backpressure: while the park cannot accept another
+		// beyond-gate block, drop the parkCap runway and clamp the frontier to the
+		// maturity gate, so neither the forward walk nor the refetch drain pulls
+		// un-parkable far-ahead blocks (which would only be park-rejected and requeued,
+		// churning the budget and starving the in-gate tip+1). Binary: full → gate,
+		// otherwise → the full static cap. The drain goroutine is the sole reader and
+		// writer of park, so atCapacity is race-free here. Self-clearing: releaseParkedBlocks
+		// freeing a slot flips atCapacity→false and the runway springs back next tick.
 		span = uint32(maxBehind) //nolint:gosec // guarded > 0 above
 	}
 

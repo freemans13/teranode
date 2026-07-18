@@ -686,6 +686,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ParallelWindowParkedMemoryFraction: getFloat64("legacy_parallelWindowParkedMemoryFraction", 0.10, alternativeContext...),
 			ParallelWindowMaxParkedBlocks:      getInt("legacy_parallelWindowMaxParkedBlocks", 16384, alternativeContext...),
 			WindowMaxBlocks:                    getInt("legacy_windowMaxBlocks", 0, alternativeContext...),
+			ParkRunwayByteSized:                getBool("legacy_parkRunwayByteSized", false, alternativeContext...),
 			SyncPeerSilentTicks:                getInt("legacy_syncPeerSilentTicks", 2, alternativeContext...),
 			InFlightTxBudget:                   getInt("legacy_inFlightTxBudget", 50000, alternativeContext...),
 			InFlightByteBudget:                 int64(getInt("legacy_inFlightByteBudget", 0, alternativeContext...)),
