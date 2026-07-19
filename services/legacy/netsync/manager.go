@@ -3318,6 +3318,17 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	// different trigger. Reconcile catches these each tick and re-enqueues them.
 	sm.reconcileLostAssignments(time.Now())
 
+	// reconcileLostAssignments + checkHeadStall both key on assignedTo. The
+	// frontier can be orphaned OUTSIDE assignedTo entirely: the single-peer
+	// fetchHeaderBlocks checkpoint-boundary send records only in requestedBlocks,
+	// so a dropped/expired getdata there strands the frontier in NO ledger below
+	// the monotonic cursor — the headers-first wedge where the committed tip
+	// freezes while headers keep flowing and only a silent-peer rotation
+	// accidentally re-requests it. Recover it here, keyed on the committed-tip
+	// frontier; assignBlocksAcrossPeers below drains it (lowest-height-first) on
+	// this same tick.
+	sm.reconcileFrontierGap()
+
 	// Snapshot whether there is header runway under headerMu, then RELEASE the
 	// lock before calling fetchHeaderBlocks (which re-takes headerMu itself and
 	// must never be called with it held — the lock is non-reentrant).
@@ -4010,6 +4021,86 @@ func (sm *SyncManager) reconcileLostAssignments(now time.Time) {
 			st.requestedBlocks.Delete(h)
 		}
 	}
+}
+
+// reconcileFrontierGap re-requests the frontier block (committed_tip+1) when it
+// has become orphaned in NO ledger. reconcileLostAssignments and checkHeadStall
+// both key on assignedTo, but the single-peer fetchHeaderBlocks path — still
+// fired at every checkpoint boundary in handleHeadersMsg even under
+// ParallelFetchPeers>1 — records a getdata ONLY in requestedBlocks (60s TTL) and,
+// on a dropped send, enqueues nothing to refetchBlocks. A frontier lost there is
+// tracked in no ledger, sits below the monotonic startHeader cursor, and is
+// re-requestable today only by the accidental cursor rewind a silent-peer
+// rotation performs every ~3 min — the observed headers-first wedge (tip frozen
+// while headers keep flowing and checkpoints keep verifying). This closes that
+// split-brain by checking the frontier directly, keyed on the committed-tip
+// frontier rather than assignedTo, so recovery is independent of which sub-path
+// lost the block. Drain-goroutine only (same caller as reconcileLostAssignments).
+func (sm *SyncManager) reconcileFrontierGap() {
+	if sm.settings.Legacy.ParallelFetchPeers <= 1 {
+		// Single-peer machinery is unchanged; its top-up owns liveness there.
+		return
+	}
+
+	// Frontier = the lowest header whose block has not been consumed yet:
+	// headerList.Front(), skipping a stale leading seed (a retained checkpoint /
+	// committed-tip node that has no block of its own to fetch). O(1) — no scan.
+	sm.headerMu.Lock()
+	var (
+		frontier     chainhash.Hash
+		haveFrontier bool
+	)
+
+	for e := sm.headerList.Front(); e != nil; e = e.Next() {
+		if e == sm.headerListSeed {
+			continue
+		}
+
+		if node, ok := e.Value.(*headerNode); ok && node.hash != nil {
+			frontier = *node.hash
+			haveFrontier = true
+		}
+
+		break
+	}
+	sm.headerMu.Unlock()
+
+	if !haveFrontier {
+		return
+	}
+
+	// Outstanding to a peer, already in hand (parked/committing), or already
+	// queued for re-fetch? Then it is not orphaned — leave it alone.
+	if _, inFlight := sm.requestedBlocks.Get(frontier); inFlight {
+		return
+	}
+
+	if sm.windowBlockOwned(frontier) {
+		return
+	}
+
+	sm.assignedMu.Lock()
+	defer sm.assignedMu.Unlock()
+
+	if _, assigned := sm.assignedTo[frontier]; assigned {
+		return
+	}
+
+	if _, queued := sm.refetchBlocks[frontier]; queued {
+		return
+	}
+
+	// Orphaned frontier: outstanding to nobody, not in hand, not queued.
+	// drainRefetchBlocks re-checks haveInventory before sending, so a benign
+	// false positive (e.g. a block that arrives on the very next tick) self-
+	// corrects with no redundant getdata.
+	if sm.refetchBlocks == nil {
+		sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+	}
+
+	sm.refetchBlocks[frontier] = struct{}{}
+
+	sm.logger.Warnf("[reconcileFrontierGap] frontier block %s outstanding to nobody (lost on the single-peer fetch path); re-enqueuing for re-fetch", frontier)
 }
 
 func (sm *SyncManager) checkHeadStall(now time.Time) {
