@@ -3274,31 +3274,24 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 
 		// Record the in-flight entries only after the getdata actually went out,
 		// so a dropped batch leaves no phantom entries the window never re-tops.
-		// Also record the assignment (peer + time) in the stall-detector ledgers,
-		// keeping this single-peer path SYMMETRIC with assignBlocksAcrossPeers: both
-		// reconcileLostAssignments and checkHeadStall scan assignedTo, so without
-		// this a block requested here whose requestedBlocks TTL (60s) lapses before
-		// it arrives is tracked in NO ledger — a ledgerless frontier orphan that
-		// pins the tip and wedges IBD. Recording it here lets the timeout scans
-		// recover it. Arrival cleanup (handleBlockPreamble) already deletes all
-		// three ledgers unconditionally, so this cannot leak.
-		assignAt := time.Now()
-		sm.assignedMu.Lock()
-		if sm.assignedTo == nil {
-			sm.assignedTo = make(map[chainhash.Hash]*peerpkg.Peer)
-		}
-		if sm.assignedAt == nil {
-			sm.assignedAt = make(map[chainhash.Hash]time.Time)
-		}
+		//
+		// Deliberately NOT recorded in assignedTo/assignedAt here. checkHeadStall
+		// scans assignedTo and fast-swaps (disconnects) the peer holding the frontier
+		// block (committed_tip+1) if it is not delivered within its 2s timeout. The
+		// single-peer path fetches the frontier at every checkpoint boundary and
+		// during cold start, when the first block legitimately takes longer than 2s
+		// to arrive through a cold pipeline; recording it in assignedTo made
+		// checkHeadStall guillotine the sync peer every 2s before the block could
+		// land, resetting header sync and livelocking IBD at the first block (live
+		// mainnet 2026-07-20). The parallel scheduler (assignBlocksAcrossPeers) owns
+		// the assignedTo ledger and its checkHeadStall fast-swap; this single-peer
+		// path stays out of it. A frontier lost on this path (dropped send below, or
+		// a lapsed requestedBlocks TTL) is recovered by reconcileFrontierGap, which
+		// keys off the committed-tip frontier rather than assignedTo.
 		for _, h := range pendingHashes {
 			sm.requestedBlocks.Set(*h, struct{}{})
 			peerState.requestedBlocks.Set(*h, struct{}{})
-			sm.assignedTo[*h] = sp
-			sm.assignedAt[*h] = assignAt
-			// A block that actually went out is no longer awaiting re-fetch.
-			delete(sm.refetchBlocks, *h)
 		}
-		sm.assignedMu.Unlock()
 	}
 }
 

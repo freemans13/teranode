@@ -52,12 +52,16 @@ func blockNotFoundClient() *blockchain2.Mock {
 	return c
 }
 
-// TestFetchHeaderBlocks_SuccessfulSendRecordsAssignedTo: the primary prevention.
-// After a successful getdata the fetched hashes must appear in assignedTo (mapped to
-// the sync peer) and assignedAt, so the timeout scans can recover a block whose
-// requestedBlocks TTL lapses before it arrives. Previously they landed ONLY in
-// requestedBlocks and became ledgerless orphans on TTL expiry.
-func TestFetchHeaderBlocks_SuccessfulSendRecordsAssignedTo(t *testing.T) {
+// TestFetchHeaderBlocks_SuccessfulSendStaysOutOfAssignedTo: the single-peer path
+// must record the in-flight block in requestedBlocks but must NOT record it in
+// assignedTo. checkHeadStall scans assignedTo and disconnects the peer holding the
+// frontier block if it is not delivered within its aggressive 2s timeout; the
+// single-peer path fetches the frontier during cold start when the first block
+// legitimately takes longer than 2s, so recording it in assignedTo livelocked IBD
+// at the first block (mainnet 2026-07-20). Recovery of a frontier lost on this path
+// belongs to reconcileFrontierGap (keyed off the committed-tip frontier), not the
+// assignedTo timeout scans. This test locks that separation in.
+func TestFetchHeaderBlocks_SuccessfulSendStaysOutOfAssignedTo(t *testing.T) {
 	chainParams := chaincfg.MainNetParams
 
 	base := chainhash.Hash{0xc0}
@@ -110,17 +114,23 @@ func TestFetchHeaderBlocks_SuccessfulSendRecordsAssignedTo(t *testing.T) {
 	sm.assignedMu.Lock()
 	defer sm.assignedMu.Unlock()
 
-	require.NotEmpty(t, sm.assignedTo,
-		"a successful single-peer getdata must record assignedTo so the timeout scans can recover it")
-	require.Equal(t, len(sm.assignedTo), len(sm.assignedAt),
-		"assignedTo and assignedAt must stay in lock-step")
-	for h, p := range sm.assignedTo {
-		require.Same(t, syncPeer, p, "every assigned block must map to the sync peer that fetched it")
-		_, hasTime := sm.assignedAt[h]
-		require.True(t, hasTime, "every assignedTo entry must have an assignedAt timestamp")
-		_, inFlight := sm.requestedBlocks.Get(h)
-		require.True(t, inFlight, "a sent block must also be in the global requestedBlocks ledger")
+	require.Empty(t, sm.assignedTo,
+		"the single-peer path must NOT record assignedTo — that feeds checkHeadStall's 2s frontier fast-swap and livelocks cold-start IBD")
+	require.Empty(t, sm.assignedAt,
+		"assignedAt must stay empty alongside assignedTo on the single-peer path")
+
+	// The block must still be tracked in-flight so the window can top up correctly.
+	require.False(t, sm.startHeader == sm.headerList.Front().Next(),
+		"precondition: the walk must have advanced past at least one fetchable header")
+	inFlightCount := 0
+	for e := sm.headerList.Front().Next(); e != nil && e != sm.startHeader; e = e.Next() {
+		node := e.Value.(*headerNode)
+		if _, ok := sm.requestedBlocks.Get(*node.hash); ok {
+			inFlightCount++
+		}
 	}
+	require.Positive(t, inFlightCount,
+		"a successful single-peer getdata must record the sent blocks in requestedBlocks (in-flight ledger)")
 }
 
 // TestFetchHeaderBlocks_DroppedSendReQueuesRefetch: the second prevention path. When
