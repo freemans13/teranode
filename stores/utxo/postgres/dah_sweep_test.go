@@ -25,11 +25,14 @@ func TestDAHSchemaObjectsExist(t *testing.T) {
 		// The dead spends spent_at_height BRIN was dropped (commit ecdc43b4f): it only
 		// served the removed O(table) backstop, so there must be NO such index.
 		{"no spends spent_at_height brin", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_spent_at_height_brin')`},
-		// Composite btree (with INCLUDE (prev_output_idx)) drives the Index-Only
-		// candidate enumeration (scales with window spend-rows, not chain size);
-		// the old two-column form must be gone — the v15 band CTE selects
-		// prev_output_idx, which regressed it to a heap-visiting scan. See schema.go.
-		{"composite btree spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_h_hash_oidx_btree'`},
+		// Plain (spent_at_height) btree drives the band enumeration (ordered range scan,
+		// no spill). It replaced the covering (spent_at_height, prev_tx_hash) INCLUDE
+		// (prev_output_idx) form: under early-DAH churn the VM is never all-visible so the
+		// covering index-only scan heap-fetched anyway (measured 91% on live mainnet) — 60
+		// GB for no index-only benefit. Both the covering and old two-column forms must be
+		// gone. See the regime-change note in schema.go.
+		{"height btree spends", `SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_height_btree'`},
+		{"no covering INCLUDE spends btree", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_h_hash_oidx_btree')`},
 		{"no old two-column spends btree", `SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='spends_p00_h_hash_btree')`},
 		// The spends-driven sweep no longer scans txs by mined_at_height, so there must
 		// be NO index on it (a btree would hurt the hot mine UPDATE's HOT ratio).
