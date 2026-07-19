@@ -168,52 +168,73 @@ func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *
 		}
 	}
 
-	// Height indexes on spends. The DAH sweep enumerates candidate parents purely from
-	// the spends side by height window ("spends enumerate, txs decides").
+	// Height index on spends. The DAH sweep enumerates candidate parents purely from
+	// the spends side by height window ("spends enumerate, txs decides"). The v15 band
+	// CTE is
+	//     SELECT prev_tx_hash, prev_output_idx, spent_at_height
+	//       FROM spends_pNN WHERE spent_at_height > $wm AND spent_at_height <= $cap
+	//       ORDER BY spent_at_height LIMIT band_rows
+	// so the index MUST be range-scannable AND sort-ordered on spent_at_height: the
+	// ORDER BY .. LIMIT is the per-band work-quantisation, and losing that order makes
+	// the LIMIT sort the whole band and spill to pgsql_tmp — the ENOSPC watermark-freeze
+	// incident class. The per-band cost stays proportional to the band's spend-rows, not
+	// to accumulated chain size. spent_at_height is MONOTONIC (block height) so inserts
+	// land on the right-most leaf (cheap, hot-page append); spends is INSERT-ONLY so a
+	// btree does NOT break HOT (HOT is an UPDATE concern).
 	//
-	// BRIN(spent_at_height): near-free on insert; kept as a planner fallback and used by
-	// the backstop. But spent_at_height is only LOOSELY correlated with heap order
-	// (concurrent block validation interleaves heights), so its bitmap goes LOSSY — a
-	// 1024-height window rechecks ~1.9M rows / ~28k heap pages to keep ~280k (measured),
-	// which does not scale and pins the cold disk during the sweep.
+	// WHY A PLAIN (spent_at_height) btree, not the former covering form — a measured
+	// regime change, not a reversal:
 	//
-	// Composite btree (spent_at_height, prev_tx_hash) INCLUDE (prev_output_idx): makes
-	// the candidate enumeration an INDEX-ONLY range scan — it reads only the window's
-	// index leaves, no heap. The v15 band CTE selects prev_output_idx (for the
-	// spent-bitmap fold), so the column MUST live in the index: without it the scan
-	// silently degrades to a plain index scan with one heap visit per band row
-	// (EXPLAIN-verified on a 200K-row band: 201,858 buffers vs 1,881 index-only —
-	// the earlier two-column index had the index-only property measured on betfair
-	// as 22,728 buffers → ~520, and the v15 select list regressed it). The cursor's
-	// per-window cost stays proportional to that window's spend rows, NOT to
-	// accumulated chain size. spends is INSERT-ONLY so a btree does NOT break HOT
-	// (HOT is an UPDATE concern); spent_at_height is MONOTONIC (block height) so
-	// inserts land on the right-most leaf (cheap, hot-page append). NOTE: INCLUDE
-	// forfeits deduplicate_items (postgres never deduplicates indexes with INCLUDE
-	// columns), so this index is somewhat larger than the two-column form — the
-	// price of restoring zero heap fetches. Measured spend-INSERT cost of the
-	// two-column form was ~+18%; create/mine path: 0% (it does not write spends).
+	//   The prior index was (spent_at_height, prev_tx_hash) INCLUDE (prev_output_idx),
+	//   chosen so the band scan was INDEX-ONLY (all three columns index-resident, zero
+	//   heap fetches — measured 1,881 buffers vs 201,858 for a non-covering scan, and a
+	//   plain height-only btree once showed bimodal sweep throughput, V3 CV 38%). That
+	//   was correct WHILE spends were effectively insert-only: the visibility map stays
+	//   all-visible, so index-only actually fires. Early-DAH broke that precondition. It
+	//   deletes spends aggressively below the checkpoint (measured 479M spend deletes of
+	//   churn on live mainnet mid-IBD), so the VM is never all-visible and the covering
+	//   index-only scan fetches the heap ANYWAY: measured on that live table, 60,074 of
+	//   66,260 band rows (91%) were heap fetches. So the covering form paid the heap cost
+	//   regardless AND cost ~60 GB (7.4 GB/leaf) — an index-only advantage that had
+	//   already evaporated in this regime.
 	//
-	// LIVE-MIGRATION NOTE: on an existing large deployment the DROP+CREATE below
-	// blocks writes for the build duration; pre-create the new index with CREATE
-	// INDEX CONCURRENTLY (per leaf, then drop the old one) before deploying.
+	//   The plain (spent_at_height) btree is 114 MB/leaf (98.5% smaller — many spends
+	//   share each height so it deduplicates heavily; INCLUDE forfeits deduplicate_items,
+	//   the plain form regains it), returns the identical band rows in the same order (no
+	//   spill), and measured EQUIVALENT sweep buffers/latency on that same churned table
+	//   (both heap-bound; warm ~100 ms either way, plain slightly faster cold — a small
+	//   index to navigate instead of a cold 7.4 GB one). It is also cheaper to insert
+	//   (narrower row, dedup re-enabled; the covering form measured ~+18% spend-INSERT).
+	//   The old V3 bimodal collapse was the covering index's fast index-only mode beating
+	//   the height-only heap mode inconsistently; in the early-DAH regime both are
+	//   heap-bound, so there is no fast mode to be bimodal against. The swap is gated on
+	//   TestThroughput_QueueStorePruned showing no sweep-throughput collapse.
+	//
+	//   SEPARATE lever (not this change): the heap-bound sweep cost itself — the plain
+	//   index must visit a heap the churn has scattered by spent_at_height (delete-then-
+	//   reuse decorrelates it), and the same churn keeps the VM stale. Addressing either
+	//   (aggressive spends autovacuum to keep the VM fresh, or re-correlating the heap)
+	//   speeds the sweep independently of this index's size.
+	//
+	// LIVE-MIGRATION NOTE: on an existing large deployment build the new index with
+	// CREATE INDEX CONCURRENTLY per leaf BEFORE deploying, so the CREATE below is a
+	// no-op. The startup DROP of the old covering index is fast, but a blocking build of
+	// the new one at startup is not.
 	//
 	// There is deliberately NO index on txs.mined_at_height (uncorrelated; a btree there
 	// would break HOT on the hot mine UPDATE). The only txs that become fully-spent AT
 	// mine time without a spend in a swept window (zero-spendable) are stamped inline in
 	// SetMinedMulti; the rarer spent-while-unmined case is caught by the backstop.
 	for i := 0; i < numPartitions; i++ {
-		// spends_spent_at_height_brin removed: it only ever served the O(table) DAH
-		// backstop, which was deleted in 3e3f7f4e9. Bench-confirmed neutral on create/
-		// spend TPS (V1), so the BRIN is pure dead weight — one fewer index per spend
-		// INSERT. The composite (spent_at_height, prev_tx_hash) btree stays: it gives the
-		// DAH-sweep candidate enumeration an index-only scan and a height-only btree was
-		// bench-confirmed to cause bimodal sweep collapse (V3, CV 38%).
+		// Create the plain height btree FIRST (no-op if pre-built CONCURRENTLY for a
+		// live swap), THEN drop the superseded forms — so a height index is always
+		// present and the sweep never falls back to a seq scan mid-migration.
 		idxStmts := []string{
-			// Old two-column form: superseded by the INCLUDE form below (the v15
-			// band CTE needs prev_output_idx index-resident; see comment above).
+			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_height_btree ON spends_p%02d USING btree (spent_at_height)`, i, i),
+			// Superseded covering INCLUDE form (see the regime-change note above).
+			fmt.Sprintf(`DROP INDEX IF EXISTS spends_p%02d_h_hash_oidx_btree`, i),
+			// Ancient two-column form.
 			fmt.Sprintf(`DROP INDEX IF EXISTS spends_p%02d_h_hash_btree`, i),
-			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS spends_p%02d_h_hash_oidx_btree ON spends_p%02d USING btree (spent_at_height, prev_tx_hash) INCLUDE (prev_output_idx) WITH (fillfactor = 90)`, i, i),
 		}
 		for _, ddl := range idxStmts {
 			if _, err := pool.Exec(ctx, ddl); err != nil {
