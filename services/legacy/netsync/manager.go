@@ -3254,15 +3254,51 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		// goroutine (the refill tick calls this every InFlightRefillInterval).
 		if !sp.TryQueueMessage(getDataMessage) {
 			sm.logger.Debugf("[fetchHeaderBlocks] outputQueue full for peer %s, deferring getdata to next tick", sp.String())
+			// A dropped getdata must leave no phantom in-flight entry, but the
+			// startHeader cursor has ALREADY advanced past these hashes (above), so
+			// the monotonic forward walk can never re-reach them. Re-queue them for
+			// the next pass's re-fetch drain instead of silently discarding them —
+			// mirrors assignBlocksAcrossPeers' dropped-send handling. Without this a
+			// single dropped frontier getdata orphans the committed-tip+1 block and
+			// wedges the whole strictly-ascending download (the mainnet IBD wedge).
+			sm.assignedMu.Lock()
+			if sm.refetchBlocks == nil {
+				sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+			}
+			for _, h := range pendingHashes {
+				sm.refetchBlocks[*h] = struct{}{}
+			}
+			sm.assignedMu.Unlock()
 			return
 		}
 
 		// Record the in-flight entries only after the getdata actually went out,
 		// so a dropped batch leaves no phantom entries the window never re-tops.
+		// Also record the assignment (peer + time) in the stall-detector ledgers,
+		// keeping this single-peer path SYMMETRIC with assignBlocksAcrossPeers: both
+		// reconcileLostAssignments and checkHeadStall scan assignedTo, so without
+		// this a block requested here whose requestedBlocks TTL (60s) lapses before
+		// it arrives is tracked in NO ledger — a ledgerless frontier orphan that
+		// pins the tip and wedges IBD. Recording it here lets the timeout scans
+		// recover it. Arrival cleanup (handleBlockPreamble) already deletes all
+		// three ledgers unconditionally, so this cannot leak.
+		assignAt := time.Now()
+		sm.assignedMu.Lock()
+		if sm.assignedTo == nil {
+			sm.assignedTo = make(map[chainhash.Hash]*peerpkg.Peer)
+		}
+		if sm.assignedAt == nil {
+			sm.assignedAt = make(map[chainhash.Hash]time.Time)
+		}
 		for _, h := range pendingHashes {
 			sm.requestedBlocks.Set(*h, struct{}{})
 			peerState.requestedBlocks.Set(*h, struct{}{})
+			sm.assignedTo[*h] = sp
+			sm.assignedAt[*h] = assignAt
+			// A block that actually went out is no longer awaiting re-fetch.
+			delete(sm.refetchBlocks, *h)
 		}
+		sm.assignedMu.Unlock()
 	}
 }
 
