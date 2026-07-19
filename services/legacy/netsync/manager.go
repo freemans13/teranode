@@ -896,6 +896,16 @@ type SyncManager struct {
 	// last declined to fire because the node was throttling its own reads. The
 	// 2s BlockStallTimeout must not execute a peer for OUR backpressure.
 	headStallSuppressedAt time.Time
+	// frontierGapHash / frontierGapSince (drain goroutine only — reconcileFrontierGap
+	// runs from the refill tick) debounce the frontier-orphan re-request. The
+	// frontier can be briefly untracked by the ledgers reconcileFrontierGap checks
+	// while it is legitimately mid-flight (e.g. its 60s global requestedBlocks entry
+	// lapsed but the block is still coming from a slow peer). Re-requesting on every
+	// 20ms tick would churn (harmless to correctness but a log/CPU storm), so we only
+	// act once the SAME frontier has stayed orphaned longer than BlockInFlightTimeout,
+	// then re-arm — matching how reconcileLostAssignments gates on the same timeout.
+	frontierGapHash  chainhash.Hash
+	frontierGapSince time.Time
 	// headerHeightIndex maps each headerNode's block hash to its authoritative
 	// PoW-verified height. It allows handleBlockPreamble to resolve the height of
 	// blocks that arrive out of order (not at headerList.Front()), which happens
@@ -3327,7 +3337,7 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	// accidentally re-requests it. Recover it here, keyed on the committed-tip
 	// frontier; assignBlocksAcrossPeers below drains it (lowest-height-first) on
 	// this same tick.
-	sm.reconcileFrontierGap()
+	sm.reconcileFrontierGap(time.Now())
 
 	// Snapshot whether there is header runway under headerMu, then RELEASE the
 	// lock before calling fetchHeaderBlocks (which re-takes headerMu itself and
@@ -4036,7 +4046,7 @@ func (sm *SyncManager) reconcileLostAssignments(now time.Time) {
 // split-brain by checking the frontier directly, keyed on the committed-tip
 // frontier rather than assignedTo, so recovery is independent of which sub-path
 // lost the block. Drain-goroutine only (same caller as reconcileLostAssignments).
-func (sm *SyncManager) reconcileFrontierGap() {
+func (sm *SyncManager) reconcileFrontierGap(now time.Time) {
 	if sm.settings.Legacy.ParallelFetchPeers <= 1 {
 		// Single-peer machinery is unchanged; its top-up owns liveness there.
 		return
@@ -4066,41 +4076,69 @@ func (sm *SyncManager) reconcileFrontierGap() {
 	sm.headerMu.Unlock()
 
 	if !haveFrontier {
+		sm.frontierGapHash = chainhash.Hash{}
 		return
 	}
 
 	// Outstanding to a peer, already in hand (parked/committing), or already
-	// queued for re-fetch? Then it is not orphaned — leave it alone.
+	// queued for re-fetch? Then it is not orphaned: clear the debounce, leave it.
+	notOrphaned := false
 	if _, inFlight := sm.requestedBlocks.Get(frontier); inFlight {
+		notOrphaned = true
+	} else if sm.windowBlockOwned(frontier) {
+		notOrphaned = true
+	}
+
+	if !notOrphaned {
+		sm.assignedMu.Lock()
+		if _, assigned := sm.assignedTo[frontier]; assigned {
+			notOrphaned = true
+		} else if _, queued := sm.refetchBlocks[frontier]; queued {
+			notOrphaned = true
+		}
+		sm.assignedMu.Unlock()
+	}
+
+	if notOrphaned {
+		sm.frontierGapHash = chainhash.Hash{}
 		return
 	}
 
-	if sm.windowBlockOwned(frontier) {
+	// Frontier is orphaned right now. Debounce: it may just be mid-flight and
+	// briefly untracked (its 60s global requestedBlocks entry lapsed while a slow
+	// peer is still delivering). Only re-request once the SAME frontier has stayed
+	// orphaned longer than BlockInFlightTimeout, so an in-flight block that arrives
+	// within that window is never touched, yet a true orphan recovers in seconds
+	// instead of the old multi-minute silent-peer rotation.
+	if sm.frontierGapHash != frontier {
+		sm.frontierGapHash = frontier
+		sm.frontierGapSince = now
+
 		return
 	}
 
+	timeout := sm.settings.Legacy.BlockInFlightTimeout
+	if timeout > 0 && now.Sub(sm.frontierGapSince) < timeout {
+		return
+	}
+
+	orphanedFor := now.Sub(sm.frontierGapSince)
+
+	// Persisted orphan: outstanding to nobody for > BlockInFlightTimeout. Re-enqueue
+	// once and re-arm the debounce so we do not churn on every subsequent tick.
+	// drainRefetchBlocks re-checks haveInventory before sending, so a benign false
+	// positive self-corrects with no redundant getdata.
 	sm.assignedMu.Lock()
-	defer sm.assignedMu.Unlock()
-
-	if _, assigned := sm.assignedTo[frontier]; assigned {
-		return
-	}
-
-	if _, queued := sm.refetchBlocks[frontier]; queued {
-		return
-	}
-
-	// Orphaned frontier: outstanding to nobody, not in hand, not queued.
-	// drainRefetchBlocks re-checks haveInventory before sending, so a benign
-	// false positive (e.g. a block that arrives on the very next tick) self-
-	// corrects with no redundant getdata.
 	if sm.refetchBlocks == nil {
 		sm.refetchBlocks = make(map[chainhash.Hash]struct{})
 	}
 
 	sm.refetchBlocks[frontier] = struct{}{}
+	sm.assignedMu.Unlock()
 
-	sm.logger.Warnf("[reconcileFrontierGap] frontier block %s outstanding to nobody (lost on the single-peer fetch path); re-enqueuing for re-fetch", frontier)
+	sm.frontierGapSince = now
+
+	sm.logger.Warnf("[reconcileFrontierGap] frontier block %s orphaned for %s (lost on the single-peer fetch path); re-enqueuing for re-fetch", frontier, orphanedFor)
 }
 
 func (sm *SyncManager) checkHeadStall(now time.Time) {

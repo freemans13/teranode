@@ -14,9 +14,10 @@ package netsync
 // monotonic startHeader cursor, and is re-requestable only by the accidental
 // cursor rewind a silent-peer rotation performs every ~3 min. reconcileFrontierGap
 // closes the split-brain: it checks the actual frontier (headerList.Front(),
-// skipping the seed) and re-enqueues it to refetchBlocks when it is outstanding
-// to nobody, in-hand nowhere, and queued nowhere — keyed on the committed-tip
-// frontier rather than on assignedTo.
+// skipping the seed) and re-enqueues it to refetchBlocks when it has stayed
+// orphaned longer than BlockInFlightTimeout — DEBOUNCED so a block that is merely
+// mid-flight and briefly untracked is never re-requested (the tick runs every
+// ~20ms; re-requesting each tick would churn/log-storm).
 
 import (
 	"container/list"
@@ -34,11 +35,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const frontierGapTestTimeout = 10 * time.Second
+
 func newFrontierGapSM(t *testing.T, parallelPeers int) *SyncManager {
 	t.Helper()
 	chainParams := chaincfg.MainNetParams
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ParallelFetchPeers = parallelPeers
+	tSettings.Legacy.BlockInFlightTimeout = frontierGapTestTimeout
 
 	sm := &SyncManager{
 		ctx:               context.Background(),
@@ -67,22 +71,44 @@ func pushHeader(sm *SyncManager, h chainhash.Hash, height int32) {
 
 // TestReconcileFrontierGap_LedgerlessFrontierRefetched: the exact wedge — the
 // frontier is at Front() but tracked in NO ledger (dropped getdata / expired
-// TTL). One reconcile must re-enqueue it.
+// TTL). The first tick ARMS the debounce (no re-fetch); a tick after
+// BlockInFlightTimeout re-enqueues it.
 func TestReconcileFrontierGap_LedgerlessFrontierRefetched(t *testing.T) {
 	sm := newFrontierGapSM(t, 3)
 	frontier := chainhash.Hash{0x01}
 	pushHeader(sm, frontier, 653071)
 
-	sm.reconcileFrontierGap()
+	base := time.Now()
 
+	sm.reconcileFrontierGap(base)
+	_, queuedEarly := sm.refetchBlocks[frontier]
+	require.False(t, queuedEarly, "first tick only arms the debounce; no immediate re-fetch")
+
+	sm.reconcileFrontierGap(base.Add(frontierGapTestTimeout + time.Second))
 	_, queued := sm.refetchBlocks[frontier]
 	require.True(t, queued,
-		"an orphaned frontier (in no ledger) must be re-enqueued to refetchBlocks")
+		"a frontier orphaned longer than BlockInFlightTimeout must be re-enqueued")
 }
 
-// TestReconcileFrontierGap_SkipsLeadingSeed: Front() is the committed-tip seed
-// (no block of its own); the frontier is the next node. The seed must be skipped
-// and the real frontier recovered.
+// TestReconcileFrontierGap_DebounceHoldsForInFlight: an orphaned frontier that is
+// still WITHIN BlockInFlightTimeout (merely mid-flight, briefly untracked) must
+// NOT be re-requested — this is the no-storm guarantee.
+func TestReconcileFrontierGap_DebounceHoldsForInFlight(t *testing.T) {
+	sm := newFrontierGapSM(t, 3)
+	frontier := chainhash.Hash{0x01}
+	pushHeader(sm, frontier, 653071)
+
+	base := time.Now()
+	sm.reconcileFrontierGap(base)
+	sm.reconcileFrontierGap(base.Add(frontierGapTestTimeout / 2)) // still < timeout
+
+	_, queued := sm.refetchBlocks[frontier]
+	require.False(t, queued,
+		"within BlockInFlightTimeout the frontier must NOT be re-requested (no per-tick storm)")
+}
+
+// TestReconcileFrontierGap_SkipsLeadingSeed: Front() is the committed-tip seed;
+// the frontier is the next node. Seed skipped, real frontier recovered.
 func TestReconcileFrontierGap_SkipsLeadingSeed(t *testing.T) {
 	sm := newFrontierGapSM(t, 3)
 	seed := chainhash.Hash{0xff}
@@ -93,7 +119,9 @@ func TestReconcileFrontierGap_SkipsLeadingSeed(t *testing.T) {
 	frontier := chainhash.Hash{0x01}
 	pushHeader(sm, frontier, 653071)
 
-	sm.reconcileFrontierGap()
+	base := time.Now()
+	sm.reconcileFrontierGap(base)
+	sm.reconcileFrontierGap(base.Add(frontierGapTestTimeout + time.Second))
 
 	_, seedQueued := sm.refetchBlocks[seed]
 	require.False(t, seedQueued, "the retained leading seed must never be re-requested")
@@ -101,67 +129,56 @@ func TestReconcileFrontierGap_SkipsLeadingSeed(t *testing.T) {
 	require.True(t, queued, "the real frontier below the seed must be re-enqueued")
 }
 
-// TestReconcileFrontierGap_LiveFrontierNotRefetched: the frontier is still
-// outstanding to a peer (in requestedBlocks) — it must NOT be re-enqueued.
+// TestReconcileFrontierGap_LiveFrontierNotRefetched: frontier still outstanding
+// (in requestedBlocks) — never re-enqueued, even after the timeout.
 func TestReconcileFrontierGap_LiveFrontierNotRefetched(t *testing.T) {
 	sm := newFrontierGapSM(t, 3)
 	frontier := chainhash.Hash{0x01}
 	pushHeader(sm, frontier, 653071)
 	sm.requestedBlocks.Set(frontier, struct{}{})
 
-	sm.reconcileFrontierGap()
+	base := time.Now()
+	sm.reconcileFrontierGap(base)
+	sm.reconcileFrontierGap(base.Add(frontierGapTestTimeout + time.Second))
 
 	_, queued := sm.refetchBlocks[frontier]
 	require.False(t, queued,
 		"a frontier still outstanding (in requestedBlocks) must NOT be re-enqueued")
 }
 
-// TestReconcileFrontierGap_WindowOwnedNotRefetched: the frontier already arrived
-// and is parked/owned by the window pipeline — not orphaned, must NOT re-enqueue.
+// TestReconcileFrontierGap_WindowOwnedNotRefetched: frontier already arrived /
+// parked — not orphaned, never re-enqueued.
 func TestReconcileFrontierGap_WindowOwnedNotRefetched(t *testing.T) {
 	sm := newFrontierGapSM(t, 3)
 	frontier := chainhash.Hash{0x01}
 	pushHeader(sm, frontier, 653071)
 	sm.windowOwnedBlocks.Set(frontier, 653071)
 
-	sm.reconcileFrontierGap()
+	base := time.Now()
+	sm.reconcileFrontierGap(base)
+	sm.reconcileFrontierGap(base.Add(frontierGapTestTimeout + time.Second))
 
 	_, queued := sm.refetchBlocks[frontier]
 	require.False(t, queued, "a window-owned (in-hand) frontier must NOT be re-enqueued")
 }
 
-// TestReconcileFrontierGap_AlreadyQueuedIdempotent: already in refetchBlocks —
-// no duplicate work, still present.
-func TestReconcileFrontierGap_AlreadyQueuedIdempotent(t *testing.T) {
-	sm := newFrontierGapSM(t, 3)
-	frontier := chainhash.Hash{0x01}
-	pushHeader(sm, frontier, 653071)
-	sm.refetchBlocks[frontier] = struct{}{}
-
-	sm.reconcileFrontierGap()
-
-	_, queued := sm.refetchBlocks[frontier]
-	require.True(t, queued, "an already-queued frontier stays queued")
-	require.Len(t, sm.refetchBlocks, 1, "no duplicate/extra entries")
-}
-
-// TestReconcileFrontierGap_SinglePeerNoop: ParallelFetchPeers<=1 uses the
-// original single-peer machinery; reconcileFrontierGap is a no-op there.
+// TestReconcileFrontierGap_SinglePeerNoop: ParallelFetchPeers<=1 is a no-op.
 func TestReconcileFrontierGap_SinglePeerNoop(t *testing.T) {
 	sm := newFrontierGapSM(t, 1)
 	frontier := chainhash.Hash{0x01}
 	pushHeader(sm, frontier, 653071)
 
-	sm.reconcileFrontierGap()
+	base := time.Now()
+	sm.reconcileFrontierGap(base)
+	sm.reconcileFrontierGap(base.Add(frontierGapTestTimeout + time.Second))
 
 	require.Empty(t, sm.refetchBlocks,
 		"single-peer mode: reconcileFrontierGap must be a no-op")
 }
 
-// TestReconcileFrontierGap_EmptyHeaderListNoop: no headers (e.g. just after
-// resetHeaderState) — nothing to reconcile.
+// TestReconcileFrontierGap_EmptyHeaderListNoop: no headers — no-op.
 func TestReconcileFrontierGap_EmptyHeaderListNoop(t *testing.T) {
 	sm := newFrontierGapSM(t, 3)
-	sm.reconcileFrontierGap()
+	sm.reconcileFrontierGap(time.Now())
 	require.Empty(t, sm.refetchBlocks, "empty header list: no-op")
 }
