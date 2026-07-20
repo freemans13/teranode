@@ -76,6 +76,19 @@ const (
 	// window to a few minutes while making the audit cost negligible.
 	connReconcileInterval = time.Minute
 
+	// dnsReseedCheckInterval is how often dnsReseedHandler samples the address
+	// table size. It is deliberately much shorter than the minimum re-seed
+	// interval that actually gates the lookup — sampling cheaply and often means
+	// a table that drains just after an interval boundary is refilled as soon as
+	// the rate limit allows, instead of waiting most of another interval.
+	dnsReseedCheckInterval = time.Minute
+
+	// feelerHandshakeTimeout bounds a single feeler attempt end to end (dial,
+	// version/verack, teardown). A black-hole address must never be able to hold
+	// the feeler goroutine open, because there is only one of them and a stuck
+	// feeler silently stops all address verification.
+	feelerHandshakeTimeout = 30 * time.Second
+
 	// connPhantomStrikes is how many consecutive audit passes an id tracked
 	// as open must go without a backing live peer before it is evicted as a
 	// phantom. Three one-minute strikes sit far beyond the ~30s dial+handshake
@@ -2856,20 +2869,33 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 			OnCreateStream: sp.OnCreateStream,
 			OnStreamAck:    sp.OnStreamAck,
 		},
-		AddrMe:             addrMe,
-		ReadBackpressured:  sp.server.syncManager.ReadBackpressured,
-		NewestBlock:        sp.newestBlock,
-		HostToNetAddress:   sp.server.addrManager.HostToNetAddress,
-		Proxy:              cfg.Proxy,
-		UserAgentName:      userAgentName,
-		UserAgentVersion:   version.String(),
-		UserAgentComments:  cfg.UserAgentComments,
-		ChainParams:        sp.server.settings.ChainCfgParams,
-		Services:           sp.server.services,
-		DisableRelayTx:     cfg.BlocksOnly,
-		ProtocolVersion:    peer.MaxProtocolVersion,
-		TrickleInterval:    cfg.TrickleInterval,
-		AllowBlockPriority: sp.server.settings.Legacy.AllowBlockPriority,
+		AddrMe:            addrMe,
+		ReadBackpressured: sp.server.syncManager.ReadBackpressured,
+		// While the FSM says CATCHINGBLOCKS the peer layer must be as patient as
+		// svnode is: a peer streaming a 4 GB checkpoint desert legitimately goes
+		// quiet for minutes, and the tip-tuned stall/idle deadlines were tearing
+		// those peers down mid-download and forcing a fresh headers-first restart.
+		// Leaving this nil selects today's tip constants everywhere, which is the
+		// rollback lever.
+		InitialBlockDownload: sp.server.syncManager.InitialBlockDownload,
+		// The liveness clock that makes the widened headers deadline safe: extra
+		// patience is only granted while the header frontier is still advancing.
+		// A frozen frontier is a real wedge, and without this hook the peer layer
+		// fails closed (no extension), so it must be wired whenever
+		// InitialBlockDownload is.
+		HeaderProgressStalled: sp.server.syncManager.HeaderProgressStalled,
+		NewestBlock:           sp.newestBlock,
+		HostToNetAddress:      sp.server.addrManager.HostToNetAddress,
+		Proxy:                 cfg.Proxy,
+		UserAgentName:         userAgentName,
+		UserAgentVersion:      version.String(),
+		UserAgentComments:     cfg.UserAgentComments,
+		ChainParams:           sp.server.settings.ChainCfgParams,
+		Services:              sp.server.services,
+		DisableRelayTx:        cfg.BlocksOnly,
+		ProtocolVersion:       peer.MaxProtocolVersion,
+		TrickleInterval:       cfg.TrickleInterval,
+		AllowBlockPriority:    sp.server.settings.Legacy.AllowBlockPriority,
 	}
 }
 
@@ -3033,6 +3059,81 @@ func (s *server) reconcileConnAccounting(state *peerState, strikes map[uint64]in
 	}
 }
 
+// seedFromDNS queries the network's DNS seeders and feeds everything they
+// return into the address manager. Callers own the rate limiting; this does
+// none of its own.
+func (s *server) seedFromDNS() {
+	connmgr.SeedFromDNS(activeNetParams.Params, defaultRequiredServices,
+		bsvdLookup, func(addrs []*wire.NetAddress) {
+			// Bitcoind uses a lookup of the dns seeder here. This
+			// is rather strange since the values looked up by the
+			// DNS seed lookups will vary quite a lot.
+			// to replicate this behaviour we put all addresses as
+			// having come from the first one.
+			s.addrManager.AddAddresses(addrs, addrs[0])
+		})
+}
+
+// dnsReseedHandler re-queries the DNS seeders whenever the address table falls
+// below the low-water mark.
+//
+// The failure this prevents: the startup seed was the only thing that ever put
+// addresses in the table, and during a multi-day initial block download the
+// table only shrinks — dials that fail age entries out and a node with a single
+// sync peer learns almost nothing new via addr gossip. Once it is empty,
+// newAddressFunc returns "no valid connect address", the replenishment loop
+// cannot refill an outbound slot, and one ordinary disconnect becomes an
+// open-ended stall. Re-seeding costs one DNS lookup per half hour at worst.
+//
+// It must be run in a goroutine.
+func (s *server) dnsReseedHandler() {
+	defer s.wg.Done()
+
+	minAddresses := s.settings.Legacy.DNSReseedMinAddresses
+	minInterval := s.settings.Legacy.DNSReseedMinInterval
+
+	// Zero disables: this is the rollback lever back to the historical
+	// single startup seed.
+	if minAddresses <= 0 || minInterval <= 0 {
+		return
+	}
+
+	// The startup seed we just performed counts as the most recent one, so the
+	// earliest possible re-seed is one full interval from now.
+	lastSeed := time.Now()
+
+	// Check far more often than we are allowed to act, so that a table which
+	// drains mid-interval is re-seeded promptly once the interval elapses
+	// rather than up to a whole interval later.
+	ticker := time.NewTicker(dnsReseedCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.quit:
+			return
+
+		case <-ticker.C:
+			if time.Since(lastSeed) < minInterval {
+				continue
+			}
+
+			known := s.addrManager.NumAddresses()
+			if known >= minAddresses {
+				continue
+			}
+
+			s.logger.Infof("[dns-reseed] address table low: known=%d threshold=%d, re-seeding from DNS", known, minAddresses)
+
+			s.seedFromDNS()
+
+			// Stamp regardless of how many addresses actually arrived: a seeder
+			// that returns nothing must not be retried every check interval.
+			lastSeed = time.Now()
+		}
+	}
+}
+
 // peerHandler is used to handle peer operations such as adding and removing
 // peers to and from the server, banning peers, and broadcasting messages to
 // peers.  It must be run in a goroutine.
@@ -3059,16 +3160,24 @@ func (s *server) peerHandler() {
 
 	if !cfg.DisableDNSSeed {
 		// Add peers discovered through DNS to the address manager.
-		connmgr.SeedFromDNS(activeNetParams.Params, defaultRequiredServices,
-			bsvdLookup, func(addrs []*wire.NetAddress) {
-				// Bitcoind uses a lookup of the dns seeder here. This
-				// is rather strange since the values looked up by the
-				// DNS seed lookups will vary quite a lot.
-				// to replicate this behaviour we put all addresses as
-				// having come from the first one.
-				s.addrManager.AddAddresses(addrs, addrs[0])
-			})
+		s.seedFromDNS()
+
+		// ...and keep topping the table up. During the checkpoint desert the node
+		// is effectively single-sourced, so the address table only ever drains:
+		// every failed dial ages an entry and nothing refills it. A node that runs
+		// its table dry has no candidates left to replace a lost peer with, which
+		// turns one disconnect into a long stall. This watches the low-water mark
+		// and re-seeds, rate-limited so we are never abusive towards the seeders.
+		s.wg.Add(1)
+
+		go s.dnsReseedHandler()
 	}
+
+	// Feeler: periodically hand-shake a single address outside the connection
+	// manager to keep the pool verified. See feeler.go.
+	s.wg.Add(1)
+
+	go s.feelerHandler()
 
 	// Connection-accounting audit (see reconcileConnAccounting): a periodic
 	// backstop so no bookkeeping leak can silently starve the node again.
@@ -3862,6 +3971,11 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		Dial:           bsvdDial,
 		OnConnection:   s.outboundPeerConnected,
 		GetNewAddress:  newAddressFunc,
+		// A minute between replenishment passes meant a peer lost early in an
+		// interval left the node running below target for the rest of it — during
+		// IBD that is a minute of lost download bandwidth per disconnect. Zero
+		// restores the historical one-minute cadence.
+		ReplenishInterval: tSettings.Legacy.ReplenishInterval,
 	})
 	if err != nil {
 		return nil, err

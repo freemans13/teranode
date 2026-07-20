@@ -65,6 +65,11 @@ func TestCheckHeadStall_DisconnectsStalledHeadPeerAndFreesAssignments(t *testing
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ParallelFetchPeers = 3
 	tSettings.Legacy.BlockStallTimeout = 2 * time.Second
+	// This test pins the IMMEDIATE-disconnect path (pre-F1 behaviour): 0 disables
+	// the F1 re-fetch-race window so a stalled head peer is dropped at
+	// BlockStallTimeout on the first tick, which is what it asserts below. The
+	// race path (default 30s) is covered by headstall_race_test.go.
+	tSettings.Legacy.HeadStallDisconnectTimeout = 0
 
 	stateA := newEligiblePeerState()
 	stateB := newEligiblePeerState()

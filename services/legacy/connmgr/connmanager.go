@@ -38,7 +38,25 @@ var (
 	// defaultTargetOutbound is the default number of outbound connections to
 	// maintain.
 	defaultTargetOutbound = uint32(8)
+
+	// defaultReplenishInterval is the cadence of the outbound replenishment
+	// loop when Config.ReplenishInterval is left unset. One minute is the
+	// historical value: leaving the setting at zero reproduces the old
+	// behaviour exactly, so it is the rollback for the continuous-replenish
+	// change.
+	defaultReplenishInterval = time.Minute
 )
+
+// replenishWakeDebounce is the minimum spacing between two wake-driven
+// replenishment passes. The wake channel exists so that a freed outbound slot
+// is patched in about a second instead of waiting up to a full tick, but a
+// single network event can disconnect many peers at once. Without this window
+// each of those disconnects would drive its own pass, and because a dial that
+// has been launched but has not yet registered as pending is invisible for a
+// few microseconds, those passes can each over-count the deficit by one and
+// dial an extra address. The window collapses a burst into one pass; anything
+// it swallows is picked up by the next tick.
+const replenishWakeDebounce = 100 * time.Millisecond
 
 // ConnState represents the state of the requested connection.
 type ConnState uint8
@@ -153,7 +171,28 @@ type Config struct {
 
 	// TargetOutbound is the number of outbound network connections to
 	// maintain. Defaults to 8.
+	//
+	// This target covers the AUTOMATIC outbound tier only. Permanent
+	// (addnode) requests are accounted separately and never consume one of
+	// these slots — see automaticCounts. Callers that dial outside the
+	// connection manager entirely (for example a feeler probe) are likewise
+	// invisible here by construction: the connection manager's books are the
+	// sole authority for the automatic slots, so anything that must not
+	// count against the target must not be handed to Connect or NewConnReq.
 	TargetOutbound uint32
+
+	// ReplenishInterval is how often the connection manager re-checks its
+	// outbound count and dials to close any deficit. The old fixed value was
+	// one minute, which meant a peer lost early in a tick left its slot empty
+	// for the best part of a minute — during initial block download, with
+	// peers churning constantly, that is a large share of the download window
+	// spent below target. A short interval (a couple of seconds) patches the
+	// hole roughly as fast as svnode's continuously running connection thread
+	// does.
+	//
+	// Defaults to defaultReplenishInterval (one minute) when zero, which is
+	// the byte-identical rollback to the previous behaviour.
+	ReplenishInterval time.Duration
 
 	// RetryDuration is the duration to wait before retrying connection
 	// requests. Defaults to 5s.
@@ -222,8 +261,81 @@ type ConnManager struct {
 	// conns represents the set of all actively connected peers.
 	conns *txmap.SyncedMap[uint64, *ConnReq]
 
+	// replenishWake nudges the replenishment loop to run before its next
+	// tick. It is a coalescing signal and never a queue: the buffer is one
+	// deep and sends are non-blocking, so any number of connection events
+	// arriving between two passes collapse into a single wake-up.
+	replenishWake chan struct{}
+
+	// replenishBackoffUntil (UnixNano; 0 = no backoff) suspends replenishment
+	// passes while consecutive dial failures say the NETWORK is down rather than
+	// a peer. Written from connHandler, read from replenishHandler, hence atomic.
+	replenishBackoffUntil atomic.Int64
+
 	// teranode addition
 	logger ulogger.Logger
+}
+
+// signalReplenish asks the replenishment loop to run now rather than waiting
+// for its next tick, so a slot freed by a disconnect is refilled immediately
+// instead of leaving the node below target for the rest of the interval.
+//
+// The send is non-blocking on purpose. This is called from connHandler, which
+// is the single serialisation point for all connection state; if it ever
+// blocked, a burst of disconnects would stall every other connection event
+// behind it.
+//
+// ReplenishInterval <= 0 is the rollback lever, and it must back out the whole
+// change, not just the cadence: with the event-driven path still live the lever
+// could not isolate "dials too often" from "dials on every connection event", so
+// an operator suspecting a dial storm would have no way to test the hypothesis.
+func (cm *ConnManager) signalReplenish() {
+	if cm.cfg.ReplenishInterval <= 0 {
+		return
+	}
+
+	select {
+	case cm.replenishWake <- struct{}{}:
+	default:
+	}
+}
+
+// automaticCounts returns how many established and pending connection requests
+// belong to the automatic outbound tier.
+//
+// Permanent (addnode) requests are excluded from both counts. They have their
+// own retry and backoff path and are not subject to the target: counting them
+// here would let a single addnode peer silently occupy one of the automatic
+// slots, which quietly costs the node one of the independent address groups
+// that the outbound diversity rules are trying to buy.
+func (cm *ConnManager) automaticCounts() (established, pending int) {
+	cm.conns.Iterate(func(_ uint64, connReq *ConnReq) bool {
+		if !connReq.Permanent {
+			established++
+		}
+
+		return true
+	})
+
+	cm.pending.Iterate(func(_ uint64, connReq *ConnReq) bool {
+		if !connReq.Permanent {
+			pending++
+		}
+
+		return true
+	})
+
+	return established, pending
+}
+
+// AutomaticOutboundCount returns the number of currently established automatic
+// outbound connections, excluding permanent (addnode) peers. This is the number
+// the target applies to, so it is the number to watch when judging whether the
+// node is actually holding its outbound quota during initial block download.
+func (cm *ConnManager) AutomaticOutboundCount() int {
+	established, _ := cm.automaticCounts()
+
+	return established
 }
 
 // handleFailedConn handles a connection failed due to a disconnect or any
@@ -260,8 +372,25 @@ func (cm *ConnManager) handleFailedConn(c *ConnReq) {
 			time.AfterFunc(cm.cfg.RetryDuration, func() {
 				cm.NewConnReq()
 			})
+
+			// Once this many attempts have failed in a row we assume the network,
+			// not the peer, is down, and the whole point of the delay above is to
+			// stop hammering it. Withholding the wake is not enough on its own:
+			// the periodic pass is now far shorter than RetryDuration, and a dial
+			// that fails instantly (ENETUNREACH) leaves cm.pending empty, so every
+			// tick would see the full deficit and launch a fresh round — burning
+			// and penalising an address per dial until the address book erodes
+			// below the re-seed floor. Suspend the periodic pass for the same
+			// RetryDuration so both paths back off together.
+			cm.replenishBackoffUntil.Store(time.Now().Add(cm.cfg.RetryDuration).UnixNano())
 		} else {
 			go cm.NewConnReq()
+
+			// The replacement dial above covers this slot, but wake the
+			// replenishment loop anyway: if this failure was one of several,
+			// the loop is the only thing that reconciles the whole book back
+			// to target rather than one slot at a time.
+			cm.signalReplenish()
 		}
 	}
 }
@@ -305,6 +434,10 @@ out:
 				cm.logger.Debugf("Connected to %v", connReq)
 				connReq.retryCount.Store(0)
 				cm.failedAttempts = 0
+				// A dial got through, so the network is evidently not down. Lift
+				// the replenishment backoff immediately rather than making the
+				// node wait out a RetryDuration it no longer needs.
+				cm.replenishBackoffUntil.Store(0)
 
 				cm.pending.Delete(connReq.id)
 
@@ -328,6 +461,8 @@ out:
 					connReq.updateState(ConnCanceled)
 					cm.logger.Debugf("Canceling: %v", connReq)
 					cm.pending.Delete(msg.id)
+					cm.signalReplenish()
+
 					continue
 				}
 
@@ -351,6 +486,13 @@ out:
 				// make no further attempts with this request.
 				if !msg.retry {
 					connReq.updateState(ConnDisconnected)
+
+					// Nothing here will ever dial again for this slot — this is
+					// the path taken by Remove, including the server's eviction
+					// of phantom connections. Without a wake the slot would sit
+					// empty until the next tick.
+					cm.signalReplenish()
+
 					continue
 				}
 
@@ -368,6 +510,11 @@ out:
 
 					cm.handleFailedConn(connReq)
 				}
+
+				// Signalled last, once this connection's state has settled, so
+				// the replenishment loop reads a book that already reflects the
+				// re-pend above and cannot double-count the freed slot.
+				cm.signalReplenish()
 
 			case handleFailed:
 				connReq := msg.c
@@ -638,43 +785,128 @@ func (cm *ConnManager) Start() {
 		go cm.NewConnReq()
 	}
 
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-cm.quit:
-				return
-			case <-ticker.C:
-				// Periodically replenish outbound connections. We might have disconnected
-				// or learned of new addresses since the last tick. cm.conns counts a ConnReq
-				// from the moment its TCP connection is established (handleConnected), before
-				// the bitcoin handshake completes, so in-flight dials already count against the
-				// deficit here. That keeps this backstop from dialing the same slots repeatedly.
-				connectionsOpen := cm.conns.Length()
-				deficit := replenishDeficit(connectionsOpen, int(cm.cfg.TargetOutbound))
-
-				cm.logger.Infof("[connmgr] replenish check: conns=%d pending=%d target=%d dialing=%d",
-					connectionsOpen, cm.pending.Length(), cm.cfg.TargetOutbound, deficit)
-
-				// deficit is guaranteed non-negative and bounded to at most TargetOutbound.
-				for i := 0; i < deficit; i++ {
-					go cm.NewConnReq()
-				}
-			}
-		}
-	}()
+	go cm.replenishHandler()
 }
 
-// replenishDeficit returns the number of new outbound dials the periodic
-// replenishment ticker should launch, given the number of currently open (or
-// in-flight) connections and the target outbound count. It returns max(0,
-// target-open): never negative, and never more than target. This guards against
-// the uint32 underflow of the original code, where open > target wrapped the
-// subtraction to ~4 billion, and replaces the broken monotonic-counter loop bound
-// that stopped the ticker dialing at all after startup.
-func replenishDeficit(open, target int) int {
+// replenishSnapshot is the set of values reported by one replenishment pass. It
+// exists only so the loop can tell whether anything actually changed since the
+// last line it logged.
+type replenishSnapshot struct {
+	established int
+	pending     int
+	target      int
+	deficit     int
+}
+
+// replenishHandler keeps the automatic outbound tier topped up. It must be run
+// as a goroutine, and is the only goroutine that runs a replenishment pass, so
+// its logging state needs no locking.
+//
+// It runs on a ticker and also whenever a connection event frees a slot. The
+// ticker is the backstop that copes with newly learned addresses and with any
+// wake that the debounce window swallowed; the wake is what makes a lost peer
+// cost about a second rather than most of an interval.
+func (cm *ConnManager) replenishHandler() {
+	interval := cm.cfg.ReplenishInterval
+	if interval <= 0 {
+		// Rollback path: an unset interval reproduces the original fixed
+		// one-minute ticker exactly.
+		interval = defaultReplenishInterval
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var (
+		lastLogged  replenishSnapshot
+		lastLogTime time.Time
+		lastWake    time.Time
+	)
+
+	for {
+		select {
+		case <-cm.quit:
+			return
+
+		case <-ticker.C:
+			cm.replenish(&lastLogged, &lastLogTime)
+
+		case <-cm.replenishWake:
+			if time.Since(lastWake) < replenishWakeDebounce {
+				continue
+			}
+
+			lastWake = time.Now()
+
+			cm.replenish(&lastLogged, &lastLogTime)
+		}
+	}
+}
+
+// replenish runs a single replenishment pass: it measures the automatic
+// outbound tier and launches enough dials to close the gap to the target.
+func (cm *ConnManager) replenish(lastLogged *replenishSnapshot, lastLogTime *time.Time) {
+	// Honour the network-down backoff set by handleFailedConn. Without this the
+	// periodic pass dials straight through the very backoff that exists to stop
+	// the node hammering a dead network and shredding its address book.
+	if until := cm.replenishBackoffUntil.Load(); until != 0 {
+		if time.Now().UnixNano() < until {
+			cm.logger.Debugf("[connmgr] replenish check skipped: backing off after %d consecutive dial failures", maxFailedAttempts)
+			return
+		}
+
+		cm.replenishBackoffUntil.Store(0)
+	}
+
+	established, pending := cm.automaticCounts()
+
+	target := int(cm.cfg.TargetOutbound)
+	deficit := replenishDeficit(established, pending, target)
+
+	// The replenish line is the measurement instrument for outbound health, so
+	// it has to survive a two-second cadence without burying every other log.
+	// The rule chosen here is: log at Infof whenever the numbers differ from the
+	// last line emitted, plus a heartbeat at roughly the old one-minute cadence
+	// so a long steady state still leaves a trail. Everything else goes to
+	// Debugf. That means every transition is visible at Infof while a node
+	// sitting healthily at target — or stuck below it — emits about one line a
+	// minute rather than thirty.
+	now := replenishSnapshot{established: established, pending: pending, target: target, deficit: deficit}
+	if now != *lastLogged || time.Since(*lastLogTime) >= defaultReplenishInterval {
+		cm.logger.Infof("[connmgr] replenish check: conns=%d pending=%d target=%d dialing=%d",
+			established, pending, target, deficit)
+
+		*lastLogged = now
+		*lastLogTime = time.Now()
+	} else {
+		cm.logger.Debugf("[connmgr] replenish check: conns=%d pending=%d target=%d dialing=%d",
+			established, pending, target, deficit)
+	}
+
+	// deficit is guaranteed non-negative and bounded to at most TargetOutbound.
+	for i := 0; i < deficit; i++ {
+		go cm.NewConnReq()
+	}
+}
+
+// replenishDeficit returns the number of new outbound dials a replenishment
+// pass should launch, given the number of established automatic outbound
+// connections, the number of automatic dials still in flight, and the target.
+// It returns max(0, target-(established+pending)): never negative, and never
+// more than target. This guards against the uint32 underflow of the original
+// code, where open > target wrapped the subtraction to ~4 billion, and replaces
+// the broken monotonic-counter loop bound that stopped the ticker dialing at
+// all after startup.
+//
+// In-flight dials must be counted. A connection is only entered in the
+// established book once its TCP connect returns, and reaching an unresponsive
+// peer can take the full dial timeout — tens of seconds. At the old one-minute
+// cadence that barely mattered, but at a two-second cadence a dial that has not
+// yet completed would otherwise look like an empty slot on every pass and be
+// re-dialled dozens of times before it either succeeded or failed, turning the
+// replenishment loop into a dial storm against the whole address table.
+func replenishDeficit(established, pending, target int) int {
+	open := established + pending
 	if open >= target {
 		return 0
 	}
@@ -729,6 +961,9 @@ func New(logger ulogger.Logger, cfg *Config) (*ConnManager, error) {
 		quit:     make(chan struct{}),
 		pending:  txmap.NewSyncedMap[uint64, *ConnReq](),
 		conns:    txmap.NewSyncedMap[uint64, *ConnReq](),
+
+		// Depth one: this is a coalescing signal, not a queue of work.
+		replenishWake: make(chan struct{}, 1),
 	}
 
 	return &cm, nil

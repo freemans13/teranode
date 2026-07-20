@@ -86,3 +86,65 @@ func TestCheckHeadStall_RollbackDisconnectsImmediately(t *testing.T) {
 	require.Eventually(t, func() bool { return !peerA.Connected() }, 2*time.Second, 5*time.Millisecond,
 		"rollback (0) must disconnect the head peer immediately at BlockStallTimeout")
 }
+
+// TestCheckHeadStall_RacePrimesThroughputBaseline connects F1 to F2.
+//
+// The F2 gate refuses to veto a disconnect it did not measure, and it needs a
+// byte sample at least headStallRateWindow old before it can compute a rate. The
+// race window is the only place there is time to grow one, so each race pass
+// seeds the baseline if the peer has none. Without this the gate would arrive at
+// every real disconnect decision unmeasured, and F2 would protect nobody.
+func TestCheckHeadStall_RacePrimesThroughputBaseline(t *testing.T) {
+	const headHeight = 100
+
+	sm, peerA, _, _ := buildHeadStallManager(t, headHeight)
+	sm.settings.Legacy.HeadStallDisconnectTimeout = 30 * time.Second
+	sm.settings.Legacy.BlockStallMinRate = 102400
+
+	sm.cachedBlockAssemblyHeight.Store(headHeight - 1)
+	sm.baHeightPolled.Store(true)
+
+	peerState, ok := sm.peerStates.Get(peerA)
+	require.True(t, ok, "precondition: the head peer must be in the peer-state map")
+	require.Zero(t, peerState.lastAssocSampleAt.Load(),
+		"precondition: the peer must start with no byte sample")
+
+	now := time.Now()
+	sm.checkHeadStall(now)
+
+	require.Equal(t, now.UnixNano(), peerState.lastAssocSampleAt.Load(),
+		"a race pass must seed the F2 baseline so the gate can measure by the time the window expires")
+	require.Equal(t, peerA.AssociationReadBytes(), peerState.lastAssocReadBytes.Load(),
+		"the seeded baseline must be the peer's live association byte total")
+}
+
+// TestCheckHeadStall_RaceDoesNotResampleAMaturingBaseline: the race pass seeds a
+// baseline, it never refreshes one. Refreshing on every ~20ms refill tick would
+// restart the measurement window continuously and it would never mature, so the
+// gate could never produce a rate — the same failure as having no baseline, but
+// silent.
+func TestCheckHeadStall_RaceDoesNotResampleAMaturingBaseline(t *testing.T) {
+	const headHeight = 100
+
+	sm, peerA, _, _ := buildHeadStallManager(t, headHeight)
+	sm.settings.Legacy.HeadStallDisconnectTimeout = 30 * time.Second
+	sm.settings.Legacy.BlockStallMinRate = 102400
+
+	sm.cachedBlockAssemblyHeight.Store(headHeight - 1)
+	sm.baHeightPolled.Store(true)
+
+	peerState, ok := sm.peerStates.Get(peerA)
+	require.True(t, ok, "precondition: the head peer must be in the peer-state map")
+
+	now := time.Now()
+	seededAt := now.Add(-500 * time.Millisecond).UnixNano()
+	peerState.lastAssocReadBytes.Store(1)
+	peerState.lastAssocSampleAt.Store(seededAt)
+
+	sm.checkHeadStall(now)
+
+	require.Equal(t, seededAt, peerState.lastAssocSampleAt.Load(),
+		"a usable baseline must be left alone so its measurement window can mature")
+	require.EqualValues(t, 1, peerState.lastAssocReadBytes.Load(),
+		"a usable baseline must be left alone so its measurement window can mature")
+}

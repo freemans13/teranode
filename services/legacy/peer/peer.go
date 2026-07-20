@@ -268,6 +268,45 @@ type Config struct {
 	// at the normal timeout whenever the node is not self-backpressured.
 	ReadBackpressured func() bool
 
+	// InitialBlockDownload, when non-nil and returning true, indicates the node
+	// is still catching up (headers-first IBD) rather than tracking the chain
+	// tip. Every stall/idle deadline in this file is sized for the tip, where a
+	// response is expected within seconds; during IBD those same deadlines are
+	// routinely blown for entirely healthy reasons — a getheaders reply spanning
+	// a 150k-block checkpoint desert, or a several-hundred-megabyte historical
+	// block behind a slow-but-delivering peer — and the peer is executed
+	// mid-transfer, discarding the partial download. That is the largest single
+	// source of the disconnect/reconnect churn measured during mainnet IBD.
+	//
+	// When this reports true the deadlines widen to svnode's timescale. No
+	// detector is ever disabled: each one simply waits as long as svnode waits,
+	// and only while catching up.
+	//
+	// Nil means "never in IBD", which selects the tip constants at every site and
+	// makes this file behave exactly as it did before these budgets existed. That
+	// is the rollback lever: leave this unset and nothing here changes.
+	InitialBlockDownload func() bool
+
+	// HeaderProgressStalled, when non-nil and returning true, indicates
+	// headers-first sync is active but no CONNECTING header batch has arrived
+	// within legacy_headerDeliveryTimeout — i.e. the header frontier is standing
+	// still even though the connection may look alive.
+	//
+	// This is the counterweight that makes the widened headers patience safe.
+	// Headers are single-sourced: a peer that keeps its transport warm with
+	// ping/pong, inv and addr traffic but simply never answers our getheaders
+	// would be caught by neither this file (widened to minutes) nor netsync's
+	// silence detector (which resets on ANY association traffic). The frontier —
+	// and therefore ALL block download behind it — would freeze for the full
+	// widened window. Consulting this callback means only a peer that is
+	// genuinely still advancing the frontier earns the extra patience; one that
+	// has gone quiet on headers specifically is still cut on the tip deadline.
+	//
+	// Nil means the liveness clock is unavailable, and with no way to prove
+	// progress the widened headers window is NOT granted — patience is only
+	// extended to peers we can show are still delivering.
+	HeaderProgressStalled func() bool
+
 	// NewestBlock specifies a callback which provides the newest block
 	// details to the peer as needed.  This can be nil in which case the
 	// peer will report a block height of 0, however it is good practice for
@@ -1132,6 +1171,28 @@ func (p *Peer) PushGetHeadersMsg(locator blockchain.BlockLocator, stopHash *chai
 	return nil
 }
 
+// ResetGetHeadersDedup forgets the last (begin, stop) pair sent by
+// PushGetHeadersMsg, so the next getheaders is put on the wire even if it is
+// identical to the previous one.
+//
+// The dedup cache is per-connection and shared by every caller. That is safe
+// while netsync's own scheduled getheaders is the only writer — it can then
+// only ever suppress a genuine repeat of its own request. It is NOT safe once
+// an unsolicited path writes to it: a re-anchor triggered by a peer's bad
+// header batch (handleUnconnectingHeaders) builds its locator from our DB-best
+// tip and its stop hash from the header checkpoint, which is byte-identical to
+// what startSync will send if that peer is later chosen as sync peer. Without
+// this reset that legitimate getheaders is silently swallowed, startSync sees a
+// nil error, declares headers-first started, and the frontier wedges with
+// nothing on the wire. Callers on unsolicited paths must clear the cache after
+// sending.
+func (p *Peer) ResetGetHeadersDedup() {
+	p.prevGetHdrsMtx.Lock()
+	p.prevGetHdrsBegin = nil
+	p.prevGetHdrsStop = nil
+	p.prevGetHdrsMtx.Unlock()
+}
+
 // PushRejectMsg sends a reject message for the provided command, reject code,
 // reject reason, and hash.  The hash will only be used when the command is a tx
 // or block and should be nil in other cases.  The wait parameter will cause the
@@ -1429,6 +1490,62 @@ func (p *Peer) shouldHandleReadError(err error) bool {
 	return true
 }
 
+// catchingUp reports whether the node is still in initial block download. Nil
+// callback means "no", which selects the tip budgets everywhere (see
+// Config.InitialBlockDownload).
+func (p *Peer) catchingUp() bool {
+	return p.cfg.InitialBlockDownload != nil && p.cfg.InitialBlockDownload()
+}
+
+// ibdBudget picks between a widened catch-up allowance and the tip allowance.
+// A zero (unset or mis-set) IBD value falls back to the tip value rather than
+// being taken literally: a configuration mistake must never leave a detector
+// with a zero deadline, and must never be a route to disabling one. Patience,
+// never disabling.
+func (p *Peer) ibdBudget(ibdValue, tipValue time.Duration) time.Duration {
+	if ibdValue <= 0 || !p.catchingUp() {
+		return tipValue
+	}
+
+	return ibdValue
+}
+
+// blockStallBudget is how long a requested block may take to arrive before the
+// peer is judged stalled. During IBD historical blocks are large and our own
+// validation backpressure delays the read loop, so the tip-sized allowance kills
+// healthy transfers just short of completion.
+func (p *Peer) blockStallBudget() time.Duration {
+	return p.ibdBudget(p.settings.Legacy.IBDBlockStallTimeout, stallResponseTimeoutBlocks)
+}
+
+// headersTipBudget is the deadline a getheaders reply is armed with. It stays at
+// the tip value even during IBD — deliberately. See shouldExtendHeadersDeadline:
+// the widened catch-up window is granted a tick at a time, and only while the
+// header frontier is provably still moving, so that a peer which goes quiet on
+// headers alone is still cut on this shorter clock.
+func headersTipBudget() time.Duration {
+	return stallResponseTimeout * 3
+}
+
+// maxBlockDownloadTime is the wall-clock ceiling on a single block fetch kept
+// alive by throughput-based extension.
+func (p *Peer) maxBlockDownloadTime() time.Duration {
+	return p.ibdBudget(p.settings.Legacy.IBDMaxBlockDownloadTime, MaxBlockDownloadTime)
+}
+
+// idleTimeout is how long the connection may be silent before it is reaped.
+// PeerIdleTimeout is sized against the 2-minute ping interval, which is right at
+// the tip; during IBD a peer we are not currently pulling from can be silent far
+// longer without being dead, and disconnecting it costs a full handshake to
+// re-establish supply.
+//
+// This is re-evaluated on every arm and every reset rather than latched at
+// connection time, so a node that reaches the tip mid-connection tightens back
+// to PeerIdleTimeout on the next reset without needing to drop anything.
+func (p *Peer) idleTimeout() time.Duration {
+	return p.ibdBudget(p.settings.Legacy.IBDPeerIdleTimeout, p.settings.Legacy.PeerIdleTimeout)
+}
+
 // maybeAddDeadline potentially adds a deadline for the appropriate expected
 // response for the passed wire protocol command to the pending responses map.
 func (p *Peer) maybeAddDeadline(pendingResponses map[string]time.Time, msgCmd string) {
@@ -1439,7 +1556,7 @@ func (p *Peer) maybeAddDeadline(pendingResponses map[string]time.Time, msgCmd st
 	// such as is typical in the case of initial block download, the
 	// response won't be received in time.
 	deadline := time.Now().Add(stallResponseTimeout)
-	blockDeadline := time.Now().Add(stallResponseTimeoutBlocks)
+	blockDeadline := time.Now().Add(p.blockStallBudget())
 
 	switch msgCmd {
 	case wire.CmdVersion:
@@ -1466,7 +1583,7 @@ func (p *Peer) maybeAddDeadline(pendingResponses map[string]time.Time, msgCmd st
 		// Expects a headers message.  Use a longer deadline since it
 		// can take a while for the remote peer to load all of the
 		// headers.
-		deadline = time.Now().Add(stallResponseTimeout * 3)
+		deadline = time.Now().Add(headersTipBudget())
 		pendingResponses[wire.CmdHeaders] = deadline
 	}
 }
@@ -1550,11 +1667,15 @@ func blockResponsePending(pending map[string]time.Time) bool {
 // shouldExtendBlockDeadline reports whether an expired block-response deadline
 // should be extended (because the block is still actively arriving) rather than
 // treated as a stall. Extension is allowed only while throughput is healthy AND
-// the fetch has been in flight for less than MaxBlockDownloadTime — the
-// wall-clock cap that stops a peer dribbling bytes forever from holding the
-// sync slot indefinitely. blockFetchStart is the zero value when no block fetch
-// is in flight.
-func shouldExtendBlockDeadline(command string, healthyDownload bool, blockFetchStart, now time.Time) bool {
+// the fetch has been in flight for less than maxDownloadTime — the wall-clock
+// cap that stops a peer dribbling bytes forever from holding the sync slot
+// indefinitely. blockFetchStart is the zero value when no block fetch is in
+// flight.
+//
+// The cap is passed in rather than read from the package constant because it
+// widens during IBD (Peer.maxBlockDownloadTime); keeping this a pure function of
+// its arguments leaves it directly testable at both values.
+func shouldExtendBlockDeadline(command string, healthyDownload bool, blockFetchStart, now time.Time, maxDownloadTime time.Duration) bool {
 	if !isBlockResponseCommand(command) || !healthyDownload {
 		return false
 	}
@@ -1563,7 +1684,68 @@ func shouldExtendBlockDeadline(command string, healthyDownload bool, blockFetchS
 		return false
 	}
 
-	return now.Sub(blockFetchStart) < MaxBlockDownloadTime
+	return now.Sub(blockFetchStart) < maxDownloadTime
+}
+
+// headersExtensionWindowOpen reports whether a headers response that has already
+// blown its (tip-sized) deadline is still inside the widened catch-up window,
+// measured from when the getheaders first went out. Split out from
+// shouldExtendHeadersDeadline so the time arithmetic is testable without a Peer.
+func headersExtensionWindowOpen(command string, headersRequestStart, now time.Time, ibdBudget time.Duration) bool {
+	if command != wire.CmdHeaders || headersRequestStart.IsZero() {
+		return false
+	}
+
+	return now.Sub(headersRequestStart) < ibdBudget
+}
+
+// shouldExtendHeadersDeadline reports whether an expired headers deadline should
+// be granted another tip-sized slice of patience instead of disconnecting.
+//
+// This is the guard that makes widened headers patience safe, and it is
+// deliberately stingier than the block equivalent. Simply arming the headers
+// deadline at the IBD value would open a hole: a sync peer that keeps its
+// transport warm with ping/pong, inv and addr traffic but stops sending HEADERS
+// is caught by neither this file (deadline now minutes away) nor netsync's
+// silence detector (which resets on ANY association traffic). Because the header
+// frontier is single-sourced, that is a multi-minute freeze of the frontier and
+// of all block download queued behind it — precisely the failure this work
+// exists to remove.
+//
+// So the extension is granted a tick at a time, and only when all of the
+// following hold: we are catching up, a catch-up budget is configured, the
+// widened window has not run out, and the header-delivery liveness clock says a
+// connecting batch HAS landed recently. If HeaderProgressStalled is nil there is
+// no way to prove the frontier is moving, so no extension is granted — the peer
+// is judged on the tip deadline exactly as it is today.
+func (p *Peer) shouldExtendHeadersDeadline(command string, headersRequestStart, now time.Time) bool {
+	if !p.catchingUp() {
+		return false
+	}
+
+	ibdBudget := p.settings.Legacy.IBDHeadersStallTimeout
+	if ibdBudget <= 0 {
+		return false
+	}
+
+	if !headersExtensionWindowOpen(command, headersRequestStart, now, ibdBudget) {
+		return false
+	}
+
+	if p.cfg.HeaderProgressStalled == nil || p.headerFrontierStalled() {
+		return false
+	}
+
+	return true
+}
+
+// headerFrontierStalled reports whether netsync says the header frontier has
+// stopped moving. A nil callback reports false, which is what the peer layer
+// assumed before the callback existed and keeps every path below byte-identical
+// to its pre-change behaviour when the callback is absent or disabled
+// (HeaderDeliveryTimeout=0 makes netsync's implementation always return false).
+func (p *Peer) headerFrontierStalled() bool {
+	return p.cfg.HeaderProgressStalled != nil && p.cfg.HeaderProgressStalled()
 }
 
 // responseStallBudget returns the deadline allowance a pending response of the
@@ -1573,13 +1755,18 @@ func shouldExtendBlockDeadline(command string, healthyDownload bool, blockFetchS
 // being cut to the 30s base. CmdInv maps to the longer block budget since the
 // only inv worth refreshing here follows a getblocks; that is conservative
 // (never shorter) for the rare mempool-inv case.
-func responseStallBudget(cmd string) time.Duration {
+//
+// blockBudget is passed in because the block allowance widens during IBD; it
+// MUST be the same value maybeAddDeadline armed with (Peer.blockStallBudget),
+// otherwise a refresh would silently move a deadline the arming logic never
+// intended and the two would drift apart.
+func responseStallBudget(cmd string, blockBudget time.Duration) time.Duration {
 	switch cmd {
 	case wire.CmdHeaders:
 		// Headers can take a while for the remote peer to load.
-		return stallResponseTimeout * 3
+		return headersTipBudget()
 	case wire.CmdBlock, wire.CmdMerkleBlock, wire.CmdTx, wire.CmdNotFound, wire.CmdInv:
-		return stallResponseTimeoutBlocks
+		return blockBudget
 	default:
 		return stallResponseTimeout
 	}
@@ -1597,7 +1784,19 @@ func responseStallBudget(cmd string) time.Duration {
 // deadline would otherwise fire mid-download and disconnect a perfectly healthy
 // sync peer. Liveness during a block fetch is gated instead by the block's own
 // (much longer) deadline.
-func expiredStallResponse(pending map[string]time.Time, now time.Time, offset time.Duration) (string, bool) {
+//
+// headersStalled is the one exception. That suppression assumes the headers
+// reply is merely QUEUED behind the block, which is true for a peer that is a
+// little slow and false for a peer that has simply stopped answering
+// getheaders. Because a sync peer under parallel fetch nearly always has a block
+// in flight, an unconditional suppression means the headers deadline can never
+// fire on the peer it matters most for: the frontier freezes, the node drains
+// its header runway at full speed, then goes quiet — the busy/quiet oscillation
+// this work exists to remove. When netsync reports the frontier has not moved
+// for HeaderDeliveryTimeout, headers are judged on their own deadline even with
+// a block in flight. headersStalled=false is byte-identical to the old
+// behaviour.
+func expiredStallResponse(pending map[string]time.Time, now time.Time, offset time.Duration, headersStalled bool) (string, bool) {
 	blockPending := blockResponsePending(pending)
 
 	for command, deadline := range pending {
@@ -1606,7 +1805,8 @@ func expiredStallResponse(pending map[string]time.Time, now time.Time, offset ti
 		}
 
 		// Suppress non-block stalls while a block is legitimately in flight.
-		if blockPending && !isBlockResponseCommand(command) {
+		if blockPending && !isBlockResponseCommand(command) &&
+			!(command == wire.CmdHeaders && headersStalled) {
 			continue
 		}
 
@@ -1628,7 +1828,15 @@ func expiredStallResponse(pending map[string]time.Time, now time.Time, offset ti
 // relayed tx (a CmdTx that was not a response to our getdata) clears the group
 // as before but must NOT refresh other deadlines, otherwise ambient tx traffic
 // would perpetually defer a genuinely stalled getheaders.
-func clearBlockResponseGroup(pending map[string]time.Time, now time.Time) bool {
+//
+// headersStalled suppresses the refresh for CmdHeaders specifically. The refresh
+// exists to forgive a headers reply that was queued behind the block, but on a
+// peer that is streaming blocks steadily it fires on every completed block and
+// pushes the headers deadline out indefinitely — so a peer that has stopped
+// answering getheaders while still serving blocks is never judged at all. Once
+// netsync reports the frontier stalled, that forgiveness is exactly wrong.
+// headersStalled=false is byte-identical to the old behaviour.
+func clearBlockResponseGroup(pending map[string]time.Time, now time.Time, blockBudget time.Duration, headersStalled bool) bool {
 	blockWasPending := false
 
 	for _, cmd := range []string{wire.CmdBlock, wire.CmdMerkleBlock, wire.CmdTx, wire.CmdNotFound} {
@@ -1644,7 +1852,11 @@ func clearBlockResponseGroup(pending map[string]time.Time, now time.Time) bool {
 	}
 
 	for cmd, deadline := range pending {
-		if refreshed := now.Add(responseStallBudget(cmd)); refreshed.After(deadline) {
+		if cmd == wire.CmdHeaders && headersStalled {
+			continue
+		}
+
+		if refreshed := now.Add(responseStallBudget(cmd, blockBudget)); refreshed.After(deadline) {
 			pending[cmd] = refreshed
 		}
 	}
@@ -1686,8 +1898,14 @@ func (p *Peer) stallHandler() {
 
 	// blockFetchStart records when the current block fetch first went in flight.
 	// It bounds how long throughput-based extension can keep a block alive
-	// (MaxBlockDownloadTime); zero when no block fetch is outstanding.
+	// (Peer.maxBlockDownloadTime); zero when no block fetch is outstanding.
 	var blockFetchStart time.Time
+
+	// headersRequestStart records when the outstanding getheaders first went out.
+	// The headers deadline itself is always armed at the tip budget; this is what
+	// bounds how far past it the catch-up extension may reach (see
+	// shouldExtendHeadersDeadline). Zero when no headers reply is outstanding.
+	var headersRequestStart time.Time
 out:
 	for {
 		select {
@@ -1702,6 +1920,15 @@ out:
 				// goes in flight, so throughput-based extension is bounded.
 				if blockFetchStart.IsZero() && blockResponsePending(pendingResponses) {
 					blockFetchStart = time.Now()
+				}
+
+				// Likewise start the headers wall-clock window when a getheaders
+				// first goes out, so the catch-up extension is bounded from the
+				// request rather than from each extension.
+				if headersRequestStart.IsZero() {
+					if _, ok := pendingResponses[wire.CmdHeaders]; ok {
+						headersRequestStart = time.Now()
+					}
 				}
 
 			case sccReceiveMessage:
@@ -1719,11 +1946,19 @@ out:
 				case wire.CmdNotFound:
 					// If a block fetch actually completed, close its wall-clock
 					// window so the next fetch starts a fresh one.
-					if clearBlockResponseGroup(pendingResponses, time.Now()) {
+					if clearBlockResponseGroup(pendingResponses, time.Now(), p.blockStallBudget(), p.headerFrontierStalled()) {
 						blockFetchStart = time.Time{}
 					}
 				default:
 					delete(pendingResponses, msgCmd)
+				}
+
+				// Close the headers wall-clock window whenever no headers reply is
+				// outstanding any more, so the next getheaders starts a fresh one.
+				// Keyed off the map rather than the received command because
+				// clearBlockResponseGroup's refresh can also touch it.
+				if _, ok := pendingResponses[wire.CmdHeaders]; !ok {
+					headersRequestStart = time.Time{}
 				}
 
 			case sccHandlerStart:
@@ -1786,18 +2021,21 @@ out:
 			}
 
 			lastAssocReadBytes = curAssocReadBytes
-			healthyDownload := recvDelta/uint64(stallTickInterval.Seconds()) >= minBlockDownloadBytesPerSec
+			bytesPerSec := recvDelta / uint64(stallTickInterval.Seconds())
+			healthyDownload := bytesPerSec >= minBlockDownloadBytesPerSec
+			maxDownloadTime := p.maxBlockDownloadTime()
 
 			// Disconnect the peer if a pending response has not arrived by
 			// its adjusted deadline. While a block fetch is in flight,
 			// non-block deadlines are suppressed (see expiredStallResponse).
-			if command, stalled := expiredStallResponse(pendingResponses, now, offset); stalled {
-				if shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now) {
+			if command, stalled := expiredStallResponse(pendingResponses, now, offset, p.headerFrontierStalled()); stalled {
+				switch {
+				case shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now, maxDownloadTime):
 					// The block is still actively arriving at a healthy rate and
 					// within the wall-clock cap; extend the whole block-response
 					// group (armed together) rather than disconnect a peer
 					// making real progress on a large (multi-GB) block.
-					refreshed := now.Add(stallResponseTimeoutBlocks)
+					refreshed := now.Add(p.blockStallBudget())
 					for cmd := range pendingResponses {
 						if isBlockResponseCommand(cmd) {
 							pendingResponses[cmd] = refreshed
@@ -1805,9 +2043,27 @@ out:
 					}
 
 					p.logger.Debugf("Extending block deadline for %s: downloading at %d B/s (%.0fs into fetch, cap %s)",
-						p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), MaxBlockDownloadTime)
-				} else {
-					reason := fmt.Sprintf("Peer appears to be stalled or misbehaving, %s timeout", command)
+						p, bytesPerSec, now.Sub(blockFetchStart).Seconds(), maxDownloadTime)
+
+				case p.shouldExtendHeadersDeadline(command, headersRequestStart, now):
+					// Catching up, and the header-delivery clock says this peer is
+					// still advancing the frontier — grant one more tip-sized slice
+					// rather than killing the only source of our headers. Re-checked
+					// on every expiry, so the moment the frontier stops moving the
+					// next slice is refused and the peer dies on the tip deadline.
+					pendingResponses[wire.CmdHeaders] = now.Add(headersTipBudget())
+
+					p.logger.Debugf("Extending headers deadline for %s: frontier still advancing, %d B/s (%.0fs into request, cap %s)",
+						p, bytesPerSec, now.Sub(headersRequestStart).Seconds(), p.settings.Legacy.IBDHeadersStallTimeout)
+
+				default:
+					// Byte rate at the moment of the drop is recorded so a soak
+					// report can prove no peer that was still delivering above the
+					// rate floor was executed. Appended after the existing reason
+					// text: the disconnect harness buckets by string prefix, so the
+					// prefix must not change.
+					reason := fmt.Sprintf("Peer appears to be stalled or misbehaving, %s timeout (association read %d B/s over last %s, floor %d B/s)",
+						command, bytesPerSec, stallTickInterval, minBlockDownloadBytesPerSec)
 					p.DisconnectWithInfo(reason)
 				}
 			}
@@ -1876,16 +2132,52 @@ func shouldArmProcessingTimer(cmd string, prefetchBudgetBytes int64, net wire.Bi
 
 // inHandler handles all incoming messages for the peer.  It must be run as a goroutine.
 func (p *Peer) inHandler() {
+	// idleReadBytes/idleSampledAt carry the previous association read sample
+	// between firings of the idle timer, so the byte rate at the moment of an
+	// idle drop can be recorded (the soak report must be able to show that no
+	// peer still delivering above the rate floor was disconnected). They are
+	// initialised here, before the timer exists, and thereafter touched only from
+	// inside the timer callback. time.AfterFunc runs f in its own goroutine and a
+	// Reset issued while f is still running can overlap two invocations, so the
+	// read-modify-write of the sample pair is kept under a mutex rather than
+	// relying on that never happening.
+	var idleSampleMu sync.Mutex
+
+	idleReadBytes := p.AssociationReadBytes()
+	idleSampledAt := time.Now()
+
 	// The timer is stopped when a new message is received and reset after it is processed.
 	var idleTimer *time.Timer
-	idleTimer = time.AfterFunc(p.settings.Legacy.PeerIdleTimeout, func() {
+	idleTimer = time.AfterFunc(p.idleTimeout(), func() {
+		// Sample first, and on every path, so each firing measures the interval
+		// since the previous one rather than since the connection opened.
+		now := time.Now()
+		curReadBytes := p.AssociationReadBytes()
+
+		idleSampleMu.Lock()
+		var idleBytesPerSec uint64
+		// AssociationReadBytes can decrease if a stream left the association
+		// between samples; treat that as no progress rather than letting the
+		// unsigned subtraction wrap into a nonsense rate.
+		if elapsed := now.Sub(idleSampledAt); elapsed > 0 && curReadBytes >= idleReadBytes {
+			idleBytesPerSec = uint64(float64(curReadBytes-idleReadBytes) / elapsed.Seconds())
+		}
+
+		idleReadBytes, idleSampledAt = curReadBytes, now
+		idleSampleMu.Unlock()
+
+		// Re-read the budget on every firing: it widens while catching up and
+		// tightens again at the tip (see Peer.idleTimeout).
+		idleTimeout := p.idleTimeout()
+
 		// For multistream associations, check if any other stream has
 		// recent activity. With BlockPriority, SV routes pings to DATA1,
 		// so the GENERAL stream may be idle even when the association is
-		// alive.
+		// alive. The activity window matches the timeout so the two agree
+		// about what "recent" means.
 		if assoc := p.AssociationRef(); assoc != nil {
-			if assoc.HasRecentActivity(p.settings.Legacy.PeerIdleTimeout) {
-				idleTimer.Reset(p.settings.Legacy.PeerIdleTimeout)
+			if assoc.HasRecentActivity(idleTimeout) {
+				idleTimer.Reset(idleTimeout)
 				return
 			}
 		}
@@ -1893,11 +2185,13 @@ func (p *Peer) inHandler() {
 		// Local read backpressure: the silence is OURS, not the peer's. Re-arm
 		// and re-check next interval (see Config.ReadBackpressured).
 		if p.cfg.ReadBackpressured != nil && p.cfg.ReadBackpressured() {
-			idleTimer.Reset(p.settings.Legacy.PeerIdleTimeout)
+			idleTimer.Reset(idleTimeout)
 			return
 		}
 
-		reason := fmt.Sprintf("No answer from peer for %s", p.settings.Legacy.PeerIdleTimeout)
+		// Rate appended after the existing text: the disconnect harness buckets
+		// by string prefix, so "No answer from peer for %s" must stay intact.
+		reason := fmt.Sprintf("No answer from peer for %s (association read %d B/s since last check)", idleTimeout, idleBytesPerSec)
 		p.DisconnectWithInfo(reason)
 	})
 
@@ -1946,7 +2240,7 @@ out:
 			// error is one of the allowed errors.
 			if p.isAllowedReadError(err) {
 				p.logger.Errorf("Allowed test error from %s: %v", p, err)
-				idleTimer.Reset(p.settings.Legacy.PeerIdleTimeout)
+				idleTimer.Reset(p.idleTimeout())
 				continue
 			}
 
@@ -2150,8 +2444,11 @@ out:
 
 		p.logger.Debugf("Processing %v from peer ID %v DONE", rmsg.Command(), p.ID())
 
-		// A message was received so reset the idle timer.
-		idleTimer.Reset(p.settings.Legacy.PeerIdleTimeout)
+		// A message was received so reset the idle timer. Every reset must use
+		// the same budget selector as the initial arm — widening only the arm
+		// would let the timeout silently revert to the tip value after the first
+		// message arrives.
+		idleTimer.Reset(p.idleTimeout())
 	}
 
 	// Ensure the idle timer is stopped to avoid leaking the resource.

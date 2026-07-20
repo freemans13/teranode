@@ -680,6 +680,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			TempStore:                          getURL("temp_store", "file://./data/tempstore", alternativeContext...),
 			PeerIdleTimeout:                    getDuration("legacy_peerIdleTimeout", 125*time.Second, alternativeContext...),     // ping/pong interval is 2 mins, so we set this to 125s to be sure
 			PeerProcessingTimeout:              getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
+			Upnp:                               getBool("legacy_upnp", false, alternativeContext...),
 			ParallelWindowMemoryFraction:       getFloat64("legacy_parallelWindowMemoryFraction", 0.0, alternativeContext...),
 			ParallelWindowPipeline:             getBool("legacy_parallelWindowPipeline", false, alternativeContext...),
 			ParallelWindowParkAhead:            getBool("legacy_parallelWindowParkAhead", false, alternativeContext...),
@@ -688,15 +689,37 @@ func NewSettings(alternativeContext ...string) *Settings {
 			WindowMaxBlocks:                    getInt("legacy_windowMaxBlocks", 0, alternativeContext...),
 			ParkRunwayByteSized:                getBool("legacy_parkRunwayByteSized", false, alternativeContext...),
 			SyncPeerSilentTicks:                getInt("legacy_syncPeerSilentTicks", 2, alternativeContext...),
-			InFlightTxBudget:                   getInt("legacy_inFlightTxBudget", 50000, alternativeContext...),
-			InFlightByteBudget:                 int64(getInt("legacy_inFlightByteBudget", 0, alternativeContext...)),
-			InFlightRefillInterval:             getDuration("legacy_inFlightRefillInterval", 20*time.Millisecond, alternativeContext...),
-			ParallelFetchPeers:                 getInt("legacy_parallelFetchPeers", 1, alternativeContext...),
-			BlockDownloadWindow:                getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
-			MaxBlocksInTransitPerPeer:          getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
-			BlockStallTimeout:                  getDuration("legacy_blockStallTimeout", 2*time.Second, alternativeContext...),
-			BlockInFlightTimeout:               getDuration("legacy_blockInFlightTimeout", 10*time.Second, alternativeContext...),
-			BlockPrefetchBufferBytes:           getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
+			// Widened last-block-time window for the headers-first sync peer; clamped to no shorter than the 3m post-IBD value in netsync.
+			SyncPeerHeadersFirstStaleBlockTimeout: getDuration("legacy_syncPeerHeadersFirstStaleBlockTimeout", 30*time.Minute, alternativeContext...),
+			InFlightTxBudget:                      getInt("legacy_inFlightTxBudget", 50000, alternativeContext...),
+			InFlightByteBudget:                    int64(getInt("legacy_inFlightByteBudget", 0, alternativeContext...)),
+			InFlightRefillInterval:                getDuration("legacy_inFlightRefillInterval", 20*time.Millisecond, alternativeContext...),
+			ParallelFetchPeers:                    getInt("legacy_parallelFetchPeers", 1, alternativeContext...),
+			BlockDownloadWindow:                   getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
+			MaxBlocksInTransitPerPeer:             getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
+			BlockStallTimeout:                     getDuration("legacy_blockStallTimeout", 2*time.Second, alternativeContext...),
+			// F1: race a stalled head block to other peers for this long before disconnecting the peer holding it.
+			HeadStallDisconnectTimeout: getDuration("legacy_headStallDisconnectTimeout", 30*time.Second, alternativeContext...),
+			// F2: never disconnect a head peer that is still moving bytes faster than this floor.
+			BlockStallMinRate:    getInt64("legacy_blockStallMinRate", 102400, alternativeContext...),
+			BlockInFlightTimeout: getDuration("legacy_blockInFlightTimeout", 10*time.Second, alternativeContext...),
+			// F3: peer-layer deadlines used only while catching up; at the tip the original values still apply.
+			IBDBlockStallTimeout:    getDuration("legacy_ibdBlockStallTimeout", 60*time.Minute, alternativeContext...),
+			IBDHeadersStallTimeout:  getDuration("legacy_ibdHeadersStallTimeout", 10*time.Minute, alternativeContext...),
+			IBDMaxBlockDownloadTime: getDuration("legacy_ibdMaxBlockDownloadTime", 60*time.Minute, alternativeContext...),
+			IBDPeerIdleTimeout:      getDuration("legacy_ibdPeerIdleTimeout", 20*time.Minute, alternativeContext...),
+			// Liveness clock that bounds the header freeze the widened F3 deadlines would otherwise permit.
+			HeaderDeliveryTimeout: getDuration("legacy_headerDeliveryTimeout", 90*time.Second, alternativeContext...),
+			// F4: svnode MAX_UNCONNECTING_HEADERS — tolerate benign header races instead of disconnecting on the first.
+			UnconnectingHeadersTolerance: getInt("legacy_unconnectingHeadersTolerance", 10, alternativeContext...),
+			// F6: connection supply — replenish faster, vet addresses with feelers, re-seed an eroded address book.
+			ReplenishInterval:     getDuration("legacy_replenishInterval", 2*time.Second, alternativeContext...),
+			FeelerInterval:        getDuration("legacy_feelerInterval", 120*time.Second, alternativeContext...),
+			DNSReseedMinAddresses: getInt("legacy_dnsReseedMinAddresses", 500, alternativeContext...),
+			DNSReseedMinInterval:  getDuration("legacy_dnsReseedMinInterval", 30*time.Minute, alternativeContext...),
+			// Phase 0: makes a frozen header frontier measurable straight from the log.
+			FrontierLogInterval:      getDuration("legacy_frontierLogInterval", 10*time.Second, alternativeContext...),
+			BlockPrefetchBufferBytes: getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

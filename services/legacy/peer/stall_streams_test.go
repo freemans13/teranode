@@ -84,7 +84,7 @@ func TestExpiredStallResponseSuppressesNonBlockWhileBlockInFlight(t *testing.T) 
 	now := time.Unix(1_000_000, 0)
 
 	t.Run("no pending responses", func(t *testing.T) {
-		cmd, stalled := expiredStallResponse(map[string]time.Time{}, now, 0)
+		cmd, stalled := expiredStallResponse(map[string]time.Time{}, now, 0, false)
 		require.False(t, stalled)
 		require.Empty(t, cmd)
 	})
@@ -93,7 +93,7 @@ func TestExpiredStallResponseSuppressesNonBlockWhileBlockInFlight(t *testing.T) 
 		pending := map[string]time.Time{
 			wire.CmdHeaders: now.Add(-time.Second),
 		}
-		cmd, stalled := expiredStallResponse(pending, now, 0)
+		cmd, stalled := expiredStallResponse(pending, now, 0, false)
 		require.True(t, stalled)
 		require.Equal(t, wire.CmdHeaders, cmd)
 	})
@@ -103,7 +103,7 @@ func TestExpiredStallResponseSuppressesNonBlockWhileBlockInFlight(t *testing.T) 
 			wire.CmdHeaders: now.Add(-time.Second),    // expired
 			wire.CmdBlock:   now.Add(4 * time.Minute), // block still has time
 		}
-		cmd, stalled := expiredStallResponse(pending, now, 0)
+		cmd, stalled := expiredStallResponse(pending, now, 0, false)
 		require.False(t, stalled, "headers must not stall while a block is in flight")
 		require.Empty(t, cmd)
 	})
@@ -113,7 +113,7 @@ func TestExpiredStallResponseSuppressesNonBlockWhileBlockInFlight(t *testing.T) 
 			wire.CmdHeaders: now.Add(-time.Second),
 			wire.CmdBlock:   now.Add(-time.Second), // block itself stalled
 		}
-		cmd, stalled := expiredStallResponse(pending, now, 0)
+		cmd, stalled := expiredStallResponse(pending, now, 0, false)
 		require.True(t, stalled)
 		require.Equal(t, wire.CmdBlock, cmd, "an expired block deadline is a real stall")
 	})
@@ -123,7 +123,7 @@ func TestExpiredStallResponseSuppressesNonBlockWhileBlockInFlight(t *testing.T) 
 			wire.CmdHeaders: now.Add(-time.Second),
 		}
 		// A 2s handler offset pushes the effective deadline past now.
-		cmd, stalled := expiredStallResponse(pending, now, 2*time.Second)
+		cmd, stalled := expiredStallResponse(pending, now, 2*time.Second, false)
 		require.False(t, stalled)
 		require.Empty(t, cmd)
 	})
@@ -166,7 +166,7 @@ func TestClearBlockResponseGroup(t *testing.T) {
 			wire.CmdBlock:   now.Add(time.Minute),  // block was in flight
 			wire.CmdHeaders: now.Add(-time.Second), // expired while suppressed
 		}
-		refreshed := clearBlockResponseGroup(pending, now)
+		refreshed := clearBlockResponseGroup(pending, now, stallResponseTimeoutBlocks, false)
 		require.True(t, refreshed)
 		require.NotContains(t, pending, wire.CmdBlock, "block group is cleared")
 		require.Equal(t, now.Add(stallResponseTimeout*3), pending[wire.CmdHeaders],
@@ -178,7 +178,7 @@ func TestClearBlockResponseGroup(t *testing.T) {
 		pending := map[string]time.Time{
 			wire.CmdHeaders: expired, // genuinely stalled getheaders
 		}
-		refreshed := clearBlockResponseGroup(pending, now)
+		refreshed := clearBlockResponseGroup(pending, now, stallResponseTimeoutBlocks, false)
 		require.False(t, refreshed, "a relayed tx with no block pending must not refresh")
 		require.Equal(t, expired, pending[wire.CmdHeaders],
 			"stalled getheaders deadline is left untouched so it can still fire")
@@ -189,7 +189,7 @@ func TestClearBlockResponseGroup(t *testing.T) {
 			wire.CmdTx:  now.Add(time.Minute),
 			wire.CmdInv: now.Add(-time.Second),
 		}
-		refreshed := clearBlockResponseGroup(pending, now)
+		refreshed := clearBlockResponseGroup(pending, now, stallResponseTimeoutBlocks, false)
 		require.True(t, refreshed)
 		require.NotContains(t, pending, wire.CmdTx)
 		require.Equal(t, now.Add(stallResponseTimeoutBlocks), pending[wire.CmdInv])
@@ -205,24 +205,24 @@ func TestShouldExtendBlockDeadline(t *testing.T) {
 	start := now.Add(-time.Minute) // fetch in flight for 1 minute
 
 	t.Run("healthy block within cap extends", func(t *testing.T) {
-		require.True(t, shouldExtendBlockDeadline(wire.CmdBlock, true, start, now))
+		require.True(t, shouldExtendBlockDeadline(wire.CmdBlock, true, start, now, MaxBlockDownloadTime))
 	})
 
 	t.Run("non-block command never extends", func(t *testing.T) {
-		require.False(t, shouldExtendBlockDeadline(wire.CmdHeaders, true, start, now))
+		require.False(t, shouldExtendBlockDeadline(wire.CmdHeaders, true, start, now, MaxBlockDownloadTime))
 	})
 
 	t.Run("unhealthy throughput does not extend", func(t *testing.T) {
-		require.False(t, shouldExtendBlockDeadline(wire.CmdBlock, false, start, now))
+		require.False(t, shouldExtendBlockDeadline(wire.CmdBlock, false, start, now, MaxBlockDownloadTime))
 	})
 
 	t.Run("no fetch in flight does not extend", func(t *testing.T) {
-		require.False(t, shouldExtendBlockDeadline(wire.CmdBlock, true, time.Time{}, now))
+		require.False(t, shouldExtendBlockDeadline(wire.CmdBlock, true, time.Time{}, now, MaxBlockDownloadTime))
 	})
 
 	t.Run("past the wall-clock cap stops extending despite healthy throughput", func(t *testing.T) {
 		overCap := now.Add(-MaxBlockDownloadTime - time.Second)
-		require.False(t, shouldExtendBlockDeadline(wire.CmdBlock, true, overCap, now),
+		require.False(t, shouldExtendBlockDeadline(wire.CmdBlock, true, overCap, now, MaxBlockDownloadTime),
 			"a slow-drip peer must be rotated once the cap is exceeded")
 	})
 }
@@ -231,14 +231,79 @@ func TestShouldExtendBlockDeadline(t *testing.T) {
 // a block fetch completes, a head-of-line-blocked response is restored to its
 // original allowance (notably headers' 90s) rather than the 30s base.
 func TestResponseStallBudget(t *testing.T) {
-	require.Equal(t, stallResponseTimeout*3, responseStallBudget(wire.CmdHeaders),
+	require.Equal(t, stallResponseTimeout*3, responseStallBudget(wire.CmdHeaders, stallResponseTimeoutBlocks),
 		"headers must keep their extended load budget on refresh")
 
 	for _, cmd := range []string{wire.CmdBlock, wire.CmdMerkleBlock, wire.CmdTx, wire.CmdNotFound, wire.CmdInv} {
-		require.Equal(t, stallResponseTimeoutBlocks, responseStallBudget(cmd),
+		require.Equal(t, stallResponseTimeoutBlocks, responseStallBudget(cmd, stallResponseTimeoutBlocks),
 			"block-family response %s must get the block budget", cmd)
 	}
 
-	require.Equal(t, stallResponseTimeout, responseStallBudget(wire.CmdVerAck),
+	require.Equal(t, stallResponseTimeout, responseStallBudget(wire.CmdVerAck, stallResponseTimeoutBlocks),
 		"other responses fall back to the base budget")
+}
+
+// TestHeadersStalledEscapesBlockSuppression guards the one escape a
+// warm-but-headerless sync peer has.
+//
+// Non-block deadlines are normally suppressed while a block is in flight,
+// because a headers reply sharing the DATA1 stream is head-of-line blocked
+// behind the block rather than missing. Under parallel fetch the sync peer
+// almost always has a block in flight, so that suppression — plus the
+// post-block deadline refresh — means the headers deadline could never fire on
+// the peer it matters most for. The frontier then freezes while blocks keep
+// arriving, the node drains its header runway at full speed and goes quiet: the
+// busy/quiet oscillation this work exists to remove. netsync's frontier-stall
+// signal is what tells the two cases apart.
+func TestHeadersStalledEscapesBlockSuppression(t *testing.T) {
+	now := time.Unix(3_000_000, 0)
+
+	t.Run("suppressed while a block is in flight and the frontier is moving", func(t *testing.T) {
+		pending := map[string]time.Time{
+			wire.CmdBlock:   now.Add(time.Minute),
+			wire.CmdHeaders: now.Add(-time.Second),
+		}
+
+		_, stalled := expiredStallResponse(pending, now, 0, false)
+		require.False(t, stalled,
+			"a headers reply queued behind a healthy block fetch is late, not missing")
+	})
+
+	t.Run("fires despite the in-flight block once the frontier is stalled", func(t *testing.T) {
+		pending := map[string]time.Time{
+			wire.CmdBlock:   now.Add(time.Minute),
+			wire.CmdHeaders: now.Add(-time.Second),
+		}
+
+		cmd, stalled := expiredStallResponse(pending, now, 0, true)
+		require.True(t, stalled,
+			"a peer serving blocks while the frontier stands still must still be judged on headers")
+		require.Equal(t, wire.CmdHeaders, cmd)
+	})
+
+	t.Run("other non-block deadlines stay suppressed", func(t *testing.T) {
+		pending := map[string]time.Time{
+			wire.CmdBlock: now.Add(time.Minute),
+			wire.CmdInv:   now.Add(-time.Second),
+		}
+
+		_, stalled := expiredStallResponse(pending, now, 0, true)
+		require.False(t, stalled,
+			"the carve-out is for headers only: nothing else measures the frozen frontier")
+	})
+
+	t.Run("post-block refresh does not extend a stalled headers deadline", func(t *testing.T) {
+		expired := now.Add(-time.Second)
+		pending := map[string]time.Time{
+			wire.CmdBlock:   now.Add(time.Minute),
+			wire.CmdHeaders: expired,
+			wire.CmdInv:     expired,
+		}
+
+		require.True(t, clearBlockResponseGroup(pending, now, stallResponseTimeoutBlocks, true))
+		require.Equal(t, expired, pending[wire.CmdHeaders],
+			"forgiving the headers deadline on every completed block is exactly wrong once the frontier is frozen")
+		require.Equal(t, now.Add(stallResponseTimeoutBlocks), pending[wire.CmdInv],
+			"the refresh still applies to everything else")
+	})
 }

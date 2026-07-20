@@ -270,6 +270,33 @@ type peerSyncState struct {
 	requestQueue    *txmap.SyncedSlice[wire.InvVect]
 	requestedTxns   *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 	requestedBlocks *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
+
+	// The three fields below are ATOMIC on purpose. peerStates is a SyncedMap, so
+	// looking a state up is safe from anywhere, but the struct it hands back has
+	// no mutex and its scalar fields above are only ever touched on the single
+	// blockHandler/drain goroutine. These three are NOT: the byte sample is
+	// written by checkHeadStall on the drain goroutine while unconnectingHeaders
+	// is written by handleHeadersMsg, and either may be read while the other
+	// writes. Anything added here that is touched from more than one goroutine
+	// must be atomic too — there is no lock to fall back on.
+
+	// lastAssocReadBytes / lastAssocSampleAt are the F2 throughput sample: the
+	// peer's association read-byte total and the wall clock (UnixNano, 0 = never
+	// sampled) at which it was taken. They exist because the existing
+	// syncPeerState throughput accounting covers the SYNC peer only and is
+	// refreshed on the 30s sync-peer tick, whereas the head-of-line stall check
+	// runs every refill tick against whichever arbitrary peer happens to hold the
+	// head block.
+	lastAssocReadBytes atomic.Uint64
+	lastAssocSampleAt  atomic.Int64
+
+	// unconnectingHeaders counts CONSECUTIVE header batches from this peer that
+	// were unrequested or failed to link to our header list (svnode's
+	// MAX_UNCONNECTING_HEADERS accounting). Any batch that connects resets it to
+	// zero, so a peer losing a benign header race — routine during IBD — never
+	// accumulates, while a peer genuinely spamming garbage still reaches the
+	// tolerance and is dropped.
+	unconnectingHeaders atomic.Int32
 }
 
 // syncPeerState stores additional info about the sync peer.
@@ -688,6 +715,27 @@ type SyncManager struct {
 	// delivery put the drain goroutine into the blocking maturity wait and the
 	// node wedged at exactly the gate width above genesis (mainnet, height 100).
 	baHeightPolled atomic.Bool
+	// catchingBlocksState caches whether the blockchain FSM is in CATCHINGBLOCKS,
+	// i.e. whether we are in initial block download. It is refreshed by the
+	// existing once-per-second FSM poll in startKafkaListeners (one extra
+	// IsFSMCurrentState call on a goroutine that was already making one), so
+	// consumers can ask "are we catching up?" on a hot path without any gRPC
+	// chatter. Exposed via InitialBlockDownload(); the peer layer uses it to pick
+	// between its catch-up and its tip deadlines, and MUST be able to read it from
+	// its own goroutines — hence atomic. Defaults to false, so before the first
+	// poll completes every consumer sees tip behaviour, which is the safe side.
+	catchingBlocksState atomic.Bool
+	// lastHeaderProgressAt (UnixNano; 0 = never stamped) is the header DELIVERY
+	// liveness clock. It is stamped ONLY when a header batch actually extends the
+	// header list — not when a peer merely talks to us. That distinction is the
+	// whole point: the peer layer's catch-up deadlines are deliberately patient,
+	// and netsync's silence detector resets on ANY association traffic, so a peer
+	// that keeps ping/pong, inv and addr flowing while never sending another
+	// header would be caught by neither, and the header frontier — which is
+	// single-sourced, so ALL block download hangs off it — would freeze for the
+	// full widened window. This clock measures the only thing that rules that out.
+	// Read cross-goroutine via HeaderProgressStalled(), hence atomic.
+	lastHeaderProgressAt atomic.Int64
 	// parkAheadActive is set once, when the drain loop creates the park store
 	// (park-ahead enabled + refill tick present). It gates the headers-first fetch
 	// runway cap (fetchRunwayHorizon): only when parking is live must the fetch
@@ -916,6 +964,16 @@ type SyncManager struct {
 	// churn the sync peer and reset the headers-first download).
 	headStallHash  chainhash.Hash
 	headStallSince time.Time
+	// lastFrontierLogAt (drain goroutine only — logFrontier runs from the refill
+	// tick) rate-limits the [frontier] progress line to FrontierLogInterval. A
+	// frozen header frontier is the failure mode most of this machinery exists to
+	// prevent and it was previously invisible in the log: block activity was
+	// visible, header progress was not, so a freeze could only be inferred by
+	// sampling the tip from outside the process. Logging on a fixed cadence rather
+	// than on change is deliberate — an on-change log goes silent exactly when the
+	// problem occurs, whereas a run of identical heights with a timestamp on each
+	// makes the freeze directly measurable after the fact.
+	lastFrontierLogAt time.Time
 	// headerHeightIndex maps each headerNode's block hash to its authoritative
 	// PoW-verified height. It allows handleBlockPreamble to resolve the height of
 	// blocks that arrive out of order (not at headerList.Front()), which happens
@@ -1418,6 +1476,18 @@ func (sm *SyncManager) startSync() {
 		}
 
 		sm.headersFirstMode.Store(true)
+
+		// Start the header-delivery clock at the moment we ASK, not at the first
+		// answer. HeaderProgressStalled reports "not stalled" for an unstamped
+		// clock, and the peer layer consumes "not stalled" as a licence to widen
+		// the headers deadline — so without this stamp a sync peer that accepts
+		// the first getheaders of a fresh IBD and never answers it would be
+		// granted the full IBDHeadersStallTimeout instead of being cut at the tip
+		// deadline. That is the cold-start path taken after every restart, and it
+		// is exactly where the frontier is most expensive to freeze. Only stamped
+		// when it has never been stamped: a rotation mid-IBD must keep measuring
+		// against the real last delivery, not restart the clock.
+		sm.lastHeaderProgressAt.CompareAndSwap(0, time.Now().UnixNano())
 
 		sm.logger.Infof("[startSync] Downloading headers for blocks %d to %d from peer %s", bestBlockHeaderMeta.Height+1, headerCheckpointHeight, bestPeer.String())
 	} else {
@@ -3391,6 +3461,10 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	// exhausted (nothing new to assign, ordered commit paused on the missing head).
 	// It is an internal no-op unless ParallelFetchPeers > 1. Any disconnect it does
 	// frees that peer's assignments for reassignment on this same or the next tick.
+	// Phase 0 measurement hook. Cheap: it returns on a clock comparison and
+	// allocates nothing until the interval has actually elapsed.
+	sm.logFrontier(time.Now())
+
 	sm.checkHeadStall(time.Now())
 
 	// checkHeadStall only recovers the HEAD orphan. A NON-head block can also be
@@ -4308,6 +4382,63 @@ func (sm *SyncManager) realignFrontierIfCommitted() int {
 	return trimmed
 }
 
+// logFrontier emits the headers-first frontier on a fixed cadence so a frozen
+// header frontier can be timed straight from the log, without an external tip
+// sampler. It reports the height of the LAST header-list element (how far the
+// header download has run ahead), the committed height the block pipeline has
+// reached, and how many block assignments are outstanding — a freeze shows up as
+// a run of lines with an unmoving frontier height.
+//
+// FrontierLogInterval == 0 disables the line entirely. Callers must already have
+// established that headers-first mode is active; this is a no-op at the tip
+// because maintainInFlightWindow returns before reaching it.
+//
+// MUST be called on the drain goroutine only (lastFrontierLogAt is unguarded).
+func (sm *SyncManager) logFrontier(now time.Time) {
+	interval := sm.settings.Legacy.FrontierLogInterval
+	if interval <= 0 {
+		return
+	}
+
+	if !sm.lastFrontierLogAt.IsZero() && now.Sub(sm.lastFrontierLogAt) < interval {
+		return
+	}
+
+	sm.lastFrontierLogAt = now
+
+	// Lock order everywhere in this file is headerMu -> assignedMu; both are leaf
+	// locks and neither is held across a peer send or any I/O.
+	sm.headerMu.Lock()
+
+	frontierHeight := int32(-1)
+	if back := sm.headerList.Back(); back != nil {
+		if node, ok := back.Value.(*headerNode); ok {
+			frontierHeight = node.height
+		}
+	}
+
+	headerListLen := sm.headerList.Len()
+	sm.headerMu.Unlock()
+
+	sm.assignedMu.Lock()
+	assigned := len(sm.assignedTo)
+	sm.assignedMu.Unlock()
+
+	sm.logger.Infof("[frontier] headerFrontier=%d headerListLen=%d committedHeight=%d assignedBlocks=%d headerProgressAge=%s",
+		frontierHeight, headerListLen, sm.cachedBlockAssemblyHeight.Load(), assigned, sm.headerProgressAge())
+}
+
+// headerProgressAge reports how long it has been since a header batch last
+// extended the header list, or "never" if none has. Used only for logging.
+func (sm *SyncManager) headerProgressAge() string {
+	last := sm.lastHeaderProgressAt.Load()
+	if last == 0 {
+		return "never"
+	}
+
+	return time.Since(time.Unix(0, last)).Truncate(time.Second).String()
+}
+
 func (sm *SyncManager) checkHeadStall(now time.Time) {
 	if sm.settings.Legacy.ParallelFetchPeers <= 1 {
 		return
@@ -4417,15 +4548,51 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 	}
 
 	disconnectTimeout := sm.settings.Legacy.HeadStallDisconnectTimeout
-	if disconnectTimeout > 0 && now.Sub(sm.headStallSince) <= disconnectTimeout {
+	if disconnectTimeout <= 0 {
+		// Rollback: with the race window disabled this path must be byte-identical
+		// to pre-F1/F2 — disconnect at BlockStallTimeout, no race, no throughput
+		// gate. The gate must NOT run here: on its first visit it has no baseline
+		// to measure against and holds the disconnect off, which would silently
+		// turn the documented one-setting rollback into a two-setting one.
+		sm.disconnectStalledHead(headHash, headHeight, headAt, headPeer, disconnectTimeout, now)
+
+		return
+	}
+
+	if now.Sub(sm.headStallSince) <= disconnectTimeout {
 		// Within the race window: re-assign the single head block to another peer and
 		// keep the current one connected. Reset the per-assignment grace so the next
 		// holder gets its own BlockStallTimeout before being raced again.
+		//
+		// Keep the F2 byte baseline warm while we race. The throughput gate needs a
+		// sample at least headStallRateWindow old to believe a rate, and the race
+		// window is the only place there is time to grow one; without this the gate
+		// would arrive at the disconnect decision unmeasured and have to stall it.
+		sm.primeHeadStallSample(headPeer, now)
 		sm.freeHeadBlockForRace(headHash, headPeer)
 
 		return
 	}
 
+	// F2 (never execute a peer that is still delivering): the race window has
+	// expired, but "stuck on the same head block for 30s" and "dead" are not the
+	// same thing. A fat frontier block from a merely SLOW peer genuinely takes
+	// longer than the window to transfer, and dropping that peer mid-transfer
+	// throws away the partial download and restarts it elsewhere — strictly
+	// slower. svnode only disconnects a sole blocker that is ALSO under a rate
+	// floor. Note this keeps the PEER; it deliberately does not put the block back
+	// inside the race window (see headStallThroughputGate).
+	if sm.headStallThroughputGate(headPeer, headHash, headHeight, now) {
+		return
+	}
+
+	sm.disconnectStalledHead(headHash, headHeight, headAt, headPeer, disconnectTimeout, now)
+}
+
+// disconnectStalledHead drops the single peer holding a head block that neither
+// the re-fetch race nor the throughput gate could rescue, and frees its
+// assignments so they are re-eligible immediately. Never mass-disconnects.
+func (sm *SyncManager) disconnectStalledHead(headHash chainhash.Hash, headHeight int32, headAt time.Time, headPeer *peerpkg.Peer, disconnectTimeout time.Duration, now time.Time) {
 	// disconnectTimeout <= 0 (rollback) OR the race genuinely failed: the peers
 	// cannot deliver this block, so disconnect the one holding it. Disconnect ONLY
 	// the single head peer (never mass-disconnect).
@@ -4441,6 +4608,140 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 	// it here makes the reassignment immediate rather than waiting for the
 	// done-peer message.
 	sm.freePeerAssignments(headPeer)
+}
+
+const (
+	// headStallRateWindow is the shortest interval over which the F2 throughput
+	// gate will believe a measurement. Association read bytes advance in chunky,
+	// irregular steps, so a rate computed over a single ~20ms refill tick reads
+	// zero for a peer that is in fact streaming fine — which would make the gate
+	// worse than useless, since it would licence exactly the disconnect it exists
+	// to prevent. Below this window the gate reports "still measuring" and the
+	// disconnect simply waits.
+	headStallRateWindow = time.Second
+	// headStallRateSampleMaxAge discards a byte sample left over from an earlier,
+	// unrelated stall episode. Averaging over minutes of intervening healthy
+	// transfer would flatter a peer that has since gone quiet.
+	headStallRateSampleMaxAge = 2 * time.Minute
+)
+
+// headStallThroughputGate reports whether the head-of-line disconnect must be
+// held off because the peer holding the head block is demonstrably still moving
+// bytes (F2). It samples the peer's association read-byte counter, which is
+// byte-granular and spans the association's streams, so it advances while a
+// large block is still arriving on DATA1 and has not yet produced a message.
+//
+// Returning true means "do not disconnect this tick" — nothing more. It
+// deliberately leaves headStallSince alone. Rewinding that clock on a measured
+// pass would put the head block back inside the F1 race window, and since the
+// gate measures ASSOCIATION-wide throughput rather than progress on the head
+// block itself, a peer that has silently dropped the head block while streaming
+// its other assignments passes the floor indefinitely. Each pass would then
+// re-enter the race branch and issue a fresh getdata for the same block roughly
+// every BlockStallTimeout, for as long as the peer keeps delivering anything at
+// all — a permanent duplicate-fetch loop on a multi-GB block. The peer is kept
+// (that is the svnode rule this implements); the block is not raced again.
+//
+// BlockStallMinRate == 0 disables the gate entirely: this returns false without
+// taking a sample and the disconnect path is byte-identical to pre-F2. The gate
+// is also never reached when HeadStallDisconnectTimeout == 0, so that rollback
+// remains a single setting.
+//
+// Drain-goroutine only, but it writes the peer's sample fields atomically since
+// peerSyncState has no lock (see the comment on those fields).
+func (sm *SyncManager) headStallThroughputGate(peer *peerpkg.Peer, headHash chainhash.Hash, headHeight int32, now time.Time) bool {
+	minRate := sm.settings.Legacy.BlockStallMinRate
+	if minRate <= 0 || peer == nil {
+		return false
+	}
+
+	peerState, ok := sm.peerStates.Get(peer)
+	if !ok {
+		// The peer is already gone from the state map; there is nothing to measure
+		// and nothing useful to protect. Fall through to the existing behaviour.
+		return false
+	}
+
+	current := peer.AssociationReadBytes()
+	prevAt := peerState.lastAssocSampleAt.Load()
+	prev := peerState.lastAssocReadBytes.Load()
+
+	// No usable baseline: either we have never sampled this peer, or the sample we
+	// hold predates an unrelated episode. Record one for next time and let the
+	// disconnect proceed.
+	//
+	// The gate must never VETO a decision it did not measure. Reaching here means
+	// the head block has been stuck for the whole HeadStallDisconnectTimeout
+	// without primeHeadStallSample ever running for this peer — i.e. the race
+	// window did not happen — so there is no evidence of delivery to protect and
+	// suppressing would make an unmeasured gate silently override the disconnect
+	// backstop, including the frontier carve-out above it. In normal operation the
+	// race window primes the baseline, so this branch is the exception, not the
+	// path every peer takes on its first stall.
+	if prevAt == 0 || now.Sub(time.Unix(0, prevAt)) > headStallRateSampleMaxAge {
+		peerState.lastAssocReadBytes.Store(current)
+		peerState.lastAssocSampleAt.Store(now.UnixNano())
+
+		return false
+	}
+
+	elapsed := now.Sub(time.Unix(0, prevAt))
+	if elapsed < headStallRateWindow {
+		// Baseline is still maturing. Leave it in place — resampling here would
+		// restart the window on every tick and it would never mature.
+		return true
+	}
+
+	// AssociationReadBytes sums over the streams present at sample time, so it can
+	// DECREASE if a stream was torn down between samples. That is the opposite of
+	// progress: treat it as zero throughput and let the disconnect proceed.
+	var delta uint64
+	if current > prev {
+		delta = current - prev
+	}
+
+	rate := int64(float64(delta) / elapsed.Seconds())
+
+	peerState.lastAssocReadBytes.Store(current)
+	peerState.lastAssocSampleAt.Store(now.UnixNano())
+
+	if rate < minRate {
+		return false
+	}
+
+	// The peer is delivering, so keep it. headStallSince is NOT rewound — see the
+	// duplicate-fetch loop described on this function. This log line is the F2
+	// acceptance metric — grep it to count how many disconnects the gate prevented
+	// over a soak.
+	sm.logger.Warnf("[checkHeadStall] head-of-line disconnect suppressed: peer %s still delivering %d B/s (floor %d B/s) on head block %s (height %d) after %s stalled; keeping peer",
+		peer, rate, minRate, headHash, headHeight, now.Sub(sm.headStallSince))
+
+	return true
+}
+
+// primeHeadStallSample seeds the F2 byte baseline for a peer whose head block is
+// being raced, so that by the time the race window expires the throughput gate
+// has a sample old enough (>= headStallRateWindow) to compute a rate from. It
+// only ever CREATES a baseline — never refreshes a usable one, because a
+// baseline that is restarted on every ~20ms refill tick would never mature and
+// the gate could never measure anything.
+func (sm *SyncManager) primeHeadStallSample(peer *peerpkg.Peer, now time.Time) {
+	if sm.settings.Legacy.BlockStallMinRate <= 0 || peer == nil {
+		return
+	}
+
+	peerState, ok := sm.peerStates.Get(peer)
+	if !ok {
+		return
+	}
+
+	prevAt := peerState.lastAssocSampleAt.Load()
+	if prevAt != 0 && now.Sub(time.Unix(0, prevAt)) <= headStallRateSampleMaxAge {
+		return
+	}
+
+	peerState.lastAssocReadBytes.Store(peer.AssociationReadBytes())
+	peerState.lastAssocSampleAt.Store(now.UnixNano())
 }
 
 // freeHeadBlockForRace re-assigns a single stalled head block to another peer
@@ -4527,13 +4828,159 @@ func (sm *SyncManager) freePeerAssignments(peer *peerpkg.Peer) {
 	}
 }
 
+// handleUnconnectingHeaders is the shared response to a header batch that was
+// either unrequested or failed to link to our header list. It replaces two
+// instant disconnects (F4).
+//
+// Both cases used to be treated as misbehaviour and cost the peer its
+// connection. During IBD they are overwhelmingly benign races: the peer
+// announced a block while our own getheaders was in flight, or it is serving
+// from a frontier a little different from the one we last asked about. Killing a
+// working peer for that is a self-inflicted wound, and svnode does not do it —
+// it tolerates MAX_UNCONNECTING_HEADERS (10) consecutive such batches first.
+//
+// The detector is NOT disabled. A peer that genuinely spams garbage produces an
+// unbroken run of offences and is still disconnected on the Kth, which is what
+// actual misbehaviour looks like; a peer that loses one race sends a connecting
+// batch next and has its counter cleared. UnconnectingHeadersTolerance <= 1
+// reproduces the old instant kill exactly — no counter, no re-anchor, same
+// reason string — and is the rollback lever.
+//
+// On tolerated offences we re-anchor: ask this peer for headers from our own
+// DB-best tip, using the same GetBlockLocator machinery the header-list recovery
+// path and startSync use, so a peer that is merely out of step is told where we
+// actually are instead of being dropped.
+//
+// On the one-outstanding-getheaders invariant documented on
+// maintainInFlightWindow: that invariant exists because a duplicate, overlapping
+// headers response trips the very linkage check we are standing in. Two things
+// keep this send safe. First, the hazard it guards against was the DISCONNECT,
+// and F4 is precisely what removes it — an overlapping response now costs a
+// counter increment, not a connection. Second, the offence counter bounds the
+// pathological case where the peer's answer is itself another offence: a run of
+// bad batches can produce at most tolerance-1 re-anchors before the peer is
+// disconnected, and any connecting batch resets the run to zero.
+// maintainInFlightWindow, which TestRunwayExhaustion_NoDuplicateGetheaders
+// covers, is untouched.
+//
+// The send deliberately does NOT leave its (begin, stop) pair in the peer's
+// duplicate-getheaders cache — see the ResetGetHeadersDedup call at the end.
+func (sm *SyncManager) handleUnconnectingHeaders(peer *peerpkg.Peer, peerState *peerSyncState, reason string) {
+	tolerance := sm.settings.Legacy.UnconnectingHeadersTolerance
+
+	// Rollback: pre-F4 behaviour, byte-for-byte.
+	if tolerance <= 1 || peerState == nil {
+		peer.DisconnectWithWarning(reason)
+		return
+	}
+
+	offences := int(peerState.unconnectingHeaders.Add(1))
+	if offences >= tolerance {
+		peerState.unconnectingHeaders.Store(0)
+		peer.DisconnectWithWarning(fmt.Sprintf("%s (%d consecutive unconnecting header batches, tolerance %d)", reason, offences, tolerance))
+
+		return
+	}
+
+	sm.logger.Debugf("[handleHeadersMsg] tolerating unconnecting headers from %s (%d/%d): %s; re-anchoring from our best tip",
+		peer, offences, tolerance, reason)
+
+	bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
+	if err != nil {
+		sm.logger.Warnf("[handleHeadersMsg] failed to get best block header while re-anchoring peer %s: %v", peer, err)
+		return
+	}
+
+	locator, err := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
+	if err != nil {
+		sm.logger.Warnf("[handleHeadersMsg] failed to build block locator while re-anchoring peer %s: %v", peer, err)
+		return
+	}
+
+	// Head toward the current header-request checkpoint when we have one; past the
+	// final checkpoint (or outside headers-first mode) a zero stop hash asks for
+	// everything we are missing, which is what an out-of-step peer needs.
+	sm.headerMu.Lock()
+	stopHash := &chainhash.Hash{}
+
+	if sm.headerCheckpoint != nil {
+		stopHash = sm.headerCheckpoint.Hash
+	}
+	sm.headerMu.Unlock()
+
+	if err := peer.PushGetHeadersMsg(locator, stopHash); err != nil {
+		sm.logger.Warnf("[handleHeadersMsg] failed to send re-anchoring getheaders to peer %s: %v", peer, err)
+	}
+
+	// Give the dedup slot back. This send used the same (DB-best tip, header
+	// checkpoint) pair startSync uses, so leaving it cached would make netsync's
+	// own next getheaders to this peer a "duplicate" and drop it on the floor —
+	// startSync would then set headers-first and log a download it never
+	// requested, freezing the frontier for good. The re-anchor is already bounded
+	// by the offence counter (at most tolerance-1 sends per run of bad batches),
+	// so we do not need the dedup cache to bound it as well.
+	peer.ResetGetHeadersDedup()
+}
+
+// InitialBlockDownload reports whether the node is catching up (blockchain FSM
+// in CATCHINGBLOCKS) rather than following the tip. It reads a cached value
+// refreshed by the existing once-per-second FSM poll, so it is safe and free to
+// call from any goroutine on a hot path — the same pattern as
+// ReadBackpressured(). The peer layer uses it to choose between its patient
+// catch-up deadlines and its original tip deadlines, so that every widened
+// timeout reverts automatically the moment we reach the tip.
+func (sm *SyncManager) InitialBlockDownload() bool {
+	return sm.catchingBlocksState.Load()
+}
+
+// HeaderProgressStalled reports whether the header frontier has stopped moving
+// while headers-first catch-up is active.
+//
+// This is the counterweight to widening the peer layer's headers deadline during
+// IBD. Headers are single-sourced: one peer that accepts a getheaders and then
+// never answers it freezes the frontier, and therefore all block download,
+// without ever going quiet enough to trip a connection-level detector — netsync's
+// silence detector resets on ANY association traffic, and a widened peer deadline
+// would not fire for many minutes. This measures header DELIVERY instead of
+// transport liveness, which is the only signal that distinguishes the two.
+//
+// It reports false — no stall — when headers-first mode is not active and when
+// HeaderDeliveryTimeout is 0, both of which mean this measure does not apply and
+// the peer must be judged on its ordinary deadlines.
+//
+// The unstamped clock is reported as STALLED, not as healthy. False here is not
+// a neutral "unknown": the sole consumer turns it into "the frontier is moving,
+// be patient", so answering false for a frontier we have never seen move would
+// hand the widest possible window to the one peer we have the least evidence
+// about. startSync stamps the clock when it sends the first getheaders, so an
+// unstamped clock during headers-first is effectively unreachable; treating it
+// as stalled simply falls back to the pre-change deadlines. Atomics only — safe
+// from any goroutine.
+func (sm *SyncManager) HeaderProgressStalled() bool {
+	timeout := sm.settings.Legacy.HeaderDeliveryTimeout
+	if timeout <= 0 {
+		return false
+	}
+
+	if !sm.headersFirstMode.Load() {
+		return false
+	}
+
+	last := sm.lastHeaderProgressAt.Load()
+	if last == 0 {
+		return true
+	}
+
+	return time.Since(time.Unix(0, last)) > timeout
+}
+
 // handleHeadersMsg handles block header messages from all peers.  Headers are
 // requested when performing a headers-first sync.
 func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	sm.logger.Debugf("[handleHeadersMsg] received headers message with %d headers from %s", len(hmsg.headers.Headers), hmsg.peer)
 	peer := hmsg.peer
 
-	_, resolved, exists := sm.peerStateResolvingPrimary(peer)
+	peerState, resolved, exists := sm.peerStateResolvingPrimary(peer)
 	if !exists {
 		sm.logger.Warnf("Received headers message from unknown peer %s", peer)
 		return
@@ -4550,8 +4997,14 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	numHeaders := len(msg.Headers)
 
 	if !sm.headersFirstMode.Load() {
-		reason := fmt.Sprintf("Got %d unrequested headers from %s", numHeaders, peer.String())
-		peer.DisconnectWithWarning(reason)
+		// F4: headers we did not ask for are not necessarily misbehaviour. A peer
+		// announcing a block, or answering a getheaders we sent just before leaving
+		// headers-first mode, lands here through no fault of its own. Count it and
+		// re-anchor instead of executing on sight. NOT gated on IBD: a headers
+		// message at the tip is a legitimate block announcement, and the same
+		// tolerance applies.
+		sm.handleUnconnectingHeaders(peer, peerState,
+			fmt.Sprintf("Got %d unrequested headers from %s", numHeaders, peer.String()))
 
 		return
 	}
@@ -4666,6 +5119,20 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			if sm.startHeader == nil {
 				sm.startHeader = e
 			}
+
+			// The header frontier actually MOVED. This is the only place that may
+			// stamp the delivery clock: transport liveness (ping/pong, inv, addr)
+			// says nothing about whether headers are arriving, and the widened
+			// catch-up deadlines mean nothing else would notice a peer that keeps
+			// its connection warm while the frontier stands still. Also clears this
+			// peer's consecutive-offence count (F4) — a peer that connects a batch
+			// has demonstrably not been spamming, so the count must measure a RUN of
+			// bad batches, never a lifetime total.
+			sm.lastHeaderProgressAt.Store(time.Now().UnixNano())
+
+			if peerState != nil && peerState.unconnectingHeaders.Load() != 0 {
+				peerState.unconnectingHeaders.Store(0)
+			}
 		} else {
 			// Post-reset grace: right after resetHeaderState a successor sync
 			// peer's first in-flight batch legitimately fails to connect to the
@@ -4681,7 +5148,12 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 				return
 			}
 
-			peer.DisconnectWithWarning("Received block header that does not properly connect to the chain")
+			// F4: past the post-reset grace, a non-linking batch is still far more
+			// often a benign race than misbehaviour — the peer is on a slightly
+			// different frontier, or it answered an older getheaders. Count it and
+			// re-anchor rather than executing on the first offence.
+			sm.handleUnconnectingHeaders(peer, peerState,
+				"Received block header that does not properly connect to the chain")
 
 			return
 		}
@@ -7287,6 +7759,14 @@ func (sm *SyncManager) startKafkaListeners(ctx context.Context, _ error) {
 
 				// Transaction-related listeners: enable only when RUNNING
 				isRunning, _ := sm.blockchainClient.IsFSMCurrentState(sm.ctx, teranodeblockchain.FSMStateRUNNING)
+
+				// Piggyback the catch-up flag on this existing poll so
+				// InitialBlockDownload() costs its hot-path callers nothing but an
+				// atomic load. On error IsFSMCurrentState returns false, which parks
+				// us on tip behaviour — the conservative side, since it only ever
+				// narrows timeouts back to today's values.
+				catchingBlocks, _ := sm.blockchainClient.IsFSMCurrentState(sm.ctx, teranodeblockchain.FSMStateCATCHINGBLOCKS)
+				sm.catchingBlocksState.Store(catchingBlocks)
 
 				// Non-blocking send to avoid deadlock if no one is reading
 				select {
