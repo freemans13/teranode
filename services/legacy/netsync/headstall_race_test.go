@@ -148,3 +148,39 @@ func TestCheckHeadStall_RaceDoesNotResampleAMaturingBaseline(t *testing.T) {
 	require.EqualValues(t, 1, peerState.lastAssocReadBytes.Load(),
 		"a usable baseline must be left alone so its measurement window can mature")
 }
+
+// TestCheckHeadStall_RacedBlockToleratesLateDelivery reproduces the cascade
+// measured live on mainnet 2026-07-20. F1 races a stalled head block to another
+// peer and keeps the original connected — but freeing the block deletes it from
+// that peer's requestedBlocks. If the raced-TO peer commits the block first, its
+// hash leaves headerHeightIndex, so the original peer's slightly-late copy matches
+// neither the per-peer ledger nor the live index and the delivered-block handler
+// disconnects it for "Got unrequested block". That drop lands on the (usually sync)
+// peer and re-anchors the frontier — the exact churn F1 exists to remove.
+//
+// The fix registers the raced hash in recentlyNeededUntil so blockStillNeeded
+// tolerates the late duplicate. RED before the fix: blockStillNeeded returns false
+// once the hash leaves the index.
+func TestCheckHeadStall_RacedBlockToleratesLateDelivery(t *testing.T) {
+	const headHeight = 100
+	sm, peerA, _, head := buildHeadStallManager(t, headHeight)
+	sm.settings.Legacy.HeadStallDisconnectTimeout = 30 * time.Second
+
+	sm.cachedBlockAssemblyHeight.Store(headHeight - 1)
+	sm.baHeightPolled.Store(true)
+
+	// Race the head block away (F1) — peer A is kept connected.
+	sm.checkHeadStall(time.Now())
+	require.True(t, peerA.Connected(), "precondition: the raced peer is kept connected")
+
+	// The raced-TO peer delivers and commits the block first, so its hash leaves the
+	// live header index (this is what handleBlockPreamble does on commit).
+	sm.headerMu.Lock()
+	delete(sm.headerHeightIndex, head)
+	sm.headerMu.Unlock()
+
+	// The original peer's late duplicate of that exact block must be TOLERATED, not
+	// punished as unrequested spam — otherwise the sync peer is disconnected here.
+	require.True(t, sm.blockStillNeeded(head),
+		"a late delivery of a raced-away block must be tolerated (recentlyNeededUntil grace), not treated as unrequested")
+}

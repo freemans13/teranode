@@ -4748,11 +4748,30 @@ func (sm *SyncManager) primeHeadStallSample(peer *peerpkg.Peer, now time.Time) {
 // WITHOUT disconnecting the peer that was holding it (F1). It removes the block
 // from the assignment ledgers and the global + per-peer requestedBlocks maps and
 // re-enqueues it for re-fetch, so the next scheduler tick hands it to a peer with
-// spare capacity. A late delivery from the original peer is a harmless no-op
-// (handleBlockPreamble dedups). Drain-goroutine only. This is the per-block analog
-// of freePeerAssignments, used on the race path so a head-of-line stall no longer
+// spare capacity. Drain-goroutine only. This is the per-block analog of
+// freePeerAssignments, used on the race path so a head-of-line stall no longer
 // churns the (often sync) peer and resets the headers-first download.
+//
+// The late-delivery hazard (measured live, 2026-07-20): the whole point of the
+// race is to keep the slow peer connected, but freeing the block deletes it from
+// that peer's requestedBlocks. If the raced-TO peer delivers and commits the block
+// FIRST, its hash leaves headerHeightIndex; the original peer's slightly-late copy
+// then matches neither the per-peer ledger nor the live index, so the delivered-
+// block handler treats it as spam and disconnects the very peer the race protected
+// ("Got unrequested block"). That fires on the sync peer, re-anchoring the frontier
+// — exactly the cascade F1 exists to remove. So register the raced hash in the
+// recentlyNeededUntil grace map (the same mechanism resetHeaderState uses for
+// rotation-orphaned deliveries): blockStillNeeded then tolerates a late duplicate
+// of a raced block as the harmless no-op the race assumes. headerMu is taken before
+// assignedMu to honour the established lock order (see checkHeadStall).
 func (sm *SyncManager) freeHeadBlockForRace(h chainhash.Hash, peer *peerpkg.Peer) {
+	sm.headerMu.Lock()
+	if sm.recentlyNeededUntil == nil {
+		sm.recentlyNeededUntil = make(map[chainhash.Hash]time.Time)
+	}
+	sm.recentlyNeededUntil[h] = time.Now().Add(recentlyNeededTTL)
+	sm.headerMu.Unlock()
+
 	sm.assignedMu.Lock()
 	delete(sm.assignedTo, h)
 	delete(sm.assignedAt, h)
