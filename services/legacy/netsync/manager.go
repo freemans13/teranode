@@ -906,6 +906,16 @@ type SyncManager struct {
 	// then re-arm — matching how reconcileLostAssignments gates on the same timeout.
 	frontierGapHash  chainhash.Hash
 	frontierGapSince time.Time
+	// headStallHash / headStallSince (drain goroutine only — checkHeadStall runs from
+	// the refill tick) track how long the SAME head block has been stalled ACROSS
+	// re-fetch races (F1). checkHeadStall re-assigns a stalled head block to another
+	// peer without disconnecting (racing it), which resets its per-assignment
+	// assignedAt each time; these fields measure the head block's total stuck time so
+	// the peer is disconnected only after the race has genuinely failed for
+	// HeadStallDisconnectTimeout, not on every 2s BlockStallTimeout tick (which would
+	// churn the sync peer and reset the headers-first download).
+	headStallHash  chainhash.Hash
+	headStallSince time.Time
 	// headerHeightIndex maps each headerNode's block hash to its authoritative
 	// PoW-verified height. It allows handleBlockPreamble to resolve the height of
 	// blocks that arrive out of order (not at headerList.Front()), which happens
@@ -4390,17 +4400,78 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 		return
 	}
 
-	sm.logger.Warnf("[checkHeadStall] head block %s (height %d) stalled %s past %s timeout on peer %s; disconnecting and freeing its assignments",
-		headHash, headHeight, now.Sub(headAt), timeout, headPeer)
+	// F1 (race, don't kill): the head block has stalled past BlockStallTimeout.
+	// Disconnecting the peer here is expensive when it is the SYNC peer — it triggers
+	// a full headers-first reset (updateSyncPeer -> resetHeaderState), and repeated
+	// every 2s on a slow frontier block that header-reset churn freezes the
+	// single-sourced header frontier for minutes (the mainnet IBD stick). Instead
+	// re-assign JUST the head block to another peer (it re-enters the re-fetch set
+	// and the scheduler hands it to a peer with spare capacity next tick) so a
+	// different peer can rescue it — svnode re-requests a slow block from other peers
+	// before dropping anyone. Track the head block's total stall time across these
+	// reassignments (headStallHash/headStallSince), independent of assignedAt which
+	// resets on every reassignment.
+	if sm.headStallHash != headHash {
+		sm.headStallHash = headHash
+		sm.headStallSince = now
+	}
 
-	// Disconnect ONLY the single head peer (never mass-disconnect).
-	headPeer.DisconnectWithWarning("head-of-line block-stalling timeout: next-needed block not delivered in time")
+	disconnectTimeout := sm.settings.Legacy.HeadStallDisconnectTimeout
+	if disconnectTimeout > 0 && now.Sub(sm.headStallSince) <= disconnectTimeout {
+		// Within the race window: re-assign the single head block to another peer and
+		// keep the current one connected. Reset the per-assignment grace so the next
+		// holder gets its own BlockStallTimeout before being raced again.
+		sm.freeHeadBlockForRace(headHash, headPeer)
+
+		return
+	}
+
+	// disconnectTimeout <= 0 (rollback) OR the race genuinely failed: the peers
+	// cannot deliver this block, so disconnect the one holding it. Disconnect ONLY
+	// the single head peer (never mass-disconnect).
+	sm.logger.Warnf("[checkHeadStall] head block %s (height %d) stalled %s (raced for %s) past disconnect window %s on peer %s; disconnecting and freeing its assignments",
+		headHash, headHeight, now.Sub(headAt), now.Sub(sm.headStallSince), disconnectTimeout, headPeer)
+
+	sm.headStallHash = chainhash.Hash{}
+
+	headPeer.DisconnectWithWarning("head-of-line block-stalling timeout: next-needed block not delivered in time after re-fetch race")
 
 	// Free that peer's assignments so they are re-eligible next tick. This mirrors
 	// what handleDonePeerMsg will also do once the disconnect propagates, but doing
 	// it here makes the reassignment immediate rather than waiting for the
 	// done-peer message.
 	sm.freePeerAssignments(headPeer)
+}
+
+// freeHeadBlockForRace re-assigns a single stalled head block to another peer
+// WITHOUT disconnecting the peer that was holding it (F1). It removes the block
+// from the assignment ledgers and the global + per-peer requestedBlocks maps and
+// re-enqueues it for re-fetch, so the next scheduler tick hands it to a peer with
+// spare capacity. A late delivery from the original peer is a harmless no-op
+// (handleBlockPreamble dedups). Drain-goroutine only. This is the per-block analog
+// of freePeerAssignments, used on the race path so a head-of-line stall no longer
+// churns the (often sync) peer and resets the headers-first download.
+func (sm *SyncManager) freeHeadBlockForRace(h chainhash.Hash, peer *peerpkg.Peer) {
+	sm.assignedMu.Lock()
+	delete(sm.assignedTo, h)
+	delete(sm.assignedAt, h)
+
+	if sm.refetchBlocks == nil {
+		sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+	}
+
+	sm.refetchBlocks[h] = struct{}{}
+	sm.assignedMu.Unlock()
+
+	sm.requestedBlocks.Delete(h)
+
+	if peer != nil {
+		if peerState, ok := sm.peerStates.Get(peer); ok {
+			peerState.requestedBlocks.Delete(h)
+		}
+	}
+
+	sm.logger.Debugf("[checkHeadStall] raced head block %s to another peer (kept peer %s connected)", h, peer)
 }
 
 // freePeerAssignments removes every block currently assigned to peer from the

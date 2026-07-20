@@ -55,6 +55,11 @@ func buildHeadStallManager(t *testing.T, headHeight int32) (*SyncManager, *peer.
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ParallelFetchPeers = 3
 	tSettings.Legacy.BlockStallTimeout = 2 * time.Second
+	// These carve-out tests exercise the IMMEDIATE-disconnect path (the pre-F1
+	// behaviour): 0 disables the F1 re-fetch-race window so a stalled head peer is
+	// disconnected at BlockStallTimeout, which is what they assert. The F1 race path
+	// (default 30s) is covered by headstall_race_test.go.
+	tSettings.Legacy.HeadStallDisconnectTimeout = 0
 
 	stateA := newEligiblePeerState()
 	stateB := newEligiblePeerState()
