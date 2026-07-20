@@ -712,6 +712,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			HeaderDeliveryTimeout: getDuration("legacy_headerDeliveryTimeout", 90*time.Second, alternativeContext...),
 			// F4: svnode MAX_UNCONNECTING_HEADERS — tolerate benign header races instead of disconnecting on the first.
 			UnconnectingHeadersTolerance: getInt("legacy_unconnectingHeadersTolerance", 10, alternativeContext...),
+			// Break the rotation-orphan "Got unrequested block" cascade during IBD: drop the late duplicate, don't disconnect the sync peer.
+			TolerateUnrequestedBlocksInIBD: getBool("legacy_tolerateUnrequestedBlocksInIBD", true, alternativeContext...),
 			// F6: connection supply — replenish faster, vet addresses with feelers, re-seed an eroded address book.
 			ReplenishInterval:     getDuration("legacy_replenishInterval", 2*time.Second, alternativeContext...),
 			FeelerInterval:        getDuration("legacy_feelerInterval", 120*time.Second, alternativeContext...),

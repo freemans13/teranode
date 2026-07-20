@@ -2299,6 +2299,23 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 			// carryover is treated as spam and disconnects.
 			if sm.blockStillNeeded(bmsg.blockHash) {
 				sm.logger.Debugf("[%s] block %v not in the per-peer ledger but still needed (post-rotation redelivery); processing", caller, bmsg.blockHash)
+			} else if catchingBlocks && sm.settings.Legacy.TolerateUnrequestedBlocksInIBD {
+				// During IBD, a block that is neither requested nor still-needed is
+				// almost always a harmless late duplicate: the sync peer was replaced,
+				// resetHeaderState/requestedBlocks.Clear orphaned its in-flight blocks,
+				// and by the time one arrives its short recentlyNeededUntil grace has
+				// expired (routine when block commit is postgres-bound and minutes-slow).
+				// Disconnecting here does not stop abuse — the block is dropped either
+				// way — but it DOES trigger another sync-peer rotation and header reset,
+				// which orphans more in-flight blocks: the self-sustaining cascade that
+				// collapses the header frontier and freezes the tip for minutes (measured
+				// live 2026-07-20). So drop it silently and let the fetch loop re-request
+				// it if it is genuinely still needed. svnode tolerates unsolicited blocks
+				// during IBD for the same reason. At the tip (not catchingBlocks) an
+				// unrequested block is genuine misbehaviour and still disconnects below.
+				sm.logger.Debugf("[%s] dropping unrequested block %v during IBD (late duplicate; not disconnecting the peer to avoid the rotation-reset cascade)", caller, bmsg.blockHash)
+				err = errors.NewServiceError("dropped unrequested block %v during IBD", bmsg.blockHash)
+				return
 			} else {
 				reason := fmt.Sprintf("Got unrequested block %v", bmsg.blockHash)
 				resolvedPeer.DisconnectWithWarning(reason)
