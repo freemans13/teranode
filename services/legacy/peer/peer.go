@@ -1748,6 +1748,30 @@ func (p *Peer) headerFrontierStalled() bool {
 	return p.cfg.HeaderProgressStalled != nil && p.cfg.HeaderProgressStalled()
 }
 
+// headersStallEscape reports whether an expired headers deadline is allowed to
+// escape the block-pending suppression (see expiredStallResponse /
+// clearBlockResponseGroup). It is gated on this being the sync peer.
+//
+// HeaderProgressStalled is a single, process-wide frontier signal wired
+// identically into every peer, but the header frontier is single-sourced: only
+// the sync peer is responsible for advancing it. A non-sync peer can hold a
+// getheaders deadline solely because handleUnconnectingHeaders re-anchored it
+// after a benign non-connecting batch, and that reply is legitimately queued
+// behind the peer's own in-flight block on the shared DATA1 stream. Judging such
+// a peer against the GLOBAL frontier stall — a condition driven by the sync
+// peer, a different connection — would disconnect a healthy peer mid-block and
+// discard the partial download, exactly the churn this work exists to remove,
+// and precisely during a frontier stall (the worst moment). Restricting the
+// escape to the sync peer keeps fix-2's intent — catch a sync peer dead on
+// headers but alive on blocks — while removing that collateral damage.
+//
+// Rollback is preserved: HeaderDeliveryTimeout=0 (or a nil callback) makes
+// headerFrontierStalled report false, so the escape never fires regardless of
+// the sync-peer flag.
+func (p *Peer) headersStallEscape() bool {
+	return p.SyncPeer() && p.headerFrontierStalled()
+}
+
 // responseStallBudget returns the deadline allowance a pending response of the
 // given command is granted, mirroring maybeAddDeadline. It is used to restore a
 // response's full budget when deadlines are refreshed after a block fetch
@@ -1946,7 +1970,7 @@ out:
 				case wire.CmdNotFound:
 					// If a block fetch actually completed, close its wall-clock
 					// window so the next fetch starts a fresh one.
-					if clearBlockResponseGroup(pendingResponses, time.Now(), p.blockStallBudget(), p.headerFrontierStalled()) {
+					if clearBlockResponseGroup(pendingResponses, time.Now(), p.blockStallBudget(), p.headersStallEscape()) {
 						blockFetchStart = time.Time{}
 					}
 				default:
@@ -2028,7 +2052,7 @@ out:
 			// Disconnect the peer if a pending response has not arrived by
 			// its adjusted deadline. While a block fetch is in flight,
 			// non-block deadlines are suppressed (see expiredStallResponse).
-			if command, stalled := expiredStallResponse(pendingResponses, now, offset, p.headerFrontierStalled()); stalled {
+			if command, stalled := expiredStallResponse(pendingResponses, now, offset, p.headersStallEscape()); stalled {
 				switch {
 				case shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now, maxDownloadTime):
 					// The block is still actively arriving at a healthy rate and
