@@ -2219,7 +2219,22 @@ func (p *Peer) inHandler() {
 		p.DisconnectWithInfo(reason)
 	})
 
-	processingTimer := time.AfterFunc(p.settings.Legacy.PeerProcessingTimeout, func() {
+	var processingTimer *time.Timer
+	processingTimer = time.AfterFunc(p.settings.Legacy.PeerProcessingTimeout, func() {
+		// Local read backpressure: the slow message-processing is OURS, not the
+		// peer's. When block processing is behind, a message handler (e.g. OnVerAck
+		// pushing onto a congested newPeers channel, or OnBlock parking under budget)
+		// can legitimately sit longer than PeerProcessingTimeout, and disconnecting
+		// then blames a healthy peer — measured live 2026-07-20 as spurious
+		// "Timeout processing message 'verack' ... waited 10m0s" drops of fresh
+		// inbound peers during IBD. Mirror the idle timer's carve-out above: re-arm
+		// and re-check rather than executing the peer for our own congestion. A
+		// genuine processing hang still fires once backpressure clears.
+		if p.cfg.ReadBackpressured != nil && p.cfg.ReadBackpressured() {
+			processingTimer.Reset(p.settings.Legacy.PeerProcessingTimeout)
+			return
+		}
+
 		p.processingCmdMtx.Lock()
 		cmd := p.currentProcessingMsgCmd
 		p.processingCmdMtx.Unlock()
@@ -2478,8 +2493,19 @@ out:
 	// Ensure the idle timer is stopped to avoid leaking the resource.
 	idleTimer.Stop()
 
-	// Ensure connection is closed.
-	p.DisconnectWithInfo("Peer appears to be stalled or misbehaving, inHandler break out")
+	// Ensure connection is closed — but only if the read loop did not already exit
+	// because the peer is being torn down elsewhere. The loop condition is
+	// `p.disconnect == 0`, so whenever any other path (stall handler, idle timer,
+	// netsync) disconnects the peer, the loop notices and exits here with
+	// p.disconnect already set. DisconnectWithLogFunc's dedup then suppresses the
+	// redundant teardown but NOT the redundant LOG line, so every such peer emitted
+	// a spurious second "inHandler break out" reason — inflating the disconnect-
+	// reason counts ~2-3x and obscuring the true root cause (measured live
+	// 2026-07-20). Genuine loop-internal exits (duplicate version/verack) still have
+	// p.disconnect == 0 here and are closed exactly as before.
+	if atomic.LoadInt32(&p.disconnect) == 0 {
+		p.DisconnectWithInfo("Peer appears to be stalled or misbehaving, inHandler break out")
+	}
 
 	close(p.inQuit)
 	p.logger.Debugf("Peer input handler done for %s", p)
