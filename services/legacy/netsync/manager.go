@@ -1617,15 +1617,24 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// During headers-first mode, only suppress network speed checks since
 	// downloading 80-byte headers makes the peer appear slow. Still check
 	// last-block-time so stalled peers get rotated even during headers-first.
+	// The last-block-time window is regime-aware: post-IBD it is the 3-minute
+	// maxLastBlockTime, but during headers-first IBD the sync peer streams 80-byte
+	// headers and completes NO block for long stretches, so 3 minutes would rotate
+	// a healthy header source mid-delivery and freeze the single-sourced header
+	// frontier. syncPeerBlockClockLimit widens it during headers-first; a truly
+	// silent peer is still caught in ~90s by the silence detector below and an
+	// unanswered getheaders in ~90s at the peer layer.
+	blockClockLimit := sm.syncPeerBlockClockLimit(headersFirst)
+
 	var isNetworkSpeedViolation bool
 	if !headersFirst {
 		validNetworkSpeed := sps.validNetworkSpeed(sm.minSyncPeerNetworkSpeed)
 		isNetworkSpeedViolation = validNetworkSpeed >= maxNetworkViolations
-		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check, network violations: %v (limit %v), time since last block: %v (limit %v)", sp.String(), validNetworkSpeed, maxNetworkViolations, lastBlockSince, maxLastBlockTime)
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check, network violations: %v (limit %v), time since last block: %v (limit %v)", sp.String(), validNetworkSpeed, maxNetworkViolations, lastBlockSince, blockClockLimit)
 	} else {
-		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check (headers-first mode, speed check skipped), time since last block: %v (limit %v)", sp.String(), lastBlockSince, maxLastBlockTime)
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s check (headers-first mode, speed check skipped), time since last block: %v (limit %v)", sp.String(), lastBlockSince, blockClockLimit)
 	}
-	isLastBlockTimeViolation := lastBlockSince > maxLastBlockTime
+	isLastBlockTimeViolation := lastBlockSince > blockClockLimit
 
 	// A multi-GB block can take longer than maxLastBlockTime to arrive. Under
 	// the BlockPriority stream policy it streams in on the DATA1 stream, so no
@@ -1681,7 +1690,10 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	case isSilenceViolation:
 		reason = "silent sync peer during headers-first sync"
 	}
-	sm.logger.Debugf("[CheckSyncPeer] sync peer %s is stalled due to %s, updating sync peer", sp.String(), reason)
+	// INFO (not Debug) so the rotation trigger is measurable in production logs:
+	// distinguishing "last block time out of range" (the headers-first churn F5
+	// targets) from "silent"/"network speed" needs the reason at a visible level.
+	sm.logger.Infof("[CheckSyncPeer] sync peer %s is stalled due to %s, rotating sync peer", sp.String(), reason)
 
 	state, exists := sm.peerStates.Get(sp)
 	if !exists {
@@ -1711,6 +1723,28 @@ func (sm *SyncManager) syncPeerSilentTickLimit() int {
 
 	if limit < 2 {
 		return 2
+	}
+
+	return limit
+}
+
+// syncPeerBlockClockLimit resolves how long the sync peer may go without
+// COMPLETING a block before the last-block-time detector rotates it. Post-IBD it
+// is maxLastBlockTime (3 minutes). During headers-first IBD it is the configured
+// SyncPeerHeadersFirstStaleBlockTimeout (default 30 minutes), because the peer is
+// streaming 80-byte headers and legitimately completes no block for long
+// stretches — rotating it at 3 minutes freezes the single-sourced header
+// frontier. The headers-first value is clamped to be no shorter than
+// maxLastBlockTime, so any value <= 3 minutes (including 0 / a nil-Settings unit
+// test) falls back to today's behaviour — the byte-identical rollback lever.
+func (sm *SyncManager) syncPeerBlockClockLimit(headersFirst bool) time.Duration {
+	if !headersFirst || sm.settings == nil {
+		return maxLastBlockTime
+	}
+
+	limit := sm.settings.Legacy.SyncPeerHeadersFirstStaleBlockTimeout
+	if limit < maxLastBlockTime {
+		return maxLastBlockTime
 	}
 
 	return limit
