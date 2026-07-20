@@ -28,10 +28,14 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -160,6 +164,78 @@ func TestReconcileFrontierGap_WindowOwnedNotRefetched(t *testing.T) {
 
 	_, queued := sm.refetchBlocks[frontier]
 	require.False(t, queued, "a window-owned (in-hand) frontier must NOT be re-enqueued")
+}
+
+// TestReconcileFrontierGap_CommittedFrontierRealigned: the mainnet-680594 wedge.
+// The header-list front is latched on already-committed blocks (a commit bypassed
+// the arrive-at-front trim). Re-fetching them is futile — haveInventory skips a
+// committed block — so instead the stale leading nodes must be TRIMMED, realigning
+// the cursor to the first genuinely-uncommitted block, WITHOUT any re-fetch enqueue.
+func TestReconcileFrontierGap_CommittedFrontierRealigned(t *testing.T) {
+	sm := newFrontierGapSM(t, 3)
+
+	committedA := chainhash.Hash{0xa1}
+	committedB := chainhash.Hash{0xb2}
+	uncommitted := chainhash.Hash{0xc3}
+	pushHeader(sm, committedA, 680571)
+	pushHeader(sm, committedB, 680572)
+	pushHeader(sm, uncommitted, 680573)
+	sm.headerHeightIndex[committedA] = 680571
+	sm.headerHeightIndex[committedB] = 680572
+	sm.headerHeightIndex[uncommitted] = 680573
+	sm.startHeader = sm.headerList.Front()
+
+	// Blockchain has A and B committed (valid); the true frontier is not found.
+	mockBC := &blockchain2.Mock{}
+	mockBC.On("GetBlockHeader", mock.Anything, &committedA).
+		Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 680571}, nil).Maybe()
+	mockBC.On("GetBlockHeader", mock.Anything, &committedB).
+		Return(&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 680572}, nil).Maybe()
+	mockBC.On("GetBlockHeader", mock.Anything, &uncommitted).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+	sm.blockchainClient = mockBC
+
+	// The stale frontier is pinned in refetchBlocks (as in the live wedge — a
+	// committed block never drains), which the old "not orphaned" check masked.
+	sm.refetchBlocks[committedA] = struct{}{}
+
+	base := time.Now()
+	sm.reconcileFrontierGap(base)                                           // arm on committedA
+	sm.reconcileFrontierGap(base.Add(frontierGapTestTimeout + time.Second)) // fire → realign
+
+	front := sm.headerList.Front()
+	require.NotNil(t, front, "header list must not be emptied")
+	require.Equal(t, uncommitted, *front.Value.(*headerNode).hash,
+		"committed leading nodes must be trimmed, realigning the cursor to the first uncommitted block")
+
+	_, aIndexed := sm.headerHeightIndex[committedA]
+	require.False(t, aIndexed, "a trimmed node's height-index entry must be removed")
+	require.Equal(t, sm.headerList.Front(), sm.startHeader,
+		"startHeader must be advanced off the trimmed nodes")
+}
+
+// TestReconcileFrontierGap_UncommittedFrontierStillRefetched: a genuinely-missing
+// (uncommitted) frontier must still take the re-fetch path, not be trimmed.
+func TestReconcileFrontierGap_UncommittedFrontierStillRefetched(t *testing.T) {
+	sm := newFrontierGapSM(t, 3)
+
+	frontier := chainhash.Hash{0xd4}
+	pushHeader(sm, frontier, 680571)
+	sm.headerHeightIndex[frontier] = 680571
+
+	mockBC := &blockchain2.Mock{}
+	mockBC.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
+	sm.blockchainClient = mockBC
+
+	base := time.Now()
+	sm.reconcileFrontierGap(base)
+	sm.reconcileFrontierGap(base.Add(frontierGapTestTimeout + time.Second))
+
+	require.Equal(t, frontier, *sm.headerList.Front().Value.(*headerNode).hash,
+		"an uncommitted frontier must NOT be trimmed")
+	_, queued := sm.refetchBlocks[frontier]
+	require.True(t, queued, "an uncommitted orphaned frontier must be re-enqueued for re-fetch")
 }
 
 // TestReconcileFrontierGap_SinglePeerNoop: ParallelFetchPeers<=1 is a no-op.

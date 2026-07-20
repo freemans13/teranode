@@ -4109,8 +4109,46 @@ func (sm *SyncManager) reconcileFrontierGap(now time.Time) {
 		return
 	}
 
-	// Outstanding to a peer, already in hand (parked/committing), or already
-	// queued for re-fetch? Then it is not orphaned: clear the debounce, leave it.
+	// Debounce on the frontier staying UNCHANGED. A frontier that is progressing
+	// advances headerList.Front() as its block commits, re-arming here; only a
+	// frontier stuck for longer than BlockInFlightTimeout is acted on. Debouncing
+	// BEFORE the in-flight-ledger check below is deliberate: a STALE-CURSOR frontier
+	// (already committed but never trimmed) sits pinned in refetchBlocks and would
+	// otherwise read as "not orphaned" on every tick, so it would never reach the
+	// realign/re-fetch decision that unwedges it.
+	if sm.frontierGapHash != frontier {
+		sm.frontierGapHash = frontier
+		sm.frontierGapSince = now
+
+		return
+	}
+
+	timeout := sm.settings.Legacy.BlockInFlightTimeout
+	if timeout > 0 && now.Sub(sm.frontierGapSince) < timeout {
+		return
+	}
+
+	// Stuck longer than the timeout. First tell a STALE CURSOR apart from a real
+	// orphan: if the frontier block is already committed in the blockchain, the
+	// header-list front was left behind by a commit that bypassed the arrive-at-
+	// front trim (a checkpoint / rotation / direct commit advances the chain and
+	// block assembly without trimming the header list — see gateContiguousWindow).
+	// Re-fetching it is futile because haveInventory skips a committed block, so the
+	// cursor would stay latched on an already-committed block forever (the mainnet
+	// wedge at 680594). Trim every already-committed leading node instead,
+	// realigning the committed cursor with the chain. This also recovers the case
+	// where the stale frontier is pinned in refetchBlocks (a committed block there
+	// never drains, so the in-flight check below would otherwise mask it).
+	if trimmed := sm.realignFrontierIfCommitted(); trimmed > 0 {
+		sm.frontierGapHash = chainhash.Hash{}
+		sm.logger.Warnf("[reconcileFrontierGap] frontier %s already committed; trimmed %d stale leading header(s), realigning the committed cursor with the chain", frontier, trimmed)
+
+		return
+	}
+
+	// Not a stale cursor. If it is outstanding to a peer, already in hand
+	// (parked/committing) or already queued for re-fetch, it is progressing or
+	// already handled — re-arm the debounce and leave it.
 	notOrphaned := false
 	if _, inFlight := sm.requestedBlocks.Get(frontier); inFlight {
 		notOrphaned = true
@@ -4129,25 +4167,8 @@ func (sm *SyncManager) reconcileFrontierGap(now time.Time) {
 	}
 
 	if notOrphaned {
-		sm.frontierGapHash = chainhash.Hash{}
-		return
-	}
-
-	// Frontier is orphaned right now. Debounce: it may just be mid-flight and
-	// briefly untracked (its 60s global requestedBlocks entry lapsed while a slow
-	// peer is still delivering). Only re-request once the SAME frontier has stayed
-	// orphaned longer than BlockInFlightTimeout, so an in-flight block that arrives
-	// within that window is never touched, yet a true orphan recovers in seconds
-	// instead of the old multi-minute silent-peer rotation.
-	if sm.frontierGapHash != frontier {
-		sm.frontierGapHash = frontier
 		sm.frontierGapSince = now
 
-		return
-	}
-
-	timeout := sm.settings.Legacy.BlockInFlightTimeout
-	if timeout > 0 && now.Sub(sm.frontierGapSince) < timeout {
 		return
 	}
 
@@ -4168,6 +4189,79 @@ func (sm *SyncManager) reconcileFrontierGap(now time.Time) {
 	sm.frontierGapSince = now
 
 	sm.logger.Warnf("[reconcileFrontierGap] frontier block %s orphaned for %s (lost on the single-peer fetch path); re-enqueuing for re-fetch", frontier, orphanedFor)
+}
+
+// realignFrontierIfCommitted trims every leading header-list node whose block is
+// already committed in the blockchain, and returns how many it removed. It is the
+// recovery for a STALE-LOW committed cursor: commits that bypass the arrive-at-front
+// trim (checkpoint / rotation / direct commits) advance the chain without removing
+// the corresponding front nodes, so the header-list front can end up latched on an
+// already-committed block. The forward fetch walk can never re-reach it (the cursor
+// is monotonic) and re-fetch skips it (haveInventory reports it present), so the
+// strictly-ascending window pipeline wedges. Restarts "fix" this only because they
+// rebuild the header list from the committed tip; this does the same realignment
+// live.
+//
+// Drain-goroutine only. All header-list mutation happens on that single goroutine
+// (handleBlockPreamble's arrive-at-front trim, handleHeadersMsg, this), so the
+// captured front element stays valid across the haveInventory gRPC even though
+// headerMu is released for the call; headerMu is taken only to keep concurrent
+// READERS (checkHeadStall, the frontier scan) consistent. Each committed leading
+// node — including a stale committed seed — is dropped, its index and needed-until
+// entries cleared, and startHeader advanced off it.
+func (sm *SyncManager) realignFrontierIfCommitted() int {
+	if sm.blockchainClient == nil {
+		return 0
+	}
+
+	trimmed := 0
+
+	for {
+		sm.headerMu.Lock()
+		front := sm.headerList.Front()
+
+		if front == nil {
+			sm.headerMu.Unlock()
+			break
+		}
+
+		node, ok := front.Value.(*headerNode)
+		if !ok || node.hash == nil {
+			sm.headerMu.Unlock()
+			break
+		}
+
+		frontHash := *node.hash
+		sm.headerMu.Unlock()
+
+		// haveInventory issues a gRPC — run it with headerMu released.
+		iv := wire.NewInvVect(wire.InvTypeBlock, &frontHash)
+
+		committed, err := sm.haveInventory(iv)
+		if err != nil || !committed {
+			// Genuinely-missing frontier (or a transient lookup error): stop. The
+			// caller falls through to the orphan re-fetch path.
+			break
+		}
+
+		sm.headerMu.Lock()
+		if sm.startHeader == front {
+			sm.startHeader = front.Next()
+		}
+
+		if sm.headerListSeed == front {
+			sm.headerListSeed = nil
+		}
+
+		sm.headerList.Remove(front)
+		delete(sm.headerHeightIndex, frontHash)
+		delete(sm.recentlyNeededUntil, frontHash)
+		sm.headerMu.Unlock()
+
+		trimmed++
+	}
+
+	return trimmed
 }
 
 func (sm *SyncManager) checkHeadStall(now time.Time) {
