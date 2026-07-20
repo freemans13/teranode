@@ -1128,6 +1128,24 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte, payl
 		// synchronous backpressure) and also spares fabricated blocks the
 		// SerializeSize walk below. Blocks we actually requested take the fast path.
 		if !sm.BlockRequested(sp.Peer, blockHash) {
+			// During IBD, an unrequested block is almost always a harmless late
+			// duplicate: a sync-peer rotation cleared the ledgers and orphaned this
+			// peer's in-flight blocks, and by the time one arrives its short
+			// recentlyNeededUntil grace has expired (routine at the postgres-bound
+			// commit rate). Disconnecting the peer here is what triggers the next
+			// rotation + header reset, which orphans yet more blocks — the measured
+			// cascade that collapses the header frontier and freezes the tip. So drop
+			// the block WITHOUT admitting it to the prefetch budget (the memory/flood
+			// protection this gate exists for is preserved — the block is not queued)
+			// and WITHOUT disconnecting. This mirrors the same-named guard in
+			// handleBlockPreamble, which the prefetch path reaches this gate before.
+			// At the tip (not IBD) an unrequested block is genuine misbehaviour and
+			// still evicts the association below. Setting-gated for rollback.
+			if sm.InitialBlockDownload() && sp.server.settings.Legacy.TolerateUnrequestedBlocksInIBD {
+				sp.server.logger.Debugf("dropping unrequested block %s during IBD (late duplicate; not disconnecting to avoid the rotation-reset cascade)", blockHash)
+				return
+			}
+
 			// Unrequested block: evict the whole association (primary drives the
 			// sync-peer rotation, plus the stream sub-peer's own connection), mirroring
 			// handleBlockMsg's downstream eviction. See disconnectMisbehaving.
