@@ -1523,7 +1523,7 @@ func TestDownloadToDisk_BoundedRetryTerminatesAcrossResets(t *testing.T) {
 		"no further deletes / re-downloads happen past the cap")
 }
 
-// TestDownloadToDisk_ExhaustedMarkerHaltsWalk pins the terminal-marker the frontier walk
+// TestDownloadToDisk_ExhaustedMarkerHaltsWalk pins the give-up marker the frontier walk
 // consults (diskRecoveryExhausted). recoverInvalidDiskBlock/recoverUnreadableDiskBlock
 // deliberately LEAVE the bad bytes on disk at the cap, so haveBlockOnDisk stays true and
 // the block remains the frontier anchor; without a stable "given up" signal the walk would
@@ -1548,21 +1548,71 @@ func TestDownloadToDisk_ExhaustedMarkerHaltsWalk(t *testing.T) {
 
 	sm.noteDiskValidateFailure(invalid)
 	require.True(t, sm.diskRecoveryExhausted(invalid),
-		"at diskValidateFailCap the walk must halt (the block can never commit)")
+		"at diskValidateFailCap the walk must quiesce on the block")
 
-	// Read/deserialize/panic counter is an independent path to the same terminal state.
+	// Read/deserialize/panic counter is an independent path to the same state.
 	for i := 0; i < diskValidateFailCap; i++ {
 		sm.noteDiskReadFailure(unreadable)
 	}
 
 	require.True(t, sm.diskRecoveryExhausted(unreadable),
-		"an unreadable/panic-faulted block reaching the cap also halts the walk")
+		"an unreadable/panic-faulted block reaching the cap also quiesces the walk")
 
 	// A genuine commit clears the marker so a later re-visit of the same hash (e.g. after a
 	// reorg re-downloads honest bytes) starts fresh rather than being permanently skipped.
 	sm.clearDiskRecoveryState(invalid)
 	require.False(t, sm.diskRecoveryExhausted(invalid),
-		"commit clears the terminal marker for a re-visited hash")
+		"commit clears the marker for a re-visited hash")
+}
+
+// TestDownloadToDisk_ExhaustedGivesUpAsBackoffNotPermanentHalt proves the critical property
+// that a permanent halt would violate: because an invalid delivery and the honest block
+// share the same hash, a hash that failed diskValidateFailCap times is NOT necessarily
+// genuinely invalid — an honest peer may still serve a committable copy. So the give-up must
+// be a BACKOFF: the walk quiesces on the block WHILE its backoff window is open (bounded
+// load) and, once the window elapses, is DUE to delete-and-refetch a fresh copy rather than
+// wedge IBD forever.
+func TestDownloadToDisk_ExhaustedGivesUpAsBackoffNotPermanentHalt(t *testing.T) {
+	ctx := context.Background()
+	store := newDTDRecordingStore()
+	sm := dtdNewManager(t, true, store)
+
+	height := int32(6000)
+	hash, raw, _ := dtdMakeBlock(t, height, 1)
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+
+	cause := errors.NewBlockInvalidError("consensus-invalid on disk")
+
+	// Drive it to the cap.
+	for i := 0; i < diskValidateFailCap; i++ {
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+		sm.recoverInvalidDiskBlock(hash, height, nil, cause)
+	}
+
+	require.True(t, sm.diskRecoveryExhausted(hash), "sanity: exhausted at the cap")
+
+	// Within the backoff window the walk must QUIESCE (not yet due), so a genuinely-invalid
+	// block does not spin — bounded load.
+	require.False(t, sm.diskRecoveryRetryDue(hash),
+		"immediately after give-up the block is within its backoff window: the walk quiesces")
+
+	// Simulate the backoff elapsing (stamp the give-up time into the past).
+	sm.diskValidateFailsMu.Lock()
+	sm.diskGiveUpAt[hash] = time.Now().Add(-2 * diskRecoveryRetryBackoff)
+	sm.diskValidateFailsMu.Unlock()
+
+	require.True(t, sm.diskRecoveryRetryDue(hash),
+		"once the backoff elapses the block is due for a fresh re-fetch — not wedged forever")
+
+	// retryExhaustedDiskBlock re-opens it: deletes the bad bytes (so the frontier re-requests
+	// an honest copy) and RESETS the recovery budget so the fresh copy gets a full round.
+	delsBefore := store.delCount(hash)
+	sm.retryExhaustedDiskBlock(hash, height)
+
+	require.Greater(t, store.delCount(hash), delsBefore,
+		"the exhausted block's bytes are deleted so an honest copy can be re-fetched")
+	require.False(t, sm.diskRecoveryExhausted(hash),
+		"the recovery budget is reset, so a recoverable hash gets a clean round of attempts")
 }
 
 // TestDownloadToDisk_ConcurrentWorkerArrivalRecoveryRace is the Stage-2 -race integration
