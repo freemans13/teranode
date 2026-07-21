@@ -31,6 +31,7 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	teranodeblockchain "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
@@ -38,6 +39,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
+	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -690,13 +692,35 @@ type SyncManager struct {
 	quit         chan struct{}
 
 	// TERANODE services
-	blockchainClient  teranodeblockchain.ClientI
-	validationClient  validator.Interface
-	utxoStore         utxostore.Store
-	subtreeStore      blob.Store
-	subtreeValidation subtreevalidation.Interface
-	blockValidation   blockvalidation.Interface
-	blockAssembly     blockassembly.ClientI
+	blockchainClient teranodeblockchain.ClientI
+	validationClient validator.Interface
+	utxoStore        utxostore.Store
+	subtreeStore     blob.Store
+	// mainBlockStore is the durable, unbounded, hash-addressed block store
+	// (fileformat.FileTypeBlock) reused from the daemon (Stores.GetBlockStore) —
+	// svnode's blk?????.dat equivalent. Used only under the legacy_downloadToDisk
+	// gate; nil when the store is unconfigured or the feature is off, and every
+	// new code path is guarded on downloadToDisk() && mainBlockStore != nil so the
+	// flag-off path is byte-identical.
+	mainBlockStore blob.Store
+	// validateSignal is the download-to-disk "a block landed on disk" poke. The
+	// wire callback (serverPeer.OnBlock) sends on it (non-blocking, coalescing)
+	// after writing a block to mainBlockStore; the single drain goroutine wakes on
+	// it and runs the in-order validateFromDisk walk. Buffered(1) so a burst of
+	// arrivals collapses to one wake and no wakeup is ever lost. Created in New but
+	// only wired into the drain select and poked when downloadToDisk() is on, so
+	// the flag-off path never touches it.
+	validateSignal chan struct{}
+	// validateFromDiskActive is true only while the drain goroutine's in-order
+	// validateFromDisk walk is wired (downloadToDisk() AND the window path enabled).
+	// PersistArrivalAndDecouple consults it: when the validator is NOT running the
+	// arrival write still happens (durability + frontier-skip) but the block is left
+	// on the normal inline QueueBlock path rather than decoupled, so a block is never
+	// stranded on disk with no validator to pick it up.
+	validateFromDiskActive atomic.Bool
+	subtreeValidation      subtreevalidation.Interface
+	blockValidation        blockvalidation.Interface
+	blockAssembly          blockassembly.ClientI
 	// cachedBlockAssemblyHeight holds the block-assembly CurrentHeight most
 	// recently observed by the background poller (blockAssemblyHeightPoller).
 	// The per-block coinbase-maturity check reads it atomically on the serial
@@ -3275,6 +3299,169 @@ func (sm *SyncManager) svnodeAlignedFetch() bool {
 	return sm.settings != nil && sm.settings.Legacy.SvnodeAlignedFetch
 }
 
+// downloadToDisk is the nil-safe master gate for the svnode-style
+// download-to-disk decoupling (legacy_downloadToDisk). It mirrors
+// svnodeAlignedFetch exactly. Every new write / read-back / frontier-skip
+// branch is additionally guarded on sm.mainBlockStore != nil so that a build
+// with the flag off — or with no block store configured — is byte-identical to
+// today's in-memory park/prefetch path.
+func (sm *SyncManager) downloadToDisk() bool {
+	return sm.settings != nil && sm.settings.Legacy.DownloadToDisk && sm.mainBlockStore != nil
+}
+
+// persistRawBlockOnArrival writes the raw serialized block bytes to the durable
+// mainBlockStore keyed by block hash (fileformat.FileTypeBlock), mirroring
+// block_persister's write exactly (services/blockpersister/persist_block.go).
+// This is svnode's AcceptBlock "Store to disk": the block is durable the moment
+// this returns, regardless of arrival order or validation state. It is
+// idempotent — a block already on disk (a re-arrival or a restart-recovered
+// block) short-circuits as a cheap no-op via NewFileStorer's ErrBlobAlreadyExists.
+// The caller must have passed the stateless gate (ban-check + requested) first.
+// Exported because the wire callback (serverPeer.OnBlock, package legacy) is the
+// arrival point; it is also directly unit-testable in the netsync package.
+func (sm *SyncManager) PersistRawBlockOnArrival(ctx context.Context, hash chainhash.Hash, blockBytes []byte) error {
+	if !sm.downloadToDisk() || len(blockBytes) == 0 {
+		return nil
+	}
+
+	storer, err := filestorer.NewFileStorer(ctx, sm.logger, sm.settings, sm.mainBlockStore, hash[:], fileformat.FileTypeBlock)
+	if err != nil {
+		if errors.Is(err, errors.ErrBlobAlreadyExists) {
+			// Already durable (re-arrival or restart-recovered) — nothing to do.
+			return nil
+		}
+
+		return errors.NewStorageError("[persistRawBlockOnArrival] error creating block file for %s", hash.String(), err)
+	}
+
+	writeSucceeded := false
+	defer func() {
+		if writeSucceeded {
+			if closeErr := storer.Close(ctx); closeErr != nil {
+				sm.logger.Warnf("[persistRawBlockOnArrival] error closing block file for %s: %v", hash.String(), closeErr)
+			}
+		} else {
+			storer.Abort(errors.NewProcessingError("[persistRawBlockOnArrival] block write failed for %s", hash.String()))
+		}
+	}()
+
+	if _, err = storer.Write(blockBytes); err != nil {
+		return errors.NewStorageError("[persistRawBlockOnArrival] error writing block %s to disk", hash.String(), err)
+	}
+
+	writeSucceeded = true
+
+	return nil
+}
+
+// haveBlockOnDisk reports whether the raw bytes for hash are already durable in
+// mainBlockStore — the analogue of svnode's pindex.getStatus().hasData()
+// (np.cpp:449). It is the presence flag the fetch frontier consults to skip
+// re-requesting a block already on disk. A store error is treated as "not on
+// disk" (conservative: at worst the block is re-requested, never skipped in error).
+func (sm *SyncManager) haveBlockOnDisk(ctx context.Context, hash chainhash.Hash) bool {
+	if !sm.downloadToDisk() {
+		return false
+	}
+
+	exists, err := sm.mainBlockStore.Exists(ctx, hash[:], fileformat.FileTypeBlock)
+	if err != nil {
+		sm.logger.Debugf("[haveBlockOnDisk] Exists check failed for %s: %v", hash.String(), err)
+		return false
+	}
+
+	return exists
+}
+
+// readRawBlockFromDisk reads a block back from mainBlockStore and deserializes
+// it — svnode's ConnectTip-reads-from-disk (validation.cpp:4229-4238). Not yet
+// consumed by a worker in this stage; it exists so the async in-order validator
+// of a later stage can pull blocks off disk at its own pace.
+func (sm *SyncManager) readRawBlockFromDisk(ctx context.Context, hash chainhash.Hash) (*wire.MsgBlock, error) {
+	if sm.mainBlockStore == nil {
+		return nil, errors.NewStorageError("[readRawBlockFromDisk] no block store configured")
+	}
+
+	reader, err := sm.mainBlockStore.GetIoReader(ctx, hash[:], fileformat.FileTypeBlock)
+	if err != nil {
+		return nil, errors.NewStorageError("[readRawBlockFromDisk] error opening block %s", hash.String(), err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	msgBlock := &wire.MsgBlock{}
+	if err = msgBlock.Deserialize(reader); err != nil {
+		return nil, errors.NewProcessingError("[readRawBlockFromDisk] error deserializing block %s", hash.String(), err)
+	}
+
+	return msgBlock, nil
+}
+
+// PokeValidateFromDisk wakes the download-to-disk in-order validator after a
+// block has been written to disk on arrival — svnode's "a block landed, run the
+// async ActivateBestChain" nudge (np.cpp:4077-4093). Non-blocking and coalescing:
+// a buffered(1) signal, so a burst of arrivals collapses to a single wake and no
+// wakeup is ever lost. A no-op when the feature is off. Called from the wire
+// callback (serverPeer.OnBlock, package legacy).
+func (sm *SyncManager) PokeValidateFromDisk() {
+	if !sm.downloadToDisk() {
+		return
+	}
+
+	select {
+	case sm.validateSignal <- struct{}{}:
+	default:
+	}
+}
+
+// PersistArrivalAndDecouple is the download-to-disk arrival hand-off called from
+// the wire callback (serverPeer.OnBlock). When the feature is on it writes the raw
+// block bytes to the durable block store and, on a SUCCESSFUL write, releases the
+// prefetch-budget reservation (the block is now durable — memory no longer needs
+// to pin it) and pokes the in-order validator, returning handled=true so the
+// caller returns immediately WITHOUT queueing the block onto the drain. That is
+// what decouples block download from prepare/commit: OnBlock never waits on the
+// validator, so a giant block ties up only the validator while peers keep
+// downloading into the block store.
+//
+// handled=false means the caller must fall through to its normal QueueBlock path:
+// the feature is off, no store is configured, or the arrival write FAILED (a
+// non-fatal condition — the block still validates via the normal inline path and
+// block_persister persists it post-commit). weight is the prefetch reservation the
+// caller acquired for this block; it is released here only on the decoupled
+// (handled=true) path. On the fall-through path the caller's normal
+// awaitBlockResult still owns and releases it.
+func (sm *SyncManager) PersistArrivalAndDecouple(ctx context.Context, hash chainhash.Hash, blockBytes []byte, weight int64) (handled bool) {
+	if !sm.downloadToDisk() {
+		return false
+	}
+
+	if err := sm.PersistRawBlockOnArrival(ctx, hash, blockBytes); err != nil {
+		// Non-fatal: fall back to the normal inline path (the block still validates
+		// there and block_persister persists it post-commit).
+		sm.logger.Warnf("[downloadToDisk] arrival write failed for block %s, falling back to inline validation: %v", hash.String(), err)
+		return false
+	}
+
+	if !sm.validateFromDiskActive.Load() || !sm.headersFirstMode.Load() {
+		// Either the in-order validator is not running (the window path is disabled),
+		// or we are not in headers-first mode. The disk validator walks the
+		// headers-first header list, which is only populated below the final
+		// checkpoint; outside that window (post-checkpoint / at the tip) there is no
+		// source for the walk, so decoupling here would strand the block. Keep it
+		// durable on disk (frontier-skip + restart recovery) but leave it on the
+		// normal inline QueueBlock path, which handles those blocks directly.
+		return false
+	}
+
+	// Durable on disk and the validator is running: drop the RAM reservation and
+	// hand off to the async in-order validator, which picks the block up when its
+	// committed-tip-forward walk reaches this height.
+	sm.ReleaseBlockPrefetch(hash, weight)
+	sm.PokeValidateFromDisk()
+
+	return true
+}
+
 // maxInFlightPerPeer returns the per-peer in-flight block ceiling used by every
 // fetch top-up guard and by fetchHeaderBlocks' single-peer cap.
 //
@@ -3469,6 +3656,16 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 				e = next
 				continue
 			}
+		}
+
+		// download-to-disk frontier advance: a block whose raw bytes are already
+		// on disk is svnode's hasData() (np.cpp:449) — advance the frontier over
+		// it and never re-request it. Composes with the in-flight skip above (a
+		// block can be both in-flight and, once delivered, on disk). Gated so the
+		// flag-off / no-store path is byte-identical.
+		if sm.downloadToDisk() && sm.haveBlockOnDisk(sm.ctx, *node.hash) {
+			e = next
+			continue
 		}
 
 		// Runway cap (see fetchRunwayHorizon): pause the walk at the parkable horizon
@@ -3871,6 +4068,15 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 			}
 		}
 
+		// download-to-disk frontier advance: skip a block whose raw bytes are
+		// already on disk (svnode hasData(), np.cpp:449) so it is never
+		// re-requested — the on-disk/restart-recovered analogue of the in-flight
+		// skip below. Gated so the flag-off / no-store path is byte-identical.
+		if sm.downloadToDisk() && sm.haveBlockOnDisk(sm.ctx, *node.hash) {
+			e = next
+			continue
+		}
+
 		// Runway cap: stop the walk once the frontier reaches the parkable horizon
 		// so the fetch cursor cannot climb unboundedly ahead of block assembly and
 		// saturate the park. Break BEFORE advancing startHeader so the cursor stays
@@ -4179,6 +4385,38 @@ func (sm *SyncManager) fetchRunwayHorizon() (uint32, bool) {
 	// occur under the gate: the aligned walk re-anchors on the download frontier every
 	// pass (fetchWalkAnchorLocked), so committed+1 is always requested first and the
 	// clamp only ever bounds the TOP of the walk, never the frontier.
+
+	// Download-to-disk ceiling. Under legacy_downloadToDisk the in-memory park is
+	// retired (disk is the unbounded buffer, svnode's mapBlocksUnlinked), so the
+	// park-derived clamp below no longer applies. Bound the fetch runway instead by
+	// a disk-ahead cap: throttle the frontier once it runs DownloadToDiskMaxBlocksAhead
+	// blocks past the committed (block-assembly) tip, so downloaded-but-unvalidated
+	// data on disk stays bounded during a long validation lag. This THROTTLES fetch
+	// (the walk pauses at the horizon) and NEVER drops an on-disk block — svnode's
+	// nDownloadHeightThreshold throttle, not the park's drop. Anchored on the same
+	// cachedBlockAssemblyHeight (validated-tip analog) as the park clamp, and only
+	// below the checkpoint (above it the arrival blocks take the normal inline path,
+	// not the disk-decoupled path, so no disk backlog accrues). This branch runs
+	// BEFORE the parkAheadActive gate so it holds even when ParallelWindowParkAhead
+	// is off (no park store); flag-off leaves everything below byte-identical.
+	if sm.downloadToDisk() {
+		ahead := sm.settings.Legacy.DownloadToDiskMaxBlocksAhead
+		if ahead <= 0 || sm.chainParams == nil || !sm.baHeightPolled.Load() {
+			return 0, false
+		}
+
+		cachedBA := sm.cachedBlockAssemblyHeight.Load()
+		if !model.BelowCheckpoint(sm.chainParams.Checkpoints, cachedBA) {
+			return 0, false
+		}
+
+		aheadU := uint32(ahead) //nolint:gosec // guarded > 0 above
+		if cachedBA > math.MaxUint32-aheadU {
+			return 0, false
+		}
+
+		return cachedBA + aheadU, true
+	}
 
 	if !sm.parkAheadActive.Load() {
 		return 0, false
@@ -6077,6 +6315,20 @@ func (sm *SyncManager) gateContiguousWindow(job windowFlushJob, park *parkStore)
 // so the refetch machinery can re-buy it — a full park must never wedge the
 // gap-fill (the block was already early-acked, so dropping owes nothing).
 func (sm *SyncManager) parkStrayWindowBlock(park *parkStore, b *model.Block) {
+	// Download-to-disk: the raw block bytes are already durable on disk (written on
+	// arrival), so a post-gap stray is NEVER dropped-for-re-fetch and needs no
+	// in-memory park copy. The in-order disk validator (drainValidateFromDisk)
+	// re-derives it straight from the on-disk set once its committed-tip-forward
+	// walk reaches this height — svnode's unbounded mapBlocksUnlinked, which never
+	// drops. Release window ownership so the disk walk is free to re-select it (a
+	// still-owned header is skipped by the walk), then return: the bytes stay on
+	// disk, unbounded, and disk growth is bounded upstream by the fetch throttle
+	// (fetchRunwayHorizon's DownloadToDiskMaxBlocksAhead ceiling), not by dropping.
+	if sm.downloadToDisk() {
+		sm.releaseWindowBlock(*b.Hash())
+		return
+	}
+
 	if park.full(int64(b.SizeInBytes)) { //nolint:gosec
 		sm.releaseWindowBlock(*b.Hash())
 		sm.logger.Warnf("[gateContiguousWindow] park full; dropping stray block height %d for re-fetch", b.Height)
@@ -6706,6 +6958,14 @@ func windowBudgetBytes(fraction float64) int64 {
 // for a budget-filling block that never arrives (e.g. at the tail of a sync).
 const windowFlushTimerInterval = 200 * time.Millisecond
 
+// maxValidateFromDiskPerPass bounds how many on-disk blocks the download-to-disk
+// in-order validator feeds in one wake, so a large on-disk backlog cannot
+// monopolise the drain goroutine in a single pass (it must return to the select to
+// service headers, shutdown and the refill tick). Subsequent pokes and the refill
+// tick continue the walk from where it left off. The block-assembly maturity gate
+// normally stops the walk well before this bound.
+const maxValidateFromDiskPerPass = 64
+
 // blockHandler is the main handler for the sync manager.  It must be run as a
 // goroutine.  It processes block and inv messages in a separate goroutine
 // from the peer handlers so the block (MsgBlock) messages are handled by a
@@ -6922,6 +7182,192 @@ func (sm *SyncManager) blockHandler() {
 			}
 		}
 
+		// drainValidateFromDisk is the download-to-disk async in-order validator
+		// (svnode's async ActivateBestChain, np.cpp:4077-4093 + validation.cpp:
+		// 4229-4238 ConnectTip-reads-from-disk). It runs on THIS single drain
+		// goroutine, so it never races the header/fetch/park state that
+		// handleBlockMsgWithWindow mutates — yet it is decoupled from block DOWNLOAD:
+		// OnBlock writes each block to disk and pokes, never waiting on prepare/commit,
+		// so a giant block ties up only this walk while peers keep filling the store.
+		//
+		// It walks the authoritative PoW-verified header chain from the download
+		// frontier (lowest uncommitted header) upward and feeds each header whose raw
+		// block is on disk, and is within the block-assembly maturity gate, through the
+		// EXISTING handleBlockMsgWithWindow — reusing every consensus check
+		// (already-committed guard, checkpoint direct-routing, deferredCheckpoint,
+		// strict-ascending single-worker poison-latched commit). It stops at the first
+		// header whose block is not yet on disk (an out-of-order gap: those blocks sit
+		// durably on disk, unbounded, never dropped — svnode's mapBlocksUnlinked — and
+		// are picked up the instant the walk reaches them on a later poke) or beyond the
+		// maturity gate (left on disk until block assembly advances — svnode's lower
+		// download window). Only ever called from this goroutine.
+		drainValidateFromDisk := func() {
+			if !sm.downloadToDisk() || !windowEnabled || wa == nil {
+				return
+			}
+
+			sp := sm.loadSyncPeer()
+			if sp == nil {
+				return
+			}
+
+			var prevHash chainhash.Hash
+			havePrev := false
+
+			for fed := 0; fed < maxValidateFromDiskPerPass; fed++ {
+				// Keep shutdown prompt: a long run of heavy prepares must still yield to
+				// sm.quit between blocks.
+				select {
+				case <-sm.quit:
+					return
+				default:
+				}
+
+				// Pick the lowest uncommitted header not already owned by the window
+				// pipeline. handleBlockMsgWithWindow takes headerMu itself, so we must
+				// not hold it across the feed.
+				sm.headerMu.Lock()
+				var hash chainhash.Hash
+				var height int32
+				found := false
+
+				for e := sm.downloadFrontierAnchorLocked(); e != nil; e = e.Next() {
+					node, ok := e.Value.(*headerNode)
+					if !ok || node.hash == nil {
+						continue
+					}
+
+					if sm.windowBlockOwned(*node.hash) {
+						continue
+					}
+
+					hash = *node.hash
+					height = node.height
+					found = true
+
+					break
+				}
+				sm.headerMu.Unlock()
+
+				if !found {
+					return
+				}
+
+				// Forward-progress guard: the same header selected twice in a row means
+				// the last feed neither committed the block, marked it owned, nor removed
+				// its front node. Stop rather than spin.
+				if havePrev && hash.IsEqual(&prevHash) {
+					return
+				}
+
+				if !sm.haveBlockOnDisk(sm.ctx, hash) {
+					// Out-of-order gap: leave the walk here; the arrival poke resumes it
+					// the instant the missing block lands.
+					return
+				}
+
+				// Maturity gate: only feed blocks within the block-assembly
+				// coinbase-maturity window (cached+maxBehind). A block beyond the gate is
+				// left ON DISK (svnode's lower download window, validation.h:149) and
+				// picked up when block assembly advances — so the disk-fed path never
+				// needs the in-memory park.
+				if height > 0 {
+					if h, convErr := safeconversion.Int32ToUint32(height); convErr == nil {
+						if admit, evaluable := sm.blockAssemblyGateAdmitsCached(h); evaluable && !admit {
+							return
+						}
+					}
+				}
+
+				msgBlock, readErr := sm.readRawBlockFromDisk(sm.ctx, hash)
+				if readErr != nil {
+					// Corrupt/unreadable on disk: leave it for the next tick; a persistent
+					// failure is recovered by the sync-peer rotation / header reset backstop.
+					sm.logger.Warnf("[drainValidateFromDisk][%s] failed to read on-disk block height %d, will retry: %v", hash, height, readErr)
+					return
+				}
+
+				bmsg := &blockQueueMsg{
+					block:       msgBlock,
+					blockHash:   hash,
+					blockHeight: height,
+					peer:        sp,
+				}
+
+				outcome, herr := sm.handleBlockMsgWithWindow(bmsg, wa, flushWindow, flushWindowSync, park)
+
+				switch outcome {
+				case blockAdmitParked:
+					// Parked ahead of block assembly (rare here — the gate check above
+					// normally stops us first). The block is window-owned now, so the next
+					// iteration skips it. No reply/backlog on the disk path.
+				case blockAdmitWindowed:
+					// Added to the window accumulator; drive the same flush/back-pressure
+					// the arrival drain drives (reply is nil on the disk path).
+					sm.ackWindowedBlock(nil, wa, flushWindow, armTimer, stopTimer)
+				default: // blockAdmitDirect (already-committed, checkpoint, or a failure)
+					if herr != nil {
+						if BlockProcessingErrorIsPeerFault(herr) {
+							// A consensus-invalid block on disk. Advancing past it would gap
+							// the chain, so halt the walk (nothing invalid is committed) and log
+							// loudly; this should not happen because the stateless PoW gate ran
+							// on arrival.
+							sm.logger.Errorf("[drainValidateFromDisk][%s] peer-fault validating on-disk block height %d; halting walk: %v", hash, height, herr)
+							return
+						}
+
+						// Tolerated failure (transient service/storage error). The preamble
+						// already removed this block's header node, so a re-walk cannot re-find
+						// it; re-enqueue the in-hand bytes onto the drain for the normal inline
+						// retry (its preamble resolves height via the restored
+						// headerHeightIndex fallback) instead of re-downloading.
+						if sm.blockBacklog.Add(1) == 1 {
+							sm.noteBacklogProgress()
+						}
+
+						select {
+						case blockQueue <- bmsg:
+						case <-sm.quit:
+							sm.blockBacklog.Add(-1)
+						case <-sm.ctx.Done():
+							sm.blockBacklog.Add(-1)
+						default:
+							// blockQueue full: drop the fast retry; the rotation/header-reset
+							// backstop still recovers it (no re-download — the bytes stay on disk).
+							sm.blockBacklog.Add(-1)
+							sm.logger.Debugf("[drainValidateFromDisk][%s] blockQueue full, deferring retry to backstop", hash)
+						}
+
+						flushWindow()
+
+						return
+					}
+
+					// Direct success (already-committed re-delivery, or a checkpoint block
+					// committed via HandleBlockDirect). Its front node was consumed by the
+					// preamble, so the walk advances; flush any pending window as the arrival
+					// drain does on the direct path.
+					flushWindow()
+				}
+
+				prevHash = hash
+				havePrev = true
+			}
+		}
+
+		// The in-order validator is live only while the window path is enabled under
+		// the gate; PersistArrivalAndDecouple consults this so a block is never
+		// stranded on disk with no validator. validateSignalC is the poke channel,
+		// nil (never selected) off the gate so the flag-off select is byte-identical.
+		var validateSignalC <-chan struct{}
+
+		if sm.downloadToDisk() && windowEnabled {
+			sm.validateFromDiskActive.Store(true)
+			validateSignalC = sm.validateSignal
+
+			defer sm.validateFromDiskActive.Store(false)
+		}
+
 		var timerC <-chan time.Time
 		if flushTimer != nil {
 			timerC = flushTimer.C
@@ -6991,6 +7437,17 @@ func (sm *SyncManager) blockHandler() {
 				sm.maintainInFlightWindow()
 				sm.releaseParkedBlocks(park, wa, flushWindow, armTimer)
 				sm.retryDeferredCheckpoint()
+
+				// Download-to-disk backstop: advance the in-order validator over any
+				// blocks that landed while a poke was coalesced, and continue a walk
+				// that a previous pass bounded. No-op off the gate (drainValidateFromDisk
+				// returns immediately).
+				drainValidateFromDisk()
+			case <-validateSignalC:
+				// A block landed on disk (OnBlock poke). Run the in-order validator over
+				// the newly-contiguous on-disk prefix. nil channel off the gate, so this
+				// case never fires and the select is byte-identical when the flag is off.
+				drainValidateFromDisk()
 			case hmsg := <-headersQueue:
 				// Runs on the SAME goroutine as block processing, so the shared
 				// headers-first state is never touched concurrently.
@@ -7892,7 +8349,7 @@ func (sm *SyncManager) Pause() chan<- struct{} {
 // New constructs a new SyncManager. Use Start to begin processing asynchronous
 // block, tx, and inv updates.
 func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient teranodeblockchain.ClientI,
-	validationClient validator.Interface, utxoStore utxostore.Store, subtreeStore blob.Store,
+	validationClient validator.Interface, utxoStore utxostore.Store, subtreeStore blob.Store, blockStore blob.Store,
 	subtreeValidation subtreevalidation.Interface, blockValidation blockvalidation.Interface,
 	blockAssembly blockassembly.ClientI, config *Config) (*SyncManager, error) {
 	initPrometheusMetrics()
@@ -7931,7 +8388,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		refetchBlocks:     make(map[chainhash.Hash]struct{}),
 		blockSizeTracker: newBlockSizeTrackerWithBudgets(10, // track last 10 blocks for rolling average
 			tSettings.Legacy.InFlightTxBudget, tSettings.Legacy.InFlightByteBudget),
-		quit: make(chan struct{}),
+		quit:           make(chan struct{}),
+		validateSignal: make(chan struct{}, 1),
 		// feeEstimator:            config.FeeEstimator,
 		minSyncPeerNetworkSpeed: config.MinSyncPeerNetworkSpeed,
 		handlerDone:             make(chan struct{}),
@@ -7941,6 +8399,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		validationClient:  validationClient,
 		utxoStore:         utxoStore,
 		subtreeStore:      subtreeStore,
+		mainBlockStore:    blockStore,
 		subtreeValidation: subtreeValidation,
 		blockValidation:   blockValidation,
 		blockAssembly:     blockAssembly,

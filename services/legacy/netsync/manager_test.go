@@ -119,6 +119,7 @@ func (tc *testContext) Setup(t *testing.T, config *testConfig) error {
 		validatorClient,
 		utxoStore,
 		subtreeStore,
+		nil, // blockStore (legacy_downloadToDisk off in test)
 		subtreeValidation,
 		blockvalidationClient,
 		nil,

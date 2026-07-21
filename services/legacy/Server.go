@@ -100,6 +100,11 @@ type Server struct {
 	// Used for ephemeral data storage during processing
 	tempStore blob.Store
 
+	// mainBlockStore is the durable, hash-addressed block store (FileTypeBlock)
+	// used by the legacy_downloadToDisk arrival-write path. May be nil (feature
+	// off or no block store configured); every consumer is nil-safe.
+	mainBlockStore blob.Store
+
 	// utxoStore manages the UTXO set
 	// Used for transaction validation and UTXO queries
 	utxoStore utxo.Store
@@ -131,6 +136,7 @@ type Server struct {
 //   - validationClient: Interface to the transaction validation service
 //   - subtreeStore: Blob storage interface for merkle subtree data
 //   - tempStore: Temporary blob storage for ephemeral data
+//   - blockStore: Durable, hash-addressed block store (FileTypeBlock) for the legacy_downloadToDisk arrival-write path; may be nil
 //   - utxoStore: Interface to the UTXO (Unspent Transaction Output) database
 //   - subtreeValidation: Interface to the subtree validation service
 //   - blockValidation: Interface to the block validation service
@@ -143,6 +149,7 @@ func New(logger ulogger.Logger,
 	validationClient validator.Interface,
 	subtreeStore blob.Store,
 	tempStore blob.Store,
+	blockStore blob.Store,
 	utxoStore utxo.Store,
 	subtreeValidation subtreevalidation.Interface,
 	blockValidation blockvalidation.Interface,
@@ -158,6 +165,7 @@ func New(logger ulogger.Logger,
 		validationClient:    validationClient,
 		subtreeStore:        subtreeStore,
 		tempStore:           tempStore,
+		mainBlockStore:      blockStore,
 		utxoStore:           utxoStore,
 		subtreeValidation:   subtreeValidation,
 		blockValidation:     blockValidation,
@@ -289,6 +297,7 @@ func (s *Server) Init(ctx context.Context) error {
 		s.utxoStore,
 		s.subtreeStore,
 		s.tempStore,
+		s.mainBlockStore,
 		s.subtreeValidation,
 		s.blockValidation,
 		s.blockAssemblyClient,

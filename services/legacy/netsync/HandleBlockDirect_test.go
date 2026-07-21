@@ -124,6 +124,7 @@ func Test_HandleBlockDirect(t *testing.T) {
 		validatorClient,
 		utxoStore,
 		subtreeStore,
+		nil, // blockStore (legacy_downloadToDisk off in test)
 		subtreeValidation,
 		blockValidation,
 		blockAssemblyClient,

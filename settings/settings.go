@@ -742,6 +742,13 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// Master gate for the svnode-aligned fetch scheduler. Default false =
 			// today's behaviour, byte-identical (a live no-rebuild rollback lever).
 			SvnodeAlignedFetch: getBool("legacy_svnodeAlignedFetch", false, alternativeContext...),
+			// Master gate for the svnode-style download-to-disk decoupling of the
+			// legacy IBD pipeline. Default false = today's behaviour, byte-identical.
+			DownloadToDisk: getBool("legacy_downloadToDisk", false, alternativeContext...),
+			// Download-to-disk fetch ceiling: max blocks the fetch frontier may run
+			// ahead of the committed tip before fetch throttles (never drops). Only
+			// consulted when DownloadToDisk is on. Replaces the retired park cap.
+			DownloadToDiskMaxBlocksAhead: getInt("legacy_downloadToDiskMaxBlocksAhead", 288, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

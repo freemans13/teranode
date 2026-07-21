@@ -1102,6 +1102,27 @@ func (d *Daemon) startLegacyService(
 		return err
 	}
 
+	// Get the durable block store for the legacy_downloadToDisk arrival-write
+	// path. Acquired ONLY when the feature is enabled, so a flag-off node never
+	// touches the block-store singleton earlier than today (flag-off is
+	// byte-identical). It is the SAME cached singleton block_persister and
+	// blockvalidation use (GetBlockStore is idempotent), so this reuses rather
+	// than duplicates. Non-fatal: a deployment with the flag on but no block
+	// store configured simply runs with the feature off (SyncManager.mainBlockStore
+	// stays nil, every new path is gated), so this cannot break startup.
+	var blockStore blob.Store
+
+	if appSettings.Legacy.DownloadToDisk {
+		blockStore, err = d.daemonStores.GetBlockStore(ctx, createLogger(loggerBlockPersisterStore), appSettings)
+		if err != nil {
+			createLogger(serviceLegacy).Warnf("legacy_downloadToDisk unavailable: block store not configured (%v); feature stays off", err)
+
+			blockStore = nil
+			// err deliberately not propagated: the feature degrades to off; the
+			// next store acquisition below reassigns err, so no reset is needed.
+		}
+	}
+
 	// Get the UTXO store
 	var utxoStore utxo.Store
 
@@ -1160,6 +1181,7 @@ func (d *Daemon) startLegacyService(
 		validatorClient,
 		subtreeStore,
 		tempStore,
+		blockStore,
 		utxoStore,
 		subtreeValidationClient,
 		blockValidationClient,

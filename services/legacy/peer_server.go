@@ -379,6 +379,7 @@ type server struct {
 	utxoStore         utxostore.Store
 	subtreeStore      blob.Store
 	tempStore         blob.Store
+	mainBlockStore    blob.Store
 	concurrentStore   *blob.ConcurrentBlob[chainhash.Hash]
 	subtreeValidation subtreevalidation.Interface
 	blockValidation   blockvalidation.Interface
@@ -1183,6 +1184,20 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte, payl
 			}
 
 			// ctx cancelled or peer torn down: nothing reserved, drop the block.
+			return
+		}
+
+		// Download-to-disk (legacy_downloadToDisk): the block has now passed the
+		// stateless gate (ban-check + requested + dedup), so write its raw bytes
+		// to the durable block store on arrival — svnode's AcceptBlock "Store to
+		// disk" (validation.cpp:6304-6323) — and, on a successful write, hand off
+		// to the async in-order validator (release the prefetch budget + poke it)
+		// and return WITHOUT queueing the block onto the drain. That decouples
+		// block download from prepare/commit: a giant block ties up only the
+		// validator, never this read-loop, so peers keep downloading into the
+		// store. handled=false (flag off, no store, or a non-fatal write failure)
+		// falls through to the normal inline QueueBlock path below unchanged.
+		if sm.PersistArrivalAndDecouple(sp.ctx, *blockHash, buf, weight) {
 			return
 		}
 
@@ -3717,7 +3732,7 @@ out:
 // bitcoin network type specified by chainParams.  Use start to begin accepting
 // connections from peers.
 func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, config Config, blockchainClient blockchain.ClientI,
-	validationClient validator.Interface, utxoStore utxostore.Store, subtreeStore blob.Store, tempStore blob.Store,
+	validationClient validator.Interface, utxoStore utxostore.Store, subtreeStore blob.Store, tempStore blob.Store, blockStore blob.Store,
 	subtreeValidation subtreevalidation.Interface, blockValidation blockvalidation.Interface,
 	blockAssembly *blockassembly.Client,
 	listenAddrs []string, assetHTTPAddress string) (*server, error) {
@@ -3870,6 +3885,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		utxoStore:            utxoStore,
 		subtreeStore:         subtreeStore,
 		tempStore:            tempStore,
+		mainBlockStore:       blockStore,
 		concurrentStore: blob.NewConcurrentBlob[chainhash.Hash](
 			tempStore,
 			blob_options.WithDeleteAt(10),
@@ -3893,6 +3909,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		validationClient,
 		utxoStore,
 		subtreeStore,
+		blockStore,
 		subtreeValidation,
 		blockValidation,
 		blockAssembly,

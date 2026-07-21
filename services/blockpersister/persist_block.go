@@ -140,6 +140,18 @@ func (u *Server) persistBlock(ctx context.Context, hash *chainhash.Hash, blockBy
 
 	storer, err := filestorer.NewFileStorer(ctx, u.logger, u.settings, u.blockStore, hash[:], fileformat.FileTypeBlock)
 	if err != nil {
+		// The raw block bytes may already be on disk — e.g. the legacy
+		// download-to-disk path (legacy_downloadToDisk) writes the block to this
+		// same store/key on arrival, before commit. A FileTypeBlock file is
+		// immutable and keyed by block hash, so an existing file is byte-identical
+		// to what we would write; treat it as a completed write (idempotent skip)
+		// rather than a hard error, so the arrival-write and this post-commit write
+		// never double-write or conflict.
+		if errors.Is(err, errors.ErrBlobAlreadyExists) {
+			u.logger.Debugf("[persistBlock][%s] block file already on disk, skipping write", block.String())
+			return nil
+		}
+
 		return errors.NewStorageError("[persistBlock][%s] error creating block file", block.String(), err)
 	}
 
