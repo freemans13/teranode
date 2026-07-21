@@ -79,8 +79,7 @@ func buildHeadStallManager(t *testing.T, headHeight int32) (*SyncManager, *peer.
 		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		blockSizeTracker:  newBlockSizeTracker(20),
 	}
 	t.Cleanup(func() { sm.requestedBlocks.Stop() })

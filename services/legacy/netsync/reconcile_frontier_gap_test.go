@@ -58,8 +58,7 @@ func newFrontierGapSM(t *testing.T, parallelPeers int) *SyncManager {
 		windowOwnedBlocks: txmap.NewSyncedMap[chainhash.Hash, uint32](),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		refetchBlocks:     make(map[chainhash.Hash]struct{}),
 	}
 	t.Cleanup(func() { sm.requestedBlocks.Stop() })

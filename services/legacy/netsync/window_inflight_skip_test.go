@@ -76,8 +76,7 @@ func TestAssignBlocks_SkipsInFlightBlock(t *testing.T) {
 		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		refetchBlocks:     make(map[chainhash.Hash]struct{}),
 		blockSizeTracker:  newBlockSizeTracker(20),
 	}

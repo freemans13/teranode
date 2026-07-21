@@ -703,6 +703,23 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// F2: never disconnect a head peer that is still moving bytes faster than this floor.
 			BlockStallMinRate:    getInt64("legacy_blockStallMinRate", 102400, alternativeContext...),
 			BlockInFlightTimeout: getDuration("legacy_blockInFlightTimeout", 10*time.Second, alternativeContext...),
+			// svnode-style parallel fetch of the slow frontier block: race the SAME head block across up to
+			// MaxBlockParallelFetch peers (first-delivery-wins) once it has been in flight BlockSlowFetchTimeout.
+			// Additive on top of F1's sub-threshold move; MaxBlockParallelFetch=1 disables racing (byte-identical rollback).
+			MaxBlockParallelFetch: getInt("legacy_maxBlockParallelFetch", 3, alternativeContext...),
+			// BlockSlowFetchTimeout MUST default STRICTLY LESS THAN HeadStallDisconnectTimeout (30s), or the
+			// additive race is unreachable and the whole parallel-fetch feature is inert. checkHeadStall enters
+			// the race branch only while now-headStallSince <= HeadStallDisconnectTimeout, and addRacerForHead
+			// issues a parallel getdata only once now-headStallSince >= BlockSlowFetchTimeout; if the two are
+			// equal the eligible set is the single instant ==30s, which the 20ms refill ticks step straight over
+			// (age lands just under -> F1 move, or just over -> F2 disconnect), so no second racer is ever added.
+			// It is THIS (new) setting that is lowered, NOT HeadStallDisconnectTimeout that is raised: the latter
+			// is a pre-existing F1 setting read even at clampedMax==1, so changing it would move the
+			// legacy_maxBlockParallelFetch=1 rollback off byte-identical. BlockSlowFetchTimeout is read only
+			// inside addRacerForHead (clampedMax>1), so at 1 it has no effect and the rollback stays exact.
+			// 15s (half the 30s disconnect window) opens a 15s racing window [15s,30s]: racing fans out to the
+			// cap within a few ticks, leaving the balance of the window for a racer to deliver before disconnect.
+			BlockSlowFetchTimeout: getDuration("legacy_blockSlowFetchTimeout", 15*time.Second, alternativeContext...),
 			// F3: peer-layer deadlines used only while catching up; at the tip the original values still apply.
 			IBDBlockStallTimeout:    getDuration("legacy_ibdBlockStallTimeout", 60*time.Minute, alternativeContext...),
 			IBDHeadersStallTimeout:  getDuration("legacy_ibdHeadersStallTimeout", 10*time.Minute, alternativeContext...),

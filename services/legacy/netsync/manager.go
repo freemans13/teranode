@@ -186,7 +186,7 @@ func BlockProcessingErrorIsPeerFault(err error) bool {
 // TOLERATED (non-peer-fault) processing failure, so the download pipeline
 // re-requests it instead of silently dropping it. handleBlockPreamble removes
 // an arriving block from ALL in-flight tracking (requestedBlocks, assignedTo,
-// assignedAt, refetchBlocks) BEFORE processing, and the monotonic startHeader
+// refetchBlocks) BEFORE processing, and the monotonic startHeader
 // cursor never rewinds, so without this requeue a tolerated failure leaves the
 // block permanently un-fetched — a silent wedge of the strictly-ascending
 // commit pipeline. Safe from any goroutine: refetchBlocks is guarded by
@@ -815,23 +815,33 @@ type SyncManager struct {
 	rejectedTxns    *txmap.SyncedMap[chainhash.Hash, struct{}]
 	requestedTxns   *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 	requestedBlocks *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
-	// assignedTo/assignedAt track, per outstanding block, which peer it was
-	// assigned to and when (Task 2.4, the head-of-line stalling timeout). They
-	// are populated in assignBlocksAcrossPeers alongside the requestedBlocks
-	// record (post-send), deleted when the block ARRIVES (handleBlockPreamble,
-	// the same site the requestedBlocks entries are removed) and when the
-	// assigned peer disconnects (handleDonePeerMsg). They are therefore kept in
-	// exact one-to-one correspondence with the global requestedBlocks ledger so
-	// they cannot leak.
+	// assignedTo tracks, per outstanding block, WHICH peers it is in flight to and
+	// WHEN each was sent (Task 2.4, the head-of-line stalling timeout). It is the Go
+	// analog of svnode's BlockDownloadTracker keyed by {blockhash, nodeid}: the SAME
+	// hash can be in flight to MULTIPLE peers at once, which is exactly what
+	// svnode-style parallel fetch races (block_parallel_fetch.go). It was a
+	// single-owner map[hash]*peer + map[hash]time.Time pair before parallel fetch;
+	// assignedAt was folded into the inner map and DELETED outright so the compiler
+	// forces every reader to be revisited (a deliberate safety feature of the retype).
 	//
-	// Almost all of that traffic (assign, arrival-delete, checkHeadStall) is on
-	// the single drain goroutine, but handleDonePeerMsg runs on the OTHER
-	// (outer) blockHandler goroutine — so a plain map would race. assignedMu
-	// guards both maps; it is a leaf lock, never held across a peer send, gRPC,
-	// or headerMu.
+	// It is populated in assignBlocksAcrossPeers and addRacerForHead alongside the
+	// requestedBlocks record (post-send), a whole hash cleared when the block ARRIVES
+	// (handleBlockPreamble, the same site the requestedBlocks entries are removed),
+	// and a single peer's entries removed on disconnect (handleDonePeerMsg). The
+	// LOAD-BEARING INVARIANT (enforced only through the helpers in
+	// block_parallel_fetch.go so no reader open-codes multiplicity and drifts):
+	//   outer key present  iff  inner map non-empty  iff  >= 1 racer holds the hash
+	//   global requestedBlocks[h] set  iff  >= 1 racer holds h
+	// At clampedMaxParallelFetch()==1 the inner map never exceeds one entry, so every
+	// helper reduces to the old single delete/set — byte-identical rollback.
+	//
+	// Almost all of that traffic (assign, arrival-clear, checkHeadStall) is on the
+	// single drain goroutine, but handleDonePeerMsg runs on the OTHER (outer)
+	// blockHandler goroutine — so a plain map would race. assignedMu guards the map
+	// (and refetchBlocks); it is a leaf lock, never held across a peer send, gRPC, or
+	// headerMu. Lock order is headerMu -> assignedMu.
 	assignedMu sync.Mutex
-	assignedTo map[chainhash.Hash]*peerpkg.Peer
-	assignedAt map[chainhash.Hash]time.Time
+	assignedTo map[chainhash.Hash]map[*peerpkg.Peer]time.Time
 	// refetchBlocks holds hashes that were assigned, had their shared-cursor
 	// (startHeader) position advanced past them, and then lost their in-flight
 	// status WITHOUT being received — either freed by the head-of-line stall
@@ -847,7 +857,7 @@ type SyncManager struct {
 	// sync generation; blocks whose requestedBlocks ledger entry expires (60s TTL)
 	// while still assigned are re-enqueued here by reconcileLostAssignments, so no
 	// orphan trigger is left unhandled. Guarded by assignedMu (same leaf lock as
-	// assignedTo/assignedAt); bounded by the total in-flight cap, so it cannot
+	// assignedTo); bounded by the total in-flight cap, so it cannot
 	// grow unbounded.
 	refetchBlocks map[chainhash.Hash]struct{}
 	syncPeerMu    sync.RWMutex // protects syncPeer and syncPeerState
@@ -958,7 +968,7 @@ type SyncManager struct {
 	// the refill tick) track how long the SAME head block has been stalled ACROSS
 	// re-fetch races (F1). checkHeadStall re-assigns a stalled head block to another
 	// peer without disconnecting (racing it), which resets its per-assignment
-	// assignedAt each time; these fields measure the head block's total stuck time so
+	// in-flight timestamp each time; these fields measure the head block's total stuck time so
 	// the peer is disconnected only after the race has genuinely failed for
 	// HeadStallDisconnectTimeout, not on every 2s BlockStallTimeout tick (which would
 	// churn the sync peer and reset the headers-first download).
@@ -2430,15 +2440,35 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 	// will fail the insert, and thus we'll retry next time we get an inv.
 	state.requestedBlocks.Delete(bmsg.blockHash)
 	sm.requestedBlocks.Delete(bmsg.blockHash)
-	// Keep the stall-detector tracking maps (Task 2.4) in lock-step with the
-	// global requestedBlocks ledger: the block has arrived, so its assignment is
-	// no longer outstanding.
+	// Keep the stall-detector tracking map (Task 2.4) in lock-step with the global
+	// requestedBlocks ledger: the block has arrived, so ALL of its assignments are no
+	// longer outstanding. This is the FIRST-DELIVERY-WINS site for parallel fetch —
+	// clearAssignment drops the whole {hash -> racers} entry and returns every peer
+	// that was racing it, so a later refill tick cannot re-race a committed block.
 	sm.assignedMu.Lock()
-	delete(sm.assignedTo, bmsg.blockHash)
-	delete(sm.assignedAt, bmsg.blockHash)
+	racers := sm.clearAssignment(bmsg.blockHash)
 	// The block has arrived; it is no longer an orphan awaiting re-fetch.
 	delete(sm.refetchBlocks, bmsg.blockHash)
 	sm.assignedMu.Unlock()
+
+	// Sweep EVERY OTHER racer's per-peer requestedBlocks ledger. The delivering peer's
+	// own entry (and the global ledger) were just Deleted above, but when a RACER wins,
+	// the ORIGINAL owner (and any other racer) becomes a loser whose per-peer auth
+	// entry still lists the hash — leaving it set would let that loser's late copy pass
+	// the handleBlockPreamble auth gate and be processed as a duplicate instead of
+	// dropped. Clearing it forces the loser's late copy through the auth-gate ->
+	// blockStillNeeded -> IBD silent-drop path (harmless no-op, no disconnect). At
+	// clampedMax==1 racers has at most the single delivering peer, so this loop is a
+	// no-op — byte-identical to the old single delete.
+	for _, rp := range racers {
+		if rp == resolvedPeer {
+			continue
+		}
+
+		if st, ok := sm.peerStates.Get(rp); ok {
+			st.requestedBlocks.Delete(bmsg.blockHash)
+		}
+	}
 
 	// Count this accepted block against the delivering peer for observability.
 	// The delivering peer is bmsg.peer (before any stream-peer resolution) for
@@ -3803,20 +3833,15 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 		// one-to-one correspondence with the global requestedBlocks ledger.
 		assignAt := time.Now()
 		sm.assignedMu.Lock()
-		// Lazy-init: production sets these in New, but the maps may be nil in a
-		// minimal test-constructed SyncManager. A nil-map WRITE panics (delete /
-		// range on nil are safe), so guard the only write site.
-		if sm.assignedTo == nil {
-			sm.assignedTo = make(map[chainhash.Hash]*peerpkg.Peer)
-		}
-		if sm.assignedAt == nil {
-			sm.assignedAt = make(map[chainhash.Hash]time.Time)
-		}
 		for _, h := range tgt.pending {
 			sm.requestedBlocks.Set(*h, struct{}{})
 			tgt.state.requestedBlocks.Set(*h, struct{}{})
-			sm.assignedTo[*h] = tgt.peer
-			sm.assignedAt[*h] = assignAt
+			// The disjoint forward walk skips in-flight (requestedBlocks) and owned
+			// hashes, so each walked hash gets a fresh single-entry inner map here —
+			// racing is NOT introduced on this path, only in addRacerForHead.
+			// addAssignment lazy-inits the map (the write site that would otherwise
+			// panic on a nil map in a minimal test-constructed SyncManager).
+			sm.addAssignment(*h, tgt.peer, assignAt)
 			// A re-fetch that actually went out is no longer orphaned; drop it from
 			// the set. delete on a nil map is a safe no-op.
 			delete(sm.refetchBlocks, *h)
@@ -4140,7 +4165,7 @@ func (sm *SyncManager) eligibleFetchPeers(exclude *peerpkg.Peer, max int) []*pee
 // abandoned, for either of two reasons:
 //
 //  1. LOST: the global requestedBlocks ledger is an expiringmap with a 60s TTL
-//     and no eviction callback, while assignedTo/assignedAt have no TTL. A block
+//     and no eviction callback, while assignedTo has no TTL. A block
 //     re-fetched to a peer that stays connected but never delivers it will have
 //     its requestedBlocks entry expire, leaving it stranded in assignedTo —
 //     outstanding to nobody, below the monotonic cursor.
@@ -4171,28 +4196,54 @@ func (sm *SyncManager) reconcileLostAssignments(now time.Time) {
 	sm.assignedMu.Lock()
 	defer sm.assignedMu.Unlock()
 
-	for h, p := range sm.assignedTo {
+	for h, inner := range sm.assignedTo {
 		_, tracked := sm.requestedBlocks.Get(h)
-		stale := timeout > 0 && now.Sub(sm.assignedAt[h]) > timeout
+		lost := !tracked
 
-		if tracked && !stale {
+		// Decide PER HOLDER whether to abandon its copy. LOST (the 60s global ledger
+		// entry expired, so no holder's delivery would authenticate globally) drops every
+		// holder; STALE (this holder has owed the block longer than BlockInFlightTimeout)
+		// drops only that holder — so a fresh racer added seconds ago is not evicted for
+		// a stale sibling's sake. Snapshot the holders to drop first: removeAssignment
+		// mutates the inner map, and we must not mutate it while ranging it.
+		var drop []*peerpkg.Peer
+
+		for p, at := range inner {
+			stale := timeout > 0 && now.Sub(at) > timeout
+			if lost || stale {
+				drop = append(drop, p)
+			}
+		}
+
+		if len(drop) == 0 {
 			continue
 		}
 
-		// Abandon this assignment and re-enqueue the block. delete during range is
-		// safe in Go.
-		if sm.refetchBlocks == nil {
-			sm.refetchBlocks = make(map[chainhash.Hash]struct{})
-		}
-		sm.refetchBlocks[h] = struct{}{}
-		delete(sm.assignedTo, h)
-		delete(sm.assignedAt, h)
+		emptied := false
 
-		// Drop the ledger entries so the block is immediately re-requestable and
-		// the peer's spare capacity frees (no-op if the entry already expired).
-		sm.requestedBlocks.Delete(h)
-		if st, ok := sm.peerStates.Get(p); ok {
-			st.requestedBlocks.Delete(h)
+		for _, p := range drop {
+			// removeAssignment returns false when it removed the LAST holder (inner map
+			// emptied, outer key deleted). delete during range of the outer map is safe.
+			if !sm.removeAssignment(h, p) {
+				emptied = true
+			}
+
+			// Free this holder's per-peer spare capacity regardless of whether others
+			// still hold the block.
+			if st, ok := sm.peerStates.Get(p); ok {
+				st.requestedBlocks.Delete(h)
+			}
+		}
+
+		// Re-enqueue and drop the GLOBAL ledger ONLY when the block is now outstanding
+		// to nobody. A hash a surviving racer still holds stays in flight (no requeue ->
+		// no double-fetch; no global delete -> reconcile*/frontier scan still see it).
+		if emptied {
+			if sm.refetchBlocks == nil {
+				sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+			}
+			sm.refetchBlocks[h] = struct{}{}
+			sm.requestedBlocks.Delete(h)
 		}
 	}
 }
@@ -4439,10 +4490,17 @@ func (sm *SyncManager) logFrontier(now time.Time) {
 
 	sm.assignedMu.Lock()
 	assigned := len(sm.assignedTo)
+	// inFlightRacers counts total {hash,peer} in-flight entries: with parallel fetch a
+	// single hash may be raced to several peers, so inFlightRacers > assignedBlocks
+	// signals active racing. At clampedMax==1 the two are always equal.
+	inFlightRacers := 0
+	for _, inner := range sm.assignedTo {
+		inFlightRacers += len(inner)
+	}
 	sm.assignedMu.Unlock()
 
-	sm.logger.Infof("[frontier] headerFrontier=%d headerListLen=%d committedHeight=%d assignedBlocks=%d headerProgressAge=%s",
-		frontierHeight, headerListLen, sm.cachedBlockAssemblyHeight.Load(), assigned, sm.headerProgressAge())
+	sm.logger.Infof("[frontier] headerFrontier=%d headerListLen=%d committedHeight=%d assignedBlocks=%d inFlightRacers=%d headerProgressAge=%s",
+		frontierHeight, headerListLen, sm.cachedBlockAssemblyHeight.Load(), assigned, inFlightRacers, sm.headerProgressAge())
 }
 
 // headerProgressAge reports how long it has been since a header batch last
@@ -4489,7 +4547,7 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 		haveHead   bool
 	)
 
-	for h, p := range sm.assignedTo {
+	for h, inner := range sm.assignedTo {
 		height, ok := sm.headerHeightIndex[h]
 		if !ok {
 			// No authoritative height for this hash (e.g. its header-list node was
@@ -4497,12 +4555,27 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 			continue
 		}
 
+		if len(inner) == 0 {
+			// Invariant: an outer key is only present with a non-empty inner map. Guard
+			// anyway so a would-be violation cannot pick a phantom head with a zero time.
+			continue
+		}
+
 		if !haveHead || height < headHeight {
 			haveHead = true
 			headHeight = height
 			headHash = h
-			headPeer = p
-			headAt = sm.assignedAt[h]
+
+			// The head peer / head age is the OLDEST holder of this hash: with parallel
+			// fetch the same block may be raced to several peers, and the true in-flight
+			// age (and the peer that has owed it longest) is the earliest getdata sent.
+			headPeer = nil
+			for p, at := range inner {
+				if headPeer == nil || at.Before(headAt) {
+					headPeer = p
+					headAt = at
+				}
+			}
 		}
 	}
 
@@ -4557,8 +4630,8 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 	// and the scheduler hands it to a peer with spare capacity next tick) so a
 	// different peer can rescue it — svnode re-requests a slow block from other peers
 	// before dropping anyone. Track the head block's total stall time across these
-	// reassignments (headStallHash/headStallSince), independent of assignedAt which
-	// resets on every reassignment.
+	// reassignments (headStallHash/headStallSince), independent of the per-holder
+	// in-flight timestamp which resets on every reassignment.
 	if sm.headStallHash != headHash {
 		sm.headStallHash = headHash
 		sm.headStallSince = now
@@ -4577,14 +4650,35 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 	}
 
 	if now.Sub(sm.headStallSince) <= disconnectTimeout {
-		// Within the race window: re-assign the single head block to another peer and
-		// keep the current one connected. Reset the per-assignment grace so the next
-		// holder gets its own BlockStallTimeout before being raced again.
+		// Within the race window. TWO-SPEED response, keeping the current holder(s)
+		// connected either way:
+		//
+		//   - Below BlockSlowFetchTimeout (15s default, kept strictly below the 30s
+		//     disconnect window so the [slow-fetch, disconnect] race window is non-empty),
+		//     or with additive racing disabled (clampedMax==1): today's proven sequential MOVE — re-hand the single head
+		//     block to one other peer (the measured mainnet-stick fast swap). Resets the
+		//     per-assignment grace so the next holder gets its own BlockStallTimeout.
+		//   - At/above BlockSlowFetchTimeout with clampedMax>1: svnode-style additive
+		//     RACE — issue an ADDITIONAL getdata to one more peer while KEEPING the
+		//     current holder(s), up to clampedMax peers total, first-delivery-wins
+		//     (addRacerForHead). addRacerForHead returns true to suppress the move once
+		//     it is in additive-race mode (raced, maxed, or a holder still delivering),
+		//     and false to fall through to the move while the block is still too young.
 		//
 		// Keep the F2 byte baseline warm while we race. The throughput gate needs a
 		// sample at least headStallRateWindow old to believe a rate, and the race
 		// window is the only place there is time to grow one; without this the gate
 		// would arrive at the disconnect decision unmeasured and have to stall it.
+		//
+		// At clampedMax==1 the whole race-branch body reduces to primeHeadStallSample +
+		// freeHeadBlockForRace, exactly as before parallel fetch — byte-identical.
+		if sm.clampedMaxParallelFetch() > 1 {
+			sm.primeHeadStallSample(headPeer, now)
+			if sm.addRacerForHead(headHash, headHeight, now) {
+				return
+			}
+		}
+
 		sm.primeHeadStallSample(headPeer, now)
 		sm.freeHeadBlockForRace(headHash, headPeer)
 
@@ -4666,61 +4760,28 @@ const (
 //
 // Drain-goroutine only, but it writes the peer's sample fields atomically since
 // peerSyncState has no lock (see the comment on those fields).
+//
+// The rate math itself lives in peerDownloadRate (shared VERBATIM with the additive
+// race gate, block_parallel_fetch.go). This gate keeps its exact original bias by
+// reading peerDownloadRate's immature-case sentinels: a maturing baseline (rate 0)
+// keeps the peer, no usable baseline (rate -1) lets the disconnect proceed.
 func (sm *SyncManager) headStallThroughputGate(peer *peerpkg.Peer, headHash chainhash.Hash, headHeight int32, now time.Time) bool {
 	minRate := sm.settings.Legacy.BlockStallMinRate
 	if minRate <= 0 || peer == nil {
 		return false
 	}
 
-	peerState, ok := sm.peerStates.Get(peer)
-	if !ok {
-		// The peer is already gone from the state map; there is nothing to measure
-		// and nothing useful to protect. Fall through to the existing behaviour.
-		return false
+	rate, mature := sm.peerDownloadRate(peer, now)
+	if !mature {
+		// Immature measurement — preserve this gate's original bias exactly:
+		//   rate == 0  -> baseline still maturing ("still measuring") -> KEEP the peer.
+		//   rate == -1 -> no usable baseline (peer gone, or never/too-long-ago sampled).
+		//                 The gate must never VETO a decision it did not measure, so let
+		//                 the disconnect proceed. In normal operation primeHeadStallSample
+		//                 seeds a baseline during the race window, so this is the exception,
+		//                 not the path every peer takes on its first stall.
+		return rate >= 0
 	}
-
-	current := peer.AssociationReadBytes()
-	prevAt := peerState.lastAssocSampleAt.Load()
-	prev := peerState.lastAssocReadBytes.Load()
-
-	// No usable baseline: either we have never sampled this peer, or the sample we
-	// hold predates an unrelated episode. Record one for next time and let the
-	// disconnect proceed.
-	//
-	// The gate must never VETO a decision it did not measure. Reaching here means
-	// the head block has been stuck for the whole HeadStallDisconnectTimeout
-	// without primeHeadStallSample ever running for this peer — i.e. the race
-	// window did not happen — so there is no evidence of delivery to protect and
-	// suppressing would make an unmeasured gate silently override the disconnect
-	// backstop, including the frontier carve-out above it. In normal operation the
-	// race window primes the baseline, so this branch is the exception, not the
-	// path every peer takes on its first stall.
-	if prevAt == 0 || now.Sub(time.Unix(0, prevAt)) > headStallRateSampleMaxAge {
-		peerState.lastAssocReadBytes.Store(current)
-		peerState.lastAssocSampleAt.Store(now.UnixNano())
-
-		return false
-	}
-
-	elapsed := now.Sub(time.Unix(0, prevAt))
-	if elapsed < headStallRateWindow {
-		// Baseline is still maturing. Leave it in place — resampling here would
-		// restart the window on every tick and it would never mature.
-		return true
-	}
-
-	// AssociationReadBytes sums over the streams present at sample time, so it can
-	// DECREASE if a stream was torn down between samples. That is the opposite of
-	// progress: treat it as zero throughput and let the disconnect proceed.
-	var delta uint64
-	if current > prev {
-		delta = current - prev
-	}
-
-	rate := int64(float64(delta) / elapsed.Seconds())
-
-	peerState.lastAssocReadBytes.Store(current)
-	peerState.lastAssocSampleAt.Store(now.UnixNano())
 
 	if rate < minRate {
 		return false
@@ -4789,9 +4850,15 @@ func (sm *SyncManager) freeHeadBlockForRace(h chainhash.Hash, peer *peerpkg.Peer
 	sm.recentlyNeededUntil[h] = time.Now().Add(recentlyNeededTTL)
 	sm.headerMu.Unlock()
 
+	// Remove ONLY this peer from the head block's in-flight set. The move path only
+	// ever runs below BlockSlowFetchTimeout, where additive racing has not started, so
+	// the head block has exactly one holder and removeAssignment always empties the
+	// inner map here — byte-identical to the old delete(assignedTo,h). It is also the
+	// clampedMax==1 rollback path (racing never entered), where the same single-holder
+	// property holds. The requestedBlocks deletes below therefore correctly drop the
+	// global + per-peer ledgers for a block that is now outstanding to nobody.
 	sm.assignedMu.Lock()
-	delete(sm.assignedTo, h)
-	delete(sm.assignedAt, h)
+	sm.removeAssignment(h, peer)
 
 	if sm.refetchBlocks == nil {
 		sm.refetchBlocks = make(map[chainhash.Hash]struct{})
@@ -4822,45 +4889,62 @@ func (sm *SyncManager) freePeerAssignments(peer *peerpkg.Peer) {
 		return
 	}
 
+	// Collect-then-mutate: identify every hash this peer holds, then remove ONLY this
+	// peer from each. removeAssignment reports whether ANOTHER live racer still holds
+	// the hash. Under parallel fetch a hash may be in flight to several peers, so a
+	// departing peer must NOT re-enqueue a hash still held by a surviving racer (that
+	// would double-fetch it) nor drop its GLOBAL requestedBlocks entry (that would let
+	// reconcile* treat a still-in-flight block as orphaned). Only a hash left with NO
+	// holder (freedFully) is re-enqueued and globally cleared. At clampedMax==1 every
+	// held hash has this peer as its sole holder, so touched == freedFully and the
+	// behaviour is byte-identical to the old unconditional requeue+global-delete.
 	sm.assignedMu.Lock()
 
-	freed := make([]chainhash.Hash, 0)
-	for h, p := range sm.assignedTo {
-		if p == peer {
-			freed = append(freed, h)
-		}
-	}
+	touched := make([]chainhash.Hash, 0)
+	freedFully := make([]chainhash.Hash, 0)
 
-	for _, h := range freed {
-		delete(sm.assignedTo, h)
-		delete(sm.assignedAt, h)
-		// Enqueue for re-fetch. The shared cursor has already advanced past these
-		// blocks, so the forward walk can never re-reach them; without this they
-		// would be orphaned below the cursor and wedge the ascending commit.
-		if sm.refetchBlocks == nil {
-			sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+	for h, inner := range sm.assignedTo {
+		if _, held := inner[peer]; !held {
+			continue
 		}
-		sm.refetchBlocks[h] = struct{}{}
+
+		touched = append(touched, h)
+
+		if !sm.removeAssignment(h, peer) {
+			freedFully = append(freedFully, h)
+
+			// Enqueue for re-fetch. The shared cursor has already advanced past these
+			// blocks, so the forward walk can never re-reach them; without this they
+			// would be orphaned below the cursor and wedge the ascending commit.
+			if sm.refetchBlocks == nil {
+				sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+			}
+			sm.refetchBlocks[h] = struct{}{}
+		}
 	}
 
 	sm.assignedMu.Unlock()
 
-	// Drop the global ledger entries outside assignedMu (the ledger is
-	// independently locked) so the freed blocks are immediately re-requestable.
-	// Also clear them from the peer's OWN requestedBlocks map when it is still in
-	// peerStates: on the stall path the peer is disconnected but its done-peer
-	// message (which would clearRequestedState) has not arrived yet, so without
-	// this the stale per-peer entries would linger until then.
+	// Drop the GLOBAL ledger entry only for hashes now held by nobody, outside
+	// assignedMu (the ledger is independently locked), so they are immediately
+	// re-requestable. Clear the departing peer's OWN requestedBlocks entry for EVERY
+	// hash it held (even ones a surviving racer still owns): on the stall path the peer
+	// is disconnected but its done-peer message (which would clearRequestedState) has
+	// not arrived yet, so without this the stale per-peer entries would linger until then.
 	peerState, hasState := sm.peerStates.Get(peer)
-	for _, h := range freed {
+
+	for _, h := range freedFully {
 		sm.requestedBlocks.Delete(h)
-		if hasState {
+	}
+
+	if hasState {
+		for _, h := range touched {
 			peerState.requestedBlocks.Delete(h)
 		}
 	}
 
-	if len(freed) > 0 {
-		sm.logger.Debugf("[freePeerAssignments] freed %d block assignment(s) from peer %s for reassignment", len(freed), peer)
+	if len(touched) > 0 {
+		sm.logger.Debugf("[freePeerAssignments] released %d block assignment(s) from peer %s (%d fully freed for re-fetch, rest still held by another racer)", len(touched), peer, len(freedFully))
 	}
 }
 
@@ -7642,8 +7726,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		msgChan:           make(chan interface{}, maxMsgQueueSize),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peerpkg.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peerpkg.Peer]time.Time),
 		refetchBlocks:     make(map[chainhash.Hash]struct{}),
 		blockSizeTracker: newBlockSizeTrackerWithBudgets(10, // track last 10 blocks for rolling average
 			tSettings.Legacy.InFlightTxBudget, tSettings.Legacy.InFlightByteBudget),

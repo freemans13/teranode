@@ -106,8 +106,7 @@ func TestCheckHeadStall_SuppressedWhileBackpressured(t *testing.T) {
 			settings:          tSettings,
 			headerList:        list.New(),
 			headerHeightIndex: map[chainhash.Hash]int32{h: 700000},
-			assignedTo:        map[chainhash.Hash]*peerpkg.Peer{h: p},
-			assignedAt:        map[chainhash.Hash]time.Time{h: time.Now().Add(-time.Minute)}, // stale
+			assignedTo:        map[chainhash.Hash]map[*peerpkg.Peer]time.Time{h: {p: time.Now().Add(-time.Minute)}}, // stale
 			refetchBlocks:     make(map[chainhash.Hash]struct{}),
 			requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 			peerStates:        txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),

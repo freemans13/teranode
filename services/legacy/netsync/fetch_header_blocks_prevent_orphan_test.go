@@ -91,8 +91,7 @@ func TestFetchHeaderBlocks_SuccessfulSendStaysOutOfAssignedTo(t *testing.T) {
 		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		refetchBlocks:     make(map[chainhash.Hash]struct{}),
 		blockSizeTracker:  newBlockSizeTracker(20),
 	}
@@ -116,8 +115,6 @@ func TestFetchHeaderBlocks_SuccessfulSendStaysOutOfAssignedTo(t *testing.T) {
 
 	require.Empty(t, sm.assignedTo,
 		"the single-peer path must NOT record assignedTo — that feeds checkHeadStall's 2s frontier fast-swap and livelocks cold-start IBD")
-	require.Empty(t, sm.assignedAt,
-		"assignedAt must stay empty alongside assignedTo on the single-peer path")
 
 	// The block must still be tracked in-flight so the window can top up correctly.
 	require.False(t, sm.startHeader == sm.headerList.Front().Next(),
@@ -174,8 +171,7 @@ func TestFetchHeaderBlocks_DroppedSendReQueuesRefetch(t *testing.T) {
 		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		refetchBlocks:     make(map[chainhash.Hash]struct{}),
 		blockSizeTracker:  newBlockSizeTracker(20),
 	}
@@ -200,7 +196,6 @@ func TestFetchHeaderBlocks_DroppedSendReQueuesRefetch(t *testing.T) {
 	require.NotEmpty(t, sm.refetchBlocks,
 		"a dropped single-peer getdata must re-queue its hashes to refetchBlocks, not discard them")
 	require.Empty(t, sm.assignedTo, "a dropped getdata must leave no assignedTo entry")
-	require.Empty(t, sm.assignedAt, "a dropped getdata must leave no assignedAt entry")
 	for h := range sm.refetchBlocks {
 		_, inFlight := sm.requestedBlocks.Get(h)
 		require.False(t, inFlight, "a dropped getdata must leave no phantom requestedBlocks entry")

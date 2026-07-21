@@ -36,8 +36,7 @@ import (
 func assignForStall(sm *SyncManager, hash chainhash.Hash, height int32, p *peer.Peer, st *peerSyncState, at time.Time) {
 	st.requestedBlocks.Set(hash, struct{}{})
 	sm.requestedBlocks.Set(hash, struct{}{})
-	sm.assignedTo[hash] = p
-	sm.assignedAt[hash] = at
+	sm.addAssignment(hash, p, at)
 	sm.headerHeightIndex[hash] = height
 }
 
@@ -87,8 +86,7 @@ func TestCheckHeadStall_DisconnectsStalledHeadPeerAndFreesAssignments(t *testing
 		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		blockSizeTracker:  newBlockSizeTracker(20),
 	}
 	defer sm.requestedBlocks.Stop()
@@ -126,8 +124,6 @@ func TestCheckHeadStall_DisconnectsStalledHeadPeerAndFreesAssignments(t *testing
 	for _, h := range []chainhash.Hash{head, aOther} {
 		_, inTo := sm.assignedTo[h]
 		require.False(t, inTo, "A's block %v must be removed from assignedTo", h)
-		_, inAt := sm.assignedAt[h]
-		require.False(t, inAt, "A's block %v must be removed from assignedAt", h)
 		_, inPeer := stateA.requestedBlocks.Get(h)
 		require.False(t, inPeer, "A's block %v must be removed from A's requestedBlocks", h)
 		_, inGlobal := sm.requestedBlocks.Get(h)
@@ -136,11 +132,10 @@ func TestCheckHeadStall_DisconnectsStalledHeadPeerAndFreesAssignments(t *testing
 
 	// B's assignments untouched in every map.
 	for _, h := range []chainhash.Hash{bLow, bHigh} {
-		gotPeer, inTo := sm.assignedTo[h]
+		inner, inTo := sm.assignedTo[h]
 		require.True(t, inTo, "B's block %v must remain in assignedTo", h)
-		require.Equal(t, peerB, gotPeer, "B's block %v must still map to peer B", h)
-		_, inAt := sm.assignedAt[h]
-		require.True(t, inAt, "B's block %v must remain in assignedAt", h)
+		_, mapsToB := inner[peerB]
+		require.True(t, mapsToB, "B's block %v must still map to peer B", h)
 		_, inPeer := stateB.requestedBlocks.Get(h)
 		require.True(t, inPeer, "B's block %v must remain in B's requestedBlocks", h)
 		_, inGlobal := sm.requestedBlocks.Get(h)
@@ -182,8 +177,7 @@ func TestCheckHeadStall_WithinTimeoutNoDisconnect(t *testing.T) {
 		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		blockSizeTracker:  newBlockSizeTracker(20),
 	}
 	defer sm.requestedBlocks.Stop()
@@ -243,8 +237,7 @@ func TestCheckHeadStall_FlagOffNoop(t *testing.T) {
 		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		blockSizeTracker:  newBlockSizeTracker(20),
 	}
 	defer sm.requestedBlocks.Stop()

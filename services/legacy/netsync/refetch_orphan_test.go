@@ -80,8 +80,7 @@ func TestAssignBlocks_FreedHeadRefetchedBelowCursor(t *testing.T) {
 		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		refetchBlocks:     make(map[chainhash.Hash]struct{}),
 		blockSizeTracker:  newBlockSizeTracker(20),
 	}
@@ -99,8 +98,7 @@ func TestAssignBlocks_FreedHeadRefetchedBelowCursor(t *testing.T) {
 	head := chainhash.Hash{0xaa}
 	syncState.requestedBlocks.Set(head, struct{}{})
 	sm.requestedBlocks.Set(head, struct{}{})
-	sm.assignedTo[head] = syncPeer
-	sm.assignedAt[head] = time.Now().Add(-10 * time.Second)
+	sm.addAssignment(head, syncPeer, time.Now().Add(-10*time.Second))
 	sm.headerHeightIndex[head] = 100
 
 	require.Nil(t, sm.startHeader, "precondition: cursor is past the head (orphan below it)")
@@ -201,8 +199,7 @@ func TestAssignBlocks_RefetchAndForwardWalkCompose(t *testing.T) {
 		requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 		headerList:        list.New(),
 		headerHeightIndex: make(map[chainhash.Hash]int32),
-		assignedTo:        make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:        make(map[chainhash.Hash]time.Time),
+		assignedTo:        make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		refetchBlocks:     make(map[chainhash.Hash]struct{}),
 		blockSizeTracker:  newBlockSizeTracker(20),
 	}
@@ -278,8 +275,7 @@ func TestReconcileLostAssignments_TTLExpiredOrphanRefetched(t *testing.T) {
 		chainParams:     &chainParams,
 		peerStates:      txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
 		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		assignedTo:      make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:      make(map[chainhash.Hash]time.Time),
+		assignedTo:      make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		refetchBlocks:   make(map[chainhash.Hash]struct{}),
 	}
 	defer sm.requestedBlocks.Stop()
@@ -290,13 +286,11 @@ func TestReconcileLostAssignments_TTLExpiredOrphanRefetched(t *testing.T) {
 	// Orphan: assigned + recorded, then its requestedBlocks ledger entry expires
 	// (modelled by never/no-longer being in requestedBlocks) while assignedTo lingers.
 	orphan := chainhash.Hash{0x77}
-	sm.assignedTo[orphan] = p
-	sm.assignedAt[orphan] = time.Now().Add(-90 * time.Second)
+	sm.addAssignment(orphan, p, time.Now().Add(-90*time.Second))
 
 	// Still-tracked, freshly-assigned block: present in BOTH maps; must be left alone.
 	live := chainhash.Hash{0x88}
-	sm.assignedTo[live] = p
-	sm.assignedAt[live] = time.Now()
+	sm.addAssignment(live, p, time.Now())
 	sm.requestedBlocks.Set(live, struct{}{})
 
 	sm.reconcileLostAssignments(time.Now())
@@ -335,8 +329,7 @@ func TestReconcileLostAssignments_StaleBlockFreed(t *testing.T) {
 		chainParams:     &chainParams,
 		peerStates:      txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
 		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		assignedTo:      make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:      make(map[chainhash.Hash]time.Time),
+		assignedTo:      make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		refetchBlocks:   make(map[chainhash.Hash]struct{}),
 	}
 	defer sm.requestedBlocks.Stop()
@@ -346,15 +339,13 @@ func TestReconcileLostAssignments_StaleBlockFreed(t *testing.T) {
 
 	// Stale block: tracked in both ledgers, but assigned 30s ago (> 10s timeout).
 	stale := chainhash.Hash{0x91}
-	sm.assignedTo[stale] = p
-	sm.assignedAt[stale] = time.Now().Add(-30 * time.Second)
+	sm.addAssignment(stale, p, time.Now().Add(-30*time.Second))
 	sm.requestedBlocks.Set(stale, struct{}{})
 	st.requestedBlocks.Set(stale, struct{}{})
 
 	// Fresh block: assigned just now, within the timeout — must be left alone.
 	fresh := chainhash.Hash{0x92}
-	sm.assignedTo[fresh] = p
-	sm.assignedAt[fresh] = time.Now()
+	sm.addAssignment(fresh, p, time.Now())
 	sm.requestedBlocks.Set(fresh, struct{}{})
 	st.requestedBlocks.Set(fresh, struct{}{})
 
@@ -391,15 +382,13 @@ func TestReconcileLostAssignments_FlagOffNoop(t *testing.T) {
 		settings:        tSettings,
 		chainParams:     &chainParams,
 		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		assignedTo:      make(map[chainhash.Hash]*peer.Peer),
-		assignedAt:      make(map[chainhash.Hash]time.Time),
+		assignedTo:      make(map[chainhash.Hash]map[*peer.Peer]time.Time),
 		refetchBlocks:   make(map[chainhash.Hash]struct{}),
 	}
 	defer sm.requestedBlocks.Stop()
 
 	orphan := chainhash.Hash{0x77}
-	sm.assignedTo[orphan] = &peer.Peer{}
-	sm.assignedAt[orphan] = time.Now().Add(-90 * time.Second)
+	sm.addAssignment(orphan, &peer.Peer{}, time.Now().Add(-90*time.Second))
 
 	sm.reconcileLostAssignments(time.Now())
 
