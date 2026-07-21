@@ -695,9 +695,15 @@ func NewSettings(alternativeContext ...string) *Settings {
 			InFlightByteBudget:                    int64(getInt("legacy_inFlightByteBudget", 0, alternativeContext...)),
 			InFlightRefillInterval:                getDuration("legacy_inFlightRefillInterval", 20*time.Millisecond, alternativeContext...),
 			ParallelFetchPeers:                    getInt("legacy_parallelFetchPeers", 1, alternativeContext...),
-			BlockDownloadWindow:                   getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
-			MaxBlocksInTransitPerPeer:             getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
-			BlockStallTimeout:                     getDuration("legacy_blockStallTimeout", 2*time.Second, alternativeContext...),
+			// Gap-first fetch: prioritise (never throttle) the contiguous committed-tip+1
+			// gap ahead of far-ahead successors, and retarget the head-stall race at the
+			// true frontier. Loader defaults MUST equal the struct-tag defaults so
+			// flag-off is byte-identical to today. GapFirstDepth=0 => derived per-tick cap.
+			GapFirstFetch:             getBool("legacy_gapFirstFetch", false, alternativeContext...),
+			GapFirstDepth:             getInt("legacy_gapFirstDepth", 0, alternativeContext...),
+			BlockDownloadWindow:       getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
+			MaxBlocksInTransitPerPeer: getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
+			BlockStallTimeout:         getDuration("legacy_blockStallTimeout", 2*time.Second, alternativeContext...),
 			// F1: race a stalled head block to other peers for this long before disconnecting the peer holding it.
 			HeadStallDisconnectTimeout: getDuration("legacy_headStallDisconnectTimeout", 30*time.Second, alternativeContext...),
 			// F2: never disconnect a head peer that is still moving bytes faster than this floor.

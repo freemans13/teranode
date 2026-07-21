@@ -3533,6 +3533,20 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	// this same tick.
 	sm.reconcileFrontierGap(time.Now())
 
+	// Gap-first sweep (flag-gated; no-op unless ParallelFetchPeers>1 && GapFirstFetch).
+	// Runs immediately AFTER reconcileFrontierGap/realignFrontierIfCommitted — so a
+	// committed-but-untrimmed leading node is realigned away first and never
+	// perpetually re-enqueued — and BEFORE assignBlocksAcrossPeers, so the in-gate
+	// contiguous range it enqueues into refetchBlocks wins that pass's budget in
+	// drainRefetchBlocks (lowest-height-first) AHEAD of the forward walk's far-ahead
+	// successors. It runs every tick with NO debounce (unlike reconcileFrontierGap's
+	// BlockInFlightTimeout gate): this is what keeps committed+1 continuously in flight
+	// (re-driven within ~20ms of ever being orphaned) instead of one block per 10s.
+	// Placed BEFORE the runway guard below on purpose — the gap must be re-driven even
+	// on a tick where the forward runway is momentarily exhausted. Pure population; it
+	// changes ordering only, never total in-flight depth (see sweepContiguousFrontier).
+	sm.sweepContiguousFrontier(time.Now())
+
 	// Snapshot whether there is header runway under headerMu, then RELEASE the
 	// lock before calling fetchHeaderBlocks (which re-takes headerMu itself and
 	// must never be called with it held — the lock is non-reentrant).
@@ -3694,6 +3708,39 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 	// (commit-blocking) blocks, so they get first claim on this pass's budget.
 	toAssign = sm.drainRefetchBlocks(targets, toAssign)
 
+	// Gap-first disjointness belt (flag-gated). drainRefetchBlocks above batchAdds
+	// each drained hash into a target's pending list but DEFERS recording it into
+	// requestedBlocks to the shared send loop that runs AFTER the forward walk below.
+	// The gap-first sweep enqueues the in-gate range (committed+1 .. ceiling) into
+	// refetchBlocks REGARDLESS of the startHeader cursor, so on a tick where the
+	// cursor sits at or below the ceiling — e.g. right after resetHeaderState rewinds
+	// startHeader to committed+1 on a sync-peer rotation, before it has walked ahead —
+	// the walk reaches a hash the drain already staged this pass. Its requestedBlocks
+	// skip cannot see the deferred entry (haveInv false, inFlight false, not owned), so
+	// it would re-stage the SAME hash to a SECOND peer: the send loop then records both
+	// into assignedTo, two getdata go out, and the second arrival races the first at
+	// window admission — the create-vs-create duplicate-admission (40P01) / unrequested-
+	// block-disconnect vector the in-flight skip below exists to prevent. Snapshot the
+	// drain-owned set ONCE here (single assignedMu take, no per-node lock) and skip any
+	// hash it holds in the walk. Only the gap-first sweep can seed refetchBlocks AT or
+	// ABOVE the monotonic cursor — every other producer feeds strictly below-cursor
+	// orphans the forward walk can never re-reach — so this is inert with the flag off
+	// (nil map, byte-identical rollback). Snapshot AFTER the drain so it also covers a
+	// hash the drain skipped for spare/horizon: the walk cannot usefully assign those
+	// either (no spare -> pickMaxSpareTarget breaks; above horizon -> the runway break),
+	// and the next tick's drain re-drives them lowest-height-first.
+	var drainOwned map[chainhash.Hash]struct{}
+	if sm.settings.Legacy.ParallelFetchPeers > 1 && sm.settings.Legacy.GapFirstFetch {
+		sm.assignedMu.Lock()
+		if len(sm.refetchBlocks) > 0 {
+			drainOwned = make(map[chainhash.Hash]struct{}, len(sm.refetchBlocks))
+			for h := range sm.refetchBlocks {
+				drainOwned[h] = struct{}{}
+			}
+		}
+		sm.assignedMu.Unlock()
+	}
+
 	// Snapshot headerGen + startHeader under the lock — identical protocol to
 	// fetchHeaderBlocks. A headerGen change at any later re-take means the list was
 	// reset out from under us and the walk must stop.
@@ -3761,6 +3808,13 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 		// changed — it has no such recovery and relies on the re-walk to re-request.
 		_, inFlight := sm.requestedBlocks.Get(*node.hash)
 
+		// Skip a hash the re-fetch drain already staged this pass (gap-first belt,
+		// see drainOwned above). The drain defers its requestedBlocks record to the
+		// send loop, so the inFlight check cannot see it yet; without this a cursor
+		// sitting on the gap (post-reset) would double-assign it. nil-map read on the
+		// flag-off path returns false — byte-identical.
+		_, drainStaged := drainOwned[*node.hash]
+
 		// Also skip a block the window pipeline OWNS (parked or in an in-flight
 		// flush job). requestedBlocks cannot cover this: the preamble wipes it when
 		// the block ARRIVES, but the block then lives on in the park for minutes,
@@ -3769,7 +3823,7 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 		// (same recovery reasoning as the in-flight skip above: a genuinely lost
 		// owned block has its ownership released on every job/park exit, so
 		// skipping it here cannot strand it).
-		if !haveInv && !inFlight && !sm.windowBlockOwned(*node.hash) {
+		if !haveInv && !inFlight && !drainStaged && !sm.windowBlockOwned(*node.hash) {
 			// Pick the assignable target with the MOST spare capacity. If none has
 			// spare left, the per-peer caps are exhausted for this pass; stop.
 			best := pickMaxSpareTarget(targets)
@@ -3916,6 +3970,27 @@ func (sm *SyncManager) drainRefetchBlocks(targets []*fetchTarget, toAssign int) 
 	// unpolled / park not full) → no skip, byte-identical to today.
 	horizon, capped := sm.fetchRunwayHorizon()
 
+	// In-gate horizon belt (gap-first, flag-gated defence). The sweep bounds gap
+	// heights at cached+maxBehind, and in the common park-full case
+	// fetchRunwayHorizon's floor is exactly cached+maxBehind, so an in-gate gap block
+	// is already never > horizon and the skip above never fires on it — which is why
+	// no horizon change is normally required. gateCeiling closes the one remaining
+	// corner: a BYTE-SIZED horizon (ParkRunwayByteSized) can momentarily fall BELOW
+	// cached+maxBehind when blocks are huge, which would skip an in-gate,
+	// commit-blocking block and let a park full of far-ahead successors starve gap
+	// re-fetch. Below, a block whose height is within the maturity gate is NEVER
+	// skipped. gateCeiling stays 0 unless gap-first is on AND the BA height is polled,
+	// so with the flag off the belt is inert and the skip is byte-identical to today.
+	var gateCeiling uint32
+	if sm.settings.Legacy.ParallelFetchPeers > 1 && sm.settings.Legacy.GapFirstFetch && sm.baHeightPolled.Load() {
+		if mb := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly; mb > 0 {
+			c := sm.cachedBlockAssemblyHeight.Load()
+			if c <= math.MaxUint32-uint32(mb) { //nolint:gosec // mb guarded > 0
+				gateCeiling = c + uint32(mb) //nolint:gosec // mb guarded > 0
+			}
+		}
+	}
+
 	for _, h := range pending {
 		if toAssign <= 0 {
 			break
@@ -3923,7 +3998,15 @@ func (sm *SyncManager) drainRefetchBlocks(targets []*fetchTarget, toAssign int) 
 
 		if capped {
 			if ht := heights[h]; ht >= 0 && ht != math.MaxInt32 && uint32(ht) > horizon { //nolint:gosec // ht guarded >= 0
-				continue
+				// Gap-first belt: an in-gate (height <= cached+maxBehind) block is the
+				// commit-blocking work the park is waiting on — never skip it, even if a
+				// byte-sized horizon momentarily dipped below the maturity gate. When
+				// gateCeiling==0 (flag off) inGate is always false, so this reduces to the
+				// original unconditional skip — byte-identical.
+				inGate := gateCeiling > 0 && uint32(ht) <= gateCeiling //nolint:gosec // ht guarded >= 0
+				if !inGate {
+					continue
+				}
 			}
 		}
 
@@ -4248,6 +4331,29 @@ func (sm *SyncManager) reconcileLostAssignments(now time.Time) {
 	}
 }
 
+// frontierElementLocked returns the header-list element of the contiguous
+// frontier: headerList.Front() skipping a stale leading seed node (a retained
+// checkpoint / committed-tip node that has no block of its own to fetch). It is
+// the SINGLE source of truth for "where the frontier is", shared verbatim by
+// reconcileFrontierGap, the gap-first sweep (sweepContiguousFrontier), and the
+// checkHeadStall race retarget, so those three can never drift on what the
+// contiguous frontier is. Returns nil when the list holds only the seed (or is
+// empty). O(1) — there is only ever one seed node, at the front.
+//
+// Caller MUST hold headerMu (it reads headerList/headerListSeed). Drain-goroutine
+// only in practice; headerMu makes it safe against concurrent header mutation.
+func (sm *SyncManager) frontierElementLocked() *list.Element {
+	for e := sm.headerList.Front(); e != nil; e = e.Next() {
+		if e == sm.headerListSeed {
+			continue
+		}
+
+		return e
+	}
+
+	return nil
+}
+
 // reconcileFrontierGap re-requests the frontier block (committed_tip+1) when it
 // has become orphaned in NO ledger. reconcileLostAssignments and checkHeadStall
 // both key on assignedTo, but the single-peer fetchHeaderBlocks path — still
@@ -4270,23 +4376,20 @@ func (sm *SyncManager) reconcileFrontierGap(now time.Time) {
 	// Frontier = the lowest header whose block has not been consumed yet:
 	// headerList.Front(), skipping a stale leading seed (a retained checkpoint /
 	// committed-tip node that has no block of its own to fetch). O(1) — no scan.
+	// frontierElementLocked() is the SINGLE derivation of "the frontier element"
+	// shared with the gap-first sweep and the checkHeadStall race retarget, so the
+	// three can never disagree on which node is the contiguous frontier.
 	sm.headerMu.Lock()
 	var (
 		frontier     chainhash.Hash
 		haveFrontier bool
 	)
 
-	for e := sm.headerList.Front(); e != nil; e = e.Next() {
-		if e == sm.headerListSeed {
-			continue
-		}
-
+	if e := sm.frontierElementLocked(); e != nil {
 		if node, ok := e.Value.(*headerNode); ok && node.hash != nil {
 			frontier = *node.hash
 			haveFrontier = true
 		}
-
-		break
 	}
 	sm.headerMu.Unlock()
 
@@ -4375,6 +4478,165 @@ func (sm *SyncManager) reconcileFrontierGap(now time.Time) {
 	sm.frontierGapSince = now
 
 	sm.logger.Warnf("[reconcileFrontierGap] frontier block %s orphaned for %s (lost on the single-peer fetch path); re-enqueuing for re-fetch", frontier, orphanedFor)
+}
+
+// gapFirstDepthResolved is the per-tick node cap on the contiguous-frontier sweep
+// (sweepContiguousFrontier). GapFirstDepth is the operator override; 0 (the
+// default) derives it as min(MaxBlocksBehindBlockAssembly,
+// MaxBlocksInTransitPerPeer*ParallelFetchPeers). The cap exists ONLY so an
+// operator can never make the sweep scan the whole BlockDownloadWindow (1024) —
+// it never limits total in-flight depth (the forward walk still spends the full
+// budget), it only bounds how far the per-tick low-height re-drive reaches.
+// Drain-goroutine only.
+func (sm *SyncManager) gapFirstDepthResolved() int {
+	if d := sm.settings.Legacy.GapFirstDepth; d > 0 {
+		return d
+	}
+
+	// Derived: no more than the total per-peer in-flight capacity across the fetch
+	// peers, and no more than the maturity gate (the in-gate range can never be
+	// wider than cached+maxBehind, so scanning past it would only ever hit
+	// far-ahead successors we intentionally leave to the forward walk).
+	depth := sm.settings.Legacy.MaxBlocksInTransitPerPeer * sm.settings.Legacy.ParallelFetchPeers
+	if mb := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly; mb > 0 && mb < depth {
+		depth = mb
+	}
+
+	if depth < 1 {
+		depth = 1
+	}
+
+	return depth
+}
+
+// sweepContiguousFrontier is the proactive per-tick gap populator (the whole
+// point of gap-first fetch). It supplies the ONE thing the reactive machinery
+// cannot: a per-pass scan that re-derives the contiguous frontier from the header
+// list and enqueues the entire in-gate range (committed+1 .. cached+maxBehind)
+// that is not already in hand, so the existing lowest-height-first drain
+// (drainRefetchBlocks) assigns and getdata-sends committed+1, committed+2, ...
+// AHEAD of every far-ahead successor at startHeader.
+//
+// WHY this exists (the live failure it fixes): startHeader is a MONOTONIC cursor —
+// once it walks past the committed frontier it is never rewound during normal
+// fetch, so committed+1..committed+N fall below it and the forward walk can never
+// re-reach them. Live (2026-07-21): committed tip 701304, the fetcher was spending
+// 36.6 MB/s racing the head block at 701366 (62 ahead), which arrived, could not
+// commit (61 blocks missing below), was parked by gateContiguousWindow and
+// eventually dropped as a stray — while the GAP blocks 701305-701365 only trickled
+// in through the single-block, BlockInFlightTimeout-debounced reconcileFrontierGap
+// path. The pipeline starved on the gap while the network was busy fetching blocks
+// it could not use. This sweep re-drives the whole gap into flight every ~20ms.
+//
+// IT PRIORITISES, IT DOES NOT THROTTLE: it is PURE ADDITION of at most
+// GapFirstDepth low-height candidates into refetchBlocks, consumed out of the SAME
+// unchanged budget by the SAME drain; the forward walk still spends every remaining
+// unit of toAssign on far-ahead runway. Total in-flight depth is therefore never
+// reduced — the decisive difference from the failed frontier-first clamp (which
+// LOWERED the fetch horizon and collapsed assignedBlocks to 0-1).
+//
+// It POPULATES ONLY — it never sends or records. drainRefetchBlocks (already the
+// first thing assignBlocksAcrossPeers does, already lowest-height-first, already
+// haveInventory-gated before send) does the sending in ascending order this same
+// tick, so no gRPC and no double-request is introduced here.
+//
+// Lock discipline: reads headerList/headerHeightIndex under headerMu, RELEASES it,
+// then takes assignedMu to test/write refetchBlocks — headerMu -> assignedMu order
+// preserved, no lock held across any peer send or gRPC. Drain-goroutine only.
+func (sm *SyncManager) sweepContiguousFrontier(now time.Time) {
+	// (a) Gate: reachable ONLY with the master parallel-fetch gate AND the new lever
+	// both on. With GapFirstFetch=false (or ParallelFetchPeers<=1) this returns
+	// immediately and NO population happens — the compiled scheduler is line-for-line
+	// today's. This is the live, no-rebuild rollback lever the clamp taught us to ship.
+	if !(sm.settings.Legacy.ParallelFetchPeers > 1 && sm.settings.Legacy.GapFirstFetch) {
+		return
+	}
+
+	// (b) Maturity ceiling. Without a trustworthy block-assembly height we do not know
+	// where the in-gate range ends; mirror fetchRunwayHorizon's baHeightPolled guard
+	// and do nothing rather than sweep against a bogus ceiling (a REAL height of 0 on
+	// a fresh node still sweeps normally — the flag, not cached==0, is the guard).
+	if !sm.baHeightPolled.Load() {
+		return
+	}
+
+	maxBehind := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly
+	if maxBehind <= 0 {
+		return
+	}
+
+	cached := sm.cachedBlockAssemblyHeight.Load()
+
+	if cached > math.MaxUint32-uint32(maxBehind) { //nolint:gosec // maxBehind guarded > 0
+		return
+	}
+
+	ceiling := cached + uint32(maxBehind) //nolint:gosec // maxBehind guarded > 0
+	depthCap := sm.gapFirstDepthResolved()
+
+	// (c) Under headerMu ONLY: walk the header list forward from the frontier element
+	// (identical seed-skip to reconcileFrontierGap, via the shared helper), collecting
+	// up to depthCap ascending hashes whose height is <= ceiling. Stop at the first
+	// node above the ceiling — those are the far-ahead successors the maturity gate
+	// would park, and prioritising them is exactly the live 701366 bug. This yields
+	// the in-gate contiguous set committed+1 .. min(headerFrontier, cached+maxBehind).
+	collected := make([]chainhash.Hash, 0, depthCap)
+
+	sm.headerMu.Lock()
+	for e := sm.frontierElementLocked(); e != nil && len(collected) < depthCap; e = e.Next() {
+		node, ok := e.Value.(*headerNode)
+		if !ok || node.hash == nil {
+			continue
+		}
+
+		if node.height >= 0 && uint32(node.height) > ceiling { //nolint:gosec // height guarded >= 0
+			break
+		}
+
+		collected = append(collected, *node.hash)
+	}
+	sm.headerMu.Unlock()
+
+	if len(collected) == 0 {
+		return
+	}
+
+	// (d) Under assignedMu: enqueue each in-gate hash that is NOT already accounted
+	// for — not in-flight (requestedBlocks), not owned (parked/flushing), not already
+	// assigned (assignedTo), not already queued (refetchBlocks). These are the SAME
+	// three skips the forward walk applies (in-flight / owned / committed), minus the
+	// haveInventory (committed) check which is deliberately deferred: haveInventory is
+	// a gRPC and MUST NOT run under a lock. drainRefetchBlocks re-checks haveInventory
+	// per hash before it sends, so an already-committed straggler is dropped there —
+	// the phantom-free / no-double-request invariant is preserved exactly as the
+	// existing side-channels preserve it. All maps here (requestedBlocks expiringmap,
+	// windowOwnedBlocks SyncedMap) are independent leaf locks with no callback that
+	// takes assignedMu, so reading them under assignedMu cannot invert.
+	sm.assignedMu.Lock()
+	if sm.refetchBlocks == nil {
+		sm.refetchBlocks = make(map[chainhash.Hash]struct{})
+	}
+
+	for _, h := range collected {
+		if _, inFlight := sm.requestedBlocks.Get(h); inFlight {
+			continue
+		}
+
+		if _, assigned := sm.assignedTo[h]; assigned {
+			continue
+		}
+
+		if _, queued := sm.refetchBlocks[h]; queued {
+			continue
+		}
+
+		if sm.windowBlockOwned(h) {
+			continue
+		}
+
+		sm.refetchBlocks[h] = struct{}{}
+	}
+	sm.assignedMu.Unlock()
 }
 
 // realignFrontierIfCommitted trims every leading header-list node whose block is
@@ -4579,8 +4841,85 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 		}
 	}
 
+	// Gap-first racing retarget (Change 3, flag-gated). The argmin-over-assignedTo
+	// head above is the lowest ASSIGNED block. During an open gap that is a far-ahead
+	// PARKED successor (live: 701366) because the true frontier (701305) was orphaned
+	// below the monotonic cursor and is NOT in assignedTo — so racing it spends peers
+	// on a block that physically cannot commit while committed+1 is missing. Retarget
+	// the race at the TRUE contiguous frontier instead. Both locks are still held here
+	// (headerHeightIndex under headerMu, assignedTo under assignedMu), lock order
+	// headerMu -> assignedMu preserved. Flag OFF => this whole block is skipped and the
+	// head stays the argmin, byte-identical to today.
+	frontierRetargetSkip := false
+
+	if sm.settings.Legacy.ParallelFetchPeers > 1 && sm.settings.Legacy.GapFirstFetch {
+		if fe := sm.frontierElementLocked(); fe != nil {
+			if node, ok := fe.Value.(*headerNode); ok && node.hash != nil {
+				frontierHash := *node.hash
+
+				if fht, known := sm.headerHeightIndex[frontierHash]; known {
+					if inner, assigned := sm.assignedTo[frontierHash]; assigned && len(inner) > 0 {
+						// (b) The frontier IS in flight (the sweep+drain put it there on a
+						// prior tick through the normal record path, so addRacerForHead's
+						// "global already set + non-empty racersOf" invariants hold). Override
+						// the head with it and its OLDEST holder, so frontierStalled below
+						// becomes true by construction whenever a gap is open — the block that
+						// genuinely gates commit gets the fast swap / additive race, not a
+						// far-ahead successor.
+						haveHead = true
+						headHash = frontierHash
+						headHeight = fht
+						headPeer = nil
+
+						for p, at := range inner {
+							if headPeer == nil || at.Before(headAt) {
+								headPeer = p
+								headAt = at
+							}
+						}
+					} else {
+						// (c) The frontier is NOT in assignedTo. Two very different sub-cases
+						// hide behind that one condition, and they must be told apart:
+						//
+						//   (c1) GENUINELY ORPHANED — not in requestedBlocks, not window-owned.
+						//        This is the transient one-tick window where checkHeadStall (which
+						//        runs BEFORE the sweep+drain in this same tick) sees the frontier
+						//        freshly orphaned. RETURN without racing: never fall back to racing
+						//        the far-ahead argmin, which is the exact bug. The sweep+drain
+						//        later this tick makes the frontier in-flight and raceable next
+						//        tick (~20ms lag, deliberately preferred over racing the wrong
+						//        block).
+						//
+						//   (c2) IN FLIGHT via the requestedBlocks-ONLY path (the single-peer
+						//        fetchHeaderBlocks fallback taken when <2 peers have spare, or a
+						//        checkpoint-boundary send — both record requestedBlocks but never
+						//        assignedTo), or window-owned (parked/flushing). Here the frontier
+						//        is legitimately progressing and simply is not raceable through
+						//        assignedTo. But it is NOT a one-tick window — the sweep skips it
+						//        (requestedBlocks in-flight) so it never enters assignedTo, so a
+						//        blanket skip would fire EVERY tick and disable the argmin head-of-
+						//        line recovery for a genuinely stalled FAR-AHEAD block until the
+						//        frontier's 60s ledger TTL, re-opening the ~60s pipeline-idle stall
+						//        F1/F2 exists to cut to ~2s. Do NOT skip: fall through to the argmin
+						//        head exactly as the GapFirstFetch-off path does. The frontier's own
+						//        single-peer-path recovery stays with reconcileFrontierGap / the TTL,
+						//        unchanged.
+						_, frontierInFlight := sm.requestedBlocks.Get(frontierHash)
+						if !frontierInFlight && !sm.windowBlockOwned(frontierHash) {
+							frontierRetargetSkip = true
+						}
+					}
+				}
+			}
+		}
+	}
+
 	sm.assignedMu.Unlock()
 	sm.headerMu.Unlock()
+
+	if frontierRetargetSkip {
+		return
+	}
 
 	if !haveHead || headPeer == nil {
 		return
