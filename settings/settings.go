@@ -720,6 +720,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// 15s (half the 30s disconnect window) opens a 15s racing window [15s,30s]: racing fans out to the
 			// cap within a few ticks, leaving the balance of the window for a racer to deliver before disconnect.
 			BlockSlowFetchTimeout: getDuration("legacy_blockSlowFetchTimeout", 15*time.Second, alternativeContext...),
+			// Frontier-first clamp: while a contiguous commit gap is open, cap successor prefetch to
+			// committedFrontier + max(setting, calculateMaxInFlightBlocks) so peer bandwidth focuses on the
+			// raced frontier block. 0 disables (byte-identical rollback); see fetchRunwayHorizon.
+			FrontierLeadClamp: getInt("legacy_frontierLeadClamp", 0, alternativeContext...),
 			// F3: peer-layer deadlines used only while catching up; at the tip the original values still apply.
 			IBDBlockStallTimeout:    getDuration("legacy_ibdBlockStallTimeout", 60*time.Minute, alternativeContext...),
 			IBDHeadersStallTimeout:  getDuration("legacy_ibdHeadersStallTimeout", 10*time.Minute, alternativeContext...),

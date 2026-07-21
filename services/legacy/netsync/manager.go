@@ -4081,6 +4081,76 @@ func (sm *SyncManager) fetchRunwayHorizon() (uint32, bool) {
 		span = uint32(maxBehind) //nolint:gosec // guarded > 0 above
 	}
 
+	// Frontier-first clamp (legacy_frontierLeadClamp > 0): while a contiguous commit
+	// gap is OPEN — the next-needed block (committedFrontier+1) is not yet in the park
+	// but a stranded successor IS parked within the maturity gate — cap how far past
+	// the committed frontier the forward scheduler prefetches, so peer bandwidth
+	// focuses on the frontier block (already raced by checkHeadStall/addRacerForHead)
+	// instead of buying un-committable successors.
+	//
+	// THE RESIDUAL THIS FIXES (measured live 2026-07-21): the span above is keyed on
+	// cachedBlockAssemblyHeight, NOT on the committed contiguous frontier. While
+	// committedFrontier+1 is stuck in flight the walk still reaches cached+maxBehind+N;
+	// those successors arrive, cannot commit (the in-order rule), pile into the park as
+	// strays (gateContiguousWindow), and when the park caps they are DROPPED ("park
+	// full; dropping stray") and re-fetched — ~150-204/hr of wasted multi-MB fetches
+	// that STEAL bandwidth from the raced frontier block, so even 3 raced peers crawl
+	// on it and committed freezes ~240-360s then bursts +27-49 when the gap finally fills.
+	//
+	// WHY IT WON'T STARVE PREFETCH (the feed-idle regression the reviewer hunts for):
+	//   - lead is FLOORED at calculateMaxInFlightBlocks() (the same dynamic in-flight
+	//     depth that bounds the window at :3578/:3664/:3681). For TINY blocks that floor
+	//     is large (up to maxInFlightBlocksCap=1024) so the clamp barely bites and the
+	//     deep tiny-block streaming the :472-497 tx-budget fix protects is preserved;
+	//     for FAT blocks it resolves to a small handful, so the clamp bites exactly
+	//     where the wasted multi-MB over-fetch and park-drop churn occur.
+	//   - it engages ONLY in the stranded-stray window (park non-empty, frontier not yet
+	//     parked, stray within the gate); at steady contiguous progress and during
+	//     NORMAL beyond-gate park-ahead (parkMin > cached+maxBehind) gapOpen is false.
+	//   - it is a MIN against the span above — it only ever NARROWS the horizon.
+	//
+	// GAP BLOCK STAYS FETCHABLE (no sync wedge): the horizon base is
+	// max(cached, lastHandedWindowEnd) — NOT raw cached, which is a stale-LOW lower
+	// bound (:5847-5851): lastHandedWindowEnd can run up to maxBehind ahead of cached,
+	// so a cached+lead base could push the true gap block (lastHandedWindowEnd+1) ABOVE
+	// the horizon and make drainRefetchBlocks skip it (:3925 ht>horizon), deadlocking
+	// commit. With lead>=1 the horizon is >= committedFrontier+1, so the gap block is
+	// always requestable; only its SUCCESSORS beyond committedFrontier+lead are throttled.
+	//
+	// legacy_frontierLeadClamp == 0 short-circuits this whole block, leaving the
+	// three-branch span and the final `return cached + span, true` byte-identical.
+	if sm.settings.Legacy.FrontierLeadClamp > 0 && park != nil {
+		if parkMin, ok := park.minHeight(); ok {
+			committedFrontier := cached
+			if sm.lastHandedWindowEnd > committedFrontier {
+				committedFrontier = sm.lastHandedWindowEnd
+			}
+
+			// Gap is OPEN iff the next-needed block committedFrontier+1 is MISSING from
+			// the park (parkMin above it) AND the stranded parked block is WITHIN the
+			// maturity gate (parkMin <= cached+maxBehind) — a contiguity stray
+			// releaseParkedBlocks cannot free because the block below it is missing. The
+			// ceiling clause distinguishes this residual from legitimate deep park-ahead
+			// (parkMin > cached+maxBehind), which must stay permissive so peers stay fed.
+			gapOpen := committedFrontier+1 < parkMin && parkMin <= cached+uint32(maxBehind) //nolint:gosec // maxBehind>0
+
+			if gapOpen {
+				lead := uint32(sm.settings.Legacy.FrontierLeadClamp) //nolint:gosec // guarded > 0
+				if floor := sm.blockSizeTracker.calculateMaxInFlightBlocks(); floor > 0 && uint32(floor) > lead {
+					lead = uint32(floor) //nolint:gosec // floor guarded > 0
+				}
+
+				// MIN, not replace: apply only when it is strictly tighter than the span
+				// already computed, and only when committedFrontier+lead cannot overflow.
+				if committedFrontier <= math.MaxUint32-lead {
+					if clamped := committedFrontier + lead; clamped < cached+span {
+						return clamped, true
+					}
+				}
+			}
+		}
+	}
+
 	if cached > math.MaxUint32-span {
 		return 0, false
 	}
@@ -5772,6 +5842,30 @@ func (ps *parkStore) add(b *model.Block) {
 }
 
 func (ps *parkStore) len() int { return len(ps.entries) }
+
+// minHeight returns the lowest block height across all parked entries and true,
+// or (0,false) when the park is empty. It performs an explicit O(n) scan rather
+// than trusting entries[0], because at the point the fetch-runway clamp reads the
+// park (the refill tick, where maintainInFlightWindow runs BEFORE
+// releaseParkedBlocks) the slice is UNSORTED: it was last sorted by the PREVIOUS
+// tick's releaseParkedBlocks (sort.Slice) and gateContiguousWindow has appended
+// fresh strays (park.add) since, so entries[0] is not necessarily the minimum.
+// The scan is bounded by ParallelWindowMaxParkedBlocks and runs on the drain
+// goroutine only — negligible and lock-free (single-owner discipline).
+func (ps *parkStore) minHeight() (uint32, bool) {
+	if len(ps.entries) == 0 {
+		return 0, false
+	}
+
+	minH := ps.entries[0].block.Height
+	for i := 1; i < len(ps.entries); i++ {
+		if h := ps.entries[i].block.Height; h < minH {
+			minH = h
+		}
+	}
+
+	return minH, true
+}
 
 // claimWindowBlock records that the window pipeline owns this block (parked,
 // accumulated, or in an in-flight flush job). Nil-map-safe: ownership is a
