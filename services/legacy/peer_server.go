@@ -1197,7 +1197,7 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte, payl
 		// validator, never this read-loop, so peers keep downloading into the
 		// store. handled=false (flag off, no store, or a non-fatal write failure)
 		// falls through to the normal inline QueueBlock path below unchanged.
-		if sm.PersistArrivalAndDecouple(sp.ctx, *blockHash, buf, weight) {
+		if sm.PersistArrivalAndDecouple(sp.ctx, *blockHash, buf, weight, sp.Peer) {
 			return
 		}
 

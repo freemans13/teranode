@@ -242,6 +242,12 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		return err
 	}
 
+	// Download-to-disk: this block committed via the direct / checkpoint path, so
+	// clear its arrival self-expiry DAH (permanent) and advance the store janitor
+	// height, mirroring the window path's markDiskBlocksCommitted. A no-op off the
+	// downloadToDisk() gate, so the flag-off path is untouched.
+	sm.markDiskBlocksCommitted(ctx, []*model.Block{teranodeBlock})
+
 	// process any orphan transactions that are now valid in background
 	// this will also remove the transactions from the orphan pool.
 	// txHashes was pre-extracted above (before prepareSubtrees) so this

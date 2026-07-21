@@ -749,6 +749,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// ahead of the committed tip before fetch throttles (never drops). Only
 			// consulted when DownloadToDisk is on. Replaces the retired park cap.
 			DownloadToDiskMaxBlocksAhead: getInt("legacy_downloadToDiskMaxBlocksAhead", 288, alternativeContext...),
+			// Self-clean DAH window for arrival writes; defaults to the node-wide blob
+			// retention horizon so unused downloads expire on the same cadence. Only
+			// consulted when DownloadToDisk is on.
+			DownloadToDiskArrivalDAHWindow: getInt("legacy_downloadToDiskArrivalDAHWindow", int(globalBlockHeightRetention), alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

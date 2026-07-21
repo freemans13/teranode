@@ -718,7 +718,20 @@ type SyncManager struct {
 	// on the normal inline QueueBlock path rather than decoupled, so a block is never
 	// stranded on disk with no validator to pick it up.
 	validateFromDiskActive atomic.Bool
-	subtreeValidation      subtreevalidation.Interface
+	// diskValidateFails counts consecutive consensus-invalid validation failures per
+	// block hash on the download-to-disk in-order validator, keyed by block hash.
+	// It is the bounded-retry backstop for the delete-and-refetch recovery
+	// (recoverInvalidDiskBlock): the first diskValidateFailCap failures self-heal
+	// (delete the bad bytes + rotate the sync peer so an honest copy is fetched),
+	// but once a block has failed that many times across peer rotations it is treated
+	// as genuinely invalid — the bytes are left on disk and the walk halts — so a
+	// validation false-positive or an all-malicious peer set can never loop forever
+	// re-downloading the same block. Cleared per sync generation in resetHeaderState.
+	// Guarded by diskValidateFailsMu (a leaf lock touched only on the invalid-block
+	// path); never held across headerMu.
+	diskValidateFails   map[chainhash.Hash]int
+	diskValidateFailsMu sync.Mutex
+	subtreeValidation   subtreevalidation.Interface
 	blockValidation        blockvalidation.Interface
 	blockAssembly          blockassembly.ClientI
 	// cachedBlockAssemblyHeight holds the block-assembly CurrentHeight most
@@ -1174,6 +1187,14 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 	sm.assignedMu.Lock()
 	clear(sm.refetchBlocks)
 	sm.assignedMu.Unlock()
+
+	// A fresh sync generation discards the header list these hashes belonged to;
+	// reset the download-to-disk delete-and-refetch failure counts so a block that
+	// exhausted its retries in a previous generation gets a clean slate. Leaf lock,
+	// never taken across headerMu.
+	sm.diskValidateFailsMu.Lock()
+	clear(sm.diskValidateFails)
+	sm.diskValidateFailsMu.Unlock()
 
 	// Re-align the header-request look-ahead cursor with the block-level
 	// checkpoint tracker on a fresh sync/recovery. From here they may diverge
@@ -3090,20 +3111,37 @@ func (sm *SyncManager) handleBlockMsgWithWindow(bmsg *blockQueueMsg, wa *windowA
 	}
 
 	// Prepare exactly once: both the admit and the park paths need a prepared block.
-	prepared, prepErr := sm.prepareBlockForWindow(sm.ctx, peer, bmsg.blockHash, msgBlock, blockHeightUint32)
-	if prepErr != nil {
-		if errors.Is(prepErr, context.Canceled) || errors.IsContextError(prepErr) {
-			return blockAdmitDirect, nil
+	// Under download-to-disk (Stage C) the heavy prepare has ALREADY been run off the
+	// drain goroutine by diskPrepareWorker and handed in via bmsg.prepared; use it
+	// verbatim so the drain/fetch goroutine never pays the prepare cost for a giant
+	// block. The pre-prepared block is only ever supplied on the in-order disk
+	// validator's feed path, and only for blocks that reach this point (window-add
+	// path: legacyUnified && !checkpoint), so the height it was prepared at is the
+	// same authoritative header-chain height blockHeightUint32 resolves to here. When
+	// bmsg.prepared is nil (every arrival-queue and direct path) this falls back to
+	// the identical inline prepareBlockForWindow — byte-identical to before.
+	var prepared *model.Block
+
+	if bmsg.prepared != nil {
+		prepared = bmsg.prepared
+	} else {
+		var prepErr error
+
+		prepared, prepErr = sm.prepareBlockForWindow(sm.ctx, peer, bmsg.blockHash, msgBlock, blockHeightUint32)
+		if prepErr != nil {
+			if errors.Is(prepErr, context.Canceled) || errors.IsContextError(prepErr) {
+				return blockAdmitDirect, nil
+			}
+
+			serviceError := errors.Is(prepErr, errors.ErrServiceError) || errors.Is(prepErr, errors.ErrStorageError)
+			if !catchingBlocks && !serviceError {
+				peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &bmsg.blockHash, false)
+			}
+
+			sm.logger.Errorf("[handleBlockMsgWithWindow][%s] prepareBlockForWindow failed: %v", bmsg.blockHash, prepErr)
+
+			return blockAdmitDirect, prepErr
 		}
-
-		serviceError := errors.Is(prepErr, errors.ErrServiceError) || errors.Is(prepErr, errors.ErrStorageError)
-		if !catchingBlocks && !serviceError {
-			peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &bmsg.blockHash, false)
-		}
-
-		sm.logger.Errorf("[handleBlockMsgWithWindow][%s] prepareBlockForWindow failed: %v", bmsg.blockHash, prepErr)
-
-		return blockAdmitDirect, prepErr
 	}
 
 	if parkThisBlock {
@@ -3334,14 +3372,14 @@ func (sm *SyncManager) PersistRawBlockOnArrival(ctx context.Context, hash chainh
 		return errors.NewStorageError("[persistRawBlockOnArrival] error creating block file for %s", hash.String(), err)
 	}
 
-	writeSucceeded := false
+	committed := false
 	defer func() {
-		if writeSucceeded {
-			if closeErr := storer.Close(ctx); closeErr != nil {
-				sm.logger.Warnf("[persistRawBlockOnArrival] error closing block file for %s: %v", hash.String(), closeErr)
-			}
-		} else {
-			storer.Abort(errors.NewProcessingError("[persistRawBlockOnArrival] block write failed for %s", hash.String()))
+		if !committed {
+			// Write OR Close failed: abandon the temp file so a partial/torn write
+			// never becomes visible. Abort is idempotent and safe to call after a
+			// failed Close (FileStorer.Abort docs), so it also cleans up the temp file
+			// left behind when the commit-rename below fails.
+			storer.Abort(errors.NewProcessingError("[persistRawBlockOnArrival] block write aborted for %s", hash.String()))
 		}
 	}()
 
@@ -3349,9 +3387,93 @@ func (sm *SyncManager) PersistRawBlockOnArrival(ctx context.Context, hash chainh
 		return errors.NewStorageError("[persistRawBlockOnArrival] error writing block %s to disk", hash.String(), err)
 	}
 
-	writeSucceeded = true
+	// Close performs the atomic temp->final rename that makes the block visible to
+	// Exists(). A failed Close (ENOSPC, a torn fsync, or any <=4KB block whose only
+	// write happens at Close) means the file never appeared — so we MUST surface the
+	// error rather than swallow it. PersistArrivalAndDecouple then returns
+	// handled=false and the caller falls back to the inline QueueBlock path,
+	// re-validating the bytes it still holds with no re-download. Invariant:
+	// this returning nil implies the block is durably on disk.
+	if err = storer.Close(ctx); err != nil {
+		return errors.NewStorageError("[persistRawBlockOnArrival] error committing block %s to disk", hash.String(), err)
+	}
+
+	committed = true
+
+	// Self-clean: tag the durable arrival write with a delete-at-height so a block
+	// that never commits self-expires. Best-effort — a lookup miss or store error
+	// just leaves the block without a DAH (today's arrival behaviour), never failing
+	// the write, which is already durable.
+	sm.setArrivalDAH(ctx, hash)
 
 	return nil
+}
+
+// setArrivalDAH tags a freshly-written arrival block with a Delete-At-Height so a
+// block that never commits self-expires — svnode's reaping of losing-fork /
+// download-ahead junk the chain has moved past. The DAH is the block's OWN header
+// height plus a modest window (legacy_downloadToDiskArrivalDAHWindow): the store's
+// janitor reaps the blob only once the committed chain passes that height, and
+// because the chain cannot pass a height without committing SOME block there, the
+// only blocks ever reaped are those whose height was filled by a DIFFERENT
+// (committed) block — orphans / losers. A block that DOES commit has its DAH
+// cleared to 0 (permanent) at commit (markDiskBlocksCommitted), so the retained
+// chain is byte-identical to today. Best-effort: a height-lookup miss (header not
+// in the index) or a store error just leaves the block without a DAH, exactly as
+// arrival writes behaved before this change; it never fails the (already durable)
+// write. Only reached under the downloadToDisk() gate via PersistRawBlockOnArrival.
+func (sm *SyncManager) setArrivalDAH(ctx context.Context, hash chainhash.Hash) {
+	window := sm.settings.Legacy.DownloadToDiskArrivalDAHWindow
+	if window <= 0 {
+		// Arrival DAH disabled: junk is removed only by delete-and-refetch recovery.
+		return
+	}
+
+	height, ok := sm.headerHeightForHash(hash)
+	if !ok || height < 0 {
+		// Height not resolvable from the headers-first index (e.g. a block that
+		// arrived without its header, or a unit harness with no index): leave it
+		// un-tagged rather than guess a DAH.
+		return
+	}
+
+	h, err := safeconversion.Int32ToUint32(height)
+	if err != nil {
+		return
+	}
+
+	w, err := safeconversion.IntToUint32(window)
+	if err != nil {
+		return
+	}
+
+	if h > math.MaxUint32-w {
+		// DAH would overflow — leave un-tagged (a height this large never occurs in
+		// practice; this only keeps the arithmetic safe).
+		return
+	}
+
+	dah := h + w
+	if derr := sm.mainBlockStore.SetDAH(ctx, hash[:], fileformat.FileTypeBlock, dah); derr != nil {
+		sm.logger.Debugf("[setArrivalDAH][%s] failed to set arrival DAH %d: %v", hash.String(), dah, derr)
+	}
+}
+
+// headerHeightForHash returns the authoritative headers-first height for a block
+// hash from headerHeightIndex, and whether it was found. It takes headerMu, so it
+// must never be called while that lock is held. Used by the download-to-disk
+// arrival write to anchor the self-expiry DAH on the block's own height.
+func (sm *SyncManager) headerHeightForHash(hash chainhash.Hash) (int32, bool) {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if sm.headerHeightIndex == nil {
+		return -1, false
+	}
+
+	h, ok := sm.headerHeightIndex[hash]
+
+	return h, ok
 }
 
 // haveBlockOnDisk reports whether the raw bytes for hash are already durable in
@@ -3430,7 +3552,7 @@ func (sm *SyncManager) PokeValidateFromDisk() {
 // caller acquired for this block; it is released here only on the decoupled
 // (handled=true) path. On the fall-through path the caller's normal
 // awaitBlockResult still owns and releases it.
-func (sm *SyncManager) PersistArrivalAndDecouple(ctx context.Context, hash chainhash.Hash, blockBytes []byte, weight int64) (handled bool) {
+func (sm *SyncManager) PersistArrivalAndDecouple(ctx context.Context, hash chainhash.Hash, blockBytes []byte, weight int64, deliveringPeer *peerpkg.Peer) (handled bool) {
 	if !sm.downloadToDisk() {
 		return false
 	}
@@ -3453,13 +3575,209 @@ func (sm *SyncManager) PersistArrivalAndDecouple(ctx context.Context, hash chain
 		return false
 	}
 
-	// Durable on disk and the validator is running: drop the RAM reservation and
-	// hand off to the async in-order validator, which picks the block up when its
-	// committed-tip-forward walk reaches this height.
+	// Durable on disk and the validator is running. The block's bytes are now on
+	// disk, so it must stop counting as "in flight": clear it from the fetch ledgers
+	// exactly as handleBlockPreamble does at delivery. On the decoupled path the
+	// block is NOT queued, so the preamble never runs and would otherwise leave the
+	// ledger entries set until the validator drained the block — gluing the gap-fill
+	// walk (fetchHeaderBlocks' currentInFlight = requestedBlocks.Len()) to validation
+	// speed instead of to open disk gaps, which is what makes
+	// legacy_downloadToDiskMaxBlocksAhead the real download-ahead bound. Ordering
+	// matters: the disk write already committed above, so any concurrent fetch walk
+	// that reads these ledgers also sees haveBlockOnDisk true and will not re-request
+	// the hash. Then drop the RAM reservation and hand off to the async in-order
+	// validator, which picks the block up when its committed-tip-forward walk reaches
+	// this height.
+	sm.clearInFlightOnArrival(hash, deliveringPeer)
 	sm.ReleaseBlockPrefetch(hash, weight)
 	sm.PokeValidateFromDisk()
 
 	return true
+}
+
+// clearInFlightOnArrival removes a block from every in-flight fetch ledger the
+// moment its bytes are durable on disk, mirroring handleBlockPreamble's
+// delivery-time clearing (the requestedBlocks / clearAssignment / refetchBlocks /
+// racer-sweep sequence around manager.go:2465) for the download-to-disk decoupled
+// arrival path — which never runs the preamble because it does not queue the
+// block. deliveringPeer is the wire peer that delivered the block (serverPeer.Peer);
+// it is resolved to its association primary exactly as the preamble resolves a
+// stream sub-peer. Every ledger it touches is internally synchronised (requestedBlocks
+// is an expiringmap RWMutex; assignedTo/refetchBlocks are guarded by assignedMu;
+// peerStates is a txmap.SyncedMap), so it is safe to run from the OnBlock read-loop
+// goroutine rather than the drain goroutine. Only reached under the downloadToDisk()
+// gate, so the flag-off path is untouched.
+func (sm *SyncManager) clearInFlightOnArrival(hash chainhash.Hash, deliveringPeer *peerpkg.Peer) {
+	// Resolve the delivering peer to its primary and clear its per-peer ledger. A nil
+	// peer (defensive; the wire callback always supplies one) skips the per-peer clear
+	// but still clears the global/assignment ledgers below.
+	var resolvedPeer *peerpkg.Peer
+
+	if deliveringPeer != nil {
+		state, resolved, exists := sm.peerStateResolvingPrimary(deliveringPeer)
+		resolvedPeer = resolved
+
+		if exists {
+			state.requestedBlocks.Delete(hash)
+		}
+	}
+
+	sm.requestedBlocks.Delete(hash)
+
+	sm.assignedMu.Lock()
+	racers := sm.clearAssignment(hash)
+	// The block has arrived on disk; it is no longer an orphan awaiting re-fetch.
+	delete(sm.refetchBlocks, hash)
+	sm.assignedMu.Unlock()
+
+	// Sweep every OTHER racer's per-peer ledger (multi-peer parallel fetch via
+	// assignBlocksAcrossPeers): when a racer's copy lands first, the original owner
+	// and any other racer are losers whose per-peer requestedBlocks still lists the
+	// hash. Mirrors the preamble's racer sweep. At clampedMax==1 racers holds at most
+	// the delivering peer, so this loop is a no-op.
+	for _, rp := range racers {
+		if rp == resolvedPeer {
+			continue
+		}
+
+		if st, ok := sm.peerStates.Get(rp); ok {
+			st.requestedBlocks.Delete(hash)
+		}
+	}
+}
+
+// diskValidateFailCap bounds the delete-and-refetch recovery: after a block has
+// failed consensus validation this many times on the in-order disk validator
+// (across sync-peer rotations, since each failure disconnects the current sync
+// peer), it is treated as genuinely invalid rather than re-downloaded again. Small
+// on purpose — an honest copy that differs from a malicious one normally arrives on
+// the first rotation; three identical failures is a genuinely-invalid block, not a
+// bad peer to keep churning.
+const diskValidateFailCap = 3
+
+// noteDiskValidateFailure records one consensus-invalid validation of hash on the
+// download-to-disk in-order validator and returns the running count. Lazily
+// initialises the map (the unit harness constructs SyncManager as a literal).
+// Guarded by diskValidateFailsMu.
+func (sm *SyncManager) noteDiskValidateFailure(hash chainhash.Hash) int {
+	sm.diskValidateFailsMu.Lock()
+	defer sm.diskValidateFailsMu.Unlock()
+
+	if sm.diskValidateFails == nil {
+		sm.diskValidateFails = make(map[chainhash.Hash]int)
+	}
+
+	sm.diskValidateFails[hash]++
+
+	return sm.diskValidateFails[hash]
+}
+
+// recoverInvalidDiskBlock self-heals after the in-order disk validator rejects an
+// on-disk block as consensus-invalid (BlockProcessingErrorIsPeerFault). Bounded
+// retry: for the first diskValidateFailCap distinct failures it
+//
+//	(a) DELETES the bad bytes from mainBlockStore so haveBlockOnDisk clears and the
+//	    gap-fill frontier re-requests the height from scratch,
+//	(b) clears every in-flight / assignment ledger entry for the hash so the block
+//	    is genuinely re-requestable (mirrors handleBlockPreamble's delivery-clear),
+//	(c) disconnects the current sync peer (the only peer the disk validator can
+//	    attribute — the walk reads bytes off disk, not from a live delivery) so the
+//	    pipeline rotates and the honest copy is fetched from a different source,
+//
+// and returns true (the caller returns, pausing the walk at this height; it resumes
+// when an honest copy lands). Once the cap is hit the same block has failed across
+// that many peer rotations, so it is treated as genuinely invalid: the bytes are
+// LEFT on disk (haveBlockOnDisk stays true, so the frontier stops re-requesting and
+// we stop churning bandwidth), the failure is logged loudly, and it returns false
+// (the caller halts the walk exactly as the pre-recovery code did). Either way
+// nothing invalid is ever committed — a gap can never be advanced past. Runs on the
+// single drain goroutine under the downloadToDisk() gate.
+func (sm *SyncManager) recoverInvalidDiskBlock(hash chainhash.Hash, height int32, sp *peerpkg.Peer, cause error) bool {
+	fails := sm.noteDiskValidateFailure(hash)
+	if fails >= diskValidateFailCap {
+		// Genuinely invalid: every fetched copy failed. Leave the bytes on disk so
+		// the frontier does not re-request them and halt the walk here. This is the
+		// original (pre-recovery) terminal behaviour, now reached only after
+		// diskValidateFailCap honest attempts rather than on the first failure.
+		sm.logger.Errorf("[drainValidateFromDisk][%s] on-disk block height %d failed validation %d times across peer rotations; treating as genuinely invalid, leaving on disk and halting walk: %v", hash, height, fails, cause)
+		return false
+	}
+
+	// Delete the bad bytes so haveBlockOnDisk clears and the frontier re-requests.
+	if derr := sm.mainBlockStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
+		sm.logger.Warnf("[drainValidateFromDisk][%s] failed to delete invalid on-disk block height %d: %v", hash, height, derr)
+	}
+
+	// Clear every in-flight / assignment ledger so the block is genuinely
+	// re-requestable, mirroring handleBlockPreamble's delivery-clear and
+	// clearInFlightOnArrival — but here the goal is the reverse: make the hash
+	// eligible for a fresh getdata, not retire it.
+	sm.requestedBlocks.Delete(hash)
+
+	sm.assignedMu.Lock()
+	racers := sm.clearAssignment(hash)
+	delete(sm.refetchBlocks, hash)
+	sm.assignedMu.Unlock()
+
+	for _, rp := range racers {
+		if st, ok := sm.peerStates.Get(rp); ok {
+			st.requestedBlocks.Delete(hash)
+		}
+	}
+
+	// Drop any lingering prefetch dedup entry (weight 0: the block's prefetch
+	// reservation was released at arrival-decouple; this only clears inFlightBlocks
+	// so a re-fetch is not rejected as a duplicate).
+	sm.ReleaseBlockPrefetch(hash, 0)
+
+	// Rotate the delivering (current sync) peer so the honest copy comes from a
+	// different source — the same escalation commitWindowJob uses on an
+	// unrecoverable commit. Idempotent (DisconnectWithWarning guards itself).
+	if sp != nil {
+		sp.DisconnectWithWarning(fmt.Sprintf("delivered consensus-invalid block %s at height %d (download-to-disk in-order validation); deleting and rotating sync peer to re-fetch: %v", hash, height, cause))
+	}
+
+	sm.logger.Warnf("[drainValidateFromDisk][%s] deleted invalid on-disk block height %d and rotated sync peer; will re-fetch (attempt %d/%d): %v", hash, height, fails, diskValidateFailCap, cause)
+
+	return true
+}
+
+// markDiskBlocksCommitted is the download-to-disk commit-finalize hook. For every
+// just-committed block it clears the arrival self-expiry DAH to 0 (permanent) —
+// exactly as block_persister marks processed data permanent — so the committed
+// chain is retained precisely as today and only un-committed / orphan blocks ever
+// expire. It also advances the store janitor's current-height notion to the highest
+// committed height so blocks below the tip whose DAH has lapsed become eligible for
+// reaping. Gated internally on downloadToDisk() so the flag-off path never calls
+// the store. Best-effort: a store error is logged, never fatal — the block is
+// already committed to the blockchain. Called from both commit-finalize points: the
+// window path (commitWindowJob success) and the direct / checkpoint path
+// (HandleBlockDirect success).
+func (sm *SyncManager) markDiskBlocksCommitted(ctx context.Context, blocks []*model.Block) {
+	if !sm.downloadToDisk() || len(blocks) == 0 {
+		return
+	}
+
+	var maxHeight uint32
+
+	for _, b := range blocks {
+		if b == nil {
+			continue
+		}
+
+		h := b.Hash()
+		if derr := sm.mainBlockStore.SetDAH(ctx, h[:], fileformat.FileTypeBlock, 0); derr != nil {
+			sm.logger.Debugf("[markDiskBlocksCommitted][%s] failed to clear DAH on commit: %v", h.String(), derr)
+		}
+
+		if b.Height > maxHeight {
+			maxHeight = b.Height
+		}
+	}
+
+	// Below-checkpoint commits are strictly ascending, so maxHeight is monotonic
+	// across calls; drive the janitor height so lapsed junk below the tip is reaped.
+	sm.mainBlockStore.SetCurrentBlockHeight(maxHeight)
 }
 
 // maxInFlightPerPeer returns the per-peer in-flight block ceiling used by every
@@ -6070,6 +6388,16 @@ type blockQueueMsg struct {
 	blockHeight int32
 	peer        *peerpkg.Peer
 	reply       chan error
+
+	// prepared, when non-nil, is a block whose heavy prepareBlockForWindow pass
+	// (subtree extend/write, the ~tens-of-seconds body for a giant block) has
+	// ALREADY been run off the drain goroutine by the download-to-disk prepare
+	// worker (diskPrepareWorker). handleBlockMsgWithWindow then uses it verbatim
+	// instead of calling prepareBlockForWindow inline, so the drain/fetch goroutine
+	// never pays the prepare cost. Only ever set on the download-to-disk in-order
+	// validator's feed path (Stage C); nil everywhere else, so the arrival-queue and
+	// direct paths are byte-identical.
+	prepared *model.Block
 }
 
 // windowEntry holds a prepared block ready for ProcessBlockWindow. The
@@ -6440,6 +6768,109 @@ type windowFlushJob struct {
 	done chan struct{}
 }
 
+// diskPrepareReq is one unit of heavy prepare work handed from the drain goroutine
+// to the download-to-disk prepare worker (diskPrepareWorker). It carries only
+// value/immutable data (a hash, the authoritative header-chain height, and the
+// current sync peer for logging) — never a pointer into drain-owned mutable state
+// — so the worker races nothing the drain owns. The worker reads the block bytes
+// back from disk itself (readRawBlockFromDisk), so the request stays tiny.
+type diskPrepareReq struct {
+	hash   chainhash.Hash
+	height int32
+	peer   *peerpkg.Peer
+}
+
+// diskPrepared is the result the prepare worker hands back to the drain goroutine
+// for exactly one diskPrepareReq. It is immutable once sent and is consumed only by
+// the drain goroutine (single-slot, one prepare in flight at a time), so there is no
+// shared-mutable-state race: the channel send/receive is the whole synchronisation.
+// msgBlock is the wire block the worker read from disk (the drain needs it for the
+// header/checkpoint bookkeeping in handleBlockMsgWithWindow); prepared is the output
+// of prepareBlockForWindow (nil on error); err carries a read or prepare failure,
+// classified by the drain exactly as the inline path classified it
+// (BlockProcessingErrorIsPeerFault -> delete-and-refetch, else transient retry).
+type diskPrepared struct {
+	hash     chainhash.Hash
+	height   int32
+	msgBlock *wire.MsgBlock
+	prepared *model.Block
+	err      error
+}
+
+// prepareDiskBlock is the heavy body the download-to-disk validator runs OFF the
+// drain/fetch goroutine: it reads the raw block back from disk and runs the full
+// prepareBlockForWindow pass (subtree partition/extend/write + the stateless
+// PoW/merkle/CVE-2012-2459 checks). It touches ONLY concurrency-safe stores (the
+// blob block store via readRawBlockFromDisk, the subtree/UTXO stores via
+// prepareBlockForWindow->prepareSubtrees) and immutable settings/logger — never the
+// drain-goroutine-owned header list, window accumulator, park, checkpoint or fetch
+// ledgers — so it is safe to run concurrently with the drain goroutine. The result
+// is returned by value for the drain to act on; no consensus decision is made here.
+func (sm *SyncManager) prepareDiskBlock(ctx context.Context, req diskPrepareReq) *diskPrepared {
+	res := &diskPrepared{hash: req.hash, height: req.height}
+
+	msgBlock, readErr := sm.readRawBlockFromDisk(ctx, req.hash)
+	if readErr != nil {
+		res.err = readErr
+		return res
+	}
+
+	res.msgBlock = msgBlock
+
+	heightU32, convErr := safeconversion.Int32ToUint32(req.height)
+	if convErr != nil {
+		res.err = convErr
+		return res
+	}
+
+	// prepareBlockForWindow is the identical prepare the inline path ran; running it
+	// here changes only the goroutine it executes on, not what it computes. The
+	// height is the walk's authoritative header-chain height — the same value the
+	// preamble re-derives on the drain when it feeds the prepared block (a matching
+	// frontier hash on re-entry guarantees the same header generation, hence the same
+	// height), so the prepared block's height can never disagree with the fed height.
+	prepared, prepErr := sm.prepareBlockForWindow(ctx, req.peer, req.hash, msgBlock, heightU32)
+	res.prepared = prepared
+	res.err = prepErr
+
+	return res
+}
+
+// diskPrepareWorker is the dedicated goroutine that decouples the download-to-disk
+// validator's heavy prepare from the drain/fetch goroutine (Stage C). It runs ONLY
+// while download-to-disk + the window path are active; off the gate it is never
+// started and its channels are nil (byte-identical flag-off). It owns no drain
+// state: it consumes diskPrepareReq values, runs prepareDiskBlock (disk read +
+// prepare), and hands the result back on readyC. The drain goroutine keeps every
+// header/window/checkpoint bookkeeping DECISION — it selects which block to prepare
+// (under headerMu), feeds the prepared block into handleBlockMsgWithWindow, and
+// commits through the existing single poison-latched flush worker — so all consensus
+// invariants (strict-ascending in-order commit, checkpoint routing,
+// waitForPreviousBlockMined, authoritative header-height resolution) stay exactly
+// where they were. Only one prepare is ever in flight (the drain dispatches the next
+// only after feeding the current), so ordering is identical to the old inline walk.
+// Exits promptly on ctx.Done()/sm.quit.
+func (sm *SyncManager) diskPrepareWorker(ctx context.Context, reqC <-chan diskPrepareReq, readyC chan<- *diskPrepared) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sm.quit:
+			return
+		case req := <-reqC:
+			res := sm.prepareDiskBlock(ctx, req)
+
+			select {
+			case readyC <- res:
+			case <-ctx.Done():
+				return
+			case <-sm.quit:
+				return
+			}
+		}
+	}
+}
+
 // drainJob drains and resets the accumulator, sorts the drained blocks ascending
 // by height, and returns them as a windowFlushJob. It returns ok=false (and an
 // empty job) when the accumulator holds no blocks. It runs on the drain
@@ -6532,7 +6963,10 @@ func (sm *SyncManager) commitWindowJob(ctx context.Context, job windowFlushJob) 
 
 	err := sm.blockValidation.ProcessBlockWindow(flushCtx, blocks, "", "legacy")
 	if err == nil {
-		// Success: acks were already sent at accept-time, nothing to do here.
+		// Success: acks were already sent at accept-time. Under download-to-disk,
+		// clear each committed block's arrival self-expiry DAH (permanent) and
+		// advance the store janitor height; a no-op off the gate.
+		sm.markDiskBlocksCommitted(ctx, blocks)
 		return false
 	}
 
@@ -7033,6 +7467,21 @@ func (sm *SyncManager) blockHandler() {
 		var flushTimer *time.Timer
 		var jobs chan windowFlushJob
 
+		// Download-to-disk prepare-worker plumbing (Stage C). These stay nil unless
+		// the download-to-disk in-order validator is active (assigned in the gate
+		// block below), so the flag-off select is byte-identical. diskPrepareReqC
+		// hands one block's heavy prepare to the worker; diskPreparedReadyC returns
+		// the result. Both are drain<->worker message-passing only. diskReady holds a
+		// completed-but-not-yet-fed result (single slot: only one prepare is ever in
+		// flight); diskPrepareInFlight tracks whether a request is outstanding so the
+		// walk never double-dispatches. ALL of these are touched ONLY by this drain
+		// goroutine (the worker only reads diskPrepareReqC and writes
+		// diskPreparedReadyC), so they need no lock.
+		var diskPrepareReqC chan diskPrepareReq
+		var diskPreparedReadyC chan *diskPrepared
+		var diskReady *diskPrepared
+		var diskPrepareInFlight bool
+
 		if windowEnabled {
 			budget := windowBudgetBytes(windowFraction)
 			// The window's block-count cap can be set BELOW the maturity ceiling
@@ -7182,25 +7631,113 @@ func (sm *SyncManager) blockHandler() {
 			}
 		}
 
-		// drainValidateFromDisk is the download-to-disk async in-order validator
-		// (svnode's async ActivateBestChain, np.cpp:4077-4093 + validation.cpp:
-		// 4229-4238 ConnectTip-reads-from-disk). It runs on THIS single drain
-		// goroutine, so it never races the header/fetch/park state that
-		// handleBlockMsgWithWindow mutates — yet it is decoupled from block DOWNLOAD:
-		// OnBlock writes each block to disk and pokes, never waiting on prepare/commit,
-		// so a giant block ties up only this walk while peers keep filling the store.
+		// feedDiskBlock feeds one on-disk block through the EXISTING
+		// handleBlockMsgWithWindow (reusing every consensus check — already-committed
+		// guard, checkpoint direct-routing, deferredCheckpoint, strict-ascending
+		// single-worker poison-latched commit) and drives the same flush/back-pressure
+		// the arrival drain drives. bmsg.prepared may already carry the off-goroutine
+		// prepared block (async path) or be nil (sync path — handleBlockMsgWithWindow
+		// prepares inline). It returns stop=true when the walk must pause/halt after
+		// this block (a peer-fault delete-and-refetch, or a tolerated-failure requeue).
+		// Runs on the drain goroutine only. Byte-identical in effect to Stage B's inline
+		// switch — only where prepare executed changed.
+		feedDiskBlock := func(bmsg *blockQueueMsg, sp *peerpkg.Peer) (stop bool) {
+			hash := bmsg.blockHash
+			height := bmsg.blockHeight
+
+			outcome, herr := sm.handleBlockMsgWithWindow(bmsg, wa, flushWindow, flushWindowSync, park)
+
+			switch outcome {
+			case blockAdmitParked:
+				// Parked ahead of block assembly (rare here — the maturity gate normally
+				// stops us first). The block is window-owned now, so the next iteration
+				// skips it. No reply/backlog on the disk path.
+				return false
+			case blockAdmitWindowed:
+				// Added to the window accumulator; drive the same flush/back-pressure the
+				// arrival drain drives (reply is nil on the disk path).
+				sm.ackWindowedBlock(nil, wa, flushWindow, armTimer, stopTimer)
+				return false
+			default: // blockAdmitDirect (already-committed, checkpoint, or a failure)
+				if herr != nil {
+					if BlockProcessingErrorIsPeerFault(herr) {
+						// A consensus-invalid block on disk (a checkpoint/non-unified block
+						// rejected by HandleBlockDirect — the async prepare path routes its own
+						// prepare peer-faults before ever reaching here). Advancing past it would
+						// gap the chain, so the walk pauses here regardless (nothing invalid is
+						// ever committed). recoverInvalidDiskBlock self-heals within a bounded
+						// retry: delete the bad bytes so the gap-fill frontier re-requests an
+						// honest copy, clear its in-flight ledgers, and rotate the sync peer so
+						// the re-fetch comes from a different source; once the same block has
+						// failed diskValidateFailCap times across rotations it is treated as
+						// genuinely invalid (left on disk, logged loudly) instead of churning.
+						sm.recoverInvalidDiskBlock(hash, height, sp, herr)
+						return true
+					}
+
+					// Tolerated failure (transient service/storage error). The preamble
+					// already removed this block's header node, so a re-walk cannot re-find
+					// it; re-enqueue the in-hand bytes onto the drain for the normal inline
+					// retry (its preamble resolves height via the restored headerHeightIndex
+					// fallback) instead of re-downloading. bmsg.prepared (if set) rides along,
+					// so the requeued retry reuses the already-prepared block.
+					if sm.blockBacklog.Add(1) == 1 {
+						sm.noteBacklogProgress()
+					}
+
+					select {
+					case blockQueue <- bmsg:
+					case <-sm.quit:
+						sm.blockBacklog.Add(-1)
+					case <-sm.ctx.Done():
+						sm.blockBacklog.Add(-1)
+					default:
+						// blockQueue full: drop the fast retry; the rotation/header-reset
+						// backstop still recovers it (no re-download — the bytes stay on disk).
+						sm.blockBacklog.Add(-1)
+						sm.logger.Debugf("[drainValidateFromDisk][%s] blockQueue full, deferring retry to backstop", hash)
+					}
+
+					flushWindow()
+
+					return true
+				}
+
+				// Direct success (already-committed re-delivery, or a checkpoint block
+				// committed via HandleBlockDirect). Its front node was consumed by the
+				// preamble, so the walk advances; flush any pending window as the arrival
+				// drain does on the direct path.
+				flushWindow()
+
+				return false
+			}
+		}
+
+		// drainValidateFromDisk is the download-to-disk in-order validator (svnode's
+		// async ActivateBestChain, np.cpp:4077-4093 + validation.cpp:4229-4238
+		// ConnectTip-reads-from-disk). It is decoupled from block DOWNLOAD (OnBlock
+		// writes each block to disk and pokes, never waiting on prepare/commit) AND —
+		// Stage C — from the drain/fetch goroutine's SCHEDULING: the heavy
+		// prepareBlockForWindow body (subtree extend/write, tens of seconds for a
+		// 123k-tx block) runs on the dedicated diskPrepareWorker goroutine, so a giant
+		// block ties up ONLY the validator, never the fetch/header scheduler.
 		//
-		// It walks the authoritative PoW-verified header chain from the download
-		// frontier (lowest uncommitted header) upward and feeds each header whose raw
-		// block is on disk, and is within the block-assembly maturity gate, through the
-		// EXISTING handleBlockMsgWithWindow — reusing every consensus check
-		// (already-committed guard, checkpoint direct-routing, deferredCheckpoint,
-		// strict-ascending single-worker poison-latched commit). It stops at the first
-		// header whose block is not yet on disk (an out-of-order gap: those blocks sit
-		// durably on disk, unbounded, never dropped — svnode's mapBlocksUnlinked — and
-		// are picked up the instant the walk reaches them on a later poke) or beyond the
-		// maturity gate (left on disk until block assembly advances — svnode's lower
-		// download window). Only ever called from this goroutine.
+		// This closure keeps EVERY header/window/checkpoint bookkeeping DECISION on the
+		// drain goroutine: it walks the authoritative PoW-verified header chain from the
+		// download frontier (lowest uncommitted header) upward under headerMu, and for
+		// each header whose raw block is on disk and within the block-assembly maturity
+		// gate it either (a) dispatches the heavy prepare to the worker and yields — the
+		// drain is then free to service refillC/headersQueue while the prepare runs — or
+		// (b) once the worker returns the prepared block, feeds it into the EXISTING
+		// handleBlockMsgWithWindow (which skips its inline prepare and does only the fast
+		// preamble + wa.add + flush hand-off). Only ONE prepare is ever in flight (the
+		// next is dispatched only after the current is fed), so the commit ORDER is
+		// strict-ascending and identical to the old inline walk. Checkpoint / non-unified
+		// blocks (which handleBlockMsgWithWindow routes direct, never through
+		// prepareBlockForWindow) skip the worker and are fed synchronously — rare and
+		// already fast. It stops at the first header whose block is not yet on disk (an
+		// out-of-order gap, picked up on a later poke) or beyond the maturity gate. Only
+		// ever called from this drain goroutine.
 		drainValidateFromDisk := func() {
 			if !sm.downloadToDisk() || !windowEnabled || wa == nil {
 				return
@@ -7215,8 +7752,8 @@ func (sm *SyncManager) blockHandler() {
 			havePrev := false
 
 			for fed := 0; fed < maxValidateFromDiskPerPass; fed++ {
-				// Keep shutdown prompt: a long run of heavy prepares must still yield to
-				// sm.quit between blocks.
+				// Keep shutdown prompt: a long run must still yield to sm.quit between
+				// blocks.
 				select {
 				case <-sm.quit:
 					return
@@ -7224,11 +7761,13 @@ func (sm *SyncManager) blockHandler() {
 				}
 
 				// Pick the lowest uncommitted header not already owned by the window
-				// pipeline. handleBlockMsgWithWindow takes headerMu itself, so we must
-				// not hold it across the feed.
+				// pipeline, and note whether it is the checkpoint block (recognised by
+				// hash under headerMu, mirroring handleBlockPreamble). handleBlockMsgWithWindow
+				// takes headerMu itself, so we must not hold it across the feed.
 				sm.headerMu.Lock()
 				var hash chainhash.Hash
 				var height int32
+				var isCheckpoint bool
 				found := false
 
 				for e := sm.downloadFrontierAnchorLocked(); e != nil; e = e.Next() {
@@ -7243,6 +7782,7 @@ func (sm *SyncManager) blockHandler() {
 
 					hash = *node.hash
 					height = node.height
+					isCheckpoint = sm.nextCheckpoint != nil && node.hash.IsEqual(sm.nextCheckpoint.Hash)
 					found = true
 
 					break
@@ -7255,7 +7795,8 @@ func (sm *SyncManager) blockHandler() {
 
 				// Forward-progress guard: the same header selected twice in a row means
 				// the last feed neither committed the block, marked it owned, nor removed
-				// its front node. Stop rather than spin.
+				// its front node. Stop rather than spin. (A block awaiting its async prepare
+				// returns below before setting prevHash, so this never trips on it.)
 				if havePrev && hash.IsEqual(&prevHash) {
 					return
 				}
@@ -7279,6 +7820,99 @@ func (sm *SyncManager) blockHandler() {
 					}
 				}
 
+				// asyncEligible mirrors EXACTLY the condition under which
+				// handleBlockMsgWithWindow reaches prepareBlockForWindow (the window-add
+				// path): a unified, non-checkpoint block. Checkpoint and non-unified blocks
+				// take the direct branch there (HandleBlockDirect, no prepareBlockForWindow),
+				// so pre-preparing them off-goroutine would be wasted work and a new failure
+				// surface — feed them synchronously instead. The worker must also be wired
+				// (diskPrepareReqC != nil, i.e. the gate is active).
+				asyncEligible := diskPrepareReqC != nil && !isCheckpoint
+				if asyncEligible {
+					if h, convErr := safeconversion.Int32ToUint32(height); convErr != nil || !sm.legacyUnified(h) {
+						asyncEligible = false
+					}
+				}
+
+				if asyncEligible {
+					// Async prepare path. Three cases, keyed on the single in-flight slot:
+					if diskReady != nil && diskReady.hash.IsEqual(&hash) {
+						// (1) The worker finished preparing THIS block: consume and feed it.
+						res := diskReady
+						diskReady = nil
+						diskPrepareInFlight = false
+
+						if res.err != nil {
+							if BlockProcessingErrorIsPeerFault(res.err) {
+								// Consensus-invalid (bad PoW/merkle/CVE-2012-2459 in prepare). The
+								// header node is still present (prepare ran BEFORE the preamble), so
+								// recoverInvalidDiskBlock's delete-and-refetch leaves the frontier able
+								// to re-request an honest copy; the walk then pauses at this gap.
+								sm.recoverInvalidDiskBlock(hash, height, sp, res.err)
+								return
+							}
+
+							// Transient read/prepare failure: leave the bytes and the header node in
+							// place and retry on the next arrival/refill poke, exactly as the inline
+							// readRawBlockFromDisk error path did. No requeue (the node was never
+							// consumed), no self-repoke (avoid spinning on a persistent store error).
+							sm.logger.Warnf("[drainValidateFromDisk][%s] async prepare failed height %d, will retry: %v", hash, height, res.err)
+							return
+						}
+
+						bmsg := &blockQueueMsg{
+							block:       res.msgBlock,
+							blockHash:   hash,
+							blockHeight: height,
+							peer:        sp,
+							prepared:    res.prepared,
+						}
+
+						if feedDiskBlock(bmsg, sp) {
+							return
+						}
+
+						prevHash = hash
+						havePrev = true
+
+						continue
+					}
+
+					if diskReady != nil {
+						// (2) A stale ready result for a DIFFERENT hash (e.g. a header reset
+						// changed the frontier under a completed prepare). Discard it and fall
+						// through to (re-)dispatch for the current frontier hash.
+						diskReady = nil
+						diskPrepareInFlight = false
+					}
+
+					if diskPrepareInFlight {
+						// (3a) A prepare is already running. If it is for THIS hash, wait for it
+						// (its completion pokes the validator and re-enters this walk). If it is a
+						// stale in-flight hash (post-reset), we cannot cancel it; wait for it to
+						// finish so its result frees the slot, then this walk re-dispatches. Either
+						// way, yield now — the drain stays free for fetch/headers meanwhile.
+						return
+					}
+
+					// (3b) Nothing prepared or in flight for this block: dispatch the heavy
+					// prepare to the worker and yield. Non-blocking (the in-flight guard means
+					// the buffered(1) request channel is empty), sm.quit-guarded so it can
+					// never wedge on shutdown.
+					select {
+					case diskPrepareReqC <- diskPrepareReq{hash: hash, height: height, peer: sp}:
+						diskPrepareInFlight = true
+					case <-sm.quit:
+					default:
+					}
+
+					return
+				}
+
+				// Synchronous path: checkpoint / non-unified block (or the worker is not
+				// wired). Read the bytes here and feed inline, exactly as Stage B did — these
+				// take handleBlockMsgWithWindow's direct branch, which never runs
+				// prepareBlockForWindow, so there is nothing heavy to offload.
 				msgBlock, readErr := sm.readRawBlockFromDisk(sm.ctx, hash)
 				if readErr != nil {
 					// Corrupt/unreadable on disk: leave it for the next tick; a persistent
@@ -7294,65 +7928,24 @@ func (sm *SyncManager) blockHandler() {
 					peer:        sp,
 				}
 
-				outcome, herr := sm.handleBlockMsgWithWindow(bmsg, wa, flushWindow, flushWindowSync, park)
-
-				switch outcome {
-				case blockAdmitParked:
-					// Parked ahead of block assembly (rare here — the gate check above
-					// normally stops us first). The block is window-owned now, so the next
-					// iteration skips it. No reply/backlog on the disk path.
-				case blockAdmitWindowed:
-					// Added to the window accumulator; drive the same flush/back-pressure
-					// the arrival drain drives (reply is nil on the disk path).
-					sm.ackWindowedBlock(nil, wa, flushWindow, armTimer, stopTimer)
-				default: // blockAdmitDirect (already-committed, checkpoint, or a failure)
-					if herr != nil {
-						if BlockProcessingErrorIsPeerFault(herr) {
-							// A consensus-invalid block on disk. Advancing past it would gap
-							// the chain, so halt the walk (nothing invalid is committed) and log
-							// loudly; this should not happen because the stateless PoW gate ran
-							// on arrival.
-							sm.logger.Errorf("[drainValidateFromDisk][%s] peer-fault validating on-disk block height %d; halting walk: %v", hash, height, herr)
-							return
-						}
-
-						// Tolerated failure (transient service/storage error). The preamble
-						// already removed this block's header node, so a re-walk cannot re-find
-						// it; re-enqueue the in-hand bytes onto the drain for the normal inline
-						// retry (its preamble resolves height via the restored
-						// headerHeightIndex fallback) instead of re-downloading.
-						if sm.blockBacklog.Add(1) == 1 {
-							sm.noteBacklogProgress()
-						}
-
-						select {
-						case blockQueue <- bmsg:
-						case <-sm.quit:
-							sm.blockBacklog.Add(-1)
-						case <-sm.ctx.Done():
-							sm.blockBacklog.Add(-1)
-						default:
-							// blockQueue full: drop the fast retry; the rotation/header-reset
-							// backstop still recovers it (no re-download — the bytes stay on disk).
-							sm.blockBacklog.Add(-1)
-							sm.logger.Debugf("[drainValidateFromDisk][%s] blockQueue full, deferring retry to backstop", hash)
-						}
-
-						flushWindow()
-
-						return
-					}
-
-					// Direct success (already-committed re-delivery, or a checkpoint block
-					// committed via HandleBlockDirect). Its front node was consumed by the
-					// preamble, so the walk advances; flush any pending window as the arrival
-					// drain does on the direct path.
-					flushWindow()
+				if feedDiskBlock(bmsg, sp) {
+					return
 				}
 
 				prevHash = hash
 				havePrev = true
 			}
+
+			// Reaching here means the loop exhausted its per-pass cap
+			// (maxValidateFromDiskPerPass) rather than running out of on-disk or mature
+			// blocks — every "no more work" exit above is a return, so this line is only
+			// hit when fed == maxValidateFromDiskPerPass. More on-disk work likely
+			// remains, so self re-poke (non-blocking, coalescing) instead of waiting for
+			// the next arrival or refill tick: continuation must not depend on the refill
+			// ticker, which is disabled when legacy_inFlightRefillInterval=0. When no work
+			// actually remains the next pass finds nothing (found=false) and returns
+			// without re-poking, so this self-terminates rather than spins.
+			sm.PokeValidateFromDisk()
 		}
 
 		// The in-order validator is live only while the window path is enabled under
@@ -7364,6 +7957,18 @@ func (sm *SyncManager) blockHandler() {
 		if sm.downloadToDisk() && windowEnabled {
 			sm.validateFromDiskActive.Store(true)
 			validateSignalC = sm.validateSignal
+
+			// Stage C: start the dedicated prepare worker and wire its channels. Both
+			// are buffered(1); only one prepare is ever in flight (the walk dispatches
+			// the next only after feeding the current), so neither ever blocks. The
+			// worker exits on sm.quit / ctx.Done. Only reached under the gate, so the
+			// flag-off path never starts a goroutine and leaves both channels nil (the
+			// diskPreparedReadyC select case below is a nil channel — never selected —
+			// byte-identical to before Stage C).
+			diskPrepareReqC = make(chan diskPrepareReq, 1)
+			diskPreparedReadyC = make(chan *diskPrepared, 1)
+
+			go sm.diskPrepareWorker(sm.ctx, diskPrepareReqC, diskPreparedReadyC)
 
 			defer sm.validateFromDiskActive.Store(false)
 		}
@@ -7447,6 +8052,15 @@ func (sm *SyncManager) blockHandler() {
 				// A block landed on disk (OnBlock poke). Run the in-order validator over
 				// the newly-contiguous on-disk prefix. nil channel off the gate, so this
 				// case never fires and the select is byte-identical when the flag is off.
+				drainValidateFromDisk()
+			case res := <-diskPreparedReadyC:
+				// Stage C: the prepare worker finished the heavy body for one block. Park
+				// the result in the drain-owned single slot and re-run the walk, which
+				// feeds it into handleBlockMsgWithWindow (the fast preamble + wa.add +
+				// flush hand-off) and dispatches the next block's prepare. nil channel off
+				// the gate, so this case never fires (byte-identical flag-off). Only this
+				// drain goroutine ever writes diskReady, so no lock is needed.
+				diskReady = res
 				drainValidateFromDisk()
 			case hmsg := <-headersQueue:
 				// Runs on the SAME goroutine as block processing, so the shared
