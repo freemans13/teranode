@@ -100,10 +100,11 @@ type Server struct {
 	// Used for ephemeral data storage during processing
 	tempStore blob.Store
 
-	// mainBlockStore is the durable, hash-addressed block store (FileTypeBlock)
-	// used by the legacy_downloadToDisk arrival-write path. May be nil (feature
-	// off or no block store configured); every consumer is nil-safe.
-	mainBlockStore blob.Store
+	// downloadStore is the DEDICATED, transient download buffer (FileTypeBlock,
+	// keyed by legacy_downloadStore) used by the legacy_downloadToDisk arrival-write
+	// path — a separate blob.Store instance from the shared block store. May be nil
+	// (feature off or no download store configured); every consumer is nil-safe.
+	downloadStore blob.Store
 
 	// utxoStore manages the UTXO set
 	// Used for transaction validation and UTXO queries
@@ -165,7 +166,7 @@ func New(logger ulogger.Logger,
 		validationClient:    validationClient,
 		subtreeStore:        subtreeStore,
 		tempStore:           tempStore,
-		mainBlockStore:      blockStore,
+		downloadStore:       blockStore,
 		utxoStore:           utxoStore,
 		subtreeValidation:   subtreeValidation,
 		blockValidation:     blockValidation,
@@ -297,7 +298,7 @@ func (s *Server) Init(ctx context.Context) error {
 		s.utxoStore,
 		s.subtreeStore,
 		s.tempStore,
-		s.mainBlockStore,
+		s.downloadStore,
 		s.subtreeValidation,
 		s.blockValidation,
 		s.blockAssemblyClient,

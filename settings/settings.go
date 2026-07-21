@@ -753,6 +753,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// retention horizon so unused downloads expire on the same cadence. Only
 			// consulted when DownloadToDisk is on.
 			DownloadToDiskArrivalDAHWindow: getInt("legacy_downloadToDiskArrivalDAHWindow", int(globalBlockHeightRetention), alternativeContext...),
+			// Dedicated, transient download buffer for the download-to-disk path —
+			// a SEPARATE blob store instance from the shared blockstore. nil/empty
+			// = feature degrades off (downloadToDisk() nil-guards the store).
+			DownloadStore: getURL("legacy_downloadStore", "file://./data/legacy-download-blocks", alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

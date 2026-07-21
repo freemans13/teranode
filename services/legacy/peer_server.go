@@ -379,7 +379,7 @@ type server struct {
 	utxoStore         utxostore.Store
 	subtreeStore      blob.Store
 	tempStore         blob.Store
-	mainBlockStore    blob.Store
+	downloadStore     blob.Store
 	concurrentStore   *blob.ConcurrentBlob[chainhash.Hash]
 	subtreeValidation subtreevalidation.Interface
 	blockValidation   blockvalidation.Interface
@@ -1197,7 +1197,13 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte, payl
 		// validator, never this read-loop, so peers keep downloading into the
 		// store. handled=false (flag off, no store, or a non-fatal write failure)
 		// falls through to the normal inline QueueBlock path below unchanged.
-		if sm.PersistArrivalAndDecouple(sp.ctx, *blockHash, buf, weight, sp.Peer) {
+		// Pass BOTH the decoded block and the raw bytes: under streaming ingestion buf
+		// is nil (the read-loop never retained the payload), so the write serializes
+		// the *wire.MsgBlock straight to disk via an io.Pipe; on the non-streaming path
+		// buf is present and is used directly to avoid re-serializing. Either way the
+		// arrival write no longer depends on buf being non-nil, and the safety guard
+		// inside guarantees the block is only decoupled once it is durable on disk.
+		if sm.PersistArrivalAndDecouple(sp.ctx, *blockHash, msg, buf, weight, sp.Peer) {
 			return
 		}
 
@@ -3885,7 +3891,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		utxoStore:            utxoStore,
 		subtreeStore:         subtreeStore,
 		tempStore:            tempStore,
-		mainBlockStore:       blockStore,
+		downloadStore:        blockStore,
 		concurrentStore: blob.NewConcurrentBlob[chainhash.Hash](
 			tempStore,
 			blob_options.WithDeleteAt(10),

@@ -27,6 +27,7 @@ import (
 type Stores struct {
 	mainBlockPersisterStore     blob.Store
 	mainBlockStore              blob.Store
+	mainLegacyDownloadStore     blob.Store
 	mainBlockValidationClient   blockvalidation.Interface
 	mainBlockAssemblyClient     blockassembly.ClientI
 	mainP2PClient               p2p.ClientI
@@ -612,6 +613,51 @@ func (d *Stores) GetBlockStore(ctx context.Context, logger ulogger.Logger, appSe
 	return d.mainBlockStore, nil
 }
 
+// GetLegacyDownloadStore returns the DEDICATED, transient download buffer used by
+// the legacy_downloadToDisk arrival-write path. It is a SEPARATE blob.Store
+// instance from GetBlockStore's shared mainBlockStore — keyed by legacy_downloadStore
+// — so the full raw wire blocks it holds never collide with the COMPACT
+// FileTypeBlock block_persister writes to the shared store post-commit.
+//
+// Unlike GetBlockStore this is the MINIMAL construction: no blockchain client, no
+// block-height tracker channel, no external blob-deletion scheduler. The download
+// buffer self-manages deletion (Del on genuine commit + arrival DAH); DAH reaping
+// is internal to the file store, driven by SetCurrentBlockHeight (which the legacy
+// sync manager calls on commit). If legacy_downloadStore is unset/unparseable the
+// URL is nil and this returns a configuration error, which the caller treats as
+// non-fatal (the download-to-disk feature degrades off).
+func (d *Stores) GetLegacyDownloadStore(logger ulogger.Logger, appSettings *settings.Settings) (blob.Store, error) {
+	if d.mainLegacyDownloadStore != nil {
+		return d.mainLegacyDownloadStore, nil
+	}
+
+	downloadStoreURL := appSettings.Legacy.DownloadStore
+
+	if downloadStoreURL == nil {
+		return nil, errors.NewConfigurationError("legacy_downloadStore config not found")
+	}
+
+	var err error
+
+	hashPrefix := -2
+
+	if downloadStoreURL.Query().Get("hashPrefix") != "" {
+		hashPrefix, err = strconv.Atoi(downloadStoreURL.Query().Get("hashPrefix"))
+		if err != nil {
+			return nil, errors.NewConfigurationError("legacy_downloadStore hashPrefix config error", err)
+		}
+	}
+
+	d.mainLegacyDownloadStore, err = blob.NewStore(logger, downloadStoreURL,
+		options.WithHashPrefix(hashPrefix),
+		options.WithStoreType(storetypes.BLOCKSTORE))
+	if err != nil {
+		return nil, errors.NewServiceError("could not create legacy download store", err)
+	}
+
+	return d.mainLegacyDownloadStore, nil
+}
+
 // GetBlockPersisterStore returns the main block persister store instance. If the store hasn't been
 // initialized yet, it creates a new one using the configured URL from settings. This store is
 // specifically used for block persistence operations.
@@ -675,6 +721,7 @@ func (d *Stores) Cleanup() {
 	globalStoreMutex.Lock()
 	d.mainBlockPersisterStore = nil
 	d.mainBlockStore = nil
+	d.mainLegacyDownloadStore = nil
 	// closeStores now closes mainBlockchainStore (DC9); nil it here too so
 	// GetBlockchainStore constructs a fresh store on reuse instead of handing
 	// back a closed cached handle. The other closed singletons (block /

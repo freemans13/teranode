@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"math/rand/v2"
 	"net"
@@ -39,10 +40,10 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
-	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -696,16 +697,21 @@ type SyncManager struct {
 	validationClient validator.Interface
 	utxoStore        utxostore.Store
 	subtreeStore     blob.Store
-	// mainBlockStore is the durable, unbounded, hash-addressed block store
-	// (fileformat.FileTypeBlock) reused from the daemon (Stores.GetBlockStore) —
-	// svnode's blk?????.dat equivalent. Used only under the legacy_downloadToDisk
-	// gate; nil when the store is unconfigured or the feature is off, and every
-	// new code path is guarded on downloadToDisk() && mainBlockStore != nil so the
-	// flag-off path is byte-identical.
-	mainBlockStore blob.Store
+	// downloadStore is the DEDICATED, transient, hash-addressed download buffer
+	// (fileformat.FileTypeBlock) for legacy sync — a SEPARATE blob.Store instance
+	// from the shared mainBlockStore (daemon Stores.GetLegacyDownloadStore, keyed
+	// by legacy_downloadStore). It holds the full raw wire block on arrival and is
+	// svnode's blk?????.dat / mapBlocksUnlinked equivalent. Keeping it separate
+	// from mainBlockStore avoids colliding with the COMPACT FileTypeBlock that
+	// block_persister writes post-commit, and lets this buffer manage its own
+	// lifetime (Del on commit + arrival DAH). Used only under the
+	// legacy_downloadToDisk gate; nil when the store is unconfigured or the feature
+	// is off, and every new code path is guarded on downloadToDisk() &&
+	// downloadStore != nil so the flag-off path is byte-identical.
+	downloadStore blob.Store
 	// validateSignal is the download-to-disk "a block landed on disk" poke. The
 	// wire callback (serverPeer.OnBlock) sends on it (non-blocking, coalescing)
-	// after writing a block to mainBlockStore; the single drain goroutine wakes on
+	// after writing a block to downloadStore; the single drain goroutine wakes on
 	// it and runs the in-order validateFromDisk walk. Buffered(1) so a burst of
 	// arrivals collapses to one wake and no wakeup is ever lost. Created in New but
 	// only wired into the drain select and poked when downloadToDisk() is on, so
@@ -3377,65 +3383,103 @@ func (sm *SyncManager) svnodeAlignedFetch() bool {
 // downloadToDisk is the nil-safe master gate for the svnode-style
 // download-to-disk decoupling (legacy_downloadToDisk). It mirrors
 // svnodeAlignedFetch exactly. Every new write / read-back / frontier-skip
-// branch is additionally guarded on sm.mainBlockStore != nil so that a build
+// branch is additionally guarded on sm.downloadStore != nil so that a build
 // with the flag off — or with no block store configured — is byte-identical to
 // today's in-memory park/prefetch path.
 func (sm *SyncManager) downloadToDisk() bool {
-	return sm.settings != nil && sm.settings.Legacy.DownloadToDisk && sm.mainBlockStore != nil
+	return sm.settings != nil && sm.settings.Legacy.DownloadToDisk && sm.downloadStore != nil
 }
 
-// persistRawBlockOnArrival writes the raw serialized block bytes to the durable
-// mainBlockStore keyed by block hash (fileformat.FileTypeBlock), mirroring
-// block_persister's write exactly (services/blockpersister/persist_block.go).
-// This is svnode's AcceptBlock "Store to disk": the block is durable the moment
-// this returns, regardless of arrival order or validation state. It is
-// idempotent — a block already on disk (a re-arrival or a restart-recovered
-// block) short-circuits as a cheap no-op via NewFileStorer's ErrBlobAlreadyExists.
-// The caller must have passed the stateless gate (ban-check + requested) first.
-// Exported because the wire callback (serverPeer.OnBlock, package legacy) is the
-// arrival point; it is also directly unit-testable in the netsync package.
-func (sm *SyncManager) PersistRawBlockOnArrival(ctx context.Context, hash chainhash.Hash, blockBytes []byte) error {
-	if !sm.downloadToDisk() || len(blockBytes) == 0 {
+// PersistRawBlockOnArrival writes the raw serialized block to the durable
+// downloadStore keyed by block hash (fileformat.FileTypeBlock). This is svnode's
+// AcceptBlock "Store to disk": the block is durable the moment this returns,
+// regardless of arrival order or validation state. The caller must have passed the
+// stateless gate (ban-check + requested) first.
+//
+// The write does NOT depend on the caller still holding the raw wire bytes. Under
+// the big-block streaming-ingestion path the peer read-loop consumes the payload off
+// the wire WITHOUT retaining it (peer.go readMessageStreaming), so OnBlock hands us
+// blockBytes=nil and only the decoded *wire.MsgBlock. In that case we serialize the
+// block straight to disk through an io.Pipe: a goroutine serializes into the pipe
+// writer while SetFromReader drains the pipe reader into the store — no second
+// full-size buffer, and it works when blockBytes is nil (the case that used to make
+// the old len==0 guard silently "succeed" and then drop the block). When the caller
+// DOES still hold the exact wire bytes (the non-streaming readMessage path) we stream
+// those directly and skip re-serializing. Either way SetFromReader performs the
+// atomic temp->final rename, so the block is invisible to Exists() until fully
+// written; a failed durable commit surfaces as an error (not a silent success).
+//
+// Idempotent: a block already on disk (a re-arrival or a restart-recovered block)
+// short-circuits as a cheap no-op via the Exists pre-check. Exported because the wire
+// callback (serverPeer.OnBlock, package legacy) is the arrival point; it is also
+// directly unit-testable in the netsync package.
+//
+// Invariant: returning nil implies the block is durably on disk — this is
+// load-bearing for PersistArrivalAndDecouple's safety guard.
+func (sm *SyncManager) PersistRawBlockOnArrival(ctx context.Context, hash chainhash.Hash, msgBlock *wire.MsgBlock, blockBytes []byte) error {
+	if !sm.downloadToDisk() {
 		return nil
 	}
 
-	storer, err := filestorer.NewFileStorer(ctx, sm.logger, sm.settings, sm.mainBlockStore, hash[:], fileformat.FileTypeBlock)
+	// Idempotent short-circuit. Also essential for the streaming pipe path below: a
+	// block already present would make SetFromReader (AllowOverwrite=false) return
+	// before draining the pipe, blocking the serialize goroutine forever — so we must
+	// never hand SetFromReader an already-present key.
+	if exists, err := sm.downloadStore.Exists(ctx, hash[:], fileformat.FileTypeBlock); err == nil && exists {
+		return nil
+	}
+
+	// Choose the write source: the exact wire bytes when the caller still holds them
+	// (avoids re-serializing), otherwise a pipe fed by the decoded block (works when
+	// blockBytes is nil — the streaming-ingestion case). Nothing to persist if the
+	// caller supplied neither; PersistArrivalAndDecouple's safety guard then sees the
+	// block is absent (haveBlockOnDisk false) and falls back to the inline path, so
+	// the block is never dropped.
+	var reader io.ReadCloser
+
+	switch {
+	case len(blockBytes) > 0:
+		reader = io.NopCloser(bytes.NewReader(blockBytes))
+	case msgBlock != nil:
+		pr, pw := io.Pipe()
+
+		go func() {
+			// Serialize writes the exact wire serialization into the pipe writer.
+			// CloseWithError propagates a serialize error to the reader side so
+			// SetFromReader fails (and the safety guard falls back to inline) rather
+			// than storing a truncated block; on success CloseWithError(nil) closes
+			// the writer with EOF so SetFromReader sees a clean end-of-stream. The
+			// goroutine therefore always terminates: either Serialize returns and it
+			// closes the writer, or the reader side is closed below and the pending
+			// Write returns ErrClosedPipe.
+			pw.CloseWithError(msgBlock.Serialize(pw))
+		}()
+
+		reader = pr
+	default:
+		return nil
+	}
+
+	err := sm.downloadStore.SetFromReader(ctx, hash[:], fileformat.FileTypeBlock, reader, options.WithAllowOverwrite(false))
+
+	// Pipe hygiene: if SetFromReader returned early (an error before it fully drained
+	// the reader), the serialize goroutine could still be blocked in pw.Write. Closing
+	// the read half with the same error makes that pending Write return immediately, so
+	// the goroutine can never leak. A no-op on a clean success (the reader is already
+	// drained and closed) and skipped entirely on the bytes path (NopCloser, not a
+	// *io.PipeReader).
+	if pr, ok := reader.(*io.PipeReader); ok {
+		_ = pr.CloseWithError(err)
+	}
+
 	if err != nil {
 		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			// Already durable (re-arrival or restart-recovered) — nothing to do.
+			// Lost a race with a concurrent arrival of the same hash — already durable.
 			return nil
 		}
 
-		return errors.NewStorageError("[persistRawBlockOnArrival] error creating block file for %s", hash.String(), err)
-	}
-
-	committed := false
-	defer func() {
-		if !committed {
-			// Write OR Close failed: abandon the temp file so a partial/torn write
-			// never becomes visible. Abort is idempotent and safe to call after a
-			// failed Close (FileStorer.Abort docs), so it also cleans up the temp file
-			// left behind when the commit-rename below fails.
-			storer.Abort(errors.NewProcessingError("[persistRawBlockOnArrival] block write aborted for %s", hash.String()))
-		}
-	}()
-
-	if _, err = storer.Write(blockBytes); err != nil {
 		return errors.NewStorageError("[persistRawBlockOnArrival] error writing block %s to disk", hash.String(), err)
 	}
-
-	// Close performs the atomic temp->final rename that makes the block visible to
-	// Exists(). A failed Close (ENOSPC, a torn fsync, or any <=4KB block whose only
-	// write happens at Close) means the file never appeared — so we MUST surface the
-	// error rather than swallow it. PersistArrivalAndDecouple then returns
-	// handled=false and the caller falls back to the inline QueueBlock path,
-	// re-validating the bytes it still holds with no re-download. Invariant:
-	// this returning nil implies the block is durably on disk.
-	if err = storer.Close(ctx); err != nil {
-		return errors.NewStorageError("[persistRawBlockOnArrival] error committing block %s to disk", hash.String(), err)
-	}
-
-	committed = true
 
 	// Self-clean: tag the durable arrival write with a delete-at-height so a block
 	// that never commits self-expires. Best-effort — a lookup miss or store error
@@ -3453,9 +3497,10 @@ func (sm *SyncManager) PersistRawBlockOnArrival(ctx context.Context, hash chainh
 // janitor reaps the blob only once the committed chain passes that height, and
 // because the chain cannot pass a height without committing SOME block there, the
 // only blocks ever reaped are those whose height was filled by a DIFFERENT
-// (committed) block — orphans / losers. A block that DOES commit has its DAH
-// cleared to 0 (permanent) at commit (markDiskBlocksCommitted), so the retained
-// chain is byte-identical to today. Best-effort: a height-lookup miss (header not
+// (committed) block — orphans / losers. A block that DOES commit is DELETED from
+// the transient buffer outright at commit (markDiskBlocksCommitted) — the buffer is
+// not the archive, so a committed block leaves no residue and its DAH is moot.
+// Best-effort: a height-lookup miss (header not
 // in the index) or a store error just leaves the block without a DAH, exactly as
 // arrival writes behaved before this change; it never fails the (already durable)
 // write. Only reached under the downloadToDisk() gate via PersistRawBlockOnArrival.
@@ -3491,7 +3536,7 @@ func (sm *SyncManager) setArrivalDAH(ctx context.Context, hash chainhash.Hash) {
 	}
 
 	dah := h + w
-	if derr := sm.mainBlockStore.SetDAH(ctx, hash[:], fileformat.FileTypeBlock, dah); derr != nil {
+	if derr := sm.downloadStore.SetDAH(ctx, hash[:], fileformat.FileTypeBlock, dah); derr != nil {
 		sm.logger.Debugf("[setArrivalDAH][%s] failed to set arrival DAH %d: %v", hash.String(), dah, derr)
 	}
 }
@@ -3514,7 +3559,7 @@ func (sm *SyncManager) headerHeightForHash(hash chainhash.Hash) (int32, bool) {
 }
 
 // haveBlockOnDisk reports whether the raw bytes for hash are already durable in
-// mainBlockStore — the analogue of svnode's pindex.getStatus().hasData()
+// downloadStore — the analogue of svnode's pindex.getStatus().hasData()
 // (np.cpp:449). It is the presence flag the fetch frontier consults to skip
 // re-requesting a block already on disk. A store error is treated as "not on
 // disk" (conservative: at worst the block is re-requested, never skipped in error).
@@ -3523,7 +3568,7 @@ func (sm *SyncManager) haveBlockOnDisk(ctx context.Context, hash chainhash.Hash)
 		return false
 	}
 
-	exists, err := sm.mainBlockStore.Exists(ctx, hash[:], fileformat.FileTypeBlock)
+	exists, err := sm.downloadStore.Exists(ctx, hash[:], fileformat.FileTypeBlock)
 	if err != nil {
 		sm.logger.Debugf("[haveBlockOnDisk] Exists check failed for %s: %v", hash.String(), err)
 		return false
@@ -3532,16 +3577,16 @@ func (sm *SyncManager) haveBlockOnDisk(ctx context.Context, hash chainhash.Hash)
 	return exists
 }
 
-// readRawBlockFromDisk reads a block back from mainBlockStore and deserializes
+// readRawBlockFromDisk reads a block back from downloadStore and deserializes
 // it — svnode's ConnectTip-reads-from-disk (validation.cpp:4229-4238). Not yet
 // consumed by a worker in this stage; it exists so the async in-order validator
 // of a later stage can pull blocks off disk at its own pace.
 func (sm *SyncManager) readRawBlockFromDisk(ctx context.Context, hash chainhash.Hash) (*wire.MsgBlock, error) {
-	if sm.mainBlockStore == nil {
+	if sm.downloadStore == nil {
 		return nil, errors.NewStorageError("[readRawBlockFromDisk] no block store configured")
 	}
 
-	reader, err := sm.mainBlockStore.GetIoReader(ctx, hash[:], fileformat.FileTypeBlock)
+	reader, err := sm.downloadStore.GetIoReader(ctx, hash[:], fileformat.FileTypeBlock)
 	if err != nil {
 		return nil, errors.NewStorageError("[readRawBlockFromDisk] error opening block %s", hash.String(), err)
 	}
@@ -3589,15 +3634,29 @@ func (sm *SyncManager) PokeValidateFromDisk() {
 // caller acquired for this block; it is released here only on the decoupled
 // (handled=true) path. On the fall-through path the caller's normal
 // awaitBlockResult still owns and releases it.
-func (sm *SyncManager) PersistArrivalAndDecouple(ctx context.Context, hash chainhash.Hash, blockBytes []byte, weight int64, deliveringPeer *peerpkg.Peer) (handled bool) {
+func (sm *SyncManager) PersistArrivalAndDecouple(ctx context.Context, hash chainhash.Hash, msgBlock *wire.MsgBlock, blockBytes []byte, weight int64, deliveringPeer *peerpkg.Peer) (handled bool) {
 	if !sm.downloadToDisk() {
 		return false
 	}
 
-	if err := sm.PersistRawBlockOnArrival(ctx, hash, blockBytes); err != nil {
+	if err := sm.PersistRawBlockOnArrival(ctx, hash, msgBlock, blockBytes); err != nil {
 		// Non-fatal: fall back to the normal inline path (the block still validates
 		// there and block_persister persists it post-commit).
 		sm.logger.Warnf("[downloadToDisk] arrival write failed for block %s, falling back to inline validation: %v", hash.String(), err)
+		return false
+	}
+
+	// SAFETY GUARD: never decouple a block that is not PROVABLY durable. Decoupling
+	// clears the in-flight ledgers and drops the block from the inline QueueBlock path,
+	// so if the block were not actually on disk it would be lost and the in-order
+	// validator's frontier walk would gap forever (the wedge this redesign fixes). A
+	// write that was skipped (both msgBlock and bytes absent) or that produced no file
+	// for any reason leaves haveBlockOnDisk false; in that case decline so OnBlock
+	// falls through to QueueBlock and re-validates the block inline. This is
+	// belt-and-braces on top of the error check above: even a write that wrongly
+	// returned nil cannot cause a drop.
+	if !sm.haveBlockOnDisk(ctx, hash) {
+		sm.logger.Warnf("[downloadToDisk] block %s not durable after arrival write, falling back to inline validation", hash.String())
 		return false
 	}
 
@@ -3843,7 +3902,7 @@ func (sm *SyncManager) clearDiskBlockLedgers(hash chainhash.Hash) {
 // on-disk block as consensus-invalid (BlockProcessingErrorIsPeerFault). Bounded
 // retry: for the first diskValidateFailCap distinct failures it
 //
-//	(a) DELETES the bad bytes from mainBlockStore so haveBlockOnDisk clears and the
+//	(a) DELETES the bad bytes from downloadStore so haveBlockOnDisk clears and the
 //	    gap-fill frontier re-requests the height from scratch,
 //	(b) clears every in-flight / assignment ledger entry for the hash so the block
 //	    is genuinely re-requestable (mirrors handleBlockPreamble's delivery-clear),
@@ -3888,7 +3947,7 @@ func (sm *SyncManager) recoverInvalidDiskBlock(hash chainhash.Hash, height int32
 	}
 
 	// Delete the bad bytes so haveBlockOnDisk clears and the frontier re-requests.
-	if derr := sm.mainBlockStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
+	if derr := sm.downloadStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
 		sm.logger.Warnf("[drainValidateFromDisk][%s] failed to delete invalid on-disk block height %d: %v", hash, height, derr)
 	}
 
@@ -3945,7 +4004,7 @@ func (sm *SyncManager) recoverUnreadableDiskBlock(hash chainhash.Hash, height in
 	}
 
 	// Delete the unreadable bytes so haveBlockOnDisk clears and the frontier re-requests.
-	if derr := sm.mainBlockStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
+	if derr := sm.downloadStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
 		sm.logger.Warnf("[drainValidateFromDisk][%s] failed to delete unreadable on-disk block height %d: %v", hash, height, derr)
 	}
 
@@ -3973,7 +4032,7 @@ func (sm *SyncManager) recoverUnreadableDiskBlock(hash chainhash.Hash, height in
 // (keep quiescing another window) and return false, and the caller does NOT fall through.
 // Runs on the single drain goroutine under the downloadToDisk() gate.
 func (sm *SyncManager) retryExhaustedDiskBlock(hash chainhash.Hash, height int32) bool {
-	if derr := sm.mainBlockStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
+	if derr := sm.downloadStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
 		sm.markDiskGiveUp(hash)
 		sm.logger.Warnf("[drainValidateFromDisk][%s] failed to delete exhausted on-disk block height %d for backoff re-fetch; quiescing another window rather than re-validating undeletable bytes: %v", hash, height, derr)
 
@@ -4021,25 +4080,26 @@ func (sm *SyncManager) restoreConsumedFrontierNode(hash chainhash.Hash, height i
 	sm.headerHeightIndex[hash] = height
 }
 
-// markDiskBlocksCommitted is the download-to-disk commit-finalize hook. For every
-// just-committed block it clears the arrival self-expiry DAH to 0 (permanent) —
-// exactly as block_persister marks processed data permanent — so the committed
-// chain is retained precisely as today and only un-committed / orphan blocks ever
-// expire. It also advances the store janitor's current-height notion to the highest
-// committed height so blocks below the tip whose DAH has lapsed become eligible for
-// reaping. Gated internally on downloadToDisk() so the flag-off path never calls
-// the store. Best-effort: a store error is logged, never fatal — the block is
-// already committed to the blockchain. Called from both commit-finalize points: the
-// window path (commitWindowJob success) and the direct / checkpoint path
-// (HandleBlockDirect success).
+// markDiskBlocksCommitted is the download-to-disk commit-finalize hook. The
+// downloadStore is a DEDICATED, TRANSIENT download buffer — not the archive — so
+// for every just-committed block it DELETES the raw wire block from the buffer. The
+// permanent, durable copy of a committed block still goes to the shared block store
+// via block_persister post-commit (unchanged); keeping the full raw copy in the
+// download buffer after commit would defeat the buffer's purpose and let it grow
+// with the chain. Deleting on commit is what makes the buffer's steady-state size
+// the in-flight backlog, not the whole chain.
 //
-// RESIDUAL (accepted, matches svnode): clearing the DAH to 0 is permanent — a block
-// committed here and LATER reorged out keeps its permanent DAH and is retained on disk
-// rather than being re-expired. This mirrors svnode, which never prunes a block it once
-// connected (a reorged block stays in the block files, only its chain-active flag flips),
-// and it is deliberate: a reorg may switch back, and re-fetching a block we already have
-// is pure waste. The only growth this admits is reorged-out branches, which are bounded
-// by chainwork and negligible next to the active chain — so no reclaim code is warranted.
+// It also advances the store janitor's current-height notion to the highest
+// committed height so the arrival-DAH backstop can reap never-committed / orphan
+// blocks below the tip whose DAH has lapsed (the blocks that arrive but never
+// commit — the buffer's only other growth source). Together, Del-on-commit and the
+// arrival DAH bound the buffer from both sides. Gated internally on downloadToDisk()
+// so the flag-off path never touches the store. Best-effort: a store error is
+// logged, never fatal — the block is already committed to the blockchain, and Del is
+// idempotent on a missing key (a block committed via the direct path that never
+// passed through the buffer deletes as a safe no-op). Called from both
+// commit-finalize points: the window path (commitWindowJob success) and the direct /
+// checkpoint path (HandleBlockDirect success).
 func (sm *SyncManager) markDiskBlocksCommitted(ctx context.Context, blocks []*model.Block) {
 	if !sm.downloadToDisk() || len(blocks) == 0 {
 		return
@@ -4053,8 +4113,11 @@ func (sm *SyncManager) markDiskBlocksCommitted(ctx context.Context, blocks []*mo
 		}
 
 		h := b.Hash()
-		if derr := sm.mainBlockStore.SetDAH(ctx, h[:], fileformat.FileTypeBlock, 0); derr != nil {
-			sm.logger.Debugf("[markDiskBlocksCommitted][%s] failed to clear DAH on commit: %v", h.String(), derr)
+		// Transient buffer: drop the raw wire block on genuine commit. The permanent
+		// copy lives in the shared block store (block_persister); this frees the
+		// download-buffer slot so its size tracks the in-flight backlog, not the chain.
+		if derr := sm.downloadStore.Del(ctx, h[:], fileformat.FileTypeBlock); derr != nil {
+			sm.logger.Debugf("[markDiskBlocksCommitted][%s] failed to delete committed block from download buffer: %v", h.String(), derr)
 		}
 
 		// Genuine commit: drop any lingering delete-and-refetch recovery state for this
@@ -4069,8 +4132,9 @@ func (sm *SyncManager) markDiskBlocksCommitted(ctx context.Context, blocks []*mo
 	}
 
 	// Below-checkpoint commits are strictly ascending, so maxHeight is monotonic
-	// across calls; drive the janitor height so lapsed junk below the tip is reaped.
-	sm.mainBlockStore.SetCurrentBlockHeight(maxHeight)
+	// across calls; drive the janitor height so lapsed arrival-DAH junk (never-committed
+	// orphans) below the tip is reaped.
+	sm.downloadStore.SetCurrentBlockHeight(maxHeight)
 }
 
 // maxInFlightPerPeer returns the per-peer in-flight block ceiling used by every
@@ -9420,7 +9484,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		validationClient:  validationClient,
 		utxoStore:         utxoStore,
 		subtreeStore:      subtreeStore,
-		mainBlockStore:    blockStore,
+		downloadStore:     blockStore,
 		subtreeValidation: subtreeValidation,
 		blockValidation:   blockValidation,
 		blockAssembly:     blockAssembly,

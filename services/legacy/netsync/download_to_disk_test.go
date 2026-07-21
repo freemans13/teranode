@@ -39,6 +39,7 @@ import (
 	"container/list"
 	"context"
 	"io"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -96,7 +97,7 @@ func dtdMakeBlock(t *testing.T, height int32, nonce uint32) (chainhash.Hash, []b
 }
 
 // dtdNewManager builds a minimal SyncManager wired with the fields the
-// download-to-disk helpers touch: a memory block store (mainBlockStore), full
+// download-to-disk helpers touch: a memory block store (downloadStore), full
 // default settings (for the filestorer buffer size), a logger, a validate-signal
 // channel, and the DownloadToDisk gate flipped as requested. It deliberately
 // leaves the heavy validation dependencies (blockValidation, subtreeValidation,
@@ -112,7 +113,7 @@ func dtdNewManager(t *testing.T, flagOn bool, store blob.Store) *SyncManager {
 		ctx:             context.Background(),
 		logger:          ulogger.TestLogger{},
 		settings:        tSettings,
-		mainBlockStore:  store,
+		downloadStore:   store,
 		validateSignal:  make(chan struct{}, 1),
 		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](60 * time.Minute),
 		peerStates:      txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
@@ -146,7 +147,7 @@ func TestDownloadToDisk_PersistAndReadBack(t *testing.T) {
 	require.False(t, sm.haveBlockOnDisk(ctx, hash), "block must not be on disk before arrival")
 
 	// Arrival write.
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 
 	// Presence flag flips.
 	require.True(t, sm.haveBlockOnDisk(ctx, hash), "block must be on disk after arrival")
@@ -163,7 +164,7 @@ func TestDownloadToDisk_PersistAndReadBack(t *testing.T) {
 
 	// Second write is an idempotent no-op (ErrBlobAlreadyExists short-circuit),
 	// not an error, and the bytes are unchanged.
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw), "re-arrival must be a no-op, not an error")
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw), "re-arrival must be a no-op, not an error")
 
 	readBack2, err := sm.readRawBlockFromDisk(ctx, hash)
 	require.NoError(t, err)
@@ -190,8 +191,8 @@ func TestDownloadToDisk_FrontierSkipPredicate(t *testing.T) {
 		hdrs[i] = hdr{hash: h, raw: raw}
 	}
 
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hdrs[0].hash, hdrs[0].raw)) // N
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hdrs[2].hash, hdrs[2].raw)) // N+2
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hdrs[0].hash, nil, hdrs[0].raw)) // N
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hdrs[2].hash, nil, hdrs[2].raw)) // N+2
 
 	// The frontier's request set = headers NOT on disk = {N+1, N+3}.
 	var wantRequest []chainhash.Hash
@@ -237,7 +238,7 @@ func TestDownloadToDisk_OutOfOrderAllLand(t *testing.T) {
 	order := []int32{n + 2, n + 4, n + 3, n, n + 1}
 	for _, h := range order {
 		b := blocks[h]
-		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, b.hash, b.raw),
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, b.hash, nil, b.raw),
 			"out-of-order block %d must persist", h)
 	}
 
@@ -286,7 +287,7 @@ func TestDownloadToDisk_GiantBlockIsolation(t *testing.T) {
 		defer close(done)
 		for i := 0; i < later; i++ {
 			hash, raw, _ := dtdMakeBlock(t, int32(1000+i), uint32(i))
-			require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+			require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 			require.True(t, sm.haveBlockOnDisk(ctx, hash))
 		}
 	}()
@@ -329,7 +330,7 @@ func TestDownloadToDisk_NoDropInvariant(t *testing.T) {
 	for i := 0; i < total; i++ {
 		hash, raw, _ := dtdMakeBlock(t, int32(i+1), uint32(i))
 		hashes[i] = hash
-		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 	}
 
 	// Not one dropped: all present.
@@ -343,7 +344,7 @@ func TestDownloadToDisk_NoDropInvariant(t *testing.T) {
 
 	// Re-arrival of an already-on-disk block is a no-op (never a re-fetch/re-write).
 	_, raw0, _ := dtdMakeBlock(t, 1, 0)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashes[0], raw0), "on-disk block must not be re-fetched/re-written")
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashes[0], nil, raw0), "on-disk block must not be re-fetched/re-written")
 }
 
 // TestDownloadToDisk_FlagOff covers test-plan item 6: with legacy_downloadToDisk
@@ -360,7 +361,7 @@ func TestDownloadToDisk_FlagOff(t *testing.T) {
 	hash, raw, _ := dtdMakeBlock(t, 300, 7)
 
 	// Arrival write is a no-op: nothing is written.
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 
 	exists, err := store.Exists(ctx, hash[:], fileformat.FileTypeBlock)
 	require.NoError(t, err)
@@ -371,7 +372,7 @@ func TestDownloadToDisk_FlagOff(t *testing.T) {
 	require.False(t, sm.haveBlockOnDisk(ctx, hash), "flag-off haveBlockOnDisk must be false")
 
 	// The decouple hand-off declines, so OnBlock falls through to today's path.
-	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, raw, 0, nil),
+	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, nil, raw, 0, nil),
 		"flag-off decouple must decline (caller uses the normal QueueBlock path)")
 }
 
@@ -387,9 +388,9 @@ func TestDownloadToDisk_NoStore(t *testing.T) {
 
 	hash, raw, _ := dtdMakeBlock(t, 400, 9)
 
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw), "no-store arrival must be a safe no-op")
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw), "no-store arrival must be a safe no-op")
 	require.False(t, sm.haveBlockOnDisk(ctx, hash), "no-store presence must be false")
-	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, raw, 0, nil), "no-store decouple must decline")
+	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, nil, raw, 0, nil), "no-store decouple must decline")
 }
 
 // TestDownloadToDisk_PersistArrivalAndDecouple covers the arrival hand-off
@@ -405,7 +406,7 @@ func TestDownloadToDisk_PersistArrivalAndDecouple(t *testing.T) {
 
 	// Validator NOT active (default): decouple declines, but the block is still
 	// written durably to disk (frontier-skip + restart recovery keep working).
-	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, raw, 0, nil),
+	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, nil, raw, 0, nil),
 		"decouple must decline while the in-order validator is not running")
 	require.True(t, sm.haveBlockOnDisk(ctx, hash),
 		"even when decouple declines, the arrival write must still be durable on disk")
@@ -417,7 +418,7 @@ func TestDownloadToDisk_PersistArrivalAndDecouple(t *testing.T) {
 	sm.headersFirstMode.Store(true)
 
 	hash2, raw2, _ := dtdMakeBlock(t, 501, 12)
-	require.True(t, sm.PersistArrivalAndDecouple(ctx, hash2, raw2, 0, nil),
+	require.True(t, sm.PersistArrivalAndDecouple(ctx, hash2, nil, raw2, 0, nil),
 		"decouple must hand off to the validator when it is running in headers-first mode")
 	require.True(t, sm.haveBlockOnDisk(ctx, hash2), "decoupled block must be durable on disk")
 	require.Len(t, sm.validateSignal, 1, "decouple must poke the in-order validator exactly once")
@@ -571,7 +572,7 @@ func TestDownloadToDisk_ArrivalDAHSet(t *testing.T) {
 	// headers-first index; seed it as headers-first would.
 	sm.headerHeightIndex = map[chainhash.Hash]int32{hash: height}
 
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 	require.True(t, sm.haveBlockOnDisk(ctx, hash))
 
 	dah, ok := store.dah(hash)
@@ -592,7 +593,7 @@ func TestDownloadToDisk_ArrivalDAHSkipped(t *testing.T) {
 	sm.settings.Legacy.DownloadToDiskArrivalDAHWindow = 0
 	hash, raw, _ := dtdMakeBlock(t, 123, 1)
 	sm.headerHeightIndex = map[chainhash.Hash]int32{hash: 123}
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 	_, ok := store.dah(hash)
 	require.False(t, ok, "window 0 must disable the arrival DAH")
 	require.True(t, sm.haveBlockOnDisk(ctx, hash), "block is still durable without a DAH")
@@ -600,40 +601,75 @@ func TestDownloadToDisk_ArrivalDAHSkipped(t *testing.T) {
 	// Window on but height not in the index: cannot anchor, so no DAH.
 	sm.settings.Legacy.DownloadToDiskArrivalDAHWindow = 100
 	hash2, raw2, _ := dtdMakeBlock(t, 124, 2)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash2, raw2))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash2, nil, raw2))
 	_, ok2 := store.dah(hash2)
 	require.False(t, ok2, "an unresolvable height must leave the block un-tagged")
 	require.True(t, sm.haveBlockOnDisk(ctx, hash2), "block is still durable without a DAH")
 }
 
-// TestDownloadToDisk_CommitClearsDAH covers Stage B #6 (commit half): committing a
-// disk-path block clears its arrival self-expiry DAH to 0 (permanent) so the
-// committed chain is retained exactly as today, and drives the store janitor's
-// current-height notion to the committed height.
-func TestDownloadToDisk_CommitClearsDAH(t *testing.T) {
+// TestDownloadToDisk_CommitDeletesFromBuffer covers Stage 3 (delete-on-commit): the
+// downloadStore is a DEDICATED, TRANSIENT download buffer, not the archive, so a
+// genuine commit DELETES the raw block from it — the permanent, durable copy of a
+// committed block still goes to the shared block store via block_persister post-commit.
+// An UNcommitted block, by contrast, is RETAINED in the buffer and self-expires only
+// via its arrival-DAH backstop, so the buffer cannot grow unbounded from orphans that
+// never commit. Commit also drives the store janitor's current-height notion to the
+// committed height so those lapsed orphan DAHs become eligible for reaping.
+//
+// This is the test that would have caught a regression back to DAH-permanent (the old
+// behaviour that kept the full raw block forever and defeated the buffer's purpose).
+func TestDownloadToDisk_CommitDeletesFromBuffer(t *testing.T) {
 	ctx := context.Background()
 	store := newDTDRecordingStore()
 	sm := dtdNewManager(t, true, store)
 	sm.settings.Legacy.DownloadToDiskArrivalDAHWindow = 100
 
-	height := int32(555)
-	hash, raw, wireBlk := dtdMakeBlock(t, height, 1)
-	sm.headerHeightIndex = map[chainhash.Hash]int32{hash: height}
+	// Two blocks land on disk; only one of them will be committed.
+	committedHeight := int32(555)
+	committedHash, committedRaw, committedWire := dtdMakeBlock(t, committedHeight, 1)
+	uncommittedHeight := int32(556)
+	uncommittedHash, uncommittedRaw, _ := dtdMakeBlock(t, uncommittedHeight, 2)
 
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
-	dah, ok := store.dah(hash)
+	sm.headerHeightIndex = map[chainhash.Hash]int32{
+		committedHash:   committedHeight,
+		uncommittedHash: uncommittedHeight,
+	}
+
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, committedHash, nil, committedRaw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, uncommittedHash, nil, uncommittedRaw))
+	require.True(t, sm.haveBlockOnDisk(ctx, committedHash))
+	require.True(t, sm.haveBlockOnDisk(ctx, uncommittedHash))
+
+	// Sanity: both were tagged with their arrival DAH backstop on arrival.
+	dahC, ok := store.dah(committedHash)
 	require.True(t, ok)
-	require.Equal(t, uint32(height)+100, dah, "sanity: arrival DAH set before commit")
+	require.Equal(t, uint32(committedHeight)+100, dahC, "sanity: arrival DAH set before commit")
 
-	mb := dtdModelBlock(t, wireBlk, uint32(height))
-	require.Equal(t, hash, *mb.Hash(), "model block hash must match the on-disk key")
+	mb := dtdModelBlock(t, committedWire, uint32(committedHeight))
+	require.Equal(t, committedHash, *mb.Hash(), "model block hash must match the on-disk key")
 
 	sm.markDiskBlocksCommitted(ctx, []*model.Block{mb})
 
-	dahAfter, ok := store.dah(hash)
-	require.True(t, ok)
-	require.Equal(t, uint32(0), dahAfter, "commit must clear the arrival DAH to 0 (permanent)")
-	require.Equal(t, uint32(height), store.height(), "commit must drive the store janitor height to the committed height")
+	// The committed block is DELETED from the transient buffer.
+	require.Positive(t, store.delCount(committedHash), "commit must delete the committed block from the download buffer")
+	require.False(t, sm.haveBlockOnDisk(ctx, committedHash), "the committed block's bytes must be gone from the buffer")
+
+	exists, err := store.Exists(ctx, committedHash[:], fileformat.FileTypeBlock)
+	require.NoError(t, err)
+	require.False(t, exists, "the committed block must be removed from the buffer (the archive copy lives in the shared store)")
+
+	// The UNcommitted block is RETAINED, still carrying its arrival-DAH backstop so it
+	// self-expires only once the chain passes its height — never deleted at this commit.
+	require.Zero(t, store.delCount(uncommittedHash), "an uncommitted block must NOT be deleted on another block's commit")
+	require.True(t, sm.haveBlockOnDisk(ctx, uncommittedHash), "the uncommitted block stays in the buffer until its DAH backstop reaps it")
+
+	dahU, ok := store.dah(uncommittedHash)
+	require.True(t, ok, "the uncommitted block keeps its self-expiry DAH backstop")
+	require.Equal(t, uint32(uncommittedHeight)+100, dahU)
+
+	// Commit still drives the store janitor height so lapsed orphan DAHs below the tip
+	// are reaped by the file store's internal janitor.
+	require.Equal(t, uint32(committedHeight), store.height(), "commit must drive the store janitor height to the committed height")
 }
 
 // TestDownloadToDisk_CommitFlagOffNoStoreCalls covers the gate: with the flag off
@@ -649,6 +685,8 @@ func TestDownloadToDisk_CommitFlagOffNoStoreCalls(t *testing.T) {
 	sm.markDiskBlocksCommitted(ctx, []*model.Block{mb})
 
 	require.Equal(t, uint32(0), store.height(), "flag-off commit must not drive the store height")
+	require.Zero(t, store.delCount(*mb.Hash()), "flag-off commit must not delete from the store")
+
 	_, ok := store.dah(*mb.Hash())
 	require.False(t, ok, "flag-off commit must not call SetDAH")
 }
@@ -666,7 +704,7 @@ func TestDownloadToDisk_RecoverInvalidDeletesAndRefetches(t *testing.T) {
 
 	height := int32(42)
 	hash, raw, _ := dtdMakeBlock(t, height, 1)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 	require.True(t, sm.haveBlockOnDisk(ctx, hash))
 
 	// Seed the in-flight ledgers so we can prove the recovery clears them.
@@ -697,7 +735,7 @@ func TestDownloadToDisk_RecoverInvalidDeletesAndRefetches(t *testing.T) {
 	require.False(t, stillRefetch, "refetch ledger must be cleared")
 
 	// Re-persist so we can prove the give-up path does NOT delete.
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 	require.True(t, sm.haveBlockOnDisk(ctx, hash))
 
 	// The cap-th failure gives up: genuinely invalid, returns false, leaves bytes.
@@ -804,7 +842,7 @@ func TestDownloadToDisk_TransientFailureKeepsBlock(t *testing.T) {
 
 	height := int32(4242)
 	hash, raw, _ := dtdMakeBlock(t, height, 1)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 	require.True(t, sm.haveBlockOnDisk(ctx, hash))
 
 	// Seed the in-flight ledgers so we can prove a transient failure leaves them alone.
@@ -872,7 +910,7 @@ func TestDownloadToDisk_DecoupleClearsInFlightLedger(t *testing.T) {
 	sm.assignedMu.Unlock()
 	require.Equal(t, 1, sm.requestedBlocks.Len(), "sanity: block counts as in-flight before arrival")
 
-	require.True(t, sm.PersistArrivalAndDecouple(ctx, hash, raw, 0, nil),
+	require.True(t, sm.PersistArrivalAndDecouple(ctx, hash, nil, raw, 0, nil),
 		"decouple must accept while the validator runs in headers-first mode")
 	require.True(t, sm.haveBlockOnDisk(ctx, hash), "decoupled block must be durable on disk")
 
@@ -957,7 +995,7 @@ func TestDownloadToDisk_CloseFailureNotDurableFallsBack(t *testing.T) {
 	hash, raw, _ := dtdMakeBlock(t, 700, 31)
 
 	// The raw arrival write surfaces the Close failure rather than swallowing it.
-	require.Error(t, sm.PersistRawBlockOnArrival(ctx, hash, raw),
+	require.Error(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw),
 		"a failed durable commit at Close must be surfaced, not swallowed")
 
 	// The block is NOT durable — the file never appeared.
@@ -968,7 +1006,7 @@ func TestDownloadToDisk_CloseFailureNotDurableFallsBack(t *testing.T) {
 	require.False(t, exists, "the atomic write means the file never appears on a failed commit")
 
 	// The decouple hand-off declines, so OnBlock falls back to the inline path.
-	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, raw, 0, nil),
+	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, nil, raw, 0, nil),
 		"a failed durable write must return handled=false (fall back to inline validation)")
 	require.False(t, sm.haveBlockOnDisk(ctx, hash),
 		"handled=false must never coincide with a block reported durable")
@@ -986,8 +1024,8 @@ func TestDownloadToDisk_BoundedRetryIsPerHash(t *testing.T) {
 
 	hashA, rawA, _ := dtdMakeBlock(t, 800, 41)
 	hashB, rawB, _ := dtdMakeBlock(t, 801, 42)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashA, rawA))
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashB, rawB))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashA, nil, rawA))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashB, nil, rawB))
 
 	cause := errors.NewBlockInvalidError("bad block")
 
@@ -995,7 +1033,7 @@ func TestDownloadToDisk_BoundedRetryIsPerHash(t *testing.T) {
 	for i := 1; i < diskValidateFailCap; i++ {
 		require.True(t, sm.recoverInvalidDiskBlock(hashA, 800, nil, cause),
 			"A attempt %d (below cap) must self-heal", i)
-		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashA, rawA)) // honest re-fetch lands
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashA, nil, rawA)) // honest re-fetch lands
 	}
 
 	// B has its OWN counter: a single failure is well below the cap and self-heals,
@@ -1225,7 +1263,7 @@ func TestDownloadToDisk_RecoverAttributesDeliveringPeer(t *testing.T) {
 	syncPeer := dtdConnectedPeer(t, 31)
 
 	hash, raw, _ := dtdMakeBlock(t, 800, 1)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 	sm.diskDeliveringPeer.Set(hash, deliveringPeer)
 
 	cause := errors.NewBlockInvalidError("bad from delivering peer")
@@ -1240,7 +1278,7 @@ func TestDownloadToDisk_RecoverAttributesDeliveringPeer(t *testing.T) {
 	// Fallback: no recorded delivering peer for a different hash -> the sync peer is
 	// rotated (pre-attribution behaviour), guaranteeing a rotation still happens.
 	hash2, raw2, _ := dtdMakeBlock(t, 801, 2)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash2, raw2))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash2, nil, raw2))
 	require.True(t, sm.recoverInvalidDiskBlock(hash2, 801, syncPeer, cause))
 	require.Eventually(t, func() bool { return !syncPeer.Connected() }, 2*time.Second, 5*time.Millisecond,
 		"with no delivering peer recorded, the recovery falls back to rotating the sync peer")
@@ -1278,7 +1316,7 @@ func TestDownloadToDisk_RecoverUnreadableDeletesAndGivesUp(t *testing.T) {
 	sm := dtdNewManager(t, true, store)
 
 	hash, raw, _ := dtdMakeBlock(t, 1000, 1)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 	require.True(t, sm.haveBlockOnDisk(ctx, hash))
 
 	// Seed the in-flight ledgers so we can prove the recovery clears them.
@@ -1307,7 +1345,7 @@ func TestDownloadToDisk_RecoverUnreadableDeletesAndGivesUp(t *testing.T) {
 	require.False(t, stillRefetch, "refetch ledger must be cleared")
 
 	// Re-persist to represent the fresh copy that is ALSO unreadable.
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 	require.True(t, sm.haveBlockOnDisk(ctx, hash))
 
 	// The cap-th failure gives up: leave the bytes, return false (halt), no loop.
@@ -1417,7 +1455,7 @@ func TestDownloadToDisk_PanicGuardSurvivesZeroTxBlock(t *testing.T) {
 	// A well-formed header with zero transactions, persisted on disk exactly as a
 	// truncated/malformed delivery would land.
 	poisonHash, poisonRaw := dtdMakeZeroTxBlock(t, 4242)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, poisonHash, poisonRaw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, poisonHash, nil, poisonRaw))
 
 	// Direct call: prepareDiskBlock must NOT panic. It converts the panic (deep inside
 	// prepareBlockForWindow) into an error flagged panicFault, so the drain routes the
@@ -1457,7 +1495,7 @@ func TestDownloadToDisk_PanicGuardSurvivesZeroTxBlock(t *testing.T) {
 	// lived through the panic (its result may itself carry a validation error — an
 	// unsolved PoW header — but the worker returning ANY result for it is the proof).
 	goodHash, goodRaw, _ := dtdMakeBlock(t, 4243, 7)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, goodHash, goodRaw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, goodHash, nil, goodRaw))
 
 	reqC <- diskPrepareReq{hash: goodHash, height: 4243}
 	select {
@@ -1486,7 +1524,7 @@ func TestDownloadToDisk_BoundedRetryTerminatesAcrossResets(t *testing.T) {
 
 	height := int32(5000)
 	hash, raw, _ := dtdMakeBlock(t, height, 1)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 
 	cause := errors.NewBlockInvalidError("consensus-invalid on disk")
 	require.True(t, BlockProcessingErrorIsPeerFault(cause), "sanity: cause is a peer-fault")
@@ -1496,7 +1534,7 @@ func TestDownloadToDisk_BoundedRetryTerminatesAcrossResets(t *testing.T) {
 	for {
 		// The frontier re-fetched a fresh copy after the previous delete; model it as the
 		// same still-invalid bytes landing again.
-		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 
 		healed := sm.recoverInvalidDiskBlock(hash, height, nil, cause)
 		attempts++
@@ -1587,13 +1625,13 @@ func TestDownloadToDisk_ExhaustedGivesUpAsBackoffNotPermanentHalt(t *testing.T) 
 
 	height := int32(6000)
 	hash, raw, _ := dtdMakeBlock(t, height, 1)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 
 	cause := errors.NewBlockInvalidError("consensus-invalid on disk")
 
 	// Drive it to the cap.
 	for i := 0; i < diskValidateFailCap; i++ {
-		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 		sm.recoverInvalidDiskBlock(hash, height, nil, cause)
 	}
 
@@ -1637,11 +1675,11 @@ func TestDownloadToDisk_BackoffRetryUndeletableKeepsQuiescing(t *testing.T) {
 
 	height := int32(6100)
 	hash, raw, _ := dtdMakeBlock(t, height, 1)
-	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 
 	cause := errors.NewBlockInvalidError("consensus-invalid on disk")
 	for i := 0; i < diskValidateFailCap; i++ {
-		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
 		sm.recoverInvalidDiskBlock(hash, height, nil, cause)
 	}
 	require.True(t, sm.diskRecoveryExhausted(hash), "sanity: exhausted at the cap")
@@ -1746,7 +1784,7 @@ func TestDownloadToDisk_ConcurrentWorkerArrivalRecoveryRace(t *testing.T) {
 			sm.refetchBlocks[hashes[i]] = struct{}{}
 			sm.assignedMu.Unlock()
 
-			sm.PersistArrivalAndDecouple(ctx, hashes[i], raws[i], 0, pool[i%poolSize])
+			sm.PersistArrivalAndDecouple(ctx, hashes[i], nil, raws[i], 0, pool[i%poolSize])
 		}
 	}()
 
@@ -1762,7 +1800,7 @@ func TestDownloadToDisk_ConcurrentWorkerArrivalRecoveryRace(t *testing.T) {
 		defer wg.Done()
 
 		for i := 0; i < n; i++ {
-			require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashes[i], raws[i]))
+			require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashes[i], nil, raws[i]))
 
 			reqC <- diskPrepareReq{hash: hashes[i], height: int32(6000 + i), peer: pool[i%poolSize]}
 
@@ -1796,4 +1834,200 @@ func TestDownloadToDisk_ConcurrentWorkerArrivalRecoveryRace(t *testing.T) {
 		t.Fatalf("prepare worker stalled on %s — the single in-flight slot never returned", h)
 	default:
 	}
+}
+
+// TestDownloadToDisk_StreamingWriteNilBuf is the Stage-2 core regression: it drives the
+// arrival write with buf=nil, exactly as the big-block streaming-ingestion path does
+// (peer.go readMessageStreaming consumes the payload off the wire without retaining it,
+// so OnBlock is handed a decoded *wire.MsgBlock and a nil buf). This is the case the old
+// len(blockBytes)==0 guard silently "succeeded" on and then dropped — the wedge. Passing
+// only the decoded block, the write must serialize it straight to disk via the io.Pipe,
+// land byte-identically, flip haveBlockOnDisk, and be idempotent on a second nil-buf
+// arrival. That the write completes with buf=nil is the whole fix.
+func TestDownloadToDisk_StreamingWriteNilBuf(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	sm := dtdNewManager(t, true, store)
+
+	hash, raw, blk := dtdMakeBlock(t, 720000, 1)
+
+	// Not on disk before arrival.
+	require.False(t, sm.haveBlockOnDisk(ctx, hash))
+
+	// Arrival write with buf=nil — only the decoded block is available (streaming path).
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, blk, nil),
+		"the streaming path must write the block from the decoded *wire.MsgBlock with buf=nil")
+
+	require.True(t, sm.haveBlockOnDisk(ctx, hash),
+		"a nil-buf streaming arrival must land durably on disk (this is the wedge fix)")
+
+	// The streamed bytes are the exact wire serialization: read-back is byte-identical
+	// to the reference bytes the block serializes to.
+	readBack, err := sm.readRawBlockFromDisk(ctx, hash)
+	require.NoError(t, err)
+	require.Equal(t, raw, serializeBlock(t, readBack),
+		"streamed-to-disk bytes must equal the block's exact wire serialization (round-trips)")
+	require.Equal(t, blk.Header.BlockHash(), readBack.Header.BlockHash())
+
+	// A second nil-buf arrival of the same block is an idempotent no-op via the Exists
+	// pre-check (never re-serializes, never errors, never deadlocks the pipe).
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, blk, nil),
+		"re-arrival on the streaming path must be an idempotent no-op")
+
+	readBack2, err := sm.readRawBlockFromDisk(ctx, hash)
+	require.NoError(t, err)
+	require.Equal(t, raw, serializeBlock(t, readBack2), "bytes unchanged after idempotent re-write")
+}
+
+// TestDownloadToDisk_StreamingMatchesBytesOnDisk proves the two write sources produce
+// identical durable bytes: the same block written via the streaming pipe (buf=nil) and
+// via the raw-bytes fast path lands byte-for-byte the same on disk, so the read-back
+// path (MsgBlock.Deserialize) round-trips regardless of which source OnBlock used.
+func TestDownloadToDisk_StreamingMatchesBytesOnDisk(t *testing.T) {
+	ctx := context.Background()
+
+	streamStore := memory.New()
+	bytesStore := memory.New()
+	smStream := dtdNewManager(t, true, streamStore)
+	smBytes := dtdNewManager(t, true, bytesStore)
+
+	hash, raw, blk := dtdMakeBlock(t, 730000, 2)
+
+	// Streaming source: decoded block, nil buf.
+	require.NoError(t, smStream.PersistRawBlockOnArrival(ctx, hash, blk, nil))
+	// Bytes source: raw wire bytes, nil block (the fast path).
+	require.NoError(t, smBytes.PersistRawBlockOnArrival(ctx, hash, nil, raw))
+
+	streamed, err := smStream.readRawBlockFromDisk(ctx, hash)
+	require.NoError(t, err)
+	bytesed, err := smBytes.readRawBlockFromDisk(ctx, hash)
+	require.NoError(t, err)
+
+	require.Equal(t, serializeBlock(t, streamed), serializeBlock(t, bytesed),
+		"streaming and bytes write sources must produce byte-identical on-disk blocks")
+	require.Equal(t, raw, serializeBlock(t, streamed), "streamed bytes equal the reference serialization")
+}
+
+// TestDownloadToDisk_StreamingDecoupleNilBuf drives the full production hand-off exactly
+// as OnBlock does under streaming ingestion: PersistArrivalAndDecouple with a decoded
+// block and buf=nil while the in-order validator is running in headers-first mode. It
+// must persist the block from the decoded MsgBlock, pass the safety guard
+// (haveBlockOnDisk true), and hand off (handled=true, validator poked) — the precise path
+// that used to drop the block when buf was nil.
+func TestDownloadToDisk_StreamingDecoupleNilBuf(t *testing.T) {
+	ctx := context.Background()
+	sm := dtdNewManager(t, true, memory.New())
+	sm.validateFromDiskActive.Store(true)
+	sm.headersFirstMode.Store(true)
+
+	hash, _, blk := dtdMakeBlock(t, 740000, 3)
+
+	require.True(t, sm.PersistArrivalAndDecouple(ctx, hash, blk, nil, 0, nil),
+		"a nil-buf streaming arrival must decouple (handled=true) once durable, not be dropped")
+	require.True(t, sm.haveBlockOnDisk(ctx, hash),
+		"the decoupled nil-buf block must be provably durable on disk")
+	require.Len(t, sm.validateSignal, 1,
+		"decouple must poke the in-order validator exactly once")
+}
+
+// TestDownloadToDisk_SafetyGuardFallsBackWhenNotDurable pins Stage-2 safety guard #2 in
+// isolation: if the arrival write persists NOTHING (neither a decoded block nor raw bytes
+// were available — the degenerate case that the old nil-buf bug hit), PersistRawBlockOnArrival
+// returns nil without writing, and PersistArrivalAndDecouple must NOT decouple. The guard
+// checks haveBlockOnDisk after the write and, seeing the block absent, returns handled=false
+// so OnBlock falls through to the inline QueueBlock path — the block is never dropped. This
+// holds even with the validator running, which is exactly when the old code wrongly dropped it.
+func TestDownloadToDisk_SafetyGuardFallsBackWhenNotDurable(t *testing.T) {
+	ctx := context.Background()
+	sm := dtdNewManager(t, true, memory.New())
+	sm.validateFromDiskActive.Store(true)
+	sm.headersFirstMode.Store(true)
+
+	hash, _, _ := dtdMakeBlock(t, 750000, 4)
+
+	// Nothing to persist: no decoded block, no bytes. The write is a safe no-op...
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, nil),
+		"with neither a block nor bytes there is nothing to persist — a safe no-op, not an error")
+	require.False(t, sm.haveBlockOnDisk(ctx, hash),
+		"nothing was written, so the block must not read as durable")
+
+	// ...and because the block is NOT durable, the safety guard declines the hand-off so
+	// the caller keeps it on the inline path. This is what stops the wedge even if a write
+	// is skipped for any reason.
+	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, nil, nil, 0, nil),
+		"the safety guard must decline (handled=false) when the block is not provably durable")
+	require.Len(t, sm.validateSignal, 0,
+		"a declined hand-off must not poke the validator")
+}
+
+// dtdEarlyErrorStore models a store whose SetFromReader fails FAST — it returns an error
+// without reading or closing the supplied reader. That is the adversarial case for the
+// streaming pipe: the serialize goroutine is blocked in pw.Write on the unbuffered pipe,
+// and the ONLY thing that can free it is the arrival path's own defensive pr.CloseWithError
+// after SetFromReader returns. If that backstop were missing the goroutine would leak.
+type dtdEarlyErrorStore struct {
+	*memory.Memory
+}
+
+func (s *dtdEarlyErrorStore) SetFromReader(_ context.Context, _ []byte, _ fileformat.FileType, _ io.ReadCloser, _ ...options.FileOption) error {
+	// Deliberately neither read nor close the reader.
+	return errors.NewStorageError("dtd test: forced early write failure (reader neither read nor closed)")
+}
+
+// TestDownloadToDisk_StreamingPipeHygieneOnEarlyWriteError proves pipe hygiene (Stage-2
+// item 3): when SetFromReader fails without draining the pipe, the streaming write must
+// still (a) surface the error, (b) leave the block not durable, and (c) fall back to
+// inline via the safety guard.
+func TestDownloadToDisk_StreamingPipeHygieneOnEarlyWriteError(t *testing.T) {
+	ctx := context.Background()
+	store := &dtdEarlyErrorStore{Memory: memory.New()}
+	sm := dtdNewManager(t, true, store)
+	sm.validateFromDiskActive.Store(true)
+	sm.headersFirstMode.Store(true)
+
+	hash, _, blk := dtdMakeBlock(t, 760000, 5)
+
+	// Streaming write (buf=nil) against a fail-fast store: the error is surfaced, not swallowed.
+	require.Error(t, sm.PersistRawBlockOnArrival(ctx, hash, blk, nil),
+		"an early SetFromReader failure on the streaming path must surface as an error")
+	require.False(t, sm.haveBlockOnDisk(ctx, hash),
+		"a failed streaming write must leave the block not durable")
+
+	// The safety guard therefore declines and OnBlock would fall back to inline validation.
+	require.False(t, sm.PersistArrivalAndDecouple(ctx, hash, blk, nil, 0, nil),
+		"a failed streaming write must return handled=false (fall back to inline)")
+}
+
+// TestDownloadToDisk_StreamingNoGoroutineLeak proves the serialize goroutine can never
+// leak (Stage-2 item 3). The adversarial dtdEarlyErrorStore returns from SetFromReader
+// WITHOUT reading or closing the pipe reader, so the only thing that can unblock the
+// serialize goroutine (parked in pw.Write on the unbuffered pipe) is the arrival path's
+// own defensive pr.CloseWithError after SetFromReader returns. A real leak would
+// accumulate one live goroutine per iteration; driving many iterations makes that leak
+// (== iterations) dwarf the handful of goroutines other tests leave winding down, which is
+// why this counts growth across a loop rather than an absolute baseline. Zero (bounded)
+// growth after the loop proves every serialize goroutine terminated.
+func TestDownloadToDisk_StreamingNoGoroutineLeak(t *testing.T) {
+	ctx := context.Background()
+	store := &dtdEarlyErrorStore{Memory: memory.New()}
+	sm := dtdNewManager(t, true, store)
+
+	const iterations = 200
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < iterations; i++ {
+		_, _, blk := dtdMakeBlock(t, int32(770000+i), uint32(i))
+		require.Error(t, sm.PersistRawBlockOnArrival(ctx, blk.Header.BlockHash(), blk, nil),
+			"the fail-fast store must surface an error on every iteration")
+	}
+
+	// Allow the (already-unblocked) serialize goroutines to be scheduled off. A leak would
+	// leave ~iterations extra live goroutines; require growth to settle far below that.
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return runtime.NumGoroutine() <= before+10
+	}, 3*time.Second, 20*time.Millisecond,
+		"streaming serialize goroutines must all terminate (a leak would add ~%d)", iterations)
 }

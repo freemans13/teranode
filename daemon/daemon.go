@@ -482,6 +482,7 @@ func (d *Daemon) closeStores(logger ulogger.Logger) {
 	tempStoreToClose := d.daemonStores.mainTempStore
 	utxoStoreToClose := d.daemonStores.mainUtxoStore
 	blockStoreToClose := d.daemonStores.mainBlockStore
+	legacyDownloadStoreToClose := d.daemonStores.mainLegacyDownloadStore
 	blockPersisterStoreToClose := d.daemonStores.mainBlockPersisterStore
 	blockchainStoreToClose := d.daemonStores.mainBlockchainStore
 	peerRegistryClientToClose := d.daemonStores.mainPeerRegistryClient
@@ -535,6 +536,14 @@ func (d *Daemon) closeStores(logger ulogger.Logger) {
 		logger.Debugf("closing block store")
 
 		_ = blockStoreToClose.Close(ctx)
+	}
+
+	// Dedicated legacy download buffer (legacy_downloadToDisk) — a separate blob
+	// store instance from the shared block store; close it alongside the others.
+	if legacyDownloadStoreToClose != nil {
+		logger.Debugf("closing legacy download store")
+
+		_ = legacyDownloadStoreToClose.Close(ctx)
 	}
 
 	if blockPersisterStoreToClose != nil {
