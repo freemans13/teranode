@@ -7397,6 +7397,15 @@ func (sm *SyncManager) commitWindowJob(ctx context.Context, job windowFlushJob) 
 		return true
 	}
 
+	// Recovery succeeded: every block in the window committed via the bounded
+	// per-block retry (sm.ProcessBlock), which is just as genuine a commit as the
+	// direct ProcessBlockWindow success above but does NOT go through
+	// HandleBlockDirect, so nothing on this path has called markDiskBlocksCommitted
+	// yet. Without this, a batch that hits a transient ProcessBlockWindow failure
+	// (the case recovery exists for) would leak its raw bytes in the download
+	// buffer forever — the exact live-node buffer-growth bug this call closes.
+	sm.markDiskBlocksCommitted(ctx, blocks)
+
 	return false
 }
 

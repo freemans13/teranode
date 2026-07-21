@@ -39,6 +39,7 @@ import (
 	"container/list"
 	"context"
 	"io"
+	"net/url"
 	"runtime"
 	"sync"
 	"testing"
@@ -53,13 +54,33 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/stores/blob"
-	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
+
+// dtdDiskStore builds a REAL, file-backed blob store rooted in a fresh
+// t.TempDir(), constructed EXACTLY as production does in
+// daemon/daemon_stores.go GetLegacyDownloadStore. Production's delete-on-commit
+// bug (the download buffer growing unbounded on a live node) is invisible
+// against the in-memory blob store, so every download-to-disk test uses this
+// real disk store instead — no memory/file toggle.
+func dtdDiskStore(t *testing.T) blob.Store {
+	t.Helper()
+
+	fileURL, err := url.Parse("file://" + t.TempDir())
+	require.NoError(t, err)
+
+	store, err := blob.NewStore(ulogger.TestLogger{}, fileURL,
+		options.WithHashPrefix(-2),
+		options.WithStoreType(storetypes.BLOCKSTORE))
+	require.NoError(t, err)
+
+	return store
+}
 
 // dtdMakeBlock builds a minimal, well-formed, uniquely-hashed wire.MsgBlock (a
 // single coinbase whose signature script carries height+nonce) and returns its
@@ -138,7 +159,7 @@ func serializeBlock(t *testing.T, b *wire.MsgBlock) []byte {
 // the same block is a cheap idempotent no-op (not an error).
 func TestDownloadToDisk_PersistAndReadBack(t *testing.T) {
 	ctx := context.Background()
-	store := memory.New()
+	store := dtdDiskStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	hash, raw, blk := dtdMakeBlock(t, 101, 1)
@@ -177,7 +198,7 @@ func TestDownloadToDisk_PersistAndReadBack(t *testing.T) {
 // frontier therefore requests exactly the not-on-disk successors.
 func TestDownloadToDisk_FrontierSkipPredicate(t *testing.T) {
 	ctx := context.Background()
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 
 	// Header chain N, N+1, N+2, N+3. Deliver only N and N+2.
 	type hdr struct {
@@ -218,7 +239,7 @@ func TestDownloadToDisk_FrontierSkipPredicate(t *testing.T) {
 // see the file header note.)
 func TestDownloadToDisk_OutOfOrderAllLand(t *testing.T) {
 	ctx := context.Background()
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 
 	n := int32(500)
 	blocks := make(map[int32]struct {
@@ -262,7 +283,7 @@ func TestDownloadToDisk_OutOfOrderAllLand(t *testing.T) {
 // additional structural proof that arrival is decoupled from validation.
 func TestDownloadToDisk_GiantBlockIsolation(t *testing.T) {
 	ctx := context.Background()
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 
 	// Model a giant block wedged in the (separate) validation slot.
 	validatorEntered := make(chan struct{})
@@ -318,7 +339,7 @@ func TestDownloadToDisk_GiantBlockIsolation(t *testing.T) {
 // parkStrayWindowBlock's "park full; dropping stray block" log line).
 func TestDownloadToDisk_NoDropInvariant(t *testing.T) {
 	ctx := context.Background()
-	store := memory.New()
+	store := dtdDiskStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	// More blocks than a single park window would ever hold in flight; every one
@@ -353,7 +374,7 @@ func TestDownloadToDisk_NoDropInvariant(t *testing.T) {
 // exact in-memory park/prefetch/inline path — byte-identical to today.
 func TestDownloadToDisk_FlagOff(t *testing.T) {
 	ctx := context.Background()
-	store := memory.New()
+	store := dtdDiskStore(t)
 	sm := dtdNewManager(t, false, store) // flag OFF, store present
 
 	require.False(t, sm.downloadToDisk(), "gate must be closed when the flag is off")
@@ -400,7 +421,7 @@ func TestDownloadToDisk_NoStore(t *testing.T) {
 // that stops a decoupled block being stranded on disk with no worker to commit it.
 func TestDownloadToDisk_PersistArrivalAndDecouple(t *testing.T) {
 	ctx := context.Background()
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 
 	hash, raw, _ := dtdMakeBlock(t, 500, 11)
 
@@ -428,7 +449,7 @@ func TestDownloadToDisk_PersistArrivalAndDecouple(t *testing.T) {
 // and coalescing: a burst of pokes collapses to a single buffered signal (no
 // wakeup lost, none blocks). A no-op when the feature is off.
 func TestDownloadToDisk_PokeCoalesces(t *testing.T) {
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 
 	// A burst of pokes must never block and must coalesce to one pending signal.
 	for i := 0; i < 100; i++ {
@@ -442,7 +463,7 @@ func TestDownloadToDisk_PokeCoalesces(t *testing.T) {
 	require.Len(t, sm.validateSignal, 1, "poke must re-arm a single wake after draining")
 
 	// Flag off: poke is a no-op (does not touch the channel).
-	off := dtdNewManager(t, false, memory.New())
+	off := dtdNewManager(t, false, dtdDiskStore(t))
 	off.PokeValidateFromDisk()
 	require.Len(t, off.validateSignal, 0, "flag-off poke must be a no-op")
 }
@@ -466,12 +487,13 @@ func TestDownloadToDisk_UniqueBlockHashes(t *testing.T) {
 	dtdBuildStats(t)
 }
 
-// dtdRecordingStore wraps the in-memory blob store to record the DAH / delete /
-// current-height calls the download-to-disk self-clean path makes, so a unit test
-// can assert them directly without waiting on the background janitor. Every other
-// blob.Store method is promoted unchanged from the embedded *memory.Memory.
+// dtdRecordingStore wraps a REAL disk-backed blob store (dtdDiskStore) to record
+// the DAH / delete / current-height calls the download-to-disk self-clean path
+// makes, so a unit test can assert them directly without waiting on the
+// background janitor. Every other blob.Store method is promoted unchanged from
+// the embedded blob.Store.
 type dtdRecordingStore struct {
-	*memory.Memory
+	blob.Store
 	mu        sync.Mutex
 	dahByKey  map[string]uint32
 	delByKey  map[string]int
@@ -479,9 +501,11 @@ type dtdRecordingStore struct {
 	failDel   bool
 }
 
-func newDTDRecordingStore() *dtdRecordingStore {
+func newDTDRecordingStore(t *testing.T) *dtdRecordingStore {
+	t.Helper()
+
 	return &dtdRecordingStore{
-		Memory:   memory.New(),
+		Store:    dtdDiskStore(t),
 		dahByKey: make(map[string]uint32),
 		delByKey: make(map[string]int),
 	}
@@ -492,7 +516,7 @@ func (s *dtdRecordingStore) SetDAH(ctx context.Context, key []byte, ft fileforma
 	s.dahByKey[string(key)] = dah
 	s.mu.Unlock()
 
-	return s.Memory.SetDAH(ctx, key, ft, dah, opts...)
+	return s.Store.SetDAH(ctx, key, ft, dah, opts...)
 }
 
 func (s *dtdRecordingStore) Del(ctx context.Context, key []byte, ft fileformat.FileType, opts ...options.FileOption) error {
@@ -503,11 +527,11 @@ func (s *dtdRecordingStore) Del(ctx context.Context, key []byte, ft fileformat.F
 
 	if fail {
 		// Simulate a wedged/permission-faulted blob backend: record the attempt but leave
-		// the bytes on disk (do NOT call Memory.Del), so haveBlockOnDisk stays true.
+		// the bytes on disk (do NOT call Store.Del), so haveBlockOnDisk stays true.
 		return errors.NewStorageError("dtd test: forced Del failure")
 	}
 
-	return s.Memory.Del(ctx, key, ft, opts...)
+	return s.Store.Del(ctx, key, ft, opts...)
 }
 
 func (s *dtdRecordingStore) SetCurrentBlockHeight(h uint32) {
@@ -515,7 +539,7 @@ func (s *dtdRecordingStore) SetCurrentBlockHeight(h uint32) {
 	s.curHeight = h
 	s.mu.Unlock()
 
-	s.Memory.SetCurrentBlockHeight(h)
+	s.Store.SetCurrentBlockHeight(h)
 }
 
 func (s *dtdRecordingStore) dah(hash chainhash.Hash) (uint32, bool) {
@@ -561,7 +585,7 @@ func dtdModelBlock(t *testing.T, wireBlk *wire.MsgBlock, height uint32) *model.B
 // passes that height.
 func TestDownloadToDisk_ArrivalDAHSet(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 	sm.settings.Legacy.DownloadToDiskArrivalDAHWindow = 100
 
@@ -586,7 +610,7 @@ func TestDownloadToDisk_ArrivalDAHSet(t *testing.T) {
 // self-expiry).
 func TestDownloadToDisk_ArrivalDAHSkipped(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	// Window 0: DAH disabled.
@@ -620,7 +644,7 @@ func TestDownloadToDisk_ArrivalDAHSkipped(t *testing.T) {
 // behaviour that kept the full raw block forever and defeated the buffer's purpose).
 func TestDownloadToDisk_CommitDeletesFromBuffer(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 	sm.settings.Legacy.DownloadToDiskArrivalDAHWindow = 100
 
@@ -676,7 +700,7 @@ func TestDownloadToDisk_CommitDeletesFromBuffer(t *testing.T) {
 // markDiskBlocksCommitted must not touch the store at all (byte-identical to today).
 func TestDownloadToDisk_CommitFlagOffNoStoreCalls(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, false, store) // flag OFF
 
 	_, _, wireBlk := dtdMakeBlock(t, 10, 1)
@@ -691,6 +715,66 @@ func TestDownloadToDisk_CommitFlagOffNoStoreCalls(t *testing.T) {
 	require.False(t, ok, "flag-off commit must not call SetDAH")
 }
 
+// TestDownloadToDisk_RecoverySuccessDeletesFromBuffer is the regression test for the
+// LIVE delete-on-commit leak: commitWindowJob only calls markDiskBlocksCommitted on
+// ProcessBlockWindow's direct-success branch (manager.go ~7373). When the batched
+// ProcessBlockWindow call fails for an infra reason and the bounded per-block
+// recoverWindowCommit retry (manager.go ~7603, driving the single-block
+// sm.ProcessBlock — NOT HandleBlockDirect) subsequently commits every block, that
+// commit is JUST AS GENUINE — the blocks are on the committed chain — but
+// commitWindowJob's recovery-success return path (recErr == nil) falls straight
+// through to `return false` WITHOUT ever calling markDiskBlocksCommitted. The raw
+// bytes for every block in that window are therefore never deleted from the
+// transient download buffer and never carry a working arrival-DAH backstop either
+// (the download store has no blob-deletion scheduler wired — see
+// daemon/daemon_stores.go GetLegacyDownloadStore — so setArrivalDAH's SetDAH call
+// silently no-ops). On a live node, ProcessBlockWindow fails for infra reasons
+// (timeouts, contention) often enough that this leak alone explains a download
+// buffer that only ever grows. This is invisible to a test that calls
+// markDiskBlocksCommitted directly (as the tests above do) because it never drives
+// the ACTUAL commit path (commitWindowJob) through its recovery branch.
+func TestDownloadToDisk_RecoverySuccessDeletesFromBuffer(t *testing.T) {
+	ctx := context.Background()
+
+	spy := &commitSpyBlockValidation{
+		windowErr:         errors.NewStorageError("window commit transient failure"),
+		perBlockErr:       errors.NewStorageError("recovery transient failure"),
+		perBlockFailUntil: 1, // one transient infra failure, then the bounded retry succeeds
+	}
+	sm := newAckTestSyncManager(t, spy)
+	sm.settings.Legacy.DownloadToDisk = true
+	sm.downloadStore = dtdDiskStore(t)
+
+	const n = 3
+
+	wa := newWindowAccumulator(1<<40, 20)
+
+	hashes := make([]chainhash.Hash, n)
+	for i := 0; i < n; i++ {
+		height := int32(9000 + i)
+		hash, raw, wireBlk := dtdMakeBlock(t, height, uint32(i+1))
+		hashes[i] = hash
+
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, nil, raw))
+		require.True(t, sm.haveBlockOnDisk(ctx, hash), "sanity: block lands on disk on arrival")
+
+		wa.add(dtdModelBlock(t, wireBlk, uint32(height))) //nolint:gosec
+	}
+
+	wa.flush(sm.ctx, sm)
+
+	// Sanity: the batched path failed and the bounded per-block recovery genuinely
+	// committed every block (more ProcessBlock calls than blocks — the failed first
+	// attempt plus the successful retry pass).
+	require.Equal(t, int32(1), spy.processWindowCalls.Load(), "sanity: ProcessBlockWindow attempted exactly once")
+	require.Greater(t, spy.processBlockCalls.Load(), int32(n), "sanity: recovery retried the per-block loop after the infra failure")
+
+	for _, h := range hashes {
+		require.False(t, sm.haveBlockOnDisk(ctx, h),
+			"a block committed via the bounded per-block recovery path must be deleted from the transient download buffer, not leaked forever")
+	}
+}
+
 // TestDownloadToDisk_RecoverInvalidDeletesAndRefetches covers Stage B #1: on a
 // consensus-invalid on-disk block the recovery deletes the bad bytes (so the
 // gap-fill frontier re-requests), clears the in-flight ledgers (so it is genuinely
@@ -699,7 +783,7 @@ func TestDownloadToDisk_CommitFlagOffNoStoreCalls(t *testing.T) {
 // times across peer rotations.
 func TestDownloadToDisk_RecoverInvalidDeletesAndRefetches(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	height := int32(42)
@@ -752,7 +836,7 @@ func TestDownloadToDisk_RecoverInvalidDeletesAndRefetches(t *testing.T) {
 // surfaces to the drain, which then leaves the header node in place and retries on
 // the next tick (never a requeue, never a peer disconnect).
 func TestDownloadToDisk_PrepareWorkerMissingBlock(t *testing.T) {
-	store := memory.New()
+	store := dtdDiskStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	hash, _, _ := dtdMakeBlock(t, 7, 1) // never persisted
@@ -776,7 +860,7 @@ func TestDownloadToDisk_PrepareWorkerMissingBlock(t *testing.T) {
 // proves the worker exits promptly on ctx cancellation and stops consuming work,
 // which is the flag-off / shutdown lifecycle the blockHandler relies on.
 func TestDownloadToDisk_PrepareWorkerDeliversOffGoroutine(t *testing.T) {
-	store := memory.New()
+	store := dtdDiskStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	reqC := make(chan diskPrepareReq, 1)
@@ -837,7 +921,7 @@ func TestDownloadToDisk_PrepareWorkerDeliversOffGoroutine(t *testing.T) {
 // which is where the delete-vs-keep decision actually lives.
 func TestDownloadToDisk_TransientFailureKeepsBlock(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	height := int32(4242)
@@ -894,7 +978,7 @@ func TestDownloadToDisk_TransientFailureKeepsBlock(t *testing.T) {
 // delivery is what makes the disk-ahead ceiling the real bound.
 func TestDownloadToDisk_DecoupleClearsInFlightLedger(t *testing.T) {
 	ctx := context.Background()
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 
 	// The in-order validator is running in headers-first mode, so decouple accepts.
 	sm.validateFromDiskActive.Store(true)
@@ -933,7 +1017,7 @@ func TestDownloadToDisk_DecoupleClearsInFlightLedger(t *testing.T) {
 // already on disk and the peer would stop being asked for new gaps.
 func TestDownloadToDisk_ClearInFlightPerPeerLedger(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 
 	// A real (unconnected) peer plus its per-peer sync state registered in peerStates.
 	p := peerpkg.NewInboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{})
@@ -965,7 +1049,7 @@ func TestDownloadToDisk_ClearInFlightPerPeerLedger(t *testing.T) {
 // — surfacing at FileStorer.Close, never storing the bytes, exactly as a failed rename
 // would. Exists() therefore stays false: the file never appeared.
 type dtdCloseFailStore struct {
-	*memory.Memory
+	blob.Store
 }
 
 func (s *dtdCloseFailStore) SetFromReader(ctx context.Context, key []byte, ft fileformat.FileType, reader io.ReadCloser, opts ...options.FileOption) error {
@@ -985,7 +1069,7 @@ func (s *dtdCloseFailStore) SetFromReader(ctx context.Context, key []byte, ft fi
 // imply "durably on disk."
 func TestDownloadToDisk_CloseFailureNotDurableFallsBack(t *testing.T) {
 	ctx := context.Background()
-	store := &dtdCloseFailStore{Memory: memory.New()}
+	store := &dtdCloseFailStore{Store: dtdDiskStore(t)}
 	sm := dtdNewManager(t, true, store)
 
 	// Even with the validator running, a failed durable write must decline the handoff.
@@ -1019,7 +1103,7 @@ func TestDownloadToDisk_CloseFailureNotDurableFallsBack(t *testing.T) {
 // budget of its neighbours.
 func TestDownloadToDisk_BoundedRetryIsPerHash(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	hashA, rawA, _ := dtdMakeBlock(t, 800, 41)
@@ -1068,7 +1152,7 @@ func TestDownloadToDisk_BoundedRetryIsPerHash(t *testing.T) {
 // ticker off. Without the self-poke the channel would be empty and the validator would
 // sleep until the (disabled) ticker — the permanent stall the fix removes.
 func TestDownloadToDisk_SelfRepokeReArmsWake(t *testing.T) {
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 
 	// The per-pass cap is a positive bound (the loop condition fed < cap).
 	require.Positive(t, maxValidateFromDiskPerPass, "per-pass cap must be a positive bound")
@@ -1096,7 +1180,7 @@ func TestDownloadToDisk_SelfRepokeReArmsWake(t *testing.T) {
 // focused on the ONE thing Stage C guarantees: the heavy body runs on the worker's own
 // goroutine, off the drain/fetch path.
 type dtdSlowReadStore struct {
-	*memory.Memory
+	blob.Store
 	delay time.Duration
 }
 
@@ -1121,7 +1205,7 @@ func (s *dtdSlowReadStore) GetIoReader(ctx context.Context, key []byte, ft filef
 func TestDownloadToDisk_SlowPrepareDoesNotBlockDispatcher(t *testing.T) {
 	const delay = 400 * time.Millisecond
 
-	store := &dtdSlowReadStore{Memory: memory.New(), delay: delay}
+	store := &dtdSlowReadStore{Store: dtdDiskStore(t), delay: delay}
 	sm := dtdNewManager(t, true, store)
 
 	reqC := make(chan diskPrepareReq, 1)
@@ -1197,7 +1281,7 @@ func dtdConnectedPeer(t *testing.T, index uint8) *peerpkg.Peer {
 // never be reached, leaving the delete-and-refetch unbounded. This proves the count
 // survives a reset and that the terminal give-up (return false) is then reachable.
 func TestDownloadToDisk_FailCountSurvivesHeaderReset(t *testing.T) {
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 	sm.headerList = list.New()
 
 	hash, _, _ := dtdMakeBlock(t, 500, 1)
@@ -1228,7 +1312,7 @@ func TestDownloadToDisk_FailCountSurvivesHeaderReset(t *testing.T) {
 // delivering-peer record for every committed hash.
 func TestDownloadToDisk_CommitClearsRecoveryState(t *testing.T) {
 	ctx := context.Background()
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 	sm.diskDeliveringPeer = txmap.NewSyncedMap[chainhash.Hash, *peerpkg.Peer]()
 
 	hash, _, blk := dtdMakeBlock(t, 700, 1)
@@ -1256,7 +1340,7 @@ func TestDownloadToDisk_CommitClearsRecoveryState(t *testing.T) {
 // the fallback: when no delivering peer is recorded, the passed sync peer is rotated.
 func TestDownloadToDisk_RecoverAttributesDeliveringPeer(t *testing.T) {
 	ctx := context.Background()
-	sm := dtdNewManager(t, true, newDTDRecordingStore())
+	sm := dtdNewManager(t, true, newDTDRecordingStore(t))
 	sm.diskDeliveringPeer = txmap.NewSyncedMap[chainhash.Hash, *peerpkg.Peer]()
 
 	deliveringPeer := dtdConnectedPeer(t, 30)
@@ -1288,7 +1372,7 @@ func TestDownloadToDisk_RecoverAttributesDeliveringPeer(t *testing.T) {
 // clearInFlightOnArrival stores the delivering peer (its association primary) under the
 // block hash so a later rejection can attribute the fault to it.
 func TestDownloadToDisk_RecordDeliveringPeerOnArrival(t *testing.T) {
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 	sm.diskDeliveringPeer = txmap.NewSyncedMap[chainhash.Hash, *peerpkg.Peer]()
 
 	peer := dtdConnectedPeer(t, 40)
@@ -1312,7 +1396,7 @@ func TestDownloadToDisk_RecordDeliveringPeerOnArrival(t *testing.T) {
 // write can never wedge IBD forever. No peer is disconnected on this path.
 func TestDownloadToDisk_RecoverUnreadableDeletesAndGivesUp(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	hash, raw, _ := dtdMakeBlock(t, 1000, 1)
@@ -1360,7 +1444,7 @@ func TestDownloadToDisk_RecoverUnreadableDeletesAndGivesUp(t *testing.T) {
 // recoverUnreadableDiskBlock (delete-and-refetch) rather than the plain transient-retry
 // path used for a service hiccup inside prepareBlockForWindow.
 func TestDownloadToDisk_PrepareWorkerReadFaultFlag(t *testing.T) {
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 
 	hash, _, _ := dtdMakeBlock(t, 11, 1) // never persisted -> read fails
 
@@ -1377,7 +1461,7 @@ func TestDownloadToDisk_PrepareWorkerReadFaultFlag(t *testing.T) {
 // frontier anchors there again and the walk gap-halts — a no-op when the node still
 // exists or when we are not in headers-first mode.
 func TestDownloadToDisk_RestoreConsumedFrontierNode(t *testing.T) {
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 	sm.headerList = list.New()
 	sm.headerHeightIndex = make(map[chainhash.Hash]int32)
 	sm.headersFirstMode.Store(true)
@@ -1449,7 +1533,7 @@ func dtdMakeZeroTxBlock(t *testing.T, nonce uint32) (chainhash.Hash, []byte) {
 // poison block and keeps servicing subsequent work.
 func TestDownloadToDisk_PanicGuardSurvivesZeroTxBlock(t *testing.T) {
 	ctx := context.Background()
-	store := memory.New()
+	store := dtdDiskStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	// A well-formed header with zero transactions, persisted on disk exactly as a
@@ -1518,7 +1602,7 @@ func TestDownloadToDisk_PanicGuardSurvivesZeroTxBlock(t *testing.T) {
 // surviving counter this loop would delete-and-refetch forever.
 func TestDownloadToDisk_BoundedRetryTerminatesAcrossResets(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 	sm.headerList = list.New()
 
@@ -1577,7 +1661,7 @@ func TestDownloadToDisk_BoundedRetryTerminatesAcrossResets(t *testing.T) {
 // flips exactly at the cap for BOTH the consensus-invalid and the unreadable/panic counters,
 // and that a genuine commit clears it so a re-visited hash gets a clean slate.
 func TestDownloadToDisk_ExhaustedMarkerHaltsWalk(t *testing.T) {
-	sm := dtdNewManager(t, true, newDTDRecordingStore())
+	sm := dtdNewManager(t, true, newDTDRecordingStore(t))
 
 	var invalid, unreadable chainhash.Hash
 	invalid[0] = 0x11
@@ -1620,7 +1704,7 @@ func TestDownloadToDisk_ExhaustedMarkerHaltsWalk(t *testing.T) {
 // wedge IBD forever.
 func TestDownloadToDisk_ExhaustedGivesUpAsBackoffNotPermanentHalt(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	height := int32(6000)
@@ -1670,7 +1754,7 @@ func TestDownloadToDisk_ExhaustedGivesUpAsBackoffNotPermanentHalt(t *testing.T) 
 // window at a time.
 func TestDownloadToDisk_BackoffRetryUndeletableKeepsQuiescing(t *testing.T) {
 	ctx := context.Background()
-	store := newDTDRecordingStore()
+	store := newDTDRecordingStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	height := int32(6100)
@@ -1728,7 +1812,7 @@ func TestDownloadToDisk_BackoffRetryUndeletableKeepsQuiescing(t *testing.T) {
 // consumed) and asserts the worker keeps up with it.
 func TestDownloadToDisk_ConcurrentWorkerArrivalRecoveryRace(t *testing.T) {
 	ctx := context.Background()
-	store := memory.New()
+	store := dtdDiskStore(t)
 	sm := dtdNewManager(t, true, store)
 	sm.diskDeliveringPeer = txmap.NewSyncedMap[chainhash.Hash, *peerpkg.Peer]()
 	sm.headerList = list.New()
@@ -1846,7 +1930,7 @@ func TestDownloadToDisk_ConcurrentWorkerArrivalRecoveryRace(t *testing.T) {
 // arrival. That the write completes with buf=nil is the whole fix.
 func TestDownloadToDisk_StreamingWriteNilBuf(t *testing.T) {
 	ctx := context.Background()
-	store := memory.New()
+	store := dtdDiskStore(t)
 	sm := dtdNewManager(t, true, store)
 
 	hash, raw, blk := dtdMakeBlock(t, 720000, 1)
@@ -1886,8 +1970,8 @@ func TestDownloadToDisk_StreamingWriteNilBuf(t *testing.T) {
 func TestDownloadToDisk_StreamingMatchesBytesOnDisk(t *testing.T) {
 	ctx := context.Background()
 
-	streamStore := memory.New()
-	bytesStore := memory.New()
+	streamStore := dtdDiskStore(t)
+	bytesStore := dtdDiskStore(t)
 	smStream := dtdNewManager(t, true, streamStore)
 	smBytes := dtdNewManager(t, true, bytesStore)
 
@@ -1916,7 +2000,7 @@ func TestDownloadToDisk_StreamingMatchesBytesOnDisk(t *testing.T) {
 // that used to drop the block when buf was nil.
 func TestDownloadToDisk_StreamingDecoupleNilBuf(t *testing.T) {
 	ctx := context.Background()
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 	sm.validateFromDiskActive.Store(true)
 	sm.headersFirstMode.Store(true)
 
@@ -1939,7 +2023,7 @@ func TestDownloadToDisk_StreamingDecoupleNilBuf(t *testing.T) {
 // holds even with the validator running, which is exactly when the old code wrongly dropped it.
 func TestDownloadToDisk_SafetyGuardFallsBackWhenNotDurable(t *testing.T) {
 	ctx := context.Background()
-	sm := dtdNewManager(t, true, memory.New())
+	sm := dtdNewManager(t, true, dtdDiskStore(t))
 	sm.validateFromDiskActive.Store(true)
 	sm.headersFirstMode.Store(true)
 
@@ -1966,7 +2050,7 @@ func TestDownloadToDisk_SafetyGuardFallsBackWhenNotDurable(t *testing.T) {
 // and the ONLY thing that can free it is the arrival path's own defensive pr.CloseWithError
 // after SetFromReader returns. If that backstop were missing the goroutine would leak.
 type dtdEarlyErrorStore struct {
-	*memory.Memory
+	blob.Store
 }
 
 func (s *dtdEarlyErrorStore) SetFromReader(_ context.Context, _ []byte, _ fileformat.FileType, _ io.ReadCloser, _ ...options.FileOption) error {
@@ -1980,7 +2064,7 @@ func (s *dtdEarlyErrorStore) SetFromReader(_ context.Context, _ []byte, _ filefo
 // inline via the safety guard.
 func TestDownloadToDisk_StreamingPipeHygieneOnEarlyWriteError(t *testing.T) {
 	ctx := context.Background()
-	store := &dtdEarlyErrorStore{Memory: memory.New()}
+	store := &dtdEarlyErrorStore{Store: dtdDiskStore(t)}
 	sm := dtdNewManager(t, true, store)
 	sm.validateFromDiskActive.Store(true)
 	sm.headersFirstMode.Store(true)
@@ -2009,7 +2093,7 @@ func TestDownloadToDisk_StreamingPipeHygieneOnEarlyWriteError(t *testing.T) {
 // growth after the loop proves every serialize goroutine terminated.
 func TestDownloadToDisk_StreamingNoGoroutineLeak(t *testing.T) {
 	ctx := context.Background()
-	store := &dtdEarlyErrorStore{Memory: memory.New()}
+	store := &dtdEarlyErrorStore{Store: dtdDiskStore(t)}
 	sm := dtdNewManager(t, true, store)
 
 	const iterations = 200
