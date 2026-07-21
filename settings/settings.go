@@ -739,6 +739,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// Phase 0: makes a frozen header frontier measurable straight from the log.
 			FrontierLogInterval:      getDuration("legacy_frontierLogInterval", 10*time.Second, alternativeContext...),
 			BlockPrefetchBufferBytes: getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
+			// Master gate for the svnode-aligned fetch scheduler. Default false =
+			// today's behaviour, byte-identical (a live no-rebuild rollback lever).
+			SvnodeAlignedFetch: getBool("legacy_svnodeAlignedFetch", false, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

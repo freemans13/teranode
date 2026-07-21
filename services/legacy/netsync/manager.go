@@ -2486,7 +2486,9 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 		txCount := int64(len(bmsg.block.Transactions))
 		sm.blockSizeTracker.addBlockStats(blockSize, txCount)
 
-		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+		// Log the ACTUAL in-flight ceiling: the fixed per-peer count under the
+		// svnode-aligned gate, else the memory/tx budget (byte-identical default).
+		dynamicMax := sm.maxInFlightPerPeer()
 		avgSize := sm.blockSizeTracker.getAverageSize()
 		avgTxCount := sm.blockSizeTracker.getAverageTxCount()
 		sm.logger.Debugf("[%s][%s] Block size: %d bytes (%d txs), avg: %d bytes / %d txs, dynamic max in-flight: %d",
@@ -2654,12 +2656,14 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// request more blocks using the header list to maintain the pipeline
 	// at the dynamic max limit (adjusts based on block size).
 	if !isCheckpointBlock {
-		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+		dynamicMax := sm.maxInFlightPerPeer()
 
-		// Snapshot startHeader under headerMu; fetchHeaderBlocks takes headerMu
-		// itself, so it must be called after releasing the lock.
+		// Snapshot the walk anchor under headerMu; fetchHeaderBlocks takes headerMu
+		// itself, so it must be called after releasing the lock. Under the aligned
+		// gate the anchor is the recomputed download frontier, not the monotonic
+		// startHeader cursor.
 		sm.headerMu.Lock()
-		hasStartHeader := sm.startHeader != nil
+		hasStartHeader := sm.fetchWalkAnchorLocked() != nil
 		sm.headerMu.Unlock()
 
 		if hasStartHeader && state.requestedBlocks.Len() < dynamicMax {
@@ -3128,12 +3132,13 @@ func (sm *SyncManager) pumpBlockRequests(peer *peerpkg.Peer, state *peerSyncStat
 		return
 	}
 
-	dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	dynamicMax := sm.maxInFlightPerPeer()
 
-	// Snapshot startHeader under headerMu; fetchHeaderBlocks takes headerMu
-	// itself, so call it only after releasing the lock.
+	// Snapshot the walk anchor under headerMu; fetchHeaderBlocks takes headerMu
+	// itself, so call it only after releasing the lock. Under the aligned gate the
+	// anchor is the recomputed download frontier, not the monotonic startHeader.
 	sm.headerMu.Lock()
-	hasStartHeader := sm.startHeader != nil
+	hasStartHeader := sm.fetchWalkAnchorLocked() != nil
 	sm.headerMu.Unlock()
 
 	if hasStartHeader && state.requestedBlocks.Len() < dynamicMax {
@@ -3197,12 +3202,13 @@ func (sm *SyncManager) runPostBlockProcessing(peer *peerpkg.Peer, state *peerSyn
 	}
 
 	if !isCheckpointBlock {
-		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+		dynamicMax := sm.maxInFlightPerPeer()
 
-		// Snapshot startHeader under headerMu; fetchHeaderBlocks takes headerMu
-		// itself, so call it only after releasing the lock.
+		// Snapshot the walk anchor under headerMu; fetchHeaderBlocks takes headerMu
+		// itself, so call it only after releasing the lock. Under the aligned gate
+		// the anchor is the recomputed download frontier, not the monotonic cursor.
 		sm.headerMu.Lock()
-		hasStartHeader := sm.startHeader != nil
+		hasStartHeader := sm.fetchWalkAnchorLocked() != nil
 		sm.headerMu.Unlock()
 
 		if hasStartHeader && state.requestedBlocks.Len() < dynamicMax {
@@ -3254,6 +3260,83 @@ func (sm *SyncManager) runPostBlockProcessing(peer *peerpkg.Peer, state *peerSyn
 	}
 }
 
+// svnodeAlignedFetch reports whether the svnode-aligned fetch scheduler is
+// enabled (legacy_svnodeAlignedFetch). Default false = today's behaviour,
+// byte-identical. When true, the in-flight governor is a fixed per-peer count
+// (MaxBlocksInTransitPerPeer) instead of the memory-scaled byte/tx budget, the
+// fetch walk is re-anchored on the download frontier each pass instead of a
+// monotonic cursor, the runway clamp is RETAINED as Teranode's analog of svnode's
+// nDownloadHeightThreshold (bound the fetch to a small lead off the validated tip;
+// np.cpp:412), and an in-flight block is treated as stale only on an IBD-scale
+// budget — so bandwidth
+// is spent on the lowest-height missing blocks (committed+1 first) rather than
+// piled far ahead on big blocks (the mainnet big-block IBD stall at ~701475).
+func (sm *SyncManager) svnodeAlignedFetch() bool {
+	return sm.settings != nil && sm.settings.Legacy.SvnodeAlignedFetch
+}
+
+// maxInFlightPerPeer returns the per-peer in-flight block ceiling used by every
+// fetch top-up guard and by fetchHeaderBlocks' single-peer cap.
+//
+// svnode bounds in-flight by a FIXED, size-blind count of
+// MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16 (validation.h:111; np.cpp:5673,5678 request
+// exactly 16-nBlocksInFlight). Teranode's calculateMaxInFlightBlocks instead
+// scales the ceiling with MEMORY (0.25×GOMEMLIMIT / avgBlockSize), which with a
+// multi-GB GOMEMLIMIT and ~100MB mainnet blocks permits dozens-to-~100 blocks in
+// flight from ONE peer — the ~100-block/~10GB far-ahead pile that starves
+// committed+1 to ~1/100 of the pipe during big-block IBD (freeze-then-burst,
+// live mainnet ~701475). When aligned, the fixed 16 makes committed+1 always
+// 1-of-16 and a full share of the pipe, regardless of block size.
+//
+// Gate off (default): identical to reading calculateMaxInFlightBlocks() at the
+// call site — byte-for-byte today's behaviour.
+func (sm *SyncManager) maxInFlightPerPeer() int {
+	if sm.svnodeAlignedFetch() {
+		k := sm.settings.Legacy.MaxBlocksInTransitPerPeer
+		if k < 1 {
+			k = 1
+		}
+
+		return k
+	}
+
+	return sm.blockSizeTracker.calculateMaxInFlightBlocks()
+}
+
+// downloadFrontierAnchorLocked returns the header-list element the svnode-aligned
+// fetch walk starts from: the lowest header whose block has not yet been consumed
+// — headerList.Front() skipping a stale leading seed. It is the Teranode analog
+// of svnode's pindexLastCommonBlock+1: recomputed EVERY pass (np.cpp:379,386) so
+// the walk can never climb ahead of landed data and can never strand a block
+// below a monotonic cursor. The forward walk then advances over the contiguous
+// on-hand run (committed / in-flight / parked) exactly as svnode advances
+// pindexLastCommonBlock over hasData blocks (np.cpp:449-461), so the ≤16 in-flight
+// always cluster immediately above the frontier. Caller must hold headerMu.
+func (sm *SyncManager) downloadFrontierAnchorLocked() *list.Element {
+	for e := sm.headerList.Front(); e != nil; e = e.Next() {
+		if e == sm.headerListSeed {
+			continue
+		}
+
+		return e
+	}
+
+	return nil
+}
+
+// fetchWalkAnchorLocked returns the element the next fetch walk should start from.
+// Under the svnode-aligned gate it is the recomputed download frontier (front
+// skipping seed); otherwise it is the persisted monotonic startHeader cursor —
+// byte-identical to today. It is also the runway indicator: nil means there is no
+// header runway above the frontier. Caller must hold headerMu.
+func (sm *SyncManager) fetchWalkAnchorLocked() *list.Element {
+	if sm.svnodeAlignedFetch() {
+		return sm.downloadFrontierAnchorLocked()
+	}
+
+	return sm.startHeader
+}
+
 // topUpBlockFetch tops up the in-flight block-fetch window. When the
 // multi-peer flag is enabled (ParallelFetchPeers > 1) it routes to the
 // disjoint multi-peer scheduler (assignBlocksAcrossPeers), distributing new
@@ -3296,7 +3379,12 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	// us and the walk must stop.
 	sm.headerMu.Lock()
 	gen := sm.headerGen
-	e := sm.startHeader
+	// Under the svnode-aligned gate the walk starts at the recomputed DOWNLOAD
+	// frontier (front skipping seed), re-derived every pass, so the cursor can
+	// never climb ahead of landed data and can never strand a block below a
+	// monotonic startHeader (np.cpp:379,386). Off the gate this is startHeader,
+	// byte-identical.
+	e := sm.fetchWalkAnchorLocked()
 	headerListLen := sm.headerList.Len()
 	sm.headerMu.Unlock()
 
@@ -3306,8 +3394,10 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		return
 	}
 
-	// Calculate how many blocks to request to reach the dynamic max limit.
-	// The limit adjusts based on observed block sizes (20 for small, down to 1 for >2GB).
+	// Calculate how many blocks to request to reach the in-flight limit. Off the
+	// gate this is the memory/tx budget (20 for small, down to 1 for >2GB); under
+	// the aligned gate it is the fixed per-peer MaxBlocksInTransitPerPeer (16),
+	// size-blind, so big blocks never inflate the in-flight set.
 	peerState, exists := sm.peerStates.Get(sp)
 	if !exists {
 		sm.logger.Warnf("[fetchHeaderBlocks] sync peer state not found")
@@ -3315,7 +3405,7 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	}
 
 	currentInFlight := peerState.requestedBlocks.Len()
-	dynamicMaxInFlight := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	dynamicMaxInFlight := sm.maxInFlightPerPeer()
 	maxBlocks := dynamicMaxInFlight - currentInFlight
 	if maxBlocks <= 0 {
 		sm.logger.Debugf("[fetchHeaderBlocks] Already at max in-flight blocks (%d/%d), not requesting more", currentInFlight, dynamicMaxInFlight)
@@ -3362,9 +3452,33 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 			continue
 		}
 
+		// svnode-aligned cheap frontier advance (no gRPC): a node already in flight
+		// to this sync peer, or owned by the window pipeline (parked), is on hand /
+		// covered — advance the frontier over it exactly as svnode advances
+		// pindexLastCommonBlock over hasData / skips in-flight blocks (np.cpp:449-461).
+		// This is LOAD-BEARING under the gate: the walk re-anchors at the frontier
+		// each pass and re-walks this prefix, and the single-peer walk has no
+		// in-flight guard of its own, so without this skip an already-outstanding
+		// block would be re-added to the getdata and re-requested (a duplicate
+		// getdata for a big block still downloading). peerState.requestedBlocks has a
+		// 60-min TTL, so a legitimately-slow 100-200MB block stays skipped for the
+		// whole svnode IBD per-block budget rather than being re-bought at 60s.
+		if sm.svnodeAlignedFetch() {
+			_, inFlight := peerState.requestedBlocks.Get(*node.hash)
+			if inFlight || sm.windowBlockOwned(*node.hash) {
+				e = next
+				continue
+			}
+		}
+
 		// Runway cap (see fetchRunwayHorizon): pause the walk at the parkable horizon
 		// so the fetch cursor cannot outrun block assembly. Break before advancing
-		// startHeader so the walk resumes here once the horizon slides up.
+		// startHeader so the walk resumes here once the horizon slides up. This stays
+		// active under the aligned gate: it is Teranode's analog of svnode's
+		// nDownloadHeightThreshold (chainActive.Height()+lowerWindow, np.cpp:412), the
+		// tight per-validated-tip ceiling that keeps svnode from fetching far ahead of a
+		// slow validator. On the single-peer path it is the ONLY such ceiling — the 1024
+		// BlockDownloadWindow lives in assignBlocksAcrossPeers, which never runs here.
 		if horizon, capped := sm.fetchRunwayHorizon(); capped && node.height >= 0 && uint32(node.height) > horizon {
 			sm.logger.Debugf("[fetchHeaderBlocks] runway horizon %d reached at height %d; pausing walk", horizon, node.height)
 			break
@@ -3392,14 +3506,19 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		}
 
 		// Re-take the lock to advance startHeader, aborting if the list was
-		// reset while we were doing the gRPC above.
+		// reset while we were doing the gRPC above. Under the aligned gate the walk
+		// is re-anchored on the download frontier every pass, so the monotonic
+		// startHeader cursor is NOT persisted — advancing it would let it climb
+		// ahead of landed data (the very divergence this fix removes).
 		sm.headerMu.Lock()
 		if sm.headerGen != gen {
 			sm.headerMu.Unlock()
 			sm.logger.Debugf("[fetchHeaderBlocks] header state reset mid-walk, aborting")
 			break
 		}
-		sm.startHeader = next
+		if !sm.svnodeAlignedFetch() {
+			sm.startHeader = next
+		}
 		sm.headerMu.Unlock()
 
 		e = next
@@ -3537,7 +3656,7 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	// lock before calling fetchHeaderBlocks (which re-takes headerMu itself and
 	// must never be called with it held — the lock is non-reentrant).
 	sm.headerMu.Lock()
-	hasRunway := sm.startHeader != nil
+	hasRunway := sm.fetchWalkAnchorLocked() != nil
 	sm.headerMu.Unlock()
 
 	if !hasRunway {
@@ -3575,7 +3694,7 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	// double-request. The non-blocking getdata send (Task 2) means a write-stalled
 	// peer cannot wedge this drain goroutine — a dropped top-up self-heals on the
 	// next tick.
-	if peerState.requestedBlocks.Len() < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
+	if peerState.requestedBlocks.Len() < sm.maxInFlightPerPeer() {
 		sm.fetchHeaderBlocks()
 	}
 }
@@ -3661,7 +3780,7 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 	// (fewer than 2 peers with spare capacity). This keeps behaviour identical to
 	// the pre-multi-peer top-up when only one peer is usable.
 	if len(targets) < 2 {
-		if syncState.requestedBlocks.Len() < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
+		if syncState.requestedBlocks.Len() < sm.maxInFlightPerPeer() {
 			sm.fetchHeaderBlocks()
 		}
 		return
@@ -3676,10 +3795,16 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 	}
 
 	// Budget = min(BlockDownloadWindow, dynamic byte cap). toAssign is how many
-	// more blocks the shared window can absorb this pass.
+	// more blocks the shared window can absorb this pass. Under the svnode-aligned
+	// gate the memory/tx byte cap is DROPPED: BlockDownloadWindow (1024) is only a
+	// loose look-ahead ceiling (np.cpp:391), and the per-peer spare k =
+	// MaxBlocksInTransitPerPeer becomes the sole throttle, so total in-flight = 16 ×
+	// downloading-peers, size-blind (np.cpp:5673,5678).
 	budget := sm.settings.Legacy.BlockDownloadWindow
-	if dynamicCap := sm.blockSizeTracker.calculateMaxInFlightBlocks(); dynamicCap < budget {
-		budget = dynamicCap
+	if !sm.svnodeAlignedFetch() {
+		if dynamicCap := sm.blockSizeTracker.calculateMaxInFlightBlocks(); dynamicCap < budget {
+			budget = dynamicCap
+		}
 	}
 
 	toAssign := budget - totalInFlight
@@ -3694,12 +3819,14 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 	// (commit-blocking) blocks, so they get first claim on this pass's budget.
 	toAssign = sm.drainRefetchBlocks(targets, toAssign)
 
-	// Snapshot headerGen + startHeader under the lock — identical protocol to
+	// Snapshot headerGen + the walk anchor under the lock — identical protocol to
 	// fetchHeaderBlocks. A headerGen change at any later re-take means the list was
-	// reset out from under us and the walk must stop.
+	// reset out from under us and the walk must stop. Under the aligned gate the
+	// anchor is the recomputed download frontier (front skipping seed), not the
+	// monotonic startHeader cursor.
 	sm.headerMu.Lock()
 	gen := sm.headerGen
-	e := sm.startHeader
+	e := sm.fetchWalkAnchorLocked()
 	sm.headerMu.Unlock()
 
 	if e == nil {
@@ -3730,10 +3857,27 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 			continue
 		}
 
+		// svnode-aligned cheap frontier advance (no gRPC): a node already in flight
+		// to some peer, or owned by the window pipeline (parked), is on hand /
+		// covered — advance the frontier over it exactly as svnode advances
+		// pindexLastCommonBlock over hasData / skips in-flight blocks (np.cpp:449-461),
+		// without a haveInventory round-trip or a startHeader persist. The global
+		// requestedBlocks ledger is IBD-scaled under the gate (see New), so a
+		// legitimately-slow big block stays covered for the whole per-block budget.
+		if sm.svnodeAlignedFetch() {
+			if _, inFlight := sm.requestedBlocks.Get(*node.hash); inFlight || sm.windowBlockOwned(*node.hash) {
+				e = next
+				continue
+			}
+		}
+
 		// Runway cap: stop the walk once the frontier reaches the parkable horizon
 		// so the fetch cursor cannot climb unboundedly ahead of block assembly and
 		// saturate the park. Break BEFORE advancing startHeader so the cursor stays
-		// on this node and the walk resumes here as the horizon slides up.
+		// on this node and the walk resumes here as the horizon slides up. This stays
+		// active under the aligned gate as Teranode's analog of svnode's
+		// nDownloadHeightThreshold (np.cpp:412); here it complements the loose 1024
+		// BlockDownloadWindow budget above with the tight per-validated-tip ceiling.
 		if horizon, capped := sm.fetchRunwayHorizon(); capped && node.height >= 0 && uint32(node.height) > horizon {
 			sm.logger.Debugf("[assignBlocksAcrossPeers] runway horizon %d reached at height %d; pausing walk (assigned %d)", horizon, node.height, assigned)
 			break
@@ -3790,14 +3934,19 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 
 		// Advance the shared cursor once per WALKED node (matching
 		// fetchHeaderBlocks, which advances past have-inventory nodes too so it
-		// never re-walks them). Re-take the lock, abort on reset.
+		// never re-walks them). Re-take the lock, abort on reset. Under the aligned
+		// gate the walk is re-anchored on the download frontier every pass, so the
+		// monotonic startHeader cursor is NOT persisted (advancing it is the
+		// divergence this fix removes).
 		sm.headerMu.Lock()
 		if sm.headerGen != gen {
 			sm.headerMu.Unlock()
 			sm.logger.Debugf("[assignBlocksAcrossPeers] header state reset mid-walk, aborting")
 			break
 		}
-		sm.startHeader = next
+		if !sm.svnodeAlignedFetch() {
+			sm.startHeader = next
+		}
 		sm.headerMu.Unlock()
 
 		e = next
@@ -4005,6 +4154,32 @@ func pickMaxSpareTarget(targets []*fetchTarget) *fetchTarget {
 // (0,false) and the forward walk runs uncapped — byte-identical to the pre-park path.
 // Drain-goroutine only (reads cachedBlockAssemblyHeight atomically).
 func (sm *SyncManager) fetchRunwayHorizon() (uint32, bool) {
+	// The runway clamp STAYS active under the svnode-aligned gate — it is Teranode's
+	// analog of svnode's nDownloadHeightThreshold, NOT a bespoke Teranode invention.
+	// svnode's FindNextBlocksToDownload applies TWO forward ceilings: the loose
+	// 1024-block nWindowEnd off pindexLastCommonBlock, AND — decisively —
+	// nDownloadHeightThreshold = chainActive.Height() + DEFAULT_BLOCK_DOWNLOAD_LOWER_WINDOW
+	// (10), carrying the explicit comment "A further limit on how far ahead we download
+	// blocks to reduce disk usage" (np.cpp:395,411-414). Because chainActive.Height()
+	// advances only on VALIDATION, that second ceiling throttles the fetch to ~10 blocks
+	// ahead of the slow validated tip — which is exactly why svnode does not waste
+	// bandwidth far ahead while its validator lags. fetchRunwayHorizon (cachedBA +
+	// maxBehind + parkCap, anchored on the block-assembly height = Teranode's validated
+	// tip) is that same clamp; neutralising it under the gate DIVERGES from svnode, not
+	// aligns to it, and re-opens the mainnet big-block IBD stall (park saturates, the 16
+	// in-flight slots climb above a full park, arrive beyond-gate and are refused
+	// "park buffer full; will re-fetch", then re-requested every pass — far-ahead
+	// bandwidth churn that also keeps lastBlockTime warm and suppresses the silent-peer
+	// rotation that recovers a lost frontier). On the single-peer live path
+	// (ParallelFetchPeers<=1) this clamp is the ONLY such ceiling: assignBlocksAcrossPeers'
+	// 1024 BlockDownloadWindow budget never runs there.
+	//
+	// The flap that once motivated neutralising this clamp (span collapsing to the gate
+	// and STRANDING committed+1 below a monotonic startHeader cursor) can no longer
+	// occur under the gate: the aligned walk re-anchors on the download frontier every
+	// pass (fetchWalkAnchorLocked), so committed+1 is always requested first and the
+	// clamp only ever bounds the TOP of the walk, never the frontier.
+
 	if !sm.parkAheadActive.Load() {
 		return 0, false
 	}
@@ -4192,6 +4367,20 @@ func (sm *SyncManager) reconcileLostAssignments(now time.Time) {
 	}
 
 	timeout := sm.settings.Legacy.BlockInFlightTimeout
+
+	// svnode's per-block IBD timeout is 60 min (600% of the 10-min spacing,
+	// np.cpp:5636-5656; validation.h:177-185) precisely so a legitimately-arriving
+	// 100-200MB block is never mistaken for a stall. The 10s BlockInFlightTimeout
+	// would churn such a block (re-enqueue it while it is actively downloading);
+	// under the aligned gate use the IBD-scale peer deadline instead and let the
+	// throughput gate (BlockStallMinRate, in the head-of-line racing path) be the
+	// real progress signal. The frontier block itself is still rescued fast by
+	// checkHeadStall racing, so lengthening the STALE budget cannot wedge the tip.
+	if sm.svnodeAlignedFetch() {
+		if ibd := sm.settings.Legacy.IBDBlockStallTimeout; ibd > timeout {
+			timeout = ibd
+		}
+	}
 
 	sm.assignedMu.Lock()
 	defer sm.assignedMu.Unlock()
@@ -7708,6 +7897,18 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	blockAssembly blockassembly.ClientI, config *Config) (*SyncManager, error) {
 	initPrometheusMetrics()
 
+	// Global in-flight ledger TTL. Off the gate: 60s (today's value). Under the
+	// svnode-aligned gate the ledger is the in-flight tracking the frontier walk's
+	// cheap-skip and reconcileLostAssignments key on, so it must span svnode's
+	// per-block IBD budget (IBDBlockStallTimeout, ~60m; np.cpp:5636-5656) — a
+	// legitimately-slow 100-200MB block must not have its ledger entry expire and be
+	// re-requested/re-enqueued mid-download. A genuinely lost frontier block is still
+	// rescued fast by the head-of-line racing (checkHeadStall), not by this TTL.
+	globalRequestedBlocksTTL := 60 * time.Second
+	if tSettings.Legacy.SvnodeAlignedFetch && tSettings.Legacy.IBDBlockStallTimeout > globalRequestedBlocksTTL {
+		globalRequestedBlocksTTL = tSettings.Legacy.IBDBlockStallTimeout
+	}
+
 	sm := SyncManager{
 		ctx:          ctx,
 		settings:     tSettings,
@@ -7717,7 +7918,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		chainParams:     config.ChainParams,
 		rejectedTxns:    txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns), // limit map size to maxRejectedTxns
 		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),   // give peers 10 seconds to respond
-		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](60 * time.Second),   // give peers 60 seconds to respond
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](globalRequestedBlocksTTL),
 		peerStates:      txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		// Hash-keyed ownership ledger for blocks between window admission and
 		// commit (see the field doc): prevents the parked-twin double-commit.
