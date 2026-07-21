@@ -722,18 +722,39 @@ type SyncManager struct {
 	// block hash on the download-to-disk in-order validator, keyed by block hash.
 	// It is the bounded-retry backstop for the delete-and-refetch recovery
 	// (recoverInvalidDiskBlock): the first diskValidateFailCap failures self-heal
-	// (delete the bad bytes + rotate the sync peer so an honest copy is fetched),
+	// (delete the bad bytes + rotate the delivering peer so an honest copy is fetched),
 	// but once a block has failed that many times across peer rotations it is treated
 	// as genuinely invalid — the bytes are left on disk and the walk halts — so a
 	// validation false-positive or an all-malicious peer set can never loop forever
-	// re-downloading the same block. Cleared per sync generation in resetHeaderState.
-	// Guarded by diskValidateFailsMu (a leaf lock touched only on the invalid-block
-	// path); never held across headerMu.
+	// re-downloading the same block. It is deliberately NOT cleared in resetHeaderState:
+	// the count must survive the sync-peer rotation that its own recovery-disconnect
+	// provokes (that rotation funnels through updateSyncPeer->resetHeaderState), or the
+	// cap could never be reached and the retry would be unbounded. It is instead cleared
+	// per hash on genuine commit (markDiskBlocksCommitted), which both bounds the map and
+	// gives a committed-then-revisited block a clean slate.
+	//
+	// diskReadFails is the sibling counter for consecutive read/deserialize failures of
+	// the on-disk bytes (corrupt/torn write recovery, recoverUnreadableDiskBlock) — a
+	// distinct failure mode from a consensus-invalid block, so it is counted separately
+	// but bounded by the same cap and cleared on the same commit hook.
+	//
+	// diskDeliveringPeer records, per block hash, the peer that delivered the bytes now
+	// on disk (its association primary), so recoverInvalidDiskBlock can disconnect the
+	// peer that actually delivered the bad bytes rather than an innocent rotated-in sync
+	// peer. Written from the OnBlock read-loop goroutine (clearInFlightOnArrival) and
+	// read from the drain goroutine (recoverInvalidDiskBlock); a txmap.SyncedMap is
+	// internally RWMutex-locked so this cross-goroutine use needs no external lock. It is
+	// cleared per hash on commit and on give-up so it never pins a departed peer.
+	//
+	// Both maps are guarded by diskValidateFailsMu (a leaf lock touched only on the
+	// disk-recovery paths); never held across headerMu.
 	diskValidateFails   map[chainhash.Hash]int
+	diskReadFails       map[chainhash.Hash]int
+	diskDeliveringPeer  *txmap.SyncedMap[chainhash.Hash, *peerpkg.Peer]
 	diskValidateFailsMu sync.Mutex
 	subtreeValidation   subtreevalidation.Interface
-	blockValidation        blockvalidation.Interface
-	blockAssembly          blockassembly.ClientI
+	blockValidation     blockvalidation.Interface
+	blockAssembly       blockassembly.ClientI
 	// cachedBlockAssemblyHeight holds the block-assembly CurrentHeight most
 	// recently observed by the background poller (blockAssemblyHeightPoller).
 	// The per-block coinbase-maturity check reads it atomically on the serial
@@ -1188,13 +1209,15 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 	clear(sm.refetchBlocks)
 	sm.assignedMu.Unlock()
 
-	// A fresh sync generation discards the header list these hashes belonged to;
-	// reset the download-to-disk delete-and-refetch failure counts so a block that
-	// exhausted its retries in a previous generation gets a clean slate. Leaf lock,
-	// never taken across headerMu.
-	sm.diskValidateFailsMu.Lock()
-	clear(sm.diskValidateFails)
-	sm.diskValidateFailsMu.Unlock()
+	// NOTE: the download-to-disk delete-and-refetch failure counts (diskValidateFails /
+	// diskReadFails) are deliberately NOT cleared here. recoverInvalidDiskBlock's own
+	// recovery disconnects the delivering peer, and when that peer is the sync peer the
+	// disconnect funnels back through handleDonePeerMsg->updateSyncPeer->resetHeaderState;
+	// clearing the counts here would wipe the very tally that bounds the retry, so the cap
+	// could never be reached and a genuinely-invalid (or unreadable) block would loop
+	// re-downloading forever. The counts are keyed by hash, self-limiting, and cleared per
+	// block on genuine commit (markDiskBlocksCommitted) instead — a surviving entry for a
+	// hash the rebuilt header list never revisits is harmless.
 
 	// Re-align the header-request look-ahead cursor with the block-level
 	// checkpoint tracker on a fresh sync/recovery. From here they may diverge
@@ -3619,6 +3642,16 @@ func (sm *SyncManager) clearInFlightOnArrival(hash chainhash.Hash, deliveringPee
 
 		if exists {
 			state.requestedBlocks.Delete(hash)
+
+			// Record who delivered these bytes so a later consensus-invalid rejection on
+			// the in-order validator (recoverInvalidDiskBlock) can disconnect the actual
+			// source rather than whichever innocent peer happens to be sync peer at
+			// validation time. Overwritten by the next delivery of the same hash (e.g.
+			// after a delete-and-refetch) and cleared on commit/give-up. SyncedMap is
+			// self-synchronised, safe from this OnBlock read-loop goroutine.
+			if sm.diskDeliveringPeer != nil && resolvedPeer != nil {
+				sm.diskDeliveringPeer.Set(hash, resolvedPeer)
+			}
 		}
 	}
 
@@ -3672,46 +3705,65 @@ func (sm *SyncManager) noteDiskValidateFailure(hash chainhash.Hash) int {
 	return sm.diskValidateFails[hash]
 }
 
-// recoverInvalidDiskBlock self-heals after the in-order disk validator rejects an
-// on-disk block as consensus-invalid (BlockProcessingErrorIsPeerFault). Bounded
-// retry: for the first diskValidateFailCap distinct failures it
-//
-//	(a) DELETES the bad bytes from mainBlockStore so haveBlockOnDisk clears and the
-//	    gap-fill frontier re-requests the height from scratch,
-//	(b) clears every in-flight / assignment ledger entry for the hash so the block
-//	    is genuinely re-requestable (mirrors handleBlockPreamble's delivery-clear),
-//	(c) disconnects the current sync peer (the only peer the disk validator can
-//	    attribute — the walk reads bytes off disk, not from a live delivery) so the
-//	    pipeline rotates and the honest copy is fetched from a different source,
-//
-// and returns true (the caller returns, pausing the walk at this height; it resumes
-// when an honest copy lands). Once the cap is hit the same block has failed across
-// that many peer rotations, so it is treated as genuinely invalid: the bytes are
-// LEFT on disk (haveBlockOnDisk stays true, so the frontier stops re-requesting and
-// we stop churning bandwidth), the failure is logged loudly, and it returns false
-// (the caller halts the walk exactly as the pre-recovery code did). Either way
-// nothing invalid is ever committed — a gap can never be advanced past. Runs on the
-// single drain goroutine under the downloadToDisk() gate.
-func (sm *SyncManager) recoverInvalidDiskBlock(hash chainhash.Hash, height int32, sp *peerpkg.Peer, cause error) bool {
-	fails := sm.noteDiskValidateFailure(hash)
-	if fails >= diskValidateFailCap {
-		// Genuinely invalid: every fetched copy failed. Leave the bytes on disk so
-		// the frontier does not re-request them and halt the walk here. This is the
-		// original (pre-recovery) terminal behaviour, now reached only after
-		// diskValidateFailCap honest attempts rather than on the first failure.
-		sm.logger.Errorf("[drainValidateFromDisk][%s] on-disk block height %d failed validation %d times across peer rotations; treating as genuinely invalid, leaving on disk and halting walk: %v", hash, height, fails, cause)
-		return false
+// noteDiskReadFailure records one read/deserialize failure of hash's on-disk bytes
+// and returns the running count. Sibling of noteDiskValidateFailure for the
+// corrupt-bytes recovery path (recoverUnreadableDiskBlock). Guarded by
+// diskValidateFailsMu; lazily initialises the map.
+func (sm *SyncManager) noteDiskReadFailure(hash chainhash.Hash) int {
+	sm.diskValidateFailsMu.Lock()
+	defer sm.diskValidateFailsMu.Unlock()
+
+	if sm.diskReadFails == nil {
+		sm.diskReadFails = make(map[chainhash.Hash]int)
 	}
 
-	// Delete the bad bytes so haveBlockOnDisk clears and the frontier re-requests.
-	if derr := sm.mainBlockStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
-		sm.logger.Warnf("[drainValidateFromDisk][%s] failed to delete invalid on-disk block height %d: %v", hash, height, derr)
-	}
+	sm.diskReadFails[hash]++
 
-	// Clear every in-flight / assignment ledger so the block is genuinely
-	// re-requestable, mirroring handleBlockPreamble's delivery-clear and
-	// clearInFlightOnArrival — but here the goal is the reverse: make the hash
-	// eligible for a fresh getdata, not retire it.
+	return sm.diskReadFails[hash]
+}
+
+// diskRecoveryExhausted reports whether hash has spent its entire download-to-disk
+// recovery budget — diskValidateFailCap consensus-invalid validations OR the same
+// number of read/deserialize/panic failures. Both counters are cleared ONLY on a
+// genuine commit (clearDiskRecoveryState), which by definition cannot happen for a
+// block that keeps failing, so once a hash reaches the cap this is a STABLE terminal
+// marker. recoverInvalidDiskBlock / recoverUnreadableDiskBlock deliberately LEAVE the
+// bad bytes on disk at the cap, so haveBlockOnDisk stays true and the block remains the
+// lowest-uncommitted download-frontier anchor; the frontier walk therefore MUST consult
+// this and halt, or it would re-select the block on every poke and re-dispatch the heavy
+// prepare forever — a permanent CPU/IO spin on a block that can never commit. Reads on a
+// nil map return 0, so this is safe on the literal-constructed unit harness. Guarded by
+// diskValidateFailsMu (a leaf lock).
+func (sm *SyncManager) diskRecoveryExhausted(hash chainhash.Hash) bool {
+	sm.diskValidateFailsMu.Lock()
+	defer sm.diskValidateFailsMu.Unlock()
+
+	return sm.diskValidateFails[hash] >= diskValidateFailCap || sm.diskReadFails[hash] >= diskValidateFailCap
+}
+
+// clearDiskRecoveryState drops every download-to-disk recovery record for a hash —
+// the two retry counters and the delivering-peer attribution — so a committed (or
+// given-up) block leaves nothing behind. delete on a nil map is a no-op, so this is
+// safe on the literal-constructed unit harness. Called on genuine commit
+// (markDiskBlocksCommitted) to bound the maps and give a revisited hash a clean slate.
+func (sm *SyncManager) clearDiskRecoveryState(hash chainhash.Hash) {
+	sm.diskValidateFailsMu.Lock()
+	delete(sm.diskValidateFails, hash)
+	delete(sm.diskReadFails, hash)
+	sm.diskValidateFailsMu.Unlock()
+
+	if sm.diskDeliveringPeer != nil {
+		sm.diskDeliveringPeer.Delete(hash)
+	}
+}
+
+// clearDiskBlockLedgers removes a hash from every in-flight / assignment fetch ledger
+// so it is genuinely re-requestable by the gap-fill frontier, mirroring
+// handleBlockPreamble's delivery-clear and clearInFlightOnArrival — but here the goal
+// is the reverse of retiring it: make the hash eligible for a fresh getdata. Shared by
+// both delete-and-refetch recoveries (consensus-invalid and unreadable). Takes
+// assignedMu internally; caller must not hold it. Drain-goroutine only.
+func (sm *SyncManager) clearDiskBlockLedgers(hash chainhash.Hash) {
 	sm.requestedBlocks.Delete(hash)
 
 	sm.assignedMu.Lock()
@@ -3729,17 +3781,150 @@ func (sm *SyncManager) recoverInvalidDiskBlock(hash chainhash.Hash, height int32
 	// reservation was released at arrival-decouple; this only clears inFlightBlocks
 	// so a re-fetch is not rejected as a duplicate).
 	sm.ReleaseBlockPrefetch(hash, 0)
+}
 
-	// Rotate the delivering (current sync) peer so the honest copy comes from a
-	// different source — the same escalation commitWindowJob uses on an
-	// unrecoverable commit. Idempotent (DisconnectWithWarning guards itself).
-	if sp != nil {
-		sp.DisconnectWithWarning(fmt.Sprintf("delivered consensus-invalid block %s at height %d (download-to-disk in-order validation); deleting and rotating sync peer to re-fetch: %v", hash, height, cause))
+// recoverInvalidDiskBlock self-heals after the in-order disk validator rejects an
+// on-disk block as consensus-invalid (BlockProcessingErrorIsPeerFault). Bounded
+// retry: for the first diskValidateFailCap distinct failures it
+//
+//	(a) DELETES the bad bytes from mainBlockStore so haveBlockOnDisk clears and the
+//	    gap-fill frontier re-requests the height from scratch,
+//	(b) clears every in-flight / assignment ledger entry for the hash so the block
+//	    is genuinely re-requestable (mirrors handleBlockPreamble's delivery-clear),
+//	(c) disconnects the peer that actually DELIVERED the bad bytes (recorded per hash
+//	    at arrival in diskDeliveringPeer), falling back to the current sync peer sp
+//	    only when the delivering peer is unknown — so the pipeline rotates away from
+//	    the bad source and the honest copy is fetched elsewhere, without penalising an
+//	    innocent peer that merely rotated in as sync peer after the bytes landed,
+//
+// and returns true (the caller returns, pausing the walk at this height; it resumes
+// when an honest copy lands). Once the cap is hit the same block has failed across
+// that many peer rotations, so it is treated as genuinely invalid: the bytes are
+// LEFT on disk (haveBlockOnDisk stays true, so the frontier stops re-requesting and
+// we stop churning bandwidth), the failure is logged loudly, and it returns false
+// (the caller halts the walk exactly as the pre-recovery code did). Either way
+// nothing invalid is ever committed — a gap can never be advanced past. The
+// diskValidateFails count survives resetHeaderState (see the field doc), so the cap
+// is reachable across the very rotation this recovery provokes. Runs on the single
+// drain goroutine under the downloadToDisk() gate.
+func (sm *SyncManager) recoverInvalidDiskBlock(hash chainhash.Hash, height int32, sp *peerpkg.Peer, cause error) bool {
+	fails := sm.noteDiskValidateFailure(hash)
+	if fails >= diskValidateFailCap {
+		// Genuinely invalid: every fetched copy failed. Leave the bytes on disk so
+		// the frontier does not re-request them and halt the walk here. This is the
+		// original (pre-recovery) terminal behaviour, now reached only after
+		// diskValidateFailCap honest attempts rather than on the first failure. Do NOT
+		// disconnect: the block failed identically from multiple sources, so it is a
+		// genuinely-invalid block, not a peer to blame. Drop the delivering-peer record
+		// so it never pins a departed peer.
+		if sm.diskDeliveringPeer != nil {
+			sm.diskDeliveringPeer.Delete(hash)
+		}
+
+		sm.logger.Errorf("[drainValidateFromDisk][%s] on-disk block height %d failed validation %d times across peer rotations; treating as genuinely invalid, leaving on disk and halting walk: %v", hash, height, fails, cause)
+
+		return false
 	}
 
-	sm.logger.Warnf("[drainValidateFromDisk][%s] deleted invalid on-disk block height %d and rotated sync peer; will re-fetch (attempt %d/%d): %v", hash, height, fails, diskValidateFailCap, cause)
+	// Delete the bad bytes so haveBlockOnDisk clears and the frontier re-requests.
+	if derr := sm.mainBlockStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
+		sm.logger.Warnf("[drainValidateFromDisk][%s] failed to delete invalid on-disk block height %d: %v", hash, height, derr)
+	}
+
+	// Make the hash re-requestable again.
+	sm.clearDiskBlockLedgers(hash)
+
+	// Rotate the peer that DELIVERED the bad bytes (recorded per hash at arrival) so
+	// the honest copy comes from a different source. Only when that peer is unknown do
+	// we fall back to the current sync peer sp — the pre-attribution behaviour — which
+	// still guarantees a rotation. Idempotent (DisconnectWithWarning guards itself).
+	target := sp
+
+	if sm.diskDeliveringPeer != nil {
+		if dp, ok := sm.diskDeliveringPeer.Get(hash); ok && dp != nil {
+			target = dp
+		}
+	}
+
+	if target != nil {
+		target.DisconnectWithWarning(fmt.Sprintf("delivered consensus-invalid block %s at height %d (download-to-disk in-order validation); deleting and rotating delivering peer to re-fetch: %v", hash, height, cause))
+	}
+
+	sm.logger.Warnf("[drainValidateFromDisk][%s] deleted invalid on-disk block height %d and rotated delivering peer; will re-fetch (attempt %d/%d): %v", hash, height, fails, diskValidateFailCap, cause)
 
 	return true
+}
+
+// recoverUnreadableDiskBlock self-heals a block whose bytes are present on disk but
+// fail to read/deserialize (readRawBlockFromDisk error) — a torn or corrupt write, NOT
+// a peer-fault (the bytes deserialized on the wire before being written, so a malicious
+// peer cannot trigger this; it is pure corruption recovery, which is why no peer is
+// disconnected). Without this a persistently-unreadable block is retried forever and
+// wedges IBD across restarts. Bounded exactly like recoverInvalidDiskBlock and by the
+// same cap:
+//
+//   - below the cap: DELETE the unreadable bytes so haveBlockOnDisk clears and the
+//     frontier re-requests a fresh copy, clear the fetch ledgers, and return true (the
+//     caller halts the walk; the honest copy resumes it). A transient store hiccup that
+//     clears on its own before the cap simply reads fine on a later tick and never
+//     deletes, because the count only advances on an actual read failure of the SAME
+//     hash.
+//   - at/after the cap: the fresh copy is STILL unreadable, so this is a persistent
+//     store fault (or a source that keeps delivering corrupt bytes). Stop churning:
+//     leave the bytes, log loudly, and return false (halt) — the same give-up shape as
+//     the consensus path, so the delete-and-refetch can never loop unbounded.
+//
+// Runs on the single drain goroutine under the downloadToDisk() gate.
+func (sm *SyncManager) recoverUnreadableDiskBlock(hash chainhash.Hash, height int32, cause error) bool {
+	fails := sm.noteDiskReadFailure(hash)
+	if fails >= diskValidateFailCap {
+		sm.logger.Errorf("[drainValidateFromDisk][%s] on-disk block height %d still unreadable after %d attempts (delete-and-refetch exhausted); leaving on disk and halting walk: %v", hash, height, fails, cause)
+		return false
+	}
+
+	// Delete the unreadable bytes so haveBlockOnDisk clears and the frontier re-requests.
+	if derr := sm.mainBlockStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
+		sm.logger.Warnf("[drainValidateFromDisk][%s] failed to delete unreadable on-disk block height %d: %v", hash, height, derr)
+	}
+
+	sm.clearDiskBlockLedgers(hash)
+
+	sm.logger.Warnf("[drainValidateFromDisk][%s] deleted unreadable on-disk block height %d; will re-fetch (attempt %d/%d): %v", hash, height, fails, diskValidateFailCap, cause)
+
+	return true
+}
+
+// restoreConsumedFrontierNode re-inserts a header node at the front of the header list
+// (and its headerHeightIndex entry) for a hash whose front node handleBlockPreamble
+// already consumed. It is the runway-repair half of the SYNCHRONOUS feedDiskBlock
+// peer-fault recovery: on that path the preamble removed the block's front node before
+// recoverInvalidDiskBlock deleted the bytes, so without this the download frontier would
+// anchor at height+1 and MARCH PAST the now-missing block — either wedging on the
+// contiguity wait for the parent or, worse, consuming further nodes. Restoring the front
+// node makes the frontier anchor at this hash again; with the bytes deleted the walk then
+// cleanly gap-halts here until an honest copy is re-fetched. It is a no-op when the node
+// still exists (headerHeightIndex already has the hash — e.g. a checkpoint block retained
+// as the leading seed, or the async path where the node was never consumed) so it is safe
+// to call unconditionally, and a no-op outside headers-first mode (a concurrent
+// resetHeaderState may have rebuilt the list from the committed tip, which re-includes this
+// hash itself). Takes headerMu; caller must not hold it. Drain-goroutine only.
+func (sm *SyncManager) restoreConsumedFrontierNode(hash chainhash.Hash, height int32) {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if !sm.headersFirstMode.Load() {
+		return
+	}
+
+	if _, ok := sm.headerHeightIndex[hash]; ok {
+		// The node is still present (retained seed, or never consumed): nothing to do.
+		return
+	}
+
+	h := hash
+	node := headerNode{height: height, hash: &h}
+	sm.headerList.PushFront(&node)
+	sm.headerHeightIndex[hash] = height
 }
 
 // markDiskBlocksCommitted is the download-to-disk commit-finalize hook. For every
@@ -3753,6 +3938,14 @@ func (sm *SyncManager) recoverInvalidDiskBlock(hash chainhash.Hash, height int32
 // already committed to the blockchain. Called from both commit-finalize points: the
 // window path (commitWindowJob success) and the direct / checkpoint path
 // (HandleBlockDirect success).
+//
+// RESIDUAL (accepted, matches svnode): clearing the DAH to 0 is permanent — a block
+// committed here and LATER reorged out keeps its permanent DAH and is retained on disk
+// rather than being re-expired. This mirrors svnode, which never prunes a block it once
+// connected (a reorged block stays in the block files, only its chain-active flag flips),
+// and it is deliberate: a reorg may switch back, and re-fetching a block we already have
+// is pure waste. The only growth this admits is reorged-out branches, which are bounded
+// by chainwork and negligible next to the active chain — so no reclaim code is warranted.
 func (sm *SyncManager) markDiskBlocksCommitted(ctx context.Context, blocks []*model.Block) {
 	if !sm.downloadToDisk() || len(blocks) == 0 {
 		return
@@ -3769,6 +3962,12 @@ func (sm *SyncManager) markDiskBlocksCommitted(ctx context.Context, blocks []*mo
 		if derr := sm.mainBlockStore.SetDAH(ctx, h[:], fileformat.FileTypeBlock, 0); derr != nil {
 			sm.logger.Debugf("[markDiskBlocksCommitted][%s] failed to clear DAH on commit: %v", h.String(), derr)
 		}
+
+		// Genuine commit: drop any lingering delete-and-refetch recovery state for this
+		// hash (retry counters + delivering-peer record). This is where the counts are
+		// cleared now that resetHeaderState no longer wipes them — it bounds the maps and
+		// gives a committed-then-revisited hash a clean slate.
+		sm.clearDiskRecoveryState(*h)
 
 		if b.Height > maxHeight {
 			maxHeight = b.Height
@@ -6795,6 +6994,21 @@ type diskPrepared struct {
 	msgBlock *wire.MsgBlock
 	prepared *model.Block
 	err      error
+	// readFault is set when err came from reading/deserializing the on-disk bytes
+	// (readRawBlockFromDisk) rather than from prepareBlockForWindow. It lets the drain
+	// route a corrupt-bytes failure to recoverUnreadableDiskBlock (bounded
+	// delete-and-refetch) while keeping a transient prepare error on the plain retry
+	// path — the bytes must not be deleted for a transient service hiccup.
+	readFault bool
+	// panicFault is set when prepareBlockForWindow PANICKED (e.g. a malformed on-disk
+	// block that deserialized to zero transactions, hitting block.Transactions()[0]
+	// before prepareSubtrees' own recover). A panic is deterministic on the same bytes,
+	// so — like readFault — the drain routes it through the bounded delete-and-refetch
+	// (recoverUnreadableDiskBlock) rather than the uncapped transient-retry path;
+	// otherwise a deterministically-panicking block would re-prepare forever, never
+	// deleted so never re-fetched, and the cap that guards the other paths never engages.
+	// The worker itself survives the panic via preparePanicGuarded.
+	panicFault bool
 }
 
 // prepareDiskBlock is the heavy body the download-to-disk validator runs OFF the
@@ -6812,6 +7026,7 @@ func (sm *SyncManager) prepareDiskBlock(ctx context.Context, req diskPrepareReq)
 	msgBlock, readErr := sm.readRawBlockFromDisk(ctx, req.hash)
 	if readErr != nil {
 		res.err = readErr
+		res.readFault = true
 		return res
 	}
 
@@ -6829,11 +7044,46 @@ func (sm *SyncManager) prepareDiskBlock(ctx context.Context, req diskPrepareReq)
 	// preamble re-derives on the drain when it feeds the prepared block (a matching
 	// frontier hash on re-entry guarantees the same header generation, hence the same
 	// height), so the prepared block's height can never disagree with the fed height.
-	prepared, prepErr := sm.prepareBlockForWindow(ctx, req.peer, req.hash, msgBlock, heightU32)
+	//
+	// It runs behind a panic guard: prepareBlockForWindow indexes block.Transactions()[0]
+	// (the coinbase) BEFORE prepareSubtrees' own recover is reached, so a malformed
+	// on-disk block that deserialized to zero transactions panics with an index-out-of
+	// -range. This body executes on the dedicated always-on diskPrepareWorker goroutine,
+	// where an unrecovered panic would crash the WHOLE process, not just fail this block.
+	// preparePanicGuarded converts the panic into an error AND flags panicked, so the
+	// worker keeps running and the drain routes the block through the BOUNDED
+	// delete-and-refetch (panicFault, like readFault) rather than an unbounded transient
+	// retry — a panic is deterministic on the same bytes, so retrying them forever would
+	// wedge IBD; deleting and re-fetching a fresh copy (capped by diskValidateFailCap)
+	// self-heals or halts loudly.
+	prepared, prepErr, panicked := sm.preparePanicGuarded(ctx, req, msgBlock, heightU32)
 	res.prepared = prepared
 	res.err = prepErr
+	res.panicFault = panicked
 
 	return res
+}
+
+// preparePanicGuarded runs prepareBlockForWindow with a recover() so a panic on the
+// dedicated diskPrepareWorker goroutine (e.g. a zero-transaction on-disk block hitting
+// block.Transactions()[0]) becomes an error + panicked=true instead of crashing the
+// process. See prepareDiskBlock for why the guard lives here rather than inside
+// prepareBlockForWindow. The panicked flag is propagated to diskPrepared.panicFault so
+// the drain routes the block through the BOUNDED delete-and-refetch (a panic is
+// deterministic on the same bytes, so it must be capped, not retried forever); the
+// worker keeps running either way.
+func (sm *SyncManager) preparePanicGuarded(ctx context.Context, req diskPrepareReq, msgBlock *wire.MsgBlock, heightU32 uint32) (prepared *model.Block, err error, panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			prepared = nil
+			err = errors.NewProcessingError("[prepareDiskBlock][%s] recovered panic preparing on-disk block at height %d: %v", req.hash.String(), req.height, r)
+			panicked = true
+		}
+	}()
+
+	prepared, err = sm.prepareBlockForWindow(ctx, req.peer, req.hash, msgBlock, heightU32)
+
+	return prepared, err, false
 }
 
 // diskPrepareWorker is the dedicated goroutine that decouples the download-to-disk
@@ -7667,11 +7917,24 @@ func (sm *SyncManager) blockHandler() {
 						// gap the chain, so the walk pauses here regardless (nothing invalid is
 						// ever committed). recoverInvalidDiskBlock self-heals within a bounded
 						// retry: delete the bad bytes so the gap-fill frontier re-requests an
-						// honest copy, clear its in-flight ledgers, and rotate the sync peer so
-						// the re-fetch comes from a different source; once the same block has
-						// failed diskValidateFailCap times across rotations it is treated as
+						// honest copy, clear its in-flight ledgers, and rotate the delivering
+						// peer so the re-fetch comes from a different source; once the same block
+						// has failed diskValidateFailCap times across rotations it is treated as
 						// genuinely invalid (left on disk, logged loudly) instead of churning.
 						sm.recoverInvalidDiskBlock(hash, height, sp, herr)
+
+						// UNLIKE the async path, this synchronous feed already ran
+						// handleBlockMsgWithWindow's preamble, which CONSUMED this block's front
+						// header node before the reject. recoverInvalidDiskBlock just deleted the
+						// bytes, so without repair the download frontier would anchor at height+1
+						// and march past the now-missing block. Re-insert the consumed front node
+						// so the frontier anchors here again and the walk cleanly gap-halts until
+						// an honest copy is re-fetched (a no-op when the node still exists, e.g. a
+						// checkpoint block retained as seed). This keeps the strict-ascending,
+						// no-gap commit invariant on the sync path exactly as the async path
+						// already holds it.
+						sm.restoreConsumedFrontierNode(hash, height)
+
 						return true
 					}
 
@@ -7801,6 +8064,20 @@ func (sm *SyncManager) blockHandler() {
 					return
 				}
 
+				// Terminal give-up guard: a block that exhausted its recovery budget
+				// (diskValidateFailCap consensus-invalid validations, or the same number of
+				// unreadable/panic failures) was deliberately LEFT on disk by
+				// recoverInvalidDiskBlock/recoverUnreadableDiskBlock — it never commits and is
+				// never window-owned, so it stays the frontier anchor. Without this guard the
+				// walk would re-select it every poke and re-dispatch the heavy prepare forever
+				// (a permanent spin on a block that can never commit). Halt here instead: the
+				// chain cannot advance past a genuinely-invalid frontier block, so quiesce (the
+				// cap-hit was already logged loudly once) until an operator intervenes or a
+				// header reset rebuilds the chain from the committed tip.
+				if sm.diskRecoveryExhausted(hash) {
+					return
+				}
+
 				if !sm.haveBlockOnDisk(sm.ctx, hash) {
 					// Out-of-order gap: leave the walk here; the arrival poke resumes it
 					// the instant the missing block lands.
@@ -7852,10 +8129,26 @@ func (sm *SyncManager) blockHandler() {
 								return
 							}
 
-							// Transient read/prepare failure: leave the bytes and the header node in
-							// place and retry on the next arrival/refill poke, exactly as the inline
-							// readRawBlockFromDisk error path did. No requeue (the node was never
-							// consumed), no self-repoke (avoid spinning on a persistent store error).
+							if res.readFault || res.panicFault {
+								// The on-disk bytes could not be turned into a block — either they
+								// failed to read/deserialize (readFault: a corrupt/torn write) or
+								// prepareBlockForWindow PANICKED on them (panicFault: e.g. a zero-tx
+								// body). Neither is a peer-fault (the bytes deserialized on the wire
+								// before being written), but both are DETERMINISTIC on the same
+								// bytes, so route through the bounded delete-and-refetch: a few
+								// retries, then delete the bad bytes so haveBlockOnDisk clears and the
+								// frontier re-requests a fresh copy, then give up (halt) once even a
+								// fresh copy fails — never an unbounded re-prepare. The header node is
+								// still present (prepare ran before the preamble).
+								sm.recoverUnreadableDiskBlock(hash, height, res.err)
+								return
+							}
+
+							// Transient prepare failure (a service/storage hiccup inside
+							// prepareBlockForWindow, not the bytes themselves): leave the bytes and
+							// the header node in place and retry on the next arrival/refill poke,
+							// exactly as the inline path did. No requeue (the node was never
+							// consumed), no self-repoke (avoid spinning on a persistent error).
 							sm.logger.Warnf("[drainValidateFromDisk][%s] async prepare failed height %d, will retry: %v", hash, height, res.err)
 							return
 						}
@@ -7915,9 +8208,13 @@ func (sm *SyncManager) blockHandler() {
 				// prepareBlockForWindow, so there is nothing heavy to offload.
 				msgBlock, readErr := sm.readRawBlockFromDisk(sm.ctx, hash)
 				if readErr != nil {
-					// Corrupt/unreadable on disk: leave it for the next tick; a persistent
-					// failure is recovered by the sync-peer rotation / header reset backstop.
-					sm.logger.Warnf("[drainValidateFromDisk][%s] failed to read on-disk block height %d, will retry: %v", hash, height, readErr)
+					// Unreadable on disk. The header node is still present here (the read
+					// happens BEFORE feedDiskBlock runs the preamble), so route through the
+					// bounded delete-and-refetch: a few transient retries, then delete the
+					// corrupt bytes so haveBlockOnDisk clears and the frontier re-requests a
+					// fresh copy, then give up (halt) if even the fresh copy is unreadable —
+					// so a corrupt/torn write can never wedge IBD forever across restarts.
+					sm.recoverUnreadableDiskBlock(hash, height, readErr)
 					return
 				}
 
@@ -8994,6 +9291,10 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// Hash-keyed ownership ledger for blocks between window admission and
 		// commit (see the field doc): prevents the parked-twin double-commit.
 		windowOwnedBlocks: txmap.NewSyncedMap[chainhash.Hash, uint32](),
+		// Per-hash record of the peer that delivered the bytes now on disk, so the
+		// download-to-disk in-order validator can attribute a bad block to its actual
+		// source (see the field doc + recoverInvalidDiskBlock).
+		diskDeliveringPeer: txmap.NewSyncedMap[chainhash.Hash, *peerpkg.Peer](),
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:           make(chan interface{}, maxMsgQueueSize),
 		headerList:        list.New(),

@@ -36,6 +36,7 @@ package netsync
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"io"
 	"sync"
@@ -1122,5 +1123,573 @@ func TestDownloadToDisk_SlowPrepareDoesNotBlockDispatcher(t *testing.T) {
 			"a slow-read storage error is transient, not a peer-fault")
 	case <-time.After(5 * time.Second):
 		t.Fatal("worker never delivered the slow prepare result")
+	}
+}
+
+// dtdConnectedPeer builds a genuinely connected peer (over a real pipe, via
+// captureGetDataPeer) so a DisconnectWithWarning closes its connection and flips
+// Connected() to false — the observable the recovery-attribution tests assert on. A
+// TstMarkConnected peer would panic on disconnect (no underlying conn to Close).
+func dtdConnectedPeer(t *testing.T, index uint8) *peerpkg.Peer {
+	t.Helper()
+
+	var (
+		mu      sync.Mutex
+		capture []*wire.MsgGetData
+	)
+
+	p := captureGetDataPeer(t, &chaincfg.MainNetParams, index, &mu, &capture)
+	require.True(t, p.Connected(), "precondition: peer starts connected")
+
+	return p
+}
+
+// TestDownloadToDisk_FailCountSurvivesHeaderReset covers Stage-1 fix 1: the per-hash
+// consensus-invalid retry count must NOT be wiped by resetHeaderState — otherwise the
+// sync-peer rotation that the recovery's own disconnect provokes (which funnels through
+// updateSyncPeer->resetHeaderState) would reset the tally every time and the cap could
+// never be reached, leaving the delete-and-refetch unbounded. This proves the count
+// survives a reset and that the terminal give-up (return false) is then reachable.
+func TestDownloadToDisk_FailCountSurvivesHeaderReset(t *testing.T) {
+	sm := dtdNewManager(t, true, memory.New())
+	sm.headerList = list.New()
+
+	hash, _, _ := dtdMakeBlock(t, 500, 1)
+
+	// Two consensus-invalid failures short of the cap (cap == 3).
+	require.Equal(t, 1, sm.noteDiskValidateFailure(hash))
+	require.Equal(t, 2, sm.noteDiskValidateFailure(hash))
+
+	// A header reset (the rotation the recovery-disconnect would provoke) must leave
+	// the count intact.
+	newest, _, _ := dtdMakeBlock(t, 499, 9)
+	sm.resetHeaderState(&newest, 499)
+
+	sm.diskValidateFailsMu.Lock()
+	surviving := sm.diskValidateFails[hash]
+	sm.diskValidateFailsMu.Unlock()
+	require.Equal(t, 2, surviving, "resetHeaderState must NOT clear the retry count")
+
+	// The next failure hits the cap, so the terminal give-up is now reachable across
+	// the reset: recover returns false (genuinely invalid, halt) rather than looping.
+	require.False(t, sm.recoverInvalidDiskBlock(hash, 500, nil, errors.NewBlockInvalidError("still bad")),
+		"cap must be reachable across a header reset (terminal give-up returns false)")
+}
+
+// TestDownloadToDisk_CommitClearsRecoveryState covers Stage-1 fix 1 (the other half):
+// now that resetHeaderState no longer clears the retry maps, a genuine commit is what
+// bounds them — markDiskBlocksCommitted must drop the retry counters AND the
+// delivering-peer record for every committed hash.
+func TestDownloadToDisk_CommitClearsRecoveryState(t *testing.T) {
+	ctx := context.Background()
+	sm := dtdNewManager(t, true, memory.New())
+	sm.diskDeliveringPeer = txmap.NewSyncedMap[chainhash.Hash, *peerpkg.Peer]()
+
+	hash, _, blk := dtdMakeBlock(t, 700, 1)
+
+	sm.noteDiskValidateFailure(hash)
+	sm.noteDiskReadFailure(hash)
+	sm.diskDeliveringPeer.Set(hash, dtdConnectedPeer(t, 20))
+
+	sm.markDiskBlocksCommitted(ctx, []*model.Block{dtdModelBlock(t, blk, 700)})
+
+	sm.diskValidateFailsMu.Lock()
+	_, hasValidate := sm.diskValidateFails[hash]
+	_, hasRead := sm.diskReadFails[hash]
+	sm.diskValidateFailsMu.Unlock()
+	require.False(t, hasValidate, "commit must clear the consensus-invalid retry count")
+	require.False(t, hasRead, "commit must clear the read-failure retry count")
+
+	_, hasPeer := sm.diskDeliveringPeer.Get(hash)
+	require.False(t, hasPeer, "commit must clear the delivering-peer record")
+}
+
+// TestDownloadToDisk_RecoverAttributesDeliveringPeer covers Stage-1 fix 2: recovery
+// disconnects the peer that actually DELIVERED the bad bytes (recorded per hash), not
+// whichever innocent peer happens to be sync peer at validation time. It also proves
+// the fallback: when no delivering peer is recorded, the passed sync peer is rotated.
+func TestDownloadToDisk_RecoverAttributesDeliveringPeer(t *testing.T) {
+	ctx := context.Background()
+	sm := dtdNewManager(t, true, newDTDRecordingStore())
+	sm.diskDeliveringPeer = txmap.NewSyncedMap[chainhash.Hash, *peerpkg.Peer]()
+
+	deliveringPeer := dtdConnectedPeer(t, 30)
+	syncPeer := dtdConnectedPeer(t, 31)
+
+	hash, raw, _ := dtdMakeBlock(t, 800, 1)
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	sm.diskDeliveringPeer.Set(hash, deliveringPeer)
+
+	cause := errors.NewBlockInvalidError("bad from delivering peer")
+	require.True(t, sm.recoverInvalidDiskBlock(hash, 800, syncPeer, cause),
+		"below the cap the recovery self-heals and returns true")
+
+	require.Eventually(t, func() bool { return !deliveringPeer.Connected() }, 2*time.Second, 5*time.Millisecond,
+		"the peer that delivered the bad bytes must be disconnected")
+	require.True(t, syncPeer.Connected(),
+		"the innocent sync peer must NOT be disconnected when the delivering peer is known")
+
+	// Fallback: no recorded delivering peer for a different hash -> the sync peer is
+	// rotated (pre-attribution behaviour), guaranteeing a rotation still happens.
+	hash2, raw2, _ := dtdMakeBlock(t, 801, 2)
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash2, raw2))
+	require.True(t, sm.recoverInvalidDiskBlock(hash2, 801, syncPeer, cause))
+	require.Eventually(t, func() bool { return !syncPeer.Connected() }, 2*time.Second, 5*time.Millisecond,
+		"with no delivering peer recorded, the recovery falls back to rotating the sync peer")
+}
+
+// TestDownloadToDisk_RecordDeliveringPeerOnArrival covers the recording half of fix 2:
+// clearInFlightOnArrival stores the delivering peer (its association primary) under the
+// block hash so a later rejection can attribute the fault to it.
+func TestDownloadToDisk_RecordDeliveringPeerOnArrival(t *testing.T) {
+	sm := dtdNewManager(t, true, memory.New())
+	sm.diskDeliveringPeer = txmap.NewSyncedMap[chainhash.Hash, *peerpkg.Peer]()
+
+	peer := dtdConnectedPeer(t, 40)
+	sm.peerStates.Set(peer, &peerSyncState{
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	})
+
+	hash, _, _ := dtdMakeBlock(t, 900, 1)
+	sm.clearInFlightOnArrival(hash, peer)
+
+	recorded, ok := sm.diskDeliveringPeer.Get(hash)
+	require.True(t, ok, "arrival must record the delivering peer")
+	require.Equal(t, peer, recorded, "recorded peer must be the delivering peer")
+}
+
+// TestDownloadToDisk_RecoverUnreadableDeletesAndGivesUp covers Stage-1 fix 4: a block
+// whose bytes are present but fail to read/deserialize is NOT a peer-fault (the bytes
+// deserialized on the wire before being written), yet must still self-heal within a
+// bound — delete the corrupt bytes so the frontier re-requests a fresh copy — and give
+// up (halt, leave the bytes) once even the fresh copy is unreadable, so a corrupt/torn
+// write can never wedge IBD forever. No peer is disconnected on this path.
+func TestDownloadToDisk_RecoverUnreadableDeletesAndGivesUp(t *testing.T) {
+	ctx := context.Background()
+	store := newDTDRecordingStore()
+	sm := dtdNewManager(t, true, store)
+
+	hash, raw, _ := dtdMakeBlock(t, 1000, 1)
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.True(t, sm.haveBlockOnDisk(ctx, hash))
+
+	// Seed the in-flight ledgers so we can prove the recovery clears them.
+	sm.requestedBlocks.Set(hash, struct{}{})
+	sm.assignedMu.Lock()
+	sm.refetchBlocks[hash] = struct{}{}
+	sm.assignedMu.Unlock()
+
+	cause := errors.NewProcessingError("deserialize failure")
+	require.False(t, BlockProcessingErrorIsPeerFault(cause), "sanity: a read fault is not a peer-fault")
+
+	// The first (cap-1) failures self-heal: delete + clear + return true.
+	for i := 1; i < diskValidateFailCap; i++ {
+		require.True(t, sm.recoverUnreadableDiskBlock(hash, 1000, cause),
+			"attempt %d (below cap) must delete-and-refetch and return true", i)
+	}
+
+	require.False(t, sm.haveBlockOnDisk(ctx, hash), "corrupt bytes must be deleted so the frontier re-requests")
+	require.Positive(t, store.delCount(hash), "block must be deleted from the store")
+
+	_, stillRequested := sm.requestedBlocks.Get(hash)
+	require.False(t, stillRequested, "in-flight ledger must be cleared")
+	sm.assignedMu.Lock()
+	_, stillRefetch := sm.refetchBlocks[hash]
+	sm.assignedMu.Unlock()
+	require.False(t, stillRefetch, "refetch ledger must be cleared")
+
+	// Re-persist to represent the fresh copy that is ALSO unreadable.
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+	require.True(t, sm.haveBlockOnDisk(ctx, hash))
+
+	// The cap-th failure gives up: leave the bytes, return false (halt), no loop.
+	require.False(t, sm.recoverUnreadableDiskBlock(hash, 1000, cause),
+		"the cap-th read failure must give up (halt) rather than delete again")
+	require.True(t, sm.haveBlockOnDisk(ctx, hash),
+		"give-up must leave the bytes on disk to stop the delete-and-refetch loop")
+}
+
+// TestDownloadToDisk_PrepareWorkerReadFaultFlag covers fix 4's routing plumbing: a read
+// failure inside the prepare worker is flagged (readFault) so the drain can send it to
+// recoverUnreadableDiskBlock (delete-and-refetch) rather than the plain transient-retry
+// path used for a service hiccup inside prepareBlockForWindow.
+func TestDownloadToDisk_PrepareWorkerReadFaultFlag(t *testing.T) {
+	sm := dtdNewManager(t, true, memory.New())
+
+	hash, _, _ := dtdMakeBlock(t, 11, 1) // never persisted -> read fails
+
+	res := sm.prepareDiskBlock(context.Background(), diskPrepareReq{hash: hash, height: 11})
+	require.Error(t, res.err, "a block absent from disk surfaces a read error")
+	require.True(t, res.readFault, "a read/deserialize failure must set readFault so the drain deletes-and-refetches")
+	require.False(t, BlockProcessingErrorIsPeerFault(res.err), "a read fault is transient, not a peer-fault")
+}
+
+// TestDownloadToDisk_RestoreConsumedFrontierNode covers Stage-1 fix 3: on the
+// synchronous feedDiskBlock peer-fault path the preamble has already consumed the
+// block's front header node, so after the bytes are deleted the frontier would march
+// past the missing block. restoreConsumedFrontierNode re-inserts the front node so the
+// frontier anchors there again and the walk gap-halts — a no-op when the node still
+// exists or when we are not in headers-first mode.
+func TestDownloadToDisk_RestoreConsumedFrontierNode(t *testing.T) {
+	sm := dtdNewManager(t, true, memory.New())
+	sm.headerList = list.New()
+	sm.headerHeightIndex = make(map[chainhash.Hash]int32)
+	sm.headersFirstMode.Store(true)
+
+	consumed, _, _ := dtdMakeBlock(t, 300, 1) // the block whose front node the preamble removed
+	successor, _, _ := dtdMakeBlock(t, 301, 2)
+
+	// Simulate the post-preamble state: the successor is now the front; the consumed
+	// node and its index entry are gone.
+	sh := successor
+	sm.headerList.PushBack(&headerNode{height: 301, hash: &sh})
+	sm.headerHeightIndex[successor] = 301
+
+	sm.restoreConsumedFrontierNode(consumed, 300)
+
+	front, ok := sm.headerList.Front().Value.(*headerNode)
+	require.True(t, ok)
+	require.True(t, front.hash.IsEqual(&consumed), "restored node must be re-inserted at the front (the frontier anchor)")
+	require.Equal(t, int32(300), sm.headerHeightIndex[consumed], "restored node's index entry must be re-added")
+
+	// Idempotent: calling again must NOT duplicate the node (index already present).
+	before := sm.headerList.Len()
+	sm.restoreConsumedFrontierNode(consumed, 300)
+	require.Equal(t, before, sm.headerList.Len(), "restore must be a no-op when the node already exists")
+
+	// No-op outside headers-first mode (a concurrent reset may have rebuilt the list).
+	other, _, _ := dtdMakeBlock(t, 302, 3)
+	sm.headersFirstMode.Store(false)
+	sm.restoreConsumedFrontierNode(other, 302)
+	_, present := sm.headerHeightIndex[other]
+	require.False(t, present, "restore must be a no-op when not in headers-first mode")
+}
+
+// dtdMakeZeroTxBlock builds a well-formed block header carrying ZERO transactions and
+// returns its hash and serialized bytes. Its bytes deserialize cleanly (header + a
+// varint transaction count of 0), but bsvutil's block.Transactions() is then empty, so
+// any code that indexes the coinbase as block.Transactions()[0] panics with
+// index-out-of-range. It is the minimal poison block for the prepare-worker panic guard.
+func dtdMakeZeroTxBlock(t *testing.T, nonce uint32) (chainhash.Hash, []byte) {
+	t.Helper()
+
+	net := &chaincfg.RegressionNetParams
+
+	var blk wire.MsgBlock
+	blk.Header = wire.BlockHeader{
+		Version:   1,
+		PrevBlock: chainhash.Hash{},
+		Timestamp: time.Unix(1600000000, 0),
+		Bits:      net.PowLimitBits,
+		Nonce:     nonce,
+	}
+	// Deliberately NO AddTransaction: the block has zero transactions.
+
+	var buf bytes.Buffer
+	require.NoError(t, blk.Serialize(&buf))
+
+	return blk.Header.BlockHash(), buf.Bytes()
+}
+
+// TestDownloadToDisk_PanicGuardSurvivesZeroTxBlock covers Stage-2 fix (LOW): the heavy
+// prepareBlockForWindow body runs on the dedicated always-on diskPrepareWorker goroutine
+// and indexes block.Transactions()[0] (the coinbase) BEFORE prepareSubtrees' own recover
+// is reached. A malformed on-disk block that deserialized to zero transactions therefore
+// panics with index-out-of-range, and an unrecovered panic on the worker goroutine would
+// crash the WHOLE process. The panic guard in prepareDiskBlock must convert the panic into
+// a TRANSIENT error (a ProcessingError, not a peer-fault) so the worker keeps running and
+// the drain retries rather than the node dying. This test proves both halves: the direct
+// call returns a transient error instead of panicking, AND a live worker survives the
+// poison block and keeps servicing subsequent work.
+func TestDownloadToDisk_PanicGuardSurvivesZeroTxBlock(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	sm := dtdNewManager(t, true, store)
+
+	// A well-formed header with zero transactions, persisted on disk exactly as a
+	// truncated/malformed delivery would land.
+	poisonHash, poisonRaw := dtdMakeZeroTxBlock(t, 4242)
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, poisonHash, poisonRaw))
+
+	// Direct call: prepareDiskBlock must NOT panic. It converts the panic (deep inside
+	// prepareBlockForWindow) into an error flagged panicFault, so the drain routes the
+	// block through the BOUNDED delete-and-refetch (a panic is deterministic on the same
+	// bytes, so it must be capped, not retried forever).
+	res := sm.prepareDiskBlock(ctx, diskPrepareReq{hash: poisonHash, height: 4242})
+	require.NotNil(t, res)
+	require.Error(t, res.err, "a zero-tx block must surface an error, not panic the process")
+	require.Nil(t, res.prepared, "a panicked prepare yields no prepared block")
+	require.True(t, res.panicFault,
+		"a recovered prepare panic must be flagged panicFault so the drain routes it to the bounded delete-and-refetch, not an unbounded transient retry")
+	require.False(t, BlockProcessingErrorIsPeerFault(res.err),
+		"a recovered panic is a ProcessingError, not ErrBlockInvalid — it is bounded via the readFault/panicFault path, not the peer-fault (disconnect) path")
+	require.False(t, res.readFault,
+		"the bytes read and deserialized fine; the fault is in prepare (panicFault), not the disk read (readFault)")
+
+	// Now drive the poison block through a LIVE worker goroutine and prove the worker
+	// survives it: it hands back an error result rather than crashing, and it keeps
+	// servicing a subsequent (healthy) request — a crashed goroutine would never reply.
+	reqC := make(chan diskPrepareReq, 1)
+	readyC := make(chan *diskPrepared, 1)
+	wctx, wcancel := context.WithCancel(ctx)
+	defer wcancel()
+
+	go sm.diskPrepareWorker(wctx, reqC, readyC)
+
+	reqC <- diskPrepareReq{hash: poisonHash, height: 4242}
+	select {
+	case got := <-readyC:
+		require.Error(t, got.err, "worker must convert the panic into an error result, not die")
+		require.Nil(t, got.prepared)
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker crashed on the poison block — no result returned")
+	}
+
+	// A healthy single-coinbase block must still be serviced, proving the worker loop
+	// lived through the panic (its result may itself carry a validation error — an
+	// unsolved PoW header — but the worker returning ANY result for it is the proof).
+	goodHash, goodRaw, _ := dtdMakeBlock(t, 4243, 7)
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, goodHash, goodRaw))
+
+	reqC <- diskPrepareReq{hash: goodHash, height: 4243}
+	select {
+	case got := <-readyC:
+		require.True(t, got.hash.IsEqual(&goodHash),
+			"worker still services work after surviving the panic (it did not crash)")
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker stopped servicing after the poison block — it did not survive")
+	}
+}
+
+// TestDownloadToDisk_BoundedRetryTerminatesAcrossResets is the Stage-1 HIGH-fix
+// regression test, hardened per Stage-2 test-plan item 1: it drives the SAME hash to
+// consensus-invalid rejection diskValidateFailCap times across simulated sync-peer
+// disconnect / header-reset cycles (the rotation each recovery-disconnect provokes) and
+// proves the bounded loop TERMINATES. Specifically: the per-hash counter is NOT wiped by
+// resetHeaderState (so the cap is reachable across rotations), the walk halts exactly at
+// the cap, the genuinely-invalid block is then LEFT on disk (the frontier stops
+// re-requesting), and no further delete / re-download happens past the cap. Without the
+// surviving counter this loop would delete-and-refetch forever.
+func TestDownloadToDisk_BoundedRetryTerminatesAcrossResets(t *testing.T) {
+	ctx := context.Background()
+	store := newDTDRecordingStore()
+	sm := dtdNewManager(t, true, store)
+	sm.headerList = list.New()
+
+	height := int32(5000)
+	hash, raw, _ := dtdMakeBlock(t, height, 1)
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+
+	cause := errors.NewBlockInvalidError("consensus-invalid on disk")
+	require.True(t, BlockProcessingErrorIsPeerFault(cause), "sanity: cause is a peer-fault")
+
+	attempts := 0
+
+	for {
+		// The frontier re-fetched a fresh copy after the previous delete; model it as the
+		// same still-invalid bytes landing again.
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+
+		healed := sm.recoverInvalidDiskBlock(hash, height, nil, cause)
+		attempts++
+
+		// The disconnect the recovery just issued funnels through
+		// updateSyncPeer->resetHeaderState; fire that reset between every attempt. It must
+		// NOT wipe the per-hash counter.
+		newest, _, _ := dtdMakeBlock(t, height-1, 99)
+		sm.resetHeaderState(&newest, height-1)
+
+		if !healed {
+			break // terminal give-up reached (return false)
+		}
+
+		require.Less(t, attempts, diskValidateFailCap+2,
+			"recovery must terminate at the cap, not loop forever across resets")
+	}
+
+	require.Equal(t, diskValidateFailCap, attempts,
+		"the walk must halt exactly at the cap, counting across every header reset")
+
+	// The genuinely-invalid block is LEFT on disk so the frontier stops re-requesting it.
+	require.True(t, sm.haveBlockOnDisk(ctx, hash),
+		"a genuinely-invalid block is left on disk after the cap (no re-download churn)")
+
+	// Any stray re-walk past the cap is an immediate terminal no-op: no new Del call, no
+	// re-download.
+	delsAtGiveUp := store.delCount(hash)
+	require.False(t, sm.recoverInvalidDiskBlock(hash, height, nil, cause),
+		"past the cap the recovery stays terminal (returns false)")
+	require.Equal(t, delsAtGiveUp, store.delCount(hash),
+		"no further deletes / re-downloads happen past the cap")
+}
+
+// TestDownloadToDisk_ExhaustedMarkerHaltsWalk pins the terminal-marker the frontier walk
+// consults (diskRecoveryExhausted). recoverInvalidDiskBlock/recoverUnreadableDiskBlock
+// deliberately LEAVE the bad bytes on disk at the cap, so haveBlockOnDisk stays true and
+// the block remains the frontier anchor; without a stable "given up" signal the walk would
+// re-select it every poke and re-dispatch the heavy prepare forever. This proves the signal
+// flips exactly at the cap for BOTH the consensus-invalid and the unreadable/panic counters,
+// and that a genuine commit clears it so a re-visited hash gets a clean slate.
+func TestDownloadToDisk_ExhaustedMarkerHaltsWalk(t *testing.T) {
+	sm := dtdNewManager(t, true, newDTDRecordingStore())
+
+	var invalid, unreadable chainhash.Hash
+	invalid[0] = 0x11
+	unreadable[0] = 0x22
+
+	require.False(t, sm.diskRecoveryExhausted(invalid), "fresh hash is not exhausted")
+
+	// Consensus-invalid counter: exhausted only AT the cap, never before.
+	for i := 1; i < diskValidateFailCap; i++ {
+		sm.noteDiskValidateFailure(invalid)
+		require.False(t, sm.diskRecoveryExhausted(invalid),
+			"below the cap the walk must still re-select and re-fetch (attempt %d)", i)
+	}
+
+	sm.noteDiskValidateFailure(invalid)
+	require.True(t, sm.diskRecoveryExhausted(invalid),
+		"at diskValidateFailCap the walk must halt (the block can never commit)")
+
+	// Read/deserialize/panic counter is an independent path to the same terminal state.
+	for i := 0; i < diskValidateFailCap; i++ {
+		sm.noteDiskReadFailure(unreadable)
+	}
+
+	require.True(t, sm.diskRecoveryExhausted(unreadable),
+		"an unreadable/panic-faulted block reaching the cap also halts the walk")
+
+	// A genuine commit clears the marker so a later re-visit of the same hash (e.g. after a
+	// reorg re-downloads honest bytes) starts fresh rather than being permanently skipped.
+	sm.clearDiskRecoveryState(invalid)
+	require.False(t, sm.diskRecoveryExhausted(invalid),
+		"commit clears the terminal marker for a re-visited hash")
+}
+
+// TestDownloadToDisk_ConcurrentWorkerArrivalRecoveryRace is the Stage-2 -race integration
+// test (test-plan item 6). It exercises the cross-goroutine touchpoints the download-to
+// -disk decoupling ADDED, concurrently: a LIVE diskPrepareWorker on its own goroutine, the
+// OnBlock arrival read-loop (PersistArrivalAndDecouple/clearInFlightOnArrival recording
+// delivering peers and clearing ledgers), and the drain-side recovery/commit bookkeeping
+// (noteDiskValidateFailure/recoverInvalidDiskBlock/markDiskBlocksCommitted) — all hammering
+// the same shared maps (diskDeliveringPeer, the retry counters, requestedBlocks, the
+// assignedMu-guarded ledgers) and the same block store. Run under -race it proves those
+// concurrent accesses are data-race-free, and it proves the worker never permanently
+// stalls: every one-in-flight dispatch returns within a deadline.
+//
+// HONEST SCOPE: the full drainValidateFromDisk scheduler (with its diskPrepareInFlight
+// single-slot guard) is a closure inside blockHandler wired to a live header list, window
+// accumulator, sync peer and maturity gate, and is not extracted here — so the production
+// double-dispatch GUARD itself is not the code under test. What is driven is the concurrent
+// shared STATE the decoupling introduced, which is where a cross-goroutine race or a
+// wedged in-flight slot would actually surface; the drain stand-in below enforces the same
+// one-in-flight discipline the real scheduler does (dispatch only after the prior result is
+// consumed) and asserts the worker keeps up with it.
+func TestDownloadToDisk_ConcurrentWorkerArrivalRecoveryRace(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	sm := dtdNewManager(t, true, store)
+	sm.diskDeliveringPeer = txmap.NewSyncedMap[chainhash.Hash, *peerpkg.Peer]()
+	sm.headerList = list.New()
+	sm.headerHeightIndex = make(map[chainhash.Hash]int32)
+	sm.headersFirstMode.Store(true)
+	sm.validateFromDiskActive.Store(true)
+
+	const n = 30
+
+	// A small pool of real connected peers, registered in peerStates so the arrival path
+	// records them as delivering peers (recording only fires for a resolvable peer).
+	const poolSize = 4
+
+	pool := make([]*peerpkg.Peer, poolSize)
+	for i := range pool {
+		p := dtdConnectedPeer(t, uint8(i+1))
+		pool[i] = p
+		sm.peerStates.Set(p, &peerSyncState{
+			requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		})
+	}
+
+	hashes := make([]chainhash.Hash, n)
+	raws := make([][]byte, n)
+	blks := make([]*wire.MsgBlock, n)
+
+	for i := 0; i < n; i++ {
+		h, raw, blk := dtdMakeBlock(t, int32(6000+i), uint32(i+1))
+		hashes[i] = h
+		raws[i] = raw
+		blks[i] = blk
+	}
+
+	reqC := make(chan diskPrepareReq, 1)
+	readyC := make(chan *diskPrepared, 1)
+	wctx, wcancel := context.WithCancel(ctx)
+	defer wcancel()
+
+	go sm.diskPrepareWorker(wctx, reqC, readyC)
+
+	var wg sync.WaitGroup
+
+	// Arrival read-loop goroutine: persist + decouple each block, recording its delivering
+	// peer and clearing its in-flight ledgers, exactly as OnBlock does off the drain.
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		for i := 0; i < n; i++ {
+			sm.requestedBlocks.Set(hashes[i], struct{}{})
+			sm.assignedMu.Lock()
+			sm.refetchBlocks[hashes[i]] = struct{}{}
+			sm.assignedMu.Unlock()
+
+			sm.PersistArrivalAndDecouple(ctx, hashes[i], raws[i], 0, pool[i%poolSize])
+		}
+	}()
+
+	// Drain stand-in goroutine: strict one-in-flight dispatch. For each block it ensures
+	// the bytes are on disk (idempotent), dispatches a prepare, waits for the result, then
+	// runs recovery OR commit bookkeeping — all touching the shared state the arrival loop
+	// mutates concurrently. A missing result within the deadline is a stall.
+	stalled := make(chan chainhash.Hash, 1)
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		for i := 0; i < n; i++ {
+			require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hashes[i], raws[i]))
+
+			reqC <- diskPrepareReq{hash: hashes[i], height: int32(6000 + i), peer: pool[i%poolSize]}
+
+			select {
+			case <-readyC:
+			case <-time.After(15 * time.Second):
+				select {
+				case stalled <- hashes[i]:
+				default:
+				}
+
+				return
+			}
+
+			// Alternate the two drain-side finalizers so both the recovery maps (delete +
+			// counter + delivering-peer lookup/disconnect) and the commit clear-path run
+			// concurrently with the arrival loop's writes.
+			if i%2 == 0 {
+				sm.noteDiskValidateFailure(hashes[i])
+				sm.recoverInvalidDiskBlock(hashes[i], int32(6000+i), nil, errors.NewBlockInvalidError("race"))
+			} else {
+				sm.markDiskBlocksCommitted(ctx, []*model.Block{dtdModelBlock(t, blks[i], uint32(6000+i))})
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	select {
+	case h := <-stalled:
+		t.Fatalf("prepare worker stalled on %s — the single in-flight slot never returned", h)
+	default:
 	}
 }
