@@ -475,6 +475,7 @@ type dtdRecordingStore struct {
 	dahByKey  map[string]uint32
 	delByKey  map[string]int
 	curHeight uint32
+	failDel   bool
 }
 
 func newDTDRecordingStore() *dtdRecordingStore {
@@ -496,7 +497,14 @@ func (s *dtdRecordingStore) SetDAH(ctx context.Context, key []byte, ft fileforma
 func (s *dtdRecordingStore) Del(ctx context.Context, key []byte, ft fileformat.FileType, opts ...options.FileOption) error {
 	s.mu.Lock()
 	s.delByKey[string(key)]++
+	fail := s.failDel
 	s.mu.Unlock()
+
+	if fail {
+		// Simulate a wedged/permission-faulted blob backend: record the attempt but leave
+		// the bytes on disk (do NOT call Memory.Del), so haveBlockOnDisk stays true.
+		return errors.NewStorageError("dtd test: forced Del failure")
+	}
 
 	return s.Memory.Del(ctx, key, ft, opts...)
 }
@@ -1613,6 +1621,52 @@ func TestDownloadToDisk_ExhaustedGivesUpAsBackoffNotPermanentHalt(t *testing.T) 
 		"the exhausted block's bytes are deleted so an honest copy can be re-fetched")
 	require.False(t, sm.diskRecoveryExhausted(hash),
 		"the recovery budget is reset, so a recoverable hash gets a clean round of attempts")
+}
+
+// TestDownloadToDisk_BackoffRetryUndeletableKeepsQuiescing guards the narrow case where the
+// blob backend cannot delete the exhausted block's bytes (a wedged/permission-faulted
+// store). If retryExhaustedDiskBlock reset the budget anyway, the still-on-disk block would
+// fall through the walk's gap check and re-dispatch the heavy prepare, re-climbing to the
+// cap within one refill tick — a busy duty cycle. Instead the retry must report failure (so
+// the walk does not fall through) and re-stamp the give-up so the block keeps quiescing one
+// window at a time.
+func TestDownloadToDisk_BackoffRetryUndeletableKeepsQuiescing(t *testing.T) {
+	ctx := context.Background()
+	store := newDTDRecordingStore()
+	sm := dtdNewManager(t, true, store)
+
+	height := int32(6100)
+	hash, raw, _ := dtdMakeBlock(t, height, 1)
+	require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+
+	cause := errors.NewBlockInvalidError("consensus-invalid on disk")
+	for i := 0; i < diskValidateFailCap; i++ {
+		require.NoError(t, sm.PersistRawBlockOnArrival(ctx, hash, raw))
+		sm.recoverInvalidDiskBlock(hash, height, nil, cause)
+	}
+	require.True(t, sm.diskRecoveryExhausted(hash), "sanity: exhausted at the cap")
+
+	// The store now refuses to delete, and the backoff has elapsed.
+	store.mu.Lock()
+	store.failDel = true
+	store.mu.Unlock()
+
+	sm.diskValidateFailsMu.Lock()
+	sm.diskGiveUpAt[hash] = time.Now().Add(-2 * diskRecoveryRetryBackoff)
+	sm.diskValidateFailsMu.Unlock()
+
+	require.True(t, sm.diskRecoveryRetryDue(hash), "sanity: backoff elapsed")
+
+	retried := sm.retryExhaustedDiskBlock(hash, height)
+
+	require.False(t, retried,
+		"an undeletable block must report retry failure so the walk does not fall through and re-prepare")
+	require.True(t, sm.haveBlockOnDisk(ctx, hash),
+		"the bytes are still on disk (Del failed)")
+	require.True(t, sm.diskRecoveryExhausted(hash),
+		"the budget must NOT be reset while the bytes are undeletable — the block keeps quiescing")
+	require.False(t, sm.diskRecoveryRetryDue(hash),
+		"the give-up was re-stamped, so the block waits another full backoff window (no busy re-validate)")
 }
 
 // TestDownloadToDisk_ConcurrentWorkerArrivalRecoveryRace is the Stage-2 -race integration

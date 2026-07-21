@@ -3962,18 +3962,30 @@ func (sm *SyncManager) recoverUnreadableDiskBlock(hash chainhash.Hash, height in
 // the recovery budget (both counters + the give-up stamp) so the fresh copy gets a full
 // round of attempts. An invalid delivery and the honest block share the hash, so this is
 // how a cap-exhausted-but-actually-recoverable frontier block eventually heals instead of
-// wedging forever; a genuinely-invalid block simply re-accumulates to the cap and backs
-// off again, bounding the load to one re-download per backoff window. Runs on the single
-// drain goroutine under the downloadToDisk() gate.
-func (sm *SyncManager) retryExhaustedDiskBlock(hash chainhash.Hash, height int32) {
+// wedging forever; a genuinely-invalid block re-accumulates to the cap and backs off again
+// (up to diskValidateFailCap fresh copies per window — a recoverable block commits on the
+// first re-fetch, so the full round only happens for a still-invalid block).
+//
+// Returns true only when the bytes were actually deleted. If the Del FAILS (e.g. a wedged
+// blob backend), the bytes stay on disk, so resetting the budget would let the walk fall
+// through and re-dispatch the heavy prepare, re-climbing to the cap within one refill tick
+// — a busy duty cycle instead of quiescence. On that path we instead re-stamp the give-up
+// (keep quiescing another window) and return false, and the caller does NOT fall through.
+// Runs on the single drain goroutine under the downloadToDisk() gate.
+func (sm *SyncManager) retryExhaustedDiskBlock(hash chainhash.Hash, height int32) bool {
 	if derr := sm.mainBlockStore.Del(sm.ctx, hash[:], fileformat.FileTypeBlock); derr != nil {
-		sm.logger.Warnf("[drainValidateFromDisk][%s] failed to delete exhausted on-disk block height %d for backoff re-fetch: %v", hash, height, derr)
+		sm.markDiskGiveUp(hash)
+		sm.logger.Warnf("[drainValidateFromDisk][%s] failed to delete exhausted on-disk block height %d for backoff re-fetch; quiescing another window rather than re-validating undeletable bytes: %v", hash, height, derr)
+
+		return false
 	}
 
 	sm.clearDiskBlockLedgers(hash)
 	sm.clearDiskRecoveryState(hash)
 
 	sm.logger.Warnf("[drainValidateFromDisk][%s] recovery backoff elapsed for on-disk block height %d; deleted and re-fetching a fresh copy (an honest peer may serve a committable block for this hash)", hash, height)
+
+	return true
 }
 
 // restoreConsumedFrontierNode re-inserts a header node at the front of the header list
@@ -8164,7 +8176,12 @@ func (sm *SyncManager) blockHandler() {
 						return
 					}
 
-					sm.retryExhaustedDiskBlock(hash, height)
+					// Backoff elapsed: delete-and-refetch a fresh copy. If the bytes could not
+					// be deleted they are still on disk, so we must NOT fall through (that would
+					// re-dispatch the heavy prepare on undeletable bytes) — quiesce another window.
+					if !sm.retryExhaustedDiskBlock(hash, height) {
+						return
+					}
 				}
 
 				if !sm.haveBlockOnDisk(sm.ctx, hash) {
