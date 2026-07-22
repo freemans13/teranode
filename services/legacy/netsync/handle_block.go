@@ -611,10 +611,8 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 		}
 	}
 
-	for i := 0; i < numSubtrees; i++ {
-		if err = sm.writeSubtree(ctx, bi, slices[i], subtreeDatas[i], subtreeMetas[i], quickValidationMode); err != nil {
-			return nil, nil, 0, err
-		}
+	if err = sm.writeSubtrees(ctx, bi, slices, subtreeDatas, subtreeMetas, quickValidationMode); err != nil {
+		return nil, nil, 0, err
 	}
 
 	// In quickValidationMode the transactions and subtree files have already been
@@ -712,6 +710,40 @@ func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, bi blockIdent,
 	}
 
 	return nil
+}
+
+// writeSubtrees writes all of a block's subtrees to the subtree store (Wave 2
+// #5 — subtree fan-out). Each subtree is an INDEPENDENT content-addressed output
+// (three files keyed by its own RootHash), so this fans the writes out across up
+// to SubtreeWriteConcurrency subtrees at once instead of writing them one at a
+// time. writeSubtree still parallelises its own three internal file writes
+// underneath, so the peak concurrent blob writes is roughly the limit times
+// three.
+//
+// The errgroup gives first-error propagation — the first non-nil write error is
+// returned and cancels gCtx, aborting the remaining subtree writes — and each
+// writeSubtree keeps its per-file Abort-on-failure, exactly as the old serial
+// loop did. There is NO ordering concern: subtrees are independent content and
+// the caller collects RootHashes in merkle order from the slices themselves in a
+// separate serial loop. A limit of 1 is the old serial loop (byte-identical).
+func (sm *SyncManager) writeSubtrees(ctx context.Context, bi blockIdent, slices []*subtreepkg.Subtree,
+	subtreeDatas []*subtreepkg.Data, subtreeMetas []*subtreepkg.Meta, quickValidationMode bool) error {
+	subtreeWriteConcurrency := sm.settings.Legacy.SubtreeWriteConcurrency
+	if subtreeWriteConcurrency < 1 {
+		subtreeWriteConcurrency = 1
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(sm.logger, g, subtreeWriteConcurrency)
+
+	for i := range slices {
+		i := i // capture loop-local index for the goroutine
+		g.Go(func() error {
+			return sm.writeSubtree(gCtx, bi, slices[i], subtreeDatas[i], subtreeMetas[i], quickValidationMode)
+		})
+	}
+
+	return g.Wait()
 }
 
 func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree *subtreepkg.Subtree,

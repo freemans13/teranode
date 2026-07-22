@@ -682,7 +682,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ParallelWindowParkAhead:            getBool("legacy_parallelWindowParkAhead", false, alternativeContext...),
 			ParallelWindowParkedMemoryFraction: getFloat64("legacy_parallelWindowParkedMemoryFraction", 0.10, alternativeContext...),
 			ParallelWindowMaxParkedBlocks:      getInt("legacy_parallelWindowMaxParkedBlocks", 16384, alternativeContext...),
-			WindowMaxBlocks:                    getInt("legacy_windowMaxBlocks", 0, alternativeContext...),
+			WindowMaxBlocks:                    getInt("legacy_windowMaxBlocks", 16, alternativeContext...),
 			ParkRunwayByteSized:                getBool("legacy_parkRunwayByteSized", false, alternativeContext...),
 			SyncPeerSilentTicks:                getInt("legacy_syncPeerSilentTicks", 2, alternativeContext...),
 			// Widened last-block-time window for the headers-first sync peer; clamped to no shorter than the 3m post-IBD value in netsync.
@@ -750,6 +750,19 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// a SEPARATE blob store instance from the shared blockstore. nil/empty
 			// = feature degrades off (downloadToDisk() nil-guards the store).
 			DownloadStore: getURL("legacy_downloadStore", "file://./data/legacy-download-blocks", alternativeContext...),
+			// Parallel prepare-worker pool for the download-to-disk in-order
+			// validator (Wave 2 #4). A height-keyed reorder buffer re-serialises
+			// their out-of-order completions to strict-ascending before commit, so
+			// commit order/validation are unchanged. 1 = single worker
+			// (byte-identical). Only consulted when DownloadToDisk is on and the
+			// window path is enabled.
+			DiskPrepareWorkers: getInt("legacy_diskPrepareWorkers", 4, alternativeContext...),
+			// Concurrent subtree writes per block on the legacy sync path (Wave 2
+			// #5). The outer subtree-write loop fans out across this many
+			// independent content-addressed subtrees at once; first-error and
+			// per-subtree Abort-on-failure are preserved. 1 = the old serial loop
+			// (byte-identical).
+			SubtreeWriteConcurrency: getInt("legacy_subtreeWriteConcurrency", 8, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

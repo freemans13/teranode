@@ -171,12 +171,33 @@ func TestParallelWindowMaxParkedBlocksDefault(t *testing.T) {
 	require.Equal(t, 16384, NewSettings().Legacy.ParallelWindowMaxParkedBlocks)
 }
 
-// TestWindowMaxBlocksDefault pins the decoupled commit-window count cap to 0,
-// which means "fall back to MaxBlocksBehindBlockAssembly" — byte-identical to the
-// pre-decoupling behaviour. A positive value below the maturity ceiling shrinks
-// the commit window so the window commit pipeline can overlap two windows in flight.
+// TestWindowMaxBlocksDefault pins the decoupled commit-window count cap to 16
+// (Wave 2 #2): a real batch below the MaxBlocksBehindBlockAssembly=20 maturity
+// ceiling so the work-driven flush hands the committer a wide window (the
+// postgres UNNEST batchers coalesce ~16 blocks' txs instead of one), while
+// leaving runway for the next window to prefill while the current one commits.
+// 0 (or >= the ceiling) falls back to the ceiling (the pre-decoupling behaviour).
 func TestWindowMaxBlocksDefault(t *testing.T) {
-	require.Equal(t, 0, NewSettings().Legacy.WindowMaxBlocks)
+	require.Equal(t, 16, NewSettings().Legacy.WindowMaxBlocks)
+}
+
+// TestDiskPrepareWorkersDefault pins the download-to-disk parallel prepare pool
+// size to 4 — a handful of workers, far below the maturity runway. A
+// height-keyed reorder buffer re-serialises their out-of-order completions back
+// to strict-ascending before commit, so commit order/validation are unchanged.
+// 1 = the single prepare worker (byte-identical to before Wave 2 #4).
+func TestDiskPrepareWorkersDefault(t *testing.T) {
+	require.Equal(t, 4, NewSettings().Legacy.DiskPrepareWorkers)
+}
+
+// TestSubtreeWriteConcurrencyDefault pins the per-block subtree write fan-out
+// (Wave 2 #5) to 8 — the outer subtree-write loop fans out across this many
+// independent content-addressed subtrees at once, matching writeSubtree's own
+// three-way internal fan-out. First-error propagation and per-subtree
+// Abort-on-failure are preserved by the errgroup. 1 = the old serial loop
+// (byte-identical).
+func TestSubtreeWriteConcurrencyDefault(t *testing.T) {
+	require.Equal(t, 8, NewSettings().Legacy.SubtreeWriteConcurrency)
 }
 
 // Pin Phase C settings defaults: EarlyDAHBelowCheckpoint and PruneDeleteMarginBlocks

@@ -7194,10 +7194,22 @@ type diskPrepareReq struct {
 	peer   *peerpkg.Peer
 }
 
-// diskPrepared is the result the prepare worker hands back to the drain goroutine
+// diskPrepareCand is one candidate header the drain considers dispatching to the
+// prepare pool (Wave 2 #4). It carries only the fields the walk resolves under
+// headerMu (hash/height/checkpoint) so the heavier on-disk / maturity / eligibility
+// checks and the dispatch itself run OUTSIDE the lock, exactly as the depth-1 walk
+// did for its single block.
+type diskPrepareCand struct {
+	hash         chainhash.Hash
+	height       int32
+	isCheckpoint bool
+}
+
+// diskPrepared is the result a prepare worker hands back to the drain goroutine
 // for exactly one diskPrepareReq. It is immutable once sent and is consumed only by
-// the drain goroutine (single-slot, one prepare in flight at a time), so there is no
-// shared-mutable-state race: the channel send/receive is the whole synchronisation.
+// the drain goroutine (which owns the height-keyed reorder buffer and in-flight
+// set — lock-free single owner), so there is no shared-mutable-state race: the
+// channel send/receive is the whole synchronisation.
 // msgBlock is the wire block the worker read from disk (the drain needs it for the
 // header/checkpoint bookkeeping in handleBlockMsgWithWindow); prepared is the output
 // of prepareBlockForWindow (nil on error); err carries a read or prepare failure,
@@ -7312,9 +7324,12 @@ func (sm *SyncManager) preparePanicGuarded(ctx context.Context, req diskPrepareR
 // commits through the existing single poison-latched flush worker — so all consensus
 // invariants (strict-ascending in-order commit, checkpoint routing,
 // waitForPreviousBlockMined, authoritative header-height resolution) stay exactly
-// where they were. Only one prepare is ever in flight (the drain dispatches the next
-// only after feeding the current), so ordering is identical to the old inline walk.
-// Exits promptly on ctx.Done()/sm.quit.
+// where they were. Wave 2 #4 runs a POOL of these workers off a shared request
+// channel; each is identical and self-contained (prepareDiskBlock is per-block
+// independent — see its doc), and the drain re-serialises their out-of-order
+// completions back into strict-ascending order via a height-keyed reorder buffer
+// before the commit window, so commit ORDER is unchanged. Exits promptly on
+// ctx.Done()/sm.quit.
 func (sm *SyncManager) diskPrepareWorker(ctx context.Context, reqC <-chan diskPrepareReq, readyC chan<- *diskPrepared) {
 	for {
 		select {
@@ -7716,7 +7731,11 @@ func (sm *SyncManager) recoverWindowCommit(ctx context.Context, blocks []*model.
 //     ahead of the commit.
 //
 // The timer manipulation is delegated to the caller's closures so the timer
-// state stays owned by the drain goroutine.
+// state stays owned by the drain goroutine. Wave 2 #2: the download-to-disk feed
+// passes the no-op diskFeedArmTimer for armTimer, so the not-full branch does NOT
+// arm the 200ms idle timer there — the disk path's residual window is flushed
+// work-driven by the drainValidateFromDisk wrapper when the prepare frontier
+// drains. Only the inline/fallback arrival path passes the real armTimer.
 func (sm *SyncManager) ackWindowedBlock(reply chan error, wa *windowAccumulator, flushWindow, armTimer, stopTimer func()) {
 	if wa.full() {
 		sm.logger.Debugf("[blockHandler] window budget exhausted, flushing before ack (back-pressure)")
@@ -7864,6 +7883,12 @@ func windowBudgetBytes(fraction float64) int64 {
 // windowFlushTimerInterval is the idle timeout after which a partially-filled
 // window is flushed. It bounds how long the last few blocks of a window wait
 // for a budget-filling block that never arrives (e.g. at the tail of a sync).
+//
+// Wave 2 #2 demoted this timer to a TAIL-LATENCY NET on the inline/fallback
+// arrival path only. The download-to-disk feed no longer arms it per block (it
+// once drained the window at k=1, since every prepare outran the 200ms tick);
+// that path flushes work-driven — wa.full() at WindowMaxBlocks, or the
+// drainValidateFromDisk wrapper the moment the prepare frontier drains.
 const windowFlushTimerInterval = 200 * time.Millisecond
 
 // maxValidateFromDiskPerPass bounds how many on-disk blocks the download-to-disk
@@ -7939,20 +7964,37 @@ func (sm *SyncManager) blockHandler() {
 		var flushTimer *time.Timer
 		var jobs chan windowFlushJob
 
-		// Download-to-disk prepare-worker plumbing (Stage C). These stay nil unless
-		// the download-to-disk in-order validator is active (assigned in the gate
-		// block below), so the flag-off select is byte-identical. diskPrepareReqC
-		// hands one block's heavy prepare to the worker; diskPreparedReadyC returns
-		// the result. Both are drain<->worker message-passing only. diskReady holds a
-		// completed-but-not-yet-fed result (single slot: only one prepare is ever in
-		// flight); diskPrepareInFlight tracks whether a request is outstanding so the
-		// walk never double-dispatches. ALL of these are touched ONLY by this drain
-		// goroutine (the worker only reads diskPrepareReqC and writes
-		// diskPreparedReadyC), so they need no lock.
+		// Download-to-disk prepare-worker plumbing (Stage C + Wave 2 #4). These stay
+		// nil unless the download-to-disk in-order validator is active (assigned in the
+		// gate block below), so the flag-off select is byte-identical. diskPrepareReqC
+		// hands a block's heavy prepare to the worker POOL; diskPreparedReadyC returns
+		// the results. Both are drain<->pool message-passing only. diskReadyMap is the
+		// height/hash-keyed REORDER BUFFER holding completed-but-not-yet-fed results
+		// (replacing the single slot); diskInFlight is the SET of hashes currently
+		// being prepared, so the walk never double-dispatches. ALL of these are touched
+		// ONLY by this drain goroutine (the workers only read diskPrepareReqC and write
+		// diskPreparedReadyC), so they need no lock — the same single-owner discipline
+		// the single slot had, generalised to N.
 		var diskPrepareReqC chan diskPrepareReq
 		var diskPreparedReadyC chan *diskPrepared
-		var diskReady *diskPrepared
-		var diskPrepareInFlight bool
+		var diskReadyMap map[chainhash.Hash]*diskPrepared
+		var diskInFlight map[chainhash.Hash]struct{}
+
+		// diskPrepareWorkers is the parallel prepare-pool size (Wave 2 #4). It bounds
+		// BOTH the pool goroutine count AND the sliding-window width, so at most this
+		// many prepares are ever in flight or buffered in the reorder map. Clamped to
+		// [1, MaxBlocksBehindBlockAssembly] so it never exceeds the maturity runway the
+		// reorder buffer is bounded by (a fat block occupies one worker while its lower
+		// neighbours, within the runway, prepare and wait). 1 = the single-worker
+		// depth-1 walk (byte-identical). Only meaningful under the gate below.
+		diskPrepareWorkers := sm.settings.Legacy.DiskPrepareWorkers
+		if diskPrepareWorkers < 1 {
+			diskPrepareWorkers = 1
+		}
+
+		if runway := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly; runway > 0 && diskPrepareWorkers > runway {
+			diskPrepareWorkers = runway
+		}
 
 		if windowEnabled {
 			budget := windowBudgetBytes(windowFraction)
@@ -8099,6 +8141,19 @@ func (sm *SyncManager) blockHandler() {
 			}
 		}
 
+		// diskFeedArmTimer is the download-to-disk feed's substitute for armTimer
+		// (Wave 2 #2): a no-op, because the disk path does NOT arm the 200ms idle
+		// timer per block. That timer used to drain the window at k=1 — every
+		// prepare outran the 200ms tick, so it fired between blocks and flushed one
+		// block at a time, defeating the postgres UNNEST batch coalescing. The disk
+		// path's flush is instead WORK-DRIVEN: wa.full() (WindowMaxBlocks) mid-feed,
+		// or the drained-frontier flush in the drainValidateFromDisk wrapper once the
+		// prepare pool goes idle (no in-flight prepare left to re-poke and feed more).
+		// The 200ms timer survives only on the inline/fallback arrival path
+		// (ackWindowedBlock at the blockQueue case), which has no drained signal and
+		// relies on it as its tail-latency net.
+		diskFeedArmTimer := func() {}
+
 		// feedDiskBlock feeds one on-disk block through the EXISTING
 		// handleBlockMsgWithWindow (reusing every consensus check — already-committed
 		// guard, checkpoint direct-routing, deferredCheckpoint, strict-ascending
@@ -8122,9 +8177,13 @@ func (sm *SyncManager) blockHandler() {
 				// skips it. No reply/backlog on the disk path.
 				return false
 			case blockAdmitWindowed:
-				// Added to the window accumulator; drive the same flush/back-pressure the
-				// arrival drain drives (reply is nil on the disk path).
-				sm.ackWindowedBlock(nil, wa, flushWindow, armTimer, stopTimer)
+				// Added to the window accumulator; drive the same full/back-pressure flush
+				// the arrival drain drives (reply is nil on the disk path). Wave 2 #2: the
+				// disk path passes the NO-OP diskFeedArmTimer instead of armTimer — it does
+				// not arm the 200ms idle timer per block (the k=1 drain). Its residual
+				// (below-WindowMaxBlocks) window is flushed work-driven by the
+				// drainValidateFromDisk wrapper the moment the prepare pool goes idle.
+				sm.ackWindowedBlock(nil, wa, flushWindow, diskFeedArmTimer, stopTimer)
 				return false
 			default: // blockAdmitDirect (already-committed, checkpoint, or a failure)
 				if herr != nil {
@@ -8198,28 +8257,37 @@ func (sm *SyncManager) blockHandler() {
 		// async ActivateBestChain, np.cpp:4077-4093 + validation.cpp:4229-4238
 		// ConnectTip-reads-from-disk). It is decoupled from block DOWNLOAD (OnBlock
 		// writes each block to disk and pokes, never waiting on prepare/commit) AND —
-		// Stage C — from the drain/fetch goroutine's SCHEDULING: the heavy
+		// Stage C + Wave 2 #4 — from the drain/fetch goroutine's SCHEDULING: the heavy
 		// prepareBlockForWindow body (subtree extend/write, tens of seconds for a
-		// 123k-tx block) runs on the dedicated diskPrepareWorker goroutine, so a giant
-		// block ties up ONLY the validator, never the fetch/header scheduler.
+		// 123k-tx block) runs on a POOL of diskPrepareWorkers goroutines, so a giant
+		// block ties up ONE worker, never the fetch/header scheduler and never the
+		// other workers preparing its neighbours.
 		//
 		// This closure keeps EVERY header/window/checkpoint bookkeeping DECISION on the
 		// drain goroutine: it walks the authoritative PoW-verified header chain from the
 		// download frontier (lowest uncommitted header) upward under headerMu, and for
 		// each header whose raw block is on disk and within the block-assembly maturity
-		// gate it either (a) dispatches the heavy prepare to the worker and yields — the
-		// drain is then free to service refillC/headersQueue while the prepare runs — or
-		// (b) once the worker returns the prepared block, feeds it into the EXISTING
-		// handleBlockMsgWithWindow (which skips its inline prepare and does only the fast
-		// preamble + wa.add + flush hand-off). Only ONE prepare is ever in flight (the
-		// next is dispatched only after the current is fed), so the commit ORDER is
-		// strict-ascending and identical to the old inline walk. Checkpoint / non-unified
-		// blocks (which handleBlockMsgWithWindow routes direct, never through
-		// prepareBlockForWindow) skip the worker and are fed synchronously — rare and
-		// already fast. It stops at the first header whose block is not yet on disk (an
-		// out-of-order gap, picked up on a later poke) or beyond the maturity gate. Only
-		// ever called from this drain goroutine.
-		drainValidateFromDisk := func() {
+		// gate it either (a) DISPATCHES the sliding window of the next N such headers to
+		// the pool and yields — the drain is then free to service refillC/headersQueue
+		// while the prepares run — or (b) once a worker returns a prepared block into the
+		// height-keyed reorder buffer, feeds ONLY the lowest-needed contiguous height
+		// into the EXISTING handleBlockMsgWithWindow (which skips its inline prepare and
+		// does only the fast preamble + wa.add + flush hand-off). The N workers complete
+		// out of height order, but the reorder buffer re-serialises them: a block is fed
+		// ONLY when it is the lowest uncommitted non-owned header, so wa.add still
+		// receives strict-ascending, contiguous-with-committed-tip input EXACTLY as the
+		// old depth-1 walk produced it, and the commit ORDER is identical. A fat block
+		// occupies one worker while its lower neighbours wait prepared in the buffer.
+		// Checkpoint / non-unified blocks (which handleBlockMsgWithWindow routes direct,
+		// never through prepareBlockForWindow) skip the pool and are fed synchronously —
+		// rare and already fast. It stops at the first header whose block is not yet on
+		// disk (an out-of-order gap, picked up on a later poke) or beyond the maturity
+		// gate. Only ever called from this drain goroutine.
+		//
+		// This is the WALK; the work-driven window flush (Wave 2 #2) lives in the
+		// drainValidateFromDisk wrapper below, which runs the walk then flushes the
+		// pending window when the prepare frontier has drained.
+		drainValidateFromDiskWalk := func() {
 			if !sm.downloadToDisk() || !windowEnabled || wa == nil {
 				return
 			}
@@ -8342,12 +8410,21 @@ func (sm *SyncManager) blockHandler() {
 				}
 
 				if asyncEligible {
-					// Async prepare path. Three cases, keyed on the single in-flight slot:
-					if diskReady != nil && diskReady.hash.IsEqual(&hash) {
-						// (1) The worker finished preparing THIS block: consume and feed it.
-						res := diskReady
-						diskReady = nil
-						diskPrepareInFlight = false
+					// Parallel prepare path (Wave 2 #4). The single in-flight slot is now a
+					// pool of diskPrepareWorkers workers feeding a height/hash-keyed REORDER
+					// BUFFER (diskReadyMap), with diskInFlight the set of hashes currently
+					// being prepared. Both are owned solely by this drain goroutine.
+					//
+					// FEED: the lowest uncommitted non-owned header (hash, this iteration's
+					// selection) is the ONLY block we may feed — strict-ascending contiguity.
+					// If the pool already prepared it, it sits in the reorder buffer: consume
+					// and feed it exactly as the depth-1 walk fed its single slot. The loop
+					// then re-selects the new lowest and the sliding window advances.
+					if res, ok := diskReadyMap[hash]; ok {
+						delete(diskReadyMap, hash)
+						// Its worker completion already cleared the in-flight marker; delete
+						// again is a harmless no-op keeping the two structures consistent.
+						delete(diskInFlight, hash)
 
 						if res.err != nil {
 							if BlockProcessingErrorIsPeerFault(res.err) {
@@ -8401,32 +8478,107 @@ func (sm *SyncManager) blockHandler() {
 						continue
 					}
 
-					if diskReady != nil {
-						// (2) A stale ready result for a DIFFERENT hash (e.g. a header reset
-						// changed the frontier under a completed prepare). Discard it and fall
-						// through to (re-)dispatch for the current frontier hash.
-						diskReady = nil
-						diskPrepareInFlight = false
+					// The lowest header is NOT yet prepared, so nothing can be fed this pass
+					// (contiguity). DISPATCH the sliding window [hash, hash+N) — this block if
+					// it is not already in flight, plus its forward neighbours to fill the pool
+					// — then yield. Each completion re-pokes this walk; when this block lands in
+					// the reorder buffer the feed branch above emits it and the window slides.
+					//
+					// Collect up to N candidate headers from the frontier anchor (ascending,
+					// non-owned) under headerMu — hash/height/checkpoint only, so the on-disk /
+					// maturity / eligibility checks and the channel send run OUTSIDE the lock,
+					// exactly as the depth-1 walk resolved its single block.
+					cands := make([]diskPrepareCand, 0, diskPrepareWorkers)
+					windowHashes := make(map[chainhash.Hash]struct{}, diskPrepareWorkers)
+
+					sm.headerMu.Lock()
+					for e := sm.downloadFrontierAnchorLocked(); e != nil && len(cands) < diskPrepareWorkers; e = e.Next() {
+						node, ok := e.Value.(*headerNode)
+						if !ok || node.hash == nil {
+							continue
+						}
+
+						if sm.windowBlockOwned(*node.hash) {
+							continue
+						}
+
+						cp := sm.nextCheckpoint != nil && node.hash.IsEqual(sm.nextCheckpoint.Hash)
+						cands = append(cands, diskPrepareCand{hash: *node.hash, height: node.height, isCheckpoint: cp})
+						windowHashes[*node.hash] = struct{}{}
+					}
+					sm.headerMu.Unlock()
+
+					// Prune reorder-buffer entries that fell outside the current window (a
+					// header reset moved the frontier under an in-flight/completed prepare —
+					// the N-slot generalisation of the depth-1 single-slot stale discard).
+					// Pruning is always safe: feed order is driven by the authoritative
+					// frontier walk above, so a pruned block is simply re-dispatched and
+					// re-prepared (idempotent, content-addressed writes) if it becomes needed
+					// again. This bounds the reorder buffer to the window width.
+					for h := range diskReadyMap {
+						if _, in := windowHashes[h]; !in {
+							delete(diskReadyMap, h)
+						}
 					}
 
-					if diskPrepareInFlight {
-						// (3a) A prepare is already running. If it is for THIS hash, wait for it
-						// (its completion pokes the validator and re-enters this walk). If it is a
-						// stale in-flight hash (post-reset), we cannot cancel it; wait for it to
-						// finish so its result frees the slot, then this walk re-dispatches. Either
-						// way, yield now — the drain stays free for fetch/headers meanwhile.
-						return
-					}
+					// Dispatch each eligible, not-already-pending candidate to the pool,
+					// stopping the window at the first gap / immature / non-async-eligible /
+					// recovery-exhausted header: the window must stay a contiguous ascending
+					// run rooted at the lowest uncommitted header, and we never prepare above a
+					// hole. Bounded by N candidates, so at most N prepares are ever in flight
+					// or buffered (in-flight + reorder-buffer size <= N).
+					for i := range cands {
+						c := cands[i]
 
-					// (3b) Nothing prepared or in flight for this block: dispatch the heavy
-					// prepare to the worker and yield. Non-blocking (the in-flight guard means
-					// the buffered(1) request channel is empty), sm.quit-guarded so it can
-					// never wedge on shutdown.
-					select {
-					case diskPrepareReqC <- diskPrepareReq{hash: hash, height: height, peer: sp}:
-						diskPrepareInFlight = true
-					case <-sm.quit:
-					default:
+						if _, pending := diskInFlight[c.hash]; pending {
+							continue // already being prepared
+						}
+
+						if _, buffered := diskReadyMap[c.hash]; buffered {
+							continue // already prepared, waiting to be fed
+						}
+
+						// Only unified, non-checkpoint blocks take the async prepare path (mirror
+						// the asyncEligible gate). A checkpoint / non-unified header in the window
+						// stops the ahead-dispatch: it is fed synchronously when it becomes the
+						// lowest header on a later pass.
+						if c.isCheckpoint {
+							break
+						}
+
+						hc, convErr := safeconversion.Int32ToUint32(c.height)
+						if convErr != nil || !sm.legacyUnified(hc) {
+							break
+						}
+
+						// A recovery-exhausted header is deliberately left on disk and never
+						// committed; do not prepare it or anything above it (it stays the anchor
+						// and is handled by the main walk's backoff guard when it becomes lowest).
+						if sm.diskRecoveryExhausted(c.hash) {
+							break
+						}
+
+						// Never prepare above an on-disk gap or beyond the maturity gate.
+						if !sm.haveBlockOnDisk(sm.ctx, c.hash) {
+							break
+						}
+
+						if c.height > 0 {
+							if admit, evaluable := sm.blockAssemblyGateAdmitsCached(hc); evaluable && !admit {
+								break
+							}
+						}
+
+						// Non-blocking, sm.quit-guarded dispatch. The buffer is sized to the pool
+						// width and in-flight can never exceed N, so the send never blocks; the
+						// default is a defensive no-op (retried on the next completion/refill poke).
+						select {
+						case diskPrepareReqC <- diskPrepareReq{hash: c.hash, height: c.height, peer: sp}:
+							diskInFlight[c.hash] = struct{}{}
+						case <-sm.quit:
+							return
+						default:
+						}
 					}
 
 					return
@@ -8475,6 +8627,42 @@ func (sm *SyncManager) blockHandler() {
 			sm.PokeValidateFromDisk()
 		}
 
+		// drainValidateFromDisk wraps the in-order frontier walk with the Wave 2 #2
+		// WORK-DRIVEN window flush. The walk feeds the contiguous ascending prefix
+		// into the window and dispatches the prepare pool, but it no longer arms the
+		// 200ms idle timer per block (the disk feed passes the no-op diskFeedArmTimer)
+		// — that timer drained the window at k=1 because every prepare outran the
+		// 200ms tick, so it fired between blocks and committed one block at a time.
+		//
+		// Instead, once the walk has yielded, we flush the pending window exactly when
+		// the PREPARE FRONTIER IS DRAINED: no prepare is in flight (diskInFlight empty)
+		// to re-poke us and feed more, so whatever sits in the window is all we will
+		// get right now — commit it rather than waiting. While prepares are still
+		// running, a completion (the diskPreparedReadyC select case) re-pokes the walk
+		// and feeds more, growing the window toward WindowMaxBlocks; wa.full() (the
+		// other trigger) flushes mid-walk at the cap, so we defer here. During bulk IBD
+		// the pool is always busy (in-flight = diskPrepareWorkers), so this drained
+		// flush stays dormant and full() hands wide windows; it fires only at a genuine
+		// frontier edge — an on-disk gap, the maturity gate, or the tip — where the pool
+		// idles with a partial window, so a lone block near the tip still commits
+		// promptly WITHOUT a 200ms wait.
+		//
+		// STRICT-ASCENDING is untouched: the walk still feeds wa.add in ascending,
+		// contiguous-with-committed-tip order (the height-keyed reorder buffer
+		// re-serialises the pool's out-of-order completions), and flushWindow still
+		// runs drainJob's ascending sort/dedupe + gateContiguousWindow before the single
+		// FIFO flushWorker. flushWindow is a no-op on an empty window. The gate mirrors
+		// the walk's own (downloadToDisk && windowEnabled && wa != nil): OFF the gate
+		// this wrapper is inert, so the inline/fallback arrival path — which still owns
+		// the 200ms timer and diskInFlight is nil there — is byte-identical.
+		drainValidateFromDisk := func() {
+			drainValidateFromDiskWalk()
+
+			if sm.downloadToDisk() && windowEnabled && wa != nil && !wa.empty() && len(diskInFlight) == 0 {
+				flushWindow()
+			}
+		}
+
 		// The in-order validator is live only while the window path is enabled under
 		// the gate; PersistArrivalAndDecouple consults this so a block is never
 		// stranded on disk with no validator. validateSignalC is the poke channel,
@@ -8485,17 +8673,24 @@ func (sm *SyncManager) blockHandler() {
 			sm.validateFromDiskActive.Store(true)
 			validateSignalC = sm.validateSignal
 
-			// Stage C: start the dedicated prepare worker and wire its channels. Both
-			// are buffered(1); only one prepare is ever in flight (the walk dispatches
-			// the next only after feeding the current), so neither ever blocks. The
-			// worker exits on sm.quit / ctx.Done. Only reached under the gate, so the
-			// flag-off path never starts a goroutine and leaves both channels nil (the
-			// diskPreparedReadyC select case below is a nil channel — never selected —
-			// byte-identical to before Stage C).
-			diskPrepareReqC = make(chan diskPrepareReq, 1)
-			diskPreparedReadyC = make(chan *diskPrepared, 1)
+			// Stage C + Wave 2 #4: start the prepare-worker POOL and wire its channels.
+			// Both are buffered to the pool size so a completed worker never blocks
+			// handing back its result and a dispatch never blocks (the sliding window is
+			// diskPrepareWorkers wide, so at most that many prepares are ever in flight —
+			// buffer >= in-flight always). The workers exit on sm.quit / ctx.Done. Only
+			// reached under the gate, so the flag-off path never starts a goroutine and
+			// leaves both channels nil (the diskPreparedReadyC select case below is a nil
+			// channel — never selected — byte-identical to before Stage C). diskInFlight /
+			// diskReadyMap are the drain-owned in-flight set and height-keyed reorder
+			// buffer that replace the single completed-but-not-fed slot.
+			diskPrepareReqC = make(chan diskPrepareReq, diskPrepareWorkers)
+			diskPreparedReadyC = make(chan *diskPrepared, diskPrepareWorkers)
+			diskInFlight = make(map[chainhash.Hash]struct{}, diskPrepareWorkers)
+			diskReadyMap = make(map[chainhash.Hash]*diskPrepared, diskPrepareWorkers)
 
-			go sm.diskPrepareWorker(sm.ctx, diskPrepareReqC, diskPreparedReadyC)
+			for i := 0; i < diskPrepareWorkers; i++ {
+				go sm.diskPrepareWorker(sm.ctx, diskPrepareReqC, diskPreparedReadyC)
+			}
 
 			defer sm.validateFromDiskActive.Store(false)
 		}
@@ -8581,13 +8776,18 @@ func (sm *SyncManager) blockHandler() {
 				// case never fires and the select is byte-identical when the flag is off.
 				drainValidateFromDisk()
 			case res := <-diskPreparedReadyC:
-				// Stage C: the prepare worker finished the heavy body for one block. Park
-				// the result in the drain-owned single slot and re-run the walk, which
-				// feeds it into handleBlockMsgWithWindow (the fast preamble + wa.add +
-				// flush hand-off) and dispatches the next block's prepare. nil channel off
+				// Stage C + Wave 2 #4: a prepare worker finished the heavy body for one
+				// block. Move it from the in-flight set into the height-keyed reorder
+				// buffer and re-run the walk, which feeds ONLY the lowest-needed
+				// contiguous height into handleBlockMsgWithWindow (the fast preamble +
+				// wa.add + flush hand-off) and refills the sliding window. Out-of-order
+				// completions wait in the buffer until they become the contiguous prefix
+				// head, so wa.add still receives strict-ascending input. nil channel off
 				// the gate, so this case never fires (byte-identical flag-off). Only this
-				// drain goroutine ever writes diskReady, so no lock is needed.
-				diskReady = res
+				// drain goroutine ever touches diskInFlight/diskReadyMap, so no lock is
+				// needed.
+				delete(diskInFlight, res.hash)
+				diskReadyMap[res.hash] = res
 				drainValidateFromDisk()
 			case hmsg := <-headersQueue:
 				// Runs on the SAME goroutine as block processing, so the shared
