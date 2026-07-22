@@ -1009,6 +1009,18 @@ type SyncManager struct {
 	// it and aborts the walk if the generation changed.
 	headerMu  sync.Mutex
 	headerGen uint64 // bumped by resetHeaderState; guarded by headerMu
+	// headerResumeFromFrontier is a one-shot flag (guarded by headerMu) set by
+	// updateSyncPeer when it RETAINS the validated header chain across a sync-peer
+	// rotation instead of wiping it (retainHeaderStateForRotation). startSync
+	// consumes it: rather than re-requesting headers from the committed tip
+	// (GetBlockLocator), it anchors the resume getheaders at the CURRENT header
+	// frontier (the tail of headerList) so the successor peer supplies only headers
+	// ABOVE what we already hold, and it leaves headerCheckpoint where it is (it may
+	// already run ahead of the block-level nextCheckpoint) rather than regressing it.
+	// This is svnode's behaviour on peer rotation: keep the PoW/checkpoint-verified
+	// header chain, re-request only the missing tail from a new peer. See
+	// updateSyncPeer / retainHeaderStateForRotation.
+	headerResumeFromFrontier bool
 	// recentlyNeededUntil carries block hashes across resetHeaderState (guarded
 	// by headerMu, TTL-bounded). A rotation clears headerHeightIndex and every
 	// fetch ledger, so blocks legitimately requested BEFORE the rotation arrive
@@ -1254,6 +1266,88 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 		sm.headerListSeed = sm.headerList.PushBack(&node)
 		sm.headerHeightIndex[*node.hash] = node.height
 	}
+}
+
+// canRetainHeaderChain reports whether the live headers-first state holds a
+// validated header prefix ABOVE the committed tip that is worth keeping across a
+// sync-peer rotation. svnode keeps its PoW/checkpoint-verified header chain when
+// its sync peer drops and merely re-requests the missing tail from a new peer;
+// Teranode's resetHeaderState instead wiped the whole chain on every rotation,
+// which starved the disk-fed commit walk (drainValidateFromDisk is header-list
+// driven) until a fresh getheaders round-trip re-downloaded the headers — the
+// measured multi-minute IBD freeze this fix removes.
+//
+// It returns true ONLY when the retained prefix is provably still usable: more
+// than the leading seed node (Len > 1), a real non-seed download frontier
+// (downloadFrontierAnchorLocked != nil), a live header-request checkpoint cursor
+// to head toward (headerCheckpoint != nil), and a frontier tail strictly above
+// the committed tip. Every one of those failing falls back to resetHeaderState —
+// the safe rewind — so an empty/seed-only list, or a rotation past the final
+// checkpoint, still resets exactly as before. It does NOT itself decide chain
+// divergence: the retained chain is authoritative and checkpoint-verified, and a
+// successor peer on a different chain simply fails the linkage check in
+// handleHeadersMsg (handleUnconnectingHeaders), which is unchanged.
+//
+// Callers must NOT hold headerMu (this takes it).
+func (sm *SyncManager) canRetainHeaderChain(bestHeight int32) bool {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if sm.headerList == nil || sm.headerList.Len() <= 1 {
+		return false
+	}
+
+	if sm.downloadFrontierAnchorLocked() == nil {
+		return false
+	}
+
+	if sm.headerCheckpoint == nil {
+		return false
+	}
+
+	back := sm.headerList.Back()
+	if back == nil {
+		return false
+	}
+
+	node, ok := back.Value.(*headerNode)
+	if !ok || node.hash == nil {
+		return false
+	}
+
+	return node.height > bestHeight
+}
+
+// retainHeaderStateForRotation keeps the validated header chain across a
+// sync-peer rotation instead of wiping it. It is the svnode-aligned counterpart
+// to resetHeaderState: the disk-fed in-order commit walk (drainValidateFromDisk)
+// walks headerList from the download frontier, so leaving that list intact lets
+// it keep feeding already-downloaded on-disk block bodies WITHOUT interruption
+// while a new sync peer is promoted.
+//
+// It bumps headerGen so any in-flight fetch walk that captured the departing sync
+// peer (fetchHeaderBlocks / assignBlocksAcrossPeers) aborts cleanly on its next
+// lock re-take — exactly as resetHeaderState does — and re-runs against the new
+// peer on the next refill tick. Crucially the disk feed does NOT snapshot
+// headerGen, so bumping it does not interrupt the commit walk. It then arms the
+// one-shot headerResumeFromFrontier flag that startSync consumes to anchor the
+// resume getheaders at the frontier rather than the committed tip.
+//
+// Everything resetHeaderState would tear down is deliberately KEPT: headerList,
+// headerHeightIndex, headerListSeed, startHeader, headerCheckpoint/nextCheckpoint,
+// and refetchBlocks (their hashes still belong to the retained list). It does not
+// touch recentlyNeededUntil (the live headerHeightIndex still reports every
+// retained block as needed) and does not set lastHeaderResetAt (the retained
+// frontier is authoritative; a successor peer that cannot extend it should be
+// handled by the normal linkage check, not swallowed by the post-reset grace).
+//
+// Callers must NOT hold headerMu (this takes it).
+func (sm *SyncManager) retainHeaderStateForRotation() {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	sm.headerGen++
+	sm.headerResumeFromFrontier = true
 }
 
 // recentlyNeededTTL bounds how long a hash carried across resetHeaderState is
@@ -1557,7 +1651,38 @@ func (sm *SyncManager) startSync() {
 
 	var headerCheckpointHeight int32
 
-	if headersFirst {
+	// resumeFromFrontier is set when updateSyncPeer retained the header chain
+	// across this rotation (headerResumeFromFrontier) AND the retained prefix is
+	// still usable now — realignCheckpointCursor above may have wiped it on a stale
+	// cursor, which is the safe rewind, so we re-validate under the lock and fall
+	// back to the committed-tip getheaders if anything is missing.
+	resumeFromFrontier := false
+
+	var resumeAnchorHash *chainhash.Hash
+
+	if headersFirst && sm.headerResumeFromFrontier {
+		if sm.downloadFrontierAnchorLocked() != nil && sm.headerCheckpoint != nil {
+			if back := sm.headerList.Back(); back != nil {
+				if node, ok := back.Value.(*headerNode); ok && node.hash != nil && node.height > bestBlockHeightInt32 {
+					// Resume from the CURRENT header frontier toward the RETAINED
+					// header-request checkpoint (which may already run ahead of the
+					// block-level nextCheckpoint). Leave headerCheckpoint untouched so
+					// the successor peer supplies only headers ABOVE the frontier — never
+					// re-requesting the thousands we already hold.
+					resumeFromFrontier = true
+					resumeAnchorHash = node.hash
+					headerCheckpointHash = sm.headerCheckpoint.Hash
+					headerCheckpointHeight = sm.headerCheckpoint.Height
+				}
+			}
+		}
+	}
+
+	// Consume the one-shot flag regardless of the outcome: a rotation is over once
+	// startSync has evaluated it.
+	sm.headerResumeFromFrontier = false
+
+	if headersFirst && !resumeFromFrontier {
 		// The header-request cursor starts aligned with the block-level
 		// checkpoint tracker; the first getheaders heads toward it.
 		sm.headerCheckpoint = nextCheckpoint
@@ -1565,6 +1690,13 @@ func (sm *SyncManager) startSync() {
 		headerCheckpointHeight = nextCheckpoint.Height
 	}
 	sm.headerMu.Unlock()
+
+	if resumeFromFrontier {
+		// Anchor the getheaders at the retained frontier instead of the committed
+		// tip. blockchain.BlockLocator has underlying type []*chainhash.Hash, so the
+		// assignment keeps locator's type and remains assignable to PushGetHeadersMsg.
+		locator = []*chainhash.Hash{resumeAnchorHash}
+	}
 
 	if headersFirst {
 		if err = bestPeer.PushGetHeadersMsg(locator, headerCheckpointHash); err != nil {
@@ -2034,10 +2166,25 @@ func (sm *SyncManager) updateSyncPeer(_ *peerSyncState, reason string) {
 	}
 
 	if sm.headersFirstMode.Load() {
-		sm.logger.Infof("Resetting header sync state at height %d with hash %v",
-			bestBlockHeightInt32, bestBlockHeader.Hash())
+		// svnode-aligned rotation: keep the validated, PoW/checkpoint-verified header
+		// chain when we can, so the disk-fed commit walk keeps feeding on-disk bodies
+		// uninterrupted and the successor peer only re-sends the missing tail. Wiping
+		// the whole chain on every rotation (resetHeaderState) starved that walk until
+		// a fresh getheaders round-trip re-downloaded thousands of headers we already
+		// held — the measured multi-minute IBD freeze. Reset remains the safe fallback
+		// whenever the retained prefix is not provably usable (empty/seed-only list,
+		// no frontier above the tip, or past the final checkpoint).
+		if sm.canRetainHeaderChain(bestBlockHeightInt32) {
+			sm.logger.Infof("Retaining validated header chain across sync-peer rotation at committed height %d (svnode-aligned): resuming getheaders from the header frontier",
+				bestBlockHeightInt32)
 
-		sm.resetHeaderState(bestBlockHeader.Hash(), bestBlockHeightInt32)
+			sm.retainHeaderStateForRotation()
+		} else {
+			sm.logger.Infof("Resetting header sync state at height %d with hash %v",
+				bestBlockHeightInt32, bestBlockHeader.Hash())
+
+			sm.resetHeaderState(bestBlockHeader.Hash(), bestBlockHeightInt32)
+		}
 	}
 
 	sm.startSync()
