@@ -200,6 +200,22 @@ func TestSubtreeWriteConcurrencyDefault(t *testing.T) {
 	require.Equal(t, 8, NewSettings().Legacy.SubtreeWriteConcurrency)
 }
 
+// TestDiskPrepareMemoryFractionDefault pins the download-to-disk prepare pool's
+// byte-budget gate (Wave 2 review fix #1) to 15% of GOMEMLIMIT — a secondary,
+// independent ceiling alongside DiskPrepareWorkers' count cap. 0 would disable
+// the byte gate (count-cap only, the pre-fix behaviour).
+func TestDiskPrepareMemoryFractionDefault(t *testing.T) {
+	require.Equal(t, 0.15, NewSettings().Legacy.DiskPrepareMemoryFraction)
+}
+
+// TestSubtreeWriteMaxConcurrencyDefault pins the joint, process-wide subtree
+// write concurrency ceiling (Wave 2 review fix #2) to 16 — comfortably below
+// the naive DiskPrepareWorkers x SubtreeWriteConcurrency x 3 product (up to
+// ~96), protecting the subtree store's connection pool / fd budget.
+func TestSubtreeWriteMaxConcurrencyDefault(t *testing.T) {
+	require.Equal(t, 16, NewSettings().Legacy.SubtreeWriteMaxConcurrency)
+}
+
 // Pin Phase C settings defaults: EarlyDAHBelowCheckpoint and PruneDeleteMarginBlocks
 func TestUtxoStore_PhaseC_Defaults(t *testing.T) {
 	tSettings := NewSettings()

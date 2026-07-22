@@ -921,6 +921,27 @@ type SyncManager struct {
 	blockPrefetchBudget      *semaphore.Weighted
 	blockPrefetchBudgetBytes int64
 
+	// subtreeWriteSem is a SINGLE process-wide counting semaphore bounding the
+	// TOTAL concurrent subtree-file blob writes across every download-to-disk
+	// prepare worker and every block being prepared at once (review fix #2 on
+	// Wave 2 #4+#5). DiskPrepareWorkers (pool width) x SubtreeWriteConcurrency
+	// (per-block subtree fan-out) x 3 (writeSubtree's own internal per-file
+	// fan-out) can reach dozens of concurrent blob writes with the Wave 2
+	// defaults; on a network-backed subtree store, or an fd/connection-limited
+	// or saturated disk, that can exhaust the store's write-connection pool or
+	// the process's file-descriptor budget, turning store errors into prepare
+	// failures. writeSubtree acquires one permit per individual file write
+	// (the subtree file, the subtree-data file, the subtree-meta file) and
+	// releases it immediately when that write finishes (success, error, or
+	// abort) — see acquireSubtreeWriteSlot. Because a write never holds a
+	// permit while waiting for another permit of this SAME semaphore, the gate
+	// cannot deadlock. nil (the zero value) when legacy_downloadToDisk is off
+	// or the SyncManager was constructed directly (e.g. by a test) rather than
+	// via New; acquireSubtreeWriteSlot treats nil as "gate disabled" and
+	// returns a no-op release, so every write proceeds exactly as before
+	// (byte-identical flag-off).
+	subtreeWriteSem *semaphore.Weighted
+
 	// inFlightBlocks is the dedup half of the same block-admission gate whose
 	// byte half is blockPrefetchBudget. It holds the hash of every block that is
 	// currently admitted (has reserved budget) OR parked waiting for budget, so
@@ -6942,6 +6963,107 @@ func (ps *parkStore) add(b *model.Block) {
 
 func (ps *parkStore) len() int { return len(ps.entries) }
 
+// diskPrepareByteTracker bounds, by estimated bytes, the download-to-disk prepare
+// pool's combined in-flight-dispatch + reorder-buffer memory (review fix #1 on
+// Wave 2 #4). DiskPrepareWorkers already bounds this window by COUNT (at most N
+// blocks ever in flight or buffered in the reorder map), but a count cap alone
+// says nothing about SIZE: N simultaneously-held fat blocks (a 123k-tx block is
+// cited elsewhere in this file) can exceed the memory the window byte budget is
+// meant to protect. This adds a byte ceiling alongside the count ceiling,
+// mirroring parkStore's own average-based budget (see parkStore.full/atCapacity).
+//
+// A block's TRUE size is only known once its prepare completes — the worker
+// reads it back from disk; at DISPATCH time the drain has only a hash/height
+// (diskPrepareCand deliberately carries no bytes, see its doc). So a
+// not-yet-completed in-flight entry is tracked by an ESTIMATE: the running
+// average of this session's already-completed block sizes, seeded — before any
+// sample exists — by budget/workers (an even split of the whole budget across a
+// full window, so the pool does not over-admit before it has real data). A
+// completed, buffered entry is tracked by its ACTUAL size
+// (wire.MsgBlock.SerializeSize — a cheap sum of per-tx sizes, no re-encode).
+//
+// Owned SOLELY by the blockHandler drain goroutine (same single-owner discipline
+// as diskInFlight/diskReadyMap), so it needs no lock.
+type diskPrepareByteTracker struct {
+	bytes   map[chainhash.Hash]int64 // per-hash bytes currently counted (estimate or actual)
+	total   int64                    // sum of `bytes`, maintained incrementally for O(1) budget checks
+	budget  int64                    // 0 disables the byte gate (count-cap-only, pre-fix behaviour)
+	workers int                      // pool width, used to seed the pre-sample estimate
+
+	sampleSum   int64 // sum of ACTUAL sizes seen so far, for the running-average estimate
+	sampleCount int64
+}
+
+// newDiskPrepareByteTracker returns a tracker for the given budget (0 disables
+// the gate) and pool width (clamped to a floor of 1, used only to seed the
+// pre-sample estimate).
+func newDiskPrepareByteTracker(budget int64, workers int) *diskPrepareByteTracker {
+	if workers < 1 {
+		workers = 1
+	}
+
+	return &diskPrepareByteTracker{bytes: make(map[chainhash.Hash]int64, workers), budget: budget, workers: workers}
+}
+
+// estimate returns the per-block byte estimate used for a NOT-yet-completed
+// dispatch: the running average of this session's completed blocks, or — before
+// any sample exists — an even split of the whole budget across the pool width.
+// Both are deliberately approximate rather than exact; the running average
+// converges to the actual block-size distribution within a few completions.
+func (t *diskPrepareByteTracker) estimate() int64 {
+	if t.sampleCount > 0 {
+		return t.sampleSum / t.sampleCount
+	}
+
+	if t.budget <= 0 {
+		return 0
+	}
+
+	return t.budget / int64(t.workers)
+}
+
+// wouldExceed reports whether dispatching one more block at the current
+// estimate would push the tracked total over budget. budget<=0 disables the
+// gate (count-cap-only, pre-fix behaviour) so this always reports false.
+func (t *diskPrepareByteTracker) wouldExceed() bool {
+	if t.budget <= 0 {
+		return false
+	}
+
+	return t.total+t.estimate() > t.budget
+}
+
+// dispatch records a NEWLY-dispatched in-flight prepare at the current
+// estimate. Call exactly once per hash sent on diskPrepareReqC.
+func (t *diskPrepareByteTracker) dispatch(hash chainhash.Hash) {
+	n := t.estimate()
+	t.bytes[hash] = n
+	t.total += n
+}
+
+// complete replaces a dispatched hash's ESTIMATE with its now-known ACTUAL size
+// (the worker's result has landed in the reorder buffer) and folds the actual
+// size into the running average used to estimate future dispatches. Call
+// exactly once per hash, at the diskPreparedReadyC receive.
+func (t *diskPrepareByteTracker) complete(hash chainhash.Hash, actual int64) {
+	old := t.bytes[hash]
+	t.bytes[hash] = actual
+	t.total += actual - old
+
+	t.sampleSum += actual
+	t.sampleCount++
+}
+
+// remove drops a hash's tracked bytes: the entry left diskInFlight/diskReadyMap,
+// either consumed by a feed or pruned as stale (a header reset moved the
+// frontier under it). Safe to call on an absent hash (a 0 delta, matching the
+// existing delete-is-a-harmless-no-op discipline diskInFlight/diskReadyMap
+// already rely on).
+func (t *diskPrepareByteTracker) remove(hash chainhash.Hash) {
+	t.total -= t.bytes[hash]
+	delete(t.bytes, hash)
+}
+
 // claimWindowBlock records that the window pipeline owns this block (parked,
 // accumulated, or in an in-flight flush job). Nil-map-safe: ownership is a
 // window-path feature and many callers/tests construct a SyncManager without it.
@@ -7236,6 +7358,21 @@ type diskPrepared struct {
 	// deleted so never re-fetched, and the cap that guards the other paths never engages.
 	// The worker itself survives the panic via preparePanicGuarded.
 	panicFault bool
+}
+
+// diskPreparedResultBytes returns the ACTUAL serialized size of a completed
+// prepare result, for the byte-budget tracker (review fix #1 on Wave 2 #4).
+// wire.MsgBlock.SerializeSize is cheap — it sums each transaction's own
+// SerializeSize, with no re-encode of the block — so this costs nothing
+// beyond what prepareDiskBlock already read. Returns 0 when msgBlock is nil
+// (a readFault: the bytes could not even be read back off disk, so the
+// buffered diskPrepared entry holds no heavy data to count).
+func diskPreparedResultBytes(res *diskPrepared) int64 {
+	if res == nil || res.msgBlock == nil {
+		return 0
+	}
+
+	return int64(res.msgBlock.SerializeSize()) //nolint:gosec
 }
 
 // prepareDiskBlock is the heavy body the download-to-disk validator runs OFF the
@@ -7979,6 +8116,10 @@ func (sm *SyncManager) blockHandler() {
 		var diskPreparedReadyC chan *diskPrepared
 		var diskReadyMap map[chainhash.Hash]*diskPrepared
 		var diskInFlight map[chainhash.Hash]struct{}
+		// diskBytes is the byte-budget companion to diskInFlight/diskReadyMap
+		// (review fix #1 on Wave 2 #4) — see its type doc. Owned solely by this
+		// drain goroutine, same as the two maps above.
+		var diskBytes *diskPrepareByteTracker
 
 		// diskPrepareWorkers is the parallel prepare-pool size (Wave 2 #4). It bounds
 		// BOTH the pool goroutine count AND the sliding-window width, so at most this
@@ -8425,6 +8566,7 @@ func (sm *SyncManager) blockHandler() {
 						// Its worker completion already cleared the in-flight marker; delete
 						// again is a harmless no-op keeping the two structures consistent.
 						delete(diskInFlight, hash)
+						diskBytes.remove(hash)
 
 						if res.err != nil {
 							if BlockProcessingErrorIsPeerFault(res.err) {
@@ -8518,6 +8660,7 @@ func (sm *SyncManager) blockHandler() {
 					for h := range diskReadyMap {
 						if _, in := windowHashes[h]; !in {
 							delete(diskReadyMap, h)
+							diskBytes.remove(h)
 						}
 					}
 
@@ -8569,12 +8712,33 @@ func (sm *SyncManager) blockHandler() {
 							}
 						}
 
+						// Byte-budget gate (review fix #1 on Wave 2 #4): throttle look-AHEAD
+						// dispatches once the tracked in-flight+buffered bytes would exceed
+						// budget — a smaller effective window under memory pressure. i==0 is
+						// EXEMPT: cands[0] is always the SAME lowest-uncommitted-non-owned
+						// header this pass's outer selection resolved (both loops walk the
+						// identical frontier-anchor/owned-skip order), and this branch is only
+						// reached when it is not already pending/buffered — i.e. it has not
+						// been dispatched at all yet. Gating it too would mean NO forward
+						// progress under sustained memory pressure (a single oversized
+						// estimate could stall the walk forever, since nothing else ever
+						// becomes "the lowest header" to unblock it); exempting it guarantees
+						// the pool always eventually prepares and feeds the lowest header
+						// regardless of budget, while the gate still throttles how far AHEAD
+						// of it the pool is allowed to run. When i==0 is instead pending or
+						// buffered (continue, above), forward progress on the true lowest
+						// header is already in motion, so gating i>0 candidates here is safe.
+						if i > 0 && diskBytes.wouldExceed() {
+							break
+						}
+
 						// Non-blocking, sm.quit-guarded dispatch. The buffer is sized to the pool
 						// width and in-flight can never exceed N, so the send never blocks; the
 						// default is a defensive no-op (retried on the next completion/refill poke).
 						select {
 						case diskPrepareReqC <- diskPrepareReq{hash: c.hash, height: c.height, peer: sp}:
 							diskInFlight[c.hash] = struct{}{}
+							diskBytes.dispatch(c.hash)
 						case <-sm.quit:
 							return
 						default:
@@ -8687,6 +8851,10 @@ func (sm *SyncManager) blockHandler() {
 			diskPreparedReadyC = make(chan *diskPrepared, diskPrepareWorkers)
 			diskInFlight = make(map[chainhash.Hash]struct{}, diskPrepareWorkers)
 			diskReadyMap = make(map[chainhash.Hash]*diskPrepared, diskPrepareWorkers)
+			// Byte-budget companion (review fix #1 on Wave 2 #4): 0 fraction disables
+			// the gate, leaving diskPrepareWorkers' count cap as the sole limit
+			// (pre-fix behaviour).
+			diskBytes = newDiskPrepareByteTracker(windowBudgetBytes(sm.settings.Legacy.DiskPrepareMemoryFraction), diskPrepareWorkers)
 
 			for i := 0; i < diskPrepareWorkers; i++ {
 				go sm.diskPrepareWorker(sm.ctx, diskPrepareReqC, diskPreparedReadyC)
@@ -8788,6 +8956,14 @@ func (sm *SyncManager) blockHandler() {
 				// needed.
 				delete(diskInFlight, res.hash)
 				diskReadyMap[res.hash] = res
+				// Byte-budget companion (review fix #1 on Wave 2 #4): the worker's
+				// result carries the ACTUAL on-disk block, so replace this hash's
+				// pre-completion ESTIMATE with its real size and fold it into the
+				// running average used to estimate future dispatches. nil-safe: off
+				// the gate diskBytes is nil and this case never fires anyway.
+				if diskBytes != nil {
+					diskBytes.complete(res.hash, diskPreparedResultBytes(res))
+				}
 				drainValidateFromDisk()
 			case hmsg := <-headersQueue:
 				// Runs on the SAME goroutine as block processing, so the shared
@@ -9748,6 +9924,20 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		subtreeValidation: subtreeValidation,
 		blockValidation:   blockValidation,
 		blockAssembly:     blockAssembly,
+	}
+
+	// Joint, process-wide subtree-write concurrency ceiling (review fix #2 on
+	// Wave 2 #4+#5) — see the subtreeWriteSem field doc. Only constructed when
+	// the download-to-disk path is active (the only path that runs the
+	// parallel prepare pool), so the flag-off path never acquires it and
+	// writeSubtree's behaviour there is byte-identical to before this fix.
+	if sm.downloadToDisk() {
+		n := tSettings.Legacy.SubtreeWriteMaxConcurrency
+		if n < 1 {
+			n = 1
+		}
+
+		sm.subtreeWriteSem = semaphore.NewWeighted(int64(n))
 	}
 
 	// Bounded async block prefetch: with a positive budget OnBlock admits a

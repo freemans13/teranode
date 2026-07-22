@@ -746,6 +746,41 @@ func (sm *SyncManager) writeSubtrees(ctx context.Context, bi blockIdent, slices 
 	return g.Wait()
 }
 
+// acquireSubtreeWriteSlot acquires one permit of the joint, process-wide
+// subtree-write concurrency ceiling (see subtreeWriteSem's field doc — review
+// fix #2 on Wave 2 #4+#5), bounding the TOTAL concurrent subtree-file blob
+// writes across every prepare worker and block regardless of how many workers
+// x subtrees are active. Returns a no-op release when the semaphore is unwired
+// (nil — legacy_downloadToDisk is off, or the SyncManager was constructed
+// directly without New, as several tests do), so the gate is strictly opt-in
+// via construction and every other caller's behaviour is unchanged.
+//
+// The semaphore is a FLAT counting semaphore: each call acquires exactly one
+// permit for the duration of ONE file's write and releases it (via the
+// returned func, called through the caller's own defer) as soon as that write
+// finishes — success, error, or abort. No caller ever holds a permit while
+// waiting to acquire a second one (of this or any other semaphore), which is
+// what makes the gate deadlock-free: a wait-for cycle needs some holder to be
+// blocked wanting a resource another holder has, and no holder here ever wants
+// a second resource.
+//
+// Acquire is context-aware: ctx is normally the errgroup's derived context, so
+// if a sibling write in the same block fails first, the group's context
+// cancels and any writer still queued for a permit returns promptly with that
+// cancellation error instead of blocking — first-error propagation and
+// per-subtree Abort-on-failure are unaffected.
+func (sm *SyncManager) acquireSubtreeWriteSlot(ctx context.Context) (release func(), err error) {
+	if sm.subtreeWriteSem == nil {
+		return func() {}, nil
+	}
+
+	if acqErr := sm.subtreeWriteSem.Acquire(ctx, 1); acqErr != nil {
+		return nil, errors.NewProcessingError("[writeSubtree] failed to acquire subtree-write concurrency slot", acqErr)
+	}
+
+	return func() { sm.subtreeWriteSem.Release(1) }, nil
+}
+
 func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree *subtreepkg.Subtree,
 	subtreeData *subtreepkg.Data, subtreeMetaData *subtreepkg.Meta, quickValidationMode bool) error {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "writeSubtree",
@@ -764,6 +799,16 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 	util.SafeSetLimit(sm.logger, g, 3)
 
 	g.Go(func() error {
+		// Joint, process-wide write-concurrency ceiling (review fix #2 on Wave 2
+		// #4+#5) — bounds this write against every OTHER concurrent subtree write
+		// across all prepare workers/blocks, not just this block's own 3-way
+		// fan-out. No-op when unwired (flag-off byte-identical).
+		release, acqErr := sm.acquireSubtreeWriteSlot(gCtx)
+		if acqErr != nil {
+			return acqErr
+		}
+		defer release()
+
 		subtreeBytes, err := subtree.Serialize()
 		if err != nil {
 			return errors.NewStorageError("[writeSubtree][%s] failed to serialize subtree", subtree.RootHash().String(), err)
@@ -815,6 +860,14 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 	})
 
 	g.Go(func() error {
+		// Joint, process-wide write-concurrency ceiling (review fix #2 on Wave 2
+		// #4+#5) — see the sibling acquire above for the full rationale.
+		release, acqErr := sm.acquireSubtreeWriteSlot(gCtx)
+		if acqErr != nil {
+			return acqErr
+		}
+		defer release()
+
 		// Subtree files use the subtree-validation retention (global + adjustment),
 		// matching quick_validate.go and get_blocks.go — one retention source for
 		// subtree files on every path.
@@ -871,6 +924,16 @@ func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree 
 		if exists, _ := sm.subtreeStore.Exists(gCtx, subtreeData.RootHash()[:], fileformat.FileTypeSubtreeMeta); exists {
 			return nil
 		}
+
+		// Joint, process-wide write-concurrency ceiling (review fix #2 on Wave 2
+		// #4+#5) — see the first acquire above for the full rationale. Acquired
+		// only once the already-exists short-circuit has passed, so a no-op
+		// metadata check never consumes a permit.
+		release, acqErr := sm.acquireSubtreeWriteSlot(gCtx)
+		if acqErr != nil {
+			return acqErr
+		}
+		defer release()
 
 		subtreeBytes, err := subtreeMetaData.Serialize()
 		if err != nil {

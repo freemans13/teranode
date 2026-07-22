@@ -763,6 +763,17 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// per-subtree Abort-on-failure are preserved. 1 = the old serial loop
 			// (byte-identical).
 			SubtreeWriteConcurrency: getInt("legacy_subtreeWriteConcurrency", 8, alternativeContext...),
+			// Byte ceiling on the download-to-disk prepare pool's combined
+			// in-flight + reorder-buffer memory (Wave 2 review fix #1),
+			// secondary/independent of DiskPrepareWorkers' count cap. 0
+			// disables the byte gate (count-cap only).
+			DiskPrepareMemoryFraction: getFloat64("legacy_diskPrepareMemoryFraction", 0.15, alternativeContext...),
+			// Process-wide ceiling on TOTAL concurrent subtree-file blob
+			// writes across every prepare worker and block (Wave 2 review
+			// fix #2), superseding the DiskPrepareWorkers x
+			// SubtreeWriteConcurrency x 3 product. Only wired when
+			// DownloadToDisk is on.
+			SubtreeWriteMaxConcurrency: getInt("legacy_subtreeWriteMaxConcurrency", 16, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),
