@@ -21,12 +21,10 @@ type unifiedRouteStore struct {
 
 func (s *unifiedRouteStore) SupportsOutpointOnlySpend() bool { return s.supports }
 
-func newUnifiedRouteSettings(t *testing.T, unified, outpointOnly bool, checkpointHeight int32) *settings.Settings {
+func newUnifiedRouteSettings(t *testing.T, checkpointHeight int32) *settings.Settings {
 	t.Helper()
 
 	tSettings := test.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = unified
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = outpointOnly
 
 	u, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
@@ -39,35 +37,32 @@ func newUnifiedRouteSettings(t *testing.T, unified, outpointOnly bool, checkpoin
 	return tSettings
 }
 
-// TestServer_legacyUnifiedRoute: full truth table. The route opens ONLY when the
-// unified flag is on AND the source is legacy AND the shared outpoint-only gate
-// (flag + store support + hardcoded checkpoint boundary) holds. Any conjunct
-// missing keeps every block on the normal validation path (fail-safe).
+// TestServer_legacyUnifiedRoute: full truth table. Now that the opt-in flags are
+// retired the route opens ONLY when the source is legacy AND the shared outpoint-only
+// gate (store support + hardcoded checkpoint boundary) holds. Any conjunct missing
+// keeps every block on the normal validation path (fail-safe) — which is what a
+// non-supporting store (Aerospike) always does.
 func TestServer_legacyUnifiedRoute(t *testing.T) {
 	const cp = int32(2000)
 
 	tests := []struct {
-		name         string
-		unified      bool
-		outpointOnly bool
-		supports     bool
-		baseURL      string
-		height       uint32
-		want         bool
+		name     string
+		supports bool
+		baseURL  string
+		height   uint32
+		want     bool
 	}{
-		{name: "all on, legacy, below", unified: true, outpointOnly: true, supports: true, baseURL: "legacy", height: 1000, want: true},
-		{name: "at checkpoint", unified: true, outpointOnly: true, supports: true, baseURL: "legacy", height: 2000, want: true},
-		{name: "above checkpoint", unified: true, outpointOnly: true, supports: true, baseURL: "legacy", height: 2001, want: false},
-		{name: "unified flag off", unified: false, outpointOnly: true, supports: true, baseURL: "legacy", height: 1000, want: false},
-		{name: "outpoint-only flag off", unified: true, outpointOnly: false, supports: true, baseURL: "legacy", height: 1000, want: false},
-		{name: "store unsupported", unified: true, outpointOnly: true, supports: false, baseURL: "legacy", height: 1000, want: false},
-		{name: "non-legacy source", unified: true, outpointOnly: true, supports: true, baseURL: "http://peer:8090", height: 1000, want: false},
-		{name: "height 0", unified: true, outpointOnly: true, supports: true, baseURL: "legacy", height: 0, want: false},
+		{name: "supporting, legacy, below", supports: true, baseURL: "legacy", height: 1000, want: true},
+		{name: "at checkpoint", supports: true, baseURL: "legacy", height: 2000, want: true},
+		{name: "above checkpoint", supports: true, baseURL: "legacy", height: 2001, want: false},
+		{name: "store unsupported", supports: false, baseURL: "legacy", height: 1000, want: false},
+		{name: "non-legacy source", supports: true, baseURL: "http://peer:8090", height: 1000, want: false},
+		{name: "height 0", supports: true, baseURL: "legacy", height: 0, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tSettings := newUnifiedRouteSettings(t, tt.unified, tt.outpointOnly, cp)
+			tSettings := newUnifiedRouteSettings(t, cp)
 
 			u := &Server{
 				settings:  tSettings,

@@ -3,7 +3,6 @@ package model
 import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
-	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
@@ -44,18 +43,17 @@ func BelowCheckpoint(checkpoints []chaincfg.Checkpoint, height uint32) bool {
 }
 
 // OutpointOnlyEligible is the single eligibility gate for the below-checkpoint
-// outpoint-only fast path (PR 1178): the operator opted in, the UTXO store supports
-// outpoint-only spends (Stage A is SQL-only; Aerospike deferred to Stage B), chain
-// params exist, and the height is below the hardcoded checkpoint per
-// BelowCheckpoint. Every conjunct must hold — any one missing keeps the gate
-// closed (fail-safe, invariant I2). Chain params are passed explicitly because
-// callers legitimately source them differently (netsync holds *chaincfg.Params
-// directly; blockvalidation and model read settings.ChainCfgParams).
-func OutpointOnlyEligible(tSettings *settings.Settings, store utxo.Store, params *chaincfg.Params, height uint32) bool {
-	if tSettings == nil || !tSettings.BlockValidation.OutpointOnlyBelowCheckpoint {
-		return false
-	}
-
+// outpoint-only fast path (PR 1178). Selection is purely store-capability driven:
+// the UTXO store must support outpoint-only spends (postgres and sql return true;
+// Aerospike, nullstore and logger return false), chain params must exist, and the
+// height must be below the hardcoded checkpoint per BelowCheckpoint. Every conjunct
+// must hold — any one missing keeps the gate closed (fail-safe, invariant I2). A
+// store that does not support outpoint-only spends (e.g. Aerospike) therefore falls
+// back to the normal full below-checkpoint validation path at every call site. Chain
+// params are passed explicitly because callers legitimately source them differently
+// (netsync holds *chaincfg.Params directly; blockvalidation and model read
+// settings.ChainCfgParams).
+func OutpointOnlyEligible(store utxo.Store, params *chaincfg.Params, height uint32) bool {
 	if store == nil || !store.SupportsOutpointOnlySpend() {
 		return false
 	}

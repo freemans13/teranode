@@ -102,12 +102,10 @@ func TestTopUpBlockFetch_MultiPeerDistributes(t *testing.T) {
 	}
 	sm.startHeader = sm.headerList.Front().Next()
 
-	// Confirm the budget constraint holds.
-	dynamicCap := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	// Confirm the budget constraint holds: budget = BlockDownloadWindow = 9 (the
+	// memory-scaled byte cap is retired; K=5 across 3 peers gives 15, so
+	// BlockDownloadWindow binds first).
 	budget := tSettings.Legacy.BlockDownloadWindow
-	if dynamicCap < budget {
-		budget = dynamicCap
-	}
 	require.Equal(t, 9, budget, "precondition: budget must bind at 9")
 
 	// --- call topUpBlockFetch (the helper this test exercises) ---
@@ -220,7 +218,8 @@ func TestTopUpBlockFetch_FlagOffSinglePeer(t *testing.T) {
 	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
 	sm.headersFirstMode.Store(true)
 
-	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	// The frontier walk skips headerListSeed, so mark the dummy as the seed.
+	sm.headerListSeed = sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
 	for i := range hashes {
 		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &hashes[i]})
 	}

@@ -1,42 +1,40 @@
 package blockvalidation
 
-// Task 7 — unification parity across the three below-checkpoint routing configs.
+// Unification parity across the surviving below-checkpoint routing configs.
 //
-// This locks in that the two fast-path variants converge on the same observable
-// commit outcome (quick_validated persisted on the block row) and that the
-// default (both flags off) leaves quick_validated=false so block assembly
-// reconciles as before:
+// The below-checkpoint opt-in flags were retired; routing is now purely
+// store-capability driven:
 //
-//	unified ON  (LegacyUnifiedBelowCheckpoint):  routes through quickValidateBlock,
-//	                                             commitBlock stamps quick_validated=true.
-//	inline ON   (LegacyBelowCheckpointFailClosed): routes through the inline path,
-//	                                             buildAddBlockOpts stamps quick_validated=true (T6).
-//	both OFF:                                    full validation, quick_validated=false,
-//	                                             WithCreateConflicting retained.
+//	unified route (supporting store below checkpoint): routes through
+//	    quickValidateBlock, commitBlock stamps quick_validated=true.
+//	full/inline path (non-supporting store, or above checkpoint): buildAddBlockOpts
+//	    stamps only mined_set, leaving quick_validated=false so block assembly
+//	    reconciles as before.
 //
-// LONG-TERM CONVERGENCE: the inline fail-closed variant exists only as the A/B
-// lever for measuring the win on a live node without the fuller unified-route
-// change. The unified route (LegacyUnifiedBelowCheckpoint), which reuses the same
-// server-side machinery native catchup uses, is the intended long-term home; the
-// inline variant should be retired once the unified route is proven in a soak.
-// See project_legacy_ibd_staged_unification. A future edit MUST keep the two
-// paths' fail-closed / no-conflicting-node guarantee identical — this test and
-// the netsync fail_closed tests are the guard against one path drifting.
+// This locks in that the unified route persists quick_validated=true while the
+// full-validation path leaves it false.
 
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
-// TestUnification_Parity drives all three configs against a real sqlitememory
-// blockchain store and asserts the persisted quick_validated flag matches the
-// route's contract. Each block is chained onto the store's current tip and given
-// a distinct ID so the three rows are independent.
+// TestUnification_Parity drives the two surviving routes against a real sqlitememory
+// blockchain store and asserts the persisted quick_validated flag matches the route's
+// contract. Each block is chained onto the store's current tip and given a distinct ID
+// so the rows are independent.
 func TestUnification_Parity(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -51,22 +49,17 @@ func TestUnification_Parity(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		unified        bool
-		failClosed     bool
+		unifiedRoute   bool // true: commit via the unified route; false: full-validation AddBlock
 		id             uint32
 		wantQuickValid bool
 	}{
-		{name: "unified ON stamps quick_validated", unified: true, failClosed: false, id: 71, wantQuickValid: true},
-		{name: "inline fail-closed ON stamps quick_validated", unified: false, failClosed: true, id: 72, wantQuickValid: true},
-		{name: "both OFF leaves quick_validated false", unified: false, failClosed: false, id: 73, wantQuickValid: false},
+		{name: "unified route stamps quick_validated", unifiedRoute: true, id: 71, wantQuickValid: true},
+		{name: "full validation leaves quick_validated false", unifiedRoute: false, id: 73, wantQuickValid: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tSettings := test.CreateBaseTestSettings(t)
-			tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = tt.unified
-			tSettings.BlockValidation.LegacyBelowCheckpointFailClosed = tt.failClosed
-			tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = tt.unified || tt.failClosed
 			p := params
 			tSettings.ChainCfgParams = &p
 
@@ -78,20 +71,13 @@ func TestUnification_Parity(t *testing.T) {
 			require.NoError(t, err)
 			block := buildStampTestBlock(t, ctx, subtreeStore, bestHeader.Hash(), "", bestMeta.Height+1, tt.id)
 
-			switch {
-			case tt.unified:
+			if tt.unifiedRoute {
 				// Unified route: commitBlock unconditionally stamps quick_validated=true.
 				require.NoError(t, bv.commitBlock(ctx, block, "legacy", "TestUnification_Parity"))
-			default:
-				// Inline / both-off: the stamp is derived by quickValidatedEligible and
-				// applied by buildAddBlockOpts — the exact production stamp site. Every
-				// subtree is pre-present here (blessedWithoutRevalidation=true), so the
-				// only lever that differs between the two rows is the flag.
-				eligible := bv.quickValidatedEligible(block, "legacy", true)
-				require.Equal(t, tt.failClosed, eligible,
-					"quickValidatedEligible must track the fail-closed flag when all other conjuncts hold")
-
-				opts := bv.buildAddBlockOpts(block, eligible)
+			} else {
+				// Full-validation path: buildAddBlockOpts stamps only mined_set for an
+				// ID-bearing block, so quick_validated stays false.
+				opts := bv.buildAddBlockOpts(block)
 				require.NoError(t, blockchainClient.AddBlock(ctx, block, "legacy", opts...))
 			}
 
@@ -101,4 +87,65 @@ func TestUnification_Parity(t *testing.T) {
 				"config %q must persist quick_validated=%v", tt.name, tt.wantQuickValid)
 		})
 	}
+}
+
+// buildStampTestBlock builds a minimal below-checkpoint block (coinbase-only subtree).
+//
+// storeAs controls how the subtree is placed in the store:
+//   - fileformat.FileTypeSubtree: the "already validated" marker. CheckBlockSubtrees' existence
+//     check (which looks for FileTypeSubtree) finds it and short-circuits to blessed WITHOUT
+//     re-validating.
+//   - fileformat.FileTypeSubtreeToCheck: the "downloaded, pending validation" marker. The
+//     existence check treats it as missing, so CheckBlockSubtrees re-validates it locally.
+//   - "" (empty): store nothing; the subtree is genuinely absent.
+func buildStampTestBlock(t *testing.T, ctx context.Context, subtreeStore blob.Store, prevHash *chainhash.Hash, storeAs fileformat.FileType, height, id uint32) *model.Block {
+	t.Helper()
+
+	coinbaseTx, err := bt.NewTxFromString(model.CoinbaseHex)
+	require.NoError(t, err)
+	coinbaseTx.Outputs = nil
+	// Vary the coinbase output value by id so each block has a unique subtree root and
+	// block hash even when several are built against the same store in one test.
+	require.NoError(t, coinbaseTx.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 5000000000+uint64(id)))
+
+	subtree, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, subtree.AddCoinbaseNode())
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	require.NoError(t, subtreeData.AddTx(coinbaseTx, 0))
+
+	if storeAs != "" {
+		subtreeBytes, err := subtree.SerializeNodes()
+		require.NoError(t, err)
+		require.NoError(t, subtreeStore.Set(ctx, subtree.RootHash()[:], storeAs, subtreeBytes))
+
+		subtreeDataBytes, err := subtreeData.Serialize()
+		require.NoError(t, err)
+		require.NoError(t, subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes))
+	}
+
+	nBits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
+
+	blockHeader := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  prevHash,
+		HashMerkleRoot: subtree.RootHash(),
+		Timestamp:      uint32(time.Now().Unix()) + id,
+		Bits:           *nBits,
+		Nonce:          0,
+	}
+
+	for {
+		if ok, _, _ := blockHeader.HasMetTargetDifficulty(); ok {
+			break
+		}
+		blockHeader.Nonce++
+	}
+
+	block, err := model.NewBlock(blockHeader, coinbaseTx, []*chainhash.Hash{subtree.RootHash()}, uint64(subtree.Length()), 123123, height, id)
+	require.NoError(t, err)
+
+	return block
 }

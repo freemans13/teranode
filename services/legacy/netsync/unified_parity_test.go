@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -41,6 +42,39 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+// nonOutpointOnlyStore wraps a utxo.Store to report SupportsOutpointOnlySpend()==false,
+// modelling an Aerospike-like store. Below a checkpoint this forces the legacy netsync
+// inline create+spend path (legacyUnified/legacyOutpointOnly are false) — the exact path
+// such a store now takes after the below-checkpoint opt-in flags were retired. A supporting
+// store (postgres/sql) instead takes the unified route, so wrapping is how a test that must
+// exercise the inline pipeline pins the store capability.
+type nonOutpointOnlyStore struct {
+	utxo.Store
+}
+
+func (nonOutpointOnlyStore) SupportsOutpointOnlySpend() bool { return false }
+
+// BatchPreviousOutputsDecorate is a test no-op that populates any un-extended input
+// with dummy parent script/satoshis. The full (non-outpoint-only) inline path calls
+// it during extendTransactions; on a real Aerospike IBD node the parents are present
+// in the store, but the parity corpus uses external parents that are not, so this
+// stand-in mirrors outpointOnlySpyStore and lets the inline path complete. Inputs
+// already populated by Phase 1 are left untouched.
+func (nonOutpointOnlyStore) BatchPreviousOutputsDecorate(_ context.Context, txs []*bt.Tx) error {
+	for _, tx := range txs {
+		for _, input := range tx.Inputs {
+			if input == nil || input.PreviousTxScript != nil {
+				continue
+			}
+
+			input.PreviousTxScript = bscript.NewFromBytes([]byte("test"))
+			input.PreviousTxSatoshis = 100_000_000_000
+		}
+	}
+
+	return nil
+}
 
 // parityCorpus holds the three test blocks and enough metadata for the parity checks.
 type parityCorpus struct {
@@ -168,13 +202,14 @@ func makeSpendValidator(store utxo.Store) *validator.MockValidator {
 }
 
 // runInlinePipeline drives Run A: calls prepareSubtrees for each block in the
-// corpus, using the inline route (LegacyUnifiedBelowCheckpoint=false). The
-// blockchain mock assigns block IDs 101, 102, 103 for each block in order.
+// corpus, using the inline route. The below-checkpoint opt-in flags were retired,
+// so the inline route is now the path a non-outpoint-only (Aerospike-like) store
+// takes below the checkpoint; storeA is wrapped in nonOutpointOnlyStore to force it.
+// The blockchain mock assigns block IDs 101, 102, 103 for each block in order.
 func runInlinePipeline(t *testing.T, ctx context.Context, corpus *parityCorpus, storeA utxo.Store, subtreeStore *memory.Memory) {
 	t.Helper()
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, 1000)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = false
+	tSettings, params := newOutpointOnlySettings(t, true, 1000)
 
 	// Override the store URL to use a unique DB name for Run A.
 	u, err := url.Parse("sqlitememory:///parity_run_a")
@@ -190,7 +225,7 @@ func runInlinePipeline(t *testing.T, ctx context.Context, corpus *parityCorpus, 
 		settings:         tSettings,
 		chainParams:      params,
 		logger:           ulogger.TestLogger{},
-		utxoStore:        storeA,
+		utxoStore:        nonOutpointOnlyStore{storeA},
 		blockchainClient: mockBC,
 		validationClient: makeSpendValidator(storeA),
 		subtreeStore:     subtreeStore,
@@ -397,10 +432,11 @@ func compareStores(
 	}
 }
 
-// TestUnifiedRouteParity proves that the inline route (LegacyUnifiedBelowCheckpoint=false,
-// Run A) and the direct Create+Spend sequence that blockvalidation performs in the unified
-// route (Run B) produce equivalent UTXO-store state for a 3-block corpus spanning
-// cross-block and same-block spend relationships.
+// TestUnifiedRouteParity proves that the inline route (Run A, forced via a
+// non-outpoint-only/Aerospike-like store below the checkpoint) and the direct
+// Create+Spend sequence that blockvalidation performs in the unified route (Run B)
+// produce equivalent UTXO-store state for a 3-block corpus spanning cross-block and
+// same-block spend relationships.
 func TestUnifiedRouteParity(t *testing.T) {
 	initPrometheusMetrics()
 

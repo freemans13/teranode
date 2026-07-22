@@ -4856,16 +4856,13 @@ func TestQuickValidateOutpointOnly_GateBounds(t *testing.T) {
 	// Two hardcoded checkpoints; highest is height 200.
 	u.settings.ChainCfgParams = &chaincfg.Params{Checkpoints: []chaincfg.Checkpoint{{Height: 100}, {Height: 200}}}
 
-	u.settings.BlockValidation.OutpointOnlyBelowCheckpoint = false
-	require.False(t, u.quickValidateOutpointOnly(&model.Block{Height: 150}), "off by default")
-
-	u.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
-	require.True(t, u.quickValidateOutpointOnly(&model.Block{Height: 150}), "on, below highest checkpoint")
-	require.True(t, u.quickValidateOutpointOnly(&model.Block{Height: 200}), "on, at highest checkpoint")
-	require.False(t, u.quickValidateOutpointOnly(&model.Block{Height: 201}), "on, above highest checkpoint")
+	// Selection is purely store-capability driven now that the opt-in flag is retired.
+	require.True(t, u.quickValidateOutpointOnly(&model.Block{Height: 150}), "supporting store, below highest checkpoint")
+	require.True(t, u.quickValidateOutpointOnly(&model.Block{Height: 200}), "supporting store, at highest checkpoint")
+	require.False(t, u.quickValidateOutpointOnly(&model.Block{Height: 201}), "supporting store, above highest checkpoint")
 
 	// Store-capability dimension: a store that does not support the fast path keeps it off
-	// even below the checkpoint with the flag on.
+	// even below the checkpoint (Aerospike falls back to the normal validation path).
 	u.utxoStore = &utxostore.MockUtxostore{SupportsOutpointOnlySpendResult: false}
 	require.False(t, u.quickValidateOutpointOnly(&model.Block{Height: 150}), "unsupported store keeps it off")
 }

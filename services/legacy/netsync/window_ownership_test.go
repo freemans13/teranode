@@ -102,8 +102,7 @@ func newOwnershipSyncManager(t *testing.T, blockchainClient *blockchain2.Mock) (
 
 	const checkpointHeight = int32(1000)
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 	// Gate: cached=100, maxBehind=20 -> ceiling 120 << block height 500 -> park.
 	tSettings.BlockValidation.MaxBlocksBehindBlockAssembly = 20

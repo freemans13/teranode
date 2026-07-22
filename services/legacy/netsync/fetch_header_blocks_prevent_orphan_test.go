@@ -101,7 +101,8 @@ func TestFetchHeaderBlocks_SuccessfulSendStaysOutOfAssignedTo(t *testing.T) {
 	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
 	sm.headersFirstMode.Store(true)
 
-	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	// The frontier walk skips headerListSeed, so mark the dummy as the seed.
+	sm.headerListSeed = sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
 	for i := range hashes {
 		hc := hashes[i]
 		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &hc})
@@ -116,17 +117,10 @@ func TestFetchHeaderBlocks_SuccessfulSendStaysOutOfAssignedTo(t *testing.T) {
 	require.Empty(t, sm.assignedTo,
 		"the single-peer path must NOT record assignedTo — that feeds checkHeadStall's 2s frontier fast-swap and livelocks cold-start IBD")
 
-	// The block must still be tracked in-flight so the window can top up correctly.
-	require.False(t, sm.startHeader == sm.headerList.Front().Next(),
-		"precondition: the walk must have advanced past at least one fetchable header")
-	inFlightCount := 0
-	for e := sm.headerList.Front().Next(); e != nil && e != sm.startHeader; e = e.Next() {
-		node := e.Value.(*headerNode)
-		if _, ok := sm.requestedBlocks.Get(*node.hash); ok {
-			inFlightCount++
-		}
-	}
-	require.Positive(t, inFlightCount,
+	// A successful single-peer getdata must record the sent blocks in the in-flight
+	// ledger. The walk no longer advances a startHeader cursor — it re-anchors on the
+	// download frontier each pass — so count the recorded in-flight blocks directly.
+	require.Positive(t, sm.requestedBlocks.Len(),
 		"a successful single-peer getdata must record the sent blocks in requestedBlocks (in-flight ledger)")
 }
 

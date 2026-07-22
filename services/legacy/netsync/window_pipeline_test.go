@@ -624,8 +624,7 @@ func TestPipeline_DirectPath_ParentUncommitted_ReRequestSafe(t *testing.T) {
 
 	blockHash := msgBlock.BlockHash()
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 
 	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
@@ -710,15 +709,13 @@ func TestPipeline_DirectPath_ParentUncommitted_ReRequestSafe(t *testing.T) {
 	//    mock, but we verify the re-request path was taken via assertion 3 above.
 }
 
-// TestPipeline_FlagOff_SynchronousFlush proves the pipeline sub-flag default
-// (false) preserves the byte-identical synchronous path: flush commits inline on
-// the calling goroutine via drainJob + commitWindowJob, and no worker is needed.
-func TestPipeline_FlagOff_SynchronousFlush(t *testing.T) {
-	tSettings, _ := newOutpointOnlySettings(t, true, true, int32(1000))
+// TestWindowAccumulator_SynchronousFlushCommitsInline proves the synchronous
+// building block used by the shutdown/barrier paths: windowAccumulator.flush
+// commits inline on the calling goroutine via drainJob + commitWindowJob, with no
+// worker needed.
+func TestWindowAccumulator_SynchronousFlushCommitsInline(t *testing.T) {
+	tSettings, _ := newOutpointOnlySettings(t, true, int32(1000))
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
-
-	require.False(t, tSettings.Legacy.ParallelWindowPipeline,
-		"pipeline sub-flag must default to false")
 
 	spy := &pipelineSpyBlockValidation{}
 	sm := newAckTestSyncManager(t, spy)

@@ -600,58 +600,6 @@ func (bst *blockSizeTracker) getAverageTxCount() int64 {
 	return bst.avgTxCount
 }
 
-// calculateMaxInFlightBlocks returns the recommended max in-flight block
-// fetches, bounding by a transaction WORK budget with a byte-budget safety
-// clamp:
-//
-//   - txBound   = inFlightTxBudget / max(avgTxCount, 1)
-//   - byteBound = inFlightByteBudget / max(avgSize, 1)
-//   - result    = clamp(min(txBound, byteBound), 1, maxInFlightBlocksCap)
-//
-// The byte clamp keeps in-flight memory bounded even when the tx count is
-// misleading (few but huge transactions). Before any sample exists
-// (avgTxCount == 0) it returns a safe default and never divides by zero.
-func (bst *blockSizeTracker) calculateMaxInFlightBlocks() int {
-	bst.mu.RLock()
-	avgTxCount := bst.avgTxCount
-	avgSize := bst.avgSize
-	txBudget := bst.inFlightTxBudget
-	byteBudget := bst.inFlightByteBudget
-	bst.mu.RUnlock()
-
-	// No samples yet: fall back to a safe default (no divide-by-zero).
-	if avgTxCount <= 0 {
-		return noSampleInFlightDefault
-	}
-
-	// Transaction WORK budget: how many average-sized (in txs) blocks fit.
-	txBound := txBudget / int(avgTxCount)
-
-	// Byte safety clamp: also cap so in-flight bytes stay within the budget,
-	// even when tx count under-represents memory. Only binds when we have a
-	// size sample.
-	result := txBound
-
-	if avgSize > 0 {
-		byteBound := int(byteBudget / avgSize)
-		if byteBound < result {
-			result = byteBound
-		}
-	}
-
-	// Always at least 1 in flight.
-	if result < 1 {
-		result = 1
-	}
-
-	// Hard cap so tiny (1-tx) blocks don't produce an absurd count.
-	if result > maxInFlightBlocksCap {
-		result = maxInFlightBlocksCap
-	}
-
-	return result
-}
-
 // calculateWindowK returns the number of blocks to admit in one window batch.
 // windowBudget is derived from effectiveGOMEMLIMIT × fraction.
 // Admit-one floor: result is always >= 1.
@@ -2711,11 +2659,10 @@ func (sm *SyncManager) handleBlockPreamble(caller string, bmsg *blockQueueMsg) (
 	// primary in the stream-peer case above.
 	prometheusLegacyNetsyncBlocksReceived.WithLabelValues(bmsg.peer.Addr()).Inc()
 
-	// Track block size AND transaction count for dynamic in-flight adjustment
-	// during headers-first mode. The in-flight bound is now a transaction WORK
-	// budget (with a byte-budget safety clamp): tiny blocks stream
-	// many-in-flight to keep the peer busy, fat blocks stay few-in-flight to
-	// bound memory. See calculateMaxInFlightBlocks.
+	// Track block size AND transaction count during headers-first mode. The
+	// in-flight bound is now the fixed per-peer MaxBlocksInTransitPerPeer
+	// (maxInFlightPerPeer); the rolling averages recorded here feed the
+	// fetch-scheduler logging (getAverageSize).
 	if sm.headersFirstMode.Load() && bmsg.block != nil {
 		blockSize := int64(bmsg.block.SerializeSize())
 		txCount := int64(len(bmsg.block.Transactions))
@@ -3512,24 +3459,9 @@ func (sm *SyncManager) runPostBlockProcessing(peer *peerpkg.Peer, state *peerSyn
 	}
 }
 
-// svnodeAlignedFetch reports whether the svnode-aligned fetch scheduler is
-// enabled (legacy_svnodeAlignedFetch). Default false = today's behaviour,
-// byte-identical. When true, the in-flight governor is a fixed per-peer count
-// (MaxBlocksInTransitPerPeer) instead of the memory-scaled byte/tx budget, the
-// fetch walk is re-anchored on the download frontier each pass instead of a
-// monotonic cursor, the runway clamp is RETAINED as Teranode's analog of svnode's
-// nDownloadHeightThreshold (bound the fetch to a small lead off the validated tip;
-// np.cpp:412), and an in-flight block is treated as stale only on an IBD-scale
-// budget — so bandwidth
-// is spent on the lowest-height missing blocks (committed+1 first) rather than
-// piled far ahead on big blocks (the mainnet big-block IBD stall at ~701475).
-func (sm *SyncManager) svnodeAlignedFetch() bool {
-	return sm.settings != nil && sm.settings.Legacy.SvnodeAlignedFetch
-}
-
 // downloadToDisk is the nil-safe master gate for the svnode-style
-// download-to-disk decoupling (legacy_downloadToDisk). It mirrors
-// svnodeAlignedFetch exactly. Every new write / read-back / frontier-skip
+// download-to-disk decoupling (legacy_downloadToDisk).
+// Every new write / read-back / frontier-skip
 // branch is additionally guarded on sm.downloadStore != nil so that a build
 // with the flag off — or with no block store configured — is byte-identical to
 // today's in-memory park/prefetch path.
@@ -4289,27 +4221,26 @@ func (sm *SyncManager) markDiskBlocksCommitted(ctx context.Context, blocks []*mo
 //
 // svnode bounds in-flight by a FIXED, size-blind count of
 // MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16 (validation.h:111; np.cpp:5673,5678 request
-// exactly 16-nBlocksInFlight). Teranode's calculateMaxInFlightBlocks instead
-// scales the ceiling with MEMORY (0.25×GOMEMLIMIT / avgBlockSize), which with a
-// multi-GB GOMEMLIMIT and ~100MB mainnet blocks permits dozens-to-~100 blocks in
-// flight from ONE peer — the ~100-block/~10GB far-ahead pile that starves
-// committed+1 to ~1/100 of the pipe during big-block IBD (freeze-then-burst,
-// live mainnet ~701475). When aligned, the fixed 16 makes committed+1 always
-// 1-of-16 and a full share of the pipe, regardless of block size.
-//
-// Gate off (default): identical to reading calculateMaxInFlightBlocks() at the
-// call site — byte-for-byte today's behaviour.
+// exactly 16-nBlocksInFlight), always spent on the LOWEST-height missing blocks
+// starting at the download frontier. So committed+1 is always 1-of-16 and gets a
+// full share of the pipe, big blocks never inflate the in-flight set, and download
+// is decoupled from a slow validator — avoiding the ~100-block/~10GB far-ahead
+// pile that starved committed+1 during big-block IBD (freeze-then-burst, live
+// mainnet ~701475).
 func (sm *SyncManager) maxInFlightPerPeer() int {
-	if sm.svnodeAlignedFetch() {
-		k := sm.settings.Legacy.MaxBlocksInTransitPerPeer
-		if k < 1 {
-			k = 1
-		}
-
-		return k
+	// Nil-safe like the sibling gate helpers (downloadToDisk): unit tests build
+	// SyncManager literals without settings. Production always has settings, where
+	// MaxBlocksInTransitPerPeer defaults to 16.
+	if sm.settings == nil {
+		return 16
 	}
 
-	return sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	k := sm.settings.Legacy.MaxBlocksInTransitPerPeer
+	if k < 1 {
+		k = 1
+	}
+
+	return k
 }
 
 // downloadFrontierAnchorLocked returns the header-list element the svnode-aligned
@@ -4322,6 +4253,10 @@ func (sm *SyncManager) maxInFlightPerPeer() int {
 // pindexLastCommonBlock over hasData blocks (np.cpp:449-461), so the ≤16 in-flight
 // always cluster immediately above the frontier. Caller must hold headerMu.
 func (sm *SyncManager) downloadFrontierAnchorLocked() *list.Element {
+	if sm.headerList == nil {
+		return nil
+	}
+
 	for e := sm.headerList.Front(); e != nil; e = e.Next() {
 		if e == sm.headerListSeed {
 			continue
@@ -4333,17 +4268,13 @@ func (sm *SyncManager) downloadFrontierAnchorLocked() *list.Element {
 	return nil
 }
 
-// fetchWalkAnchorLocked returns the element the next fetch walk should start from.
-// Under the svnode-aligned gate it is the recomputed download frontier (front
-// skipping seed); otherwise it is the persisted monotonic startHeader cursor —
-// byte-identical to today. It is also the runway indicator: nil means there is no
-// header runway above the frontier. Caller must hold headerMu.
+// fetchWalkAnchorLocked returns the element the next fetch walk should start from:
+// the recomputed download frontier (front skipping seed), so the walk can never
+// climb ahead of landed data and the next-needed block is always in the request
+// set. It is also the runway indicator: nil means there is no header runway above
+// the frontier. Caller must hold headerMu.
 func (sm *SyncManager) fetchWalkAnchorLocked() *list.Element {
-	if sm.svnodeAlignedFetch() {
-		return sm.downloadFrontierAnchorLocked()
-	}
-
-	return sm.startHeader
+	return sm.downloadFrontierAnchorLocked()
 }
 
 // topUpBlockFetch tops up the in-flight block-fetch window. When the
@@ -4465,19 +4396,16 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		// to this sync peer, or owned by the window pipeline (parked), is on hand /
 		// covered — advance the frontier over it exactly as svnode advances
 		// pindexLastCommonBlock over hasData / skips in-flight blocks (np.cpp:449-461).
-		// This is LOAD-BEARING under the gate: the walk re-anchors at the frontier
-		// each pass and re-walks this prefix, and the single-peer walk has no
-		// in-flight guard of its own, so without this skip an already-outstanding
-		// block would be re-added to the getdata and re-requested (a duplicate
-		// getdata for a big block still downloading). peerState.requestedBlocks has a
-		// 60-min TTL, so a legitimately-slow 100-200MB block stays skipped for the
-		// whole svnode IBD per-block budget rather than being re-bought at 60s.
-		if sm.svnodeAlignedFetch() {
-			_, inFlight := peerState.requestedBlocks.Get(*node.hash)
-			if inFlight || sm.windowBlockOwned(*node.hash) {
-				e = next
-				continue
-			}
+		// This is LOAD-BEARING: the walk re-anchors at the frontier each pass and
+		// re-walks this prefix, and the single-peer walk has no in-flight guard of
+		// its own, so without this skip an already-outstanding block would be
+		// re-added to the getdata and re-requested (a duplicate getdata for a big
+		// block still downloading). peerState.requestedBlocks has a 60-min TTL, so a
+		// legitimately-slow 100-200MB block stays skipped for the whole svnode IBD
+		// per-block budget rather than being re-bought at 60s.
+		if _, inFlight := peerState.requestedBlocks.Get(*node.hash); inFlight || sm.windowBlockOwned(*node.hash) {
+			e = next
+			continue
 		}
 
 		// download-to-disk frontier advance: a block whose raw bytes are already
@@ -4524,19 +4452,16 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 			numRequested++
 		}
 
-		// Re-take the lock to advance startHeader, aborting if the list was
-		// reset while we were doing the gRPC above. Under the aligned gate the walk
-		// is re-anchored on the download frontier every pass, so the monotonic
-		// startHeader cursor is NOT persisted — advancing it would let it climb
-		// ahead of landed data (the very divergence this fix removes).
+		// Re-check the generation, aborting if the list was reset while we were
+		// doing the gRPC above. The walk is re-anchored on the download frontier
+		// every pass, so the monotonic startHeader cursor is NOT persisted here —
+		// advancing it would let it climb ahead of landed data (the very divergence
+		// this fix removes).
 		sm.headerMu.Lock()
 		if sm.headerGen != gen {
 			sm.headerMu.Unlock()
 			sm.logger.Debugf("[fetchHeaderBlocks] header state reset mid-walk, aborting")
 			break
-		}
-		if !sm.svnodeAlignedFetch() {
-			sm.startHeader = next
 		}
 		sm.headerMu.Unlock()
 
@@ -4595,7 +4520,7 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 }
 
 // maintainInFlightWindow tops the in-flight block-fetch window back up to the
-// memory-aware cap (calculateMaxInFlightBlocks), independently of block
+// fixed per-peer cap (maxInFlightPerPeer), independently of block
 // processing. It is the continuous-refill driver: the refill ticker in
 // blockHandler fires it on the SAME single drain goroutine that reads
 // blockQueue/headersQueue, so it never runs concurrently with block or header
@@ -4813,18 +4738,12 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 		totalInFlight += st.requestedBlocks.Len()
 	}
 
-	// Budget = min(BlockDownloadWindow, dynamic byte cap). toAssign is how many
-	// more blocks the shared window can absorb this pass. Under the svnode-aligned
-	// gate the memory/tx byte cap is DROPPED: BlockDownloadWindow (1024) is only a
-	// loose look-ahead ceiling (np.cpp:391), and the per-peer spare k =
-	// MaxBlocksInTransitPerPeer becomes the sole throttle, so total in-flight = 16 ×
+	// Budget = BlockDownloadWindow. toAssign is how many more blocks the shared
+	// window can absorb this pass. BlockDownloadWindow (1024) is only a loose
+	// look-ahead ceiling (np.cpp:391); the per-peer spare k =
+	// MaxBlocksInTransitPerPeer is the sole throttle, so total in-flight = 16 ×
 	// downloading-peers, size-blind (np.cpp:5673,5678).
 	budget := sm.settings.Legacy.BlockDownloadWindow
-	if !sm.svnodeAlignedFetch() {
-		if dynamicCap := sm.blockSizeTracker.calculateMaxInFlightBlocks(); dynamicCap < budget {
-			budget = dynamicCap
-		}
-	}
 
 	toAssign := budget - totalInFlight
 	if toAssign <= 0 {
@@ -4876,18 +4795,16 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 			continue
 		}
 
-		// svnode-aligned cheap frontier advance (no gRPC): a node already in flight
-		// to some peer, or owned by the window pipeline (parked), is on hand /
-		// covered — advance the frontier over it exactly as svnode advances
-		// pindexLastCommonBlock over hasData / skips in-flight blocks (np.cpp:449-461),
-		// without a haveInventory round-trip or a startHeader persist. The global
-		// requestedBlocks ledger is IBD-scaled under the gate (see New), so a
-		// legitimately-slow big block stays covered for the whole per-block budget.
-		if sm.svnodeAlignedFetch() {
-			if _, inFlight := sm.requestedBlocks.Get(*node.hash); inFlight || sm.windowBlockOwned(*node.hash) {
-				e = next
-				continue
-			}
+		// Cheap frontier advance (no gRPC): a node already in flight to some peer,
+		// or owned by the window pipeline (parked), is on hand / covered — advance
+		// the frontier over it exactly as svnode advances pindexLastCommonBlock over
+		// hasData / skips in-flight blocks (np.cpp:449-461), without a haveInventory
+		// round-trip or a startHeader persist. The global requestedBlocks ledger is
+		// IBD-scaled (see New), so a legitimately-slow big block stays covered for
+		// the whole per-block budget.
+		if _, inFlight := sm.requestedBlocks.Get(*node.hash); inFlight || sm.windowBlockOwned(*node.hash) {
+			e = next
+			continue
 		}
 
 		// download-to-disk frontier advance: skip a block whose raw bytes are
@@ -4960,20 +4877,15 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 			assigned++
 		}
 
-		// Advance the shared cursor once per WALKED node (matching
-		// fetchHeaderBlocks, which advances past have-inventory nodes too so it
-		// never re-walks them). Re-take the lock, abort on reset. Under the aligned
-		// gate the walk is re-anchored on the download frontier every pass, so the
-		// monotonic startHeader cursor is NOT persisted (advancing it is the
-		// divergence this fix removes).
+		// Re-check the generation once per WALKED node, aborting on reset. The walk
+		// is re-anchored on the download frontier every pass, so the monotonic
+		// startHeader cursor is NOT persisted here — advancing it would let it climb
+		// ahead of landed data (the divergence this fix removes).
 		sm.headerMu.Lock()
 		if sm.headerGen != gen {
 			sm.headerMu.Unlock()
 			sm.logger.Debugf("[assignBlocksAcrossPeers] header state reset mid-walk, aborting")
 			break
-		}
-		if !sm.svnodeAlignedFetch() {
-			sm.startHeader = next
 		}
 		sm.headerMu.Unlock()
 
@@ -5431,15 +5343,13 @@ func (sm *SyncManager) reconcileLostAssignments(now time.Time) {
 	// svnode's per-block IBD timeout is 60 min (600% of the 10-min spacing,
 	// np.cpp:5636-5656; validation.h:177-185) precisely so a legitimately-arriving
 	// 100-200MB block is never mistaken for a stall. The 10s BlockInFlightTimeout
-	// would churn such a block (re-enqueue it while it is actively downloading);
-	// under the aligned gate use the IBD-scale peer deadline instead and let the
-	// throughput gate (BlockStallMinRate, in the head-of-line racing path) be the
-	// real progress signal. The frontier block itself is still rescued fast by
-	// checkHeadStall racing, so lengthening the STALE budget cannot wedge the tip.
-	if sm.svnodeAlignedFetch() {
-		if ibd := sm.settings.Legacy.IBDBlockStallTimeout; ibd > timeout {
-			timeout = ibd
-		}
+	// would churn such a block (re-enqueue it while it is actively downloading); use
+	// the IBD-scale peer deadline instead and let the throughput gate
+	// (BlockStallMinRate, in the head-of-line racing path) be the real progress
+	// signal. The frontier block itself is still rescued fast by checkHeadStall
+	// racing, so lengthening the STALE budget cannot wedge the tip.
+	if ibd := sm.settings.Legacy.IBDBlockStallTimeout; ibd > timeout {
+		timeout = ibd
 	}
 
 	sm.assignedMu.Lock()
@@ -6438,8 +6348,8 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// blocks), and intervals overlap block fetching. So Back()-at-message-start
 	// is NOT necessarily the stale DB-best seed — on any non-first message of an
 	// interval it is a real header ~2000 blocks below the checkpoint tip whose
-	// block has not been requested yet (block fetch is bounded to
-	// calculateMaxInFlightBlocks, 1-20). Removing it here would splice out a node
+	// block has not been requested yet (block fetch is bounded to the fixed
+	// per-peer MaxBlocksInTransitPerPeer). Removing it here would splice out a node
 	// whose block is still pending, so fetchHeaderBlocks' Next() walk would skip
 	// it and its block would never be fetched — a header-list gap that wedges the
 	// sync. The DB-best seed is instead dropped exactly once in fetchHeaderBlocks
@@ -8020,13 +7930,11 @@ func (sm *SyncManager) blockHandler() {
 		windowFraction := sm.settings.Legacy.ParallelWindowMemoryFraction
 		windowEnabled := windowFraction > 0
 
-		// Pipeline mode: when the window is enabled AND the pipeline sub-flag is
-		// set, window commits run on a single dedicated FIFO flush worker so the
-		// next window fills while the current one commits. Bounded to two windows
-		// in flight (channel depth 1 + the one the worker holds). Only this drain
-		// goroutine ever sends on or closes jobs.
-		pipelineEnabled := windowEnabled && sm.settings.Legacy.ParallelWindowPipeline
-
+		// Pipeline mode: whenever the window is enabled, window commits run on a
+		// single dedicated FIFO flush worker so the next window fills while the
+		// current one commits. Bounded to two windows in flight (channel depth 1 +
+		// the one the worker holds). Only this drain goroutine ever sends on or
+		// closes jobs.
 		var wa *windowAccumulator
 		var flushTimer *time.Timer
 		var jobs chan windowFlushJob
@@ -8064,7 +7972,7 @@ func (sm *SyncManager) blockHandler() {
 			flushTimer.Stop() // don't fire until we have blocks
 		}
 
-		if pipelineEnabled {
+		if windowEnabled {
 			jobs = make(chan windowFlushJob, 1)
 			go sm.flushWorker(sm.ctx, jobs)
 		}
@@ -8108,13 +8016,9 @@ func (sm *SyncManager) blockHandler() {
 					j = sm.gateContiguousWindow(j, park)
 
 					if len(j.blocks) > 0 {
-						if pipelineEnabled {
-							// Hand the drained window to the worker. The blocking send is
-							// the depth-1 back-pressure that bounds in-flight windows.
-							jobs <- j
-						} else {
-							sm.commitWindowJob(sm.ctx, j)
-						}
+						// Hand the drained window to the worker. The blocking send is
+						// the depth-1 back-pressure that bounds in-flight windows.
+						jobs <- j
 					}
 				}
 			}
@@ -8125,18 +8029,18 @@ func (sm *SyncManager) blockHandler() {
 		}
 
 		// flushWindowSync is the synchronous variant of flushWindow used before a
-		// direct/checkpoint commit (see handleBlockMsgWithWindow). In pipeline mode
-		// it hands a barrier job (the pending window, possibly empty) to the flush
-		// worker and BLOCKS until the worker signals it finished committing — FIFO
-		// ordering means every earlier in-flight window has committed too, so a
-		// following HandleBlockDirect is guaranteed to find its parent already in the
-		// blockchain. Without this the async hand-off lets the direct commit race the
-		// worker and fail its parent check, stalling at the checkpoint boundary until
-		// the slow re-request path recovers. Only the drain goroutine calls this, so
-		// it never races another sender on jobs.
+		// direct/checkpoint commit (see handleBlockMsgWithWindow). It hands a barrier
+		// job (the pending window, possibly empty) to the flush worker and BLOCKS
+		// until the worker signals it finished committing — FIFO ordering means every
+		// earlier in-flight window has committed too, so a following HandleBlockDirect
+		// is guaranteed to find its parent already in the blockchain. Without this the
+		// async hand-off lets the direct commit race the worker and fail its parent
+		// check, stalling at the checkpoint boundary until the slow re-request path
+		// recovers. Only the drain goroutine calls this, so it never races another
+		// sender on jobs.
 		flushWindowSync := func() {
-			if wa == nil || !pipelineEnabled {
-				// Pipeline off: flushWindow already commits inline on this goroutine.
+			if wa == nil {
+				// Window disabled: nothing is pending and there is no worker.
 				flushWindow()
 				return
 			}
@@ -9591,15 +9495,15 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	blockAssembly blockassembly.ClientI, config *Config) (*SyncManager, error) {
 	initPrometheusMetrics()
 
-	// Global in-flight ledger TTL. Off the gate: 60s (today's value). Under the
-	// svnode-aligned gate the ledger is the in-flight tracking the frontier walk's
-	// cheap-skip and reconcileLostAssignments key on, so it must span svnode's
+	// Global in-flight ledger TTL. The ledger is the in-flight tracking the frontier
+	// walk's cheap-skip and reconcileLostAssignments key on, so it must span svnode's
 	// per-block IBD budget (IBDBlockStallTimeout, ~60m; np.cpp:5636-5656) — a
 	// legitimately-slow 100-200MB block must not have its ledger entry expire and be
 	// re-requested/re-enqueued mid-download. A genuinely lost frontier block is still
-	// rescued fast by the head-of-line racing (checkHeadStall), not by this TTL.
+	// rescued fast by the head-of-line racing (checkHeadStall), not by this TTL. The
+	// 60s floor preserves today's value when IBDBlockStallTimeout is set lower.
 	globalRequestedBlocksTTL := 60 * time.Second
-	if tSettings.Legacy.SvnodeAlignedFetch && tSettings.Legacy.IBDBlockStallTimeout > globalRequestedBlocksTTL {
+	if tSettings.Legacy.IBDBlockStallTimeout > globalRequestedBlocksTTL {
 		globalRequestedBlocksTTL = tSettings.Legacy.IBDBlockStallTimeout
 	}
 
@@ -9646,13 +9550,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		blockAssembly:     blockAssembly,
 	}
 
-	// The fail-closed inline lever is a no-op unless the outpoint-only below-checkpoint
-	// path is also enabled (legacyFailClosed depends on legacyOutpointOnly). Warn so an
-	// operator A/B-testing the new flag alone is not silently getting nothing.
-	if tSettings.BlockValidation.LegacyBelowCheckpointFailClosed && !tSettings.BlockValidation.OutpointOnlyBelowCheckpoint {
-		logger.Warnf("[netsync] blockvalidation_legacy_below_checkpoint_fail_closed is set but has no effect without blockvalidation_outpoint_only_below_checkpoint")
-	}
-
 	// Bounded async block prefetch: with a positive budget OnBlock admits a
 	// block against this global byte-weighted semaphore and returns, so the
 	// read-loop downloads the next block while the current one is validated.
@@ -9665,13 +9562,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// in lockstep with it: paired 1:1 with each budget reservation so at most
 		// one copy of a block hash is ever admitted/queued at a time.
 		sm.inFlightBlocks = make(map[chainhash.Hash]struct{})
-	}
-
-	// The fail-closed inline lever is a no-op unless the outpoint-only below-checkpoint
-	// path is also enabled (legacyFailClosed depends on legacyOutpointOnly). Warn so an
-	// operator A/B-testing the new flag alone is not silently getting nothing.
-	if tSettings.BlockValidation.LegacyBelowCheckpointFailClosed && !tSettings.BlockValidation.OutpointOnlyBelowCheckpoint {
-		logger.Warnf("[netsync] blockvalidation_legacy_below_checkpoint_fail_closed is set but has no effect without blockvalidation_outpoint_only_below_checkpoint")
 	}
 
 	// create the transaction announcement batcher

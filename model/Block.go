@@ -686,9 +686,8 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	//     must have run and bound the body to the checkpoint-certified header — so it
 	//     is never taken on a nil-subtreeStore / no-subtree caller where that binding
 	//     is absent (see skipOrderAndBlessedBelowCheckpoint, which shares the fee
-	//     skip's safety contract but additionally requires the
-	//     OutpointOnlyBelowCheckpoint opt-in, so it engages on a subset of the
-	//     fee-skip blocks).
+	//     skip's safety contract and — now the opt-in flag is retired — engages on
+	//     the same store-capability-gated set of blocks).
 	if txMetaStore != nil {
 		if merkleRootChecked && b.skipOrderAndBlessedBelowCheckpoint(settings, txMetaStore) {
 			logger.Debugf("[Block:Valid][%s] skipping validOrderAndBlessed for block at height %d at or below hardcoded checkpoint (outpoint-only fast path)", b.String(), b.Height)
@@ -742,20 +741,16 @@ func (b *Block) releaseTxMap() {
 
 // skipOrderAndBlessedBelowCheckpoint reports whether validOrderAndBlessed may be
 // skipped for this block. It shares the same checkpoint safety contract as the
-// below-checkpoint fee skip in checkBlockRewardAndFees, but adds one conjunct the
-// fee skip deliberately omits — the OutpointOnlyBelowCheckpoint opt-in — so this
-// skip engages on a strict subset of the fee-skip blocks (flag-on only). The fee
-// skip cannot depend on the flag because a fast-path block persists fee=0 and would
-// be wrongly rejected on flag-off revalidation; validOrderAndBlessed has no such
-// hazard (it reads persisted subtree meta and parent existence, not fees), so
-// gating it on the opt-in is safe and strictly more conservative. True only when
-// ALL of the following hold:
+// below-checkpoint fee skip in checkBlockRewardAndFees. Now that the outpoint-only
+// opt-in flag is retired, both skips gate purely on store capability
+// (SupportsOutpointOnlySpend) plus the checkpoint conjuncts, so they engage on
+// exactly the same blocks: a store that cannot run the fast path (e.g. Aerospike)
+// keeps both skips OFF and takes the full validOrderAndBlessed / fee-check path.
+// True only when ALL of the following hold:
 //
-//   - the operator has opted into the below-checkpoint outpoint-only fast path
-//     (OutpointOnlyBelowCheckpoint);
-//   - the UTXO store can actually run that fast path
-//     (txMetaStore.SupportsOutpointOnlySpend()) — the capability check that
-//     replaced the old SQL-store restriction;
+//   - the UTXO store can run the outpoint-only fast path
+//     (txMetaStore.SupportsOutpointOnlySpend()) — postgres/sql return true, Aerospike
+//     returns false and falls back to full validation;
 //   - the block is a confirmed ancestor of the pinned checkpoint
 //     (b.checkpointConfirmedAncestor, set only by the blockvalidation service via
 //     SetCheckpointConfirmedAncestor; defaults false). This closes the forward /
@@ -786,7 +781,7 @@ func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings,
 		params = tSettings.ChainCfgParams
 	}
 
-	return OutpointOnlyEligible(tSettings, txMetaStore, params, b.Height)
+	return OutpointOnlyEligible(txMetaStore, params, b.Height)
 }
 
 // https://en.bitcoin.it/wiki/BIP_0034
@@ -806,13 +801,13 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOu
 	// can actually produce the fee=0 subtrees this skip exists to tolerate, and the block is a
 	// confirmed ancestor of the pinned checkpoint. Each condition answers a distinct concern:
 	//
-	//  1. NOT gated on the OutpointOnlyBelowCheckpoint setting. The outpoint-only fast path
-	//     persists subtree fees as 0. A block synced that way must still revalidate on
-	//     reconsiderblock/RevalidateBlock even after the operator restores the default (flag
-	//     off) — a flag-gated skip would recompute coinbaseOutput (subsidy+realFees) >
-	//     subtreeFees(0)+subsidy and wrongly reject a genuinely-valid, checkpoint-pinned block
-	//     as BLOCK_INVALID. The read side cannot distinguish a fast-path fee=0 block from a
-	//     default one, so the skip cannot depend on live config.
+	//  1. NOT gated on any opt-in flag (the OutpointOnlyBelowCheckpoint setting is retired).
+	//     The outpoint-only fast path persists subtree fees as 0. A block synced that way must
+	//     still revalidate on reconsiderblock/RevalidateBlock — a flag-gated skip would recompute
+	//     coinbaseOutput (subsidy+realFees) > subtreeFees(0)+subsidy and wrongly reject a
+	//     genuinely-valid, checkpoint-pinned block as BLOCK_INVALID. The read side cannot
+	//     distinguish a fast-path fee=0 block from a default one, so the skip is driven only by
+	//     store capability, never live config.
 	//  2. GATED on store support (storeSupportsOutpointOnly). On a store that cannot run the
 	//     fast path (Aerospike, or the unconfigured default) real fees are always written, no
 	//     fee=0 block can exist, and there is nothing to tolerate — so full no-inflation

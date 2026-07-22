@@ -87,8 +87,7 @@ func TestHandleBlockMsgWithWindow_HeightFromHeaderChain_ParentAbsent(t *testing.
 		"a raw peer block's wrapper must report height -1 (documents the trap)")
 
 	// Settings/params that make the below-checkpoint block window-eligible.
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 
 	// Blockchain mock: FSM is CATCHINGBLOCKS, and — crucially — GetBlockHeader

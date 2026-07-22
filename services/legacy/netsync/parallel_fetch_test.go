@@ -251,6 +251,9 @@ func TestReconcileLostAssignments_PerPeerStale(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ParallelFetchPeers = 3
 	tSettings.Legacy.BlockInFlightTimeout = 10 * time.Second
+	// reconcileLostAssignments uses max(BlockInFlightTimeout, IBDBlockStallTimeout);
+	// zero the IBD extension so this unit test exercises the 10s stale boundary.
+	tSettings.Legacy.IBDBlockStallTimeout = 0
 
 	sm := &SyncManager{
 		logger:          ulogger.TestLogger{},

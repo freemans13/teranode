@@ -41,7 +41,6 @@ func newWindowPhasesHarness(t *testing.T) (*BlockValidation, context.Context, co
 	tSettings := testutil.CreateBaseTestSettings(t)
 
 	// Engage the outpoint-only fast path so createBlockUTXOs can run.
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 
 	// Place a high checkpoint so height 100 is firmly below it (RegressionNetParams has none).
@@ -213,7 +212,6 @@ func newWindowParityHarness(t *testing.T) (bvA, bvB *BlockValidation, ctx contex
 
 	newBV := func(suffix string) *BlockValidation {
 		tSettings := testutil.CreateBaseTestSettings(t)
-		tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 		tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 
 		params := *tSettings.ChainCfgParams

@@ -65,8 +65,7 @@ func TestHandleBlockMsgWithWindow_ToleratedRequeueRestoresHeightIndex(t *testing
 	msgBlock.Transactions = append(msgBlock.Transactions, coinbaseMsgTx)
 	blockHash := msgBlock.BlockHash()
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 	tSettings.BlockValidation.MaxBlocksBehindBlockAssembly = 20
 

@@ -41,8 +41,7 @@ func TestHandleBlockMsgWithWindow_RefreshesLastBlockTimeOnAccept(t *testing.T) {
 	const checkpointHeight = int32(1000)
 	const blockHeight = uint32(500)
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 
 	// A single coinbase-only block: prepareSubtrees takes the txCount<=1 early

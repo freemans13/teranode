@@ -69,7 +69,6 @@ func newProcessWindowHarness(t *testing.T, urlSuffix string) (*BlockValidation, 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	logger := ulogger.TestLogger{}
 	tSettings := testutil.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 
 	// Put a high checkpoint so test heights (100-102) are firmly below it.
@@ -489,7 +488,6 @@ func TestProcessBlockWindow_BarrierProperty(t *testing.T) {
 
 	logger := ulogger.TestLogger{}
 	tSettings := testutil.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 
 	params := *tSettings.ChainCfgParams
@@ -649,7 +647,6 @@ func TestProcessBlockWindow_CommitOrder(t *testing.T) {
 
 	logger := ulogger.TestLogger{}
 	tSettings := testutil.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 
 	params := *tSettings.ChainCfgParams
@@ -770,7 +767,6 @@ func TestProcessBlockWindow_BlockIDsAscendingWithHeight(t *testing.T) {
 
 	logger := ulogger.TestLogger{}
 	tSettings := testutil.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 
 	params := *tSettings.ChainCfgParams
@@ -894,7 +890,6 @@ func TestProcessBlockWindow_FailClosed(t *testing.T) {
 
 		logger := ulogger.TestLogger{}
 		tSettings := testutil.CreateBaseTestSettings(t)
-		tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 		tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 
 		params := *tSettings.ChainCfgParams
@@ -1012,7 +1007,6 @@ func newBlockExistsSpyHarness(t *testing.T, urlSuffix string) (*BlockValidation,
 
 	logger := ulogger.TestLogger{}
 	tSettings := testutil.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 
 	params := *tSettings.ChainCfgParams

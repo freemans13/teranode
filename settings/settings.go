@@ -379,9 +379,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			QuickValidateSkipUtxoLock:             getBool("blockvalidation_quick_validate_skip_utxo_lock", false, alternativeContext...),
 			SkipUnspendableTxStorageDuringCatchup: getBool("blockvalidation_skipUnspendableTxStorageDuringCatchup", false, alternativeContext...),
 			CatchupAllowQuickValidation:           getBool("blockvalidation_catchup_allow_quick_validation", true, alternativeContext...),
-			OutpointOnlyBelowCheckpoint:           getBool("blockvalidation_outpoint_only_below_checkpoint", false, alternativeContext...),
-			LegacyUnifiedBelowCheckpoint:          getBool("blockvalidation_legacy_unified_below_checkpoint", false, alternativeContext...),
-			LegacyBelowCheckpointFailClosed:       getBool("blockvalidation_legacy_below_checkpoint_fail_closed", false, alternativeContext...),
 			// Catchup circuit breaker configuration
 			CircuitBreakerFailureThreshold: getInt("blockvalidation_circuit_breaker_failure_threshold", 5, alternativeContext...),
 			CircuitBreakerSuccessThreshold: getInt("blockvalidation_circuit_breaker_success_threshold", 2, alternativeContext...),
@@ -682,7 +679,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PeerProcessingTimeout:              getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
 			Upnp:                               getBool("legacy_upnp", false, alternativeContext...),
 			ParallelWindowMemoryFraction:       getFloat64("legacy_parallelWindowMemoryFraction", 0.0, alternativeContext...),
-			ParallelWindowPipeline:             getBool("legacy_parallelWindowPipeline", false, alternativeContext...),
 			ParallelWindowParkAhead:            getBool("legacy_parallelWindowParkAhead", false, alternativeContext...),
 			ParallelWindowParkedMemoryFraction: getFloat64("legacy_parallelWindowParkedMemoryFraction", 0.10, alternativeContext...),
 			ParallelWindowMaxParkedBlocks:      getInt("legacy_parallelWindowMaxParkedBlocks", 16384, alternativeContext...),
@@ -739,9 +735,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// Phase 0: makes a frozen header frontier measurable straight from the log.
 			FrontierLogInterval:      getDuration("legacy_frontierLogInterval", 10*time.Second, alternativeContext...),
 			BlockPrefetchBufferBytes: getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
-			// Master gate for the svnode-aligned fetch scheduler. Default false =
-			// today's behaviour, byte-identical (a live no-rebuild rollback lever).
-			SvnodeAlignedFetch: getBool("legacy_svnodeAlignedFetch", false, alternativeContext...),
 			// Master gate for the svnode-style download-to-disk decoupling of the
 			// legacy IBD pipeline. Default false = today's behaviour, byte-identical.
 			DownloadToDisk: getBool("legacy_downloadToDisk", false, alternativeContext...),

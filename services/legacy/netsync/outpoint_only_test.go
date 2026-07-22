@@ -28,6 +28,10 @@ import (
 type outpointOnlySpyStore struct {
 	*nullstore.NullStore
 	decorateCalls atomic.Int32
+	// unsupported models an Aerospike-like store: when set, SupportsOutpointOnlySpend
+	// reports false so the capability gate closes. Zero value = supported (postgres/sql),
+	// keeping the common construction a supporting store.
+	unsupported bool
 }
 
 func (s *outpointOnlySpyStore) BatchPreviousOutputsDecorate(_ context.Context, txs []*bt.Tx) error {
@@ -52,18 +56,20 @@ func (s *outpointOnlySpyStore) BatchPreviousOutputsDecorate(_ context.Context, t
 	return nil
 }
 
-// SupportsOutpointOnlySpend overrides the embedded NullStore to model a store that
-// honours the fast path, so legacyOutpointOnly can engage in these tests.
-func (s *outpointOnlySpyStore) SupportsOutpointOnlySpend() bool { return true }
+// SupportsOutpointOnlySpend reports the configured capability, modelling either a
+// store that honours the fast path (postgres/sql) or one that does not (Aerospike),
+// so legacyOutpointOnly's capability gate can be exercised in both directions.
+func (s *outpointOnlySpyStore) SupportsOutpointOnlySpend() bool { return !s.unsupported }
 
-// newOutpointOnlySettings returns settings configured so legacyOutpointOnly can
-// return true: the feature flag on, a SQL-backed (sqlitememory) UTXO store URL,
-// and a single hard-coded checkpoint at checkpointHeight on the chain params.
-func newOutpointOnlySettings(t *testing.T, enabled bool, sqlStore bool, checkpointHeight int32) (*settings.Settings, *chaincfg.Params) {
+// newOutpointOnlySettings returns settings with a single hard-coded checkpoint at
+// checkpointHeight on the chain params. The outpoint-only fast path is now purely
+// store-capability driven (the opt-in flag is retired), so eligibility is decided by
+// the store assigned to the SyncManager, not by settings; sqlStore only selects the
+// cosmetic UTXO store URL scheme.
+func newOutpointOnlySettings(t *testing.T, sqlStore bool, checkpointHeight int32) (*settings.Settings, *chaincfg.Params) {
 	t.Helper()
 
 	tSettings := test.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = enabled
 
 	if sqlStore {
 		u, err := url.Parse("sqlitememory://test")
@@ -84,8 +90,11 @@ func newOutpointOnlySettings(t *testing.T, enabled bool, sqlStore bool, checkpoi
 }
 
 // TestSyncManager_legacyOutpointOnly is the full truth table for the gate helper.
-// Every conjunct must hold (flag on AND SQL store AND at/below the highest hard-coded
-// checkpoint) for the fast path to engage; any one missing keeps it OFF (fail-safe).
+// Selection is purely store-capability driven now that the opt-in flag is retired:
+// every conjunct (the store supports outpoint-only spends AND at/below the highest
+// hard-coded checkpoint) must hold for the fast path to engage; any one missing keeps
+// it OFF (fail-safe). A store that does not support outpoint-only spends (Aerospike)
+// falls back to the normal below-checkpoint validation path.
 func TestSyncManager_legacyOutpointOnly(t *testing.T) {
 	const checkpointHeight = int32(1000)
 	const below = uint32(500)
@@ -94,44 +103,34 @@ func TestSyncManager_legacyOutpointOnly(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		enabled    bool
-		sqlStore   bool
+		supports   bool
 		nilChain   bool
 		noCheckpts bool
 		height     uint32
 		want       bool
 	}{
-		{name: "flag off, SQL, below", enabled: false, sqlStore: true, height: below, want: false},
-		{name: "flag on, non-SQL (aerospike), below", enabled: true, sqlStore: false, height: below, want: false},
-		{name: "flag on, SQL, below checkpoint", enabled: true, sqlStore: true, height: below, want: true},
-		{name: "flag on, SQL, at checkpoint", enabled: true, sqlStore: true, height: atCheckpoint, want: true},
-		{name: "flag on, SQL, above checkpoint", enabled: true, sqlStore: true, height: above, want: false},
+		{name: "non-supporting store (aerospike), below", supports: false, height: below, want: false},
+		{name: "supporting store, below checkpoint", supports: true, height: below, want: true},
+		{name: "supporting store, at checkpoint", supports: true, height: atCheckpoint, want: true},
+		{name: "supporting store, above checkpoint", supports: true, height: above, want: false},
 		// Height 0 is fail-closed since the gates collapsed onto
 		// model.BelowCheckpoint: genesis carries only a coinbase and never flows
 		// through the legacy fast path, so excluding it costs nothing and keeps
 		// one boundary definition everywhere.
-		{name: "flag on, SQL, height 0 fail-closed", enabled: true, sqlStore: true, height: 0, want: false},
-		{name: "flag on, SQL, nil chain params", enabled: true, sqlStore: true, nilChain: true, height: below, want: false},
-		{name: "flag on, SQL, no checkpoints", enabled: true, sqlStore: true, noCheckpts: true, height: below, want: false},
+		{name: "supporting store, height 0 fail-closed", supports: true, height: 0, want: false},
+		{name: "supporting store, nil chain params", supports: true, nilChain: true, height: below, want: false},
+		{name: "supporting store, no checkpoints", supports: true, noCheckpts: true, height: below, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tSettings, params := newOutpointOnlySettings(t, tt.enabled, tt.sqlStore, checkpointHeight)
+			tSettings, params := newOutpointOnlySettings(t, tt.supports, checkpointHeight)
 
 			sm := &SyncManager{
 				settings:    tSettings,
 				chainParams: params,
 				logger:      ulogger.TestLogger{},
-			}
-
-			// The gate now asks the store, not the settings URL: a supporting store
-			// (spy over NullStore) for the SQL case, a plain NullStore (reports false)
-			// otherwise.
-			if tt.sqlStore {
-				sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
-			} else {
-				sm.utxoStore = &nullstore.NullStore{}
+				utxoStore:   &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}, unsupported: !tt.supports},
 			}
 
 			if tt.nilChain {
@@ -147,7 +146,7 @@ func TestSyncManager_legacyOutpointOnly(t *testing.T) {
 			}
 
 			require.Equal(t, tt.want, sm.legacyOutpointOnly(tt.height),
-				"legacyOutpointOnly(%d) enabled=%v sql=%v", tt.height, tt.enabled, tt.sqlStore)
+				"legacyOutpointOnly(%d) supports=%v", tt.height, tt.supports)
 		})
 	}
 }
@@ -245,7 +244,7 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 	const blockHeight = int32(500) // below checkpoint
 
 	t.Run("gate ON => fees are 0", func(t *testing.T) {
-		tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
+		tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 		block, txMap, txOrder := buildExtendedSubtreeBlock(t, blockHeight, 5)
 
 		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{},
@@ -263,11 +262,12 @@ func TestSyncManager_createSubtrees_OutpointOnlyZeroFees(t *testing.T) {
 	})
 
 	t.Run("gate OFF => real fees computed", func(t *testing.T) {
-		// flag off keeps the gate closed
-		tSettings, params := newOutpointOnlySettings(t, false, true, checkpointHeight)
+		// A non-supporting store keeps the capability gate closed.
+		tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 		block, txMap, txOrder := buildExtendedSubtreeBlock(t, blockHeight, 5)
 
-		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{}}
+		sm := &SyncManager{settings: tSettings, chainParams: params, logger: ulogger.TestLogger{},
+			utxoStore: &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}, unsupported: true}}
 		require.False(t, sm.legacyOutpointOnly(uint32(blockHeight)), "gate must be OFF for this case")
 
 		slices, datas, metas := makeSubtreeSlices(t, len(block.Transactions()))
@@ -388,9 +388,11 @@ func TestSyncManager_extendTransactions_OutpointOnlySkipsDecorate(t *testing.T) 
 	// run drives extendTransactions with a same-block-parent block and reports both
 	// the decorate-call count and whether Phase 1 extended the child's input.
 	run := func(t *testing.T, enabled bool) (decorateCalls int32, childScript *bscript.Script, childSatoshis, wantSatoshis uint64) {
-		tSettings, params := newOutpointOnlySettings(t, enabled, true, checkpointHeight)
+		tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 
-		spy := &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
+		// Store capability tracks the case so the gate matches the explicit path arg;
+		// the spy still counts decorate calls on the OFF (non-supporting) path.
+		spy := &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}, unsupported: !enabled}
 
 		sm := &SyncManager{
 			settings:    tSettings,
@@ -432,38 +434,31 @@ func TestSyncManager_needsParentMinedWait(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		enabled  bool
-		sqlStore bool
+		supports bool
 		height   uint32
 		want     bool
 	}{
-		{name: "height 0 never waits", enabled: false, sqlStore: true, height: 0, want: false},
-		{name: "height 1 never waits", enabled: false, sqlStore: true, height: 1, want: false},
-		{name: "flag off, below checkpoint: waits", enabled: false, sqlStore: true, height: 500, want: true},
-		{name: "flag on, non-supporting store, below checkpoint: waits", enabled: true, sqlStore: false, height: 500, want: true},
-		{name: "flag on, supporting store, below checkpoint: skips", enabled: true, sqlStore: true, height: 500, want: false},
-		{name: "flag on, supporting store, at checkpoint: skips", enabled: true, sqlStore: true, height: 1000, want: false},
-		{name: "flag on, supporting store, above checkpoint: waits", enabled: true, sqlStore: true, height: 1500, want: true},
+		{name: "height 0 never waits", supports: true, height: 0, want: false},
+		{name: "height 1 never waits", supports: true, height: 1, want: false},
+		{name: "non-supporting store, below checkpoint: waits", supports: false, height: 500, want: true},
+		{name: "supporting store, below checkpoint: skips", supports: true, height: 500, want: false},
+		{name: "supporting store, at checkpoint: skips", supports: true, height: 1000, want: false},
+		{name: "supporting store, above checkpoint: waits", supports: true, height: 1500, want: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tSettings, params := newOutpointOnlySettings(t, tt.enabled, tt.sqlStore, checkpointHeight)
+			tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 
 			sm := &SyncManager{
 				settings:    tSettings,
 				chainParams: params,
 				logger:      ulogger.TestLogger{},
-			}
-
-			if tt.sqlStore {
-				sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
-			} else {
-				sm.utxoStore = &nullstore.NullStore{}
+				utxoStore:   &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}, unsupported: !tt.supports},
 			}
 
 			require.Equal(t, tt.want, sm.needsParentMinedWait(tt.height),
-				"needsParentMinedWait(%d) enabled=%v store=%v", tt.height, tt.enabled, tt.sqlStore)
+				"needsParentMinedWait(%d) supports=%v", tt.height, tt.supports)
 		})
 	}
 }

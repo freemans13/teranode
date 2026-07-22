@@ -61,7 +61,6 @@ func TestOperatorOverrideFence(t *testing.T) {
 	suite.MockUTXOStore.SupportsOutpointOnlySpendResult = true
 
 	// Enable the outpoint-only fast path.
-	suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 
 	// Set the HARDCODED checkpoint to 1000.
 	setCheckpoints(t, suite, hardcodedCheckpointHeight)
@@ -116,7 +115,6 @@ func TestQuickValidateOutpointOnly_StoreCapabilityGate(t *testing.T) {
 			suite := NewCatchupTestSuite(t)
 			defer suite.Cleanup()
 
-			suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 			setCheckpoints(t, suite, checkpointHeight)
 			suite.MockUTXOStore.SupportsOutpointOnlySpendResult = tt.storeSupports
 

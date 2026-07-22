@@ -10,41 +10,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSyncManager_legacyUnified: the netsync adapter gate is the unified flag
-// AND the full outpoint-only gate. Any conjunct missing keeps the inline
-// pipeline (fail-safe).
+// TestSyncManager_legacyUnified: the netsync adapter gate is now purely the
+// store-capability outpoint-only gate (the unified opt-in flag is retired). The
+// unified route engages iff the store supports outpoint-only spends AND the block is
+// below the hardcoded checkpoint; any conjunct missing keeps the inline pipeline
+// (fail-safe), which is the path a non-supporting store (Aerospike) always takes.
 func TestSyncManager_legacyUnified(t *testing.T) {
 	const checkpointHeight = int32(1000)
 
 	tests := []struct {
 		name     string
-		unified  bool
-		enabled  bool
-		sqlStore bool
+		supports bool
 		height   uint32
 		want     bool
 	}{
-		{name: "unified+outpoint on, below", unified: true, enabled: true, sqlStore: true, height: 500, want: true},
-		{name: "unified on, outpoint off", unified: true, enabled: false, sqlStore: true, height: 500, want: false},
-		{name: "unified off, outpoint on", unified: false, enabled: true, sqlStore: true, height: 500, want: false},
-		{name: "above checkpoint", unified: true, enabled: true, sqlStore: true, height: 1500, want: false},
-		{name: "non-SQL store", unified: true, enabled: true, sqlStore: false, height: 500, want: false},
+		{name: "supporting store, below", supports: true, height: 500, want: true},
+		{name: "non-supporting store, below", supports: false, height: 500, want: false},
+		{name: "supporting store, above checkpoint", supports: true, height: 1500, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tSettings, params := newOutpointOnlySettings(t, tt.enabled, tt.sqlStore, checkpointHeight)
-			tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = tt.unified
+			tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 
 			sm := &SyncManager{
 				settings:    tSettings,
 				chainParams: params,
 				logger:      ulogger.TestLogger{},
-			}
-			if tt.sqlStore {
-				sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
-			} else {
-				sm.utxoStore = &nullstore.NullStore{}
+				utxoStore:   &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}, unsupported: !tt.supports},
 			}
 
 			require.Equal(t, tt.want, sm.legacyUnified(tt.height))
@@ -64,8 +57,7 @@ func TestSyncManager_prepareSubtrees_UnifiedSkipsUTXOOps(t *testing.T) {
 	const checkpointHeight = int32(1000)
 	const blockHeight = int32(500) // below checkpoint
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 
 	spy := &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
 	subtreeStore := memory.New()

@@ -77,10 +77,10 @@ func makeDuplicateTxidBlock(height int32) *bsvutil.Block {
 }
 
 // TestLegacyInline_DuplicateTxid_Rejected proves that a below-checkpoint block
-// routed through the INLINE path (prepareSubtrees,
-// LegacyUnifiedBelowCheckpoint=false) carrying a duplicated txid is rejected
-// with a BlockInvalidError before any UTXO commit. Previously this block would
-// slip past the dedup guard (which only fired on the unified route) and reach
+// routed through the INLINE path (prepareSubtrees, forced via a non-outpoint-only /
+// Aerospike-like store so legacyUnified is false) carrying a duplicated txid is
+// rejected with a BlockInvalidError before any UTXO commit. Previously this block
+// would slip past the dedup guard (which only fired on the unified route) and reach
 // ValidateTransactionsLegacyMode.
 func TestLegacyInline_DuplicateTxid_Rejected(t *testing.T) {
 	initPrometheusMetrics()
@@ -91,8 +91,7 @@ func TestLegacyInline_DuplicateTxid_Rejected(t *testing.T) {
 	const checkpointHeight = int32(1000)
 	const height = int32(500)
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = false
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 
 	logger := ulogger.TestLogger{}
 
@@ -105,19 +104,21 @@ func TestLegacyInline_DuplicateTxid_Rejected(t *testing.T) {
 	mockBC := &blockchain.Mock{}
 	mockBC.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(101), nil).Maybe()
 
+	// Wrap the store so SupportsOutpointOnlySpend() is false: below the checkpoint a
+	// non-outpoint-only (Aerospike-like) store takes the inline route, which is the
+	// route whose CVE dedup floor this test exercises.
 	sm := &SyncManager{
 		settings:         tSettings,
 		chainParams:      params,
 		logger:           logger,
-		utxoStore:        store,
+		utxoStore:        nonOutpointOnlyStore{store},
 		blockchainClient: mockBC,
 		validationClient: makeSpendValidator(store),
 		subtreeStore:     memory.New(),
 		ctx:              ctx,
 	}
 
-	// Sanity: the below-checkpoint inline gate engages for this block.
-	require.True(t, sm.legacyOutpointOnly(uint32(height)), "below-checkpoint outpoint-only gate must engage for the test block")
+	// Sanity: a non-supporting store takes the inline (non-unified) route below the checkpoint.
 	require.False(t, sm.legacyUnified(uint32(height)), "test must exercise the inline (non-unified) route")
 
 	block := makeDuplicateTxidBlock(height)

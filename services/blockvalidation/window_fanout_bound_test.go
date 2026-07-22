@@ -197,7 +197,6 @@ func newFanoutHarness(t *testing.T, ctx context.Context, spy utxo.Store, windowS
 
 	logger := ulogger.TestLogger{}
 	tSettings := testutil.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 	tSettings.BlockValidation.WindowStoreConcurrency = windowStoreConcurrency
 

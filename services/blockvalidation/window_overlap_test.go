@@ -420,7 +420,6 @@ func TestWindowOverlap_FlagOffByteIdentical(t *testing.T) {
 func newOverlapSettings(t *testing.T, flagOn bool) *settings.Settings {
 	t.Helper()
 	tSettings := testutil.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
 	tSettings.BlockValidation.WindowBarrierCollapse = flagOn
 

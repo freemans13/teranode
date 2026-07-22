@@ -45,11 +45,12 @@ func (s *panicTxMetaStore) SupportsOutpointOnlySpend() bool { return true }
 // Get is exercised on the happy path.
 type minedParentTxMetaStore struct {
 	*nullstore.NullStore
+	supportsOutpointOnly bool
 }
 
 const minedParentBlockID = uint32(7)
 
-func (s *minedParentTxMetaStore) SupportsOutpointOnlySpend() bool { return true }
+func (s *minedParentTxMetaStore) SupportsOutpointOnlySpend() bool { return s.supportsOutpointOnly }
 
 func (s *minedParentTxMetaStore) Get(_ context.Context, _ *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
 	// Fee left 0 on purpose: the outpoint-only fast path persists fee=0, and this
@@ -57,13 +58,14 @@ func (s *minedParentTxMetaStore) Get(_ context.Context, _ *chainhash.Hash, _ ...
 	return &meta.Data{BlockIDs: []uint32{minedParentBlockID}}, nil
 }
 
-// newSkipTestSettings returns settings with the outpoint-only flag set as given,
-// a sqlitememory UTXO store URL, and one hardcoded checkpoint at checkpointHeight.
-func newSkipTestSettings(t *testing.T, enabled bool, checkpointHeight int32) *settings.Settings {
+// newSkipTestSettings returns settings with a sqlitememory UTXO store URL and one
+// hardcoded checkpoint at checkpointHeight. The below-checkpoint skip is now purely
+// store-capability driven (the opt-in flag is retired), so eligibility is controlled
+// by the store passed to Valid, not by settings.
+func newSkipTestSettings(t *testing.T, checkpointHeight int32) *settings.Settings {
 	t.Helper()
 
 	tSettings := test.CreateBaseTestSettings(t)
-	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = enabled
 
 	u, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
@@ -77,17 +79,18 @@ func newSkipTestSettings(t *testing.T, enabled bool, checkpointHeight int32) *se
 }
 
 // TestBlock_SkipOrderAndBlessedBelowCheckpoint_Predicate is the full truth table:
-// every conjunct (flag on AND a store that supports the fast path AND the block
-// is a confirmed checkpoint ancestor AND a checkpoint exists AND 0 < height <=
-// checkpoint) must hold; any one missing keeps the skip OFF (fail-safe). The
-// store-support and confirmed-ancestor gates mirror the sibling fee skip in
-// checkBlockRewardAndFees so both skips engage on exactly the same blocks.
+// every conjunct (a store that supports the fast path AND the block is a confirmed
+// checkpoint ancestor AND a checkpoint exists AND 0 < height <= checkpoint) must
+// hold; any one missing keeps the skip OFF (fail-safe). Selection is purely
+// store-capability driven now that the opt-in flag is retired: the store-support and
+// confirmed-ancestor gates mirror the sibling fee skip in checkBlockRewardAndFees so
+// both skips engage on exactly the same blocks. A non-supporting store (Aerospike-like)
+// keeps the skip OFF and takes the normal validOrderAndBlessed path.
 func TestBlock_SkipOrderAndBlessedBelowCheckpoint_Predicate(t *testing.T) {
 	const checkpointHeight = int32(2000)
 
 	tests := []struct {
 		name          string
-		enabled       bool
 		supportsStore bool
 		confirmed     bool
 		noCheckpts    bool
@@ -95,20 +98,19 @@ func TestBlock_SkipOrderAndBlessedBelowCheckpoint_Predicate(t *testing.T) {
 		height        uint32
 		want          bool
 	}{
-		{name: "flag off, below", enabled: false, supportsStore: true, confirmed: true, height: 1000, want: false},
-		{name: "flag on, non-supporting store, below", enabled: true, supportsStore: false, confirmed: true, height: 1000, want: false},
-		{name: "flag on, supporting, not confirmed ancestor, below", enabled: true, supportsStore: true, confirmed: false, height: 1000, want: false},
-		{name: "flag on, supporting, confirmed, below checkpoint", enabled: true, supportsStore: true, confirmed: true, height: 1000, want: true},
-		{name: "flag on, supporting, confirmed, at checkpoint", enabled: true, supportsStore: true, confirmed: true, height: 2000, want: true},
-		{name: "flag on, supporting, confirmed, above checkpoint", enabled: true, supportsStore: true, confirmed: true, height: 2001, want: false},
-		{name: "flag on, supporting, confirmed, height 0", enabled: true, supportsStore: true, confirmed: true, height: 0, want: false},
-		{name: "flag on, supporting, confirmed, no checkpoints", enabled: true, supportsStore: true, confirmed: true, noCheckpts: true, height: 1000, want: false},
-		{name: "flag on, supporting, confirmed, nil chain params", enabled: true, supportsStore: true, confirmed: true, nilParams: true, height: 1000, want: false},
+		{name: "non-supporting store, below", supportsStore: false, confirmed: true, height: 1000, want: false},
+		{name: "supporting, not confirmed ancestor, below", supportsStore: true, confirmed: false, height: 1000, want: false},
+		{name: "supporting, confirmed, below checkpoint", supportsStore: true, confirmed: true, height: 1000, want: true},
+		{name: "supporting, confirmed, at checkpoint", supportsStore: true, confirmed: true, height: 2000, want: true},
+		{name: "supporting, confirmed, above checkpoint", supportsStore: true, confirmed: true, height: 2001, want: false},
+		{name: "supporting, confirmed, height 0", supportsStore: true, confirmed: true, height: 0, want: false},
+		{name: "supporting, confirmed, no checkpoints", supportsStore: true, confirmed: true, noCheckpts: true, height: 1000, want: false},
+		{name: "supporting, confirmed, nil chain params", supportsStore: true, confirmed: true, nilParams: true, height: 1000, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tSettings := newSkipTestSettings(t, tt.enabled, checkpointHeight)
+			tSettings := newSkipTestSettings(t, checkpointHeight)
 
 			if tt.noCheckpts {
 				noCp := chaincfg.RegressionNetParams
@@ -142,7 +144,7 @@ func TestBlock_SkipOrderAndBlessedBelowCheckpoint_Predicate(t *testing.T) {
 	})
 
 	t.Run("nil store", func(t *testing.T) {
-		tSettings := newSkipTestSettings(t, true, checkpointHeight)
+		tSettings := newSkipTestSettings(t, checkpointHeight)
 		b := &Block{Height: 1000}
 		b.SetCheckpointConfirmedAncestor(true)
 		require.False(t, b.skipOrderAndBlessedBelowCheckpoint(tSettings, nil))
@@ -171,7 +173,7 @@ func TestBlock_Valid_SkipRefusedWhenMerkleRootNotChecked(t *testing.T) {
 
 	// Flag ON and all policy conjuncts satisfied: only the missing merkle check
 	// should keep the skip from engaging.
-	tSettings := newSkipTestSettings(t, true, checkpointHeight)
+	tSettings := newSkipTestSettings(t, checkpointHeight)
 
 	coinbase, err := bt.NewTxFromString(CoinbaseHex)
 	require.NoError(t, err)
@@ -219,7 +221,7 @@ func TestBlock_Valid_SkipRefusedWhenMerkleRootNotChecked(t *testing.T) {
 	// reference — the observable proof that validOrderAndBlessed actually ran.
 	valid, err := block.Valid(
 		context.Background(), ulogger.TestLogger{}, blobStore,
-		&minedParentTxMetaStore{}, oldBlockIDs, []*BlockHeader{}, []uint32{}, tSettings, nil,
+		&minedParentTxMetaStore{supportsOutpointOnly: true}, oldBlockIDs, []*BlockHeader{}, []uint32{}, tSettings, nil,
 	)
 	require.NoError(t, err)
 	require.True(t, valid)
@@ -339,7 +341,7 @@ func TestBlock_MerkleFloor_RejectsTamperingWhileSkipIsActive(t *testing.T) {
 	const checkpointHeight = int32(2000)
 	const blockHeight = uint32(1000) // <= checkpoint
 
-	tSettings := newSkipTestSettings(t, true, checkpointHeight)
+	tSettings := newSkipTestSettings(t, checkpointHeight)
 
 	coinbase, err := bt.NewTxFromString(CoinbaseHex)
 	require.NoError(t, err)
@@ -400,27 +402,32 @@ func TestBlock_MerkleFloor_RejectsTamperingWhileSkipIsActive(t *testing.T) {
 	})
 }
 
-// TestBlock_Valid_OrderAndBlessedPassesOnFlagOffRevalidation is the regression
-// guard for the safe asymmetry between the two below-checkpoint skips.
+// TestBlock_Valid_OrderAndBlessedPassesOnNonSupportingStoreRevalidation is the
+// regression guard for the safe asymmetry between the two below-checkpoint skips.
 //
-// The sibling fee skip (checkBlockRewardAndFees) is deliberately NOT gated on
-// the OutpointOnlyBelowCheckpoint flag: a fast-path-synced block persists
-// subtree fees as 0, so a flag-gated fee skip would recompute
-// coinbaseOutput(subsidy+realFees) > subtreeFees(0)+subsidy on later
-// revalidation and wrongly reject a genuinely-valid, checkpoint-pinned block.
+// The sibling fee skip (checkBlockRewardAndFees) is gated on store capability, not
+// on any opt-in flag: a fast-path-synced block persists subtree fees as 0, so a
+// flag-gated fee skip would recompute coinbaseOutput(subsidy+realFees) >
+// subtreeFees(0)+subsidy on later revalidation and wrongly reject a genuinely-valid,
+// checkpoint-pinned block.
 //
-// The order-blessed skip IS additionally gated on the flag, which is only safe
-// because validOrderAndBlessed has no equivalent fee=0 hazard: it reads
-// persisted subtree meta (parent tx hashes / inpoints) and parent existence on
-// chain, never fees. This test proves that — with the flag OFF so the skip is
-// disabled and validOrderAndBlessed actually runs — a fast-path-shaped block
-// (subtree Fees == 0, parents already mined) still validates.
-func TestBlock_Valid_OrderAndBlessedPassesOnFlagOffRevalidation(t *testing.T) {
+// The order-blessed skip is store-capability gated too: on a store that does NOT
+// support outpoint-only spends (Aerospike-like) the skip is disabled and
+// validOrderAndBlessed runs in full. This test proves that — with a non-supporting
+// store so the skip is disabled and validOrderAndBlessed actually runs — a
+// fast-path-shaped block (subtree Fees == 0, parents already mined) still validates.
+func TestBlock_Valid_OrderAndBlessedPassesOnNonSupportingStoreRevalidation(t *testing.T) {
 	const checkpointHeight = int32(2000)
-	const blockHeight = uint32(1000) // <= checkpoint
+	// Below checkpoint AND below the first regtest halving (interval 150): the
+	// subsidy is a full 50 BTC, matching the 50-BTC CoinbaseHex output. This
+	// matters because a non-supporting store also disables the sibling fee skip
+	// (checkBlockRewardAndFees runs in full), so the coinbase must genuinely
+	// satisfy the no-inflation check — a fee=0 subtree with a coinbase claiming
+	// exactly the subsidy is a legitimately-valid block.
+	const blockHeight = uint32(100) // <= checkpoint, < first regtest halving
 
-	// Flag OFF: the skip is disabled, so validOrderAndBlessed runs in full.
-	tSettings := newSkipTestSettings(t, false, checkpointHeight)
+	// Non-supporting store below: the skip is disabled, so validOrderAndBlessed runs in full.
+	tSettings := newSkipTestSettings(t, checkpointHeight)
 
 	coinbase, err := bt.NewTxFromString(CoinbaseHex)
 	require.NoError(t, err)
@@ -473,7 +480,7 @@ func TestBlock_Valid_OrderAndBlessedPassesOnFlagOffRevalidation(t *testing.T) {
 	// so checkParentExistsOnChain resolves it to exactly one recent block.
 	valid, err := block.Valid(
 		context.Background(), ulogger.TestLogger{}, blobStore,
-		&minedParentTxMetaStore{}, oldBlockIDs, []*BlockHeader{}, []uint32{minedParentBlockID}, tSettings, nil,
+		&minedParentTxMetaStore{supportsOutpointOnly: false}, oldBlockIDs, []*BlockHeader{}, []uint32{minedParentBlockID}, tSettings, nil,
 	)
 	require.NoError(t, err, "validOrderAndBlessed must pass on a fee=0 flag-off revalidation")
 	require.True(t, valid)

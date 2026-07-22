@@ -9,9 +9,8 @@ package netsync
 // fetchHeaderBlocks walk across N eligible peers, assigning each walked block to
 // exactly ONE peer (disjoint), bounding per-peer in-flight by K
 // (MaxBlocksInTransitPerPeer), bounding total in-flight by Budget
-// (BlockDownloadWindow ∧ the dynamic byte cap), advancing the shared startHeader
-// cursor exactly once per assigned block, and sending each peer a getdata for
-// exactly its assigned hashes.
+// (BlockDownloadWindow), re-anchoring the walk on the download frontier each pass,
+// and sending each peer a getdata for exactly its assigned hashes.
 import (
 	"container/list"
 	"context"
@@ -150,20 +149,17 @@ func TestAssignBlocks_DisjointAcrossThreePeers(t *testing.T) {
 	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
 	sm.headersFirstMode.Store(true)
 
-	// Seed the header list: a leading dummy node (never fetched) + the runway.
-	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	// Seed the header list: a leading dummy seed node (never fetched) + the runway.
+	// The frontier walk skips headerListSeed, so mark the dummy as the seed.
+	sm.headerListSeed = sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
 	for i := range hashes {
 		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &hashes[i]})
 	}
 	sm.startHeader = sm.headerList.Front().Next() // first fetchable node
 
-	// The Budget = min(BlockDownloadWindow=18, dynamicCap). dynamicCap here is the
-	// no-sample default 20, so Budget = 18.
-	dynamicCap := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	// Budget = BlockDownloadWindow = 18 (the memory-scaled byte cap is retired; the
+	// per-peer cap K=8 across 3 peers gives 24, so BlockDownloadWindow binds first).
 	budget := tSettings.Legacy.BlockDownloadWindow
-	if dynamicCap < budget {
-		budget = dynamicCap
-	}
 	require.Equal(t, 18, budget, "precondition: budget must bind at 18")
 
 	// --- run the scheduler ---
@@ -230,17 +226,10 @@ func TestAssignBlocks_DisjointAcrossThreePeers(t *testing.T) {
 	requirePeerConsistent(stateB, inv2)
 	requirePeerConsistent(stateC, inv3)
 
-	// (d) startHeader advanced past every assigned block: it must point at the
-	// (budget+1)-th fetchable node (index `budget` in hashes), since exactly
-	// `budget` blocks were assigned from the front of the runway.
-	sm.headerMu.Lock()
-	start := sm.startHeader
-	sm.headerMu.Unlock()
-	require.NotNil(t, start, "(d) startHeader must still have runway (runway > budget)")
-	startNode, ok := start.Value.(*headerNode)
-	require.True(t, ok)
-	require.Equal(t, hashes[budget], *startNode.hash,
-		"(d) startHeader must have advanced past all %d assigned blocks", budget)
+	// (d) The fetch walk re-anchors on the download frontier every pass and no
+	// longer persists a monotonic startHeader cursor, so the assigned set is the
+	// lowest `budget` blocks purely by the frontier walk (verified above), not by a
+	// cursor advance. The startHeader field is not touched by assignBlocksAcrossPeers.
 
 	// Every assigned hash must also be in the global requestedBlocks ledger.
 	for h := range seen {
@@ -303,7 +292,8 @@ func TestAssignBlocks_FlagOffSinglePeerByteIdentical(t *testing.T) {
 	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
 	sm.headersFirstMode.Store(true)
 
-	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	// The frontier walk skips headerListSeed, so mark the dummy as the seed.
+	sm.headerListSeed = sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
 	for i := range hashes {
 		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &hashes[i]})
 	}
@@ -329,8 +319,8 @@ func TestAssignBlocks_FlagOffSinglePeerByteIdentical(t *testing.T) {
 	require.Zero(t, otherState.requestedBlocks.Len(), "flag-off: other peer requestedBlocks must stay empty")
 	require.Equal(t, runway, syncState.requestedBlocks.Len(), "flag-off: sync peer must hold the whole runway")
 
-	// startHeader walked to the end (all runway blocks fetched) => nil.
-	sm.headerMu.Lock()
-	require.Nil(t, sm.startHeader, "flag-off: startHeader must advance exactly as single-peer fetchHeaderBlocks")
-	sm.headerMu.Unlock()
+	// The single-peer fetch walk re-anchors on the download frontier each pass and
+	// no longer advances the monotonic startHeader cursor; the whole runway is
+	// fetched by the frontier walk + in-flight skip (asserted above), not by the
+	// cursor climbing to nil.
 }

@@ -662,49 +662,27 @@ func (sm *SyncManager) quickValidationAllowed(blockHeight uint32) bool {
 // legacyOutpointOnly reports whether this block may use the below-checkpoint
 // outpoint-only fast path on the legacy netsync route: skip the bulk decorate,
 // stamp subtree fees as 0, do a minimal (inputs-only) UTXO create, and spend
-// using the validator's outpoint-only mode. Default OFF — every conjunct must
-// hold for the path to engage, so when the setting is off, the store does not
-// support the fast path, or the block is above the highest hard-coded checkpoint,
-// the legacy path behaves exactly as before (byte-identical, invariant I2).
+// using the validator's outpoint-only mode. Selection is purely store-capability
+// driven — every conjunct in OutpointOnlyEligible must hold for the path to engage,
+// so when the store does not support the fast path (e.g. Aerospike) or the block is
+// above the highest hard-coded checkpoint, the legacy path behaves exactly as before
+// (byte-identical, invariant I2), following the normal full-validation pipeline.
 //
 // Boundary and eligibility live in model.BelowCheckpoint / model.OutpointOnlyEligible — one definition for every path.
 func (sm *SyncManager) legacyOutpointOnly(height uint32) bool {
-	if sm.settings == nil {
-		return false
-	}
-
-	return model.OutpointOnlyEligible(sm.settings, sm.utxoStore, sm.chainParams, height)
+	return model.OutpointOnlyEligible(sm.utxoStore, sm.chainParams, height)
 }
 
 // legacyUnified reports whether this block takes the unified below-checkpoint
-// route: the operator enabled blockvalidation_legacy_unified_below_checkpoint
-// AND the full outpoint-only gate holds. When true, prepareSubtrees becomes a
-// protocol adapter — it still partitions the wire block, builds the txMap,
-// extends in-block parents, creates and writes the subtree files, and
-// HandleBlockDirect verifies the merkle root — but UTXO create+spend and block
-// ID assignment move server-side into quickValidateBlock (the same machinery
-// native catchup uses). Default off; with the flag off the inline pipeline is
-// byte-identical.
+// route: the full outpoint-only gate holds (store capability + below the hardcoded
+// checkpoint). When true, prepareSubtrees becomes a protocol adapter — it still
+// partitions the wire block, builds the txMap, extends in-block parents, creates and
+// writes the subtree files, and HandleBlockDirect verifies the merkle root — but
+// UTXO create+spend and block ID assignment move server-side into quickValidateBlock
+// (the same machinery native catchup uses). A store that cannot run outpoint-only
+// spends (e.g. Aerospike) fails the gate, so the inline pipeline stays byte-identical.
 func (sm *SyncManager) legacyUnified(height uint32) bool {
-	return sm.settings != nil &&
-		sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint &&
-		sm.legacyOutpointOnly(height)
-}
-
-// legacyFailClosed reports whether this block takes the fail-closed variant of the
-// non-unified legacy below-checkpoint inline path: the operator enabled
-// blockvalidation_legacy_below_checkpoint_fail_closed AND the outpoint-only gate
-// holds AND the unified route is NOT engaged (the unified route is already
-// fail-closed end-to-end, so this inline lever only applies when it is off). When
-// true, PreValidateTransactions drops validator.WithCreateConflicting so a genuine
-// conflict hard-fails the block (no conflicting subtree node is written) instead of
-// being written-and-reconciled later. Default off; with the flag off the inline
-// pipeline is byte-identical to today.
-func (sm *SyncManager) legacyFailClosed(height uint32) bool {
-	return sm.settings != nil &&
-		sm.settings.BlockValidation.LegacyBelowCheckpointFailClosed &&
-		sm.legacyOutpointOnly(height) &&
-		!sm.legacyUnified(height)
+	return sm.legacyOutpointOnly(height)
 }
 
 // needsParentMinedWait reports whether HandleBlockDirect must block on the
@@ -930,11 +908,6 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 	// the phases (minimal create, outpoint-only pre-validate) so they cannot disagree.
 	outpointOnly := sm.legacyOutpointOnly(bi.height)
 
-	// failClosed is the requested A/B lever: when engaged, the inline spend drops
-	// WithCreateConflicting so a genuine conflict hard-fails rather than writing a
-	// conflicting subtree node. Computed once and threaded in for the same reason.
-	failClosed := sm.legacyFailClosed(bi.height)
-
 	if err = sm.createUtxos(ctx, txMap, bi, blockID, outpointOnly); err != nil {
 		return err
 	}
@@ -946,7 +919,7 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to select finality time sources", err)
 	}
 
-	if err = sm.PreValidateTransactions(ctx, txMap, bi.hash, bi.height, candidateBlockTime, candidateParentMedianTime, outpointOnly, failClosed); err != nil {
+	if err = sm.PreValidateTransactions(ctx, txMap, bi.hash, bi.height, candidateBlockTime, candidateParentMedianTime, outpointOnly); err != nil {
 		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to pre-validate transactions", err)
 	}
 
@@ -1310,7 +1283,7 @@ func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, bi blockIdent, 
 // src/validation.cpp:6001). The caller passes the one matching this block's
 // era and zeroes the other.
 func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
-	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32, outpointOnly bool, failClosed bool) (err error) {
+	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32, outpointOnly bool) (err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "PreValidateTransactions",
 		tracing.WithLogMessage(sm.logger, "[PreValidateTransactions] called for block %s / height %d", blockHash, blockHeight),
 		tracing.WithHistogram(prometheusLegacyNetsyncPreValidateTransactions),
@@ -1406,16 +1379,13 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					validator.WithCandidateBlockTime(candidateBlockTime),
 					validator.WithCandidateParentMedianTime(candidateParentMedianTime),
 				}
-				if !failClosed {
-					// Default (flag OFF): the validator may create a conflicting txMeta on a
-					// spend clash, which is later written as a conflicting subtree node and
-					// reconciled by block assembly. On the fail-closed path this option is
-					// dropped so the validator instead returns a non-retryable ErrSpent/
-					// ErrTxConflicting (joined into a ProcessingError wrapping ErrUtxoError),
-					// which hard-fails the block before AddBlock — no conflicting node is ever
-					// written below the checkpoint.
-					validateOpts = append(validateOpts, validator.WithCreateConflicting(true))
-				}
+				// The validator may create a conflicting txMeta on a spend clash, which is
+				// later written as a conflicting subtree node and reconciled by block
+				// assembly. This is the inline route's behaviour on every below-checkpoint
+				// block: a genuine conflict cannot occur in a checkpoint-certified chain, so
+				// tolerating it here (rather than hard-failing) matches the historical inline
+				// pipeline byte-for-byte.
+				validateOpts = append(validateOpts, validator.WithCreateConflicting(true))
 				if outpointOnly {
 					validateOpts = append(validateOpts, validator.WithOutpointOnlySpend(true))
 				}
@@ -1429,15 +1399,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					// has stale spending data. The block is confirmed, so its transactions
 					// take precedence — the conflict will be resolved by ProcessConflicting
 					// during block acceptance.
-					//
-					// On the fail-closed path this swallow is unreachable: dropping
-					// WithCreateConflicting above means the validator never takes the
-					// conflicting-create branch, so a clash surfaces as a non-retryable
-					// ErrSpent/ErrTxConflicting that must reach hardFail below. The swallow is
-					// therefore gated on !failClosed both to preserve today's behaviour when
-					// the flag is off AND so a future refactor that re-introduces a conflict
-					// path cannot silently swallow a genuine below-checkpoint conflict.
-					if !failClosed && errors.Is(validateErr, errors.ErrTxConflicting) {
+					if errors.Is(validateErr, errors.ErrTxConflicting) {
 						return nil
 					}
 

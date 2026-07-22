@@ -4,11 +4,11 @@
 
 package netsync
 
-// Centrepiece tests for the svnode-aligned fetch scheduler
-// (legacy_svnodeAlignedFetch): they REPRODUCE the live mainnet big-block IBD
-// stall (height ~701475) as a divergence from bitcoin-sv/svnode, then lock in
-// that flipping the gate on ALIGNS Teranode's scheduler to svnode's proven
-// design.
+// Centrepiece tests for the svnode-aligned fetch scheduler (now the only
+// scheduler): they lock in that Teranode's block-download layer matches
+// bitcoin-sv/svnode's proven design, which the earlier memory-scaled scheduler
+// diverged from — reproducing the live mainnet big-block IBD stall (height
+// ~701475).
 //
 // The live shape (from ground truth): blocks commit STRICTLY IN ORDER, but the
 // fetcher spends the whole 73-88 MB/s pipe pulling blocks 60-100 heights AHEAD
@@ -25,14 +25,13 @@ package netsync
 // scattered across ~100 far-ahead heights.
 //
 // These tests encode two svnode-faithful invariants the hand-tuned Teranode
-// knobs failed to hold, plus the byte-identical-default guarantee:
+// knobs failed to hold:
 //
 //	I1  DEPTH IS HEALTHY, NOT STARVED — the in-flight set is a full 16, never
 //	    collapsed to 1-of-100. (guards against under-fetch)
 //	I2  DEPTH IS CONTIGUOUS FROM THE FRONTIER — the in-flight heights are the
 //	    lowest missing run immediately above committed, NOT spread far ahead;
 //	    committed+1 is ALWAYS pursued. (guards against the live over-fetch)
-//	I3  DEFAULT (gate off) IS BYTE-IDENTICAL to today's behaviour.
 //
 // They reuse the harness from svnode_aligned_fetch_test.go (bigBlockTracker,
 // seedHeaderList, requestedHashes) and assign_blocks_test.go (captureGetDataPeer,
@@ -60,12 +59,11 @@ import (
 )
 
 // newAlignTestManager builds a minimal drain-goroutine SyncManager wired for the
-// single-peer headers-first fetch path, with the given gate state and a
-// big-block size tracker (the exact shape of the live stall — a memory-scaled
-// ceiling far above svnode's fixed 16). The returned peer's getdata sends are
-// captured but the tests assert on the synchronously-recorded requestedBlocks
-// ledger, which is the authoritative in-flight (bandwidth) set.
-func newAlignTestManager(t *testing.T, index uint8, seed byte, runway int, nonce uint32, gateOn bool) (*SyncManager, *peer.Peer, *peerSyncState, chainhash.Hash, []chainhash.Hash) {
+// single-peer headers-first fetch path, with a big-block size tracker (proving the
+// fixed per-peer cap is size-blind). The returned peer's getdata sends are captured
+// but the tests assert on the synchronously-recorded requestedBlocks ledger, which
+// is the authoritative in-flight (bandwidth) set.
+func newAlignTestManager(t *testing.T, index uint8, seed byte, runway int, nonce uint32) (*SyncManager, *peer.Peer, *peerSyncState, chainhash.Hash, []chainhash.Hash) {
 	t.Helper()
 
 	chainParams := chaincfg.MainNetParams
@@ -83,7 +81,6 @@ func newAlignTestManager(t *testing.T, index uint8, seed byte, runway int, nonce
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ParallelFetchPeers = 1
-	tSettings.Legacy.SvnodeAlignedFetch = gateOn
 	tSettings.Legacy.MaxBlocksInTransitPerPeer = 16
 	tSettings.Legacy.FrontierLogInterval = 0
 
@@ -110,8 +107,8 @@ func newAlignTestManager(t *testing.T, index uint8, seed byte, runway int, nonce
 	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
 	sm.headersFirstMode.Store(true)
 	seedHeaderList(sm, base, hashes)
-	// Off the gate the walk uses the monotonic startHeader cursor; on the gate it
-	// re-anchors on the download frontier every pass and startHeader is ignored.
+	// The walk re-anchors on the download frontier every pass; startHeader is not
+	// used as a fetch cursor, but seed it as resetHeaderState would for realism.
 	sm.startHeader = sm.headerList.Front().Next()
 
 	return sm, syncPeer, syncState, base, hashes
@@ -131,52 +128,14 @@ func maxRequestedHeight(state *peerSyncState, hashes []chainhash.Hash) int {
 	return hi
 }
 
-// TestSvnodeAlign_Centrepiece_GateOff_FrontierStarvesAsCursorClimbs is the RED
-// characterisation of the live stall on the single-peer path. With the gate OFF
-// the walk persists a MONOTONIC startHeader cursor: once it has requested the
-// window it never looks back. So when committed+1 is freed (its getdata dropped,
-// or the head-stall detector released it) but the cursor has already climbed
-// past it, the next fetch spends its freed slot on a block FAR AHEAD of the
-// frontier and leaves committed+1 outstanding to nobody — the very
-// freeze-then-burst wedge measured live (the fetcher pulls ahead while the
-// frontier starves).
-func TestSvnodeAlign_Centrepiece_GateOff_FrontierStarvesAsCursorClimbs(t *testing.T) {
-	sm, _, syncState, _, hashes := newAlignTestManager(t, 60, 0xe0, 60, 30000, false)
-
-	// Tick 1: the memory-scaled budget (big blocks => 30) fills the window with
-	// the lowest 30, and the monotonic cursor climbs to hashes[30].
-	sm.fetchHeaderBlocks()
-	require.Equal(t, 30, syncState.requestedBlocks.Len(),
-		"gate OFF: the memory-scaled budget lets the single peer hold 30 (>16) big blocks in flight")
-	require.True(t, requestedHashes(syncState, hashes)[hashes[0]], "tick 1: committed+1 is initially requested")
-
-	// The frontier block (committed+1) is freed WITHOUT the frontier advancing —
-	// the getdata was dropped, or the head-stall detector released it. Its
-	// header node stays in the list (nothing has committed), so committed+1 is
-	// still the next-needed block.
-	syncState.requestedBlocks.Delete(hashes[0])
-	sm.requestedBlocks.Delete(hashes[0])
-
-	// Tick 2: one slot is free. The monotonic cursor sits at hashes[30], so the
-	// walk spends the slot on a FAR-AHEAD block and never re-pursues committed+1.
-	sm.fetchHeaderBlocks()
-
-	req := requestedHashes(syncState, hashes)
-	require.False(t, req[hashes[0]],
-		"gate OFF live stall: committed+1 is NOT re-pursued — the frontier starves outstanding to nobody")
-	require.True(t, req[hashes[30]],
-		"gate OFF live stall: the freed slot is spent on a block 30 heights AHEAD of the frontier (bandwidth pulled far ahead)")
-}
-
-// TestSvnodeAlign_Centrepiece_GateOn_ReanchorsFrontier_PursuesCommittedPlus1 is
-// the GREEN alignment: the SAME freed-frontier scenario with the gate ON.
-// svnode recomputes the download frontier every pass (pindexLastCommonBlock,
-// np.cpp:379,386), so the walk re-anchors at the front, sees committed+1 is no
-// longer in flight, and re-pursues it FIRST — while blocks already in flight
-// just above it are skipped and no new far-ahead block is bought. Bandwidth goes
-// to the next-needed block, exactly as svnode.
-func TestSvnodeAlign_Centrepiece_GateOn_ReanchorsFrontier_PursuesCommittedPlus1(t *testing.T) {
-	sm, _, syncState, _, hashes := newAlignTestManager(t, 61, 0xe1, 60, 31000, true)
+// TestSvnodeAlign_Centrepiece_ReanchorsFrontier_PursuesCommittedPlus1 locks in
+// the alignment: on a freed-frontier scenario the walk recomputes the download
+// frontier every pass (pindexLastCommonBlock, np.cpp:379,386), re-anchors at the
+// front, sees committed+1 is no longer in flight, and re-pursues it FIRST — while
+// blocks already in flight just above it are skipped and no new far-ahead block is
+// bought. Bandwidth goes to the next-needed block, exactly as svnode.
+func TestSvnodeAlign_Centrepiece_ReanchorsFrontier_PursuesCommittedPlus1(t *testing.T) {
+	sm, _, syncState, _, hashes := newAlignTestManager(t, 61, 0xe1, 60, 31000)
 
 	// Tick 1: fixed size-blind cap of 16, contiguous from the frontier.
 	sm.fetchHeaderBlocks()
@@ -212,7 +171,7 @@ func TestSvnodeAlign_Centrepiece_GateOn_ReanchorsFrontier_PursuesCommittedPlus1(
 func TestSvnodeAlign_InFlightHealthyAndContiguousFromFrontier(t *testing.T) {
 	// A 120-block runway is deep enough that a memory-scaled/monotonic scheduler
 	// COULD scatter far ahead; the aligned one must not.
-	sm, _, syncState, _, hashes := newAlignTestManager(t, 62, 0xe2, 120, 32000, true)
+	sm, _, syncState, _, hashes := newAlignTestManager(t, 62, 0xe2, 120, 32000)
 
 	sm.fetchHeaderBlocks()
 
@@ -259,7 +218,6 @@ func TestSvnodeAlign_MultiPeer_ScarceBandwidthGoesToFrontier(t *testing.T) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ParallelFetchPeers = 3
-	tSettings.Legacy.SvnodeAlignedFetch = true
 	tSettings.Legacy.MaxBlocksInTransitPerPeer = 16
 	tSettings.Legacy.BlockDownloadWindow = 1024 // loose ceiling: the per-peer spare is the real throttle
 	tSettings.Legacy.FrontierLogInterval = 0
@@ -345,46 +303,38 @@ func TestSvnodeAlign_MultiPeer_ScarceBandwidthGoesToFrontier(t *testing.T) {
 	require.LessOrEqual(t, stateC.requestedBlocks.Len(), 16)
 }
 
-// TestSvnodeAlign_DefaultGateOff_ByteIdentical is invariant I3: with the gate
-// off (the default), every aligned decision point reduces EXACTLY to today's
-// pre-feature behaviour. The load-bearing helpers are pure pass-throughs — the
-// in-flight governor is the memory-scaled cap, the walk anchor is the monotonic
-// startHeader cursor, the runway clamp is the pre-gate value — and a real fetch
-// pass requests exactly the lowest calculateMaxInFlightBlocks() hashes from the
-// cursor, byte-for-byte what the pre-feature scheduler did.
-func TestSvnodeAlign_DefaultGateOff_ByteIdentical(t *testing.T) {
-	sm, _, syncState, _, hashes := newAlignTestManager(t, 66, 0xe4, 40, 34000, false)
+// TestSvnodeAlign_FetchWalkAnchorIsDownloadFrontier locks in that the fetch walk
+// anchor is the recomputed download frontier (front skipping the seed), and that a
+// real fetch pass requests exactly the lowest MaxBlocksInTransitPerPeer hashes from
+// the frontier — the size-blind svnode-aligned getdata window.
+func TestSvnodeAlign_FetchWalkAnchorIsDownloadFrontier(t *testing.T) {
+	sm, _, syncState, _, hashes := newAlignTestManager(t, 66, 0xe4, 40, 34000)
 
-	// Helper purity: gate off, the aligned helpers must equal the pre-feature
-	// expressions they replaced.
-	require.False(t, sm.svnodeAlignedFetch(), "the gate must be OFF (default)")
-
-	require.Equal(t, sm.blockSizeTracker.calculateMaxInFlightBlocks(), sm.maxInFlightPerPeer(),
-		"gate off: the in-flight governor IS the memory-scaled cap, byte-identical")
-
+	// The walk anchor is the download frontier (front skipping the seed), not a
+	// persisted monotonic cursor.
 	sm.headerMu.Lock()
 	anchor := sm.fetchWalkAnchorLocked()
+	frontier := sm.downloadFrontierAnchorLocked()
 	sm.headerMu.Unlock()
-	require.Equal(t, sm.startHeader, anchor,
-		"gate off: the fetch walk anchor IS the monotonic startHeader cursor, byte-identical")
+	require.Equal(t, frontier, anchor,
+		"the fetch walk anchor IS the recomputed download frontier")
 
 	horizon, capped := sm.fetchRunwayHorizon()
 	require.Equal(t, uint32(0), horizon)
 	require.False(t, capped,
-		"gate off with parkAhead inactive: the runway clamp is the pre-gate (0,false), unchanged")
+		"with parkAhead inactive and no block store the runway clamp is (0,false)")
 
-	// Behavioural equality: a real fetch pass requests exactly the lowest
-	// calculateMaxInFlightBlocks() hashes from the cursor (30 for these big
-	// blocks) — the exact pre-feature getdata window.
-	want := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	// A real fetch pass requests exactly the lowest MaxBlocksInTransitPerPeer (16)
+	// hashes from the frontier — size-blind, regardless of the ~100MB block size.
+	want := sm.maxInFlightPerPeer()
 	sm.fetchHeaderBlocks()
 	require.Equal(t, want, syncState.requestedBlocks.Len(),
-		"gate off: in-flight is exactly the memory-scaled window (%d), today's behaviour", want)
+		"in-flight is exactly the fixed per-peer window (%d)", want)
 
 	req := requestedHashes(syncState, hashes)
 	for i := 0; i < want; i++ {
-		require.True(t, req[hashes[i]], "gate off: the lowest %d hashes from the cursor are requested; block %d missing", want, i)
+		require.True(t, req[hashes[i]], "the lowest %d hashes from the frontier are requested; block %d missing", want, i)
 	}
 	require.False(t, req[hashes[want]],
-		"gate off: nothing beyond the memory-scaled window is requested — the cursor stopped exactly at the pre-feature bound")
+		"nothing beyond the fixed per-peer window is requested — the walk stopped at the cap")
 }

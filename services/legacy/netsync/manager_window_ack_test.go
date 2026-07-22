@@ -48,8 +48,7 @@ var _ blockvalidation.Interface = (*gatedSpyBlockValidation)(nil)
 func newAckTestSyncManager(t *testing.T, spy blockvalidation.Interface) *SyncManager {
 	t.Helper()
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, int32(1000))
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, int32(1000))
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 
 	return &SyncManager{
@@ -205,7 +204,7 @@ func TestAckWindowedBlock_FillsWindowMultipleBlocks(t *testing.T) {
 // false, so the accumulator is never constructed and the whole window/ack path
 // (including ackWindowedBlock) is unreachable — flag-off stays byte-identical.
 func TestAckWindowedBlock_FlagOff_AccumulatorNeverConstructed(t *testing.T) {
-	tSettings, _ := newOutpointOnlySettings(t, true, true, int32(1000))
+	tSettings, _ := newOutpointOnlySettings(t, true, int32(1000))
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.0
 
 	// This is the exact gate the drain goroutine evaluates before constructing

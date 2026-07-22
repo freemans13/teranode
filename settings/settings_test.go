@@ -174,7 +174,7 @@ func TestParallelWindowMaxParkedBlocksDefault(t *testing.T) {
 // TestWindowMaxBlocksDefault pins the decoupled commit-window count cap to 0,
 // which means "fall back to MaxBlocksBehindBlockAssembly" — byte-identical to the
 // pre-decoupling behaviour. A positive value below the maturity ceiling shrinks
-// the commit window so ParallelWindowPipeline can overlap two windows in flight.
+// the commit window so the window commit pipeline can overlap two windows in flight.
 func TestWindowMaxBlocksDefault(t *testing.T) {
 	require.Equal(t, 0, NewSettings().Legacy.WindowMaxBlocks)
 }

@@ -2054,9 +2054,9 @@ func TestFetchHeaderBlocks_OutputQueueFull_DoesNotBlockAndDoesNotLeakLedger(t *t
 func TestMaintainInFlightWindow_TopsUpToCapWithoutExceeding(t *testing.T) {
 	base := chainhash.Hash{0xd0}
 
-	// Build more headers than the cap so a single top-up can reach the cap.
-	// newBlockSizeTracker(20) has no samples, so calculateMaxInFlightBlocks()
-	// returns noSampleInFlightDefault (20).
+	// Build more headers than the cap so a single top-up can reach the cap. The
+	// in-flight cap is now the fixed per-peer MaxBlocksInTransitPerPeer (16 by
+	// default) via maxInFlightPerPeer().
 	const headerCount = 30
 	_, hashes := buildHeaderChain(base, headerCount, 4000)
 
@@ -2111,14 +2111,15 @@ func TestMaintainInFlightWindow_TopsUpToCapWithoutExceeding(t *testing.T) {
 	sm.headersFirstMode.Store(true)
 
 	// Seed the header list (dummy seed + the built headers) and set startHeader
-	// exactly as handleHeadersMsg / resetHeaderState would.
-	sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
+	// exactly as handleHeadersMsg / resetHeaderState would. The frontier walk skips
+	// headerListSeed, so mark the dummy as the seed.
+	sm.headerListSeed = sm.headerList.PushBack(&headerNode{height: 0, hash: &base})
 	for i := range hashes {
 		sm.headerList.PushBack(&headerNode{height: int32(i + 1), hash: &hashes[i]})
 	}
 	sm.startHeader = sm.headerList.Front().Next()
 
-	dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	dynamicMax := sm.maxInFlightPerPeer()
 	require.Greater(t, dynamicMax, 0, "sanity: dynamic cap must be positive")
 	require.Less(t, dynamicMax, headerCount, "sanity: runway must exceed the cap")
 	require.Zero(t, state.requestedBlocks.Len(), "precondition: nothing in flight yet")
@@ -2881,32 +2882,24 @@ func TestHeadersFirst_MultiMessageInterval_NoStrandedBlock(t *testing.T) {
 			defer state.requestedBlocks.Stop()
 
 			sm := &SyncManager{
-				ctx:              context.Background(),
-				logger:           ulogger.TestLogger{},
-				chainParams:      &chainParams,
-				blockchainClient: blockchainClient,
-				peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-				requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-				rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](),
-				headerList:       list.New(),
-				// maxSamples 4, preloaded below with ~1.5 GB / high-tx samples so
-				// calculateMaxInFlightBlocks returns 2 — an in-flight bound far
-				// SMALLER than the 8-block interval, forcing multiple bounded
-				// fetch rounds interleaved with commits (the real regime). The
-				// 3 GB byte budget with 1.5 GB blocks makes the byte-safety
-				// clamp bind at 2; a large tx budget keeps the tx-bound out of
-				// the way so the clamp is what limits us.
-				blockSizeTracker:  newBlockSizeTrackerWithBudgets(4, 1<<30, 3*1024*1024*1024),
+				ctx:               context.Background(),
+				logger:            ulogger.TestLogger{},
+				chainParams:       &chainParams,
+				blockchainClient:  blockchainClient,
+				peerStates:        txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+				requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+				rejectedTxns:      txmap.NewSyncedMap[chainhash.Hash, struct{}](),
+				headerList:        list.New(),
+				blockSizeTracker:  newBlockSizeTracker(4),
 				headerHeightIndex: make(map[chainhash.Hash]int32),
 			}
 			defer sm.requestedBlocks.Stop()
 
-			const oneAndHalfGB = int64(1536) * 1024 * 1024
-			for i := 0; i < 4; i++ {
-				sm.blockSizeTracker.addBlockStats(oneAndHalfGB, 2500)
-			}
-			require.Equal(t, 2, sm.blockSizeTracker.calculateMaxInFlightBlocks(),
-				"precondition: in-flight bound must be smaller than the interval")
+			// With nil settings the per-peer in-flight cap is the maxInFlightPerPeer
+			// fallback (16); every interval block is still requested across the
+			// commit-driven refill rounds below — invariant (a) does not depend on
+			// the exact bound.
+			require.Positive(t, sm.maxInFlightPerPeer(), "precondition: in-flight bound is positive")
 
 			sm.peerStates.Set(syncPeer, state)
 			sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
@@ -2954,8 +2947,8 @@ func TestHeadersFirst_MultiMessageInterval_NoStrandedBlock(t *testing.T) {
 			}
 
 			// Drive bounded fetch + commit rounds: fetchHeaderBlocks already ran
-			// at receivedCheckpoint (requesting the first 2), so commit the
-			// interval's blocks in order; each commit's pumpBlockRequests refills
+			// at receivedCheckpoint (requesting up to the in-flight cap), so commit
+			// the interval's blocks in order; each commit's pumpBlockRequests refills
 			// the bounded in-flight window from the list, requesting the next
 			// blocks. This interleaves real block processing with the header list.
 			for i := 0; i < intervalLen; i++ {

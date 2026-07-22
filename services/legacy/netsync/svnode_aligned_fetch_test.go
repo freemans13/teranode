@@ -4,16 +4,15 @@
 
 package netsync
 
-// Tests for the svnode-aligned fetch scheduler (legacy_svnodeAlignedFetch).
+// Tests for the svnode-aligned fetch scheduler (now the only scheduler).
 //
-// They reproduce the LIVE mainnet big-block IBD stall (height ~701475): with big
-// (~100MB) blocks the memory-scaled in-flight budget (calculateMaxInFlightBlocks)
-// lets ONE sync peer hold dozens-to-~100 blocks in flight, far ahead of the
-// committed frontier, so the next-needed block (committed+1) gets ~1/100 of the
-// pipe and the tip freezes-then-bursts. The aligned gate replaces that with
-// svnode's fixed MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16 count, size-blind, filled
-// lowest-height-first from the download frontier — so committed+1 is always
-// 1-of-16 and never starved.
+// They guard against the LIVE mainnet big-block IBD stall (height ~701475) that
+// the retired memory-scaled in-flight budget produced: with big (~100MB) blocks it
+// let ONE sync peer hold dozens-to-~100 blocks in flight, far ahead of the
+// committed frontier, so the next-needed block (committed+1) got ~1/100 of the
+// pipe and the tip froze-then-burst. The scheduler instead uses svnode's fixed
+// MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16 count, size-blind, filled lowest-height-first
+// from the download frontier — so committed+1 is always 1-of-16 and never starved.
 //
 // The tests drive the real fetch entry points (maintainInFlightWindow for the
 // single-peer live path, assignBlocksAcrossPeers for the multi-peer path) against
@@ -41,9 +40,9 @@ import (
 )
 
 // bigBlockTracker returns a blockSizeTracker whose rolling average is one ~100MB
-// block, so calculateMaxInFlightBlocks (the gate-OFF governor) computes a LARGE
-// memory budget: byteBound = 30×100MB / 100MB = 30 in flight. This is the exact
-// shape of the live stall — a memory-scaled ceiling far above svnode's fixed 16.
+// block. It is used to prove the fixed per-peer in-flight cap is SIZE-BLIND: the
+// cap stays at MaxBlocksInTransitPerPeer (16) regardless of the ~100MB block size,
+// where the retired memory-scaled governor would have permitted ~30 in flight.
 func bigBlockTracker() *blockSizeTracker {
 	const oneHundredMB = int64(100 * 1024 * 1024)
 	bst := newBlockSizeTrackerWithBudgets(10, 50000, 30*oneHundredMB)
@@ -79,63 +78,9 @@ func requestedHashes(state *peerSyncState, all []chainhash.Hash) map[chainhash.H
 	return out
 }
 
-// TestSvnodeAligned_SinglePeer_GateOff_OverfetchesBigBlocks is the
-// characterisation of the live stall: with big blocks and the gate OFF, the
-// single sync peer holds the memory-scaled 30 blocks in flight — far above 16.
-func TestSvnodeAligned_SinglePeer_GateOff_OverfetchesBigBlocks(t *testing.T) {
-	chainParams := chaincfg.MainNetParams
-
-	base := chainhash.Hash{0xd0}
-	const runway = 40
-	_, hashes := buildHeaderChain(base, runway, 20000)
-
-	var mu sync.Mutex
-	var got []*wire.MsgGetData
-	syncPeer := captureGetDataPeer(t, &chainParams, 50, &mu, &got)
-
-	blockchainClient := &blockchain2.Mock{}
-	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
-		Return(nil, nil, errors.NewBlockNotFoundError("not found")).Maybe()
-
-	tSettings := test.CreateBaseTestSettings(t)
-	tSettings.Legacy.ParallelFetchPeers = 1
-	tSettings.Legacy.SvnodeAlignedFetch = false // gate OFF: today's behaviour
-	tSettings.Legacy.FrontierLogInterval = 0
-
-	syncState := newEligiblePeerState()
-	defer syncState.requestedBlocks.Stop()
-	defer syncState.requestedTxns.Stop()
-
-	sm := &SyncManager{
-		ctx:              context.Background(),
-		logger:           ulogger.TestLogger{},
-		settings:         tSettings,
-		chainParams:      &chainParams,
-		blockchainClient: blockchainClient,
-		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-		headerList:       list.New(),
-		blockSizeTracker: bigBlockTracker(),
-	}
-	defer sm.requestedBlocks.Stop()
-
-	sm.peerStates.Set(syncPeer, syncState)
-	sm.storeSyncPeer(syncPeer, &syncPeerState{lastBlockTime: time.Now()})
-	sm.headersFirstMode.Store(true)
-	seedHeaderList(sm, base, hashes)
-	sm.startHeader = sm.headerList.Front().Next() // gate-off uses the monotonic cursor
-
-	sm.maintainInFlightWindow()
-
-	require.Equal(t, 30, syncState.requestedBlocks.Len(),
-		"gate OFF: the memory-scaled budget lets the single peer hold 30 (>16) big blocks in flight — the far-ahead over-fetch")
-	require.Greater(t, syncState.requestedBlocks.Len(), tSettings.Legacy.MaxBlocksInTransitPerPeer,
-		"gate OFF characterisation: in-flight must climb far above the svnode cap of 16")
-}
-
 // TestSvnodeAligned_SinglePeer_CapsAt16_LowestFirst asserts the primary fix: with
-// the gate ON and the SAME big blocks, the single peer holds exactly 16 blocks in
-// flight (size-blind), and they are the LOWEST 16 starting at the frontier — so
+// the SAME big blocks, the single peer holds exactly 16 blocks in flight
+// (size-blind), and they are the LOWEST 16 starting at the frontier — so
 // committed+1 is always in the request set and block 16 (far ahead) is not.
 func TestSvnodeAligned_SinglePeer_CapsAt16_LowestFirst(t *testing.T) {
 	chainParams := chaincfg.MainNetParams
@@ -154,7 +99,6 @@ func TestSvnodeAligned_SinglePeer_CapsAt16_LowestFirst(t *testing.T) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ParallelFetchPeers = 1
-	tSettings.Legacy.SvnodeAlignedFetch = true // gate ON
 	tSettings.Legacy.MaxBlocksInTransitPerPeer = 16
 	tSettings.Legacy.FrontierLogInterval = 0
 
@@ -215,7 +159,6 @@ func TestSvnodeAligned_SinglePeer_FrontierAnchorSlides_NoClimb(t *testing.T) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ParallelFetchPeers = 1
-	tSettings.Legacy.SvnodeAlignedFetch = true
 	tSettings.Legacy.MaxBlocksInTransitPerPeer = 16
 	tSettings.Legacy.FrontierLogInterval = 0
 
@@ -298,7 +241,6 @@ func TestSvnodeAligned_MultiPeer_SizeBlind16xPeers(t *testing.T) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ParallelFetchPeers = 3
-	tSettings.Legacy.SvnodeAlignedFetch = true
 	tSettings.Legacy.MaxBlocksInTransitPerPeer = 16
 	tSettings.Legacy.BlockDownloadWindow = 1024 // loose ceiling: must NOT bind
 	tSettings.Legacy.FrontierLogInterval = 0

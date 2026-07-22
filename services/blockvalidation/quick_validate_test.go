@@ -541,7 +541,8 @@ func buildOneSubtreeBlock(t *testing.T, s *CatchupTestSuite, height uint32) *mod
 
 // enableOutpointOnlyFastPath makes the suite's mock UTXO store report fast-path
 // support, so quickValidateOutpointOnly's store-capability guard is satisfied. Call
-// this on any test suite where OutpointOnlyBelowCheckpoint=true is expected to engage.
+// this on any test suite where the outpoint-only fast path is expected to engage
+// (selection is purely store-capability driven).
 func enableOutpointOnlyFastPath(t *testing.T, s *CatchupTestSuite) {
 	t.Helper()
 	s.MockUTXOStore.SupportsOutpointOnlySpendResult = true
@@ -698,7 +699,6 @@ func TestQuickValidate_OutpointOnly_NoDecorate_ZeroFees(t *testing.T) {
 		suite := setupSuite(t)
 		defer suite.Cleanup()
 
-		suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 		enableOutpointOnlyFastPath(t, suite) // make the mock store report fast-path support
 		block := buildOneSubtreeBlockWithExternalParentTx(t, suite, 500)
 
@@ -725,7 +725,6 @@ func TestQuickValidate_OutpointOnly_NoDecorate_ZeroFees(t *testing.T) {
 		suite := setupSuite(t)
 		defer suite.Cleanup()
 
-		suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = false
 		block := buildOneSubtreeBlockWithExternalParentTx(t, suite, 500)
 
 		// Register expectation: decorate must be called with the unextended tx.
@@ -1004,8 +1003,8 @@ func TestSkipUnspendableTxStorageDuringCatchup_EndToEnd(t *testing.T) {
 // TestOutpointOnly_MetricIncrementsBelowOnly verifies that the
 // prometheusBlockValidationOutpointOnlyBlocks counter increments by exactly 1
 // per block (not per subtree batch) when quickValidateBlock processes a
-// below-checkpoint block with OutpointOnlyBelowCheckpoint on, and does NOT
-// increment when the setting is off.
+// below-checkpoint block on a store that supports the outpoint-only fast path, and
+// does NOT increment when the store does not support it.
 //
 // Per-block counting is guaranteed by the Inc() placement at the top of
 // quickValidateBlock (and quickValidateBlockAsync), before any batch loop.
@@ -1020,7 +1019,6 @@ func TestOutpointOnly_MetricIncrementsBelowOnly(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
 		defer suite.Cleanup()
 
-		suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 		enableOutpointOnlyFastPath(t, suite) // make the mock store report fast-path support
 		suite.Server.blockValidation.settings.BlockValidation.QuickValidateSkipUtxoLock = true
 		setCheckpoints(t, suite, 1000)
@@ -1040,7 +1038,6 @@ func TestOutpointOnly_MetricIncrementsBelowOnly(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
 		defer suite.Cleanup()
 
-		suite.Server.blockValidation.settings.BlockValidation.OutpointOnlyBelowCheckpoint = false
 		setCheckpoints(t, suite, 1000)
 		setupQuickValidateMocks(suite)
 

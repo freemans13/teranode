@@ -1,13 +1,10 @@
 package model
 
 import (
-	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/go-chaincfg"
-	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,58 +46,46 @@ func TestBelowCheckpoint(t *testing.T) {
 }
 
 // TestOutpointOnlyEligible: full truth table for the shared outpoint-only gate.
-// Every conjunct must hold; any one missing keeps the gate closed (fail-safe).
+// Selection is purely store-capability driven now that the opt-in flag is retired:
+// every conjunct (store supports outpoint-only, params present, below checkpoint)
+// must hold; any one missing keeps the gate closed (fail-safe). A store that does
+// not support outpoint-only spends (e.g. Aerospike) always falls back to the normal
+// below-checkpoint validation path.
 func TestOutpointOnlyEligible(t *testing.T) {
 	params := chaincfg.RegressionNetParams
 	params.Checkpoints = []chaincfg.Checkpoint{{Height: 2000}}
-
-	newSettings := func(enabled bool) *settings.Settings {
-		tSettings := test.CreateBaseTestSettings(t)
-		tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = enabled
-		u, err := url.Parse("sqlitememory:///test")
-		require.NoError(t, err)
-		tSettings.UtxoStore.UtxoStore = u
-		tSettings.ChainCfgParams = &params
-		return tSettings
-	}
 
 	supported := &eligibilityStore{supports: true}
 	unsupported := &eligibilityStore{supports: false}
 
 	tests := []struct {
-		name     string
-		settings *settings.Settings
-		store    *eligibilityStore
-		params   *chaincfg.Params
-		height   uint32
-		want     bool
+		name   string
+		store  *eligibilityStore
+		params *chaincfg.Params
+		height uint32
+		want   bool
 	}{
-		{name: "all conjuncts hold, below", settings: newSettings(true), store: supported, params: &params, height: 1000, want: true},
-		{name: "at checkpoint", settings: newSettings(true), store: supported, params: &params, height: 2000, want: true},
-		{name: "above checkpoint", settings: newSettings(true), store: supported, params: &params, height: 2001, want: false},
-		{name: "height 0 (genesis)", settings: newSettings(true), store: supported, params: &params, height: 0, want: false},
-		{name: "flag off", settings: newSettings(false), store: supported, params: &params, height: 1000, want: false},
-		{name: "store does not support", settings: newSettings(true), store: unsupported, params: &params, height: 1000, want: false},
-		{name: "nil params", settings: newSettings(true), store: supported, params: nil, height: 1000, want: false},
+		{name: "all conjuncts hold, below", store: supported, params: &params, height: 1000, want: true},
+		{name: "at checkpoint", store: supported, params: &params, height: 2000, want: true},
+		{name: "above checkpoint", store: supported, params: &params, height: 2001, want: false},
+		{name: "height 0 (genesis)", store: supported, params: &params, height: 0, want: false},
+		{name: "store does not support (Aerospike-like) falls back", store: unsupported, params: &params, height: 1000, want: false},
+		{name: "nil params", store: supported, params: nil, height: 1000, want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, OutpointOnlyEligible(tt.settings, tt.store, tt.params, tt.height))
+			require.Equal(t, tt.want, OutpointOnlyEligible(tt.store, tt.params, tt.height))
 		})
 	}
 
-	t.Run("nil settings", func(t *testing.T) {
-		require.False(t, OutpointOnlyEligible(nil, supported, &params, 1000))
-	})
-
 	t.Run("nil store", func(t *testing.T) {
-		require.False(t, OutpointOnlyEligible(newSettings(true), nil, &params, 1000))
+		require.False(t, OutpointOnlyEligible(nil, &params, 1000))
 	})
 
 	t.Run("no checkpoints on params", func(t *testing.T) {
 		noCp := chaincfg.RegressionNetParams
 		noCp.Checkpoints = nil
-		require.False(t, OutpointOnlyEligible(newSettings(true), supported, &noCp, 1000))
+		require.False(t, OutpointOnlyEligible(supported, &noCp, 1000))
 	})
 }

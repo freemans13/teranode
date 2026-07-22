@@ -1,11 +1,11 @@
 package netsync
 
-// Task 9 — crash-replay idempotency on the fail-closed spend leg.
+// Crash-replay idempotency on the inline below-checkpoint spend leg.
 //
-// The T5 fail-closed change dropped the ErrTxConflicting transient tolerance on
-// the inline below-checkpoint path. This test proves a below-cp block re-
-// delivered after a partial/crashed prior attempt does NOT spuriously hard-fail
-// under the flag:
+// The inline below-checkpoint path (the route a non-outpoint-only, Aerospike-like
+// store takes below the checkpoint) must be idempotent across a re-delivery. This
+// test proves a below-cp block re-delivered after a partial/crashed prior attempt
+// does NOT spuriously hard-fail:
 //
 //	(a) createUtxos tolerates ErrTxExists on the second Create pass (handle_block.go
 //	    swallows ErrTxExists and re-stamps mined info via SetMinedMulti).
@@ -15,7 +15,7 @@ package netsync
 //	    the spend as success without an UPDATE (stores/utxo/sql/sql.go ~:2264).
 //	    No store code change was needed — this test locks that behaviour in.
 //	(c) the block does not hard-fail: the full inline prepareSubtrees pipeline
-//	    (create + fail-closed spend) succeeds on the replay.
+//	    (create + spend) succeeds on the replay.
 //
 // Parts (d) commitBlock/AddBlock swallowing ErrBlockExists and (e) StoreBlock not
 // upserting quick_validated are pinned by TestStoreBlock_NoUpsertQuickValidated
@@ -39,16 +39,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newReplaySyncManager wires an inline (non-unified) fail-closed SyncManager
+// newReplaySyncManager wires an inline (non-outpoint-only) SyncManager
 // backed by a real sqlitememory store so prepareSubtrees does genuine
 // Create/Spend work against durable rows that survive between the two delivery
 // attempts.
 func newReplaySyncManager(t *testing.T, ctx context.Context, store utxo.Store) *SyncManager {
 	t.Helper()
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, 1000)
-	tSettings.BlockValidation.LegacyBelowCheckpointFailClosed = true
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = false
+	tSettings, params := newOutpointOnlySettings(t, true, 1000)
 	tSettings.Legacy.StoreBatcherSize = 2
 	tSettings.Legacy.StoreBatcherConcurrency = 2
 	tSettings.Legacy.SpendBatcherSize = 2
@@ -59,11 +57,15 @@ func newReplaySyncManager(t *testing.T, ctx context.Context, store utxo.Store) *
 	mockBC := &blockchain.Mock{}
 	mockBC.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(101), nil).Maybe()
 
+	// Wrap the store so SupportsOutpointOnlySpend() is false: below the checkpoint
+	// this forces the inline create+spend path (legacyUnified false), which is the
+	// path an Aerospike-like store now takes and whose crash-replay idempotency this
+	// test pins.
 	return &SyncManager{
 		settings:         tSettings,
 		chainParams:      params,
 		logger:           ulogger.TestLogger{},
-		utxoStore:        store,
+		utxoStore:        nonOutpointOnlyStore{store},
 		blockchainClient: mockBC,
 		validationClient: makeSpendValidator(store),
 		subtreeStore:     memory.New(),
@@ -71,11 +73,11 @@ func newReplaySyncManager(t *testing.T, ctx context.Context, store utxo.Store) *
 	}
 }
 
-// TestLegacyFailClosed_CrashReplay_Idempotent commits a below-cp block through the
-// inline fail-closed pipeline, then re-delivers the identical block and asserts
+// TestInlineBelowCheckpoint_CrashReplay_Idempotent commits a below-cp block through the
+// inline below-checkpoint pipeline, then re-delivers the identical block and asserts
 // that the second attempt succeeds (create tolerates ErrTxExists, the same-spender
 // re-spend is idempotent, and the block does not hard-fail).
-func TestLegacyFailClosed_CrashReplay_Idempotent(t *testing.T) {
+func TestInlineBelowCheckpoint_CrashReplay_Idempotent(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -91,7 +93,7 @@ func TestLegacyFailClosed_CrashReplay_Idempotent(t *testing.T) {
 	// Use blocks 500 and 501 so we exercise both a cross-block spend (tx_c spends
 	// tx_a from block 500) and a same-block spend (tx_d spends tx_c in block 501)
 	// on replay.
-	tSettings, _ := newOutpointOnlySettings(t, true, true, 1000)
+	tSettings, _ := newOutpointOnlySettings(t, true, 1000)
 	storeURL, err := url.Parse("sqlitememory:///crash_replay")
 	require.NoError(t, err)
 	store, err := utxosql.New(ctx, logger, tSettings, storeURL)
@@ -136,15 +138,14 @@ func TestLegacyFailClosed_CrashReplay_Idempotent(t *testing.T) {
 
 // TestSqlStore_SameSpenderReSpend_Idempotent is the focused store-level lock-in for
 // Task 9(b): a Spend of an outpoint already spent by THE SAME transaction returns
-// idempotent success, not ErrSpent. This is the invariant the fail-closed replay
-// depends on (a genuine different-spender clash still returns ErrSpent — that is
-// the fail-closed hard-fail path, covered by the fail_closed tests).
+// idempotent success, not ErrSpent. This is the invariant the inline crash-replay
+// depends on (a genuine different-spender clash still returns ErrSpent).
 func TestSqlStore_SameSpenderReSpend_Idempotent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	logger := ulogger.TestLogger{}
-	tSettings, _ := newOutpointOnlySettings(t, true, true, 1000)
+	tSettings, _ := newOutpointOnlySettings(t, true, 1000)
 
 	storeURL, err := url.Parse("sqlitememory:///same_spender")
 	require.NoError(t, err)

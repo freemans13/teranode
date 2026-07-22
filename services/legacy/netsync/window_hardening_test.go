@@ -117,8 +117,7 @@ func TestHandleBlockMsgWithWindow_BackPressureBeforeAdd(t *testing.T) {
 
 	msgBlock, blockHash := buildWindowBlockMsg(t)
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 	// Small lag tolerance so a far-behind block assembly forces the wait to retry.
 	tSettings.BlockValidation.MaxBlocksBehindBlockAssembly = 2
@@ -217,8 +216,7 @@ func TestHandleBlockMsgWithWindow_FlushPrefixBeforeReject(t *testing.T) {
 
 	msgBlock, blockHash := buildWindowBlockMsg(t)
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 
 	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
@@ -318,8 +316,7 @@ func TestHandleBlockMsgWithWindow_FlushPrefixBeforeReject(t *testing.T) {
 func TestWindow_BoundaryContiguity(t *testing.T) {
 	const checkpointHeight = int32(10000)
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 
 	spy := &spyBlockValidation{}

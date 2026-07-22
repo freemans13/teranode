@@ -70,8 +70,7 @@ func TestWindowAdmission_EligibilityGating(t *testing.T) {
 	const aboveCheckpoint = uint32(1500)
 	const belowCheckpoint = uint32(500)
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 
 	spy := &spyBlockValidation{}
@@ -172,13 +171,12 @@ func TestWindowAdmission_CheckpointBlockBypassesWindow(t *testing.T) {
 	const belowBlockHeight = uint32(499)
 
 	// Two checkpoints: the block under test lands exactly on checkpoint1.
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpoint1Height)
+	tSettings, params := newOutpointOnlySettings(t, true, checkpoint1Height)
 	// Add a second checkpoint so findNextHeaderCheckpoint has something to advance to.
 	params.Checkpoints = []chaincfg.Checkpoint{
 		{Height: checkpoint1Height},
 		{Height: checkpoint2Height},
 	}
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 
 	spy := &spyBlockValidation{}

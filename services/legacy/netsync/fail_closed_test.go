@@ -20,8 +20,8 @@ import (
 
 // createConflictingSpyValidator records the CreateConflicting validator option
 // observed on each Validate call and, optionally, returns a fixed error to model
-// a conflicting/double-spend outcome. It lets the fail-closed tests assert both
-// which option the netsync path passed AND how PreValidateTransactions treats the
+// a conflicting/double-spend outcome. It lets these tests assert both which option
+// the netsync inline path passed AND how PreValidateTransactions treats the
 // resulting error, without standing up a real validator + UTXO store.
 type createConflictingSpyValidator struct {
 	validator.MockValidator
@@ -71,22 +71,18 @@ func (v *createConflictingSpyValidator) createConflictCounts() (with, without in
 	return v.sawCreateConflict, v.sawNoCreateConflict
 }
 
-// failClosedCheckpointHeight is the single hard-coded checkpoint used by the
-// fail-closed harness; block height 500 is below it so the outpoint-only gate can
-// engage.
-const failClosedCheckpointHeight = int32(1000)
+// inlineBelowCheckpointHeight is the single hard-coded checkpoint used by the
+// inline-path harness; block height 500 is below it.
+const inlineBelowCheckpointHeight = int32(1000)
 
-// newFailClosedSyncManager wires a SyncManager whose legacyFailClosed gate engages
-// (or not) exactly as requested: the outpoint-only prerequisite on, a supporting
-// store, a checkpoint above the test height, the unified route off, and the
-// fail-closed flag set per the argument. It returns the manager ready to drive
-// PreValidateTransactions.
-func newFailClosedSyncManager(t *testing.T, failClosed bool, cv validator.Interface) *SyncManager {
+// newInlineBelowCheckpointSyncManager wires a SyncManager ready to drive
+// PreValidateTransactions. The below-checkpoint fail-closed flag was retired, so the
+// inline path always retains validator.WithCreateConflicting and swallows a resulting
+// ErrTxConflicting — the behaviour these tests pin.
+func newInlineBelowCheckpointSyncManager(t *testing.T, cv validator.Interface) *SyncManager {
 	t.Helper()
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, failClosedCheckpointHeight)
-	tSettings.BlockValidation.LegacyBelowCheckpointFailClosed = failClosed
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = false
+	tSettings, params := newOutpointOnlySettings(t, true, inlineBelowCheckpointHeight)
 	tSettings.Legacy.SpendBatcherSize = 2
 	tSettings.Legacy.SpendBatcherConcurrency = 2
 
@@ -101,8 +97,7 @@ func newFailClosedSyncManager(t *testing.T, failClosed bool, cv validator.Interf
 
 // makeSameBlockParentChainTxMap builds n regular txs where tx[k] spends tx[k-1]'s
 // output (a same-block parent chain). All spends succeed at the validator (no
-// conflict), so this exercises the happy path where the WithCreateConflicting drop
-// must NOT introduce any spurious failure.
+// conflict), so this exercises the happy path.
 func makeSameBlockParentChainTxMap(t *testing.T, n int) *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper] {
 	t.Helper()
 
@@ -130,124 +125,47 @@ func makeSameBlockParentChainTxMap(t *testing.T, n int) *txmap.SyncedMap[chainha
 	return txMap
 }
 
-// TestLegacyFailClosed_SameBlockParentChain_NoConflictingNodes proves that with the
-// fail-closed flag ON, a below-checkpoint block whose txs form a same-block parent
-// chain still validates: the validator sees WithCreateConflicting=false on every tx
-// (the drop happened) and PreValidateTransactions returns no error. Because no tx is
-// ever validated with CreateConflicting=true, the store can never mark a txMeta
-// Conflicting, so no conflicting subtree node can be written downstream.
-func TestLegacyFailClosed_SameBlockParentChain_NoConflictingNodes(t *testing.T) {
+// TestPreValidateTransactions_SameBlockParentChain_Succeeds proves that a
+// below-checkpoint block whose txs form a same-block parent chain validates: the
+// validator sees WithCreateConflicting=true on every tx and PreValidateTransactions
+// returns no error.
+func TestPreValidateTransactions_SameBlockParentChain_Succeeds(t *testing.T) {
 	initPrometheusMetrics()
 
 	cv := &createConflictingSpyValidator{} // all spends succeed
 
-	sm := newFailClosedSyncManager(t, true, cv)
+	sm := newInlineBelowCheckpointSyncManager(t, cv)
 
 	txMap := makeSameBlockParentChainTxMap(t, 5)
 
-	// failClosed is true on this path.
-	require.True(t, sm.legacyFailClosed(500))
-
-	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 500, 0, 0, true, true)
-	require.NoError(t, err, "same-block parent chain must validate under fail-closed with no spurious ErrTxNotFound")
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 500, 0, 0, true)
+	require.NoError(t, err, "same-block parent chain must validate with no spurious ErrTxNotFound")
 
 	with, without := cv.createConflictCounts()
-	require.Zero(t, with, "fail-closed path must NOT pass WithCreateConflicting(true) to the validator")
-	require.Equal(t, 5, without, "every tx must be validated with CreateConflicting=false so no conflicting node can be produced")
+	require.Equal(t, 5, with, "the inline path always appends WithCreateConflicting(true)")
+	require.Zero(t, without, "no tx should be validated without CreateConflicting on the inline path")
 }
 
-// TestLegacyFailClosed_GenuineConflict_HardFails proves that with the flag ON a
-// genuine conflict (validator returns ErrTxConflicting) is NOT swallowed: it surfaces
-// as a non-retryable ProcessingError from PreValidateTransactions, so the block is
-// never committed. The error is non-retryable (ERR_TX_CONFLICTING is not in the
-// retryable set), so it lands in hardFail rather than looping.
-func TestLegacyFailClosed_GenuineConflict_HardFails(t *testing.T) {
+// TestPreValidateTransactions_ConflictSwallowed proves that an ErrTxConflicting
+// result from the validator is swallowed on the inline below-checkpoint path: the
+// conflict is reconciled downstream by ProcessConflicting during block acceptance, so
+// PreValidateTransactions returns no error and the block proceeds. This is the
+// permanent behaviour after the fail-closed lever was retired.
+func TestPreValidateTransactions_ConflictSwallowed(t *testing.T) {
 	initPrometheusMetrics()
 
 	cv := &createConflictingSpyValidator{
 		returnErr: errors.ErrTxConflicting,
 	}
 
-	sm := newFailClosedSyncManager(t, true, cv)
+	sm := newInlineBelowCheckpointSyncManager(t, cv)
 
 	txMap := makeTxMap(t, 3)
 
-	require.True(t, sm.legacyFailClosed(500))
-
-	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 500, 0, 0, true, true)
-	require.Error(t, err, "genuine conflict must hard-fail under fail-closed")
-	require.Contains(t, err.Error(), "non-retryable", "conflict must surface via the non-retryable hardFail branch")
-	require.False(t, errors.IsRetryableError(err), "the surfaced error must be non-retryable")
-
-	with, _ := cv.createConflictCounts()
-	require.Zero(t, with, "fail-closed path must NOT pass WithCreateConflicting(true) even for a conflicting tx")
-}
-
-// TestLegacyFailClosed_FlagOff_ByteIdentical proves that with the flag OFF the
-// behaviour is unchanged: WithCreateConflicting(true) is still appended (the validator
-// observes it on every tx) and an ErrTxConflicting result is still swallowed, so
-// PreValidateTransactions returns no error and the block proceeds exactly as today.
-func TestLegacyFailClosed_FlagOff_ByteIdentical(t *testing.T) {
-	initPrometheusMetrics()
-
-	cv := &createConflictingSpyValidator{
-		returnErr: errors.ErrTxConflicting,
-	}
-
-	sm := newFailClosedSyncManager(t, false, cv)
-
-	txMap := makeTxMap(t, 3)
-
-	require.False(t, sm.legacyFailClosed(500), "flag off must keep fail-closed OFF")
-
-	// failClosed=false is what ValidateTransactionsLegacyMode threads through when
-	// legacyFailClosed is false.
-	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 500, 0, 0, true, false)
-	require.NoError(t, err, "flag-off path must still swallow ErrTxConflicting and proceed")
+	err := sm.PreValidateTransactions(context.Background(), txMap, chainhash.Hash{}, 500, 0, 0, true)
+	require.NoError(t, err, "inline path must swallow ErrTxConflicting and proceed")
 
 	with, without := cv.createConflictCounts()
-	require.Equal(t, 3, with, "flag-off path must still append WithCreateConflicting(true) on every tx")
-	require.Zero(t, without, "no tx should be validated without CreateConflicting on the flag-off path")
-}
-
-// TestSyncManager_legacyFailClosed is the truth table for the gate helper: the flag
-// must be ON, the outpoint-only prerequisite must hold, and the unified route must be
-// OFF for the inline fail-closed path to engage.
-func TestSyncManager_legacyFailClosed(t *testing.T) {
-	const checkpointHeight = int32(1000)
-	const below = uint32(500)
-	const above = uint32(1500)
-
-	tests := []struct {
-		name       string
-		failClosed bool
-		outpoint   bool
-		unified    bool
-		height     uint32
-		want       bool
-	}{
-		{name: "all off", failClosed: false, outpoint: false, unified: false, height: below, want: false},
-		{name: "failClosed on, outpoint off => no-op", failClosed: true, outpoint: false, unified: false, height: below, want: false},
-		{name: "failClosed on, outpoint on, below => engages", failClosed: true, outpoint: true, unified: false, height: below, want: true},
-		{name: "failClosed on, outpoint on, above checkpoint => off", failClosed: true, outpoint: true, unified: false, height: above, want: false},
-		{name: "failClosed on, outpoint on, unified on => off (unified wins)", failClosed: true, outpoint: true, unified: true, height: below, want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tSettings, params := newOutpointOnlySettings(t, tt.outpoint, true, checkpointHeight)
-			tSettings.BlockValidation.LegacyBelowCheckpointFailClosed = tt.failClosed
-			tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = tt.unified
-
-			sm := &SyncManager{
-				settings:    tSettings,
-				chainParams: params,
-				logger:      ulogger.TestLogger{},
-				utxoStore:   &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}},
-			}
-
-			require.Equal(t, tt.want, sm.legacyFailClosed(tt.height),
-				"legacyFailClosed(%d) failClosed=%v outpoint=%v unified=%v", tt.height, tt.failClosed, tt.outpoint, tt.unified)
-		})
-	}
+	require.Equal(t, 3, with, "the inline path always appends WithCreateConflicting(true) on every tx")
+	require.Zero(t, without, "no tx should be validated without CreateConflicting on the inline path")
 }

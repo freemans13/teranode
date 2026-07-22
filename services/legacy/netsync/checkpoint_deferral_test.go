@@ -38,8 +38,7 @@ import (
 func newCheckpointDeferralManager(t *testing.T, blockchainClient *blockchain2.Mock, blockHash chainhash.Hash, height int32) (*SyncManager, *peer.Peer, *peerSyncState) {
 	t.Helper()
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, height)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, height)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 
 	p := peer.NewInboundPeer(ulogger.TestLogger{}, test.CreateBaseTestSettings(t), &peer.Config{})

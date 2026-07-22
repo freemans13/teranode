@@ -31,8 +31,7 @@ func newSkipCommittedSyncManager(t *testing.T, blockHash chainhash.Hash, headerC
 ) (*SyncManager, *outpointOnlySpyStore, *peer.Peer, func()) {
 	t.Helper()
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 	// Small lag tolerance so, if the block ever reaches the window-add path, the
 	// far-behind block assembly forces WaitForBlockAssemblyReady to retry — a

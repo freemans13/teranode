@@ -33,8 +33,7 @@ func newParkLastBlockTimeFixture(t *testing.T) (*SyncManager, *blockQueueMsg, ti
 	const checkpointHeight = int32(1000)
 	const blockHeight = uint32(500)
 
-	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
-	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings, params := newOutpointOnlySettings(t, true, checkpointHeight)
 	tSettings.Legacy.ParallelWindowMemoryFraction = 0.1
 	tSettings.BlockValidation.MaxBlocksBehindBlockAssembly = 20
 
