@@ -4797,6 +4797,14 @@ func (m *mockBlockValidationClient) ProcessBlockWindow(_ context.Context, _ []*m
 	return nil
 }
 
+func (m *mockBlockValidationClient) PrepareBlockWindow(_ context.Context, _ []*model.Block, _, _ string) error {
+	return nil
+}
+
+func (m *mockBlockValidationClient) CommitBlockWindow(_ context.Context, _ []*model.Block, _, _ string) error {
+	return nil
+}
+
 // TestHandleFreezeComprehensive tests the handleFreeze handler
 func TestHandleFreezeComprehensive(t *testing.T) {
 	logger := mocklogger.NewTestLogger()

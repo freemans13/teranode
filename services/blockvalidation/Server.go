@@ -1397,6 +1397,107 @@ func (u *Server) ProcessBlockWindow(ctx context.Context, request *blockvalidatio
 	return &blockvalidation_api.EmptyMessage{}, nil
 }
 
+// deserialiseWindowRequest is the shared request-decoding + validation logic used by
+// ProcessBlockWindow, PrepareBlockWindow, and CommitBlockWindow: it deserialises each
+// block from the request's index-aligned arrays, sorts them ascending by height, and
+// validates the base URL. tag is the calling RPC's name, used to prefix any error
+// message the same way each handler tagged its own errors before this was factored out.
+func deserialiseWindowRequest(request *blockvalidation_api.ProcessBlockWindowRequest, tag string) ([]*model.Block, string, error) {
+	blockBytes := request.GetBlock()
+	heights := request.GetHeight()
+	blockIDs := request.GetBlockId()
+
+	if len(blockBytes) == 0 {
+		return nil, "", nil
+	}
+
+	if len(heights) != len(blockBytes) || len(blockIDs) != len(blockBytes) {
+		return nil, "", errors.NewProcessingError(
+			"[%s] mismatched array lengths: blocks=%d heights=%d block_ids=%d",
+			tag, len(blockBytes), len(heights), len(blockIDs),
+		)
+	}
+
+	blocks := make([]*model.Block, len(blockBytes))
+	for i, b := range blockBytes {
+		blk, err := model.NewBlockFromBytes(b)
+		if err != nil {
+			return nil, "", errors.NewProcessingError("[%s] failed to deserialise block %d", tag, i, err)
+		}
+		blk.Height = heights[i]
+		if blockIDs[i] != 0 {
+			blk.ID = blockIDs[i]
+		}
+		blocks[i] = blk
+	}
+
+	// Sort ascending by height — the engine requires this order for C3 serial commits.
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Height < blocks[j].Height })
+
+	baseURL := request.GetBaseUrl()
+	if baseURL == "" {
+		baseURL = "legacy"
+	}
+
+	if err := util.ValidateURL(baseURL); err != nil {
+		return nil, "", errors.NewInvalidArgumentError("invalid base URL", err)
+	}
+
+	return blocks, baseURL, nil
+}
+
+// PrepareBlockWindow handles the prepare-only stage (C1 parallel creates → C2 parallel
+// spends) of the window pipeline. It performs no commit; see CommitBlockWindow for the
+// serial ascending commit stage. Request shape and decoding are identical to
+// ProcessBlockWindow.
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - request: Index-aligned arrays of block bytes, heights, and block IDs; peer_id and base_url
+//
+// Returns an EmptyMessage on success or an error if any phase fails.
+func (u *Server) PrepareBlockWindow(ctx context.Context, request *blockvalidation_api.ProcessBlockWindowRequest) (*blockvalidation_api.EmptyMessage, error) {
+	blocks, _, err := deserialiseWindowRequest(request, "PrepareBlockWindow")
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+	if len(blocks) == 0 {
+		return &blockvalidation_api.EmptyMessage{}, nil
+	}
+
+	if err := u.blockValidation.PrepareWindow(ctx, blocks, request.GetPeerId()); err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	return &blockvalidation_api.EmptyMessage{}, nil
+}
+
+// CommitBlockWindow handles the commit-only stage (C3 serial ascending commits) of the
+// window pipeline. It is idempotent-safe to call as a stateless RPC separate from the
+// PrepareBlockWindow call that prepared the window (the block-ID pre-pass is re-run).
+// Request shape and decoding are identical to ProcessBlockWindow.
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - request: Index-aligned arrays of block bytes, heights, and block IDs; peer_id and base_url
+//
+// Returns an EmptyMessage on success or an error if any phase fails.
+func (u *Server) CommitBlockWindow(ctx context.Context, request *blockvalidation_api.ProcessBlockWindowRequest) (*blockvalidation_api.EmptyMessage, error) {
+	blocks, _, err := deserialiseWindowRequest(request, "CommitBlockWindow")
+	if err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+	if len(blocks) == 0 {
+		return &blockvalidation_api.EmptyMessage{}, nil
+	}
+
+	if err := u.blockValidation.CommitWindow(ctx, blocks, request.GetPeerId()); err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
+	return &blockvalidation_api.EmptyMessage{}, nil
+}
+
 // ValidateBlock validates a block directly from the block bytes
 // without needing to fetch it from the network or the database.
 // This method is typically used for testing or when the block is already

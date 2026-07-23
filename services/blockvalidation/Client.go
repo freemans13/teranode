@@ -186,6 +186,33 @@ func (s *Client) ProcessBlock(ctx context.Context, block *model.Block, blockHeig
 	return nil
 }
 
+// buildProcessBlockWindowRequest serialises blocks into the index-aligned
+// ProcessBlockWindowRequest shape shared by ProcessBlockWindow, PrepareBlockWindow, and
+// CommitBlockWindow.
+func buildProcessBlockWindowRequest(blocks []*model.Block, peerID, baseURL string) (*blockvalidation_api.ProcessBlockWindowRequest, error) {
+	blockSlices := make([][]byte, len(blocks))
+	heights := make([]uint32, len(blocks))
+	blockIDs := make([]uint32, len(blocks))
+
+	for i, blk := range blocks {
+		b, err := blk.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		blockSlices[i] = b
+		heights[i] = blk.Height
+		blockIDs[i] = blk.ID
+	}
+
+	return &blockvalidation_api.ProcessBlockWindowRequest{
+		Block:   blockSlices,
+		Height:  heights,
+		BlockId: blockIDs,
+		PeerId:  peerID,
+		BaseUrl: baseURL,
+	}, nil
+}
+
 // ProcessBlockWindow submits a window of K below-checkpoint blocks for concurrent
 // processing via the three-fence phased pipeline (C1 parallel creates → C2 parallel
 // spends → C3 serial commits). The blocks slice must be sorted ascending by height
@@ -200,29 +227,48 @@ func (s *Client) ProcessBlock(ctx context.Context, block *model.Block, blockHeig
 // Returns an error if window processing fails (including partial-commit errors that
 // name the last successfully committed height).
 func (s *Client) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
-	blockSlices := make([][]byte, len(blocks))
-	heights := make([]uint32, len(blocks))
-	blockIDs := make([]uint32, len(blocks))
-
-	for i, blk := range blocks {
-		b, err := blk.Bytes()
-		if err != nil {
-			return err
-		}
-		blockSlices[i] = b
-		heights[i] = blk.Height
-		blockIDs[i] = blk.ID
+	req, err := buildProcessBlockWindowRequest(blocks, peerID, baseURL)
+	if err != nil {
+		return err
 	}
 
-	req := &blockvalidation_api.ProcessBlockWindowRequest{
-		Block:   blockSlices,
-		Height:  heights,
-		BlockId: blockIDs,
-		PeerId:  peerID,
-		BaseUrl: baseURL,
+	_, err = s.apiClient.ProcessBlockWindow(ctx, req)
+	if err != nil {
+		return errors.UnwrapGRPC(err)
 	}
 
-	_, err := s.apiClient.ProcessBlockWindow(ctx, req)
+	return nil
+}
+
+// PrepareBlockWindow submits a window of K below-checkpoint blocks for the prepare-only
+// stage (C1 parallel creates → C2 parallel spends) of the window pipeline; it performs
+// no commit. See CommitBlockWindow for the serial commit stage. Parameters and request
+// shape are identical to ProcessBlockWindow.
+func (s *Client) PrepareBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
+	req, err := buildProcessBlockWindowRequest(blocks, peerID, baseURL)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.apiClient.PrepareBlockWindow(ctx, req)
+	if err != nil {
+		return errors.UnwrapGRPC(err)
+	}
+
+	return nil
+}
+
+// CommitBlockWindow submits a window of K below-checkpoint blocks for the commit-only
+// stage (C3 serial ascending commits) of the window pipeline. It is safe to call as a
+// stateless RPC separate from the PrepareBlockWindow call that prepared the window.
+// Parameters and request shape are identical to ProcessBlockWindow.
+func (s *Client) CommitBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
+	req, err := buildProcessBlockWindowRequest(blocks, peerID, baseURL)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.apiClient.CommitBlockWindow(ctx, req)
 	if err != nil {
 		return errors.UnwrapGRPC(err)
 	}

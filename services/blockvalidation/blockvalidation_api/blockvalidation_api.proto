@@ -12,6 +12,13 @@ service BlockValidationAPI {
   rpc BlockFound (BlockFoundRequest) returns (EmptyMessage) {}
   rpc ProcessBlock (ProcessBlockRequest) returns (EmptyMessage) {}
   rpc ProcessBlockWindow (ProcessBlockWindowRequest) returns (EmptyMessage) {}
+  // PrepareBlockWindow runs only the prepare stage (C1 parallel creates + C2 parallel
+  // spends) of the window pipeline, without committing any block. See CommitBlockWindow.
+  rpc PrepareBlockWindow (ProcessBlockWindowRequest) returns (EmptyMessage) {}
+  // CommitBlockWindow runs only the commit stage (C3 serial ascending commits) of the
+  // window pipeline. Idempotent: re-runs the block-ID pre-pass so it can be called as
+  // a stateless RPC separate from the PrepareBlockWindow call that prepared the window.
+  rpc CommitBlockWindow (ProcessBlockWindowRequest) returns (EmptyMessage) {}
   rpc ValidateBlock (ValidateBlockRequest) returns (ValidateBlockResponse) {}
   rpc RevalidateBlock (RevalidateBlockRequest) returns (EmptyMessage) {}
   rpc GetCatchupStatus (EmptyMessage) returns (CatchupStatusResponse) {}

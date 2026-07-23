@@ -774,6 +774,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// SubtreeWriteConcurrency x 3 product. Only wired when
 			// DownloadToDisk is on.
 			SubtreeWriteMaxConcurrency: getInt("legacy_subtreeWriteMaxConcurrency", 16, alternativeContext...),
+			// Two-stage prepare/commit window pipeline (IBD commit-throughput
+			// plan, Stage 2). false (default) = today's single flushWorker,
+			// byte-identical.
+			PipelineWindowCommit: getBool("legacy_pipelineWindowCommit", false, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

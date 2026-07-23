@@ -386,34 +386,61 @@ func buildMinimalSpendTx(spendingTxHash chainhash.Hash, inputs []windowSpend) *b
 	return tx
 }
 
-// ProcessBlockWindow processes a batch of K below-checkpoint blocks concurrently
-// using the three-fence phased pipeline:
+// assignWindowBlockIDs runs the serial block-ID pre-pass (ascending height order)
+// shared by PrepareWindow and CommitWindow.
+//
+// AssignBlockID burns a fresh nextval per new hash, so the ID a block receives is
+// determined by the ORDER of the AssignBlockID calls. Assigning inside the parallel
+// C1 work made that order depend on goroutine scheduling — a random permutation of
+// height→ID — which breaks StoreBlock's fast-path CAS (maxBlockID+1 == newBlockID)
+// and spuriously demotes IBD blocks off-chain (there are no real forks below the
+// checkpoint). Assign IDs serially here, iterating in the caller-guaranteed ascending
+// height order, so the block at height h gets a smaller, CONTIGUOUS id than height h+1.
+// C3 then commits in that same ascending order, so at commit time each block's id is
+// exactly maxBlockID+1 and StoreBlock keeps it on the main chain — matching the legacy
+// serial path's invariant. AssignBlockID is idempotent per hash, so an idempotent
+// re-run returns each block's existing id — which is why CommitWindow can safely
+// re-run this pre-pass on its own (e.g. when it runs as a separate RPC call from
+// PrepareWindow): the ids it resolves to are identical to what PrepareWindow already
+// assigned. block.ID set here is read by C1 (createBlockUTXOs' WithMinedBlockInfo)
+// and by C3 (commitBlock's WithID).
+func (u *BlockValidation) assignWindowBlockIDs(ctx context.Context, blocks []*model.Block) error {
+	for _, blk := range blocks {
+		id, err := u.blockchainClient.AssignBlockID(ctx, blk.Hash())
+		if err != nil {
+			return errors.NewProcessingError("[assignWindowBlockIDs][%s] failed to assign block ID at height %d", blk.Hash().String(), blk.Height, err)
+		}
+		blk.ID, err = blockIDToUint32(id, blk.Hash().String())
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PrepareWindow runs the postgres-heavy prepare stage of the window pipeline for a
+// batch of K below-checkpoint blocks: the fail-closed guards, the serial block-ID
+// pre-pass, and C1/C2 (parallel creates then parallel spends, or the barrier-collapsed
+// overlap of the two depending on WindowBarrierCollapse). It performs NO commit —
+// no AddBlock/StoreBlock call, no chain-tip advance — so it is safe to run ahead of,
+// or concurrently with, another window's CommitWindow (see the package-level
+// commit-pipelining design: C1/C2 reads never intersect C3 writes).
 //
 //	C1 (parallel): createBlockUTXOs for all K blocks → barrier (g.Wait)
 //	C2 (parallel): spendBlockUTXOs for all K blocks → barrier (g.Wait)
-//	C3 (serial):   commitBlock for each block in ascending height order
 //
 // Correctness invariants:
 //   - Every block must be below the hardcoded checkpoint AND outpoint-only eligible;
 //     if any block fails this guard the window is rejected fail-closed before C1.
-//   - C1→C2 barrier: no spend may run until ALL K creates are committed (the
-//     g.Wait() call is the only synchronisation point; there is no other path).
+//   - C1→C2 barrier (phased path): no spend may run until ALL K creates are
+//     committed (the g.Wait() call is the only synchronisation point; there is no
+//     other path).
 //   - Spend order is unordered (safe below checkpoint: disjoint outpoints, no
 //     double-spends, CVE-2012-2459 dedup enforced in PREPARE before hand-off).
-//   - C3 commits in strict ascending height order via commitBlock. There is no
-//     FSM/out-of-order rejection inside AddBlock (it is a thin wrapper over
-//     StoreBlock); main-chain membership is decided in StoreBlock by
-//     onMainChain = (HashPrevBlock == current best). Ascending-height commit plus
-//     the contiguous block ids from the serial pre-pass keep each block's parent
-//     equal to the tip at commit time, so the onMainChain fast-path stays true and
-//     the chain advances in order. A genuine parent gap would store the child
-//     off-chain (tip stalls), not raise an FSM error.
 //
 // Failure handling:
-//   - C1 or C2 error: return immediately; no C3 commits run; creates are
-//     idempotent (ErrTxExists→SetMinedMultiChunked) so the caller may retry.
-//   - C3 error at height h: return an error that names the last successfully
-//     committed height so the caller can resume after that block.
+//   - C1 or C2 error: return immediately; creates are idempotent
+//     (ErrTxExists→SetMinedMultiChunked) so the caller may retry the whole window.
 //
 // blocks must be sorted ascending by Height and all below the highest hardcoded
 // checkpoint with outpointOnly eligibility. An empty slice is a no-op.
@@ -421,8 +448,8 @@ func buildMinimalSpendTx(spendingTxHash chainhash.Hash, inputs []windowSpend) *b
 // Coinbase-only (0-subtree) blocks: a block with no subtrees has no UTXOs to
 // create and no spends to record. Such a block skips createBlockUTXOs entirely
 // in C1 — it only assigns its block ID idempotently (mirroring quickValidateBlock's
-// no-subtree path) — records no spends (C2 no-op), and commits ZERO subtrees in C3.
-func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID string) error {
+// no-subtree path) — and records no spends (C2 no-op).
+func (u *BlockValidation) PrepareWindow(ctx context.Context, blocks []*model.Block, peerID string) error {
 	if len(blocks) == 0 {
 		return nil
 	}
@@ -440,19 +467,28 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		return err
 	}
 
+	// --- UTXO-lock fail-closed guard (only when the two-stage commit pipeline is ON). ---
+	// See guardPipelinedUtxoLock: the pipeline requires QuickValidateSkipUtxoLock so
+	// CommitWindow's unlock pass (which otherwise races the next window's spends and
+	// cannot see C1's in-memory subtree state across the PrepareBlockWindow/
+	// CommitBlockWindow RPC boundary) never runs at all. No-op when the flag is off.
+	if err := u.guardPipelinedUtxoLock(); err != nil {
+		return err
+	}
+
 	// --- Gate: every block must be below the hardcoded checkpoint + outpoint-only. ---
 	// Fail-closed: a single above-checkpoint block must never enter the concurrent path.
 	highest := model.HighestCheckpointHeight(u.settings.ChainCfgParams.Checkpoints)
 	for _, blk := range blocks {
 		if !model.BelowCheckpoint(u.settings.ChainCfgParams.Checkpoints, blk.Height) {
 			return errors.NewProcessingError(
-				"[ProcessBlockWindow] block at height %d is not below the hardcoded checkpoint (highest=%d); window rejected fail-closed",
+				"[PrepareWindow] block at height %d is not below the hardcoded checkpoint (highest=%d); window rejected fail-closed",
 				blk.Height, highest,
 			)
 		}
 		if !u.quickValidateOutpointOnly(blk) {
 			return errors.NewProcessingError(
-				"[ProcessBlockWindow] block at height %d is not outpoint-only eligible; window rejected fail-closed",
+				"[PrepareWindow] block at height %d is not outpoint-only eligible; window rejected fail-closed",
 				blk.Height,
 			)
 		}
@@ -461,28 +497,8 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 	k := len(blocks)
 
 	// --- Serial block-ID pre-pass (ascending height order). ---
-	// AssignBlockID burns a fresh nextval per new hash, so the ID a block receives is
-	// determined by the ORDER of the AssignBlockID calls. Assigning inside the parallel
-	// C1 work made that order depend on goroutine scheduling — a random permutation of
-	// height→ID — which breaks StoreBlock's fast-path CAS (maxBlockID+1 == newBlockID)
-	// and spuriously demotes IBD blocks off-chain (there are no real forks below the
-	// checkpoint). Assign IDs serially here, iterating in the caller-guaranteed ascending
-	// height order, so the block at height h gets a smaller, CONTIGUOUS id than height h+1.
-	// C3 then commits in that same ascending order, so at commit time each block's id is
-	// exactly maxBlockID+1 and StoreBlock keeps it on the main chain — matching the legacy
-	// serial path's invariant. AssignBlockID is idempotent per hash, so an idempotent
-	// re-run returns each block's existing id (a prior buggy run's wrong-order ids persist
-	// and need a separate main-chain reconcile — out of scope here). block.ID set here is
-	// read by C1 (createBlockUTXOs' WithMinedBlockInfo) and by C3 (commitBlock's WithID).
-	for _, blk := range blocks {
-		id, err := u.blockchainClient.AssignBlockID(ctx, blk.Hash())
-		if err != nil {
-			return errors.NewProcessingError("[ProcessBlockWindow][%s] failed to assign block ID at height %d", blk.Hash().String(), blk.Height, err)
-		}
-		blk.ID, err = blockIDToUint32(id, blk.Hash().String())
-		if err != nil {
-			return err
-		}
+	if err := u.assignWindowBlockIDs(ctx, blocks); err != nil {
+		return err
 	}
 
 	// End of the serial pre-pass (guards + block-ID assignment); C1 starts here.
@@ -542,7 +558,7 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 
 				ws, err := u.createBlockUTXOs(c1ctx, blk, true /* outpointOnly */, storeSem)
 				if err != nil {
-					return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)
+					return errors.NewProcessingError("[PrepareWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)
 				}
 				mu.Lock()
 				spends[blockIdx] = ws
@@ -565,7 +581,7 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 			ws := spends[i]
 			c2g.Go(func() error {
 				if err := u.spendBlockUTXOs(c2ctx, blk, ws, true /* outpointOnly */, storeSem); err != nil {
-					return errors.NewProcessingError("[ProcessBlockWindow][C2][%s] spendBlockUTXOs failed", blk.Hash().String(), err)
+					return errors.NewProcessingError("[PrepareWindow][C2][%s] spendBlockUTXOs failed", blk.Hash().String(), err)
 				}
 				return nil
 			})
@@ -627,7 +643,7 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 
 				ws, err := u.createBlockUTXOs(gctx, blk, true /* outpointOnly */, storeSem)
 				if err != nil {
-					return errors.NewProcessingError("[ProcessBlockWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)
+					return errors.NewProcessingError("[PrepareWindow][C1][%s] createBlockUTXOs failed", blk.Hash().String(), err)
 				}
 				// spends[blockIdx] is written here and read only by this block's spend
 				// leg AFTER it waits createDone[blockIdx]; close() is the happens-before edge.
@@ -655,7 +671,7 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 				}
 
 				if err := u.spendBlockUTXOs(gctx, blk, spends[blockIdx], true /* outpointOnly */, storeSem); err != nil {
-					return errors.NewProcessingError("[ProcessBlockWindow][C2][%s] spendBlockUTXOs failed", blk.Hash().String(), err)
+					return errors.NewProcessingError("[PrepareWindow][C2][%s] spendBlockUTXOs failed", blk.Hash().String(), err)
 				}
 				return nil
 			})
@@ -667,8 +683,83 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		}
 	}
 
-	// Prepare (C1+C2, whichever path) ends here; the serial C3 tail starts.
+	// Prepare-side timing report (INFO so it lands in the default live logs): the
+	// prepare-vs-commit split is the go/no-go number for the pipelining design.
+	// The commit-side counterpart is logged by CommitWindow.
+	var txCount uint64
+	for _, blk := range blocks {
+		txCount += blk.TransactionCount
+	}
+	u.logger.Infof("[PrepareWindow] timing blocks=%d txs=%d heights=%d-%d prepass=%v c1=%v c2=%v prepare=%v",
+		k, txCount, blocks[0].Height, blocks[k-1].Height,
+		tPrepassDone.Sub(tWindowStart).Round(time.Millisecond),
+		c1Dur.Round(time.Millisecond), c2Dur.Round(time.Millisecond),
+		time.Since(tPrepassDone).Round(time.Millisecond))
+
+	u.logger.Debugf("[PrepareWindow] completed window of %d blocks (heights %d–%d)", k, blocks[0].Height, blocks[k-1].Height)
+	return nil
+}
+
+// CommitWindow runs the serial C3 commit stage of the window pipeline for a batch of
+// K below-checkpoint blocks: commitBlock for each block in strict ascending height
+// order. It first re-runs the (cheap, idempotent) block-ID pre-pass so the call is
+// stateless — safe to invoke as an RPC separate from the PrepareWindow call that
+// produced these blocks, since AssignBlockID resolves to the SAME ids on any
+// idempotent re-run (see assignWindowBlockIDs).
+//
+// CommitWindow assumes PrepareWindow has already run (successfully) for this window:
+// it does not create or spend any UTXOs — only commitBlock's AddBlock/StoreBlock,
+// subtree-unlock, and subtree-DAH bookkeeping. blocks must be sorted ascending by
+// Height (same contract as PrepareWindow/ProcessBlockWindow). An empty slice is a
+// no-op.
+//
+// Correctness invariants:
+//   - C3 commits in strict ascending height order via commitBlock. There is no
+//     FSM/out-of-order rejection inside AddBlock (it is a thin wrapper over
+//     StoreBlock); main-chain membership is decided in StoreBlock by
+//     onMainChain = (HashPrevBlock == current best). Ascending-height commit plus
+//     the contiguous block ids from the pre-pass keep each block's parent equal to
+//     the tip at commit time, so the onMainChain fast-path stays true and the chain
+//     advances in order. A genuine parent gap would store the child off-chain (tip
+//     stalls), not raise an FSM error.
+//
+// Failure handling:
+//   - C3 error at height h: return an error that names the last successfully
+//     committed height so the caller can resume after that block.
+func (u *BlockValidation) CommitWindow(ctx context.Context, blocks []*model.Block, peerID string) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	// Defense in depth: CommitWindow can be invoked as a standalone RPC
+	// (CommitBlockWindow) without going through this process's own PrepareWindow
+	// call, so re-check the same fail-closed guard PrepareWindow enforces — see
+	// guardPipelinedUtxoLock for why the pipeline requires QuickValidateSkipUtxoLock.
+	if err := u.guardPipelinedUtxoLock(); err != nil {
+		return err
+	}
+
+	// Re-run the idempotent block-ID pre-pass: makes CommitWindow stateless when
+	// called as a separate RPC from PrepareWindow (same ids either way). The
+	// composed ProcessBlockWindow path skips this by calling commitWindowC3
+	// directly — PrepareWindow already assigned the IDs in the same process.
+	if err := u.assignWindowBlockIDs(ctx, blocks); err != nil {
+		return err
+	}
+
+	return u.commitWindowC3(ctx, blocks, peerID)
+}
+
+// commitWindowC3 is the C3 serial ascending commit loop shared by CommitWindow
+// (standalone RPC: guard + idempotent ID re-assign first) and ProcessBlockWindow
+// (composed path: PrepareWindow already ran the guard and the ID pre-pass, so
+// re-running them here would only add k idempotent AssignBlockID round-trips per
+// window — the flag-off parity cost the adversarial review flagged).
+func (u *BlockValidation) commitWindowC3(ctx context.Context, blocks []*model.Block, peerID string) error {
+	// The serial C3 tail starts here.
 	tC3Start := time.Now()
+
+	k := len(blocks)
 
 	// --- C3: serial commits in ascending height order. ---
 	// blocks is already sorted ascending by Height (caller contract).
@@ -684,31 +775,56 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		if err := u.commitBlock(ctx, blk, peerID, "ProcessBlockWindow"); err != nil {
 			if lastCommittedHeight > 0 {
 				return errors.NewProcessingError(
-					"[ProcessBlockWindow][C3][%s] commitBlock failed; last committed height=%d",
+					"[CommitWindow][C3][%s] commitBlock failed; last committed height=%d",
 					blk.Hash().String(), lastCommittedHeight, err,
 				)
 			}
-			return errors.NewProcessingError("[ProcessBlockWindow][C3][%s] commitBlock failed (no blocks committed yet)", blk.Hash().String(), err)
+			return errors.NewProcessingError("[CommitWindow][C3][%s] commitBlock failed (no blocks committed yet)", blk.Hash().String(), err)
 		}
 		lastCommittedHeight = blk.Height
 	}
 
-	// Single-line timing report (INFO so it lands in the default live logs): the
+	// Commit-side timing report (INFO so it lands in the default live logs): the
 	// prepare-vs-commit split is the go/no-go number for the pipelining design.
+	// The prepare-side counterpart is logged by PrepareWindow.
 	var txCount uint64
 	for _, blk := range blocks {
 		txCount += blk.TransactionCount
 	}
-	u.logger.Infof("[ProcessBlockWindow] timing blocks=%d txs=%d heights=%d-%d prepass=%v c1=%v c2=%v prepare=%v commit=%v total=%v",
+	u.logger.Infof("[CommitWindow] timing blocks=%d txs=%d heights=%d-%d commit=%v",
 		k, txCount, blocks[0].Height, blocks[k-1].Height,
-		tPrepassDone.Sub(tWindowStart).Round(time.Millisecond),
-		c1Dur.Round(time.Millisecond), c2Dur.Round(time.Millisecond),
-		tC3Start.Sub(tPrepassDone).Round(time.Millisecond),
-		time.Since(tC3Start).Round(time.Millisecond),
-		time.Since(tWindowStart).Round(time.Millisecond))
+		time.Since(tC3Start).Round(time.Millisecond))
 
-	u.logger.Debugf("[ProcessBlockWindow] completed window of %d blocks (heights %d–%d)", k, blocks[0].Height, blocks[k-1].Height)
+	u.logger.Debugf("[CommitWindow] completed window of %d blocks (heights %d–%d)", k, blocks[0].Height, blocks[k-1].Height)
 	return nil
+}
+
+// ProcessBlockWindow processes a batch of K below-checkpoint blocks by running
+// PrepareWindow (C1 parallel creates → C2 parallel spends, either phased or
+// barrier-collapsed per WindowBarrierCollapse) followed by CommitWindow (C3 serial
+// commits in ascending height order). It is provided for callers that want the
+// whole window processed in one call — every existing caller of
+// ProcessBlockWindow is behaviourally identical to before the Prepare/Commit split,
+// since this is exactly that composition.
+//
+// See PrepareWindow and CommitWindow for the detailed per-stage contracts,
+// invariants, and failure handling.
+//
+// blocks must be sorted ascending by Height and all below the highest hardcoded
+// checkpoint with outpointOnly eligibility. An empty slice is a no-op.
+func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID string) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	if err := u.PrepareWindow(ctx, blocks, peerID); err != nil {
+		return err
+	}
+
+	// commitWindowC3 (not CommitWindow): PrepareWindow already ran the guard and
+	// the block-ID pre-pass in this process, so the composed path keeps the exact
+	// single-pre-pass behaviour of the pre-split ProcessBlockWindow.
+	return u.commitWindowC3(ctx, blocks, peerID)
 }
 
 // windowPoolBudgetHeadroom is the number of connections reserved above the
@@ -731,6 +847,44 @@ func (u *BlockValidation) guardWindowPoolBudget() error {
 		u.settings.UtxoStore.BatcherMaxConcurrent,
 		u.settings.UtxoStore.PostgresMaintenancePoolConns,
 	)
+}
+
+// guardPipelinedUtxoLock fails the window closed when the two-stage prepare/commit
+// window pipeline (Legacy.PipelineWindowCommit) is active but
+// BlockValidation.QuickValidateSkipUtxoLock is not, since the pipeline is only safe
+// under that combination:
+//
+//   - CommitWindow's unlock pass (unlockSubtreeTransactionsIfNeeded) reads
+//     block.SubtreeSlices, which is populated by C1 in memory. When CommitWindow
+//     runs as a separate CommitBlockWindow RPC from the PrepareBlockWindow call
+//     that produced it, the block is a FRESH deserialisation
+//     (model.NewBlockFromBytes) with SubtreeSlices nil — the unlock would
+//     silently no-op, permanently leaving every below-checkpoint tx locked.
+//   - Even carrying that data across the RPC boundary, the unlock UPDATE
+//     (setUnlockedBulk) recomputes delete_at_height from a snapshot that can go
+//     stale under Postgres READ COMMITTED if window N's unlock (part of C3(N))
+//     runs concurrently with window N+1's spend (part of C2(N+1)) on the SAME
+//     transaction row — exactly the cross-window tx chains this pipeline exists
+//     to overlap. That race can silently clobber the spend's delete_at_height
+//     back to NULL, leaking otherwise-prunable rows.
+//
+// QuickValidateSkipUtxoLock removes both hazards by construction: below-checkpoint
+// UTXOs are created already-unlocked and the unlock pass is skipped entirely (a
+// pure no-op, see quickValidateSkipsUtxoLock / unlockSubtreeTransactionsIfNeeded),
+// so there is nothing to lose across the RPC boundary and nothing to race. A no-op
+// when the pipeline flag is off (byte-identical to before this guard).
+func (u *BlockValidation) guardPipelinedUtxoLock() error {
+	if !u.settings.Legacy.PipelineWindowCommit {
+		return nil
+	}
+
+	if !u.settings.BlockValidation.QuickValidateSkipUtxoLock {
+		return errors.NewConfigurationError(
+			"[ProcessBlockWindow] legacy_pipelineWindowCommit requires blockvalidation_quick_validate_skip_utxo_lock=true; the two-stage pipeline's cross-window C1/C2(N+1)-vs-C3(N) overlap is only safe when UTXOs are created unlocked and CommitWindow's post-commit unlock pass is skipped entirely",
+		)
+	}
+
+	return nil
 }
 
 // checkWindowPoolBudget is the pure budget rule for the barrier-collapse overlap.

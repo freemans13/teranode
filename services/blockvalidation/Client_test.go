@@ -78,6 +78,22 @@ func (m *mockBlockValidationAPIClient) ProcessBlockWindow(ctx context.Context, i
 	return args.Get(0).(*blockvalidation_api.EmptyMessage), args.Error(1)
 }
 
+func (m *mockBlockValidationAPIClient) PrepareBlockWindow(ctx context.Context, in *blockvalidation_api.ProcessBlockWindowRequest, opts ...grpc.CallOption) (*blockvalidation_api.EmptyMessage, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockvalidation_api.EmptyMessage), args.Error(1)
+}
+
+func (m *mockBlockValidationAPIClient) CommitBlockWindow(ctx context.Context, in *blockvalidation_api.ProcessBlockWindowRequest, opts ...grpc.CallOption) (*blockvalidation_api.EmptyMessage, error) {
+	args := m.Called(ctx, in, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*blockvalidation_api.EmptyMessage), args.Error(1)
+}
+
 func createTestClient(mockClient *mockBlockValidationAPIClient) *Client {
 	logger := ulogger.TestLogger{}
 	tSettings := &settings.Settings{

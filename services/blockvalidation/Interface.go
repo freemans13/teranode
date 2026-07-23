@@ -42,7 +42,20 @@ type Interface interface {
 	// ProcessBlockWindow processes a window of K below-checkpoint blocks via the three-fence phased pipeline
 	// (C1 parallel creates → C2 parallel spends → C3 serial commits in ascending height order).
 	// blocks must be sorted ascending by height; all must be below the hardcoded checkpoint and outpoint-only eligible.
+	// It is equivalent to calling PrepareBlockWindow followed by CommitBlockWindow.
 	ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error
+
+	// PrepareBlockWindow runs only the prepare stage of the window pipeline (C1 parallel
+	// creates → C2 parallel spends) without committing any block. blocks must be sorted
+	// ascending by height; all must be below the hardcoded checkpoint and outpoint-only
+	// eligible. See CommitBlockWindow for the serial commit stage.
+	PrepareBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error
+
+	// CommitBlockWindow runs only the commit stage of the window pipeline (C3 serial
+	// commits in ascending height order). It is safe to call as a stateless RPC separate
+	// from the PrepareBlockWindow call that prepared the window (the block-ID pre-pass
+	// is idempotent and re-run internally).
+	CommitBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error
 
 	// ValidateBlock validates a block using the provided request, but does not update any state or database tables.
 	// This is useful for validating blocks without committing them to the database.
@@ -74,6 +87,14 @@ func (mv *MockBlockValidation) ProcessBlock(ctx context.Context, block *model.Bl
 }
 
 func (mv *MockBlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
+	return nil
+}
+
+func (mv *MockBlockValidation) PrepareBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
+	return nil
+}
+
+func (mv *MockBlockValidation) CommitBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
 	return nil
 }
 

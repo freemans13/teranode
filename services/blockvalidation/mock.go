@@ -51,6 +51,18 @@ func (m *Mock) ProcessBlockWindow(ctx context.Context, blocks []*model.Block, pe
 	return args.Error(0)
 }
 
+// PrepareBlockWindow performs a mock prepare-only stage of window processing.
+func (m *Mock) PrepareBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
+	args := m.Called(ctx, blocks, peerID, baseURL)
+	return args.Error(0)
+}
+
+// CommitBlockWindow performs a mock commit-only stage of window processing.
+func (m *Mock) CommitBlockWindow(ctx context.Context, blocks []*model.Block, peerID, baseURL string) error {
+	args := m.Called(ctx, blocks, peerID, baseURL)
+	return args.Error(0)
+}
+
 // ValidateBlock performs a mock block validation.
 func (m *Mock) ValidateBlock(ctx context.Context, block *model.Block, options *ValidateBlockOptions) error {
 	args := m.Called(ctx, block, options)

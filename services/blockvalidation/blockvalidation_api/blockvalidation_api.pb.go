@@ -837,14 +837,16 @@ const file_services_blockvalidation_blockvalidation_api_blockvalidation_api_prot
 	"fork_depth\x18\f \x01(\rR\tforkDepth\x120\n" +
 	"\x14common_ancestor_hash\x18\r \x01(\tR\x12commonAncestorHash\x124\n" +
 	"\x16common_ancestor_height\x18\x0e \x01(\rR\x14commonAncestorHeight\x12V\n" +
-	"\x10previous_attempt\x18\x0f \x01(\v2+.blockvalidation_api.PreviousCatchupAttemptR\x0fpreviousAttempt2\xc5\x05\n" +
+	"\x10previous_attempt\x18\x0f \x01(\v2+.blockvalidation_api.PreviousCatchupAttemptR\x0fpreviousAttempt2\x9a\a\n" +
 	"\x12BlockValidationAPI\x12V\n" +
 	"\n" +
 	"HealthGRPC\x12!.blockvalidation_api.EmptyMessage\x1a#.blockvalidation_api.HealthResponse\"\x00\x12Y\n" +
 	"\n" +
 	"BlockFound\x12&.blockvalidation_api.BlockFoundRequest\x1a!.blockvalidation_api.EmptyMessage\"\x00\x12]\n" +
 	"\fProcessBlock\x12(.blockvalidation_api.ProcessBlockRequest\x1a!.blockvalidation_api.EmptyMessage\"\x00\x12i\n" +
-	"\x12ProcessBlockWindow\x12..blockvalidation_api.ProcessBlockWindowRequest\x1a!.blockvalidation_api.EmptyMessage\"\x00\x12h\n" +
+	"\x12ProcessBlockWindow\x12..blockvalidation_api.ProcessBlockWindowRequest\x1a!.blockvalidation_api.EmptyMessage\"\x00\x12i\n" +
+	"\x12PrepareBlockWindow\x12..blockvalidation_api.ProcessBlockWindowRequest\x1a!.blockvalidation_api.EmptyMessage\"\x00\x12h\n" +
+	"\x11CommitBlockWindow\x12..blockvalidation_api.ProcessBlockWindowRequest\x1a!.blockvalidation_api.EmptyMessage\"\x00\x12h\n" +
 	"\rValidateBlock\x12).blockvalidation_api.ValidateBlockRequest\x1a*.blockvalidation_api.ValidateBlockResponse\"\x00\x12c\n" +
 	"\x0fRevalidateBlock\x12+.blockvalidation_api.RevalidateBlockRequest\x1a!.blockvalidation_api.EmptyMessage\"\x00\x12c\n" +
 	"\x10GetCatchupStatus\x12!.blockvalidation_api.EmptyMessage\x1a*.blockvalidation_api.CatchupStatusResponse\"\x00B\x18Z\x16./;blockvalidation_apib\x06proto3"
@@ -882,18 +884,22 @@ var file_services_blockvalidation_blockvalidation_api_blockvalidation_api_proto_
 	2,  // 3: blockvalidation_api.BlockValidationAPI.BlockFound:input_type -> blockvalidation_api.BlockFoundRequest
 	3,  // 4: blockvalidation_api.BlockValidationAPI.ProcessBlock:input_type -> blockvalidation_api.ProcessBlockRequest
 	6,  // 5: blockvalidation_api.BlockValidationAPI.ProcessBlockWindow:input_type -> blockvalidation_api.ProcessBlockWindowRequest
-	4,  // 6: blockvalidation_api.BlockValidationAPI.ValidateBlock:input_type -> blockvalidation_api.ValidateBlockRequest
-	7,  // 7: blockvalidation_api.BlockValidationAPI.RevalidateBlock:input_type -> blockvalidation_api.RevalidateBlockRequest
-	0,  // 8: blockvalidation_api.BlockValidationAPI.GetCatchupStatus:input_type -> blockvalidation_api.EmptyMessage
-	1,  // 9: blockvalidation_api.BlockValidationAPI.HealthGRPC:output_type -> blockvalidation_api.HealthResponse
-	0,  // 10: blockvalidation_api.BlockValidationAPI.BlockFound:output_type -> blockvalidation_api.EmptyMessage
-	0,  // 11: blockvalidation_api.BlockValidationAPI.ProcessBlock:output_type -> blockvalidation_api.EmptyMessage
-	0,  // 12: blockvalidation_api.BlockValidationAPI.ProcessBlockWindow:output_type -> blockvalidation_api.EmptyMessage
-	5,  // 13: blockvalidation_api.BlockValidationAPI.ValidateBlock:output_type -> blockvalidation_api.ValidateBlockResponse
-	0,  // 14: blockvalidation_api.BlockValidationAPI.RevalidateBlock:output_type -> blockvalidation_api.EmptyMessage
-	9,  // 15: blockvalidation_api.BlockValidationAPI.GetCatchupStatus:output_type -> blockvalidation_api.CatchupStatusResponse
-	9,  // [9:16] is the sub-list for method output_type
-	2,  // [2:9] is the sub-list for method input_type
+	6,  // 6: blockvalidation_api.BlockValidationAPI.PrepareBlockWindow:input_type -> blockvalidation_api.ProcessBlockWindowRequest
+	6,  // 7: blockvalidation_api.BlockValidationAPI.CommitBlockWindow:input_type -> blockvalidation_api.ProcessBlockWindowRequest
+	4,  // 8: blockvalidation_api.BlockValidationAPI.ValidateBlock:input_type -> blockvalidation_api.ValidateBlockRequest
+	7,  // 9: blockvalidation_api.BlockValidationAPI.RevalidateBlock:input_type -> blockvalidation_api.RevalidateBlockRequest
+	0,  // 10: blockvalidation_api.BlockValidationAPI.GetCatchupStatus:input_type -> blockvalidation_api.EmptyMessage
+	1,  // 11: blockvalidation_api.BlockValidationAPI.HealthGRPC:output_type -> blockvalidation_api.HealthResponse
+	0,  // 12: blockvalidation_api.BlockValidationAPI.BlockFound:output_type -> blockvalidation_api.EmptyMessage
+	0,  // 13: blockvalidation_api.BlockValidationAPI.ProcessBlock:output_type -> blockvalidation_api.EmptyMessage
+	0,  // 14: blockvalidation_api.BlockValidationAPI.ProcessBlockWindow:output_type -> blockvalidation_api.EmptyMessage
+	0,  // 15: blockvalidation_api.BlockValidationAPI.PrepareBlockWindow:output_type -> blockvalidation_api.EmptyMessage
+	0,  // 16: blockvalidation_api.BlockValidationAPI.CommitBlockWindow:output_type -> blockvalidation_api.EmptyMessage
+	5,  // 17: blockvalidation_api.BlockValidationAPI.ValidateBlock:output_type -> blockvalidation_api.ValidateBlockResponse
+	0,  // 18: blockvalidation_api.BlockValidationAPI.RevalidateBlock:output_type -> blockvalidation_api.EmptyMessage
+	9,  // 19: blockvalidation_api.BlockValidationAPI.GetCatchupStatus:output_type -> blockvalidation_api.CatchupStatusResponse
+	11, // [11:20] is the sub-list for method output_type
+	2,  // [2:11] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
 	2,  // [2:2] is the sub-list for extension extendee
 	0,  // [0:2] is the sub-list for field type_name

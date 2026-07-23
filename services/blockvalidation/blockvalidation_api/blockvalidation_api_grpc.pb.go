@@ -23,6 +23,8 @@ const (
 	BlockValidationAPI_BlockFound_FullMethodName         = "/blockvalidation_api.BlockValidationAPI/BlockFound"
 	BlockValidationAPI_ProcessBlock_FullMethodName       = "/blockvalidation_api.BlockValidationAPI/ProcessBlock"
 	BlockValidationAPI_ProcessBlockWindow_FullMethodName = "/blockvalidation_api.BlockValidationAPI/ProcessBlockWindow"
+	BlockValidationAPI_PrepareBlockWindow_FullMethodName = "/blockvalidation_api.BlockValidationAPI/PrepareBlockWindow"
+	BlockValidationAPI_CommitBlockWindow_FullMethodName  = "/blockvalidation_api.BlockValidationAPI/CommitBlockWindow"
 	BlockValidationAPI_ValidateBlock_FullMethodName      = "/blockvalidation_api.BlockValidationAPI/ValidateBlock"
 	BlockValidationAPI_RevalidateBlock_FullMethodName    = "/blockvalidation_api.BlockValidationAPI/RevalidateBlock"
 	BlockValidationAPI_GetCatchupStatus_FullMethodName   = "/blockvalidation_api.BlockValidationAPI/GetCatchupStatus"
@@ -37,6 +39,13 @@ type BlockValidationAPIClient interface {
 	BlockFound(ctx context.Context, in *BlockFoundRequest, opts ...grpc.CallOption) (*EmptyMessage, error)
 	ProcessBlock(ctx context.Context, in *ProcessBlockRequest, opts ...grpc.CallOption) (*EmptyMessage, error)
 	ProcessBlockWindow(ctx context.Context, in *ProcessBlockWindowRequest, opts ...grpc.CallOption) (*EmptyMessage, error)
+	// PrepareBlockWindow runs only the prepare stage (C1 parallel creates + C2 parallel
+	// spends) of the window pipeline, without committing any block. See CommitBlockWindow.
+	PrepareBlockWindow(ctx context.Context, in *ProcessBlockWindowRequest, opts ...grpc.CallOption) (*EmptyMessage, error)
+	// CommitBlockWindow runs only the commit stage (C3 serial ascending commits) of the
+	// window pipeline. Idempotent: re-runs the block-ID pre-pass so it can be called as
+	// a stateless RPC separate from the PrepareBlockWindow call that prepared the window.
+	CommitBlockWindow(ctx context.Context, in *ProcessBlockWindowRequest, opts ...grpc.CallOption) (*EmptyMessage, error)
 	ValidateBlock(ctx context.Context, in *ValidateBlockRequest, opts ...grpc.CallOption) (*ValidateBlockResponse, error)
 	RevalidateBlock(ctx context.Context, in *RevalidateBlockRequest, opts ...grpc.CallOption) (*EmptyMessage, error)
 	GetCatchupStatus(ctx context.Context, in *EmptyMessage, opts ...grpc.CallOption) (*CatchupStatusResponse, error)
@@ -90,6 +99,26 @@ func (c *blockValidationAPIClient) ProcessBlockWindow(ctx context.Context, in *P
 	return out, nil
 }
 
+func (c *blockValidationAPIClient) PrepareBlockWindow(ctx context.Context, in *ProcessBlockWindowRequest, opts ...grpc.CallOption) (*EmptyMessage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EmptyMessage)
+	err := c.cc.Invoke(ctx, BlockValidationAPI_PrepareBlockWindow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *blockValidationAPIClient) CommitBlockWindow(ctx context.Context, in *ProcessBlockWindowRequest, opts ...grpc.CallOption) (*EmptyMessage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EmptyMessage)
+	err := c.cc.Invoke(ctx, BlockValidationAPI_CommitBlockWindow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *blockValidationAPIClient) ValidateBlock(ctx context.Context, in *ValidateBlockRequest, opts ...grpc.CallOption) (*ValidateBlockResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ValidateBlockResponse)
@@ -129,6 +158,13 @@ type BlockValidationAPIServer interface {
 	BlockFound(context.Context, *BlockFoundRequest) (*EmptyMessage, error)
 	ProcessBlock(context.Context, *ProcessBlockRequest) (*EmptyMessage, error)
 	ProcessBlockWindow(context.Context, *ProcessBlockWindowRequest) (*EmptyMessage, error)
+	// PrepareBlockWindow runs only the prepare stage (C1 parallel creates + C2 parallel
+	// spends) of the window pipeline, without committing any block. See CommitBlockWindow.
+	PrepareBlockWindow(context.Context, *ProcessBlockWindowRequest) (*EmptyMessage, error)
+	// CommitBlockWindow runs only the commit stage (C3 serial ascending commits) of the
+	// window pipeline. Idempotent: re-runs the block-ID pre-pass so it can be called as
+	// a stateless RPC separate from the PrepareBlockWindow call that prepared the window.
+	CommitBlockWindow(context.Context, *ProcessBlockWindowRequest) (*EmptyMessage, error)
 	ValidateBlock(context.Context, *ValidateBlockRequest) (*ValidateBlockResponse, error)
 	RevalidateBlock(context.Context, *RevalidateBlockRequest) (*EmptyMessage, error)
 	GetCatchupStatus(context.Context, *EmptyMessage) (*CatchupStatusResponse, error)
@@ -153,6 +189,12 @@ func (UnimplementedBlockValidationAPIServer) ProcessBlock(context.Context, *Proc
 }
 func (UnimplementedBlockValidationAPIServer) ProcessBlockWindow(context.Context, *ProcessBlockWindowRequest) (*EmptyMessage, error) {
 	return nil, status.Error(codes.Unimplemented, "method ProcessBlockWindow not implemented")
+}
+func (UnimplementedBlockValidationAPIServer) PrepareBlockWindow(context.Context, *ProcessBlockWindowRequest) (*EmptyMessage, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareBlockWindow not implemented")
+}
+func (UnimplementedBlockValidationAPIServer) CommitBlockWindow(context.Context, *ProcessBlockWindowRequest) (*EmptyMessage, error) {
+	return nil, status.Error(codes.Unimplemented, "method CommitBlockWindow not implemented")
 }
 func (UnimplementedBlockValidationAPIServer) ValidateBlock(context.Context, *ValidateBlockRequest) (*ValidateBlockResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ValidateBlock not implemented")
@@ -256,6 +298,42 @@ func _BlockValidationAPI_ProcessBlockWindow_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BlockValidationAPI_PrepareBlockWindow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProcessBlockWindowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BlockValidationAPIServer).PrepareBlockWindow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BlockValidationAPI_PrepareBlockWindow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BlockValidationAPIServer).PrepareBlockWindow(ctx, req.(*ProcessBlockWindowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BlockValidationAPI_CommitBlockWindow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProcessBlockWindowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BlockValidationAPIServer).CommitBlockWindow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BlockValidationAPI_CommitBlockWindow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BlockValidationAPIServer).CommitBlockWindow(ctx, req.(*ProcessBlockWindowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _BlockValidationAPI_ValidateBlock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ValidateBlockRequest)
 	if err := dec(in); err != nil {
@@ -332,6 +410,14 @@ var BlockValidationAPI_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ProcessBlockWindow",
 			Handler:    _BlockValidationAPI_ProcessBlockWindow_Handler,
+		},
+		{
+			MethodName: "PrepareBlockWindow",
+			Handler:    _BlockValidationAPI_PrepareBlockWindow_Handler,
+		},
+		{
+			MethodName: "CommitBlockWindow",
+			Handler:    _BlockValidationAPI_CommitBlockWindow_Handler,
 		},
 		{
 			MethodName: "ValidateBlock",

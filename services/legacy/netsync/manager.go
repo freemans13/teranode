@@ -775,6 +775,34 @@ type SyncManager struct {
 	// goroutine reads/writes park, so this pointer is atomic solely for safe setup
 	// publication (no cross-goroutine park mutation).
 	parkRef atomic.Pointer[parkStore]
+	// windowPoisoned is the shared fatal-commit latch for the two-stage
+	// prepare/commit window pipeline (legacy_pipelineWindowCommit). It replaces
+	// the single flushWorker's goroutine-local `poisoned bool` when the flag is
+	// on, since two workers (prepareWorker + the commit worker) must observe the
+	// SAME fail-stop state: once a window commit fatally fails, no later
+	// window's prepare OR commit may proceed. Only the commit worker ever
+	// CLEARS it (windowRelinksAfterPoison requires GetBestBlockHeader, i.e.
+	// genuinely committed state, which only the commit worker observes);
+	// prepareWorker only reads it. Unused (always false) when the flag is off,
+	// where flushWorker keeps its original local bool for byte-identical
+	// behaviour.
+	windowPoisoned atomic.Bool
+	// windowPoisonedFirstHeight is the first height of the window whose fatal
+	// failure most recently set windowPoisoned (0 when not poisoned). It lets
+	// commitWorker distinguish two very different arrivals while poisoned: a
+	// window entirely BELOW this height was already queued/prepared before the
+	// poisoning failure and does not depend on it — safe to commit, exactly as
+	// flushWorker's single-worker FIFO would already have committed it before
+	// ever reaching the later, failing window — but committing it must NOT clear
+	// the latch, since the gap at this height is still unresolved. Only a window
+	// whose commit reaches or crosses this height can be the genuine post-
+	// rotation resync that heals the gap. Without this a merely tip-aligned
+	// pre-poison window (queued ahead of the failure) incorrectly cleared the
+	// shared latch, letting a later, still-missing window commit off-chain
+	// (Finding 1 of the pipelining adversarial review). Set by whichever worker
+	// poisons (prepare or commit stage); cleared (to 0) only by commitWorker
+	// alongside windowPoisoned.
+	windowPoisonedFirstHeight atomic.Uint32
 	// windowOwnedBlocks is the hash-keyed ownership ledger for blocks the window
 	// pipeline holds between admission and commit: parked (parkStore), accumulated
 	// (windowAccumulator), or inside an in-flight windowFlushJob. Such a block is
@@ -7289,18 +7317,29 @@ func (sm *SyncManager) releaseWindowBlocks(blocks []*model.Block) {
 
 // windowFlushJob is a drained, ascending-sorted window ready to commit. It is
 // produced on the drain goroutine (drainJob) and consumed either synchronously
-// (flush → commitWindowJob) or, in pipeline mode, by the single flush worker
-// (flushWorker → commitWindowJob).
+// (flush → commitWindowJob), by the single flush worker (flushWorker →
+// commitWindowJob) when legacy_pipelineWindowCommit is false, or by the
+// two-stage prepare/commit pipeline (prepareWorker → commitJobs → commitWorker)
+// when the flag is true — in the pipelined case the SAME job value flows
+// unmodified from prepareWorker to commitWorker over the commitJobs channel.
 type windowFlushJob struct {
 	blocks []*model.Block
 
-	// done, when non-nil, is closed by the flush worker AFTER it has finished
-	// handling this job (committed, or skipped because poisoned/shutdown). It
-	// turns an otherwise fire-and-forget hand-off into a synchronous barrier: the
-	// drain goroutine can hand off a job and wait for the worker to quiesce,
-	// guaranteeing every earlier in-flight window has committed. Normal (async)
-	// jobs leave it nil. Used by flushWindowSync for the direct/checkpoint path,
-	// whose HandleBlockDirect requires its parent block already committed.
+	// done, when non-nil, is closed AFTER the job has finished being handled
+	// (committed, or skipped because poisoned/shutdown). It turns an otherwise
+	// fire-and-forget hand-off into a synchronous barrier: the drain goroutine
+	// can hand off a job and wait for it to quiesce, guaranteeing every earlier
+	// in-flight window has committed. Normal (async) jobs leave it nil. Used by
+	// flushWindowSync for the direct/checkpoint path, whose HandleBlockDirect
+	// requires its parent block already committed.
+	//
+	// Closed by the flush worker (flag off), or by whichever pipeline stage a
+	// job STOPS at (flag on): commitWorker for every job that reaches the
+	// commit stage (this is the common case, and is what makes "done" mean
+	// "committed"), or prepareWorker itself only for a job that never reaches
+	// the commit stage at all (a poisoned discard at the prepare stage, or a
+	// ctx-cancelled shutdown drain) — prepareWorker never closes done for a
+	// job it forwards to commitJobs.
 	done chan struct{}
 }
 
@@ -7856,6 +7895,423 @@ func (sm *SyncManager) recoverWindowCommit(ctx context.Context, blocks []*model.
 	return lastErr
 }
 
+// --- Two-stage prepare/commit window pipeline (legacy_pipelineWindowCommit) ---
+//
+// The functions below implement the FLAG-ON path only: prepareWorker and
+// commitWorker replace the single flushWorker with a prepare-stage worker
+// (jobs -> PrepareBlockWindow -> commitJobs) and a dedicated commit-stage
+// worker (commitJobs -> CommitBlockWindow), so window N+1's postgres-heavy
+// C1/C2 prepare overlaps window N's serial C3 commit tail. The commit worker
+// remains the SOLE, strictly-FIFO committer (I1/I2 unchanged); the only
+// reordering this introduces is C1/C2(N+1) running alongside C3(N) (I7,
+// verified disjoint read/write sets — see
+// docs/superpowers/specs/ibd-commit-throughput-plan.md).
+//
+// commitWindowJob/commitWindowJobRecovered/flushWorker above are the FLAG-OFF
+// path and are left completely untouched, so legacy_pipelineWindowCommit=false
+// stays byte-identical to before this change (I6).
+
+// recoverWindowPrepare re-drives a failed PrepareBlockWindow call for the
+// prepare stage of the two-stage pipeline. Unlike recoverWindowCommit — which
+// re-drives the per-block ProcessBlock path, a REAL commit including AddBlock
+// — this retries PrepareBlockWindow itself: PrepareWindow performs no commit
+// (no AddBlock/StoreBlock, no chain-tip advance) and is idempotent (creates
+// tolerate ErrTxExists, AssignBlockID resolves to the same ids on replay), so
+// it is always safe to retry regardless of what any other window's commit is
+// doing concurrently. This matters because, under the pipeline, prepare(N+1)
+// legitimately runs WHILE commit(N) is still in flight — reusing
+// recoverWindowCommit here would run a second, concurrent commit-capable path
+// alongside commitWorker (violating "commitWorker is the sole committer") and
+// could misreport a window as committed when ProcessBlock silently declines to
+// commit a block whose parent (window N, still mid-commit) is not yet visible
+// (adversarial review Findings 2/3).
+//
+// Classification and budget mirror recoverWindowCommit exactly: an
+// ErrServiceError/ErrStorageError is retried up to windowCommitRetryCap times
+// with windowCommitRetryBackoff between attempts; any other error escalates
+// immediately without consuming the cap.
+func (sm *SyncManager) recoverWindowPrepare(ctx context.Context, blocks []*model.Block) error {
+	var lastErr error
+
+	for attempt := 1; attempt <= windowCommitRetryCap; attempt++ {
+		lastErr = sm.blockValidation.PrepareBlockWindow(ctx, blocks, "", "legacy")
+		if lastErr == nil {
+			return nil
+		}
+
+		if !errors.Is(lastErr, errors.ErrServiceError) && !errors.Is(lastErr, errors.ErrStorageError) {
+			sm.logger.Errorf("[windowPipeline] prepare recovery hit fatal error, escalating: %v", lastErr)
+			return lastErr
+		}
+
+		sm.logger.Warnf("[windowPipeline] prepare recovery infra error (attempt %d/%d): %v", attempt, windowCommitRetryCap, lastErr)
+
+		if attempt < windowCommitRetryCap {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(windowCommitRetryBackoff):
+			}
+		}
+	}
+
+	return lastErr
+}
+
+// commitWindowJobPrepare is the PREPARE-stage half of the two-stage window
+// pipeline: it runs blockValidation.PrepareBlockWindow (C1/C2) instead of the
+// whole ProcessBlockWindow. Unlike commitWindowJob it does NOT release
+// window-block ownership on success — a successfully prepared window is
+// forwarded to the commit stage by prepareWorker, which still owns the
+// blocks (and the job's barrier channel) until CommitWindow, or a poisoned
+// discard there, releases them. On an unrecoverable failure it returns true
+// (poison) and likewise does not touch ownership/the barrier channel; the
+// caller (prepareWorker) owns releasing the blocks and closing job.done for a
+// job that stops here, exactly as flushWorker does today for a poisoned
+// discard.
+//
+// Recovery retries PrepareBlockWindow itself (recoverWindowPrepare), NOT the
+// per-block ProcessBlock commit path recoverWindowCommit uses — see
+// recoverWindowPrepare's doc for why. A successful recovery here has NOT
+// committed anything (unlike the old design), so no markDiskBlocksCommitted
+// call belongs here; the job is forwarded to the commit stage exactly like
+// the plain-success path above, and CommitWindow (or its own recovery) is
+// what commits and marks the disk blocks.
+func (sm *SyncManager) commitWindowJobPrepare(ctx context.Context, job windowFlushJob) bool {
+	blocks := job.blocks
+	if len(blocks) == 0 {
+		return false
+	}
+
+	sm.logger.Debugf("[windowPipeline] flushing window of %d blocks to PrepareBlockWindow", len(blocks))
+
+	perBlock := sm.settings.Legacy.PeerProcessingTimeout
+	if perBlock <= 0 {
+		perBlock = 3 * time.Minute
+	}
+
+	deadline := perBlock * time.Duration(len(blocks)) //nolint:gosec
+	prepareCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	err := sm.blockValidation.PrepareBlockWindow(prepareCtx, blocks, "", "legacy")
+	if err == nil {
+		return false
+	}
+
+	sm.logger.Warnf("[windowPipeline] PrepareBlockWindow error, entering bounded recovery: %v", err)
+
+	if recErr := sm.recoverWindowPrepare(ctx, blocks); recErr != nil {
+		reason := fmt.Sprintf("post-ack window prepare unrecoverable after %d attempts, disconnecting to trigger sync peer rotation: %v", windowCommitRetryCap, recErr)
+		sm.logger.Errorf("[windowPipeline] %s", reason)
+
+		if sp := sm.loadSyncPeer(); sp != nil {
+			sp.DisconnectWithWarning(reason)
+		}
+
+		return true
+	}
+
+	return false
+}
+
+// commitWindowJobPrepareRecovered wraps commitWindowJobPrepare so a panic in
+// the prepare path is converted into the same fatal-poison outcome as an
+// unrecoverable prepare error, instead of killing prepareWorker — mirrors
+// commitWindowJobRecovered's panic-safety shape.
+func (sm *SyncManager) commitWindowJobPrepareRecovered(ctx context.Context, job windowFlushJob) (poison bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			poison = true
+
+			sm.logger.Errorf("[windowPipeline] recovered panic in window prepare, poisoning pipeline (no further windows prepared or committed): %v", r)
+		}
+	}()
+
+	return sm.commitWindowJobPrepare(ctx, job)
+}
+
+// commitWindowJobCommit is the COMMIT-stage half of the two-stage window
+// pipeline: it runs blockValidation.CommitBlockWindow (the idempotent
+// block-ID re-pass + the serial ascending C3 commitBlock loop) instead of the
+// whole ProcessBlockWindow. It releases window-block ownership exactly like
+// commitWindowJob (a job always stops here, whether committed or escalated),
+// via the same deferred sm.releaseWindowBlocks.
+func (sm *SyncManager) commitWindowJobCommit(ctx context.Context, job windowFlushJob) bool {
+	blocks := job.blocks
+	if len(blocks) == 0 {
+		return false
+	}
+
+	defer sm.releaseWindowBlocks(blocks)
+
+	sm.logger.Debugf("[windowPipeline] flushing window of %d blocks to CommitBlockWindow", len(blocks))
+
+	perBlock := sm.settings.Legacy.PeerProcessingTimeout
+	if perBlock <= 0 {
+		perBlock = 3 * time.Minute
+	}
+
+	deadline := perBlock * time.Duration(len(blocks)) //nolint:gosec
+	commitCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	err := sm.blockValidation.CommitBlockWindow(commitCtx, blocks, "", "legacy")
+	if err == nil {
+		sm.markDiskBlocksCommitted(ctx, blocks)
+		return false
+	}
+
+	sm.logger.Warnf("[windowPipeline] CommitBlockWindow error, entering bounded recovery: %v", err)
+
+	if recErr := sm.recoverWindowCommit(ctx, blocks); recErr != nil {
+		reason := fmt.Sprintf("post-ack window commit unrecoverable after %d attempts, disconnecting to trigger sync peer rotation: %v", windowCommitRetryCap, recErr)
+		sm.logger.Errorf("[windowPipeline] %s", reason)
+
+		if sp := sm.loadSyncPeer(); sp != nil {
+			sp.DisconnectWithWarning(reason)
+		}
+
+		return true
+	}
+
+	sm.markDiskBlocksCommitted(ctx, blocks)
+
+	return false
+}
+
+// commitWindowJobCommitRecovered wraps commitWindowJobCommit so a panic in
+// the commit path is converted into the same fatal-poison outcome as an
+// unrecoverable commit error, instead of killing commitWorker — mirrors
+// commitWindowJobRecovered's panic-safety shape.
+func (sm *SyncManager) commitWindowJobCommitRecovered(ctx context.Context, job windowFlushJob) (poison bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			poison = true
+
+			sm.logger.Errorf("[windowPipeline] recovered panic in window commit, poisoning pipeline (no further windows committed): %v", r)
+		}
+	}()
+
+	return sm.commitWindowJobCommit(ctx, job)
+}
+
+// prepareWorker is the PREPARE-stage worker of the two-stage window pipeline
+// (legacy_pipelineWindowCommit). It mirrors flushWorker's FIFO consume loop
+// but calls PrepareBlockWindow (C1/C2) instead of the whole ProcessBlockWindow,
+// then forwards each successfully-prepared job to commitJobs for commitWorker
+// to run CommitWindow (C3) — this is what lets window N+1's prepare overlap
+// window N's serial commit tail.
+//
+// The poison latch is the SHARED sm.windowPoisoned atomic (not a goroutine-
+// local bool, unlike flushWorker): a fatal failure in EITHER stage must stop
+// both further prepares and further commits. prepareWorker never CLEARS the
+// latch itself — only commitWorker does, since only it observes genuinely
+// committed chain state (windowRelinksAfterPoison needs GetBestBlockHeader).
+// It DOES consult windowRelinksAfterPoison (read-only) while poisoned, so a
+// genuine post-rotation re-fetched window (tip-aligned) is still prepared
+// instead of discarded outright — otherwise the un-poison self-heal that
+// flushWorker relies on today could never reach commitWorker to clear the
+// latch, permanently wedging the pipeline after one transient failure. A
+// window that is NOT tip-aligned (still part of the old doomed continuation)
+// is discarded here without spending prepare work on it.
+//
+// prepareWorker is the sole writer of commitJobs, so it alone closes it, once
+// its own consumption of jobs ends — mirroring the single-writer-closes
+// discipline the drain goroutine uses for jobs itself.
+func (sm *SyncManager) prepareWorker(ctx context.Context, jobs <-chan windowFlushJob, commitJobs chan<- windowFlushJob) {
+	defer close(commitJobs)
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Context cancelled: drain without preparing or forwarding any
+			// further window, releasing ownership and unblocking any barrier
+			// waiter on each drained job — mirrors flushWorker's ctx.Done()
+			// branch exactly.
+			for job := range jobs {
+				sm.releaseWindowBlocks(job.blocks)
+
+				if job.done != nil {
+					close(job.done)
+				}
+			}
+
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+
+			if sm.windowPoisoned.Load() {
+				if sm.windowRelinksAfterPoison(ctx, job) {
+					sm.logger.Debugf("[windowPipeline] tip-aligned window (first height %d) arrived while poisoned; preparing (commit stage will confirm and clear the latch)", job.blocks[0].Height)
+				} else {
+					sm.logger.Warnf("[windowPipeline] poisoned, discarding queued window of %d blocks before prepare", len(job.blocks))
+					sm.releaseWindowBlocks(job.blocks)
+
+					if job.done != nil {
+						close(job.done)
+					}
+
+					continue
+				}
+			}
+
+			if sm.commitWindowJobPrepareRecovered(ctx, job) {
+				if len(job.blocks) > 0 {
+					sm.windowPoisonedFirstHeight.Store(job.blocks[0].Height)
+				}
+				sm.windowPoisoned.Store(true)
+				sm.releaseWindowBlocks(job.blocks)
+
+				if job.done != nil {
+					close(job.done)
+				}
+
+				continue
+			}
+
+			// Prepared (or already fully committed via recovery): forward to
+			// the commit stage. Ownership and the barrier channel travel WITH
+			// the job — commitWorker is guaranteed to keep draining commitJobs
+			// (committing or not, depending on ctx/poison state) until THIS
+			// worker closes it, so this send can never block forever.
+			commitJobs <- job
+		}
+	}
+}
+
+// windowJobBelowPoisonedGap reports whether job is entirely below gapHeight,
+// the first height of the window whose fatal failure most recently set the
+// shared poison latch (0 = not currently poisoned / no gap recorded, always
+// false). Such a window was queued/prepared before the poisoning failure and
+// does not depend on it, so committing it is safe — see commitWorker's use of
+// this (adversarial review Finding 1): a merely tip-aligned pre-poison window
+// must not be mistaken for the genuine post-rotation resync of the gap, or a
+// later, still-missing window can slip through and commit off-chain.
+func windowJobBelowPoisonedGap(job windowFlushJob, gapHeight uint32) bool {
+	if gapHeight == 0 || len(job.blocks) == 0 {
+		return false
+	}
+
+	return job.blocks[len(job.blocks)-1].Height < gapHeight
+}
+
+// commitWorker is the COMMIT-stage worker of the two-stage window pipeline
+// (legacy_pipelineWindowCommit). It is the SOLE committer of windowed blocks
+// under the flag, consuming commitJobs strictly FIFO (ascending, contiguous —
+// the same guarantee flushWorker provides today) and running CommitWindow
+// (C3) via commitWindowJobCommitRecovered.
+//
+// Mirrors flushWorker's poison/un-poison structure exactly, but against the
+// SHARED sm.windowPoisoned atomic instead of a local bool: only commitWorker
+// ever clears the latch (windowRelinksAfterPoison needs genuinely committed
+// state via GetBestBlockHeader, which only this worker's own successful
+// commits produce).
+func (sm *SyncManager) commitWorker(ctx context.Context, commitJobs <-chan windowFlushJob) {
+	for {
+		select {
+		case <-ctx.Done():
+			// Context cancelled: drain without committing further, releasing
+			// ownership and unblocking any barrier waiter on each drained job
+			// — mirrors flushWorker's ctx.Done() branch exactly. commitJobs is
+			// closed by prepareWorker once its own loop ends, so this range
+			// terminates.
+			for job := range commitJobs {
+				sm.releaseWindowBlocks(job.blocks)
+
+				if job.done != nil {
+					close(job.done)
+				}
+			}
+
+			return
+		case job, ok := <-commitJobs:
+			if !ok {
+				return
+			}
+
+			poisonedNow := sm.windowPoisoned.Load()
+
+			// A window entirely BELOW the height that triggered the current poison
+			// was already queued/prepared before that failure and does not depend
+			// on it — this is exactly what flushWorker's single-worker FIFO would
+			// already have committed before ever reaching the later, failing
+			// window (e.g. a prepare-stage failure on window N+1 while window N-1
+			// still sits, already prepared, in commitJobs). Commit it, but do NOT
+			// let it clear the latch: the gap at windowPoisonedFirstHeight is
+			// still unresolved, and only a window whose commit reaches or crosses
+			// that height can be the genuine post-rotation resync. Without this
+			// distinction a merely tip-aligned pre-poison window incorrectly
+			// cleared the shared latch, letting a later, still-missing window
+			// commit off-chain (adversarial review Finding 1).
+			belowGap := poisonedNow && windowJobBelowPoisonedGap(job, sm.windowPoisonedFirstHeight.Load())
+
+			if poisonedNow && !belowGap && sm.windowRelinksAfterPoison(ctx, job) {
+				sm.logger.Warnf("[windowPipeline] tip-aligned window (first height %d) arrived after poison; clearing latch and retrying commit", job.blocks[0].Height)
+				sm.windowPoisoned.Store(false)
+				sm.windowPoisonedFirstHeight.Store(0)
+				poisonedNow = false
+			}
+
+			if poisonedNow && !belowGap {
+				// A prior window hit a fatal gap; commit no later window. The
+				// discarded blocks re-sync after rotation/restart, so their
+				// ownership must be released or the re-delivery is skipped
+				// forever.
+				sm.logger.Warnf("[windowPipeline] poisoned after fatal window failure, discarding queued window of %d blocks", len(job.blocks))
+				sm.releaseWindowBlocks(job.blocks)
+			} else if sm.commitWindowJobCommitRecovered(ctx, job) {
+				sm.windowPoisoned.Store(true)
+				if len(job.blocks) > 0 {
+					sm.windowPoisonedFirstHeight.Store(job.blocks[0].Height)
+				}
+			}
+
+			// Release any barrier waiter AFTER the job has been fully handled
+			// (committed, or skipped when poisoned). commitWorker is the ONLY
+			// place job.done is closed for a job that reached the commit
+			// stage, so "done" means "committed" (or genuinely poison-skipped)
+			// exactly as the contract requires.
+			if job.done != nil {
+				close(job.done)
+			}
+		}
+	}
+}
+
+// startWindowFlushWorkers launches the window-commit worker(s) for jobs,
+// honouring legacy_pipelineWindowCommit. It is the ONLY place that decides
+// between the flag-off single flushWorker and the flag-on two-stage
+// prepareWorker/commitWorker pipeline, factored out of blockHandler's setup
+// goroutine so the decision itself is directly unit-testable (I6: proving the
+// flag-off path never constructs the two-stage machinery — the commitJobs
+// channel, prepareWorker, commitWorker — at all, not merely that it behaves
+// the same).
+//
+// Flag off (default): starts the single flushWorker on jobs and returns nil —
+// no commitJobs channel is ever allocated and neither prepareWorker nor
+// commitWorker is ever started.
+//
+// Flag on: allocates a fresh depth-1 commitJobs channel, starts prepareWorker
+// (jobs -> commitJobs) and commitWorker (commitJobs), and returns commitJobs
+// (callers that don't need it, e.g. blockHandler's setup goroutine, simply
+// discard the return value).
+func (sm *SyncManager) startWindowFlushWorkers(jobs chan windowFlushJob) chan windowFlushJob {
+	if sm.settings.Legacy.PipelineWindowCommit {
+		commitJobs := make(chan windowFlushJob, 1)
+		go sm.prepareWorker(sm.ctx, jobs, commitJobs)
+		go sm.commitWorker(sm.ctx, commitJobs)
+
+		return commitJobs
+	}
+
+	go sm.flushWorker(sm.ctx, jobs)
+
+	return nil
+}
+
 // ackWindowedBlock sends the accept-time ack for a block that has just been
 // added to the window, applying withhold-on-full back-pressure. It runs on the
 // single drain goroutine after wa.add.
@@ -8157,7 +8613,7 @@ func (sm *SyncManager) blockHandler() {
 
 		if windowEnabled {
 			jobs = make(chan windowFlushJob, 1)
-			go sm.flushWorker(sm.ctx, jobs)
+			sm.startWindowFlushWorkers(jobs)
 		}
 
 		// Continuous-refill ticker: fires maintainInFlightWindow on THIS drain
