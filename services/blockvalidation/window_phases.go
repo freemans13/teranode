@@ -427,6 +427,10 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		return nil
 	}
 
+	// Window wall-clock timers: decision data for the commit-pipelining design —
+	// how much of a window's time is postgres prepare (C1/C2) vs the serial C3 tail.
+	tWindowStart := time.Now()
+
 	// --- Pool-budget fail-closed guard (only when the barrier-collapse flag is ON). ---
 	// Collapsing the C1->C2 barrier makes the create AND spend batchers hot at the same
 	// time, so peak in-flight pool demand becomes ~2*BatcherMaxConcurrent. If that exceeds
@@ -480,6 +484,14 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 			return err
 		}
 	}
+
+	// End of the serial pre-pass (guards + block-ID assignment); C1 starts here.
+	tPrepassDone := time.Now()
+
+	// c1Dur/c2Dur are only separable on the phased path; the overlap path interleaves
+	// creates and spends in one errgroup, so there they stay zero and the combined
+	// prepare duration is what gets reported.
+	var c1Dur, c2Dur time.Duration
 
 	// --- Shared cross-block goroutine limiter (off-heap stack memory control). ---
 	// ONE semaphore for the whole window, shared by C1 (create) and C2 (spend), sizes
@@ -543,6 +555,7 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		if err := c1g.Wait(); err != nil {
 			return err
 		}
+		c1Dur = time.Since(tPrepassDone)
 
 		// --- C2: parallel spends. ---
 		c2g, c2ctx := errgroup.WithContext(ctx)
@@ -562,6 +575,7 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		if err := c2g.Wait(); err != nil {
 			return err
 		}
+		c2Dur = time.Since(tPrepassDone) - c1Dur
 	} else {
 		// -----------------------------------------------------------------------
 		// OVERLAP path (WindowBarrierCollapse=true): collapse the C1→C2 barrier so
@@ -653,6 +667,9 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		}
 	}
 
+	// Prepare (C1+C2, whichever path) ends here; the serial C3 tail starts.
+	tC3Start := time.Now()
+
 	// --- C3: serial commits in ascending height order. ---
 	// blocks is already sorted ascending by Height (caller contract).
 	// commitBlock calls AddBlock (a thin wrapper over StoreBlock); there is no
@@ -675,6 +692,20 @@ func (u *BlockValidation) ProcessBlockWindow(ctx context.Context, blocks []*mode
 		}
 		lastCommittedHeight = blk.Height
 	}
+
+	// Single-line timing report (INFO so it lands in the default live logs): the
+	// prepare-vs-commit split is the go/no-go number for the pipelining design.
+	var txCount uint64
+	for _, blk := range blocks {
+		txCount += blk.TransactionCount
+	}
+	u.logger.Infof("[ProcessBlockWindow] timing blocks=%d txs=%d heights=%d-%d prepass=%v c1=%v c2=%v prepare=%v commit=%v total=%v",
+		k, txCount, blocks[0].Height, blocks[k-1].Height,
+		tPrepassDone.Sub(tWindowStart).Round(time.Millisecond),
+		c1Dur.Round(time.Millisecond), c2Dur.Round(time.Millisecond),
+		tC3Start.Sub(tPrepassDone).Round(time.Millisecond),
+		time.Since(tC3Start).Round(time.Millisecond),
+		time.Since(tWindowStart).Round(time.Millisecond))
 
 	u.logger.Debugf("[ProcessBlockWindow] completed window of %d blocks (heights %d–%d)", k, blocks[0].Height, blocks[k-1].Height)
 	return nil
