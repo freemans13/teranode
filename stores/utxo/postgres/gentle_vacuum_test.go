@@ -94,3 +94,39 @@ func TestGentleVacuum_ProfileApplied(t *testing.T) {
 	require.True(t, spends["autovacuum_vacuum_cost_delay=20"],
 		"gentle profile must throttle the spends leaves")
 }
+
+// TestGentleVacuum_ExistingPartitionsLeftAlone is the core contract of the
+// set-once-then-leave-it design: teranode stamps the autovacuum profile only when a
+// leaf is FIRST created; a later startup must NOT re-stamp it, so out-of-band
+// operator tuning survives restarts (the bug this fixes: a hand-throttled autovacuum
+// reverting to the aggressive default every restart).
+func TestGentleVacuum_ExistingPartitionsLeftAlone(t *testing.T) {
+	ctx := context.Background()
+
+	pool, err := pgxpool.New(ctx, testDSN)
+	if err != nil || pool.Ping(ctx) != nil {
+		t.Skip("no postgres")
+	}
+	defer pool.Close()
+
+	logger := ulogger.TestLogger{}
+
+	// First creation stamps the (aggressive) default.
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS txs, spends CASCADE`)
+	require.NoError(t, createSchemaInternalFF(ctx, pool, nil, logger, 50, false))
+	require.True(t, leafReloptions(t, pool, ctx, "txs_p00")["autovacuum_vacuum_cost_delay=0"])
+
+	// Ops tunes it out-of-band to a value teranode's profile would never set.
+	_, err = pool.Exec(ctx, `ALTER TABLE txs_p00 SET (autovacuum_vacuum_cost_delay = 37)`)
+	require.NoError(t, err)
+
+	// A subsequent startup (even with the OPPOSITE gentle setting) must leave the
+	// existing leaf's reloptions untouched.
+	require.NoError(t, createSchemaInternalFF(ctx, pool, nil, logger, 50, true))
+
+	after := leafReloptions(t, pool, ctx, "txs_p00")
+	require.True(t, after["autovacuum_vacuum_cost_delay=37"],
+		"an already-created leaf's operator tuning must survive a restart untouched")
+	require.False(t, after["autovacuum_vacuum_cost_delay=20"],
+		"teranode must NOT re-stamp its profile onto an existing leaf")
+}

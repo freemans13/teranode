@@ -170,19 +170,40 @@ func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *
 	}
 	for _, spec := range tables {
 		for i := 0; i < numPartitions; i++ {
-			ddl := fmt.Sprintf(
-				"CREATE TABLE IF NOT EXISTS %s_p%02d PARTITION OF %s FOR VALUES WITH (MODULUS %d, REMAINDER %d) WITH (fillfactor = %d)",
-				spec.name, i, spec.name, numPartitions, i, spec.fillfactor,
-			)
-			if _, err := pool.Exec(ctx, ddl); err != nil {
-				return errors.NewStorageError("partition creation failed for %s_p%02d", spec.name, i, err)
+			leaf := fmt.Sprintf("%s_p%02d", spec.name, i)
+
+			// Stamp the autovacuum profile ONLY when the leaf is first created, then
+			// leave it alone. Re-applying it on every startup clobbered any out-of-band
+			// tuning an operator had set (the reason a hand-throttled autovacuum kept
+			// reverting to the aggressive default on restart). teranode sets a sane
+			// default at creation; ops/devops own it thereafter. Existence is checked
+			// BEFORE the CREATE so the CREATE-vs-ALTER decision is based on the
+			// pre-create state.
+			var existed bool
+			if err := pool.QueryRow(ctx,
+				"SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname=$1 AND relkind='r')", leaf,
+			).Scan(&existed); err != nil {
+				return errors.NewStorageError("partition existence check failed for %s", leaf, err)
 			}
 
-			// Idempotent: also back-fills partitions created before these settings
-			// existed. Set on the leaf (autovacuum ignores parent-level params).
-			av := fmt.Sprintf("ALTER TABLE %s_p%02d SET (%s)", spec.name, i, spec.autovacuum)
+			ddl := fmt.Sprintf(
+				"CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES WITH (MODULUS %d, REMAINDER %d) WITH (fillfactor = %d)",
+				leaf, spec.name, numPartitions, i, spec.fillfactor,
+			)
+			if _, err := pool.Exec(ctx, ddl); err != nil {
+				return errors.NewStorageError("partition creation failed for %s", leaf, err)
+			}
+
+			if existed {
+				// Already created on a prior run — its storage params belong to ops now.
+				continue
+			}
+
+			// First creation: stamp the default profile on the leaf (autovacuum ignores
+			// parent-level params).
+			av := fmt.Sprintf("ALTER TABLE %s SET (%s)", leaf, spec.autovacuum)
 			if _, err := pool.Exec(ctx, av); err != nil {
-				return errors.NewStorageError("autovacuum tuning failed for %s_p%02d", spec.name, i, err)
+				return errors.NewStorageError("autovacuum tuning failed for %s", leaf, err)
 			}
 		}
 	}
