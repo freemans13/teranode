@@ -4664,8 +4664,9 @@ func (sm *SyncManager) maintainInFlightWindow() {
 	// distribute the header-runway walk across up to ParallelFetchPeers eligible
 	// peers (the sync peer plus others), assigning each walked block to exactly
 	// ONE peer. This supersedes the single-peer fetchHeaderBlocks top-up (the sync
-	// peer is one of the N fetch peers). assignBlocksAcrossPeers falls back to
-	// fetchHeaderBlocks internally when fewer than 2 targets are eligible.
+	// peer is one of the N fetch peers). assignBlocksAcrossPeers runs its full
+	// pass (orphan drain + walk) for ANY number of spare targets >= 1 — svnode
+	// alignment, see the livelock note inside it.
 	//
 	// When ParallelFetchPeers <= 1 (flag-off) the path is byte-identical to the
 	// pre-feature single-peer behaviour: no eligibleFetchPeers call, no new alloc,
@@ -4729,9 +4730,10 @@ type fetchTarget struct {
 //     AFTER that peer's getdata send succeeds (phantom-free, like
 //     fetchHeaderBlocks). A dropped send leaves no in-flight entry.
 //
-// Falls back to the single-peer fetchHeaderBlocks when fewer than 2 targets are
-// assignable, so the byte-identical single-peer path is preserved whenever
-// parallelism cannot actually be exercised.
+// Runs the full pass (orphan drain first, then the frontier walk) for ANY
+// target count >= 1 — including a single spare peer — so the refetch queue is
+// always drainable by whoever has capacity (svnode: the want-list is re-derived
+// for every peer with a free slot). Returns only when NO peer has spare.
 func (sm *SyncManager) assignBlocksAcrossPeers() {
 	sp := sm.loadSyncPeer()
 	if sp == nil {
@@ -4747,7 +4749,10 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 
 	// Build the fetch-peer set: the sync peer PLUS up to (ParallelFetchPeers-1)
 	// other eligible peers. The sync peer is one of the N fetch peers now.
-	k := sm.settings.Legacy.MaxBlocksInTransitPerPeer
+	// maxInFlightPerPeer (not the raw setting): clamps a misconfigured <= 0 value
+	// to 1, so a bad config degrades to slow fetching instead of computing zero
+	// spare for every peer and silently never fetching at all.
+	k := sm.maxInFlightPerPeer()
 
 	targets := make([]*fetchTarget, 0, sm.settings.Legacy.ParallelFetchPeers)
 	appendTarget := func(p *peerpkg.Peer, st *peerSyncState) {
@@ -4769,13 +4774,22 @@ func (sm *SyncManager) assignBlocksAcrossPeers() {
 		appendTarget(p, st)
 	}
 
-	// Fall back to the single-peer path when parallelism cannot be exercised
-	// (fewer than 2 peers with spare capacity). This keeps behaviour identical to
-	// the pre-multi-peer top-up when only one peer is usable.
-	if len(targets) < 2 {
-		if syncState.requestedBlocks.Len() < sm.maxInFlightPerPeer() {
-			sm.fetchHeaderBlocks()
-		}
+	// svnode alignment: ANY peer with spare capacity runs the full scheduler pass —
+	// orphan drain first (drainRefetchBlocks), then the frontier walk. The previous
+	// fallback here routed len(targets) < 2 to the sync-peer-only fetchHeaderBlocks(),
+	// which never touches the refetch queue: with the sync peer at its in-flight cap
+	// and exactly one OTHER peer spare (a routine state on 10-50MB blocks, where
+	// peers legitimately sit at MaxBlocksInTransitPerPeer for whole transfer times),
+	// an orphaned frontier block had NO surviving re-request path — the proven
+	// "restart -> flurry -> stall" livelock (2026-07-24 forensics): commit, block
+	// assembly and the DAH sweep all idle behind one lost block until a process
+	// restart zeroed the peer bookkeeping. svnode has no such state by construction:
+	// FindNextBlocksToDownload re-derives the want-list (¬hasData ∧ ¬inFlight) for
+	// every peer with a free slot (net_processing.cpp:335), which is exactly what
+	// running this pass with a single target restores. With ZERO spare targets there
+	// is nobody to send to — return and let the next tick (or checkHeadStall freeing
+	// a stale claim) retry.
+	if len(targets) == 0 {
 		return
 	}
 
@@ -5707,7 +5721,11 @@ func (sm *SyncManager) logFrontier(now time.Time) {
 	}
 	sm.assignedMu.Unlock()
 
-	sm.logger.Infof("[frontier] headerFrontier=%d headerListLen=%d committedHeight=%d assignedBlocks=%d inFlightRacers=%d headerProgressAge=%s",
+	// assemblyHeight (NOT committedHeight): this is cachedBlockAssemblyHeight, the
+	// block-assembly service's polled height. It was previously labelled
+	// "committedHeight", which repeatedly misdirected stall diagnosis toward the
+	// commit path when assembly was merely lagging (2026-07-24 forensics).
+	sm.logger.Infof("[frontier] headerFrontier=%d headerListLen=%d assemblyHeight=%d assignedBlocks=%d inFlightRacers=%d headerProgressAge=%s",
 		frontierHeight, headerListLen, sm.cachedBlockAssemblyHeight.Load(), assigned, inFlightRacers, sm.headerProgressAge())
 }
 
@@ -5888,6 +5906,18 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 		}
 
 		sm.primeHeadStallSample(headPeer, now)
+
+		// Sole-peer guard (adversarial review of the livelock fix, finding 1):
+		// freeing the head block away from the ONLY eligible peer just re-hands it
+		// to the SAME peer next tick — a duplicate getdata for a block it is
+		// already mid-transfer on, repeated every BlockStallTimeout. svnode's
+		// stall response likewise presumes another peer to switch to. Keep the
+		// sample warm (above) so the F2 gate is measured, and retry once an
+		// alternative peer exists.
+		if !sm.hasAlternativeFetchPeer(headPeer) {
+			return
+		}
+
 		sm.freeHeadBlockForRace(headHash, headPeer)
 
 		return
@@ -5905,7 +5935,27 @@ func (sm *SyncManager) checkHeadStall(now time.Time) {
 		return
 	}
 
+	// Sole-peer guard (finding 1): executing the ONLY eligible peer cannot help —
+	// after the expensive reconnect (updateSyncPeer -> resetHeaderState) the block
+	// can only be re-assigned back to the same peer, and on a genuinely slow sole
+	// link the first fat block never completes: a hard 30s disconnect/reconnect
+	// loop. Keep the peer; the transfer finishes eventually, or a second peer
+	// arrives and normal stall handling resumes. The explicit rollback path above
+	// (HeadStallDisconnectTimeout <= 0) is deliberately NOT guarded — it is
+	// documented byte-identical to pre-F1/F2 behaviour.
+	if !sm.hasAlternativeFetchPeer(headPeer) {
+		return
+	}
+
 	sm.disconnectStalledHead(headHash, headHeight, headAt, headPeer, disconnectTimeout, now)
+}
+
+// hasAlternativeFetchPeer reports whether at least one eligible fetch peer other
+// than exclude exists — the precondition for any head-stall response that frees
+// or executes a peer (moving or disconnecting the sole peer can never help; the
+// block has nowhere else to go).
+func (sm *SyncManager) hasAlternativeFetchPeer(exclude *peerpkg.Peer) bool {
+	return len(sm.eligibleFetchPeers(exclude, 1)) > 0
 }
 
 // disconnectStalledHead drops the single peer holding a head block that neither

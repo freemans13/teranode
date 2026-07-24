@@ -98,6 +98,21 @@ func TestCheckHeadStall_SuppressedWhileBackpressured(t *testing.T) {
 	p, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "127.0.0.1:8333")
 	require.NoError(t, err)
 
+	// An ALTERNATIVE eligible peer must exist for any head-stall response to fire:
+	// freeing/executing the sole peer can never help (the block has nowhere else to
+	// go), so checkHeadStall no-ops without one — see hasAlternativeFetchPeer and
+	// TestCheckHeadStall_SolePeerNeverFires.
+	alt, err := peerpkg.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peerpkg.Config{}, "127.0.0.2:8333")
+	require.NoError(t, err)
+	alt.TstMarkConnected()
+
+	altState := newEligiblePeerState()
+
+	t.Cleanup(func() {
+		altState.requestedBlocks.Stop()
+		altState.requestedTxns.Stop()
+	})
+
 	h := chainhash.Hash{0xee}
 
 	newSM := func() *SyncManager {
@@ -111,6 +126,7 @@ func TestCheckHeadStall_SuppressedWhileBackpressured(t *testing.T) {
 			requestedBlocks:   expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 			peerStates:        txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		}
+		sm.peerStates.Set(alt, altState)
 		t.Cleanup(func() { sm.requestedBlocks.Stop() })
 
 		return sm
