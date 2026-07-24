@@ -3,6 +3,7 @@ package options
 import (
 	"net/url"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
@@ -254,4 +255,49 @@ func TestQueryToFileOptions(t *testing.T) {
 		options := NewFileOptions(opts...)
 		assert.Equal(t, uint32(0), options.DAH)
 	})
+}
+
+// TestAbsCachedMatchesFilepathAbs verifies the cached-cwd helper is behaviourally
+// identical to filepath.Abs (which it replaces on the hot path to avoid a per-call
+// os.Getwd). Both absolute and relative inputs must resolve the same way.
+func TestAbsCachedMatchesFilepathAbs(t *testing.T) {
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+
+	cases := []string{
+		"relative/path",
+		"./dot/relative",
+		"nested/../cleaned",
+		filepath.Join(wd, "already", "absolute"),
+		"/tmp/absolute/path",
+		"",
+	}
+
+	for _, in := range cases {
+		want, wantErr := filepath.Abs(in)
+		got, gotErr := absCached(in)
+
+		if wantErr != nil {
+			require.Error(t, gotErr, "input %q", in)
+			continue
+		}
+
+		require.NoError(t, gotErr, "input %q", in)
+		require.Equal(t, want, got, "absCached must match filepath.Abs for %q", in)
+	}
+}
+
+// TestValidatePathWithinBase confirms the path-traversal guard still accepts paths
+// inside the base and rejects escapes after the switch to absCached — the safety
+// contract must be unchanged by the allocation optimisation.
+func TestValidatePathWithinBase(t *testing.T) {
+	base := t.TempDir()
+
+	// Within base: the base itself, and a nested folder under it.
+	require.NoError(t, validatePathWithinBase(base, base))
+	require.NoError(t, validatePathWithinBase(base, filepath.Join(base, "sub", "dir")))
+
+	// Escapes: a sibling directory and a parent-traversal must be rejected.
+	require.Error(t, validatePathWithinBase(base, filepath.Join(base, "..", "sibling")))
+	require.Error(t, validatePathWithinBase(base, filepath.Dir(base)))
 }

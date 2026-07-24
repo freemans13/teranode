@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
@@ -334,15 +335,45 @@ func QueryToFileOptions(query url.Values) []FileOption {
 	return opts
 }
 
+var (
+	cachedCwd     string
+	cachedCwdErr  error
+	cachedCwdOnce sync.Once
+)
+
+// absCached is filepath.Abs but with the process working directory resolved only once.
+// filepath.Abs calls os.Getwd() (which stats the filesystem and allocates) on every
+// invocation for a relative path; the working directory does not change during a run, so
+// caching it removes that per-call cost. This matters because validatePathWithinBase runs
+// for every blob file constructed during sync — os.Getwd was ~3.4 GB of allocation and a
+// steady stat storm in the IBD hot path. Behaviour matches filepath.Abs exactly: an
+// already-absolute path is just cleaned; a relative path is joined onto the cached cwd
+// (filepath.Join cleans the result).
+func absCached(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+
+	cachedCwdOnce.Do(func() {
+		cachedCwd, cachedCwdErr = os.Getwd()
+	})
+
+	if cachedCwdErr != nil {
+		return "", cachedCwdErr
+	}
+
+	return filepath.Join(cachedCwd, path), nil
+}
+
 // validatePathWithinBase ensures the resolved path stays within basePath to prevent
 // path traversal attacks. It resolves both paths to absolute form and checks that
 // the target path is a subdirectory of the base path.
 func validatePathWithinBase(basePath, targetPath string) error {
-	absBase, err := filepath.Abs(basePath)
+	absBase, err := absCached(basePath)
 	if err != nil {
 		return err
 	}
-	absTarget, err := filepath.Abs(targetPath)
+	absTarget, err := absCached(targetPath)
 	if err != nil {
 		return err
 	}
