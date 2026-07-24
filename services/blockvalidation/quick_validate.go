@@ -1670,8 +1670,13 @@ func (u *BlockValidation) extendBatch(
 				}
 			}
 
-			extendedTxs[*tx.TxIDChainHash()] = tx
-			tx.SetTxHash(tx.TxIDChainHash())
+			// Compute the txid once and cache it on the tx. TxIDChainHash serializes
+			// the whole tx and double-hashes it on a cache miss (tx.txHash unset), so
+			// the previous two back-to-back calls hashed each tx twice. SetTxHash
+			// populates the cache so this and any later TxIDChainHash call is free.
+			txid := tx.TxIDChainHash()
+			tx.SetTxHash(txid)
+			extendedTxs[*txid] = tx
 			batch.batchTxs = append(batch.batchTxs, tx)
 		}
 		batch.txRanges[i] = [2]int{startIdx, len(batch.batchTxs)}
