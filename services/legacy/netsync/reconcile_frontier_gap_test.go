@@ -132,13 +132,42 @@ func TestReconcileFrontierGap_SkipsLeadingSeed(t *testing.T) {
 	require.True(t, queued, "the real frontier below the seed must be re-enqueued")
 }
 
-// TestReconcileFrontierGap_LiveFrontierNotRefetched: frontier still outstanding
-// (in requestedBlocks) — never re-enqueued, even after the timeout.
-func TestReconcileFrontierGap_LiveFrontierNotRefetched(t *testing.T) {
+// TestReconcileFrontierGap_StalledInFlightFrontierReRaced: the core fix. A frontier
+// that is "in flight" ONLY in requestedBlocks (the single-peer fetchHeaderBlocks
+// path records no assignedTo) has a 60-MINUTE TTL, so a lingering entry is not a
+// liveness signal and is invisible to checkHeadStall. Once it has been stuck past
+// BlockInFlightTimeout it MUST be treated as stalled: the stale requestedBlocks entry
+// cleared (so drainRefetchBlocks actually re-sends) and the block re-enqueued to race
+// a fresh peer. Before this fix the tip froze for up to an hour on such a block.
+func TestReconcileFrontierGap_StalledInFlightFrontierReRaced(t *testing.T) {
+	sm := newFrontierGapSM(t, 3)
+	frontier := chainhash.Hash{0x01}
+	pushHeader(sm, frontier, 653071)
+	sm.requestedBlocks.Set(frontier, struct{}{}) // outstanding to a silently-non-delivering peer
+
+	base := time.Now()
+	sm.reconcileFrontierGap(base)                                           // arm the debounce
+	sm.reconcileFrontierGap(base.Add(frontierGapTestTimeout + time.Second)) // fire past the timeout
+
+	_, queued := sm.refetchBlocks[frontier]
+	require.True(t, queued,
+		"a frontier stuck in requestedBlocks past BlockInFlightTimeout (no assignedTo) must be re-enqueued to re-race")
+
+	_, stillInFlight := sm.requestedBlocks.Get(frontier)
+	require.False(t, stillInFlight,
+		"the stale in-flight entry must be cleared so drainRefetchBlocks actually re-sends the block")
+}
+
+// TestReconcileFrontierGap_AssignedFrontierLeftToCheckHeadStall: a frontier that IS
+// in assignedTo (multi-peer fetch) is owned by checkHeadStall's fast race/disconnect
+// (with its bandwidth gate); reconcileFrontierGap must NOT double-race it, even after
+// the timeout.
+func TestReconcileFrontierGap_AssignedFrontierLeftToCheckHeadStall(t *testing.T) {
 	sm := newFrontierGapSM(t, 3)
 	frontier := chainhash.Hash{0x01}
 	pushHeader(sm, frontier, 653071)
 	sm.requestedBlocks.Set(frontier, struct{}{})
+	sm.assignedTo[frontier] = map[*peer.Peer]time.Time{} // tracked for checkHeadStall
 
 	base := time.Now()
 	sm.reconcileFrontierGap(base)
@@ -146,7 +175,9 @@ func TestReconcileFrontierGap_LiveFrontierNotRefetched(t *testing.T) {
 
 	_, queued := sm.refetchBlocks[frontier]
 	require.False(t, queued,
-		"a frontier still outstanding (in requestedBlocks) must NOT be re-enqueued")
+		"an assignedTo frontier is checkHeadStall's to race; reconcileFrontierGap must leave it")
+	_, stillInFlight := sm.requestedBlocks.Get(frontier)
+	require.True(t, stillInFlight, "an assignedTo frontier's in-flight entry must be left intact")
 }
 
 // TestReconcileFrontierGap_WindowOwnedNotRefetched: frontier already arrived /

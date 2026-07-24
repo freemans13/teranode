@@ -5554,27 +5554,38 @@ func (sm *SyncManager) reconcileFrontierGap(now time.Time) {
 		return
 	}
 
-	// Not a stale cursor. If it is outstanding to a peer, already in hand
-	// (parked/committing) or already queued for re-fetch, it is progressing or
-	// already handled — re-arm the debounce and leave it.
-	notOrphaned := false
-	if _, inFlight := sm.requestedBlocks.Get(frontier); inFlight {
-		notOrphaned = true
-	} else if sm.windowBlockOwned(frontier) {
-		notOrphaned = true
+	// Not a stale cursor. Decide whether the frontier is genuinely being handled.
+	//
+	// GENUINELY PROGRESSING — leave it:
+	//   - windowBlockOwned: the block is parked or in a flush job (in hand).
+	//   - assignedTo: checkHeadStall owns the fast race/disconnect for a stalled
+	//     MULTI-peer assignment (BlockStallTimeout race, HeadStallDisconnectTimeout
+	//     drop, with a bandwidth gate). Duplicating that here would double-race it.
+	//   - refetchBlocks: already queued for the next drain pass.
+	//
+	// NOT a liveness signal (the fix): a bare requestedBlocks entry. Its TTL is 60
+	// MINUTES, and the single-peer fetchHeaderBlocks path records ONLY requestedBlocks
+	// (no assignedTo), so a frontier lost/stalled there is invisible to checkHeadStall
+	// and, treated as "in flight = fine", froze the tip for up to an hour while a peer
+	// silently failed to deliver it (the observed ~1-block-per-timeout crawl; hard
+	// freeze under download-to-disk, whose in-order validator hard-stops at this exact
+	// missing block). By the time we are here the frontier has been unchanged for >
+	// BlockInFlightTimeout, so a requestedBlocks entry that has NOT delivered it in that
+	// window is stale — clear it (drainRefetchBlocks skips still-in-flight hashes) and
+	// re-race to a fresh peer. This is svnode's stalling-timeout re-race of the peer
+	// pinning the frontier, applied to the one block that gates every commit.
+	if sm.windowBlockOwned(frontier) {
+		sm.frontierGapSince = now
+
+		return
 	}
 
-	if !notOrphaned {
-		sm.assignedMu.Lock()
-		if _, assigned := sm.assignedTo[frontier]; assigned {
-			notOrphaned = true
-		} else if _, queued := sm.refetchBlocks[frontier]; queued {
-			notOrphaned = true
-		}
-		sm.assignedMu.Unlock()
-	}
+	sm.assignedMu.Lock()
+	_, assigned := sm.assignedTo[frontier]
+	_, queued := sm.refetchBlocks[frontier]
+	sm.assignedMu.Unlock()
 
-	if notOrphaned {
+	if assigned || queued {
 		sm.frontierGapSince = now
 
 		return
@@ -5582,10 +5593,15 @@ func (sm *SyncManager) reconcileFrontierGap(now time.Time) {
 
 	orphanedFor := now.Sub(sm.frontierGapSince)
 
-	// Persisted orphan: outstanding to nobody for > BlockInFlightTimeout. Re-enqueue
-	// once and re-arm the debounce so we do not churn on every subsequent tick.
-	// drainRefetchBlocks re-checks haveInventory before sending, so a benign false
-	// positive self-corrects with no redundant getdata.
+	// Stuck > BlockInFlightTimeout in no fast-recovery ledger. Clear any stale
+	// requestedBlocks entry so the re-fetch actually re-sends, then enqueue once and
+	// re-arm the debounce so we do not churn every tick. drainRefetchBlocks re-checks
+	// haveInventory before sending, so a benign false positive self-corrects with no
+	// redundant getdata; a duplicate delivery is tolerated in IBD (and deduped on disk
+	// under download-to-disk).
+	_, wasInFlight := sm.requestedBlocks.Get(frontier)
+	sm.requestedBlocks.Delete(frontier)
+
 	sm.assignedMu.Lock()
 	if sm.refetchBlocks == nil {
 		sm.refetchBlocks = make(map[chainhash.Hash]struct{})
@@ -5596,7 +5612,7 @@ func (sm *SyncManager) reconcileFrontierGap(now time.Time) {
 
 	sm.frontierGapSince = now
 
-	sm.logger.Warnf("[reconcileFrontierGap] frontier block %s orphaned for %s (lost on the single-peer fetch path); re-enqueuing for re-fetch", frontier, orphanedFor)
+	sm.logger.Warnf("[reconcileFrontierGap] frontier block %s stuck %s (wasInFlight=%t, no fast-recovery ledger); clearing stale in-flight and re-racing to a fresh peer", frontier, orphanedFor, wasInFlight)
 }
 
 // realignFrontierIfCommitted trims every leading header-list node whose block is
