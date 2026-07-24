@@ -205,6 +205,21 @@ func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *
 			if _, err := pool.Exec(ctx, av); err != nil {
 				return errors.NewStorageError("autovacuum tuning failed for %s", leaf, err)
 			}
+
+			// txs carries raw_tx — a ~1 KB blob written once and never changed. Force it
+			// out-of-line into TOAST (paired with STORAGE EXTERNAL on the parent, applied
+			// in applyTxsColumnStorageTuning) so the SetMined / DAH row rewrites stop
+			// re-logging the untouched blob: measured ~63% less WAL per stamp on mainnet.
+			// STORAGE EXTERNAL alone only toasts rows over toast_tuple_target (default
+			// 2048) and txs rows are ~1 KB, so the target is lowered here to push them
+			// out. Set-once like the autovacuum profile above; ops owns it thereafter.
+			// toast_tuple_target is a per-leaf reloption (not inherited from the parent).
+			if spec.name == "txs" {
+				tt := fmt.Sprintf("ALTER TABLE %s SET (toast_tuple_target = 128)", leaf)
+				if _, err := pool.Exec(ctx, tt); err != nil {
+					return errors.NewStorageError("toast_tuple_target tuning failed for %s", leaf, err)
+				}
+			}
 		}
 	}
 
@@ -713,24 +728,28 @@ func applySpentBitmapMigration(ctx context.Context, pool *pgxpool.Pool) (bool, e
 }
 
 // applyTxsColumnStorageTuning applies the two per-column storage tunings on txs
-// (raw_tx → LZ4 compression, utxo_hashes → EXTERNAL storage). Each is pre-checked
+// (raw_tx → EXTERNAL storage, utxo_hashes → EXTERNAL storage). Each is pre-checked
 // against pg_attribute so an already-tuned database never re-issues the ALTER: the
 // ALTER takes an ACCESS EXCLUSIVE lock on txs even when the change is a no-op, and
 // that redundant lock can deadlock at startup against the DAH sweep's per-partition
 // locks (the same hazard applySpentBitmapMigration guards). The tunings are
-// non-fatal (performance only), but failures are logged — a missing ALTER privilege
-// or a Postgres build without liblz4 support would otherwise vanish silently.
+// non-fatal (performance only), but failures are logged.
 func applyTxsColumnStorageTuning(ctx context.Context, pool *pgxpool.Pool, logger ulogger.Logger) {
-	// raw_tx → LZ4 compression. attcompression is 'l' once set; the default
-	// (unset) renders as an empty string and 'p' is pglz — either means "apply it".
-	var compression string
+	// raw_tx → EXTERNAL storage (uncompressed, out-of-line). Measured on mainnet: raw_tx
+	// (BSV wire tx bytes — high-entropy signatures/pubkeys/hashes) compresses only ~6%,
+	// so LZ4/pglz burns compress+decompress CPU for almost no size gain. EXTERNAL skips
+	// that and, paired with the per-partition toast_tuple_target=128 stamped at creation,
+	// pushes the write-once raw_tx blob out-of-line so the SetMined/DAH row rewrites stop
+	// re-logging it — measured ~63% less WAL per stamp (4.6 KB → 1.7 KB). attstorage is
+	// 'e' once set. SET STORAGE recurses to the partitions and is inherited by new ones.
+	var rawStorage string
 	if err := pool.QueryRow(ctx, `
-		SELECT attcompression::text FROM pg_attribute
-		WHERE attrelid = 'txs'::regclass AND attname = 'raw_tx'`).Scan(&compression); err != nil {
-		logger.Warnf("[schema] could not read raw_tx compression, skipping LZ4 tuning: %v", err)
-	} else if compression != "l" {
-		if _, err := pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET COMPRESSION lz4`); err != nil {
-			logger.Warnf("[schema] ALTER txs.raw_tx SET COMPRESSION lz4 failed (tuning skipped): %v", err)
+		SELECT attstorage::text FROM pg_attribute
+		WHERE attrelid = 'txs'::regclass AND attname = 'raw_tx'`).Scan(&rawStorage); err != nil {
+		logger.Warnf("[schema] could not read raw_tx storage, skipping EXTERNAL tuning: %v", err)
+	} else if rawStorage != "e" {
+		if _, err := pool.Exec(ctx, `ALTER TABLE txs ALTER COLUMN raw_tx SET STORAGE EXTERNAL`); err != nil {
+			logger.Warnf("[schema] ALTER txs.raw_tx SET STORAGE EXTERNAL failed (tuning skipped): %v", err)
 		}
 	}
 
