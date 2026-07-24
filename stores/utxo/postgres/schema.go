@@ -34,7 +34,7 @@ import (
 //     (flat bytea + bitmaps + scalar counts). A single row lookup returns
 //     everything needed for spend validation — zero extra table JOINs.
 func (s *Store) createSchema(ctx context.Context) error {
-	if err := createSchemaInternalFF(ctx, s.pool, s.maintPool, s.logger, s.settings.UtxoStore.PostgresTxsFillfactor); err != nil {
+	if err := createSchemaInternalFF(ctx, s.pool, s.maintPool, s.logger, s.settings.UtxoStore.PostgresTxsFillfactor, s.settings.UtxoStore.PostgresGentleVacuum); err != nil {
 		return err
 	}
 
@@ -90,7 +90,7 @@ func createSchemaWithPoolFlag(ctx context.Context, pool *pgxpool.Pool, _ bool) e
 // delete_at_height) and unconditionally backfills+drops the legacy
 // px_delete_at_height BRIN index on txs — pending_deletes is the only pruner path.
 func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pgxpool.Pool, logger ulogger.Logger) error {
-	return createSchemaInternalFF(ctx, pool, maintPool, logger, 0)
+	return createSchemaInternalFF(ctx, pool, maintPool, logger, 0, false)
 }
 
 // createSchemaInternalFF is createSchemaInternal with an explicit txs
@@ -98,7 +98,7 @@ func createSchemaInternal(ctx context.Context, pool *pgxpool.Pool, maintPool *pg
 // an existing deployment keeps the fillfactor its leaves were built with.
 // Out-of-range values (including the 0 the compat wrappers pass) fall back to
 // the HOT-safe default of 50; see the partitionSpec comment for the trade.
-func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *pgxpool.Pool, logger ulogger.Logger, txsFillfactor int) error {
+func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *pgxpool.Pool, logger ulogger.Logger, txsFillfactor int, gentleVacuum bool) error {
 	if txsFillfactor < 10 || txsFillfactor > 100 {
 		txsFillfactor = 50
 	}
@@ -148,6 +148,25 @@ func createSchemaInternalFF(ctx context.Context, pool *pgxpool.Pool, maintPool *
 			"autovacuum_vacuum_cost_limit = 2000, " +
 			"autovacuum_vacuum_cost_delay = 2, " +
 			"autovacuum_analyze_scale_factor = 0.05"},
+	}
+
+	// Gentle-vacuum override (utxostore_postgresGentleVacuum): throttle autovacuum so
+	// it cannot saturate the disk and starve commits, for deployments that reclaim
+	// out-of-band (a threshold-triggered VACUUM FULL pack cycle during IBD). Applied
+	// to the leaf AND its TOAST (raw_tx lives in TOAST; the toast table has its own
+	// independent autovacuum, unthrottled by default). Bloat is bounded by the
+	// external pack cycle, not by this autovacuum — never enable without one.
+	if gentleVacuum {
+		const gentle = "autovacuum_vacuum_scale_factor = 0.2, " + commonAV +
+			"autovacuum_vacuum_cost_limit = 150, " +
+			"autovacuum_vacuum_cost_delay = 20, " +
+			"autovacuum_freeze_max_age = 500000000, " +
+			"toast.autovacuum_vacuum_scale_factor = 0.2, " +
+			"toast.autovacuum_vacuum_cost_limit = 150, " +
+			"toast.autovacuum_vacuum_cost_delay = 20"
+		for i := range tables {
+			tables[i].autovacuum = gentle
+		}
 	}
 	for _, spec := range tables {
 		for i := 0; i < numPartitions; i++ {

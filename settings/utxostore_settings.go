@@ -105,6 +105,17 @@ type UtxoStoreSettings struct {
 	// raise with the HOT-rate gate watched (n_tup_hot_upd/n_tup_upd >= 75%
 	// during sustained load; revert on breach).
 	PostgresTxsFillfactor int `key:"utxostore_postgresTxsFillfactor" desc:"fillfactor for txs leaf partitions (fresh schemas only)" default:"50" category:"UtxoStore" usage:"50=HOT-safe default; 60-70 = denser pages for cold reads, gate on HOT rate" type:"int"`
+
+	// PostgresGentleVacuum throttles the per-leaf autovacuum applied at schema
+	// creation. Default false = the store's aggressive reclaim profile (txs
+	// cost_limit=8000/cost_delay=0, scale_factor=0.01), correct when continuous
+	// autovacuum is the reclamation mechanism. Set true for deployments that reclaim
+	// out-of-band (e.g. a threshold-triggered VACUUM FULL pack-watchdog during IBD):
+	// autovacuum is throttled (cost_delay=20/cost_limit=150, scale_factor=0.2, on the
+	// leaves AND their TOAST) so it cannot saturate the disk and starve commits. The
+	// store re-applies these on every startup (schema.go is idempotent), so this is
+	// how the throttle survives restarts instead of being clobbered back to aggressive.
+	PostgresGentleVacuum bool `key:"utxostore_postgresGentleVacuum" desc:"throttle per-leaf autovacuum (for out-of-band pack-based reclaim during IBD) instead of the aggressive continuous-vacuum default" default:"false" category:"UtxoStore" usage:"false=aggressive continuous vacuum (default); true=throttled vacuum, pair with an external pack/reclaim cycle so bloat is still bounded" type:"bool"`
 	// Max estimated wire bytes per bulk-create INSERT (PostgreSQL store only). The
 	// pgx driver rejects any single wire message at or above maxMessageBodyLen
 	// (~1 GiB) with "message body too large", so a block whose combined raw_tx
