@@ -35,6 +35,17 @@ type Store struct {
 
 	blockHeight     atomic.Uint32
 	medianBlockTime atomic.Uint32
+
+	// journal controls whether a spend captures its undo payload.
+	//
+	// It defaults to TRUE and must be turned off deliberately. Without a journal a
+	// spend is irreversible: nothing can restore the coin on a reorg, and
+	// ProcessConflicting cannot unspend. The only condition under which that is safe
+	// is applying blocks below the hardcoded checkpoint, where a reorg is impossible
+	// by rule and there is no mempool to produce conflicts -- which is exactly what
+	// SetSyncMode asserts. Defaulting to off would make an irreversible store the
+	// accident rather than the choice.
+	journal atomic.Bool
 }
 
 // New opens the store and installs the schema.
@@ -50,6 +61,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	s := &Store{logger: logger, settings: tSettings, pool: pool}
+	s.journal.Store(true)
 
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
@@ -79,6 +91,14 @@ func (s *Store) SetMedianBlockTime(t uint32) error {
 }
 
 func (s *Store) GetMedianBlockTime() uint32 { return s.medianBlockTime.Load() }
+
+// SetSyncMode disables the undo journal for below-checkpoint block application, where a
+// reorg is impossible by rule and there is no mempool. It must be turned back on before
+// the node crosses the checkpoint or starts accepting unmined transactions.
+func (s *Store) SetSyncMode(on bool) { s.journal.Store(!on) }
+
+// JournalEnabled reports whether spends are currently reversible.
+func (s *Store) JournalEnabled() bool { return s.journal.Load() }
 
 func (s *Store) PoolMaxConns() int { return int(s.pool.Config().MaxConns) }
 

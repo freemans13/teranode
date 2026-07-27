@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/jackc/pgx/v5"
 )
 
 // spendSQL is the whole design in one statement.
@@ -74,6 +75,8 @@ func (s *Store) spendIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight u
 		return nil, nil
 	}
 
+	var err error
+
 	n := len(tx.Inputs)
 	leaves := make([]int16, n)
 	ukeys := make([][16]byte, n)
@@ -90,7 +93,22 @@ func (s *Store) spendIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight u
 		spends[i] = &utxo.Spend{TxID: parent, Vout: in.PreviousTxOutIndex}
 	}
 
-	rows, err := q.Query(ctx, spendSQL, leaves, ukeys, txids, vins, int32(blockHeight))
+	spendingTxID := tx.TxIDChainHash()
+
+	var rows pgx.Rows
+
+	if s.journal.Load() {
+		// The journal leaf must exist before the insert, and creating it is idempotent.
+		if err = s.ensureUndoPartition(ctx, blockHeight); err != nil {
+			return nil, err
+		}
+
+		rows, err = q.Query(ctx, spendJournalSQL, leaves, ukeys, txids, vins,
+			int32(blockHeight), spendingTxID[:])
+	} else {
+		rows, err = q.Query(ctx, spendSQL, leaves, ukeys, txids, vins, int32(blockHeight))
+	}
+
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset][Spend] delete", err)
 	}

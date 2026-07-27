@@ -112,6 +112,47 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- record written in the SAME transaction as the work it describes. This is what
 -- keeps invariant 5 intact — nothing is authorised by a counter.
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- THE UNDO JOURNAL. svnode's rev*.dat, in a table.
+--
+-- A delete-on-spend store destroys the row, so a reorg or a conflict resolution has
+-- nothing to restore FROM unless the payload is captured at the moment it is deleted.
+-- Re-deriving it from the block is not an option: this node retains 696 KB of blocks
+-- against 2,838 GB of chain, and the subtree data it does keep is not in extended
+-- format, so it records WHICH outpoints a block consumed and none of their satoshis or
+-- scripts.
+--
+-- The journal row is therefore written in the SAME STATEMENT as the delete, not merely
+-- the same transaction -- see spendJournalSQL. It carries every field needed to
+-- reconstruct the arbiter row byte-for-byte, including hash_override, because
+-- ReAssignUTXO splices an operator-supplied utxo hash that is NOT derivable from
+-- (txid, vout, satoshis, script); recomputing it on restore would silently reverse a
+-- court-ordered reassignment.
+--
+-- spending_txid is an ownership token, deliberately NOT indexed: a restore must match
+-- the spender that actually took the coin, so a stale reorg record whose output has
+-- since been re-spent by a different transaction matches nothing and is a no-op rather
+-- than resurrecting a coin someone else now owns.
+--
+-- RANGE partitioned by spent_height so reclaim is DROP TABLE -- O(1), no scan, no
+-- vacuum, no background job that can fall behind. Age clusters by insert time by
+-- definition, which is why partition-drop works here and did not for the rejected
+-- epoch-slab design (there, garbage clustered by SPEND time, which is decorrelated
+-- from creation).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS utxo_undo (
+    spent_height    INTEGER  NOT NULL,
+    satoshis        BIGINT   NOT NULL,
+    created_height  INTEGER  NOT NULL,
+    spendable_from  INTEGER  NOT NULL,
+    flags           SMALLINT NOT NULL,
+    ukey            UUID     NOT NULL,
+    txid            BYTEA    NOT NULL,
+    spending_txid   BYTEA    NOT NULL,
+    script          BYTEA    NOT NULL,
+    hash_override   BYTEA
+) PARTITION BY RANGE (spent_height);
+
 CREATE TABLE IF NOT EXISTS applied_block (
     height       INTEGER NOT NULL,
     block_hash   BYTEA   NOT NULL,

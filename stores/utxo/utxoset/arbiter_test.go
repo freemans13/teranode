@@ -45,6 +45,7 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 
 	// clean slate
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS utxo CASCADE;
+	                       DROP TABLE IF EXISTS utxo_undo CASCADE;
 	                       DROP TABLE IF EXISTS applied_block CASCADE;
 	                       DROP TABLE IF EXISTS applied_chunk CASCADE;`)
 	pool.Close()
@@ -272,4 +273,83 @@ func TestSpendAndCreateRejectsContradictoryOptions(t *testing.T) {
 
 	_, _, err := s.SpendAndCreate(ctx, tx, 100, utxo.WithCreateOnly(), utxo.WithSpendOnly())
 	require.Error(t, err, "WithCreateOnly and WithSpendOnly are mutually exclusive")
+}
+
+// TestSpendWritesUndoJournal is the property that makes a delete-on-spend store
+// recoverable at all: the coin's payload must be captured at the instant it is
+// destroyed, in the same statement, or a reorg and ProcessConflicting have nothing to
+// restore from. It cannot be re-derived -- the node keeps almost no blocks, and the
+// subtree data it does keep carries outpoints without satoshis or scripts.
+func TestSpendWritesUndoJournal(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	require.True(t, s.JournalEnabled(), "the journal must default to ON: an irreversible store should be a deliberate choice, never an accident")
+
+	parent := mkTx(t, 1, 4242)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	parentHash := parent.TxIDChainHash()
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash: parentHash, Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+
+	_, err = s.Spend(ctx, child, 200)
+	require.NoError(t, err)
+
+	// the arbiter row is gone...
+	var live int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
+	require.Equal(t, 0, live)
+
+	// ...and everything needed to put it back is in the journal, with the spender
+	// recorded as the ownership token
+	var (
+		sats      int64
+		script    []byte
+		spender   []byte
+		spentAt   int32
+		createdAt int32
+	)
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT satoshis, script, spending_txid, spent_height, created_height
+		   FROM utxo_undo WHERE txid = $1`, parentHash[:]).
+		Scan(&sats, &script, &spender, &spentAt, &createdAt))
+
+	childHash := child.TxIDChainHash()
+	require.Equal(t, int64(4242), sats, "the journal must carry the satoshis")
+	require.Equal(t, []byte(*parent.Outputs[0].LockingScript), script, "and the locking script")
+	require.Equal(t, childHash[:], spender, "and the spender, as the restore ownership token")
+	require.Equal(t, int32(200), spentAt)
+	require.Equal(t, int32(100), createdAt, "created_height must survive, for BIP68 and maturity")
+}
+
+// TestSyncModeSkipsJournal covers the one condition under which an irreversible spend is
+// safe: below the checkpoint a reorg is impossible by rule and there is no mempool, so
+// nothing can ask to undo. It has to be asked for explicitly.
+func TestSyncModeSkipsJournal(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	s.SetSyncMode(true)
+	require.False(t, s.JournalEnabled())
+
+	parent := mkTx(t, 1, 555)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+
+	_, err = s.Spend(ctx, child, 200)
+	require.NoError(t, err)
+
+	var journalled int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo_undo`).Scan(&journalled))
+	require.Equal(t, 0, journalled, "sync mode must write no journal rows")
 }
