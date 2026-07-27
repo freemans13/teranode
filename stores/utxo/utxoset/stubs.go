@@ -16,10 +16,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
-func (s *Store) Create(_ context.Context, _ *bt.Tx, _ uint32, _ ...utxo.CreateOption) (*meta.Data, error) {
-	return nil, errM1("Create")
-}
-
 func (s *Store) Get(_ context.Context, _ *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
 	return nil, errM1("Get")
 }

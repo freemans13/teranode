@@ -27,7 +27,7 @@ import (
 //	                    spend the wrong coin.
 //
 //	u.spendable_from    Coinbase maturity and the ReAssignUTXO delay, folded into one
-//	  <= $2             precomputed height so the hot path never branches on "is this a
+//	  <= $5             precomputed height so the hot path never branches on "is this a
 //	                    coinbase".
 //
 // Frozen and conflicting outputs are excluded by flag mask, so a frozen coin fails the
@@ -43,7 +43,7 @@ DELETE FROM utxo u USING k
    AND u.txid           = k.txid
    AND (u.flags & 1)    = 0          -- not frozen
    AND (u.flags & 4)    = 0          -- not conflicting
-   AND u.spendable_from <= $2
+   AND u.spendable_from <= $5
 RETURNING k.vin, u.satoshis, u.script`
 
 // classifySQL explains a miss. Reached only when the DELETE affected fewer rows than
