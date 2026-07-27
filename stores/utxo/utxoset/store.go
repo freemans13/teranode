@@ -46,6 +46,13 @@ type Store struct {
 	// SetSyncMode asserts. Defaulting to off would make an irreversible store the
 	// accident rather than the choice.
 	journal atomic.Bool
+
+	// undoLeaf is the journal leaf the last spend landed in, so the catalog is only
+	// touched when it changes.
+	undoLeaf atomic.Uint32
+
+	// undoRetention is how far back spends stay undoable, in blocks.
+	undoRetention uint32
 }
 
 // New opens the store and installs the schema.
@@ -60,7 +67,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, errors.NewStorageError("[utxoset] ping", err)
 	}
 
-	s := &Store{logger: logger, settings: tSettings, pool: pool}
+	s := &Store{logger: logger, settings: tSettings, pool: pool,
+		undoRetention: DefaultUndoRetentionBlocks}
 	s.journal.Store(true)
 
 	if err := CreateSchema(ctx, pool); err != nil {

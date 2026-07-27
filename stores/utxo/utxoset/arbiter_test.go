@@ -353,3 +353,41 @@ func TestSyncModeSkipsJournal(t *testing.T) {
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo_undo`).Scan(&journalled))
 	require.Equal(t, 0, journalled, "sync mode must write no journal rows")
 }
+
+// TestUndoJournalReclaim proves the leaf count is BOUNDED rather than growing forever.
+// Reclaim was written before this test and never wired up, so leaves accumulated
+// indefinitely -- the failure this pins.
+func TestUndoJournalReclaim(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	s.undoRetention = 96 // 2 leaves, so the test does not need 1440 blocks
+
+	// spend across a span wide enough to roll several leaves over
+	for h := uint32(100); h <= 500; h += 40 {
+		parent := mkTx(t, 1, uint64(1000+h))
+		_, err := s.Create(ctx, parent, h)
+		require.NoError(t, err)
+
+		child := bt.NewTx()
+		require.NoError(t, child.FromUTXOs(&bt.UTXO{
+			TxIDHash: parent.TxIDChainHash(), Vout: 0,
+			LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+		}))
+
+		_, err = s.Spend(ctx, child, h)
+		require.NoError(t, err)
+	}
+
+	var leaves int
+	require.NoError(t, s.pool.QueryRow(ctx, `
+        SELECT count(*) FROM pg_class c
+          JOIN pg_inherits i ON i.inhrelid = c.oid
+          JOIN pg_class p ON p.oid = i.inhparent
+         WHERE p.relname = 'utxo_undo'`).Scan(&leaves))
+
+	// retention 96 / 48 per leaf = 2, plus the one being filled, plus at most one
+	// not yet crossed. The point is that it is bounded, not that it is exact.
+	require.LessOrEqual(t, leaves, 4,
+		"journal leaves must be reclaimed as the chain advances, not accumulate")
+	require.Positive(t, leaves, "recent history must still be retained")
+}

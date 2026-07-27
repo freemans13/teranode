@@ -7,9 +7,24 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// UndoPartitionBlocks is the width of one journal leaf. Reclaim is DROP TABLE on whole
-// leaves, so retention is granular to this.
+// UndoPartitionBlocks is the width of one journal leaf. Reclaim drops whole leaves, so
+// retention is granular to this. At the measured frontier (~20,000 spends/block) a leaf
+// holds roughly 960,000 rows.
 const UndoPartitionBlocks = 48
+
+// DefaultUndoRetentionBlocks is how far back a spend stays undoable.
+//
+// 1440, not the 288 the design originally proposed. ParentPreservationBlocks is 1440 and
+// its own settings documentation says in bold "DO NOT reduce below 1440 as this risks
+// invalidating legitimate transaction resubmissions" -- so a 288-block journal would
+// have compiled, passed tests, and then silently failed to protect a resubmitted
+// transaction ten days later. The measured UTXO growth slope (251/block, not the 802
+// assumed) leaves the budget at roughly 60-66% even at this depth, so the correct number
+// is affordable.
+//
+// Steady-state leaf count is retention/UndoPartitionBlocks + 1 = 31 tables. Bounded, and
+// reclaimed as the chain advances.
+const DefaultUndoRetentionBlocks = 1440
 
 // spendJournalSQL deletes the arbiter row AND captures its payload in one statement.
 //
@@ -54,6 +69,12 @@ SELECT d.vin, d.satoshis, d.script FROM del d`
 // all but one spend in that many.
 func (s *Store) ensureUndoPartition(ctx context.Context, height uint32) error {
 	leaf := height / UndoPartitionBlocks
+
+	// Only touch the catalog when the leaf actually changes -- once every
+	// UndoPartitionBlocks heights, not once per spend.
+	if prev := s.undoLeaf.Swap(leaf); prev == leaf {
+		return nil
+	}
 	lo := leaf * UndoPartitionBlocks
 	hi := lo + UndoPartitionBlocks
 
@@ -67,6 +88,20 @@ CREATE INDEX IF NOT EXISTS utxo_undo_%[1]d_ukey ON utxo_undo_%[1]d (ukey);`, lea
 
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return errors.NewStorageError("[utxoset] create undo partition %d", leaf, err)
+	}
+
+	// Crossing into a new leaf is exactly the moment old ones fall out of retention, so
+	// reclaim here rather than from a background job. That is deliberate: a background
+	// reclaimer that falls behind is the failure mode that dominated the previous store,
+	// and this design has no per-row work to fall behind on -- reclaim is a catalog
+	// operation that either happens or does not.
+	if height > s.undoRetention {
+		if err := s.DropUndoPartitionsBelow(ctx, height-s.undoRetention); err != nil {
+			// Not fatal: a spend must not fail because old history could not be
+			// discarded. Surfaced so it cannot rot silently.
+			s.logger.Warnf("[utxoset] undo journal reclaim below height %d failed: %v",
+				height-s.undoRetention, err)
+		}
 	}
 
 	return nil
@@ -113,6 +148,14 @@ func (s *Store) DropUndoPartitionsBelow(ctx context.Context, height uint32) erro
 
 		if leaf >= cutoff {
 			continue
+		}
+
+		// DETACH CONCURRENTLY first, then drop the now-standalone table. A bare DROP
+		// TABLE on an attached partition briefly takes ACCESS EXCLUSIVE on the PARENT,
+		// which would stall every concurrent spend; detaching concurrently does not.
+		if _, err := s.pool.Exec(ctx,
+			fmt.Sprintf(`ALTER TABLE utxo_undo DETACH PARTITION %s CONCURRENTLY`, name)); err != nil {
+			return errors.NewStorageError("[utxoset] detach undo partition %s", name, err)
 		}
 
 		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, name)); err != nil {
