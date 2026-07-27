@@ -22,7 +22,7 @@ import (
 // create is an INSERT; issue both inside one transaction and a failure is a ROLLBACK, so
 // the deletes simply never happened. There is no window in which the inputs are spent
 // and the outputs are missing, no retry loop, and no dependence on Unspend — which
-// matters for this store in particular, because its Unspend needs the undo journal that
+// matters for this store in particular, because its Unspend needs the spend journal that
 // only exists above the checkpoint.
 //
 // On ErrTxExists this is still all-or-nothing, and that is not a contract violation.
@@ -78,10 +78,21 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		// Per-input failures are reported on the Spend records, not as a returned
 		// error, so they must be inspected here: committing a partial spend would
 		// leave the transaction half-applied.
+		// Per-input failures are reported on the Spend records rather than as a returned
+		// error, so they must be inspected here -- committing a partial spend would leave
+		// the transaction half-applied. The aggregate is a UtxoError because that is what
+		// callers match on; each input's specific cause (ErrFrozen, ErrSpent, immaturity)
+		// stays on its own Spend record for conflict detection.
+		var spendErrors []error
+
 		for _, sp := range spends {
 			if sp != nil && sp.Err != nil {
-				return nil, spends, errors.NewProcessingError("[utxoset][SpendAndCreate] input %d: %w", sp.Vout, sp.Err)
+				spendErrors = append(spendErrors, sp.Err)
 			}
+		}
+
+		if len(spendErrors) > 0 {
+			return nil, spends, errors.NewUtxoError("[utxoset][SpendAndCreate] %d of %d inputs could not be spent", len(spendErrors), len(spends), spendErrors[0])
 		}
 
 		if options.SpendOnly {

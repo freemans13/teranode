@@ -23,10 +23,6 @@ func (s *Store) Delete(_ context.Context, _ *chainhash.Hash) error {
 	return errM1("Delete")
 }
 
-func (s *Store) GetSpend(_ context.Context, _ *utxo.Spend) (*utxo.SpendResponse, error) {
-	return nil, errM1("GetSpend")
-}
-
 func (s *Store) GetMeta(_ context.Context, _ *chainhash.Hash, _ *meta.Data) error {
 	return errM1("GetMeta")
 }
@@ -61,14 +57,6 @@ func (s *Store) ProcessExpiredPreservations(_ context.Context, _ uint32) error {
 
 func (s *Store) BatchDecorate(_ context.Context, _ []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
 	return errM1("BatchDecorate")
-}
-
-func (s *Store) FreezeUTXOs(_ context.Context, _ []*utxo.Spend, _ *settings.Settings) error {
-	return errM1("FreezeUTXOs")
-}
-
-func (s *Store) UnFreezeUTXOs(_ context.Context, _ []*utxo.Spend, _ *settings.Settings) error {
-	return errM1("UnFreezeUTXOs")
 }
 
 func (s *Store) ReAssignUTXO(_ context.Context, _ *utxo.Spend, _ *utxo.Spend, _ *settings.Settings) error {

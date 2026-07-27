@@ -47,12 +47,12 @@ type Store struct {
 	// accident rather than the choice.
 	journal atomic.Bool
 
-	// undoLeaf is the journal leaf the last spend landed in, so the catalog is only
+	// journalLeaf is the spend-journal leaf the last spend landed in, so the catalog is only
 	// touched when it changes.
-	undoLeaf atomic.Uint32
+	journalLeaf atomic.Uint32
 
-	// undoRetention is how far back spends stay undoable, in blocks.
-	undoRetention uint32
+	// journalRetention is how far back spends stay undoable, in blocks.
+	journalRetention uint32
 }
 
 // New opens the store and installs the schema.
@@ -68,7 +68,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
-		undoRetention: DefaultUndoRetentionBlocks}
+		journalRetention: DefaultSpendJournalRetentionBlocks}
 	s.journal.Store(true)
 
 	if err := CreateSchema(ctx, pool); err != nil {
@@ -100,7 +100,7 @@ func (s *Store) SetMedianBlockTime(t uint32) error {
 
 func (s *Store) GetMedianBlockTime() uint32 { return s.medianBlockTime.Load() }
 
-// SetSyncMode disables the undo journal for below-checkpoint block application, where a
+// SetSyncMode disables the spend journal for below-checkpoint block application, where a
 // reorg is impossible by rule and there is no mempool. It must be turned back on before
 // the node crosses the checkpoint or starts accepting unmined transactions.
 func (s *Store) SetSyncMode(on bool) { s.journal.Store(!on) }
@@ -131,5 +131,5 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 // quietly answers "not found" for a question it cannot answer is how consensus bugs
 // start.
 func errM1(method string) error {
-	return errors.NewProcessingError("[utxoset] %s is not implemented in M1 (arbiter-only, sync mode); it depends on the undo journal or tx_meta window landing in M3", method)
+	return errors.NewProcessingError("[utxoset] %s is not implemented in M1 (arbiter-only, sync mode); it depends on the spend journal or tx_meta window landing in M3", method)
 }

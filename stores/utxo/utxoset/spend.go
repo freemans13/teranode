@@ -99,7 +99,7 @@ func (s *Store) spendIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight u
 
 	if s.journal.Load() {
 		// The journal leaf must exist before the insert, and creating it is idempotent.
-		if err = s.ensureUndoPartition(ctx, blockHeight); err != nil {
+		if err = s.ensureSpendJournalPartition(ctx, blockHeight); err != nil {
 			return nil, err
 		}
 

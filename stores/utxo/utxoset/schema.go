@@ -22,7 +22,7 @@
 //     REINDEX CONCURRENTLY (3.1 s per 10M entries)
 //
 // M1 scope: the arbiter and the block/chunk ledger only. Sync mode — below the
-// hardcoded checkpoint, where a reorg is impossible by rule, so no undo journal and no
+// hardcoded checkpoint, where a reorg is impossible by rule, so no spend journal and no
 // tx_meta window are needed. Those arrive in M3.
 package utxoset
 
@@ -85,7 +85,7 @@ const (
 )
 
 // schemaSQL is the M1 schema: the arbiter plus the ledger that makes block application
-// idempotent. Deliberately excludes the undo journal and tx_meta — below the checkpoint a
+// idempotent. Deliberately excludes the spend journal and tx_meta — below the checkpoint a
 // reorg is impossible by rule, so neither is reachable.
 const schemaSQL = `
 -- ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- keeps invariant 5 intact — nothing is authorised by a counter.
 -- ---------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------
--- THE UNDO JOURNAL. svnode's rev*.dat, in a table.
+-- THE SPEND JOURNAL. svnode's rev*.dat, in a table.
 --
 -- A delete-on-spend store destroys the row, so a reorg or a conflict resolution has
 -- nothing to restore FROM unless the payload is captured at the moment it is deleted.
@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- epoch-slab design (there, garbage clustered by SPEND time, which is decorrelated
 -- from creation).
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS utxo_undo (
+CREATE TABLE IF NOT EXISTS spend_journal (
     spent_height    INTEGER  NOT NULL,
     satoshis        BIGINT   NOT NULL,
     created_height  INTEGER  NOT NULL,

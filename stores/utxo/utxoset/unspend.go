@@ -37,7 +37,7 @@ WITH items AS (
     SELECT * FROM unnest($1::uuid[], $2::bytea[], $3::bytea[]) AS t(ukey, ptxid, stxid)
 ),
 taken AS (
-    DELETE FROM utxo_undo j USING items i
+    DELETE FROM spend_journal j USING items i
      WHERE j.ukey          = i.ukey
        AND j.txid          = i.ptxid
        AND j.spending_txid = i.stxid
@@ -59,7 +59,7 @@ restored AS (
 )
 SELECT (SELECT count(*) FROM restored), (SELECT count(*) FROM items)`
 
-// Unspend restores previously spent UTXOs from the undo journal.
+// Unspend restores previously spent UTXOs from the spend journal.
 //
 // Used by reorg handling and by conflicting-transaction resolution. Note that a plain
 // block disconnect does NOT come through here: a transaction in a disconnected block is

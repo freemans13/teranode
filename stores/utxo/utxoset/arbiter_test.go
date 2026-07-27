@@ -46,7 +46,7 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 
 	// clean slate
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS utxo CASCADE;
-	                       DROP TABLE IF EXISTS utxo_undo CASCADE;
+	                       DROP TABLE IF EXISTS spend_journal CASCADE;
 	                       DROP TABLE IF EXISTS applied_block CASCADE;
 	                       DROP TABLE IF EXISTS applied_chunk CASCADE;`)
 	pool.Close()
@@ -276,12 +276,12 @@ func TestSpendAndCreateRejectsContradictoryOptions(t *testing.T) {
 	require.Error(t, err, "WithCreateOnly and WithSpendOnly are mutually exclusive")
 }
 
-// TestSpendWritesUndoJournal is the property that makes a delete-on-spend store
+// TestSpendWritesJournal is the property that makes a delete-on-spend store
 // recoverable at all: the coin's payload must be captured at the instant it is
 // destroyed, in the same statement, or a reorg and ProcessConflicting have nothing to
 // restore from. It cannot be re-derived -- the node keeps almost no blocks, and the
 // subtree data it does keep carries outpoints without satoshis or scripts.
-func TestSpendWritesUndoJournal(t *testing.T) {
+func TestSpendWritesJournal(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	require.True(t, s.JournalEnabled(), "the journal must default to ON: an irreversible store should be a deliberate choice, never an accident")
@@ -317,7 +317,7 @@ func TestSpendWritesUndoJournal(t *testing.T) {
 	)
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT satoshis, script, spending_txid, spent_height, created_height
-		   FROM utxo_undo WHERE txid = $1`, parentHash[:]).
+		   FROM spend_journal WHERE txid = $1`, parentHash[:]).
 		Scan(&sats, &script, &spender, &spentAt, &createdAt))
 
 	childHash := child.TxIDChainHash()
@@ -351,17 +351,17 @@ func TestSyncModeSkipsJournal(t *testing.T) {
 	require.NoError(t, err)
 
 	var journalled int
-	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo_undo`).Scan(&journalled))
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal`).Scan(&journalled))
 	require.Equal(t, 0, journalled, "sync mode must write no journal rows")
 }
 
-// TestUndoJournalReclaim proves the leaf count is BOUNDED rather than growing forever.
+// TestSpendJournalReclaim proves the leaf count is BOUNDED rather than growing forever.
 // Reclaim was written before this test and never wired up, so leaves accumulated
 // indefinitely -- the failure this pins.
-func TestUndoJournalReclaim(t *testing.T) {
+func TestSpendJournalReclaim(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	s.undoRetention = 96 // 2 leaves, so the test does not need 1440 blocks
+	s.journalRetention = 96 // 2 leaves, so the test does not need 1440 blocks
 
 	// spend across a span wide enough to roll several leaves over
 	for h := uint32(100); h <= 500; h += 40 {
@@ -384,7 +384,7 @@ func TestUndoJournalReclaim(t *testing.T) {
         SELECT count(*) FROM pg_class c
           JOIN pg_inherits i ON i.inhrelid = c.oid
           JOIN pg_class p ON p.oid = i.inhparent
-         WHERE p.relname = 'utxo_undo'`).Scan(&leaves))
+         WHERE p.relname = 'spend_journal'`).Scan(&leaves))
 
 	// retention 96 / 48 per leaf = 2, plus the one being filled, plus at most one
 	// not yet crossed. The point is that it is bounded, not that it is exact.
@@ -444,7 +444,7 @@ func TestUnspendRestoresFromJournal(t *testing.T) {
 	// the journal row is consumed: the restore is single-use, which is what makes it
 	// idempotent without a counter
 	var remaining int
-	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo_undo WHERE txid = $1`, parentHash[:]).Scan(&remaining))
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal WHERE txid = $1`, parentHash[:]).Scan(&remaining))
 	require.Equal(t, 0, remaining, "the journal row must be consumed by the restore")
 
 	// so a second restore finds nothing and must say so rather than silently succeeding
@@ -476,7 +476,7 @@ func TestUnspendRefusesWrongSpender(t *testing.T) {
 	require.Equal(t, 0, live, "the coin must stay spent")
 
 	var journalled int
-	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo_undo WHERE txid = $1`, parentHash[:]).Scan(&journalled))
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal WHERE txid = $1`, parentHash[:]).Scan(&journalled))
 	require.Equal(t, 1, journalled, "and its journal row must be left intact for the rightful restore")
 }
 
@@ -489,4 +489,76 @@ func TestUnspendRequiresSpender(t *testing.T) {
 	spends[0].SpendingData = nil
 
 	require.Error(t, s.Unspend(ctx, spends), "no ownership token means no restore")
+}
+
+// TestSpendBelowFirstJournalLeafCreatesPartition pins a bug that only ever appears on a
+// fresh sync from genesis, which is exactly the workload this store exists for.
+//
+// The partition cache used to hold the leaf number itself, so its zero value was
+// indistinguishable from "leaf 0 has already been created". Every spend below height 48
+// therefore saw a cache hit, skipped the CREATE TABLE, and failed the journal insert with
+// "no partition of relation spend_journal found for row". Higher leaves worked fine, so
+// every test that happened to pick a height above 48 passed and the store looked healthy.
+func TestSpendBelowFirstJournalLeafCreatesPartition(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 7777)
+	_, err := s.Create(ctx, parent, 1)
+	require.NoError(t, err)
+
+	parentHash := parent.TxIDChainHash()
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash: parentHash, Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+
+	// Height 2 lands in leaf 0 -- the leaf the zero value shadowed.
+	_, err = s.Spend(ctx, child, 2)
+	require.NoError(t, err, "a spend in the first journal leaf must create its partition")
+
+	var journaled int
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM spend_journal_0 WHERE txid = $1`, parentHash[:]).Scan(&journaled))
+	require.Equal(t, 1, journaled)
+}
+
+// TestCreateDoesNotGateOrdinaryOutputsOnHeight guards against re-inventing a consensus
+// rule that does not exist.
+//
+// spendable_from used to be set to the creation height for every output, which quietly
+// meant "an output may not be spent below the height it was created at". Nothing in
+// consensus says that -- only coinbase maturity and an explicit reassignment delay hold
+// an output back -- and it would reject valid spends during a reorg or whenever a caller
+// passes a height that is not strictly increasing.
+func TestCreateDoesNotGateOrdinaryOutputsOnHeight(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5150)
+	_, err := s.Create(ctx, parent, 1000)
+	require.NoError(t, err)
+
+	parentHash := parent.TxIDChainHash()
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash: parentHash, Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+
+	// Spent far below the height it was created at.
+	//
+	// Assert on the Spend records, not just the returned error: a miss is reported per
+	// input on spends[i].Err and classifyMisses can leave the top-level error nil, so
+	// require.NoError alone would sail straight past the bug this test exists for.
+	spends, err := s.Spend(ctx, child, 1)
+	require.NoError(t, err)
+	require.Len(t, spends, 1)
+	require.NoError(t, spends[0].Err, "an ordinary output must not be gated on its own creation height")
+
+	var live int
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
+	require.Equal(t, 0, live, "the coin must actually be gone, not merely reported as spent")
 }

@@ -46,7 +46,13 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 	// Coinbase maturity and the ReAssignUTXO delay are folded into one precomputed
 	// height so the spend hot path never branches on "is this a coinbase" — it just
 	// compares spendable_from against the current height.
-	spendableFrom := int32(blockHeight)
+	//
+	// Zero for an ordinary output, NOT the creation height. There is no consensus rule
+	// keeping a normal output from being spent at a height below the one it was created
+	// at, and encoding one here would reject perfectly valid spends -- during a reorg,
+	// or whenever a caller passes a height that is not strictly increasing. Only coinbase
+	// maturity and an explicit reassignment delay may hold an output back.
+	var spendableFrom int32
 	if isCoinbase {
 		spendableFrom = int32(blockHeight) + int32(s.settings.ChainCfgParams.CoinbaseMaturity)
 	}
