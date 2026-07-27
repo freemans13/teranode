@@ -1,0 +1,141 @@
+package utxoset
+
+// M1 stubs. Every method here is outside the arbiter-only scope and fails loudly rather
+// than returning a plausible wrong answer -- a store that quietly answers "not found"
+// for a question it cannot answer is how consensus bugs start. Replacing these, guided
+// by the store-agnostic suite in stores/utxo/tests, is the M1..M4 worklist.
+
+import (
+	"context"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+)
+
+func (s *Store) Create(_ context.Context, _ *bt.Tx, _ uint32, _ ...utxo.CreateOption) (*meta.Data, error) {
+	return nil, errM1("Create")
+}
+
+func (s *Store) Get(_ context.Context, _ *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
+	return nil, errM1("Get")
+}
+
+func (s *Store) Delete(_ context.Context, _ *chainhash.Hash) error {
+	return errM1("Delete")
+}
+
+func (s *Store) GetSpend(_ context.Context, _ *utxo.Spend) (*utxo.SpendResponse, error) {
+	return nil, errM1("GetSpend")
+}
+
+func (s *Store) GetMeta(_ context.Context, _ *chainhash.Hash, _ *meta.Data) error {
+	return errM1("GetMeta")
+}
+
+func (s *Store) Unspend(_ context.Context, _ []*utxo.Spend, _ ...bool) error {
+	return errM1("Unspend")
+}
+
+func (s *Store) SetMinedMulti(_ context.Context, _ []*chainhash.Hash, _ utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	return nil, errM1("SetMinedMulti")
+}
+
+func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
+	return nil, errM1("GetUnminedTxIterator")
+}
+
+func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
+	return nil, errM1("ScanInconsistentUnminedTxs")
+}
+
+func (s *Store) GetPrunableUnminedTxIterator(_ uint32) (utxo.UnminedTxIterator, error) {
+	return nil, errM1("GetPrunableUnminedTxIterator")
+}
+
+func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chainhash.Hash, error) {
+	return nil, errM1("QueryOldUnminedTransactions")
+}
+
+func (s *Store) PreserveTransactions(_ context.Context, _ []chainhash.Hash, _ uint32) error {
+	return errM1("PreserveTransactions")
+}
+
+func (s *Store) ProcessExpiredPreservations(_ context.Context, _ uint32) error {
+	return errM1("ProcessExpiredPreservations")
+}
+
+func (s *Store) BatchDecorate(_ context.Context, _ []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
+	return errM1("BatchDecorate")
+}
+
+func (s *Store) PreviousOutputsDecorate(_ context.Context, _ *bt.Tx) error {
+	return errM1("PreviousOutputsDecorate")
+}
+
+func (s *Store) BatchPreviousOutputsDecorate(_ context.Context, _ []*bt.Tx) error {
+	return errM1("BatchPreviousOutputsDecorate")
+}
+
+func (s *Store) FreezeUTXOs(_ context.Context, _ []*utxo.Spend, _ *settings.Settings) error {
+	return errM1("FreezeUTXOs")
+}
+
+func (s *Store) UnFreezeUTXOs(_ context.Context, _ []*utxo.Spend, _ *settings.Settings) error {
+	return errM1("UnFreezeUTXOs")
+}
+
+func (s *Store) ReAssignUTXO(_ context.Context, _ *utxo.Spend, _ *utxo.Spend, _ *settings.Settings) error {
+	return errM1("ReAssignUTXO")
+}
+
+func (s *Store) GetCounterConflicting(_ context.Context, _ chainhash.Hash) ([]chainhash.Hash, error) {
+	return nil, errM1("GetCounterConflicting")
+}
+
+func (s *Store) GetConflictingChildren(_ context.Context, _ chainhash.Hash) ([]chainhash.Hash, error) {
+	return nil, errM1("GetConflictingChildren")
+}
+
+func (s *Store) SetConflicting(_ context.Context, _ []chainhash.Hash, _ bool) ([]*utxo.Spend, []chainhash.Hash, error) {
+	return nil, nil, errM1("SetConflicting")
+}
+
+func (s *Store) RemoveFromConflictingChildren(_ context.Context, _ []utxo.ConflictingChildRemoval) error {
+	return errM1("RemoveFromConflictingChildren")
+}
+
+func (s *Store) RemoveBlockIDs(_ context.Context, _ []utxo.BlockIDsRemoval) error {
+	return errM1("RemoveBlockIDs")
+}
+
+func (s *Store) GetConflictingTxIterator() (utxo.UnminedTxIterator, error) {
+	return nil, errM1("GetConflictingTxIterator")
+}
+
+func (s *Store) SetLocked(_ context.Context, _ []chainhash.Hash, _ bool) error {
+	return errM1("SetLocked")
+}
+
+func (s *Store) BeginConflictIntent(_ context.Context, _ utxo.ConflictIntent) error {
+	return errM1("BeginConflictIntent")
+}
+
+func (s *Store) CompleteConflictIntent(_ context.Context, _ chainhash.Hash) error {
+	return errM1("CompleteConflictIntent")
+}
+
+func (s *Store) PendingConflictIntents(_ context.Context) ([]utxo.ConflictIntent, error) {
+	return nil, errM1("PendingConflictIntents")
+}
+
+func (s *Store) MarkTransactionsOnLongestChain(_ context.Context, _ []chainhash.Hash, _ bool) error {
+	return errM1("MarkTransactionsOnLongestChain")
+}
+
+func (s *Store) GetBlockState() utxo.BlockState {
+	return utxo.BlockState{}
+}
