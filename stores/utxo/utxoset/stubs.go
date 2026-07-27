@@ -31,10 +31,6 @@ func (s *Store) GetMeta(_ context.Context, _ *chainhash.Hash, _ *meta.Data) erro
 	return errM1("GetMeta")
 }
 
-func (s *Store) Unspend(_ context.Context, _ []*utxo.Spend, _ ...bool) error {
-	return errM1("Unspend")
-}
-
 func (s *Store) SetMinedMulti(_ context.Context, _ []*chainhash.Hash, _ utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	return nil, errM1("SetMinedMulti")
 }

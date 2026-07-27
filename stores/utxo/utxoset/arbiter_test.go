@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -390,4 +391,102 @@ func TestUndoJournalReclaim(t *testing.T) {
 	require.LessOrEqual(t, leaves, 4,
 		"journal leaves must be reclaimed as the chain advances, not accumulate")
 	require.Positive(t, leaves, "recent history must still be retained")
+}
+
+// spendOne creates a parent, spends output 0, and returns the Spend record describing it.
+func spendOne(t *testing.T, s *Store, ctx context.Context, sats uint64, h uint32) (*bt.Tx, *bt.Tx, []*utxo.Spend) {
+	t.Helper()
+
+	parent := mkTx(t, 1, sats)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+
+	spends, err := s.Spend(ctx, child, h)
+	require.NoError(t, err)
+	require.Len(t, spends, 1)
+
+	// the caller is expected to know who spent it; Spend does not fill this in
+	spends[0].SpendingData = spend.NewSpendingData(child.TxIDChainHash(), 0)
+
+	return parent, child, spends
+}
+
+// TestUnspendRestoresFromJournal is the round trip that makes a reorg survivable: a coin
+// destroyed by a spend must come back byte-identical, and the journal row must be
+// CONSUMED so a second restore cannot duplicate it.
+func TestUnspendRestoresFromJournal(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent, _, spends := spendOne(t, s, ctx, 3131, 200)
+	parentHash := parent.TxIDChainHash()
+
+	require.NoError(t, s.Unspend(ctx, spends))
+
+	// restored byte-identical
+	var (
+		sats    int64
+		script  []byte
+		created int32
+	)
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT satoshis, script, created_height FROM utxo WHERE txid = $1`, parentHash[:]).
+		Scan(&sats, &script, &created))
+	require.Equal(t, int64(3131), sats)
+	require.Equal(t, []byte(*parent.Outputs[0].LockingScript), script)
+	require.Equal(t, int32(100), created, "created_height must survive the round trip, for BIP68 and maturity")
+
+	// the journal row is consumed: the restore is single-use, which is what makes it
+	// idempotent without a counter
+	var remaining int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo_undo WHERE txid = $1`, parentHash[:]).Scan(&remaining))
+	require.Equal(t, 0, remaining, "the journal row must be consumed by the restore")
+
+	// so a second restore finds nothing and must say so rather than silently succeeding
+	require.Error(t, s.Unspend(ctx, spends), "a second restore must not duplicate the coin")
+
+	var live int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
+	require.Equal(t, 1, live, "exactly one live row after a double restore attempt")
+}
+
+// TestUnspendRefusesWrongSpender is the ownership token doing its job. A stale reorg
+// record must never resurrect a coin that a DIFFERENT transaction has since taken.
+func TestUnspendRefusesWrongSpender(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent, _, spends := spendOne(t, s, ctx, 4141, 200)
+
+	// claim it was spent by some other transaction
+	other := mkTx(t, 1, 1)
+	spends[0].SpendingData = spend.NewSpendingData(other.TxIDChainHash(), 0)
+
+	require.Error(t, s.Unspend(ctx, spends),
+		"a restore naming the wrong spender must fail, not resurrect the coin")
+
+	parentHash := parent.TxIDChainHash()
+
+	var live int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
+	require.Equal(t, 0, live, "the coin must stay spent")
+
+	var journalled int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo_undo WHERE txid = $1`, parentHash[:]).Scan(&journalled))
+	require.Equal(t, 1, journalled, "and its journal row must be left intact for the rightful restore")
+}
+
+// TestUnspendRequiresSpender refuses to guess. Restoring on the outpoint alone could
+// resurrect a coin a different transaction now owns.
+func TestUnspendRequiresSpender(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	_, _, spends := spendOne(t, s, ctx, 5151, 200)
+	spends[0].SpendingData = nil
+
+	require.Error(t, s.Unspend(ctx, spends), "no ownership token means no restore")
 }
