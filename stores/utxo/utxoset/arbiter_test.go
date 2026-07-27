@@ -165,3 +165,58 @@ func TestArbiterUnspendableOutputsCreateNoRow(t *testing.T) {
 		txHash[:]).Scan(&rows))
 	require.Equal(t, 1, rows, "only the spendable output may occupy an arbiter row")
 }
+
+// TestDecorateFromArbiter answers the question directly: can PreviousOutputsDecorate be
+// served from the UTXO table alone?
+//
+// Today it cannot -- the postgres store fetches the parent's raw_tx (~1.7 KB) and runs
+// bt.NewTxFromBytes over it to pull out two fields. Here those two fields ARE the row,
+// so decorate is an index probe. Note this store holds no transaction bodies at all, so
+// if the input comes back decorated it can only have come from the arbiter.
+func TestDecorateFromArbiter(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 7777)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash:      parent.TxIDChainHash(),
+		Vout:          0,
+		LockingScript: parent.Outputs[0].LockingScript,
+		Satoshis:      parent.Outputs[0].Satoshis,
+	}))
+
+	// strip what FromUTXOs pre-filled, so decorate has to do the work
+	child.Inputs[0].PreviousTxScript = nil
+	child.Inputs[0].PreviousTxSatoshis = 0
+
+	require.NoError(t, s.PreviousOutputsDecorate(ctx, child))
+
+	require.Equal(t, uint64(7777), child.Inputs[0].PreviousTxSatoshis,
+		"satoshis must come from the arbiter row")
+	require.NotNil(t, child.Inputs[0].PreviousTxScript,
+		"locking script must come from the arbiter row")
+	require.Equal(t, parent.Outputs[0].LockingScript.String(), child.Inputs[0].PreviousTxScript.String(),
+		"the decorated script must be the parent's actual locking script")
+
+	// and once spent, the row is gone -- decorate must say so rather than inventing an answer
+	spent := bt.NewTx()
+	require.NoError(t, spent.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+	_, err = s.Spend(ctx, spent, 200)
+	require.NoError(t, err)
+
+	orphan := bt.NewTx()
+	require.NoError(t, orphan.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+	orphan.Inputs[0].PreviousTxScript = nil
+
+	require.Error(t, s.PreviousOutputsDecorate(ctx, orphan),
+		"a spent parent has no arbiter row and decorate must not fabricate one")
+}

@@ -8,7 +8,6 @@ package utxoset
 import (
 	"context"
 
-	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -66,14 +65,6 @@ func (s *Store) ProcessExpiredPreservations(_ context.Context, _ uint32) error {
 
 func (s *Store) BatchDecorate(_ context.Context, _ []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
 	return errM1("BatchDecorate")
-}
-
-func (s *Store) PreviousOutputsDecorate(_ context.Context, _ *bt.Tx) error {
-	return errM1("PreviousOutputsDecorate")
-}
-
-func (s *Store) BatchPreviousOutputsDecorate(_ context.Context, _ []*bt.Tx) error {
-	return errM1("BatchPreviousOutputsDecorate")
 }
 
 func (s *Store) FreezeUTXOs(_ context.Context, _ []*utxo.Spend, _ *settings.Settings) error {
