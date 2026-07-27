@@ -25,15 +25,23 @@ import (
 // matters for this store in particular, because its Unspend needs the undo journal that
 // only exists above the checkpoint.
 //
-// One contract point deserves attention rather than silent compliance. The interface
-// specifies that ErrTxExists from the create phase is returned WITH THE SPENDS LEFT IN
-// PLACE. That is a deliberately non-atomic outcome, and expressing it inside a
-// transaction means committing the spends and returning an error, which is the one path
-// here that is not simply "all or nothing". PR 1326 flags this as an open question --
-// whether the contract survives real atomicity -- and this implementation honours the
-// documented behaviour rather than quietly changing it. Note the branch is currently
-// unreachable: this store cannot yet detect a duplicate transaction, because its key is
-// deliberately non-unique and duplicate detection is the applied_block ledger's job.
+// On ErrTxExists this is still all-or-nothing, and that is not a contract violation.
+// The interface says the error is returned "with the spends left in place", which reads
+// like a required partial commit but is not: if the transaction already exists then it
+// was already processed, its inputs were already spent BY IT, and the spend phase wrote
+// nothing. The postgres store makes that explicit -- its spend is
+// ON CONFLICT (prev_tx_hash, prev_output_idx) DO NOTHING, so a re-spend is a no-op. So
+// there is nothing to leave in place and nothing to undo, and a ROLLBACK reaches the
+// same state a COMMIT would. Every path here is genuinely atomic.
+//
+// NOTE this store cannot yet reach that branch at all, and the reason is a real gap
+// rather than a subtlety. Delete-on-spend has no spends row carrying spending_data, so
+// a duplicate transaction arrives as per-input ErrSpent from the DELETE affecting zero
+// rows -- indistinguishable from a genuine double-spend -- and never reaches the create
+// phase to report ErrTxExists. Duplicate detection therefore has to happen BEFORE the
+// spend: the applied_block ledger covers block application, and a mempool duplicate
+// needs tx_meta. Until both exist, this store does not implement the ErrTxExists
+// contract; it does not fake it either.
 func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
 	options := &utxo.CreateOptions{}
@@ -89,18 +97,6 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 
 	data, err := s.createIn(ctx, dbTx, tx, blockHeight, opts...)
 	if err != nil {
-		if errors.Is(err, errors.ErrTxExists) {
-			// The documented exception: keep the spends, report the duplicate. Commit
-			// so they survive, then return the error.
-			if cErr := dbTx.Commit(ctx); cErr != nil {
-				return nil, spends, errors.NewStorageError("[utxoset][SpendAndCreate] commit (ErrTxExists)", cErr)
-			}
-
-			committed = true
-
-			return nil, spends, err
-		}
-
 		return nil, spends, err
 	}
 
