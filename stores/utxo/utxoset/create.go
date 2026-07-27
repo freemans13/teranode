@@ -29,6 +29,12 @@ SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[], $4::smallint[], $5::sma
 // postgres store's spendable_count and the aerospike store's ShouldStoreOutputAsUTXO
 // gate, so all three agree on what "spendable" means.
 func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
+	return s.createIn(ctx, s.pool, tx, blockHeight, opts...)
+}
+
+// createIn is Create against an arbitrary querier, so SpendAndCreate can run it inside
+// the same transaction as the spend.
+func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, _ ...utxo.CreateOption) (*meta.Data, error) {
 	if tx == nil {
 		return nil, errors.NewProcessingError("[utxoset][Create] nil tx")
 	}
@@ -87,7 +93,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	}
 
 	if len(ukeys) > 0 {
-		if _, err := s.pool.Exec(ctx, createSQL, satoshis, createdAt, spendable,
+		if _, err := q.Exec(ctx, createSQL, satoshis, createdAt, spendable,
 			leaves, flagArr, ukeys, txids, scripts); err != nil {
 			return nil, errors.NewStorageError("[utxoset][Create] insert %s", txHash.String(), err)
 		}

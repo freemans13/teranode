@@ -8,8 +8,20 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// querier is satisfied by both *pgxpool.Pool and pgx.Tx, so the create and spend
+// statements run unchanged whether they are issued standalone or composed inside one
+// transaction by SpendAndCreate. That composition is the whole reason this abstraction
+// exists: it is what lets a failed create undo its spends with a ROLLBACK instead of
+// compensating logic.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
 
 // Store is the delete-on-spend UTXO-set store.
 //

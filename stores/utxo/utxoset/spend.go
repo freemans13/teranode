@@ -64,7 +64,12 @@ SELECT k.vin, u.flags, u.spendable_from
 // Errors are reported per-input on the returned Spend records rather than as a single
 // error, matching the postgres store's contract: the caller needs to know WHICH input
 // failed and why.
-func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, _ ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	return s.spendIn(ctx, s.pool, tx, blockHeight, ignoreFlags...)
+}
+
+// spendIn is Spend against an arbitrary querier.
+func (s *Store) spendIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, _ ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	if tx == nil || tx.IsCoinbase() {
 		return nil, nil
 	}
@@ -85,7 +90,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, _ ...u
 		spends[i] = &utxo.Spend{TxID: parent, Vout: in.PreviousTxOutIndex}
 	}
 
-	rows, err := s.pool.Query(ctx, spendSQL, leaves, ukeys, txids, vins, int32(blockHeight))
+	rows, err := q.Query(ctx, spendSQL, leaves, ukeys, txids, vins, int32(blockHeight))
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset][Spend] delete", err)
 	}
@@ -124,13 +129,13 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, _ ...u
 		return spends, nil
 	}
 
-	return spends, s.classifyMisses(ctx, leaves, ukeys, txids, vins, blockHeight, done, spends)
+	return spends, s.classifyMisses(ctx, q, leaves, ukeys, txids, vins, blockHeight, done, spends)
 }
 
 // classifyMisses turns "the DELETE did not take this row" into a specific error.
-func (s *Store) classifyMisses(ctx context.Context, leaves []int16, ukeys [][16]byte, txids [][]byte,
+func (s *Store) classifyMisses(ctx context.Context, q querier, leaves []int16, ukeys [][16]byte, txids [][]byte,
 	vins []int32, blockHeight uint32, done map[int32]struct{}, spends []*utxo.Spend) error {
-	rows, err := s.pool.Query(ctx, classifySQL, leaves, ukeys, txids, vins)
+	rows, err := q.Query(ctx, classifySQL, leaves, ukeys, txids, vins)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Spend] classify", err)
 	}

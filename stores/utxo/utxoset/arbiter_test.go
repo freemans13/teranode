@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -219,4 +220,56 @@ func TestDecorateFromArbiter(t *testing.T) {
 
 	require.Error(t, s.PreviousOutputsDecorate(ctx, orphan),
 		"a spent parent has no arbiter row and decorate must not fabricate one")
+}
+
+// TestSpendAndCreateAtomic covers the contract PR 1326 introduces, and the property that
+// makes this store's implementation different from the sequential helper: spend and
+// create share ONE transaction, so there is no window in which the inputs are spent and
+// the outputs missing, and no compensating Unspend on failure.
+func TestSpendAndCreateAtomic(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 9000)
+	_, _, err := s.SpendAndCreate(ctx, parent, 100, utxo.WithCreateOnly())
+	require.NoError(t, err)
+
+	parentHash := parent.TxIDChainHash()
+
+	var n int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&n))
+	require.Equal(t, 1, n, "WithCreateOnly must create outputs")
+
+	// a child spending the parent and creating its own outputs, in one call
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash: parentHash, Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+
+	script, err := bscript.NewFromHexString("76a914000000000000000000000000000000000000000088ac")
+	require.NoError(t, err)
+	child.AddOutput(&bt.Output{Satoshis: 8000, LockingScript: script})
+
+	_, spends, err := s.SpendAndCreate(ctx, child, 200)
+	require.NoError(t, err)
+	require.Len(t, spends, 1)
+	require.NoError(t, spends[0].Err)
+
+	// both halves must have landed: the parent output consumed AND the child's created
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&n))
+	require.Equal(t, 0, n, "the spent parent output must be gone")
+
+	childHash := child.TxIDChainHash()
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, childHash[:]).Scan(&n))
+	require.Equal(t, 1, n, "the child's output must exist")
+}
+
+// TestSpendAndCreateRejectsContradictoryOptions pins the one invalid combination.
+func TestSpendAndCreateRejectsContradictoryOptions(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 100)
+
+	_, _, err := s.SpendAndCreate(ctx, tx, 100, utxo.WithCreateOnly(), utxo.WithSpendOnly())
+	require.Error(t, err, "WithCreateOnly and WithSpendOnly are mutually exclusive")
 }
