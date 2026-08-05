@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -113,7 +112,7 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 	// hash.String() from block validation, so keying by the raw message string
 	// would let a peer evade the invalid-block ban by announcing a
 	// non-canonical hex form (uppercase, truncated).
-	s.storePeerMapEntry(&s.blockPeerMap, hash.String(), fromID, now)
+	s.storePeerMapEntry(&s.blockPeerMap, hash.String(), fromID, now, "block")
 
 	s.logger.Debugf("[handleBlockTopic] storing peer %s for block %s", fromID, blockMessage.Hash)
 
@@ -246,7 +245,7 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, fromID string) 
 	// string so the ReportInvalidSubtree lookup (which uses hash.String() from
 	// subtree validation) matches even when the announcer sent a non-canonical
 	// hex form.
-	s.storePeerMapEntry(&s.subtreePeerMap, hash.String(), fromID, now)
+	s.storePeerMapEntry(&s.subtreePeerMap, hash.String(), fromID, now, "subtree")
 	s.logger.Debugf("[handleSubtreeTopic] storing peer %s for subtree %s", fromID, subtreeMessage.Hash)
 
 	if s.subtreeKafkaProducerClient != nil { // tests may not set this
@@ -844,22 +843,18 @@ func (s *Server) cleanupPeerMaps() {
 	subtreeCount := 0
 
 	// First pass: count entries and collect expired ones
-	s.blockPeerMap.Range(func(key, value interface{}) bool {
+	s.blockPeerMap.Range(func(key string, entry peerMapEntry) bool {
 		blockCount++
-		if entry, ok := value.(peerMapEntry); ok {
-			if now.Sub(entry.timestamp) > s.peerMapTTL {
-				blockKeysToDelete = append(blockKeysToDelete, key.(string))
-			}
+		if now.Sub(entry.timestamp) > s.peerMapTTL {
+			blockKeysToDelete = append(blockKeysToDelete, key)
 		}
 		return true
 	})
 
-	s.subtreePeerMap.Range(func(key, value interface{}) bool {
+	s.subtreePeerMap.Range(func(key string, entry peerMapEntry) bool {
 		subtreeCount++
-		if entry, ok := value.(peerMapEntry); ok {
-			if now.Sub(entry.timestamp) > s.peerMapTTL {
-				subtreeKeysToDelete = append(subtreeKeysToDelete, key.(string))
-			}
+		if now.Sub(entry.timestamp) > s.peerMapTTL {
+			subtreeKeysToDelete = append(subtreeKeysToDelete, key)
 		}
 		return true
 	})
@@ -936,13 +931,22 @@ func (s *Server) cleanupPeerMaps() {
 		s.enforceMapSizeLimit(&s.subtreePeerMap, s.peerMapMaxSize, "subtree")
 	}
 
+	// Surface how many inserts the inline cap refused since the last sweep
+	// (issue 1409) — flood visibility without a per-insert log line.
+	if blockRejected, subtreeRejected := s.blockPeerMap.RejectedSinceLastRead(), s.subtreePeerMap.RejectedSinceLastRead(); blockRejected > 0 || subtreeRejected > 0 {
+		s.logger.Warnf("[cleanupPeerMaps] peer maps were full: dropped attribution for %d block and %d subtree announcements since the last sweep", blockRejected, subtreeRejected)
+	}
+
 	// Log current sizes
 	s.logger.Infof("[cleanupPeerMaps] current map sizes - blocks: %d, subtrees: %d",
 		remainingBlockCount, remainingSubtreeCount)
 }
 
-// enforceMapSizeLimit removes oldest entries from a map to enforce size limit
-func (s *Server) enforceMapSizeLimit(m *sync.Map, maxSize int, mapType string) {
+// enforceMapSizeLimit removes oldest entries from a map to enforce size limit.
+// With the inline insert cap (issue 1409) the map cannot exceed its bound
+// between sweeps, so this is a safety net whose sort cost is bounded by the
+// cap rather than by however large a flood grew the map.
+func (s *Server) enforceMapSizeLimit(m *cappedPeerMap, maxSize int, mapType string) {
 	type entryWithKey struct {
 		key       string
 		timestamp time.Time
@@ -951,13 +955,11 @@ func (s *Server) enforceMapSizeLimit(m *sync.Map, maxSize int, mapType string) {
 	var entries []entryWithKey
 
 	// Collect all entries with their timestamps
-	m.Range(func(key, value interface{}) bool {
-		if entry, ok := value.(peerMapEntry); ok {
-			entries = append(entries, entryWithKey{
-				key:       key.(string),
-				timestamp: entry.timestamp,
-			})
-		}
+	m.Range(func(key string, entry peerMapEntry) bool {
+		entries = append(entries, entryWithKey{
+			key:       key,
+			timestamp: entry.timestamp,
+		})
 		return true
 	})
 
@@ -1136,28 +1138,29 @@ func (s *Server) shouldSkipUnhealthyPeer(from string, messageType string) bool {
 	return false
 }
 
-// storePeerMapEntry stores a peer entry in the specified map
-func (s *Server) storePeerMapEntry(peerMap *sync.Map, hash string, from string, timestamp time.Time) {
+// storePeerMapEntry stores a peer entry in the specified map. Inserts are
+// capped inline (issue 1409): once the map is full, new attacker-suppliable
+// hashes are dropped (attribution for them is lost until the sweep frees
+// space) instead of growing memory without bound between sweeps.
+func (s *Server) storePeerMapEntry(peerMap *cappedPeerMap, hash string, from string, timestamp time.Time, mapType string) {
 	entry := peerMapEntry{
 		peerID:    from,
 		timestamp: timestamp,
 	}
-	peerMap.Store(hash, entry)
+
+	if !peerMap.Store(hash, entry) {
+		s.logger.Debugf("[storePeerMapEntry] %s peer map full, dropping attribution for %s from %s", mapType, hash, from)
+	}
 }
 
-// getPeerFromMap retrieves and validates a peer entry from a map
-func (s *Server) getPeerFromMap(peerMap *sync.Map, hash string, mapType string) (string, error) {
-	peerIDVal, ok := peerMap.Load(hash)
+// getPeerFromMap retrieves a peer entry from a map
+func (s *Server) getPeerFromMap(peerMap *cappedPeerMap, hash string, mapType string) (string, error) {
+	entry, ok := peerMap.Load(hash)
 	if !ok {
 		s.logger.Warnf("[getPeerFromMap] no peer found for %s %s", mapType, hash)
 		return "", errors.NewNotFoundError("no peer found for %s %s", mapType, hash)
 	}
 
-	entry, ok := peerIDVal.(peerMapEntry)
-	if !ok {
-		s.logger.Errorf("[getPeerFromMap] peer entry for %s %s is not a peerMapEntry: %v", mapType, hash, peerIDVal)
-		return "", errors.NewInvalidArgumentError("peer entry for %s %s is not a peerMapEntry", mapType, hash)
-	}
 	return entry.peerID, nil
 }
 

@@ -59,7 +59,7 @@ func TestStartInvalidBlocksConsumer_BansPeer(t *testing.T) {
 	}()
 
 	blockHash := "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b"
-	s.storePeerMapEntry(&s.blockPeerMap, blockHash, pid.String(), time.Now())
+	s.storePeerMapEntry(&s.blockPeerMap, blockHash, pid.String(), time.Now(), "block")
 
 	// The same call Server.Start makes to wire the consumer.
 	s.startInvalidBlocksConsumer(ctx)
@@ -128,7 +128,7 @@ func TestProcessInvalidBlockMessage_AddBanScoreErrorIsReturned(t *testing.T) {
 	s.peerRegistry = &failingBanScoreRegistry{err: errors.NewServiceError("registry down")}
 
 	blockHash := "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c"
-	s.storePeerMapEntry(&s.blockPeerMap, blockHash, pid.String(), time.Now())
+	s.storePeerMapEntry(&s.blockPeerMap, blockHash, pid.String(), time.Now(), "block")
 
 	msgBytes := mustMarshalInvalidBlockMsg(t, blockHash, "registry failure")
 

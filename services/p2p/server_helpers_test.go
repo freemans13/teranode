@@ -447,7 +447,7 @@ func TestHandleBlockTopic_RejectsMalformedAdvertisedHash(t *testing.T) {
 	}
 
 	entries := 0
-	s.blockPeerMap.Range(func(_, _ any) bool { entries++; return true })
+	s.blockPeerMap.Range(func(_ string, _ peerMapEntry) bool { entries++; return true })
 	require.Zero(t, entries, "malformed hash must not create a blockPeerMap entry")
 }
 
@@ -556,7 +556,7 @@ func TestHandleSubtreeTopic_RejectsMalformedHash(t *testing.T) {
 	}
 
 	entries := 0
-	s.subtreePeerMap.Range(func(_, _ any) bool { entries++; return true })
+	s.subtreePeerMap.Range(func(_ string, _ peerMapEntry) bool { entries++; return true })
 	require.Zero(t, entries, "malformed hash must not create a subtreePeerMap entry")
 
 	_, ok := reg.Get(remote.String())

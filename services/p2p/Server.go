@@ -146,8 +146,8 @@ type Server struct {
 	invalidSubtreeTopicName           string                         // Kafka topic for invalid subtrees
 	nodeStatusTopicName               string                         // pubsub topic for node status messages
 	topicPrefix                       string                         // Chain identifier prefix for topic validation
-	blockPeerMap                      sync.Map                       // Map to track which peer sent each block (canonical chainhash.Hash.String() -> peerMapEntry)
-	subtreePeerMap                    sync.Map                       // Map to track which peer sent each subtree (canonical chainhash.Hash.String() -> peerMapEntry)
+	blockPeerMap                      cappedPeerMap                  // Which peer sent each block (canonical hash -> peerMapEntry); insert-capped, issue 1409
+	subtreePeerMap                    cappedPeerMap                  // Which peer sent each subtree (canonical hash -> peerMapEntry); insert-capped, issue 1409
 	startTime                         time.Time                      // Server start time for uptime calculation
 	peerRegistry                      blockchain.PeerRegistryClientI // gRPC client for the centralized peer registry hosted by the blockchain service
 	peerSelector                      *PeerSelector                  // Stateless peer selection logic
@@ -458,6 +458,11 @@ func NewServer(
 	if tSettings.P2P.PeerMapTTL > 0 {
 		p2pServer.peerMapTTL = tSettings.P2P.PeerMapTTL
 	}
+
+	// The attribution maps are bounded at insert (issue 1409); the cap is set
+	// once the size setting is resolved.
+	p2pServer.blockPeerMap.setMaxSize(p2pServer.peerMapMaxSize)
+	p2pServer.subtreePeerMap.setMaxSize(p2pServer.peerMapMaxSize)
 
 	// Use the centralized peer registry hosted by the blockchain service.
 	// Loading, persistence, ban scoring, and TTL/LRU eviction all live there now.
@@ -1857,14 +1862,8 @@ func (s *Server) Stop(ctx context.Context) error {
 	// drives its own TTL/LRU eviction (deferred to PR2 in any case).
 
 	// Clear the peer maps to free memory
-	s.blockPeerMap.Range(func(key, value interface{}) bool {
-		s.blockPeerMap.Delete(key)
-		return true
-	})
-	s.subtreePeerMap.Range(func(key, value interface{}) bool {
-		s.subtreePeerMap.Delete(key)
-		return true
-	})
+	s.blockPeerMap.Clear()
+	s.subtreePeerMap.Clear()
 	s.logger.Infof("[Stop] cleared peer maps")
 
 	if len(errs) > 0 {
