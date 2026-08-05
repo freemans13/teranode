@@ -1610,6 +1610,10 @@ func TestSmokeTests(t *testing.T) {
 		tests.Store(t, store)
 	})
 
+	t.Run("aerospike_set_block_state", func(t *testing.T) {
+		tests.SetBlockStateContract(t, store)
+	})
+
 	t.Run("aerospike_spend", func(t *testing.T) {
 		err := store.Delete(ctx, tests.TXHash)
 		require.NoError(t, err)

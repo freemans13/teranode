@@ -949,6 +949,27 @@ func SetBlockHeightZero(t *testing.T, db utxostore.Store) {
 	require.ErrorIs(t, err, errors.ErrInvalidArgument)
 }
 
+// SetBlockStateContract pins the write side of the GetBlockState snapshot
+// guarantee on a real store (issue 1443): after one SetBlockState call the
+// snapshot AND the single-field getters must all agree — the single-field
+// atomics feed DAH and maturity logic directly, so a SetBlockState that
+// updated only the snapshot pair would silently freeze those readers at a
+// stale height while every pair-based test stayed green. Height zero is
+// rejected exactly like SetBlockHeight(0).
+func SetBlockStateContract(t *testing.T, db utxostore.Store) {
+	require.NoError(t, db.SetBlockState(4242, 1700000042))
+
+	state := db.GetBlockState()
+	require.Equal(t, uint32(4242), state.Height)
+	require.Equal(t, uint32(1700000042), state.MedianTime)
+	require.Equal(t, uint32(4242), db.GetBlockHeight(), "single-field height reader must stay in step with the snapshot")
+	require.Equal(t, uint32(1700000042), db.GetMedianBlockTime(), "single-field median reader must stay in step with the snapshot")
+
+	err := db.SetBlockState(0, 1700000042)
+	require.Error(t, err)
+	require.ErrorIs(t, err, errors.ErrInvalidArgument)
+}
+
 // SetLockedBehavior tests the SetLocked lifecycle:
 //   - Locking a tx makes its outputs report Status_LOCKED via GetSpend
 //   - Spending a locked tx returns ErrTxLocked

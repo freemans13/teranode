@@ -1035,6 +1035,12 @@ func Test_SmokeTests(t *testing.T) {
 		tests.SetBlockHeightZero(t, db)
 	})
 
+	t.Run("set block state contract", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		tests.SetBlockStateContract(t, db)
+	})
+
 	t.Run("set locked behavior", func(t *testing.T) {
 		db, _ := setup(ctx, t)
 
