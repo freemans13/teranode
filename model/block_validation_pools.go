@@ -1,6 +1,7 @@
 package model
 
 import (
+	"math"
 	"sync"
 
 	txmap "github.com/bsv-blockchain/go-tx-map"
@@ -59,10 +60,13 @@ var txMapPools = func() []*sync.Pool {
 
 // txMapClassIdxFor returns the smallest size-class index that holds n
 // entries, or -1 if n exceeds every class (caller allocates fresh + skips
-// the pool).
-func txMapClassIdxFor(n uint32) int {
+// the pool). n is 64-bit because a block's transaction count is: post-Genesis
+// BSV has no block-size limit, and narrowing the count to uint32 turned a
+// consensus-valid block with more than 2^32 transactions into an eternally
+// retried processing error (issue 1428).
+func txMapClassIdxFor(n uint64) int {
 	for i, class := range txMapSizeClasses {
-		if n <= class {
+		if n <= uint64(class) {
 			return i
 		}
 	}
@@ -71,11 +75,18 @@ func txMapClassIdxFor(n uint32) int {
 
 // GetTxMap returns a *SplitSwissMapUint64 sized for at least n entries.
 // Drawn from the pool when n fits a known size class; allocated fresh
-// otherwise. Pass the same n to PutTxMap.
-func GetTxMap(n uint32) *txmap.SplitSwissMapUint64 {
+// otherwise. Pass the same n to PutTxMap. n is a preallocation hint — the
+// underlying swiss maps grow on demand — so counts beyond uint32 clamp the
+// hint rather than failing.
+func GetTxMap(n uint64) *txmap.SplitSwissMapUint64 {
 	idx := txMapClassIdxFor(n)
 	if idx < 0 {
-		return txmap.NewSplitSwissMapUint64(n, txMapBuckets)
+		hint := n
+		if hint > math.MaxUint32 {
+			hint = math.MaxUint32
+		}
+
+		return txmap.NewSplitSwissMapUint64(uint32(hint), txMapBuckets)
 	}
 	return txMapPools[idx].Get().(*txmap.SplitSwissMapUint64)
 }
@@ -83,7 +94,7 @@ func GetTxMap(n uint32) *txmap.SplitSwissMapUint64 {
 // PutTxMap clears m and returns it to the size-class pool keyed by n.
 // n must match the value passed to GetTxMap. Maps that did not come from
 // the pool (n above max class) are dropped.
-func PutTxMap(m *txmap.SplitSwissMapUint64, n uint32) {
+func PutTxMap(m *txmap.SplitSwissMapUint64, n uint64) {
 	if m == nil {
 		return
 	}

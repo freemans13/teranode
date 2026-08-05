@@ -795,10 +795,9 @@ func (b *Block) releaseTxMap() {
 		// Return the pooled in-memory map for reuse on the next block.
 		// b.TransactionCount was set in GetAndValidateSubtrees before
 		// checkDuplicateTransactions ran, so it matches the value used at
-		// GetTxMap time and the map lands in the correct size-class pool.
-		if n, err := safeconversion.Uint64ToUint32(b.TransactionCount); err == nil {
-			PutTxMap(poolable, n)
-		}
+		// GetTxMap time and the map lands in the correct size-class pool
+		// (counts above every size class are dropped by PutTxMap).
+		PutTxMap(poolable, b.TransactionCount)
 	} else if closer, ok := b.txMap.(io.Closer); ok {
 		_ = closer.Close()
 	}
@@ -971,11 +970,6 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 	g := new(errgroup.Group)
 	util.SafeSetLimit(logger, g, concurrency)
 
-	transactionCountUint32, err := safeconversion.Uint64ToUint32(b.TransactionCount)
-	if err != nil {
-		return errors.NewProcessingError("[checkDuplicateTransactions][%s] failed to convert transaction count to int", b.String(), err)
-	}
-
 	// set the expected subtree size based on the first subtree in the block
 	subtreeSize := 0
 	if len(b.SubtreeSlices) > 0 {
@@ -1001,8 +995,10 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 	} else {
 		// Draw the txMap from a size-class pool so the (potentially multi-GB)
 		// backing storage is reused across blocks. PutTxMap is called at
-		// release time below, keyed by the same transactionCountUint32.
-		b.txMap = GetTxMap(transactionCountUint32)
+		// release time below, keyed by the same 64-bit transaction count —
+		// counts above every size class allocate fresh with a clamped
+		// preallocation hint instead of failing the block (issue 1428).
+		b.txMap = GetTxMap(b.TransactionCount)
 	}
 	for subIdx := 0; subIdx < len(b.SubtreeSlices); subIdx++ {
 		subIdx := subIdx
@@ -1013,7 +1009,7 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 		})
 	}
 
-	if err = g.Wait(); err != nil {
+	if err := g.Wait(); err != nil {
 		// return the error from above without wrapping it
 		return err
 	}
