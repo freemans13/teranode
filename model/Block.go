@@ -514,8 +514,9 @@ type SubtreeStore interface {
 // single source of truth.
 //
 // currentChain is a run of this block's ancestor headers with the block's parent at one end:
-// newest-first (the blockchainClient.GetBlockHeaders order every block-validation call site
-// passes, parent at index 0) or oldest-first (parent last). The median-time-past window is
+// newest-first with the parent at index 0 — the order both block-validation header sources
+// produce, blockchainClient.GetBlockHeaders and the catchup HeaderChainCache — or oldest-first
+// with the parent last. The median-time-past window is
 // anchored on whichever end carries the parent; a run with the parent at neither end is
 // rejected with a processing error, because evaluating the median against headers that are
 // not the parent's makes the rule silently diverge from consensus (issue #1467 — the old
@@ -543,6 +544,13 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 	if currentChainLength > 0 {
 		if currentChainLength < pruneLength {
 			pruneLength = currentChainLength
+		}
+
+		// The window is anchored by parent hash, so a header with no parent hash cannot be
+		// anchored at all. Reject before the switch: the fall-through error below formats the
+		// block, and hashing a header whose HashPrevBlock is nil panics.
+		if b.Header.HashPrevBlock == nil {
+			return errors.NewProcessingError("[BLOCK] block header carries no parent hash, cannot evaluate median time past")
 		}
 
 		var lastTimeStamps []*BlockHeader

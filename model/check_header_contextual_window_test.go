@@ -194,4 +194,16 @@ func TestCheckHeaderContextualMedianWindow(t *testing.T) {
 		accepted := buildChildBlock(t, single[0], baseTime+1)
 		require.NoError(t, accepted.CheckHeaderContextual(single, newSettings(t), logger))
 	})
+
+	t.Run("header with no parent hash is a processing error, not a panic", func(t *testing.T) {
+		block := buildChildBlock(t, parent, trueMedianTimePast+1)
+		block.Header.HashPrevBlock = nil
+
+		// chainhash.Hash.String() has a value receiver, so formatting a block whose
+		// HashPrevBlock is nil panics; the anchoring check must reject before it gets there.
+		err := block.CheckHeaderContextual(newestFirst(ascending), newSettings(t), logger)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "no parent hash")
+		require.False(t, errors.Is(err, errors.ErrBlockInvalid))
+	})
 }
