@@ -73,20 +73,28 @@ func txMapClassIdxFor(n uint64) int {
 	return -1
 }
 
+// txMapAllocHint clamps a 64-bit entry count to the preallocation hint the
+// map constructor accepts. The constructor preallocates EAGERLY from the hint
+// (tens of GB for counts near the clamp — see the note in
+// TestGetTxMap_OversizedAllocatesFresh about keeping such allocations out of
+// tests), so the clamp caps preallocation only; the swiss maps resize on
+// insert, so capacity is not limited by it.
+func txMapAllocHint(n uint64) uint32 {
+	if n > math.MaxUint32 {
+		return math.MaxUint32
+	}
+
+	return uint32(n)
+}
+
 // GetTxMap returns a *SplitSwissMapUint64 sized for at least n entries.
 // Drawn from the pool when n fits a known size class; allocated fresh
-// otherwise. Pass the same n to PutTxMap. n is a preallocation hint — the
-// underlying swiss maps grow on demand — so counts beyond uint32 clamp the
-// hint rather than failing.
+// otherwise (with the preallocation hint clamped for counts beyond uint32,
+// instead of failing — issue 1428). Pass the same n to PutTxMap.
 func GetTxMap(n uint64) *txmap.SplitSwissMapUint64 {
 	idx := txMapClassIdxFor(n)
 	if idx < 0 {
-		hint := n
-		if hint > math.MaxUint32 {
-			hint = math.MaxUint32
-		}
-
-		return txmap.NewSplitSwissMapUint64(uint32(hint), txMapBuckets)
+		return txmap.NewSplitSwissMapUint64(txMapAllocHint(n), txMapBuckets)
 	}
 	return txMapPools[idx].Get().(*txmap.SplitSwissMapUint64)
 }
