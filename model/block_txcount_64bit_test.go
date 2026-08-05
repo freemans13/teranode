@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -90,6 +91,14 @@ func TestCheckDuplicateTransactionsUsesFullCount(t *testing.T) {
 
 	require.NoError(t, block.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, 4, nil))
 
+	// Hold the map across release: PutTxMap clears it only when the 64-bit key
+	// resolves to a pool class, so a wrong or stale release key (which would
+	// silently drop the map instead of pooling it) leaves the 3 entries behind.
+	pooled, ok := block.txMap.(*txmap.SplitSwissMapUint64)
+	require.True(t, ok)
+	require.Equal(t, 3, pooled.Length())
+
 	block.releaseTxMap()
 	require.Nil(t, block.txMap)
+	require.Equal(t, 0, pooled.Length(), "released map must be cleared and pooled, not dropped")
 }
