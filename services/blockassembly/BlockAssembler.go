@@ -122,6 +122,11 @@ type BlockAssembler struct {
 	// bestBlock atomically stores the current best block header and height together
 	bestBlock atomic.Pointer[BestBlockInfo]
 
+	// mtpFloorWarnedTip remembers the last parent block for which candidateTime
+	// warned that the median-time-past floor engaged, so the warning fires once
+	// per tip instead of once per miner poll (see candidateTime)
+	mtpFloorWarnedTip atomic.Pointer[chainhash.Hash]
+
 	// stateChangeCh notifies listeners of state changes
 	// Protected by stateChangeMu to prevent race conditions
 	stateChangeMu sync.RWMutex
