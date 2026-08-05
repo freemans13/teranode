@@ -2,6 +2,7 @@ package blockassembly
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -221,6 +222,31 @@ func TestCandidateTimeFallback(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("floor warning fires once per tip, not once per poll", func(t *testing.T) {
+		logger := &warnCountingLogger{}
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+
+		assembler := &BlockAssembler{logger: logger, blockchainClient: mockClient}
+
+		for i := 0; i < 3; i++ {
+			got, err := assembler.candidateTime(t.Context(), tip)
+			require.NoError(t, err)
+			require.Equal(t, wantFloor, got)
+		}
+
+		require.Equal(t, int32(1), logger.warns.Load(), "repeated polls on the same tip must warn once")
+
+		// A new tip is a new condition: it must warn again.
+		nextHeaders := linkedHeaders(t, 11, baseTime+100)
+		nextTip := nextHeaders[0]
+		mockClient.On("GetBlockHeaders", mock.Anything, nextTip.Hash(), mock.Anything).Return(nextHeaders, []*model.BlockHeaderMeta{}, nil)
+
+		_, err := assembler.candidateTime(t.Context(), nextTip)
+		require.NoError(t, err)
+		require.Equal(t, int32(2), logger.warns.Load(), "a different tip must warn again")
+	})
+
 	t.Run("walk stops cleanly at the chain start", func(t *testing.T) {
 		// A 3-block chain whose oldest header points at the all-zero genesis
 		// parent: the walk must return the short run, and the median over 3
@@ -238,6 +264,17 @@ func TestCandidateTimeFallback(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, int64(baseTime+1)+1, got)
 	})
+}
+
+// warnCountingLogger counts Warnf calls so tests can pin the once-per-tip
+// warning latch in candidateTime; everything else is the no-op TestLogger.
+type warnCountingLogger struct {
+	ulogger.TestLogger
+	warns atomic.Int32
+}
+
+func (l *warnCountingLogger) Warnf(format string, args ...interface{}) {
+	l.warns.Add(1)
 }
 
 // linkedHeadersFromGenesis is linkedHeaders but the oldest header's parent is
