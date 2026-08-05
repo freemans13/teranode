@@ -34,8 +34,13 @@ type Level []Node
 // It contains the offset (position) and optionally the hash data,
 // with flags indicating the type of node and data present.
 type Node struct {
-	// Offset is the position of this node within its level of the tree
-	Offset uint32 `json:"offset"`
+	// Offset is the position of this node within its level of the tree.
+	// BUMP offsets are leaf indices in a single flat tree over the whole
+	// block, encoded as VarInt on the wire (BRC-74), so they are carried in
+	// 64 bits: at Teranode scale a block's padded leaf count can exceed 2^32,
+	// and 32-bit arithmetic silently wrapped the offset, producing a proof
+	// that points at the wrong transaction (issue 1427).
+	Offset uint64 `json:"offset"`
 
 	// Hash is the hex-encoded hash value for this node (optional, may be empty)
 	Hash string `json:"hash,omitempty"`
@@ -86,8 +91,48 @@ func ConvertToBUMP(proof *merkleproof.MerkleProof) (*Format, error) {
 	// of the transaction's global leaf offset, and the subtree index contributes the high bits. (The
 	// previous code numbered the two segments independently, which produced wrong offsets — and thus
 	// unverifiable BUMPs — for any block with more than one subtree.)
+	//
+	// All offset arithmetic is in uint64: BUMP offsets are unbounded leaf indices (VarInt on the
+	// wire), and a padded leaf count beyond 2^32 silently wrapped the previous 32-bit computation
+	// into a proof for the wrong transaction. The guards below reject inputs the arithmetic cannot
+	// represent, loudly, instead of wrapping.
 	subtreeLevels := len(proof.SubtreeProof)
-	globalOffset := (uint32(proof.SubtreeIndex) << uint(subtreeLevels)) | uint32(proof.TxIndexInSubtree) //nolint:gosec
+	totalLevels := subtreeLevels + len(proof.BlockProof)
+
+	if totalLevels > 64 {
+		return nil, errors.NewInvalidArgumentError("proof has %d levels, beyond the 64 a leaf offset can address", totalLevels)
+	}
+
+	// A subtree proof — a proof of a subtree root rather than of a transaction — carries the
+	// sentinel TxIndexInSubtree == -1 with an empty SubtreeProof (see ConstructSubtreeMerkleProof).
+	// The leaf being proven is then the subtree root itself: index 0 of its zero-level segment.
+	// The old 32-bit code folded the sentinel to 0xFFFFFFFF and served garbage offsets for every
+	// subtree-proof BUMP.
+	txIndex := proof.TxIndexInSubtree
+	if txIndex == -1 && subtreeLevels == 0 {
+		txIndex = 0
+	}
+
+	// The tx index addresses a leaf within its subtree and the subtree index addresses a
+	// subtree within the block, so each must fit in its segment's bit width — otherwise the
+	// OR below would silently merge bits across the two segments and point at a different
+	// transaction. (When a segment spans all 64 bits any index fits, and totalLevels <= 64
+	// makes the shifts below safe.)
+	blockLevels := len(proof.BlockProof)
+
+	if proof.SubtreeIndex < 0 || txIndex < 0 {
+		return nil, errors.NewInvalidArgumentError("negative proof position (subtree index %d, tx index %d)", proof.SubtreeIndex, proof.TxIndexInSubtree)
+	}
+
+	if subtreeLevels < 64 && uint64(txIndex) >= 1<<uint(subtreeLevels) {
+		return nil, errors.NewInvalidArgumentError("tx index %d does not fit in a subtree of %d levels", txIndex, subtreeLevels)
+	}
+
+	if blockLevels < 64 && uint64(proof.SubtreeIndex) >= 1<<uint(blockLevels) {
+		return nil, errors.NewInvalidArgumentError("subtree index %d does not fit in a block of %d subtree levels", proof.SubtreeIndex, blockLevels)
+	}
+
+	globalOffset := (uint64(proof.SubtreeIndex) << uint(subtreeLevels)) | uint64(txIndex)
 
 	appendLevel := func(levelIdx int, siblingHash chainhash.Hash) {
 		// Sibling offset at this level: the working hash sits at globalOffset>>levelIdx; its sibling is
@@ -161,7 +206,7 @@ func (b *Format) EncodeBinary() ([]byte, error) {
 		// Write each node in the level
 		for nodeIdx, node := range level {
 			// Write offset as VarInt
-			if err := writeVarInt(&buf, uint64(node.Offset)); err != nil {
+			if err := writeVarInt(&buf, node.Offset); err != nil {
 				return nil, errors.NewProcessingError("failed to write offset for level %d, node %d", levelIdx, nodeIdx, err)
 			}
 
