@@ -161,21 +161,32 @@ func TestCandidateTimeFallback(t *testing.T) {
 	})
 
 	t.Run("mis-anchored batched run falls back to the hash-keyed walk", func(t *testing.T) {
-		// The run starts at the wrong block — what a reorg between the batched
-		// lookup's height probe and its range scan produces.
+		// The run is a correctly-linked chain anchored at the WRONG block with
+		// different timestamps — what a reorg between the batched lookup's
+		// height probe and its range scan produces (the winning fork's blocks
+		// at the same heights). Its median differs from the true chain's, so
+		// this test fails if the anchor guard is ever weakened: the floor
+		// would come out of the wrong fork's timestamps.
+		wrongFork := linkedHeaders(t, 11, baseTime+1000)
+
 		mockClient := &blockchain.Mock{}
-		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(headers[1:], []*model.BlockHeaderMeta{}, nil)
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(wrongFork, []*model.BlockHeaderMeta{}, nil)
 		stubWalk(mockClient)
 
 		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
 		require.NoError(t, err)
 		require.Equal(t, wantFloor, got)
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 11)
 	})
 
 	t.Run("broken link in the batched run falls back to the hash-keyed walk", func(t *testing.T) {
+		// Replace one mid-run header with a differently-stamped stray so the
+		// run's median differs from the true chain's — swapping two elements
+		// would leave the (sorted) median identical and the link guard
+		// unpinned under mutation.
 		broken := make([]*model.BlockHeader, len(headers))
 		copy(broken, headers)
-		broken[5], broken[6] = broken[6], broken[5]
+		broken[6] = linkedHeaders(t, 1, baseTime+1000)[0]
 
 		mockClient := &blockchain.Mock{}
 		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(broken, []*model.BlockHeaderMeta{}, nil)
@@ -184,6 +195,7 @@ func TestCandidateTimeFallback(t *testing.T) {
 		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
 		require.NoError(t, err)
 		require.Equal(t, wantFloor, got)
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 11)
 	})
 
 	t.Run("nil header in the batched run falls back to the hash-keyed walk", func(t *testing.T) {
