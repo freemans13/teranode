@@ -513,8 +513,15 @@ type SubtreeStore interface {
 // optimistic AddBlock to close that gap (issue #1149). Valid() also calls it so the check remains a
 // single source of truth.
 //
-// currentChain is the run of previous headers ending at the block's parent; when empty the
-// median-time-past rule is skipped (same as Valid()). Returns nil when the header passes.
+// currentChain is a run of this block's ancestor headers with the block's parent at one end:
+// newest-first (the blockchainClient.GetBlockHeaders order every block-validation call site
+// passes, parent at index 0) or oldest-first (parent last). The median-time-past window is
+// anchored on whichever end carries the parent; a run with the parent at neither end is
+// rejected with a processing error, because evaluating the median against headers that are
+// not the parent's makes the rule silently diverge from consensus (issue #1467 — the old
+// tail-slice selection measured the oldest headers of a newest-first run, ~90 blocks below
+// the parent). When currentChain is empty the median-time-past rule is skipped (same as
+// Valid()). Returns nil when the header passes.
 func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *settings.Settings, logger ulogger.Logger) error {
 	// 2. Check that the block timestamp is not more than two hours in the future.
 	twoHoursToTheFutureTimestampUint32, err := safeconversion.Int64ToUint32(time.Now().Add(2 * time.Hour).Unix())
@@ -526,8 +533,10 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 		return errors.NewBlockInvalidError("[BLOCK][%s] block timestamp is more than two hours in the future", b.String())
 	}
 
-	// 3. Check that the median time past of the block is after the median time past of the last 11 blocks.
-	// if we don't have 11 blocks then use what we have
+	// 3. Check that the block's timestamp is strictly after the median timestamp of the 11
+	// blocks ending at its parent (use what we have when the chain is shorter). The window
+	// must be the headers ADJACENT to the parent, so anchor it on whichever end of the run
+	// the parent sits at rather than assuming an order.
 	pruneLength := 11
 	currentChainLength := len(currentChain)
 	// if the current chain length is 0 skip this test
@@ -536,11 +545,28 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 			pruneLength = currentChainLength
 		}
 
-		// prune the last few timestamps from the current chain
-		lastTimeStamps := currentChain[currentChainLength-pruneLength:]
+		var lastTimeStamps []*BlockHeader
+
+		switch {
+		case currentChain[0] != nil && currentChain[0].Hash().IsEqual(b.Header.HashPrevBlock):
+			// newest-first (GetBlockHeaders order): the parent and its predecessors lead the run
+			lastTimeStamps = currentChain[:pruneLength]
+		case currentChain[currentChainLength-1] != nil && currentChain[currentChainLength-1].Hash().IsEqual(b.Header.HashPrevBlock):
+			// oldest-first: the parent and its predecessors end the run
+			lastTimeStamps = currentChain[currentChainLength-pruneLength:]
+		default:
+			// The supplied run is not this block's parent chain: a context error on the caller's
+			// side, not proof the block is invalid — do not mark the block bad for it.
+			return errors.NewProcessingError("[BLOCK][%s] currentChain (%d headers) is not anchored at the block's parent %s, cannot evaluate median time past", b.String(), currentChainLength, b.Header.HashPrevBlock.String())
+		}
+
 		prevTimeStamps := make([]time.Time, pruneLength)
 
 		for i, bh := range lastTimeStamps {
+			if bh == nil {
+				return errors.NewProcessingError("[BLOCK][%s] nil header in the median-time-past window", b.String())
+			}
+
 			prevTimeStamps[i] = time.Unix(int64(bh.Timestamp), 0)
 		}
 

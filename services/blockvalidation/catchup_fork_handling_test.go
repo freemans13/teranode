@@ -851,6 +851,13 @@ func TestCatchup_CompetingEqualWorkChains(t *testing.T) {
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*chainhash.Hash{bestBlockHeader.Hash()}, nil)
 
+		// Anchored parent-chain runs for both competing chains' blocks:
+		// CheckHeaderContextual requires GetBlockHeaders(parent) to actually return the
+		// parent's chain (issue 1467). Registered before the catch-all below so testify
+		// matches these first.
+		registerParentChainHeaders(mockBlockchainClient, append([]*model.BlockHeader{genesisHeader}, chain1...), 0)
+		registerParentChainHeaders(mockBlockchainClient, append([]*model.BlockHeader{genesisHeader}, chain2...), 0)
+
 		// Mock GetBlockHeaders for common ancestor finding
 		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*model.BlockHeader{bestBlockHeader}, []*model.BlockHeaderMeta{{Height: 0, ID: 1}}, nil).Maybe()
