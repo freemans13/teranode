@@ -61,6 +61,13 @@ func (m *NullStore) GetMedianBlockTime() uint32 {
 	return m.medianBlockTime
 }
 
+func (m *NullStore) SetBlockState(height, medianTime uint32) error {
+	m.blockHeight = height
+	m.medianBlockTime = medianTime
+
+	return nil
+}
+
 func (m *NullStore) GetBlockState() utxo.BlockState {
 	return utxo.BlockState{
 		Height:     m.blockHeight,

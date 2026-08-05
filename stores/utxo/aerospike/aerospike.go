@@ -209,6 +209,7 @@ type Store struct {
 	setName             string
 	blockHeight         atomic.Uint32
 	medianBlockTime     atomic.Uint32
+	blockState          utxo.BlockStateHolder
 	logger              ulogger.Logger
 	settings            *settings.Settings
 	batchID             atomic.Uint64
@@ -650,6 +651,7 @@ func (s *Store) SetBlockHeight(blockHeight uint32) error {
 
 	s.logger.Debugf("setting block height to %d", blockHeight)
 	s.blockHeight.Store(blockHeight)
+	s.blockState.SetHeight(blockHeight)
 	s.externalStore.SetCurrentBlockHeight(blockHeight)
 
 	return nil
@@ -695,6 +697,7 @@ func (s *Store) deleteAtHeightFor(blockHeight uint32) (uint32, bool) {
 func (s *Store) SetMedianBlockTime(medianTime uint32) error {
 	s.logger.Debugf("setting median block time to %d", medianTime)
 	s.medianBlockTime.Store(medianTime)
+	s.blockState.SetMedianTime(medianTime)
 
 	return nil
 }
@@ -703,11 +706,25 @@ func (s *Store) GetMedianBlockTime() uint32 {
 	return s.medianBlockTime.Load()
 }
 
-func (s *Store) GetBlockState() utxo.BlockState {
-	return utxo.BlockState{
-		Height:     s.blockHeight.Load(),
-		MedianTime: s.medianBlockTime.Load(),
+// SetBlockState publishes both chain-tip values as one atomic snapshot; see
+// utxo.Store. The individual atomics are kept in step for their existing
+// single-field readers.
+func (s *Store) SetBlockState(blockHeight, medianTime uint32) error {
+	if blockHeight == 0 {
+		return errors.NewInvalidArgumentError("block height cannot be zero")
 	}
+
+	s.logger.Debugf("setting block state to height %d, median time %d", blockHeight, medianTime)
+	s.blockHeight.Store(blockHeight)
+	s.medianBlockTime.Store(medianTime)
+	s.blockState.SetPair(blockHeight, medianTime)
+	s.externalStore.SetCurrentBlockHeight(blockHeight)
+
+	return nil
+}
+
+func (s *Store) GetBlockState() utxo.BlockState {
+	return s.blockState.Load()
 }
 
 // Close drains all batched-write workers and releases the Aerospike client.

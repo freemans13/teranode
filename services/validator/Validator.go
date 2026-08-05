@@ -367,9 +367,11 @@ func (v *Validator) GetMedianBlockTime() uint32 {
 	return v.utxoStore.GetMedianBlockTime()
 }
 
-// GetBlockState returns an atomic snapshot of both block height and median block time
-// from the UTXO store. This prevents race conditions that could occur when reading
-// these values separately, ensuring consistency during validation.
+// GetBlockState returns the block height and median block time from the UTXO
+// store as one snapshot: the store keeps the pair behind a single atomic
+// pointer written by SetBlockState, so a reader can never pair a new height
+// with a stale median time mid-read (issue 1443) — both values in one
+// finality decision come from the same chain tip.
 func (v *Validator) GetBlockState() utxo.BlockState {
 	return v.utxoStore.GetBlockState()
 }

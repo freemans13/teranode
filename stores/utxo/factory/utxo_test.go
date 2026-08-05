@@ -44,6 +44,11 @@ func (m *MockUTXOStore) SetMedianBlockTime(time uint32) error {
 	return args.Error(0)
 }
 
+func (m *MockUTXOStore) SetBlockState(height, medianTime uint32) error {
+	args := m.Called(height, medianTime)
+	return args.Error(0)
+}
+
 func (m *MockUTXOStore) GetBlockHeight() uint32 {
 	args := m.Called()
 	return args.Get(0).(uint32)
