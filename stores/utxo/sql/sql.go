@@ -1650,7 +1650,10 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		}
 	}
 
-	if contains(bins, fields.BlockIDs) {
+	// This one query fills BlockIDs, BlockHeights and SubtreeIdxs together, so asking
+	// for any of the three has to run it. Gating on BlockIDs alone meant a caller that
+	// asked only for BlockHeights or SubtreeIdxs got an empty slice and no error.
+	if contains(bins, fields.BlockIDs) || contains(bins, fields.BlockHeights) || contains(bins, fields.SubtreeIdxs) {
 		q := `
 			SELECT
 			    block_id,
@@ -3683,7 +3686,10 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 
 	needInputs := contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)
 	needOutputs := contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos)
-	needBlockIDs := contains(bins, fields.BlockIDs)
+	// One query fills BlockIDs, BlockHeights and SubtreeIdxs together, so asking for
+	// any of the three has to run it. Gating on BlockIDs alone meant a caller that
+	// asked only for BlockHeights or SubtreeIdxs got an empty slice and no error.
+	needBlockIDs := contains(bins, fields.BlockIDs) || contains(bins, fields.BlockHeights) || contains(bins, fields.SubtreeIdxs)
 
 	// Query 2: Bulk fetch inputs
 	if needInputs {

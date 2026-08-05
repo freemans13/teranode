@@ -3625,3 +3625,78 @@ func TestMinimalCreate_CoinbaseMaturity_OutpointOnlySpend(t *testing.T) {
 		utxo.IgnoreFlags{IgnoreLocked: true, SkipUTXOHashCheck: true})
 	require.NoError(t, err, "spending at maturity height must succeed")
 }
+
+// TestGetBlockHeightsWithoutBlockIDs pins a field-selection bug that was silent.
+//
+// BlockIDs, BlockHeights and SubtreeIdxs all come from one query against the
+// block_ids table, and that query used to run only when the caller asked for
+// BlockIDs. A caller that asked for BlockHeights or SubtreeIdxs on their own got an
+// empty slice back and no error at all — indistinguishable from a transaction that
+// genuinely has not been mined.
+//
+// Nothing in the tree hits it today, because both callers that want BlockHeights
+// happen to ask for BlockIDs alongside it (Validator.go and
+// check_block_subtrees.go). That makes this a trap rather than a live fault, and
+// an expensive one: BlockHeights feeds the input script block height used for
+// BIP68 relative locktime, so a future caller that dropped the seemingly-unused
+// BlockIDs from its field list would have silently changed consensus-relevant
+// behaviour on every sqlite-backed store — including the sqlitememory store the
+// project's own guidance tells people to use in tests.
+//
+// The aerospike store has the opposite habit: it ADDS BlockHeights and SubtreeIdxs
+// whenever BlockIDs is requested (aerospike/get.go addAbstractedBins). Making the
+// two backends agree is the point of the fix.
+func TestGetBlockHeightsWithoutBlockIDs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	utxoStore, tx := setup(ctx, t)
+
+	_, err := utxoStore.Create(ctx, tx, 0)
+	require.NoError(t, err)
+
+	_, err = utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{tx.TxIDChainHash()}, utxo.MinedBlockInfo{
+		BlockID:        7,
+		BlockHeight:    99,
+		SubtreeIdx:     3,
+		OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
+	t.Run("Get with only BlockHeights", func(t *testing.T) {
+		data, err := utxoStore.Get(ctx, tx.TxIDChainHash(), fields.BlockHeights)
+		require.NoError(t, err)
+		require.Equal(t, []uint32{99}, data.BlockHeights,
+			"asking for BlockHeights alone must return them, not an empty slice")
+	})
+
+	t.Run("Get with only SubtreeIdxs", func(t *testing.T) {
+		data, err := utxoStore.Get(ctx, tx.TxIDChainHash(), fields.SubtreeIdxs)
+		require.NoError(t, err)
+		require.Equal(t, []int{3}, data.SubtreeIdxs,
+			"asking for SubtreeIdxs alone must return them, not an empty slice")
+	})
+
+	// BatchDecorate reaches the same block_ids query through a separate gate, so it
+	// needs its own case; fixing only the single-Get path would leave the batched
+	// path — the one the validator's parent prefetch actually uses — still wrong.
+	t.Run("BatchDecorate with only BlockHeights", func(t *testing.T) {
+		items := []*utxo.UnresolvedMetaData{{Hash: *tx.TxIDChainHash(), Idx: 0}}
+
+		require.NoError(t, utxoStore.BatchDecorate(ctx, items, fields.BlockHeights))
+		require.NoError(t, items[0].Err)
+		require.NotNil(t, items[0].Data)
+		require.Equal(t, []uint32{99}, items[0].Data.BlockHeights,
+			"batched read must honour BlockHeights on its own too")
+	})
+
+	// The existing behaviour must be untouched: BlockIDs alone still returns all
+	// three, which is what every caller in the tree relies on today.
+	t.Run("Get with only BlockIDs still returns all three", func(t *testing.T) {
+		data, err := utxoStore.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
+		require.NoError(t, err)
+		require.Equal(t, []uint32{7}, data.BlockIDs)
+		require.Equal(t, []uint32{99}, data.BlockHeights)
+		require.Equal(t, []int{3}, data.SubtreeIdxs)
+	})
+}
