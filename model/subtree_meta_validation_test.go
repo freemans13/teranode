@@ -87,10 +87,12 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 		require.Len(t, parents, 1)
 	})
 
-	t.Run("short claimed entry count is rejected, not silently empty", func(t *testing.T) {
+	t.Run("short claimed entry count is rejected up front", func(t *testing.T) {
 		// A count of 2 with 4 real leaves previously deserialized cleanly and
-		// left leaves 2 and 3 with zero recorded inputs — the duplicate-inputs
-		// check then passed vacuously for them.
+		// left leaves 2 and 3 with zero recorded inputs; the downstream
+		// nil-parents guard then rejected the whole (valid) block as invalid —
+		// a persisted wrong verdict caused by a torn local cache file, with no
+		// regeneration. Failing the read here routes into regeneration instead.
 		subtree, metaBytes, block := buildMetaFixture(t)
 
 		torn := make([]byte, len(metaBytes))

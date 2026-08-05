@@ -1680,16 +1680,19 @@ func (b *Block) getSubtreeMetaSlice(ctx context.Context, subtreeStore SubtreeSto
 		_ = subtreeMetaReader.Close()
 	}()
 
-	// The .subtreeMeta file is only a cache, but the within-block duplicate-inputs
-	// check trusts its contents, so a torn or foreign file must fail loudly here
-	// (the caller then regenerates the meta) rather than feed the check silently
-	// wrong data (issue 1425). The file's fixed header — the subtree root hash it
-	// was built for and the entry count it claims — is validated against the
-	// subtree being checked BEFORE the body is deserialized: a short count would
-	// leave tail transactions with zero recorded inputs (a real double-spend among
-	// them then passes vacuously), an over-long count would write past the
-	// deserializer's slice and panic on every restart, and a foreign file would
-	// attribute another subtree's inputs to this one.
+	// The .subtreeMeta file is only a cache, but block validation trusts its
+	// contents, so a torn or foreign file must fail loudly here — routing the
+	// caller into meta regeneration — rather than flow onward (issue 1425). The
+	// file's fixed header — the subtree root hash it was built for and the entry
+	// count it claims — is validated against the subtree being checked BEFORE
+	// the body is deserialized. A short count leaves tail transactions with zero
+	// recorded inputs, which the nil-parents guard downstream then converts into
+	// a spurious block-invalid verdict: a VALID block rejected and persisted as
+	// invalid because a local cache file was torn, with no regeneration (that
+	// wraps only this read). An over-long count writes past the deserializer's
+	// slice and panics on every restart, since the file is on disk. A foreign
+	// file attributes another subtree's inputs to this one — the one shape that
+	// can genuinely hide an in-block double-spend.
 	var metaHeader [36]byte
 	if _, err = io.ReadFull(subtreeMetaReader, metaHeader[:]); err != nil {
 		return nil, errors.NewProcessingError("[BLOCK][%s][%s] failed to read subtree meta header", b.String(), subtreeHash.String(), err)
