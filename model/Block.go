@@ -1696,7 +1696,12 @@ func (b *Block) getSubtreeMetaSlice(ctx context.Context, subtreeStore SubtreeSto
 	}
 
 	if !bytes.Equal(metaHeader[:32], subtreeHash[:]) {
-		return nil, errors.NewProcessingError("[BLOCK][%s][%s] subtree meta root hash mismatch: meta was built for %x", b.String(), subtreeHash.String(), metaHeader[:32])
+		// Print the foreign hash in display order like every other hash in the
+		// logs, or the one line meant for triage shows two incomparable hex
+		// strings (the byte-order trap behind the phantom-fork misdiagnosis).
+		metaRootHash, _ := chainhash.NewHash(metaHeader[:32])
+
+		return nil, errors.NewProcessingError("[BLOCK][%s][%s] subtree meta root hash mismatch: meta was built for %s", b.String(), subtreeHash.String(), metaRootHash.String())
 	}
 
 	subtreeLength, err := safeconversion.IntToUint32(subtree.Length())

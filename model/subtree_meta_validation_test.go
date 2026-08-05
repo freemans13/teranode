@@ -104,15 +104,40 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 		require.Contains(t, err.Error(), "entry count mismatch")
 	})
 
-	t.Run("over-long claimed entry count is rejected, not a panic", func(t *testing.T) {
-		// A count above the subtree size previously wrote past the
-		// deserializer's slice: an index-out-of-range panic recurring on every
-		// restart, since the file is on disk.
+	t.Run("over-long claimed count with no extra body is rejected", func(t *testing.T) {
+		// With no extra body bytes the old code failed on EOF rather than
+		// panicking; either way the count must now be rejected up front.
 		subtree, metaBytes, block := buildMetaFixture(t)
 
 		torn := make([]byte, len(metaBytes))
 		copy(torn, metaBytes)
 		binary.LittleEndian.PutUint32(torn[32:36], 64)
+
+		store := newMemSubtreeStore(subtree.RootHash()[:], torn)
+
+		require.NotPanics(t, func() {
+			_, err := block.getSubtreeMetaSlice(ctx, store, *subtree.RootHash(), subtree)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "entry count mismatch")
+		})
+	})
+
+	t.Run("over-long count with a well-formed extra entry is rejected, not a panic", func(t *testing.T) {
+		// This is the shape that genuinely panicked before the fix: the
+		// deserializer sizes its slice from the real subtree (4) but writes
+		// the file-claimed number of entries, so a well-formed fifth entry
+		// hit index 4 of a length-4 slice — recurring on every restart,
+		// since the file is on disk.
+		subtree, metaBytes, block := buildMetaFixture(t)
+
+		extraInpoints := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{chainhash.HashH([]byte{0xcc})}, []uint32{1, 0})
+		extra, err := extraInpoints.Serialize()
+		require.NoError(t, err)
+
+		torn := make([]byte, len(metaBytes), len(metaBytes)+len(extra))
+		copy(torn, metaBytes)
+		binary.LittleEndian.PutUint32(torn[32:36], 5)
+		torn = append(torn, extra...)
 
 		store := newMemSubtreeStore(subtree.RootHash()[:], torn)
 
