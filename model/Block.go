@@ -1680,8 +1680,35 @@ func (b *Block) getSubtreeMetaSlice(ctx context.Context, subtreeStore SubtreeSto
 		_ = subtreeMetaReader.Close()
 	}()
 
-	// no need to check whether this fails or not, it's just a cache file and not critical
-	subtreeMetaSlice, err := subtreepkg.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
+	// The .subtreeMeta file is only a cache, but the within-block duplicate-inputs
+	// check trusts its contents, so a torn or foreign file must fail loudly here
+	// (the caller then regenerates the meta) rather than feed the check silently
+	// wrong data (issue 1425). The file's fixed header — the subtree root hash it
+	// was built for and the entry count it claims — is validated against the
+	// subtree being checked BEFORE the body is deserialized: a short count would
+	// leave tail transactions with zero recorded inputs (a real double-spend among
+	// them then passes vacuously), an over-long count would write past the
+	// deserializer's slice and panic on every restart, and a foreign file would
+	// attribute another subtree's inputs to this one.
+	var metaHeader [36]byte
+	if _, err = io.ReadFull(subtreeMetaReader, metaHeader[:]); err != nil {
+		return nil, errors.NewProcessingError("[BLOCK][%s][%s] failed to read subtree meta header", b.String(), subtreeHash.String(), err)
+	}
+
+	if !bytes.Equal(metaHeader[:32], subtreeHash[:]) {
+		return nil, errors.NewProcessingError("[BLOCK][%s][%s] subtree meta root hash mismatch: meta was built for %x", b.String(), subtreeHash.String(), metaHeader[:32])
+	}
+
+	subtreeLength, err := safeconversion.IntToUint32(subtree.Length())
+	if err != nil {
+		return nil, errors.NewProcessingError("[BLOCK][%s][%s] failed to convert subtree length", b.String(), subtreeHash.String(), err)
+	}
+
+	if claimedCount := binary.LittleEndian.Uint32(metaHeader[32:36]); claimedCount != subtreeLength {
+		return nil, errors.NewProcessingError("[BLOCK][%s][%s] subtree meta entry count mismatch: meta claims %d entries, subtree has %d transactions", b.String(), subtreeHash.String(), claimedCount, subtreeLength)
+	}
+
+	subtreeMetaSlice, err := subtreepkg.NewSubtreeMetaFromReader(subtree, io.MultiReader(bytes.NewReader(metaHeader[:]), subtreeMetaReader))
 	if err != nil {
 		return nil, errors.NewProcessingError("[BLOCK][%s][%s] failed to deserialize subtree meta", b.String(), subtreeHash.String(), err)
 	}
