@@ -1429,7 +1429,7 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 			return nil, nil, errors.NewProcessingError("failed to get best block header during block processing", err)
 		}
 
-		return b.generateEmptyBlockCandidate(bestBlockHeader, bestBlockMeta.Height)
+		return b.generateEmptyBlockCandidate(ctx, bestBlockHeader, bestBlockMeta.Height)
 	}
 
 	// Get current block state first (single atomic read for consistency)
@@ -1456,7 +1456,7 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 			data = incompleteData
 			subtrees = incompleteData.Subtrees
 		} else {
-			return b.generateEmptyBlockCandidate(baBestBlockHeader, baBestBlockHeight)
+			return b.generateEmptyBlockCandidate(ctx, baBestBlockHeader, baBestBlockHeight)
 		}
 	}
 
@@ -1513,8 +1513,15 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 
 	subtreeCountUint32, _ := safeconversion.IntToUint32(len(subtrees))
 
-	// Compute time-sensitive fields
-	timeNow := time.Now().Unix()
+	// Compute time-sensitive fields. The candidate time is the wall clock
+	// floored at the parent chain's median-time-past+1, so the block we hand
+	// to miners cannot violate the median-time rule that block validation
+	// enforces (see candidateTime).
+	timeNow, err := b.candidateTime(ctx, data.PreviousHeader)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	timeNowUint32, err := safeconversion.Int64ToUint32(timeNow)
 	if err != nil {
 		return nil, nil, errors.NewProcessingError("error converting time now", err)
@@ -1588,9 +1595,14 @@ func (b *BlockAssembler) filterSubtreesByMaxSize(subtrees []*subtree.Subtree, ma
 	return includedSubtrees, nil
 }
 
-func (b *BlockAssembler) generateEmptyBlockCandidate(bestBlockHeader *model.BlockHeader, bestBlockHeight uint32) (*model.MiningCandidate, []*subtree.Subtree, error) {
+func (b *BlockAssembler) generateEmptyBlockCandidate(ctx context.Context, bestBlockHeader *model.BlockHeader, bestBlockHeight uint32) (*model.MiningCandidate, []*subtree.Subtree, error) {
 	nextBlockHeight := bestBlockHeight + 1
-	timeNow := time.Now().Unix()
+
+	// Same median-time-past floor as the main candidate path (see candidateTime).
+	timeNow, err := b.candidateTime(ctx, bestBlockHeader)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	b.logger.Infof("[generateEmptyBlockCandidate] Generating empty block template for height %d (prev: %s)", nextBlockHeight, bestBlockHeader.Hash())
 
