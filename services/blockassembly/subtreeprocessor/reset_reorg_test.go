@@ -1346,7 +1346,7 @@ func TestResetMarksAssemblyTxsAsNotOnLongestChainBeforeClearing(t *testing.T) {
 // txs), serializes it together with a valid SubtreeMeta, and stores both under
 // key in the blob store — exactly what the reorg moveBack path expects to read
 // back. Returns nothing; fails the test on any error.
-func storeReorgSubtree(t *testing.T, ctx context.Context, blobStore *blob_memory.Memory, key *chainhash.Hash, txs []subtree.Node) {
+func storeReorgSubtree(t *testing.T, ctx context.Context, blobStore *blob_memory.Memory, txs []subtree.Node) *chainhash.Hash {
 	t.Helper()
 
 	st, err := subtree.NewTreeByLeafCount(64)
@@ -1356,6 +1356,11 @@ func storeReorgSubtree(t *testing.T, ctx context.Context, blobStore *blob_memory
 	for _, n := range txs {
 		require.NoError(t, st.AddSubtreeNode(n))
 	}
+
+	// Store under the subtree's REAL root hash, as production does: the meta
+	// header validation (issue 1425) rejects a file whose embedded root does
+	// not match the key it was fetched by.
+	key := st.RootHash()
 
 	stBytes, err := st.Serialize()
 	require.NoError(t, err)
@@ -1369,6 +1374,8 @@ func storeReorgSubtree(t *testing.T, ctx context.Context, blobStore *blob_memory
 	metaBytes, err := meta.Serialize()
 	require.NoError(t, err)
 	require.NoError(t, blobStore.Set(ctx, key[:], fileformat.FileTypeSubtreeMeta, metaBytes))
+
+	return key
 }
 
 // TestSubtreeProcessor_ReorgThroughRealSubtrees exercises the bulk reorg path
@@ -1407,11 +1414,7 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		tx2Hash, err := chainhash.NewHashFromStr("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2")
 		require.NoError(t, err)
 
-		// Unique subtree storage key (distinct from any tx hash).
-		moveBackSubtreeHash, err := chainhash.NewHashFromStr("c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3")
-		require.NoError(t, err)
-
-		storeReorgSubtree(t, ctx, blobStore, moveBackSubtreeHash, []subtree.Node{
+		moveBackSubtreeHash := storeReorgSubtree(t, ctx, blobStore, []subtree.Node{
 			{Hash: *tx1Hash, Fee: 100, SizeInBytes: 250},
 			{Hash: *tx2Hash, Fee: 200, SizeInBytes: 300},
 		})
@@ -1499,16 +1502,11 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		forwardOnlyTx, err := chainhash.NewHashFromStr("f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6")
 		require.NoError(t, err)
 
-		backSubtreeHash, err := chainhash.NewHashFromStr("1717171717171717171717171717171717171717171717171717171717171717")
-		require.NoError(t, err)
-		forwardSubtreeHash, err := chainhash.NewHashFromStr("2828282828282828282828282828282828282828282828282828282828282828")
-		require.NoError(t, err)
-
-		storeReorgSubtree(t, ctx, blobStore, backSubtreeHash, []subtree.Node{
+		backSubtreeHash := storeReorgSubtree(t, ctx, blobStore, []subtree.Node{
 			{Hash: *doubleSpendTx, Fee: 100, SizeInBytes: 250},
 			{Hash: *backOnlyTx, Fee: 150, SizeInBytes: 300},
 		})
-		storeReorgSubtree(t, ctx, blobStore, forwardSubtreeHash, []subtree.Node{
+		forwardSubtreeHash := storeReorgSubtree(t, ctx, blobStore, []subtree.Node{
 			{Hash: *doubleSpendTx, Fee: 100, SizeInBytes: 250},
 			{Hash: *forwardOnlyTx, Fee: 200, SizeInBytes: 400},
 		})

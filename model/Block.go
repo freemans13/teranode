@@ -1165,9 +1165,13 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 
 	subtreeMetaSlice, err = b.getSubtreeMetaSlice(ctx, deps.subtreeStore, *subtreeHash, subtree)
 
-	// Attempt regeneration if meta not found and regenerator is available
+	// Attempt regeneration if the meta is missing or invalid and a regenerator is
+	// available. The read error is included in the log line: it carries the
+	// header-validation verdict (root-hash or entry-count mismatch, issue 1425),
+	// and regeneration succeeding would otherwise discard the only trace of a
+	// torn or foreign file.
 	if err != nil && deps.metaRegenerator != nil {
-		logger.Warnf("[validateSubtree][%s][%s:%d] subtree meta not found, attempting regeneration", b.String(), subtreeHash.String(), sIdx)
+		logger.Warnf("[validateSubtree][%s][%s:%d] subtree meta unusable (%v), attempting regeneration", b.String(), subtreeHash.String(), sIdx, err)
 
 		subtreeMetaSlice, err = deps.metaRegenerator.RegenerateMeta(ctx, subtreeHash, subtree)
 		if err == nil {
@@ -1680,45 +1684,13 @@ func (b *Block) getSubtreeMetaSlice(ctx context.Context, subtreeStore SubtreeSto
 		_ = subtreeMetaReader.Close()
 	}()
 
-	// The .subtreeMeta file is only a cache, but block validation trusts its
-	// contents, so a torn or foreign file must fail loudly here — routing the
-	// caller into meta regeneration — rather than flow onward (issue 1425). The
-	// file's fixed header — the subtree root hash it was built for and the entry
-	// count it claims — is validated against the subtree being checked BEFORE
-	// the body is deserialized. A short count leaves tail transactions with zero
-	// recorded inputs, which the nil-parents guard downstream then converts into
-	// a spurious block-invalid verdict: a VALID block rejected and persisted as
-	// invalid because a local cache file was torn, with no regeneration (that
-	// wraps only this read). An over-long count writes past the deserializer's
-	// slice and panics on every restart, since the file is on disk. A foreign
-	// file attributes another subtree's inputs to this one — the one shape that
-	// can genuinely hide an in-block double-spend.
-	var metaHeader [36]byte
-	if _, err = io.ReadFull(subtreeMetaReader, metaHeader[:]); err != nil {
-		return nil, errors.NewProcessingError("[BLOCK][%s][%s] failed to read subtree meta header", b.String(), subtreeHash.String(), err)
-	}
-
-	if !bytes.Equal(metaHeader[:32], subtreeHash[:]) {
-		// Print the foreign hash in display order like every other hash in the
-		// logs, or the one line meant for triage shows two incomparable hex
-		// strings (the byte-order trap behind the phantom-fork misdiagnosis).
-		metaRootHash, _ := chainhash.NewHash(metaHeader[:32])
-
-		return nil, errors.NewProcessingError("[BLOCK][%s][%s] subtree meta root hash mismatch: meta was built for %s", b.String(), subtreeHash.String(), metaRootHash.String())
-	}
-
-	subtreeLength, err := safeconversion.IntToUint32(subtree.Length())
+	// Validate the file's fixed header against the subtree being checked before
+	// any body deserialization (issue 1425); a mismatch fails loudly here and
+	// routes the caller into meta regeneration. See
+	// NewSubtreeMetaFromValidatedReader for the three torn-file failure shapes.
+	subtreeMetaSlice, err := NewSubtreeMetaFromValidatedReader(subtreeHash, subtree, subtreeMetaReader)
 	if err != nil {
-		return nil, errors.NewProcessingError("[BLOCK][%s][%s] failed to convert subtree length", b.String(), subtreeHash.String(), err)
-	}
-
-	if claimedCount := binary.LittleEndian.Uint32(metaHeader[32:36]); claimedCount != subtreeLength {
-		return nil, errors.NewProcessingError("[BLOCK][%s][%s] subtree meta entry count mismatch: meta claims %d entries, subtree has %d transactions", b.String(), subtreeHash.String(), claimedCount, subtreeLength)
-	}
-
-	subtreeMetaSlice, err := subtreepkg.NewSubtreeMetaFromReader(subtree, io.MultiReader(bytes.NewReader(metaHeader[:]), subtreeMetaReader))
-	if err != nil {
-		return nil, errors.NewProcessingError("[BLOCK][%s][%s] failed to deserialize subtree meta", b.String(), subtreeHash.String(), err)
+		return nil, errors.NewProcessingError("[BLOCK][%s] invalid subtree meta", b.String(), err)
 	}
 
 	return subtreeMetaSlice, nil

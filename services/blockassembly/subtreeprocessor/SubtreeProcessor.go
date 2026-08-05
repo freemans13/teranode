@@ -4160,7 +4160,12 @@ func (stp *SubtreeProcessor) moveBackBlockGetSubtrees(ctx context.Context, block
 					_ = subtreeMetaReader.Close()
 				}()
 
-				subtreeMeta, err := subtreepkg.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
+				// Validate the meta header against the subtree before deserializing
+				// (issue 1425): an over-long torn file panics inside the raw
+				// deserializer, and this call runs in an errgroup goroutine where a
+				// panic kills the process — recurring on every restart, since the
+				// file is on disk.
+				subtreeMeta, err := model.NewSubtreeMetaFromValidatedReader(*subtreeHash, subtree, subtreeMetaReader)
 				if err != nil {
 					return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] error deserializing subtree meta", block.String(), err)
 				}
