@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
+	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -72,7 +73,7 @@ func TestCanonicalCoinbaseAt(t *testing.T) {
 	cb1 := coinbaseTxForHeader(t, blockHeader1)
 	addCanonicalBlockWithCoinbase(ctx, t, items, blockHeader1, cb1)
 
-	_, err := items.utxoStore.Create(ctx, cb1, 1)
+	_, _, err := items.utxoStore.SpendAndCreate(ctx, cb1, 1, utxoStore.WithCreateOnly())
 	require.NoError(t, err)
 
 	present, blk, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 1)
@@ -143,7 +144,7 @@ func seedCoinbase(ctx context.Context, t *testing.T, items *baTestItems, headers
 	header := headers[height-1]
 	coinbaseTx := coinbaseTxForHeader(t, header)
 
-	_, err := items.utxoStore.Create(ctx, coinbaseTx, height)
+	_, _, err := items.utxoStore.SpendAndCreate(ctx, coinbaseTx, height, utxoStore.WithCreateOnly())
 	require.NoError(t, err)
 }
 
