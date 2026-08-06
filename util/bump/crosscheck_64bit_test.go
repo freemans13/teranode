@@ -10,12 +10,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestConvertToBUMP64BitCrosscheck verifies the 64-bit offset path against the
-// go-bc reference implementation, independently of Teranode's own arithmetic:
-// with 32 subtree levels the transaction's global leaf offset exceeds 2^32
-// (the range the old uint32 computation silently wrapped, issue 1427). go-bc
-// must parse the encoded BUMP and fold the proof to the same merkle root a
-// manual sibling-by-sibling fold produces.
+// TestConvertToBUMP64BitCrosscheck runs an offset above 2^32 (issue 1427) through the
+// go-bc reference implementation. It pins two things: that a 9-byte VarInt offset
+// survives the wire round trip into go-bc's parser, and that the per-level offsets
+// Teranode writes satisfy go-bc's own sibling rule at every level — go-bc derives each
+// sibling as (index >> height) ^ 1 and fails outright if the node it needs is not
+// where that rule says it should be.
+//
+// The starting offset below is a hand-derived literal rather than a recomputation of
+// the production expression, so a change to that expression fails this test instead of
+// moving both sides together. What this test cannot do is validate the offset against a
+// real merkle tree: the sibling hashes are arbitrary bytes. That end-to-end check —
+// real subtrees, folded to the block header's own merkle root — lives in
+// coinbase_placeholder_crosscheck_test.go, at small scale.
 func TestConvertToBUMP64BitCrosscheck(t *testing.T) {
 	const (
 		subtreeLevels = 32
@@ -60,8 +67,9 @@ func TestConvertToBUMP64BitCrosscheck(t *testing.T) {
 	require.NoError(t, err)
 
 	// Manual fold: start at the leaf, combine with each sibling by offset
-	// parity, exactly as any BRC-74 verifier must.
-	offset := uint64(subtreeIndex)<<subtreeLevels | uint64(txIndex)
+	// parity, exactly as any BRC-74 verifier must. The offset is the hand-derived
+	// literal (3 * 2^32 + 5), not the production expression.
+	offset := uint64(12884901893)
 	working := txID
 
 	fold := func(a, b chainhash.Hash) chainhash.Hash {

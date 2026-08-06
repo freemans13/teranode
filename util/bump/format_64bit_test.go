@@ -61,7 +61,11 @@ func TestConvertToBUMPLargeBlockOffsets(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, bump.Path, subtreeLevels+blockLevels)
 
-	wantGlobal := uint64(subtreeIndex)<<subtreeLevels | uint64(txIndex) // 12884901893, wraps to 5 in uint32
+	// Hand-derived, not recomputed from the production expression: subtree index 3 sits
+	// above bit 32 (3 * 2^32 = 12884901888) and tx index 5 occupies the low bits. A uint32
+	// computation keeps only the remainder mod 2^32, which is 5 — the offset of a different
+	// transaction, in a different subtree, that the proof would still appear to prove.
+	const wantGlobal uint64 = 12884901893
 
 	// Level 0 holds the sibling and (odd offset) the appended txid node.
 	level0 := bump.Path[0]
