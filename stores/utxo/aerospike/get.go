@@ -897,7 +897,15 @@ NEXT_BATCH_RECORD:
 			case fields.Utxos:
 				res, err := s.processUTXOs(ctx, &items[idx].Hash, bins)
 				if err != nil {
-					items[idx].Err = errors.NewTxInvalidError("could not process utxos", err)
+					// A failed or torn read of our own records is this node's storage being
+					// wrong. It says nothing about the transaction, so it must keep its
+					// storage class: ErrTxInvalid is a consensus verdict that persists the
+					// block as permanently invalid and flags the peer that served it.
+					if errors.Is(err, errors.ErrStorageError) {
+						items[idx].Err = err
+					} else {
+						items[idx].Err = errors.NewTxInvalidError("could not process utxos", err)
+					}
 
 					continue NEXT_BATCH_RECORD // because there was an error processing the utxos.
 				}
@@ -1184,6 +1192,12 @@ func (s *Store) processUTXOs(ctx context.Context, txid *chainhash.Hash, bins aer
 	spendingDatas := make([]*spendpkg.SpendingData, totalUtxos)
 
 	for i, ui := range utxos {
+		if i >= len(spendingDatas) {
+			// The totalUtxos bin disagrees with the stored list, so this record is
+			// torn or mis-keyed. Error rather than index past the end and panic.
+			return nil, errors.NewStorageError("[processUTXOs][%s] record holds more outputs than totalUtxos says (%d of %d) — torn record", txid.String(), i, len(spendingDatas))
+		}
+
 		u, ok := ui.([]uint8)
 		if ok && len(u) == 68 {
 			spendingData, err := spendpkg.NewSpendingDataFromBytes(u[32:])
@@ -1242,7 +1256,7 @@ func processConflictingChildren(bins aerospike.BinMap) (conflictingChildren []ch
 	return conflictingChildren, nil
 }
 
-// getAllExtraUTXOs retrieves all UTXOs from child records recursively
+// getAllExtraUTXOs retrieves all UTXOs from the transaction's extra (paginated) child records
 func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, totalExtraRecs int, spendingDatas []*spendpkg.SpendingData) error {
 	if totalExtraRecs <= 0 {
 		return nil
