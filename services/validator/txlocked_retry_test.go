@@ -34,6 +34,14 @@ import (
 // call returns it, which is what the "retry on locked/creating" logic
 // actually branches on.
 func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
+	// MANDATORY here, as in the other tests in this package that build a Validator by
+	// hand: the retry loop increments package-level CounterVecs that only New() (via
+	// initPrometheusMetrics) populates, so without this they are nil and the retry path
+	// panics. Running the whole package hides it — an earlier test happens to have run
+	// the sync.Once — so the crash only shows up under -run, which is the documented
+	// single-test workflow.
+	initPrometheusMetrics()
+
 	tracing.SetupMockTracer()
 
 	tests := []struct {

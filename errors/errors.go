@@ -784,6 +784,13 @@ var publicCauseCodes = map[ERR]struct{}{
 	// node-internal state and is actionable by the submitter (resubmit shortly),
 	// so it belongs on the same allowlist for the same reason ERR_TX_LOCKED does.
 	ERR_TX_CREATING: {},
+	// ERR_UTXO_FROZEN is a verdict about the submitted tx — an output it spends is
+	// held, either outright or until a given height — and its message carries only
+	// txid:vout and that height, no node-internal state. It was already the answer
+	// Aerospike gave for a held output, so its absence here was collapsing that
+	// message for every Aerospike node; routing the SQL store's height-gated hold
+	// here too would have widened that rather than fixing it.
+	ERR_UTXO_FROZEN: {},
 }
 
 // isPublicCause reports whether code is on the client-safe allowlist.
@@ -1043,7 +1050,8 @@ func ErrorCodeToGRPCCode(code ERR) codes.Code {
 	case ERR_TX_INVALID, ERR_TX_LOCK_TIME, ERR_UTXO_NON_FINAL, ERR_TX_POLICY:
 		return codes.InvalidArgument
 	// Conflict/locked family: valid request, chain-state conflict.
-	case ERR_TX_INVALID_DOUBLE_SPEND, ERR_TX_CONFLICTING, ERR_UTXO_SPENT, ERR_TX_LOCKED, ERR_TX_CREATING:
+	case ERR_TX_INVALID_DOUBLE_SPEND, ERR_TX_CONFLICTING, ERR_UTXO_SPENT, ERR_TX_LOCKED, ERR_TX_CREATING,
+		ERR_UTXO_FROZEN:
 		return codes.FailedPrecondition
 	default:
 		return codes.Internal
