@@ -10,8 +10,8 @@ import (
 
 // canonicalCoinbaseAt reports whether block assembly's UTXO store holds the
 // canonical coinbase transaction for the given height. It returns the
-// canonical block itself so callers (the repair path added in later tasks)
-// can reuse its CoinbaseTx without re-fetching from the blockchain client.
+// canonical block itself so the repair path can reuse its CoinbaseTx without
+// re-fetching from the blockchain client.
 func (b *BlockAssembler) canonicalCoinbaseAt(ctx context.Context, height uint32) (present bool, canonicalBlock *model.Block, err error) {
 	blk, err := b.blockchainClient.GetBlockByHeight(ctx, height)
 	if err != nil {
@@ -40,8 +40,8 @@ func (b *BlockAssembler) canonicalCoinbaseAt(ctx context.Context, height uint32)
 
 // errCoinbaseGapTooLarge is returned by scopeCoinbaseGap when the walk-back
 // from the trigger height exceeds CoinbaseRecoveryMaxGapBlocks without
-// finding a proven-good floor. The orchestrator (Task 8) treats this as a
-// non-local divergence and escalates to halt+alarm rather than auto-repairing.
+// finding a proven-good floor. The orchestrator treats this as a non-local
+// divergence and escalates to halt+alarm rather than auto-repairing.
 var errCoinbaseGapTooLarge = errors.NewProcessingError("[coinbaseRecovery] gap exceeds max recoverable blocks")
 
 // scopeCoinbaseGap walks back from triggerHeight, collecting canonical
