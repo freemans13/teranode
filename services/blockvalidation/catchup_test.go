@@ -4169,8 +4169,12 @@ func TestFindCommonAncestor_ForkDepthNotUnderstatedByLag(t *testing.T) {
 	require.Equal(t, uint32(150), catchupCtx.forkDepth, "depth must be measured from the accepted tip, not a lagging counter")
 
 	// With the true depth the coinbase-maturity gate rejects it. Under the old arithmetic
-	// this same fork scored 90 and was waved through.
-	server.settings.ChainCfgParams.CoinbaseMaturity = 100
+	// this same fork scored 90 and was waved through. Asserted rather than assigned: the
+	// numbers above (tip 200, ancestor 50, lag 60) are chosen against a gate of 100, so if
+	// the fixture's value ever changes this should fail loudly rather than silently retune.
+	require.Equal(t, 100, int(server.settings.ChainCfgParams.CoinbaseMaturity),
+		"this test's depths are chosen against a coinbase-maturity gate of 100")
+
 	err := server.validateForkDepth(catchupCtx)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds coinbase maturity")
