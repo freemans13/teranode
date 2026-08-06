@@ -40,6 +40,7 @@ import (
 	"syscall"
 	"time"
 
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
@@ -47,6 +48,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/debugflags"
+	"github.com/bsv-blockchain/teranode/util/fdlimit"
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/semaphore"
 )
@@ -334,6 +336,27 @@ func InitSemaphores(readLimit, writeLimit int) error {
 		if writeLimit < MinSemaphoreLimit || writeLimit > MaxSemaphoreLimit {
 			initErr = errors.NewConfigurationError("invalid write limit %d: must be between %d and %d",
 				writeLimit, MinSemaphoreLimit, MaxSemaphoreLimit)
+			return
+		}
+
+		// The semaphores bound how many file operations run at once, but they
+		// cannot bound what the OS allows. If the process's descriptor limit is
+		// below that budget, operations still fail with "too many open files" —
+		// a misconfiguration the node previously neither corrected nor reported
+		// (issue 1431). Raise the soft limit toward what is needed, and refuse
+		// to start with an actionable message if it still does not fit.
+		total, convErr := safeconversion.IntToUint64(readLimit + writeLimit)
+		if convErr != nil {
+			initErr = errors.NewConfigurationError("invalid semaphore total", convErr)
+			return
+		}
+
+		// A zero effective limit means the platform does not expose one
+		// (Windows); the semaphores still bound concurrency there, so that is
+		// not a reason to refuse to start. A non-zero one that is still too
+		// small is a real misconfiguration and must stop startup.
+		if effective, _, limitErr := fdlimit.Ensure(total); limitErr != nil && effective > 0 {
+			initErr = limitErr
 			return
 		}
 
