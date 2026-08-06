@@ -1,10 +1,6 @@
 // Package fdlimit inspects and raises the process's open-file-descriptor limit.
 package fdlimit
 
-import (
-	"github.com/bsv-blockchain/teranode/errors"
-)
-
 // Headroom is the number of descriptors reserved for everything that is NOT
 // bounded by the file store's semaphores: listening and peer sockets, gRPC
 // connections, database pools, log files, and the Go runtime's own handles.
@@ -12,27 +8,31 @@ import (
 // or the node can still hit EMFILE on a descriptor the semaphores never see.
 const Headroom uint64 = 512
 
-// Ensure makes sure the process can open at least required+Headroom files.
+// Ensure raises the process's open-file soft limit toward required+Headroom
+// and reports what is actually usable for file operations.
 //
-// It reads the current limit, and if the soft limit is too low it raises it —
-// up to the hard limit, which an unprivileged process cannot exceed. It then
-// verifies the result and returns a configuration error naming both numbers if
-// the budget still does not fit, because the alternative is a node that starts
-// happily and then fails file operations with "too many open files" under load
-// (issue 1431).
+// It deliberately does NOT fail when the limit is too small. The file store's
+// semaphores are a CEILING on concurrent operations, not a reservation: a
+// descriptor is held only for the duration of one operation, so a node whose
+// ceiling exceeds the OS limit still runs fine at any realistic load, and
+// refusing to start it would turn a bounded, already-handled condition (one
+// operation waiting, then returning ServiceUnavailable) into total
+// unavailability from boot (issue 1431). The caller clamps its concurrency to
+// the returned budget instead.
 //
-// Returns the effective limit after any raise, and whether a raise happened.
-func Ensure(required uint64) (effective uint64, raised bool, err error) {
+// Returns the descriptors available for file operations after any raise, and
+// whether a raise happened. An error means the limit could not be read at all
+// (a platform without RLIMIT_NOFILE), in which case budget is 0 and the caller
+// should carry on unclamped.
+func Ensure(required uint64) (budget uint64, raised bool, err error) {
 	need := required + Headroom
 
 	soft, hard, err := get()
 	if err != nil {
-		// Not being able to read the limit is not a reason to refuse to start;
-		// the semaphores still bound concurrency. Report it and carry on.
 		return 0, false, err
 	}
 
-	effective = soft
+	effective := soft
 
 	if soft < need {
 		target := need
@@ -48,11 +48,11 @@ func Ensure(required uint64) (effective uint64, raised bool, err error) {
 		}
 	}
 
-	if effective < need {
-		return effective, raised, errors.NewConfigurationError(
-			"open-file limit too low: need %d descriptors (%d for file operations + %d headroom) but the limit is %d (hard limit %d) — raise it with ulimit -n / LimitNOFILE, or lower the configured file-store concurrency",
-			need, required, Headroom, effective, hard)
+	if effective <= Headroom {
+		// Nothing left once the descriptors the semaphores do not bound are
+		// accounted for.
+		return 0, raised, nil
 	}
 
-	return effective, raised, nil
+	return effective - Headroom, raised, nil
 }

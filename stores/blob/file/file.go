@@ -340,25 +340,34 @@ func InitSemaphores(readLimit, writeLimit int) error {
 		}
 
 		// The semaphores bound how many file operations run at once, but they
-		// cannot bound what the OS allows. If the process's descriptor limit is
-		// below that budget, operations still fail with "too many open files" —
-		// a misconfiguration the node previously neither corrected nor reported
-		// (issue 1431). Raise the soft limit toward what is needed, and refuse
-		// to start with an actionable message if it still does not fit.
+		// cannot bound what the OS allows. Raise the descriptor limit toward
+		// what this budget needs, and if it still does not fit, CLAMP the
+		// concurrency to what the OS permits rather than refusing to start
+		// (issue 1431).
+		//
+		// Clamping, not refusing, is the important choice. The semaphores are a
+		// ceiling on concurrent operations, not a reservation — a descriptor is
+		// held only for one operation — so a node whose ceiling exceeds the
+		// limit still runs fine at any realistic load. Refusing to start it
+		// would convert a bounded, already-handled condition (an operation
+		// waits, then returns ServiceUnavailable) into total unavailability
+		// from boot, on hosts that ran indefinitely before. Clamping instead
+		// makes EMFILE structurally impossible, which is what the file store's
+		// "use system limits" mode already promises operators.
 		total, convErr := safeconversion.IntToUint64(readLimit + writeLimit)
 		if convErr != nil {
 			initErr = errors.NewConfigurationError("invalid semaphore total", convErr)
 			return
 		}
 
-		// A zero effective limit means the platform does not expose one
-		// (Windows); the semaphores still bound concurrency there, so that is
-		// not a reason to refuse to start. A non-zero one that is still too
-		// small is a real misconfiguration and must stop startup.
-		if effective, _, limitErr := fdlimit.Ensure(total); limitErr != nil && effective > 0 {
-			initErr = limitErr
-			return
+		// A zero budget means the platform exposes no limit to read (Windows);
+		// the semaphores still bound concurrency there, so carry on unclamped.
+		if budget, _, limitErr := fdlimit.Ensure(total); limitErr == nil && budget > 0 && budget < total {
+			readLimit, writeLimit = clampSemaphoreLimits(readLimit, writeLimit, budget)
+			appliedClamp = true
 		}
+
+		appliedReadLimit, appliedWriteLimit = readLimit, writeLimit
 
 		// Create new semaphores with validated limits
 		readSemaphore = semaphore.NewWeighted(int64(readLimit))
@@ -1550,4 +1559,45 @@ func (s *File) writeFileAtomically(filename string, data []byte, perm os.FileMod
 	cleanupTmpFile = false
 
 	return nil
+}
+
+// appliedReadLimit / appliedWriteLimit record the concurrency actually in
+// force after any clamp to the OS descriptor limit, and appliedClamp whether a
+// clamp happened. Exposed so startup can report the real numbers rather than
+// the configured ones (issue 1431).
+var (
+	appliedReadLimit  int
+	appliedWriteLimit int
+	appliedClamp      bool
+)
+
+// AppliedSemaphoreLimits returns the file-operation concurrency actually in
+// force, and whether it was clamped below the configured values to fit the
+// operating system's open-file limit.
+func AppliedSemaphoreLimits() (readLimit, writeLimit int, clamped bool) {
+	return appliedReadLimit, appliedWriteLimit, appliedClamp
+}
+
+// clampSemaphoreLimits scales read and write concurrency down proportionally
+// so their total fits the descriptors the OS actually allows, keeping at least
+// one of each so the store remains functional however small the budget.
+func clampSemaphoreLimits(readLimit, writeLimit int, budget uint64) (int, int) {
+	total := readLimit + writeLimit
+	if total <= 0 || budget == 0 {
+		return MinSemaphoreLimit, MinSemaphoreLimit
+	}
+
+	available := int(budget) // nolint:gosec // budget < total, which is an int
+
+	scaledRead := readLimit * available / total
+	if scaledRead < MinSemaphoreLimit {
+		scaledRead = MinSemaphoreLimit
+	}
+
+	scaledWrite := available - scaledRead
+	if scaledWrite < MinSemaphoreLimit {
+		scaledWrite = MinSemaphoreLimit
+	}
+
+	return scaledRead, scaledWrite
 }

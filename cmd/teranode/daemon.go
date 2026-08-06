@@ -74,7 +74,15 @@ func RunDaemon(progname, version, commit string) {
 		panic(fmt.Sprintf("Failed to initialize file store semaphores: %v", err))
 	}
 
-	fmt.Printf("File store semaphores initialized: read=%d, write=%d\n", readLimit, writeLimit)
+	// Report the limits actually in force: they may have been clamped below the
+	// configured values to fit the operating system's open-file limit.
+	appliedRead, appliedWrite, clamped := file.AppliedSemaphoreLimits()
+	if clamped {
+		fmt.Printf("File store semaphores clamped to the open-file limit: read=%d, write=%d (configured read=%d, write=%d) — raise the limit with ulimit -n / LimitNOFILE to use the configured concurrency\n",
+			appliedRead, appliedWrite, readLimit, writeLimit)
+	} else {
+		fmt.Printf("File store semaphores initialized: read=%d, write=%d\n", appliedRead, appliedWrite)
+	}
 
 	logger := ulogger.InitLogger(progname, tSettings)
 
