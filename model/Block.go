@@ -797,11 +797,14 @@ func (b *Block) releaseTxMap() {
 		_ = diskMap.Close()
 		ClearTxMapStats()
 	} else if poolable, ok := b.txMap.(*txmap.SplitSwissMapUint64); ok {
-		// Return the pooled in-memory map for reuse on the next block.
-		// b.txMapCount is the value checkDuplicateTransactions sized the map
-		// from, stashed there for exactly this purpose, so the map lands in the
-		// size-class pool it came from (counts above every size class are
-		// dropped by PutTxMap).
+		// Return the pooled in-memory map for reuse on the next block. The
+		// invariant this relies on is narrow and local: checkDuplicateTransactions
+		// assigns b.txMapCount immediately before GetTxMap and nothing between
+		// there and here writes it, so the Put key equals the Get key and the map
+		// lands in the pool it came from (counts above every size class are
+		// dropped by PutTxMap). Deliberately not stated in terms of
+		// b.TransactionCount, which GetAndValidateSubtrees only recomputes when
+		// Valid took the `subtreeStore != nil && len(b.Subtrees) > 0` branch.
 		PutTxMap(poolable, b.txMapCount)
 	} else if closer, ok := b.txMap.(io.Closer); ok {
 		_ = closer.Close()

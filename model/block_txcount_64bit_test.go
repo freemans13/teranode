@@ -57,18 +57,60 @@ func TestTxMapAllocHintClamp(t *testing.T) {
 
 // TestTxMapAllocHintAvoidsConstructorOverflow pins the bound below the point
 // where the map constructor's own per-bucket arithmetic wraps. It computes
-// per-bucket size as (hint + hint/5) in uint32, so any hint above ~3.58e9
-// overflows and preallocates an arbitrary amount unrelated to the count
-// (MaxUint32 wraps to ~859M entries). Every hint this package can produce must
-// stay in the range where that arithmetic is exact.
+// per-bucket size as (hint + hint/5) in uint32, so any hint above
+// txMapConstructorWrapThreshold overflows and preallocates an arbitrary amount
+// unrelated to the count (math.MaxUint32 wraps to ~859M entries).
+//
+// Asserted two ways on purpose. The threshold constant is checked to be the real
+// wrap point, so it cannot drift from the dependency silently; then every hint
+// the package can produce is checked against that constant. Note the constant is
+// tied to go-tx-map's 20% headroom factor: if a dependency bump changes that
+// factor, the first loop below fails rather than the bound quietly becoming
+// wrong.
 func TestTxMapAllocHintAvoidsConstructorOverflow(t *testing.T) {
-	for _, n := range []uint64{0, 1 << 20, uint64(txMapSizeClasses[len(txMapSizeClasses)-1]), math.MaxUint32, 1 << 40, math.MaxUint64} {
-		hint := txMapAllocHint(n)
+	// The threshold really is the last exact value, and one past it wraps.
+	for _, tc := range []struct {
+		hint  uint32
+		exact bool
+	}{
+		{hint: uint32(txMapConstructorWrapThreshold), exact: true},
+		{hint: uint32(txMapConstructorWrapThreshold) + 1, exact: false},
+		{hint: math.MaxUint32, exact: false},
+	} {
+		got := uint64(tc.hint) + uint64(tc.hint)/5
+		require.Equal(t, tc.exact, got == uint64(tc.hint+tc.hint/5),
+			"hint %d: expected exact=%v for the constructor's (hint + hint/5)", tc.hint, tc.exact)
+	}
 
-		// The constructor's computation, in uint32 as it performs it, must equal
-		// the same computation carried out without truncation.
-		require.Equal(t, uint64(hint)+uint64(hint)/5, uint64(hint+hint/5),
-			"hint %d (from count %d) overflows the constructor's per-bucket arithmetic", hint, n)
+	// Every hint this package can produce stays at or below that threshold.
+	for _, n := range []uint64{0, 1 << 20, uint64(txMapSizeClasses[len(txMapSizeClasses)-1]), math.MaxUint32, 1 << 40, math.MaxUint64} {
+		require.LessOrEqual(t, uint64(txMapAllocHint(n)), txMapConstructorWrapThreshold,
+			"hint for count %d must stay below the constructor's wrap point", n)
+	}
+}
+
+// TestParentSpendsAllocHint pins the parent-spends preallocation bound, which
+// exists for the same reason as txMapAllocHint: NewSplitSyncedParentMap
+// preallocates eagerly per bucket and computes uint32((n + n/5) / nrOfBuckets),
+// so an unbounded hint asks for an unbounded allocation and can truncate.
+func TestParentSpendsAllocHint(t *testing.T) {
+	largestClass := parentSpendsSizeClasses[len(parentSpendsSizeClasses)-1]
+
+	require.Equal(t, uint64(0), parentSpendsAllocHint(0))
+	require.Equal(t, uint64(1<<20), parentSpendsAllocHint(1<<20))
+	require.Equal(t, largestClass, parentSpendsAllocHint(largestClass))
+
+	for _, n := range []uint64{largestClass + 1, 1 << 40, math.MaxUint64} {
+		require.Equal(t, largestClass, parentSpendsAllocHint(n), "count %d must be bounded", n)
+	}
+
+	// Every bounded hint must survive the constructor's per-bucket arithmetic
+	// without truncating to an arbitrary value.
+	for _, n := range []uint64{0, 1 << 20, largestClass, largestClass + 1, math.MaxUint64} {
+		h := parentSpendsAllocHint(n)
+		perBucket := (h + h/5) / uint64(parentSpendsBuckets)
+		require.Equal(t, perBucket, uint64(uint32(perBucket)),
+			"hint %d (from count %d) truncates in the constructor", h, n)
 	}
 }
 
@@ -117,7 +159,15 @@ func TestCheckDuplicateTransactionsUsesFullCount(t *testing.T) {
 	// Hold the map across release and assert PutTxMap cleared it, which only
 	// happens on the pooled branch. This proves the release key still resolves
 	// to a pool class — it does NOT pin the exact key, since at this size any
-	// key at or below the largest class also pools and clears.
+	// key at or below the largest class also pools and clears. The exact key is
+	// pinned by the b.txMapCount assertion above, which is the value releaseTxMap
+	// passes.
+	//
+	// Observing the map after handing it back to a package-global sync.Pool is
+	// only sound because this test owns it until it returns: the assertion must
+	// stay immediately after releaseTxMap, and this test must never be given
+	// t.Parallel() (the package convention anyway), or a concurrent GetTxMap on
+	// the 4K class could take the map first.
 	pooled, ok := block.txMap.(*txmap.SplitSwissMapUint64)
 	require.True(t, ok)
 	require.Equal(t, 3, pooled.Length())
@@ -176,6 +226,44 @@ func TestCheckDuplicateTransactionsAboveUint32(t *testing.T) {
 
 	block.releaseTxMap()
 	require.Equal(t, 0, pooled.Length(), "released map must be cleared and pooled, not dropped")
+}
+
+// TestGetParentSpendsMapBoundsPreallocation pins the bound at its call site, not
+// just in the helper: GetParentSpendsMap must preallocate from the bounded hint
+// for a count above every size class. Observed through the underlying swiss map's
+// Capacity(), which on a freshly built map is the preallocation limit.
+//
+// The size classes are shrunk so the over-max branch is reachable cheaply; the
+// unbounded reference below is deliberately sized to cost tens of MB rather than
+// the hundreds of GB a realistic over-max count would ask for. parentSpendsPools
+// is built from the original classes at init, so the surviving index still
+// resolves to a real pool. Cleanup restore is mandatory; no t.Parallel().
+func TestGetParentSpendsMapBoundsPreallocation(t *testing.T) {
+	origClasses := parentSpendsSizeClasses
+	parentSpendsSizeClasses = []uint64{1 << 8}
+
+	t.Cleanup(func() { parentSpendsSizeClasses = origClasses })
+
+	const overMax = 1 << 20 // above the shrunk largest class, so idx < 0
+
+	require.Equal(t, -1, parentSpendsClassIdxFor(overMax), "count must take the allocate-fresh path")
+	require.Equal(t, uint64(1<<8), parentSpendsAllocHint(overMax))
+
+	got := GetParentSpendsMap(overMax)
+	require.NotNil(t, got)
+
+	bounded := NewSplitSyncedParentMap(parentSpendsBuckets, parentSpendsAllocHint(overMax))
+	unbounded := NewSplitSyncedParentMap(parentSpendsBuckets, overMax)
+
+	require.Equal(t, bounded.buckets[0].m.Capacity(), got.buckets[0].m.Capacity(),
+		"GetParentSpendsMap must preallocate from the bounded hint")
+	require.NotEqual(t, unbounded.buckets[0].m.Capacity(), got.buckets[0].m.Capacity(),
+		"this assertion is only meaningful if the bounded and unbounded hints differ")
+
+	// The map still accepts entries beyond the bounded preallocation.
+	ok, err := got.SetIfNotExists(subtreepkg.Inpoint{Hash: chainhash.HashH([]byte{0x5a}), Index: 0})
+	require.NoError(t, err)
+	require.True(t, ok)
 }
 
 // TestParentSpendsCapacity pins the parent-spends sizing helper: it multiplies
