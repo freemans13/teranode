@@ -21,8 +21,13 @@ import (
 //
 // The zero value is usable and reports healthy until the first Beat, so a
 // service that has not started its loop yet is never killed during startup.
+//
+// The beat is stored as a time.Time rather than a plain unix-nanosecond count
+// so it keeps its monotonic reading. Age therefore measures elapsed time, not
+// wall-clock difference: an NTP correction or a host clock step cannot age the
+// heartbeat past the timeout and restart a node that is working fine.
 type Heartbeat struct {
-	lastBeat atomic.Int64 // unix nanos; 0 = never beaten
+	lastBeat atomic.Pointer[time.Time] // nil = never beaten
 	now      func() time.Time
 }
 
@@ -44,7 +49,24 @@ func New() *Heartbeat {
 
 // Beat records that the loop is still making progress.
 func (h *Heartbeat) Beat() {
-	h.lastBeat.Store(h.clock().UnixNano())
+	t := h.clock()
+	h.lastBeat.Store(&t)
+}
+
+// BeatIfStarted records progress only once a loop has claimed the heartbeat
+// with a first Beat, and does nothing before that.
+//
+// Work that can run BOTH during startup and from inside the loop must use this
+// rather than Beat. Beating from the startup path would move the heartbeat off
+// its never-beaten state part-way through a preamble that is legitimately
+// unbounded, so the remainder of that preamble would age the heartbeat and the
+// probe would report a healthy, still-starting node as wedged.
+func (h *Heartbeat) BeatIfStarted() {
+	if h.lastBeat.Load() == nil {
+		return
+	}
+
+	h.Beat()
 }
 
 // Age returns how long since the last beat. A Heartbeat that has never beaten
@@ -52,17 +74,17 @@ func (h *Heartbeat) Beat() {
 // not be read as a stall.
 func (h *Heartbeat) Age() time.Duration {
 	last := h.lastBeat.Load()
-	if last == 0 {
+	if last == nil {
 		return 0
 	}
 
-	age := h.clock().UnixNano() - last
+	age := h.clock().Sub(*last)
 	if age < 0 {
 		// A backwards clock step must not be read as a stall.
 		return 0
 	}
 
-	return time.Duration(age)
+	return age
 }
 
 // Stalled reports whether the last beat is older than deadline. A deadline of
@@ -79,7 +101,7 @@ func (h *Heartbeat) Stalled(deadline time.Duration) bool {
 // SetLastBeatForTest forces the last-beat time. Test-only seam so a caller can
 // stand in for a loop that has stopped being serviced without sleeping.
 func (h *Heartbeat) SetLastBeatForTest(t time.Time) {
-	h.lastBeat.Store(t.UnixNano())
+	h.lastBeat.Store(&t)
 }
 
 func (h *Heartbeat) clock() time.Time {

@@ -304,12 +304,6 @@ func (b *BlockAssembler) GetChainedSubtreesTotalSize() uint64 {
 	return b.subtreeProcessor.GetChainedSubtreesTotalSize()
 }
 
-// startChannelListeners initializes and starts all channel listeners for block assembly operations.
-// It handles blockchain notifications, mining candidate requests, and reset operations.
-//
-// Parameters:
-//   - ctx: Context for cancellation
-//
 // blockAssemblerHeartbeatInterval is how often the main loop's idle tick
 // fires. It only needs to be comfortably shorter than any liveness timeout an
 // operator would configure.
@@ -318,7 +312,16 @@ func (b *BlockAssembler) GetChainedSubtreesTotalSize() uint64 {
 // unrelated timeout-bounded tests over their limits.
 var blockAssemblerHeartbeatInterval = 5 * time.Second
 
-// startChannelListeners starts the main event loop goroutine.
+// startChannelListeners initializes and starts all channel listeners for block assembly operations.
+// It handles blockchain notifications, mining candidate requests, and reset operations.
+// The listener goroutine also owns the liveness heartbeat, beating on every pass
+// of its select so a wedged loop can be told apart from an idle one.
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//
+// Returns:
+//   - error: Any error encountered subscribing to blockchain notifications
 func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) {
 	// start a subscription for the best block header and the FSM state
 	// this will be used to reset the subtree processor when a new block is mined
@@ -333,6 +336,14 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 	// reorg path replays missing blocks from the common ancestor; on a healthy
 	// node it returns early when hashes match.
 	b.triggerReconcile()
+
+	// A liveness timeout at or below the idle tick cannot tell an idle loop from
+	// a wedged one, so it would restart a healthy node. Warn rather than clamp:
+	// the operator chose the value and silently overriding it would hide the
+	// mistake (issue 1447).
+	if stallTimeout := b.settings.BlockAssembly.LivenessStallTimeout; stallTimeout > 0 && stallTimeout <= 2*blockAssemblerHeartbeatInterval {
+		b.logger.Warnf("[BlockAssembler] blockassembly_livenessStallTimeout %s is not comfortably longer than the %s heartbeat interval: a healthy idle node may be reported as wedged and restarted", stallTimeout, blockAssemblerHeartbeatInterval)
+	}
 
 	b.wg.Add(1)
 	go func() {
@@ -2035,12 +2046,18 @@ func (b *BlockAssembler) validateParentChain(
 
 	// Process transactions in batches for performance
 	for i := 0; i < len(unminedTxs); i += batchSize {
-		// Beat on completed batches: this work runs inside a select case, so
-		// without it a large-but-progressing validation looks identical to a
-		// wedge. Beating on FORWARD PROGRESS (a finished batch) rather than on
-		// entry keeps the distinction — a run that stops progressing still
-		// goes stale (issue 1447).
-		b.heartbeat.Beat()
+		// Beat on completed batches: when this runs from the reset path it is
+		// inside a select case, so without it a large-but-progressing validation
+		// looks identical to a wedge. Beating on FORWARD PROGRESS (a finished
+		// batch) rather than on entry keeps the distinction — a run that stops
+		// progressing still goes stale (issue 1447).
+		//
+		// BeatIfStarted, not Beat: this same code also runs from Start, before
+		// the main loop owns the heartbeat, and the rest of that startup path
+		// (bulk-loading the unmined set into the subtree processor) is
+		// legitimately unbounded. A plain Beat here would start the clock
+		// mid-startup and let the probe report a still-starting node as wedged.
+		b.heartbeat.BeatIfStarted()
 
 		// Check for context cancellation at start of each batch
 		select {
