@@ -205,6 +205,10 @@ func (b *BlockAssembler) recoverCoinbaseDivergence(ctx context.Context, triggerH
 // probe again; a runtime (mid-operation) point-of-pain detector is future
 // work, not something this branch implements.
 func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) error {
+	if b.blockchainClient == nil || b.utxoStore == nil {
+		return nil // nothing to probe against; matches the guards on the other optional-store paths in Start
+	}
+
 	header, height := b.CurrentBlock()
 	if header == nil || height == 0 {
 		return nil // genesis / unset — nothing to check
