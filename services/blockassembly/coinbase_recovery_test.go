@@ -10,8 +10,10 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -329,4 +331,234 @@ func TestRecoverCoinbaseDivergence_GapTooLarge_Escalates(t *testing.T) {
 	escalatedAfter := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
 	require.Equal(t, float64(1), escalatedAfter-escalatedBefore,
 		"escalated counter must increment exactly once when the gap exceeds the cap")
+}
+
+// swapSubtreeProcessor installs a stand-in subtree processor for the duration
+// of the test and puts the real one back before the test helper's own cleanup
+// runs. Cleanups run last-registered-first, so the Stop() that
+// setupBlockAssemblyTestWithUtxoStore registered still lands on the real
+// processor rather than on a stand-in that was never asked to expect it.
+func swapSubtreeProcessor(t *testing.T, items *baTestItems, replacement subtreeprocessor.Interface) {
+	t.Helper()
+
+	original := items.blockAssembler.subtreeProcessor
+	items.blockAssembler.subtreeProcessor = replacement
+
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor = original })
+}
+
+// TestErrCoinbaseGapTooLargeIsDistinguishable pins the property the retry logic
+// in recoverCoinbaseDivergence depends on: errors.Is must say "yes" for the
+// sentinel and "no" for the wrapped store/blockchain-client errors
+// scopeCoinbaseGap returns from the same function.
+//
+// This is not theoretical. teranode's errors.Is compares two *Error values by
+// error *code*, so while errCoinbaseGapTooLarge was built with
+// errors.NewProcessingError it matched every other ProcessingError, and the
+// "is this structural or transient?" test would have been permanently true.
+func TestErrCoinbaseGapTooLargeIsDistinguishable(t *testing.T) {
+	require.True(t, errors.Is(errCoinbaseGapTooLarge, errCoinbaseGapTooLarge),
+		"the sentinel must match itself")
+
+	transient := errors.NewProcessingError("[coinbaseRecovery] cannot get canonical block at height %d", 42,
+		errors.NewStorageError("connection refused"))
+	require.False(t, errors.Is(transient, errCoinbaseGapTooLarge),
+		"a transient walk-back error must not be mistaken for the gap-too-large sentinel")
+
+	require.True(t, errors.Is(errors.NewProcessingError("wrapped", errCoinbaseGapTooLarge), errCoinbaseGapTooLarge),
+		"the sentinel must still be recognisable through a wrapper")
+}
+
+// TestRecoverCoinbaseDivergence_RetriesThenSucceeds covers the retry budget
+// actually being used: ReconcileCoinbases fails once (as a transient store
+// error would) and succeeds on the second attempt. Before this test,
+// MaxAttempts=3 was indistinguishable from MaxAttempts=1 because no test ever
+// drove a failing repair.
+//
+// The subtree processor is mocked here (which AGENTS.md permits - the rule is
+// about the blockchain client and store, both of which stay real sqlitememory)
+// because the point under test is the orchestration's reaction to a failing
+// repair, and a real processor has no way to fail on demand.
+func TestRecoverCoinbaseDivergence_RetriesThenSucceeds(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t)
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	headers := buildCanonicalChain(ctx, t, items, 4)
+	seedCoinbase(ctx, t, items, headers, 1) // floor good; 2,3,4 missing
+
+	mockProcessor := &subtreeprocessor.MockSubtreeProcessor{}
+	mockProcessor.On("ReconcileCoinbases", mock.Anything, mock.Anything).
+		Return(errors.NewStorageError("transient store blip")).Once()
+	mockProcessor.On("ReconcileCoinbases", mock.Anything, mock.Anything).
+		Return(nil).Once()
+	swapSubtreeProcessor(t, items, mockProcessor)
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+	repairedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired"))
+	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+
+	require.NoError(t, items.blockAssembler.recoverCoinbaseDivergence(ctx, 4))
+
+	mockProcessor.AssertNumberOfCalls(t, "ReconcileCoinbases", 2)
+
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore)
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired"))-repairedBefore,
+		"a repair that needed a retry still counts as exactly one repair")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
+		"a retry that eventually succeeds must not raise the operator alarm")
+}
+
+// TestRecoverCoinbaseDivergence_ExhaustsAttemptsThenEscalates covers the other
+// half of the retry budget: every attempt fails, so recovery must spend the
+// whole budget (not give up after one) and then escalate exactly once.
+func TestRecoverCoinbaseDivergence_ExhaustsAttemptsThenEscalates(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t)
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	headers := buildCanonicalChain(ctx, t, items, 4)
+	seedCoinbase(ctx, t, items, headers, 1) // floor good; 2,3,4 missing
+
+	mockProcessor := &subtreeprocessor.MockSubtreeProcessor{}
+	mockProcessor.On("ReconcileCoinbases", mock.Anything, mock.Anything).
+		Return(errors.NewStorageError("store is down"))
+	swapSubtreeProcessor(t, items, mockProcessor)
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+	repairedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired"))
+	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+
+	err := items.blockAssembler.recoverCoinbaseDivergence(ctx, 4)
+	require.Error(t, err)
+
+	mockProcessor.AssertNumberOfCalls(t, "ReconcileCoinbases", 3)
+
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore)
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired"))-repairedBefore)
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
+		"exhausting the attempt budget must escalate exactly once")
+}
+
+// TestRecoverCoinbaseDivergence_NoGapBalancesMetric pins the accounting rule
+// stated on the metric: every "detected" gets exactly one follow-up outcome.
+// When scoping finds nothing to repair there is neither a repair nor an
+// escalation, so without the dedicated "no_gap" outcome the three counters
+// would never add up.
+func TestRecoverCoinbaseDivergence_NoGapBalancesMetric(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t)
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// Every height present: scoping finds no gap at all.
+	headers := buildCanonicalChain(ctx, t, items, 3)
+	for h := uint32(1); h <= 3; h++ {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+	noGapBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("no_gap"))
+
+	require.NoError(t, items.blockAssembler.recoverCoinbaseDivergence(ctx, 3))
+
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore)
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("no_gap"))-noGapBefore,
+		"a detection that turns out to have nothing to repair must record the no_gap outcome")
+}
+
+// TestStartupCoinbaseDivergenceCheck_HoleBelowPresentTip is the regression test
+// for the detection gap the review flagged as blocking (ChiR1). The tip's
+// coinbase is present, so the old tip-only probe returned early and never ran
+// the walk-back that exists precisely to repair this shape: a hole left below a
+// healthy-looking tip by the concurrent fast-forward create loop. Undetected,
+// that hole wedges the node on the missing coinbase's eventual maturity spend.
+func TestStartupCoinbaseDivergenceCheck_HoleBelowPresentTip(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t)
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// heights 1..6 present except 3 and 4 -- the tip (6) and 5 are fine, so a
+	// tip-only probe sees a healthy node.
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	for _, h := range []uint32{1, 2, 5, 6} {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	for h := uint32(1); h <= 6; h++ {
+		present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, h)
+		require.NoError(t, err)
+		require.True(t, present, "coinbase at height %d must be present after startup recovery", h)
+	}
+}
+
+// TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned states the
+// honest limit of the widened startup scan: it covers a bounded window below
+// the tip (CoinbaseRecoveryMaxGapBlocks heights), not the whole chain. A hole
+// deeper than the window is left for the runtime detector that is deliberately
+// out of scope for this change, and this test exists so that boundary is
+// asserted rather than assumed.
+func TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t)
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+	// Window of 2 heights: from tip 6 the scan reaches only heights 6 and 5.
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 2
+
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	for _, h := range []uint32{1, 2, 4, 5, 6} {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+	// height 3 is missing and sits below the window.
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		"a hole below the scan window is not detected at startup - that is the documented boundary")
+
+	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 3)
+	require.NoError(t, err)
+	require.False(t, present)
 }

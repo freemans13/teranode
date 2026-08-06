@@ -44,12 +44,66 @@
 | ParallelSetIfNotExistsThreshold      | int           | 10000            | blockassembly_parallelSetIfNotExistsThreshold      | Threshold for parallelizing conditional writes                                       |
 | StoreTxInpointsForSubtreeMeta        | bool          | true             | blockassembly_storeTxInpointsForSubtreeMeta        | Store transaction input points in subtree metadata (required for checkblocktemplate) |
 | IdleSleepDuration                    | time.Duration | 10ms             | blockassembly_idle_sleep_duration                  | Sleep duration when subtree processor queue is empty                                 |
+| CoinbaseRecoveryMaxGapBlocks         | int           | 200              | blockassembly_coinbaseRecoveryMaxGapBlocks         | Startup scan window below the tip, and the largest coinbase gap auto-repair will fix |
+| CoinbaseRecoveryConsecutiveGood      | int           | 6                | blockassembly_coinbaseRecoveryConsecutiveGood      | Consecutive present coinbases proving the gap floor during walk-back                 |
+| CoinbaseRecoveryMaxAttempts          | int           | 3                | blockassembly_coinbaseRecoveryMaxAttempts          | Automatic coinbase-recovery attempts before raising an operator alert                |
+
+## Coinbase Divergence Recovery
+
+Block assembly keeps two pieces of state that have to agree: the chain pointer (the
+header it believes it is on) and the coinbase UTXOs it has created. Nothing makes
+those two writes atomic, so an unclean shutdown — a crash part-way through the
+fast-forward create loop, for instance — can leave the pointer ahead of the coinbase
+set. The damage is not visible immediately: it shows up a hundred blocks later, when
+a coinbase-maturity spend looks for a parent coinbase that was never written, cannot
+find it, and wedges the tip permanently.
+
+To catch that, block assembly runs a check once during startup, after the subtree
+processor is running but before it starts consuming block notifications. It walks
+down from the persisted tip looking for canonical coinbases missing from the UTXO
+store. On the first (highest) one it finds, it scopes the contiguous gap beneath it
+and re-creates just those coinbases — never the transactions in those blocks, so the
+cost is proportional to the number of affected blocks rather than to chain size.
+
+Three settings bound that work:
+
+- `blockassembly_coinbaseRecoveryMaxGapBlocks` does double duty. It is how far below
+  the tip the startup scan looks, and it is the largest gap recovery will repair on
+  its own. The two are deliberately the same number: there is no value in detecting a
+  divergence deeper than the node is willing to fix automatically. A clean boot costs
+  two store reads per height in the window; the scan stops at the first miss.
+- `blockassembly_coinbaseRecoveryConsecutiveGood` guards against under-repair. The
+  fast-forward create loop runs one goroutine per block, so a crash can leave a
+  present coinbase sitting above still-missing ones. Stopping the walk-back at the
+  first present coinbase would miss those, so it keeps going until it has seen this
+  many present coinbases in a row.
+- `blockassembly_coinbaseRecoveryMaxAttempts` caps automatic retries. Retries exist
+  for transient failures (a store or blockchain-client blip), with a short pause
+  between them. A gap larger than the cap is structural and escalates straight away
+  without spending retries on it.
+
+Detection coverage is a bounded window, not the whole chain. A hole further below the
+tip than `coinbaseRecoveryMaxGapBlocks` is not found at startup; detecting that
+cheaply during normal operation is separate, future work.
+
+When recovery cannot fix a divergence it logs a single `MANUAL INTERVENTION REQUIRED`
+line naming `resetblockassembly`, and increments the `escalated` outcome on the
+`teranode_blockassembly_coinbase_divergence_total` metric. Startup does **not** fail
+in that case — the node boots and keeps building on the diverged tip. That is
+deliberate: crash-looping the process helps nobody, and a running node an operator can
+inspect is strictly more useful. The trade-off is that the escalation log is a call to
+action, not a description of a node that has stopped itself.
+
+Every detection records exactly one follow-up outcome on that metric, so
+`detected == repaired + no_gap + escalated`. A non-zero `no_gap` means the divergence
+had already closed by the time recovery scoped it.
 
 ## Hardcoded Settings (Not Configurable)
 
 | Setting | Value | Usage |
 |---------|-------|-------|
 | jobTTL | 10 minutes | Mining job cache TTL |
+| coinbaseRecoveryRetryBackoff | 500 milliseconds | Pause between automatic coinbase-recovery attempts |
 
 ## Configuration Dependencies
 

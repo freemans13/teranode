@@ -425,6 +425,10 @@ var (
 
 	// StateCheckSubtreeProcessor indicates the processor is checking its state
 	StateCheckSubtreeProcessor State = 11
+
+	// StateReconcileCoinbases indicates the processor is creating canonical
+	// coinbase UTXOs to repair a detected coinbase divergence
+	StateReconcileCoinbases State = 12
 )
 
 var StateStrings = map[State]string{
@@ -439,6 +443,7 @@ var StateStrings = map[State]string{
 	StateResetBlocks:           "resetBlocks",
 	StateRemoveTx:              "removeTx",
 	StateCheckSubtreeProcessor: "checkSubtreeProcessor",
+	StateReconcileCoinbases:    "reconcileCoinbases",
 }
 
 var (
@@ -888,10 +893,13 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					// just logs and exits) and leave the caller of ReconcileCoinbases
 					// blocked forever on responseCh.
 					reconcileErr := stp.runHandlerWithRecover("reconcileCoinbases", func() error {
+						stp.setCurrentRunningState(StateReconcileCoinbases)
 						return stp.reconcileCoinbases(reconcileMsg.ctx, reconcileMsg.gapBlocks)
 					})
 
 					reconcileMsg.responseCh <- reconcileErr
+
+					stp.setCurrentRunningState(StateRunning)
 
 				case removeTxHash := <-stp.removeTxCh:
 					// remove the given transaction from the subtrees.
@@ -4067,6 +4075,14 @@ func (stp *SubtreeProcessor) moveBackBlockBulkBuild(ctx context.Context, block *
 }
 
 // removeCoinbaseUtxos removes the coinbase UTXO and its child spends from the UTXO store.
+//
+// The nil block / nil CoinbaseTx guard exists for the rollback paths that call
+// this on the way out of a failure: moveBackBlock during a reorg, and the
+// fast-forward reset unwind, both of which iterate blocks assembled elsewhere.
+// Without the guard a nil coinbase turns a recoverable rollback into a panic
+// inside the processor goroutine. Coinbase-divergence recovery only ever
+// creates coinbases (ReconcileCoinbases -> processCoinbaseUtxos) and never
+// reaches here.
 //
 // Parameters:
 //   - ctx: Context for cancellation
