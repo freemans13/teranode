@@ -133,9 +133,9 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		require.NoError(t, err)
 
 		// Mock UTXO store Create method
-		server.utxoStore.(*utxo.MockUtxostore).On("Create",
+		server.utxoStore.(*utxo.MockUtxostore).On("SpendAndCreate",
 			mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(&utxometa.Data{}, nil)
+			Return(&utxometa.Data{}, nil, nil)
 
 		// Mock validator to return success - set up the validator client to succeed
 		mockValidator := server.validatorClient.(*validator.MockValidator)
@@ -400,9 +400,9 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		require.NoError(t, err)
 
 		// Mock UTXO store Create method
-		server.utxoStore.(*utxo.MockUtxostore).On("Create",
+		server.utxoStore.(*utxo.MockUtxostore).On("SpendAndCreate",
 			mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(&utxometa.Data{}, nil)
+			Return(&utxometa.Data{}, nil, nil)
 
 		// Mock validator and blockchain client
 		mockValidator := server.validatorClient.(*validator.MockValidator)
@@ -1691,6 +1691,58 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("WalkLimitExceededFailsFast", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+		require.NoError(t, err)
+
+		allTransactions := []*bt.Tx{tx1}
+		blockIds := make(map[uint32]bool)
+
+		mockValidator := server.validatorClient.(*validator.MockValidator)
+		mockValidator.UtxoStore = server.utxoStore
+		mockValidator.Errors = []error{errors.NewUtxoWalkLimitExceededError("walk limit exceeded for testing")}
+
+		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
+			mock.Anything, blockchain.FSMStateRUNNING).
+			Return(true, nil)
+
+		// The walk-limit error is deterministic for the block: it must fail the
+		// level immediately and keep its distinct code through the wrapping, not
+		// be swallowed into a countless summary error.
+		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, blockIds, true)
+		require.Error(t, err)
+		require.ErrorIs(t, err, errors.ErrUtxoWalkLimitExceeded)
+	})
+
+	t.Run("SummaryChainsFirstError", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+		require.NoError(t, err)
+
+		allTransactions := []*bt.Tx{tx1}
+		blockIds := make(map[uint32]bool)
+
+		mockValidator := server.validatorClient.(*validator.MockValidator)
+		mockValidator.UtxoStore = server.utxoStore
+		mockValidator.Errors = []error{errors.NewStorageError("distinctive storage failure for testing")}
+
+		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
+			mock.Anything, blockchain.FSMStateRUNNING).
+			Return(true, nil)
+
+		// Generic per-tx errors are counted and deferred, but the summary error
+		// must chain the first cause instead of reporting bare counts.
+		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, blockIds, true)
+		require.Error(t, err)
+		require.ErrorIs(t, err, errors.ErrStorageError)
+		require.Contains(t, err.Error(), "distinctive storage failure for testing")
+	})
+
 	t.Run("NilTransaction", func(t *testing.T) {
 		server, cleanup := setupTestServer(t)
 		defer cleanup()
@@ -2287,9 +2339,9 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	// Mock UTXO store
 	mockUtxoStore := &utxo.MockUtxostore{}
 	// Set up default mock for Create method
-	mockUtxoStore.On("Create",
+	mockUtxoStore.On("SpendAndCreate",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return(&utxometa.Data{}, nil).Maybe()
+		Return(&utxometa.Data{}, nil, nil).Maybe()
 	// Set up default mock for BatchDecorate method
 	mockUtxoStore.On("BatchDecorate",
 		mock.Anything, mock.Anything, mock.Anything).

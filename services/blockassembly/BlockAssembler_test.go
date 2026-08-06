@@ -454,31 +454,31 @@ func TestBlockAssembly_AddTx(t *testing.T) {
 			}
 		}()
 
-		_, err := testItems.utxoStore.Create(ctx, tx1, 0)
+		_, _, err := testItems.utxoStore.SpendAndCreate(ctx, tx1, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash1, Fee: 111}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx2, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx2, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash2, Fee: 222}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx3, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx3, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash3, Fee: 333}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx4, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx4, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash4, Fee: 110}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx5, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx5, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash5, Fee: 220}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx6, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx6, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash6, Fee: 330}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx7, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx7, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash7, Fee: 6}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
@@ -845,23 +845,23 @@ func TestBlockAssembly_ShouldNotAllowMoreThanOneCoinbaseTx(t *testing.T) {
 			}
 		}()
 
-		_, err := testItems.utxoStore.Create(ctx, tx1, 0)
+		_, _, err := testItems.utxoStore.SpendAndCreate(ctx, tx1, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *subtreepkg.CoinbasePlaceholderHash, Fee: 5000000000}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx2, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx2, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash2, Fee: 222}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx3, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx3, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash3, Fee: 334}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx4, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx4, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash4, Fee: 444}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx5, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx5, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash5, Fee: 555}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
@@ -952,15 +952,15 @@ func TestBlockAssembly_GetMiningCandidate(t *testing.T) {
 			}
 		}()
 
-		_, err := testItems.utxoStore.Create(ctx, tx2, 0)
+		_, _, err := testItems.utxoStore.SpendAndCreate(ctx, tx2, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash2, Fee: 222, SizeInBytes: 222}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx3, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx3, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash3, Fee: 333, SizeInBytes: 333}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx4, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx4, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *hash4, Fee: 444, SizeInBytes: 444}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
@@ -1070,7 +1070,7 @@ func TestBlockAssembly_GetMiningCandidate_MaxBlockSize(t *testing.T) {
 		for i := 1; i < 15; i++ {
 			// nolint:gosec // G404: Use of weak random number generator (math/rand instead of crypto/rand) (gosec)
 			tx := newTx(uint32(i))
-			_, err := testItems.utxoStore.Create(ctx, tx, 0)
+			_, _, err := testItems.utxoStore.SpendAndCreate(ctx, tx, 0, utxoStore.WithCreateOnly())
 			require.NoError(t, err)
 
 			testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *tx.TxIDChainHash(), Fee: 1000000000, SizeInBytes: 15000}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
@@ -1169,7 +1169,7 @@ func TestBlockAssembly_GetMiningCandidate_MaxBlockSize_LessThanSubtreeSize(t *te
 		for i := 1; i < 4; i++ {
 			// nolint:gosec // G404: Use of weak random number generator (math/rand instead of crypto/rand) (gosec)
 			tx := newTx(uint32(i))
-			_, err := testItems.utxoStore.Create(ctx, tx, 0)
+			_, _, err := testItems.utxoStore.SpendAndCreate(ctx, tx, 0, utxoStore.WithCreateOnly())
 			require.NoError(t, err)
 
 			testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{Hash: *tx.TxIDChainHash(), Fee: 1000000000, SizeInBytes: 150000}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}}) // 0.15MB
@@ -1275,7 +1275,7 @@ func TestBlockAssembly_CoinbaseSubsidyBugReproduction(t *testing.T) {
 		tx3 := newTx(3)
 
 		// Add transactions to UTXO store and then to block assembler
-		_, err := testItems.utxoStore.Create(ctx, tx1, 0)
+		_, _, err := testItems.utxoStore.SpendAndCreate(ctx, tx1, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 			Hash:        *tx1.TxIDChainHash(),
@@ -1283,7 +1283,7 @@ func TestBlockAssembly_CoinbaseSubsidyBugReproduction(t *testing.T) {
 			SizeInBytes: 250,
 		}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx2, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx2, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 			Hash:        *tx2.TxIDChainHash(),
@@ -1291,7 +1291,7 @@ func TestBlockAssembly_CoinbaseSubsidyBugReproduction(t *testing.T) {
 			SizeInBytes: 250,
 		}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 
-		_, err = testItems.utxoStore.Create(ctx, tx3, 0)
+		_, _, err = testItems.utxoStore.SpendAndCreate(ctx, tx3, 0, utxoStore.WithCreateOnly())
 		require.NoError(t, err)
 		testItems.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 			Hash:        *tx3.TxIDChainHash(),
@@ -2032,7 +2032,7 @@ func TestBlockAssembly_LoadUnminedTransactions_ReseedsMinedTx_WhenUnminedSinceNo
 	// Create a test tx and insert into UTXO store as unmined initially (unmined_since set)
 	tx := newTx(42)
 	txHash := tx.TxIDChainHash()
-	_, err := items.utxoStore.Create(ctx, tx, 0) // blockHeight=0 -> unmined_since set to 0
+	_, _, err := items.utxoStore.SpendAndCreate(ctx, tx, 0, utxoStore.WithCreateOnly()) // blockHeight=0 -> unmined_since set to 0
 	require.NoError(t, err)
 
 	// Mark as mined on longest chain (this should clear unmined_since)
@@ -2078,7 +2078,7 @@ func TestBlockAssembly_LoadUnminedTransactions_ReorgCornerCase_MisUnsetMinedStat
 	// Prepare a mined tx on the main chain
 	tx := newTx(43)
 	txHash := tx.TxIDChainHash()
-	_, err := items.utxoStore.Create(ctx, tx, 0)
+	_, _, err := items.utxoStore.SpendAndCreate(ctx, tx, 0, utxoStore.WithCreateOnly())
 	require.NoError(t, err)
 
 	_, err = items.utxoStore.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, utxoStore.MinedBlockInfo{
@@ -2131,9 +2131,9 @@ func TestBlockAssembly_LoadUnminedTransactions_SkipsTransactionsOnCurrentChain(t
 	txHash2 := tx2.TxIDChainHash()
 
 	// Add both transactions to UTXO store as unmined initially
-	_, err := items.utxoStore.Create(ctx, tx1, 0)
+	_, _, err := items.utxoStore.SpendAndCreate(ctx, tx1, 0, utxoStore.WithCreateOnly())
 	require.NoError(t, err)
-	_, err = items.utxoStore.Create(ctx, tx2, 0)
+	_, _, err = items.utxoStore.SpendAndCreate(ctx, tx2, 0, utxoStore.WithCreateOnly())
 	require.NoError(t, err)
 
 	// Add the first test block (using existing blockHeader1 pattern)
@@ -2950,7 +2950,7 @@ func TestReset_ConflictDetectionViaValidateInputs(t *testing.T) {
 	txParent.Outputs = []*bt.Output{
 		{Satoshis: 100000, LockingScript: bscript.NewFromBytes([]byte{0x76, 0xa9, 0x14, 0x00, 0x88, 0xac})},
 	}
-	_, err := items.utxoStore.Create(ctx, txParent, 1)
+	_, _, err := items.utxoStore.SpendAndCreate(ctx, txParent, 1, utxoStore.WithCreateOnly())
 	require.NoError(t, err)
 	parentHash := txParent.TxIDChainHash()
 	require.NoError(t, items.utxoStore.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*parentHash}, true))
@@ -2965,7 +2965,7 @@ func TestReset_ConflictDetectionViaValidateInputs(t *testing.T) {
 	txA.Outputs = []*bt.Output{{Satoshis: 90000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
 	const assemblyHeight = uint32(5)
 	require.NoError(t, items.utxoStore.SetBlockHeight(assemblyHeight))
-	_, err = items.utxoStore.Create(ctx, txA, assemblyHeight)
+	_, _, err = items.utxoStore.SpendAndCreate(ctx, txA, assemblyHeight, utxoStore.WithCreateOnly())
 	require.NoError(t, err)
 	txAHash := txA.TxIDChainHash()
 

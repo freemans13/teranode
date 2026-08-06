@@ -59,6 +59,8 @@ import (
 // construct fresh maps without re-deriving the value.
 const splitMapBuckets = 16 * 1024
 
+const errAddingNodeToSubtree = "error adding node to subtree"
+
 // splitMapBucketsMax is the inclusive upper bound for
 // BlockAssembly.SplitMapBuckets — driven by the uint16 internal
 // representation in SplitTxInpointsMap. Settings above this are clamped
@@ -2135,7 +2137,7 @@ func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.T
 	}
 
 	if err = stp.currentSubtree.Load().AddSubtreeNode(node); err != nil {
-		return errors.NewProcessingError("error adding node to subtree", err)
+		return errors.NewProcessingError(errAddingNodeToSubtree, err)
 	}
 
 	if stp.currentSubtree.Load().IsComplete() {
@@ -2176,7 +2178,7 @@ func (stp *SubtreeProcessor) addNodePreValidated(node subtreepkg.Node, skipNotif
 	}
 
 	if err = stp.currentSubtree.Load().AddSubtreeNode(node); err != nil {
-		return errors.NewProcessingError("error adding node to subtree", err)
+		return errors.NewProcessingError(errAddingNodeToSubtree, err)
 	}
 
 	if stp.currentSubtree.Load().IsComplete() {
@@ -2893,7 +2895,7 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 				// Restore to currentTxMap to avoid inconsistent state
 				stp.currentTxMap.Set(node.Hash, parents)
 				stp.deletedTxs.Delete(node.Hash)
-				return errors.NewProcessingError("error adding node to subtree", err)
+				return errors.NewProcessingError(errAddingNodeToSubtree, err)
 			}
 
 			// Clear from deletedTxs (transaction successfully re-added, no longer deleted)
@@ -5020,10 +5022,11 @@ func (stp *SubtreeProcessor) processCoinbaseUtxos(ctx context.Context, block *mo
 	stp.logger.Debugf("[SubtreeProcessor][%s] height %d storeCoinbaseTx %s blockID %d", block.Header.Hash().String(), blockHeight, block.CoinbaseTx.TxIDChainHash().String(), block.ID)
 	// we pass in the block height we are working on here, since the utxo store will recognize the tx as
 	// a coinbase and add the correct spending height, which should be + 99
-	if _, err = stp.utxoStore.Create(
+	if _, _, err = stp.utxoStore.SpendAndCreate(
 		ctx,
 		block.CoinbaseTx,
 		blockHeight,
+		utxostore.WithCreateOnly(),
 		utxostore.WithMinedBlockInfo(
 			utxostore.MinedBlockInfo{
 				BlockID:     block.ID,

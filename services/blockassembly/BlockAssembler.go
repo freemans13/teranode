@@ -40,6 +40,18 @@ const (
 	// pendingBlocksPollInterval is the interval at which the block assembler
 	// polls for pending blocks during startup
 	pendingBlocksPollInterval = 1 * time.Second
+
+	// miningCandidateVersion is the block version advertised in mining candidates: 0x20000000 is
+	// the BIP9/versionbits base (top three bits 001, no deployment bits) and clears the BIP34/66/65
+	// mandatory floor (>= 4). Used for both the normal and empty-block candidates rather than
+	// inheriting the tip's version: at an activation boundary the tip can validly carry the old
+	// floor while the next block requires the new one, so an inherited version could be rejected.
+	miningCandidateVersion uint32 = 0x20000000
+
+	logTxInvalidParent          = "[BlockAssembler][validateParentChain] Transaction %s has invalid parent: %s"
+	errGettingBestBlockHeaders  = "error getting best block headers"
+	errMarkingTxsMined          = "error marking transactions as mined on longest chain"
+	errGettingUnminedTxIterator = "error getting unmined tx iterator"
 )
 
 // create state strings for the processor
@@ -1551,7 +1563,7 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 		Id:                  id,
 		PreviousHash:        previousHash[:],
 		CoinbaseValue:       totalFees + blockSubsidy,
-		Version:             0x20000000,
+		Version:             miningCandidateVersion,
 		NBits:               nBits.CloneBytes(),
 		Height:              baBestBlockHeight + 1, // next block height
 		Time:                timeNowUint32,
@@ -1619,11 +1631,12 @@ func (b *BlockAssembler) generateEmptyBlockCandidate(bestBlockHeader *model.Bloc
 	copy(id[:], bestBlockHeader.Hash()[:])
 	id[0] ^= 0xFF
 
+	// Version uses miningCandidateVersion (same as the main candidate) rather than the tip's version.
 	miningCandidate := &model.MiningCandidate{
 		Id:                  id[:],
 		PreviousHash:        bestBlockHeader.Hash()[:],
 		CoinbaseValue:       blockSubsidy,
-		Version:             bestBlockHeader.Version,
+		Version:             miningCandidateVersion,
 		NBits:               nBits[:],
 		Time:                timeNowUint32,
 		Height:              nextBlockHeight,
@@ -2116,7 +2129,7 @@ func (b *BlockAssembler) validateParentChain(
 				if _, isConflictingCascade := conflictingDescendants[parentTxID]; isConflictingCascade {
 					allParentsValid = false
 					invalidReason = fmt.Sprintf("parent tx %s is conflicting (cascade)", parentTxID.String())
-					b.logger.Warnf("[BlockAssembler][validateParentChain] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
+					b.logger.Warnf(logTxInvalidParent, tx.Hash.String(), invalidReason)
 					if filteringEnabled {
 						conflictingDescendants[tx.Hash] = struct{}{}
 					}
@@ -2128,7 +2141,7 @@ func (b *BlockAssembler) validateParentChain(
 				if _, isRejectedCascade := rejectedHashes[parentTxID]; isRejectedCascade {
 					allParentsValid = false
 					invalidReason = fmt.Sprintf("parent tx %s was filtered earlier in this run (cascade)", parentTxID.String())
-					b.logger.Warnf("[BlockAssembler][validateParentChain] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
+					b.logger.Warnf(logTxInvalidParent, tx.Hash.String(), invalidReason)
 					break
 				}
 
@@ -2139,14 +2152,14 @@ func (b *BlockAssembler) validateParentChain(
 					// This means BatchDecorate couldn't find it - it doesn't exist
 					allParentsValid = false
 					invalidReason = fmt.Sprintf("parent tx %s not found in UTXO store", parentTxID.String())
-					b.logger.Warnf("[BlockAssembler][validateParentChain] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
+					b.logger.Warnf(logTxInvalidParent, tx.Hash.String(), invalidReason)
 					break
 				}
 
 				if parentMeta.Conflicting {
 					allParentsValid = false
 					invalidReason = fmt.Sprintf("parent tx %s is conflicting", parentTxID.String())
-					b.logger.Warnf("[BlockAssembler][validateParentChain] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
+					b.logger.Warnf(logTxInvalidParent, tx.Hash.String(), invalidReason)
 					if filteringEnabled {
 						conflictingDescendants[tx.Hash] = struct{}{}
 					}
@@ -2173,7 +2186,7 @@ func (b *BlockAssembler) validateParentChain(
 						// Unmined but not in our list - this is a problem
 						allParentsValid = false
 						invalidReason = fmt.Sprintf("parent tx %s is unmined but not in processing list", parentTxID.String())
-						b.logger.Warnf("[BlockAssembler][validateParentChain] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
+						b.logger.Warnf(logTxInvalidParent, tx.Hash.String(), invalidReason)
 						break
 					}
 				} else if len(parentMeta.BlockIDs) > 0 {
@@ -2194,7 +2207,7 @@ func (b *BlockAssembler) validateParentChain(
 						allParentsValid = false
 						invalidReason = fmt.Sprintf("parent tx %s is on wrong chain (blocks: %v) and not in unmined list - data integrity issue from fork handling",
 							parentTxID.String(), parentMeta.BlockIDs)
-						b.logger.Warnf("[BlockAssembler][validateParentChain] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
+						b.logger.Warnf(logTxInvalidParent, tx.Hash.String(), invalidReason)
 						break
 					}
 					// else: parent is mined on best chain - all good, continue
@@ -2203,7 +2216,7 @@ func (b *BlockAssembler) validateParentChain(
 					// This should never happen - a tx with unmined_since=0 should have BlockIDs
 					allParentsValid = false
 					invalidReason = fmt.Sprintf("parent tx %s has data inconsistency (unmined_since=0 but no block_ids)", parentTxID.String())
-					b.logger.Warnf("[BlockAssembler][validateParentChain] Transaction %s has invalid parent: %s", tx.Hash.String(), invalidReason)
+					b.logger.Warnf(logTxInvalidParent, tx.Hash.String(), invalidReason)
 					break
 				}
 			}
@@ -2458,7 +2471,7 @@ func (b *BlockAssembler) fixUnminedSinceInconsistencies(ctx context.Context) err
 	bestBlockHeader, _ := b.CurrentBlock()
 	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, bestBlockHeader.Hash(), scanHeaders)
 	if err != nil {
-		return errors.NewProcessingError("error getting best block headers", err)
+		return errors.NewProcessingError(errGettingBestBlockHeaders, err)
 	}
 
 	bestBlockHeaderIDsMap := make(map[uint32]bool, len(bestBlockHeaderIDs))
@@ -2537,7 +2550,7 @@ func (b *BlockAssembler) fixUnminedSinceInconsistencies(ctx context.Context) err
 	if len(markAsMinedOnLongestChain) > 0 {
 		markStart := time.Now()
 		if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, markAsMinedOnLongestChain, true); err != nil {
-			return errors.NewProcessingError("error marking transactions as mined on longest chain", err)
+			return errors.NewProcessingError(errMarkingTxsMined, err)
 		}
 		b.logger.Infof("[fixUnminedSinceInconsistencies] fixed %d inconsistent transactions in %s",
 			len(markAsMinedOnLongestChain), time.Since(markStart).Truncate(time.Millisecond))
@@ -2629,7 +2642,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 
 	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, bestBlockHeader.Hash(), scanHeaders)
 	if err != nil {
-		return errors.NewProcessingError("error getting best block headers", err)
+		return errors.NewProcessingError(errGettingBestBlockHeaders, err)
 	}
 
 	bestBlockHeaderIDsMap := make(map[uint32]bool, len(bestBlockHeaderIDs))
@@ -2643,7 +2656,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 	duration := time.Since(start).Seconds()
 	if err != nil {
 		prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues("false", "error").Observe(duration)
-		return errors.NewProcessingError("error getting unmined tx iterator", err)
+		return errors.NewProcessingError(errGettingUnminedTxIterator, err)
 	}
 	prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues("false", "success").Observe(duration)
 	b.logger.Infof("[loadUnminedTransactions] successfully created unmined tx iterator, starting to process transactions")
@@ -2813,7 +2826,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 	if len(markAsMinedOnLongestChain) > 0 {
 		markStart := time.Now()
 		if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, markAsMinedOnLongestChain, true); err != nil {
-			return errors.NewProcessingError("error marking transactions as mined on longest chain", err)
+			return errors.NewProcessingError(errMarkingTxsMined, err)
 		}
 		prometheusBlockAssemblerMarkTransactionsTime.Observe(time.Since(markStart).Seconds())
 		prometheusBlockAssemblerMarkTransactionsCount.Add(float64(len(markAsMinedOnLongestChain)))
@@ -3073,7 +3086,7 @@ func (b *BlockAssembler) CheckInputValidation(ctx context.Context) (int, error) 
 	}
 	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, bestBlockHeader.Hash(), 1000)
 	if err != nil {
-		return 0, errors.NewProcessingError("error getting best block headers", err)
+		return 0, errors.NewProcessingError(errGettingBestBlockHeaders, err)
 	}
 
 	bestBlockHeaderIDsMap := make(map[uint32]bool, len(bestBlockHeaderIDs))
@@ -3083,7 +3096,7 @@ func (b *BlockAssembler) CheckInputValidation(ctx context.Context) (int, error) 
 
 	it, err := b.utxoStore.GetUnminedTxIterator()
 	if err != nil {
-		return 0, errors.NewProcessingError("error getting unmined tx iterator", err)
+		return 0, errors.NewProcessingError(errGettingUnminedTxIterator, err)
 	}
 	defer it.Close()
 
@@ -3154,7 +3167,7 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 	bestBlockHeader, _ := b.CurrentBlock()
 	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, bestBlockHeader.Hash(), scanHeaders)
 	if err != nil {
-		return errors.NewProcessingError("error getting best block headers", err)
+		return errors.NewProcessingError(errGettingBestBlockHeaders, err)
 	}
 
 	bestBlockHeaderIDsMap := make(map[uint32]bool, len(bestBlockHeaderIDs))
@@ -3168,7 +3181,7 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 	duration := time.Since(start).Seconds()
 	if err != nil {
 		prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues("false", "error").Observe(duration)
-		return errors.NewProcessingError("error getting unmined tx iterator", err)
+		return errors.NewProcessingError(errGettingUnminedTxIterator, err)
 	}
 	prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues("false", "success").Observe(duration)
 	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] successfully created unmined tx iterator")
@@ -3301,7 +3314,7 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 	if len(markAsMinedOnLongestChain) > 0 {
 		markStart := time.Now()
 		if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, markAsMinedOnLongestChain, true); err != nil {
-			return errors.NewProcessingError("error marking transactions as mined on longest chain", err)
+			return errors.NewProcessingError(errMarkingTxsMined, err)
 		}
 		prometheusBlockAssemblerMarkTransactionsTime.Observe(time.Since(markStart).Seconds())
 		prometheusBlockAssemblerMarkTransactionsCount.Add(float64(len(markAsMinedOnLongestChain)))

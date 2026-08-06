@@ -89,6 +89,8 @@ var (
 	previousOutputsDecorateStat = gocoreStat.NewStat("PreviousOutputsDecorate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000)
 )
 
+const errCouldNotReadInput = "could not read input"
+
 // batchGetItemData holds the result of a batch get operation
 type batchGetItemData struct {
 	Data *meta.Data // Retrieved data
@@ -407,13 +409,24 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 // getBatcher for processing. It then waits on a shared completion.Group and reads
 // the result from the item's result slot once the wait returns.
 func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
+	// Abort early on a cancelled context (e.g. graceful shutdown) before touching
+	// the batcher. Store.Close may have already closed the get batcher's input
+	// channel, and enqueuing into it then panics "send on closed channel". The
+	// putGetBatch guard below converts that panic into a returned error for the
+	// residual race where the store closes while this caller's context is live.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	var res batchGetItemData
 
 	group := completion.NewGroup(1)
 	item := &batchGetItem{hash: *hash, fields: bins, group: group, result: &res}
 
 	if s.getBatcher != nil {
-		s.getBatcher.PutCtx(ctx, item)
+		if err := s.putGetBatch(ctx, item); err != nil {
+			return nil, err
+		}
 	} else {
 		// if the batcher is disabled, we still want to process the request in a go routine
 		go func() {
@@ -452,6 +465,16 @@ func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.Fie
 	}
 
 	return res.Data, res.Err
+}
+
+// putGetBatch enqueues item into the get batcher, converting the
+// "send on closed channel" panic — which go-batcher v2.0.6 raises when Put is
+// called after Close — into a returned error. Store.Close closes the get batcher
+// during shutdown while external callers (e.g. an in-flight block-validation
+// goroutine in checkParentsExistOnChain) may still be calling Get. That race
+// must abort the read, not crash the process.
+func (s *Store) putGetBatch(ctx context.Context, item *batchGetItem) error {
+	return safeBatcherPutCtx(s.getBatcher, ctx, item, "get")
 }
 
 // getTxFromBins reconstructs a Bitcoin transaction from Aerospike bin data.
@@ -498,7 +521,7 @@ func (s *Store) getTxFromBins(bins aerospike.BinMap) (tx *bt.Tx, err error) {
 
 			_, err = tx.Inputs[i].ReadFromExtended(bytes.NewReader(input))
 			if err != nil {
-				return nil, errors.NewTxInvalidError("could not read input", err)
+				return nil, errors.NewTxInvalidError(errCouldNotReadInput, err)
 			}
 		}
 	}
@@ -686,7 +709,6 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 
 	err = s.batchOperate(batchPolicy, batchRecords)
 	if err != nil {
-		s.logger.Errorf("error in aerospike map store batch records:\n%v\n%v", batchRecords, err)
 		return errors.NewStorageError("error in aerospike map store batch records", err)
 	}
 
@@ -779,7 +801,7 @@ NEXT_BATCH_RECORD:
 
 							_, err = tx.Inputs[i].ReadFromExtended(bytes.NewReader(input))
 							if err != nil {
-								return errors.NewTxInvalidError("could not read input", err)
+								return errors.NewTxInvalidError(errCouldNotReadInput, err)
 							}
 						}
 					}
@@ -986,7 +1008,7 @@ func processInputsToTxInpoints(bins aerospike.BinMap) (txInpoints subtree.TxInpo
 
 		_, err = tx.Inputs[i].ReadFromExtended(bytes.NewReader(input))
 		if err != nil {
-			return txInpoints, errors.NewProcessingError("could not read input", err)
+			return txInpoints, errors.NewProcessingError(errCouldNotReadInput, err)
 		}
 	}
 
@@ -1291,8 +1313,13 @@ func (s *Store) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error {
 
 	for _, item := range items {
 		item.group = group
-		// Wrap the outpoint in OutpointRequest and put it in the batcher
-		s.outpointBatcher.Put(item)
+		// Guard the enqueue: Store.Close may have closed the outpoint batcher while
+		// this caller is still decorating during shutdown. safeBatcherPut converts a
+		// send-on-closed-channel panic into an error instead of crashing the process;
+		// complete the item so the shared group wait below does not hang on it.
+		if err := safeBatcherPut(s.outpointBatcher, item, "outpoint"); err != nil {
+			item.complete(err)
+		}
 	}
 
 	// One shared wait for the whole group, bounded so a wedged outpoint batcher
@@ -1497,7 +1524,8 @@ func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
 // mining height, used to apply the era-aware unspendable rule (see
 // getExternalOutpoints).
 //
-// The reconstruction is cached by txid (externalTxCache). That is correct
+// The reconstruction is cached by txid (externalOutpointsCache — never the full
+// transaction's cache; see the field comments on Store). That is correct
 // because the era-filtered output set is fixed per tx once the parent is mined,
 // and an unmined parent is necessarily post-Genesis on production networks
 // (mainnet/testnet/teratestnet activation heights sit far below any live tip),
@@ -1517,8 +1545,11 @@ func (s *Store) GetOutpointsFromExternalStore(ctx context.Context, previousTxHas
 		tracing.WithHistogram(prometheusTxMetaAerospikeMapGetExternal),
 	)
 
-	if s.externalTxCache != nil {
-		return s.externalTxCache.GetOrSet(previousTxHash, func() (*bt.Tx, bool, error) {
+	// Deliberately a different cache from GetTxFromExternalStore's: the value here
+	// has its inputs stripped and its era-unspendable outputs nil'd, so sharing a
+	// cache keyed on the txid would let either reader receive the other's shape.
+	if s.externalOutpointsCache != nil {
+		return s.externalOutpointsCache.GetOrSet(previousTxHash, func() (*bt.Tx, bool, error) {
 			tx, numberOfActiveOutputs, err := s.getExternalOutpoints(ctx, previousTxHash, creationHeight)
 			if err != nil {
 				return nil, false, err
