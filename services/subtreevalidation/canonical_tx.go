@@ -3,6 +3,7 @@ package subtreevalidation
 import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util"
 )
 
 // checkCanonicalTxEncoding rejects a transaction whose wire bytes are not the
@@ -31,7 +32,10 @@ import (
 // carrying its parent's satoshis and locking script), which serialize longer
 // than tx.Size() reports. The comparison is therefore made against whichever
 // serialization the transaction actually uses, or a legitimate extended
-// transaction would be rejected as non-canonical.
+// transaction would be rejected as non-canonical. The extended size is
+// computed arithmetically (util.ExtendedTxSize): calling ExtendedBytes here
+// would allocate and copy every transaction twice, on the very loop that was
+// built to read transactions without allocating.
 func checkCanonicalTxEncoding(tx *bt.Tx, bytesRead int64) error {
 	if tx == nil {
 		return errors.NewProcessingError("nil transaction")
@@ -39,7 +43,7 @@ func checkCanonicalTxEncoding(tx *bt.Tx, bytesRead int64) error {
 
 	canonicalSize := int64(tx.Size())
 	if tx.IsExtended() {
-		canonicalSize = int64(len(tx.ExtendedBytes()))
+		canonicalSize = int64(util.ExtendedTxSize(tx))
 	}
 
 	if bytesRead != canonicalSize {
