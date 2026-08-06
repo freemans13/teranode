@@ -43,6 +43,20 @@ var (
 	// or fails structural validation checks. High values may indicate network attacks or client issues.
 	prometheusInvalidTransactions prometheus.Counter
 
+	// prometheusValidatorParentCommitRetries counts retries spent waiting for a parent
+	// transaction to finish its own commit, labelled by condition (tx_locked or
+	// tx_creating). Paired with prometheusValidatorParentCommitExhausted, this gives the
+	// denominator the logs cannot: a node retrying often but succeeding looks identical in
+	// the logs to one that is fine, because only the give-up path warns. Counted rather
+	// than logged per retry — at Teranode's transaction rates a log line per retry is a
+	// flood, and the useful question ("how close are we to the budget?") is a rate.
+	prometheusValidatorParentCommitRetries *prometheus.CounterVec
+
+	// prometheusValidatorParentCommitExhausted counts transactions rejected because the
+	// retry budget ran out while the parent was still committing, labelled by condition.
+	// Every increment is a valid transaction dropped, so this is the alertable one.
+	prometheusValidatorParentCommitExhausted *prometheus.CounterVec
+
 	// prometheusTransactionValidateTotal measures the complete end-to-end validation time for transactions.
 	// This histogram tracks the total time spent validating a transaction from initial receipt through
 	// final validation completion, including all validation steps and database operations. Units: seconds.
@@ -252,6 +266,27 @@ func _initPrometheusMetrics() {
 			Help:      "Size of transactions processed by the validator service",
 			Buckets:   util.MetricsBucketsSize,
 		},
+	)
+
+	// Parent-commit retry counters
+	prometheusValidatorParentCommitRetries = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "parent_commit_retries",
+			Help:      "Retries spent waiting for a parent transaction to finish committing, by condition",
+		},
+		[]string{"condition"},
+	)
+
+	prometheusValidatorParentCommitExhausted = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "parent_commit_exhausted",
+			Help:      "Transactions rejected because the parent-commit retry budget ran out, by condition",
+		},
+		[]string{"condition"},
 	)
 
 	// Block assembly operations histogram

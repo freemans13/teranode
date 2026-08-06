@@ -779,6 +779,11 @@ var publicCauseCodes = map[ERR]struct{}{
 	ERR_TX_CONFLICTING:          {},
 	ERR_UTXO_SPENT:              {},
 	ERR_TX_LOCKED:               {},
+	// ERR_TX_CREATING is the same kind of verdict as ERR_TX_LOCKED: the parent
+	// tx this one spends from is still completing its own commit. It carries no
+	// node-internal state and is actionable by the submitter (resubmit shortly),
+	// so it belongs on the same allowlist for the same reason ERR_TX_LOCKED does.
+	ERR_TX_CREATING: {},
 }
 
 // isPublicCause reports whether code is on the client-safe allowlist.
@@ -1038,7 +1043,7 @@ func ErrorCodeToGRPCCode(code ERR) codes.Code {
 	case ERR_TX_INVALID, ERR_TX_LOCK_TIME, ERR_UTXO_NON_FINAL, ERR_TX_POLICY:
 		return codes.InvalidArgument
 	// Conflict/locked family: valid request, chain-state conflict.
-	case ERR_TX_INVALID_DOUBLE_SPEND, ERR_TX_CONFLICTING, ERR_UTXO_SPENT, ERR_TX_LOCKED:
+	case ERR_TX_INVALID_DOUBLE_SPEND, ERR_TX_CONFLICTING, ERR_UTXO_SPENT, ERR_TX_LOCKED, ERR_TX_CREATING:
 		return codes.FailedPrecondition
 	default:
 		return codes.Internal

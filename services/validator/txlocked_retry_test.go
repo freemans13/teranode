@@ -1,0 +1,122 @@
+package validator
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/tracing"
+	"github.com/ordishs/gocore"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+// TestValidateWithOptions_RetryPredicateByErrorType pins which errors returned
+// by the UTXO store's SpendAndCreate get the TX_LOCKED/TX_CREATING retry
+// treatment in ValidateWithOptions, and which break out on the first attempt.
+//
+// NOTE: this uses a fully mocked utxo.Store (utxo.MockUtxostore) rather than
+// the sqlitememory SQL store used elsewhere in this file. The sqlitememory
+// store can genuinely produce ErrTxLocked (via the parent's `locked` column,
+// see TestValidator_LockedFlagNotChangedIfBlockAssemblyDidNotStoreTx above),
+// but it cannot produce ErrTxCreating: that error only comes from Aerospike's
+// LuaErrorCodeCreating path (stores/utxo/aerospike/spend.go) for a large,
+// multi-record parent still being written, which the SQL store has no
+// equivalent state for. Rather than fake that condition through a store that
+// cannot express it, this test drives the retry predicate directly by
+// injecting each error type at the point where the validator's own spend
+// call returns it, which is what the "retry on locked/creating" logic
+// actually branches on.
+func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	tests := []struct {
+		name        string
+		returnErr   error
+		wantRetried bool
+	}{
+		{
+			name:        "TX_LOCKED is retried to the configured budget",
+			returnErr:   errors.NewTxLockedError("parent still committing its own two-phase commit"),
+			wantRetried: true,
+		},
+		{
+			name:        "TX_CREATING is retried to the configured budget",
+			returnErr:   errors.NewTxCreatingError("parent still being written (multi-record create)"),
+			wantRetried: true,
+		},
+		{
+			name:        "TX_CONFLICTING breaks out on the first attempt",
+			returnErr:   errors.NewTxConflictingError("tx conflicts with chain state"),
+			wantRetried: false,
+		},
+		{
+			name:        "a generic processing error breaks out on the first attempt",
+			returnErr:   errors.NewProcessingError("unrelated storage failure"),
+			wantRetried: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			txs := transactions.CreateTestTransactionChainWithCount(t, 3)
+			childTx := txs[1]
+			require.True(t, childTx.IsExtended(), "test fixture must already be extended so no PreviousOutputsDecorate call is needed")
+
+			mockStore := &utxo.MockUtxostore{}
+			mockStore.On("GetBlockState").Return(utxo.BlockState{Height: 1, MedianTime: 1700000000})
+			// One parent per input; validateInternal always fetches block-height
+			// fields for the parent, extended or not.
+			mockStore.On("Get", mock.Anything, mock.Anything, mock.Anything).
+				Return(&meta.Data{BlockHeights: []uint32{100}}, nil)
+			mockStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				Return(nil, nil, tc.returnErr)
+
+			tSettings := test.CreateBaseTestSettings(t)
+			// Keep the budget small so the backoff (10ms, 20ms, ...) stays cheap
+			// while still proving the loop is bounded rather than unbounded or
+			// single-shot for the retried cases.
+			tSettings.Validator.TxLockedMaxRetries = 2
+
+			v := &Validator{
+				logger:      ulogger.TestLogger{},
+				utxoStore:   mockStore,
+				settings:    tSettings,
+				txValidator: NewTxValidator(ulogger.TestLogger{}, tSettings),
+				stats:       gocore.NewStat("validator"),
+			}
+
+			opts := &Options{}
+
+			start := time.Now()
+			_, err := v.ValidateWithOptions(ctx, childTx, 2, opts)
+			elapsed := time.Since(start)
+
+			require.Error(t, err)
+			require.True(t, errors.Is(err, tc.returnErr), "expected the original error to be reachable via errors.Is through the wrap chain, got: %v", err)
+
+			wantCalls := 1
+			if tc.wantRetried {
+				wantCalls = tSettings.Validator.TxLockedMaxRetries + 1 // 1 initial attempt + N retries
+
+				// 10ms + 20ms backoff between the 3 attempts; assert a floor so a
+				// regression that stops sleeping between retries (i.e. retries
+				// fire back-to-back with no backoff) is caught. No sleeps beyond
+				// what the retry budget itself needs.
+				require.GreaterOrEqual(t, elapsed, 30*time.Millisecond, "retried case should have paid the exponential backoff between attempts")
+			} else {
+				require.Less(t, elapsed, 30*time.Millisecond, "non-retried case must not sleep at all")
+			}
+
+			mockStore.AssertNumberOfCalls(t, "SpendAndCreate", wantCalls)
+		})
+	}
+}
