@@ -1,7 +1,6 @@
 package model
 
 import (
-	"math"
 	"sync"
 
 	txmap "github.com/bsv-blockchain/go-tx-map"
@@ -73,24 +72,35 @@ func txMapClassIdxFor(n uint64) int {
 	return -1
 }
 
-// txMapAllocHint clamps a 64-bit entry count to the preallocation hint the
-// map constructor accepts. The constructor preallocates EAGERLY from the hint
-// (tens of GB for counts near the clamp — see the note in
-// TestGetTxMap_OversizedAllocatesFresh about keeping such allocations out of
-// tests), so the clamp caps preallocation only; the swiss maps resize on
+// txMapAllocHint bounds a 64-bit entry count to the preallocation hint passed
+// to the map constructor. It caps preallocation only — the swiss maps resize on
 // insert, so capacity is not limited by it.
+//
+// The bound is the largest pooled size class rather than math.MaxUint32 for two
+// reasons. The constructor preallocates EAGERLY from the hint at roughly 46
+// bytes per entry (see the note in TestGetTxMap_OversizedAllocatesFresh about
+// keeping such allocations out of tests), so a hint near the top of the uint32
+// range asks for well over 100 GB. Worse, it derives its per-bucket size as
+// (hint + hint/5) in uint32, which silently wraps for hints above ~3.58e9 and
+// yields an arbitrary preallocation unrelated to the count — MaxUint32 wraps to
+// ~859M entries. Bounding at the largest class keeps the hint below that
+// wraparound and asks for no more than the biggest allocation this pool design
+// already sanctions.
 func txMapAllocHint(n uint64) uint32 {
-	if n > math.MaxUint32 {
-		return math.MaxUint32
+	largestClass := txMapSizeClasses[len(txMapSizeClasses)-1]
+	if n > uint64(largestClass) {
+		return largestClass
 	}
 
 	return uint32(n)
 }
 
-// GetTxMap returns a *SplitSwissMapUint64 sized for at least n entries.
-// Drawn from the pool when n fits a known size class; allocated fresh
-// otherwise (with the preallocation hint clamped for counts beyond uint32,
-// instead of failing — issue 1428). Pass the same n to PutTxMap.
+// GetTxMap returns a *SplitSwissMapUint64 for n entries. Drawn from the pool
+// when n fits a known size class; allocated fresh otherwise, with the
+// preallocation hint bounded by txMapAllocHint instead of failing on counts
+// beyond uint32 (issue 1428). A bounded hint sizes the initial allocation only:
+// the map still holds n entries, growing on insert. Pass the same n to
+// PutTxMap.
 func GetTxMap(n uint64) *txmap.SplitSwissMapUint64 {
 	idx := txMapClassIdxFor(n)
 	if idx < 0 {

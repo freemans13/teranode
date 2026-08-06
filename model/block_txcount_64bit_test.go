@@ -40,16 +40,36 @@ func TestTxMapClassIdx64Bit(t *testing.T) {
 	}
 }
 
-// TestTxMapAllocHintClamp pins the preallocation-hint clamp: counts beyond
-// uint32 cap the hint at MaxUint32 (preallocation only — the map resizes on
-// insert), everything else passes through unchanged.
+// TestTxMapAllocHintClamp pins the preallocation-hint bound: any count above
+// the largest pooled size class caps the hint at that class (preallocation only
+// — the map resizes on insert), everything else passes through unchanged.
 func TestTxMapAllocHintClamp(t *testing.T) {
+	largestClass := txMapSizeClasses[len(txMapSizeClasses)-1]
+
 	require.Equal(t, uint32(0), txMapAllocHint(0))
 	require.Equal(t, uint32(1<<20), txMapAllocHint(1<<20))
-	require.Equal(t, uint32(math.MaxUint32), txMapAllocHint(math.MaxUint32))
-	require.Equal(t, uint32(math.MaxUint32), txMapAllocHint(math.MaxUint32+1))
-	require.Equal(t, uint32(math.MaxUint32), txMapAllocHint(1<<40))
-	require.Equal(t, uint32(math.MaxUint32), txMapAllocHint(math.MaxUint64))
+	require.Equal(t, largestClass, txMapAllocHint(uint64(largestClass)))
+
+	for _, n := range []uint64{uint64(largestClass) + 1, math.MaxUint32, math.MaxUint32 + 1, 1 << 40, math.MaxUint64} {
+		require.Equal(t, largestClass, txMapAllocHint(n), "count %d must be bounded to the largest class", n)
+	}
+}
+
+// TestTxMapAllocHintAvoidsConstructorOverflow pins the bound below the point
+// where the map constructor's own per-bucket arithmetic wraps. It computes
+// per-bucket size as (hint + hint/5) in uint32, so any hint above ~3.58e9
+// overflows and preallocates an arbitrary amount unrelated to the count
+// (MaxUint32 wraps to ~859M entries). Every hint this package can produce must
+// stay in the range where that arithmetic is exact.
+func TestTxMapAllocHintAvoidsConstructorOverflow(t *testing.T) {
+	for _, n := range []uint64{0, 1 << 20, uint64(txMapSizeClasses[len(txMapSizeClasses)-1]), math.MaxUint32, 1 << 40, math.MaxUint64} {
+		hint := txMapAllocHint(n)
+
+		// The constructor's computation, in uint32 as it performs it, must equal
+		// the same computation carried out without truncation.
+		require.Equal(t, uint64(hint)+uint64(hint)/5, uint64(hint+hint/5),
+			"hint %d (from count %d) overflows the constructor's per-bucket arithmetic", hint, n)
+	}
 }
 
 // TestTxMapPoolRoundTrip64BitKey pins Get/Put with the 64-bit key on pooled
