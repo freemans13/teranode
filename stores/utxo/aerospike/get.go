@@ -1152,6 +1152,22 @@ func processSubtreeIdxs(bins aerospike.BinMap) ([]int, error) {
 	return res, nil
 }
 
+// classifyUTXOReadError decides what class of error a failed UTXO read carries.
+//
+// A failed or torn read of our own records is this node's storage being wrong.
+// It says nothing about the transaction, so it must keep its storage class:
+// ErrTxInvalid is a consensus verdict — isUnvalidatablePeerError treats it as a
+// genuine consensus failure, so ValidateBlock persists the block as permanently
+// invalid and flags the peer that served it. Local disk damage must never
+// condemn a valid block or blame an innocent peer.
+func classifyUTXOReadError(err error) error {
+	if errors.Is(err, errors.ErrStorageError) {
+		return err
+	}
+
+	return errors.NewTxInvalidError("could not process utxos", err)
+}
+
 // processUTXOs extracts and processes UTXO data from Aerospike bins.
 // This function handles the reconstruction of UTXO spending data from stored
 // binary format, including handling of paginated records for large transactions.
@@ -1170,22 +1186,6 @@ func processSubtreeIdxs(bins aerospike.BinMap) ([]int, error) {
 // Returns:
 //   - []*spendpkg.SpendingData: Array of UTXO spending data (may contain nil entries)
 //   - error: Any error encountered during processing
-// classifyUTXOReadError decides what class of error a failed UTXO read carries.
-//
-// A failed or torn read of our own records is this node's storage being wrong.
-// It says nothing about the transaction, so it must keep its storage class:
-// ErrTxInvalid is a consensus verdict — isUnvalidatablePeerError treats it as a
-// genuine consensus failure, so ValidateBlock persists the block as permanently
-// invalid and flags the peer that served it. Local disk damage must never
-// condemn a valid block or blame an innocent peer.
-func classifyUTXOReadError(err error) error {
-	if errors.Is(err, errors.ErrStorageError) {
-		return err
-	}
-
-	return errors.NewTxInvalidError("could not process utxos", err)
-}
-
 func (s *Store) processUTXOs(ctx context.Context, txid *chainhash.Hash, bins aerospike.BinMap) ([]*spendpkg.SpendingData, error) {
 	totalUtxos, ok := bins[fields.TotalUtxos.String()].(int)
 	if !ok {
