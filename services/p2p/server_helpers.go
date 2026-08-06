@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 
@@ -832,40 +831,18 @@ func (s *Server) isBlockchainSyncingOrCatchingUp(ctx context.Context) (bool, err
 }
 
 // cleanupPeerMaps performs periodic cleanup of blockPeerMap and subtreePeerMap
-// It removes entries older than TTL and enforces size limits using LRU eviction
+// and of the reputation, IP-ban and ban-status caches. It removes entries older
+// than their TTL; size is enforced at insert instead (issue 1409), so there is
+// no size pass here.
 func (s *Server) cleanupPeerMaps() {
 	now := time.Now()
 
-	// Collect entries to delete
-	var blockKeysToDelete []string
-	var subtreeKeysToDelete []string
-	blockCount := 0
-	subtreeCount := 0
-
-	// First pass: count entries and collect expired ones
-	s.blockPeerMap.Range(func(key string, entry peerMapEntry) bool {
-		blockCount++
-		if now.Sub(entry.timestamp) > s.peerMapTTL {
-			blockKeysToDelete = append(blockKeysToDelete, key)
-		}
-		return true
-	})
-
-	s.subtreePeerMap.Range(func(key string, entry peerMapEntry) bool {
-		subtreeCount++
-		if now.Sub(entry.timestamp) > s.peerMapTTL {
-			subtreeKeysToDelete = append(subtreeKeysToDelete, key)
-		}
-		return true
-	})
-
-	// Delete expired entries
-	for _, key := range blockKeysToDelete {
-		s.blockPeerMap.Delete(key)
-	}
-	for _, key := range subtreeKeysToDelete {
-		s.subtreePeerMap.Delete(key)
-	}
+	// Expire the attribution maps in a single locked pass each. Size is not
+	// enforced here: the maps are bounded at insert (issue 1409), so by the
+	// time this runs they are already within the cap.
+	ttlCutoff := now.Add(-s.peerMapTTL)
+	blockExpired := s.blockPeerMap.DeleteExpired(ttlCutoff)
+	subtreeExpired := s.subtreePeerMap.DeleteExpired(ttlCutoff)
 
 	// Evict expired reputationCache entries. shouldSkipUnhealthyPeer only ever
 	// inserts; without this sweep the map would grow once per unique peer ID
@@ -914,21 +891,9 @@ func (s *Server) cleanupPeerMaps() {
 	}
 
 	// Log cleanup stats
-	if len(blockKeysToDelete) > 0 || len(subtreeKeysToDelete) > 0 || len(reputationKeysToDelete) > 0 || len(ipBanKeysToDelete) > 0 || len(banStatusKeysToDelete) > 0 {
+	if blockExpired > 0 || subtreeExpired > 0 || len(reputationKeysToDelete) > 0 || len(ipBanKeysToDelete) > 0 || len(banStatusKeysToDelete) > 0 {
 		s.logger.Infof("[cleanupPeerMaps] removed %d expired block entries, %d expired subtree entries, %d expired reputation entries, %d expired IP-ban entries, %d expired ban-status entries",
-			len(blockKeysToDelete), len(subtreeKeysToDelete), len(reputationKeysToDelete), len(ipBanKeysToDelete), len(banStatusKeysToDelete))
-	}
-
-	// Second pass: enforce size limits if needed
-	remainingBlockCount := blockCount - len(blockKeysToDelete)
-	remainingSubtreeCount := subtreeCount - len(subtreeKeysToDelete)
-
-	if remainingBlockCount > s.peerMapMaxSize {
-		s.enforceMapSizeLimit(&s.blockPeerMap, s.peerMapMaxSize, "block")
-	}
-
-	if remainingSubtreeCount > s.peerMapMaxSize {
-		s.enforceMapSizeLimit(&s.subtreePeerMap, s.peerMapMaxSize, "subtree")
+			blockExpired, subtreeExpired, len(reputationKeysToDelete), len(ipBanKeysToDelete), len(banStatusKeysToDelete))
 	}
 
 	// Surface how many entries the inline cap evicted since the last sweep
@@ -941,44 +906,7 @@ func (s *Server) cleanupPeerMaps() {
 
 	// Log current sizes
 	s.logger.Infof("[cleanupPeerMaps] current map sizes - blocks: %d, subtrees: %d",
-		remainingBlockCount, remainingSubtreeCount)
-}
-
-// enforceMapSizeLimit removes oldest entries from a map to enforce size limit.
-// With the inline evict-oldest cap (issue 1409) the map cannot exceed its
-// bound between sweeps, so this is a safety net whose sort cost is bounded by
-// the cap rather than by however large a flood grew the map.
-func (s *Server) enforceMapSizeLimit(m *cappedPeerMap, maxSize int, mapType string) {
-	type entryWithKey struct {
-		key       string
-		timestamp time.Time
-	}
-
-	var entries []entryWithKey
-
-	// Collect all entries with their timestamps
-	m.Range(func(key string, entry peerMapEntry) bool {
-		entries = append(entries, entryWithKey{
-			key:       key,
-			timestamp: entry.timestamp,
-		})
-		return true
-	})
-
-	// Sort by timestamp (oldest first)
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].timestamp.Before(entries[j].timestamp)
-	})
-
-	// Remove oldest entries to get under the limit
-	toRemove := len(entries) - maxSize
-	if toRemove > 0 {
-		for i := 0; i < toRemove; i++ {
-			m.Delete(entries[i].key)
-		}
-		s.logger.Warnf("[enforceMapSizeLimit] removed %d oldest %s entries to enforce size limit of %d",
-			toRemove, mapType, maxSize)
-	}
+		s.blockPeerMap.Len(), s.subtreePeerMap.Len())
 }
 
 // startPeerMapCleanup starts the periodic cleanup goroutine
@@ -1142,8 +1070,10 @@ func (s *Server) shouldSkipUnhealthyPeer(from string, messageType string) bool {
 
 // storePeerMapEntry stores a peer entry in the specified map. The map is
 // bounded inline (issue 1409): at capacity the OLDEST entry is evicted, so a
-// distinct-hash flood cannot grow memory without bound between sweeps and
-// cannot suppress attribution for the announcement arriving next.
+// distinct-hash flood cannot grow memory without bound between sweeps, and
+// cannot pre-emptively suppress attribution for the announcement arriving
+// next. A flood after an honest announcement can still age it out before
+// validation reports on it; see issue 1503.
 func (s *Server) storePeerMapEntry(peerMap *cappedPeerMap, hash string, from string, timestamp time.Time) {
 	peerMap.Store(hash, peerMapEntry{
 		peerID:    from,

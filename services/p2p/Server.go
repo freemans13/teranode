@@ -445,24 +445,9 @@ func NewServer(
 		nodeStatusTopicName:               fmt.Sprintf("%s-%s", topicPrefix, nodeStatusTopic),
 		topicPrefix:                       topicPrefix,
 		startTime:                         time.Now(),
-
-		// Initialize cleanup configuration with defaults
-		peerMapMaxSize: defaultPeerMapMaxSize,
-		peerMapTTL:     defaultPeerMapTTL,
 	}
 
-	// Override defaults with settings if provided
-	if tSettings.P2P.PeerMapMaxSize > 0 {
-		p2pServer.peerMapMaxSize = tSettings.P2P.PeerMapMaxSize
-	}
-	if tSettings.P2P.PeerMapTTL > 0 {
-		p2pServer.peerMapTTL = tSettings.P2P.PeerMapTTL
-	}
-
-	// The attribution maps are bounded at insert (issue 1409); the cap is set
-	// once the size setting is resolved.
-	p2pServer.blockPeerMap.setMaxSize(p2pServer.peerMapMaxSize)
-	p2pServer.subtreePeerMap.setMaxSize(p2pServer.peerMapMaxSize)
+	p2pServer.applyPeerMapLimits(tSettings)
 
 	// Use the centralized peer registry hosted by the blockchain service.
 	// Loading, persistence, ban scoring, and TTL/LRU eviction all live there now.
@@ -550,6 +535,28 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 	}
 
 	return health.CheckAll(ctx, checkLiveness, checks)
+}
+
+// applyPeerMapLimits resolves the attribution maps' size cap and TTL, taking
+// the configured values when set and the service defaults otherwise, and
+// applies the cap to both maps. The maps are bounded at insert (issue 1409),
+// so a map that never receives its cap here would be unbounded — this lives
+// apart from NewServer so that wiring can be tested without standing up the
+// service's dependencies.
+func (s *Server) applyPeerMapLimits(tSettings *settings.Settings) {
+	s.peerMapMaxSize = defaultPeerMapMaxSize
+	s.peerMapTTL = defaultPeerMapTTL
+
+	if tSettings.P2P.PeerMapMaxSize > 0 {
+		s.peerMapMaxSize = tSettings.P2P.PeerMapMaxSize
+	}
+
+	if tSettings.P2P.PeerMapTTL > 0 {
+		s.peerMapTTL = tSettings.P2P.PeerMapTTL
+	}
+
+	s.blockPeerMap.setMaxSize(s.peerMapMaxSize)
+	s.subtreePeerMap.setMaxSize(s.peerMapMaxSize)
 }
 
 // httpServeError returns the error the HTTP serve goroutine exited with, or nil

@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // cappedPeerMap is a size-bounded map from announced hash to the peer that
@@ -15,13 +16,18 @@ import (
 // sweep's own full-map sort scale with the flood.
 //
 // At capacity a new key evicts the OLDEST entry rather than being refused.
-// That direction is load-bearing for security, not a style choice: refusing
-// the new key would let a flooder fill every slot with junk hashes and thereby
-// suppress attribution for the invalid block it announces next — switching off
-// the node's only automatic ban path for invalid blocks. Evicting oldest keeps
-// memory bounded while always retaining the most recent announcements, which
-// are the ones an in-flight validation is about to report. It is also the
-// behaviour p2p_peer_map_max_size documents.
+// That direction is deliberate: refusing the new key would let a flooder fill
+// every slot with junk hashes ahead of time and so suppress attribution for
+// the invalid block it announces next. Evicting oldest keeps memory bounded
+// while always retaining the most recent announcements, which are the ones an
+// in-flight validation is about to report.
+//
+// What this does NOT do is make attribution flood-proof. The map is a single
+// space shared by all peers, so a peer that announces enough distinct hashes
+// AFTER an honest announcement can still age that honest entry out before the
+// block finishes validating. Evicting oldest changes when a flooder can strike,
+// not whether it can; closing that needs a per-peer share of the map, tracked
+// in issue 1503. Attribution is best-effort here, as the TTL already implies.
 //
 // Eviction is O(1): a list holds keys in insertion order (most recent at the
 // back), so no sort is needed at insert or at sweep time.
@@ -63,7 +69,10 @@ func (m *cappedPeerMap) initLocked() {
 
 // Store inserts or updates an entry, evicting the oldest entry first when a
 // new key would exceed the cap. Updating an existing key refreshes its value
-// and its recency.
+// and its recency, so attribution for a hash announced by two peers is
+// last-writer-wins — unchanged from the sync.Map this replaced, and reachable
+// only when a second node genuinely announces the same hash as its own tip,
+// since the fromID check rejects re-attribution by relays.
 func (m *cappedPeerMap) Store(hash string, entry peerMapEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -149,6 +158,44 @@ func (m *cappedPeerMap) Range(f func(hash string, entry peerMapEntry) bool) {
 			return
 		}
 	}
+}
+
+// DeleteExpired removes every entry whose timestamp predates cutoff and
+// returns how many it removed. This is the TTL sweep's one pass over the map:
+// it holds the lock once and allocates nothing, where Range would copy every
+// entry into a snapshot first and the caller would then re-enter the lock per
+// deletion.
+//
+// It walks the whole list rather than stopping at the first live entry.
+// Insertion order tracks timestamp order closely but not strictly — two
+// concurrent announcements can read the clock in one order and take the lock
+// in the other — so an early exit could skip an expired entry and leave it for
+// the next sweep. At the configured cap the full walk costs little enough that
+// the exactness is worth more than the saved iterations.
+func (m *cappedPeerMap) DeleteExpired(cutoff time.Time) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.order == nil {
+		return 0
+	}
+
+	removed := 0
+
+	for element := m.order.Front(); element != nil; {
+		next := element.Next()
+
+		if node := element.Value.(*peerMapNode); node.entry.timestamp.Before(cutoff) {
+			m.order.Remove(element)
+			delete(m.entries, node.hash)
+
+			removed++
+		}
+
+		element = next
+	}
+
+	return removed
 }
 
 // EvictedSinceLastRead returns the number of entries dropped to make room
