@@ -1296,15 +1296,30 @@ func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, tota
 // spendable one, and a double-spend of it is then accepted with no error
 // anywhere (issue 1440).
 //
-// Two element shapes are legitimate and must both keep working: 68 bytes is a
-// spent output (32-byte utxo hash + 36-byte spending data) and 32 bytes is an
-// unspent one (hash only), which correctly leaves the slot nil. Any other
-// length, or a non-byte element, is a torn or partially-applied record.
+// Three element shapes are legitimate and must all keep working:
+//
+//   - nil — the output was never entered into the UTXO set because it is
+//     provably unspendable (see utxo.ShouldStoreOutputAsUTXO: OP_FALSE
+//     OP_RETURN in every era, plus bare OP_RETURN and oversized locking
+//     scripts pre-Genesis). GetBinsToStore leaves those slots nil and the
+//     Aerospike client round-trips them as a nil list element, so a large
+//     transaction carrying a data output has nils in its extra records.
+//   - 32 bytes — an unspent output: the utxo hash alone, no spending data.
+//   - 68 bytes — a spent (or frozen) output: 32-byte utxo hash + 36-byte
+//     spending data.
+//
+// All three correctly leave, or set, the caller's slot. Any other length, or a
+// non-nil non-byte element, is a torn or partially-applied record.
 func applyExtraRecordUTXOs(txID *chainhash.Hash, recordNum int, extraUtxos []interface{}, baseOffset int, spendingDatas []*spendpkg.SpendingData) error {
 	for i, ui := range extraUtxos {
 		offset := baseOffset + i
 		if offset >= len(spendingDatas) {
 			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d holds more outputs than the transaction has (offset %d of %d) — torn or mis-keyed record", txID.String(), recordNum, offset, len(spendingDatas))
+		}
+
+		if ui == nil {
+			// Provably unspendable output, never stored as a UTXO. Slot stays nil.
+			continue
 		}
 
 		u, ok := ui.([]uint8)

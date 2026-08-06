@@ -56,6 +56,26 @@ func TestExtraRecordElementShapes(t *testing.T) {
 		require.Nil(t, spendingDatas[1], "32-byte element is a legitimate unspent output")
 	})
 
+	t.Run("a nil element is a provably-unspendable output, not damage", func(t *testing.T) {
+		// GetBinsToStore leaves utxos[i] nil for every output that
+		// utxo.ShouldStoreOutputAsUTXO rejects (OP_FALSE OP_RETURN in any era,
+		// bare OP_RETURN and oversized scripts pre-Genesis). Those nils are
+		// packed as msgpack nil and come back as nil list elements, so a large
+		// transaction with a data output has them in its extra records.
+		// Rejecting them would fail the read of a perfectly healthy record.
+		spendingDatas := make([]*spendpkg.SpendingData, 3)
+
+		require.NoError(t, applyExtraRecordUTXOs(&chainhash.Hash{}, 1, []interface{}{
+			nil,
+			spentElement(t, 0x55),
+			nil,
+		}, 0, spendingDatas))
+
+		require.Nil(t, spendingDatas[0], "an unspendable output has no spending data")
+		require.NotNil(t, spendingDatas[1], "the spent output either side of it must still be read")
+		require.Nil(t, spendingDatas[2])
+	})
+
 	t.Run("a short element fails the read", func(t *testing.T) {
 		spendingDatas := make([]*spendpkg.SpendingData, 1)
 
