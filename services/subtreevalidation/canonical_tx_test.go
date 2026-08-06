@@ -1,11 +1,14 @@
 package subtreevalidation
 
 import (
+	"bytes"
 	"encoding/hex"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -88,4 +91,41 @@ func TestNonMinimalTxKeepsCanonicalTxID(t *testing.T) {
 
 	require.Equal(t, canonical.TxID(), nonMinimal.TxID(),
 		"go-bt canonicalizes on re-serialization, so the merkle check cannot catch this — the parse path must")
+}
+
+// TestReadTransactionsFromSubtreeDataStreamRejectsNonCanonical drives the real
+// block-path ingestion function, not just the helper: a stream whose first
+// transaction carries a 3-byte input-count prefix must be rejected. go-bt
+// accepts and canonicalizes that encoding, so the txid still matches and every
+// hash-based check downstream would pass — this parse is the only place it can
+// be caught.
+func TestReadTransactionsFromSubtreeDataStreamRejectsNonCanonical(t *testing.T) {
+	raw, err := hex.DecodeString(canonicalTxHex)
+	require.NoError(t, err)
+
+	tx, err := bt.NewTxFromBytes(raw)
+	require.NoError(t, err)
+
+	st, err := subtreepkg.NewIncompleteTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, st.AddNode(*tx.TxIDChainHash(), 1, uint64(len(raw))))
+
+	server := &Server{logger: ulogger.TestLogger{}}
+	arena := bt.NewArena(4096)
+
+	t.Run("canonical stream is accepted", func(t *testing.T) {
+		var txs []*bt.Tx
+
+		_, err := server.readTransactionsFromSubtreeDataStream(st, bytes.NewReader(raw), &txs, arena)
+		require.NoError(t, err)
+		require.Len(t, txs, 1)
+	})
+
+	t.Run("non-minimal stream is rejected", func(t *testing.T) {
+		var txs []*bt.Tx
+
+		_, err := server.readTransactionsFromSubtreeDataStream(st, bytes.NewReader(withInputCountPrefix(t, []byte{0xfd, 0x01, 0x00})), &txs, arena)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "non-canonical transaction")
+	})
 }
