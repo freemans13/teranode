@@ -1023,6 +1023,58 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	)
 }
 
+// isKeyExists reports whether err is Aerospike's "this key already exists" result, which on
+// a CREATE_ONLY write means another attempt got there first.
+func isKeyExists(err error) bool {
+	aErr, ok := err.(*aerospike.AerospikeError)
+	return ok && aErr.ResultCode == types.KEY_EXISTS_ERROR
+}
+
+// classifyCreateBatchResults decides, from one CREATE_ONLY batch's per-record results,
+// whether THIS writer created the transaction.
+//
+// masterCreated is true only when record 0 was written by us. Record 0 is the master:
+// getBinsToStore puts BlockIDs/BlockHeights/SubtreeIdxs — or UnminedSince when there are
+// none — only on batches[0]. So if record 0 already existed, another writer owns that
+// mined-state metadata and ours was never applied, however many child records we filled in.
+//
+// Answering "did I create this transaction" with "did I write any record" is what let a
+// writer report success over someone else's master. That success is one the caller acts on:
+// block validation only collects a transaction for its mined-info repair when the store says
+// it already exists, so a false success suppressed the repair and left the master carrying
+// the earlier writer's UnminedSince with no BlockIDs — a mined transaction recorded as
+// unmined, which then feeds the unmined pruner and the re-add-to-block-assembly path.
+//
+// It needs no concurrency: a partial batch failure deliberately leaves its records in place
+// for the next attempt, so a later sequential create from a different caller finds the master
+// present, fills in the missing child, and used to report success.
+//
+// hasFailures covers any error that is not already-exists; alreadyPresent lists the indices
+// that were already there, for the caller to log. Split out from storeExternallyWithLock so
+// the rule can be tested without an Aerospike client — the surrounding function acquires the
+// creation lock through the concrete client before it ever reaches this point.
+func classifyCreateBatchResults(batchRecords []aerospike.BatchRecordIfc) (masterCreated, hasFailures bool, alreadyPresent []int) {
+	for idx, record := range batchRecords {
+		err := record.BatchRec().Err
+		if err == nil {
+			if idx == 0 {
+				masterCreated = true
+			}
+
+			continue
+		}
+
+		if isKeyExists(err) {
+			alreadyPresent = append(alreadyPresent, idx)
+			continue
+		}
+
+		hasFailures = true
+	}
+
+	return masterCreated, hasFailures, alreadyPresent
+}
+
 // storeExternallyWithLock is the shared implementation for external transaction storage
 // Both StoreTransactionExternally and StorePartialTransactionExternally delegate to this
 //
@@ -1134,20 +1186,17 @@ func (s *Store) storeExternallyWithLock(
 	}
 
 	// Check results - KEY_EXISTS_ERROR means recovery (completing previous attempt)
-	hasFailures := false
-	createdAny := false
-	for idx, record := range batchRecords {
-		if err := record.BatchRec().Err; err != nil {
-			aErr, ok := err.(*aerospike.AerospikeError)
-			if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
-				s.logger.Debugf("[%s] Record %d already exists for tx %s (completing previous attempt)", funcName, idx, bItem.txHash)
-				continue
+	masterCreated, hasFailures, alreadyPresent := classifyCreateBatchResults(batchRecords)
+
+	for _, idx := range alreadyPresent {
+		s.logger.Debugf("[%s] Record %d already exists for tx %s (completing previous attempt)", funcName, idx, bItem.txHash)
+	}
+
+	if hasFailures {
+		for idx, record := range batchRecords {
+			if err := record.BatchRec().Err; err != nil && !isKeyExists(err) {
+				s.logger.Errorf("[%s] Failed to create record %d for tx %s: %v", funcName, idx, bItem.txHash, err)
 			}
-			s.logger.Errorf("[%s] Failed to create record %d for tx %s: %v", funcName, idx, bItem.txHash, err)
-			hasFailures = true
-		} else {
-			// No error - this record was created successfully
-			createdAny = true
 		}
 	}
 
@@ -1159,9 +1208,10 @@ func (s *Store) storeExternallyWithLock(
 		return
 	}
 
-	// If we didn't create any new records, all already existed - transaction is complete
-	if !createdAny {
-		// RECOVERY PATH: All records already exist from previous attempt
+	// If we did not create the master record, this transaction was created by someone else -
+	// their mined-state metadata stands, and ours must be reconciled by the caller.
+	if !masterCreated {
+		// RECOVERY PATH: the master record already exists from a previous attempt
 		//
 		// We don't notify block assembly (transaction already processed) but we still attempt
 		// Phase 2 cleanup to handle the case where a previous attempt completed Phase 1 but
