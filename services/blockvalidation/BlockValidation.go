@@ -1527,10 +1527,10 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			}
 
 			if block.SizeInBytes > excessiveBlockSizeUint64 {
-				if !opts.IsRevalidation {
-					u.storeInvalidBlock(ctx, block, opts.PeerID, fmt.Sprintf("block size %d exceeds excessiveblocksize %d", block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize))
-				}
-
+				// Body-attributable: SizeInBytes reflects the peer-supplied body, not the
+				// header, so we must not persist the header's hash as invalid here — an
+				// attacker could otherwise replay an honest header with an oversized body
+				// to wedge the node off the honest chain.
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block size %d exceeds excessiveblocksize %d", block.Header.Hash().String(), block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize)
 			}
 		}
@@ -1553,10 +1553,10 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 		// check the coinbase length
 		if len(block.CoinbaseTx.Inputs[0].UnlockingScript.Bytes()) < 2 || len(block.CoinbaseTx.Inputs[0].UnlockingScript.Bytes()) > int(u.settings.ChainCfgParams.MaxCoinbaseScriptSigSize) {
-			if !opts.IsRevalidation {
-				u.storeInvalidBlock(ctx, block, opts.PeerID, "bad coinbase length")
-			}
-
+			// Body-attributable: the coinbase tx is peer-supplied body data, not the
+			// header, so we must not persist the header's hash as invalid here — an
+			// attacker could otherwise replay an honest header with a malformed coinbase
+			// to wedge the node off the honest chain.
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] bad coinbase length", block.Header.Hash().String())
 		}
 
@@ -1948,6 +1948,17 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					// the serving peer's fault: mark it so the catchup penalty path does not
 					// demote an honest (possibly sole-source) ahead peer.
 					return errors.NewBlockIncompleteTransientError("[ValidateBlock][%s] block validation hit transient missing-data state: %s", block.Hash().String(), err)
+				}
+
+				// A body-attributable fault (e.g. CVE-2012-2459 duplicate transactions, a bad
+				// merkle root) is a property of the peer-supplied BODY, not the header. The
+				// block's hash names the header only, so persisting the hash as invalid here
+				// would let an attacker replay the honest header with a doctored body (zero
+				// mining cost) to condemn a real block. Return the same BlockInvalid error
+				// (so catchup's errors.Is(err, ErrBlockInvalid) peer-punishment keying is
+				// unchanged) without calling storeInvalidBlock.
+				if errors.IsBlockInvalidBody(err) {
+					return errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err)
 				}
 
 				if !opts.IsRevalidation {

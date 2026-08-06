@@ -665,13 +665,16 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		}
 
 		// Verify that we have at least one subtree and that it has at least one node
+		// Body-attributable: the subtree contents are peer-supplied body data, not the
+		// header, so this must not mark the header's hash invalid.
 		if len(b.SubtreeSlices) == 0 || len(b.SubtreeSlices[0].Nodes) == 0 {
-			return false, errors.NewBlockInvalidError("[BLOCK][%s] first subtree has no nodes", b.String())
+			return false, errors.NewBlockInvalidBodyError("[BLOCK][%s] first subtree has no nodes", b.String())
 		}
 
 		// 7. Check that the first transaction in the first subtree is a coinbase placeholder (zeros)
+		// Body-attributable: same reasoning as above.
 		if !b.SubtreeSlices[0].Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholder) {
-			return false, errors.NewBlockInvalidError("[BLOCK][%s] first transaction in first subtree is not a coinbase placeholder: %s", b.String(), b.SubtreeSlices[0].Nodes[0].Hash.String())
+			return false, errors.NewBlockInvalidBodyError("[BLOCK][%s] first transaction in first subtree is not a coinbase placeholder: %s", b.String(), b.SubtreeSlices[0].Nodes[0].Hash.String())
 		}
 
 		// 8. Calculate the merkle root of the list of subtrees and check it matches the MR in the block header.
@@ -1058,7 +1061,10 @@ func (b *Block) checkDuplicateTransactionsInSubtree(subtree *subtreepkg.Subtree,
 		// in a tx map, Put is mutually exclusive, can only be called once per key
 		if err = b.txMap.Put(subtreeNode.Hash, idx64); err != nil {
 			if errors.Is(err, errors.ErrTxExists) || strings.Contains(err.Error(), "hash already exists in map") {
-				return errors.NewBlockInvalidError("[BLOCK][%s] block contains duplicate transaction %s", b.String(), subtreeNode.Hash.String())
+				// Body-attributable: the duplicated transaction is peer-supplied body data,
+				// not the header, so this must not mark the header's hash invalid
+				// (CVE-2012-2459 duplicates the same merkle root under a different tx list).
+				return errors.NewBlockInvalidBodyError("[BLOCK][%s] block contains duplicate transaction %s", b.String(), subtreeNode.Hash.String())
 			}
 
 			return errors.NewStorageError("[BLOCK][%s] error adding transaction %s to txMap", b.String(), subtreeNode.Hash.String(), err)
@@ -1746,8 +1752,10 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 		// the canonical flat merkle root. Without this guard a peer can craft a
 		// non-power-of-two first subtree (e.g. lengths [3, 2]) and produce a
 		// merkle root that a canonical SV Node validator would not agree with.
+		// Body-attributable: the subtree shape is peer-supplied body data, not the
+		// header, so these rejections must not mark the header's hash invalid.
 		if !subtreepkg.IsPowerOfTwo(targetLength) {
-			return errors.NewBlockInvalidError(
+			return errors.NewBlockInvalidBodyError(
 				"[BLOCK][%s] first subtree leaf count is not a power of two: %d",
 				b.String(), targetLength,
 			)
@@ -1757,14 +1765,14 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 			isLast := i == len(b.SubtreeSlices)-1
 
 			if !isLast && sub.Length() != targetLength {
-				return errors.NewBlockInvalidError(
+				return errors.NewBlockInvalidBodyError(
 					"[BLOCK][%s] only the final subtree may be incomplete (index %d, length %d, targetLength %d)",
 					b.String(), i, sub.Length(), targetLength,
 				)
 			}
 
 			if isLast && sub.Length() > targetLength {
-				return errors.NewBlockInvalidError(
+				return errors.NewBlockInvalidBodyError(
 					"[BLOCK][%s] final subtree exceeds first subtree size (length %d, targetLength %d)",
 					b.String(), sub.Length(), targetLength,
 				)
@@ -1799,7 +1807,9 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 
 		for _, hash := range hashes {
 			if _, dup := seen[hash]; dup {
-				return errors.NewBlockInvalidError("[BLOCK][%s] duplicate subtree root hash in top-level merkle tree: %s", b.String(), hash.String())
+				// Body-attributable: the set of subtree roots is derived from peer-supplied
+				// body data, not the header, so this must not mark the header's hash invalid.
+				return errors.NewBlockInvalidBodyError("[BLOCK][%s] duplicate subtree root hash in top-level merkle tree: %s", b.String(), hash.String())
 			}
 
 			seen[hash] = struct{}{}
@@ -1821,7 +1831,10 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 	}
 
 	if !b.Header.HashMerkleRoot.IsEqual(calculatedMerkleRootHash) {
-		return errors.NewBlockInvalidError("[BLOCK][%s] merkle root does not match", b.String())
+		// Body-attributable: the merkle root is computed from peer-supplied body data
+		// (transactions/subtrees), not the header, so a mismatch here must not mark the
+		// header's hash invalid (CVE-2012-2459: a doctored body can reproduce the same root).
+		return errors.NewBlockInvalidBodyError("[BLOCK][%s] merkle root does not match", b.String())
 	}
 
 	return nil

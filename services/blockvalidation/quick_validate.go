@@ -226,6 +226,16 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 		// This function waits for all processing to complete before returning, ensuring block.ID is set
 		_, err = u.processBlockSubtrees(ctx, block, outpointOnly)
 		if err != nil {
+			// A consensus rejection (e.g. the CVE-2012-2459 duplicate-transaction check in
+			// validateSubtrees) must survive unwrapped. This entry point is the legacy
+			// unified route (Server.processBlockFound), which returns this error straight to
+			// its caller with no fallback to normal validation — so re-wrapping it as
+			// ProcessingError would report a consensus rejection as a transient processing
+			// fault and lose the peer punishment that keys on ErrBlockInvalid.
+			if errors.Is(err, errors.ErrBlockInvalid) {
+				return err
+			}
+
 			return errors.NewProcessingError("[quickValidateBlock][%s] failed to process block subtrees", block.Hash().String(), err)
 		}
 
@@ -301,6 +311,16 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 		}
 		_, err = u.processBlockSubtreesPipelineAsync(ctx, block, prefetchDepth, writeJobsChan, outpointOnly)
 		if err != nil {
+			// Same pass-through as quickValidateBlock, for the same reason: a consensus
+			// rejection must not be reported as a transient processing fault. On this
+			// (catchup) route the immediate consequence is milder — tryQuickValidation
+			// discards the subtree files and falls back to normal validation on any error,
+			// which re-checks the block properly either way — but the error type is what
+			// tells the caller whether the block was rejected on consensus grounds.
+			if errors.Is(err, errors.ErrBlockInvalid) {
+				return err
+			}
+
 			return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to process block subtrees", block.Hash().String(), err)
 		}
 	}
@@ -753,6 +773,20 @@ func (u *BlockValidation) validateSubtrees(ctx context.Context, block *model.Blo
 		} else if block.SubtreeSlices[i].Length() != subtreeSize {
 			return 0, errors.NewProcessingError("[validateSubtrees][%s] subtree %d size mismatch", block.Hash().String(), i)
 		}
+	}
+
+	// The quick-validation path runs no other duplicate-transaction check, and the merkle
+	// root CANNOT detect a CVE-2012-2459 duplicate (the duplicate-last-node-when-odd rule
+	// means a doctored, duplicated tail can reproduce the same root). This MUST run before
+	// CheckMerkleRoot and before the block is committed (commitBlock, later in the caller);
+	// UTXOs may already have been created/spent for this batch by the time we get here (see
+	// createAndSpendUTXOsForBatch upstream in the pipeline) but the block itself is never
+	// committed, which is the security-critical property. Returned unwrapped: it is already
+	// a body-kind BlockInvalid error (model.CheckSubtreeSlicesForDuplicateTxs), and wrapping
+	// it in ProcessingError would report a consensus rejection as a transient processing
+	// fault — see the pass-throughs in quickValidateBlock/quickValidateBlockAsync.
+	if err := model.CheckSubtreeSlicesForDuplicateTxs(block.SubtreeSlices); err != nil {
+		return 0, err
 	}
 
 	// Verify merkle root

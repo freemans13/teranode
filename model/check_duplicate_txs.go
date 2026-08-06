@@ -63,7 +63,9 @@ func CheckSubtreeSlicesForDuplicateTxs(slices []*subtreepkg.Subtree) error {
 			}
 
 			if _, exists := seen[node.Hash]; exists {
-				return errors.NewBlockInvalidError(
+				// Body-attributable: the duplicated transaction is peer-supplied body
+				// data, not the header, so this must not mark the header's hash invalid.
+				return errors.NewBlockInvalidBodyError(
 					"[CheckSubtreeSlicesForDuplicateTxs] block contains duplicate transaction %s (CVE-2012-2459)",
 					node.Hash.String(),
 				)

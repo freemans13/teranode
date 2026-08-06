@@ -175,6 +175,43 @@ func NewBlockInvalidError(message string, params ...interface{}) *Error {
 	return New(ERR_BLOCK_INVALID, message, params...)
 }
 
+const (
+	blockInvalidKindDataKey = "block_invalid_kind"
+	blockInvalidKindBody    = "body"
+)
+
+// NewBlockInvalidBodyError builds a block-invalid error attributable to the peer-supplied
+// BODY (e.g. transactions/subtrees) rather than the header. A block's hash names its header
+// only, so a fault found while checking the body is not a property of that hash: persisting
+// the hash as invalid lets an attacker replay an honest header with a doctored body (zero
+// mining cost) to get the node to condemn a real block, wedging it off the honest chain. It
+// keeps the ERR_BLOCK_INVALID code so existing errors.Is checks (including peer-punishment
+// keying in catchup.go) keep working unchanged, but IsBlockInvalidBody reports true so callers
+// can skip persisting the hash as invalid for it.
+func NewBlockInvalidBodyError(message string, params ...interface{}) *Error {
+	e := New(ERR_BLOCK_INVALID, message, params...)
+	e.SetData(blockInvalidKindDataKey, blockInvalidKindBody)
+	return e
+}
+
+// IsBlockInvalidBody reports whether err (or anything it wraps) is a block-invalid error
+// marked body-attributable rather than header-attributable. stderrors.As locates the next
+// *Error link (walking through any foreign wrappers); Unwrap then advances past each checked
+// link so every *Error in the chain is inspected.
+func IsBlockInvalidBody(err error) bool {
+	for cur := err; cur != nil; {
+		var e *Error
+		if !stderrors.As(cur, &e) {
+			return false
+		}
+		if v := e.GetData(blockInvalidKindDataKey); v == blockInvalidKindBody {
+			return true
+		}
+		cur = e.Unwrap()
+	}
+	return false
+}
+
 // NewBlockExistsError creates a new error with the block exists error code.
 func NewBlockExistsError(message string, params ...interface{}) *Error {
 	return New(ERR_BLOCK_EXISTS, message, params...)
