@@ -207,3 +207,95 @@ func TestCheckHeaderContextualMedianWindow(t *testing.T) {
 		require.False(t, errors.Is(err, errors.ErrBlockInvalid))
 	})
 }
+
+// TestCheckHeaderContextualWindowIntegrity pins the two guarantees SV Node gets
+// for free and Teranode has to enforce by hand.
+//
+// SV Node's CBlockIndex::GetMedianTimePast (src/block_index.h) walks pprev
+// pointers from the parent, so its window is linked by construction and can only
+// be shorter than 11 when the chain genuinely ends at genesis
+// ("i < nMedianTimeSpan && pindex"). CheckHeaderContextual takes a
+// caller-supplied slice instead, so a run can be unlinked, or short while the
+// chain behind it is long — both of which silently produce a median that is not
+// the consensus one.
+func TestCheckHeaderContextualWindowIntegrity(t *testing.T) {
+	logger := ulogger.TestLogger{}
+
+	newSettings := func(t *testing.T) *settings.Settings {
+		tSettings := test.CreateBaseTestSettings(t)
+		mainParams := chaincfg.MainNetParams
+		tSettings.ChainCfgParams = &mainParams
+
+		return tSettings
+	}
+
+	baseTime := uint32(time.Now().Add(-2 * time.Hour).Unix())
+	ascending := buildLinkedChain(t, 100, baseTime)
+
+	// Comfortably above every timestamp in the chain and still in the past, so
+	// only a window-integrity failure can produce an error.
+	const futureEnough = 200
+
+	t.Run("forward-ordered run starting at the parent is refused", func(t *testing.T) {
+		// [parent, child, grandchild, ...]: the parent sits at index 0, so the
+		// newest-first case matches, but the 10 headers after it are the parent's
+		// DESCENDANTS. Anchoring alone cannot tell this from a real newest-first
+		// run — only linkage can.
+		parent := ascending[50]
+		block := buildChildBlock(t, parent, baseTime+futureEnough)
+
+		err := block.CheckHeaderContextual(ascending[50:], newSettings(t), logger)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "not a linked chain")
+		require.False(t, errors.Is(err, errors.ErrBlockInvalid))
+	})
+
+	t.Run("broken linkage inside the window is refused", func(t *testing.T) {
+		parent := ascending[len(ascending)-1]
+		block := buildChildBlock(t, parent, baseTime+futureEnough)
+
+		unrelated := buildLinkedChain(t, 1, baseTime+5000)
+
+		run := newestFirst(ascending)
+		spliced := make([]*BlockHeader, len(run))
+		copy(spliced, run)
+		spliced[5] = unrelated[0]
+
+		err := block.CheckHeaderContextual(spliced, newSettings(t), logger)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "not a linked chain")
+		require.False(t, errors.Is(err, errors.ErrBlockInvalid))
+	})
+
+	t.Run("short run that does not reach genesis is refused", func(t *testing.T) {
+		// Five headers from the middle of a long chain. SV Node could never
+		// produce this: it stops early only at genesis, so fewer than 11 samples
+		// always means the chain really is that short.
+		parent := ascending[len(ascending)-1]
+		block := buildChildBlock(t, parent, baseTime+futureEnough)
+
+		err := block.CheckHeaderContextual(newestFirst(ascending)[:5], newSettings(t), logger)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "does not reach genesis")
+		require.False(t, errors.Is(err, errors.ErrBlockInvalid))
+	})
+
+	t.Run("short run reaching genesis is accepted, both orders", func(t *testing.T) {
+		// buildLinkedChain roots at the all-zero parent hash, so this really is a
+		// five-block chain and the shorter window is the consensus one.
+		shortAscending := buildLinkedChain(t, 5, baseTime)
+		shortParent := shortAscending[len(shortAscending)-1]
+
+		block := buildChildBlock(t, shortParent, baseTime+futureEnough)
+		require.NoError(t, block.CheckHeaderContextual(newestFirst(shortAscending), newSettings(t), logger))
+		require.NoError(t, block.CheckHeaderContextual(shortAscending, newSettings(t), logger))
+	})
+
+	t.Run("full-length runs are unaffected by the genesis rule, both orders", func(t *testing.T) {
+		parent := ascending[len(ascending)-1]
+		block := buildChildBlock(t, parent, baseTime+futureEnough)
+
+		require.NoError(t, block.CheckHeaderContextual(newestFirst(ascending), newSettings(t), logger))
+		require.NoError(t, block.CheckHeaderContextual(ascending, newSettings(t), logger))
+	})
+}

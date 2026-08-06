@@ -500,6 +500,41 @@ type SubtreeStore interface {
 	GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (io.ReadCloser, error)
 }
 
+// medianTimeBlocks is the number of blocks the median-time-past rule is evaluated over —
+// svnode's CBlockIndex::nMedianTimeSpan (src/block_index.h). It is a consensus constant, not a
+// tunable: changing it forks the chain.
+//
+// The same value is the floor on blockvalidation_previous_block_header_count, which is what
+// block validation fetches for this check. Both read it from one declaration so they cannot
+// drift, and that declaration lives in settings because settings cannot import model without an
+// import cycle.
+const medianTimeBlocks = settings.MedianTimeSpan
+
+// verifyMedianWindowLinkage checks that window is a contiguous run of headers, each linked to
+// the next by hash. window is ordered newest-first when newestFirst is true, oldest-first
+// otherwise. svnode gets this for free by walking pprev pointers; here the headers arrive as a
+// caller-supplied slice, so an unlinked run has to be detected explicitly.
+func verifyMedianWindowLinkage(window []*BlockHeader, newestFirst bool) error {
+	for i := 0; i < len(window)-1; i++ {
+		child, parent := window[i], window[i+1]
+		if !newestFirst {
+			child, parent = window[i+1], window[i]
+		}
+
+		// Hashing a header whose HashPrevBlock is nil panics (BlockHeader.Bytes clones it
+		// unguarded), so report the position rather than the hash.
+		if child.HashPrevBlock == nil {
+			return errors.NewProcessingError("header at window position %d carries no parent hash", i)
+		}
+
+		if !child.HashPrevBlock.IsEqual(parent.Hash()) {
+			return errors.NewProcessingError("header %s does not follow %s", child.Hash().String(), parent.Hash().String())
+		}
+	}
+
+	return nil
+}
+
 // CheckHeaderContextual runs the header checks whose outcome depends on wall-clock time
 // (time.Now()) or on the current chain: the 2-hours-in-the-future timestamp bound, the
 // median-time-past rule, and the mandatory block-version floor (BIP34/66/65). It mirrors the
@@ -516,13 +551,24 @@ type SubtreeStore interface {
 // currentChain is a run of this block's ancestor headers with the block's parent at one end:
 // newest-first with the parent at index 0 — the order both block-validation header sources
 // produce, blockchainClient.GetBlockHeaders and the catchup HeaderChainCache — or oldest-first
-// with the parent last. The median-time-past window is
-// anchored on whichever end carries the parent; a run with the parent at neither end is
-// rejected with a processing error, because evaluating the median against headers that are
-// not the parent's makes the rule silently diverge from consensus (issue #1467 — the old
-// tail-slice selection measured the oldest headers of a newest-first run, ~90 blocks below
-// the parent). When currentChain is empty the median-time-past rule is skipped (same as
-// Valid()). Returns nil when the header passes.
+// with the parent last. The median-time-past window is anchored on whichever end carries the
+// parent.
+//
+// svnode's CBlockIndex::GetMedianTimePast walks pprev pointers from the parent, which makes
+// three properties structural. Here the headers arrive as a caller-supplied slice, so all three
+// are checked, and a run that fails any of them is rejected with a processing error rather than
+// a block-invalid one — the supplied context is wrong, which is not evidence the block is bad,
+// and block validation persists invalid verdicts:
+//
+//   - the run must be anchored at the block's parent (issue #1467 — the old tail-slice
+//     selection measured the oldest headers of a newest-first run, ~90 blocks below the parent);
+//   - the selected window must be a linked chain, so that a forward-ordered run starting at the
+//     parent cannot yield a median over the parent's descendants;
+//   - a window shorter than 11 must reach genesis, so that a caller simply holding fewer headers
+//     cannot shrink the window while the chain behind it is long.
+//
+// When currentChain is empty the median-time-past rule is skipped (same as Valid()). Returns nil
+// when the header passes.
 func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *settings.Settings, logger ulogger.Logger) error {
 	// 2. Check that the block timestamp is not more than two hours in the future.
 	twoHoursToTheFutureTimestampUint32, err := safeconversion.Int64ToUint32(time.Now().Add(2 * time.Hour).Unix())
@@ -535,10 +581,10 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 	}
 
 	// 3. Check that the block's timestamp is strictly after the median timestamp of the 11
-	// blocks ending at its parent (use what we have when the chain is shorter). The window
-	// must be the headers ADJACENT to the parent, so anchor it on whichever end of the run
-	// the parent sits at rather than assuming an order.
-	pruneLength := 11
+	// blocks ending at its parent (fewer only when the chain itself ends at genesis, as in
+	// svnode). The window must be the headers ADJACENT to the parent, so anchor it on whichever
+	// end of the run the parent sits at rather than assuming an order.
+	pruneLength := medianTimeBlocks
 	currentChainLength := len(currentChain)
 	// if the current chain length is 0 skip this test
 	if currentChainLength > 0 {
@@ -553,12 +599,16 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 			return errors.NewProcessingError("[BLOCK] block header carries no parent hash, cannot evaluate median time past")
 		}
 
-		var lastTimeStamps []*BlockHeader
+		var (
+			lastTimeStamps []*BlockHeader
+			newestFirst    bool
+		)
 
 		switch {
 		case currentChain[0] != nil && currentChain[0].Hash().IsEqual(b.Header.HashPrevBlock):
 			// newest-first (GetBlockHeaders order): the parent and its predecessors lead the run
 			lastTimeStamps = currentChain[:pruneLength]
+			newestFirst = true
 		case currentChain[currentChainLength-1] != nil && currentChain[currentChainLength-1].Hash().IsEqual(b.Header.HashPrevBlock):
 			// oldest-first: the parent and its predecessors end the run
 			lastTimeStamps = currentChain[currentChainLength-pruneLength:]
@@ -576,6 +626,28 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 			}
 
 			prevTimeStamps[i] = time.Unix(int64(bh.Timestamp), 0)
+		}
+
+		// Anchoring fixes only which END of the run is used. svnode walks pprev pointers, so its
+		// window is a linked chain by construction and is shorter than 11 only when the chain
+		// itself ends at genesis. Both guarantees have to be re-established here, because
+		// currentChain is caller-supplied: without them a forward-ordered run starting at the
+		// parent yields a median over the parent's descendants, and a short run from a caller that
+		// simply held fewer headers yields a median over fewer than 11 blocks while the chain
+		// behind it is long. Either way the median silently stops being the consensus one.
+		if err := verifyMedianWindowLinkage(lastTimeStamps, newestFirst); err != nil {
+			return errors.NewProcessingError("[BLOCK][%s] median-time-past window is not a linked chain", b.String(), err)
+		}
+
+		if pruneLength < medianTimeBlocks {
+			oldest := lastTimeStamps[pruneLength-1]
+			if !newestFirst {
+				oldest = lastTimeStamps[0]
+			}
+
+			if oldest.HashPrevBlock == nil || !oldest.HashPrevBlock.IsEqual(&chainhash.Hash{}) {
+				return errors.NewProcessingError("[BLOCK][%s] median-time-past window holds only %d headers and does not reach genesis, cannot evaluate median time past", b.String(), pruneLength)
+			}
 		}
 
 		// calculate the median timestamp
