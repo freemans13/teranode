@@ -1,9 +1,13 @@
 package aerospike
 
 import (
+	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/stretchr/testify/require"
 )
@@ -103,5 +107,123 @@ func TestExtraRecordElementShapes(t *testing.T) {
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "more outputs than the transaction has")
 		})
+	})
+}
+
+// TestApplyExtraRecordBins covers interpreting a fetched extra record. The
+// fetch itself needs Aerospike; the interpretation does not, and it is where
+// the torn-record decisions live.
+func TestApplyExtraRecordBins(t *testing.T) {
+	t.Run("a healthy record is applied", func(t *testing.T) {
+		spendingDatas := make([]*spendpkg.SpendingData, 2)
+
+		record := &aerospike.Record{Bins: aerospike.BinMap{
+			fields.Utxos.String(): []interface{}{spentElement(t, 0x11), unspentElement(0x22)},
+		}}
+
+		require.NoError(t, applyExtraRecordBins(&chainhash.Hash{}, 1, record, 0, spendingDatas))
+		require.NotNil(t, spendingDatas[0])
+		require.Nil(t, spendingDatas[1])
+	})
+
+	t.Run("a missing record fails instead of panicking", func(t *testing.T) {
+		// The Aerospike client returns a nil record with no error when the key is
+		// not there, so a master record claiming more extra records than were
+		// written reaches this path.
+		spendingDatas := make([]*spendpkg.SpendingData, 1)
+
+		require.NotPanics(t, func() {
+			err := applyExtraRecordBins(&chainhash.Hash{}, 2, nil, 0, spendingDatas)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "is missing")
+		})
+	})
+
+	t.Run("a record with nil bins fails instead of panicking", func(t *testing.T) {
+		spendingDatas := make([]*spendpkg.SpendingData, 1)
+
+		require.NotPanics(t, func() {
+			err := applyExtraRecordBins(&chainhash.Hash{}, 2, &aerospike.Record{}, 0, spendingDatas)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "is missing")
+		})
+	})
+
+	t.Run("a missing or malformed utxos bin fails the read", func(t *testing.T) {
+		spendingDatas := make([]*spendpkg.SpendingData, 1)
+
+		record := &aerospike.Record{Bins: aerospike.BinMap{fields.Utxos.String(): "not a list"}}
+
+		err := applyExtraRecordBins(&chainhash.Hash{}, 3, record, 0, spendingDatas)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "missing or malformed utxos bin")
+		require.Contains(t, err.Error(), "string", "the offending type must be named so the damage is diagnosable")
+	})
+
+	t.Run("an error from the element loop is propagated", func(t *testing.T) {
+		spendingDatas := make([]*spendpkg.SpendingData, 1)
+
+		record := &aerospike.Record{Bins: aerospike.BinMap{
+			fields.Utxos.String(): []interface{}{make([]uint8, 40)},
+		}}
+
+		err := applyExtraRecordBins(&chainhash.Hash{}, 4, record, 0, spendingDatas)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "expected 32 (unspent) or 68 (spent)")
+	})
+}
+
+// TestClassifyUTXOReadError pins the rule that keeps local storage damage out
+// of the consensus verdict path. ErrTxInvalid makes ValidateBlock persist the
+// block as permanently invalid and flags the peer that served it, so a torn
+// read of our own records must never be dressed up as one.
+func TestClassifyUTXOReadError(t *testing.T) {
+	t.Run("a storage error keeps its class", func(t *testing.T) {
+		err := classifyUTXOReadError(errors.NewStorageError("torn record"))
+
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+		require.False(t, errors.Is(err, errors.ErrTxInvalid), "storage damage must not become a consensus verdict")
+	})
+
+	t.Run("anything else becomes tx invalid", func(t *testing.T) {
+		err := classifyUTXOReadError(errors.NewProcessingError("bad utxo hash"))
+
+		require.True(t, errors.Is(err, errors.ErrTxInvalid))
+	})
+}
+
+// TestProcessUTXOsBoundsCheck covers the master-record reader refusing to index
+// past the end of its result slice when the totalUtxos bin disagrees with the
+// stored list. With no totalExtraRecs bin this needs no Aerospike client.
+func TestProcessUTXOsBoundsCheck(t *testing.T) {
+	t.Run("more outputs than totalUtxos says fails instead of panicking", func(t *testing.T) {
+		s := &Store{}
+
+		bins := aerospike.BinMap{
+			fields.TotalUtxos.String(): 1,
+			fields.Utxos.String():      []interface{}{unspentElement(0x11), unspentElement(0x22)},
+		}
+
+		require.NotPanics(t, func() {
+			_, err := s.processUTXOs(context.Background(), &chainhash.Hash{}, bins)
+			require.Error(t, err)
+			require.True(t, errors.Is(err, errors.ErrStorageError))
+			require.Contains(t, err.Error(), "more outputs than totalUtxos says")
+		})
+	})
+
+	t.Run("a consistent record is read normally", func(t *testing.T) {
+		s := &Store{}
+
+		bins := aerospike.BinMap{
+			fields.TotalUtxos.String(): 2,
+			fields.Utxos.String():      []interface{}{spentElement(t, 0x33), unspentElement(0x44)},
+		}
+
+		spendingDatas, err := s.processUTXOs(context.Background(), &chainhash.Hash{}, bins)
+		require.NoError(t, err)
+		require.Len(t, spendingDatas, 2)
+		require.NotNil(t, spendingDatas[0])
+		require.Nil(t, spendingDatas[1])
 	})
 }

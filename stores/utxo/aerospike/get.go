@@ -897,15 +897,7 @@ NEXT_BATCH_RECORD:
 			case fields.Utxos:
 				res, err := s.processUTXOs(ctx, &items[idx].Hash, bins)
 				if err != nil {
-					// A failed or torn read of our own records is this node's storage being
-					// wrong. It says nothing about the transaction, so it must keep its
-					// storage class: ErrTxInvalid is a consensus verdict that persists the
-					// block as permanently invalid and flags the peer that served it.
-					if errors.Is(err, errors.ErrStorageError) {
-						items[idx].Err = err
-					} else {
-						items[idx].Err = errors.NewTxInvalidError("could not process utxos", err)
-					}
+					items[idx].Err = classifyUTXOReadError(err)
 
 					continue NEXT_BATCH_RECORD // because there was an error processing the utxos.
 				}
@@ -1178,6 +1170,22 @@ func processSubtreeIdxs(bins aerospike.BinMap) ([]int, error) {
 // Returns:
 //   - []*spendpkg.SpendingData: Array of UTXO spending data (may contain nil entries)
 //   - error: Any error encountered during processing
+// classifyUTXOReadError decides what class of error a failed UTXO read carries.
+//
+// A failed or torn read of our own records is this node's storage being wrong.
+// It says nothing about the transaction, so it must keep its storage class:
+// ErrTxInvalid is a consensus verdict — isUnvalidatablePeerError treats it as a
+// genuine consensus failure, so ValidateBlock persists the block as permanently
+// invalid and flags the peer that served it. Local disk damage must never
+// condemn a valid block or blame an innocent peer.
+func classifyUTXOReadError(err error) error {
+	if errors.Is(err, errors.ErrStorageError) {
+		return err
+	}
+
+	return errors.NewTxInvalidError("could not process utxos", err)
+}
+
 func (s *Store) processUTXOs(ctx context.Context, txid *chainhash.Hash, bins aerospike.BinMap) ([]*spendpkg.SpendingData, error) {
 	totalUtxos, ok := bins[fields.TotalUtxos.String()].(int)
 	if !ok {
@@ -1288,17 +1296,33 @@ func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, tota
 		// Calculate the base offset for this pagination record
 		baseOffset := recordNum * s.utxoBatchSize
 
-		extraUtxos, ok := extraRecord.Bins[fields.Utxos.String()].([]interface{})
-		if !ok {
-			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d has a missing or malformed utxos bin (%T) — torn or partially-applied record", txID.String(), recordNum, extraRecord.Bins[fields.Utxos.String()])
-		}
-
-		if applyErr := applyExtraRecordUTXOs(txID, recordNum, extraUtxos, baseOffset, spendingDatas); applyErr != nil {
+		if applyErr := applyExtraRecordBins(txID, recordNum, extraRecord, baseOffset, spendingDatas); applyErr != nil {
 			return applyErr
 		}
 	}
 
 	return nil
+}
+
+// applyExtraRecordBins interprets one fetched extra (paginated) record and
+// writes the spend state it holds into the caller's slice.
+//
+// It is split from the fetch so the interpretation can be tested without an
+// Aerospike container. A nil record means the master record claims more extra
+// records than were actually written, which is a torn write: the Aerospike
+// client returns a nil record with no error for a key that is not there, so
+// without this guard the missing record would panic rather than error.
+func applyExtraRecordBins(txID *chainhash.Hash, recordNum int, extraRecord *aerospike.Record, baseOffset int, spendingDatas []*spendpkg.SpendingData) error {
+	if extraRecord == nil || extraRecord.Bins == nil {
+		return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d is missing — torn or partially-applied write", txID.String(), recordNum)
+	}
+
+	extraUtxos, ok := extraRecord.Bins[fields.Utxos.String()].([]interface{})
+	if !ok {
+		return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record has a missing or malformed utxos bin (%T) at record %d — torn or partially-applied record", txID.String(), extraRecord.Bins[fields.Utxos.String()], recordNum)
+	}
+
+	return applyExtraRecordUTXOs(txID, recordNum, extraUtxos, baseOffset, spendingDatas)
 }
 
 // applyExtraRecordUTXOs writes the spend state held in one extra (paginated)
@@ -1338,7 +1362,7 @@ func applyExtraRecordUTXOs(txID *chainhash.Hash, recordNum int, extraUtxos []int
 
 		u, ok := ui.([]uint8)
 		if !ok {
-			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d output %d is %T, not bytes — torn or partially-applied record", txID.String(), recordNum, i, ui)
+			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d output is %T, not bytes, at offset %d — torn or partially-applied record", txID.String(), recordNum, ui, i)
 		}
 
 		switch len(u) {
