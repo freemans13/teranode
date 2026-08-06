@@ -1,6 +1,7 @@
 package fdlimit
 
 import (
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -36,12 +37,39 @@ func TestEnsureReservesHeadroom(t *testing.T) {
 
 	budget, _, err := Ensure(1)
 	require.NoError(t, err)
-	require.LessOrEqual(t, budget+Headroom, maxU64(soft, budget+Headroom),
-		"budget plus headroom must never exceed the effective limit")
 
 	// With a tiny request the limit is untouched, so the budget is exactly the
 	// current limit minus the reserve.
 	require.Equal(t, soft-Headroom, budget)
+	require.LessOrEqual(t, budget+Headroom, soft, "the reserve must come out of the effective limit")
+}
+
+// TestEnsureSaturatesInsteadOfWrapping pins that a required value within
+// Headroom of the largest representable one still raises toward the hard limit.
+// Adding the headroom to it overflows, and a wrapped total would look tiny and
+// silently skip the raise instead of taking everything the OS allows.
+func TestEnsureSaturatesInsteadOfWrapping(t *testing.T) {
+	restoreLimit(t)
+
+	_, hard, err := get()
+	require.NoError(t, err)
+
+	const lowered = 1024
+	if hard < lowered*2 {
+		t.Skip("hard limit too low to exercise a raise")
+	}
+
+	require.NoError(t, set(lowered, hard))
+
+	// Adding Headroom to this overflows uint64. A wrapped total would look tiny,
+	// sit below even the lowered soft limit, and skip the raise altogether.
+	_, raised, err := Ensure(math.MaxUint64 - 1)
+	require.NoError(t, err, "an unreachable budget must not be an error")
+	require.True(t, raised, "the raise must still be attempted, not skipped by a wrapped total")
+
+	soft, _, err := get()
+	require.NoError(t, err)
+	require.Greater(t, soft, uint64(lowered), "the soft limit must actually have moved")
 }
 
 // TestEnsureRaisesASoftLimitThatIsTooLow pins the useful half of the feature:
@@ -89,12 +117,4 @@ func restoreLimit(t *testing.T) {
 	t.Cleanup(func() {
 		_ = set(soft, hard)
 	})
-}
-
-func maxU64(a, b uint64) uint64 {
-	if a > b {
-		return a
-	}
-
-	return b
 }

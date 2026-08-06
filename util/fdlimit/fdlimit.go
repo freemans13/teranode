@@ -1,6 +1,8 @@
 // Package fdlimit inspects and raises the process's open-file-descriptor limit.
 package fdlimit
 
+import "math"
+
 // Headroom is the number of descriptors reserved for everything that is NOT
 // bounded by the file store's semaphores: listening and peer sockets, gRPC
 // connections, database pools, log files, and the Go runtime's own handles.
@@ -26,6 +28,13 @@ const Headroom uint64 = 512
 // should carry on unclamped.
 func Ensure(required uint64) (budget uint64, raised bool, err error) {
 	need := required + Headroom
+	if need < required {
+		// The addition wrapped, which takes a required value within Headroom of
+		// the largest representable one. Saturate rather than wrap: no limit can
+		// satisfy such a budget, and wrapping would silently skip the raise
+		// below instead of taking everything the hard limit allows.
+		need = math.MaxUint64
+	}
 
 	soft, hard, err := get()
 	if err != nil {
