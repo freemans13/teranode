@@ -14,6 +14,12 @@ import (
 // mainnet the gap between blocks is routinely tens of minutes — so an idle
 // node must never be restarted (issue 1447).
 func TestLivenessDoesNotRestartAnIdleNode(t *testing.T) {
+	// Shrink the tick so this runs in milliseconds instead of tens of seconds.
+	restore := blockAssemblerHeartbeatInterval
+	blockAssemblerHeartbeatInterval = 10 * time.Millisecond
+
+	defer func() { blockAssemblerHeartbeatInterval = restore }()
+
 	server, _ := setupServer(t)
 	require.NoError(t, server.blockAssembler.Start(t.Context()))
 
@@ -25,10 +31,10 @@ func TestLivenessDoesNotRestartAnIdleNode(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return server.blockAssembler.heartbeat.Age() > 0
-	}, 5*time.Second, 50*time.Millisecond, "loop must take ownership of the heartbeat")
+	}, 5*time.Second, 5*time.Millisecond, "loop must take ownership of the heartbeat")
 
 	// No blocks, no transactions — only the idle tick can keep this healthy.
-	time.Sleep(3 * blockAssemblerHeartbeatInterval)
+	time.Sleep(5 * blockAssemblerHeartbeatInterval)
 
 	status, msg, err := server.Health(t.Context(), true)
 	require.NoError(t, err)

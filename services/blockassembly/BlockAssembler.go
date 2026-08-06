@@ -131,7 +131,7 @@ type BlockAssembler struct {
 	// heartbeat records that the main select loop is still being serviced, so
 	// the liveness probe can distinguish a wedged assembler from an idle one
 	// (issue 1447)
-	heartbeat *health.Heartbeat
+	heartbeat health.Heartbeat
 
 	// currentChainMap maps block hashes to their heights
 	currentChainMap map[chainhash.Hash]uint32
@@ -243,7 +243,6 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 
 	b := &BlockAssembler{
 		logger:              logger,
-		heartbeat:           health.New(),
 		stats:               stats.NewStat("BlockAssembler"),
 		settings:            tSettings,
 		utxoStore:           utxoStore,
@@ -314,7 +313,10 @@ func (b *BlockAssembler) GetChainedSubtreesTotalSize() uint64 {
 // blockAssemblerHeartbeatInterval is how often the main loop's idle tick
 // fires. It only needs to be comfortably shorter than any liveness timeout an
 // operator would configure.
-const blockAssemblerHeartbeatInterval = 5 * time.Second
+// var, not const, so tests can shrink it — a test that must wait several real
+// tick intervals otherwise adds tens of seconds to the package run and pushes
+// unrelated timeout-bounded tests over their limits.
+var blockAssemblerHeartbeatInterval = 5 * time.Second
 
 // startChannelListeners starts the main event loop goroutine.
 func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) {

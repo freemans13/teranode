@@ -27,7 +27,8 @@ type Heartbeat struct {
 }
 
 // New returns a Heartbeat that has NOT yet beaten, so it reports healthy until
-// its loop starts.
+// its loop starts. The zero value behaves identically and is usable directly,
+// which is what callers embedding it as a struct field should do.
 //
 // This matters more than it looks. A service is constructed during Init but its
 // loop may not start until well into Start, behind work that is legitimately
