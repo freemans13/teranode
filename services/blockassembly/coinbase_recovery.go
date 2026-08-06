@@ -57,19 +57,39 @@ var errCoinbaseGapTooLarge = errors.NewProcessingError("[coinbaseRecovery] gap e
 // errCoinbaseGapTooLarge so the caller can escalate instead of attempting to
 // repair an unbounded (and likely non-local) divergence.
 //
+// The walk stops at height 1: the genesis coinbase is provably unspendable and
+// is never created in the UTXO store, so probing height 0 would always report
+// it as "missing" and pull the genesis block into the repair set, where
+// processCoinbaseUtxos would write a bogus UTXO entry (block ID 0, and a
+// maturity height taken from the store's current height rather than 0).
+// Genesis can never be the parent of a coinbase-maturity spend, so excluding
+// it loses nothing.
+//
 // gapBlocks is returned in ascending height order. An empty slice with a nil
 // error means no gap was found (the trigger height itself already satisfies
 // the consecutive-good floor).
 func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uint32) (gapBlocks []*model.Block, err error) {
 	needConsecutive := b.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood
+	if needConsecutive < 1 {
+		// A non-positive setting would satisfy the floor test on the first
+		// present coinbase, silently degrading the walk to the stop-at-first
+		// behaviour this function exists to avoid.
+		needConsecutive = 1
+	}
+
 	maxGap := b.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks
+	if maxGap < 1 {
+		// A non-positive setting would escalate on the very first missing
+		// coinbase, making every divergence unrecoverable.
+		maxGap = 1
+	}
 
 	var gap []*model.Block
 
 	consecutiveGood := 0
 	scanned := 0
 
-	for h := int64(triggerHeight); h >= 0; h-- {
+	for h := int64(triggerHeight); h >= 1; h-- {
 		present, blk, err := b.canonicalCoinbaseAt(ctx, uint32(h))
 		if err != nil {
 			return nil, err
