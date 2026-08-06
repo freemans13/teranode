@@ -1036,7 +1036,7 @@ func isKeyExists(err error) bool {
 // whether THIS writer created the transaction.
 //
 // masterCreated is true only when record 0 was written by us. Record 0 is the master:
-// getBinsToStore puts BlockIDs/BlockHeights/SubtreeIdxs — or UnminedSince when there are
+// GetBinsToStore puts BlockIDs/BlockHeights/SubtreeIdxs — or UnminedSince when there are
 // none — only on batches[0]. So if record 0 already existed, another writer owns that
 // mined-state metadata and ours was never applied, however many child records we filled in.
 //
