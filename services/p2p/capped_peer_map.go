@@ -45,7 +45,7 @@ type peerMapNode struct {
 
 // setMaxSize configures the insert cap. The zero value (no cap configured)
 // stores without bound, preserving the zero-value usability that many test
-// fixtures rely on; Server.New always configures a positive cap.
+// fixtures rely on; NewServer always configures a positive cap.
 func (m *cappedPeerMap) setMaxSize(maxSize int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
