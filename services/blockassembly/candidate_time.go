@@ -35,8 +35,11 @@ type mtpFloorEntry struct {
 // (model.Block CheckHeaderContextual), so without the floor a lagging local
 // clock — or a run of forward-stamped blocks dragging the median above
 // wall-clock time — makes the assembler hand miners a candidate that the
-// network refuses once mined. SV Node applies the same floor in UpdateTime
-// (max of the parent's median-time-past+1 and adjusted time).
+// network refuses once mined. SV Node applies the same floor in UpdateTime, as
+// max(median-time-past+1, GetAdjustedTime()); note it floors against
+// network-adjusted time where this floors against the raw local clock, so a
+// skewed node here has nothing pulling it back towards its peers. Consulting
+// the MedianTimeSource in services/legacy/blockchain would close that gap.
 //
 // The two consensus bounds on a block timestamp are a pair, and this function
 // honours both. The median rule is the floor; the two-hours-in-the-future rule
