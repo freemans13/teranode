@@ -122,10 +122,12 @@ type BlockAssembler struct {
 	// bestBlock atomically stores the current best block header and height together
 	bestBlock atomic.Pointer[BestBlockInfo]
 
-	// mtpFloorWarnedTip remembers the last parent block for which candidateTime
-	// warned that the median-time-past floor engaged, so the warning fires once
-	// per tip instead of once per miner poll (see candidateTime)
-	mtpFloorWarnedTip atomic.Pointer[chainhash.Hash]
+	// mtpFloorMemo caches the median-time-past floor per parent block so a miner
+	// poll costs no blockchain round-trip once the tip's floor is known. Two
+	// slots because the busy and main candidate paths key on different parents
+	// (see mtpFloor); mtpFloorMemoNext round-robins writes between them
+	mtpFloorMemo     [2]atomic.Pointer[mtpFloorEntry]
+	mtpFloorMemoNext atomic.Uint64
 
 	// stateChangeCh notifies listeners of state changes
 	// Protected by stateChangeMu to prevent race conditions

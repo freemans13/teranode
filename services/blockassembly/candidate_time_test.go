@@ -8,9 +8,11 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -61,10 +63,26 @@ func buildFutureChain(t *testing.T, ctx context.Context, blockchainClient blockc
 func linkedHeaders(t *testing.T, count int, baseTime uint32) []*model.BlockHeader {
 	t.Helper()
 
+	// A non-zero seed so the oldest header does not look like the chain start.
+	return linkedHeadersFrom(t, count, baseTime, &chainhash.Hash{1})
+}
+
+// linkedHeadersFromGenesis is linkedHeaders but the oldest header's parent is
+// the all-zero hash, marking the start of the chain.
+func linkedHeadersFromGenesis(t *testing.T, count int, baseTime uint32) []*model.BlockHeader {
+	t.Helper()
+
+	return linkedHeadersFrom(t, count, baseTime, &chainhash.Hash{})
+}
+
+// linkedHeadersFrom builds the run, seeding the oldest header's HashPrevBlock
+// with prev.
+func linkedHeadersFrom(t *testing.T, count int, baseTime uint32, prev *chainhash.Hash) []*model.BlockHeader {
+	t.Helper()
+
 	nbits, err := model.NewNBitFromString("207fffff")
 	require.NoError(t, err)
 
-	prev := &chainhash.Hash{1}
 	newestFirst := make([]*model.BlockHeader, count)
 
 	for i := 0; i < count; i++ {
@@ -213,13 +231,133 @@ func TestCandidateTimeFallback(t *testing.T) {
 		require.Equal(t, wantFloor, got)
 	})
 
-	t.Run("errors only when the batched fetch and the walk both fail", func(t *testing.T) {
+	t.Run("degrades to the wall clock when the batched fetch and the walk both fail", func(t *testing.T) {
+		// A blockchain hiccup must not stop mining. The floor only changes the
+		// outcome when the wall clock is at or below median-time-past, so an
+		// unfloored candidate is no worse than the pre-floor behaviour, whereas
+		// failing the poll takes mining down outright — including on
+		// generateEmptyBlockCandidate, the path whose job is to keep serving
+		// work while a block is processed.
 		mockClient := &blockchain.Mock{}
 		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil, context.DeadlineExceeded)
 		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, nil, context.DeadlineExceeded)
 
-		_, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
+		before := time.Now().Unix()
+		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, got, before)
+		require.LessOrEqual(t, got, time.Now().Unix())
+	})
+
+	t.Run("nil header from the walk degrades to the wall clock", func(t *testing.T) {
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil, context.DeadlineExceeded)
+		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return((*model.BlockHeader)(nil), &model.BlockHeaderMeta{}, nil)
+
+		before := time.Now().Unix()
+		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, got, before)
+		require.Less(t, got, wantFloor, "a nil header must not yield a floored time")
+	})
+
+	t.Run("nil parent header is rejected", func(t *testing.T) {
+		_, err := newAssembler(&blockchain.Mock{}).candidateTime(t.Context(), nil)
 		require.Error(t, err)
+	})
+
+	t.Run("empty batched run falls back to the hash-keyed walk", func(t *testing.T) {
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil)
+		stubWalk(mockClient)
+
+		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
+		require.NoError(t, err)
+		require.Equal(t, wantFloor, got)
+	})
+
+	t.Run("nil head in the batched run falls back to the hash-keyed walk", func(t *testing.T) {
+		// The anchor guard, not the loop guard: a nil at index 0 is the shape
+		// that would otherwise reach the median calculation.
+		withNilHead := make([]*model.BlockHeader, len(headers))
+		copy(withNilHead, headers)
+		withNilHead[0] = nil
+
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(withNilHead, []*model.BlockHeaderMeta{}, nil)
+		stubWalk(mockClient)
+
+		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
+		require.NoError(t, err)
+		require.Equal(t, wantFloor, got)
+	})
+
+	t.Run("short batched run that does not reach the chain start falls back to the walk", func(t *testing.T) {
+		// Truncated at its OLDEST end, so it is still anchored at the parent and
+		// still correctly linked — invisible to both of those guards. Its median
+		// is taken over a narrower window and comes out higher than the true
+		// median, so this test fails if the run-length guard is removed.
+		truncated := headers[:4]
+		require.NotEqual(t, int64(truncated[len(truncated)/2].Timestamp)+1, wantFloor, "fixture must make the short-run median differ from the true one")
+
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(truncated, []*model.BlockHeaderMeta{}, nil)
+		stubWalk(mockClient)
+
+		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
+		require.NoError(t, err)
+		require.Equal(t, wantFloor, got)
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 11)
+	})
+
+	t.Run("over-long batched run falls back to the walk", func(t *testing.T) {
+		tooMany := linkedHeaders(t, 12, baseTime)
+
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(tooMany, []*model.BlockHeaderMeta{}, nil)
+		for _, h := range tooMany {
+			mockClient.On("GetBlockHeader", mock.Anything, h.Hash()).Return(h, &model.BlockHeaderMeta{}, nil)
+		}
+
+		got, err := newAssembler(mockClient).candidateTime(t.Context(), tooMany[0])
+		require.NoError(t, err)
+		require.Equal(t, int64(baseTime+6)+1, got, "the walk's 11 headers end at the over-long run's tip")
+	})
+
+	t.Run("the median is fetched once per tip, not once per poll", func(t *testing.T) {
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+
+		assembler := newAssembler(mockClient)
+		for i := 0; i < 5; i++ {
+			got, err := assembler.candidateTime(t.Context(), tip)
+			require.NoError(t, err)
+			require.Equal(t, wantFloor, got)
+		}
+
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeaders", 1)
+	})
+
+	t.Run("both candidate paths' parents stay memoized together", func(t *testing.T) {
+		// The busy branch keys on the blockchain service's tip while the main
+		// path keys on the subtree processor's precomputed parent, so a
+		// single-slot memo would refetch on every alternation.
+		otherHeaders := linkedHeaders(t, 11, baseTime+100)
+		other := otherHeaders[0]
+
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+		mockClient.On("GetBlockHeaders", mock.Anything, other.Hash(), mock.Anything).Return(otherHeaders, []*model.BlockHeaderMeta{}, nil)
+
+		assembler := newAssembler(mockClient)
+		for i := 0; i < 4; i++ {
+			_, err := assembler.candidateTime(t.Context(), tip)
+			require.NoError(t, err)
+			_, err = assembler.candidateTime(t.Context(), other)
+			require.NoError(t, err)
+		}
+
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeaders", 2)
 	})
 
 	t.Run("floor warning fires once per tip, not once per poll", func(t *testing.T) {
@@ -264,6 +402,124 @@ func TestCandidateTimeFallback(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, int64(baseTime+1)+1, got)
 	})
+
+	t.Run("short batched run reaching the chain start is accepted without a walk", func(t *testing.T) {
+		short := linkedHeadersFromGenesis(t, 3, baseTime)
+		shortTip := short[0]
+
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, shortTip.Hash(), mock.Anything).Return(short, []*model.BlockHeaderMeta{}, nil)
+
+		got, err := newAssembler(mockClient).candidateTime(t.Context(), shortTip)
+		require.NoError(t, err)
+		require.Equal(t, int64(baseTime+1)+1, got)
+		mockClient.AssertNotCalled(t, "GetBlockHeader", mock.Anything, mock.Anything)
+	})
+}
+
+// TestCandidateTimeTwoHourCeiling pins the upper bound. The median-time rule is
+// a floor and the two-hours-in-the-future rule is a ceiling; when a lagging
+// local clock puts median-time-past+1 above now+2h no timestamp satisfies both.
+// model.Block CheckHeaderContextual enforces the ceiling with no currentChain,
+// so submitMiningSolution's block.Valid call does catch it — and treats the
+// failure as a subtree-processor fault, deleting the job and resetting block
+// assembly. Flooring regardless would therefore turn every solution found into
+// a full assembler reset, so candidateTime must fail the poll instead.
+func TestCandidateTimeTwoHourCeiling(t *testing.T) {
+	// Stamped five hours ahead: the floor lands ~3h above the ceiling.
+	baseTime := uint32(time.Now().Add(5 * time.Hour).Unix())
+	headers := linkedHeaders(t, 11, baseTime)
+	tip := headers[0]
+
+	newAssembler := func(generateSupported bool) *BlockAssembler {
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+
+		return &BlockAssembler{
+			logger:           ulogger.TestLogger{},
+			blockchainClient: mockClient,
+			settings: &settings.Settings{
+				ChainCfgParams: &chaincfg.Params{GenerateSupported: generateSupported},
+			},
+		}
+	}
+
+	t.Run("fails the poll rather than emitting an unmineable candidate", func(t *testing.T) {
+		_, err := newAssembler(false).candidateTime(t.Context(), tip)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "two-hour future bound")
+	})
+
+	t.Run("serves the wall clock on chains where the median rule is advisory", func(t *testing.T) {
+		// GenerateSupported downgrades the median-time violation to a warning in
+		// CheckHeaderContextual, so an unfloored candidate is still valid there
+		// and rapid generation must keep working.
+		before := time.Now().Unix()
+
+		got, err := newAssembler(true).candidateTime(t.Context(), tip)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, got, before)
+		require.LessOrEqual(t, got, time.Now().Unix())
+	})
+
+	t.Run("nil settings does not fault and fails closed", func(t *testing.T) {
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+
+		_, err := (&BlockAssembler{logger: ulogger.TestLogger{}, blockchainClient: mockClient}).candidateTime(t.Context(), tip)
+		require.Error(t, err)
+	})
+
+	t.Run("a floor just inside the ceiling still applies", func(t *testing.T) {
+		// baseTime+5 is the median, so the floor is baseTime+6. Placing the
+		// median an hour ahead keeps the floor well below now+2h.
+		insideBase := uint32(time.Now().Add(time.Hour).Unix())
+		inside := linkedHeaders(t, 11, insideBase)
+
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, inside[0].Hash(), mock.Anything).Return(inside, []*model.BlockHeaderMeta{}, nil)
+
+		got, err := (&BlockAssembler{logger: ulogger.TestLogger{}, blockchainClient: mockClient}).candidateTime(t.Context(), inside[0])
+		require.NoError(t, err)
+		require.Equal(t, int64(insideBase+5)+1, got)
+	})
+}
+
+// TestMinCandidateTime covers the memo read the submit path uses to reject a
+// miner-supplied nTime below the consensus floor.
+func TestMinCandidateTime(t *testing.T) {
+	baseTime := uint32(time.Now().Add(100 * time.Minute).Unix())
+	headers := linkedHeaders(t, 11, baseTime)
+	tip := headers[0]
+
+	mockClient := &blockchain.Mock{}
+	mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+
+	assembler := &BlockAssembler{logger: ulogger.TestLogger{}, blockchainClient: mockClient}
+
+	t.Run("unknown before a candidate is built", func(t *testing.T) {
+		_, ok := assembler.MinCandidateTime(tip.Hash())
+		require.False(t, ok)
+	})
+
+	t.Run("nil hash is unknown", func(t *testing.T) {
+		_, ok := assembler.MinCandidateTime(nil)
+		require.False(t, ok)
+	})
+
+	t.Run("returns the floor the candidate was built from", func(t *testing.T) {
+		_, err := assembler.candidateTime(t.Context(), tip)
+		require.NoError(t, err)
+
+		minTime, ok := assembler.MinCandidateTime(tip.Hash())
+		require.True(t, ok)
+		require.Equal(t, int64(baseTime+5)+1, minTime)
+	})
+
+	t.Run("unknown for a parent no candidate was built on", func(t *testing.T) {
+		_, ok := assembler.MinCandidateTime(linkedHeaders(t, 11, baseTime+500)[0].Hash())
+		require.False(t, ok)
+	})
 }
 
 // warnCountingLogger counts Warnf calls so tests can pin the once-per-tip
@@ -275,33 +531,6 @@ type warnCountingLogger struct {
 
 func (l *warnCountingLogger) Warnf(format string, args ...interface{}) {
 	l.warns.Add(1)
-}
-
-// linkedHeadersFromGenesis is linkedHeaders but the oldest header's parent is
-// the all-zero hash, marking the start of the chain for walkParentChain.
-func linkedHeadersFromGenesis(t *testing.T, count int, baseTime uint32) []*model.BlockHeader {
-	t.Helper()
-
-	nbits, err := model.NewNBitFromString("207fffff")
-	require.NoError(t, err)
-
-	prev := &chainhash.Hash{}
-	newestFirst := make([]*model.BlockHeader, count)
-
-	for i := 0; i < count; i++ {
-		header := &model.BlockHeader{
-			Version:        0x20000000,
-			HashPrevBlock:  prev,
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      baseTime + uint32(i),
-			Bits:           *nbits,
-			Nonce:          uint32(i),
-		}
-		newestFirst[count-1-i] = header
-		prev = header.Hash()
-	}
-
-	return newestFirst
 }
 
 // TestMiningCandidateTimeFlooredAtMedianTimePast drives the public
