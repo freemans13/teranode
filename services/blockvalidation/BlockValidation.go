@@ -1534,8 +1534,13 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// takes the ban-score hit: on the gossip route that notification is what
 				// drives punishment (p2p keys it on the announcing peer, not on the stored
 				// block), so dropping it would ban nobody. Punish the peer, spare the hash —
-				// the same split svnode makes for a corruption-possible rejection.
-				u.kafkaNotifyBlockInvalid(block, fmt.Sprintf("block size %d exceeds excessiveblocksize %d", block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize))
+				// the same split svnode makes for a corruption-possible rejection. Still
+				// skipped on revalidation, as the persist was: an operator re-checking a
+				// stored block must not cost whichever peer happens to be recorded against
+				// it a ban score.
+				if !opts.IsRevalidation {
+					u.kafkaNotifyBlockInvalid(block, fmt.Sprintf("block size %d exceeds excessiveblocksize %d", block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize))
+				}
 
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block size %d exceeds excessiveblocksize %d", block.Header.Hash().String(), block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize)
 			}
@@ -1564,7 +1569,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// attacker could otherwise replay an honest header with a malformed coinbase
 			// to wedge the node off the honest chain. Notify anyway, for the ban score —
 			// see the size check above.
-			u.kafkaNotifyBlockInvalid(block, "bad coinbase length")
+			if !opts.IsRevalidation {
+				u.kafkaNotifyBlockInvalid(block, "bad coinbase length")
+			}
 
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] bad coinbase length", block.Header.Hash().String())
 		}
@@ -1969,7 +1976,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				if errors.IsBlockInvalidBody(err) {
 					// Notify without persisting: the peer still takes the ban-score hit
 					// (p2p keys it on the announcing peer), the honest hash stays clean.
-					u.kafkaNotifyBlockInvalid(block, reason)
+					// Guarded like the persist below, so an operator revalidation stays
+					// silent rather than banning a peer for a block it is re-checking.
+					if !opts.IsRevalidation {
+						u.kafkaNotifyBlockInvalid(block, reason)
+					}
 
 					return errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err)
 				}
