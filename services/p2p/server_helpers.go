@@ -931,10 +931,12 @@ func (s *Server) cleanupPeerMaps() {
 		s.enforceMapSizeLimit(&s.subtreePeerMap, s.peerMapMaxSize, "subtree")
 	}
 
-	// Surface how many inserts the inline cap refused since the last sweep
-	// (issue 1409) — flood visibility without a per-insert log line.
-	if blockRejected, subtreeRejected := s.blockPeerMap.RejectedSinceLastRead(), s.subtreePeerMap.RejectedSinceLastRead(); blockRejected > 0 || subtreeRejected > 0 {
-		s.logger.Warnf("[cleanupPeerMaps] peer maps were full: dropped attribution for %d block and %d subtree announcements since the last sweep", blockRejected, subtreeRejected)
+	// Surface how many entries the inline cap evicted since the last sweep
+	// (issue 1409) — flood visibility without a per-insert log line. Sustained
+	// eviction means announcements are arriving faster than the cap can hold,
+	// so attribution for the oldest of them is being aged out early.
+	if blockEvicted, subtreeEvicted := s.blockPeerMap.EvictedSinceLastRead(), s.subtreePeerMap.EvictedSinceLastRead(); blockEvicted > 0 || subtreeEvicted > 0 {
+		s.logger.Warnf("[cleanupPeerMaps] peer maps at capacity: evicted %d oldest block and %d oldest subtree entries since the last sweep", blockEvicted, subtreeEvicted)
 	}
 
 	// Log current sizes
@@ -943,9 +945,9 @@ func (s *Server) cleanupPeerMaps() {
 }
 
 // enforceMapSizeLimit removes oldest entries from a map to enforce size limit.
-// With the inline insert cap (issue 1409) the map cannot exceed its bound
-// between sweeps, so this is a safety net whose sort cost is bounded by the
-// cap rather than by however large a flood grew the map.
+// With the inline evict-oldest cap (issue 1409) the map cannot exceed its
+// bound between sweeps, so this is a safety net whose sort cost is bounded by
+// the cap rather than by however large a flood grew the map.
 func (s *Server) enforceMapSizeLimit(m *cappedPeerMap, maxSize int, mapType string) {
 	type entryWithKey struct {
 		key       string
@@ -1138,19 +1140,15 @@ func (s *Server) shouldSkipUnhealthyPeer(from string, messageType string) bool {
 	return false
 }
 
-// storePeerMapEntry stores a peer entry in the specified map. Inserts are
-// capped inline (issue 1409): once the map is full, new attacker-suppliable
-// hashes are dropped (attribution for them is lost until the sweep frees
-// space) instead of growing memory without bound between sweeps.
-func (s *Server) storePeerMapEntry(peerMap *cappedPeerMap, hash string, from string, timestamp time.Time, mapType string) {
-	entry := peerMapEntry{
+// storePeerMapEntry stores a peer entry in the specified map. The map is
+// bounded inline (issue 1409): at capacity the OLDEST entry is evicted, so a
+// distinct-hash flood cannot grow memory without bound between sweeps and
+// cannot suppress attribution for the announcement arriving next.
+func (s *Server) storePeerMapEntry(peerMap *cappedPeerMap, hash string, from string, timestamp time.Time, _ string) {
+	peerMap.Store(hash, peerMapEntry{
 		peerID:    from,
 		timestamp: timestamp,
-	}
-
-	if !peerMap.Store(hash, entry) {
-		s.logger.Debugf("[storePeerMapEntry] %s peer map full, dropping attribution for %s from %s", mapType, hash, from)
-	}
+	})
 }
 
 // getPeerFromMap retrieves a peer entry from a map
