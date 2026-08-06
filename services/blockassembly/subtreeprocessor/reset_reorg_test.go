@@ -1344,8 +1344,9 @@ func TestResetMarksAssemblyTxsAsNotOnLongestChainBeforeClearing(t *testing.T) {
 
 // storeReorgSubtree builds a real subtree (coinbase placeholder + the given
 // txs), serializes it together with a valid SubtreeMeta, and stores both under
-// key in the blob store — exactly what the reorg moveBack path expects to read
-// back. Returns nothing; fails the test on any error.
+// the subtree's real root hash in the blob store — exactly what the reorg
+// moveBack path expects to read back. Returns that root hash, which is the
+// blob-store key the caller must reference; fails the test on any error.
 func storeReorgSubtree(t *testing.T, ctx context.Context, blobStore *blob_memory.Memory, txs []subtree.Node) *chainhash.Hash {
 	t.Helper()
 

@@ -33,7 +33,7 @@ func NewSubtreeMetaFromValidatedReader(subtreeHash chainhash.Hash, subtree *subt
 		// Print the foreign hash in display order like every other hash in the
 		// logs, or the one line meant for triage shows two incomparable hex
 		// strings (the byte-order trap behind the phantom-fork misdiagnosis).
-		metaRootHash, _ := chainhash.NewHash(metaHeader[:32])
+		metaRootHash := chainhash.Hash(metaHeader[0:32])
 
 		return nil, errors.NewProcessingError("subtree meta root hash mismatch for %s: meta was built for %s", subtreeHash.String(), metaRootHash.String())
 	}
