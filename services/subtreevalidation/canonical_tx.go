@@ -42,10 +42,7 @@ func checkCanonicalTxEncoding(tx *bt.Tx, bytesRead int64) error {
 		return errors.NewProcessingError("nil transaction")
 	}
 
-	canonicalSize := int64(tx.Size())
-	if tx.IsExtended() {
-		canonicalSize = int64(util.ExtendedTxSize(tx))
-	}
+	canonicalSize := int64(util.CanonicalTxSize(tx))
 
 	if bytesRead != canonicalSize {
 		return errors.NewTxInvalidError("transaction %s is not canonically encoded: %d wire bytes for a %d-byte canonical serialization (non-minimal CompactSize prefix)", tx.TxIDChainHash().String(), bytesRead, canonicalSize)
