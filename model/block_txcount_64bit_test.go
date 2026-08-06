@@ -111,9 +111,13 @@ func TestCheckDuplicateTransactionsUsesFullCount(t *testing.T) {
 
 	require.NoError(t, block.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, 4, nil))
 
-	// Hold the map across release: PutTxMap clears it only when the 64-bit key
-	// resolves to a pool class, so a wrong or stale release key (which would
-	// silently drop the map instead of pooling it) leaves the 3 entries behind.
+	// The map is sized from the loaded body, not the claimed count.
+	require.Equal(t, uint64(4), block.txMapCount)
+
+	// Hold the map across release and assert PutTxMap cleared it, which only
+	// happens on the pooled branch. This proves the release key still resolves
+	// to a pool class — it does NOT pin the exact key, since at this size any
+	// key at or below the largest class also pools and clears.
 	pooled, ok := block.txMap.(*txmap.SplitSwissMapUint64)
 	require.True(t, ok)
 	require.Equal(t, 3, pooled.Length())
@@ -121,4 +125,108 @@ func TestCheckDuplicateTransactionsUsesFullCount(t *testing.T) {
 	block.releaseTxMap()
 	require.Nil(t, block.txMap)
 	require.Equal(t, 0, pooled.Length(), "released map must be cleared and pooled, not dropped")
+}
+
+// TestCheckDuplicateTransactionsAboveUint32 is the end-to-end pin issue 1428
+// asked for: a block claiming more than math.MaxUint32 transactions must run the
+// real duplicate-check path without returning the retryable processing error the
+// old uint32 narrowing produced.
+//
+// It costs a four-node map. The claimed count no longer sizes anything — the
+// hint comes from the loaded body (txMapEntryCount) — so nothing here
+// materialises a large allocation, which is what previously made this scenario
+// untestable (the CI-memory trap of issue 1051).
+//
+// The size classes are shrunk for the duration anyway, so that if the sizing
+// ever regresses to the claimed count this test stays cheap and fails on the
+// assertion instead of trying to preallocate for 2^32 entries. txMapPools is
+// built from the original classes at init, so every surviving index still
+// resolves to a real pool. The Cleanup restore is mandatory and this test must
+// not run in parallel, since it mutates package state.
+func TestCheckDuplicateTransactionsAboveUint32(t *testing.T) {
+	origClasses := txMapSizeClasses
+	txMapSizeClasses = []uint32{1 << 12}
+
+	t.Cleanup(func() { txMapSizeClasses = origClasses })
+
+	subtree, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+	require.NoError(t, subtree.AddCoinbaseNode())
+
+	for i := byte(1); i <= 3; i++ {
+		hash := chainhash.HashH([]byte{i, 0x77})
+		require.NoError(t, subtree.AddNode(hash, 1, 0))
+	}
+
+	block := &Block{
+		Header:           &BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}},
+		TransactionCount: math.MaxUint32 + 1,
+		SubtreeSlices:    []*subtreepkg.Subtree{subtree},
+	}
+
+	require.NoError(t, block.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, 4, nil),
+		"a count above MaxUint32 must not fail the duplicate check")
+
+	// Sized from the four loaded nodes, not from the claimed 2^32+1.
+	require.Equal(t, uint64(4), block.txMapCount)
+
+	pooled, ok := block.txMap.(*txmap.SplitSwissMapUint64)
+	require.True(t, ok)
+	require.Equal(t, 3, pooled.Length())
+
+	block.releaseTxMap()
+	require.Equal(t, 0, pooled.Length(), "released map must be cleared and pooled, not dropped")
+}
+
+// TestParentSpendsCapacity pins the parent-spends sizing helper: it multiplies
+// the body-derived node count by the assumed inputs per transaction, treats a 0
+// multiplier as 1, never returns 0 (the mmap-backed table rejects a zero
+// capacity), and on an overflowing operator-supplied multiplier degrades to the
+// unmultiplied count rather than carrying a wrapped product into
+// NewSplitSyncedParentMap, whose uint32((e + e/5) / buckets) would turn it into
+// an arbitrary per-bucket size.
+func TestParentSpendsCapacity(t *testing.T) {
+	require.Equal(t, uint64(2_000), parentSpendsCapacity(1_000, 2))
+	require.Equal(t, uint64(1_000), parentSpendsCapacity(1_000, 1))
+	require.Equal(t, uint64(1_000), parentSpendsCapacity(1_000, 0), "a 0 multiplier means 1")
+
+	require.Equal(t, uint64(1), parentSpendsCapacity(0, 2), "capacity must never be 0")
+	require.Equal(t, uint64(1), parentSpendsCapacity(0, 0))
+
+	// An overflowing multiplier degrades to the node count, not a wrapped value.
+	const entryCount = 4
+	require.Equal(t, uint64(entryCount), parentSpendsCapacity(entryCount, math.MaxUint64),
+		"an overflowing multiplier must fall back to the unmultiplied count")
+	require.Equal(t, uint64(entryCount), parentSpendsCapacity(entryCount, math.MaxUint64/2))
+
+	// Every value the helper can return must survive the constructor's per-bucket
+	// arithmetic without truncating, which is the property the fallback protects.
+	for _, m := range []uint64{0, 1, 2, 16, math.MaxUint64 / 2, math.MaxUint64} {
+		c := parentSpendsCapacity(entryCount, m)
+		require.Equal(t, (c+c/5)/uint64(parentSpendsBuckets), uint64(uint32((c+c/5)/uint64(parentSpendsBuckets))),
+			"capacity %d (multiplier %d) truncates in the constructor", c, m)
+	}
+}
+
+// TestTxMapEntryCountIgnoresClaimedCount pins that the sizing hint is taken from
+// the loaded body and never from the peer-supplied TransactionCount: a block
+// claiming a huge count while carrying few (or no) subtree nodes must size for
+// what it carries (issue 1501).
+func TestTxMapEntryCountIgnoresClaimedCount(t *testing.T) {
+	subtree, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+	require.NoError(t, subtree.AddCoinbaseNode())
+	require.NoError(t, subtree.AddNode(chainhash.HashH([]byte{0x01}), 1, 0))
+
+	// A block that claims 2^40 transactions but carries two nodes.
+	block := &Block{TransactionCount: 1 << 40, SubtreeSlices: []*subtreepkg.Subtree{subtree}}
+	require.Equal(t, uint64(2), block.txMapEntryCount())
+
+	// The zero-subtree shape from issue 1501: nothing loaded, so nothing sized.
+	empty := &Block{TransactionCount: math.MaxUint64}
+	require.Equal(t, uint64(0), empty.txMapEntryCount())
+
+	// A nil slice entry must not panic or inflate the count.
+	withNil := &Block{TransactionCount: 1 << 40, SubtreeSlices: []*subtreepkg.Subtree{nil, subtree}}
+	require.Equal(t, uint64(2), withNil.txMapEntryCount())
 }

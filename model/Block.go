@@ -108,6 +108,11 @@ type Block struct {
 	subtreeLength   uint64
 	subtreeSlicesMu sync.RWMutex
 	txMap           txmap.TxMap
+	// txMapCount is the entry count txMap was sized from, and the pool key it
+	// must be returned with. Derived from the loaded block body by
+	// txMapEntryCount, not from the peer-supplied TransactionCount. Stashed so
+	// the release key cannot drift from the one used at GetTxMap time.
+	txMapCount      uint64
 	medianTimestamp uint32
 	// nodeAllocator, if non-nil, supplies pooled backing slices for the
 	// per-subtree Node arrays during GetAndValidateSubtrees. Only the
@@ -793,11 +798,11 @@ func (b *Block) releaseTxMap() {
 		ClearTxMapStats()
 	} else if poolable, ok := b.txMap.(*txmap.SplitSwissMapUint64); ok {
 		// Return the pooled in-memory map for reuse on the next block.
-		// b.TransactionCount was set in GetAndValidateSubtrees before
-		// checkDuplicateTransactions ran, so it matches the value used at
-		// GetTxMap time and the map lands in the correct size-class pool
-		// (counts above every size class are dropped by PutTxMap).
-		PutTxMap(poolable, b.TransactionCount)
+		// b.txMapCount is the value checkDuplicateTransactions sized the map
+		// from, stashed there for exactly this purpose, so the map lands in the
+		// size-class pool it came from (counts above every size class are
+		// dropped by PutTxMap).
+		PutTxMap(poolable, b.txMapCount)
 	} else if closer, ok := b.txMap.(io.Closer); ok {
 		_ = closer.Close()
 	}
@@ -976,10 +981,14 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 		subtreeSize = b.SubtreeSlices[0].Size()
 	}
 
+	// Size both map variants from the loaded block body rather than the
+	// peer-supplied TransactionCount, and keep the value for the release key.
+	b.txMapCount = b.txMapEntryCount()
+
 	if len(diskMapDirs) > 0 {
-		// An empty (coinbase-only) block has TransactionCount == 0, but the
-		// mmap-backed table rejects a zero capacity — clamp to 1.
-		filterCapacity := b.TransactionCount
+		// An empty (coinbase-only) block inserts nothing, but the mmap-backed
+		// table rejects a zero capacity — clamp to 1.
+		filterCapacity := b.txMapCount
 		if filterCapacity == 0 {
 			filterCapacity = 1
 		}
@@ -995,10 +1004,10 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 	} else {
 		// Draw the txMap from a size-class pool so the (potentially multi-GB)
 		// backing storage is reused across blocks. PutTxMap is called at
-		// release time below, keyed by the same 64-bit transaction count —
-		// counts above every size class allocate fresh with a clamped
-		// preallocation hint instead of failing the block (issue 1428).
-		b.txMap = GetTxMap(b.TransactionCount)
+		// release time below, keyed by the same 64-bit count held in
+		// b.txMapCount — counts above every size class allocate fresh with a
+		// bounded preallocation hint instead of failing the block (issue 1428).
+		b.txMap = GetTxMap(b.txMapCount)
 	}
 	for subIdx := 0; subIdx < len(b.SubtreeSlices); subIdx++ {
 		subIdx := subIdx
@@ -1015,6 +1024,33 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 	}
 
 	return nil
+}
+
+// txMapEntryCount returns the number of entries the duplicate check will insert,
+// summed over the loaded subtree bodies. It is exact bar one:
+// checkDuplicateTransactionsInSubtree skips the coinbase placeholder at
+// subIdx 0/txIdx 0 and nothing else.
+//
+// This deliberately does NOT use b.TransactionCount. That field is read straight
+// off a wire varint by readBlockFromReader, and GetAndValidateSubtrees only
+// recomputes it from the real subtree contents inside the
+// `subtreeStore != nil && len(b.Subtrees) > 0` guard in Valid, while the
+// duplicate check runs unconditionally. Sizing an allocation from it therefore
+// trusts a peer-chosen integer on paths where nothing has reconciled it against
+// the body (issue 1501). The slices below are already loaded by the time any
+// caller needs this, so the honest count costs one len() per subtree: for a
+// truthful block the derived number *is* TransactionCount, and for a block
+// claiming more than it carries the map is sized for what it actually carries.
+func (b *Block) txMapEntryCount() uint64 {
+	var n uint64
+
+	for _, subtree := range b.SubtreeSlices {
+		if subtree != nil {
+			n += uint64(len(subtree.Nodes))
+		}
+	}
+
+	return n
 }
 
 // checkDuplicateTransactionsInSubtree checks for duplicate transactions in a subtree.
@@ -1064,6 +1100,35 @@ func (b *Block) checkDuplicateTransactionsInSubtree(subtree *subtreepkg.Subtree,
 	return nil
 }
 
+// parentSpendsCapacity returns the capacity hint for the parent-spends map:
+// entryCount (taken from the loaded block body) times the assumed average
+// inputs per transaction. A multiplier of 0 is treated as 1, and the result is
+// never 0 because the mmap-backed table rejects a zero capacity.
+//
+// entryCount is bounded by the subtrees actually held in memory, so it cannot
+// overflow the product on its own. The multiplier can: it is operator-supplied
+// (block_parentSpendsCapacityMultiplier) and unvalidated. On overflow this
+// returns entryCount unmultiplied — losing the headroom but keeping a real
+// number — because NewSplitSyncedParentMap computes
+// uint32((e + e/5) / nrOfBuckets), which turns a wrapped or saturated hint into
+// an arbitrary per-bucket size rather than merely a small one.
+func parentSpendsCapacity(entryCount, multiplier uint64) uint64 {
+	if multiplier == 0 {
+		multiplier = 1
+	}
+
+	capacity := entryCount * multiplier
+	if capacity/multiplier != entryCount {
+		capacity = entryCount
+	}
+
+	if capacity == 0 {
+		return 1
+	}
+
+	return capacity
+}
+
 type validationDependencies struct {
 	txMetaStore           utxo.Store
 	subtreeStore          SubtreeStore
@@ -1083,20 +1148,19 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 		return errors.NewStorageError("[validOrderAndBlessed][%s] txMap is nil, cannot check transaction order", b.String())
 	}
 
-	// Size the parent-spends map at TransactionCount * multiplier (assumed
+	// Size the parent-spends map at transaction count * multiplier (assumed
 	// average inputs/tx). For the disk-backed map this is a hard cap, so the
 	// multiplier is configurable (block_parentSpendsCapacityMultiplier); a
 	// consolidation-heavy block exceeding it overflows a segment and halts
 	// (fail-safe). 0 is treated as 1.
-	if parentSpendsCapacityMultiplier == 0 {
-		parentSpendsCapacityMultiplier = 1
-	}
-	expectedInpoints := b.TransactionCount * parentSpendsCapacityMultiplier
-	if expectedInpoints == 0 {
-		// Empty (coinbase-only) block: TransactionCount == 0, but the
-		// mmap-backed table rejects a zero capacity — clamp to 1.
-		expectedInpoints = 1
-	}
+	//
+	// The transaction count comes from the loaded block body, not from the
+	// peer-supplied b.TransactionCount — see txMapEntryCount for why (issue
+	// 1501). That alone bounds this product: the node count is limited by the
+	// subtrees actually held in memory, so a claimed count can no longer drive
+	// it. The remaining overflow route is the multiplier itself, which is
+	// operator-supplied (block_parentSpendsCapacityMultiplier) and unvalidated.
+	expectedInpoints := parentSpendsCapacity(b.txMapEntryCount(), parentSpendsCapacityMultiplier)
 
 	var psMap ParentSpendsMap
 	if len(diskMapDirs) > 0 {
