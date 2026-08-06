@@ -10,8 +10,10 @@ import (
 // TestBlockStateHolderSnapshot pins issue 1443: a reader must never observe a
 // pair that no single writer published. The writer publishes pairs with the
 // fixed relation MedianTime == Height + 1000 via SetPair; concurrent readers
-// assert every snapshot satisfies the relation. On the old two-independent-
-// atomics layout the equivalent loop tears within a few thousand iterations.
+// assert every snapshot satisfies the relation. Held in two independent
+// atomics, the pair can tear here — a reader loads the new height, the writer
+// advances, and the second load returns the median time of the next tip — so
+// the relation breaks. One atomic pointer load cannot produce that.
 func TestBlockStateHolderSnapshot(t *testing.T) {
 	var holder BlockStateHolder
 
@@ -19,7 +21,11 @@ func TestBlockStateHolderSnapshot(t *testing.T) {
 
 	const iterations = 200_000
 
-	var wg sync.WaitGroup
+	var (
+		wg     sync.WaitGroup
+		tornMu sync.Mutex
+		torn   []BlockState
+	)
 
 	stop := make(chan struct{})
 
@@ -36,8 +42,15 @@ func TestBlockStateHolderSnapshot(t *testing.T) {
 				default:
 				}
 
-				got := holder.Load()
-				require.Equal(t, got.Height+1000, got.MedianTime, "torn snapshot: height %d paired with median time %d", got.Height, got.MedianTime)
+				// Assert after wg.Wait rather than here: testify's FailNow is
+				// only valid on the goroutine running the test.
+				if got := holder.Load(); got.MedianTime != got.Height+1000 {
+					tornMu.Lock()
+					torn = append(torn, got)
+					tornMu.Unlock()
+
+					return
+				}
 			}
 		}()
 	}
@@ -48,6 +61,8 @@ func TestBlockStateHolderSnapshot(t *testing.T) {
 
 	close(stop)
 	wg.Wait()
+
+	require.Empty(t, torn, "torn snapshots observed: %v", torn)
 }
 
 // TestBlockStateHolderSingleFieldSetters pins the carry-forward semantics of

@@ -956,7 +956,20 @@ func SetBlockHeightZero(t *testing.T, db utxostore.Store) {
 // updated only the snapshot pair would silently freeze those readers at a
 // stale height while every pair-based test stayed green. Height zero is
 // rejected exactly like SetBlockHeight(0).
+//
+// The store's block state is restored on the way out, so this is safe to run
+// against a suite-wide shared store: later cases that derive a height from
+// GetBlockHeight() see what they would have seen without it. A store that
+// started at height zero cannot be restored — zero is not a settable height —
+// so run this case last against such a store.
 func SetBlockStateContract(t *testing.T, db utxostore.Store) {
+	prior := db.GetBlockState()
+	if prior.Height > 0 {
+		defer func() {
+			require.NoError(t, db.SetBlockState(prior.Height, prior.MedianTime))
+		}()
+	}
+
 	require.NoError(t, db.SetBlockState(4242, 1700000042))
 
 	state := db.GetBlockState()

@@ -1610,10 +1610,6 @@ func TestSmokeTests(t *testing.T) {
 		tests.Store(t, store)
 	})
 
-	t.Run("aerospike_set_block_state", func(t *testing.T) {
-		tests.SetBlockStateContract(t, store)
-	})
-
 	t.Run("aerospike_spend", func(t *testing.T) {
 		err := store.Delete(ctx, tests.TXHash)
 		require.NoError(t, err)
@@ -1743,6 +1739,12 @@ func TestSmokeTests(t *testing.T) {
 		}
 
 		tests.MinedThenSpendAllPrunes(t, store, prunerSvc)
+	})
+
+	// Last: this case moves the shared store's block height, and cannot restore
+	// it if the store started at zero.
+	t.Run("aerospike_set_block_state", func(t *testing.T) {
+		tests.SetBlockStateContract(t, store)
 	})
 }
 

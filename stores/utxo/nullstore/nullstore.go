@@ -28,8 +28,7 @@ import (
 // All methods succeed immediately without performing any actual storage operations.
 // This is useful for testing scenarios or when UTXO tracking needs to be disabled.
 type NullStore struct {
-	blockHeight     uint32
-	medianBlockTime uint32
+	blockState utxo.BlockStateHolder
 }
 
 // BatchDecorate implements utxo.Store.
@@ -44,35 +43,31 @@ func NewNullStore() (*NullStore, error) {
 }
 
 func (m *NullStore) SetBlockHeight(height uint32) error {
-	m.blockHeight = height
+	m.blockState.SetHeight(height)
 	return nil
 }
 
 func (m *NullStore) GetBlockHeight() uint32 {
-	return m.blockHeight
+	return m.blockState.Load().Height
 }
 
 func (m *NullStore) SetMedianBlockTime(medianTime uint32) error {
-	m.medianBlockTime = medianTime
+	m.blockState.SetMedianTime(medianTime)
 	return nil
 }
 
 func (m *NullStore) GetMedianBlockTime() uint32 {
-	return m.medianBlockTime
+	return m.blockState.Load().MedianTime
 }
 
 func (m *NullStore) SetBlockState(height, medianTime uint32) error {
-	m.blockHeight = height
-	m.medianBlockTime = medianTime
+	m.blockState.SetPair(height, medianTime)
 
 	return nil
 }
 
 func (m *NullStore) GetBlockState() utxo.BlockState {
-	return utxo.BlockState{
-		Height:     m.blockHeight,
-		MedianTime: m.medianBlockTime,
-	}
+	return m.blockState.Load()
 }
 
 // SupportsOutpointOnlySpend reports false: the null store performs no real UTXO work.
