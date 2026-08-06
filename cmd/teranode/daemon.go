@@ -4,9 +4,6 @@ import (
 	"fmt"
 	_ "net/http/pprof" //nolint:gosec // Import for pprof, only enabled via CLI flag
 	"os"
-	"os/exec"
-	"strconv"
-	"strings"
 
 	"github.com/bsv-blockchain/teranode/daemon"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -46,31 +43,20 @@ func RunDaemon(progname, version, commit string) {
 	readLimit := tSettings.Block.FileStoreReadConcurrency
 	writeLimit := tSettings.Block.FileStoreWriteConcurrency
 
-	if tSettings.Block.FileStoreUseSystemLimits {
-		out, err := exec.Command("/bin/sh", "-c", "ulimit -u").Output()
-		if err != nil {
-			fmt.Printf("Warning: Failed to get ulimit: %v, using configured limits\n", err)
-		} else {
-			limit, err := strconv.Atoi(strings.TrimSpace(string(out)))
-			if err != nil {
-				fmt.Printf("Warning: Failed to parse ulimit: %v, using configured limits\n", err)
-			} else if limit > 0 {
-				if limit > file.MaxSemaphoreLimit {
-					limit = file.MaxSemaphoreLimit
-				}
-
-				readLimit = limit * 3 / 4
-				writeLimit = limit / 4
-			}
-		}
-	}
-
 	// CRITICAL: Initialize file store semaphores BEFORE any file operations begin.
 	// This MUST happen before daemon.Start() creates any file stores or starts any
 	// services that use file stores. The InitSemaphores function replaces global
 	// channel variables and is not safe to call after file operations have started.
 	// See file.go for detailed documentation on the race condition risk.
-	if err := file.InitSemaphores(readLimit, writeLimit); err != nil {
+	//
+	// Respecting the system's open-file limit happens inside InitSemaphores, which
+	// reads it directly. This used to be attempted here by shelling out to
+	// "ulimit -u" and scaling the configured concurrency up to three quarters of
+	// the result — but that is the max-user-processes limit, not the open-file
+	// limit, so the file store was sized from an unrelated number, and scaling UP
+	// is the opposite of what the setting documents ("may reduce configured
+	// concurrency").
+	if err := file.InitSemaphores(readLimit, writeLimit, tSettings.Block.FileStoreUseSystemLimits); err != nil {
 		panic(fmt.Sprintf("Failed to initialize file store semaphores: %v", err))
 	}
 

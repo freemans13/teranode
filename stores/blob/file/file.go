@@ -300,11 +300,21 @@ func init() {
 //
 // VALIDATION:
 // The function validates limits and returns an error if they're out of acceptable bounds.
-// Valid range: 1 to 10,000 for both read and write limits.
+// Valid range: MinSemaphoreLimit to MaxSemaphoreLimit for both read and write limits.
+//
+// OPEN-FILE LIMIT:
+// A semaphore cannot bound what the operating system allows, so the process's soft
+// RLIMIT_NOFILE is raised toward readLimit+writeLimit plus fdlimit.Headroom, capped at
+// the hard limit an unprivileged process cannot exceed. If the budget still does not
+// fit and useSystemLimits is set, the concurrency is scaled down proportionally to what
+// the OS permits; call AppliedSemaphoreLimits to read the values actually in force.
+// Platforms with no RLIMIT_NOFILE are left alone. See util/fdlimit.
 //
 // Parameters:
-//   - readLimit: Maximum concurrent read operations (must be 1-10000)
-//   - writeLimit: Maximum concurrent write operations (must be 1-10000)
+//   - readLimit: Maximum concurrent read operations (MinSemaphoreLimit..MaxSemaphoreLimit)
+//   - writeLimit: Maximum concurrent write operations (MinSemaphoreLimit..MaxSemaphoreLimit)
+//   - useSystemLimits: Reduce the concurrency to fit the open-file limit when it does not
+//     fit. False keeps the configured values regardless, accepting the risk of EMFILE.
 //
 // Returns:
 //   - error: Configuration error if limits are invalid, nil otherwise
@@ -316,12 +326,13 @@ func init() {
 //	    if err := file.InitSemaphores(
 //	        settings.Block.FileStoreReadConcurrency,
 //	        settings.Block.FileStoreWriteConcurrency,
+//	        settings.Block.FileStoreUseSystemLimits,
 //	    ); err != nil {
 //	        panic(fmt.Sprintf("Failed to initialize file store semaphores: %v", err))
 //	    }
 //	    // ... continue with service initialization
 //	}
-func InitSemaphores(readLimit, writeLimit int) error {
+func InitSemaphores(readLimit, writeLimit int, useSystemLimits bool) error {
 	var initErr error
 
 	semaphoreInitOnce.Do(func() {
@@ -360,10 +371,20 @@ func InitSemaphores(readLimit, writeLimit int) error {
 			return
 		}
 
+		// Raise the limit regardless: a bigger soft limit can only help, and it is
+		// what makes the configured concurrency achievable in the first place.
+		//
+		// Whether to then clamp is the operator's call, via useSystemLimits. Left
+		// on (the default) it means "adjust concurrency to respect system limits",
+		// which is exactly this clamp. Turned off it means "use the explicit values
+		// regardless of system limits", so the configured numbers stand and the
+		// risk of EMFILE is accepted — both halves of what that setting documents.
+		//
 		// A non-nil error means the platform exposes no limit to read (Windows),
 		// and a zero budget means the limit is at or below the reserve; in both
 		// cases the semaphores still bound concurrency, so carry on unclamped.
-		if budget, _, limitErr := fdlimit.Ensure(total); limitErr == nil && budget > 0 && budget < total {
+		budget, _, limitErr := fdlimit.Ensure(total)
+		if useSystemLimits && limitErr == nil && budget > 0 && budget < total {
 			readLimit, writeLimit = clampSemaphoreLimits(readLimit, writeLimit, budget)
 			appliedClamp = true
 		}
