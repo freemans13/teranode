@@ -44,8 +44,8 @@ var (
 	prometheusInvalidTransactions prometheus.Counter
 
 	// prometheusValidatorParentCommitRetries counts retries spent waiting for a parent
-	// transaction to finish its own commit, labelled by condition (tx_locked or
-	// tx_creating). Paired with prometheusValidatorParentCommitExhausted, this gives the
+	// transaction to finish its own commit, labelled by condition (TX_LOCKED or
+	// TX_CREATING). Paired with prometheusValidatorParentCommitExhausted, this gives the
 	// denominator the logs cannot: a node retrying often but succeeding looks identical in
 	// the logs to one that is fine, because only the give-up path warns. Counted rather
 	// than logged per retry — at Teranode's transaction rates a log line per retry is a
