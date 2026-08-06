@@ -1530,7 +1530,13 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// Body-attributable: SizeInBytes reflects the peer-supplied body, not the
 				// header, so we must not persist the header's hash as invalid here — an
 				// attacker could otherwise replay an honest header with an oversized body
-				// to wedge the node off the honest chain.
+				// to wedge the node off the honest chain. Still notify, so the serving peer
+				// takes the ban-score hit: on the gossip route that notification is what
+				// drives punishment (p2p keys it on the announcing peer, not on the stored
+				// block), so dropping it would ban nobody. Punish the peer, spare the hash —
+				// the same split svnode makes for a corruption-possible rejection.
+				u.kafkaNotifyBlockInvalid(block, fmt.Sprintf("block size %d exceeds excessiveblocksize %d", block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize))
+
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block size %d exceeds excessiveblocksize %d", block.Header.Hash().String(), block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize)
 			}
 		}
@@ -1556,7 +1562,10 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// Body-attributable: the coinbase tx is peer-supplied body data, not the
 			// header, so we must not persist the header's hash as invalid here — an
 			// attacker could otherwise replay an honest header with a malformed coinbase
-			// to wedge the node off the honest chain.
+			// to wedge the node off the honest chain. Notify anyway, for the ban score —
+			// see the size check above.
+			u.kafkaNotifyBlockInvalid(block, "bad coinbase length")
+
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] bad coinbase length", block.Header.Hash().String())
 		}
 
@@ -1958,6 +1967,10 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// (so catchup's errors.Is(err, ErrBlockInvalid) peer-punishment keying is
 				// unchanged) without calling storeInvalidBlock.
 				if errors.IsBlockInvalidBody(err) {
+					// Notify without persisting: the peer still takes the ban-score hit
+					// (p2p keys it on the announcing peer), the honest hash stays clean.
+					u.kafkaNotifyBlockInvalid(block, reason)
+
 					return errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err)
 				}
 
