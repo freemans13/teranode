@@ -62,6 +62,17 @@ func getUint64(key string, defaultValue uint64, alternativeContext ...string) ui
 	return value
 }
 
+// getUint64AtLeast reads a uint64 setting and raises it to floor when the configured value is
+// lower. For settings where too small a value is unsafe rather than merely slow, so that a
+// misconfiguration degrades into the safe minimum instead of taking effect.
+func getUint64AtLeast(key string, defaultValue, floor uint64, alternativeContext ...string) uint64 {
+	if value := getUint64(key, defaultValue, alternativeContext...); value > floor {
+		return value
+	}
+
+	return floor
+}
+
 func getURL(key string, defaultValue string, alternativeContext ...string) *url.URL {
 	str, _ := gocore.Config(alternativeContext...).Get(key, defaultValue)
 	if str == "" {
