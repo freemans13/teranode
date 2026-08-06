@@ -4034,36 +4034,40 @@ func TestCatchup_MemoryLimitAfterDuplicateRemoval(t *testing.T) {
 	}
 }
 
-// TestFindCommonAncestor_RejectsHeadersAboveUTXOHeight documents findCommonAncestor's
-// contract: it rejects any block whose height exceeds the UTXO height, even if the
-// block exists in the blockchain store. This is why catchupGetBlockHeaders must cap
-// the locator at UTXO height — without capping, the peer returns headers starting
-// from blockchain height, and findCommonAncestor rejects them all.
-func TestFindCommonAncestor_RejectsHeadersAboveUTXOHeight(t *testing.T) {
-	server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
+// TestFindCommonAncestor_FindsAncestorAboveLaggingUTXOHeight is the regression test for
+// issue 1438. It replaces a test that pinned the opposite — the old contract rejected any
+// block above the UTXO store's height, and its own comment called this "the divergence
+// scenario that causes the bug".
+//
+// Where two chains diverge is a property of the accepted chain. The UTXO store's height is
+// a counter refreshed asynchronously on each block notification, so it can trail the
+// accepted chain while that subscription is starved or during bulk sync. Measuring the
+// divergence point against it made the ancestor search stop early, which is what this test
+// now forbids: with the accepted chain at 200 and the counter still at 100, the ancestor at
+// 152 must be found.
+func TestFindCommonAncestor_FindsAncestorAboveLaggingUTXOHeight(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
 
-	// Blockchain is at height 200, UTXO is at height 100
-	// This is the divergence scenario that causes the bug
-	mockUTXOStore.On("GetBlockHeight").Return(uint32(100))
+	// The accepted chain is at 200. The UTXO counter is irrelevant now and deliberately
+	// left un-mocked: if findCommonAncestor still consulted it, the mock would panic on the
+	// unexpected call rather than quietly passing.
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
+		&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 200}, nil,
+	)
 
 	blocks := testhelpers.CreateTestBlockChain(t, 5)
 
-	// Simulate peer headers that all exist in blockchain store but are ABOVE UTXO height
-	// This is what happens when the locator starts from blockchain height (200)
-	// instead of UTXO height (100)
 	peerHeaders := make([]*model.BlockHeader, 3)
 	for i := 0; i < 3; i++ {
 		peerHeaders[i] = blocks[i].Header
 	}
 
-	// All headers exist in blockchain store, but their heights are all above UTXO
-	// height (100) — this is the problem. GetBlockHeader conveys both existence and
-	// height in a single RPC.
+	// All three exist in our chain at 150, 151, 152 — above the old ceiling of 100.
 	for i, header := range peerHeaders {
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, header.Hash()).Return(
 			header,
-			&model.BlockHeaderMeta{Height: uint32(150 + i)}, // Heights 150, 151, 152 — all > 100
+			&model.BlockHeaderMeta{Height: uint32(150 + i)},
 			nil,
 		)
 	}
@@ -4075,34 +4079,149 @@ func TestFindCommonAncestor_RejectsHeadersAboveUTXOHeight(t *testing.T) {
 		},
 	}
 
-	err := server.findCommonAncestor(context.Background(), catchupCtx)
+	require.NoError(t, server.findCommonAncestor(context.Background(), catchupCtx))
+	assert.Equal(t, 2, catchupCtx.commonAncestorIndex)
+	assert.Equal(t, uint32(152), catchupCtx.commonAncestorMeta.Height)
 
-	// Without the locator capping fix, findCommonAncestor rejects all headers
-	// because their heights (150+) exceed UTXO height (100)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no common ancestor found")
+	// And the depth is measured from the accepted tip: 200 - 152.
+	assert.Equal(t, uint32(48), catchupCtx.forkDepth)
 }
 
-// TestFindCommonAncestor_AcceptsHeadersAtOrBelowUTXOHeight documents the complementary
-// contract: findCommonAncestor accepts blocks whose heights are within the UTXO range.
-// This is the normal case when the locator is properly capped.
-func TestFindCommonAncestor_AcceptsHeadersAtOrBelowUTXOHeight(t *testing.T) {
-	server, mockBlockchainClient, mockUTXOStore, cleanup := setupTestCatchupServer(t)
+// TestFindCommonAncestor_IgnoresStoredBlocksAboveOurTip pins the ceiling that survives the
+// issue 1438 fix, and it exists because deleting that ceiling outright was my first attempt
+// and it broke the Sybil test. The ancestor walk asks "is this block in our store", which
+// answers yes for a block on a side chain we did not adopt — and such a block can sit above
+// our tip. Selecting it would make the ancestor higher than the chain we measure divergence
+// from, which checkSecretMiningFromCommonAncestor asserts cannot happen and aborts on.
+//
+// What the fix changed is where the ceiling's height comes from, not that there is one.
+func TestFindCommonAncestor_IgnoresStoredBlocksAboveOurTip(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
 
-	// Both stores at height 100 — no divergence
-	mockUTXOStore.On("GetBlockHeight").Return(uint32(100))
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
+		&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 100}, nil,
+	)
+
+	blocks := testhelpers.CreateTestBlockChain(t, 5)
+	peerHeaders := []*model.BlockHeader{blocks[0].Header, blocks[1].Header}
+
+	// First header is a genuine ancestor on our chain.
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[0].Hash()).Return(
+		peerHeaders[0], &model.BlockHeaderMeta{Height: 90}, nil,
+	)
+	// Second is held in our store but sits above our tip — a side-chain block we did not
+	// adopt. It must not be chosen as the ancestor.
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[1].Hash()).Return(
+		peerHeaders[1], &model.BlockHeaderMeta{Height: 120}, nil,
+	)
+
+	catchupCtx := &CatchupContext{
+		blockUpTo: blocks[4],
+		headersFetchResult: &catchup.Result{
+			Headers: peerHeaders,
+		},
+	}
+
+	require.NoError(t, server.findCommonAncestor(context.Background(), catchupCtx))
+	assert.Equal(t, uint32(90), catchupCtx.commonAncestorMeta.Height, "must stop at the last block at or below our tip")
+	assert.LessOrEqual(t, catchupCtx.commonAncestorMeta.Height, catchupCtx.currentHeight,
+		"the ancestor must never exceed the tip we measure divergence from")
+}
+
+// TestFindCommonAncestor_ForkDepthNotUnderstatedByLag pins the consensus-safety half of
+// issue 1438, which the ticket itself missed. The old code took both the ceiling and the
+// depth baseline from the lagging counter, so the depth came out as (true depth - lag) and a
+// genuinely too-deep fork could slip under the coinbase-maturity gate. Here a 150-deep fork
+// with a 60-block lag scored 90 and passed a gate set at 100; it must now score 150 and be
+// rejected.
+func TestFindCommonAncestor_ForkDepthNotUnderstatedByLag(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
+		&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 200}, nil,
+	)
 
 	blocks := testhelpers.CreateTestBlockChain(t, 5)
 
-	// Peer headers at or below UTXO height
+	peerHeaders := []*model.BlockHeader{blocks[0].Header, blocks[1].Header}
+
+	// The shared ancestor sits at 50, i.e. 150 blocks behind the accepted tip of 200.
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[0].Hash()).Return(
+		peerHeaders[0], &model.BlockHeaderMeta{Height: 50}, nil,
+	)
+	// The next header is where we diverge.
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[1].Hash()).Return(
+		(*model.BlockHeader)(nil), (*model.BlockHeaderMeta)(nil),
+		errors.NewBlockNotFoundError("block not found"),
+	)
+
+	catchupCtx := &CatchupContext{
+		peerID:    "peer-1",
+		blockUpTo: blocks[4],
+		headersFetchResult: &catchup.Result{
+			Headers: peerHeaders,
+		},
+	}
+
+	require.NoError(t, server.findCommonAncestor(context.Background(), catchupCtx))
+	require.Equal(t, uint32(150), catchupCtx.forkDepth, "depth must be measured from the accepted tip, not a lagging counter")
+
+	// With the true depth the coinbase-maturity gate rejects it. Under the old arithmetic
+	// this same fork scored 90 and was waved through.
+	server.settings.ChainCfgParams.CoinbaseMaturity = 100
+	err := server.validateForkDepth(catchupCtx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds coinbase maturity")
+}
+
+// TestFindCommonAncestor_ReportsLocalRPCFailureWithoutBlamingPeer pins the error type on the
+// new RPC. Reading our own best header is a local operation, so a failure must be a service
+// error — that is the one class the catchup caller retries without charging the peer. A
+// processing error here would penalise an innocent peer for our own fault, which is the very
+// hazard issue 1438 is about.
+func TestFindCommonAncestor_ReportsLocalRPCFailureWithoutBlamingPeer(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
+		(*model.BlockHeader)(nil), (*model.BlockHeaderMeta)(nil),
+		errors.NewServiceError("blockchain service unavailable"),
+	)
+
+	blocks := testhelpers.CreateTestBlockChain(t, 3)
+
+	catchupCtx := &CatchupContext{
+		blockUpTo: blocks[2],
+		headersFetchResult: &catchup.Result{
+			Headers: []*model.BlockHeader{blocks[0].Header},
+		},
+	}
+
+	err := server.findCommonAncestor(context.Background(), catchupCtx)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrServiceError), "a local RPC failure must be a service error so the peer is not charged, got: %v", err)
+	require.False(t, errors.Is(err, errors.ErrProcessing), "must not be a processing error — that path reports peer failure")
+}
+
+// TestFindCommonAncestor_AcceptsHeadersAtOrBelowCurrentHeight is the surviving half of the
+// old pair: the ordinary case where the divergence point is below the tip.
+func TestFindCommonAncestor_AcceptsHeadersAtOrBelowCurrentHeight(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
+		&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 100}, nil,
+	)
+
+	blocks := testhelpers.CreateTestBlockChain(t, 5)
+
 	peerHeaders := make([]*model.BlockHeader, 3)
 	for i := 0; i < 3; i++ {
 		peerHeaders[i] = blocks[i].Header
 	}
 
-	// First two headers exist in our chain at heights within UTXO range.
-	// GetBlockHeader conveys both existence and height in a single RPC.
 	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[0].Hash()).Return(
 		peerHeaders[0], &model.BlockHeaderMeta{Height: 98}, nil,
 	)
@@ -4125,7 +4244,6 @@ func TestFindCommonAncestor_AcceptsHeadersAtOrBelowUTXOHeight(t *testing.T) {
 
 	err := server.findCommonAncestor(context.Background(), catchupCtx)
 
-	// With aligned heights, findCommonAncestor finds peerHeaders[1] at height 99
 	require.NoError(t, err)
 	assert.Equal(t, 1, catchupCtx.commonAncestorIndex)
 	assert.Equal(t, uint32(99), catchupCtx.commonAncestorMeta.Height)

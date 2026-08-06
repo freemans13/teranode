@@ -643,13 +643,31 @@ func (u *Server) findCommonAncestor(ctx context.Context, catchupCtx *CatchupCont
 		return errors.NewProcessingError("[catchup][%s] no headers received from peer", catchupCtx.blockUpTo.Hash().String())
 	}
 
-	currentHeight := u.utxoStore.GetBlockHeight()
+	// Where the two chains diverge is a property of the accepted chain, so the baseline is
+	// the blockchain store's tip — the same tip checkSecretMiningFromCommonAncestor weighs
+	// against. It used to be the UTXO store's height, which is a counter refreshed
+	// asynchronously on each block notification and can trail the accepted chain by an
+	// unbounded amount while that subscription is starved or during bulk sync. Mixing the two
+	// sources made the fork depth wrong in both directions: understated here (the ancestor was
+	// pinned at the lagging height, and the depth measured from that same height), so a
+	// genuinely too-deep fork could slip under the coinbase-maturity gate; and overstated in
+	// the secret-mining check, which measures from the real tip, so an honest peer offering a
+	// shallow fork could be accused of withholding a chain. Nothing here needs the ancestor's
+	// UTXOs to be present — catchup validates forward and never unspends or rewinds.
+	_, bestMeta, err := u.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		// Our own RPC failed. ServiceError so the caller retries without charging the peer for
+		// a local fault (see processCatchupChItem's ErrServiceError branch).
+		return errors.NewServiceError("[catchup][%s] failed to read best block header for the common-ancestor search", catchupCtx.blockUpTo.Hash().String(), err)
+	}
+
+	currentHeight := bestMeta.Height
 	catchupCtx.currentHeight = currentHeight
 
 	// Walk through peer's headers (oldest to newest) to find the highest common ancestor
 	commonAncestorIndex := -1
 	var commonAncestorMeta *model.BlockHeaderMeta
-	u.logger.Debugf("[catchup][%s] Checking %d peer headers for common ancestor (current UTXO height: %d)", catchupCtx.blockUpTo.Hash().String(), len(peerHeaders), currentHeight)
+	u.logger.Debugf("[catchup][%s] Checking %d peer headers for common ancestor (current height: %d)", catchupCtx.blockUpTo.Hash().String(), len(peerHeaders), currentHeight)
 
 	for i, header := range peerHeaders {
 		// GetBlockHeader conveys both existence and height in a single RPC: a
@@ -665,10 +683,14 @@ func (u *Server) findCommonAncestor(ctx context.Context, catchupCtx *CatchupCont
 			return errors.NewProcessingError("[catchup][%s] failed to get header for block %s: %v", catchupCtx.blockUpTo.Hash().String(), header.Hash().String(), err)
 		}
 
-		// Only consider blocks at or below our current UTXO height as potential common ancestors
-		// Blocks ahead of our UTXO height exist in blockchain store but aren't fully processed yet
+		// A candidate ancestor must be at or below our accepted tip. GetBlockHeader reports
+		// any block held in the store, including one on a side chain we did not adopt, which
+		// can sit above our tip — so without this the walk could pick an ancestor higher than
+		// the chain we are measuring divergence from, tripping the invariant
+		// checkSecretMiningFromCommonAncestor asserts. This is the same ceiling as before;
+		// what changed is only where the height comes from.
 		if meta.Height > currentHeight {
-			u.logger.Debugf("[catchup][%s] Block %s at height %d is ahead of current UTXO height %d - stopping search", catchupCtx.blockUpTo.Hash().String(), header.Hash().String(), meta.Height, currentHeight)
+			u.logger.Debugf("[catchup][%s] Block %s at height %d is ahead of our tip %d - stopping search", catchupCtx.blockUpTo.Hash().String(), header.Hash().String(), meta.Height, currentHeight)
 			break
 		}
 
