@@ -1654,8 +1654,11 @@ func (s *Store) GetTxFromExternalStore(ctx context.Context, previousTxHash chain
 func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chainhash.Hash) (*bt.Tx, error) {
 	fileType := fileformat.FileTypeTx
 
-	// Stream parse from external store to avoid double memory allocation (raw bytes + parsed tx)
-	// This saves ~50% memory by eliminating the intermediate txBytes buffer
+	// Stream parse from external store rather than reading the whole blob into a
+	// byte slice first, so the raw bytes are not held alongside the parsed tx for
+	// the duration of the parse. Note that the FileTypeTx branch below transiently
+	// re-creates a buffer of that size when it re-hashes the parsed tx, so the
+	// peak-memory saving does not hold for that branch.
 	reader, err := s.externalStore.GetIoReader(ctx, previousTxHash[:], fileType)
 	if err != nil {
 		// Try to get the data from an output file instead
@@ -1674,49 +1677,62 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 	bufferedReader := bufio.NewReader(reader)
 
 	if fileType == fileformat.FileTypeTx {
-		// Stream parse directly from buffered reader
+		// Stream parse directly from buffered reader. A parse failure here is a
+		// storage fault, not a transaction fault: the blob was written from our
+		// own bytes, so bytes that no longer parse mean this node's stored copy is
+		// truncated or torn — never evidence about the block or the peer that
+		// served it. See the classification note on the re-hash below; a truncated
+		// blob is the more likely corruption mode of the two.
 		if _, err = tx.ReadFrom(bufferedReader); err != nil {
-			return nil, errors.NewTxInvalidError("[GetTxFromExternalStore][%s] could not read tx from stream", previousTxHash.String(), err)
+			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] could not read tx from stream", previousTxHash.String(), err)
 		}
 
 		// Re-hash the reconstructed parent against the key it was fetched under
 		// (issue 1439). The parent's outputs are consensus inputs to spend
-		// validation: if the bytes are the wrong bytes but still parse as a
-		// valid transaction — a rotted or torn blob, a stale file from the
-		// pruner's delete-then-write race, or a correct-but-wrong-key return —
-		// the validator would check the child's signature against the wrong
-		// locking script and its value against the wrong satoshis, silently.
-		// A body checksum cannot catch a stale-but-intact file; only re-hashing
-		// against the requested outpoint can. This is also why the failure must
-		// happen HERE rather than being cached: the caller memoizes by txid, so
-		// one bad read would be re-served to every later spend of this parent,
-		// and re-served again after a restart because the source is on disk.
+		// validation: bytes that are the wrong bytes but still parse as a valid
+		// transaction — a rotted or torn blob, a stale file from the pruner's
+		// delete-then-write race, a mis-keyed return — would have the child's
+		// signature checked against the wrong locking script and its value against
+		// the wrong satoshis, silently. A body checksum cannot catch a
+		// stale-but-intact file; only re-hashing against the requested outpoint
+		// can. It must fail here rather than be cached: the caller memoizes by
+		// txid, so one bad read would be re-served to every later spend of this
+		// parent, and again after a restart because the source is on disk.
 		//
-		// FileTypeTx always holds the complete transaction (written from
-		// tx.ExtendedBytes and never rewritten), so its txid is reproducible.
-		// The FileTypeOutputs branch below is NOT re-hashable — it reconstructs
-		// outputs only, with no inputs, version or locktime — and neither is the
-		// inline-bins path, which nils out spent outputs; both need a different
-		// mechanism and are deliberately left alone here.
-		// Classified as a STORAGE fault, not a transaction fault. The blob is
-		// written from our own tx.ExtendedBytes under our own computed hash, so
-		// a mismatch can only mean this node's stored bytes are wrong — it is
-		// never evidence about the block being validated or the peer that served
-		// it. Returning TxInvalid here would be read downstream as a proven
-		// consensus violation: block validation persists such a block as invalid
-		// (poisoning every descendant via the parent-invalid cascade) and flags
-		// the serving peer malicious, so a single flipped bit on local disk
-		// would fork this node off the honest chain until someone manually
-		// revalidated. A storage error instead routes into the existing
-		// transient path, matching the branch above that already reports this
-		// subsystem's failures that way.
+		// A storage fault, never a transaction fault. The blob is written from our
+		// own bytes under our own computed hash, so a mismatch can only mean this
+		// node's stored bytes are wrong. TxInvalid would be read downstream as a
+		// proven consensus violation — the block persisted invalid, its
+		// descendants poisoned via the parent-invalid cascade, and the serving
+		// peer flagged malicious — so a single flipped bit on local disk would
+		// fork this node off the honest chain until someone manually revalidated.
+		// The sibling failures in this function are classified the same way, for
+		// the same reason.
+		//
+		// Deliberately no fallback to FileTypeOutputs on mismatch, even where that
+		// blob exists and carries the same satoshis and locking script: it cannot
+		// be re-hashed either, so trusting it here would reintroduce the
+		// unverified-parent-outputs hazard in precisely the case where we have
+		// positive evidence this node's stored bytes are wrong.
+		//
+		// FileTypeTx always holds the whole transaction body under its own txid,
+		// so that txid is reproducible. Three sibling paths read the same data and
+		// are deliberately NOT guarded, because none of them can be re-hashed: the
+		// FileTypeOutputs branch below reconstructs outputs only, with no inputs,
+		// version or locktime; the inline-bins path nils out spent outputs; and
+		// GetTxInpointsFromExternalStore parses input references only, by design
+		// never materialising scripts or outputs. Covering those needs a different
+		// mechanism.
 		if actual := tx.TxIDChainHash(); !actual.Equal(previousTxHash) {
 			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external tx does not hash to the key it was stored under (got %s) — stale, rotted or mis-keyed blob", previousTxHash.String(), actual.String())
 		}
 	} else {
+		// As with the FileTypeTx branch, a parse failure is a storage fault: these
+		// bytes were written from our own outputs, so bytes that no longer parse
+		// mean this node's stored copy is wrong, not that the block or peer is.
 		uw, err := utxopersister.NewUTXOWrapperFromReader(ctx, bufferedReader)
 		if err != nil {
-			return nil, errors.NewTxInvalidError("[GetTxFromExternalStore][%s] could not read outputs from reader", previousTxHash.String(), err)
+			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] could not read outputs from reader", previousTxHash.String(), err)
 		}
 
 		utxos := utxopersister.PadUTXOsWithNil(uw.UTXOs)

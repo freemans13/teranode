@@ -109,6 +109,23 @@ func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
 		require.True(t, errors.Is(err, errors.ErrStorageError))
 	})
 
+	t.Run("a truncated blob is a storage fault, not a consensus violation", func(t *testing.T) {
+		// The re-hash catches a stale-but-intact blob; a torn or partially written
+		// one fails earlier, in tx.ReadFrom. Both are this node's disk being wrong,
+		// so both must be storage faults. Classifying a truncated blob as TxInvalid
+		// would persist the block invalid and flag the serving peer over a local
+		// fault — and a truncated blob is the more likely corruption mode.
+		s := newStore(t)
+
+		good := parent.ExtendedBytes()
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, good[:len(good)/2]))
+
+		_, err := s.getExternalTransaction(ctx, parentHash)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
+		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
+	})
+
 	t.Run("a mismatched read is never cached", func(t *testing.T) {
 		// The caller memoizes by txid, so a cached bad read would be re-served
 		// to every later spend of this parent — and again after a restart,
@@ -127,6 +144,17 @@ func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
 
 		got, err := s.GetTxFromExternalStore(ctx, parentHash)
 		require.NoError(t, err)
+		require.Equal(t, parentHash, *got.TxIDChainHash())
+
+		// Positive control: without this, the subtest would also pass against an
+		// inert or always-bypassing cache, proving nothing about retention.
+		// Deleting the blob makes the store unable to serve a fresh fetch, so a
+		// third successful read can only have come from the cache — which pins
+		// that the cache is live AND that the earlier bad read was not in it.
+		require.NoError(t, s.externalStore.Del(ctx, parentHash[:], fileformat.FileTypeTx))
+
+		got, err = s.GetTxFromExternalStore(ctx, parentHash)
+		require.NoError(t, err, "successful read must be retained by a live cache")
 		require.Equal(t, parentHash, *got.TxIDChainHash())
 	})
 }
