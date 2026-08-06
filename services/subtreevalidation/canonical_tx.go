@@ -29,14 +29,16 @@ import (
 // the canonical form — that would let a malformed transaction change identity
 // mid-flight; reject it.
 //
-// Teranode's subtree data carries EXTENDED transactions (each input also
-// carrying its parent's satoshis and locking script), which serialize longer
-// than tx.Size() reports. The comparison is therefore made against whichever
-// serialization the transaction actually uses, or a legitimate extended
-// transaction would be rejected as non-canonical. The extended size is
-// computed arithmetically (util.ExtendedTxSize): calling ExtendedBytes here
-// would allocate and copy every transaction twice, on the very loop that was
-// built to read transactions without allocating.
+// Subtree data may carry EXTENDED transactions (each input also carrying its
+// parent's satoshis and locking script), which serialize longer than tx.Size()
+// reports — a subtree-data file written from parsed transactions keeps whatever
+// form they were in, while the asset service's on-demand generator writes the
+// standard form. The comparison is therefore made against whichever
+// serialization the transaction actually uses (util.CanonicalTxSize), or a
+// legitimate extended transaction would be rejected as non-canonical. That size
+// is computed arithmetically: calling ExtendedBytes here would allocate and copy
+// every transaction twice, on the very loop that was built to read transactions
+// without allocating.
 func checkCanonicalTxEncoding(tx *bt.Tx, bytesRead int64) error {
 	if tx == nil {
 		return errors.NewProcessingError("nil transaction")
