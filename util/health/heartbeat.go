@@ -21,6 +21,13 @@ import (
 //
 // The zero value is usable and reports healthy until the first Beat, so a
 // service that has not started its loop yet is never killed during startup.
+// That matters more than it looks: a service is constructed during Init but its
+// loop may not start until well into Start, behind work that is legitimately
+// unbounded — waiting on pending block validation, reloading a large unmined
+// set from disk. Beating before the loop owns the heartbeat would age it
+// through that entire preamble and report a perfectly healthy, still-starting
+// node as wedged; worse, a restart sends the node back through the same
+// preamble, so it could never finish starting.
 //
 // The beat is stored as a time.Time rather than a plain unix-nanosecond count
 // so it keeps its monotonic reading. Age therefore measures elapsed time, not
@@ -29,22 +36,6 @@ import (
 type Heartbeat struct {
 	lastBeat atomic.Pointer[time.Time] // nil = never beaten
 	now      func() time.Time
-}
-
-// New returns a Heartbeat that has NOT yet beaten, so it reports healthy until
-// its loop starts. The zero value behaves identically and is usable directly,
-// which is what callers embedding it as a struct field should do.
-//
-// This matters more than it looks. A service is constructed during Init but its
-// loop may not start until well into Start, behind work that is legitimately
-// unbounded — waiting on pending block validation, reloading a large unmined
-// set from disk. Beating at construction would age the heartbeat through that
-// entire preamble and report a perfectly healthy, still-starting node as
-// wedged; worse, a restart sends it back through Init into the same preamble,
-// so the node could never finish starting. Not beating until the loop owns the
-// heartbeat makes that window safe by construction.
-func New() *Heartbeat {
-	return &Heartbeat{}
 }
 
 // Beat records that the loop is still making progress.
@@ -87,15 +78,23 @@ func (h *Heartbeat) Age() time.Duration {
 	return age
 }
 
-// Stalled reports whether the last beat is older than deadline. A deadline of
-// zero or less disables the check, so an operator can turn the probe's
-// restart behaviour off without redeploying different code.
-func (h *Heartbeat) Stalled(deadline time.Duration) bool {
+// Stalled reports whether the last beat is older than deadline, along with the
+// age that decision was made on. A deadline of zero or less disables the check,
+// so an operator can turn the probe's restart behaviour off without redeploying
+// different code.
+//
+// The age is returned rather than left to a second Age call so a caller can
+// report the number the decision actually used. Reading twice would let the
+// loop beat in between and produce a message that contradicts its own verdict
+// — "has not made progress for 0s".
+func (h *Heartbeat) Stalled(deadline time.Duration) (age time.Duration, stalled bool) {
 	if deadline <= 0 {
-		return false
+		return 0, false
 	}
 
-	return h.Age() > deadline
+	age = h.Age()
+
+	return age, age > deadline
 }
 
 // SetLastBeatForTest forces the last-beat time. Test-only seam so a caller can

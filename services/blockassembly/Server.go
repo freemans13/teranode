@@ -192,9 +192,9 @@ func (ba *BlockAssembly) Health(ctx context.Context, checkLiveness bool) (int, s
 		// disabled (issue 1447).
 		if ba.blockAssembler != nil {
 			stallTimeout := ba.settings.BlockAssembly.LivenessStallTimeout
-			if ba.blockAssembler.heartbeat.Stalled(stallTimeout) {
+			if age, stalled := ba.blockAssembler.heartbeat.Stalled(stallTimeout); stalled {
 				return http.StatusServiceUnavailable,
-					fmt.Sprintf("block assembly main loop has not made progress for %s (limit %s)", ba.blockAssembler.heartbeat.Age().Truncate(time.Second), stallTimeout),
+					fmt.Sprintf("block assembly main loop has not made progress for %s (limit %s)", age, stallTimeout),
 					nil
 			}
 		}

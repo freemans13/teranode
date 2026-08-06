@@ -133,6 +133,13 @@ type BlockAssembler struct {
 	// (issue 1447)
 	heartbeat health.Heartbeat
 
+	// heartbeatInterval is how often the main loop's idle tick fires. It only
+	// needs to be comfortably shorter than any liveness timeout an operator
+	// would configure. Held per-assembler rather than as a package variable so
+	// a test that shrinks it cannot race another test's running loop.
+	// Set by NewBlockAssembler; read once when the loop starts.
+	heartbeatInterval time.Duration
+
 	// currentChainMap maps block hashes to their heights
 	currentChainMap map[chainhash.Hash]uint32
 
@@ -255,6 +262,7 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 		resetCh:             make(chan resetRequest, 2),
 		reconcileCh:         make(chan struct{}, 1),
 		currentRunningState: atomic.Value{},
+		heartbeatInterval:   defaultHeartbeatInterval,
 	}
 
 	b.setCurrentRunningState(StateStarting)
@@ -304,13 +312,10 @@ func (b *BlockAssembler) GetChainedSubtreesTotalSize() uint64 {
 	return b.subtreeProcessor.GetChainedSubtreesTotalSize()
 }
 
-// blockAssemblerHeartbeatInterval is how often the main loop's idle tick
-// fires. It only needs to be comfortably shorter than any liveness timeout an
-// operator would configure.
-// var, not const, so tests can shrink it — a test that must wait several real
-// tick intervals otherwise adds tens of seconds to the package run and pushes
-// unrelated timeout-bounded tests over their limits.
-var blockAssemblerHeartbeatInterval = 5 * time.Second
+// defaultHeartbeatInterval is the idle-tick period every assembler starts with.
+// Tests shrink the per-assembler field instead, so waiting several tick
+// intervals costs milliseconds rather than tens of seconds.
+const defaultHeartbeatInterval = 5 * time.Second
 
 // startChannelListeners initializes and starts all channel listeners for block assembly operations.
 // It handles blockchain notifications, mining candidate requests, and reset operations.
@@ -341,8 +346,8 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 	// a wedged one, so it would restart a healthy node. Warn rather than clamp:
 	// the operator chose the value and silently overriding it would hide the
 	// mistake (issue 1447).
-	if stallTimeout := b.settings.BlockAssembly.LivenessStallTimeout; stallTimeout > 0 && stallTimeout <= 2*blockAssemblerHeartbeatInterval {
-		b.logger.Warnf("[BlockAssembler] blockassembly_livenessStallTimeout %s is not comfortably longer than the %s heartbeat interval: a healthy idle node may be reported as wedged and restarted", stallTimeout, blockAssemblerHeartbeatInterval)
+	if stallTimeout := b.settings.BlockAssembly.LivenessStallTimeout; stallTimeout > 0 && stallTimeout <= 2*b.heartbeatInterval {
+		b.logger.Warnf("[BlockAssembler] blockassembly_livenessStallTimeout %s is not comfortably longer than the %s heartbeat interval: a healthy idle node may be reported as wedged and restarted", stallTimeout, b.heartbeatInterval)
 	}
 
 	b.wg.Add(1)
@@ -356,7 +361,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 		// A node with no blocks is healthy — on mainnet the gap between blocks
 		// is routinely tens of minutes — but a deadlocked loop cannot service
 		// the tick either, which is the freeze the liveness probe must catch.
-		heartbeatTicker := time.NewTicker(blockAssemblerHeartbeatInterval)
+		heartbeatTicker := time.NewTicker(b.heartbeatInterval)
 		defer heartbeatTicker.Stop()
 
 		// First beat happens HERE, not at construction: everything before this
