@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -981,6 +982,80 @@ func SetBlockStateContract(t *testing.T, db utxostore.Store) {
 	err := db.SetBlockState(0, 1700000042)
 	require.Error(t, err)
 	require.ErrorIs(t, err, errors.ErrInvalidArgument)
+}
+
+// SetBlockStateSnapshotUnderConcurrency pins the read side of the same
+// guarantee on a real store: GetBlockState must return a pair some single
+// writer actually published, never one assembled from two separate reads.
+//
+// The holder is already covered in isolation by TestBlockStateHolderSnapshot,
+// but nothing there stops a store's own GetBlockState from going back to two
+// independent atomic loads — which is exactly what issue 1443 was. That
+// regression would keep the sequential contract above green, because torn
+// pairs only appear while a writer is mid-update. So: one writer publishing
+// pairs with the fixed relation MedianTime == Height + 1000, readers checking
+// the relation holds on every snapshot they observe.
+//
+// Restores the prior block state on the way out, with the same height-zero
+// caveat as SetBlockStateContract.
+func SetBlockStateSnapshotUnderConcurrency(t *testing.T, db utxostore.Store) {
+	prior := db.GetBlockState()
+	if prior.Height > 0 {
+		defer func() {
+			require.NoError(t, db.SetBlockState(prior.Height, prior.MedianTime))
+		}()
+	}
+
+	const (
+		baseHeight = uint32(5_000_000)
+		iterations = uint32(20_000)
+		offset     = uint32(1000)
+	)
+
+	require.NoError(t, db.SetBlockState(baseHeight, baseHeight+offset))
+
+	var (
+		wg     sync.WaitGroup
+		tornMu sync.Mutex
+		torn   []utxostore.BlockState
+	)
+
+	stop := make(chan struct{})
+
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+
+				// Recorded and asserted after wg.Wait: testify's FailNow is only
+				// valid on the goroutine running the test.
+				if got := db.GetBlockState(); got.MedianTime != got.Height+offset {
+					tornMu.Lock()
+					torn = append(torn, got)
+					tornMu.Unlock()
+
+					return
+				}
+			}
+		}()
+	}
+
+	for i := baseHeight + 1; i <= baseHeight+iterations; i++ {
+		require.NoError(t, db.SetBlockState(i, i+offset))
+	}
+
+	close(stop)
+	wg.Wait()
+
+	require.Empty(t, torn, "GetBlockState returned torn pairs: %v", torn)
 }
 
 // SetLockedBehavior tests the SetLocked lifecycle:

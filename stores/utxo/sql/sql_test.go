@@ -1041,6 +1041,12 @@ func Test_SmokeTests(t *testing.T) {
 		tests.SetBlockStateContract(t, db)
 	})
 
+	t.Run("set block state snapshot under concurrency", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		tests.SetBlockStateSnapshotUnderConcurrency(t, db)
+	})
+
 	t.Run("set locked behavior", func(t *testing.T) {
 		db, _ := setup(ctx, t)
 
