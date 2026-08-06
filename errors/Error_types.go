@@ -198,8 +198,14 @@ func NewBlockInvalidBodyError(message string, params ...interface{}) *Error {
 // marked body-attributable rather than header-attributable. stderrors.As locates the next
 // *Error link (walking through any foreign wrappers); Unwrap then advances past each checked
 // link so every *Error in the chain is inspected.
+//
+// The walk is bounded by maxIsChainDepth for the same reason (*Error).Is is: each step costs
+// a reflection-based stderrors.As, and a pathologically deep chain (a mass spend failure on a
+// high-input-count tx produced chains tens of thousands of links deep) would otherwise turn
+// one classification call into an unbounded CPU burn.
 func IsBlockInvalidBody(err error) bool {
-	for cur := err; cur != nil; {
+	cur := err
+	for depth := 0; cur != nil && depth < maxIsChainDepth; depth++ {
 		var e *Error
 		if !stderrors.As(cur, &e) {
 			return false
