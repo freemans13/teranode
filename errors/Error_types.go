@@ -15,6 +15,7 @@ var (
 	ErrBlockCoinbaseMissingHeight = New(ERR_BLOCK_COINBASE_MISSING_HEIGHT, "the coinbase signature script doesn't have the block height")
 	ErrBlockError                 = New(ERR_BLOCK_ERROR, "block error")
 	ErrBlockExists                = New(ERR_BLOCK_EXISTS, "block exists")
+	ErrBlockHeaderContext         = New(ERR_BLOCK_HEADER_CONTEXT, "block header context invalid")
 	ErrBlockIncomplete            = New(ERR_BLOCK_INCOMPLETE, "block incomplete")
 	ErrBlockInvalid               = New(ERR_BLOCK_INVALID, "block invalid")
 	ErrBlockInvalidFormat         = New(ERR_BLOCK_INVALID_FORMAT, "block format is invalid")
@@ -99,6 +100,21 @@ func NewNotFoundError(message string, params ...interface{}) *Error {
 // NewProcessingError creates a new error with the processing error code.
 func NewProcessingError(message string, params ...interface{}) *Error {
 	return New(ERR_PROCESSING, message, params...)
+}
+
+// NewBlockHeaderContextError creates a new error for a block whose header could not be evaluated
+// because the CHAIN CONTEXT supplied alongside it was wrong — the parent-header run was not
+// anchored at the block's parent, was not a linked chain, or was too short to hold the
+// median-time-past window. It says nothing about the block itself, so it must never be turned
+// into a block-invalid verdict or charged to the peer that served the block.
+//
+// It wraps ErrProcessing so the existing transient/infrastructure handling (which matches on
+// ErrProcessing) keeps treating it as retryable, while callers that need to distinguish a local
+// context failure from a generic processing error can match this code specifically.
+func NewBlockHeaderContextError(message string, params ...interface{}) *Error {
+	params = append(params, ErrProcessing)
+
+	return New(ERR_BLOCK_HEADER_CONTEXT, message, params...)
 }
 
 // NewConfigurationError creates a new error with the configuration error code.

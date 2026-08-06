@@ -1397,6 +1397,20 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 		if errors.Is(err, errors.ErrBlockIncomplete) {
 			return nil, errors.WrapGRPC(errors.NewBlockIncompleteError("[ValidateBlock][%s] block validation hit transient missing-data state: %s", block.Hash().String(), err))
 		}
+
+		// Infrastructure failures are not verdicts on the block: a storage/service outage, or a
+		// parent-header run from our own store that was unanchored or unlinked (issue #1467),
+		// says nothing about consensus validity. Relabelling them "block is not valid" tells an
+		// operator running cmd/checkblock that a perfectly good block is consensus-invalid.
+		//
+		// Deliberately NOT a blanket ErrProcessing pass-through: block.Valid reports genuine
+		// consensus failures as processing errors too (model/Block.go's target-difficulty check,
+		// for one), so passing all of them through would mislabel real invalid blocks as
+		// infrastructure trouble — the mirror image of the bug being fixed here.
+		if errors.Is(err, errors.ErrStorageError) || errors.Is(err, errors.ErrServiceError) || errors.Is(err, errors.ErrBlockHeaderContext) {
+			return nil, errors.WrapGRPC(err)
+		}
+
 		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err))
 	}
 

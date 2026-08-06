@@ -516,15 +516,22 @@ const medianTimeBlocks = settings.MedianTimeSpan
 // caller-supplied slice, so an unlinked run has to be detected explicitly.
 func verifyMedianWindowLinkage(window []*BlockHeader, newestFirst bool) error {
 	for i := 0; i < len(window)-1; i++ {
-		child, parent := window[i], window[i+1]
+		childIdx, parentIdx := i, i+1
 		if !newestFirst {
-			child, parent = window[i+1], window[i]
+			childIdx, parentIdx = i+1, i
 		}
 
-		// Hashing a header whose HashPrevBlock is nil panics (BlockHeader.Bytes clones it
-		// unguarded), so report the position rather than the hash.
-		if child.HashPrevBlock == nil {
-			return errors.NewProcessingError("header at window position %d carries no parent hash", i)
+		child, parent := window[childIdx], window[parentIdx]
+
+		// Both headers get hashed below, and BlockHeader.Bytes clones HashPrevBlock and
+		// HashMerkleRoot without guarding either, so a header missing one panics. Report the
+		// position instead — the offending header cannot be named by hash.
+		if !hashableHeader(child) {
+			return errors.NewProcessingError("header at window position %d is missing a hash field", childIdx)
+		}
+
+		if !hashableHeader(parent) {
+			return errors.NewProcessingError("header at window position %d is missing a hash field", parentIdx)
 		}
 
 		if !child.HashPrevBlock.IsEqual(parent.Hash()) {
@@ -533,6 +540,14 @@ func verifyMedianWindowLinkage(window []*BlockHeader, newestFirst bool) error {
 	}
 
 	return nil
+}
+
+// hashableHeader reports whether bh can be hashed without panicking. BlockHeader.Bytes clones
+// HashPrevBlock and HashMerkleRoot with no nil guard, so a hand-built header missing either
+// takes down the caller. Headers from NewBlockHeaderFromBytes and from the store always
+// populate both; this covers everything else.
+func hashableHeader(bh *BlockHeader) bool {
+	return bh != nil && bh.HashPrevBlock != nil && bh.HashMerkleRoot != nil
 }
 
 // CheckHeaderContextual runs the header checks whose outcome depends on wall-clock time
@@ -596,7 +611,7 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 		// anchored at all. Reject before the switch: the fall-through error below formats the
 		// block, and hashing a header whose HashPrevBlock is nil panics.
 		if b.Header.HashPrevBlock == nil {
-			return errors.NewProcessingError("[BLOCK] block header carries no parent hash, cannot evaluate median time past")
+			return errors.NewBlockHeaderContextError("[BLOCK] block header carries no parent hash, cannot evaluate median time past")
 		}
 
 		var (
@@ -605,24 +620,24 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 		)
 
 		switch {
-		case currentChain[0] != nil && currentChain[0].Hash().IsEqual(b.Header.HashPrevBlock):
+		case hashableHeader(currentChain[0]) && currentChain[0].Hash().IsEqual(b.Header.HashPrevBlock):
 			// newest-first (GetBlockHeaders order): the parent and its predecessors lead the run
 			lastTimeStamps = currentChain[:pruneLength]
 			newestFirst = true
-		case currentChain[currentChainLength-1] != nil && currentChain[currentChainLength-1].Hash().IsEqual(b.Header.HashPrevBlock):
+		case hashableHeader(currentChain[currentChainLength-1]) && currentChain[currentChainLength-1].Hash().IsEqual(b.Header.HashPrevBlock):
 			// oldest-first: the parent and its predecessors end the run
 			lastTimeStamps = currentChain[currentChainLength-pruneLength:]
 		default:
 			// The supplied run is not this block's parent chain: a context error on the caller's
 			// side, not proof the block is invalid — do not mark the block bad for it.
-			return errors.NewProcessingError("[BLOCK][%s] currentChain (%d headers) is not anchored at the block's parent %s, cannot evaluate median time past", b.String(), currentChainLength, b.Header.HashPrevBlock.String())
+			return errors.NewBlockHeaderContextError("[BLOCK][%s] currentChain (%d headers) is not anchored at the block's parent %s, cannot evaluate median time past", b.String(), currentChainLength, b.Header.HashPrevBlock.String())
 		}
 
 		prevTimeStamps := make([]time.Time, pruneLength)
 
 		for i, bh := range lastTimeStamps {
 			if bh == nil {
-				return errors.NewProcessingError("[BLOCK][%s] nil header in the median-time-past window", b.String())
+				return errors.NewBlockHeaderContextError("[BLOCK][%s] nil header in the median-time-past window", b.String())
 			}
 
 			prevTimeStamps[i] = time.Unix(int64(bh.Timestamp), 0)
@@ -636,7 +651,7 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 		// simply held fewer headers yields a median over fewer than 11 blocks while the chain
 		// behind it is long. Either way the median silently stops being the consensus one.
 		if err := verifyMedianWindowLinkage(lastTimeStamps, newestFirst); err != nil {
-			return errors.NewProcessingError("[BLOCK][%s] median-time-past window is not a linked chain", b.String(), err)
+			return errors.NewBlockHeaderContextError("[BLOCK][%s] median-time-past window is not a linked chain", b.String(), err)
 		}
 
 		if pruneLength < medianTimeBlocks {
@@ -646,7 +661,7 @@ func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *set
 			}
 
 			if oldest.HashPrevBlock == nil || !oldest.HashPrevBlock.IsEqual(&chainhash.Hash{}) {
-				return errors.NewProcessingError("[BLOCK][%s] median-time-past window holds only %d headers and does not reach genesis, cannot evaluate median time past", b.String(), pruneLength)
+				return errors.NewBlockHeaderContextError("[BLOCK][%s] median-time-past window holds only %d headers and does not reach genesis, cannot evaluate median time past", b.String(), pruneLength)
 			}
 		}
 

@@ -437,6 +437,19 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			isPeerError = false
 			reportIncompleteBlock = true
 			incompleteBlockHash = ctx.incompleteBlockHash
+		case errors.Is(*err, errors.ErrBlockHeaderContext):
+			// The parent-header run our own store returned was not anchored at the block's
+			// parent, was not linked, or was too short for the median-time-past window (issue
+			// #1467). Purely local: the serving peer had no part in producing it, so charging it
+			// would demote an honest peer and tear down the session over our own state. Same
+			// reasoning as the 1368 and 1031 fixes above.
+			//
+			// Deliberately NOT a blanket ErrProcessing case: this switch's own
+			// TestReleaseCatchupLock_DrainChargesPrimaryEvenOnMixedCycle uses a bare
+			// NewProcessingError as its example of a generic PEER error, so suppressing all
+			// processing errors here would stop charging peers that deserve it.
+			errorType = "local_header_context_error"
+			isPeerError = false
 		}
 
 		ctx.failedPeersMu.Lock()

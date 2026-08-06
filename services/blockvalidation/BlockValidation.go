@@ -1579,7 +1579,17 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] block conflicts with hardcoded checkpoint", block.Hash().String(), err)
 		}
 
-		// Use cached headers if available (during catchup), otherwise fetch from blockchain
+		// Use cached headers if available (during catchup), otherwise fetch from blockchain.
+		//
+		// NOTE: the cached run must not be used for the median-time-past window.
+		// HeaderChainCache.collectPreviousHeaders returns only the headers preceding the block
+		// WITHIN the batch, so blocks 2..11 of a batch get a 1..10-header run whose oldest entry
+		// is the common ancestor rather than genesis — too short to evaluate the rule against,
+		// and CheckHeaderContextual rejects it as such (issue #1467). Today that never happens
+		// because every caller passing CachedHeaders also sets DisableOptimisticMining, and the
+		// non-optimistic branch below re-fetches a full run from the store. Anything that changes
+		// either of those must first make the cache top up short windows from the store — see
+		// issue #1499.
 		var blockHeaders []*model.BlockHeader
 		if opts.CachedHeaders != nil && len(opts.CachedHeaders) > 0 {
 			// Use provided cached headers
@@ -1764,6 +1774,15 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					return errors.NewBlockInvalidError("[ValidateBlock][%s] block header failed contextual validation", block.Header.Hash().String(), err)
 				}
 
+				// Anything else is a local header-context failure, not the block's fault: the
+				// parent-header run we supplied was unanchored, unlinked or too short (issue
+				// #1467). GetBlockHeaders' fast path probes on_main_chain/height and then
+				// range-scans in a separate statement, so a reorg landing between the two can
+				// hand back somebody else's chain. The block has not been added yet, so
+				// returning here would drop it until a peer re-announces — re-queue instead,
+				// matching the header-fetch failures above.
+				u.ReValidateBlock(block, baseURL)
+
 				return err
 			}
 
@@ -1887,7 +1906,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// get all 100 previous block headers on the main chain
 			u.logger.Infof(logValidateBlockGetBlockHeaders, block.Header.Hash().String())
 
-			blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, 100)
+			blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, u.settings.BlockValidation.PreviousBlockHeaderCount)
 			if err != nil {
 				u.logger.Errorf("[ValidateBlock][%s] failed to get block headers: %s", block.String(), err)
 				u.ReValidateBlock(block, baseURL)
@@ -1923,6 +1942,12 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				if errors.Is(err, errors.ErrStorageError) ||
 					errors.Is(err, errors.ErrServiceError) ||
 					errors.Is(err, errors.ErrProcessing) {
+					// Transient by definition, and the block was never added — dropping it here
+					// leaves it lost until a peer re-announces. Re-queue so it is retried once
+					// the underlying condition clears (issue #1467: CheckHeaderContextual now
+					// reports an unanchored/unlinked/short parent-header run this way).
+					u.ReValidateBlock(block, baseURL)
+
 					return err
 				}
 
