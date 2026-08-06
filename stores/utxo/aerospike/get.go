@@ -1154,18 +1154,24 @@ func processSubtreeIdxs(bins aerospike.BinMap) ([]int, error) {
 
 // classifyUTXOReadError decides what class of error a failed UTXO read carries.
 //
-// A failed or torn read of our own records is this node's storage being wrong.
-// It says nothing about the transaction, so it must keep its storage class:
-// ErrTxInvalid is a consensus verdict — isUnvalidatablePeerError treats it as a
+// ErrTxInvalid is a consensus verdict: isUnvalidatablePeerError treats it as a
 // genuine consensus failure, so ValidateBlock persists the block as permanently
-// invalid and flags the peer that served it. Local disk damage must never
-// condemn a valid block or blame an innocent peer.
+// invalid and flags the peer that served it. Nothing processUTXOs can discover
+// justifies that. It only decodes a record this node wrote itself, so every way
+// it can fail — a torn record, a failed fetch, a cancelled context, a key that
+// would not build — means our own read went wrong, never that the transaction
+// or the peer is at fault.
+//
+// So the rule is to preserve whatever class the error already carries, and hand
+// out a consensus verdict only for an error that already is one. That keeps
+// routine runtime events, above all context cancellation at shutdown, from
+// permanently condemning a valid block.
 func classifyUTXOReadError(err error) error {
-	if errors.Is(err, errors.ErrStorageError) {
-		return err
+	if errors.Is(err, errors.ErrTxInvalid) {
+		return errors.NewTxInvalidError("could not process utxos", err)
 	}
 
-	return errors.NewTxInvalidError("could not process utxos", err)
+	return err
 }
 
 // processUTXOs extracts and processes UTXO data from Aerospike bins.
@@ -1194,7 +1200,11 @@ func (s *Store) processUTXOs(ctx context.Context, txid *chainhash.Hash, bins aer
 
 	utxos, ok := bins[fields.Utxos.String()].([]interface{})
 	if !ok {
-		return nil, errors.NewTxInvalidError("missing utxos")
+		// Every record this store writes carries a utxos bin, so a missing or
+		// wrong-typed one is our own record being malformed — storage damage, not
+		// evidence about the transaction. The extra-record reader classifies the
+		// identical condition the same way.
+		return nil, errors.NewStorageError("[processUTXOs] missing or malformed utxos bin (%T) on %s — torn or partially-applied record", bins[fields.Utxos.String()], txid.String())
 	}
 
 	spendingDatas := make([]*spendpkg.SpendingData, totalUtxos)

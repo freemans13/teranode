@@ -185,8 +185,24 @@ func TestClassifyUTXOReadError(t *testing.T) {
 		require.False(t, errors.Is(err, errors.ErrTxInvalid), "storage damage must not become a consensus verdict")
 	})
 
-	t.Run("anything else becomes tx invalid", func(t *testing.T) {
-		err := classifyUTXOReadError(errors.NewProcessingError("bad utxo hash"))
+	t.Run("a cancelled context is not a consensus verdict", func(t *testing.T) {
+		// getAllExtraUTXOs returns ctx.Err() unwrapped, and processUTXOs passes it
+		// straight up. Shutting a node down mid-read must not permanently invalidate
+		// a valid block or flag the peer that served it.
+		require.False(t, errors.Is(classifyUTXOReadError(context.Canceled), errors.ErrTxInvalid))
+		require.False(t, errors.Is(classifyUTXOReadError(context.DeadlineExceeded), errors.ErrTxInvalid))
+		require.ErrorIs(t, classifyUTXOReadError(context.Canceled), context.Canceled)
+	})
+
+	t.Run("a processing error is not a consensus verdict", func(t *testing.T) {
+		err := classifyUTXOReadError(errors.NewProcessingError("failed to create key for extra record"))
+
+		require.True(t, errors.Is(err, errors.ErrProcessing))
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
+	})
+
+	t.Run("an error that already is a consensus verdict stays one", func(t *testing.T) {
+		err := classifyUTXOReadError(errors.NewTxInvalidError("genuinely invalid"))
 
 		require.True(t, errors.Is(err, errors.ErrTxInvalid))
 	})
