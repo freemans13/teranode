@@ -93,7 +93,11 @@ func TestFetchAndStoreSubtreeData_NonCanonicalEncoding(t *testing.T) {
 		err := server.fetchAndStoreSubtreeData(ctx, testBlock, subtreeHash, st, peerID, baseURL, false)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "non-canonical subtree data")
-		require.True(t, errors.Is(err, errors.ErrTxInvalid))
+		require.True(t, errors.Is(err, errors.ErrProcessing))
+		// Must NOT be ErrTxInvalid: that routes to storeInvalidBlock and would
+		// permanently invalidate a valid block over a delivery-level fault,
+		// while isUnvalidatablePeerError stopped us trying another source.
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
 
 		// The canonicalised form must NOT have been written: storing it would
 		// discard the evidence and bless a subtree SV Node rejects at parse.

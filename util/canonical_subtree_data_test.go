@@ -23,7 +23,10 @@ func TestCheckCanonicalSubtreeData(t *testing.T) {
 		err := CheckCanonicalSubtreeData(int64(len(payload))+2, payload, nil)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "not canonically encoded")
-		require.True(t, errors.Is(err, errors.ErrTxInvalid))
+		require.True(t, errors.Is(err, errors.ErrProcessing))
+		// Must NOT be ErrTxInvalid: that routes to storeInvalidBlock and would
+		// permanently invalidate a valid block over a delivery-level fault.
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
 	})
 
 	// The first subtree of a block carries a coinbase the parser consumes but

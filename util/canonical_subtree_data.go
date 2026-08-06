@@ -35,7 +35,14 @@ func (c *CountingReader) BytesConsumed() int64 {
 }
 
 // CanonicalTxSize returns the size of tx in the serialization it actually uses,
-// without serializing it.
+// without serializing it. tx must be non-nil.
+//
+// Note one go-bt quirk: bt.Tx.IsExtended reports false for an extended
+// transaction with no inputs (it tests tx.Inputs == nil before the extended
+// flag), so such a transaction is measured in its standard form and a caller
+// comparing against consumed wire bytes sees a mismatch. Harmless in practice —
+// a transaction with no inputs is consensus-invalid regardless — but it means
+// the rejection reason can misattribute for that one shape.
 func CanonicalTxSize(tx *bt.Tx) int {
 	if tx.IsExtended() {
 		return ExtendedTxSize(tx)
@@ -67,6 +74,18 @@ func CanonicalTxSize(tx *bt.Tx) int {
 // the consumed count legitimately exceeds the serialized length by exactly the
 // coinbase. Its canonical size is added rather than the consumed bytes being
 // ignored, so a non-minimal coinbase is still caught.
+//
+// The failure is a ProcessingError, deliberately NOT a TxInvalidError, and must
+// stay that way. Non-minimality is a property of the DELIVERY, not of the block:
+// because go-bt canonicalizes, the txids and therefore the merkle root are
+// identical either way, so the same subtree fetched from an honest peer
+// validates fine. ErrTxInvalid would route to BlockValidation.go's
+// storeInvalidBlock and mark a perfectly valid block permanently invalid,
+// surviving restart, and isUnvalidatablePeerError would stop us trying another
+// source — handing any peer we fetch subtree data from a cheap way to poison a
+// valid block. Wrapping does not contain the code either: errors.Is walks the
+// chain by code, so a TxInvalidError inside a ProcessingError still matches
+// ErrTxInvalid.
 func CheckCanonicalSubtreeData(consumed int64, serialized []byte, omittedCoinbase *bt.Tx) error {
 	canonicalSize := int64(len(serialized))
 	if omittedCoinbase != nil {
@@ -74,7 +93,7 @@ func CheckCanonicalSubtreeData(consumed int64, serialized []byte, omittedCoinbas
 	}
 
 	if consumed != canonicalSize {
-		return errors.NewTxInvalidError("subtree data is not canonically encoded: %d wire bytes for a %d-byte canonical serialization (non-minimal CompactSize prefix)", consumed, canonicalSize)
+		return errors.NewProcessingError("subtree data is not canonically encoded: %d wire bytes for a %d-byte canonical serialization (non-minimal CompactSize prefix)", consumed, canonicalSize)
 	}
 
 	return nil

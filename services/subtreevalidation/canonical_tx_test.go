@@ -56,7 +56,10 @@ func TestCheckCanonicalTxEncoding(t *testing.T) {
 		err = checkCanonicalTxEncoding(tx, int64(len(raw)))
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "not canonically encoded")
-		require.True(t, errors.Is(err, errors.ErrTxInvalid))
+		require.True(t, errors.Is(err, errors.ErrProcessing))
+		// Must NOT be ErrTxInvalid: that routes to storeInvalidBlock and would
+		// permanently invalidate a valid block over a delivery-level fault.
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
 	})
 
 	t.Run("eight-byte form of a one-byte count is rejected", func(t *testing.T) {

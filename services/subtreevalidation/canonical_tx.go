@@ -29,6 +29,18 @@ import (
 // the canonical form — that would let a malformed transaction change identity
 // mid-flight; reject it.
 //
+// The failure is a ProcessingError, deliberately NOT a TxInvalidError, and
+// must stay that way. Non-minimality is a property of the DELIVERY, not of the
+// block: because go-bt canonicalizes, the txids and therefore the merkle root
+// are identical either way, so the same subtree fetched from an honest peer
+// validates fine. ErrTxInvalid would route to BlockValidation.go's
+// storeInvalidBlock and mark a perfectly valid block permanently invalid,
+// surviving restart, and isUnvalidatablePeerError would stop us trying another
+// source — handing any peer we fetch subtree data from a cheap way to poison a
+// valid block. Wrapping does not contain the code either: errors.Is walks the
+// chain by code, so a TxInvalidError inside a ProcessingError still matches
+// ErrTxInvalid.
+//
 // Subtree data may carry EXTENDED transactions (each input also carrying its
 // parent's satoshis and locking script), which serialize longer than tx.Size()
 // reports — a subtree-data file written from parsed transactions keeps whatever
@@ -47,7 +59,7 @@ func checkCanonicalTxEncoding(tx *bt.Tx, bytesRead int64) error {
 	canonicalSize := int64(util.CanonicalTxSize(tx))
 
 	if bytesRead != canonicalSize {
-		return errors.NewTxInvalidError("transaction %s is not canonically encoded: %d wire bytes for a %d-byte canonical serialization (non-minimal CompactSize prefix)", tx.TxIDChainHash().String(), bytesRead, canonicalSize)
+		return errors.NewProcessingError("transaction %s is not canonically encoded: %d wire bytes for a %d-byte canonical serialization (non-minimal CompactSize prefix)", tx.TxIDChainHash().String(), bytesRead, canonicalSize)
 	}
 
 	return nil
