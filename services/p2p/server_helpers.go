@@ -112,7 +112,7 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 	// hash.String() from block validation, so keying by the raw message string
 	// would let a peer evade the invalid-block ban by announcing a
 	// non-canonical hex form (uppercase, truncated).
-	s.storePeerMapEntry(&s.blockPeerMap, hash.String(), fromID, now, "block")
+	s.storePeerMapEntry(&s.blockPeerMap, hash.String(), fromID, now)
 
 	s.logger.Debugf("[handleBlockTopic] storing peer %s for block %s", fromID, blockMessage.Hash)
 
@@ -245,7 +245,7 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, fromID string) 
 	// string so the ReportInvalidSubtree lookup (which uses hash.String() from
 	// subtree validation) matches even when the announcer sent a non-canonical
 	// hex form.
-	s.storePeerMapEntry(&s.subtreePeerMap, hash.String(), fromID, now, "subtree")
+	s.storePeerMapEntry(&s.subtreePeerMap, hash.String(), fromID, now)
 	s.logger.Debugf("[handleSubtreeTopic] storing peer %s for subtree %s", fromID, subtreeMessage.Hash)
 
 	if s.subtreeKafkaProducerClient != nil { // tests may not set this
@@ -1144,7 +1144,7 @@ func (s *Server) shouldSkipUnhealthyPeer(from string, messageType string) bool {
 // bounded inline (issue 1409): at capacity the OLDEST entry is evicted, so a
 // distinct-hash flood cannot grow memory without bound between sweeps and
 // cannot suppress attribution for the announcement arriving next.
-func (s *Server) storePeerMapEntry(peerMap *cappedPeerMap, hash string, from string, timestamp time.Time, _ string) {
+func (s *Server) storePeerMapEntry(peerMap *cappedPeerMap, hash string, from string, timestamp time.Time) {
 	peerMap.Store(hash, peerMapEntry{
 		peerID:    from,
 		timestamp: timestamp,

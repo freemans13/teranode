@@ -68,13 +68,13 @@ func TestStorePeerMapEntryKeepsAttributionUnderFlood(t *testing.T) {
 
 	now := time.Now()
 	for i := 0; i < 200; i++ {
-		s.storePeerMapEntry(&s.blockPeerMap, fmt.Sprintf("%064d", i), "attacker", now, "block")
+		s.storePeerMapEntry(&s.blockPeerMap, fmt.Sprintf("%064d", i), "attacker", now)
 	}
 
 	require.Equal(t, 20, s.blockPeerMap.Len(), "gossip inserts must not grow the map past the cap")
 
 	realHash := fmt.Sprintf("%064d", 999999)
-	s.storePeerMapEntry(&s.blockPeerMap, realHash, "peer-to-ban", now, "block")
+	s.storePeerMapEntry(&s.blockPeerMap, realHash, "peer-to-ban", now)
 
 	peerID, err := s.getPeerFromMap(&s.blockPeerMap, realHash, "block")
 	require.NoError(t, err, "the ban path must still find the announcing peer after a flood")
