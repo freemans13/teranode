@@ -56,6 +56,8 @@ package aerospike
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"runtime/debug"
 	"sync/atomic"
@@ -1122,7 +1124,7 @@ func (s *Store) storeExternallyWithLock(
 	}
 
 	// Acquire lock FIRST to prevent duplicate work
-	lockKey, err := s.acquireLock(bItem.txHash, len(binsToStore))
+	lockKey, lockToken, err := s.acquireLock(bItem.txHash, len(binsToStore))
 	if err != nil {
 		bItem.complete(err)
 		return
@@ -1132,7 +1134,7 @@ func (s *Store) storeExternallyWithLock(
 	// The creating bin in each record prevents UTXO spending until cleared
 	// Failed creations leave partial records for the next attempt to "finish off"
 	defer func() {
-		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
+		if releaseErr := s.releaseLock(lockKey, lockToken); releaseErr != nil {
 			s.logger.Warnf("[%s] Failed to release lock: %v", funcName, releaseErr)
 		}
 	}()
@@ -1286,12 +1288,26 @@ func calculateLockTTL(numRecords int) uint32 {
 	return ttl
 }
 
+// generateLockToken returns a fresh, random 16-byte token, hex-encoded, that uniquely
+// identifies one acquisition of the creation lock. It is written into the lock record
+// so that release can later prove it is deleting the lock it created, rather than a
+// different writer's lock that was created after this one's TTL expired.
+func generateLockToken() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", errors.NewProcessingError("failed to generate lock token", err)
+	}
+
+	return hex.EncodeToString(buf), nil
+}
+
 // acquireLock creates and acquires the lock record for transaction creation
-// Returns the lock key on success, or error if lock acquisition fails
-func (s *Store) acquireLock(txHash *chainhash.Hash, numRecords int) (*aerospike.Key, error) {
+// Returns the lock key and the token identifying this acquisition on success, or error
+// if lock acquisition fails
+func (s *Store) acquireLock(txHash *chainhash.Hash, numRecords int) (*aerospike.Key, string, error) {
 	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(txHash))
 	if err != nil {
-		return nil, errors.NewProcessingError("failed to create lock key", err)
+		return nil, "", errors.NewProcessingError("failed to create lock key", err)
 	}
 
 	lockTTL := calculateLockTTL(numRecords)
@@ -1301,35 +1317,66 @@ func (s *Store) acquireLock(txHash *chainhash.Hash, numRecords int) (*aerospike.
 
 	hostname, _ := os.Hostname()
 
+	token, tokenErr := generateLockToken()
+	if tokenErr != nil {
+		return nil, "", tokenErr
+	}
+
 	lockBins := []*aerospike.Bin{
 		aerospike.NewBin("created_at", time.Now().Unix()),
 		aerospike.NewBin("lock_type", "tx_creation"),
 		aerospike.NewBin("process_id", os.Getpid()),
 		aerospike.NewBin("hostname", hostname),
 		aerospike.NewBin("expected_recs", numRecords),
+		aerospike.NewBin("lock_token", token),
 	}
 
 	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
 	if err != nil {
 		aErr, ok := err.(*aerospike.AerospikeError)
 		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
-			return nil, errors.NewTxExistsError("transaction creation in progress or already exists: %s", txHash)
+			return nil, "", errors.NewTxExistsError("transaction creation in progress or already exists: %s", txHash)
 		}
 
-		return nil, errors.NewProcessingError("failed to acquire lock", err)
+		return nil, "", errors.NewProcessingError("failed to acquire lock", err)
 	}
 
-	return lockKey, nil
+	return lockKey, token, nil
 }
 
-// releaseLock deletes the lock record
-func (s *Store) releaseLock(lockKey *aerospike.Key) error {
+// releaseLock deletes the lock record, but only if it still carries the token this
+// caller was given when it acquired the lock.
+//
+// What this fences against: a writer that stalls past the lock's TTL loses the lock
+// silently - Aerospike expires the record regardless of whether the stalled writer is
+// still "holding" it in its own head. A second writer can then CREATE_ONLY a fresh lock
+// record for the same key. Without the token check, the first writer's deferred release
+// would delete that second writer's live lock by key alone, letting a third writer in
+// while the second still believes it holds the lock. The FilterExpression makes the
+// delete conditional on lock_token still matching what THIS acquisition wrote, so a
+// stale release becomes a no-op (FILTERED_OUT) instead of evicting someone else's lock.
+//
+// What this does NOT fence against: the token check only protects the lock record
+// itself from cross-writer deletion. It does nothing to stop two writers from both
+// believing they hold the lock and racing to create the same transaction's records at
+// the same time - that race is bounded separately, by the per-record CREATE_ONLY writes
+// (which Aerospike settles server-side, so only one writer's put can win each record)
+// and by the master-record-owns-mined-state fix already on this branch
+// (classifyCreateBatchResults / isKeyExists).
+func (s *Store) releaseLock(lockKey *aerospike.Key, token string) error {
 	policy := util.GetAerospikeWritePolicy(s.settings, 0)
+	policy.FilterExpression = aerospike.ExpEq(aerospike.ExpStringBin("lock_token"), aerospike.ExpStringVal(token))
 
 	_, err := s.client.Delete(policy, lockKey)
 	if err != nil {
 		aErr, ok := err.(*aerospike.AerospikeError)
 		if ok && aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
+			s.logger.Debugf("[releaseLock] Lock record for key %v already gone (expired or already released)", lockKey)
+			return nil
+		}
+
+		if ok && aErr.ResultCode == types.FILTERED_OUT {
+			s.logger.Debugf("[releaseLock] Lock record for key %v is now held by a different token; not ours to delete", lockKey)
 			return nil
 		}
 
