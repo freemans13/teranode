@@ -27,6 +27,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/health"
 	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/gocore"
@@ -126,6 +127,11 @@ type BlockAssembler struct {
 	// Protected by stateChangeMu to prevent race conditions
 	stateChangeMu sync.RWMutex
 	stateChangeCh chan BestBlockInfo
+
+	// heartbeat records that the main select loop is still being serviced, so
+	// the liveness probe can distinguish a wedged assembler from an idle one
+	// (issue 1447)
+	heartbeat *health.Heartbeat
 
 	// currentChainMap maps block hashes to their heights
 	currentChainMap map[chainhash.Hash]uint32
@@ -237,6 +243,7 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 
 	b := &BlockAssembler{
 		logger:              logger,
+		heartbeat:           health.New(),
 		stats:               stats.NewStat("BlockAssembler"),
 		settings:            tSettings,
 		utxoStore:           utxoStore,
@@ -303,6 +310,12 @@ func (b *BlockAssembler) GetChainedSubtreesTotalSize() uint64 {
 //
 // Parameters:
 //   - ctx: Context for cancellation
+//
+// blockAssemblerHeartbeatInterval is how often the main loop's idle tick
+// fires. It only needs to be comfortably shorter than any liveness timeout an
+// operator would configure.
+const blockAssemblerHeartbeatInterval = 5 * time.Second
+
 func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) {
 	// start a subscription for the best block header and the FSM state
 	// this will be used to reset the subtree processor when a new block is mined
@@ -324,13 +337,26 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 		// variables are defined here to prevent unnecessary allocations
 		b.setCurrentRunningState(StateRunning)
 
+		// Beat on every pass of the select, including the idle tick below: this
+		// records that the loop can still be SERVICED, not that work arrived.
+		// A node with no blocks is healthy — on mainnet the gap between blocks
+		// is routinely tens of minutes — but a deadlocked loop cannot service
+		// the tick either, which is the freeze the liveness probe must catch.
+		heartbeatTicker := time.NewTicker(blockAssemblerHeartbeatInterval)
+		defer heartbeatTicker.Stop()
+
 		for {
+			b.heartbeat.Beat()
+
 			select {
 			case <-ctx.Done():
 				b.logger.Infof("Stopping blockassembler as ctx is done")
 				// Note: We don't close blockchainSubscriptionCh here because we don't own it -
 				// it's created by the blockchain client's Subscribe method
 				return
+
+			case <-heartbeatTicker.C:
+				// Idle tick: proves the loop is alive without requiring work.
 
 			case resetReq := <-b.resetCh:
 				b.setCurrentRunningState(StateResetting)
