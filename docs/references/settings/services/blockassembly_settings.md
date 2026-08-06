@@ -72,6 +72,8 @@ Three settings bound that work:
   its own. The two are deliberately the same number: there is no value in detecting a
   divergence deeper than the node is willing to fix automatically. A clean boot costs
   two store reads per height in the window; the scan stops at the first miss.
+  A second, non-configurable bound applies underneath it — see the safety floor below —
+  so with the default settings the effective reach is the coinbase-maturity window.
 - `blockassembly_coinbaseRecoveryConsecutiveGood` guards against under-repair. The
   fast-forward create loop runs one goroutine per block, so a crash can leave a
   present coinbase sitting above still-missing ones. Stopping the walk-back at the
@@ -82,9 +84,30 @@ Three settings bound that work:
   between them. A gap larger than the cap is structural and escalates straight away
   without spending retries on it.
 
-Detection coverage is a bounded window, not the whole chain. A hole further below the
-tip than `coinbaseRecoveryMaxGapBlocks` is not found at startup; detecting that
-cheaply during normal operation is separate, future work.
+### The safety floor
+
+Recovery never looks further back than the coinbase-maturity window, no matter how
+the settings above are tuned. This is a correctness limit rather than a performance
+one, and it is worth understanding because it is what keeps the repair safe.
+
+"No coinbase in the UTXO store" is an ambiguous observation. It is true of a coinbase
+that was never created — the divergence being repaired — but it is equally true of one
+that was created, matured, fully spent, and then deleted by the pruner. Both look
+identical to a lookup. Re-creating the second kind would put outputs that were already
+legitimately spent back into the UTXO set as unspent, which is a far worse problem
+than the wedge this feature exists to fix.
+
+Coinbase maturity separates the two cases cleanly. A coinbase cannot be spent until
+maturity blocks have been built on top of it, and an unspent output is never marked
+for deletion, so it is never pruned. Above `tip - CoinbaseMaturity`, therefore, absence
+can only mean "never created". Below it, the answer is unknowable from a lookup alone,
+so the walk stops rather than guessing. If a genuine divergence extends past that line,
+recovery escalates to an operator instead of repairing it.
+
+Detection coverage is consequently a bounded window, not the whole chain. A hole
+further below the tip than the smaller of `coinbaseRecoveryMaxGapBlocks` and the
+maturity window is not found at startup; detecting that cheaply during normal
+operation is separate, future work.
 
 When recovery cannot fix a divergence it logs a single `MANUAL INTERVENTION REQUIRED`
 line naming `resetblockassembly`, and increments the `escalated` outcome on the

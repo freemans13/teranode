@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	utxostoresql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
@@ -27,7 +28,12 @@ import (
 // processCoinbaseUtxos() which needs a non-nil utxoStore.
 // NewBlockAssembler passes the utxoStore through to its internal SubtreeProcessor,
 // so no separate SubtreeProcessor construction is needed.
-func setupBlockAssemblyTestWithUtxoStore(t *testing.T) *baTestItems {
+// withSettings, if supplied, is applied to the test settings before any store
+// or client is constructed. Mutating settings after this helper returns is not
+// safe: the blockchain SQL store starts a background goroutine at construction
+// that reads ChainCfgParams, so a later write races it. Anything a test needs
+// to change about settings must therefore be changed here, up front.
+func setupBlockAssemblyTestWithUtxoStore(t *testing.T, withSettings ...func(*settings.Settings)) *baTestItems {
 	t.Helper()
 
 	items := baTestItems{}
@@ -42,6 +48,10 @@ func setupBlockAssemblyTestWithUtxoStore(t *testing.T) *baTestItems {
 	require.NoError(t, err)
 
 	tSettings := createTestSettings(t)
+
+	for _, apply := range withSettings {
+		apply(tSettings)
+	}
 
 	utxo, err := utxostoresql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)

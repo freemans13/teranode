@@ -11,12 +11,31 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
+	"github.com/bsv-blockchain/teranode/settings"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+// testCoinbaseMaturity is the coinbase maturity these tests run with. The
+// shared base test settings use 1, which would put coinbaseRepairFloor at the
+// tip and collapse every walk-back to a single height. A realistic value keeps
+// the safety floor out of the way so the tests exercise the behaviour they are
+// actually about; the one test that targets the floor sets its own.
+const testCoinbaseMaturity = 100
+
+// withCoinbaseMaturity sets the coinbase maturity used to derive
+// coinbaseRepairFloor. It has to be applied before the stores are built rather
+// than poked in afterwards: the blockchain SQL store starts a background
+// goroutine at construction that reads ChainCfgParams, and a later write races
+// it (caught by -race).
+func withCoinbaseMaturity(maturity uint16) func(*settings.Settings) {
+	return func(s *settings.Settings) {
+		s.ChainCfgParams.CoinbaseMaturity = maturity
+	}
+}
 
 // coinbaseTxForHeader clones the shared fixture coinbase (see addBlockWithMinedSet)
 // and perturbs its scriptSig with bytes derived from the header hash, so that
@@ -66,7 +85,7 @@ func TestCanonicalCoinbaseAt(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t)
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 
 	// height 1: canonical block carries cb1, and the store holds cb1 -> present.
@@ -172,7 +191,7 @@ func TestScopeCoinbaseGap_ContiguousAndHoled(t *testing.T) {
 
 	t.Run("contiguous gap", func(t *testing.T) {
 		ctx := t.Context()
-		items := setupBlockAssemblyTestWithUtxoStore(t)
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 		require.NotNil(t, items)
 		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 2
 		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
@@ -190,7 +209,7 @@ func TestScopeCoinbaseGap_ContiguousAndHoled(t *testing.T) {
 
 	t.Run("holed gap does not stop at first present coinbase", func(t *testing.T) {
 		ctx := t.Context()
-		items := setupBlockAssemblyTestWithUtxoStore(t)
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 		require.NotNil(t, items)
 		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 2
 		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
@@ -213,7 +232,7 @@ func TestScopeCoinbaseGap_ContiguousAndHoled(t *testing.T) {
 
 	t.Run("gap exceeding the cap escalates", func(t *testing.T) {
 		ctx := t.Context()
-		items := setupBlockAssemblyTestWithUtxoStore(t)
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 		require.NotNil(t, items)
 		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 2
 		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 2
@@ -240,7 +259,7 @@ func TestScopeCoinbaseGap_ContiguousAndHoled(t *testing.T) {
 func TestRecoverCoinbaseDivergence_RepairsGapNoConflicts(t *testing.T) {
 	initPrometheusMetrics()
 	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t)
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
@@ -277,7 +296,7 @@ func TestRecoverCoinbaseDivergence_RepairsGapNoConflicts(t *testing.T) {
 func TestStartupCoinbaseDivergenceCheck_Repairs(t *testing.T) {
 	initPrometheusMetrics()
 	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t)
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
@@ -304,7 +323,7 @@ func TestStartupCoinbaseDivergenceCheck_Repairs(t *testing.T) {
 func TestRecoverCoinbaseDivergence_GapTooLarge_Escalates(t *testing.T) {
 	initPrometheusMetrics()
 	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t)
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 1
@@ -332,6 +351,102 @@ func TestRecoverCoinbaseDivergence_GapTooLarge_Escalates(t *testing.T) {
 	escalatedAfter := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
 	require.Equal(t, float64(1), escalatedAfter-escalatedBefore,
 		"escalated counter must increment exactly once when the gap exceeds the cap")
+}
+
+// TestScopeCoinbaseGap_StopsAtCoinbaseMaturityFloor covers the pruned-coinbase
+// resurrection hazard. "Absent from the UTXO store" has two possible meanings:
+// never created (the divergence this PR repairs) and created, matured, fully
+// spent and then pruned by the DAH pruner (a perfectly healthy block). Both
+// return ErrTxNotFound, and re-creating the second kind would put already-spent
+// coinbase outputs back into the UTXO set as unspent.
+//
+// Coinbase maturity separates them: above tip-maturity a coinbase is too young
+// to have been spent, so it cannot have been pruned. The walk must stop there
+// and escalate rather than repair on a guess.
+func TestScopeCoinbaseGap_StopsAtCoinbaseMaturityFloor(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	// Maturity 3 with a tip of 6 puts the safety floor at height 4, so heights
+	// 1..3 are mature and could legitimately have been spent and pruned.
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(3))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 2
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+
+	// Heights 1 and 2 are present but sit below the floor, so they cannot be
+	// used to prove it. Heights 3, 4, 5 are absent and 6 (the tip) is present.
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	seedCoinbase(ctx, t, items, headers, 1)
+	seedCoinbase(ctx, t, items, headers, 2)
+	seedCoinbase(ctx, t, items, headers, 6)
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+
+	gap, err := items.blockAssembler.scopeCoinbaseGap(ctx, 6)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errCoinbaseFloorNotProven),
+		"reaching the maturity floor mid-gap must be reported as an unproven floor, not a repairable gap")
+	require.Nil(t, gap, "no blocks may be handed to the repair when the floor is unproven")
+	require.True(t, isUnscopableCoinbaseGap(err),
+		"an unproven floor is structural, so recovery must escalate rather than retry")
+	require.False(t, errors.Is(err, errCoinbaseGapTooLarge),
+		"an unproven floor is a distinct condition from an over-large gap")
+}
+
+// TestScopeCoinbaseGap_SameChainScopesWithFloorOutOfTheWay is the control for
+// TestScopeCoinbaseGap_StopsAtCoinbaseMaturityFloor: the identical chain shape
+// scopes normally once the maturity floor no longer bites, proving the refusal
+// there comes from the floor and not from the shape of the chain.
+func TestScopeCoinbaseGap_SameChainScopesWithFloorOutOfTheWay(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 2
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	seedCoinbase(ctx, t, items, headers, 1)
+	seedCoinbase(ctx, t, items, headers, 2)
+	seedCoinbase(ctx, t, items, headers, 6)
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+
+	gap, err := items.blockAssembler.scopeCoinbaseGap(ctx, 6)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{3, 4, 5}, gapHeights(gap))
+}
+
+// TestCoinbaseRepairFloor covers the arithmetic of the safety floor directly,
+// including the short-chain case where every height down to 1 is still
+// immature and therefore safe to probe.
+func TestCoinbaseRepairFloor(t *testing.T) {
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+
+	// Tip well above the maturity window: floor is tip-maturity+1, so exactly
+	// `maturity` heights are probeable and the lowest of them is still immature.
+	require.Equal(t, uint32(901), items.blockAssembler.coinbaseRepairFloor(1000))
+
+	// Chain shorter than the maturity window: nothing has matured, so the whole
+	// chain above genesis is safe.
+	require.Equal(t, uint32(1), items.blockAssembler.coinbaseRepairFloor(100))
+	require.Equal(t, uint32(1), items.blockAssembler.coinbaseRepairFloor(5))
+
+	// Boundary: one block past the maturity window opens exactly one height.
+	require.Equal(t, uint32(2), items.blockAssembler.coinbaseRepairFloor(101))
+}
+
+// TestCoinbaseRepairFloor_MaturityUnset covers the degenerate configuration
+// where maturity is zero: no height can be proven immature, so the floor falls
+// back to 1 rather than to the tip.
+func TestCoinbaseRepairFloor_MaturityUnset(t *testing.T) {
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(0))
+	require.NotNil(t, items)
+
+	require.Equal(t, uint32(1), items.blockAssembler.coinbaseRepairFloor(1000))
 }
 
 // swapSubtreeProcessor installs a stand-in subtree processor for the duration
@@ -384,7 +499,7 @@ func TestRecoverCoinbaseDivergence_RetriesThenSucceeds(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t)
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
@@ -425,7 +540,7 @@ func TestRecoverCoinbaseDivergence_ExhaustsAttemptsThenEscalates(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t)
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
@@ -466,7 +581,7 @@ func TestRecoverCoinbaseDivergence_NoGapBalancesMetric(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t)
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
@@ -500,7 +615,7 @@ func TestStartupCoinbaseDivergenceCheck_HoleBelowPresentTip(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t)
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
@@ -536,7 +651,7 @@ func TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned(t *testing.T)
 	initPrometheusMetrics()
 
 	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t)
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3

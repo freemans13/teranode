@@ -73,6 +73,64 @@ func (coinbaseGapTooLargeError) Error() string {
 // divergence and escalates immediately rather than spending retries on it.
 var errCoinbaseGapTooLarge error = coinbaseGapTooLargeError{}
 
+// coinbaseFloorNotProvenError is the type of the errCoinbaseFloorNotProven
+// sentinel. Same reasoning as coinbaseGapTooLargeError for why it is not a
+// teranode *Error.
+type coinbaseFloorNotProvenError struct{}
+
+// Error implements the error interface.
+func (coinbaseFloorNotProvenError) Error() string {
+	return "[coinbaseRecovery] walk-back reached its safety floor without proving a good floor beneath the gap"
+}
+
+// errCoinbaseFloorNotProven is returned by scopeCoinbaseGap when the walk-back
+// runs out of safely-probeable heights while still inside a gap. Like
+// errCoinbaseGapTooLarge it is structural, not transient.
+var errCoinbaseFloorNotProven error = coinbaseFloorNotProvenError{}
+
+// isUnscopableCoinbaseGap reports whether err is one of the structural scoping
+// failures, for which retrying cannot change the answer, as opposed to a
+// transient canonicalCoinbaseAt failure, which the attempt budget should
+// absorb.
+func isUnscopableCoinbaseGap(err error) bool {
+	return errors.Is(err, errCoinbaseGapTooLarge) || errors.Is(err, errCoinbaseFloorNotProven)
+}
+
+// coinbaseRepairFloor returns the lowest height at which "no coinbase in the
+// UTXO store" provably means "this coinbase was never created", so re-creating
+// it cannot resurrect an output that was already legitimately spent.
+//
+// The distinction matters because absence is ambiguous. A coinbase that was
+// created, matured, fully spent and then pruned by the DAH pruner leaves no
+// record either -- utxoStore.Get returns ErrTxNotFound for it exactly as it
+// does for one that was never written. Re-creating that one would put spent
+// outputs back into the UTXO set as unspent: a corruption far worse than the
+// wedge this recovery exists to fix.
+//
+// Coinbase maturity draws the line. A coinbase at height h cannot be spent
+// until a block at height h+CoinbaseMaturity exists, and an unspent output is
+// never given a delete-at height, so it is never pruned. Every height above
+// tipHeight-CoinbaseMaturity is therefore still immature, cannot have been
+// spent, cannot have been pruned, and absence there means exactly one thing.
+//
+// Below that line the walk stops rather than guessing, which is why a
+// divergence deeper than the maturity window escalates to an operator instead
+// of being auto-repaired.
+func (b *BlockAssembler) coinbaseRepairFloor(tipHeight uint32) uint32 {
+	if b.settings == nil || b.settings.ChainCfgParams == nil {
+		return 1
+	}
+
+	maturity := uint32(b.settings.ChainCfgParams.CoinbaseMaturity)
+	if maturity == 0 || tipHeight <= maturity {
+		// Chain shorter than the maturity window: nothing on it can have
+		// matured yet, so every height down to 1 is safe to probe.
+		return 1
+	}
+
+	return tipHeight - maturity + 1
+}
+
 // scopeCoinbaseGap walks back from triggerHeight, collecting canonical
 // blocks whose coinbase is absent from the UTXO store, until it has seen
 // CoinbaseRecoveryConsecutiveGood *consecutive* present coinbases -- proving
@@ -86,13 +144,18 @@ var errCoinbaseGapTooLarge error = coinbaseGapTooLargeError{}
 // errCoinbaseGapTooLarge so the caller can escalate instead of attempting to
 // repair an unbounded (and likely non-local) divergence.
 //
-// The walk stops at height 1: the genesis coinbase is provably unspendable and
-// is never created in the UTXO store, so probing height 0 would always report
-// it as "missing" and pull the genesis block into the repair set, where
-// processCoinbaseUtxos would write a bogus UTXO entry (block ID 0, and a
-// maturity height taken from the store's current height rather than 0).
-// Genesis can never be the parent of a coinbase-maturity spend, so excluding
-// it loses nothing.
+// The walk never descends below coinbaseRepairFloor. That floor is what keeps
+// "absent" unambiguous: above it a coinbase is too young to have been spent,
+// so it cannot have been pruned, so absence can only mean it was never
+// created. It also subsumes the genesis case -- the floor is never below
+// height 1, and the genesis coinbase is unspendable and never written to the
+// UTXO store, so probing height 0 would always report it "missing" and pull
+// genesis into the repair set, where processCoinbaseUtxos would write a bogus
+// entry (block ID 0, maturity taken from the store's current height).
+//
+// Reaching the floor while still inside a gap returns errCoinbaseFloorNotProven:
+// the repair set cannot be proven safe, so the caller escalates rather than
+// re-creating coinbases that may have been legitimately spent and pruned.
 //
 // gapBlocks is returned in ascending height order. An empty slice with a nil
 // error means no gap was found (the trigger height itself already satisfies
@@ -113,12 +176,25 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 		maxGap = 1
 	}
 
+	// The maturity window is measured from the chain tip, not from
+	// triggerHeight, since it is the tip that determines what has had the
+	// chance to mature. triggerHeight is used as a lower bound on the tip so
+	// that a direct call with no persisted tip still gets a real floor rather
+	// than falling all the way back to height 1.
+	_, tipHeight := b.CurrentBlock()
+	if triggerHeight > tipHeight {
+		tipHeight = triggerHeight
+	}
+
+	safetyFloor := b.coinbaseRepairFloor(tipHeight)
+
 	var gap []*model.Block
 
 	consecutiveGood := 0
 	scanned := 0
+	floorProven := false
 
-	for h := int64(triggerHeight); h >= 1; h-- {
+	for h := int64(triggerHeight); h >= int64(safetyFloor); h-- {
 		present, blk, err := b.canonicalCoinbaseAt(ctx, uint32(h))
 		if err != nil {
 			return nil, err
@@ -127,6 +203,8 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 		if present {
 			consecutiveGood++
 			if consecutiveGood >= needConsecutive {
+				floorProven = true
+
 				break
 			}
 
@@ -140,6 +218,13 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 		if scanned > maxGap {
 			return nil, errCoinbaseGapTooLarge
 		}
+	}
+
+	if len(gap) > 0 && !floorProven {
+		// The walk ran out of safely-probeable heights while still inside the
+		// gap, so nothing proves the blocks collected were never created
+		// rather than created-spent-and-pruned. Refuse to repair on a guess.
+		return nil, errCoinbaseFloorNotProven
 	}
 
 	// gap was accumulated walking toward genesis (descending height);
@@ -163,13 +248,14 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 // ordinary-transaction double-spend/conflict state for a genuine competing-fork
 // reorg is out of scope here -- that state is owned by block validation.
 //
-// Only errCoinbaseGapTooLarge escalates immediately: it is structural, so no
-// number of retries will change the answer. Every other failure -- a
-// canonicalCoinbaseAt error during the walk-back, or a ReconcileCoinbases
-// error during the repair -- is treated as possibly transient and absorbed by
-// the attempt budget, with coinbaseRecoveryRetryBackoff between attempts. A
-// momentary store hiccup must not fire the loudest signal the system has:
-// crying wolf on "escalated" would erode its value for real divergences.
+// Only a structural scoping failure escalates immediately (see
+// isUnscopableCoinbaseGap): no number of retries will change the answer. Every
+// other failure -- a canonicalCoinbaseAt error during the walk-back, or a
+// ReconcileCoinbases error during the repair -- is treated as possibly
+// transient and absorbed by the attempt budget, with
+// coinbaseRecoveryRetryBackoff between attempts. A momentary store hiccup must
+// not fire the loudest signal the system has: crying wolf on "escalated" would
+// erode its value for real divergences.
 //
 // Exactly one outcome metric is recorded per call alongside "detected", so
 // detected == repaired + no_gap + escalated:
@@ -219,9 +305,10 @@ attempts:
 		if err != nil {
 			lastErr = err
 
-			if errors.Is(err, errCoinbaseGapTooLarge) {
-				// Structural: the divergence is non-local, so retrying the
-				// same walk-back cannot produce a scopeable gap.
+			if isUnscopableCoinbaseGap(err) {
+				// Structural: either the divergence is non-local, or the walk
+				// ran out of heights where "absent" provably means "never
+				// created". Retrying the same walk-back cannot change either.
 				break
 			}
 
@@ -287,10 +374,14 @@ attempts:
 // tip-only probe would return early and never invoke it, leaving the hole to
 // wedge the node on the eventual maturity spend.
 //
-// The window is CoinbaseRecoveryMaxGapBlocks heights, reusing the same bound
-// the repair itself honours: there is no point detecting a divergence deeper
-// than recovery is willing to auto-repair. Cost is two store reads per height
-// on a clean boot and it short-circuits on the first miss.
+// The window is the smaller of CoinbaseRecoveryMaxGapBlocks heights and the
+// coinbase-maturity window (see coinbaseRepairFloor). The first bound reuses
+// what the repair itself honours -- there is no point detecting a divergence
+// deeper than recovery will auto-repair. The second is a correctness bound:
+// below the maturity floor a missing coinbase may simply have been spent and
+// pruned, so probing there would report healthy blocks as diverged. Cost is
+// two store reads per height on a clean boot, and it short-circuits on the
+// first miss.
 //
 // This is a bounded window, not whole-chain coverage. A hole further below the
 // tip than the window stays invisible here; finding that cheaply is the job of
@@ -325,10 +416,13 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 		window = 1
 	}
 
-	// Walk down from the tip. h stops at 1 for the same reason the walk-back
-	// in scopeCoinbaseGap does: the genesis coinbase is unspendable and never
-	// exists in the UTXO store, so probing height 0 always reports "missing".
-	for h, scanned := height, 0; h >= 1 && scanned < window; h, scanned = h-1, scanned+1 {
+	// Walk down from the tip, stopping at whichever bound bites first. The
+	// safety floor is never below height 1, which also keeps the walk off
+	// genesis: its coinbase is unspendable and never written to the UTXO
+	// store, so probing height 0 would always report "missing".
+	scanFloor := b.coinbaseRepairFloor(height)
+
+	for h, scanned := height, 0; h >= scanFloor && scanned < window; h, scanned = h-1, scanned+1 {
 		present, _, err := b.canonicalCoinbaseAt(ctx, h)
 		if err != nil {
 			// Non-fatal: log and continue booting; see the function-level
