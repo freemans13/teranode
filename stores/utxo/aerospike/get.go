@@ -1274,18 +1274,56 @@ func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, tota
 		// Calculate the base offset for this pagination record
 		baseOffset := recordNum * s.utxoBatchSize
 
-		// Extract UTXOs from the extra record
-		if extraUtxos, ok := extraRecord.Bins[fields.Utxos.String()].([]interface{}); ok {
-			for i, ui := range extraUtxos {
-				if u, ok := ui.([]uint8); ok && len(u) == 68 {
-					spendingData, err := spendpkg.NewSpendingDataFromBytes(u[32:])
-					if err != nil {
-						return errors.NewStorageError("failed to parse spending data from extra record", err)
-					}
+		extraUtxos, ok := extraRecord.Bins[fields.Utxos.String()].([]interface{})
+		if !ok {
+			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d has a missing or malformed utxos bin (%T) — torn or partially-applied record", txID.String(), recordNum, extraRecord.Bins[fields.Utxos.String()])
+		}
 
-					spendingDatas[baseOffset+i] = spendingData
-				}
+		if applyErr := applyExtraRecordUTXOs(txID, recordNum, extraUtxos, baseOffset, spendingDatas); applyErr != nil {
+			return applyErr
+		}
+	}
+
+	return nil
+}
+
+// applyExtraRecordUTXOs writes the spend state held in one extra (paginated)
+// record into the caller's slice.
+//
+// Whether an output is spent is consensus state, and here "no data" reads as
+// UNSPENT. So anything unexpected in the record fails the read rather than
+// being skipped: silently leaving a slot nil turns a spent output back into a
+// spendable one, and a double-spend of it is then accepted with no error
+// anywhere (issue 1440).
+//
+// Two element shapes are legitimate and must both keep working: 68 bytes is a
+// spent output (32-byte utxo hash + 36-byte spending data) and 32 bytes is an
+// unspent one (hash only), which correctly leaves the slot nil. Any other
+// length, or a non-byte element, is a torn or partially-applied record.
+func applyExtraRecordUTXOs(txID *chainhash.Hash, recordNum int, extraUtxos []interface{}, baseOffset int, spendingDatas []*spendpkg.SpendingData) error {
+	for i, ui := range extraUtxos {
+		offset := baseOffset + i
+		if offset >= len(spendingDatas) {
+			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d holds more outputs than the transaction has (offset %d of %d) — torn or mis-keyed record", txID.String(), recordNum, offset, len(spendingDatas))
+		}
+
+		u, ok := ui.([]uint8)
+		if !ok {
+			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d output %d is %T, not bytes — torn or partially-applied record", txID.String(), recordNum, i, ui)
+		}
+
+		switch len(u) {
+		case 32:
+			// Unspent: hash only, no spending data. Slot stays nil.
+		case 68:
+			spendingData, err := spendpkg.NewSpendingDataFromBytes(u[32:])
+			if err != nil {
+				return errors.NewStorageError("failed to parse spending data from extra record", err)
 			}
+
+			spendingDatas[offset] = spendingData
+		default:
+			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d output %d is %d bytes, expected 32 (unspent) or 68 (spent) — torn or short record", txID.String(), recordNum, i, len(u))
 		}
 	}
 
