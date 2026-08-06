@@ -302,7 +302,7 @@ func TestValidateBUMP(t *testing.T) {
 		for i := range path {
 			path[i] = Level{
 				{
-					Offset: uint64(i), //nolint:gosec // loop index is non-negative
+					Offset: uint64(i),
 					Hash:   "abc1234567890123456789012345678901234567890123456789012345678901",
 				},
 			}
