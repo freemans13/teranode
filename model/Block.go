@@ -605,11 +605,16 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 
 	// 4. Check that the coinbase transaction is valid (reward checked later).
 	if b.CoinbaseTx == nil {
-		return false, errors.NewBlockInvalidError("[BLOCK][%s] block has no coinbase tx", b.String())
+		return false, errors.NewBlockInvalidBodyError("[BLOCK][%s] block has no coinbase tx", b.String())
 	}
 
+	// Body-attributable: the coinbase is peer-supplied body data and nothing has yet tied the
+	// body to the header (CheckMerkleRoot is step 8), so this must not mark the header's hash
+	// invalid. IsCoinbase() checks more than the outer guard in ValidateBlockWithOptions does
+	// (all-zero prev-txid, prev-index/sequence), so an honest header replayed with a coinbase
+	// whose input is rewritten but whose length and height push are intact lands exactly here.
 	if !b.CoinbaseTx.IsCoinbase() {
-		return false, errors.NewBlockInvalidError("[BLOCK][%s] block coinbase tx is not a valid coinbase tx", b.String())
+		return false, errors.NewBlockInvalidBodyError("[BLOCK][%s] block coinbase tx is not a valid coinbase tx", b.String())
 	}
 
 	// 4b. Check that the coinbase scriptSig (unlocking script) length is within consensus bounds.
@@ -622,7 +627,7 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	}
 
 	if scriptSigLen < 2 || scriptSigLen > int(settings.ChainCfgParams.MaxCoinbaseScriptSigSize) {
-		return false, errors.NewBlockInvalidError("[BLOCK][%s] bad coinbase length", b.String())
+		return false, errors.NewBlockInvalidBodyError("[BLOCK][%s] bad coinbase length", b.String())
 	}
 
 	// https://en.bitcoin.it/wiki/BIP_0034
@@ -639,13 +644,19 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	// Valid() would otherwise attempt ExtractCoinbaseHeight — contradicting the genesis exemption
 	// that CheckBlockVersion already applies. svnode never runs this check on genesis.
 	if b.Height > 0 && heightAtOrAfterActivation(b.Height, settings.ChainCfgParams.BIP0034Height) {
+		// Body-attributable for the same reason as the coinbase checks above: b.Height is
+		// parent-derived and authoritative (Server.deriveBlockHeight) while the height here is
+		// parsed from the peer-supplied coinbase scriptSig, so a mismatch says the body is
+		// wrong, not the header. Today the wedge does not actually land here — the SQL store's
+		// own validateCoinbaseHeight aborts the invalid-block insert before the Invalid flag is
+		// consulted — but that is an incidental property of one store, not a guarantee.
 		height, err := b.ExtractCoinbaseHeight()
 		if err != nil {
-			return false, errors.NewBlockInvalidError("[BLOCK][%s] error extracting coinbase height", b.String(), err)
+			return false, errors.NewBlockInvalidBodyError("[BLOCK][%s] error extracting coinbase height", b.String(), err)
 		}
 
 		if height != b.Height {
-			return false, errors.NewBlockInvalidError("[BLOCK][%s] block height in coinbase tx (%d) does not match block height in block header (%d)", b.String(), height, b.Height)
+			return false, errors.NewBlockInvalidBodyError("[BLOCK][%s] block height in coinbase tx (%d) does not match block height in block header (%d)", b.String(), height, b.Height)
 		}
 	}
 
@@ -1627,15 +1638,17 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 	nrOfSubtrees := len(b.Subtrees)
 
 	for sIdx := 0; sIdx < len(b.SubtreeSlices); sIdx++ {
+		// Body-attributable: the subtree shape is peer-supplied body data, not the header — the
+		// same class as the shape rules inside CheckMerkleRoot, which run one step later.
 		subtree := b.SubtreeSlices[sIdx]
 		if subtree == nil {
-			return errors.NewBlockInvalidError("[BLOCK][%s][ID %d] subtree %d of %d was loaded but is nil", b.String(), b.ID, sIdx, nrOfSubtrees)
+			return errors.NewBlockInvalidBodyError("[BLOCK][%s][ID %d] subtree %d of %d was loaded but is nil", b.String(), b.ID, sIdx, nrOfSubtrees)
 		}
 		if sIdx == 0 {
 			subtreeSize = subtree.Length()
 		} else if subtree.Length() != subtreeSize && sIdx != nrOfSubtrees-1 {
 			// all subtrees need to be the same size as the first tree, except the last one
-			return errors.NewBlockInvalidError("[BLOCK][%s][ID %d] subtree %d has length %d, expected %d", b.String(), b.ID, sIdx, subtree.Length(), subtreeSize)
+			return errors.NewBlockInvalidBodyError("[BLOCK][%s][ID %d] subtree %d has length %d, expected %d", b.String(), b.ID, sIdx, subtree.Length(), subtreeSize)
 		}
 	}
 
