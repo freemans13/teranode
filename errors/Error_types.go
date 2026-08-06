@@ -112,9 +112,16 @@ func NewProcessingError(message string, params ...interface{}) *Error {
 // ErrProcessing) keeps treating it as retryable, while callers that need to distinguish a local
 // context failure from a generic processing error can match this code specifically.
 func NewBlockHeaderContextError(message string, params ...interface{}) *Error {
-	params = append(params, ErrProcessing)
+	// New() takes the LAST param as the wrapped cause, so the ErrProcessing tail cannot be
+	// appended to params — that would displace a caller-supplied cause into a format argument
+	// and render it as %!(EXTRA ...). Build the error first so the caller's cause is wrapped
+	// normally, then attach the tail. The tail is a fresh instance, never the ErrProcessing
+	// singleton: SetWrappedErr and Join walk to the tail and assign, so sharing the global
+	// would let a later Join mutate process-wide state.
+	e := New(ERR_BLOCK_HEADER_CONTEXT, message, params...)
+	e.SetWrappedErr(New(ERR_PROCESSING, "error processing"))
 
-	return New(ERR_BLOCK_HEADER_CONTEXT, message, params...)
+	return e
 }
 
 // NewConfigurationError creates a new error with the configuration error code.

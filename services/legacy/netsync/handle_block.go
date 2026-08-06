@@ -980,10 +980,10 @@ func (sm *SyncManager) candidateParentMedianTimeForBlock(ctx context.Context, pa
 // can re-anchor them with the same logic.
 //
 // A nil pointer (cur == nil) or a nil header response (header == nil) is
-// treated as a hard error. Production callers only invoke this when the
-// candidate height is at or above CSVHeight, which is well past the first
-// `depth` blocks of the chain — so we never legitimately walk off the
-// beginning of the chain. Tolerating short returns would silently produce
+// treated as a hard error. Walking off the BEGINNING of the chain is not one of
+// those cases: the loop breaks at genesis, because on teratestnet, tstn and stn
+// CSVHeight is 0, so a candidate can legitimately sit below the first `depth`
+// blocks and a genesis-terminated run is the correct short window there. Tolerating short returns would silently produce
 // an incomplete MTP on a transient cache miss mid-chain; raising loudly
 // instead forces the caller to surface the underlying issue.
 func (sm *SyncManager) walkParentChain(ctx context.Context, startHash *chainhash.Hash, depth uint64) ([]*model.BlockHeader, error) {
@@ -1005,6 +1005,15 @@ func (sm *SyncManager) walkParentChain(ctx context.Context, startHash *chainhash
 		}
 
 		headers = append(headers, header)
+
+		// Stop at genesis. Its HashPrevBlock is the all-zero hash, not nil, so the nil guard
+		// above never fires — without this the walk asks GetBlockHeader for the zero hash and
+		// fails with "failed at depth N". A run that ends at genesis is a complete window; the
+		// caller's genesis carve-out decides whether it is long enough.
+		if header.HashPrevBlock == nil || header.HashPrevBlock.IsEqual(&chainhash.Hash{}) {
+			break
+		}
+
 		cur = header.HashPrevBlock
 	}
 
@@ -1078,7 +1087,9 @@ func candidateParentMedianTimeFromHeaders(parentHash *chainhash.Hash, headers []
 	// the chain itself ends at genesis. Re-establish that here, matching
 	// model.Block CheckHeaderContextual: a short run is legitimate only when its
 	// oldest header is genesis. On the batched path the error sends the caller to
-	// walkParentChain, which walks by hash and returns the full window.
+	// walkParentChain, which walks by hash — immune to the batched query's race — and
+	// stops at genesis, so it returns either the full window or a genuinely
+	// genesis-terminated one that this same carve-out then accepts.
 	if uint64(len(headers)) < blockchain.MedianTimeBlocks {
 		oldest := headers[len(headers)-1]
 		if oldest.HashPrevBlock == nil || !oldest.HashPrevBlock.IsEqual(&chainhash.Hash{}) {

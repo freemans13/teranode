@@ -1526,6 +1526,15 @@ func (u *Server) walkParentChain(ctx context.Context, startHash *chainhash.Hash,
 		}
 
 		headers = append(headers, header)
+
+		// Stop at genesis. Its HashPrevBlock is the all-zero hash, not nil, so the nil guard
+		// above never fires — without this the walk asks GetBlockHeader for the zero hash and
+		// fails with "failed at depth N". A run that ends at genesis is a complete window; the
+		// caller's genesis carve-out decides whether it is long enough.
+		if header.HashPrevBlock == nil || header.HashPrevBlock.IsEqual(&chainhash.Hash{}) {
+			break
+		}
+
 		cur = header.HashPrevBlock
 	}
 
@@ -1597,7 +1606,9 @@ func candidateParentMedianTimeFromHeaders(parentHash *chainhash.Hash, headers []
 	// the chain itself ends at genesis. Re-establish that here, matching
 	// model.Block CheckHeaderContextual: a short run is legitimate only when its
 	// oldest header is genesis. On the batched path the error sends the caller to
-	// walkParentChain, which walks by hash and returns the full window.
+	// walkParentChain, which walks by hash — immune to the batched query's race — and
+	// stops at genesis, so it returns either the full window or a genuinely
+	// genesis-terminated one that this same carve-out then accepts.
 	if uint64(len(headers)) < blockchain.MedianTimeBlocks {
 		oldest := headers[len(headers)-1]
 		if oldest.HashPrevBlock == nil || !oldest.HashPrevBlock.IsEqual(&chainhash.Hash{}) {

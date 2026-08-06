@@ -80,6 +80,12 @@ type ValidateBlockOptions struct {
 	// When true, skips existence check and clears invalid flag after successful validation.
 	IsRevalidation bool
 
+	// IsRequeuedRetry marks an attempt that the revalidation worker started for a block that
+	// failed BEFORE it was stored. It exists solely to stop that retry from enqueuing itself
+	// again — it must NOT be confused with IsRevalidation, which asserts the block is already
+	// on the chain and marked invalid, a precondition this path does not meet.
+	IsRequeuedRetry bool
+
 	// PeerID is the P2P peer identifier used for reputation tracking.
 	// This is used to track peer behavior during subtree validation.
 	PeerID string
@@ -140,6 +146,15 @@ type revalidateBlockData struct {
 
 	// retries tracks the number of revalidation attempts
 	retries int
+
+	// notYetAdded marks a block that failed BEFORE it was stored, so the worker must
+	// re-enter full validation (which ends in AddBlock) instead of reValidateBlock, which
+	// only re-checks blocks already on the chain and stores nothing.
+	notYetAdded bool
+
+	// peerID carries the serving peer through a notYetAdded re-entry so the retried
+	// validation attributes an invalid verdict to the same peer the first attempt would have.
+	peerID string
 }
 
 // BlockValidation handles the core validation logic for blocks in Teranode.
@@ -754,7 +769,21 @@ func (u *BlockValidation) start(ctx context.Context) error {
 
 				u.logger.Infof("[BlockValidation:start][%s] block revalidation Chan", blockData.block.String())
 
-				err := u.reValidateBlock(blockData)
+				// A block that never reached AddBlock has to go back through full validation:
+				// reValidateBlock re-checks an already-stored block and has no AddBlock on any
+				// path, so sending a not-yet-added block there would validate it and discard it.
+				// IsRequeuedRetry stops the retried attempt from enqueuing itself again, so the
+				// worker's retry counter below stays the only retry budget.
+				var err error
+				if blockData.notYetAdded {
+					err = u.ValidateBlockWithOptions(ctx, blockData.block, blockData.baseURL, &ValidateBlockOptions{
+						PeerID:          blockData.peerID,
+						IsRequeuedRetry: true,
+					})
+				} else {
+					err = u.reValidateBlock(blockData)
+				}
+
 				if err != nil {
 					prometheusBlockValidationReValidateBlockErr.Observe(float64(time.Since(startTime).Microseconds() / 1_000_000))
 					// Check if context is done before logging
@@ -1779,9 +1808,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// #1467). GetBlockHeaders' fast path probes on_main_chain/height and then
 				// range-scans in a separate statement, so a reorg landing between the two can
 				// hand back somebody else's chain. The block has not been added yet, so
-				// returning here would drop it until a peer re-announces — re-queue instead,
-				// matching the header-fetch failures above.
-				u.ReValidateBlock(block, baseURL)
+				// returning here would drop it until a peer re-announces — re-queue through the
+				// from-scratch path, which re-enters validation and ends in AddBlock.
+				if !opts.IsRequeuedRetry {
+					u.ReValidateBlockFromScratch(block, baseURL, opts.PeerID)
+				}
 
 				return err
 			}
@@ -1942,11 +1973,17 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				if errors.Is(err, errors.ErrStorageError) ||
 					errors.Is(err, errors.ErrServiceError) ||
 					errors.Is(err, errors.ErrProcessing) {
-					// Transient by definition, and the block was never added — dropping it here
-					// leaves it lost until a peer re-announces. Re-queue so it is retried once
-					// the underlying condition clears (issue #1467: CheckHeaderContextual now
-					// reports an unanchored/unlinked/short parent-header run this way).
-					u.ReValidateBlock(block, baseURL)
+					// Re-queue ONLY the header-context case (issue #1467): the parent-header run
+					// our own store returned was unanchored, unlinked or too short, which clears
+					// on its own, and the block was never added so returning alone would lose it.
+					// Deliberately not every ErrProcessing: the revalidation worker is a single
+					// goroutine off a 2-slot channel that retries three times with no backoff, so
+					// widening this turns a storage outage into four full validation passes per
+					// block with catchup blocking on the send — and a non-transient processing
+					// error (model/Block.go's target-difficulty check) fails identically each time.
+					if errors.Is(err, errors.ErrBlockHeaderContext) && !opts.IsRequeuedRetry {
+						u.ReValidateBlockFromScratch(block, baseURL, opts.PeerID)
+					}
 
 					return err
 				}
@@ -2236,10 +2273,27 @@ func (u *BlockValidation) waitForPreviousBlocksToBeProcessed(ctx context.Context
 //
 // The function logs the revalidation attempt and queues the block for processing.
 // No return value is provided as the operation is asynchronous.
-func (u *BlockValidation) ReValidateBlock(block *model.Block, baseURL string) {
-	u.logger.Errorf("[ValidateBlock][%s] re-validating block", block.String())
+// ReValidateBlockFromScratch re-queues a block that failed BEFORE it was stored. The worker
+// re-enters ValidateBlockWithOptions, which ends in AddBlock — unlike ReValidateBlock, whose
+// worker path only re-checks blocks already on the chain and would validate this one and then
+// throw it away, leaving it absent until a peer re-announces it.
+func (u *BlockValidation) ReValidateBlockFromScratch(block *model.Block, baseURL, peerID string) {
+	u.enqueueRevalidation(revalidateBlockData{
+		block:       block,
+		baseURL:     baseURL,
+		peerID:      peerID,
+		notYetAdded: true,
+	})
+}
 
-	data := revalidateBlockData{block: block, baseURL: baseURL}
+func (u *BlockValidation) ReValidateBlock(block *model.Block, baseURL string) {
+	u.enqueueRevalidation(revalidateBlockData{block: block, baseURL: baseURL})
+}
+
+func (u *BlockValidation) enqueueRevalidation(data revalidateBlockData) {
+	block := data.block
+
+	u.logger.Errorf("[ValidateBlock][%s] re-validating block", block.String())
 
 	// Prefer an immediate enqueue whenever the channel has space (this also lets a
 	// stopped-worker test observe the routing decision). Only when the channel is
