@@ -360,8 +360,9 @@ func InitSemaphores(readLimit, writeLimit int) error {
 			return
 		}
 
-		// A zero budget means the platform exposes no limit to read (Windows);
-		// the semaphores still bound concurrency there, so carry on unclamped.
+		// A non-nil error means the platform exposes no limit to read (Windows),
+		// and a zero budget means the limit is at or below the reserve; in both
+		// cases the semaphores still bound concurrency, so carry on unclamped.
 		if budget, _, limitErr := fdlimit.Ensure(total); limitErr == nil && budget > 0 && budget < total {
 			readLimit, writeLimit = clampSemaphoreLimits(readLimit, writeLimit, budget)
 			appliedClamp = true

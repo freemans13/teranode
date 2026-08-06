@@ -12,6 +12,8 @@ import (
 // ceiling exceeds the OS limit still runs fine — refusing to start it would
 // turn a bounded, handled condition into total unavailability (issue 1431).
 func TestEnsureReportsABudgetRatherThanRefusing(t *testing.T) {
+	restoreLimit(t)
+
 	_, hard, err := get()
 	require.NoError(t, err, "this platform should expose RLIMIT_NOFILE")
 
@@ -26,6 +28,8 @@ func TestEnsureReportsABudgetRatherThanRefusing(t *testing.T) {
 // descriptors for everything the semaphores do NOT bound — sockets, gRPC
 // connections, database pools, log files.
 func TestEnsureReservesHeadroom(t *testing.T) {
+	restoreLimit(t)
+
 	soft, _, err := get()
 	require.NoError(t, err)
 	require.Greater(t, soft, Headroom, "test host has an unusably small limit")
@@ -44,21 +48,47 @@ func TestEnsureReservesHeadroom(t *testing.T) {
 // where the hard limit allows it, the soft limit is raised rather than the
 // budget being reported as small.
 func TestEnsureRaisesASoftLimitThatIsTooLow(t *testing.T) {
-	soft, hard, err := get()
+	restoreLimit(t)
+
+	_, hard, err := get()
 	require.NoError(t, err)
 
-	if hard <= soft {
-		t.Skip("soft limit is already at the hard limit; nothing to raise")
+	// Drive the raise from a deliberately lowered soft limit rather than the
+	// ambient one. Depending on the ambient limit made this test silently skip
+	// (Go's runtime raises soft to hard-1 at startup, and an earlier test here
+	// used to leave it pinned at hard), so the only coverage of the raise —
+	// the useful half of this feature — never ran.
+	const lowered = 1024
+	if hard < lowered*2 {
+		t.Skip("hard limit too low to exercise a raise")
 	}
 
-	want := soft + 1
+	require.NoError(t, set(lowered, hard))
+
+	want := uint64(lowered) // needs lowered+Headroom, above the lowered soft limit
+
 	budget, raised, err := Ensure(want)
 	require.NoError(t, err)
 	require.True(t, raised, "a raisable soft limit must be raised")
-	require.GreaterOrEqual(t, budget+Headroom, want+Headroom)
+	require.GreaterOrEqual(t, budget, want, "the budget must cover what was asked for")
 
-	// Restore so the change does not leak into other tests in this binary.
-	require.NoError(t, set(soft, hard))
+	soft, _, err := get()
+	require.NoError(t, err)
+	require.Greater(t, soft, uint64(lowered), "the soft limit must actually have moved")
+}
+
+// restoreLimit snapshots RLIMIT_NOFILE and puts it back when the test ends.
+// Ensure mutates a process-global resource, so without this one test silently
+// changes what every later test in the binary observes.
+func restoreLimit(t *testing.T) {
+	t.Helper()
+
+	soft, hard, err := get()
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = set(soft, hard)
+	})
 }
 
 func maxU64(a, b uint64) uint64 {
