@@ -1698,8 +1698,20 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 		// outputs only, with no inputs, version or locktime — and neither is the
 		// inline-bins path, which nils out spent outputs; both need a different
 		// mechanism and are deliberately left alone here.
+		// Classified as a STORAGE fault, not a transaction fault. The blob is
+		// written from our own tx.ExtendedBytes under our own computed hash, so
+		// a mismatch can only mean this node's stored bytes are wrong — it is
+		// never evidence about the block being validated or the peer that served
+		// it. Returning TxInvalid here would be read downstream as a proven
+		// consensus violation: block validation persists such a block as invalid
+		// (poisoning every descendant via the parent-invalid cascade) and flags
+		// the serving peer malicious, so a single flipped bit on local disk
+		// would fork this node off the honest chain until someone manually
+		// revalidated. A storage error instead routes into the existing
+		// transient path, matching the branch above that already reports this
+		// subsystem's failures that way.
 		if actual := tx.TxIDChainHash(); !actual.Equal(previousTxHash) {
-			return nil, errors.NewTxInvalidError("[GetTxFromExternalStore][%s] external tx does not hash to the key it was stored under (got %s) — stale, rotted or mis-keyed blob", previousTxHash.String(), actual.String())
+			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external tx does not hash to the key it was stored under (got %s) — stale, rotted or mis-keyed blob", previousTxHash.String(), actual.String())
 		}
 	} else {
 		uw, err := utxopersister.NewUTXOWrapperFromReader(ctx, bufferedReader)

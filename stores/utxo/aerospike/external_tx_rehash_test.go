@@ -1,6 +1,7 @@
 package aerospike
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
@@ -64,7 +66,7 @@ func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
 		require.Equal(t, uint64(1000), got.Outputs[0].Satoshis)
 	})
 
-	t.Run("another transaction's bytes under the key are rejected", func(t *testing.T) {
+	t.Run("another transaction's bytes under the key are rejected as a storage fault", func(t *testing.T) {
 		// A stale file from the pruner's delete-then-write race, or any
 		// mis-keyed return: the stored bytes are perfectly valid, so a body
 		// checksum would pass them. Only re-hashing catches it.
@@ -74,21 +76,37 @@ func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
 		_, err := s.getExternalTransaction(ctx, parentHash)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "does not hash to the key it was stored under")
+
+		// The class matters as much as the rejection: this is OUR disk being
+		// wrong, never evidence about the block or the peer. TxInvalid would be
+		// read downstream as a proven consensus violation — the block persisted
+		// invalid and the serving peer flagged malicious over a local fault.
+		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
+		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
 	})
 
 	t.Run("a flipped byte in the locking script is rejected", func(t *testing.T) {
 		// The exact consensus hazard: a rotted blob whose script still parses
 		// would have the child's signature checked against the wrong spending
-		// condition.
+		// condition. Target the locking script explicitly rather than trusting
+		// an offset from the end — review caught the first version of this test
+		// flipping a locktime byte and claiming otherwise.
 		s := newStore(t)
 
-		corrupt := parent.ExtendedBytes()
-		corrupt[len(corrupt)-3] ^= 0xff
+		good := parent.ExtendedBytes()
+		script := *parent.Outputs[0].LockingScript
+		idx := bytes.Index(good, script)
+		require.GreaterOrEqual(t, idx, 0, "fixture must contain the locking script verbatim")
+
+		corrupt := append([]byte{}, good...)
+		corrupt[idx+2] ^= 0xff
 
 		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, corrupt))
 
 		_, err := s.getExternalTransaction(ctx, parentHash)
 		require.Error(t, err)
+		require.Contains(t, err.Error(), "does not hash to the key it was stored under")
+		require.True(t, errors.Is(err, errors.ErrStorageError))
 	})
 
 	t.Run("a mismatched read is never cached", func(t *testing.T) {
