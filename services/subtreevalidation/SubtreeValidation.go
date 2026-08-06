@@ -370,8 +370,14 @@ func (u *Server) readTxFromReader(body io.ReadCloser) (tx *bt.Tx, err error) {
 
 	tx = &bt.Tx{}
 
-	_, err = tx.ReadFrom(body)
+	bytesRead, err := tx.ReadFrom(body)
 	if err != nil {
+		return nil, err
+	}
+
+	// Peer-supplied bytes: reject a non-minimal CompactSize encoding, which
+	// go-bt would otherwise accept and silently canonicalize (issue 1421).
+	if err = checkCanonicalTxEncoding(tx, bytesRead); err != nil {
 		return nil, err
 	}
 
