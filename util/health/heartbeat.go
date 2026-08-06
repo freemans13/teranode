@@ -26,13 +26,19 @@ type Heartbeat struct {
 	now      func() time.Time
 }
 
-// New returns a Heartbeat that is already beating, so a service is not
-// declared dead in the window between construction and its first tick.
+// New returns a Heartbeat that has NOT yet beaten, so it reports healthy until
+// its loop starts.
+//
+// This matters more than it looks. A service is constructed during Init but its
+// loop may not start until well into Start, behind work that is legitimately
+// unbounded — waiting on pending block validation, reloading a large unmined
+// set from disk. Beating at construction would age the heartbeat through that
+// entire preamble and report a perfectly healthy, still-starting node as
+// wedged; worse, a restart sends it back through Init into the same preamble,
+// so the node could never finish starting. Not beating until the loop owns the
+// heartbeat makes that window safe by construction.
 func New() *Heartbeat {
-	h := &Heartbeat{}
-	h.Beat()
-
-	return h
+	return &Heartbeat{}
 }
 
 // Beat records that the loop is still making progress.

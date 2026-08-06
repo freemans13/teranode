@@ -316,6 +316,7 @@ func (b *BlockAssembler) GetChainedSubtreesTotalSize() uint64 {
 // operator would configure.
 const blockAssemblerHeartbeatInterval = 5 * time.Second
 
+// startChannelListeners starts the main event loop goroutine.
 func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) {
 	// start a subscription for the best block header and the FSM state
 	// this will be used to reset the subtree processor when a new block is mined
@@ -344,6 +345,12 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 		// the tick either, which is the freeze the liveness probe must catch.
 		heartbeatTicker := time.NewTicker(blockAssemblerHeartbeatInterval)
 		defer heartbeatTicker.Stop()
+
+		// First beat happens HERE, not at construction: everything before this
+		// point is startup work that is legitimately unbounded (waiting on
+		// pending block validation, reloading a large unmined set), and the
+		// heartbeat must not age through it.
+		b.heartbeat.Beat()
 
 		for {
 			b.heartbeat.Beat()
@@ -2026,6 +2033,13 @@ func (b *BlockAssembler) validateParentChain(
 
 	// Process transactions in batches for performance
 	for i := 0; i < len(unminedTxs); i += batchSize {
+		// Beat on completed batches: this work runs inside a select case, so
+		// without it a large-but-progressing validation looks identical to a
+		// wedge. Beating on FORWARD PROGRESS (a finished batch) rather than on
+		// entry keeps the distinction — a run that stops progressing still
+		// goes stale (issue 1447).
+		b.heartbeat.Beat()
+
 		// Check for context cancellation at start of each batch
 		select {
 		case <-ctx.Done():
