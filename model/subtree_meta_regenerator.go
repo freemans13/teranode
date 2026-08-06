@@ -172,8 +172,12 @@ func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtr
 		return
 	}
 
+	// Regeneration runs for a corrupt meta file as well as a missing one, so the write has to
+	// replace whatever is already there. Without this the torn file stays on disk and the meta
+	// is rebuilt from subtree data on every read of that subtree.
 	dah := r.getBlockHeight() + r.blockHeightRetention
-	if err := r.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta, metaBytes, options.WithDeleteAt(dah)); err != nil {
+	if err := r.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta, metaBytes,
+		options.WithDeleteAt(dah), options.WithAllowOverwrite(true)); err != nil {
 		r.logger.Warnf("[storeRegeneratedMeta][%s] failed to store meta: %v", subtreeHash.String(), err)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -308,6 +309,50 @@ func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_Success(t *testing.T) {
 
 	// Verify meta was stored
 	require.Len(t, mockStore.storedMeta, 1)
+}
+
+// TestSubtreeMetaRegenerator_StoreRegeneratedMeta_ReplacesCorruptFile pins the repair
+// down to disk. Regeneration now also runs for a file that is present but corrupt, not
+// only for a missing one, so the store write has to be allowed to overwrite. A blob
+// store that refuses the overwrite leaves the corrupt bytes in place and the node
+// rebuilds the same meta on every read, forever.
+func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_ReplacesCorruptFile(t *testing.T) {
+	store := memory.New()
+	ctx := context.Background()
+
+	regenerator := &SubtreeMetaRegenerator{
+		logger:               ulogger.TestLogger{},
+		subtreeStore:         store,
+		getBlockHeight:       func() uint32 { return 100 },
+		blockHeightRetention: 288,
+	}
+
+	hash1, err := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
+	require.NoError(t, err)
+
+	subtree := &subtreepkg.Subtree{
+		Nodes: []subtreepkg.Node{
+			{Hash: subtreepkg.CoinbasePlaceholderHashValue},
+			{Hash: *hash1},
+		},
+	}
+	subtreeHash := subtree.RootHash()
+
+	// A torn meta file is already on disk under the key regeneration will write to.
+	corrupt := []byte("torn meta file")
+	require.NoError(t, store.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta, corrupt))
+
+	meta := subtreepkg.NewSubtreeMeta(subtree)
+	meta.TxInpoints[1] = subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}}
+
+	regenerator.storeRegeneratedMeta(ctx, subtreeHash, meta)
+
+	expected, err := meta.Serialize()
+	require.NoError(t, err)
+
+	stored, err := store.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
+	require.NoError(t, err)
+	require.Equal(t, expected, stored, "regenerated meta must replace the corrupt file on disk")
 }
 
 func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_NilStore(t *testing.T) {
