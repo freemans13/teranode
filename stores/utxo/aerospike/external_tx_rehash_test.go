@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/utxopersister"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -124,6 +125,45 @@ func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
 		require.Error(t, err)
 		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
 		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
+	})
+
+	t.Run("a corrupt outputs blob is a storage fault, not a consensus violation", func(t *testing.T) {
+		// Reached only when no FileTypeTx blob exists, so the read falls back to
+		// the outputs-only file. Same reasoning as the branch above: these bytes
+		// were written from our own outputs, so bytes that no longer parse mean
+		// this node's stored copy is wrong, not that the block or peer is.
+		s := newStore(t)
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeOutputs, []byte{0x01, 0x02, 0x03}))
+
+		_, err := s.getExternalTransaction(ctx, parentHash)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
+		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
+	})
+
+	t.Run("a legitimate outputs-only blob is still readable and deliberately not re-hashed", func(t *testing.T) {
+		// Pins the carve-out. This path reconstructs outputs only — no inputs, no
+		// version, no locktime — so the result cannot hash back to the key it was
+		// fetched under. Extending the re-hash to cover it would therefore reject
+		// perfectly good reads, which is exactly why it is left unguarded.
+		s := newStore(t)
+
+		wrapper := &utxopersister.UTXOWrapper{
+			TxID:   parentHash,
+			Height: 1,
+			UTXOs: []*utxopersister.UTXO{{
+				Index:  0,
+				Value:  1000,
+				Script: *parent.Outputs[0].LockingScript,
+			}},
+		}
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeOutputs, wrapper.Bytes()))
+
+		got, err := s.getExternalTransaction(ctx, parentHash)
+		require.NoError(t, err, "outputs-only reads must keep working")
+		require.Equal(t, uint64(1000), got.Outputs[0].Satoshis)
+		require.Equal(t, *parent.Outputs[0].LockingScript, *got.Outputs[0].LockingScript)
+		require.NotEqual(t, parentHash, *got.TxIDChainHash(), "cannot be re-hashed: this is why the branch is not guarded")
 	})
 
 	t.Run("a mismatched read is never cached", func(t *testing.T) {
