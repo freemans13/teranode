@@ -1,9 +1,8 @@
 package subtreevalidation
 
 import (
-	"io"
-
 	"github.com/bsv-blockchain/go-bt/v2"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/util"
 )
@@ -55,37 +54,19 @@ func checkCanonicalTxEncoding(tx *bt.Tx, bytesRead int64) error {
 	return nil
 }
 
-// countingReader counts the bytes a parser consumes, so a caller that cannot
-// instrument the parse itself can still compare what came off the wire against
-// what the parsed result serializes back to (issue 1421).
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-
-	return n, err
-}
-
-// checkCanonicalSubtreeData rejects a subtree-data payload whose wire bytes are
-// not the shortest encoding of themselves. The bulk /subtree_data/ fetch parses
-// with go-subtree, which discards the per-transaction byte counts
-// checkCanonicalTxEncoding relies on, so the equivalent check is made over the
-// whole payload: the bytes the parser consumed must equal the bytes the parsed
-// data serializes back to. Any non-minimal CompactSize prefix anywhere in the
-// payload makes the wire form longer.
-//
-// This matters because the caller stores the RE-SERIALIZED (canonical) form:
-// without the check, non-minimal bytes are silently normalised, the evidence is
-// discarded, and the subtree is blessed — after which the block referencing it
-// skips the per-transaction parse entirely, so nothing downstream can catch it.
-func checkCanonicalSubtreeData(consumed int64, serialized []byte) error {
-	if canonicalSize := int64(len(serialized)); consumed != canonicalSize {
-		return errors.NewTxInvalidError("subtree data is not canonically encoded: %d wire bytes for a %d-byte canonical serialization (non-minimal CompactSize prefix)", consumed, canonicalSize)
+// omittedCoinbaseTx returns the coinbase the subtree-data serialization leaves
+// out, or nil. go-subtree parses a leading coinbase into Txs[0] for a subtree
+// whose first node is the coinbase placeholder, but writes the file from index
+// 1 — so the parser consumes bytes the serialization never re-emits, and the
+// canonical-size comparison has to account for them (issue 1421).
+func omittedCoinbaseTx(subtree *subtreepkg.Subtree, data *subtreepkg.Data) *bt.Tx {
+	if subtree == nil || data == nil || len(subtree.Nodes) == 0 || len(data.Txs) == 0 {
+		return nil
 	}
 
-	return nil
+	if !subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+		return nil
+	}
+
+	return data.Txs[0]
 }

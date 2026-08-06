@@ -1378,7 +1378,7 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 						// Count what the parser consumes: go-subtree discards the
 						// per-transaction byte counts, so canonical encoding is
 						// checked over the whole payload below (issue 1421).
-						countingBody := &countingReader{r: bufferedReader}
+						countingBody := util.NewCountingReader(bufferedReader)
 
 						subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtreeForData, countingBody)
 						_ = body.Close()
@@ -1395,7 +1395,7 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 							subtreeDataBytes, err := subtreeData.Serialize()
 							if err != nil {
 								u.logger.Errorf("[validateSubtree][%s] failed to serialize subtree data: %v", subtreeHash.String(), err)
-							} else if canonicalErr := checkCanonicalSubtreeData(countingBody.n, subtreeDataBytes); canonicalErr != nil {
+							} else if canonicalErr := util.CheckCanonicalSubtreeData(countingBody.BytesConsumed(), subtreeDataBytes, omittedCoinbaseTx(subtreeForData, subtreeData)); canonicalErr != nil {
 								// Peer-supplied bytes: reject rather than storing the
 								// canonicalised form, which would discard the evidence
 								// and bless a subtree SV Node rejects at parse.

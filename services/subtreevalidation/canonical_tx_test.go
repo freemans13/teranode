@@ -1,9 +1,7 @@
 package subtreevalidation
 
 import (
-	"bytes"
 	"encoding/hex"
-	"io"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -90,41 +88,4 @@ func TestNonMinimalTxKeepsCanonicalTxID(t *testing.T) {
 
 	require.Equal(t, canonical.TxID(), nonMinimal.TxID(),
 		"go-bt canonicalizes on re-serialization, so the merkle check cannot catch this — the parse path must")
-}
-
-// TestCheckCanonicalSubtreeData pins the payload-level check used on the bulk
-// /subtree_data/ fetch, which parses via go-subtree and therefore cannot see
-// per-transaction byte counts. Round-2 review demonstrated that path accepted
-// non-minimal bytes and stored the canonicalised form, blessing a subtree whose
-// block then skipped the per-transaction parse entirely.
-func TestCheckCanonicalSubtreeData(t *testing.T) {
-	t.Run("matching sizes are accepted", func(t *testing.T) {
-		payload := []byte{1, 2, 3, 4, 5}
-		require.NoError(t, checkCanonicalSubtreeData(int64(len(payload)), payload))
-	})
-
-	t.Run("longer wire form than canonical serialization is rejected", func(t *testing.T) {
-		payload := []byte{1, 2, 3, 4, 5}
-
-		err := checkCanonicalSubtreeData(int64(len(payload))+2, payload)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "not canonically encoded")
-		require.True(t, errors.Is(err, errors.ErrTxInvalid))
-	})
-}
-
-// TestCountingReaderCountsExactly pins the byte counter the bulk check depends
-// on: an undercount would let non-minimal bytes through.
-func TestCountingReaderCountsExactly(t *testing.T) {
-	payload := make([]byte, 5000)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-
-	c := &countingReader{r: bytes.NewReader(payload)}
-
-	read, err := io.Copy(io.Discard, c)
-	require.NoError(t, err)
-	require.Equal(t, int64(len(payload)), read)
-	require.Equal(t, int64(len(payload)), c.n)
 }
