@@ -1,0 +1,114 @@
+package aerospike
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/stretchr/testify/require"
+)
+
+// buildParentTx returns a small complete transaction usable as a spend parent.
+func buildParentTx(t *testing.T, satoshis uint64, scriptByte byte) *bt.Tx {
+	t.Helper()
+
+	tx := bt.NewTx()
+
+	in := &bt.Input{PreviousTxOutIndex: 0, SequenceNumber: 0xffffffff, UnlockingScript: bscript.NewFromBytes([]byte{scriptByte, 0x02, 0x03})}
+	require.NoError(t, in.PreviousTxIDAdd(&chainhash.Hash{1}))
+	tx.Inputs = append(tx.Inputs, in)
+
+	tx.Outputs = append(tx.Outputs, &bt.Output{
+		Satoshis:      satoshis,
+		LockingScript: bscript.NewFromBytes([]byte{0x76, 0xa9, scriptByte, 0x88, 0xac}),
+	})
+
+	return tx
+}
+
+// TestGetTxFromExternalStoreRehashesAgainstKey pins issue 1439: a parent read
+// from the external store is a consensus input to spend validation (its
+// locking script and satoshis), so bytes that parse as *a* valid transaction
+// but are not the transaction the key names must be rejected rather than
+// silently validated against.
+func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
+	ctx := context.Background()
+
+	parent := buildParentTx(t, 1000, 0xaa)
+	other := buildParentTx(t, 999999, 0xbb)
+
+	parentHash := *parent.TxIDChainHash()
+	require.NotEqual(t, parentHash, *other.TxIDChainHash())
+
+	newStore := func(t *testing.T) *Store {
+		t.Helper()
+
+		return &Store{logger: ulogger.TestLogger{}, externalStore: memory.New()}
+	}
+
+	t.Run("correct bytes under the key are returned", func(t *testing.T) {
+		s := newStore(t)
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, parent.ExtendedBytes()))
+
+		got, err := s.getExternalTransaction(ctx, parentHash)
+		require.NoError(t, err)
+		require.Equal(t, parentHash, *got.TxIDChainHash())
+		require.Equal(t, uint64(1000), got.Outputs[0].Satoshis)
+	})
+
+	t.Run("another transaction's bytes under the key are rejected", func(t *testing.T) {
+		// A stale file from the pruner's delete-then-write race, or any
+		// mis-keyed return: the stored bytes are perfectly valid, so a body
+		// checksum would pass them. Only re-hashing catches it.
+		s := newStore(t)
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, other.ExtendedBytes()))
+
+		_, err := s.getExternalTransaction(ctx, parentHash)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "does not hash to the key it was stored under")
+	})
+
+	t.Run("a flipped byte in the locking script is rejected", func(t *testing.T) {
+		// The exact consensus hazard: a rotted blob whose script still parses
+		// would have the child's signature checked against the wrong spending
+		// condition.
+		s := newStore(t)
+
+		corrupt := parent.ExtendedBytes()
+		corrupt[len(corrupt)-3] ^= 0xff
+
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, corrupt))
+
+		_, err := s.getExternalTransaction(ctx, parentHash)
+		require.Error(t, err)
+	})
+
+	t.Run("a mismatched read is never cached", func(t *testing.T) {
+		// The caller memoizes by txid, so a cached bad read would be re-served
+		// to every later spend of this parent — and again after a restart,
+		// since the source is a file on disk.
+		s := newStore(t)
+		s.externalTxCache = util.NewExpiringConcurrentCacheWithMaxSize[chainhash.Hash, *bt.Tx](10*time.Second, 128)
+
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, other.ExtendedBytes()))
+
+		_, err := s.GetTxFromExternalStore(ctx, parentHash)
+		require.Error(t, err)
+
+		// Repair the blob; the next read must return the good value, proving
+		// the poisoned one was not retained.
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, parent.ExtendedBytes(), options.WithAllowOverwrite(true)))
+
+		got, err := s.GetTxFromExternalStore(ctx, parentHash)
+		require.NoError(t, err)
+		require.Equal(t, parentHash, *got.TxIDChainHash())
+	})
+}

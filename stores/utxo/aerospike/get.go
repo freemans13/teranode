@@ -1678,6 +1678,29 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 		if _, err = tx.ReadFrom(bufferedReader); err != nil {
 			return nil, errors.NewTxInvalidError("[GetTxFromExternalStore][%s] could not read tx from stream", previousTxHash.String(), err)
 		}
+
+		// Re-hash the reconstructed parent against the key it was fetched under
+		// (issue 1439). The parent's outputs are consensus inputs to spend
+		// validation: if the bytes are the wrong bytes but still parse as a
+		// valid transaction — a rotted or torn blob, a stale file from the
+		// pruner's delete-then-write race, or a correct-but-wrong-key return —
+		// the validator would check the child's signature against the wrong
+		// locking script and its value against the wrong satoshis, silently.
+		// A body checksum cannot catch a stale-but-intact file; only re-hashing
+		// against the requested outpoint can. This is also why the failure must
+		// happen HERE rather than being cached: the caller memoizes by txid, so
+		// one bad read would be re-served to every later spend of this parent,
+		// and re-served again after a restart because the source is on disk.
+		//
+		// FileTypeTx always holds the complete transaction (written from
+		// tx.ExtendedBytes and never rewritten), so its txid is reproducible.
+		// The FileTypeOutputs branch below is NOT re-hashable — it reconstructs
+		// outputs only, with no inputs, version or locktime — and neither is the
+		// inline-bins path, which nils out spent outputs; both need a different
+		// mechanism and are deliberately left alone here.
+		if actual := tx.TxIDChainHash(); !actual.Equal(previousTxHash) {
+			return nil, errors.NewTxInvalidError("[GetTxFromExternalStore][%s] external tx does not hash to the key it was stored under (got %s) — stale, rotted or mis-keyed blob", previousTxHash.String(), actual.String())
+		}
 	} else {
 		uw, err := utxopersister.NewUTXOWrapperFromReader(ctx, bufferedReader)
 		if err != nil {
