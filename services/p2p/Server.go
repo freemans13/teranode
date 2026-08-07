@@ -543,9 +543,11 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 // mirrored on Server. This lives apart from NewServer so that the wiring can
 // be tested without standing up the service's dependencies.
 //
-// A map that never reaches this function still falls back to
-// defaultPeerMapMaxSize rather than growing unbounded, so forgetting the call
-// degrades configurability, not the bound itself.
+// Neither value depends on this call having happened: an unconfigured cap
+// falls back to defaultPeerMapMaxSize inside cappedPeerMap, and an
+// unconfigured TTL falls back to defaultPeerMapTTL in peerMapTTLOrDefault.
+// Forgetting the call therefore costs configurability, not the bound and not
+// attribution.
 func (s *Server) applyPeerMapLimits(tSettings *settings.Settings) {
 	maxSize := defaultPeerMapMaxSize
 	s.peerMapTTL = defaultPeerMapTTL
@@ -560,6 +562,19 @@ func (s *Server) applyPeerMapLimits(tSettings *settings.Settings) {
 
 	s.blockPeerMap.setMaxSize(maxSize)
 	s.subtreePeerMap.setMaxSize(maxSize)
+}
+
+// peerMapTTLOrDefault returns the attribution TTL, falling back to
+// defaultPeerMapTTL when it was never configured. A zero TTL is not "expire
+// nothing" but "expire everything": the sweep's cutoff would land on now, so
+// every announcement would be gone before the block it names finishes
+// validating, and the invalid-block ban path would find nobody to blame.
+func (s *Server) peerMapTTLOrDefault() time.Duration {
+	if s.peerMapTTL <= 0 {
+		return defaultPeerMapTTL
+	}
+
+	return s.peerMapTTL
 }
 
 // httpServeError returns the error the HTTP serve goroutine exited with, or nil

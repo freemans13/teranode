@@ -639,6 +639,29 @@ func TestApplyPeerMapLimits(t *testing.T) {
 		require.Equal(t, 5, s.subtreePeerMap.Len())
 	})
 
+	t.Run("an unconfigured TTL does not expire everything on the next sweep", func(t *testing.T) {
+		// The zero TTL is the mirror hazard of the zero cap. It reads like
+		// "expire nothing" and behaves like "expire everything": the sweep
+		// cutoff lands on now, so every announcement is gone before the block
+		// it names finishes validating and the ban path finds nobody to blame.
+		s := &Server{logger: ulogger.TestLogger{}}
+		require.Zero(t, s.peerMapTTL, "the hazard only exists while the field is unset")
+		require.Equal(t, defaultPeerMapTTL, s.peerMapTTLOrDefault())
+
+		s.storePeerMapEntry(&s.blockPeerMap, "block-hash", "peer-to-ban", now)
+		s.storePeerMapEntry(&s.subtreePeerMap, "subtree-hash", "peer-to-ban", now)
+
+		s.cleanupPeerMaps()
+
+		peerID, err := s.getPeerFromMap(&s.blockPeerMap, "block-hash", "block")
+		require.NoError(t, err, "a sweep on an unconfigured Server must not wipe attribution")
+		require.Equal(t, "peer-to-ban", peerID)
+
+		peerID, err = s.getPeerFromMap(&s.subtreePeerMap, "subtree-hash", "subtree")
+		require.NoError(t, err)
+		require.Equal(t, "peer-to-ban", peerID)
+	})
+
 	t.Run("a non-positive configured size cannot unbound the maps", func(t *testing.T) {
 		tSettings := &settings.Settings{}
 		tSettings.P2P.PeerMapMaxSize = -1

@@ -840,7 +840,12 @@ func (s *Server) cleanupPeerMaps() {
 	// Expire the attribution maps in a single locked pass each. Size is not
 	// enforced here: the maps are bounded at insert (issue 1409), so by the
 	// time this runs they are already within the cap.
-	ttlCutoff := now.Add(-s.peerMapTTL)
+	//
+	// Resolve the TTL rather than trusting the field: a Server that never
+	// reached applyPeerMapLimits leaves it at zero, and a zero TTL puts the
+	// cutoff at now, expiring every entry on every tick and switching off ban
+	// attribution entirely. The cap fails closed, so this does too.
+	ttlCutoff := now.Add(-s.peerMapTTLOrDefault())
 	blockExpired := s.blockPeerMap.DeleteExpired(ttlCutoff)
 	subtreeExpired := s.subtreePeerMap.DeleteExpired(ttlCutoff)
 
