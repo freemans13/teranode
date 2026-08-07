@@ -19,6 +19,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// withNonMinimalInputCount rewrites the input-count prefix of the transaction
+// starting at off from its minimal 1-byte form to the 3-byte form. go-bt accepts
+// the over-long prefix and re-serializes it canonically, so every hash-based
+// check downstream still passes — which is precisely why the encoding has to be
+// caught at the parse.
+func withNonMinimalInputCount(t *testing.T, payload []byte, off int) []byte {
+	t.Helper()
+
+	count := payload[off+4]
+	require.Greater(t, count, byte(0x00), "fixture transaction must have inputs")
+	require.Less(t, count, byte(0xfd), "fixture transaction must have a 1-byte input count")
+
+	mangled := make([]byte, 0, len(payload)+2)
+	mangled = append(mangled, payload[:off+4]...) // through version
+	mangled = append(mangled, 0xfd, count, 0x00)  // non-minimal input count
+	mangled = append(mangled, payload[off+5:]...) // the rest, unchanged
+
+	return mangled
+}
+
 // TestFetchAndStoreSubtreeData_NonCanonicalEncoding pins issue 1421 on the
 // catchup prewarm. This path runs BEFORE block validation and stores the
 // re-serialized form, so an unchecked non-minimal payload is laundered to disk
@@ -71,18 +91,10 @@ func TestFetchAndStoreSubtreeData_NonCanonicalEncoding(t *testing.T) {
 	})
 
 	t.Run("non-minimal CompactSize is rejected, not laundered to disk", func(t *testing.T) {
-		// Rewrite the first transaction's input-count prefix from its minimal
-		// 1-byte form to the 3-byte form. go-bt accepts it and re-serializes
-		// canonically, so every hash-based check downstream still passes —
-		// which is exactly why the encoding has to be rejected here.
-		firstTx := txs[1].Bytes()
-		idx := bytes.Index(canonical, firstTx)
+		idx := bytes.Index(canonical, txs[1].Bytes())
 		require.GreaterOrEqual(t, idx, 0, "fixture must contain the first transaction verbatim")
 
-		mangled := make([]byte, 0, len(canonical)+2)
-		mangled = append(mangled, canonical[:idx+4]...)   // through version
-		mangled = append(mangled, 0xfd, firstTx[4], 0x00) // non-minimal input count
-		mangled = append(mangled, canonical[idx+5:]...)   // the rest, unchanged
+		mangled := withNonMinimalInputCount(t, canonical, idx)
 
 		server := newServer()
 		httpmock.ActivateNonDefault(util.HTTPClient())
@@ -103,6 +115,55 @@ func TestFetchAndStoreSubtreeData_NonCanonicalEncoding(t *testing.T) {
 
 		// The canonicalised form must NOT have been written: storing it would
 		// discard the evidence and bless a subtree SV Node rejects at parse.
+		exists, existsErr := server.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
+		require.NoError(t, existsErr)
+		require.False(t, exists, "non-canonical payload must not be stored")
+	})
+
+	// A peer may equally serve the coinbase, which is what a subtree-data file
+	// written from parsed transactions contains. go-subtree parses it into Txs[0]
+	// but Serialize writes the file from index 1, so the parse legitimately
+	// consumes bytes the serialization never re-emits. The check has to add the
+	// coinbase's canonical size back, or every first subtree of every block from
+	// such a peer is rejected and catchup stalls. An earlier commit on this branch
+	// had to fix exactly that, which is why the branch is pinned here rather than
+	// left to the util-level unit test.
+	withCoinbase := append(txs[0].Bytes(), canonical...)
+
+	t.Run("canonical payload including the coinbase is accepted", func(t *testing.T) {
+		server := newServer()
+		httpmock.ActivateNonDefault(util.HTTPClient())
+		defer httpmock.DeactivateAndReset()
+
+		httpmock.RegisterResponder("GET", subtreeDataURL, httpmock.NewBytesResponder(200, withCoinbase))
+
+		require.NoError(t, server.fetchAndStoreSubtreeData(ctx, testBlock, subtreeHash, st, peerID, baseURL, false))
+
+		// The stored form omits the coinbase, so accepting the payload must not
+		// mean storing the bytes that came off the wire.
+		stored, storedErr := server.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
+		require.NoError(t, storedErr)
+		require.Equal(t, canonical, stored)
+	})
+
+	t.Run("non-minimal coinbase prefix is rejected", func(t *testing.T) {
+		// The coinbase's size is ADDED back rather than the consumed bytes being
+		// ignored, so an over-long prefix on the one transaction the serialization
+		// drops is still caught.
+		mangled := withNonMinimalInputCount(t, withCoinbase, 0)
+
+		server := newServer()
+		httpmock.ActivateNonDefault(util.HTTPClient())
+		defer httpmock.DeactivateAndReset()
+
+		httpmock.RegisterResponder("GET", subtreeDataURL, httpmock.NewBytesResponder(200, mangled))
+
+		err := server.fetchAndStoreSubtreeData(ctx, testBlock, subtreeHash, st, peerID, baseURL, false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "non-canonical subtree data")
+		require.True(t, errors.Is(err, errors.ErrProcessing))
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
+
 		exists, existsErr := server.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 		require.NoError(t, existsErr)
 		require.False(t, exists, "non-canonical payload must not be stored")
