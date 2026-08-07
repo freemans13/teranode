@@ -85,19 +85,25 @@ type peerMapNode struct {
 	entry peerMapEntry
 }
 
-// setMaxSize configures the insert cap. A non-positive value selects
-// defaultPeerMapMaxSize: this type has no unbounded mode, so a map that never
-// reaches applyPeerMapLimits — a bare Server literal in a test fixture, or a
-// future construction path that forgets the call — is still bounded.
+// setMaxSize configures the insert cap, normalising a non-positive value to
+// defaultPeerMapMaxSize so that maxSize always holds the cap actually in
+// force. This type has no unbounded mode: a map that never reaches
+// applyPeerMapLimits — a bare Server literal in a test fixture, or a future
+// construction path that forgets the call — is still bounded, by capLocked.
 func (m *cappedPeerMap) setMaxSize(maxSize int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if maxSize <= 0 {
+		maxSize = defaultPeerMapMaxSize
+	}
+
 	m.maxSize = maxSize
 }
 
-// capLocked returns the cap in force, resolving the unconfigured zero value to
-// the default. Callers must hold the mutex.
+// capLocked returns the cap in force, covering the one case setMaxSize cannot:
+// a struct whose zero value was never configured at all. Callers must hold the
+// mutex.
 func (m *cappedPeerMap) capLocked() int {
 	if m.maxSize <= 0 {
 		return defaultPeerMapMaxSize
@@ -200,13 +206,21 @@ func (m *cappedPeerMap) Delete(hash string) {
 	}
 }
 
-// Clear removes every entry.
+// Clear removes every entry, along with the eviction pressure recorded for
+// them. The counters describe entries that no longer exist, so carrying them
+// past a Clear would report pressure from before the reset on the next sweep.
+// The configured cap survives: Stop calls Clear, and a cap dropped here would
+// leave the maps on the fallback for the rest of the process's life.
 func (m *cappedPeerMap) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.entries = nil
 	m.order = nil
+	m.evictors = nil
+	m.evictorsOverflow = false
+
+	m.evicted.Store(0)
 }
 
 // Len returns the number of entries.

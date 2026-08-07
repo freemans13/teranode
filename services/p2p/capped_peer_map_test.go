@@ -554,8 +554,19 @@ func TestCappedPeerMapClearRetainsMaxSize(t *testing.T) {
 		m.Store(fmt.Sprintf("hash-%d", i), peerMapEntry{peerID: "p", timestamp: now})
 	}
 
+	// Evict a few so there is pressure recorded to carry across the Clear.
+	for i := 0; i < 5; i++ {
+		m.Store(fmt.Sprintf("pressure-%d", i), peerMapEntry{peerID: "attacker", timestamp: now})
+	}
+
 	m.Clear()
 	require.Equal(t, 0, m.Len())
+
+	// The counters described entries that no longer exist, so they go with
+	// them: otherwise the sweep after a Clear reports pressure from before it.
+	cleared := m.EvictionsSinceLastRead()
+	require.Equal(t, int64(0), cleared.total, "Clear must drop the eviction counter")
+	require.Empty(t, cleared.topPeer, "Clear must drop the eviction attribution")
 
 	for i := 0; i < 50; i++ {
 		m.Store(fmt.Sprintf("after-%d", i), peerMapEntry{peerID: "p", timestamp: now})
