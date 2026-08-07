@@ -409,9 +409,13 @@ attempts:
 //
 // # Detection coverage
 //
-// It probes a bounded window of heights walking down from the tip, stopping at
-// the first (i.e. highest) missing coinbase and running recovery from there --
-// recoverCoinbaseDivergence then scopes and repairs everything beneath it.
+// It probes a bounded window of heights walking down from the tip. On the
+// first (i.e. highest) missing coinbase it runs recovery from there --
+// recoverCoinbaseDivergence scopes and repairs the gap beneath it -- and then
+// carries on down the same window looking for further holes, because the
+// walk-back only proves CoinbaseRecoveryConsecutiveGood present coinbases
+// below the gap it closed and stops there. Only a refusal ends the scan, since
+// a structural refusal would repeat identically at every lower height.
 //
 // Probing the tip alone is not enough. The fast-forward create loop in
 // SubtreeProcessor.reset runs one goroutine per moveForward block, so a crash
@@ -500,13 +504,29 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 			// has already logged the loud MANUAL INTERVENTION alert and incremented
 			// the "escalated" metric; log that startup recovery failed and let the
 			// node boot so an operator can inspect and act.
+			//
+			// Stop scanning here. A refusal is structural -- an over-large gap,
+			// or a floor that cannot be proven -- so the same walk-back run from
+			// a lower height would refuse for the same reason, adding nothing
+			// but repeat alarms.
 			b.logger.Errorf("[coinbaseRecovery] startup recovery failed at height %d (tip %d): %v; manual intervention required (run resetblockassembly)", h, height, err)
+
+			return nil
 		}
 
-		// One recovery pass per boot: recoverCoinbaseDivergence already scoped
-		// and repaired the contiguous gap beneath the highest miss, and
-		// re-scanning here would double-report the same divergence.
-		return nil
+		// Keep scanning below the range just repaired, inside the same window
+		// budget. The walk-back only proved CoinbaseRecoveryConsecutiveGood
+		// present coinbases beneath the gap it closed, so a second hole
+		// separated from the first by that many present heights is still
+		// missing and has not been looked for. That shape is the norm, not an
+		// exotic case: the fast-forward create loop runs one goroutine per
+		// block, so a crash mid-loop leaves a scattered set of misses, and at a
+		// low miss rate runs of several successes between them are expected.
+		//
+		// Re-probing the heights just repaired costs one store read each and
+		// now reports them present, so they are skipped. h decrements every
+		// iteration, so the existing window and floor bounds still terminate
+		// the loop.
 	}
 
 	return nil

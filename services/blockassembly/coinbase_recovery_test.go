@@ -732,6 +732,94 @@ func TestStartupCoinbaseDivergenceCheck_HoleBelowPresentTip(t *testing.T) {
 	}
 }
 
+// TestStartupCoinbaseDivergenceCheck_RepairsSecondClusterBelowTheFirst is the
+// regression test for ChiR6. The startup scan used to stop the moment one
+// recovery pass had run, but that pass only proves
+// CoinbaseRecoveryConsecutiveGood present coinbases beneath the gap it closed.
+// A second hole separated from the first by that many present heights was
+// therefore never looked for, and being startup-only the detector would not
+// come back to it until the next reboot -- converging one cluster per restart
+// with nothing forcing those restarts, while the unrepaired coinbase re-wedged
+// the tip on its maturity spend.
+//
+// This uses the default-shaped ConsecutiveGood of 6 and two clusters with
+// exactly six present heights between them, which is the case a single-cluster
+// test with ConsecutiveGood=1 cannot reach.
+func TestStartupCoinbaseDivergenceCheck_RepairsSecondClusterBelowTheFirst(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 6
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// Heights 1..20. Missing: 18 (upper cluster) and 11 (lower cluster), with
+	// the six present heights 12..17 between them. Recovery triggered at 18
+	// sees 17,16,15,14,13,12 present, declares its floor there and stops, so
+	// the hole at 11 survives unless the scan keeps walking below the repair.
+	const chainLen = 20
+
+	missing := map[uint32]bool{18: true, 11: true}
+
+	headers := buildCanonicalChain(ctx, t, items, chainLen)
+
+	for h := uint32(1); h <= chainLen; h++ {
+		if !missing[h] {
+			seedCoinbase(ctx, t, items, headers, h)
+		}
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[chainLen-1], chainLen)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	for h := uint32(1); h <= chainLen; h++ {
+		present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, h)
+		require.NoError(t, err)
+		require.True(t, present, "coinbase at height %d must be present after startup recovery", h)
+	}
+
+	require.Equal(t, float64(2),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		"both clusters must be detected and repaired in a single boot")
+}
+
+// TestStartupCoinbaseDivergenceCheck_StopsScanningAfterARefusal is the other
+// half of ChiR6: a refusal is structural, so the same walk-back from a lower
+// height would refuse for the same reason. The scan must stop rather than
+// repeat the manual-intervention alarm once per missing height.
+func TestStartupCoinbaseDivergenceCheck_StopsScanningAfterARefusal(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 1
+
+	// Heights 2..6 all missing above a good floor at 1. With a gap cap of 1 the
+	// walk-back refuses, and it would refuse identically from 5, 4, 3 and 2.
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	seedCoinbase(ctx, t, items, headers, 1)
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+
+	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
+		"a structural refusal must be reported once, not once per missing height")
+}
+
 // TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned states the
 // honest limit of the widened startup scan: it covers a bounded window below
 // the tip (CoinbaseRecoveryMaxGapBlocks heights), not the whole chain. A hole
