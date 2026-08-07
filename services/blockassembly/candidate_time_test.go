@@ -433,6 +433,66 @@ func TestCandidateTimeFallback(t *testing.T) {
 		require.Equal(t, 1, occupied, "one parent must occupy at most one slot, or it evicts the other candidate path's entry")
 	})
 
+	t.Run("a caller joining an in-flight fetch waits on its own context, not the leader's", func(t *testing.T) {
+		// Single-flighting makes one caller's fetch serve every other caller on
+		// that parent, which is the point — but it must not make them hostage to
+		// it. Miners poll several times a second with their own gRPC deadlines,
+		// so a follower whose own deadline fires has to give up and degrade to
+		// the wall clock for that poll rather than block until the leader's fetch
+		// returns. Nothing is memoized on that path, so its next poll re-flights.
+		var enterOnce sync.Once
+
+		entered := make(chan struct{})
+		release := make(chan struct{})
+
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).
+			Return(headers, []*model.BlockHeaderMeta{}, nil).
+			Run(func(mock.Arguments) {
+				enterOnce.Do(func() { close(entered) })
+				<-release
+			})
+
+		assembler := newAssembler(mockClient)
+
+		leaderDone := make(chan int64, 1)
+
+		go func() {
+			got, _ := assembler.candidateTime(context.WithoutCancel(t.Context()), tip)
+			leaderDone <- got
+		}()
+
+		<-entered
+
+		// The leader is inside the fetch, so this caller joins its flight rather
+		// than starting one of its own.
+		followerCtx, cancelFollower := context.WithCancel(t.Context())
+		followerDone := make(chan int64, 1)
+		followerErr := make(chan error, 1)
+
+		go func() {
+			got, err := assembler.candidateTime(followerCtx, tip)
+			followerErr <- err
+			followerDone <- got
+		}()
+
+		cancelFollower()
+
+		select {
+		case got := <-followerDone:
+			require.NoError(t, <-followerErr)
+			require.Less(t, got, wantFloor, "a caller that gave up must degrade to the wall clock, not report a floor it never fetched")
+		case <-time.After(5 * time.Second):
+			close(release)
+			t.Fatal("a follower blocked past its own cancelled context waiting on the leader's fetch")
+		}
+
+		close(release)
+
+		require.Equal(t, wantFloor, <-leaderDone, "the leader's own fetch must still complete and floor its candidate")
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeaders", 1)
+	})
+
 	t.Run("both candidate paths' parents stay memoized together", func(t *testing.T) {
 		// The busy branch keys on the blockchain service's tip while the main
 		// path keys on the subtree processor's precomputed parent, so a

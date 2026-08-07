@@ -174,7 +174,20 @@ func (b *BlockAssembler) mtpFloor(ctx context.Context, parentHeader *model.Block
 	// its own round-robin slot, so one parent occupies both and evicts the other
 	// candidate path's entry. Sharing one flight per parent makes the entry a
 	// single object again, which is what the per-entry log latches assume.
-	shared, _, _ := b.mtpFloorFlight.Do(parentHash.String(), func() (interface{}, error) {
+	//
+	// DoChan rather than Do so that sharing the flight does not also share the
+	// leader's deadline: Do blocks every follower until the leader's fetch
+	// returns, however long after their own contexts died. Each caller therefore
+	// waits on its own context and degrades to the wall clock when it expires,
+	// which is the same degradation a failed lookup already takes. A caller that
+	// gives up memoizes nothing, so the next poll re-flights.
+	//
+	// The flight itself still runs on whichever context entered it first, so a
+	// leader that is cancelled mid-fetch returns nil to the followers waiting on
+	// it and costs them a floor for that one poll. Detaching the flight from its
+	// leader would fix that too, but it would leave the fetch with no deadline at
+	// all and nothing to cancel it; one self-healing poll is the cheaper problem.
+	ch := b.mtpFloorFlight.DoChan(parentHash.String(), func() (interface{}, error) {
 		// Re-check inside the flight: a previous flight for this parent may have
 		// completed between the read above and getting here.
 		if entry := b.memoizedMtpFloor(parentHash); entry != nil {
@@ -184,9 +197,17 @@ func (b *BlockAssembler) mtpFloor(ctx context.Context, parentHeader *model.Block
 		return b.computeMtpFloor(ctx, parentHeader, parentHash), nil
 	})
 
-	entry, _ := shared.(*mtpFloorEntry)
+	select {
+	case res := <-ch:
+		entry, _ := res.Val.(*mtpFloorEntry)
 
-	return entry
+		return entry
+	case <-ctx.Done():
+		// No log line: the caller is abandoning this poll, so the candidate this
+		// feeds is already on its way to being discarded. computeMtpFloor logs
+		// the causes that matter.
+		return nil
+	}
 }
 
 // memoizedMtpFloor returns the memo entry for parentHash, or nil on a miss.
