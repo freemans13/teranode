@@ -107,7 +107,6 @@ type Store struct {
 	storeURL        *url.URL
 	engine          string
 	blockHeight     atomic.Uint32
-	medianBlockTime atomic.Uint32
 	blockState      utxo.BlockStateHolder
 	ctx             context.Context
 	spendBatcher    *batcher.Batcher[batchSpend]
@@ -196,7 +195,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		storeURL:        storeURL,
 		engine:          storeURL.Scheme,
 		blockHeight:     atomic.Uint32{},
-		medianBlockTime: atomic.Uint32{},
 		ctx:             ctx,
 	}
 
@@ -293,19 +291,21 @@ func (s *Store) GetBlockHeight() uint32 {
 
 func (s *Store) SetMedianBlockTime(medianTime uint32) error {
 	s.logger.Debugf("setting median block time to %d", medianTime)
-	s.medianBlockTime.Store(medianTime)
 	s.blockState.SetMedianTime(medianTime)
 
 	return nil
 }
 
 func (s *Store) GetMedianBlockTime() uint32 {
-	return s.medianBlockTime.Load()
+	return s.blockState.Load().MedianTime
 }
 
 // SetBlockState publishes both chain-tip values as one atomic snapshot; see
-// utxo.Store. The individual atomics are kept in step for their existing
-// single-field readers.
+// utxo.Store. The separate blockHeight atomic — read directly by the DAH and
+// maturity paths — is stored alongside the snapshot rather than as part of it,
+// so concurrent writers could leave the two disagreeing. Production has a
+// single writer (the blockchain notification listener), which keeps them in
+// step; callers that need one guaranteed-consistent pair use GetBlockState.
 func (s *Store) SetBlockState(blockHeight, medianTime uint32) error {
 	if blockHeight == 0 {
 		return errors.NewInvalidArgumentError("block height cannot be zero")
@@ -313,7 +313,6 @@ func (s *Store) SetBlockState(blockHeight, medianTime uint32) error {
 
 	s.logger.Debugf("setting block state to height %d, median time %d", blockHeight, medianTime)
 	s.blockHeight.Store(blockHeight)
-	s.medianBlockTime.Store(medianTime)
 	s.blockState.SetPair(blockHeight, medianTime)
 
 	return nil

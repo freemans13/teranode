@@ -952,11 +952,11 @@ func SetBlockHeightZero(t *testing.T, db utxostore.Store) {
 
 // SetBlockStateContract pins the write side of the GetBlockState snapshot
 // guarantee on a real store (issue 1443): after one SetBlockState call the
-// snapshot AND the single-field getters must all agree — the single-field
-// atomics feed DAH and maturity logic directly, so a SetBlockState that
-// updated only the snapshot pair would silently freeze those readers at a
-// stale height while every pair-based test stayed green. Height zero is
-// rejected exactly like SetBlockHeight(0).
+// snapshot AND the single-field getters must all agree. Height matters most
+// here: stores keep it in a separate atomic that DAH and maturity logic read
+// directly, so a SetBlockState that updated only the snapshot pair would
+// silently freeze those readers at a stale height while every pair-based test
+// stayed green. Height zero is rejected exactly like SetBlockHeight(0).
 //
 // The store's block state is restored on the way out, so this is safe to run
 // against a suite-wide shared store: later cases that derive a height from
@@ -1048,13 +1048,20 @@ func SetBlockStateSnapshotUnderConcurrency(t *testing.T, db utxostore.Store) {
 		}()
 	}
 
+	// Recorded rather than asserted inside the loop: a FailNow here would skip
+	// close(stop) and leave the readers spinning for the rest of the run.
+	var writeErr error
+
 	for i := baseHeight + 1; i <= baseHeight+iterations; i++ {
-		require.NoError(t, db.SetBlockState(i, i+offset))
+		if writeErr = db.SetBlockState(i, i+offset); writeErr != nil {
+			break
+		}
 	}
 
 	close(stop)
 	wg.Wait()
 
+	require.NoError(t, writeErr)
 	require.Empty(t, torn, "GetBlockState returned torn pairs: %v", torn)
 }
 

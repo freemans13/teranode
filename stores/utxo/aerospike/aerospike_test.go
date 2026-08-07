@@ -563,11 +563,11 @@ func TestStore_MedianBlockTime(t *testing.T) {
 	})
 
 	t.Run("DirectAtomicManipulation", func(t *testing.T) {
-		// Test direct manipulation of atomic value for GetMedianBlockTime
-		store.medianBlockTime.Store(54321)
+		// Test direct manipulation of the backing snapshot for GetMedianBlockTime
+		store.blockState.SetMedianTime(54321)
 		assert.Equal(t, uint32(54321), store.GetMedianBlockTime())
 
-		store.medianBlockTime.Store(98765)
+		store.blockState.SetMedianTime(98765)
 		assert.Equal(t, uint32(98765), store.GetMedianBlockTime())
 	})
 }
@@ -705,7 +705,7 @@ func TestStore_AtomicOperations(t *testing.T) {
 		const numOperations = 100
 
 		// Set initial value
-		store.medianBlockTime.Store(2000)
+		store.blockState.SetMedianTime(2000)
 
 		// Test concurrent reads and atomic writes
 		for i := 0; i < numGoroutines; i++ {
@@ -716,7 +716,7 @@ func TestStore_AtomicOperations(t *testing.T) {
 					assert.NotNil(t, medianTime) // Just ensure it doesn't panic
 
 					// Atomic store operation
-					store.medianBlockTime.Store(uint32(id*2000 + j))
+					store.blockState.SetMedianTime(uint32(id*2000 + j))
 				}
 			}(i)
 		}

@@ -47,10 +47,11 @@ import (
 // before a reassigned UTXO becomes spendable.
 const ReAssignedUtxoSpendableAfterBlocks = 1_000
 
-// BlockState represents an atomic snapshot of blockchain state containing
-// both block height and median block time. This ensures consistency between
-// these values during validation, preventing race conditions that could occur
-// when reading them separately.
+// BlockState is the pair of chain-tip values validation reads together: the
+// block height and the median block time. GetBlockState returns it in a single
+// atomic load, so the two fields can never be torn mid-read the way separate
+// reads of two atomics could be; how consistent the pair is with one chain tip
+// is down to the writer (see SetBlockState).
 type BlockState struct {
 	Height     uint32 // Current block height
 	MedianTime uint32 // Median time of recent blocks
