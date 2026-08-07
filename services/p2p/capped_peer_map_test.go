@@ -94,6 +94,40 @@ func TestCappedPeerMapEvictionAttribution(t *testing.T) {
 		m.mu.Unlock()
 	})
 
+	t.Run("a dominant flooder is still named when the tracker overflowed", func(t *testing.T) {
+		var m cappedPeerMap
+
+		m.setMaxSize(10)
+
+		// The attacker forces the bulk of the evictions.
+		for i := 0; i < 100; i++ {
+			m.Store(fmt.Sprintf("junk-%d", i), peerMapEntry{peerID: "attacker", timestamp: now})
+		}
+
+		// Then enough distinct honest peers arrive to overflow the tracker. At
+		// capacity every new hash evicts, so on a real mesh this happens within
+		// one sweep window whenever the node has more peers than the tracker can
+		// name — which must not be allowed to hide the flooder behind "spread".
+		for i := 0; i < evictorTrackLimit+4; i++ {
+			m.Store(fmt.Sprintf("honest-%d", i), peerMapEntry{
+				peerID:    fmt.Sprintf("honest-peer-%d", i),
+				timestamp: now,
+			})
+		}
+
+		evictions := m.EvictionsSinceLastRead()
+		require.True(t, evictions.spread, "more contributors than the tracker can name must set spread")
+		require.Equal(t, "attacker", evictions.topPeer)
+		require.Greater(t, evictions.topCount*2, evictions.total, "the attacker must hold a majority share")
+
+		// total is exact even under overflow, so a majority share cannot be an
+		// artefact of which peers the tracker happened to name first. Reporting
+		// "spread" here would tell the operator to raise the cap, which is the
+		// one response issue 1503 says is wrong for a flood.
+		require.Contains(t, evictions.String(), "top contributor peer attacker")
+		require.NotContains(t, evictions.String(), "spread across")
+	})
+
 	t.Run("the flooder is named, not the honest peers it displaced", func(t *testing.T) {
 		var m cappedPeerMap
 

@@ -58,23 +58,29 @@ type cappedPeerMap struct {
 }
 
 // evictorTrackLimit bounds how many distinct peers the eviction attribution
-// names before it gives up on naming and reports the overflow instead. Past
-// this many contributors the pressure is spread by definition, which is the
-// answer the operator needed anyway.
+// names before it stops admitting new ones, so the diagnostic cannot itself
+// become the unbounded map issue 1409 is about. Overflowing it does not mean
+// the pressure is spread — at capacity every new hash evicts, so a busy mesh
+// overflows the tracker routinely — which is why String weighs the top
+// contributor's share against the exact total rather than trusting the flag.
 const evictorTrackLimit = 16
 
 // evictionStats summarises eviction pressure for one sweep window.
 type evictionStats struct {
 	total int64 // entries dropped to make room since the previous read
 
-	// topPeer is the peer whose inserts forced the most evictions, exact while
-	// the number of distinct contributors stayed within evictorTrackLimit.
-	// Empty when nothing was evicted.
+	// topPeer is the peer whose inserts forced the most evictions, and topCount
+	// its exact share. Empty when nothing was evicted. Under spread this is the
+	// largest contributor the tracker admitted rather than provably the largest
+	// overall, since a peer that first evicted after the tracker filled is
+	// counted as zero — so the attribution can miss a flooder, but the count it
+	// does report is never inflated.
 	topPeer  string
 	topCount int64
 
-	// spread is set when more peers contributed than the tracker can name, so
-	// topPeer is only one of many rather than a dominant flooder.
+	// spread is set when more peers contributed than the tracker can name. It
+	// bounds how much the attribution can be trusted; it is not by itself
+	// evidence that no peer dominates.
 	spread bool
 }
 
@@ -302,15 +308,25 @@ func (m *cappedPeerMap) EvictionsSinceLastRead() evictionStats {
 }
 
 // String renders the eviction attribution for the at-capacity log line.
+//
+// Dominance is tested before overflow, not after. Once a map sits at capacity
+// every new hash evicts, so on a mesh with more peers than the tracker can name
+// the overflow flag is set in almost every sweep window — and testing it first
+// would discard the name and report "spread" even when one peer caused nearly
+// all of the pressure. That is the one answer issue 1503 says is wrong for a
+// flood: it tells the operator to raise the cap, which only buys the attacker
+// more memory. Comparing against total is safe under overflow because total is
+// exact while evictors is not, so a majority share cannot be an artefact of
+// which peers the tracker happened to name first.
 func (s evictionStats) String() string {
 	switch {
 	case s.total == 0:
 		return "none"
-	case s.spread:
-		return fmt.Sprintf("spread across more than %d peers", evictorTrackLimit)
 	case s.topCount == s.total:
 		return fmt.Sprintf("all from peer %s", s.topPeer)
+	case s.spread && s.topCount*2 <= s.total:
+		return fmt.Sprintf("spread across more than %d peers", evictorTrackLimit)
 	default:
-		return fmt.Sprintf("top contributor peer %s with %d", s.topPeer, s.topCount)
+		return fmt.Sprintf("top contributor peer %s with %d of %d", s.topPeer, s.topCount, s.total)
 	}
 }
