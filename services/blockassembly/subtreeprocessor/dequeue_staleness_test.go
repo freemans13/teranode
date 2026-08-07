@@ -62,6 +62,36 @@ func TestLastDequeueTime_SeededBeforeStart(t *testing.T) {
 		"LastDequeueTime must be seeded at construction, before Start() is ever called")
 }
 
+// TestLastDequeueTime_ReseededAtStart pins the second seed, which the two tests
+// above cannot: with a constructor seed in place, removing the re-seed in Start()
+// fails nothing, because the constructor value is already approximately now by the
+// time either of them asserts.
+//
+// The re-seed earns its keep because the gap between the two is not small in
+// production — Init brings up ingest, then loadUnminedTransactions runs, and only
+// then does Start reach the consumer. Staleness accrued across that window belongs
+// to the startup sequence, not to a consumer that did not exist yet; without the
+// re-seed the first reading after Start would already be minutes old and could
+// trip the stall warning against a consumer that had just begun working.
+func TestLastDequeueTime_ReseededAtStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stp := newTestSubtreeProcessorForDequeueStaleness(t, ctx)
+
+	constructed := stp.LastDequeueTime()
+
+	// Stand in for the reload window between construction and Start. Short, but
+	// comfortably larger than the assertion's margin.
+	time.Sleep(100 * time.Millisecond)
+
+	stp.Start(ctx)
+	t.Cleanup(func() { stp.Stop(ctx) })
+
+	require.True(t, stp.LastDequeueTime().After(constructed.Add(50*time.Millisecond)),
+		"Start() must re-seed LastDequeueTime, so staleness accrued before the consumer existed is not attributed to it")
+}
+
 // TestLastDequeueTime_StopsAdvancingWhileConsumerParked is the test required
 // by issue #1429: it parks the SubtreeProcessor's single consumer goroutine
 // via a real, already-shipped production code path (the lengthCh plumbing
