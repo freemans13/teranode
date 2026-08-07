@@ -129,6 +129,12 @@ type BlockAssembler struct {
 	mtpFloorMemo     [2]atomic.Pointer[mtpFloorEntry]
 	mtpFloorMemoNext atomic.Uint64
 
+	// mtpFloorFailureLoggedTip latches the floor-lookup failure log to one parent,
+	// so a condition that persists across polls is reported once (see
+	// logFloorLookupFailure). Separate from mtpFloorMemo because those paths
+	// produce no entry to hang a flag on
+	mtpFloorFailureLoggedTip atomic.Pointer[chainhash.Hash]
+
 	// stateChangeCh notifies listeners of state changes
 	// Protected by stateChangeMu to prevent race conditions
 	stateChangeMu sync.RWMutex

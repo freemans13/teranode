@@ -169,14 +169,21 @@ func TestCandidateTimeFallback(t *testing.T) {
 		mockClient.AssertNotCalled(t, "GetBlockHeader", mock.Anything, mock.Anything)
 	})
 
-	t.Run("batched fetch error falls back to the hash-keyed walk", func(t *testing.T) {
+	t.Run("transport failure degrades without attempting the walk", func(t *testing.T) {
+		// A failed call means the blockchain service is unhealthy. Walking it once
+		// per header would add MedianTimeBlocks more sequential reads without
+		// adding information, against a service that is already failing — so this
+		// path degrades immediately rather than amplifying the load.
 		mockClient := &blockchain.Mock{}
 		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil, context.DeadlineExceeded)
 		stubWalk(mockClient)
 
+		before := time.Now().Unix()
 		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
 		require.NoError(t, err)
-		require.Equal(t, wantFloor, got)
+		require.GreaterOrEqual(t, got, before)
+		require.Less(t, got, wantFloor, "a transport failure must not yield a floored time")
+		mockClient.AssertNotCalled(t, "GetBlockHeader", mock.Anything, mock.Anything)
 	})
 
 	t.Run("mis-anchored batched run falls back to the hash-keyed walk", func(t *testing.T) {
@@ -195,7 +202,7 @@ func TestCandidateTimeFallback(t *testing.T) {
 		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
 		require.NoError(t, err)
 		require.Equal(t, wantFloor, got)
-		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 11)
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 10)
 	})
 
 	t.Run("broken link in the batched run falls back to the hash-keyed walk", func(t *testing.T) {
@@ -214,7 +221,7 @@ func TestCandidateTimeFallback(t *testing.T) {
 		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
 		require.NoError(t, err)
 		require.Equal(t, wantFloor, got)
-		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 11)
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 10)
 	})
 
 	t.Run("nil header in the batched run falls back to the hash-keyed walk", func(t *testing.T) {
@@ -239,7 +246,7 @@ func TestCandidateTimeFallback(t *testing.T) {
 		// generateEmptyBlockCandidate, the path whose job is to keep serving
 		// work while a block is processed.
 		mockClient := &blockchain.Mock{}
-		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil, context.DeadlineExceeded)
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(linkedHeaders(t, 11, baseTime+1000), []*model.BlockHeaderMeta{}, nil)
 		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, nil, context.DeadlineExceeded)
 
 		before := time.Now().Unix()
@@ -251,7 +258,7 @@ func TestCandidateTimeFallback(t *testing.T) {
 
 	t.Run("nil header from the walk degrades to the wall clock", func(t *testing.T) {
 		mockClient := &blockchain.Mock{}
-		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil, context.DeadlineExceeded)
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(linkedHeaders(t, 11, baseTime+1000), []*model.BlockHeaderMeta{}, nil)
 		mockClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return((*model.BlockHeader)(nil), &model.BlockHeaderMeta{}, nil)
 
 		before := time.Now().Unix()
@@ -307,7 +314,7 @@ func TestCandidateTimeFallback(t *testing.T) {
 		got, err := newAssembler(mockClient).candidateTime(t.Context(), tip)
 		require.NoError(t, err)
 		require.Equal(t, wantFloor, got)
-		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 11)
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 10)
 	})
 
 	t.Run("over-long batched run falls back to the walk", func(t *testing.T) {
@@ -388,12 +395,13 @@ func TestCandidateTimeFallback(t *testing.T) {
 	t.Run("walk stops cleanly at the chain start", func(t *testing.T) {
 		// A 3-block chain whose oldest header points at the all-zero genesis
 		// parent: the walk must return the short run, and the median over 3
-		// headers is the middle timestamp.
+		// headers is the middle timestamp. The walk is reached via an unusable
+		// batched result rather than a transport failure, which no longer walks.
 		short := linkedHeadersFromGenesis(t, 3, baseTime)
 		shortTip := short[0]
 
 		mockClient := &blockchain.Mock{}
-		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil, context.DeadlineExceeded)
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(linkedHeaders(t, 11, baseTime+1000), []*model.BlockHeaderMeta{}, nil)
 		for _, h := range short {
 			mockClient.On("GetBlockHeader", mock.Anything, h.Hash()).Return(h, &model.BlockHeaderMeta{}, nil)
 		}
@@ -401,6 +409,8 @@ func TestCandidateTimeFallback(t *testing.T) {
 		got, err := newAssembler(mockClient).candidateTime(t.Context(), shortTip)
 		require.NoError(t, err)
 		require.Equal(t, int64(baseTime+1)+1, got)
+		// 2, not 3: the walk is seeded with the parent header the caller holds.
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeader", 2)
 	})
 
 	t.Run("short batched run reaching the chain start is accepted without a walk", func(t *testing.T) {
@@ -460,6 +470,46 @@ func TestCandidateTimeTwoHourCeiling(t *testing.T) {
 		require.NoError(t, err)
 		require.GreaterOrEqual(t, got, before)
 		require.LessOrEqual(t, got, time.Now().Unix())
+	})
+
+	t.Run("the advisory-chain warning fires once per tip, not once per poll", func(t *testing.T) {
+		// Same reasoning as the floor warning: this branch stays engaged for as
+		// long as the clock condition lasts, on a path polled several times a
+		// second, so an unlatched line floods the log during the incident an
+		// operator is trying to read it through.
+		logger := &warnCountingLogger{}
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+
+		assembler := &BlockAssembler{
+			logger:           logger,
+			blockchainClient: mockClient,
+			settings: &settings.Settings{
+				ChainCfgParams: &chaincfg.Params{GenerateSupported: true},
+			},
+		}
+
+		for i := 0; i < 4; i++ {
+			_, err := assembler.candidateTime(t.Context(), tip)
+			require.NoError(t, err)
+		}
+
+		require.Equal(t, int32(1), logger.warns.Load(), "repeated polls past the ceiling must warn once")
+	})
+
+	t.Run("the floor-lookup failure error fires once per tip, not once per poll", func(t *testing.T) {
+		logger := &warnCountingLogger{}
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil, context.DeadlineExceeded)
+
+		assembler := &BlockAssembler{logger: logger, blockchainClient: mockClient}
+
+		for i := 0; i < 4; i++ {
+			_, err := assembler.candidateTime(t.Context(), tip)
+			require.NoError(t, err)
+		}
+
+		require.Equal(t, int32(1), logger.errs.Load(), "a persistent lookup failure must be reported once per tip")
 	})
 
 	t.Run("nil settings does not fault and fails closed", func(t *testing.T) {
@@ -527,10 +577,15 @@ func TestMinCandidateTime(t *testing.T) {
 type warnCountingLogger struct {
 	ulogger.TestLogger
 	warns atomic.Int32
+	errs  atomic.Int32
 }
 
 func (l *warnCountingLogger) Warnf(format string, args ...interface{}) {
 	l.warns.Add(1)
+}
+
+func (l *warnCountingLogger) Errorf(format string, args ...interface{}) {
+	l.errs.Add(1)
 }
 
 // TestMiningCandidateTimeFlooredAtMedianTimePast drives the public

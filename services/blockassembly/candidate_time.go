@@ -20,12 +20,15 @@ const maxFutureBlockTime = 2 * time.Hour
 // mtpFloorEntry is the median-time-past floor for one parent block. The median
 // of the 11 headers ending at a given hash can never change — headers are
 // immutable once stored — so it is computed once per parent and reused for
-// every miner poll on that tip. warned latches the "floor engaged" log line so
-// it fires once per parent rather than once per poll.
+// every miner poll on that tip. The two flags latch their log lines so each
+// fires once per parent rather than once per poll: both conditions stay engaged
+// for as long as the underlying clock problem lasts, on a path miners poll
+// several times a second.
 type mtpFloorEntry struct {
-	parent  chainhash.Hash
-	minTime int64
-	warned  atomic.Bool
+	parent        chainhash.Hash
+	minTime       int64
+	warnedFloor   atomic.Bool
+	warnedCeiling atomic.Bool
 }
 
 // candidateTime returns the timestamp to stamp on a mining candidate built on
@@ -71,7 +74,7 @@ func (b *BlockAssembler) candidateTime(ctx context.Context, parentHeader *model.
 	parentHash := parentHeader.Hash()
 	timeNow := time.Now().Unix()
 
-	entry := b.mtpFloor(ctx, parentHash)
+	entry := b.mtpFloor(ctx, parentHeader, parentHash)
 	if entry == nil {
 		// mtpFloor has already logged the cause. Serve the wall clock rather
 		// than stopping mining on a blockchain hiccup.
@@ -82,7 +85,12 @@ func (b *BlockAssembler) candidateTime(ctx context.Context, parentHeader *model.
 	// no valid timestamp at all and flooring makes things worse, not better.
 	if maxTime := timeNow + int64(maxFutureBlockTime/time.Second); entry.minTime > maxTime {
 		if b.generateSupported() {
-			b.logger.Warnf("[candidateTime] parent %s median-time-past floor %d exceeds the two-hour future bound %d; serving the wall clock %d because this chain treats the median-time rule as advisory", parentHash.String(), entry.minTime, maxTime, timeNow)
+			// Latched per parent like the floor warning below: this branch stays
+			// engaged for as long as the clock condition lasts, and it sits on a
+			// path polled several times a second per connected miner.
+			if entry.warnedCeiling.CompareAndSwap(false, true) {
+				b.logger.Warnf("[candidateTime] parent %s median-time-past floor %d exceeds the two-hour future bound %d; serving the wall clock %d because this chain treats the median-time rule as advisory", parentHash.String(), entry.minTime, maxTime, timeNow)
+			}
 
 			return timeNow, nil
 		}
@@ -91,7 +99,7 @@ func (b *BlockAssembler) candidateTime(ctx context.Context, parentHeader *model.
 	}
 
 	if timeNow < entry.minTime {
-		if entry.warned.CompareAndSwap(false, true) {
+		if entry.warnedFloor.CompareAndSwap(false, true) {
 			b.logger.Warnf("[candidateTime] local clock %d is at or below the parent chain's median-time-past; flooring candidate time to %d for blocks on parent %s", timeNow, entry.minTime, parentHash.String())
 		}
 
@@ -105,12 +113,20 @@ func (b *BlockAssembler) candidateTime(ctx context.Context, parentHeader *model.
 // parentHash, and whether it is known. It is a pure memo read: the entry is warm
 // whenever a candidate was just built on that parent, so the submit path can
 // reject a miner-supplied nTime below the consensus floor without a round-trip.
-// A false second return means no floor was established for that parent (the
-// candidate was served on the degraded wall-clock path, or the tip has since
-// moved twice), in which case the submit path has nothing to enforce and behaves
-// as it did before the floor existed.
+// A false second return means there is no floor for the submit path to enforce —
+// the candidate was served on the degraded wall-clock path, the tip has since
+// moved twice, or this chain treats the median rule as advisory — in which case
+// the submit path behaves as it did before the floor existed.
 func (b *BlockAssembler) MinCandidateTime(parentHash *chainhash.Hash) (int64, bool) {
-	if parentHash == nil {
+	// The "this chain treats the median rule as advisory" decision has to live in
+	// one place or the producer and the guard drift apart. candidateTime's ceiling
+	// branch deliberately serves an unfloored wall-clock candidate on chains with
+	// GenerateSupported, while the memo entry it read still carries a minTime above
+	// now+2h. mining.Mine copies the candidate's own time into the solution
+	// unconditionally, so enforcing that floor here would reject every solution
+	// against a candidate this package chose to hand out — turning the carve-out
+	// that keeps rapid generation working into the thing that stops it.
+	if parentHash == nil || b.generateSupported() {
 		return 0, false
 	}
 
@@ -132,26 +148,42 @@ func (b *BlockAssembler) MinCandidateTime(parentHash *chainhash.Hash) (int64, bo
 // while the main path uses the subtree processor's precomputed parent. A single
 // slot would thrash whenever those two alternate, refetching on every poll and
 // re-firing the floor warning each time.
-func (b *BlockAssembler) mtpFloor(ctx context.Context, parentHash *chainhash.Hash) *mtpFloorEntry {
+func (b *BlockAssembler) mtpFloor(ctx context.Context, parentHeader *model.BlockHeader, parentHash *chainhash.Hash) *mtpFloorEntry {
 	for i := range b.mtpFloorMemo {
 		if entry := b.mtpFloorMemo[i].Load(); entry != nil && entry.parent.IsEqual(parentHash) {
 			return entry
 		}
 	}
 
-	run, batchedErr := b.batchedParentChain(ctx, parentHash)
-	if batchedErr != nil {
-		walked, walkErr := b.walkParentChain(ctx, parentHash, blockchain.MedianTimeBlocks)
+	// A transport failure and an unusable result call for opposite responses, so
+	// the fetch and the verification are separate steps. If the call itself fails
+	// the blockchain service is unhealthy, and walking it once per header would
+	// add MedianTimeBlocks more sequential reads without adding any information —
+	// exactly the amplification to avoid, since a saturated service is what caused
+	// the failure. Only a result that arrives but cannot be trusted (mis-anchored,
+	// unlinked, or short) is worth the walk, because that is the reorg race the
+	// walk exists to recover from and its per-hash reads cannot hit it.
+	headers, fetchErr := b.fetchParentChainHeaders(ctx, parentHash)
+	if fetchErr != nil {
+		b.logFloorLookupFailure(parentHash, "the blockchain service did not answer the batched header fetch (%v); not attempting the %d-read parent-chain walk against a service that is already failing", fetchErr, blockchain.MedianTimeBlocks)
+
+		return nil
+	}
+
+	run := headers
+
+	if verifyErr := verifyParentChainRun(parentHash, headers); verifyErr != nil {
+		walked, walkErr := b.walkParentChain(ctx, parentHeader, blockchain.MedianTimeBlocks)
 		if walkErr != nil {
-			b.logger.Errorf("[candidateTime] cannot establish the median-time-past floor for parent %s: batched header fetch failed (%v) and the hash-keyed parent-chain walk also failed (%v); serving an unfloored candidate time", parentHash.String(), batchedErr, walkErr)
+			b.logFloorLookupFailure(parentHash, "the batched header fetch returned an unusable run (%v) and the hash-keyed parent-chain walk also failed (%v)", verifyErr, walkErr)
 
 			return nil
 		}
 
-		// Name the cause of the slower path rather than discarding the batched
-		// error silently: the walk costs one round-trip per header, so an
-		// operator seeing the extra latency needs to know why it engaged.
-		b.logger.Warnf("[candidateTime] batched header fetch for parent %s was unusable (%v); fell back to the hash-keyed parent-chain walk", parentHash.String(), batchedErr)
+		// Name the cause of the slower path rather than discarding the error
+		// silently: the walk costs one round-trip per header, so an operator
+		// seeing the extra latency needs to know why it engaged.
+		b.logger.Warnf("[candidateTime] batched header fetch for parent %s was unusable (%v); fell back to the hash-keyed parent-chain walk", parentHash.String(), verifyErr)
 
 		run = walked
 	}
@@ -165,7 +197,7 @@ func (b *BlockAssembler) mtpFloor(ctx context.Context, parentHash *chainhash.Has
 	// producers above guarantee at least one header.
 	medianTimestamp, err := model.CalculateMedianTimestamp(timestamps)
 	if err != nil {
-		b.logger.Errorf("[candidateTime] failed to calculate the median timestamp for parent %s over %d headers: %v; serving an unfloored candidate time", parentHash.String(), len(run), err)
+		b.logFloorLookupFailure(parentHash, "the median timestamp over %d headers could not be calculated (%v)", len(run), err)
 
 		return nil
 	}
@@ -186,33 +218,54 @@ func (b *BlockAssembler) generateSupported() bool {
 	return b.settings != nil && b.settings.ChainCfgParams != nil && b.settings.ChainCfgParams.GenerateSupported
 }
 
-// batchedParentChain fetches the MedianTimeBlocks headers ending at parentHash
-// in one batched call and verifies the run is complete, anchored at the parent
-// and correctly linked. Any mismatch means the batched lookup cannot be trusted
-// — its fast path is a height-range scan over main-chain flags and its CTE
-// stops early on an unresolved parent_id, neither of which is an atomic
-// parent-chain walk — and the caller falls back to walkParentChain.
-func (b *BlockAssembler) batchedParentChain(ctx context.Context, parentHash *chainhash.Hash) ([]*model.BlockHeader, error) {
+// logFloorLookupFailure reports that the median-time-past floor could not be
+// established, latched to the last parent it fired for. The floor-lookup failure
+// modes persist while the underlying problem does, and this sits on a path polled
+// several times a second per connected miner, so an unlatched line floods the log
+// during precisely the incident an operator is trying to read it through. The
+// latch is a single slot rather than per-entry because these are the paths where
+// no memo entry exists to hang a flag on.
+func (b *BlockAssembler) logFloorLookupFailure(parentHash *chainhash.Hash, format string, args ...interface{}) {
+	if prev := b.mtpFloorFailureLoggedTip.Swap(parentHash); prev != nil && prev.IsEqual(parentHash) {
+		return
+	}
+
+	b.logger.Errorf("[candidateTime] cannot establish the median-time-past floor for parent %s: "+format+"; serving an unfloored candidate time", append([]interface{}{parentHash.String()}, args...)...)
+}
+
+// fetchParentChainHeaders performs the batched header fetch and nothing else, so
+// its caller can tell a transport failure apart from a result that arrived but
+// cannot be trusted. The two want opposite responses: see mtpFloor.
+func (b *BlockAssembler) fetchParentChainHeaders(ctx context.Context, parentHash *chainhash.Hash) ([]*model.BlockHeader, error) {
 	headers, _, err := b.blockchainClient.GetBlockHeaders(ctx, parentHash, blockchain.MedianTimeBlocks)
 	if err != nil {
 		return nil, errors.NewProcessingError("failed to fetch parent-chain headers for %s", parentHash.String(), err)
 	}
 
+	return headers, nil
+}
+
+// verifyParentChainRun checks that a batched run is complete, anchored at the
+// parent and correctly linked. Any mismatch means the batched lookup cannot be
+// trusted — its fast path is a height-range scan over main-chain flags and its
+// CTE stops early on an unresolved parent_id, neither of which is an atomic
+// parent-chain walk — and the caller falls back to walkParentChain.
+func verifyParentChainRun(parentHash *chainhash.Hash, headers []*model.BlockHeader) error {
 	if len(headers) == 0 || headers[0] == nil || !headers[0].Hash().IsEqual(parentHash) {
-		return nil, errors.NewProcessingError("returned chain head does not match requested parent %s", parentHash.String())
+		return errors.NewProcessingError("returned chain head does not match requested parent %s", parentHash.String())
 	}
 
 	if uint64(len(headers)) > blockchain.MedianTimeBlocks {
-		return nil, errors.NewProcessingError("batched run below parent %s returned %d headers, more than the %d requested", parentHash.String(), len(headers), blockchain.MedianTimeBlocks)
+		return errors.NewProcessingError("batched run below parent %s returned %d headers, more than the %d requested", parentHash.String(), len(headers), blockchain.MedianTimeBlocks)
 	}
 
 	for i := 1; i < len(headers); i++ {
 		if headers[i] == nil {
-			return nil, errors.NewProcessingError("nil header at depth %d below parent %s", i, parentHash.String())
+			return errors.NewProcessingError("nil header at depth %d below parent %s", i, parentHash.String())
 		}
 
 		if !headers[i-1].HashPrevBlock.IsEqual(headers[i].Hash()) {
-			return nil, errors.NewProcessingError("parent-chain link broken at depth %d below parent %s", i, parentHash.String())
+			return errors.NewProcessingError("parent-chain link broken at depth %d below parent %s", i, parentHash.String())
 		}
 	}
 
@@ -222,45 +275,51 @@ func (b *BlockAssembler) batchedParentChain(ctx context.Context, parentHash *cha
 	// straight into the two-hour ceiling above. A short run is only legitimate
 	// when it reaches the start of the chain.
 	if uint64(len(headers)) < blockchain.MedianTimeBlocks && !isChainStart(headers[len(headers)-1]) {
-		return nil, errors.NewProcessingError("short parent-chain run (%d of %d) below parent %s does not reach the chain start", len(headers), blockchain.MedianTimeBlocks, parentHash.String())
+		return errors.NewProcessingError("short parent-chain run (%d of %d) below parent %s does not reach the chain start", len(headers), blockchain.MedianTimeBlocks, parentHash.String())
 	}
 
-	return headers, nil
+	return nil
 }
 
-// walkParentChain fetches up to depth headers ending at startHash by following
-// HashPrevBlock one header at a time. Each read is keyed by hash — immutable
-// once stored — so the result cannot be poisoned by a reorg happening between
-// reads, at the cost of one round-trip per header. Unlike the equivalents in
+// walkParentChain returns up to depth headers ending at startHeader by following
+// HashPrevBlock one header at a time. Each read is keyed by hash — immutable once
+// stored — so the result cannot be poisoned by a reorg happening between reads,
+// at the cost of one round-trip per header. Unlike the equivalents in
 // subtreevalidation and legacy/netsync it tolerates reaching the start of the
 // chain (returning fewer than depth headers), because block assembly runs from
-// genesis on fresh networks; the validator applies the median rule over
-// however many headers exist in the same way.
-func (b *BlockAssembler) walkParentChain(ctx context.Context, startHash *chainhash.Hash, depth uint64) ([]*model.BlockHeader, error) {
+// genesis on fresh networks; the validator applies the median rule over however
+// many headers exist in the same way.
+//
+// The run is seeded with startHeader rather than re-fetching it: the caller
+// already holds the parent header, so fetching it again would spend one of the
+// depth round-trips re-reading data in hand — on the path that engages precisely
+// when the blockchain service is struggling.
+func (b *BlockAssembler) walkParentChain(ctx context.Context, startHeader *model.BlockHeader, depth uint64) ([]*model.BlockHeader, error) {
+	if startHeader == nil {
+		return nil, errors.NewProcessingError("nil start header")
+	}
+
 	headers := make([]*model.BlockHeader, 0, depth)
-	cur := startHash
+	headers = append(headers, startHeader)
 
-	for i := uint64(0); i < depth; i++ {
-		if cur == nil {
-			return nil, errors.NewProcessingError("nil parent hash at depth %d below %s", i, startHash.String())
-		}
+	cur := startHeader
 
-		header, _, err := b.blockchainClient.GetBlockHeader(ctx, cur)
-		if err != nil {
-			return nil, errors.NewProcessingError("failed to fetch header %s at depth %d", cur.String(), i, err)
-		}
-
-		if header == nil {
-			return nil, errors.NewProcessingError("nil header for %s at depth %d", cur.String(), i)
-		}
-
-		headers = append(headers, header)
-
-		if isChainStart(header) {
+	for uint64(len(headers)) < depth {
+		if isChainStart(cur) {
 			break
 		}
 
-		cur = header.HashPrevBlock
+		header, _, err := b.blockchainClient.GetBlockHeader(ctx, cur.HashPrevBlock)
+		if err != nil {
+			return nil, errors.NewProcessingError("failed to fetch header %s at depth %d", cur.HashPrevBlock.String(), len(headers), err)
+		}
+
+		if header == nil {
+			return nil, errors.NewProcessingError("nil header for %s at depth %d", cur.HashPrevBlock.String(), len(headers))
+		}
+
+		headers = append(headers, header)
+		cur = header
 	}
 
 	return headers, nil
