@@ -1527,19 +1527,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			}
 
 			if block.SizeInBytes > excessiveBlockSizeUint64 {
-				// Body-attributable: SizeInBytes reflects the peer-supplied body, not the
-				// header, so we must not persist the header's hash as invalid here — an
-				// attacker could otherwise replay an honest header with an oversized body
-				// to wedge the node off the honest chain. Still notify, so the serving peer
-				// takes the ban-score hit: on the gossip route that notification is what
-				// drives punishment (p2p keys it on the announcing peer, not on the stored
-				// block), so dropping it would ban nobody. Punish the peer, spare the hash —
-				// the same split svnode makes for a corruption-possible rejection. Still
-				// skipped on revalidation, as the persist was: an operator re-checking a
-				// stored block must not cost whichever peer happens to be recorded against
-				// it a ban score.
 				if !opts.IsRevalidation {
-					u.kafkaNotifyBlockInvalid(block, fmt.Sprintf("block size %d exceeds excessiveblocksize %d", block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize))
+					u.storeInvalidBlock(ctx, block, opts.PeerID, fmt.Sprintf("block size %d exceeds excessiveblocksize %d", block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize))
 				}
 
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block size %d exceeds excessiveblocksize %d", block.Header.Hash().String(), block.SizeInBytes, u.settings.Policy.ExcessiveBlockSize)
@@ -1564,13 +1553,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 		// check the coinbase length
 		if len(block.CoinbaseTx.Inputs[0].UnlockingScript.Bytes()) < 2 || len(block.CoinbaseTx.Inputs[0].UnlockingScript.Bytes()) > int(u.settings.ChainCfgParams.MaxCoinbaseScriptSigSize) {
-			// Body-attributable: the coinbase tx is peer-supplied body data, not the
-			// header, so we must not persist the header's hash as invalid here — an
-			// attacker could otherwise replay an honest header with a malformed coinbase
-			// to wedge the node off the honest chain. Notify anyway, for the ban score —
-			// see the size check above.
 			if !opts.IsRevalidation {
-				u.kafkaNotifyBlockInvalid(block, "bad coinbase length")
+				u.storeInvalidBlock(ctx, block, opts.PeerID, "bad coinbase length")
 			}
 
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] bad coinbase length", block.Header.Hash().String())
@@ -1964,25 +1948,6 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					// the serving peer's fault: mark it so the catchup penalty path does not
 					// demote an honest (possibly sole-source) ahead peer.
 					return errors.NewBlockIncompleteTransientError("[ValidateBlock][%s] block validation hit transient missing-data state: %s", block.Hash().String(), err)
-				}
-
-				// A body-attributable fault (e.g. CVE-2012-2459 duplicate transactions, a bad
-				// merkle root) is a property of the peer-supplied BODY, not the header. The
-				// block's hash names the header only, so persisting the hash as invalid here
-				// would let an attacker replay the honest header with a doctored body (zero
-				// mining cost) to condemn a real block. Return the same BlockInvalid error
-				// (so catchup's errors.Is(err, ErrBlockInvalid) peer-punishment keying is
-				// unchanged) without calling storeInvalidBlock.
-				if errors.IsBlockInvalidBody(err) {
-					// Notify without persisting: the peer still takes the ban-score hit
-					// (p2p keys it on the announcing peer), the honest hash stays clean.
-					// Guarded like the persist below, so an operator revalidation stays
-					// silent rather than banning a peer for a block it is re-checking.
-					if !opts.IsRevalidation {
-						u.kafkaNotifyBlockInvalid(block, reason)
-					}
-
-					return errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err)
 				}
 
 				if !opts.IsRevalidation {

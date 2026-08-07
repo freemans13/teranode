@@ -229,35 +229,3 @@ func TestCVE20122459_MerklePassesDedupCatches(t *testing.T) {
 	require.True(t, errors.Is(err, errors.ErrBlockInvalid),
 		"error must be a BlockInvalidError, got: %v", err)
 }
-
-// TestCheckSubtreeSlicesForDuplicateTxs_BodyKindError pins the Change 2 classification:
-// the CVE-2012-2459 duplicate-transaction rejection returned by
-// CheckSubtreeSlicesForDuplicateTxs must be body-attributable (IsBlockInvalidBody true),
-// not merely BlockInvalid. This is what lets BlockValidation.go's
-// errors.IsBlockInvalidBody carve-out skip storeInvalidBlock for it, so a doctored
-// peer body can never condemn the honest header's hash. On the same layout it also
-// reconfirms the coinbase placeholder at [0][0] is not itself part of the duplicate
-// scan: a first subtree carrying the placeholder plus a genuine duplicate elsewhere
-// rejects on the real duplicate, and a first subtree carrying only the placeholder
-// plus unique transactions passes cleanly.
-func TestCheckSubtreeSlicesForDuplicateTxs_BodyKindError(t *testing.T) {
-	dup := randHash(0x55)
-
-	// Placeholder at [0][0] plus a genuine duplicate (dup repeated in the same
-	// subtree) — the rejection must be the duplicate, classified body-kind.
-	slices := []*subtreepkg.Subtree{
-		subtreeWithHashes(subtreepkg.CoinbasePlaceholderHashValue, dup, dup),
-	}
-
-	err := CheckSubtreeSlicesForDuplicateTxs(slices)
-	require.Error(t, err, "genuine duplicate must be rejected")
-	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "must still be a BlockInvalid error")
-	require.True(t, errors.IsBlockInvalidBody(err), "CVE-2012-2459 rejection must be classified body-attributable")
-
-	// The placeholder alone (no other duplicate) must not itself trigger a rejection —
-	// it is skipped at [0][0], not deduped against itself.
-	cleanSlices := []*subtreepkg.Subtree{
-		subtreeWithHashes(subtreepkg.CoinbasePlaceholderHashValue, randHash(0x01), randHash(0x02)),
-	}
-	require.NoError(t, CheckSubtreeSlicesForDuplicateTxs(cleanSlices), "coinbase placeholder at [0][0] must be exempt from the dedup scan")
-}

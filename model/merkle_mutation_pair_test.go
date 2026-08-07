@@ -80,10 +80,7 @@ func computeMultiSubtreeMerkleRoot(t *testing.T, coinbase *bt.Tx, subtrees []*su
 //  2. (b) Block.CheckMerkleRoot PASSES on BOTH blocks, pinning that the merkle root
 //     alone cannot detect the mutation.
 //  3. (c) Block.Valid REJECTS the mutant — via the later, independent
-//     duplicate-transaction check (the CVE-2012-2459 floor), not the merkle check —
-//     with an error that is BOTH errors.Is(err, errors.ErrBlockInvalid) (so peer
-//     punishment is unaffected) AND errors.IsBlockInvalidBody(err) (so the header's
-//     hash is never persisted invalid for a peer-supplied body fault).
+//     duplicate-transaction check (the CVE-2012-2459 floor), not the merkle check.
 func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 	ctx := context.Background()
 	tSettings := test.CreateBaseTestSettings(t)
@@ -193,7 +190,7 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 		"CheckMerkleRoot must not catch the CVE-2012-2459 mutation: the duplicate-last-node rule "+
 			"makes the mutant's subtree root identical to the honest one, so the header still matches")
 
-	// --- (c) Block.Valid rejects the mutant, classified body-attributable ------------
+	// --- (c) Block.Valid rejects the mutant -------------------------------------------
 	subtreeStore, err := null.New(ulogger.TestLogger{})
 	require.NoError(t, err)
 
@@ -209,6 +206,5 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 	require.False(t, validMutant, "the mutant block must be rejected")
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "mutant rejection must be BlockInvalid (so the peer is still punished)")
-	require.True(t, errors.IsBlockInvalidBody(err), "mutant rejection must be classified body-attributable (so the header hash is never persisted invalid)")
 	require.Contains(t, err.Error(), "duplicate transaction", "the mutant must be caught by the duplicate-transaction check, not the merkle check")
 }

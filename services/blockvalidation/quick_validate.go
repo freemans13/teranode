@@ -782,9 +782,9 @@ func (u *BlockValidation) validateSubtrees(ctx context.Context, block *model.Blo
 	// UTXOs may already have been created/spent for this batch by the time we get here (see
 	// createAndSpendUTXOsForBatch upstream in the pipeline) but the block itself is never
 	// committed, which is the security-critical property. Returned unwrapped: it is already
-	// a body-kind BlockInvalid error (model.CheckSubtreeSlicesForDuplicateTxs), and wrapping
-	// it in ProcessingError would report a consensus rejection as a transient processing
-	// fault — see the pass-throughs in quickValidateBlock/quickValidateBlockAsync.
+	// a BlockInvalid error (model.CheckSubtreeSlicesForDuplicateTxs), and wrapping it in
+	// ProcessingError would report a consensus rejection as a transient processing fault —
+	// see the pass-throughs in quickValidateBlock/quickValidateBlockAsync.
 	if err := model.CheckSubtreeSlicesForDuplicateTxs(block.SubtreeSlices); err != nil {
 		return 0, err
 	}

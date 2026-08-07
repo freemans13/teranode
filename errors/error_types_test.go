@@ -182,36 +182,6 @@ func TestNewBlockInvalidError(t *testing.T) {
 	assert.Nil(t, err.Data(), "error data should be nil when params are provided")
 }
 
-// TestBlockInvalidBody verifies the body-attributable variant keeps the
-// ERR_BLOCK_INVALID code (so existing errors.Is peer-punishment checks in
-// catchup.go still match) while being distinguishable via IsBlockInvalidBody,
-// including through wrapping, so BlockValidation.go can suppress
-// storeInvalidBlock for it without disturbing peer-reputation handling.
-func TestBlockInvalidBody(t *testing.T) {
-	bodyErr := NewBlockInvalidBodyError("body fault %s", "reason")
-
-	// Same code: existing ErrBlockInvalid / peer-punishment keying (catchup.go)
-	// keeps matching so the peer is still punished.
-	require.Equal(t, ERR_BLOCK_INVALID, bodyErr.Code(), "body variant keeps the ERR_BLOCK_INVALID code")
-	require.True(t, Is(bodyErr, ErrBlockInvalid), "body variant must still match ErrBlockInvalid")
-	require.True(t, IsBlockInvalidBody(bodyErr), "body variant must be detected as body-attributable")
-
-	// A plain block-invalid error is header-attributable (the default), not body.
-	plain := NewBlockInvalidError("plain invalid")
-	require.True(t, Is(plain, ErrBlockInvalid))
-	require.False(t, IsBlockInvalidBody(plain), "plain block-invalid must not be flagged body-attributable")
-
-	// The marker survives when the body error is wrapped by an outer *Error, which is
-	// exactly what BlockValidation.go's block.Valid failure handler does today.
-	wrapped := NewBlockInvalidError("outer wrap", bodyErr)
-	require.True(t, Is(wrapped, ErrBlockInvalid), "wrapped body error must still match ErrBlockInvalid")
-	require.True(t, IsBlockInvalidBody(wrapped), "wrapped body error must still be detected as body-attributable")
-
-	// Unrelated errors and nil are never body-attributable.
-	require.False(t, IsBlockInvalidBody(NewBlockInvalidError("invalid")))
-	require.False(t, IsBlockInvalidBody(nil))
-}
-
 // TestNewBlockExistsError tests the NewBlockExistsError function to ensure it creates an error with the correct code and message.
 func TestNewBlockExistsError(t *testing.T) {
 	message := "test block exists error %s %d"

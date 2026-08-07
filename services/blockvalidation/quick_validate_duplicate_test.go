@@ -101,11 +101,6 @@ func TestValidateSubtrees_RejectsDuplicateTransaction(t *testing.T) {
 			"a duplicate on the quick path must be BlockInvalid, so the peer is punished")
 		require.False(t, errors.Is(err, errors.ErrProcessing),
 			"it must not be wrapped as a processing error, which reads as transient")
-
-		// And it must be body-attributable, so the honest header's hash is never
-		// persisted invalid for it.
-		require.True(t, errors.IsBlockInvalidBody(err),
-			"a duplicate is a fault in the peer-supplied body, not the header")
 	})
 
 	t.Run("distinct transactions pass the duplicate check", func(t *testing.T) {
