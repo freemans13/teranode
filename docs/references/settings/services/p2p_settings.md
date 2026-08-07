@@ -61,9 +61,9 @@
 
 ### Peer Map Management
 
-- `PeerMapMaxSize` limits memory usage for block/subtree peer tracking
-- `PeerMapTTL` controls peer map entry expiration (30 minutes)
-- `PeerMapCleanupInterval` sets cleanup frequency (5 minutes)
+- `PeerMapMaxSize` limits memory usage for block/subtree peer tracking (10000 entries, enforced at insert)
+- `PeerMapTTL` controls peer map entry expiration (10 minutes)
+- `PeerMapCleanupInterval` sets cleanup frequency (1 minute)
 - These settings have sensible defaults but can be overridden via environment variables
 
 ### Network Scanning Prevention
