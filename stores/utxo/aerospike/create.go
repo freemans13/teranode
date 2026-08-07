@@ -1200,9 +1200,7 @@ func (s *Store) storeExternallyWithLock(
 				s.logger.Errorf("[%s] Failed to create record %d for tx %s: %v", funcName, idx, bItem.txHash, err)
 			}
 		}
-	}
 
-	if hasFailures {
 		// Do NOT clean up partial records - leave them for the next attempt to complete
 		// The creating bin in each record prevents UTXO spending until all records exist
 		// The defer will release the lock, allowing another process to finish the creation
@@ -1367,20 +1365,26 @@ func (s *Store) releaseLock(lockKey *aerospike.Key, token string) error {
 	policy := util.GetAerospikeWritePolicy(s.settings, 0)
 	policy.FilterExpression = aerospike.ExpEq(aerospike.ExpStringBin("lock_token"), aerospike.ExpStringVal(token))
 
-	_, err := s.client.Delete(policy, lockKey)
+	existed, err := s.client.Delete(policy, lockKey)
 	if err != nil {
 		aErr, ok := err.(*aerospike.AerospikeError)
-		if ok && aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
-			s.logger.Debugf("[releaseLock] Lock record for key %v already gone (expired or already released)", lockKey)
-			return nil
-		}
-
 		if ok && aErr.ResultCode == types.FILTERED_OUT {
 			s.logger.Debugf("[releaseLock] Lock record for key %v is now held by a different token; not ours to delete", lockKey)
 			return nil
 		}
 
+		if ok && aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
+			return nil
+		}
+
 		return err
+	}
+
+	// A missing lock record is not an error on the delete path - the client reports it as
+	// existed=false with a nil error - but it is worth distinguishing in the logs from a
+	// delete that actually removed our lock.
+	if !existed {
+		s.logger.Debugf("[releaseLock] Lock record for key %v already gone (expired or already released)", lockKey)
 	}
 
 	return nil

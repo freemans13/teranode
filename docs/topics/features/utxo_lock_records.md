@@ -80,6 +80,7 @@ const LockRecordIndex = uint32(0xFFFFFFFF)
 | `process_id` | `int` | OS process ID that holds the lock |
 | `hostname` | `string` | Host where lock was acquired |
 | `expected_recs` | `int` | Number of records to be created |
+| `lock_token` | `string` | Random 16-byte hex token identifying this acquisition |
 
 ### 3.2. Creating Flag
 
@@ -156,7 +157,10 @@ The first phase creates all transaction records with the `creating` flag set to 
 
 4. **Release Lock**
 
-    - Delete lock record (always, even on partial failure)
+    - Delete lock record (always, even on partial failure), gated by a filter
+      expression on `lock_token` so a release that arrives after the lock expired
+      and was re-acquired by another writer is a no-op rather than evicting the
+      new holder's lock
     - Partial records remain for next attempt to complete
 
 ### 4.2. Phase 2: Flag Clearing
