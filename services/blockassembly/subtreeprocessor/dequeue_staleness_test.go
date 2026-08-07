@@ -31,10 +31,35 @@ func TestLastDequeueTime_InitialisedAtStart(t *testing.T) {
 	stp.Start(ctx)
 	t.Cleanup(func() { stp.Stop(ctx) })
 
-	require.False(t, stp.LastDequeueTime().IsZero(),
-		"LastDequeueTime must never read as the zero time - that would misreport a fresh processor as stalled since the epoch")
+	// Deliberately NOT an IsZero() check. An unseeded atomic.Int64 decodes via
+	// time.UnixMilli(0) to 1970, which is a perfectly non-zero time.Time - Go's
+	// zero Time is year 1. So IsZero() would pass whether or not the seed
+	// exists, and the real regression (a ~56-year staleness reading) would slip
+	// straight through it. Assert the value is approximately now instead, which
+	// is the property that actually matters and the one that fails when the
+	// seed is removed.
 	require.False(t, stp.LastDequeueTime().Before(before.Add(-time.Second)),
-		"LastDequeueTime must be seeded to approximately now at Start(), not left at whatever zero-ish value it had before")
+		"LastDequeueTime must be seeded to approximately now, not left at the Unix epoch")
+}
+
+// TestLastDequeueTime_SeededBeforeStart pins the constructor seed, which the
+// two tests around it cannot: both call Start() immediately, whereas production
+// does not. BlockAssembly.Init launches the metrics/stall updater and brings up
+// the gRPC ingest path before BlockAssembler.Start ever reaches
+// subtreeProcessor.Start, and loadUnminedTransactions runs in between and can
+// take minutes on a large unmined set. Without a constructor seed the gauge
+// publishes roughly 56 years of staleness for that whole window, on every node,
+// at exactly the moment an operator is watching a restart - discrediting the
+// signal this change exists to provide.
+func TestLastDequeueTime_SeededBeforeStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	before := time.Now()
+	stp := newTestSubtreeProcessorForDequeueStaleness(t, ctx)
+
+	require.False(t, stp.LastDequeueTime().Before(before.Add(-time.Second)),
+		"LastDequeueTime must be seeded at construction, before Start() is ever called")
 }
 
 // TestLastDequeueTime_StopsAdvancingWhileConsumerParked is the test required
