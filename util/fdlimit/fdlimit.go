@@ -63,8 +63,19 @@ func Ensure(required uint64) (budget uint64, raised bool, err error) {
 
 		if target > soft {
 			if setErr := set(target, hard); setErr == nil {
+				// Read the limit back rather than trusting the request. Darwin
+				// accepts a setrlimit and then silently grants less, capping at
+				// OPEN_MAX / kern.maxfilesperproc, so target can overstate what
+				// the process actually got — and an overstated budget puts
+				// EMFILE straight back on the table, which is the one thing
+				// this package exists to prevent.
 				effective = target
-				raised = true
+
+				if newSoft, _, getErr := get(); getErr == nil {
+					effective = newSoft
+				}
+
+				raised = effective > soft
 			}
 		}
 	}

@@ -44,7 +44,14 @@ func TestEnsureReservesHeadroom(t *testing.T) {
 
 	soft, _, err := get()
 	require.NoError(t, err)
-	require.Greater(t, soft, Headroom, "test host has an unusably small limit")
+
+	// Below twice the headroom the reserve turns proportional (half the limit),
+	// so the fixed-reserve assertion below would not hold. That regime has its
+	// own synthetic test; this one needs a host limit ample enough to get the
+	// fixed reserve.
+	if soft < 2*Headroom {
+		t.Skipf("test host limit %d is below 2*Headroom, where the reserve is proportional", soft)
+	}
 
 	budget, _, err := Ensure(1)
 	require.NoError(t, err)

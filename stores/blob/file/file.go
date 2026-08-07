@@ -1644,9 +1644,15 @@ func clampSemaphoreLimits(readLimit, writeLimit int, budget uint64) (int, int) {
 		return MinSemaphoreLimit, MinSemaphoreLimit
 	}
 
-	available := int(budget) // nolint:gosec // caller precondition: budget < total, which is an int
+	available := int(budget) //nolint:gosec // caller precondition: budget < total, which is an int
 
-	scaledRead := readLimit * available / total
+	// The product is formed in int64 because int is 32 bits on the 32-bit
+	// targets this package still builds for, where MaxSemaphoreLimit configured
+	// against a budget of a few tens of thousands would overflow it and hand
+	// back a negative — a wider concurrency than the budget, which is the exact
+	// failure the clamp exists to prevent. The quotient is at most available, so
+	// narrowing back to int is safe.
+	scaledRead := int(int64(readLimit) * int64(available) / int64(total))
 	if scaledRead < MinSemaphoreLimit {
 		scaledRead = MinSemaphoreLimit
 	}
