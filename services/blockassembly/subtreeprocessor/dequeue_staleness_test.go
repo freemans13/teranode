@@ -44,8 +44,9 @@ func TestLastDequeueTime_InitialisedAtStart(t *testing.T) {
 
 // TestLastDequeueTime_SeededBeforeStart pins the constructor seed, which the
 // two tests around it cannot: both call Start() immediately, whereas production
-// does not. BlockAssembly.Init launches the metrics/stall updater and brings up
-// the gRPC ingest path before BlockAssembler.Start ever reaches
+// does not. BlockAssembly.Init launches the metrics/stall updater and
+// BlockAssembly.Start brings up the gRPC ingest path, both before
+// BlockAssembler.Start ever reaches
 // subtreeProcessor.Start, and loadUnminedTransactions runs in between and can
 // take minutes on a large unmined set. Without a constructor seed the gauge
 // publishes roughly 56 years of staleness for that whole window, on every node,

@@ -397,9 +397,10 @@ type SubtreeProcessor struct {
 	// Seeded in NewSubtreeProcessor and again in Start() so it never reads as
 	// the zero time, which would misreport "stalled since the epoch". The
 	// constructor seed matters because BlockAssembly.Init starts the metrics
-	// updater and the gRPC ingest path before BlockAssembler.Start reaches
-	// stp.Start(ctx) - loadUnminedTransactions runs in between and can take
-	// minutes, during which the queue is already being filled.
+	// updater, and BlockAssembly.Start brings the gRPC ingest path up, both
+	// before BlockAssembler.Start reaches stp.Start(ctx) -
+	// loadUnminedTransactions runs in between and can take minutes, during
+	// which the queue is already being filled.
 	lastDequeueMillis atomic.Int64
 }
 
@@ -4927,12 +4928,13 @@ func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwi
 	//     total work at the snapshot.
 	//
 	// Previous form left validFromMillis=0 when DoubleSpendWindow=0,
-	// which disables the queue filter entirely (queue.go:96 short-circuits
-	// on `validFromMillis > 0`). And the items-bound compared
+	// which disables the queue filter entirely (LockFreeQueue.dequeueBatch
+	// short-circuits on `validFromMillis > 0`). And the items-bound compared
 	// `nrBatchesProcessed` to `queueLength`, but queue.length() returns
-	// total *items* (queue.go:71 / 75 add len(nodes)), not batches. With
-	// ~1k items/batch and ingest at line-rate, neither bound fired — the
-	// scaling-2 pod sat for 35+ minutes at 558 GB RSS inside this loop.
+	// total *items* (LockFreeQueue.enqueueBatch adds len(nodes)), not
+	// batches. With ~1k items/batch and ingest at line-rate, neither bound
+	// fired — the scaling-2 pod sat for 35+ minutes at 558 GB RSS inside
+	// this loop.
 	queueLength := stp.queue.length()
 	if queueLength > 0 {
 		itemsProcessed := int64(0)
