@@ -654,6 +654,14 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 		b.logger.Infof("[coinbaseRecovery] startup divergence check stopped before scanning at tip height %d: shutting down", height)
 		return nil
 
+	case tipErr != nil && canonicalBlockAbsent(tipErr):
+		// The canonical chain simply does not reach this height -- block
+		// assembly's persisted tip sits above it. That is not a fault, so it must
+		// not read like one. The branch below would blame the blockchain client
+		// for a question it answered correctly.
+		b.logger.Infof("[coinbaseRecovery] startup divergence check skipped: block assembly tip height %d is above the canonical chain height, so there is nothing to check there", height)
+		return nil
+
 	case tipErr != nil:
 		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: cannot resolve the canonical block at block assembly's tip height %d: %v", height, tipErr)
 		return nil

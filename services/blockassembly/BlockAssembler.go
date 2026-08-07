@@ -764,7 +764,8 @@ func resetBlockHeights(targetHeader *model.BlockHeader, targetHeight uint32, mov
 		lowest = &moveForward[0]
 	}
 
-	if lowest != nil && lowest.block != nil && lowest.block.Header != nil && lowest.meta != nil && lowest.meta.Height > 0 {
+	if lowest != nil && lowest.block != nil && lowest.block.Header != nil &&
+		lowest.block.Header.HashPrevBlock != nil && lowest.meta != nil && lowest.meta.Height > 0 {
 		heights[*lowest.block.Header.HashPrevBlock] = lowest.meta.Height - 1
 	}
 

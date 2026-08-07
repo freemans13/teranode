@@ -1241,6 +1241,9 @@ func TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight(t *testing.
 	}
 	items.blockAssembler.setBestBlockHeader(aheadOfChain, 6)
 
+	logger := newCapturingLogger()
+	items.blockAssembler.logger = logger
+
 	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
 	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
 
@@ -1254,6 +1257,8 @@ func TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight(t *testing.
 	require.Equal(t, float64(0),
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
 		"and it must not raise the manual-intervention alarm")
+	require.False(t, logger.sawWarn("cannot resolve the canonical block at block assembly's tip height"),
+		"a chain that simply does not reach this height is not the blockchain client failing to answer")
 }
 
 // TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned states the
