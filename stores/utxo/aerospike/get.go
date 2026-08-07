@@ -1306,7 +1306,17 @@ func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, tota
 		// Calculate the base offset for this pagination record
 		baseOffset := recordNum * s.utxoBatchSize
 
-		if applyErr := applyExtraRecordBins(txID, recordNum, extraRecord, baseOffset, spendingDatas); applyErr != nil {
+		// How many outputs this record must hold. splitIntoBatches gives every
+		// record a full batch except the last, which takes the remainder, so
+		// the transaction's output count fixes the expected length exactly.
+		remaining := len(spendingDatas) - baseOffset
+		if remaining <= 0 {
+			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d starts at offset %d, past the transaction's %d outputs — torn or mis-keyed record", txID.String(), recordNum, baseOffset, len(spendingDatas))
+		}
+
+		expected := min(remaining, s.utxoBatchSize)
+
+		if applyErr := applyExtraRecordBins(txID, recordNum, extraRecord, baseOffset, spendingDatas, expected); applyErr != nil {
 			return applyErr
 		}
 	}
@@ -1328,7 +1338,7 @@ func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, tota
 // malformed-bin branch below). The guard exists so that a client or wrapper
 // that ever did return a nil record with no error would error here rather than
 // panic on the deref.
-func applyExtraRecordBins(txID *chainhash.Hash, recordNum int, extraRecord *aerospike.Record, baseOffset int, spendingDatas []*spendpkg.SpendingData) error {
+func applyExtraRecordBins(txID *chainhash.Hash, recordNum int, extraRecord *aerospike.Record, baseOffset int, spendingDatas []*spendpkg.SpendingData, expectedCount int) error {
 	if extraRecord == nil || extraRecord.Bins == nil {
 		return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d is missing — torn or partially-applied write", txID.String(), recordNum)
 	}
@@ -1338,7 +1348,7 @@ func applyExtraRecordBins(txID *chainhash.Hash, recordNum int, extraRecord *aero
 		return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record has a missing or malformed utxos bin (%T) at record %d — torn or partially-applied record", txID.String(), extraRecord.Bins[fields.Utxos.String()], recordNum)
 	}
 
-	return applyExtraRecordUTXOs(txID, recordNum, extraUtxos, baseOffset, spendingDatas)
+	return applyExtraRecordUTXOs(txID, recordNum, extraUtxos, baseOffset, spendingDatas, expectedCount)
 }
 
 // applyExtraRecordUTXOs writes the spend state held in one extra (paginated)
@@ -1364,7 +1374,18 @@ func applyExtraRecordBins(txID *chainhash.Hash, recordNum int, extraRecord *aero
 //
 // All three correctly leave, or set, the caller's slot. Any other length, or a
 // non-nil non-byte element, is a torn or partially-applied record.
-func applyExtraRecordUTXOs(txID *chainhash.Hash, recordNum int, extraUtxos []interface{}, baseOffset int, spendingDatas []*spendpkg.SpendingData) error {
+//
+// The element count is checked first, because a short list is the same hazard
+// arriving from the other direction: the loop would simply never visit the
+// missing offsets, leaving those slots nil, and nil reads as UNSPENT. Trailing
+// nils survive the round trip (pinned by TestTrailingNilSlotsSurviveRoundTrip),
+// so a healthy record ending in unspendable outputs still comes back at its
+// full length and exact equality cannot misfire on it.
+func applyExtraRecordUTXOs(txID *chainhash.Hash, recordNum int, extraUtxos []interface{}, baseOffset int, spendingDatas []*spendpkg.SpendingData, expectedCount int) error {
+	if len(extraUtxos) != expectedCount {
+		return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d holds %d outputs, expected %d — truncated or over-long record", txID.String(), recordNum, len(extraUtxos), expectedCount)
+	}
+
 	for i, ui := range extraUtxos {
 		offset := baseOffset + i
 		if offset >= len(spendingDatas) {

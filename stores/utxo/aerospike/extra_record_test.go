@@ -54,7 +54,7 @@ func TestExtraRecordElementShapes(t *testing.T) {
 		require.NoError(t, applyExtraRecordUTXOs(&chainhash.Hash{}, 1, []interface{}{
 			spentElement(t, 0x11),
 			unspentElement(0x22),
-		}, 0, spendingDatas))
+		}, 0, spendingDatas, 2))
 
 		require.NotNil(t, spendingDatas[0], "68-byte element must record spending data")
 		require.Nil(t, spendingDatas[1], "32-byte element is a legitimate unspent output")
@@ -73,7 +73,7 @@ func TestExtraRecordElementShapes(t *testing.T) {
 			nil,
 			spentElement(t, 0x55),
 			nil,
-		}, 0, spendingDatas))
+		}, 0, spendingDatas, 3))
 
 		require.Nil(t, spendingDatas[0], "an unspendable output has no spending data")
 		require.NotNil(t, spendingDatas[1], "the spent output either side of it must still be read")
@@ -83,7 +83,7 @@ func TestExtraRecordElementShapes(t *testing.T) {
 	t.Run("a short element fails the read", func(t *testing.T) {
 		spendingDatas := make([]*spendpkg.SpendingData, 1)
 
-		err := applyExtraRecordUTXOs(&chainhash.Hash{}, 1, []interface{}{make([]uint8, 40)}, 0, spendingDatas)
+		err := applyExtraRecordUTXOs(&chainhash.Hash{}, 1, []interface{}{make([]uint8, 40)}, 0, spendingDatas, 1)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "expected 32 (unspent) or 68 (spent)")
 	})
@@ -91,9 +91,41 @@ func TestExtraRecordElementShapes(t *testing.T) {
 	t.Run("a non-byte element fails the read", func(t *testing.T) {
 		spendingDatas := make([]*spendpkg.SpendingData, 1)
 
-		err := applyExtraRecordUTXOs(&chainhash.Hash{}, 1, []interface{}{"not bytes"}, 0, spendingDatas)
+		err := applyExtraRecordUTXOs(&chainhash.Hash{}, 1, []interface{}{"not bytes"}, 0, spendingDatas, 1)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "not bytes")
+	})
+
+	t.Run("a truncated record fails the read", func(t *testing.T) {
+		// The same hazard as a torn element, arriving from the other direction:
+		// the loop never visits the missing offsets, so those slots stay nil,
+		// and nil reads as UNSPENT. Without the count check a truncated record
+		// hands back spent outputs as spendable with no error anywhere.
+		spendingDatas := make([]*spendpkg.SpendingData, 3)
+
+		err := applyExtraRecordUTXOs(&chainhash.Hash{}, 1, []interface{}{
+			spentElement(t, 0x11),
+		}, 0, spendingDatas, 3)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "holds 1 outputs, expected 3")
+	})
+
+	t.Run("a trailing nil is not mistaken for truncation", func(t *testing.T) {
+		// A healthy batch whose tail is unspendable outputs stores trailing
+		// nils, and they survive the round trip (pinned against a real
+		// Aerospike by TestTrailingNilSlotsSurviveRoundTrip). Exact equality
+		// must not reject it.
+		spendingDatas := make([]*spendpkg.SpendingData, 3)
+
+		require.NoError(t, applyExtraRecordUTXOs(&chainhash.Hash{}, 1, []interface{}{
+			spentElement(t, 0x11),
+			nil,
+			nil,
+		}, 0, spendingDatas, 3))
+
+		require.NotNil(t, spendingDatas[0])
+		require.Nil(t, spendingDatas[1])
+		require.Nil(t, spendingDatas[2])
 	})
 
 	t.Run("more outputs than the transaction has fails instead of panicking", func(t *testing.T) {
@@ -103,7 +135,7 @@ func TestExtraRecordElementShapes(t *testing.T) {
 			err := applyExtraRecordUTXOs(&chainhash.Hash{}, 1, []interface{}{
 				unspentElement(0x33),
 				unspentElement(0x44),
-			}, 0, spendingDatas)
+			}, 0, spendingDatas, 2)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "more outputs than the transaction has")
 		})
@@ -121,7 +153,7 @@ func TestApplyExtraRecordBins(t *testing.T) {
 			fields.Utxos.String(): []interface{}{spentElement(t, 0x11), unspentElement(0x22)},
 		}}
 
-		require.NoError(t, applyExtraRecordBins(&chainhash.Hash{}, 1, record, 0, spendingDatas))
+		require.NoError(t, applyExtraRecordBins(&chainhash.Hash{}, 1, record, 0, spendingDatas, 2))
 		require.NotNil(t, spendingDatas[0])
 		require.Nil(t, spendingDatas[1])
 	})
@@ -134,7 +166,7 @@ func TestApplyExtraRecordBins(t *testing.T) {
 		spendingDatas := make([]*spendpkg.SpendingData, 1)
 
 		require.NotPanics(t, func() {
-			err := applyExtraRecordBins(&chainhash.Hash{}, 2, nil, 0, spendingDatas)
+			err := applyExtraRecordBins(&chainhash.Hash{}, 2, nil, 0, spendingDatas, 1)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "is missing")
 		})
@@ -144,7 +176,7 @@ func TestApplyExtraRecordBins(t *testing.T) {
 		spendingDatas := make([]*spendpkg.SpendingData, 1)
 
 		require.NotPanics(t, func() {
-			err := applyExtraRecordBins(&chainhash.Hash{}, 2, &aerospike.Record{}, 0, spendingDatas)
+			err := applyExtraRecordBins(&chainhash.Hash{}, 2, &aerospike.Record{}, 0, spendingDatas, 1)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "is missing")
 		})
@@ -155,7 +187,7 @@ func TestApplyExtraRecordBins(t *testing.T) {
 
 		record := &aerospike.Record{Bins: aerospike.BinMap{fields.Utxos.String(): "not a list"}}
 
-		err := applyExtraRecordBins(&chainhash.Hash{}, 3, record, 0, spendingDatas)
+		err := applyExtraRecordBins(&chainhash.Hash{}, 3, record, 0, spendingDatas, 1)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "missing or malformed utxos bin")
 		require.Contains(t, err.Error(), "string", "the offending type must be named so the damage is diagnosable")
@@ -168,7 +200,7 @@ func TestApplyExtraRecordBins(t *testing.T) {
 			fields.Utxos.String(): []interface{}{make([]uint8, 40)},
 		}}
 
-		err := applyExtraRecordBins(&chainhash.Hash{}, 4, record, 0, spendingDatas)
+		err := applyExtraRecordBins(&chainhash.Hash{}, 4, record, 0, spendingDatas, 1)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "expected 32 (unspent) or 68 (spent)")
 	})

@@ -87,7 +87,66 @@ func TestUnspendableOutputSlotRoundTrip(t *testing.T) {
 	// End to end: the reader must accept the real round-tripped list, leaving the
 	// unspendable slot unspent rather than failing the record.
 	spendingDatas := make([]*spendpkg.SpendingData, 2)
-	require.NoError(t, applyExtraRecordUTXOs(&chainhash.Hash{}, 1, got[:2], 0, spendingDatas))
+	require.NoError(t, applyExtraRecordUTXOs(&chainhash.Hash{}, 1, got[:2], 0, spendingDatas, 2))
 	require.Nil(t, spendingDatas[0])
 	require.Nil(t, spendingDatas[1], "a 32-byte element is unspent, so it records no spending data")
+}
+
+// TestTrailingNilSlotsSurviveRoundTrip pins the fact the element-count check
+// rests on: a list whose last slots are nil comes back at its full stored
+// length, not truncated.
+//
+// This is what a paginated transaction ending in unspendable outputs stores —
+// a trailing OP_FALSE OP_RETURN leaves the final slots nil. If the client (or
+// the server's list encoding) dropped them, the record would come back short
+// and the reader's count check would reject perfectly healthy data. Nothing in
+// our own code decides this, so it is pinned against the real thing.
+func TestTrailingNilSlotsSurviveRoundTrip(t *testing.T) {
+	ctx := context.Background()
+
+	container, err := runAerospikeTestContainer(ctx)
+	if err != nil {
+		t.Skipf("Skipping Aerospike integration test: container not available (%v)", err)
+	}
+
+	defer func() { _ = container.Terminate(ctx) }()
+
+	host, err := container.Host(ctx)
+	require.NoError(t, err)
+
+	port, err := container.ServicePort(ctx)
+	require.NoError(t, err)
+
+	client, aErr := aerospike.NewClient(host, port)
+	require.Nil(t, aErr)
+
+	defer client.Close()
+
+	key, aErr := aerospike.NewKey("test", "extrarecord", "trailingnils")
+	require.Nil(t, aErr)
+
+	// One spendable output followed by two unspendable ones: the shape of a
+	// batch whose tail is data outputs.
+	stored := []interface{}{
+		aerospike.NewBytesValue(make([]byte, 32)),
+		nil,
+		nil,
+	}
+
+	aErr = client.PutBins(nil, key, aerospike.NewBin("utxos", aerospike.NewListValue(stored)))
+	require.Nil(t, aErr)
+
+	record, aErr := client.Get(nil, key, "utxos")
+	require.Nil(t, aErr)
+	require.NotNil(t, record)
+
+	got, ok := record.Bins["utxos"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, got, 3, "trailing nil slots must survive the round trip, or the element-count check would reject healthy data")
+	require.Nil(t, got[1])
+	require.Nil(t, got[2])
+
+	// And the reader accepts it at the count the transaction expects.
+	spendingDatas := make([]*spendpkg.SpendingData, 3)
+	require.NoError(t, applyExtraRecordUTXOs(&chainhash.Hash{}, 1, got, 0, spendingDatas, 3))
 }
