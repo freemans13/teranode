@@ -2,11 +2,13 @@ package subtreeprocessor
 
 import (
 	"context"
+	"encoding/binary"
 	"net/url"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
@@ -1379,6 +1381,61 @@ func storeReorgSubtree(t *testing.T, ctx context.Context, blobStore *blob_memory
 	return key
 }
 
+// storeReorgSubtreeWithTornMeta stores a real subtree exactly as
+// storeReorgSubtree does, but writes a meta file whose claimed entry count is
+// one too high, followed by a well-formed extra entry. That is the shape that
+// panicked with an index out of range inside go-subtree's raw meta
+// deserializer (issue 1425): it sizes its destination slice from the real
+// subtree but writes however many entries the file claims. On this path the
+// panic happened inside a moveBack errgroup goroutine, which does not recover,
+// so it took the whole process down — and recurred on every restart, since the
+// file is on disk.
+func storeReorgSubtreeWithTornMeta(t *testing.T, ctx context.Context, blobStore *blob_memory.Memory, txs []subtree.Node) *chainhash.Hash {
+	t.Helper()
+
+	st, err := subtree.NewTreeByLeafCount(64)
+	require.NoError(t, err)
+	require.NoError(t, st.AddCoinbaseNode())
+
+	for _, n := range txs {
+		require.NoError(t, st.AddSubtreeNode(n))
+	}
+
+	key := st.RootHash()
+
+	stBytes, err := st.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, blobStore.Set(ctx, key[:], fileformat.FileTypeSubtree, stBytes))
+
+	meta := subtree.NewSubtreeMeta(st)
+	for i := range st.Nodes {
+		require.NoError(t, meta.SetTxInpoints(i, subtree.NewTxInpoints()))
+	}
+
+	metaBytes, err := meta.Serialize()
+	require.NoError(t, err)
+
+	// One more entry than the subtree has leaves, with real bytes behind it, so
+	// the deserializer walks past the end of its slice rather than hitting EOF.
+	extraInpoints := subtree.NewTxInpointsFromPacked([]chainhash.Hash{chainhash.HashH([]byte{0xcc})}, []uint32{1, 0})
+
+	extra, err := extraInpoints.Serialize()
+	require.NoError(t, err)
+
+	torn := make([]byte, len(metaBytes), len(metaBytes)+len(extra))
+	copy(torn, metaBytes)
+
+	claimed, err := safeconversion.IntToUint32(len(st.Nodes) + 1)
+	require.NoError(t, err)
+
+	binary.LittleEndian.PutUint32(torn[chainhash.HashSize:], claimed)
+	torn = append(torn, extra...)
+
+	require.NoError(t, blobStore.Set(ctx, key[:], fileformat.FileTypeSubtreeMeta, torn))
+
+	return key
+}
+
 // TestSubtreeProcessor_ReorgThroughRealSubtrees exercises the bulk reorg path
 // (reorgBlocks -> moveBackBlock -> moveBackBlockBulkBuild -> bulkBuildSubtrees)
 // against blocks carrying REAL serialized subtrees, rather than the empty
@@ -1557,5 +1614,89 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		// doubleSpend is now mined in the moved-forward block (on the longest
 		// chain), so it must NOT be left pending in block assembly.
 		require.False(t, finalTxMap.Exists(*doubleSpendTx), "a tx mined in the moved-forward block must not be left pending in block assembly")
+	})
+
+	t.Run("torn subtree meta fails the reorg instead of killing the process", func(t *testing.T) {
+		// The negative counterpart of the first subtest, pinning issue 1425 on
+		// the SECOND production consumer of the .subtreeMeta file. Before the
+		// header validation, an over-long claimed count panicked inside the raw
+		// deserializer, in an errgroup goroutine with no recover — so this test
+		// crashes the whole package binary if the validation regresses, rather
+		// than reporting a failed assertion.
+		//
+		// Note what this does NOT assert: unlike block validation, this path has
+		// no meta regenerator behind it, so the torn file is not repaired. A
+		// failed reorg is the intended outcome here, not self-healing.
+		ctx := context.Background()
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, test.CreateBaseTestSettings(t), utxoStoreURL)
+		require.NoError(t, err)
+
+		blobStore := blob_memory.New()
+		settings := test.CreateBaseTestSettings(t)
+		require.True(t, settings.BlockAssembly.StoreTxInpointsForSubtreeMeta,
+			"the meta read under test is skipped entirely when this setting is off")
+
+		newSubtreeChan := make(chan NewSubtreeRequest, 10)
+
+		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
+		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
+		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+
+		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+		stp.Start(ctx)
+
+		tx1Hash, err := chainhash.NewHashFromStr("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4")
+		require.NoError(t, err)
+		tx2Hash, err := chainhash.NewHashFromStr("e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5")
+		require.NoError(t, err)
+
+		// The subtree itself is valid and stored under its real root hash; only
+		// the meta file is torn, so the failure is attributable to the meta.
+		moveBackSubtreeHash := storeReorgSubtreeWithTornMeta(t, ctx, blobStore, []subtree.Node{
+			{Hash: *tx1Hash, Fee: 100, SizeInBytes: 250},
+			{Hash: *tx2Hash, Fee: 200, SizeInBytes: 300},
+		})
+
+		block2Header := &model.BlockHeader{Version: 1, HashPrevBlock: prevBlockHeader.Hash(), HashMerkleRoot: &chainhash.Hash{}, Timestamp: 1800000004, Bits: model.NBit{}, Nonce: 704}
+		blockNewHeader := &model.BlockHeader{Version: 1, HashPrevBlock: prevBlockHeader.Hash(), HashMerkleRoot: &chainhash.Hash{}, Timestamp: 1800000005, Bits: model.NBit{}, Nonce: 705}
+
+		blockToMoveBack := &model.Block{
+			Height:     2,
+			CoinbaseTx: coinbaseTx2,
+			Subtrees:   []*chainhash.Hash{moveBackSubtreeHash},
+			Header:     block2Header,
+		}
+		blockToMoveForward := &model.Block{
+			Height:     2,
+			CoinbaseTx: coinbaseTx3,
+			Subtrees:   []*chainhash.Hash{},
+			Header:     blockNewHeader,
+		}
+
+		_, err = utxoStore.Create(ctx, coinbaseTx2, 2)
+		require.NoError(t, err)
+		_, err = utxoStore.Create(ctx, coinbaseTx3, 2)
+		require.NoError(t, err)
+
+		stp.InitCurrentBlockHeader(block2Header)
+
+		go func() {
+			for req := range newSubtreeChan {
+				if req.ErrChan != nil {
+					req.ErrChan <- nil
+				}
+			}
+		}()
+
+		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward})
+		require.Error(t, err, "a torn subtree meta must fail the reorg, not be trusted and not panic")
+		require.Contains(t, err.Error(), "invalid subtree meta")
 	})
 }
