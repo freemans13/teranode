@@ -853,6 +853,60 @@ func TestStartupCoinbaseDivergenceCheck_StopsScanningAfterARefusal(t *testing.T)
 		"a structural refusal must be reported once, not once per missing height")
 }
 
+// TestStartupCoinbaseDivergenceCheck_SkippedWhenTipIsNotCanonical covers ChiR8.
+// Block assembly restarts on a branch the chain has since reorged away from.
+// Every canonical height then resolves to a block whose coinbase block assembly
+// legitimately never created, so a scan would report divergence everywhere and
+// -- for a fork deeper than the consecutive-good window -- end in a false
+// MANUAL INTERVENTION alarm for something the ordinary reconcile handles.
+func TestStartupCoinbaseDivergenceCheck_SkippedWhenTipIsNotCanonical(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// The canonical chain is 1..6 with nothing seeded, so a scan that ran would
+	// find every height missing.
+	headers := buildCanonicalChain(ctx, t, items, 6)
+
+	// Block assembly's tip is a block at height 6 that is not the canonical one
+	// there -- the shape left by a restart on an abandoned branch.
+	offBranchTip := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  headers[4].Hash(),
+		HashMerkleRoot: &chainhash.Hash{},
+		Nonce:          9999,
+		Bits:           *bits,
+	}
+	require.False(t, offBranchTip.Hash().IsEqual(headers[5].Hash()))
+
+	items.blockAssembler.setBestBlockHeader(offBranchTip, 6)
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		"a block assembler that is not on the canonical chain at its own tip must defer to the normal reconcile")
+
+	// Control: put block assembly back on the canonical tip and the same chain
+	// is scanned and reported, proving the skip came from the branch check.
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.Greater(t,
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		float64(0), "the same chain is detected once block assembly is on the canonical tip")
+}
+
 // TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned states the
 // honest limit of the widened startup scan: it covers a bounded window below
 // the tip (CoinbaseRecoveryMaxGapBlocks heights), not the whole chain. A hole

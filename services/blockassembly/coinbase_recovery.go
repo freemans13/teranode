@@ -489,6 +489,29 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 		return nil // genesis / unset — nothing to check
 	}
 
+	// Only judge divergence when block assembly is actually on the canonical
+	// chain at its own tip height. Every probe below resolves its height with
+	// GetBlockByHeight, i.e. against the best-work chain, so a block assembler
+	// still sitting on a branch the chain has since reorged away from would see
+	// canonical coinbases it legitimately never created and report them as
+	// diverged. The repair itself would be harmless -- processCoinbaseUtxos is
+	// idempotent and moveForwardBlock would create those coinbases anyway --
+	// but a fork deeper than CoinbaseRecoveryConsecutiveGood ends in an
+	// unproven floor and a MANUAL INTERVENTION line for something the ordinary
+	// reconcile handles on its own. Reorgs are shallow and rare on BSV, so this
+	// is unlikely; the point is to keep that alarm meaningful when it does fire.
+	tipBlk, tipErr := b.blockchainClient.GetBlockByHeight(ctx, height)
+
+	switch {
+	case tipErr != nil:
+		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: cannot resolve the canonical block at block assembly's tip height %d: %v", height, tipErr)
+		return nil
+
+	case tipBlk == nil || tipBlk.Header == nil || !tipBlk.Header.Hash().IsEqual(header.Hash()):
+		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: block assembly tip %s at height %d is not the canonical block there, so the normal reconcile owns this", header.Hash().String(), height)
+		return nil
+	}
+
 	window := b.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks
 	if window < 1 {
 		// A non-positive setting would scan nothing at all, silently disabling
