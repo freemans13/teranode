@@ -404,6 +404,17 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// all-peers-failed error as a network error against the primary.
 			errorType = "peer_data_unavailable"
 			isPeerError = false
+		case errors.Is(*err, errors.ErrStorageError):
+			// A failed read or write of our own store — a torn, stale or mis-keyed
+			// external transaction blob (issue 1439), a full disk — is this node's
+			// fault, never the peer's. Must precede the IsNetworkError case for the
+			// same ordering reason documented above: IsNetworkError falls back to
+			// substring matching and a truncated blob surfaces as "unexpected EOF",
+			// which would otherwise be mislabelled a network error against the
+			// primary. recordCatchupPeerFailure already exempts storage errors, so
+			// this makes the terminal-error path agree with the per-fetch one.
+			errorType = "local_storage_fault"
+			isPeerError = false
 		case errors.IsNetworkError(*err):
 			errorType = "network_error"
 		case strings.Contains(errorMsg, "secret mining") || strings.Contains(errorMsg, "secretly mined"):
@@ -507,7 +518,8 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 		// fetchAndStoreSubtreeAndSubtreeData (e.g. its "Local error fetching
 		// subtree ... not retrying with other peers" wrap) is coded
 		// ErrServiceError, which this switch has no specific case for (it falls
-		// to the unknown_error default with isPeerError left true), and
+		// to the unknown_error default with isPeerError left true, unless it
+		// happens to wrap a storage error, which the case above now catches), and
 		// Server.go's ErrServiceError branch returns early WITHOUT ever calling
 		// reportCatchupFailureForError. Skipping the primary here in that case
 		// charged it zero times for a real subtree failure it caused — an

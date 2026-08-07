@@ -173,6 +173,69 @@ func TestReleaseCatchupLock_LocalErrorSkipsReputationRPC(t *testing.T) {
 	require.False(t, blocker.errorCalled, "local error must not report peer error")
 }
 
+// TestReleaseCatchupLock_StorageErrorIsLocalNotPeer covers the peer-attribution
+// hole left open by issue 1439's reclassification: a torn, stale or mis-keyed
+// external transaction blob is now correctly an ErrStorageError, but the switch
+// in releaseCatchupLock had no case for it, so it reached the unknown_error
+// default with isPeerError left true and charged the primary for this node's own
+// disk fault.
+//
+// The truncated-blob variant was worse than a bare default. Its wrap chain
+// contains "unexpected EOF", and errors.IsNetworkError falls back to substring
+// matching that includes "eof", so it was actively labelled a network error
+// against the peer — which is why the new case has to sit above IsNetworkError.
+func TestReleaseCatchupLock_StorageErrorIsLocalNotPeer(t *testing.T) {
+	header := testhelpers.CreateTestHeaders(t, 1)[0]
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "mis-keyed blob",
+			err:  errors.NewStorageError("[GetTxFromExternalStore][abc] external tx does not hash to the key it was stored under (got def) — stale, rotted or mis-keyed blob"),
+		},
+		{
+			// Must not be classified network_error by the IsNetworkError substring
+			// fallback, which matches "eof".
+			name: "truncated blob surfacing as unexpected EOF",
+			err:  errors.NewStorageError("[GetTxFromExternalStore][abc] could not read tx from stream", errors.NewProcessingError("unexpected EOF")),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _, _, cleanup := setupTestCatchupServer(t)
+			defer cleanup()
+
+			recorder := newPeerFailureRecordingP2PClient()
+			server.p2pClient = recorder
+
+			ctx := &CatchupContext{
+				blockUpTo: &model.Block{Header: header, Height: 1000},
+				baseURL:   "http://honest-primary:8000",
+				peerID:    "honest-primary",
+				startTime: time.Now(),
+			}
+			require.NoError(t, server.acquireCatchupLock(ctx))
+
+			relErr := tc.err
+			server.releaseCatchupLock(ctx, &relErr)
+
+			recorder.mu.Lock()
+			defer recorder.mu.Unlock()
+
+			require.Equal(t, 0, recorder.failuresByPeer["honest-primary"],
+				"a local storage fault must never be charged to the serving peer")
+			require.Empty(t, recorder.errorMsgsByPeer["honest-primary"])
+
+			require.NotNil(t, server.previousCatchupAttempt)
+			require.Equal(t, "local_storage_fault", server.previousCatchupAttempt.ErrorType,
+				"must be classified as a local fault, not network_error or unknown_error")
+		})
+	}
+}
+
 // incompleteBlockP2PClient records whether the peer-attributable incomplete-block penalty
 // path (RecordCatchupFailureWithKind) fires. Only that method is overridden; any other call
 // hits the nil embedded interface and panics, which would flag an unexpected penalty path.
