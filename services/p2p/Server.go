@@ -560,8 +560,47 @@ func (s *Server) applyPeerMapLimits(tSettings *settings.Settings) {
 		s.peerMapTTL = tSettings.P2P.PeerMapTTL
 	}
 
+	s.announcePeerMapLimits(tSettings, maxSize)
+
 	s.blockPeerMap.setMaxSize(maxSize)
 	s.subtreePeerMap.setMaxSize(maxSize)
+}
+
+// announcePeerMapLimits logs the two ways a configured value differs from what
+// the node ran before these keys were wired.
+//
+// Until this change the three p2p_peer_map_* keys carried struct tags but were
+// never read, so every deployment ran the constants no matter what its config
+// said. An operator who followed the reference docs — which advertised
+// 100000/30m/5m — has had dead lines that now take effect on the next restart,
+// at a higher per-entry cost than the sync.Map this replaced. A silent 10x
+// growth in the attribution maps on a change whose purpose is bounding them is
+// the kind of thing that gets diagnosed as a leak three weeks later, so say it
+// at startup instead.
+//
+// The other direction is a value coerced upwards: there is no unbounded mode
+// here, but the adjacent p2p_peer_registry_max_size documents 0 as "disable
+// enforcement", so an operator can reasonably set 0 expecting that and get a
+// bound they did not ask for. A silently-coerced value looks exactly like a
+// value that was never read, which is the bug this change just finished fixing.
+func (s *Server) announcePeerMapLimits(tSettings *settings.Settings, maxSize int) {
+	if tSettings.P2P.PeerMapMaxSize <= 0 {
+		s.logger.Infof("[applyPeerMapLimits] p2p_peer_map_max_size=%d is not a usable cap; using the %d default — there is no unbounded mode",
+			tSettings.P2P.PeerMapMaxSize, defaultPeerMapMaxSize)
+	} else if maxSize > defaultPeerMapMaxSize {
+		s.logger.Warnf("[applyPeerMapLimits] p2p_peer_map_max_size=%d exceeds the %d default; this key was inert before and is now read, so check the value is intended — it also lengthens the cleanup sweep's locked walk",
+			maxSize, defaultPeerMapMaxSize)
+	}
+
+	if s.peerMapTTL > defaultPeerMapTTL {
+		s.logger.Warnf("[applyPeerMapLimits] p2p_peer_map_ttl=%s exceeds the %s default; this key was inert before and is now read, so check the value is intended",
+			s.peerMapTTL, defaultPeerMapTTL)
+	}
+
+	if tSettings.P2P.PeerMapCleanupInterval > defaultPeerMapCleanupInterval {
+		s.logger.Warnf("[applyPeerMapLimits] p2p_peer_map_cleanup_interval=%s exceeds the %s default; this key was inert before and is now read, so check the value is intended",
+			tSettings.P2P.PeerMapCleanupInterval, defaultPeerMapCleanupInterval)
+	}
 }
 
 // peerMapTTLOrDefault returns the attribution TTL, falling back to

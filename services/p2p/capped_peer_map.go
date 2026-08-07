@@ -23,12 +23,27 @@ import (
 // while always retaining the most recent announcements, which are the ones an
 // in-flight validation is about to report.
 //
-// What this does NOT do is make attribution flood-proof. The map is a single
-// space shared by all peers, so a peer that announces enough distinct hashes
-// AFTER an honest announcement can still age that honest entry out before the
-// block finishes validating. Evicting oldest changes when a flooder can strike,
-// not whether it can; closing that needs a per-peer share of the map, tracked
-// in issue 1503. Attribution is best-effort here, as the TTL already implies.
+// What this does NOT do is make attribution flood-proof, in two distinct ways.
+//
+// Cross-peer: the map is a single space shared by all peers, so a peer that
+// announces enough distinct hashes AFTER an honest announcement can age that
+// honest entry out before the block finishes validating. Evicting oldest
+// changes when a flooder can strike, not whether it can; closing that needs a
+// per-peer share of the map, tracked in issue 1503.
+//
+// Self-eviction: a peer can drop ITS OWN attribution the same way, by
+// announcing maxSize further distinct hashes on the same topic between serving
+// an invalid block and that block being reported. This is the sharper of the
+// two, because the invalid-block Kafka message carries only the hash and a
+// reason, so this map is the sole attribution channel the ban path has — losing
+// the entry means the peer is never scored. It is not created here (the sweep
+// on main trimmed oldest-first too), but it is made cheaper: the retention
+// window between sweeps is now set by the announcement rate, which the attacker
+// controls, rather than by the cleanup timer, which it does not. A per-peer
+// share does not help, since a peer evicting from its own share is exactly the
+// case; it needs a per-peer announcement budget, tracked in issue 1433.
+//
+// Attribution is best-effort here, as the TTL already implies.
 //
 // Eviction is O(1): a list holds keys in insertion order (most recent at the
 // back), so no sort is needed at insert or at sweep time.
@@ -49,20 +64,22 @@ type cappedPeerMap struct {
 	// evictors attributes those evictions to the peers whose inserts forced
 	// them — the pressure, not the entries dropped by it — so the at-capacity
 	// warning can tell a busy deployment (pressure spread across peers) from a
-	// flood (one dominant peer); the two call for opposite responses. It is
-	// capped at evictorTrackLimit distinct peers and then stops naming new
-	// ones, so the diagnostic cannot itself become the unbounded map issue
-	// 1409 is about. Guarded by mu.
+	// flood (one dominant peer); the two call for opposite responses. It holds
+	// at most evictorTrackLimit distinct peers, so the diagnostic cannot itself
+	// become the unbounded map issue 1409 is about, and it spends that budget
+	// on whoever dominates rather than whoever arrived first. Guarded by mu.
 	evictors         map[string]int64
 	evictorsOverflow bool
 }
 
 // evictorTrackLimit bounds how many distinct peers the eviction attribution
-// names before it stops admitting new ones, so the diagnostic cannot itself
-// become the unbounded map issue 1409 is about. Overflowing it does not mean
-// the pressure is spread — at capacity every new hash evicts, so a busy mesh
-// overflows the tracker routinely — which is why String weighs the top
-// contributor's share against the exact total rather than trusting the flag.
+// holds at once, so the diagnostic cannot itself become the unbounded map issue
+// 1409 is about. It also sets the resolution: a peer causing more than
+// total/(evictorTrackLimit+1) of the evictions is guaranteed to still be named.
+// Overflowing it does not mean the pressure is spread — at capacity every new
+// hash evicts, so a busy mesh overflows the tracker routinely — which is why
+// String weighs the top contributor's share against the exact total rather than
+// trusting the flag.
 const evictorTrackLimit = 16
 
 // evictionStats summarises eviction pressure for one sweep window.
@@ -70,17 +87,16 @@ type evictionStats struct {
 	total int64 // entries dropped to make room since the previous read
 
 	// topPeer is the peer whose inserts forced the most evictions, and topCount
-	// its exact share. Empty when nothing was evicted. Under spread this is the
-	// largest contributor the tracker admitted rather than provably the largest
-	// overall, since a peer that first evicted after the tracker filled is
-	// counted as zero — so the attribution can miss a flooder, but the count it
-	// does report is never inflated.
+	// its share. Empty when nothing was evicted, and also when the pressure was
+	// a long tail that cancelled itself out of the tracker. Under spread the
+	// count is a lower bound rather than exact — see recordEvictorLocked — so
+	// it can understate a flooder but never overstates one.
 	topPeer  string
 	topCount int64
 
-	// spread is set when more peers contributed than the tracker can name. It
-	// bounds how much the attribution can be trusted; it is not by itself
-	// evidence that no peer dominates.
+	// spread is set when more peers contributed than the tracker can hold. It
+	// says the counts are lower bounds; it is not by itself evidence that no
+	// peer dominates, which is why String weighs the share instead.
 	spread bool
 }
 
@@ -174,6 +190,18 @@ func (m *cappedPeerMap) Store(hash string, entry peerMapEntry) {
 
 // recordEvictorLocked attributes one eviction to the peer whose insert forced
 // it, within the evictorTrackLimit budget. Callers must hold the mutex.
+//
+// The budget is spent by Misra-Gries rather than first-come-first-served,
+// because peer IDs are free and connection limits are unbounded (issue 1163):
+// keeping the first evictorTrackLimit names would let an attacker seed the
+// tracker with throwaway identities and then flood unattributed for the rest of
+// the window. Decrementing every counter instead means a long tail of one-off
+// peers cancels itself out while a heavy hitter survives, so any peer causing
+// more than total/(evictorTrackLimit+1) of the evictions is still named.
+//
+// The counts this leaves are lower bounds, understated by at most that same
+// fraction. That direction is the one worth having: the reported share can miss
+// a flooder but can never overstate one, so it cannot accuse an honest peer.
 func (m *cappedPeerMap) recordEvictorLocked(peerID string) {
 	if m.evictors == nil {
 		m.evictors = make(map[string]int64, evictorTrackLimit)
@@ -181,6 +209,13 @@ func (m *cappedPeerMap) recordEvictorLocked(peerID string) {
 
 	if _, ok := m.evictors[peerID]; !ok && len(m.evictors) >= evictorTrackLimit {
 		m.evictorsOverflow = true
+
+		for id := range m.evictors {
+			if m.evictors[id]--; m.evictors[id] <= 0 {
+				delete(m.evictors, id)
+			}
+		}
+
 		return
 	}
 
@@ -322,10 +357,17 @@ func (s evictionStats) String() string {
 	switch {
 	case s.total == 0:
 		return "none"
+	case s.topPeer == "":
+		// Nobody survived the Misra-Gries decrements, which is itself the
+		// answer: the pressure was a long tail of peers with no heavy hitter.
+		return fmt.Sprintf("spread across more than %d peers", evictorTrackLimit)
 	case s.topCount == s.total:
 		return fmt.Sprintf("all from peer %s", s.topPeer)
 	case s.spread && s.topCount*2 <= s.total:
-		return fmt.Sprintf("spread across more than %d peers", evictorTrackLimit)
+		return fmt.Sprintf("spread across more than %d peers; largest tracked contributor peer %s with at least %d of %d",
+			evictorTrackLimit, s.topPeer, s.topCount, s.total)
+	case s.spread:
+		return fmt.Sprintf("top contributor peer %s with at least %d of %d", s.topPeer, s.topCount, s.total)
 	default:
 		return fmt.Sprintf("top contributor peer %s with %d of %d", s.topPeer, s.topCount, s.total)
 	}

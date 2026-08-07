@@ -94,6 +94,48 @@ func TestCappedPeerMapEvictionAttribution(t *testing.T) {
 		m.mu.Unlock()
 	})
 
+	t.Run("cheap identities cannot crowd the flooder out of the tracker", func(t *testing.T) {
+		var m cappedPeerMap
+
+		m.setMaxSize(10)
+
+		for i := 0; i < 10; i++ {
+			m.Store(fmt.Sprintf("filler-%d", i), peerMapEntry{peerID: "filler", timestamp: now})
+		}
+
+		require.Equal(t, int64(0), m.EvictionsSinceLastRead().total, "filling to the cap must not evict")
+
+		// Peer IDs are free and connection limits are unbounded (issue 1163), so
+		// an attacker can seed the tracker with throwaway identities before it
+		// starts flooding. First-come-first-served tracking would then never
+		// admit the flooder at all, and the warning would report spread no
+		// matter how dominant the flood became.
+		for i := 0; i < evictorTrackLimit; i++ {
+			m.Store(fmt.Sprintf("sybil-%d", i), peerMapEntry{
+				peerID:    fmt.Sprintf("sybil-peer-%d", i),
+				timestamp: now,
+			})
+		}
+
+		for i := 0; i < 100; i++ {
+			m.Store(fmt.Sprintf("junk-%d", i), peerMapEntry{peerID: "attacker", timestamp: now})
+		}
+
+		evictions := m.EvictionsSinceLastRead()
+		require.Equal(t, int64(evictorTrackLimit+100), evictions.total)
+		require.Equal(t, "attacker", evictions.topPeer, "the flooder must displace the throwaway identities")
+		require.Contains(t, evictions.String(), "top contributor peer attacker")
+		require.NotContains(t, evictions.String(), "spread across")
+
+		// A counted share is never inflated, so the dominance verdict cannot be
+		// an accusation the evidence does not support.
+		require.LessOrEqual(t, evictions.topCount, int64(100))
+
+		m.mu.Lock()
+		require.LessOrEqual(t, len(m.evictors), evictorTrackLimit)
+		m.mu.Unlock()
+	})
+
 	t.Run("a dominant flooder is still named when the tracker overflowed", func(t *testing.T) {
 		var m cappedPeerMap
 
@@ -645,7 +687,7 @@ func TestApplyPeerMapLimits(t *testing.T) {
 		tSettings.P2P.PeerMapMaxSize = 7
 		tSettings.P2P.PeerMapTTL = 3 * time.Minute
 
-		s := &Server{}
+		s := &Server{logger: ulogger.TestLogger{}}
 		s.applyPeerMapLimits(tSettings)
 
 		require.Equal(t, 3*time.Minute, s.peerMapTTL)
@@ -658,7 +700,7 @@ func TestApplyPeerMapLimits(t *testing.T) {
 	})
 
 	t.Run("unset settings fall back to the service defaults", func(t *testing.T) {
-		s := &Server{}
+		s := &Server{logger: ulogger.TestLogger{}}
 		s.applyPeerMapLimits(&settings.Settings{})
 
 		require.Equal(t, defaultPeerMapTTL, s.peerMapTTL)
@@ -700,7 +742,7 @@ func TestApplyPeerMapLimits(t *testing.T) {
 		tSettings := &settings.Settings{}
 		tSettings.P2P.PeerMapMaxSize = -1
 
-		s := &Server{}
+		s := &Server{logger: ulogger.TestLogger{}}
 		s.applyPeerMapLimits(tSettings)
 
 		requireConfiguredCap(t, &s.blockPeerMap, defaultPeerMapMaxSize)

@@ -1083,7 +1083,8 @@ func (s *Server) shouldSkipUnhealthyPeer(from string, messageType string) bool {
 // distinct-hash flood cannot grow memory without bound between sweeps, and
 // cannot pre-emptively suppress attribution for the announcement arriving
 // next. A flood after an honest announcement can still age it out before
-// validation reports on it; see issue 1503.
+// validation reports on it (issue 1503), and a peer can age out its own
+// attribution the same way to escape the invalid-block ban path (issue 1433).
 func (s *Server) storePeerMapEntry(peerMap *cappedPeerMap, hash string, from string, timestamp time.Time) {
 	peerMap.Store(hash, peerMapEntry{
 		peerID:    from,
