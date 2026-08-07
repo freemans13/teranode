@@ -647,6 +647,13 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 	})
 
 	switch {
+	case errors.IsContextError(tipErr):
+		// Shutdown (or a cancelled startup) landed on the tip lookup. Saying the
+		// canonical block could not be resolved would point an operator at the
+		// blockchain client for something that is not a fault at all.
+		b.logger.Infof("[coinbaseRecovery] startup divergence check stopped before scanning at tip height %d: shutting down", height)
+		return nil
+
 	case tipErr != nil:
 		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: cannot resolve the canonical block at block assembly's tip height %d: %v", height, tipErr)
 		return nil
@@ -689,6 +696,16 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 				b.logger.Warnf("[coinbaseRecovery] startup: no canonical block at height %d (tip %d); skipping that height", h, height)
 
 				continue
+			}
+
+			if errors.IsContextError(err) {
+				// The node is shutting down mid-probe, either in the lookup
+				// itself or in withProbeRetry's backoff. Detection is not lost
+				// for the run -- there is no run left -- so this must not claim
+				// it is. Same reasoning as the recovery call site below.
+				b.logger.Infof("[coinbaseRecovery] startup divergence check stopped at height %d: shutting down", h)
+
+				return nil
 			}
 
 			// Non-fatal: log and continue booting; see the function-level
