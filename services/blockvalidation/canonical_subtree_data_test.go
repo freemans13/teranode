@@ -94,9 +94,11 @@ func TestFetchAndStoreSubtreeData_NonCanonicalEncoding(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "non-canonical subtree data")
 		require.True(t, errors.Is(err, errors.ErrProcessing))
-		// Must NOT be ErrTxInvalid: that routes to storeInvalidBlock and would
-		// permanently invalidate a valid block over a delivery-level fault,
-		// while isUnvalidatablePeerError stopped us trying another source.
+		// Must NOT be ErrTxInvalid. On this prewarm path that code does not reach
+		// storeInvalidBlock (the prewarm runs before ValidateBlock), but
+		// releaseCatchupLock's classification tests ErrBlockInvalid/ErrTxInvalid
+		// first, so it would report the serving peer as malicious for delivering
+		// bytes that are not in fact invalid. See CheckCanonicalSubtreeData.
 		require.False(t, errors.Is(err, errors.ErrTxInvalid))
 
 		// The canonicalised form must NOT have been written: storing it would

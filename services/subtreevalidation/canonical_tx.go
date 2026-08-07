@@ -33,13 +33,39 @@ import (
 // must stay that way. Non-minimality is a property of the DELIVERY, not of the
 // block: because go-bt canonicalizes, the txids and therefore the merkle root
 // are identical either way, so the same subtree fetched from an honest peer
-// validates fine. ErrTxInvalid would route to BlockValidation.go's
-// storeInvalidBlock and mark a perfectly valid block permanently invalid,
-// surviving restart, and isUnvalidatablePeerError would stop us trying another
-// source — handing any peer we fetch subtree data from a cheap way to poison a
-// valid block. Wrapping does not contain the code either: errors.Is walks the
-// chain by code, so a TxInvalidError inside a ProcessingError still matches
-// ErrTxInvalid.
+// validates fine, and marking the block invalid would be simply wrong.
+//
+// Concretely, from the readTxFromReader caller the error travels
+// getMissingTransactionsBatch -> getSubtreeMissingTxs -> ValidateSubtreeInternal
+// -> validateMissingSubtreesWithOrderedRetry, which wraps it with
+// errors.WrapGRPC, so the code survives the gRPC hop to blockvalidation. There
+// BlockValidation.ValidateBlock tests errors.Is(err, ErrTxInvalid) on the
+// validateBlockSubtrees result: a TxInvalidError would reach storeInvalidBlock
+// and mark a perfectly valid block permanently invalid, surviving restart,
+// while the resulting BlockInvalidError makes isUnvalidatablePeerError true and
+// stops us trying another source — handing any peer we fetch from a cheap way
+// to poison a valid block. Wrapping does not contain the code either:
+// errors.Is walks the chain by code (errors/errors.go (*Error).Is), so a
+// TxInvalidError inside a ProcessingError still matches ErrTxInvalid.
+//
+// From the readTransactionsFromSubtreeDataStream caller that branch is not
+// reachable TODAY only by accident: CheckBlockSubtrees returns the batch
+// pipeline's error without errors.WrapGRPC, so grpc-go flattens it to
+// codes.Unknown with no TError detail and UnwrapGRPC rebuilds a bare
+// ERR_ERROR. Adding the missing WrapGRPC there is a plausible future fix, and
+// would immediately restore the hazard — so do not rely on the code being
+// dropped in transit.
+//
+// What ProcessingError buys instead is bounded retry rather than poisoning: on
+// the catchup route the block is retried against alternative peers and then
+// counted against CatchupMaxAttemptsPerBlock (default 5) with a 10-minute
+// cooldown, and ReportPeerFailure rotates the sync peer. If every peer serves
+// the same non-minimal bytes the node stops advancing at that height instead of
+// recording a false verdict, and recovers by itself as soon as one peer serves
+// canonical bytes. That is the same liveness profile as the established sibling
+// check in this package — the "subtree data does not match subtree"
+// ProcessingError in getSubtreeMissingTxs — and it is the right trade for a
+// consensus-divergence hazard: stalling is recoverable, a wrong verdict is not.
 //
 // Subtree data may carry EXTENDED transactions (each input also carrying its
 // parent's satoshis and locking script), which serialize longer than tx.Size()

@@ -18,6 +18,10 @@ type CountingReader struct {
 // NewCountingReader wraps r. Wrap the reader the PARSER reads from (inside any
 // buffering), so the count is bytes consumed by the parse rather than bytes
 // pulled from the network including read-ahead.
+//
+// Not safe for concurrent use: the counter is a plain field, so read the reader
+// and then BytesConsumed from the same goroutine (which is how a parse-then-
+// compare caller naturally uses it).
 func NewCountingReader(r io.Reader) *CountingReader {
 	return &CountingReader{r: r}
 }
@@ -79,13 +83,39 @@ func CanonicalTxSize(tx *bt.Tx) int {
 // stay that way. Non-minimality is a property of the DELIVERY, not of the block:
 // because go-bt canonicalizes, the txids and therefore the merkle root are
 // identical either way, so the same subtree fetched from an honest peer
-// validates fine. ErrTxInvalid would route to BlockValidation.go's
-// storeInvalidBlock and mark a perfectly valid block permanently invalid,
-// surviving restart, and isUnvalidatablePeerError would stop us trying another
-// source — handing any peer we fetch subtree data from a cheap way to poison a
-// valid block. Wrapping does not contain the code either: errors.Is walks the
-// chain by code, so a TxInvalidError inside a ProcessingError still matches
-// ErrTxInvalid.
+// validates fine, and marking the block invalid would be simply wrong. The two
+// callers reach two different verdict machines, and TxInvalidError is wrong at
+// both:
+//
+//   - subtreevalidation's getSubtreeMissingTxs runs under
+//     ValidateSubtreeInternal, whose error is WrapGRPC'd back to blockvalidation.
+//     BlockValidation.ValidateBlock tests errors.Is(err, ErrTxInvalid) on the
+//     validateBlockSubtrees result, so a TxInvalidError reaches
+//     storeInvalidBlock and marks a perfectly valid block permanently invalid,
+//     surviving restart; the resulting BlockInvalidError then makes
+//     isUnvalidatablePeerError true and stops us trying another source.
+//   - blockvalidation's catchup prewarm (fetchAndStoreSubtreeData) never reaches
+//     ValidateBlock, so it cannot store the block invalid. Instead
+//     fetchAndStoreSubtreeAndSubtreeData reclassifies an all-peers-failed fetch
+//     as ErrExternal, and releaseCatchupLock's classification tests
+//     ErrBlockInvalid/ErrTxInvalid FIRST — so a TxInvalidError there reports the
+//     serving peer as malicious for delivering bytes that are not in fact
+//     invalid.
+//
+// Wrapping does not contain the code either: errors.Is walks the chain by code
+// (errors/errors.go (*Error).Is), so a TxInvalidError inside a ProcessingError
+// still matches ErrTxInvalid.
+//
+// What ProcessingError buys instead is bounded retry rather than a false
+// verdict. On the catchup route the error rotates through the alternative peers
+// for the subtree, then counts against CatchupMaxAttemptsPerBlock (default 5)
+// with a 10-minute cooldown, and ReportPeerFailure rotates the sync peer. If
+// every peer serves the same non-minimal bytes the node stops advancing at that
+// height instead of recording a verdict it cannot justify, and recovers by
+// itself as soon as one peer serves canonical bytes. That matches the
+// established sibling check — the "subtree data does not match subtree"
+// ProcessingError in getSubtreeMissingTxs — and it is the right trade for a
+// consensus-divergence hazard: stalling is recoverable, a wrong verdict is not.
 func CheckCanonicalSubtreeData(consumed int64, serialized []byte, omittedCoinbase *bt.Tx) error {
 	canonicalSize := int64(len(serialized))
 	if omittedCoinbase != nil {
