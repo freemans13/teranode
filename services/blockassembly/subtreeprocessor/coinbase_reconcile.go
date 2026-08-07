@@ -73,7 +73,14 @@ func (stp *SubtreeProcessor) ReconcileCoinbases(ctx context.Context, gapBlocks [
 // block - and never touches per-transaction state; that is the scale
 // invariant that keeps recovery cheap regardless of mempool size.
 func (stp *SubtreeProcessor) reconcileCoinbases(ctx context.Context, gapBlocks []*model.Block) error {
-	for _, block := range gapBlocks {
+	for i, block := range gapBlocks {
+		if block == nil || block.Header == nil {
+			// Reported before processCoinbaseUtxos is reached, because the error
+			// formatting below describes the block with block.String(), which
+			// dereferences both the block and its header.
+			return errors.NewProcessingError("[SubtreeProcessor][reconcileCoinbases] gap block at index %d is nil or has no header", i)
+		}
+
 		if err := stp.processCoinbaseUtxos(ctx, block); err != nil {
 			return errors.NewProcessingError("[SubtreeProcessor][reconcileCoinbases] error creating coinbase for block %s", block.String(), err)
 		}

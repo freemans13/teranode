@@ -71,7 +71,10 @@ Three settings bound that work:
   the tip the startup scan looks, and it is the largest gap recovery will repair on
   its own. The two are deliberately the same number: there is no value in detecting a
   divergence deeper than the node is willing to fix automatically. A clean boot costs
-  two store reads per height in the window; the scan stops at the first miss.
+  two store reads per height in the window; a miss triggers a repair and the scan then
+  carries on down the rest of the window, so a second hole below the first is still
+  found. Only a refusal to repair ends the scan early, since a refusal is structural
+  and would repeat identically at every lower height.
   A second, non-configurable bound applies underneath it — see the safety floor below —
   so with the default settings the effective reach is the coinbase-maturity window.
 - `blockassembly_coinbaseRecoveryConsecutiveGood` guards against under-repair. The
@@ -148,6 +151,7 @@ operator that the UTXO state needs manual intervention.
 |---------|-------|-------|
 | jobTTL | 10 minutes | Mining job cache TTL |
 | coinbaseRecoveryRetryBackoff | 500 milliseconds | Pause between automatic coinbase-recovery attempts |
+| coinbaseRecoveryProbeRetries | 2 | Probe retries the whole startup divergence scan may spend, shared across every height it visits |
 
 ## Configuration Dependencies
 
