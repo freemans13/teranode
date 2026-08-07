@@ -4662,7 +4662,11 @@ func TestRemoveCoinbaseUtxos_NilCoinbase_ReturnsErrorNotPanic(t *testing.T) {
 
 	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, nil, utxoStore, newSubtreeChan)
 	require.NoError(t, err)
-	stp.Start(ctx)
+
+	// The processor is deliberately not started. removeCoinbaseUtxos is called
+	// directly here, so the background worker adds nothing to the test -- and
+	// starting it would leave a goroutine running past the end of the test,
+	// racing the deferred close of newSubtreeChan above.
 
 	// Test with nil CoinbaseTx
 	err = stp.removeCoinbaseUtxos(ctx, &model.Block{Header: &model.BlockHeader{}, CoinbaseTx: nil})

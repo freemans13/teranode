@@ -86,6 +86,24 @@ func (b *BlockAssembler) canonicalCoinbaseAt(ctx context.Context, height uint32)
 // Two retries caps the added latency at one second.
 const coinbaseRecoveryProbeRetries = 2
 
+// probeBudget is the retry allowance one startup scan may spend, shared by
+// every lookup that scan makes.
+type probeBudget struct {
+	left int
+}
+
+// spend takes one retry from the budget, reporting whether there was one to
+// take.
+func (p *probeBudget) spend() bool {
+	if p.left <= 0 {
+		return false
+	}
+
+	p.left--
+
+	return true
+}
+
 // canonicalBlockAbsent reports whether err means the canonical chain has no
 // block at the probed height at all, as opposed to the client or store failing
 // to answer. It pairs with the tag canonicalBlockAt applies.
@@ -108,19 +126,17 @@ func canonicalBlockAbsent(err error) bool {
 // opportunity, losing the check to one blip is a poor trade when an attempt
 // budget is already available a level down.
 //
-// retriesLeft is decremented in place, so every probe in one scan draws on the
-// same budget. A missing canonical block is returned immediately without
-// spending any of it: retrying cannot conjure a block the chain does not have.
-func (b *BlockAssembler) withProbeRetry(ctx context.Context, height uint32, retriesLeft *int, probe func() error) error {
+// budget is shared by every probe in one scan. A missing canonical block is
+// returned immediately without spending any of it: retrying cannot conjure a
+// block the chain does not have.
+func (b *BlockAssembler) withProbeRetry(ctx context.Context, height uint32, budget *probeBudget, probe func() error) error {
 	for {
 		err := probe()
-		if err == nil || canonicalBlockAbsent(err) || *retriesLeft <= 0 {
+		if err == nil || canonicalBlockAbsent(err) || !budget.spend() {
 			return err
 		}
 
-		*retriesLeft--
-
-		b.logger.Warnf("[coinbaseRecovery] startup probe at height %d failed, retrying (%d scan retries left): %v", height, *retriesLeft, err)
+		b.logger.Warnf("[coinbaseRecovery] startup probe at height %d failed, retrying (%d scan retries left): %v", height, budget.left, err)
 
 		select {
 		case <-ctx.Done():
@@ -132,8 +148,8 @@ func (b *BlockAssembler) withProbeRetry(ctx context.Context, height uint32, retr
 
 // probeCanonicalCoinbase is canonicalCoinbaseAt with the shared retry budget
 // applied, discarding the canonical block the detection path has no use for.
-func (b *BlockAssembler) probeCanonicalCoinbase(ctx context.Context, height uint32, retriesLeft *int) (present bool, err error) {
-	err = b.withProbeRetry(ctx, height, retriesLeft, func() error {
+func (b *BlockAssembler) probeCanonicalCoinbase(ctx context.Context, height uint32, budget *probeBudget) (present bool, err error) {
+	err = b.withProbeRetry(ctx, height, budget, func() error {
 		var probeErr error
 
 		present, _, probeErr = b.canonicalCoinbaseAt(ctx, height)
@@ -618,11 +634,11 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 	//
 	// This lookup draws on the same retry budget as the probes below, so it is
 	// not itself a single point of failure for the whole scan.
-	probeRetries := coinbaseRecoveryProbeRetries
+	budget := &probeBudget{left: coinbaseRecoveryProbeRetries}
 
 	var tipBlk *model.Block
 
-	tipErr := b.withProbeRetry(ctx, height, &probeRetries, func() error {
+	tipErr := b.withProbeRetry(ctx, height, budget, func() error {
 		var err error
 
 		tipBlk, err = b.canonicalBlockAt(ctx, height)
@@ -663,7 +679,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 	}
 
 	for h, scanned := height, 0; h >= scanFloor && scanned < window; h, scanned = h-1, scanned+1 {
-		present, err := b.probeCanonicalCoinbase(ctx, h, &probeRetries)
+		present, err := b.probeCanonicalCoinbase(ctx, h, budget)
 		if err != nil {
 			if canonicalBlockAbsent(err) {
 				// The canonical chain simply has no block at this height. Skip
