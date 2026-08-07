@@ -531,3 +531,38 @@ func TestNewBlobFooterSizeMismatchError(t *testing.T) {
 	assert.Equal(t, "test blob footer size mismatch error param1 42", err.Message(), "error message should match")
 	assert.Nil(t, err.Data(), "error data should be nil when params are provided")
 }
+
+// TestNewBlockHeaderContextError pins the two properties that make this constructor work, both
+// of which are invisible at the call site and both of which were wrong once already.
+//
+// It must satisfy TWO predicates at the same time: Is(err, ErrBlockHeaderContext), which the
+// catchup classifier and the gRPC handler use to tell a local context failure from a peer or
+// consensus one, and Is(err, ErrProcessing), which the pre-existing transient handling uses to
+// keep it retryable. And the caller's cause has to survive: New() takes the LAST param as the
+// wrapped error, so appending the ERR_PROCESSING tail to params — the obvious "simplification" —
+// displaces the caller's error into a format argument and renders it as %!(EXTRA ...).
+func TestNewBlockHeaderContextError(t *testing.T) {
+	cause := NewProcessingError("header X does not follow Y")
+	err := NewBlockHeaderContextError("[BLOCK][%s] window is not a linked chain", "abc", cause)
+
+	require.Equal(t, ERR_BLOCK_HEADER_CONTEXT, err.Code())
+	require.True(t, Is(err, ErrBlockHeaderContext), "the catchup classifier and gRPC handler match on this")
+	require.True(t, Is(err, ErrProcessing), "existing retryable handling matches on this")
+	require.False(t, Is(err, ErrBlockInvalid), "a bad header context is never a verdict on the block")
+
+	// The caller's cause is wrapped, not formatted away.
+	require.Contains(t, err.Error(), "does not follow", "the cause must survive as the wrapped error")
+	require.NotContains(t, err.Error(), "%!", "a displaced cause renders as %!(EXTRA ...)")
+	require.Contains(t, err.Error(), "abc", "the format argument is still applied")
+
+	// The ERR_PROCESSING tail must be a fresh instance. SetWrappedErr and Join walk to the tail
+	// and assign, so sharing the package-level singleton would let a later Join mutate it
+	// process-wide.
+	require.Nil(t, ErrProcessing.WrappedErr(), "the ErrProcessing global must never be mutated")
+
+	// Works with no cause supplied at all.
+	bare := NewBlockHeaderContextError("no cause here")
+	require.True(t, Is(bare, ErrBlockHeaderContext))
+	require.True(t, Is(bare, ErrProcessing))
+	require.NotContains(t, bare.Error(), "%!")
+}

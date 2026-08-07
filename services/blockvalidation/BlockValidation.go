@@ -155,6 +155,12 @@ type revalidateBlockData struct {
 	// peerID carries the serving peer through a notYetAdded re-entry so the retried
 	// validation attributes an invalid verdict to the same peer the first attempt would have.
 	peerID string
+
+	// disableOptimisticMining and isCatchupMode preserve the original caller's mode across a
+	// notYetAdded re-entry. Without them the retry resolves optimistic mining from the global
+	// setting, which defaults to on.
+	disableOptimisticMining bool
+	isCatchupMode           bool
 }
 
 // BlockValidation handles the core validation logic for blocks in Teranode.
@@ -777,8 +783,10 @@ func (u *BlockValidation) start(ctx context.Context) error {
 				var err error
 				if blockData.notYetAdded {
 					err = u.ValidateBlockWithOptions(ctx, blockData.block, blockData.baseURL, &ValidateBlockOptions{
-						PeerID:          blockData.peerID,
-						IsRequeuedRetry: true,
+						PeerID:                  blockData.peerID,
+						IsRequeuedRetry:         true,
+						DisableOptimisticMining: blockData.disableOptimisticMining,
+						IsCatchupMode:           blockData.isCatchupMode,
 					})
 				} else {
 					err = u.reValidateBlock(blockData)
@@ -799,6 +807,18 @@ func (u *BlockValidation) start(ctx context.Context) error {
 					if blockData.retries < 3 {
 						blockData.retries++
 						go func() {
+							// A not-yet-added retry runs inside its own runOncePerBlock
+							// closure, so re-enqueuing immediately would collide with that
+							// attempt's own gate entry and short-circuit again. Wait out the
+							// grace window here, off the worker.
+							if blockData.notYetAdded {
+								select {
+								case <-time.After(revalidateFromScratchDelay):
+								case <-ctx.Done():
+									return
+								}
+							}
+
 							// Guard the re-enqueue: on shutdown the consumer (this
 							// worker) exits, so an unguarded send would leak this
 							// goroutine forever on the full channel.
@@ -1388,6 +1408,18 @@ func (u *BlockValidation) isParentMined(ctx context.Context, blockHeader *model.
 
 // runOncePerBlock ensures validation runs only once per block.
 // If another goroutine is already validating, it waits and returns that result.
+// validationResultGrace is how long a finished validation's result stays published for
+// concurrent arrivals of the same block before runOncePerBlock drops the entry. Any re-entry
+// inside this window is answered from the stored result instead of re-validating.
+const validationResultGrace = 100 * time.Millisecond
+
+// revalidateFromScratchDelay is how long a not-yet-stored block waits before being queued for
+// another attempt. It MUST exceed validationResultGrace: the re-queue is raised from inside the
+// runOncePerBlock closure, so an attempt scheduled any sooner is answered by the failure that
+// caused it and never reaches AddBlock. Derived from the grace window rather than written as a
+// second independent timeout, so the two cannot drift apart.
+const revalidateFromScratchDelay = 2 * validationResultGrace
+
 func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *ValidateBlockOptions, validate func(opts *ValidateBlockOptions) error) error {
 	result := &validationResult{
 		done: make(chan struct{}),
@@ -1415,7 +1447,7 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 
 	// Cleanup after delay
 	go func() {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(validationResultGrace)
 		u.blocksCurrentlyValidating.Delete(*blockHash)
 	}()
 
@@ -1811,7 +1843,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// returning here would drop it until a peer re-announces — re-queue through the
 				// from-scratch path, which re-enters validation and ends in AddBlock.
 				if !opts.IsRequeuedRetry {
-					u.ReValidateBlockFromScratch(block, baseURL, opts.PeerID)
+					u.ReValidateBlockFromScratch(block, baseURL, opts)
 				}
 
 				return err
@@ -1982,7 +2014,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					// block with catchup blocking on the send — and a non-transient processing
 					// error (model/Block.go's target-difficulty check) fails identically each time.
 					if errors.Is(err, errors.ErrBlockHeaderContext) && !opts.IsRequeuedRetry {
-						u.ReValidateBlockFromScratch(block, baseURL, opts.PeerID)
+						u.ReValidateBlockFromScratch(block, baseURL, opts)
 					}
 
 					return err
@@ -2277,13 +2309,35 @@ func (u *BlockValidation) waitForPreviousBlocksToBeProcessed(ctx context.Context
 // re-enters ValidateBlockWithOptions, which ends in AddBlock — unlike ReValidateBlock, whose
 // worker path only re-checks blocks already on the chain and would validate this one and then
 // throw it away, leaving it absent until a peer re-announces it.
-func (u *BlockValidation) ReValidateBlockFromScratch(block *model.Block, baseURL, peerID string) {
-	u.enqueueRevalidation(revalidateBlockData{
+func (u *BlockValidation) ReValidateBlockFromScratch(block *model.Block, baseURL string, opts *ValidateBlockOptions) {
+	data := revalidateBlockData{
 		block:       block,
 		baseURL:     baseURL,
-		peerID:      peerID,
+		peerID:      opts.PeerID,
 		notYetAdded: true,
-	})
+		// Carry the caller's mode through. Rebuilding the options from scratch would resolve
+		// optimistic mining from the global setting (default true), handing a caller that
+		// deliberately disabled it — catchup does — the AddBlock-before-full-Valid branch it
+		// opted out of, and flipping its per-block logging from debug to info.
+		disableOptimisticMining: opts.DisableOptimisticMining,
+		isCatchupMode:           opts.IsCatchupMode,
+		// CachedHeaders is deliberately NOT carried: the run it holds is what failed, and the
+		// retry should re-fetch a fresh one from the store.
+	}
+
+	// Wait out the result-grace window off the caller's goroutine and off the worker: the
+	// re-queue is raised from inside the runOncePerBlock closure, so enqueuing immediately
+	// gets the retry answered from the failure that caused it. Waiting here rather than in the
+	// drain loop also keeps the single worker free and takes the blocking send off catchup.
+	go func() {
+		select {
+		case <-time.After(revalidateFromScratchDelay):
+		case <-u.revalidateWorkerStopped:
+			return
+		}
+
+		u.enqueueRevalidation(data)
+	}()
 }
 
 func (u *BlockValidation) ReValidateBlock(block *model.Block, baseURL string) {
