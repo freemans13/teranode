@@ -171,6 +171,27 @@ func TestValidateBlock_CachedHeadersShortWindowIsRefused(t *testing.T) {
 // proper genesis-terminated run afterwards, which is the shape of the reorg race the re-queue
 // exists for.
 func TestValidateBlock_HeaderContextFailureIsRetriedIntoAddBlock(t *testing.T) {
+	// Both re-queue sites must end in AddBlock. The optimistic one is reached with the global
+	// setting on; the non-optimistic one is the branch EVERY catchup block and every operator
+	// reconsider takes, since both set DisableOptimisticMining.
+	// TODO(#1525): the non-optimistic branch — the one catchup and operator reconsider both
+	// take — is NOT covered here. Driving it needs a subtree fixture that survives a full
+	// block.Valid, because unlike the optimistic branch (which reaches AddBlock before full
+	// validation) that path validates completely before storing. Raised by ctnguyen as ChiR19
+	// and deliberately left open rather than covered by a fixture that only appears to pass.
+	for _, tc := range []struct {
+		name                    string
+		disableOptimisticMining bool
+	}{
+		{"optimistic branch", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runHeaderContextRetryReachesAddBlock(t, tc.disableOptimisticMining)
+		})
+	}
+}
+
+func runHeaderContextRetryReachesAddBlock(t *testing.T, disableOptimisticMining bool) {
 	initPrometheusMetrics()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -250,10 +271,23 @@ func TestValidateBlock_HeaderContextFailureIsRetriedIntoAddBlock(t *testing.T) {
 	mockBlockchain.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Return(parent, &model.BlockHeaderMeta{ID: 1, Height: 1}, nil).Maybe()
 
-	// First call hands back the racy short run; every later call is healthy. Ordered
-	// expectations: testify consumes the Once() first, then falls through to the general one.
+	// The first attempt hands back the racy short run; every later call is healthy. Ordered
+	// expectations: testify consumes the Times() ones first, then falls through to the general
+	// one.
+	//
+	// The count differs by branch because the two paths fetch a different number of times per
+	// attempt: the optimistic branch evaluates the header context from the run fetched at the
+	// top of ValidateBlockWithOptions, while the non-optimistic branch fetches again for
+	// block.Valid, which is where its CheckHeaderContextual runs. Scripting only one bad call
+	// would let the second fetch hand block.Valid a healthy run, and the failure under test
+	// would never occur.
+	badCalls := 1
+	if disableOptimisticMining {
+		badCalls = 2
+	}
+
 	mockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
-		Return([]*model.BlockHeader{badParent, badGrandparent}, goodMeta, nil).Once()
+		Return([]*model.BlockHeader{badParent, badGrandparent}, goodMeta, nil).Times(badCalls)
 	mockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
 		Return(goodRun, goodMeta, nil).Maybe()
 
@@ -293,7 +327,9 @@ func TestValidateBlock_HeaderContextFailureIsRetriedIntoAddBlock(t *testing.T) {
 	require.NoError(t, subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes))
 
 	// No IsRequeuedRetry: the re-queue must actually fire.
-	err = bv.ValidateBlockWithOptions(ctx, block, "", &ValidateBlockOptions{})
+	err = bv.ValidateBlockWithOptions(ctx, block, "", &ValidateBlockOptions{
+		DisableOptimisticMining: disableOptimisticMining,
+	})
 	require.Error(t, err, "the first attempt sees the racy short run")
 	require.True(t, errors.Is(err, errors.ErrBlockHeaderContext))
 

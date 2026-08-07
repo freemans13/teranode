@@ -147,10 +147,16 @@ type revalidateBlockData struct {
 	// retries tracks the number of revalidation attempts
 	retries int
 
-	// notYetAdded marks a block that failed BEFORE it was stored, so the worker must
-	// re-enter full validation (which ends in AddBlock) instead of reValidateBlock, which
-	// only re-checks blocks already on the chain and stores nothing.
-	notYetAdded bool
+	// useFullValidation sends the worker back through ValidateBlockWithOptions instead of
+	// reValidateBlock. Needed whenever the retry must reach a step reValidateBlock does not
+	// perform: AddBlock for a block that failed before it was stored, and the invalid-flag
+	// clearing that only runs under IsRevalidation.
+	useFullValidation bool
+
+	// isRevalidation preserves an operator reconsider request across the re-queue. Without it
+	// the retry re-enters with the flag false, trips the existence check, and is rejected with
+	// "block already exists as invalid" on every attempt.
+	isRevalidation bool
 
 	// peerID carries the serving peer through a notYetAdded re-entry so the retried
 	// validation attributes an invalid verdict to the same peer the first attempt would have.
@@ -781,10 +787,11 @@ func (u *BlockValidation) start(ctx context.Context) error {
 				// IsRequeuedRetry stops the retried attempt from enqueuing itself again, so the
 				// worker's retry counter below stays the only retry budget.
 				var err error
-				if blockData.notYetAdded {
+				if blockData.useFullValidation {
 					err = u.ValidateBlockWithOptions(ctx, blockData.block, blockData.baseURL, &ValidateBlockOptions{
 						PeerID:                  blockData.peerID,
 						IsRequeuedRetry:         true,
+						IsRevalidation:          blockData.isRevalidation,
 						DisableOptimisticMining: blockData.disableOptimisticMining,
 						IsCatchupMode:           blockData.isCatchupMode,
 					})
@@ -811,7 +818,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 							// closure, so re-enqueuing immediately would collide with that
 							// attempt's own gate entry and short-circuit again. Wait out the
 							// grace window here, off the worker.
-							if blockData.notYetAdded {
+							if blockData.useFullValidation {
 								select {
 								case <-time.After(revalidateFromScratchDelay):
 								case <-ctx.Done():
@@ -1836,12 +1843,21 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				}
 
 				// Anything else is a local header-context failure, not the block's fault: the
-				// parent-header run we supplied was unanchored, unlinked or too short (issue
-				// #1467). GetBlockHeaders' fast path probes on_main_chain/height and then
-				// range-scans in a separate statement, so a reorg landing between the two can
-				// hand back somebody else's chain. The block has not been added yet, so
-				// returning here would drop it until a peer re-announces — re-queue through the
-				// from-scratch path, which re-enters validation and ends in AddBlock.
+				// parent-header run we supplied was unanchored, unlinked or too short to hold
+				// the median window (issue #1467). Whatever produced it, it is a run our own
+				// store returned that we cannot interpret, so the block must not be marked bad
+				// for it — and it has not been added yet, so returning alone would drop it
+				// until a peer re-announces. Re-queue through the from-scratch path, which
+				// re-enters validation and ends in AddBlock.
+				//
+				// On what the retry can and cannot fix: the probe/range-scan window in
+				// GetBlockHeaders' fast path is NOT an established live cause — StoreBlock
+				// raises mainChainRebuilding for exactly the !onMainChain reorg case, and the
+				// fast path is skipped entirely while that is non-zero. And the retry re-issues
+				// the same GetBlockHeaders key, which the store memoizes for up to
+				// chainWalkCacheTTL, so a retry inside that window sees the same answer. Its
+				// value is that a genuinely transient cause gets another attempt instead of the
+				// block being silently lost, not that it can force a fresh read.
 				if !opts.IsRequeuedRetry {
 					u.ReValidateBlockFromScratch(block, baseURL, opts)
 				}
@@ -2311,10 +2327,14 @@ func (u *BlockValidation) waitForPreviousBlocksToBeProcessed(ctx context.Context
 // throw it away, leaving it absent until a peer re-announces it.
 func (u *BlockValidation) ReValidateBlockFromScratch(block *model.Block, baseURL string, opts *ValidateBlockOptions) {
 	data := revalidateBlockData{
-		block:       block,
-		baseURL:     baseURL,
-		peerID:      opts.PeerID,
-		notYetAdded: true,
+		block:             block,
+		baseURL:           baseURL,
+		peerID:            opts.PeerID,
+		useFullValidation: true,
+		// Carried so an operator reconsider request stays a reconsider request. Dropping it
+		// makes the retry trip the existence check and fail as "already exists as invalid"
+		// every attempt, and leaves the invalid flag uncleared.
+		isRevalidation: opts.IsRevalidation,
 		// Carry the caller's mode through. Rebuilding the options from scratch would resolve
 		// optimistic mining from the global setting (default true), handing a caller that
 		// deliberately disabled it — catchup does — the AddBlock-before-full-Valid branch it

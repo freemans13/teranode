@@ -1502,11 +1502,13 @@ func (u *Server) fetchCandidateParentMedianTime(ctx context.Context, parentHash 
 // services/legacy/netsync for the rationale — duplicated by design (small,
 // internal, avoids a new shared util package).
 //
-// nil pointers and nil header responses are hard errors: production callers
-// only invoke this at heights at or above CSVHeight, well past the chain's
-// first `depth` blocks, so we never legitimately walk off the beginning.
-// Tolerating short returns would silently produce an incomplete MTP on a
-// transient cache miss; raising loudly forces the caller to surface it.
+// nil pointers and nil header responses are hard errors. Walking off the
+// BEGINNING of the chain is not one of them: the loop breaks at genesis,
+// because CSVHeight is 0 on teratestnet, tstn and stn, so a candidate can
+// legitimately sit below the first `depth` blocks and a genesis-terminated
+// run is the correct short window there. Tolerating other short returns would
+// silently produce an incomplete MTP on a transient cache miss; raising
+// loudly forces the caller to surface it.
 func (u *Server) walkParentChain(ctx context.Context, startHash *chainhash.Hash, depth uint64) ([]*model.BlockHeader, error) {
 	headers := make([]*model.BlockHeader, 0, depth)
 	cur := startHash
