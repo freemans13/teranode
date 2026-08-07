@@ -11,6 +11,17 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
+const (
+	// subtreeMetaEntryCountSize is the width of the little-endian uint32 entry
+	// count that go-subtree's Meta.serializeTxInpoints writes straight after the
+	// root hash.
+	subtreeMetaEntryCountSize = 4
+
+	// subtreeMetaHeaderSize is the fixed header go-subtree's Meta.Serialize
+	// emits: the subtree root hash followed by the entry count.
+	subtreeMetaHeaderSize = chainhash.HashSize + subtreeMetaEntryCountSize
+)
+
 // NewSubtreeMetaFromValidatedReader deserializes a .subtreeMeta stream after
 // validating its fixed 36-byte header — the subtree root hash the file was
 // built for and the entry count it claims — against the subtree it is being
@@ -24,16 +35,20 @@ import (
 // count as the subtree's node count keyed by the subtree root, so a mismatch
 // always means a torn or foreign file, never a legitimate one.
 func NewSubtreeMetaFromValidatedReader(subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree, reader io.Reader) (*subtreepkg.Meta, error) {
-	var metaHeader [36]byte
+	if subtree == nil {
+		return nil, errors.NewProcessingError("cannot validate subtree meta for %s: subtree is nil", subtreeHash.String())
+	}
+
+	var metaHeader [subtreeMetaHeaderSize]byte
 	if _, err := io.ReadFull(reader, metaHeader[:]); err != nil {
 		return nil, errors.NewProcessingError("failed to read subtree meta header for %s", subtreeHash.String(), err)
 	}
 
-	if !bytes.Equal(metaHeader[:32], subtreeHash[:]) {
+	if !bytes.Equal(metaHeader[:chainhash.HashSize], subtreeHash[:]) {
 		// Print the foreign hash in display order like every other hash in the
 		// logs, or the one line meant for triage shows two incomparable hex
 		// strings (the byte-order trap behind the phantom-fork misdiagnosis).
-		metaRootHash := chainhash.Hash(metaHeader[0:32])
+		metaRootHash := chainhash.Hash(metaHeader[:chainhash.HashSize])
 
 		return nil, errors.NewProcessingError("subtree meta root hash mismatch for %s: meta was built for %s", subtreeHash.String(), metaRootHash.String())
 	}
@@ -43,7 +58,7 @@ func NewSubtreeMetaFromValidatedReader(subtreeHash chainhash.Hash, subtree *subt
 		return nil, errors.NewProcessingError("failed to convert subtree length for %s", subtreeHash.String(), err)
 	}
 
-	if claimedCount := binary.LittleEndian.Uint32(metaHeader[32:36]); claimedCount != subtreeLength {
+	if claimedCount := binary.LittleEndian.Uint32(metaHeader[chainhash.HashSize:]); claimedCount != subtreeLength {
 		return nil, errors.NewProcessingError("subtree meta entry count mismatch for %s: meta claims %d entries, subtree has %d transactions", subtreeHash.String(), claimedCount, subtreeLength)
 	}
 
