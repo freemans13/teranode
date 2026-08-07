@@ -394,8 +394,12 @@ type SubtreeProcessor struct {
 	// consumer has been away from that branch - the signal that was missing
 	// during the incident recorded at dequeueDuringBlockMovement's docstring
 	// (35+ minutes at 558 GB RSS with queue depth alone giving no warning).
-	// Initialised in Start() so it never reads as the zero time, which would
-	// misreport "stalled since the epoch" before the first iteration runs.
+	// Seeded in NewSubtreeProcessor and again in Start() so it never reads as
+	// the zero time, which would misreport "stalled since the epoch". The
+	// constructor seed matters because BlockAssembly.Init starts the metrics
+	// updater and the gRPC ingest path before BlockAssembler.Start reaches
+	// stp.Start(ctx) - loadUnminedTransactions runs in between and can take
+	// minutes, during which the queue is already being filled.
 	lastDequeueMillis atomic.Int64
 }
 
@@ -566,6 +570,8 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 		opts(stp)
 	}
 
+	stp.lastDequeueMillis.Store(stp.clock.Now().UnixMilli())
+
 	// If mmap dir is configured, recreate first subtree with mmap backing
 	if stp.mmapDir != "" {
 		mmapSubtree, mmapErr := subtreepkg.NewTreeByLeafCountMmap(initialItemsPerFile, stp.mmapDir)
@@ -634,10 +640,10 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 
 		stp.setCurrentRunningState(StateRunning)
 
-		// Seed lastDequeueMillis before the loop starts so LastDequeueTime()
-		// never reads as the zero time (which would misreport "stalled since
-		// the epoch") in the window before the first iteration of the
-		// default: dequeue branch below.
+		// Re-seed lastDequeueMillis before the loop starts. The constructor
+		// already seeded it, but that value may be minutes stale by now
+		// (loadUnminedTransactions runs between the two), and staleness
+		// accrued before the consumer existed must not be attributed to it.
 		stp.lastDequeueMillis.Store(stp.clock.Now().UnixMilli())
 
 		go func() {
