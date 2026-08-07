@@ -1163,6 +1163,13 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 	// subtrees actually held in memory, so a claimed count can no longer drive
 	// it. The remaining overflow route is the multiplier itself, which is
 	// operator-supplied (block_parentSpendsCapacityMultiplier) and unvalidated.
+	//
+	// Recomputed here rather than read from b.txMapCount, deliberately: that
+	// field is only set by checkDuplicateTransactions, and callers that invoke
+	// this method directly (rather than through Valid, which always runs step 11
+	// first) would otherwise size from a zero. Recomputing is one len() per
+	// subtree and keeps this method self-contained — please do not "tidy" it into
+	// reading the field.
 	expectedInpoints := parentSpendsCapacity(b.txMapEntryCount(), parentSpendsCapacityMultiplier)
 
 	var psMap ParentSpendsMap

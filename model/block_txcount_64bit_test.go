@@ -9,6 +9,7 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/dolthub/swiss"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,6 +24,34 @@ import (
 // removing after it dominated CI memory, issue 1051). The narrowing seam
 // itself no longer exists at the type level — GetTxMap/PutTxMap take uint64 —
 // so the pure classification and clamp logic carries the behavioural pin.
+
+// withTxMapSizeClasses and withParentSpendsSizeClasses swap a package-global
+// size-class table for the duration of one test and restore it afterwards.
+//
+// The tables are global mutable state that the pools were built from at init, so
+// a test that shrinks one must always restore it or it corrupts every later test
+// in the package. Routing every swap through these helpers keeps that restore in
+// one place rather than relying on each test remembering its own t.Cleanup.
+// Shrinking is safe because the pools are indexed by position and every
+// surviving index still resolves to a real pool. Callers must not use
+// t.Parallel().
+func withTxMapSizeClasses(t *testing.T, classes []uint32) {
+	t.Helper()
+
+	orig := txMapSizeClasses
+	txMapSizeClasses = classes
+
+	t.Cleanup(func() { txMapSizeClasses = orig })
+}
+
+func withParentSpendsSizeClasses(t *testing.T, classes []uint64) {
+	t.Helper()
+
+	orig := parentSpendsSizeClasses
+	parentSpendsSizeClasses = classes
+
+	t.Cleanup(func() { parentSpendsSizeClasses = orig })
+}
 
 // TestTxMapClassIdx64Bit pins the size-class classification on 64-bit counts:
 // everything at or below the largest class resolves to a pool class, and
@@ -61,14 +90,15 @@ func TestTxMapAllocHintClamp(t *testing.T) {
 // txMapConstructorWrapThreshold overflows and preallocates an arbitrary amount
 // unrelated to the count (math.MaxUint32 wraps to ~859M entries).
 //
-// Asserted two ways on purpose. The threshold constant is checked to be the real
-// wrap point, so it cannot drift from the dependency silently; then every hint
-// the package can produce is checked against that constant. Note the constant is
-// tied to go-tx-map's 20% headroom factor: if a dependency bump changes that
-// factor, the first loop below fails rather than the bound quietly becoming
-// wrong.
+// Asserted three ways, because the first two alone would be self-referential:
+// the 1/5 headroom below is transcribed from the dependency, so checking the
+// constant against that transcription proves only that the transcription is
+// self-consistent. The third check observes the real constructor, so a
+// dependency bump that changes the factor fails here instead of leaving the
+// constant quietly wrong.
 func TestTxMapAllocHintAvoidsConstructorOverflow(t *testing.T) {
-	// The threshold really is the last exact value, and one past it wraps.
+	// The threshold really is the last value the transcribed arithmetic holds
+	// exactly, and one past it wraps.
 	for _, tc := range []struct {
 		hint  uint32
 		exact bool
@@ -87,6 +117,23 @@ func TestTxMapAllocHintAvoidsConstructorOverflow(t *testing.T) {
 		require.LessOrEqual(t, uint64(txMapAllocHint(n)), txMapConstructorWrapThreshold,
 			"hint for count %d must stay below the constructor's wrap point", n)
 	}
+
+	// The headroom factor really is 1/5, observed rather than transcribed. The
+	// threshold above cannot be probed directly (constructing at that size costs
+	// tens of GB), but the factor that determines it can: with a single bucket the
+	// constructor's per-bucket size is the whole (hint + hint/5), so a fresh map's
+	// capacity exposes the factor for a few hundred KB.
+	const (
+		probeHint    uint32 = 1000
+		probeBuckets uint16 = 1
+	)
+
+	transcribed := (probeHint + probeHint/5) / uint32(probeBuckets)
+	want := swiss.NewMap[chainhash.Hash, uint64](transcribed).Capacity()
+	got := txmap.NewSplitSwissMapUint64(probeHint, probeBuckets).Map()[0].Map().Capacity()
+
+	require.Equal(t, want, got,
+		"go-tx-map's per-bucket headroom factor no longer matches the 1/5 transcribed here, so txMapConstructorWrapThreshold is stale")
 }
 
 // TestParentSpendsAllocHint pins the parent-spends preallocation bound, which
@@ -194,10 +241,7 @@ func TestCheckDuplicateTransactionsUsesFullCount(t *testing.T) {
 // resolves to a real pool. The Cleanup restore is mandatory and this test must
 // not run in parallel, since it mutates package state.
 func TestCheckDuplicateTransactionsAboveUint32(t *testing.T) {
-	origClasses := txMapSizeClasses
-	txMapSizeClasses = []uint32{1 << 12}
-
-	t.Cleanup(func() { txMapSizeClasses = origClasses })
+	withTxMapSizeClasses(t, []uint32{1 << 12})
 
 	subtree, err := subtreepkg.NewTreeByLeafCount(4)
 	require.NoError(t, err)
@@ -239,10 +283,7 @@ func TestCheckDuplicateTransactionsAboveUint32(t *testing.T) {
 // is built from the original classes at init, so the surviving index still
 // resolves to a real pool. Cleanup restore is mandatory; no t.Parallel().
 func TestGetParentSpendsMapBoundsPreallocation(t *testing.T) {
-	origClasses := parentSpendsSizeClasses
-	parentSpendsSizeClasses = []uint64{1 << 8}
-
-	t.Cleanup(func() { parentSpendsSizeClasses = origClasses })
+	withParentSpendsSizeClasses(t, []uint64{1 << 8})
 
 	const overMax = 1 << 20 // above the shrunk largest class, so idx < 0
 
