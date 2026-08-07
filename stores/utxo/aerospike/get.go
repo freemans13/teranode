@@ -1318,10 +1318,16 @@ func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, tota
 // writes the spend state it holds into the caller's slice.
 //
 // It is split from the fetch so the interpretation can be tested without an
-// Aerospike container. A nil record means the master record claims more extra
-// records than were actually written, which is a torn write: the Aerospike
-// client returns a nil record with no error for a key that is not there, so
-// without this guard the missing record would panic rather than error.
+// Aerospike container.
+//
+// The nil-record guard is defence in depth rather than the primary handling of
+// a missing extra record. This client version reports an absent key as
+// ErrKeyNotFound, which getAllExtraUTXOs already turns into a storage error
+// before calling here, and it never hands back a nil BinMap (a record whose
+// utxos bin is absent arrives with an empty map, and falls through to the
+// malformed-bin branch below). The guard exists so that a client or wrapper
+// that ever did return a nil record with no error would error here rather than
+// panic on the deref.
 func applyExtraRecordBins(txID *chainhash.Hash, recordNum int, extraRecord *aerospike.Record, baseOffset int, spendingDatas []*spendpkg.SpendingData) error {
 	if extraRecord == nil || extraRecord.Bins == nil {
 		return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d is missing — torn or partially-applied write", txID.String(), recordNum)
@@ -1372,7 +1378,7 @@ func applyExtraRecordUTXOs(txID *chainhash.Hash, recordNum int, extraUtxos []int
 
 		u, ok := ui.([]uint8)
 		if !ok {
-			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d output is %T, not bytes, at offset %d — torn or partially-applied record", txID.String(), recordNum, ui, i)
+			return errors.NewStorageError("[getAllExtraUTXOs][%s] extra record %d output is %T, not bytes, at offset %d — torn or partially-applied record", txID.String(), recordNum, ui, offset)
 		}
 
 		switch len(u) {

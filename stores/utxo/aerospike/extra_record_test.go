@@ -127,9 +127,10 @@ func TestApplyExtraRecordBins(t *testing.T) {
 	})
 
 	t.Run("a missing record fails instead of panicking", func(t *testing.T) {
-		// The Aerospike client returns a nil record with no error when the key is
-		// not there, so a master record claiming more extra records than were
-		// written reaches this path.
+		// Defence in depth: this client version reports an absent key as
+		// ErrKeyNotFound, which getAllExtraUTXOs turns into a storage error before
+		// reaching here, so a nil record should be unreachable in production. It
+		// must still error rather than panic on the deref if it ever arrives.
 		spendingDatas := make([]*spendpkg.SpendingData, 1)
 
 		require.NotPanics(t, func() {
