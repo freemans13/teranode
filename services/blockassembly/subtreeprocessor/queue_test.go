@@ -122,6 +122,54 @@ func Test_queueWithTime(t *testing.T) {
 	assert.Equal(t, 10, batches)
 }
 
+// Test_enqueueBatchUnboundedContract pins LockFreeQueue's current intake
+// contract: enqueueBatch accepts an arbitrary number of batches with no
+// ceiling, and length() (a transaction count - see the field comment above)
+// grows linearly forever with whatever is enqueued.
+//
+// This is DELIBERATE, not an oversight (issue #1429). Bounding intake here -
+// by blocking enqueueBatch or by making it reject/shed - is inadmissible
+// until the validator's two-phase commit unlock path is made safe against
+// it: SpendAndCreate marks new outputs WithLocked(true), and only unlocks
+// them (SetLocked(false), via twoPhaseCommitTransaction) after block
+// assembly acknowledges the transaction. If enqueueBatch ever returns an
+// error and a caller used it to reject, the unlock would be skipped and the
+// transaction would stay Locked in the shared UTXO store indefinitely,
+// failing every descendant with ErrTxLocked. If a caller silently dropped
+// instead, the submitter would be told the transaction was accepted while it
+// sits unmined forever - BSV has no mempool to re-send it. Blocking is
+// separately disqualified because the producer's context has no deadline.
+//
+// So this test exists to make any future change to enqueueBatch's contract
+// (a ceiling, a return value, a block) a visible, deliberate diff rather
+// than an accident - and it must not be "fixed" by adding a bound without
+// first fixing the two-phase-commit unlock path above.
+func Test_enqueueBatchUnboundedContract(t *testing.T) {
+	q := NewLockFreeQueue()
+
+	const batches = 5_000
+	const txsPerBatch = 3
+
+	for i := 0; i < batches; i++ {
+		nodes := make([]subtree.Node, txsPerBatch)
+		inpoints := make([]*subtree.TxInpoints, txsPerBatch)
+
+		for j := range nodes {
+			nodes[j] = subtree.Node{
+				Hash:        chainhash.HashH(fmt.Appendf(nil, "%d-%d", i, j)),
+				Fee:         1,
+				SizeInBytes: 100,
+			}
+			inpoints[j] = &subtree.TxInpoints{}
+		}
+
+		q.enqueueBatch(nodes, inpoints)
+	}
+
+	require.Equal(t, int64(batches*txsPerBatch), q.length(),
+		"enqueueBatch has no ceiling: length grows linearly with every transaction enqueued, by design (issue #1429)")
+}
+
 type fixedClock struct{ t time.Time }
 
 func (f fixedClock) Now() time.Time { return f.t }

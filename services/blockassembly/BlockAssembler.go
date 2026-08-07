@@ -272,6 +272,17 @@ func (b *BlockAssembler) QueueLength() int64 {
 	return b.subtreeProcessor.QueueLength()
 }
 
+// LastDequeueTime returns the wall-clock time the subtree processor's
+// consumer goroutine last passed through its dequeue branch. See
+// subtreeprocessor.Interface.LastDequeueTime for why this, not QueueLength
+// alone, is what detects a stalled consumer.
+//
+// Returns:
+//   - time.Time: last time the dequeue branch ran
+func (b *BlockAssembler) LastDequeueTime() time.Time {
+	return b.subtreeProcessor.LastDequeueTime()
+}
+
 // SubtreeCount returns the total number of subtrees.
 //
 // Returns:

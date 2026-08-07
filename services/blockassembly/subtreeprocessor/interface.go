@@ -14,6 +14,7 @@ package subtreeprocessor
 
 import (
 	"context"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
@@ -297,6 +298,16 @@ type Interface interface {
 	// Returns:
 	//   - int64: Current queue length
 	QueueLength() int64
+
+	// LastDequeueTime returns the wall-clock time the consumer goroutine last
+	// passed through the queue's dequeue branch. Combined with QueueLength,
+	// this reveals a stalled consumer sitting on a non-empty queue, which a
+	// depth reading alone cannot distinguish from a queue that is merely
+	// growing under normal load.
+	//
+	// Returns:
+	//   - time.Time: last time the dequeue branch ran
+	LastDequeueTime() time.Time
 
 	// SubtreeCount returns the total number of subtrees managed by the processor.
 	// This metric provides visibility into the processor's organizational state.

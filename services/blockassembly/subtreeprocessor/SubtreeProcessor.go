@@ -385,6 +385,18 @@ type SubtreeProcessor struct {
 	// clock is the source of wall time for codepaths that need a deterministic
 	// substitute in tests (validFromMillis calculations). Replaced in tests.
 	clock clock
+
+	// lastDequeueMillis holds the wall-clock Unix milliseconds of the most
+	// recent pass through the default: dequeue branch of the Start() select
+	// loop (stored at the top of that branch, before any dequeue work
+	// happens). It advances once per loop iteration regardless of whether
+	// the queue was empty, so LastDequeueTime() reports how long the single
+	// consumer has been away from that branch - the signal that was missing
+	// during the incident recorded at dequeueDuringBlockMovement's docstring
+	// (35+ minutes at 558 GB RSS with queue depth alone giving no warning).
+	// Initialised in Start() so it never reads as the zero time, which would
+	// misreport "stalled since the epoch" before the first iteration runs.
+	lastDequeueMillis atomic.Int64
 }
 
 type State uint32
@@ -621,6 +633,12 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 		stp.processorCtx.Store(&ctxToStore)
 
 		stp.setCurrentRunningState(StateRunning)
+
+		// Seed lastDequeueMillis before the loop starts so LastDequeueTime()
+		// never reads as the zero time (which would misreport "stalled since
+		// the epoch") in the window before the first iteration of the
+		// default: dequeue branch below.
+		stp.lastDequeueMillis.Store(stp.clock.Now().UnixMilli())
 
 		go func() {
 			// Recover from panics (e.g., send on closed channel during shutdown).
@@ -952,6 +970,13 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					}
 
 				default:
+					// Record that the consumer passed through this branch
+					// before doing any dequeue work, so a slow or wedged
+					// step further down still counts as "the consumer was
+					// just here" for this iteration's timestamp. One atomic
+					// store per iteration; see LastDequeueTime's docstring.
+					stp.lastDequeueMillis.Store(stp.clock.Now().UnixMilli())
+
 					stp.setCurrentRunningState(StateDequeue)
 
 					// Phase 1: Dequeue multiple batches
@@ -1856,6 +1881,23 @@ func (stp *SubtreeProcessor) TxCount() uint64 {
 //   - int64: Current queue length
 func (stp *SubtreeProcessor) QueueLength() int64 {
 	return stp.queue.length()
+}
+
+// LastDequeueTime returns the wall-clock time of the most recent pass through
+// the Start() goroutine's default: dequeue branch - i.e. the last moment the
+// single consumer was available to drain the queue. It advances on every
+// iteration of that branch, whether or not a batch was actually dequeued, so
+// a growing gap between this value and now while QueueLength() is non-zero
+// means every other case in the select (reorg, move-forward-block, reset,
+// get*, etc.) has been preventing dequeue - not that ingest has merely
+// slowed down. Callers should compare against QueueLength() together: a deep
+// but actively-draining queue is normal and self-correcting, whereas a
+// non-empty queue with a stale LastDequeueTime is not.
+//
+// Returns:
+//   - time.Time: the last time the dequeue branch ran
+func (stp *SubtreeProcessor) LastDequeueTime() time.Time {
+	return time.UnixMilli(stp.lastDequeueMillis.Load())
 }
 
 // SubtreeCount returns the total number of subtrees.

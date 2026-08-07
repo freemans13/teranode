@@ -285,6 +285,27 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 	go ba.runBlockSubmissionListener(ctx, listenerDone)
 
 	go func() {
+		// dequeueStallWarnRepeat bounds how often the "consumer stalled"
+		// warning below repeats while the condition persists. Chosen so an
+		// operator sees it promptly but is not paged every 5 seconds for the
+		// duration of an incident that may run for many minutes; 2 minutes
+		// still gives ~15+ log lines across the 35-minute incident on record
+		// (see dequeueDuringBlockMovement's docstring) without flooding logs.
+		const dequeueStallWarnRepeat = 2 * time.Minute
+		// dequeueStallThreshold is the hard-coded 30s bound below which a
+		// non-empty queue with no dequeue activity is unambiguously wrong in
+		// every deployment - see issue #1429. Deliberately not a setting:
+		// nobody can yet justify a different number, and during CATCHINGBLOCKS
+		// the queue should be near-empty anyway (subtree validation calls
+		// AddTXToBlockAssembly(false), which bypasses this queue).
+		const dequeueStallThreshold = 30 * time.Second
+
+		var (
+			queueStalled  bool
+			stalledSince  time.Time
+			lastStallWarn time.Time
+		)
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -292,8 +313,32 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 				return
 			case <-time.After(5 * time.Second):
 				prometheusBlockAssemblerTransactions.Set(float64(ba.blockAssembler.TxCount()))
-				prometheusBlockAssemblerQueuedTransactions.Set(float64(ba.blockAssembler.QueueLength()))
+
+				queueLength := ba.blockAssembler.QueueLength()
+				prometheusBlockAssemblerQueuedTransactions.Set(float64(queueLength))
+
 				prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
+
+				staleness := time.Since(ba.blockAssembler.LastDequeueTime())
+				prometheusBlockAssemblerDequeueStalenessSeconds.Set(staleness.Seconds())
+
+				stalledNow := queueLength > 0 && staleness > dequeueStallThreshold
+
+				switch {
+				case stalledNow && !queueStalled:
+					// Rising edge: log immediately, every time this starts.
+					ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue)", queueLength, staleness.Round(time.Second))
+					queueStalled = true
+					stalledSince = time.Now()
+					lastStallWarn = stalledSince
+				case stalledNow && queueStalled && time.Since(lastStallWarn) >= dequeueStallWarnRepeat:
+					// Still stalled: repeat at a reduced cadence rather than every 5s.
+					ba.logger.Warnf("block assembler intake queue still stalled: %d transactions queued, consumer has not dequeued for %s", queueLength, staleness.Round(time.Second))
+					lastStallWarn = time.Now()
+				case !stalledNow && queueStalled:
+					ba.logger.Infof("block assembler intake queue consumer recovered, was stalled for %s", time.Since(stalledSince).Round(time.Second))
+					queueStalled = false
+				}
 			}
 		}
 	}()
