@@ -130,6 +130,12 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 		"CVE-2012-2459: honest (7-tx) and mutant (8-tx, duplicated T6) subtree layouts must "+
 			"produce the SAME merkle root under go-subtree's duplicate-last-node-when-odd rule")
 
+	// Sampled ONCE and shared by both headers. Sampling inside buildHeader would take
+	// time.Now() twice, and a second boundary falling between the two calls would give the
+	// honest and mutant headers different timestamps — hence different block hashes — and
+	// flake the identical-hash assertion below.
+	timestamp := uint32(time.Now().Unix()) //nolint:gosec
+
 	buildHeader := func(root *chainhash.Hash) *BlockHeader {
 		bits, bitsErr := NewNBitFromString("207fffff")
 		require.NoError(t, bitsErr)
@@ -138,7 +144,7 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 			Version:        1,
 			HashPrevBlock:  &chainhash.Hash{},
 			HashMerkleRoot: root,
-			Timestamp:      uint32(time.Now().Unix()), //nolint:gosec
+			Timestamp:      timestamp,
 			Bits:           *bits,
 			Nonce:          0,
 		}

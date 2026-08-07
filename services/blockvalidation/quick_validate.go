@@ -229,9 +229,12 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 			// A consensus rejection (e.g. the CVE-2012-2459 duplicate-transaction check in
 			// validateSubtrees) must survive unwrapped. This entry point is the legacy
 			// unified route (Server.processBlockFound), which returns this error straight to
-			// its caller with no fallback to normal validation — so re-wrapping it as
-			// ProcessingError would report a consensus rejection as a transient processing
-			// fault and lose the peer punishment that keys on ErrBlockInvalid.
+			// its caller with no fallback to normal validation. (*Error).Is walks the wrapped
+			// chain, so an ErrBlockInvalid buried inside a ProcessingError is still matched by
+			// the errors.Is(err, ErrBlockInvalid) consumers; what re-wrapping changes is the
+			// error's OWN code — the rejection would additionally satisfy ErrProcessing, so any
+			// consumer that classifies on the top-level code, or tests ErrProcessing first,
+			// would read a consensus rejection as a transient processing fault.
 			if errors.Is(err, errors.ErrBlockInvalid) {
 				return err
 			}
@@ -313,10 +316,11 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 		if err != nil {
 			// Same pass-through as quickValidateBlock, for the same reason: a consensus
 			// rejection must not be reported as a transient processing fault. On this
-			// (catchup) route the immediate consequence is milder — tryQuickValidation
-			// discards the subtree files and falls back to normal validation on any error,
-			// which re-checks the block properly either way — but the error type is what
-			// tells the caller whether the block was rejected on consensus grounds.
+			// (catchup) route it has no behavioural effect today — tryQuickValidation
+			// inspects only ErrBlockIncomplete; for every other error it discards the subtree
+			// files, swallows the error and falls back to normal validation, which re-checks
+			// the block properly. It is kept so both quick-path entry points classify the
+			// same rejection identically.
 			if errors.Is(err, errors.ErrBlockInvalid) {
 				return err
 			}
@@ -775,16 +779,20 @@ func (u *BlockValidation) validateSubtrees(ctx context.Context, block *model.Blo
 		}
 	}
 
-	// The quick-validation path runs no other duplicate-transaction check, and the merkle
-	// root CANNOT detect a CVE-2012-2459 duplicate (the duplicate-last-node-when-odd rule
-	// means a doctored, duplicated tail can reproduce the same root). This MUST run before
-	// CheckMerkleRoot and before the block is committed (commitBlock, later in the caller);
-	// UTXOs may already have been created/spent for this batch by the time we get here (see
-	// createAndSpendUTXOsForBatch upstream in the pipeline) but the block itself is never
+	// The quick-validation pipeline runs no other duplicate-transaction check (netsync does
+	// check before handing a block to the legacy unified route, but the catchup route has
+	// nothing), and the merkle root CANNOT detect a CVE-2012-2459 duplicate (the
+	// duplicate-last-node-when-odd rule means a doctored, duplicated tail can reproduce the
+	// same root). It MUST run before the block is committed (commitBlock, later in the
+	// caller); it sits ahead of CheckMerkleRoot only so a duplicate is reported as such
+	// rather than masked by an unrelated merkle failure. By the time we get here every batch
+	// has finished, so the whole block's UTXOs have already been created — locked, on
+	// default settings, and never unlocked because commitBlock is not reached — and spent
+	// (see createAndSpendUTXOsForBatch upstream in the pipeline); the block itself is never
 	// committed, which is the security-critical property. Returned unwrapped: it is already
 	// a BlockInvalid error (model.CheckSubtreeSlicesForDuplicateTxs), and wrapping it in
-	// ProcessingError would report a consensus rejection as a transient processing fault —
-	// see the pass-throughs in quickValidateBlock/quickValidateBlockAsync.
+	// ProcessingError would give the rejection an ErrProcessing code on top — see the
+	// pass-throughs in quickValidateBlock/quickValidateBlockAsync.
 	if err := model.CheckSubtreeSlicesForDuplicateTxs(block.SubtreeSlices); err != nil {
 		return 0, err
 	}
