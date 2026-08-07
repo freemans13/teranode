@@ -402,11 +402,13 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 // erode its value for real divergences.
 //
 // Exactly one outcome metric is recorded per call alongside "detected", so
-// detected == repaired + no_gap + escalated:
+// detected == repaired + no_gap + escalated + aborted:
 //   - "repaired"  -- a non-empty gap was closed
 //   - "no_gap"    -- scoping found nothing to repair (a concurrent writer, or
 //     a retry, closed it first)
 //   - "escalated" -- structural gap, or the attempt budget ran out
+//   - "aborted"   -- the context was cancelled mid-recovery, i.e. the node is
+//     shutting down. Nothing is known to be wrong, so this raises no alarm.
 //
 // On escalation it logs a single loud operator-facing line naming
 // resetblockassembly and returns an error. "Escalate" means this recovery
@@ -490,6 +492,18 @@ attempts:
 	// does not.
 	if lastErr == nil {
 		lastErr = errors.NewProcessingError("[coinbaseRecovery] no repair attempt completed after %d attempts", maxAttempts)
+	}
+
+	if errors.IsContextError(lastErr) {
+		// The node is shutting down, or the startup context was cancelled.
+		// Nothing is known to be wrong with the UTXO state, so this must not
+		// fire the loudest signal the system has. Telling an operator who just
+		// restarted a pod mid-repair that manual intervention is required is
+		// the same crying-wolf failure the attempt budget exists to avoid.
+		prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("aborted").Inc()
+		b.logger.Warnf("[coinbaseRecovery] recovery at height %d abandoned before completing: %v", triggerHeight, lastErr)
+
+		return lastErr
 	}
 
 	// Stage 2: stop retrying and raise a single loud operator signal.
@@ -654,6 +668,13 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 		b.logger.Warnf("[coinbaseRecovery] startup: canonical coinbase missing at height %d (tip %d); running recovery", h, height)
 
 		if err := b.recoverCoinbaseDivergence(ctx, h); err != nil {
+			if errors.IsContextError(err) {
+				// Shutdown, not a divergence we failed to fix.
+				// recoverCoinbaseDivergence has already recorded the "aborted"
+				// outcome and said so; do not restate it as a call to action.
+				return nil
+			}
+
 			// Non-fatal: see the function-level comment above. recoverCoinbaseDivergence
 			// has already logged the loud MANUAL INTERVENTION alert and incremented
 			// the "escalated" metric; log that startup recovery failed and let the

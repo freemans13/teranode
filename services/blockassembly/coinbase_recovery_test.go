@@ -697,6 +697,85 @@ func TestRecoverCoinbaseDivergence_ExhaustsAttemptsThenEscalates(t *testing.T) {
 		"exhausting the attempt budget must escalate exactly once")
 }
 
+// TestRecoverCoinbaseDivergence_CancellationAbortsWithoutAlarm covers ChiR10.
+// A context cancelled while recovery is retrying used to fall through to the
+// escalation path, so a node stopped mid-boot emitted the loudest signal the
+// system has -- MANUAL INTERVENTION REQUIRED, naming resetblockassembly -- for
+// an entirely ordinary shutdown. Cancellation is now its own outcome.
+func TestRecoverCoinbaseDivergence_CancellationAbortsWithoutAlarm(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	headers := buildCanonicalChain(t.Context(), t, items, 4)
+	seedCoinbase(t.Context(), t, items, headers, 1) // floor good; 2,3,4 missing
+
+	// The first repair fails as a transient error would, and the shutdown lands
+	// while recovery is waiting to try again.
+	mockProcessor := &subtreeprocessor.MockSubtreeProcessor{}
+	mockProcessor.On("ReconcileCoinbases", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { cancel() }).
+		Return(errors.NewStorageError("store went away during shutdown"))
+	swapSubtreeProcessor(t, items, mockProcessor)
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+	abortedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("aborted"))
+	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+
+	err := items.blockAssembler.recoverCoinbaseDivergence(ctx, 4)
+	require.Error(t, err)
+	require.True(t, errors.IsContextError(err), "the real reason must be reported, not a generic unrecoverable-divergence error")
+
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore)
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("aborted"))-abortedBefore,
+		"a cancelled recovery records its own outcome so the metric still balances")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
+		"a shutdown must not raise the manual-intervention alarm")
+}
+
+// TestStartupCoinbaseDivergenceCheck_CancellationIsNotReportedAsIntervention is
+// the caller-side half of ChiR10: the startup hook must stay non-fatal and must
+// not restate a shutdown as a call to action.
+func TestStartupCoinbaseDivergenceCheck_CancellationIsNotReportedAsIntervention(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	headers := buildCanonicalChain(t.Context(), t, items, 4)
+	seedCoinbase(t.Context(), t, items, headers, 1)
+	items.blockAssembler.setBestBlockHeader(headers[3], 4)
+
+	mockProcessor := &subtreeprocessor.MockSubtreeProcessor{}
+	mockProcessor.On("ReconcileCoinbases", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { cancel() }).
+		Return(errors.NewStorageError("store went away during shutdown"))
+	swapSubtreeProcessor(t, items, mockProcessor)
+
+	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+	abortedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("aborted"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx),
+		"the startup hook stays non-fatal even when the context is cancelled under it")
+
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("aborted"))-abortedBefore)
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore)
+}
+
 // TestRecoverCoinbaseDivergence_NoGapBalancesMetric pins the accounting rule
 // stated on the metric: every "detected" gets exactly one follow-up outcome.
 // When scoping finds nothing to repair there is neither a repair nor an

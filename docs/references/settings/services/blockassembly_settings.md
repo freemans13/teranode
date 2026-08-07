@@ -136,8 +136,11 @@ inspect is strictly more useful. The trade-off is that the escalation log is a c
 action, not a description of a node that has stopped itself.
 
 Every detection records exactly one follow-up outcome on that metric, so
-`detected == repaired + no_gap + escalated`. A non-zero `no_gap` means the divergence
-had already closed by the time recovery scoped it.
+`detected == repaired + no_gap + escalated + aborted`. A non-zero `no_gap` means the
+divergence had already closed by the time recovery scoped it. `aborted` means the node
+was shut down while a repair was still retrying — nothing is known to be wrong in that
+case, and it deliberately raises no alarm, so a node stopped mid-boot does not tell its
+operator that the UTXO state needs manual intervention.
 
 ## Hardcoded Settings (Not Configurable)
 
