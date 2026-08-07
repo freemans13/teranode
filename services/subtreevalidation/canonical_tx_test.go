@@ -32,10 +32,13 @@ func withInputCountPrefix(t *testing.T, prefix []byte) []byte {
 
 // TestCheckCanonicalTxEncoding pins issue 1421. go-bt accepts a non-minimal
 // CompactSize and then re-serializes it canonically, so the txid Teranode
-// computes matches the canonical one — an attacker can ship non-minimal bytes
-// while committing canonical txids in the merkle tree, and Teranode accepts a
-// block every SV Node rejects at parse. The check must reject the wire bytes
-// rather than accept the canonicalized transaction.
+// computes matches the canonical one — every hash-based check downstream
+// passes and the canonicalized bytes are stored, leaving no trace that this
+// node accepted an encoding SV Node rejects at parse. The parse is the only
+// place that can still see it, so the check must reject the wire bytes rather
+// than accept the canonicalized transaction. It says nothing about whether the
+// block is valid — see checkCanonicalTxEncoding for why this is a
+// ProcessingError and not a TxInvalidError.
 func TestCheckCanonicalTxEncoding(t *testing.T) {
 	t.Run("canonical encoding is accepted", func(t *testing.T) {
 		raw, err := hex.DecodeString(canonicalTxHex)
