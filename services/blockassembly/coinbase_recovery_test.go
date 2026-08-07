@@ -2,6 +2,7 @@ package blockassembly
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -531,13 +532,45 @@ func TestCoinbaseRepairFloor(t *testing.T) {
 }
 
 // TestCoinbaseRepairFloor_MaturityUnset covers the degenerate configuration
-// where maturity is zero: no height can be proven immature, so the floor falls
-// back to 1 rather than to the tip.
+// where maturity is zero, and pins the direction it fails in (ChiR7).
+//
+// With maturity zero a coinbase is spendable the moment it is created, so no
+// height is provably unspent and none of them can be safely re-created. This
+// test previously asserted a floor of 1 -- the widest possible window, which
+// would have let the repair resurrect any pruned coinbase on the chain. The
+// safe answer is to refuse every height instead.
 func TestCoinbaseRepairFloor_MaturityUnset(t *testing.T) {
 	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(0))
 	require.NotNil(t, items)
 
-	require.Equal(t, uint32(1), items.blockAssembler.coinbaseRepairFloor(1000))
+	require.Equal(t, uint32(1001), items.blockAssembler.coinbaseRepairFloor(1000),
+		"a floor above the tip admits no height, which is the safe answer when nothing can be proven immature")
+
+	// Saturating rather than wrapping matters: tip+1 at the top of the range
+	// would be 0, which reads as "no floor" and opens the whole chain.
+	require.Equal(t, uint32(math.MaxUint32), items.blockAssembler.coinbaseRepairFloor(math.MaxUint32))
+}
+
+// TestScopeCoinbaseGap_MaturityUnsetRepairsNothing is the behavioural half of
+// ChiR7: with maturity zero the walk must collect nothing at all, whatever the
+// chain looks like.
+func TestScopeCoinbaseGap_MaturityUnsetRepairsNothing(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(0))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	seedCoinbase(ctx, t, items, headers, 1) // 2..6 missing
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+
+	gap, err := items.blockAssembler.scopeCoinbaseGap(ctx, 6)
+	require.NoError(t, err)
+	require.Empty(t, gap, "with maturity zero nothing is provably unspent, so nothing may be repaired")
 }
 
 // swapSubtreeProcessor installs a stand-in subtree processor for the duration

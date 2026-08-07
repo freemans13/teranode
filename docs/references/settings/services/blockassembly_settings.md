@@ -119,6 +119,14 @@ further below the tip than the smaller of `coinbaseRecoveryMaxGapBlocks` and the
 maturity window is not found at startup; detecting that cheaply during normal
 operation is separate, future work.
 
+Because the maturity window is also the ceiling on how far the walk-back can reach,
+a network configured with a small coinbase maturity gets little or nothing out of
+this feature. Below `coinbaseRecoveryConsecutiveGood` there are not enough probeable
+heights left to prove a floor, so every miss is refused rather than repaired, and at
+a maturity of zero — where a coinbase is spendable immediately and so nothing is ever
+provably unspent — the feature is a deliberate no-op. Every shipped network uses 100,
+which leaves ample room; only custom chain parameters can land in that territory.
+
 When recovery cannot fix a divergence it logs a single `MANUAL INTERVENTION REQUIRED`
 line naming `resetblockassembly`, and increments the `escalated` outcome on the
 `teranode_blockassembly_coinbase_divergence_total` metric. Startup does **not** fail

@@ -2,6 +2,7 @@ package blockassembly
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -120,19 +121,47 @@ func isUnscopableCoinbaseGap(err error) bool {
 // tipHeight must be a prune reference height (see pruneReferenceHeight), not
 // block assembly's own tip: the floor is only sound if it is measured against
 // the highest height the pruner could already have acted on.
+//
+// Where the proof cannot be made at all -- no chain parameters to read, or a
+// maturity of zero, under which a coinbase is spendable the moment it is
+// created and therefore no height is provably unspent -- the answer is to
+// refuse every height, not to open the whole chain. Those are configurations
+// no shipped network uses (all go-chaincfg networks set 100), but a floor
+// whose degenerate branch is the widest possible window is the wrong way round.
 func (b *BlockAssembler) coinbaseRepairFloor(tipHeight uint32) uint32 {
 	if b.settings == nil || b.settings.ChainCfgParams == nil {
-		return 1
+		// Nothing to measure maturity with, so nothing can be proven immature.
+		return refuseEveryHeight(tipHeight)
 	}
 
 	maturity := uint32(b.settings.ChainCfgParams.CoinbaseMaturity)
-	if maturity == 0 || tipHeight <= maturity {
+	if maturity == 0 {
+		// Coinbases are spendable immediately, so any of them could already
+		// have been spent and pruned. Nothing is safe to re-create.
+		return refuseEveryHeight(tipHeight)
+	}
+
+	if tipHeight <= maturity {
 		// Chain shorter than the maturity window: nothing on it can have
 		// matured yet, so every height down to 1 is safe to probe.
 		return 1
 	}
 
 	return tipHeight - maturity + 1
+}
+
+// refuseEveryHeight returns a floor that sits above tipHeight, so every
+// walk-back bounded by it collects nothing. Used for the configurations where
+// coinbaseRepairFloor cannot prove any height unspent.
+func refuseEveryHeight(tipHeight uint32) uint32 {
+	if tipHeight == math.MaxUint32 {
+		// Saturate rather than wrap: tipHeight+1 would be 0 here, which reads
+		// as "no floor at all" and would open the entire chain to repair --
+		// the exact opposite of what this function is for.
+		return tipHeight
+	}
+
+	return tipHeight + 1
 }
 
 // pruneReferenceHeight returns the highest height the DAH pruner could already
