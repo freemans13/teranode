@@ -18,23 +18,51 @@ import (
 // is bounded at (CoinbaseRecoveryMaxAttempts-1) * this value.
 const coinbaseRecoveryRetryBackoff = 500 * time.Millisecond
 
+// canonicalBlockAt fetches the canonical block at a height, tagging "the chain
+// has no block there" as a block-not-found error so callers can tell it apart
+// from the client being unable to answer (see canonicalBlockAbsent).
+//
+// The tag has to be applied here rather than inferred later. Different
+// blockchain-client implementations report the missing case with different
+// error codes, and once every failure is wrapped in the same processing error
+// the distinction is only recoverable by matching on the wrapped code -- which
+// then also matches a store failure that happens to carry the same code.
+func (b *BlockAssembler) canonicalBlockAt(ctx context.Context, height uint32) (*model.Block, error) {
+	blk, err := b.blockchainClient.GetBlockByHeight(ctx, height)
+	if err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound) {
+			return nil, errors.NewBlockNotFoundError("[coinbaseRecovery] no canonical block at height %d", height, err)
+		}
+
+		return nil, errors.NewProcessingError("[coinbaseRecovery] cannot get canonical block at height %d", height, err)
+	}
+
+	if blk == nil {
+		return nil, errors.NewBlockNotFoundError("[coinbaseRecovery] no canonical block at height %d", height)
+	}
+
+	return blk, nil
+}
+
 // canonicalCoinbaseAt reports whether block assembly's UTXO store holds the
 // canonical coinbase transaction for the given height. It returns the
 // canonical block itself so the repair path can reuse its CoinbaseTx without
 // re-fetching from the blockchain client.
 func (b *BlockAssembler) canonicalCoinbaseAt(ctx context.Context, height uint32) (present bool, canonicalBlock *model.Block, err error) {
-	blk, err := b.blockchainClient.GetBlockByHeight(ctx, height)
+	blk, err := b.canonicalBlockAt(ctx, height)
 	if err != nil {
-		return false, nil, errors.NewProcessingError("[coinbaseRecovery] cannot get canonical block at height %d", height, err)
+		return false, nil, err
 	}
 
-	if blk == nil || blk.CoinbaseTx == nil {
+	if blk.CoinbaseTx == nil {
 		return false, nil, errors.NewProcessingError("[coinbaseRecovery] canonical block at height %d has no coinbase", height)
 	}
 
 	txMeta, err := b.utxoStore.Get(ctx, blk.CoinbaseTx.TxIDChainHash(), fields.Tx)
 	if err != nil {
-		if errors.Is(err, errors.ErrTxNotFound) {
+		// Either code means the same thing here -- the coinbase is not in the
+		// store -- and which one comes back depends on the store backend.
+		if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
 			return false, blk, nil
 		}
 
@@ -60,7 +88,7 @@ const coinbaseRecoveryProbeRetries = 2
 
 // canonicalBlockAbsent reports whether err means the canonical chain has no
 // block at the probed height at all, as opposed to the client or store failing
-// to answer.
+// to answer. It pairs with the tag canonicalBlockAt applies.
 //
 // This is worth separating because it is not a health signal: it says the
 // question was wrong, not that the answer is unavailable. It happens when block
@@ -68,7 +96,7 @@ const coinbaseRecoveryProbeRetries = 2
 // treating it like a store outage would abandon the whole scan on the very
 // first probe.
 func canonicalBlockAbsent(err error) bool {
-	return errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound)
+	return errors.Is(err, errors.ErrBlockNotFound)
 }
 
 // withProbeRetry runs a startup probe, retrying transient failures out of the
@@ -597,7 +625,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 	tipErr := b.withProbeRetry(ctx, height, &probeRetries, func() error {
 		var err error
 
-		tipBlk, err = b.blockchainClient.GetBlockByHeight(ctx, height)
+		tipBlk, err = b.canonicalBlockAt(ctx, height)
 
 		return err
 	})
@@ -607,7 +635,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: cannot resolve the canonical block at block assembly's tip height %d: %v", height, tipErr)
 		return nil
 
-	case tipBlk == nil || tipBlk.Header == nil || !tipBlk.Header.Hash().IsEqual(header.Hash()):
+	case tipBlk.Header == nil || !tipBlk.Header.Hash().IsEqual(header.Hash()):
 		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: block assembly tip %s at height %d is not the canonical block there, so the normal reconcile owns this", header.Hash().String(), height)
 		return nil
 	}
