@@ -228,6 +228,43 @@ func TestProcessUTXOsBoundsCheck(t *testing.T) {
 		})
 	})
 
+	t.Run("a missing utxos bin is storage damage, not a consensus verdict", func(t *testing.T) {
+		// Every record this store writes carries a utxos bin, so its absence means
+		// our own record is malformed. It must not become a TxInvalid verdict: the
+		// extra-record reader already classifies the identical condition as storage.
+		s := &Store{}
+
+		bins := aerospike.BinMap{fields.TotalUtxos.String(): 1}
+
+		_, err := s.processUTXOs(context.Background(), &chainhash.Hash{}, bins)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
+		require.Contains(t, err.Error(), "missing or malformed utxos bin")
+	})
+
+	t.Run("a wrong-typed utxos bin is storage damage", func(t *testing.T) {
+		s := &Store{}
+
+		bins := aerospike.BinMap{
+			fields.TotalUtxos.String(): 1,
+			fields.Utxos.String():      "not a list",
+		}
+
+		_, err := s.processUTXOs(context.Background(), &chainhash.Hash{}, bins)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+		require.Contains(t, err.Error(), "string", "the offending type must be named so the damage is diagnosable")
+	})
+
+	t.Run("a missing totalUtxos bin is storage damage", func(t *testing.T) {
+		s := &Store{}
+
+		_, err := s.processUTXOs(context.Background(), &chainhash.Hash{}, aerospike.BinMap{})
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+	})
+
 	t.Run("a consistent record is read normally", func(t *testing.T) {
 		s := &Store{}
 
