@@ -1379,7 +1379,13 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		if err := stp.removeCoinbaseUtxos(ctx, block); err != nil {
 			// no need to error out if the key doesn't exist anyway
 			if !errors.Is(err, errors.ErrTxNotFound) {
-				return errors.NewProcessingError("[SubtreeProcessor][Reset] error deleting utxos for tx %s", block.CoinbaseTx.String(), err)
+				// Identify the block, not its coinbase. removeCoinbaseUtxos
+				// reports a nil coinbase as a processing error, and formatting
+				// that failure with block.CoinbaseTx.String() would panic on
+				// the very nil it just reported -- turning the guard into a
+				// panic one frame further out. moveBackBlock already describes
+				// the block here for the same reason.
+				return errors.NewProcessingError("[SubtreeProcessor][Reset] error deleting coinbase utxos for %s", block.String(), err)
 			}
 		}
 
@@ -1433,7 +1439,10 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 				// remove all the coinbase transactions we added
 				block := value.(*model.Block)
 				if delErr := stp.removeCoinbaseUtxos(context.Background(), block); delErr != nil {
-					stp.logger.Errorf("[SubtreeProcessor][Reset] error deleting utxos for coinbase tx %s: %v", block.CoinbaseTx.String(), delErr)
+					// Same reason as the moveBack loop above: describe the
+					// block, so a nil-coinbase failure cannot panic the
+					// unwind that is already handling a failure.
+					stp.logger.Errorf("[SubtreeProcessor][Reset] error deleting coinbase utxos for %s: %v", block.String(), delErr)
 				}
 
 				return true

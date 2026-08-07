@@ -4668,8 +4668,30 @@ func TestRemoveCoinbaseUtxos_NilCoinbase_ReturnsErrorNotPanic(t *testing.T) {
 	// starting it would leave a goroutine running past the end of the test,
 	// racing the deferred close of newSubtreeChan above.
 
-	// Test with nil CoinbaseTx
-	err = stp.removeCoinbaseUtxos(ctx, &model.Block{Header: &model.BlockHeader{}, CoinbaseTx: nil})
+	// A real block carrying a real header but no coinbase -- the shape the
+	// rollback paths can hand to removeCoinbaseUtxos.
+	nilCoinbaseBlock := &model.Block{Header: blockHeader, CoinbaseTx: nil}
+
+	err = stp.removeCoinbaseUtxos(ctx, nilCoinbaseBlock)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "coinbase")
+
+	// The guard is only worth having if the callers can report what it
+	// rejected. Reset's rollback loop used to format this failure with
+	// block.CoinbaseTx.String(), which dereferences the very nil the guard just
+	// reported -- moving the panic one frame out instead of removing it.
+	// Describing the block instead is nil-safe; this reproduces what that call
+	// site now does.
+	require.Panics(t, func() { _ = nilCoinbaseBlock.CoinbaseTx.String() },
+		"the old formatting really did dereference the nil coinbase")
+
+	require.NotPanics(t, func() {
+		_ = errors.NewProcessingError("[SubtreeProcessor][Reset] error deleting coinbase utxos for %s", nilCoinbaseBlock.String(), err)
+	})
+
+	// The error must stay distinguishable from "the coinbase was not in the
+	// store". A nil coinbase is a corrupt block, not nothing-to-remove, and
+	// mapping it onto ErrTxNotFound would make every caller skip it silently.
+	require.False(t, errors.Is(err, errors.ErrTxNotFound),
+		"a nil coinbase must not be reported as an absent transaction")
 }

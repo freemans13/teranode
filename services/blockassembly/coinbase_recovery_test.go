@@ -1100,6 +1100,59 @@ func TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock(t *testi
 	require.True(t, present, "a height the chain has no block for must not abandon the scan below it")
 }
 
+// TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight covers the
+// trigger ChiR9 called out as the likeliest one: block assembly's persisted tip
+// height sits above the canonical chain height, so the very first lookup gets a
+// not-found.
+//
+// That used to be treated as the blockchain client being unable to answer,
+// which abandoned the whole scan with a Warnf and left the boot with no
+// detection at all. It is now recognised as a question about a height the chain
+// has no block for. Here it is the tip itself, so the canonical-tip check
+// (ChiR8) ends the scan first -- block assembly is by definition not on the
+// canonical chain at a height the canonical chain does not reach. The point of
+// this test is that the outcome is a clean, quiet skip rather than an
+// abandoned scan, a false divergence, or a nil dereference.
+func TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// The canonical chain reaches height 3; block assembly thinks it is at 6.
+	headers := buildCanonicalChain(ctx, t, items, 3)
+	for h := uint32(1); h <= 3; h++ {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	aheadOfChain := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  headers[2].Hash(),
+		HashMerkleRoot: &chainhash.Hash{},
+		Nonce:          4242,
+		Bits:           *bits,
+	}
+	items.blockAssembler.setBestBlockHeader(aheadOfChain, 6)
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+
+	require.NotPanics(t, func() {
+		require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	})
+
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		"a tip above the canonical chain height is not a divergence")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
+		"and it must not raise the manual-intervention alarm")
+}
+
 // TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned states the
 // honest limit of the widened startup scan: it covers a bounded window below
 // the tip (CoinbaseRecoveryMaxGapBlocks heights), not the whole chain. A hole
