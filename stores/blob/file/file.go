@@ -382,21 +382,9 @@ func InitSemaphores(readLimit, writeLimit int, useSystemLimits bool) error {
 
 		// Raise the limit regardless: a bigger soft limit can only help, and it is
 		// what makes the configured concurrency achievable in the first place.
-		//
-		// Whether to then clamp is the operator's call, via useSystemLimits. Left
-		// on (the default) it means "adjust concurrency to respect system limits",
-		// which is exactly this clamp. Turned off it means "use the explicit values
-		// regardless of system limits", so the configured numbers stand and the
-		// risk of EMFILE is accepted — both halves of what that setting documents.
-		//
-		// A non-nil error means the platform exposes no limit to read (Windows),
-		// and a zero budget means the limit is at or below the reserve; in both
-		// cases the semaphores still bound concurrency, so carry on unclamped.
 		budget, _, limitErr := fdlimit.Ensure(total)
-		if useSystemLimits && limitErr == nil && budget > 0 && budget < total {
-			readLimit, writeLimit = clampSemaphoreLimits(readLimit, writeLimit, budget)
-			appliedClamp = true
-		}
+
+		readLimit, writeLimit, appliedClamp = resolveConcurrency(readLimit, writeLimit, total, useSystemLimits, budget, limitErr)
 
 		appliedReadLimit, appliedWriteLimit = readLimit, writeLimit
 
@@ -1612,6 +1600,30 @@ var (
 // from a goroutine racing InitSemaphores is a data race.
 func AppliedSemaphoreLimits() (readLimit, writeLimit int, clamped bool) {
 	return appliedReadLimit, appliedWriteLimit, appliedClamp
+}
+
+// resolveConcurrency decides the concurrency actually to use, given the budget
+// of descriptors fdlimit could secure. It is separated from InitSemaphores so
+// the decision can be tested directly: InitSemaphores itself is guarded by a
+// sync.Once and can only run once per process.
+//
+// Whether to reduce the configured concurrency is the operator's call, via
+// useSystemLimits. Left on (the default) it means "adjust concurrency to respect
+// system limits", which is exactly this clamp. Turned off it means "use the
+// explicit values regardless of system limits", so the configured numbers stand
+// and the risk of EMFILE is accepted — both halves of what that setting
+// documents.
+//
+// A non-nil limitErr means the platform exposes no limit to read (Windows), so
+// there is nothing to clamp against and the semaphores alone bound concurrency.
+func resolveConcurrency(readLimit, writeLimit int, total uint64, useSystemLimits bool, budget uint64, limitErr error) (int, int, bool) {
+	if !useSystemLimits || limitErr != nil || budget >= total {
+		return readLimit, writeLimit, false
+	}
+
+	read, write := clampSemaphoreLimits(readLimit, writeLimit, budget)
+
+	return read, write, true
 }
 
 // clampSemaphoreLimits scales read and write concurrency down proportionally

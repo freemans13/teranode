@@ -12,7 +12,7 @@ import "syscall"
 // straight into a syscall.Rlimit literal does not compile on the signed
 // platforms, which the unix build tag also covers.
 
-func get() (soft, hard uint64, err error) {
+func getRlimit() (soft, hard uint64, err error) {
 	var lim syscall.Rlimit
 	if err = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
 		return 0, 0, err
@@ -22,7 +22,7 @@ func get() (soft, hard uint64, err error) {
 	return uint64(lim.Cur), uint64(lim.Max), nil
 }
 
-func set(soft, hard uint64) error {
+func setRlimit(soft, hard uint64) error {
 	var lim syscall.Rlimit
 
 	assignRlim(&lim.Cur, soft)

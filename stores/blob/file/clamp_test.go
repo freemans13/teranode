@@ -3,6 +3,7 @@ package file
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,5 +47,68 @@ func TestClampSemaphoreLimits(t *testing.T) {
 
 		require.Equal(t, MinSemaphoreLimit, read)
 		require.Equal(t, MinSemaphoreLimit, write)
+	})
+}
+
+// TestResolveConcurrency pins the decision InitSemaphores makes. It lives in its
+// own function precisely so it can be tested: InitSemaphores is guarded by a
+// sync.Once and only runs once per process, so driving these cases through it
+// would need one process each.
+func TestResolveConcurrency(t *testing.T) {
+	const total = uint64(1024) // 768 + 256
+
+	t.Run("clamps when the budget is short", func(t *testing.T) {
+		read, write, clamped := resolveConcurrency(768, 256, total, true, 512, nil)
+
+		require.True(t, clamped)
+		require.Equal(t, 384, read)
+		require.Equal(t, 128, write)
+	})
+
+	t.Run("leaves an ample budget alone", func(t *testing.T) {
+		read, write, clamped := resolveConcurrency(768, 256, total, true, 100_000, nil)
+
+		require.False(t, clamped, "nothing to clamp when the budget covers the total")
+		require.Equal(t, 768, read)
+		require.Equal(t, 256, write)
+	})
+
+	t.Run("a budget exactly equal to the total is not clamped", func(t *testing.T) {
+		_, _, clamped := resolveConcurrency(768, 256, total, true, total, nil)
+
+		require.False(t, clamped, "the budget fits exactly; reducing it would be wrong")
+	})
+
+	t.Run("the operator can opt out", func(t *testing.T) {
+		read, write, clamped := resolveConcurrency(768, 256, total, false, 512, nil)
+
+		// useSystemLimits=false means "use the explicit values regardless of
+		// system limits", accepting the risk. The configured numbers must stand
+		// even though the budget cannot cover them.
+		require.False(t, clamped)
+		require.Equal(t, 768, read)
+		require.Equal(t, 256, write)
+	})
+
+	t.Run("an unreadable limit leaves concurrency alone", func(t *testing.T) {
+		read, write, clamped := resolveConcurrency(768, 256, total, true, 0,
+			errors.NewProcessingError("no limit on this platform"))
+
+		// Windows and friends: there is no limit to clamp against, and a zero
+		// budget here means "unknown", not "no descriptors".
+		require.False(t, clamped)
+		require.Equal(t, 768, read)
+		require.Equal(t, 256, write)
+	})
+
+	t.Run("a genuinely tiny budget clamps rather than being ignored", func(t *testing.T) {
+		read, write, clamped := resolveConcurrency(768, 256, total, true, 256, nil)
+
+		// The case that previously escaped: a host whose whole open-file limit is
+		// at or below the headroom used to yield budget 0 and skip the clamp,
+		// running 1024 concurrent operations against 512 descriptors.
+		require.True(t, clamped)
+		require.LessOrEqual(t, read+write, 256)
+		require.Greater(t, read, write)
 	})
 }

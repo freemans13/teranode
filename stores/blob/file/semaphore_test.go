@@ -15,3 +15,18 @@ func TestSemaphoreDefaults(t *testing.T) {
 	// Note: golang.org/x/sync/semaphore.Weighted doesn't expose capacity,
 	// so we can't verify the capacity directly. Checking non-nil is sufficient.
 }
+
+// TestAppliedSemaphoreLimitsBeforeInit pins that the accessor reports the
+// concurrency genuinely in force before InitSemaphores runs — the defaults set
+// up in init(). Reporting zeros here would name a concurrency that applies
+// nowhere, and startup prints these numbers.
+//
+// Nothing else in this package calls InitSemaphores, so this holds whatever
+// order the tests run in.
+func TestAppliedSemaphoreLimitsBeforeInit(t *testing.T) {
+	read, write, clamped := AppliedSemaphoreLimits()
+
+	require.Equal(t, defaultReadLimit, read)
+	require.Equal(t, defaultWriteLimit, write)
+	require.False(t, clamped, "no clamp can have happened before InitSemaphores")
+}

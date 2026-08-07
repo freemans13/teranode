@@ -8,7 +8,19 @@ import "math"
 // connections, database pools, log files, and the Go runtime's own handles.
 // The file-operation budget must fit under the OS limit with this left over,
 // or the node can still hit EMFILE on a descriptor the semaphores never see.
+//
+// Where the whole limit is smaller than twice this, Ensure reserves half the
+// limit instead, because a fixed reserve there would leave no budget at all.
 const Headroom uint64 = 512
+
+// get and set are indirected through variables so tests can substitute
+// synthetic limits. The cases worth testing involve lowering the HARD limit,
+// which an unprivileged process cannot undo — doing it for real would leak into
+// every later test in the binary.
+var (
+	get = getRlimit
+	set = setRlimit
+)
 
 // Ensure raises the process's open-file soft limit toward required+Headroom
 // and reports what is actually usable for file operations.
@@ -57,11 +69,23 @@ func Ensure(required uint64) (budget uint64, raised bool, err error) {
 		}
 	}
 
-	if effective <= Headroom {
-		// Nothing left once the descriptors the semaphores do not bound are
-		// accounted for.
+	// Take the reserve out of the effective limit — but never all of it. On a host
+	// whose entire limit is at or below Headroom, a fixed reserve leaves a budget
+	// of zero; the caller reads zero as "no limit worth clamping to" and lets the
+	// file store keep its full configured concurrency, so 1024 concurrent
+	// operations run against 512 descriptors. That is no protection at all on the
+	// host that can least afford it. Reserving half instead keeps a small limit
+	// honest and, crucially, still clampable.
+	reserve := Headroom
+	if half := effective / 2; reserve > half {
+		reserve = half
+	}
+
+	if effective <= reserve {
+		// Only reachable at an effective limit of zero, which a running process
+		// cannot really have.
 		return 0, raised, nil
 	}
 
-	return effective - Headroom, raised, nil
+	return effective - reserve, raised, nil
 }
