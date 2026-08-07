@@ -1004,6 +1004,11 @@ type interposedBlockchainClient struct {
 	// call returns a transient-looking error instead of reaching the real client.
 	failuresLeft int
 
+	// failOnlyHeights, when non-empty, confines failuresLeft to those heights.
+	// Without it the very first lookup a scan makes is the canonical-tip check,
+	// so a test cannot aim a failure at a probe further down the window.
+	failOnlyHeights map[uint32]bool
+
 	// absentHeights always return a block-not-found error.
 	absentHeights map[uint32]bool
 }
@@ -1013,13 +1018,213 @@ func (c *interposedBlockchainClient) GetBlockByHeight(ctx context.Context, heigh
 		return nil, errors.NewBlockNotFoundError("no canonical block at height %d", height)
 	}
 
-	if c.failuresLeft > 0 {
+	if c.failuresLeft > 0 && (len(c.failOnlyHeights) == 0 || c.failOnlyHeights[height]) {
 		c.failuresLeft--
 
 		return nil, errors.NewStorageError("transient blockchain-client blip at height %d", height)
 	}
 
 	return c.ClientI.GetBlockByHeight(ctx, height)
+}
+
+// TestStartupCoinbaseDivergenceCheck_ExhaustedProbeBudgetAbandonsTheScan is the
+// other side of TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip.
+// That test proves a blip costs a retry rather than the boot; this one proves the
+// budget is genuinely finite, so a store that flaps for the whole window cannot
+// inflate boot time without bound.
+//
+// The budget is a whole-scan allowance, not a per-height one, so once it is gone
+// the scan stops at the failing height rather than carrying on to the ones below
+// -- and because detection is startup-only, that means no coinbase-divergence
+// check at all until the next restart. That is the trade being pinned here: a
+// bounded boot in exchange for lost coverage, reported at Errorf so it is visible.
+func TestStartupCoinbaseDivergenceCheck_ExhaustedProbeBudgetAbandonsTheScan(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// heights 1..4 with 2 missing its coinbase. The scan walks 4, 3, 2, so
+	// height 2 is only reached if the scan survives height 3.
+	headers := buildCanonicalChain(ctx, t, items, 4)
+	for _, h := range []uint32{1, 3, 4} {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[3], 4)
+
+	// Height 3 fails every time it is asked, more often than the budget can
+	// absorb. The tip check at height 4 is left alone so the scan actually
+	// starts, which is what puts the exhaustion on a probe rather than on the
+	// canonical-tip lookup.
+	//
+	// The budget allows one attempt plus coinbaseRecoveryProbeRetries retries, so
+	// stocking the interposer with that many failures plus a spare and asserting
+	// the spare is untouched pins both halves: the scan does spend the whole
+	// budget, and it stops asking once the budget is gone.
+	const spareFailures = 5
+
+	interposer := &interposedBlockchainClient{
+		ClientI:         items.blockchainClient,
+		failuresLeft:    1 + coinbaseRecoveryProbeRetries + spareFailures,
+		failOnlyHeights: map[uint32]bool{3: true},
+	}
+	items.blockAssembler.blockchainClient = interposer
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx),
+		"an exhausted probe budget must still leave the node bootable")
+
+	require.Equal(t, spareFailures, interposer.failuresLeft,
+		"the scan must make exactly one attempt plus coinbaseRecoveryProbeRetries retries, then stop asking")
+
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		"a store that cannot answer is not a divergence")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
+		"and it must not raise the manual-intervention alarm")
+
+	// The scan stopped at height 3, so the real hole at height 2 was never
+	// looked for and the store is untouched.
+	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 2)
+	require.NoError(t, err)
+	require.False(t, present, "the scan abandons the heights below the failing probe")
+}
+
+// TestCoinbaseRecoverySettingLowerBoundClamps covers the defensive clamps the
+// recovery paths apply to their own settings. Each one exists because the
+// unclamped value does not fail loudly -- it silently degrades the behaviour the
+// setting is supposed to control -- so a regression that dropped one would be
+// invisible without these.
+func TestCoinbaseRecoverySettingLowerBoundClamps(t *testing.T) {
+	initPrometheusMetrics()
+
+	t.Run("consecutive good of zero still requires a present coinbase", func(t *testing.T) {
+		ctx := t.Context()
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+		require.NotNil(t, items)
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 0
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+
+		// heights 1..3: 1 present, 2 and 3 missing. The walk must stop at height
+		// 1 having proven the floor there.
+		//
+		// Unlike the other three, this clamp is belt-and-braces rather than
+		// load-bearing as the loop stands: consecutiveGood is incremented before
+		// it is compared, so a setting of 0 already needs one present coinbase to
+		// satisfy the test and behaves identically to 1. Removing the clamp today
+		// does not change this test's outcome. It is asserted anyway because the
+		// property that matters -- a non-positive setting never proves a floor no
+		// present coinbase supports -- would silently stop holding if that
+		// increment ever moved below the comparison.
+		headers := buildCanonicalChain(ctx, t, items, 3)
+		seedCoinbase(ctx, t, items, headers, 1)
+
+		gap, err := items.blockAssembler.scopeCoinbaseGap(ctx, 3)
+		require.NoError(t, err)
+		require.Equal(t, []uint32{2, 3}, gapHeights(gap),
+			"a non-positive consecutive-good setting must behave as 1, not as 'no proof required'")
+	})
+
+	t.Run("max gap of zero still admits a one-block gap", func(t *testing.T) {
+		ctx := t.Context()
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+		require.NotNil(t, items)
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 0
+
+		// heights 1..3 with only 3 missing: a gap of one. Clamped to 1 that is
+		// repairable; unclamped, the cap of zero would escalate on the very first
+		// missing coinbase and make every divergence unrecoverable.
+		headers := buildCanonicalChain(ctx, t, items, 3)
+		seedCoinbase(ctx, t, items, headers, 1)
+		seedCoinbase(ctx, t, items, headers, 2)
+
+		gap, err := items.blockAssembler.scopeCoinbaseGap(ctx, 3)
+		require.NoError(t, err)
+		require.Equal(t, []uint32{3}, gapHeights(gap))
+	})
+
+	t.Run("max gap of zero clamps to one, not to something wider", func(t *testing.T) {
+		ctx := t.Context()
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+		require.NotNil(t, items)
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 0
+
+		// The same setup one height wider: 2 and 3 both missing is a gap of two,
+		// which exceeds the clamped cap of one and must escalate.
+		headers := buildCanonicalChain(ctx, t, items, 3)
+		seedCoinbase(ctx, t, items, headers, 1)
+
+		gap, err := items.blockAssembler.scopeCoinbaseGap(ctx, 3)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errCoinbaseGapTooLarge))
+		require.Nil(t, gap)
+	})
+
+	t.Run("scan window of zero still probes the tip", func(t *testing.T) {
+		ctx := t.Context()
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+		require.NotNil(t, items)
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 0
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+		// The tip's coinbase is missing. Clamped to a window of 1 the scan still
+		// probes the tip and repairs it; unclamped, a window of zero would scan
+		// nothing at all and silently disable startup detection.
+		headers := buildCanonicalChain(ctx, t, items, 3)
+		seedCoinbase(ctx, t, items, headers, 1)
+		seedCoinbase(ctx, t, items, headers, 2)
+
+		items.blockAssembler.setBestBlockHeader(headers[2], 3)
+		items.blockAssembler.subtreeProcessor.Start(ctx)
+		t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+		detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+
+		require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+		require.Equal(t, float64(1),
+			testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+			"a non-positive window must still probe the tip rather than disabling detection")
+
+		present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 3)
+		require.NoError(t, err)
+		require.True(t, present)
+	})
+
+	t.Run("max attempts of zero still makes one attempt", func(t *testing.T) {
+		ctx := t.Context()
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+		require.NotNil(t, items)
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+		items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 0
+
+		headers := buildCanonicalChain(ctx, t, items, 4)
+		seedCoinbase(ctx, t, items, headers, 1) // floor good; 2,3,4 missing
+
+		mockProcessor := &subtreeprocessor.MockSubtreeProcessor{}
+		mockProcessor.On("ReconcileCoinbases", mock.Anything, mock.Anything).
+			Return(errors.NewStorageError("store is down"))
+		swapSubtreeProcessor(t, items, mockProcessor)
+
+		err := items.blockAssembler.recoverCoinbaseDivergence(ctx, 4)
+		require.Error(t, err)
+
+		mockProcessor.AssertNumberOfCalls(t, "ReconcileCoinbases", 1)
+		require.Contains(t, err.Error(), "store is down",
+			"the reported reason must be the repair failure, not the defensive no-attempts-completed placeholder")
+	})
 }
 
 // TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip covers

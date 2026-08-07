@@ -90,6 +90,66 @@ func TestReconcileCoinbases_CreatesAndIsIdempotent(t *testing.T) {
 	require.NoError(t, stp.ReconcileCoinbases(ctx, blocks)) // idempotent
 }
 
+// TestReconcileCoinbases_NilGapBlock_ReturnsErrorNotPanic pins the guard on the
+// repair loop. ReconcileCoinbases is an exported Interface method, so gapBlocks
+// is not fully under this package's control, and the loop's own failure path
+// describes the offending block with block.String() -- which takes the subtree
+// mutex and hashes the header, dereferencing both the block and its header. A
+// nil entry therefore used to turn a reported error into a panic one frame
+// further out, the same shape as the nil coinbase the Reset rollback used to
+// format.
+func TestReconcileCoinbases_NilGapBlock_ReturnsErrorNotPanic(t *testing.T) {
+	initPrometheusMetrics()
+	ctx := context.Background()
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, test.CreateBaseTestSettings(t), utxoStoreURL)
+	require.NoError(t, err)
+
+	blobStore := blob_memory.New()
+	settings := test.CreateBaseTestSettings(t)
+	newSubtreeChan := make(chan NewSubtreeRequest, 10)
+
+	mockBlockchainClient := &blockchain.Mock{}
+
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+	stp.Start(ctx)
+	t.Cleanup(func() { stp.Stop(context.Background()) })
+
+	blocks := makeBlocksWithDistinctCoinbases(t, 2) // heights 1,2
+
+	t.Run("nil block", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			err := stp.ReconcileCoinbases(ctx, []*model.Block{nil, blocks[0]})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "index 0")
+		})
+
+		// Rejected before any repair ran, so the good block behind the bad entry
+		// was never created either.
+		_, getErr := utxoStore.Get(ctx, blocks[0].CoinbaseTx.TxIDChainHash())
+		require.Error(t, getErr)
+	})
+
+	t.Run("block with no header", func(t *testing.T) {
+		headerless := &model.Block{
+			Height:     blocks[1].Height,
+			ID:         blocks[1].ID,
+			CoinbaseTx: blocks[1].CoinbaseTx,
+			Subtrees:   []*chainhash.Hash{},
+		}
+
+		require.NotPanics(t, func() {
+			err := stp.ReconcileCoinbases(ctx, []*model.Block{blocks[0], headerless})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "index 1")
+		})
+	})
+}
+
 func TestReconcileCoinbases_EmptyGapBlocks_NoOp(t *testing.T) {
 	initPrometheusMetrics()
 	ctx := context.Background()
