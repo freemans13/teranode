@@ -2,9 +2,13 @@
 // It improves performance by aggregating multiple small blob operations into larger batches,
 // which reduces overhead for storage backends with high per-operation costs (like network or disk I/O).
 //
-// The batcher works by collecting individual blob operations in memory until either:
-// - The accumulated data reaches a configured size threshold
-// - A background process flushes the batch after a timeout
+// The batcher works by collecting individual blob operations in memory and flushing the
+// accumulated batch to the underlying store only when either:
+// - Adding the next item would overflow the configured size threshold, or
+// - The batcher is closed (a final flush of whatever remains).
+//
+// There is no background timer or ticker: under a low write rate, data queued via Set sits
+// in memory, unflushed, until either the size threshold is reached or Close is called.
 //
 // This implementation is particularly useful for high-throughput scenarios where many small
 // blobs are being stored in rapid succession. By batching these operations, it significantly
@@ -21,6 +25,7 @@ import (
 	"encoding/hex"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -54,10 +59,16 @@ type Batcher struct {
 	notifyCh chan struct{}
 	// wg is used to wait for the background worker goroutine to complete during shutdown
 	wg sync.WaitGroup
-	// currentBatch holds the accumulated blob data for the current batch
+	// currentBatch holds the accumulated blob data for the current batch. Only the
+	// background worker goroutine ever reads or writes it.
 	currentBatch []byte
 	// currentBatchKeys holds the accumulated key data for the current batch (if writeKeys is true)
 	currentBatchKeys []byte
+	// currentBatchLen mirrors len(currentBatch), updated by the worker goroutine after every
+	// change. Close reads it from the caller's goroutine while the worker may still be running,
+	// so it must not read currentBatch directly (that would race); this atomic mirror is the
+	// safe way to report an approximate unflushed-byte count in that situation.
+	currentBatchLen atomic.Int64
 }
 
 // BatchItem represents a single blob operation to be included in a batch.
@@ -176,17 +187,30 @@ func (b *Batcher) processBatchItem(batchItem *BatchItem) error {
 	currentPos := len(b.currentBatch)
 	dataSize := len(batchItem.value)
 
-	if currentPos+dataSize > b.sizeInBytes && currentPos > 0 {
-		if err := b.writeBatch(b.currentBatch, b.currentBatchKeys); err != nil {
-			return errors.NewStorageError("error writing batch", err)
-		}
+	var flushErr error
 
-		b.currentBatch = make([]byte, 0, b.sizeInBytes)
-		b.currentBatchKeys = make([]byte, 0, b.sizeInBytes)
+	if currentPos+dataSize > b.sizeInBytes && currentPos > 0 {
+		flushErr = b.writeBatch(b.currentBatch, b.currentBatchKeys)
+
+		// Only reset the batch (and the position the item is about to be keyed against) if the
+		// flush actually succeeded. If it failed, the item below is appended to the batch that
+		// just failed to flush rather than being dropped, and its key is recorded at its real
+		// position within that still-unflushed batch. This deliberately lets the in-memory batch
+		// grow across repeated flush failures against a dead backend, rather than silently
+		// discarding the bytes the caller was told were queued: an unbounded-growth risk that
+		// would need a new setting to cap is preferable to data loss, and is out of scope here.
+		if flushErr == nil {
+			b.currentBatch = make([]byte, 0, b.sizeInBytes)
+			b.currentBatchKeys = make([]byte, 0, b.sizeInBytes)
+			currentPos = 0
+		}
 	}
 
-	// add to batch
+	// add to batch, regardless of whether the flush above succeeded or failed
 	b.currentBatch = append(b.currentBatch, batchItem.value...)
+	// mirror the new length for Close, which reads it from a different goroutine
+	// and must not touch currentBatch itself (see the field comment)
+	b.currentBatchLen.Store(int64(len(b.currentBatch)))
 
 	if b.writeKeys {
 		// keys are written as a separate batch, with the position and size as the first 8 bytes
@@ -214,6 +238,10 @@ func (b *Batcher) processBatchItem(batchItem *BatchItem) error {
 
 		// append the bytes of the key
 		b.currentBatchKeys = append(b.currentBatchKeys, []byte(hexKey)...)
+	}
+
+	if flushErr != nil {
+		return errors.NewStorageError("error writing batch", flushErr)
 	}
 
 	return nil
@@ -301,12 +329,24 @@ func (b *Batcher) Health(ctx context.Context, checkLiveness bool) (int, string, 
 // and flushing any remaining items in the queue. This ensures that all pending
 // operations are completed before the batcher is terminated.
 //
+// The wait for the shutdown flush is bounded by ctx: if ctx is cancelled or its
+// deadline expires first, Close abandons the wait and returns an error rather than
+// blocking forever. This matters because daemon.closeStores gives every store a
+// shared budget (e.g. 30s) and closes them SEQUENTIALLY, so one store hung here
+// would otherwise also block the blockchain state store's orderly close later in
+// that same list. Abandoning is the right trade-off, not just an expedient one:
+// the unflushed data is memory-only, held against a backend that is already stuck,
+// so waiting longer does not make it any safer, while every second spent waiting
+// is a second stolen from the stores that close after this one. Note that
+// daemon.closeStores currently discards the error this method returns, so the log
+// line below is the only operator-visible signal that a flush was abandoned.
+//
 // Parameters:
-//   - ctx: Context for the close operation (unused in this implementation)
+//   - ctx: Context bounding how long Close will wait for the shutdown flush
 //
 // Returns:
-//   - error: Any error that occurred during shutdown
-func (b *Batcher) Close(_ context.Context) error {
+//   - error: NewContextCanceledError if ctx expires before the shutdown flush completes
+func (b *Batcher) Close(ctx context.Context) error {
 	// Signal the background goroutine to stop
 	close(b.done)
 
@@ -316,10 +356,26 @@ func (b *Batcher) Close(_ context.Context) error {
 	default:
 	}
 
-	// Wait for the background goroutine to finish processing all remaining items
-	b.wg.Wait()
+	// Wait for the background goroutine to finish processing all remaining items, but don't
+	// wait past ctx: run the wait on a goroutine so we can select it against ctx.Done().
+	waitDone := make(chan struct{})
 
-	return nil
+	go func() {
+		b.wg.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		return nil
+	case <-ctx.Done():
+		// currentBatch itself is only safe to read from the worker goroutine, which may still
+		// be running at this point; currentBatchLen is the atomic mirror kept for this purpose.
+		unflushed := b.currentBatchLen.Load()
+		b.logger.Errorf("batcher close abandoned shutdown flush of %d unflushed bytes: %v", unflushed, ctx.Err())
+
+		return errors.NewContextCanceledError("batcher close abandoned shutdown flush of %d unflushed bytes", unflushed, ctx.Err())
+	}
 }
 
 // SetFromReader reads data from an io.ReadCloser and queues it for batch processing.
@@ -361,6 +417,10 @@ func (b *Batcher) SetFromReader(ctx context.Context, key []byte, fileType filefo
 // Returns:
 //   - error: Any error that occurred during queueing
 func (b *Batcher) Set(_ context.Context, hash []byte, fileType fileformat.FileType, value []byte, _ ...options.FileOption) error {
+	if len(hash) != chainhash.HashSize {
+		return errors.NewInvalidArgumentError("hash must be %d bytes, got %d", chainhash.HashSize, len(hash))
+	}
+
 	b.queue.Enqueue(BatchItem{
 		hash:     chainhash.Hash(hash),
 		fileType: fileType,

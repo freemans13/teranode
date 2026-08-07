@@ -7,13 +7,17 @@ import (
 	"encoding/hex"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/stretchr/testify/require"
 )
 
 // getBatchFiles gets the most recent batch files from the store
@@ -301,4 +305,198 @@ func TestBatcher_UnsupportedOperations(t *testing.T) {
 			t.Error("expected error for unsupported GetIoReader operation")
 		}
 	})
+}
+
+// failFirstThenSucceedStore is a blobStoreSetter fake whose Set call fails exactly
+// once (the first call) and succeeds on every call after that. It records every
+// value written on a successful batch-data Set so tests can assert nothing was
+// silently dropped by a failed overflow flush.
+type failFirstThenSucceedStore struct {
+	mu      sync.Mutex
+	calls   int
+	written [][]byte
+}
+
+func (f *failFirstThenSucceedStore) Health(_ context.Context, _ bool) (int, string, error) {
+	return 200, "ok", nil
+}
+
+func (f *failFirstThenSucceedStore) Set(_ context.Context, _ []byte, fileType fileformat.FileType, value []byte, _ ...options.FileOption) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.calls++
+	if f.calls == 1 {
+		return errors.NewStorageError("simulated transient backend failure")
+	}
+
+	if fileType == fileformat.FileTypeBatchData {
+		cp := make([]byte, len(value))
+		copy(cp, value)
+		f.written = append(f.written, cp)
+	}
+
+	return nil
+}
+
+func (f *failFirstThenSucceedStore) concatWritten() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var all []byte
+	for _, w := range f.written {
+		all = append(all, w...)
+	}
+
+	return all
+}
+
+// TestBatcher_OverflowFlushFailure_ItemNotDropped pins defect 1: processBatchItem
+// used to return before appending the item that triggered a failed overflow
+// flush, silently discarding it forever (the queue has no re-enqueue). value2
+// below is that triggering item. writeKeys is disabled so writeBatch only makes
+// one Set call per flush, keeping the fake's call-count-based failure
+// deterministic.
+func TestBatcher_OverflowFlushFailure_ItemNotDropped(t *testing.T) {
+	store := &failFirstThenSucceedStore{}
+	batcher := New(ulogger.TestLogger{}, store, 10, false)
+
+	value1 := []byte("AAAAAAAA") // 8 bytes
+	value2 := []byte("BBBBBBBB") // 8 bytes: triggers the (failing) first overflow flush
+	value3 := []byte("CCCCCCCC") // 8 bytes: triggers the (succeeding) second overflow flush
+
+	var hash1, hash2, hash3 chainhash.Hash
+	hash1[0] = 1
+	hash2[0] = 2
+	hash3[0] = 3
+
+	require.NoError(t, batcher.Set(context.Background(), hash1[:], fileformat.FileTypeUtxoSet, value1))
+	require.NoError(t, batcher.Set(context.Background(), hash2[:], fileformat.FileTypeUtxoSet, value2))
+	require.NoError(t, batcher.Set(context.Background(), hash3[:], fileformat.FileTypeUtxoSet, value3))
+	require.NoError(t, batcher.Close(context.Background()))
+
+	all := store.concatWritten()
+
+	require.Contains(t, string(all), string(value1), "value1 should have been flushed")
+	require.Contains(t, string(all), string(value2), "value2 was the item that triggered the failed flush and must not be dropped")
+	require.Contains(t, string(all), string(value3), "value3 should have been flushed on close")
+}
+
+// TestBatcher_KeyOffset_MatchesActualPosition pins defect 2: currentPos used to be
+// captured before the overflow flush reset the batch, so on a successful flush the
+// triggering item actually lands at offset 0 of the freshly reset batch but its key
+// record kept the stale pre-reset offset. value2 below is that triggering item; its
+// key must describe where it actually sits in the batch that gets written to the
+// store, not where it would have sat in the batch that was just flushed away.
+func TestBatcher_KeyOffset_MatchesActualPosition(t *testing.T) {
+	store := memory.New()
+	batcher := New(ulogger.TestLogger{}, store, 10, true)
+
+	value1 := []byte("AAAAAAAA") // 8 bytes
+	value2 := []byte("BBBBBBBB") // 8 bytes: triggers the overflow flush of value1's batch
+
+	var hash1, hash2 chainhash.Hash
+	hash1[0] = 1
+	hash2[0] = 2
+
+	require.NoError(t, batcher.Set(context.Background(), hash1[:], fileformat.FileTypeUtxoSet, value1))
+	require.NoError(t, batcher.Set(context.Background(), hash2[:], fileformat.FileTypeUtxoSet, value2))
+	require.NoError(t, batcher.Close(context.Background()))
+
+	keys := store.ListKeys()
+	require.NotEmpty(t, keys)
+
+	expected := map[chainhash.Hash][]byte{
+		hash1: value1,
+		hash2: value2,
+	}
+	found := map[chainhash.Hash]bool{}
+
+	for _, k := range keys {
+		batchData, err := store.Get(context.Background(), k, fileformat.FileTypeBatchData)
+		require.NoError(t, err)
+
+		batchKeys, err := store.Get(context.Background(), k, fileformat.FileTypeBatchKeys)
+		require.NoError(t, err)
+
+		for _, line := range strings.Split(strings.TrimSpace(string(batchKeys)), "\n") {
+			if line == "" {
+				continue
+			}
+
+			raw, err := hex.DecodeString(line)
+			require.NoError(t, err)
+			require.Len(t, raw, chainhash.HashSize+8)
+
+			var h chainhash.Hash
+			copy(h[:], raw[:chainhash.HashSize])
+
+			pos := binary.BigEndian.Uint32(raw[chainhash.HashSize : chainhash.HashSize+4])
+			size := binary.BigEndian.Uint32(raw[chainhash.HashSize+4 : chainhash.HashSize+8])
+
+			want, ok := expected[h]
+			if !ok {
+				continue
+			}
+
+			require.LessOrEqualf(t, uint64(pos)+uint64(size), uint64(len(batchData)),
+				"key record for %x claims offset %d size %d but its batch data is only %d bytes", h[:], pos, size, len(batchData))
+			require.Equal(t, want, batchData[pos:pos+size], "batch data at the key's recorded offset does not match the value written for %x", h[:])
+
+			found[h] = true
+		}
+	}
+
+	require.True(t, found[hash1], "hash1's key record was never located")
+	require.True(t, found[hash2], "hash2's key record was never located")
+}
+
+// blockingStore is a blobStoreSetter fake whose Set call never returns, simulating
+// a hung backend. Used to verify Close abandons the shutdown flush wait rather than
+// blocking forever.
+type blockingStore struct{}
+
+func (blockingStore) Health(_ context.Context, _ bool) (int, string, error) {
+	return 200, "ok", nil
+}
+
+func (blockingStore) Set(_ context.Context, _ []byte, _ fileformat.FileType, _ []byte, _ ...options.FileOption) error {
+	select {} // block forever
+}
+
+// TestBatcher_Close_AbandonsHungFlush pins defect 3: Close used to discard its
+// context and do a bare wg.Wait(), so a hung backend meant Close never returned.
+// Here the shutdown flush calls into blockingStore.Set, which never returns; Close
+// must still return (with an error) once its own context expires, rather than
+// hanging indefinitely.
+func TestBatcher_Close_AbandonsHungFlush(t *testing.T) {
+	batcher := New(ulogger.TestLogger{}, blockingStore{}, 1024, false)
+
+	var hash chainhash.Hash
+	require.NoError(t, batcher.Set(context.Background(), hash[:], fileformat.FileTypeUtxoSet, []byte("data")))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := batcher.Close(ctx)
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "Close should report the abandoned shutdown flush")
+	require.Less(t, elapsed, 5*time.Second, "Close should abandon the wait close to its deadline, not hang")
+}
+
+// TestBatcher_Set_ShortKey_ReturnsError pins defect 4: Set used to do
+// chainhash.Hash(hash) unconditionally, which panics for any key that isn't
+// exactly 32 bytes (e.g. the blockchain peer-registry store's 13-byte
+// "peer-registry" key). It must return an error instead.
+func TestBatcher_Set_ShortKey_ReturnsError(t *testing.T) {
+	store := memory.New()
+	batcher := New(ulogger.TestLogger{}, store, 1024, false)
+	defer batcher.Close(context.Background())
+
+	shortKey := []byte("peer-registry") // 13 bytes, not a 32-byte hash
+
+	err := batcher.Set(context.Background(), shortKey, fileformat.FileTypeUtxoSet, []byte("value"))
+	require.Error(t, err)
 }
