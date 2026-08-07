@@ -11,12 +11,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 )
 
-// maxFutureBlockTime mirrors the two-hours-in-the-future ceiling that
-// model.Block CheckHeaderContextual applies to every header unconditionally —
-// unlike the median-time rule, that check needs no currentChain, so the local
-// submit path does enforce it (model/Block.go).
-const maxFutureBlockTime = 2 * time.Hour
-
 // mtpFloorEntry is the median-time-past floor for one parent block. The median
 // of the 11 headers ending at a given hash can never change — headers are
 // immutable once stored — so it is computed once per parent and reused for
@@ -83,7 +77,11 @@ func (b *BlockAssembler) candidateTime(ctx context.Context, parentHeader *model.
 
 	// Check the ceiling before applying the floor: when the two cross there is
 	// no valid timestamp at all and flooring makes things worse, not better.
-	if maxTime := timeNow + int64(maxFutureBlockTime/time.Second); entry.minTime > maxTime {
+	// model.MaxFutureBlockTime rather than a local copy: this is the ceiling
+	// CheckHeaderContextual will judge the mined block against, and it needs no
+	// currentChain, so the local submit path enforces it too. A second copy here
+	// would let the producer and its own validator drift apart silently.
+	if maxTime := timeNow + int64(model.MaxFutureBlockTime/time.Second); entry.minTime > maxTime {
 		if b.generateSupported() {
 			// Latched per parent like the floor warning below: this branch stays
 			// engaged for as long as the clock condition lasts, and it sits on a
@@ -102,13 +100,21 @@ func (b *BlockAssembler) candidateTime(ctx context.Context, parentHeader *model.
 		// whose node has stopped producing blocks has to reconstruct the cause
 		// from the miners' error strings. Latched on the same flag as the
 		// carve-out above, which is mutually exclusive with this branch.
+		//
+		// Both messages name the two causes rather than only the local clock.
+		// The condition is a gap between this node's clock and the parent
+		// chain's timestamps, and it is silent about which of the two moved: a
+		// slow local clock produces it, and so does a parent chain stamped into
+		// the future by a misconfigured or hostile upstream miner. An operator
+		// reading only "fix your clock" chases NTP while the real cause is
+		// upstream.
 		if entry.warnedCeiling.CompareAndSwap(false, true) {
-			b.logger.Errorf("[candidateTime] block production has stopped for parent %s: its median-time-past floor %d is above the two-hour future bound %d, so no timestamp satisfies both consensus rules; the local clock is at least %d seconds slow and must be corrected", parentHash.String(), entry.minTime, maxTime, entry.minTime-maxTime)
+			b.logger.Errorf("[candidateTime] block production has stopped for parent %s: its median-time-past floor %d is above the two-hour future bound %d, so no timestamp satisfies both consensus rules; either the local clock is at least %d seconds behind the network and must be corrected, or the parent chain is future-stamped by an upstream miner", parentHash.String(), entry.minTime, maxTime, entry.minTime-maxTime)
 		}
 
 		prometheusBlockAssemblerCandidateTimeClockSkew.Inc()
 
-		return 0, errors.NewProcessingError("[candidateTime] parent %s median-time-past floor %d exceeds the two-hour future bound %d, so no timestamp satisfies both consensus rules; the local clock is skewed by at least %d seconds", parentHash.String(), entry.minTime, maxTime, entry.minTime-maxTime)
+		return 0, errors.NewProcessingError("[candidateTime] parent %s median-time-past floor %d exceeds the two-hour future bound %d, so no timestamp satisfies both consensus rules; the local clock is at least %d seconds behind the parent chain, which is either local clock skew or a future-stamped parent chain", parentHash.String(), entry.minTime, maxTime, entry.minTime-maxTime)
 	}
 
 	if timeNow < entry.minTime {
@@ -130,6 +136,14 @@ func (b *BlockAssembler) candidateTime(ctx context.Context, parentHeader *model.
 // the candidate was served on the degraded wall-clock path, the tip has since
 // moved twice, or this chain treats the median rule as advisory — in which case
 // the submit path behaves as it did before the floor existed.
+//
+// That is a property of the moment the solution arrives, not of the job it was
+// built from, and the two can disagree. A degraded poll memoizes nothing, so a
+// later poll on the same parent can succeed and memoize a floor that a solution
+// against the earlier job then fails; within a job's TTL the guard can therefore
+// reject a candidate this node itself served unfloored. The rejection is right —
+// that block is peer-invalid either way — and submitMiningSolution logs that
+// case as ours rather than as a miner's bad timestamp.
 func (b *BlockAssembler) MinCandidateTime(parentHash *chainhash.Hash) (int64, bool) {
 	// The "this chain treats the median rule as advisory" decision has to live in
 	// one place or the producer and the guard drift apart. candidateTime's ceiling
@@ -143,10 +157,8 @@ func (b *BlockAssembler) MinCandidateTime(parentHash *chainhash.Hash) (int64, bo
 		return 0, false
 	}
 
-	for i := range b.mtpFloorMemo {
-		if entry := b.mtpFloorMemo[i].Load(); entry != nil && entry.parent.IsEqual(parentHash) {
-			return entry.minTime, true
-		}
+	if entry := b.memoizedMtpFloor(parentHash); entry != nil {
+		return entry.minTime, true
 	}
 
 	return 0, false

@@ -639,6 +639,32 @@ func TestCandidateTimeTwoHourCeiling(t *testing.T) {
 		require.Equal(t, int32(1), logger.errs.Load(), "the operator must be told once, not on every poll")
 	})
 
+	t.Run("names the future-stamped parent chain as well as the local clock", func(t *testing.T) {
+		// A floor above now+2h is equally consistent with a parent chain stamped
+		// into the future by a misconfigured or hostile upstream miner as with a
+		// slow local clock. This is the one line an operator reads when block
+		// production has gone to zero, so naming only the clock sends them to
+		// chase NTP when the cause may be upstream.
+		logger := &warnCountingLogger{}
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+
+		assembler := &BlockAssembler{
+			logger:           logger,
+			blockchainClient: mockClient,
+			settings: &settings.Settings{
+				ChainCfgParams: &chaincfg.Params{GenerateSupported: false},
+			},
+		}
+
+		_, err := assembler.candidateTime(t.Context(), tip)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "local clock")
+		require.Contains(t, err.Error(), "future-stamped")
+		require.Equal(t, 1, logger.countMatching("local clock"))
+		require.Equal(t, 1, logger.countMatching("future-stamped"))
+	})
+
 	t.Run("serves the wall clock on chains where the median rule is advisory", func(t *testing.T) {
 		// GenerateSupported downgrades the median-time violation to a warning in
 		// CheckHeaderContextual, so an unfloored candidate is still valid there

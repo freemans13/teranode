@@ -570,6 +570,52 @@ func TestSubmitMiningSolution_NTimeFloor(t *testing.T) {
 		requirePastFloorGuard(t, submit(t, s, idBytes, &at))
 	})
 
+	t.Run("warns when the rejected nTime is the one this node served", func(t *testing.T) {
+		// The guard's usual subject is a miner-supplied timestamp. But it also
+		// fires on a candidate this node served unfloored — the floor lookup was
+		// failing when the job was built, memoized nothing, and a later poll on
+		// the same parent then succeeded and memoized the floor. Rejecting is
+		// right, that block is peer-invalid, but "we served bad work" is a
+		// different operator problem from "a miner sent a bad ntime" and the log
+		// has to tell them apart.
+		s, idBytes := setup(t)
+
+		logger := &warnCountingLogger{}
+		s.logger = logger
+
+		id, err := chainhash.NewHash(idBytes)
+		require.NoError(t, err)
+
+		// Re-stamp the stored job below the floor and submit with no nTime of our
+		// own, so the offending timestamp is provably the candidate's own.
+		s.jobStore.Set(*id, &subtreeprocessor.Job{
+			ID: id,
+			MiningCandidate: &model.MiningCandidate{
+				Id:           idBytes,
+				PreviousHash: parent[:],
+				Time:         uint32(floor - 1),
+			},
+		}, time.Minute)
+
+		err = submit(t, s, idBytes, nil)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "median-time-past floor")
+		require.Equal(t, 1, logger.countMatching("this node served"), "a candidate we served below the floor must be reported as ours, not as a miner's bad ntime")
+	})
+
+	t.Run("does not blame this node for a miner's own bad nTime", func(t *testing.T) {
+		s, idBytes := setup(t)
+
+		logger := &warnCountingLogger{}
+		s.logger = logger
+
+		below := uint32(floor - 1)
+
+		err := submit(t, s, idBytes, &below)
+		require.Error(t, err)
+		require.Equal(t, 0, logger.countMatching("this node served"), "the candidate this node served was at the floor; only the miner's replacement was below it")
+	})
+
 	t.Run("enforces nothing when no floor is known for the parent", func(t *testing.T) {
 		s, idBytes := setup(t)
 		s.blockAssembler.mtpFloorMemo[0].Store(nil)

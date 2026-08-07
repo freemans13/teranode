@@ -46,6 +46,14 @@ var bufioReaderPool = sync.Pool{
 
 const GenesisBlockID = 0
 
+// MaxFutureBlockTime is how far ahead of local time a block header's timestamp
+// may be stamped. CheckHeaderContextual rejects anything beyond it, so it is the
+// ceiling every block producer has to stay under; block assembly reads it to
+// decide whether a candidate can satisfy both timestamp rules at once. Producer
+// and validator must agree on the value or the producer emits work the validator
+// refuses, so it lives here, next to the check that enforces it.
+const MaxFutureBlockTime = 2 * time.Hour
+
 // heightAtOrAfterActivation reports whether block height h is at or after an activation height
 // taken from chaincfg. chaincfg activation heights are int32 and non-negative for BIP34/65/66; a
 // negative value (should not occur) is treated as "never active" so it can never wrongly reject.
@@ -517,7 +525,7 @@ type SubtreeStore interface {
 // median-time-past rule is skipped (same as Valid()). Returns nil when the header passes.
 func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *settings.Settings, logger ulogger.Logger) error {
 	// 2. Check that the block timestamp is not more than two hours in the future.
-	twoHoursToTheFutureTimestampUint32, err := safeconversion.Int64ToUint32(time.Now().Add(2 * time.Hour).Unix())
+	twoHoursToTheFutureTimestampUint32, err := safeconversion.Int64ToUint32(time.Now().Add(MaxFutureBlockTime).Unix())
 	if err != nil {
 		return errors.NewProcessingError("[BLOCK][%s] failed to convert two hours to the future timestamp to uint32", b.String(), err)
 	}
