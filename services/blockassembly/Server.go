@@ -327,7 +327,7 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 				switch {
 				case stalledNow && !queueStalled:
 					// Rising edge: log immediately, every time this starts.
-					ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue)", queueLength, staleness.Round(time.Second))
+					ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue), or whether the consumer has not started yet (Init brings up ingest before Start reaches it, and the unmined reload runs in between)", queueLength, staleness.Round(time.Second))
 					queueStalled = true
 					stalledSince = time.Now()
 					lastStallWarn = stalledSince
