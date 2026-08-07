@@ -217,6 +217,7 @@ require (
 	github.com/twmb/franz-go/pkg/kmsg v1.12.0
 	github.com/urfave/cli/v3 v3.8.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
+	go.uber.org/goleak v1.3.0
 	pgregory.net/rapid v1.3.0
 )
 
