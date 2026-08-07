@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"container/list"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,10 @@ import (
 //
 // Eviction is O(1): a list holds keys in insertion order (most recent at the
 // back), so no sort is needed at insert or at sweep time.
+//
+// There is no unbounded mode. An unconfigured map falls back to
+// defaultPeerMapMaxSize rather than growing without limit, so the control
+// cannot be defeated by a construction path that forgets to configure it.
 type cappedPeerMap struct {
 	mu      sync.Mutex
 	entries map[string]*list.Element
@@ -40,6 +45,36 @@ type cappedPeerMap struct {
 	// evicted counts entries dropped to make room since the last sweep read —
 	// flood observability without a per-insert log line.
 	evicted atomic.Int64
+
+	// evictors attributes those evictions to the peers that caused them, so the
+	// at-capacity warning can tell a busy deployment (pressure spread across
+	// peers) from a flood (one dominant peer) — the two call for opposite
+	// responses. It is capped at evictorTrackLimit distinct peers and then
+	// stops naming new ones, so the diagnostic cannot itself become the
+	// unbounded map issue 1409 is about. Guarded by mu.
+	evictors         map[string]int64
+	evictorsOverflow bool
+}
+
+// evictorTrackLimit bounds how many distinct peers the eviction attribution
+// names before it gives up on naming and reports the overflow instead. Past
+// this many contributors the pressure is spread by definition, which is the
+// answer the operator needed anyway.
+const evictorTrackLimit = 16
+
+// evictionStats summarises eviction pressure for one sweep window.
+type evictionStats struct {
+	total int64 // entries dropped to make room since the previous read
+
+	// topPeer is the largest single contributor, exact while the number of
+	// distinct contributors stayed within evictorTrackLimit. Empty when
+	// nothing was evicted.
+	topPeer  string
+	topCount int64
+
+	// spread is set when more peers contributed than the tracker can name, so
+	// topPeer is only one of many rather than a dominant flooder.
+	spread bool
 }
 
 // peerMapNode is the list payload: the key plus its entry, so evicting from
@@ -49,14 +84,25 @@ type peerMapNode struct {
 	entry peerMapEntry
 }
 
-// setMaxSize configures the insert cap. The zero value (no cap configured)
-// stores without bound, preserving the zero-value usability that many test
-// fixtures rely on; NewServer always configures a positive cap.
+// setMaxSize configures the insert cap. A non-positive value selects
+// defaultPeerMapMaxSize: this type has no unbounded mode, so a map that never
+// reaches applyPeerMapLimits — a bare Server literal in a test fixture, or a
+// future construction path that forgets the call — is still bounded.
 func (m *cappedPeerMap) setMaxSize(maxSize int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.maxSize = maxSize
+}
+
+// capLocked returns the cap in force, resolving the unconfigured zero value to
+// the default. Callers must hold the mutex.
+func (m *cappedPeerMap) capLocked() int {
+	if m.maxSize <= 0 {
+		return defaultPeerMapMaxSize
+	}
+
+	return m.maxSize
 }
 
 // init prepares the internal structures; callers must hold the mutex.
@@ -86,15 +132,42 @@ func (m *cappedPeerMap) Store(hash string, entry peerMapEntry) {
 		return
 	}
 
-	if m.maxSize > 0 && m.order.Len() >= m.maxSize {
-		if oldest := m.order.Front(); oldest != nil {
-			m.order.Remove(oldest)
-			delete(m.entries, oldest.Value.(*peerMapNode).hash)
-			m.evicted.Add(1)
+	// Loop rather than evict once: a cap lowered on a populated map leaves it
+	// over-cap, and evicting a single entry per insert would hold it there
+	// forever. The sweep no longer has a size pass to correct that.
+	limit := m.capLocked()
+
+	for m.order.Len() >= limit {
+		oldest := m.order.Front()
+		if oldest == nil {
+			break
 		}
+
+		node := oldest.Value.(*peerMapNode)
+
+		m.order.Remove(oldest)
+		delete(m.entries, node.hash)
+		m.evicted.Add(1)
+		m.recordEvictorLocked(node.entry.peerID)
 	}
 
 	m.entries[hash] = m.order.PushBack(&peerMapNode{hash: hash, entry: entry})
+}
+
+// recordEvictorLocked attributes one eviction to the peer whose announcement
+// was dropped, within the evictorTrackLimit budget. Callers must hold the
+// mutex.
+func (m *cappedPeerMap) recordEvictorLocked(peerID string) {
+	if m.evictors == nil {
+		m.evictors = make(map[string]int64, evictorTrackLimit)
+	}
+
+	if _, ok := m.evictors[peerID]; !ok && len(m.evictors) >= evictorTrackLimit {
+		m.evictorsOverflow = true
+		return
+	}
+
+	m.evictors[peerID]++
 }
 
 // Load returns the entry for hash, if present. It does not change recency:
@@ -139,32 +212,16 @@ func (m *cappedPeerMap) Len() int {
 	return len(m.entries)
 }
 
-// Range calls f for each entry over a snapshot of the keys, so f may call
-// Delete without deadlocking. Iteration runs oldest-first.
-func (m *cappedPeerMap) Range(f func(hash string, entry peerMapEntry) bool) {
-	m.mu.Lock()
-
-	snapshot := make([]peerMapNode, 0, len(m.entries))
-	if m.order != nil {
-		for element := m.order.Front(); element != nil; element = element.Next() {
-			snapshot = append(snapshot, *element.Value.(*peerMapNode))
-		}
-	}
-
-	m.mu.Unlock()
-
-	for _, node := range snapshot {
-		if !f(node.hash, node.entry) {
-			return
-		}
-	}
-}
-
 // DeleteExpired removes every entry whose timestamp predates cutoff and
 // returns how many it removed. This is the TTL sweep's one pass over the map:
 // it holds the lock once and allocates nothing, where Range would copy every
 // entry into a snapshot first and the caller would then re-enter the lock per
 // deletion.
+//
+// It is also the only whole-map walk left, and its cost is bounded by the cap
+// rather than by how many hashes were announced — the property the removed
+// sweep-time sort did not have. Raising the cap lengthens this walk, which
+// holds the mutex against every gossip insert for its duration.
 //
 // It walks the whole list rather than stopping at the first live entry.
 // Insertion order tracks timestamp order closely but not strictly — two
@@ -198,8 +255,43 @@ func (m *cappedPeerMap) DeleteExpired(cutoff time.Time) int {
 	return removed
 }
 
-// EvictedSinceLastRead returns the number of entries dropped to make room
-// since the previous call, resetting the counter.
-func (m *cappedPeerMap) EvictedSinceLastRead() int64 {
-	return m.evicted.Swap(0)
+// EvictionsSinceLastRead returns how many entries were dropped to make room
+// since the previous call, and who caused them, resetting both. The
+// attribution is what lets the caller distinguish sustained legitimate
+// throughput — pressure spread across peers, where a larger cap is the right
+// answer — from one peer spraying distinct hashes, where a larger cap only
+// buys the attacker more of the node's memory (issue 1503).
+func (m *cappedPeerMap) EvictionsSinceLastRead() evictionStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	stats := evictionStats{
+		total:  m.evicted.Swap(0),
+		spread: m.evictorsOverflow,
+	}
+
+	for peerID, count := range m.evictors {
+		if count > stats.topCount {
+			stats.topPeer, stats.topCount = peerID, count
+		}
+	}
+
+	m.evictors = nil
+	m.evictorsOverflow = false
+
+	return stats
+}
+
+// String renders the eviction attribution for the at-capacity log line.
+func (s evictionStats) String() string {
+	switch {
+	case s.total == 0:
+		return "none"
+	case s.spread:
+		return fmt.Sprintf("spread across more than %d peers", evictorTrackLimit)
+	case s.topCount == s.total:
+		return fmt.Sprintf("all from peer %s", s.topPeer)
+	default:
+		return fmt.Sprintf("top contributor peer %s with %d", s.topPeer, s.topCount)
+	}
 }

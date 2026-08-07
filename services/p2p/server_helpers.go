@@ -899,9 +899,14 @@ func (s *Server) cleanupPeerMaps() {
 	// Surface how many entries the inline cap evicted since the last sweep
 	// (issue 1409) — flood visibility without a per-insert log line. Sustained
 	// eviction means announcements are arriving faster than the cap can hold,
-	// so attribution for the oldest of them is being aged out early.
-	if blockEvicted, subtreeEvicted := s.blockPeerMap.EvictedSinceLastRead(), s.subtreePeerMap.EvictedSinceLastRead(); blockEvicted > 0 || subtreeEvicted > 0 {
-		s.logger.Warnf("[cleanupPeerMaps] peer maps at capacity: evicted %d oldest block and %d oldest subtree entries since the last sweep", blockEvicted, subtreeEvicted)
+	// so attribution for the oldest of them is being aged out early. The
+	// attribution matters as much as the count: pressure spread across peers
+	// is throughput and a larger cap helps, whereas one dominant contributor
+	// is a flood, where a larger cap just hands the attacker more memory and a
+	// longer sweep — ban the peer instead (issue 1503).
+	if blockEvictions, subtreeEvictions := s.blockPeerMap.EvictionsSinceLastRead(), s.subtreePeerMap.EvictionsSinceLastRead(); blockEvictions.total > 0 || subtreeEvictions.total > 0 {
+		s.logger.Warnf("[cleanupPeerMaps] peer maps at capacity since the last sweep: evicted %d oldest block entries (%s) and %d oldest subtree entries (%s)",
+			blockEvictions.total, blockEvictions, subtreeEvictions.total, subtreeEvictions)
 	}
 
 	// Log current sizes

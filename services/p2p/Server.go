@@ -156,8 +156,7 @@ type Server struct {
 
 	// Cleanup configuration
 	peerMapCleanupTicker *time.Ticker  // Ticker for periodic cleanup of peer maps
-	peerMapMaxSize       int           // Maximum number of entries in peer maps
-	peerMapTTL           time.Duration // Time-to-live for peer map entries
+	peerMapTTL           time.Duration // Time-to-live for peer map entries; the size cap lives in cappedPeerMap.maxSize
 
 	invalidPolicyWarnOnce sync.Once // Emits the invalid-fee-policy warning at most once per process to avoid log spam
 
@@ -539,24 +538,28 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 
 // applyPeerMapLimits resolves the attribution maps' size cap and TTL, taking
 // the configured values when set and the service defaults otherwise, and
-// applies the cap to both maps. The maps are bounded at insert (issue 1409),
-// so a map that never receives its cap here would be unbounded — this lives
-// apart from NewServer so that wiring can be tested without standing up the
-// service's dependencies.
+// applies the cap to both maps. The maps are bounded at insert (issue 1409);
+// the cap they enforce is the authoritative one, which is why it is not also
+// mirrored on Server. This lives apart from NewServer so that the wiring can
+// be tested without standing up the service's dependencies.
+//
+// A map that never reaches this function still falls back to
+// defaultPeerMapMaxSize rather than growing unbounded, so forgetting the call
+// degrades configurability, not the bound itself.
 func (s *Server) applyPeerMapLimits(tSettings *settings.Settings) {
-	s.peerMapMaxSize = defaultPeerMapMaxSize
+	maxSize := defaultPeerMapMaxSize
 	s.peerMapTTL = defaultPeerMapTTL
 
 	if tSettings.P2P.PeerMapMaxSize > 0 {
-		s.peerMapMaxSize = tSettings.P2P.PeerMapMaxSize
+		maxSize = tSettings.P2P.PeerMapMaxSize
 	}
 
 	if tSettings.P2P.PeerMapTTL > 0 {
 		s.peerMapTTL = tSettings.P2P.PeerMapTTL
 	}
 
-	s.blockPeerMap.setMaxSize(s.peerMapMaxSize)
-	s.subtreePeerMap.setMaxSize(s.peerMapMaxSize)
+	s.blockPeerMap.setMaxSize(maxSize)
+	s.subtreePeerMap.setMaxSize(maxSize)
 }
 
 // httpServeError returns the error the HTTP serve goroutine exited with, or nil

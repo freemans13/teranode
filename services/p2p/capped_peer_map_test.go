@@ -27,8 +27,89 @@ func TestCappedPeerMapFloodBounded(t *testing.T) {
 	}
 
 	require.Equal(t, 100, m.Len(), "map must not grow past its cap under a distinct-hash flood")
-	require.Equal(t, int64(150), m.EvictedSinceLastRead())
-	require.Equal(t, int64(0), m.EvictedSinceLastRead(), "counter must reset on read")
+
+	// Eviction count is exactly the overflow — cost tracks the flood only in
+	// the sense that each surplus insert drops exactly one entry, never more.
+	evictions := m.EvictionsSinceLastRead()
+	require.Equal(t, int64(150), evictions.total)
+	require.Equal(t, "attacker", evictions.topPeer, "a single flooder must be named")
+	require.Equal(t, int64(150), evictions.topCount)
+	require.False(t, evictions.spread)
+	require.Equal(t, "all from peer attacker", evictions.String())
+
+	require.Equal(t, int64(0), m.EvictionsSinceLastRead().total, "counter must reset on read")
+}
+
+// TestCappedPeerMapEvictionAttribution pins the signal the at-capacity warning
+// relies on: an operator has to be able to tell sustained legitimate
+// throughput (pressure spread across peers, where raising the cap helps) from
+// one peer spraying hashes (where raising the cap only buys the attacker more
+// memory — issue 1503). The tracker is itself bounded, so past
+// evictorTrackLimit contributors it reports the spread instead of a name.
+func TestCappedPeerMapEvictionAttribution(t *testing.T) {
+	now := time.Now()
+
+	t.Run("one dominant contributor is named", func(t *testing.T) {
+		var m cappedPeerMap
+
+		m.setMaxSize(10)
+
+		for i := 0; i < 100; i++ {
+			peerID := "busy-peer"
+			if i%10 == 0 {
+				peerID = "quiet-peer"
+			}
+
+			m.Store(fmt.Sprintf("hash-%d", i), peerMapEntry{peerID: peerID, timestamp: now})
+		}
+
+		evictions := m.EvictionsSinceLastRead()
+		require.Equal(t, int64(90), evictions.total)
+		require.Equal(t, "busy-peer", evictions.topPeer)
+		require.False(t, evictions.spread)
+		require.Contains(t, evictions.String(), "top contributor peer busy-peer")
+	})
+
+	t.Run("pressure spread past the tracking limit reports the spread", func(t *testing.T) {
+		var m cappedPeerMap
+
+		m.setMaxSize(10)
+
+		for i := 0; i < 200; i++ {
+			m.Store(fmt.Sprintf("hash-%d", i), peerMapEntry{
+				peerID:    fmt.Sprintf("peer-%d", i%(evictorTrackLimit*4)),
+				timestamp: now,
+			})
+		}
+
+		evictions := m.EvictionsSinceLastRead()
+		require.Equal(t, int64(190), evictions.total)
+		require.True(t, evictions.spread, "more contributors than the tracker can name must report as spread")
+		require.Contains(t, evictions.String(), "spread across more than")
+
+		// The tracker itself must stay bounded: that is the failure mode of
+		// issue 1409, and a diagnostic is no exception.
+		m.mu.Lock()
+		require.LessOrEqual(t, len(m.evictors), evictorTrackLimit)
+		m.mu.Unlock()
+	})
+
+	t.Run("attribution resets with the counter", func(t *testing.T) {
+		var m cappedPeerMap
+
+		m.setMaxSize(2)
+
+		for i := 0; i < 10; i++ {
+			m.Store(fmt.Sprintf("hash-%d", i), peerMapEntry{peerID: "attacker", timestamp: now})
+		}
+
+		require.Equal(t, int64(8), m.EvictionsSinceLastRead().total)
+
+		next := m.EvictionsSinceLastRead()
+		require.Equal(t, int64(0), next.total)
+		require.Empty(t, next.topPeer)
+		require.Equal(t, "none", next.String())
+	})
 }
 
 // TestCappedPeerMapKeepsNewestUnderFlood pins the security-critical direction
@@ -83,6 +164,134 @@ func TestStorePeerMapEntryKeepsAttributionUnderFlood(t *testing.T) {
 	require.Equal(t, "peer-to-ban", peerID)
 }
 
+// TestStorePeerMapEntryKeepsSubtreeAttributionUnderFlood mirrors the block-side
+// flood test on the subtree path, through the same two helpers the handlers
+// use. The subtree map is the one that realistically sits at capacity — by the
+// sizing analysis roughly 16 subtrees a second fills the default cap for a
+// whole TTL window — and storePeerMapEntry(&s.subtreePeerMap, …) has exactly
+// one call site, all of it production code, so nothing else would catch the
+// subtree handler being pointed at the wrong map.
+func TestStorePeerMapEntryKeepsSubtreeAttributionUnderFlood(t *testing.T) {
+	s := &Server{logger: ulogger.TestLogger{}}
+	s.subtreePeerMap.setMaxSize(20)
+
+	now := time.Now()
+	for i := 0; i < 200; i++ {
+		s.storePeerMapEntry(&s.subtreePeerMap, fmt.Sprintf("%064d", i), "attacker", now)
+	}
+
+	require.Equal(t, 20, s.subtreePeerMap.Len(), "gossip inserts must not grow the subtree map past the cap")
+	require.Equal(t, 0, s.blockPeerMap.Len(), "the subtree path must not touch the block map")
+
+	realHash := fmt.Sprintf("%064d", 999999)
+	s.storePeerMapEntry(&s.subtreePeerMap, realHash, "peer-to-ban", now)
+
+	peerID, err := s.getPeerFromMap(&s.subtreePeerMap, realHash, "subtree")
+	require.NoError(t, err, "the ban path must still find the announcing peer after a flood")
+	require.Equal(t, "peer-to-ban", peerID)
+}
+
+// TestCappedPeerMapCostBoundedByCapNotFlood pins the other half of what issue
+// 1409 asks for: not just that the map stays small, but that the work done to
+// keep it small does not scale with the flood.
+//
+// Two properties, both deterministic. Inserting at capacity does a fixed
+// number of allocations regardless of how many hashes have already been thrown
+// at the map — the old scheme let the surplus accumulate and then paid for a
+// full-map sort. And the sweep, the only whole-map walk left, allocates
+// nothing and visits at most cap entries however large the flood was; the
+// removed sort.Slice snapshotted and sorted every one of them.
+func TestCappedPeerMapCostBoundedByCapNotFlood(t *testing.T) {
+	const (
+		maxSize    = 64
+		smallFlood = 1_000
+		largeFlood = 100_000
+	)
+
+	now := time.Now()
+
+	// Pre-generate keys so the measured closure allocates nothing of its own.
+	keys := make([]string, largeFlood+2_000)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("hash-%d", i)
+	}
+
+	newFloodedMap := func(flood int) *cappedPeerMap {
+		m := &cappedPeerMap{}
+		m.setMaxSize(maxSize)
+
+		for i := 0; i < flood; i++ {
+			m.Store(keys[i], peerMapEntry{peerID: "attacker", timestamp: now})
+		}
+
+		require.Equal(t, maxSize, m.Len(), "a flood of %d must leave exactly the cap behind", flood)
+
+		return m
+	}
+
+	allocsPerStoreAfter := func(flood int) float64 {
+		m := newFloodedMap(flood)
+		next := flood
+
+		return testing.AllocsPerRun(1_000, func() {
+			m.Store(keys[next], peerMapEntry{peerID: "attacker", timestamp: now})
+			next++
+		})
+	}
+
+	small := allocsPerStoreAfter(smallFlood)
+	large := allocsPerStoreAfter(largeFlood)
+	require.InDelta(t, small, large, 0.5,
+		"insert cost at capacity must not depend on how many hashes were flooded before it")
+
+	// The sweep is the only whole-map walk left. However large the flood was,
+	// it visits at most cap entries and allocates nothing — where the removed
+	// sort.Slice snapshotted and sorted every entry the flood had produced.
+	m := newFloodedMap(largeFlood)
+
+	walkAllocs := testing.AllocsPerRun(100, func() {
+		// Cutoff in the past: walks all maxSize entries, removes none, so
+		// every run measures exactly the same work.
+		m.DeleteExpired(now.Add(-time.Hour))
+	})
+	require.Zero(t, walkAllocs, "the sweep's whole-map walk must allocate nothing")
+
+	require.Equal(t, maxSize, m.DeleteExpired(now.Add(time.Hour)),
+		"the sweep touches at most cap entries after a %d-hash flood", largeFlood)
+	require.Equal(t, 0, m.Len())
+}
+
+// BenchmarkCappedPeerMapStoreUnderFlood is the wall-clock companion to
+// TestCappedPeerMapCostBoundedByCapNotFlood: ns/op must stay flat as the flood
+// grows by two orders of magnitude. Against the removed sweep-time sort it
+// would not have.
+func BenchmarkCappedPeerMapStoreUnderFlood(b *testing.B) {
+	now := time.Now()
+
+	for _, flood := range []int{1000, 100000} {
+		b.Run(fmt.Sprintf("flood=%d", flood), func(b *testing.B) {
+			var m cappedPeerMap
+
+			m.setMaxSize(defaultPeerMapMaxSize)
+
+			keys := make([]string, flood)
+			for i := range keys {
+				keys[i] = fmt.Sprintf("hash-%d", i)
+			}
+
+			for i := 0; i < flood; i++ {
+				m.Store(keys[i], peerMapEntry{peerID: "attacker", timestamp: now})
+			}
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				m.Store(keys[i%flood], peerMapEntry{peerID: "attacker", timestamp: now})
+			}
+		})
+	}
+}
+
 // TestCappedPeerMapUpdateAndDelete pins the non-growth operations: updating an
 // existing key refreshes it (and its recency) without evicting, and a delete
 // frees a slot.
@@ -98,7 +307,7 @@ func TestCappedPeerMapUpdateAndDelete(t *testing.T) {
 	// Update 'a': no eviction, and 'a' becomes the most recent.
 	m.Store("a", peerMapEntry{peerID: "p2", timestamp: now})
 	require.Equal(t, 2, m.Len())
-	require.Equal(t, int64(0), m.EvictedSinceLastRead(), "updating an existing key must not evict")
+	require.Equal(t, int64(0), m.EvictionsSinceLastRead().total, "updating an existing key must not evict")
 
 	entry, ok := m.Load("a")
 	require.True(t, ok)
@@ -115,19 +324,27 @@ func TestCappedPeerMapUpdateAndDelete(t *testing.T) {
 	require.Equal(t, 1, m.Len())
 }
 
-// TestCappedPeerMapZeroValue pins the zero-value affordance the test fixtures
-// rely on: no cap configured means unbounded storage, and all methods are
-// usable without construction.
-func TestCappedPeerMapZeroValue(t *testing.T) {
+// TestCappedPeerMapZeroValueIsBounded pins that the control fails CLOSED. The
+// zero value is reachable from any bare Server literal, and from any future
+// construction path that forgets applyPeerMapLimits; if that meant "unbounded"
+// then the one guarantee this type exists to provide would be off by default
+// and every test would still be green. An unconfigured map takes the default
+// cap instead — there is no unbounded mode.
+func TestCappedPeerMapZeroValueIsBounded(t *testing.T) {
 	var m cappedPeerMap
 
 	now := time.Now()
-	for i := 0; i < 300; i++ {
+	for i := 0; i < defaultPeerMapMaxSize+250; i++ {
 		m.Store(fmt.Sprintf("hash-%d", i), peerMapEntry{peerID: "p", timestamp: now})
 	}
 
-	require.Equal(t, 300, m.Len())
-	require.Equal(t, int64(0), m.EvictedSinceLastRead())
+	require.Equal(t, defaultPeerMapMaxSize, m.Len(), "an unconfigured map must still be bounded")
+	require.Equal(t, int64(250), m.EvictionsSinceLastRead().total)
+
+	// A non-positive cap is not an opt-out either.
+	m.setMaxSize(0)
+	m.Store("still-bounded", peerMapEntry{peerID: "p", timestamp: now})
+	require.Equal(t, defaultPeerMapMaxSize, m.Len())
 
 	m.Clear()
 	require.Equal(t, 0, m.Len())
@@ -135,31 +352,32 @@ func TestCappedPeerMapZeroValue(t *testing.T) {
 	// Usable again after Clear.
 	m.Store("after-clear", peerMapEntry{peerID: "p", timestamp: now})
 	require.Equal(t, 1, m.Len())
+	requireMapConsistent(t, &m)
 }
 
-// TestCappedPeerMapRangeDeletes pins that the sweep's usage — deleting while
-// ranging — is safe, and that iteration runs oldest-first.
-func TestCappedPeerMapRangeDeletes(t *testing.T) {
+// TestCappedPeerMapConvergesWhenOverCap pins that a map holding more than its
+// cap drains back down instead of sitting over-cap forever. Evicting exactly
+// one entry per insert would hold it at the same size indefinitely, and the
+// sweep no longer has a size pass to correct that.
+func TestCappedPeerMapConvergesWhenOverCap(t *testing.T) {
 	var m cappedPeerMap
 
-	base := time.Now()
-	for i := 0; i < 10; i++ {
-		m.Store(fmt.Sprintf("hash-%d", i), peerMapEntry{peerID: "p", timestamp: base.Add(time.Duration(i) * time.Second)})
+	m.setMaxSize(50)
+
+	now := time.Now()
+	for i := 0; i < 50; i++ {
+		m.Store(fmt.Sprintf("hash-%d", i), peerMapEntry{peerID: "p", timestamp: now})
 	}
 
-	var seen []string
+	require.Equal(t, 50, m.Len())
 
-	m.Range(func(hash string, _ peerMapEntry) bool {
-		seen = append(seen, hash)
-		m.Delete(hash)
+	// Lower the cap on a populated map: the next insert must bring it all the
+	// way down, not shave off a single entry.
+	m.setMaxSize(5)
+	m.Store("after-shrink", peerMapEntry{peerID: "p", timestamp: now})
 
-		return true
-	})
-
-	require.Len(t, seen, 10)
-	require.Equal(t, "hash-0", seen[0], "iteration must run oldest-first")
-	require.Equal(t, "hash-9", seen[9])
-	require.Equal(t, 0, m.Len())
+	require.Equal(t, 5, m.Len(), "an over-cap map must converge to the new cap")
+	requireMapConsistent(t, &m)
 }
 
 // requireMapConsistent asserts the map and its insertion-order list describe
@@ -201,7 +419,7 @@ func TestCappedPeerMapConcurrent(t *testing.T) {
 		iterations = 400
 		storers    = 8
 		deleters   = 4
-		rangers    = 2
+		sweepers   = 2
 	)
 
 	var m cappedPeerMap
@@ -238,23 +456,18 @@ func TestCappedPeerMapConcurrent(t *testing.T) {
 		}(g)
 	}
 
-	// The sweep's shape: range the map and delete from inside the callback.
-	for g := 0; g < rangers; g++ {
+	// The sweep's shape: a whole-map expiry pass, plus the eviction-counter
+	// read that follows it, running against live inserts.
+	for g := 0; g < sweepers; g++ {
 		wg.Add(1)
 
 		go func() {
 			defer wg.Done()
 
 			for i := 0; i < iterations/10; i++ {
-				m.Range(func(hash string, entry peerMapEntry) bool {
-					if entry.timestamp.Before(now) {
-						m.Delete(hash)
-					}
-
-					return true
-				})
-
 				m.DeleteExpired(now.Add(-time.Hour))
+				m.DeleteExpired(now.Add(time.Hour))
+				m.EvictionsSinceLastRead()
 			}
 		}()
 	}
@@ -319,9 +532,24 @@ func TestCappedPeerMapClearRetainsMaxSize(t *testing.T) {
 	requireMapConsistent(t, &m)
 }
 
+// requireConfiguredCap asserts the cap a map was actually configured with,
+// read under its own lock. Behavioural fills cannot substitute here: since the
+// zero value now resolves to defaultPeerMapMaxSize, a map that lost its wiring
+// still enforces the default, so only the configured value distinguishes
+// "wired" from "fell back".
+func requireConfiguredCap(t *testing.T, m *cappedPeerMap, want int) {
+	t.Helper()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	require.Equal(t, want, m.maxSize, "configured cap did not reach the map")
+}
+
 // TestApplyPeerMapLimits pins that the configured size actually reaches both
 // attribution maps. Nothing else asserts it, so a refactor could drop the
-// wiring and leave the maps unbounded with every other test still green.
+// wiring and leave both maps silently on the fallback with every other test
+// still green.
 func TestApplyPeerMapLimits(t *testing.T) {
 	now := time.Now()
 
@@ -342,8 +570,9 @@ func TestApplyPeerMapLimits(t *testing.T) {
 		s := &Server{}
 		s.applyPeerMapLimits(tSettings)
 
-		require.Equal(t, 7, s.peerMapMaxSize)
 		require.Equal(t, 3*time.Minute, s.peerMapTTL)
+		requireConfiguredCap(t, &s.blockPeerMap, 7)
+		requireConfiguredCap(t, &s.subtreePeerMap, 7)
 
 		fill(t, s, 20)
 		require.Equal(t, 7, s.blockPeerMap.Len())
@@ -354,12 +583,26 @@ func TestApplyPeerMapLimits(t *testing.T) {
 		s := &Server{}
 		s.applyPeerMapLimits(&settings.Settings{})
 
-		require.Equal(t, defaultPeerMapMaxSize, s.peerMapMaxSize)
 		require.Equal(t, defaultPeerMapTTL, s.peerMapTTL)
 
-		// Bounded, not unbounded: the default cap must reach the maps too.
+		// The default must be applied to the maps, not merely relied on as
+		// their fallback: this is what would fail if the wiring were dropped.
+		requireConfiguredCap(t, &s.blockPeerMap, defaultPeerMapMaxSize)
+		requireConfiguredCap(t, &s.subtreePeerMap, defaultPeerMapMaxSize)
+
 		fill(t, s, 5)
 		require.Equal(t, 5, s.blockPeerMap.Len())
 		require.Equal(t, 5, s.subtreePeerMap.Len())
+	})
+
+	t.Run("a non-positive configured size cannot unbound the maps", func(t *testing.T) {
+		tSettings := &settings.Settings{}
+		tSettings.P2P.PeerMapMaxSize = -1
+
+		s := &Server{}
+		s.applyPeerMapLimits(tSettings)
+
+		requireConfiguredCap(t, &s.blockPeerMap, defaultPeerMapMaxSize)
+		requireConfiguredCap(t, &s.subtreePeerMap, defaultPeerMapMaxSize)
 	})
 }
