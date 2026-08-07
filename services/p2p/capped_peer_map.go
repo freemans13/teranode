@@ -46,12 +46,13 @@ type cappedPeerMap struct {
 	// flood observability without a per-insert log line.
 	evicted atomic.Int64
 
-	// evictors attributes those evictions to the peers that caused them, so the
-	// at-capacity warning can tell a busy deployment (pressure spread across
-	// peers) from a flood (one dominant peer) — the two call for opposite
-	// responses. It is capped at evictorTrackLimit distinct peers and then
-	// stops naming new ones, so the diagnostic cannot itself become the
-	// unbounded map issue 1409 is about. Guarded by mu.
+	// evictors attributes those evictions to the peers whose inserts forced
+	// them — the pressure, not the entries dropped by it — so the at-capacity
+	// warning can tell a busy deployment (pressure spread across peers) from a
+	// flood (one dominant peer); the two call for opposite responses. It is
+	// capped at evictorTrackLimit distinct peers and then stops naming new
+	// ones, so the diagnostic cannot itself become the unbounded map issue
+	// 1409 is about. Guarded by mu.
 	evictors         map[string]int64
 	evictorsOverflow bool
 }
@@ -66,9 +67,9 @@ const evictorTrackLimit = 16
 type evictionStats struct {
 	total int64 // entries dropped to make room since the previous read
 
-	// topPeer is the largest single contributor, exact while the number of
-	// distinct contributors stayed within evictorTrackLimit. Empty when
-	// nothing was evicted.
+	// topPeer is the peer whose inserts forced the most evictions, exact while
+	// the number of distinct contributors stayed within evictorTrackLimit.
+	// Empty when nothing was evicted.
 	topPeer  string
 	topCount int64
 
@@ -148,15 +149,19 @@ func (m *cappedPeerMap) Store(hash string, entry peerMapEntry) {
 		m.order.Remove(oldest)
 		delete(m.entries, node.hash)
 		m.evicted.Add(1)
-		m.recordEvictorLocked(node.entry.peerID)
+
+		// Attribute the eviction to the peer whose insert forced it, not to
+		// the peer whose entry was dropped. The dropped entry is the victim:
+		// blaming it would name honest peers for an attacker's flood, and the
+		// warning's whole purpose is to tell the operator who to ban.
+		m.recordEvictorLocked(entry.peerID)
 	}
 
 	m.entries[hash] = m.order.PushBack(&peerMapNode{hash: hash, entry: entry})
 }
 
-// recordEvictorLocked attributes one eviction to the peer whose announcement
-// was dropped, within the evictorTrackLimit budget. Callers must hold the
-// mutex.
+// recordEvictorLocked attributes one eviction to the peer whose insert forced
+// it, within the evictorTrackLimit budget. Callers must hold the mutex.
 func (m *cappedPeerMap) recordEvictorLocked(peerID string) {
 	if m.evictors == nil {
 		m.evictors = make(map[string]int64, evictorTrackLimit)

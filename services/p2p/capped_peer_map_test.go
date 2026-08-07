@@ -94,6 +94,39 @@ func TestCappedPeerMapEvictionAttribution(t *testing.T) {
 		m.mu.Unlock()
 	})
 
+	t.Run("the flooder is named, not the honest peers it displaced", func(t *testing.T) {
+		var m cappedPeerMap
+
+		m.setMaxSize(10)
+
+		// Honest peers fill the map first, so every entry the flood evicts
+		// belongs to one of them.
+		for i := 0; i < 10; i++ {
+			m.Store(fmt.Sprintf("honest-%d", i), peerMapEntry{
+				peerID:    fmt.Sprintf("honest-peer-%d", i),
+				timestamp: now,
+			})
+		}
+
+		require.Equal(t, int64(0), m.EvictionsSinceLastRead().total, "filling to the cap must not evict")
+
+		// Flood less than the cap, so every entry dropped belongs to an honest
+		// peer and none of the attacker's own entries are reached.
+		for i := 0; i < 8; i++ {
+			m.Store(fmt.Sprintf("junk-%d", i), peerMapEntry{peerID: "attacker", timestamp: now})
+		}
+
+		// Attribution must follow the insert that forced the eviction, not the
+		// entry that was dropped: blaming the dropped entries would name eight
+		// honest peers, one eviction each, and point the operator at the
+		// victims of the flood rather than its source.
+		evictions := m.EvictionsSinceLastRead()
+		require.Equal(t, int64(8), evictions.total)
+		require.Equal(t, "attacker", evictions.topPeer, "the peer applying the pressure must be named")
+		require.Equal(t, int64(8), evictions.topCount)
+		require.False(t, evictions.spread)
+	})
+
 	t.Run("attribution resets with the counter", func(t *testing.T) {
 		var m cappedPeerMap
 
