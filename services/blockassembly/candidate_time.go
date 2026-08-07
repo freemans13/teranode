@@ -95,6 +95,19 @@ func (b *BlockAssembler) candidateTime(ctx context.Context, parentHeader *model.
 			return timeNow, nil
 		}
 
+		// This is the only new branch that takes mining output to zero, and the
+		// error it returns is never logged locally: GetMiningCandidate and
+		// generateEmptyBlockCandidate propagate it verbatim, and the gRPC handler
+		// returns errors.WrapGRPC(err) without a log line. Unlogged, an operator
+		// whose node has stopped producing blocks has to reconstruct the cause
+		// from the miners' error strings. Latched on the same flag as the
+		// carve-out above, which is mutually exclusive with this branch.
+		if entry.warnedCeiling.CompareAndSwap(false, true) {
+			b.logger.Errorf("[candidateTime] block production has stopped for parent %s: its median-time-past floor %d is above the two-hour future bound %d, so no timestamp satisfies both consensus rules; the local clock is at least %d seconds slow and must be corrected", parentHash.String(), entry.minTime, maxTime, entry.minTime-maxTime)
+		}
+
+		prometheusBlockAssemblerCandidateTimeClockSkew.Inc()
+
 		return 0, errors.NewProcessingError("[candidateTime] parent %s median-time-past floor %d exceeds the two-hour future bound %d, so no timestamp satisfies both consensus rules; the local clock is skewed by at least %d seconds", parentHash.String(), entry.minTime, maxTime, entry.minTime-maxTime)
 	}
 
@@ -149,12 +162,67 @@ func (b *BlockAssembler) MinCandidateTime(parentHash *chainhash.Hash) (int64, bo
 // slot would thrash whenever those two alternate, refetching on every poll and
 // re-firing the floor warning each time.
 func (b *BlockAssembler) mtpFloor(ctx context.Context, parentHeader *model.BlockHeader, parentHash *chainhash.Hash) *mtpFloorEntry {
+	if entry := b.memoizedMtpFloor(parentHash); entry != nil {
+		return entry
+	}
+
+	// Single-flight the miss. Neither GetMiningCandidate entry point holds a lock
+	// and every miner polls several times a second, so a cold tip is entered
+	// concurrently as a matter of course — the check-then-compute-then-store
+	// below is not atomic. Unflighted, each racer fetches the same eleven
+	// headers, each wins its own CompareAndSwap and warns, and each stores into
+	// its own round-robin slot, so one parent occupies both and evicts the other
+	// candidate path's entry. Sharing one flight per parent makes the entry a
+	// single object again, which is what the per-entry log latches assume.
+	shared, _, _ := b.mtpFloorFlight.Do(parentHash.String(), func() (interface{}, error) {
+		// Re-check inside the flight: a previous flight for this parent may have
+		// completed between the read above and getting here.
+		if entry := b.memoizedMtpFloor(parentHash); entry != nil {
+			return entry, nil
+		}
+
+		return b.computeMtpFloor(ctx, parentHeader, parentHash), nil
+	})
+
+	entry, _ := shared.(*mtpFloorEntry)
+
+	return entry
+}
+
+// memoizedMtpFloor returns the memo entry for parentHash, or nil on a miss.
+// Reads stay lock-free: the slots are atomic pointers and entries are immutable
+// apart from their own atomic log latches.
+func (b *BlockAssembler) memoizedMtpFloor(parentHash *chainhash.Hash) *mtpFloorEntry {
 	for i := range b.mtpFloorMemo {
 		if entry := b.mtpFloorMemo[i].Load(); entry != nil && entry.parent.IsEqual(parentHash) {
 			return entry
 		}
 	}
 
+	return nil
+}
+
+// placeMtpFloor stores entry, reusing the slot its parent already occupies so a
+// single parent can never hold both and evict the other candidate path's entry.
+// The round-robin victim is therefore always a different parent.
+func (b *BlockAssembler) placeMtpFloor(entry *mtpFloorEntry) {
+	for i := range b.mtpFloorMemo {
+		if cur := b.mtpFloorMemo[i].Load(); cur != nil && cur.parent.IsEqual(&entry.parent) {
+			b.mtpFloorMemo[i].Store(entry)
+
+			return
+		}
+	}
+
+	slot := b.mtpFloorMemoNext.Add(1) % uint64(len(b.mtpFloorMemo))
+	b.mtpFloorMemo[slot].Store(entry)
+}
+
+// computeMtpFloor does the actual lookup and median calculation for one parent.
+// It runs inside a single flight, so at most one caller per parent is here at a
+// time. It returns nil — having logged the cause — when the floor cannot be
+// established, leaving the caller to decide how to degrade.
+func (b *BlockAssembler) computeMtpFloor(ctx context.Context, parentHeader *model.BlockHeader, parentHash *chainhash.Hash) *mtpFloorEntry {
 	// A transport failure and an unusable result call for opposite responses, so
 	// the fetch and the verification are separate steps. If the call itself fails
 	// the blockchain service is unhealthy, and walking it once per header would
@@ -204,8 +272,7 @@ func (b *BlockAssembler) mtpFloor(ctx context.Context, parentHeader *model.Block
 
 	entry := &mtpFloorEntry{parent: *parentHash, minTime: medianTimestamp.Unix() + 1}
 
-	slot := b.mtpFloorMemoNext.Add(1) % uint64(len(b.mtpFloorMemo))
-	b.mtpFloorMemo[slot].Store(entry)
+	b.placeMtpFloor(entry)
 
 	return entry
 }

@@ -2,6 +2,8 @@ package blockassembly
 
 import (
 	"context"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -134,6 +136,42 @@ func TestCandidateTime(t *testing.T) {
 
 		medianTimePast := int64(baseTime + 5)
 		require.Equal(t, medianTimePast+1, got)
+	})
+
+	t.Run("the real store satisfies the batched-run contract without the walk", func(t *testing.T) {
+		// Every other batched-success subtest supplies the run shape itself via
+		// blockchain.Mock, and the real-store tests assert only the resulting
+		// floor — which walkParentChain reproduces identically. So the three
+		// assumptions verifyParentChainRun encodes about GetBlockHeaders(parent, 11)
+		// — newest-first, anchor-inclusive, and at most 11 — are a live
+		// cross-package contract with nothing pinning them.
+		//
+		// Flip ORDER BY b.height DESC to ASC in stores/blockchain/sql, or make the
+		// fast path exclusive of the anchor, and every miner poll would silently
+		// take MedianTimeBlocks-1 extra sequential GetBlockHeader round-trips plus
+		// a warning per tip, with the rest of the suite still green. This asserts
+		// the batched run is accepted as-is against the sqlitememory store: exactly
+		// one warning, the floor line, and no "was unusable" fallback line.
+		server, _ := setupServer(t)
+
+		// The logger is swapped before anything starts: assigning it to a running
+		// assembler races the channel-listener goroutines that read b.logger.
+		// candidateTime needs only the blockchain client, so nothing is started
+		// here — which also keeps unrelated background logging out of the counts.
+		logger := &warnCountingLogger{}
+		server.blockAssembler.logger = logger
+
+		baseTime := uint32(time.Now().Add(100 * time.Minute).Unix())
+		tipHeader := buildFutureChain(t, t.Context(), server.blockchainClient, baseTime)
+
+		got, err := server.blockAssembler.candidateTime(t.Context(), tipHeader)
+		require.NoError(t, err)
+		require.Equal(t, int64(baseTime+5)+1, got)
+
+		// Count the specific line rather than all of them: the fallback line only
+		// appears when verifyParentChainRun rejected the store's run.
+		require.Zero(t, logger.countMatching("was unusable"), "the real store's batched run must be accepted as-is, not routed through walkParentChain")
+		require.Equal(t, 1, logger.countMatching("flooring candidate time"), "the floor must still engage, so this test cannot pass by never reaching the median at all")
 	})
 }
 
@@ -345,6 +383,56 @@ func TestCandidateTimeFallback(t *testing.T) {
 		mockClient.AssertNumberOfCalls(t, "GetBlockHeaders", 1)
 	})
 
+	t.Run("concurrent misses on one cold tip fetch, warn and occupy a slot once", func(t *testing.T) {
+		// The ordinary state on a cold tip: neither GetMiningCandidate entry point
+		// takes a lock and every miner polls several times a second, so the
+		// check-then-compute-then-store sequence is entered concurrently. Without
+		// single-flighting, each racer fetches, each warns, and the round-robin
+		// slot has no per-parent affinity so the same parent lands in both slots —
+		// evicting the other candidate path's entry and making MinCandidateTime
+		// report no floor for a live tip.
+		const racers = 8
+
+		logger := &warnCountingLogger{}
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+
+		assembler := &BlockAssembler{logger: logger, blockchainClient: mockClient}
+
+		start := make(chan struct{})
+
+		var wg sync.WaitGroup
+
+		for i := 0; i < racers; i++ {
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+				<-start
+
+				got, err := assembler.candidateTime(t.Context(), tip)
+				require.NoError(t, err)
+				require.Equal(t, wantFloor, got)
+			}()
+		}
+
+		close(start)
+		wg.Wait()
+
+		mockClient.AssertNumberOfCalls(t, "GetBlockHeaders", 1)
+		require.Equal(t, int32(1), logger.warns.Load(), "a cold tip must warn once however many polls race")
+
+		occupied := 0
+
+		for i := range assembler.mtpFloorMemo {
+			if entry := assembler.mtpFloorMemo[i].Load(); entry != nil && entry.parent.IsEqual(tip.Hash()) {
+				occupied++
+			}
+		}
+
+		require.Equal(t, 1, occupied, "one parent must occupy at most one slot, or it evicts the other candidate path's entry")
+	})
+
 	t.Run("both candidate paths' parents stay memoized together", func(t *testing.T) {
 		// The busy branch keys on the blockchain service's tip while the main
 		// path keys on the subtree processor's precomputed parent, so a
@@ -436,6 +524,11 @@ func TestCandidateTimeFallback(t *testing.T) {
 // assembly. Flooring regardless would therefore turn every solution found into
 // a full assembler reset, so candidateTime must fail the poll instead.
 func TestCandidateTimeTwoHourCeiling(t *testing.T) {
+	// The fail-closed branch increments a counter, and these subtests build the
+	// assembler directly rather than through New(), which is what registers the
+	// package's metrics in production.
+	initPrometheusMetrics()
+
 	// Stamped five hours ahead: the floor lands ~3h above the ceiling.
 	baseTime := uint32(time.Now().Add(5 * time.Hour).Unix())
 	headers := linkedHeaders(t, 11, baseTime)
@@ -458,6 +551,32 @@ func TestCandidateTimeTwoHourCeiling(t *testing.T) {
 		_, err := newAssembler(false).candidateTime(t.Context(), tip)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "two-hour future bound")
+	})
+
+	t.Run("reports the stopped block production once per tip", func(t *testing.T) {
+		// This branch is the only one that takes mining output to zero, and the
+		// error it returns is never logged locally — GetMiningCandidate propagates
+		// it and the gRPC handler wraps it without a log line. So it has to log
+		// here, and latched, because every poll takes this branch for as long as
+		// the clock stays out.
+		logger := &warnCountingLogger{}
+		mockClient := &blockchain.Mock{}
+		mockClient.On("GetBlockHeaders", mock.Anything, tip.Hash(), mock.Anything).Return(headers, []*model.BlockHeaderMeta{}, nil)
+
+		assembler := &BlockAssembler{
+			logger:           logger,
+			blockchainClient: mockClient,
+			settings: &settings.Settings{
+				ChainCfgParams: &chaincfg.Params{GenerateSupported: false},
+			},
+		}
+
+		for i := 0; i < 4; i++ {
+			_, err := assembler.candidateTime(t.Context(), tip)
+			require.Error(t, err)
+		}
+
+		require.Equal(t, int32(1), logger.errs.Load(), "the operator must be told once, not on every poll")
 	})
 
 	t.Run("serves the wall clock on chains where the median rule is advisory", func(t *testing.T) {
@@ -535,6 +654,52 @@ func TestCandidateTimeTwoHourCeiling(t *testing.T) {
 	})
 }
 
+// TestPlaceMtpFloor pins the one-slot-per-parent invariant directly on the
+// helper. Single-flighting the miss already prevents two concurrent computations
+// of the same parent from reaching here, so the reuse branch is defence against
+// a future change to that flighting rather than a live path — which is exactly
+// why the invariant is worth stating in a test rather than left implicit. If a
+// parent could hold both slots it would evict the other candidate path's entry,
+// and MinCandidateTime would report no floor for a live tip.
+func TestPlaceMtpFloor(t *testing.T) {
+	parentA := chainhash.Hash{1}
+	parentB := chainhash.Hash{2}
+
+	assembler := &BlockAssembler{logger: ulogger.TestLogger{}}
+
+	occupiedBy := func(parent chainhash.Hash) int {
+		count := 0
+
+		for i := range assembler.mtpFloorMemo {
+			if entry := assembler.mtpFloorMemo[i].Load(); entry != nil && entry.parent.IsEqual(&parent) {
+				count++
+			}
+		}
+
+		return count
+	}
+
+	assembler.placeMtpFloor(&mtpFloorEntry{parent: parentA, minTime: 100})
+	assembler.placeMtpFloor(&mtpFloorEntry{parent: parentB, minTime: 200})
+
+	require.Equal(t, 1, occupiedBy(parentA))
+	require.Equal(t, 1, occupiedBy(parentB))
+
+	// Re-placing an existing parent must reuse its slot, not consume the other's.
+	assembler.placeMtpFloor(&mtpFloorEntry{parent: parentA, minTime: 300})
+
+	require.Equal(t, 1, occupiedBy(parentA), "a parent must never occupy both slots")
+	require.Equal(t, 1, occupiedBy(parentB), "re-placing one parent must not evict the other")
+
+	got, ok := assembler.MinCandidateTime(&parentA)
+	require.True(t, ok)
+	require.Equal(t, int64(300), got, "the slot must carry the newest entry")
+
+	got, ok = assembler.MinCandidateTime(&parentB)
+	require.True(t, ok)
+	require.Equal(t, int64(200), got)
+}
+
 // TestMinCandidateTime covers the memo read the submit path uses to reject a
 // miner-supplied nTime below the consensus floor.
 func TestMinCandidateTime(t *testing.T) {
@@ -578,14 +743,44 @@ type warnCountingLogger struct {
 	ulogger.TestLogger
 	warns atomic.Int32
 	errs  atomic.Int32
+
+	mu      sync.Mutex
+	formats []string
 }
 
 func (l *warnCountingLogger) Warnf(format string, args ...interface{}) {
 	l.warns.Add(1)
+	l.record(format)
 }
 
 func (l *warnCountingLogger) Errorf(format string, args ...interface{}) {
 	l.errs.Add(1)
+	l.record(format)
+}
+
+func (l *warnCountingLogger) record(format string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.formats = append(l.formats, format)
+}
+
+// countMatching returns how many recorded lines contain substr. Counting a
+// specific line is more durable than counting all of them when the assembler
+// under test may log for unrelated reasons.
+func (l *warnCountingLogger) countMatching(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	count := 0
+
+	for _, f := range l.formats {
+		if strings.Contains(f, substr) {
+			count++
+		}
+	}
+
+	return count
 }
 
 // TestMiningCandidateTimeFlooredAtMedianTimePast drives the public

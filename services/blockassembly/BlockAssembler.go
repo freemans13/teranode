@@ -30,6 +30,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/gocore"
+	"golang.org/x/sync/singleflight"
 )
 
 // State represents the current operational state of the BlockAssembler.
@@ -134,6 +135,11 @@ type BlockAssembler struct {
 	// logFloorLookupFailure). Separate from mtpFloorMemo because those paths
 	// produce no entry to hang a flag on
 	mtpFloorFailureLoggedTip atomic.Pointer[chainhash.Hash]
+
+	// mtpFloorFlight collapses concurrent memo misses on the same parent into one
+	// lookup, so a cold tip polled by several miners at once fetches, warns and
+	// occupies a slot exactly once (see mtpFloor)
+	mtpFloorFlight singleflight.Group
 
 	// stateChangeCh notifies listeners of state changes
 	// Protected by stateChangeMu to prevent race conditions

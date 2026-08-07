@@ -463,6 +463,25 @@ func TestSubmitMiningSolution_NoCurrentBlock(t *testing.T) {
 	require.Contains(t, err.Error(), "no current best block")
 }
 
+// requirePastFloorGuard asserts that a submission got past the median-time-past
+// guard, and does so durably.
+//
+// The accept direction cannot assert success: these fixtures carry no real
+// subtrees or nBits, so the submission always dies further down. Asserting only
+// "the error does not mention the floor" would pass just as happily if a future
+// fixture change made it die *above* the guard, or stop erroring at all — the
+// assertion would be vacuous and nothing would say so. Pinning the specific
+// downstream failure keeps it honest: if the fixture stops dying exactly there,
+// this fails loudly and whoever changed it re-checks that the guard is still on
+// the path being exercised.
+func requirePastFloorGuard(t *testing.T, err error) {
+	t.Helper()
+
+	require.Error(t, err, "fixture is expected to fail below the guard; if it now succeeds, the guard may no longer be on this path")
+	require.NotContains(t, err.Error(), "median-time-past floor", "the floor guard must not be what stopped this submission")
+	require.Contains(t, err.Error(), "failed to convert bits", "expected the known downstream failure; a different one means the path above the guard changed and this assertion may no longer prove anything")
+}
+
 // TestSubmitMiningSolution_NTimeFloor pins the submit-path guard against a
 // miner-supplied timestamp below the parent chain's median-time-past. The
 // block.Valid call further down passes no currentChain, so it skips the
@@ -548,10 +567,7 @@ func TestSubmitMiningSolution_NTimeFloor(t *testing.T) {
 		s, idBytes := setup(t)
 		at := uint32(floor)
 
-		err := submit(t, s, idBytes, &at)
-		if err != nil {
-			require.NotContains(t, err.Error(), "median-time-past floor")
-		}
+		requirePastFloorGuard(t, submit(t, s, idBytes, &at))
 	})
 
 	t.Run("enforces nothing when no floor is known for the parent", func(t *testing.T) {
@@ -560,10 +576,7 @@ func TestSubmitMiningSolution_NTimeFloor(t *testing.T) {
 
 		below := uint32(floor - 1)
 
-		err := submit(t, s, idBytes, &below)
-		if err != nil {
-			require.NotContains(t, err.Error(), "median-time-past floor")
-		}
+		requirePastFloorGuard(t, submit(t, s, idBytes, &below))
 	})
 }
 
@@ -633,9 +646,7 @@ func TestSubmitMiningSolution_NTimeFloorAdvisoryChain(t *testing.T) {
 		SubmitMiningSolutionRequest: &blockassembly_api.SubmitMiningSolutionRequest{Id: idBytes, Time: &nTime},
 	})
 
-	if err != nil {
-		require.NotContains(t, err.Error(), "median-time-past floor", "the guard must not refuse the candidate the carve-out served")
-	}
+	requirePastFloorGuard(t, err)
 }
 
 // TestWaitForBestBlockHeaderUpdate_ToleratesNilCurrentBlock verifies that the polling
