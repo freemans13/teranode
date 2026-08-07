@@ -914,10 +914,17 @@ func TestStartupCoinbaseDivergenceCheck_StopsScanningAfterARefusal(t *testing.T)
 	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 1
+	// CoinbaseRecoveryMaxGapBlocks does double duty: it caps the walk-back AND
+	// sets the startup scan window. A cap of 1 would refuse as intended but also
+	// give the loop a window of one height, so the loop body would run exactly
+	// once whatever the refusal did -- deleting the refusal return would leave
+	// this test green. Two heights is the smallest window that lets the scan
+	// reach a second missing height, so escalated == 1 can only hold because the
+	// refusal stopped it.
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 2
 
-	// Heights 2..6 all missing above a good floor at 1. With a gap cap of 1 the
+	// Heights 2..6 all missing above a good floor at 1. With a gap cap of 2 the
 	// walk-back refuses, and it would refuse identically from 5, 4, 3 and 2.
 	headers := buildCanonicalChain(ctx, t, items, 6)
 	seedCoinbase(ctx, t, items, headers, 1)
