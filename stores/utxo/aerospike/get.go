@@ -839,7 +839,18 @@ NEXT_BATCH_RECORD:
 						items[idx].Data.TxInpoints, err = s.GetTxInpointsFromExternalStore(ctx, items[idx].Hash)
 					}
 					if err != nil {
-						items[idx].Err = errors.NewTxInvalidError("could not process tx inpoints", err)
+						// Preserve a storage fault instead of laundering it into a
+						// consensus violation. errors.Is walks the whole wrap chain and
+						// every downstream switch tests ErrTxInvalid first, so wrapping a
+						// local blob-store failure in TxInvalid presents this node's own
+						// bad disk as a proven invalid transaction — the misclassification
+						// getExternalTransaction was fixed for. Only a genuine failure to
+						// build inpoints from well-formed data is a transaction fault.
+						if errors.Is(err, errors.ErrStorageError) {
+							items[idx].Err = errors.NewStorageError("could not process tx inpoints", err)
+						} else {
+							items[idx].Err = errors.NewTxInvalidError("could not process tx inpoints", err)
+						}
 
 						continue NEXT_BATCH_RECORD // because there was an error processing the tx inpoints.
 					}
@@ -1657,8 +1668,10 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 	// Stream parse from external store rather than reading the whole blob into a
 	// byte slice first, so the raw bytes are not held alongside the parsed tx for
 	// the duration of the parse. Note that the FileTypeTx branch below transiently
-	// re-creates a buffer of that size when it re-hashes the parsed tx, so the
-	// peak-memory saving does not hold for that branch.
+	// re-creates a buffer the size of the standard serialization when it re-hashes
+	// the parsed tx (TxIDChainHash goes via tx.Bytes(), which is smaller than the
+	// extended form the blob is stored in), so the peak-memory saving does not
+	// hold for that branch.
 	reader, err := s.externalStore.GetIoReader(ctx, previousTxHash[:], fileType)
 	if err != nil {
 		// Try to get the data from an output file instead
@@ -1716,13 +1729,15 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 		// positive evidence this node's stored bytes are wrong.
 		//
 		// FileTypeTx always holds the whole transaction body under its own txid,
-		// so that txid is reproducible. Three sibling paths read the same data and
-		// are deliberately NOT guarded, because none of them can be re-hashed: the
-		// FileTypeOutputs branch below reconstructs outputs only, with no inputs,
-		// version or locktime; the inline-bins path nils out spent outputs; and
-		// GetTxInpointsFromExternalStore parses input references only, by design
-		// never materialising scripts or outputs. Covering those needs a different
-		// mechanism.
+		// so that txid is reproducible. No other read path in this file can be
+		// re-hashed: the FileTypeOutputs branch below reconstructs outputs only,
+		// with no inputs, version or locktime, and so gets the weaker
+		// self-declared-txid check documented there; the inline-bins path nils out
+		// spent outputs; and GetTxInpointsFromExternalStore parses input references
+		// only, by design never materialising scripts or outputs. (The pruner reads
+		// FileTypeTx too, in pruner_service.go, but only to collect outpoints for
+		// deletion bookkeeping — it never feeds consensus.) Covering those
+		// cryptographically needs a different mechanism.
 		if actual := tx.TxIDChainHash(); !actual.Equal(previousTxHash) {
 			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external tx does not hash to the key it was stored under (got %s) — stale, rotted or mis-keyed blob", previousTxHash.String(), actual.String())
 		}
@@ -1733,6 +1748,20 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 		uw, err := utxopersister.NewUTXOWrapperFromReader(ctx, bufferedReader)
 		if err != nil {
 			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] could not read outputs from reader", previousTxHash.String(), err)
+		}
+
+		// This blob cannot be re-hashed — it holds outputs only, so there is no
+		// body to hash back to a txid — but it does carry a self-declared txid,
+		// written from the same hash it is keyed under (see
+		// StorePartialTransactionExternally). Comparing it is not cryptographic
+		// and a rotted blob could carry a matching txid with corrupt outputs, so
+		// this is strictly weaker than the FileTypeTx re-hash above. It does
+		// however catch the stale-file and mis-keyed cases — the pruner's
+		// delete-then-write race being the motivating one — which would otherwise
+		// surface further downstream as "previous tx has no output at index N",
+		// i.e. a consensus violation manufactured from a local fault.
+		if !uw.TxID.Equal(previousTxHash) {
+			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external outputs blob declares a different txid (got %s) — stale, rotted or mis-keyed blob", previousTxHash.String(), uw.TxID.String())
 		}
 
 		utxos := utxopersister.PadUTXOsWithNil(uw.UTXOs)
@@ -1775,9 +1804,13 @@ func (s *Store) GetTxInpointsFromExternalStore(ctx context.Context, txHash chain
 	defer reader.Close()
 
 	// Parse only input references from stream, skipping all scripts and outputs
+	// A storage fault, not a transaction fault, for the same reason as the parse
+	// failures in getExternalTransaction above: this blob was written from our own
+	// bytes, so bytes that no longer parse mean this node's stored copy is torn or
+	// truncated — never evidence about the block or the peer that served it.
 	inputs, err := txparse.ParseInputReferencesFromExtendedTx(reader)
 	if err != nil {
-		return subtree.TxInpoints{}, errors.NewTxInvalidError("[GetTxInpointsFromExternalStore][%s] could not parse input references", txHash.String(), err)
+		return subtree.TxInpoints{}, errors.NewStorageError("[GetTxInpointsFromExternalStore][%s] could not parse input references", txHash.String(), err)
 	}
 
 	s.logger.Debugf("[GetTxInpointsFromExternalStore] Streamed and parsed %d input references from external tx %s, skipped all scripts", len(inputs), txHash.String())

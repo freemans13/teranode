@@ -141,11 +141,41 @@ func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
 		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
 	})
 
+	t.Run("an outputs blob declaring another txid is a storage fault", func(t *testing.T) {
+		// The outputs blob cannot be re-hashed, but it does carry a self-declared
+		// txid written from the key it is stored under. A stale file from the
+		// pruner's delete-then-write race passes every byte-level check and would
+		// otherwise surface downstream as "previous tx has no output at index N" —
+		// a consensus violation manufactured from a local fault. Weaker than the
+		// re-hash (a matching txid does not vouch for the outputs), but it catches
+		// the mis-keyed and stale cases for free.
+		s := newStore(t)
+
+		wrapper := &utxopersister.UTXOWrapper{
+			TxID:   *other.TxIDChainHash(),
+			Height: 1,
+			UTXOs: []*utxopersister.UTXO{{
+				Index:  0,
+				Value:  999999,
+				Script: *other.Outputs[0].LockingScript,
+			}},
+		}
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeOutputs, wrapper.Bytes()))
+
+		_, err := s.getExternalTransaction(ctx, parentHash)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "declares a different txid")
+		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
+		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
+	})
+
 	t.Run("a legitimate outputs-only blob is still readable and deliberately not re-hashed", func(t *testing.T) {
 		// Pins the carve-out. This path reconstructs outputs only — no inputs, no
 		// version, no locktime — so the result cannot hash back to the key it was
 		// fetched under. Extending the re-hash to cover it would therefore reject
-		// perfectly good reads, which is exactly why it is left unguarded.
+		// perfectly good reads, which is exactly why it is left unguarded. The
+		// self-declared-txid check above is the weaker substitute, and must not
+		// reject a legitimate read like this one.
 		s := newStore(t)
 
 		wrapper := &utxopersister.UTXOWrapper{
@@ -196,5 +226,57 @@ func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
 		got, err = s.GetTxFromExternalStore(ctx, parentHash)
 		require.NoError(t, err, "successful read must be retained by a live cache")
 		require.Equal(t, parentHash, *got.TxIDChainHash())
+	})
+}
+
+// TestGetTxInpointsFromExternalStoreClassifiesParseFailureAsStorage covers the
+// sibling read path in this file, which had the same misclassification the
+// re-hash change fixed above: a blob that fails to parse was reported as
+// ErrTxInvalid, i.e. as a proven consensus violation, even though the bytes were
+// written from our own transaction and can only be wrong because this node's
+// disk is.
+//
+// The wrap at the BatchDecorate call site matters as much as the class here.
+// errors.Is walks the whole chain and every downstream switch tests ErrTxInvalid
+// first, so re-wrapping a storage fault in TxInvalid there would launder it
+// straight back into a consensus violation. That call site needs an Aerospike
+// batch to reach, so it is covered by the classification at this level plus the
+// explicit branch in BatchDecorate rather than by a hermetic test.
+func TestGetTxInpointsFromExternalStoreClassifiesParseFailureAsStorage(t *testing.T) {
+	ctx := context.Background()
+
+	parent := buildParentTx(t, 1000, 0xaa)
+	parentHash := *parent.TxIDChainHash()
+
+	t.Run("a well-formed blob still parses", func(t *testing.T) {
+		s := &Store{logger: ulogger.TestLogger{}, externalStore: memory.New()}
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, parent.ExtendedBytes()))
+
+		inpoints, err := s.GetTxInpointsFromExternalStore(ctx, parentHash)
+		require.NoError(t, err)
+		require.Len(t, inpoints.ParentTxHashes, 1)
+	})
+
+	t.Run("a truncated blob is a storage fault, not a consensus violation", func(t *testing.T) {
+		s := &Store{logger: ulogger.TestLogger{}, externalStore: memory.New()}
+
+		good := parent.ExtendedBytes()
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, good[:len(good)/2]))
+
+		_, err := s.GetTxInpointsFromExternalStore(ctx, parentHash)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
+		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
+	})
+
+	t.Run("a missing blob is a storage fault", func(t *testing.T) {
+		// Pre-existing behaviour, pinned so the two failure modes of this function
+		// stay classified alike.
+		s := &Store{logger: ulogger.TestLogger{}, externalStore: memory.New()}
+
+		_, err := s.GetTxInpointsFromExternalStore(ctx, parentHash)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
 	})
 }
