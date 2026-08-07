@@ -226,14 +226,14 @@ func (b *BlockAssembler) computeMtpFloor(ctx context.Context, parentHeader *mode
 	// A transport failure and an unusable result call for opposite responses, so
 	// the fetch and the verification are separate steps. If the call itself fails
 	// the blockchain service is unhealthy, and walking it once per header would
-	// add MedianTimeBlocks more sequential reads without adding any information —
+	// add MedianTimeBlocks-1 more sequential reads without adding any information —
 	// exactly the amplification to avoid, since a saturated service is what caused
 	// the failure. Only a result that arrives but cannot be trusted (mis-anchored,
 	// unlinked, or short) is worth the walk, because that is the reorg race the
 	// walk exists to recover from and its per-hash reads cannot hit it.
 	headers, fetchErr := b.fetchParentChainHeaders(ctx, parentHash)
 	if fetchErr != nil {
-		b.logFloorLookupFailure(parentHash, "the blockchain service did not answer the batched header fetch (%v); not attempting the %d-read parent-chain walk against a service that is already failing", fetchErr, blockchain.MedianTimeBlocks)
+		b.logFloorLookupFailure(parentHash, "the blockchain service did not answer the batched header fetch (%v); not attempting the %d-read parent-chain walk against a service that is already failing", fetchErr, blockchain.MedianTimeBlocks-1)
 
 		return nil
 	}
