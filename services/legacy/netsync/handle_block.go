@@ -983,9 +983,10 @@ func (sm *SyncManager) candidateParentMedianTimeForBlock(ctx context.Context, pa
 // treated as a hard error. Walking off the BEGINNING of the chain is not one of
 // those cases: the loop breaks at genesis, because on teratestnet, tstn and stn
 // CSVHeight is 0, so a candidate can legitimately sit below the first `depth`
-// blocks and a genesis-terminated run is the correct short window there. Tolerating short returns would silently produce
-// an incomplete MTP on a transient cache miss mid-chain; raising loudly
-// instead forces the caller to surface the underlying issue.
+// blocks and a genesis-terminated run is the correct short window there.
+// Tolerating other short returns would silently produce an incomplete MTP on a
+// transient cache miss mid-chain; raising loudly instead forces the caller to
+// surface the underlying issue.
 func (sm *SyncManager) walkParentChain(ctx context.Context, startHash *chainhash.Hash, depth uint64) ([]*model.BlockHeader, error) {
 	headers := make([]*model.BlockHeader, 0, depth)
 	cur := startHash

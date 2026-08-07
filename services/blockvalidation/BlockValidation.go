@@ -1982,7 +1982,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				}
 			}()
 		} else {
-			// get all 100 previous block headers on the main chain
+			// get all X previous block headers on the main chain, 100 is the default
 			u.logger.Infof(logValidateBlockGetBlockHeaders, block.Header.Hash().String())
 
 			blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, u.settings.BlockValidation.PreviousBlockHeaderCount)
