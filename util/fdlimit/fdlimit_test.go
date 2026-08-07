@@ -18,11 +18,21 @@ func TestEnsureReportsABudgetRatherThanRefusing(t *testing.T) {
 	_, hard, err := get()
 	require.NoError(t, err, "this platform should expose RLIMIT_NOFILE")
 
-	// Far beyond anything the OS will grant.
-	budget, _, err := Ensure(hard + 1_000_000)
+	// Far beyond anything the OS will grant. Where the hard limit is already
+	// RLIM_INFINITY (root in a container, LimitNOFILE=infinity), adding to it
+	// wraps to a small number that the OS would happily grant, which would both
+	// stop testing the unreachable case and fail the comparison below — so ask
+	// for the hard limit itself, which is still more than can be handed out once
+	// the headroom is reserved.
+	request := hard
+	if hard <= math.MaxUint64-1_000_000 {
+		request = hard + 1_000_000
+	}
+
+	budget, _, err := Ensure(request)
 	require.NoError(t, err, "an unreachable budget must not be an error")
 	require.Greater(t, budget, uint64(0), "a usable budget must still be reported")
-	require.Less(t, budget, hard+1_000_000, "the budget must reflect reality, not the request")
+	require.Less(t, budget, request, "the budget must reflect reality, not the request")
 }
 
 // TestEnsureReservesHeadroom pins that the reported budget always leaves

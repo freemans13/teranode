@@ -263,6 +263,15 @@ func init() {
 	// to maintain the same system performance characteristics.
 	readSemaphore = semaphore.NewWeighted(defaultReadLimit)
 	writeSemaphore = semaphore.NewWeighted(defaultWriteLimit)
+
+	// Keep the reported limits in step with the semaphores that actually exist.
+	// InitSemaphores overwrites these, but it may never be called (tests, other
+	// binaries) or may return early on a validation error, and in both cases the
+	// defaults above are what bounds file operations. Leaving these at zero would
+	// have AppliedSemaphoreLimits report a concurrency that is not in force
+	// anywhere.
+	appliedReadLimit = defaultReadLimit
+	appliedWriteLimit = defaultWriteLimit
 }
 
 // InitSemaphores initializes the read and write semaphores with configured limits.
@@ -1595,7 +1604,12 @@ var (
 
 // AppliedSemaphoreLimits returns the file-operation concurrency actually in
 // force, and whether it was clamped below the configured values to fit the
-// operating system's open-file limit.
+// operating system's open-file limit. Before InitSemaphores runs it reports the
+// package defaults, which are what bounds file operations until then.
+//
+// These are plain globals, written once by InitSemaphores. Call this after
+// InitSemaphores has returned on the same goroutine, as startup does; reading it
+// from a goroutine racing InitSemaphores is a data race.
 func AppliedSemaphoreLimits() (readLimit, writeLimit int, clamped bool) {
 	return appliedReadLimit, appliedWriteLimit, appliedClamp
 }
@@ -1603,13 +1617,22 @@ func AppliedSemaphoreLimits() (readLimit, writeLimit int, clamped bool) {
 // clampSemaphoreLimits scales read and write concurrency down proportionally
 // so their total fits the descriptors the OS actually allows, keeping at least
 // one of each so the store remains functional however small the budget.
+//
+// The floor wins over the budget in exactly one case: a budget of one still
+// yields one read and one write, borrowing a single descriptor from the 512 that
+// fdlimit reserves. Every other budget is met exactly, with the truncation
+// remainder going to writes.
+//
+// The caller must pass a budget below readLimit+writeLimit; there is nothing to
+// clamp otherwise, and it is that bound which keeps the arithmetic below inside
+// an int.
 func clampSemaphoreLimits(readLimit, writeLimit int, budget uint64) (int, int) {
 	total := readLimit + writeLimit
 	if total <= 0 || budget == 0 {
 		return MinSemaphoreLimit, MinSemaphoreLimit
 	}
 
-	available := int(budget) // nolint:gosec // budget < total, which is an int
+	available := int(budget) // nolint:gosec // caller precondition: budget < total, which is an int
 
 	scaledRead := readLimit * available / total
 	if scaledRead < MinSemaphoreLimit {

@@ -62,9 +62,14 @@ func RunDaemon(progname, version, commit string) {
 
 	// Report the limits actually in force: they may have been clamped below the
 	// configured values to fit the operating system's open-file limit.
+	//
+	// A clamp means the HARD limit is the binding constraint, not the soft one:
+	// InitSemaphores has already raised the soft limit as far as the hard limit
+	// allows, so telling the operator to raise the soft limit alone would send
+	// them to change a number that is already at its ceiling.
 	appliedRead, appliedWrite, clamped := file.AppliedSemaphoreLimits()
 	if clamped {
-		fmt.Printf("File store semaphores clamped to the open-file limit: read=%d, write=%d (configured read=%d, write=%d) — raise the limit with ulimit -n / LimitNOFILE to use the configured concurrency\n",
+		fmt.Printf("File store semaphores clamped to the open-file limit: read=%d, write=%d (configured read=%d, write=%d) — raise the hard limit with ulimit -Hn or systemd LimitNOFILE to use the configured concurrency\n",
 			appliedRead, appliedWrite, readLimit, writeLimit)
 	} else {
 		fmt.Printf("File store semaphores initialized: read=%d, write=%d\n", appliedRead, appliedWrite)
