@@ -14,8 +14,13 @@
 // blobs are being stored in rapid succession. By batching these operations, it significantly
 // reduces the number of actual storage operations performed on the underlying store.
 //
-// Note that the batcher only supports write operations (Set). Read operations (Get, Exists)
-// and metadata operations (SetDAH) are passed through to the underlying store.
+// Note that the batcher only supports write operations (Set, SetFromReader). Read and query
+// operations (Get, GetIoReader, Exists), deletion (Del) and metadata operations (SetDAH) are
+// NOT passed through to the underlying store: they return an unsupported-operation error.
+// SetCurrentBlockHeight is a no-op, so a wrapped store never sees block-height updates and
+// its Delete-At-Height bookkeeping stops advancing. Nothing in this repository reads back the
+// batch-data / batch-keys files this package writes, so a batched store is write-only in the
+// strongest sense: the data goes in and there is no supported way to get it out again.
 package batcher
 
 import (
