@@ -63,8 +63,13 @@ func CanonicalTxSize(tx *bt.Tx) int {
 // non-minimal payload parses to transactions with canonical txids. Every
 // hash-based check downstream therefore passes, and the caller stores the
 // canonicalised bytes — silently normalising the payload and discarding the
-// evidence, after which nothing can tell that this node accepted bytes every
-// SV Node rejects at parse.
+// evidence, after which nothing can tell that this node accepted bytes SV Node
+// would reject at parse. The parse is the only place that can still see it.
+//
+// This is a fail-closed guard on malformed peer input, not a fleet-split fix:
+// subtree data is a Teranode-internal format, a receiving node relays the
+// canonical form, so SV Node never sees these bytes by this route. The legacy
+// p2p path it does share is already covered by go-wire's minimality check.
 //
 // The subtree-data parsers do not expose per-transaction byte counts, so the
 // check is made over the whole payload: the bytes the parser consumed must

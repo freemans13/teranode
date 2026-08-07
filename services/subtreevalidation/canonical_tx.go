@@ -14,13 +14,21 @@ import (
 // its minimal form — writing the value 1 as `fd 01 00` instead of `01` is a
 // hard parse error there. go-bt's varint reader has no such check: it accepts
 // the over-long form and then RE-SERIALIZES it canonically, so the txid
-// Teranode computes is the canonical one. That combination is what makes this
-// a consensus hazard rather than a curiosity: an attacker ships non-minimal
-// bytes while committing the canonical txids in the merkle tree, so
-// Teranode's merkle check passes and the block is accepted, while every SV
-// Node fleet member rejects the same block at parse time. Neither side logs
-// an error; the fleets simply disagree about which chain is real, and because
-// the block is already on disk a restart does not clear it.
+// Teranode computes is the canonical one.
+//
+// That re-serialization is the whole problem, and it cuts both ways. Because
+// the txid is unchanged, so is the merkle root — every hash-based check
+// downstream passes, precisely because canonicalization defeats them, so the
+// parse is the only place that can still see the over-long encoding. But by
+// the same token a non-minimal prefix says nothing about whether the block is
+// valid: the same subtree from an honest peer parses to identical transactions.
+// So the point of this check is NOT to stop a fleet split — subtree data is a
+// Teranode-internal format, a receiving node relays the canonical form, and SV
+// Node never sees these bytes by this route (the legacy p2p path it does share
+// is already covered by go-wire's minimality check). The point is the plainer
+// one: fail closed on malformed peer input instead of normalising it, storing
+// the canonicalized bytes, and discarding the evidence that this node accepted
+// something SV Node would reject at parse.
 //
 // The check is a length comparison, not a re-parse: any non-minimal prefix
 // makes the consumed wire bytes longer than the canonical serialization, so
