@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/settings"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
@@ -905,6 +906,119 @@ func TestStartupCoinbaseDivergenceCheck_SkippedWhenTipIsNotCanonical(t *testing.
 	require.Greater(t,
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
 		float64(0), "the same chain is detected once block assembly is on the canonical tip")
+}
+
+// interposedBlockchainClient wraps the real sqlitememory-backed blockchain
+// client and perturbs GetBlockByHeight for specific heights, so tests can
+// exercise the startup scan's reaction to a transient failure or to a height
+// the canonical chain has no block for.
+//
+// This is not a mocked blockchain client in the sense AGENTS.md rules out: the
+// real client and store answer every call that is not deliberately perturbed,
+// and the chain semantics under test stay real. It exists because neither a
+// transient store blip nor a hole in the canonical chain can be produced from
+// a healthy sqlitememory store.
+type interposedBlockchainClient struct {
+	blockchain.ClientI
+
+	// failuresLeft is decremented on each intercepted call; while positive the
+	// call returns a transient-looking error instead of reaching the real client.
+	failuresLeft int
+
+	// absentHeights always return a block-not-found error.
+	absentHeights map[uint32]bool
+}
+
+func (c *interposedBlockchainClient) GetBlockByHeight(ctx context.Context, height uint32) (*model.Block, error) {
+	if c.absentHeights[height] {
+		return nil, errors.NewBlockNotFoundError("no canonical block at height %d", height)
+	}
+
+	if c.failuresLeft > 0 {
+		c.failuresLeft--
+
+		return nil, errors.NewStorageError("transient blockchain-client blip at height %d", height)
+	}
+
+	return c.ClientI.GetBlockByHeight(ctx, height)
+}
+
+// TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip covers
+// the first half of ChiR9. The startup probe sat outside every retry loop, so
+// one transient failure abandoned the scan for the whole boot -- and because
+// detection is startup-only, that meant no detection at all until the next
+// restart.
+func TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// heights 1..4, with 3 missing its coinbase.
+	headers := buildCanonicalChain(ctx, t, items, 4)
+	for _, h := range []uint32{1, 2, 4} {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[3], 4)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	// One transient failure, which lands on the canonical-tip check that opens
+	// the scan. That check draws on the same budget as the probes, so it is not
+	// a single point of failure either.
+	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+		ClientI:      items.blockchainClient,
+		failuresLeft: 1,
+	}
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 3)
+	require.NoError(t, err)
+	require.True(t, present, "a single transient probe failure must not cost the whole scan")
+}
+
+// TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock covers the
+// second half of ChiR9. canonicalCoinbaseAt turns "the chain has no block at
+// this height" into a hard error, which used to abandon the scan. That says
+// nothing about the health of the client, so the scan must skip the height and
+// carry on checking the ones below it.
+func TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// heights 1..5, with 2 missing its coinbase, below a height (4) the
+	// interposer reports as having no canonical block.
+	headers := buildCanonicalChain(ctx, t, items, 5)
+	for _, h := range []uint32{1, 3, 5} {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[4], 5)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+		ClientI:       items.blockchainClient,
+		absentHeights: map[uint32]bool{4: true},
+	}
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 2)
+	require.NoError(t, err)
+	require.True(t, present, "a height the chain has no block for must not abandon the scan below it")
 }
 
 // TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned states the

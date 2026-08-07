@@ -48,6 +48,74 @@ func (b *BlockAssembler) canonicalCoinbaseAt(ctx context.Context, height uint32)
 	return true, blk, nil
 }
 
+// coinbaseRecoveryProbeRetries is the number of probe retries the startup scan
+// may spend in total, across every height it visits.
+//
+// It is a whole-scan budget rather than a per-height one on purpose. Detection
+// runs only at startup, so a single transient failure must not be allowed to
+// disable it for the entire boot -- but a store that flaps for the whole window
+// must not be allowed to add window * retries * backoff to boot time either.
+// Two retries caps the added latency at one second.
+const coinbaseRecoveryProbeRetries = 2
+
+// canonicalBlockAbsent reports whether err means the canonical chain has no
+// block at the probed height at all, as opposed to the client or store failing
+// to answer.
+//
+// This is worth separating because it is not a health signal: it says the
+// question was wrong, not that the answer is unavailable. It happens when block
+// assembly's persisted tip height sits above the canonical chain height, and
+// treating it like a store outage would abandon the whole scan on the very
+// first probe.
+func canonicalBlockAbsent(err error) bool {
+	return errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound)
+}
+
+// withProbeRetry runs a startup probe, retrying transient failures out of the
+// shared whole-scan budget.
+//
+// Without it a single transient store or blockchain-client failure abandons the
+// only coinbase-divergence detector for the whole boot -- and because the
+// incident this recovery exists for had a restart as its only repair
+// opportunity, losing the check to one blip is a poor trade when an attempt
+// budget is already available a level down.
+//
+// retriesLeft is decremented in place, so every probe in one scan draws on the
+// same budget. A missing canonical block is returned immediately without
+// spending any of it: retrying cannot conjure a block the chain does not have.
+func (b *BlockAssembler) withProbeRetry(ctx context.Context, height uint32, retriesLeft *int, probe func() error) error {
+	for {
+		err := probe()
+		if err == nil || canonicalBlockAbsent(err) || *retriesLeft <= 0 {
+			return err
+		}
+
+		*retriesLeft--
+
+		b.logger.Warnf("[coinbaseRecovery] startup probe at height %d failed, retrying (%d scan retries left): %v", height, *retriesLeft, err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(coinbaseRecoveryRetryBackoff):
+		}
+	}
+}
+
+// probeCanonicalCoinbase is canonicalCoinbaseAt with the shared retry budget
+// applied, discarding the canonical block the detection path has no use for.
+func (b *BlockAssembler) probeCanonicalCoinbase(ctx context.Context, height uint32, retriesLeft *int) (present bool, err error) {
+	err = b.withProbeRetry(ctx, height, retriesLeft, func() error {
+		var probeErr error
+
+		present, _, probeErr = b.canonicalCoinbaseAt(ctx, height)
+
+		return probeErr
+	})
+
+	return present, err
+}
+
 // coinbaseGapTooLargeError is the type of the errCoinbaseGapTooLarge sentinel.
 //
 // It is deliberately NOT built with errors.NewProcessingError. teranode's
@@ -467,6 +535,11 @@ attempts:
 // tip than the window stays invisible here; finding that cheaply is the job of
 // the runtime point-of-pain detector, which is deliberately future work.
 //
+// Every lookup the scan makes draws on one shared retry budget
+// (coinbaseRecoveryProbeRetries), so a transient blip costs a retry rather than
+// the whole boot's detection, while a store that flaps for the entire window
+// still cannot inflate boot time without bound.
+//
 // # Why it never fails Start
 //
 // This always returns nil. A recovery give-up is deliberately non-fatal:
@@ -500,7 +573,20 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 	// unproven floor and a MANUAL INTERVENTION line for something the ordinary
 	// reconcile handles on its own. Reorgs are shallow and rare on BSV, so this
 	// is unlikely; the point is to keep that alarm meaningful when it does fire.
-	tipBlk, tipErr := b.blockchainClient.GetBlockByHeight(ctx, height)
+	//
+	// This lookup draws on the same retry budget as the probes below, so it is
+	// not itself a single point of failure for the whole scan.
+	probeRetries := coinbaseRecoveryProbeRetries
+
+	var tipBlk *model.Block
+
+	tipErr := b.withProbeRetry(ctx, height, &probeRetries, func() error {
+		var err error
+
+		tipBlk, err = b.blockchainClient.GetBlockByHeight(ctx, height)
+
+		return err
+	})
 
 	switch {
 	case tipErr != nil:
@@ -535,13 +621,29 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 	}
 
 	for h, scanned := height, 0; h >= scanFloor && scanned < window; h, scanned = h-1, scanned+1 {
-		present, _, err := b.canonicalCoinbaseAt(ctx, h)
+		present, err := b.probeCanonicalCoinbase(ctx, h, &probeRetries)
 		if err != nil {
+			if canonicalBlockAbsent(err) {
+				// The canonical chain simply has no block at this height. Skip
+				// it rather than abandoning the scan: the heights below it are
+				// still worth checking, and this is the one "error" that says
+				// nothing at all about whether the client is healthy.
+				b.logger.Warnf("[coinbaseRecovery] startup: no canonical block at height %d (tip %d); skipping that height", h, height)
+
+				continue
+			}
+
 			// Non-fatal: log and continue booting; see the function-level
 			// comment above. Abandoning the whole scan (rather than skipping
-			// this height) is deliberate -- if the blockchain client or store
-			// cannot answer, the remaining probes will not either.
-			b.logger.Warnf("[coinbaseRecovery] startup divergence check failed at height %d (tip %d): %v", h, height, err)
+			// this height) is deliberate -- the probe has already spent its
+			// retry budget, so if the blockchain client or store still cannot
+			// answer, the remaining probes will not either.
+			//
+			// Errorf, not Warnf: detection is startup-only, so giving up here
+			// means the node runs with no coinbase-divergence check at all
+			// until the next restart. That lost coverage should be visible.
+			b.logger.Errorf("[coinbaseRecovery] startup divergence check abandoned at height %d (tip %d): %v; no coinbase-divergence detection will run until the next restart", h, height, err)
+
 			return nil
 		}
 
