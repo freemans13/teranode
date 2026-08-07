@@ -419,6 +419,97 @@ func TestScopeCoinbaseGap_SameChainScopesWithFloorOutOfTheWay(t *testing.T) {
 	require.Equal(t, []uint32{3, 4, 5}, gapHeights(gap))
 }
 
+// TestPruneReferenceHeight_TracksTheStoreNotBlockAssembly pins the input the
+// safety floor is measured against. The DAH pruner stamps delete-at heights
+// against the UTXO store's height, which follows the chain tip; block
+// assembly's own pointer lags it on any catch-up. Deriving the floor from the
+// lagging pointer would reach into heights the pruner may already have emptied.
+func TestPruneReferenceHeight_TracksTheStoreNotBlockAssembly(t *testing.T) {
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+
+	// Store ahead of block assembly: the store's height wins.
+	require.NoError(t, items.utxoStore.SetBlockHeight(5000))
+	require.Equal(t, uint32(5000), items.blockAssembler.pruneReferenceHeight(1000))
+
+	// Block assembly ahead of the store (or the store not yet initialised):
+	// block assembly's height is the lower bound and wins.
+	require.Equal(t, uint32(9000), items.blockAssembler.pruneReferenceHeight(9000))
+}
+
+// TestScopeCoinbaseGap_FloorFollowsStoreHeightWhenBlockAssemblyLags is the
+// behavioural half of the same point (ChiR5). Block assembly restarts a long
+// way behind the chain, so every height in its own tip window is old enough to
+// have been spent and pruned. Scoped against block assembly's pointer the walk
+// would happily collect those heights and hand them to the repair, which would
+// write already-spent coinbase outputs back into the UTXO set as unspent.
+// Scoped against the store's height the floor lands above the whole window, so
+// the walk collects nothing at all.
+//
+// It returns an empty gap rather than an unproven-floor error on purpose: a
+// lagging block assembler is an ordinary catch-up, and raising the
+// manual-intervention alarm on every restart during one would be crying wolf.
+func TestScopeCoinbaseGap_FloorFollowsStoreHeightWhenBlockAssemblyLags(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	// Maturity 3: from a block assembly tip of 6 the floor would be height 4,
+	// so heights 4, 5, 6 look probeable.
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(3))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	seedCoinbase(ctx, t, items, headers, 5) // floor would be proven at height 5
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+
+	// Control: with the store level with block assembly, height 6 scopes fine.
+	require.NoError(t, items.utxoStore.SetBlockHeight(6))
+
+	gap, err := items.blockAssembler.scopeCoinbaseGap(ctx, 6)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{6}, gapHeights(gap))
+
+	// Now the chain has moved on while block assembly is still at 6. Everything
+	// at or below height 6 is past maturity from the store's point of view, so
+	// no height in the window is provably unpruned.
+	require.NoError(t, items.utxoStore.SetBlockHeight(1000))
+
+	gap, err = items.blockAssembler.scopeCoinbaseGap(ctx, 6)
+	require.NoError(t, err)
+	require.Empty(t, gap, "no prunable height may be handed to the repair")
+}
+
+// TestStartupCoinbaseDivergenceCheck_SkippedWhenBlockAssemblyBelowFloor covers
+// the startup half of ChiR5: when the store height puts the whole scan window
+// below the maturity floor there is nothing safe to probe, so the scan must
+// record no detection at all rather than reporting pruned heights as diverged.
+func TestStartupCoinbaseDivergenceCheck_SkippedWhenBlockAssemblyBelowFloor(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(3))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// Nothing seeded: every height would look "missing" to a scan that ran.
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+	require.NoError(t, items.utxoStore.SetBlockHeight(1000))
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		"a window that is entirely prunable must not be reported as a divergence")
+}
+
 // TestCoinbaseRepairFloor covers the arithmetic of the safety floor directly,
 // including the short-chain case where every height down to 1 is still
 // immature and therefore safe to probe.

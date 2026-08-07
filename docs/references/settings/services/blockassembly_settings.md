@@ -104,6 +104,16 @@ can only mean "never created". Below it, the answer is unknowable from a lookup 
 so the walk stops rather than guessing. If a genuine divergence extends past that line,
 recovery escalates to an operator instead of repairing it.
 
+The `tip` in that subtraction is the chain tip as the UTXO store sees it, not block
+assembly's own position. The pruner marks outputs for deletion against the store's
+height, and block assembly's pointer can sit hundreds of blocks behind it during a
+normal catch-up. Measuring the floor from the lagging pointer would put the bottom of
+the window inside already-prunable territory, which is the exact mistake the floor
+exists to prevent, so the higher of the two heights is always used. The visible effect
+is that a block assembler well behind the chain scans a narrower window, and one behind
+by more than the maturity window scans nothing and logs that it skipped the check —
+correct, because at that distance nothing it could look at is provably unpruned.
+
 Detection coverage is consequently a bounded window, not the whole chain. A hole
 further below the tip than the smaller of `coinbaseRecoveryMaxGapBlocks` and the
 maturity window is not found at startup; detecting that cheaply during normal

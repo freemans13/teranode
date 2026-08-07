@@ -116,6 +116,10 @@ func isUnscopableCoinbaseGap(err error) bool {
 // Below that line the walk stops rather than guessing, which is why a
 // divergence deeper than the maturity window escalates to an operator instead
 // of being auto-repaired.
+//
+// tipHeight must be a prune reference height (see pruneReferenceHeight), not
+// block assembly's own tip: the floor is only sound if it is measured against
+// the highest height the pruner could already have acted on.
 func (b *BlockAssembler) coinbaseRepairFloor(tipHeight uint32) uint32 {
 	if b.settings == nil || b.settings.ChainCfgParams == nil {
 		return 1
@@ -129,6 +133,37 @@ func (b *BlockAssembler) coinbaseRepairFloor(tipHeight uint32) uint32 {
 	}
 
 	return tipHeight - maturity + 1
+}
+
+// pruneReferenceHeight returns the highest height the DAH pruner could already
+// have acted on, which is what coinbaseRepairFloor has to be measured against.
+//
+// The pruner does not work off block assembly's tip pointer. Delete-at heights
+// are stamped as the UTXO store's own height plus the retention window, and the
+// store's height is fed from the chain best height by the store factory's
+// blockchain subscription (stores/utxo/factory/utxo.go). Block assembly's
+// pointer routinely lags that -- handleCatchUp exists for exactly that case --
+// so deriving the floor from it would put the bottom of the scan window inside
+// prunable territory once the lag exceeded roughly CoinbaseMaturity plus the
+// retention window. Absence down there stops meaning "never created" and can
+// equally mean "created, matured, fully spent, pruned", which is precisely the
+// resurrection the floor exists to prevent.
+//
+// Taking the higher of the two can only raise the floor, never lower it, so the
+// worst case is a scan window narrower than strictly necessary -- the safe
+// direction. baHeight is kept as the lower bound so a store that has not yet
+// been given a height (or is absent altogether, as in the store-less test
+// paths) still yields a real floor rather than falling back to height 1.
+func (b *BlockAssembler) pruneReferenceHeight(baHeight uint32) uint32 {
+	if b.utxoStore == nil {
+		return baHeight
+	}
+
+	if storeHeight := b.utxoStore.GetBlockHeight(); storeHeight > baHeight {
+		return storeHeight
+	}
+
+	return baHeight
 }
 
 // scopeCoinbaseGap walks back from triggerHeight, collecting canonical
@@ -180,13 +215,25 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 	// triggerHeight, since it is the tip that determines what has had the
 	// chance to mature. triggerHeight is used as a lower bound on the tip so
 	// that a direct call with no persisted tip still gets a real floor rather
-	// than falling all the way back to height 1.
+	// than falling all the way back to height 1. pruneReferenceHeight then
+	// lifts it to the UTXO store's height when block assembly is lagging the
+	// chain, which is the height the pruner actually works off.
 	_, tipHeight := b.CurrentBlock()
 	if triggerHeight > tipHeight {
 		tipHeight = triggerHeight
 	}
 
-	safetyFloor := b.coinbaseRepairFloor(tipHeight)
+	safetyFloor := b.coinbaseRepairFloor(b.pruneReferenceHeight(tipHeight))
+	if safetyFloor > triggerHeight {
+		// Every height at or below the trigger is old enough to have been
+		// spent and pruned, so absence proves nothing down there and there is
+		// no safe repair set to build. Report "no gap" rather than an unproven
+		// floor: a block assembler lagging the chain would otherwise raise the
+		// manual-intervention alarm on every restart during a normal catch-up.
+		b.logger.Warnf("[coinbaseRecovery] not scoping a gap at height %d: the maturity floor is %d, so no height at or below the trigger is provably unpruned", triggerHeight, safetyFloor)
+
+		return nil, nil
+	}
 
 	var gap []*model.Block
 
@@ -375,13 +422,13 @@ attempts:
 // wedge the node on the eventual maturity spend.
 //
 // The window is the smaller of CoinbaseRecoveryMaxGapBlocks heights and the
-// coinbase-maturity window (see coinbaseRepairFloor). The first bound reuses
-// what the repair itself honours -- there is no point detecting a divergence
-// deeper than recovery will auto-repair. The second is a correctness bound:
-// below the maturity floor a missing coinbase may simply have been spent and
-// pruned, so probing there would report healthy blocks as diverged. Cost is
-// two store reads per height on a clean boot, and it short-circuits on the
-// first miss.
+// coinbase-maturity window (see coinbaseRepairFloor, measured against
+// pruneReferenceHeight). The first bound reuses what the repair itself honours
+// -- there is no point detecting a divergence deeper than recovery will
+// auto-repair. The second is a correctness bound: below the maturity floor a
+// missing coinbase may simply have been spent and pruned, so probing there
+// would report healthy blocks as diverged. Cost is two store reads per height
+// on a clean boot.
 //
 // This is a bounded window, not whole-chain coverage. A hole further below the
 // tip than the window stays invisible here; finding that cheaply is the job of
@@ -419,8 +466,17 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 	// Walk down from the tip, stopping at whichever bound bites first. The
 	// safety floor is never below height 1, which also keeps the walk off
 	// genesis: its coinbase is unspendable and never written to the UTXO
-	// store, so probing height 0 would always report "missing".
-	scanFloor := b.coinbaseRepairFloor(height)
+	// store, so probing height 0 would always report "missing". It is measured
+	// against the prune reference height rather than block assembly's own tip,
+	// so a lagging block assembler does not scan into already-prunable heights.
+	scanFloor := b.coinbaseRepairFloor(b.pruneReferenceHeight(height))
+	if scanFloor > height {
+		// Block assembly is far enough behind the chain that its whole tip
+		// window is already prunable, so no height here can be probed safely.
+		// Say so rather than silently checking nothing.
+		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: block assembly tip %d is below the maturity floor %d, so no height in the window is provably unpruned", height, scanFloor)
+		return nil
+	}
 
 	for h, scanned := height, 0; h >= scanFloor && scanned < window; h, scanned = h-1, scanned+1 {
 		present, _, err := b.canonicalCoinbaseAt(ctx, h)
