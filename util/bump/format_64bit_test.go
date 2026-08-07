@@ -116,6 +116,68 @@ func TestConvertToBUMPSubtreeProofSentinel(t *testing.T) {
 	require.Equal(t, uint64(0), bump.Path[1][0].Offset)
 }
 
+// requireOffsetsFrom asserts that every level's offsets derive from the given
+// 64-bit global leaf offset: level 0 carries the sibling and the txid node in
+// tree order, and each higher level the sibling alone.
+func requireOffsetsFrom(t *testing.T, bump *Format, global uint64, levels int) {
+	t.Helper()
+
+	require.Len(t, bump.Path, levels)
+
+	level0 := bump.Path[0]
+	require.Len(t, level0, 2)
+
+	// The txid sits left of its sibling at an even offset, right of it at an odd one.
+	txidIdx, siblingIdx := 1, 0
+	if global%2 == 0 {
+		txidIdx, siblingIdx = 0, 1
+	}
+
+	require.True(t, level0[txidIdx].TxID)
+	require.Equal(t, global, level0[txidIdx].Offset)
+	require.Equal(t, global^1, level0[siblingIdx].Offset)
+
+	for levelIdx := 1; levelIdx < levels; levelIdx++ {
+		require.Len(t, bump.Path[levelIdx], 1)
+		require.Equal(t, (global>>uint(levelIdx))^1, bump.Path[levelIdx][0].Offset, "level %d", levelIdx)
+	}
+}
+
+// TestConvertToBUMPAcceptsSixtyFourLevels pins the passing side of the level
+// limit, which the rejection tests below cannot reach. 64 is the most levels a
+// uint64 leaf offset can address, and it is the only input that reaches the
+// segment guards' short-circuits and the shift by a full 64 bits. Go yields
+// zero for a shift at or beyond the operand's width, which is the right answer
+// here only because a segment spanning all 64 levels leaves the other segment
+// with none, forcing its index to zero — worth pinning rather than leaving to
+// coincidence.
+func TestConvertToBUMPAcceptsSixtyFourLevels(t *testing.T) {
+	// Well above 2^32, to show the segment really does span all 64 bits.
+	const bigIndex uint64 = 1<<40 | 7
+
+	t.Run("all 64 levels in the subtree segment", func(t *testing.T) {
+		// No block levels means a single subtree, so the subtree index must be 0
+		// and the global offset is the tx index alone: (0 << 64) | bigIndex.
+		proof := proofWithLevels(t, 64, 0, 0, int(bigIndex))
+
+		bump, err := ConvertToBUMP(proof)
+		require.NoError(t, err)
+
+		requireOffsetsFrom(t, bump, bigIndex, 64)
+	})
+
+	t.Run("all 64 levels in the block segment", func(t *testing.T) {
+		// No subtree levels means one leaf per subtree, so the tx index must be 0
+		// and the global offset is the subtree index alone: (bigIndex << 0) | 0.
+		proof := proofWithLevels(t, 0, 64, int(bigIndex), 0)
+
+		bump, err := ConvertToBUMP(proof)
+		require.NoError(t, err)
+
+		requireOffsetsFrom(t, bump, bigIndex, 64)
+	})
+}
+
 // TestConvertToBUMPRejectsInconsistentIndices pins the guards that replace the
 // old silent wrap: indices that cannot be represented in their segment of the
 // flat leaf offset are rejected loudly.
