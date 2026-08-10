@@ -95,6 +95,10 @@ const (
 	// AddRebroadcastInventory drops on full rather than blocking the
 	// hot relay path, so this is best-effort, not lossless.
 	modifyRebroadcastInvBuffer = 1024
+
+	// cantSplitBanPeerMsg is logged when a peer address cannot be split into
+	// host and port during ban handling.
+	cantSplitBanPeerMsg = "can't split ban peer %s %v"
 )
 
 var (
@@ -1183,13 +1187,21 @@ func preAdmitTimedOut(preAdmitCtx context.Context) bool {
 }
 
 // shouldDisconnectOnBlockErr reports whether a block-processing error should
-// rotate the sync peer. Block validation failures disconnect the peer; local
-// infrastructure errors (database, Kafka, etc.) must not, since they would only
-// cause unnecessary sync-peer churn.
+// rotate the sync peer. Block validation failures disconnect the peer; transient
+// LOCAL conditions must not, since they would only cause unnecessary sync-peer
+// churn. The suppressed set is service/storage errors plus the per-block backoff
+// throttle (ErrServiceUnavailable, #1187) and ErrStorageUnavailable ("no
+// aerospike nodes available") — the backoff skip returns ErrServiceUnavailable
+// on every re-delivery, so disconnecting on it would churn through sync peers for
+// a fault that is ours, not the peer's. errors.IsTransientLocalError is the
+// shared classifier (also used by the netsync backoff path) so the two decisions
+// cannot drift apart.
 func shouldDisconnectOnBlockErr(err error) bool {
-	return err != nil &&
-		!errors.Is(err, errors.ErrServiceError) &&
-		!errors.Is(err, errors.ErrStorageError)
+	if err == nil {
+		return false
+	}
+
+	return !errors.IsTransientLocalError(err)
 }
 
 // tearDownAssociationStreams closes the live connection of every stream
@@ -1993,6 +2005,27 @@ func (s *server) pushTxMsg(sp *serverPeer, hash *chainhash.Hash, doneChan chan<-
 		return err
 	}
 
+	// A node bootstrapped from a UTXO-set snapshot stores transactions as their
+	// live outputs only, and the UTXO store hands that shape straight back for a
+	// reader that asked for fields.Tx. Bytes() below either panics on a nil output
+	// hole — swallowed by the deferred recover above, leaving the peer with silence
+	// — or serializes cleanly into a short, 0-input transaction that does not hash
+	// to what the peer asked for, which would then go on the wire as if it did.
+	// Same gate as the asset boundary (services/asset/repository.isRequestedTransaction):
+	// the predicate must come first, because TxIDChainHash() dereferences the same
+	// nil *bt.Output.
+	if !txMeta.TxIsSerializable() || !txMeta.Tx.TxIDChainHash().IsEqual(hash) {
+		err = fmt.Errorf("[pushTxMsg] tx %v is not retained in full by this node", hash)
+
+		sp.server.logger.Warnf("%s", err.Error())
+
+		if doneChan != nil {
+			doneChan <- struct{}{}
+		}
+
+		return err
+	}
+
 	tx, err := bsvutil.NewTxFromBytes(txMeta.Tx.Bytes())
 	if err != nil {
 		sp.server.logger.Warnf("[pushTxMsg] Unable to deserialize tx %v: %v", hash, err)
@@ -2407,7 +2440,7 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 func (s *server) handleBanPeerMsg(state *peerState, sp *serverPeer) {
 	host, _, err := net.SplitHostPort(sp.Addr())
 	if err != nil {
-		sp.server.logger.Debugf("can't split ban peer %s %v", sp.Addr(), err)
+		sp.server.logger.Debugf(cantSplitBanPeerMsg, sp.Addr(), err)
 		return
 	}
 
@@ -2432,7 +2465,7 @@ func (s *server) handleBanPeerMsg(state *peerState, sp *serverPeer) {
 func (s *server) handleBanPeerForDurationMsg(state *peerState, sp *serverPeer, banUntil int64) {
 	host, _, err := net.SplitHostPort(sp.Addr())
 	if err != nil {
-		sp.server.logger.Debugf("can't split ban peer %s %v", sp.Addr(), err)
+		sp.server.logger.Debugf(cantSplitBanPeerMsg, sp.Addr(), err)
 		return
 	}
 
@@ -2460,7 +2493,7 @@ func (s *server) handleBanPeerForDurationMsg(state *peerState, sp *serverPeer, b
 func (s *server) handleUnbanPeerMsg(state *peerState, spAddr bannedPeerAddr) {
 	host, _, err := net.SplitHostPort(string(spAddr))
 	if err != nil {
-		s.logger.Errorf("can't split ban peer %s %v", spAddr, err)
+		s.logger.Errorf(cantSplitBanPeerMsg, spAddr, err)
 		return
 	}
 

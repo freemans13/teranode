@@ -82,6 +82,12 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
+const (
+	errOutputNotFound           = "output %s:%d not found"
+	errFailedCreateSpendingData = "failed to create spending data from bytes"
+	errSQLUpdatingTransactions  = "SQL error updating transactions: %v"
+)
+
 // batchSpend represents a single UTXO spend request in a batch.
 // Mirrors aerospike/spend.go batchSpend struct.
 type batchSpend struct {
@@ -1440,8 +1446,10 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 //   - tx: Full transaction data
 //   - inputs: Transaction inputs
 //   - outputs: Transaction outputs
-//   - blockIDs: Block references
-//   - parentTxHashes: Previous transaction hashes
+//   - blockIDs, blockHeights, subtreeIdxs: where this transaction has been mined,
+//     index-aligned — entry i of each describes one placement. All three come from
+//     a single query, so requesting any one of them runs it and fills all three.
+//   - txInpoints: parent outpoints referenced by this transaction
 func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fields ...fields.FieldName) (*meta.Data, error) {
 	bins := utxo.MetaFieldsWithTx
 	if len(fields) > 0 {
@@ -1644,7 +1652,7 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		}
 	}
 
-	if contains(bins, fields.BlockIDs) {
+	if needsBlockIDsQuery(bins) {
 		q := `
 			SELECT
 			    block_id,
@@ -1772,6 +1780,16 @@ func contains(slice []fields.FieldName, item fields.FieldName) bool {
 	}
 
 	return false
+}
+
+// needsBlockIDsQuery reports whether any field served by the single block_ids
+// query was requested. BlockIDs, BlockHeights and SubtreeIdxs all come from that
+// one query, so asking for any of them has to run it. Both read paths call this
+// so the grouping is stated once rather than copied.
+func needsBlockIDsQuery(bins []fields.FieldName) bool {
+	return contains(bins, fields.BlockIDs) ||
+		contains(bins, fields.BlockHeights) ||
+		contains(bins, fields.SubtreeIdxs)
 }
 
 // parseInsertedAtMillis converts the inserted_at column value into Unix
@@ -2214,7 +2232,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		spend := item.spend
 		r, found := resultMap[i]
 		if !found {
-			validationErrors[i] = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+			validationErrors[i] = errors.NewTxNotFoundError(errOutputNotFound, spend.TxID, spend.Vout)
 			continue
 		}
 
@@ -2240,7 +2258,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			if spend.SpendingData != nil && !bytes.Equal(r.spendingDataBytes, spend.SpendingData.Bytes()) {
 				existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(r.spendingDataBytes)
 				if parseErr != nil {
-					validationErrors[i] = errors.NewProcessingError("failed to create spending data from bytes", parseErr)
+					validationErrors[i] = errors.NewProcessingError(errFailedCreateSpendingData, parseErr)
 					continue
 				}
 				validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
@@ -2295,7 +2313,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				spend := batch[u.batchIdx].spend
 				existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(entry.spendingData)
 				if parseErr != nil {
-					validationErrors[u.batchIdx] = errors.NewProcessingError("failed to create spending data from bytes", parseErr)
+					validationErrors[u.batchIdx] = errors.NewProcessingError(errFailedCreateSpendingData, parseErr)
 				} else {
 					validationErrors[u.batchIdx] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
 				}
@@ -2705,7 +2723,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 		)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				validationErrors[i] = errors.NewTxNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+				validationErrors[i] = errors.NewTxNotFoundError(errOutputNotFound, spend.TxID, spend.Vout)
 				continue
 			}
 			if isDeadlock(err) {
@@ -2742,7 +2760,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 			if spend.SpendingData != nil && !bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
 				existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
 				if parseErr != nil {
-					validationErrors[i] = errors.NewProcessingError("failed to create spending data from bytes", parseErr)
+					validationErrors[i] = errors.NewProcessingError(errFailedCreateSpendingData, parseErr)
 					continue
 				}
 				validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
@@ -3069,7 +3087,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 				// still runs; the only real error here is a missing row.
 				if err = txn.QueryRowContext(ctx, qFindTxID, spend.TxID[:], spend.Vout).Scan(&transactionID); err != nil {
 					if errors.Is(err, sql.ErrNoRows) {
-						return errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+						return errors.NewNotFoundError(errOutputNotFound, spend.TxID, spend.Vout)
 					}
 
 					return err
@@ -3352,7 +3370,7 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 			`, inClause3)
 			args := append([]interface{}{newDAH}, inArgs3...)
 			if _, err = txn.ExecContext(ctx, qUpdate, args...); err != nil {
-				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+				return nil, errors.NewStorageError(errSQLUpdatingTransactions, err)
 			}
 		} else {
 			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
@@ -3362,7 +3380,7 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 				WHERE hash IN %s
 			`, inClause3)
 			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
-				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+				return nil, errors.NewStorageError(errSQLUpdatingTransactions, err)
 			}
 		}
 	} else {
@@ -3386,7 +3404,7 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 				WHERE hash IN %s
 			`, inClause3)
 			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
-				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+				return nil, errors.NewStorageError(errSQLUpdatingTransactions, err)
 			}
 
 			// Step 2: Set unmined_since only for transactions with no remaining block_ids
@@ -3417,7 +3435,7 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 				WHERE hash IN %s
 			`, inClause3)
 			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
-				return nil, errors.NewStorageError("SQL error updating transactions: %v", err)
+				return nil, errors.NewStorageError(errSQLUpdatingTransactions, err)
 			}
 		}
 	}
@@ -3677,7 +3695,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 
 	needInputs := contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)
 	needOutputs := contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos)
-	needBlockIDs := contains(bins, fields.BlockIDs)
+	needBlockIDs := needsBlockIDsQuery(bins)
 
 	// Query 2: Bulk fetch inputs
 	if needInputs {
@@ -4233,7 +4251,10 @@ func (s *Store) GetCounterConflicting(ctx context.Context, hash chainhash.Hash) 
 
 	defer deferFn()
 
-	return utxo.GetCounterConflictingTxHashes(ctx, s, hash)
+	// unbounded: this is the conflict-demotion path (ProcessConflicting), which
+	// must always walk the full descendant set to completion — a budget failure
+	// here would wedge block assembly on the block forever (issue 1391)
+	return utxo.GetCounterConflictingTxHashes(ctx, s, hash, 0)
 }
 
 // GetConflictingChildren returns a list of conflicting transactions for a given transaction hash.
@@ -4244,7 +4265,7 @@ func (s *Store) GetConflictingChildren(ctx context.Context, hash chainhash.Hash)
 
 	defer deferFn()
 
-	return utxo.GetConflictingChildren(ctx, s, hash)
+	return utxo.GetConflictingChildren(ctx, s, hash, s.settings.UtxoStore.ConflictingChildrenMaxNodes)
 }
 
 // SetConflicting marks a list of transactions as conflicting.

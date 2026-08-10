@@ -72,10 +72,31 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
-	aeroTest "github.com/bsv-blockchain/testcontainers-aerospike-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestResolveBatcherMaxConcurrent(t *testing.T) {
+	tests := []struct {
+		name       string
+		perBatcher int
+		shared     int
+		want       int
+	}{
+		{name: "unset inherits shared", perBatcher: 0, shared: 24, want: 24},
+		{name: "override wins over shared", perBatcher: 8, shared: 24, want: 8},
+		{name: "override above shared also wins", perBatcher: 128, shared: 24, want: 128},
+		{name: "both zero stays uncapped", perBatcher: 0, shared: 0, want: 0},
+		{name: "negative override defensively inherits", perBatcher: -1, shared: 24, want: 24},
+		{name: "override set while shared unlimited", perBatcher: 8, shared: 0, want: 8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, resolveBatcherMaxConcurrent(tt.perBatcher, tt.shared))
+		})
+	}
+}
 
 func TestCalculateKeySource(t *testing.T) {
 	hash := chainhash.HashH([]byte("test"))
@@ -115,7 +136,7 @@ func TestUnmined(t *testing.T) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 
-	container, err := aeroTest.RunContainer(ctx)
+	container, err := runAerospikeTestContainer(ctx)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -137,6 +158,9 @@ func TestUnmined(t *testing.T) {
 
 	store, err := New(ctx, logger, tSettings, aeroURL)
 	require.NoError(t, err)
+	if os.Getenv("AEROSPIKE_EXPECT_NATIVE_OPS") == "true" {
+		require.True(t, store.useNativeTeranodeOps.Load())
+	}
 
 	t.Run("check_empty_store", func(t *testing.T) {
 		exists, err := store.indexExists("unminedSinceIndex")
@@ -339,7 +363,7 @@ func TestLargeTxStoresExternally(t *testing.T) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 
-	container, err := aeroTest.RunContainer(ctx)
+	container, err := runAerospikeTestContainer(ctx)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {

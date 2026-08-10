@@ -251,6 +251,10 @@ type Server struct {
 	blocksFetched   atomic.Int64
 	blocksValidated atomic.Int64
 
+	// cacheBustCounter produces the unique token appended to a peer request URL when
+	// a previous response from that peer looked poisoned. See peer_cache_bypass.go.
+	cacheBustCounter atomic.Uint64
+
 	// previousCatchupAttempt stores details about the last failed catchup attempt.
 	// This is used to display in the dashboard why we switched from one peer to another.
 	// Protected by activeCatchupCtxMu for thread-safe access.
@@ -372,7 +376,14 @@ func New(
 		// when catchup completes or fails, but a missed Delete on any error/early-return
 		// branch would otherwise leak the entry permanently. Mirrors catchupAlternatives,
 		// the sibling cache for the same in-flight block.
-		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](ttlcache.WithTTL[chainhash.Hash, bool](10 * time.Minute)),
+		processBlockNotify: ttlcache.New[chainhash.Hash, bool](
+			ttlcache.WithTTL[chainhash.Hash, bool](10*time.Minute),
+			// Do not extend the window on reads, for the same reason as
+			// blockCatchupAttempts below: the enqueue gate reads this entry on every
+			// duplicate announcement, so touch-on-hit would let a stream of duplicates
+			// hold the suppression open past the safety-net TTL.
+			ttlcache.WithDisableTouchOnHit[chainhash.Hash, bool](),
+		),
 		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](ttlcache.WithTTL[chainhash.Hash, []processBlockCatchup](10 * time.Minute)),
 		blockCatchupAttempts: ttlcache.New[chainhash.Hash, int](
 			ttlcache.WithTTL[chainhash.Hash, int](10*time.Minute),
@@ -1406,6 +1417,25 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 	}, nil
 }
 
+// deriveBlockHeight settles a peer-supplied block height against the on-chain parent.
+//
+// block.Height is a varint in the block body (model.NewBlockFromBytes) and is not covered
+// by the header hash, so on the peer-fetched path it cannot be trusted. An honest peer sends
+// either the correct height or 0 (the field "can be left empty"); any other value is a lie
+// and the block is rejected. The returned height (parentHeight + 1) is authoritative and must
+// be written back onto the block before anything downstream reads block.Height — the
+// checkpoint guard, the difficulty skip, block-assembly gating and the coinbase subsidy all
+// key off it. Catchup (get_blocks.go) and the operator revalidation endpoint already carry
+// authoritative heights, so this settlement is only needed on the peer-fetched route.
+func deriveBlockHeight(claimed, parentHeight uint32) (uint32, error) {
+	derived := parentHeight + 1
+	if claimed != 0 && claimed != derived {
+		return 0, errors.NewBlockInvalidError("claimed height %d does not match parent height %d + 1", claimed, parentHeight)
+	}
+
+	return derived, nil
+}
+
 // processBlockFound processes a newly discovered block by validating it and managing
 // parent block dependencies. It handles block retrieval, validation sequencing,
 // and ensures proper processing order for blockchain consistency.
@@ -1478,6 +1508,29 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 
 		return nil
 	}
+
+	// Settle the peer-supplied height against the on-chain parent before anything reads
+	// block.Height (block-assembly gating and the unified-route decision below, and downstream
+	// the checkpoint guard, difficulty skip and coinbase subsidy in ValidateBlockWithOptions).
+	// See deriveBlockHeight.
+	_, parentMeta, err := u.blockchainClient.GetBlockHeader(ctx, block.Header.HashPrevBlock)
+	if err != nil {
+		return errors.NewServiceError("[processBlockFound][%s] failed to get parent header %s", hash.String(), block.Header.HashPrevBlock.String(), err)
+	}
+
+	// No implementation returns a nil meta with a nil error, but the settled height is
+	// security-relevant, so fail closed rather than derive it from a nil dereference.
+	// Mirrors the guard on the sibling GetBlockHeader call in ProcessBlock.
+	if parentMeta == nil {
+		return errors.NewServiceError("[processBlockFound][%s] nil metadata for parent header %s", hash.String(), block.Header.HashPrevBlock.String())
+	}
+
+	settledHeight, err := deriveBlockHeight(block.Height, parentMeta.Height)
+	if err != nil {
+		return errors.NewBlockInvalidError("[processBlockFound][%s] rejecting block with peer-inconsistent height", hash.String(), err)
+	}
+
+	block.Height = settledHeight
 
 	// Wait for block assembly to be ready before processing the block
 	if err = blockassemblyutil.WaitForBlockAssemblyReady(ctx, u.logger, u.blockAssemblyClient, block.Height, u.settings.BlockValidation.MaxBlocksBehindBlockAssembly); err != nil {
@@ -1807,8 +1860,42 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 			u.logger.Warnf("[catchup] All peers failed for block %s (attempt %d/%d), clearing markers and reporting peer failure to allow retry from a different peer: %v", c.block.Hash().String(), attempts, u.settings.BlockValidation.CatchupMaxAttemptsPerBlock, err)
 			u.processBlockNotify.Delete(*c.block.Hash())
 			u.catchupAlternatives.Delete(*c.block.Hash())
-			u.reportCatchupFailure(ctx, c.peerID)
 
+			// Peers that actually failed were charged individually at the point of
+			// failure (recordCatchupPeerFailure / markCatchupFailureReported). Charging
+			// c.peerID here would blame the catchup primary for another peer's failure,
+			// which is what drove healthy peers to 0% success in issue 1368. The
+			// already-reported marker check inside reportCatchupFailureForError
+			// suppresses exactly that duplicate *reputation* charge.
+			u.reportCatchupFailureForError(ctx, c.peerID, err)
+
+			// ReportPeerFailure is deliberately NOT gated on catchupFailureAlreadyReported.
+			// It is not a reputation call — it is the sync-peer ROTATION signal, and it has
+			// to fire on every all-peers-failed cycle:
+			//
+			//   blockchain.Server.ReportPeerFailure broadcasts NotificationType_PeerFailure
+			//   -> p2p.Server routes failure_type "catchup" to
+			//      syncCoordinator.HandleCatchupFailure (and its subscription listener
+			//      deliberately bypasses the "skip notifications while syncing" filter for
+			//      this type — "needed to switch peers on catchup failure")
+			//   -> SyncCoordinator clears currentSyncPeer and calls triggerSyncLocked, i.e.
+			//      immediate re-selection of a different sync peer.
+			//
+			// A marker gate here is dead code in production: fetchAndStoreSubtreeAndSubtreeData
+			// applies markCatchupFailureReported unconditionally to every all-peers-failed
+			// error and is the only producer of this ErrExternal in the package, so the gate
+			// is always false and rotation never happens. A stuck node would then depend on
+			// the sync coordinator's 30s periodicEvaluation, which only rotates on reputation
+			// below 20 or the 5-minute SyncPeerNoProgressTimeout — a peer with history (say
+			// 100 successes and 1 failure) trips neither, so recovery costs the full five
+			// minutes per stuck cycle.
+			//
+			// The price is one extra interaction-failure charge against the primary. That is
+			// accepted, and consistent with the round-2 adjudication documented in
+			// catchup.go's failedPeers drain: an over-charge is directionally accurate while
+			// an under-charge hides a real failure, and the duplicate increment is a
+			// telemetry-precision cost rather than a reputation-math break. Losing peer
+			// rotation to save one charge is the worse trade — do not re-add the gate.
 			if reportErr := u.blockchainClient.ReportPeerFailure(ctx, c.block.Hash(), c.peerID, "catchup", err.Error()); reportErr != nil {
 				u.logger.Errorf("[catchup] failed to report peer failure for block %s peer %s: %v", c.block.Hash().String(), c.peerID, reportErr)
 			}
