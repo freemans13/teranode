@@ -713,6 +713,18 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 		// set the new height based on the best block header from the subtree processor
 		bestBlockchainBlockHeader = stpHeader
 		currentHeight = stpHeight
+
+		b.setBestBlockHeader(bestBlockchainBlockHeader, currentHeight)
+
+		// Realigning is the right state to land on, but it is not a reset. Falling
+		// through from here would run SetState, log "resetting block assembler
+		// DONE" and return nil, so a caller whose reset never rebuilt the subtree
+		// processor's state would be told it succeeded -- and a failed reset is
+		// the drift this whole recovery exists to undo. Report it instead, so the
+		// return value and the Errorf above agree with each other. The two
+		// branches above already return without persisting state for the same
+		// reason.
+		return errors.NewProcessingError("[Reset] subtree processor reset failed; block assembly realigned to %s at height %d", stpHeader.Hash().String(), currentHeight, response.Err)
 	}
 
 	b.setBestBlockHeader(bestBlockchainBlockHeader, currentHeight)

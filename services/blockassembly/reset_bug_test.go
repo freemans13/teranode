@@ -364,6 +364,13 @@ func TestReset_FallbackHeaderFailure_RollbackDirectionStaysOffTheChainTip(t *tes
 // so it does not depend on a blockchain lookup that can fail. Here that lookup is
 // guaranteed to fail for the exact hash being resolved, and the fallback still
 // lands on the right block at the right height.
+//
+// The reset itself must still report failure. Realigning onto the processor's
+// own header is the right state to land on, but the processor's state was never
+// rebuilt, so a caller told "no error" would believe a reset happened that did
+// not -- and a failed reset is the drift this recovery exists to undo. The
+// assertion this test is really about is the height and header below; the error
+// is asserted so the contract cannot silently revert to success-on-failure.
 func TestReset_FailedRollbackResolvesHeightWithoutTheBlockchain(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -381,7 +388,10 @@ func TestReset_FailedRollbackResolvesHeightWithoutTheBlockchain(t *testing.T) {
 		failFor: blockHeader2.Hash(),
 	}
 
-	require.NoError(t, items.blockAssembler.reset(ctx))
+	err := items.blockAssembler.reset(ctx)
+	require.Error(t, err, "a reset whose subtree processor failed must not report success")
+	require.Contains(t, err.Error(), "realigned",
+		"the error must say the pointer was realigned, not imply nothing happened")
 
 	gotHeader, gotHeight := items.blockAssembler.CurrentBlock()
 	require.Equal(t, uint32(2), gotHeight, "the height must come from the metadata the reset already had")
