@@ -1,7 +1,6 @@
 package blockvalidation
 
 import (
-	"context"
 	"net/url"
 	"testing"
 
@@ -19,115 +18,76 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// buildQuickPathSubtrees returns two subtree slices of capacity 2 whose leaves are the
-// given transaction hashes, with a coinbase placeholder occupying the first position of
-// the first subtree — the shape validateSubtrees sees on the quick-validation path.
-func buildQuickPathSubtrees(t *testing.T, second, third chainhash.Hash) []*subtreepkg.Subtree {
+// newTestScanner returns a released-on-cleanup in-memory scanner.
+func newTestScanner(t *testing.T) *model.DuplicateTxScanner {
 	t.Helper()
 
-	first, err := subtreepkg.NewTreeByLeafCount(2)
+	s, err := model.NewDuplicateTxScanner(8, nil)
 	require.NoError(t, err)
-	require.NoError(t, first.AddCoinbaseNode())
-	require.NoError(t, first.AddNode(second, 1, 100))
+	t.Cleanup(s.Release)
 
-	last, err := subtreepkg.NewTreeByLeafCount(2)
-	require.NoError(t, err)
-	require.NoError(t, last.AddNode(third, 1, 100))
-
-	return []*subtreepkg.Subtree{first, last}
+	return s
 }
 
-// newQuickPathBlock wraps the given subtree slices in the minimum viable block for
-// validateSubtrees: a header (for block.Hash() and the merkle-root comparison), a real
-// coinbase, and matching Subtrees/SubtreeSlices lengths. The header's merkle root is
-// deliberately unrelated to the body, so a block that gets past the duplicate check fails
-// on the merkle root — which is what the second sub-test asserts.
-func newQuickPathBlock(t *testing.T, slices []*subtreepkg.Subtree) *model.Block {
-	t.Helper()
-
-	coinbase, err := bt.NewTxFromString(model.CoinbaseHex)
-	require.NoError(t, err)
-
-	nBits, err := model.NewNBitFromString("207fffff")
-	require.NoError(t, err)
-
-	subtreeHashes := make([]*chainhash.Hash, len(slices))
-	for i, st := range slices {
-		subtreeHashes[i] = st.RootHash()
-	}
-
-	return &model.Block{
-		Header: &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  &chainhash.Hash{},
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      1,
-			Bits:           *nBits,
-			Nonce:          0,
-		},
-		CoinbaseTx:    coinbase,
-		Subtrees:      subtreeHashes,
-		SubtreeSlices: slices,
-	}
+// batchOf wraps transactions in the minimum SubtreeProcessingBatch scanBatchForDuplicates
+// reads: it only looks at batchTxs, the list about to be applied to the UTXO store.
+func batchOf(txs ...*bt.Tx) *SubtreeProcessingBatch {
+	return &SubtreeProcessingBatch{batchTxs: txs}
 }
 
-// TestValidateSubtrees_RejectsDuplicateTransaction pins the CVE-2012-2459 duplicate check
-// this PR adds to the quick-validation path (issue 1424). That path is default-on for every
-// block at or below the highest checkpoint and previously ran no duplicate check at all,
-// while the merkle root provably cannot detect the mutation.
+// TestScanBatchForDuplicates pins the CVE-2012-2459 floor at its seam on the
+// quick-validation path (issue 1424). That path is default-on for every block at or below
+// the highest checkpoint and previously ran no duplicate check at all, while the merkle
+// root provably cannot detect the mutation.
 //
-// A package coverage profile showed the rejection branch had zero coverage: the existing
-// quick-path tests execute the call but never drive a duplicate through it, so removing the
-// check entirely left every test in the package passing. This test closes that gap — it
-// fails if the check is removed or moved after CheckMerkleRoot.
-//
-// It calls validateSubtrees directly because that is the single seam all three quick-path
-// pipelines funnel through, and it needs no BlockValidation dependencies: the function
-// reads only the block's subtree slices.
-func TestValidateSubtrees_RejectsDuplicateTransaction(t *testing.T) {
-	ctx := context.Background()
+// The scan deliberately reads batchTxs — the transactions about to be written — rather
+// than block.SubtreeSlices, because on a retry those slices are deserialized from a local
+// .subtree file that can differ from the peer body being applied.
+func TestScanBatchForDuplicates(t *testing.T) {
+	// coinbase plus three distinct spendable transactions.
+	txs := transactions.CreateTestTransactionChainWithCount(t, 5)
+	require.Len(t, txs, 4)
+	txA, txB, txC := txs[1], txs[2], txs[3]
 
-	txA := chainhash.Hash{0x01}
-	txB := chainhash.Hash{0x02}
-
-	u := &BlockValidation{}
-
-	t.Run("duplicate transaction is rejected", func(t *testing.T) {
-		// txA appears in both subtrees — the duplicate a mutated body carries.
-		block := newQuickPathBlock(t, buildQuickPathSubtrees(t, txA, txA))
-
-		_, err := u.validateSubtrees(ctx, block, 0)
+	t.Run("duplicate inside one batch is rejected", func(t *testing.T) {
+		err := scanBatchForDuplicates(batchOf(txA, txB, txA), newTestScanner(t))
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "duplicate transaction")
 		require.Contains(t, err.Error(), "CVE-2012-2459")
-
-		// The error must reach the caller as a consensus rejection, not a transient
-		// processing fault: the legacy unified route returns it straight out with no
-		// fallback, and peer punishment keys on ErrBlockInvalid.
 		require.True(t, errors.Is(err, errors.ErrBlockInvalid),
-			"a duplicate on the quick path must be BlockInvalid, so the peer is punished")
+			"a duplicate must be BlockInvalid, so the peer is punished")
 		require.False(t, errors.Is(err, errors.ErrProcessing),
-			"it must not be wrapped as a processing error, which reads as transient")
+			"it must not carry a top-level ErrProcessing code, which reads as transient")
 	})
 
-	t.Run("distinct transactions pass the duplicate check", func(t *testing.T) {
-		// Same shape, no duplicate: this must get past the duplicate check and fail only
-		// on the merkle root (the block header here carries an unrelated root), proving
-		// the new check does not misfire on a legitimate body — in particular that the
-		// coinbase placeholder in the first slot is not treated as a duplicate.
-		block := newQuickPathBlock(t, buildQuickPathSubtrees(t, txA, txB))
+	t.Run("duplicate spanning two batches is rejected", func(t *testing.T) {
+		// The cross-batch case is why the scanner is per block rather than per batch: a
+		// mutant can put its repeat in a later subtree than the original, and a batch-local
+		// check would see two clean batches.
+		dedup := newTestScanner(t)
 
-		_, err := u.validateSubtrees(ctx, block, 0)
+		require.NoError(t, scanBatchForDuplicates(batchOf(txA, txB), dedup))
+
+		err := scanBatchForDuplicates(batchOf(txC, txA), dedup)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "merkle root mismatch")
-		require.NotContains(t, err.Error(), "duplicate transaction")
+		require.Contains(t, err.Error(), "duplicate transaction")
+		require.True(t, errors.Is(err, errors.ErrBlockInvalid))
+	})
+
+	t.Run("distinct transactions pass", func(t *testing.T) {
+		dedup := newTestScanner(t)
+		require.NoError(t, scanBatchForDuplicates(batchOf(txA, txB), dedup))
+		require.NoError(t, scanBatchForDuplicates(batchOf(txC), dedup))
+	})
+
+	t.Run("an empty batch is a no-op", func(t *testing.T) {
+		require.NoError(t, scanBatchForDuplicates(batchOf(), newTestScanner(t)))
 	})
 }
 
 // newQuickPathSuiteWithRealUTXOStore returns a catchup suite whose mock UTXO store has been
-// swapped for a real sqlitememory one. The duplicate has to genuinely survive create+spend to
-// reach validateSubtrees at all, which a mock cannot model — and per AGENTS.md the store is
-// not something to mock.
+// swapped for a real sqlitememory one, so the test can assert on what was actually written
+// rather than on mock call expectations — and per AGENTS.md the store is not something to mock.
 func newQuickPathSuiteWithRealUTXOStore(t *testing.T) *CatchupTestSuite {
 	t.Helper()
 
@@ -147,8 +107,8 @@ func newQuickPathSuiteWithRealUTXOStore(t *testing.T) *CatchupTestSuite {
 	// variant (blockvalidation_subtree_batch_prefetch_depth=0) cannot be driven end to end
 	// today: processSubtreeBatch never allocates SubtreeProcessingBatch.fullSubtreeExists,
 	// which prefetchSubtreeBatch does, so writeSubtreeFilesForBatch panics indexing a nil
-	// slice. That is pre-existing on main and unrelated to this change. All variants funnel
-	// through validateSubtrees, so the check itself is covered either way.
+	// slice. That is pre-existing on main and unrelated to this change. All three variants
+	// call scanBatchForDuplicates before their fan-out, so the floor holds on each.
 
 	return suite
 }
@@ -157,11 +117,9 @@ func newQuickPathSuiteWithRealUTXOStore(t *testing.T) *CatchupTestSuite {
 // different subtrees — the CVE-2012-2459 shape — and writes both subtrees and their data to
 // the suite's subtree store so the quick-validation pipeline can read them back.
 //
-// The duplicate must survive UTXO processing to reach validateSubtrees at all: the repeated
-// create is absorbed by createAndSpendUTXOsForBatch as ErrTxExists and the repeated spend
-// takes the store's idempotent same-spender path, so nothing rejects the block earlier. That
-// is precisely why the duplicate check is needed here and not merely nice to have.
-func storeDuplicateBearingBlock(t *testing.T, suite *CatchupTestSuite) *model.Block {
+// It returns the duplicated transaction alongside the block so a caller can assert that
+// nothing was written for it — the property the scan's placement exists to guarantee.
+func storeDuplicateBearingBlock(t *testing.T, suite *CatchupTestSuite) (*model.Block, *bt.Tx) {
 	t.Helper()
 
 	// A real coinbase plus one real spending transaction; readSubtree requires subtree 0
@@ -206,7 +164,7 @@ func storeDuplicateBearingBlock(t *testing.T, suite *CatchupTestSuite) *model.Bl
 	block.Subtrees = []*chainhash.Hash{first.RootHash(), second.RootHash()}
 	block.Height = 1 // the UTXO store rejects a spend at height zero
 
-	return block
+	return block, dupTx
 }
 
 // TestQuickValidateBlock_DuplicateIsBlockInvalidNotProcessing pins the two entry-point
@@ -214,17 +172,21 @@ func storeDuplicateBearingBlock(t *testing.T, suite *CatchupTestSuite) *model.Bl
 // ErrBlockInvalid from the subtree pipeline unwrapped instead of re-wrapping it as a
 // ProcessingError.
 //
-// A mutation check showed these had zero coverage: deleting BOTH pass-throughs left every
-// test in the package passing. TestValidateSubtrees_RejectsDuplicateTransaction above does
-// not reach them, because it calls validateSubtrees directly and so never crosses the site
-// that does the wrapping.
+// A mutation check showed these had zero coverage: deleting BOTH left every test in the
+// package passing. TestScanBatchForDuplicates above does not reach them — it drives the scan
+// directly and so never crosses the site that does the wrapping.
 //
-// The assertion that matters is the negative one. (*Error).Is walks the wrapped chain, so
-// errors.Is(err, ErrBlockInvalid) stays true even when the rejection IS re-wrapped —
-// asserting only that would pass with the pass-throughs deleted. What re-wrapping changes is
-// the error's own code: the rejection would additionally satisfy ErrProcessing, so a consumer
-// classifying on the top-level code, or testing ErrProcessing first, would read a consensus
-// rejection as a transient fault. Hence require.False on ErrProcessing.
+// Two assertions carry the test. The negative error assertion: (*Error).Is walks the wrapped
+// chain, so errors.Is(err, ErrBlockInvalid) stays true even when the rejection IS re-wrapped
+// as a ProcessingError, and asserting only that would pass with the pass-throughs deleted.
+// What re-wrapping changes is the error's own code — the rejection would additionally satisfy
+// ErrProcessing, so a consumer classifying on the top-level code reads a consensus rejection
+// as transient. Hence require.False on ErrProcessing.
+//
+// And the store assertion: nothing may have been written for the duplicated transaction. That
+// is the property the scan's placement exists to guarantee. Before the scan moved ahead of
+// createAndSpendUTXOsForBatch, a rejected mutant left the whole block's UTXOs created and
+// locked, with no unlock pass on any rejection path to clear them.
 func TestQuickValidateBlock_DuplicateIsBlockInvalidNotProcessing(t *testing.T) {
 	// requireConsensusRejection asserts the shape both entry points must produce.
 	requireConsensusRejection := func(t *testing.T, err error) {
@@ -242,22 +204,40 @@ func TestQuickValidateBlock_DuplicateIsBlockInvalidNotProcessing(t *testing.T) {
 		suite := newQuickPathSuiteWithRealUTXOStore(t)
 		defer suite.Cleanup()
 
-		block := storeDuplicateBearingBlock(t, suite)
+		block, dupTx := storeDuplicateBearingBlock(t, suite)
 
 		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
 		requireConsensusRejection(t, err)
+		requireNothingWritten(t, suite, dupTx)
 	})
 
 	t.Run("quickValidateBlockAsync returns the rejection unwrapped", func(t *testing.T) {
 		suite := newQuickPathSuiteWithRealUTXOStore(t)
 		defer suite.Cleanup()
 
-		block := storeDuplicateBearingBlock(t, suite)
+		block, dupTx := storeDuplicateBearingBlock(t, suite)
 
 		// Buffered large enough that the async path never blocks queuing a write job.
 		writeJobsChan := make(chan *SubtreeWriteJob, 16)
 
 		err := suite.Server.blockValidation.quickValidateBlockAsync(suite.Ctx, block, "test-peer", "", writeJobsChan)
 		requireConsensusRejection(t, err)
+		requireNothingWritten(t, suite, dupTx)
+
+		// Nothing doctored may have been queued for writing either: subtreeWriteWorker
+		// writes with WithAllowOverwrite(true), so a job surviving the rejection could
+		// land a doctored body under an honest subtree hash after catchup's cleanup pass.
+		require.Empty(t, writeJobsChan, "a rejected block must not have queued subtree write jobs")
 	})
+}
+
+// requireNothingWritten asserts the rejected block left no trace of the duplicated
+// transaction in the UTXO store — neither created nor created-and-locked.
+func requireNothingWritten(t *testing.T, suite *CatchupTestSuite, dupTx *bt.Tx) {
+	t.Helper()
+
+	_, err := suite.Server.blockValidation.utxoStore.Get(suite.Ctx, dupTx.TxIDChainHash())
+	require.Error(t, err, "the duplicate's UTXOs must never have been created")
+	require.True(t, errors.Is(err, errors.ErrTxNotFound),
+		"expected the tx to be absent from the store, got: %v", err)
 }
