@@ -90,6 +90,13 @@ Three settings bound that work:
   between them. A gap larger than the cap is structural and escalates straight away
   without spending retries on it.
 
+With the shipped defaults the gap cap never fires. The walk-back stops at the
+maturity safety floor described below, so it can never collect more than
+`CoinbaseMaturity` (100) misses, while `coinbaseRecoveryMaxGapBlocks` defaults to
+200. The cap only becomes a live control when it is set *below* the maturity —
+otherwise every escalation you see came from the safety floor, not from the cap.
+Its other role, bounding the startup scan window, stays live at any setting.
+
 ### The safety floor
 
 Recovery never looks further back than the coinbase-maturity window, no matter how
