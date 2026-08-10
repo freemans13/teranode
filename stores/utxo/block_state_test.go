@@ -2,7 +2,9 @@ package utxo
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -22,9 +24,11 @@ func TestBlockStateHolderSnapshot(t *testing.T) {
 	const iterations = 200_000
 
 	var (
-		wg     sync.WaitGroup
-		tornMu sync.Mutex
-		torn   []BlockState
+		wg        sync.WaitGroup
+		tornMu    sync.Mutex
+		torn      []BlockState
+		samples   atomic.Uint64
+		tornFound atomic.Bool
 	)
 
 	stop := make(chan struct{})
@@ -42,12 +46,17 @@ func TestBlockStateHolderSnapshot(t *testing.T) {
 				default:
 				}
 
+				got := holder.Load()
+				samples.Add(1)
+
 				// Assert after wg.Wait rather than here: testify's FailNow is
 				// only valid on the goroutine running the test.
-				if got := holder.Load(); got.MedianTime != got.Height+1000 {
+				if got.MedianTime != got.Height+1000 {
 					tornMu.Lock()
 					torn = append(torn, got)
 					tornMu.Unlock()
+
+					tornFound.Store(true)
 
 					return
 				}
@@ -55,14 +64,36 @@ func TestBlockStateHolderSnapshot(t *testing.T) {
 		}()
 	}
 
-	for i := uint32(2); i <= iterations; i++ {
+	// Gated on the sample count rather than a fixed iteration count, for the
+	// reason given in tests.SetBlockStateSnapshotUnderConcurrency: on one core
+	// the readers may never be scheduled during a fixed-length writer loop, so
+	// a bare count assertion would fail this case on correct code.
+	const minSamples = uint64(1_000)
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for i := uint32(2); ; i++ {
 		holder.SetPair(i, i+1000)
+
+		if tornFound.Load() {
+			break
+		}
+
+		if i >= iterations && samples.Load() >= minSamples {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
 	}
 
 	close(stop)
 	wg.Wait()
 
 	require.Empty(t, torn, "torn snapshots observed: %v", torn)
+	// Vacuity guard; see the writer loop above.
+	require.NotZero(t, samples.Load(), "readers observed no snapshots at all")
 }
 
 // TestBlockStateHolderSingleFieldSetters pins the carry-forward semantics of

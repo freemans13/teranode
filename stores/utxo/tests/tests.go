@@ -3,7 +3,9 @@ package tests
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -1015,9 +1017,11 @@ func SetBlockStateSnapshotUnderConcurrency(t *testing.T, db utxostore.Store) {
 	require.NoError(t, db.SetBlockState(baseHeight, baseHeight+offset))
 
 	var (
-		wg     sync.WaitGroup
-		tornMu sync.Mutex
-		torn   []utxostore.BlockState
+		wg        sync.WaitGroup
+		tornMu    sync.Mutex
+		torn      []utxostore.BlockState
+		samples   atomic.Uint64
+		tornFound atomic.Bool
 	)
 
 	stop := make(chan struct{})
@@ -1035,12 +1039,17 @@ func SetBlockStateSnapshotUnderConcurrency(t *testing.T, db utxostore.Store) {
 				default:
 				}
 
+				got := db.GetBlockState()
+				samples.Add(1)
+
 				// Recorded and asserted after wg.Wait: testify's FailNow is only
 				// valid on the goroutine running the test.
-				if got := db.GetBlockState(); got.MedianTime != got.Height+offset {
+				if got.MedianTime != got.Height+offset {
 					tornMu.Lock()
 					torn = append(torn, got)
 					tornMu.Unlock()
+
+					tornFound.Store(true)
 
 					return
 				}
@@ -1052,8 +1061,36 @@ func SetBlockStateSnapshotUnderConcurrency(t *testing.T, db utxostore.Store) {
 	// close(stop) and leave the readers spinning for the rest of the run.
 	var writeErr error
 
-	for i := baseHeight + 1; i <= baseHeight+iterations; i++ {
+	// The writer keeps going until the readers have actually sampled, rather
+	// than stopping at a fixed count and asserting the sample total afterwards.
+	// On a single-processor run the readers may not be scheduled at all while a
+	// fixed-length writer loop runs, which would leave the torn-pair assertion
+	// vacuously true; asserting the count instead would fail the case on
+	// correct code. Gating the loop keeps it meaningful on one core either way.
+	//
+	// Note the tear itself is only reliably observable with GOMAXPROCS > 1: at
+	// -cpu=1 a reader can only interleave with the writer where the scheduler
+	// preempts it, so this case guards the regression in CI, not on one core.
+	const minSamples = uint64(1_000)
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for i := baseHeight + 1; ; i++ {
 		if writeErr = db.SetBlockState(i, i+offset); writeErr != nil {
+			break
+		}
+
+		// Readers exit on the first torn pair, so stop chasing minSamples once
+		// the case has already failed — otherwise a real tear costs a stall.
+		if tornFound.Load() {
+			break
+		}
+
+		if i-baseHeight >= iterations && samples.Load() >= minSamples {
+			break
+		}
+
+		if time.Now().After(deadline) {
 			break
 		}
 	}
@@ -1063,6 +1100,10 @@ func SetBlockStateSnapshotUnderConcurrency(t *testing.T, db utxostore.Store) {
 
 	require.NoError(t, writeErr)
 	require.Empty(t, torn, "GetBlockState returned torn pairs: %v", torn)
+	// Vacuity guard: the assertion above also holds for a reader loop that never
+	// ran. The writer loop gates on this, so reaching zero means the readers
+	// were starved for the full deadline rather than merely descheduled.
+	require.NotZero(t, samples.Load(), "readers observed no snapshots at all")
 }
 
 // SetLockedBehavior tests the SetLocked lifecycle:
