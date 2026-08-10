@@ -329,8 +329,13 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 					// Rising edge: log immediately, every time this starts.
 					ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue), or whether the consumer has not started yet (gRPC ingest is up before BlockAssembler.Start reaches it, and the unmined reload runs in between)", queueLength, staleness.Round(time.Second))
 					queueStalled = true
-					stalledSince = time.Now()
-					lastStallWarn = stalledSince
+					// Backdate to the last dequeue, not to detection: the stall
+					// began when the consumer stopped, which is at least
+					// dequeueStallThreshold plus up to one tick ago. lastStallWarn
+					// must stay at now, or a stall already older than
+					// dequeueStallWarnRepeat would repeat on the very next tick.
+					stalledSince = time.Now().Add(-staleness)
+					lastStallWarn = time.Now()
 				case stalledNow && queueStalled && time.Since(lastStallWarn) >= dequeueStallWarnRepeat:
 					// Still stalled: repeat at a reduced cadence rather than every 5s.
 					ba.logger.Warnf("block assembler intake queue still stalled: %d transactions queued, consumer has not dequeued for %s", queueLength, staleness.Round(time.Second))
