@@ -34,6 +34,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const (
+	// txNotFoundInTxMapMsg is the error message used when a transaction hash
+	// cannot be located in the block's txMap.
+	txNotFoundInTxMapMsg = "transaction %s not found in txMap"
+)
+
 func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, msgBlock *wire.MsgBlock) (err error) {
 	sm.logger.Debugf("[HandleBlockDirect][%s] starting handling block", blockHash.String())
 
@@ -70,7 +76,18 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// Lookup previous block height from blockchain
 	_, previousBlockHeaderMeta, err = sm.blockchainClient.GetBlockHeader(ctx, &block.MsgBlock().Header.PrevBlock)
 	if err != nil {
-		sm.logger.Errorf("[HandleBlockDirect][%s] failed to get block header for previous block %s: %s", blockHash.String(), block.MsgBlock().Header.PrevBlock, err)
+		// A missing parent is an expected, recoverable condition: a normal orphan /
+		// out-of-order tip announce, or a descendant of a block that was rejected
+		// upstream. The caller (handleBlockMsg) answers with a getblocks and, for a
+		// known-failed ancestor, short-circuits the descendant cascade (#1333) — so
+		// logging it at ERROR here only produces misleading "previous block
+		// NOT_FOUND" spam. Genuine lookup failures (e.g. storage errors) still ERROR.
+		if errors.Is(err, errors.ErrBlockNotFound) {
+			sm.logger.Debugf("[HandleBlockDirect][%s] previous block %s not found (orphan/out-of-order; caller will request missing blocks): %v", blockHash.String(), block.MsgBlock().Header.PrevBlock, err)
+		} else {
+			sm.logger.Errorf("[HandleBlockDirect][%s] failed to get block header for previous block %s: %s", blockHash.String(), block.MsgBlock().Header.PrevBlock, err)
+		}
+
 		return errors.NewProcessingError("failed to get block header for previous block %s", block.MsgBlock().Header.PrevBlock, err)
 	}
 
@@ -1117,16 +1134,19 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 		g.Go(func() error {
 			txWrapper, ok := txMap.Get(txHash)
 			if !ok {
-				return errors.NewProcessingError("transaction %s not found in txMap", txHash.String())
+				return errors.NewProcessingError(txNotFoundInTxMapMsg, txHash.String())
 			}
 
-			createOpts := append(baseOpts[:len(baseOpts):len(baseOpts)], utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
-				BlockID:     blockID,
-				BlockHeight: blockHeightUint32,
-				SubtreeIdx:  0, // legacy path produces a single subtree at index 0
-			}))
+			createOpts := append(baseOpts[:len(baseOpts):len(baseOpts)],
+				utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+					BlockID:     blockID,
+					BlockHeight: blockHeightUint32,
+					SubtreeIdx:  0, // legacy path produces a single subtree at index 0
+				}),
+				utxo.WithCreateOnly(),
+			)
 
-			if _, err := sm.utxoStore.Create(gCtx, txWrapper.Tx, blockHeightUint32, createOpts...); err != nil {
+			if _, _, err := sm.utxoStore.SpendAndCreate(gCtx, txWrapper.Tx, blockHeightUint32, createOpts...); err != nil {
 				if errors.Is(err, errors.ErrTxExists) {
 					existingTxsMu.Lock()
 					existingTxHashes = append(existingTxHashes, &txHash)
@@ -1289,7 +1309,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 				if !ok {
 					// Not found in txMap — non-recoverable, fail immediately
 					mu.Lock()
-					hardFail = errors.NewProcessingError("transaction %s not found in txMap", txHash.String())
+					hardFail = errors.NewProcessingError(txNotFoundInTxMapMsg, txHash.String())
 					mu.Unlock()
 					return nil
 				}
@@ -1539,7 +1559,7 @@ func (sm *SyncManager) extendTransactions(ctx context.Context, bi blockIdent, tx
 		// the coinbase transaction is not part of the txMap
 		txWrapper, found := txMap.Get(txHash)
 		if !found {
-			return errors.NewTxError("transaction %s not found in txMap", txHash.String())
+			return errors.NewTxError(txNotFoundInTxMapMsg, txHash.String())
 		}
 
 		tx := txWrapper.Tx

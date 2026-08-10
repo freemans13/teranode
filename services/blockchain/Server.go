@@ -56,6 +56,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+const errStoreNoBlobDeletion = "blockchain store does not support blob deletion"
+
 // subscriber represents a subscription to blockchain notifications.
 //
 // subscriber encapsulates the connection to a client interested in blockchain events,
@@ -2310,6 +2312,13 @@ func (b *Blockchain) InvalidateBlock(ctx context.Context, request *blockchain_ap
 		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[Blockchain][InvalidateBlock] request's hash is not valid", err))
 	}
 
+	// Refuse to invalidate the genesis block. The store's recursive CTE would flip the
+	// whole chain invalid in one statement and it could not be undone via reconsiderblock.
+	// Guarded in the store too (defense in depth); reject early here with a clear error.
+	if b.settings != nil && b.settings.ChainCfgParams != nil && blockHash.IsEqual(b.settings.ChainCfgParams.GenesisHash) {
+		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[Blockchain][InvalidateBlock] cannot invalidate the genesis block"))
+	}
+
 	// invalidate block will also invalidate all child blocks
 	invalidatedHashes, err := b.store.InvalidateBlock(ctx, blockHash)
 	if err != nil {
@@ -3403,7 +3412,7 @@ func (b *Blockchain) ScheduleBlobDeletion(ctx context.Context, req *blockchain_a
 		ScheduleBlobDeletion(ctx context.Context, req *blockchain_sql.ScheduleRequest) (int64, error)
 	})
 	if !ok {
-		return nil, errors.NewStorageError("blockchain store does not support blob deletion")
+		return nil, errors.NewStorageError(errStoreNoBlobDeletion)
 	}
 
 	schedReq := &blockchain_sql.ScheduleRequest{
@@ -3439,7 +3448,7 @@ func (b *Blockchain) CancelBlobDeletion(ctx context.Context, req *blockchain_api
 		CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType int32) error
 	})
 	if !ok {
-		return nil, errors.NewStorageError("blockchain store does not support blob deletion")
+		return nil, errors.NewStorageError(errStoreNoBlobDeletion)
 	}
 
 	err := storeWithBlobDeletion.CancelBlobDeletion(ctx, req.BlobKey, req.FileType, int32(req.StoreType))
@@ -3470,7 +3479,7 @@ func (b *Blockchain) ListScheduledDeletions(ctx context.Context, req *blockchain
 		ListScheduledBlobDeletions(ctx context.Context, filters *blockchain_sql.ListFilters) ([]*blockchain_sql.ScheduledDeletion, int, error)
 	})
 	if !ok {
-		return nil, errors.NewStorageError("blockchain store does not support blob deletion")
+		return nil, errors.NewStorageError(errStoreNoBlobDeletion)
 	}
 
 	filters := &blockchain_sql.ListFilters{
@@ -3516,7 +3525,7 @@ func (b *Blockchain) GetPendingBlobDeletions(ctx context.Context, req *blockchai
 		GetPendingBlobDeletions(ctx context.Context, height uint32, limit int) ([]*blockchain_sql.ScheduledDeletion, error)
 	})
 	if !ok {
-		return nil, errors.NewStorageError("blockchain store does not support blob deletion")
+		return nil, errors.NewStorageError(errStoreNoBlobDeletion)
 	}
 
 	deletions, err := storeWithBlobDeletion.GetPendingBlobDeletions(ctx, req.Height, limit)
@@ -3547,7 +3556,7 @@ func (b *Blockchain) RemoveBlobDeletion(ctx context.Context, req *blockchain_api
 		RemoveBlobDeletion(ctx context.Context, id int64) error
 	})
 	if !ok {
-		return nil, errors.NewStorageError("blockchain store does not support blob deletion")
+		return nil, errors.NewStorageError(errStoreNoBlobDeletion)
 	}
 
 	err := storeWithBlobDeletion.RemoveBlobDeletion(ctx, req.DeletionId)
@@ -3564,7 +3573,7 @@ func (b *Blockchain) IncrementBlobDeletionRetry(ctx context.Context, req *blockc
 		IncrementBlobDeletionRetry(ctx context.Context, id int64, maxRetries int) (shouldRemove bool, newRetryCount int, err error)
 	})
 	if !ok {
-		return nil, errors.NewStorageError("blockchain store does not support blob deletion")
+		return nil, errors.NewStorageError(errStoreNoBlobDeletion)
 	}
 
 	shouldRemove, newRetryCount, err := storeWithBlobDeletion.IncrementBlobDeletionRetry(ctx, req.DeletionId, int(req.MaxRetries))

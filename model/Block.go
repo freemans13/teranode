@@ -46,8 +46,37 @@ var bufioReaderPool = sync.Pool{
 
 const GenesisBlockID = 0
 
-// LastV1Block https://github.com/bitcoin/bips/blob/master/bip-0034.mediawiki
-const LastV1Block = 227_835
+// heightAtOrAfterActivation reports whether block height h is at or after an activation height
+// taken from chaincfg. chaincfg activation heights are int32 and non-negative for BIP34/65/66; a
+// negative value (should not occur) is treated as "never active" so it can never wrongly reject.
+func heightAtOrAfterActivation(h uint32, activation int32) bool {
+	if activation < 0 {
+		return false
+	}
+
+	return h >= uint32(activation)
+}
+
+// CheckBlockVersion enforces the BIP34/66/65 mandatory version floors, mirroring bitcoin-sv
+// ContextualCheckBlockHeader (validation.cpp:5918-5924). version is compared as a SIGNED int32
+// exactly as svnode compares CBlockHeader::nVersion, so a high-bit version (e.g. 0xffffffff -> -1)
+// is treated as below the floor. Genesis (height 0) is exempt, matching svnode which never runs
+// this check on the genesis block. Returns a BlockInvalidError carrying the bad-version token.
+func CheckBlockVersion(version uint32, height uint32, params *chaincfg.Params) error {
+	if height == 0 {
+		return nil
+	}
+
+	v := int32(version)
+	if (v < 2 && heightAtOrAfterActivation(height, params.BIP0034Height)) ||
+		(v < 3 && heightAtOrAfterActivation(height, params.BIP0066Height)) ||
+		(v < 4 && heightAtOrAfterActivation(height, params.BIP0065Height)) {
+		return errors.NewBlockInvalidError(
+			"bad-version(0x%08x) rejected nVersion=0x%08x block", version, version)
+	}
+
+	return nil
+}
 
 var (
 	emptyTX = &bt.Tx{}
@@ -79,6 +108,11 @@ type Block struct {
 	subtreeLength   uint64
 	subtreeSlicesMu sync.RWMutex
 	txMap           txmap.TxMap
+	// txMapCount is the entry count txMap was sized from, and the pool key it
+	// must be returned with. Derived from the loaded block body by
+	// txMapEntryCount, not from the peer-supplied TransactionCount. Stashed so
+	// the release key cannot drift from the one used at GetTxMap time.
+	txMapCount      uint64
 	medianTimestamp uint32
 	// nodeAllocator, if non-nil, supplies pooled backing slices for the
 	// per-subtree Node arrays during GetAndValidateSubtrees. Only the
@@ -471,32 +505,30 @@ type SubtreeStore interface {
 	GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (io.ReadCloser, error)
 }
 
-func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, txMetaStore utxo.Store, oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
-	currentChain []*BlockHeader, currentBlockHeaderIDs []uint32, settings *settings.Settings, metaRegenerator SubtreeMetaRegeneratorI) (bool, error) {
-	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "Valid",
-		tracing.WithHistogram(prometheusBlockValid),
-		tracing.WithLogMessage(logger, "[Block:Valid] called for %s", b.Header.String()),
-	)
-	defer deferFn()
-
-	// 1. Check that the block header hash is less than the target difficulty.
-	headerValid, _, err := b.Header.HasMetTargetDifficulty()
-	if err != nil {
-		return false, errors.NewProcessingError("[BLOCK][%s] error checking target difficulty", b.String(), err)
-	}
-
-	if !headerValid {
-		return false, errors.NewBlockInvalidError("[BLOCK][%s] block header hash is not less than the target difficulty", b.String())
-	}
-
+// CheckHeaderContextual runs the header checks whose outcome depends on wall-clock time
+// (time.Now()) or on the current chain: the 2-hours-in-the-future timestamp bound, the
+// median-time-past rule, and the mandatory block-version floor (BIP34/66/65). It mirrors the
+// timestamp/version portion of bitcoin-sv's ContextualCheckBlockHeader (proof-of-work and nBits
+// are checked separately by the block-validation service, so they are not repeated here).
+//
+// It is the subset of Valid()'s header checks that must be evaluated at block-receipt time. Under
+// optimistic mining Valid() runs in a background goroutine after the block has already been added,
+// so evaluating the 2-hours-in-the-future check there uses a drifted time.Now() and can transiently
+// accept a too-far-future block; the block-validation service calls this synchronously before the
+// optimistic AddBlock to close that gap (issue #1149). Valid() also calls it so the check remains a
+// single source of truth.
+//
+// currentChain is the run of previous headers ending at the block's parent; when empty the
+// median-time-past rule is skipped (same as Valid()). Returns nil when the header passes.
+func (b *Block) CheckHeaderContextual(currentChain []*BlockHeader, settings *settings.Settings, logger ulogger.Logger) error {
 	// 2. Check that the block timestamp is not more than two hours in the future.
 	twoHoursToTheFutureTimestampUint32, err := safeconversion.Int64ToUint32(time.Now().Add(2 * time.Hour).Unix())
 	if err != nil {
-		return false, errors.NewProcessingError("[BLOCK][%s] failed to convert two hours to the future timestamp to uint32", b.String(), err)
+		return errors.NewProcessingError("[BLOCK][%s] failed to convert two hours to the future timestamp to uint32", b.String(), err)
 	}
 
 	if b.Header.Timestamp > twoHoursToTheFutureTimestampUint32 {
-		return false, errors.NewBlockInvalidError("[BLOCK][%s] block timestamp is more than two hours in the future", b.String())
+		return errors.NewBlockInvalidError("[BLOCK][%s] block timestamp is more than two hours in the future", b.String())
 	}
 
 	// 3. Check that the median time past of the block is after the median time past of the last 11 blocks.
@@ -520,23 +552,60 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		// calculate the median timestamp
 		medianTimestamp, err := CalculateMedianTimestamp(prevTimeStamps)
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		b.medianTimestamp, err = safeconversion.Int64ToUint32(medianTimestamp.Unix())
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		// validate that the block's timestamp is after the median timestamp
 		if b.Header.Timestamp <= b.medianTimestamp {
 			// if we're not on a chain that allows blocks to be generated quickly then return an error
 			if !settings.ChainCfgParams.GenerateSupported {
-				return false, errors.NewBlockInvalidError("block timestamp %d is not after median time past of last %d blocks %d", b.Header.Timestamp, pruneLength, medianTimestamp.Unix())
+				return errors.NewBlockInvalidError("block timestamp %d is not after median time past of last %d blocks %d", b.Header.Timestamp, pruneLength, medianTimestamp.Unix())
 			}
 			// otherwise just warn
 			logger.Warnf("block timestamp %d is not after median time past of last %d blocks %d", b.Header.Timestamp, pruneLength, medianTimestamp.Unix())
 		}
+	}
+
+	// 3b. Reject outdated block versions once the matching upgrade has activated (BIP34/66/65).
+	// Parity with bitcoin-sv ContextualCheckBlockHeader; must run before body/coinbase checks to
+	// match svnode's bad-version error priority.
+	if err := CheckBlockVersion(b.Header.Version, b.Height, settings.ChainCfgParams); err != nil {
+		return errors.NewBlockInvalidError("[BLOCK][%s] outdated block version", b.String(), err)
+	}
+
+	return nil
+}
+
+func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, txMetaStore utxo.Store, oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
+	currentChain []*BlockHeader, currentBlockHeaderIDs []uint32, settings *settings.Settings, metaRegenerator SubtreeMetaRegeneratorI) (bool, error) {
+	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "Valid",
+		tracing.WithHistogram(prometheusBlockValid),
+		tracing.WithLogMessage(logger, "[Block:Valid] called for %s", b.Header.String()),
+	)
+	defer deferFn()
+
+	// 1. Check that the block header hash is less than the target difficulty.
+	headerValid, _, err := b.Header.HasMetTargetDifficulty()
+	if err != nil {
+		return false, errors.NewProcessingError("[BLOCK][%s] error checking target difficulty", b.String(), err)
+	}
+
+	if !headerValid {
+		return false, errors.NewBlockInvalidError("[BLOCK][%s] block header hash is not less than the target difficulty", b.String())
+	}
+
+	// 2, 3, 3b: contextual header checks (2h-future timestamp, median-time-past, block-version
+	// floor). These depend on time.Now() and the current chain, so under optimistic mining they
+	// must be evaluated at block-receipt time rather than only in the background Valid() goroutine
+	// where time.Now() has drifted past receipt. Factored into CheckHeaderContextual so the
+	// optimistic path can run them synchronously before AddBlock (issue #1149).
+	if err := b.CheckHeaderContextual(currentChain, settings, logger); err != nil {
+		return false, err
 	}
 
 	// 4. Check that the coinbase transaction is valid (reward checked later).
@@ -561,18 +630,20 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		return false, errors.NewBlockInvalidError("[BLOCK][%s] bad coinbase length", b.String())
 	}
 
-	// We can only calculate the height from coinbase transactions in block versions 2 and higher
-
 	// https://en.bitcoin.it/wiki/BIP_0034
-	// BIP-34 was created to force miners to add the block height to the coinbase tx.
-	// This BIP came into effect at block 227,835, which is after the first halving
-	// at block 210,000.  Therefore, until this happened, we do not know the actual
-	// height of the block we are checking for.
+	// BIP-34 forces miners to encode the block height in the coinbase tx. It activates per network
+	// at ChainCfgParams.BIP0034Height; before that height the coinbase need not encode the height, so
+	// the check below is skipped. Enforcement is height-driven and version-independent — blocks below
+	// the mandatory version floor are already rejected above by CheckBlockVersion.
 
-	// TODO - do this another way, if necessary
-
-	// 5. Check that the coinbase transaction includes the correct block height.
-	if b.Header.Version > 1 && b.Height > LastV1Block {
+	// 5. Check that the coinbase transaction includes the correct block height (BIP34).
+	// Parity with bitcoin-sv ContextualCheckBlock: enforced for every block at/after BIP34Height.
+	// Version < 2 blocks are already rejected above (bad-version), so no version sub-condition here.
+	// The explicit b.Height > 0 guard is MANDATORY: on teratestnet/tstn BIP0034Height == 0, so
+	// heightAtOrAfterActivation(0, 0) is true and a height-0 (genesis-like) block driven through
+	// Valid() would otherwise attempt ExtractCoinbaseHeight — contradicting the genesis exemption
+	// that CheckBlockVersion already applies. svnode never runs this check on genesis.
+	if b.Height > 0 && heightAtOrAfterActivation(b.Height, settings.ChainCfgParams.BIP0034Height) {
 		height, err := b.ExtractCoinbaseHeight()
 		if err != nil {
 			return false, errors.NewBlockInvalidError("[BLOCK][%s] error extracting coinbase height", b.String(), err)
@@ -726,13 +797,15 @@ func (b *Block) releaseTxMap() {
 		_ = diskMap.Close()
 		ClearTxMapStats()
 	} else if poolable, ok := b.txMap.(*txmap.SplitSwissMapUint64); ok {
-		// Return the pooled in-memory map for reuse on the next block.
-		// b.TransactionCount was set in GetAndValidateSubtrees before
-		// checkDuplicateTransactions ran, so it matches the value used at
-		// GetTxMap time and the map lands in the correct size-class pool.
-		if n, err := safeconversion.Uint64ToUint32(b.TransactionCount); err == nil {
-			PutTxMap(poolable, n)
-		}
+		// Return the pooled in-memory map for reuse on the next block. The
+		// invariant this relies on is narrow and local: checkDuplicateTransactions
+		// assigns b.txMapCount immediately before GetTxMap and nothing between
+		// there and here writes it, so the Put key equals the Get key and the map
+		// lands in the pool it came from (counts above every size class are
+		// dropped by PutTxMap). Deliberately not stated in terms of
+		// b.TransactionCount, which GetAndValidateSubtrees only recomputes when
+		// Valid took the `subtreeStore != nil && len(b.Subtrees) > 0` branch.
+		PutTxMap(poolable, b.txMapCount)
 	} else if closer, ok := b.txMap.(io.Closer); ok {
 		_ = closer.Close()
 	}
@@ -905,21 +978,20 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 	g := new(errgroup.Group)
 	util.SafeSetLimit(logger, g, concurrency)
 
-	transactionCountUint32, err := safeconversion.Uint64ToUint32(b.TransactionCount)
-	if err != nil {
-		return errors.NewProcessingError("[checkDuplicateTransactions][%s] failed to convert transaction count to int", b.String(), err)
-	}
-
 	// set the expected subtree size based on the first subtree in the block
 	subtreeSize := 0
 	if len(b.SubtreeSlices) > 0 {
 		subtreeSize = b.SubtreeSlices[0].Size()
 	}
 
+	// Size both map variants from the loaded block body rather than the
+	// peer-supplied TransactionCount, and keep the value for the release key.
+	b.txMapCount = b.txMapEntryCount()
+
 	if len(diskMapDirs) > 0 {
-		// An empty (coinbase-only) block has TransactionCount == 0, but the
-		// mmap-backed table rejects a zero capacity — clamp to 1.
-		filterCapacity := b.TransactionCount
+		// An empty (coinbase-only) block inserts nothing, but the mmap-backed
+		// table rejects a zero capacity — clamp to 1.
+		filterCapacity := b.txMapCount
 		if filterCapacity == 0 {
 			filterCapacity = 1
 		}
@@ -935,8 +1007,10 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 	} else {
 		// Draw the txMap from a size-class pool so the (potentially multi-GB)
 		// backing storage is reused across blocks. PutTxMap is called at
-		// release time below, keyed by the same transactionCountUint32.
-		b.txMap = GetTxMap(transactionCountUint32)
+		// release time below, keyed by the same 64-bit count held in
+		// b.txMapCount — counts above every size class allocate fresh with a
+		// bounded preallocation hint instead of failing the block (issue 1428).
+		b.txMap = GetTxMap(b.txMapCount)
 	}
 	for subIdx := 0; subIdx < len(b.SubtreeSlices); subIdx++ {
 		subIdx := subIdx
@@ -947,12 +1021,39 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 		})
 	}
 
-	if err = g.Wait(); err != nil {
+	if err := g.Wait(); err != nil {
 		// return the error from above without wrapping it
 		return err
 	}
 
 	return nil
+}
+
+// txMapEntryCount returns the number of entries the duplicate check will insert,
+// summed over the loaded subtree bodies. It is exact bar one:
+// checkDuplicateTransactionsInSubtree skips the coinbase placeholder at
+// subIdx 0/txIdx 0 and nothing else.
+//
+// This deliberately does NOT use b.TransactionCount. That field is read straight
+// off a wire varint by readBlockFromReader, and GetAndValidateSubtrees only
+// recomputes it from the real subtree contents inside the
+// `subtreeStore != nil && len(b.Subtrees) > 0` guard in Valid, while the
+// duplicate check runs unconditionally. Sizing an allocation from it therefore
+// trusts a peer-chosen integer on paths where nothing has reconciled it against
+// the body (issue 1501). The slices below are already loaded by the time any
+// caller needs this, so the honest count costs one len() per subtree: for a
+// truthful block the derived number *is* TransactionCount, and for a block
+// claiming more than it carries the map is sized for what it actually carries.
+func (b *Block) txMapEntryCount() uint64 {
+	var n uint64
+
+	for _, subtree := range b.SubtreeSlices {
+		if subtree != nil {
+			n += uint64(len(subtree.Nodes))
+		}
+	}
+
+	return n
 }
 
 // checkDuplicateTransactionsInSubtree checks for duplicate transactions in a subtree.
@@ -1002,6 +1103,35 @@ func (b *Block) checkDuplicateTransactionsInSubtree(subtree *subtreepkg.Subtree,
 	return nil
 }
 
+// parentSpendsCapacity returns the capacity hint for the parent-spends map:
+// entryCount (taken from the loaded block body) times the assumed average
+// inputs per transaction. A multiplier of 0 is treated as 1, and the result is
+// never 0 because the mmap-backed table rejects a zero capacity.
+//
+// entryCount is bounded by the subtrees actually held in memory, so it cannot
+// overflow the product on its own. The multiplier can: it is operator-supplied
+// (block_parentSpendsCapacityMultiplier) and unvalidated. On overflow this
+// returns entryCount unmultiplied — losing the headroom but keeping a real
+// number — because NewSplitSyncedParentMap computes
+// uint32((e + e/5) / nrOfBuckets), which turns a wrapped or saturated hint into
+// an arbitrary per-bucket size rather than merely a small one.
+func parentSpendsCapacity(entryCount, multiplier uint64) uint64 {
+	if multiplier == 0 {
+		multiplier = 1
+	}
+
+	capacity := entryCount * multiplier
+	if capacity/multiplier != entryCount {
+		capacity = entryCount
+	}
+
+	if capacity == 0 {
+		return 1
+	}
+
+	return capacity
+}
+
 type validationDependencies struct {
 	txMetaStore           utxo.Store
 	subtreeStore          SubtreeStore
@@ -1021,20 +1151,26 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 		return errors.NewStorageError("[validOrderAndBlessed][%s] txMap is nil, cannot check transaction order", b.String())
 	}
 
-	// Size the parent-spends map at TransactionCount * multiplier (assumed
+	// Size the parent-spends map at transaction count * multiplier (assumed
 	// average inputs/tx). For the disk-backed map this is a hard cap, so the
 	// multiplier is configurable (block_parentSpendsCapacityMultiplier); a
 	// consolidation-heavy block exceeding it overflows a segment and halts
 	// (fail-safe). 0 is treated as 1.
-	if parentSpendsCapacityMultiplier == 0 {
-		parentSpendsCapacityMultiplier = 1
-	}
-	expectedInpoints := b.TransactionCount * parentSpendsCapacityMultiplier
-	if expectedInpoints == 0 {
-		// Empty (coinbase-only) block: TransactionCount == 0, but the
-		// mmap-backed table rejects a zero capacity — clamp to 1.
-		expectedInpoints = 1
-	}
+	//
+	// The transaction count comes from the loaded block body, not from the
+	// peer-supplied b.TransactionCount — see txMapEntryCount for why (issue
+	// 1501). That alone bounds this product: the node count is limited by the
+	// subtrees actually held in memory, so a claimed count can no longer drive
+	// it. The remaining overflow route is the multiplier itself, which is
+	// operator-supplied (block_parentSpendsCapacityMultiplier) and unvalidated.
+	//
+	// Recomputed here rather than read from b.txMapCount, deliberately: that
+	// field is only set by checkDuplicateTransactions, and callers that invoke
+	// this method directly (rather than through Valid, which always runs step 11
+	// first) would otherwise size from a zero. Recomputing is one len() per
+	// subtree and keeps this method self-contained — please do not "tidy" it into
+	// reading the field.
+	expectedInpoints := parentSpendsCapacity(b.txMapEntryCount(), parentSpendsCapacityMultiplier)
 
 	var psMap ParentSpendsMap
 	if len(diskMapDirs) > 0 {
