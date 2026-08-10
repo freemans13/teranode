@@ -1446,8 +1446,10 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 //   - tx: Full transaction data
 //   - inputs: Transaction inputs
 //   - outputs: Transaction outputs
-//   - blockIDs: Block references
-//   - parentTxHashes: Previous transaction hashes
+//   - blockIDs, blockHeights, subtreeIdxs: where this transaction has been mined,
+//     index-aligned — entry i of each describes one placement. All three come from
+//     a single query, so requesting any one of them runs it and fills all three.
+//   - txInpoints: parent outpoints referenced by this transaction
 func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fields ...fields.FieldName) (*meta.Data, error) {
 	bins := utxo.MetaFieldsWithTx
 	if len(fields) > 0 {
@@ -1650,7 +1652,7 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		}
 	}
 
-	if contains(bins, fields.BlockIDs) {
+	if needsBlockIDsQuery(bins) {
 		q := `
 			SELECT
 			    block_id,
@@ -1778,6 +1780,16 @@ func contains(slice []fields.FieldName, item fields.FieldName) bool {
 	}
 
 	return false
+}
+
+// needsBlockIDsQuery reports whether any field served by the single block_ids
+// query was requested. BlockIDs, BlockHeights and SubtreeIdxs all come from that
+// one query, so asking for any of them has to run it. Both read paths call this
+// so the grouping is stated once rather than copied.
+func needsBlockIDsQuery(bins []fields.FieldName) bool {
+	return contains(bins, fields.BlockIDs) ||
+		contains(bins, fields.BlockHeights) ||
+		contains(bins, fields.SubtreeIdxs)
 }
 
 // parseInsertedAtMillis converts the inserted_at column value into Unix
@@ -3683,7 +3695,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 
 	needInputs := contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)
 	needOutputs := contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos)
-	needBlockIDs := contains(bins, fields.BlockIDs)
+	needBlockIDs := needsBlockIDsQuery(bins)
 
 	// Query 2: Bulk fetch inputs
 	if needInputs {
