@@ -42,8 +42,15 @@ func NewNullStore() (*NullStore, error) {
 	return &NullStore{}, nil
 }
 
+// SetBlockHeight rejects height zero like the real stores, so the null store
+// satisfies the same interface contract rather than being a laxer special case.
 func (m *NullStore) SetBlockHeight(height uint32) error {
+	if height == 0 {
+		return errors.NewInvalidArgumentError("block height cannot be zero")
+	}
+
 	m.blockState.SetHeight(height)
+
 	return nil
 }
 
@@ -60,7 +67,12 @@ func (m *NullStore) GetMedianBlockTime() uint32 {
 	return m.blockState.Load().MedianTime
 }
 
+// SetBlockState rejects height zero like the real stores; see SetBlockHeight.
 func (m *NullStore) SetBlockState(height, medianTime uint32) error {
+	if height == 0 {
+		return errors.NewInvalidArgumentError("block height cannot be zero")
+	}
+
 	m.blockState.SetPair(height, medianTime)
 
 	return nil

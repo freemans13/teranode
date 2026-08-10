@@ -596,6 +596,12 @@ type Store interface {
 	// rather than the two individual setters, whose back-to-back calls leave
 	// a window where a reader pairs a new height with a stale median time
 	// (issue 1443).
+	//
+	// height must be non-zero, matching SetBlockHeight: implementations
+	// return an ErrInvalidArgument error for zero rather than publishing a
+	// snapshot that cannot be distinguished from a store that was never
+	// written. medianTime has no such restriction — zero is the legitimate
+	// "not yet known" value.
 	SetBlockState(height, medianTime uint32) error
 
 	// GetBlockState returns the block height and median block time as one
