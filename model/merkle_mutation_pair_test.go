@@ -3,7 +3,6 @@ package model
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -130,45 +129,33 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 		"CVE-2012-2459: honest (7-tx) and mutant (8-tx, duplicated T6) subtree layouts must "+
 			"produce the SAME merkle root under go-subtree's duplicate-last-node-when-odd rule")
 
-	// Sampled ONCE and shared by both headers. Sampling inside buildHeader would take
-	// time.Now() twice, and a second boundary falling between the two calls would give the
-	// honest and mutant headers different timestamps — hence different block hashes — and
-	// flake the identical-hash assertion below.
-	timestamp := uint32(time.Now().Unix()) //nolint:gosec
+	// ONE header, mined once, shared by both blocks. That sharing IS the crux of the CVE and
+	// is why there is no honest-vs-mutant hash comparison here: since the roots are equal
+	// (asserted above), a header built from each would be bit-identical, so comparing their
+	// hashes could not fail unless that assertion already had. Hanging both bodies off a
+	// single header states the property directly — one block hash, one proof-of-work, two
+	// different transaction lists — instead of restating it as an assertion that cannot fail.
+	// It also avoids grinding the same nonce twice.
+	bits, err := NewNBitFromString("207fffff")
+	require.NoError(t, err)
 
-	buildHeader := func(root *chainhash.Hash) *BlockHeader {
-		bits, bitsErr := NewNBitFromString("207fffff")
-		require.NoError(t, bitsErr)
-
-		h := &BlockHeader{
-			Version:        1,
-			HashPrevBlock:  &chainhash.Hash{},
-			HashMerkleRoot: root,
-			Timestamp:      timestamp,
-			Bits:           *bits,
-			Nonce:          0,
-		}
-
-		for {
-			if ok, _, _ := h.HasMetTargetDifficulty(); ok {
-				break
-			}
-
-			require.Less(t, h.Nonce, uint32(1_000_000), "could not grind a nonce meeting the easy target")
-			h.Nonce++
-		}
-
-		return h
+	sharedHeader := &BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: honestRoot, // == mutantRoot, asserted above
+		Timestamp:      1231006505, // fixed, so the test is deterministic
+		Bits:           *bits,
+		Nonce:          0,
 	}
 
-	honestHeader := buildHeader(honestRoot)
-	mutantHeader := buildHeader(mutantRoot)
+	for {
+		if ok, _, _ := sharedHeader.HasMetTargetDifficulty(); ok {
+			break
+		}
 
-	// Same merkle root plus identical other header fields (version, prev-hash,
-	// timestamp, bits, nonce) -> identical block hash. This is the crux of the CVE: the
-	// attacker replays the honest proof-of-work over a doctored body.
-	require.True(t, honestHeader.Hash().IsEqual(mutantHeader.Hash()),
-		"CVE-2012-2459: honest and mutant blocks must produce the SAME block hash")
+		require.Less(t, sharedHeader.Nonce, uint32(1_000_000), "could not grind a nonce meeting the easy target")
+		sharedHeader.Nonce++
+	}
 
 	buildBlock := func(header *BlockHeader, subtrees []*subtreepkg.Subtree) *Block {
 		subtreeHashes := make([]*chainhash.Hash, len(subtrees))
@@ -187,8 +174,11 @@ func TestCVE20122459_MerkleMutantPair_SameHashDifferentBody(t *testing.T) {
 		return b
 	}
 
-	honestBlock := buildBlock(honestHeader, honestSubtrees)
-	mutantBlock := buildBlock(mutantHeader, mutantSubtrees)
+	// Both bodies hang off the SAME header, so they necessarily share a block hash.
+	honestBlock := buildBlock(sharedHeader, honestSubtrees)
+	mutantBlock := buildBlock(sharedHeader, mutantSubtrees)
+	require.True(t, honestBlock.Hash().IsEqual(mutantBlock.Hash()),
+		"the two blocks must be indistinguishable by hash — that is what makes the mutation free")
 
 	// --- (b) CheckMerkleRoot passes on BOTH -------------------------------------------
 	require.NoError(t, honestBlock.CheckMerkleRoot(ctx))
