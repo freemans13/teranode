@@ -11,6 +11,19 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 )
 
+// maxFutureBlockTime mirrors the two-hours-in-the-future ceiling that
+// model.Block CheckHeaderContextual applies to every header unconditionally —
+// unlike the median-time rule, that check needs no currentChain, so the local
+// submit path does enforce it (model/Block.go).
+//
+// Deliberately a second copy rather than a shared constant, for now. Declaring
+// it once is issue #1528, which settles on `settings` as the home — the same
+// place PR #1481 had to put the eleven-block window, since `settings` cannot
+// import `model` without an import cycle. Doing it here would edit
+// model/Block.go while #1481 is changing that same consensus-critical function,
+// which is a merge conflict worth not having.
+const maxFutureBlockTime = 2 * time.Hour
+
 // mtpFloorEntry is the median-time-past floor for one parent block. The median
 // of the 11 headers ending at a given hash can never change — headers are
 // immutable once stored — so it is computed once per parent and reused for
@@ -77,11 +90,7 @@ func (b *BlockAssembler) candidateTime(ctx context.Context, parentHeader *model.
 
 	// Check the ceiling before applying the floor: when the two cross there is
 	// no valid timestamp at all and flooring makes things worse, not better.
-	// model.MaxFutureBlockTime rather than a local copy: this is the ceiling
-	// CheckHeaderContextual will judge the mined block against, and it needs no
-	// currentChain, so the local submit path enforces it too. A second copy here
-	// would let the producer and its own validator drift apart silently.
-	if maxTime := timeNow + int64(model.MaxFutureBlockTime/time.Second); entry.minTime > maxTime {
+	if maxTime := timeNow + int64(maxFutureBlockTime/time.Second); entry.minTime > maxTime {
 		if b.generateSupported() {
 			// Latched per parent like the floor warning below: this branch stays
 			// engaged for as long as the clock condition lasts, and it sits on a
