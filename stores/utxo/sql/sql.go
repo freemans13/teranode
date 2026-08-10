@@ -101,18 +101,18 @@ type batchSpend struct {
 
 // Store implements the UTXO store interface using a SQL database backend.
 type Store struct {
-	logger          ulogger.Logger
-	settings        *settings.Settings
-	db              *usql.DB
-	storeURL        *url.URL
-	engine          string
-	blockHeight     atomic.Uint32
-	blockState      utxo.BlockStateHolder
-	ctx             context.Context
-	spendBatcher    *batcher.Batcher[batchSpend]
-	getBatcher      *batcher.Batcher[batchGetItem]
-	createBatcher   *batcher.Batcher[batchCreateItem]
-	unlockBatcher   *batcher.Batcher[batchUnlockItem]
+	logger        ulogger.Logger
+	settings      *settings.Settings
+	db            *usql.DB
+	storeURL      *url.URL
+	engine        string
+	blockHeight   atomic.Uint32
+	blockState    utxo.BlockStateHolder
+	ctx           context.Context
+	spendBatcher  *batcher.Batcher[batchSpend]
+	getBatcher    *batcher.Batcher[batchGetItem]
+	createBatcher *batcher.Batcher[batchCreateItem]
+	unlockBatcher *batcher.Batcher[batchUnlockItem]
 }
 
 // batchUnlockItem represents a single SetLocked(false) request.
@@ -189,13 +189,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	s := &Store{
-		logger:          logger,
-		settings:        tSettings,
-		db:              db,
-		storeURL:        storeURL,
-		engine:          storeURL.Scheme,
-		blockHeight:     atomic.Uint32{},
-		ctx:             ctx,
+		logger:      logger,
+		settings:    tSettings,
+		db:          db,
+		storeURL:    storeURL,
+		engine:      storeURL.Scheme,
+		blockHeight: atomic.Uint32{},
+		ctx:         ctx,
 	}
 
 	otelTracer := tracing.Tracer("utxo").OTelTracer()
