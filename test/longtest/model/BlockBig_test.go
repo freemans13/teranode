@@ -73,6 +73,11 @@ func anchorBlockOnTestChain(t *testing.T, block *teranode_model.Block) ([]*teran
 		}
 
 		block.Header.Nonce++
+
+		// Bounded like the sibling grinders in services/blockvalidation. The regtest target is
+		// easy enough that this never runs long, but an unbounded loop turns any future change
+		// to the target into a hung long-test suite rather than a failing test.
+		require.Less(t, block.Header.Nonce, uint32(10_000_000), "could not find a valid nonce")
 	}
 
 	return currentChain, currentChainIDs

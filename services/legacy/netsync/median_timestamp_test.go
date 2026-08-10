@@ -294,6 +294,24 @@ func TestCandidateParentMedianTimeForBlock_WalkFallbackRecoversFromBadBatchedFet
 	require.Equal(t, uint32(100), got, "MTP must come from the correct chain, not from the racy batched fetch")
 }
 
+// TestCandidateParentMedianTimeFromHeaders_AcceptsShortRunAtGenesis is the other side of the
+// rule, and the half netsync was missing while its subtreevalidation twin had both: a chain that
+// genuinely ends at genesis is shorter than 11 legitimately, exactly as in svnode, and must still
+// produce a median. Without it the short-run test alone is satisfied by a helper that rejects
+// every short run, which would break the early chain on teratestnet, tstn and stn — the networks
+// where CSVHeight is 0 and a candidate can legitimately sit below the first 11 blocks.
+func TestCandidateParentMedianTimeFromHeaders_AcceptsShortRunAtGenesis(t *testing.T) {
+	headers := makeChain(t, 3, []uint32{130, 120, 110})
+	parent := headers[0].Hash()
+
+	require.True(t, headers[len(headers)-1].HashPrevBlock.IsEqual(&chainhash.Hash{}),
+		"fixture's oldest header must be genesis-rooted, or this tests the wrong rule")
+
+	got, err := candidateParentMedianTimeFromHeaders(parent, headers)
+	require.NoError(t, err)
+	require.Equal(t, uint32(120), got)
+}
+
 // TestCandidateParentMedianTimeFromHeaders_ErrorsOnShortRunNotAtGenesis pins the
 // run-length half of the window contract. Truncating the run at its OLDEST end
 // leaves it anchored at the parent and correctly linked, so neither of those
