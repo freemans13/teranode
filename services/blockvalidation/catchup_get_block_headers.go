@@ -126,10 +126,18 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 	// catchup that validated some blocks before erroring out, the blockchain store can
 	// be many blocks ahead of the UTXO store.
 	//
-	// This matters because findCommonAncestor rejects any block whose height exceeds the
-	// UTXO height (those blocks exist in the blockchain store but aren't fully processed).
-	// If the locator starts from blockchain height, the peer returns headers from that
-	// height onwards, and findCommonAncestor rejects them all — "no common ancestor found".
+	// The cap existed because findCommonAncestor used to reject any block above that same
+	// UTXO height, so a locator built from the chain tip yielded headers it rejected all of
+	// — "no common ancestor found". That is no longer the case: the ancestor ceiling is now
+	// the blockchain tip, and a locator built from the tip would resolve normally.
+	//
+	// What the cap does now is start the peer's header stream lower than necessary, so the
+	// ancestor walk climbs back through headers we already hold. That costs extra
+	// GetBlockHeader lookups, bounded by the lag, and changes no outcome — the walk still
+	// stops at our tip and the depth is still measured from it. It is kept because asking
+	// from lower is the conservative direction and the cost is small; removing it is a
+	// separate tidy, not a correctness fix. Note it also sets startHash/startHeight, which
+	// are reported on the catchup Result and not used in any decision.
 	if u.utxoStore != nil {
 		utxoHeight := u.utxoStore.GetBlockHeight()
 		if bestBlockMeta.Height > utxoHeight {
