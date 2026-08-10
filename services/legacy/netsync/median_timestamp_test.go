@@ -319,3 +319,27 @@ func TestCandidateParentMedianTimeFromHeaders_ErrorsOnShortRunNotAtGenesis(t *te
 	_, err = candidateParentMedianTimeFromHeaders(parent, short)
 	require.Error(t, err, "a short run that does not reach genesis must be refused, not measured")
 }
+
+// TestCandidateParentMedianTimeFromHeaders_ErrorsOnOverLongRun pins the guard block assembly's
+// copy of this logic already has (verifyParentChainRun in services/blockassembly/candidate_time.go).
+//
+// A run LONGER than the window is as wrong as one shorter than it: the median would be taken over
+// blocks the consensus rule does not include, and the anchor and linkage checks cannot see it —
+// an over-long run is still anchored at the parent and still correctly linked. Unreachable today,
+// because the only caller requests exactly MedianTimeBlocks headers and the store cannot return
+// more than asked; the point is that the three copies of this helper agree, so a later change to
+// the request size fails loudly in all of them rather than silently widening the window in two.
+func TestCandidateParentMedianTimeFromHeaders_ErrorsOnOverLongRun(t *testing.T) {
+	n := int(blockchain.MedianTimeBlocks) + 1
+
+	timestamps := make([]uint32, n)
+	for i := range timestamps {
+		timestamps[i] = uint32(1_700_000_000 + i)
+	}
+
+	headers := makeChain(t, n, timestamps)
+
+	_, err := candidateParentMedianTimeFromHeaders(headers[0].Hash(), headers)
+	require.Error(t, err, "a run longer than the median window must be refused")
+	require.Contains(t, err.Error(), "more than")
+}

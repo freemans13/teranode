@@ -268,6 +268,13 @@ type BlockValidation struct {
 	// blocking forever on a full channel after the worker is gone at shutdown.
 	revalidateWorkerStopped chan struct{}
 
+	// revalidateWorkerRunning is set when that consumer is launched. It answers the case
+	// revalidateWorkerStopped cannot: a worker that never STARTED never closes the stop
+	// signal either, so a producer facing a full channel would have no consumer and no
+	// escape and would park permanently. Set before the goroutine is spawned, so a producer
+	// can never observe "not running" for a worker that is about to drain.
+	revalidateWorkerRunning atomic.Bool
+
 	// stats tracks operational metrics for monitoring
 	stats *gocore.Stat
 
@@ -763,6 +770,10 @@ func (u *BlockValidation) start(ctx context.Context) error {
 
 	// start a worker to revalidate blocks
 	u.logger.Infof("[BlockValidation:start] starting reValidation goroutine")
+
+	// Set before the spawn, not inside it: a producer that saw "not running" for a worker
+	// already on its way would drop a block the worker was about to drain.
+	u.revalidateWorkerRunning.Store(true)
 
 	go func() {
 		// Signal producers (site 1's re-enqueue and ReValidateBlock) that this sole
@@ -2496,6 +2507,16 @@ func (u *BlockValidation) enqueueRevalidation(data revalidateBlockData) {
 	select {
 	case u.revalidateBlockChan <- data:
 	default:
+		// A worker that never started never closes revalidateWorkerStopped, so the guarded
+		// send below would have neither a consumer nor an escape and would park this
+		// goroutine permanently. Blocking for backpressure is only correct while something
+		// is draining.
+		if !u.revalidateWorkerRunning.Load() {
+			u.logger.Warnf("[ReValidateBlock][%s] dropped: revalidation worker never started", block.String())
+
+			return
+		}
+
 		select {
 		case u.revalidateBlockChan <- data:
 		case <-u.revalidateWorkerStopped:

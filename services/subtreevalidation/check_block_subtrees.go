@@ -1588,6 +1588,17 @@ func candidateParentMedianTimeFromHeaders(parentHash *chainhash.Hash, headers []
 		return 0, errors.NewProcessingError("returned chain head does not match requested parent hash (possible reorg between header probe and fetch)")
 	}
 
+	// A run LONGER than the window is as wrong as one shorter than it, and just as invisible to
+	// the anchor and linkage checks: an over-long run is still anchored at the parent and still
+	// correctly linked, but its median covers blocks the consensus rule excludes. Unreachable
+	// while the only caller requests exactly MedianTimeBlocks, which the store cannot exceed;
+	// enforced so that all three copies of this helper — here, netsync, and block assembly's
+	// verifyParentChainRun — agree, and a later change to the request size fails loudly rather
+	// than silently widening the window in some of them.
+	if uint64(len(headers)) > blockchain.MedianTimeBlocks {
+		return 0, errors.NewProcessingError("run below parent %s holds %d headers, more than the %d the median window covers", parentHash.String(), len(headers), blockchain.MedianTimeBlocks)
+	}
+
 	for i := 1; i < len(headers); i++ {
 		if headers[i] == nil {
 			return 0, errors.NewProcessingError("nil header at depth %d", i)

@@ -181,3 +181,21 @@ func TestCandidateParentMedianTimeFromHeaders_AcceptsShortRunAtGenesis(t *testin
 	require.NoError(t, err)
 	require.Equal(t, uint32(120), got)
 }
+
+// TestCandidateParentMedianTimeFromHeaders_ErrorsOnOverLongRun mirrors the netsync copy: see the
+// comment there. A run longer than the window is as wrong as a short one and is invisible to the
+// anchor and linkage checks, and block assembly's verifyParentChainRun already refuses it.
+func TestCandidateParentMedianTimeFromHeaders_ErrorsOnOverLongRun(t *testing.T) {
+	n := int(blockchain.MedianTimeBlocks) + 1
+
+	timestamps := make([]uint32, n)
+	for i := range timestamps {
+		timestamps[i] = uint32(1_700_000_000 + i)
+	}
+
+	headers := makeChain(t, n, timestamps)
+
+	_, err := candidateParentMedianTimeFromHeaders(headers[0].Hash(), headers)
+	require.Error(t, err, "a run longer than the median window must be refused")
+	require.Contains(t, err.Error(), "more than")
+}
