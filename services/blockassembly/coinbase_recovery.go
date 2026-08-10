@@ -27,14 +27,38 @@ const coinbaseRecoveryRetryBackoff = 500 * time.Millisecond
 // error codes, and once every failure is wrapped in the same processing error
 // the distinction is only recoverable by matching on the wrapped code -- which
 // then also matches a store failure that happens to carry the same code.
+//
+// A not-found from the client is not on its own proof that the chain stops
+// short of this height, and must be corroborated before it is believed. The
+// blockchain gRPC server relabels every store failure as block-not-found
+// (services/blockchain/Server.go, GetBlockByHeight), and teranode's errors.Is
+// matches *Error values by code, so a query failure, a dropped connection or a
+// driver deadline all arrive here indistinguishable from a genuinely absent
+// block. Block assembly runs that gRPC client in production while every test
+// drives the local client, which does keep storage errors and not-found apart
+// -- so believing the tag would pass the tests and fail on the real node.
+//
+// Believing it wrongly is the expensive direction: canonicalBlockAbsent short
+// circuits withProbeRetry before the retry budget is touched, and the startup
+// scan skips the height rather than abandoning the boot with a visible error,
+// so a blockchain service that is down for the whole window would silently skip
+// every height and report nothing. Corroborating against the chain height costs
+// one extra call on a path that is rare on a healthy node, and an
+// uncorroborated not-found is treated as possibly transient so the retry budget
+// engages as intended.
 func (b *BlockAssembler) canonicalBlockAt(ctx context.Context, height uint32) (*model.Block, error) {
 	blk, err := b.blockchainClient.GetBlockByHeight(ctx, height)
 	if err != nil {
-		if errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound) {
+		if (errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound)) && b.chainStopsBelow(ctx, height) {
 			return nil, errors.NewBlockNotFoundError("[coinbaseRecovery] no canonical block at height %d", height, err)
 		}
 
-		return nil, errors.NewProcessingError("[coinbaseRecovery] cannot get canonical block at height %d", height, err)
+		// The cause is folded in as text rather than wrapped. teranode's
+		// errors.Is matches *Error values by code through the wrapped chain, so
+		// wrapping an uncorroborated not-found would leave canonicalBlockAbsent
+		// still answering true for it -- which is the whole condition this branch
+		// exists to deny.
+		return nil, errors.NewProcessingError("[coinbaseRecovery] cannot get canonical block at height %d: %s", height, err.Error())
 	}
 
 	if blk == nil {
@@ -42,6 +66,23 @@ func (b *BlockAssembler) canonicalBlockAt(ctx context.Context, height uint32) (*
 	}
 
 	return blk, nil
+}
+
+// chainStopsBelow reports whether the canonical chain genuinely does not reach
+// the given height, corroborating a not-found from the blockchain client
+// against the chain's own best height (see canonicalBlockAt).
+//
+// It answers false when the corroborating lookup itself fails. That keeps the
+// unprovable case on the retry path rather than the skip path: a client that
+// cannot answer this question is exactly the client whose not-found should not
+// be trusted.
+func (b *BlockAssembler) chainStopsBelow(ctx context.Context, height uint32) bool {
+	_, meta, err := b.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil || meta == nil {
+		return false
+	}
+
+	return height > meta.Height
 }
 
 // canonicalCoinbaseAt reports whether block assembly's UTXO store holds the
@@ -380,7 +421,7 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 
 	consecutiveGood := 0
 	scanned := 0
-	floorProven := false
+	gapReachedFloor := false
 
 	for h := int64(triggerHeight); h >= int64(safetyFloor); h-- {
 		present, blk, err := b.canonicalCoinbaseAt(ctx, uint32(h))
@@ -391,8 +432,6 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 		if present {
 			consecutiveGood++
 			if consecutiveGood >= needConsecutive {
-				floorProven = true
-
 				break
 			}
 
@@ -403,17 +442,43 @@ func (b *BlockAssembler) scopeCoinbaseGap(ctx context.Context, triggerHeight uin
 		gap = append(gap, blk)
 		scanned++
 
+		if uint32(h) == safetyFloor { //nolint:gosec // h is bounded below by safetyFloor, a uint32
+			// The lowest height that can be probed safely is itself missing, so
+			// the divergence probably carries on below it -- into heights where
+			// absence proves nothing. That is the case worth refusing.
+			gapReachedFloor = true
+		}
+
 		if scanned > maxGap {
 			return nil, errCoinbaseGapTooLarge
 		}
 	}
 
-	if len(gap) > 0 && !floorProven {
-		// The walk ran out of safely-probeable heights while still inside the
-		// gap, so nothing proves the blocks collected were never created
-		// rather than created-spent-and-pruned. Refuse to repair on a guess.
+	if gapReachedFloor {
+		// Refuse the whole walk rather than repairing its safe part. The blocks
+		// collected are provably safe (see below), but the part of the
+		// divergence that continues below the floor is not visible from here, so
+		// a partial repair would report success while leaving the rest to wedge
+		// the tip on its maturity spend. Escalating names a remedy that covers
+		// all of it.
 		return nil, errCoinbaseFloorNotProven
 	}
+
+	// Deliberately no "was the floor proven by consecutive-good runs?" test here.
+	// Every height the loop visits is at or above safetyFloor, and the floor's
+	// definition is that such a height is too young to have been spent and
+	// therefore cannot have been pruned -- so absence at any collected height
+	// already means "never created", whatever the consecutive-good run did.
+	//
+	// Conflating the two refused repairs that were provably safe, and did it in
+	// the worst place: the bottom of the scan window is the set of coinbases
+	// closest to maturity, i.e. the last chance to fix a hole before its
+	// maturity spend wedges the tip. With the default ConsecutiveGood of 6, a
+	// single miss two heights above the floor left consecutiveGood at 2 and
+	// raised MANUAL INTERVENTION REQUIRED for a one-block repair that could not
+	// have resurrected anything. The consecutive-good rule guards against
+	// under-scoping a gap (a concurrent-create hole above still-missing
+	// heights); it was never what made the repair safe.
 
 	// gap was accumulated walking toward genesis (descending height);
 	// reverse it so callers get a deterministic ascending-height repair order.

@@ -1029,9 +1029,28 @@ type interposedBlockchainClient struct {
 	// that height, standing in for a shutdown that lands mid-probe.
 	cancelAtHeight *uint32
 	cancel         context.CancelFunc
+
+	// grpcStyleFaultHeights answer with a block-not-found *wrapping* a storage
+	// error, which is what the blockchain gRPC server produces for any store
+	// failure (services/blockchain/Server.go, GetBlockByHeight). It is the one
+	// shape no other field here can produce, and the one production actually
+	// emits: absentHeights models a chain that genuinely stops short, and
+	// failuresLeft models a client honest enough to say it failed.
+	grpcStyleFaultHeights map[uint32]bool
+
+	// grpcStyleFaults counts how many such answers were given, so a test can
+	// assert the retry budget was spent on them rather than skipped over.
+	grpcStyleFaults int
 }
 
 func (c *interposedBlockchainClient) GetBlockByHeight(ctx context.Context, height uint32) (*model.Block, error) {
+	if c.grpcStyleFaultHeights[height] {
+		c.grpcStyleFaults++
+
+		return nil, errors.NewBlockNotFoundError("[Blockchain] block not found at height",
+			errors.NewStorageError("failed to get block by height"))
+	}
+
 	if c.absentHeights[height] {
 		return nil, errors.NewBlockNotFoundError("no canonical block at height %d", height)
 	}
@@ -1061,6 +1080,7 @@ type capturingLogger struct {
 	mu    sync.Mutex
 	warns []string
 	errs  []string
+	infos []string
 }
 
 func newCapturingLogger() *capturingLogger {
@@ -1095,8 +1115,19 @@ func (l *capturingLogger) contains(lines []string, substr string) bool {
 	return false
 }
 
+func (l *capturingLogger) Infof(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.infos = append(l.infos, fmt.Sprintf(format, args...))
+}
+
 func (l *capturingLogger) sawWarn(substr string) bool {
 	return l.contains(l.warns, substr)
+}
+
+func (l *capturingLogger) sawInfo(substr string) bool {
+	return l.contains(l.infos, substr)
 }
 
 func (l *capturingLogger) sawError(substr string) bool {
@@ -1165,12 +1196,24 @@ func TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip(t *tes
 	require.True(t, present, "a single transient probe failure must not cost the whole scan")
 }
 
-// TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock covers the
-// second half of ChiR9. canonicalCoinbaseAt turns "the chain has no block at
-// this height" into a hard error, which used to abandon the scan. That says
-// nothing about the health of the client, so the scan must skip the height and
-// carry on checking the ones below it.
-func TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock(t *testing.T) {
+// TestStartupCoinbaseDivergenceCheck_NotFoundBelowTheChainTipIsTreatedAsAFault
+// replaces the second half of ChiR9's coverage, which ChiR16 supersedes.
+//
+// That half asserted that a not-found for a height *below* the chain tip was
+// skipped so the scan carried on beneath it. The premise does not survive
+// ChiR16: for any height the chain actually reaches there is by definition a
+// canonical block there, so a not-found below the tip is not the chain saying
+// "nothing here" -- it is the blockchain client failing to answer while wearing
+// the not-found badge the gRPC server puts on every store error. Skipping it is
+// what let a service outage pass for a clean scan.
+//
+// So the corrected contract is the opposite one, and it is what this test pins:
+// an uncorroborated not-found spends the retry budget and, if it persists,
+// abandons the scan with the visible Errorf rather than silently skipping the
+// height. Genuine absence -- a height above the chain tip -- is still skipped,
+// and that path keeps its own coverage in
+// TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight.
+func TestStartupCoinbaseDivergenceCheck_NotFoundBelowTheChainTipIsTreatedAsAFault(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx := t.Context()
@@ -1180,8 +1223,8 @@ func TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock(t *testi
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
 
-	// heights 1..5, with 2 missing its coinbase, below a height (4) the
-	// interposer reports as having no canonical block.
+	// heights 1..5, with 2 missing its coinbase, below a height (4) the client
+	// answers "not found" for even though the chain plainly reaches height 5.
 	headers := buildCanonicalChain(ctx, t, items, 5)
 	for _, h := range []uint32{1, 3, 5} {
 		seedCoinbase(ctx, t, items, headers, h)
@@ -1196,11 +1239,21 @@ func TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock(t *testi
 		absentHeights: map[uint32]bool{4: true},
 	}
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	logger := newCapturingLogger()
+	items.blockAssembler.logger = logger
 
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx),
+		"the startup hook stays non-fatal however the probe fails")
+
+	require.True(t, logger.sawError("startup divergence check abandoned at height 4"),
+		"an uncorroborated not-found must report the lost coverage rather than skipping the height")
+
+	// The hole at height 2 is below the failing probe, so it is not reached.
+	// That is the honest cost of refusing to trust the badge, and it is loud
+	// rather than silent -- which is the whole point of ChiR16.
 	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 2)
 	require.NoError(t, err)
-	require.True(t, present, "a height the chain has no block for must not abandon the scan below it")
+	require.False(t, present)
 }
 
 // TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight covers the
@@ -1618,4 +1671,143 @@ func TestCoinbaseRecoverySettingLowerBoundClamps(t *testing.T) {
 		require.Contains(t, err.Error(), "store is down",
 			"the reported reason must be the repair failure, not the defensive no-attempts-completed placeholder")
 	})
+}
+
+// TestStartupCoinbaseDivergenceCheck_GRPCStyleNotFoundIsNotTrustedAsAbsence
+// covers ChiR16. canonicalBlockAt has to separate "the chain has no block at
+// this height" from "the client could not answer", and it used to take the
+// client's block-not-found code as proof of the first. Against the production
+// client that code proves nothing: the blockchain gRPC server relabels every
+// store failure as block-not-found, and teranode's errors.Is matches *Error
+// values by code, so a store outage arrives wearing the same badge as a genuinely
+// absent block.
+//
+// Believing it is the expensive direction. canonicalBlockAbsent short circuits
+// withProbeRetry before the budget is touched and the scan skips the height
+// rather than reporting lost coverage, so a blockchain service that is down for
+// the whole window would skip every height and say nothing -- the same loss the
+// probe budget was added to prevent, reached through a different door.
+//
+// Every other test drives blockchain.NewLocalClient, which calls the SQL store
+// directly and does keep NewStorageError apart from NewBlockNotFoundError. That
+// is exactly why this shape needs its own interposer: no existing test could
+// tell the two apart, because on the local path they never were the same.
+func TestStartupCoinbaseDivergenceCheck_GRPCStyleNotFoundIsNotTrustedAsAbsence(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// A four-block canonical chain with block assembly correctly on its tip, so
+	// nothing about the chain itself is unusual: the only fault is the client.
+	headers := buildCanonicalChain(ctx, t, items, 4)
+	for h := uint32(1); h <= 4; h++ {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[3], 4)
+
+	interposer := &interposedBlockchainClient{
+		ClientI:               items.blockchainClient,
+		grpcStyleFaultHeights: map[uint32]bool{4: true},
+	}
+	items.blockAssembler.blockchainClient = interposer
+
+	logger := newCapturingLogger()
+	items.blockAssembler.logger = logger
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	// The fault is diagnosed as the client failing to answer, not as the chain
+	// stopping short. The second reading is the misdiagnosis: it tells an
+	// operator their tip is ahead of the chain when the chain is fine and the
+	// blockchain service is not.
+	require.True(t, logger.sawWarn("cannot resolve the canonical block at block assembly's tip height 4"),
+		"a relabelled store failure must be reported as the client being unable to answer")
+	require.False(t, logger.sawInfo("is above the canonical chain height"),
+		"block assembly is on the canonical tip, so nothing may claim its tip is above the chain")
+
+	// And the retry budget was spent on it rather than short-circuited: one
+	// attempt plus coinbaseRecoveryProbeRetries retries.
+	require.Equal(t, 1+coinbaseRecoveryProbeRetries, interposer.grpcStyleFaults,
+		"an uncorroborated not-found must go down the retry path, not the skip path")
+}
+
+// TestScopeCoinbaseGap_RepairsSafeMissesAtTheBottomOfTheWindow covers ChiR17.
+// The walk-back used to refuse whenever it exited on the floor bound rather than
+// on a consecutive-good run, justified as "nothing proves these blocks were
+// never created rather than created, spent and pruned". The loop bound had
+// already proved exactly that: it never descends below safetyFloor, and every
+// height at or above the floor is too young to have been spent, so it cannot
+// have been pruned.
+//
+// Conflating the two refused safe repairs precisely where repair matters most.
+// The bottom of the scan window holds the coinbases closest to maturity, so it
+// is the last chance to close a hole before its maturity spend wedges the tip --
+// and a refusal also stops the scan, ending the boot there.
+func TestScopeCoinbaseGap_RepairsSafeMissesAtTheBottomOfTheWindow(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	// Maturity 5 with a tip of 10 puts the safety floor at height 6.
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(5))
+	require.NotNil(t, items)
+	// The shipped default. It is what makes the old behaviour bite: a single
+	// miss near the floor cannot be followed by six consecutive present heights
+	// before the floor bound ends the walk.
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 6
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+
+	// One miss at floor+2 (height 8); the floor itself and everything else is
+	// present, so the divergence demonstrably does not continue below the floor.
+	headers := buildCanonicalChain(ctx, t, items, 10)
+
+	for h := uint32(1); h <= 10; h++ {
+		if h != 8 {
+			seedCoinbase(ctx, t, items, headers, h)
+		}
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[9], 10)
+
+	gap, err := items.blockAssembler.scopeCoinbaseGap(ctx, 10)
+	require.NoError(t, err, "a miss above a present floor is provably safe to repair")
+	require.Equal(t, []uint32{8}, gapHeights(gap))
+}
+
+// TestScopeCoinbaseGap_StillRefusesWhenTheFloorHeightItselfIsMissing is the
+// other half of ChiR17, and the reason the refusal is narrowed rather than
+// removed. When the lowest safely-probeable height is itself missing, the
+// divergence plausibly carries on below it into heights where absence proves
+// nothing -- and the walk cannot see down there to find out.
+func TestScopeCoinbaseGap_StillRefusesWhenTheFloorHeightItselfIsMissing(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	// Same shape as the test above: maturity 5, tip 10, floor at height 6.
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(5))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 6
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+
+	// The one miss is the floor height itself.
+	headers := buildCanonicalChain(ctx, t, items, 10)
+
+	for h := uint32(1); h <= 10; h++ {
+		if h != 6 {
+			seedCoinbase(ctx, t, items, headers, h)
+		}
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[9], 10)
+
+	gap, err := items.blockAssembler.scopeCoinbaseGap(ctx, 10)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errCoinbaseFloorNotProven),
+		"a gap that reaches the floor may continue below it, so it must still refuse")
+	require.Nil(t, gap, "no blocks may be handed to the repair when the gap reaches the floor")
 }
