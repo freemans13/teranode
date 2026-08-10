@@ -210,7 +210,7 @@ func (cc *coldCorpus) drawUniform() (chainhash.Hash, uint32, bool) {
 // the timed phase's demand distribution. Parents are created concurrently and
 // mined in batches at their cohort height. Returns the corpus and the run's
 // starting block height (older than every seeded parent).
-func seedColdCorpus(t *testing.T, store utxo.Store, statPool *pgxpool.Pool, seedTxs int, verbose bool) (*coldCorpus, uint32) {
+func seedColdCorpus(t *testing.T, store benchStore, statPool *pgxpool.Pool, seedTxs int, verbose bool) (*coldCorpus, uint32) {
 	t.Helper()
 	ctx := context.Background()
 

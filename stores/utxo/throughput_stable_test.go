@@ -272,7 +272,7 @@ func (a *pgAdmin) checkpoint(ctx context.Context) {
 // is alive at a time. Mirrors newQueueStoreForBench but does not register a
 // t.Cleanup, which would otherwise keep every cell's pool open until the end and
 // exhaust max_connections.
-func newStableQueueStore(t *testing.T) (utxo.Store, func()) {
+func newStableQueueStore(t *testing.T) (benchStore, func()) {
 	t.Helper()
 	cleanDB(t) // t.Skipf's the whole test if postgres is unreachable
 	ctx := context.Background()
@@ -298,7 +298,7 @@ func newStableQueueStore(t *testing.T) (utxo.Store, func()) {
 // runStableValidator runs the validator hot path (Get+Spend+Create+Unlock per
 // tx) for numWorkers concurrent chains, with one untimed warmup phase followed
 // by cfg.reps timed phases of cfg.measure each. It returns the per-rep TPS.
-func runStableValidator(t *testing.T, store utxo.Store, numWorkers, workerOffset int, cfg stableCfg, admin *pgAdmin) []float64 {
+func runStableValidator(t *testing.T, store benchStore, numWorkers, workerOffset int, cfg stableCfg, admin *pgAdmin) []float64 {
 	t.Helper()
 	ctx := context.Background()
 	const blockHeight = uint32(200)
@@ -454,7 +454,7 @@ func summarize(samples []float64) stableStats {
 type stableTarget struct {
 	label       string   // for the report header
 	adminTables []string // tables the Tier-2 layer ANALYZEs / pauses autovacuum on
-	newStore    func(t *testing.T) (utxo.Store, func())
+	newStore    func(t *testing.T) (benchStore, func())
 	reuseStore  bool // reuse one store across the whole sweep (for stores without a Close())
 }
 
@@ -476,7 +476,7 @@ func sqlTarget() stableTarget {
 	return stableTarget{
 		label:       "SQL Store (baseline)",
 		adminTables: []string{"transactions", "outputs", "inputs"},
-		newStore:    func(t *testing.T) (utxo.Store, func()) { return newSQLStoreForBench(t), func() {} },
+		newStore:    func(t *testing.T) (benchStore, func()) { return newSQLStoreForBench(t), func() {} },
 		reuseStore:  true,
 	}
 }
@@ -521,7 +521,7 @@ func runStableSweep(t *testing.T, tgt stableTarget) {
 
 	// For reuse-mode stores (no Close), build one store up front and keep it for
 	// the whole sweep; otherwise build a fresh one per cell.
-	var sharedStore utxo.Store
+	var sharedStore benchStore
 	var sharedStop func()
 	if tgt.reuseStore {
 		sharedStore, sharedStop = tgt.newStore(t)

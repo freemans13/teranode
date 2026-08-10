@@ -191,7 +191,7 @@ func newPrunedQueueStore(t *testing.T) (*pgstore.Store, func()) {
 // the full utxo.Store hot path plus access to the pruner service. Satisfied by
 // *pgstore.Store and by the 2-shard router in throughput_sharded_test.go.
 type prunedBenchStore interface {
-	utxo.Store
+	benchStore
 	GetPrunerService() (pruner.Service, error)
 }
 

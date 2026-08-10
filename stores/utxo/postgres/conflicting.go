@@ -17,13 +17,13 @@ import (
 // GetCounterConflicting delegates to the store-agnostic implementation which
 // walks inputs to find counter-conflicting transactions.
 func (s *Store) GetCounterConflicting(ctx context.Context, hash chainhash.Hash) ([]chainhash.Hash, error) {
-	return utxo.GetCounterConflictingTxHashes(ctx, s, hash)
+	return utxo.GetCounterConflictingTxHashes(ctx, s, hash, 0)
 }
 
 // GetConflictingChildren delegates to the store-agnostic implementation which
 // recursively walks spending children and conflicting_children records.
 func (s *Store) GetConflictingChildren(ctx context.Context, hash chainhash.Hash) ([]chainhash.Hash, error) {
-	return utxo.GetConflictingChildren(ctx, s, hash)
+	return utxo.GetConflictingChildren(ctx, s, hash, s.settings.UtxoStore.ConflictingChildrenMaxNodes)
 }
 
 // SetConflicting marks transactions as conflicting or not conflicting.

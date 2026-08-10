@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	aerostore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	pgstore "github.com/bsv-blockchain/teranode/stores/utxo/postgres"
 	sqlstore "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -33,6 +34,18 @@ var throughputDSN = func() string {
 	}
 	return "postgres://teranode:teranode@localhost:5432/teranode_test"
 }()
+
+// benchStore is the utxo.Store contract plus the split Create/Spend methods the
+// throughput harness drives directly. utxo.Store now exposes only the combined
+// SpendAndCreate, but every concrete backend used here (sql, postgres,
+// aerospike, and the bench-only sharded router) still implements the split
+// methods, and the benches intentionally keep driving them so the measured hot
+// path stays identical.
+type benchStore interface {
+	utxo.Store
+	Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error)
+	Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error)
+}
 
 func cleanDB(t *testing.T) {
 	t.Helper()
@@ -139,7 +152,7 @@ func makeChildTx(parent *bt.Tx) *bt.Tx {
 	return tx
 }
 
-func runValidatorThroughputOffset(t *testing.T, store utxo.Store, opsPerWorker int, numWorkers int, workerOffset int) float64 {
+func runValidatorThroughputOffset(t *testing.T, store benchStore, opsPerWorker int, numWorkers int, workerOffset int) float64 {
 	return doRunValidatorThroughput(t, store, opsPerWorker, numWorkers, workerOffset)
 }
 
@@ -150,11 +163,11 @@ func runValidatorThroughputOffset(t *testing.T, store utxo.Store, opsPerWorker i
 //  4. SetLocked(false) to unlock
 //
 // Each worker builds a chain: genesis → tx1 → tx2 → ...
-func runValidatorThroughput(t *testing.T, store utxo.Store, opsPerWorker int, numWorkers int) float64 {
+func runValidatorThroughput(t *testing.T, store benchStore, opsPerWorker int, numWorkers int) float64 {
 	return doRunValidatorThroughput(t, store, opsPerWorker, numWorkers, 0)
 }
 
-func doRunValidatorThroughput(t *testing.T, store utxo.Store, opsPerWorker int, numWorkers int, workerOffset int) float64 {
+func doRunValidatorThroughput(t *testing.T, store benchStore, opsPerWorker int, numWorkers int, workerOffset int) float64 {
 	ctx := context.Background()
 	blockHeight := uint32(200)
 	_ = store.SetBlockHeight(blockHeight)
@@ -302,7 +315,7 @@ func doRunValidatorThroughput(t *testing.T, store utxo.Store, opsPerWorker int, 
 	return validatorTPS
 }
 
-func newSQLStoreForBench(t *testing.T) utxo.Store {
+func newSQLStoreForBench(t *testing.T) benchStore {
 	t.Helper()
 	cleanDB(t)
 	ctx := context.Background()
@@ -324,7 +337,7 @@ func newSQLStoreForBench(t *testing.T) utxo.Store {
 	return s
 }
 
-func newQueueStoreForBench(t *testing.T) utxo.Store {
+func newQueueStoreForBench(t *testing.T) benchStore {
 	t.Helper()
 	cleanDB(t)
 	ctx := context.Background()
@@ -401,7 +414,7 @@ func TestThroughput_QueueStore(t *testing.T) {
 	}
 }
 
-func newAerospikeStoreForBench(t *testing.T) utxo.Store {
+func newAerospikeStoreForBench(t *testing.T) benchStore {
 	t.Helper()
 	ctx := context.Background()
 	storeURL, _ := url.Parse("aerospike://localhost:3000/utxo-store?set=throughput_test&block_retention=1&externalStore=file://./data/externalStore")

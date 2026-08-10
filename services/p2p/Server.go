@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -52,6 +53,8 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
+const logProcessingNotification = "[processBlockchainNotification] Processing %s notification: %s"
+
 const (
 	banActionAdd = "add" // Action constant for adding a ban
 
@@ -65,6 +68,18 @@ const (
 	defaultPeerMapTTL             = 10 * time.Minute // Time-to-live for peer map entries (reduced from 30min)
 	defaultPeerMapCleanupInterval = 1 * time.Minute  // Cleanup interval (reduced from 5min)
 	protocolIDVersion             = "1.0.0"          // Protocol version identifier
+
+	// defaultGossipHandlerConcurrency is the per-topic worker pool size used
+	// when p2p_gossip_handler_concurrency is unset.
+	defaultGossipHandlerConcurrency = 4
+
+	// syncCoordinatorStopTimeout is the sync coordinator's drain sub-budget
+	// inside Server.Stop. Coordinator RPCs are bounded at defaultRPCTimeout
+	// (5s), so a healthy drain completes well within it; the cap only bites
+	// when a goroutine is wedged in a non-context-aware call, and it must be
+	// well under the service manager's per-service stop budget so the Kafka
+	// producer flushes later in Server.Stop still get usable time.
+	syncCoordinatorStopTimeout = 10 * time.Second
 
 	// maxP2PMessageSize is the absolute upper bound on a pubsub message payload.
 	// Anything larger is dropped before parsing. Per-topic limits below should
@@ -115,6 +130,7 @@ type Server struct {
 	AssetHTTPAddressURL               string                    // HTTP address URL for assets
 	PropagationURL                    string                    // URL for peers to use for propagating txs (defaults to AssetHTTPAddressURL)
 	e                                 *echo.Echo                // Echo server instance
+	httpServeErr                      atomic.Pointer[error]     // Unexpected exit error of the HTTP serve goroutine; surfaced via Health
 	notificationCh                    chan *notificationMsg     // Channel for notifications
 	rejectedTxKafkaConsumerClient     kafka.KafkaConsumerGroupI // Kafka consumer for rejected transactions
 	invalidBlocksKafkaConsumerClient  kafka.KafkaConsumerGroupI // Kafka consumer for invalid blocks
@@ -127,12 +143,11 @@ type Server struct {
 	blockTopicName                    string
 	subtreeTopicName                  string
 	rejectedTxTopicName               string
-	invalidBlocksTopicName            string                         // Kafka topic for invalid blocks
 	invalidSubtreeTopicName           string                         // Kafka topic for invalid subtrees
 	nodeStatusTopicName               string                         // pubsub topic for node status messages
 	topicPrefix                       string                         // Chain identifier prefix for topic validation
-	blockPeerMap                      sync.Map                       // Map to track which peer sent each block (hash -> peerMapEntry)
-	subtreePeerMap                    sync.Map                       // Map to track which peer sent each subtree (hash -> peerMapEntry)
+	blockPeerMap                      sync.Map                       // Map to track which peer sent each block (canonical chainhash.Hash.String() -> peerMapEntry)
+	subtreePeerMap                    sync.Map                       // Map to track which peer sent each subtree (canonical chainhash.Hash.String() -> peerMapEntry)
 	startTime                         time.Time                      // Server start time for uptime calculation
 	peerRegistry                      blockchain.PeerRegistryClientI // gRPC client for the centralized peer registry hosted by the blockchain service
 	peerSelector                      *PeerSelector                  // Stateless peer selection logic
@@ -153,6 +168,19 @@ type Server struct {
 	// shouldSkipUnhealthyPeer to avoid a gRPC round-trip per pubsub message.
 	// Entries expire after reputationCacheTTL; misses fall back to the registry.
 	reputationCache sync.Map // peerID string -> reputationCacheEntry
+	// banStatusCache is a short-lived cache of registry IsPeerBanned lookups
+	// used by shouldSkipBannedPeer, avoiding a gRPC round-trip per gossip
+	// message. Entries expire after reputationCacheTTL; local ban transitions
+	// (onPeerBanned) overwrite the entry immediately.
+	banStatusCache sync.Map // peerID string -> banStatusCacheEntry
+	// registryBatcher coalesces the per-message peer-registry writes from the
+	// gossip handlers into one batch of RPCs per peer per flush interval. Nil
+	// in tests that construct Server directly; helpers then fall back to
+	// synchronous registry calls.
+	registryBatcher *peerRegistryBatcher
+	// localHeightCache is a short-lived cache of the local best height used by
+	// getLocalHeight, avoiding a blockchain gRPC round-trip per gossip message.
+	localHeightCache atomic.Pointer[localHeightCacheEntry]
 }
 
 // NewServer creates a new P2P server instance with the provided configuration and dependencies.
@@ -238,6 +266,15 @@ func NewServer(
 	listenMode := tSettings.P2P.ListenMode
 	if listenMode != settings.ListenModeFull && listenMode != settings.ListenModeListenOnly && listenMode != settings.ListenModeSilent {
 		return nil, errors.NewConfigurationError("listen_mode must be one of '%s', '%s', or '%s' (got '%s')", settings.ListenModeFull, settings.ListenModeListenOnly, settings.ListenModeSilent, listenMode)
+	}
+
+	// Surface blacklist entries with no parseable host: they can only ever
+	// match an announcement byte-for-byte, so the operator almost certainly
+	// misconfigured them. Warn loudly instead of leaving the entry silently inert.
+	for blocked := range tSettings.SubtreeValidation.BlacklistedBaseURLs {
+		if blacklistEntryHost(blocked) == "" {
+			logger.Warnf("[P2P] blacklisted base URL %q has no parseable host and will only match announcements exactly equal to it", blocked)
+		}
 	}
 
 	banlist, banChan, err := GetBanList(ctx, logger, tSettings)
@@ -404,7 +441,6 @@ func NewServer(
 		blockTopicName:                    fmt.Sprintf("%s-%s", topicPrefix, blockTopic),
 		subtreeTopicName:                  fmt.Sprintf("%s-%s", topicPrefix, subtreeTopic),
 		rejectedTxTopicName:               fmt.Sprintf("%s-%s", topicPrefix, rejectedTxTopic),
-		invalidBlocksTopicName:            tSettings.Kafka.InvalidBlocks,
 		invalidSubtreeTopicName:           tSettings.Kafka.InvalidSubtrees,
 		nodeStatusTopicName:               fmt.Sprintf("%s-%s", topicPrefix, nodeStatusTopic),
 		topicPrefix:                       topicPrefix,
@@ -426,6 +462,15 @@ func NewServer(
 	// Use the centralized peer registry hosted by the blockchain service.
 	// Loading, persistence, ban scoring, and TTL/LRU eviction all live there now.
 	p2pServer.peerRegistry = peerRegistryClient
+	if peerRegistryClient != nil {
+		// Clamp to the default: <= 0 would select the batcher's synchronous
+		// test mode, which serializes every gossip handler on one mutex.
+		batchInterval := tSettings.P2P.PeerRegistryBatchInterval
+		if batchInterval <= 0 {
+			batchInterval = defaultRegistryBatchInterval
+		}
+		p2pServer.registryBatcher = newPeerRegistryBatcher(ctx, logger, peerRegistryClient, batchInterval)
+	}
 	p2pServer.peerSelector = NewPeerSelector(logger, tSettings)
 
 	p2pServer.syncCoordinator = NewSyncCoordinator(
@@ -460,6 +505,18 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 		// Add liveness checks here. Don't include dependency checks.
 		// If the service is stuck return http.StatusServiceUnavailable
 		// to indicate a restart is needed
+		//
+		// A dead HTTP serve goroutine is deliberately a liveness failure, not
+		// just a readiness one: once Serve/ServeTLS returns, the goroutine is
+		// gone and the listener may be closed, so the HTTP/websocket surface
+		// cannot recover in-process. Restarting the whole P2P process (and
+		// dropping healthy libp2p/gRPC state with it) is the only way to get
+		// the endpoint back; readiness-only would leave the node running
+		// permanently without it.
+		if err := s.httpServeError(); err != nil {
+			return http.StatusServiceUnavailable, "HTTP server not serving", err
+		}
+
 		return http.StatusOK, "OK", nil
 	}
 
@@ -473,6 +530,13 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 	// If all dependencies are ready, return http.StatusOK
 	// A failed dependency check does not imply the service needs restarting
 	checks := make([]health.Check, 0, 4)
+	checks = append(checks, health.Check{Name: "HTTPServer", Check: func(_ context.Context, _ bool) (int, string, error) {
+		if err := s.httpServeError(); err != nil {
+			return http.StatusServiceUnavailable, "HTTP server not serving", err
+		}
+
+		return http.StatusOK, "OK", nil
+	}})
 	checks = append(checks, health.Check{Name: "Kafka", Check: kafka.HealthChecker(ctx, brokersURL)})
 
 	if s.blockchainClient != nil {
@@ -481,6 +545,16 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 	}
 
 	return health.CheckAll(ctx, checkLiveness, checks)
+}
+
+// httpServeError returns the error the HTTP serve goroutine exited with, or nil
+// if the HTTP server is (still) serving or was shut down gracefully.
+func (s *Server) httpServeError() error {
+	if errPtr := s.httpServeErr.Load(); errPtr != nil {
+		return *errPtr
+	}
+
+	return nil
 }
 
 // Init initializes the P2P server and its components.
@@ -573,10 +647,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	s.rejectedTxKafkaConsumerClient.Start(ctx, s.rejectedTxHandler(ctx), kafka.WithLogErrorAndMoveOn())
 
 	// Handler for invalid blocks Kafka messages
-	if s.invalidBlocksKafkaConsumerClient != nil {
-		s.logger.Infof("[Start] Starting invalid blocks Kafka consumer on topic: %s", s.invalidBlocksTopicName)
-		s.invalidBlocksKafkaConsumerClient.Start(ctx, s.invalidBlockHandler(ctx), kafka.WithLogErrorAndMoveOn())
-	}
+	s.startInvalidBlocksConsumer(ctx)
 
 	// Handler for invalid subtrees Kafka messages
 	if s.invalidSubtreeKafkaConsumerClient != nil {
@@ -589,17 +660,12 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	s.e = s.setupHTTPServer()
 
-	go func() {
-		if err := s.StartHTTP(ctx); err != nil {
-			if errors.Is(err, http.ErrServerClosed) {
-				s.logger.Infof("http server shutdown")
-			} else {
-				s.logger.Errorf("failed to start http server: %v", err)
-			}
-
-			return
-		}
-	}()
+	// StartHTTP binds the listener synchronously (serving happens in its own
+	// goroutine), so bind and TLS configuration errors fail startup here rather
+	// than leaving the node ready with its HTTP surface down.
+	if err := s.StartHTTP(ctx); err != nil {
+		return errors.NewServiceError("failed to start http server", err)
+	}
 
 	// Start a goroutine to periodically log observed addresses (for debugging NAT traversal)
 	go func() {
@@ -628,6 +694,11 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		}
 	}()
 
+	// Start the peer-registry batcher before the topic subscriptions that feed it
+	if s.registryBatcher != nil {
+		s.registryBatcher.start()
+	}
+
 	// Subscribe to all topics
 	s.subscribeToTopic(ctx, s.blockTopicName, s.handleBlockTopic)
 	s.subscribeToTopic(ctx, s.subtreeTopicName, s.handleSubtreeTopic)
@@ -648,11 +719,6 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	// disconnect any pre-existing banned peers at startup
 	go s.disconnectPreExistingBannedPeers(ctx)
-
-	// start the invalid blocks consumer
-	if err := s.startInvalidBlockConsumer(ctx); err != nil {
-		return errors.NewServiceError("failed to start invalid blocks consumer", err)
-	}
 
 	// Start periodic cleanup of peer maps
 	s.startPeerMapCleanup(ctx)
@@ -676,18 +742,14 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		if err != nil {
 			return errors.NewServiceError("error generating random API key", err)
 		}
-	}
 
-	// Define protected methods - use the full gRPC method path
-	protectedMethods := map[string]bool{
-		"/p2p_api.PeerService/BanPeer":   true,
-		"/p2p_api.PeerService/UnbanPeer": true,
+		s.logger.Warnf("[P2P] grpc_admin_api_key is not set; a random key was generated so admin RPCs (ban, unban, clear bans, ban score, reputation reset, connect/disconnect peer) are unreachable until a key is configured")
 	}
 
 	// Create auth options
 	authOptions := &util.AuthOptions{
 		APIKey:           apiKey,
-		ProtectedMethods: protectedMethods,
+		ProtectedMethods: adminProtectedMethods(),
 	}
 
 	// this will block
@@ -705,15 +767,43 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 func (s *Server) subscribeToTopic(ctx context.Context, topicName string, handler func(context.Context, []byte, string)) {
 	topicChannel := s.P2PClient.Subscribe(topicName)
+
+	workers := defaultGossipHandlerConcurrency
+	if s.settings != nil && s.settings.P2P.GossipHandlerConcurrency > 0 {
+		workers = s.settings.P2P.GossipHandlerConcurrency
+	}
+
+	// A bounded pool of workers drains the topic so one slow message (or a
+	// slow downstream dependency) cannot stall every other message on the
+	// topic. Messages within a topic may be processed out of order.
+	// DO NOT check ctx.Done() here - context cancellation during operations like Kafka consumer recovery
+	// should not stop P2P message processing. The subscription ends when the topic channel closes.
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for msg := range topicChannel {
+				s.handleTopicMessage(ctx, topicName, handler, msg.Data, msg.FromID)
+			}
+		}()
+	}
 	go func() {
-		// Process messages until the topic channel is closed
-		// DO NOT check ctx.Done() here - context cancellation during operations like Kafka consumer recovery
-		// should not stop P2P message processing. The subscription ends when the topic channel closes.
-		for msg := range topicChannel {
-			handler(ctx, msg.Data, msg.FromID)
-		}
+		wg.Wait()
 		s.logger.Warnf("%s topic channel closed", topicName)
 	}()
+}
+
+// handleTopicMessage invokes a gossip handler with a per-message recover.
+// Handlers parse untrusted network input; without this, a single message that
+// drives a handler into a panic would crash the whole node.
+func (s *Server) handleTopicMessage(ctx context.Context, topicName string, handler func(context.Context, []byte, string), data []byte, fromID string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Errorf("[%s] gossip handler panic recovered (peer %s): %v", topicName, fromID, r)
+		}
+	}()
+	handler(ctx, data, fromID)
 }
 
 func (s *Server) invalidSubtreeHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
@@ -745,40 +835,6 @@ func (s *Server) invalidSubtreeHandler(ctx context.Context) func(msg *kafka.Kafk
 			// Don't return error here, as we want to continue processing messages
 			s.logger.Errorf("[invalidSubtreeHandler] Failed to report invalid subtree from Kafka: %v", err)
 		}
-
-		return nil
-	}
-}
-
-func (s *Server) invalidBlockHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
-	return func(msg *kafka.KafkaMessage) error {
-		var (
-			syncing bool
-			err     error
-		)
-
-		if syncing, err = s.isBlockchainSyncingOrCatchingUp(ctx); err != nil {
-			return err
-		}
-
-		if syncing {
-			return nil
-		}
-
-		var m kafkamessage.KafkaInvalidBlockTopicMessage
-		if err := proto.Unmarshal(msg.Value, &m); err != nil {
-			s.logger.Errorf("[invalidBlockHandler] error unmarshalling invalidBlocksMessage: %v", err)
-			return err
-		}
-
-		s.logger.Infof("[invalidBlockHandler] Received invalid block notification via Kafka: %s, reason: %s", m.BlockHash, m.Reason)
-
-		// Use the existing ReportInvalidBlock method to handle the invalid block
-		/*err = s.ReportInvalidBlock(ctx, m.BlockHash, m.Reason)
-		if err != nil {
-			// Don't return error here, as we want to continue processing messages
-			s.logger.Errorf("[invalidBlockHandler] Failed to report invalid block from Kafka: %v", err)
-		}*/
 
 		return nil
 	}
@@ -858,6 +914,25 @@ func (s *Server) disconnectPreExistingBannedPeers(ctx context.Context) {
 	s.disconnectPeersOnBanList(ctx, "banned before startup")
 }
 
+// adminProtectedMethods returns the full gRPC method paths of every
+// state-mutating admin RPC on the PeerService; the auth interceptor requires
+// the admin API key for these. Read-only queries and internal data-plane
+// reporting RPCs (catchup metrics, valid block/subtree reports, bytes
+// downloaded) stay unauthenticated because other services call them without
+// admin credentials. Any new mutating admin RPC must be added here; the
+// classification is enforced by TestAdminProtectedMethodsCoverAllRPCs.
+func adminProtectedMethods() map[string]bool {
+	return map[string]bool{
+		"/p2p_api.PeerService/BanPeer":         true,
+		"/p2p_api.PeerService/UnbanPeer":       true,
+		"/p2p_api.PeerService/ClearBanned":     true,
+		"/p2p_api.PeerService/AddBanScore":     true,
+		"/p2p_api.PeerService/ResetReputation": true,
+		"/p2p_api.PeerService/ConnectPeer":     true,
+		"/p2p_api.PeerService/DisconnectPeer":  true,
+	}
+}
+
 func generateRandomKey() (string, error) {
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
@@ -889,9 +964,7 @@ func (s *Server) updatePeerLastMessageTime(from string, originatorPeerID string)
 	}
 
 	s.addConnectedPeer(senderID, "", 0, nil, "")
-	if err := s.peerRegistry.UpdateLastMessageTime(s.gCtx, senderID.String()); err != nil {
-		s.logger.Warnf("[updatePeerLastMessageTime] sender %s: %v", senderID, err)
-	}
+	s.touchLastMessageTime(senderID)
 
 	// Also update for the originator if different (gossiped message)
 	// The originator is not directly connected to us
@@ -903,10 +976,20 @@ func (s *Server) updatePeerLastMessageTime(from string, originatorPeerID string)
 			}
 			// Add as gossiped peer (not connected) before updating last message time
 			s.addPeer(peerID, "", 0, nil, "")
-			if err := s.peerRegistry.UpdateLastMessageTime(s.gCtx, peerID.String()); err != nil {
-				s.logger.Warnf("[updatePeerLastMessageTime] originator %s: %v", peerID, err)
-			}
+			s.touchLastMessageTime(peerID)
 		}
+	}
+}
+
+// touchLastMessageTime records that a wire message was received from the peer,
+// via the batcher when present or synchronously otherwise.
+func (s *Server) touchLastMessageTime(peerID peer.ID) {
+	if s.registryBatcher != nil {
+		s.registryBatcher.enqueueLastMessage(peerID.String())
+		return
+	}
+	if err := s.peerRegistry.UpdateLastMessageTime(s.gCtx, peerID.String()); err != nil {
+		s.logger.Warnf("[updatePeerLastMessageTime] %s: %v", peerID, err)
 	}
 }
 
@@ -923,23 +1006,31 @@ func (s *Server) updateBytesReceived(from string, originatorPeerID string, messa
 		s.logger.Errorf("failed to decode sender peer ID %s: %v", from, err)
 		return
 	}
-	// Atomic delta increment via UpdatePeerMetrics — fixes the read-modify-write
-	// race the previous code had under concurrent gossip ingestion.
-	if err := s.peerRegistry.UpdatePeerMetrics(s.gCtx, senderID.String(), 0, 0, messageSize, false, false, false, 0); err != nil {
-		s.logger.Warnf("[updateBytesReceived] sender %s: %v", senderID, err)
-	}
+	s.recordBytesReceived(senderID, messageSize)
 
 	// Also update for the originator if different (gossiped message)
 	if originatorPeerID != "" {
 		if peerID, err := peer.Decode(originatorPeerID); err == nil && peerID != senderID {
-			if err := s.peerRegistry.UpdatePeerMetrics(s.gCtx, peerID.String(), 0, 0, messageSize, false, false, false, 0); err != nil {
-				s.logger.Warnf("[updateBytesReceived] originator %s: %v", peerID, err)
-			}
+			s.recordBytesReceived(peerID, messageSize)
 		}
 	}
 }
 
-func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID string) {
+// recordBytesReceived accumulates a received-bytes delta for the peer, via the
+// batcher when present or synchronously otherwise.
+func (s *Server) recordBytesReceived(peerID peer.ID, n uint64) {
+	if s.registryBatcher != nil {
+		s.registryBatcher.enqueueBytesReceived(peerID.String(), n)
+		return
+	}
+	// Atomic delta increment via UpdatePeerMetrics — fixes the read-modify-write
+	// race the previous code had under concurrent gossip ingestion.
+	if err := s.peerRegistry.UpdatePeerMetrics(s.gCtx, peerID.String(), 0, 0, n, false, false, false, 0); err != nil {
+		s.logger.Warnf("[updateBytesReceived] %s: %v", peerID, err)
+	}
+}
+
+func (s *Server) handleNodeStatusTopic(ctx context.Context, m []byte, peerID string) {
 	// Check message size before parsing to prevent memory exhaustion
 	if len(m) > maxNodeStatusMessageSize {
 		s.logger.Errorf("[handleNodeStatusTopic] message size %d exceeds max %d from peer %s", len(m), maxNodeStatusMessageSize, peerID)
@@ -975,18 +1066,29 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID strin
 		return
 	}
 
-	// Validate BaseURL to prevent SSRF attacks
 	if nodeStatusMessage.BaseURL != "" {
+		// Validate BaseURL to prevent SSRF attacks
 		if err := s.validateDataHubURL(nodeStatusMessage.BaseURL); err != nil {
 			s.logger.Errorf("[handleNodeStatusTopic] invalid BaseURL from peer %s: %v", peerID, err)
 			s.applyBanScore(peerID, ReasonProtocolViolation)
 			return
 		}
+
+		// A blacklisted BaseURL must not reach the peer registry, but
+		// node_status is telemetry: keep the message with the URL removed
+		// instead of hiding the peer from monitoring. This only stops fresh
+		// registrations; a URL stored before its host was blacklisted stays in
+		// the registry and is filtered at the point of use instead
+		// (GetPeersForCatchup and PeerSelector.isEligible).
+		if s.isBlacklistedBaseURL(nodeStatusMessage.BaseURL) {
+			s.logger.Warnf("[handleNodeStatusTopic] removed blacklisted BaseURL %s from node_status of peer %s", nodeStatusMessage.BaseURL, peerID)
+			nodeStatusMessage.BaseURL = ""
+		}
 	}
 
 	if !isSelf && nodeStatusMessage.BestHeight > 0 && nodeStatusMessage.PeerID != "" {
 		var ok bool
-		sanitizedBestHeight, sanitizedBestBlockHash, ok = s.sanitizeAdvertisedTip(nodeStatusMessage.PeerID, nodeStatusMessage.BestHeight, nodeStatusMessage.BestBlockHash, s.getLocalHeight())
+		sanitizedBestHeight, sanitizedBestBlockHash, ok = s.sanitizeAdvertisedTip(nodeStatusMessage.PeerID, nodeStatusMessage.BestHeight, nodeStatusMessage.BestBlockHash, s.getLocalHeight(ctx))
 		if ok {
 			sanitizedTipOK = true
 			notificationBestHeight = sanitizedBestHeight
@@ -1092,7 +1194,7 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 
 	h, meta, err := s.blockchainClient.GetBlockHeader(ctx, hash)
 	if err != nil {
-		return errors.NewError("error getting block header and meta for BlockMessage: %w", err)
+		return errors.NewError("error getting block header and meta for BlockMessage", err)
 	}
 
 	if meta.Invalid {
@@ -1112,11 +1214,11 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 
 	msgBytes, err = json.Marshal(blockMessage)
 	if err != nil {
-		return errors.NewError("blockMessage - json marshal error: %w", err)
+		return errors.NewError("blockMessage - json marshal error", err)
 	}
 
 	if err = s.P2PClient.Publish(ctx, s.blockTopicName, msgBytes); err != nil {
-		return errors.NewError("blockMessage - publish error: %w", err)
+		return errors.NewError("blockMessage - publish error", err)
 	}
 
 	// Also send a node_status update when best block changes
@@ -1225,40 +1327,46 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 	// Get current sync peer
 	syncPeer := s.getSyncPeer()
 	if syncPeer != "" {
-		if syncPeer != "" {
-			syncPeerID = syncPeer.String()
+		syncPeerID = syncPeer.String()
 
-			// Track when we first connected to this sync peer
-			if existingTime, ok := s.syncConnectionTimes.Load(syncPeerID); ok {
-				syncConnectedAt = existingTime.(int64)
-			} else {
-				// First time connecting to this sync peer
-				syncConnectedAt = time.Now().Unix()
-				s.syncConnectionTimes.Store(syncPeerID, syncConnectedAt)
-				s.logger.Debugf("[handleNodeStatusNotification] Recording sync connection time for peer %s: %d", syncPeerID, syncConnectedAt)
-			}
-
-			// Get sync peer's height and block hash
-			for _, peerInfo := range s.P2PClient.GetPeers() {
-				if peerInfo.ID == syncPeer.String() {
-					// Get the peer's best block hash from registry
-					if pInfo, exists := s.getPeer(syncPeer); exists {
-						if pInfo.BlockHash != nil {
-							syncPeerBlockHash = pInfo.BlockHash.String()
-						}
-
-						syncPeerHeight = pInfo.Height
-					}
-					break
-				}
-			}
+		// Track when we first connected to this sync peer
+		if existingTime, ok := s.syncConnectionTimes.Load(syncPeerID); ok {
+			syncConnectedAt = existingTime.(int64)
 		} else {
-			// No sync peer - clear any old connection time tracking
-			s.syncConnectionTimes.Range(func(key, value interface{}) bool {
-				s.syncConnectionTimes.Delete(key)
-				return true
-			})
+			// First time connecting to this sync peer
+			syncConnectedAt = time.Now().Unix()
+			s.syncConnectionTimes.Store(syncPeerID, syncConnectedAt)
+			s.logger.Debugf("[handleNodeStatusNotification] Recording sync connection time for peer %s: %d", syncPeerID, syncConnectedAt)
 		}
+
+		// Drop entries for previous sync peers so the map only tracks the current one
+		s.syncConnectionTimes.Range(func(key, value any) bool {
+			if key != syncPeerID {
+				s.syncConnectionTimes.Delete(key)
+			}
+			return true
+		})
+
+		// Get sync peer's height and block hash
+		for _, peerInfo := range s.P2PClient.GetPeers() {
+			if peerInfo.ID == syncPeer.String() {
+				// Get the peer's best block hash from registry
+				if pInfo, exists := s.getPeer(syncPeer); exists {
+					if pInfo.BlockHash != nil {
+						syncPeerBlockHash = pInfo.BlockHash.String()
+					}
+
+					syncPeerHeight = pInfo.Height
+				}
+				break
+			}
+		}
+	} else {
+		// No sync peer - clear any old connection time tracking
+		s.syncConnectionTimes.Range(func(key, value any) bool {
+			s.syncConnectionTimes.Delete(key)
+			return true
+		})
 	}
 
 	// Get peer ID safely
@@ -1327,14 +1435,19 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		s.logger.Debugf("[getNodeStatusMessage] Policy settings not available, using default MinMiningTxFee: %f", defaultFee)
 	}
 
-	// Get connected peers count from the registry
+	// Get connected peers count from the registry. The registry also holds
+	// gossiped/disconnected peers, so count only directly connected ones.
 	connectedPeersCount := 0
 	if s.peerRegistry != nil {
 		allPeers, err := s.peerRegistry.ListPeers(ctx, nil, 0, 0, false, false)
 		if err != nil {
 			s.logger.Warnf("[getNodeStatusMessage] ListPeers failed: %v", err)
 		} else {
-			connectedPeersCount = len(allPeers)
+			for _, p := range allPeers {
+				if p.IsConnected {
+					connectedPeersCount++
+				}
+			}
 		}
 	}
 
@@ -1454,14 +1567,14 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 
 	msgBytes, err := json.Marshal(nodeStatusMessage)
 	if err != nil {
-		return errors.NewError("nodeStatusMessage - json marshal error: %w", err)
+		return errors.NewError("nodeStatusMessage - json marshal error", err)
 	}
 
 	s.logger.Infof("[handleNodeStatusNotification] P2P publishing node_status to topic %s (height=%d, version=%s, storage=%q)", s.nodeStatusTopicName, nodeStatusMessage.BestHeight, nodeStatusMessage.Version, nodeStatusMessage.Storage)
 	s.logger.Debugf("[handleNodeStatusNotification] JSON payload: %s", string(msgBytes))
 
 	if err = s.P2PClient.Publish(ctx, s.nodeStatusTopicName, msgBytes); err != nil {
-		return errors.NewError("nodeStatusMessage - publish error: %w", err)
+		return errors.NewError("nodeStatusMessage - publish error", err)
 	}
 
 	s.logger.Debugf("[handleNodeStatusNotification] Successfully published node_status message")
@@ -1492,11 +1605,11 @@ func (s *Server) handleSubtreeNotification(ctx context.Context, hash *chainhash.
 
 	msgBytes, err := json.Marshal(subtreeMessage)
 	if err != nil {
-		return errors.NewError("subtreeMessage - json marshal error: %w", err)
+		return errors.NewError("subtreeMessage - json marshal error", err)
 	}
 
 	if err := s.P2PClient.Publish(ctx, s.subtreeTopicName, msgBytes); err != nil {
-		return errors.NewError("subtreeMessage - publish error: %w", err)
+		return errors.NewError("subtreeMessage - publish error", err)
 	}
 
 	return nil
@@ -1528,20 +1641,20 @@ func (s *Server) processBlockchainNotification(ctx context.Context, notification
 	hash, err := chainhash.NewHash(notification.Hash)
 	if err != nil {
 		// Specific error about hash conversion, not logged here, but returned to caller.
-		return errors.NewError(fmt.Sprintf("error getting chainhash from notification hash %s: %%w", notification.Hash), err)
+		return errors.NewError("error getting chainhash from notification hash %s", notification.Hash, err)
 	}
 
 	switch notification.Type {
 	case model.NotificationType_Block:
-		ctxLogger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
+		ctxLogger.Infof(logProcessingNotification, notification.Type, hash.String())
 		return s.handleBlockNotification(ctx, hash) // These handlers return wrapped errors
 
 	case model.NotificationType_Subtree:
-		ctxLogger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
+		ctxLogger.Infof(logProcessingNotification, notification.Type, hash.String())
 		return s.handleSubtreeNotification(ctx, hash)
 
 	case model.NotificationType_PeerFailure:
-		ctxLogger.Infof("[processBlockchainNotification] Processing %s notification: %s", notification.Type, hash.String())
+		ctxLogger.Infof(logProcessingNotification, notification.Type, hash.String())
 		return s.handlePeerFailureNotification(ctx, notification)
 
 	default:
@@ -1600,6 +1713,21 @@ func (s *Server) StartHTTP(ctx context.Context) error {
 		return errors.NewConfigurationError("p2p HTTP listen address is not set")
 	}
 
+	// Validate TLS configuration before binding so a misconfigured HTTPS setup
+	// fails startup instead of being logged and swallowed in the serve goroutine.
+	var certFile, keyFile string
+	if s.settings.SecurityLevelHTTP != 0 {
+		certFile = s.settings.ServerCertFile
+		if certFile == "" {
+			return errors.NewConfigurationError("[StartHTTP] server_certFile is required for HTTPS")
+		}
+
+		keyFile = s.settings.ServerKeyFile
+		if keyFile == "" {
+			return errors.NewConfigurationError("[StartHTTP] server_keyFile is required for HTTPS")
+		}
+	}
+
 	// Get listener using util.GetListener
 	listener, address, _, err := util.GetListener(s.settings.Context, "p2p", "http://", addr)
 	if err != nil {
@@ -1621,28 +1749,21 @@ func (s *Server) StartHTTP(ctx context.Context) error {
 	go func() {
 		defer util.RemoveListener(s.settings.Context, "p2p", "http://")
 
+		var serveErr error
+
 		if s.settings.SecurityLevelHTTP == 0 {
 			servicemanager.AddListenerInfo(fmt.Sprintf("[StartHTTP] p2p HTTP listening on %s", address))
-			err = s.e.Server.Serve(listener)
+			serveErr = s.e.Server.Serve(listener)
 		} else {
-			certFile := s.settings.ServerCertFile
-			if certFile == "" {
-				s.logger.Errorf("server_certFile is required for HTTPS")
-				return
-			}
-
-			keyFile := s.settings.ServerKeyFile
-			if keyFile == "" {
-				s.logger.Errorf("server_keyFile is required for HTTPS")
-				return
-			}
-
 			servicemanager.AddListenerInfo(fmt.Sprintf("[StartHTTP] p2p HTTPS listening on %s", address))
-			err = s.e.Server.ServeTLS(listener, certFile, keyFile)
+			serveErr = s.e.Server.ServeTLS(listener, certFile, keyFile)
 		}
 
-		if err != nil && err != http.ErrServerClosed {
-			s.logger.Errorf("[StartHTTP] server error: %v", err)
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			s.logger.Errorf("[StartHTTP] server error: %v", serveErr)
+			// Record the failure so Health reports the service unhealthy instead
+			// of the node staying ready with its HTTP surface down.
+			s.httpServeErr.Store(&serveErr)
 		}
 	}()
 
@@ -1674,6 +1795,19 @@ func (s *Server) Stop(ctx context.Context) error {
 			s.logger.Errorf("[Stop] failed to %s: %v", action, err)
 			errs = append(errs, err)
 		}
+	}
+
+	// Stop the sync coordinator first: its monitor goroutines call into the
+	// registry and publish to the blocks Kafka producer, both of which are torn
+	// down below. The drain gets a sub-budget of the shutdown context rather
+	// than ctx itself: coordinator RPCs are bounded at defaultRPCTimeout, so a
+	// healthy drain finishes well within it, and a goroutine wedged in a
+	// non-context-aware call must not burn the whole per-service stop budget
+	// and hand the DC11 producer flushes below an already-expired ctx.
+	if s.syncCoordinator != nil {
+		coordCtx, coordCancel := context.WithTimeout(ctx, syncCoordinatorStopTimeout)
+		s.syncCoordinator.Stop(coordCtx)
+		coordCancel()
 	}
 
 	// Stop the underlying P2P node
@@ -1713,6 +1847,12 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.logger.Infof("[Stop] stopped peer map cleanup ticker")
 	}
 
+	// Stop the registry batcher (performs a final flush of pending updates,
+	// bounded by the service manager's stop budget carried in ctx)
+	if s.registryBatcher != nil {
+		s.registryBatcher.stop(ctx)
+	}
+
 	// Peer registry cleanup ticker is gone — the centralized blockchain registry
 	// drives its own TTL/LRU eviction (deferred to PR2 in any case).
 
@@ -1747,27 +1887,30 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 			return nil, errors.WrapGRPCPublic(errors.NewServiceError("list peers", err))
 		}
 
+		// Look up libp2p addresses once, not per registry peer.
+		addrByPeerID := make(map[string]string)
+		if s.P2PClient != nil {
+			for _, sp := range s.P2PClient.GetPeers() {
+				if len(sp.Addrs) > 0 {
+					addrByPeerID[sp.ID] = sp.Addrs[0]
+				}
+			}
+		}
+
 		resp := &p2p_api.GetPeersResponse{}
 		for _, p := range allPeers {
 			if !p.IsConnected {
 				continue
 			}
-			// Get address from libp2p if available.
-			addr := ""
-			if s.P2PClient != nil {
-				libp2pPeers := s.P2PClient.GetPeers()
-				for _, sp := range libp2pPeers {
-					if sp.ID == p.ID && len(sp.Addrs) > 0 {
-						addr = sp.Addrs[0]
-						break
-					}
-				}
-			}
+
+			addr := addrByPeerID[p.ID]
 
 			resp.Peers = append(resp.Peers, &p2p_api.Peer{
-				Id:       p.ID,
-				Addr:     addr,
-				Banscore: p.BanScore,
+				Id:            p.ID,
+				Addr:          addr,
+				Banscore:      p.BanScore,
+				CurrentHeight: p.Height,
+				BytesReceived: p.BytesReceived,
 			})
 		}
 
@@ -1950,6 +2093,10 @@ func (s *Server) onPeerBanned(peerID, reason string) {
 	until := time.Now().Add(banDuration)
 	s.logger.Infof("[onPeerBanned] Peer %s banned until %s for reason: %s", peerID, until.Format(time.RFC3339), reason)
 
+	// Make the ban effective for gossip filtering immediately, without waiting
+	// for the cached IsPeerBanned=false entry to expire.
+	s.banStatusCache.Store(peerID, banStatusCacheEntry{banned: true, expiresAt: time.Now().Add(reputationCacheTTL)})
+
 	pid, err := peer.Decode(peerID)
 	if err != nil {
 		s.logger.Errorf("[onPeerBanned] failed to decode peer ID %s: %v", peerID, err)
@@ -2015,9 +2162,16 @@ func (s *Server) ResetReputation(ctx context.Context, req *p2p_api.ResetReputati
 		return nil, errors.WrapGRPCPublic(errors.NewServiceError("reset reputation", err))
 	}
 
+	// Drop cached ban statuses so a reset (which may unban) takes effect
+	// immediately instead of after the cache TTL.
 	if req.PeerId == "" {
+		s.banStatusCache.Range(func(key, _ interface{}) bool {
+			s.banStatusCache.Delete(key)
+			return true
+		})
 		s.logger.Infof("[ResetReputation] Reset reputation for all peers. Count: %d", peersReset)
 	} else {
+		s.banStatusCache.Delete(req.PeerId)
 		s.logger.Infof("[ResetReputation] Reset reputation for peer %s", req.PeerId)
 	}
 
@@ -2155,6 +2309,9 @@ func peerInfoToP2PProto(p *blockchain.PeerInfo) *p2p_api.PeerRegistryInfo {
 		ClientName:             p.ClientName,
 		LastCatchupError:       p.LastCatchupError,
 		LastCatchupErrorTime:   timeToUnix(p.LastCatchupErrorTime),
+		CatchupAttempts:        p.CatchupAttempts,
+		CatchupSuccesses:       p.CatchupSuccesses,
+		CatchupFailures:        p.CatchupFailures,
 	}
 }
 

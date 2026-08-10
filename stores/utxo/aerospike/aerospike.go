@@ -124,6 +124,81 @@ type batcherIfc[T any] interface {
 	Close()
 }
 
+// shutdownPanicText is the runtime's message when a send targets a closed
+// channel. That is how go-batcher v2 surfaces Put-after-Close; see
+// batcher.Batcher.Close, which documents that Put must not be called after it.
+const shutdownPanicText = "send on closed channel"
+
+// recoverBatcherShutdown turns the send-on-closed-channel panic into a returned
+// error and re-panics everything else. Store.Close closes the batchers during
+// graceful shutdown while external callers (block validation, assembly, …) may
+// still be enqueuing; that race must abort the operation rather than crash the
+// process. Any other panic — a nil batcher, a future go-batcher failure mode — is
+// a genuine bug and must not be relabelled as an orderly shutdown.
+//
+// Matching is on the rendered text, not the concrete type: the runtime panics
+// with a runtime.plainError, so a type switch would pass in tests that fake the
+// panic with a string and miss in production. Rendering also has to happen before
+// the value reaches errors.New, which consumes a trailing error argument as the
+// wrapped error instead of formatting it — orphaning the %v verb and mislabelling
+// the result as wrapping an UNKNOWN (0).
+//
+// ERR_SERVICE_UNAVAILABLE is deliberate — it keeps this inside
+// errors.IsTransientLocalError so a shutdown is not reported to peers as an
+// invalid block. Do not align with handleSpendPanic's ERR_UNKNOWN.
+func recoverBatcherShutdown(r any, who string, err *error) {
+	text := fmt.Sprint(r)
+
+	if !strings.Contains(text, shutdownPanicText) {
+		panic(r)
+	}
+
+	*err = errors.NewServiceUnavailableError("[%s] aerospike batcher unavailable (store shutting down): %v", who, text)
+}
+
+// safeBatcherPutCtx enqueues item into b, converting a Put-after-Close panic into
+// a returned error. who labels the call site.
+func safeBatcherPutCtx[T any](b batcherIfc[T], ctx context.Context, item *T, who string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			recoverBatcherShutdown(r, who, &err)
+		}
+	}()
+
+	b.PutCtx(ctx, item)
+
+	return nil
+}
+
+// safeBatcherPut is the Put (no-context) counterpart of safeBatcherPutCtx.
+func safeBatcherPut[T any](b batcherIfc[T], item *T, who string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			recoverBatcherShutdown(r, who, &err)
+		}
+	}()
+
+	b.Put(item)
+
+	return nil
+}
+
+// safeBatcherPutBatchCtx is the PutBatchCtx counterpart. PutBatch* enqueues the
+// whole group in a single channel send, so a rejected send rejects every item:
+// callers must complete all of them, or the shared group.Wait parks for its full
+// timeout and then reports a misleading timeout instead of the shutdown.
+func safeBatcherPutBatchCtx[T any](b batcherIfc[T], ctx context.Context, items []*T, who string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			recoverBatcherShutdown(r, who, &err)
+		}
+	}()
+
+	b.PutBatchCtx(ctx, items)
+
+	return nil
+}
+
 // Store implements the UTXO store interface using Aerospike.
 // It is thread-safe for concurrent access.
 type Store struct {
@@ -147,11 +222,40 @@ type Store struct {
 	lockedBatcher       batcherIfc[batchLocked]
 	externalStore       blob.Store
 	utxoBatchSize       int
-	externalTxCache     *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
-	externalStoreSem    chan struct{} // Semaphore to limit concurrent external storage operations
-	indexMutex          sync.Mutex    // Mutex for index creation operations
-	indexOnce           sync.Once     // Ensures index creation/wait is only done once per process
-	spendLuaPackages    []string      // Pre-initialized array of Lua package names for spend operations
+
+	// externalTxCache caches the full externally-stored transaction, as returned
+	// by GetTxFromExternalStore.
+	externalTxCache *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
+
+	// externalOutpointsCache caches the outpoint-resolution reconstruction, as
+	// returned by GetOutpointsFromExternalStore. It MUST stay separate from
+	// externalTxCache: that reconstruction has its inputs stripped and its
+	// era-unspendable outputs nil'd, so sharing one cache under the txid key lets
+	// whichever reader arrives first hand the other the wrong shape.
+	externalOutpointsCache *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
+
+	externalStoreSem chan struct{} // Semaphore to limit concurrent external storage operations
+	indexMutex       sync.Mutex    // Mutex for index creation operations
+	indexOnce        sync.Once     // Ensures index creation/wait is only done once per process
+	spendLuaPackages []string      // Pre-initialized array of Lua package names for spend operations
+
+	// useNativeTeranodeOps caches whether the store should issue mod-teranode
+	// invocations through the native operate-path (TeranodeModifyOp, wire op
+	// type 200) rather than the legacy UDF path. Both the Aerospike setting
+	// and a server-capability probe (see detectNativeTeranodeOpSupport) must
+	// agree; otherwise calls fall back to UDF transparently. Atomic because a
+	// runtime PARAMETER_ERROR demotes it back to false while batch goroutines
+	// read it concurrently (see demoteNativeOnUnsupported in native_op.go).
+	useNativeTeranodeOps atomic.Bool
+
+	// nativeOpBatchWritePolicy is the shared BatchWritePolicy used by every
+	// NewBatchWrite the native-op path constructs in teranodeBatchRecord.
+	// Allocated once in initNativeTeranodeOps; the Aerospike client only
+	// reads from it during BatchOperate, so concurrent reads from many
+	// goroutines are safe. Sharing one policy instead of allocating a
+	// fresh one per batch record reverses the per-record alloc the
+	// original PR-828 implementation introduced.
+	nativeOpBatchWritePolicy *aerospike.BatchWritePolicy
 
 	// batchKeysPool is a per-Store sync.Pool of *[]*aerospike.Key slices reused
 	// across SetMinedMulti calls. Per-Store scoping ensures the Key's intrinsic
@@ -177,6 +281,19 @@ func (s *Store) batchOperate(policy *aerospike.BatchPolicy, records []aerospike.
 	}
 
 	return s.client.BatchOperate(policy, records)
+}
+
+// resolveBatcherMaxConcurrent returns the effective per-batcher concurrency cap.
+// A per-batcher override > 0 takes precedence; otherwise the shared
+// BatcherMaxConcurrent is used. A non-positive perBatcher value is treated as
+// "unset" so the shared knob still governs (and the caller's `> 0` guard keeps
+// the "both 0 = leave uncapped" path byte-identical to the pre-split behaviour).
+func resolveBatcherMaxConcurrent(perBatcher, shared int) int {
+	if perBatcher > 0 {
+		return perBatcher
+	}
+
+	return shared
 }
 
 // New creates a new Aerospike-based UTXO store.
@@ -230,9 +347,20 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// the external tx cache is used to cache externally stored transactions for a short time after being read from
 	// the store. Transactions with lots of outputs, being spent at the same time, benefit greatly from this cache,
 	// since external cache takes care of concurrent reads to the same transaction.
-	var externalTxCache *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
+	//
+	// Two separate instances, keyed the same way but never shared: the full
+	// transaction and the outpoint-resolution reconstruction are different shapes
+	// for the same txid, and one cache would let either reader receive the other's
+	// value. See the field comments on Store.
+	var externalTxCache, externalOutpointsCache *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
+
+	// Bounded: these hold whole transactions, external storage is the path taken by
+	// the largest ones, and the two instances hold separate copies of the same
+	// output vector. An eviction costs a refetch, not correctness.
 	if tSettings.UtxoStore.UseExternalTxCache {
-		externalTxCache = util.NewExpiringConcurrentCache[chainhash.Hash, *bt.Tx](10 * time.Second)
+		maxItems := tSettings.UtxoStore.ExternalTxCacheMaxItems
+		externalTxCache = util.NewExpiringConcurrentCacheWithMaxSize[chainhash.Hash, *bt.Tx](10*time.Second, maxItems)
+		externalOutpointsCache = util.NewExpiringConcurrentCacheWithMaxSize[chainhash.Hash, *bt.Tx](10*time.Second, maxItems)
 	}
 
 	// Initialize external store semaphore if concurrency limit is set
@@ -249,12 +377,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		setName:   setName,
 		logger:    logger,
 
-		settings:         tSettings,
-		externalStore:    externalStore,
-		utxoBatchSize:    utxoBatchSize,
-		externalTxCache:  externalTxCache,
-		externalStoreSem: externalStoreSem,
-		batcherWait:      batcherWaitTimeout(tSettings),
+		settings:               tSettings,
+		externalStore:          externalStore,
+		utxoBatchSize:          utxoBatchSize,
+		externalTxCache:        externalTxCache,
+		externalOutpointsCache: externalOutpointsCache,
+		externalStoreSem:       externalStoreSem,
+		batcherWait:            batcherWaitTimeout(tSettings),
 	}
 
 	// Initialize spendLuaPackages array with configurable count
@@ -264,6 +393,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 			s.spendLuaPackages[i] = LuaPackage + "_" + fmt.Sprintf("%d", i)
 		}
 	}
+
+	// Decide once whether to use the native operate-path for mod-teranode
+	// invocations. Falls back to UDF transparently if the setting is off
+	// or the cluster doesn't support the new opcode. See native_op.go.
+	s.initNativeTeranodeOps(ctx)
 
 	// Ensure index creation/wait is only done once per process
 	if pruner.IndexName != "" {
@@ -391,8 +525,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	outpointBatchDurationStr := s.settings.UtxoStore.OutpointBatcherDurationMillis
 	outpointBatchDuration := time.Duration(outpointBatchDurationStr) * time.Millisecond
 	outpointBatcherInst := batcher.NewWithPool(outpointBatchSize, outpointBatchDuration, s.sendOutpointBatch, batcherBackground, append(batcherOpts("aerospike_outpoint"), batcher.WithGreedyAccumulate(tSettings.UtxoStore.OutpointBatcherGreedyAccumulate))...)
-	if batcherMaxConcurrent > 0 {
-		outpointBatcherInst.SetMaxConcurrent(batcherMaxConcurrent)
+	if mc := resolveBatcherMaxConcurrent(tSettings.UtxoStore.OutpointBatcherMaxConcurrent, batcherMaxConcurrent); mc > 0 {
+		outpointBatcherInst.SetMaxConcurrent(mc)
 	}
 	s.outpointBatcher = outpointBatcherInst
 
@@ -1019,33 +1153,40 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		aerospike.ExpBinExists(fields.PreserveUntil.String()),
 	)
 
-	batchRecords := make([]aerospike.BatchRecordIfc, len(txIDs))
+	// Build batchRecords via append so a failed NewKey doesn't leave a nil
+	// entry in the slice — client.BatchOperate can nil-deref on nil entries.
+	// recordTxIDs tracks the original txID for each surviving batch record so
+	// result-handling logs reference the right hash.
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(txIDs))
+	recordTxIDs := make([]chainhash.Hash, 0, len(txIDs))
 
 	var keyErrors int
-	for i, txID := range txIDs {
+	for _, txID := range txIDs {
 		key, err := aerospike.NewKey(s.namespace, s.setName, txID[:])
 		if err != nil {
 			keyErrors++
 			continue
 		}
 
-		batchRecords[i] = aerospike.NewBatchUDF(
-			batchUDFPolicy,
-			key,
-			LuaPackage,
-			"preserveUntil",
-			aerospike.NewIntegerValue(int(preserveUntilHeight)),
-		)
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(
+			batchUDFPolicy, LuaPackage, key, subOpPreserveUntil, "preserveUntil",
+			int(preserveUntilHeight),
+		))
+		recordTxIDs = append(recordTxIDs, txID)
 	}
 
 	if keyErrors > 0 {
 		s.logger.Errorf("[PreserveTransactions] Failed to create keys for %d/%d transactions", keyErrors, len(txIDs))
 	}
 
+	if len(batchRecords) == 0 {
+		return nil
+	}
+
 	// Execute batch operation
 	err := s.client.BatchOperate(batchPolicy, batchRecords)
 	if err != nil {
-		return errors.NewStorageError("failed to preserve transactions", err)
+		return errors.NewStorageError("failed to preserve %d transactions: %s", len(txIDs), err.Error(), err)
 	}
 
 	// Check results and handle external transactions
@@ -1055,8 +1196,31 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	var skippedCount int
 
 	for i, record := range batchRecords {
+		if record == nil {
+			noResponseErrors++
+			s.logger.Warnf("[PreserveTransactions][%s] missing batch record; %s", recordTxIDs[i].String(), describeAerospikeBatchRecord(record))
+			continue
+		}
+
 		batchRecord := record.BatchRec()
+		if batchRecord == nil {
+			noResponseErrors++
+			s.logger.Warnf("[PreserveTransactions][%s] missing batch record; %s", recordTxIDs[i].String(), describeAerospikeBatchRecord(record))
+			continue
+		}
+
 		if batchRecord.Err != nil {
+			s.demoteNativeOnUnsupported(batchRecord.Err)
+
+			// Missing record: the UDF path reports this as a Lua TX_NOT_FOUND
+			// status, which the switch below deliberately does not count as an
+			// error. Under the native path's UPDATE_ONLY policy the same
+			// condition arrives as a per-record KEY_NOT_FOUND — skip it the
+			// same way.
+			if isKeyNotFound(batchRecord.Err) {
+				continue
+			}
+
 			// FILTERED_OUT: not prune-eligible (no deleteAtHeight and not already preserved) —
 			// a deliberate skip by the eligibility gate, not an error.
 			var aErr *aerospike.AerospikeError
@@ -1065,15 +1229,17 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 				continue
 			}
 
-			s.logger.Warnf("[PreserveTransactions] Failed to preserve tx %s: %v", txIDs[i].String(), batchRecord.Err)
+			s.logger.Warnf("[PreserveTransactions][%s] failed to preserve tx; %s: %v", recordTxIDs[i].String(), describeAerospikeBatchRecord(record), batchRecord.Err)
 			continue
 		}
 
 		response := batchRecord.Record
 		if response != nil && response.Bins != nil && response.Bins[LuaSuccess.String()] != nil {
-			res, err := s.ParseLuaMapResponse(response.Bins[LuaSuccess.String()])
+			rawResponse := response.Bins[LuaSuccess.String()]
+			res, err := s.ParseLuaMapResponse(rawResponse)
 			if err != nil {
 				parseErrors++
+				s.logger.Warnf("[PreserveTransactions][%s] failed to parse response bin %q (value %s); %s: %v", recordTxIDs[i].String(), LuaSuccess.String(), describeAerospikeValue(rawResponse), describeAerospikeBatchRecord(record), err)
 				continue
 			}
 
@@ -1083,10 +1249,12 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 			case LuaStatusError:
 				if res.ErrorCode != LuaErrorCodeTxNotFound {
 					luaErrors++
+					s.logger.Warnf("[PreserveTransactions][%s] preserveUntil returned error: %s", recordTxIDs[i].String(), res.Message)
 				}
 			}
 		} else {
 			noResponseErrors++
+			s.logger.Warnf("[PreserveTransactions][%s] missing expected response bin %q; %s", recordTxIDs[i].String(), LuaSuccess.String(), describeAerospikeBatchRecord(record))
 		}
 	}
 

@@ -180,6 +180,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			EnableSetMinedFilterExpressions: getBool("aerospike_enable_setmined_filter_expressions", false, alternativeContext...),
 			UseSeparateUDFMinedModule:       getBool("aerospike_use_separate_udf_mined_module", false, alternativeContext...),
 			SeparateSpendUDFModuleCount:     getInt("aerospike_separate_udf_spend_module_count", 0, alternativeContext...),
+			UseNativeTeranodeOps:            getBool("aerospike_use_native_teranode_ops", false, alternativeContext...),
+			EnableClientMetrics:             getBool("aerospike_enable_client_metrics", true, alternativeContext...),
 			SemaphoreMultiplier:             getFloat64("aerospike_semaphore_multiplier", 1.0, alternativeContext...),
 			OverloadRetryMaxElapsed:         getDuration("aerospike_overload_retry_max_elapsed", 2*time.Minute, alternativeContext...),
 			OverloadRetryBaseBackoff:        getDuration("aerospike_overload_retry_base_backoff", 50*time.Millisecond, alternativeContext...),
@@ -354,6 +356,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ValidationWarmupCount:                     getInt("blockvalidation_validation_warmup_count", 128, alternativeContext...),
 			BatchMissingTransactions:                  getBool("blockvalidation_batch_missing_transactions", false, alternativeContext...),
 			CheckSubtreeFromBlockTimeout:              getDuration("blockvalidation_check_subtree_from_block_timeout", 5*time.Minute),
+			SubtreeDataFetchTimeout:                   getDuration("blockvalidation_subtree_data_fetch_timeout", DefaultSubtreeDataFetchTimeout, alternativeContext...),
 			CheckSubtreeFromBlockRetries:              getInt("blockvalidation_check_subtree_from_block_retries", 5, alternativeContext...),
 			CheckSubtreeFromBlockRetryBackoffDuration: getDuration("blockvalidation_check_subtree_from_block_retry_backoff_duration", 30*time.Second),
 			SecretMiningThreshold:                     getUint32("blockvalidation_secret_mining_threshold", uint32(params.CoinbaseMaturity-1), alternativeContext...), // golint:nolint
@@ -474,6 +477,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GetBatcherDurationMillis:                getInt("utxostore_getBatcherDurationMillis", 10, alternativeContext...),
 			DBTimeout:                               getDuration("utxostore_dbTimeoutDuration", 5*time.Second, alternativeContext...),
 			UseExternalTxCache:                      getBool("utxostore_useExternalTxCache", true, alternativeContext...),
+			ExternalTxCacheMaxItems:                 getInt("utxostore_externalTxCacheMaxItems", 1024, alternativeContext...),
 			ExternalizeAllTransactions:              getBool("utxostore_externalizeAllTransactions", false, alternativeContext...),
 			ExternalStoreConcurrency:                getInt("utxostore_externalStoreConcurrency", 16, alternativeContext...),
 			PostgresPool:                            getPostgresPoolSettings("utxostore", alternativeContext...),
@@ -488,6 +492,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			DisableDAHCleaner:                       getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 			ReAssignedUtxoSpendableAfterBlocks:      getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
 			BatcherMaxConcurrent:                    getInt("utxostore_batcherMaxConcurrent", 64, alternativeContext...),
+			OutpointBatcherMaxConcurrent:            getInt("utxostore_outpointBatcherMaxConcurrent", 0, alternativeContext...),
 			QueryIdleTimeoutSeconds:                 getInt("utxostore_queryIdleTimeoutSeconds", 60, alternativeContext...),
 			PostgresDAHSweepLag:                     getInt("utxostore_postgresDAHSweepLag", 2, alternativeContext...),
 			PostgresDAHSweepStallAlertSeconds:       getInt("utxostore_postgresDAHSweepStallAlertSeconds", 900, alternativeContext...),
@@ -501,6 +506,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PostgresMaintenancePoolConns:            getInt("utxostore_postgresMaintenancePoolConns", 0, alternativeContext...),
 			PostgresTxsFillfactor:                   getInt("utxostore_postgresTxsFillfactor", 50, alternativeContext...),
 			PostgresCreateBatchMaxBytes:             getInt("utxostore_postgresCreateBatchMaxBytes", 536870912, alternativeContext...),
+			ConflictingChildrenMaxNodes:             getInt("utxostore_conflictingChildrenMaxNodes", 100_000, alternativeContext...),
 			StoreBatcherTickerIntervalMillis:        getInt("utxostore_storeBatcherTickerIntervalMillis", 0, alternativeContext...),
 			GetBatcherTickerIntervalMillis:          getInt("utxostore_getBatcherTickerIntervalMillis", 0, alternativeContext...),
 			SpendBatcherTickerIntervalMillis:        getInt("utxostore_spendBatcherTickerIntervalMillis", 0, alternativeContext...),
@@ -551,6 +557,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SyncCoordinatorPeriodicEvaluationInterval: getDuration("p2p_sync_coordinator_periodic_evaluation_interval", 30*time.Second, alternativeContext...),
 			// On-demand peer health checking (uses built-in 2s timeout)
 			HealthCheckEnabled: getBool("p2p_health_check_enabled", true, alternativeContext...),
+			// Gossip handler load management
+			PeerRegistryBatchInterval: getDuration("p2p_peer_registry_batch_interval", time.Second, alternativeContext...),
+			GossipHandlerConcurrency:  getInt("p2p_gossip_handler_concurrency", 4, alternativeContext...),
 		},
 		Coinbase: CoinbaseSettings{
 			DB:                          getString("coinbaseDB", "", alternativeContext...),
@@ -593,6 +602,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UTXOProgressLogInterval:        getDuration("pruner_utxoProgressLogInterval", 30*time.Second, alternativeContext...), // Progress every 30s
 			UTXOPartitionQueries:           getInt("pruner_utxoPartitionQueries", 0, alternativeContext...),                      // 0 = auto-detect based on CPU cores
 			UTXOSetTTL:                     getBool("pruner_utxoSetTTL", false, alternativeContext...),                           // Use TTL instead of delete (false = hard delete)
+			RelaxRemovalCommitLevel:        getBool("pruner_relaxRemovalCommitLevel", true, alternativeContext...),               // Pruner removals ACK from the master only (idempotent, re-pruned next scan)
 			SkipBlobDeletion:               getBool("pruner_skipBlobDeletion", false, alternativeContext...),                     // Skip blob deletion disabled by default (deletion enabled)
 			BlobDeletionSafetyWindow:       getUint32("pruner_blobDeletionSafetyWindow", 10, alternativeContext...),              // Wait 10 blocks behind triggering height
 			BlobDeletionBatchSize:          getInt("pruner_blobDeletionBatchSize", 1000, alternativeContext...),                  // Process 1000 deletions per batch
@@ -672,6 +682,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			TempStore:                        getURL("temp_store", "file://./data/tempstore", alternativeContext...),
 			PeerIdleTimeout:                  getDuration("legacy_peerIdleTimeout", 125*time.Second, alternativeContext...),     // ping/pong interval is 2 mins, so we set this to 125s to be sure
 			PeerProcessingTimeout:            getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
+			BlockFailureBackoffBase:          getDuration("legacy_blockFailureBackoffBase", 5*time.Second, alternativeContext...),
+			BlockFailureBackoffMaxDuration:   getDuration("legacy_blockFailureBackoffMaxDuration", 150*time.Second, alternativeContext...),
 			BlockPrefetchBufferBytes:         getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
