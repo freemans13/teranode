@@ -69,8 +69,13 @@ func Ensure(required uint64) (budget uint64, raised bool, err error) {
 				// the process actually got — and an overstated budget puts
 				// EMFILE straight back on the table, which is the one thing
 				// this package exists to prevent.
-				effective = target
-
+				//
+				// If the read-back itself fails, effective stays at the soft
+				// limit already observed above: the last figure the kernel
+				// actually reported. That under-states the budget and clamps a
+				// little harder, which is the direction this package must err
+				// in — falling back to target would be trusting exactly the
+				// number the read-back exists to distrust.
 				if newSoft, _, getErr := get(); getErr == nil {
 					effective = newSoft
 				}

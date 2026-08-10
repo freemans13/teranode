@@ -201,6 +201,73 @@ func TestEnsureStopsAtTheHardLimit(t *testing.T) {
 	require.Equal(t, uint64(4096)-Headroom, budget)
 }
 
+// TestEnsureReportsTheGrantedLimitNotTheRequest pins the platform behaviour the
+// read-back exists for. Darwin accepts a setrlimit and then silently caps the
+// soft limit at OPEN_MAX / kern.maxfilesperproc, so a budget sized from the
+// request would count descriptors the process does not hold, and the clamp
+// built on it would permit exactly the EMFILE this package prevents.
+func TestEnsureReportsTheGrantedLimitNotTheRequest(t *testing.T) {
+	realGet, realSet := get, set
+	t.Cleanup(func() { get, set = realGet, realSet })
+
+	const (
+		hard    = 1 << 20
+		granted = 10_240 // all this kernel will hand out, whatever is asked for
+	)
+
+	curSoft := uint64(1024)
+
+	get = func() (uint64, uint64, error) { return curSoft, hard, nil }
+	set = func(s, _ uint64) error {
+		// Succeeds, then grants less — the whole point of the case.
+		if s > granted {
+			s = granted
+		}
+
+		curSoft = s
+
+		return nil
+	}
+
+	budget, raised, err := Ensure(100_000)
+	require.NoError(t, err)
+	require.True(t, raised, "the limit did move, just not as far as asked")
+	require.Equal(t, uint64(granted), curSoft, "the kernel granted less than the request")
+	require.Equal(t, uint64(granted)-Headroom, budget, "the budget must reflect what was granted, not what was asked for")
+}
+
+// TestEnsureFallsBackToTheObservedLimitWhenTheReadBackFails pins the safe
+// direction on the other half of that path: if the read-back after a successful
+// raise cannot be done, the budget is sized from the last limit the kernel
+// actually reported rather than from the request, which could overstate it.
+func TestEnsureFallsBackToTheObservedLimitWhenTheReadBackFails(t *testing.T) {
+	realGet, realSet := get, set
+	t.Cleanup(func() { get, set = realGet, realSet })
+
+	const (
+		soft = 2048
+		hard = 1 << 20
+	)
+
+	first := true
+
+	get = func() (uint64, uint64, error) {
+		if first {
+			first = false
+
+			return soft, hard, nil
+		}
+
+		return 0, 0, errors.NewProcessingError("read-back failed")
+	}
+	set = func(uint64, uint64) error { return nil }
+
+	budget, raised, err := Ensure(100_000)
+	require.NoError(t, err, "an unreadable read-back must not fail startup")
+	require.False(t, raised, "an unverifiable raise must not be reported as one")
+	require.Equal(t, uint64(soft)-Headroom, budget, "the budget must fall back to the observed limit, not the request")
+}
+
 // TestEnsureReportsUnreadableLimit pins the platform-without-RLIMIT_NOFILE path:
 // a zero budget and an error, which the caller reads as "carry on unclamped".
 func TestEnsureReportsUnreadableLimit(t *testing.T) {
