@@ -1842,13 +1842,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					return errors.NewBlockInvalidError("[ValidateBlock][%s] block header failed contextual validation", block.Header.Hash().String(), err)
 				}
 
-				// Anything else is a local header-context failure, not the block's fault: the
-				// parent-header run we supplied was unanchored, unlinked or too short to hold
-				// the median window (issue #1467). Whatever produced it, it is a run our own
-				// store returned that we cannot interpret, so the block must not be marked bad
-				// for it — and it has not been added yet, so returning alone would drop it
-				// until a peer re-announces. Re-queue through the from-scratch path, which
-				// re-enters validation and ends in AddBlock.
+				// Anything else is not the block's fault, so it must not be marked bad for it —
+				// and it has not been added yet, so returning alone would drop it until a peer
+				// re-announces. A header-context failure gets one more full attempt through the
+				// from-scratch path, which ends in AddBlock; shouldRequeueForHeaderContext holds
+				// the decision, shared with the non-optimistic site below.
 				//
 				// Reaching here means the run could not be repaired: parentHeaderRun already
 				// re-derived it by hash walk, which is not range-memoized, and that run was
@@ -1856,7 +1854,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// claims to be rather than the first — it exists for a cause transient enough to
 				// clear on its own, e.g. the store still settling after a restart. It cannot
 				// clear a stale batched answer; the hash walk above is what does that.
-				if !opts.IsRequeuedRetry {
+				if shouldRequeueForHeaderContext(err, opts) {
 					u.ReValidateBlockFromScratch(block, baseURL, opts)
 				}
 
@@ -2023,13 +2021,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					// our own store returned was unanchored, unlinked or too short, and
 					// parentHeaderRun's hash-walk rebuild could not repair it either, so all
 					// that is left is to hope the cause clears. The block was never added, so
-					// returning alone would lose it.
-					// Deliberately not every ErrProcessing: the revalidation worker is a single
-					// goroutine off a 2-slot channel that retries three times with no backoff, so
-					// widening this turns a storage outage into four full validation passes per
-					// block with catchup blocking on the send — and a non-transient processing
-					// error (model/Block.go's target-difficulty check) fails identically each time.
-					if errors.Is(err, errors.ErrBlockHeaderContext) && !opts.IsRequeuedRetry {
+					// returning alone would lose it. shouldRequeueForHeaderContext carries the
+					// reasoning and is shared with the optimistic site above.
+					if shouldRequeueForHeaderContext(err, opts) {
 						u.ReValidateBlockFromScratch(block, baseURL, opts)
 					}
 
@@ -2244,6 +2238,27 @@ func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Bl
 // Returns true if the parent block is marked as invalid, false otherwise.
 func (*BlockValidation) checkParentInvalid(parentMeta *model.BlockHeaderMeta) bool {
 	return parentMeta != nil && parentMeta.Invalid
+}
+
+// shouldRequeueForHeaderContext reports whether a validation failure should be re-queued for
+// another full attempt through ReValidateBlockFromScratch.
+//
+// Only a header-context failure qualifies (issue #1467): the parent-header run our own store
+// returned was unusable and parentHeaderRun's hash-walk rebuild could not repair it either, so the
+// block is not at fault and has not been added — returning alone would drop it until a peer
+// re-announces.
+//
+// Deliberately NOT every retryable error. The revalidation worker is a single goroutine draining a
+// two-slot channel that retries three times with no backoff, so widening this turns a storage
+// outage into four full validation passes per block with catchup blocking on the send — and a
+// permanent failure such as model.Block.Valid's target-difficulty check, which is also reported as
+// a processing error, fails identically on every one of them.
+//
+// One predicate rather than the condition written out at each call site: the two sites answered
+// this differently for several commits, each defensible in isolation, and that is precisely the
+// drift a shared decision makes impossible.
+func shouldRequeueForHeaderContext(err error, opts *ValidateBlockOptions) bool {
+	return errors.Is(err, errors.ErrBlockHeaderContext) && !opts.IsRequeuedRetry
 }
 
 // parentHeaderRun returns the run of the block's ancestor headers that validation measures the
