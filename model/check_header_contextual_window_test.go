@@ -299,3 +299,27 @@ func TestCheckHeaderContextualWindowIntegrity(t *testing.T) {
 		require.NoError(t, block.CheckHeaderContextual(ascending, newSettings(t), logger))
 	})
 }
+
+// TestMedianTimeWindow_EmptyRunIsRejected pins the one piece of contract MedianTimeWindow does not
+// share with CheckHeaderContextual.
+//
+// CheckHeaderContextual treats an empty run as "no chain supplied, skip the rule" — the block
+// assembly submit path relies on that. MedianTimeWindow cannot: it returns the window itself, and
+// there is no window to return, so answering nil,nil would hand a caller an empty slice to compute
+// a median over. Callers use it to decide whether a run they hold is worth committing to, so the
+// empty case has to be reported rather than silently treated as fine.
+func TestMedianTimeWindow_EmptyRunIsRejected(t *testing.T) {
+	baseTime := uint32(time.Now().Add(-24 * time.Hour).Unix())
+	ascending := buildLinkedChain(t, 3, baseTime)
+	block := buildChildBlock(t, ascending[len(ascending)-1], baseTime+200)
+
+	window, err := block.MedianTimeWindow(nil)
+	require.Error(t, err)
+	require.Nil(t, window)
+	require.True(t, errors.Is(err, errors.ErrBlockHeaderContext))
+
+	window, err = block.MedianTimeWindow([]*BlockHeader{})
+	require.Error(t, err)
+	require.Nil(t, window)
+	require.True(t, errors.Is(err, errors.ErrBlockHeaderContext))
+}

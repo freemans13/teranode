@@ -1694,7 +1694,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			previousBlockHeaderCount := u.settings.BlockValidation.PreviousBlockHeaderCount
 
 			var parentBlockHeadersMeta []*model.BlockHeaderMeta
-			blockHeaders, parentBlockHeadersMeta, err = u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, previousBlockHeaderCount)
+			blockHeaders, parentBlockHeadersMeta, err = u.parentHeaderRun(ctx, block, previousBlockHeaderCount)
 			if err != nil {
 				ctxLogger.Errorf("[ValidateBlock][%s] failed to get block headers: %s", block.String(), err)
 				u.ReValidateBlock(block, baseURL)
@@ -1850,14 +1850,12 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// until a peer re-announces. Re-queue through the from-scratch path, which
 				// re-enters validation and ends in AddBlock.
 				//
-				// On what the retry can and cannot fix: the probe/range-scan window in
-				// GetBlockHeaders' fast path is NOT an established live cause — StoreBlock
-				// raises mainChainRebuilding for exactly the !onMainChain reorg case, and the
-				// fast path is skipped entirely while that is non-zero. And the retry re-issues
-				// the same GetBlockHeaders key, which the store memoizes for up to
-				// chainWalkCacheTTL, so a retry inside that window sees the same answer. Its
-				// value is that a genuinely transient cause gets another attempt instead of the
-				// block being silently lost, not that it can force a fresh read.
+				// Reaching here means the run could not be repaired: parentHeaderRun already
+				// re-derived it by hash walk, which is not range-memoized, and that run was
+				// unusable too (or the walk itself failed). So the retry is the last resort it
+				// claims to be rather than the first — it exists for a cause transient enough to
+				// clear on its own, e.g. the store still settling after a restart. It cannot
+				// clear a stale batched answer; the hash walk above is what does that.
 				if !opts.IsRequeuedRetry {
 					u.ReValidateBlockFromScratch(block, baseURL, opts)
 				}
@@ -1985,7 +1983,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// get all X previous block headers on the main chain, 100 is the default
 			u.logger.Infof(logValidateBlockGetBlockHeaders, block.Header.Hash().String())
 
-			blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, u.settings.BlockValidation.PreviousBlockHeaderCount)
+			blockHeaders, blockHeadersMeta, err := u.parentHeaderRun(ctx, block, u.settings.BlockValidation.PreviousBlockHeaderCount)
 			if err != nil {
 				u.logger.Errorf("[ValidateBlock][%s] failed to get block headers: %s", block.String(), err)
 				u.ReValidateBlock(block, baseURL)
@@ -2022,8 +2020,10 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					errors.Is(err, errors.ErrServiceError) ||
 					errors.Is(err, errors.ErrProcessing) {
 					// Re-queue ONLY the header-context case (issue #1467): the parent-header run
-					// our own store returned was unanchored, unlinked or too short, which clears
-					// on its own, and the block was never added so returning alone would lose it.
+					// our own store returned was unanchored, unlinked or too short, and
+					// parentHeaderRun's hash-walk rebuild could not repair it either, so all
+					// that is left is to hope the cause clears. The block was never added, so
+					// returning alone would lose it.
 					// Deliberately not every ErrProcessing: the revalidation worker is a single
 					// goroutine off a 2-slot channel that retries three times with no backoff, so
 					// widening this turns a storage outage into four full validation passes per
@@ -2244,6 +2244,111 @@ func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Bl
 // Returns true if the parent block is marked as invalid, false otherwise.
 func (*BlockValidation) checkParentInvalid(parentMeta *model.BlockHeaderMeta) bool {
 	return parentMeta != nil && parentMeta.Invalid
+}
+
+// parentHeaderRun returns the run of the block's ancestor headers that validation measures the
+// median-time-past rule over, newest-first, with their metadata.
+//
+// It fetches the run the cheap way — one batched blockchainClient.GetBlockHeaders — and then asks
+// model.Block.MedianTimeWindow whether what came back can actually carry the rule. When it cannot,
+// the run is re-derived by walking parent hashes and the walked run is used instead.
+//
+// The fallback is the point. GetBlockHeaders memoizes its answer per (startHash, count) key for up
+// to the store's chainWalkCacheTTL — ten minutes — so a caller that discovers the problem only when
+// the check fails cannot fix it by asking the same question again: every retry inside that window
+// replays the same unusable run. walkParentChain asks a different question, keyed by hash, which is
+// neither range-memoized nor sensitive to which block is canonical. netsync, subtreevalidation and
+// block assembly already reach for the same fallback when re-anchoring their own median windows.
+//
+// A walk that fails, or that produces a run no better than the batched one, is not an error here:
+// the batched run is returned unchanged and the usual header checks report on it as they always
+// did. The fallback can only turn a failure into a success, never reshape one.
+func (u *BlockValidation) parentHeaderRun(ctx context.Context, block *model.Block, count uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	headers, meta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, count)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// An empty run is the caller's signal to skip the median-time-past rule entirely, not a run
+	// to repair — matching CheckHeaderContextual and block.Valid.
+	if len(headers) == 0 {
+		return headers, meta, nil
+	}
+
+	_, windowErr := block.MedianTimeWindow(headers)
+	if windowErr == nil {
+		return headers, meta, nil
+	}
+
+	u.logger.Warnf("[ValidateBlock][%s] batched parent-header run cannot carry the median-time-past window, re-deriving it by hash walk: %s", block.Hash().String(), windowErr)
+
+	walked, walkedMeta, walkErr := u.walkParentChain(ctx, block.Header.HashPrevBlock, count)
+	if walkErr != nil {
+		u.logger.Warnf("[ValidateBlock][%s] hash-walk fallback failed, keeping the batched run: %s", block.Hash().String(), walkErr)
+
+		return headers, meta, nil
+	}
+
+	if _, windowErr := block.MedianTimeWindow(walked); windowErr != nil {
+		u.logger.Warnf("[ValidateBlock][%s] hash-walk fallback is no better than the batched run, keeping it: %s", block.Hash().String(), windowErr)
+
+		return headers, meta, nil
+	}
+
+	u.logger.Infof("[ValidateBlock][%s] rebuilt a %d-header parent run by hash walk", block.Hash().String(), len(walked))
+
+	return walked, walkedMeta, nil
+}
+
+// walkParentChain fetches up to depth block headers starting at startHash and walking backwards
+// via HashPrevBlock, stopping early at genesis. Each hop uses blockchainClient.GetBlockHeader,
+// which is keyed by hash rather than by (start, count) range — so unlike GetBlockHeaders it is
+// neither memoized per range nor dependent on which block is canonical at a given height, and
+// block contents are immutable once stored. That is what makes it a usable second opinion.
+//
+// Returned headers are ordered newest-first, matching blockchainClient.GetBlockHeaders' order, so
+// the two are interchangeable to callers.
+//
+// The cost is depth round-trips on a cold cache against one batched query, which is why this is a
+// fallback rather than the default. It runs only when the batched run cannot carry the
+// median-time-past window at all.
+//
+// Mirrors the same-named helpers in services/legacy/netsync and services/subtreevalidation —
+// duplicated by design (small, internal, avoids a new shared util package), differing only in also
+// returning the header metadata that block validation needs for block header IDs.
+func (u *BlockValidation) walkParentChain(ctx context.Context, startHash *chainhash.Hash, depth uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	headers := make([]*model.BlockHeader, 0, depth)
+	metas := make([]*model.BlockHeaderMeta, 0, depth)
+	cur := startHash
+
+	for i := uint64(0); i < depth; i++ {
+		if cur == nil {
+			return nil, nil, errors.NewProcessingError("walkParentChain: nil prev-block link at depth %d (walked off the chain)", i)
+		}
+
+		header, meta, err := u.blockchainClient.GetBlockHeader(ctx, cur)
+		if err != nil {
+			return nil, nil, errors.NewProcessingError("walkParentChain: failed at depth %d (hash %s)", i, cur.String(), err)
+		}
+
+		if header == nil {
+			return nil, nil, errors.NewProcessingError("walkParentChain: nil header at depth %d (hash %s) — possible transient cache miss", i, cur.String())
+		}
+
+		headers = append(headers, header)
+		metas = append(metas, meta)
+
+		// Stop at genesis. Its HashPrevBlock is the all-zero hash, not nil, so the nil guard
+		// above never fires — without this the walk asks GetBlockHeader for the zero hash and
+		// fails with "failed at depth N". A run that ends at genesis is a complete window.
+		if header.HashPrevBlock == nil || header.HashPrevBlock.IsEqual(&chainhash.Hash{}) {
+			break
+		}
+
+		cur = header.HashPrevBlock
+	}
+
+	return headers, metas, nil
 }
 
 func (u *BlockValidation) kafkaNotifyBlockInvalid(block *model.Block, reason string) {
@@ -2487,7 +2592,7 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 	// get all X previous block headers, 100 is the default
 	previousBlockHeaderCount := u.settings.BlockValidation.PreviousBlockHeaderCount
 
-	blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, blockData.block.Header.HashPrevBlock, previousBlockHeaderCount)
+	blockHeaders, blockHeadersMeta, err := u.parentHeaderRun(ctx, blockData.block, previousBlockHeaderCount)
 	if err != nil {
 		u.logger.Errorf("[reValidateBlock][%s] failed to get block headers: %s", blockData.block.String(), err)
 
