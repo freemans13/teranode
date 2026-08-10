@@ -1728,16 +1728,27 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 		// unverified-parent-outputs hazard in precisely the case where we have
 		// positive evidence this node's stored bytes are wrong.
 		//
-		// FileTypeTx always holds the whole transaction body under its own txid,
-		// so that txid is reproducible. No other read path in this file can be
-		// re-hashed: the FileTypeOutputs branch below reconstructs outputs only,
-		// with no inputs, version or locktime, and so gets the weaker
-		// self-declared-txid check documented there; the inline-bins path nils out
-		// spent outputs; and GetTxInpointsFromExternalStore parses input references
-		// only, by design never materialising scripts or outputs. (The pruner reads
-		// FileTypeTx too, in pruner_service.go, but only to collect outpoints for
-		// deletion bookkeeping — it never feeds consensus.) Covering those
-		// cryptographically needs a different mechanism.
+		// Scope, and why each other read path is left alone. Two of them CANNOT be
+		// re-hashed, and one CAN but deliberately is not:
+		//
+		//   - FileTypeOutputs (below) reconstructs outputs only, with no inputs,
+		//     version or locktime, so there is no body to hash. It gets the weaker
+		//     self-declared-txid check documented there.
+		//   - GetTxInpointsFromExternalStore parses input references only, by
+		//     design never materialising scripts or outputs. Same problem.
+		//   - getTxFromBins (the inline path, for transactions small enough to live
+		//     inside the Aerospike record) CAN be re-hashed. Its inputs and outputs
+		//     bins are written once at create and never mutated — spending touches
+		//     the utxos/spentUtxos bins, not these — so a round-trip reproduces the
+		//     txid exactly. It is excluded on COST, not on impossibility: external
+		//     parents are a size-gated minority sitting behind a ten-second cache,
+		//     whereas inline parents are the common case, so re-hashing them would
+		//     put a double-SHA256 and a full re-serialization on essentially every
+		//     spend validation. That trade deserves its own change, with its own
+		//     benchmark to justify it.
+		//
+		// (The pruner reads FileTypeTx too, in pruner_service.go, but only to
+		// collect outpoints for deletion bookkeeping — it never feeds consensus.)
 		if actual := tx.TxIDChainHash(); !actual.Equal(previousTxHash) {
 			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external tx does not hash to the key it was stored under (got %s) — stale, rotted or mis-keyed blob", previousTxHash.String(), actual.String())
 		}
