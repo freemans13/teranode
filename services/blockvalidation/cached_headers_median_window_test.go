@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/mock"
@@ -173,17 +174,21 @@ func TestValidateBlock_CachedHeadersShortWindowIsRefused(t *testing.T) {
 func TestValidateBlock_HeaderContextFailureIsRetriedIntoAddBlock(t *testing.T) {
 	// Both re-queue sites must end in AddBlock. The optimistic one is reached with the global
 	// setting on; the non-optimistic one is the branch EVERY catchup block and every operator
-	// reconsider takes, since both set DisableOptimisticMining.
-	// TODO(#1525): the non-optimistic branch — the one catchup and operator reconsider both
-	// take — is NOT covered here. Driving it needs a subtree fixture that survives a full
-	// block.Valid, because unlike the optimistic branch (which reaches AddBlock before full
-	// validation) that path validates completely before storing. Raised by ctnguyen as ChiR19
-	// and deliberately left open rather than covered by a fixture that only appears to pass.
+	// reconsider takes, since both set DisableOptimisticMining — and it is the stricter of the
+	// two, because it validates completely before storing rather than storing first.
+	//
+	// Covering it needed the fixture to survive a full block.Valid, which took three corrections
+	// (ChiR19): the subtree must be stored via Serialize() rather than SerializeNodes(), the
+	// header's merkle root must be taken with the coinbase substituted into leaf 0, and the
+	// AddBlock assertion must exclude storeInvalidBlock's call — without that last one the
+	// subtest passed while the block was being recorded as consensus-invalid, which is precisely
+	// the "fixture that only appears to pass" this test was held back to avoid.
 	for _, tc := range []struct {
 		name                    string
 		disableOptimisticMining bool
 	}{
 		{"optimistic branch", false},
+		{"non-optimistic branch", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runHeaderContextRetryReachesAddBlock(t, tc.disableOptimisticMining)
@@ -251,8 +256,19 @@ func runHeaderContextRetryReachesAddBlock(t *testing.T, disableOptimisticMining 
 	}
 	mineHeader(t, badParent)
 
+	// block.Valid computes the merkle root from the subtree with the coinbase txid substituted
+	// into leaf 0, not from the bare subtree root — a header carrying the bare root fails with
+	// "merkle root does not match". The optimistic branch never saw that, because it stores the
+	// block before full validation runs.
+	subtreeRootHash := subtree.RootHash()
+
+	merkleRoot, err := subtree.RootHashWithReplaceRootNode(coinbaseTx.TxIDChainHash(), 0, uint64(coinbaseTx.Size()))
+	require.NoError(t, err)
+	require.Equal(t, subtreeRootHash, subtree.RootHash(),
+		"substituting the coinbase must not disturb the stored subtree's identity")
+
 	blockHeader := &model.BlockHeader{
-		Version: 1, HashPrevBlock: parent.Hash(), HashMerkleRoot: subtree.RootHash(),
+		Version: 1, HashPrevBlock: parent.Hash(), HashMerkleRoot: merkleRoot,
 		Timestamp: now + 100, Bits: *nBits,
 	}
 	mineHeader(t, blockHeader)
@@ -311,14 +327,35 @@ func runHeaderContextRetryReachesAddBlock(t *testing.T, disableOptimisticMining 
 	notificationChan := make(chan *blockchain_api.Notification, 1)
 	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return(notificationChan, nil).Maybe()
 
-	var added atomic.Int32
+	// storeInvalidBlock ALSO calls AddBlock — with WithInvalid(true) — so a bare call count
+	// cannot tell recovery from rejection. It counted the invalid store and passed while the
+	// block was being recorded as consensus-invalid, which is the failure this whole test
+	// exists to catch. Split the two.
+	var added, storedInvalid atomic.Int32
 
 	mockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return(nil).Run(func(mock.Arguments) { added.Add(1) }).Maybe()
+		Return(nil).Run(func(args mock.Arguments) {
+		var storeOpts blockchainoptions.StoreBlockOptions
+		for _, apply := range args.Get(3).([]blockchainoptions.StoreBlockOption) {
+			apply(&storeOpts)
+		}
+
+		if storeOpts.Invalid {
+			storedInvalid.Add(1)
+			return
+		}
+
+		added.Add(1)
+	}).Maybe()
 
 	bv := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, subtreeStore, txStore, utxoStore, nil, subtreeValidationClient)
 
-	subtreeBytes, err := subtree.SerializeNodes()
+	// Serialize(), not SerializeNodes(): block.Valid deserializes the whole subtree, so the
+	// nodes-only form dies on "unable to read root hash". The optimistic branch never noticed,
+	// because it reaches AddBlock before full validation and its background Valid can fail
+	// unobserved — which is exactly the shallowness this subtest exists to close.
+	// services/subtreevalidation writes Serialize() here in production.
+	subtreeBytes, err := subtree.Serialize()
 	require.NoError(t, err)
 	require.NoError(t, subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
 
@@ -336,6 +373,9 @@ func runHeaderContextRetryReachesAddBlock(t *testing.T, disableOptimisticMining 
 	// The retry is scheduled past the result-grace window, then runs on the drain worker.
 	require.Eventually(t, func() bool { return added.Load() > 0 }, 15*time.Second, 50*time.Millisecond,
 		"the re-queued attempt must reach AddBlock — re-queuing alone is not recovery")
+
+	require.Zero(t, storedInvalid.Load(),
+		"our own header context being unusable must never be recorded against the block")
 }
 
 // mineHeader grinds a nonce until the header meets its own (regtest-easy) target.
