@@ -486,6 +486,71 @@ func TestBatcher_Close_AbandonsHungFlush(t *testing.T) {
 	require.Less(t, elapsed, 5*time.Second, "Close should abandon the wait close to its deadline, not hang")
 }
 
+// alwaysFailingStore is a blobStoreSetter fake whose Set call always returns an error,
+// simulating a backend that is reachable but rejecting writes — as opposed to
+// blockingStore, which hangs. Used to verify Close reports a shutdown flush that ran
+// and failed, rather than one that never completed.
+type alwaysFailingStore struct{}
+
+func (alwaysFailingStore) Health(_ context.Context, _ bool) (int, string, error) {
+	return 200, "ok", nil
+}
+
+func (alwaysFailingStore) Set(_ context.Context, _ []byte, _ fileformat.FileType, _ []byte, _ ...options.FileOption) error {
+	return errors.NewStorageError("simulated permanent backend failure")
+}
+
+// TestBatcher_Close_ReportsFailedShutdownFlush pins the case the hung-backend fix left
+// open: the worker's final writeBatch error was only logged, so Close returned nil and
+// the caller was told the store shut down cleanly while the batch it was holding had
+// been discarded. That is the same "told success, dropped the bytes" defect this type
+// fixes on the overflow path, and it must not survive on the shutdown path.
+func TestBatcher_Close_ReportsFailedShutdownFlush(t *testing.T) {
+	batcher := New(ulogger.TestLogger{}, alwaysFailingStore{}, 1024, false)
+
+	var hash chainhash.Hash
+	require.NoError(t, batcher.Set(context.Background(), hash[:], fileformat.FileTypeUtxoSet, []byte("data")))
+
+	// A generous deadline: this must fail because the flush failed, not because it timed out.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := batcher.Close(ctx)
+	require.Error(t, err, "Close must report a shutdown flush that ran and failed")
+	require.NotErrorIs(t, err, context.DeadlineExceeded, "the error should describe the failed flush, not a timeout")
+}
+
+// TestBatcher_Close_IsIdempotent pins the panic that making Close fallible invited: a
+// caller that sees an error from Close is exactly the caller who retries it, and the
+// second close of the done channel used to panic during shutdown.
+func TestBatcher_Close_IsIdempotent(t *testing.T) {
+	batcher := New(ulogger.TestLogger{}, memory.New(), 1024, false)
+
+	var hash chainhash.Hash
+	require.NoError(t, batcher.Set(context.Background(), hash[:], fileformat.FileTypeUtxoSet, []byte("data")))
+
+	first := batcher.Close(context.Background())
+	require.NoError(t, first)
+
+	require.NotPanics(t, func() {
+		second := batcher.Close(context.Background())
+		require.Equal(t, first, second, "a repeat Close should return the first call's result")
+	})
+}
+
+// TestBatcher_Set_AfterClose_ReturnsError pins the third "told success, dropped the
+// bytes" path: the worker has returned by then, so an item accepted after Close would
+// sit in the queue forever with its caller told the write was queued fine.
+func TestBatcher_Set_AfterClose_ReturnsError(t *testing.T) {
+	batcher := New(ulogger.TestLogger{}, memory.New(), 1024, false)
+
+	require.NoError(t, batcher.Close(context.Background()))
+
+	var hash chainhash.Hash
+	err := batcher.Set(context.Background(), hash[:], fileformat.FileTypeUtxoSet, []byte("data"))
+	require.Error(t, err, "Set after Close must not silently accept a write nobody will process")
+}
+
 // TestBatcher_Set_ShortKey_ReturnsError pins defect 4: Set used to do
 // chainhash.Hash(hash) unconditionally, which panics for any key that isn't
 // exactly 32 bytes (e.g. the blockchain peer-registry store's 13-byte

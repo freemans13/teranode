@@ -74,6 +74,20 @@ type Batcher struct {
 	// so it must not read currentBatch directly (that would race); this atomic mirror is the
 	// safe way to report an approximate unflushed-byte count in that situation.
 	currentBatchLen atomic.Int64
+	// closeOnce guards the shutdown sequence so it runs exactly once. Close is fallible, which
+	// invites a caller that sees an error to retry it; without this, the second call would panic
+	// on close of an already-closed done channel.
+	closeOnce sync.Once
+	// closeErr memoises the outcome of that single shutdown sequence, so repeat callers get the
+	// same answer the first caller got. sync.Once establishes the happens-before that makes
+	// reading it from another goroutine safe.
+	closeErr error
+	// closed is set as soon as shutdown begins, so Set can reject writes that would otherwise be
+	// enqueued behind a worker that is already draining or has exited.
+	closed atomic.Bool
+	// shutdownFlushErr carries the final flush's error from the worker goroutine back to Close.
+	// It is a pointer so that "flushed fine" and "has not run yet" remain distinguishable.
+	shutdownFlushErr atomic.Pointer[error]
 }
 
 // BatchItem represents a single blob operation to be included in a batch.
@@ -163,6 +177,13 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 				if len(b.currentBatch) > 0 {
 					if err = b.writeBatch(b.currentBatch, b.currentBatchKeys); err != nil {
 						b.logger.Errorf("error writing final batch during shutdown: %v", err)
+						// Hand the failure to Close rather than only logging it: the caller is
+						// being told its store shut down cleanly, and these bytes are gone.
+						// Copy first, so the stored pointer does not alias the loop's err.
+						finalErr := err
+						b.shutdownFlushErr.Store(&finalErr)
+					} else {
+						b.currentBatchLen.Store(0)
 					}
 				}
 				return
@@ -346,12 +367,32 @@ func (b *Batcher) Health(ctx context.Context, checkLiveness bool) (int, string, 
 // daemon.closeStores currently discards the error this method returns, so the log
 // line below is the only operator-visible signal that a flush was abandoned.
 //
+// Close is idempotent and safe to call more than once. Because it can fail, a caller
+// that sees an error is quite likely to retry it; the shutdown sequence therefore runs
+// under a sync.Once and later calls return the first call's result. Note that this
+// result is a snapshot: if the first call abandoned a hung flush that later completed,
+// a second call still reports the abandonment.
+//
 // Parameters:
 //   - ctx: Context bounding how long Close will wait for the shutdown flush
 //
 // Returns:
-//   - error: NewContextCanceledError if ctx expires before the shutdown flush completes
+//   - error: NewContextCanceledError if ctx expires before the shutdown flush completes,
+//     or NewStorageError if the shutdown flush ran but failed to write
 func (b *Batcher) Close(ctx context.Context) error {
+	b.closeOnce.Do(func() {
+		b.closeErr = b.shutdown(ctx)
+	})
+
+	return b.closeErr
+}
+
+// shutdown performs the one-shot teardown behind Close's sync.Once.
+func (b *Batcher) shutdown(ctx context.Context) error {
+	// Reject any further writes before draining, so a Set racing this teardown is told
+	// the store is closed instead of parking an item in a queue nobody will read again.
+	b.closed.Store(true)
+
 	// Signal the background goroutine to stop
 	close(b.done)
 
@@ -372,6 +413,16 @@ func (b *Batcher) Close(ctx context.Context) error {
 
 	select {
 	case <-waitDone:
+		// The worker has returned, so wg.Wait() orders its writes before these reads.
+		// A final flush that errored has to surface here: returning nil would tell the
+		// caller the store closed cleanly while the batch it was holding was discarded,
+		// which is the same defect on the shutdown path that this type fixes on the
+		// overflow path.
+		if flushErr := b.shutdownFlushErr.Load(); flushErr != nil {
+			unflushed := b.currentBatchLen.Load()
+			return errors.NewStorageError("batcher shutdown flush failed, %d bytes not written", unflushed, *flushErr)
+		}
+
 		return nil
 	case <-ctx.Done():
 		// currentBatch itself is only safe to read from the worker goroutine, which may still
@@ -419,11 +470,22 @@ func (b *Batcher) SetFromReader(ctx context.Context, key []byte, fileType filefo
 //   - value: The blob data to store
 //   - opts: Optional file options (ignored in this implementation)
 //
+// After Close, Set returns an error rather than accepting a write it cannot honour: the
+// worker goroutine has stopped, so an item enqueued then would sit in the queue forever
+// while its caller was told the write had been accepted. A Set running concurrently with
+// Close can still slip through this check and be dropped — closing that window would mean
+// serialising the write path, which would cost more than this dormant path is worth. Do
+// not call Set concurrently with Close and rely on the outcome.
+//
 // Returns:
-//   - error: Any error that occurred during queueing
+//   - error: Any error that occurred during queueing, or if the batcher has been closed
 func (b *Batcher) Set(_ context.Context, hash []byte, fileType fileformat.FileType, value []byte, _ ...options.FileOption) error {
 	if len(hash) != chainhash.HashSize {
 		return errors.NewInvalidArgumentError("hash must be %d bytes, got %d", chainhash.HashSize, len(hash))
+	}
+
+	if b.closed.Load() {
+		return errors.NewStorageError("batcher is closed, write not accepted")
 	}
 
 	b.queue.Enqueue(BatchItem{
