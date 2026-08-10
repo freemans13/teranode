@@ -61,9 +61,12 @@ find it, and wedges the tip permanently.
 To catch that, block assembly runs a check once during startup, after the subtree
 processor is running but before it starts consuming block notifications. It walks
 down from the persisted tip looking for canonical coinbases missing from the UTXO
-store. On the first (highest) one it finds, it scopes the contiguous gap beneath it
-and re-creates just those coinbases — never the transactions in those blocks, so the
-cost is proportional to the number of affected blocks rather than to chain size.
+store. Each one it finds is repaired in place: it scopes the contiguous gap beneath
+that height and re-creates just those coinbases — never the transactions in those
+blocks, so the cost is proportional to the number of affected blocks rather than to
+chain size. The scan then carries on below the repair, because a repair only proves
+a few present coinbases underneath itself and a second hole further down would
+otherwise go unnoticed until the next restart.
 
 Three settings bound that work:
 
@@ -71,10 +74,10 @@ Three settings bound that work:
   the tip the startup scan looks, and it is the largest gap recovery will repair on
   its own. The two are deliberately the same number: there is no value in detecting a
   divergence deeper than the node is willing to fix automatically. A clean boot costs
-  two store reads per height in the window; a miss triggers a repair and the scan then
-  carries on down the rest of the window, so a second hole below the first is still
-  found. Only a refusal to repair ends the scan early, since a refusal is structural
-  and would repeat identically at every lower height.
+  two store reads per height in the window; the scan ends early only when a divergence
+  cannot be repaired, since a refusal is structural and would repeat identically at
+  every lower height. Tuning this down to limit repair scope also shrinks detection
+  coverage by the same amount.
   A second, non-configurable bound applies underneath it — see the safety floor below —
   so with the default settings the effective reach is the coinbase-maturity window.
 - `blockassembly_coinbaseRecoveryConsecutiveGood` guards against under-repair. The

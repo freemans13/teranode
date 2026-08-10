@@ -2,7 +2,10 @@ package blockassembly
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -16,6 +19,9 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -914,10 +920,17 @@ func TestStartupCoinbaseDivergenceCheck_StopsScanningAfterARefusal(t *testing.T)
 	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 1
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 1
+	// CoinbaseRecoveryMaxGapBlocks does double duty: it caps the walk-back AND
+	// sets the startup scan window. A cap of 1 would refuse as intended but also
+	// give the loop a window of one height, so the loop body would run exactly
+	// once whatever the refusal did -- deleting the refusal return would leave
+	// this test green. Two heights is the smallest window that lets the scan
+	// reach a second missing height, so escalated == 1 can only hold because the
+	// refusal stopped it.
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 2
 
-	// Heights 2..6 all missing above a good floor at 1. With a gap cap of 1 the
+	// Heights 2..6 all missing above a good floor at 1. With a gap cap of 2 the
 	// walk-back refuses, and it would refuse identically from 5, 4, 3 and 2.
 	headers := buildCanonicalChain(ctx, t, items, 6)
 	seedCoinbase(ctx, t, items, headers, 1)
@@ -1004,13 +1017,18 @@ type interposedBlockchainClient struct {
 	// call returns a transient-looking error instead of reaching the real client.
 	failuresLeft int
 
-	// failOnlyHeights, when non-empty, confines failuresLeft to those heights.
-	// Without it the very first lookup a scan makes is the canonical-tip check,
-	// so a test cannot aim a failure at a probe further down the window.
-	failOnlyHeights map[uint32]bool
+	// neverFailHeights are exempt from failuresLeft, so a test can let the
+	// canonical-tip check through and aim the transient failures at the scan
+	// loop beneath it.
+	neverFailHeights map[uint32]bool
 
 	// absentHeights always return a block-not-found error.
 	absentHeights map[uint32]bool
+
+	// cancelAtHeight, when non-nil, cancels the scan's context on the lookup for
+	// that height, standing in for a shutdown that lands mid-probe.
+	cancelAtHeight *uint32
+	cancel         context.CancelFunc
 }
 
 func (c *interposedBlockchainClient) GetBlockByHeight(ctx context.Context, height uint32) (*model.Block, error) {
@@ -1018,7 +1036,13 @@ func (c *interposedBlockchainClient) GetBlockByHeight(ctx context.Context, heigh
 		return nil, errors.NewBlockNotFoundError("no canonical block at height %d", height)
 	}
 
-	if c.failuresLeft > 0 && (len(c.failOnlyHeights) == 0 || c.failOnlyHeights[height]) {
+	if c.cancelAtHeight != nil && *c.cancelAtHeight == height {
+		c.cancel()
+
+		return nil, errors.NewProcessingError("shutting down during the lookup at height %d", height, context.Canceled)
+	}
+
+	if c.failuresLeft > 0 && !c.neverFailHeights[height] {
 		c.failuresLeft--
 
 		return nil, errors.NewStorageError("transient blockchain-client blip at height %d", height)
@@ -1027,18 +1051,86 @@ func (c *interposedBlockchainClient) GetBlockByHeight(ctx context.Context, heigh
 	return c.ClientI.GetBlockByHeight(ctx, height)
 }
 
-// TestStartupCoinbaseDivergenceCheck_ExhaustedProbeBudgetAbandonsTheScan is the
-// other side of TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip.
-// That test proves a blip costs a retry rather than the boot; this one proves the
-// budget is genuinely finite, so a store that flaps for the whole window cannot
-// inflate boot time without bound.
-//
-// The budget is a whole-scan allowance, not a per-height one, so once it is gone
-// the scan stops at the failing height rather than carrying on to the ones below
-// -- and because detection is startup-only, that means no coinbase-divergence
-// check at all until the next restart. That is the trade being pinned here: a
-// bounded boot in exchange for lost coverage, reported at Errorf so it is visible.
-func TestStartupCoinbaseDivergenceCheck_ExhaustedProbeBudgetAbandonsTheScan(t *testing.T) {
+// capturingLogger records the Warnf and Errorf lines a test produces. Several of
+// the paths below differ from each other only in which line they emit -- they all
+// return nil and leave the metrics alone -- so the log line is the only thing a
+// test can assert on.
+type capturingLogger struct {
+	ulogger.Logger
+
+	mu    sync.Mutex
+	warns []string
+	errs  []string
+}
+
+func newCapturingLogger() *capturingLogger {
+	return &capturingLogger{Logger: ulogger.TestLogger{}}
+}
+
+func (l *capturingLogger) Warnf(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.warns = append(l.warns, fmt.Sprintf(format, args...))
+}
+
+func (l *capturingLogger) Errorf(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.errs = append(l.errs, fmt.Sprintf(format, args...))
+}
+
+// contains reports whether any captured line of the given kind holds substr.
+func (l *capturingLogger) contains(lines []string, substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for _, line := range lines {
+		if strings.Contains(line, substr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (l *capturingLogger) sawWarn(substr string) bool {
+	return l.contains(l.warns, substr)
+}
+
+func (l *capturingLogger) sawError(substr string) bool {
+	return l.contains(l.errs, substr)
+}
+
+// notFoundTranslatingUtxoStore reports a missing record with errors.ErrNotFound
+// instead of errors.ErrTxNotFound, which is how some UTXO-store backends answer.
+// Before the absent-check was widened to accept both codes, canonicalCoinbaseAt
+// wrapped this in a processing error whose chain still matched ErrNotFound, so
+// canonicalBlockAbsent swallowed it and the height was skipped rather than
+// repaired -- i.e. the feature silently did nothing on those backends.
+type notFoundTranslatingUtxoStore struct {
+	utxoStore.Store
+}
+
+func (s *notFoundTranslatingUtxoStore) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
+	data, err := s.Store.Get(ctx, hash, f...)
+	if err != nil && (errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound)) {
+		// Deliberately not wrapping the original: the point is a backend whose
+		// only signal is ErrNotFound. Wrapping would leave an ErrTxNotFound in
+		// the chain for the old, narrower check to match on.
+		return nil, errors.NewNotFoundError("record not found for %s", hash.String())
+	}
+
+	return data, err
+}
+
+// TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip covers
+// the first half of ChiR9. The startup probe sat outside every retry loop, so
+// one transient failure abandoned the scan for the whole boot -- and because
+// detection is startup-only, that meant no detection at all until the next
+// restart.
+func TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip(t *testing.T) {
 	initPrometheusMetrics()
 
 	ctx := t.Context()
@@ -1048,54 +1140,355 @@ func TestStartupCoinbaseDivergenceCheck_ExhaustedProbeBudgetAbandonsTheScan(t *t
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
 	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
 
-	// heights 1..4 with 2 missing its coinbase. The scan walks 4, 3, 2, so
-	// height 2 is only reached if the scan survives height 3.
+	// heights 1..4, with 3 missing its coinbase.
 	headers := buildCanonicalChain(ctx, t, items, 4)
-	for _, h := range []uint32{1, 3, 4} {
+	for _, h := range []uint32{1, 2, 4} {
 		seedCoinbase(ctx, t, items, headers, h)
 	}
 
 	items.blockAssembler.setBestBlockHeader(headers[3], 4)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
 
-	// Height 3 fails every time it is asked, more often than the budget can
-	// absorb. The tip check at height 4 is left alone so the scan actually
-	// starts, which is what puts the exhaustion on a probe rather than on the
-	// canonical-tip lookup.
-	//
-	// The budget allows one attempt plus coinbaseRecoveryProbeRetries retries, so
-	// stocking the interposer with that many failures plus a spare and asserting
-	// the spare is untouched pins both halves: the scan does spend the whole
-	// budget, and it stops asking once the budget is gone.
-	const spareFailures = 5
-
-	interposer := &interposedBlockchainClient{
-		ClientI:         items.blockchainClient,
-		failuresLeft:    1 + coinbaseRecoveryProbeRetries + spareFailures,
-		failOnlyHeights: map[uint32]bool{3: true},
+	// One transient failure, which lands on the canonical-tip check that opens
+	// the scan. That check draws on the same budget as the probes, so it is not
+	// a single point of failure either.
+	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+		ClientI:      items.blockchainClient,
+		failuresLeft: 1,
 	}
-	items.blockAssembler.blockchainClient = interposer
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 3)
+	require.NoError(t, err)
+	require.True(t, present, "a single transient probe failure must not cost the whole scan")
+}
+
+// TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock covers the
+// second half of ChiR9. canonicalCoinbaseAt turns "the chain has no block at
+// this height" into a hard error, which used to abandon the scan. That says
+// nothing about the health of the client, so the scan must skip the height and
+// carry on checking the ones below it.
+func TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// heights 1..5, with 2 missing its coinbase, below a height (4) the
+	// interposer reports as having no canonical block.
+	headers := buildCanonicalChain(ctx, t, items, 5)
+	for _, h := range []uint32{1, 3, 5} {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[4], 5)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+		ClientI:       items.blockchainClient,
+		absentHeights: map[uint32]bool{4: true},
+	}
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 2)
+	require.NoError(t, err)
+	require.True(t, present, "a height the chain has no block for must not abandon the scan below it")
+}
+
+// TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight covers the
+// trigger ChiR9 called out as the likeliest one: block assembly's persisted tip
+// height sits above the canonical chain height, so the very first lookup gets a
+// not-found.
+//
+// That used to be treated as the blockchain client being unable to answer,
+// which abandoned the whole scan with a Warnf and left the boot with no
+// detection at all. It is now recognised as a question about a height the chain
+// has no block for. Here it is the tip itself, so the canonical-tip check
+// (ChiR8) ends the scan first -- block assembly is by definition not on the
+// canonical chain at a height the canonical chain does not reach. The point of
+// this test is that the outcome is a clean, quiet skip rather than an
+// abandoned scan, a false divergence, or a nil dereference.
+func TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// The canonical chain reaches height 3; block assembly thinks it is at 6.
+	headers := buildCanonicalChain(ctx, t, items, 3)
+	for h := uint32(1); h <= 3; h++ {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	aheadOfChain := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  headers[2].Hash(),
+		HashMerkleRoot: &chainhash.Hash{},
+		Nonce:          4242,
+		Bits:           *bits,
+	}
+	items.blockAssembler.setBestBlockHeader(aheadOfChain, 6)
+
+	logger := newCapturingLogger()
+	items.blockAssembler.logger = logger
 
 	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
 	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx),
-		"an exhausted probe budget must still leave the node bootable")
-
-	require.Equal(t, spareFailures, interposer.failuresLeft,
-		"the scan must make exactly one attempt plus coinbaseRecoveryProbeRetries retries, then stop asking")
+	require.NotPanics(t, func() {
+		require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	})
 
 	require.Equal(t, float64(0),
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
-		"a store that cannot answer is not a divergence")
+		"a tip above the canonical chain height is not a divergence")
 	require.Equal(t, float64(0),
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
 		"and it must not raise the manual-intervention alarm")
+	require.False(t, logger.sawWarn("cannot resolve the canonical block at block assembly's tip height"),
+		"a chain that simply does not reach this height is not the blockchain client failing to answer")
+}
 
-	// The scan stopped at height 3, so the real hole at height 2 was never
-	// looked for and the store is untouched.
-	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 2)
+// TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned states the
+// honest limit of the widened startup scan: it covers a bounded window below
+// the tip (CoinbaseRecoveryMaxGapBlocks heights), not the whole chain. A hole
+// deeper than the window is left for the runtime detector that is deliberately
+// out of scope for this change, and this test exists so that boundary is
+// asserted rather than assumed.
+func TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+	// Window of 2 heights: from tip 6 the scan reaches only heights 6 and 5.
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 2
+
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	for _, h := range []uint32{1, 2, 4, 5, 6} {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+	// height 3 is missing and sits below the window.
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		"a hole below the scan window is not detected at startup - that is the documented boundary")
+
+	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 3)
 	require.NoError(t, err)
-	require.False(t, present, "the scan abandons the heights below the failing probe")
+	require.False(t, present)
+}
+
+// TestStartupCoinbaseDivergenceCheck_ProbeBudgetExhaustionStopsTheScan covers
+// ChiR13, which is the probe-budget half of the point @oskarszoon made about the
+// retry/escalation branch being untested one level up.
+//
+// coinbaseRecoveryProbeRetries bounds how much a flapping store can add to boot
+// time. Every existing test drove exactly one transient failure, which the budget
+// always absorbed, so the exhausted branch never ran and a bound of two was
+// indistinguishable from an unbounded retry loop.
+//
+// Here the store fails five times at height 5 -- more than the budget can absorb.
+// A bounded scan gives up at 5 and never reaches the genuinely missing coinbase at
+// height 4. An unbounded one would ride out the fifth failure and repair it, so
+// height 4 staying absent is what pins the bound.
+func TestStartupCoinbaseDivergenceCheck_ProbeBudgetExhaustionStopsTheScan(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// Heights 1..6 with 4 missing its coinbase. Height 6 (the tip) is present so
+	// the scan gets past it and reaches the failing height 5.
+	headers := buildCanonicalChain(ctx, t, items, 6)
+	for _, h := range []uint32{1, 2, 3, 5, 6} {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	logger := newCapturingLogger()
+	items.blockAssembler.logger = logger
+
+	// Height 6 is exempt so the canonical-tip check, which draws on the same
+	// budget, does not consume it before the scan starts.
+	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+		ClientI:          items.blockchainClient,
+		failuresLeft:     5,
+		neverFailHeights: map[uint32]bool{6: true},
+	}
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx),
+		"the startup hook stays non-fatal when the store outlasts the probe budget")
+
+	require.True(t, logger.sawError("startup divergence check abandoned at height 5"),
+		"exhausting the probe budget must abandon the scan and say so")
+
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		"a scan that never got past the failing height cannot have detected anything")
+
+	// Restore a healthy client to check the state the scan left behind.
+	items.blockAssembler.blockchainClient = items.blockchainClient
+
+	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 4)
+	require.NoError(t, err)
+	require.False(t, present,
+		"the scan must have stopped at the failing height, not retried past it to the hole below")
+}
+
+// TestStartupCoinbaseDivergenceCheck_RepairsWhenTheStoreSaysErrNotFound is the
+// store-side half of ChiR13. Different UTXO-store backends report a missing
+// record with different codes. Until the absent-check accepted ErrNotFound as
+// well as ErrTxNotFound, a backend using the former had its "missing" answer
+// wrapped in a processing error that canonicalBlockAbsent then read as "the chain
+// has no block at this height" -- so every height was skipped and the whole
+// feature silently did nothing on that backend.
+func TestStartupCoinbaseDivergenceCheck_RepairsWhenTheStoreSaysErrNotFound(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	// Heights 1..4 with 3 missing its coinbase.
+	headers := buildCanonicalChain(ctx, t, items, 4)
+	for _, h := range []uint32{1, 2, 4} {
+		seedCoinbase(ctx, t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[3], 4)
+	items.blockAssembler.subtreeProcessor.Start(ctx)
+	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
+
+	// Only the detection path sees the translated code; the repair writes through
+	// the real store underneath, which is where the assertion reads from.
+	items.blockAssembler.utxoStore = &notFoundTranslatingUtxoStore{Store: items.utxoStore}
+
+	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
+	repairedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired"))
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
+		"a store that reports absence as ErrNotFound must still register as a divergence")
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired"))-repairedBefore)
+
+	repaired, err := items.utxoStore.Get(ctx, coinbaseTxForHeader(t, headers[2]).TxIDChainHash(), fields.Tx)
+	require.NoError(t, err, "the coinbase at height 3 must have been created in the real store")
+	require.NotNil(t, repaired.Tx)
+}
+
+// TestStartupCoinbaseDivergenceCheck_ShutdownDuringAProbeIsNotReportedAsLostDetection
+// covers the scan-loop half of ChiR14. ChiR10 taught the recovery call site to
+// tell a shutdown apart from a failure, but a cancellation landing on a probe (or
+// on withProbeRetry's backoff) still fell through to the line claiming no
+// coinbase-divergence detection would run until the next restart -- which is a
+// false alarm for a node that is simply stopping.
+func TestStartupCoinbaseDivergenceCheck_ShutdownDuringAProbeIsNotReportedAsLostDetection(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	headers := buildCanonicalChain(t.Context(), t, items, 5)
+	for h := uint32(1); h <= 5; h++ {
+		seedCoinbase(t.Context(), t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[4], 5)
+
+	logger := newCapturingLogger()
+	items.blockAssembler.logger = logger
+
+	// The tip check at height 5 goes through; the shutdown lands on the next
+	// probe down.
+	cancelAt := uint32(4)
+	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+		ClientI:        items.blockchainClient,
+		cancelAtHeight: &cancelAt,
+		cancel:         cancel,
+	}
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.False(t, logger.sawError("no coinbase-divergence detection will run until the next restart"),
+		"a node that is shutting down has not lost its detection coverage")
+}
+
+// TestStartupCoinbaseDivergenceCheck_ShutdownDuringTheTipCheckIsNotBlamedOnTheClient
+// is the other half of ChiR14. A cancellation on the canonical-tip lookup used to
+// surface as the generic "cannot resolve the canonical block at block assembly's
+// tip height" warning, pointing an operator at the blockchain client for something
+// that was only a shutdown.
+func TestStartupCoinbaseDivergenceCheck_ShutdownDuringTheTipCheckIsNotBlamedOnTheClient(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	headers := buildCanonicalChain(t.Context(), t, items, 3)
+	for h := uint32(1); h <= 3; h++ {
+		seedCoinbase(t.Context(), t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[2], 3)
+
+	logger := newCapturingLogger()
+	items.blockAssembler.logger = logger
+
+	cancelAt := uint32(3)
+	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+		ClientI:        items.blockchainClient,
+		cancelAtHeight: &cancelAt,
+		cancel:         cancel,
+	}
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.False(t, logger.sawWarn("cannot resolve the canonical block at block assembly's tip height"),
+		"a shutdown on the tip lookup must not be diagnosed as the blockchain client failing")
 }
 
 // TestCoinbaseRecoverySettingLowerBoundClamps covers the defensive clamps the
@@ -1225,173 +1618,4 @@ func TestCoinbaseRecoverySettingLowerBoundClamps(t *testing.T) {
 		require.Contains(t, err.Error(), "store is down",
 			"the reported reason must be the repair failure, not the defensive no-attempts-completed placeholder")
 	})
-}
-
-// TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip covers
-// the first half of ChiR9. The startup probe sat outside every retry loop, so
-// one transient failure abandoned the scan for the whole boot -- and because
-// detection is startup-only, that meant no detection at all until the next
-// restart.
-func TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip(t *testing.T) {
-	initPrometheusMetrics()
-
-	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
-	require.NotNil(t, items)
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
-
-	// heights 1..4, with 3 missing its coinbase.
-	headers := buildCanonicalChain(ctx, t, items, 4)
-	for _, h := range []uint32{1, 2, 4} {
-		seedCoinbase(ctx, t, items, headers, h)
-	}
-
-	items.blockAssembler.setBestBlockHeader(headers[3], 4)
-	items.blockAssembler.subtreeProcessor.Start(ctx)
-	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
-
-	// One transient failure, which lands on the canonical-tip check that opens
-	// the scan. That check draws on the same budget as the probes, so it is not
-	// a single point of failure either.
-	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
-		ClientI:      items.blockchainClient,
-		failuresLeft: 1,
-	}
-
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
-
-	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 3)
-	require.NoError(t, err)
-	require.True(t, present, "a single transient probe failure must not cost the whole scan")
-}
-
-// TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock covers the
-// second half of ChiR9. canonicalCoinbaseAt turns "the chain has no block at
-// this height" into a hard error, which used to abandon the scan. That says
-// nothing about the health of the client, so the scan must skip the height and
-// carry on checking the ones below it.
-func TestStartupCoinbaseDivergenceCheck_SkipsHeightWithNoCanonicalBlock(t *testing.T) {
-	initPrometheusMetrics()
-
-	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
-	require.NotNil(t, items)
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
-
-	// heights 1..5, with 2 missing its coinbase, below a height (4) the
-	// interposer reports as having no canonical block.
-	headers := buildCanonicalChain(ctx, t, items, 5)
-	for _, h := range []uint32{1, 3, 5} {
-		seedCoinbase(ctx, t, items, headers, h)
-	}
-
-	items.blockAssembler.setBestBlockHeader(headers[4], 5)
-	items.blockAssembler.subtreeProcessor.Start(ctx)
-	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
-
-	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
-		ClientI:       items.blockchainClient,
-		absentHeights: map[uint32]bool{4: true},
-	}
-
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
-
-	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 2)
-	require.NoError(t, err)
-	require.True(t, present, "a height the chain has no block for must not abandon the scan below it")
-}
-
-// TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight covers the
-// trigger ChiR9 called out as the likeliest one: block assembly's persisted tip
-// height sits above the canonical chain height, so the very first lookup gets a
-// not-found.
-//
-// That used to be treated as the blockchain client being unable to answer,
-// which abandoned the whole scan with a Warnf and left the boot with no
-// detection at all. It is now recognised as a question about a height the chain
-// has no block for. Here it is the tip itself, so the canonical-tip check
-// (ChiR8) ends the scan first -- block assembly is by definition not on the
-// canonical chain at a height the canonical chain does not reach. The point of
-// this test is that the outcome is a clean, quiet skip rather than an
-// abandoned scan, a false divergence, or a nil dereference.
-func TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight(t *testing.T) {
-	initPrometheusMetrics()
-
-	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
-	require.NotNil(t, items)
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
-
-	// The canonical chain reaches height 3; block assembly thinks it is at 6.
-	headers := buildCanonicalChain(ctx, t, items, 3)
-	for h := uint32(1); h <= 3; h++ {
-		seedCoinbase(ctx, t, items, headers, h)
-	}
-
-	aheadOfChain := &model.BlockHeader{
-		Version:        1,
-		HashPrevBlock:  headers[2].Hash(),
-		HashMerkleRoot: &chainhash.Hash{},
-		Nonce:          4242,
-		Bits:           *bits,
-	}
-	items.blockAssembler.setBestBlockHeader(aheadOfChain, 6)
-
-	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
-	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
-
-	require.NotPanics(t, func() {
-		require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
-	})
-
-	require.Equal(t, float64(0),
-		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
-		"a tip above the canonical chain height is not a divergence")
-	require.Equal(t, float64(0),
-		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
-		"and it must not raise the manual-intervention alarm")
-}
-
-// TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned states the
-// honest limit of the widened startup scan: it covers a bounded window below
-// the tip (CoinbaseRecoveryMaxGapBlocks heights), not the whole chain. A hole
-// deeper than the window is left for the runtime detector that is deliberately
-// out of scope for this change, and this test exists so that boundary is
-// asserted rather than assumed.
-func TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned(t *testing.T) {
-	initPrometheusMetrics()
-
-	ctx := t.Context()
-	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
-	require.NotNil(t, items)
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
-	// Window of 2 heights: from tip 6 the scan reaches only heights 6 and 5.
-	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 2
-
-	headers := buildCanonicalChain(ctx, t, items, 6)
-	for _, h := range []uint32{1, 2, 4, 5, 6} {
-		seedCoinbase(ctx, t, items, headers, h)
-	}
-	// height 3 is missing and sits below the window.
-
-	items.blockAssembler.setBestBlockHeader(headers[5], 6)
-
-	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
-
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
-
-	require.Equal(t, float64(0),
-		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
-		"a hole below the scan window is not detected at startup - that is the documented boundary")
-
-	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 3)
-	require.NoError(t, err)
-	require.False(t, present)
 }
