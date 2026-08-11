@@ -768,6 +768,17 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		s.registryBatcher.start()
 	}
 
+	// Start the peer-map sweep before the topic subscriptions that feed it, for
+	// the same reason. The gossip handlers below insert into the attribution
+	// maps and the reputation and IP-ban caches, and subscribeToTopic
+	// deliberately drains its channel without watching ctx.Done, so its workers
+	// outlive a failed Start. Starting the sweep afterwards would leave any
+	// early return between here and there — the blockchain Subscribe below —
+	// with those maps being fed and nothing expiring them or reading the
+	// at-capacity diagnostic. The attribution maps are bounded at insert either
+	// way (issue 1409), but the caches that share this sweep are TTL-only.
+	s.startPeerMapCleanup(ctx)
+
 	// Subscribe to all topics
 	s.subscribeToTopic(ctx, s.blockTopicName, s.handleBlockTopic)
 	s.subscribeToTopic(ctx, s.subtreeTopicName, s.handleSubtreeTopic)
@@ -788,9 +799,6 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	// disconnect any pre-existing banned peers at startup
 	go s.disconnectPreExistingBannedPeers(ctx)
-
-	// Start periodic cleanup of peer maps
-	s.startPeerMapCleanup(ctx)
 
 	// Peer registry cache save and TTL/LRU eviction now live in the centralized
 	// blockchain peer registry service. The periodic cleanup driver itself is a
