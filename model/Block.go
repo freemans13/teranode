@@ -1588,6 +1588,15 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 		}
 	}
 
+	// Close whatever survived the loaded-check before dropping the slice.
+	// Reallocating over an mmap-backed survivor would leak its mapping and its
+	// backing file, since nothing else holds a reference once the slice header
+	// is replaced. Nodes are not pooled here: the pool's put function lives in
+	// blockvalidation and this path has no access to it.
+	if closeErr := b.releaseSubtreeNodesLocked(nil); closeErr != nil {
+		logger.Warnf("[BLOCK][%s][ID %d] failed closing subtrees before reload: %v", b.Hash().String(), b.ID, closeErr)
+	}
+
 	b.SubtreeSlices = make([]*subtreepkg.Subtree, len(b.Subtrees))
 
 	// Snapshot the node allocator under the lock we already hold so deserialize
@@ -1727,9 +1736,22 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 // for heap-backed ones), and each SubtreeSlices entry is nil-ed so every
 // loaded-check sees the subtree as missing and a later revalidation reloads
 // from the store. Safe to call multiple times; nil entries are skipped.
-func (b *Block) ReleaseSubtreeNodes(put func([]subtreepkg.Node)) {
+//
+// Returns the joined Close errors, if any. A failed Close means a mapping was
+// not torn down (or its backing file not removed), which grows the address
+// space with no other signal — model.Block has no logger, so the caller is
+// expected to log it.
+func (b *Block) ReleaseSubtreeNodes(put func([]subtreepkg.Node)) error {
 	b.subtreeSlicesMu.Lock()
 	defer b.subtreeSlicesMu.Unlock()
+
+	return b.releaseSubtreeNodesLocked(put)
+}
+
+// releaseSubtreeNodesLocked is ReleaseSubtreeNodes' body. The caller must hold
+// b.subtreeSlicesMu for writing.
+func (b *Block) releaseSubtreeNodesLocked(put func([]subtreepkg.Node)) error {
+	var closeErrs []error
 
 	for i, st := range b.SubtreeSlices {
 		if st == nil {
@@ -1741,10 +1763,14 @@ func (b *Block) ReleaseSubtreeNodes(put func([]subtreepkg.Node)) {
 			put(nodes)
 		}
 
-		_ = st.Close()
+		if err := st.Close(); err != nil {
+			closeErrs = append(closeErrs, errors.NewProcessingError("subtree %d", i, err))
+		}
 
 		b.SubtreeSlices[i] = nil
 	}
+
+	return errors.Join(closeErrs...)
 }
 
 // SubtreesLoaded checks if subtrees are loaded and valid.

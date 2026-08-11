@@ -23,6 +23,7 @@ import (
 
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // nodePoolClasses are the size-class capacities for the per-subtree Node pool,
@@ -133,10 +134,16 @@ func NodeAllocFromPool(numLeaves int) []subtreepkg.Node {
 // requeued revalidation of the same *Block fail "first subtree has no nodes"
 // instead of reloading from the store. Safe to call multiple times. Intended
 // for cache eviction and validation failure paths.
-func releaseBlockNodes(b *model.Block) {
+//
+// A failed Close leaves a mapping (or its backing file) behind with no other
+// signal, so it is logged here rather than discarded — model.Block has no
+// logger of its own.
+func releaseBlockNodes(logger ulogger.Logger, b *model.Block) {
 	if b == nil {
 		return
 	}
 
-	b.ReleaseSubtreeNodes(PutNodeSlice)
+	if err := b.ReleaseSubtreeNodes(PutNodeSlice); err != nil && logger != nil {
+		logger.Warnf("[releaseBlockNodes][%s] failed closing released subtrees: %v", b.Hash().String(), err)
+	}
 }

@@ -39,20 +39,29 @@ type SubtreeMetaRegenerator struct {
 	peerURLs             []string
 	getBlockHeight       func() uint32
 	blockHeightRetention uint32
+	peerFetchTimeout     time.Duration
 }
 
 // NewSubtreeMetaRegenerator creates a new SubtreeMetaRegenerator instance.
 // peerURLs are the announcing peers' DataHub base URLs, which already include
 // the peer's API prefix (e.g. http://peer:9090/api/v1) — the same base every
 // other subtree_data fetcher appends only the resource path to.
+//
+// peerFetchTimeout bounds one peer's fetch; a non-positive value falls back to
+// DefaultPeerFetchTimeout so the fetch is never left unbounded.
 func NewSubtreeMetaRegenerator(logger ulogger.Logger, subtreeStore SubtreeStoreWriter, peerURLs []string,
-	getBlockHeight func() uint32, blockHeightRetention uint32) *SubtreeMetaRegenerator {
+	getBlockHeight func() uint32, blockHeightRetention uint32, peerFetchTimeout time.Duration) *SubtreeMetaRegenerator {
+	if peerFetchTimeout <= 0 {
+		peerFetchTimeout = DefaultPeerFetchTimeout
+	}
+
 	return &SubtreeMetaRegenerator{
 		logger:               logger.New("meta_regenerator"),
 		subtreeStore:         subtreeStore,
 		peerURLs:             peerURLs,
 		getBlockHeight:       getBlockHeight,
 		blockHeightRetention: blockHeightRetention,
+		peerFetchTimeout:     peerFetchTimeout,
 	}
 }
 
@@ -66,10 +75,14 @@ func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash
 	if err == nil {
 		return r.buildAndStoreMeta(ctx, subtreeHash, subtree, data)
 	}
-	r.logger.Debugf("[RegenerateMeta][%s] local subtreedata not found: %v", subtreeHash.String(), err)
 
-	// Fall back to peers
-	var lastErr error
+	r.logger.Warnf("[RegenerateMeta][%s] local subtreedata not found: %v", subtreeHash.String(), err)
+
+	// Fall back to peers. lastErr starts as the local failure so the returned
+	// error always carries a cause: with no peers configured it explains why
+	// the local lookup missed, rather than reporting a bare "not available"
+	// (and, before this seeding, risking a %!(EXTRA <nil>) formatting artifact).
+	lastErr := err
 
 	for _, peerURL := range r.peerURLs {
 		data, err = r.getSubtreeDataFromPeer(ctx, subtreeHash, subtree, peerURL)
@@ -81,11 +94,7 @@ func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash
 		r.logger.Warnf("[RegenerateMeta][%s] peer %s failed: %v", subtreeHash.String(), peerURL, err)
 	}
 
-	if lastErr != nil {
-		return nil, errors.NewProcessingError("[RegenerateMeta][%s] subtreedata not available locally or from peers", subtreeHash.String(), lastErr)
-	}
-
-	return nil, errors.NewProcessingError("[RegenerateMeta][%s] subtreedata not available locally or from peers", subtreeHash.String())
+	return nil, errors.NewProcessingError("[RegenerateMeta][%s] subtreedata not available locally or from peers", subtreeHash.String(), lastErr)
 }
 
 // getLocalSubtreeData reads subtree data from local store
@@ -105,21 +114,26 @@ func (r *SubtreeMetaRegenerator) getLocalSubtreeData(ctx context.Context, subtre
 	return subtreepkg.NewSubtreeDataFromReader(subtree, reader)
 }
 
-// peerFetchTimeout bounds one peer's fetch (all 503 retries plus the body
-// stream). This fetch runs inline in Block.Valid on a context with no
-// deadline, where the shared client would otherwise allow a hung peer the full
-// http_streaming_timeout (5 minutes by default) per attempt. Note this is a
-// whole-peer budget, not a per-attempt one: the previous bare http.Client gave
-// 30s to a single attempt with no retries, so under sustained 503 backoff the
-// last attempt here gets considerably less than 30s.
-const peerFetchTimeout = 30 * time.Second
+// DefaultPeerFetchTimeout is the fallback bound on one peer's fetch (all 503
+// retries plus the body stream) when the caller supplies no timeout. This fetch
+// runs inline in Block.Valid on a context with no deadline, where the shared
+// client would otherwise allow a hung peer the full http_streaming_timeout
+// (5 minutes by default) per attempt. Note this is a whole-peer budget, not a
+// per-attempt one: the previous bare http.Client gave 30s to a single attempt
+// with no retries, so under sustained 503 backoff the last attempt here gets
+// considerably less than 30s.
+//
+// Operators configure this via blockvalidation_subtree_meta_peer_fetch_timeout;
+// settings.DefaultSubtreeMetaPeerFetchTimeout carries the same value. The two
+// are separate constants only because model must not import settings.
+const DefaultPeerFetchTimeout = 30 * time.Second
 
 // getSubtreeDataFromPeer fetches subtree data from a peer via HTTP. The peer's
 // base URL already carries its API prefix, so only the resource path is
 // appended. Retries on 503 — the peer's asset service may reject under
 // admission control while it generates the file on-demand.
 func (r *SubtreeMetaRegenerator) getSubtreeDataFromPeer(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, peerURL string) (*subtreepkg.Data, error) {
-	ctx, cancel := context.WithTimeout(ctx, peerFetchTimeout)
+	ctx, cancel := context.WithTimeout(ctx, r.peerFetchTimeout)
 	defer cancel()
 
 	url := fmt.Sprintf("%s/subtree_data/%s", peerURL, subtreeHash.String())

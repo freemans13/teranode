@@ -140,6 +140,68 @@ func TestGetAndValidateSubtrees_SizeMismatchDoesNotDeadlock(t *testing.T) {
 	}
 }
 
+// TestGetAndValidateSubtrees_ReloadClosesSurvivingSubtrees pins the cleanup on
+// the reload path. When only some entries are gutted, the survivors are still
+// dropped by the SubtreeSlices reallocation — and an mmap-backed survivor
+// dropped without Close leaks its mapping and its backing file, since nothing
+// holds a reference once the slice header is replaced.
+func TestGetAndValidateSubtrees_ReloadClosesSurvivingSubtrees(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	blobStore := blobmemory.New()
+
+	// Two real subtrees of equal length so the block passes the size check.
+	first, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, first.AddCoinbaseNode())
+	require.NoError(t, first.AddNode(chainhash.HashH([]byte("survivor-a")), 1, 0))
+	storeSubtree(t, blobStore, first)
+
+	second, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, second.AddNode(chainhash.HashH([]byte("gutted-a")), 1, 0))
+	require.NoError(t, second.AddNode(chainhash.HashH([]byte("gutted-b")), 1, 0))
+	storeSubtree(t, blobStore, second)
+
+	blockHeaderBytes, _ := hex.DecodeString(block1Header)
+	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+	require.NoError(t, err)
+
+	coinbase, err := bt.NewTxFromString(CoinbaseHex)
+	require.NoError(t, err)
+
+	b, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{first.RootHash(), second.RootHash()}, 4, 123, 0, 0)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	require.NoError(t, b.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, blobStore,
+		tSettings.Block.GetAndValidateSubtreesConcurrency))
+
+	// Swap entry 0 for an mmap-backed subtree so we can observe whether the
+	// reload closes it, and gut entry 1 so the reload actually triggers.
+	serialized, err := first.Serialize()
+	require.NoError(t, err)
+
+	mmapDir := t.TempDir()
+	mmapSurvivor, err := subtreepkg.NewSubtreeFromReaderMmap(bytes.NewReader(serialized), mmapDir)
+	require.NoError(t, err)
+	require.True(t, mmapSurvivor.IsMmapBacked())
+
+	b.SubtreeSlices[0] = mmapSurvivor
+	_ = b.SubtreeSlices[1].ReleaseNodes()
+
+	entries, err := os.ReadDir(mmapDir)
+	require.NoError(t, err)
+	require.NotEmpty(t, entries, "sanity: the survivor's backing file exists before the reload")
+
+	require.NoError(t, b.GetAndValidateSubtrees(ctx, ulogger.TestLogger{}, blobStore,
+		tSettings.Block.GetAndValidateSubtreesConcurrency))
+
+	entries, err = os.ReadDir(mmapDir)
+	require.NoError(t, err)
+	require.Empty(t, entries,
+		"the reload must Close a surviving mmap-backed subtree before dropping it, not leak its mapping")
+}
+
 // TestReleaseSubtreeNodes_ClosesMmapAndNilsEntries pins the full release
 // contract: heap-backed node slices are handed to the pool callback, mmap-backed
 // slices are NOT (their backing is the mapped region — pooling it after munmap
@@ -166,7 +228,8 @@ func TestReleaseSubtreeNodes_ClosesMmapAndNilsEntries(t *testing.T) {
 	b := &Block{SubtreeSlices: []*subtreepkg.Subtree{heapSt, mmapSt, nil}}
 
 	var pooled [][]subtreepkg.Node
-	b.ReleaseSubtreeNodes(func(nodes []subtreepkg.Node) { pooled = append(pooled, nodes) })
+	require.NoError(t, b.ReleaseSubtreeNodes(func(nodes []subtreepkg.Node) { pooled = append(pooled, nodes) }),
+		"a clean release must report no Close errors")
 
 	require.Len(t, pooled, 1, "only the heap-backed slice may be pooled")
 	require.Nil(t, b.SubtreeSlices[0])

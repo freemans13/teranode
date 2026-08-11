@@ -309,7 +309,8 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 
 	wrapper := &subtreeStoreWrapper{store: u.subtreeStore}
 	return model.NewSubtreeMetaRegenerator(u.logger, wrapper, peerURLs,
-		u.utxoStore.GetBlockHeight, u.subtreeBlockHeightRetention)
+		u.utxoStore.GetBlockHeight, u.subtreeBlockHeightRetention,
+		u.settings.BlockValidation.SubtreeMetaPeerFetchTimeout)
 }
 
 // NewBlockValidation creates a new block validation instance with the provided dependencies.
@@ -367,7 +368,7 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 				// Pools heap-backed []Node slices, Closes mmap-backed subtrees
 				// (unmap + backing-file removal), and nils the entries — all
 				// under the block's subtree mutex.
-				releaseBlockNodes(block)
+				releaseBlockNodes(logger, block)
 				return true // allow eviction
 			}),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute), // we keep this for 2 hours
@@ -1308,7 +1309,9 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	// TTL cleaner runs the same release concurrently. Nodes are not pooled here
 	// (put is nil) — these subtrees were read straight from the store, not
 	// allocated from the block validation node pool.
-	block.ReleaseSubtreeNodes(nil)
+	if releaseErr := block.ReleaseSubtreeNodes(nil); releaseErr != nil {
+		u.logger.Warnf("[setTxMined][%s] failed closing subtrees after setting mined: %v", block.Hash().String(), releaseErr)
+	}
 
 	// update block mined_set to true
 	if err = u.blockchainClient.SetBlockMinedSet(ctx, blockHash); err != nil {
@@ -1806,7 +1809,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 					// Block will not be cached on the optimistic-mining failure path —
 					// return pooled []Node slices before re-validation or invalidation.
-					releaseBlockNodes(block)
+					releaseBlockNodes(u.logger, block)
 
 					if errors.Is(err, errors.ErrBlockInvalid) {
 						reason := p2pconstants.ReasonInvalidBlock.String()
@@ -1840,7 +1843,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					u.logger.Errorf("[ValidateBlock][%s] failed to check old block IDs: %s", block.String(), err)
 
 					// Block will not be cached on the optimistic-mining failure path.
-					releaseBlockNodes(block)
+					releaseBlockNodes(u.logger, block)
 
 					if errors.Is(err, errors.ErrBlockInvalid) {
 						if _, invalidateBlockErr := u.blockchainClient.InvalidateBlock(decoupledCtx, block.Header.Hash()); invalidateBlockErr != nil {
@@ -1868,7 +1871,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					// eviction function so we must release pooled []Node slices
 					// explicitly here.
 					u.lastValidatedBlocks.Delete(*block.Hash())
-					releaseBlockNodes(block)
+					releaseBlockNodes(u.logger, block)
 					// Trigger revalidation to ensure block is retried
 					// This is consistent with other error handling in this goroutine
 					u.ReValidateBlock(block, baseURL)
@@ -1908,7 +1911,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 				// Block will not be cached — return pooled []Node slices now so
 				// the next block can reuse the same backing storage.
-				releaseBlockNodes(block)
+				releaseBlockNodes(u.logger, block)
 
 				// Check if we had an infrastructure error (storage, service, or processing);
 				// if so do not mark the block as invalid - these are transient issues
@@ -1951,7 +1954,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 			if iterationError := u.checkOldBlockIDs(ctx, oldBlockIDsMap, block); iterationError != nil {
 				// Block will not be cached on this path either.
-				releaseBlockNodes(block)
+				releaseBlockNodes(u.logger, block)
 
 				if errors.Is(iterationError, errors.ErrBlockInvalid) && !opts.IsRevalidation {
 					reason := iterationError.Error()
@@ -1978,7 +1981,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				defer storeCancel()
 
 				if err = u.blockchainClient.RevalidateBlock(storeCtx, block.Header.Hash()); err != nil {
-					releaseBlockNodes(block)
+					releaseBlockNodes(u.logger, block)
 					return errors.NewServiceError("[ValidateBlock][%s] failed to clear invalid flag after successful revalidation", block.Hash().String(), err)
 				}
 			} else {
@@ -1995,7 +1998,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 				addBlockOpts := u.buildAddBlockOpts(block)
 				if err = u.blockchainClient.AddBlock(storeCtx, block, opts.PeerID, addBlockOpts...); err != nil {
-					releaseBlockNodes(block)
+					releaseBlockNodes(u.logger, block)
 					return errors.NewServiceError("[ValidateBlock][%s] failed to store block", block.Hash().String(), err)
 				}
 			}
@@ -2043,7 +2046,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// eviction function so we must release pooled []Node slices
 				// explicitly here.
 				u.lastValidatedBlocks.Delete(*block.Hash())
-				releaseBlockNodes(block)
+				releaseBlockNodes(u.logger, block)
 				return errors.NewProcessingError("[ValidateBlock][%s] failed to update subtrees DAH", block.Hash().String(), err)
 			}
 		}
