@@ -4,7 +4,6 @@ import (
 	"container/list"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -58,8 +57,12 @@ type cappedPeerMap struct {
 	maxSize int
 
 	// evicted counts entries dropped to make room since the last sweep read —
-	// flood observability without a per-insert log line.
-	evicted atomic.Int64
+	// flood observability without a per-insert log line. Guarded by mu, not
+	// atomic: it is only ever touched alongside evictors below, and the two are
+	// read together as one verdict. An atomic here would advertise a lock-free
+	// read this type does not offer, and taking one would return a count that
+	// disagrees with the attribution it is reported with.
+	evicted int64
 
 	// evictors attributes those evictions to the peers whose inserts forced
 	// them — the pressure, not the entries dropped by it — so the at-capacity
@@ -163,10 +166,16 @@ func (m *cappedPeerMap) Store(hash string, entry peerMapEntry) {
 
 	// Loop rather than evict once: a cap lowered on a populated map leaves it
 	// over-cap, and evicting a single entry per insert would hold it there
-	// forever. The sweep no longer has a size pass to correct that.
+	// forever. The sweep no longer has a size pass to correct that. Note this
+	// sits below the update path, so it is new keys that drain an over-cap map;
+	// updates refresh in place and leave the length alone.
 	limit := m.capLocked()
 
 	for m.order.Len() >= limit {
+		// Front cannot be nil here: capLocked never returns less than 1, so the
+		// loop guard means the list is non-empty. Taken defensively rather than
+		// asserted, because the alternative to a wrong guess here is a nil
+		// dereference on the gossip hot path.
 		oldest := m.order.Front()
 		if oldest == nil {
 			break
@@ -176,7 +185,7 @@ func (m *cappedPeerMap) Store(hash string, entry peerMapEntry) {
 
 		m.order.Remove(oldest)
 		delete(m.entries, node.hash)
-		m.evicted.Add(1)
+		m.evicted++
 
 		// Attribute the eviction to the peer whose insert forced it, not to
 		// the peer whose entry was dropped. The dropped entry is the victim:
@@ -261,7 +270,7 @@ func (m *cappedPeerMap) Clear() {
 	m.evictors = nil
 	m.evictorsOverflow = false
 
-	m.evicted.Store(0)
+	m.evicted = 0
 }
 
 // Len returns the number of entries.
@@ -326,7 +335,7 @@ func (m *cappedPeerMap) EvictionsSinceLastRead() evictionStats {
 	defer m.mu.Unlock()
 
 	stats := evictionStats{
-		total:  m.evicted.Swap(0),
+		total:  m.evicted,
 		spread: m.evictorsOverflow,
 	}
 
@@ -336,6 +345,7 @@ func (m *cappedPeerMap) EvictionsSinceLastRead() evictionStats {
 		}
 	}
 
+	m.evicted = 0
 	m.evictors = nil
 	m.evictorsOverflow = false
 

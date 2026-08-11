@@ -541,7 +541,9 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 // applies the cap to both maps. The maps are bounded at insert (issue 1409);
 // the cap they enforce is the authoritative one, which is why it is not also
 // mirrored on Server. This lives apart from NewServer so that the wiring can
-// be tested without standing up the service's dependencies.
+// be tested against a bare Server literal, needing a logger but none of the
+// service's other dependencies — it announces what it resolved, so the logger
+// is load-bearing rather than incidental.
 //
 // Neither value depends on this call having happened: an unconfigured cap
 // falls back to defaultPeerMapMaxSize inside cappedPeerMap, and an
