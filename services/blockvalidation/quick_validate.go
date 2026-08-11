@@ -479,6 +479,7 @@ func (u *BlockValidation) processBlockSubtreesSequential(ctx context.Context, bl
 
 		// Phase 4.5: CVE-2012-2459 floor — must precede every write below.
 		if err := scanBatchForDuplicates(batch, dedup); err != nil {
+			batch.Close()
 			return 0, err
 		}
 
