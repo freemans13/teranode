@@ -9,12 +9,17 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/blockvalidation_api"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/jellydator/ttlcache/v3"
+	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -172,4 +177,162 @@ func TestValidateBlock_UnusableHeaderRunIsRebuiltByHashWalk(t *testing.T) {
 	require.NoError(t, err, "the hash walk must rebuild a usable run when the range fetch cannot")
 	require.Positive(t, walkHops.Load(), "recovery must go through the hash-keyed walk, not the range fetch")
 	require.Positive(t, added.Load(), "a repaired header run must end with the block stored")
+}
+
+// TestServerValidateBlock_UnusableHeaderRunIsRebuiltByHashWalk is the gRPC counterpart of the
+// test above.
+//
+// Server.ValidateBlock was the one block.Valid call site still fetching its parent run with a
+// bare GetBlockHeaders, so it alone got no hash-walk repair. That matters more here than
+// anywhere else, not less: this entry point has no re-queue behind it — cmd/checkblock and any
+// RPC caller get exactly one attempt — and GetBlockHeaders' answer stays memoized per
+// (parentHash, count) for chainWalkCacheTTL, so a caller who retried by hand within ten minutes
+// would be handed the identical unusable run.
+//
+// The fixture is deliberately the same shape as its sibling: the range fetch never returns a
+// usable run, so the only route to a NoError verdict is the walk. Before the wiring this
+// returned an ErrBlockHeaderContext instead.
+func TestServerValidateBlock_UnusableHeaderRunIsRebuiltByHashWalk(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	utxoStore, subtreeValidationClient, _, txStore, subtreeStore, cleanup := setup(t)
+	defer cleanup()
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	coinbaseTx, err := bt.NewTxFromString(model.CoinbaseHex)
+	require.NoError(t, err)
+
+	subtree, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, subtree.AddCoinbaseNode())
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	require.NoError(t, subtreeData.AddTx(coinbaseTx, 0))
+
+	nBits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
+
+	now := uint32(time.Now().Add(-time.Hour).Unix())
+
+	genesisHash := &chainhash.Hash{}
+
+	greatGrandparent := &model.BlockHeader{
+		Version: 1, HashPrevBlock: genesisHash, HashMerkleRoot: &chainhash.Hash{},
+		Timestamp: now, Bits: *nBits,
+	}
+	mineHeader(t, greatGrandparent)
+
+	grandparent := &model.BlockHeader{
+		Version: 1, HashPrevBlock: greatGrandparent.Hash(), HashMerkleRoot: &chainhash.Hash{},
+		Timestamp: now + 1, Bits: *nBits,
+	}
+	mineHeader(t, grandparent)
+
+	parent := &model.BlockHeader{
+		Version: 1, HashPrevBlock: grandparent.Hash(), HashMerkleRoot: &chainhash.Hash{},
+		Timestamp: now + 2, Bits: *nBits,
+	}
+	mineHeader(t, parent)
+
+	// Anchored and correctly linked, but truncated at its oldest end and short of genesis —
+	// invisible to the anchor and linkage guards, and the median it yields is biased high.
+	staleRun := []*model.BlockHeader{parent, grandparent}
+
+	// This path runs the full block.Valid, which recomputes the merkle root with the coinbase
+	// substituted into leaf 0 — so the header must carry that root, not the bare subtree root the
+	// optimistic sibling gets away with.
+	replicatedSubtree := subtree.Duplicate()
+	replicatedSubtree.ReplaceRootNode(coinbaseTx.TxIDChainHash(), 0, uint64(coinbaseTx.Size()))
+
+	blockHeader := &model.BlockHeader{
+		Version: 1, HashPrevBlock: parent.Hash(), HashMerkleRoot: replicatedSubtree.RootHash(),
+		Timestamp: now + 100, Bits: *nBits,
+	}
+	mineHeader(t, blockHeader)
+
+	block := &model.Block{
+		Header:           blockHeader,
+		Subtrees:         []*chainhash.Hash{subtree.RootHash()},
+		Height:           3,
+		CoinbaseTx:       coinbaseTx,
+		TransactionCount: uint64(subtree.Length()),
+		SizeInBytes:      123123,
+	}
+
+	mockBlockchain := new(blockchain.Mock)
+
+	var walkHops atomic.Int32
+
+	mockBlockchain.On("GetBlockHeader", mock.Anything, parent.Hash()).
+		Return(parent, &model.BlockHeaderMeta{ID: 2, Height: 2}, nil).
+		Run(func(mock.Arguments) { walkHops.Add(1) }).Maybe()
+	mockBlockchain.On("GetBlockHeader", mock.Anything, grandparent.Hash()).
+		Return(grandparent, &model.BlockHeaderMeta{ID: 1, Height: 1}, nil).
+		Run(func(mock.Arguments) { walkHops.Add(1) }).Maybe()
+	mockBlockchain.On("GetBlockHeader", mock.Anything, greatGrandparent.Hash()).
+		Return(greatGrandparent, &model.BlockHeaderMeta{ID: 0, Height: 0}, nil).
+		Run(func(mock.Arguments) { walkHops.Add(1) }).Maybe()
+
+	// Every range fetch is unusable, for the whole life of the test.
+	mockBlockchain.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
+		Return(staleRun,
+			[]*model.BlockHeaderMeta{{ID: 2, Height: 2}, {ID: 1, Height: 1}}, nil).Maybe()
+
+	mockBlockchain.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nBits, nil).Maybe()
+	mockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
+	mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil).Maybe()
+
+	bv := &BlockValidation{
+		blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
+		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
+		logger:                        ulogger.TestLogger{},
+		settings:                      tSettings,
+		blockchainClient:              mockBlockchain,
+		subtreeStore:                  subtreeStore,
+		txStore:                       txStore,
+		utxoStore:                     utxoStore,
+		subtreeValidationClient:       subtreeValidationClient,
+		blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
+		stats:                         gocore.NewStat("test"),
+	}
+	defer bv.blockExistsCache.Stop()
+
+	// blockAssemblyClient is left nil so WaitForBlockAssemblyReady is a no-op.
+	server := &Server{
+		logger:              ulogger.TestLogger{},
+		settings:            tSettings,
+		blockValidation:     bv,
+		blockchainClient:    mockBlockchain,
+		subtreeStore:        subtreeStore,
+		txStore:             txStore,
+		utxoStore:           utxoStore,
+		stats:               gocore.NewStat("test"),
+		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
+		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
+	}
+
+	subtreeBytes, err := subtree.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
+
+	subtreeDataBytes, err := subtreeData.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes))
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	resp, err := server.ValidateBlock(ctx, &blockvalidation_api.ValidateBlockRequest{
+		Block:  blockBytes,
+		Height: 3,
+	})
+
+	require.NoError(t, err, "the gRPC path must rebuild a usable run by hash walk, not report a header-context failure")
+	require.NotNil(t, resp)
+	require.True(t, resp.Ok)
+	require.Positive(t, walkHops.Load(), "recovery must go through the hash-keyed walk, not the range fetch")
 }

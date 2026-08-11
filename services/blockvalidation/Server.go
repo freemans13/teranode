@@ -1383,7 +1383,12 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 		return nil, errors.WrapGRPC(err)
 	}
 
-	blockHeaders, blockHeadersMeta, err := u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, u.settings.BlockValidation.PreviousBlockHeaderCount)
+	// parentHeaderRun rather than a bare GetBlockHeaders: GetBlockHeaders memoizes its answer per
+	// (startHash, count) for chainWalkCacheTTL, so a run that cannot carry the median-time-past
+	// window stays unusable for the whole TTL and every retry replays it. This entry point has no
+	// re-queue behind it — cmd/checkblock and RPC callers get one attempt — so the hash-walk
+	// rebuild is the only repair available here. See issue #1467.
+	blockHeaders, blockHeadersMeta, err := u.blockValidation.parentHeaderRun(ctx, block, u.settings.BlockValidation.PreviousBlockHeaderCount)
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewServiceError("[ValidateBlock][%s] failed to get block headers", block.String(), err))
 	}

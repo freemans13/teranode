@@ -1735,10 +1735,18 @@ func Test_ValidateBlock(t *testing.T) {
 		mockBlockchainClient.On("GetBlock", mock.Anything, mock.Anything).Return(nil, errors.New(errors.ERR_BLOCK_NOT_FOUND, "block not found"))
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 
-		// Mock GetBlockHeaders
+		// Mock GetBlockHeaders. This run is the block's own header, so it is not anchored on the
+		// block's parent and cannot carry the median-time-past window — which is what sends
+		// ValidateBlock's parentHeaderRun down its hash-walk repair path.
 		blockHeaders := []*model.BlockHeader{block.Header}
 		blockMetas := []*model.BlockHeaderMeta{{Height: 99}}
 		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return(blockHeaders, blockMetas, nil)
+
+		// The parent is absent from this fixture's store, so the hash walk cannot repair the run
+		// either and parentHeaderRun keeps the batched one — leaving the subtest exercising the
+		// generic validation-failure path it was written for.
+		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
+			Return(nil, nil, errors.New(errors.ERR_BLOCK_NOT_FOUND, "block not found"))
 
 		req := &blockvalidation_api.ValidateBlockRequest{
 			Block:  blockBytes,
