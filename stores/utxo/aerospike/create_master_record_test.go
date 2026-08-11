@@ -29,23 +29,13 @@ func batchResults(t *testing.T, errs ...aerospike.Error) []aerospike.BatchRecord
 }
 
 func keyExists() aerospike.Error {
-	return &aerospike.AerospikeError{ResultCode: types.KEY_EXISTS_ERROR}
+	return aeroErr(types.KEY_EXISTS_ERROR)
 }
 
 // TestClassifyCreateBatchResults pins the rule that decides whether THIS writer created a
-// transaction, which is the fix for issue 1442.
-//
-// The consequential case is the third one. Record 0 is the master — it alone carries the
-// block references, or the unmined marker when there are none. A writer that finds the
-// master already present but fills in a missing child has NOT created the transaction:
-// the mined-state metadata on record 0 belongs to whoever wrote it. Reporting success there
-// is a lie the caller acts on, because block validation only repairs mined information when
-// the store says the transaction already exists, so the master keeps the earlier writer's
-// unmined marker and a mined transaction stays recorded as unmined.
-//
-// That case needs no concurrency at all: a partial batch failure deliberately leaves its
-// records in place for the next attempt, so a later sequential create from a different
-// caller lands exactly here.
+// transaction, which is the fix for issue 1442. The consequential case is the third one -
+// master already present, child written by us. See the classifyCreateBatchResults doc
+// comment for why that must not report success.
 func TestClassifyCreateBatchResults(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -82,13 +72,13 @@ func TestClassifyCreateBatchResults(t *testing.T) {
 		},
 		{
 			name:         "a genuine failure is not mistaken for already-present",
-			errs:         []aerospike.Error{nil, &aerospike.AerospikeError{ResultCode: types.TIMEOUT}},
+			errs:         []aerospike.Error{nil, aeroErr(types.TIMEOUT)},
 			wantMaster:   true,
 			wantFailures: true,
 		},
 		{
 			name:         "a failure on the master is a failure, not a creation",
-			errs:         []aerospike.Error{&aerospike.AerospikeError{ResultCode: types.TIMEOUT}, nil},
+			errs:         []aerospike.Error{aeroErr(types.TIMEOUT), nil},
 			wantMaster:   false,
 			wantFailures: true,
 		},
@@ -101,11 +91,11 @@ func TestClassifyCreateBatchResults(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			masterCreated, hasFailures, alreadyPresent := classifyCreateBatchResults(batchResults(t, tt.errs...))
+			masterCreated, alreadyPresent, failed := classifyCreateBatchResults(batchResults(t, tt.errs...))
 
 			require.Equal(t, tt.wantMaster, masterCreated,
 				"masterCreated decides whether the caller is told it created this transaction")
-			require.Equal(t, tt.wantFailures, hasFailures)
+			require.Equal(t, tt.wantFailures, len(failed) > 0)
 			require.Len(t, alreadyPresent, tt.wantPresentCount)
 		})
 	}
@@ -116,8 +106,8 @@ func TestClassifyCreateBatchResults(t *testing.T) {
 // non-Aerospike error, must fall through to the failure path rather than being quietly
 // treated as a completed previous attempt.
 func TestIsKeyExists(t *testing.T) {
-	require.True(t, isKeyExists(&aerospike.AerospikeError{ResultCode: types.KEY_EXISTS_ERROR}))
-	require.False(t, isKeyExists(&aerospike.AerospikeError{ResultCode: types.TIMEOUT}))
-	require.False(t, isKeyExists(&aerospike.AerospikeError{ResultCode: types.KEY_NOT_FOUND_ERROR}))
+	require.True(t, isKeyExists(aeroErr(types.KEY_EXISTS_ERROR)))
+	require.False(t, isKeyExists(aeroErr(types.TIMEOUT)))
+	require.False(t, isKeyExists(aeroErr(types.KEY_NOT_FOUND_ERROR)))
 	require.False(t, isKeyExists(errors.NewProcessingError("not an aerospike error")))
 }
