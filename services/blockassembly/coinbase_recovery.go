@@ -46,19 +46,47 @@ const coinbaseRecoveryRetryBackoff = 500 * time.Millisecond
 // one extra call on a path that is rare on a healthy node, and an
 // uncorroborated not-found is treated as possibly transient so the retry budget
 // engages as intended.
+//
+// The text-fold that denial needs is confined to the error it is aimed at.
+// Flattening a cause into a message is not a neutral reformatting: it discards
+// the whole chain, and with it every classification a caller might test for --
+// so applying it to all causes silently broke errors.IsContextError, which is
+// what tells a shutdown apart from a fault in both callers. A cancellation is
+// now returned untouched, an uncorroborated not-found is still folded, and
+// anything else is wrapped normally. (Review finding ChiR20.)
 func (b *BlockAssembler) canonicalBlockAt(ctx context.Context, height uint32) (*model.Block, error) {
 	blk, err := b.blockchainClient.GetBlockByHeight(ctx, height)
 	if err != nil {
-		if (errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound)) && b.chainStopsBelow(ctx, height) {
+		if errors.IsContextError(err) {
+			// A shutdown, not a fault, and returned exactly as it arrived.
+			// Everything below either asks the client a second question it can
+			// no longer answer, or flattens the cause into text -- and a
+			// flattened cause leaves errors.IsContextError nothing to inspect,
+			// so an ordinary stop reads as a failure. That costs the
+			// "aborted" outcome its meaning and fires MANUAL INTERVENTION
+			// REQUIRED at an operator who only stopped the node.
+			return nil, err
+		}
+
+		notFound := errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound)
+
+		if notFound && b.chainStopsBelow(ctx, height) {
 			return nil, errors.NewBlockNotFoundError("[coinbaseRecovery] no canonical block at height %d", height, err)
 		}
 
-		// The cause is folded in as text rather than wrapped. teranode's
-		// errors.Is matches *Error values by code through the wrapped chain, so
-		// wrapping an uncorroborated not-found would leave canonicalBlockAbsent
-		// still answering true for it -- which is the whole condition this branch
-		// exists to deny.
-		return nil, errors.NewProcessingError("[coinbaseRecovery] cannot get canonical block at height %d: %s", height, err.Error())
+		if notFound {
+			// Only the uncorroborated not-found is folded in as text rather
+			// than wrapped, and only because wrapping it would leave
+			// canonicalBlockAbsent still answering true for it through the
+			// chain -- the whole condition this branch exists to deny. The fold
+			// is a targeted way to hide one error code, so it is applied to the
+			// one error that needs hiding and to nothing else.
+			return nil, errors.NewProcessingError("[coinbaseRecovery] cannot get canonical block at height %d: %s", height, err.Error())
+		}
+
+		// Not a not-found at all, so there is nothing to hide: wrap normally and
+		// let every classification the cause carries survive for its callers.
+		return nil, errors.NewProcessingError("[coinbaseRecovery] cannot get canonical block at height %d", height, err)
 	}
 
 	if blk == nil {

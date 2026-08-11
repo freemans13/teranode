@@ -1041,6 +1041,22 @@ type interposedBlockchainClient struct {
 	// grpcStyleFaults counts how many such answers were given, so a test can
 	// assert the retry budget was spent on them rather than skipped over.
 	grpcStyleFaults int
+
+	// contextCodeCancelAt, when non-nil, cancels the scan's context on the
+	// lookup for that height and answers with a teranode *Error that carries a
+	// context *code*, rather than one wrapping context.Canceled as
+	// cancelAtHeight does.
+	//
+	// The two shapes are not interchangeable, and only this one tests what it
+	// looks like it tests. errors.Is falls back to a substring match on the
+	// rendered message when the target is not an *Error, and a cancellation
+	// that wraps context.Canceled renders that literal text -- so it keeps
+	// answering IsContextError even after its chain has been flattened into a
+	// message. This shape renders "CONTEXT_CANCELED (7): ...", which shares no
+	// substring with "context canceled", so it can only be classified through
+	// the error chain. It is what a client that reports cancellation with
+	// teranode's own error type produces.
+	contextCodeCancelAt *uint32
 }
 
 func (c *interposedBlockchainClient) GetBlockByHeight(ctx context.Context, height uint32) (*model.Block, error) {
@@ -1053,6 +1069,12 @@ func (c *interposedBlockchainClient) GetBlockByHeight(ctx context.Context, heigh
 
 	if c.absentHeights[height] {
 		return nil, errors.NewBlockNotFoundError("no canonical block at height %d", height)
+	}
+
+	if c.contextCodeCancelAt != nil && *c.contextCodeCancelAt == height {
+		c.cancel()
+
+		return nil, errors.NewContextCanceledError("blockchain client stopped before answering for height %d", height)
 	}
 
 	if c.cancelAtHeight != nil && *c.cancelAtHeight == height {
@@ -1810,4 +1832,176 @@ func TestScopeCoinbaseGap_StillRefusesWhenTheFloorHeightItselfIsMissing(t *testi
 	require.True(t, errors.Is(err, errCoinbaseFloorNotProven),
 		"a gap that reaches the floor may continue below it, so it must still refuse")
 	require.Nil(t, gap, "no blocks may be handed to the repair when the gap reaches the floor")
+}
+
+// TestCanonicalBlockAt_ContextCancellationSurvivesTheFold covers ChiR20.
+//
+// canonicalBlockAt folds its cause into the message as text rather than wrapping
+// it. That is deliberate and necessary for one case: wrapping an uncorroborated
+// not-found would leave canonicalBlockAbsent still matching ErrBlockNotFound
+// through the chain, which is the whole condition that branch exists to deny.
+// But folding is indiscriminate -- it flattens the chain for every cause, and
+// errors.IsContextError has nothing left to inspect. A shutdown then reads as an
+// ordinary fault, and recovery raises MANUAL INTERVENTION REQUIRED for a node
+// that is merely stopping.
+//
+// The subtests below are the same scenario told with two error shapes, and the
+// difference between them is the whole reason this was easy to miss. Only the
+// first can actually detect the bug.
+func TestCanonicalBlockAt_ContextCancellationSurvivesTheFold(t *testing.T) {
+	initPrometheusMetrics()
+
+	// A cancellation carrying a context *code*. Its rendered text is
+	// "CONTEXT_CANCELED (7): ...", which shares no substring with
+	// "context canceled", so classification has to come from the error chain --
+	// and the fold destroys the chain.
+	t.Run("classified by code", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+		require.NotNil(t, items)
+
+		buildCanonicalChain(t.Context(), t, items, 3)
+
+		at := uint32(3)
+		items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+			ClientI:             items.blockchainClient,
+			contextCodeCancelAt: &at,
+			cancel:              cancel,
+		}
+
+		_, err := items.blockAssembler.canonicalBlockAt(ctx, 3)
+		require.Error(t, err)
+		require.True(t, errors.IsContextError(err),
+			"a cancellation must stay classifiable, or every shutdown check downstream reads it as a client fault")
+		require.False(t, canonicalBlockAbsent(err),
+			"and it must not be mistaken for the chain genuinely stopping short of this height")
+	})
+
+	// The same shutdown reported as a wrapper around context.Canceled. This one
+	// passes even against the unfixed code, because the fold interpolates the
+	// cause's text and errors.Is falls back to a substring match on the rendered
+	// message when the target is not an *Error -- so the literal "context
+	// canceled" survives in the message and answers for the lost chain. Kept as
+	// a control: a test written only in this shape looks like it pins the
+	// property and pins nothing.
+	t.Run("classified by wrapped sentinel", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+		require.NotNil(t, items)
+
+		buildCanonicalChain(t.Context(), t, items, 3)
+
+		at := uint32(3)
+		items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+			ClientI:        items.blockchainClient,
+			cancelAtHeight: &at,
+			cancel:         cancel,
+		}
+
+		_, err := items.blockAssembler.canonicalBlockAt(ctx, 3)
+		require.Error(t, err)
+		require.True(t, errors.IsContextError(err))
+	})
+}
+
+// TestRecoverCoinbaseDivergence_CancellationOnTheFinalAttemptAbortsRatherThanEscalates
+// is the operator-visible half of ChiR20, and the reason it is worth pinning
+// separately from TestRecoverCoinbaseDivergence_CancellationAbortsWithoutAlarm.
+//
+// That test cancels with attempts still in hand, so the retry loop's own
+// ctx.Err() check at the top of the next attempt catches the shutdown before the
+// error it is carrying ever matters. The unguarded window is the last attempt:
+// there is no next iteration to re-check the context, so whatever error the
+// scoping walk returned becomes the verdict directly. A cancellation stripped of
+// its classification lands there as an ordinary failure and fires the loudest
+// signal the system has -- MANUAL INTERVENTION REQUIRED, naming
+// resetblockassembly -- at an operator who did nothing but stop the node, while
+// also polluting the "escalated" metric.
+func TestRecoverCoinbaseDivergence_CancellationOnTheFinalAttemptAbortsRatherThanEscalates(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+
+	// One attempt, so the attempt the shutdown lands in is also the final one.
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 1
+
+	headers := buildCanonicalChain(t.Context(), t, items, 4)
+	seedCoinbase(t.Context(), t, items, headers, 1)
+	items.blockAssembler.setBestBlockHeader(headers[3], 4)
+
+	// The shutdown lands inside the walk-back's very first lookup.
+	at := uint32(4)
+	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+		ClientI:             items.blockchainClient,
+		contextCodeCancelAt: &at,
+		cancel:              cancel,
+	}
+
+	logger := newCapturingLogger()
+	items.blockAssembler.logger = logger
+
+	abortedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("aborted"))
+	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
+
+	err := items.blockAssembler.recoverCoinbaseDivergence(ctx, 4)
+	require.Error(t, err)
+	require.True(t, errors.IsContextError(err),
+		"the real reason must be reported, not a generic unrecoverable-divergence error")
+
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("aborted"))-abortedBefore,
+		"a shutdown on the last attempt is still a shutdown")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
+		"and it must not raise the manual-intervention alarm")
+	require.False(t, logger.sawError("MANUAL INTERVENTION REQUIRED"),
+		"stopping a node must not print the loudest line the system has")
+}
+
+// TestStartupCoinbaseDivergenceCheck_ContextCodeShutdownIsNotReportedAsLostDetection
+// is the detection-path half of ChiR20. It is narrower than the recovery half --
+// it needs the shared probe budget to be spent before the cancellation lands,
+// because while retries remain withProbeRetry's own ctx.Done() case answers with
+// a real ctx.Err() and hides the flattened one. Once the budget is gone the
+// folded error is returned as-is, and the scan blames the client for a shutdown
+// on the very line ChiR14 added its context check to avoid.
+func TestStartupCoinbaseDivergenceCheck_ContextCodeShutdownIsNotReportedAsLostDetection(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryConsecutiveGood = 1
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks = 100
+	items.blockAssembler.settings.BlockAssembly.CoinbaseRecoveryMaxAttempts = 3
+
+	headers := buildCanonicalChain(t.Context(), t, items, 6)
+	for h := uint32(1); h <= 6; h++ {
+		seedCoinbase(t.Context(), t, items, headers, h)
+	}
+
+	items.blockAssembler.setBestBlockHeader(headers[5], 6)
+
+	logger := newCapturingLogger()
+	items.blockAssembler.logger = logger
+
+	// Spend the whole shared budget on transient blips first (the tip check at
+	// height 6 is exempt so the scan actually starts), then cancel.
+	at := uint32(4)
+	items.blockAssembler.blockchainClient = &interposedBlockchainClient{
+		ClientI:             items.blockchainClient,
+		failuresLeft:        coinbaseRecoveryProbeRetries,
+		neverFailHeights:    map[uint32]bool{6: true},
+		contextCodeCancelAt: &at,
+		cancel:              cancel,
+	}
+
+	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+
+	require.False(t, logger.sawError("no coinbase-divergence detection will run until the next restart"),
+		"a node that is shutting down has not lost its detection coverage")
 }
