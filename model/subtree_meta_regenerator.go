@@ -108,8 +108,10 @@ func (r *SubtreeMetaRegenerator) getLocalSubtreeData(ctx context.Context, subtre
 // peerFetchTimeout bounds one peer's fetch (all 503 retries plus the body
 // stream). This fetch runs inline in Block.Valid on a context with no
 // deadline, where the shared client would otherwise allow a hung peer the full
-// http_streaming_timeout (5 minutes by default) per attempt; 30s preserves the
-// previous per-peer ceiling.
+// http_streaming_timeout (5 minutes by default) per attempt. Note this is a
+// whole-peer budget, not a per-attempt one: the previous bare http.Client gave
+// 30s to a single attempt with no retries, so under sustained 503 backoff the
+// last attempt here gets considerably less than 30s.
 const peerFetchTimeout = 30 * time.Second
 
 // getSubtreeDataFromPeer fetches subtree data from a peer via HTTP. The peer's
