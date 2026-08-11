@@ -157,6 +157,18 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 		}
 	}
 
+	// The subtree data deserializer stops at EOF without checking it filled every node, so a
+	// short .subtreeData file yields trailing nil transactions and a meta with no recorded
+	// parents for the tail. Such a meta is unusable in both directions: it fails serialization,
+	// and the within-block duplicate-inputs check reads a missing entry as a transaction with
+	// no parents and rejects the whole block. Fail regeneration rather than return it.
+	// The bound mirrors Meta.Serialize, which requires parents for every node except index 0.
+	for i := 1; i < subtree.Length(); i++ {
+		if meta.TxInpoints[i].ParentTxHashes == nil {
+			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: no inpoints for node %d of %d", i, subtree.Length())
+		}
+	}
+
 	return meta, nil
 }
 

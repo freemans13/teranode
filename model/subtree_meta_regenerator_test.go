@@ -277,6 +277,50 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_NilStore_PeerFallback(t *testing.
 	require.NotNil(t, meta)
 }
 
+// TestSubtreeMetaRegenerator_RegenerateMeta_RejectsIncompleteSubtreeData pins the
+// completeness of a regenerated meta. go-subtree's data deserializer stops at io.EOF
+// without checking it filled every node, so a truncated .subtreeData file yields
+// trailing nil transactions. Those become nodes with no recorded parent hashes, and
+// feeding such a meta to the within-block duplicate-inputs check sends it down the
+// nil-parents path, which rejects the whole block as invalid. Regeneration has to fail
+// loudly rather than hand back a partial meta while logging success.
+func TestSubtreeMetaRegenerator_RegenerateMeta_RejectsIncompleteSubtreeData(t *testing.T) {
+	ctx := context.Background()
+
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+	tx2 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000002", 1)
+
+	subtree := createTestSubtree([]chainhash.Hash{*tx1.TxIDChainHash(), *tx2.TxIDChainHash()})
+	subtreeHash := subtree.RootHash()
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	subtreeData.Txs[1] = tx1
+	subtreeData.Txs[2] = tx2
+
+	full, err := subtreeData.Serialize()
+	require.NoError(t, err)
+
+	// Cut the file after the first transaction. Subtree data is bare concatenated
+	// transactions with no header, so this is exactly the shape a short write leaves
+	// on disk: tx1 parses, then EOF, and node 2 never gets its inpoints.
+	truncated := full[:len(tx1.SerializeBytes())]
+	require.Less(t, len(truncated), len(full), "fixture must actually be short")
+
+	store := memory.New()
+	require.NoError(t, store.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData, truncated))
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, nil, "", func() uint32 { return 100 }, 288)
+
+	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree)
+
+	require.Error(t, err, "regeneration from truncated subtree data must fail, not return a partial meta")
+	require.Nil(t, meta)
+
+	// A meta that failed the completeness check must not reach disk either.
+	_, err = store.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
+	require.Error(t, err, "incomplete meta must not be persisted")
+}
+
 func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_Success(t *testing.T) {
 	mockStore := newMockSubtreeStoreWriter()
 	logger := ulogger.TestLogger{}
