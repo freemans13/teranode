@@ -344,15 +344,29 @@ func (m *cappedPeerMap) EvictionsSinceLastRead() evictionStats {
 
 // String renders the eviction attribution for the at-capacity log line.
 //
-// Dominance is tested before overflow, not after. Once a map sits at capacity
-// every new hash evicts, so on a mesh with more peers than the tracker can name
-// the overflow flag is set in almost every sweep window — and testing it first
-// would discard the name and report "spread" even when one peer caused nearly
-// all of the pressure. That is the one answer issue 1503 says is wrong for a
-// flood: it tells the operator to raise the cap, which only buys the attacker
-// more memory. Comparing against total is safe under overflow because total is
-// exact while evictors is not, so a majority share cannot be an artefact of
-// which peers the tracker happened to name first.
+// The verdict turns on the top contributor's share, not on how many peers
+// contributed. Those two questions come apart in both directions, and the log
+// line is read as a recommendation — "spread" means raise the cap, a named
+// contributor means ban that peer — so getting either one backwards points the
+// operator at the wrong response.
+//
+// Share is therefore tested before overflow. Once a map sits at capacity every
+// new hash evicts, so on a mesh with more peers than the tracker can name the
+// overflow flag is set in almost every sweep window — and testing it first would
+// discard the name and report "spread" even when one peer caused nearly all of
+// the pressure. That is the one answer issue 1503 says is wrong for a flood: it
+// tells the operator to raise the cap, which only buys the attacker more memory.
+// Comparing against total is safe under overflow because total is exact while
+// evictors is not, so a majority share cannot be an artefact of which peers the
+// tracker happened to name first.
+//
+// The same test has to apply when the tracker did not overflow, which is the
+// easier case to get right because the counts are exact there. A handful of
+// busy honest peers each forcing a quarter of the evictions is throughput, and
+// naming the largest of them as a top contributor would recommend banning the
+// node's busiest honest peer. Overflow then only decides the wording — whether
+// the count is exact or a lower bound, and whether unnamed contributors exist —
+// never whether the pressure counts as a flood.
 func (s evictionStats) String() string {
 	switch {
 	case s.total == 0:
@@ -363,9 +377,14 @@ func (s evictionStats) String() string {
 		return fmt.Sprintf("spread across more than %d peers", evictorTrackLimit)
 	case s.topCount == s.total:
 		return fmt.Sprintf("all from peer %s", s.topPeer)
-	case s.spread && s.topCount*2 <= s.total:
-		return fmt.Sprintf("spread across more than %d peers; largest tracked contributor peer %s with at least %d of %d",
-			evictorTrackLimit, s.topPeer, s.topCount, s.total)
+	case s.topCount*2 <= s.total:
+		if s.spread {
+			return fmt.Sprintf("spread across more than %d peers; largest tracked contributor peer %s with at least %d of %d",
+				evictorTrackLimit, s.topPeer, s.topCount, s.total)
+		}
+
+		return fmt.Sprintf("spread across peers; largest contributor peer %s with %d of %d",
+			s.topPeer, s.topCount, s.total)
 	case s.spread:
 		return fmt.Sprintf("top contributor peer %s with at least %d of %d", s.topPeer, s.topCount, s.total)
 	default:

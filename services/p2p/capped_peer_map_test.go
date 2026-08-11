@@ -70,6 +70,40 @@ func TestCappedPeerMapEvictionAttribution(t *testing.T) {
 		require.Contains(t, evictions.String(), "top contributor peer busy-peer")
 	})
 
+	t.Run("a balanced few contributors report as spread, not as a flooder", func(t *testing.T) {
+		var m cappedPeerMap
+
+		m.setMaxSize(10)
+
+		// Few enough contributors that the tracker never overflows, so the
+		// counts are exact and spread stays unset. The busiest of them still
+		// holds well under half the evictions, which is the whole question:
+		// the verdict must follow the share, not the number of contributors.
+		// Naming a plurality here would point the operator at the busiest
+		// honest peer with the wording the setting's guidance reads as "ban
+		// this peer".
+		const contributors = 4
+
+		for i := 0; i < 100; i++ {
+			m.Store(fmt.Sprintf("hash-%d", i), peerMapEntry{
+				peerID:    fmt.Sprintf("peer-%d", i%contributors),
+				timestamp: now,
+			})
+		}
+
+		evictions := m.EvictionsSinceLastRead()
+		require.Equal(t, int64(90), evictions.total)
+		require.False(t, evictions.spread, "four contributors must fit the tracker")
+		require.NotEmpty(t, evictions.topPeer, "exact counts must still name the largest contributor")
+		require.LessOrEqual(t, evictions.topCount*2, evictions.total, "no contributor holds a majority")
+
+		require.Equal(t,
+			fmt.Sprintf("spread across peers; largest contributor peer %s with %d of %d",
+				evictions.topPeer, evictions.topCount, evictions.total),
+			evictions.String(),
+			"a plurality below a majority is throughput, whatever the contributor count")
+	})
+
 	t.Run("pressure spread past the tracking limit reports the spread", func(t *testing.T) {
 		var m cappedPeerMap
 
@@ -85,7 +119,14 @@ func TestCappedPeerMapEvictionAttribution(t *testing.T) {
 		evictions := m.EvictionsSinceLastRead()
 		require.Equal(t, int64(190), evictions.total)
 		require.True(t, evictions.spread, "more contributors than the tracker can name must report as spread")
-		require.Contains(t, evictions.String(), "spread across more than")
+
+		// Asserted exactly rather than by substring: several arms of String
+		// open with "spread across", so a loose match would keep passing if a
+		// future edit routed this case through a different one.
+		require.Equal(t,
+			fmt.Sprintf("spread across more than %d peers; largest tracked contributor peer %s with at least %d of %d",
+				evictorTrackLimit, evictions.topPeer, evictions.topCount, evictions.total),
+			evictions.String())
 
 		// The tracker itself must stay bounded: that is the failure mode of
 		// issue 1409, and a diagnostic is no exception.
