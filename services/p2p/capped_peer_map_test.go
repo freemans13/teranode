@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -133,6 +134,40 @@ func TestCappedPeerMapEvictionAttribution(t *testing.T) {
 		m.mu.Lock()
 		require.LessOrEqual(t, len(m.evictors), evictorTrackLimit)
 		m.mu.Unlock()
+	})
+
+	t.Run("a long tail with no heavy hitter names nobody", func(t *testing.T) {
+		var m cappedPeerMap
+
+		const capacity = 10
+
+		m.setMaxSize(capacity)
+
+		// Every contributor distinct and none repeating is the case Misra-Gries
+		// cancels out entirely: sixteen peers fill the tracker, the seventeenth
+		// decrements all of them to zero, and the cycle repeats. Landing on an
+		// exact multiple of that cycle leaves the tracker empty, which is not a
+		// failure to attribute but the answer itself — pressure with no heavy
+		// hitter is throughput. It is the one case where the verdict has no
+		// name to offer, so it has its own line.
+		const rounds = 11
+
+		evictions := (evictorTrackLimit + 1) * rounds
+
+		for i := 0; i < capacity+evictions; i++ {
+			m.Store(fmt.Sprintf("hash-%d", i), peerMapEntry{
+				peerID:    fmt.Sprintf("one-shot-peer-%d", i),
+				timestamp: now,
+			})
+		}
+
+		stats := m.EvictionsSinceLastRead()
+		require.Equal(t, int64(evictions), stats.total)
+		require.True(t, stats.spread)
+		require.Empty(t, stats.topPeer, "a uniform long tail must leave no survivor to name")
+		require.Equal(t,
+			fmt.Sprintf("spread across more than %d peers", evictorTrackLimit),
+			stats.String())
 	})
 
 	t.Run("cheap identities cannot crowd the flooder out of the tracker", func(t *testing.T) {
@@ -788,5 +823,127 @@ func TestApplyPeerMapLimits(t *testing.T) {
 
 		requireConfiguredCap(t, &s.blockPeerMap, defaultPeerMapMaxSize)
 		requireConfiguredCap(t, &s.subtreePeerMap, defaultPeerMapMaxSize)
+	})
+}
+
+// recordingLogger captures the lines a test triggers so the startup
+// announcements can be asserted on. Everything else is the no-op TestLogger.
+type recordingLogger struct {
+	ulogger.TestLogger
+
+	mu    sync.Mutex
+	warns []string
+	infos []string
+}
+
+func (l *recordingLogger) Warnf(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.warns = append(l.warns, fmt.Sprintf(format, args...))
+}
+
+func (l *recordingLogger) Infof(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.infos = append(l.infos, fmt.Sprintf(format, args...))
+}
+
+// linesContaining returns the recorded lines holding substr, so an assertion
+// names the line it means rather than depending on how many others were logged.
+func (l *recordingLogger) linesContaining(lines []string, substr string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var matched []string
+
+	for _, line := range lines {
+		if strings.Contains(line, substr) {
+			matched = append(matched, line)
+		}
+	}
+
+	return matched
+}
+
+func (l *recordingLogger) warnsContaining(substr string) []string {
+	return l.linesContaining(l.warns, substr)
+}
+
+func (l *recordingLogger) infosContaining(substr string) []string {
+	return l.linesContaining(l.infos, substr)
+}
+
+// TestAnnouncePeerMapLimits pins the startup announcements, which are the only
+// warning an operator gets that these three keys changed status. They carried
+// struct tags but were never read, so a config that pinned the pre-tuning
+// 100000/30m/5m from the old reference docs was inert and is now live — a 10x
+// growth in the attribution maps arriving on a change whose purpose is bounding
+// them. Nothing else exercises these branches, so a wrong format verb or a
+// dropped condition would ship silently and only surface as a leak weeks later.
+func TestAnnouncePeerMapLimits(t *testing.T) {
+	t.Run("each configured value above its default announces itself", func(t *testing.T) {
+		tSettings := &settings.Settings{}
+		tSettings.P2P.PeerMapMaxSize = defaultPeerMapMaxSize * 10
+		tSettings.P2P.PeerMapTTL = defaultPeerMapTTL * 3
+		tSettings.P2P.PeerMapCleanupInterval = defaultPeerMapCleanupInterval * 5
+
+		logger := &recordingLogger{}
+		s := &Server{logger: logger}
+		s.applyPeerMapLimits(tSettings)
+
+		// Asserted per key, and with the configured value in the line: an
+		// operator reading it has to be able to tell which setting to look at
+		// and what it resolved to, and a swapped format argument would
+		// otherwise pass.
+		require.Equal(t, []string{fmt.Sprintf(
+			"[applyPeerMapLimits] p2p_peer_map_max_size=%d exceeds the %d default; this key was inert before and is now read, so check the value is intended — it also lengthens the cleanup sweep's locked walk",
+			defaultPeerMapMaxSize*10, defaultPeerMapMaxSize)},
+			logger.warnsContaining("p2p_peer_map_max_size"))
+
+		require.Equal(t, []string{fmt.Sprintf(
+			"[applyPeerMapLimits] p2p_peer_map_ttl=%s exceeds the %s default; this key was inert before and is now read, so check the value is intended",
+			defaultPeerMapTTL*3, defaultPeerMapTTL)},
+			logger.warnsContaining("p2p_peer_map_ttl"))
+
+		require.Equal(t, []string{fmt.Sprintf(
+			"[applyPeerMapLimits] p2p_peer_map_cleanup_interval=%s exceeds the %s default; this key was inert before and is now read, so check the value is intended",
+			defaultPeerMapCleanupInterval*5, defaultPeerMapCleanupInterval)},
+			logger.warnsContaining("p2p_peer_map_cleanup_interval"))
+	})
+
+	t.Run("values at or below their defaults stay quiet", func(t *testing.T) {
+		tSettings := &settings.Settings{}
+		tSettings.P2P.PeerMapMaxSize = defaultPeerMapMaxSize
+		tSettings.P2P.PeerMapTTL = defaultPeerMapTTL
+		tSettings.P2P.PeerMapCleanupInterval = defaultPeerMapCleanupInterval
+
+		logger := &recordingLogger{}
+		s := &Server{logger: logger}
+		s.applyPeerMapLimits(tSettings)
+
+		require.Empty(t, logger.warns, "a config matching the defaults is not worth a startup warning")
+	})
+
+	t.Run("a coerced non-positive cap says so", func(t *testing.T) {
+		// The adjacent p2p_peer_registry_max_size documents 0 as "disable
+		// enforcement", so an operator can reasonably set 0 here expecting the
+		// same and get a bound they did not ask for. Silence would look exactly
+		// like the inert key this change just finished fixing.
+		tSettings := &settings.Settings{}
+		tSettings.P2P.PeerMapMaxSize = 0
+
+		logger := &recordingLogger{}
+		s := &Server{logger: logger}
+		s.applyPeerMapLimits(tSettings)
+
+		require.Equal(t, []string{fmt.Sprintf(
+			"[applyPeerMapLimits] p2p_peer_map_max_size=%d is not a usable cap; using the %d default — there is no unbounded mode",
+			0, defaultPeerMapMaxSize)},
+			logger.infosContaining("p2p_peer_map_max_size"))
+
+		require.Empty(t, logger.warnsContaining("p2p_peer_map_max_size"),
+			"a coerced cap is not also an exceeds-the-default warning")
 	})
 }
