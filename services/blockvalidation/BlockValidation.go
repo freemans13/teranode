@@ -2357,8 +2357,8 @@ func (u *BlockValidation) walkParentChain(ctx context.Context, startHash *chainh
 			return nil, nil, errors.NewProcessingError("walkParentChain: failed at depth %d (hash %s)", i, cur.String(), err)
 		}
 
-		if header == nil {
-			return nil, nil, errors.NewProcessingError("walkParentChain: nil header at depth %d (hash %s) — possible transient cache miss", i, cur.String())
+		if header == nil || meta == nil {
+			return nil, nil, errors.NewProcessingError("walkParentChain: nil header or metadata at depth %d (hash %s) — possible transient cache miss", i, cur.String())
 		}
 
 		headers = append(headers, header)
