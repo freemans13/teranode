@@ -4023,8 +4023,8 @@ func TestCatchup_MemoryLimitAfterDuplicateRemoval(t *testing.T) {
 // a counter refreshed asynchronously on each block notification, so it can trail the
 // accepted chain while that subscription is starved or during bulk sync. Measuring the
 // divergence point against it made the ancestor search stop early, which is what this test
-// now forbids: with the accepted chain at 200 and the counter still at 100, the ancestor at
-// 152 must be found.
+// now forbids: the accepted chain is at 200 and the ancestor at 152 must be found. Under the
+// old code a counter lagging at 100 would have stopped the walk below it and found nothing.
 func TestFindCommonAncestor_FindsAncestorAboveLaggingUTXOHeight(t *testing.T) {
 	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
@@ -4148,10 +4148,11 @@ func TestFindCommonAncestor_ForkDepthNotUnderstatedByLag(t *testing.T) {
 	require.NoError(t, server.findCommonAncestor(context.Background(), catchupCtx))
 	require.Equal(t, uint32(150), catchupCtx.forkDepth, "depth must be measured from the accepted tip, not a lagging counter")
 
-	// With the true depth the coinbase-maturity gate rejects it. Under the old arithmetic
-	// this same fork scored 90 and was waved through. Asserted rather than assigned: the
-	// numbers above (tip 200, ancestor 50, lag 60) are chosen against a gate of 100, so if
-	// the fixture's value ever changes this should fail loudly rather than silently retune.
+	// With the true depth the coinbase-maturity gate rejects it. Under the old arithmetic a
+	// counter lagging 60 behind would have scored this same fork at 90 and waved it through.
+	// Asserted rather than assigned: the fixture (tip 200, ancestor 50) is chosen against a
+	// gate of 100, so if that value ever changes this should fail loudly rather than silently
+	// retune.
 	require.Equal(t, 100, int(server.settings.ChainCfgParams.CoinbaseMaturity),
 		"this test's depths are chosen against a coinbase-maturity gate of 100")
 
