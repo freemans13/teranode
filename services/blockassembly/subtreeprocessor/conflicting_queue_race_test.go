@@ -110,7 +110,7 @@ func TestDequeueDuringBlockMovement_RejectsChildOfConflictingParent(t *testing.T
 //
 // The drain's validFromMillis is always set (clock.Now() when
 // DoubleSpendWindow=0, clock.Now()-DoubleSpendWindow otherwise) so the
-// queue filter at queue.go:96 (`batch.time >= validFromMillis -> hold`)
+// queue filter in LockFreeQueue.dequeueBatch (`batch.time >= validFromMillis -> hold`)
 // uses the drain clock as the cutoff. This bounds the drain to batches
 // that already existed before the drain started, preventing the loop
 // from chasing fresh ingest produced by AddTxBatchColumnar — the

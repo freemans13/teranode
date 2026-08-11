@@ -197,7 +197,7 @@ func Test_queueClockOverride(t *testing.T) {
 // validFromMillis formulas inside SubtreeProcessor at DoubleSpendWindow=0
 // (the documented default - see settings/blockassembly_settings.go:29).
 // Both call sites now zero-guard the calculation, so neither activates
-// the queue filter at queue.go:96 and both admit same-millisecond
+// the queue filter in LockFreeQueue.dequeueBatch and both admit same-millisecond
 // batches.
 //
 //	Start loop (SubtreeProcessor.go:807-813):
@@ -256,7 +256,7 @@ func Test_zeroWindowFormulasAgree(t *testing.T) {
 
 // Test_validFromMillisBoundaries pins the inclusive-reject semantics and
 // the negative/zero-bypass behaviour of the queue's validFromMillis
-// filter at queue.go:96:
+// filter in LockFreeQueue.dequeueBatch:
 //
 //	if validFromMillis > 0 && next.time >= validFromMillis {
 //	    return nil, false

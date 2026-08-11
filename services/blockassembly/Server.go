@@ -292,7 +292,7 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 		// still gives ~15+ log lines across the 35-minute incident on record
 		// (see dequeueDuringBlockMovement's docstring) without flooding logs.
 		const dequeueStallWarnRepeat = 2 * time.Minute
-		// dequeueStallThreshold is the hard-coded 30s bound below which a
+		// dequeueStallThreshold is the hard-coded 30s bound beyond which a
 		// non-empty queue with no dequeue activity is unambiguously wrong in
 		// every deployment - see issue #1429. Deliberately not a setting:
 		// nobody can yet justify a different number, and during CATCHINGBLOCKS

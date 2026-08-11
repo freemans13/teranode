@@ -4914,7 +4914,7 @@ func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwi
 	//
 	//  1. Time: validFromMillis = clock.Now() at function entry (or
 	//     clock.Now() - DoubleSpendWindow when that filter is enabled).
-	//     The queue filter at queue.go:96 holds back any batch whose
+	//     The queue filter in LockFreeQueue.dequeueBatch holds back any batch whose
 	//     enqueue timestamp is >= this value, so we only drain batches
 	//     that existed before this moment. Batches arriving during the
 	//     drain stay queued and roll forward to the next state-transition

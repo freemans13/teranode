@@ -102,8 +102,8 @@ func TestLastDequeueTime_ReseededAtStart(t *testing.T) {
 //
 // This is a genuine stall of the real select loop, not a faked clock or a
 // direct field write: the loop is blocked exactly the way a slow reorg,
-// move-forward-block, reset, or get* handler would block it (see
-// SubtreeProcessor.go ~954-973 - the default: dequeue branch only runs when
+// move-forward-block, reset, or get* handler would block it (the
+// default: branch of SubtreeProcessor.Start's select loop only runs when
 // no other case is ready), because sending into the unbuffered lengthCh
 // response channel without reading it holds the loop inside that case's
 // body until the test reads the response.
