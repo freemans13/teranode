@@ -41,15 +41,21 @@ const (
 
 // CatchupContext holds all the state needed during a catchup operation
 type CatchupContext struct {
-	blockUpTo               *model.Block
-	baseURL                 string
-	peerID                  string
-	startTime               time.Time
-	commonAncestorHash      *chainhash.Hash
-	commonAncestorMeta      *model.BlockHeaderMeta
-	commonAncestorIndex     int // Index of common ancestor in peer headers
-	forkDepth               uint32
-	currentHeight           uint32
+	blockUpTo           *model.Block
+	baseURL             string
+	peerID              string
+	startTime           time.Time
+	commonAncestorHash  *chainhash.Hash
+	commonAncestorMeta  *model.BlockHeaderMeta
+	commonAncestorIndex int // Index of common ancestor in peer headers
+	forkDepth           uint32
+	currentHeight       uint32
+	// bestBlockMeta is the accepted chain tip read once by findCommonAncestor and reused by
+	// every later step, so they all reason about the same tip. Reading it a second time would
+	// let the tip move in between: the ancestor is chosen against this height, so a tip that
+	// decreased would make the ancestor exceed it and trip the invariant
+	// checkSecretMiningFromCommonAncestor asserts — charging a peer for our own local reorg.
+	bestBlockMeta           *model.BlockHeaderMeta
 	blockHeaders            []*model.BlockHeader
 	headersFetchResult      *catchup.Result
 	useQuickValidation      bool   // Whether to use quick validation for checkpointed blocks
@@ -654,6 +660,9 @@ func (u *Server) findCommonAncestor(ctx context.Context, catchupCtx *CatchupCont
 	// the secret-mining check, which measures from the real tip, so an honest peer offering a
 	// shallow fork could be accused of withholding a chain. Nothing here needs the ancestor's
 	// UTXOs to be present — catchup validates forward and never unspends or rewinds.
+	//
+	// This is the only place the tip is read. It is stashed on the context and handed to the
+	// later steps rather than re-read, so the whole catchup measures against one fixed tip.
 	_, bestMeta, err := u.blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
 		// Our own RPC failed. ServiceError so the caller retries without charging the peer for
@@ -663,6 +672,7 @@ func (u *Server) findCommonAncestor(ctx context.Context, catchupCtx *CatchupCont
 
 	currentHeight := bestMeta.Height
 	catchupCtx.currentHeight = currentHeight
+	catchupCtx.bestBlockMeta = bestMeta
 
 	// Walk through peer's headers (oldest to newest) to find the highest common ancestor
 	commonAncestorIndex := -1
@@ -785,7 +795,7 @@ func (u *Server) checkSecretMining(ctx context.Context, catchupCtx *CatchupConte
 		}
 	}
 
-	return u.checkSecretMiningFromCommonAncestor(ctx, catchupCtx.blockUpTo, catchupCtx.peerID, catchupCtx.baseURL, catchupCtx.commonAncestorHash, catchupCtx.commonAncestorMeta, offeredHeaders)
+	return u.checkSecretMiningFromCommonAncestor(ctx, catchupCtx.blockUpTo, catchupCtx.peerID, catchupCtx.baseURL, catchupCtx.commonAncestorHash, catchupCtx.commonAncestorMeta, catchupCtx.bestBlockMeta, offeredHeaders)
 }
 
 // filterHeaders filters headers to only those after the common ancestor that we don't have.
@@ -1483,25 +1493,29 @@ func getLowestCheckpointHeight(checkpoints []chaincfg.Checkpoint) uint32 {
 //   - baseURL: Peer URL for metrics
 //   - commonAncestorHash: Hash of the common ancestor
 //   - commonAncestorMeta: Metadata of the common ancestor
+//   - bestMeta: The accepted chain tip findCommonAncestor measured the ancestor against,
+//     supplying both the height for the depth trigger and the chainwork for the work gate
 //   - offeredHeaders: Peer's headers after the common ancestor (the candidate chain)
 //
 // Returns:
 //   - error: If secret mining is detected, or the deep fork cannot be safely followed
-func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockUpTo *model.Block, peerID, baseURL string, commonAncestorHash *chainhash.Hash, commonAncestorMeta *model.BlockHeaderMeta, offeredHeaders []*model.BlockHeader) error {
-	// Read the local best chain tip once, from the same source used for the work comparison
-	// below, so the depth trigger and the work gate reason about the same tip (they can
-	// momentarily disagree during catchup). If it can't be read we cannot evaluate the fork:
-	// abort this catchup without penalising the peer — uncertainty must not be treated as malice.
-	_, bestMeta, err := u.blockchainClient.GetBestBlockHeader(ctx)
-	if err != nil {
-		u.logger.Warnf("[catchup][%s] cannot read best block header for secret-mining check from peer %s: %v - aborting without flagging malicious", blockUpTo.Hash().String(), baseURL, err)
-		return errors.NewProcessingError("[catchup][%s] unable to read best block header for secret-mining check", blockUpTo.Hash().String(), err)
+func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockUpTo *model.Block, peerID, baseURL string, commonAncestorHash *chainhash.Hash, commonAncestorMeta *model.BlockHeaderMeta, bestMeta *model.BlockHeaderMeta, offeredHeaders []*model.BlockHeader) error {
+	// The tip arrives from findCommonAncestor rather than being read again here, so the depth
+	// trigger, the work gate and the ancestor selection all reason about one fixed tip. Re-reading
+	// let them disagree: the ancestor is selected against a tip that may since have moved, and a
+	// decrease would make the ancestor exceed it and trip the invariant below — a local reorg
+	// charged to the peer. A missing tip means the caller skipped that step, which is our fault,
+	// not the peer's: abort without penalising it.
+	if bestMeta == nil {
+		u.logger.Warnf("[catchup][%s] no best block header for secret-mining check from peer %s - aborting without flagging malicious", blockUpTo.Hash().String(), baseURL)
+		return errors.NewServiceError("[catchup][%s] no best block header available for secret-mining check", blockUpTo.Hash().String())
 	}
 
 	currentHeight := bestMeta.Height
 
-	// Common ancestor should always be at or below current height due to findCommonAncestor
-	// validation. If not, we cannot reason about the fork - abort without penalising the peer.
+	// findCommonAncestor rejects any candidate above this same tip, so this cannot trip while
+	// both steps share one read — it is kept as a guard on that arrangement, and on the uint32
+	// subtraction below. If it ever does trip we cannot reason about the fork, so abort.
 	if commonAncestorMeta.Height > currentHeight {
 		return errors.NewProcessingError("[catchup][%s] common ancestor height %d is ahead of current height %d - this should not happen", blockUpTo.Hash().String(), commonAncestorMeta.Height, currentHeight)
 	}
