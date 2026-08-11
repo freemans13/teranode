@@ -1,6 +1,10 @@
 package utxo
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/bsv-blockchain/teranode/errors"
+)
 
 // BlockStateHolder keeps the chain-tip pair — block height and median block
 // time — behind a single atomic pointer, so a GetBlockState reader receives a
@@ -65,4 +69,77 @@ func (h *BlockStateHolder) SetMedianTime(medianTime uint32) {
 			return
 		}
 	}
+}
+
+// BlockStateFields supplies the Store interface's six chain-tip methods —
+// SetBlockHeight, GetBlockHeight, SetMedianBlockTime, GetMedianBlockTime,
+// SetBlockState and GetBlockState — to any store that embeds it, over a single
+// BlockStateHolder.
+//
+// Sharing one implementation is what makes the snapshot guarantee hold across
+// stores rather than per store. Each store used to carry its own copy of these
+// bodies beside a second, independent height atomic, which meant the height a
+// store reported through GetBlockHeight and the height inside the snapshot it
+// returned from GetBlockState were different pieces of memory: two readers, or
+// one reader making two calls, could see them disagree even under the
+// single-writer discipline production relies on. Here both come from the same
+// holder, so they cannot.
+//
+// A store that must mirror the height somewhere else — aerospike pushes it into
+// its external blob store — declares its own SetBlockHeight and SetBlockState
+// and delegates to the embedded methods for the state change itself. Stores
+// also wrap the setters where they want a debug line; the embedded type holds
+// no logger.
+type BlockStateFields struct {
+	blockState BlockStateHolder
+}
+
+// SetBlockHeight publishes a new chain-tip height, carrying the current median
+// time forward. Height zero is rejected: it cannot be told apart from a store
+// that has never been written, so accepting it would let a caller silently
+// reset the tip.
+func (f *BlockStateFields) SetBlockHeight(height uint32) error {
+	if height == 0 {
+		return errors.NewInvalidArgumentError("block height cannot be zero")
+	}
+
+	f.blockState.SetHeight(height)
+
+	return nil
+}
+
+// GetBlockHeight returns the height of the current snapshot.
+func (f *BlockStateFields) GetBlockHeight() uint32 {
+	return f.blockState.Load().Height
+}
+
+// SetMedianBlockTime publishes a new median block time, carrying the current
+// height forward. Zero is legitimate here — it is the "not yet known" value.
+func (f *BlockStateFields) SetMedianBlockTime(medianTime uint32) error {
+	f.blockState.SetMedianTime(medianTime)
+
+	return nil
+}
+
+// GetMedianBlockTime returns the median block time of the current snapshot.
+func (f *BlockStateFields) GetMedianBlockTime() uint32 {
+	return f.blockState.Load().MedianTime
+}
+
+// SetBlockState publishes both chain-tip values as one snapshot; see
+// Store.SetBlockState for why callers holding both should use this rather than
+// the two single-field setters. Height zero is rejected, as in SetBlockHeight.
+func (f *BlockStateFields) SetBlockState(height, medianTime uint32) error {
+	if height == 0 {
+		return errors.NewInvalidArgumentError("block height cannot be zero")
+	}
+
+	f.blockState.SetPair(height, medianTime)
+
+	return nil
+}
+
+// GetBlockState returns both chain-tip values from a single atomic load.
+func (f *BlockStateFields) GetBlockState() BlockState {
+	return f.blockState.Load()
 }
