@@ -438,9 +438,10 @@ func TestCatchup_SybilAttack(t *testing.T) {
 		)
 
 		// Mock validation for honest chain headers (excluding common ancestor which is
-		// already mocked as existing). Their heights sit above our UTXO height (1000),
-		// so the common-ancestor walk stops at bestBlockHeader instead of treating
-		// unprocessed honest blocks as potential ancestors.
+		// already mocked as existing). Their heights sit above our own chain tip (1000,
+		// the height GetBestBlockHeader is mocked with above), so the common-ancestor
+		// walk stops at bestBlockHeader instead of treating blocks we hold but have not
+		// adopted as potential ancestors.
 		for i := 1; i < len(mainnetHeaders); i++ {
 			header := mainnetHeaders[i]
 			mockBlockchainClient.On("GetBlockExists", mock.Anything, header.Hash()).
