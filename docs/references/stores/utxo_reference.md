@@ -256,6 +256,11 @@ type Store interface {
     MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error
 
     // SetBlockHeight updates the current block height in the store.
+    //
+    // height must be non-zero: implementations return an ErrInvalidArgument
+    // error for zero rather than publishing a height that cannot be told
+    // apart from a store that was never written. SetBlockState states the
+    // same precondition and the shared suite pins it for every store.
     SetBlockHeight(height uint32) error
 
     // GetBlockHeight returns the current block height from the store.
