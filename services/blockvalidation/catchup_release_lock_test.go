@@ -454,12 +454,20 @@ func TestReleaseCatchupLock_DrainChargesPrimaryEvenOnMixedCycle(t *testing.T) {
 // genuinely LOCAL failure (get_blocks.go's "Local error fetching subtree ...
 // not retrying with other peers", re-wrapped by fetchSubtreeDataForBlock).
 // releaseCatchupLock's switch has no specific case for generic ErrServiceError
-// (only the narrower ErrServiceUnavailable), so this falls to the
-// unknown_error default with isPeerError left true — and Server.go's
-// ErrServiceError branch returns early WITHOUT ever calling
+// (only the narrower ErrServiceUnavailable). This particular fixture wraps a
+// StorageError — the shape IsLocalError admits most often in production, since
+// get_blocks.go's own store reads and writes are all ErrStorageError-coded — so
+// since issue 1439 it lands in the local_storage_fault case rather than the
+// unknown_error default, and isPeerError is false rather than true. Either way
+// nothing outside the drain charges the primary: reportPeerErr is not set, and
+// Server.go's ErrServiceError branch returns early WITHOUT ever calling
 // reportCatchupFailureForError. The drain loop is therefore the ONLY place
 // this cycle's genuine primary failure can be recorded; it must not be
 // skipped down to zero.
+//
+// (The unknown_error + isPeerError=true combination this test originally
+// exercised is still covered by DrainChargesPrimaryEvenOnMixedCycle above,
+// whose terminal error carries no storage link.)
 func TestReleaseCatchupLock_LocalTerminalErrorStillChargesFailedPrimary(t *testing.T) {
 	server, _, _, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
