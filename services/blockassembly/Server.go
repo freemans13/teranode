@@ -295,41 +295,53 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 				ba.logger.Infof("Stopping block assembler metrics updater")
 				return
 			case <-time.After(5 * time.Second):
-				prometheusBlockAssemblerTransactions.Set(float64(ba.blockAssembler.TxCount()))
-
-				queueLength := ba.blockAssembler.QueueLength()
-				prometheusBlockAssemblerQueuedTransactions.Set(float64(queueLength))
-
-				prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
-
-				staleness := time.Since(ba.blockAssembler.LastDequeueTime())
-				prometheusBlockAssemblerDequeueStalenessSeconds.Set(staleness.Seconds())
-
-				var (
-					stallEvent dequeueStallEvent
-					stalledFor time.Duration
-				)
-
-				stallState, stallEvent, stalledFor = observeDequeueStall(stallState, time.Now(), queueLength, staleness)
-
-				switch stallEvent {
-				case dequeueStallBegan:
-					ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue), whether the dequeue branch itself is blocked storing or announcing a subtree, or whether the consumer has not started yet (gRPC ingest is up before BlockAssembler.Start reaches it, and the unmined reload runs in between)", queueLength, staleness.Round(time.Second))
-				case dequeueStallContinues:
-					// The queue length is reported second, and may well be
-					// zero: a reorg or move-forward-block handler drains the
-					// queue from inside the branch that is blocking the
-					// consumer, so an empty queue here does not mean recovery.
-					ba.logger.Warnf("block assembler intake queue still stalled: consumer has not dequeued for %s, %d transactions queued", staleness.Round(time.Second), queueLength)
-				case dequeueStallEnded:
-					ba.logger.Infof("block assembler intake queue consumer recovered, was stalled for %s", stalledFor.Round(time.Second))
-				case dequeueStallNone:
-				}
+				stallState = ba.sampleBlockAssemblerMetrics(stallState, time.Now())
 			}
 		}
 	}()
 
 	return nil
+}
+
+// sampleBlockAssemblerMetrics performs one tick of the metrics updater:
+// publishes the block assembler gauges, folds the intake-queue observation into
+// the stall state, and logs whatever that observation calls for. It returns the
+// next stall state.
+//
+// It is a method rather than inline in the updater goroutine so the tick can be
+// driven directly in tests. The goroutine waits on a hard-coded
+// time.After(5 * time.Second), so anything left inline is only reachable by a
+// test willing to wait out real tick intervals - which is why the reduced
+// repeat cadence and the recovery arithmetic went unexercised for so long.
+// Taking now as a parameter keeps the whole tick deterministic.
+func (ba *BlockAssembly) sampleBlockAssemblerMetrics(stallState dequeueStallState, now time.Time) dequeueStallState {
+	prometheusBlockAssemblerTransactions.Set(float64(ba.blockAssembler.TxCount()))
+
+	queueLength := ba.blockAssembler.QueueLength()
+	prometheusBlockAssemblerQueuedTransactions.Set(float64(queueLength))
+
+	prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
+
+	staleness := now.Sub(ba.blockAssembler.LastDequeueTime())
+	prometheusBlockAssemblerDequeueStalenessSeconds.Set(staleness.Seconds())
+
+	stallState, stallEvent, stalledFor := observeDequeueStall(stallState, now, queueLength, staleness)
+
+	switch stallEvent {
+	case dequeueStallBegan:
+		ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue), whether the dequeue branch itself is blocked storing or announcing a subtree, or whether the consumer has not started yet (gRPC ingest is up before BlockAssembler.Start reaches it, and the unmined reload runs in between)", queueLength, staleness.Round(time.Second))
+	case dequeueStallContinues:
+		// The queue length is reported second, and may well be zero: a reorg
+		// or move-forward-block handler drains the queue from inside the
+		// branch that is blocking the consumer, so an empty queue here does
+		// not mean recovery.
+		ba.logger.Warnf("block assembler intake queue still stalled: consumer has not dequeued for %s, %d transactions queued", staleness.Round(time.Second), queueLength)
+	case dequeueStallEnded:
+		ba.logger.Infof("block assembler intake queue consumer recovered, was stalled for %s", stalledFor.Round(time.Second))
+	case dequeueStallNone:
+	}
+
+	return stallState
 }
 
 // GetBlockAssembler returns the BlockAssembler instance.
