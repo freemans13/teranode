@@ -74,10 +74,12 @@ Three settings bound that work:
   the tip the startup scan looks, and it is the largest gap recovery will repair on
   its own. The two are deliberately the same number: there is no value in detecting a
   divergence deeper than the node is willing to fix automatically. A clean boot costs
-  two store reads per height in the window; the scan ends early only when a divergence
-  cannot be repaired, since a refusal is structural and would repeat identically at
-  every lower height. Tuning this down to limit repair scope also shrinks detection
-  coverage by the same amount.
+  one blockchain-client lookup and one UTXO store read per height in the window, issued
+  one after another — and the first of those is a call to the blockchain service, not a
+  local read, so the startup cost tracks the latency to that service rather than local
+  disk. The scan ends early only when a divergence cannot be repaired, since a refusal
+  is structural and would repeat identically at every lower height. Tuning this down to
+  limit repair scope also shrinks detection coverage by the same amount.
   A second, non-configurable bound applies underneath it — see the safety floor below —
   so with the default settings the effective reach is the coinbase-maturity window.
 - `blockassembly_coinbaseRecoveryConsecutiveGood` guards against under-repair. The

@@ -316,7 +316,7 @@ func TestStartupCoinbaseDivergenceCheck_Repairs(t *testing.T) {
 	items.blockAssembler.subtreeProcessor.Start(ctx)
 	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 3)
 	require.NoError(t, err)
@@ -511,7 +511,7 @@ func TestStartupCoinbaseDivergenceCheck_SkippedWhenBlockAssemblyBelowFloor(t *te
 
 	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.Equal(t, float64(0),
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
@@ -772,9 +772,7 @@ func TestStartupCoinbaseDivergenceCheck_CancellationIsNotReportedAsIntervention(
 
 	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
 	abortedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("aborted"))
-
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx),
-		"the startup hook stays non-fatal even when the context is cancelled under it")
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.Equal(t, float64(1),
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("aborted"))-abortedBefore)
@@ -842,7 +840,7 @@ func TestStartupCoinbaseDivergenceCheck_HoleBelowPresentTip(t *testing.T) {
 	items.blockAssembler.subtreeProcessor.Start(ctx)
 	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	for h := uint32(1); h <= 6; h++ {
 		present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, h)
@@ -896,7 +894,7 @@ func TestStartupCoinbaseDivergenceCheck_RepairsSecondClusterBelowTheFirst(t *tes
 
 	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	for h := uint32(1); h <= chainLen; h++ {
 		present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, h)
@@ -939,7 +937,7 @@ func TestStartupCoinbaseDivergenceCheck_StopsScanningAfterARefusal(t *testing.T)
 
 	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.Equal(t, float64(1),
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))-escalatedBefore,
@@ -981,7 +979,7 @@ func TestStartupCoinbaseDivergenceCheck_SkippedWhenTipIsNotCanonical(t *testing.
 
 	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.Equal(t, float64(0),
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
@@ -993,7 +991,7 @@ func TestStartupCoinbaseDivergenceCheck_SkippedWhenTipIsNotCanonical(t *testing.
 	items.blockAssembler.subtreeProcessor.Start(ctx)
 	t.Cleanup(func() { items.blockAssembler.subtreeProcessor.Stop(context.Background()) })
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.Greater(t,
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
@@ -1211,7 +1209,7 @@ func TestStartupCoinbaseDivergenceCheck_ProbeRetriesThroughATransientBlip(t *tes
 		failuresLeft: 1,
 	}
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	present, _, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 3)
 	require.NoError(t, err)
@@ -1263,9 +1261,7 @@ func TestStartupCoinbaseDivergenceCheck_NotFoundBelowTheChainTipIsTreatedAsAFaul
 
 	logger := newCapturingLogger()
 	items.blockAssembler.logger = logger
-
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx),
-		"the startup hook stays non-fatal however the probe fails")
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.True(t, logger.sawError("startup divergence check abandoned at height 4"),
 		"an uncorroborated not-found must report the lost coverage rather than skipping the height")
@@ -1323,7 +1319,7 @@ func TestStartupCoinbaseDivergenceCheck_TipAboveCanonicalChainHeight(t *testing.
 	escalatedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("escalated"))
 
 	require.NotPanics(t, func() {
-		require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+		items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 	})
 
 	require.Equal(t, float64(0),
@@ -1363,7 +1359,7 @@ func TestStartupCoinbaseDivergenceCheck_HoleBeyondWindowNotScanned(t *testing.T)
 
 	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.Equal(t, float64(0),
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
@@ -1420,9 +1416,7 @@ func TestStartupCoinbaseDivergenceCheck_ProbeBudgetExhaustionStopsTheScan(t *tes
 	}
 
 	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
-
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx),
-		"the startup hook stays non-fatal when the store outlasts the probe budget")
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.True(t, logger.sawError("startup divergence check abandoned at height 5"),
 		"exhausting the probe budget must abandon the scan and say so")
@@ -1474,7 +1468,7 @@ func TestStartupCoinbaseDivergenceCheck_RepairsWhenTheStoreSaysErrNotFound(t *te
 	detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
 	repairedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("repaired"))
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.Equal(t, float64(1),
 		testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
@@ -1522,7 +1516,7 @@ func TestStartupCoinbaseDivergenceCheck_ShutdownDuringAProbeIsNotReportedAsLostD
 		cancel:         cancel,
 	}
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.False(t, logger.sawError("no coinbase-divergence detection will run until the next restart"),
 		"a node that is shutting down has not lost its detection coverage")
@@ -1560,7 +1554,7 @@ func TestStartupCoinbaseDivergenceCheck_ShutdownDuringTheTipCheckIsNotBlamedOnTh
 		cancel:         cancel,
 	}
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.False(t, logger.sawWarn("cannot resolve the canonical block at block assembly's tip height"),
 		"a shutdown on the tip lookup must not be diagnosed as the blockchain client failing")
@@ -1659,7 +1653,7 @@ func TestCoinbaseRecoverySettingLowerBoundClamps(t *testing.T) {
 
 		detectedBefore := testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))
 
-		require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+		items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 		require.Equal(t, float64(1),
 			testutil.ToFloat64(prometheusBlockAssemblyCoinbaseDivergence.WithLabelValues("detected"))-detectedBefore,
@@ -1742,7 +1736,7 @@ func TestStartupCoinbaseDivergenceCheck_GRPCStyleNotFoundIsNotTrustedAsAbsence(t
 	logger := newCapturingLogger()
 	items.blockAssembler.logger = logger
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	// The fault is diagnosed as the client failing to answer, not as the chain
 	// stopping short. The second reading is the misdiagnosis: it tells an
@@ -2000,7 +1994,7 @@ func TestStartupCoinbaseDivergenceCheck_ContextCodeShutdownIsNotReportedAsLostDe
 		cancel:              cancel,
 	}
 
-	require.NoError(t, items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx))
+	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
 	require.False(t, logger.sawError("no coinbase-divergence detection will run until the next restart"),
 		"a node that is shutting down has not lost its detection coverage")

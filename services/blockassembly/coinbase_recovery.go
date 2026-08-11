@@ -312,6 +312,13 @@ func isUnscopableCoinbaseGap(err error) bool {
 func (b *BlockAssembler) coinbaseRepairFloor(tipHeight uint32) uint32 {
 	if b.settings == nil || b.settings.ChainCfgParams == nil {
 		// Nothing to measure maturity with, so nothing can be proven immature.
+		//
+		// Only the ChainCfgParams half of this is reachable today: both callers
+		// read b.settings.BlockAssembly before they get here, so a nil settings
+		// would already have panicked further up. It is kept because dropping it
+		// would move the nil dereference into the line below rather than remove
+		// it -- but it should not be read as evidence that a nil settings is
+		// handled, because upstream of here it is not.
 		return refuseEveryHeight(tipHeight)
 	}
 
@@ -679,8 +686,15 @@ attempts:
 // -- there is no point detecting a divergence deeper than recovery will
 // auto-repair. The second is a correctness bound: below the maturity floor a
 // missing coinbase may simply have been spent and pruned, so probing there
-// would report healthy blocks as diverged. Cost is two store reads per height
-// on a clean boot.
+// would report healthy blocks as diverged.
+//
+// A clean boot costs one blockchain-client lookup and one UTXO store read per
+// height in the window, issued serially. Only the second of those is local: the
+// first is GetBlockByHeight, which in a deployed node is a gRPC call to the
+// blockchain service, so at the shipped defaults this adds on the order of a
+// hundred sequential round-trips to startup. That is small on a healthy
+// cluster, but it scales with the latency to another service rather than with
+// local disk, which is worth knowing before this is blamed on the store.
 //
 // This is a bounded window, not whole-chain coverage. A hole further below the
 // tip than the window stays invisible here; finding that cheaply is the job of
@@ -691,26 +705,34 @@ attempts:
 // the whole boot's detection, while a store that flaps for the entire window
 // still cannot inflate boot time without bound.
 //
-// # Why it never fails Start
+// # Why it cannot fail Start
 //
-// This always returns nil. A recovery give-up is deliberately non-fatal:
-// recoverCoinbaseDivergence has already logged the loud operator-facing alert
-// and incremented the "escalated" metric internally before returning its
-// error, so there is nothing left to surface here except the fact that
-// startup could not repair it. Returning an error here would fail Start and
-// crash-loop the process, which does not help an operator -- a running node
-// they can inspect is strictly better than one stuck restarting. The trade-off
-// is explicit: the node boots and keeps building on a tip known to be
-// diverged, so the escalation log is a call to action, not a description of a
-// node that has stopped itself.
-func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) error {
+// It returns nothing, which is the whole contract rather than an omission. A
+// recovery give-up is deliberately non-fatal: recoverCoinbaseDivergence has
+// already logged the loud operator-facing alert and incremented the "escalated"
+// metric internally before returning its error, so there is nothing left to
+// surface here except the fact that startup could not repair it. Returning an
+// error would fail Start and crash-loop the process, which does not help an
+// operator -- a running node they can inspect is strictly better than one stuck
+// restarting. The trade-off is explicit: the node boots and keeps building on a
+// tip known to be diverged, so the escalation log is a call to action, not a
+// description of a node that has stopped itself.
+//
+// Having no return value is what makes that contract enforceable. While this
+// returned an error it was statically always nil, so the callers' handling of
+// it -- Start discarding it, the tests requiring it to be nil -- asserted
+// nothing at all, and a future edit that started returning a real error would
+// have silently gained the power to abort the boot. Everything worth observing
+// here is already on the logger and the coinbase-divergence metric, which is
+// what the tests read.
+func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) {
 	if b.blockchainClient == nil || b.utxoStore == nil {
-		return nil // nothing to probe against; matches the guards on the other optional-store paths in Start
+		return // nothing to probe against; matches the guards on the other optional-store paths in Start
 	}
 
 	header, height := b.CurrentBlock()
 	if header == nil || height == 0 {
-		return nil // genesis / unset — nothing to check
+		return // genesis / unset — nothing to check
 	}
 
 	// Only judge divergence when block assembly is actually on the canonical
@@ -745,7 +767,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 		// canonical block could not be resolved would point an operator at the
 		// blockchain client for something that is not a fault at all.
 		b.logger.Infof("[coinbaseRecovery] startup divergence check stopped before scanning at tip height %d: shutting down", height)
-		return nil
+		return
 
 	case tipErr != nil && canonicalBlockAbsent(tipErr):
 		// The canonical chain simply does not reach this height -- block
@@ -753,15 +775,15 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 		// not read like one. The branch below would blame the blockchain client
 		// for a question it answered correctly.
 		b.logger.Infof("[coinbaseRecovery] startup divergence check skipped: block assembly tip height %d is above the canonical chain height, so there is nothing to check there", height)
-		return nil
+		return
 
 	case tipErr != nil:
 		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: cannot resolve the canonical block at block assembly's tip height %d: %v", height, tipErr)
-		return nil
+		return
 
 	case tipBlk.Header == nil || !tipBlk.Header.Hash().IsEqual(header.Hash()):
 		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: block assembly tip %s at height %d is not the canonical block there, so the normal reconcile owns this", header.Hash().String(), height)
-		return nil
+		return
 	}
 
 	window := b.settings.BlockAssembly.CoinbaseRecoveryMaxGapBlocks
@@ -783,7 +805,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 		// window is already prunable, so no height here can be probed safely.
 		// Say so rather than silently checking nothing.
 		b.logger.Warnf("[coinbaseRecovery] startup divergence check skipped: block assembly tip %d is below the maturity floor %d, so no height in the window is provably unpruned", height, scanFloor)
-		return nil
+		return
 	}
 
 	for h, scanned := height, 0; h >= scanFloor && scanned < window; h, scanned = h-1, scanned+1 {
@@ -806,7 +828,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 				// it is. Same reasoning as the recovery call site below.
 				b.logger.Infof("[coinbaseRecovery] startup divergence check stopped at height %d: shutting down", h)
 
-				return nil
+				return
 			}
 
 			// Non-fatal: log and continue booting; see the function-level
@@ -820,7 +842,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 			// until the next restart. That lost coverage should be visible.
 			b.logger.Errorf("[coinbaseRecovery] startup divergence check abandoned at height %d (tip %d): %v; no coinbase-divergence detection will run until the next restart", h, height, err)
 
-			return nil
+			return
 		}
 
 		if present {
@@ -834,7 +856,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 				// Shutdown, not a divergence we failed to fix.
 				// recoverCoinbaseDivergence has already recorded the "aborted"
 				// outcome and said so; do not restate it as a call to action.
-				return nil
+				return
 			}
 
 			// Non-fatal: see the function-level comment above. recoverCoinbaseDivergence
@@ -848,7 +870,7 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 			// but repeat alarms.
 			b.logger.Errorf("[coinbaseRecovery] startup recovery failed at height %d (tip %d): %v; manual intervention required (run resetblockassembly)", h, height, err)
 
-			return nil
+			return
 		}
 
 		// Keep scanning below the range just repaired, inside the same window
@@ -865,6 +887,4 @@ func (b *BlockAssembler) checkCoinbaseDivergenceOnStart(ctx context.Context) err
 		// iteration, so the existing window and floor bounds still terminate
 		// the loop.
 	}
-
-	return nil
 }

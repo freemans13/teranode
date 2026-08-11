@@ -1099,13 +1099,10 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	// advancing. Must run after subtreeProcessor.Start, since a repair uses
 	// subtreeProcessor.ReconcileCoinbases, and before startChannelListeners,
 	// so no new block/subtree notifications are processed against a diverged
-	// tip. The return value is always nil: an unrecoverable divergence is
-	// logged loudly (and surfaced via the "escalated" metric) rather than
-	// failing Start, since crash-looping the process would not help an
-	// operator. Discarded explicitly (rather than changing the signature)
-	// so the direct-call test (checkCoinbaseDivergenceOnStart) keeps its
-	// require.NoError(...) call shape.
-	_ = b.checkCoinbaseDivergenceOnStart(ctx)
+	// tip. It returns nothing by design: an unrecoverable divergence is logged
+	// loudly (and surfaced via the "escalated" metric) rather than failing
+	// Start, since crash-looping the process would not help an operator.
+	b.checkCoinbaseDivergenceOnStart(ctx)
 
 	if err = b.startChannelListeners(ctx); err != nil {
 		return errors.NewProcessingError("[BlockAssembler] failed to start channel listeners: %v", err)
