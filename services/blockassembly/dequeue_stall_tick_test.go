@@ -48,13 +48,13 @@ func TestSampleBlockAssemblerMetrics_DrivesTheStallSignal(t *testing.T) {
 	// when the consumer resumes.
 	lastDequeue := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	stp.On("LastDequeueTime").Return(lastDequeue).Times(3)
+	stp.On("LastDequeueTime").Return(lastDequeue).Times(4)
 	stp.On("LastDequeueTime").Return(lastDequeue.Add(7 * time.Minute)).Once()
 
 	// Deep queue for the first two ticks; the blocking handler drains it from
 	// inside its own branch before the third.
 	stp.On("QueueLength").Return(int64(10_000)).Twice()
-	stp.On("QueueLength").Return(int64(0)).Twice()
+	stp.On("QueueLength").Return(int64(0)).Times(3)
 
 	var state dequeueStallState
 
@@ -75,7 +75,16 @@ func TestSampleBlockAssemblerMetrics_DrivesTheStallSignal(t *testing.T) {
 	require.True(t, state.stalled, "an empty queue must not be mistaken for a recovered consumer")
 	require.Equal(t, lastDequeue, state.stalledSince, "the incident must keep its original start instant")
 
-	// Tick 4, the consumer resumes: it stamps on every loop iteration, so
+	// Tick 4, once the repeat cadence has elapsed since the rising edge: the
+	// warning repeats, still on an empty queue, because the consumer is still
+	// parked. A stall that goes quiet after one line would be worse than no
+	// signal - it reads as resolved.
+	state = ba.sampleBlockAssemblerMetrics(state, lastDequeue.Add(35*time.Second+dequeueStallWarnRepeat))
+	require.True(t, state.stalled)
+	require.Equal(t, lastDequeue.Add(35*time.Second+dequeueStallWarnRepeat), state.lastWarn,
+		"the repeat must re-arm the cadence, so warnings keep coming at a fixed rate rather than once")
+
+	// Tick 5, the consumer resumes: it stamps on every loop iteration, so
 	// staleness collapses even though the queue is still empty.
 	state = ba.sampleBlockAssemblerMetrics(state, lastDequeue.Add(7*time.Minute))
 	require.False(t, state.stalled, "a fresh dequeue timestamp is the only thing that ends a stall")
