@@ -40,6 +40,8 @@ func RunDaemon(progname, version, commit string) {
 		UTXOStore: tSettings.Debug.UTXOStore,
 	})
 
+	logger := ulogger.InitLogger(progname, tSettings)
+
 	readLimit := tSettings.Block.FileStoreReadConcurrency
 	writeLimit := tSettings.Block.FileStoreWriteConcurrency
 
@@ -49,33 +51,30 @@ func RunDaemon(progname, version, commit string) {
 	// channel variables and is not safe to call after file operations have started.
 	// See file.go for detailed documentation on the race condition risk.
 	//
-	// Respecting the system's open-file limit happens inside InitSemaphores, which
-	// reads it directly. This used to be attempted here by shelling out to
-	// "ulimit -u" and scaling the configured concurrency up to three quarters of
-	// the result — but that is the max-user-processes limit, not the open-file
-	// limit, so the file store was sized from an unrelated number, and scaling UP
-	// is the opposite of what the setting documents ("may reduce configured
-	// concurrency").
-	if err := file.InitSemaphores(readLimit, writeLimit, tSettings.Block.FileStoreUseSystemLimits); err != nil {
+	// It runs after the logger exists so that a reduced concurrency reaches the
+	// operator's log rather than only stdout. Nothing between here and
+	// daemon.Start() opens a file store.
+	//
+	// Note for anyone tempted to reinstate a shell-out here: the previous version
+	// read "ulimit -u", which is the max-user-processes limit rather than the
+	// open-file limit, and scaled concurrency UP from it. The open-file limit is
+	// now read directly, in util/fdlimit.
+	applied, err := file.InitSemaphores(readLimit, writeLimit, tSettings.Block.FileStoreUseSystemLimits)
+	if err != nil {
 		panic(fmt.Sprintf("Failed to initialize file store semaphores: %v", err))
 	}
 
-	// Report the limits actually in force: they may have been clamped below the
-	// configured values to fit the operating system's open-file limit.
-	//
-	// A clamp means the HARD limit is the binding constraint, not the soft one:
-	// InitSemaphores has already raised the soft limit as far as the hard limit
-	// allows, so telling the operator to raise the soft limit alone would send
-	// them to change a number that is already at its ceiling.
-	appliedRead, appliedWrite, clamped := file.AppliedSemaphoreLimits()
-	if clamped {
-		fmt.Printf("File store semaphores clamped to the open-file limit: read=%d, write=%d (configured read=%d, write=%d) — raise the hard limit with ulimit -Hn or systemd LimitNOFILE to use the configured concurrency\n",
-			appliedRead, appliedWrite, readLimit, writeLimit)
+	if applied.Clamped {
+		// Deliberately a warning and not fatal. The semaphores are a ceiling on
+		// concurrent operations, not a reservation of descriptors, so the node runs
+		// correctly here — just with less file concurrency than was configured.
+		// Refusing to start would turn a bounded, already-handled condition into
+		// total unavailability from boot (issue 1431).
+		logger.Warnf("File store concurrency reduced to fit the open-file limit: read=%d, write=%d (configured read=%d, write=%d). Raise the hard limit (ulimit -Hn, systemd LimitNOFILE, or macOS kern.maxfilesperproc) to use the configured concurrency.",
+			applied.Read, applied.Write, readLimit, writeLimit)
 	} else {
-		fmt.Printf("File store semaphores initialized: read=%d, write=%d\n", appliedRead, appliedWrite)
+		logger.Infof("File store semaphores initialized: read=%d, write=%d", applied.Read, applied.Write)
 	}
-
-	logger := ulogger.InitLogger(progname, tSettings)
 
 	util.InitGRPCResolver(logger, tSettings.GRPCResolver)
 
