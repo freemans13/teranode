@@ -408,9 +408,9 @@ func (s *Store) sendStoreBatch(batch []*BatchStoreItem) {
 				}
 			}
 		} else {
-			// tx.Size() omits the extended per-input data; extendedTxSize adds it
+			// tx.Size() omits the extended per-input data; ExtendedTxSize adds it
 			// (matches len(tx.ExtendedBytes()) without serializing).
-			extendedSize = extendedTxSize(batch[idx].tx)
+			extendedSize = util.ExtendedTxSize(batch[idx].tx)
 		}
 
 		if extendedSize > MaxTxSizeInStoreInBytes {
@@ -765,13 +765,6 @@ func appendInputExtendedInto(arena *bt.Arena, in *bt.Input) []byte {
 	return buf
 }
 
-// extendedTxSize returns len(tx.ExtendedBytes()) without serializing the tx.
-// The arithmetic lives in util.ExtendedTxSize, shared with the subtree-data
-// canonical-encoding check, and is pinned against the real serialization there.
-func extendedTxSize(tx *bt.Tx) int {
-	return util.ExtendedTxSize(tx)
-}
-
 // GetBinsToStore prepares Aerospike bins for storage, handling transaction data
 // and UTXO organization.
 //
@@ -813,7 +806,7 @@ func (s *Store) GetBinsToStore(tx *bt.Tx, blockHeight uint32, blockIDs, blockHei
 		utxoHashes, err = utxo.GetUtxoHashes(tx, txHash)
 	} else {
 		size = tx.Size()
-		extendedSize = extendedTxSize(tx)
+		extendedSize = util.ExtendedTxSize(tx)
 		fee, utxoHashes, err = utxo.GetFeesAndUtxoHashes(context.Background(), tx, blockHeight)
 	}
 

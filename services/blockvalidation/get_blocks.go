@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -636,11 +635,11 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 
 	// loading the subtree data like this will validate the data as it is read
 	// compared to the transactions in the subtree
+	//
 	// Count what the parser consumes so the payload's canonical encoding can be
 	// checked below (issue 1421). This prewarm runs BEFORE block validation and
 	// stores the re-serialized form, so an unchecked non-minimal payload here is
-	// laundered to disk and every downstream check then sees only canonical
-	// bytes.
+	// laundered to disk ahead of every downstream check.
 	countingSubtreeData := util.NewCountingReader(subtreeDataBufferedReader)
 
 	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, countingSubtreeData)
@@ -700,15 +699,8 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 	}
 
 	// Peer-supplied bytes: reject a non-minimal CompactSize encoding rather than
-	// storing the canonicalised form (issue 1421). The coinbase is parsed but
-	// deliberately omitted from the serialization, so it is accounted for
-	// explicitly.
-	var omittedCoinbase *bt.Tx
-	if coinbaseAtZero && len(subtreeData.Txs) > 0 {
-		omittedCoinbase = subtreeData.Txs[0]
-	}
-
-	if err = util.CheckCanonicalSubtreeData(countingSubtreeData.BytesConsumed(), subtreeDataBytes, omittedCoinbase); err != nil {
+	// storing the canonicalised form (issue 1421).
+	if err = util.CheckCanonicalSubtreeData(countingSubtreeData.BytesConsumed(), subtreeDataBytes, util.OmittedCoinbaseTx(subtree, subtreeData)); err != nil {
 		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Peer %s (%s) provided non-canonical subtree data for %s", peerID, baseURL, subtreeHash.String(), err)
 	}
 

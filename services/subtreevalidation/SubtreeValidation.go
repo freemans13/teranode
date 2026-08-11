@@ -1395,7 +1395,7 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 							subtreeDataBytes, err := subtreeData.Serialize()
 							if err != nil {
 								u.logger.Errorf("[validateSubtree][%s] failed to serialize subtree data: %v", subtreeHash.String(), err)
-							} else if canonicalErr := util.CheckCanonicalSubtreeData(countingBody.BytesConsumed(), subtreeDataBytes, omittedCoinbaseTx(subtreeForData, subtreeData)); canonicalErr != nil {
+							} else if canonicalErr := util.CheckCanonicalSubtreeData(countingBody.BytesConsumed(), subtreeDataBytes, util.OmittedCoinbaseTx(subtreeForData, subtreeData)); canonicalErr != nil {
 								// Peer-supplied bytes: reject rather than storing the
 								// canonicalised form, which would discard the evidence
 								// and bless a subtree SV Node rejects at parse.

@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,7 +54,7 @@ func TestExtendedTxSizeMatchesExtendedBytes(t *testing.T) {
 	}
 	for _, c := range cases {
 		tx := makeTxForSize(t, c.nIn, c.nOut, c.prevScript)
-		require.Equal(t, len(tx.ExtendedBytes()), extendedTxSize(tx),
+		require.Equal(t, len(tx.ExtendedBytes()), util.ExtendedTxSize(tx),
 			"nIn=%d nOut=%d prevScript=%v", c.nIn, c.nOut, c.prevScript)
 	}
 }
@@ -74,7 +75,7 @@ func TestExtendedTxSize_LargePrevScript(t *testing.T) {
 	require.NoError(t, err)
 	tx.Outputs = append(tx.Outputs, &bt.Output{Satoshis: 1, LockingScript: script})
 
-	require.Equal(t, len(tx.ExtendedBytes()), extendedTxSize(tx))
+	require.Equal(t, len(tx.ExtendedBytes()), util.ExtendedTxSize(tx))
 }
 
 func TestExtendedTxSize_DecodedTxShape(t *testing.T) {
@@ -83,7 +84,7 @@ func TestExtendedTxSize_DecodedTxShape(t *testing.T) {
 	src := makeTxForSize(t, 3, 4, true)
 	decoded, err := bt.NewTxFromBytes(src.ExtendedBytes())
 	require.NoError(t, err)
-	require.Equal(t, len(decoded.ExtendedBytes()), extendedTxSize(decoded))
+	require.Equal(t, len(decoded.ExtendedBytes()), util.ExtendedTxSize(decoded))
 
 	// Coinbase-shaped tx: single input with 32 zero-byte prev txid (non-nil).
 	cb := bt.NewTx()
@@ -94,7 +95,7 @@ func TestExtendedTxSize_DecodedTxShape(t *testing.T) {
 	script, err := bscript.NewFromHexString("76a914000000000000000000000000000000000000000088ac")
 	require.NoError(t, err)
 	cb.Outputs = append(cb.Outputs, &bt.Output{Satoshis: 5000000000, LockingScript: script})
-	require.Equal(t, len(cb.ExtendedBytes()), extendedTxSize(cb))
+	require.Equal(t, len(cb.ExtendedBytes()), util.ExtendedTxSize(cb))
 }
 
 func TestAppendOutputInto_MatchesOutputBytes(t *testing.T) {
@@ -154,7 +155,7 @@ func TestAppendInputExtendedInto_NilPrevScript(t *testing.T) {
 
 func TestExtendedTxSize_NilPrevTxIDHash(t *testing.T) {
 	// An input with no previousTxIDHash set: go-bt's ExtendedBytes() omits the
-	// 32 txid bytes, but Input.Size() counts them. extendedTxSize must still
+	// 32 txid bytes, but Input.Size() counts them. util.ExtendedTxSize must still
 	// match len(ExtendedBytes()) — i.e. not rely on the hash being set.
 	tx := bt.NewTx()
 	in := &bt.Input{PreviousTxOutIndex: 0, PreviousTxSatoshis: 1000, SequenceNumber: 0xffffffff}
@@ -167,7 +168,7 @@ func TestExtendedTxSize_NilPrevTxIDHash(t *testing.T) {
 	tx.Inputs = append(tx.Inputs, in)
 	tx.Outputs = append(tx.Outputs, &bt.Output{Satoshis: 1, LockingScript: script})
 
-	require.Equal(t, len(tx.ExtendedBytes()), extendedTxSize(tx))
+	require.Equal(t, len(tx.ExtendedBytes()), util.ExtendedTxSize(tx))
 }
 
 func BenchmarkAppendOutputInto_Arena(b *testing.B) {
