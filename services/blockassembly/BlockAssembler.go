@@ -342,12 +342,21 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 	// node it returns early when hashes match.
 	b.triggerReconcile()
 
+	// NewBlockAssembler always sets this, but the package builds &BlockAssembler{}
+	// literals in a lot of tests, and time.NewTicker panics on a non-positive
+	// interval from inside the goroutine below, which takes the process down
+	// rather than failing a test.
+	heartbeatInterval := b.heartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = defaultHeartbeatInterval
+	}
+
 	// A liveness timeout at or below the idle tick cannot tell an idle loop from
 	// a wedged one, so it would restart a healthy node. Warn rather than clamp:
 	// the operator chose the value and silently overriding it would hide the
 	// mistake (issue 1447).
-	if stallTimeout := b.settings.BlockAssembly.LivenessStallTimeout; stallTimeout > 0 && stallTimeout <= 2*b.heartbeatInterval {
-		b.logger.Warnf("[BlockAssembler] blockassembly_livenessStallTimeout %s is not comfortably longer than the %s heartbeat interval: a healthy idle node may be reported as wedged and restarted", stallTimeout, b.heartbeatInterval)
+	if stallTimeout := b.settings.BlockAssembly.LivenessStallTimeout; stallTimeout > 0 && stallTimeout <= 2*heartbeatInterval {
+		b.logger.Warnf("[BlockAssembler] blockassembly_livenessStallTimeout %s is not comfortably longer than the %s heartbeat interval: a healthy idle node may be reported as wedged and restarted", stallTimeout, heartbeatInterval)
 	}
 
 	b.wg.Add(1)
@@ -361,7 +370,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 		// A node with no blocks is healthy — on mainnet the gap between blocks
 		// is routinely tens of minutes — but a deadlocked loop cannot service
 		// the tick either, which is the freeze the liveness probe must catch.
-		heartbeatTicker := time.NewTicker(b.heartbeatInterval)
+		heartbeatTicker := time.NewTicker(heartbeatInterval)
 		defer heartbeatTicker.Stop()
 
 		// First beat happens HERE, not at construction: everything before this
