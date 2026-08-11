@@ -27,7 +27,11 @@ func TestLivenessDoesNotRestartAnIdleNode(t *testing.T) {
 	// a loop that had stopped beating would be caught. Review caught the first
 	// version of this test passing with the tick disabled — it proved nothing,
 	// which is the worst kind of test for a safety property.
-	server.settings.BlockAssembly.LivenessStallTimeout = 4 * tick
+	//
+	// Both margins are deliberately generous. A beating loop is 250ms inside the
+	// timeout, so a one-off GC or scheduler stall under -race cannot fail it; a
+	// stopped loop is 5x past the timeout, so the test still cannot pass by luck.
+	server.settings.BlockAssembly.LivenessStallTimeout = 6 * tick
 
 	require.NoError(t, server.blockAssembler.Start(t.Context()))
 
@@ -36,7 +40,7 @@ func TestLivenessDoesNotRestartAnIdleNode(t *testing.T) {
 	}, 5*time.Second, 5*time.Millisecond, "loop must take ownership of the heartbeat")
 
 	// No blocks, no transactions — only the idle tick can keep this healthy.
-	time.Sleep(10 * tick)
+	time.Sleep(30 * tick)
 
 	status, msg, err := server.Health(t.Context(), true)
 	require.NoError(t, err)
