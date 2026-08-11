@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -74,6 +75,69 @@ func TestGetAndValidateSubtrees_ReloadsAfterNodesReleased(t *testing.T) {
 		"subtrees must be reloaded from the store after their nodes were released")
 	require.Equal(t, uint64(2), b.TransactionCount,
 		"a reload must recompute TransactionCount from the store, not keep the stale value")
+}
+
+// TestGetAndValidateSubtrees_SizeMismatchDoesNotDeadlock pins the error paths of
+// the subtree-size check. GetAndValidateSubtrees holds b.subtreeSlicesMu for its
+// whole body, and Block.String() takes that same mutex — sync.RWMutex is not
+// reentrant, so formatting the error with b.String() hung the goroutine forever
+// while still holding the block's mutex (which in turn blocks the
+// lastValidatedBlocks eviction callback). A peer can reach this with a block
+// whose non-final subtrees have unequal lengths.
+func TestGetAndValidateSubtrees_SizeMismatchDoesNotDeadlock(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	blobStore := blobmemory.New()
+
+	newSubtree := func(leafCount int, withCoinbase bool, label string) *subtreepkg.Subtree {
+		st, err := subtreepkg.NewTreeByLeafCount(leafCount)
+		require.NoError(t, err)
+
+		if withCoinbase {
+			require.NoError(t, st.AddCoinbaseNode())
+		}
+
+		for i := st.Length(); i < leafCount; i++ {
+			require.NoError(t, st.AddNode(chainhash.HashH([]byte(label+string(rune('a'+i)))), 1, 0))
+		}
+
+		storeSubtree(t, blobStore, st)
+
+		return st
+	}
+
+	// Lengths 2, 1, 2: the middle subtree is neither the first nor the last, so
+	// it trips "subtree %d has length %d, expected %d".
+	st0 := newSubtree(2, true, "zero")
+	st1 := newSubtree(1, false, "one")
+	st2 := newSubtree(2, false, "two")
+
+	blockHeaderBytes, _ := hex.DecodeString(block1Header)
+	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+	require.NoError(t, err)
+
+	coinbase, err := bt.NewTxFromString(CoinbaseHex)
+	require.NoError(t, err)
+
+	b, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{
+		st0.RootHash(), st1.RootHash(), st2.RootHash(),
+	}, 5, 123, 0, 0)
+	require.NoError(t, err)
+
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- b.GetAndValidateSubtrees(context.Background(), ulogger.TestLogger{}, blobStore,
+			tSettings.Block.GetAndValidateSubtreesConcurrency)
+	}()
+
+	select {
+	case err = <-errCh:
+		require.Error(t, err, "unequal non-final subtree lengths must be rejected")
+		require.Contains(t, err.Error(), "expected",
+			"the size-mismatch error must be the one returned")
+	case <-time.After(30 * time.Second):
+		t.Fatal("GetAndValidateSubtrees deadlocked formatting its error while holding subtreeSlicesMu")
+	}
 }
 
 // TestReleaseSubtreeNodes_ClosesMmapAndNilsEntries pins the full release

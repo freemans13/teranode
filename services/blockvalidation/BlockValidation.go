@@ -1302,13 +1302,13 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
 	}
 
-	// Close mmap-backed subtrees and clear to free memory
-	for _, st := range block.SubtreeSlices {
-		if st != nil {
-			st.Close()
-		}
-	}
-	block.SubtreeSlices = nil
+	// Close mmap-backed subtrees and clear to free memory. Routed through
+	// ReleaseSubtreeNodes so the entries are nil-ed under the block's subtree
+	// mutex: this block may still be reachable via lastValidatedBlocks, whose
+	// TTL cleaner runs the same release concurrently. Nodes are not pooled here
+	// (put is nil) — these subtrees were read straight from the store, not
+	// allocated from the block validation node pool.
+	block.ReleaseSubtreeNodes(nil)
 
 	// update block mined_set to true
 	if err = u.blockchainClient.SetBlockMinedSet(ctx, blockHash); err != nil {
