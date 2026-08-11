@@ -296,6 +296,7 @@ func (w *subtreeStoreWrapper) Set(ctx context.Context, key []byte, fileType file
 
 // createMetaRegenerator creates a SubtreeMetaRegenerator with the given peer URLs.
 // This is used to regenerate missing subtree meta files during block validation.
+// peerURLs are DataHub base URLs, which already carry the peer's API prefix.
 // If peerURLs is empty and subtreeStore is nil, returns nil (regeneration not available).
 func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.SubtreeMetaRegeneratorI {
 	if u.subtreeStore == nil && len(peerURLs) == 0 {
@@ -307,7 +308,7 @@ func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.Subtree
 	}
 
 	wrapper := &subtreeStoreWrapper{store: u.subtreeStore}
-	return model.NewSubtreeMetaRegenerator(u.logger, wrapper, peerURLs, u.settings.Asset.APIPrefix,
+	return model.NewSubtreeMetaRegenerator(u.logger, wrapper, peerURLs,
 		u.utxoStore.GetBlockHeight, u.subtreeBlockHeightRetention)
 }
 
@@ -363,19 +364,10 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		subtreeValidationClient:     subtreeValidationClient,
 		lastValidatedBlocks: expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute).
 			WithEvictionFunction(func(_ chainhash.Hash, block *model.Block) bool {
-				// Return pooled []Node backing slices to the per-class pool
-				// BEFORE closing the subtree. PutNodeSlice is cap-classified, so
-				// mmap-backed subtrees (whose nodes are not pool-sourced) are
-				// silently discarded — safe but ineffective, which is what we
-				// want.
+				// Pools heap-backed []Node slices, Closes mmap-backed subtrees
+				// (unmap + backing-file removal), and nils the entries — all
+				// under the block's subtree mutex.
 				releaseBlockNodes(block)
-
-				// Close mmap-backed subtrees when block expires from cache
-				for _, st := range block.SubtreeSlices {
-					if st != nil {
-						st.Close()
-					}
-				}
 				return true // allow eviction
 			}),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute), // we keep this for 2 hours

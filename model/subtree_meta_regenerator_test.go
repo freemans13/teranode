@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -15,6 +16,7 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -103,6 +105,14 @@ func createTestTransaction(t *testing.T, prevTxIDHex string, prevVout uint32) *b
 	return tx
 }
 
+// allowLoopbackHTTP disables the util HTTP client's SSRF protection for the
+// duration of a test that talks to a localhost httptest server.
+func allowLoopbackHTTP(t *testing.T) {
+	t.Helper()
+	util.SetSSRFProtection(false)
+	t.Cleanup(func() { util.SetSSRFProtection(true) })
+}
+
 func TestSubtreeMetaRegenerator_RegenerateMeta_FromLocal(t *testing.T) {
 	// Create test transactions
 	prevTxID1 := "0000000000000000000000000000000000000000000000000000000000000001"
@@ -133,7 +143,7 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_FromLocal(t *testing.T) {
 
 	logger := ulogger.TestLogger{}
 
-	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, nil, "", func() uint32 { return 100 }, 288)
+	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, nil, func() uint32 { return 100 }, 288)
 
 	// Test regeneration
 	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
@@ -155,6 +165,8 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_FromLocal(t *testing.T) {
 }
 
 func TestSubtreeMetaRegenerator_RegenerateMeta_FromPeer(t *testing.T) {
+	allowLoopbackHTTP(t)
+
 	// Create test transactions
 	prevTxID1 := "0000000000000000000000000000000000000000000000000000000000000001"
 	prevTxID2 := "0000000000000000000000000000000000000000000000000000000000000002"
@@ -194,7 +206,7 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_FromPeer(t *testing.T) {
 	mockStore := newMockSubtreeStoreWriter()
 	logger := ulogger.TestLogger{}
 
-	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL}, "/api/v1", func() uint32 { return 100 }, 288)
+	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288)
 
 	// Test regeneration
 	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
@@ -216,6 +228,8 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_FromPeer(t *testing.T) {
 }
 
 func TestSubtreeMetaRegenerator_RegenerateMeta_AllSourcesFail(t *testing.T) {
+	allowLoopbackHTTP(t)
+
 	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
 	txHash1 := *tx1.TxIDChainHash()
 
@@ -232,7 +246,7 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_AllSourcesFail(t *testing.T) {
 	mockStore := newMockSubtreeStoreWriter()
 	logger := ulogger.TestLogger{}
 
-	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL}, "/api/v1", func() uint32 { return 100 }, 288)
+	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288)
 
 	// Test regeneration should fail
 	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
@@ -243,6 +257,8 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_AllSourcesFail(t *testing.T) {
 }
 
 func TestSubtreeMetaRegenerator_RegenerateMeta_NilStore_PeerFallback(t *testing.T) {
+	allowLoopbackHTTP(t)
+
 	// Create test transaction
 	prevTxID1 := "0000000000000000000000000000000000000000000000000000000000000001"
 	tx1 := createTestTransaction(t, prevTxID1, 0)
@@ -268,7 +284,7 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_NilStore_PeerFallback(t *testing.
 	logger := ulogger.TestLogger{}
 
 	// Create regenerator with nil store - should still work via peer
-	regenerator := NewSubtreeMetaRegenerator(logger, nil, []string{server.URL}, "/api/v1", func() uint32 { return 100 }, 288)
+	regenerator := NewSubtreeMetaRegenerator(logger, nil, []string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288)
 
 	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
 
@@ -346,4 +362,106 @@ func TestSubtreeStoreAdapter(t *testing.T) {
 
 	// Verify nothing was stored (adapter's Set is a no-op)
 	require.Empty(t, mockStore.FileData)
+}
+
+// buildPeerSubtreeData builds a one-tx subtree and its serialized subtreeData,
+// the payload a peer's asset service would serve for /subtree_data/<hash>.
+func buildPeerSubtreeData(t *testing.T) (*subtreepkg.Subtree, *chainhash.Hash, []byte) {
+	t.Helper()
+
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+	subtree := createTestSubtree([]chainhash.Hash{*tx1.TxIDChainHash()})
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	subtreeData.Txs[1] = tx1
+
+	subtreeDataBytes, err := subtreeData.Serialize()
+	require.NoError(t, err)
+
+	return subtree, subtree.RootHash(), subtreeDataBytes
+}
+
+// TestSubtreeMetaRegenerator_PeerBaseURLAlreadyHasAPIPrefix pins the production
+// contract: the peer URL handed to the regenerator is the announcing peer's
+// DataHub URL, which already ends in the API prefix (every asset_httpAddress /
+// asset_httpPublicAddress form in settings.conf embeds ${asset_apiPrefix}).
+// The regenerator must request <peerURL>/subtree_data/<hash> exactly like
+// check_block_subtrees.go and peer_cache_bypass.go do, and must not append a
+// second prefix (which 404s on every real peer).
+func TestSubtreeMetaRegenerator_PeerBaseURLAlreadyHasAPIPrefix(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, subtreeDataBytes := buildPeerSubtreeData(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/subtree_data/"+subtreeHash.String() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(subtreeDataBytes)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	mockStore := newMockSubtreeStoreWriter()
+	logger := ulogger.TestLogger{}
+
+	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288)
+
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+}
+
+// TestSubtreeMetaRegenerator_RetriesOn503 verifies the peer fetch backs off and
+// retries when the peer's asset service rejects under admission control while
+// it generates subtree_data on demand — the same 503 semantics
+// check_block_subtrees.go handles via util.DoHTTPRequestBodyReaderWithRetry.
+func TestSubtreeMetaRegenerator_RetriesOn503(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, subtreeDataBytes := buildPeerSubtreeData(t)
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(subtreeDataBytes)
+	}))
+	defer server.Close()
+
+	mockStore := newMockSubtreeStoreWriter()
+	logger := ulogger.TestLogger{}
+
+	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL}, func() uint32 { return 100 }, 288)
+
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+	require.GreaterOrEqual(t, attempts.Load(), int32(2), "the 503 must be retried, not returned")
+}
+
+// TestSubtreeMetaRegenerator_NoPeers_CleanError pins the error shape on the
+// gRPC validation path, which builds the regenerator with no peer URLs: with
+// nothing to wrap, the returned error must not carry fmt artifacts like
+// "%!(EXTRA <nil>)" from wrapping a nil cause.
+func TestSubtreeMetaRegenerator_NoPeers_CleanError(t *testing.T) {
+	subtree, subtreeHash, _ := buildPeerSubtreeData(t)
+
+	mockStore := newMockSubtreeStoreWriter()
+	logger := ulogger.TestLogger{}
+
+	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, nil, func() uint32 { return 100 }, 288)
+
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+
+	require.Error(t, err)
+	require.Nil(t, meta)
+	require.NotContains(t, err.Error(), "%!", "no-peers error must not wrap a nil cause")
 }

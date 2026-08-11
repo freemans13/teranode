@@ -1571,7 +1571,12 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 		missing := false
 
 		for i := range b.Subtrees {
-			if b.SubtreeSlices[i] == nil {
+			// A non-nil *Subtree with zero Nodes is not loaded: ReleaseNodes
+			// (via blockvalidation's node pooling) strips the Nodes backing
+			// slice while the pointer stays in SubtreeSlices. Trusting it here
+			// made requeued revalidations fail "first subtree has no nodes" on
+			// valid blocks instead of reloading from the store.
+			if b.SubtreeSlices[i] == nil || len(b.SubtreeSlices[i].Nodes) == 0 {
 				missing = true
 				break
 			}
@@ -1710,6 +1715,34 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 	// TODO something with conflicts
 
 	return nil
+}
+
+// ReleaseSubtreeNodes releases every loaded subtree under the block's subtree
+// mutex: each heap-backed subtree's Nodes backing slice is handed to put
+// (mmap-backed subtrees are skipped — their backing is the mapped region, and
+// pooling it after munmap would be a use-after-free), each subtree is Closed
+// (unmapping and removing the backing file for mmap-backed subtrees; a no-op
+// for heap-backed ones), and each SubtreeSlices entry is nil-ed so every
+// loaded-check sees the subtree as missing and a later revalidation reloads
+// from the store. Safe to call multiple times; nil entries are skipped.
+func (b *Block) ReleaseSubtreeNodes(put func([]subtreepkg.Node)) {
+	b.subtreeSlicesMu.Lock()
+	defer b.subtreeSlicesMu.Unlock()
+
+	for i, st := range b.SubtreeSlices {
+		if st == nil {
+			continue
+		}
+
+		nodes := st.ReleaseNodes()
+		if nodes != nil && put != nil && !st.IsMmapBacked() {
+			put(nodes)
+		}
+
+		_ = st.Close()
+
+		b.SubtreeSlices[i] = nil
+	}
 }
 
 // SubtreesLoaded checks if subtrees are loaded and valid.
