@@ -285,26 +285,9 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 	go ba.runBlockSubmissionListener(ctx, listenerDone)
 
 	go func() {
-		// dequeueStallWarnRepeat bounds how often the "consumer stalled"
-		// warning below repeats while the condition persists. Chosen so an
-		// operator sees it promptly but is not paged every 5 seconds for the
-		// duration of an incident that may run for many minutes; 2 minutes
-		// still gives ~15+ log lines across the 35-minute incident on record
-		// (see dequeueDuringBlockMovement's docstring) without flooding logs.
-		const dequeueStallWarnRepeat = 2 * time.Minute
-		// dequeueStallThreshold is the hard-coded 30s bound beyond which a
-		// non-empty queue with no dequeue activity is unambiguously wrong in
-		// every deployment - see issue #1429. Deliberately not a setting:
-		// nobody can yet justify a different number, and during CATCHINGBLOCKS
-		// the queue should be near-empty anyway (subtree validation calls
-		// AddTXToBlockAssembly(false), which bypasses this queue).
-		const dequeueStallThreshold = 30 * time.Second
-
-		var (
-			queueStalled  bool
-			stalledSince  time.Time
-			lastStallWarn time.Time
-		)
+		// Stall bookkeeping lives in observeDequeueStall (dequeue_stall.go) so
+		// the decision is testable without driving this goroutine's 5s tick.
+		var stallState dequeueStallState
 
 		for {
 			select {
@@ -322,27 +305,25 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 				staleness := time.Since(ba.blockAssembler.LastDequeueTime())
 				prometheusBlockAssemblerDequeueStalenessSeconds.Set(staleness.Seconds())
 
-				stalledNow := queueLength > 0 && staleness > dequeueStallThreshold
+				var (
+					stallEvent dequeueStallEvent
+					stalledFor time.Duration
+				)
 
-				switch {
-				case stalledNow && !queueStalled:
-					// Rising edge: log immediately, every time this starts.
-					ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue), or whether the consumer has not started yet (gRPC ingest is up before BlockAssembler.Start reaches it, and the unmined reload runs in between)", queueLength, staleness.Round(time.Second))
-					queueStalled = true
-					// Backdate to the last dequeue, not to detection: the stall
-					// began when the consumer stopped, which is at least
-					// dequeueStallThreshold plus up to one tick ago. lastStallWarn
-					// must stay at now, or a stall already older than
-					// dequeueStallWarnRepeat would repeat on the very next tick.
-					stalledSince = time.Now().Add(-staleness)
-					lastStallWarn = time.Now()
-				case stalledNow && queueStalled && time.Since(lastStallWarn) >= dequeueStallWarnRepeat:
-					// Still stalled: repeat at a reduced cadence rather than every 5s.
-					ba.logger.Warnf("block assembler intake queue still stalled: %d transactions queued, consumer has not dequeued for %s", queueLength, staleness.Round(time.Second))
-					lastStallWarn = time.Now()
-				case !stalledNow && queueStalled:
-					ba.logger.Infof("block assembler intake queue consumer recovered, was stalled for %s", time.Since(stalledSince).Round(time.Second))
-					queueStalled = false
+				stallState, stallEvent, stalledFor = observeDequeueStall(stallState, time.Now(), queueLength, staleness)
+
+				switch stallEvent {
+				case dequeueStallBegan:
+					ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue), whether the dequeue branch itself is blocked storing or announcing a subtree, or whether the consumer has not started yet (gRPC ingest is up before BlockAssembler.Start reaches it, and the unmined reload runs in between)", queueLength, staleness.Round(time.Second))
+				case dequeueStallContinues:
+					// The queue length is reported second, and may well be
+					// zero: a reorg or move-forward-block handler drains the
+					// queue from inside the branch that is blocking the
+					// consumer, so an empty queue here does not mean recovery.
+					ba.logger.Warnf("block assembler intake queue still stalled: consumer has not dequeued for %s, %d transactions queued", staleness.Round(time.Second), queueLength)
+				case dequeueStallEnded:
+					ba.logger.Infof("block assembler intake queue consumer recovered, was stalled for %s", stalledFor.Round(time.Second))
+				case dequeueStallNone:
 				}
 			}
 		}
