@@ -265,19 +265,22 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 
 	var subtreeMeta *subtree.Meta
 
+	// Print what the subtree file says before touching the meta, so an operator
+	// triaging a rejected meta still gets both sides of the comparison.
+	fmt.Printf("Subtree root hash: %s\n", st.RootHash())
+
+	fmt.Printf(numTransactionsFormat, st.Length())
+
 	// Route through the validated reader rather than the raw one: this is the
 	// tool an operator reaches for to inspect a suspect .subtreeMeta, and on an
 	// over-long claimed count the raw deserializer writes past its slice and the
 	// CLI dies with an index out of range instead of naming the defect
-	// (issue 1425). The validated reader reports the mismatched root or count.
+	// (issue 1425). The validated reader names the mismatched root or count,
+	// which is the diagnosis the operator came for.
 	subtreeMeta, err = blockmodel.NewSubtreeMetaFromValidatedReader(*st.RootHash(), st, br)
 	if err != nil {
 		return errors.NewProcessingError("error reading subtree meta", err)
 	}
-
-	fmt.Printf("Subtree root hash: %s\n", st.RootHash())
-
-	fmt.Printf(numTransactionsFormat, st.Length())
 
 	if verbose {
 		for i, txInpoint := range subtreeMeta.TxInpoints {

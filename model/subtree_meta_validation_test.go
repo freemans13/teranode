@@ -172,9 +172,11 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 func TestCommittedSubtreeHash(t *testing.T) {
 	subtree, _, block := buildMetaFixture(t)
 
+	// Compared by value throughout: the assertions are about which hash comes
+	// back, not which pointer.
 	t.Run("falls back to the subtree root when no committed list is present", func(t *testing.T) {
 		require.Empty(t, block.Subtrees)
-		require.Equal(t, subtree.RootHash(), block.committedSubtreeHash(0, subtree))
+		require.Equal(t, *subtree.RootHash(), *block.committedSubtreeHash(0, subtree))
 	})
 
 	t.Run("prefers the block-header-committed hash", func(t *testing.T) {
@@ -184,13 +186,13 @@ func TestCommittedSubtreeHash(t *testing.T) {
 			Subtrees: []*chainhash.Hash{&committed},
 		}
 
-		require.Equal(t, &committed, withList.committedSubtreeHash(0, subtree))
-		require.NotEqual(t, subtree.RootHash(), withList.committedSubtreeHash(0, subtree))
+		require.Equal(t, committed, *withList.committedSubtreeHash(0, subtree))
+		require.NotEqual(t, *subtree.RootHash(), *withList.committedSubtreeHash(0, subtree))
 	})
 
 	t.Run("falls back when the committed entry is nil or out of range", func(t *testing.T) {
 		withNil := &Block{Header: block.Header, Subtrees: []*chainhash.Hash{nil}}
-		require.Equal(t, subtree.RootHash(), withNil.committedSubtreeHash(0, subtree))
-		require.Equal(t, subtree.RootHash(), withNil.committedSubtreeHash(1, subtree))
+		require.Equal(t, *subtree.RootHash(), *withNil.committedSubtreeHash(0, subtree))
+		require.Equal(t, *subtree.RootHash(), *withNil.committedSubtreeHash(1, subtree))
 	})
 }
