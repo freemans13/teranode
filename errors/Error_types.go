@@ -119,7 +119,23 @@ func NewBlockHeaderContextError(message string, params ...interface{}) *Error {
 	// singleton: SetWrappedErr and Join walk to the tail and assign, so sharing the global
 	// would let a later Join mutate process-wide state.
 	e := New(ERR_BLOCK_HEADER_CONTEXT, message, params...)
-	e.SetWrappedErr(New(ERR_PROCESSING, "error processing"))
+	tail := New(ERR_PROCESSING, "error processing")
+
+	// Attaching the tail with SetWrappedErr is only safe when nothing is wrapped yet, because it
+	// assigns to the LAST *Error in the chain — which, when the caller supplied a cause, is the
+	// caller's own object. Every Err* here is a process-wide singleton, so
+	// NewBlockHeaderContextError("...", ErrServiceError) would write this tail into the global
+	// ErrServiceError permanently, making Is(ErrServiceError, ErrProcessing) true for every
+	// caller in the process. Splice the tail in above the caller's cause instead: the cause stays
+	// reachable, both predicates still hold, and no object we do not own is touched.
+	if e.wrappedErr == nil {
+		e.SetWrappedErr(tail)
+
+		return e
+	}
+
+	tail.wrappedErr = e.wrappedErr
+	e.wrappedErr = tail
 
 	return e
 }

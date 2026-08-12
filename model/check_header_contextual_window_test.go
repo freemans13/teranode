@@ -15,24 +15,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// buildLinkedChain returns count properly linked headers in ascending height
-// order (oldest first), with strictly increasing timestamps baseTime,
-// baseTime+1, ... The first header's parent is the all-zero hash.
-func buildLinkedChain(t *testing.T, count int, baseTime uint32) []*BlockHeader {
+// buildLinkedChainWithTimestamps returns len(timestamps) properly linked headers in ascending
+// height order (oldest first), stamped from the supplied slice. The first header's parent is the
+// all-zero hash.
+//
+// Explicit timestamps are what let a test tell an 11-header window from a 12-header one. With the
+// strictly increasing stamps buildLinkedChain produces, both medians land on the same value, so a
+// widened span is invisible — the timestamps have to be shaped deliberately for the two to differ.
+func buildLinkedChainWithTimestamps(t *testing.T, timestamps []uint32) []*BlockHeader {
 	t.Helper()
 
 	bits, err := NewNBitFromString("207fffff")
 	require.NoError(t, err)
 
-	chain := make([]*BlockHeader, count)
+	chain := make([]*BlockHeader, len(timestamps))
 	prev := &chainhash.Hash{}
 
-	for i := 0; i < count; i++ {
+	for i, timestamp := range timestamps {
 		chain[i] = &BlockHeader{
 			Version:        1,
 			HashPrevBlock:  prev,
 			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      baseTime + uint32(i),
+			Timestamp:      timestamp,
 			Bits:           *bits,
 			Nonce:          uint32(i),
 		}
@@ -40,6 +44,20 @@ func buildLinkedChain(t *testing.T, count int, baseTime uint32) []*BlockHeader {
 	}
 
 	return chain
+}
+
+// buildLinkedChain returns count properly linked headers in ascending height
+// order (oldest first), with strictly increasing timestamps baseTime,
+// baseTime+1, ... The first header's parent is the all-zero hash.
+func buildLinkedChain(t *testing.T, count int, baseTime uint32) []*BlockHeader {
+	t.Helper()
+
+	timestamps := make([]uint32, count)
+	for i := range timestamps {
+		timestamps[i] = baseTime + uint32(i)
+	}
+
+	return buildLinkedChainWithTimestamps(t, timestamps)
 }
 
 // newestFirst returns a reversed copy: index 0 is the highest header — the
@@ -193,6 +211,43 @@ func TestCheckHeaderContextualMedianWindow(t *testing.T) {
 
 		accepted := buildChildBlock(t, single[0], baseTime+1)
 		require.NoError(t, accepted.CheckHeaderContextual(single, newSettings(t), logger))
+	})
+
+	t.Run("a twelfth header must not reach the median", func(t *testing.T) {
+		// Every other subtest here pins the span from BELOW — that it is not fewer than 11. None
+		// pins it from above, because with strictly increasing timestamps the 11-header median and
+		// the 12-header median are the same number, so widening the span changes nothing a test
+		// can see. Setting MedianTimeSpan to 12, or taking one header too many in
+		// MedianTimeWindow, leaves the whole model suite green while Teranode evaluates BIP113
+		// over the wrong number of blocks and forks from the network.
+		//
+		// Shape the timestamps so the two windows disagree: the 12th-newest header is stamped far
+		// ahead of its neighbours, which is legal (Bitcoin never required monotonic timestamps)
+		// and moves the median by one position when it is included.
+		//
+		//   11 headers, ascending[89..99] -> sorted [b+89..b+99],       upper median = b+94
+		//   12 headers, ascending[88..99] -> sorted [b+89..b+99, b+500], upper median = b+95
+		//
+		// So a child stamped b+95 is valid under the real rule and invalid under a widened one.
+		timestamps := make([]uint32, 100)
+		for i := range timestamps {
+			timestamps[i] = baseTime + uint32(i)
+		}
+
+		timestamps[88] = baseTime + 500
+
+		skewed := buildLinkedChainWithTimestamps(t, timestamps)
+		skewedParent := skewed[len(skewed)-1]
+
+		accepted := buildChildBlock(t, skewedParent, baseTime+95)
+		require.NoError(t, accepted.CheckHeaderContextual(newestFirst(skewed), newSettings(t), logger),
+			"b+95 is above the 11-header median (b+94); a span of 12 or more would reject it")
+
+		// And the window is still pinned from below on the same chain.
+		rejected := buildChildBlock(t, skewedParent, baseTime+94)
+		err := rejected.CheckHeaderContextual(newestFirst(skewed), newSettings(t), logger)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "median time past")
 	})
 
 	t.Run("header with no parent hash is a processing error, not a panic", func(t *testing.T) {
