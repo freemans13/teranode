@@ -1315,8 +1315,10 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	// ReleaseSubtreeNodes so the entries are nil-ed under the block's subtree
 	// mutex: this block may still be reachable via lastValidatedBlocks, whose
 	// TTL cleaner runs the same release concurrently. Nodes are not pooled here
-	// (put is nil) — these subtrees were read straight from the store, not
-	// allocated from the block validation node pool.
+	// (put is nil): a block fetched fresh from the blockchain has no node
+	// allocator, so its slices never came from the pool. A block taken from
+	// lastValidatedBlocks does carry pool-allocated slices — recycling those is
+	// a possible improvement, not a requirement, and is left out of this change.
 	if releaseErr := block.ReleaseSubtreeNodes(nil); releaseErr != nil {
 		u.logger.Warnf("[setTxMined][%s] failed closing subtrees after setting mined: %v", block.Hash().String(), releaseErr)
 	}
