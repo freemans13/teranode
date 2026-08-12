@@ -166,13 +166,15 @@ func (r *SubtreeMetaRegenerator) buildAndStoreMeta(ctx context.Context, subtreeH
 func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Subtree, data *subtreepkg.Data) (*subtreepkg.Meta, error) {
 	meta := subtreepkg.NewSubtreeMeta(subtree)
 
+	hasCoinbasePlaceholder := subtree.Length() > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+
 	for i, tx := range data.Txs {
 		if tx == nil {
 			continue // Skip nil entries (e.g., coinbase placeholder)
 		}
 
 		// Skip coinbase placeholder at index 0
-		if i == 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+		if i == 0 && hasCoinbasePlaceholder {
 			continue
 		}
 
@@ -193,7 +195,7 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 	// carries the coinbase placeholder there — for every other subtree node 0 is a real
 	// transaction, so it is checked too.
 	firstChecked := 0
-	if subtree.Length() > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+	if hasCoinbasePlaceholder {
 		firstChecked = 1
 	}
 

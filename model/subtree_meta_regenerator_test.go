@@ -470,10 +470,6 @@ func TestSubtreeMetaRegenerator_NoPeers_CleanError(t *testing.T) {
 		"the local store's cause must survive into the returned error, not be logged and dropped")
 }
 
-// TestSubtreeMetaRegenerator_PeerFetchTimeoutFallback pins the fail-closed
-// contract on the configurable per-peer bound: a non-positive setting must fall
-// back to the default rather than leaving the fetch unbounded, since this fetch
-// runs inline in block validation.
 // TestSubtreeMetaRegenerator_IncompletePeerBody_IsTransient pins the completeness
 // check on the peer body. go-subtree's deserializer stops at a clean io.EOF and
 // reports success, so a truncated or zero-byte 200 leaves the tail Txs nil and
@@ -595,6 +591,10 @@ func TestSubtreeMetaRegenerator_StalledPeer_IsBounded(t *testing.T) {
 	}
 }
 
+// TestSubtreeMetaRegenerator_PeerFetchTimeoutFallback pins the fail-closed
+// contract on the configurable per-peer bound: a non-positive setting must fall
+// back to the default rather than leaving the fetch unbounded, since this fetch
+// runs inline in block validation.
 func TestSubtreeMetaRegenerator_PeerFetchTimeoutFallback(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	mockStore := newMockSubtreeStoreWriter()
