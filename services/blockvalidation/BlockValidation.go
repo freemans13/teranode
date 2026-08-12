@@ -1234,6 +1234,14 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	if len(unsetMined) > 0 && unsetMined[0] {
 		u.logger.Warnf("[setTxMined][%s] block is marked as invalid, will attempt to unset tx mined", block.Hash().String())
 
+		// A block taken from lastValidatedBlocks arrives here with its subtrees
+		// still loaded. Overwriting SubtreeSlices below drops the only reference
+		// to them, and an mmap-backed subtree has no finalizer — its mapping and
+		// its temp backing file would survive until process exit. Release first.
+		if releaseErr := block.ReleaseSubtreeNodes(nil); releaseErr != nil {
+			u.logger.Warnf("[setTxMined][%s] failed closing subtrees before unset-mined reload: %v", block.Hash().String(), releaseErr)
+		}
+
 		block.SubtreeSlices = make([]*subtreepkg.Subtree, len(block.Subtrees))
 
 		// when the block is invalid, we might not have all the subtrees
