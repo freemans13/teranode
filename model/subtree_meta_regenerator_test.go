@@ -321,6 +321,47 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_RejectsIncompleteSubtreeData(t *t
 	require.Error(t, err, "incomplete meta must not be persisted")
 }
 
+// TestSubtreeMetaRegenerator_RejectsMissingInpointsAtNodeZero covers the one node the
+// completeness check would otherwise let through. Meta.Serialize exempts index 0
+// unconditionally, because the FIRST subtree of a block carries the coinbase
+// placeholder there — but every other subtree has a real transaction at index 0. An
+// empty .subtreeData for such a subtree used to rebuild into a meta with no recorded
+// parents that serialized cleanly and then overwrote the intact file on disk, leaving a
+// poisoned cache that rejects a valid block on every restart.
+func TestSubtreeMetaRegenerator_RejectsMissingInpointsAtNodeZero(t *testing.T) {
+	ctx := context.Background()
+
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+
+	// No coinbase placeholder: a single real transaction at index 0, as every
+	// subtree after the first one has.
+	subtree := &subtreepkg.Subtree{Nodes: []subtreepkg.Node{{Hash: *tx1.TxIDChainHash()}}}
+	subtreeHash := subtree.RootHash()
+
+	// An empty subtree data file: the deserializer breaks on io.EOF without error,
+	// so every node comes back nil.
+	store := memory.New()
+	require.NoError(t, store.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData, []byte{}))
+
+	// An intact meta the poisoned rebuild must not be allowed to replace.
+	intact := subtreepkg.NewSubtreeMeta(subtree)
+	require.NoError(t, intact.SetTxInpointsFromTx(tx1))
+
+	intactBytes, err := intact.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, store.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta, intactBytes))
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, nil, "", func() uint32 { return 100 }, 288)
+
+	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree)
+	require.Error(t, err, "a rebuild with no inpoints for the real transaction at node 0 must fail")
+	require.Nil(t, meta)
+
+	stored, err := store.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
+	require.NoError(t, err)
+	require.Equal(t, intactBytes, stored, "the failed rebuild must not overwrite the intact meta")
+}
+
 func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_Success(t *testing.T) {
 	mockStore := newMockSubtreeStoreWriter()
 	logger := ulogger.TestLogger{}

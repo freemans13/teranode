@@ -1,17 +1,14 @@
 package model
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
-	"io"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/stretchr/testify/require"
 )
 
@@ -45,26 +42,17 @@ func buildMetaFixture(t *testing.T) (*subtreepkg.Subtree, []byte, *Block) {
 	return subtree, metaBytes, block
 }
 
-// memSubtreeStore serves stored bytes keyed by "<key>.<fileType>" through the
-// model.SubtreeStore interface (the shared TestLocalSubtreeStore reads testdata
-// files by index in GetIoReader, so it cannot serve crafted bytes).
-type memSubtreeStore struct {
-	data map[string][]byte
-}
+// newMemSubtreeStore serves the given meta bytes under the given key from the
+// shared in-memory blob store, which already satisfies model.SubtreeStore. (The
+// other test double in this package, TestLocalSubtreeStore, reads testdata files
+// by index in GetIoReader, so it cannot serve crafted bytes.)
+func newMemSubtreeStore(t *testing.T, key []byte, metaBytes []byte) SubtreeStore {
+	t.Helper()
 
-func (m *memSubtreeStore) GetIoReader(_ context.Context, key []byte, fileType fileformat.FileType, _ ...options.FileOption) (io.ReadCloser, error) {
-	b, ok := m.data[string(key)+"."+fileType.String()]
-	if !ok {
-		return nil, errors.NewNotFoundError("subtree meta not found")
-	}
+	store := memory.New()
+	require.NoError(t, store.Set(context.Background(), key, fileformat.FileTypeSubtreeMeta, metaBytes))
 
-	return io.NopCloser(bytes.NewReader(b)), nil
-}
-
-func newMemSubtreeStore(key []byte, metaBytes []byte) *memSubtreeStore {
-	return &memSubtreeStore{data: map[string][]byte{
-		string(key) + "." + fileformat.FileTypeSubtreeMeta.String(): metaBytes,
-	}}
+	return store
 }
 
 // TestGetSubtreeMetaSliceValidation pins issue 1425: the within-block
@@ -77,7 +65,7 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 	t.Run("valid meta passes and carries the inpoints", func(t *testing.T) {
 		subtree, metaBytes, block := buildMetaFixture(t)
 
-		store := newMemSubtreeStore(subtree.RootHash()[:], metaBytes)
+		store := newMemSubtreeStore(t, subtree.RootHash()[:], metaBytes)
 
 		got, err := block.getSubtreeMetaSlice(ctx, store, *subtree.RootHash(), subtree)
 		require.NoError(t, err)
@@ -99,7 +87,7 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 		copy(torn, metaBytes)
 		binary.LittleEndian.PutUint32(torn[32:36], 2)
 
-		store := newMemSubtreeStore(subtree.RootHash()[:], torn)
+		store := newMemSubtreeStore(t, subtree.RootHash()[:], torn)
 
 		_, err := block.getSubtreeMetaSlice(ctx, store, *subtree.RootHash(), subtree)
 		require.Error(t, err)
@@ -115,7 +103,7 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 		copy(torn, metaBytes)
 		binary.LittleEndian.PutUint32(torn[32:36], 64)
 
-		store := newMemSubtreeStore(subtree.RootHash()[:], torn)
+		store := newMemSubtreeStore(t, subtree.RootHash()[:], torn)
 
 		require.NotPanics(t, func() {
 			_, err := block.getSubtreeMetaSlice(ctx, store, *subtree.RootHash(), subtree)
@@ -141,7 +129,7 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 		binary.LittleEndian.PutUint32(torn[32:36], 5)
 		torn = append(torn, extra...)
 
-		store := newMemSubtreeStore(subtree.RootHash()[:], torn)
+		store := newMemSubtreeStore(t, subtree.RootHash()[:], torn)
 
 		require.NotPanics(t, func() {
 			_, err := block.getSubtreeMetaSlice(ctx, store, *subtree.RootHash(), subtree)
@@ -158,7 +146,7 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 		other := chainhash.HashH([]byte{0xfe, 0xed})
 		copy(foreign[:32], other[:])
 
-		store := newMemSubtreeStore(subtree.RootHash()[:], foreign)
+		store := newMemSubtreeStore(t, subtree.RootHash()[:], foreign)
 
 		_, err := block.getSubtreeMetaSlice(ctx, store, *subtree.RootHash(), subtree)
 		require.Error(t, err)
@@ -168,10 +156,41 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 	t.Run("truncated file fails the header read", func(t *testing.T) {
 		subtree, metaBytes, block := buildMetaFixture(t)
 
-		store := newMemSubtreeStore(subtree.RootHash()[:], metaBytes[:20])
+		store := newMemSubtreeStore(t, subtree.RootHash()[:], metaBytes[:20])
 
 		_, err := block.getSubtreeMetaSlice(ctx, store, *subtree.RootHash(), subtree)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "header")
+	})
+}
+
+// TestCommittedSubtreeHash pins which hash the meta header is validated against.
+// subtree.RootHash() is the 32 bytes the deserializer cached verbatim from the
+// .subtree file header, so validating one file's claim against another's would
+// let a torn .subtree header reject a good meta and let a foreign .subtree pass
+// alongside its own meta. The block header's committed list is the authority.
+func TestCommittedSubtreeHash(t *testing.T) {
+	subtree, _, block := buildMetaFixture(t)
+
+	t.Run("falls back to the subtree root when no committed list is present", func(t *testing.T) {
+		require.Empty(t, block.Subtrees)
+		require.Equal(t, subtree.RootHash(), block.committedSubtreeHash(0, subtree))
+	})
+
+	t.Run("prefers the block-header-committed hash", func(t *testing.T) {
+		committed := chainhash.HashH([]byte{0xc0, 0xde})
+		withList := &Block{
+			Header:   block.Header,
+			Subtrees: []*chainhash.Hash{&committed},
+		}
+
+		require.Equal(t, &committed, withList.committedSubtreeHash(0, subtree))
+		require.NotEqual(t, subtree.RootHash(), withList.committedSubtreeHash(0, subtree))
+	})
+
+	t.Run("falls back when the committed entry is nil or out of range", func(t *testing.T) {
+		withNil := &Block{Header: block.Header, Subtrees: []*chainhash.Hash{nil}}
+		require.Equal(t, subtree.RootHash(), withNil.committedSubtreeHash(0, subtree))
+		require.Equal(t, subtree.RootHash(), withNil.committedSubtreeHash(1, subtree))
 	})
 }

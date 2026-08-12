@@ -162,8 +162,17 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 	// parents for the tail. Such a meta is unusable in both directions: it fails serialization,
 	// and the within-block duplicate-inputs check reads a missing entry as a transaction with
 	// no parents and rejects the whole block. Fail regeneration rather than return it.
-	// The bound mirrors Meta.Serialize, which requires parents for every node except index 0.
-	for i := 1; i < subtree.Length(); i++ {
+	// Meta.Serialize exempts index 0 unconditionally, but only the first subtree of a block
+	// carries the coinbase placeholder there — for every other subtree node 0 is a real
+	// transaction. Checking it too closes the shape where an empty .subtreeData rebuilds a
+	// single-node subtree into a meta that serializes cleanly with no recorded parents and
+	// then overwrites an intact file.
+	firstChecked := 0
+	if subtree.Length() > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+		firstChecked = 1
+	}
+
+	for i := firstChecked; i < subtree.Length(); i++ {
 		if meta.TxInpoints[i].ParentTxHashes == nil {
 			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: no inpoints for node %d of %d", i, subtree.Length())
 		}

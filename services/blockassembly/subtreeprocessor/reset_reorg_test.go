@@ -1352,45 +1352,18 @@ func TestResetMarksAssemblyTxsAsNotOnLongestChainBeforeClearing(t *testing.T) {
 func storeReorgSubtree(t *testing.T, ctx context.Context, blobStore *blob_memory.Memory, txs []subtree.Node) *chainhash.Hash {
 	t.Helper()
 
-	st, err := subtree.NewTreeByLeafCount(64)
-	require.NoError(t, err)
-	require.NoError(t, st.AddCoinbaseNode())
-
-	for _, n := range txs {
-		require.NoError(t, st.AddSubtreeNode(n))
-	}
-
-	// Store under the subtree's REAL root hash, as production does: the meta
-	// header validation (issue 1425) rejects a file whose embedded root does
-	// not match the key it was fetched by.
-	key := st.RootHash()
-
-	stBytes, err := st.Serialize()
-	require.NoError(t, err)
-	require.NoError(t, blobStore.Set(ctx, key[:], fileformat.FileTypeSubtree, stBytes))
-
-	meta := subtree.NewSubtreeMeta(st)
-	for i := range st.Nodes {
-		require.NoError(t, meta.SetTxInpoints(i, subtree.NewTxInpoints()))
-	}
-
-	metaBytes, err := meta.Serialize()
-	require.NoError(t, err)
+	_, key, metaBytes := buildReorgSubtree(t, ctx, blobStore, txs)
 	require.NoError(t, blobStore.Set(ctx, key[:], fileformat.FileTypeSubtreeMeta, metaBytes))
 
 	return key
 }
 
-// storeReorgSubtreeWithTornMeta stores a real subtree exactly as
-// storeReorgSubtree does, but writes a meta file whose claimed entry count is
-// one too high, followed by a well-formed extra entry. That is the shape that
-// panicked with an index out of range inside go-subtree's raw meta
-// deserializer (issue 1425): it sizes its destination slice from the real
-// subtree but writes however many entries the file claims. On this path the
-// panic happened inside a moveBack errgroup goroutine, which does not recover,
-// so it took the whole process down — and recurred on every restart, since the
-// file is on disk.
-func storeReorgSubtreeWithTornMeta(t *testing.T, ctx context.Context, blobStore *blob_memory.Memory, txs []subtree.Node) *chainhash.Hash {
+// buildReorgSubtree builds the subtree, stores the .subtree file under the
+// subtree's REAL root hash as production does (the meta header validation of
+// issue 1425 rejects a file whose embedded root does not match the key it was
+// fetched by), and returns the subtree, that key and the correctly serialized
+// meta bytes. The caller decides what meta actually lands in the store.
+func buildReorgSubtree(t *testing.T, ctx context.Context, blobStore *blob_memory.Memory, txs []subtree.Node) (*subtree.Subtree, *chainhash.Hash, []byte) {
 	t.Helper()
 
 	st, err := subtree.NewTreeByLeafCount(64)
@@ -1414,6 +1387,23 @@ func storeReorgSubtreeWithTornMeta(t *testing.T, ctx context.Context, blobStore 
 
 	metaBytes, err := meta.Serialize()
 	require.NoError(t, err)
+
+	return st, key, metaBytes
+}
+
+// storeReorgSubtreeWithTornMeta stores a real subtree exactly as
+// storeReorgSubtree does, but writes a meta file whose claimed entry count is
+// one too high, followed by a well-formed extra entry. That is the shape that
+// panicked with an index out of range inside go-subtree's raw meta
+// deserializer (issue 1425): it sizes its destination slice from the real
+// subtree but writes however many entries the file claims. On this path the
+// panic happened inside a moveBack errgroup goroutine, which does not recover,
+// so it took the whole process down — and recurred on every restart, since the
+// file is on disk.
+func storeReorgSubtreeWithTornMeta(t *testing.T, ctx context.Context, blobStore *blob_memory.Memory, txs []subtree.Node) *chainhash.Hash {
+	t.Helper()
+
+	st, key, metaBytes := buildReorgSubtree(t, ctx, blobStore, txs)
 
 	// One more entry than the subtree has leaves, with real bytes behind it, so
 	// the deserializer walks past the end of its slice rather than hitting EOF.
@@ -1627,7 +1617,10 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		// Note what this does NOT assert: unlike block validation, this path has
 		// no meta regenerator behind it, so the torn file is not repaired. A
 		// failed reorg is the intended outcome here, not self-healing.
-		ctx := context.Background()
+		//
+		// The context is cancellable and the drain goroutine joins on it, so the
+		// SubtreeProcessor started below and the drain do not outlive the subtest.
+		ctx, cancel := context.WithCancel(context.Background())
 
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
@@ -1687,12 +1680,26 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 
 		stp.InitCurrentBlockHeader(block2Header)
 
+		drained := make(chan struct{})
+
 		go func() {
-			for req := range newSubtreeChan {
-				if req.ErrChan != nil {
-					req.ErrChan <- nil
+			defer close(drained)
+
+			for {
+				select {
+				case req := <-newSubtreeChan:
+					if req.ErrChan != nil {
+						req.ErrChan <- nil
+					}
+				case <-ctx.Done():
+					return
 				}
 			}
+		}()
+
+		defer func() {
+			cancel()
+			<-drained
 		}()
 
 		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward})
