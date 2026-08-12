@@ -21,6 +21,10 @@
 // its Delete-At-Height bookkeeping stops advancing. Nothing in this repository reads back the
 // batch-data / batch-keys files this package writes, so a batched store is write-only in the
 // strongest sense: the data goes in and there is no supported way to get it out again.
+//
+// The caller's file type is also discarded. Every flush is written as FileTypeBatchData, and a
+// key record carries only the hash, offset and size, so a batch that mixes (say) subtree and
+// transaction blobs cannot be told apart afterwards even in principle.
 package batcher
 
 import (
@@ -70,7 +74,10 @@ type Batcher struct {
 	// currentBatchKeys holds the accumulated key data for the current batch (if writeKeys is true)
 	currentBatchKeys []byte
 	// currentBatchLen mirrors len(currentBatch), updated by the worker goroutine after every
-	// change. Close reads it from the caller's goroutine while the worker may still be running,
+	// append. It is deliberately not updated when a flush empties the buffer, so a Close landing
+	// between a successful flush and the following append reports the pre-flush length; the value
+	// is approximate by nature and is only ever used for a log line and an error message.
+	// Close reads it from the caller's goroutine while the worker may still be running,
 	// so it must not read currentBatch directly (that would race); this atomic mirror is the
 	// safe way to report an approximate unflushed-byte count in that situation.
 	currentBatchLen atomic.Int64
@@ -95,7 +102,9 @@ type Batcher struct {
 type BatchItem struct {
 	// hash is the unique identifier for the blob, typically a transaction ID or similar hash
 	hash chainhash.Hash
-	// fileType indicates the type of file being stored (e.g., transaction, block, etc.)
+	// fileType indicates the type of file being stored (e.g., transaction, block, etc.).
+	// It is recorded here for completeness but never persisted: batches are written as
+	// FileTypeBatchData and key records carry no discriminator (see the package comment).
 	fileType fileformat.FileType
 	// value contains the actual blob data to be stored
 	value []byte
@@ -122,7 +131,9 @@ type blobStoreSetter interface {
 //   - logger: Logger instance for batcher operations and error reporting
 //   - blobStore: The underlying blob store where batches will be stored
 //   - sizeInBytes: Maximum size of a batch in bytes before it's automatically flushed
-//   - writeKeys: Whether to store a separate index of keys for each batch, enabling later retrieval by key
+//   - writeKeys: Whether to store a separate index of keys and their offsets for each batch.
+//     This only helps an external consumer that parses the batch-keys format; nothing in this
+//     repository reads it back (see the package comment).
 //
 // Returns:
 //   - *Batcher: A configured batcher instance ready to accept blob operations
@@ -232,11 +243,12 @@ func (b *Batcher) processBatchItem(batchItem *BatchItem) error {
 		}
 	}
 
-	// add to batch, regardless of whether the flush above succeeded or failed
-	b.currentBatch = append(b.currentBatch, batchItem.value...)
-	// mirror the new length for Close, which reads it from a different goroutine
-	// and must not touch currentBatch itself (see the field comment)
-	b.currentBatchLen.Store(int64(len(b.currentBatch)))
+	// The key record is built before the value is appended, not after. Both currentPos and
+	// dataSize are already known here, and building it first means a failed conversion cannot
+	// return with the value already sitting in the batch data and no index entry addressing
+	// it. That path is reachable now that a batch is retained across flush failures and can
+	// therefore grow past the uint32 offset ceiling.
+	var keyRecord []byte
 
 	if b.writeKeys {
 		// keys are written as a separate batch, with the position and size as the first 8 bytes
@@ -262,8 +274,17 @@ func (b *Batcher) processBatchItem(batchItem *BatchItem) error {
 		hexKey := hex.EncodeToString(key)
 		hexKey += "\n"
 
-		// append the bytes of the key
-		b.currentBatchKeys = append(b.currentBatchKeys, []byte(hexKey)...)
+		keyRecord = []byte(hexKey)
+	}
+
+	// add to batch, regardless of whether the flush above succeeded or failed
+	b.currentBatch = append(b.currentBatch, batchItem.value...)
+	// mirror the new length for Close, which reads it from a different goroutine
+	// and must not touch currentBatch itself (see the field comment)
+	b.currentBatchLen.Store(int64(len(b.currentBatch)))
+
+	if keyRecord != nil {
+		b.currentBatchKeys = append(b.currentBatchKeys, keyRecord...)
 	}
 
 	if flushErr != nil {
@@ -372,6 +393,18 @@ func (b *Batcher) Health(ctx context.Context, checkLiveness bool) (int, string, 
 // under a sync.Once and later calls return the first call's result. Note that this
 // result is a snapshot: if the first call abandoned a hung flush that later completed,
 // a second call still reports the abandonment.
+//
+// Two consequences of abandoning are worth stating rather than leaving to be discovered.
+// The worker goroutine and the goroutine waiting on it are not killed, so both leak for
+// the remaining life of the process, and the worker may call the wrapped store's Set well
+// after the daemon considers this store closed. Both are acceptable on a shutdown path
+// that is about to exit anyway, and neither is fixable without a way to interrupt a Set
+// that is already in flight.
+//
+// Close also does not close the store it wraps: blobStoreSetter exposes only Health and
+// Set. Since createBatchedStore returns the batcher in place of the real store, nothing
+// closes the wrapped store at all when batch=true, so any cleanup it does on Close is
+// skipped.
 //
 // Parameters:
 //   - ctx: Context bounding how long Close will wait for the shutdown flush
