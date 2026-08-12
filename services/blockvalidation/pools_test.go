@@ -7,7 +7,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/model"
-	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -101,7 +100,7 @@ func TestReleaseBlockNodes_NilsSubtreeSliceEntries(t *testing.T) {
 
 	b := &model.Block{SubtreeSlices: []*subtreepkg.Subtree{st, nil}}
 
-	releaseBlockNodes(ulogger.TestLogger{}, b)
+	releaseBlockNodes(b)
 
 	require.Nil(t, b.SubtreeSlices[0], "released entry must be nil so already-loaded checks treat it as missing")
 	require.Nil(t, b.SubtreeSlices[1])
