@@ -284,7 +284,14 @@ func TestServerValidateBlock_UnusableHeaderRunIsRebuiltByHashWalk(t *testing.T) 
 
 	mockBlockchain.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nBits, nil).Maybe()
 	mockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
+
+	// checkOldBlockIDs picks its route from BlockChain.UseInMemoryChainCheck, which comes from
+	// whatever settings_local.conf the machine happens to carry — the in-memory route calls
+	// CheckBlockIsInCurrentChain, the prefetch route calls GetBlockHeaderIDs. Mock both, so the
+	// test asserts the same thing on a developer box as it does in CI.
 	mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil).Maybe()
+	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
+		Return([]uint32{2, 1, 0}, nil).Maybe()
 
 	bv := &BlockValidation{
 		blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
