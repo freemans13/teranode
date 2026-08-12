@@ -350,9 +350,10 @@ func TestNewStore_BlockchainClientError(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
 
-	// Register mock database initializer
+	// Register mock database initializer. No SetBlockState expectation: this
+	// test makes blockchain-client creation fail, so NewStore returns before it
+	// subscribes and the listener never runs.
 	mockStore := &MockUTXOStore{}
-	mockStore.On("SetBlockState", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	availableDatabases["memory"] = func(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, url *url.URL) (utxo.Store, error) {
 		return mockStore, nil
