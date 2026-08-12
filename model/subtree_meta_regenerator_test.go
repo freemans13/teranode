@@ -474,6 +474,127 @@ func TestSubtreeMetaRegenerator_NoPeers_CleanError(t *testing.T) {
 // contract on the configurable per-peer bound: a non-positive setting must fall
 // back to the default rather than leaving the fetch unbounded, since this fetch
 // runs inline in block validation.
+// TestSubtreeMetaRegenerator_IncompletePeerBody_IsTransient pins the completeness
+// check on the peer body. go-subtree's deserializer stops at a clean io.EOF and
+// reports success, so a truncated or zero-byte 200 leaves the tail Txs nil and
+// produces a meta whose GetParentTxHashes returns nil with no error. Block
+// validation reads that as "transaction could not be found in tx meta data",
+// raises ErrBlockInvalid and calls storeInvalidBlock — permanently invalidating a
+// perfectly valid block. Regeneration must fail transiently instead.
+//
+// This path was unreachable before the peer URL fix in this branch: every peer
+// fetch requested /api/v1/api/v1/... and 404ed. Repairing the URL makes it live.
+// A zero-byte 200 is a documented real case — see the proxy-cache note at
+// services/blockvalidation/get_blocks.go:641-646.
+func TestSubtreeMetaRegenerator_IncompletePeerBody_IsTransient(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	// Two real transactions so a body can be truncated cleanly between them —
+	// the deserializer must accept what it reads and stop at EOF, leaving the
+	// second node with no inpoints.
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+	tx2 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000002", 0)
+	subtree := createTestSubtree([]chainhash.Hash{*tx1.TxIDChainHash(), *tx2.TxIDChainHash()})
+	subtreeHash := subtree.RootHash()
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	subtreeData.Txs[1] = tx1
+	subtreeData.Txs[2] = tx2
+
+	fullBody, err := subtreeData.Serialize()
+	require.NoError(t, err)
+
+	firstTxOnly := tx1.SerializeBytes()
+	require.Less(t, len(firstTxOnly), len(fullBody), "sanity: truncation actually drops the second tx")
+
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "zero-byte 200", body: []byte{}},
+		{name: "truncated at a transaction boundary", body: firstTxOnly},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.body
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/v1/subtree_data/"+subtreeHash.String() {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(body)
+			}))
+			defer server.Close()
+
+			mockStore := newMockSubtreeStoreWriter()
+			regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, mockStore,
+				[]string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
+
+			meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+
+			require.Error(t, err, "an incomplete body must not yield a meta")
+			require.Nil(t, meta)
+			require.False(t, errors.Is(err, errors.ErrBlockInvalid),
+				"the error must stay transient — ErrBlockInvalid would poison a valid block")
+			require.Empty(t, mockStore.storedMeta,
+				"an incomplete meta must never reach the store, where it would overwrite an intact file")
+		})
+	}
+}
+
+// TestSubtreeMetaRegenerator_StalledPeer_IsBounded exercises the per-peer
+// deadline against a peer that accepts the request and then never responds.
+// The constructor-field test below only proves the value was stored; deleting
+// the context.WithTimeout in getSubtreeDataFromPeer leaves that test green but
+// fails this one, because the fetch would then inherit the shared client's
+// streaming timeout and hold block validation open for minutes.
+func TestSubtreeMetaRegenerator_StalledPeer_IsBounded(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, _ := buildPeerSubtreeData(t)
+
+	released := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Hold the response open; the regenerator's own deadline is what must
+		// end this, not the peer.
+		select {
+		case <-released:
+		case <-r.Context().Done():
+		}
+	}))
+
+	// Registered before the close below so it runs after it: Close waits for the
+	// handler to return, and the handler only returns once released is closed.
+	defer server.Close()
+	defer close(released)
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, newMockSubtreeStoreWriter(),
+		[]string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 750*time.Millisecond)
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "a stalled peer must not hang block validation")
+	case <-time.After(20 * time.Second):
+		t.Fatal("the per-peer deadline did not bound the fetch against a stalled peer")
+	}
+}
+
 func TestSubtreeMetaRegenerator_PeerFetchTimeoutFallback(t *testing.T) {
 	logger := ulogger.TestLogger{}
 	mockStore := newMockSubtreeStoreWriter()

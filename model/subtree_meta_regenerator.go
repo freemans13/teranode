@@ -181,6 +181,28 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 		}
 	}
 
+	// The subtree data deserializer stops at EOF without checking it filled every node, so a
+	// short or empty body yields trailing nil transactions and a meta with no recorded parents
+	// for the tail. That meta is worse than no meta: GetParentTxHashes returns nil with no
+	// error, validOrderAndBlessed reads that as "transaction could not be found in tx meta
+	// data" and raises ErrBlockInvalid, and ValidateBlock then calls storeInvalidBlock — a
+	// valid block permanently invalidated, which is the outcome this PR exists to prevent.
+	// Fail regeneration instead so the error stays transient.
+	//
+	// Meta.Serialize exempts index 0 unconditionally, but only the first subtree of a block
+	// carries the coinbase placeholder there — for every other subtree node 0 is a real
+	// transaction, so it is checked too.
+	firstChecked := 0
+	if subtree.Length() > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+		firstChecked = 1
+	}
+
+	for i := firstChecked; i < subtree.Length(); i++ {
+		if meta.TxInpoints[i].ParentTxHashes == nil {
+			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: no inpoints for node %d of %d", i, subtree.Length())
+		}
+	}
+
 	return meta, nil
 }
 
