@@ -7,7 +7,7 @@
 | Parameter | Type | Default | Usage | Impact |
 |-----------|------|---------|-------|--------|
 | batch | bool | false | `storeURL.Query().Get("batch") == "true"` | **WRITE-ONLY, EXPERIMENTAL** - see the warning below before enabling |
-| sizeInBytes | int64 | 4194304 | `storeURL.Query().Get("sizeInBytes")` | **CRITICAL** - Controls batch memory usage. Must be greater than 0 |
+| sizeInBytes | int | 4194304 | `storeURL.Query().Get("sizeInBytes")` | **CRITICAL** - Controls batch memory usage. Must be greater than 0 |
 | writeKeys | bool | false | `storeURL.Query().Get("writeKeys") == "true"` | Writes a per-batch index of keys and offsets. Nothing in Teranode reads it back |
 | localDAHStore | string | "" | `storeURL.Query().Get("localDAHStore") != ""` | **CRITICAL** - Enables Delete-At-Height functionality |
 | localDAHStorePath | string | "/tmp/localDAH" | `storeURL.Query().Get("localDAHStorePath")` | DAH metadata storage directory |
@@ -64,7 +64,7 @@
 | Parameter | Validation | Impact | When Checked |
 |-----------|------------|--------|-------------|
 | batch | Boolean string check | Batch wrapper creation | During store initialization |
-| sizeInBytes | ParseInt validation | Batch memory allocation | During batcher creation |
+| sizeInBytes | Atoi validation, must be greater than 0 | Batch memory allocation; a non-positive value is rejected at startup | During batcher creation |
 | writeKeys | Boolean string check | Key indexing behavior | During batcher creation |
 | localDAHStore | Non-empty string check | DAH functionality | During store initialization |
 | hashPrefix | ParseInt validation | Directory structure | During file store creation |
@@ -87,9 +87,10 @@ file:///data/store?batch=true&sizeInBytes=8388608
 > **Warning.** The batch wrapper is write-only. Reads (`Get`, `GetIoReader`, `Exists`),
 > deletion (`Del`) and `SetDAH` all return an unsupported-operation error, and nothing in
 > Teranode parses the batch files it writes — so batched data cannot be read back. Do not
-> combine `batch=true` with `localDAHStore`: `SetCurrentBlockHeight` is a no-op on a batched
-> store, so Delete-At-Height bookkeeping never advances. Writes are also asynchronous, and
-> a batch is held in memory until it reaches `sizeInBytes` or the store is closed.
+> use `batch=true` where Delete-At-Height matters: `SetCurrentBlockHeight` is a no-op on a
+> batched store, so the wrapped store's height never advances and its DAH bookkeeping
+> stalls. Writes are also asynchronous, and a batch is held in memory until adding the next
+> item would take it past `sizeInBytes`, or until the store is closed.
 
 ### Hash-organized Store
 

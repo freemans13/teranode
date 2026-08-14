@@ -130,7 +130,10 @@ type blobStoreSetter interface {
 // Parameters:
 //   - logger: Logger instance for batcher operations and error reporting
 //   - blobStore: The underlying blob store where batches will be stored
-//   - sizeInBytes: Maximum size of a batch in bytes before it's automatically flushed
+//   - sizeInBytes: Maximum size of a batch in bytes before it's automatically flushed.
+//     Must be greater than 0; the buffers are preallocated with this capacity, so a
+//     non-positive value panics in make(). createBatchedStore rejects such a value before
+//     it reaches here, so any other caller has to do the same.
 //   - writeKeys: Whether to store a separate index of keys and their offsets for each batch.
 //     This only helps an external consumer that parses the batch-keys format; nothing in this
 //     repository reads it back (see the package comment).
