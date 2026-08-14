@@ -400,7 +400,7 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 
 	// CalculateUtxoStatus expects uint32; coinbaseSpendingHeight fits since block
 	// heights are well below 2^32.
-	utxoStatus := utxo.CalculateUtxoStatus(spendingData, uint32(coinbaseSpendingHeight), s.blockHeight.Load())
+	utxoStatus := utxo.CalculateUtxoStatus(spendingData, uint32(coinbaseSpendingHeight), s.GetBlockHeight())
 
 	if frozen {
 		utxoStatus = utxo.Status_FROZEN

@@ -9,7 +9,7 @@ import (
 // dahSafeTip returns the highest height Worker 2 may scan: the persisted block
 // height minus a safety lag, so no spend tagged in range can still be mid-commit.
 func (s *Store) dahSafeTip(lag int64) int64 {
-	h := int64(s.blockHeight.Load())
+	h := int64(s.GetBlockHeight())
 	if h <= lag {
 		return 0
 	}

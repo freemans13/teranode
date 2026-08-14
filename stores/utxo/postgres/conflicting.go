@@ -41,7 +41,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		// Widen to int64 before adding so the sum cannot wrap in uint32
 		// arithmetic, then narrow to int32 for the INT4 delete_at_height column
 		// (heights and retention are far below 2^31).
-		v64 := int64(s.blockHeight.Load()) + 1 + int64(s.settings.GetUtxoStoreBlockHeightRetention())
+		v64 := int64(s.GetBlockHeight()) + 1 + int64(s.settings.GetUtxoStoreBlockHeightRetention())
 		v := int32(v64)
 		deleteAtHeight = &v
 	}

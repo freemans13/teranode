@@ -329,14 +329,14 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 
 	// unmined_since is INT4 (heights < 2^31). Use blockHeight + 1, matching the
 	// aerospike Lua (unmined_since = currentBlockHeight) and the sql store
-	// (sql.go: s.blockHeight.Load() + 1) so a reorged-out tx is classified
+	// (sql.go: s.GetBlockHeight() + 1) so a reorged-out tx is classified
 	// identically across backends — a bare blockHeight.Load() made it one block low
 	// and thus prune-eligible one block earlier than the gold standard. Floor at 1:
 	// a stored unmined_since of 0 is indistinguishable at the meta layer from
 	// "mined" — NULL (mined) and 0 both map to UnminedSince==0 in getInternal — so
 	// the value must never be 0 (the +1 already guarantees this for tip >= 0, but
 	// keep the explicit floor as a guard).
-	currentBlockHeight := int32(s.blockHeight.Load()) + 1
+	currentBlockHeight := int32(s.GetBlockHeight()) + 1
 	if currentBlockHeight < 1 {
 		currentBlockHeight = 1
 	}
@@ -438,7 +438,7 @@ func (s *Store) unsetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, b
 		// U1: when fully reorged out (no records remain), insert into pending_unmined.
 		// pending_unmined is ALWAYS-ON (no flag). We derive whether the tx is now fully
 		// unmined from the post-update mined_info returned by RETURNING above.
-		// unmined_since is currentBlockHeight (= s.blockHeight.Load()+1), matching the
+		// unmined_since is currentBlockHeight (= s.GetBlockHeight()+1), matching the
 		// CASE expression in the UPDATE above — COPY-FROM-RETURNING semantics without
 		// re-reading the row. Harmless ON CONFLICT DO UPDATE if the hash was already
 		// in pending_unmined from a prior reorg (idempotent).

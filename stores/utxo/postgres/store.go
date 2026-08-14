@@ -35,9 +35,11 @@ type Store struct {
 	// behaviour when PostgresMaintenancePoolConns <= 0).
 	maintPool *pgxpool.Pool
 
-	// block state
-	blockHeight     atomic.Uint32
-	medianBlockTime atomic.Uint32
+	// utxo.BlockStateFields supplies the chain-tip height and median block time
+	// as one atomic snapshot, and with it the Store interface's six block-state
+	// methods. SetBlockHeight and SetBlockState are wrapped below to keep the
+	// int32-cast guard at the single chokepoint.
+	utxo.BlockStateFields
 
 	// earlyDAHBoundary is the highest block height at or below which a fully-spent
 	// tx may be stamped with an immediate delete-at-height (no retention wait). It
@@ -541,26 +543,14 @@ func (s *Store) SetBlockHeight(blockHeight uint32) error {
 	if _, err := blockHeightToInt32(blockHeight); err != nil {
 		return err
 	}
-	s.blockHeight.Store(blockHeight)
-	return nil
+	return s.BlockStateFields.SetBlockHeight(blockHeight)
 }
 
-func (s *Store) GetBlockHeight() uint32 {
-	return s.blockHeight.Load()
-}
-
-func (s *Store) SetMedianBlockTime(medianTime uint32) error {
-	s.medianBlockTime.Store(medianTime)
-	return nil
-}
-
-func (s *Store) GetMedianBlockTime() uint32 {
-	return s.medianBlockTime.Load()
-}
-
-func (s *Store) GetBlockState() utxo.BlockState {
-	return utxo.BlockState{
-		Height:     s.blockHeight.Load(),
-		MedianTime: s.medianBlockTime.Load(),
+func (s *Store) SetBlockState(blockHeight, medianTime uint32) error {
+	// Same int32-cast guard as SetBlockHeight — this is the other write path for
+	// the tip height.
+	if _, err := blockHeightToInt32(blockHeight); err != nil {
+		return err
 	}
+	return s.BlockStateFields.SetBlockState(blockHeight, medianTime)
 }
