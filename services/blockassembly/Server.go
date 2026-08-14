@@ -322,7 +322,15 @@ func (ba *BlockAssembly) sampleBlockAssemblerMetrics(stallState dequeueStallStat
 
 	prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
 
+	// now is sampled before the timestamp is read, so a consumer that stamps in
+	// that window leaves staleness fractionally negative. Floor it: a gauge
+	// claiming the consumer last ran in the future is nonsense on a dashboard,
+	// and zero is the honest reading for "it just ran".
 	staleness := now.Sub(ba.blockAssembler.LastDequeueTime())
+	if staleness < 0 {
+		staleness = 0
+	}
+
 	prometheusBlockAssemblerDequeueStalenessSeconds.Set(staleness.Seconds())
 
 	stallState, stallEvent, stalledFor := observeDequeueStall(stallState, now, queueLength, staleness)
