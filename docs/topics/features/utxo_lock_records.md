@@ -80,7 +80,7 @@ const LockRecordIndex = uint32(0xFFFFFFFE)
 | `process_id` | `int` | OS process ID that holds the lock |
 | `hostname` | `string` | Host where lock was acquired |
 | `expected_recs` | `int` | Number of records to be created |
-| `lock_token` | `string` | Random 16-byte hex token identifying this acquisition |
+| `lock_token` | `string` | Random token (at least 128 bits) identifying this acquisition |
 
 ### 3.2. Creating Flag
 

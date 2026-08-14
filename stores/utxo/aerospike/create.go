@@ -57,7 +57,6 @@ package aerospike
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"os"
 	"runtime/debug"
 	"sync/atomic"
@@ -1035,6 +1034,13 @@ func isKeyExists(err error) bool {
 	return errors.As(err, &aErr) && aErr.Matches(types.KEY_EXISTS_ERROR)
 }
 
+// isFilteredOut reports whether err is Aerospike's "the policy's filter expression did not
+// match" result, which on a write means the server declined to apply it.
+func isFilteredOut(err error) bool {
+	var aErr aerospike.Error
+	return errors.As(err, &aErr) && aErr.Matches(types.FILTERED_OUT)
+}
+
 // classifyCreateBatchResults decides, from one CREATE_ONLY batch's per-record results,
 // whether THIS writer created the transaction.
 //
@@ -1282,19 +1288,6 @@ func calculateLockTTL(numRecords int) uint32 {
 	return ttl
 }
 
-// generateLockToken returns a fresh, random 16-byte token, hex-encoded, that uniquely
-// identifies one acquisition of the creation lock. It is written into the lock record
-// so that release can later prove it is deleting the lock it created, rather than a
-// different writer's lock that was created after this one's TTL expired.
-func generateLockToken() (string, error) {
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		return "", errors.NewProcessingError("failed to generate lock token", err)
-	}
-
-	return hex.EncodeToString(buf), nil
-}
-
 // acquireLock creates and acquires the lock record for transaction creation
 // Returns the lock key and the token identifying this acquisition on success, or error
 // if lock acquisition fails
@@ -1311,10 +1304,10 @@ func (s *Store) acquireLock(txHash *chainhash.Hash, numRecords int) (*aerospike.
 
 	hostname, _ := os.Hostname()
 
-	token, tokenErr := generateLockToken()
-	if tokenErr != nil {
-		return nil, "", tokenErr
-	}
+	// token uniquely identifies this acquisition, so that releaseLock can prove it is
+	// deleting the lock it was handed rather than a different writer's lock created
+	// after this one's TTL expired. rand.Text is at least 128 bits and cannot fail.
+	token := rand.Text()
 
 	lockBins := []*aerospike.Bin{
 		aerospike.NewBin("created_at", time.Now().Unix()),
@@ -1366,21 +1359,17 @@ func (s *Store) releaseLock(lockKey *aerospike.Key, token string) error {
 
 	existed, err := s.client.Delete(policy, lockKey)
 	if err != nil {
-		var aErr aerospike.Error
-		if errors.As(err, &aErr) && aErr.Matches(types.FILTERED_OUT) {
+		if isFilteredOut(err) {
 			s.logger.Debugf("[releaseLock] Lock record for key %v is now held by a different token; not ours to delete", lockKey)
-			return nil
-		}
-
-		if isKeyNotFound(err) {
 			return nil
 		}
 
 		return err
 	}
 
-	// A missing lock record is not an error on the delete path - the client reports it as
-	// existed=false with a nil error - but it is worth distinguishing in the logs from a
+	// A missing lock record is not an error on the delete path - the client maps the
+	// server's KEY_NOT_FOUND to existed=false with a nil error, so there is no separate
+	// not-found branch to take here - but it is worth distinguishing in the logs from a
 	// delete that actually removed our lock.
 	if !existed {
 		s.logger.Debugf("[releaseLock] Lock record for key %v already gone (expired or already released)", lockKey)
