@@ -37,6 +37,7 @@ var (
 
 	// Additional metrics for block assembler operations
 	prometheusBlockAssemblerGetMiningCandidate          prometheus.Counter
+	prometheusBlockAssemblerCandidateTimeClockSkew      prometheus.Counter
 	prometheusBlockAssemblerSubtreeCreated              prometheus.Counter
 	prometheusBlockAssemblerTransactions                prometheus.Gauge
 	prometheusBlockAssemblerQueuedTransactions          prometheus.Gauge
@@ -51,6 +52,7 @@ var (
 	prometheusBlockAssemblyCurrentBlockHeight           prometheus.Gauge
 	prometheusBlockAssemblyTipLagBlocks                 prometheus.Gauge
 	prometheusBlockAssemblyProcessingStuck              *prometheus.CounterVec
+	prometheusBlockAssemblyCoinbaseDivergence           *prometheus.CounterVec
 	prometheusBlockAssemblerCurrentState                prometheus.Gauge
 	prometheusBlockAssemblerStateTransitions            *prometheus.CounterVec
 	prometheusBlockAssemblerStateDuration               *prometheus.HistogramVec
@@ -161,6 +163,15 @@ func _initPrometheusMetrics() {
 			Subsystem: "blockassembly",
 			Name:      "block_assembler_get_mining_candidate",
 			Help:      "Number of calls to GetMiningCandidate in the block assembler",
+		},
+	)
+
+	prometheusBlockAssemblerCandidateTimeClockSkew = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "block_assembler_candidate_time_clock_skew",
+			Help:      "Mining-candidate polls refused because the parent's median-time-past floor is above the two-hour future bound, so no valid block timestamp exists; a non-zero rate means the local clock is far behind the network and block production has stopped",
 		},
 	)
 
@@ -313,6 +324,16 @@ func _initPrometheusMetrics() {
 			Help:      "Count of block assembly catch-up/reorg/move-forward failures that left the assembler behind the tip, labelled by reason (issue #980).",
 		},
 		[]string{"reason"},
+	)
+
+	prometheusBlockAssemblyCoinbaseDivergence = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "coinbase_divergence_total",
+			Help:      "Coinbase-divergence events by outcome. Every detection records exactly one follow-up outcome, so detected == repaired + no_gap + escalated + aborted.",
+		},
+		[]string{"outcome"},
 	)
 
 	prometheusBlockAssemblerCurrentState = promauto.NewGauge(
