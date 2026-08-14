@@ -1515,9 +1515,11 @@ func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockU
 
 	// findCommonAncestor rejects any candidate above this same tip, so this cannot trip while
 	// both steps share one read — it is kept as a guard on that arrangement, and on the uint32
-	// subtraction below. If it ever does trip we cannot reason about the fork, so abort.
+	// subtraction below. Both heights come from our own blockchain store, so a trip means our
+	// state is inconsistent with itself, never that the peer misbehaved: ServiceError, so the
+	// caller retries locally rather than charging the peer.
 	if commonAncestorMeta.Height > currentHeight {
-		return errors.NewProcessingError("[catchup][%s] common ancestor height %d is ahead of current height %d - this should not happen", blockUpTo.Hash().String(), commonAncestorMeta.Height, currentHeight)
+		return errors.NewServiceError("[catchup][%s] common ancestor height %d is ahead of current height %d - this should not happen", blockUpTo.Hash().String(), commonAncestorMeta.Height, currentHeight)
 	}
 
 	blocksBehind := currentHeight - commonAncestorMeta.Height
