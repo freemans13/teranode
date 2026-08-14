@@ -2038,30 +2038,23 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// Cache the block BEFORE updating subtrees DAH to avoid race condition
 		// The setMined worker needs the block cached when it receives the BlockSubtreesSet notification
 		//
-		// Skipped on the optimistic-mining path. There the background goroutine
-		// above may still be inside block.Valid on this same *Block, and
-		// nothing waits on optimisticMiningWg. Caching it here exposes it to
-		// the 2-minute TTL eviction, whose callback releases the block's
-		// subtree nodes — nil-ing SubtreeSlices entries and returning pooled
-		// []Node slices while that validation is still reading them. The
-		// goroutine already caches the block itself once Valid returns, which
-		// is the only Set on this path with a safe lifetime.
+		// Both are skipped under optimistic mining, which does them in its
+		// background validation goroutine instead. That goroutine may still be
+		// inside block.Valid on this same *Block, and nothing waits on
+		// optimisticMiningWg, so caching the block here would expose it to the
+		// 2-minute TTL eviction — whose callback releases the block's subtree
+		// nodes, nil-ing SubtreeSlices entries and returning pooled []Node
+		// slices while that validation is still reading them. The goroutine
+		// caches the block once Valid returns, which is the only Set on this
+		// path with a lifetime that outlives its reader.
 		if !useOptimisticMining {
 			if u.hasValidSubtrees(block) {
 				u.logger.Debugf("[ValidateBlock][%s] caching block with %d subtrees loaded", block.Hash().String(), block.GetSubtreeSlicesCount())
 				u.lastValidatedBlocks.Set(*block.Hash(), block)
 			} else {
-				if !block.SubtreesLoaded() {
-					u.logger.Warnf("[ValidateBlock][%s] not caching block - subtrees not loaded (%d slices, %d hashes)", block.Hash().String(), block.GetSubtreeSlicesCount(), len(block.Subtrees))
-				} else {
-					u.logger.Warnf("[ValidateBlock][%s] not caching block - some subtrees are nil", block.Hash().String())
-				}
+				u.logger.Warnf("[ValidateBlock][%s] not caching block - subtrees not loaded (%d slices, %d hashes)", block.Hash().String(), block.GetSubtreeSlicesCount(), len(block.Subtrees))
 			}
-		}
 
-		// Only update subtrees DAH for non-optimistic mining
-		// (optimistic mining handles this in its background validation goroutine)
-		if !useOptimisticMining {
 			// it's critical that we call updateSubtreesDAH() only when we know the block is valid
 			// This sends the BlockSubtreesSet notification which triggers setMined
 			if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {

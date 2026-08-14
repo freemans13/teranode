@@ -4,13 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"os"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
@@ -43,14 +41,7 @@ func TestGetAndValidateSubtrees_ReloadsAfterNodesReleased(t *testing.T) {
 	blobStore := blobmemory.New()
 	storeSubtree(t, blobStore, st)
 
-	blockHeaderBytes, _ := hex.DecodeString(block1Header)
-	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-	require.NoError(t, err)
-
-	coinbase, err := bt.NewTxFromString(CoinbaseHex)
-	require.NoError(t, err)
-
-	b, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{st.RootHash()}, 2, 123, 0, 0)
+	b, err := NewBlock(newTestBlockHeader(t), newTestCoinbaseTx(t), []*chainhash.Hash{st.RootHash()}, 2, 123, 0, 0)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -112,14 +103,7 @@ func TestGetAndValidateSubtrees_SizeMismatchDoesNotDeadlock(t *testing.T) {
 	st1 := newSubtree(1, false, "one")
 	st2 := newSubtree(2, false, "two")
 
-	blockHeaderBytes, _ := hex.DecodeString(block1Header)
-	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-	require.NoError(t, err)
-
-	coinbase, err := bt.NewTxFromString(CoinbaseHex)
-	require.NoError(t, err)
-
-	b, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{
+	b, err := NewBlock(newTestBlockHeader(t), newTestCoinbaseTx(t), []*chainhash.Hash{
 		st0.RootHash(), st1.RootHash(), st2.RootHash(),
 	}, 5, 123, 0, 0)
 	require.NoError(t, err)
@@ -163,14 +147,7 @@ func TestGetAndValidateSubtrees_ReloadClosesSurvivingSubtrees(t *testing.T) {
 	require.NoError(t, second.AddNode(chainhash.HashH([]byte("gutted-b")), 1, 0))
 	storeSubtree(t, blobStore, second)
 
-	blockHeaderBytes, _ := hex.DecodeString(block1Header)
-	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-	require.NoError(t, err)
-
-	coinbase, err := bt.NewTxFromString(CoinbaseHex)
-	require.NoError(t, err)
-
-	b, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{first.RootHash(), second.RootHash()}, 4, 123, 0, 0)
+	b, err := NewBlock(newTestBlockHeader(t), newTestCoinbaseTx(t), []*chainhash.Hash{first.RootHash(), second.RootHash()}, 4, 123, 0, 0)
 	require.NoError(t, err)
 
 	ctx := context.Background()

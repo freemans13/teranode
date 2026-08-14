@@ -165,6 +165,14 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_FromLocal(t *testing.T) {
 	require.Len(t, mockStore.storedMeta, 1)
 }
 
+// TestSubtreeMetaRegenerator_RegenerateMeta_FromPeer also pins the peer URL
+// contract: the URL handed to the regenerator is the announcing peer's DataHub
+// URL, which already ends in the API prefix (every asset_httpAddress /
+// asset_httpPublicAddress form in settings.conf embeds ${asset_apiPrefix}). The
+// regenerator must request <peerURL>/subtree_data/<hash> exactly like
+// check_block_subtrees.go and peer_cache_bypass.go do — appending a second
+// prefix 404s on every real peer, which is why the handler below serves only
+// /api/v1/subtree_data/<hash> and 404s everything else.
 func TestSubtreeMetaRegenerator_RegenerateMeta_FromPeer(t *testing.T) {
 	allowLoopbackHTTP(t)
 
@@ -380,39 +388,6 @@ func buildPeerSubtreeData(t *testing.T) (*subtreepkg.Subtree, *chainhash.Hash, [
 	require.NoError(t, err)
 
 	return subtree, subtree.RootHash(), subtreeDataBytes
-}
-
-// TestSubtreeMetaRegenerator_PeerBaseURLAlreadyHasAPIPrefix pins the production
-// contract: the peer URL handed to the regenerator is the announcing peer's
-// DataHub URL, which already ends in the API prefix (every asset_httpAddress /
-// asset_httpPublicAddress form in settings.conf embeds ${asset_apiPrefix}).
-// The regenerator must request <peerURL>/subtree_data/<hash> exactly like
-// check_block_subtrees.go and peer_cache_bypass.go do, and must not append a
-// second prefix (which 404s on every real peer).
-func TestSubtreeMetaRegenerator_PeerBaseURLAlreadyHasAPIPrefix(t *testing.T) {
-	allowLoopbackHTTP(t)
-
-	subtree, subtreeHash, subtreeDataBytes := buildPeerSubtreeData(t)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/subtree_data/"+subtreeHash.String() {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(subtreeDataBytes)
-		} else {
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-
-	mockStore := newMockSubtreeStoreWriter()
-	logger := ulogger.TestLogger{}
-
-	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
-
-	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
-
-	require.NoError(t, err)
-	require.NotNil(t, meta)
 }
 
 // TestSubtreeMetaRegenerator_RetriesOn503 verifies the peer fetch backs off and

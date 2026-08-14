@@ -3,10 +3,8 @@ package model
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"testing"
 
-	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -42,15 +40,6 @@ import (
 func newTestBlockWithSubtreeSlices(t *testing.T, slices []*subtreepkg.Subtree) *Block {
 	t.Helper()
 
-	blockHeaderBytes, err := hex.DecodeString(block1Header)
-	require.NoError(t, err)
-
-	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-	require.NoError(t, err)
-
-	coinbase, err := bt.NewTxFromString(CoinbaseHex)
-	require.NoError(t, err)
-
 	hashes := make([]*chainhash.Hash, 0, len(slices))
 
 	for _, st := range slices {
@@ -60,17 +49,13 @@ func newTestBlockWithSubtreeSlices(t *testing.T, slices []*subtreepkg.Subtree) *
 		}
 
 		// A nil entry still needs a hash in b.Subtrees: the readers size their
-		// work from len(b.Subtrees), and the real block always has one.
-		raw := make([]byte, 32)
-		_, _ = rand.Read(raw)
-
-		h, hErr := chainhash.NewHash(raw)
-		require.NoError(t, hErr)
-
-		hashes = append(hashes, h)
+		// work from len(b.Subtrees), and the real block always has one. Nothing
+		// reads the value, so a fixed placeholder is better than a random hash
+		// — it cannot pass on a lucky draw.
+		hashes = append(hashes, &chainhash.Hash{})
 	}
 
-	b, err := NewBlock(blockHeader, coinbase, hashes, 2, 123, 0, 0)
+	b, err := NewBlock(newTestBlockHeader(t), newTestCoinbaseTx(t), hashes, 2, 123, 0, 0)
 	require.NoError(t, err)
 
 	b.SubtreeSlices = slices
@@ -155,9 +140,18 @@ func TestCheckDuplicateTransactions_NilSubtreeEntryIsTransient(t *testing.T) {
 	})
 }
 
-// TestCheckMerkleRoot_NilSubtreeEntryIsTransient pins the guard CheckMerkleRoot
-// already had — the precedent the other guards are modelled on — so a later
-// refactor cannot quietly drop it.
+// TestCheckMerkleRoot_NilSubtreeEntryIsTransient pins the OUTCOME for a nil
+// entry in CheckMerkleRoot — a processing error, never a consensus verdict.
+//
+// It deliberately does not claim to pin CheckMerkleRoot's own entry-nil guard,
+// and cannot: that guard is defence in depth rather than the load-bearing
+// check. Removing it keeps this test green from either subtree position,
+// because go-subtree degrades gracefully on a nil receiver — RootHash returns
+// a nil pointer, which the rootHash == nil check below catches, and
+// RootHashWithReplaceRootNode returns an error rather than panicking. Both
+// were confirmed by removing the guard and re-running. Keep the guard anyway:
+// it fails fast with the index in the message, and it does not depend on a
+// third-party package's nil-receiver behaviour staying charitable.
 func TestCheckMerkleRoot_NilSubtreeEntryIsTransient(t *testing.T) {
 	b := newTestBlockWithSubtreeSlices(t, []*subtreepkg.Subtree{newCompleteTestSubtree(t), nil})
 

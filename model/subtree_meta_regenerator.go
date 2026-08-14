@@ -80,8 +80,7 @@ func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash
 
 	// Fall back to peers. lastErr starts as the local failure so the returned
 	// error always carries a cause: with no peers configured it explains why
-	// the local lookup missed, rather than reporting a bare "not available"
-	// (and, before this seeding, risking a %!(EXTRA <nil>) formatting artifact).
+	// the local lookup missed, rather than reporting a bare "not available".
 	lastErr := err
 
 	for _, peerURL := range r.peerURLs {
