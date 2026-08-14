@@ -2037,14 +2037,25 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 		// Cache the block BEFORE updating subtrees DAH to avoid race condition
 		// The setMined worker needs the block cached when it receives the BlockSubtreesSet notification
-		if u.hasValidSubtrees(block) {
-			u.logger.Debugf("[ValidateBlock][%s] caching block with %d subtrees loaded", block.Hash().String(), block.GetSubtreeSlicesCount())
-			u.lastValidatedBlocks.Set(*block.Hash(), block)
-		} else {
-			if !block.SubtreesLoaded() {
-				u.logger.Warnf("[ValidateBlock][%s] not caching block - subtrees not loaded (%d slices, %d hashes)", block.Hash().String(), block.GetSubtreeSlicesCount(), len(block.Subtrees))
+		//
+		// Skipped on the optimistic-mining path. There the background goroutine
+		// above may still be inside block.Valid on this same *Block, and
+		// nothing waits on optimisticMiningWg. Caching it here exposes it to
+		// the 2-minute TTL eviction, whose callback releases the block's
+		// subtree nodes — nil-ing SubtreeSlices entries and returning pooled
+		// []Node slices while that validation is still reading them. The
+		// goroutine already caches the block itself once Valid returns, which
+		// is the only Set on this path with a safe lifetime.
+		if !useOptimisticMining {
+			if u.hasValidSubtrees(block) {
+				u.logger.Debugf("[ValidateBlock][%s] caching block with %d subtrees loaded", block.Hash().String(), block.GetSubtreeSlicesCount())
+				u.lastValidatedBlocks.Set(*block.Hash(), block)
 			} else {
-				u.logger.Warnf("[ValidateBlock][%s] not caching block - some subtrees are nil", block.Hash().String())
+				if !block.SubtreesLoaded() {
+					u.logger.Warnf("[ValidateBlock][%s] not caching block - subtrees not loaded (%d slices, %d hashes)", block.Hash().String(), block.GetSubtreeSlicesCount(), len(block.Subtrees))
+				} else {
+					u.logger.Warnf("[ValidateBlock][%s] not caching block - some subtrees are nil", block.Hash().String())
+				}
 			}
 		}
 
