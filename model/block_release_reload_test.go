@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -227,11 +228,29 @@ func TestReleaseSubtreeNodes_ClosesMmapAndNilsEntries(t *testing.T) {
 
 	b := &Block{SubtreeSlices: []*subtreepkg.Subtree{heapSt, mmapSt, nil}}
 
+	// Capture the backing arrays before the release nils them. Asserting the
+	// COUNT of pooled slices is not enough: both subtrees carry two nodes, so
+	// inverting the IsMmapBacked guard still pools exactly one slice — the mmap
+	// region — and a count-only assertion waves through the precise
+	// use-after-free the guard exists to prevent. Identity is the assertion
+	// that has teeth.
+	// Compared as plain integers, never dereferenced: by the time we assert,
+	// Close has munmapped the mmap region, so reading through that pointer
+	// would fault the test binary rather than fail it.
+	heapNodesPtr := reflect.ValueOf(heapSt.Nodes).Pointer()
+	mmapNodesPtr := reflect.ValueOf(mmapSt.Nodes).Pointer()
+	require.NotEmpty(t, heapSt.Nodes, "sanity: the heap-backed subtree has nodes to pool")
+	require.NotEmpty(t, mmapSt.Nodes, "sanity: the mmap-backed subtree has nodes")
+
 	var pooled [][]subtreepkg.Node
 	require.NoError(t, b.ReleaseSubtreeNodes(func(nodes []subtreepkg.Node) { pooled = append(pooled, nodes) }),
 		"a clean release must report no Close errors")
 
 	require.Len(t, pooled, 1, "only the heap-backed slice may be pooled")
+	require.Equal(t, heapNodesPtr, reflect.ValueOf(pooled[0]).Pointer(),
+		"the pooled slice must be the heap-backed subtree's own backing array")
+	require.NotEqual(t, mmapNodesPtr, reflect.ValueOf(pooled[0]).Pointer(),
+		"the mmap region must never reach the pool: Close munmaps it, and the pool would hand it out as a live Node slice")
 	require.Nil(t, b.SubtreeSlices[0])
 	require.Nil(t, b.SubtreeSlices[1])
 
