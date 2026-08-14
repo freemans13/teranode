@@ -34,12 +34,12 @@ func TestBudgetReserve(t *testing.T) {
 		{"no limit at all yields no budget", 0, 0},
 		{"a limit of one reserves nothing it cannot spare", 1, 1},
 		{"a tiny limit reserves half", 2, 1},
-		{"half of a small limit, just below the handover", 511, 256},
-		{"at twice Headroom the two rules agree", 512, 256},
-		{"just above the handover", 513, 257},
-		{"the last limit where half still binds", 1023, 512},
-		{"the handover point itself", 1024, 512},
-		{"the first limit where the fixed reserve binds", 1025, 513},
+		{"a limit just below Headroom reserves half of itself", 511, 256},
+		{"a limit equal to Headroom reserves half, not all of it", 512, 256},
+		{"just above Headroom the reserve is still half", 513, 257},
+		{"the last limit where half is the smaller reserve", 1023, 512},
+		{"at twice Headroom the two reserves agree", 1024, 512},
+		{"the last limit where the two reserves still agree", 1025, 513},
 		{"an ample limit reserves exactly Headroom", 100_000, 100_000 - Headroom},
 	}
 
