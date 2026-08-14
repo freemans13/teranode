@@ -33,6 +33,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -214,6 +215,39 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 	return b
 }
 
+// shouldFlushBefore reports whether the accumulated batch has to be written out before an
+// item of dataSize bytes can be appended to it.
+//
+// Two things force a flush. The obvious one is the configured size limit. The second is the
+// uint32 offset that each key record uses to address its item: a batch is retained across
+// flush failures, so it can grow past that ceiling, and the conversion in processBatchItem
+// would then fail with the item already dequeued and its caller long since told the write
+// was queued. Flushing first resets the offset to zero, so the item is appended normally
+// instead of being dropped. The ceiling only binds when key records are actually written.
+//
+// An empty batch is never flushed: there is nothing to write, and an item larger than the
+// whole batch size is appended on its own and flushed by the next Set or by Close.
+//
+// Parameters:
+//   - currentPos: Current length of the accumulated batch, and the offset the item would take
+//   - dataSize: Length of the item about to be appended
+//   - sizeInBytes: Configured maximum batch size
+//   - writeKeys: Whether key records, and therefore uint32 offsets, are being written
+//
+// Returns:
+//   - bool: Whether the batch must be flushed before appending the item
+func shouldFlushBefore(currentPos, dataSize, sizeInBytes int, writeKeys bool) bool {
+	if currentPos == 0 {
+		return false
+	}
+
+	if currentPos+dataSize > sizeInBytes {
+		return true
+	}
+
+	return writeKeys && int64(currentPos)+int64(dataSize) > math.MaxUint32
+}
+
 // processBatchItem handles a single batch item, adding it to the current batch.
 // If adding the item would exceed the configured batch size limit, the current batch
 // is first flushed to the underlying store. This method is called by the background
@@ -231,7 +265,7 @@ func (b *Batcher) processBatchItem(batchItem *BatchItem) error {
 
 	var flushErr error
 
-	if currentPos+dataSize > b.sizeInBytes && currentPos > 0 {
+	if shouldFlushBefore(currentPos, dataSize, b.sizeInBytes, b.writeKeys) {
 		flushErr = b.writeBatch(b.currentBatch, b.currentBatchKeys)
 
 		// Only reset the batch (and the position the item is about to be keyed against) if the
@@ -251,8 +285,14 @@ func (b *Batcher) processBatchItem(batchItem *BatchItem) error {
 	// The key record is built before the value is appended, not after. Both currentPos and
 	// dataSize are already known here, and building it first means a failed conversion cannot
 	// return with the value already sitting in the batch data and no index entry addressing
-	// it. That path is reachable now that a batch is retained across flush failures and can
-	// therefore grow past the uint32 offset ceiling.
+	// it.
+	//
+	// shouldFlushBefore above keeps currentPos under the uint32 ceiling whenever a flush can
+	// succeed, and Set rejects a value too large to be addressed by one, so the conversions
+	// below only fail in one remaining case: the backend is dead, the retained batch has
+	// already grown past 4 GiB, and the flush that would have reset it failed too. That batch
+	// is unwritable either way — Close reports it as lost — so dropping one further item
+	// changes nothing that was still recoverable.
 	var keyRecord []byte
 
 	if b.writeKeys {
@@ -265,6 +305,13 @@ func (b *Batcher) processBatchItem(batchItem *BatchItem) error {
 
 		currentPosUint32, err := safeconversion.IntToUint32(currentPos)
 		if err != nil {
+			// Carry flushErr when there is one. This path is only reached after a failed flush,
+			// so returning the conversion error alone would lose the "error writing batch"
+			// signal that tells the worker why the backend is unhealthy in the first place.
+			if flushErr != nil {
+				return errors.NewStorageError("error writing batch, and item at offset %d cannot be addressed in a key record", currentPos, flushErr)
+			}
+
 			return err
 		}
 
@@ -508,6 +555,13 @@ func (b *Batcher) SetFromReader(ctx context.Context, key []byte, fileType filefo
 //   - value: The blob data to store
 //   - opts: Optional file options (ignored in this implementation)
 //
+// Set does not copy value. It enqueues the caller's slice and the worker appends it to the
+// batch later, so the batcher takes ownership of those bytes until the batch is flushed:
+// mutating or reusing the buffer after Set returns corrupts the batch. Every other blob
+// store is synchronous and copies before returning, so this is the one backend where that
+// is unsafe. Copying here instead would add a full copy per item to the only path this type
+// exists to make cheap.
+//
 // After Close, Set returns an error rather than accepting a write it cannot honour: the
 // worker goroutine has stopped, so an item enqueued then would sit in the queue forever
 // while its caller was told the write had been accepted. A Set running concurrently with
@@ -524,6 +578,13 @@ func (b *Batcher) Set(_ context.Context, hash []byte, fileType fileformat.FileTy
 
 	if b.closed.Load() {
 		return errors.NewStorageError("batcher is closed, write not accepted")
+	}
+
+	// A key record addresses its item's size with a uint32, so a value this large could never
+	// be indexed. Refuse it here, synchronously, rather than accepting it and discarding it in
+	// the worker once its caller has already been told the write was queued.
+	if b.writeKeys && int64(len(value)) > math.MaxUint32 {
+		return errors.NewInvalidArgumentError("value of %d bytes cannot be indexed in a batch key record, limit is %d", len(value), int64(math.MaxUint32))
 	}
 
 	b.queue.Enqueue(BatchItem{

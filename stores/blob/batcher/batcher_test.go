@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -564,4 +565,55 @@ func TestBatcher_Set_ShortKey_ReturnsError(t *testing.T) {
 
 	err := batcher.Set(context.Background(), shortKey, fileformat.FileTypeUtxoSet, []byte("value"))
 	require.Error(t, err)
+}
+
+// TestBatcher_shouldFlushBefore pins the last "told success, dropped the bytes" path.
+// Key records address each item with a uint32 offset, so a batch retained across flush
+// failures could grow past that ceiling; the conversion in processBatchItem then failed
+// and returned before appending the item, discarding bytes whose caller had long since
+// been told the write was queued. The batch has to be flushed before it can reach the
+// ceiling, which resets the offset to zero and lets the item be appended normally.
+//
+// The arithmetic is exercised directly rather than through Set, because reaching the
+// ceiling for real would need a 4 GiB batch.
+func TestBatcher_shouldFlushBefore(t *testing.T) {
+	// One item short of the ceiling, so a modest item tips it over.
+	nearCeiling := int(math.MaxUint32) - 8
+
+	tests := []struct {
+		name        string
+		currentPos  int
+		dataSize    int
+		sizeInBytes int
+		writeKeys   bool
+		want        bool
+	}{
+		{
+			name:       "an empty batch is never flushed, even for an oversize item",
+			currentPos: 0, dataSize: 4096, sizeInBytes: 1024, want: false,
+		},
+		{
+			name:       "an item that exactly fills the batch does not flush first",
+			currentPos: 512, dataSize: 512, sizeInBytes: 1024, want: false,
+		},
+		{
+			name:       "one byte of overflow flushes first",
+			currentPos: 512, dataSize: 513, sizeInBytes: 1024, want: true,
+		},
+		{
+			name:       "the uint32 offset ceiling flushes first when keys are written",
+			currentPos: nearCeiling, dataSize: 16, sizeInBytes: math.MaxInt, writeKeys: true, want: true,
+		},
+		{
+			name:       "the uint32 offset ceiling is irrelevant when no keys are written",
+			currentPos: nearCeiling, dataSize: 16, sizeInBytes: math.MaxInt, writeKeys: false, want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldFlushBefore(tt.currentPos, tt.dataSize, tt.sizeInBytes, tt.writeKeys)
+			require.Equal(t, tt.want, got)
+		})
+	}
 }
