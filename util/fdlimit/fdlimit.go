@@ -19,7 +19,8 @@ const Headroom uint64 = 512
 var get = getRlimit
 
 // Budget reports the descriptors available for a bounded workload: the soft
-// open-file limit, less Headroom.
+// open-file limit, less a reserve of Headroom — or of half the limit, where
+// that is the smaller of the two.
 //
 // It deliberately does not raise the limit, for two reasons. The Go runtime
 // already raises RLIMIT_NOFILE to the hard limit during startup, before main
