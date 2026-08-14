@@ -292,11 +292,11 @@ type Interface interface {
 	//   - uint64: Total transaction count
 	TxCount() uint64
 
-	// QueueLength returns the current length of the processing queue.
-	// This indicates the processor's current workload.
+	// QueueLength returns the number of transactions currently queued, not
+	// the number of batches. This indicates the processor's current workload.
 	//
 	// Returns:
-	//   - int64: Current queue length
+	//   - int64: Current queue length, in transactions
 	QueueLength() int64
 
 	// LastDequeueTime returns the wall-clock time the consumer goroutine last

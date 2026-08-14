@@ -283,10 +283,11 @@ func (b *BlockAssembler) TxCount() uint64 {
 	return b.subtreeProcessor.TxCount()
 }
 
-// QueueLength returns the current length of the transaction queue.
+// QueueLength returns the number of transactions currently queued in the
+// subtree processor's intake queue, not the number of batches.
 //
 // Returns:
-//   - int64: Current queue length
+//   - int64: Current queue length, in transactions
 func (b *BlockAssembler) QueueLength() int64 {
 	return b.subtreeProcessor.QueueLength()
 }

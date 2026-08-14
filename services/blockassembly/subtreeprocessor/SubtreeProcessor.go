@@ -1882,10 +1882,12 @@ func (stp *SubtreeProcessor) TxCount() uint64 {
 	return stp.txCount.Load()
 }
 
-// QueueLength returns the current length of the transaction queue.
+// QueueLength returns the number of transactions currently queued, not the
+// number of batches - see LockFreeQueue.length for why that distinction
+// matters.
 //
 // Returns:
-//   - int64: Current queue length
+//   - int64: Current queue length, in transactions
 func (stp *SubtreeProcessor) QueueLength() int64 {
 	return stp.queue.length()
 }
