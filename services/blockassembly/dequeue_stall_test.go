@@ -153,7 +153,9 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			staleness:   time.Second,
 			wantEvent:   dequeueStallEnded,
 			wantStalled: false,
-			wantFor:     10 * time.Minute,
+			// The consumer resumed one second before this tick saw it, so the
+			// incident ran to stallBase+10m-1s, not to the tick instant.
+			wantFor: 10*time.Minute - time.Second,
 		},
 		{
 			name: "recoveryWithWorkStillQueuedStillCounts",
@@ -165,7 +167,7 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			staleness:   time.Second,
 			wantEvent:   dequeueStallEnded,
 			wantStalled: false,
-			wantFor:     3 * time.Minute,
+			wantFor:     3*time.Minute - time.Second,
 		},
 		{
 			name:        "recoveryAtThresholdExactly",
@@ -175,7 +177,10 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			staleness:   dequeueStallThreshold,
 			wantEvent:   dequeueStallEnded,
 			wantStalled: false,
-			wantFor:     time.Minute,
+			// The worst case for the correction: recovery is only detectable
+			// once staleness has fallen to the threshold, so a full threshold's
+			// worth of running time would otherwise be counted as stalled.
+			wantFor: time.Minute - dequeueStallThreshold,
 		},
 	}
 
@@ -267,10 +272,13 @@ func TestObserveDequeueStall_IncidentIsReportedAsOneIncident(t *testing.T) {
 	require.Equal(t, 3, continued,
 		"a 7-minute stall must repeat on the 2-minute cadence throughout, including while the queue sits at zero")
 
-	// The rising edge fires on the first tick where staleness exceeds the
-	// threshold - stallBase+35s - and backdates by that staleness to stallBase+0s.
-	// Recovery is detected at stallBase+7m. The whole incident, not a fragment.
-	require.Equal(t, resumeAt, reportedAs,
+	// Both ends are dated from the consumer, not from the tick that noticed.
+	// The stall opens on the first tick where staleness exceeds the threshold -
+	// stallBase+35s - and backdates by that staleness to stallBase+0s. Recovery
+	// is seen at stallBase+7m with a second of staleness still on the clock, so
+	// the consumer resumed at stallBase+7m-1s. The whole incident, not a
+	// fragment, and not padded at either end.
+	require.Equal(t, resumeAt-time.Second, reportedAs,
 		"the reported duration must cover the whole incident, from when the consumer stopped to when it resumed")
 	require.False(t, state.stalled)
 }

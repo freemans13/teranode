@@ -95,7 +95,15 @@ func observeDequeueStall(state dequeueStallState, now time.Time, queueLength int
 	}
 
 	if staleness <= dequeueStallThreshold {
-		return dequeueStallState{}, dequeueStallEnded, now.Sub(state.stalledSince)
+		// End the incident when the consumer resumed, not when this tick
+		// noticed - the same correction stalledSince applies to the start.
+		// Recovery is only visible once staleness has fallen back to the
+		// threshold, so by now the consumer has been running again for
+		// staleness, which is up to dequeueStallThreshold plus a tick. Timing
+		// to now would add that to every reported duration. The result cannot
+		// go negative: staleness here is at most the threshold, and the
+		// staleness that opened the incident exceeded it.
+		return dequeueStallState{}, dequeueStallEnded, now.Add(-staleness).Sub(state.stalledSince)
 	}
 
 	if now.Sub(state.lastWarn) >= dequeueStallWarnRepeat {
