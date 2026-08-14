@@ -454,16 +454,22 @@ func TestReleaseCatchupLock_DrainChargesPrimaryEvenOnMixedCycle(t *testing.T) {
 // genuinely LOCAL failure (get_blocks.go's "Local error fetching subtree ...
 // not retrying with other peers", re-wrapped by fetchSubtreeDataForBlock).
 // releaseCatchupLock's switch has no specific case for generic ErrServiceError
-// (only the narrower ErrServiceUnavailable). This particular fixture wraps a
-// StorageError — the shape IsLocalError admits most often in production, since
-// get_blocks.go's own store reads and writes are all ErrStorageError-coded — so
-// since issue 1439 it lands in the local_storage_fault case rather than the
-// unknown_error default, and isPeerError is false rather than true. Either way
-// nothing outside the drain charges the primary: reportPeerErr is not set, and
-// Server.go's ErrServiceError branch returns early WITHOUT ever calling
-// reportCatchupFailureForError. The drain loop is therefore the ONLY place
-// this cycle's genuine primary failure can be recorded; it must not be
-// skipped down to zero.
+// (only the narrower ErrServiceUnavailable). IsLocalError admits two shapes —
+// a context error and an ErrStorageError — and this fixture uses the storage
+// one, which is what most of get_blocks.go's own subtree store reads and writes
+// are coded as (fetchAndStoreSubtreeData's Exists check is the exception, still
+// ErrProcessing). Since issue 1439 that lands the terminal error in the
+// local_storage_fault case rather than the unknown_error default, and leaves
+// isPeerError false rather than true.
+//
+// Either way nothing outside the drain CHARGES the primary. Post-1439
+// reportPeerErr is not set at all; pre-1439 it was, but its only effect is
+// reportCatchupError, which stores the error text for the dashboard and does
+// not touch the failure counters. And Server.go's local-infra branch returns
+// early WITHOUT ever calling reportCatchupFailureForError (it now matches this
+// fixture on ErrStorageError as well as ErrServiceError). The drain loop is
+// therefore the ONLY place this cycle's genuine primary failure can be
+// recorded; it must not be skipped down to zero.
 //
 // (The unknown_error + isPeerError=true combination this test originally
 // exercised is still covered by DrainChargesPrimaryEvenOnMixedCycle above,
