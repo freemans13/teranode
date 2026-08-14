@@ -93,7 +93,8 @@ func NewStore(logger ulogger.Logger, storeURL *url.URL, opts ...options.StoreOpt
 // The batcher is configured through URL query parameters:
 //   - sizeInBytes: Size threshold in bytes at which the accumulated batch is flushed
 //     (default: 4194304, i.e. 4MiB). Must be greater than 0: the batcher preallocates
-//     buffers with this capacity, so a non-positive value would panic in make().
+//     buffers with this capacity, so a negative value would panic in make(), and zero
+//     would flush after every single item rather than batching anything.
 //   - writeKeys: "true" to also write a per-batch index of keys and their offsets
 //     within the batch data (default: false)
 //
