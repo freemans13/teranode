@@ -297,7 +297,9 @@ func (w *subtreeStoreWrapper) Set(ctx context.Context, key []byte, fileType file
 // createMetaRegenerator creates a SubtreeMetaRegenerator with the given peer URLs.
 // This is used to regenerate missing subtree meta files during block validation.
 // peerURLs are DataHub base URLs, which already carry the peer's API prefix.
-// If peerURLs is empty and subtreeStore is nil, returns nil (regeneration not available).
+// Returns nil (regeneration not available) when there is no source to regenerate
+// from — peerURLs empty and subtreeStore nil — or when utxoStore is nil, since
+// storeRegeneratedMeta needs its block height to compute the meta file's DAH.
 func (u *BlockValidation) createMetaRegenerator(peerURLs []string) model.SubtreeMetaRegeneratorI {
 	if u.subtreeStore == nil && len(peerURLs) == 0 {
 		return nil
