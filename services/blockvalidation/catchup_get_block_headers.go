@@ -132,12 +132,18 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 	// the blockchain tip, and a locator built from the tip would resolve normally.
 	//
 	// What the cap does now is start the peer's header stream lower than necessary, so the
-	// ancestor walk climbs back through headers we already hold. That costs extra
-	// GetBlockHeader lookups, bounded by the lag, and changes no outcome — the walk still
-	// stops at our tip and the depth is still measured from it. It is kept because asking
-	// from lower is the conservative direction and the cost is small; removing it is a
-	// separate tidy, not a correctness fix. Note it also sets startHash/startHeight, which
-	// are reported on the catchup Result and not used in any decision.
+	// ancestor walk climbs back through headers we already hold. That costs one GetBlockHeader
+	// lookup per block of lag, where the old ceiling stopped the walk after roughly two (any
+	// header above the UTXO height was rejected outright). The outcome is unchanged only while
+	// the lag stays below CatchupMaxAccumulatedHeaders: the fetch truncates there (see the
+	// maxAccumulatedHeaders check below), so a larger lag ends the served stream *below* our
+	// tip, the walk takes its ancestor at that point, and the depth is overstated by
+	// (lag - CatchupMaxAccumulatedHeaders) — the same over-measurement this ceiling change
+	// exists to remove, reached by a different route. That needs a lag of 100k blocks by
+	// default, so the cap is kept for now rather than removed alongside the ceiling fix, but
+	// it is a correctness trade and not the free conservatism it looks like. Note it also sets
+	// startHash/startHeight, which are reported on the catchup Result and not used in any
+	// decision.
 	if u.utxoStore != nil {
 		utxoHeight := u.utxoStore.GetBlockHeight()
 		if bestBlockMeta.Height > utxoHeight {
