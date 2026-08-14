@@ -195,16 +195,17 @@ func Test_queueClockOverride(t *testing.T) {
 
 // Test_zeroWindowFormulasAgree asserts parity between the two
 // validFromMillis formulas inside SubtreeProcessor at DoubleSpendWindow=0
-// (the documented default - see settings/blockassembly_settings.go:29).
+// (the documented default - see BlockAssembly.DoubleSpendWindow in
+// settings/blockassembly_settings.go).
 // Both call sites now zero-guard the calculation, so neither activates
 // the queue filter in LockFreeQueue.dequeueBatch and both admit same-millisecond
 // batches.
 //
-//	Start loop (SubtreeProcessor.go:807-813):
+//	Start loop (the default: branch of SubtreeProcessor.Start):
 //	  validFromMillis = 0                              if DoubleSpendWindow == 0
 //	  validFromMillis = (now - window).UnixMilli()     otherwise
 //
-//	dequeueDuringBlockMovement (SubtreeProcessor.go:3789-3796):
+//	SubtreeProcessor.dequeueDuringBlockMovement:
 //	  validFromMillis = 0                              if DoubleSpendWindow == 0
 //	  validFromMillis = (now - window).UnixMilli()     otherwise
 //
@@ -227,7 +228,7 @@ func Test_zeroWindowFormulasAgree(t *testing.T) {
 	}
 
 	t.Run("start_loop_formula_admits_same_millisecond_batch", func(t *testing.T) {
-		// Mirror of the formula at SubtreeProcessor.go:810-813.
+		// Mirror of the formula in the default: branch of SubtreeProcessor.Start.
 		startValidFromMillis := int64(0)
 		if window > 0 {
 			startValidFromMillis = fixed.Add(-window).UnixMilli()
@@ -240,7 +241,7 @@ func Test_zeroWindowFormulasAgree(t *testing.T) {
 	})
 
 	t.Run("drain_formula_admits_same_millisecond_batch", func(t *testing.T) {
-		// Mirror of the formula at SubtreeProcessor.go:3789-3796.
+		// Mirror of the formula in SubtreeProcessor.dequeueDuringBlockMovement.
 		drainValidFromMillis := int64(0)
 		if window > 0 {
 			drainValidFromMillis = fixed.Add(-window).UnixMilli()

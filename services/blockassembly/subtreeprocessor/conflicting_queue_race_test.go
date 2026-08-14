@@ -118,7 +118,8 @@ func TestDequeueDuringBlockMovement_RejectsChildOfConflictingParent(t *testing.T
 // moveForwardBlock.
 //
 // The Start-loop default-case dequeue still uses its own zero-guard
-// (SubtreeProcessor.go:807-813) and is NOT affected by this test.
+// (the default: branch of SubtreeProcessor.Start) and is NOT affected by
+// this test.
 //
 // The "+1ms" subtest exercises the complementary case where the
 // SubtreeProcessor clock has advanced past the enqueue clock; the
