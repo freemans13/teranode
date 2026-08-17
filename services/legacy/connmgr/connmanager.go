@@ -267,6 +267,13 @@ type ConnManager struct {
 	// arriving between two passes collapse into a single wake-up.
 	replenishWake chan struct{}
 
+	// dialMu serialises "measure the automatic tier, then claim the slots that
+	// measurement justified". Both halves must happen under it or the count is
+	// stale by the time it is acted on. It guards only bookkeeping — never a
+	// dial, and never a send on cm.requests — so connHandler can take it without
+	// risking a cycle.
+	dialMu sync.Mutex
+
 	// replenishBackoffUntil (UnixNano; 0 = no backoff) suspends replenishment
 	// passes while consecutive dial failures say the NETWORK is down rather than
 	// a peer. Written from connHandler, read from replenishHandler, hence atomic.
@@ -361,13 +368,23 @@ func (cm *ConnManager) handleFailedConn(c *ConnReq) {
 			cm.Connect(c)
 		})
 	} else if cm.cfg.GetNewAddress != nil {
-		// check whether this connection was pending, remove from there, before reconnecting
-		if _, ok := cm.pending.Get(c.id); ok {
-			cm.pending.Delete(c.id)
-		}
-
 		cm.failedAttempts++
-		if cm.failedAttempts >= maxFailedAttempts {
+
+		// Retire the dead request and claim its replacement in one step. Held
+		// apart, a replenishment pass can land in between, see the slot as free,
+		// and dial a second address for a slot this path has already taken
+		// responsibility for — which is exactly what used to happen on every
+		// disconnect.
+		cm.dialMu.Lock()
+		cm.pending.Delete(c.id)
+
+		var replacement *ConnReq
+		if cm.failedAttempts < maxFailedAttempts {
+			replacement = cm.reserveSlot()
+		}
+		cm.dialMu.Unlock()
+
+		if replacement == nil {
 			cm.logger.Debugf("Max failed connection attempts reached: [%d] -- retrying connection in: %v", maxFailedAttempts, cm.cfg.RetryDuration)
 			time.AfterFunc(cm.cfg.RetryDuration, func() {
 				cm.NewConnReq()
@@ -383,15 +400,18 @@ func (cm *ConnManager) handleFailedConn(c *ConnReq) {
 			// below the re-seed floor. Suspend the periodic pass for the same
 			// RetryDuration so both paths back off together.
 			cm.replenishBackoffUntil.Store(time.Now().Add(cm.cfg.RetryDuration).UnixNano())
-		} else {
-			go cm.NewConnReq()
 
-			// The replacement dial above covers this slot, but wake the
-			// replenishment loop anyway: if this failure was one of several,
-			// the loop is the only thing that reconciles the whole book back
-			// to target rather than one slot at a time.
-			cm.signalReplenish()
+			return
 		}
+
+		go cm.dialReserved(replacement)
+
+		// The replacement above covers this slot, but wake the replenishment
+		// loop anyway: if this failure was one of several, the loop is the only
+		// thing that reconciles the whole book back to target rather than one
+		// slot at a time. The wake is now safe to send early — the reservation
+		// is already visible, so the pass it triggers cannot double-count.
+		cm.signalReplenish()
 	}
 }
 
@@ -538,36 +558,43 @@ out:
 	cm.logger.Infof("Connection handler done")
 }
 
-// NewConnReq creates a new connection request and connects to the
-// corresponding address.
-func (cm *ConnManager) NewConnReq() {
-	if atomic.LoadInt32(&cm.stop) != 0 {
-		return
-	}
-
-	if cm.cfg.GetNewAddress == nil {
-		return
-	}
-
+// reserveSlot claims one automatic outbound slot by registering an
+// address-less request in cm.pending, and returns it ready to be dialed.
+//
+// Reserving is the whole point. A slot is only safe from being dialed twice
+// once it is visible in cm.pending, and the previous code made it visible by
+// sending registerPending on cm.requests — a channel serviced by connHandler.
+// Every replacement dial is decided inside connHandler, so that registration
+// could not be serviced until the handler returned, leaving a window in which a
+// replenishment pass saw the slot as free and dialed a second address for it.
+// Writing the reservation directly closes the window: the map is
+// mutex-protected, and the decision and the record now happen in one step.
+//
+// Callers must hold dialMu across the measurement that justified the
+// reservation.
+func (cm *ConnManager) reserveSlot() *ConnReq {
 	c := &ConnReq{}
 	atomic.StoreUint64(&c.id, atomic.AddUint64(&cm.connReqCount, 1))
+	c.updateState(ConnPending)
+	cm.pending.Set(c.id, c)
 
-	// Submit a request of a pending connection attempt to the connection
-	// manager. By registering the id before the connection is even
-	// established, we'll be able to later cancel the connection via the
-	// Remove method.
-	done := make(chan struct{})
-	select {
-	case cm.requests <- registerPending{c, done}:
-	case <-cm.quit:
-		return
-	}
+	return c
+}
 
-	// Wait for the registration to successfully add the pending conn req to
-	// the conn manager's internal state.
-	select {
-	case <-done:
-	case <-cm.quit:
+// dialReserved resolves an address for an already-reserved slot and dials it.
+//
+// This is the slow half of a dial and is deliberately kept off both connHandler
+// and dialMu: GetNewAddress consults the address manager and the dedup scans
+// walk both books. Only the reservation has to be prompt; choosing what to dial
+// does not.
+//
+// Every path that gives up must release the reservation, or the slot is held by
+// a dial that will never happen — the same leak this PR fixes on the dedup
+// returns.
+func (cm *ConnManager) dialReserved(c *ConnReq) {
+	if atomic.LoadInt32(&cm.stop) != 0 || cm.cfg.GetNewAddress == nil {
+		cm.pending.Delete(c.id)
+
 		return
 	}
 
@@ -640,6 +667,24 @@ func (cm *ConnManager) NewConnReq() {
 	c.SetAddr(addr)
 
 	cm.Connect(c)
+}
+
+// NewConnReq creates a new connection request and connects to the
+// corresponding address.
+func (cm *ConnManager) NewConnReq() {
+	if atomic.LoadInt32(&cm.stop) != 0 {
+		return
+	}
+
+	if cm.cfg.GetNewAddress == nil {
+		return
+	}
+
+	cm.dialMu.Lock()
+	c := cm.reserveSlot()
+	cm.dialMu.Unlock()
+
+	cm.dialReserved(c)
 }
 
 // Connect assigns an id and dials a connection to the address of the
@@ -858,10 +903,23 @@ func (cm *ConnManager) replenish(lastLogged *replenishSnapshot, lastLogTime *tim
 		cm.replenishBackoffUntil.Store(0)
 	}
 
-	established, pending := cm.automaticCounts()
-
 	target := int(cm.cfg.TargetOutbound)
+
+	// Measure and claim under one lock. A deficit is a statement about slots
+	// that were free a moment ago; acting on it after another path has taken one
+	// of them is how a top-up turns into an over-dial.
+	cm.dialMu.Lock()
+	established, pending := cm.automaticCounts()
 	deficit := replenishDeficit(established, pending, target)
+
+	var reserved []*ConnReq
+	if cm.cfg.GetNewAddress != nil {
+		reserved = make([]*ConnReq, 0, deficit)
+		for i := 0; i < deficit; i++ {
+			reserved = append(reserved, cm.reserveSlot())
+		}
+	}
+	cm.dialMu.Unlock()
 
 	// The replenish line is the measurement instrument for outbound health, so
 	// it has to survive a two-second cadence without burying every other log.
@@ -884,8 +942,8 @@ func (cm *ConnManager) replenish(lastLogged *replenishSnapshot, lastLogTime *tim
 	}
 
 	// deficit is guaranteed non-negative and bounded to at most TargetOutbound.
-	for i := 0; i < deficit; i++ {
-		go cm.NewConnReq()
+	for _, c := range reserved {
+		go cm.dialReserved(c)
 	}
 }
 
