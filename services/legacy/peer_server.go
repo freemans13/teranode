@@ -3765,6 +3765,11 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		Dial:           bsvdDial,
 		OnConnection:   s.outboundPeerConnected,
 		GetNewAddress:  newAddressFunc,
+		// A minute between replenishment passes meant a peer lost early in an
+		// interval left the node running below target for the rest of it — during
+		// IBD that is a minute of lost download bandwidth per disconnect. Zero
+		// restores the historical one-minute cadence.
+		ReplenishInterval: tSettings.Legacy.ReplenishInterval,
 	})
 	if err != nil {
 		return nil, err
