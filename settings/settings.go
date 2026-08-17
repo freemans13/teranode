@@ -676,6 +676,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			TempStore:                        getURL("temp_store", "file://./data/tempstore", alternativeContext...),
 			PeerIdleTimeout:                  getDuration("legacy_peerIdleTimeout", 125*time.Second, alternativeContext...),     // ping/pong interval is 2 mins, so we set this to 125s to be sure
 			PeerProcessingTimeout:            getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
+			IBDBlockStallTimeout:             getDuration("legacy_ibdBlockStallTimeout", 60*time.Minute, alternativeContext...),
+			IBDHeadersStallTimeout:           getDuration("legacy_ibdHeadersStallTimeout", 10*time.Minute, alternativeContext...),
+			IBDMaxBlockDownloadTime:          getDuration("legacy_ibdMaxBlockDownloadTime", 60*time.Minute, alternativeContext...),
+			IBDPeerIdleTimeout:               getDuration("legacy_ibdPeerIdleTimeout", 20*time.Minute, alternativeContext...),
 			BlockFailureBackoffBase:          getDuration("legacy_blockFailureBackoffBase", 5*time.Second, alternativeContext...),
 			BlockFailureBackoffMaxDuration:   getDuration("legacy_blockFailureBackoffMaxDuration", 150*time.Second, alternativeContext...),
 			BlockPrefetchBufferBytes:         getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),

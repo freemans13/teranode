@@ -32,6 +32,21 @@ type OnSeed func(addrs []*wire.NetAddress)
 type LookupFunc func(string) ([]net.IP, error)
 
 // SeedFromDNS uses DNS seeding to populate the address manager with peers.
+//
+// It is safe to call repeatedly. It holds no once-only or cross-call state: each
+// call reads chainParams, fans out one goroutine per configured seed host, and
+// every one of those goroutines terminates as soon as its lookup returns, so
+// repeated calls cannot accumulate goroutines beyond the handful in flight at
+// any moment. seedFn is invoked once per host that resolves to at least one
+// address, and duplicate addresses across calls are the address manager's
+// problem to deduplicate, as they already are within a single call.
+//
+// Being re-callable matters during a long initial block download: the address
+// table can drain faster than gossip refills it, and with a single seeding at
+// startup there is then nothing left to dial. The caller owns the policy for
+// when to re-seed — both the minimum interval between calls and the low-water
+// mark that triggers one. This function deliberately enforces neither, so that
+// policy lives in one place rather than being split across two layers.
 func SeedFromDNS(chainParams *chaincfg.Params, reqServices wire.ServiceFlag,
 	lookupFn LookupFunc, seedFn OnSeed) {
 	for _, dnsseed := range chainParams.DNSSeeds {
