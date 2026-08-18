@@ -684,6 +684,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockDownloadTimeoutPerPeerPercent: getInt64("legacy_blockDownloadTimeoutPerPeerPercent", 50, alternativeContext...),
 
 			BlockPrefetchBufferBytes: getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
+
+			MaxBlockParallelFetch: getInt("legacy_maxBlockParallelFetch", 2, alternativeContext...),
+			BlockSlowFetchTimeout: getDuration("legacy_blockSlowFetchTimeout", 20*time.Second, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

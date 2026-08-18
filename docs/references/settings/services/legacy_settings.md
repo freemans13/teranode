@@ -28,6 +28,8 @@
 | BlockFailureBackoffBase | time.Duration | 5s | legacy_blockFailureBackoffBase | Base per-block backoff after a transient storage/service failure (0 disables) |
 | BlockFailureBackoffMaxDuration | time.Duration | 150s | legacy_blockFailureBackoffMaxDuration | Cap on the per-block backoff window and the failure-tracking map TTL, kept below the 180s sync-peer stall window (0 disables) |
 | BlockPrefetchBufferBytes | int64 | 268435456 | legacy_blockPrefetchBufferBytes | Byte budget for blocks downloaded ahead of processing during sync (0 disables prefetch) |
+| MaxBlockParallelFetch | int | 2 | legacy_maxBlockParallelFetch | Maximum peers downloading the same stalled frontier block at once (1 disables racing) |
+| BlockSlowFetchTimeout | time.Duration | 20s | legacy_blockSlowFetchTimeout | How long the download frontier may sit unchanged before a second peer is asked for the same block (0 disables racing) |
 | Upnp | bool | false | legacy_upnp | Enable UPnP for automatic port mapping |
 
 ## Configuration Dependencies
@@ -41,10 +43,12 @@
 - `SavePeers` controls peer information persistence to disk
 
 ### Batch Processing Performance
+
 - Batch sizes and concurrency settings work together for memory and performance control
 - `StoreBatcherSize` * `StoreBatcherConcurrency` limits concurrent requests
 
 ### Peer Timeout Management
+
 - `PeerIdleTimeout` set to 125s to accommodate 2-minute ping/pong intervals
 - `PeerProcessingTimeout` set to 3m for block processing (largest operations)
 
