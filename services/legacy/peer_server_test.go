@@ -891,12 +891,12 @@ func TestServerPeerAddBanScoreExists(t *testing.T) {
 	assert.NotNil(t, sp.addBanScore)
 }
 
-// TestServerOutboundGroupCountExists tests the OutboundGroupCount method exists
-func TestServerOutboundGroupCountExists(t *testing.T) {
+// TestServerOutboundGroupsExists tests the OutboundGroups method exists
+func TestServerOutboundGroupsExists(t *testing.T) {
 	// This method requires complex channel setup and peer state management
 	// We'll just verify the method exists on server
 	s := &server{}
-	assert.NotNil(t, s.OutboundGroupCount)
+	assert.NotNil(t, s.OutboundGroups)
 }
 
 // TestServerPeerPushAddrMsgExists tests the pushAddrMsg method exists

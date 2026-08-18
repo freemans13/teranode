@@ -117,65 +117,78 @@ func TestCountExcludingPermanentIsAdditive(t *testing.T) {
 		"the node still holds them, and Count still reports the true total")
 }
 
-// TestClaimsNetgroup pins the last place a named peer could charge the
-// automatic tier.
+// TestOutboundGroupsCountsOnlyTheAutomaticTier pins the netgroup rule now that
+// it is derived rather than maintained.
 //
-// The outbound group tally exists to stop the node spending several of its
-// limited automatic slots on one network segment: newAddressFunc skips any
-// candidate whose group is already represented. A named peer does not occupy an
-// automatic slot, so if it claimed a group anyway, configuring one would cost
-// the node an independently chosen address for a slot the named peer never
-// took — the same charge the separate addnode budget exists to remove, levied
-// in a different currency. svnode makes exactly this exclusion, and says why:
-// addnode peers are left out of the setConnected group set because they "do not
-// use our outbound slots".
+// The set exists so newAddressFunc will not spend several of the node's limited
+// automatic slots on one network segment. Only peers holding such a slot belong
+// in it: inbound peers do not hold one, and named peers have their own budget,
+// so counting either would cost the node an independently chosen address for a
+// slot that was never taken. svnode excludes both from its setConnected for the
+// same reason.
 //
-// Claim and release must agree. handleAddPeerMsg and handleDonePeerMsg both
-// call this, so a drift between them is impossible by construction rather than
-// by two conditions being kept in step by hand.
-func TestClaimsNetgroup(t *testing.T) {
-	tests := []struct {
-		name       string
-		inbound    bool
-		persistent bool
-		want       bool
-	}{
-		{name: "automatic outbound claims its group", want: true},
-		{name: "named outbound peer claims nothing", persistent: true},
-		{name: "inbound peer claims nothing", inbound: true},
-		{name: "inbound and named claims nothing", inbound: true, persistent: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, claimsNetgroup(tt.inbound, tt.persistent))
-		})
-	}
-}
-
-// TestNetgroupReleasedWhenPeerDropsBeforeHandshake drives the real
-// handleDonePeerMsg for the case the release used to miss.
-//
-// The claim in handleAddPeerMsg is unconditional for an automatic outbound
-// peer, but the release carried an extra VersionKnown guard, inherited from
-// when inbound peers shared this tally — an inbound peer's address is only
-// learned during the version exchange, so releasing before then would have used
-// a nil address. Outbound peers have their address from the moment
-// NewOutboundPeer builds them, and since they are now the only peers that claim
-// a group, the guard protected nothing while doing real harm: a peer that
-// dropped before completing its handshake claimed a group and never released
-// it, barring that whole /16 from automatic outbound selection for the life of
-// the process.
-//
-// That is the same shape as the leaks this PR exists to fix — a resource taken
-// and never given back, quietly shrinking the node's reach — and it is most
-// likely exactly when peers are flakiest, which is when reach matters most.
-//
-// The peer here is deliberately never handshaked, so VersionKnown is false.
-func TestNetgroupReleasedWhenPeerDropsBeforeHandshake(t *testing.T) {
+// Deriving it from the peer lists is what makes that true without anyone having
+// to remember it. The three lists ARE the rule, so there is no claim to skip and
+// no release to forget — which is exactly how the two bugs this replaced arose.
+// The peers below are all built as outbound so each has a usable address; which
+// list they are filed under is the thing under test.
+func TestOutboundGroupsCountsOnlyTheAutomaticTier(t *testing.T) {
 	tSettings := settings.NewSettings()
 
-	p, err := peer.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peer.Config{}, "203.0.113.7:8333")
+	newPeer := func(t *testing.T, addr string) *serverPeer {
+		t.Helper()
+
+		p, err := peer.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peer.Config{}, addr)
+		require.NoError(t, err)
+
+		return &serverPeer{Peer: p}
+	}
+
+	state := &peerState{
+		inboundPeers:    txmap.NewSyncedMap[int32, *serverPeer](),
+		outboundPeers:   txmap.NewSyncedMap[int32, *serverPeer](),
+		persistentPeers: txmap.NewSyncedMap[int32, *serverPeer](),
+	}
+
+	// Routable addresses in distinct /16s. Documentation ranges all collapse to
+	// the same "unroutable" group key, which would make this test agree with
+	// itself for the wrong reason.
+	automatic := newPeer(t, "8.8.8.8:8333")
+	named := newPeer(t, "1.1.1.1:8333")
+	inbound := newPeer(t, "9.9.9.9:8333")
+
+	state.outboundPeers.Set(1, automatic)
+	state.persistentPeers.Set(2, named)
+	state.inboundPeers.Set(3, inbound)
+
+	groups := state.outboundGroups()
+
+	require.Contains(t, groups, addrmgr.GroupKey(automatic.NA()),
+		"an automatic outbound peer holds its netgroup")
+	require.NotContains(t, groups, addrmgr.GroupKey(named.NA()),
+		"a named peer has its own budget and must not cost the automatic tier a netgroup")
+	require.NotContains(t, groups, addrmgr.GroupKey(inbound.NA()),
+		"an inbound peer occupies no automatic slot, so it claims no netgroup")
+	require.Len(t, groups, 1)
+}
+
+// TestNetgroupFreedWhenPeerDropsBeforeHandshake covers the case that used to
+// leak, driven through the real handleDonePeerMsg.
+//
+// The old maintained tally released a peer's netgroup only if VersionKnown was
+// also true, so a peer that dropped before completing its version exchange kept
+// its group for the life of the process, barring that whole segment from
+// automatic outbound selection. It leaked worst when peers were flakiest, which
+// is when reach matters most.
+//
+// Deriving the set retires the question: the group is occupied for exactly as
+// long as the peer is in the list, so removing the peer frees it with no release
+// step to get wrong. The peer here is deliberately never handshaked, which is
+// the condition the old guard tripped over.
+func TestNetgroupFreedWhenPeerDropsBeforeHandshake(t *testing.T) {
+	tSettings := settings.NewSettings()
+
+	p, err := peer.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peer.Config{}, "8.8.4.4:8333")
 	require.NoError(t, err)
 	require.False(t, p.VersionKnown(), "the peer must be pre-handshake for this test to mean anything")
 
@@ -186,21 +199,18 @@ func TestNetgroupReleasedWhenPeerDropsBeforeHandshake(t *testing.T) {
 		inboundPeers:    txmap.NewSyncedMap[int32, *serverPeer](),
 		outboundPeers:   txmap.NewSyncedMap[int32, *serverPeer](),
 		persistentPeers: txmap.NewSyncedMap[int32, *serverPeer](),
-		outboundGroups:  txmap.NewSyncedMap[string, int](),
 		connectionCount: txmap.NewSyncedMap[string, int](),
 	}
 
-	// The state handleAddPeerMsg would have left behind: the peer tracked, and
-	// its netgroup claimed.
-	key := addrmgr.GroupKey(sp.NA())
 	state.outboundPeers.Set(sp.ID(), sp)
-	state.outboundGroups.Set(key, 1)
+
+	key := addrmgr.GroupKey(sp.NA())
+	require.Contains(t, state.outboundGroups(), key, "the peer should hold its netgroup while connected")
 
 	srv.handleDonePeerMsg(state, sp)
 
-	got, _ := state.outboundGroups.Get(key)
-	require.Equal(t, 0, got,
-		"a peer that dropped before its handshake kept its netgroup, barring that segment from automatic outbound for good")
+	require.NotContains(t, state.outboundGroups(), key,
+		"a peer that dropped before its handshake kept its netgroup, barring that segment from automatic outbound")
 
 	_, stillTracked := state.outboundPeers.Get(sp.ID())
 	require.False(t, stillTracked, "the peer should have been removed from the outbound list")

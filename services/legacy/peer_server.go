@@ -230,7 +230,6 @@ type peerState struct {
 	outboundPeers   *txmap.SyncedMap[int32, *serverPeer]
 	persistentPeers *txmap.SyncedMap[int32, *serverPeer]
 	banned          *txmap.SyncedMap[string, time.Time]
-	outboundGroups  *txmap.SyncedMap[string, int]
 	connectionCount *txmap.SyncedMap[string, int]
 }
 
@@ -292,22 +291,38 @@ func (s *server) recordFailedDial(addr net.Addr) {
 	s.addrManager.Attempt(wire.NewNetAddressIPPort(ip, portUint16, 0), s.countFailedDial())
 }
 
-// claimsNetgroup reports whether a peer occupies one of the automatic outbound
-// netgroup slots.
+// outboundGroups derives the set of netgroups currently occupied by automatic
+// outbound peers.
 //
-// The tally exists to stop the node spending several of its limited automatic
-// slots on a single network segment, so only peers that actually hold such a
-// slot may claim a group. Inbound peers do not, and neither do named (addnode)
-// peers: they have their own budget, so letting one claim a group would cost
-// the node an independently chosen address for a slot it never took. svnode
-// excludes both for the same reason.
+// Derived, not maintained. This used to be a tally incremented when a peer was
+// added and decremented when it left, across four separate mutation sites, and
+// two of them were wrong: named peers claimed a group they never occupied, and
+// a peer that dropped before its handshake claimed one it never released,
+// barring that segment for the life of the process. Both were symptoms of the
+// same thing — a derived quantity kept by hand.
 //
-// The claim in handleAddPeerMsg and the release in handleDonePeerMsg both go
-// through here. They have to agree exactly — a peer that skipped the claim but
-// still released would drive the tally below zero and make an occupied segment
-// look free — so the rule is stated once rather than spelled out at each site.
-func claimsNetgroup(inbound, persistent bool) bool {
-	return !inbound && !persistent
+// Reading it from the peer list instead makes those bugs unrepresentable. There
+// is no claim to forget and no release to skip; membership of outboundPeers is
+// the whole rule, and that list is already the authority on which peers hold an
+// automatic slot. Inbound and named peers are excluded for free, because they
+// are kept in different lists. svnode does exactly this, rebuilding its
+// setConnected from vNodes on every pass of ThreadOpenConnections rather than
+// carrying a counter.
+//
+// The cost is a walk of the automatic tier per address selection — at most a
+// handful of peers, and only when the node is about to dial.
+func (ps *peerState) outboundGroups() map[string]struct{} {
+	groups := make(map[string]struct{}, ps.outboundPeers.Length())
+
+	ps.outboundPeers.Iterate(func(_ int32, sp *serverPeer) bool {
+		if na := sp.NA(); na != nil {
+			groups[addrmgr.GroupKey(na)] = struct{}{}
+		}
+
+		return true
+	})
+
+	return groups
 }
 
 // CountExcludingPermanent returns the peers that draw on MaxPeers: the inbound
@@ -2419,11 +2434,6 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 		count, _ := state.connectionCount.Get(host)
 		state.connectionCount.Set(host, count+1)
 	} else {
-		if claimsNetgroup(sp.Inbound(), sp.persistent) {
-			count, _ := state.outboundGroups.Get(addrmgr.GroupKey(sp.NA()))
-			state.outboundGroups.Set(addrmgr.GroupKey(sp.NA()), count+1)
-		}
-
 		if sp.persistent {
 			state.persistentPeers.Set(sp.ID(), sp)
 		} else {
@@ -2487,20 +2497,6 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 	}
 
 	if _, ok := list.Get(sp.ID()); ok {
-		// Exactly the condition used to claim the group in handleAddPeerMsg, and
-		// nothing more. This release was additionally guarded on VersionKnown,
-		// inherited from when inbound peers shared this tally — their address is
-		// only learned during the version exchange. Outbound peers have theirs
-		// from the moment they are constructed, and they are the only peers that
-		// claim now, so the extra guard could not protect anything and did real
-		// harm: a peer that dropped before its handshake completed had claimed
-		// but never released, barring its whole segment from automatic outbound
-		// for the life of the process.
-		if claimsNetgroup(sp.Inbound(), sp.persistent) {
-			count, _ := state.outboundGroups.Get(addrmgr.GroupKey(sp.NA()))
-			state.outboundGroups.Set(addrmgr.GroupKey(sp.NA()), count-1)
-		}
-
 		if !sp.Inbound() && sp.connReq != nil {
 			s.connManager.Disconnect(sp.connReq.ID())
 		}
@@ -2727,9 +2723,8 @@ type getPeersMsg struct {
 	reply chan []*serverPeer
 }
 
-type getOutboundGroup struct {
-	key   string
-	reply chan int
+type getOutboundGroups struct {
+	reply chan map[string]struct{}
 }
 
 type getAddedNodesMsg struct {
@@ -2840,13 +2835,8 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		} else {
 			msg.reply <- errors.NewProcessingError("peer not found")
 		}
-	case getOutboundGroup:
-		count, ok := state.outboundGroups.Get(msg.key)
-		if ok {
-			msg.reply <- count
-		} else {
-			msg.reply <- 0
-		}
+	case getOutboundGroups:
+		msg.reply <- state.outboundGroups()
 	// Request a list of the persistent (added) peers.
 	case getAddedNodesMsg:
 		// Respond with a slice of the relevant peers.
@@ -2865,21 +2855,13 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		}
 
 		// Check outbound peers.
-		found = disconnectPeer(state.outboundPeers, msg.cmp, func(sp *serverPeer) {
-			// Keep group counts ok since we remove from
-			// the list now.
-			count, _ := state.outboundGroups.Get(addrmgr.GroupKey(sp.NA()))
-			state.outboundGroups.Set(addrmgr.GroupKey(sp.NA()), count-1)
-		})
+		found = disconnectPeer(state.outboundPeers, msg.cmp, nil)
 		if found {
 			// If there are multiple outbound connections to the same
 			// ip:port, continue disconnecting them all until no such
 			// peers are found.
 			for found {
-				found = disconnectPeer(state.outboundPeers, msg.cmp, func(sp *serverPeer) {
-					count, _ := state.outboundGroups.Get(addrmgr.GroupKey(sp.NA()))
-					state.outboundGroups.Set(addrmgr.GroupKey(sp.NA()), count-1)
-				})
+				found = disconnectPeer(state.outboundPeers, msg.cmp, nil)
 			}
 			msg.reply <- nil
 
@@ -3110,7 +3092,6 @@ func (s *server) peerHandler() {
 		outboundPeers:   txmap.NewSyncedMap[int32, *serverPeer](),
 		persistentPeers: txmap.NewSyncedMap[int32, *serverPeer](),
 		banned:          txmap.NewSyncedMap[string, time.Time](),
-		outboundGroups:  txmap.NewSyncedMap[string, int](),
 		connectionCount: txmap.NewSyncedMap[string, int](),
 	}
 
@@ -3268,11 +3249,16 @@ func (s *server) ConnectedCount() int32 {
 	return <-replyChan
 }
 
-// OutboundGroupCount returns the number of peers connected to the given
-// outbound group key.
-func (s *server) OutboundGroupCount(key string) int {
-	replyChan := make(chan int)
-	s.query <- getOutboundGroup{key: key, reply: replyChan}
+// OutboundGroups returns the set of netgroups currently occupied by automatic
+// outbound peers, read from the peer list at the moment of the call.
+//
+// Returned as a set rather than queried one key at a time so a caller sifting
+// candidate addresses reads a single consistent snapshot, instead of asking
+// once per candidate and seeing the peer set shift underneath it. svnode builds
+// the same set once per pass of ThreadOpenConnections for the same reason.
+func (s *server) OutboundGroups() map[string]struct{} {
+	replyChan := make(chan map[string]struct{})
+	s.query <- getOutboundGroups{reply: replyChan}
 
 	return <-replyChan
 }
@@ -3847,6 +3833,12 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	var newAddressFunc func() (net.Addr, error)
 	if len(cfg.ConnectPeers) == 0 {
 		newAddressFunc = func() (net.Addr, error) {
+			// One snapshot for the whole selection, so every candidate is
+			// judged against the same peer set. Asking per candidate would let
+			// the set shift mid-sift, and would pay for a peer walk on each of
+			// the hundred tries below rather than once.
+			occupiedGroups := s.OutboundGroups()
+
 			for tries := 0; tries < 100; tries++ {
 				addr := s.addrManager.GetAddress()
 				if addr == nil {
@@ -3859,8 +3851,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 				// in the same group so that we are not connecting
 				// to the same network segment at the expense of
 				// others.
-				key := addrmgr.GroupKey(addr.NetAddress())
-				if s.OutboundGroupCount(key) != 0 {
+				if _, occupied := occupiedGroups[addrmgr.GroupKey(addr.NetAddress())]; occupied {
 					continue
 				}
 
