@@ -28,9 +28,14 @@ import (
 )
 
 const (
-	defaultDataDir                 = "data"
-	defaultMaxPeers                = 125
-	defaultMaxPeersPerIP           = 5
+	defaultDataDir       = "data"
+	defaultMaxPeers      = 125
+	defaultMaxPeersPerIP = 5
+	// defaultMaxAddnodePeers matches svnode's -maxaddnodeconnections default.
+	// Named peers get their own budget rather than a share of MaxPeers, so
+	// configuring them cannot cost the node any of its automatic outbound
+	// slots or its inbound capacity.
+	defaultMaxAddnodePeers         = 8
 	defaultBanDuration             = time.Hour * 24
 	defaultBanThreshold            = 100
 	defaultConnectTimeout          = time.Second * 30
@@ -151,6 +156,7 @@ type config struct {
 	Port                    string        `long:"port" description:"Port for peer connections (overrides network default)"`
 	MaxPeers                int           `long:"maxpeers" description:"Max number of inbound and outbound peers"`
 	MaxPeersPerIP           int           `long:"maxpeersperip" description:"Max number of inbound and outbound peers per IP"`
+	MaxAddnodePeers         int           `long:"maxaddnodepeers" description:"Max number of peers connected via addnode/connect, budgeted separately from maxpeers"`
 	MinSyncPeerNetworkSpeed uint64        `long:"minsyncpeernetworkspeed" description:"Disconnect sync peers slower than this threshold in bytes/sec"`
 	DisableBanning          bool          `long:"nobanning" description:"Disable banning of misbehaving peers"`
 	BanDuration             time.Duration `long:"banduration" description:"How long to ban misbehaving peers.  Valid time units are {s, m, h}.  Minimum 1 second"`
@@ -355,6 +361,7 @@ func loadConfig(logger ulogger.Logger) (*config, []string, error) {
 	cfg := config{
 		MaxPeers:                defaultMaxPeers,
 		MaxPeersPerIP:           defaultMaxPeersPerIP,
+		MaxAddnodePeers:         defaultMaxAddnodePeers,
 		MinSyncPeerNetworkSpeed: defaultMinSyncPeerNetworkSpeed,
 		BanDuration:             defaultBanDuration,
 		BanThreshold:            defaultBanThreshold,

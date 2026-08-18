@@ -3,50 +3,112 @@ package legacy
 import (
 	"testing"
 
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/stretchr/testify/require"
 )
 
-// TestAutomaticOutboundTarget pins the interaction between the automatic
-// outbound target and MaxPeers once permanent peers stopped consuming automatic
-// slots.
+// TestAutomaticOutboundTarget pins that MaxPeers bounds the automatic tier and
+// nothing else.
 //
-// Excluding addnode peers from the automatic tier is what makes the
-// replenishment deficit meaningful, but it also means the node's outbound total
-// is the target plus those peers. The original clamp compared MaxPeers against
-// the target alone, so with the tier split in place a node given addnode peers
-// would sit above the cap it was configured with — silently, because each half
-// was individually within bounds.
+// Permanent peers are budgeted separately by MaxAddnodePeers, so they must not
+// shrink this target — that is what makes the addnode budget additive rather
+// than a share of MaxPeers, and it is how svnode arranges the same two tiers:
+// its addnode semaphore is sized independently of nMaxConnections, and its
+// inbound arithmetic (nMaxConnections minus outbound and feeler) never
+// mentions addnode at all.
 func TestAutomaticOutboundTarget(t *testing.T) {
 	tests := []struct {
 		name       string
 		configured uint32
 		maxPeers   int
-		permanent  int
 		want       uint32
 	}{
-		{name: "no permanent peers leaves the target alone", configured: 8, maxPeers: 125, permanent: 0, want: 8},
-		{name: "permanent peers reserve their share", configured: 8, maxPeers: 10, permanent: 4, want: 6},
-		{name: "ample headroom is not clamped", configured: 8, maxPeers: 125, permanent: 4, want: 8},
-		{name: "exactly enough room for both", configured: 8, maxPeers: 12, permanent: 4, want: 8},
-		{name: "one short of enough room", configured: 8, maxPeers: 11, permanent: 4, want: 7},
-		{name: "permanent peers fill the cap exactly", configured: 8, maxPeers: 4, permanent: 4, want: 0},
-		{name: "permanent peers exceed the cap", configured: 8, maxPeers: 2, permanent: 4, want: 0},
-		{name: "connect-only: cap equals the named peers", configured: 8, maxPeers: 3, permanent: 3, want: 0},
-		{name: "cap alone still binds with no permanent peers", configured: 8, maxPeers: 5, permanent: 0, want: 5},
-		{name: "zero configured target stays zero", configured: 0, maxPeers: 125, permanent: 0, want: 0},
+		{name: "ample headroom leaves the target alone", configured: 8, maxPeers: 125, want: 8},
+		{name: "cap below the target binds", configured: 8, maxPeers: 5, want: 5},
+		{name: "cap equal to the target", configured: 8, maxPeers: 8, want: 8},
+		{name: "zero configured target stays zero", configured: 0, maxPeers: 125, want: 0},
+		{name: "zero cap yields no automatic peers", configured: 8, maxPeers: 0, want: 0},
+		{name: "negative cap is treated as none", configured: 8, maxPeers: -1, want: 0},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := automaticOutboundTarget(tt.configured, tt.maxPeers, tt.permanent)
-			require.Equal(t, tt.want, got)
-
-			// The property the clamp exists for: the outbound total the node
-			// will actually aim at must never exceed the cap it was given.
-			if tt.maxPeers >= 0 {
-				require.LessOrEqual(t, int(got)+tt.permanent, max(tt.maxPeers, tt.permanent),
-					"automatic target plus permanent peers must stay within MaxPeers")
-			}
+			require.Equal(t, tt.want, automaticOutboundTarget(tt.configured, tt.maxPeers))
 		})
 	}
+}
+
+// TestAddnodePeers pins the addnode budget itself.
+//
+// svnode enforces it with a semaphore of MaxAddnodePeers permits, so a longer
+// -addnode list waits rather than growing the node without bound. Teranode's
+// list is fixed at startup, so the equivalent is to dial the first budget-many
+// and report the rest as ignored — silently truncating would leave an operator
+// believing peers were connected that never were.
+func TestAddnodePeers(t *testing.T) {
+	four := []string{"a", "b", "c", "d"}
+
+	tests := []struct {
+		name        string
+		configured  []string
+		budget      int
+		wantDial    []string
+		wantDropped int
+	}{
+		{name: "within budget dials all", configured: four, budget: 8, wantDial: four},
+		{name: "exactly at budget dials all", configured: four, budget: 4, wantDial: four},
+		{name: "over budget dials the first few", configured: four, budget: 2, wantDial: []string{"a", "b"}, wantDropped: 2},
+		{name: "zero budget dials none", configured: four, budget: 0, wantDial: []string{}, wantDropped: 4},
+		{name: "negative budget dials none", configured: four, budget: -1, wantDial: []string{}, wantDropped: 4},
+		{name: "none configured", configured: nil, budget: 8, wantDial: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dial, dropped := addnodePeers(tt.configured, tt.budget)
+			require.Equal(t, tt.wantDial, dial)
+			require.Equal(t, tt.wantDropped, dropped)
+			require.LessOrEqual(t, len(dial), max(tt.budget, 0), "must never dial more named peers than the budget")
+			require.Equal(t, len(tt.configured), len(dial)+dropped, "every configured peer is either dialed or reported dropped")
+		})
+	}
+}
+
+// TestCountExcludingPermanentIsAdditive pins the other half of the addnode
+// budget: named peers must not eat the capacity that MaxPeers governs.
+//
+// The peer cap is enforced at the door in handleAddPeerMsg, so if permanent
+// peers counted there, giving a node eight named peers would silently cost it
+// eight inbound slots — the separate budget granted at startup and taken back
+// on the first inbound connection. svnode avoids this by deriving inbound
+// capacity from nMaxConnections minus the outbound and feeler budgets only,
+// leaving addnode out of the sum entirely.
+func TestCountExcludingPermanentIsAdditive(t *testing.T) {
+	state := &peerState{
+		inboundPeers:    txmap.NewSyncedMap[int32, *serverPeer](),
+		outboundPeers:   txmap.NewSyncedMap[int32, *serverPeer](),
+		persistentPeers: txmap.NewSyncedMap[int32, *serverPeer](),
+	}
+
+	for i := int32(0); i < 3; i++ {
+		state.inboundPeers.Set(i, &serverPeer{})
+	}
+
+	for i := int32(0); i < 2; i++ {
+		state.outboundPeers.Set(i, &serverPeer{})
+	}
+
+	require.Equal(t, 5, state.CountExcludingPermanent())
+	require.Equal(t, 5, state.Count())
+
+	// Named peers are additive: they raise the total the node holds without
+	// drawing down the budget MaxPeers governs.
+	for i := int32(0); i < 4; i++ {
+		state.persistentPeers.Set(i, &serverPeer{})
+	}
+
+	require.Equal(t, 5, state.CountExcludingPermanent(),
+		"permanent peers must not consume the capacity MaxPeers bounds")
+	require.Equal(t, 9, state.Count(),
+		"the node still holds them, and Count still reports the true total")
 }

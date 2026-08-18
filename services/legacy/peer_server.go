@@ -239,6 +239,13 @@ func (ps *peerState) Count() int {
 	return ps.inboundPeers.Length() + ps.outboundPeers.Length() + ps.persistentPeers.Length()
 }
 
+// CountExcludingPermanent returns the peers that draw on MaxPeers: the inbound
+// and automatic outbound tiers. Permanent (addnode) peers have their own budget
+// and are additive to this figure, so they are deliberately left out.
+func (ps *peerState) CountExcludingPermanent() int {
+	return ps.inboundPeers.Length() + ps.outboundPeers.Length()
+}
+
 // CountIP returns the count of all peers matching the IP.
 func (ps *peerState) CountIP(host string) int {
 	count, found := ps.connectionCount.Get(host)
@@ -2317,7 +2324,14 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 	}
 
 	// Limit max number of total peers.
-	if state.Count() >= cfg.MaxPeers {
+	//
+	// Permanent (addnode) peers are excluded because they are budgeted
+	// separately by MaxAddnodePeers, following svnode: its inbound capacity is
+	// nMaxConnections minus the OUTBOUND and feeler budgets only, and its
+	// addnode semaphore is independent of nMaxConnections entirely. Counting
+	// them here would make named peers cost the node inbound capacity, which is
+	// the additive budget undone at the door.
+	if state.CountExcludingPermanent() >= cfg.MaxPeers {
 		reason := fmt.Sprintf("Max peers reached [%d] - disconnecting peer", cfg.MaxPeers)
 		sp.DisconnectWithInfo(reason)
 		// TODO: how to handle permanent peers here?
@@ -2824,30 +2838,44 @@ func disconnectPeer(peerList *txmap.SyncedMap[int32, *serverPeer], compareFunc f
 }
 
 // automaticOutboundTarget returns how many automatic outbound peers the
-// connection manager should aim for, given the configured target, the overall
-// peer cap, and how many permanent (addnode) peers are configured.
+// connection manager should aim for, given the configured target and the
+// overall peer cap.
 //
-// Permanent peers are deliberately excluded from the automatic tier, so they no
-// longer consume one of its slots. That makes the node's outbound total the
-// automatic target plus the permanent peers, and MaxPeers has to bound the
-// total rather than the automatic half alone — otherwise configuring addnode
-// peers quietly lifts the node above the cap it was given. Reserving the
-// permanent peers' share here keeps the sum within MaxPeers.
-//
-// A configuration whose permanent peers alone meet or exceed MaxPeers yields a
-// target of zero: the operator has asked for a node built entirely from named
-// peers, which is exactly the connect-only case.
-func automaticOutboundTarget(configured uint32, maxPeers, permanentCount int) uint32 {
-	available := maxPeers - permanentCount
-	if available < 0 {
-		available = 0
+// Permanent (addnode) peers are NOT deducted here. They are budgeted
+// separately by MaxAddnodePeers, the way svnode gives them their own semaphore
+// (semAddnode) rather than a share of maxconnections: asking for named peers
+// buys them in addition to the node's ordinary capacity, and never at the cost
+// of an automatic slot. MaxPeers therefore bounds the automatic and inbound
+// tiers, which is exactly what svnode's nMaxInbound arithmetic does.
+func automaticOutboundTarget(configured uint32, maxPeers int) uint32 {
+	if maxPeers < 0 {
+		return 0
 	}
 
-	if available < int(configured) {
-		return uint32(available)
+	if maxPeers < int(configured) {
+		return uint32(maxPeers)
 	}
 
 	return configured
+}
+
+// addnodePeers caps the configured named peers at their own budget, returning
+// the peers to dial and how many were dropped.
+//
+// svnode enforces this with a semaphore of MaxAddnodePeers permits, so a long
+// -addnode list simply waits rather than growing the node without limit. The
+// list here is fixed at startup, so the equivalent is to take the first
+// budget-many and say plainly what was left out.
+func addnodePeers(configured []string, budget int) (dial []string, dropped int) {
+	if budget < 0 {
+		budget = 0
+	}
+
+	if len(configured) <= budget {
+		return configured, 0
+	}
+
+	return configured[:budget], len(configured) - budget
 }
 
 // newPeerConfig returns the configuration for the given serverPeer.
@@ -3789,7 +3817,12 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		permanentPeers = cfg.AddPeers
 	}
 
-	targetOutbound := automaticOutboundTarget(cfg.TargetOutboundPeers, cfg.MaxPeers, len(permanentPeers))
+	permanentPeers, droppedPeers := addnodePeers(permanentPeers, cfg.MaxAddnodePeers)
+	if droppedPeers > 0 {
+		logger.Warnf("More named peers configured than maxaddnodepeers allows [%d]: dialing the first %d, ignoring %d", cfg.MaxAddnodePeers, len(permanentPeers), droppedPeers)
+	}
+
+	targetOutbound := automaticOutboundTarget(cfg.TargetOutboundPeers, cfg.MaxPeers)
 
 	cmgr, err := connmgr.New(logger, &connmgr.Config{
 		Listeners:      listeners,
