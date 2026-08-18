@@ -336,9 +336,25 @@ func (cm *ConnManager) automaticCounts() (established, pending int) {
 	})
 
 	cm.pending.Iterate(func(_ uint64, connReq *ConnReq) bool {
-		if !connReq.Permanent {
-			pending++
+		if connReq.Permanent {
+			return true
 		}
+
+		// A failed request that cannot be replaced is dead, not pending. With
+		// no address source there is nothing to retry it with and nothing to
+		// dial in its place, so it stays in the book until an operator removes
+		// it — and it is kept there deliberately, because that entry is the
+		// only handle Remove has for cancelling it.
+		//
+		// Counting it would be the bug. `addnode <ip> onetry` against a host
+		// that is down builds exactly such a request, so without this every
+		// failed one-shot dial would retire one automatic slot for the life of
+		// the process, and enough of them would starve the tier outright.
+		if cm.cfg.GetNewAddress == nil && connReq.State() == ConnFailing {
+			return true
+		}
+
+		pending++
 
 		return true
 	})

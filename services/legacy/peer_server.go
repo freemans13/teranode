@@ -2823,6 +2823,33 @@ func disconnectPeer(peerList *txmap.SyncedMap[int32, *serverPeer], compareFunc f
 	return false
 }
 
+// automaticOutboundTarget returns how many automatic outbound peers the
+// connection manager should aim for, given the configured target, the overall
+// peer cap, and how many permanent (addnode) peers are configured.
+//
+// Permanent peers are deliberately excluded from the automatic tier, so they no
+// longer consume one of its slots. That makes the node's outbound total the
+// automatic target plus the permanent peers, and MaxPeers has to bound the
+// total rather than the automatic half alone — otherwise configuring addnode
+// peers quietly lifts the node above the cap it was given. Reserving the
+// permanent peers' share here keeps the sum within MaxPeers.
+//
+// A configuration whose permanent peers alone meet or exceed MaxPeers yields a
+// target of zero: the operator has asked for a node built entirely from named
+// peers, which is exactly the connect-only case.
+func automaticOutboundTarget(configured uint32, maxPeers, permanentCount int) uint32 {
+	available := maxPeers - permanentCount
+	if available < 0 {
+		available = 0
+	}
+
+	if available < int(configured) {
+		return uint32(available)
+	}
+
+	return configured
+}
+
 // newPeerConfig returns the configuration for the given serverPeer.
 func newPeerConfig(sp *serverPeer) *peer.Config {
 	return &peer.Config{
@@ -3752,10 +3779,17 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	}
 
 	// Create a connection manager.
-	targetOutbound := cfg.TargetOutboundPeers
-	if cfg.MaxPeers < int(targetOutbound) {
-		targetOutbound = uint32(cfg.MaxPeers)
+	//
+	// permanentPeers is resolved before the target is computed because the two
+	// are related: the replenishment pass counts only the automatic tier, so
+	// the node's outbound total is the target PLUS its addnode peers. MaxPeers
+	// has to bound that total rather than the automatic half alone.
+	permanentPeers := cfg.ConnectPeers
+	if len(permanentPeers) == 0 {
+		permanentPeers = cfg.AddPeers
 	}
+
+	targetOutbound := automaticOutboundTarget(cfg.TargetOutboundPeers, cfg.MaxPeers, len(permanentPeers))
 
 	cmgr, err := connmgr.New(logger, &connmgr.Config{
 		Listeners:      listeners,
@@ -3778,12 +3812,6 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	s.connManager = cmgr
 
 	// Start up persistent peers.
-	permanentPeers := cfg.ConnectPeers
-
-	if len(permanentPeers) == 0 {
-		permanentPeers = cfg.AddPeers
-	}
-
 	for _, addr := range permanentPeers {
 		netAddr, err := addrStringToNetAddr(addr)
 		if err != nil {
