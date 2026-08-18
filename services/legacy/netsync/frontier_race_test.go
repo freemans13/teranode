@@ -452,6 +452,84 @@ func TestHandleBlockMsg_LateCopyOfARacedBlockIsNotPunished(t *testing.T) {
 		"a peer we never asked must still be disconnected for an unrequested block")
 }
 
+// TestFetchHeaderBlocks_PublishesTheFrontier proves the frontier is actually
+// recorded by the code that sends the block requests. Nothing else sets it, so
+// without this call the race could never find a block to run on.
+func TestFetchHeaderBlocks_PublishesTheFrontier(t *testing.T) {
+	blockchainClient := &blockchain2.Mock{}
+	// No block we ask about is already in our chain, so all of them get requested.
+	blockchainClient.Mock.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewNotFoundError("not found"))
+
+	sm := newRaceManager(t)
+	sm.ctx = context.Background()
+	sm.blockchainClient = blockchainClient
+	sm.blockSizeTracker = newBlockSizeTracker(10)
+	sm.requestedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Hour)
+	t.Cleanup(func() { sm.requestedBlocks.Stop() })
+
+	syncPeer, _, syncRec := connectRacePeer(t, 17, 1000)
+	registerRacePeer(sm, syncPeer)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	first := chainhash.Hash{0xf1}
+	second := chainhash.Hash{0xf2}
+	sm.startHeader = sm.headerList.PushBack(&headerNode{height: 10, hash: &first})
+	sm.headerList.PushBack(&headerNode{height: 11, hash: &second})
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return syncRec.count() == 2 }, 5*time.Second),
+		"both blocks should have been requested from the sync peer")
+
+	sm.frontierMu.Lock()
+	defer sm.frontierMu.Unlock()
+	require.Equal(t, first, sm.frontierHash, "the oldest requested block is what everything else waits on")
+	require.Equal(t, int32(10), sm.frontierHeight)
+}
+
+// TestHandleBlockMsg_AdvancesTheFrontier proves the other half of the wiring:
+// when the block everything was queued behind arrives, the block handler moves
+// the frontier on. If it did not, the race would keep firing at a block that has
+// already been delivered.
+func TestHandleBlockMsg_AdvancesTheFrontier(t *testing.T) {
+	running := blockchain2.FSMStateRUNNING
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+
+	sm := newRaceManager(t)
+	sm.ctx = context.Background()
+	sm.blockchainClient = blockchainClient
+	sm.requestedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Hour)
+	t.Cleanup(func() { sm.requestedBlocks.Stop() })
+
+	checkpointHash := chainhash.Hash{0xcf}
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 999, Hash: &checkpointHash}
+
+	syncPeer, _, _ := connectRacePeer(t, 18, 1000)
+	syncState := registerRacePeer(sm, syncPeer)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	arriving := chainhash.Hash{0xa1}
+	next := chainhash.Hash{0xa2}
+	sm.headerList.PushBack(&headerNode{height: 10, hash: &arriving})
+	sm.headerList.PushBack(&headerNode{height: 11, hash: &next})
+	sm.startHeader = nil // everything in the list has been requested
+
+	syncState.requestedBlocks.Set(arriving, struct{}{})
+	sm.setFrontier(arriving, 10, time.Now().Add(-30*time.Second))
+
+	// Carrying no block makes handleBlockMsg bail immediately after the
+	// header-list bookkeeping, which is the part under test.
+	err := sm.handleBlockMsg(&blockQueueMsg{blockHash: arriving, peer: syncPeer})
+	require.Error(t, err)
+
+	sm.frontierMu.Lock()
+	defer sm.frontierMu.Unlock()
+	require.Equal(t, next, sm.frontierHash, "the next block in the list is now what everything waits on")
+	require.Equal(t, int32(11), sm.frontierHeight)
+}
+
 // TestSetFrontier_AgeIsMeasuredFromTheBlockNotTheUpdate pins the behaviour the
 // age gate depends on. fetchHeaderBlocks republishes the same frontier every
 // time it tops up the request pipeline; if each republish reset the clock, the
