@@ -41,9 +41,12 @@ var (
 
 	// defaultReplenishInterval is the cadence of the outbound replenishment
 	// loop when Config.ReplenishInterval is left unset. One minute is the
-	// historical value: leaving the setting at zero reproduces the old
-	// behaviour exactly, so it is the rollback for the continuous-replenish
-	// change.
+	// historical value, so leaving the setting at zero is the rollback lever
+	// for the continuous-replenish change: it restores the old CADENCE and
+	// disables the event-driven wake. It does not restore the old behaviour,
+	// which is materially worse — the previous periodic pass bounded its dial
+	// loop by a monotonic request counter against the target, so once startup
+	// had pushed that counter to the target the loop never dialled again.
 	defaultReplenishInterval = time.Minute
 )
 
@@ -172,13 +175,19 @@ type Config struct {
 	// TargetOutbound is the number of outbound network connections to
 	// maintain. Defaults to 8.
 	//
-	// This target covers the AUTOMATIC outbound tier only. Permanent
-	// (addnode) requests are accounted separately and never consume one of
-	// these slots — see automaticCounts. Callers that dial outside the
-	// connection manager entirely (for example a feeler probe) are likewise
-	// invisible here by construction: the connection manager's books are the
-	// sole authority for the automatic slots, so anything that must not
-	// count against the target must not be handed to Connect or NewConnReq.
+	// The REPLENISHMENT PASS applies this target to the automatic outbound
+	// tier only: automaticCounts excludes permanent (addnode) requests from
+	// both of its counts, so a permanent peer never causes the pass to dial
+	// one fewer automatic address. The reconnect decision in handleDisconnected
+	// is deliberately not scoped that way — it compares the whole conns book
+	// against the target — so a permanent peer does hold a place there. That is
+	// the pre-existing behaviour and is left alone.
+	//
+	// Callers that dial outside the connection manager entirely (for example a
+	// feeler probe) are invisible here by construction: the connection
+	// manager's books are the sole authority for the automatic slots, so
+	// anything that must not count against the target must not be handed to
+	// Connect or NewConnReq.
 	TargetOutbound uint32
 
 	// ReplenishInterval is how often the connection manager re-checks its
@@ -191,7 +200,9 @@ type Config struct {
 	// does.
 	//
 	// Defaults to defaultReplenishInterval (one minute) when zero, which is
-	// the byte-identical rollback to the previous behaviour.
+	// the rollback lever: it restores the previous cadence and disables the
+	// event-driven wake, but not the previous behaviour — see
+	// defaultReplenishInterval for why the old periodic pass never dialled.
 	ReplenishInterval time.Duration
 
 	// RetryDuration is the duration to wait before retrying connection
@@ -793,16 +804,6 @@ func (cm *ConnManager) Remove(id uint64) {
 	}
 }
 
-// OpenConnIDs returns the ids of every outbound connection the manager
-// currently counts as open. It deliberately exposes the manager's BOOKS (not
-// kernel truth): the server audits these ids against its live outbound peer
-// set (reconcileConnAccounting) so any entry that leaks into the book without
-// a backing peer — the mainnet phantom-connection starvation — is detected
-// and evicted instead of permanently counting toward TargetOutbound.
-func (cm *ConnManager) OpenConnIDs() []uint64 {
-	return cm.conns.Keys()
-}
-
 // listenHandler accepts incoming connections on a given listener.  It must be
 // run as a goroutine.
 func (cm *ConnManager) listenHandler(listener net.Listener) {
@@ -851,7 +852,18 @@ func (cm *ConnManager) Start() {
 		go cm.NewConnReq()
 	}
 
-	go cm.replenishHandler()
+	// Tracked so Wait blocks until the replenishment loop has actually stopped.
+	// Untracked, Wait can return while a pass is still in flight and the caller
+	// believes shutdown is complete while a fresh dial is being launched. The
+	// Done is wrapped here rather than placed inside replenishHandler because
+	// the tests start that loop directly and would then unbalance the group.
+	cm.wg.Add(1)
+
+	go func() {
+		defer cm.wg.Done()
+
+		cm.replenishHandler()
+	}()
 }
 
 // replenishSnapshot is the set of values reported by one replenishment pass. It
@@ -921,7 +933,15 @@ func (cm *ConnManager) replenish(lastLogged *replenishSnapshot, lastLogTime *tim
 			return
 		}
 
-		cm.replenishBackoffUntil.Store(0)
+		// Clear only the expired deadline that was just read. connHandler can
+		// arm a fresher one between the load and here, and an unconditional
+		// store would discard it and dial straight through the very backoff
+		// that exists to stop the node hammering a dead network. If the swap
+		// loses, something newer is in force, so skip this pass and let the
+		// next one re-read it.
+		if !cm.replenishBackoffUntil.CompareAndSwap(until, 0) {
+			return
+		}
 	}
 
 	target := int(cm.cfg.TargetOutbound)

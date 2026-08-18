@@ -438,12 +438,34 @@ func TestReplenishBacksOffWhenTheNetworkIsDown(t *testing.T) {
 	}, 5*time.Second, 5*time.Millisecond,
 		"consecutive dial failures past maxFailedAttempts must engage the replenishment backoff")
 
-	settled := dials.Load()
+	// Let the dials that were already in flight when the backoff engaged land
+	// before sampling. The deadline is armed by one failing dial, while the
+	// others from the same pass are still somewhere between their reservation
+	// and the Dial call, so they can raise the counter after Eventually has
+	// observed the deadline. Sampling straight after it would race those
+	// stragglers rather than test the backoff. Waiting for two readings a
+	// couple of ticker periods apart to agree is what "in flight" means here.
+	var settled atomic.Int32
+
+	require.Eventually(t, func() bool {
+		before := dials.Load()
+
+		time.Sleep(2 * interval)
+
+		if dials.Load() != before {
+			return false
+		}
+
+		settled.Store(before)
+
+		return true
+	}, 5*time.Second, interval,
+		"the dial count never went quiet after the backoff engaged")
 
 	// Many ticker periods, but well inside RetryDuration.
 	time.Sleep(50 * interval)
 
-	require.Equal(t, settled, dials.Load(),
+	require.Equal(t, settled.Load(), dials.Load(),
 		"the periodic pass must honour the network-down backoff instead of dialling straight through it")
 }
 
