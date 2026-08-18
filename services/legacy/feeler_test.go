@@ -378,6 +378,53 @@ func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
 	}
 }
 
+// TestStartFeelerHonoursTheDisableLever pins the second half of the rollback
+// lever. Setting the budget to zero has to stop the goroutine from starting as
+// well as stop the slot being reserved; a version that reserved nothing but
+// still ran the loop would be a disabled feature that still probes.
+//
+// Observed through the server's wait group, which is what startFeeler adds to.
+// A count of zero cannot be observed through the probe rate, because a token
+// channel of capacity zero would hand out no probes either way.
+func TestStartFeelerHonoursTheDisableLever(t *testing.T) {
+	t.Run("disabled: nothing is started", func(t *testing.T) {
+		srv := newFeelerTestServer(t)
+		srv.feelerSlots = 0
+
+		srv.startFeeler()
+
+		require.True(t, waitGroupSettles(&srv.wg, 5*time.Second),
+			"a disabled feeler must not leave a goroutine running")
+	})
+
+	t.Run("enabled: the loop is running", func(t *testing.T) {
+		srv := newFeelerTestServer(t)
+		serveFeelerSnapshot(srv, feelerSnapshot{})
+
+		srv.startFeeler()
+
+		require.False(t, waitGroupSettles(&srv.wg, time.Second),
+			"an enabled feeler must leave its loop running until shutdown")
+	})
+}
+
+// waitGroupSettles reports whether the wait group drained within the timeout.
+func waitGroupSettles(wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // TestFeelerWaitsForTheOutboundTier pins the gate where it is actually applied,
 // in the probe loop, rather than only in the predicate it calls.
 //
