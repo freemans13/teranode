@@ -2819,9 +2819,9 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		// nothing enforced MaxAddnodePeers here at all, so the startup budget
 		// could be walked straight past at runtime.
 		if !connectNodeAdmitted(msg.permanent, state.persistentPeers.Length(),
-			state.CountExcludingPermanent(), cfg.MaxAddnodePeers, cfg.MaxPeers) {
+			state.CountExcludingPermanent(), s.settings.Legacy.MaxAddnodePeers, cfg.MaxPeers) {
 			if msg.permanent {
-				msg.reply <- errors.NewProcessingError("max addnode peers reached [%d]", cfg.MaxAddnodePeers)
+				msg.reply <- errors.NewProcessingError("max addnode peers reached [%d]", s.settings.Legacy.MaxAddnodePeers)
 			} else {
 				msg.reply <- errors.NewProcessingError("max peers reached [%d]", cfg.MaxPeers)
 			}
@@ -3980,9 +3980,9 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	// are related: the replenishment pass counts only the automatic tier, so
 	// the node's outbound total is the target PLUS its addnode peers. MaxPeers
 	// has to bound that total rather than the automatic half alone.
-	permanentPeers, droppedPeers := permanentPeerList(cfg.ConnectPeers, cfg.AddPeers, cfg.MaxAddnodePeers)
+	permanentPeers, droppedPeers := permanentPeerList(cfg.ConnectPeers, cfg.AddPeers, tSettings.Legacy.MaxAddnodePeers)
 	if droppedPeers > 0 {
-		logger.Warnf("More addnode peers configured than maxaddnodepeers allows [%d]: dialing the first %d, ignoring %d", cfg.MaxAddnodePeers, len(permanentPeers), droppedPeers)
+		logger.Warnf("More addnode peers configured than legacy_maxAddnodePeers allows [%d]: dialing the first %d, ignoring %d", tSettings.Legacy.MaxAddnodePeers, len(permanentPeers), droppedPeers)
 	}
 
 	targetOutbound := automaticOutboundTarget(cfg.TargetOutboundPeers, cfg.MaxPeers)
