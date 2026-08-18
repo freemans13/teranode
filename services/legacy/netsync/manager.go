@@ -3132,8 +3132,6 @@ func (sm *SyncManager) SyncPeerID() int32 {
 	return <-reply
 }
 
-// IsCurrent returns whether the sync manager believes it is synced with
-// the connected peers.
 // PeersWithBlockDownloads reports how many peers currently have at least one
 // block request outstanding.
 //
@@ -3157,6 +3155,8 @@ func (sm *SyncManager) PeersWithBlockDownloads() int {
 	return n
 }
 
+// IsCurrent returns whether the sync manager believes it is synced with
+// the connected peers.
 func (sm *SyncManager) IsCurrent() bool {
 	return sm.current()
 }

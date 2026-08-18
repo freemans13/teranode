@@ -1568,7 +1568,7 @@ func blockResponsePending(pending map[string]time.Time) bool {
 // from (our downstream link is shared between them, so each transfer is honestly
 // slower). This mirrors svnode, which computes
 //
-//	nPowTargetSpacing * (timeoutBase + timeoutPerPeer * nOtherPeers)
+//	nPowTargetSpacing * (timeoutBase + timeoutPerPeer * nOtherPeers) / 100
 //
 // with base 100%/600% for tip/catch-up and 50% per other peer.
 //
