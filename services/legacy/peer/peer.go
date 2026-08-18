@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"strconv"
@@ -1568,7 +1569,7 @@ func blockResponsePending(pending map[string]time.Time) bool {
 // from (our downstream link is shared between them, so each transfer is honestly
 // slower). This mirrors svnode, which computes
 //
-//	nPowTargetSpacing * (timeoutBase + timeoutPerPeer * nOtherPeers) / 100
+//	nPowTargetSpacing * (timeoutBase + timeoutPerPeer * nOtherPeers)
 //
 // with base 100%/600% for tip/catch-up and 50% per other peer.
 //
@@ -1601,9 +1602,19 @@ func (p *Peer) blockDownloadBudget() time.Duration {
 		return MaxBlockDownloadTime
 	}
 
-	// Re-check after the multiply, not just before it: an absurdly large
-	// percentage overflows the duration and wraps negative, which would
-	// disconnect every peer just as surely as a zero would.
+	// Bound the multiply rather than inspecting its result. An overflowing
+	// product wraps to a small POSITIVE duration as readily as to a negative
+	// one — 30744574% of a ten-minute interval wraps to 3.26 seconds — and a
+	// three-second ceiling disconnects every peer just as surely as a zero
+	// would, while sailing straight past any check on the sign. Both operands
+	// are positive here, so this division is the exact largest total that
+	// cannot overflow.
+	if total > math.MaxInt64/int64(interval) {
+		return MaxBlockDownloadTime
+	}
+
+	// The product cannot overflow now, but a chain whose interval is shorter
+	// than the percentage divisor can still floor to zero.
 	budget := time.Duration(total) * interval / 100
 	if budget <= 0 {
 		return MaxBlockDownloadTime

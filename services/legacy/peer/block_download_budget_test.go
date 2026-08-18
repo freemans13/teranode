@@ -78,16 +78,36 @@ func TestBlockDownloadBudgetNeverZero(t *testing.T) {
 		require.Equal(t, MaxBlockDownloadTime, p.blockDownloadBudget())
 	})
 
-	// A percentage large enough to overflow the multiplication wraps the result
-	// negative, which disconnects every peer just as surely as a zero would. The
-	// guard has to run after the multiply, not only before it.
+	// A percentage large enough to overflow the multiplication must fall back
+	// rather than have its wrapped product taken at face value.
 	//
-	// 15372287% of ten minutes is 9223372200000000000ns, which is just past the
-	// largest positive int64 (9223372036854775807) and so wraps.
-	t.Run("percentage large enough to overflow falls back", func(t *testing.T) {
+	// Just past the edge: 15372287% of ten minutes is 9223372200000000000ns,
+	// against a largest int64 of 9223372036854775807, so it wraps negative.
+	t.Run("percentage that overflows negative falls back", func(t *testing.T) {
 		p := budgetPeer(t, 10*time.Minute, true, 1)
 		p.settings.Legacy.BlockDownloadTimeoutBaseIBDPercent = 15372287
 		require.Equal(t, MaxBlockDownloadTime, p.blockDownloadBudget())
+	})
+
+	// Far past the edge, and the reason a check on the sign of the product is
+	// not enough: 30744574% of ten minutes exceeds 2^64, so it wraps all the way
+	// round to a small POSITIVE 326s, which /100 leaves as a 3.26s ceiling. That
+	// is a plausible-looking duration that would disconnect every peer within one
+	// stall tick, and it is greater than zero, so any guard reading only the sign
+	// of the result waves it through. The bound has to be on the multiply itself.
+	t.Run("percentage that overflows positive falls back", func(t *testing.T) {
+		p := budgetPeer(t, 10*time.Minute, true, 1)
+		p.settings.Legacy.BlockDownloadTimeoutBaseIBDPercent = 30744574
+		require.Equal(t, MaxBlockDownloadTime, p.blockDownloadBudget())
+	})
+
+	// The largest total that does NOT overflow must still be honoured, so the
+	// bound rejects only what genuinely cannot be computed. 15372286% of ten
+	// minutes is within int64, giving roughly 1067 days.
+	t.Run("largest non-overflowing percentage is honoured", func(t *testing.T) {
+		p := budgetPeer(t, 10*time.Minute, true, 1)
+		p.settings.Legacy.BlockDownloadTimeoutBaseIBDPercent = 15372286
+		require.Equal(t, 15372286*10*time.Minute/100, p.blockDownloadBudget())
 	})
 }
 
