@@ -77,6 +77,18 @@ func TestBlockDownloadBudgetNeverZero(t *testing.T) {
 		p.settings.Legacy.BlockDownloadTimeoutPerPeerPercent = 0
 		require.Equal(t, MaxBlockDownloadTime, p.blockDownloadBudget())
 	})
+
+	// A percentage large enough to overflow the multiplication wraps the result
+	// negative, which disconnects every peer just as surely as a zero would. The
+	// guard has to run after the multiply, not only before it.
+	//
+	// 15372287% of ten minutes is 9223372200000000000ns, which is just past the
+	// largest positive int64 (9223372036854775807) and so wraps.
+	t.Run("percentage large enough to overflow falls back", func(t *testing.T) {
+		p := budgetPeer(t, 10*time.Minute, true, 1)
+		p.settings.Legacy.BlockDownloadTimeoutBaseIBDPercent = 15372287
+		require.Equal(t, MaxBlockDownloadTime, p.blockDownloadBudget())
+	})
 }
 
 // TestBlockDownloadBudgetUnwiredIsSafe pins the behaviour when the callbacks are

@@ -31,18 +31,20 @@ func TestNewPeerConfigWiresDownloadDeadlineCallbacks(t *testing.T) {
 	amgr := addrmgr.New(ulogger.TestLogger{}, t.TempDir(), func(string) ([]net.IP, error) { return nil, nil })
 	sp := &serverPeer{server: &server{settings: settings.NewSettings(), addrManager: amgr}}
 
-	cfg := newPeerConfig(sp)
-	require.NotNil(t, cfg)
+	// Deliberately not named cfg: that is the package-level global this test is
+	// swapping out above, and shadowing it here would hide the restore.
+	peerCfg := newPeerConfig(sp)
+	require.NotNil(t, peerCfg)
 
-	require.NotNil(t, cfg.CatchingUp,
+	require.NotNil(t, peerCfg.CatchingUp,
 		"CatchingUp must be wired or the catch-up ceiling can never apply")
-	require.NotNil(t, cfg.PeersWithBlockDownloads,
+	require.NotNil(t, peerCfg.PeersWithBlockDownloads,
 		"PeersWithBlockDownloads must be wired or the per-peer compensation can never apply")
 
 	// With no sync manager attached both must answer safely rather than panic:
 	// "not catching up" and "no peers", which together give the shortest ceiling.
-	require.False(t, cfg.CatchingUp(),
+	require.False(t, peerCfg.CatchingUp(),
 		"a peer with no sync manager must not claim to be catching up")
-	require.Zero(t, cfg.PeersWithBlockDownloads(),
+	require.Zero(t, peerCfg.PeersWithBlockDownloads(),
 		"a peer with no sync manager must not report downloading peers")
 }

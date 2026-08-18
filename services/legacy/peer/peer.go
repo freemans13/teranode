@@ -87,15 +87,22 @@ const (
 	// far below real block-transfer rates.
 	minBlockDownloadBytesPerSec = 51200
 
-	// MaxBlockDownloadTime is the absolute wall-clock ceiling on how long a
-	// single block fetch may be kept alive by throughput-based deadline
-	// extension. Without a cap, a malicious peer could dribble bytes at just
-	// above minBlockDownloadBytesPerSec indefinitely — never completing a valid
-	// block — and hold the single sync-peer slot, stalling IBD. Past this cap
-	// the block deadline is enforced (and, in netsync, the sync peer rotated)
-	// regardless of throughput. Generous for honest fat blocks: a 4 GB block
-	// need only average ~2.3 MB/s to finish inside the window. Shared with the
-	// netsync sync-peer rotation cap so both layers agree.
+	// MaxBlockDownloadTime is a fixed wall-clock ceiling on how long a single
+	// block fetch may be kept alive by throughput-based deadline extension.
+	// Without a cap, a malicious peer could dribble bytes at just above
+	// minBlockDownloadBytesPerSec indefinitely — never completing a valid block —
+	// and hold the single sync-peer slot, stalling IBD. Generous for honest fat
+	// blocks: a 4 GB block need only average ~2.3 MB/s to finish inside the
+	// window.
+	//
+	// The peer layer no longer uses this as its normal ceiling: blockDownloadBudget
+	// scales the ceiling with the chain's block interval, whether we are catching
+	// up, and how many peers we are downloading from. This constant remains the
+	// fallback that blockDownloadBudget returns when that calculation cannot
+	// produce a usable value, and it is still the flat cap on netsync's sync-peer
+	// rotation, which is NOT scaled — so during catch-up netsync rotates the sync
+	// peer at this value even though the peer layer would wait longer. See
+	// SyncManager.CheckSyncPeer.
 	MaxBlockDownloadTime = 30 * time.Minute
 )
 
@@ -1594,16 +1601,24 @@ func (p *Peer) blockDownloadBudget() time.Duration {
 		return MaxBlockDownloadTime
 	}
 
-	return time.Duration(total) * interval / 100
+	// Re-check after the multiply, not just before it: an absurdly large
+	// percentage overflows the duration and wraps negative, which would
+	// disconnect every peer just as surely as a zero would.
+	budget := time.Duration(total) * interval / 100
+	if budget <= 0 {
+		return MaxBlockDownloadTime
+	}
+
+	return budget
 }
 
 // shouldExtendBlockDeadline reports whether an expired block-response deadline
 // should be extended (because the block is still actively arriving) rather than
 // treated as a stall. Extension is allowed only while throughput is healthy AND
-// the fetch has been in flight for less than MaxBlockDownloadTime — the
-// wall-clock cap that stops a peer dribbling bytes forever from holding the
-// sync slot indefinitely. blockFetchStart is the zero value when no block fetch
-// is in flight.
+// the fetch has been in flight for less than budget — the wall-clock ceiling
+// that stops a peer dribbling bytes forever from holding the sync slot
+// indefinitely, supplied by blockDownloadBudget. blockFetchStart is the zero
+// value when no block fetch is in flight.
 func shouldExtendBlockDeadline(command string, healthyDownload bool, blockFetchStart, now time.Time, budget time.Duration) bool {
 	if !isBlockResponseCommand(command) || !healthyDownload {
 		return false
@@ -1735,8 +1750,8 @@ func (p *Peer) stallHandler() {
 	lastAssocReadBytes := p.AssociationReadBytes()
 
 	// blockFetchStart records when the current block fetch first went in flight.
-	// It bounds how long throughput-based extension can keep a block alive
-	// (MaxBlockDownloadTime); zero when no block fetch is outstanding.
+	// It bounds how long throughput-based extension can keep a block alive (see
+	// blockDownloadBudget); zero when no block fetch is outstanding.
 	var blockFetchStart time.Time
 out:
 	for {
@@ -1842,7 +1857,8 @@ out:
 			// its adjusted deadline. While a block fetch is in flight,
 			// non-block deadlines are suppressed (see expiredStallResponse).
 			if command, stalled := expiredStallResponse(pendingResponses, now, offset); stalled {
-				if shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now, p.blockDownloadBudget()) {
+				budget := p.blockDownloadBudget()
+				if shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now, budget) {
 					// The block is still actively arriving at a healthy rate and
 					// within the wall-clock cap; extend the whole block-response
 					// group (armed together) rather than disconnect a peer
@@ -1855,7 +1871,7 @@ out:
 					}
 
 					p.logger.Debugf("Extending block deadline for %s: downloading at %d B/s (%.0fs into fetch, cap %s)",
-						p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), p.blockDownloadBudget())
+						p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), budget)
 				} else {
 					reason := fmt.Sprintf("Peer appears to be stalled or misbehaving, %s timeout", command)
 					p.DisconnectWithInfo(reason)
@@ -1913,7 +1929,7 @@ func UseBlockPrefetchIngestion(budgetBytes int64, net wire.BitcoinNet) bool {
 // should run for this command. With block prefetch ingestion active, OnBlock
 // legitimately blocks in AcquireBlockPrefetch under budget backpressure for
 // longer than PeerProcessingTimeout; block-stall detection is owned by the
-// netsync stall detector, the idle timer, and MaxBlockDownloadTime, so the
+// netsync stall detector, the idle timer, and the block-download budget, so the
 // watchdog is not armed for block messages in that mode. It shares the
 // UseBlockPrefetchIngestion predicate with netsync.SyncManager.UsePrefetchIngestion
 // so the read-loop and sync manager agree on when prefetch is active — regtest
@@ -2032,8 +2048,8 @@ out:
 		// With block prefetch enabled, OnBlock legitimately parks in
 		// AcquireBlockPrefetch under budget backpressure for longer than
 		// PeerProcessingTimeout; block-stall detection is then owned by the
-		// netsync stall detector, the idle timer, and MaxBlockDownloadTime, so the
-		// per-message watchdog must not fire for block messages in that mode.
+		// netsync stall detector, the idle timer, and the block-download budget, so
+		// the per-message watchdog must not fire for block messages in that mode.
 		if shouldArmProcessingTimer(rmsg.Command(), p.settings.Legacy.BlockPrefetchBufferBytes, p.cfg.ChainParams.Net) {
 			processingTimer.Reset(p.settings.Legacy.PeerProcessingTimeout)
 		}
