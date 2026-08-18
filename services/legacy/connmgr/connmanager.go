@@ -491,8 +491,32 @@ out:
 				// callback.
 				cm.logger.Debugf("Disconnected from %v", connReq)
 
+				// Retire the connection and, when it is to be retried, re-pend
+				// it in the same step. A slot counts as occupied while its
+				// request is visible in either book, so if the two halves are
+				// held apart the request belongs to neither for as long as the
+				// steps between them take — and a replenishment pass landing
+				// there sees a free slot that this path is already about to
+				// fill, and dials a second address for it.
+				//
+				// The decision is taken here rather than below because it is
+				// the same measurement problem: whether there is room to
+				// reconnect has to be read and acted on without another pass
+				// slipping in between.
+				cm.dialMu.Lock()
 				cm.conns.Delete(msg.id)
 
+				repend := msg.retry &&
+					(cm.conns.Length() < int(cm.cfg.TargetOutbound) || connReq.Permanent)
+				if repend {
+					connReq.updateState(ConnPending)
+					cm.pending.Set(msg.id, connReq)
+				}
+				cm.dialMu.Unlock()
+
+				// Closing a socket is a syscall and the callback is the
+				// server's, so both are deliberately kept outside dialMu, which
+				// guards bookkeeping only.
 				if connReq.conn != nil {
 					connReq.conn.Close()
 				}
@@ -518,15 +542,12 @@ out:
 
 				// Otherwise, we will attempt a reconnection if
 				// we do not have enough peers, or if this is a
-				// persistent peer. The connection request is
-				// re added to the pending map, so that
+				// persistent peer. The connection request was
+				// re added to the pending map above, so that
 				// subsequent processing of connections and
 				// failures do not ignore the request.
-				if cm.conns.Length() < int(cm.cfg.TargetOutbound) || connReq.Permanent {
-					connReq.updateState(ConnPending)
+				if repend {
 					cm.logger.Debugf("Reconnecting to %v", connReq)
-
-					cm.pending.Set(msg.id, connReq)
 
 					cm.handleFailedConn(connReq)
 				}
