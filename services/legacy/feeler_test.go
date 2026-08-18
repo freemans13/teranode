@@ -1,12 +1,16 @@
 package legacy
 
 import (
+	"math/rand/v2"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/internal/banlist"
+	"github.com/bsv-blockchain/teranode/services/legacy/addrmgr"
 	"github.com/bsv-blockchain/teranode/services/legacy/connmgr"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -187,6 +191,7 @@ func startTestConnManager(t *testing.T, target uint32) (*connmgr.ConnManager, fu
 	t.Helper()
 
 	var (
+		mtx     sync.Mutex
 		closers []net.Conn
 		nextIP  int
 	)
@@ -195,7 +200,11 @@ func startTestConnManager(t *testing.T, target uint32) (*connmgr.ConnManager, fu
 		TargetOutbound: target,
 		Dial: func(net.Addr) (net.Conn, error) {
 			ours, theirs := net.Pipe()
+
+			// Dials run on their own goroutines, so the bookkeeping needs a lock.
+			mtx.Lock()
 			closers = append(closers, ours, theirs)
+			mtx.Unlock()
 
 			return ours, nil
 		},
@@ -207,6 +216,9 @@ func startTestConnManager(t *testing.T, target uint32) (*connmgr.ConnManager, fu
 	t.Cleanup(func() {
 		cmgr.Stop()
 		cmgr.Wait()
+
+		mtx.Lock()
+		defer mtx.Unlock()
 
 		for _, c := range closers {
 			_ = c.Close()
@@ -237,4 +249,413 @@ func startTestConnManager(t *testing.T, target uint32) (*connmgr.ConnManager, fu
 	}
 
 	return cmgr, establish
+}
+
+// TestPoissonNextIsExponential pins the shape of the pacing, not just its
+// average.
+//
+// A fixed two-minute period would be a fingerprint: an observer who sees probes
+// exactly two minutes apart can recognise the node across address changes and
+// predict the next one, and a fleet started together would probe in lockstep.
+// svnode randomises for the same reason. A single-sample test would pass
+// happily against a constant, so this checks the mean AND the spread.
+func TestPoissonNextIsExponential(t *testing.T) {
+	const (
+		draws = 20000
+		mean  = time.Millisecond
+	)
+
+	var (
+		total   time.Duration
+		sawLong bool
+		sawTiny bool
+	)
+
+	for i := 0; i < draws; i++ {
+		d := poissonNext(mean)
+		total += d
+
+		require.GreaterOrEqual(t, d, time.Duration(0), "a delay must never be negative")
+
+		if d > 3*mean {
+			sawLong = true
+		}
+
+		if d < mean/10 {
+			sawTiny = true
+		}
+	}
+
+	observed := float64(total) / draws
+
+	require.InEpsilon(t, float64(mean), observed, 0.05,
+		"the sample mean must sit within five percent of the configured mean")
+	require.True(t, sawLong, "an exponential draw must sometimes run well over its mean")
+	require.True(t, sawTiny, "an exponential draw must sometimes come in well under its mean")
+}
+
+// TestFeelerSkipsCandidatesAlreadyHeldOrOccupied covers the two exclusions that
+// keep a probe from taking anything away from a real peer.
+//
+// The earlier sketch on stu/legacy-svnode-align claimed the netgroup filter
+// alone guaranteed the node would never open a second connection to a peer it
+// already held. That is not true: the netgroup set is derived from the automatic
+// outbound list only, so inbound and named peers are invisible to it. Both
+// filters are checked here separately, against the same address.
+func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
+	restoreCfg := swapTestConfig(t, "")
+	defer restoreCfg()
+
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+
+	tests := []struct {
+		name string
+		snap feelerSnapshot
+		want bool
+	}{
+		{
+			name: "host already connected",
+			snap: feelerSnapshot{hosts: map[string]struct{}{"8.8.8.8": {}}},
+			want: false,
+		},
+		{
+			name: "netgroup already occupied",
+			snap: feelerSnapshot{outboundGroups: map[string]struct{}{addrmgr.GroupKey(na): {}}},
+			want: false,
+		},
+		{
+			name: "nothing in the way",
+			snap: feelerSnapshot{},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newFeelerTestServer(t)
+			serveFeelerSnapshot(srv, tt.snap)
+
+			srv.addrManager.AddAddress(na, testSourceAddr())
+
+			got := srv.feelerCandidate()
+
+			if !tt.want {
+				require.Nil(t, got, "the candidate should have been skipped")
+				return
+			}
+
+			require.NotNil(t, got)
+			require.Equal(t, "8.8.8.8:8333", addrmgr.NetAddressKey(got))
+		})
+	}
+}
+
+// TestFeelerSnapshotQueryReportsPeers drives the peer handler's answer to the
+// probe's one question, which is the half of the exchange the end-to-end tests
+// stub out.
+//
+// It also pins the difference between the two halves of the snapshot. The
+// netgroup set covers automatic outbound peers only, because that is the tier
+// whose diversity the node is protecting. The host set covers every tier,
+// because a second connection to a host is a problem whichever tier the first
+// one is in — and the earlier sketch got exactly this wrong, claiming the
+// netgroup check made the host check unnecessary.
+func TestFeelerSnapshotQueryReportsPeers(t *testing.T) {
+	srv := &server{logger: ulogger.TestLogger{}, settings: settings.NewSettings()}
+	state := newTestPeerState()
+
+	outbound := newTestOutboundPeer(t, srv, "8.8.8.8:8333")
+	inbound := newTestOutboundPeer(t, srv, "1.1.1.1:8333")
+	named := newTestOutboundPeer(t, srv, "9.9.9.9:8333")
+
+	state.outboundPeers.Set(1, outbound)
+	state.inboundPeers.Set(2, inbound)
+	state.persistentPeers.Set(3, named)
+
+	reply := make(chan feelerSnapshot, 1)
+	srv.handleQuery(state, getFeelerSnapshotMsg{reply: reply})
+
+	snap := <-reply
+
+	require.Contains(t, snap.hosts, "8.8.8.8")
+	require.Contains(t, snap.hosts, "1.1.1.1", "an inbound peer still occupies its host")
+	require.Contains(t, snap.hosts, "9.9.9.9", "a named peer still occupies its host")
+	require.Len(t, snap.hosts, 3)
+
+	require.Contains(t, snap.outboundGroups, addrmgr.GroupKey(outbound.NA()))
+	require.NotContains(t, snap.outboundGroups, addrmgr.GroupKey(inbound.NA()),
+		"only the automatic outbound tier claims a netgroup")
+	require.NotContains(t, snap.outboundGroups, addrmgr.GroupKey(named.NA()))
+}
+
+// TestFeelerPromotesAnAddressEndToEnd drives the whole probe: the real dial
+// path, a real handshake against a real listener, and the address book.
+//
+// Promotion is observed through exported API alone. Moving an address from new
+// to tried leaves the total unchanged while emptying the new table, so
+// "UnverifiedAddress returns nothing while NumAddresses is still one" is exactly
+// the promotion, with no test-only accessor needed.
+//
+// The book entry has to be a routable address, because the address manager
+// refuses to store loopback, while the socket has to be loopback because that is
+// where the test listener is. cfg.dial bridges the two: it is a real production
+// field, set by loadConfig, so redirecting it exercises the production dial path
+// without adding a seam to production code.
+func TestFeelerPromotesAnAddressEndToEnd(t *testing.T) {
+	ln, served := startFeelerTestListener(t, "/Bitcoin SV:1.1.0/")
+
+	restoreCfg := swapTestConfig(t, ln.Addr().String())
+	defer restoreCfg()
+
+	srv := newFeelerTestServer(t)
+	serveFeelerSnapshot(srv, feelerSnapshot{})
+	atFeelerTarget(t, srv)
+
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+	srv.addrManager.AddAddress(na, testSourceAddr())
+
+	require.Equal(t, 1, srv.addrManager.NumAddresses())
+	require.NotNil(t, srv.addrManager.UnverifiedAddress(), "the address starts out unverified")
+
+	startFeelerLoop(t, srv)
+
+	select {
+	case <-served:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the probe never reached the listener")
+	}
+
+	require.Eventually(t, func() bool {
+		return srv.addrManager.UnverifiedAddress() == nil
+	}, 20*time.Second, 10*time.Millisecond,
+		"a verified address must leave the new table")
+
+	require.Equal(t, 1, srv.addrManager.NumAddresses(),
+		"promotion moves the address between tables, it does not add or drop one")
+	require.Equal(t, uint64(1), srv.feelerVerified.Load())
+}
+
+// TestFeelerDoesNotPromoteNonBSVPeer is the counterpart, and it guards against
+// the sketch's worst defect: it installed no version listener at all and marked
+// every address that completed a handshake as good. A BTC or BCH node that
+// answered would have been promoted, and because promotion can evict an existing
+// tried entry, that does not merely waste a probe -- it pushes out a real BSV
+// peer.
+func TestFeelerDoesNotPromoteNonBSVPeer(t *testing.T) {
+	ln, served := startFeelerTestListener(t, "/Satoshi:0.21.0/")
+
+	restoreCfg := swapTestConfig(t, ln.Addr().String())
+	defer restoreCfg()
+
+	srv := newFeelerTestServer(t)
+	serveFeelerSnapshot(srv, feelerSnapshot{})
+
+	// Two established automatic peers, so countFailedDial has the evidence it
+	// needs to hold an address responsible. Below that threshold an attempt is
+	// recorded but never counted, and the attempt tally would stay at zero for
+	// reasons that have nothing to do with this probe.
+	atLeastTwoAutomaticPeers(t, srv)
+
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+	srv.addrManager.AddAddress(na, testSourceAddr())
+
+	startFeelerLoop(t, srv)
+
+	select {
+	case <-served:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the probe never reached the listener")
+	}
+
+	// Wait for the probe to finish deciding, which the counter records.
+	require.Eventually(t, func() bool {
+		return srv.feelerAttempted.Load() > 0
+	}, 20*time.Second, 10*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		ka := srv.addrManager.UnverifiedAddress()
+		return ka != nil && ka.Attempts() > 0
+	}, 20*time.Second, 10*time.Millisecond,
+		"the address must stay unverified, and the attempt must be recorded against it")
+
+	require.Equal(t, uint64(0), srv.feelerVerified.Load(),
+		"a node that is not a BSV node must never be promoted")
+}
+
+// testSourceAddr is the "who told us about this address" address. It only has
+// to be routable and distinct from the address under test.
+func testSourceAddr() *wire.NetAddress {
+	return wire.NewNetAddressIPPort(net.ParseIP("173.194.115.1"), 8333, wire.SFNodeNetwork)
+}
+
+// swapTestConfig replaces the package-level legacy config for the duration of a
+// test. When redirectTo is set, every dial goes there instead of the address
+// asked for, which is what lets a probe of a routable book entry land on a
+// loopback listener.
+//
+// cfg.dial is a real production field, set by loadConfig, so this exercises the
+// production dial path rather than a test-only injection point.
+func swapTestConfig(t *testing.T, redirectTo string) func() {
+	t.Helper()
+
+	orig := cfg
+
+	c := &config{
+		MaxPeers:        125,
+		MaxPeersPerIP:   5,
+		TrickleInterval: 10 * time.Second,
+	}
+
+	c.dial = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		if redirectTo != "" {
+			addr = redirectTo
+		}
+
+		return net.DialTimeout(network, addr, timeout)
+	}
+
+	cfg = c
+
+	return func() { cfg = orig }
+}
+
+// newFeelerTestServer builds the smallest server the probe path needs.
+func newFeelerTestServer(t *testing.T) *server {
+	t.Helper()
+
+	tSettings := settings.NewSettings()
+	tSettings.Legacy.FeelerInterval = time.Millisecond
+
+	srv := &server{
+		logger:      ulogger.TestLogger{},
+		settings:    tSettings,
+		addrManager: addrmgr.New(ulogger.TestLogger{}, t.TempDir(), nil),
+		banList:     banlist.New(nil, "", ulogger.TestLogger{}),
+		quit:        make(chan struct{}),
+		query:       make(chan interface{}),
+		feelerSlots: 1,
+		services:    wire.SFNodeNetwork,
+	}
+
+	t.Cleanup(func() {
+		close(srv.quit)
+		srv.wg.Wait()
+	})
+
+	return srv
+}
+
+// serveFeelerSnapshot answers the probe's peer-set query with a fixed snapshot,
+// standing in for the peer handler.
+func serveFeelerSnapshot(srv *server, snap feelerSnapshot) {
+	go func() {
+		for {
+			select {
+			case <-srv.quit:
+				return
+			case q := <-srv.query:
+				if msg, ok := q.(getFeelerSnapshotMsg); ok {
+					msg.reply <- snap
+				}
+			}
+		}
+	}()
+}
+
+// atFeelerTarget gives the server a connection manager that is at its outbound
+// target, which is the condition feelerAllowed requires.
+func atFeelerTarget(t *testing.T, srv *server) {
+	t.Helper()
+
+	cmgr, establish := startTestConnManager(t, 1)
+	establish(t, 1)
+
+	srv.connManager = cmgr
+
+	require.True(t, srv.feelerAllowed())
+}
+
+// atLeastTwoAutomaticPeers puts the node at target with two established
+// automatic outbound peers, which is also the threshold countFailedDial needs
+// before it will hold an address responsible for a failure.
+func atLeastTwoAutomaticPeers(t *testing.T, srv *server) {
+	t.Helper()
+
+	cmgr, establish := startTestConnManager(t, 2)
+	establish(t, 2)
+
+	srv.connManager = cmgr
+
+	require.True(t, srv.feelerAllowed())
+	require.True(t, srv.countFailedDial())
+}
+
+// startFeelerLoop runs the real feeler goroutine against the test server.
+func startFeelerLoop(t *testing.T, srv *server) {
+	t.Helper()
+
+	srv.wg.Add(1)
+
+	go srv.feelerHandler()
+}
+
+// startFeelerTestListener accepts one connection and answers it the way a
+// remote node would: it reads the probe's version message and replies with its
+// own, carrying the given user agent, then a verack.
+//
+// Deliberately a raw wire responder rather than a peer.Peer. Two peers built in
+// this process share the sent-nonce cache the protocol uses to spot a node that
+// has dialled itself, so an in-process peer would recognise the probe's own
+// nonce and hang up on it as a self-connection.
+func startFeelerTestListener(t *testing.T, userAgent string) (net.Listener, <-chan struct{}) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = ln.Close() })
+
+	net2 := settings.NewSettings().ChainCfgParams.Net
+	served := make(chan struct{})
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+
+		defer func() { _ = conn.Close() }()
+
+		msg, _, err := wire.ReadMessage(conn, wire.ProtocolVersion, net2)
+		if err != nil {
+			return
+		}
+
+		if _, ok := msg.(*wire.MsgVersion); !ok {
+			return
+		}
+
+		me := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 8333, wire.SFNodeNetwork)
+		you := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 8333, wire.SFNodeNetwork)
+
+		reply := wire.NewMsgVersion(me, you, rand.Uint64(), 0)
+		reply.UserAgent = userAgent
+		reply.Services = wire.SFNodeNetwork
+
+		if err := wire.WriteMessage(conn, reply, wire.ProtocolVersion, net2); err != nil {
+			return
+		}
+
+		if err := wire.WriteMessage(conn, wire.NewMsgVerAck(), wire.ProtocolVersion, net2); err != nil {
+			return
+		}
+
+		close(served)
+
+		// Hold the connection open so the probe is the side that hangs up.
+		buf := make([]byte, 1)
+		_, _ = conn.Read(buf)
+	}()
+
+	return ln, served
 }

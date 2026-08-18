@@ -324,6 +324,40 @@ func (ps *peerState) outboundGroups() map[string]struct{} {
 	return groups
 }
 
+// connectedHosts returns the host of every peer the node currently holds, in
+// any tier.
+//
+// Coarser than the netgroup set and deliberately so: it is what the feeler
+// probe uses to avoid opening a second connection to a host the node is already
+// talking to. The netgroup set cannot answer that question, because it is
+// derived from the automatic outbound list alone and so cannot see inbound or
+// named peers at all.
+//
+// Host rather than host:port, because MaxPeersPerIP is the rule a remote is
+// likely to be applying to us, and a second connection to a host we are
+// mid-download from is a good way to lose the first one.
+func (ps *peerState) connectedHosts() map[string]struct{} {
+	hosts := make(map[string]struct{}, ps.Count())
+
+	note := func(sp *serverPeer) {
+		if host, _, err := net.SplitHostPort(sp.Addr()); err == nil {
+			hosts[host] = struct{}{}
+		}
+	}
+
+	for _, list := range []*txmap.SyncedMap[int32, *serverPeer]{
+		ps.inboundPeers, ps.outboundPeers, ps.persistentPeers,
+	} {
+		list.Iterate(func(_ int32, sp *serverPeer) bool {
+			note(sp)
+
+			return true
+		})
+	}
+
+	return hosts
+}
+
 // CountExcludingPermanent returns the peers that draw on MaxPeers: the inbound
 // and automatic outbound tiers. Permanent (addnode) peers have their own budget
 // and are additive to this figure, so they are deliberately left out.
@@ -475,6 +509,13 @@ type server struct {
 	assetHTTPAddress  string
 	banList           *p2p.BanList
 	banChan           chan p2p.BanEvent
+
+	// feelerAttempted and feelerVerified count probes launched and probes that
+	// completed a BSV version exchange. Reported on the per-probe log line so
+	// the feature's slow, statistical benefit can be checked from the logs
+	// rather than inferred. Never reset.
+	feelerAttempted atomic.Uint64
+	feelerVerified  atomic.Uint64
 
 	// feelerSlots is how many peer slots are held back for feeler probes. It
 	// is deducted from the peer-admission ceiling and never from the automatic
@@ -708,6 +749,17 @@ func hasServices(advertised, desired wire.ServiceFlag) bool {
 	return advertised&desired == desired
 }
 
+// isBSVUserAgent reports whether a peer's user agent identifies a BSV node.
+//
+// Extracted so the feeler probe applies the same test as the ordinary peer
+// path. A probe that promoted a BTC or BCH node into the tried table would not
+// merely waste itself: promotion can evict an existing tried entry, so it would
+// push out a genuine BSV peer and degrade the very pool the probe exists to
+// improve.
+func isBSVUserAgent(userAgent string) bool {
+	return strings.Contains(userAgent, "Bitcoin SV") || strings.Contains(userAgent, "BSV")
+}
+
 // OnVersion is invoked when a peer receives a version bitcoin message
 // and is used to negotiate the protocol version details as well as kick start
 // the communications.
@@ -744,7 +796,7 @@ func (sp *serverPeer) OnVersion(p *peer.Peer, msg *wire.MsgVersion) *wire.MsgRej
 	// Only allow connections from peers running BSV Blockchain nodes
 	// This prevents connections from BCH/BTC/BTG and other incompatible forks
 	userAgent := msg.UserAgent
-	if !strings.Contains(userAgent, "Bitcoin SV") && !strings.Contains(userAgent, "BSV") {
+	if !isBSVUserAgent(userAgent) {
 		// Ban the peer to prevent repeated connection attempts from incompatible
 		// clients, unless banning is disabled. The peer is rejected either way.
 		if cfg.DisableBanning {
@@ -2771,6 +2823,22 @@ type getOutboundGroups struct {
 	reply chan map[string]struct{}
 }
 
+// feelerSnapshot is everything the feeler probe needs to know about the current
+// peer set, read in one pass so that a whole selection is judged against a
+// single consistent view.
+type feelerSnapshot struct {
+	// outboundGroups are the netgroups held by automatic outbound peers. A
+	// probe must not claim one, so it must not pick an address in one.
+	outboundGroups map[string]struct{}
+
+	// hosts is the host of every peer in any tier.
+	hosts map[string]struct{}
+}
+
+type getFeelerSnapshotMsg struct {
+	reply chan feelerSnapshot
+}
+
 type getAddedNodesMsg struct {
 	reply chan []*serverPeer
 }
@@ -2899,6 +2967,11 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		}
 	case getOutboundGroups:
 		msg.reply <- state.outboundGroups()
+	case getFeelerSnapshotMsg:
+		msg.reply <- feelerSnapshot{
+			outboundGroups: state.outboundGroups(),
+			hosts:          state.connectedHosts(),
+		}
 	// Request a list of the persistent (added) peers.
 	case getAddedNodesMsg:
 		// Respond with a slice of the relevant peers.
@@ -3218,6 +3291,13 @@ func (s *server) peerHandler() {
 
 	go s.connManager.Start()
 
+	// Started here, alongside the connection manager, because the two are two
+	// halves of the same job: the connection manager spends the outbound
+	// budget, and the feeler keeps the pool of addresses worth spending it on
+	// healthy. It also has to be here rather than in newServer, because it
+	// depends on s.query being served, which is this loop.
+	s.startFeeler()
+
 out:
 	for {
 		select {
@@ -3389,6 +3469,36 @@ func (s *server) OutboundGroups() map[string]struct{} {
 		return groups
 	case <-s.quit:
 		return nil
+	}
+}
+
+// feelerPeerSnapshot reads the peer set the feeler probe sifts candidates
+// against, in a single query.
+//
+// One query per selection pass, not one per candidate. The peer handler is a
+// single goroutine serving every peer-state question in the service, so a
+// hundred round trips to sift a hundred addresses would put the probe in its
+// way for no benefit, and would let the peer set shift under the sift.
+//
+// Both halves of the exchange give up on shutdown, for the reason spelled out
+// on OutboundGroups: the peer handler drains s.query without answering once
+// s.quit closes, so an unguarded send would be accepted and never replied to.
+// An empty snapshot is the safe answer, because the probe that reads it is
+// about to check s.quit itself.
+func (s *server) feelerPeerSnapshot() feelerSnapshot {
+	replyChan := make(chan feelerSnapshot, 1)
+
+	select {
+	case s.query <- getFeelerSnapshotMsg{reply: replyChan}:
+	case <-s.quit:
+		return feelerSnapshot{}
+	}
+
+	select {
+	case snap := <-replyChan:
+		return snap
+	case <-s.quit:
+		return feelerSnapshot{}
 	}
 }
 
