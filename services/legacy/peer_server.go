@@ -2434,7 +2434,16 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 	}
 
 	if _, ok := list.Get(sp.ID()); ok {
-		if claimsNetgroup(sp.Inbound(), sp.persistent) && sp.VersionKnown() {
+		// Exactly the condition used to claim the group in handleAddPeerMsg, and
+		// nothing more. This release was additionally guarded on VersionKnown,
+		// inherited from when inbound peers shared this tally — their address is
+		// only learned during the version exchange. Outbound peers have theirs
+		// from the moment they are constructed, and they are the only peers that
+		// claim now, so the extra guard could not protect anything and did real
+		// harm: a peer that dropped before its handshake completed had claimed
+		// but never released, barring its whole segment from automatic outbound
+		// for the life of the process.
+		if claimsNetgroup(sp.Inbound(), sp.persistent) {
 			count, _ := state.outboundGroups.Get(addrmgr.GroupKey(sp.NA()))
 			state.outboundGroups.Set(addrmgr.GroupKey(sp.NA()), count-1)
 		}

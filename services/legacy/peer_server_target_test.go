@@ -4,6 +4,10 @@ import (
 	"testing"
 
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/services/legacy/addrmgr"
+	"github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -147,4 +151,57 @@ func TestClaimsNetgroup(t *testing.T) {
 			require.Equal(t, tt.want, claimsNetgroup(tt.inbound, tt.persistent))
 		})
 	}
+}
+
+// TestNetgroupReleasedWhenPeerDropsBeforeHandshake drives the real
+// handleDonePeerMsg for the case the release used to miss.
+//
+// The claim in handleAddPeerMsg is unconditional for an automatic outbound
+// peer, but the release carried an extra VersionKnown guard, inherited from
+// when inbound peers shared this tally — an inbound peer's address is only
+// learned during the version exchange, so releasing before then would have used
+// a nil address. Outbound peers have their address from the moment
+// NewOutboundPeer builds them, and since they are now the only peers that claim
+// a group, the guard protected nothing while doing real harm: a peer that
+// dropped before completing its handshake claimed a group and never released
+// it, barring that whole /16 from automatic outbound selection for the life of
+// the process.
+//
+// That is the same shape as the leaks this PR exists to fix — a resource taken
+// and never given back, quietly shrinking the node's reach — and it is most
+// likely exactly when peers are flakiest, which is when reach matters most.
+//
+// The peer here is deliberately never handshaked, so VersionKnown is false.
+func TestNetgroupReleasedWhenPeerDropsBeforeHandshake(t *testing.T) {
+	tSettings := settings.NewSettings()
+
+	p, err := peer.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peer.Config{}, "203.0.113.7:8333")
+	require.NoError(t, err)
+	require.False(t, p.VersionKnown(), "the peer must be pre-handshake for this test to mean anything")
+
+	srv := &server{logger: ulogger.TestLogger{}}
+	sp := &serverPeer{Peer: p, server: srv}
+
+	state := &peerState{
+		inboundPeers:    txmap.NewSyncedMap[int32, *serverPeer](),
+		outboundPeers:   txmap.NewSyncedMap[int32, *serverPeer](),
+		persistentPeers: txmap.NewSyncedMap[int32, *serverPeer](),
+		outboundGroups:  txmap.NewSyncedMap[string, int](),
+		connectionCount: txmap.NewSyncedMap[string, int](),
+	}
+
+	// The state handleAddPeerMsg would have left behind: the peer tracked, and
+	// its netgroup claimed.
+	key := addrmgr.GroupKey(sp.NA())
+	state.outboundPeers.Set(sp.ID(), sp)
+	state.outboundGroups.Set(key, 1)
+
+	srv.handleDonePeerMsg(state, sp)
+
+	got, _ := state.outboundGroups.Get(key)
+	require.Equal(t, 0, got,
+		"a peer that dropped before its handshake kept its netgroup, barring that segment from automatic outbound for good")
+
+	_, stillTracked := state.outboundPeers.Get(sp.ID())
+	require.False(t, stillTracked, "the peer should have been removed from the outbound list")
 }
