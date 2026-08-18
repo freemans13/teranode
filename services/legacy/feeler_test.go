@@ -378,6 +378,53 @@ func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
 	}
 }
 
+// TestFeelerWaitsForTheOutboundTier pins the gate where it is actually applied,
+// in the probe loop, rather than only in the predicate it calls.
+//
+// svnode probes only once its outbound connections are all up (net.cpp:1865),
+// and the reason is supply: below target the node is short of real peers and
+// the replenishment loop is trying to close that gap, so a probe launched then
+// is competing for exactly the dials the node is missing.
+//
+// The second half matters as much as the first. svnode does not restart its
+// wait when it finds itself below target, so a node that has been held back
+// fires as soon as the tier fills. Asserting only that nothing happens below
+// target would be satisfied by a feeler that never ran at all.
+func TestFeelerWaitsForTheOutboundTier(t *testing.T) {
+	ln, served := startFeelerTestListener(t, "/Bitcoin SV:1.1.0/")
+
+	restoreCfg := swapTestConfig(t, ln.Addr().String())
+	defer restoreCfg()
+
+	srv := newFeelerTestServer(t)
+	serveFeelerSnapshot(srv, feelerSnapshot{})
+
+	cmgr, establish := startTestConnManager(t, 2)
+	srv.connManager = cmgr
+
+	establish(t, 1)
+	require.False(t, srv.feelerAllowed(), "one peer short of the target of two")
+
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+	srv.addrManager.AddAddress(na, testSourceAddr())
+
+	startFeelerLoop(t, srv)
+
+	require.Never(t, func() bool {
+		return srv.feelerAttempted.Load() > 0
+	}, 2*time.Second, 25*time.Millisecond,
+		"a node below its outbound target must not spend dials on probing")
+
+	establish(t, 1)
+	require.True(t, srv.feelerAllowed())
+
+	select {
+	case <-served:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the probe did not start once the outbound tier reached target")
+	}
+}
+
 // TestFeelerRecordsAFailedDial covers the half of the story that is easy to
 // forget: the probe has to teach the book bad news as well as good.
 //
