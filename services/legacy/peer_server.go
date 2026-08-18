@@ -476,6 +476,12 @@ type server struct {
 	banList           *p2p.BanList
 	banChan           chan p2p.BanEvent
 
+	// feelerSlots is how many peer slots are held back for feeler probes. It
+	// is deducted from the peer-admission ceiling and never from the automatic
+	// outbound target, mirroring svnode's nMaxInbound arithmetic
+	// (net.cpp:1261). Zero disables feelers entirely, reservation included.
+	feelerSlots int
+
 	// multistream association tracking
 	associationMgr *peer.AssociationManager
 }
@@ -2452,8 +2458,9 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 	// addnode semaphore is independent of nMaxConnections entirely. Counting
 	// them here would make named peers cost the node inbound capacity, which is
 	// the additive budget undone at the door.
-	if state.CountExcludingPermanent() >= cfg.MaxPeers {
-		reason := fmt.Sprintf("Max peers reached [%d] - disconnecting peer", cfg.MaxPeers)
+	ceiling := peerAdmissionCeiling(cfg.MaxPeers, s.feelerSlots)
+	if state.CountExcludingPermanent() >= ceiling {
+		reason := fmt.Sprintf("Max peers reached [%d] - disconnecting peer", ceiling)
 		sp.DisconnectWithInfo(reason)
 		// TODO: how to handle permanent peers here?
 		// they should be rescheduled.
@@ -2836,12 +2843,18 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		// never gain another named peer however small MaxAddnodePeers was, and
 		// nothing enforced MaxAddnodePeers here at all, so the startup budget
 		// could be walked straight past at runtime.
+		//
+		// The ceiling here is MaxPeers less the feeler reservation, the same
+		// figure the door in handleAddPeerMsg applies. A one-shot addnode
+		// becomes an ordinary automatic peer, so if the two disagreed the node
+		// would admit a peer through one path that the other had just refused.
+		ceiling := peerAdmissionCeiling(cfg.MaxPeers, s.feelerSlots)
 		if !connectNodeAdmitted(msg.permanent, state.persistentPeers.Length(),
-			state.CountExcludingPermanent(), s.settings.Legacy.MaxAddnodePeers, cfg.MaxPeers) {
+			state.CountExcludingPermanent(), s.settings.Legacy.MaxAddnodePeers, ceiling) {
 			if msg.permanent {
 				msg.reply <- errors.NewProcessingError("max addnode peers reached [%d]", s.settings.Legacy.MaxAddnodePeers)
 			} else {
-				msg.reply <- errors.NewProcessingError("max peers reached [%d]", cfg.MaxPeers)
+				msg.reply <- errors.NewProcessingError("max peers reached [%d]", ceiling)
 			}
 
 			return
@@ -4004,6 +4017,13 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	}
 
 	targetOutbound := automaticOutboundTarget(cfg.TargetOutboundPeers, cfg.MaxPeers)
+
+	// Computed here, after the connect-peers block above has had its say on
+	// cfg.MaxPeers, and deliberately alongside the outbound target so the two
+	// halves of the peer budget are set in one place. Note that the target is
+	// NOT reduced: the reservation comes out of the joint inbound/automatic
+	// ceiling, exactly as svnode takes its feeler budget out of nMaxInbound.
+	s.feelerSlots = feelerBudget(tSettings.Legacy.MaxFeelerPeers, len(cfg.ConnectPeers) > 0, cfg.MaxPeers)
 
 	cmgr, err := connmgr.New(logger, &connmgr.Config{
 		Listeners:      listeners,
