@@ -239,6 +239,24 @@ func (ps *peerState) Count() int {
 	return ps.inboundPeers.Length() + ps.outboundPeers.Length() + ps.persistentPeers.Length()
 }
 
+// claimsNetgroup reports whether a peer occupies one of the automatic outbound
+// netgroup slots.
+//
+// The tally exists to stop the node spending several of its limited automatic
+// slots on a single network segment, so only peers that actually hold such a
+// slot may claim a group. Inbound peers do not, and neither do named (addnode)
+// peers: they have their own budget, so letting one claim a group would cost
+// the node an independently chosen address for a slot it never took. svnode
+// excludes both for the same reason.
+//
+// The claim in handleAddPeerMsg and the release in handleDonePeerMsg both go
+// through here. They have to agree exactly — a peer that skipped the claim but
+// still released would drive the tally below zero and make an occupied segment
+// look free — so the rule is stated once rather than spelled out at each site.
+func claimsNetgroup(inbound, persistent bool) bool {
+	return !inbound && !persistent
+}
+
 // CountExcludingPermanent returns the peers that draw on MaxPeers: the inbound
 // and automatic outbound tiers. Permanent (addnode) peers have their own budget
 // and are additive to this figure, so they are deliberately left out.
@@ -2348,15 +2366,17 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 		count, _ := state.connectionCount.Get(host)
 		state.connectionCount.Set(host, count+1)
 	} else {
-		count, _ := state.outboundGroups.Get(addrmgr.GroupKey(sp.NA()))
-		state.outboundGroups.Set(addrmgr.GroupKey(sp.NA()), count+1)
+		if claimsNetgroup(sp.Inbound(), sp.persistent) {
+			count, _ := state.outboundGroups.Get(addrmgr.GroupKey(sp.NA()))
+			state.outboundGroups.Set(addrmgr.GroupKey(sp.NA()), count+1)
+		}
 
 		if sp.persistent {
 			state.persistentPeers.Set(sp.ID(), sp)
 		} else {
 			state.outboundPeers.Set(sp.ID(), sp)
 
-			count, _ = state.connectionCount.Get(host)
+			count, _ := state.connectionCount.Get(host)
 			state.connectionCount.Set(host, count+1)
 		}
 	}
@@ -2414,7 +2434,7 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 	}
 
 	if _, ok := list.Get(sp.ID()); ok {
-		if !sp.Inbound() && sp.VersionKnown() {
+		if claimsNetgroup(sp.Inbound(), sp.persistent) && sp.VersionKnown() {
 			count, _ := state.outboundGroups.Get(addrmgr.GroupKey(sp.NA()))
 			state.outboundGroups.Set(addrmgr.GroupKey(sp.NA()), count-1)
 		}
@@ -2749,12 +2769,9 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 
 		msg.reply <- nil
 	case removeNodeMsg:
-		found := disconnectPeer(state.persistentPeers, msg.cmp, func(sp *serverPeer) {
-			// Keep group counts ok since we remove from
-			// the list now.
-			count, _ := state.outboundGroups.Get(addrmgr.GroupKey(sp.NA()))
-			state.outboundGroups.Set(addrmgr.GroupKey(sp.NA()), count-1)
-		})
+		// No group release here: this removes a permanent peer, and permanent
+		// peers no longer claim a netgroup when they are added.
+		found := disconnectPeer(state.persistentPeers, msg.cmp, func(_ *serverPeer) {})
 
 		if found {
 			msg.reply <- nil

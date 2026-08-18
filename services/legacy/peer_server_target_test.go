@@ -112,3 +112,39 @@ func TestCountExcludingPermanentIsAdditive(t *testing.T) {
 	require.Equal(t, 9, state.Count(),
 		"the node still holds them, and Count still reports the true total")
 }
+
+// TestClaimsNetgroup pins the last place a named peer could charge the
+// automatic tier.
+//
+// The outbound group tally exists to stop the node spending several of its
+// limited automatic slots on one network segment: newAddressFunc skips any
+// candidate whose group is already represented. A named peer does not occupy an
+// automatic slot, so if it claimed a group anyway, configuring one would cost
+// the node an independently chosen address for a slot the named peer never
+// took — the same charge the separate addnode budget exists to remove, levied
+// in a different currency. svnode makes exactly this exclusion, and says why:
+// addnode peers are left out of the setConnected group set because they "do not
+// use our outbound slots".
+//
+// Claim and release must agree. handleAddPeerMsg and handleDonePeerMsg both
+// call this, so a drift between them is impossible by construction rather than
+// by two conditions being kept in step by hand.
+func TestClaimsNetgroup(t *testing.T) {
+	tests := []struct {
+		name       string
+		inbound    bool
+		persistent bool
+		want       bool
+	}{
+		{name: "automatic outbound claims its group", want: true},
+		{name: "named outbound peer claims nothing", persistent: true},
+		{name: "inbound peer claims nothing", inbound: true},
+		{name: "inbound and named claims nothing", inbound: true, persistent: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, claimsNetgroup(tt.inbound, tt.persistent))
+		})
+	}
+}
