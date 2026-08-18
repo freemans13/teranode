@@ -3,6 +3,7 @@ package legacy
 import (
 	"math/rand/v2"
 	"net"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -13,8 +14,11 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/addrmgr"
 	"github.com/bsv-blockchain/teranode/services/legacy/connmgr"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/services/p2p"
 	"github.com/bsv-blockchain/teranode/settings"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -330,6 +334,30 @@ func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
 		},
 	}
 
+	t.Run("a banned address is never a candidate", func(t *testing.T) {
+		srv := newFeelerTestServer(t)
+		serveFeelerSnapshot(srv, feelerSnapshot{})
+
+		srv.banList = bannedTestBanList(t, "8.8.8.8")
+		srv.addrManager.AddAddress(na, testSourceAddr())
+
+		require.Nil(t, srv.feelerCandidate(),
+			"a banned address would be dropped the moment it answered, so it is not worth a probe")
+	})
+
+	t.Run("an already verified address is never a candidate", func(t *testing.T) {
+		srv := newFeelerTestServer(t)
+		serveFeelerSnapshot(srv, feelerSnapshot{})
+
+		srv.addrManager.AddAddress(na, testSourceAddr())
+		srv.addrManager.Good(na)
+
+		require.Equal(t, 1, srv.addrManager.NumAddresses(),
+			"the address is still known, it has just moved into tried")
+		require.Nil(t, srv.feelerCandidate(),
+			"probing an address that is already verified achieves nothing")
+	})
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := newFeelerTestServer(t)
@@ -349,6 +377,46 @@ func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
 		})
 	}
 }
+
+// TestFeelerRecordsAFailedDial covers the half of the story that is easy to
+// forget: the probe has to teach the book bad news as well as good.
+//
+// recordFailedDial is wired into the connection manager's own dial closure, and
+// a probe dials directly, so it bypasses that wiring entirely. Without the
+// explicit call the feeler would only ever mark addresses good, and a host that
+// had stopped answering would keep its full selection weight for ever -- which
+// is the exact bug PR 1601 fixed for the main dial path.
+func TestFeelerRecordsAFailedDial(t *testing.T) {
+	// A dial that always fails, standing in for a host that has gone away.
+	restoreCfg := swapTestConfig(t, "")
+	defer restoreCfg()
+
+	cfg.dial = func(string, string, time.Duration) (net.Conn, error) {
+		return nil, errDeadHost
+	}
+
+	srv := newFeelerTestServer(t)
+	serveFeelerSnapshot(srv, feelerSnapshot{})
+	atLeastTwoAutomaticPeers(t, srv)
+
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+	srv.addrManager.AddAddress(na, testSourceAddr())
+
+	require.True(t, srv.addrManager.UnverifiedAddress().LastAttempt().IsZero(),
+		"the address starts out with no attempt against it")
+
+	startFeelerLoop(t, srv)
+
+	require.Eventually(t, func() bool {
+		ka := srv.addrManager.UnverifiedAddress()
+		return ka != nil && !ka.LastAttempt().IsZero() && ka.Attempts() > 0
+	}, 20*time.Second, 10*time.Millisecond,
+		"a dial that produced nothing must be recorded against the address")
+
+	require.Equal(t, uint64(0), srv.feelerVerified.Load())
+}
+
+var errDeadHost = net.UnknownNetworkError("the host under test is not answering")
 
 // TestFeelerSnapshotQueryReportsPeers drives the peer handler's answer to the
 // probe's one question, which is the half of the exchange the end-to-end tests
@@ -476,16 +544,42 @@ func TestFeelerDoesNotPromoteNonBSVPeer(t *testing.T) {
 		ka := srv.addrManager.UnverifiedAddress()
 		return ka != nil && ka.Attempts() > 0
 	}, 20*time.Second, 10*time.Millisecond,
-		"the address must stay unverified, and the attempt must be recorded against it")
+		"the attempt must be recorded against the address")
 
-	require.Equal(t, uint64(0), srv.feelerVerified.Load(),
-		"a node that is not a BSV node must never be promoted")
+	// Never, not Eventually. The probe records its attempt before it has seen
+	// the user agent, so an Eventually that stopped at the attempt could be
+	// checking the promotion a moment too early and would pass whatever the
+	// code did. This watches for a window many probe intervals long.
+	require.Never(t, func() bool {
+		return srv.feelerVerified.Load() > 0 || srv.addrManager.UnverifiedAddress() == nil
+	}, 3*time.Second, 25*time.Millisecond,
+		"a node that is not a BSV node must never be promoted out of the new table")
 }
 
 // testSourceAddr is the "who told us about this address" address. It only has
 // to be routable and distinct from the address under test.
 func testSourceAddr() *wire.NetAddress {
 	return wire.NewNetAddressIPPort(net.ParseIP("173.194.115.1"), 8333, wire.SFNodeNetwork)
+}
+
+// bannedTestBanList returns a ban list already holding the given address. It is
+// backed by an in-memory database because Add writes through to storage.
+func bannedTestBanList(t *testing.T, ip string) *p2p.BanList {
+	t.Helper()
+
+	storeURL, err := url.Parse("sqlitememory://")
+	require.NoError(t, err)
+
+	store, err := blockchainstore.NewStore(ulogger.TestLogger{}, storeURL, settings.NewSettings())
+	require.NoError(t, err)
+
+	bl := banlist.New(store.GetDB(), util.SqliteMemory, ulogger.TestLogger{})
+	require.NoError(t, bl.Init(t.Context()))
+
+	t.Cleanup(bl.Stop)
+	require.NoError(t, bl.Add(t.Context(), ip, time.Now().Add(time.Hour)))
+
+	return bl
 }
 
 // swapTestConfig replaces the package-level legacy config for the duration of a
