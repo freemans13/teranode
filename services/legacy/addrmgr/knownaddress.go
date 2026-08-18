@@ -17,15 +17,29 @@ type KnownAddress struct {
 	srcAddr     *wire.NetAddress
 	attempts    int
 	lastattempt time.Time
-	lastsuccess time.Time
-	tried       bool
-	refs        int // reference count of new buckets
+	// lastCountAttempt is when a failure was last counted against this
+	// address. Together with AddrManager.lastGood it bounds the damage one
+	// outage can do: see AddrManager.Attempt.
+	lastCountAttempt time.Time
+	lastsuccess      time.Time
+	tried            bool
+	refs             int // reference count of new buckets
 }
 
 // NetAddress returns the underlying wire.NetAddress associated with the
 // known address.
 func (ka *KnownAddress) NetAddress() *wire.NetAddress {
 	return ka.na
+}
+
+// Attempts returns how many failed attempts have been counted against the
+// known address. It is the figure that demotes an address: chance divides
+// selection weight by 1.5 per attempt, and isBad condemns an address with
+// three failures and no success.
+//
+// This function is safe for concurrent access.
+func (ka *KnownAddress) Attempts() int {
+	return ka.attempts
 }
 
 // LastAttempt returns the last time the known address was attempted.

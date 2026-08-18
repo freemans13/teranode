@@ -239,6 +239,59 @@ func (ps *peerState) Count() int {
 	return ps.inboundPeers.Length() + ps.outboundPeers.Length() + ps.persistentPeers.Length()
 }
 
+// countFailedDial reports whether a failed dial should count against the
+// address that failed.
+//
+// It should only count when the node has evidence that its own connectivity is
+// fine, or a spell of broken networking would walk the whole address book,
+// blame every address for the node's own fault, and leave it with nowhere to
+// dial on recovery. svnode makes the same judgement the same way, at
+// net.cpp:1943, requiring at least min(nMaxConnections-1, 2) distinct outbound
+// netgroups before it will hold an address responsible.
+//
+// svnode counts netgroups where this counts automatic outbound peers, and in
+// Teranode those are the same number: newAddressFunc refuses any candidate
+// whose group is already represented, so every automatic outbound peer holds a
+// distinct group by construction.
+func (s *server) countFailedDial() bool {
+	if s.connManager == nil {
+		return false
+	}
+
+	required := cfg.MaxPeers - 1
+	if required > 2 {
+		required = 2
+	}
+
+	return s.connManager.AutomaticOutboundCount() >= required
+}
+
+// recordFailedDial tells the address manager that a dial to this address did
+// not produce a connection.
+func (s *server) recordFailedDial(addr net.Addr) {
+	host, portStr, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return
+	}
+
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return
+	}
+
+	portUint16, err := safeconversion.Uint64ToUint16(port)
+	if err != nil {
+		return
+	}
+
+	s.addrManager.Attempt(wire.NewNetAddressIPPort(ip, portUint16, 0), s.countFailedDial())
+}
+
 // claimsNetgroup reports whether a peer occupies one of the automatic outbound
 // netgroup slots.
 //
@@ -3012,7 +3065,7 @@ func (s *server) outboundPeerConnected(c *connmgr.ConnReq, conn net.Conn) {
 	sp.AssociateConnection(conn)
 
 	go s.peerDoneHandler(sp)
-	s.addrManager.Attempt(sp.NA())
+	s.addrManager.Attempt(sp.NA(), s.countFailedDial())
 }
 
 // peerDoneHandler handles peer disconnects by notifiying the server that it's
@@ -3855,9 +3908,23 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		OnAccept:       s.inboundPeerConnected,
 		RetryDuration:  connectionRetryInterval,
 		TargetOutbound: targetOutbound,
-		Dial:           bsvdDial,
-		OnConnection:   s.outboundPeerConnected,
-		GetNewAddress:  newAddressFunc,
+		Dial: func(addr net.Addr) (net.Conn, error) {
+			conn, err := bsvdDial(addr)
+			if err != nil {
+				// A dial that never produced a connection is the only evidence
+				// the address book ever gets that an address is dead. Without
+				// this it only ever learns that addresses are good, so an
+				// address that stopped answering keeps full selection weight
+				// for ever and the node spends dials on it indefinitely.
+				// svnode records the same thing in the failure arm of
+				// ConnectNode (net.cpp:425).
+				s.recordFailedDial(addr)
+			}
+
+			return conn, err
+		},
+		OnConnection:  s.outboundPeerConnected,
+		GetNewAddress: newAddressFunc,
 		// A minute between replenishment passes meant a peer lost early in an
 		// interval left the node running below target for the rest of it — during
 		// IBD that is a minute of lost download bandwidth per disconnect. Zero
