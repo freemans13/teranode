@@ -307,8 +307,7 @@ func TestPoissonNextIsExponential(t *testing.T) {
 // outbound list only, so inbound and named peers are invisible to it. Both
 // filters are checked here separately, against the same address.
 func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
-	restoreCfg := swapTestConfig(t, "")
-	defer restoreCfg()
+	swapTestConfig(t, "")
 
 	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
 
@@ -440,8 +439,7 @@ func waitGroupSettles(wg *sync.WaitGroup, timeout time.Duration) bool {
 func TestFeelerWaitsForTheOutboundTier(t *testing.T) {
 	ln, served := startFeelerTestListener(t, "/Bitcoin SV:1.1.0/")
 
-	restoreCfg := swapTestConfig(t, ln.Addr().String())
-	defer restoreCfg()
+	swapTestConfig(t, ln.Addr().String())
 
 	srv := newFeelerTestServer(t)
 	serveFeelerSnapshot(srv, feelerSnapshot{})
@@ -482,8 +480,7 @@ func TestFeelerWaitsForTheOutboundTier(t *testing.T) {
 // is the exact bug PR 1601 fixed for the main dial path.
 func TestFeelerRecordsAFailedDial(t *testing.T) {
 	// A dial that always fails, standing in for a host that has gone away.
-	restoreCfg := swapTestConfig(t, "")
-	defer restoreCfg()
+	swapTestConfig(t, "")
 
 	cfg.dial = func(string, string, time.Duration) (net.Conn, error) {
 		return nil, errDeadHost
@@ -499,14 +496,18 @@ func TestFeelerRecordsAFailedDial(t *testing.T) {
 	require.True(t, srv.addrManager.UnverifiedAddress().LastAttempt().IsZero(),
 		"the address starts out with no attempt against it")
 
-	startFeelerLoop(t, srv)
+	// One probe, run inline. The KnownAddress accessors are documented as
+	// unsafe to read while the address manager is being written to, so the
+	// assertions below have to happen with no probe in flight.
+	runOneProbe(srv)
 
-	require.Eventually(t, func() bool {
-		ka := srv.addrManager.UnverifiedAddress()
-		return ka != nil && !ka.LastAttempt().IsZero() && ka.Attempts() > 0
-	}, 20*time.Second, 10*time.Millisecond,
+	ka := srv.addrManager.UnverifiedAddress()
+	require.NotNil(t, ka, "a failed dial must not move the address anywhere")
+	require.False(t, ka.LastAttempt().IsZero(),
 		"a dial that produced nothing must be recorded against the address")
-
+	require.Positive(t, ka.Attempts(),
+		"with the node connected elsewhere, the failure counts against the address")
+	require.Equal(t, uint64(1), srv.feelerAttempted.Load())
 	require.Equal(t, uint64(0), srv.feelerVerified.Load())
 }
 
@@ -566,8 +567,7 @@ func TestFeelerSnapshotQueryReportsPeers(t *testing.T) {
 func TestFeelerPromotesAnAddressEndToEnd(t *testing.T) {
 	ln, served := startFeelerTestListener(t, "/Bitcoin SV:1.1.0/")
 
-	restoreCfg := swapTestConfig(t, ln.Addr().String())
-	defer restoreCfg()
+	swapTestConfig(t, ln.Addr().String())
 
 	srv := newFeelerTestServer(t)
 	serveFeelerSnapshot(srv, feelerSnapshot{})
@@ -606,8 +606,7 @@ func TestFeelerPromotesAnAddressEndToEnd(t *testing.T) {
 func TestFeelerDoesNotPromoteNonBSVPeer(t *testing.T) {
 	ln, served := startFeelerTestListener(t, "/Satoshi:0.21.0/")
 
-	restoreCfg := swapTestConfig(t, ln.Addr().String())
-	defer restoreCfg()
+	swapTestConfig(t, ln.Addr().String())
 
 	srv := newFeelerTestServer(t)
 	serveFeelerSnapshot(srv, feelerSnapshot{})
@@ -621,33 +620,26 @@ func TestFeelerDoesNotPromoteNonBSVPeer(t *testing.T) {
 	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
 	srv.addrManager.AddAddress(na, testSourceAddr())
 
-	startFeelerLoop(t, srv)
+	// One probe, run inline, so the assertions below see a settled state rather
+	// than racing the loop. runOneProbe returns when the probe has finished
+	// deciding, which is what makes the promotion check meaningful: polling for
+	// the attempt instead would look at the address before the user agent had
+	// even been read, and would pass whatever the code did.
+	runOneProbe(srv)
 
 	select {
 	case <-served:
-	case <-time.After(20 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("the probe never reached the listener")
 	}
 
-	// Wait for the probe to finish deciding, which the counter records.
-	require.Eventually(t, func() bool {
-		return srv.feelerAttempted.Load() > 0
-	}, 20*time.Second, 10*time.Millisecond)
+	require.Equal(t, uint64(1), srv.feelerAttempted.Load())
+	require.Equal(t, uint64(0), srv.feelerVerified.Load(),
+		"a node that is not a BSV node must never be promoted")
 
-	require.Eventually(t, func() bool {
-		ka := srv.addrManager.UnverifiedAddress()
-		return ka != nil && ka.Attempts() > 0
-	}, 20*time.Second, 10*time.Millisecond,
-		"the attempt must be recorded against the address")
-
-	// Never, not Eventually. The probe records its attempt before it has seen
-	// the user agent, so an Eventually that stopped at the attempt could be
-	// checking the promotion a moment too early and would pass whatever the
-	// code did. This watches for a window many probe intervals long.
-	require.Never(t, func() bool {
-		return srv.feelerVerified.Load() > 0 || srv.addrManager.UnverifiedAddress() == nil
-	}, 3*time.Second, 25*time.Millisecond,
-		"a node that is not a BSV node must never be promoted out of the new table")
+	ka := srv.addrManager.UnverifiedAddress()
+	require.NotNil(t, ka, "the address must stay in the new table")
+	require.Positive(t, ka.Attempts(), "the attempt is still recorded against it")
 }
 
 // testSourceAddr is the "who told us about this address" address. It only has
@@ -683,7 +675,7 @@ func bannedTestBanList(t *testing.T, ip string) *p2p.BanList {
 //
 // cfg.dial is a real production field, set by loadConfig, so this exercises the
 // production dial path rather than a test-only injection point.
-func swapTestConfig(t *testing.T, redirectTo string) func() {
+func swapTestConfig(t *testing.T, redirectTo string) {
 	t.Helper()
 
 	orig := cfg
@@ -704,7 +696,11 @@ func swapTestConfig(t *testing.T, redirectTo string) func() {
 
 	cfg = c
 
-	return func() { cfg = orig }
+	// Registered as a cleanup rather than returned, so it runs LAST. Cleanups
+	// run in reverse order of registration and after every deferred call, and
+	// the test server is built after this, so its shutdown -- which waits for
+	// probes still reading cfg -- is guaranteed to happen first.
+	t.Cleanup(func() { cfg = orig })
 }
 
 // newFeelerTestServer builds the smallest server the probe path needs.
@@ -728,9 +724,31 @@ func newFeelerTestServer(t *testing.T) *server {
 	t.Cleanup(func() {
 		close(srv.quit)
 		srv.wg.Wait()
+		drainFeelerProbes(t, srv)
 	})
 
 	return srv
+}
+
+// drainFeelerProbes waits until no probe is in flight, by taking every slot
+// token. A probe holds its token for its whole life, so holding them all means
+// nothing is still running.
+//
+// The probe loop must already have stopped, or it will keep taking tokens back.
+// This matters because probe goroutines are deliberately not tracked by the
+// server's wait group, so waiting on that alone can return while a probe is
+// still reading package state the test is about to put back.
+func drainFeelerProbes(t *testing.T, srv *server) {
+	t.Helper()
+
+	for i := 0; i < cap(srv.feelerTokens); i++ {
+		select {
+		case <-srv.feelerTokens:
+		case <-time.After(45 * time.Second):
+			t.Error("a feeler probe never finished")
+			return
+		}
+	}
 }
 
 // serveFeelerSnapshot answers the probe's peer-set query with a fixed snapshot,
@@ -778,13 +796,26 @@ func atLeastTwoAutomaticPeers(t *testing.T, srv *server) {
 	require.True(t, srv.countFailedDial())
 }
 
-// startFeelerLoop runs the real feeler goroutine against the test server.
+// runOneProbe runs exactly one probe on the calling goroutine and returns when
+// it has finished.
+//
+// Used where a test needs to read the address book afterwards: the
+// KnownAddress accessors are documented as unsafe to read while the address
+// manager is being written to, so those assertions cannot race a probe. The
+// pacing loop around this is covered separately.
+func runOneProbe(srv *server) {
+	srv.feelerTokens = make(chan struct{}, 1)
+
+	srv.feelerProbe()
+}
+
+// startFeelerLoop starts the feeler exactly as peerHandler does.
 func startFeelerLoop(t *testing.T, srv *server) {
 	t.Helper()
 
-	srv.wg.Add(1)
+	srv.startFeeler()
 
-	go srv.feelerHandler()
+	require.NotNil(t, srv.feelerTokens, "the feeler must have started")
 }
 
 // startFeelerTestListener accepts one connection and answers it the way a

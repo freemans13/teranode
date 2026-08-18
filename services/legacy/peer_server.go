@@ -517,6 +517,11 @@ type server struct {
 	feelerAttempted atomic.Uint64
 	feelerVerified  atomic.Uint64
 
+	// feelerTokens hands out the reserved probe slots: one token per slot,
+	// taken for the whole life of a probe and returned when it ends. Created by
+	// startFeeler, nil when feelers are disabled.
+	feelerTokens chan struct{}
+
 	// feelerSlots is how many peer slots are held back for feeler probes. It
 	// is deducted from the peer-admission ceiling and never from the automatic
 	// outbound target, mirroring svnode's nMaxInbound arithmetic

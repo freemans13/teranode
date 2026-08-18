@@ -133,6 +133,16 @@ func (s *server) startFeeler() {
 		return
 	}
 
+	// One token per reserved slot. A probe holds a token for its whole life, so
+	// the number in flight can never exceed the number of peer slots held back
+	// for them, and at the default budget of one this is svnode's single feeler
+	// exactly. Created here rather than inside the loop so that the loop and the
+	// probes it starts share one channel.
+	s.feelerTokens = make(chan struct{}, s.feelerSlots)
+	for i := 0; i < s.feelerSlots; i++ {
+		s.feelerTokens <- struct{}{}
+	}
+
 	s.wg.Add(1)
 
 	go s.feelerHandler()
@@ -173,14 +183,6 @@ func (s *server) feelerHandler() {
 		s.logger.Warnf("[Feeler] legacy_feelerInterval must be positive, using %s (set legacy_maxFeelerPeers to 0 to disable feelers)", interval)
 	}
 
-	// One token per reserved slot, so the number of probes in flight can never
-	// exceed the number of peer slots held back for them. At the default budget
-	// of one this is svnode's single feeler exactly.
-	tokens := make(chan struct{}, s.feelerSlots)
-	for i := 0; i < s.feelerSlots; i++ {
-		tokens <- struct{}{}
-	}
-
 	s.logger.Infof("[Feeler] Starting with %d slot(s), mean interval %s", s.feelerSlots, interval)
 
 	deadline := time.Now().Add(poissonNext(interval))
@@ -202,8 +204,8 @@ func (s *server) feelerHandler() {
 		deadline = time.Now().Add(poissonNext(interval))
 
 		select {
-		case tok := <-tokens:
-			go s.feelerProbe(tokens, tok)
+		case <-s.feelerTokens:
+			go s.feelerProbe()
 		default:
 			// Every slot is already probing. Skip this one; the deadline has
 			// already moved on, so the pace is unchanged.
@@ -227,8 +229,8 @@ func (s *server) feelerHandler() {
 // drives a bare peer and calls the address book itself. That is three lines
 // duplicated from OnVersion, and the bare-peer structure is the one idea worth
 // keeping from the earlier sketch on stu/legacy-svnode-align.
-func (s *server) feelerProbe(tokens chan struct{}, tok struct{}) {
-	defer func() { tokens <- tok }()
+func (s *server) feelerProbe() {
+	defer func() { s.feelerTokens <- struct{}{} }()
 
 	na := s.feelerCandidate()
 	if na == nil {
