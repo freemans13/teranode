@@ -2792,9 +2792,21 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		// })
 	case connectNodeMsg:
 		// TODO: duplicate oneshots?
-		// Limit max number of total peers.
-		if state.Count() >= cfg.MaxPeers {
-			msg.reply <- errors.NewProcessingError("max peers reached")
+		// Each tier is checked against its own budget, the same way the startup
+		// list and the peer-admission door are. Before this, the runtime path
+		// compared every peer against MaxPeers, which disagreed with both: a
+		// node holding its full automatic quota plus a few named peers could
+		// never gain another named peer however small MaxAddnodePeers was, and
+		// nothing enforced MaxAddnodePeers here at all, so the startup budget
+		// could be walked straight past at runtime.
+		if !connectNodeAdmitted(msg.permanent, state.persistentPeers.Length(),
+			state.CountExcludingPermanent(), cfg.MaxAddnodePeers, cfg.MaxPeers) {
+			if msg.permanent {
+				msg.reply <- errors.NewProcessingError("max addnode peers reached [%d]", cfg.MaxAddnodePeers)
+			} else {
+				msg.reply <- errors.NewProcessingError("max peers reached [%d]", cfg.MaxPeers)
+			}
+
 			return
 		}
 
@@ -2960,6 +2972,23 @@ func permanentPeerList(connectPeers, addPeers []string, budget int) (dial []stri
 	}
 
 	return addnodePeers(addPeers, budget)
+}
+
+// connectNodeAdmitted reports whether a runtime addnode request has room in the
+// tier it will join.
+//
+// A permanent request joins the named tier and is bounded by MaxAddnodePeers; a
+// one-shot becomes an ordinary automatic outbound peer and is bounded by
+// MaxPeers alongside the inbound peers. Checking each against its own budget is
+// what keeps this path agreeing with the startup list and with the admission
+// check in handleAddPeerMsg — the budgets are only additive if every path that
+// spends them says so.
+func connectNodeAdmitted(permanent bool, persistentCount, automaticCount, maxAddnode, maxPeers int) bool {
+	if permanent {
+		return persistentCount < maxAddnode
+	}
+
+	return automaticCount < maxPeers
 }
 
 // newPeerConfig returns the configuration for the given serverPeer.

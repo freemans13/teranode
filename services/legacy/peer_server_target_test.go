@@ -265,3 +265,53 @@ func TestPermanentPeerListSparesConnectOnly(t *testing.T) {
 		require.Zero(t, dropped)
 	})
 }
+
+// TestConnectNodeAdmitted pins that the runtime addnode path spends the same
+// two budgets as the startup list and the admission door.
+//
+// The budgets are only additive if every path that spends them agrees. This one
+// used to compare every request against MaxPeers, which broke it in both
+// directions: a node holding its automatic quota plus a few named peers could
+// never gain another named peer however generous MaxAddnodePeers was, and
+// nothing enforced MaxAddnodePeers here at all, so an operator could walk
+// straight past the startup budget by adding peers at runtime.
+func TestConnectNodeAdmitted(t *testing.T) {
+	const (
+		maxAddnode = 8
+		maxPeers   = 125
+	)
+
+	tests := []struct {
+		name            string
+		permanent       bool
+		persistentCount int
+		automaticCount  int
+		want            bool
+	}{
+		{name: "named peer with room in its own tier", permanent: true, persistentCount: 3, want: true},
+		{name: "named peer at its budget", permanent: true, persistentCount: maxAddnode},
+		{name: "named peer past its budget", permanent: true, persistentCount: maxAddnode + 4},
+		{
+			name:            "named peer admitted even when the automatic tier is full",
+			permanent:       true,
+			persistentCount: 1,
+			automaticCount:  maxPeers,
+			want:            true,
+		},
+		{name: "one-shot with room", automaticCount: 10, want: true},
+		{name: "one-shot at the peer cap", automaticCount: maxPeers},
+		{
+			name:            "one-shot admitted even when the named tier is full",
+			persistentCount: maxAddnode,
+			automaticCount:  10,
+			want:            true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := connectNodeAdmitted(tt.permanent, tt.persistentCount, tt.automaticCount, maxAddnode, maxPeers)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
