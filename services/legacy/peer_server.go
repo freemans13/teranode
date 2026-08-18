@@ -230,7 +230,6 @@ type peerState struct {
 	outboundPeers   *txmap.SyncedMap[int32, *serverPeer]
 	persistentPeers *txmap.SyncedMap[int32, *serverPeer]
 	banned          *txmap.SyncedMap[string, time.Time]
-	connectionCount *txmap.SyncedMap[string, int]
 }
 
 // Count returns the count of all known peers.
@@ -332,12 +331,44 @@ func (ps *peerState) CountExcludingPermanent() int {
 	return ps.inboundPeers.Length() + ps.outboundPeers.Length()
 }
 
-// CountIP returns the count of all peers matching the IP.
+// CountIP returns how many peers the node holds from the given host.
+//
+// Derived, not maintained, for the same reason the netgroup set is. The tally
+// this replaces was incremented when a peer was added and decremented when it
+// left, and the two did not always pair up: handleAddPeerMsg's
+// already-connected dedup deletes the displaced peer from its list directly, so
+// when that peer's disconnect arrived, handleDonePeerMsg no longer found it and
+// took the fall-through branch that decrements nothing. The count ratcheted up
+// and never came back down, and after MaxPeersPerIP such events the node
+// refused every peer from that host for the life of the process.
+//
+// Counting the peers themselves cannot drift: there is nothing to decrement.
+// svnode does the same, deriving nConnectionsFromAddr by walking vNodes at
+// accept time (net.cpp:1273) rather than carrying a counter.
+//
+// Persistent peers are excluded, matching what the old tally counted: they are
+// named by the operator, so holding several from one host is a deliberate
+// choice rather than a stranger crowding the node out.
 func (ps *peerState) CountIP(host string) int {
-	count, found := ps.connectionCount.Get(host)
-	if !found {
-		return 0
+	count := 0
+
+	tally := func(sp *serverPeer) {
+		if peerHost, _, err := net.SplitHostPort(sp.Addr()); err == nil && peerHost == host {
+			count++
+		}
 	}
+
+	ps.inboundPeers.Iterate(func(_ int32, sp *serverPeer) bool {
+		tally(sp)
+
+		return true
+	})
+
+	ps.outboundPeers.Iterate(func(_ int32, sp *serverPeer) bool {
+		tally(sp)
+
+		return true
+	})
 
 	return count
 }
@@ -2430,17 +2461,11 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 
 	if sp.Inbound() {
 		state.inboundPeers.Set(sp.ID(), sp)
-
-		count, _ := state.connectionCount.Get(host)
-		state.connectionCount.Set(host, count+1)
 	} else {
 		if sp.persistent {
 			state.persistentPeers.Set(sp.ID(), sp)
 		} else {
 			state.outboundPeers.Set(sp.ID(), sp)
-
-			count, _ := state.connectionCount.Get(host)
-			state.connectionCount.Set(host, count+1)
 		}
 	}
 
@@ -2502,12 +2527,6 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 		}
 
 		list.Delete(sp.ID())
-
-		host, _, err := net.SplitHostPort(sp.Addr())
-		if err == nil && !sp.persistent {
-			count, _ := state.connectionCount.Get(host)
-			state.connectionCount.Set(host, count-1)
-		}
 
 		sp.server.logger.Debugf("Removed peer %s", sp)
 
@@ -3086,6 +3105,13 @@ func (s *server) outboundPeerConnected(c *connmgr.ConnReq, conn net.Conn) {
 	if err != nil {
 		sp.server.logger.Debugf("Cannot create outbound peer %s: %v", c.GetAddr(), err)
 		s.connManager.Disconnect(c.ID())
+
+		// Without this the nil peer was assigned to sp.Peer and then used:
+		// AssociateConnection is a method on the embedded *peer.Peer, so the
+		// very next steps dereferenced it and brought the node down. Disconnect
+		// closes the connection for us, since the connection manager recorded
+		// it before invoking this callback.
+		return
 	}
 
 	sp.Peer = p
@@ -3144,7 +3170,6 @@ func (s *server) peerHandler() {
 		outboundPeers:   txmap.NewSyncedMap[int32, *serverPeer](),
 		persistentPeers: txmap.NewSyncedMap[int32, *serverPeer](),
 		banned:          txmap.NewSyncedMap[string, time.Time](),
-		connectionCount: txmap.NewSyncedMap[string, int](),
 	}
 
 	if !cfg.DisableDNSSeed {

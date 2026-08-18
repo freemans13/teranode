@@ -199,7 +199,6 @@ func TestNetgroupFreedWhenPeerDropsBeforeHandshake(t *testing.T) {
 		inboundPeers:    txmap.NewSyncedMap[int32, *serverPeer](),
 		outboundPeers:   txmap.NewSyncedMap[int32, *serverPeer](),
 		persistentPeers: txmap.NewSyncedMap[int32, *serverPeer](),
-		connectionCount: txmap.NewSyncedMap[string, int](),
 	}
 
 	state.outboundPeers.Set(sp.ID(), sp)
@@ -314,4 +313,70 @@ func TestConnectNodeAdmitted(t *testing.T) {
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestCountIPSurvivesTheDedupPath covers the ratchet that the maintained per-IP
+// tally used to suffer.
+//
+// handleAddPeerMsg's already-connected dedup disconnects the displaced peer and
+// removes it from its list on the spot. When that peer's disconnect later
+// arrived, handleDonePeerMsg no longer found it in the list and took the
+// fall-through branch, which decrements nothing — so the old counter went up
+// and never came back down. After MaxPeersPerIP (default 5) such events the
+// node refused every peer from that host for the life of the process, which is
+// the same permanent, invisible shrinking of reach as the leaks elsewhere in
+// this PR.
+//
+// Counting the peers themselves cannot ratchet, because there is nothing to
+// decrement. This drives the real handleDonePeerMsg down that fall-through
+// branch — the peer is deliberately absent from every list, exactly as the
+// dedup leaves it — and asserts the count reflects reality either way.
+func TestCountIPSurvivesTheDedupPath(t *testing.T) {
+	tSettings := settings.NewSettings()
+
+	newPeer := func(t *testing.T, addr string) *serverPeer {
+		t.Helper()
+
+		p, err := peer.NewOutboundPeer(ulogger.TestLogger{}, tSettings, &peer.Config{}, addr)
+		require.NoError(t, err)
+
+		return &serverPeer{Peer: p, server: &server{logger: ulogger.TestLogger{}}}
+	}
+
+	const host = "8.8.8.8"
+
+	state := &peerState{
+		inboundPeers:    txmap.NewSyncedMap[int32, *serverPeer](),
+		outboundPeers:   txmap.NewSyncedMap[int32, *serverPeer](),
+		persistentPeers: txmap.NewSyncedMap[int32, *serverPeer](),
+	}
+
+	require.Equal(t, 0, state.CountIP(host), "no peers, no connections from the host")
+
+	displaced := newPeer(t, host+":8333")
+	state.outboundPeers.Set(displaced.ID(), displaced)
+
+	require.Equal(t, 1, state.CountIP(host))
+
+	// What the dedup does: disconnect the old peer and drop it from the list
+	// immediately, rather than letting handleDonePeerMsg unwind it.
+	state.outboundPeers.Delete(displaced.ID())
+
+	require.Equal(t, 0, state.CountIP(host),
+		"a peer removed by the dedup must stop counting the moment it leaves the list")
+
+	// Its disconnect still arrives afterwards, and finds it in no list at all.
+	// Under the old maintained tally this path decremented nothing, so the
+	// count stayed high for ever.
+	srv := &server{logger: ulogger.TestLogger{}}
+	srv.handleDonePeerMsg(state, displaced)
+
+	require.Equal(t, 0, state.CountIP(host),
+		"the late disconnect of an already-removed peer must not leave the host counted")
+
+	// And the host is usable again, which is the behaviour that was lost.
+	replacement := newPeer(t, host+":8334")
+	state.outboundPeers.Set(replacement.ID(), replacement)
+
+	require.Equal(t, 1, state.CountIP(host), "the host must still be connectable after a dedup")
 }
