@@ -1093,6 +1093,15 @@ func (sp *serverPeer) OnBlock(_ *peer.Peer, msg *wire.MsgBlock, buf []byte, payl
 		// synchronous backpressure) and also spares fabricated blocks the
 		// SerializeSize walk below. Blocks we actually requested take the fast path.
 		if !sm.BlockRequested(sp.Peer, blockHash) {
+			// One exception: when sync stalls on a single block we ask a second
+			// peer for the same block, and cancel the request with the losers
+			// once a copy arrives. A late copy from one of exactly those peers is
+			// an answer to our own question, so drop it and leave the peer alone.
+			if sm.BlockRacedTo(sp.Peer, blockHash) {
+				sp.server.logger.Debugf("dropping late copy of block %s from %s, another peer already delivered it", blockHash, sp)
+				return
+			}
+
 			// Unrequested block: evict the whole association (primary drives the
 			// sync-peer rotation, plus the stream sub-peer's own connection), mirroring
 			// handleBlockMsg's downstream eviction. See disconnectMisbehaving.

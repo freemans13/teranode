@@ -570,6 +570,30 @@ type SyncManager struct {
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
+	// The download frontier: the oldest block we have asked for and not yet
+	// received. Because blocks are committed strictly in order, that one block
+	// gates everything behind it, so it is the only block worth asking a second
+	// peer for (see frontier_race.go). It is published here rather than read
+	// straight off headerList because headerList and startHeader are already
+	// mutated from two goroutines without synchronisation, and the five-second
+	// race timer runs on a third; publishing under a mutex from the existing
+	// touch points keeps the timer off that unsynchronised state entirely.
+	// frontierMu is a leaf lock and is never held across a send to a peer.
+	frontierMu     sync.Mutex
+	frontierHash   chainhash.Hash
+	frontierHeight int32
+	frontierSince  time.Time
+	frontierRacers map[*peerpkg.Peer]struct{}
+
+	// racedBlocks remembers, for each block we asked more than one peer for,
+	// exactly which peers were left holding a request we then cancelled once a
+	// copy arrived. A late copy from one of those peers is our own doing, so it
+	// is dropped quietly instead of getting the peer evicted for sending an
+	// unrequested block. Scoped to those peers and those hashes, so the eviction
+	// defence is unchanged for every peer we did not ask. nil-guarded because
+	// tests build SyncManager as a struct literal.
+	racedBlocks *expiringmap.ExpiringMap[chainhash.Hash, map[*peerpkg.Peer]struct{}]
+
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64
@@ -629,6 +653,7 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
 	sm.startHeader = nil
+	sm.clearFrontier()
 
 	// When there is a next checkpoint, add an entry for the latest known
 	// block into the header pool.  This allows the next downloaded header
@@ -1603,6 +1628,16 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		// mode, in this case, so the chain code is actually fed the
 		// duplicate blocks.
 		if sm.chainParams != &chaincfg.RegressionNetParams {
+			// Unless this is a peer we deliberately asked for a second copy of a
+			// block that has since arrived. Then it is answering our own
+			// question, just too late to be useful, and disconnecting it would
+			// make the stall recovery cost more than the stall.
+			if sm.BlockRacedTo(peer, &bmsg.blockHash) {
+				sm.logger.Debugf("[handleBlockMsg][%s] discarding late copy from %s, another peer already delivered it", bmsg.blockHash, peer)
+
+				return errors.NewServiceError("[handleBlockMsg] late copy of block %v from %s", bmsg.blockHash, peer)
+			}
+
 			reason := fmt.Sprintf("Got unrequested block %v", bmsg.blockHash)
 			peer.DisconnectWithWarning(reason)
 
@@ -1631,6 +1666,20 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 					isCheckpointBlock = true
 				} else {
 					sm.headerList.Remove(firstNodeEl)
+				}
+
+				// The block everything else was queued behind has arrived. Tidy
+				// up after any race for it, then move the frontier on. At a
+				// checkpoint the header node stays in the list to anchor the
+				// next round of headers, but the block itself is no longer
+				// outstanding, so there is nothing to race until the next batch
+				// of getdata requests goes out.
+				sm.noteRaceWinner(bmsg.blockHash)
+
+				if isCheckpointBlock {
+					sm.clearFrontier()
+				} else {
+					sm.publishFrontier(time.Now())
 				}
 			}
 		}
@@ -1932,6 +1981,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// from the block after this one up to the end of the chain (zero hash).
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
+	sm.clearFrontier()
 	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
 
 	locator := blockchain.BlockLocator([]*chainhash.Hash{&bmsg.blockHash})
@@ -2027,6 +2077,10 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	if len(getDataMessage.InvList) > 0 {
 		sp.QueueMessage(getDataMessage, nil)
 	}
+
+	// Record which block everything behind it is now waiting on, so the race
+	// timer can tell how long it has been outstanding.
+	sm.publishFrontier(time.Now())
 }
 
 // handleHeadersMsg handles block header messages from all peers.  Headers are
@@ -2441,6 +2495,13 @@ func (sm *SyncManager) blockHandler() {
 	ticker := time.NewTicker(syncPeerTickerInterval)
 	defer ticker.Stop()
 
+	// Checks whether the one block that is holding up in-order commit has been
+	// outstanding long enough to be worth asking a second peer for. Runs here
+	// because this goroutine is the one place that can safely look at the
+	// frontier without touching the header list.
+	frontierTicker := time.NewTicker(frontierCheckInterval)
+	defer frontierTicker.Stop()
+
 	// This buffer holds one *blockQueueMsg (a *wire.MsgBlock pointer) per slot.
 	// With prefetch disabled a small fixed depth suffices: OnBlock keeps at most
 	// one block per peer in flight, so the queue barely fills.
@@ -2525,6 +2586,8 @@ out:
 		select {
 		case <-ticker.C:
 			sm.handleCheckSyncPeer()
+		case <-frontierTicker.C:
+			sm.raceFrontierBlock(time.Now())
 		case m := <-sm.msgChan:
 			// whenever legacy receives a message, check if we are current
 			// this call should have the current state cached, so it should be fast
@@ -3073,6 +3136,10 @@ func (sm *SyncManager) Stop() error {
 		sm.recentlyFailedBlocks.Stop()
 	}
 
+	if sm.racedBlocks != nil {
+		sm.racedBlocks.Stop()
+	}
+
 	// DC15 / review C1: quiesce Put then drain the tx-announce batcher before
 	// tearing down transports.
 	sm.closeTxAnnounceBatcher()
@@ -3168,6 +3235,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),   // give peers 10 seconds to respond
 		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](60 * time.Second),   // give peers 60 seconds to respond
 		peerStates:      txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
+		// Peers we asked for a second copy of a stalled block, so their late
+		// copy is dropped rather than costing them their connection.
+		racedBlocks: expiringmap.New[chainhash.Hash, map[*peerpkg.Peer]struct{}](racedBlockGraceTTL).WithMaxSize(racedBlockGraceMaxTracked),
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		headerList:       list.New(),
