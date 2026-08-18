@@ -2872,14 +2872,27 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 			OnCreateStream: sp.OnCreateStream,
 			OnStreamAck:    sp.OnStreamAck,
 		},
-		AddrMe:             addrMe,
-		NewestBlock:        sp.newestBlock,
-		HostToNetAddress:   sp.server.addrManager.HostToNetAddress,
-		Proxy:              cfg.Proxy,
-		UserAgentName:      userAgentName,
-		UserAgentVersion:   version.String(),
-		UserAgentComments:  cfg.UserAgentComments,
-		ChainParams:        sp.server.settings.ChainCfgParams,
+		AddrMe:            addrMe,
+		NewestBlock:       sp.newestBlock,
+		HostToNetAddress:  sp.server.addrManager.HostToNetAddress,
+		Proxy:             cfg.Proxy,
+		UserAgentName:     userAgentName,
+		UserAgentVersion:  version.String(),
+		UserAgentComments: cfg.UserAgentComments,
+		ChainParams:       sp.server.settings.ChainCfgParams,
+		CatchingUp: func() bool {
+			if sp.server == nil || sp.server.syncManager == nil {
+				return false
+			}
+			return !sp.server.syncManager.IsCurrent()
+		},
+		PeersWithBlockDownloads: func() int {
+			if sp.server == nil || sp.server.syncManager == nil {
+				return 0
+			}
+			return sp.server.syncManager.PeersWithBlockDownloads()
+		},
+
 		Services:           sp.server.services,
 		DisableRelayTx:     cfg.BlocksOnly,
 		ProtocolVersion:    peer.MaxProtocolVersion,

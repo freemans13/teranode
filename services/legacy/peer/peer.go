@@ -289,6 +289,20 @@ type Config struct {
 	// '/', ':', '(', ')'.
 	UserAgentComments []string
 
+	// CatchingUp reports whether the node is still catching up with the chain.
+	// A block download is given a far longer ceiling while this is true, because
+	// historical blocks are large and our own validation backpressure delays the
+	// read loop. Nil means "assume we are at the tip", which is the conservative
+	// choice: the shorter ceiling.
+	CatchingUp func() bool
+
+	// PeersWithBlockDownloads reports how many peers currently have a block
+	// request outstanding, this one included. Downloading from several peers at
+	// once makes each transfer legitimately slower because our own downstream
+	// link is shared, so the ceiling widens with the count. Nil means "just this
+	// peer", which adds no compensation.
+	PeersWithBlockDownloads func() int
+
 	// ChainParams identifies which chain parameters the peer is associated
 	// with.  It is highly recommended to specify this field, however it can
 	// be omitted in which case the test network will be used.
@@ -1538,6 +1552,51 @@ func blockResponsePending(pending map[string]time.Time) bool {
 	return false
 }
 
+// blockDownloadBudget is the wall-clock ceiling on a single block transfer.
+//
+// It is a percentage of the chain's target block interval rather than a fixed
+// duration, so one setting is correct on any chain, and it widens on two counts:
+// while we are catching up (historical blocks are large and our own validation
+// backpressure delays the read loop), and once per other peer we are downloading
+// from (our downstream link is shared between them, so each transfer is honestly
+// slower). This mirrors svnode, which computes
+//
+//	nPowTargetSpacing * (timeoutBase + timeoutPerPeer * nOtherPeers)
+//
+// with base 100%/600% for tip/catch-up and 50% per other peer.
+//
+// Only peers with a genuine outstanding request are counted, so a peer cannot
+// inflate our patience by advertising blocks it does not have.
+func (p *Peer) blockDownloadBudget() time.Duration {
+	interval := p.cfg.ChainParams.TargetTimePerBlock
+	if interval <= 0 {
+		return MaxBlockDownloadTime
+	}
+
+	base := p.settings.Legacy.BlockDownloadTimeoutBasePercent
+	if p.cfg.CatchingUp != nil && p.cfg.CatchingUp() {
+		base = p.settings.Legacy.BlockDownloadTimeoutBaseIBDPercent
+	}
+
+	// Count only OTHER peers: this peer's own download is what the ceiling is
+	// being computed for, and svnode excludes it for the same reason.
+	others := 0
+	if p.cfg.PeersWithBlockDownloads != nil {
+		if n := p.cfg.PeersWithBlockDownloads() - 1; n > 0 {
+			others = n
+		}
+	}
+
+	total := base + p.settings.Legacy.BlockDownloadTimeoutPerPeerPercent*int64(others)
+	if total <= 0 {
+		// A misconfiguration must never produce a zero ceiling, which would
+		// disconnect every peer immediately. Fall back to the old constant.
+		return MaxBlockDownloadTime
+	}
+
+	return time.Duration(total) * interval / 100
+}
+
 // shouldExtendBlockDeadline reports whether an expired block-response deadline
 // should be extended (because the block is still actively arriving) rather than
 // treated as a stall. Extension is allowed only while throughput is healthy AND
@@ -1545,7 +1604,7 @@ func blockResponsePending(pending map[string]time.Time) bool {
 // wall-clock cap that stops a peer dribbling bytes forever from holding the
 // sync slot indefinitely. blockFetchStart is the zero value when no block fetch
 // is in flight.
-func shouldExtendBlockDeadline(command string, healthyDownload bool, blockFetchStart, now time.Time) bool {
+func shouldExtendBlockDeadline(command string, healthyDownload bool, blockFetchStart, now time.Time, budget time.Duration) bool {
 	if !isBlockResponseCommand(command) || !healthyDownload {
 		return false
 	}
@@ -1554,7 +1613,7 @@ func shouldExtendBlockDeadline(command string, healthyDownload bool, blockFetchS
 		return false
 	}
 
-	return now.Sub(blockFetchStart) < MaxBlockDownloadTime
+	return now.Sub(blockFetchStart) < budget
 }
 
 // responseStallBudget returns the deadline allowance a pending response of the
@@ -1783,7 +1842,7 @@ out:
 			// its adjusted deadline. While a block fetch is in flight,
 			// non-block deadlines are suppressed (see expiredStallResponse).
 			if command, stalled := expiredStallResponse(pendingResponses, now, offset); stalled {
-				if shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now) {
+				if shouldExtendBlockDeadline(command, healthyDownload, blockFetchStart, now, p.blockDownloadBudget()) {
 					// The block is still actively arriving at a healthy rate and
 					// within the wall-clock cap; extend the whole block-response
 					// group (armed together) rather than disconnect a peer
@@ -1796,7 +1855,7 @@ out:
 					}
 
 					p.logger.Debugf("Extending block deadline for %s: downloading at %d B/s (%.0fs into fetch, cap %s)",
-						p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), MaxBlockDownloadTime)
+						p, recvDelta/uint64(stallTickInterval.Seconds()), now.Sub(blockFetchStart).Seconds(), p.blockDownloadBudget())
 				} else {
 					reason := fmt.Sprintf("Peer appears to be stalled or misbehaving, %s timeout", command)
 					p.DisconnectWithInfo(reason)

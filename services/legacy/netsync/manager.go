@@ -3134,6 +3134,29 @@ func (sm *SyncManager) SyncPeerID() int32 {
 
 // IsCurrent returns whether the sync manager believes it is synced with
 // the connected peers.
+// PeersWithBlockDownloads reports how many peers currently have at least one
+// block request outstanding.
+//
+// The peer layer uses this to widen a block's wall-clock ceiling: pulling blocks
+// from several peers at once shares our downstream link between them, so every
+// transfer is honestly slower and judging each against a single-peer deadline
+// disconnects peers that are doing nothing wrong.
+//
+// Only peers with a genuine outstanding request count. A peer cannot inflate our
+// patience by announcing blocks it never sends, because nothing is recorded until
+// we ask for it.
+func (sm *SyncManager) PeersWithBlockDownloads() int {
+	n := 0
+
+	for _, state := range sm.peerStates.Range() {
+		if state != nil && state.requestedBlocks != nil && state.requestedBlocks.Len() > 0 {
+			n++
+		}
+	}
+
+	return n
+}
+
 func (sm *SyncManager) IsCurrent() bool {
 	return sm.current()
 }
