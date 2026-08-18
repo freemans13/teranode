@@ -215,3 +215,53 @@ func TestNetgroupFreedWhenPeerDropsBeforeHandshake(t *testing.T) {
 	_, stillTracked := state.outboundPeers.Get(sp.ID())
 	require.False(t, stillTracked, "the peer should have been removed from the outbound list")
 }
+
+// TestPermanentPeerListSparesConnectOnly pins where the addnode budget applies.
+//
+// The budget is for -addnode: peers added on top of a node that is already
+// dialling the network for itself, so dropping the surplus costs it nothing it
+// cannot replace from the address book. Connect-only mode is the opposite
+// case. cfg.ConnectPeers is the node's entire connectivity — there is no
+// address source at all, and MaxPeers is set to the length of that same list —
+// so capping it at eight would strand every entry past the eighth with nothing
+// to fall back on, and leave the node permanently below the capacity it had
+// just sized itself for.
+//
+// svnode draws the line in the same place: semAddnode gates
+// ThreadOpenAddedConnections, while the -connect loop in ThreadOpenConnections
+// dials every entry with no semaphore at all.
+func TestPermanentPeerListSparesConnectOnly(t *testing.T) {
+	twelve := make([]string, 12)
+	for i := range twelve {
+		twelve[i] = string(rune('a' + i))
+	}
+
+	t.Run("connect-only is never truncated", func(t *testing.T) {
+		dial, dropped := permanentPeerList(twelve, nil, 8)
+
+		require.Equal(t, twelve, dial,
+			"connect-only peers are the node's only connectivity and must all be dialed")
+		require.Zero(t, dropped)
+	})
+
+	t.Run("connect-only wins over addnode and is still not truncated", func(t *testing.T) {
+		dial, dropped := permanentPeerList(twelve, []string{"x", "y"}, 8)
+
+		require.Equal(t, twelve, dial)
+		require.Zero(t, dropped)
+	})
+
+	t.Run("addnode is budgeted", func(t *testing.T) {
+		dial, dropped := permanentPeerList(nil, twelve, 8)
+
+		require.Len(t, dial, 8, "the addnode list is capped at its own budget")
+		require.Equal(t, 4, dropped)
+	})
+
+	t.Run("neither configured", func(t *testing.T) {
+		dial, dropped := permanentPeerList(nil, nil, 8)
+
+		require.Empty(t, dial)
+		require.Zero(t, dropped)
+	})
+}

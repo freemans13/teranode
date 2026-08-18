@@ -37,7 +37,10 @@ func (ka *KnownAddress) NetAddress() *wire.NetAddress {
 // selection weight by 1.5 per attempt, and isBad condemns an address with
 // three failures and no success.
 //
-// This function is safe for concurrent access.
+// NOT safe for concurrent access: ka.attempts is written by AddrManager under
+// its own mutex, which this does not take (the same is true of every other
+// accessor on this type). Read it from a goroutine that is not racing the
+// address manager — in practice, tests.
 func (ka *KnownAddress) Attempts() int {
 	return ka.attempts
 }

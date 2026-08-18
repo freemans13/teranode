@@ -2828,7 +2828,7 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 	case removeNodeMsg:
 		// No group release here: this removes a permanent peer, and permanent
 		// peers no longer claim a netgroup when they are added.
-		found := disconnectPeer(state.persistentPeers, msg.cmp, func(_ *serverPeer) {})
+		found := disconnectPeer(state.persistentPeers, msg.cmp, nil)
 
 		if found {
 			msg.reply <- nil
@@ -2937,6 +2937,29 @@ func addnodePeers(configured []string, budget int) (dial []string, dropped int) 
 	}
 
 	return configured[:budget], len(configured) - budget
+}
+
+// permanentPeerList resolves the named peers to dial at startup, and applies
+// the addnode budget to the addnode list only.
+//
+// The two lists are not the same kind of thing. connectPeers is connect-only
+// mode: it is the node's ENTIRE connectivity, there is no address source at
+// all, and MaxPeers is set to the length of that very list — so capping it
+// would strand whatever an operator listed past the budget with nothing to
+// fall back on, and the node would run permanently below the capacity it just
+// sized itself for. addPeers is additive to a node that is already dialling
+// the network for itself, so a cap there costs it nothing it cannot replace.
+//
+// svnode draws the line in the same place: semAddnode gates
+// ThreadOpenAddedConnections (net.cpp:2021), while the -connect loop in
+// ThreadOpenConnections (net.cpp:1772) dials every entry with no semaphore at
+// all.
+func permanentPeerList(connectPeers, addPeers []string, budget int) (dial []string, dropped int) {
+	if len(connectPeers) > 0 {
+		return connectPeers, 0
+	}
+
+	return addnodePeers(addPeers, budget)
 }
 
 // newPeerConfig returns the configuration for the given serverPeer.
@@ -3256,11 +3279,32 @@ func (s *server) ConnectedCount() int32 {
 // candidate addresses reads a single consistent snapshot, instead of asking
 // once per candidate and seeing the peer set shift underneath it. svnode builds
 // the same set once per pass of ThreadOpenConnections for the same reason.
+// Both halves of the exchange give up on shutdown. This runs on a dial
+// goroutine, and the peer handler stops serving queries the moment s.quit
+// closes — it then drains s.query without answering, so an unguarded send
+// would be accepted and the reply would never come, parking the dial goroutine
+// for the life of the process. An empty set is the safe answer at that point:
+// the connection manager is being stopped in the very next statement of the
+// peer handler, so at worst the caller picks one more address that is never
+// dialled.
 func (s *server) OutboundGroups() map[string]struct{} {
-	replyChan := make(chan map[string]struct{})
-	s.query <- getOutboundGroups{reply: replyChan}
+	// Buffered so that abandoning the reply cannot wedge the peer handler:
+	// handleQuery sends the answer unguarded, and on an unbuffered channel a
+	// caller that had already given up would block it there for good.
+	replyChan := make(chan map[string]struct{}, 1)
 
-	return <-replyChan
+	select {
+	case s.query <- getOutboundGroups{reply: replyChan}:
+	case <-s.quit:
+		return nil
+	}
+
+	select {
+	case groups := <-replyChan:
+		return groups
+	case <-s.quit:
+		return nil
+	}
 }
 
 // AddBytesSent adds the passed number of bytes to the total bytes sent counter
@@ -3882,14 +3926,9 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	// are related: the replenishment pass counts only the automatic tier, so
 	// the node's outbound total is the target PLUS its addnode peers. MaxPeers
 	// has to bound that total rather than the automatic half alone.
-	permanentPeers := cfg.ConnectPeers
-	if len(permanentPeers) == 0 {
-		permanentPeers = cfg.AddPeers
-	}
-
-	permanentPeers, droppedPeers := addnodePeers(permanentPeers, cfg.MaxAddnodePeers)
+	permanentPeers, droppedPeers := permanentPeerList(cfg.ConnectPeers, cfg.AddPeers, cfg.MaxAddnodePeers)
 	if droppedPeers > 0 {
-		logger.Warnf("More named peers configured than maxaddnodepeers allows [%d]: dialing the first %d, ignoring %d", cfg.MaxAddnodePeers, len(permanentPeers), droppedPeers)
+		logger.Warnf("More addnode peers configured than maxaddnodepeers allows [%d]: dialing the first %d, ignoring %d", cfg.MaxAddnodePeers, len(permanentPeers), droppedPeers)
 	}
 
 	targetOutbound := automaticOutboundTarget(cfg.TargetOutboundPeers, cfg.MaxPeers)

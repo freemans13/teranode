@@ -851,6 +851,16 @@ func (a *AddrManager) AddressCache() []*wire.NetAddress {
 func (a *AddrManager) reset() {
 	a.addrIndex = make(map[string]*KnownAddress)
 
+	// Started just off zero so that "never counted" is strictly worse than
+	// "never succeeded". Attempt only counts a failure when the address's
+	// lastCountAttempt is BEFORE lastGood, and a zero lastGood is not after a
+	// zero lastCountAttempt — so leaving it zero would silently swallow every
+	// failure until the node's first successful version exchange, which is
+	// exactly the window in which the address book most needs to learn that
+	// its seeds are dead. svnode sets nLastGood = 1 in CAddrMan::Clear
+	// (addrman.h:505) for this reason.
+	a.lastGood = time.Unix(1, 0)
+
 	// fill key with bytes from a good random source.
 	io.ReadFull(crand.Reader, a.key[:])
 

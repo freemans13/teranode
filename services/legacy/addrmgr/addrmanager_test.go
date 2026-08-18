@@ -571,3 +571,38 @@ func TestAttemptCountsOnlyBlameworthyFailures(t *testing.T) {
 		}
 	})
 }
+
+// TestAttemptCountsFromColdStart pins that a blameworthy failure counts before
+// the node's first successful version exchange.
+//
+// Attempt only counts when ka.lastCountAttempt is BEFORE a.lastGood. Both start
+// at the zero time, and zero is not before zero — so a lastGood left at zero
+// swallows every failure until the first Good(), which is precisely the window
+// in which the address book most needs to learn that its seed addresses are
+// dead. svnode initialises nLastGood to 1 in CAddrMan::Clear (addrman.h:505)
+// with the comment "Initially at 1 so that 'never' is strictly worse".
+func TestAttemptCountsFromColdStart(t *testing.T) {
+	n := addrmgr.New(ulogger.TestLogger{}, "testattemptcoldstart", lookupFunc)
+	if err := n.AddAddressByIP(someIP + ":8333"); err != nil {
+		t.Fatalf("Adding address failed: %v", err)
+	}
+
+	ka := n.GetAddress()
+
+	// No Good() has ever been called: this is a node that has just started and
+	// has not yet completed a handshake with anybody.
+	n.Attempt(ka.NetAddress(), true)
+
+	if got := ka.Attempts(); got != 1 {
+		t.Errorf("a blameworthy failure before the first success must still count: got %d attempts, want 1", got)
+	}
+
+	// And still only once, until connectivity is confirmed.
+	for i := 0; i < 5; i++ {
+		n.Attempt(ka.NetAddress(), true)
+	}
+
+	if got := ka.Attempts(); got != 1 {
+		t.Errorf("repeated failures between successes should count once: got %d attempts, want 1", got)
+	}
+}
