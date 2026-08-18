@@ -21,8 +21,15 @@ import (
 func newPendingReleaseTestManager(t *testing.T, addr net.Addr) *ConnManager {
 	t.Helper()
 
+	// TargetOutbound is 2, not 1, because NewConnReq only reserves a slot when
+	// the automatic tier is below target. Each test below pre-seeds one book
+	// entry to set up the duplicate it wants deduped; at a target of 1 that
+	// entry alone would satisfy the target, NewConnReq would return without
+	// reserving anything, and the test would pass without ever reaching the
+	// dedup release it exists to cover. requireDeficit below fails loudly if
+	// that ever stops being true.
 	cm, err := New(ulogger.TestLogger{}, &Config{
-		TargetOutbound: 1,
+		TargetOutbound: 2,
 		GetNewAddress:  func() (net.Addr, error) { return addr, nil },
 		Dial: func(_ net.Addr) (net.Conn, error) {
 			t.Fatal("dial must not run in the duplicate-address dedup tests")
@@ -41,6 +48,18 @@ func newPendingReleaseTestManager(t *testing.T, addr net.Addr) *ConnManager {
 	return cm
 }
 
+// requireDeficit asserts the manager is genuinely short of an automatic
+// outbound slot, so that the NewConnReq under test really does reserve one and
+// really does reach the dedup return. Without this the tests below could pass
+// for the wrong reason.
+func requireDeficit(t *testing.T, cm *ConnManager) {
+	t.Helper()
+
+	established, pending := cm.automaticCounts()
+	require.Positive(t, replenishDeficit(established, pending, int(cm.cfg.TargetOutbound)),
+		"test setup is vacuous: NewConnReq will not reserve a slot because the tier is already at target")
+}
+
 // TestNewConnReqDuplicateConnectedAddrReleasesPending: when the fresh request
 // is abandoned because the address is already CONNECTED, the just-registered
 // pending entry must be released.
@@ -52,6 +71,7 @@ func TestNewConnReqDuplicateConnectedAddrReleasesPending(t *testing.T) {
 	existing.SetAddr(addr)
 	cm.conns.Set(99, existing)
 
+	requireDeficit(t, cm)
 	cm.NewConnReq()
 
 	require.Eventuallyf(t, func() bool { return cm.pending.Length() == 0 },
@@ -70,6 +90,7 @@ func TestNewConnReqDuplicatePendingAddrReleasesPending(t *testing.T) {
 	inflight.SetAddr(addr)
 	cm.pending.Set(98, inflight)
 
+	requireDeficit(t, cm)
 	cm.NewConnReq()
 
 	require.Eventuallyf(t, func() bool { return cm.pending.Length() == 1 },

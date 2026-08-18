@@ -460,7 +460,21 @@ out:
 				connReq.updateState(ConnEstablished)
 				connReq.conn = msg.conn
 
+				// Promote the request from the pending book to the connected
+				// book as one step, for the same reason handleDisconnected
+				// retires and re-pends under one lock. A slot counts as
+				// occupied only while its request is visible in one book or the
+				// other, and automaticCounts walks conns first and pending
+				// second: split apart, a promotion landing between those two
+				// walks is counted by NEITHER, the pass reads a deficit that
+				// does not exist, and it dials a second address for a slot that
+				// has just been filled. dialMu is what makes the promotion and
+				// the measurement mutually exclusive; the two map mutexes
+				// cannot, because they are separate locks.
+				cm.dialMu.Lock()
 				cm.conns.Set(connReq.id, connReq)
+				cm.pending.Delete(connReq.id)
+				cm.dialMu.Unlock()
 
 				cm.logger.Debugf("Connected to %v", connReq)
 				connReq.retryCount.Store(0)
@@ -469,8 +483,6 @@ out:
 				// the replenishment backoff immediately rather than making the
 				// node wait out a RetryDuration it no longer needs.
 				cm.replenishBackoffUntil.Store(0)
-
-				cm.pending.Delete(connReq.id)
 
 				if cm.cfg.OnConnection != nil {
 					go cm.cfg.OnConnection(connReq, msg.conn)
@@ -701,8 +713,39 @@ func (cm *ConnManager) dialReserved(c *ConnReq) {
 	cm.Connect(c)
 }
 
+// reserveSlotIfBelowTarget claims one automatic outbound slot, but only when
+// the tier is actually short of one. It returns nil when the books already
+// account for the target, meaning the caller must not dial.
+//
+// The measurement and the claim are taken together under dialMu for the same
+// reason replenish does it: a deficit read a moment ago is not a licence to
+// dial now.
+func (cm *ConnManager) reserveSlotIfBelowTarget() *ConnReq {
+	cm.dialMu.Lock()
+	defer cm.dialMu.Unlock()
+
+	established, pending := cm.automaticCounts()
+	if replenishDeficit(established, pending, int(cm.cfg.TargetOutbound)) == 0 {
+		return nil
+	}
+
+	return cm.reserveSlot()
+}
+
 // NewConnReq creates a new connection request and connects to the
-// corresponding address.
+// corresponding address, provided the automatic outbound tier is below target.
+//
+// The target check is not optional. This used to be an unconditional dial, and
+// that was harmless while the only caller that mattered was a strict
+// one-for-one replacement inside handleFailedConn — the request it replaced had
+// just been retired, so the slot really was free. It stopped being harmless
+// once the replenishment pass became a second, independent dial driver. The
+// max-failed-attempts arm of handleFailedConn retires its request, arms the
+// replenishment backoff for RetryDuration, and schedules NewConnReq for the
+// same instant the backoff expires; whichever of the two runs first fills the
+// slot, and an unconditional NewConnReq then filled it a second time. Nothing
+// sheds the extra connection afterwards, so each such episode left the node
+// permanently one connection above TargetOutbound.
 func (cm *ConnManager) NewConnReq() {
 	if atomic.LoadInt32(&cm.stop) != 0 {
 		return
@@ -712,9 +755,10 @@ func (cm *ConnManager) NewConnReq() {
 		return
 	}
 
-	cm.dialMu.Lock()
-	c := cm.reserveSlot()
-	cm.dialMu.Unlock()
+	c := cm.reserveSlotIfBelowTarget()
+	if c == nil {
+		return
+	}
 
 	cm.dialReserved(c)
 }
