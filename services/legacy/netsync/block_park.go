@@ -56,9 +56,9 @@ const (
 	// so the safety net can never turn into a scan of the whole park.
 	parkSweepRPCBudget = 8
 
-	// parkMinWriteTimeout is the floor on legacy_parkWriteTimeout. A zero or
-	// negative deadline would fail every write instantly.
-	parkMinWriteTimeout = time.Second
+	// parkMinStoreTimeout is the floor on legacy_parkStoreTimeout. A zero or
+	// negative deadline would fail every store operation instantly.
+	parkMinStoreTimeout = time.Second
 
 	// parkReadBufferSize buffers the read side of a drain. MsgBlock.Bsvdecode
 	// makes many small reads and an unbuffered *os.File would make that
@@ -140,11 +140,16 @@ type parkedBlock struct {
 // the many tests that build SyncManager as a struct literal, and any deployment
 // that turns the park off, take the old discard path unchanged.
 type blockPark struct {
-	logger       ulogger.Logger
-	store        blob.Store
-	dir          string
-	maxBytes     int64
-	writeTimeout time.Duration
+	logger   ulogger.Logger
+	store    blob.Store
+	dir      string
+	maxBytes int64
+	// storeTimeout is the ceiling on ONE blob store operation. Every one of the
+	// park's — write, read back, delete, and the header peek the restart scan
+	// makes — carries it, because all of them wait on the same process-wide
+	// permit pool and all but the restart scan run on the single goroutine that
+	// commits blocks in order.
+	storeTimeout time.Duration
 
 	mu       sync.Mutex
 	entries  map[chainhash.Hash]*parkedBlock
@@ -185,19 +190,19 @@ func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blo
 		return nil
 	}
 
-	writeTimeout := tSettings.Legacy.ParkWriteTimeout
-	if writeTimeout < parkMinWriteTimeout {
-		writeTimeout = parkMinWriteTimeout
+	storeTimeout := tSettings.Legacy.ParkStoreTimeout
+	if storeTimeout < parkMinStoreTimeout {
+		storeTimeout = parkMinStoreTimeout
 	}
 
-	logger.Infof("[blockPark] parking out-of-order blocks in %s, up to %d bytes, write deadline %s", dir, tSettings.Legacy.ParkMaxBytes, writeTimeout)
+	logger.Infof("[blockPark] parking out-of-order blocks in %s, up to %d bytes, store deadline %s", dir, tSettings.Legacy.ParkMaxBytes, storeTimeout)
 
 	return &blockPark{
 		logger:       logger,
 		store:        store,
 		dir:          dir,
 		maxBytes:     tSettings.Legacy.ParkMaxBytes,
-		writeTimeout: writeTimeout,
+		storeTimeout: storeTimeout,
 		entries:      make(map[chainhash.Hash]*parkedBlock),
 		children:     make(map[chainhash.Hash][]chainhash.Hash),
 	}
@@ -298,7 +303,21 @@ func (p *blockPark) Park(ctx context.Context, entry parkedBlock, msgBlock *wire.
 
 	p.mu.Unlock()
 
-	if err := validateParkCandidate(msgBlock, entry.hash); err != nil {
+	// Timed, not deadlined, and the difference is the point. The stateless check
+	// rebuilds the merkle tree over every transaction in the block, which is CPU
+	// work on this same in-order commit goroutine that no context can interrupt
+	// part way through. legacy_parkStoreTimeout cannot bound it. What it can do
+	// is make it visible, so an operator who sees the commit goroutine stalling
+	// can tell validation from store contention.
+	validationStart := time.Now()
+
+	err := validateParkCandidate(msgBlock, entry.hash)
+
+	if elapsed := time.Since(validationStart); elapsed > p.storeTimeout {
+		p.logger.Warnf("[blockPark][%s] the stateless check on a %d transaction block took %s, longer than the %s store deadline; this is CPU on the block commit goroutine and no deadline bounds it", entry.hash, len(msgBlock.Transactions), elapsed, p.storeTimeout)
+	}
+
+	if err != nil {
 		p.logger.Warnf("[blockPark][%s] refusing to park an invalid block: %v", entry.hash, err)
 
 		return parkRejected
@@ -345,15 +364,23 @@ func (p *blockPark) Park(ctx context.Context, entry parkedBlock, msgBlock *wire.
 	return parkAccepted
 }
 
+// storeCtx puts the configured deadline on one blob store operation.
+//
+// EVERY store call the park makes goes through this, and that is the whole of
+// what legacy_parkStoreTimeout promises. The file store waits up to 25 seconds
+// for one of its 256 write or 768 read permits — permits it shares with subtree
+// writes, transaction writes and both persisters — and a caller deadline is the
+// only thing that can shorten that wait. Park, read-back and delete all run on
+// the single goroutine that commits blocks in order, so an undeadlined one is
+// head-of-line blocking for every block queued behind it.
+func (p *blockPark) storeCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, p.storeTimeout)
+}
+
 // write streams the block into the blob store. The block is serialized straight
 // down a pipe, so a 150 MB block never exists twice in memory.
 func (p *blockPark) write(ctx context.Context, hash chainhash.Hash, msgBlock *wire.MsgBlock) error {
-	// A caller deadline can only shorten the store's own 25 second wait for one
-	// of its 256 process-wide write permits — permits it shares with subtree
-	// writes, transaction writes and both persisters. This runs on the single
-	// goroutine that commits blocks in order, so that wait is head-of-line
-	// blocking for every queued block, and this is the ceiling on it.
-	writeCtx, cancel := context.WithTimeout(ctx, p.writeTimeout)
+	writeCtx, cancel := p.storeCtx(ctx)
 	defer cancel()
 
 	pr, pw := io.Pipe()
@@ -387,9 +414,17 @@ func (p *blockPark) Read(ctx context.Context, hash chainhash.Hash) (*wire.MsgBlo
 		return nil, errors.NewNotFoundError("[blockPark] no park")
 	}
 
+	// The deadline covers getting hold of the reader, which is where the permit
+	// wait is. It deliberately does NOT cover the decode below: cancelling a
+	// half-read block would leave a good blob looking corrupt and give it up for
+	// good, and the decode is local disk reads through a 1 MB buffer, not a
+	// contended resource.
+	readCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
 	// The ReadCloser holds one of the store's 768 process-wide read permits and
 	// only gives it back on Close, so every path out of here must close it.
-	rc, err := p.store.GetIoReader(ctx, hash[:], fileformat.FileTypeMsgBlock, parkOpts...)
+	rc, err := p.store.GetIoReader(readCtx, hash[:], fileformat.FileTypeMsgBlock, parkOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -474,8 +509,9 @@ func (p *blockPark) Restore(entry parkedBlock) {
 // with one that was never in it.
 //
 // A delete failure is not fatal: Del takes a write permit from the same
-// contended pool as the park write, so it can time out. The entry is forgotten
-// either way and the restart sweep collects the file.
+// contended pool as the park write, so it can time out — and it carries the
+// configured deadline for exactly that reason. The entry is forgotten either
+// way and the restart sweep collects the file.
 func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	if p == nil {
 		return
@@ -489,7 +525,10 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	p.setGauges()
 	p.mu.Unlock()
 
-	if err := p.store.Del(ctx, entry.hash[:], fileformat.FileTypeMsgBlock, parkOpts...); err != nil {
+	delCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	if err := p.store.Del(delCtx, entry.hash[:], fileformat.FileTypeMsgBlock, parkOpts...); err != nil {
 		p.logger.Warnf("[blockPark][%s] failed to delete parked block, leaving it for the next restart sweep: %v", entry.hash, err)
 	}
 }
@@ -738,7 +777,10 @@ func (p *blockPark) Recover(ctx context.Context) {
 // name claims. GetIoReader has already consumed the store's own 8-byte header,
 // so the first bytes it hands back are the block header.
 func (p *blockPark) readParkedPrevBlock(ctx context.Context, hash chainhash.Hash) (chainhash.Hash, error) {
-	rc, err := p.store.GetIoReader(ctx, hash[:], fileformat.FileTypeMsgBlock, parkOpts...)
+	readCtx, cancel := p.storeCtx(ctx)
+	defer cancel()
+
+	rc, err := p.store.GetIoReader(readCtx, hash[:], fileformat.FileTypeMsgBlock, parkOpts...)
 	if err != nil {
 		return chainhash.Hash{}, err
 	}

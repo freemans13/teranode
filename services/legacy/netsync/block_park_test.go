@@ -426,24 +426,24 @@ func TestBlockPark_IsOffWhenItCannotBeRecovered(t *testing.T) {
 	})
 }
 
-// TestBlockPark_ParkWriteDeadlineIsTheOneThatCounts pins the floor on the write
-// deadline. A zero or negative deadline would fail every write instantly, so a
-// misconfigured setting must not switch parking off by accident.
-func TestBlockPark_ParkWriteDeadlineIsTheOneThatCounts(t *testing.T) {
+// TestBlockPark_ParkStoreDeadlineIsTheOneThatCounts pins the floor on the store
+// deadline. A zero or negative deadline would fail every store operation
+// instantly, so a misconfigured setting must not switch parking off by accident.
+func TestBlockPark_ParkStoreDeadlineIsTheOneThatCounts(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 
 	storeURL, err := url.Parse("file://" + t.TempDir())
 	require.NoError(t, err)
 
 	tSettings.Legacy.TempStore = storeURL
-	tSettings.Legacy.ParkWriteTimeout = 0
+	tSettings.Legacy.ParkStoreTimeout = 0
 
 	store, err := blob.NewStore(ulogger.TestLogger{}, storeURL)
 	require.NoError(t, err)
 
 	park := newBlockPark(ulogger.TestLogger{}, tSettings, store)
 	require.NotNil(t, park)
-	require.Equal(t, parkMinWriteTimeout, park.writeTimeout)
+	require.Equal(t, parkMinStoreTimeout, park.storeTimeout)
 
 	blocks := minedBlocks(t, 1)
 	msgBlock := blocks[0].MsgBlock()
