@@ -212,43 +212,6 @@ func TestBlockDownloadTracker_NilIsSafeAndFailsClosed(t *testing.T) {
 	require.Zero(t, tr.Len())
 }
 
-// TestBlockDownloadTracker_EvictsTheOldestOverTheCap pins which entry goes when
-// a flood of announcements pushes the ledger over its size cap. It must be the
-// one we have waited longest for, never the newest: a block whose record is
-// dropped while it is still on the way arrives looking unrequested and costs an
-// honest peer its connection.
-func TestBlockDownloadTracker_EvictsTheOldestOverTheCap(t *testing.T) {
-	tr, advance := newTestTracker(blockRequestAssignmentTTL)
-
-	p := newTestPeer(t, "localhost:18408")
-
-	// The filler hashes below only ever set bytes 0-2, so marking the last byte
-	// keeps this one distinct from all of them.
-	oldest := chainhash.Hash{}
-	oldest[31] = 0xff
-	tr.Add(p, oldest)
-
-	advance(time.Second)
-
-	for i := 0; i <= maxTrackedBlockDownloads; i++ {
-		h := chainhash.Hash{}
-		h[0] = byte(i)
-		h[1] = byte(i >> 8)
-		h[2] = byte(i >> 16)
-		tr.Add(p, h)
-	}
-
-	require.LessOrEqual(t, tr.Len(), maxTrackedBlockDownloads, "the ledger must stay under its cap")
-	require.False(t, tr.HasOwner(p, oldest), "the longest-outstanding block is the one evicted")
-
-	last := maxTrackedBlockDownloads
-	newest := chainhash.Hash{}
-	newest[0] = byte(last)
-	newest[1] = byte(last >> 8)
-	newest[2] = byte(last >> 16)
-	require.True(t, tr.HasOwner(p, newest), "the block we asked for most recently must survive")
-}
-
 // TestPeersWithBlockDownloads_ExpiredAssignmentDoesNotInflateTheCount pins that
 // an assignment past its lifetime stops counting as a live download. The count
 // this feeds multiplies every peer's block deadline, and the same number caps

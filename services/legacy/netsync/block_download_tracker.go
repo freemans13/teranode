@@ -1,7 +1,6 @@
 package netsync
 
 import (
-	"sort"
 	"sync"
 	"time"
 
@@ -25,11 +24,13 @@ const (
 	blockRequestRetryInterval = 60 * time.Second
 
 	// maxTrackedBlockDownloads bounds how many distinct blocks the ledger will
-	// track, so a flood of announcements cannot grow it without limit. Eviction
-	// is oldest-first: a burst of new announcements must never displace the
-	// frontier block we are actually waiting on, because a block that arrives
-	// after its record was dropped looks unrequested and costs the peer its
-	// connection.
+	// track, so a flood of announcements cannot grow it without limit. The cap
+	// is applied by refusing the newcomer, never by dropping work already in
+	// progress: a block that arrives after its record was dropped looks
+	// unrequested and costs an honest peer its connection, and the block we have
+	// waited longest for — the frontier everything else is queued behind — is by
+	// definition the oldest record of all. Refusing is only safe because Add
+	// says so to its caller, which then does not send the getdata; see Add.
 	maxTrackedBlockDownloads = 50_000
 )
 
@@ -81,12 +82,27 @@ func newBlockDownloadTracker(ttl time.Duration) *blockDownloadTracker {
 	}
 }
 
-// Add records that we have asked peer p for block h. Asking the same peer again
-// refreshes the assignment, which is what we want: the clock should run from the
-// most recent time we actually asked.
-func (t *blockDownloadTracker) Add(p *peerpkg.Peer, h chainhash.Hash) {
+// Add records that we have asked peer p for block h and reports whether the
+// ledger took it. Asking the same peer again refreshes the assignment, which is
+// what we want: the clock should run from the most recent time we actually
+// asked.
+//
+// A false answer means the ledger is at its size cap and this is a block it does
+// not already know about. The caller must then not send the getdata, because a
+// request the ledger cannot vouch for comes back looking unrequested and costs
+// an honest peer its connection. Refusing the newcomer is the only way to apply
+// the cap that leaves every block we are already waiting on exactly where it
+// was; evicting to make room would aim that same disconnect at whichever peer
+// lost the eviction, which for oldest-first is the frontier peer — the one block
+// sync cannot proceed without.
+//
+// Recording an additional owner for a block already in the ledger never fails.
+// That is what the frontier race needs: asking a second peer for the block that
+// is holding up sync must work however full the ledger is, because it adds no
+// block to it.
+func (t *blockDownloadTracker) Add(p *peerpkg.Peer, h chainhash.Hash) bool {
 	if t == nil {
-		return
+		return false
 	}
 
 	t.mu.Lock()
@@ -104,6 +120,16 @@ func (t *blockDownloadTracker) Add(p *peerpkg.Peer, h chainhash.Hash) {
 
 	owners := t.byHash[h]
 	if owners == nil {
+		if len(t.byHash) >= maxTrackedBlockDownloads {
+			// Aged-out assignments are the only room this ledger makes for
+			// itself, and the walk is worth it before turning a request away.
+			t.sweepExpiredLocked(now)
+
+			if len(t.byHash) >= maxTrackedBlockDownloads {
+				return false
+			}
+		}
+
 		owners = make(map[*peerpkg.Peer]time.Time, 1)
 		t.byHash[h] = owners
 	}
@@ -119,6 +145,8 @@ func (t *blockDownloadTracker) Add(p *peerpkg.Peer, h chainhash.Hash) {
 	hashes[h] = struct{}{}
 
 	t.maybeSweepLocked(now)
+
+	return true
 }
 
 // HasOwner reports whether peer p is currently on the hook for block h. This is
@@ -390,18 +418,23 @@ func (t *blockDownloadTracker) removeHashLocked(h chainhash.Hash) {
 	delete(t.byHash, h)
 }
 
-// maybeSweepLocked drops aged-out assignments, and then, if the ledger is still
-// over its size cap, the oldest live ones. Sweeping runs at most once every
-// quarter of the ttl so it costs nothing in the steady state; readers do not
-// depend on it having run, because they check each assignment's own age.
+// maybeSweepLocked drops aged-out assignments if a sweep is due. Sweeping runs
+// at most once every quarter of the ttl so it costs nothing in the steady state;
+// readers do not depend on it having run, because they check each assignment's
+// own age.
 func (t *blockDownloadTracker) maybeSweepLocked(now time.Time) {
-	overCap := len(t.byHash) > maxTrackedBlockDownloads
-	due := t.ttl > 0 && now.Sub(t.lastSweep) >= t.ttl/4
-
-	if !overCap && !due {
+	if t.ttl <= 0 || now.Sub(t.lastSweep) < t.ttl/4 {
 		return
 	}
 
+	t.sweepExpiredLocked(now)
+}
+
+// sweepExpiredLocked drops every assignment that has aged past the ownership
+// ceiling. It is the only thing that removes a record the caller did not ask to
+// remove: expiry means the peer's hour is up and its copy is no longer welcome,
+// so nothing honest is thrown away.
+func (t *blockDownloadTracker) sweepExpiredLocked(now time.Time) {
 	t.lastSweep = now
 
 	for h, owners := range t.byHash {
@@ -410,43 +443,5 @@ func (t *blockDownloadTracker) maybeSweepLocked(now time.Time) {
 				t.removeOwnerLocked(p, h)
 			}
 		}
-	}
-
-	if len(t.byHash) <= maxTrackedBlockDownloads {
-		return
-	}
-
-	t.evictOldestLocked(maxTrackedBlockDownloads * 9 / 10)
-}
-
-// evictOldestLocked shrinks the ledger to keep at most `target` blocks, dropping
-// the least recently requested first. Oldest-first is the whole point: dropping
-// a block we are still waiting on turns its arrival into an unrequested block
-// and disconnects an honest peer, and the block we have waited longest for is
-// the one least likely to still be coming.
-func (t *blockDownloadTracker) evictOldestLocked(target int) {
-	type aged struct {
-		hash chainhash.Hash
-		at   time.Time
-	}
-
-	ages := make([]aged, 0, len(t.byHash))
-
-	for h, owners := range t.byHash {
-		newest := time.Time{}
-
-		for _, at := range owners {
-			if at.After(newest) {
-				newest = at
-			}
-		}
-
-		ages = append(ages, aged{hash: h, at: newest})
-	}
-
-	sort.Slice(ages, func(i, j int) bool { return ages[i].at.Before(ages[j].at) })
-
-	for i := 0; i < len(ages)-target; i++ {
-		t.removeHashLocked(ages[i].hash)
 	}
 }

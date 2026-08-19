@@ -2338,12 +2338,20 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		}
 
 		if !haveInv {
+			// Record the request before it goes out. A block the ledger will
+			// not take is a block we must not ask for: the reply would arrive
+			// with nothing vouching for it and cost this peer its connection.
+			// Leaving startHeader where it is means the header is simply picked
+			// up again on the next pass, once arrivals or expiry have made room.
+			if !sm.blockDownloads.Add(sp, *node.hash) {
+				sm.logger.Warnf("[fetchHeaderBlocks] block download ledger full at %d blocks, holding off on %s", maxTrackedBlockDownloads, node.hash)
+				break
+			}
+
 			if err = getDataMessage.AddInvVect(iv); err != nil {
 				sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
 				break
 			}
-
-			sm.blockDownloads.Add(sp, *node.hash)
 
 			numRequested++
 		}
@@ -2718,12 +2726,19 @@ outside:
 		case wire.InvTypeBlock:
 			// Request the block if there is not already a pending request.
 			if !sm.blockDownloads.RequestedWithin(iv.Hash, blockRequestRetryInterval) {
+				// As in fetchHeaderBlocks: a block the ledger will not take is
+				// a block we must not ask for, or the reply looks unrequested
+				// and costs this peer its connection. The block is announced
+				// again soon enough, and by then there is room.
+				if !sm.blockDownloads.Add(peer, iv.Hash) {
+					sm.logger.Warnf("[handleInvMsg] block download ledger full at %d blocks, holding off on %s from %s", maxTrackedBlockDownloads, iv.Hash, peer)
+					break outside
+				}
+
 				if err = gdmsg.AddInvVect(iv); err != nil {
 					sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
 					break outside
 				}
-
-				sm.blockDownloads.Add(peer, iv.Hash)
 
 				numRequested++
 			}

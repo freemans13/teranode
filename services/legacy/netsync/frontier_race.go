@@ -250,7 +250,15 @@ func (sm *SyncManager) raceFrontierBlock(now time.Time) {
 	// and the one in handleBlockMsg ask whether this peer owes us the block, and
 	// a peer that does not gets disconnected for sending it. Recording a second
 	// owner is exactly what the ledger is for.
-	sm.blockDownloads.Add(target, hash)
+	// The frontier is already in the ledger — this adds an owner, not a block —
+	// so the size cap cannot turn the race away. The check is here for the one
+	// case where it can: a frontier whose record aged out of the hour-long
+	// ceiling while the ledger stayed full. Racing a block we cannot vouch for
+	// would punish the peer that answered, so we let the stall stand instead.
+	if !sm.blockDownloads.Add(target, hash) {
+		sm.logger.Warnf("[raceFrontierBlock] block download ledger full at %d blocks, not racing %s", maxTrackedBlockDownloads, hash)
+		return
+	}
 
 	getData := wire.NewMsgGetDataSizeHint(1)
 	if err := getData.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hash)); err != nil {
