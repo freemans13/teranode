@@ -353,6 +353,14 @@ func (b *Batcher) processBatchItem(batchItem *BatchItem) error {
 // The batch keys provide an index that maps each original blob key to its position within
 // the batch data, enabling potential future retrieval by key.
 //
+// The two writes are independent Set calls issued concurrently, so a partial failure is
+// possible: one lands, the other does not, and writeBatch reports an error. Since a failed
+// flush now retains the batch, the next successful flush writes those same bytes again under
+// a freshly generated batchKey. The store is then left holding whichever half of the first
+// attempt succeeded, addressed by a key nothing else refers to, plus a duplicate of its
+// contents. Nothing reads either file type back today, so this costs space rather than
+// correctness; making it atomic would need a two-phase write.
+//
 // Parameters:
 //   - currentBatch: The accumulated blob data to write as a single batch
 //   - batchKeys: The accumulated key data to write (if writeKeys is enabled)
@@ -458,6 +466,12 @@ func (b *Batcher) Health(ctx context.Context, checkLiveness bool) (int, string, 
 // Set. Since createBatchedStore returns the batcher in place of the real store, nothing
 // closes the wrapped store at all when batch=true, so any cleanup it does on Close is
 // skipped.
+//
+// Pass a context that still has budget left. A select among ready cases picks at random, so
+// an already-expired ctx can take the cancellation branch on the very first poll and abandon
+// the final batch without the worker getting a chance to flush it at all. daemon.closeStores
+// builds a fresh budget for exactly this reason; a caller that instead reuses a shutdown
+// context already drained by earlier work would silently discard whatever is still batched.
 //
 // Parameters:
 //   - ctx: Context bounding how long Close will wait for the shutdown flush
@@ -568,7 +582,9 @@ func (b *Batcher) SetFromReader(ctx context.Context, key []byte, fileType filefo
 // while its caller was told the write had been accepted. A Set running concurrently with
 // Close can still slip through this check and be dropped — closing that window would mean
 // serialising the write path, which would cost more than this dormant path is worth. Do
-// not call Set concurrently with Close and rely on the outcome.
+// not call Set concurrently with Close and rely on the outcome. Such an item is worse than
+// dropped: the queue is unbounded and the worker has already returned, so nothing will ever
+// dequeue it and its bytes stay resident for the remaining life of the process.
 //
 // Returns:
 //   - error: Any error that occurred during queueing, or if the batcher has been closed
