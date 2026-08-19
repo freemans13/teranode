@@ -2413,6 +2413,20 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 // forever. A nil peer is a defined state and costs a warning, not a panic; the
 // next sync-peer check restarts sync.
 func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash chainhash.Hash) error {
+	// Before anything is changed, not after. Moving the checkpoint on is the
+	// node's record of which round of headers it still has to fetch, and this
+	// function is the only thing that asks for that round. With no peer to ask,
+	// advancing it first threw away the question as well as the answer: nothing
+	// went out, and when a peer did turn up the node asked for the round AFTER
+	// the one it was missing, so the gap was never filled and headers-first sync
+	// stopped at this checkpoint. Leaving the checkpoint where it is costs one
+	// repeated transition when a peer returns, which is free.
+	if peer == nil {
+		sm.logger.Warnf("[checkpointBlockCommitted][%s] checkpoint reached with no peer to ask for the next round of headers; the checkpoint stays where it is until there is one", blockHash)
+
+		return nil
+	}
+
 	// Advance the checkpoint under headerMu and work from the snapshot, so the
 	// getheaders send and the loadSyncPeer lookup below stay outside the lock.
 	sm.headerMu.Lock()
@@ -2428,12 +2442,6 @@ func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash ch
 	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
 	nextCP := sm.nextCheckpoint
 	sm.headerMu.Unlock()
-
-	if peer == nil {
-		sm.logger.Warnf("[checkpointBlockCommitted][%s] checkpoint reached with no peer to ask for the next round of headers; waiting for the next sync-peer check", blockHash)
-
-		return nil
-	}
 
 	if nextCP != nil {
 		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
