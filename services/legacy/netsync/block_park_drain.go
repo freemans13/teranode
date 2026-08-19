@@ -13,7 +13,12 @@ import (
 // a commit event this node saw. It runs on that goroutine and not on the outer
 // message handler because a commit is minutes of work, and the outer handler
 // dispatches disconnects, invs and headers for every peer.
-const parkSweepInterval = 30 * time.Second
+//
+// A var rather than a const so the two tests that prove this ticker is really
+// wired up can run in milliseconds instead of half a minute. Nothing in
+// production writes it, and the only reader takes its value once, when the block
+// handler starts.
+var parkSweepInterval = 30 * time.Second
 
 // drainParkedDescendants commits everything parked behind a block that has just
 // been committed, and then everything parked behind those, and so on.
