@@ -29,6 +29,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/txscript"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
 	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/stores/blob"
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
@@ -105,6 +106,21 @@ func (tc *testContext) Setup(t *testing.T, config *testConfig) error {
 
 	subtreeStore := blob_memory.New()
 
+	// A real file-backed temp store, because the out-of-order block park needs a
+	// store whose contents a restart could enumerate — anything else and the park
+	// switches itself off.
+	tempStoreURL, err := url.Parse("file://" + t.TempDir())
+	if err != nil {
+		return errors.NewServiceError("failed to parse temp store url", err)
+	}
+
+	tSettings.Legacy.TempStore = tempStoreURL
+
+	tempStore, err := blob.NewStore(ulogger.TestLogger{}, tempStoreURL)
+	if err != nil {
+		return errors.NewServiceError("failed to create temp store", err)
+	}
+
 	subtreeValidation := &subtreevalidation.MockSubtreeValidation{}
 
 	blockvalidationClient, err := blockvalidation.NewClient(context.Background(), ulogger.TestLogger{}, tSettings, "manager_test")
@@ -119,6 +135,7 @@ func (tc *testContext) Setup(t *testing.T, config *testConfig) error {
 		validatorClient,
 		utxoStore,
 		subtreeStore,
+		tempStore,
 		subtreeValidation,
 		blockvalidationClient,
 		nil,

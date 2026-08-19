@@ -544,10 +544,18 @@ type SyncManager struct {
 	// deleted on successful (re)process. A skipped descendant records its own hash
 	// too, so the whole descendant chain is suppressed transitively.
 	recentlyFailedBlocks *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
-	syncPeerMu           sync.RWMutex // protects syncPeer and syncPeerState
-	syncPeer             *peerpkg.Peer
-	syncPeerState        *syncPeerState
-	peerStates           *txmap.SyncedMap[*peerpkg.Peer, *peerSyncState]
+	// blockPark holds blocks that arrived before their parent. Without it such a
+	// block is fully downloaded, fully decoded and then discarded, and the
+	// getblocks sent in its place is ignored for as long as headers-first mode is
+	// on — so the download is simply wasted and nothing ever asks for the block
+	// again. nil means the park is off and the old discard path runs; every entry
+	// point is nil-safe, because tests build SyncManager as a struct literal that
+	// never goes through New().
+	blockPark     *blockPark
+	syncPeerMu    sync.RWMutex // protects syncPeer and syncPeerState
+	syncPeer      *peerpkg.Peer
+	syncPeerState *syncPeerState
+	peerStates    *txmap.SyncedMap[*peerpkg.Peer, *peerSyncState]
 
 	// blockBacklog counts blocks sitting in the local processing pipeline:
 	// queued in blockHandler's blockQueue plus the one inside handleBlockMsg.
@@ -1800,6 +1808,67 @@ func (sm *SyncManager) requestMissingBlocks(peer *peerpkg.Peer, blockHash chainh
 	}
 }
 
+// advanceHeaderListFor moves the header list on for a block that has arrived.
+//
+// When in headers-first mode, if the block matches the hash of the first header
+// in the list of headers that are being fetched, it is eligible for less
+// validation since the headers have already been verified to link together and
+// are valid up to the next checkpoint. The list entry is removed for all blocks
+// except the checkpoint, which is needed to verify that the next round of
+// headers links properly.
+//
+// It returns whether this was the checkpoint block, and the header node it took
+// off the front — nil when the block was not the front, or was the checkpoint
+// and so was left in place. Both the arriving-block path and the park drain go
+// through here: a block committed off disk never passes the arrival path, so
+// without this the front would stick on a block we already have, the next block
+// would never match it, the frontier would never be republished and the
+// checkpoint transition would never fire.
+func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpointBlock bool, removedFront *headerNode) {
+	if !sm.headersFirstMode.Load() {
+		return false, nil
+	}
+
+	// Explicit Unlock, not defer: the callers run for hundreds of lines past
+	// here and make blocking client calls, so a deferred unlock would turn this
+	// into a serialisation bug.
+	sm.headerMu.Lock()
+
+	firstNodeEl := sm.headerList.Front()
+	if firstNodeEl != nil {
+		firstNode := firstNodeEl.Value.(*headerNode)
+
+		if blockHash.IsEqual(firstNode.hash) {
+			if sm.nextCheckpoint != nil && firstNode.hash.IsEqual(sm.nextCheckpoint.Hash) {
+				isCheckpointBlock = true
+			} else {
+				sm.unindexHeaderLocked(firstNodeEl, *firstNode.hash)
+				sm.headerList.Remove(firstNodeEl)
+
+				removedFront = firstNode
+			}
+
+			// The block everything else was queued behind has arrived. Tidy
+			// up after any race for it, then move the frontier on. At a
+			// checkpoint the header node stays in the list to anchor the
+			// next round of headers, but the block itself is no longer
+			// outstanding, so there is nothing to race until the next batch
+			// of getdata requests goes out.
+			sm.noteRaceWinner(blockHash)
+
+			if isCheckpointBlock {
+				sm.clearFrontier()
+			} else {
+				sm.publishFrontierLocked(time.Now())
+			}
+		}
+	}
+
+	sm.headerMu.Unlock()
+
+	return isCheckpointBlock, removedFront
+}
+
 func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	sm.logger.Debugf("[handleBlockMsg][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 	peer := bmsg.peer
@@ -1899,54 +1968,10 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// Also, remove the list entry for all blocks except the checkpoint
 	// since it is needed to verify the next round of headers links
 	// properly.
-	isCheckpointBlock := false
-
-	// The header node this block's arrival takes off the front of the list, kept
-	// so a drop further down can put it back. Nothing else remembers it: once the
-	// element is removed and unindexed, headerIndex[hash] answers nil for exactly
-	// the block a rewind most needs to reach.
-	var removedFront *headerNode
-
-	if sm.headersFirstMode.Load() {
-		sm.logger.Debugf("[handleBlockMsg][%s] headers-first mode, checking block", bmsg.blockHash)
-
-		// Explicit Unlock, not defer: handleBlockMsg runs for hundreds of lines
-		// past here and makes blocking client calls, so a deferred unlock would
-		// turn this into a serialisation bug.
-		sm.headerMu.Lock()
-
-		firstNodeEl := sm.headerList.Front()
-		if firstNodeEl != nil {
-			firstNode := firstNodeEl.Value.(*headerNode)
-
-			if bmsg.blockHash.IsEqual(firstNode.hash) {
-				if firstNode.hash.IsEqual(sm.nextCheckpoint.Hash) {
-					isCheckpointBlock = true
-				} else {
-					sm.unindexHeaderLocked(firstNodeEl, *firstNode.hash)
-					sm.headerList.Remove(firstNodeEl)
-
-					removedFront = firstNode
-				}
-
-				// The block everything else was queued behind has arrived. Tidy
-				// up after any race for it, then move the frontier on. At a
-				// checkpoint the header node stays in the list to anchor the
-				// next round of headers, but the block itself is no longer
-				// outstanding, so there is nothing to race until the next batch
-				// of getdata requests goes out.
-				sm.noteRaceWinner(bmsg.blockHash)
-
-				if isCheckpointBlock {
-					sm.clearFrontier()
-				} else {
-					sm.publishFrontierLocked(time.Now())
-				}
-			}
-		}
-
-		sm.headerMu.Unlock()
-	}
+	// isCheckpointBlock says the block just taken off the header list is the
+	// checkpoint the list was anchored on; removedFront is the header node its
+	// arrival took off the front, kept so a drop further down can put it back.
+	isCheckpointBlock, removedFront := sm.advanceHeaderListFor(bmsg.blockHash)
 
 	// This peer has answered, so it no longer owes us the block: either the
 	// chain will know about it and nobody needs to fetch it again, or the insert
@@ -2062,11 +2087,47 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// PushGetBlocksMsg filters duplicate requests and the peer only
 			// invs blocks past the locator fork point, so a redundant
 			// request costs one inv message at most.
+			// Keep the block instead of throwing it away. It is checked before
+			// anything reaches the disk, so a peer cannot fill the park with
+			// rubbish, and it is committed from disk as soon as its parent
+			// lands.
+			switch sm.blockPark.Park(sm.ctx, parkedBlock{
+				hash:      bmsg.blockHash,
+				prevBlock: prevBlockHash,
+				height:    bmsg.blockHeight,
+				peer:      bmsg.peer,
+			}, msgBlock) {
+			case parkAccepted:
+				sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
+
+				// The peer answered; the ordering is not its fault, so keep its
+				// stall timer fresh. Then keep the pipeline full: this peer's
+				// in-flight count just dropped and nothing else will notice.
+				if sps, ok := sm.syncPeerStateFor(peer); ok {
+					sps.updateLastBlockTime()
+				}
+
+				sm.fetchMoreHeaderBlocks(peer)
+
+				return nil
+
+			case parkRejected:
+				// The block failed its own stateless checks — a peer fault, and
+				// nothing was written. Treat it as any other bad block.
+				if !catchingBlocks {
+					peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &bmsg.blockHash, false)
+				}
+
+			case parkUnavailable, parkDisabled:
+				// A local fault, or no park at all. Either way the block is gone
+				// and has to be downloaded again.
+			}
+
 			sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks",
 				bmsg.blockHash, prevBlockHash)
 
 			// The block is being dropped, so put the download walk back on it.
-			// Without this the getblocks above is the only recovery there is, and
+			// Without this the getblocks below is the only recovery there is, and
 			// in headers-first mode it is inert: processInvMsg returns before it
 			// can request anything, so the block is never asked for again.
 			sm.rewindHeaderCursor(bmsg.blockHash, removedFront)
@@ -2116,6 +2177,13 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			return err
 		}
 	}
+
+	// The block is in the chain. The consumer reads this to decide whether to
+	// drain the blocks parked behind it; handleBlockMsg also returns nil from
+	// several paths that did NOT commit (a missing parent, a failed ancestor, a
+	// cancelled context), and draining after one of those would try to commit
+	// children of a block that is not in the chain.
+	bmsg.committed = true
 
 	// Block processed successfully — clear any transient-failure backoff so a
 	// future failure starts a fresh count rather than inheriting a stale one (#1187).
@@ -2232,24 +2300,49 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		return nil
 	}
 
-	// This is headers-first mode and the block is a checkpoint.  When
-	// there is a next checkpoint, get the next round of headers by asking
-	// for headers starting from the block after this one up to the next
-	// checkpoint.
+	// This is headers-first mode and the block is a checkpoint.
+	return sm.checkpointBlockCommitted(peer, bmsg.blockHash)
+}
+
+// checkpointBlockCommitted moves headers-first sync past the checkpoint the
+// header list was anchored on. When there is a next checkpoint it asks for the
+// next round of headers, from the block after this one up to that checkpoint;
+// when there is not, it leaves headers-first mode and goes back to asking for
+// blocks by inventory.
+//
+// A parked block can be the checkpoint block, so this runs from the park drain
+// too. peer is whoever the caller decided to aim it at: the delivering peer when
+// that peer is still connected, otherwise the current sync peer — because if the
+// getheaders never goes out, headers-first sync stops at this checkpoint
+// forever. A nil peer is a defined state and costs a warning, not a panic; the
+// next sync-peer check restarts sync.
+func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash chainhash.Hash) error {
 	// Advance the checkpoint under headerMu and work from the snapshot, so the
 	// getheaders send and the loadSyncPeer lookup below stay outside the lock.
 	sm.headerMu.Lock()
+
+	if sm.nextCheckpoint == nil {
+		sm.headerMu.Unlock()
+
+		return nil
+	}
+
 	prevHeight := sm.nextCheckpoint.Height
 	prevHash := sm.nextCheckpoint.Hash
 	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
 	nextCP := sm.nextCheckpoint
 	sm.headerMu.Unlock()
 
+	if peer == nil {
+		sm.logger.Warnf("[checkpointBlockCommitted][%s] checkpoint reached with no peer to ask for the next round of headers; waiting for the next sync-peer check", blockHash)
+
+		return nil
+	}
+
 	if nextCP != nil {
 		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
 
-		err = peer.PushGetHeadersMsg(locator, nextCP.Hash)
-		if err != nil {
+		if err := peer.PushGetHeadersMsg(locator, nextCP.Hash); err != nil {
 			return errors.NewServiceError("failed to send getheaders message to peer %s", peer.String(), err)
 		}
 
@@ -2265,19 +2358,56 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		return nil
 	}
 
-	// This is headers-first mode, the block is a checkpoint, and there are
-	// no more checkpoints, so switch to normal mode by requesting blocks
-	// from the block after this one up to the end of the chain (zero hash).
+	// The block is a checkpoint and there are no more checkpoints, so switch to
+	// normal mode by requesting blocks from the block after this one up to the
+	// end of the chain (zero hash).
 	sm.leaveHeadersFirstMode()
 
 	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
 
-	locator := blockchain.BlockLocator([]*chainhash.Hash{&bmsg.blockHash})
-	if err = peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
+	locator := blockchain.BlockLocator([]*chainhash.Hash{&blockHash})
+	if err := peer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
 		return errors.NewServiceError("Failed to send getblocks message to peer %s", peer.String(), err)
 	}
 
 	return nil
+}
+
+// processQueuedBlock is what the block-queue consumer does with one block:
+// commit it, and then commit everything that was parked waiting for it.
+//
+// The committed guard is load-bearing. handleBlockMsg returns nil from several
+// paths that did NOT put the block in the chain — a missing parent, a
+// short-circuited descendant of a failed block, a cancelled context. Draining
+// after one of those would try to commit the children of a block that is not in
+// the chain; every one of them would fail its own parent lookup, and each would
+// cost a wasted read, a deleted blob and a re-download.
+func (sm *SyncManager) processQueuedBlock(msg *blockQueueMsg) error {
+	err := sm.handleBlockMsg(msg)
+
+	if err == nil && msg.committed {
+		sm.drainParkedDescendants(msg.blockHash)
+	}
+
+	return err
+}
+
+// fetchMoreHeaderBlocks tops the download pipeline back up after a block from
+// this peer stopped being outstanding, whether it was committed or parked.
+// Without it a parked block is a silent loss of one in-flight slot, and the
+// pipeline drains one block at a time until nothing is outstanding at all.
+func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
+	if !sm.headersFirstMode.Load() || sm.blockSizeTracker == nil {
+		return
+	}
+
+	sm.headerMu.Lock()
+	haveMoreHeaders := sm.startHeader != nil
+	sm.headerMu.Unlock()
+
+	if haveMoreHeaders && sm.blockDownloads.CountForPeer(peer) < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
+		sm.fetchHeaderBlocks()
+	}
 }
 
 // rewindHeaderCursor puts the download walk back on a block that has just been
@@ -3072,6 +3202,11 @@ type blockQueueMsg struct {
 	blockHeight int32
 	peer        *peerpkg.Peer
 	reply       chan error
+	// committed says handleBlockMsg actually put this block in the chain, as
+	// opposed to the several paths on which it returns nil having done no such
+	// thing. Only the consumer reads it, and only to decide whether to drain the
+	// blocks parked behind this one.
+	committed bool
 }
 
 // blockHandler is the main handler for the sync manager.  It must be run as a
@@ -3121,6 +3256,12 @@ func (sm *SyncManager) blockHandler() {
 
 	// start the block queue handler
 	go func() {
+		// The park sweep runs on THIS goroutine, not the outer handler below,
+		// because committing a block is minutes of work and the outer handler
+		// dispatches disconnects, invs, headers and tx for every peer.
+		parkSweep := time.NewTicker(parkSweepInterval)
+		defer parkSweep.Stop()
+
 		for {
 			select {
 			case <-sm.quit:
@@ -3152,10 +3293,13 @@ func (sm *SyncManager) blockHandler() {
 						return
 					}
 				}
+			case <-parkSweep.C:
+				sm.sweepParkedBlocks(time.Now())
+
 			case msg := <-blockQueue:
 				sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
 
-				err := sm.handleBlockMsg(msg)
+				err := sm.processQueuedBlock(msg)
 
 				// A completion advances the backlog: stamp it so the stall check
 				// treats the pipeline as live for another window (see
@@ -3694,6 +3838,11 @@ func (sm *SyncManager) Start() {
 
 	sm.logger.Infof("Starting sync manager")
 
+	// Adopt whatever a previous run left parked, before anything can drain it.
+	// No RPCs are made here; the parents are reconciled with the chain by the
+	// park sweep once the block-queue consumer is running.
+	sm.blockPark.Recover(sm.ctx)
+
 	go sm.blockHandler()
 }
 
@@ -3821,7 +3970,7 @@ func (sm *SyncManager) Pause() chan<- struct{} {
 // New constructs a new SyncManager. Use Start to begin processing asynchronous
 // block, tx, and inv updates.
 func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient teranodeblockchain.ClientI,
-	validationClient validator.Interface, utxoStore utxostore.Store, subtreeStore blob.Store,
+	validationClient validator.Interface, utxoStore utxostore.Store, subtreeStore blob.Store, tempStore blob.Store,
 	subtreeValidation subtreevalidation.Interface, blockValidation blockvalidation.Interface,
 	blockAssembly blockassembly.ClientI, config *Config) (*SyncManager, error) {
 	initPrometheusMetrics()
@@ -3859,6 +4008,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		blockValidation:   blockValidation,
 		blockAssembly:     blockAssembly,
 	}
+
+	// Where a block whose parent is not stored yet waits instead of being thrown
+	// away. nil when the park is switched off or the temp store is one whose
+	// contents a restart could not enumerate; every call site reads nil as
+	// "discard the block", which is what the node did before the park existed.
+	sm.blockPark = newBlockPark(logger, tSettings, tempStore)
 
 	// Bounded async block prefetch: with a positive budget OnBlock admits a
 	// block against this global byte-weighted semaphore and returns, so the

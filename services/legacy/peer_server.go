@@ -3912,13 +3912,13 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		utxoStore:            utxoStore,
 		subtreeStore:         subtreeStore,
 		tempStore:            tempStore,
-		subtreeValidation: subtreeValidation,
-		blockValidation:   blockValidation,
-		blockAssembly:     blockAssembly,
-		assetHTTPAddress:  assetHTTPAddress,
-		banList:           banList,
-		banChan:           banChan,
-		associationMgr:    peer.NewAssociationManager(),
+		subtreeValidation:    subtreeValidation,
+		blockValidation:      blockValidation,
+		blockAssembly:        blockAssembly,
+		assetHTTPAddress:     assetHTTPAddress,
+		banList:              banList,
+		banChan:              banChan,
+		associationMgr:       peer.NewAssociationManager(),
 	}
 
 	s.syncManager, err = netsync.New(
@@ -3929,6 +3929,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 		validationClient,
 		utxoStore,
 		subtreeStore,
+		tempStore,
 		subtreeValidation,
 		blockValidation,
 		blockAssembly,
