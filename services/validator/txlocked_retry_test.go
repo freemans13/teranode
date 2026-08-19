@@ -22,17 +22,18 @@ import (
 // treatment in ValidateWithOptions, and which break out on the first attempt.
 //
 // NOTE: this uses a fully mocked utxo.Store (utxo.MockUtxostore) rather than
-// the sqlitememory SQL store the rest of this package's validator tests use.
-// The sqlitememory store can genuinely produce ErrTxLocked (via the parent's
-// `locked` column, see TestValidator_LockedFlagNotChangedIfBlockAssemblyDidNotStoreTx
-// in Validator_test.go), but it cannot produce ErrTxCreating: that error only comes from Aerospike's
-// LuaErrorCodeCreating path (stores/utxo/aerospike/spend.go) for a large,
-// multi-record parent still being written, which the SQL store has no
-// equivalent state for. Rather than fake that condition through a store that
-// cannot express it, this test drives the retry predicate directly by
-// injecting each error type at the point where the validator's own spend
-// call returns it, which is what the "retry on locked/creating" logic
-// actually branches on.
+// the sqlitememory SQL store that Validator_test.go's validator tests use. The
+// sqlitememory store can genuinely produce ErrTxLocked, via the parent's
+// `locked` column -- see
+// TestValidator_LockedFlagNotChangedIfBlockAssemblyDidNotStoreTx in
+// Validator_test.go -- but it cannot produce ErrTxCreating: that error only
+// comes from Aerospike's LuaErrorCodeCreating path
+// (stores/utxo/aerospike/spend.go) for a large, multi-record parent still being
+// written, which the SQL store has no equivalent state for. Rather than fake
+// that condition through a store that cannot express it, this test drives the
+// retry predicate directly by injecting each error type at the point where the
+// validator's own spend call returns it, which is what the "retry on
+// locked/creating" logic actually branches on.
 func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
 	// MANDATORY here, for the same reason as in
 	// TestValidator_TwoPhaseCommitCompletesAfterTxMetaSerializationFailure
@@ -45,10 +46,24 @@ func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
 
 	tracing.SetupMockTracer()
 
+	// The verdict Aerospike really produces for a still-creating parent. When the
+	// Lua layer reports CREATING as a top-level response, handleErrorSpends sets
+	// one general error across every spend in the parent's record group
+	// (aerospike/spend.go:1001), and Spend then returns them nested inside a
+	// top-level utxo error (aerospike/spend.go:525).
+	aerospikeCreatingErr := errors.NewTxCreatingError("parent still being written (multi-record create)")
+
 	tests := []struct {
-		name        string
-		returnErr   error
-		wantRetried bool
+		name      string
+		returnErr error
+		// returnSpends is the []*utxo.Spend returned alongside returnErr. Only
+		// the Aerospike-shaped case needs it; nil elsewhere.
+		returnSpends []*utxo.Spend
+		// wantSentinel is the error the retry predicate must still find after
+		// validateInternal has finished rewriting the wrap chain. Defaults to
+		// returnErr when nil.
+		wantSentinel error
+		wantRetried  bool
 	}{
 		{
 			name:        "TX_LOCKED is retried to the configured budget",
@@ -59,6 +74,33 @@ func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
 			name:        "TX_CREATING is retried to the configured budget",
 			returnErr:   errors.NewTxCreatingError("parent still being written (multi-record create)"),
 			wantRetried: true,
+		},
+		{
+			// The cases above hand the sentinel back as the top-level error,
+			// which is not the shape production takes: the store returns an
+			// ErrUtxoError with the per-input verdicts nested underneath. That
+			// difference matters because being an ErrUtxoError sends
+			// validateInternal down the branch at Validator.go:863, which the
+			// other cases never enter -- it walks spentUtxos, can divert to the
+			// conflicting-create path, and calls SetWrappedErr. So this case
+			// pins that the retry still fires when the sentinel is nested rather
+			// than top-level, and that the branch leaves it reachable.
+			//
+			// SetWrappedErr appends to the end of the chain rather than
+			// replacing it, so it cannot lose a sentinel that arrived via the
+			// constructor -- verified, not assumed. The exposure that remains is
+			// the JoinCapped(maxAggregatedSpendErrs) cap inside the store: with
+			// more than ten failing inputs, a verdict sorting past the tenth is
+			// dropped before the validator ever sees it. That cap is
+			// pre-existing and shared with ErrTxLocked.
+			name:      "TX_CREATING is retried when nested in the ErrUtxoError the store returns",
+			returnErr: errors.NewUtxoError("failed to spend utxos", aerospikeCreatingErr),
+			returnSpends: []*utxo.Spend{
+				{Err: aerospikeCreatingErr},
+				{Err: aerospikeCreatingErr},
+			},
+			wantSentinel: aerospikeCreatingErr,
+			wantRetried:  true,
 		},
 		{
 			name:        "TX_CONFLICTING breaks out on the first attempt",
@@ -87,7 +129,7 @@ func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
 			mockStore.On("Get", mock.Anything, mock.Anything, mock.Anything).
 				Return(&meta.Data{BlockHeights: []uint32{100}}, nil)
 			mockStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-				Return(nil, nil, tc.returnErr)
+				Return(nil, tc.returnSpends, tc.returnErr)
 
 			tSettings := test.CreateBaseTestSettings(t)
 			// Keep the budget small so the backoff (10ms, 20ms, ...) stays cheap
@@ -110,7 +152,13 @@ func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
 			elapsed := time.Since(start)
 
 			require.Error(t, err)
-			require.True(t, errors.Is(err, tc.returnErr), "expected the original error to be reachable via errors.Is through the wrap chain, got: %v", err)
+
+			wantSentinel := tc.wantSentinel
+			if wantSentinel == nil {
+				wantSentinel = tc.returnErr
+			}
+
+			require.True(t, errors.Is(err, wantSentinel), "expected the sentinel to be reachable via errors.Is through the wrap chain, got: %v", err)
 
 			wantCalls := 1
 			if tc.wantRetried {
