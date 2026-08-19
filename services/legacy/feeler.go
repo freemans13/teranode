@@ -33,10 +33,11 @@ const defaultFeelerInterval = 120 * time.Second
 //
 //   - A configured budget of zero or less. This is the single rollback lever.
 //   - Connect-only mode. There the node's entire connectivity is the configured
-//     list, MaxPeers has already been set to the length of that list, and the
-//     address source the probe draws from is not installed at all — so a probe
-//     could never run, and reserving a slot would strand a configured peer for
-//     nothing.
+//     list, and MaxPeers has already been resized to the length of that list, so
+//     every slot is spoken for. The node also stops discovering peers for
+//     itself — newAddressFunc is not installed — so there is nothing for a
+//     verified address to feed. Reserving a slot would strand a configured peer
+//     for nothing.
 //   - A budget that would leave no room for an ordinary peer. Reserving the
 //     node's whole capacity for probing is never what an operator meant.
 func feelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPeers, targetOutbound int) int {
@@ -101,7 +102,7 @@ func (s *server) feelerAllowed() bool {
 
 // feelerPollInterval is how often the feeler loop wakes to ask whether it is
 // time to probe. svnode's connection thread reaches the same decision on a
-// 500ms sleep (net.cpp:1932); a second is the same idea, one wakeup cheaper.
+// 500ms sleep (net.cpp:1802); a second is the same idea, one wakeup cheaper.
 const feelerPollInterval = time.Second
 
 // feelerCandidateTries bounds one selection pass. It matches newAddressFunc, so
@@ -177,12 +178,14 @@ func (s *server) startFeeler() {
 //
 //   - Below target, the deadline is NOT re-rolled. A node that has been waiting
 //     while short of peers fires as soon as the tier refills, rather than
-//     starting its wait over. This is svnode's continue at net.cpp:1870.
+//     starting its wait over. svnode gets the same effect by skipping the
+//     whole feeler block while below target, so nNextFeeler is left alone
+//     (net.cpp:1865).
 //   - The deadline is re-rolled at the decision, not after the probe. A slow
 //     probe does not shorten the following gap, and a long stretch below target
 //     does not bank up a burst of probes (net.cpp:1869).
 //   - There is no pre-dial sleep. svnode adds a random 0-1s before a feeler
-//     dial (net.cpp:1931) purely to break up the half-second granularity of its
+//     dial (net.cpp:1934) purely to break up the half-second granularity of its
 //     own connect loop. Our deadline is an absolute time drawn at nanosecond
 //     granularity, so the jitter is already there.
 //
@@ -428,7 +431,7 @@ func (s *server) feelerPeerConfig(res *feelerResult) *peer.Config {
 //     pass. svnode breaks out on the first unlucky draw (net.cpp:1882), which
 //     throws away a two-minute slot; newAddressFunc continues, and agreeing with
 //     the sibling function in this file matters more than copying the quirk.
-//   - No service-flag filter. svnode has one (net.cpp:1898); teranode's dial
+//   - No service-flag filter. svnode has one (net.cpp:1902); teranode's dial
 //     path does not, and a probe that is stricter than the thing it feeds would
 //     verify addresses the node then declines to use.
 func (s *server) feelerCandidate() *wire.NetAddress {
@@ -447,7 +450,7 @@ func (s *server) feelerCandidate() *wire.NetAddress {
 		na := ka.NetAddress()
 
 		// Filtered at selection rather than at dial time, unlike svnode, which
-		// only notices a ban inside OpenNetworkConnection (net.cpp:2115) and so
+		// only notices a ban inside OpenNetworkConnection (net.cpp:2113) and so
 		// burns the whole slot on it.
 		if s.banList.IsBanned(addrmgr.NetAddressKey(na)) {
 			continue

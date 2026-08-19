@@ -27,11 +27,10 @@ import (
 // Each of them matters for a different reason. A configured zero is the single
 // rollback lever, and it has to switch off the reservation as well as the
 // probing, or an operator who disabled feelers would still be paying an inbound
-// slot for them. Connect-only mode cannot run a probe at all — the address
-// source is not installed and MaxPeers has been resized to the configured list
-// — so reserving there would strand a peer the operator explicitly asked for.
-// And a budget that consumes the node's whole capacity is never what anyone
-// meant.
+// slot for them. Connect-only mode has MaxPeers resized to the configured list
+// and never dials anything else, so a verified address has nothing to feed and
+// reserving there would strand a peer the operator explicitly asked for. And a
+// budget that consumes the node's whole capacity is never what anyone meant.
 func TestFeelerBudget(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -899,9 +898,12 @@ func startFeelerTestListener(t *testing.T, userAgent string) (net.Listener, <-ch
 // the accounting PR 1601 fixed is wrong again by a different route.
 //
 // The token channel is that cap. This drains it and shows a probe cannot start,
-// then returns a token and shows one can. Deleting the acquisition in
-// feelerHandler leaves every other test in the package passing, which is why
-// this exists.
+// then returns a token and shows one can.
+//
+// Note what this does NOT cover: it exercises the channel directly, not
+// feelerHandler, so deleting feelerHandler's acquisition and letting every tick
+// start a probe would leave this test green. The enforcement site itself is
+// still unpinned.
 func TestFeelerTokensCapProbesInFlight(t *testing.T) {
 	srv := &server{
 		logger:       ulogger.TestLogger{},
