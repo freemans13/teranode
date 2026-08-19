@@ -4133,13 +4133,6 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 
 	targetOutbound := automaticOutboundTarget(cfg.TargetOutboundPeers, cfg.MaxPeers)
 
-	// Computed here, after the connect-peers block above has had its say on
-	// cfg.MaxPeers, and deliberately alongside the outbound target so the two
-	// halves of the peer budget are set in one place. Note that the target is
-	// NOT reduced: the reservation comes out of the joint inbound/automatic
-	// ceiling, exactly as svnode takes its feeler budget out of nMaxInbound.
-	s.feelerSlots = feelerBudget(logger, tSettings.Legacy.MaxFeelerPeers, len(cfg.ConnectPeers) > 0, cfg.MaxPeers, int(targetOutbound))
-
 	cmgr, err := connmgr.New(logger, &connmgr.Config{
 		Listeners:      listeners,
 		OnAccept:       s.inboundPeerConnected,
@@ -4173,6 +4166,14 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	}
 
 	s.connManager = cmgr
+
+	// Set after the manager exists, because the reservation has to be judged
+	// against the target the manager will really chase rather than the one
+	// computed above — connmgr.New substitutes its own default for a configured
+	// zero. Note that the target itself is NOT reduced: the reservation comes
+	// out of the joint inbound/automatic ceiling, exactly as svnode takes its
+	// feeler budget out of nMaxInbound.
+	s.setFeelerBudget(logger, tSettings.Legacy.MaxFeelerPeers, len(cfg.ConnectPeers) > 0, cfg.MaxPeers)
 
 	// Start up persistent peers.
 	for _, addr := range permanentPeers {

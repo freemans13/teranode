@@ -64,6 +64,31 @@ func feelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPe
 	return configured
 }
 
+// setFeelerBudget fixes the slot reservation, judging it against the outbound
+// target the connection manager will actually chase.
+//
+// The target is read off the manager rather than recomputed from configuration,
+// for exactly the reason its own accessor gives: connmgr.New substitutes its
+// default for a configured zero, so the number the node ends up chasing can be
+// higher than the one its caller computed. Judging the reservation against the
+// caller's number defeated the guard below in the one case it was written for —
+// with a target read as zero, no reservation could ever look like it starved
+// the tier, so the node reserved a slot, dropped its admission ceiling below
+// the target the manager was really aiming for, and dialled for a peer its own
+// door then refused, indefinitely.
+//
+// Must be called after connmgr.New has returned, and before peerHandler starts:
+// handleAddPeerMsg and handleQuery are the only readers of feelerSlots, and
+// neither runs until then.
+func (s *server) setFeelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPeers int) {
+	if s.connManager == nil {
+		s.feelerSlots = 0
+		return
+	}
+
+	s.feelerSlots = feelerBudget(logger, configured, connectOnly, maxPeers, int(s.connManager.TargetOutbound()))
+}
+
 // peerAdmissionCeiling is how many inbound and automatic outbound peers the
 // node will admit: MaxPeers less the slots held back for feeler probes.
 //

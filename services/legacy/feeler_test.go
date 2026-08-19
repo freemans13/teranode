@@ -944,3 +944,88 @@ func TestFeelerTokensCapProbesInFlight(t *testing.T) {
 		require.Fail(t, "a returned token must let the next probe start")
 	}
 }
+
+// TestSetFeelerBudgetUsesTheManagersEffectiveTarget pins a guard that used to
+// judge itself against the wrong number.
+//
+// feelerBudget refuses a reservation that would leave the automatic outbound
+// tier unable to reach its target. It used to be handed the target computed
+// from configuration, before connmgr.New had a say -- and New substitutes its
+// own default of eight for a configured zero. The guard therefore compared
+// against zero in exactly the case it was written for: no reservation can look
+// like it starves a tier that is aiming for nothing. With MaxPeers at eight the
+// node reserved a slot anyway, dropped its admission ceiling to seven, and was
+// left dialling for an eighth peer its own door would refuse, indefinitely.
+//
+// Reading the target off the manager is what its own accessor documentation
+// asks callers to do, and what feelerAllowed already did.
+func TestSetFeelerBudgetUsesTheManagersEffectiveTarget(t *testing.T) {
+	cmgr, err := connmgr.New(ulogger.TestLogger{}, &connmgr.Config{
+		Dial: func(net.Addr) (net.Conn, error) { return nil, errNoTestDial },
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint32(8), cmgr.TargetOutbound(),
+		"New substitutes its default for an unset target, which is the whole trap")
+
+	srv := &server{logger: ulogger.TestLogger{}, connManager: cmgr}
+
+	srv.setFeelerBudget(ulogger.TestLogger{}, 1, false, 8)
+	require.Equal(t, 0, srv.feelerSlots,
+		"reserving one of eight leaves seven, below the eight the manager will chase")
+
+	srv.setFeelerBudget(ulogger.TestLogger{}, 1, false, 1)
+	require.Equal(t, 0, srv.feelerSlots,
+		"a reservation that consumes the node's whole capacity is refused")
+
+	srv.setFeelerBudget(ulogger.TestLogger{}, 1, false, 125)
+	require.Equal(t, 1, srv.feelerSlots,
+		"the shipped defaults leave the outbound tier untouched, so the slot is granted")
+}
+
+// TestFeelerHandlerWaitsForASlotToken pins the enforcement site itself.
+//
+// The reservation is only worth anything if the loop actually respects it. The
+// earlier test for this drove a channel it built by hand rather than the loop,
+// so deleting the acquisition in feelerHandler and letting every tick start a
+// probe left the whole package green -- the cap was the one part of "paid for
+// rather than borrowed" that nothing checked.
+//
+// This starts the real loop with its only slot already spoken for and shows no
+// probe runs, then returns the token and shows one does. The second half is
+// what makes the first half mean anything: without it, a loop that had simply
+// died would pass.
+func TestFeelerHandlerWaitsForASlotToken(t *testing.T) {
+	swapTestConfig(t, "")
+
+	cfg.dial = func(string, string, time.Duration) (net.Conn, error) {
+		return nil, errDeadHost
+	}
+
+	srv := newFeelerTestServer(t)
+	serveFeelerSnapshot(srv, feelerSnapshot{})
+	atLeastTwoAutomaticPeers(t, srv)
+
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+	srv.addrManager.AddAddress(na, testSourceAddr())
+
+	// Built here rather than by startFeeler, and left empty. Filling it and
+	// then draining it would leave a window in which the loop could take the
+	// token before the test removed it.
+	srv.feelerTokens = make(chan struct{}, 1)
+
+	srv.wg.Add(1)
+
+	go srv.feelerHandler()
+
+	require.Never(t, func() bool {
+		return srv.feelerAttempted.Load() > 0
+	}, 3*time.Second, 25*time.Millisecond,
+		"with its only slot taken the loop must skip its turn rather than probe anyway")
+
+	srv.feelerTokens <- struct{}{}
+
+	require.Eventually(t, func() bool {
+		return srv.feelerAttempted.Load() > 0
+	}, 20*time.Second, 25*time.Millisecond,
+		"a returned token must let the loop probe, or the silence above proved nothing")
+}
