@@ -181,20 +181,7 @@ func (u *Server) catchupGetBlockHeaders(ctx context.Context, blockUpTo *model.Bl
 		maxRetries = 3
 	}
 
-	// Get the peer's actual chain tip from P2P registry
-	// This is the peer's BestBlockHash from their node_status messages,
-	// not just a block they announced (which could be invalid or relayed)
-	chainTipHash := blockUpTo.Hash() // Default to announced block
-	if peerID != "" {
-		peerChainTip, err := u.getPeerChainTip(ctx, peerID)
-		if err != nil {
-			// Log but don't fail - fall back to using blockUpTo
-			u.logger.Warnf("[catchup][%s] Could not get peer chain tip from P2P registry for peer %s: %v, falling back to announced block", blockUpTo.Hash().String(), peerID, err)
-		} else if peerChainTip != nil {
-			u.logger.Infof("[catchup][%s] Using peer %s's actual chain tip %s instead of announced block %s", blockUpTo.Hash().String(), peerID, peerChainTip.String(), blockUpTo.Hash().String())
-			chainTipHash = peerChainTip
-		}
-	}
+	chainTipHash := u.catchupTargetHash(ctx, blockUpTo, peerID)
 
 	// Collect all headers through iteration
 	allCatchupHeaders := make([]*model.BlockHeader, 0, maxBlockHeadersPerRequest)
@@ -533,4 +520,57 @@ func (u *Server) getPeerChainTip(ctx context.Context, peerID string) (*chainhash
 	chainTipHash := peerInfo.BlockHash
 
 	return chainTipHash, nil
+}
+
+// catchupTargetHash picks the block to request headers up to.
+//
+// The default is the block the peer announced. The P2P registry's BestBlockHash is preferred
+// where it is genuinely more advanced, because it lets one catchup fetch the peer's whole chain
+// rather than stopping at a block that may itself be relayed or stale.
+//
+// The registry entry is only refreshed from the peer's node_status every 10 seconds and nothing
+// upstream discards a stale one — sanitizeAdvertisedTip caps tips that are too high but passes
+// anything too low straight through — so it can name a block well behind the one the peer just
+// announced. That matters because the served header stream ends at whatever we ask for: a stale
+// tip truncates it below our own tip, every header in it is one we already hold, and the
+// common-ancestor walk takes its ancestor at the end of a list in which nothing diverged. The
+// resulting fork depth describes no fork, and validateForkDepth records a coinbase-maturity
+// violation against a peer sitting on our own chain.
+//
+// Already holding the block is exactly the tell that the entry is stale: it can teach us nothing
+// we do not have. blockUpTo cannot be stale in the same way — catchupGetBlockHeaders returns
+// early if it already exists, so by this point it is a block we lack.
+//
+// Returns the announced block's hash on any doubt: a registry lookup failure, an existence check
+// we could not complete, or an entry naming a block we hold.
+func (u *Server) catchupTargetHash(ctx context.Context, blockUpTo *model.Block, peerID string) *chainhash.Hash {
+	announced := blockUpTo.Hash()
+
+	if peerID == "" {
+		return announced
+	}
+
+	peerChainTip, err := u.getPeerChainTip(ctx, peerID)
+	if err != nil {
+		u.logger.Warnf("[catchup][%s] Could not get peer chain tip from P2P registry for peer %s: %v, falling back to announced block", announced.String(), peerID, err)
+		return announced
+	}
+
+	if peerChainTip == nil {
+		return announced
+	}
+
+	alreadyHave, existsErr := u.blockchainClient.GetBlockExists(ctx, peerChainTip)
+
+	switch {
+	case existsErr != nil:
+		u.logger.Warnf("[catchup][%s] could not check whether peer %s's registry tip %s is already held: %v, falling back to announced block", announced.String(), peerID, peerChainTip.String(), existsErr)
+		return announced
+	case alreadyHave:
+		u.logger.Infof("[catchup][%s] ignoring peer %s's registry tip %s: we already hold it, so the entry is stale - using announced block", announced.String(), peerID, peerChainTip.String())
+		return announced
+	default:
+		u.logger.Infof("[catchup][%s] Using peer %s's actual chain tip %s instead of announced block %s", announced.String(), peerID, peerChainTip.String(), announced.String())
+		return peerChainTip
+	}
 }

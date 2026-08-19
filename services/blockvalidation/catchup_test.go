@@ -1301,8 +1301,47 @@ func TestCheckSecretMiningWorkGating(t *testing.T) {
 
 		require.Error(t, err)
 		require.True(t, errors.Is(err, errors.ErrServiceError), "a local fault must not be charged to the peer as a processing error")
+		// Name the guard that must have produced this. Without it a zero-value tip falls through
+		// to the ancestor-height check below, which returns a service error too, mentions no
+		// secret mining too, and flags nobody either — so every other assertion here is satisfied
+		// by the wrong branch and the guard could be deleted with this subtest still green.
+		require.Contains(t, err.Error(), "no best block header available")
 		require.NotContains(t, err.Error(), "secretly mined chain")
 		require.False(t, rec.maliciousCalled(), "an internal lookup failure must not penalise the peer")
+	})
+
+	// The depth trigger is a boundary, and the height feeding it is what this change rewired, so
+	// pin both sides of it. Neither case is exercised by the fixtures above, which all sit 180
+	// blocks behind a threshold of 100 and so cannot tell <= from < or catch an off-by-one in the
+	// subtraction.
+	t.Run("depth exactly at the secret-mining threshold returns early", func(t *testing.T) {
+		rec := &recordingP2PClient{}
+
+		srv, ancestorHash, ancestorMeta, bestMeta := newServer(t, big.NewInt(1_000_000), rec)
+		threshold := srv.settings.BlockValidation.SecretMiningThreshold
+		// blocksBehind == threshold exactly: shallow enough to return before any work comparison.
+		bestMeta.Height = ancestorMeta.Height + threshold
+
+		err := srv.checkSecretMiningFromCommonAncestor(context.Background(), blockUpTo, "peer-at", "http://at", ancestorHash, ancestorMeta, bestMeta, nil)
+
+		require.NoError(t, err, "a fork exactly at the threshold is not deep, so it must not be weighed")
+		require.False(t, rec.maliciousCalled())
+	})
+
+	t.Run("depth one past the secret-mining threshold is weighed", func(t *testing.T) {
+		rec := &recordingP2PClient{}
+
+		srv, ancestorHash, ancestorMeta, bestMeta := newServer(t, big.NewInt(1_000_000), rec)
+		threshold := srv.settings.BlockValidation.SecretMiningThreshold
+		// One deeper: now deep, and with no offered headers it must abort unweighable rather
+		// than return nil. That error is the proof the early return was not taken.
+		bestMeta.Height = ancestorMeta.Height + threshold + 1
+
+		err := srv.checkSecretMiningFromCommonAncestor(context.Background(), blockUpTo, "peer-past", "http://past", ancestorHash, ancestorMeta, bestMeta, nil)
+
+		require.Error(t, err, "one block past the threshold is deep and must reach the work gate")
+		require.Contains(t, err.Error(), "no offered headers")
+		require.False(t, rec.maliciousCalled())
 	})
 }
 
@@ -4093,16 +4132,23 @@ func TestFindCommonAncestor_IgnoresStoredBlocksAboveOurTip(t *testing.T) {
 	)
 
 	blocks := testhelpers.CreateTestBlockChain(t, 5)
-	peerHeaders := []*model.BlockHeader{blocks[0].Header, blocks[1].Header}
+	peerHeaders := []*model.BlockHeader{blocks[0].Header, blocks[1].Header, blocks[2].Header}
 
 	// First header is a genuine ancestor on our chain.
 	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[0].Hash()).Return(
 		peerHeaders[0], &model.BlockHeaderMeta{Height: 90}, nil,
 	)
-	// Second is held in our store but sits above our tip — a side-chain block we did not
-	// adopt. It must not be chosen as the ancestor.
+	// Second sits at exactly our tip. The ceiling is "above the tip", not "at or above it", so
+	// this one must still be taken — it is our own tip, the most recent block the two chains can
+	// possibly share. Without a header at exactly this height the ceiling's comparison could be
+	// loosened from > to >= and nothing in this file would notice.
 	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[1].Hash()).Return(
-		peerHeaders[1], &model.BlockHeaderMeta{Height: 120}, nil,
+		peerHeaders[1], &model.BlockHeaderMeta{Height: 100}, nil,
+	)
+	// Third is held in our store but sits above our tip — a side-chain block we did not
+	// adopt. It must not be chosen as the ancestor.
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[2].Hash()).Return(
+		peerHeaders[2], &model.BlockHeaderMeta{Height: 120}, nil,
 	)
 
 	catchupCtx := &CatchupContext{
@@ -4113,7 +4159,8 @@ func TestFindCommonAncestor_IgnoresStoredBlocksAboveOurTip(t *testing.T) {
 	}
 
 	require.NoError(t, server.findCommonAncestor(context.Background(), catchupCtx))
-	assert.Equal(t, uint32(90), catchupCtx.commonAncestorMeta.Height, "must stop at the last block at or below our tip")
+	assert.Equal(t, uint32(100), catchupCtx.commonAncestorMeta.Height, "must take the block at exactly our tip and stop at the one above it")
+	assert.Equal(t, uint32(0), catchupCtx.forkDepth, "an ancestor at our own tip is no fork at all")
 	assert.LessOrEqual(t, catchupCtx.commonAncestorMeta.Height, catchupCtx.currentHeight,
 		"the ancestor must never exceed the tip we measure divergence from")
 }
@@ -4249,7 +4296,12 @@ func TestFindCommonAncestor_AcceptsHeadersAtOrBelowCurrentHeight(t *testing.T) {
 // reads the tip could move between them, so a local reorg that lowered it would trip that
 // assertion and abort a sound catchup for a reason that has nothing to do with the peer.
 // One read, stashed on the context and handed on, removes the window entirely.
-func TestCatchupReadsChainTipOnce(t *testing.T) {
+// TestAncestorSearchAndSecretMiningShareOneTipRead pins the arrangement rather than the
+// mechanism: the ancestor search, the depth baseline and the work gate must all measure against
+// one tip. (Only these two steps — catchupGetBlockHeaders reads the tip earlier in the same
+// catchup, but only to seed the locator, so the name is deliberately narrower than "catchup".)
+// TestSecretMiningSurvivesATipThatMovesDown is the outcome half of the same contract.
+func TestAncestorSearchAndSecretMiningShareOneTipRead(t *testing.T) {
 	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
 
@@ -4284,6 +4336,53 @@ func TestCatchupReadsChainTipOnce(t *testing.T) {
 	require.NoError(t, server.checkSecretMining(context.Background(), catchupCtx))
 
 	mockBlockchainClient.AssertNumberOfCalls(t, "GetBestBlockHeader", 1)
+}
+
+// TestSecretMiningSurvivesATipThatMovesDown is why the single read matters, stated as an
+// outcome rather than a call count. Every other fixture in this file mocks a tip that never
+// changes, so a second read is behaviourally invisible to them and only the count above would
+// notice one returning. Here the tip decreases between the two reads a local reorg would
+// produce: with one read the catchup completes, and with two the ancestor chosen against the
+// old tip exceeds the new one, tripping the ancestor-height check and discarding a sound
+// catchup over our own reorg.
+func TestSecretMiningSurvivesATipThatMovesDown(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	// A local reorg lands between the two reads the old arrangement made: 100, then 95.
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
+		&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 100, ChainWork: big.NewInt(1_000).Bytes()}, nil,
+	).Once()
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
+		&model.BlockHeader{}, &model.BlockHeaderMeta{Height: 95, ChainWork: big.NewInt(950).Bytes()}, nil,
+	).Once()
+
+	blocks := testhelpers.CreateTestBlockChain(t, 5)
+	peerHeaders := []*model.BlockHeader{blocks[0].Header, blocks[1].Header}
+
+	// The ancestor sits at 99: at or below the first tip, above the second.
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[0].Hash()).Return(
+		peerHeaders[0], &model.BlockHeaderMeta{Height: 99, ChainWork: big.NewInt(900).Bytes()}, nil,
+	)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, peerHeaders[1].Hash()).Return(
+		(*model.BlockHeader)(nil), (*model.BlockHeaderMeta)(nil),
+		errors.NewBlockNotFoundError("block not found"),
+	)
+
+	catchupCtx := &CatchupContext{
+		peerID:    "peer-1",
+		blockUpTo: blocks[4],
+		headersFetchResult: &catchup.Result{
+			Headers: peerHeaders,
+		},
+	}
+
+	require.NoError(t, server.findCommonAncestor(context.Background(), catchupCtx))
+	require.Equal(t, uint32(99), catchupCtx.commonAncestorMeta.Height)
+
+	// Re-reading here would see 95, find the ancestor at 99 above it, and abort.
+	require.NoError(t, server.checkSecretMining(context.Background(), catchupCtx),
+		"a tip that moved down after the ancestor was chosen must not discard the catchup")
 }
 
 type validatedProgressReport struct {
@@ -4806,4 +4905,85 @@ func filterMockCalls(calls []*mock.Call, method string) []*mock.Call {
 		}
 	}
 	return filtered
+}
+
+// staticTipP2PClient serves one fixed registry entry, standing in for the peer's node_status.
+type staticTipP2PClient struct {
+	P2PClientI
+
+	tip *chainhash.Hash
+	err error
+}
+
+func (s *staticTipP2PClient) GetPeer(_ context.Context, _ string) (*p2p.PeerInfo, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	return &p2p.PeerInfo{BlockHash: s.tip}, nil
+}
+
+// TestCatchupTargetHash_IgnoresARegistryTipWeAlreadyHold pins the guard on the header-fetch
+// target. The P2P registry is refreshed from a peer's node_status only every ten seconds and
+// nothing upstream rejects a stale entry, so it can name a block behind the one the peer just
+// announced. Asking a peer for headers up to a block we already hold truncates the served stream
+// below our own tip, and the common-ancestor walk then takes its ancestor at the end of a list in
+// which nothing diverged — a fork depth describing no fork, which validateForkDepth turns into a
+// coinbase-maturity violation against a peer sitting on our own chain. Holding the block is the
+// tell, so on that signal the announced block is the target instead.
+func TestCatchupTargetHash_IgnoresARegistryTipWeAlreadyHold(t *testing.T) {
+	blocks := testhelpers.CreateTestBlockChain(t, 3)
+	announced := blocks[2]
+	staleTip := blocks[0].Header.Hash()
+	freshTip := blocks[1].Header.Hash()
+
+	t.Run("a registry tip we already hold is ignored", func(t *testing.T) {
+		server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+		defer cleanup()
+
+		server.p2pClient = &staticTipP2PClient{tip: staleTip}
+		mockBlockchainClient.On("GetBlockExists", mock.Anything, staleTip).Return(true, nil)
+
+		require.Equal(t, announced.Hash(), server.catchupTargetHash(context.Background(), announced, "peer-1"),
+			"a tip we already hold teaches us nothing and must not truncate the header stream")
+	})
+
+	t.Run("a registry tip we do not hold is followed", func(t *testing.T) {
+		server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+		defer cleanup()
+
+		server.p2pClient = &staticTipP2PClient{tip: freshTip}
+		mockBlockchainClient.On("GetBlockExists", mock.Anything, freshTip).Return(false, nil)
+
+		require.Equal(t, freshTip, server.catchupTargetHash(context.Background(), announced, "peer-1"),
+			"a genuinely more advanced tip is still preferred - that is what the registry is for")
+	})
+
+	t.Run("an existence check we cannot complete falls back to the announced block", func(t *testing.T) {
+		server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+		defer cleanup()
+
+		server.p2pClient = &staticTipP2PClient{tip: freshTip}
+		mockBlockchainClient.On("GetBlockExists", mock.Anything, freshTip).
+			Return(false, errors.NewServiceError("store unavailable"))
+
+		require.Equal(t, announced.Hash(), server.catchupTargetHash(context.Background(), announced, "peer-1"),
+			"an unanswerable check is doubt, and doubt takes the block we know we lack")
+	})
+
+	t.Run("a registry lookup failure falls back to the announced block", func(t *testing.T) {
+		server, _, _, cleanup := setupTestCatchupServer(t)
+		defer cleanup()
+
+		server.p2pClient = &staticTipP2PClient{err: errors.NewNotFoundError("peer not in registry")}
+
+		require.Equal(t, announced.Hash(), server.catchupTargetHash(context.Background(), announced, "peer-1"))
+	})
+
+	t.Run("no peerID means no registry to consult", func(t *testing.T) {
+		server, _, _, cleanup := setupTestCatchupServer(t)
+		defer cleanup()
+
+		require.Equal(t, announced.Hash(), server.catchupTargetHash(context.Background(), announced, ""))
+	})
 }
