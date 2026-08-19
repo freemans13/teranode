@@ -262,18 +262,40 @@ func (t *blockDownloadTracker) ClearPeer(p *peerpkg.Peer) {
 	delete(t.byPeer, p)
 }
 
-// Clear forgets every assignment. Used when the sync peer changes, so blocks the
-// previous peer failed to send are not ignored when they are announced again.
-func (t *blockDownloadTracker) Clear() {
-	if t == nil {
+// ForgetForRetry reopens every block for a fresh request without cancelling
+// anybody's permission to deliver one. It is what the sync peer changing means:
+// blocks the departing peer never sent must be fetchable from the new peer the
+// moment they are announced again, but the peers we already asked are still
+// answering a question we put to them and must not be punished for a late reply.
+//
+// The two are genuinely different questions with different windows, so it moves
+// only the shorter one. Every assignment newer than retryWindow is back-dated to
+// exactly retryWindow old, which is the point at which RequestedWithin stops
+// claiming somebody is already on the job. Ownership is judged against the far
+// longer assignment ceiling and survives, one retryWindow shorter than it was.
+//
+// There is deliberately no method that forgets assignments outright. The ledger
+// this replaced was two maps — a global one the sync peer change cleared, and a
+// separate per-peer one the disconnect decision read — so clearing could not
+// revoke anyone's permission to deliver. With one map it can, and did: an honest
+// peer racing the frontier block lost its whole association for answering us.
+func (t *blockDownloadTracker) ForgetForRetry(retryWindow time.Duration) {
+	if t == nil || retryWindow <= 0 {
 		return
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.byHash = make(map[chainhash.Hash]map[*peerpkg.Peer]time.Time)
-	t.byPeer = make(map[*peerpkg.Peer]map[chainhash.Hash]struct{})
+	cut := t.clock().Add(-retryWindow)
+
+	for _, owners := range t.byHash {
+		for p, at := range owners {
+			if at.After(cut) {
+				owners[p] = cut
+			}
+		}
+	}
 }
 
 // Len returns how many distinct blocks are currently owed by somebody, ignoring

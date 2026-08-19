@@ -202,7 +202,7 @@ func TestBlockDownloadTracker_NilIsSafeAndFailsClosed(t *testing.T) {
 		tr.Remove(h)
 		tr.RemoveOwner(p, h)
 		tr.ClearPeer(p)
-		tr.Clear()
+		tr.ForgetForRetry(blockRequestRetryInterval)
 	})
 
 	require.False(t, tr.HasOwner(p, h))
@@ -347,4 +347,44 @@ func TestHandleBlockMsg_DeliveryDoesNotCancelTheOtherPeersWeAsked(t *testing.T) 
 	err = sm.handleBlockMsg(&blockQueueMsg{blockHash: h, peer: second})
 	require.Error(t, err)
 	require.True(t, second.Connected(), "a second copy from a peer we also asked must not be treated as unrequested")
+}
+
+// TestBlockDownloadTracker_ForgetForRetryMovesOnlyTheRetryWindow pins the two
+// windows apart at the ledger level. Reopening a block for re-request must make
+// the inv path willing to ask somebody else immediately, and must leave the peer
+// we already asked free to deliver — the delivery ceiling is an hour, and losing
+// a minute of it is the whole cost.
+func TestBlockDownloadTracker_ForgetForRetryMovesOnlyTheRetryWindow(t *testing.T) {
+	tr, advance := newTestTracker(blockRequestAssignmentTTL)
+
+	fresh := chainhash.Hash{0x01}
+	stale := chainhash.Hash{0x02}
+
+	freshPeer := newTestPeer(t, "localhost:18421")
+	stalePeer := newTestPeer(t, "localhost:18422")
+
+	// One assignment made half an hour ago, one made just now.
+	tr.Add(stalePeer, stale)
+	advance(30 * time.Minute)
+	tr.Add(freshPeer, fresh)
+
+	require.True(t, tr.RequestedWithin(fresh, blockRequestRetryInterval), "sanity: just asked")
+	require.False(t, tr.RequestedWithin(stale, blockRequestRetryInterval), "sanity: asked long ago")
+
+	tr.ForgetForRetry(blockRequestRetryInterval)
+
+	require.False(t, tr.RequestedWithin(fresh, blockRequestRetryInterval),
+		"the fresh request must be reopened, so the next inv fetches the block from the new sync peer")
+	require.True(t, tr.HasOwner(freshPeer, fresh),
+		"the peer we asked keeps its permission to deliver")
+	require.True(t, tr.HasOwner(stalePeer, stale),
+		"an older assignment keeps its permission to deliver too")
+
+	// The half-hour-old assignment must not have been made younger: it has to
+	// keep ageing out of the delivery ceiling on its original schedule.
+	advance(30 * time.Minute)
+	require.False(t, tr.HasOwner(stalePeer, stale),
+		"reopening must not reset an assignment's age against the delivery ceiling")
+	require.True(t, tr.HasOwner(freshPeer, fresh),
+		"the fresh assignment is only a minute older than it was, well inside the ceiling")
 }

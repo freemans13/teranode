@@ -1026,10 +1026,13 @@ func (sm *SyncManager) startSync() {
 		return
 	}
 
-	// Forget every outstanding request if the sync peer changes, otherwise
-	// we may ignore blocks we need that the last sync peer failed
-	// to send.
-	sm.blockDownloads.Clear()
+	// Reopen every outstanding block for a fresh request now the sync peer has
+	// changed, otherwise we may ignore blocks we need that the last sync peer
+	// failed to send. Only the re-request window moves: the peers we already
+	// asked keep their permission to deliver, because a sync peer change is not
+	// evidence against them and a late copy must not cost an honest peer its
+	// connection.
+	sm.blockDownloads.ForgetForRetry(blockRequestRetryInterval)
 
 	locator, err := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
 	if err != nil {
