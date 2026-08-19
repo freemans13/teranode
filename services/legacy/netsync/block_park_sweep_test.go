@@ -2,13 +2,17 @@ package netsync
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,69 +27,83 @@ func newIndexOnlyPark() *blockPark {
 	}
 }
 
-// TestBlockPark_TheSweepWorksThroughTheWholeParkInsteadOfResamplingIt is the
-// difference between a safety net and a lottery.
+// TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires is the sweep's whole
+// reason for existing, asserted as what the sweep does rather than as arithmetic
+// over the constants that shape it.
 //
 // The sweep is the ONLY thing that ever commits a parked block whose parent was
-// already in the chain when the node started — a restart-recovered block never
-// sees a commit event for its parent, so nothing else will ever look at it.
-// Iterating the index map in Go's randomised order, and returning entries
-// without recording that they were looked at, means each tick re-samples the
-// same population: some entries come up repeatedly and others may not come up
-// at all before their thirty minutes are gone and they are re-downloaded.
+// already in the chain when the node started: a block recovered from disk never
+// sees a commit event for that parent, so nothing else will ever look at it. It
+// gets from parkStuckThreshold to parkEntryTTL to work through the park, one
+// tick every parkSweepInterval, parkSweepRPCBudget parents per tick. If a full
+// pass over a full park does not fit in that window, then after a restart with a
+// full park the blocks it never reached expire and are downloaded a second time
+// — which is the entire cost the park exists to avoid.
 //
-// The assertion is coverage, not order: every parked block must have been
-// offered once after the number of ticks it takes to spend one budget per
-// entry.
-func TestBlockPark_TheSweepWorksThroughTheWholeParkInsteadOfResamplingIt(t *testing.T) {
-	const (
-		parked = 40
-		budget = 8
+// It is driven through sweepParkedBlocks, the production entry point, and the
+// assertion is made on what actually reached the blockchain service, so it
+// covers the round-robin, the per-tick budget and the wiring between them
+// together. A sweep that re-sampled the index at random would leave blocks
+// unasked about however long it ran.
+func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seen = make(map[chainhash.Hash]struct{}, maxParkedEntries)
 	)
 
-	park := newIndexOnlyPark()
+	client := &blockchain2.Mock{}
+	client.On("GetBlockExists", mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			hash, ok := args.Get(1).(*chainhash.Hash)
+			require.True(t, ok)
 
-	now := time.Now()
-	longEnoughAgo := now.Add(-parkStuckThreshold - time.Minute)
+			mu.Lock()
+			seen[*hash] = struct{}{}
+			mu.Unlock()
+		}).
+		Return(false, nil)
 
-	for i := 0; i < parked; i++ {
-		var hash chainhash.Hash
-
-		hash[0] = byte(i)
-
-		park.entries[hash] = &parkedBlock{hash: hash, parkedAt: longEnoughAgo}
+	sm := &SyncManager{
+		logger:           ulogger.TestLogger{},
+		ctx:              context.Background(),
+		blockchainClient: client,
+		blockPark:        newIndexOnlyPark(),
 	}
 
-	seen := make(map[chainhash.Hash]struct{}, parked)
+	// A full park, as a restart can find one: every block waiting on a different
+	// parent, none of them yet looked at.
+	parked := time.Now()
 
-	for tick := 0; tick < parked/budget; tick++ {
-		batch := park.StuckCandidates(now, budget)
-		require.Len(t, batch, budget, "a tick must spend its whole budget while candidates remain")
+	for i := 0; i < maxParkedEntries; i++ {
+		var hash, prev chainhash.Hash
 
-		for _, candidate := range batch {
-			seen[candidate.hash] = struct{}{}
-		}
+		binary.LittleEndian.PutUint32(hash[:], uint32(i))
+		binary.LittleEndian.PutUint32(prev[4:], uint32(i))
+
+		sm.blockPark.entries[hash] = &parkedBlock{hash: hash, prevBlock: prev, parkedAt: parked}
 	}
 
-	require.Len(t, seen, parked,
-		"every parked block must have been offered to the chain once after %d ticks of %d; a sweep that re-samples at random leaves blocks to expire and be downloaded again", parked/budget, budget)
-}
+	// The ticks a block gets between becoming a sweep candidate and running out
+	// of time. Only as many as a full pass needs are used, so the test says "a
+	// full pass fits" rather than "a full pass happens eventually".
+	ticks := maxParkedEntries / parkSweepRPCBudget
 
-// TestBlockPark_TheSweepCanCoverAFullParkBeforeItsBlocksExpire pins the
-// arithmetic that makes the sweep a safety net at all.
-//
-// A block is given up after parkEntryTTL. The sweep runs every
-// parkSweepInterval and asks the chain about at most parkSweepRPCBudget parents
-// each time. If a full pass over a full park cannot finish inside the TTL, then
-// after a restart with a full park most of those blocks expire unexamined and
-// are downloaded a second time — which is the whole cost the park exists to
-// avoid.
-func TestBlockPark_TheSweepCanCoverAFullParkBeforeItsBlocksExpire(t *testing.T) {
-	ticksBeforeExpiry := int(parkEntryTTL / parkSweepInterval)
+	require.LessOrEqual(t, time.Duration(ticks)*parkSweepInterval, parkEntryTTL-parkStuckThreshold,
+		"a full pass has to fit between a block becoming a candidate and its time running out")
 
-	require.GreaterOrEqual(t, ticksBeforeExpiry*parkSweepRPCBudget, maxParkedEntries,
-		"the sweep gets %d ticks of %d lookups before a block expires, %d in all, and the park holds up to %d; a full pass has to fit",
-		ticksBeforeExpiry, parkSweepRPCBudget, ticksBeforeExpiry*parkSweepRPCBudget, maxParkedEntries)
+	for tick := 0; tick < ticks; tick++ {
+		sm.sweepParkedBlocks(parked.Add(parkStuckThreshold + time.Second + time.Duration(tick)*parkSweepInterval))
+	}
+
+	require.Equal(t, maxParkedEntries, sm.blockPark.Len(),
+		"nothing may have expired while the sweep was still working through the park")
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	require.Len(t, seen, maxParkedEntries,
+		"every parked block's parent must have been asked about within %d ticks of %d; whatever the sweep does not reach expires and is downloaded again",
+		ticks, parkSweepRPCBudget)
 }
 
 // TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart closes the
