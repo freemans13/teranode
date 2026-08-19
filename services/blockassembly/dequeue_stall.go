@@ -37,6 +37,14 @@ const (
 // is the correct starting state: not stalled, nothing warned yet.
 type dequeueStallState struct {
 	stalled bool
+	// beforeConsumerStarted records whether the consumer had been started when
+	// this incident began. It only affects how the incident is reported: a gap
+	// that opens before the consumer exists is startup, not a wedge, and its
+	// end is the consumer arriving rather than recovering. Latched on the rising
+	// edge because by the time the incident ends the consumer has necessarily
+	// started - SubtreeProcessor.Start re-seeds the dequeue timestamp, which is
+	// what ends a startup gap in the first place.
+	beforeConsumerStarted bool
 	// stalledSince is when the consumer stopped, not when we noticed. Set
 	// once on the rising edge and never touched again until recovery, so one
 	// incident is reported as one incident.
@@ -58,6 +66,14 @@ type dequeueStallState struct {
 //     queue is not the failure this signal exists for - issue #1429 is about
 //     intake growing without bound.
 //
+//   - consumerStarted does not change WHETHER an incident is reported, only how.
+//     Both conditions are worth a line - a queue nobody is draining is worth
+//     knowing about either way, and a loadUnminedTransactions that never returns
+//     is a failure mode on record - but they have different causes and different
+//     severities, so the caller is told which one it is rather than left to
+//     guess between them. Suppressing the pre-start case outright would hide a
+//     stuck unmined reload, which is the one failure the startup window has.
+//
 //   - A stall ENDS only when staleness drops back to the threshold, regardless
 //     of queue depth. Keying the exit on depth instead looks equivalent but is
 //     not: reorgBlocks and moveForwardBlock drain the queue from inside the
@@ -76,11 +92,12 @@ type dequeueStallState struct {
 //
 // Returns the next state, the event to log, and - for dequeueStallEnded only -
 // how long the incident lasted end to end.
-func observeDequeueStall(state dequeueStallState, now time.Time, queueLength int64, staleness time.Duration) (dequeueStallState, dequeueStallEvent, time.Duration) {
+func observeDequeueStall(state dequeueStallState, now time.Time, queueLength int64, staleness time.Duration, consumerStarted bool) (dequeueStallState, dequeueStallEvent, time.Duration) {
 	if !state.stalled {
 		if queueLength > 0 && staleness > dequeueStallThreshold {
 			return dequeueStallState{
-				stalled: true,
+				stalled:               true,
+				beforeConsumerStarted: !consumerStarted,
 				// Backdate to the last dequeue rather than to detection: the
 				// stall began when the consumer stopped, which is at least
 				// dequeueStallThreshold plus up to one tick ago. lastWarn

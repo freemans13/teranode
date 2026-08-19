@@ -406,6 +406,17 @@ type SubtreeProcessor struct {
 	// loadUnminedTransactions runs in between and can take minutes, during
 	// which the queue is already being filled.
 	lastDequeueMillis atomic.Int64
+
+	// consumerStarted records whether the Start() goroutine has begun running.
+	// It exists so the stall signal can tell "the consumer is wedged" from "the
+	// consumer does not exist yet": BlockAssembly.Init starts the metrics
+	// updater and BlockAssembly.Start brings gRPC ingest up, both before
+	// BlockAssembler.Start reaches stp.Start(ctx), with loadUnminedTransactions
+	// in between. On a busy node that reload takes minutes while AddTx is
+	// already enqueueing, so a non-empty queue and a stale dequeue timestamp is
+	// the ordinary startup path, not a fault. Without this the signal reports
+	// every restart as an unbounded-growth incident.
+	consumerStarted atomic.Bool
 }
 
 type State uint32
@@ -656,6 +667,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 		// (loadUnminedTransactions runs between the two), and staleness
 		// accrued before the consumer existed must not be attributed to it.
 		stp.lastDequeueMillis.Store(stp.clock.Now().UnixMilli())
+		stp.consumerStarted.Store(true)
 
 		go func() {
 			// Recover from panics (e.g., send on closed channel during shutdown).
@@ -1941,6 +1953,21 @@ func (stp *SubtreeProcessor) QueueLength() int64 {
 //   - time.Time: the last time the dequeue branch ran
 func (stp *SubtreeProcessor) LastDequeueTime() time.Time {
 	return time.UnixMilli(stp.lastDequeueMillis.Load())
+}
+
+// ConsumerStarted reports whether Start has begun running the consumer
+// goroutine. A stale LastDequeueTime only means the consumer is wedged once
+// this is true; before then it means the consumer has not been started yet,
+// which is the ordinary state for the minutes BlockAssembler.Start spends in
+// loadUnminedTransactions with gRPC ingest already accepting transactions.
+//
+// Like LastDequeueTime this is a plain atomic load, so it stays answerable
+// while the consumer's select loop is blocked.
+//
+// Returns:
+//   - bool: true once the consumer goroutine has been started
+func (stp *SubtreeProcessor) ConsumerStarted() bool {
+	return stp.consumerStarted.Load()
 }
 
 // SubtreeCount returns the total number of subtrees.

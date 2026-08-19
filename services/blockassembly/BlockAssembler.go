@@ -303,6 +303,16 @@ func (b *BlockAssembler) LastDequeueTime() time.Time {
 	return b.subtreeProcessor.LastDequeueTime()
 }
 
+// ConsumerStarted reports whether the subtree processor's consumer goroutine
+// has been started. See subtreeprocessor.Interface.ConsumerStarted for why the
+// stall signal needs this to avoid reporting every restart as an incident.
+//
+// Returns:
+//   - bool: true once the consumer goroutine has been started
+func (b *BlockAssembler) ConsumerStarted() bool {
+	return b.subtreeProcessor.ConsumerStarted()
+}
+
 // SubtreeCount returns the total number of subtrees.
 //
 // Returns:

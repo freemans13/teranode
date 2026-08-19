@@ -144,11 +144,26 @@ func TestLastDequeueTime_StopsAdvancingWhileConsumerParked(t *testing.T) {
 		"LastDequeueTime must advance every loop iteration, even with an empty queue")
 
 	go func() {
-		stp.lengthCh <- respCh
+		// The ctx.Done() arm keeps this goroutine from outliving the test. The
+		// respCh drain in the cleanup above only rescues the consumer, which by
+		// then has already taken this send; if the consumer never reaches its
+		// lengthCh receive at all - which is what a failure here looks like -
+		// this send has nothing to unblock it.
+		select {
+		case stp.lengthCh <- respCh:
+		case <-ctx.Done():
+		}
 	}()
 
-	// Give the parking send time to land inside the select loop.
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the park to actually take hold, rather than guessing at how long
+	// it takes. The consumer stamps once per loop iteration and idles for
+	// IdleSleepDuration (10ms), so a gap this wide means it is no longer
+	// reaching that branch - which is precisely the state the rest of the test
+	// depends on.
+	require.Eventually(t, func() bool {
+		return time.Since(stp.LastDequeueTime()) > 150*time.Millisecond
+	}, 2*time.Second, 5*time.Millisecond,
+		"the consumer must be parked outside the dequeue branch before the queue is filled")
 
 	// Enqueue directly into the queue (bypassing the gRPC ingest path,
 	// which is out of scope here) so the queue is genuinely non-empty for

@@ -333,19 +333,56 @@ func (ba *BlockAssembly) sampleBlockAssemblerMetrics(stallState dequeueStallStat
 
 	prometheusBlockAssemblerDequeueStalenessSeconds.Set(staleness.Seconds())
 
-	stallState, stallEvent, stalledFor := observeDequeueStall(stallState, now, queueLength, staleness)
+	// Sampled with the rest of the tick so the report can name the cause rather
+	// than list candidates: a stale timestamp means a wedged consumer only once
+	// the consumer exists. Like the other three, a plain atomic load, so it
+	// stays answerable while the consumer's select loop is blocked.
+	consumerStarted := ba.blockAssembler.ConsumerStarted()
+
+	// Captured before the fold, which resets the state on the closing edge.
+	stallBeganBeforeConsumerStarted := stallState.beforeConsumerStarted
+
+	stallState, stallEvent, stalledFor := observeDequeueStall(stallState, now, queueLength, staleness, consumerStarted)
 
 	switch stallEvent {
 	case dequeueStallBegan:
-		ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue), whether the dequeue branch itself is blocked storing or announcing a subtree, or whether the consumer has not started yet (gRPC ingest is up before BlockAssembler.Start reaches it, and the unmined reload runs in between)", queueLength, staleness.Round(time.Second))
+		if !consumerStarted {
+			// Expected on any node whose unmined reload outlasts the threshold,
+			// so this is not a warning: gRPC ingest comes up in
+			// BlockAssembly.Start, while BlockAssembler.Start only reaches
+			// subtreeProcessor.Start after loadUnminedTransactions, which takes
+			// minutes on a busy node. Still reported, because a reload that
+			// never returns looks exactly like this and would otherwise be
+			// silent.
+			ba.logger.Infof("block assembler intake queue has %d transactions queued and the consumer has not started yet - normal during startup while BlockAssembler.Start loads unmined transactions with ingest already accepting; queued for %s so far, and the queue drains as soon as the consumer starts", queueLength, staleness.Round(time.Second))
+		} else {
+			ba.logger.Warnf("block assembler intake queue has %d transactions queued but the consumer has not dequeued for %s - intake is growing unbounded; check what is occupying the subtree processor's Start() select loop (reorg/move-forward-block/reset/get* all suppress dequeue), or whether the dequeue branch itself is blocked storing or announcing a subtree", queueLength, staleness.Round(time.Second))
+		}
 	case dequeueStallContinues:
 		// The queue length is reported second, and may well be zero: a reorg
 		// or move-forward-block handler drains the queue from inside the
 		// branch that is blocking the consumer, so an empty queue here does
 		// not mean recovery.
-		ba.logger.Warnf("block assembler intake queue still stalled: consumer has not dequeued for %s, %d transactions queued", staleness.Round(time.Second), queueLength)
+		//
+		// consumerStarted is read live rather than from the latch because a
+		// startup gap always closes the moment the consumer starts -
+		// SubtreeProcessor.Start re-seeds the dequeue timestamp - so a repeat
+		// while it is still false is still startup, and a repeat once it is
+		// true is a genuine wedge.
+		if !consumerStarted {
+			ba.logger.Infof("block assembler intake queue consumer still has not started after %s, %d transactions queued - if this persists, the unmined transaction reload in BlockAssembler.Start is stuck", staleness.Round(time.Second), queueLength)
+		} else {
+			ba.logger.Warnf("block assembler intake queue still stalled: consumer has not dequeued for %s, %d transactions queued", staleness.Round(time.Second), queueLength)
+		}
 	case dequeueStallEnded:
-		ba.logger.Infof("block assembler intake queue consumer recovered, was stalled for %s", stalledFor.Round(time.Second))
+		// Only the closing edge needs the latch: by here the consumer has
+		// necessarily started, so the live reading cannot distinguish a startup
+		// gap from a wedge that recovered.
+		if stallBeganBeforeConsumerStarted {
+			ba.logger.Infof("block assembler intake queue consumer started after %s and is now dequeuing", stalledFor.Round(time.Second))
+		} else {
+			ba.logger.Infof("block assembler intake queue consumer recovered, was stalled for %s", stalledFor.Round(time.Second))
+		}
 	case dequeueStallNone:
 	}
 

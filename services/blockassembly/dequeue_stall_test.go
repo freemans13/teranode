@@ -47,6 +47,9 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 		staleness   time.Duration
 		wantEvent   dequeueStallEvent
 		wantStalled bool
+		// beforeConsumerStarted drives the consumerStarted input. Zero value
+		// means the consumer had started, which is the case for every wedge.
+		beforeConsumerStarted bool
 		// wantFor is only meaningful for dequeueStallEnded.
 		wantFor time.Duration
 		// wantSince is only checked when wantStalled is true.
@@ -170,6 +173,20 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			wantFor:     3*time.Minute - time.Second,
 		},
 		{
+			// The startup window is still reported - a queue nobody is draining
+			// matters either way, and a loadUnminedTransactions that never
+			// returns looks exactly like this - but it is latched as startup so
+			// it can be reported as such rather than as unbounded growth.
+			name:                  "startupGapIsReportedButMarkedAsStartup",
+			now:                   stallBase.Add(45 * time.Second),
+			queueLength:           10_000,
+			staleness:             45 * time.Second,
+			beforeConsumerStarted: true,
+			wantEvent:             dequeueStallBegan,
+			wantStalled:           true,
+			wantSince:             stallBase,
+		},
+		{
 			name:        "recoveryAtThresholdExactly",
 			state:       stalledState(0, 0),
 			now:         stallBase.Add(time.Minute),
@@ -186,7 +203,7 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, event, stalledFor := observeDequeueStall(tt.state, tt.now, tt.queueLength, tt.staleness)
+			got, event, stalledFor := observeDequeueStall(tt.state, tt.now, tt.queueLength, tt.staleness, !tt.beforeConsumerStarted)
 
 			require.Equal(t, tt.wantEvent, event, "event")
 			require.Equal(t, tt.wantStalled, got.stalled, "stalled flag")
@@ -194,6 +211,8 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			if tt.wantStalled {
 				require.Equal(t, tt.wantSince, got.stalledSince,
 					"stalledSince must only ever be set on the rising edge, so one incident reports as one incident")
+				require.Equal(t, tt.beforeConsumerStarted, got.beforeConsumerStarted,
+					"the cause must be latched on the rising edge, since by the closing edge the consumer has necessarily started and the live reading can no longer tell startup from a wedge")
 			}
 
 			if tt.wantEvent == dequeueStallEnded {
@@ -253,7 +272,7 @@ func TestObserveDequeueStall_IncidentIsReportedAsOneIncident(t *testing.T) {
 			stalledFor time.Duration
 		)
 
-		state, event, stalledFor = observeDequeueStall(state, stallBase.Add(elapsed), queueLength, staleness)
+		state, event, stalledFor = observeDequeueStall(state, stallBase.Add(elapsed), queueLength, staleness, true)
 
 		switch event {
 		case dequeueStallBegan:

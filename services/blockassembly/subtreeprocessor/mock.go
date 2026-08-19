@@ -142,6 +142,11 @@ func (m *MockSubtreeProcessor) LastDequeueTime() time.Time {
 	return args.Get(0).(time.Time)
 }
 
+func (m *MockSubtreeProcessor) ConsumerStarted() bool {
+	args := m.Called()
+	return args.Bool(0)
+}
+
 func (m *MockSubtreeProcessor) SubtreeCount() int {
 	args := m.Called()
 	return args.Int(0)

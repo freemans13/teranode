@@ -309,6 +309,16 @@ type Interface interface {
 	//   - time.Time: last time the dequeue branch ran
 	LastDequeueTime() time.Time
 
+	// ConsumerStarted reports whether the consumer goroutine has been started.
+	// A stale LastDequeueTime means a wedged consumer only once this is true;
+	// before then it simply means Start has not reached the consumer yet, which
+	// is the ordinary state while BlockAssembler.Start loads unmined
+	// transactions with ingest already running.
+	//
+	// Returns:
+	//   - bool: true once the consumer goroutine has been started
+	ConsumerStarted() bool
+
 	// SubtreeCount returns the total number of subtrees managed by the processor.
 	// This metric provides visibility into the processor's organizational state.
 	//
