@@ -226,3 +226,157 @@ func TestFetchHeaderBlocks_RequestsExactlyTheBlocksItRequestedBefore(t *testing.
 	require.Equal(t, hashes[lastConsidered+1], *node.hash,
 		"startHeader must be left on the first header the walk did not consider")
 }
+
+// TestFetchHeaderBlocks_DiscardsARoundWhoseHeaderListMovedUnderIt is the price of
+// doing the lookups unlocked: what was read before the lock was dropped can no
+// longer be trusted on the way back. Here the header state is reset while the
+// lookups are in flight, which is what happens when sync moves to a new peer or
+// leaves headers-first mode.
+//
+// A commit that trusted its snapshot would ask for blocks from the chain we just
+// abandoned and re-anchor startHeader onto an element that is no longer in the
+// list — container/list leaves a detached element's links intact, so the walk
+// happily carries on through a list nobody can reach any more, and the header
+// list never drains again. Nothing must be committed, and the next pass starts
+// from the list as it now is.
+func TestFetchHeaderBlocks_DiscardsARoundWhoseHeaderListMovedUnderIt(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+
+	sm := newFetchLockManager(t, nil, gate, entered)
+
+	syncPeer, _, rec := connectRacePeer(t, 43, 1000)
+	registerRacePeer(sm, syncPeer)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xa3}
+	msg, hashes := linkedHeaders(anchor, 25, &nonce)
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		sm.fetchHeaderBlocks()
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(gate)
+		t.Fatal("fetchHeaderBlocks never reached the blockchain lookup")
+	}
+
+	// Sync starts over from a different point entirely while the lookups are
+	// parked. The list, the index and startHeader all go with it.
+	sm.resetHeaderState(&chainhash.Hash{0xb3}, 500)
+	sm.headersFirstMode.Store(true)
+
+	close(gate)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fetchHeaderBlocks never returned")
+	}
+
+	require.False(t, WaitUntil(func() bool { return rec.count() > 0 }, 500*time.Millisecond),
+		"no block from the abandoned chain may be asked for")
+
+	for _, h := range hashes {
+		require.False(t, sm.blockDownloads.HasOwner(syncPeer, h),
+			"no block from the abandoned chain may be recorded as requested")
+	}
+
+	sm.headerMu.Lock()
+	startHeader := sm.startHeader
+	sm.headerMu.Unlock()
+
+	require.Nil(t, startHeader,
+		"the reset left nothing to fetch, and a discarded round must not re-anchor startHeader into the abandoned list")
+}
+
+// TestFetchHeaderBlocks_DiscardsARoundWhoseStartHeaderWasRemovedUnderIt is the
+// case a pointer comparison cannot see, and the reason the commit consults the
+// hash index as well. handleBlockMsg removes the front of the header list when
+// that block arrives, and the front is startHeader itself whenever the block
+// queue has caught up with the requests. startHeader is left pointing at the
+// removed element, so it still compares equal to the element the round was
+// walked from — but a removed container/list element answers Next() with nil, so
+// a commit that trusted the comparison would ask again for the block that has
+// just arrived and then advance startHeader to nil, abandoning every header
+// queued behind it with no way back.
+func TestFetchHeaderBlocks_DiscardsARoundWhoseStartHeaderWasRemovedUnderIt(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+
+	sm := newFetchLockManager(t, nil, gate, entered)
+
+	syncPeer, _, rec := connectRacePeer(t, 44, 1000)
+	registerRacePeer(sm, syncPeer)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xa4}
+	msg, hashes := linkedHeaders(anchor, 25, &nonce)
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	// The anchor block arrives, so it leaves the front of the list and the first
+	// unfetched header takes its place: front and startHeader are now the same
+	// element. The ledger has to vouch for it or handleBlockMsg drops the peer
+	// before it gets as far as the header list, and carrying no block makes it
+	// return straight after the bookkeeping that matters here.
+	sm.blockDownloads.Add(syncPeer, anchor)
+	_ = sm.handleBlockMsg(&blockQueueMsg{blockHash: anchor, peer: syncPeer})
+
+	sm.headerMu.Lock()
+	frontIsStartHeader := sm.headerList.Front() == sm.startHeader
+	sm.headerMu.Unlock()
+
+	require.True(t, frontIsStartHeader, "the front of the list should now be the header the walk starts from")
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		sm.fetchHeaderBlocks()
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		close(gate)
+		t.Fatal("fetchHeaderBlocks never reached the blockchain lookup")
+	}
+
+	// And now that same block arrives while the lookups are parked, taking the
+	// element startHeader points at out of the list with it.
+	sm.blockDownloads.Add(syncPeer, hashes[0])
+	_ = sm.handleBlockMsg(&blockQueueMsg{blockHash: hashes[0], peer: syncPeer})
+
+	close(gate)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fetchHeaderBlocks never returned")
+	}
+
+	require.False(t, WaitUntil(func() bool { return rec.count() > 0 }, 500*time.Millisecond),
+		"the block that has already arrived must not be asked for again")
+
+	sm.headerMu.Lock()
+	startHeader := sm.startHeader
+	remaining := sm.headerList.Len()
+	sm.headerMu.Unlock()
+
+	require.Equal(t, 24, remaining, "the headers behind the arrived block are still queued")
+	require.NotNil(t, startHeader, "advancing startHeader off a removed element would abandon every header still queued")
+}
