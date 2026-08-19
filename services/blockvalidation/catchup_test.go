@@ -1152,6 +1152,15 @@ func TestCatchup(t *testing.T) {
 		// Should return an error because common ancestor is ahead of current height
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "ahead of current height")
+
+		// Both heights come from our own blockchain store, so a trip means our state is
+		// inconsistent with itself and never that the peer misbehaved. It must therefore be a
+		// service error: that is the one class processCatchupChItem retries without calling
+		// ReportPeerFailure. A processing error here would rotate away an innocent peer.
+		require.True(t, errors.Is(err, errors.ErrServiceError),
+			"our own inconsistent state must not be charged to the peer, got: %v", err)
+		require.False(t, errors.Is(err, errors.ErrProcessing),
+			"must not be a processing error — that path reports peer failure")
 	})
 }
 
