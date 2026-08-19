@@ -227,6 +227,44 @@ type peerSyncState struct {
 	syncCandidate bool
 	requestQueue  *txmap.SyncedSlice[wire.InvVect]
 	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
+
+	// bestKnownHeight is the highest block height this peer has demonstrated it
+	// has: the height it announced at handshake, raised whenever it delivers a
+	// block, announces one we already have, or hands us headers.
+	//
+	// This is deliberately a SECOND copy of information Peer already carries in
+	// LastBlock(). It is keyed by peerSyncState rather than by *Peer because the
+	// multi-peer block scheduler that follows asks "which of the peers I am
+	// tracking claims to have block N" while walking peerStates, and it is
+	// netsync's own record rather than the peer package's.
+	//
+	// It is atomic because a *peerSyncState is shared by pointer across the
+	// blockHandler goroutine and the per-message inv and headers handlers, each
+	// of which runs on its own goroutine. Only noteBestKnownHeight writes it.
+	bestKnownHeight atomic.Int32
+}
+
+// noteBestKnownHeight raises the peer's best known height to h, and never lowers
+// it. A compare-and-swap loop rather than a load-then-store, because concurrent
+// reports would otherwise let a lower one overwrite a higher one.
+func (s *peerSyncState) noteBestKnownHeight(h int32) {
+	for {
+		cur := s.bestKnownHeight.Load()
+		if h <= cur {
+			return
+		}
+
+		if s.bestKnownHeight.CompareAndSwap(cur, h) {
+			return
+		}
+	}
+}
+
+// BestKnownHeight returns the highest block height this peer has demonstrated it
+// has. Read it through here rather than touching the field, so how it is stored
+// stays private to this type.
+func (s *peerSyncState) BestKnownHeight() int32 {
+	return s.bestKnownHeight.Load()
 }
 
 // syncPeerState stores additional info about the sync peer.
@@ -1189,11 +1227,18 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 		sm.currentFeeFilter.Store(bsvutil.SatoshiPerBitcoin)
 	}
 
-	sm.peerStates.Set(peer, &peerSyncState{
+	state := &peerSyncState{
 		syncCandidate: isSyncCandidate,
 		requestQueue:  txmap.NewSyncedSlice[wire.InvVect](maxRequestedBlocks),
 		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](10 * time.Second), // allow the node 10 seconds to respond to the tx request
-	})
+	}
+
+	// Seed the peer's best known height from the height it advertised during the
+	// handshake, so a peer is never mistaken for one that has nothing. An atomic
+	// cannot be initialised in the struct literal above.
+	state.noteBestKnownHeight(peer.StartingHeight())
+
+	sm.peerStates.Set(peer, state)
 
 	// Start syncing by choosing the best candidate if needed.
 	if isSyncCandidate && sm.loadSyncPeer() == nil {
@@ -1748,7 +1793,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	sm.logger.Debugf("[handleBlockMsg][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 	peer := bmsg.peer
 
-	_, resolved, exists := sm.peerStateResolvingPrimary(peer)
+	state, resolved, exists := sm.peerStateResolvingPrimary(peer)
 	if !exists {
 		sm.logger.Errorf("[handleBlockMsg][%s] Received block message from unknown peer %s", bmsg.blockHash, peer)
 		return errors.NewServiceError("[handleBlockMsg] Received block message from unknown peer %s", peer)
@@ -2114,6 +2159,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// if we're syncing the chain from scratch.
 	if heightUpdate != 0 {
 		peer.UpdateLastBlockHeight(heightUpdate)
+		state.noteBestKnownHeight(heightUpdate)
 		sm.logger.Debugf("peer %s reports new best height %d, current %v", peer.String(), peer.LastBlock(), sm.current())
 
 		if sm.current() { // used to check for isOrphan || sm.current()
@@ -2326,7 +2372,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	sm.logger.Debugf("[handleHeadersMsg] received headers message with %d headers from %s", len(hmsg.headers.Headers), hmsg.peer)
 	peer := hmsg.peer
 
-	_, resolved, exists := sm.peerStateResolvingPrimary(peer)
+	state, resolved, exists := sm.peerStateResolvingPrimary(peer)
 	if !exists {
 		sm.logger.Warnf("Received headers message from unknown peer %s", peer)
 		return
@@ -2397,6 +2443,10 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// (Rule B).
 	var disconnectReason string
 
+	// Highest height this batch linked up to, reported to the peer's state after
+	// the unlock below so the atomic write stays outside the locked region.
+	var maxHeaderHeight int32
+
 	sm.headerMu.Lock()
 
 	for _, blockHeader := range msg.Headers {
@@ -2420,6 +2470,10 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			node.height = prevNode.height + 1
 			e := sm.headerList.PushBack(&node)
 			sm.indexHeaderLocked(e, blockHash)
+
+			if node.height > maxHeaderHeight {
+				maxHeaderHeight = node.height
+			}
 
 			if sm.startHeader == nil {
 				sm.startHeader = e
@@ -2450,6 +2504,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	}
 
 	sm.headerMu.Unlock()
+
+	// A peer that hands us headers up to height N has demonstrably got the chain
+	// that far. Done after the unlock, so no peer state is touched under
+	// headerMu.
+	if maxHeaderHeight > 0 {
+		state.noteBestKnownHeight(maxHeaderHeight)
+	}
 
 	if disconnectReason != "" {
 		peer.DisconnectWithWarning(disconnectReason)
@@ -2595,6 +2656,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			}
 
 			peer.UpdateLastBlockHeight(blockHeightInt32)
+			state.noteBestKnownHeight(blockHeightInt32)
 		}
 	}
 
