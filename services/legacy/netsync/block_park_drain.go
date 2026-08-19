@@ -180,6 +180,24 @@ func (sm *SyncManager) livePeer(recorded *peerpkg.Peer) *peerpkg.Peer {
 	return sm.loadSyncPeer()
 }
 
+// resumeHeaderWalk sends the download walk out again from wherever the cursor
+// now is.
+//
+// Every rewind moves the cursor back and sends nothing. What actually issues a
+// getdata is fetchHeaderBlocks, and its only callers are a block arriving, a
+// headers message arriving, and the pipeline top-up after a block is committed —
+// all of which are things that happen because sync is moving. In the regime the
+// rewinds exist for, sync is not moving: the block that was given up on was the
+// one everything else was queued behind, so no later block is coming to carry
+// the rewound cursor out with it, and a node would sit on a perfectly good
+// cursor until the stall detector rotated the peer and threw the cursor away.
+//
+// Called from the park sweep's ticker, on the block-queue consumer, so it costs
+// one comparison per tick when there is nothing to do.
+func (sm *SyncManager) resumeHeaderWalk() {
+	sm.fetchMoreHeaderBlocks(sm.loadSyncPeer())
+}
+
 // sweepParkedBlocks is the safety net for blocks whose parent never arrives
 // through a commit this node saw.
 //

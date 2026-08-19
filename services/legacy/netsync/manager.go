@@ -2033,6 +2033,14 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			if sps, ok := sm.syncPeerStateFor(peer); ok {
 				sps.updateLastBlockTime()
 			}
+
+			// advanceHeaderListFor has already taken this block's header off the
+			// front, so without this the block leaves the download walk here and
+			// nothing in headers-first mode ever asks for it again. The walk does
+			// not re-request it straight away: commitHeaderCandidates stops on a
+			// block that is still inside its backoff and leaves the cursor on it.
+			sm.rewindHeaderCursor(bmsg.blockHash, removedFront)
+
 			return errors.NewServiceUnavailableError("[handleBlockMsg][%s] block in backoff after %d transient failure(s)", bmsg.blockHash, fs.attempts)
 		}
 	}
@@ -2044,6 +2052,10 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// parent hash first — the missing-parent error path below needs it.
 	msgBlock := bmsg.block
 	if msgBlock == nil {
+		// No rewind here on purpose. This is not a block we downloaded and then
+		// dropped, it is a queue message that never carried one — a programming
+		// fault, not a sync one — and every test that advances the header list
+		// by hand comes through here.
 		return errors.NewProcessingError("[handleBlockMsg][%s] block message carries no block", bmsg.blockHash)
 	}
 
@@ -2070,6 +2082,17 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				sps.updateLastBlockTime()
 			}
 
+			// No rewind here, and it is worth saying why rather than leaving the
+			// omission to be found again. This block's header is only taken off
+			// the front if this block IS the front, which needs its parent's
+			// header to be gone already. When the parent failed on a local fault
+			// its header is put straight back, so this block is never the front
+			// and never leaves the list — the walk reaches it in order once the
+			// parent is retried. When the parent was judged rather than merely
+			// unlucky there is deliberately nothing to go back to: re-requesting
+			// a descendant of a block that is never coming would download it over
+			// and over, and every delivery refreshes the delivering peer's stall
+			// timer, so nothing would rotate that peer out of the loop either.
 			sm.requestMissingBlocks(peer, bmsg.blockHash)
 
 			return nil
@@ -2227,6 +2250,21 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// failure count persists across re-deliveries within the map TTL.
 			if serviceError && sm.blockFailureBackoff != nil {
 				sm.recordBlockFailureBackoff(bmsg.blockHash)
+
+				// A local fault says nothing about the block, so the block is
+				// still wanted — and its header is already off the front of the
+				// walk, which in headers-first mode is the only thing that
+				// fetches anything. Put the walk back on it and let the backoff
+				// decide when it goes out again.
+				//
+				// Deliberately NOT done for a block we judged: re-requesting a
+				// block we have just rejected would download it and reject it
+				// again for as long as the peer keeps sending it, and because
+				// every delivery refreshes that peer's stall timer, nothing
+				// would rotate the peer out of the loop. A judged block keeps
+				// the recovery it has always had — the stall detector rebuilds
+				// the header list from a fresh peer.
+				sm.rewindHeaderCursor(bmsg.blockHash, removedFront)
 			}
 
 			sm.logger.Errorf("Failed to process new block in service blockQueueMsg %v: %v", bmsg.blockHash, err)
@@ -2856,6 +2894,22 @@ func (sm *SyncManager) commitHeaderCandidates(sp *peerpkg.Peer, anchor *list.Ele
 		// delivers it, recovery is ForgetForRetry on sync-peer rotation plus
 		// resetHeaderState — so anything that removes resetHeaderState-on-rotation
 		// has to replace that recovery, or a skipped block has no way back.
+		// A block still inside its transient-failure backoff must not be asked
+		// for yet — throttling the re-decorate storm is the whole point of the
+		// backoff — and it must not be walked past either, because the rewind
+		// that put the walk back on it would then be undone and the block would
+		// leave the walk for good. So the round stops here with the cursor still
+		// on it, and the next round picks it up once the backoff has expired.
+		// The cap on that backoff is deliberately below the sync-peer stall
+		// window, so the wait always ends before the peer would be rotated.
+		if !alreadyHave[i] && sm.blockFailureBackoff != nil {
+			if fs, backedOff := sm.blockFailureBackoff.Get(hashes[i]); backedOff && time.Now().Before(fs.nextRetry) {
+				sm.logger.Debugf("[fetchHeaderBlocks] block %s is still inside its transient-failure backoff, holding the walk here", hashes[i])
+
+				return requested, false
+			}
+		}
+
 		if !alreadyHave[i] && sm.blockDownloads.RequestedWithin(hashes[i], blockRequestRetryInterval) {
 			e = e.Next()
 			sm.startHeader = e
@@ -3444,6 +3498,11 @@ func (sm *SyncManager) blockHandler() {
 				}
 			case <-parkSweep.C:
 				sm.sweepParkedBlocks(time.Now())
+				// A rewind — from the sweep just above, or from a block given up
+				// on since the last tick — moves the download cursor back and
+				// sends nothing. This is what carries it out. See
+				// resumeHeaderWalk.
+				sm.resumeHeaderWalk()
 
 			case msg := <-blockQueue:
 				sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
