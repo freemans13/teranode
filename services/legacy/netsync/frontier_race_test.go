@@ -469,8 +469,15 @@ func TestFetchHeaderBlocks_PublishesTheFrontier(t *testing.T) {
 
 	first := chainhash.Hash{0xf1}
 	second := chainhash.Hash{0xf2}
+
+	// Seeded through the index, as every production push is: fetchHeaderBlocks
+	// asks the index whether startHeader is still the live holder of its hash
+	// before acting on lookups made with the header lock released.
+	sm.headerMu.Lock()
 	sm.startHeader = sm.headerList.PushBack(&headerNode{height: 10, hash: &first})
-	sm.headerList.PushBack(&headerNode{height: 11, hash: &second})
+	sm.indexHeaderLocked(sm.startHeader, first)
+	sm.indexHeaderLocked(sm.headerList.PushBack(&headerNode{height: 11, hash: &second}), second)
+	sm.headerMu.Unlock()
 
 	sm.fetchHeaderBlocks()
 

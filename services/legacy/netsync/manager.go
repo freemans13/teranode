@@ -2260,6 +2260,19 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 
 // fetchHeaderBlocks creates and sends a request to the syncPeer for the next
 // list of blocks to be downloaded based on the current list of headers.
+//
+// The header list is only ever read or written under headerMu, but the "do we
+// already have this block?" question is a gRPC round-trip to the blockchain
+// service on a context with no deadline, so it is asked with the lock released.
+// The walk therefore runs in rounds: snapshot the next run of candidate hashes
+// under the lock, ask about them unlocked, re-take the lock and commit. Bounding
+// the number of round-trips bounds the cost in calls but not in time, and time
+// is the only thing a goroutine waiting on headerMu cares about — the block
+// queue consumer takes this same lock as its first act in headers-first mode.
+//
+// Nothing raced means nothing changes: the getdata carries exactly the blocks,
+// in exactly the order, the single-locked walk produced, and startHeader is left
+// on exactly the same header.
 func (sm *SyncManager) fetchHeaderBlocks() {
 	// Nothing to do if there is no sync peer.
 	sp := sm.loadSyncPeer()
@@ -2268,13 +2281,13 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		return
 	}
 
-	// Nothing to do if there is no start header. The header list is walked and
-	// startHeader re-anchored below, so everything from here to the getdata
-	// send runs under headerMu; the send itself does not (Rule B).
 	sm.headerMu.Lock()
+	haveStartHeader := sm.startHeader != nil
+	headerListLen := sm.headerList.Len()
+	sm.headerMu.Unlock()
 
-	if sm.startHeader == nil {
-		sm.headerMu.Unlock()
+	// Nothing to do if there is no start header.
+	if !haveStartHeader {
 		sm.logger.Warnf("fetchHeaderBlocks called with no start header")
 
 		return
@@ -2283,7 +2296,6 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	// Calculate how many blocks to request to reach the dynamic max limit.
 	// The limit adjusts based on observed block sizes (20 for small, down to 1 for >2GB).
 	if _, exists := sm.peerStates.Get(sp); !exists {
-		sm.headerMu.Unlock()
 		sm.logger.Warnf("[fetchHeaderBlocks] sync peer state not found")
 
 		return
@@ -2291,80 +2303,62 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 
 	currentInFlight := sm.blockDownloads.CountForPeer(sp)
 	dynamicMaxInFlight := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+
 	maxBlocks := dynamicMaxInFlight - currentInFlight
 	if maxBlocks <= 0 {
-		sm.headerMu.Unlock()
 		sm.logger.Debugf("[fetchHeaderBlocks] Already at max in-flight blocks (%d/%d), not requesting more", currentInFlight, dynamicMaxInFlight)
 
 		return
 	}
 
-	headerListLen := sm.headerList.Len()
 	avgBlockSize := sm.blockSizeTracker.getAverageSize()
 	sm.logger.Debugf("[fetchHeaderBlocks] Header list: %d blocks, in-flight: %d/%d, avg size: %d bytes, requesting: %d more",
 		headerListLen, currentInFlight, dynamicMaxInFlight, avgBlockSize, maxBlocks)
 
 	// Build up a getdata request for the list of blocks the headers
 	// describe. Size the InvList to maxBlocks rather than headerList.Len()
-	// because the loop below breaks at maxBlocks — sizing to headerList.Len()
+	// because the walk below stops at maxBlocks — sizing to headerList.Len()
 	// (often 2000) caused large repeated allocations (~16 KB) when only a
 	// handful of slots ever get used (maxBlocks shrinks to 1 for >2 GB blocks).
 	getDataMessage := wire.NewMsgGetDataSizeHint(uint(maxBlocks)) // nolint:gosec
 	numRequested := 0
 
-	for e := sm.startHeader; e != nil; e = e.Next() {
-		node, ok := e.Value.(*headerNode)
+	// A round asks about at most the blocks still wanted. Blocks we turn out to
+	// already have cost a slot in the round but not a request, so a second round
+	// picks up the shortfall — which is what keeps the getdata contents the same
+	// as the old single-locked walk, where the loop simply carried on past them.
+	for numRequested < maxBlocks {
+		hashes, anchor, anchorHash, ok := sm.snapshotHeaderCandidates(maxBlocks - numRequested)
 		if !ok {
-			sm.logger.Warnf("Header list node type is not a headerNode")
-			continue
+			break
 		}
 
-		iv := wire.NewInvVect(wire.InvTypeBlock, node.hash)
+		alreadyHave := make([]bool, len(hashes))
 
-		// The one deliberate exception to Rule B. haveInventory does a
-		// blockchain header lookup for this single hash, and the loop runs at
-		// most dynamicMaxInFlight times (20, falling to 1 for multi-GB blocks),
-		// so this is a bounded cost — not the unbounded GetBestBlockHeader the
-		// rule is aimed at. The two goroutines that would contend for headerMu
-		// are the same two that call fetchHeaderBlocks, so barely any new
-		// serialisation is introduced. Follow-up once the header list is
-		// indexed by hash: snapshot the hashes, do the lookups unlocked, then
-		// re-take the lock and only re-anchor startHeader if it has not moved.
-		haveInv, err := sm.haveInventory(iv)
-		if err != nil {
-			sm.logger.Warnf("Unexpected failure when checking for "+
-				"existing inventory during header block "+
-				"fetch: %v", err)
-		}
+		for i := range hashes {
+			iv := wire.NewInvVect(wire.InvTypeBlock, &hashes[i])
 
-		if !haveInv {
-			// Record the request before it goes out. A block the ledger will
-			// not take is a block we must not ask for: the reply would arrive
-			// with nothing vouching for it and cost this peer its connection.
-			// Leaving startHeader where it is means the header is simply picked
-			// up again on the next pass, once arrivals or expiry have made room.
-			if !sm.blockDownloads.Add(sp, *node.hash) {
-				sm.logger.Warnf("[fetchHeaderBlocks] block download ledger full at %d blocks, holding off on %s", maxTrackedBlockDownloads, node.hash)
-				break
+			haveInv, err := sm.haveInventory(iv)
+			if err != nil {
+				sm.logger.Warnf("Unexpected failure when checking for "+
+					"existing inventory during header block "+
+					"fetch: %v", err)
 			}
 
-			if err = getDataMessage.AddInvVect(iv); err != nil {
-				sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
-				break
-			}
-
-			numRequested++
+			alreadyHave[i] = haveInv
 		}
 
-		sm.startHeader = e.Next()
+		requested, more := sm.commitHeaderCandidates(sp, anchor, anchorHash, hashes, alreadyHave, getDataMessage)
+		numRequested += requested
 
-		if numRequested >= maxBlocks {
-			sm.logger.Debugf("[fetchHeaderBlocks] Limiting to %d block(s) from %s", numRequested, sp)
+		if !more {
 			break
 		}
 	}
 
-	sm.headerMu.Unlock()
+	if numRequested > 0 {
+		sm.logger.Debugf("[fetchHeaderBlocks] Requesting %d block(s) from %s", numRequested, sp)
+	}
 
 	if len(getDataMessage.InvList) > 0 {
 		sp.QueueMessage(getDataMessage, nil)
@@ -2375,6 +2369,114 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	// walk above has already released headerMu, and the publish-after-send
 	// order is unchanged.
 	sm.publishFrontier(time.Now())
+}
+
+// snapshotHeaderCandidates copies up to limit hashes from startHeader forward,
+// and returns the element startHeader points at together with its hash, so the
+// blockchain lookups can be made with headerMu released and the commit can tell
+// whether the list moved in the meantime. ok is false when there is nothing
+// usable to walk.
+func (sm *SyncManager) snapshotHeaderCandidates(limit int) (hashes []chainhash.Hash, anchor *list.Element, anchorHash chainhash.Hash, ok bool) {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	anchor = sm.startHeader
+	if anchor == nil {
+		return nil, nil, chainhash.Hash{}, false
+	}
+
+	hashes = make([]chainhash.Hash, 0, limit)
+
+	for e := anchor; e != nil && len(hashes) < limit; e = e.Next() {
+		node, isHeaderNode := e.Value.(*headerNode)
+		if !isHeaderNode || node.hash == nil {
+			// Unreachable: nothing but a *headerNode carrying a hash is ever put
+			// in the list. Stopping the walk is the safe reading of a list that
+			// says otherwise — stepping over an entry we cannot identify would
+			// leave startHeader anchored past headers nobody ever asked for.
+			sm.logger.Warnf("Header list node is not a headerNode carrying a hash")
+
+			break
+		}
+
+		hashes = append(hashes, *node.hash)
+	}
+
+	if len(hashes) == 0 {
+		return nil, nil, chainhash.Hash{}, false
+	}
+
+	return hashes, anchor, hashes[0], true
+}
+
+// commitHeaderCandidates re-takes headerMu and, provided the list has not moved
+// under the unlocked lookups, does exactly what the old single-locked walk did:
+// record each block we do not already have against the sync peer, add it to the
+// getdata, and advance startHeader past every header it considered.
+//
+// more reports whether another round may follow. It is false when the walk
+// reached the end of the list, when a request was held back, and when the list
+// moved while the lookups were in flight — in that last case nothing at all is
+// committed, because a getdata built from a stale reading of the list could ask
+// for a block twice or step over one nobody asked for. The next tick redoes the
+// round against the list as it then is.
+func (sm *SyncManager) commitHeaderCandidates(sp *peerpkg.Peer, anchor *list.Element, anchorHash chainhash.Hash,
+	hashes []chainhash.Hash, alreadyHave []bool, getDataMessage *wire.MsgGetData) (requested int, more bool) {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	// startHeader must still be the element the round was walked from, and that
+	// element must still be the live holder of its hash. Both are needed:
+	// handleBlockMsg removes the front of the list, which is startHeader itself
+	// once the block queue has caught up, and a removed element still answers
+	// Next() with nil rather than admitting it is gone. The index is what tells
+	// a detached element from the last one in the list.
+	if sm.startHeader != anchor || sm.headerIndex[anchorHash] != anchor {
+		sm.logger.Debugf("[fetchHeaderBlocks] header list moved while checking inventory, leaving the rest to the next pass")
+
+		return 0, false
+	}
+
+	e := anchor
+
+	for i := range hashes {
+		if e == nil {
+			return requested, false
+		}
+
+		node, isHeaderNode := e.Value.(*headerNode)
+		if !isHeaderNode || node.hash == nil || !node.hash.IsEqual(&hashes[i]) {
+			// The run of headers we asked about is no longer the run in the
+			// list, so stop where the two still agree.
+			return requested, false
+		}
+
+		if !alreadyHave[i] {
+			// Record the request before it goes out. A block the ledger will
+			// not take is a block we must not ask for: the reply would arrive
+			// with nothing vouching for it and cost this peer its connection.
+			// Leaving startHeader where it is means the header is simply picked
+			// up again on the next pass, once arrivals or expiry have made room.
+			if !sm.blockDownloads.Add(sp, hashes[i]) {
+				sm.logger.Warnf("[fetchHeaderBlocks] block download ledger full at %d blocks, holding off on %s", maxTrackedBlockDownloads, node.hash)
+
+				return requested, false
+			}
+
+			if err := getDataMessage.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, node.hash)); err != nil {
+				sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
+
+				return requested, false
+			}
+
+			requested++
+		}
+
+		e = e.Next()
+		sm.startHeader = e
+	}
+
+	return requested, e != nil
 }
 
 // handleHeadersMsg handles block header messages from all peers.  Headers are
