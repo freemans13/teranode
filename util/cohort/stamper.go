@@ -62,15 +62,19 @@ func NewStamper(opts ...StamperOption) *Stamper {
 //
 // A clock that is slow, frozen or running backwards must not stop transactions
 // being created, so Stamp falls back to floor+1 rather than failing, and counts
-// the event in SkewedStamps. It only fails in two cases that no amount of
-// falling back can rescue: the clock reads before the Bitcoin genesis block and
-// no floor has ever been observed, so there is nothing to count up from; and the
-// floor has reached the top of the uint32 range, so there is no room above it.
+// the event in SkewedStamps. The same fallback covers a clock reading outside
+// the representable range entirely - before the Bitcoin genesis second, or
+// beyond what a uint32 can hold. It only fails in two cases that no amount of
+// falling back can rescue: the clock is outside that range and no floor has ever
+// been observed, so there is nothing to count up from; and the floor has reached
+// the top of the uint32 range, so there is no room above it.
 func (s *Stamper) Stamp() (ID, error) {
 	// A clock reading outside the representable range leaves us with no
-	// candidate at all; the floor fallback below is then the only option.
-	candidate, err := FromTime(s.now())
-	if err != nil {
+	// candidate at all; the floor fallback below is then the only option. Keep
+	// the reason rather than asserting one - the clock can be too early or too
+	// late, and reporting the wrong direction sends an operator the wrong way.
+	candidate, clockErr := FromTime(s.now())
+	if clockErr != nil {
 		candidate = Unset
 	}
 
@@ -81,7 +85,7 @@ func (s *Stamper) Stamp() (ID, error) {
 	}
 
 	if floor == Unset {
-		return Unset, errors.NewProcessingError("cohort: clock is before genesis and no mapped cohort has been observed")
+		return Unset, errors.NewProcessingError("cohort: clock reading is outside the cohort range and no mapped cohort has been observed", clockErr)
 	}
 
 	if floor == MaxClock {
@@ -129,7 +133,8 @@ func (s *Stamper) Floor() ID {
 
 // SkewedStamps returns how many stamps had to fall back to floor+1 because the
 // clock had not advanced past the floor. A number that keeps climbing means the
-// clock is slow, frozen or running backwards.
+// clock is slow, frozen, running backwards, or so far ahead that it falls
+// outside the representable cohort range.
 func (s *Stamper) SkewedStamps() uint64 {
 	return s.skewed.Load()
 }

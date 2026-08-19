@@ -124,6 +124,27 @@ func TestStamperClockBeforeGenesis(t *testing.T) {
 	require.Equal(t, uint64(1), stamper.SkewedStamps())
 }
 
+func TestStamperClockBeyondRange(t *testing.T) {
+	// A clock past 2106 is as unrepresentable as one before genesis, and the
+	// error must not claim the opposite direction.
+	clock := newFixedClock(int64(MaxClock) + 1)
+	stamper := NewStamper(WithClock(clock.now))
+
+	_, err := stamper.Stamp()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "outside the cohort range")
+	require.NotContains(t, err.Error(), "before genesis")
+	require.Equal(t, uint64(0), stamper.SkewedStamps())
+
+	// With a floor, the same unusable clock still hands out a stamp.
+	stamper.ObserveMapped(GenesisTime + 11)
+
+	got, err := stamper.Stamp()
+	require.NoError(t, err)
+	require.Equal(t, GenesisTime+12, got)
+	require.Equal(t, uint64(1), stamper.SkewedStamps())
+}
+
 func TestStamperClockSpaceExhausted(t *testing.T) {
 	clock := newFixedClock(int64(MaxClock))
 	stamper := NewStamper(WithClock(clock.now))
