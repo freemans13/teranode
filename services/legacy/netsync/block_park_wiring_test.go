@@ -30,6 +30,7 @@ type parkWiringHarness struct {
 	sm      *SyncManager
 	client  *blockchain2.Mock
 	peer    *peerpkg.Peer
+	rec     *peerMsgRecorder
 	parkDir string
 	blocks  []*bsvutil.Block
 }
@@ -81,7 +82,7 @@ func newParkWiringHarness(t *testing.T, parkOn bool) *parkWiringHarness {
 	checkpointHash := chainhash.Hash{0xcc}
 	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 1_000_000, Hash: &checkpointHash}
 
-	syncPeer, _, _ := connectRacePeer(t, 71, 1000)
+	syncPeer, _, rec := connectRecordingPeer(t, 71, 1000)
 	registerRacePeer(sm, syncPeer)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
@@ -103,7 +104,7 @@ func newParkWiringHarness(t *testing.T, parkOn bool) *parkWiringHarness {
 	sm.headerMu.Unlock()
 	sm.headersFirstMode.Store(true)
 
-	return &parkWiringHarness{sm: sm, client: client, peer: syncPeer, parkDir: parkDirectory(storeURL), blocks: blocks}
+	return &parkWiringHarness{sm: sm, client: client, peer: syncPeer, rec: rec, parkDir: parkDirectory(storeURL), blocks: blocks}
 }
 
 // deliver feeds one block through the block-queue consumer's own path.

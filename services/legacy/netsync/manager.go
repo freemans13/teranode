@@ -2091,6 +2091,8 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// anything reaches the disk, so a peer cannot fill the park with
 			// rubbish, and it is committed from disk as soon as its parent
 			// lands.
+			parked := false
+
 			switch sm.blockPark.Park(sm.ctx, parkedBlock{
 				hash:      bmsg.blockHash,
 				prevBlock: prevBlockHash,
@@ -2100,16 +2102,14 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			case parkAccepted:
 				sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
 
-				// The peer answered; the ordering is not its fault, so keep its
-				// stall timer fresh. Then keep the pipeline full: this peer's
-				// in-flight count just dropped and nothing else will notice.
-				if sps, ok := sm.syncPeerStateFor(peer); ok {
-					sps.updateLastBlockTime()
-				}
-
-				sm.fetchMoreHeaderBlocks(peer)
-
-				return nil
+				// No stall-timer refresh here. HandleBlockDirect already
+				// refreshed it at receipt, before the parent lookup that made
+				// this an orphan, so a second refresh bought nothing — and a
+				// peer that answers with an endless stream of orphans is exactly
+				// what the stall detector exists to rotate. The drop path below
+				// has never refreshed it, and parking must not judge a peer
+				// differently from discarding.
+				parked = true
 
 			case parkRejected:
 				// The block failed its own stateless checks — a peer fault, and
@@ -2123,15 +2123,37 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				// and has to be downloaded again.
 			}
 
-			sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks",
-				bmsg.blockHash, prevBlockHash)
+			if parked {
+				// The block is kept, so the walk must NOT be rewound onto it:
+				// it is already downloaded and the park commits it from disk
+				// when the parent lands. Every path that later gives the block
+				// up rewinds then instead. What does need doing is topping the
+				// pipeline back up, because this peer's in-flight count just
+				// dropped and nothing else will notice.
+				sm.fetchMoreHeaderBlocks(peer)
+			} else {
+				sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks",
+					bmsg.blockHash, prevBlockHash)
 
-			// The block is being dropped, so put the download walk back on it.
-			// Without this the getblocks below is the only recovery there is, and
-			// in headers-first mode it is inert: processInvMsg returns before it
-			// can request anything, so the block is never asked for again.
-			sm.rewindHeaderCursor(bmsg.blockHash, removedFront)
+				// The block is being dropped, so put the download walk back on
+				// it. Without this the getblocks below is the only recovery
+				// there is, and in headers-first mode it is inert: processInvMsg
+				// returns before it can request anything, so the block is never
+				// asked for again.
+				sm.rewindHeaderCursor(bmsg.blockHash, removedFront)
+			}
 
+			// Parked or dropped, the parent still has to be asked for, and the
+			// getblocks is not an alternative to keeping the block — it is the
+			// only thing that fetches the gap. It is also the batch-continuation
+			// signal the legacy protocol runs on: the peer pushes its tip after
+			// a batch and then sends nothing at all until the next getblocks
+			// arrives. Sent in both modes, exactly as the drop path has always
+			// sent it, so turning the park on cannot change what a peer sees.
+			// Inside headers-first mode the reply is dropped by processInvMsg
+			// and the request costs one message; outside it — every node past
+			// the final checkpoint — it is the whole of the recovery, and
+			// fetchMoreHeaderBlocks above does nothing at all.
 			sm.requestMissingBlocks(peer, bmsg.blockHash)
 
 			return nil
