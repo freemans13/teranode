@@ -53,8 +53,10 @@ type CatchupContext struct {
 	// bestBlockMeta is the accepted chain tip read once by findCommonAncestor and reused by
 	// every later step, so they all reason about the same tip. Reading it a second time would
 	// let the tip move in between: the ancestor is chosen against this height, so a tip that
-	// decreased would make the ancestor exceed it and trip the invariant
-	// checkSecretMiningFromCommonAncestor asserts — charging a peer for our own local reorg.
+	// decreased would make the ancestor exceed it and trip the height check
+	// checkSecretMiningFromCommonAncestor makes, throwing away a sound catchup over our own
+	// local reorg. That check reports the trip as a service error, so the peer is not charged
+	// for it, but the catchup is lost all the same.
 	bestBlockMeta           *model.BlockHeaderMeta
 	blockHeaders            []*model.BlockHeader
 	headersFetchResult      *catchup.Result
@@ -1508,9 +1510,10 @@ func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockU
 	// The tip arrives from findCommonAncestor rather than being read again here, so the depth
 	// trigger, the work gate and the ancestor selection all reason about one fixed tip. Re-reading
 	// let them disagree: the ancestor is selected against a tip that may since have moved, and a
-	// decrease would make the ancestor exceed it and trip the invariant below — a local reorg
-	// charged to the peer. A missing tip means the caller skipped that step, which is our fault,
-	// not the peer's: abort without penalising it.
+	// decrease would make the ancestor exceed it and trip the height check below, throwing away
+	// a sound catchup over our own local reorg. That trip is reported as a service error, so the
+	// peer is not charged for it, but the catchup is lost all the same. A missing tip means the
+	// caller skipped that step, which is our fault, not the peer's: abort without penalising it.
 	if bestMeta == nil {
 		u.logger.Warnf("[catchup][%s] no best block header for secret-mining check from peer %s - aborting without flagging malicious", blockUpTo.Hash().String(), baseURL)
 		return errors.NewServiceError("[catchup][%s] no best block header available for secret-mining check", blockUpTo.Hash().String())

@@ -4238,7 +4238,7 @@ func TestFindCommonAncestor_AcceptsHeadersAtOrBelowCurrentHeight(t *testing.T) {
 // unreachable. The ancestor is selected against the tip read here, and the secret-mining check
 // asserts the ancestor does not exceed the tip it measures from. While those were two separate
 // reads the tip could move between them, so a local reorg that lowered it would trip that
-// assertion — and its failure path returns a processing error, which is charged to the peer.
+// assertion and abort a sound catchup for a reason that has nothing to do with the peer.
 // One read, stashed on the context and handed on, removes the window entirely.
 func TestCatchupReadsChainTipOnce(t *testing.T) {
 	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
