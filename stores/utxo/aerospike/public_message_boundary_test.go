@@ -8,9 +8,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// allLuaErrorCodes is every error code the Lua layer can return. Kept in one
-// place so a new code that reaches createGeneralError without considering the
-// public error boundary trips the tests below.
+// allLuaErrorCodes mirrors the LuaErrorCode constants in teranode.go, so the
+// tests below sweep every code createGeneralError can be handed rather than
+// just the interesting ones. Go constants cannot be enumerated at runtime, so
+// this list is not self-checking: adding a LuaErrorCode constant means adding
+// it here too, or the new code goes unswept.
 var allLuaErrorCodes = []LuaErrorCode{
 	LuaErrorCodeTxNotFound, LuaErrorCodeConflicting, LuaErrorCodeLocked,
 	LuaErrorCodeCreating, LuaErrorCodeFrozen, LuaErrorCodeAlreadyFrozen,

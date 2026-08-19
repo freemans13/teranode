@@ -22,10 +22,10 @@ import (
 // treatment in ValidateWithOptions, and which break out on the first attempt.
 //
 // NOTE: this uses a fully mocked utxo.Store (utxo.MockUtxostore) rather than
-// the sqlitememory SQL store used elsewhere in this file. The sqlitememory
-// store can genuinely produce ErrTxLocked (via the parent's `locked` column,
-// see TestValidator_LockedFlagNotChangedIfBlockAssemblyDidNotStoreTx above),
-// but it cannot produce ErrTxCreating: that error only comes from Aerospike's
+// the sqlitememory SQL store the rest of this package's validator tests use.
+// The sqlitememory store can genuinely produce ErrTxLocked (via the parent's
+// `locked` column, see TestValidator_LockedFlagNotChangedIfBlockAssemblyDidNotStoreTx
+// in Validator_test.go), but it cannot produce ErrTxCreating: that error only comes from Aerospike's
 // LuaErrorCodeCreating path (stores/utxo/aerospike/spend.go) for a large,
 // multi-record parent still being written, which the SQL store has no
 // equivalent state for. Rather than fake that condition through a store that
@@ -34,12 +34,13 @@ import (
 // call returns it, which is what the "retry on locked/creating" logic
 // actually branches on.
 func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
-	// MANDATORY here, as in the other tests in this package that build a Validator by
-	// hand: the retry loop increments package-level CounterVecs that only New() (via
-	// initPrometheusMetrics) populates, so without this they are nil and the retry path
-	// panics. Running the whole package hides it — an earlier test happens to have run
-	// the sync.Once — so the crash only shows up under -run, which is the documented
-	// single-test workflow.
+	// MANDATORY here, for the same reason as in
+	// TestValidator_TwoPhaseCommitCompletesAfterTxMetaSerializationFailure
+	// (Validator_test.go): the retry loop increments package-level CounterVecs that
+	// only New() (via initPrometheusMetrics) populates, so without this they are nil
+	// and the retry path panics. Running the whole package hides it — an earlier test
+	// happens to have run the sync.Once — so the crash only shows up under -run, which
+	// is the documented single-test workflow.
 	initPrometheusMetrics()
 
 	tracing.SetupMockTracer()
