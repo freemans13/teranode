@@ -276,6 +276,23 @@ func (p *blockPark) Len() int {
 	return len(p.entries)
 }
 
+// Has reports whether this block is parked: downloaded, checked and on disk,
+// waiting for its parent. It is the question the inventory path has to ask
+// before it asks a peer for a block, because a parked block is in no other place
+// that question looks.
+func (p *blockPark) Has(hash chainhash.Hash) bool {
+	if p == nil {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	_, ok := p.entries[hash]
+
+	return ok
+}
+
 // Bytes returns the serialized bytes currently charged against the budget.
 func (p *blockPark) Bytes() int64 {
 	if p == nil {

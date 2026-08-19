@@ -3156,6 +3156,19 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 	switch invVect.Type {
 	case wire.InvTypeBlock:
+		// A parked block is downloaded, checked and on disk; it is simply not in
+		// the chain yet, because its parent is not. Asking the blockchain alone
+		// answers "no" for it, and past the final checkpoint — which is every
+		// mainnet node — that answer is what the whole recovery loop runs on: the
+		// getblocks a park sends brings back an inv, the inv is not recognised,
+		// and the block we are already holding is downloaded all over again,
+		// once every blockRequestRetryInterval for as long as it stays parked.
+		// Without this the park saves the disk write and none of the bandwidth
+		// outside headers-first mode.
+		if sm.blockPark.Has(invVect.Hash) {
+			return true, nil
+		}
+
 		// single round-trip: GetBlockHeader tells us both existence and validity
 		_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &invVect.Hash)
 		if err != nil {
