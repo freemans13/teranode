@@ -170,3 +170,42 @@ func TestSyncManager_AParkedOrphanIsStillAnsweredWithAGetblocks(t *testing.T) {
 		})
 	}
 }
+
+// TestSyncManager_AParkedFrontBlockIsAskedForAgainWhenItIsGivenUp is the case
+// the rewind machinery exists for and nothing exercised. A block that arrives as
+// the front of the header list has its header removed and unindexed before the
+// park ever sees it, so by the time the park gives the block up there is nothing
+// left to look the header up by. Unless the park carried that header node with
+// the block, the rewind finds nothing, and the block is in neither the header
+// list, nor the park, nor any download ledger — sync cannot pass it again
+// without a peer rotation that rebuilds the whole walk.
+func TestSyncManager_AParkedFrontBlockIsAskedForAgainWhenItIsGivenUp(t *testing.T) {
+	h := newParkWiringHarness(t, true)
+
+	front := h.blocks[0].MsgBlock().BlockHash()
+
+	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+
+	require.NoError(t, h.deliver(t, 0))
+	require.Equal(t, 1, h.sm.blockPark.Len(), "the front block parks like any other orphan")
+
+	// This is what makes the case different: its header left the list on
+	// arrival, so an index lookup can no longer find it.
+	h.sm.headerMu.Lock()
+	_, stillIndexed := h.sm.headerIndex[front]
+	h.sm.headerMu.Unlock()
+
+	require.False(t, stillIndexed, "an arriving front block's header is removed before the park sees it")
+
+	// The parent never arrives and the block's time runs out.
+	h.sm.sweepParkedBlocks(time.Now().Add(parkEntryTTL + time.Second))
+
+	require.Zero(t, h.sm.blockPark.Len())
+
+	before := h.rec.getDataCount()
+
+	h.sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, front) }, 5*time.Second),
+		"a block given up on must go back into the download walk, or nothing ever asks for it again")
+}

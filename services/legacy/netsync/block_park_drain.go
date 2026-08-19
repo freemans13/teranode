@@ -65,7 +65,7 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 		// here, so give the block up and make the walk ask for it again.
 		sm.logger.Warnf("[commitParkedBlock][%s] parked block could not be read back, it will have to be downloaded again: %v", entry.hash, err)
 		sm.blockPark.Delete(sm.ctx, entry)
-		sm.rewindHeaderCursor(entry.hash, nil)
+		sm.rewindHeaderCursor(entry.hash, entry.removedFront)
 
 		return false
 	}
@@ -138,7 +138,7 @@ func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 	}
 
 	sm.blockPark.Delete(sm.ctx, entry)
-	sm.rewindHeaderCursor(entry.hash, nil)
+	sm.rewindHeaderCursor(entry.hash, entry.removedFront)
 
 	// A misbehaviour signal goes to the peer that actually sent the block or
 	// nowhere at all. Aiming it at a fallback peer would punish an innocent one
@@ -225,7 +225,7 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 	for _, entry := range sm.blockPark.Expire(now) {
 		sm.logger.Warnf("[sweepParkedBlocks][%s] parent %s never arrived, giving the block up after %s", entry.hash, entry.prevBlock, parkEntryTTL)
 		sm.blockPark.Delete(sm.ctx, entry)
-		sm.rewindHeaderCursor(entry.hash, nil)
+		sm.rewindHeaderCursor(entry.hash, entry.removedFront)
 	}
 
 	for _, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {

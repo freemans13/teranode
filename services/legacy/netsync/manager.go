@@ -2098,6 +2098,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				prevBlock: prevBlockHash,
 				height:    bmsg.blockHeight,
 				peer:      bmsg.peer,
+				// The header node this block's arrival already took off the
+				// front, so whichever path eventually gives the block up can put
+				// it back. Without it a parked front block is unreachable: its
+				// header is gone from the list and from the index, and the
+				// rewind has nothing to work from.
+				removedFront: removedFront,
 			}, msgBlock) {
 			case parkAccepted:
 				sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
