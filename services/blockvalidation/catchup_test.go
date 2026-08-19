@@ -4290,17 +4290,17 @@ func TestFindCommonAncestor_AcceptsHeadersAtOrBelowCurrentHeight(t *testing.T) {
 	assert.Equal(t, uint32(99), catchupCtx.commonAncestorMeta.Height)
 }
 
-// TestCatchupReadsChainTipOnce pins the arrangement that makes the ancestor-height invariant
-// unreachable. The ancestor is selected against the tip read here, and the secret-mining check
-// asserts the ancestor does not exceed the tip it measures from. While those were two separate
-// reads the tip could move between them, so a local reorg that lowered it would trip that
-// assertion and abort a sound catchup for a reason that has nothing to do with the peer.
+// TestAncestorSearchAndSecretMiningShareOneTipRead pins the arrangement that makes the
+// ancestor-height check unreachable. The ancestor is selected against the tip read here, and the
+// secret-mining check asserts the ancestor does not exceed the tip it measures from. While those
+// were two separate reads the tip could move between them, so a local reorg that lowered it would
+// trip that check and abort a sound catchup for a reason that has nothing to do with the peer.
 // One read, stashed on the context and handed on, removes the window entirely.
-// TestAncestorSearchAndSecretMiningShareOneTipRead pins the arrangement rather than the
-// mechanism: the ancestor search, the depth baseline and the work gate must all measure against
-// one tip. (Only these two steps — catchupGetBlockHeaders reads the tip earlier in the same
-// catchup, but only to seed the locator, so the name is deliberately narrower than "catchup".)
-// TestSecretMiningSurvivesATipThatMovesDown is the outcome half of the same contract.
+//
+// Only these two steps share it: catchupGetBlockHeaders reads the tip earlier in the same
+// catchup, but only to seed the locator, so this name is deliberately narrower than "catchup".
+// TestSecretMiningSurvivesATipThatMovesDown is the outcome half of the same contract — this test
+// asserts the call count, which alone cannot show what the single read buys.
 func TestAncestorSearchAndSecretMiningShareOneTipRead(t *testing.T) {
 	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
