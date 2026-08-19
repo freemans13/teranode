@@ -661,8 +661,13 @@ func (u *Server) findCommonAncestor(ctx context.Context, catchupCtx *CatchupCont
 	// shallow fork could be accused of withholding a chain. Nothing here needs the ancestor's
 	// UTXOs to be present — catchup validates forward and never unspends or rewinds.
 	//
-	// This is the only place the tip is read. It is stashed on the context and handed to the
-	// later steps rather than re-read, so the whole catchup measures against one fixed tip.
+	// This is the only place the ancestor search, the fork-depth baseline and the work
+	// comparison take their tip from: it is stashed on the context and handed to the later
+	// steps rather than re-read, so all three measure against one fixed tip.
+	// catchupGetBlockHeaders reads the tip too, earlier in this same catchup, but only to seed
+	// the block locator and the startHash/startHeight it reports — neither feeds a decision
+	// here, so a tip that moves between the two reads costs at most a locator that starts
+	// lower than it needed to.
 	_, bestMeta, err := u.blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
 		// Our own RPC failed. ServiceError so the caller retries without charging the peer for
