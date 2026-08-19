@@ -624,9 +624,11 @@ type SyncManager struct {
 	// PushGetHeadersMsg, PushGetBlocksMsg, DisconnectWithWarning — a peer's
 	// output queue is buffered but finite, so a send can block) and no
 	// blockchain client call that can block for an unbounded time
-	// (GetBestBlockHeader can take minutes during initial sync). There is one
-	// named exception, the bounded haveInventory lookup inside
-	// fetchHeaderBlocks' walk, justified at that call site.
+	// (GetBestBlockHeader can take minutes during initial sync). There are no
+	// exceptions. fetchHeaderBlocks' haveInventory lookups used to be one, on
+	// the grounds that the number of them was bounded; they are now made with
+	// the lock released, in rounds, because bounding the number of calls does
+	// not bound the time they take — see fetchHeaderBlocks.
 	headerMu         sync.Mutex
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
 	headerList       *list.List
@@ -2425,14 +2427,51 @@ func (sm *SyncManager) commitHeaderCandidates(sp *peerpkg.Peer, anchor *list.Ele
 	sm.headerMu.Lock()
 	defer sm.headerMu.Unlock()
 
-	// startHeader must still be the element the round was walked from, and that
-	// element must still be the live holder of its hash. Both are needed:
-	// handleBlockMsg removes the front of the list, which is startHeader itself
-	// once the block queue has caught up, and a removed element still answers
-	// Next() with nil rather than admitting it is gone. The index is what tells
-	// a detached element from the last one in the list.
-	if sm.startHeader != anchor || sm.headerIndex[anchorHash] != anchor {
+	// startHeader must still be the element the round was walked from. When it
+	// is not, another round or a reset has already moved it on, and it points
+	// into the list as it now is — so there is nothing to repair and nothing to
+	// commit: the headers this round walked are either already requested or no
+	// longer wanted. This is the ordinary case, because two rounds run
+	// concurrently all the time: the block-queue consumer starts one on every
+	// block that arrives and every headers message starts another.
+	if sm.startHeader != anchor {
 		sm.logger.Debugf("[fetchHeaderBlocks] header list moved while checking inventory, leaving the rest to the next pass")
+
+		return 0, false
+	}
+
+	// startHeader still points at the anchor, but the anchor is no longer the
+	// live holder of its hash: the block arrived while the lookups were in
+	// flight and handleBlockMsg took that element out of the list. Nothing may
+	// be committed from a reading of the list that stale — but the pointer
+	// cannot simply be left where it is either, and that is the part that was
+	// missing. container/list clears a removed element's links, so a detached
+	// startHeader answers Next() with nil: every later round would snapshot one
+	// header, be refused here, and commit nothing, so the header list would
+	// never drain again; and handleBlockMsg reads a non-nil startHeader as
+	// "there is still work queued", so its getblocks fallback would never fire
+	// either. Sync would fetch nothing at all until the 180 second stall
+	// detector rotated the peer, over and over. Before the walk was restructured
+	// to do its lookups unlocked, this healed itself by accident — the walk read
+	// Next() off the detached element, got nil, and stored that.
+	//
+	// Re-anchor on the front of the list rather than on nil, because the queued
+	// headers are still worth fetching and nil throws them away. It is provably
+	// the right element: headers only ever leave the list from the front, so an
+	// element that is detached while still being startHeader was the front when
+	// it went, which means nothing between the front and startHeader was
+	// outstanding and the new front is exactly the first header nobody has asked
+	// for yet. An empty list leaves startHeader nil, which is what re-enables
+	// the getblocks fallback.
+	if sm.headerIndex[anchorHash] != anchor {
+		var front *list.Element
+		if sm.headerList != nil {
+			front = sm.headerList.Front()
+		}
+
+		sm.startHeader = front
+
+		sm.logger.Debugf("[fetchHeaderBlocks] block %s arrived while checking inventory, re-anchoring the header walk on the front of the list", anchorHash)
 
 		return 0, false
 	}
