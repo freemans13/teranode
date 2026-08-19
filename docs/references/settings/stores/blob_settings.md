@@ -90,7 +90,9 @@ file:///data/store?batch=true&sizeInBytes=8388608
 > use `batch=true` where Delete-At-Height matters: `SetCurrentBlockHeight` is a no-op on a
 > batched store, so the wrapped store's height never advances and its DAH bookkeeping
 > stalls. Writes are also asynchronous, and a batch is held in memory until adding the next
-> item would take it past `sizeInBytes`, or until the store is closed.
+> item would take it past `sizeInBytes`, or until the store is closed. Keys must be exactly
+> 32 bytes: a batched store rejects anything else, so it cannot back a store that uses
+> non-hash keys.
 
 ### Hash-organized Store
 
