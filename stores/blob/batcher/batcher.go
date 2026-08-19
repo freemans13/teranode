@@ -216,6 +216,27 @@ func New(logger ulogger.Logger, blobStore blobStoreSetter, sizeInBytes int, writ
 	return b
 }
 
+// exceedsKeyRecordSize reports whether a value is too large for a key record to describe.
+// A key record stores its item's size as a uint32, so a larger value could never be indexed
+// no matter how the batch is flushed. Set refuses such a value synchronously rather than
+// accepting it and discarding it in the worker, by which point its caller has long since
+// been told the write was queued.
+//
+// Without writeKeys no key records are produced and no such limit applies. This is split out
+// from Set so the arithmetic can be tested directly: reaching the limit through Set would
+// need a 4 GiB value. On a platform where int is 32 bits the comparison is simply never
+// true, since no slice can be that long.
+//
+// Parameters:
+//   - valueLen: Length of the value being written
+//   - writeKeys: Whether key records, and therefore uint32 sizes, are being written
+//
+// Returns:
+//   - bool: Whether the value is too large to be addressed by a key record
+func exceedsKeyRecordSize(valueLen int, writeKeys bool) bool {
+	return writeKeys && int64(valueLen) > math.MaxUint32
+}
+
 // shouldFlushBefore reports whether the accumulated batch has to be written out before an
 // item of dataSize bytes can be appended to it.
 //
@@ -597,10 +618,7 @@ func (b *Batcher) Set(_ context.Context, hash []byte, fileType fileformat.FileTy
 		return errors.NewStorageError("batcher is closed, write not accepted")
 	}
 
-	// A key record addresses its item's size with a uint32, so a value this large could never
-	// be indexed. Refuse it here, synchronously, rather than accepting it and discarding it in
-	// the worker once its caller has already been told the write was queued.
-	if b.writeKeys && int64(len(value)) > math.MaxUint32 {
+	if exceedsKeyRecordSize(len(value), b.writeKeys) {
 		return errors.NewInvalidArgumentError("value of %d bytes cannot be indexed in a batch key record, limit is %d", len(value), int64(math.MaxUint32))
 	}
 

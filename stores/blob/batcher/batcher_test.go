@@ -576,6 +576,32 @@ func TestBatcher_Set_ShortKey_ReturnsError(t *testing.T) {
 //
 // The arithmetic is exercised directly rather than through Set, because reaching the
 // ceiling for real would need a 4 GiB batch.
+// TestBatcher_exceedsKeyRecordSize covers the guard Set applies to an oversize value.
+// The arithmetic is tested directly because reaching the limit through Set would need a
+// 4 GiB allocation. The boundary matters: a value of exactly MaxUint32 bytes still fits a
+// key record and must be accepted, so the comparison has to be strictly greater than.
+func TestBatcher_exceedsKeyRecordSize(t *testing.T) {
+	tests := []struct {
+		name      string
+		valueLen  int
+		writeKeys bool
+		want      bool
+	}{
+		{name: "an ordinary value is fine", valueLen: 4096, writeKeys: true, want: false},
+		{name: "exactly the ceiling still fits a key record", valueLen: math.MaxUint32, writeKeys: true, want: false},
+		{name: "one byte past the ceiling cannot be indexed", valueLen: math.MaxUint32 + 1, writeKeys: true, want: true},
+		{name: "without key records there is no ceiling", valueLen: math.MaxUint32 + 1, writeKeys: false, want: false},
+		{name: "an empty value is fine", valueLen: 0, writeKeys: true, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := exceedsKeyRecordSize(tt.valueLen, tt.writeKeys)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestBatcher_shouldFlushBefore(t *testing.T) {
 	// One item short of the ceiling, so a modest item tips it over.
 	nearCeiling := int(math.MaxUint32) - 8
