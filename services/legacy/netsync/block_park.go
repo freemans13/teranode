@@ -87,15 +87,22 @@ const (
 // WithNoHashPrefix and the blobs land in shard subdirectories that the flat
 // recovery scan never finds, and every parked block leaks on every restart.
 //
-// Deliberately no DAH option. The file store schedules its own blob deletion
-// when a DAH is set, or when the store carries a block-height retention; the
-// temp store has no retention today, so the park owns deletion itself. Anyone
-// adding retention to the temp store would be handing parked blocks to the
-// pruner mid-flight.
+// WithNoDAH is not belt and braces either. The park owns the lifetime of every
+// blob it writes: it deletes one when the block commits, when the block is given
+// up on, or when the restart scan finds it unusable, and nothing else may. The
+// file store, though, derives a delete-at-height from the STORE's block-height
+// retention for any blob that carries no DAH of its own, and MergeOptions copies
+// that retention in before these options are applied. The temp store has no
+// retention today, so without this the park's safety rested on a setting nobody
+// is guarding: the day one is added, every parked blob is booked with the
+// deletion scheduler and blocks start disappearing from under a live park.
+// WithNoDAH clears it here, per operation, which is the only level the park can
+// speak at — it does not own the store it is handed.
 var parkOpts = []options.FileOption{
 	options.WithSubDirectory(parkSubDirectory),
 	options.WithNoHashPrefix(),
 	options.WithAllowOverwrite(true),
+	options.WithNoDAH(),
 }
 
 // parkResult says what happened to a block offered to the park.
