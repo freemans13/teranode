@@ -59,16 +59,30 @@ const (
 )
 
 // publishFrontier records headerList's front node — the oldest block we have
-// asked for and not yet received — as the current download frontier. It reads
-// headerList, so it may only be called from the goroutines that already own it
-// (the block handler and the headers handler), never from the race timer.
+// asked for and not yet received — as the current download frontier. It takes
+// headerMu, so callers already holding it must use publishFrontierLocked
+// instead; sync.Mutex is not reentrant.
+//
+// Publishing the frontier here, rather than having the race timer read
+// headerList itself, is what keeps the timer off the header list entirely, so
+// it never has to take headerMu and the headerMu -> frontierMu ordering stays
+// one-directional.
+func (sm *SyncManager) publishFrontier(now time.Time) {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	sm.publishFrontierLocked(now)
+}
+
+// publishFrontierLocked is publishFrontier's body. The caller must hold
+// headerMu.
 //
 // The frontier is cleared rather than published when headers-first fetching is
 // not running, when the header list is empty, or when the front block has not
 // actually been requested yet — fetchHeaderBlocks stops early once the in-flight
 // cap is reached, leaving startHeader sitting on the front node, and a block we
 // never asked for is not stuck, it is simply not wanted yet.
-func (sm *SyncManager) publishFrontier(now time.Time) {
+func (sm *SyncManager) publishFrontierLocked(now time.Time) {
 	if !sm.headersFirstMode.Load() || sm.headerList == nil {
 		sm.clearFrontier()
 		return

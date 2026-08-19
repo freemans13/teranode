@@ -564,6 +564,28 @@ type SyncManager struct {
 	blockPrefetchWaiters atomic.Int64
 
 	// The following fields are used for headers-first mode.
+	//
+	// headerMu is the single owner of headerList, startHeader and
+	// nextCheckpoint. Those three are reached from three goroutines — the
+	// per-message headers handler (blockHandler dispatches one goroutine per
+	// headers message), the block-queue consumer running handleBlockMsg, and
+	// fetchHeaderBlocks, which both of those call — and container/list is not
+	// goroutine-safe, so without this lock every push, walk and remove races.
+	//
+	// Two rules keep it that way:
+	//
+	// Rule A, lock ordering: headerMu -> frontierMu -> peerStates. headerMu is
+	// the outermost of the three; nothing may take it while already holding
+	// frontierMu or the peerStates map lock.
+	//
+	// Rule B, what may not run under it: no send to a peer (QueueMessage,
+	// PushGetHeadersMsg, PushGetBlocksMsg, DisconnectWithWarning — a peer's
+	// output queue is buffered but finite, so a send can block) and no
+	// blockchain client call that can block for an unbounded time
+	// (GetBestBlockHeader can take minutes during initial sync). There is one
+	// named exception, the bounded haveInventory lookup inside
+	// fetchHeaderBlocks' walk, justified at that call site.
+	headerMu         sync.Mutex
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
 	headerList       *list.List
 	startHeader      *list.Element
@@ -573,11 +595,10 @@ type SyncManager struct {
 	// The download frontier: the oldest block we have asked for and not yet
 	// received. Because blocks are committed strictly in order, that one block
 	// gates everything behind it, so it is the only block worth asking a second
-	// peer for (see frontier_race.go). It is published here rather than read
-	// straight off headerList because headerList and startHeader are already
-	// mutated from two goroutines without synchronisation, and the five-second
-	// race timer runs on a third; publishing under a mutex from the existing
-	// touch points keeps the timer off that unsynchronised state entirely.
+	// peer for (see frontier_race.go). It is published here under frontierMu,
+	// rather than read straight off headerList, so the five-second race timer
+	// never touches the header list at all and so never needs headerMu — which
+	// is what keeps Rule A's ordering one-directional.
 	// frontierMu is a leaf lock and is never held across a send to a peer.
 	frontierMu     sync.Mutex
 	frontierHash   chainhash.Hash
@@ -648,8 +669,19 @@ func (sm *SyncManager) storeSyncPeer(peer *peerpkg.Peer, state *syncPeerState) {
 }
 
 // resetHeaderState sets the headers-first mode state to values appropriate for
-// syncing from a new peer.
+// syncing from a new peer. It takes headerMu; callers already holding it must
+// use resetHeaderStateLocked instead, because sync.Mutex is not reentrant.
 func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight int32) {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	sm.resetHeaderStateLocked(newestHash, newestHeight)
+}
+
+// resetHeaderStateLocked is resetHeaderState's body. The caller must hold
+// headerMu. clearFrontier takes frontierMu from in here, which is what
+// establishes headerMu -> frontierMu as the lock order (Rule A).
+func (sm *SyncManager) resetHeaderStateLocked(newestHash *chainhash.Hash, newestHeight int32) {
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
 	sm.startHeader = nil
@@ -662,6 +694,62 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 		node := headerNode{height: newestHeight, hash: newestHash}
 		sm.headerList.PushBack(&node)
 	}
+}
+
+// resetHeaderStateIfEmpty recovers the header state only if the list is still
+// empty, and reports whether it did.
+//
+// The empty-list recovery in handleHeadersMsg has to drop headerMu across
+// GetBestBlockHeader, which can block for minutes during initial sync (Rule B).
+// Once the lock has been dropped, what was read before the call is no longer
+// true: another headers message may have recovered the state and pushed real
+// headers in the meantime. Resetting unconditionally on the way back would throw
+// those away, so the emptiness is re-checked under the lock instead.
+func (sm *SyncManager) resetHeaderStateIfEmpty(newestHash *chainhash.Hash, newestHeight int32) bool {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if sm.headerList == nil || sm.headerList.Back() != nil {
+		return false
+	}
+
+	sm.resetHeaderStateLocked(newestHash, newestHeight)
+
+	return true
+}
+
+// headerListLen returns the number of headers currently queued. Nil-guarded
+// because tests build SyncManager as a struct literal.
+func (sm *SyncManager) headerListLen() int {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if sm.headerList == nil {
+		return 0
+	}
+
+	return sm.headerList.Len()
+}
+
+// headerListEmpty reports whether there is no header to link the next batch to.
+func (sm *SyncManager) headerListEmpty() bool {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	return sm.headerList == nil || sm.headerList.Back() == nil
+}
+
+// nextCheckpointSnapshot returns the next checkpoint under headerMu.
+//
+// The returned pointer outlives the lock, which is safe only because
+// checkpoints are immutable: findNextHeaderCheckpoint only ever returns
+// pointers into chainParams.Checkpoints, a fixed slice nothing writes to. Do
+// not start mutating one.
+func (sm *SyncManager) nextCheckpointSnapshot() *chaincfg.Checkpoint {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	return sm.nextCheckpoint
 }
 
 // findNextHeaderCheckpoint returns the next checkpoint after the passed height.
@@ -850,10 +938,13 @@ func (sm *SyncManager) startSync() {
 	// and fully validate them.  Finally, regression test mode does
 	// not support the headers-first approach so do normal block
 	// downloads when in regression test mode.
-	if sm.nextCheckpoint != nil &&
-		bestBlockHeightInt32 < sm.nextCheckpoint.Height &&
+	// Snapshot the checkpoint under headerMu, then work from the snapshot: the
+	// getheaders send below must not happen with the lock held (Rule B).
+	nextCP := sm.nextCheckpointSnapshot()
+	if nextCP != nil &&
+		bestBlockHeightInt32 < nextCP.Height &&
 		sm.chainParams != &chaincfg.RegressionNetParams {
-		if err = bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash); err != nil {
+		if err = bestPeer.PushGetHeadersMsg(locator, nextCP.Hash); err != nil {
 			sm.logger.Warnf("[startSync] Failed to send getheaders message to peer %s: %v", bestPeer.String(), err)
 
 			return
@@ -861,7 +952,7 @@ func (sm *SyncManager) startSync() {
 
 		sm.headersFirstMode.Store(true)
 
-		sm.logger.Infof("[startSync] Downloading headers for blocks %d to %d from peer %s", bestBlockHeaderMeta.Height+1, sm.nextCheckpoint.Height, bestPeer.String())
+		sm.logger.Infof("[startSync] Downloading headers for blocks %d to %d from peer %s", bestBlockHeaderMeta.Height+1, nextCP.Height, bestPeer.String())
 	} else {
 		if err = bestPeer.PushGetBlocksMsg(locator, &zeroHash); err != nil {
 			sm.logger.Warnf("[startSync] Failed to send getblocks message to peer %s: %v", bestPeer.String(), err)
@@ -1181,8 +1272,12 @@ func (sm *SyncManager) updateSyncPeer(_ *peerSyncState) {
 	if sp != nil {
 		// Log current sync state before disconnecting
 		if sm.headersFirstMode.Load() {
-			sm.logger.Debugf("Current header sync state - headerList length: %d, startHeader exists: %v",
-				sm.headerList.Len(), sm.startHeader != nil)
+			sm.headerMu.Lock()
+			hlLen := sm.headerList.Len()
+			haveStart := sm.startHeader != nil
+			sm.headerMu.Unlock()
+
+			sm.logger.Debugf("Current header sync state - headerList length: %d, startHeader exists: %v", hlLen, haveStart)
 		}
 
 		sp.SetSyncPeer(false)
@@ -1657,6 +1752,11 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	if sm.headersFirstMode.Load() {
 		sm.logger.Debugf("[handleBlockMsg][%s] headers-first mode, checking block", bmsg.blockHash)
 
+		// Explicit Unlock, not defer: handleBlockMsg runs for hundreds of lines
+		// past here and makes blocking client calls, so a deferred unlock would
+		// turn this into a serialisation bug.
+		sm.headerMu.Lock()
+
 		firstNodeEl := sm.headerList.Front()
 		if firstNodeEl != nil {
 			firstNode := firstNodeEl.Value.(*headerNode)
@@ -1679,10 +1779,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				if isCheckpointBlock {
 					sm.clearFrontier()
 				} else {
-					sm.publishFrontier(time.Now())
+					sm.publishFrontierLocked(time.Now())
 				}
 			}
 		}
+
+		sm.headerMu.Unlock()
 	}
 
 	// Remove block from request maps. Either chain will know about it, and
@@ -1929,7 +2031,15 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// at the dynamic max limit (adjusts based on block size).
 	if !isCheckpointBlock {
 		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
-		if sm.startHeader != nil && state.requestedBlocks.Len() < dynamicMax {
+
+		// startHeader is now sampled a few microseconds before the in-flight
+		// count rather than in the same expression. Harmless: fetchHeaderBlocks
+		// re-checks startHeader under headerMu before doing anything.
+		sm.headerMu.Lock()
+		haveMoreHeaders := sm.startHeader != nil
+		sm.headerMu.Unlock()
+
+		if haveMoreHeaders && state.requestedBlocks.Len() < dynamicMax {
 			sm.fetchHeaderBlocks()
 		} else if !sm.current() && state.requestedBlocks.Len() == 0 {
 			sm.logger.Debugf("Not current, and no headers to sync to, fetching more headers")
@@ -1952,14 +2062,19 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// there is a next checkpoint, get the next round of headers by asking
 	// for headers starting from the block after this one up to the next
 	// checkpoint.
+	// Advance the checkpoint under headerMu and work from the snapshot, so the
+	// getheaders send and the loadSyncPeer lookup below stay outside the lock.
+	sm.headerMu.Lock()
 	prevHeight := sm.nextCheckpoint.Height
 	prevHash := sm.nextCheckpoint.Hash
-
 	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
-	if sm.nextCheckpoint != nil {
+	nextCP := sm.nextCheckpoint
+	sm.headerMu.Unlock()
+
+	if nextCP != nil {
 		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
 
-		err = peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
+		err = peer.PushGetHeadersMsg(locator, nextCP.Hash)
 		if err != nil {
 			return errors.NewServiceError("failed to send getheaders message to peer %s", peer.String(), err)
 		}
@@ -1968,7 +2083,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			sm.logger.Infof(
 				"handleBlockMsg - Downloading headers for blocks %d to %d from peer %s",
 				prevHeight+1,
-				sm.nextCheckpoint.Height,
+				nextCP.Height,
 				sp.String(),
 			)
 		}
@@ -1979,9 +2094,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// This is headers-first mode, the block is a checkpoint, and there are
 	// no more checkpoints, so switch to normal mode by requesting blocks
 	// from the block after this one up to the end of the chain (zero hash).
+	sm.headerMu.Lock()
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
 	sm.clearFrontier()
+	sm.headerMu.Unlock()
+
 	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
 
 	locator := blockchain.BlockLocator([]*chainhash.Hash{&bmsg.blockHash})
@@ -2002,9 +2120,15 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		return
 	}
 
-	// Nothing to do if there is no start header.
+	// Nothing to do if there is no start header. The header list is walked and
+	// startHeader re-anchored below, so everything from here to the getdata
+	// send runs under headerMu; the send itself does not (Rule B).
+	sm.headerMu.Lock()
+
 	if sm.startHeader == nil {
+		sm.headerMu.Unlock()
 		sm.logger.Warnf("fetchHeaderBlocks called with no start header")
+
 		return
 	}
 
@@ -2012,7 +2136,9 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	// The limit adjusts based on observed block sizes (20 for small, down to 1 for >2GB).
 	peerState, exists := sm.peerStates.Get(sp)
 	if !exists {
+		sm.headerMu.Unlock()
 		sm.logger.Warnf("[fetchHeaderBlocks] sync peer state not found")
+
 		return
 	}
 
@@ -2020,7 +2146,9 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	dynamicMaxInFlight := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 	maxBlocks := dynamicMaxInFlight - currentInFlight
 	if maxBlocks <= 0 {
+		sm.headerMu.Unlock()
 		sm.logger.Debugf("[fetchHeaderBlocks] Already at max in-flight blocks (%d/%d), not requesting more", currentInFlight, dynamicMaxInFlight)
+
 		return
 	}
 
@@ -2046,6 +2174,15 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 
 		iv := wire.NewInvVect(wire.InvTypeBlock, node.hash)
 
+		// The one deliberate exception to Rule B. haveInventory does a
+		// blockchain header lookup for this single hash, and the loop runs at
+		// most dynamicMaxInFlight times (20, falling to 1 for multi-GB blocks),
+		// so this is a bounded cost — not the unbounded GetBestBlockHeader the
+		// rule is aimed at. The two goroutines that would contend for headerMu
+		// are the same two that call fetchHeaderBlocks, so barely any new
+		// serialisation is introduced. Follow-up once the header list is
+		// indexed by hash: snapshot the hashes, do the lookups unlocked, then
+		// re-take the lock and only re-anchor startHeader if it has not moved.
 		haveInv, err := sm.haveInventory(iv)
 		if err != nil {
 			sm.logger.Warnf("Unexpected failure when checking for "+
@@ -2074,12 +2211,16 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		}
 	}
 
+	sm.headerMu.Unlock()
+
 	if len(getDataMessage.InvList) > 0 {
 		sp.QueueMessage(getDataMessage, nil)
 	}
 
 	// Record which block everything behind it is now waiting on, so the race
-	// timer can tell how long it has been outstanding.
+	// timer can tell how long it has been outstanding. Self-locking form: the
+	// walk above has already released headerMu, and the publish-after-send
+	// order is unchanged.
 	sm.publishFrontier(time.Now())
 }
 
@@ -2117,9 +2258,14 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
-	// ensure we have a valid starting point for header validation
-	prevNodeEl := sm.headerList.Back()
-	if prevNodeEl == nil {
+	// Ensure we have a valid starting point for header validation.
+	//
+	// GetBestBlockHeader can block for minutes during initial sync, so headerMu
+	// must not be held across it (Rule B) — which means the emptiness read
+	// above cannot be trusted on the way back. resetHeaderStateIfEmpty re-checks
+	// under the lock and does nothing if another headers message recovered the
+	// state while we were waiting, rather than wiping the headers it added.
+	if sm.headerListEmpty() {
 		sm.logger.Warnf("Header list is empty, attempting to recover sync state")
 
 		bestBlockHeader, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
@@ -2134,10 +2280,9 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			return
 		}
 
-		sm.resetHeaderState(bestBlockHeader.Hash(), bestBlockHeightInt32)
+		sm.resetHeaderStateIfEmpty(bestBlockHeader.Hash(), bestBlockHeightInt32)
 
-		prevNodeEl = sm.headerList.Back()
-		if prevNodeEl == nil {
+		if sm.headerListEmpty() {
 			peer.DisconnectWithWarning("Failed to initialize header sync state")
 			return
 		}
@@ -2149,6 +2294,15 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 
 	var finalHash *chainhash.Hash
 
+	// One lock for the whole loop is the point: it is what stops two concurrent
+	// headers messages interleaving their pushes into the same list. The three
+	// disconnect paths inside collect a reason and break instead of
+	// disconnecting on the spot, because a peer send must not run under headerMu
+	// (Rule B).
+	var disconnectReason string
+
+	sm.headerMu.Lock()
+
 	for _, blockHeader := range msg.Headers {
 		blockHash := blockHeader.BlockHash()
 		finalHash = &blockHash
@@ -2156,9 +2310,9 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		// Ensure there is a previous header to compare against.
 		prevNodeEl := sm.headerList.Back()
 		if prevNodeEl == nil {
-			peer.DisconnectWithWarning("Header list does not contain a previous element as expected")
+			disconnectReason = "Header list does not contain a previous element as expected"
 
-			return
+			break
 		}
 
 		// Ensure the header properly connects to the previous one and
@@ -2174,9 +2328,9 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 				sm.startHeader = e
 			}
 		} else {
-			peer.DisconnectWithWarning("Received block header that does not properly connect to the chain")
+			disconnectReason = "Received block header that does not properly connect to the chain"
 
-			return
+			break
 		}
 
 		// Verify the header at the next checkpoint height matches.
@@ -2188,17 +2342,22 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 					"header against checkpoint at height "+
 					"%d/hash %s", node.height, node.hash)
 			} else {
-				reason := fmt.Sprintf("Block header at height %d/hash "+
+				disconnectReason = fmt.Sprintf("Block header at height %d/hash "+
 					"%s does NOT match expected checkpoint hash of %s",
 					node.height, node.hash,
 					sm.nextCheckpoint.Hash)
-				peer.DisconnectWithWarning(reason)
-
-				return
 			}
 
 			break
 		}
+	}
+
+	sm.headerMu.Unlock()
+
+	if disconnectReason != "" {
+		peer.DisconnectWithWarning(disconnectReason)
+
+		return
 	}
 
 	// When this header is a checkpoint, switch to fetching the blocks for
@@ -2208,8 +2367,15 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		// that is already in the database and is only used to ensure
 		// the next header links properly, it must be removed before
 		// fetching the blocks.
+		sm.headerMu.Lock()
 		sm.headerList.Remove(sm.headerList.Front())
-		sm.logger.Infof("Received %v block headers: Fetching blocks", sm.headerList.Len())
+		remaining := sm.headerList.Len()
+		sm.headerMu.Unlock()
+
+		sm.logger.Infof("Received %v block headers: Fetching blocks", remaining)
+
+		// fetchHeaderBlocks takes headerMu itself, so it must be called after
+		// the unlock — sync.Mutex is not reentrant.
 		sm.fetchHeaderBlocks()
 
 		return
@@ -2220,7 +2386,9 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// next checkpoint.
 	locator := blockchain.BlockLocator([]*chainhash.Hash{finalHash})
 
-	if err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash); err != nil {
+	stopHash := sm.nextCheckpointSnapshot().Hash
+
+	if err := peer.PushGetHeadersMsg(locator, stopHash); err != nil {
 		sm.logger.Warnf("Failed to send getheaders message to peer %s: %v", peer.String(), err)
 	}
 }
@@ -3370,9 +3538,17 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 			sm.logger.Errorf(failedToConvertBlockHeightInt32Msg, err)
 		}
 
-		// Initialize the next checkpoint based on the current height.
+		// Initialize the next checkpoint based on the current height. New is
+		// single-threaded, but the lock is taken anyway so the rule that
+		// nextCheckpoint is only ever written under headerMu has no exceptions
+		// for a future reader. resetHeaderState takes headerMu itself and so
+		// must stay outside the hold — sync.Mutex is not reentrant.
+		sm.headerMu.Lock()
 		sm.nextCheckpoint = sm.findNextHeaderCheckpoint(bestBlockHeightInt32)
-		if sm.nextCheckpoint != nil {
+		haveCheckpoint := sm.nextCheckpoint != nil
+		sm.headerMu.Unlock()
+
+		if haveCheckpoint {
 			sm.resetHeaderState(bestBlockHeader.Hash(), bestBlockHeightInt32)
 		}
 	} else {
