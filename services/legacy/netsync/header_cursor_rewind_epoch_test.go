@@ -127,3 +127,39 @@ func TestSyncManager_TwoGivenUpBlocksAreAskedForInTheOrderTheyAreNeeded(t *testi
 	require.Less(t, firstAt, secondAt,
 		"the parent must be asked for before the child, or the child comes back as an orphan of a block nobody has asked for")
 }
+
+// TestSyncManager_PastTheFinalCheckpointAGivenUpBlockIsNotRewound pins the
+// other limit on the rewind, and it is what makes the park switch honest about
+// what it does and does not change.
+//
+// The rewind exists for one reason: inside headers-first mode the header list is
+// the only thing that fetches blocks, and the getblocks a drop path sends is
+// thrown away by processInvMsg. Past the final checkpoint — every mainnet node
+// today — that is the other way round: the getblocks is the whole of the
+// recovery and the header list drives nothing. Rewinding there builds a header
+// list out of a block that was just given up on, and fetchHeaderBlocks has no
+// headers-first guard of its own, so it would go on to issue a getdata from a
+// list that exists only because of the rewind.
+func TestSyncManager_PastTheFinalCheckpointAGivenUpBlockIsNotRewound(t *testing.T) {
+	h := newParkWiringHarness(t, true)
+
+	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+
+	// The block parks while headers-first sync is still on, so it carries the
+	// header its arrival took off the front.
+	front := h.parkFrontBlock(t)
+
+	// The final checkpoint is passed and the node goes back to asking for blocks
+	// by inventory.
+	h.sm.headersFirstMode.Store(false)
+
+	// The parked block's time runs out and it is given up on.
+	h.sm.sweepParkedBlocks(time.Now().Add(parkEntryTTL + time.Second))
+
+	// A walk, synchronously: a block is recorded in the download ledger before
+	// its getdata is queued.
+	h.sm.fetchHeaderBlocks()
+
+	require.False(t, h.sm.blockDownloads.RequestedWithin(front, time.Minute),
+		"past the final checkpoint the header walk drives nothing, so a given-up block must not be fetched from it")
+}
