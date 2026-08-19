@@ -5,10 +5,13 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/stretchr/testify/mock"
@@ -94,6 +97,14 @@ func TestSyncManager_AParkedBlockSurvivesAReadThatSaysNothingAboutTheBlock(t *te
 			name: "the read was cancelled by shutdown",
 			err:  errors.NewContextCanceledError("[File] read operation canceled while waiting for semaphore permit", context.Canceled),
 		},
+		{
+			// file.acquireReadPermit's third branch, and the whole point of the
+			// classifier defaulting to "keep": an error nobody anticipated is
+			// not evidence that the blob is bad, and reading it as such is how a
+			// good block gets destroyed by a condition nobody thought about.
+			name: "the read failed for a reason nobody classified",
+			err:  errors.NewProcessingError("[File] failed to acquire read permit"),
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newParkWiringHarness(t, true)
@@ -146,4 +157,66 @@ func TestSyncManager_AParkedBlockSurvivesATransientCommitFailure(t *testing.T) {
 	require.NoError(t, h.deliver(t, 0))
 
 	h.requireStillParked(t, child, parkedBytes)
+}
+
+// TestSyncManager_ABlockTheParkRefusesIsDroppedAndAskedForAgain is the row for a
+// block that fails the park's own stateless checks. Nothing was written, so
+// there is no blob to keep or delete, but the header has already left the walk —
+// so the walk still has to be put back onto it or the block is gone for good.
+//
+// It is also the one row where the node's state, rather than the error, decides
+// whether the peer hears about it: handleBlockMsg suppresses every reject while
+// the node is catching blocks, because then it is replaying history rather than
+// judging a peer's tip, and parking must not judge a peer differently from
+// discarding. Both sides of that are driven here.
+func TestSyncManager_ABlockTheParkRefusesIsDroppedAndAskedForAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		fsmState     blockchain2.FSMStateType
+		expectReject bool
+	}{
+		{
+			name:         "catching blocks, so the peer is not blamed",
+			fsmState:     blockchain2.FSMStateCATCHINGBLOCKS,
+			expectReject: false,
+		},
+		{
+			name:         "running, so the peer is told the block was bad",
+			fsmState:     blockchain2.FSMStateRUNNING,
+			expectReject: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newParkWiringHarnessInState(t, true, tc.fsmState)
+
+			// A real header with real proof of work, carrying somebody else's
+			// transactions. It hashes to the front block of the header list, so
+			// the header list gives it up on arrival exactly as it would for the
+			// genuine article — and then the park refuses it on the merkle root.
+			tampered := &wire.MsgBlock{
+				Header:       h.blocks[0].MsgBlock().Header,
+				Transactions: h.blocks[1].MsgBlock().Transactions,
+			}
+			front := tampered.BlockHash()
+
+			h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+
+			getDataBefore := h.rec.getDataCount()
+
+			require.NoError(t, h.deliverBlock(t, tampered, 1))
+
+			require.Zero(t, h.sm.blockPark.Len(), "a refused block must not be parked")
+			require.Empty(t, parkDirEntries(t, h.parkDir), "nothing may reach the disk once the block has been refused")
+
+			h.requireBackInTheWalk(t, front, getDataBefore)
+
+			if tc.expectReject {
+				require.True(t, WaitUntil(func() bool { return h.rec.wasRejected(front) }, 5*time.Second),
+					"a block that failed its own stateless checks is a peer fault and the peer must be told")
+			} else {
+				require.False(t, h.rec.wasRejected(front),
+					"while catching blocks no reject is sent, whether the block is parked or discarded")
+			}
+		})
+	}
 }

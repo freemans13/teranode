@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
@@ -43,17 +44,26 @@ type parkWiringHarness struct {
 func newParkWiringHarness(t *testing.T, parkOn bool) *parkWiringHarness {
 	t.Helper()
 
+	return newParkWiringHarnessInState(t, parkOn, blockchain2.FSMStateCATCHINGBLOCKS)
+}
+
+// newParkWiringHarnessInState is the same harness with the FSM state chosen by
+// the caller. It matters for one decision only: handleBlockMsg suppresses every
+// reject while the node is catching blocks, so a test about who gets blamed has
+// to be able to run on both sides of that.
+func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2.FSMStateType) *parkWiringHarness {
+	t.Helper()
+
 	// The real constructor registers these; a struct-literal manager reaches the
 	// same gauges on the commit path.
 	initPrometheusMetrics()
 
 	blocks := minedBlocks(t, 3)
 
-	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
 	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
 
 	client := &blockchain2.Mock{}
-	client.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil)
+	client.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil)
 	client.On("GetBestBlockHeader", mock.Anything).Return(bestHeader, &model.BlockHeaderMeta{Height: 100}, nil)
 	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return([]*chainhash.Hash{{}}, nil)
 	// Nothing is stored, so every parent lookup fails the way it does for a
@@ -127,6 +137,23 @@ func (h *parkWiringHarness) deliver(t *testing.T, index int) error {
 		block:       msgBlock,
 		blockHash:   hash,
 		blockHeight: int32(index + 1),
+		peer:        h.peer,
+	})
+}
+
+// deliverBlock feeds one arbitrary block through the block-queue consumer's own
+// path, for the tests that need a block the harness did not mine.
+func (h *parkWiringHarness) deliverBlock(t *testing.T, msgBlock *wire.MsgBlock, height int32) error {
+	t.Helper()
+
+	hash := msgBlock.BlockHash()
+
+	h.sm.blockDownloads.Add(h.peer, hash)
+
+	return h.sm.processQueuedBlock(&blockQueueMsg{
+		block:       msgBlock,
+		blockHash:   hash,
+		blockHeight: height,
 		peer:        h.peer,
 	})
 }
@@ -257,11 +284,14 @@ func TestSyncManager_NothingIsDrainedAfterABlockThatDidNotCommit(t *testing.T) {
 	require.False(t, failed, "a block nobody tried to commit must not be marked as having failed")
 }
 
-// TestSyncManager_ParkingOffIsExactlyTheOldBehaviour is the settings-only
-// rollback. With the park switched off, an out-of-order block must produce the
-// behaviour the node had before it existed: nothing written anywhere, and the
-// block given up on.
-func TestSyncManager_ParkingOffIsExactlyTheOldBehaviour(t *testing.T) {
+// TestSyncManager_WithTheParkOffTheBlockIsDiscardedAndAskedForAgain is the
+// settings-only rollback. With legacy_parkOutOfOrderBlocks false there is no
+// park at all and nothing reaches the disk — but the block is NOT simply
+// forgotten, because the download walk is put back onto it. That rewind is not
+// gated by the setting, and it is the half of the drop path that keeps
+// headers-first sync from stopping on the first out-of-order block, so the test
+// asserts it rather than only asserting the absence of a park.
+func TestSyncManager_WithTheParkOffTheBlockIsDiscardedAndAskedForAgain(t *testing.T) {
 	h := newParkWiringHarness(t, false)
 
 	require.Nil(t, h.sm.blockPark, "legacy_parkOutOfOrderBlocks false must leave no park at all")
@@ -274,6 +304,13 @@ func TestSyncManager_ParkingOffIsExactlyTheOldBehaviour(t *testing.T) {
 
 	require.Empty(t, parkDirEntries(t, h.parkDir), "with the park off nothing may reach the disk")
 	require.Zero(t, h.sm.blockPark.Len())
+
+	h.sm.headerMu.Lock()
+	startHeader := h.sm.startHeader
+	h.sm.headerMu.Unlock()
+
+	require.NotNil(t, startHeader, "a discarded block must go back into the download walk")
+	require.Equal(t, child.String(), startHeader.Value.(*headerNode).hash.String())
 }
 
 // TestHandleBlockDirect_ToleratesANilPeer. Every block recovered from the park
