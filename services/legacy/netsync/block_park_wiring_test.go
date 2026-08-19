@@ -33,6 +33,11 @@ type parkWiringHarness struct {
 	rec     *peerMsgRecorder
 	parkDir string
 	blocks  []*bsvutil.Block
+	// store sits between the park and the real file store so a test can make
+	// reading a blob back fail the way a starved or shutting-down store fails,
+	// without disturbing the blob itself. Pass-through until a test says
+	// otherwise, so every other test in this file is unaffected.
+	store *parkReadFaultStore
 }
 
 func newParkWiringHarness(t *testing.T, parkOn bool) *parkWiringHarness {
@@ -61,8 +66,10 @@ func newParkWiringHarness(t *testing.T, parkOn bool) *parkWiringHarness {
 	storeURL, err := url.Parse("file://" + root)
 	require.NoError(t, err)
 
-	store, err := blob.NewStore(ulogger.TestLogger{}, storeURL)
+	realStore, err := blob.NewStore(ulogger.TestLogger{}, storeURL)
 	require.NoError(t, err)
+
+	store := &parkReadFaultStore{Store: realStore}
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.TempStore = storeURL
@@ -104,7 +111,7 @@ func newParkWiringHarness(t *testing.T, parkOn bool) *parkWiringHarness {
 	sm.headerMu.Unlock()
 	sm.headersFirstMode.Store(true)
 
-	return &parkWiringHarness{sm: sm, client: client, peer: syncPeer, rec: rec, parkDir: parkDirectory(storeURL), blocks: blocks}
+	return &parkWiringHarness{sm: sm, client: client, peer: syncPeer, rec: rec, parkDir: parkDirectory(storeURL), blocks: blocks, store: store}
 }
 
 // deliver feeds one block through the block-queue consumer's own path.
@@ -231,11 +238,13 @@ func TestSyncManager_NothingIsDrainedAfterABlockThatDidNotCommit(t *testing.T) {
 	// nothing. handleBlockMsg still returns nil.
 	h.client.On("GetBlockExists", mock.Anything, &parent).Return(false, nil).Once()
 
-	// And the store is now unwell, so any drain that DOES run gives the child up
-	// for good rather than quietly putting it back — which is what makes the
-	// difference visible instead of merely wasteful.
+	// And the child would now be judged bad if anything did try to commit it, so
+	// a drain that should not have run destroys its blob and writes it off —
+	// which is what makes the difference visible instead of merely wasteful. It
+	// has to be a fault of the BLOCK and not a local one: a local fault leaves
+	// the block parked either way, so it could not tell the two apart.
 	h.client.On("GetBlockExists", mock.Anything, &child).
-		Return(false, errors.NewStorageError("the store is not answering")).Once()
+		Return(false, errors.NewBlockInvalidError("this block is not one we can take")).Once()
 
 	require.NoError(t, h.deliver(t, 0))
 

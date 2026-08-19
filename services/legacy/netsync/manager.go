@@ -2091,9 +2091,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// anything reaches the disk, so a peer cannot fill the park with
 			// rubbish, and it is committed from disk as soon as its parent
 			// lands.
-			parked := false
-
-			switch sm.blockPark.Park(sm.ctx, parkedBlock{
+			entry := parkedBlock{
 				hash:      bmsg.blockHash,
 				prevBlock: prevBlockHash,
 				height:    bmsg.blockHeight,
@@ -2104,8 +2102,33 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				// header is gone from the list and from the index, and the
 				// rewind has nothing to work from.
 				removedFront: removedFront,
-			}, msgBlock) {
-			case parkAccepted:
+			}
+
+			result := sm.blockPark.Park(sm.ctx, entry, msgBlock)
+
+			// The same table the drain and the sweep answer to: whether the
+			// blob survives, whether the walk goes back onto the block, and
+			// whether the peer hears about it. See block_park_policy.go.
+			d := parkWriteOutcome(result)
+
+			if catchingBlocks {
+				// While catching blocks handleBlockMsg suppresses every other
+				// reject, because we are replaying history rather than judging
+				// a peer's tip. Parking must not judge a peer differently from
+				// discarding.
+				d = d.withoutBlame()
+			}
+
+			// The reject, like every other reject in handleBlockMsg, goes to the
+			// resolved primary rather than to a stream sub-peer, so it is
+			// applied to a copy of the entry that names it. Safe to copy because
+			// every write outcome leaves the blob alone: whatever the park kept
+			// it kept under its own entry, and nothing the caller is holding is
+			// charged against the budget.
+			blamed := entry
+			blamed.peer = peer
+
+			if result == parkAccepted {
 				sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
 
 				// No stall-timer refresh here. HandleBlockDirect already
@@ -2115,38 +2138,25 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				// what the stall detector exists to rotate. The drop path below
 				// has never refreshed it, and parking must not judge a peer
 				// differently from discarding.
-				parked = true
+				sm.applyParkDisposition(blamed, d)
 
-			case parkRejected:
-				// The block failed its own stateless checks — a peer fault, and
-				// nothing was written. Treat it as any other bad block.
-				if !catchingBlocks {
-					peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &bmsg.blockHash, false)
-				}
-
-			case parkUnavailable, parkDisabled:
-				// A local fault, or no park at all. Either way the block is gone
-				// and has to be downloaded again.
-			}
-
-			if parked {
-				// The block is kept, so the walk must NOT be rewound onto it:
-				// it is already downloaded and the park commits it from disk
-				// when the parent lands. Every path that later gives the block
-				// up rewinds then instead. What does need doing is topping the
+				// The block is kept, so the walk must NOT be rewound onto it: it
+				// is already downloaded and the park commits it from disk when
+				// the parent lands. Every path that later gives the block up
+				// rewinds then instead. What does need doing is topping the
 				// pipeline back up, because this peer's in-flight count just
 				// dropped and nothing else will notice.
 				sm.fetchMoreHeaderBlocks(peer)
 			} else {
-				sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks",
-					bmsg.blockHash, prevBlockHash)
+				sm.logger.Infof("Block %v has missing parent %v and was not kept (%s), requesting missing blocks",
+					bmsg.blockHash, prevBlockHash, d.reason)
 
 				// The block is being dropped, so put the download walk back on
 				// it. Without this the getblocks below is the only recovery
 				// there is, and in headers-first mode it is inert: processInvMsg
 				// returns before it can request anything, so the block is never
 				// asked for again.
-				sm.rewindHeaderCursor(bmsg.blockHash, removedFront)
+				sm.applyParkDisposition(blamed, d)
 			}
 
 			// Parked or dropped, the parent still has to be asked for, and the

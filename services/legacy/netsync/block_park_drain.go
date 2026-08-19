@@ -1,13 +1,10 @@
 package netsync
 
 import (
-	"context"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
-	"github.com/bsv-blockchain/go-wire"
-	"github.com/bsv-blockchain/teranode/errors"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
@@ -57,15 +54,19 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 //
 // The entry has already been taken out of the park index by the caller. Its blob
 // is still on disk and still charged against the budget, so every path out of
-// here has to either Delete it or Restore it.
+// here goes through applyParkDisposition, which is what settles that.
 func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 	msgBlock, err := sm.blockPark.Read(sm.ctx, entry.hash)
 	if err != nil {
-		// The blob has gone or will not decode. Nothing is recoverable from
-		// here, so give the block up and make the walk ask for it again.
-		sm.logger.Warnf("[commitParkedBlock][%s] parked block could not be read back, it will have to be downloaded again: %v", entry.hash, err)
-		sm.blockPark.Delete(sm.ctx, entry)
-		sm.rewindHeaderCursor(entry.hash, entry.removedFront)
+		// A read can fail because the blob is bad, but it can equally fail
+		// because the store had no permit free inside the park's deadline or
+		// because the node is shutting down — and neither of those says anything
+		// about the block. parkReadFailure tells them apart; treating them alike
+		// destroys fully downloaded blocks under ordinary load.
+		d := parkReadFailure(err)
+
+		sm.logger.Warnf("[commitParkedBlock][%s] parked block could not be read back (%s): %v", entry.hash, d.reason, err)
+		sm.applyParkDisposition(entry, d)
 
 		return false
 	}
@@ -82,7 +83,7 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 	// block after the first successful drain.
 	isCheckpointBlock, _ := sm.advanceHeaderListFor(entry.hash)
 
-	sm.blockPark.Delete(sm.ctx, entry)
+	sm.applyParkDisposition(entry, parkDispositionCommitted)
 
 	if sm.blockFailureBackoff != nil {
 		sm.blockFailureBackoff.Delete(entry.hash)
@@ -112,44 +113,18 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 }
 
 // parkedBlockFailed decides what to do with a parked block that would not
-// commit, and reports false so the drain stops walking that branch.
+// commit, and reports false so the drain stops walking that branch. The decision
+// itself is parkCommitFailure's; all this does is log it and carry it out.
 func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
-	if errors.Is(err, errors.ErrBlockNotFound) {
-		// The parent has gone missing again — a reorg under us. The block itself
-		// is fine, so keep it: the sweep retries it once the parent is back.
-		sm.logger.Infof("[commitParkedBlock][%s] parent %s is missing again, leaving the block parked", entry.hash, entry.prevBlock)
-		sm.blockPark.Restore(entry)
+	d := parkCommitFailure(err)
 
-		return false
-	}
-
-	if errors.Is(err, context.Canceled) || errors.IsContextError(err) {
-		// Shutting down, or the commit was cancelled. Leave the block where it
-		// is; the restart scan adopts it. Same classifier handleBlockMsg uses.
-		sm.blockPark.Restore(entry)
-
-		return false
-	}
-
-	sm.logger.Errorf("[commitParkedBlock][%s] parked block failed to store or validate: %v", entry.hash, err)
-
-	if sm.recentlyFailedBlocks != nil {
-		sm.recentlyFailedBlocks.Set(entry.hash, struct{}{})
-	}
-
-	sm.blockPark.Delete(sm.ctx, entry)
-	sm.rewindHeaderCursor(entry.hash, entry.removedFront)
-
-	// A misbehaviour signal goes to the peer that actually sent the block or
-	// nowhere at all. Aiming it at a fallback peer would punish an innocent one
-	// for a block it never sent; losing the signal when the guilty peer has
-	// already left is the cheaper mistake. Transient local failures are not the
-	// peer's fault either way.
-	if entry.peer != nil && entry.peer.Connected() && !errors.IsTransientLocalError(err) {
-		entry.peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &entry.hash, false)
+	if d.blob == parkBlobKeep {
+		sm.logger.Infof("[commitParkedBlock][%s] leaving the block parked (%s), parent %s: %v", entry.hash, d.reason, entry.prevBlock, err)
 	} else {
-		sm.logger.Warnf("[commitParkedBlock][%s] no connected peer to reject the block to; the signal is lost", entry.hash)
+		sm.logger.Errorf("[commitParkedBlock][%s] giving the block up (%s): %v", entry.hash, d.reason, err)
 	}
+
+	sm.applyParkDisposition(entry, d)
 
 	return false
 }
@@ -223,9 +198,8 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 	}
 
 	for _, entry := range sm.blockPark.Expire(now) {
-		sm.logger.Warnf("[sweepParkedBlocks][%s] parent %s never arrived, giving the block up after %s", entry.hash, entry.prevBlock, parkEntryTTL)
-		sm.blockPark.Delete(sm.ctx, entry)
-		sm.rewindHeaderCursor(entry.hash, entry.removedFront)
+		sm.logger.Warnf("[sweepParkedBlocks][%s] %s, giving the block up after %s: parent %s", entry.hash, parkDispositionExpired.reason, parkEntryTTL, entry.prevBlock)
+		sm.applyParkDisposition(entry, parkDispositionExpired)
 	}
 
 	for _, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {
