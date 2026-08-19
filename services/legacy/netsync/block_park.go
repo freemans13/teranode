@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -53,8 +54,19 @@ const (
 	parkStuckThreshold = 2 * time.Minute
 
 	// parkSweepRPCBudget caps how many of those lookups one sweep tick may make,
-	// so the safety net can never turn into a scan of the whole park.
-	parkSweepRPCBudget = 8
+	// so the safety net can never turn into a scan of the whole park in one go.
+	//
+	// It has to be big enough that a full pass over a full park finishes inside
+	// parkEntryTTL, or the sweep is not a safety net: a restart with a full park
+	// would leave most of those blocks unexamined until they expired and were
+	// downloaded a second time. parkEntryTTL / parkSweepInterval is 60 ticks, and
+	// the park holds up to maxParkedEntries, so the floor is 4096/60 = 69. At 128
+	// a full pass takes 32 ticks, sixteen minutes, comfortably inside the half
+	// hour — and it is still only 128 sequential chain lookups per thirty
+	// seconds on the commit goroutine, which is well under a percent of it.
+	// TestBlockPark_TheSweepCanCoverAFullParkBeforeItsBlocksExpire holds the
+	// arithmetic to this.
+	parkSweepRPCBudget = 128
 
 	// parkMinStoreTimeout is the floor on legacy_parkStoreTimeout. A zero or
 	// negative deadline would fail every store operation instantly.
@@ -131,6 +143,11 @@ type parkedBlock struct {
 	// that node's header list was rebuilt from scratch.
 	removedFront *headerNode
 	parkedAt     time.Time
+	// lastSweptAt is when the stuck sweep last handed this entry back for a
+	// parent lookup, zero if it never has. The sweep takes the least recently
+	// looked at first, which is what makes it a round robin over the whole park
+	// rather than a repeated random sample of it.
+	lastSweptAt time.Time
 }
 
 // blockPark keeps blocks whose parent is not stored yet on disk, and commits
@@ -576,18 +593,46 @@ func (p *blockPark) StuckCandidates(now time.Time, limit int) []parkedBlock {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	candidates := make([]parkedBlock, 0, limit)
+	eligible := make([]*parkedBlock, 0, len(p.entries))
 
 	for _, entry := range p.entries {
 		if now.Sub(entry.parkedAt) < parkStuckThreshold {
 			continue
 		}
 
-		candidates = append(candidates, *entry)
+		eligible = append(eligible, entry)
+	}
 
-		if len(candidates) == limit {
-			break
+	// Least recently looked at first, and never looked at — the zero time —
+	// before all of those. Together with the stamp below that turns the sweep
+	// into a round robin: each tick takes the next budget's worth and a full pass
+	// takes exactly len(entries)/limit ticks. Ranging over the map instead took a
+	// fresh random sample every tick, so an entry could come up over and over
+	// while others were never examined at all before they expired. Ties break on
+	// the oldest parked, then on the hash, so the order is total and the sweep is
+	// reproducible.
+	sort.Slice(eligible, func(i, j int) bool {
+		if !eligible[i].lastSweptAt.Equal(eligible[j].lastSweptAt) {
+			return eligible[i].lastSweptAt.Before(eligible[j].lastSweptAt)
 		}
+
+		if !eligible[i].parkedAt.Equal(eligible[j].parkedAt) {
+			return eligible[i].parkedAt.Before(eligible[j].parkedAt)
+		}
+
+		return bytes.Compare(eligible[i].hash[:], eligible[j].hash[:]) < 0
+	})
+
+	if len(eligible) > limit {
+		eligible = eligible[:limit]
+	}
+
+	candidates := make([]parkedBlock, 0, len(eligible))
+
+	for _, entry := range eligible {
+		entry.lastSweptAt = now
+
+		candidates = append(candidates, *entry)
 	}
 
 	return candidates
@@ -746,10 +791,23 @@ func (p *blockPark) Recover(ctx context.Context) {
 			continue
 		}
 
+		// The blob's modification time is when the block was parked, and it is on
+		// disk, so it is the one thing about a recovered block that survives the
+		// restart. Stamping time.Now() here instead would restart every block's
+		// half hour on every boot: a node restarting more often than parkEntryTTL
+		// would never expire anything, and a block whose parent is genuinely
+		// never coming would hold its budget for as long as that went on. Anything
+		// unusable — a zero time, or a clock that has gone backwards since the
+		// write — falls back to now, which is only ever the old behaviour.
+		parkedAt := info.ModTime()
+		if parkedAt.IsZero() || parkedAt.After(time.Now()) {
+			parkedAt = time.Now()
+		}
+
 		// peer nil and height 0 are both defined: post-commit peer actions fall
 		// back to the current sync peer, and HandleBlockDirect derives a
 		// non-positive height from the parent.
-		entry := parkedBlock{hash: *hash, prevBlock: prevBlock, size: size, parkedAt: time.Now()}
+		entry := parkedBlock{hash: *hash, prevBlock: prevBlock, size: size, parkedAt: parkedAt}
 
 		p.mu.Lock()
 		stored := entry
