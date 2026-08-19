@@ -219,6 +219,12 @@ type pauseMsg struct {
 type headerNode struct {
 	height int32
 	hash   *chainhash.Hash
+	// listEpoch is the header list this node was made for. A node handed back
+	// to the list after the list has been thrown away and started again — a
+	// parked block given up on after its sync peer was rotated — carries an
+	// older epoch than the list it is being handed back to, and must not be put
+	// into it. See rewindHeaderCursor and SyncManager.headerListEpoch.
+	listEpoch uint64
 }
 
 // peerSyncState stores additional information that the SyncManager tracks
@@ -647,7 +653,14 @@ type SyncManager struct {
 	// handleBlockMsg, the push in handleHeadersMsg, the front removal on the
 	// checkpoint branch, and the wipe in leaveHeadersFirstMode. Miss one and the
 	// index hands back an element that is no longer in any list.
-	headerIndex      map[chainhash.Hash]*list.Element
+	headerIndex map[chainhash.Hash]*list.Element
+	// headerListEpoch counts how many times the header list has been thrown
+	// away and started from scratch — resetHeaderStateLocked when the sync peer
+	// is rotated, and leaveHeadersFirstMode at the final checkpoint. Every
+	// header node is stamped with the epoch it was made under, which is what
+	// lets a rewind tell a node that belongs in this list from one left over
+	// from a list that no longer exists. Guarded by headerMu.
+	headerListEpoch  uint64
 	startHeader      *list.Element
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
@@ -747,12 +760,16 @@ func (sm *SyncManager) resetHeaderStateLocked(newestHash *chainhash.Hash, newest
 	sm.clearHeaderIndexLocked()
 	sm.startHeader = nil
 	sm.clearFrontier()
+	// The list that follows is a different list. Anything still holding a node
+	// from the old one — a parked block carrying the header its arrival took off
+	// the front — must not be able to put that node back; see rewindHeaderCursor.
+	sm.headerListEpoch++
 
 	// When there is a next checkpoint, add an entry for the latest known
 	// block into the header pool.  This allows the next downloaded header
 	// to prove it links to the chain properly.
 	if sm.nextCheckpoint != nil {
-		node := headerNode{height: newestHeight, hash: newestHash}
+		node := headerNode{height: newestHeight, hash: newestHash, listEpoch: sm.headerListEpoch}
 		sm.indexHeaderLocked(sm.headerList.PushBack(&node), *newestHash)
 	}
 }
@@ -852,6 +869,9 @@ func (sm *SyncManager) leaveHeadersFirstMode() {
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
 	sm.clearHeaderIndexLocked()
+	// Same reason as resetHeaderStateLocked: the list is gone, so a header node
+	// somebody else is still holding no longer belongs anywhere.
+	sm.headerListEpoch++
 	// Same wipe as resetHeaderStateLocked, and startHeader is part of it. Left
 	// pointing into the list that has just been emptied it reads, to every
 	// caller that asks "is there anything left to fetch?", as "yes" — which is
@@ -2448,6 +2468,81 @@ func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
 	}
 }
 
+// reinsertHeaderLocked puts a header node that left the list back into it, and
+// reports the element it now occupies — or nil when the node does not belong in
+// this list at all. The caller must hold headerMu.
+//
+// A plain PushFront was wrong twice over.
+//
+// The list is not always a queue of blocks still wanted. resetHeaderStateLocked
+// throws it away on a sync-peer rotation and pushes exactly one node, the best
+// block already in the database, there only so the next round of headers can
+// prove it links — and handleHeadersMsg removes Front() at the next checkpoint
+// on the strength of it being exactly that. A block parked before the rotation
+// and given up on after it would be pushed in front of that anchor, and the
+// checkpoint would then remove the rewound header instead of the anchor: the
+// rewind achieves nothing, the anchor stays in the list, and the walk goes back
+// and downloads a block that is already in the database. The epoch check is what
+// says no: a node stamped under an older list does not go into this one.
+//
+// And a second rewind in the same list would put a higher block in front of a
+// lower one, because PushFront knows nothing about what the first rewind put
+// there. The list runs in ascending height, and fetchHeaderBlocks walks it in
+// order, so out-of-order entries ask for blocks out of order. Inserting by
+// height says what is meant and is a single step in the ordinary case, where the
+// node belongs on the front.
+func (sm *SyncManager) reinsertHeaderLocked(node *headerNode) *list.Element {
+	if node == nil || node.hash == nil || sm.headerList == nil || node.listEpoch != sm.headerListEpoch {
+		return nil
+	}
+
+	for e := sm.headerList.Front(); e != nil; e = e.Next() {
+		existing, ok := e.Value.(*headerNode)
+		if !ok {
+			return nil
+		}
+
+		if existing.height == node.height {
+			// The list already holds this height. Whatever is there is the live
+			// entry; adding a second one at the same height would have the walk
+			// ask for one of them twice.
+			return nil
+		}
+
+		if existing.height > node.height {
+			return sm.headerList.InsertBefore(node, e)
+		}
+	}
+
+	return sm.headerList.PushBack(node)
+}
+
+// moveStartHeaderBackLocked puts the download cursor on e, unless it is already
+// on something earlier. The caller must hold headerMu.
+//
+// Two blocks can be given up on before either is asked for again — a parent and
+// its child both parked, both expiring in the same sweep — and the walk starts
+// wherever the cursor is left. Left on the second of them, the first is never
+// reached and never asked for, which is the whole failure the rewind exists to
+// prevent. A cursor only ever moves backwards here, so whichever of them is
+// lowest wins however the sweep happened to order them.
+func (sm *SyncManager) moveStartHeaderBackLocked(e *list.Element) {
+	if e == nil {
+		return
+	}
+
+	if sm.startHeader != nil {
+		current, currentOK := sm.startHeader.Value.(*headerNode)
+		candidate, candidateOK := e.Value.(*headerNode)
+
+		if currentOK && candidateOK && current.height <= candidate.height && sm.headerIndex[*current.hash] == sm.startHeader {
+			return
+		}
+	}
+
+	sm.startHeader = e
+}
+
 // rewindHeaderCursor puts the download walk back on a block that has just been
 // dropped, so it is asked for again.
 //
@@ -2470,7 +2565,17 @@ func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
 // obligation was already released upstream, and any other peer racing the same
 // block keeps its right to deliver it; stripping every owner here would make an
 // honest peer's copy look unrequested and cost it its connection.
+//
+// Two things it will not do. Outside headers-first mode there is no walk to
+// rewind: nothing reads the header list to decide what to fetch, and recovery is
+// the getblocks the drop paths already send, which works there. And a header
+// node from a list that has since been thrown away is not put back at all — see
+// reinsertHeaderLocked.
 func (sm *SyncManager) rewindHeaderCursor(hash chainhash.Hash, removed *headerNode) bool {
+	if !sm.headersFirstMode.Load() {
+		return false
+	}
+
 	sm.headerMu.Lock()
 	defer sm.headerMu.Unlock()
 
@@ -2478,12 +2583,18 @@ func (sm *SyncManager) rewindHeaderCursor(hash chainhash.Hash, removed *headerNo
 	case sm.headerIndex[hash] != nil:
 		// Still in the list: a checkpoint header, which is kept to anchor the
 		// next round, or a block that was never the front.
-		sm.startHeader = sm.headerIndex[hash]
+		sm.moveStartHeaderBackLocked(sm.headerIndex[hash])
 
 	case removed != nil && sm.headerList != nil:
-		e := sm.headerList.PushFront(removed)
+		e := sm.reinsertHeaderLocked(removed)
+		if e == nil {
+			sm.logger.Warnf("[rewindHeaderCursor][%s] the header list has been rebuilt since this block left it; recovery is the next headers round", hash)
+
+			return false
+		}
+
 		sm.indexHeaderLocked(e, hash)
-		sm.startHeader = e
+		sm.moveStartHeaderBackLocked(e)
 
 	default:
 		sm.logger.Warnf("[rewindHeaderCursor][%s] block dropped with no header to rewind to; recovery is down to the next headers round", hash)
@@ -2877,7 +2988,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 
 		// Ensure the header properly connects to the previous one and
 		// add it to the list of headers.
-		node := headerNode{hash: &blockHash}
+		node := headerNode{hash: &blockHash, listEpoch: sm.headerListEpoch}
 
 		prevNode := prevNodeEl.Value.(*headerNode)
 		if prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
