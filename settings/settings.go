@@ -689,6 +689,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 
 			MaxBlockParallelFetch: getInt("legacy_maxBlockParallelFetch", 2, alternativeContext...),
 			BlockSlowFetchTimeout: getDuration("legacy_blockSlowFetchTimeout", 20*time.Second, alternativeContext...),
+			ParkOutOfOrderBlocks:  getBool("legacy_parkOutOfOrderBlocks", true, alternativeContext...),
+			ParkMaxBytes:          getInt64("legacy_parkMaxBytes", 4*1024*1024*1024, alternativeContext...),
+			ParkWriteTimeout:      getDuration("legacy_parkWriteTimeout", 10*time.Second, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),
