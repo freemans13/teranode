@@ -1901,6 +1901,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// properly.
 	isCheckpointBlock := false
 
+	// The header node this block's arrival takes off the front of the list, kept
+	// so a drop further down can put it back. Nothing else remembers it: once the
+	// element is removed and unindexed, headerIndex[hash] answers nil for exactly
+	// the block a rewind most needs to reach.
+	var removedFront *headerNode
+
 	if sm.headersFirstMode.Load() {
 		sm.logger.Debugf("[handleBlockMsg][%s] headers-first mode, checking block", bmsg.blockHash)
 
@@ -1919,6 +1925,8 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				} else {
 					sm.unindexHeaderLocked(firstNodeEl, *firstNode.hash)
 					sm.headerList.Remove(firstNodeEl)
+
+					removedFront = firstNode
 				}
 
 				// The block everything else was queued behind has arrived. Tidy
@@ -2056,6 +2064,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// request costs one inv message at most.
 			sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks",
 				bmsg.blockHash, prevBlockHash)
+
+			// The block is being dropped, so put the download walk back on it.
+			// Without this the getblocks above is the only recovery there is, and
+			// in headers-first mode it is inert: processInvMsg returns before it
+			// can request anything, so the block is never asked for again.
+			sm.rewindHeaderCursor(bmsg.blockHash, removedFront)
 
 			sm.requestMissingBlocks(peer, bmsg.blockHash)
 
@@ -2264,6 +2278,60 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	}
 
 	return nil
+}
+
+// rewindHeaderCursor puts the download walk back on a block that has just been
+// dropped, so it is asked for again.
+//
+// It exists because the walk is forward-only. commitHeaderCandidates advances
+// startHeader past every header it considers, and nothing in headers-first mode
+// ever moves it back, so a block that is downloaded and then discarded falls out
+// of the walk for good. The getblocks the drop paths send instead cannot cover
+// it: processInvMsg returns early while headers-first mode is on, so the reply
+// is ignored. Without the rewind a single dropped block stops sync permanently.
+//
+// removed is the header node this block's arrival took off the front of the
+// list, or nil if it was never the front. Both cases happen and both must work:
+// by the time a block is dropped its header has usually already been removed and
+// unindexed, so an index lookup alone finds nothing for exactly the hash that
+// matters. Pushing it back on the front restores the list to the shape it had,
+// because headers only ever leave the list from the front — an element that was
+// removed while it was the front has nothing that belongs in front of it.
+//
+// The download ledger is deliberately left alone. The delivering peer's
+// obligation was already released upstream, and any other peer racing the same
+// block keeps its right to deliver it; stripping every owner here would make an
+// honest peer's copy look unrequested and cost it its connection.
+func (sm *SyncManager) rewindHeaderCursor(hash chainhash.Hash, removed *headerNode) bool {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	switch {
+	case sm.headerIndex[hash] != nil:
+		// Still in the list: a checkpoint header, which is kept to anchor the
+		// next round, or a block that was never the front.
+		sm.startHeader = sm.headerIndex[hash]
+
+	case removed != nil && sm.headerList != nil:
+		e := sm.headerList.PushFront(removed)
+		sm.indexHeaderLocked(e, hash)
+		sm.startHeader = e
+
+	default:
+		sm.logger.Warnf("[rewindHeaderCursor][%s] block dropped with no header to rewind to; recovery is down to the next headers round", hash)
+
+		return false
+	}
+
+	// Republish, because the front of the list may have changed. When the
+	// rewound cursor is itself the front, publishFrontierLocked clears the
+	// frontier — which is right: we have not asked for it again yet, so there is
+	// nothing for the race timer to race.
+	sm.publishFrontierLocked(time.Now())
+
+	sm.logger.Warnf("[rewindHeaderCursor][%s] download cursor moved back after the block was dropped", hash)
+
+	return true
 }
 
 // fetchHeaderBlocks creates and sends a request to the syncPeer for the next
@@ -2494,6 +2562,26 @@ func (sm *SyncManager) commitHeaderCandidates(sp *peerpkg.Peer, anchor *list.Ele
 			// The run of headers we asked about is no longer the run in the
 			// list, so stop where the two still agree.
 			return requested, false
+		}
+
+		// A rewind puts this walk back in front of blocks that are already in
+		// flight. Asking for those again makes the peer send each of them a
+		// second time, and the second copy arrives after the first one released
+		// that peer's obligation — so it looks unrequested and costs an honest
+		// peer its connection. Skipping anything somebody was asked for recently
+		// is the same rule the inv path already applies, and it is a no-op on the
+		// ordinary forward walk, where a header is reached before it has ever
+		// been requested.
+		//
+		// A block skipped here is still owed by a live peer. If that peer never
+		// delivers it, recovery is ForgetForRetry on sync-peer rotation plus
+		// resetHeaderState — so anything that removes resetHeaderState-on-rotation
+		// has to replace that recovery, or a skipped block has no way back.
+		if !alreadyHave[i] && sm.blockDownloads.RequestedWithin(hashes[i], blockRequestRetryInterval) {
+			e = e.Next()
+			sm.startHeader = e
+
+			continue
 		}
 
 		if !alreadyHave[i] {
