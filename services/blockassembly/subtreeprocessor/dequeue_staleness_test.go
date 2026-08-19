@@ -42,6 +42,31 @@ func TestLastDequeueTime_InitialisedAtStart(t *testing.T) {
 		"LastDequeueTime must be seeded to approximately now, not left at the Unix epoch")
 }
 
+// TestConsumerStarted_FalseUntilStart pins the flag the stall signal uses to
+// tell a wedged consumer from one that does not exist yet. The distinction only
+// works if the flag really is false for the whole pre-Start window: a processor
+// that reported itself started from construction would send every restart back
+// to warning "intake is growing unbounded" at the operator, which is the
+// regression this exists to prevent.
+//
+// Pinned against the real processor rather than the mock, because the mock
+// cannot catch the flag being set in the wrong place.
+func TestConsumerStarted_FalseUntilStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stp := newTestSubtreeProcessorForDequeueStaleness(t, ctx)
+
+	require.False(t, stp.ConsumerStarted(),
+		"a constructed processor has no consumer yet, and reporting otherwise blames it for the unmined reload's staleness")
+
+	stp.Start(ctx)
+	t.Cleanup(func() { stp.Stop(ctx) })
+
+	require.True(t, stp.ConsumerStarted(),
+		"once Start has run, a stale dequeue timestamp really does mean the consumer is wedged")
+}
+
 // TestLastDequeueTime_SeededBeforeStart pins the constructor seed, which the
 // two tests around it cannot: both call Start() immediately, whereas production
 // does not. BlockAssembly.Init launches the metrics/stall updater and
