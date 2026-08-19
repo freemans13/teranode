@@ -4,7 +4,8 @@
 //
 // The batcher works by collecting individual blob operations in memory and flushing the
 // accumulated batch to the underlying store only when either:
-// - Adding the next item would overflow the configured size threshold, or
+// - Adding the next item would overflow the configured size threshold,
+// - Adding the next item would push its offset past the uint32 a key record addresses it with (writeKeys only), or
 // - The batcher is closed (a final flush of whatever remains).
 //
 // There is no background timer or ticker: under a low write rate, data queued via Set sits
@@ -75,7 +76,7 @@ type Batcher struct {
 	// currentBatchKeys holds the accumulated key data for the current batch (if writeKeys is true)
 	currentBatchKeys []byte
 	// currentBatchLen mirrors len(currentBatch), updated by the worker goroutine after every
-	// append. It is deliberately not updated when a flush empties the buffer, so a Close landing
+	// append. It is deliberately not updated when an overflow flush empties the buffer, so a Close landing
 	// between a successful flush and the following append reports the pre-flush length; the value
 	// is approximate by nature and is only ever used for a log line and an error message.
 	// Close reads it from the caller's goroutine while the worker may still be running,
