@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/addrmgr"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/services/legacy/version"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // defaultFeelerInterval is the fallback mean gap between probes, used when
@@ -38,12 +39,24 @@ const defaultFeelerInterval = 120 * time.Second
 //     nothing.
 //   - A budget that would leave no room for an ordinary peer. Reserving the
 //     node's whole capacity for probing is never what an operator meant.
-func feelerBudget(configured int, connectOnly bool, maxPeers int) int {
+func feelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPeers, targetOutbound int) int {
 	if configured <= 0 || connectOnly {
 		return 0
 	}
 
-	if maxPeers-configured < 1 {
+	// The reservation must leave room for the WHOLE automatic outbound tier, not
+	// merely for one peer. svnode takes its feeler allowance out of the inbound
+	// share and never touches nMaxOutbound, so probing can never cost it a peer
+	// it chose to dial. Teranode has one combined ceiling instead of two, so the
+	// same guarantee has to be asserted here: if reserving would push the
+	// admission ceiling below the outbound target, the node would sit
+	// permanently below target, dialling and being refused in a loop, and the
+	// operator would see connection churn with no obvious cause.
+	//
+	// Giving up the probe is the right way to lose that argument. Real peers are
+	// what the node is for; the feeler only exists to make finding them easier.
+	if maxPeers-configured < targetOutbound {
+		logger.Warnf("[Feeler] Disabled: reserving %d of %d peer slots would leave less than the automatic outbound target of %d", configured, maxPeers, targetOutbound)
 		return 0
 	}
 

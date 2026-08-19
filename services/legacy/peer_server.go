@@ -4138,7 +4138,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	// halves of the peer budget are set in one place. Note that the target is
 	// NOT reduced: the reservation comes out of the joint inbound/automatic
 	// ceiling, exactly as svnode takes its feeler budget out of nMaxInbound.
-	s.feelerSlots = feelerBudget(tSettings.Legacy.MaxFeelerPeers, len(cfg.ConnectPeers) > 0, cfg.MaxPeers)
+	s.feelerSlots = feelerBudget(logger, tSettings.Legacy.MaxFeelerPeers, len(cfg.ConnectPeers) > 0, cfg.MaxPeers, int(targetOutbound))
 
 	cmgr, err := connmgr.New(logger, &connmgr.Config{
 		Listeners:      listeners,

@@ -34,23 +34,33 @@ import (
 // meant.
 func TestFeelerBudget(t *testing.T) {
 	tests := []struct {
-		name        string
-		configured  int
-		connectOnly bool
-		maxPeers    int
-		want        int
+		name           string
+		configured     int
+		connectOnly    bool
+		maxPeers       int
+		targetOutbound int
+		want           int
 	}{
-		{name: "default budget of one", configured: 1, maxPeers: 125, want: 1},
-		{name: "operator raises the budget", configured: 3, maxPeers: 125, want: 3},
-		{name: "zero is the disable lever", configured: 0, maxPeers: 125, want: 0},
-		{name: "negative is treated as disabled", configured: -1, maxPeers: 125, want: 0},
-		{name: "connect-only reserves nothing", configured: 1, connectOnly: true, maxPeers: 4, want: 0},
-		{name: "never reserve the whole capacity", configured: 1, maxPeers: 1, want: 0},
+		{name: "default budget of one", configured: 1, maxPeers: 125, targetOutbound: 8, want: 1},
+		{name: "operator raises the budget", configured: 3, maxPeers: 125, targetOutbound: 8, want: 3},
+		{name: "zero is the disable lever", configured: 0, maxPeers: 125, targetOutbound: 8, want: 0},
+		{name: "negative is treated as disabled", configured: -1, maxPeers: 125, targetOutbound: 8, want: 0},
+		{name: "connect-only reserves nothing", configured: 1, connectOnly: true, maxPeers: 4, targetOutbound: 4, want: 0},
+		{name: "never reserve the whole capacity", configured: 1, maxPeers: 1, targetOutbound: 1, want: 0},
+
+		// The reservation must never push the admission ceiling below the
+		// automatic outbound target. A node in that state sits permanently below
+		// target, dialling and being refused in a loop — connection churn with no
+		// obvious cause, and a reserved slot the probe can never use either.
+		{name: "a tight cap gives up the probe rather than the tier", configured: 1, maxPeers: 8, targetOutbound: 8, want: 0},
+		{name: "one spare slot above the tier is enough", configured: 1, maxPeers: 9, targetOutbound: 8, want: 1},
+		{name: "a raised target squeezes the probe out", configured: 2, maxPeers: 10, targetOutbound: 9, want: 0},
+		{name: "a raised target with room still probes", configured: 2, maxPeers: 12, targetOutbound: 9, want: 2},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, feelerBudget(tt.configured, tt.connectOnly, tt.maxPeers))
+			require.Equal(t, tt.want, feelerBudget(ulogger.TestLogger{}, tt.configured, tt.connectOnly, tt.maxPeers, tt.targetOutbound))
 		})
 	}
 }
@@ -877,4 +887,58 @@ func startFeelerTestListener(t *testing.T, userAgent string) (net.Listener, <-ch
 	}()
 
 	return ln, served
+}
+
+// TestFeelerTokensCapProbesInFlight is the test for the whole point of the
+// reservation.
+//
+// The issue asks for slots "reserved from the peer cap rather than taken out of
+// the automatic tier". Reserving them is only half of it — the probes actually
+// have to respect the reservation. If more probes can be in flight than slots
+// were held back, the node is quietly using peer capacity it never reserved, and
+// the accounting PR 1601 fixed is wrong again by a different route.
+//
+// The token channel is that cap. This drains it and shows a probe cannot start,
+// then returns a token and shows one can. Deleting the acquisition in
+// feelerHandler leaves every other test in the package passing, which is why
+// this exists.
+func TestFeelerTokensCapProbesInFlight(t *testing.T) {
+	srv := &server{
+		logger:       ulogger.TestLogger{},
+		feelerSlots:  2,
+		feelerTokens: make(chan struct{}, 2),
+	}
+	for i := 0; i < srv.feelerSlots; i++ {
+		srv.feelerTokens <- struct{}{}
+	}
+
+	// Two probes may run at once, because two slots were reserved.
+	acquired := 0
+
+	for i := 0; i < srv.feelerSlots; i++ {
+		select {
+		case <-srv.feelerTokens:
+			acquired++
+		default:
+		}
+	}
+
+	require.Equal(t, 2, acquired, "both reserved slots must be available to probes")
+
+	// A third must not, however long the loop has been waiting to fire. This is
+	// the non-blocking default branch in feelerHandler: skip, do not queue.
+	select {
+	case <-srv.feelerTokens:
+		require.Fail(t, "a third probe started with only two slots reserved")
+	default:
+	}
+
+	// A finished probe returns its token and the next one may start.
+	srv.feelerTokens <- struct{}{}
+
+	select {
+	case <-srv.feelerTokens:
+	default:
+		require.Fail(t, "a returned token must let the next probe start")
+	}
 }

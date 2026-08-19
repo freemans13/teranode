@@ -2528,11 +2528,22 @@ func (p *Peer) DisconnectWithLogFunc(reason string, logFunc func(format string, 
 	// n := runtime.Stack(buf, false)
 	// stackTrace := string(buf[:n])
 	// p.logger.Debugf("Disconnecting (%s) reason: %s\nStack trace:\n%s", p, reason, stackTrace)
-	logFunc("Disconnecting (%s) reason: %s", p, reason)
-
+	// Log only for the caller that actually initiates the disconnect. A peer is
+	// commonly torn down from two directions at once — something decides to drop
+	// it, and its own read loop then hits the closed socket — and logging both
+	// reports one disconnect twice. That matters beyond tidiness: this line is
+	// the anchor the disconnect-rate measurements count, so a double entry
+	// inflates the very number those measurements exist to drive down.
+	//
+	// It also means a deliberate quiet teardown stays quiet. A feeler probe hangs
+	// up on purpose and logs at debug; without this guard its peer's read loop
+	// would still log the same disconnect at warn, and a probe working exactly as
+	// intended would look like a lost peer.
 	if atomic.AddInt32(&p.disconnect, 1) != 1 {
 		return
 	}
+
+	logFunc("Disconnecting (%s) reason: %s", p, reason)
 
 	if atomic.LoadInt32(&p.connected) != 0 {
 		p.conn.Close()
