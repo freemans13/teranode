@@ -2,6 +2,7 @@ package legacy
 
 import (
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -92,9 +93,16 @@ func (s *server) setFeelerBudget(logger ulogger.Logger, configured int, connectO
 // peerAdmissionCeiling is how many inbound and automatic outbound peers the
 // node will admit: MaxPeers less the slots held back for feeler probes.
 //
-// Named (addnode) peers are not bounded by this, and are not meant to be: they
-// have their own budget and are additive, which is what CountExcludingPermanent
-// exists to express.
+// Named (addnode) peers are not counted against this, and are not meant to be:
+// they have their own budget and are additive, which is what
+// CountExcludingPermanent exists to express. Not counted is not the same as not
+// gated, though — handleAddPeerMsg applies the comparison to every peer it
+// admits, named ones included — so a node whose inbound and automatic tiers are
+// already full still turns a named peer away, and the reservation makes that
+// bite one peer sooner. connectNodeAdmitted, the runtime addnode door,
+// deliberately does not apply the ceiling to a permanent request, so the two
+// doors disagree on this point. That predates the feeler; the TODO at the check
+// itself is where it is tracked.
 func peerAdmissionCeiling(maxPeers, feelerSlots int) int {
 	ceiling := maxPeers - feelerSlots
 	if ceiling < 0 {
@@ -128,6 +136,12 @@ func (s *server) feelerAllowed() bool {
 // feelerPollInterval is how often the feeler loop wakes to ask whether it is
 // time to probe. svnode's connection thread reaches the same decision on a
 // 500ms sleep (net.cpp:1802); a second is the same idea, one wakeup cheaper.
+//
+// It is also the floor under legacy_feelerInterval: the deadline is only ever
+// examined on a tick, so any mean below a second is served at a second, and the
+// realised mean of a sub-second setting is higher than the one configured. That
+// only matters to a test winding the interval down, and it is written into the
+// setting's own documentation.
 const feelerPollInterval = time.Second
 
 // feelerCandidateTries bounds one selection pass. It matches newAddressFunc, so
@@ -154,10 +168,37 @@ const feelerHandshakeTimeout = 30 * time.Second
 // memoryless gap leaks neither. svnode randomises its feeler pacing the same
 // way, in PoissonNextSend (net.cpp:3326), and for the same reason.
 //
-// Unbounded above, as svnode's is. At a two-minute mean an exponential draw
-// cannot come close to overflowing an int64 of nanoseconds.
+// Unbounded above, as svnode's is, but not unguarded: see boundedDuration.
 func poissonNext(mean time.Duration) time.Duration {
-	return time.Duration(rand.ExpFloat64() * float64(mean))
+	return boundedDuration(rand.ExpFloat64()*float64(mean), mean)
+}
+
+// boundedDuration turns a nanosecond count into a Duration, falling back when
+// the value will not fit.
+//
+// At the default two-minute mean an exponential draw cannot come close to
+// overflowing an int64 of nanoseconds. The mean is operator-settable, though,
+// and ExpFloat64 reaches about 745, so a mean beyond roughly a hundred and
+// forty days puts the product past MaxInt64 — and converting a float that does
+// not fit is undefined in Go. The two architectures teranode ships on do
+// genuinely different things with it, both measured rather than assumed:
+//
+//   - amd64 produces the indefinite value, MinInt64, for an overflow in either
+//     direction. A negative gap parks the deadline permanently in the past, so
+//     the probe fires on every single tick.
+//   - arm64 saturates, so a positive overflow becomes MaxInt64 — a deadline
+//     some 292 years out, which stops the feeler for the life of the process.
+//
+// Neither is a pacing anyone asked for, and they fail in opposite directions,
+// so the out-of-range case returns the fallback instead. The comparison is
+// written as a negated in-range test so that NaN, which loses every ordinary
+// comparison, takes the fallback too.
+func boundedDuration(ns float64, fallback time.Duration) time.Duration {
+	if !(ns > math.MinInt64 && ns < math.MaxInt64) {
+		return fallback
+	}
+
+	return time.Duration(ns)
 }
 
 // startFeeler launches the probe loop, unless feelers are switched off.
@@ -289,6 +330,20 @@ func (s *server) feelerProbe() {
 	s.feelerAttempted.Add(1)
 
 	conn, err := bsvdDial(netAddr)
+
+	// Everything past the dial wants to write to the address book, and by now
+	// the node may be shutting down: peerHandler stops the address manager
+	// immediately after its loop exits, so a write that loses that race is
+	// silently lost. Give up rather than write — on both arms, because the
+	// failure arm records against the book too.
+	if s.shuttingDown() {
+		if conn != nil {
+			_ = conn.Close()
+		}
+
+		return
+	}
+
 	if err != nil {
 		// A dial that produced nothing is the only evidence the book ever gets
 		// that an address is dead. recordFailedDial is wired into the connection
@@ -297,14 +352,6 @@ func (s *server) feelerProbe() {
 		s.recordFailedDial(netAddr)
 		s.logger.Debugf("[Feeler] Dial %s failed: %v", addrString, err)
 
-		return
-	}
-
-	// Past this point the node may be shutting down, and peerHandler stops the
-	// address manager immediately after its loop exits — a write after the save
-	// is silently lost. Give up rather than write.
-	if s.shuttingDown() {
-		_ = conn.Close()
 		return
 	}
 
@@ -330,7 +377,14 @@ func (s *server) feelerProbe() {
 	// After the TCP connect, matching outboundPeerConnected and svnode, which
 	// records the attempt on both arms of ConnectNode. countFailedDial is what
 	// stops a spell of broken local networking blaming the whole address book.
-	s.addrManager.Attempt(na, s.countFailedDial())
+	//
+	// Shutdown is re-checked rather than leaning on the check after the dial:
+	// the steps between are short but not free, and this is the same rule Good()
+	// follows below. Skipping the write is not a loss — the book it would land
+	// in has already been saved.
+	if !s.shuttingDown() {
+		s.addrManager.Attempt(na, s.countFailedDial())
+	}
 
 	gone := make(chan struct{})
 

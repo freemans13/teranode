@@ -1,6 +1,7 @@
 package legacy
 
 import (
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/url"
@@ -1028,4 +1029,26 @@ func TestFeelerHandlerWaitsForASlotToken(t *testing.T) {
 		return srv.feelerAttempted.Load() > 0
 	}, 20*time.Second, 25*time.Millisecond,
 		"a returned token must let the loop probe, or the silence above proved nothing")
+}
+
+// TestBoundedDurationRefusesAConversionThatDoesNotFit pins the guard under
+// poissonNext, deterministically and on either architecture.
+//
+// It is tested here rather than through poissonNext because poissonNext cannot
+// show the bug on every platform: at a mean of MaxInt64 the guard returns the
+// mean and an unguarded arm64 saturates to the same MaxInt64, so the two are
+// indistinguishable. Feeding the conversion directly makes the fallback visible
+// wherever the suite runs -- deleting the guard yields MaxInt64 on arm64 and
+// MinInt64 on amd64, and neither is the fallback.
+func TestBoundedDurationRefusesAConversionThatDoesNotFit(t *testing.T) {
+	fallback := 120 * time.Second
+
+	require.Equal(t, 5*time.Second, boundedDuration(float64(5*time.Second), fallback),
+		"a value that fits is converted, not replaced")
+	require.Equal(t, fallback, boundedDuration(1e30, fallback),
+		"past MaxInt64: amd64 would report a negative gap, arm64 a 292-year one")
+	require.Equal(t, fallback, boundedDuration(-1e30, fallback),
+		"past MinInt64")
+	require.Equal(t, fallback, boundedDuration(math.NaN(), fallback),
+		"NaN loses every ordinary comparison, so the test has to be written to catch it")
 }
