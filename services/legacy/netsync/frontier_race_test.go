@@ -101,11 +101,12 @@ func newRaceManager(t *testing.T) *SyncManager {
 	t.Helper()
 
 	sm := &SyncManager{
-		logger:      ulogger.TestLogger{},
-		settings:    test.CreateBaseTestSettings(t),
-		chainParams: &chaincfg.MainNetParams,
-		peerStates:  txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-		headerList:  list.New(),
+		logger:         ulogger.TestLogger{},
+		settings:       test.CreateBaseTestSettings(t),
+		chainParams:    &chaincfg.MainNetParams,
+		peerStates:     txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
+		headerList:     list.New(),
+		blockDownloads: newBlockDownloadTracker(blockRequestAssignmentTTL),
 		racedBlocks: expiringmap.New[chainhash.Hash, map[*peerpkg.Peer]struct{}](racedBlockGraceTTL).
 			WithMaxSize(racedBlockGraceMaxTracked),
 	}
@@ -120,8 +121,7 @@ func newRaceManager(t *testing.T) *SyncManager {
 // its state.
 func registerRacePeer(sm *SyncManager, p *peerpkg.Peer) *peerSyncState {
 	state := &peerSyncState{
-		syncCandidate:   true,
-		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Hour),
+		syncCandidate: true,
 	}
 	sm.peerStates.Set(p, state)
 
@@ -138,14 +138,14 @@ func TestFrontierRace_AsksASecondPeerForTheStuckBlock(t *testing.T) {
 	syncPeer, _, syncRec := connectRacePeer(t, 1, 1000)
 	other, _, otherRec := connectRacePeer(t, 2, 1000)
 
-	syncState := registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, syncPeer)
 	registerRacePeer(sm, other)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
 	// The sync peer was asked for this block and has not answered for 30
 	// seconds, comfortably past the 20 second default.
 	frontier := chainhash.Hash{0xaa}
-	syncState.requestedBlocks.Set(frontier, struct{}{})
+	sm.blockDownloads.Add(syncPeer, frontier)
 	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
 
 	sm.raceFrontierBlock(time.Now())
@@ -158,13 +158,13 @@ func TestFrontierRace_AsksASecondPeerForTheStuckBlock(t *testing.T) {
 
 	// The reply has to be authorised, or the delivering peer would be
 	// disconnected for sending a block we never asked for.
-	otherState, exists := sm.peerStates.Get(other)
+	_, exists := sm.peerStates.Get(other)
 	require.True(t, exists)
-	_, authorised := otherState.requestedBlocks.Get(frontier)
+	authorised := sm.blockDownloads.HasOwner(other, frontier)
 	require.True(t, authorised, "the second peer's reply must be authorised in advance")
 
 	// The original request stands: we added a copy, we did not move the block.
-	_, stillAsked := syncState.requestedBlocks.Get(frontier)
+	stillAsked := sm.blockDownloads.HasOwner(syncPeer, frontier)
 	require.True(t, stillAsked, "the original request must be left in place")
 }
 
@@ -180,12 +180,12 @@ func TestFrontierRace_RunsFromTheBlockHandler(t *testing.T) {
 	syncPeer, _, _ := connectRacePeer(t, 3, 1000)
 	other, _, otherRec := connectRacePeer(t, 4, 1000)
 
-	syncState := registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, syncPeer)
 	registerRacePeer(sm, other)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
 	frontier := chainhash.Hash{0xbb}
-	syncState.requestedBlocks.Set(frontier, struct{}{})
+	sm.blockDownloads.Add(syncPeer, frontier)
 	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
 
 	go sm.blockHandler()
@@ -224,53 +224,52 @@ func TestFrontierRaceTarget(t *testing.T) {
 
 	t.Run("races when the frontier is stuck and nothing else is wrong", func(t *testing.T) {
 		sm := setup(t)
-		hash, height, target, state, ok := sm.frontierRaceTarget(time.Now())
+		hash, height, target, ok := sm.frontierRaceTarget(time.Now())
 		require.True(t, ok)
 		require.Equal(t, chainhash.Hash{0xcc}, hash)
 		require.Equal(t, int32(500), height)
 		require.Equal(t, other, target)
-		require.NotNil(t, state)
 	})
 
 	t.Run("no frontier", func(t *testing.T) {
 		sm := setup(t)
 		sm.clearFrontier()
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
 	t.Run("frontier not stuck for long enough yet", func(t *testing.T) {
 		sm := setup(t)
 		sm.setFrontier(chainhash.Hash{0xdd}, 500, time.Now().Add(-2*time.Second))
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
 	t.Run("racing switched off by legacy_maxBlockParallelFetch", func(t *testing.T) {
 		sm := setup(t)
 		sm.settings.Legacy.MaxBlockParallelFetch = 1
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
 	t.Run("racing switched off by legacy_blockSlowFetchTimeout", func(t *testing.T) {
 		sm := setup(t)
 		sm.settings.Legacy.BlockSlowFetchTimeout = 0
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
 	t.Run("not in headers-first mode", func(t *testing.T) {
 		sm := setup(t)
 		sm.headersFirstMode.Store(false)
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
 	t.Run("already at the configured number of peers", func(t *testing.T) {
 		sm := setup(t)
 		require.True(t, sm.registerFrontierRacer(chainhash.Hash{0xcc}, other))
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok, "default of 2 is the holder plus one racer, so no third peer")
 	})
 
@@ -278,7 +277,7 @@ func TestFrontierRaceTarget(t *testing.T) {
 		sm := setup(t)
 		sm.blockBacklog.Store(1)
 		require.True(t, sm.localReadBackpressured())
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
@@ -289,14 +288,14 @@ func TestFrontierRaceTarget(t *testing.T) {
 			assocReadBytes:         64 << 20,
 			assocReadBytesLastTick: 0,
 		})
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok, "a peer mid-transfer of a large block is slow, not stalled")
 	})
 
 	t.Run("no sync peer", func(t *testing.T) {
 		sm := setup(t)
 		sm.storeSyncPeer(nil, nil)
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
@@ -305,7 +304,7 @@ func TestFrontierRaceTarget(t *testing.T) {
 		state, exists := sm.peerStates.Get(other)
 		require.True(t, exists)
 		state.syncCandidate = false
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
@@ -313,7 +312,7 @@ func TestFrontierRaceTarget(t *testing.T) {
 		sm := setup(t)
 		sm.peerStates.Delete(other)
 		registerRacePeer(sm, &peerpkg.Peer{})
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
@@ -321,14 +320,14 @@ func TestFrontierRaceTarget(t *testing.T) {
 		sm := setup(t)
 		sm.peerStates.Delete(other)
 		registerRacePeer(sm, shortPeer)
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 	})
 
 	t.Run("there is no other peer at all", func(t *testing.T) {
 		sm := setup(t)
 		sm.peerStates.Delete(other)
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok, "with only the peer that already owes us the block, do nothing")
 	})
 }
@@ -343,24 +342,24 @@ func TestNoteRaceWinner_CancelsTheRequestWithEveryoneElse(t *testing.T) {
 	syncPeer, _, _ := connectRacePeer(t, 8, 1000)
 	other, _, _ := connectRacePeer(t, 9, 1000)
 
-	syncState := registerRacePeer(sm, syncPeer)
-	otherState := registerRacePeer(sm, other)
+	registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, other)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
 	frontier := chainhash.Hash{0xee}
-	syncState.requestedBlocks.Set(frontier, struct{}{})
+	sm.blockDownloads.Add(syncPeer, frontier)
 	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
 
 	sm.raceFrontierBlock(time.Now())
 
-	_, asked := otherState.requestedBlocks.Get(frontier)
+	asked := sm.blockDownloads.HasOwner(other, frontier)
 	require.True(t, asked, "precondition: the second peer was asked")
 
 	sm.noteRaceWinner(frontier)
 
-	_, stillAsked := syncState.requestedBlocks.Get(frontier)
+	stillAsked := sm.blockDownloads.HasOwner(syncPeer, frontier)
 	require.False(t, stillAsked, "the original peer's request must be cancelled once the block arrives")
-	_, stillAskedOther := otherState.requestedBlocks.Get(frontier)
+	stillAskedOther := sm.blockDownloads.HasOwner(other, frontier)
 	require.False(t, stillAskedOther, "the second peer's request must be cancelled too")
 
 	sm.frontierMu.Lock()
@@ -380,12 +379,12 @@ func TestBlockRacedTo_OnlyForPeersWeAsked(t *testing.T) {
 	other, _, _ := connectRacePeer(t, 11, 1000)
 	stranger, _, _ := connectRacePeer(t, 12, 1000)
 
-	syncState := registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, syncPeer)
 	registerRacePeer(sm, other)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
 	frontier := chainhash.Hash{0x0f}
-	syncState.requestedBlocks.Set(frontier, struct{}{})
+	sm.blockDownloads.Add(syncPeer, frontier)
 	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
 
 	// Only one other peer is registered at this point, so it is the one raced to.
@@ -418,19 +417,17 @@ func TestHandleBlockMsg_LateCopyOfARacedBlockIsNotPunished(t *testing.T) {
 	sm := newRaceManager(t)
 	sm.ctx = context.Background()
 	sm.blockchainClient = blockchainClient
-	sm.requestedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Hour)
-	t.Cleanup(func() { sm.requestedBlocks.Stop() })
 
 	syncPeer, _, _ := connectRacePeer(t, 14, 1000)
 	loser, _, _ := connectRacePeer(t, 15, 1000)
 	stranger, _, _ := connectRacePeer(t, 16, 1000)
 
-	syncState := registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, syncPeer)
 	registerRacePeer(sm, loser)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
 	frontier := chainhash.Hash{0x77}
-	syncState.requestedBlocks.Set(frontier, struct{}{})
+	sm.blockDownloads.Add(syncPeer, frontier)
 	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
 
 	// Race it, then let it be delivered, which cancels the request with the
@@ -465,8 +462,6 @@ func TestFetchHeaderBlocks_PublishesTheFrontier(t *testing.T) {
 	sm.ctx = context.Background()
 	sm.blockchainClient = blockchainClient
 	sm.blockSizeTracker = newBlockSizeTracker(10)
-	sm.requestedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Hour)
-	t.Cleanup(func() { sm.requestedBlocks.Stop() })
 
 	syncPeer, _, syncRec := connectRacePeer(t, 17, 1000)
 	registerRacePeer(sm, syncPeer)
@@ -500,14 +495,12 @@ func TestHandleBlockMsg_AdvancesTheFrontier(t *testing.T) {
 	sm := newRaceManager(t)
 	sm.ctx = context.Background()
 	sm.blockchainClient = blockchainClient
-	sm.requestedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Hour)
-	t.Cleanup(func() { sm.requestedBlocks.Stop() })
 
 	checkpointHash := chainhash.Hash{0xcf}
 	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 999, Hash: &checkpointHash}
 
 	syncPeer, _, _ := connectRacePeer(t, 18, 1000)
-	syncState := registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, syncPeer)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
 	arriving := chainhash.Hash{0xa1}
@@ -516,7 +509,7 @@ func TestHandleBlockMsg_AdvancesTheFrontier(t *testing.T) {
 	sm.headerList.PushBack(&headerNode{height: 11, hash: &next})
 	sm.startHeader = nil // everything in the list has been requested
 
-	syncState.requestedBlocks.Set(arriving, struct{}{})
+	sm.blockDownloads.Add(syncPeer, arriving)
 	sm.setFrontier(arriving, 10, time.Now().Add(-30*time.Second))
 
 	// Carrying no block makes handleBlockMsg bail immediately after the
@@ -608,7 +601,7 @@ func TestPublishFrontier(t *testing.T) {
 		sm.setFrontier(hashA, 10, time.Now())
 		sm.resetHeaderState(&hashB, 11)
 
-		_, _, _, _, ok := sm.frontierRaceTarget(time.Now())
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok)
 
 		sm.frontierMu.Lock()

@@ -143,22 +143,22 @@ func (sm *SyncManager) setFrontier(hash chainhash.Hash, height int32, now time.T
 //     part-way through a large block rather than ignoring us — racing a peer
 //     mid-transfer just buys a duplicate of a download that is already working;
 //   - there is nobody else worth asking.
-func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32, *peerpkg.Peer, *peerSyncState, bool) {
+func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32, *peerpkg.Peer, bool) {
 	var none chainhash.Hash
 
 	if sm.settings == nil {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	maxRacing := sm.settings.Legacy.MaxBlockParallelFetch
 	slowAfter := sm.settings.Legacy.BlockSlowFetchTimeout
 
 	if maxRacing < 2 || slowAfter <= 0 {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	if !sm.headersFirstMode.Load() {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	sm.frontierMu.Lock()
@@ -173,26 +173,26 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	sm.frontierMu.Unlock()
 
 	if hash == none {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	if now.Sub(since) < slowAfter {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	// The peer that already owes us the block counts towards the limit, so at
 	// the default of 2 exactly one extra peer is ever added.
 	if len(racing)+1 >= maxRacing {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	if sm.localReadBackpressured() {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	sp, sps := sm.loadSyncPeerAndState()
 	if sp == nil || sps == nil {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	// A brand new sync peer has no throughput sample yet and is treated as not
@@ -200,11 +200,11 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	// block from a peer that turned out to be fine, whereas the opposite bias
 	// would let a genuinely silent peer hide behind a missing measurement.
 	if sps.hasHealthyDownloadThroughput(sm.minSyncPeerNetworkSpeed) {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	if sm.peerStates == nil {
-		return none, 0, nil, nil, false
+		return none, 0, nil, false
 	}
 
 	for p, state := range sm.peerStates.Range() {
@@ -221,10 +221,10 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 			continue
 		}
 
-		return hash, height, p, state, true
+		return hash, height, p, true
 	}
 
-	return none, 0, nil, nil, false
+	return none, 0, nil, false
 }
 
 // raceFrontierBlock asks one additional peer for the block that is currently
@@ -232,7 +232,7 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 // driven by a five-second timer in blockHandler. The original request is left
 // exactly as it was, so the worst this can cost is one duplicate block.
 func (sm *SyncManager) raceFrontierBlock(now time.Time) {
-	hash, height, target, state, ok := sm.frontierRaceTarget(now)
+	hash, height, target, ok := sm.frontierRaceTarget(now)
 	if !ok {
 		return
 	}
@@ -247,9 +247,10 @@ func (sm *SyncManager) raceFrontierBlock(now time.Time) {
 	}
 
 	// Authorise the reply. Both the pre-admission check in the peer read-loop
-	// and the one in handleBlockMsg consult this peer's own outstanding-request
-	// list, and a block that is not on it gets the peer disconnected.
-	state.requestedBlocks.Set(hash, struct{}{})
+	// and the one in handleBlockMsg ask whether this peer owes us the block, and
+	// a peer that does not gets disconnected for sending it. Recording a second
+	// owner is exactly what the ledger is for.
+	sm.blockDownloads.Add(target, hash)
 
 	getData := wire.NewMsgGetDataSizeHint(1)
 	if err := getData.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hash)); err != nil {
@@ -302,7 +303,10 @@ func (sm *SyncManager) registerFrontierRacer(hash chainhash.Hash, p *peerpkg.Pee
 // otherwise sit in that peer's outstanding list for a full hour, counting
 // against the in-flight limit fetchHeaderBlocks uses to decide how much more to
 // ask for — a limit that drops to a single block once blocks get large enough,
-// at which point one stale entry stops us fetching anything at all.
+// at which point one stale entry stops us fetching anything at all. The download
+// ledger ages assignments out on its own, but that is only the backstop for
+// requests nobody ever cancels; this is the fast path, and an hour of a stalled
+// in-flight budget is far too long to wait for the slow one.
 //
 // Remembering matters because the peers whose request we just cancelled may
 // still be part-way through sending their copy. When it lands it would look
@@ -332,12 +336,8 @@ func (sm *SyncManager) noteRaceWinner(hash chainhash.Hash) {
 		asked[sp] = struct{}{}
 	}
 
-	if sm.peerStates != nil {
-		for p := range asked {
-			if state, exists := sm.peerStates.Get(p); exists {
-				state.requestedBlocks.Delete(hash)
-			}
-		}
+	for p := range asked {
+		sm.blockDownloads.RemoveOwner(p, hash)
 	}
 
 	if sm.racedBlocks != nil {

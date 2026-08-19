@@ -986,12 +986,9 @@ func TestHandleBlockMsg_OrphanDuringCatchup(t *testing.T) {
 	p := peer.NewInboundPeer(ulogger.TestLogger{}, test.CreateBaseTestSettings(t), &peer.Config{})
 
 	state := &peerSyncState{
-		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),
-		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),
 	}
 	defer state.requestedTxns.Stop()
-	defer state.requestedBlocks.Stop()
-	state.requestedBlocks.Set(blockHash, struct{}{})
 
 	sm := &SyncManager{
 		ctx:              context.Background(),
@@ -999,11 +996,10 @@ func TestHandleBlockMsg_OrphanDuringCatchup(t *testing.T) {
 		chainParams:      &chaincfg.MainNetParams,
 		blockchainClient: blockchainClient,
 		peerStates:       txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		blockDownloads:   newBlockDownloadTracker(blockRequestAssignmentTTL),
 	}
-	defer sm.requestedBlocks.Stop()
 	sm.peerStates.Set(p, state)
-	sm.requestedBlocks.Set(blockHash, struct{}{})
+	sm.blockDownloads.Add(p, blockHash)
 
 	err := sm.handleBlockMsg(&blockQueueMsg{
 		block:       msgBlock,
@@ -1031,11 +1027,9 @@ func newBackoffTestManager(t *testing.T, blockchainClient *blockchain2.Mock, blo
 	p := peer.NewInboundPeer(ulogger.TestLogger{}, tSettings, &peer.Config{})
 
 	state := &peerSyncState{
-		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),
-		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),
 	}
-	t.Cleanup(func() { state.requestedTxns.Stop(); state.requestedBlocks.Stop() })
-	state.requestedBlocks.Set(blockHash, struct{}{})
+	t.Cleanup(func() { state.requestedTxns.Stop() })
 
 	sm := &SyncManager{
 		ctx:                  context.Background(),
@@ -1044,13 +1038,13 @@ func newBackoffTestManager(t *testing.T, blockchainClient *blockchain2.Mock, blo
 		chainParams:          &chaincfg.MainNetParams,
 		blockchainClient:     blockchainClient,
 		peerStates:           txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
-		requestedBlocks:      expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		blockDownloads:       newBlockDownloadTracker(blockRequestAssignmentTTL),
 		blockFailureBackoff:  expiringmap.New[chainhash.Hash, *blockFailureState](time.Minute),
 		recentlyFailedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
 	}
-	t.Cleanup(func() { sm.requestedBlocks.Stop(); sm.blockFailureBackoff.Stop(); sm.recentlyFailedBlocks.Stop() })
+	t.Cleanup(func() { sm.blockFailureBackoff.Stop(); sm.recentlyFailedBlocks.Stop() })
 	sm.peerStates.Set(p, state)
-	sm.requestedBlocks.Set(blockHash, struct{}{})
+	sm.blockDownloads.Add(p, blockHash)
 
 	return sm, p
 }

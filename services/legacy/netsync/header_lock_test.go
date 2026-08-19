@@ -12,7 +12,6 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
-	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -70,9 +69,6 @@ func newHeaderLockManager(t *testing.T, gate chan struct{}, entered chan struct{
 	sm.ctx = context.Background()
 	sm.blockchainClient = blockchainClient
 	sm.blockSizeTracker = newBlockSizeTracker(10)
-	sm.requestedBlocks = expiringmap.New[chainhash.Hash, struct{}](time.Hour)
-
-	t.Cleanup(func() { sm.requestedBlocks.Stop() })
 
 	// A checkpoint far above anything these tests generate, so the checkpoint
 	// branches never fire and the plain push/remove paths are what is exercised.
@@ -99,7 +95,7 @@ func TestHeaderList_ConcurrentHeadersAndBlocksDoNotCorruptTheList(t *testing.T) 
 	sm := newHeaderLockManager(t, nil, nil)
 
 	syncPeer, _, _ := connectRacePeer(t, 30, 1000)
-	state := registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, syncPeer)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
 	// Seed the list with an anchor the first batch of headers can link to.
@@ -151,7 +147,7 @@ func TestHeaderList_ConcurrentHeadersAndBlocksDoNotCorruptTheList(t *testing.T) 
 			<-tick
 
 			h := <-hashCh
-			state.requestedBlocks.Set(h, struct{}{})
+			sm.blockDownloads.Add(syncPeer, h)
 			// The message carries no block, so handleBlockMsg returns straight
 			// after the header-list bookkeeping that is under test.
 			_ = sm.handleBlockMsg(&blockQueueMsg{blockHash: h, peer: syncPeer})

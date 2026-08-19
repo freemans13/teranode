@@ -224,10 +224,9 @@ type headerNode struct {
 // peerSyncState stores additional information that the SyncManager tracks
 // about a peer.
 type peerSyncState struct {
-	syncCandidate   bool
-	requestQueue    *txmap.SyncedSlice[wire.InvVect]
-	requestedTxns   *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
-	requestedBlocks *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
+	syncCandidate bool
+	requestQueue  *txmap.SyncedSlice[wire.InvVect]
+	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 }
 
 // syncPeerState stores additional info about the sync peer.
@@ -486,9 +485,14 @@ type SyncManager struct {
 
 	// These fields should only be accessed from the blockHandler thread
 	// (except syncPeer/syncPeerState which are protected by syncPeerMu).
-	rejectedTxns    *txmap.SyncedMap[chainhash.Hash, struct{}]
-	requestedTxns   *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
-	requestedBlocks *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
+	rejectedTxns  *txmap.SyncedMap[chainhash.Hash, struct{}]
+	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
+	// blockDownloads is the single record of which peers owe us which blocks,
+	// replacing the global and per-peer request maps that used to hold half the
+	// answer each. Unlike the fields above it carries its own lock, so it is
+	// read and written from any goroutine — the frontier race timer and the
+	// peer read-loops both consult it. See block_download_tracker.go.
+	blockDownloads *blockDownloadTracker
 	// blockFailureBackoff throttles re-processing of a block that just failed
 	// with a transient storage/service error, so a re-delivered block does not
 	// immediately re-run the full multi-million-record decorate at full
@@ -984,10 +988,10 @@ func (sm *SyncManager) startSync() {
 		return
 	}
 
-	// Clear the requestedBlocks if the sync peer changes, otherwise
+	// Forget every outstanding request if the sync peer changes, otherwise
 	// we may ignore blocks we need that the last sync peer failed
 	// to send.
-	sm.requestedBlocks.Clear()
+	sm.blockDownloads.Clear()
 
 	locator, err := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
 	if err != nil {
@@ -1186,10 +1190,9 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 	}
 
 	sm.peerStates.Set(peer, &peerSyncState{
-		syncCandidate:   isSyncCandidate,
-		requestQueue:    txmap.NewSyncedSlice[wire.InvVect](maxRequestedBlocks),
-		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](10 * time.Second), // allow the node 10 seconds to respond to the tx request
-		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](60 * time.Minute), // allow the node 1 hour to respond to the requested blocks, needed for legacy sync/checkpoints
+		syncCandidate: isSyncCandidate,
+		requestQueue:  txmap.NewSyncedSlice[wire.InvVect](maxRequestedBlocks),
+		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](10 * time.Second), // allow the node 10 seconds to respond to the tx request
 	})
 
 	// Start syncing by choosing the best candidate if needed.
@@ -1288,7 +1291,7 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 
 	sm.logger.Debugf("[CheckSyncPeer] removing sync peer %s", sp.String())
 
-	sm.clearRequestedState(state)
+	sm.clearRequestedState(sp, state)
 	sm.updateSyncPeer(state)
 }
 
@@ -1325,7 +1328,7 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 	sm.logger.Infof("Lost peer %s (removed from peerStates)", peer)
 
 	// Cleanup state of requested items.
-	sm.clearRequestedState(state)
+	sm.clearRequestedState(peer, state)
 
 	// Fetch a new sync peer if this is the sync peer.
 	if peer == sm.loadSyncPeer() {
@@ -1333,16 +1336,24 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 	}
 }
 
-// clearRequestedState removes requested transactions
-// and blocks from the global map.
-func (sm *SyncManager) clearRequestedState(state *peerSyncState) {
-	// Remove requested transactions from the global map so that they will
-	// be fetched from elsewhere next time we get an inv.
+// clearRequestedState releases everything we were still waiting on from a peer
+// we are giving up on, so the next inv that announces one of those items fetches
+// it from somewhere else.
+//
+// It used to only call Stop() on the two expiring maps. Stop closes the cleanup
+// goroutine's channel and never touches the entries, so nothing was released:
+// the per-peer map became garbage the moment the peer was dropped from
+// peerStates, and the entries that actually mattered — the departing peer's
+// entries in the global map — were never consulted at all. A block owed by a
+// peer that has gone was therefore owed forever, and was never asked for again.
+func (sm *SyncManager) clearRequestedState(peer *peerpkg.Peer, state *peerSyncState) {
+	// Drop the transactions we were waiting on, then stop the map's cleanup
+	// goroutine. Clear before Stop: after Stop nothing sweeps it any more.
+	state.requestedTxns.Clear()
 	state.requestedTxns.Stop()
 
-	// Remove requested blocks from the global map so that they will be
-	// fetched from elsewhere next time we get an inv.
-	state.requestedBlocks.Stop()
+	// Release every block this peer owed us.
+	sm.blockDownloads.ClearPeer(peer)
 }
 
 // updateSyncPeer picks a new peer to sync from.
@@ -1737,7 +1748,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	sm.logger.Debugf("[handleBlockMsg][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 	peer := bmsg.peer
 
-	state, resolved, exists := sm.peerStateResolvingPrimary(peer)
+	_, resolved, exists := sm.peerStateResolvingPrimary(peer)
 	if !exists {
 		sm.logger.Errorf("[handleBlockMsg][%s] Received block message from unknown peer %s", bmsg.blockHash, peer)
 		return errors.NewServiceError("[handleBlockMsg] Received block message from unknown peer %s", peer)
@@ -1801,7 +1812,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	}
 
 	// If we didn't ask for this block then the peer is misbehaving.
-	if _, exists = state.requestedBlocks.Get(bmsg.blockHash); !exists {
+	if !sm.blockDownloads.HasOwner(peer, bmsg.blockHash) {
 		// The regression test intentionally sends some blocks twice
 		// to test duplicate block insertion fails.  Don't disconnect
 		// the peer or ignore the block when we're in regression test
@@ -1873,18 +1884,24 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		sm.headerMu.Unlock()
 	}
 
-	// Remove block from request maps. Either chain will know about it, and
-	// so we shouldn't have any more instances of trying to fetch it, or we
-	// will fail the insert, and thus we'll retry next time we get an inv.
-	state.requestedBlocks.Delete(bmsg.blockHash)
-	sm.requestedBlocks.Delete(bmsg.blockHash)
+	// This peer has answered, so it no longer owes us the block: either the
+	// chain will know about it and nobody needs to fetch it again, or the insert
+	// fails and we retry next time we get an inv.
+	//
+	// Only this peer's obligation goes. Any other peer we also asked keeps
+	// theirs, exactly as the per-peer map it replaced did, so a second copy
+	// already on the wire lands as an answer to our own question rather than as
+	// an unrequested block that costs an honest peer its connection. It cannot
+	// hold up a retry for long: the inv path only declines to re-request a block
+	// somebody was asked for within the last blockRequestRetryInterval.
+	sm.blockDownloads.RemoveOwner(peer, bmsg.blockHash)
 
 	// Per-block transient-failure backoff (#1187): if this block recently failed
 	// with a storage/service error, skip the expensive HandleBlockDirect path
 	// until the backoff window elapses instead of re-running the full decorate at
 	// full concurrency. Returning a retryable error (not sleeping) keeps the
 	// single block-processing goroutine free. The block was already removed from
-	// requestedBlocks above, so re-delivery is driven by the existing recovery
+	// download ledger above, so re-delivery is driven by the existing recovery
 	// plumbing — a later block arrives as an orphan of this un-stored one and
 	// triggers a getblocks that re-requests it — not by a proactive re-request
 	// here. Two things keep this from stalling sync (#1187, review): the backoff
@@ -2125,9 +2142,9 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		haveMoreHeaders := sm.startHeader != nil
 		sm.headerMu.Unlock()
 
-		if haveMoreHeaders && state.requestedBlocks.Len() < dynamicMax {
+		if haveMoreHeaders && sm.blockDownloads.CountForPeer(peer) < dynamicMax {
 			sm.fetchHeaderBlocks()
-		} else if !sm.current() && state.requestedBlocks.Len() == 0 {
+		} else if !sm.current() && sm.blockDownloads.CountForPeer(peer) == 0 {
 			sm.logger.Debugf("Not current, and no headers to sync to, fetching more headers")
 
 			latestBlockHeader, _, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
@@ -2216,15 +2233,14 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 
 	// Calculate how many blocks to request to reach the dynamic max limit.
 	// The limit adjusts based on observed block sizes (20 for small, down to 1 for >2GB).
-	peerState, exists := sm.peerStates.Get(sp)
-	if !exists {
+	if _, exists := sm.peerStates.Get(sp); !exists {
 		sm.headerMu.Unlock()
 		sm.logger.Warnf("[fetchHeaderBlocks] sync peer state not found")
 
 		return
 	}
 
-	currentInFlight := peerState.requestedBlocks.Len()
+	currentInFlight := sm.blockDownloads.CountForPeer(sp)
 	dynamicMaxInFlight := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 	maxBlocks := dynamicMaxInFlight - currentInFlight
 	if maxBlocks <= 0 {
@@ -2278,9 +2294,7 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 				break
 			}
 
-			sm.requestedBlocks.Set(*node.hash, struct{}{})
-			peerState, _ := sm.peerStates.Get(sp)
-			peerState.requestedBlocks.Set(*node.hash, struct{}{})
+			sm.blockDownloads.Add(sp, *node.hash)
 
 			numRequested++
 		}
@@ -2638,14 +2652,13 @@ outside:
 		switch iv.Type {
 		case wire.InvTypeBlock:
 			// Request the block if there is not already a pending request.
-			if _, exists = sm.requestedBlocks.Get(iv.Hash); !exists {
+			if !sm.blockDownloads.RequestedWithin(iv.Hash, blockRequestRetryInterval) {
 				if err = gdmsg.AddInvVect(iv); err != nil {
 					sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
 					break outside
 				}
 
-				sm.requestedBlocks.Set(iv.Hash, struct{}{})
-				state.requestedBlocks.Set(iv.Hash, struct{}{})
+				sm.blockDownloads.Add(peer, iv.Hash)
 
 				numRequested++
 			}
@@ -3043,16 +3056,13 @@ func (sm *SyncManager) BlockRequested(peer *peerpkg.Peer, blockHash *chainhash.H
 	}
 
 	// Resolve stream sub-peers to their association primary, as handleBlockMsg
-	// does; BlockRequested only reads the resolved state, so the primary itself
-	// is not needed here.
-	state, _, exists := sm.peerStateResolvingPrimary(peer)
+	// does; the ledger records the primary, so that is the identity to ask about.
+	_, primary, exists := sm.peerStateResolvingPrimary(peer)
 	if !exists {
 		return false
 	}
 
-	_, requested := state.requestedBlocks.Get(*blockHash)
-
-	return requested
+	return sm.blockDownloads.HasOwner(primary, *blockHash)
 }
 
 // AcquireBlockPrefetch reserves prefetch budget for a block of the given
@@ -3387,7 +3397,6 @@ func (sm *SyncManager) Stop() error {
 
 	sm.orphanTxs.Stop()
 	sm.requestedTxns.Stop()
-	sm.requestedBlocks.Stop()
 
 	if sm.blockFailureBackoff != nil {
 		sm.blockFailureBackoff.Stop()
@@ -3470,17 +3479,11 @@ func (sm *SyncManager) SyncPeerID() int32 {
 //
 // Only peers with a genuine outstanding request count. A peer cannot inflate our
 // patience by announcing blocks it never sends, because nothing is recorded until
-// we ask for it.
+// we ask for it, and a request old enough to have aged out of the download ledger
+// stops counting too — a getdata that was lost on the wire must not go on buying
+// every peer extra time forever.
 func (sm *SyncManager) PeersWithBlockDownloads() int {
-	n := 0
-
-	for _, state := range sm.peerStates.Range() {
-		if state != nil && state.requestedBlocks != nil && state.requestedBlocks.Len() > 0 {
-			n++
-		}
-	}
-
-	return n
+	return sm.blockDownloads.PeersWithDownloads()
 }
 
 // IsCurrent returns whether the sync manager believes it is synced with
@@ -3513,12 +3516,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		settings:     tSettings,
 		peerNotifier: config.PeerNotifier,
 		// txMemPool:     config.TxMemPool,
-		orphanTxs:       expiringmap.New[chainhash.Hash, *orphanTxAndParents](tSettings.Legacy.OrphanEvictionDuration).WithMaxSize(tSettings.Legacy.MaxOrphanTxs),
-		chainParams:     config.ChainParams,
-		rejectedTxns:    txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns), // limit map size to maxRejectedTxns
-		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),   // give peers 10 seconds to respond
-		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](60 * time.Second),   // give peers 60 seconds to respond
-		peerStates:      txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
+		orphanTxs:      expiringmap.New[chainhash.Hash, *orphanTxAndParents](tSettings.Legacy.OrphanEvictionDuration).WithMaxSize(tSettings.Legacy.MaxOrphanTxs),
+		chainParams:    config.ChainParams,
+		rejectedTxns:   txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns), // limit map size to maxRejectedTxns
+		requestedTxns:  expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),   // give peers 10 seconds to respond
+		blockDownloads: newBlockDownloadTracker(blockRequestAssignmentTTL),
+		peerStates:     txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		// Peers we asked for a second copy of a stalled block, so their late
 		// copy is dropped rather than costing them their connection.
 		racedBlocks: expiringmap.New[chainhash.Hash, map[*peerpkg.Peer]struct{}](racedBlockGraceTTL).WithMaxSize(racedBlockGraceMaxTracked),

@@ -56,14 +56,14 @@ func requireIndexMatchesList(t *testing.T, sm *SyncManager, where string) {
 }
 
 // seedHeaderIndexManager builds a manager in headers-first mode with an anchor
-// in the header list, and returns it with the anchor hash and the peer.
-func seedHeaderIndexManager(t *testing.T, peerID uint8, anchor chainhash.Hash) (*SyncManager, *peerSyncState) {
+// in the header list, and returns it.
+func seedHeaderIndexManager(t *testing.T, peerID uint8, anchor chainhash.Hash) *SyncManager {
 	t.Helper()
 
 	sm := newHeaderLockManager(t, nil, nil)
 
 	p, _, _ := connectRacePeer(t, peerID, 1000)
-	state := registerRacePeer(sm, p)
+	registerRacePeer(sm, p)
 	sm.storeSyncPeer(p, &syncPeerState{})
 
 	sm.resetHeaderState(&anchor, 10)
@@ -71,7 +71,7 @@ func seedHeaderIndexManager(t *testing.T, peerID uint8, anchor chainhash.Hash) (
 	// headers-first paths, so turn it back on.
 	sm.headersFirstMode.Store(true)
 
-	return sm, state
+	return sm
 }
 
 // TestHeaderIndex_ClearedOnFinalCheckpointInit is the site the design first
@@ -83,7 +83,7 @@ func seedHeaderIndexManager(t *testing.T, peerID uint8, anchor chainhash.Hash) (
 // back a detached element.
 func TestHeaderIndex_ClearedOnFinalCheckpointInit(t *testing.T) {
 	anchor := chainhash.Hash{0xa1}
-	sm, _ := seedHeaderIndexManager(t, 40, anchor)
+	sm := seedHeaderIndexManager(t, 40, anchor)
 
 	peer := sm.loadSyncPeer()
 
@@ -118,7 +118,7 @@ func TestHeaderIndex_ClearedOnFinalCheckpointInit(t *testing.T) {
 // reset, and the final-checkpoint wipe.
 func TestHeaderIndex_MatchesTheListAfterEveryOperation(t *testing.T) {
 	anchor := chainhash.Hash{0xa2}
-	sm, state := seedHeaderIndexManager(t, 41, anchor)
+	sm := seedHeaderIndexManager(t, 41, anchor)
 	peer := sm.loadSyncPeer()
 
 	requireIndexMatchesList(t, sm, "after the reset that seeded the anchor")
@@ -133,7 +133,7 @@ func TestHeaderIndex_MatchesTheListAfterEveryOperation(t *testing.T) {
 	// Front removal: the block at the front of the list arrives. The message
 	// carries no block, so handleBlockMsg returns straight after the header-list
 	// bookkeeping that is under test.
-	state.requestedBlocks.Set(anchor, struct{}{})
+	sm.blockDownloads.Add(peer, anchor)
 	_ = sm.handleBlockMsg(&blockQueueMsg{blockHash: anchor, peer: peer})
 	requireIndexMatchesList(t, sm, "after the front block arrived")
 
@@ -169,7 +169,7 @@ func TestHeaderIndex_MatchesTheListAfterEveryOperation(t *testing.T) {
 // entry rather than adding the new anchor on top of the old index.
 func TestHeaderIndex_ResetLeavesOnlyTheAnchor(t *testing.T) {
 	anchor := chainhash.Hash{0xa4}
-	sm, _ := seedHeaderIndexManager(t, 42, anchor)
+	sm := seedHeaderIndexManager(t, 42, anchor)
 	peer := sm.loadSyncPeer()
 
 	var nonce uint32
@@ -196,7 +196,7 @@ func TestHeaderIndex_ResetLeavesOnlyTheAnchor(t *testing.T) {
 // entry that points at the newer one still in the list.
 func TestHeaderIndex_DuplicateHashDoesNotEvictTheLiveEntry(t *testing.T) {
 	anchor := chainhash.Hash{0xa6}
-	sm, _ := seedHeaderIndexManager(t, 43, anchor)
+	sm := seedHeaderIndexManager(t, 43, anchor)
 
 	dup := chainhash.Hash{0xdd}
 
