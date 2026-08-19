@@ -844,6 +844,12 @@ func (sm *SyncManager) leaveHeadersFirstMode() {
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
 	sm.clearHeaderIndexLocked()
+	// Same wipe as resetHeaderStateLocked, and startHeader is part of it. Left
+	// pointing into the list that has just been emptied it reads, to every
+	// caller that asks "is there anything left to fetch?", as "yes" — which is
+	// how handleBlockMsg's fallback, the one thing that re-primes sync with a
+	// getblocks once the peer has gone quiet, stops being reachable at all.
+	sm.startHeader = nil
 	sm.clearFrontier()
 }
 
