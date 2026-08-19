@@ -68,6 +68,14 @@ const (
 	// arithmetic to this.
 	parkSweepRPCBudget = 128
 
+	// parkRecoverBudgetOps is how many store operations' worth of waiting the
+	// whole restart scan gets, as a multiple of the per-operation deadline. It is
+	// expressed that way rather than as a number of seconds because it is the
+	// same question one layer up: an operator who raises the per-operation
+	// deadline because their store is slow has said how patient this node should
+	// be, and the scan should be that patient and no more.
+	parkRecoverBudgetOps = 3
+
 	// parkMinStoreTimeout is the floor on legacy_parkStoreTimeout. A zero or
 	// negative deadline would fail every store operation instantly.
 	parkMinStoreTimeout = time.Second
@@ -724,6 +732,25 @@ func (p *blockPark) Recover(ctx context.Context) {
 		return
 	}
 
+	// One overall budget for the whole scan, on top of the per-operation
+	// deadline every store call already carries.
+	//
+	// Without it the cost of starting the node is files x storeTimeout, and the
+	// number of files is set by whatever a PREVIOUS run left behind — a run that
+	// may have had a much larger legacy_parkMaxBytes, so this run refuses most of
+	// them and pays a store delete for each. That happens before blockHandler is
+	// started, so it is time the node spends not syncing, not answering, and not
+	// visibly doing anything.
+	//
+	// Whatever the budget does not reach is simply left on disk. It is not lost:
+	// nothing is charged for it, nothing points at it, and the next start scans
+	// the directory again. Giving up on adopting a block is always cheaper than
+	// making a node slow to start.
+	recoverCtx, cancel := context.WithTimeout(ctx, parkRecoverBudgetOps*p.storeTimeout)
+	defer cancel()
+
+	ctx = recoverCtx
+
 	dirEntries, err := os.ReadDir(p.dir)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -737,7 +764,15 @@ func (p *blockPark) Recover(ctx context.Context) {
 
 	var adoptedBytes int64
 
-	for _, dirEntry := range dirEntries {
+	var abandoned int
+
+	for i, dirEntry := range dirEntries {
+		if ctx.Err() != nil {
+			abandoned = len(dirEntries) - i
+
+			break
+		}
+
 		name := dirEntry.Name()
 
 		switch {
@@ -845,7 +880,11 @@ func (p *blockPark) Recover(ctx context.Context) {
 		adoptedBytes += size
 	}
 
-	if adopted == 0 && skipped == 0 && discarded == 0 {
+	if abandoned > 0 {
+		p.logger.Warnf("[blockPark] recovery ran out of its %s budget with %d file(s) in %s not looked at; they are left where they are and the next start will find them", parkRecoverBudgetOps*p.storeTimeout, abandoned, p.dir)
+	}
+
+	if adopted == 0 && skipped == 0 && discarded == 0 && abandoned == 0 {
 		return
 	}
 
