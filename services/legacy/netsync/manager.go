@@ -588,6 +588,14 @@ type SyncManager struct {
 	headerMu         sync.Mutex
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
 	headerList       *list.List
+	// headerIndex resolves a block hash to its element in headerList in O(1),
+	// so a caller does not have to walk the list to find a header. Guarded by
+	// headerMu, and maintained at every single place headerList changes —
+	// resetHeaderStateLocked's wipe and its anchor push, the front removal in
+	// handleBlockMsg, the push in handleHeadersMsg, the front removal on the
+	// checkpoint branch, and the wipe in leaveHeadersFirstMode. Miss one and the
+	// index hands back an element that is no longer in any list.
+	headerIndex      map[chainhash.Hash]*list.Element
 	startHeader      *list.Element
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
@@ -684,6 +692,7 @@ func (sm *SyncManager) resetHeaderState(newestHash *chainhash.Hash, newestHeight
 func (sm *SyncManager) resetHeaderStateLocked(newestHash *chainhash.Hash, newestHeight int32) {
 	sm.headersFirstMode.Store(false)
 	sm.headerList.Init()
+	sm.clearHeaderIndexLocked()
 	sm.startHeader = nil
 	sm.clearFrontier()
 
@@ -692,8 +701,67 @@ func (sm *SyncManager) resetHeaderStateLocked(newestHash *chainhash.Hash, newest
 	// to prove it links to the chain properly.
 	if sm.nextCheckpoint != nil {
 		node := headerNode{height: newestHeight, hash: newestHash}
-		sm.headerList.PushBack(&node)
+		sm.indexHeaderLocked(sm.headerList.PushBack(&node), *newestHash)
 	}
+}
+
+// indexHeaderLocked records e as the element holding hash. The caller must hold
+// headerMu.
+//
+// Last write wins: the header list tolerates the same hash appearing twice and a
+// map cannot, so the newest element for a hash owns the entry. That rule only
+// works paired with unindexHeaderLocked's identity check — read the two
+// together.
+//
+// The map is allocated lazily because tests build SyncManager as a struct
+// literal that never goes through New().
+func (sm *SyncManager) indexHeaderLocked(e *list.Element, hash chainhash.Hash) {
+	if e == nil {
+		return
+	}
+
+	if sm.headerIndex == nil {
+		sm.headerIndex = make(map[chainhash.Hash]*list.Element)
+	}
+
+	sm.headerIndex[hash] = e
+}
+
+// unindexHeaderLocked drops hash from the index, but only if the entry still
+// points at e. The caller must hold headerMu.
+//
+// The identity check is what makes last-write-wins safe: when the same hash is
+// in the list twice, removing the older element must not evict the entry that
+// points at the newer one still in the list.
+func (sm *SyncManager) unindexHeaderLocked(e *list.Element, hash chainhash.Hash) {
+	if sm.headerIndex == nil {
+		return
+	}
+
+	if sm.headerIndex[hash] == e {
+		delete(sm.headerIndex, hash)
+	}
+}
+
+// clearHeaderIndexLocked empties the index. The caller must hold headerMu.
+// It must be called wherever the header list itself is emptied, or the index
+// keeps resolving hashes to elements that are no longer in any list.
+func (sm *SyncManager) clearHeaderIndexLocked() {
+	if sm.headerIndex == nil {
+		return
+	}
+
+	sm.headerIndex = make(map[chainhash.Hash]*list.Element)
+}
+
+// headerElement returns the header list element holding hash, or nil when the
+// hash is not queued. It takes headerMu itself; callers already holding it must
+// read sm.headerIndex directly.
+func (sm *SyncManager) headerElement(hash chainhash.Hash) *list.Element {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	return sm.headerIndex[hash]
 }
 
 // resetHeaderStateIfEmpty recovers the header state only if the list is still
@@ -716,6 +784,23 @@ func (sm *SyncManager) resetHeaderStateIfEmpty(newestHash *chainhash.Hash, newes
 	sm.resetHeaderStateLocked(newestHash, newestHeight)
 
 	return true
+}
+
+// leaveHeadersFirstMode switches out of headers-first mode and wipes the header
+// list. It is the body of handleBlockMsg's "reached the final checkpoint"
+// branch, named so the wipe has one place to be maintained: every field the
+// header list owns has to be cleared together, and inline three-line versions of
+// that are exactly how one of them gets forgotten.
+//
+// It takes headerMu itself, so it must not be called from a locked region.
+func (sm *SyncManager) leaveHeadersFirstMode() {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	sm.headersFirstMode.Store(false)
+	sm.headerList.Init()
+	sm.clearHeaderIndexLocked()
+	sm.clearFrontier()
 }
 
 // headerListLen returns the number of headers currently queued. Nil-guarded
@@ -1765,6 +1850,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				if firstNode.hash.IsEqual(sm.nextCheckpoint.Hash) {
 					isCheckpointBlock = true
 				} else {
+					sm.unindexHeaderLocked(firstNodeEl, *firstNode.hash)
 					sm.headerList.Remove(firstNodeEl)
 				}
 
@@ -2094,11 +2180,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// This is headers-first mode, the block is a checkpoint, and there are
 	// no more checkpoints, so switch to normal mode by requesting blocks
 	// from the block after this one up to the end of the chain (zero hash).
-	sm.headerMu.Lock()
-	sm.headersFirstMode.Store(false)
-	sm.headerList.Init()
-	sm.clearFrontier()
-	sm.headerMu.Unlock()
+	sm.leaveHeadersFirstMode()
 
 	sm.logger.Infof("Reached the final checkpoint -- switching to normal mode")
 
@@ -2323,6 +2405,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		if prevNode.hash.IsEqual(&blockHeader.PrevBlock) {
 			node.height = prevNode.height + 1
 			e := sm.headerList.PushBack(&node)
+			sm.indexHeaderLocked(e, blockHash)
 
 			if sm.startHeader == nil {
 				sm.startHeader = e
@@ -2368,7 +2451,17 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		// the next header links properly, it must be removed before
 		// fetching the blocks.
 		sm.headerMu.Lock()
-		sm.headerList.Remove(sm.headerList.Front())
+
+		// Front() was dereferenced unguarded here before the index forced this
+		// line to be rewritten; an empty list would have panicked.
+		if front := sm.headerList.Front(); front != nil {
+			if node, ok := front.Value.(*headerNode); ok && node.hash != nil {
+				sm.unindexHeaderLocked(front, *node.hash)
+			}
+
+			sm.headerList.Remove(front)
+		}
+
 		remaining := sm.headerList.Len()
 		sm.headerMu.Unlock()
 
@@ -3432,6 +3525,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		headerList:       list.New(),
+		headerIndex:      make(map[chainhash.Hash]*list.Element),
 		blockSizeTracker: newBlockSizeTracker(10), // track last 10 blocks for rolling average
 		quit:             make(chan struct{}),
 		// feeEstimator:            config.FeeEstimator,
