@@ -301,8 +301,20 @@ func TestBlockPark_RecoversWhatAPreviousRunLeftBehind(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, ".abcdef.4711.tmp"), []byte("half a block"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "0000000000000000000000000000000000000000000000000000000000000009.msgBlock.sha256"), []byte("orphaned"), 0o600))
 
-	corrupt := chainhash.Hash{0x11, 0x22}
-	require.NoError(t, os.WriteFile(filepath.Join(dir, corrupt.String()+".msgBlock"), make([]byte, 200), 0o600))
+	// A blob that reads back perfectly and is somebody else's block. That is
+	// evidence about the file, so it must be deleted and the block asked for
+	// again.
+	wrongBlock := chainhash.Hash{0x11, 0x22}
+	firstBlob, err := os.ReadFile(filepath.Join(dir, blocks[0].MsgBlock().BlockHash().String()+".msgBlock"))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, wrongBlock.String()+".msgBlock"), firstBlob, 0o600))
+
+	// A file the store itself will not open — a torn store header, an unreadable
+	// disk. The store reports both of those the same way, and the park's error
+	// policy reads that as "says nothing about the block", so this one is left
+	// where it is rather than deleted. See parkReadFailure.
+	unreadable := chainhash.Hash{0x33, 0x44}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, unreadable.String()+".msgBlock"), make([]byte, 200), 0o600))
 
 	fresh, _ := newTestPark(t, "")
 	fresh.dir = dir
@@ -325,7 +337,9 @@ func TestBlockPark_RecoversWhatAPreviousRunLeftBehind(t *testing.T) {
 	names := parkDirEntries(t, dir)
 	require.NotContains(t, names, ".abcdef.4711.tmp", "a crash's half-written temp file must be swept")
 	require.NotContains(t, names, "0000000000000000000000000000000000000000000000000000000000000009.msgBlock.sha256", "a sidecar whose block is gone must be swept")
-	require.NotContains(t, names, corrupt.String()+".msgBlock", "a file that is not the block its name claims must be deleted")
+	require.NotContains(t, names, wrongBlock.String()+".msgBlock", "a file that is not the block its name claims must be deleted")
+	require.Contains(t, names, unreadable.String()+".msgBlock",
+		"a blob the store could not open says nothing about the block, so recovery must leave it for the next start")
 }
 
 // TestBlockPark_RecoveryStopsAtThisRunsBudget: a previous run's park must never

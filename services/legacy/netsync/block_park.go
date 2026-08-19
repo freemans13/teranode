@@ -840,8 +840,22 @@ func (p *blockPark) Recover(ctx context.Context) {
 			continue
 		}
 
-		prevBlock, err := p.readParkedPrevBlock(ctx, *hash)
+		prevBlock, d, err := p.readParkedPrevBlock(ctx, *hash)
 		if err != nil {
+			// The same policy the drain uses, for the same reason. A read that
+			// could not get one of the store's shared permits, or that was cut
+			// short because this scan's own budget ran out, says nothing about
+			// the block — and deleting on that would destroy fully downloaded
+			// blocks on every restart that happens while the node is busy, which
+			// is when restarts happen.
+			if d.blob != parkBlobDrop {
+				p.logger.Warnf("[blockPark][%s] parked block could not be read (%s), leaving it on disk for the next start: %v", hash, d.reason, err)
+
+				skipped++
+
+				continue
+			}
+
 			p.logger.Warnf("[blockPark][%s] parked block is unusable, deleting it: %v", hash, err)
 			p.Delete(ctx, parkedBlock{hash: *hash})
 
@@ -897,13 +911,19 @@ func (p *blockPark) Recover(ctx context.Context) {
 // returns its parent, checking on the way that the file really is the block its
 // name claims. GetIoReader has already consumed the store's own 8-byte header,
 // so the first bytes it hands back are the block header.
-func (p *blockPark) readParkedPrevBlock(ctx context.Context, hash chainhash.Hash) (chainhash.Hash, error) {
+//
+// It returns the failure's classification alongside the error, so a caller
+// cannot read a parked blob without being handed the answer to "does this say
+// anything about the block?". Recovery once decided that for itself and deleted
+// good blocks whenever the store was busy; there is no signature here that lets
+// that happen again.
+func (p *blockPark) readParkedPrevBlock(ctx context.Context, hash chainhash.Hash) (chainhash.Hash, parkDisposition, error) {
 	readCtx, cancel := p.storeCtx(ctx)
 	defer cancel()
 
 	rc, err := p.store.GetIoReader(readCtx, hash[:], fileformat.FileTypeMsgBlock, parkOpts...)
 	if err != nil {
-		return chainhash.Hash{}, err
+		return chainhash.Hash{}, parkReadFailure(err), err
 	}
 
 	defer func() {
@@ -914,14 +934,18 @@ func (p *blockPark) readParkedPrevBlock(ctx context.Context, hash chainhash.Hash
 
 	var header wire.BlockHeader
 	if err = header.Deserialize(rc); err != nil {
-		return chainhash.Hash{}, errors.NewBlockInvalidError("[blockPark][%s] could not read the block header", hash, err)
+		err = errors.NewBlockInvalidError("[blockPark][%s] could not read the block header", hash, err)
+
+		return chainhash.Hash{}, parkReadFailure(err), err
 	}
 
 	if got := header.BlockHash(); !got.IsEqual(&hash) {
-		return chainhash.Hash{}, errors.NewBlockInvalidError("[blockPark][%s] header belongs to %s", hash, got)
+		err = errors.NewBlockInvalidError("[blockPark][%s] header belongs to %s", hash, got)
+
+		return chainhash.Hash{}, parkReadFailure(err), err
 	}
 
-	return header.PrevBlock, nil
+	return header.PrevBlock, parkDispositionParked, nil
 }
 
 // removeParkFile unlinks one file from the park directory by name.
