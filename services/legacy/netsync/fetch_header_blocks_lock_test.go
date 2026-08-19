@@ -380,3 +380,71 @@ func TestFetchHeaderBlocks_DiscardsARoundWhoseStartHeaderWasRemovedUnderIt(t *te
 	require.Equal(t, 24, remaining, "the headers behind the arrived block are still queued")
 	require.NotNil(t, startHeader, "advancing startHeader off a removed element would abandon every header still queued")
 }
+
+// TestCommitHeaderCandidates_RefusesASecondCommitFromTheSameSnapshot pins the
+// half of the guard that compares startHeader with the anchor the round was
+// walked from. Two rounds of fetchHeaderBlocks run concurrently in a live node —
+// the block-queue consumer starts one on every block that arrives and each
+// headers message goroutine starts another — so two rounds walking from the same
+// anchor is ordinary, not exotic. Both do their blockchain lookups unlocked and
+// then both try to commit.
+//
+// The second one must commit nothing. Nothing was removed from the list, so the
+// hash index still resolves the anchor perfectly and only the startHeader
+// comparison can tell that the first round already consumed those headers.
+// Without it the same run of blocks is requested from the same peer twice and
+// startHeader is dragged backwards over headers already in flight.
+//
+// No goroutines and no timing: one snapshot, two commits.
+func TestCommitHeaderCandidates_RefusesASecondCommitFromTheSameSnapshot(t *testing.T) {
+	sm := newFetchLockManager(t, nil, nil, nil)
+
+	syncPeer, _, _ := connectRacePeer(t, 46, 1000)
+	registerRacePeer(sm, syncPeer)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xa6}
+	msg, hashes := linkedHeaders(anchor, 10, &nonce)
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	// One reading of the list, shared by both rounds — exactly what two
+	// concurrent walks from the same startHeader come back holding.
+	snapshot, anchorEl, anchorHash, ok := sm.snapshotHeaderCandidates(len(hashes))
+	require.True(t, ok)
+	require.Equal(t, hashes, snapshot, "the snapshot should be the whole seeded run")
+
+	alreadyHave := make([]bool, len(snapshot))
+
+	first := wire.NewMsgGetData()
+	requested, _ := sm.commitHeaderCandidates(syncPeer, anchorEl, anchorHash, snapshot, alreadyHave, first)
+	require.Equal(t, len(snapshot), requested, "the first round should request every header it walked")
+	require.Len(t, first.InvList, len(snapshot))
+
+	sm.headerMu.Lock()
+	afterFirst := sm.startHeader
+	sm.headerMu.Unlock()
+
+	// The anchor is still in the list and the index still resolves it, so the
+	// index half of the guard cannot catch this one.
+	sm.headerMu.Lock()
+	stillIndexed := sm.headerIndex[anchorHash] == anchorEl
+	sm.headerMu.Unlock()
+	require.True(t, stillIndexed, "the first commit removes nothing, so the anchor is still the live holder of its hash")
+
+	second := wire.NewMsgGetData()
+	requestedAgain, more := sm.commitHeaderCandidates(syncPeer, anchorEl, anchorHash, snapshot, alreadyHave, second)
+
+	require.Zero(t, requestedAgain, "a round whose headers another round already took must request nothing")
+	require.Empty(t, second.InvList, "no block may be asked for a second time off the same snapshot")
+
+	require.False(t, more, "there is nothing more to do with a snapshot that has been overtaken")
+
+	sm.headerMu.Lock()
+	afterSecond := sm.startHeader
+	sm.headerMu.Unlock()
+
+	require.Equal(t, afterFirst, afterSecond, "the second round must not drag startHeader back over headers already in flight")
+}
