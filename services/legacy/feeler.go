@@ -165,12 +165,14 @@ const defaultFeelerHandshakeTimeout = 25 * time.Second
 //   - At or beyond peer.NegotiateTimeout. The failure this deadline bounds is a
 //     host that accepts a TCP connection and then says nothing at all, and the
 //     peer package covers that case too: AssociateConnection starts its own
-//     negotiation timer before the probe builds this one, so a deadline equal to
-//     or longer than it always loses the race. Losing it means the hang-up is
-//     reported by the peer package at warning level, on the same line the
-//     disconnect-rate measurements count, so a probe that did its job looks like
-//     a lost peer. Firing first hands the teardown back to the probe, which
-//     hangs up quietly at debug.
+//     negotiation timer within microseconds of the probe building this one, so a
+//     deadline equal to or longer than it cannot be relied on to fire first.
+//     Whichever fires first owns the teardown, because a disconnect is only
+//     reported once. The peer package reports its own timeout at warning level,
+//     on the same line the disconnect-rate measurements count, so if it wins, a
+//     probe that did its job looks like a lost peer; the probe hangs up quietly
+//     at debug instead. The five-second margin the default leaves is what makes
+//     the answer never in doubt.
 func feelerHandshakeTimeout(logger ulogger.Logger, configured time.Duration) time.Duration {
 	timeout := configured
 	if timeout <= 0 {
