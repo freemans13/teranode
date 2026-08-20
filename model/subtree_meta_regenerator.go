@@ -225,9 +225,16 @@ func (r *SubtreeMetaRegenerator) getLocalSubtreeData(ctx context.Context, subtre
 // retries plus the body stream) when the caller supplies no timeout. This fetch
 // runs inline in Block.Valid on a context with no deadline, where the shared
 // client would otherwise allow a hung peer the full http_streaming_timeout per
-// attempt — retries multiplied by that window. Note this is a whole-peer budget,
-// not a per-attempt one: under sustained 503 backoff the later attempts get
-// progressively less of it.
+// attempt — retries multiplied by that window.
+//
+// It bounds one fetch, covering all of that fetch's 503 retries and its body
+// stream rather than any single attempt: under sustained 503 backoff the later
+// attempts get progressively less of it. It is NOT a whole-peer bound, because
+// tryPeer can make a second, cache-busting fetch, and each fetch starts this
+// budget afresh. Worst case per peer is therefore twice this value, and worst
+// case for one RegenerateMeta call is that again per configured peer — which
+// matters because the call runs in a validOrderAndBlessed errgroup goroutine
+// that holds a pooled parent-spends map for its whole duration.
 //
 // Sized to match settings.DefaultSubtreeDataFetchTimeout, which bounds the same
 // subtree_data payload fetched from the same peer endpoint by
