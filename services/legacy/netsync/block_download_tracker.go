@@ -290,26 +290,35 @@ func (t *blockDownloadTracker) ClearPeer(p *peerpkg.Peer) {
 	delete(t.byPeer, p)
 }
 
-// ForgetForRetry reopens every block for a fresh request without cancelling
-// anybody's permission to deliver one. It is what the sync peer changing means:
-// blocks the departing peer never sent must be fetchable from the new peer the
-// moment they are announced again, but the peers we already asked are still
-// answering a question we put to them and must not be punished for a late reply.
+// ForgetForRetryPeer reopens one peer's outstanding blocks for a fresh request
+// without cancelling its permission to deliver them, and returns the hashes it
+// reopened so the caller can rewind the download walk onto the lowest of them.
 //
 // The two are genuinely different questions with different windows, so it moves
-// only the shorter one. Every assignment newer than retryWindow is back-dated to
-// exactly retryWindow old, which is the point at which RequestedWithin stops
-// claiming somebody is already on the job. Ownership is judged against the far
-// longer assignment ceiling and survives, one retryWindow shorter than it was.
+// only the shorter one. Every assignment of p's newer than retryWindow is
+// back-dated to exactly retryWindow old, which is the point at which
+// RequestedWithin stops claiming somebody is already on the job. Ownership is
+// judged against the far longer assignment ceiling and survives, one retryWindow
+// shorter than it was — so a late copy from p is still admitted rather than
+// costing an honest peer its connection.
+//
+// It is deliberately per-peer. The whole-ledger form this replaced back-dated
+// EVERY assignment at once, which made RequestedWithin answer false for every
+// outstanding block. That was survivable only while a sync-peer change also
+// threw the header list away, because there was then nothing left to re-walk.
+// Beside a header list that survives a demotion, a whole-ledger back-date hands
+// every in-flight block to a second peer on the very next pass, and both copies
+// are admitted and committed — the duplicate-commit storm and the 40P01 deadlock
+// on the transaction unique index that came with it.
 //
 // There is deliberately no method that forgets assignments outright. The ledger
 // this replaced was two maps — a global one the sync peer change cleared, and a
 // separate per-peer one the disconnect decision read — so clearing could not
 // revoke anyone's permission to deliver. With one map it can, and did: an honest
 // peer racing the frontier block lost its whole association for answering us.
-func (t *blockDownloadTracker) ForgetForRetry(retryWindow time.Duration) {
+func (t *blockDownloadTracker) ForgetForRetryPeer(p *peerpkg.Peer, retryWindow time.Duration) []chainhash.Hash {
 	if t == nil || retryWindow <= 0 {
-		return
+		return nil
 	}
 
 	t.mu.Lock()
@@ -317,13 +326,27 @@ func (t *blockDownloadTracker) ForgetForRetry(retryWindow time.Duration) {
 
 	cut := t.clock().Add(-retryWindow)
 
-	for _, owners := range t.byHash {
-		for p, at := range owners {
-			if at.After(cut) {
-				owners[p] = cut
-			}
+	reopened := make([]chainhash.Hash, 0, len(t.byPeer[p]))
+
+	for h := range t.byPeer[p] {
+		owners, ok := t.byHash[h]
+		if !ok {
+			continue
 		}
+
+		at, owned := owners[p]
+		if !owned {
+			continue
+		}
+
+		if at.After(cut) {
+			owners[p] = cut
+		}
+
+		reopened = append(reopened, h)
 	}
+
+	return reopened
 }
 
 // Len returns how many distinct blocks are currently owed by somebody, ignoring

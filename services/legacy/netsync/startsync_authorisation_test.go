@@ -137,30 +137,42 @@ func TestStartSync_HonestPeerKeepsItsAuthorisationAcrossASyncPeerChange(t *testi
 	}
 }
 
-// TestStartSync_StillReopensBlocksForReRequest is the other half of the same
-// question, and the reason the ledger-wide clear was there at all: a block the
-// departed sync peer never sent must be fetchable from somebody else straight
-// away, without waiting out the re-request interval.
-func TestStartSync_StillReopensBlocksForReRequest(t *testing.T) {
+// TestStartSync_DoesNotReopenBlocksOwedByPeersStillOnTheJob pins the deletion of
+// the whole-ledger back-date, which is the mechanism behind the historical
+// duplicate-commit storm and the 40P01 deadlock on the transaction unique index.
+//
+// It used to be here for a good reason: a block the departing sync peer never
+// sent has to be fetchable from somebody else without waiting out the re-request
+// interval. But it reopened EVERY outstanding block, not the departing peer's,
+// and it was survivable only because a sync-peer change threw the header list
+// away in the same breath and left nothing to re-walk. Now that a demotion keeps
+// the list, reopening everything would have the very next pass hand every
+// in-flight block to a second peer.
+//
+// The recovery it provided is now scoped to the peer that actually stalled — see
+// TestDemotion_ReopensOnlyTheDemotedPeersSliceAndRewindsToItsLowestBlock.
+func TestStartSync_DoesNotReopenBlocksOwedByPeersStillOnTheJob(t *testing.T) {
 	sm := newSyncPeerChangeManager(t)
 
-	stuck := chainhash.Hash{0xc3}
+	inFlight := chainhash.Hash{0xc3}
 
 	newSyncPeer, _, _ := connectRacePeer(t, 23, 1000)
 	registerSyncPeerChangePeer(t, sm, newSyncPeer, true)
 
-	quiet, _, _ := connectRacePeer(t, 24, 1000)
-	registerSyncPeerChangePeer(t, sm, quiet, false)
+	// A peer that is not the one being replaced, and is answering a question we
+	// put to it right now.
+	busy, _, _ := connectRacePeer(t, 24, 1000)
+	registerSyncPeerChangePeer(t, sm, busy, false)
 
-	sm.blockDownloads.Add(quiet, stuck)
-	require.True(t, sm.blockDownloads.RequestedWithin(stuck, blockRequestRetryInterval),
-		"sanity: the block was just asked for, so the inv path would skip it")
+	sm.blockDownloads.Add(busy, inFlight)
+	require.True(t, sm.blockDownloads.RequestedWithin(inFlight, blockRequestRetryInterval),
+		"sanity: the block was just asked for, so the walk would skip it")
 
 	sm.startSync()
 	require.Equal(t, newSyncPeer, sm.loadSyncPeer())
 
-	require.False(t, sm.blockDownloads.RequestedWithin(stuck, blockRequestRetryInterval),
-		"after a sync peer change the next inv announcing this block must fetch it from the new peer")
-	require.True(t, sm.blockDownloads.HasOwner(quiet, stuck),
-		"reopening the block for re-request must not revoke the old peer's permission to deliver it")
+	require.True(t, sm.blockDownloads.RequestedWithin(inFlight, blockRequestRetryInterval),
+		"a sync peer change must leave another peer's in-flight block vouching for itself, or the next pass asks a second peer for it")
+	require.True(t, sm.blockDownloads.HasOwner(busy, inFlight),
+		"and that peer keeps its permission to deliver it")
 }

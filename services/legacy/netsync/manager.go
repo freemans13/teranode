@@ -265,6 +265,38 @@ type peerSyncState struct {
 	// blockHandler goroutine and the per-message inv and headers handlers, each
 	// of which runs on its own goroutine. Only noteBestKnownHeight writes it.
 	bestKnownHeight atomic.Int32
+
+	// demotedUntil is the UnixNano instant before which this peer must not be
+	// re-elected sync peer, stamped when it is demoted for stalling.
+	//
+	// It is the replacement for the disconnect that used to keep a stalled sync
+	// peer out of the election that runs immediately afterwards. startSync picks
+	// at random from connected sync candidates, and its only liveness test is
+	// Connected(), which the demoted peer still passes.
+	//
+	// Atomic for the same reason bestKnownHeight is: a *peerSyncState is shared
+	// by pointer across the blockHandler goroutine and the per-message handlers.
+	// Nothing sweeps it — the stamp is only ever read.
+	demotedUntil atomic.Int64
+}
+
+// noteDemotedFor bars this peer from election as sync peer for d.
+func (s *peerSyncState) noteDemotedFor(d time.Duration) {
+	s.demotedUntil.Store(time.Now().Add(d).UnixNano())
+}
+
+// inDemotionCooldown reports whether this peer was demoted recently enough that
+// it should not be elected sync peer again yet.
+func (s *peerSyncState) inDemotionCooldown() bool {
+	until := s.demotedUntil.Load()
+
+	return until > 0 && time.Now().UnixNano() < until
+}
+
+// clearDemotionCooldown makes the peer immediately electable again. Tests use it
+// to step past a cooldown without sleeping; nothing in the service calls it.
+func (s *peerSyncState) clearDemotionCooldown() {
+	s.demotedUntil.Store(0)
 }
 
 // noteBestKnownHeight raises the peer's best known height to h, and never lowers
@@ -988,6 +1020,11 @@ func (sm *SyncManager) startSync() {
 
 	okPeers := make([]*peerpkg.Peer, 0)
 
+	// Peers that would be candidates but were demoted for stalling too recently.
+	// Kept aside rather than dropped: they are elected below if there is nobody
+	// else at all, because a node with one peer must still sync.
+	cooledPeers := make([]*peerpkg.Peer, 0)
+
 	sm.logger.Debugf("[startSync] selecting sync peer from %d candidates", sm.peerStates.Length())
 
 	for peer, state := range sm.peerStates.Range() {
@@ -1033,6 +1070,18 @@ func (sm *SyncManager) startSync() {
 			continue
 		}
 
+		// A peer demoted for stalling is still connected and still a sync
+		// candidate, so the disconnect that used to keep it out of the election
+		// running immediately afterwards no longer does. Without this the node
+		// hands the role straight back to the peer it just judged stalled and
+		// buys another stall window of no progress.
+		if state.inDemotionCooldown() {
+			sm.logger.Debugf("[startSync][%v] peer is inside its demotion cooldown, deferring", peer.String())
+			cooledPeers = append(cooledPeers, peer)
+
+			continue
+		}
+
 		// Append each good peer to bestPeers for selection later.
 		sm.logger.Debugf("[startSync][%v] peer is a sync candidate at height %d (us: %d), adding to bestPeers", peer.String(), peer.LastBlock(), bestBlockHeaderMeta.Height)
 		bestPeers = append(bestPeers, peer)
@@ -1051,6 +1100,14 @@ func (sm *SyncManager) startSync() {
 		// #nosec G404
 		bestPeer = okPeers[rand.IntN(len(okPeers))]
 		sm.logger.Debugf("[startSync] no peers ahead, selected ok peer %s from %d peers at same height", bestPeer.String(), len(okPeers))
+	} else if len(cooledPeers) > 0 {
+		// Nobody else at all, so the cooldown is ignored rather than leaving the
+		// node with no sync peer. On a two-peer network this lets the role
+		// ping-pong every stall window, which is noisy but harmless now that a
+		// swap no longer throws the header list away.
+		// #nosec G404
+		bestPeer = cooledPeers[rand.IntN(len(cooledPeers))]
+		sm.logger.Warnf("[startSync] every candidate is inside its demotion cooldown, electing %s anyway rather than leaving the node with no sync peer", bestPeer.String())
 	}
 
 	// Start syncing from the best peer if one was selected.
@@ -1082,15 +1139,21 @@ func (sm *SyncManager) startSync() {
 		return
 	}
 
-	// Reopen every outstanding block for a fresh request now the sync peer has
-	// changed, otherwise we may ignore blocks we need that the last sync peer
-	// failed to send. Only the re-request window moves: the peers we already
-	// asked keep their permission to deliver, because a sync peer change is not
-	// evidence against them and a late copy must not cost an honest peer its
-	// connection.
-	sm.blockDownloads.ForgetForRetry(blockRequestRetryInterval)
+	// Nothing reopens the whole ledger here any more. A sync-peer change used to
+	// back-date every outstanding assignment at once, which was survivable only
+	// because it threw the header list away in the same breath and left nothing
+	// to re-walk. A demotion keeps the list, so a whole-ledger back-date would
+	// have the very next pass hand every in-flight block to a second peer, and
+	// both copies committed — the duplicate-commit storm. The demoted peer's own
+	// slice is reopened by demoteSyncPeer instead, and only its own.
 
-	locator, err := sm.blockchainClient.GetBlockLocator(sm.ctx, bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
+	// Where to continue the headers round from. Mid-round, that is the back of
+	// the header list we already have: handleHeadersMsg requires every incoming
+	// header to connect to the back, so a locator built from our own database
+	// best block — hundreds of headers below it — would have the new sync peer
+	// answer honestly and be disconnected for it. Only a rebuilt list falls back
+	// to the database.
+	locator, err := sm.headersRoundLocator(bestBlockHeader.Hash(), bestBlockHeaderMeta.Height)
 	if err != nil {
 		sm.logger.Errorf("[startSync] Failed to get block locator for the latest block: %v", err)
 
@@ -1395,8 +1458,165 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 
 	sm.logger.Debugf("[CheckSyncPeer] removing sync peer %s", sp.String())
 
+	// With block bodies coming from every eligible peer, the sync peer's job is
+	// headers, and a peer that is slow at headers is often a perfectly good body
+	// source. Demote it: it keeps its connection, its registration and the blocks
+	// it owes, and the header list survives. With the fan-out off the sync peer is
+	// the only body source, so keeping a stalled one buys nothing and the old
+	// disconnect-and-reset is the right behaviour.
+	if sm.settings.Legacy.MultiPeerBlockDownload {
+		sm.demoteSyncPeer(sp, state)
+
+		return
+	}
+
 	sm.clearRequestedState(sp, state)
 	sm.updateSyncPeer(state)
+}
+
+// demoteSyncPeer takes the headers role off a sync peer that has stopped
+// delivering blocks, and takes nothing else off it.
+//
+// What it deliberately does NOT do, all of which the disconnect-and-reset path
+// still does:
+//   - it does not call clearRequestedState. The peer is staying, so stopping its
+//     requested-transaction map would leave it with no cleanup at all, and
+//     revoking its block ownership would make its late copies arrive looking
+//     unrequested and cost it its connection.
+//   - it does not disconnect. Up to 2000 verified headers and a live connection
+//     were being thrown away because one peer was slow at headers.
+//   - it does not reset the header state, so headers-first mode, the header list,
+//     the download cursor and the frontier all survive.
+//
+// The exclusion the disconnect used to provide is the demotion cooldown, read by
+// startSync: Connected() is the only liveness test the election makes, and a
+// demoted peer still passes it.
+func (sm *SyncManager) demoteSyncPeer(sp *peerpkg.Peer, state *peerSyncState) {
+	sm.logger.Infof("[demoteSyncPeer] demoting stalled sync peer %s: connection and block assignments kept, headers role moving on", sp.String())
+
+	// The same window that judged it, so it cannot be re-elected before it would
+	// be re-judged.
+	state.noteDemotedFor(maxLastBlockTime)
+
+	sp.SetSyncPeer(false)
+	sm.storeSyncPeer(nil, nil)
+
+	sm.reopenDemotedPeerSlice(sp)
+
+	sm.startSync()
+}
+
+// reopenDemotedPeerSlice makes the blocks a demoted peer still owes askable of
+// somebody else, and puts the download walk back in front of them.
+//
+// It is the replacement for the recovery the header-state reset used to provide.
+// The walk is forward-only, so without the rewind a demoted peer's slice is
+// recovered one block at a time by the frontier race, at its stall window each.
+//
+// Why this cannot bring back the duplicate-commit storm, which was caused by
+// exactly this pairing — a cursor rewind beside a ledger that had been reopened:
+//   - only the demoted peer's own assignments are reopened, so every other
+//     peer's in-flight block still answers true to RequestedWithin and the
+//     re-walk skips it. The whole-ledger back-date that did not is deleted.
+//   - the demoted peer keeps ownership of those blocks, so if its copies do turn
+//     up they are admitted rather than treated as unrequested.
+//   - a hash the walk does re-assign is still assigned to exactly one peer per
+//     pass, and AcquireBlockPrefetch refuses a second concurrent copy of a hash
+//     outright.
+func (sm *SyncManager) reopenDemotedPeerSlice(sp *peerpkg.Peer) {
+	// Leaf lock only, and taken with headerMu released.
+	reopened := sm.blockDownloads.ForgetForRetryPeer(sp, blockRequestRetryInterval)
+	if len(reopened) == 0 {
+		return
+	}
+
+	lowestHeight, rewound := sm.rewindToLowestHeader(reopened)
+	if !rewound {
+		sm.logger.Warnf("[demoteSyncPeer] reopened %d blocks owed by %s but none of them is still in the header list; recovery is down to the frontier race", len(reopened), sp.String())
+
+		return
+	}
+
+	sm.logger.Infof("[demoteSyncPeer] reopened %d blocks owed by %s and moved the download cursor back to height %d", len(reopened), sp.String(), lowestHeight)
+}
+
+// rewindToLowestHeader moves the download cursor back onto the lowest of hashes
+// that is still in the header list, and reports its height.
+func (sm *SyncManager) rewindToLowestHeader(hashes []chainhash.Hash) (int32, bool) {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	var (
+		lowest       *list.Element
+		lowestHeight int32
+	)
+
+	for _, h := range hashes {
+		e := sm.headerIndex[h]
+		if e == nil {
+			continue
+		}
+
+		node, ok := e.Value.(*headerNode)
+		if !ok {
+			continue
+		}
+
+		if lowest == nil || node.height < lowestHeight {
+			lowest, lowestHeight = e, node.height
+		}
+	}
+
+	if lowest == nil {
+		return 0, false
+	}
+
+	sm.moveStartHeaderBackLocked(lowest)
+
+	return lowestHeight, true
+}
+
+// headersRoundLocator returns the locator to send the next getheaders with.
+//
+// Mid-round that is the back of the header list, not our own database best
+// block: handleHeadersMsg requires every incoming header to connect to the back
+// of the list, so a locator from the database — which after a demotion is
+// hundreds or thousands of headers below it — would have the new sync peer answer
+// honestly and be disconnected for it. This is the same one-hash locator
+// handleHeadersMsg itself continues a round with.
+//
+// With the fan-out off, a sync-peer change resets the header state first, so the
+// database locator is the only correct one and is what this returns.
+func (sm *SyncManager) headersRoundLocator(bestHash *chainhash.Hash, bestHeight uint32) (blockchain.BlockLocator, error) {
+	if sm.settings.Legacy.MultiPeerBlockDownload && sm.headersFirstMode.Load() {
+		if back, ok := sm.headerListBackHash(); ok {
+			return blockchain.BlockLocator([]*chainhash.Hash{&back}), nil
+		}
+	}
+
+	return sm.blockchainClient.GetBlockLocator(sm.ctx, bestHash, bestHeight)
+}
+
+// headerListBackHash returns the hash of the last header in the list.
+func (sm *SyncManager) headerListBackHash() (chainhash.Hash, bool) {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if sm.headerList == nil {
+		return chainhash.Hash{}, false
+	}
+
+	e := sm.headerList.Back()
+	if e == nil {
+		return chainhash.Hash{}, false
+	}
+
+	node, ok := e.Value.(*headerNode)
+	if !ok || node.hash == nil {
+		return chainhash.Hash{}, false
+	}
+
+	return *node.hash, true
 }
 
 // topBlock returns the best chains top block height
@@ -3182,6 +3402,13 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// the unlock below so the atomic write stays outside the locked region.
 	var maxHeaderHeight int32
 
+	// How many headers in this batch linked onto the list, and whether the batch
+	// turned out to be a late answer to a getheaders we ourselves sent.
+	var (
+		pushed     int
+		staleReply bool
+	)
+
 	sm.headerMu.Lock()
 
 	for _, blockHeader := range msg.Headers {
@@ -3205,6 +3432,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			node.height = prevNode.height + 1
 			e := sm.headerList.PushBack(&node)
 			sm.indexHeaderLocked(e, blockHash)
+			pushed++
 
 			if node.height > maxHeaderHeight {
 				maxHeaderHeight = node.height
@@ -3214,6 +3442,27 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 				sm.startHeader = e
 			}
 		} else {
+			// A peer we demoted still has our getheaders outstanding, and by the
+			// time it answers the new sync peer has usually extended the list —
+			// so its reply connects to a header we hold rather than to the back.
+			// That is an honest answer to our own question, and disconnecting the
+			// sender with a misbehaviour warning throws away the very peer we
+			// kept connected so it could carry block bodies. Recognised only
+			// while nothing in this batch has linked yet: a batch that starts
+			// connecting and then stops is a different animal, and still costs
+			// the sender its connection.
+			//
+			// Only reachable with the fan-out on, because that is what keeps a
+			// demoted peer connected in the first place.
+			_, holdParent := sm.headerIndex[blockHeader.PrevBlock]
+			_, holdHeader := sm.headerIndex[blockHash]
+
+			if sm.settings.Legacy.MultiPeerBlockDownload && pushed == 0 && (holdParent || holdHeader) {
+				staleReply = true
+
+				break
+			}
+
 			disconnectReason = "Received block header that does not properly connect to the chain"
 
 			break
@@ -3245,6 +3494,12 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// headerMu.
 	if maxHeaderHeight > 0 {
 		state.noteBestKnownHeight(maxHeaderHeight)
+	}
+
+	if staleReply {
+		sm.logger.Debugf("[handleHeadersMsg] ignoring %d late headers from %s: they connect to a header we already hold rather than to the back of the list", numHeaders, peer.String())
+
+		return
 	}
 
 	if disconnectReason != "" {

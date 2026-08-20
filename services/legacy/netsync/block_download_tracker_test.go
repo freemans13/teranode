@@ -202,7 +202,7 @@ func TestBlockDownloadTracker_NilIsSafeAndFailsClosed(t *testing.T) {
 		tr.Remove(h)
 		tr.RemoveOwner(p, h)
 		tr.ClearPeer(p)
-		tr.ForgetForRetry(blockRequestRetryInterval)
+		require.Nil(t, tr.ForgetForRetryPeer(p, blockRequestRetryInterval))
 	})
 
 	require.False(t, tr.HasOwner(p, h))
@@ -312,12 +312,12 @@ func TestHandleBlockMsg_DeliveryDoesNotCancelTheOtherPeersWeAsked(t *testing.T) 
 	require.True(t, second.Connected(), "a second copy from a peer we also asked must not be treated as unrequested")
 }
 
-// TestBlockDownloadTracker_ForgetForRetryMovesOnlyTheRetryWindow pins the two
+// TestBlockDownloadTracker_ForgetForRetryPeerMovesOnlyTheRetryWindow pins the two
 // windows apart at the ledger level. Reopening a block for re-request must make
 // the inv path willing to ask somebody else immediately, and must leave the peer
 // we already asked free to deliver — the delivery ceiling is an hour, and losing
 // a minute of it is the whole cost.
-func TestBlockDownloadTracker_ForgetForRetryMovesOnlyTheRetryWindow(t *testing.T) {
+func TestBlockDownloadTracker_ForgetForRetryPeerMovesOnlyTheRetryWindow(t *testing.T) {
 	tr, advance := newTestTracker(blockRequestAssignmentTTL)
 
 	fresh := chainhash.Hash{0x01}
@@ -334,7 +334,8 @@ func TestBlockDownloadTracker_ForgetForRetryMovesOnlyTheRetryWindow(t *testing.T
 	require.True(t, tr.RequestedWithin(fresh, blockRequestRetryInterval), "sanity: just asked")
 	require.False(t, tr.RequestedWithin(stale, blockRequestRetryInterval), "sanity: asked long ago")
 
-	tr.ForgetForRetry(blockRequestRetryInterval)
+	tr.ForgetForRetryPeer(freshPeer, blockRequestRetryInterval)
+	tr.ForgetForRetryPeer(stalePeer, blockRequestRetryInterval)
 
 	require.False(t, tr.RequestedWithin(fresh, blockRequestRetryInterval),
 		"the fresh request must be reopened, so the next inv fetches the block from the new sync peer")
@@ -350,4 +351,52 @@ func TestBlockDownloadTracker_ForgetForRetryMovesOnlyTheRetryWindow(t *testing.T
 		"reopening must not reset an assignment's age against the delivery ceiling")
 	require.True(t, tr.HasOwner(freshPeer, fresh),
 		"the fresh assignment is only a minute older than it was, well inside the ceiling")
+}
+
+// TestBlockDownloadTracker_ForgetForRetryPeerReopensOnlyThatPeersBlocks pins the
+// scoping, which is the whole reason the per-peer form exists.
+//
+// The whole-ledger back-date it replaces made RequestedWithin answer false for
+// every outstanding block at once. That was survivable only while a sync-peer
+// change also threw the header list away, because there was then nothing left to
+// re-walk. Beside a header list that survives, it hands every in-flight block to
+// a second peer on the very next pass — the shape of the duplicate-commit storm
+// and the 40P01 deadlock it caused.
+func TestBlockDownloadTracker_ForgetForRetryPeerReopensOnlyThatPeersBlocks(t *testing.T) {
+	tr, advance := newTestTracker(blockRequestAssignmentTTL)
+
+	demoted := newTestPeer(t, "localhost:18431")
+	other := newTestPeer(t, "localhost:18432")
+
+	mine := []chainhash.Hash{{0x11}, {0x12}}
+	theirs := chainhash.Hash{0x13}
+
+	for _, h := range mine {
+		tr.Add(demoted, h)
+	}
+
+	tr.Add(other, theirs)
+
+	reopened := tr.ForgetForRetryPeer(demoted, blockRequestRetryInterval)
+	require.ElementsMatch(t, mine, reopened, "the caller needs the hashes back so it can rewind the download cursor")
+
+	for _, h := range mine {
+		require.False(t, tr.RequestedWithin(h, blockRequestRetryInterval),
+			"the demoted peer's blocks must be askable of somebody else")
+		require.True(t, tr.HasOwner(demoted, h),
+			"reopening must not revoke permission to deliver")
+	}
+
+	require.True(t, tr.RequestedWithin(theirs, blockRequestRetryInterval),
+		"another peer's in-flight block must keep vouching for itself")
+
+	// Only the short re-request window moved. The hour-long delivery ceiling is
+	// what decides whether a late copy costs an honest peer its connection, and
+	// it must be one retry window shorter, not reset and not expired.
+	advance(blockRequestRetryInterval)
+
+	for _, h := range mine {
+		require.True(t, tr.HasOwner(demoted, h),
+			"the delivery ceiling must be untouched beyond the one retry window")
+	}
 }
