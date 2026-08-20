@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -151,8 +152,14 @@ func TestSyncManager_AParkedBlobThatIsNotTheBlockItClaimsIsGivenUp(t *testing.T)
 // the third row of the table, on the block that makes the rewind hard. A block
 // that will not validate IS evidence about the block and about whoever sent it,
 // so the blob goes, the walk is put back on it, and the delivering peer is told.
+//
+// Told only once the node is RUNNING, which is why this one does not use the
+// default harness: while catching blocks no reject is sent at all, on the wire
+// path or off the disk. That suppression is pinned in both directions by
+// AParkedBlockThatWillNotCommitIsGivenUpAndRejected, so what is under test here
+// is who hears about it, not whether anybody does.
 func TestSyncManager_AParkedFrontBlockThatFailsValidationIsGivenUpAndRejected(t *testing.T) {
-	h := newParkWiringHarness(t, true)
+	h := newParkWiringHarnessInState(t, true, blockchain2.FSMStateRUNNING)
 
 	front := h.blocks[0].MsgBlock().BlockHash()
 	prev := h.blocks[0].MsgBlock().Header.PrevBlock

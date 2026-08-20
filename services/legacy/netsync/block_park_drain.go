@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	teranodeblockchain "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
@@ -117,11 +118,42 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 	return true
 }
 
+// replayingHistory reports whether the node is catching blocks rather than
+// judging a peer's tip. It is the same question handleBlockMsg asks before it
+// suppresses a reject, asked from the paths that commit a block off disk.
+//
+// An FSM state that cannot be read counts as replaying, because that is what the
+// live path does with it too: it fails the block before it ever reaches a reject.
+func (sm *SyncManager) replayingHistory() bool {
+	if sm.blockchainClient == nil {
+		return false
+	}
+
+	state, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
+	if err != nil {
+		sm.logger.Warnf("[replayingHistory] could not read the FSM state, so no peer is blamed for a block that would not commit: %v", err)
+
+		return true
+	}
+
+	return state != nil && *state == teranodeblockchain.FSMStateCATCHINGBLOCKS
+}
+
 // parkedBlockFailed decides what to do with a parked block that would not
 // commit, and reports false so the drain stops walking that branch. The decision
 // itself is parkCommitFailure's; all this does is log it and carry it out.
 func (sm *SyncManager) parkedBlockFailed(entry parkedBlock, err error) bool {
 	d := parkCommitFailure(err)
+
+	// The same suppression the live path applies. While the node is catching
+	// blocks handleBlockMsg sends no reject for a block that would not commit,
+	// because we are replaying history rather than judging a peer's tip — and
+	// during initial sync this drain is the MAIN commit path, so without this a
+	// parked block earns its peer a reject that the same block delivered live
+	// would not. Committing from disk must judge a peer exactly as the wire does.
+	if d.blamePeer && sm.replayingHistory() {
+		d = d.withoutBlame()
+	}
 
 	if d.blob == parkBlobKeep {
 		sm.logger.Infof("[commitParkedBlock][%s] leaving the block parked (%s), parent %s: %v", entry.hash, d.reason, entry.prevBlock, err)

@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -252,40 +253,72 @@ func TestSyncManager_AParkedBlockThatWillNotReadBackIsAskedForAgain(t *testing.T
 // is dropped, the block goes back into the download walk, and the peer that
 // actually sent it — not a fallback peer, and not nobody — is told it was
 // rejected.
+//
+// Whether the peer is told at all is the node's state and not the error's, and
+// both sides of that are driven here. handleBlockMsg suppresses every reject
+// while the node is catching blocks, because then it is replaying history rather
+// than judging a peer's tip — and during initial sync this drain is the MAIN
+// commit path, so a parked block must not earn its peer a reject that the same
+// block delivered live would not.
 func TestSyncManager_AParkedBlockThatWillNotCommitIsGivenUpAndRejected(t *testing.T) {
-	h := newParkWiringHarness(t, true)
+	for _, tc := range []struct {
+		name         string
+		fsmState     blockchain2.FSMStateType
+		expectReject bool
+	}{
+		{
+			name:         "catching blocks, so the peer is not blamed",
+			fsmState:     blockchain2.FSMStateCATCHINGBLOCKS,
+			expectReject: false,
+		},
+		{
+			name:         "running, so the peer is told the block was bad",
+			fsmState:     blockchain2.FSMStateRUNNING,
+			expectReject: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newParkWiringHarnessInState(t, true, tc.fsmState)
 
-	child := h.blocks[1].MsgBlock().BlockHash()
-	parent := h.blocks[0].MsgBlock().BlockHash()
+			child := h.blocks[1].MsgBlock().BlockHash()
+			parent := h.blocks[0].MsgBlock().BlockHash()
 
-	// First lookup parks the block. The second, on the drain, fails with a
-	// fault that is the block's and not the local node's, so it earns a reject.
-	h.client.On("GetBlockExists", mock.Anything, &child).Return(false, nil).Once()
-	h.client.On("GetBlockExists", mock.Anything, &child).
-		Return(false, errors.NewBlockInvalidError("this block is not one we can take")).Once()
-	h.client.On("GetBlockExists", mock.Anything, &parent).Return(true, nil)
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+			// First lookup parks the block. The second, on the drain, fails with
+			// a fault that is the block's and not the local node's, so the error
+			// itself is a judgement on the block.
+			h.client.On("GetBlockExists", mock.Anything, &child).Return(false, nil).Once()
+			h.client.On("GetBlockExists", mock.Anything, &child).
+				Return(false, errors.NewBlockInvalidError("this block is not one we can take")).Once()
+			h.client.On("GetBlockExists", mock.Anything, &parent).Return(true, nil)
+			h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 
-	require.NoError(t, h.deliver(t, 1))
-	require.Equal(t, 1, h.sm.blockPark.Len())
+			require.NoError(t, h.deliver(t, 1))
+			require.Equal(t, 1, h.sm.blockPark.Len())
 
-	before := h.rec.getDataCount()
+			before := h.rec.getDataCount()
 
-	require.NoError(t, h.deliver(t, 0))
+			require.NoError(t, h.deliver(t, 0))
 
-	require.Zero(t, h.sm.blockPark.Len(), "a block that will not commit must not stay parked")
+			require.Zero(t, h.sm.blockPark.Len(), "a block that will not commit must not stay parked")
 
-	for _, name := range parkDirEntries(t, h.parkDir) {
-		require.NotContains(t, name, child.String(), "a block given up on must not leave its blob behind")
+			for _, name := range parkDirEntries(t, h.parkDir) {
+				require.NotContains(t, name, child.String(), "a block given up on must not leave its blob behind")
+			}
+
+			if tc.expectReject {
+				require.True(t, WaitUntil(func() bool { return h.rec.wasRejected(child) }, 5*time.Second),
+					"the peer that sent the block must be the one told it was rejected")
+			} else {
+				require.False(t, h.rec.wasRejected(child),
+					"while catching blocks no reject is sent, whether the block is committed from the wire or from the park")
+			}
+
+			h.sm.fetchHeaderBlocks()
+
+			require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
+				"a block given up on must go back into the download walk")
+		})
 	}
-
-	require.True(t, WaitUntil(func() bool { return h.rec.wasRejected(child) }, 5*time.Second),
-		"the peer that sent the block must be the one told it was rejected")
-
-	h.sm.fetchHeaderBlocks()
-
-	require.True(t, WaitUntil(func() bool { return h.rec.askedForSince(before, child) }, 5*time.Second),
-		"a block given up on must go back into the download walk")
 }
 
 // TestSyncManager_AParkedBlockWhoseParentGoesMissingAgainStaysParked covers the
