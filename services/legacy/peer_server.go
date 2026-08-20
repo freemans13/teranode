@@ -3764,7 +3764,7 @@ func newServer(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	blockAssembly *blockassembly.Client,
 	listenAddrs []string, assetHTTPAddress string) (*server, error) {
 	// init config
-	c, _, err := loadConfig(logger)
+	c, _, err := loadConfig(logger, tSettings.Policy.ExcessiveBlockSize)
 	if err != nil {
 		return nil, err
 	}
