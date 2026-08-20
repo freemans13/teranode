@@ -143,10 +143,48 @@ const feelerPollInterval = time.Second
 const feelerCandidateTries = 100
 
 // defaultFeelerHandshakeTimeout is the fallback when
-// legacy_feelerHandshakeTimeout is not positive. It must sit inside
-// peer.NegotiateTimeout so a mute host is hung up by the feeler, not logged
-// as a lost peer.
+// legacy_feelerHandshakeTimeout is not positive.
+//
+// Deliberately tighter than svnode's DEFAULT_P2P_HANDSHAKE_TIMEOUT_INTERVAL of
+// sixty seconds (net.h:86). A connection we have already decided to hang up on
+// the moment it answers has no reason to be given a full minute to answer.
+//
+// It must also sit inside peer.NegotiateTimeout, for the reason
+// feelerHandshakeTimeout gives.
 const defaultFeelerHandshakeTimeout = 25 * time.Second
+
+// feelerHandshakeTimeout settles the probe deadline from the configured value.
+//
+// Extracted from the probe so both guarantees the setting's documentation makes
+// are reachable from a test, the same reason feelerBudget is its own function.
+//
+// Two configured values are unusable, and the guards fire in the order written:
+//
+//   - Not positive. A timer built from zero or less fires immediately, so every
+//     probe would report a timeout before the far side could possibly answer.
+//   - At or beyond peer.NegotiateTimeout. The failure this deadline bounds is a
+//     host that accepts a TCP connection and then says nothing at all, and the
+//     peer package covers that case too: AssociateConnection starts its own
+//     negotiation timer before the probe builds this one, so a deadline equal to
+//     or longer than it always loses the race. Losing it means the hang-up is
+//     reported by the peer package at warning level, on the same line the
+//     disconnect-rate measurements count, so a probe that did its job looks like
+//     a lost peer. Firing first hands the teardown back to the probe, which
+//     hangs up quietly at debug.
+func feelerHandshakeTimeout(logger ulogger.Logger, configured time.Duration) time.Duration {
+	timeout := configured
+	if timeout <= 0 {
+		timeout = defaultFeelerHandshakeTimeout
+		logger.Warnf("[Feeler] legacy_feelerHandshakeTimeout must be positive, using %s", timeout)
+	}
+
+	if timeout >= peer.NegotiateTimeout {
+		timeout = peer.NegotiateTimeout - time.Second
+		logger.Warnf("[Feeler] legacy_feelerHandshakeTimeout must be less than the %s peer negotiate timeout, using %s", peer.NegotiateTimeout, timeout)
+	}
+
+	return timeout
+}
 
 // poissonNext returns an exponentially distributed delay with the given mean.
 //
@@ -162,11 +200,25 @@ func poissonNext(mean time.Duration) time.Duration {
 }
 
 // boundedDuration turns a nanosecond count into a Duration, falling back when
-// the value will not fit an int64. The mean is operator-settable and
-// ExpFloat64 reaches about 745, so a large mean overflows; converting a float
-// that does not fit is undefined in Go. The comparison is a negated in-range
-// test so that NaN, which loses every ordinary comparison, takes the fallback
-// too.
+// the value will not fit an int64.
+//
+// At the default two-minute mean an exponential draw cannot come close to
+// overflowing an int64 of nanoseconds. The mean is operator-settable, though,
+// and ExpFloat64 reaches about 745, so a mean beyond roughly a hundred and
+// forty days puts the product past MaxInt64 — and converting a float that does
+// not fit is undefined in Go. The two architectures teranode ships on do
+// genuinely different things with it, both measured rather than assumed:
+//
+//   - amd64 produces the indefinite value, MinInt64, for an overflow in either
+//     direction. A negative gap parks the deadline permanently in the past, so
+//     the probe fires on every single tick.
+//   - arm64 saturates, so a positive overflow becomes MaxInt64 — a deadline
+//     some 292 years out, which stops the feeler for the life of the process.
+//
+// Neither is a pacing anyone asked for, and they fail in opposite directions,
+// so the out-of-range case returns the fallback instead. The comparison is
+// written as a negated in-range test so that NaN, which loses every ordinary
+// comparison, takes the fallback too.
 func boundedDuration(ns float64, fallback time.Duration) time.Duration {
 	if !(ns > math.MinInt64 && ns < math.MaxInt64) {
 		return fallback
@@ -278,6 +330,10 @@ func (s *server) feelerHandler() {
 // The connection manager's job is to keep connections alive: handed a probe,
 // it would count it against the outbound target and dial a replacement when
 // it hung up.
+//
+// svnode can afford to route its feeler through the ordinary path because its
+// probes live well under a second; ours is asked to claim nothing at all, so it
+// drives a bare peer and calls the address book itself.
 func (s *server) feelerProbe() {
 	defer func() { s.feelerTokens <- struct{}{} }()
 
@@ -360,18 +416,7 @@ func (s *server) feelerProbe() {
 		close(gone)
 	}()
 
-	timeout := s.settings.Legacy.FeelerHandshakeTimeout
-	if timeout <= 0 {
-		timeout = defaultFeelerHandshakeTimeout
-		s.logger.Warnf("[Feeler] legacy_feelerHandshakeTimeout must be positive, using %s", timeout)
-	}
-
-	if timeout >= peer.NegotiateTimeout {
-		timeout = peer.NegotiateTimeout - time.Second
-		s.logger.Warnf("[Feeler] legacy_feelerHandshakeTimeout must be less than the %s peer negotiate timeout, using %s", peer.NegotiateTimeout, timeout)
-	}
-
-	timer := time.NewTimer(timeout)
+	timer := time.NewTimer(feelerHandshakeTimeout(s.logger, s.settings.Legacy.FeelerHandshakeTimeout))
 	defer timer.Stop()
 
 	outcome := "no version received"
@@ -425,18 +470,44 @@ func (s *server) shuttingDown() bool {
 	}
 }
 
+// banNonBSVHost bans a host that answered a probe with a user agent that is not
+// a BSV node's, for the same duration and under the same disable lever as the
+// ordinary peer path, which reaches the same decision in OnVersion.
+//
+// Without it the address stays in the new table and nothing stops the next
+// selection pass drawing it again, so the node would spend probe slots
+// re-establishing a fact it already knows about a fork client it can never
+// promote. feelerCandidate consults the ban list, so one ban takes the address
+// out of the draw for good.
+//
+// svnode does the same thing by the same means where an operator has asked for
+// it: a user agent matching -banclientua is pushed straight to the ban score
+// threshold as "invalid-UA" (net_processing.cpp:1722). The only difference is
+// that for teranode the BSV-only rule is the protocol requirement rather than an
+// operator option.
+//
+// Written straight to the shared ban list rather than through BanPeer, because
+// that path needs a serverPeer and the peer handler and a probe has neither.
+// handleAddPeerMsg tests the ban list before it tests its own peerState copy, so
+// a ban recorded here still turns the host away at the door.
 func (s *server) banNonBSVHost(addrString string) {
 	if cfg.DisableBanning {
 		return
 	}
 
+	// Given up on rather than guessed at, matching handleBanPeerMsg. The ban
+	// list keys on a bare host, and IsBanned strips the port before it looks
+	// one up, so a key that still carried a port could never be found again.
 	host, _, err := net.SplitHostPort(addrString)
 	if err != nil {
-		host = addrString
+		s.logger.Debugf("[Feeler] Cannot ban %s, its address will not split: %v", addrString, err)
+		return
 	}
 
+	s.logger.Infof("[Feeler] Banning %s for %v: not a BSV node", host, cfg.BanDuration)
+
 	if err := s.banList.Add(s.ctx, host, time.Now().Add(cfg.BanDuration)); err != nil {
-		s.logger.Debugf("[Feeler] Cannot ban %s: %v", host, err)
+		s.logger.Errorf("[Feeler] Failed to add ban for %s: %v", host, err)
 	}
 }
 

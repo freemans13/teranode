@@ -1086,3 +1086,107 @@ func TestBoundedDurationRefusesAConversionThatDoesNotFit(t *testing.T) {
 func TestDefaultFeelerHandshakeTimeoutBeatsPeerNegotiateTimeout(t *testing.T) {
 	require.Less(t, defaultFeelerHandshakeTimeout, peer.NegotiateTimeout)
 }
+
+// TestFeelerHandshakeTimeoutGuardsBothConfiguredEdges pins the two promises the
+// setting's own documentation makes about values it cannot use.
+//
+// Both are worth a test rather than a comment. A non-positive deadline fires
+// before the far side can answer, so every probe would report a timeout. And a
+// deadline at or beyond peer.NegotiateTimeout loses the race to the peer
+// package, whose hang-up is logged at warning level on the line the
+// disconnect-rate measurements count -- exactly the noise the deadline exists to
+// keep out.
+func TestFeelerHandshakeTimeoutGuardsBothConfiguredEdges(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured time.Duration
+		want       time.Duration
+	}{
+		{name: "zero falls back to the default", configured: 0, want: defaultFeelerHandshakeTimeout},
+		{name: "negative falls back to the default", configured: -time.Second, want: defaultFeelerHandshakeTimeout},
+		{name: "equal to the peer timeout is brought inside it", configured: peer.NegotiateTimeout, want: peer.NegotiateTimeout - time.Second},
+		{name: "beyond the peer timeout is brought inside it", configured: peer.NegotiateTimeout + time.Hour, want: peer.NegotiateTimeout - time.Second},
+		{name: "the shipped default is left alone", configured: defaultFeelerHandshakeTimeout, want: defaultFeelerHandshakeTimeout},
+		{name: "a short testing value is left alone", configured: 250 * time.Millisecond, want: 250 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, feelerHandshakeTimeout(ulogger.TestLogger{}, tc.configured))
+		})
+	}
+}
+
+// TestFeelerProbeUsesTheConfiguredHandshakeTimeout pins the second hop, which
+// the settings loader test cannot see: that the loaded value actually reaches
+// the probe's timer.
+//
+// The listener accepts the connection and then says nothing, which is the
+// failure the deadline is for. With the setting honoured the probe gives up
+// after the configured moment; with the setting ignored in favour of any of the
+// constants around it, the probe sits there for tens of seconds. The generous
+// budget is deliberate -- it is not measuring the timeout, only proving the
+// configured one is the one being used.
+func TestFeelerProbeUsesTheConfiguredHandshakeTimeout(t *testing.T) {
+	ln := startMuteFeelerTestListener(t)
+
+	swapTestConfig(t, ln.Addr().String())
+
+	srv := newFeelerTestServer(t)
+	srv.settings.Legacy.FeelerHandshakeTimeout = 250 * time.Millisecond
+	serveFeelerSnapshot(srv, feelerSnapshot{})
+
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+	srv.addrManager.AddAddress(na, testSourceAddr())
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		runOneProbe(srv)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the probe ignored the configured handshake timeout")
+	}
+
+	require.Equal(t, uint64(1), srv.feelerAttempted.Load())
+	require.Equal(t, uint64(0), srv.feelerVerified.Load(),
+		"a host that never identified itself must never be promoted")
+}
+
+// startMuteFeelerTestListener accepts one connection, reads the probe's version
+// message so the probe is genuinely waiting on a reply, and then holds the
+// connection open without answering.
+//
+// Holding it open is the whole point: a listener that closed instead would end
+// the probe through its disconnect arm, which would satisfy a timing assertion
+// whatever the deadline was set to.
+func startMuteFeelerTestListener(t *testing.T) net.Listener {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = ln.Close() })
+
+	net2 := settings.NewSettings().ChainCfgParams.Net
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+
+		defer func() { _ = conn.Close() }()
+
+		if _, _, err := wire.ReadMessage(conn, wire.ProtocolVersion, net2); err != nil {
+			return
+		}
+
+		buf := make([]byte, 1)
+		_, _ = conn.Read(buf)
+	}()
+
+	return ln
+}
