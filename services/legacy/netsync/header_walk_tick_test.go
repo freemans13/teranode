@@ -108,3 +108,81 @@ func TestSyncManager_ATickBetweenHeaderBatchesDoesNotWedgeTheCheckpointTransitio
 	require.Equal(t, checkpoint.String(), last.hash.String(),
 		"what is left is the checkpoint node, kept to anchor the next round")
 }
+
+// TestSyncManager_AFreedInFlightSlotIsToppedUpMidRound is the other half of the
+// same rule, and it is what stops the guard above from being "simplified" into
+// the thing that quietly switches sync down to one block at a time.
+//
+// fetchMoreHeaderBlocks exists because a block that stops being outstanding
+// without being committed — parked, or committed later off disk — is a silent
+// loss of one in-flight slot. Nothing else notices, so without the top-up the
+// pipeline drains a slot at a time until nothing is outstanding at all and every
+// block waits a full round trip for the one before it.
+//
+// The state it has to work in is the ordinary forward walk, where the cursor is
+// deliberately AHEAD of the front: the front is the block we are waiting on and
+// the cursor is past everything already asked for. So "the cursor is on the
+// front" — right for driving the walk from a timer, and true of a rewound cursor
+// — is exactly false here. Using it as the condition for the top-up as well
+// leaves every test in the package green and turns the pipeline off.
+func TestSyncManager_AFreedInFlightSlotIsToppedUpMidRound(t *testing.T) {
+	sm := newFetchLockManager(t, nil, nil, nil)
+
+	syncPeer, _, _ := connectRacePeer(t, 81, 1000)
+	registerRacePeer(sm, syncPeer)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	// More headers than one pipeline holds, so there is something left to top up
+	// with. The checkpoint is the last of them, which is the only shape in which
+	// a real round ever fetches anything.
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xa8}
+	msg, chain := linkedHeaders(anchor, 25, &nonce)
+	checkpoint := chain[len(chain)-1]
+
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 35, Hash: &checkpoint}
+
+	sm.resetHeaderState(&anchor, 10)
+	sm.headersFirstMode.Store(true)
+
+	// The batch reaches the checkpoint, so the anchor comes off the front and
+	// the round's first getdata goes out.
+	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+
+	requested := 0
+
+	for _, hash := range chain {
+		if !sm.blockDownloads.RequestedWithin(hash, time.Minute) {
+			break
+		}
+
+		requested++
+	}
+
+	require.Greater(t, requested, 1, "the round's first fetch must have filled the pipeline")
+	require.Less(t, requested, len(chain), "the round must be longer than one pipeline, or there is nothing left to top up with")
+
+	// This is the forward-walk state: the front is the block we are waiting on,
+	// and the cursor is past everything already asked for.
+	sm.headerMu.Lock()
+	cursorOnTheFront := sm.startHeader == sm.headerList.Front()
+	sm.headerMu.Unlock()
+
+	require.False(t, cursorOnTheFront, "mid-round the cursor is ahead of the front; a top-up that only ran when it was not would never run at all")
+
+	// One of the blocks in flight stops being outstanding without being
+	// committed — it was parked, which releases the peer's obligation and puts
+	// nothing in the chain. It is not the front, so the walk is not moved on by
+	// it and nothing else will notice the free slot.
+	sm.blockDownloads.Remove(chain[1])
+
+	next := chain[requested]
+
+	require.False(t, sm.blockDownloads.RequestedWithin(next, time.Minute))
+
+	sm.fetchMoreHeaderBlocks(syncPeer)
+
+	require.True(t, sm.blockDownloads.RequestedWithin(next, time.Minute),
+		"a freed in-flight slot must be refilled, or the pipeline drains one block at a time until sync is serial")
+}
