@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -583,4 +584,173 @@ func TestSubtreeMetaRegenerator_PeerFetchTimeoutFallback(t *testing.T) {
 
 	r := NewSubtreeMetaRegenerator(logger, mockStore, nil, height, 288, 90*time.Second)
 	require.Equal(t, 90*time.Second, r.peerFetchTimeout, "an explicit timeout must be honoured")
+}
+
+// buildTruncatableSubtreeData builds a two-transaction subtree plus both a
+// complete serialized body and one truncated at the boundary between the two
+// transactions. The truncated body is what a failed on-demand generation or a
+// poisoned proxy cache serves: the deserializer accepts it and stops at a clean
+// io.EOF, leaving the second node with no inpoints.
+func buildTruncatableSubtreeData(t *testing.T) (subtree *subtreepkg.Subtree, subtreeHash *chainhash.Hash, full, truncated []byte) {
+	t.Helper()
+
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+	tx2 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000002", 0)
+
+	subtree = createTestSubtree([]chainhash.Hash{*tx1.TxIDChainHash(), *tx2.TxIDChainHash()})
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	subtreeData.Txs[1] = tx1
+	subtreeData.Txs[2] = tx2
+
+	full, err := subtreeData.Serialize()
+	require.NoError(t, err)
+
+	truncated = tx1.SerializeBytes()
+	require.Less(t, len(truncated), len(full), "sanity: truncation actually drops the second tx")
+
+	return subtree, subtree.RootHash(), full, truncated
+}
+
+// requireCompleteMeta asserts the regenerated meta records inpoints for every
+// non-coinbase node. A meta that merely exists is not enough: the incident this
+// whole path guards against was a meta whose tail entries were silently empty.
+func requireCompleteMeta(t *testing.T, meta *subtreepkg.Meta, nodes int) {
+	t.Helper()
+
+	require.NotNil(t, meta)
+
+	for i := 1; i < nodes; i++ {
+		inpoints, err := meta.GetTxInpoints(i)
+		require.NoError(t, err, "node %d has no inpoints", i)
+		require.NotNil(t, inpoints, "node %d has no inpoints", i)
+	}
+}
+
+// TestSubtreeMetaRegenerator_TruncatedLocalData_FallsThroughToPeer pins the
+// source fall-through contract on the local branch.
+//
+// A truncated local subtree_data file passes getLocalSubtreeData — the
+// deserializer stops at a clean io.EOF and reports success — so the
+// completeness check only rejects it one layer later, while building the meta.
+// Committing to the local source before knowing its data is usable turns that
+// rejection into the whole call's verdict, and the peer that holds a complete
+// copy is never asked. Every retry then re-reads the same truncated file, so a
+// valid block never validates.
+func TestSubtreeMetaRegenerator_TruncatedLocalData_FallsThroughToPeer(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, full, truncated := buildTruncatableSubtreeData(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/subtree_data/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full)
+	}))
+	defer server.Close()
+
+	mockStore := newMockSubtreeStoreWriter()
+	mockStore.subtreeData[string(subtreeHash[:])+"."+string(fileformat.FileTypeSubtreeData)] = truncated
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, mockStore,
+		[]string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
+
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+
+	require.NoError(t, err, "a truncated local file must fall through to the peer, not end the attempt")
+	requireCompleteMeta(t, meta, subtree.Length())
+	require.Len(t, mockStore.storedMeta, 1, "the peer-built meta must be stored so the next call skips regeneration entirely")
+}
+
+// TestSubtreeMetaRegenerator_PoisonedPeer_FallsThroughToNextPeer pins the same
+// contract inside the peer loop: the first peer to yield a body must not be the
+// only peer tried. A single poisoned cache entry on peer 1 otherwise wedges
+// regeneration even with healthy peers behind it.
+func TestSubtreeMetaRegenerator_PoisonedPeer_FallsThroughToNextPeer(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, full, _ := buildTruncatableSubtreeData(t)
+
+	var poisonedHits atomic.Int32
+
+	poisoned := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/subtree_data/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		poisonedHits.Add(1)
+		// HTTP 200 with an empty body — a proxy replaying an aborted on-demand
+		// generation, the shape documented in issue 1368.
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer poisoned.Close()
+
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/subtree_data/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full)
+	}))
+	defer healthy.Close()
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, newMockSubtreeStoreWriter(),
+		[]string{poisoned.URL + "/api/v1", healthy.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
+
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+
+	require.NoError(t, err, "a poisoned first peer must not end the peer loop")
+	requireCompleteMeta(t, meta, subtree.Length())
+	require.Positive(t, poisonedHits.Load(), "sanity: the poisoned peer was actually tried first")
+}
+
+// TestSubtreeMetaRegenerator_PoisonedPeer_RetriedWithCacheBust pins the
+// cache-bypass retry the sibling fetcher already performs.
+//
+// A peer's nginx proxy_cache keys on $request_uri but location matching ignores
+// the query string, so a unique cachebust parameter reaches the same handler
+// while missing the cache — forcing a fresh on-demand generation. Without it a
+// single cached empty response wedges this subtree for the whole upstream TTL,
+// however many times we ask, because every request is byte-identical.
+func TestSubtreeMetaRegenerator_PoisonedPeer_RetriedWithCacheBust(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, full, _ := buildTruncatableSubtreeData(t)
+
+	var sawCacheBust atomic.Bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/subtree_data/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		// The cache serves the poisoned entry for the bare URL and is bypassed
+		// entirely once a cachebust parameter is present.
+		if r.URL.Query().Get("cachebust") == "" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		sawCacheBust.Store(true)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full)
+	}))
+	defer server.Close()
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, newMockSubtreeStoreWriter(),
+		[]string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
+
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+
+	require.NoError(t, err, "the poisoned entry must be bypassed with a cache-busting retry")
+	require.True(t, sawCacheBust.Load(), "the retry must carry a cachebust parameter, or the cache replays the same empty body")
+	requireCompleteMeta(t, meta, subtree.Length())
 }

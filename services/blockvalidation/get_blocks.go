@@ -641,40 +641,10 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 	}
 
 	// Reject a response the subtree cannot be satisfied by, before Serialize turns it
-	// into a generic ErrSubtreeLengthMismatch that names no peer. An empty body is the
-	// issue-1368 signature: a peer's proxy cache replaying a failed or aborted
-	// on-demand generation as "200 + 0 bytes".
-	//
-	// The predicate mirrors what subtreepkg.Data.Serialize *safely* tolerates, which is
-	// not the same as its literal `i != 0` nil exemption. Serialize skips index 0 only
-	// when Nodes[0] is the coinbase placeholder: it then sets txStartIndex = 1 and never
-	// touches Txs[0]. For any other Nodes[0] it sets txStartIndex = 0 while still
-	// guarding its own nil check with `i != 0`, so it walks straight into
-	// Txs[0].SerializeBytes() on a nil *bt.Tx and panics (IsExtended is nil-safe, so it
-	// falls through to Bytes -> toBytesHelper -> Size). Copying the unconditional
-	// exemption here would let such a response through with missing == 0, and the panic
-	// lands in a per-subtree errgroup goroutine that no recover() in this package
-	// covers. That is reachable without malice: a non-first subtree has no coinbase
-	// placeholder, so any block whose tx count is congruent to 1 modulo the subtree size
-	// ends with a one-node subtree holding a real tx hash at index 0.
-	//
-	// So index 0 counts as missing unless it genuinely is the coinbase placeholder —
-	// the only case Serialize actually tolerates — and nothing that used to succeed
-	// starts failing here.
-	missing := 0
-	coinbaseAtZero := len(subtree.Nodes) > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
-
-	for i, tx := range subtreeData.Txs {
-		if tx != nil {
-			continue
-		}
-
-		if i == 0 && coinbaseAtZero {
-			continue
-		}
-
-		missing++
-	}
+	// into a generic ErrSubtreeLengthMismatch that names no peer — or panics on a nil
+	// tx at index 0. model.MissingSubtreeDataTxs owns that reasoning, shared with the
+	// subtree meta regenerator so the two cannot drift on it.
+	missing := model.MissingSubtreeDataTxs(subtree, subtreeData)
 
 	bytesRead := subtreeDataReader.BytesRead()
 

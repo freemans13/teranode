@@ -1,0 +1,62 @@
+package model
+
+import (
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
+)
+
+// MissingSubtreeDataTxs reports how many of the subtree's nodes a subtree_data
+// body failed to fill. A non-zero result means the body cannot satisfy the
+// subtree and must be rejected rather than built on.
+//
+// NewSubtreeDataFromReader stops at a clean io.EOF without checking it filled
+// every node, so a short or empty body deserializes "successfully" and leaves
+// the tail Txs entries nil. An empty body is the issue-1368 signature: a peer's
+// proxy cache replaying a failed or aborted on-demand generation as
+// "200 + 0 bytes".
+//
+// Two distinct disasters follow from trusting such a body, which is why both
+// the subtree meta regenerator and blockvalidation's catchup subtree_data
+// fetcher call this one predicate rather than each keeping their own copy:
+//
+//   - A meta derived from it records no parents for the missing tail.
+//     GetParentTxHashes then returns nil with no error, validOrderAndBlessed
+//     reads that as a transaction it cannot find, and a valid block is
+//     permanently invalidated.
+//   - Data.Serialize panics on it. Serialize skips index 0 only when Nodes[0]
+//     is the coinbase placeholder: it then sets txStartIndex = 1 and never
+//     touches Txs[0]. For any other Nodes[0] it sets txStartIndex = 0 while
+//     still guarding its own nil check with `i != 0`, so it walks straight into
+//     Txs[0].SerializeBytes() on a nil *bt.Tx (IsExtended is nil-safe, so it
+//     falls through to Bytes -> toBytesHelper -> Size).
+//
+// So index 0 counts as missing unless it genuinely holds the coinbase
+// placeholder — the only case Serialize actually tolerates. Exempting index 0
+// unconditionally, matching Serialize's literal `i != 0`, would let such a body
+// through with a count of zero and land the panic in a per-subtree errgroup
+// goroutine that no recover() covers. That is reachable without malice: a
+// non-first subtree has no coinbase placeholder, so any block whose transaction
+// count is congruent to 1 modulo the subtree size ends with a one-node subtree
+// holding a real tx hash at index 0.
+func MissingSubtreeDataTxs(subtree *subtreepkg.Subtree, data *subtreepkg.Data) int {
+	if subtree == nil || data == nil {
+		return 0
+	}
+
+	coinbaseAtZero := len(subtree.Nodes) > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+
+	missing := 0
+
+	for i, tx := range data.Txs {
+		if tx != nil {
+			continue
+		}
+
+		if i == 0 && coinbaseAtZero {
+			continue
+		}
+
+		missing++
+	}
+
+	return missing
+}
