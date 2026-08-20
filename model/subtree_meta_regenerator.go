@@ -42,11 +42,30 @@ type SubtreeMetaRegenerator struct {
 	getBlockHeight       func() uint32
 	blockHeightRetention uint32
 	peerFetchTimeout     time.Duration
+}
 
-	// cacheBustCounter produces the unique token appended to a peer request URL
-	// when a first attempt came back with an unusable body, so the retry cannot
-	// be served from that peer's cache.
-	cacheBustCounter atomic.Uint64
+// cacheBustCounter produces the token appended to a peer request URL when a
+// first attempt came back with an unusable body, so the retry cannot be served
+// from that peer's cache.
+//
+// Process-wide and clock-seeded, deliberately, because it has to be unique
+// across regenerators and not merely within one. blockvalidation builds a fresh
+// SubtreeMetaRegenerator for every validation attempt (createMetaRegenerator is
+// called per ValidateBlock and per ReValidateBlock), so a per-instance counter
+// would restart at zero each time and every retry would request the identical
+// "?cachebust=1" URL. nginx caches that URL under its own key like any other, so
+// a busted request whose generation also aborted would leave the block wedged
+// for the whole upstream TTL — exactly the failure this retry exists to break.
+// blockvalidation's sibling counter gets process-lifetime uniqueness by living
+// on the long-lived Server; this is the model-package equivalent, with a clock
+// seed so a node restart mid-poison does not replay a token either.
+var cacheBustCounter = newCacheBustCounter()
+
+func newCacheBustCounter() *atomic.Uint64 {
+	c := &atomic.Uint64{}
+	c.Store(uint64(time.Now().UnixNano()))
+
+	return c
 }
 
 // NewSubtreeMetaRegenerator creates a new SubtreeMetaRegenerator instance.
@@ -234,7 +253,7 @@ func (r *SubtreeMetaRegenerator) getSubtreeDataFromPeer(ctx context.Context, sub
 
 	url := fmt.Sprintf("%s/subtree_data/%s", peerURL, subtreeHash.String())
 	if bypassCache {
-		url = fmt.Sprintf("%s?cachebust=%d", url, r.cacheBustCounter.Add(1))
+		url = fmt.Sprintf("%s?cachebust=%d", url, cacheBustCounter.Add(1))
 	}
 
 	body, err := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
