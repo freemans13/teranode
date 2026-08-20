@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/stretchr/testify/require"
 )
@@ -590,4 +591,55 @@ func TestScheduler_WhenNobodyClaimsTheHeightTheFirstPeerIsStillAsked(t *testing.
 		"with nobody claiming the height the walk must still ask somebody")
 	require.Equal(t, hashes, shortRec.all())
 	require.Zero(t, otherRec.count(), "and only the first peer with budget, not everybody")
+}
+
+// blockHeaderLookups counts how many times a pass asked the blockchain service
+// whether we already hold a block.
+func blockHeaderLookups(t *testing.T, sm *SyncManager) int {
+	t.Helper()
+
+	client, ok := sm.blockchainClient.(*blockchain2.Mock)
+	require.True(t, ok)
+
+	n := 0
+
+	for _, call := range client.Calls {
+		if call.Method == "GetBlockHeader" {
+			n++
+		}
+	}
+
+	return n
+}
+
+// TestScheduler_DoesNotAskTheBlockchainAboutBlocksItCannotHandOut bounds the
+// cost of a pass. Each candidate header costs one "do we already have this?"
+// question, and that is a gRPC round trip to the blockchain service on a context
+// with no deadline. A pass must therefore only ask about the headers it could
+// actually hand to a peer: with the node-wide window at its default of 1024 and
+// one peer able to take 16, walking 60 headers would make 60 round trips to
+// place 16 blocks, and this runs on every arriving block.
+func TestScheduler_DoesNotAskTheBlockchainAboutBlocksItCannotHandOut(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xde}
+	msg, _ := linkedHeaders(anchor, 60, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+
+	syncPeer, syncRec := schedulerPeer(t, sm, 113, 1000)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	before := blockHeaderLookups(t, sm)
+
+	sm.fetchHeaderBlocks()
+
+	budget := schedulerPeerBudget(sm)
+
+	require.True(t, WaitUntil(func() bool { return syncRec.count() == budget }, 5*time.Second),
+		"the pass should have handed out one peer's budget")
+	require.Equal(t, budget, blockHeaderLookups(t, sm)-before,
+		"a pass must not ask the blockchain about headers it has no budget to hand out")
 }

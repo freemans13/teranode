@@ -134,6 +134,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 	fanout := min(len(eligible), ladder)
 
 	peers := make([]*assignerPeer, 0, fanout)
+	assignable := 0
 
 	for _, candidate := range eligible {
 		if len(peers) == fanout {
@@ -146,6 +147,7 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		}
 
 		peers = append(peers, &assignerPeer{peer: candidate.peer, state: candidate.state, budget: budget})
+		assignable += budget
 	}
 
 	if len(peers) == 0 {
@@ -154,7 +156,13 @@ func (sm *SyncManager) newDownloadAssigner() *downloadAssigner {
 		return nil
 	}
 
-	return &downloadAssigner{peers: peers, remaining: remaining}
+	// The pass budget is also the size of each round's snapshot, and every header
+	// in a snapshot costs one "do we already have this?" round trip to the
+	// blockchain service. So it is what the peers can actually take between them,
+	// not the whole node-wide window: at the default window of 1024 and one peer
+	// able to take 16, sizing the round by the window would make 1024 round trips
+	// to place 16 blocks, on every arriving block.
+	return &downloadAssigner{peers: peers, remaining: min(remaining, assignable)}
 }
 
 // singlePeerAssigner is the behaviour the node had before the scheduler: one
