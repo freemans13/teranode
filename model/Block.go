@@ -1642,9 +1642,18 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 	// good one. Nothing is lost by leaving them: a heap subtree needs no Close,
 	// and dropping the reference is all the reallocation below has to do.
 	//
-	// This is safe precisely because the two sharing sites share heap-backed
-	// subtrees only — quick_validate builds the shared one with AddNode, and its
-	// mmap-capable branch queues a job that carries no Subtree at all.
+	// For quick_validate that is airtight: it builds the shared subtree with
+	// AddNode, and its mmap-capable branch queues a job carrying no Subtree at
+	// all, so the entry it shares is always heap-backed.
+	//
+	// blockassembly is NOT airtight. With blockassembly_subtreeMmapDir set the
+	// processor's chained subtrees come from SubtreeProcessor.newSubtree, which
+	// returns NewTreeByLeafCountMmap — so a job subtree aliased into a Block can
+	// be mmap-backed, and Closing it would unmap and delete a file the live
+	// processor is still using. What saves that path today is that it never
+	// reaches here: its SubtreeSlices are always fully loaded and the same
+	// length as its Subtrees, so the "already loaded" check above returns first.
+	// Anything that tightens that check has to give blockassembly a copy.
 	if closeErr := b.closeMmapSubtreesLocked(); closeErr != nil {
 		logger.Warnf("[BLOCK][%s][ID %d] failed closing mmap subtrees before reload: %v", b.Hash().String(), b.ID, closeErr)
 	}
@@ -1870,8 +1879,14 @@ func (b *Block) ReplaceSubtreeSlices(slices []*subtreepkg.Subtree) {
 // Used where the block is about to drop its references to the subtrees but may
 // not be their only holder. Closing is only needed for mmap-backed subtrees —
 // it unmaps the region and removes the backing file, which no finalizer would
-// ever do — and those are never shared, so this is the release that cannot harm
-// another holder.
+// ever do.
+//
+// Callers must satisfy themselves that the block's mmap-backed entries are its
+// own. That holds for every caller today, but not because mmap-backed subtrees
+// are inherently unshared: see the note in GetAndValidateSubtrees on
+// blockassembly, whose job subtrees are mmap-backed whenever
+// blockassembly_subtreeMmapDir is set and are only ever safe here because that
+// path returns before reaching this function.
 //
 // The array itself is not written to, deliberately. SubtreeSlices can be the
 // caller's own slice: blockassembly builds a model.Block with

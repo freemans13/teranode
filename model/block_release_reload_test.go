@@ -250,11 +250,13 @@ func TestReleaseSubtreeNodes_ClosesMmapAndNilsEntries(t *testing.T) {
 // one, or dereferencing a nil RootHash — and it is a data race on Nodes either
 // way.
 //
-// Only mmap-backed subtrees need Closing, and those are always exclusively the
-// block's: the two sites that share a subtree share a heap-backed one
-// (quick_validate builds it with AddNode, and its mmap-capable branch queues a
-// job carrying no Subtree at all). So the reload closes mmap survivors and
-// leaves heap survivors alone.
+// Only mmap-backed subtrees need Closing, so the reload closes mmap survivors
+// and leaves heap survivors alone. quick_validate's shared entry is always
+// heap-backed (it builds it with AddNode, and its mmap-capable branch queues a
+// job carrying no Subtree at all). blockassembly's job subtrees can be
+// mmap-backed when blockassembly_subtreeMmapDir is set; they are safe only
+// because that path takes GetAndValidateSubtrees' "already loaded" early exit
+// and never reaches the release at all.
 func TestGetAndValidateSubtrees_ReloadLeavesSharedHeapSubtreeUsable(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	blobStore := blobmemory.New()
@@ -281,7 +283,7 @@ func TestGetAndValidateSubtrees_ReloadLeavesSharedHeapSubtreeUsable(t *testing.T
 
 	// The pointer a queued SubtreeWriteJob would still be holding.
 	shared := b.SubtreeSlices[0]
-	require.False(t, shared.IsMmapBacked(), "sanity: the shared subtree is heap-backed, like every actually-shared one")
+	require.False(t, shared.IsMmapBacked(), "sanity: this stands in for quick_validate's shared entry, which is always heap-backed")
 	require.NotEmpty(t, shared.Nodes, "sanity: the shared subtree is loaded before the reload")
 
 	// Gut entry 1 so the reload branch runs over the surviving entry 0.

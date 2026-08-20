@@ -1664,11 +1664,21 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		// this block shares both the backing array and the *Subtree values with
 		// whatever else holds the job. Block.Valid must therefore not mutate
 		// either: model.Block.closeMmapSubtreesLocked is the release on that
-		// path, and it Closes only mmap-backed subtrees and never writes to the
-		// array. Job subtrees are built in memory by the processor, so none of
-		// them is mmap-backed and nothing here is touched — a cross-package
-		// dependency worth naming, because a release that reached further would
-		// corrupt the processor's state from inside block validation.
+		// path, and it never writes to the array — a cross-package dependency
+		// worth naming, because a release that reached further would corrupt the
+		// processor's state from inside block validation.
+		//
+		// It does Close mmap-backed entries, and these CAN be mmap-backed: with
+		// blockassembly_subtreeMmapDir set, the processor builds its chained
+		// subtrees with SubtreeProcessor.newSubtree, which returns
+		// NewTreeByLeafCountMmap. What keeps that harmless is only that the
+		// release never runs on this path — GetAndValidateSubtrees takes its
+		// "already loaded" early exit, because len(jobSubtreeHashes) always
+		// equals len(job.Subtrees) and every job subtree carries nodes. Tighten
+		// that loaded-check, or hand this block a subtree it cannot account for,
+		// and block validation would unmap and delete the live processor's
+		// backing files. Pass a copy rather than relying on the early exit if
+		// this ever needs to stop being true.
 		SubtreeSlices: job.Subtrees,
 		CoinbaseBUMP:  coinbaseBUMP,
 	}
