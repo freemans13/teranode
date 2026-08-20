@@ -85,6 +85,15 @@ func (r *peerMsgRecorder) blocksAskedFor() []chainhash.Hash {
 // higher block in front of the lower one, and the walk would then ask for the
 // child before the parent — and the child arrives as an orphan of a block
 // nobody has asked for yet.
+//
+// The order the two blocks are given up in is the whole test, and the sweep does
+// not choose it: Expire ranges over a map, so one run in two took the order that
+// hides the bug and the test only caught its mutation about ten times in twelve.
+// So the expiry is driven one block at a time here, parent first, which is the
+// order a naive rewind gets wrong — with a plain push-to-the-front the child
+// then goes in AHEAD of the parent, and because the cursor only ever moves
+// backwards it is left on the parent, so the walk from there never reaches the
+// child at all.
 func TestSyncManager_TwoGivenUpBlocksAreAskedForInTheOrderTheyAreNeeded(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
@@ -101,8 +110,23 @@ func TestSyncManager_TwoGivenUpBlocksAreAskedForInTheOrderTheyAreNeeded(t *testi
 
 	getDataBefore := h.rec.getDataCount()
 
-	// Neither parent ever turns up, so both are given up on and both rewind.
-	h.sm.sweepParkedBlocks(time.Now().Add(parkEntryTTL + time.Second))
+	// Neither parent ever turns up, so both are given up on and both rewind —
+	// the parent on this tick and the child on the next. Holding the child's
+	// clock at the sweep time is what keeps it: an entry expires on how long it
+	// has been parked, so a child parked "now" is not yet old enough.
+	parentGivenUpAt := time.Now().Add(parkEntryTTL + time.Second)
+
+	h.sm.blockPark.mu.Lock()
+	h.sm.blockPark.entries[second].parkedAt = parentGivenUpAt
+	h.sm.blockPark.mu.Unlock()
+
+	h.sm.sweepParkedBlocks(parentGivenUpAt)
+
+	require.Equal(t, 1, h.sm.blockPark.Len(), "only the parent may have been given up on so far")
+
+	h.sm.sweepParkedBlocks(parentGivenUpAt.Add(parkEntryTTL + time.Second))
+
+	require.Zero(t, h.sm.blockPark.Len(), "the child must have been given up on too")
 
 	h.sm.fetchHeaderBlocks()
 
