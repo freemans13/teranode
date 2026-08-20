@@ -1280,6 +1280,14 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		// still loaded. Overwriting SubtreeSlices below drops the only reference
 		// to them, and an mmap-backed subtree has no finalizer — its mapping and
 		// its temp backing file would survive until process exit. Release first.
+		//
+		// A full release, unlike the reload in model.GetAndValidateSubtrees which
+		// closes only mmap-backed subtrees. The difference is ownership, not
+		// oversight: this block is exclusively ours. It reached the cache only
+		// after its validation finished, so the SubtreeWriteJobs that shared
+		// quick_validate's subtrees have all been drained, and blockassembly's
+		// blocks never enter this cache. Gutting the heap-backed nodes here is
+		// the point — it returns the memory of a block being discarded.
 		if releaseErr := block.ReleaseSubtreeNodes(nil); releaseErr != nil {
 			u.logger.Warnf("[setTxMined][%s] failed closing subtrees before unset-mined reload: %v", block.Hash().String(), releaseErr)
 		}
