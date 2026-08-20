@@ -30,6 +30,9 @@
 | BlockPrefetchBufferBytes | int64 | 268435456 | legacy_blockPrefetchBufferBytes | Byte budget for blocks downloaded ahead of processing during sync (0 disables prefetch) |
 | MaxBlockParallelFetch | int | 2 | legacy_maxBlockParallelFetch | Maximum peers downloading the same stalled frontier block at once (1 disables racing) |
 | BlockSlowFetchTimeout | time.Duration | 20s | legacy_blockSlowFetchTimeout | How long the download frontier may sit unchanged before a second peer is asked for the same block (0 disables racing) |
+| MultiPeerBlockDownload | bool | true | legacy_multiPeerBlockDownload | Download block bodies from every eligible peer during legacy sync (false restores the single-sync-peer path) |
+| MaxBlocksInTransitPerPeer | int | 16 | legacy_maxBlocksInTransitPerPeer | Maximum block bodies one peer may be downloading at once (the block-size ladder lowers it further for large blocks) |
+| BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Maximum block bodies the whole node may be downloading at once, counting every peer together |
 | Upnp | bool | false | legacy_upnp | Enable UPnP for automatic port mapping |
 
 ## Configuration Dependencies
