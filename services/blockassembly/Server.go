@@ -1677,8 +1677,13 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		// equals len(job.Subtrees) and every job subtree carries nodes. Tighten
 		// that loaded-check, or hand this block a subtree it cannot account for,
 		// and block validation would unmap and delete the live processor's
-		// backing files. Pass a copy rather than relying on the early exit if
-		// this ever needs to stop being true.
+		// backing files.
+		//
+		// Copying the slice would not buy anything either, because Close acts on
+		// the *Subtree and not on the array: a clone holds the same pointers.
+		// Anything that stops relying on the early exit has to give the block
+		// subtrees of its own, or tell the release the entries are not its to
+		// close.
 		SubtreeSlices: job.Subtrees,
 		CoinbaseBUMP:  coinbaseBUMP,
 	}

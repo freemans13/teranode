@@ -11,8 +11,9 @@ const DefaultSubtreeDataFetchTimeout = 10 * time.Minute
 // DefaultSubtreeMetaPeerFetchTimeout is the default bound on one subtree_data
 // fetch made during subtree meta regeneration, covering all of that fetch's 503
 // retries plus its body stream. Not a whole-peer bound: a peer that answers with
-// an unusable body gets a second, cache-busting fetch with a fresh budget. Declared here for the same reason as the constant above: the value
-// populating the setting and the fail-closed fallback must not drift apart.
+// an unusable body gets a second, cache-busting fetch with a fresh budget.
+// Declared here for the same reason as the constant above: the value populating
+// the setting and the fail-closed fallback must not drift apart.
 const DefaultSubtreeMetaPeerFetchTimeout = 10 * time.Minute
 
 // BlockValidationSettings configures the block validation service.

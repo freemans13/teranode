@@ -1653,7 +1653,13 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 	// processor is still using. What saves that path today is that it never
 	// reaches here: its SubtreeSlices are always fully loaded and the same
 	// length as its Subtrees, so the "already loaded" check above returns first.
-	// Anything that tightens that check has to give blockassembly a copy.
+	//
+	// Anything that tightens that check has to give blockassembly ownership of
+	// what it hands over, and copying the slice is not enough to do that: Close
+	// acts on the *Subtree, so a cloned array still holds the same pointers and
+	// unmapping one still tears down the mapping the processor is reading. It
+	// needs either subtrees of its own or a way to tell this release the entries
+	// are not the block's to close.
 	if closeErr := b.closeMmapSubtreesLocked(); closeErr != nil {
 		logger.Warnf("[BLOCK][%s][ID %d] failed closing mmap subtrees before reload: %v", b.Hash().String(), b.ID, closeErr)
 	}
