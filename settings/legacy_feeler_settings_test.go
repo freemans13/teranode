@@ -21,19 +21,21 @@ import (
 // distinctive value set at the winning precedence must come back out.
 func TestLegacyFeelerSettings_LoaderReadsKeys(t *testing.T) {
 	const (
-		budgetKey   = "legacy_maxFeelerPeers"
-		intervalKey = "legacy_feelerInterval"
+		budgetKey    = "legacy_maxFeelerPeers"
+		intervalKey  = "legacy_feelerInterval"
+		handshakeKey = "legacy_feelerHandshakeTimeout"
 	)
 
 	// gocore resolves key.<context> ahead of the bare key, so a plain Set on the
 	// base key is shadowed by any context override in settings.conf. Set at the
 	// precedence that wins under the ambient context to keep this hermetic.
 	ctx := gocore.Config().GetContext()
-	winBudget, winInterval := budgetKey, intervalKey
+	winBudget, winInterval, winHandshake := budgetKey, intervalKey, handshakeKey
 
 	if ctx != "" {
 		winBudget = budgetKey + "." + ctx
 		winInterval = intervalKey + "." + ctx
+		winHandshake = handshakeKey + "." + ctx
 	}
 
 	if ctx == "" || ctx == "dev" {
@@ -42,14 +44,18 @@ func TestLegacyFeelerSettings_LoaderReadsKeys(t *testing.T) {
 			"the shipped default is one probe, matching svnode's single feeler")
 		require.Equal(t, 120*time.Second, def.Legacy.FeelerInterval,
 			"the shipped default is svnode's FEELER_INTERVAL")
+		require.Equal(t, 25*time.Second, def.Legacy.FeelerHandshakeTimeout,
+			"the shipped default sits inside the 30s peer negotiate timeout")
 	}
 
 	gocore.Config().Set(winBudget, "4")
 	gocore.Config().Set(winInterval, "7s")
+	gocore.Config().Set(winHandshake, "9s")
 
 	t.Cleanup(func() {
 		gocore.Config().Set(winBudget, "")
 		gocore.Config().Set(winInterval, "")
+		gocore.Config().Set(winHandshake, "")
 	})
 
 	loaded := NewSettings()
@@ -58,4 +64,6 @@ func TestLegacyFeelerSettings_LoaderReadsKeys(t *testing.T) {
 		"NewSettings must read %s under context %q", budgetKey, ctx)
 	require.Equal(t, 7*time.Second, loaded.Legacy.FeelerInterval,
 		"NewSettings must read %s under context %q", intervalKey, ctx)
+	require.Equal(t, 9*time.Second, loaded.Legacy.FeelerHandshakeTimeout,
+		"NewSettings must read %s under context %q", handshakeKey, ctx)
 }

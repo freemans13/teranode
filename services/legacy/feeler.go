@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"net"
 	"sync"
 	"time"
 
@@ -65,18 +66,10 @@ func feelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPe
 	return configured
 }
 
-// setFeelerBudget fixes the slot reservation, judging it against the outbound
-// target the connection manager will actually chase.
-//
-// The target is read off the manager rather than recomputed from configuration,
-// for exactly the reason its own accessor gives: connmgr.New substitutes its
-// default for a configured zero, so the number the node ends up chasing can be
-// higher than the one its caller computed. Judging the reservation against the
-// caller's number defeated the guard below in the one case it was written for —
-// with a target read as zero, no reservation could ever look like it starved
-// the tier, so the node reserved a slot, dropped its admission ceiling below
-// the target the manager was really aiming for, and dialled for a peer its own
-// door then refused, indefinitely.
+// setFeelerBudget fixes the slot reservation against the outbound target the
+// connection manager will actually chase. connmgr.New substitutes its default
+// for a configured zero, so the number judged here has to be the manager's,
+// not the caller's.
 //
 // Must be called after connmgr.New has returned, and before peerHandler starts:
 // handleAddPeerMsg and handleQuery are the only readers of feelerSlots, and
@@ -149,16 +142,11 @@ const feelerPollInterval = time.Second
 // escalation thresholds below line up with each other.
 const feelerCandidateTries = 100
 
-// feelerHandshakeTimeout bounds how long a probe waits for the far side's
-// version message before giving up on it.
-//
-// Deliberately tighter than svnode's DEFAULT_P2P_HANDSHAKE_TIMEOUT_INTERVAL of
-// sixty seconds (net.h:86). A connection we have already decided to hang up on
-// the moment it answers has no reason to be given a full minute to answer. The
-// peer package's own negotiateTimeout does not cover this case: it starts once
-// negotiation begins, and the failure this bounds is a host that accepts a TCP
-// connection and then says nothing at all.
-const feelerHandshakeTimeout = 30 * time.Second
+// defaultFeelerHandshakeTimeout is the fallback when
+// legacy_feelerHandshakeTimeout is not positive. It must sit inside
+// peer.NegotiateTimeout so a mute host is hung up by the feeler, not logged
+// as a lost peer.
+const defaultFeelerHandshakeTimeout = 25 * time.Second
 
 // poissonNext returns an exponentially distributed delay with the given mean.
 //
@@ -174,25 +162,11 @@ func poissonNext(mean time.Duration) time.Duration {
 }
 
 // boundedDuration turns a nanosecond count into a Duration, falling back when
-// the value will not fit.
-//
-// At the default two-minute mean an exponential draw cannot come close to
-// overflowing an int64 of nanoseconds. The mean is operator-settable, though,
-// and ExpFloat64 reaches about 745, so a mean beyond roughly a hundred and
-// forty days puts the product past MaxInt64 — and converting a float that does
-// not fit is undefined in Go. The two architectures teranode ships on do
-// genuinely different things with it, both measured rather than assumed:
-//
-//   - amd64 produces the indefinite value, MinInt64, for an overflow in either
-//     direction. A negative gap parks the deadline permanently in the past, so
-//     the probe fires on every single tick.
-//   - arm64 saturates, so a positive overflow becomes MaxInt64 — a deadline
-//     some 292 years out, which stops the feeler for the life of the process.
-//
-// Neither is a pacing anyone asked for, and they fail in opposite directions,
-// so the out-of-range case returns the fallback instead. The comparison is
-// written as a negated in-range test so that NaN, which loses every ordinary
-// comparison, takes the fallback too.
+// the value will not fit an int64. The mean is operator-settable and
+// ExpFloat64 reaches about 745, so a large mean overflows; converting a float
+// that does not fit is undefined in Go. The comparison is a negated in-range
+// test so that NaN, which loses every ordinary comparison, takes the fallback
+// too.
 func boundedDuration(ns float64, fallback time.Duration) time.Duration {
 	if !(ns > math.MinInt64 && ns < math.MaxInt64) {
 		return fallback
@@ -209,7 +183,7 @@ func boundedDuration(ns float64, fallback time.Duration) time.Duration {
 // validator, a UTXO store, a subtree store and three validation clients.
 func (s *server) startFeeler() {
 	if s.feelerSlots <= 0 {
-		s.logger.Infof("[Feeler] Disabled (legacy_maxFeelerPeers is not set above zero)")
+		s.logger.Infof("[Feeler] Disabled")
 		return
 	}
 
@@ -298,19 +272,12 @@ func (s *server) feelerHandler() {
 // feelerProbe dials one unverified address, waits for it to identify itself,
 // records what it learned, and hangs up.
 //
-// It never builds a serverPeer and never goes near the connection manager, and
-// both of those are load-bearing rather than stylistic. Membership of
-// state.outboundPeers is the entire netgroup claim and the entire peer count, so
-// a probe registered as an ordinary peer would take a netgroup and an automatic
-// slot away from a real peer. And the connection manager's job is to keep
-// connections alive: handed a probe, it would count it against the outbound
-// target for as long as it lived and then dial a replacement when it hung up.
-//
-// svnode can afford to route its feeler through the ordinary path because its
-// probes live well under a second; ours is asked to claim nothing at all, so it
-// drives a bare peer and calls the address book itself. That is three lines
-// duplicated from OnVersion, and the bare-peer structure is the one idea worth
-// keeping from the earlier sketch on stu/legacy-svnode-align.
+// It never builds a serverPeer and never goes near the connection manager.
+// Membership of state.outboundPeers is the netgroup claim and the peer count,
+// so a probe registered as an ordinary peer would take both from a real one.
+// The connection manager's job is to keep connections alive: handed a probe,
+// it would count it against the outbound target and dial a replacement when
+// it hung up.
 func (s *server) feelerProbe() {
 	defer func() { s.feelerTokens <- struct{}{} }()
 
@@ -393,7 +360,18 @@ func (s *server) feelerProbe() {
 		close(gone)
 	}()
 
-	timer := time.NewTimer(feelerHandshakeTimeout)
+	timeout := s.settings.Legacy.FeelerHandshakeTimeout
+	if timeout <= 0 {
+		timeout = defaultFeelerHandshakeTimeout
+		s.logger.Warnf("[Feeler] legacy_feelerHandshakeTimeout must be positive, using %s", timeout)
+	}
+
+	if timeout >= peer.NegotiateTimeout {
+		timeout = peer.NegotiateTimeout - time.Second
+		s.logger.Warnf("[Feeler] legacy_feelerHandshakeTimeout must be less than the %s peer negotiate timeout, using %s", peer.NegotiateTimeout, timeout)
+	}
+
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	outcome := "no version received"
@@ -405,6 +383,7 @@ func (s *server) feelerProbe() {
 			outcome = "abandoned, shutting down"
 		case !isBSVUserAgent(res.userAgent()):
 			outcome = "answered but is not a BSV node"
+			s.banNonBSVHost(addrString)
 		default:
 			// Promotes the address from new to tried, which is the entire point
 			// of the exercise. svnode's feeler clears the same bar at the same
@@ -443,6 +422,21 @@ func (s *server) shuttingDown() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func (s *server) banNonBSVHost(addrString string) {
+	if cfg.DisableBanning {
+		return
+	}
+
+	host, _, err := net.SplitHostPort(addrString)
+	if err != nil {
+		host = addrString
+	}
+
+	if err := s.banList.Add(s.ctx, host, time.Now().Add(cfg.BanDuration)); err != nil {
+		s.logger.Debugf("[Feeler] Cannot ban %s: %v", host, err)
 	}
 }
 

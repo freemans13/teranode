@@ -614,42 +614,61 @@ func TestFeelerPromotesAnAddressEndToEnd(t *testing.T) {
 // tried entry, that does not merely waste a probe -- it pushes out a real BSV
 // peer.
 func TestFeelerDoesNotPromoteNonBSVPeer(t *testing.T) {
-	ln, served := startFeelerTestListener(t, "/Satoshi:0.21.0/")
+	for _, tt := range []struct {
+		name           string
+		disableBanning bool
+		wantBanned     bool
+	}{
+		{name: "bans by default so it is not probed again", wantBanned: true},
+		{name: "disable banning still rejects without a ban", disableBanning: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, served := startFeelerTestListener(t, "/Satoshi:0.21.0/")
 
-	swapTestConfig(t, ln.Addr().String())
+			swapTestConfig(t, ln.Addr().String())
+			cfg.DisableBanning = tt.disableBanning
 
-	srv := newFeelerTestServer(t)
-	serveFeelerSnapshot(srv, feelerSnapshot{})
+			srv := newFeelerTestServer(t)
+			srv.banList = emptyWritableBanList(t)
+			serveFeelerSnapshot(srv, feelerSnapshot{})
 
-	// Two established automatic peers, so countFailedDial has the evidence it
-	// needs to hold an address responsible. Below that threshold an attempt is
-	// recorded but never counted, and the attempt tally would stay at zero for
-	// reasons that have nothing to do with this probe.
-	atLeastTwoAutomaticPeers(t, srv)
+			// Two established automatic peers, so countFailedDial has the evidence it
+			// needs to hold an address responsible. Below that threshold an attempt is
+			// recorded but never counted, and the attempt tally would stay at zero for
+			// reasons that have nothing to do with this probe.
+			atLeastTwoAutomaticPeers(t, srv)
 
-	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
-	srv.addrManager.AddAddress(na, testSourceAddr())
+			na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+			srv.addrManager.AddAddress(na, testSourceAddr())
 
-	// One probe, run inline, so the assertions below see a settled state rather
-	// than racing the loop. runOneProbe returns when the probe has finished
-	// deciding, which is what makes the promotion check meaningful: polling for
-	// the attempt instead would look at the address before the user agent had
-	// even been read, and would pass whatever the code did.
-	runOneProbe(srv)
+			// One probe, run inline, so the assertions below see a settled state rather
+			// than racing the loop. runOneProbe returns when the probe has finished
+			// deciding, which is what makes the promotion check meaningful: polling for
+			// the attempt instead would look at the address before the user agent had
+			// even been read, and would pass whatever the code did.
+			runOneProbe(srv)
 
-	select {
-	case <-served:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the probe never reached the listener")
+			select {
+			case <-served:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the probe never reached the listener")
+			}
+
+			require.Equal(t, uint64(1), srv.feelerAttempted.Load())
+			require.Equal(t, uint64(0), srv.feelerVerified.Load(),
+				"a node that is not a BSV node must never be promoted")
+
+			ka := srv.addrManager.UnverifiedAddress()
+			require.NotNil(t, ka, "the address must stay in the new table")
+			require.Positive(t, ka.Attempts(), "the attempt is still recorded against it")
+			require.Equal(t, tt.wantBanned, srv.banList.IsBanned("8.8.8.8"))
+
+			if tt.wantBanned {
+				require.Nil(t, srv.feelerCandidate(),
+					"a banned non-BSV address must not be drawn again")
+			}
+		})
 	}
-
-	require.Equal(t, uint64(1), srv.feelerAttempted.Load())
-	require.Equal(t, uint64(0), srv.feelerVerified.Load(),
-		"a node that is not a BSV node must never be promoted")
-
-	ka := srv.addrManager.UnverifiedAddress()
-	require.NotNil(t, ka, "the address must stay in the new table")
-	require.Positive(t, ka.Attempts(), "the attempt is still recorded against it")
 }
 
 // testSourceAddr is the "who told us about this address" address. It only has
@@ -658,9 +677,9 @@ func testSourceAddr() *wire.NetAddress {
 	return wire.NewNetAddressIPPort(net.ParseIP("173.194.115.1"), 8333, wire.SFNodeNetwork)
 }
 
-// bannedTestBanList returns a ban list already holding the given address. It is
-// backed by an in-memory database because Add writes through to storage.
-func bannedTestBanList(t *testing.T, ip string) *p2p.BanList {
+// emptyWritableBanList returns a ban list backed by an in-memory database,
+// which Add needs because it writes through to storage.
+func emptyWritableBanList(t *testing.T) *p2p.BanList {
 	t.Helper()
 
 	storeURL, err := url.Parse("sqlitememory://")
@@ -673,6 +692,15 @@ func bannedTestBanList(t *testing.T, ip string) *p2p.BanList {
 	require.NoError(t, bl.Init(t.Context()))
 
 	t.Cleanup(bl.Stop)
+
+	return bl
+}
+
+// bannedTestBanList returns a ban list already holding the given address.
+func bannedTestBanList(t *testing.T, ip string) *p2p.BanList {
+	t.Helper()
+
+	bl := emptyWritableBanList(t)
 	require.NoError(t, bl.Add(t.Context(), ip, time.Now().Add(time.Hour)))
 
 	return bl
@@ -694,6 +722,7 @@ func swapTestConfig(t *testing.T, redirectTo string) {
 		MaxPeers:        125,
 		MaxPeersPerIP:   5,
 		TrickleInterval: 10 * time.Second,
+		BanDuration:     24 * time.Hour,
 	}
 
 	c.dial = func(network, addr string, timeout time.Duration) (net.Conn, error) {
@@ -721,6 +750,7 @@ func newFeelerTestServer(t *testing.T) *server {
 	tSettings.Legacy.FeelerInterval = time.Millisecond
 
 	srv := &server{
+		ctx:         t.Context(),
 		logger:      ulogger.TestLogger{},
 		settings:    tSettings,
 		addrManager: addrmgr.New(ulogger.TestLogger{}, t.TempDir(), nil),
@@ -1051,4 +1081,8 @@ func TestBoundedDurationRefusesAConversionThatDoesNotFit(t *testing.T) {
 		"past MinInt64")
 	require.Equal(t, fallback, boundedDuration(math.NaN(), fallback),
 		"NaN loses every ordinary comparison, so the test has to be written to catch it")
+}
+
+func TestDefaultFeelerHandshakeTimeoutBeatsPeerNegotiateTimeout(t *testing.T) {
+	require.Less(t, defaultFeelerHandshakeTimeout, peer.NegotiateTimeout)
 }

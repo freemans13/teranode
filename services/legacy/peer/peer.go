@@ -58,9 +58,9 @@ const (
 	// messages.
 	pingInterval = 2 * time.Minute
 
-	// negotiateTimeout is the duration of inactivity before we timeout a
-	// peer that hasn't completed the initial version negotiation.
-	negotiateTimeout = 30 * time.Second
+	// NegotiateTimeout is how long a peer waits for the version handshake
+	// before hanging up.
+	NegotiateTimeout = 30 * time.Second
 
 	// stallTickInterval is the interval of time between each check for
 	// stalled peers.
@@ -2820,7 +2820,7 @@ func (p *Peer) start() error {
 		}
 	}()
 
-	// Negotiate the protocol within the specified negotiateTimeout.
+	// Negotiate the protocol within the specified NegotiateTimeout.
 	select {
 	case err := <-negotiateErr:
 		if err != nil {
@@ -2829,7 +2829,7 @@ func (p *Peer) start() error {
 
 			return err
 		}
-	case <-time.After(negotiateTimeout):
+	case <-time.After(NegotiateTimeout):
 		reason := "protocol negotiation timeout"
 		p.DisconnectWithWarning(reason)
 
