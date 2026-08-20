@@ -141,3 +141,19 @@ func releaseBlockNodes(b *model.Block) {
 
 	_ = b.ReleaseSubtreeNodes(PutNodeSlice)
 }
+
+// tryReleaseBlockNodes is releaseBlockNodes for the cache-eviction path, which
+// runs under expiringmap's own write lock and so must never block. It reports
+// whether the release happened; false means the block was busy and the caller
+// should decline the eviction so the next tick retries it.
+//
+// Its Close error is dropped for the same reason releaseBlockNodes drops it.
+func tryReleaseBlockNodes(b *model.Block) bool {
+	if b == nil {
+		return true
+	}
+
+	released, _ := b.TryReleaseSubtreeNodes(PutNodeSlice)
+
+	return released
+}

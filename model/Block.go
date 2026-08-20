@@ -1629,13 +1629,24 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 		}
 	}
 
-	// Close whatever survived the loaded-check before dropping the slice.
-	// Reallocating over an mmap-backed survivor would leak its mapping and its
-	// backing file, since nothing else holds a reference once the slice header
-	// is replaced. Nodes are not pooled here: the pool's put function lives in
-	// blockvalidation and this path has no access to it.
-	if closeErr := b.releaseSubtreeNodesLocked(nil); closeErr != nil {
-		logger.Warnf("[BLOCK][%s][ID %d] failed closing subtrees before reload: %v", b.Hash().String(), b.ID, closeErr)
+	// Close the mmap-backed survivors before dropping the slice. Reallocating
+	// over one would leak its mapping and its backing file, since nothing else
+	// holds a reference once the slice header is replaced.
+	//
+	// Heap-backed survivors are deliberately left alone: the block does not
+	// exclusively own them. blockvalidation's quick_validate puts the same
+	// *Subtree into both block.SubtreeSlices and the SubtreeWriteJob it queues
+	// on the shared write channel, and blockassembly aliases the processor's
+	// live job.Subtrees into a model.Block. Releasing one of those under a write
+	// worker races its Nodes and makes Serialize write a 0-leaf .subtree over a
+	// good one. Nothing is lost by leaving them: a heap subtree needs no Close,
+	// and dropping the reference is all the reallocation below has to do.
+	//
+	// This is safe precisely because the two sharing sites share heap-backed
+	// subtrees only — quick_validate builds the shared one with AddNode, and its
+	// mmap-capable branch queues a job that carries no Subtree at all.
+	if closeErr := b.closeMmapSubtreesLocked(); closeErr != nil {
+		logger.Warnf("[BLOCK][%s][ID %d] failed closing mmap subtrees before reload: %v", b.Hash().String(), b.ID, closeErr)
 	}
 
 	b.SubtreeSlices = make([]*subtreepkg.Subtree, len(b.Subtrees))
@@ -1789,6 +1800,27 @@ func (b *Block) ReleaseSubtreeNodes(put func([]subtreepkg.Node)) error {
 	return b.releaseSubtreeNodesLocked(put)
 }
 
+// TryReleaseSubtreeNodes is ReleaseSubtreeNodes for callers that must not block.
+// It reports whether the release happened: false means the block's subtree mutex
+// was held by someone else and nothing was touched.
+//
+// For callers running underneath another lock. blockvalidation's
+// lastValidatedBlocks eviction function runs inside expiringmap.clean(), which
+// holds the map's own write lock for the whole sweep, while
+// GetAndValidateSubtrees holds a block's subtree mutex across store reads with
+// retries and backoff. Blocking there parks the cleaner under the map lock and
+// queues every Get/Set/Delete on the cache behind a single block's I/O. Such a
+// caller should decline the eviction instead and let the next tick retry it —
+// clean() leaves a vetoed entry in place with its expiry unchanged.
+func (b *Block) TryReleaseSubtreeNodes(put func([]subtreepkg.Node)) (bool, error) {
+	if !b.subtreeSlicesMu.TryLock() {
+		return false, nil
+	}
+	defer b.subtreeSlicesMu.Unlock()
+
+	return true, b.releaseSubtreeNodesLocked(put)
+}
+
 // releaseSubtreeNodesLocked is ReleaseSubtreeNodes' body. The caller must hold
 // b.subtreeSlicesMu for writing.
 func (b *Block) releaseSubtreeNodesLocked(put func([]subtreepkg.Node)) error {
@@ -1802,6 +1834,50 @@ func (b *Block) releaseSubtreeNodesLocked(put func([]subtreepkg.Node)) error {
 		nodes := st.ReleaseNodes()
 		if nodes != nil && put != nil && !st.IsMmapBacked() {
 			put(nodes)
+		}
+
+		if err := st.Close(); err != nil {
+			closeErrs = append(closeErrs, errors.NewProcessingError("subtree %d", i, err))
+		}
+
+		b.SubtreeSlices[i] = nil
+	}
+
+	return errors.Join(closeErrs...)
+}
+
+// ReplaceSubtreeSlices swaps in a freshly built set of subtree slices under the
+// block's subtree mutex.
+//
+// Callers that reload a block's subtrees must build the replacement in a local
+// slice and hand it over here, rather than assigning SubtreeSlices and then
+// filling its entries. A block can be reachable from blockvalidation's
+// lastValidatedBlocks while it is being reloaded, and that cache's TTL cleaner
+// runs ReleaseSubtreeNodes on it under this same mutex — so an unlocked reload
+// races the release on both the slice header and its elements, and entries the
+// reload has just filled get nil-ed underneath it.
+func (b *Block) ReplaceSubtreeSlices(slices []*subtreepkg.Subtree) {
+	b.subtreeSlicesMu.Lock()
+	defer b.subtreeSlicesMu.Unlock()
+
+	b.SubtreeSlices = slices
+}
+
+// closeMmapSubtreesLocked Closes every mmap-backed subtree in SubtreeSlices and
+// nils its entry, leaving heap-backed subtrees untouched. The caller must hold
+// b.subtreeSlicesMu for writing.
+//
+// Used where the block is about to drop its references to the subtrees but may
+// not be their only holder. Closing is only needed for mmap-backed subtrees —
+// it unmaps the region and removes the backing file, which no finalizer would
+// ever do — and those are never shared, so this is the release that cannot harm
+// another holder. Returns the joined Close errors, if any.
+func (b *Block) closeMmapSubtreesLocked() error {
+	var closeErrs []error
+
+	for i, st := range b.SubtreeSlices {
+		if st == nil || !st.IsMmapBacked() {
+			continue
 		}
 
 		if err := st.Close(); err != nil {
