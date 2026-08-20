@@ -1964,13 +1964,19 @@ func (sp *serverPeer) OnReject(p *peer.Peer, msg *wire.MsgReject) {
 	sp.server.logger.Warnf("Received reject message from peer %s, cmd: %s, code: %s, reason: %s, hash: %s", p, msg.Cmd, msg.Code.String(), msg.Reason, msg.Hash.String())
 }
 
-// OnNotFound logs all not found messages received from the remote peer.
+// OnNotFound handles a not found message received from the remote peer.
+//
+// It used to only log. A notfound naming a block we asked this peer for has to
+// reach the sync manager: the peer has told us its copy is never coming, so its
+// obligation for that block must be discharged and the block put back into the
+// download walk, or it is stranded behind a forward-only cursor with nobody
+// owing it.
 func (sp *serverPeer) OnNotFound(p *peer.Peer, msg *wire.MsgNotFound) {
 	_, _, _ = tracing.Tracer("legacy").Start(sp.ctx, "serverPeer.OnNotFound",
 		tracing.WithHistogram(peerServerMetrics["OnNotFound"]),
 	)
 
-	sp.server.logger.Warnf("Received not found message from peer %s, %d not found invs", p, len(msg.InvList))
+	sp.server.syncManager.NotFound(msg, sp.Peer)
 }
 
 // OnRead is invoked when a peer receives a message and it is used to update

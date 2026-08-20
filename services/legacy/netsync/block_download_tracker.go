@@ -274,20 +274,28 @@ func (t *blockDownloadTracker) PeersWithDownloads() int {
 }
 
 // ClearPeer releases everything this peer owed us, so the next announcement of
-// any of those blocks fetches them from somewhere else.
-func (t *blockDownloadTracker) ClearPeer(p *peerpkg.Peer) {
+// any of those blocks fetches them from somewhere else. It returns the hashes it
+// released, which is what the caller needs to put the download walk back in
+// front of them: the walk is forward-only, so a block released here is behind
+// the cursor and nothing would ask for it again.
+func (t *blockDownloadTracker) ClearPeer(p *peerpkg.Peer) []chainhash.Hash {
 	if t == nil {
-		return
+		return nil
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	released := make([]chainhash.Hash, 0, len(t.byPeer[p]))
+
 	for h := range t.byPeer[p] {
+		released = append(released, h)
 		t.removeOwnerFromHashLocked(p, h)
 	}
 
 	delete(t.byPeer, p)
+
+	return released
 }
 
 // ForgetForRetryPeer reopens one peer's outstanding blocks for a fresh request

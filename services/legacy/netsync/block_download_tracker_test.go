@@ -12,6 +12,7 @@ import (
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +39,10 @@ func TestClearRequestedState_ActuallyReleasesTheHash(t *testing.T) {
 	h := chainhash.Hash{0x42}
 
 	sm := &SyncManager{
-		logger:         ulogger.TestLogger{},
+		logger: ulogger.TestLogger{},
+		// Real settings, because a departing peer's released blocks are now put
+		// back into the download walk and that is read off the fan-out setting.
+		settings:       test.CreateBaseTestSettings(t),
 		peerStates:     txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		blockDownloads: newBlockDownloadTracker(blockRequestAssignmentTTL),
 	}

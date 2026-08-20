@@ -1676,8 +1676,47 @@ func (sm *SyncManager) clearRequestedState(peer *peerpkg.Peer, state *peerSyncSt
 	state.requestedTxns.Clear()
 	state.requestedTxns.Stop()
 
-	// Release every block this peer owed us.
-	sm.blockDownloads.ClearPeer(peer)
+	// Release every block this peer owed us, and put the download walk back in
+	// front of them.
+	sm.reopenStrandedSlice(peer, sm.blockDownloads.ClearPeer(peer))
+}
+
+// reopenStrandedSlice moves the download cursor back onto the blocks a peer we
+// have just given up on was still carrying.
+//
+// It is reopenDemotedPeerSlice's other half. That one exists because a demoted
+// sync peer's slice would otherwise be recovered one block at a time by the
+// frontier race, at its stall window each; the same is true of every other peer
+// the scheduler hands a contiguous run to, and a departing peer is worse than a
+// demoted one — its blocks are owed by nobody at all, so nothing is ever coming.
+// Without the rewind the run sits behind a forward-only cursor, and because the
+// runs are ascending the lowest of them is routinely the front of the header
+// list, which is the block every commit behind it is waiting on. The escape is
+// then the sync peer's own 180-second stall window, and only if the sync peer is
+// also unhealthy — the frontier race declines to fire while the peer that owes
+// the frontier is pulling bytes at a healthy rate.
+//
+// Nothing here can bring back the duplicate-commit storm: these blocks are owed
+// by nobody once ClearPeer has run, so a re-walk hands each of them to exactly
+// one peer, and any hash the departing peer shared with a live peer still answers
+// true to RequestedWithin and is skipped.
+//
+// With the fan-out off this is dead weight: only the sync peer is ever asked for
+// a body, and its departure resets the header state, so there is no list left to
+// rewind.
+func (sm *SyncManager) reopenStrandedSlice(p *peerpkg.Peer, released []chainhash.Hash) {
+	if len(released) == 0 || !sm.settings.Legacy.MultiPeerBlockDownload {
+		return
+	}
+
+	lowestHeight, rewound := sm.rewindToLowestHeader(released)
+	if !rewound {
+		sm.logger.Debugf("[clearRequestedState] released %d blocks owed by %s, none of them still in the header list", len(released), p.String())
+
+		return
+	}
+
+	sm.logger.Infof("[clearRequestedState] released %d blocks owed by %s and moved the download cursor back to height %d", len(released), p.String(), lowestHeight)
 }
 
 // updateSyncPeer picks a new peer to sync from.
@@ -4438,6 +4477,76 @@ func (sm *SyncManager) QueueHeaders(headers *wire.MsgHeaders, peer *peerpkg.Peer
 	}
 
 	sm.msgChan <- &headersMsg{headers: headers, peer: peer}
+}
+
+// NotFound handles a peer telling us it does not have blocks we asked it for.
+//
+// A notfound is the peer discharging a getdata honestly, and the two things it
+// has to change are the two the log-only handler this replaces left alone: the
+// peer is no longer down for that block, and the block is wanted again. Neither
+// happens on its own. Ownership would otherwise stand for the hour-long
+// assignment ceiling, holding a queue slot the peer can never fill, and the
+// download walk is forward-only, so the hash sits behind the cursor with nobody
+// owing it — which is the same stranded state a departing peer leaves behind,
+// reached without losing the peer.
+//
+// It happens legitimately: take() deliberately falls back to a peer that has not
+// claimed the height rather than stopping the walk, and a pruned peer answers
+// notfound to every request for an old block.
+//
+// Only blocks this peer actually owed are touched, so a notfound naming a hash
+// somebody else is carrying — or one we never asked for — cannot move the cursor
+// or discharge anyone. Releasing rather than back-dating is deliberate: the peer
+// has told us its copy is not coming, so holding it to an obligation it has
+// already answered would spend its queue slot on nothing for the rest of the
+// hour.
+//
+// This runs on the caller's goroutine, which is the peer's read loop. It takes
+// the download ledger's leaf lock and then, released, the header lock; both are
+// held for pure in-memory work, so the read loop is never parked on I/O.
+//
+// With the fan-out off, the sync peer is the only peer ever asked for a body and
+// asking it again for a block it has just said it does not have has nowhere else
+// to go, so the old log-only behaviour is kept.
+func (sm *SyncManager) NotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) {
+	if atomic.LoadInt32(&sm.shutdown) != 0 {
+		return
+	}
+
+	sm.logger.Warnf("[NotFound] peer %s does not have %d of the items we asked it for", peer.String(), len(notFound.InvList))
+
+	if !sm.settings.Legacy.MultiPeerBlockDownload {
+		return
+	}
+
+	released := make([]chainhash.Hash, 0, len(notFound.InvList))
+
+	for _, iv := range notFound.InvList {
+		if iv.Type != wire.InvTypeBlock {
+			continue
+		}
+
+		if !sm.blockDownloads.HasOwner(peer, iv.Hash) {
+			continue
+		}
+
+		sm.blockDownloads.RemoveOwner(peer, iv.Hash)
+
+		released = append(released, iv.Hash)
+	}
+
+	if len(released) == 0 {
+		return
+	}
+
+	lowestHeight, rewound := sm.rewindToLowestHeader(released)
+	if !rewound {
+		sm.logger.Debugf("[NotFound] released %d blocks %s says it does not have, none of them still in the header list", len(released), peer.String())
+
+		return
+	}
+
+	sm.logger.Infof("[NotFound] released %d blocks %s says it does not have and moved the download cursor back to height %d", len(released), peer.String(), lowestHeight)
 }
 
 // DonePeer informs the blockmanager that a peer has disconnected.
