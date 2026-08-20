@@ -186,3 +186,139 @@ func TestSyncManager_AFreedInFlightSlotIsToppedUpMidRound(t *testing.T) {
 	require.True(t, sm.blockDownloads.RequestedWithin(next, time.Minute),
 		"a freed in-flight slot must be refilled, or the pipeline drains one block at a time until sync is serial")
 }
+
+// TestSyncManager_AGivenUpBlockAfterACheckpointTransitionIsAskedForAgain is the
+// third state the same guard has to get right, and it is the one neither test
+// above can see.
+//
+// A checkpoint transition does not rebuild the header list. It leaves the
+// checkpoint node in it as the next round's anchor and moves the checkpoint on
+// to the next one, which on mainnet is tens of thousands of blocks higher. So
+// for as long as it takes the next round of headers to arrive, the list holds
+// one node — the anchor — sitting far below the checkpoint height.
+//
+// A block from the round that has just finished can be given up on in that
+// window: it was parked when it arrived, its time ran out, and the sweep puts
+// the walk back on it. Its header node carries the epoch of a list that is still
+// the live list, so it goes back in — and because the list runs in ascending
+// height it goes in AHEAD of the anchor. The front of the list is now a block
+// this node wants and nobody has asked for since.
+//
+// Reading the answer off the list's tail cannot tell that state from the one
+// above it: the tail is the anchor either way, and it is below the checkpoint
+// height either way. So the top-up refuses to run, and the one thing that would
+// have asked for the given-up block again does nothing. Nothing else asks — the
+// getblocks the drop paths send is thrown away by processInvMsg while
+// headers-first mode is on — so the block is lost until the stall detector
+// rotates the peer.
+//
+// The end state asserted is the one sync needs: after the transition, a block
+// given up on is asked for again.
+func TestSyncManager_AGivenUpBlockAfterACheckpointTransitionIsAskedForAgain(t *testing.T) {
+	sm := newFetchLockManager(t, nil, nil, nil)
+
+	syncPeer, _, rec := connectRacePeer(t, 82, 1000)
+	registerRacePeer(sm, syncPeer)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	var nonce uint32
+
+	// A round of five headers ending on a checkpoint at a real mainnet
+	// checkpoint height, so that the transition finds a real next checkpoint
+	// above it — which is what puts the anchor below the checkpoint height.
+	anchor := chainhash.Hash{0xa9}
+	msg, round := linkedHeaders(anchor, 5, &nonce)
+	checkpoint := round[len(round)-1]
+
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 11111, Hash: &checkpoint}
+
+	sm.resetHeaderState(&anchor, 11106)
+	sm.headersFirstMode.Store(true)
+
+	// The batch reaches the checkpoint, so the anchor is trimmed and the round's
+	// first getdata goes out.
+	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
+
+	// The round is delivered in order. The second block's arrival takes its
+	// header off the front, and that header node is what the block carries with
+	// it into the park.
+	var parked *headerNode
+
+	sawCheckpoint := false
+
+	for i, hash := range round {
+		require.True(t, sm.blockDownloads.RequestedWithin(hash, time.Minute),
+			"the round's first fetch must have asked for %s", hash)
+
+		isCheckpoint, removed := sm.advanceHeaderListFor(hash)
+		if isCheckpoint {
+			sawCheckpoint = true
+		}
+
+		if i != 1 {
+			continue
+		}
+
+		require.NotNil(t, removed, "the block was the front, so its header came off the list with it")
+
+		parked = removed
+
+		// Parking releases the delivering peer's obligation: the block stops
+		// being outstanding, and nothing has gone into the chain for it.
+		sm.blockDownloads.Remove(hash)
+	}
+
+	require.True(t, sawCheckpoint, "the round must reach its checkpoint, or there is no transition to test")
+
+	// The transition. The checkpoint node stays in the list as the next round's
+	// anchor, and the checkpoint moves on to the one above it.
+	require.NoError(t, sm.checkpointBlockCommitted(syncPeer, checkpoint))
+
+	sm.headerMu.Lock()
+	afterTransition := sm.headerList.Front().Value.(*headerNode)
+	nextCheckpointHeight := sm.nextCheckpoint.Height
+	sm.headerMu.Unlock()
+
+	require.True(t, afterTransition.isAnchor, "the transition leaves the checkpoint node behind as the next round's anchor")
+	require.Greater(t, nextCheckpointHeight, afterTransition.height,
+		"the next round's checkpoint is far above the anchor, which is the whole window this test is about")
+
+	givenUp := round[1]
+
+	askedBefore := 0
+
+	for _, hash := range rec.all() {
+		if hash.IsEqual(&givenUp) {
+			askedBefore++
+		}
+	}
+
+	// The parked block's time runs out. The sweep gives it up and puts the walk
+	// back on it, ahead of the anchor.
+	require.True(t, sm.rewindHeaderCursor(givenUp, parked),
+		"the transition did not rebuild the list, so the header node still belongs in it")
+
+	sm.headerMu.Lock()
+	front := sm.headerList.Front().Value.(*headerNode)
+	sm.headerMu.Unlock()
+
+	require.Equal(t, givenUp.String(), front.hash.String(),
+		"the front of the list is the rewound header, not the anchor")
+
+	sm.fetchMoreHeaderBlocks(syncPeer)
+
+	require.True(t, sm.blockDownloads.RequestedWithin(givenUp, time.Minute),
+		"a block given up on after a checkpoint transition must be asked for again; while headers-first mode is on, nothing else will")
+
+	require.True(t, WaitUntil(func() bool {
+		asked := 0
+
+		for _, hash := range rec.all() {
+			if hash.IsEqual(&givenUp) {
+				asked++
+			}
+		}
+
+		return asked > askedBefore
+	}, 5*time.Second), "the getdata for the given-up block must actually reach the peer")
+}

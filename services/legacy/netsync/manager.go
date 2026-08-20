@@ -2528,9 +2528,9 @@ func (sm *SyncManager) processQueuedBlock(msg *blockQueueMsg) error {
 }
 
 // anchorIsStillTheFrontLocked reports whether the front of the header list is
-// the previous round's anchor: a block that is already in this node's chain,
-// kept in the list only so the next header can prove it links, and which no peer
-// will ever deliver to us again. The caller must hold headerMu.
+// an anchor: a block that is already in this node's chain, kept in the list only
+// so the next header can prove it links, and which no peer will ever deliver to
+// us again. The caller must hold headerMu.
 //
 // Nothing may fetch blocks while that is the front. The header list is only ever
 // advanced by a block that matches its front, so blocks fetched now arrive,
@@ -2543,35 +2543,40 @@ func (sm *SyncManager) processQueuedBlock(msg *blockQueueMsg) error {
 // sequential header round-trips — so that window is minutes wide, not an
 // instant.
 //
-// The list's own tail answers the question, with no extra state to keep in step.
-// handleHeadersMsg stops appending at the checkpoint height, and the one batch
-// that reaches it is the same batch that takes the anchor off the front. So a
-// tail below the checkpoint height means the round's headers are still coming in
-// and the anchor is still there; a tail at the checkpoint height means the
-// anchor has gone and the list from Front() on is the walk's own. Delivering
-// blocks only ever removes from the front, and the checkpoint node itself stays
-// to anchor the round after this one, so the tail does not move back down again
-// until the checkpoint advances — at which point what is left in the list really
-// is the next anchor.
+// The node says so itself: headerNode.isAnchor is set by the only two places
+// that ever create an anchor — resetHeaderStateLocked when it rebuilds the list,
+// and checkpointBlockCommitted for the checkpoint node it leaves behind to
+// anchor the round that follows. Asking the front node is the same question the
+// checkpoint trim asks (removeHeaderAnchorLocked) and the same one the frontier
+// racer asks before it publishes a front block, so all three now agree by
+// construction.
 //
-// With no checkpoint there is no anchor and no headers-first walk, so the answer
-// is no.
+// It used to be inferred from heights instead — a list whose tail was still
+// below the checkpoint height meant the round's headers were still coming in, so
+// the anchor must still be at the front. That is right while headers arrive and
+// wrong straight after a checkpoint transition: the transition leaves the anchor
+// far below the new checkpoint height, and a block given up on in that window is
+// put back into the list AHEAD of the anchor (reinsertHeaderLocked inserts by
+// height). The tail is the anchor and below the checkpoint either way, so the
+// height reading answered "the anchor is still the front" when the front was in
+// fact a block nobody had asked for since — and suppressed the one thing that
+// would have asked for it again.
 func (sm *SyncManager) anchorIsStillTheFrontLocked() bool {
-	if sm.headerList == nil || sm.nextCheckpoint == nil {
+	if sm.headerList == nil {
 		return false
 	}
 
-	back := sm.headerList.Back()
-	if back == nil {
+	front := sm.headerList.Front()
+	if front == nil {
 		return false
 	}
 
-	node, ok := back.Value.(*headerNode)
+	node, ok := front.Value.(*headerNode)
 	if !ok {
 		return false
 	}
 
-	return node.height < sm.nextCheckpoint.Height
+	return node.isAnchor
 }
 
 // removeHeaderAnchorLocked takes the round's anchor out of the header list, and
