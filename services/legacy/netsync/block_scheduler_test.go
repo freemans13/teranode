@@ -643,3 +643,114 @@ func TestScheduler_DoesNotAskTheBlockchainAboutBlocksItCannotHandOut(t *testing.
 	require.Equal(t, budget, blockHeaderLookups(t, sm)-before,
 		"a pass must not ask the blockchain about headers it has no budget to hand out")
 }
+
+// TestScheduler_TheNodeWideWindowCountsWhatIsAlreadyInFlight is the other half
+// of TestScheduler_RespectsTheNodeWideWindow. That one starts with an empty
+// ledger, so it cannot tell a node-wide ceiling from a per-pass one: with
+// nothing outstanding the two are the same number. This one starts with blocks
+// already in flight, which is the state every pass after the first runs in.
+//
+// The three outstanding blocks are owed by a peer that takes no part in the pass,
+// so the only budget they can touch is the node-wide window.
+func TestScheduler_TheNodeWideWindowCountsWhatIsAlreadyInFlight(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xd9}
+	msg, hashes := linkedHeaders(anchor, 10, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+	sm.settings.Legacy.BlockDownloadWindow = 5
+
+	syncPeer, syncRec := schedulerPeer(t, sm, 140, 1000)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	_, secondRec := schedulerPeer(t, sm, 141, 1000)
+
+	elsewhere, _, _ := connectRacePeer(t, 142, 1000)
+	for i := 0; i < 3; i++ {
+		require.True(t, sm.blockDownloads.Add(elsewhere, chainhash.Hash{0xf0, byte(i)}))
+	}
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return syncRec.count() == 2 }, 5*time.Second),
+		"the window's remaining two slots should have been requested")
+
+	require.Equal(t, 2, syncRec.count()+secondRec.count(),
+		"a node-wide window of 5 with 3 already in flight leaves 2, however many peers are available")
+	require.Equal(t, hashes[0:2], syncRec.all())
+	require.Equal(t, 5, sm.blockDownloads.Len(), "and the node is now at its window, not above it")
+
+	cursor, ok := startHeaderHash(t, sm)
+	require.True(t, ok, "the cursor must stay in the list")
+	require.Equal(t, hashes[2], cursor, "the first header the window could not cover must still be next")
+}
+
+// TestScheduler_ADisconnectedPeerIsNotAskedForAnything is the fan-out's own
+// admission test. QueueMessage returns silently for a peer whose socket has
+// gone, so nothing on the wire says the request was lost — but the ledger would
+// have recorded the blocks as owed by a peer that can never deliver them, and the
+// walk would have advanced past them into exactly the stranded state a departing
+// peer leaves behind.
+//
+// The disconnected peer is the only peer, so the pass has to place nothing at all
+// and leave the cursor where it is: advancing past a header nobody was asked for
+// loses that block from the walk for good.
+func TestScheduler_ADisconnectedPeerIsNotAskedForAnything(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xda}
+	msg, hashes := linkedHeaders(anchor, 6, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+
+	gone, goneRec := schedulerPeer(t, sm, 143, 1000)
+	sm.storeSyncPeer(gone, &syncPeerState{})
+
+	seedFetchHeaders(t, sm, gone, anchor, msg)
+
+	gone.DisconnectWithInfo("test: the peer's socket has gone")
+	require.True(t, WaitUntil(func() bool { return !gone.Connected() }, 5*time.Second),
+		"the peer should have registered as disconnected")
+
+	sm.fetchHeaderBlocks()
+
+	require.Zero(t, sm.blockDownloads.Len(),
+		"a block owed by a peer that cannot deliver it is a block nothing will ever ask for again")
+	require.Zero(t, goneRec.count())
+
+	cursor, ok := startHeaderHash(t, sm)
+	require.True(t, ok, "the cursor must stay in the list")
+	require.Equal(t, hashes[0], cursor, "and on the first header, which nobody was asked for")
+}
+
+// TestScheduler_ANonCandidatePeerIsNotAskedForAnything is the same admission
+// test for the other half of the rule. A peer we hold state for but have not
+// accepted as a sync candidate is not a body source either.
+func TestScheduler_ANonCandidatePeerIsNotAskedForAnything(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xdb}
+	msg, hashes := linkedHeaders(anchor, 6, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+
+	peer, peerRec := schedulerPeer(t, sm, 144, 1000)
+
+	seedFetchHeaders(t, sm, peer, anchor, msg)
+
+	state, exists := sm.peerStates.Get(peer)
+	require.True(t, exists)
+	state.syncCandidate = false
+
+	sm.fetchHeaderBlocks()
+
+	require.Zero(t, sm.blockDownloads.Len(), "a peer that is not a sync candidate must not be handed a slice")
+	require.Zero(t, peerRec.count())
+
+	cursor, ok := startHeaderHash(t, sm)
+	require.True(t, ok, "the cursor must stay in the list")
+	require.Equal(t, hashes[0], cursor)
+}

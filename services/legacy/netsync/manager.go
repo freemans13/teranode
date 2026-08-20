@@ -3196,8 +3196,11 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		return
 	}
 
-	sm.logger.Debugf("[fetchHeaderBlocks] Header list: %d blocks, in-flight: %d, avg size: %d bytes, budget: %d over %d peer(s)",
-		headerListLen, sm.blockDownloads.Len(), sm.blockSizeTracker.getAverageSize(), assigner.remaining, len(assigner.peers))
+	// Deliberately without sm.blockDownloads.Len(): a Debugf argument list is
+	// evaluated whether or not debug logging is on, and Len() walks every tracked
+	// hash under the ledger's lock on a path that runs for every arriving block.
+	sm.logger.Debugf("[fetchHeaderBlocks] Header list: %d blocks, avg size: %d bytes, budget: %d over %d peer(s)",
+		headerListLen, sm.blockSizeTracker.getAverageSize(), assigner.remaining, len(assigner.peers))
 
 	// A round asks about at most the blocks still wanted. Blocks we turn out to
 	// already have cost a slot in the round but not a request, so a second round
@@ -3367,10 +3370,14 @@ func (sm *SyncManager) commitHeaderCandidates(assigner *downloadAssigner, anchor
 		// ordinary forward walk, where a header is reached before it has ever
 		// been requested.
 		//
-		// A block skipped here is still owed by a live peer. If that peer never
-		// delivers it, recovery is ForgetForRetry on sync-peer rotation plus
-		// resetHeaderState — so anything that removes resetHeaderState-on-rotation
-		// has to replace that recovery, or a skipped block has no way back.
+		// A block skipped here is still owed by a live peer, and the walk moves
+		// past it, so what brings it back is one of the four things that put the
+		// cursor in front of it again: the peer is demoted as sync peer
+		// (reopenDemotedPeerSlice), it disconnects (reopenStrandedSlice), it
+		// answers notfound for it (NotFound), or — for the one block that is
+		// actually holding up commits — the frontier race asks a second peer
+		// without moving the cursor at all. Nothing else recovers a skipped
+		// block, so a change that removes one of those four has to replace it.
 		// A block still inside its transient-failure backoff must not be asked
 		// for yet — throttling the re-decorate storm is the whole point of the
 		// backoff — and it must not be walked past either, because the rewind
