@@ -82,6 +82,15 @@ func (sm *SyncManager) publishFrontier(now time.Time) {
 // actually been requested yet — fetchHeaderBlocks stops early once the in-flight
 // cap is reached, leaving startHeader sitting on the front node, and a block we
 // never asked for is not stuck, it is simply not wanted yet.
+//
+// The anchor is cleared for a different reason. While a round's headers are
+// still coming in, the front of the list is the previous round's anchor and the
+// cursor is on the first real header behind it, so the two checks above both
+// pass — and publishing it would have raceFrontierBlock ask a second peer for a
+// block that is already in this node's chain. Nobody is waiting for it, so it is
+// not the frontier; and the reply would take the anchor off the front early,
+// which is one of the two ways the checkpoint trim used to lose a real header
+// (see removeHeaderAnchorLocked).
 func (sm *SyncManager) publishFrontierLocked(now time.Time) {
 	if !sm.headersFirstMode.Load() || sm.headerList == nil {
 		sm.clearFrontier()
@@ -95,7 +104,7 @@ func (sm *SyncManager) publishFrontierLocked(now time.Time) {
 	}
 
 	node, ok := front.Value.(*headerNode)
-	if !ok || node.hash == nil {
+	if !ok || node.hash == nil || node.isAnchor {
 		sm.clearFrontier()
 		return
 	}

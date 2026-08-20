@@ -225,6 +225,23 @@ type headerNode struct {
 	// older epoch than the list it is being handed back to, and must not be put
 	// into it. See rewindHeaderCursor and SyncManager.headerListEpoch.
 	listEpoch uint64
+	// isAnchor marks a node that is in the list only so the next header can
+	// prove it links: its block is already in this node's chain, and no peer
+	// will ever deliver it to us again. resetHeaderStateLocked pushes one when
+	// the list is rebuilt, and checkpointBlockCommitted marks the checkpoint
+	// node it leaves behind to anchor the round that follows. Nothing else sets
+	// it, and it is never cleared — an anchor stops being one by leaving the
+	// list.
+	//
+	// It is recorded on the node rather than worked out from the node's
+	// position, because position lies. Two of this package's own mechanisms put
+	// something other than the anchor at the front of the list: a rewind after a
+	// checkpoint transition inserts a lower header ahead of it
+	// (reinsertHeaderLocked), and a peer can deliver the anchor early, which
+	// takes it out of the list altogether. So "the front" and "the anchor" are
+	// not the same node, and the one place that has to tell them apart is
+	// removeHeaderAnchorLocked.
+	isAnchor bool
 }
 
 // peerSyncState stores additional information that the SyncManager tracks
@@ -769,7 +786,10 @@ func (sm *SyncManager) resetHeaderStateLocked(newestHash *chainhash.Hash, newest
 	// block into the header pool.  This allows the next downloaded header
 	// to prove it links to the chain properly.
 	if sm.nextCheckpoint != nil {
-		node := headerNode{height: newestHeight, hash: newestHash, listEpoch: sm.headerListEpoch}
+		// isAnchor: this block is already in the database. It is here to be
+		// linked to and then removed, which is what the trim at the next
+		// checkpoint has to be able to recognise.
+		node := headerNode{height: newestHeight, hash: newestHash, listEpoch: sm.headerListEpoch, isAnchor: true}
 		sm.indexHeaderLocked(sm.headerList.PushBack(&node), *newestHash)
 	}
 }
@@ -2431,6 +2451,17 @@ func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash ch
 	// getheaders send and the loadSyncPeer lookup below stay outside the lock.
 	sm.headerMu.Lock()
 
+	// advanceHeaderListFor leaves the checkpoint node in the list so the next
+	// round's first header can prove it links to it. That makes it the next
+	// round's anchor: a block now in this node's chain that no peer will deliver
+	// again. Say so on the node, because this is the moment it becomes true and
+	// nothing later can work it out from where the node sits — see headerNode.
+	if e := sm.headerIndex[blockHash]; e != nil {
+		if node, ok := e.Value.(*headerNode); ok {
+			node.isAnchor = true
+		}
+	}
+
 	if sm.nextCheckpoint == nil {
 		sm.headerMu.Unlock()
 
@@ -2541,6 +2572,73 @@ func (sm *SyncManager) anchorIsStillTheFrontLocked() bool {
 	}
 
 	return node.height < sm.nextCheckpoint.Height
+}
+
+// removeHeaderAnchorLocked takes the round's anchor out of the header list, and
+// does nothing if it has already gone. The caller must hold headerMu.
+//
+// It is what handleHeadersMsg does when a batch reaches the checkpoint, and it
+// used to be "remove Front()" on the strength of a comment: the first entry of
+// the list is always the block already in the database. Two of this package's
+// own mechanisms make that false, and both cost the round a real header.
+//
+// A rewind after a checkpoint transition inserts a lower header AHEAD of the
+// anchor — reinsertHeaderLocked inserts by height, and the epoch check that
+// stops a stale node going back into a rebuilt list does not fire at a
+// transition, because a transition does not rebuild the list. Removing the front
+// there deletes the block that was just put back to be asked for again, from the
+// list and from the index, and leaves the anchor in place to wedge the front
+// once more.
+//
+// And the frontier racer can have the anchor delivered early: while the headers
+// are still coming in the front is the anchor and the cursor is on the first
+// real header, so publishFrontierLocked used to publish the anchor as the
+// frontier and raceFrontierBlock would ask a second peer for it. That reply
+// takes the anchor off the front, so the trim then deletes the round's FIRST
+// REAL HEADER — every block above it in the round arrives as an orphan of a
+// block nobody will ask for again, the checkpoint block parks with them, and the
+// round stalls until the stall detector rotates the peer. publishFrontierLocked
+// now refuses to publish an anchor, which closes that at source; this closes it
+// at the one point both routes pass through.
+//
+// So the anchor is removed by identity, wherever it sits. Anything still marked
+// as an anchor is a block already in our chain (see headerNode.isAnchor), and
+// keeping one anywhere in the list wedges the walk as soon as the front reaches
+// it. The loop runs the whole list rather than stopping at the first hit,
+// because leaving a second one behind would be the same bug one round later; in
+// practice there is exactly one, at or near the front.
+func (sm *SyncManager) removeHeaderAnchorLocked() {
+	if sm.headerList == nil {
+		return
+	}
+
+	for e := sm.headerList.Front(); e != nil; {
+		next := e.Next()
+
+		node, ok := e.Value.(*headerNode)
+		if !ok || !node.isAnchor {
+			e = next
+
+			continue
+		}
+
+		if node.hash != nil {
+			sm.unindexHeaderLocked(e, *node.hash)
+		}
+
+		// The cursor must not be left on a detached element: startHeader is what
+		// every walk starts from, and an element out of the list answers Next()
+		// with nil, so the round would ask for nothing at all. Nil is the right
+		// answer when there is nothing behind the anchor — that is what
+		// re-enables the getblocks fallback.
+		if sm.startHeader == e {
+			sm.startHeader = next
+		}
+
+		sm.headerList.Remove(e)
+
+		e = next
+	}
 }
 
 // fetchMoreHeaderBlocks tops the download pipeline back up after a block from
@@ -3169,21 +3267,14 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// When this header is a checkpoint, switch to fetching the blocks for
 	// all the headers since the last checkpoint.
 	if receivedCheckpoint {
-		// Since the first entry of the list is always the final block
-		// that is already in the database and is only used to ensure
-		// the next header links properly, it must be removed before
-		// fetching the blocks.
+		// The round's anchor is a block already in this node's database, in the
+		// list only so this round's first header could prove it links. It has to
+		// go before any of these blocks is asked for: the list is advanced by an
+		// arriving block matching its front, and no peer will ever deliver the
+		// anchor again.
 		sm.headerMu.Lock()
 
-		// Front() was dereferenced unguarded here before the index forced this
-		// line to be rewritten; an empty list would have panicked.
-		if front := sm.headerList.Front(); front != nil {
-			if node, ok := front.Value.(*headerNode); ok && node.hash != nil {
-				sm.unindexHeaderLocked(front, *node.hash)
-			}
-
-			sm.headerList.Remove(front)
-		}
+		sm.removeHeaderAnchorLocked()
 
 		remaining := sm.headerList.Len()
 		sm.headerMu.Unlock()
