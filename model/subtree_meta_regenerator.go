@@ -282,8 +282,10 @@ func (r *SubtreeMetaRegenerator) buildAndStoreMeta(ctx context.Context, subtreeH
 	}
 
 	r.storeRegeneratedMeta(ctx, subtreeHash, meta)
-	r.logger.Warnf("[RegenerateMeta][%s] successfully regenerated meta", subtreeHash.String())
 
+	// The outcome is logged by RegenerateMeta, at Info and naming the source that
+	// worked. Repeating it here — at Warn, and without the source — is the noise
+	// the aggregated failure line was meant to remove, not add to.
 	return meta, nil
 }
 
