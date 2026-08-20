@@ -197,37 +197,20 @@ func (sm *SyncManager) livePeer(recorded *peerpkg.Peer) *peerpkg.Peer {
 // the rewound cursor out with it, and a node would sit on a perfectly good
 // cursor until the stall detector rotated the peer and threw the cursor away.
 //
-// It sends the walk out again ONLY when the cursor is sitting on the front of
-// the header list, and that condition is the whole of its safety.
+// It used to check that the cursor was sitting on the front of the list before
+// sending anything, and to call that check the whole of its safety. The rule it
+// was reaching for — nothing may fetch while the round's anchor is still the
+// front — now lives in fetchMoreHeaderBlocks, which is the one place all three
+// of the top-up callers pass through, and it is stated there as a fact about the
+// list rather than about the cursor. What is left of the old check is an
+// accident: "the cursor is on the front" is also false during an ordinary
+// forward walk, where the cursor is deliberately ahead of the front, so the
+// ticker declined to top the pipeline up in exactly the state the top-up exists
+// for. Keeping it would have meant keeping a condition no test could hold to
+// account, next to a comment claiming it was load-bearing.
 //
-// A rewound cursor is on the front: a block that was the front when it arrived
-// goes back on the front, because headers only ever leave the list from there.
-// So the case this exists for is covered. What the condition excludes is the
-// window between the header batches of a checkpoint round, where the front is
-// still the PREVIOUS round's anchor — a block already in the chain, which no
-// peer will ever deliver again — and the cursor is on the first real header
-// behind it. Fetching there wedges the round: the blocks arrive, none of them
-// matches the front, so none comes off the list; the checkpoint batch then
-// trims the anchor and the front becomes a block that has already been
-// delivered, which nothing after it will ever match either. The checkpoint
-// block is never recognised as the checkpoint, the next round of headers is
-// never asked for, and sync sits until the stall detector rotates the peer.
-//
-// The other thing it excludes is an ordinary forward walk, where the cursor has
-// been advanced past the front by the requests already in flight. Nothing is
-// owed there: arriving blocks top the pipeline up by themselves.
-//
-// Called from the park sweep's ticker, on the block-queue consumer, so it costs
-// one comparison per tick when there is nothing to do.
+// Called from the park sweep's ticker, on the block-queue consumer.
 func (sm *SyncManager) resumeHeaderWalk() {
-	sm.headerMu.Lock()
-	cursorOnTheFront := sm.headerList != nil && sm.startHeader != nil && sm.startHeader == sm.headerList.Front()
-	sm.headerMu.Unlock()
-
-	if !cursorOnTheFront {
-		return
-	}
-
 	sm.fetchMoreHeaderBlocks(sm.loadSyncPeer())
 }
 
