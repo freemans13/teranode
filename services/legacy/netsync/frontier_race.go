@@ -16,13 +16,19 @@ import (
 // headers-first sync.
 //
 // Blocks are committed strictly in order, so the oldest block we have asked for
-// and not yet received — the download frontier — gates everything behind it.
-// Every block body is requested from the sync peer, so if that peer silently
-// drops one getdata, sync simply stops. The only response available today is the
-// 180-second sync-peer stall timer, which disconnects the peer and then throws
-// away the entire downloaded header list (resetHeaderState), forcing a fresh
-// getheaders round from someone else. One dropped request therefore costs three
-// minutes of nothing plus a full header re-download.
+// and not yet received — the download frontier — gates everything behind it. If
+// the peer carrying it silently drops the getdata, sync simply stops. The only
+// other response is the 180-second sync-peer stall timer, which with the fan-out
+// off disconnects the peer and throws away the entire downloaded header list
+// (resetHeaderState), forcing a fresh getheaders round from someone else. One
+// dropped request therefore costs three minutes of nothing plus a full header
+// re-download.
+//
+// This file was written when every block body was requested from the sync peer,
+// so "the peer that owes the frontier" and "the sync peer" were the same peer
+// and the code said the latter. With the scheduler they are routinely different
+// peers, and everything below asks about the owner of the frontier hash instead:
+// the ledger knows who owes it.
 //
 // Instead, once the frontier has sat unchanged for legacy_blockSlowFetchTimeout,
 // we send one additional getdata for that single hash to one more connected peer
@@ -148,9 +154,13 @@ func (sm *SyncManager) setFrontier(hash chainhash.Hash, height int32, now time.T
 //   - we already have as many peers on it as configuration allows;
 //   - we are throttling our own network reads because local validation is
 //     behind, in which case the silence is ours, not the peer's;
-//   - the sync peer's connection is visibly pulling bytes, which means it is
-//     part-way through a large block rather than ignoring us — racing a peer
-//     mid-transfer just buys a duplicate of a download that is already working;
+//   - the sync peer owes the frontier and its connection is visibly pulling
+//     bytes, which means it is part-way through a large block rather than
+//     ignoring us — racing a peer mid-transfer just buys a duplicate of a
+//     download that is already working. The sample is only consulted when the
+//     sync peer is the peer that owes the block, because it is the only
+//     download-throughput sample this node keeps and it says nothing about
+//     anybody else's connection;
 //   - there is nobody else worth asking.
 func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32, *peerpkg.Peer, bool) {
 	var none chainhash.Hash
@@ -208,7 +218,13 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	// downloading. That is the safe bias here: the worst case is one duplicate
 	// block from a peer that turned out to be fine, whereas the opposite bias
 	// would let a genuinely silent peer hide behind a missing measurement.
-	if sps.hasHealthyDownloadThroughput(sm.minSyncPeerNetworkSpeed) {
+	//
+	// Consulted only when the sync peer is the peer that owes this block. With
+	// the fan-out off that is always true and this reads exactly as it did
+	// before. With it on, a frontier owed by another peer used to be suppressed
+	// by the sync peer's healthy run of its own later slice — which is precisely
+	// the state the race was built for, and the one state it never fired in.
+	if sm.blockDownloads.HasOwner(sp, hash) && sps.hasHealthyDownloadThroughput(sm.minSyncPeerNetworkSpeed) {
 		return none, 0, nil, false
 	}
 
@@ -217,7 +233,16 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	}
 
 	for p, state := range sm.peerStates.Range() {
-		if p == sp || state == nil || !state.syncCandidate || !p.Connected() {
+		if state == nil || !state.syncCandidate || !p.Connected() {
+			continue
+		}
+
+		// Skip whoever already owes us this block, rather than skipping the sync
+		// peer. They were the same test while the sync peer carried every body;
+		// now the peer sitting on the frontier is often another one, and asking
+		// it again buys nothing while the sync peer — the one peer this used to
+		// rule out — is frequently the healthiest peer available to ask.
+		if sm.blockDownloads.HasOwner(p, hash) {
 			continue
 		}
 

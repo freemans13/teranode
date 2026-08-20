@@ -231,6 +231,12 @@ func TestFrontierRaceTarget(t *testing.T) {
 		sm.storeSyncPeer(syncPeer, &syncPeerState{})
 		sm.setFrontier(chainhash.Hash{0xcc}, 500, stale())
 
+		// A frontier is by definition a block we have already asked somebody for
+		// — publishFrontier will not publish one we have not — and unless a case
+		// says otherwise that somebody is the sync peer, which is the only shape
+		// this path had before the scheduler existed.
+		sm.blockDownloads.Add(syncPeer, chainhash.Hash{0xcc})
+
 		return sm
 	}
 
@@ -293,7 +299,7 @@ func TestFrontierRaceTarget(t *testing.T) {
 		require.False(t, ok)
 	})
 
-	t.Run("sync peer is still pulling bytes", func(t *testing.T) {
+	t.Run("the peer that owes the frontier is still pulling bytes", func(t *testing.T) {
 		sm := setup(t)
 		sm.storeSyncPeer(syncPeer, &syncPeerState{
 			ticks:                  1,
@@ -302,6 +308,28 @@ func TestFrontierRaceTarget(t *testing.T) {
 		})
 		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok, "a peer mid-transfer of a large block is slow, not stalled")
+	})
+
+	// The throughput sample this node keeps belongs to the sync peer, and under
+	// the fan-out the frontier is routinely owed by somebody else — so the
+	// sample can suppress the race for a block it knows nothing about. That is
+	// the state the race exists for: everything behind the frontier is piling up
+	// in the park while the sync peer's own later run comes in at a healthy rate,
+	// and nothing else fires until the sync peer's 180-second stall window ends.
+	t.Run("a healthy sync peer does not speak for a frontier another peer owes", func(t *testing.T) {
+		sm := setup(t)
+		sm.blockDownloads.RemoveOwner(syncPeer, chainhash.Hash{0xcc})
+		sm.blockDownloads.Add(other, chainhash.Hash{0xcc})
+		sm.storeSyncPeer(syncPeer, &syncPeerState{
+			ticks:                  1,
+			assocReadBytes:         64 << 20,
+			assocReadBytesLastTick: 0,
+		})
+
+		_, _, target, ok := sm.frontierRaceTarget(time.Now())
+		require.True(t, ok, "the sync peer's throughput says nothing about a block another peer owes")
+		require.Equal(t, syncPeer, target,
+			"and the peer already sitting on the block must not be asked for it twice, which leaves the sync peer")
 	})
 
 	t.Run("no sync peer", func(t *testing.T) {
