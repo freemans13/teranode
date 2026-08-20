@@ -25,17 +25,29 @@ import (
 type getDataRecorder struct {
 	mu     sync.Mutex
 	hashes []chainhash.Hash
+	msgs   int
 }
 
 func (r *getDataRecorder) record(msg *wire.MsgGetData) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	r.msgs++
+
 	for _, iv := range msg.InvList {
 		if iv.Type == wire.InvTypeBlock {
 			r.hashes = append(r.hashes, iv.Hash)
 		}
 	}
+}
+
+// messages reports how many getdata messages arrived, as distinct from how many
+// hashes they carried between them.
+func (r *getDataRecorder) messages() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.msgs
 }
 
 func (r *getDataRecorder) count() int {

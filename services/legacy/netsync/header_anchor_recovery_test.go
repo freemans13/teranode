@@ -88,7 +88,7 @@ func TestFetchHeaderBlocks_QueuedHeadersAreStillFetchedAfterTheAnchorLeavesTheLi
 	// message. It must pick the queued headers up.
 	sm.fetchHeaderBlocks()
 
-	maxBlocks := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	maxBlocks := schedulerPeerBudget(sm)
 
 	want := make([]chainhash.Hash, 0, maxBlocks)
 	for i := 1; i < len(hashes) && len(want) < maxBlocks; i++ {

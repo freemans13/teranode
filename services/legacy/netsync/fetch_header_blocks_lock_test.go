@@ -158,10 +158,10 @@ func TestFetchHeaderBlocks_DoesNotHoldTheHeaderLockAcrossTheBlockchainLookup(t *
 
 // TestFetchHeaderBlocks_RequestsExactlyTheBlocksItRequestedBefore pins the
 // contents of the getdata, so the restructure cannot quietly change what is
-// asked for. With nothing racing, one pass must ask for the first
-// maxInFlightBlocks headers it does not already have, in list order, skipping
-// the ones we hold without requesting them and without leaving them behind, and
-// must leave startHeader on the first header it did not consider.
+// asked for. With nothing racing and one peer to ask, one pass must ask for the
+// first budget's worth of headers it does not already have, in list order,
+// skipping the ones we hold without requesting them and without leaving them
+// behind, and must leave startHeader on the first header it did not consider.
 func TestFetchHeaderBlocks_RequestsExactlyTheBlocksItRequestedBefore(t *testing.T) {
 	const seeded = 30
 
@@ -186,7 +186,8 @@ func TestFetchHeaderBlocks_RequestsExactlyTheBlocksItRequestedBefore(t *testing.
 
 	sm.fetchHeaderBlocks()
 
-	maxBlocks := sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	// One pass, one peer: what bounds it is that peer's own budget.
+	maxBlocks := schedulerPeerBudget(sm)
 
 	// Everything in list order except the two we already hold, capped at the
 	// in-flight limit.
@@ -418,10 +419,12 @@ func TestCommitHeaderCandidates_RefusesASecondCommitFromTheSameSnapshot(t *testi
 
 	alreadyHave := make([]bool, len(snapshot))
 
-	first := wire.NewMsgGetData()
-	requested, _ := sm.commitHeaderCandidates(syncPeer, anchorEl, anchorHash, snapshot, alreadyHave, first)
+	firstAssigner := sm.newDownloadAssigner()
+	require.NotNil(t, firstAssigner, "one connected sync candidate is all a pass needs")
+
+	requested, _ := sm.commitHeaderCandidates(firstAssigner, anchorEl, anchorHash, snapshot, alreadyHave)
 	require.Equal(t, len(snapshot), requested, "the first round should request every header it walked")
-	require.Len(t, first.InvList, len(snapshot))
+	require.Len(t, firstAssigner.peers[0].getData.InvList, len(snapshot))
 
 	sm.headerMu.Lock()
 	afterFirst := sm.startHeader
@@ -434,11 +437,13 @@ func TestCommitHeaderCandidates_RefusesASecondCommitFromTheSameSnapshot(t *testi
 	sm.headerMu.Unlock()
 	require.True(t, stillIndexed, "the first commit removes nothing, so the anchor is still the live holder of its hash")
 
-	second := wire.NewMsgGetData()
-	requestedAgain, more := sm.commitHeaderCandidates(syncPeer, anchorEl, anchorHash, snapshot, alreadyHave, second)
+	secondAssigner := sm.newDownloadAssigner()
+	require.NotNil(t, secondAssigner)
+
+	requestedAgain, more := sm.commitHeaderCandidates(secondAssigner, anchorEl, anchorHash, snapshot, alreadyHave)
 
 	require.Zero(t, requestedAgain, "a round whose headers another round already took must request nothing")
-	require.Empty(t, second.InvList, "no block may be asked for a second time off the same snapshot")
+	require.Nil(t, secondAssigner.peers[0].getData, "no block may be asked for a second time off the same snapshot")
 
 	require.False(t, more, "there is nothing more to do with a snapshot that has been overtaken")
 
