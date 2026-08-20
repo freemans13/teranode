@@ -70,20 +70,32 @@ func newRefusedBlock(t *testing.T, peerIdx uint8, backoffBase time.Duration) *re
 
 	t.Cleanup(func() { sm.blockFailureBackoff.Stop(); sm.recentlyFailedBlocks.Stop() })
 
-	checkpointHash := chainhash.Hash{0xcd}
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 1_000_000, Hash: &checkpointHash}
+	// The round's checkpoint is the last of these headers. That is the shape a
+	// real round has, and it is the only shape in which blocks are fetched at
+	// all: handleHeadersMsg appends up to the checkpoint height, and the batch
+	// that reaches it is the same batch that takes the previous round's anchor
+	// off the front and starts the download walk. Parking the checkpoint far
+	// above the list instead leaves the node in the first half of a round, where
+	// the front is still an anchor already in the chain and nothing may ask for
+	// a block — so the walk under test would never run in production at all.
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 15, Hash: &hashes[len(hashes)-1]}
 
 	syncPeer, _, _ := connectRacePeer(t, peerIdx, 1000)
 	registerRacePeer(sm, syncPeer)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
-	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+	sm.resetHeaderState(&anchor, 10)
+	// resetHeaderState turns headers-first mode off; the walk under test only
+	// runs in headers-first mode.
+	sm.headersFirstMode.Store(true)
 
-	// The anchor block arrives, so the first real header becomes the front.
-	sm.blockDownloads.Add(syncPeer, anchor)
-	_ = sm.handleBlockMsg(&blockQueueMsg{blockHash: anchor, peer: syncPeer})
+	// Reaching the checkpoint is what trims the anchor and sends the round's
+	// first getdata, so this one call puts the node in the state the tests
+	// below start from.
+	sm.handleHeadersMsg(&headersMsg{headers: msg, peer: syncPeer})
 
-	sm.fetchHeaderBlocks()
+	require.Equal(t, len(hashes), sm.headerListLen(),
+		"the checkpoint batch links all five headers and takes the anchor off the front")
 
 	require.True(t, WaitUntil(func() bool { return sm.blockDownloads.RequestedWithin(failing, time.Minute) }, 5*time.Second),
 		"the front block should have been asked for")

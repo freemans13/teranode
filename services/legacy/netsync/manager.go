@@ -2496,10 +2496,66 @@ func (sm *SyncManager) processQueuedBlock(msg *blockQueueMsg) error {
 	return err
 }
 
+// anchorIsStillTheFrontLocked reports whether the front of the header list is
+// the previous round's anchor: a block that is already in this node's chain,
+// kept in the list only so the next header can prove it links, and which no peer
+// will ever deliver to us again. The caller must hold headerMu.
+//
+// Nothing may fetch blocks while that is the front. The header list is only ever
+// advanced by a block that matches its front, so blocks fetched now arrive,
+// match nothing and stay in the list; then the batch that reaches the checkpoint
+// trims the anchor and the front becomes a block that has already been
+// delivered, which nothing after it matches either. The checkpoint block is
+// never recognised as the checkpoint, the next round of headers is never asked
+// for, and sync sits until the 180-second stall detector rotates the peer and
+// rebuilds the list. Mainnet checkpoint gaps run to 50,000 blocks — 25
+// sequential header round-trips — so that window is minutes wide, not an
+// instant.
+//
+// The list's own tail answers the question, with no extra state to keep in step.
+// handleHeadersMsg stops appending at the checkpoint height, and the one batch
+// that reaches it is the same batch that takes the anchor off the front. So a
+// tail below the checkpoint height means the round's headers are still coming in
+// and the anchor is still there; a tail at the checkpoint height means the
+// anchor has gone and the list from Front() on is the walk's own. Delivering
+// blocks only ever removes from the front, and the checkpoint node itself stays
+// to anchor the round after this one, so the tail does not move back down again
+// until the checkpoint advances — at which point what is left in the list really
+// is the next anchor.
+//
+// With no checkpoint there is no anchor and no headers-first walk, so the answer
+// is no.
+func (sm *SyncManager) anchorIsStillTheFrontLocked() bool {
+	if sm.headerList == nil || sm.nextCheckpoint == nil {
+		return false
+	}
+
+	back := sm.headerList.Back()
+	if back == nil {
+		return false
+	}
+
+	node, ok := back.Value.(*headerNode)
+	if !ok {
+		return false
+	}
+
+	return node.height < sm.nextCheckpoint.Height
+}
+
 // fetchMoreHeaderBlocks tops the download pipeline back up after a block from
 // this peer stopped being outstanding, whether it was committed or parked.
 // Without it a parked block is a silent loss of one in-flight slot, and the
 // pipeline drains one block at a time until nothing is outstanding at all.
+//
+// All three of its callers — a block accepted into the park, a parked block
+// committed off disk, and the park sweep's ticker carrying a rewound cursor
+// forward — can run while the round's anchor is still the front of the header
+// list, so the check that says "not yet" lives here rather than in any one of
+// them. It is deliberately not the check the ticker makes: "the cursor is on the
+// front" is true of a rewound cursor and false of an ordinary forward walk,
+// which is right for driving the walk from a timer and would silently switch off
+// the top-up this function exists for.
 func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
 	if !sm.headersFirstMode.Load() || sm.blockSizeTracker == nil {
 		return
@@ -2507,7 +2563,12 @@ func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
 
 	sm.headerMu.Lock()
 	haveMoreHeaders := sm.startHeader != nil
+	anchorIsStillTheFront := sm.anchorIsStillTheFrontLocked()
 	sm.headerMu.Unlock()
+
+	if anchorIsStillTheFront {
+		return
+	}
 
 	if haveMoreHeaders && sm.blockDownloads.CountForPeer(peer) < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
 		sm.fetchHeaderBlocks()
