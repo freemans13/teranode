@@ -358,3 +358,60 @@ func TestTryReleaseSubtreeNodes_DoesNotBlockOnABusyBlock(t *testing.T) {
 	require.True(t, released, "an idle block must be released, or eviction would never reclaim anything")
 	require.Nil(t, b.SubtreeSlices[0], "a successful release must nil the entry")
 }
+
+// TestGetAndValidateSubtrees_ReloadDoesNotWriteIntoACallerOwnedArray pins that
+// the reload leaves the SubtreeSlices array itself alone.
+//
+// A block's SubtreeSlices can be the caller's own slice rather than one the
+// block allocated: blockassembly builds a model.Block with
+// SubtreeSlices: job.Subtrees and calls Valid on it, sharing the backing array
+// with the live subtree processor. Writing nil into an element there reaches
+// straight into the processor's state — the block replaces its own header a
+// moment later, so nothing is gained by nil-ing first.
+func TestGetAndValidateSubtrees_ReloadDoesNotWriteIntoACallerOwnedArray(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	blobStore := blobmemory.New()
+
+	first, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, first.AddCoinbaseNode())
+	require.NoError(t, first.AddNode(chainhash.HashH([]byte("owned-a")), 1, 0))
+	storeSubtree(t, blobStore, first)
+
+	second, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, second.AddNode(chainhash.HashH([]byte("owned-b0")), 1, 0))
+	require.NoError(t, second.AddNode(chainhash.HashH([]byte("owned-b1")), 1, 0))
+	storeSubtree(t, blobStore, second)
+
+	serialized, err := first.Serialize()
+	require.NoError(t, err)
+
+	// An mmap-backed entry, because that is the only kind the reload's close
+	// touches — so it is the entry that would be nil-ed in the caller's array.
+	mmapSt, err := subtreepkg.NewSubtreeFromReaderMmap(bytes.NewReader(serialized), t.TempDir())
+	require.NoError(t, err)
+	require.True(t, mmapSt.IsMmapBacked())
+
+	// The caller's array, shared with the block the way blockassembly shares
+	// job.Subtrees.
+	callerOwned := []*subtreepkg.Subtree{mmapSt, nil}
+
+	b, err := NewBlock(newTestBlockHeader(t), newTestCoinbaseTx(t),
+		[]*chainhash.Hash{first.RootHash(), second.RootHash()}, 4, 123, 0, 0)
+	require.NoError(t, err)
+
+	b.SubtreeSlices = callerOwned
+
+	// Compared as a plain integer, never dereferenced: the reload Closes this
+	// subtree, so by assert time its Nodes point into a munmapped region and any
+	// formatting of the value (which require.Same does on failure) would fault
+	// the test binary instead of failing it.
+	expected := reflect.ValueOf(mmapSt).Pointer()
+
+	require.NoError(t, b.GetAndValidateSubtrees(context.Background(), ulogger.TestLogger{}, blobStore,
+		tSettings.Block.GetAndValidateSubtreesConcurrency))
+
+	require.Equal(t, expected, reflect.ValueOf(callerOwned[0]).Pointer(),
+		"the reload must not write into an array it may not own - the block replaces its own header instead")
+}

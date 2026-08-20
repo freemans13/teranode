@@ -1660,8 +1660,17 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		TransactionCount: transactionCount,
 		SizeInBytes:      blockSize,
 		Subtrees:         jobSubtreeHashes, // we need to store the hashes of the subtrees in the block, without the coinbase
-		SubtreeSlices:    job.Subtrees,
-		CoinbaseBUMP:     coinbaseBUMP,
+		// Aliases the subtree processor's live slice rather than copying it, so
+		// this block shares both the backing array and the *Subtree values with
+		// whatever else holds the job. Block.Valid must therefore not mutate
+		// either: model.Block.closeMmapSubtreesLocked is the release on that
+		// path, and it Closes only mmap-backed subtrees and never writes to the
+		// array. Job subtrees are built in memory by the processor, so none of
+		// them is mmap-backed and nothing here is touched — a cross-package
+		// dependency worth naming, because a release that reached further would
+		// corrupt the processor's state from inside block validation.
+		SubtreeSlices: job.Subtrees,
+		CoinbaseBUMP:  coinbaseBUMP,
 	}
 
 	// check fully valid, including whether difficulty in header is low enough

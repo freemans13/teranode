@@ -1863,15 +1863,22 @@ func (b *Block) ReplaceSubtreeSlices(slices []*subtreepkg.Subtree) {
 	b.SubtreeSlices = slices
 }
 
-// closeMmapSubtreesLocked Closes every mmap-backed subtree in SubtreeSlices and
-// nils its entry, leaving heap-backed subtrees untouched. The caller must hold
+// closeMmapSubtreesLocked Closes every mmap-backed subtree in SubtreeSlices,
+// leaving heap-backed subtrees untouched. The caller must hold
 // b.subtreeSlicesMu for writing.
 //
 // Used where the block is about to drop its references to the subtrees but may
 // not be their only holder. Closing is only needed for mmap-backed subtrees —
 // it unmaps the region and removes the backing file, which no finalizer would
 // ever do — and those are never shared, so this is the release that cannot harm
-// another holder. Returns the joined Close errors, if any.
+// another holder.
+//
+// The array itself is not written to, deliberately. SubtreeSlices can be the
+// caller's own slice: blockassembly builds a model.Block with
+// SubtreeSlices: job.Subtrees and calls Valid on it, sharing the backing array
+// with the live subtree processor. Nil-ing an element there would reach into the
+// processor's state to no purpose, since the only caller replaces the slice
+// header immediately afterwards. Returns the joined Close errors, if any.
 func (b *Block) closeMmapSubtreesLocked() error {
 	var closeErrs []error
 
@@ -1883,8 +1890,6 @@ func (b *Block) closeMmapSubtreesLocked() error {
 		if err := st.Close(); err != nil {
 			closeErrs = append(closeErrs, errors.NewProcessingError("subtree %d", i, err))
 		}
-
-		b.SubtreeSlices[i] = nil
 	}
 
 	return errors.Join(closeErrs...)

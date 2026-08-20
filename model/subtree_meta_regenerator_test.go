@@ -108,11 +108,14 @@ func createTestTransaction(t *testing.T, prevTxIDHex string, prevVout uint32) *b
 }
 
 // allowLoopbackHTTP disables the util HTTP client's SSRF protection for the
-// duration of a test that talks to a localhost httptest server.
+// duration of a test that talks to a localhost httptest server, restoring
+// whatever it was rather than assuming the default.
 func allowLoopbackHTTP(t *testing.T) {
 	t.Helper()
+
+	previous := util.SSRFProtectionEnabled()
 	util.SetSSRFProtection(false)
-	t.Cleanup(func() { util.SetSSRFProtection(true) })
+	t.Cleanup(func() { util.SetSSRFProtection(previous) })
 }
 
 func TestSubtreeMetaRegenerator_RegenerateMeta_FromLocal(t *testing.T) {
