@@ -196,37 +196,31 @@ func TestStalledSyncPeer_IsDemotedAndStaysConnected(t *testing.T) {
 // node hands the role straight back to the peer it just judged stalled and buys
 // another stall window of no progress.
 //
-// The election is deterministic in both halves. First the stalled peer is inside
-// its cooldown, so the only peer ahead of us is the successor. Then the cooldown
-// is expired and the only other peer is one at our own height, which lands in the
-// last-resort pool: were the cooldown still in force that peer would be elected,
-// and a peer at our height never becomes sync peer at all — so "the demoted peer
-// is the sync peer" is the only outcome that says the cooldown expired, rather
-// than the no-candidate escape hatch firing.
+// The election is deterministic because the only other peer is at our own
+// height, which puts it in the last-resort pool — and a peer at our height is
+// never made sync peer at all. So while the cooldown holds, the stalled peer is
+// the ONLY peer that could be elected and the node deliberately ends up with
+// none; once the cooldown passes, that same peer is elected. One peer, two
+// outcomes, no random choice either way.
 func TestDemotedSyncPeer_IsNotReElectedStraightAway(t *testing.T) {
 	sm := newDemotionManager(t)
 
 	stalled, _, _ := demotionPeer(t, sm, 102, 1000)
-	successor, _, _ := demotionPeer(t, sm, 103, 1000)
+	demotionPeer(t, sm, 103, 100)
 
 	sm.storeSyncPeer(stalled, stalledSyncPeerState())
 	stalled.SetSyncPeer(true)
 
 	sm.handleCheckSyncPeer()
-	require.Equal(t, successor, sm.loadSyncPeer(),
+	require.NotEqual(t, stalled, sm.loadSyncPeer(),
 		"a peer inside its demotion cooldown must not be re-elected")
+	require.Nil(t, sm.loadSyncPeer(),
+		"and the only other peer is at our own height, so there is nobody to promote")
 
-	// The cooldown expires. The successor leaves, and the only other peer left is
-	// one at our own height, which lands in the last-resort pool.
+	// The cooldown expires, and the same election runs again.
 	state, exists := sm.peerStates.Get(stalled)
 	require.True(t, exists)
 	state.clearDemotionCooldown()
-
-	successor.SetSyncPeer(false)
-	sm.peerStates.Delete(successor)
-	sm.storeSyncPeer(nil, nil)
-
-	demotionPeer(t, sm, 115, 100)
 
 	sm.startSync()
 	require.Equal(t, stalled, sm.loadSyncPeer(),
