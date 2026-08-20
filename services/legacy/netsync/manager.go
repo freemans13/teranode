@@ -1578,23 +1578,98 @@ func (sm *SyncManager) rewindToLowestHeader(hashes []chainhash.Hash) (int32, boo
 
 // headersRoundLocator returns the locator to send the next getheaders with.
 //
-// Mid-round that is the back of the header list, not our own database best
-// block: handleHeadersMsg requires every incoming header to connect to the back
-// of the list, so a locator from the database — which after a demotion is
-// hundreds or thousands of headers below it — would have the new sync peer answer
-// honestly and be disconnected for it. This is the same one-hash locator
-// handleHeadersMsg itself continues a round with.
+// Mid-round it is built from the header list we already have, not from our own
+// database best block: handleHeadersMsg requires every incoming header to connect
+// to the back of the list, so a locator from the database — which after a
+// demotion is hundreds or thousands of headers below it — would have the new sync
+// peer answer honestly and be disconnected for it.
 //
 // With the fan-out off, a sync-peer change resets the header state first, so the
 // database locator is the only correct one and is what this returns.
 func (sm *SyncManager) headersRoundLocator(bestHash *chainhash.Hash, bestHeight uint32) (blockchain.BlockLocator, error) {
 	if sm.settings.Legacy.MultiPeerBlockDownload && sm.headersFirstMode.Load() {
-		if back, ok := sm.headerListBackHash(); ok {
-			return blockchain.BlockLocator([]*chainhash.Hash{&back}), nil
+		if locator := sm.headerListLocator(bestHash); len(locator) > 0 {
+			return blockchain.BlockLocator(locator), nil
 		}
 	}
 
 	return sm.blockchainClient.GetBlockLocator(sm.ctx, bestHash, bestHeight)
+}
+
+// headerListLocator builds a block locator out of the header list: the back
+// first, then stepping back through the list at a doubling stride, then the front
+// of the list and our own database best block.
+//
+// The back has to come first, because a peer that has it answers from it and the
+// round continues where it left off. Everything after the back is what makes the
+// question answerable by a peer that has not got that far. startSync elects any
+// connected candidate above our own height, which mid-round can be up to a full
+// headers batch below the back of the list; asked only about the back, such a
+// peer recognises nothing, its node falls back to the genesis block, and it
+// replies from height 1 — headers whose parent we have never heard of, which
+// costs it its connection with a misbehaviour warning for answering honestly.
+// A single hash is the degenerate case of this locator, and the degenerate case
+// is the one that loses peers.
+//
+// Bounding it on the peer's claimed height instead would be cheaper but worse in
+// two ways: a claimed height is a lower bound that goes stale downward, so a peer
+// that does have the back would be sent the database locator and the round would
+// not continue; and the database locator's own reply does not connect to the back
+// either, so it buys nothing beyond not being disconnected.
+//
+// Every entry is a block we hold, so a reply is either a continuation from the
+// back or an answer whose first header connects to a header we hold — which
+// handleHeadersMsg recognises as a late or short answer, ignores, and leaves the
+// peer connected. The list front is appended explicitly because the stride can
+// step over it, and our database best block last because after the checkpoint
+// transition the round's anchor is removed and the front is one above the tip.
+func (sm *SyncManager) headerListLocator(bestHash *chainhash.Hash) []*chainhash.Hash {
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if sm.headerList == nil || sm.headerList.Len() == 0 {
+		return nil
+	}
+
+	locator := make([]*chainhash.Hash, 0, 24)
+
+	step := 1
+	skip := 0
+
+	for e := sm.headerList.Back(); e != nil; e = e.Prev() {
+		node, ok := e.Value.(*headerNode)
+		if !ok || node.hash == nil {
+			continue
+		}
+
+		if skip > 0 {
+			skip--
+
+			continue
+		}
+
+		locator = append(locator, node.hash)
+
+		// The first ten are consecutive, as in every other bitcoin locator, so a
+		// peer only a few headers behind the back finds its fork point exactly.
+		if len(locator) > 10 {
+			step *= 2
+		}
+
+		skip = step - 1
+	}
+
+	if front, ok := sm.headerList.Front().Value.(*headerNode); ok && front.hash != nil {
+		if len(locator) == 0 || !locator[len(locator)-1].IsEqual(front.hash) {
+			locator = append(locator, front.hash)
+		}
+	}
+
+	if bestHash != nil && (len(locator) == 0 || !locator[len(locator)-1].IsEqual(bestHash)) {
+		locator = append(locator, bestHash)
+	}
+
+	return locator
 }
 
 // headerListBackHash returns the hash of the last header in the list.

@@ -313,8 +313,11 @@ func TestDemotion_TheNewSyncPeerContinuesTheHeadersRoundFromTheBackOfTheList(t *
 
 	got := successorHeaders.last()
 	require.NotNil(t, got)
-	require.Equal(t, []*chainhash.Hash{&hashes[len(hashes)-1]}, got.BlockLocatorHashes,
-		"the locator must be the back of the header list we kept")
+	require.NotEmpty(t, got.BlockLocatorHashes)
+	require.Equal(t, &hashes[len(hashes)-1], got.BlockLocatorHashes[0],
+		"the locator must start at the back of the header list we kept")
+	require.Greater(t, len(got.BlockLocatorHashes), 1,
+		"and step back through the list, so a peer that cannot reach the back can still find a fork point")
 
 	// And the honest answer to that locator has to be accepted.
 	more, moreHashes := linkedHeaders(hashes[len(hashes)-1], 5, &nonce)
