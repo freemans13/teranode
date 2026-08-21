@@ -251,6 +251,20 @@ type peerSyncState struct {
 	requestQueue  *txmap.SyncedSlice[wire.InvVect]
 	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 
+	// assocReadBytes and assocReadBytesLastTick are two consecutive samples of
+	// this peer's association-wide read counter, taken on the frontier ticker.
+	// The difference over one tick is how fast the peer is pulling bytes in.
+	//
+	// syncPeerState keeps the same pair, but only for the sync peer, and the
+	// rotation decision needs it there. This copy exists because the frontier
+	// race has to ask the question of whichever peer owes the stuck block, which
+	// under the fan-out is routinely not the sync peer — svnode asks it of every
+	// in-flight source. Sampled here rather than read from the peer layer so that
+	// one sampler answers for every peer.
+	assocReadBytes         atomic.Uint64
+	assocReadBytesLastTick atomic.Uint64
+	throughputTicks        atomic.Uint64
+
 	// bestKnownHeight is the highest block height this peer has demonstrated it
 	// has: the height it announced at handshake, raised whenever it delivers a
 	// block, announces one we already have, or hands us headers.
@@ -302,6 +316,61 @@ func (s *peerSyncState) clearDemotionCooldown() {
 // noteBestKnownHeight raises the peer's best known height to h, and never lowers
 // it. A compare-and-swap loop rather than a load-then-store, because concurrent
 // reports would otherwise let a lower one overwrite a higher one.
+// sampleThroughput takes this tick's reading of the peer's association-wide read
+// counter, keeping the previous one to subtract from.
+func (s *peerSyncState) sampleThroughput(p *peerpkg.Peer) {
+	if s == nil || p == nil {
+		return
+	}
+
+	s.assocReadBytesLastTick.Store(s.assocReadBytes.Load())
+	s.assocReadBytes.Store(p.AssociationReadBytes())
+	s.throughputTicks.Add(1)
+}
+
+// isPullingBytes reports whether this peer's association brought data in over
+// the last tick at or above minSpeed bytes per second.
+//
+// False before two samples exist, which reads as "not downloading". That is the
+// safe bias for the frontier race: the cost of racing a peer that turned out to
+// be fine is one duplicate block, and the cost of not racing a silent one is the
+// stall the race exists to break.
+func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
+	if s == nil || s.throughputTicks.Load() < 2 {
+		return false
+	}
+
+	cur := s.assocReadBytes.Load()
+	prev := s.assocReadBytesLastTick.Load()
+
+	// AssociationReadBytes sums the streams present at sample time, so a stream
+	// dying between samples drops the total. A decrease is the opposite of
+	// progress, not a wrapped-around healthy figure.
+	if cur < prev {
+		return false
+	}
+
+	delta := cur - prev
+
+	// Bytes must have moved, tested apart from the threshold: minSpeed may be
+	// configured as 0, and a bare comparison against 0 would make a peer that
+	// sent nothing look busy and switch the race off altogether.
+	if delta == 0 {
+		return false
+	}
+
+	// Multiplied rather than divided: `delta/seconds >= minSpeed` truncates, and
+	// it divides by a figure that is only ever a few seconds, so a shorter
+	// interval would floor it to zero and panic. The sibling on syncPeerState
+	// still has that shape; this one does not need it.
+	seconds := uint64(frontierCheckInterval.Seconds())
+	if seconds == 0 {
+		seconds = 1
+	}
+
+	return delta >= minSpeed*seconds
+}
+
 func (s *peerSyncState) noteBestKnownHeight(h int32) {
 	for {
 		cur := s.bestKnownHeight.Load()
@@ -4156,6 +4225,10 @@ out:
 		case <-ticker.C:
 			sm.handleCheckSyncPeer()
 		case <-frontierTicker.C:
+			// Sampled immediately before the only thing that reads it, on the
+			// same tick and over the same interval, so the rate and the decision
+			// cannot be measured against different clocks.
+			sm.samplePeerThroughput()
 			sm.raceFrontierBlock(time.Now())
 		case m := <-sm.msgChan:
 			// whenever legacy receives a message, check if we are current
@@ -5370,4 +5443,22 @@ func (sm *SyncManager) processTXmetaBatchMessage(data []byte) error {
 	}
 
 	return nil
+}
+
+// samplePeerThroughput takes one throughput reading for every registered peer.
+//
+// It runs on the frontier ticker rather than a timer of its own, immediately
+// before the race that reads it: the reading is three atomic operations per peer,
+// and the interval the rate is measured over has to be the interval it is sampled
+// on. The race asks the result whether the peer that owes the stuck block is
+// actually sending it, which is the question svnode asks of every in-flight
+// source before racing one.
+func (sm *SyncManager) samplePeerThroughput() {
+	if sm.peerStates == nil {
+		return
+	}
+
+	for p, state := range sm.peerStates.Range() {
+		state.sampleThroughput(p)
+	}
 }

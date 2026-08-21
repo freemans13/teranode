@@ -238,23 +238,33 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 		return none, 0, nil, false
 	}
 
-	sp, sps := sm.loadSyncPeerAndState()
-	if sp == nil || sps == nil {
+	sp, _ := sm.loadSyncPeerAndState()
+	if sp == nil {
 		return none, 0, nil, false
 	}
 
-	// A brand new sync peer has no throughput sample yet and is treated as not
-	// downloading. That is the safe bias here: the worst case is one duplicate
-	// block from a peer that turned out to be fine, whereas the opposite bias
-	// would let a genuinely silent peer hide behind a missing measurement.
+	// Is anybody actually sending this block? Asked of every peer that owes it,
+	// which is what svnode does: its race walks GetBlockDetails for the stuck hash
+	// and abandons the attempt the moment one owner turns out to be active ("this
+	// peer seems active currently"). One owner making real progress is enough — a
+	// peer part-way through a multi-gigabyte block is slow, not stalled, and
+	// racing it wastes the bandwidth already spent.
 	//
-	// Consulted only when the sync peer is the peer that owes this block. With
-	// the fan-out off that is always true and this reads exactly as it did
-	// before. With it on, a frontier owed by another peer used to be suppressed
-	// by the sync peer's healthy run of its own later slice — which is precisely
-	// the state the race was built for, and the one state it never fired in.
-	if sm.blockDownloads.HasOwner(sp, hash) && sps.hasHealthyDownloadThroughput(sm.minSyncPeerNetworkSpeed) {
-		return none, 0, nil, false
+	// This used to ask only the sync peer, and only when the sync peer owed the
+	// block. Under the fan-out the frontier belongs to whichever peer the
+	// scheduler gave it to, so for a frontier owed by anybody else no throughput
+	// test happened at all and a peer mid-transfer was raced regardless.
+	//
+	// The frontier's own age is already checked above, which is where svnode puts
+	// its per-owner slow-fetch timeout.
+	for _, owner := range sm.blockDownloads.OwnersOf(hash) {
+		if owner == nil || !owner.Connected() {
+			continue
+		}
+
+		if state, ok := sm.peerStates.Get(owner); ok && state.isPullingBytes(sm.minSyncPeerNetworkSpeed) {
+			return none, 0, nil, false
+		}
 	}
 
 	if sm.peerStates == nil {

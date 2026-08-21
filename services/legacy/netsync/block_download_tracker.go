@@ -237,6 +237,41 @@ func (t *blockDownloadTracker) ReassertOwner(p *peerpkg.Peer, h chainhash.Hash) 
 	return true
 }
 
+// OwnersOf returns every peer that still owes us block h, forgiven ones included
+// — a peer that has been let off may still be mid-send, and for the question this
+// answers ("is anybody actually delivering this?") that is the same thing as
+// owing it.
+//
+// The frontier race needs it in order to judge the peers that owe the block
+// rather than the sync peer, which with the fan-out on is routinely not the same
+// peer. svnode asks the equivalent question with GetBlockDetails.
+func (t *blockDownloadTracker) OwnersOf(h chainhash.Hash) []*peerpkg.Peer {
+	if t == nil {
+		return nil
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	owners := t.byHash[h]
+	if len(owners) == 0 {
+		return nil
+	}
+
+	now := t.clock()
+	out := make([]*peerpkg.Peer, 0, len(owners))
+
+	for p, rec := range owners {
+		if t.expiredAt(rec.at, now, t.ttl) {
+			continue
+		}
+
+		out = append(out, p)
+	}
+
+	return out
+}
+
 // ForgiveOwners lets every peer that owes block h off the hook, and returns the
 // peers it let off. Ownership is kept, so a copy still on the wire from any of
 // them is still admitted; only the obligation goes.

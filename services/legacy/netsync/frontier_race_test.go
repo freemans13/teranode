@@ -223,6 +223,20 @@ func TestFrontierRaceTarget(t *testing.T) {
 
 	stale := func() time.Time { return time.Now().Add(-30 * time.Second) }
 
+	// pulling makes a peer look like it is actively bringing bytes in, in the
+	// same terms samplePeerThroughput records: two samples a tick apart with a
+	// healthy delta between them.
+	pulling := func(t *testing.T, sm *SyncManager, p *peerpkg.Peer) {
+		t.Helper()
+
+		state, exists := sm.peerStates.Get(p)
+		require.True(t, exists)
+
+		state.assocReadBytesLastTick.Store(0)
+		state.assocReadBytes.Store(64 << 20)
+		state.throughputTicks.Store(2)
+	}
+
 	// setup builds a manager in the state where a race SHOULD happen, so each
 	// case only has to break the one thing it is about.
 	setup := func(t *testing.T) *SyncManager {
@@ -302,13 +316,39 @@ func TestFrontierRaceTarget(t *testing.T) {
 
 	t.Run("the peer that owes the frontier is still pulling bytes", func(t *testing.T) {
 		sm := setup(t)
-		sm.storeSyncPeer(syncPeer, &syncPeerState{
-			ticks:                  1,
-			assocReadBytes:         64 << 20,
-			assocReadBytesLastTick: 0,
-		})
+		pulling(t, sm, syncPeer)
 		_, _, _, ok := sm.frontierRaceTarget(time.Now())
 		require.False(t, ok, "a peer mid-transfer of a large block is slow, not stalled")
+	})
+
+	// The same question, of a peer that is not the sync peer. This is the
+	// ordinary case once bodies come from everybody, and it used to get no
+	// throughput test at all: the check consulted the sync peer's sample and only
+	// when the sync peer owed the block, so a non-sync owner streaming a
+	// multi-gigabyte block was raced regardless of how fast it was going.
+	t.Run("a non-sync peer that owes the frontier is still pulling bytes", func(t *testing.T) {
+		sm := setup(t)
+		sm.blockDownloads.RemoveOwner(syncPeer, chainhash.Hash{0xcc})
+		require.True(t, sm.blockDownloads.Add(other, chainhash.Hash{0xcc}))
+
+		pulling(t, sm, other)
+
+		_, _, _, ok := sm.frontierRaceTarget(time.Now())
+		require.False(t, ok,
+			"the owner is mid-transfer, so racing it wastes the bandwidth already spent")
+	})
+
+	// And the flip side, so the case above is not passing for the wrong reason:
+	// a silent owner must still be raced.
+	t.Run("a non-sync peer that owes the frontier and is silent is raced", func(t *testing.T) {
+		sm := setup(t)
+		sm.blockDownloads.RemoveOwner(syncPeer, chainhash.Hash{0xcc})
+		require.True(t, sm.blockDownloads.Add(other, chainhash.Hash{0xcc}))
+
+		_, _, target, ok := sm.frontierRaceTarget(time.Now())
+		require.True(t, ok, "an owner bringing nothing in is what racing is for")
+		require.Equal(t, syncPeer, target,
+			"and the owner must not be asked again, which leaves the sync peer")
 	})
 
 	// The throughput sample this node keeps belongs to the sync peer, and under
