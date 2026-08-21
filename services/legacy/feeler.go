@@ -400,16 +400,8 @@ func (s *server) feelerProbe() {
 	p.AssociateConnection(conn)
 
 	// After the TCP connect, matching outboundPeerConnected and svnode, which
-	// records the attempt on both arms of ConnectNode. countFailedDial is what
-	// stops a spell of broken local networking blaming the whole address book.
-	//
-	// Shutdown is re-checked rather than leaning on the check after the dial:
-	// the steps between are short but not free, and this is the same rule Good()
-	// follows below. Skipping the write is not a loss — the book it would land
-	// in has already been saved.
-	if !s.shuttingDown() {
-		s.addrManager.Attempt(na, s.countFailedDial())
-	}
+	// records the attempt on both arms of ConnectNode.
+	s.attemptIfRunning(na)
 
 	gone := make(chan struct{})
 
@@ -421,36 +413,36 @@ func (s *server) feelerProbe() {
 	timer := time.NewTimer(feelerHandshakeTimeout(s.logger, s.settings.Legacy.FeelerHandshakeTimeout))
 	defer timer.Stop()
 
-	outcome := "no version received"
+	// Each arm records only why its own wait ended, and the verdict is reached
+	// once, afterwards, for all of them. That shape is deliberate.
+	//
+	// A version can land in the same instant the far side hangs up or the deadline
+	// expires, and a select picks uniformly among cases that are already ready. An
+	// arm that decided its own outcome would therefore throw away a version the
+	// probe already had, on a coin toss: the address would go unpromoted, and
+	// worse, a non-BSV host that answers and drops at once would go unbanned and
+	// be drawn again for as long as it kept doing it — which is the whole loop the
+	// ban exists to close.
+	//
+	// Reaching the verdict in one place downstream of the select means no arm can
+	// be written that skips it. The reason attached to res.done is unreachable for
+	// that arm, and says what it would mean if it were.
+	fallback := "no version received"
 
 	select {
 	case <-res.done:
-		switch {
-		case s.shuttingDown():
-			outcome = "abandoned, shutting down"
-		case !isBSVUserAgent(res.userAgent()):
-			outcome = "answered but is not a BSV node"
-			s.banNonBSVHost(addrString)
-		default:
-			// Promotes the address from new to tried, which is the entire point
-			// of the exercise. svnode's feeler clears the same bar at the same
-			// moment, in ProcessVersionMessage rather than on verack, and so
-			// does teranode's own outbound path in OnVersion.
-			s.addrManager.Good(na)
-			s.feelerVerified.Add(1)
-
-			outcome = "verified"
-		}
 
 	case <-gone:
-		outcome = "hung up before its version"
+		fallback = "hung up before its version"
 
 	case <-timer.C:
-		outcome = "timed out"
+		fallback = "timed out"
 
 	case <-s.quit:
-		outcome = "abandoned, shutting down"
+		fallback = "abandoned, shutting down"
 	}
+
+	outcome := s.judgeVersion(na, addrString, res, fallback)
 
 	// Debug rather than Info, because "Disconnecting (%s) reason:" is the line
 	// the disconnect-rate measurements key on, and a probe hanging up on purpose
@@ -459,6 +451,61 @@ func (s *server) feelerProbe() {
 
 	s.logger.Infof("[Feeler] Probe %s: %s (user agent %q, attempted %d, verified %d)",
 		addrString, outcome, res.userAgent(), s.feelerAttempted.Load(), s.feelerVerified.Load())
+}
+
+// attemptIfRunning records a dial attempt against na, unless the node has begun
+// shutting down. It reports whether the write happened.
+//
+// Shutdown is re-checked here rather than leaning on the check after the dial:
+// the steps between are short but not free. Skipping the write is not a loss —
+// peerHandler stops the address manager immediately after its loop exits, so the
+// book this would land in has already been saved.
+//
+// countFailedDial is what stops a spell of broken local networking blaming the
+// whole address book.
+func (s *server) attemptIfRunning(na *wire.NetAddress) bool {
+	if s.shuttingDown() {
+		return false
+	}
+
+	s.addrManager.Attempt(na, s.countFailedDial())
+
+	return true
+}
+
+// judgeVersion decides a probe's outcome once its wait is over, and carries out
+// whatever that outcome asks of the address book.
+//
+// fallback is what to report when no version ever arrived. Callers pass the
+// reason their own wait ended and let this function overrule it, because a
+// version that landed in the same instant as a hang-up or a timeout is still a
+// version: res.done is re-read here rather than trusted to have won its select.
+func (s *server) judgeVersion(na *wire.NetAddress, addrString string, res *feelerResult, fallback string) string {
+	select {
+	case <-res.done:
+	default:
+		return fallback
+	}
+
+	switch {
+	case s.shuttingDown():
+		return "abandoned, shutting down"
+
+	case !isBSVUserAgent(res.userAgent()):
+		s.banNonBSVHost(addrString)
+
+		return "answered but is not a BSV node"
+
+	default:
+		// Promotes the address from new to tried, which is the entire point of
+		// the exercise. svnode's feeler clears the same bar at the same moment,
+		// in ProcessVersionMessage rather than on verack, and so does teranode's
+		// own outbound path in OnVersion.
+		s.addrManager.Good(na)
+		s.feelerVerified.Add(1)
+
+		return "verified"
+	}
 }
 
 // shuttingDown reports whether the server has begun shutting down. Used by the

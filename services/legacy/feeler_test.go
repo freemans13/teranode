@@ -629,7 +629,6 @@ func TestFeelerDoesNotPromoteNonBSVPeer(t *testing.T) {
 			cfg.DisableBanning = tt.disableBanning
 
 			srv := newFeelerTestServer(t)
-			srv.banList = emptyWritableBanList(t)
 			serveFeelerSnapshot(srv, feelerSnapshot{})
 
 			// Two established automatic peers, so countFailedDial has the evidence it
@@ -754,7 +753,12 @@ func newFeelerTestServer(t *testing.T) *server {
 		logger:      ulogger.TestLogger{},
 		settings:    tSettings,
 		addrManager: addrmgr.New(ulogger.TestLogger{}, t.TempDir(), nil),
-		banList:     banlist.New(nil, "", ulogger.TestLogger{}),
+		// A writable ban list rather than banlist.New(nil, ...). A nil database
+		// makes Add dereference nil and panic rather than error, so the cheaper
+		// construction turned any test whose probe met a non-BSV user agent into
+		// a panicking binary instead of a failing assertion — one edited string
+		// literal away, for whoever extends these tests next.
+		banList:     emptyWritableBanList(t),
 		quit:        make(chan struct{}),
 		query:       make(chan interface{}),
 		feelerSlots: 1,
@@ -762,12 +766,28 @@ func newFeelerTestServer(t *testing.T) *server {
 	}
 
 	t.Cleanup(func() {
-		close(srv.quit)
+		beginFeelerShutdown(srv)
 		srv.wg.Wait()
 		drainFeelerProbes(t, srv)
 	})
 
 	return srv
+}
+
+// beginFeelerShutdown puts the node into shutting-down state, and is safe to
+// call twice because the cleanup calls it too.
+//
+// The check-then-close is not safe against concurrent closers in general. It is
+// safe here because the only two callers are a test body and its own cleanup,
+// which run in sequence on the same goroutine.
+func beginFeelerShutdown(srv *server) {
+	select {
+	case <-srv.quit:
+		return
+	default:
+	}
+
+	close(srv.quit)
 }
 
 // drainFeelerProbes waits until no probe is in flight, by taking every slot
@@ -1189,4 +1209,268 @@ func startMuteFeelerTestListener(t *testing.T) net.Listener {
 	}()
 
 	return ln
+}
+
+// TestFeelerProbeWritesNothingWhileShuttingDown covers the guard immediately
+// after the dial, on both of its arms.
+//
+// peerHandler stops the address manager the moment its loop exits, so a write
+// that loses that race is silently lost. The guard gives up instead. Before this
+// test all three of the probe's shutdown checks could be deleted with the whole
+// package staying green, which is why each of them now has one.
+//
+// Both arms matter and they are separate code paths: the failure arm records an
+// attempt through recordFailedDial, the success arm goes on to build a peer and
+// can promote. Each subtest is paired with its running counterpart, because
+// "nothing was written" is only evidence if something is written when the node
+// is up.
+func TestFeelerProbeWritesNothingWhileShuttingDown(t *testing.T) {
+	t.Run("failed dial", func(t *testing.T) {
+		for _, tt := range []struct {
+			name         string
+			shuttingDown bool
+			wantRecorded bool
+		}{
+			{name: "running records the failure", wantRecorded: true},
+			{name: "shutting down records nothing", shuttingDown: true},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				swapTestConfig(t, "")
+
+				cfg.dial = func(string, string, time.Duration) (net.Conn, error) {
+					return nil, errDeadHost
+				}
+
+				srv := newFeelerTestServer(t)
+				serveFeelerSnapshot(srv, feelerSnapshot{})
+				atLeastTwoAutomaticPeers(t, srv)
+
+				na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+				srv.addrManager.AddAddress(na, testSourceAddr())
+
+				if tt.shuttingDown {
+					beginFeelerShutdown(srv)
+				}
+
+				runOneProbe(srv)
+
+				ka := srv.addrManager.UnverifiedAddress()
+				require.NotNil(t, ka, "a failed dial must not move the address anywhere")
+				require.Equal(t, tt.wantRecorded, !ka.LastAttempt().IsZero(),
+					"a dial failure is recorded against the address only while the node is running")
+			})
+		}
+	})
+
+	t.Run("successful dial", func(t *testing.T) {
+		for _, tt := range []struct {
+			name         string
+			shuttingDown bool
+			wantRecorded bool
+			wantPromoted bool
+		}{
+			{name: "running promotes", wantRecorded: true, wantPromoted: true},
+			{name: "shutting down writes nothing", shuttingDown: true},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				ln, _ := startFeelerTestListener(t, "/Bitcoin SV:1.1.0/")
+
+				swapTestConfig(t, ln.Addr().String())
+
+				srv := newFeelerTestServer(t)
+				serveFeelerSnapshot(srv, feelerSnapshot{})
+				atLeastTwoAutomaticPeers(t, srv)
+
+				na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+				srv.addrManager.AddAddress(na, testSourceAddr())
+
+				if tt.shuttingDown {
+					beginFeelerShutdown(srv)
+				}
+
+				runOneProbe(srv)
+
+				if tt.wantPromoted {
+					require.Nil(t, srv.addrManager.UnverifiedAddress(),
+						"a verified address must leave the new table")
+					require.Equal(t, uint64(1), srv.feelerVerified.Load())
+
+					return
+				}
+
+				ka := srv.addrManager.UnverifiedAddress()
+				require.NotNil(t, ka, "an abandoned probe must leave the address where it was")
+				require.Equal(t, tt.wantRecorded, !ka.LastAttempt().IsZero(),
+					"an abandoned probe must not record an attempt either")
+				require.Equal(t, uint64(0), srv.feelerVerified.Load())
+			})
+		}
+	})
+}
+
+// TestAttemptIfRunningRefusesToWriteWhileShuttingDown pins the second of the
+// three shutdown checks, the one covering the attempt recorded after the TCP
+// connect.
+//
+// It is its own function rather than a step in a probe because the check it
+// guards is only reachable when shutdown begins *between* the dial and this
+// write. Driving a whole probe cannot land in that window on purpose, so the
+// window is tested where it lives.
+func TestAttemptIfRunningRefusesToWriteWhileShuttingDown(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		shuttingDown bool
+		wantWritten  bool
+	}{
+		{name: "running writes", wantWritten: true},
+		{name: "shutting down does not", shuttingDown: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			swapTestConfig(t, "")
+
+			srv := newFeelerTestServer(t)
+			atLeastTwoAutomaticPeers(t, srv)
+
+			na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+			srv.addrManager.AddAddress(na, testSourceAddr())
+
+			require.True(t, srv.addrManager.UnverifiedAddress().LastAttempt().IsZero(),
+				"the address starts out with no attempt against it")
+
+			if tt.shuttingDown {
+				beginFeelerShutdown(srv)
+			}
+
+			require.Equal(t, tt.wantWritten, srv.attemptIfRunning(na),
+				"attemptIfRunning must report whether it wrote")
+
+			require.Equal(t, tt.wantWritten, !srv.addrManager.UnverifiedAddress().LastAttempt().IsZero(),
+				"and the report must match what reached the address book")
+		})
+	}
+}
+
+// TestJudgeVersionHonoursAVersionThatRacedTheTeardown is the test for the fix to
+// the probe's select.
+//
+// A version can land in the same instant the far side hangs up, or the handshake
+// deadline expires. A select picks uniformly among cases that are already ready,
+// so before this the hang-up and timeout arms could throw away a version the
+// probe already had. The promotion that goes missing is a nuisance; the ban that
+// goes missing is the problem, because the address stays in the new table and the
+// feeler spends its whole allowance rediscovering the same BTC and BCH nodes.
+//
+// Measured before the fix, with a delay widening the window the probe reaches
+// the select through: 23 of 40 probes of a BSV host failed to promote it and 20
+// of 40 probes of a BTC host failed to ban it. A clean coin toss, as advertised.
+//
+// So each arm is driven here with a version already in hand, and has to reach the
+// same verdict the version arm would.
+func TestJudgeVersionHonoursAVersionThatRacedTheTeardown(t *testing.T) {
+	for _, fallback := range []string{
+		"hung up before its version",
+		"timed out",
+	} {
+		t.Run(fallback, func(t *testing.T) {
+			t.Run("a BSV version is still a promotion", func(t *testing.T) {
+				swapTestConfig(t, "")
+
+				srv := newFeelerTestServer(t)
+
+				na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+				srv.addrManager.AddAddress(na, testSourceAddr())
+
+				res := settledFeelerResult("/Bitcoin SV:1.1.0/")
+
+				require.Equal(t, "verified", srv.judgeVersion(na, "8.8.8.8:8333", res, fallback))
+				require.Nil(t, srv.addrManager.UnverifiedAddress(),
+					"a verified address must leave the new table however its wait ended")
+				require.Equal(t, uint64(1), srv.feelerVerified.Load())
+			})
+
+			t.Run("a non-BSV version is still a ban", func(t *testing.T) {
+				swapTestConfig(t, "")
+
+				srv := newFeelerTestServer(t)
+
+				na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+				srv.addrManager.AddAddress(na, testSourceAddr())
+
+				res := settledFeelerResult("/Satoshi:0.21.0/")
+
+				require.Equal(t, "answered but is not a BSV node",
+					srv.judgeVersion(na, "8.8.8.8:8333", res, fallback))
+				require.True(t, srv.banList.IsBanned("8.8.8.8"),
+					"a host that identifies itself as non-BSV must be banned whichever arm woke")
+				require.Equal(t, uint64(0), srv.feelerVerified.Load())
+			})
+		})
+	}
+
+	// The counterpart, and the half that stops the re-check swallowing the honest
+	// case: with no version in hand the arm's own reason must survive untouched.
+	t.Run("no version means the arm keeps its own reason", func(t *testing.T) {
+		swapTestConfig(t, "")
+
+		srv := newFeelerTestServer(t)
+
+		na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+		srv.addrManager.AddAddress(na, testSourceAddr())
+
+		res := &feelerResult{done: make(chan struct{})}
+
+		require.Equal(t, "hung up before its version",
+			srv.judgeVersion(na, "8.8.8.8:8333", res, "hung up before its version"))
+		require.NotNil(t, srv.addrManager.UnverifiedAddress(),
+			"a host that never answered must stay where it was")
+		require.Equal(t, uint64(0), srv.feelerVerified.Load())
+	})
+}
+
+// TestJudgeVersionRefusesToPromoteWhileShuttingDown pins the last of the three
+// shutdown checks, the one inside the verdict.
+//
+// It is reachable only when shutdown begins after a version has arrived, and it
+// is the belt to the select's own quit arm: with both ready that select is a
+// coin toss too, so the promotion has to be refused on either outcome.
+func TestJudgeVersionRefusesToPromoteWhileShuttingDown(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		shuttingDown bool
+		wantOutcome  string
+	}{
+		{name: "running promotes", wantOutcome: "verified"},
+		{name: "shutting down abandons", shuttingDown: true, wantOutcome: "abandoned, shutting down"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			swapTestConfig(t, "")
+
+			srv := newFeelerTestServer(t)
+
+			na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+			srv.addrManager.AddAddress(na, testSourceAddr())
+
+			if tt.shuttingDown {
+				beginFeelerShutdown(srv)
+			}
+
+			res := settledFeelerResult("/Bitcoin SV:1.1.0/")
+
+			require.Equal(t, tt.wantOutcome,
+				srv.judgeVersion(na, "8.8.8.8:8333", res, "no version received"))
+
+			require.Equal(t, !tt.shuttingDown, srv.addrManager.UnverifiedAddress() == nil,
+				"the address moves out of the new table only while the node is running")
+		})
+	}
+}
+
+// settledFeelerResult is a feelerResult that has already taken a version, as one
+// woken by res.done would be.
+func settledFeelerResult(userAgent string) *feelerResult {
+	res := &feelerResult{done: make(chan struct{})}
+	res.ua = userAgent
+	res.once.Do(func() { close(res.done) })
+
+	return res
 }
