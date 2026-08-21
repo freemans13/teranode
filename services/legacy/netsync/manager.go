@@ -2508,7 +2508,14 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				hash:      bmsg.blockHash,
 				prevBlock: prevBlockHash,
 				height:    bmsg.blockHeight,
-				peer:      bmsg.peer,
+				// The resolved association primary, not bmsg.peer. A block
+				// delivered on a stream sub-peer (BlockPriority DATA1) carries
+				// that sub-peer, and sub-peers are not registered in peerStates
+				// — so noteCommittedParkedBlock's lookup missed and the height
+				// bookkeeping a committed block is supposed to do was silently
+				// skipped. The ledger records the primary too, which is the
+				// identity HasOwner and the reject path ask about.
+				peer: peer,
 				// The header node this block's arrival already took off the
 				// front, so whichever path eventually gives the block up can put
 				// it back. Without it a parked front block is unreachable: its
@@ -2745,9 +2752,22 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		// re-checks startHeader under headerMu before doing anything.
 		sm.headerMu.Lock()
 		haveMoreHeaders := sm.startHeader != nil
+		anchorIsStillTheFront := sm.anchorIsStillTheFrontLocked()
 		sm.headerMu.Unlock()
 
-		if haveMoreHeaders && sm.blockDownloads.CountForPeer(peer) < dynamicMax {
+		if anchorIsStillTheFront {
+			// The same "not yet" fetchMoreHeaderBlocks makes, for the same
+			// reason, because this top-up can now run in that state too. A
+			// header round reaching towards a checkpoint several batches away
+			// has startHeader set with the anchor still in front, and multi-peer
+			// assignment plus demotion mean a body can still commit in that
+			// window — a late copy, or a block another peer was carrying. Asking
+			// for the next round then starts blocks that arrive, match nothing at
+			// the front, and sit in the list until the stall detector rebuilds
+			// it. handleHeadersMsg's own call is not affected: it trims the
+			// anchor first, which is why the ordering comment there says it must.
+			sm.logger.Debugf("[handleBlockMsg][%s] the round's anchor is still the front of the header list, not topping the pipeline up yet", bmsg.blockHash)
+		} else if haveMoreHeaders && sm.blockDownloads.CountForPeer(peer) < dynamicMax {
 			sm.fetchHeaderBlocks()
 		} else if !sm.current() && sm.blockDownloads.CountForPeer(peer) == 0 {
 			sm.logger.Debugf("Not current, and no headers to sync to, fetching more headers")
@@ -3621,7 +3641,17 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		}
 
 		// Verify the header at the next checkpoint height matches.
-		if node.height == sm.nextCheckpoint.Height {
+		//
+		// nextCheckpoint is nil once the final one has been passed.
+		// checkpointBlockCommitted advances it under headerMu and only leaves
+		// headers-first mode after releasing the lock, so a second headers
+		// goroutine that had already passed the mode check can hold the lock in
+		// that window and read the nil. Multi-peer demotion makes overlapping
+		// headers replies from the outgoing and incoming sync peer ordinary,
+		// which is what makes the window worth guarding rather than arguing
+		// about. There is no checkpoint left to verify against, so there is
+		// nothing to do but carry on with the batch.
+		if sm.nextCheckpoint != nil && node.height == sm.nextCheckpoint.Height {
 			if node.hash.IsEqual(sm.nextCheckpoint.Hash) {
 				receivedCheckpoint = true
 
@@ -3689,9 +3719,18 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// next checkpoint.
 	locator := blockchain.BlockLocator([]*chainhash.Hash{finalHash})
 
-	stopHash := sm.nextCheckpointSnapshot().Hash
+	// Same window as the checkpoint compare above: no checkpoint left means
+	// headers-first mode is on its way out and there is no stop hash to ask up
+	// to. Asking for another round here would be asking on behalf of a mode we
+	// are leaving, so leave it to the getblocks that leaveHeadersFirstMode sends.
+	nextCP := sm.nextCheckpointSnapshot()
+	if nextCP == nil {
+		sm.logger.Debugf("[handleHeadersMsg] no checkpoint left to ask up to; leaving the next round to normal mode")
 
-	if err := peer.PushGetHeadersMsg(locator, stopHash); err != nil {
+		return
+	}
+
+	if err := peer.PushGetHeadersMsg(locator, nextCP.Hash); err != nil {
 		sm.logger.Warnf("Failed to send getheaders message to peer %s: %v", peer.String(), err)
 	}
 }
@@ -3853,8 +3892,12 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 
 outside:
 	for state.requestQueue.Length() != 0 {
-		// shift the first items from the request queue until we have enough to send in a single message
-		iv, found := state.requestQueue.Shift()
+		// Read the front without consuming it. Everything below either deals
+		// with the item and falls through to the Shift at the bottom, or breaks
+		// out leaving it where it is — which is what a full ledger needs: the
+		// queue is the only record that this block was announced, and an inv is
+		// not guaranteed to come again.
+		iv, found := state.requestQueue.Get(0)
 		if !found {
 			break
 		}
@@ -3865,8 +3908,10 @@ outside:
 			if !sm.blockDownloads.RequestedWithin(iv.Hash, blockRequestRetryInterval) {
 				// As in fetchHeaderBlocks: a block the ledger will not take is
 				// a block we must not ask for, or the reply looks unrequested
-				// and costs this peer its connection. The block is announced
-				// again soon enough, and by then there is room.
+				// and costs this peer its connection. And as there, the work
+				// item is held in place rather than discarded — this used to
+				// rely on the peer announcing the block again, which a one-shot
+				// inv past the final checkpoint never does.
 				if !sm.blockDownloads.Add(peer, iv.Hash) {
 					sm.logger.Warnf("[handleInvMsg] block download ledger full at %d blocks, holding off on %s from %s", maxTrackedBlockDownloads, iv.Hash, peer)
 					break outside
@@ -3894,6 +3939,10 @@ outside:
 				numRequested++
 			}
 		}
+
+		// Dealt with one way or the other, so it comes off the queue. Every path
+		// that wants to keep it has broken out above.
+		state.requestQueue.Shift()
 
 		if numRequested >= maxRequestedBlocks {
 			sm.logger.Debugf("[handleInvMsg] Limiting to %d item(s) from %s", numRequested, peer)

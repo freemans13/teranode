@@ -237,6 +237,41 @@ func (t *blockDownloadTracker) ReassertOwner(p *peerpkg.Peer, h chainhash.Hash) 
 	return true
 }
 
+// OwnersOf returns every peer that still owes us block h — forgiven ones
+// included, because a peer that has been let off may still deliver, and for the
+// question this answers ("who did we ask, and so who must not be punished for
+// answering") that is the same thing as owing it.
+//
+// The frontier race needs it. A block being raced is owed by whichever peer the
+// scheduler gave it to, which with the fan-out on is routinely not the sync peer,
+// so the set cannot be worked out from the sync peer and the racers.
+func (t *blockDownloadTracker) OwnersOf(h chainhash.Hash) []*peerpkg.Peer {
+	if t == nil {
+		return nil
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	owners := t.byHash[h]
+	if len(owners) == 0 {
+		return nil
+	}
+
+	now := t.clock()
+	out := make([]*peerpkg.Peer, 0, len(owners))
+
+	for p, rec := range owners {
+		if t.expiredAt(rec.at, now, t.ttl) {
+			continue
+		}
+
+		out = append(out, p)
+	}
+
+	return out
+}
+
 // RequestedWithin reports whether anybody was asked for block h within maxAge.
 // This is the question the inv path asks before requesting a block, so a false
 // answer means "ask somebody", not "punish somebody".

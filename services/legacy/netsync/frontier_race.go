@@ -52,10 +52,23 @@ const (
 
 	// racedBlockGraceTTL is how long we remember that a particular peer was
 	// asked for a particular block as part of a race, so that a late copy from
-	// it is dropped quietly rather than treated as an unrequested block. It
-	// matches the peer package's absolute ceiling on a single block download, so
-	// the grace outlives any copy that could still legitimately be on its way.
-	racedBlockGraceTTL = peerpkg.MaxBlockDownloadTime
+	// it is dropped quietly rather than treated as an unrequested block.
+	//
+	// It is the ledger's own ownership ceiling, not the peer package's 30-minute
+	// constant it used to be. That constant stopped being the ceiling on a block
+	// download when blockDownloadBudget started scaling one: at the IBD defaults
+	// a peer sharing our downlink with seven others is given 95 minutes, so a
+	// grace of 30 left an hour in which a peer still legitimately sending was
+	// disconnected for answering us. Matching the ledger means the grace lasts
+	// exactly as long as the node considers anybody to owe the block at all.
+	//
+	// A residual remains and is worth naming: the scaled budget can outlive the
+	// ledger's ceiling too, so a copy still on the wire past that is punished
+	// either way. Closing it properly means not cancelling the other owners in
+	// the first place, which is what svnode does — its stall race only ever adds
+	// a source and lets each one's own timeout retire it. That is a change to
+	// the shape of this file, not a constant.
+	racedBlockGraceTTL = blockRequestAssignmentTTL
 
 	// racedBlockGraceMaxTracked caps the number of raced block hashes held in
 	// memory at once. Only the frontier is ever raced and only one racer is
@@ -388,15 +401,21 @@ func (sm *SyncManager) noteRaceWinner(hash chainhash.Hash) {
 	sm.frontierRacers = nil
 	sm.frontierMu.Unlock()
 
-	// The peer that already owed us the block is the sync peer, which is never
-	// in the racer set, so add it here.
+	// Everyone who owes us this block, plus everyone we raced it to. The owner
+	// used to be assumed to be the sync peer, which was true only while the sync
+	// peer carried every body: with the fan-out on the frontier belongs to
+	// whichever peer the scheduler gave it to, and a demotion hands the headers
+	// role to someone else while leaving the original owner's assignment where it
+	// is. Assuming wrongly left that peer holding a live in-flight slot for the
+	// whole hour — the stall this helper exists to prevent — and left it out of
+	// the grace set, so its copy arriving later cost it its connection.
 	asked := make(map[*peerpkg.Peer]struct{}, len(racers)+1)
 	for p := range racers {
 		asked[p] = struct{}{}
 	}
 
-	if sp := sm.loadSyncPeer(); sp != nil {
-		asked[sp] = struct{}{}
+	for _, p := range sm.blockDownloads.OwnersOf(hash) {
+		asked[p] = struct{}{}
 	}
 
 	for p := range asked {

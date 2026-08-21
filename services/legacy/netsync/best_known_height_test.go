@@ -2,6 +2,7 @@ package netsync
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 	"testing"
 	"time"
@@ -319,4 +320,59 @@ func TestHandleInvMsg_HeadersFirstInvIsIgnored(t *testing.T) {
 
 	require.False(t, WaitUntil(func() bool { return syncRec.count() > 0 }, invQuietPeriod),
 		"no getdata must go out for an inv received during headers-first sync")
+}
+
+// TestHandleInvMsg_AFullLedgerHoldsTheInvInsteadOfDroppingIt pins the work item.
+//
+// A block the ledger will not take is a block we must not ask for, or the reply
+// arrives with nothing vouching for it and costs an honest peer its connection.
+// That part was right. What was wrong was where the block went: the inv had
+// already been shifted off the request queue before the ledger was consulted, so
+// breaking out of the loop discarded it. The comment relied on the peer
+// announcing it again, and a one-shot inv — the only kind there is past the final
+// checkpoint, where there are no more headers rounds — never comes again.
+//
+// The header walk gets this right by leaving its cursor on the block it could
+// not place. The inv queue has to do the same.
+func TestHandleInvMsg_AFullLedgerHoldsTheInvInsteadOfDroppingIt(t *testing.T) {
+	announced := chainhash.Hash{0xc9}
+
+	// Not in the chain, so it is a block the node would want to fetch.
+	sm := newInvManager(t, nil)
+
+	syncPeer, _, rec := connectRacePeer(t, 66, 900)
+	registerInvPeer(sm, syncPeer, 100)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	// Past the final checkpoint: headers-first mode is off, so an inv is the
+	// only thing that will ever tell us about this block. That is precisely the
+	// case where discarding the work item cannot be recovered from.
+	sm.headersFirstMode.Store(false)
+
+	// Fill the ledger so no new hash can be taken.
+	filler := newTestPeer(t, "localhost:18444")
+
+	for i := 0; i < maxTrackedBlockDownloads; i++ {
+		var h chainhash.Hash
+
+		binary.LittleEndian.PutUint32(h[:4], uint32(i))
+		h[31] = 0xfd
+
+		require.True(t, sm.blockDownloads.Add(filler, h))
+	}
+
+	state, exists := sm.peerStates.Get(syncPeer)
+	require.True(t, exists)
+
+	sm.handleInvMsg(&invMsg{inv: blockInv(announced), peer: syncPeer})
+
+	require.Zero(t, rec.count(),
+		"a block the ledger cannot vouch for must not be asked of anybody")
+
+	require.Equal(t, 1, state.requestQueue.Length(),
+		"the announcement is the only record that this block exists, so it must stay queued until there is room")
+
+	held, ok := state.requestQueue.Get(0)
+	require.True(t, ok)
+	require.Equal(t, announced, held.Hash, "the held item must be the block that could not be placed")
 }

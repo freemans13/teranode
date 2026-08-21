@@ -720,3 +720,55 @@ func TestFrontierRace_AFullLedgerDoesNotSuppressTheRaceForever(t *testing.T) {
 	require.True(t, sm.blockDownloads.HasOwner(other, frontier),
 		"the second peer's reply must be authorised in advance")
 }
+
+// TestNoteRaceWinner_CancelsTheRealOwnerNotTheSyncPeer covers the shape its
+// sibling above does not: the frontier owed by a peer that is not the sync peer.
+//
+// That is the ordinary case once bodies come from every eligible peer. The
+// frontier belongs to whichever peer the scheduler gave it to, and a demotion
+// moves the headers role to somebody else while leaving the original owner's
+// assignment exactly where it is. Assuming the owner was the sync peer had two
+// costs: the real owner kept a live in-flight slot for the whole hour-long
+// ownership ceiling — the stall this helper exists to prevent — and it was left
+// out of the grace set, so its copy turning up later cost an honest peer its
+// whole association.
+func TestNoteRaceWinner_CancelsTheRealOwnerNotTheSyncPeer(t *testing.T) {
+	sm := newRaceManager(t)
+
+	// The sync peer is below the frontier height, so it is neither the owner nor
+	// an eligible racer, and the racer choice is deterministic.
+	syncPeer, _, syncRec := connectRacePeer(t, 20, 100)
+	owner, _, _ := connectRacePeer(t, 21, 1000)
+	racer, _, racerRec := connectRacePeer(t, 22, 1000)
+
+	registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, owner)
+	registerRacePeer(sm, racer)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	frontier := chainhash.Hash{0xef}
+
+	// A non-sync peer owes the frontier, which is what the scheduler produces.
+	require.True(t, sm.blockDownloads.Add(owner, frontier))
+	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
+
+	sm.raceFrontierBlock(time.Now())
+
+	require.True(t, WaitUntil(func() bool { return racerRec.count() > 0 }, 5*time.Second),
+		"precondition: the eligible peer was raced the frontier block")
+	require.Zero(t, syncRec.count(), "the peer below the frontier height must not be asked")
+
+	sm.noteRaceWinner(frontier)
+
+	require.False(t, sm.blockDownloads.HasOwner(owner, frontier),
+		"the peer that actually owed the block must have its request cancelled, or it holds an in-flight slot for the hour")
+	require.False(t, sm.blockDownloads.HasOwner(racer, frontier),
+		"the racer's request must be cancelled too")
+
+	// And both must be forgiven a late copy, the owner included — it is the one
+	// whose copy is most likely still on the wire, since it was asked first.
+	require.True(t, sm.BlockRacedTo(owner, &frontier),
+		"the real owner must not be punished for answering the question we asked it")
+	require.True(t, sm.BlockRacedTo(racer, &frontier),
+		"the racer must not be punished either")
+}

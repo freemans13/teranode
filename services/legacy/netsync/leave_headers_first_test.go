@@ -152,3 +152,52 @@ func TestLeaveHeadersFirstMode_LetsSyncAskForTheNextBatchAgain(t *testing.T) {
 	require.True(t, WaitUntil(func() bool { return rec.count() > 0 }, 5*time.Second),
 		"with no headers left and nothing in flight, sync must ask the peer for the next batch of blocks")
 }
+
+// TestHandleHeadersMsg_SurvivesTheCheckpointGoingNilUnderIt pins the window
+// between advancing past the final checkpoint and actually leaving headers-first
+// mode.
+//
+// checkpointBlockCommitted sets nextCheckpoint to nil under headerMu and only
+// calls leaveHeadersFirstMode after releasing the lock. A headers goroutine that
+// had already passed the mode check can take the lock in that gap and read the
+// nil. Multi-peer demotion makes overlapping headers replies from the outgoing
+// and incoming sync peer ordinary, so this is a state a running node reaches
+// rather than a theoretical one — and the two reads it makes of nextCheckpoint
+// were bare dereferences, so it did not fail gracefully, it panicked and took
+// the goroutine with it.
+//
+// The end state asserted is the one that matters: the batch is handled without
+// panicking, and nothing is asked for on behalf of a mode we are leaving.
+func TestHandleHeadersMsg_SurvivesTheCheckpointGoingNilUnderIt(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xe1}
+	msg, _ := linkedHeaders(anchor, 3, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+
+	peer, _, _ := connectRacePeer(t, 60, 1000)
+	registerRacePeer(sm, peer)
+	sm.storeSyncPeer(peer, &syncPeerState{})
+
+	sm.resetHeaderState(&anchor, 10)
+	sm.headersFirstMode.Store(true)
+
+	// The state the gap leaves behind: past the final checkpoint, but the mode
+	// flag has not been turned off yet.
+	sm.headerMu.Lock()
+	sm.nextCheckpoint = nil
+	sm.headerMu.Unlock()
+
+	require.NotPanics(t, func() {
+		sm.handleHeadersMsg(&headersMsg{headers: msg, peer: peer})
+	}, "a headers batch arriving past the final checkpoint must not take the goroutine down")
+
+	require.True(t, peer.Connected(),
+		"the sender answered our own getheaders and must not be punished for the checkpoint moving")
+
+	// And the batch was actually processed rather than the goroutine dying
+	// part-way through it: the anchor plus three linked headers.
+	require.Equal(t, 4, sm.headerListLen(),
+		"the headers must still link, or the guard has turned a panic into silently dropping the batch")
+}
