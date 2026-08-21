@@ -359,9 +359,10 @@ func (u *Server) loadSubtreeBatch(ctx, fetchCtx context.Context, request *subtre
 // wrapCheckBlockSubtreesErr prepares a CheckBlockSubtrees failure for the gRPC
 // boundary.
 //
-// It exists because teranode's *Error carries no GRPCStatus method and this
-// service installs no server-side error interceptor. A bare *Error returned from
-// a handler therefore crosses the wire as codes.Unknown with no status details,
+// It exists because teranode's *Error carries no GRPCStatus method, and the only
+// server-side interceptors util's getGRPCServer installs are tracing and
+// prometheus metrics — neither converts errors. A bare *Error returned from a
+// handler therefore crosses the wire as codes.Unknown with no status details,
 // and the caller's errors.UnwrapGRPC rebuilds a single generic ERR_ERROR holding
 // nothing but flattened message text. Every error code in the chain is lost, so
 // every errors.Is check in block validation misses — including the ones that
