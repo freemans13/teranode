@@ -769,3 +769,52 @@ func TestSubtreeMetaRegenerator_TruncatedLocalFallsBackToPeer(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, stored)
 }
+
+// TestSubtreeMetaRegenerator_PlaceholderExemptionMatchesValidateSubtree pins that
+// node 0 is exempt only where validateSubtree also skips it — the block's first
+// subtree. Exempting node 0 of any subtree that happens to carry a placeholder
+// leaves TxInpoints[0] unset on a later subtree that validateSubtree does not
+// skip, and GetParentTxHashes returning nil there is a BlockInvalidError on a
+// valid block: a consensus-shaped verdict manufactured by the two predicates
+// disagreeing.
+func TestSubtreeMetaRegenerator_PlaceholderExemptionMatchesValidateSubtree(t *testing.T) {
+	ctx := context.Background()
+
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+
+	// Node 0 is the coinbase placeholder, node 1 a real transaction.
+	subtree := &subtreepkg.Subtree{Nodes: []subtreepkg.Node{
+		{Hash: subtreepkg.CoinbasePlaceholderHashValue},
+		{Hash: *tx1.TxIDChainHash()},
+	}}
+	subtreeHash := subtree.RootHash()
+
+	// Subtree data carrying only the real transaction — what a placeholder at
+	// node 0 always produces, since a placeholder has no transaction.
+	data := subtreepkg.NewSubtreeData(subtree)
+	data.Txs[1] = tx1
+
+	serialized, err := data.Serialize()
+	require.NoError(t, err)
+
+	store := memory.New()
+	require.NoError(t, store.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData, serialized))
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, nil, func() uint32 { return 100 }, 288, 0)
+
+	t.Run("the first subtree exempts node 0", func(t *testing.T) {
+		meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree, true)
+		require.NoError(t, err)
+		require.NotNil(t, meta)
+	})
+
+	t.Run("a later subtree does not", func(t *testing.T) {
+		// validateSubtree would not skip node 0 here, so a meta with no inpoints
+		// there gets the block condemned. Failing regeneration keeps the error
+		// transient instead.
+		meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree, false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "no transaction for node 0")
+		require.Nil(t, meta)
+	})
+}
