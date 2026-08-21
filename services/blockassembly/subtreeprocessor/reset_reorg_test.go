@@ -1714,6 +1714,6 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 
 		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward})
 		require.Error(t, err, "a torn subtree meta must fail the reorg, not be trusted and not panic")
-		require.Contains(t, err.Error(), "invalid subtree meta")
+		require.Contains(t, err.Error(), "error deserializing subtree meta")
 	})
 }
