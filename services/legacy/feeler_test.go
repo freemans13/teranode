@@ -1699,3 +1699,100 @@ func serveFeelerSnapshotSequence(srv *server, snaps []feelerSnapshot) {
 		}
 	}()
 }
+
+// recordingLogger counts what was logged at each level, so a test can assert on
+// the level a line came out at rather than on its text.
+type recordingLogger struct {
+	ulogger.Logger
+
+	mtx   sync.Mutex
+	warns int
+	errs  int
+}
+
+func (l *recordingLogger) Warnf(format string, args ...interface{}) {
+	l.mtx.Lock()
+	l.warns++
+	l.mtx.Unlock()
+}
+
+func (l *recordingLogger) Errorf(format string, args ...interface{}) {
+	l.mtx.Lock()
+	l.errs++
+	l.mtx.Unlock()
+}
+
+func (l *recordingLogger) counts() (int, int) {
+	l.mtx.Lock()
+	defer l.mtx.Unlock()
+
+	return l.warns, l.errs
+}
+
+// TestQuietProbeLoggerKeepsAProbeOutOfTheDisconnectCount is the test for the
+// third thing the first mainnet soak found.
+//
+// Probing a non-BSV host produced two loud lines: the probe peer's read loop met
+// a command the BSV parser cannot handle, logged an ERROR, and disconnected at
+// WARN with "reason: malformed message". That WARN is the exact line the
+// disconnect-rate measurements key on, so the feeler inflated the number this
+// series exists to drive down - on every probe of the fork clients it is built to
+// find and ban.
+//
+// The log-once guard cannot fix it: the read loop's teardown ran first and won,
+// so the guard suppressed the feeler's own quiet line and let the warning stand.
+// The fix is to quieten the probe peer's logger instead.
+func TestQuietProbeLoggerKeepsAProbeOutOfTheDisconnectCount(t *testing.T) {
+	rec := &recordingLogger{Logger: ulogger.TestLogger{}}
+
+	quiet := quietProbeLogger{rec}
+
+	quiet.Warnf("Disconnecting (%s) reason: %s", "1.2.3.4:8333", "malformed message")
+	quiet.Errorf("Can't read message from %s: %v", "1.2.3.4:8333", errDeadHost)
+
+	warns, errs := rec.counts()
+	require.Zero(t, warns, "a probe peer must never log at warn: that level is the disconnect-rate anchor")
+	require.Zero(t, errs, "nor at error")
+
+	// The counterpart: the wrapper must pass everything else straight through,
+	// or quietening the probe would blind the feeler's own reporting too.
+	plain := &recordingLogger{Logger: ulogger.TestLogger{}}
+	plain.Warnf("a real peer problem")
+	plain.Errorf("another")
+
+	warns, errs = plain.counts()
+	require.Equal(t, 1, warns, "the underlying logger must still count what is sent straight to it")
+	require.Equal(t, 1, errs)
+}
+
+// TestFeelerProbeOfANonBSVHostStaysQuiet drives the whole path against a listener
+// that answers with a Bitcoin Cash user agent and then sends a command the BSV
+// parser cannot handle, which is what the mainnet host actually did.
+//
+// The assertion is on the level, not the text: no warning may escape a probe,
+// because a probe is not a peer the node lost.
+func TestFeelerProbeOfANonBSVHostStaysQuiet(t *testing.T) {
+	ln, _ := startFeelerTestListener(t, "/Bitcoin Cash Node:29.1.0(EB32.0)/")
+
+	swapTestConfig(t, ln.Addr().String())
+
+	srv := newFeelerTestServer(t)
+	rec := &recordingLogger{Logger: ulogger.TestLogger{}}
+	srv.logger = rec
+
+	serveFeelerSnapshot(srv, feelerSnapshot{})
+	atLeastTwoAutomaticPeers(t, srv)
+
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+	srv.addrManager.AddAddress(na, testSourceAddr())
+
+	runOneProbe(srv)
+
+	require.Equal(t, uint64(0), srv.feelerVerified.Load(),
+		"a Bitcoin Cash node must never be promoted")
+
+	warns, errs := rec.counts()
+	require.Zero(t, warns,
+		"probing a fork client must not add to the disconnect-rate measurement")
+	require.Zero(t, errs, "nor log an error for a host behaving exactly as expected")
+}
