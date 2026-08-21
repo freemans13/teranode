@@ -17,8 +17,12 @@ import (
 
 // SubtreeMetaRegeneratorI defines the interface for regenerating missing subtree meta files
 type SubtreeMetaRegeneratorI interface {
-	// RegenerateMeta attempts to rebuild meta from subtreedata (local or from peers)
-	RegenerateMeta(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree) (*subtreepkg.Meta, error)
+	// RegenerateMeta attempts to rebuild meta from subtreedata (local or from peers).
+	// isFirstSubtree says whether this is the block's first subtree, which is the
+	// only one whose node 0 may hold the coinbase placeholder; the rebuild has to
+	// apply the same rule validateSubtree does, or it produces a meta with a hole
+	// the caller then condemns the block for.
+	RegenerateMeta(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, isFirstSubtree bool) (*subtreepkg.Meta, error)
 }
 
 // SubtreeStoreReader is a subset of blob.Store for reading subtree data
@@ -67,30 +71,49 @@ func NewSubtreeMetaRegenerator(logger ulogger.Logger, subtreeStore SubtreeStoreW
 
 // RegenerateMeta attempts to rebuild meta from subtreedata (local store or peers)
 // Returns the regenerated meta or an error if regeneration fails
-func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree) (*subtreepkg.Meta, error) {
+func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, isFirstSubtree bool) (*subtreepkg.Meta, error) {
 	r.logger.Warnf("[RegenerateMeta][%s] attempting to regenerate subtree meta", subtreeHash.String())
 
-	// Try local subtreedata first
-	data, err := r.getLocalSubtreeData(ctx, subtreeHash, subtree)
-	if err == nil {
-		return r.buildAndStoreMeta(ctx, subtreeHash, subtree, data)
+	// A successful read is not a successful rebuild: go-subtree's data
+	// deserializer stops at io.EOF without reporting that it filled fewer nodes
+	// than the subtree has, so a truncated .subtreeData comes back with a nil
+	// error and only fails buildAndStoreMeta's completeness check. Treating that
+	// like a read failure — rather than returning it — is what keeps the peer
+	// fallback reachable; otherwise a truncated local file strands a block that
+	// any peer could repair.
+	var lastErr error
+
+	tryBuild := func(source string, data *subtreepkg.Data, readErr error) (*subtreepkg.Meta, bool) {
+		if readErr != nil {
+			lastErr = readErr
+
+			r.logger.Warnf("[RegenerateMeta][%s] %s subtreedata not available: %v", subtreeHash.String(), source, readErr)
+
+			return nil, false
+		}
+
+		meta, buildErr := r.buildAndStoreMeta(ctx, subtreeHash, subtree, data, isFirstSubtree)
+		if buildErr != nil {
+			lastErr = buildErr
+
+			r.logger.Warnf("[RegenerateMeta][%s] %s subtreedata unusable: %v", subtreeHash.String(), source, buildErr)
+
+			return nil, false
+		}
+
+		return meta, true
 	}
 
-	r.logger.Warnf("[RegenerateMeta][%s] local subtreedata not found: %v", subtreeHash.String(), err)
-
-	// Fall back to peers. lastErr starts as the local failure so the returned
-	// error always carries a cause: with no peers configured it explains why
-	// the local lookup missed, rather than reporting a bare "not available".
-	lastErr := err
+	data, err := r.getLocalSubtreeData(ctx, subtreeHash, subtree)
+	if meta, ok := tryBuild("local", data, err); ok {
+		return meta, nil
+	}
 
 	for _, peerURL := range r.peerURLs {
 		data, err = r.getSubtreeDataFromPeer(ctx, subtreeHash, subtree, peerURL)
-		if err == nil {
-			return r.buildAndStoreMeta(ctx, subtreeHash, subtree, data)
+		if meta, ok := tryBuild(peerURL, data, err); ok {
+			return meta, nil
 		}
-
-		lastErr = err
-		r.logger.Warnf("[RegenerateMeta][%s] peer %s failed: %v", subtreeHash.String(), peerURL, err)
 	}
 
 	return nil, errors.NewProcessingError("[RegenerateMeta][%s] subtreedata not available locally or from peers", subtreeHash.String(), lastErr)
@@ -149,8 +172,8 @@ func (r *SubtreeMetaRegenerator) getSubtreeDataFromPeer(ctx context.Context, sub
 }
 
 // buildAndStoreMeta creates meta from subtree data and stores it for future use
-func (r *SubtreeMetaRegenerator) buildAndStoreMeta(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, data *subtreepkg.Data) (*subtreepkg.Meta, error) {
-	meta, err := r.buildMetaFromSubtreeData(subtree, data)
+func (r *SubtreeMetaRegenerator) buildAndStoreMeta(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, data *subtreepkg.Data, isFirstSubtree bool) (*subtreepkg.Meta, error) {
+	meta, err := r.buildMetaFromSubtreeData(subtree, data, isFirstSubtree)
 	if err != nil {
 		return nil, err
 	}
@@ -162,10 +185,15 @@ func (r *SubtreeMetaRegenerator) buildAndStoreMeta(ctx context.Context, subtreeH
 }
 
 // buildMetaFromSubtreeData creates meta from subtree data containing all transactions
-func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Subtree, data *subtreepkg.Data) (*subtreepkg.Meta, error) {
+func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Subtree, data *subtreepkg.Data, isFirstSubtree bool) (*subtreepkg.Meta, error) {
 	meta := subtreepkg.NewSubtreeMeta(subtree)
 
-	hasCoinbasePlaceholder := subtree.Length() > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+	// Same predicate validateSubtree uses to skip node 0 (sIdx == 0 && snIdx == 0 &&
+	// node is the placeholder). Exempting node 0 of any subtree that happens to
+	// carry a placeholder would leave TxInpoints[0] unset on a later subtree that
+	// validateSubtree does not skip, and GetParentTxHashes returning nil there is
+	// a BlockInvalidError on a valid block.
+	hasCoinbasePlaceholder := isFirstSubtree && subtree.Length() > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
 
 	for i, tx := range data.Txs {
 		if tx == nil {
@@ -188,20 +216,32 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 	// error, validOrderAndBlessed reads that as "transaction could not be found in tx meta
 	// data" and raises ErrBlockInvalid, and ValidateBlock then calls storeInvalidBlock — a
 	// valid block permanently invalidated, which is the outcome this PR exists to prevent.
-	// Fail regeneration instead so the error stays transient.
+	// Fail regeneration instead so the error stays transient, and so RegenerateMeta moves on
+	// to the peers rather than accepting a rebuild it cannot use.
 	//
-	// Meta.Serialize exempts index 0 unconditionally, but only the first subtree of a block
-	// carries the coinbase placeholder there — for every other subtree node 0 is a real
-	// transaction, so it is checked too.
-	firstChecked := 0
-	if hasCoinbasePlaceholder {
-		firstChecked = 1
+	// The test is on the source data, not on the built meta. A nil ParentTxHashes does not
+	// mean "nothing was recorded for this node": newSizedFromInputs leaves it nil for a
+	// transaction with no inputs, and the wire deserializer leaves it nil whenever the
+	// parent count is zero. Both are fully-present nodes, and keying the check off them
+	// would fail regeneration permanently on data that is entirely intact. data.Txs[i] == nil
+	// is the signal the loop above already skips on, and it means exactly what is wanted
+	// here: the deserializer never filled this node.
+	//
+	// Node 0 is exempt only where it holds the coinbase placeholder — the same condition
+	// validateSubtree uses to skip it, so the two agree rather than one leaving a hole the
+	// other then condemns the block for.
+	for i := 0; i < subtree.Length() && i < len(data.Txs); i++ {
+		if i == 0 && hasCoinbasePlaceholder {
+			continue
+		}
+
+		if data.Txs[i] == nil {
+			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: no transaction for node %d of %d", i, subtree.Length())
+		}
 	}
 
-	for i := firstChecked; i < subtree.Length(); i++ {
-		if meta.TxInpoints[i].ParentTxHashes == nil {
-			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: no inpoints for node %d of %d", i, subtree.Length())
-		}
+	if len(data.Txs) < subtree.Length() {
+		return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: %d transactions for %d nodes", len(data.Txs), subtree.Length())
 	}
 
 	return meta, nil

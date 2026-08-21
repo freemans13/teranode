@@ -4212,7 +4212,7 @@ func (stp *SubtreeProcessor) moveBackBlockGetSubtrees(ctx context.Context, block
 				// file is on disk.
 				subtreeMeta, err := model.NewSubtreeMetaFromValidatedReader(*subtreeHash, subtree, subtreeMetaReader)
 				if err != nil {
-					return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] invalid subtree meta", block.String(), err)
+					return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] error deserializing subtree meta", block.String(), err)
 				}
 
 				subtreeMetaTxInpoints[idx] = subtreeMeta.TxInpoints

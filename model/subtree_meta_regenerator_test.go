@@ -148,7 +148,7 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_FromLocal(t *testing.T) {
 	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, nil, func() uint32 { return 100 }, 288, 0)
 
 	// Test regeneration
-	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
 
 	require.NoError(t, err)
 	require.NotNil(t, meta)
@@ -219,7 +219,7 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_FromPeer(t *testing.T) {
 	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
 
 	// Test regeneration
-	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
 
 	require.NoError(t, err)
 	require.NotNil(t, meta)
@@ -259,7 +259,7 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_AllSourcesFail(t *testing.T) {
 	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
 
 	// Test regeneration should fail
-	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
 
 	require.Error(t, err)
 	require.Nil(t, meta)
@@ -296,7 +296,7 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_NilStore_PeerFallback(t *testing.
 	// Create regenerator with nil store - should still work via peer
 	regenerator := NewSubtreeMetaRegenerator(logger, nil, []string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
 
-	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
 
 	require.NoError(t, err)
 	require.NotNil(t, meta)
@@ -336,7 +336,7 @@ func TestSubtreeMetaRegenerator_RegenerateMeta_RejectsIncompleteSubtreeData(t *t
 
 	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, nil, func() uint32 { return 100 }, 288, 0)
 
-	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree)
+	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree, true)
 
 	require.Error(t, err, "regeneration from truncated subtree data must fail, not return a partial meta")
 	require.Nil(t, meta)
@@ -378,7 +378,7 @@ func TestSubtreeMetaRegenerator_RejectsMissingInpointsAtNodeZero(t *testing.T) {
 
 	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, nil, func() uint32 { return 100 }, 288, 0)
 
-	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree)
+	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree, true)
 	require.Error(t, err, "a rebuild with no inpoints for the real transaction at node 0 must fail")
 	require.Nil(t, meta)
 
@@ -546,7 +546,7 @@ func TestSubtreeMetaRegenerator_RetriesOn503(t *testing.T) {
 
 	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, []string{server.URL}, func() uint32 { return 100 }, 288, 0)
 
-	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
 
 	require.NoError(t, err)
 	require.NotNil(t, meta)
@@ -566,7 +566,7 @@ func TestSubtreeMetaRegenerator_NoPeers_CleanError(t *testing.T) {
 
 	regenerator := NewSubtreeMetaRegenerator(logger, mockStore, nil, func() uint32 { return 100 }, 288, 0)
 
-	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
 
 	require.Error(t, err)
 	require.Nil(t, meta)
@@ -635,7 +635,7 @@ func TestSubtreeMetaRegenerator_IncompletePeerBody_IsTransient(t *testing.T) {
 			regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, mockStore,
 				[]string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
 
-			meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+			meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
 
 			require.Error(t, err, "an incomplete body must not yield a meta")
 			require.Nil(t, meta)
@@ -684,7 +684,7 @@ func TestSubtreeMetaRegenerator_StalledPeer_IsBounded(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+		_, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
 		done <- err
 	}()
 
@@ -713,4 +713,59 @@ func TestSubtreeMetaRegenerator_PeerFetchTimeoutFallback(t *testing.T) {
 
 	r := NewSubtreeMetaRegenerator(logger, mockStore, nil, height, 288, 90*time.Second)
 	require.Equal(t, 90*time.Second, r.peerFetchTimeout, "an explicit timeout must be honoured")
+}
+
+// TestSubtreeMetaRegenerator_TruncatedLocalFallsBackToPeer pins that an
+// incomplete local rebuild does not short-circuit the peer loop. The data
+// deserializer stops at io.EOF without reporting a short fill, so a truncated
+// .subtreeData reads back with a nil error and only fails the completeness
+// check. Returning that failure directly — as this code did when the
+// completeness check was first added — strands a block permanently even though
+// a peer holds an intact copy of exactly the file needed to repair it.
+func TestSubtreeMetaRegenerator_TruncatedLocalFallsBackToPeer(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	ctx := context.Background()
+
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+	tx2 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000002", 1)
+
+	subtree := createTestSubtree([]chainhash.Hash{*tx1.TxIDChainHash(), *tx2.TxIDChainHash()})
+	subtreeHash := subtree.RootHash()
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	subtreeData.Txs[1] = tx1
+	subtreeData.Txs[2] = tx2
+
+	full, err := subtreeData.Serialize()
+	require.NoError(t, err)
+
+	// Local copy is short; the peer's is intact.
+	store := memory.New()
+	require.NoError(t, store.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData, full[:len(tx1.SerializeBytes())]))
+
+	var peerHits int
+
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		peerHits++
+
+		_, _ = w.Write(full)
+	}))
+	defer peer.Close()
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, []string{peer.URL}, func() uint32 { return 100 }, 288, 0)
+
+	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree, true)
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+	require.Equal(t, 1, peerHits, "the peer must be asked once the local rebuild comes back incomplete")
+
+	parents, err := meta.GetParentTxHashes(2)
+	require.NoError(t, err)
+	require.NotEmpty(t, parents, "the repaired meta must carry the tail node's inpoints")
+
+	// The repaired meta replaces the unusable local file.
+	stored, err := store.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
+	require.NoError(t, err)
+	require.NotEmpty(t, stored)
 }

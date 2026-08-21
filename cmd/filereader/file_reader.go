@@ -19,6 +19,7 @@ package filereader
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -263,31 +264,42 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 		return errors.NewProcessingError(msgErrorReadingSubtree, err)
 	}
 
-	var subtreeMeta *subtree.Meta
-
 	// Print what the subtree file says before touching the meta, so an operator
 	// triaging a rejected meta still gets both sides of the comparison.
 	fmt.Printf("Subtree root hash: %s\n", st.RootHash())
 
 	fmt.Printf(numTransactionsFormat, st.Length())
 
-	// Route through the validated reader rather than the raw one: this is the
-	// tool an operator reaches for to inspect a suspect .subtreeMeta, and on an
-	// over-long claimed count the raw deserializer writes past its slice and the
-	// CLI dies with an index out of range instead of naming the defect
-	// (issue 1425). The validated reader names the mismatched root or count,
-	// which is the diagnosis the operator came for.
-	//
-	// Unlike block validation this compares against the .subtree file's own
-	// claimed root, because the CLI is pointed at a pair of files and has no
-	// block to supply the committed hash. Two consequences worth knowing when
-	// reading the output: a torn .subtree header is reported here as a meta root
-	// hash mismatch, naming the wrong file of the two; and a rejected meta stops
-	// the run, so the TxInpoints dump below is skipped for exactly the corrupt
-	// file an operator may have opened the tool to inspect.
-	subtreeMeta, err = blockmodel.NewSubtreeMetaFromValidatedReader(*st.RootHash(), st, br)
+	// Buffer the meta so a rejection can still be inspected. The whole point of
+	// this tool is the file that will not load, so it reports the defect and then
+	// dumps whatever the body yields, rather than returning and leaving the
+	// operator with a verdict and no data.
+	metaBytes, err := io.ReadAll(br)
 	if err != nil {
 		return errors.NewProcessingError("error reading subtree meta", err)
+	}
+
+	// Route through the validated reader rather than the raw one: on an over-long
+	// claimed count the raw deserializer writes past its slice and the CLI dies
+	// with an index out of range instead of naming the defect (issue 1425). The
+	// validated reader names the mismatched root or count, which is the diagnosis
+	// the operator came for.
+	//
+	// Unlike block validation this compares against the .subtree file's own
+	// claimed root, because the CLI is pointed at a pair of files and has no block
+	// to supply a committed hash. So a torn .subtree header is reported here as a
+	// meta root hash mismatch, naming the other file of the two — worth knowing
+	// when reading the output.
+	subtreeMeta, err := blockmodel.NewSubtreeMetaFromValidatedReader(*st.RootHash(), st, bytes.NewReader(metaBytes))
+	if err != nil {
+		fmt.Printf("Subtree meta REJECTED: %v\n", err)
+
+		subtreeMeta = parseSubtreeMetaBestEffort(st, metaBytes)
+		if subtreeMeta == nil {
+			return errors.NewProcessingError("error reading subtree meta", err)
+		}
+
+		fmt.Printf("Dumping the body anyway; entries below come from a file that failed validation.\n")
 	}
 
 	if verbose {
@@ -302,6 +314,31 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 	}
 
 	return nil
+}
+
+// parseSubtreeMetaBestEffort re-parses a meta the validated reader rejected, so
+// the CLI can still show its contents. Returns nil when the body cannot be
+// parsed at all — including the over-long-count shape, where go-subtree's
+// deserializer indexes past its destination slice and panics. Recovering is
+// right here and wrong in the node: this is a diagnostic tool being pointed at a
+// file already known to be malformed, and the alternative is showing nothing.
+func parseSubtreeMetaBestEffort(st *subtree.Subtree, metaBytes []byte) (meta *subtree.Meta) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Body could not be parsed: %v\n", r)
+
+			meta = nil
+		}
+	}()
+
+	parsed, err := subtree.NewSubtreeMetaFromReader(st, bytes.NewReader(metaBytes))
+	if err != nil {
+		fmt.Printf("Body could not be parsed: %v\n", err)
+
+		return nil
+	}
+
+	return parsed
 }
 
 // handleBlockHeader processes the unnamed block header case.

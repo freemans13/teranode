@@ -5,9 +5,9 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -166,93 +166,101 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 	})
 }
 
-// TestCommittedSubtreeHash pins which hash the meta header is validated against.
-// subtree.RootHash() is the 32 bytes the deserializer cached verbatim from the
-// .subtree file header, so validating one file's claim against another's would
-// let a torn .subtree header reject a good meta and let a foreign .subtree pass
-// alongside its own meta. The block header's committed list is the authority.
-func TestCommittedSubtreeHash(t *testing.T) {
-	subtree, _, block := buildMetaFixture(t)
-
-	// Compared by value throughout: the assertions are about which hash comes
-	// back, not which pointer.
-	t.Run("falls back to the subtree root when no committed list is present", func(t *testing.T) {
-		require.Empty(t, block.Subtrees)
-		require.Equal(t, *subtree.RootHash(), *block.committedSubtreeHash(0, subtree))
-	})
-
-	t.Run("prefers the block-header-committed hash", func(t *testing.T) {
-		committed := chainhash.HashH([]byte{0xc0, 0xde})
-		withList := &Block{
-			Header:   block.Header,
-			Subtrees: []*chainhash.Hash{&committed},
-		}
-
-		require.Equal(t, committed, *withList.committedSubtreeHash(0, subtree))
-		require.NotEqual(t, *subtree.RootHash(), *withList.committedSubtreeHash(0, subtree))
-	})
-
-	t.Run("falls back when the committed entry is nil or out of range", func(t *testing.T) {
-		withNil := &Block{Header: block.Header, Subtrees: []*chainhash.Hash{nil}}
-		require.Equal(t, *subtree.RootHash(), *withNil.committedSubtreeHash(0, subtree))
-		require.Equal(t, *subtree.RootHash(), *withNil.committedSubtreeHash(1, subtree))
-	})
-}
-
-// TestValidateSubtreeCommittedHashMismatch pins the tie between the .subtree
-// file and the hash the proof of work commits to. GetAndValidateSubtrees stores
-// whatever sits under the blob key without comparing it, and RootHash() returns
-// the bytes the file header claimed rather than a recomputation, so without this
-// a genuine-but-foreign .subtree under the right key is validated as the
-// committed one and its meta — which agrees with the key — passes the header
-// check, attributing another subtree's inputs to this one.
-//
-// It also pins the routing at the meta-read call site. The check compares
-// RootHash() against committedSubtreeHash(), so reverting that call site to
-// subtree.RootHash() turns the comparison into a tautology and the mismatch case
-// below stops failing.
-func TestValidateSubtreeCommittedHashMismatch(t *testing.T) {
+// TestSubtreeBoundToItsKey pins the load-site binding. The .subtree file's root
+// hash is cached verbatim from its header by DeserializeFromReaderWithAllocator
+// and RootHash() never recomputes it, so without this comparison a
+// genuine-but-foreign subtree stored under the right key is accepted as the
+// committed one and every later consumer of RootHash() inherits that.
+// CheckMerkleRoot does not close it: for subtree 0 it recomputes the root via
+// RootHashWithReplaceRootNode, so the file's cached root is never compared there.
+func TestSubtreeBoundToItsKey(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.TestLogger{}
 
-	newCtx := func() *validationContext {
-		return &validationContext{
-			currentBlockHeaderHashesMap: map[chainhash.Hash]struct{}{},
-			currentBlockHeaderIDsMap:    map[uint32]struct{}{},
-		}
+	// storeSubtree writes subtree's serialized bytes under an arbitrary key, which
+	// is what lets the mismatch case exist at all.
+	storeSubtree := func(t *testing.T, st *subtreepkg.Subtree, key chainhash.Hash) SubtreeStore {
+		t.Helper()
+
+		b, err := st.Serialize()
+		require.NoError(t, err)
+
+		store := memory.New()
+		require.NoError(t, store.Set(ctx, key[:], fileformat.FileTypeSubtree, b))
+
+		return store
 	}
 
-	t.Run("a subtree that does not match its committed hash is rejected", func(t *testing.T) {
-		subtree, metaBytes, block := buildMetaFixture(t)
+	t.Run("a subtree stored under a foreign key is rejected", func(t *testing.T) {
+		subtree, _, block := buildMetaFixture(t)
 
-		// Serve the meta under the committed key, so the rejection is the
-		// subtree/committed mismatch and not a missing file.
-		committed := chainhash.HashH([]byte{0xc0, 0xde})
-		block.Subtrees = []*chainhash.Hash{&committed}
+		foreign := chainhash.HashH([]byte{0xc0, 0xde})
+		block.Subtrees = []*chainhash.Hash{&foreign}
 
-		deps := &validationDependencies{subtreeStore: newMemSubtreeStore(t, committed[:], metaBytes)}
-
-		err := block.validateSubtree(ctx, logger, deps, newCtx(), subtree, 0)
+		err := block.GetAndValidateSubtrees(ctx, logger, storeSubtree(t, subtree, foreign), 1)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "does not match its committed hash")
+		require.Contains(t, err.Error(), "does not match its key")
 	})
 
-	t.Run("a subtree matching its committed hash gets past the check", func(t *testing.T) {
-		subtree, metaBytes, block := buildMetaFixture(t)
+	t.Run("a subtree stored under its own root hash is accepted", func(t *testing.T) {
+		subtree, _, block := buildMetaFixture(t)
 
-		committed := *subtree.RootHash()
-		block.Subtrees = []*chainhash.Hash{&committed}
+		key := *subtree.RootHash()
+		block.Subtrees = []*chainhash.Hash{&key}
 
-		deps := &validationDependencies{subtreeStore: newMemSubtreeStore(t, committed[:], metaBytes)}
-		block.txMap = txmap.NewSplitSwissMapUint64(10)
+		// GetAndValidateSubtrees goes on to size the block, which reads the
+		// coinbase; the fixture only needs it to be non-nil.
+		coinbase, err := bt.NewTxFromString(CoinbaseHex)
+		require.NoError(t, err)
 
-		// Validation carries on into the per-transaction checks, which this
-		// fixture deliberately does not satisfy — the leaves were never added
-		// to txMap — so assert on what this check is responsible for rather
-		// than on overall success.
-		err := block.validateSubtree(ctx, logger, deps, newCtx(), subtree, 0)
-		require.Error(t, err)
-		require.NotContains(t, err.Error(), "does not match its committed hash")
-		require.Contains(t, err.Error(), "not in the txMap")
+		block.CoinbaseTx = coinbase
+
+		require.NoError(t, block.GetAndValidateSubtrees(ctx, logger, storeSubtree(t, subtree, key), 1))
+		require.Equal(t, key, *block.SubtreeSlices[0].RootHash())
 	})
+}
+
+// TestMetaCountCheckedAgainstLength pins which of the subtree's two notions of
+// size the entry count is compared with. Meta.serializeTxInpoints writes
+// Length(); Size() is cap(Nodes) and can be larger, because block validation
+// deserializes with a pooled node allocator that rounds capacity up to a size
+// class and because an incomplete final subtree is legitimately short. Every
+// other fixture in this file has Size() == Length(), the one case where the two
+// coincide, so switching the reader to Size() would pass the whole suite while
+// rejecting every incomplete final subtree in production.
+func TestMetaCountCheckedAgainstLength(t *testing.T) {
+	ctx := context.Background()
+
+	// Capacity for 8, filled with 3: Size() == 8, Length() == 3.
+	subtree, err := subtreepkg.NewTreeByLeafCount(8)
+	require.NoError(t, err)
+
+	for i := byte(0); i < 3; i++ {
+		require.NoError(t, subtree.AddNode(chainhash.HashH([]byte{i, 0x11}), 1, 0))
+	}
+
+	require.Greater(t, subtree.Size(), subtree.Length(), "fixture must have spare capacity or it tests nothing")
+
+	meta := subtreepkg.NewSubtreeMeta(subtree)
+
+	for i := 0; i < subtree.Length(); i++ {
+		parent := chainhash.HashH([]byte{byte(i), 0x22})
+		require.NoError(t, meta.SetTxInpoints(i, subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{parent}, []uint32{1, 0})))
+	}
+
+	metaBytes, err := meta.Serialize()
+	require.NoError(t, err)
+
+	// The serializer wrote Length(), so the header must be accepted as written.
+	require.Equal(t, uint32(subtree.Length()), binary.LittleEndian.Uint32(metaBytes[32:36]))
+
+	block := &Block{Header: &BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}}
+	store := newMemSubtreeStore(t, subtree.RootHash()[:], metaBytes)
+
+	got, err := block.getSubtreeMetaSlice(ctx, store, *subtree.RootHash(), subtree)
+	require.NoError(t, err, "a short subtree with spare capacity must not be rejected")
+
+	parents, err := got.GetParentTxHashes(subtree.Length() - 1)
+	require.NoError(t, err)
+	require.Len(t, parents, 1)
 }

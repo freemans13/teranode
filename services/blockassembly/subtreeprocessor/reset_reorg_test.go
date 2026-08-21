@@ -1628,6 +1628,10 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, test.CreateBaseTestSettings(t), utxoStoreURL)
 		require.NoError(t, err)
 
+		t.Cleanup(func() {
+			_ = utxoStore.Close(context.Background())
+		})
+
 		blobStore := blob_memory.New()
 		settings := test.CreateBaseTestSettings(t)
 		require.True(t, settings.BlockAssembly.StoreTxInpointsForSubtreeMeta,
@@ -1644,6 +1648,12 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
 		stp.Start(ctx)
+
+		// Stop the processor before the deferred cancel below unblocks the drain,
+		// so neither outlives the subtest.
+		t.Cleanup(func() {
+			stp.Stop(context.Background())
+		})
 
 		tx1Hash, err := chainhash.NewHashFromStr("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4")
 		require.NoError(t, err)
