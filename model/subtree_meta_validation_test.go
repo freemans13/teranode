@@ -7,8 +7,10 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -194,5 +196,63 @@ func TestCommittedSubtreeHash(t *testing.T) {
 		withNil := &Block{Header: block.Header, Subtrees: []*chainhash.Hash{nil}}
 		require.Equal(t, *subtree.RootHash(), *withNil.committedSubtreeHash(0, subtree))
 		require.Equal(t, *subtree.RootHash(), *withNil.committedSubtreeHash(1, subtree))
+	})
+}
+
+// TestValidateSubtreeCommittedHashMismatch pins the tie between the .subtree
+// file and the hash the proof of work commits to. GetAndValidateSubtrees stores
+// whatever sits under the blob key without comparing it, and RootHash() returns
+// the bytes the file header claimed rather than a recomputation, so without this
+// a genuine-but-foreign .subtree under the right key is validated as the
+// committed one and its meta — which agrees with the key — passes the header
+// check, attributing another subtree's inputs to this one.
+//
+// It also pins the routing at the meta-read call site. The check compares
+// RootHash() against committedSubtreeHash(), so reverting that call site to
+// subtree.RootHash() turns the comparison into a tautology and the mismatch case
+// below stops failing.
+func TestValidateSubtreeCommittedHashMismatch(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+
+	newCtx := func() *validationContext {
+		return &validationContext{
+			currentBlockHeaderHashesMap: map[chainhash.Hash]struct{}{},
+			currentBlockHeaderIDsMap:    map[uint32]struct{}{},
+		}
+	}
+
+	t.Run("a subtree that does not match its committed hash is rejected", func(t *testing.T) {
+		subtree, metaBytes, block := buildMetaFixture(t)
+
+		// Serve the meta under the committed key, so the rejection is the
+		// subtree/committed mismatch and not a missing file.
+		committed := chainhash.HashH([]byte{0xc0, 0xde})
+		block.Subtrees = []*chainhash.Hash{&committed}
+
+		deps := &validationDependencies{subtreeStore: newMemSubtreeStore(t, committed[:], metaBytes)}
+
+		err := block.validateSubtree(ctx, logger, deps, newCtx(), subtree, 0)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "does not match its committed hash")
+	})
+
+	t.Run("a subtree matching its committed hash gets past the check", func(t *testing.T) {
+		subtree, metaBytes, block := buildMetaFixture(t)
+
+		committed := *subtree.RootHash()
+		block.Subtrees = []*chainhash.Hash{&committed}
+
+		deps := &validationDependencies{subtreeStore: newMemSubtreeStore(t, committed[:], metaBytes)}
+		block.txMap = txmap.NewSplitSwissMapUint64(10)
+
+		// Validation carries on into the per-transaction checks, which this
+		// fixture deliberately does not satisfy — the leaves were never added
+		// to txMap — so assert on what this check is responsible for rather
+		// than on overall success.
+		err := block.validateSubtree(ctx, logger, deps, newCtx(), subtree, 0)
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), "does not match its committed hash")
+		require.Contains(t, err.Error(), "not in the txMap")
 	})
 }

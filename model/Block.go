@@ -1256,6 +1256,30 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 		err                 error
 	)
 
+	// The .subtree file has to answer to the committed hash before its meta is
+	// read against that hash. GetAndValidateSubtrees deserializes whatever sits
+	// under the blob key without comparing anything, and RootHash() hands back
+	// the bytes the file header claimed rather than a recomputation, so a
+	// genuine-but-foreign .subtree under the right key would otherwise be
+	// validated as if it were the committed one — its meta agrees with the key,
+	// the header check passes, and another subtree's inputs are attributed to
+	// this one.
+	//
+	// It also keeps regeneration from looping. Meta.Serialize embeds
+	// subtree.RootHash(), not the key it is stored under, so regenerating for a
+	// subtree whose root disagrees with the committed hash writes a file that
+	// fails this same header check on the next read — and, now that the write
+	// allows overwrite, rewrites it every time.
+	//
+	// This compares the file's own claim, not a recomputation, so it catches the
+	// wrong file under the right key rather than a doctored header. Kept a
+	// processing error: a subtree that does not match its key is a storage
+	// fault, and condemning the block for it is exactly the misclassification
+	// issue 1425 set out to remove.
+	if subtreeRootHash := subtree.RootHash(); subtreeRootHash == nil || !subtreeRootHash.IsEqual(subtreeHash) {
+		return errors.NewProcessingError("[validateSubtree][%s][%s:%d] subtree does not match its committed hash: subtree file was built for %v", b.String(), subtreeHash.String(), sIdx, subtreeRootHash)
+	}
+
 	subtreeMetaSlice, err = b.getSubtreeMetaSlice(ctx, deps.subtreeStore, *subtreeHash, subtree)
 
 	// Attempt regeneration if the meta is missing or invalid and a regenerator is

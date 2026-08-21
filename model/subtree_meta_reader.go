@@ -28,12 +28,19 @@ const (
 // read for (issue 1425). The file is only a cache, but its consumers trust
 // the contents: a short claimed count leaves tail transactions with zero
 // recorded inputs (block validation then spuriously rejects a valid block on
-// the nil-parents guard), an over-long count writes past the deserializer's
-// slice and panics on every restart since the file is on disk, and a foreign
-// file attributes another subtree's inputs to this one — the one shape that
-// can genuinely hide an in-block double-spend. Every producer writes the
-// count as the subtree's node count keyed by the subtree root, so a mismatch
-// always means a torn or foreign file, never a legitimate one.
+// the nil-parents guard), an over-long count panics once it runs past the
+// destination slice — on every restart, since the file is on disk — and a
+// foreign file attributes another subtree's inputs to this one, the one shape
+// that can genuinely hide an in-block double-spend.
+//
+// The count is compared against Length() because that is what
+// Meta.serializeTxInpoints writes. Note this is not the same as the slice the
+// deserializer fills: block validation installs a pooled node allocator, which
+// rounds capacity up to a size class, so a short final subtree carries real
+// headroom and an over-claim inside it fills padding quietly rather than
+// panicking. Comparing against the serialized count catches both. Every
+// producer writes that count keyed by the subtree root, so a mismatch always
+// means a torn or foreign file, never a legitimate one.
 func NewSubtreeMetaFromValidatedReader(subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree, reader io.Reader) (*subtreepkg.Meta, error) {
 	if subtree == nil {
 		return nil, errors.NewProcessingError("cannot validate subtree meta for %s: subtree is nil", subtreeHash.String())

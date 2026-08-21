@@ -277,6 +277,14 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 	// CLI dies with an index out of range instead of naming the defect
 	// (issue 1425). The validated reader names the mismatched root or count,
 	// which is the diagnosis the operator came for.
+	//
+	// Unlike block validation this compares against the .subtree file's own
+	// claimed root, because the CLI is pointed at a pair of files and has no
+	// block to supply the committed hash. Two consequences worth knowing when
+	// reading the output: a torn .subtree header is reported here as a meta root
+	// hash mismatch, naming the wrong file of the two; and a rejected meta stops
+	// the run, so the TxInpoints dump below is skipped for exactly the corrupt
+	// file an operator may have opened the tool to inspect.
 	subtreeMeta, err = blockmodel.NewSubtreeMetaFromValidatedReader(*st.RootHash(), st, br)
 	if err != nil {
 		return errors.NewProcessingError("error reading subtree meta", err)
