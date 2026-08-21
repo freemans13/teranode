@@ -157,21 +157,21 @@ func TestCheckBlockSubtrees_GRPCPreservesBatchLoadStorageCode(t *testing.T) {
 		"caller lost ERR_STORAGE_ERROR across the gRPC boundary: %v", err)
 }
 
-// TestCheckBlockSubtrees_GRPCPreservesBatchTxInvalidCode is the consensus-affecting
-// half of this fix, kept as its own test so the behaviour change is impossible to
-// miss in review.
+// TestCheckBlockSubtrees_GRPCHoldsBackBatchTxInvalidCode is the deliberate
+// carve-out, kept as its own test so the decision is impossible to miss in review.
 //
 // A transaction in the block fails validation with ERR_TX_INVALID inside the batch
-// pipeline. Block validation's handler for this call keys on
-// errors.Is(err, errors.ErrTxInvalid) to persist the block as invalid and to report
-// the serving peer as malicious. Today that code never arrives, so the batch path
-// cannot reach either behaviour; with the boundary restored it can.
+// pipeline. Restoring the boundary naively would hand that code to block
+// validation, which treats it as proof of a consensus violation: permanent
+// invalid=true persistence, a cascade over every descendant, and a malicious-peer
+// report. The UTXO store's error vocabulary cannot support that yet — it labels
+// its own decode and blob-read failures ErrTxInvalid — so the consensus codes are
+// held back and the caller sees a processing error carrying the full detail as
+// text.
 //
-// The same ERR_TX_INVALID from the same blessMissingTransaction call already
-// crosses this boundary intact on the phase-3 ordered-retry route, which has always
-// been wrapped — so this is the removal of an inconsistency, not a new class of
-// error escaping the service.
-func TestCheckBlockSubtrees_GRPCPreservesBatchTxInvalidCode(t *testing.T) {
+// The block is still rejected either way: the call fails, so the block is not
+// accepted. What is withheld is only the irreversible bookkeeping.
+func TestCheckBlockSubtrees_GRPCHoldsBackBatchTxInvalidCode(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
@@ -225,6 +225,13 @@ func TestCheckBlockSubtrees_GRPCPreservesBatchTxInvalidCode(t *testing.T) {
 
 	err = callCheckBlockSubtrees(t, client, block)
 
-	require.True(t, errors.Is(err, errors.ErrTxInvalid),
-		"caller lost ERR_TX_INVALID across the gRPC boundary: %v", err)
+	require.False(t, errors.Is(err, errors.ErrTxInvalid),
+		"ERR_TX_INVALID reached the caller: block validation would persist invalid=true and ban the peer on the strength of it: %v", err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid),
+		"ERR_BLOCK_INVALID reached the caller: %v", err)
+
+	// The detail is still there for an operator reading the logs — only the code
+	// that triggers irreversible action is withheld.
+	require.Contains(t, err.Error(), "simulated consensus violation",
+		"the underlying reason must survive as text: %v", err)
 }
