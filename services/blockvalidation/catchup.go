@@ -53,7 +53,7 @@ type CatchupContext struct {
 	blockHeaders            []*model.BlockHeader
 	headersFetchResult      *catchup.Result
 	useQuickValidation      bool   // Whether to use quick validation for checkpointed blocks
-	highestCheckpointHeight uint32 // Highest checkpoint height for validation checks
+	highestCheckpointHeight uint32 // Highest checkpoint height hash-verified in THIS catchup run (not the highest configured checkpoint)
 	catchupError            error  // Any error encountered during catchup
 	incompleteBlockHash     string // Block hash reported when a peer serves an incomplete block
 
@@ -430,6 +430,29 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// isPeerError left true, charging an honest primary for our own
 			// shutdown. Mirrors the predicate now used in processCatchupChItem.
 			errorType = "local_context_cancelled"
+			isPeerError = false
+		case errors.Is(*err, errors.ErrBlockHeaderContext):
+			// The parent-header run our own store returned was not anchored at the block's
+			// parent, was not linked, or was too short for the median-time-past window (issue
+			// #1467). Purely local: the serving peer had no part in producing it, so charging it
+			// would demote an honest peer and tear down the session over our own state. Same
+			// reasoning as the 1368 and 1031 fixes below.
+			//
+			// Must precede IsNetworkError and the strings.Contains cases, which match on message
+			// text: IsNetworkError counts a message merely containing "http" or "eof" as a network
+			// error, so an outer wrapper carrying a peer baseURL would reclassify this as a peer
+			// error — exactly what this case exists to prevent.
+			//
+			// It must also precede the consensus case below, for the reason set out on the
+			// storage case at the top of this switch: errors.Is walks the whole chain, so a
+			// wrapper carrying both codes would otherwise be scored a validation_failure with
+			// reportMalicious set. It sat below the consensus case until this change.
+			//
+			// Deliberately NOT a blanket ErrProcessing case: this switch's own
+			// TestReleaseCatchupLock_DrainChargesPrimaryEvenOnMixedCycle uses a bare
+			// NewProcessingError as its example of a generic PEER error, so suppressing all
+			// processing errors here would stop charging peers that deserve it.
+			errorType = "local_header_context_error"
 			isPeerError = false
 		case errors.Is(*err, errors.ErrBlockInvalid) || errors.Is(*err, errors.ErrTxInvalid):
 			errorType = "validation_failure"
@@ -932,9 +955,12 @@ func (u *Server) verifyCheckpointsInHeaderChain(catchupCtx *CatchupContext) erro
 //   - int: Number of checkpoints successfully verified
 //   - error: If checkpoint verification fails (hash mismatch)
 func (u *Server) verifyCheckpointsAgainstHeaders(catchupCtx *CatchupContext) (int, error) {
-	// Get the highest checkpoint height for reference
-	highestCheckpointHeight := blockchain.HighestCheckpointHeight(catchupCtx.checkpoints)
-	catchupCtx.highestCheckpointHeight = highestCheckpointHeight
+	// Track the highest checkpoint height actually verified (hash-matched) in this run.
+	// Quick validation eligibility must be bound to what was genuinely proven this run,
+	// not to the highest checkpoint in the globally configured list - a checkpoint that
+	// is merely configured but falls outside the current catchup range (or is never
+	// reached by the loop below) provides no cryptographic guarantee for this session.
+	var highestVerifiedCheckpointHeight uint32
 
 	firstBlockHeight := catchupCtx.commonAncestorMeta.Height + 1
 	lastBlockHeight := catchupCtx.commonAncestorMeta.Height + uint32(len(catchupCtx.blockHeaders))
@@ -967,8 +993,14 @@ func (u *Server) verifyCheckpointsAgainstHeaders(catchupCtx *CatchupContext) (in
 
 			u.logger.Infof("[catchup][%s] Verified checkpoint at height %d with hash %s", catchupCtx.blockUpTo.Hash().String(), checkpointHeight, checkpoint.Hash.String())
 			checkpointsChecked++
+
+			if checkpointHeight > highestVerifiedCheckpointHeight {
+				highestVerifiedCheckpointHeight = checkpointHeight
+			}
 		}
 	}
+
+	catchupCtx.highestCheckpointHeight = highestVerifiedCheckpointHeight
 
 	return checkpointsChecked, nil
 }
