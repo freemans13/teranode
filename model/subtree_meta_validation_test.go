@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -263,4 +264,57 @@ func TestMetaCountCheckedAgainstLength(t *testing.T) {
 	parents, err := got.GetParentTxHashes(subtree.Length() - 1)
 	require.NoError(t, err)
 	require.Len(t, parents, 1)
+}
+
+// countingRegenerator records whether validateSubtree reached the repair path.
+type countingRegenerator struct{ calls int }
+
+func (c *countingRegenerator) RegenerateMeta(_ context.Context, _ *chainhash.Hash, _ *subtreepkg.Subtree, _ bool) (*subtreepkg.Meta, error) {
+	c.calls++
+
+	return nil, errors.NewProcessingError("regeneration not available in this test")
+}
+
+// TestRegenerationSkippedOnCancelledContext pins that a cancelled validation does
+// not trigger repair work. Regeneration reads the whole .subtreeData and, on a
+// miss, fetches from every configured peer behind a 30s timeout. At shutdown
+// every subtree of the in-flight block would do that at once, to rebuild a file
+// nothing is going to use — a refetch storm and a warn burst indistinguishable
+// from real corruption during triage.
+func TestRegenerationSkippedOnCancelledContext(t *testing.T) {
+	logger := ulogger.TestLogger{}
+
+	newDeps := func(reg *countingRegenerator) *validationDependencies {
+		// Empty store, so the meta read always fails and the repair path is the
+		// only thing deciding whether the regenerator runs.
+		return &validationDependencies{subtreeStore: memory.New(), metaRegenerator: reg}
+	}
+
+	newCtx := func() *validationContext {
+		return &validationContext{
+			currentBlockHeaderHashesMap: map[chainhash.Hash]struct{}{},
+			currentBlockHeaderIDsMap:    map[uint32]struct{}{},
+		}
+	}
+
+	t.Run("a live context reaches the regenerator", func(t *testing.T) {
+		subtree, _, block := buildMetaFixture(t)
+		reg := &countingRegenerator{}
+
+		err := block.validateSubtree(context.Background(), logger, newDeps(reg), newCtx(), subtree, 0)
+		require.Error(t, err)
+		require.Equal(t, 1, reg.calls)
+	})
+
+	t.Run("a cancelled context does not", func(t *testing.T) {
+		subtree, _, block := buildMetaFixture(t)
+		reg := &countingRegenerator{}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := block.validateSubtree(ctx, logger, newDeps(reg), newCtx(), subtree, 0)
+		require.Error(t, err)
+		require.Zero(t, reg.calls, "shutdown must not fan out subtree-data reads and peer fetches")
+	})
 }
