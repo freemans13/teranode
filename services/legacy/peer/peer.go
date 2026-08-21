@@ -86,6 +86,12 @@ const (
 	// peer that is making real progress. Mirrors the netsync default
 	// minSyncPeerNetworkSpeed (50 KiB/s) — comfortably above ping/inv chatter,
 	// far below real block-transfer rates.
+	//
+	// Half of svnode's equivalent floor, -blockstallingmindownloadspeed, which
+	// defaults to 100 KB/s. So a peer this node still counts as making progress
+	// is one svnode would already have judged stalled. Deliberately not changed
+	// here: raising it disconnects peers that today survive, which is a decision
+	// to take with numbers from a real sync rather than for symmetry.
 	minBlockDownloadBytesPerSec = 51200
 
 	// MaxBlockDownloadTime is a fixed wall-clock ceiling on how long a single
