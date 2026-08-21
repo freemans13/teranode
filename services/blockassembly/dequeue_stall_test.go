@@ -210,6 +210,21 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			// worth of running time would otherwise be counted as stalled.
 			wantFor: time.Minute - dequeueStallThreshold,
 		},
+		{
+			name: "clockStepBackDoesNotReportANegativeDuration",
+			// Both ends of the duration are a wall-clock reading minus the
+			// staleness at that reading, and time.Now() is not monotonic across
+			// an NTP correction. Here the incident opened at stallBase and the
+			// clock then stepped back five minutes, so the raw subtraction is
+			// about -5m. An operator reading "was stalled for -5m0s" learns
+			// nothing, so it is floored - the same treatment the gauge gets.
+			state:       stalledState(0, 0),
+			now:         stallBase.Add(-5 * time.Minute),
+			staleness:   time.Second,
+			wantEvent:   dequeueStallEnded,
+			wantStalled: false,
+			wantFor:     0,
+		},
 	}
 
 	for _, tt := range tests {

@@ -149,10 +149,22 @@ func observeDequeueStall(state dequeueStallState, now time.Time, queueLength int
 		// Recovery is only visible once staleness has fallen back to the
 		// threshold, so by now the consumer has been running again for
 		// staleness, which is up to dequeueStallThreshold plus a tick. Timing
-		// to now would add that to every reported duration. The result cannot
-		// go negative: staleness here is at most the threshold, and the
-		// staleness that opened the incident exceeded it.
-		return dequeueStallState{}, dequeueStallEnded, now.Add(-staleness).Sub(state.stalledSince)
+		// to now would add that to every reported duration.
+		//
+		// Both ends of that subtraction are a wall-clock reading minus the
+		// staleness at that reading, so each is the moment of a dequeue. The
+		// later dequeue happened after the earlier one, so the difference is
+		// positive whenever the clock advances monotonically between the two
+		// ticks - but time.Now() is not monotonic across an NTP step, and a
+		// backward step between the opening and closing tick would otherwise
+		// report a negative duration. Floored for the same reason the gauge
+		// itself is floored in sampleBlockAssemblerMetrics.
+		stalledFor := now.Add(-staleness).Sub(state.stalledSince)
+		if stalledFor < 0 {
+			stalledFor = 0
+		}
+
+		return dequeueStallState{}, dequeueStallEnded, stalledFor
 	}
 
 	// Still stalled, and the consumer has started since the incident opened.
