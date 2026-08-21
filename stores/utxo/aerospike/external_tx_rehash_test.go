@@ -3,6 +3,7 @@ package aerospike
 import (
 	"bytes"
 	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/utxopersister"
+	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -202,6 +204,7 @@ func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
 		// since the source is a file on disk.
 		s := newStore(t)
 		s.externalTxCache = util.NewExpiringConcurrentCacheWithMaxSize[chainhash.Hash, *bt.Tx](10*time.Second, 128)
+		t.Cleanup(s.externalTxCache.Stop) // otherwise its cleanup goroutine outlives the package run
 
 		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, other.ExtendedBytes()))
 
@@ -278,5 +281,152 @@ func TestGetTxInpointsFromExternalStoreClassifiesParseFailureAsStorage(t *testin
 		require.Error(t, err)
 		require.True(t, errors.Is(err, errors.ErrStorageError))
 		require.False(t, errors.Is(err, errors.ErrTxInvalid))
+	})
+}
+
+// failingTxBlobStore serves everything from an embedded real store except a
+// FileTypeTx read, which fails with a chosen error. It models the case the
+// unconditional fallback used to mask: the full-transaction blob is present but
+// cannot be read, while the outputs-only blob is readable.
+type failingTxBlobStore struct {
+	blob.Store
+
+	err error
+}
+
+func (f *failingTxBlobStore) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (io.ReadCloser, error) {
+	if fileType == fileformat.FileTypeTx {
+		return nil, f.err
+	}
+
+	return f.Store.GetIoReader(ctx, key, fileType, opts...)
+}
+
+// TestGetExternalTransactionFallbackOnlyOnAbsence pins that the outputs-only
+// blob is a fallback for a *missing* transaction and nothing else.
+//
+// Falling back on any error sent real read failures down the weaker path, which
+// has no re-hash — only a self-declared txid. It did so silently: with the tx
+// blob unreadable and an outputs blob present, the read returned a zero-input
+// transaction whose txid was not the key it was asked for, and no error at all,
+// which BatchDecorate then handed to fields.Tx and fields.Inputs consumers. The
+// pruner's delete-then-write race, which is what motivates the re-hash in the
+// first place, is one of the errors that took that route.
+func TestGetExternalTransactionFallbackOnlyOnAbsence(t *testing.T) {
+	ctx := context.Background()
+
+	parent := buildParentTx(t, 1000, 0xaa)
+	parentHash := *parent.TxIDChainHash()
+
+	// The outputs-only blob is always present and valid, so any leak down the
+	// fallback path would succeed rather than error — which is what made the old
+	// behaviour silent.
+	withOutputsBlob := func(t *testing.T, inner blob.Store) {
+		t.Helper()
+
+		wrapper := utxopersister.UTXOWrapper{
+			TxID: parentHash,
+			UTXOs: []*utxopersister.UTXO{{
+				Index:  0,
+				Value:  1000,
+				Script: *parent.Outputs[0].LockingScript,
+			}},
+		}
+		require.NoError(t, inner.Set(ctx, parentHash[:], fileformat.FileTypeOutputs, wrapper.Bytes()))
+	}
+
+	// Each of these used to reach the outputs blob and be served as a success.
+	for name, readErr := range map[string]error{
+		"an i/o or permission failure": errors.NewStorageError("permission denied"),
+		"a context deadline":           errors.NewContextCanceledError("deadline exceeded"),
+		"a service outage":             errors.NewServiceUnavailableError("backend throttled"),
+	} {
+		t.Run(name+" is a storage fault, not a silent downgrade", func(t *testing.T) {
+			inner := memory.New()
+			withOutputsBlob(t, inner)
+
+			s := &Store{
+				logger:        ulogger.TestLogger{},
+				externalStore: &failingTxBlobStore{Store: inner, err: readErr},
+			}
+
+			_, err := s.getExternalTransaction(ctx, parentHash)
+			require.Error(t, err, "must not be served from the outputs blob")
+			require.True(t, errors.Is(err, errors.ErrStorageError), "a failed read of our own store is a storage fault")
+			require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be a consensus violation")
+		})
+	}
+
+	t.Run("a genuinely absent tx blob still falls back to outputs", func(t *testing.T) {
+		// The gate must not break the legitimate case it narrows: a transaction
+		// stored outputs-only has no FileTypeTx blob at all. Every blob backend
+		// reports that as ErrNotFound, distinct from a failed read.
+		inner := memory.New()
+		withOutputsBlob(t, inner)
+
+		s := &Store{
+			logger:        ulogger.TestLogger{},
+			externalStore: &failingTxBlobStore{Store: inner, err: errors.ErrNotFound},
+		}
+
+		got, err := s.getExternalTransaction(ctx, parentHash)
+		require.NoError(t, err, "outputs-only reads must keep working")
+		require.Equal(t, uint64(1000), got.Outputs[0].Satoshis)
+		require.Equal(t, *parent.Outputs[0].LockingScript, *got.Outputs[0].LockingScript)
+	})
+
+	t.Run("a readable tx blob is preferred over the outputs blob", func(t *testing.T) {
+		inner := memory.New()
+		withOutputsBlob(t, inner)
+		require.NoError(t, inner.Set(ctx, parentHash[:], fileformat.FileTypeTx, parent.ExtendedBytes()))
+
+		s := &Store{logger: ulogger.TestLogger{}, externalStore: inner}
+
+		got, err := s.getExternalTransaction(ctx, parentHash)
+		require.NoError(t, err)
+		require.Len(t, got.Inputs, 1, "the full transaction should have been used, not the outputs blob")
+		require.Equal(t, parentHash, *got.TxIDChainHash())
+	})
+}
+
+// TestClassifyRecordError pins that reading our own Aerospike bins back cannot
+// manufacture a consensus verdict.
+//
+// Each bin processor already returns a StorageError for the failures it can
+// attribute to the store, but every caller re-wrapped all of them in TxInvalid.
+// Because errors.Is walks the whole chain and every downstream switch tests
+// ErrTxInvalid first, that wrap presented a transient store read — including a
+// live client.Get on a paginated record — as a proven consensus violation, which
+// persists the block as invalid and flags the serving peer malicious.
+func TestClassifyRecordError(t *testing.T) {
+	t.Run("a storage fault stays a storage fault", func(t *testing.T) {
+		err := classifyRecordError("could not process block IDs", errors.NewStorageError("failed to get extra record"))
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+		require.False(t, errors.Is(err, errors.ErrTxInvalid), "laundering this is what blamed honest peers for our disk")
+	})
+
+	t.Run("a context error is ours, not the block's", func(t *testing.T) {
+		err := classifyRecordError("could not process utxos", errors.NewContextCanceledError("shutting down"))
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
+	})
+
+	t.Run("a local service outage is ours, not the block's", func(t *testing.T) {
+		err := classifyRecordError("could not process utxos", errors.NewServiceUnavailableError("aerospike batch timed out"))
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
+	})
+
+	t.Run("a failed key construction is ours, not the block's", func(t *testing.T) {
+		err := classifyRecordError("could not process utxos", errors.NewProcessingError("failed to create key for extra record"))
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+		require.False(t, errors.Is(err, errors.ErrTxInvalid))
+	})
+
+	t.Run("well-formed data that is not a valid transaction is still a transaction fault", func(t *testing.T) {
+		// TxInvalid must stay reachable, or the store could never report a genuine
+		// violation and a bad block would stall catchup instead of being rejected.
+		err := classifyRecordError("invalid tx", errors.NewTxInvalidError("output index out of range"))
+		require.True(t, errors.Is(err, errors.ErrTxInvalid))
 	})
 }
