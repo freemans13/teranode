@@ -54,7 +54,9 @@ var (
 
 	// prometheusValidatorParentCommitExhausted counts transactions rejected because the
 	// retry budget ran out while the parent was still committing, labelled by condition.
-	// Every increment is a valid transaction dropped, so this is the alertable one.
+	// This is the alertable one: the transaction was valid, and on every intake path
+	// except legacy p2p relay (which parks it in netsync's orphan pool) nothing is
+	// holding it, so the increment marks a transaction the node lost.
 	prometheusValidatorParentCommitExhausted *prometheus.CounterVec
 
 	// prometheusTransactionValidateTotal measures the complete end-to-end validation time for transactions.

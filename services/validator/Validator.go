@@ -510,9 +510,13 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 			condition = "TX_CREATING"
 		}
 
-		// TX_LOCKED/TX_CREATING error on the last attempt — give up. Every increment of
-		// this counter is a valid transaction dropped, and BSV has no mempool to catch it,
-		// so it is the alertable signal that the budget is too short for this node's load.
+		// TX_LOCKED/TX_CREATING error on the last attempt — give up. This is the
+		// alertable signal that the budget is too short for this node's load: BSV has no
+		// mempool, so on the client-facing paths the transaction is simply gone — the
+		// propagation surfaces hand the submitter a 409 and keep nothing, and the Kafka
+		// intake runs WithLogErrorAndMoveOn. The one path that survives it is legacy p2p
+		// relay, which parks the tx in netsync's orphan pool and revalidates it once when
+		// that entry is evicted.
 		if attempt >= maxRetries {
 			prometheusValidatorParentCommitExhausted.WithLabelValues(condition).Inc()
 			ctxLogger.Warnf("[ValidateWithOptions] %s for tx %s after %d retries, giving up: %v", condition, tx.TxID(), attempt, err)
