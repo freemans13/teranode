@@ -237,15 +237,26 @@ func (t *blockDownloadTracker) ReassertOwner(p *peerpkg.Peer, h chainhash.Hash) 
 	return true
 }
 
-// OwnersOf returns every peer that still owes us block h — forgiven ones
-// included, because a peer that has been let off may still deliver, and for the
-// question this answers ("who did we ask, and so who must not be punished for
-// answering") that is the same thing as owing it.
+// ForgiveOwners lets every peer that owes block h off the hook, and returns the
+// peers it let off. Ownership is kept, so a copy still on the wire from any of
+// them is still admitted; only the obligation goes.
 //
-// The frontier race needs it. A block being raced is owed by whichever peer the
-// scheduler gave it to, which with the fan-out on is routinely not the sync peer,
-// so the set cannot be worked out from the sync peer and the racers.
-func (t *blockDownloadTracker) OwnersOf(h chainhash.Hash) []*peerpkg.Peer {
+// This is what a delivered race needs. Cancelling the other owners outright was
+// the obvious thing and it was wrong in both directions: it freed their budget,
+// which is what the cancel was for, but it also revoked their permission to
+// deliver — so a copy arriving afterwards looked unrequested and cost an honest
+// peer its whole association, and a separate grace map with a separate expiry
+// had to exist to paper over exactly that. svnode never cancels: MarkBlockAsReceived
+// removes only {hash, node} and the stall race in FindNextBlocksToDownload only
+// ever adds a source. Forgiving gets svnode's admission behaviour and keeps the
+// budget release that made cancelling attractive, with one expiry instead of two.
+//
+// The timestamp is back-dated exactly as ForgetForRetryPeer does it, so the block
+// is re-requestable straight away. That matters on the failure path: the arrival
+// takes the header off the list before validation runs, and if validation then
+// rejects the block the cursor is rewound onto it — which would be silently
+// skipped for a retry interval by a record that still looked fresh.
+func (t *blockDownloadTracker) ForgiveOwners(h chainhash.Hash, retryWindow time.Duration) []*peerpkg.Peer {
 	if t == nil {
 		return nil
 	}
@@ -259,17 +270,25 @@ func (t *blockDownloadTracker) OwnersOf(h chainhash.Hash) []*peerpkg.Peer {
 	}
 
 	now := t.clock()
-	out := make([]*peerpkg.Peer, 0, len(owners))
+	cut := now.Add(-retryWindow)
+	forgiven := make([]*peerpkg.Peer, 0, len(owners))
 
 	for p, rec := range owners {
 		if t.expiredAt(rec.at, now, t.ttl) {
 			continue
 		}
 
-		out = append(out, p)
+		if rec.at.After(cut) {
+			rec.at = cut
+		}
+
+		rec.forgiven = true
+		owners[p] = rec
+
+		forgiven = append(forgiven, p)
 	}
 
-	return out
+	return forgiven
 }
 
 // RequestedWithin reports whether anybody was asked for block h within maxAge.

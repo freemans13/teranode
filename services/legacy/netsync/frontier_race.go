@@ -62,12 +62,13 @@ const (
 	// disconnected for answering us. Matching the ledger means the grace lasts
 	// exactly as long as the node considers anybody to owe the block at all.
 	//
-	// A residual remains and is worth naming: the scaled budget can outlive the
-	// ledger's ceiling too, so a copy still on the wire past that is punished
-	// either way. Closing it properly means not cancelling the other owners in
-	// the first place, which is what svnode does — its stall race only ever adds
-	// a source and lets each one's own timeout retire it. That is a change to
-	// the shape of this file, not a constant.
+	// This is now belt-and-braces rather than the mechanism. noteRaceWinner
+	// forgives the other owners instead of cancelling them, so their permission
+	// to deliver comes from the ledger itself and expires with it — which is what
+	// closed the residual an earlier version of this comment had to admit. What is
+	// left for this map is the peer that actually delivered, whose obligation
+	// handleBlockMsg removes: a second copy from that one peer is the only case
+	// the ledger no longer answers for.
 	racedBlockGraceTTL = blockRequestAssignmentTTL
 
 	// racedBlockGraceMaxTracked caps the number of raced block hashes held in
@@ -387,10 +388,11 @@ func (sm *SyncManager) unregisterFrontierRacer(hash chainhash.Hash, p *peerpkg.P
 	delete(sm.frontierRacers, p)
 }
 
-// noteRaceWinner is called when a block we had raced is delivered. It cancels
-// the request with everybody else we asked, and remembers that we did so.
+// noteRaceWinner is called when a block we had raced is delivered. It lets
+// everybody else we asked off the hook — without revoking their permission to
+// deliver — and remembers that it did so.
 //
-// Cancelling matters because a request that will never be answered would
+// Letting them off matters because a request that will never be answered would
 // otherwise sit in that peer's outstanding list for a full hour, counting
 // against the in-flight limit fetchHeaderBlocks uses to decide how much more to
 // ask for — a limit that drops to a single block once blocks get large enough,
@@ -399,11 +401,24 @@ func (sm *SyncManager) unregisterFrontierRacer(hash chainhash.Hash, p *peerpkg.P
 // requests nobody ever cancels; this is the fast path, and an hour of a stalled
 // in-flight budget is far too long to wait for the slow one.
 //
-// Remembering matters because the peers whose request we just cancelled may
-// still be part-way through sending their copy. When it lands it would look
-// unrequested, and an unrequested block costs a peer its connection. Punishing a
-// peer for answering a question we asked would make the recovery worse than the
-// stall it fixes, so those specific peers get a pass on that specific hash.
+// NOT revoking matters for the opposite reason, and this is where an earlier
+// version of this function was wrong. It cancelled the other owners outright,
+// which freed the budget and also took away their permission to deliver — so a
+// copy of the block still on the wire arrived owned by nobody, and an unrequested
+// block costs a peer its whole association. Punishing a peer for answering a
+// question we asked would make the recovery worse than the stall it fixes.
+//
+// svnode never cancels: MarkBlockAsReceived removes only {hash, node}, and the
+// stall race in FindNextBlocksToDownload only ever adds a source. Forgiving the
+// assignment rather than deleting it gets that behaviour and keeps the budget
+// release too, and it means the answer to "may this peer deliver this block?" has
+// one expiry rather than a ledger ceiling and a separate grace window that could
+// disagree with each other — which they did.
+//
+// racedBlocks is kept, with one job left: the peer that actually delivered has
+// its obligation removed by handleBlockMsg a few lines after this runs, so a
+// second copy from that one peer is the only case forgiveness does not already
+// cover.
 func (sm *SyncManager) noteRaceWinner(hash chainhash.Hash) {
 	sm.frontierMu.Lock()
 
@@ -421,27 +436,26 @@ func (sm *SyncManager) noteRaceWinner(hash chainhash.Hash) {
 	// peer carried every body: with the fan-out on the frontier belongs to
 	// whichever peer the scheduler gave it to, and a demotion hands the headers
 	// role to someone else while leaving the original owner's assignment where it
-	// is. Assuming wrongly left that peer holding a live in-flight slot for the
-	// whole hour — the stall this helper exists to prevent — and left it out of
-	// the grace set, so its copy arriving later cost it its connection.
+	// is.
+	//
+	// This runs before handleBlockMsg discharges the peer that delivered, so the
+	// delivering peer is still an owner here and is forgiven along with the rest.
+	// Its own obligation goes a few lines later, which is the one case racedBlocks
+	// still answers for.
 	asked := make(map[*peerpkg.Peer]struct{}, len(racers)+1)
 	for p := range racers {
 		asked[p] = struct{}{}
 	}
 
-	for _, p := range sm.blockDownloads.OwnersOf(hash) {
+	for _, p := range sm.blockDownloads.ForgiveOwners(hash, blockRequestRetryInterval) {
 		asked[p] = struct{}{}
-	}
-
-	for p := range asked {
-		sm.blockDownloads.RemoveOwner(p, hash)
 	}
 
 	if sm.racedBlocks != nil {
 		sm.racedBlocks.Set(hash, asked)
 	}
 
-	sm.logger.Debugf("[noteRaceWinner] block %s delivered, cancelling the same request with %d other peer(s)", hash, len(asked)-1)
+	sm.logger.Debugf("[noteRaceWinner] block %s delivered, releasing the same request from %d other peer(s)", hash, len(asked)-1)
 }
 
 // BlockRacedTo reports whether the given block arriving from the given peer is a

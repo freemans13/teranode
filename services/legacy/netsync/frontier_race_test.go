@@ -377,7 +377,7 @@ func TestFrontierRaceTarget(t *testing.T) {
 // leaving requests behind that will never be answered. One stale entry counts
 // against the in-flight limit fetchHeaderBlocks uses, and that limit drops to a
 // single block once blocks get large, so a leftover would stop fetching outright.
-func TestNoteRaceWinner_CancelsTheRequestWithEveryoneElse(t *testing.T) {
+func TestNoteRaceWinner_ReleasesEveryoneElseWithoutRevokingThem(t *testing.T) {
 	sm := newRaceManager(t)
 
 	syncPeer, _, _ := connectRacePeer(t, 8, 1000)
@@ -398,10 +398,22 @@ func TestNoteRaceWinner_CancelsTheRequestWithEveryoneElse(t *testing.T) {
 
 	sm.noteRaceWinner(frontier)
 
-	stillAsked := sm.blockDownloads.HasOwner(syncPeer, frontier)
-	require.False(t, stillAsked, "the original peer's request must be cancelled once the block arrives")
-	stillAskedOther := sm.blockDownloads.HasOwner(other, frontier)
-	require.False(t, stillAskedOther, "the second peer's request must be cancelled too")
+	// Released, not revoked. The budget goes, which is the whole reason the
+	// release exists — a request that will never be answered must not go on
+	// counting against what we ask that peer for next. Permission stays, because
+	// either peer may still be part-way through sending its copy, and a block
+	// arriving from a peer that no longer owns it costs that peer its whole
+	// association. Cancelling did both at once and so had to be papered over by a
+	// separate grace map with its own expiry.
+	require.Zero(t, sm.blockDownloads.CountForPeer(syncPeer),
+		"the original peer's obligation must be released once the block arrives")
+	require.Zero(t, sm.blockDownloads.CountForPeer(other),
+		"the second peer's obligation must be released too")
+
+	require.True(t, sm.blockDownloads.HasOwner(syncPeer, frontier),
+		"but its permission to deliver must survive, or its copy arrives unowned")
+	require.True(t, sm.blockDownloads.HasOwner(other, frontier),
+		"and so must the second peer's")
 
 	sm.frontierMu.Lock()
 	racers := len(sm.frontierRacers)
@@ -479,12 +491,17 @@ func TestHandleBlockMsg_LateCopyOfARacedBlockIsNotPunished(t *testing.T) {
 
 	registerRacePeer(sm, stranger)
 
-	err := sm.handleBlockMsg(&blockQueueMsg{blockHash: frontier, peer: loser})
-	require.Error(t, err, "the late copy is discarded")
-	require.True(t, errors.IsTransientLocalError(err), "discarding a late copy must not read as misbehaviour")
+	// The node will still accept the loser's copy, which is the property that
+	// keeps it connected. It is no longer a special case bolted on beside the
+	// ownership question: the loser still owns the block, so it answers the same
+	// question every honest delivery answers.
+	require.True(t, sm.BlockRequested(loser, &frontier),
+		"a peer we asked must still be allowed to deliver, however late")
+
+	_ = sm.handleBlockMsg(&blockQueueMsg{blockHash: frontier, peer: loser})
 	require.True(t, loser.Connected(), "a peer that answered our own request must not be disconnected")
 
-	err = sm.handleBlockMsg(&blockQueueMsg{blockHash: frontier, peer: stranger})
+	err := sm.handleBlockMsg(&blockQueueMsg{blockHash: frontier, peer: stranger})
 	require.Error(t, err)
 	require.True(t, WaitUntil(func() bool { return !stranger.Connected() }, 2*time.Second),
 		"a peer we never asked must still be disconnected for an unrequested block")
@@ -732,7 +749,7 @@ func TestFrontierRace_AFullLedgerDoesNotSuppressTheRaceForever(t *testing.T) {
 // ownership ceiling — the stall this helper exists to prevent — and it was left
 // out of the grace set, so its copy turning up later cost an honest peer its
 // whole association.
-func TestNoteRaceWinner_CancelsTheRealOwnerNotTheSyncPeer(t *testing.T) {
+func TestNoteRaceWinner_ReleasesTheRealOwnerNotTheSyncPeer(t *testing.T) {
 	sm := newRaceManager(t)
 
 	// The sync peer is below the frontier height, so it is neither the owner nor
@@ -760,17 +777,17 @@ func TestNoteRaceWinner_CancelsTheRealOwnerNotTheSyncPeer(t *testing.T) {
 
 	sm.noteRaceWinner(frontier)
 
-	require.False(t, sm.blockDownloads.HasOwner(owner, frontier),
-		"the peer that actually owed the block must have its request cancelled, or it holds an in-flight slot for the hour")
-	require.False(t, sm.blockDownloads.HasOwner(racer, frontier),
-		"the racer's request must be cancelled too")
+	require.Zero(t, sm.blockDownloads.CountForPeer(owner),
+		"the peer that actually owed the block must be released, or it holds an in-flight slot for the hour")
+	require.Zero(t, sm.blockDownloads.CountForPeer(racer),
+		"the racer must be released too")
 
-	// And both must be forgiven a late copy, the owner included — it is the one
-	// whose copy is most likely still on the wire, since it was asked first.
-	require.True(t, sm.BlockRacedTo(owner, &frontier),
-		"the real owner must not be punished for answering the question we asked it")
-	require.True(t, sm.BlockRacedTo(racer, &frontier),
-		"the racer must not be punished either")
+	// And neither may be punished for a copy still on the wire. The owner is the
+	// likelier of the two, having been asked first.
+	require.True(t, sm.blockDownloads.HasOwner(owner, frontier),
+		"the real owner must keep permission to deliver the block we asked it for")
+	require.True(t, sm.blockDownloads.HasOwner(racer, frontier),
+		"and so must the racer")
 }
 
 // TestFrontierRace_ADepartedRacerDoesNotDisableTheRace pins the other way a race
