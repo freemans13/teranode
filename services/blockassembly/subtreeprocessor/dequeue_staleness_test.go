@@ -253,3 +253,40 @@ func newTestSubtreeProcessorForDequeueStaleness(t *testing.T, ctx context.Contex
 
 	return stp
 }
+
+// TestConsumerExited_TracksTheGoroutineNotTheShutdownRequest pins the third
+// lifecycle answer the stall signal needs, and pins it against the real
+// processor because the thing that could go wrong is where the flag is set,
+// which a mock cannot see.
+//
+// Two readings have to be right. Before Start there is no consumer, but there
+// is also nothing to report as departed - a processor that claimed to have
+// exited from construction would turn every pre-Start tick into "block
+// assembly is dead" on a node that is merely still loading unmined
+// transactions. And once the consumer is genuinely gone the flag must be true,
+// because that is the reading that stops the operator being sent to find which
+// select branch is holding a loop that no longer exists.
+//
+// Stop is used here to end the consumer, which is the reachable way to do it in
+// a test. The production case that motivates the classification is a panic in
+// the dequeue branch, which runHandlerWithRecover does not cover: that lands on
+// the same deferred close, so it sets the same flag.
+func TestConsumerExited_TracksTheGoroutineNotTheShutdownRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stp := newTestSubtreeProcessorForDequeueStaleness(t, ctx)
+
+	require.False(t, stp.ConsumerExited(),
+		"a constructed processor has not started, but neither has it exited - reporting otherwise turns the ordinary pre-Start window into a dead-service alert")
+
+	stp.Start(ctx)
+
+	require.False(t, stp.ConsumerExited(),
+		"a running consumer must not read as departed, or every wedge is misreported as a dead goroutine")
+
+	stp.Stop(ctx)
+
+	require.Eventually(t, stp.ConsumerExited, 5*time.Second, 10*time.Millisecond,
+		"once the consumer goroutine is gone the queue will never drain again, and the stall signal has to be able to say so")
+}

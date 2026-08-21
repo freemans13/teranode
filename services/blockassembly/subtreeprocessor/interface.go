@@ -319,6 +319,15 @@ type Interface interface {
 	//   - bool: true once the consumer goroutine has been started
 	ConsumerStarted() bool
 
+	// ConsumerExited reports whether the consumer goroutine has exited. A
+	// stale LastDequeueTime means a wedged consumer only while one still
+	// exists; once this is true the queue will never drain again, which is a
+	// different fault with a different remedy.
+	//
+	// Returns:
+	//   - bool: true once the consumer goroutine has exited
+	ConsumerExited() bool
+
 	// SubtreeCount returns the total number of subtrees managed by the processor.
 	// This metric provides visibility into the processor's organizational state.
 	//

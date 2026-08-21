@@ -313,6 +313,16 @@ func (b *BlockAssembler) ConsumerStarted() bool {
 	return b.subtreeProcessor.ConsumerStarted()
 }
 
+// ConsumerExited reports whether the subtree processor's consumer goroutine
+// has exited. See subtreeprocessor.Interface.ConsumerExited for why a stalled
+// consumer and a departed one need telling apart.
+//
+// Returns:
+//   - bool: true once the consumer goroutine has exited
+func (b *BlockAssembler) ConsumerExited() bool {
+	return b.subtreeProcessor.ConsumerExited()
+}
+
 // SubtreeCount returns the total number of subtrees.
 //
 // Returns:

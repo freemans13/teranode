@@ -335,7 +335,11 @@ type SubtreeProcessor struct {
 	// startOnce ensures the processing goroutine is only started once
 	startOnce sync.Once
 
-	// stopped indicates the worker goroutine has exited (set on context cancellation)
+	// stopped indicates the worker goroutine has exited. Set on EVERY exit
+	// path - clean context cancellation, panic recovery, and fall-through -
+	// by the deferred close in Start, so it answers "is there still a
+	// consumer" and not merely "was shutdown requested". ConsumerExited
+	// exposes it for exactly that question.
 	stopped atomic.Bool
 
 	// precomputedMiningData holds pre-computed data for mining candidate generation.
@@ -1982,6 +1986,29 @@ func (stp *SubtreeProcessor) LastDequeueTime() time.Time {
 //   - bool: true once the consumer goroutine has been started
 func (stp *SubtreeProcessor) ConsumerStarted() bool {
 	return stp.consumerStarted.Load()
+}
+
+// ConsumerExited reports whether the consumer goroutine has exited. It is the
+// third lifecycle answer the stall signal needs, alongside ConsumerStarted:
+// a stale LastDequeueTime means the consumer is wedged only if there is still
+// a consumer. If it has exited the queue will never drain again, and telling
+// an operator to go and find which select branch is occupying the loop sends
+// them after the one thing that is not happening.
+//
+// The goroutine's deferred close stores this on every exit path, panic
+// recovery included, so a consumer killed by a panic in the dequeue branch -
+// which runHandlerWithRecover does not cover - is reported as exited rather
+// than as wedged. During an ordinary shutdown it also reads true, which is
+// honest; the stall threshold is long enough that a clean shutdown finishes
+// well before an incident could open.
+//
+// Like the other lifecycle reads this is a plain atomic load, so it stays
+// answerable whatever the consumer is doing.
+//
+// Returns:
+//   - bool: true once the consumer goroutine has exited
+func (stp *SubtreeProcessor) ConsumerExited() bool {
+	return stp.stopped.Load()
 }
 
 // SubtreeCount returns the total number of subtrees.

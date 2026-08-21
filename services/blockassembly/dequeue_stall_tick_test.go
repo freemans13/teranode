@@ -64,6 +64,12 @@ func TestSampleBlockAssemblerMetrics_DrivesTheStallSignal(t *testing.T) {
 
 	// The consumer is running throughout: this sequence is a wedge, not startup.
 	stp.On("ConsumerStarted").Return(true)
+	// ...and it is still there, which is what makes this a wedge rather than a
+	// consumer that died and will never come back.
+	stp.On("ConsumerExited").Return(false)
+	// The branch holding the loop. The warning names it so the operator does
+	// not have to go and find it, which is the whole reason it is sampled.
+	stp.On("GetCurrentRunningState").Return(subtreeprocessor.StateMoveForwardBlock)
 
 	// Deep queue for the first two ticks; the blocking handler drains it from
 	// inside its own branch before the third.
@@ -90,6 +96,8 @@ func TestSampleBlockAssemblerMetrics_DrivesTheStallSignal(t *testing.T) {
 	require.Equal(t, float64(35), testutil.ToFloat64(prometheusBlockAssemblerDequeueStalenessSeconds))
 	require.True(t, logger.sawWarn("intake is growing unbounded"),
 		"the rising edge of a genuine wedge warns immediately")
+	require.True(t, logger.sawWarn(`state "moveForwardBlock"`),
+		"the warning must name the select branch holding the loop, or it sends the operator looking for what it already knows")
 
 	// Tick 3, queue drained from inside the blocking handler. The consumer has
 	// not moved, so this is still the same stall.
@@ -126,6 +134,8 @@ func TestSampleBlockAssemblerMetrics_DrivesTheStallSignal(t *testing.T) {
 
 	require.True(t, logger.sawWarn("still stalled"),
 		"a stall that goes quiet after one line reads as resolved, so the repeat cadence must warn too")
+	require.False(t, logger.sawInfo("nothing is at risk"),
+		"the drain at tick 3 empties the queue mid-incident, and severity must not follow it down - the latch is what keeps this a warning")
 
 	stp.AssertExpectations(t)
 }
@@ -186,6 +196,10 @@ func TestSampleBlockAssemblerMetrics_StartupIsNotReportedAsUnboundedGrowth(t *te
 	require.False(t, logger.sawWarn("intake is growing unbounded"),
 		"routine startup must not be reported as unbounded growth")
 	require.True(t, logger.sawInfo("consumer has not started yet"))
+	require.False(t, logger.sawInfo("queued for"),
+		"on this path the duration is time since the subtree processor was constructed, not how long anything has been queued - saying otherwise overstates by minutes on a node that starts ingesting late in the reload")
+	require.True(t, logger.sawInfo("subtree processor was created 45s ago"),
+		"the line must say what the duration actually measures")
 
 	// Tick 2, once the repeat cadence has elapsed: still startup, still info,
 	// and it names the reload as the thing to suspect if it persists.
@@ -266,4 +280,117 @@ func TestSampleBlockAssemblerMetrics_ReadsConsumerStartedBeforeStaleness(t *test
 	require.NotEqual(t, -1, lastDequeue, "the tick must sample LastDequeueTime, or there is no staleness to report")
 	require.Less(t, consumerStarted, lastDequeue,
 		"ConsumerStarted must be read before LastDequeueTime, so a true reading guarantees the re-seeded timestamp is visible and a restart is never reported as a wedge")
+}
+
+// TestSampleBlockAssemblerMetrics_DepartedConsumerIsNotReportedAsAWedge pins
+// the third lifecycle case, which the wedge message actively misdirects on.
+//
+// A panic in the dequeue branch is not covered by runHandlerWithRecover, so it
+// unwinds to the goroutine's deferred close: the consumer is gone, the service
+// stays up, and nothing will ever drain the queue again for the lifetime of the
+// process. Staleness climbs exactly as it does for a wedge, so without this
+// classification the operator is told to go and find which select branch is
+// occupying a loop that no longer exists - the one thing that is not happening.
+//
+// The assertion that regresses is the negative one: delete the ConsumerExited
+// arm and this sees the unbounded-growth warning instead, while every other
+// test in this file still passes.
+func TestSampleBlockAssemblerMetrics_DepartedConsumerIsNotReportedAsAWedge(t *testing.T) {
+	initPrometheusMetrics()
+
+	stp := &subtreeprocessor.MockSubtreeProcessor{}
+	stp.Test(t)
+
+	logger := newCapturingLogger()
+
+	ba := &BlockAssembly{
+		logger:         logger,
+		blockAssembler: &BlockAssembler{subtreeProcessor: stp},
+	}
+
+	stp.On("TxCount").Return(uint64(0))
+	stp.On("SubtreeCount").Return(0)
+	stp.On("QueueLength").Return(int64(80_000))
+
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// The consumer ran, then died. The timestamp froze where it fell.
+	stp.On("LastDequeueTime").Return(start)
+	stp.On("ConsumerStarted").Return(true)
+	stp.On("ConsumerExited").Return(true)
+
+	var state dequeueStallState
+
+	state = ba.sampleBlockAssemblerMetrics(state, start.Add(45*time.Second))
+
+	require.True(t, state.stalled)
+	require.True(t, logger.sawError("consumer has exited and will not restart"),
+		"a consumer that will never come back is a dead service, not a slow one, and the level has to say so")
+	require.False(t, logger.sawWarn("intake is growing unbounded"),
+		"the wedge message sends the operator after the select branch holding the loop, and here there is no loop")
+
+	stp.AssertExpectations(t)
+}
+
+// TestSampleBlockAssemblerMetrics_SeveritySplitsOnWorkNotOnStaleness pins the
+// answer to the two things that pull in opposite directions here.
+//
+// The incident has to open on staleness alone, because depth is the
+// untrustworthy half: the handlers that block the consumer drain the queue from
+// inside the branch that is blocking it, so a tick landing on zero would
+// otherwise decline to open an incident that is already minutes old. But
+// opening on staleness alone means a large moveForwardBlock on a quiet node
+// trips the threshold legitimately, and warning "intake is growing unbounded"
+// at an operator on a routine block is how a new signal gets ignored.
+//
+// So the incident opens either way and the level follows whether work has ever
+// stacked up behind the consumer during it - latched, not sampled, so the same
+// mid-incident drain cannot walk it back down.
+func TestSampleBlockAssemblerMetrics_SeveritySplitsOnWorkNotOnStaleness(t *testing.T) {
+	initPrometheusMetrics()
+
+	stp := &subtreeprocessor.MockSubtreeProcessor{}
+	stp.Test(t)
+
+	logger := newCapturingLogger()
+
+	ba := &BlockAssembly{
+		logger:         logger,
+		blockAssembler: &BlockAssembler{subtreeProcessor: stp},
+	}
+
+	stp.On("TxCount").Return(uint64(0))
+	stp.On("SubtreeCount").Return(0)
+	stp.On("ConsumerStarted").Return(true)
+	stp.On("ConsumerExited").Return(false)
+	stp.On("GetCurrentRunningState").Return(subtreeprocessor.StateMoveForwardBlock)
+
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	stp.On("LastDequeueTime").Return(start)
+
+	// Tick 1: a long block move with nothing queued behind it. Reported, so a
+	// handler holding the loop is never silent, but nothing is at risk.
+	stp.On("QueueLength").Return(int64(0)).Once()
+
+	var state dequeueStallState
+
+	state = ba.sampleBlockAssemblerMetrics(state, start.Add(45*time.Second))
+	require.True(t, state.stalled, "the incident opens on staleness alone - depth must not decide whether there is anything to report")
+	require.False(t, state.sawQueuedWork)
+	require.False(t, logger.sawWarn("intake is growing unbounded"),
+		"a long handler on an empty queue is not unbounded growth, and warning as though it were is how the signal gets ignored")
+	require.True(t, logger.sawInfo("nothing is at risk"))
+	require.True(t, logger.sawInfo(`state "moveForwardBlock"`),
+		"even the quiet line names the branch, since that is the whole diagnostic")
+
+	// Tick 2: the same handler is still holding the loop, and now transactions
+	// are stacking up behind it. That is issue #1429, and it must escalate.
+	stp.On("QueueLength").Return(int64(50_000)).Once()
+
+	state = ba.sampleBlockAssemblerMetrics(state, start.Add(45*time.Second+dequeueStallWarnRepeat))
+	require.True(t, state.sawQueuedWork, "work arriving mid-incident must latch, or the escalation is lost on the next drain")
+	require.True(t, logger.sawWarn("still stalled"),
+		"once work is stacking up behind a consumer that is not dequeuing, the incident is the one this signal exists for")
+
+	stp.AssertExpectations(t)
 }

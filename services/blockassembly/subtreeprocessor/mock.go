@@ -147,6 +147,11 @@ func (m *MockSubtreeProcessor) ConsumerStarted() bool {
 	return args.Bool(0)
 }
 
+func (m *MockSubtreeProcessor) ConsumerExited() bool {
+	args := m.Called()
+	return args.Bool(0)
+}
+
 func (m *MockSubtreeProcessor) SubtreeCount() int {
 	args := m.Called()
 	return args.Int(0)

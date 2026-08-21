@@ -19,9 +19,9 @@ var stallBase = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 // meant a two-minute test.
 //
 // The case that matters most is drainedMidStallMustNotReportRecovery. The
-// original form keyed the exit on stalledNow, which is
+// original form keyed both edges on stalledNow, which is
 // `queueLength > 0 && staleness > threshold`, so queueLength == 0 alone
-// satisfied it - and the queue is drained from inside the very handlers that
+// satisfied the exit - and the queue is drained from inside the very handlers that
 // block the consumer (reorgBlocks and moveForwardBlock both call
 // SubtreeProcessor.dequeueDuringBlockMovement, which does not stamp
 // lastDequeueMillis). A long moveForwardBlock would therefore empty its own
@@ -30,6 +30,11 @@ var stallBase = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 // cleared the stalled flag, discarding the repeat cadence, so one incident
 // reported as a series of short flapping fragments and anything grepping for
 // "recovered" got a false all-clear.
+//
+// Depth has since left the entry condition too, for the same reason it left
+// the exit: the tick that lands just after that in-branch drain reads zero in
+// the middle of the failure this exists for. It survives only as the input to
+// the sawQueuedWork latch, which picks how loudly the caller reports.
 func TestObserveDequeueStall_Transitions(t *testing.T) {
 	stalledState := func(sinceOffset, warnOffset time.Duration) dequeueStallState {
 		return dequeueStallState{
@@ -40,13 +45,17 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		state       dequeueStallState
-		now         time.Time
+		name  string
+		state dequeueStallState
+		now   time.Time
+		// queueLength never gates entry or exit. It only feeds the
+		// sawQueuedWork latch, which decides how loudly the caller reports.
 		queueLength int64
 		staleness   time.Duration
 		wantEvent   dequeueStallEvent
 		wantStalled bool
+		// wantSawQueuedWork is only checked when wantStalled is true.
+		wantSawQueuedWork bool
 		// beforeConsumerStarted drives the consumerStarted input. Zero value
 		// means the consumer had started, which is the case for every wedge.
 		beforeConsumerStarted bool
@@ -73,11 +82,18 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			wantEvent:   dequeueStallNone,
 		},
 		{
-			name:        "staleConsumerWithEmptyQueueDoesNotBeginAStall",
+			// Depth no longer gates entry. It cannot: the handlers that block
+			// the consumer drain the queue from inside the branch that blocks
+			// it, so a zero reading is as likely to mean "the wedge is draining
+			// its own backlog" as "there is nothing to drain". The caller
+			// reports this one at info precisely because nothing is
+			// accumulating - see BlockAssembly.reportDequeueStall.
+			name:        "staleConsumerWithEmptyQueueStillBeginsAStall",
 			now:         stallBase,
-			queueLength: 0,
 			staleness:   5 * time.Minute,
-			wantEvent:   dequeueStallNone,
+			wantEvent:   dequeueStallBegan,
+			wantStalled: true,
+			wantSince:   stallBase.Add(-5 * time.Minute),
 		},
 		{
 			name:        "atThresholdExactlyIsNotYetAStall",
@@ -87,12 +103,13 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			wantEvent:   dequeueStallNone,
 		},
 		{
-			name:        "risingEdgeBackdatesToWhenTheConsumerStopped",
-			now:         stallBase.Add(time.Hour),
-			queueLength: 10_000,
-			staleness:   dequeueStallThreshold + time.Second,
-			wantEvent:   dequeueStallBegan,
-			wantStalled: true,
+			name:              "risingEdgeBackdatesToWhenTheConsumerStopped",
+			now:               stallBase.Add(time.Hour),
+			queueLength:       10_000,
+			staleness:         dequeueStallThreshold + time.Second,
+			wantEvent:         dequeueStallBegan,
+			wantStalled:       true,
+			wantSawQueuedWork: true,
 			// Not `now`: the stall began when the consumer stopped, which is
 			// at least the threshold plus up to one tick earlier.
 			wantSince: stallBase.Add(time.Hour).Add(-(dequeueStallThreshold + time.Second)),
@@ -101,7 +118,6 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			name:        "repeatIsSuppressedBeforeTheCadenceElapses",
 			state:       stalledState(0, 0),
 			now:         stallBase.Add(dequeueStallWarnRepeat - time.Second),
-			queueLength: 10_000,
 			staleness:   5 * time.Minute,
 			wantEvent:   dequeueStallNone,
 			wantStalled: true,
@@ -111,7 +127,6 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			name:        "repeatFiresOnceTheCadenceElapses",
 			state:       stalledState(0, 0),
 			now:         stallBase.Add(dequeueStallWarnRepeat),
-			queueLength: 10_000,
 			staleness:   5 * time.Minute,
 			wantEvent:   dequeueStallContinues,
 			wantStalled: true,
@@ -125,7 +140,6 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			// consumer has not moved, so this is still one stall.
 			state:       stalledState(0, 0),
 			now:         stallBase.Add(65 * time.Second),
-			queueLength: 0,
 			staleness:   65 * time.Second,
 			wantEvent:   dequeueStallNone,
 			wantStalled: true,
@@ -139,7 +153,6 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			// into fragments. stalledSince must survive the drain untouched.
 			state:       stalledState(0, 0),
 			now:         stallBase.Add(dequeueStallWarnRepeat + time.Minute),
-			queueLength: 0,
 			staleness:   dequeueStallWarnRepeat + time.Minute,
 			wantEvent:   dequeueStallContinues,
 			wantStalled: true,
@@ -152,7 +165,6 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			// does mean it is running.
 			state:       stalledState(0, 0),
 			now:         stallBase.Add(10 * time.Minute),
-			queueLength: 0,
 			staleness:   time.Second,
 			wantEvent:   dequeueStallEnded,
 			wantStalled: false,
@@ -166,7 +178,6 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			// the healthy deep-queue case, not a stall.
 			state:       stalledState(0, 0),
 			now:         stallBase.Add(3 * time.Minute),
-			queueLength: 400_000,
 			staleness:   time.Second,
 			wantEvent:   dequeueStallEnded,
 			wantStalled: false,
@@ -184,13 +195,13 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			beforeConsumerStarted: true,
 			wantEvent:             dequeueStallBegan,
 			wantStalled:           true,
+			wantSawQueuedWork:     true,
 			wantSince:             stallBase,
 		},
 		{
 			name:        "recoveryAtThresholdExactly",
 			state:       stalledState(0, 0),
 			now:         stallBase.Add(time.Minute),
-			queueLength: 1,
 			staleness:   dequeueStallThreshold,
 			wantEvent:   dequeueStallEnded,
 			wantStalled: false,
@@ -213,6 +224,8 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 					"stalledSince must only ever be set on the rising edge, so one incident reports as one incident")
 				require.Equal(t, tt.beforeConsumerStarted, got.beforeConsumerStarted,
 					"the cause must be latched on the rising edge, since by the closing edge the consumer has necessarily started and the live reading can no longer tell startup from a wedge")
+				require.Equal(t, tt.wantSawQueuedWork, got.sawQueuedWork,
+					"severity must follow whether work has queued at any point in the incident, not this tick's depth")
 			}
 
 			if tt.wantEvent == dequeueStallEnded {
@@ -230,7 +243,9 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 // This is the regression the transition table proves in pieces; driving the
 // sequence catches state that is individually plausible but does not compose
 // - in particular a mid-stall drain resetting stalledSince, which no single
-// transition assertion can see.
+// transition assertion can see. The same drain is now also the case that would
+// silently downgrade the incident to info if severity were read per tick
+// instead of latched, so this asserts the latch survives it.
 func TestObserveDequeueStall_IncidentIsReportedAsOneIncident(t *testing.T) {
 	const tick = 5 * time.Second
 
@@ -273,6 +288,11 @@ func TestObserveDequeueStall_IncidentIsReportedAsOneIncident(t *testing.T) {
 		)
 
 		state, event, stalledFor = observeDequeueStall(state, stallBase.Add(elapsed), queueLength, staleness, true)
+
+		if state.stalled {
+			require.True(t, state.sawQueuedWork,
+				"the incident opened with 10k queued, so it must stay a warning even on the ticks after the blocking handler drained its own queue")
+		}
 
 		switch event {
 		case dequeueStallBegan:
