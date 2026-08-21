@@ -1,6 +1,7 @@
 package model
 
 import (
+	"github.com/bsv-blockchain/go-bt/v2"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 )
 
@@ -37,17 +38,36 @@ import (
 // non-first subtree has no coinbase placeholder, so any block whose transaction
 // count is congruent to 1 modulo the subtree size ends with a one-node subtree
 // holding a real tx hash at index 0.
+// The count is driven by the subtree's nodes rather than by len(data.Txs), so a
+// body carrying fewer entries than the subtree has nodes counts the shortfall
+// instead of reporting the entries it does have as complete. Today those two
+// lengths always agree, because serializeFromReader allocates Txs at
+// Subtree.Length() before it reads anything — but a Data reaching here by any
+// other route would otherwise pass, and the callers' error messages already
+// report the denominator as Subtree.Length(). Nil data is the same case with no
+// entries at all: every node is unfilled.
+//
+// A nil subtree has no nodes, so nothing can be unfilled and the answer is
+// genuinely zero. That is arithmetic rather than a fail-open default — no body
+// can be judged against a subtree that is not there, and neither caller can
+// reach it, both holding a subtree they have already deserialized against.
 func MissingSubtreeDataTxs(subtree *subtreepkg.Subtree, data *subtreepkg.Data) int {
-	if subtree == nil || data == nil {
+	if subtree == nil {
 		return 0
 	}
 
-	coinbaseAtZero := len(subtree.Nodes) > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+	var txs []*bt.Tx
+	if data != nil {
+		txs = data.Txs
+	}
+
+	nodes := subtree.Length()
+	coinbaseAtZero := nodes > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
 
 	missing := 0
 
-	for i, tx := range data.Txs {
-		if tx != nil {
+	for i := 0; i < nodes; i++ {
+		if i < len(txs) && txs[i] != nil {
 			continue
 		}
 
