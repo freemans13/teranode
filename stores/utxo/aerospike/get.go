@@ -1743,9 +1743,12 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 		//     mutated afterwards, because spending touches the utxos/spentUtxos
 		//     bins, not these. But a record seeded from a UTXO-set snapshot
 		//     (cmd/seeder, cmd/seedimport) keeps no inputs and a nil hole at every
-		//     output index already spent at snapshot time, so it can never hash back
-		//     to its key — and TxIDChainHash() panics on the nil output rather than
-		//     returning a mismatch. See meta.Data.TxIsSerializable, which documents
+		//     output index already spent at snapshot time, so it cannot hash back to
+		//     its key — and TxIDChainHash() panics on the nil output rather than
+		//     returning a mismatch. (cmd/seeder's restoreCoinbaseInput is the one
+		//     exception: it keeps a rebuilt coinbase input only when the result does
+		//     hash to the key, and only when no output is missing.) See
+		//     meta.Data.TxIsSerializable, which documents
 		//     that shape and which the existing txid comparisons (e.g.
 		//     services/asset/repository) gate on. So extending the re-hash inline is
 		//     not a straight cost/benefit trade: it needs that predicate in front of
