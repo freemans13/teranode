@@ -772,3 +772,54 @@ func TestNoteRaceWinner_CancelsTheRealOwnerNotTheSyncPeer(t *testing.T) {
 	require.True(t, sm.BlockRacedTo(racer, &frontier),
 		"the racer must not be punished either")
 }
+
+// TestFrontierRace_ADepartedRacerDoesNotDisableTheRace pins the other way a race
+// could be switched off permanently.
+//
+// frontierRacers is only cleared wholesale — when the frontier moves, or when
+// the raced block arrives. clearRequestedState releases a departed peer's ledger
+// ownership and never touches this map. So a racer that disconnects stayed in the
+// set, and because the set is what maxRacing is measured against, at the default
+// of two a single departed racer meant "already racing as hard as we can" for as
+// long as the frontier sat on that block. The frontier only moves when the block
+// arrives, so that is until the 180-second backstop fires — the exact stall this
+// file exists to avoid, reintroduced by the thing meant to fix it.
+func TestFrontierRace_ADepartedRacerDoesNotDisableTheRace(t *testing.T) {
+	sm := newRaceManager(t)
+
+	// Below the frontier height, so it is neither owner nor eligible racer and
+	// the choice of target is deterministic.
+	syncPeer, _, syncRec := connectRacePeer(t, 30, 100)
+	owner, _, _ := connectRacePeer(t, 31, 1000)
+	departed, _, _ := connectRacePeer(t, 32, 1000)
+	live, _, liveRec := connectRacePeer(t, 33, 1000)
+
+	registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, owner)
+	registerRacePeer(sm, departed)
+	registerRacePeer(sm, live)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	frontier := chainhash.Hash{0xfa}
+
+	require.True(t, sm.blockDownloads.Add(owner, frontier))
+	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
+
+	// One racer was already asked, and has since gone.
+	require.True(t, sm.registerFrontierRacer(frontier, departed))
+	departed.DisconnectWithInfo("test: the racer goes away")
+
+	require.True(t, WaitUntil(func() bool { return !departed.Connected() }, 5*time.Second),
+		"precondition: the racer has actually gone")
+
+	sm.raceFrontierBlock(time.Now())
+
+	require.True(t, WaitUntil(func() bool { return liveRec.count() > 0 }, 5*time.Second),
+		"a departed racer must not count towards the parallel-fetch limit; the stuck block must still be raced")
+	require.Equal(t, []chainhash.Hash{frontier}, liveRec.all(),
+		"and it must be raced the frontier block, nothing else")
+	require.Zero(t, syncRec.count(), "the peer below the frontier height must not be asked")
+
+	require.True(t, sm.blockDownloads.HasOwner(live, frontier),
+		"the racer's reply has to be authorised in advance")
+}

@@ -200,6 +200,21 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	racing := make(map[*peerpkg.Peer]struct{}, len(sm.frontierRacers))
 
 	for p := range sm.frontierRacers {
+		if p == nil || !p.Connected() {
+			// A racer that has gone can deliver nothing, so it must count
+			// towards nothing. Nothing else takes it out either: the set is only
+			// cleared wholesale when the frontier moves or the block arrives, and
+			// clearRequestedState releases a departed peer's ledger ownership
+			// without touching this map. Left in place it counted towards
+			// maxRacing for as long as the frontier sat on this block — and the
+			// frontier only moves when the block arrives, so at the default of
+			// two one departed racer disabled racing for precisely the block
+			// racing exists to rescue, until the 180-second backstop fired.
+			delete(sm.frontierRacers, p)
+
+			continue
+		}
+
 		racing[p] = struct{}{}
 	}
 	sm.frontierMu.Unlock()

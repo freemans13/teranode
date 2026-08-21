@@ -3478,6 +3478,16 @@ func (sm *SyncManager) commitHeaderCandidates(assigner *downloadAssigner, anchor
 			}
 
 			if err := assigner.recordRequest(target, node.hash); err != nil {
+				// The ledger was told about a request that is not going to be
+				// sent, so take it back. Left in place the hash is owned by a
+				// peer that was never asked, which answers RequestedWithin and
+				// HasOwner for the hour-long ceiling and so quietly holds the
+				// walk off it. Only reachable above wire.MaxInvPerMsg, which the
+				// per-peer budget keeps far out of reach, but the branch above
+				// holds the cursor without adding and these two should fail the
+				// same way.
+				sm.blockDownloads.RemoveOwner(target.peer, hashes[i])
+
 				sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
 
 				return requested, false
