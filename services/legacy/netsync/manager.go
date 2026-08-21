@@ -1254,8 +1254,7 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 	if err != nil {
 		// ErrTxCreating is the same situation as ErrTxLocked — the parent this tx spends
 		// from is still completing its own commit, just via the multi-record write path —
-		// so it parks for the same reason. It could not be named here before, because the
-		// errors package had no sentinel for it.
+		// so it parks for the same reason.
 		if errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxLocked) || errors.Is(err, errors.ErrTxCreating) {
 			// this is an orphan transaction, we will accept it when the parent comes in
 			// first check if the transaction already exists in the orphan pool, otherwise add it

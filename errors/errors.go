@@ -792,10 +792,6 @@ var publicCauseCodes = map[ERR]struct{}{
 	// which reports the group rather than one output and substitutes the current
 	// block height), and the height the hold expires at only where the store knows
 	// it. All of that is either supplied by the submitter or already public.
-	// Frozen was already the answer Aerospike gave for a held output, so its
-	// absence here was collapsing that message for every Aerospike node; routing
-	// the SQL store's height-gated hold here too would have widened that rather
-	// than fixing it.
 	ERR_UTXO_FROZEN: {},
 	// ERR_TX_MISSING_PARENT meets every bar above: its messages name transactions
 	// and nothing else, and "a parent this transaction spends is not in my utxo
