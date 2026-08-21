@@ -818,3 +818,31 @@ func TestSubtreeMetaRegenerator_PlaceholderExemptionMatchesValidateSubtree(t *te
 		require.Nil(t, meta)
 	})
 }
+
+// TestSubtreeMetaRegenerator_ZeroInputTxIsComplete pins which nil the
+// completeness check reads. A transaction with no inputs leaves ParentTxHashes
+// nil even though the node is fully present, so keying the check off the built
+// meta rather than off data.Txs fails regeneration permanently on intact data.
+func TestSubtreeMetaRegenerator_ZeroInputTxIsComplete(t *testing.T) {
+	ctx := context.Background()
+
+	noInputs := &bt.Tx{}
+
+	subtree := &subtreepkg.Subtree{Nodes: []subtreepkg.Node{{Hash: *noInputs.TxIDChainHash()}}}
+	subtreeHash := subtree.RootHash()
+
+	data := subtreepkg.NewSubtreeData(subtree)
+	data.Txs[0] = noInputs
+
+	serialized, err := data.Serialize()
+	require.NoError(t, err)
+
+	store := memory.New()
+	require.NoError(t, store.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData, serialized))
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, nil, func() uint32 { return 100 }, 288, 0)
+
+	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree, false)
+	require.NoError(t, err, "a present transaction with no inputs is complete data, not a short rebuild")
+	require.NotNil(t, meta)
+}
