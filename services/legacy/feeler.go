@@ -429,7 +429,7 @@ func (s *server) feelerProbe() {
 
 	res := &feelerResult{done: make(chan struct{})}
 
-	p, err := peer.NewOutboundPeer(s.logger, s.settings, s.feelerPeerConfig(res), addrString)
+	p, err := peer.NewOutboundPeer(quietProbeLogger{s.logger}, s.settings, s.feelerPeerConfig(res), addrString)
 	if err != nil {
 		s.logProbe(addrString, fmt.Sprintf("cannot build a peer: %v", err), "")
 		_ = conn.Close()
@@ -490,6 +490,36 @@ func (s *server) feelerProbe() {
 	p.DisconnectWithLogFunc("feeler probe complete", s.logger.Debugf)
 
 	s.logProbe(addrString, outcome, res.userAgent())
+}
+
+// quietProbeLogger is the logger a probe's own peer gets. It moves that peer's
+// warnings and errors down to debug, and leaves everything else alone.
+//
+// A probe is not a peer the node lost, and its troubles are nobody's business but
+// the feeler's. Without this, probing a non-BSV host reliably produced two loud
+// lines: the read loop meets a command the BSV parser cannot handle, logs an
+// ERROR, and disconnects at WARN with "reason: malformed message" — and that WARN
+// is the exact line the disconnect-rate measurements count, so the feeler
+// inflated the very number this series exists to drive down, on every probe of
+// the fork clients it is designed to seek out and ban.
+//
+// The log-once guard in DisconnectWithLogFunc cannot help here. It works, but in
+// the wrong direction: the read loop's teardown ran first and won, so the guard
+// suppressed the feeler's deliberate debug line and let the warning through.
+// Observed on the first mainnet soak, against a /Bitcoin Cash Node:29.1.0/ host.
+//
+// The feeler's own info line still reports the outcome, so nothing worth knowing
+// is lost by quietening the peer underneath it.
+type quietProbeLogger struct {
+	ulogger.Logger
+}
+
+func (l quietProbeLogger) Warnf(format string, args ...interface{}) {
+	l.Logger.Debugf(format, args...)
+}
+
+func (l quietProbeLogger) Errorf(format string, args ...interface{}) {
+	l.Logger.Debugf(format, args...)
 }
 
 // logProbe reports how one probe ended.
