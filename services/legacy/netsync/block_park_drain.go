@@ -256,14 +256,18 @@ func (sm *SyncManager) resumeHeaderWalk() {
 // so nothing would ever drain it.
 //
 // It runs on the block-queue consumer, the same goroutine that commits blocks in
-// order, and its chain lookups are capped per tick so it can never turn into a
-// scan of the whole park.
+// order, so BOTH halves are capped per tick and neither can turn into a pass over
+// the whole park in one go: the chain lookups by parkSweepRPCBudget, and the
+// blocks it gives up on by parkSweepExpiryBudget. The second cap is the one that
+// is easy to miss, and it is the more expensive item — a store delete and a
+// cursor rewind rather than a lookup — and the one that arrives in bursts,
+// because blocks parked together age out together.
 func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 	if !sm.blockPark.Enabled() {
 		return
 	}
 
-	for _, entry := range sm.blockPark.Expire(now) {
+	for _, entry := range sm.blockPark.Expire(now, parkSweepExpiryBudget) {
 		sm.logger.Warnf("[sweepParkedBlocks][%s] %s, giving the block up after %s: parent %s", entry.hash, parkDispositionExpired.reason, parkEntryTTL, entry.prevBlock)
 		sm.applyParkDisposition(entry, parkDispositionExpired)
 	}

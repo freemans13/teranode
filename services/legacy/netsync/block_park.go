@@ -68,6 +68,28 @@ const (
 	// arithmetic to this.
 	parkSweepRPCBudget = 128
 
+	// parkSweepExpiryBudget caps how many expired blocks one sweep tick gives up
+	// on, for the same reason parkSweepRPCBudget caps the lookups beside it, and
+	// against a bill that is larger per item.
+	//
+	// Each one costs a store Del carrying legacy_parkStoreTimeout — a write permit
+	// from a pool of 256 shared process-wide with subtree writes, transaction
+	// writes and both persisters — plus a cursor rewind that takes headerMu. All
+	// of it on the one goroutine that commits blocks in order. Expiry arrives in
+	// bursts by its nature: the blocks in a stalled park were queued together, so
+	// they age out together, and an uncapped pass could hand the whole index to
+	// that goroutine in a single tick. With blockQueue full, the outer message
+	// loop blocks on it and disconnects, rotation, inv, headers and transaction
+	// dispatch stall for every peer.
+	//
+	// 128 matches its neighbour and drains a full park in 32 ticks, sixteen
+	// minutes — well inside parkEntryTTL, so nothing waits appreciably longer to
+	// be re-requested than it did when the loop was unbounded. Which 128 a tick
+	// takes is unspecified, because map order is, and it does not matter: every
+	// candidate is already past the TTL, so there is no fairness question, only a
+	// rate one.
+	parkSweepExpiryBudget = 128
+
 	// parkRecoverBudgetOps is how many store operations' worth of waiting the
 	// whole restart scan gets, as a multiple of the per-operation deadline. It is
 	// expressed that way rather than as a number of seconds because it is the
@@ -582,10 +604,14 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	}
 }
 
-// Expire removes and returns every block that has been parked longer than
-// parkEntryTTL. Their parents are not coming; the caller re-requests them.
-func (p *blockPark) Expire(now time.Time) []parkedBlock {
-	if p == nil {
+// Expire removes and returns up to limit blocks that have been parked longer
+// than parkEntryTTL. Their parents are not coming; the caller re-requests them.
+//
+// The limit is what stops a burst of expiry becoming one long turn on the
+// block-queue consumer — see parkSweepExpiryBudget. Anything over it waits for
+// the next tick, which costs it nothing it was not already waiting for.
+func (p *blockPark) Expire(now time.Time, limit int) []parkedBlock {
+	if p == nil || limit <= 0 {
 		return nil
 	}
 
@@ -595,6 +621,10 @@ func (p *blockPark) Expire(now time.Time) []parkedBlock {
 	var expired []parkedBlock
 
 	for h, entry := range p.entries {
+		if len(expired) == limit {
+			break
+		}
+
 		if now.Sub(entry.parkedAt) < parkEntryTTL {
 			continue
 		}

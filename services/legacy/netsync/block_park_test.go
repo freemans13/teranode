@@ -426,7 +426,7 @@ func TestBlockPark_IsOffWhenItCannotBeRecovered(t *testing.T) {
 		require.Zero(t, park.Len())
 		require.Zero(t, park.Bytes())
 		require.Nil(t, park.TakeChildren(chainhash.Hash{}))
-		require.Nil(t, park.Expire(time.Now()))
+		require.Nil(t, park.Expire(time.Now(), parkSweepExpiryBudget))
 		require.Nil(t, park.StuckCandidates(time.Now(), 8))
 
 		_, ok := park.Take(chainhash.Hash{})

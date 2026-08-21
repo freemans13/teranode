@@ -136,10 +136,68 @@ func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T)
 
 	require.Equal(t, 1, fresh.Len(), "the block must be adopted before anything can expire it")
 
-	expired := fresh.Expire(time.Now())
+	expired := fresh.Expire(time.Now(), parkSweepExpiryBudget)
 
 	require.Len(t, expired, 1,
 		"a block parked longer ago than the TTL must expire on the first sweep after a restart, not start its half hour again")
 	require.True(t, expired[0].hash.IsEqual(&hash))
 	require.Zero(t, fresh.Len())
+}
+
+// TestBlockPark_ExpiryIsRatedPerTickLikeTheLookupsBesideIt pins the second of the
+// sweep's two caps.
+//
+// The lookup half was given a per-tick budget with a paragraph of arithmetic
+// behind it; the expiry half directly above it had none, and it is the more
+// expensive item — each block given up on costs a store delete carrying
+// legacy_parkStoreTimeout and a cursor rewind under headerMu, on the one
+// goroutine that commits blocks in order. It is also the half that arrives in
+// bursts, because blocks parked together age out together. An uncapped pass could
+// hand the whole index to that goroutine in a single tick, and with blockQueue
+// full the outer loop blocks on it and every peer's dispatch stalls behind it.
+//
+// The asymmetry was the tell, so this asserts the rate rather than the mechanism:
+// a park holding more expired blocks than one tick's budget must give up exactly
+// the budget, and the remainder must still be there afterwards.
+func TestBlockPark_ExpiryIsRatedPerTickLikeTheLookupsBesideIt(t *testing.T) {
+	park, _ := newTestPark(t, "")
+
+	// Comfortably more than one tick's worth, and all of them already past the
+	// TTL, so nothing but the budget decides how many go.
+	const parked = parkSweepExpiryBudget + 40
+
+	aged := time.Now().Add(-parkEntryTTL - time.Minute)
+
+	park.mu.Lock()
+
+	for i := 0; i < parked; i++ {
+		var h, prev chainhash.Hash
+
+		binary.LittleEndian.PutUint32(h[:4], uint32(i))
+		h[31] = 0xb1
+		binary.LittleEndian.PutUint32(prev[:4], uint32(i))
+		prev[31] = 0xb2
+
+		entry := &parkedBlock{hash: h, prevBlock: prev, parkedAt: aged}
+		park.entries[h] = entry
+		park.children[prev] = append(park.children[prev], h)
+	}
+
+	park.mu.Unlock()
+
+	require.Equal(t, parked, park.Len(), "harness check: every block is parked")
+
+	// Lengths compared as counts, not with require.Len on the slice: a failure
+	// there prints every parkedBlock it holds and buries the message.
+	first := park.Expire(time.Now(), parkSweepExpiryBudget)
+	require.Equal(t, parkSweepExpiryBudget, len(first),
+		"one tick must give up exactly its budget, however many are ready")
+	require.Equal(t, parked-parkSweepExpiryBudget, park.Len(),
+		"the rest must still be parked, to be given up on the next tick")
+
+	// And the remainder is not stranded: the next tick takes what is left.
+	second := park.Expire(time.Now(), parkSweepExpiryBudget)
+	require.Equal(t, parked-parkSweepExpiryBudget, len(second),
+		"the following tick must take the remainder rather than leaving it behind")
+	require.Zero(t, park.Len())
 }
