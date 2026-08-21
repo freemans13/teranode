@@ -3393,6 +3393,21 @@ func (sm *SyncManager) commitHeaderCandidates(assigner *downloadAssigner, anchor
 				return requested, false
 			}
 
+			// The peer the assigner picked may be the one that already owes us
+			// this block. A demoted peer's reopened slice is exactly that case:
+			// reopening back-dates the record rather than dropping it, so the
+			// walk is free to place the block again and nothing kept it off the
+			// same peer. That peer already has our request, so re-arm what we
+			// hold rather than asking twice — a peer that answers twice has its
+			// second copy arrive after the first discharged its obligation, and
+			// loses its whole association for answering us.
+			if sm.blockDownloads.ReassertOwner(target.peer, hashes[i]) {
+				e = e.Next()
+				sm.startHeader = e
+
+				continue
+			}
+
 			// Record the request before it goes out. A block the ledger will
 			// not take is a block we must not ask for: the reply would arrive
 			// with nothing vouching for it and cost this peer its connection.

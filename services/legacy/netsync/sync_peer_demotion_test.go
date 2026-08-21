@@ -180,8 +180,18 @@ func TestStalledSyncPeer_IsDemotedAndStaysConnected(t *testing.T) {
 	_, stillRegistered := sm.peerStates.Get(stalled)
 	require.True(t, stillRegistered, "the demoted peer must stay a registered, schedulable peer")
 
-	require.Equal(t, len(owed), sm.blockDownloads.CountForPeer(stalled),
-		"revoking a connected peer's block ownership makes its late copies look unrequested")
+	for _, h := range owed {
+		require.True(t, sm.blockDownloads.HasOwner(stalled, h),
+			"revoking a connected peer's block ownership makes its late copies look unrequested")
+	}
+
+	// Ownership is kept so a late copy is admitted; the budget is not, or the
+	// peer the demotion deliberately kept in order to keep using it is handed no
+	// block work at all until the hour-long ownership ceiling expires. Those are
+	// two different questions about the same record, and counting them as one is
+	// what made the demoted peer useless.
+	require.Zero(t, sm.blockDownloads.CountForPeer(stalled),
+		"a peer let off its slice must get that budget back straight away")
 
 	_, txStillWanted := state.requestedTxns.Get(awaitedTx)
 	require.True(t, txStillWanted, "the demoted peer's outstanding transaction requests must survive")

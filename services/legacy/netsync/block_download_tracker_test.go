@@ -404,3 +404,52 @@ func TestBlockDownloadTracker_ForgetForRetryPeerReopensOnlyThatPeersBlocks(t *te
 			"the delivery ceiling must be untouched beyond the one retry window")
 	}
 }
+
+// TestForgivenAssignment_IsStillOwnedButNoLongerSpendsBudget pins the two
+// different questions the ledger is asked about one record, which used to be the
+// same question.
+//
+// "Will you admit this peer's copy?" has to stay yes after the peer is let off,
+// or a block that does turn up costs an honest peer its whole association.
+// "Is this peer busy?" has to become no, or the peer a demotion deliberately
+// kept connected in order to keep using is handed no work at all: arrival only
+// discharges the peer that delivered, so the record the reopen left behind sat
+// there spending that peer's entire budget for the rest of the hour.
+func TestForgivenAssignment_IsStillOwnedButNoLongerSpendsBudget(t *testing.T) {
+	tr, advance := newTestTracker(blockRequestAssignmentTTL)
+
+	p := newTestPeer(t, "localhost:18333")
+	h := chainhash.Hash{0x71}
+
+	require.True(t, tr.Add(p, h))
+	require.Equal(t, 1, tr.CountForPeer(p), "sanity: an ordinary assignment spends budget")
+
+	reopened := tr.ForgetForRetryPeer(p, blockRequestRetryInterval)
+	require.Equal(t, []chainhash.Hash{h}, reopened)
+
+	require.True(t, tr.HasOwner(p, h),
+		"a peer let off a block must still be able to deliver it without being punished")
+	require.Zero(t, tr.CountForPeer(p),
+		"a block the peer has been let off must not go on spending its download budget")
+	require.Zero(t, tr.PeersWithDownloads(),
+		"a peer that owes nothing live must not widen every peer's download deadline")
+	require.Zero(t, tr.Len(),
+		"a block nobody is waiting on must not hold a slot in the node-wide window")
+
+	// Handing it back to the same peer re-arms the record rather than sending a
+	// duplicate request, so the block is genuinely owed again.
+	require.True(t, tr.ReassertOwner(p, h))
+	require.Equal(t, 1, tr.CountForPeer(p), "a re-armed assignment spends budget again")
+	require.Equal(t, 1, tr.Len())
+
+	// A peer that never owed it is not given it by the back door.
+	other := newTestPeer(t, "localhost:18334")
+	require.False(t, tr.ReassertOwner(other, h))
+	require.False(t, tr.HasOwner(other, h))
+
+	// Past the ownership ceiling the peer has long since dropped the request, so
+	// re-arming would vouch for a reply that is never coming. The caller has to
+	// send a real one.
+	advance(blockRequestAssignmentTTL + time.Minute)
+	require.False(t, tr.ReassertOwner(p, h), "a dead assignment must not be re-armed")
+}

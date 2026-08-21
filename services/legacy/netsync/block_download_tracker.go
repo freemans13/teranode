@@ -59,13 +59,31 @@ const (
 // writes do nothing. Reading a nil tracker as "we never asked for this" is the
 // safe direction — it costs a misbehaving-looking peer its connection rather
 // than admitting a block nobody requested.
+// ownerRecord is what one peer owes us for one block.
+type ownerRecord struct {
+	// at is when we last asked, and what the ownership ceiling is measured from.
+	at time.Time
+	// forgiven marks an assignment the peer has been let off. The record stays,
+	// because a copy that does turn up must still be admitted rather than costing
+	// an honest peer its whole association — but the peer is no longer spending
+	// budget on it, and no longer counts as a peer we are downloading from.
+	//
+	// Without this the two questions were the same question. A demoted peer's
+	// slice was reopened by back-dating it, another peer delivered those blocks,
+	// and because arrival only discharges the delivering peer the back-dated
+	// records sat there for the rest of the hour — spending the whole budget of
+	// the peer the demotion had deliberately kept connected in order to use.
+	forgiven bool
+}
+
 type blockDownloadTracker struct {
 	mu  sync.Mutex
 	ttl time.Duration
 	// now is the clock, injectable so tests can age assignments without sleeping.
 	now func() time.Time
-	// byHash answers "who owes us this block, and since when".
-	byHash map[chainhash.Hash]map[*peerpkg.Peer]time.Time
+	// byHash answers "who owes us this block, since when, and whether they have
+	// been let off it".
+	byHash map[chainhash.Hash]map[*peerpkg.Peer]ownerRecord
 	// byPeer answers "what does this peer owe us", so a peer's own outstanding
 	// count and its removal are both O(what that peer owes) rather than O(all).
 	byPeer    map[*peerpkg.Peer]map[chainhash.Hash]struct{}
@@ -77,7 +95,7 @@ func newBlockDownloadTracker(ttl time.Duration) *blockDownloadTracker {
 	return &blockDownloadTracker{
 		ttl:    ttl,
 		now:    time.Now,
-		byHash: make(map[chainhash.Hash]map[*peerpkg.Peer]time.Time),
+		byHash: make(map[chainhash.Hash]map[*peerpkg.Peer]ownerRecord),
 		byPeer: make(map[*peerpkg.Peer]map[chainhash.Hash]struct{}),
 	}
 }
@@ -111,7 +129,7 @@ func (t *blockDownloadTracker) Add(p *peerpkg.Peer, h chainhash.Hash) bool {
 	now := t.clock()
 
 	if t.byHash == nil {
-		t.byHash = make(map[chainhash.Hash]map[*peerpkg.Peer]time.Time)
+		t.byHash = make(map[chainhash.Hash]map[*peerpkg.Peer]ownerRecord)
 	}
 
 	if t.byPeer == nil {
@@ -130,11 +148,11 @@ func (t *blockDownloadTracker) Add(p *peerpkg.Peer, h chainhash.Hash) bool {
 			}
 		}
 
-		owners = make(map[*peerpkg.Peer]time.Time, 1)
+		owners = make(map[*peerpkg.Peer]ownerRecord, 1)
 		t.byHash[h] = owners
 	}
 
-	owners[p] = now
+	owners[p] = ownerRecord{at: now}
 
 	hashes := t.byPeer[p]
 	if hashes == nil {
@@ -164,9 +182,59 @@ func (t *blockDownloadTracker) HasOwner(p *peerpkg.Peer, h chainhash.Hash) bool 
 	now := t.clock()
 	t.maybeSweepLocked(now)
 
-	at, ok := t.byHash[h][p]
+	rec, ok := t.byHash[h][p]
 
-	return ok && !t.expiredAt(at, now, t.ttl)
+	return ok && !t.expiredAt(rec.at, now, t.ttl)
+}
+
+// ReassertOwner puts a peer back on the hook for a block it already holds our
+// request for, and reports whether it did. A true answer means this peer has
+// already been asked and must NOT be asked again.
+//
+// This is the answer to a pass whose assigner picks, for some header, the very
+// peer that already owes it. A demoted peer's reopened slice is exactly that
+// case: reopening back-dates the record rather than dropping it, so the walk is
+// free to place the block again and nothing stopped it landing back on the same
+// peer. Sending a second getdata would have that peer answer twice, and the
+// second copy arrives after the first discharged its obligation — unowned, and
+// fatal to an honest peer's whole association.
+//
+// Re-arming the record we already hold leaves the block where it is: with the
+// one peer that has the request. Its recovery is unchanged — that peer's own
+// stall handler, the frontier race, and this ledger's expiry.
+//
+// An assignment already past the ownership ceiling is not re-armed. At that age
+// the peer has long since dropped the request, so the caller must send a real
+// one; false sends it down the ordinary Add path, which overwrites the stale
+// record with a fresh one.
+func (t *blockDownloadTracker) ReassertOwner(p *peerpkg.Peer, h chainhash.Hash) bool {
+	if t == nil {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	owners, ok := t.byHash[h]
+	if !ok {
+		return false
+	}
+
+	rec, owned := owners[p]
+	if !owned {
+		return false
+	}
+
+	now := t.clock()
+	if t.expiredAt(rec.at, now, t.ttl) {
+		return false
+	}
+
+	rec.at = now
+	rec.forgiven = false
+	owners[p] = rec
+
+	return true
 }
 
 // RequestedWithin reports whether anybody was asked for block h within maxAge.
@@ -183,8 +251,8 @@ func (t *blockDownloadTracker) RequestedWithin(h chainhash.Hash, maxAge time.Dur
 	now := t.clock()
 	t.maybeSweepLocked(now)
 
-	for _, at := range t.byHash[h] {
-		if !t.expiredAt(at, now, maxAge) {
+	for _, rec := range t.byHash[h] {
+		if !t.expiredAt(rec.at, now, maxAge) {
 			return true
 		}
 	}
@@ -237,7 +305,7 @@ func (t *blockDownloadTracker) CountForPeer(p *peerpkg.Peer) int {
 	n := 0
 
 	for h := range t.byPeer[p] {
-		if at, ok := t.byHash[h][p]; ok && !t.expiredAt(at, now, t.ttl) {
+		if rec, ok := t.byHash[h][p]; ok && !rec.forgiven && !t.expiredAt(rec.at, now, t.ttl) {
 			n++
 		}
 	}
@@ -263,7 +331,7 @@ func (t *blockDownloadTracker) PeersWithDownloads() int {
 
 	for p, hashes := range t.byPeer {
 		for h := range hashes {
-			if at, ok := t.byHash[h][p]; ok && !t.expiredAt(at, now, t.ttl) {
+			if rec, ok := t.byHash[h][p]; ok && !rec.forgiven && !t.expiredAt(rec.at, now, t.ttl) {
 				n++
 				break
 			}
@@ -342,14 +410,17 @@ func (t *blockDownloadTracker) ForgetForRetryPeer(p *peerpkg.Peer, retryWindow t
 			continue
 		}
 
-		at, owned := owners[p]
+		rec, owned := owners[p]
 		if !owned {
 			continue
 		}
 
-		if at.After(cut) {
-			owners[p] = cut
+		if rec.at.After(cut) {
+			rec.at = cut
 		}
+
+		rec.forgiven = true
+		owners[p] = rec
 
 		reopened = append(reopened, h)
 	}
@@ -373,8 +444,8 @@ func (t *blockDownloadTracker) Len() int {
 	n := 0
 
 	for _, owners := range t.byHash {
-		for _, at := range owners {
-			if !t.expiredAt(at, now, t.ttl) {
+		for _, rec := range owners {
+			if !rec.forgiven && !t.expiredAt(rec.at, now, t.ttl) {
 				n++
 				break
 			}
@@ -469,8 +540,8 @@ func (t *blockDownloadTracker) sweepExpiredLocked(now time.Time) {
 	t.lastSweep = now
 
 	for h, owners := range t.byHash {
-		for p, at := range owners {
-			if t.expiredAt(at, now, t.ttl) {
+		for p, rec := range owners {
+			if t.expiredAt(rec.at, now, t.ttl) {
 				t.removeOwnerLocked(p, h)
 			}
 		}

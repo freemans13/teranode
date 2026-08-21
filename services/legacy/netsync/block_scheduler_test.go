@@ -754,3 +754,48 @@ func TestScheduler_ANonCandidatePeerIsNotAskedForAnything(t *testing.T) {
 	require.True(t, ok, "the cursor must stay in the list")
 	require.Equal(t, hashes[0], cursor)
 }
+
+// TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock pins the other half
+// of the "never ask twice" rule. Its sibling above covers a block still live
+// with another peer, which RequestedWithin catches. This covers the block the
+// reopen deliberately made re-requestable while leaving its owner in place —
+// where RequestedWithin answers false on purpose, and nothing kept the walk from
+// landing the block back on the very peer that already holds the request.
+//
+// A peer asked twice answers twice. The first copy discharges its obligation, so
+// the second arrives owned by nobody, and peer_server evicts that peer's whole
+// association for sending a block we asked it for. The block must instead stay
+// where it is, with the one peer that has the request.
+func TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xd9}
+	msg, hashes := linkedHeaders(anchor, 6, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+
+	// One peer only, so the assigner has no choice but to offer the reopened
+	// block back to the peer that already owes it.
+	syncPeer, syncRec := schedulerPeer(t, sm, 96, 1000)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	// Exactly the state a demotion leaves behind: the peer was asked, then let
+	// off, so the block is re-requestable but the peer is still its owner.
+	require.True(t, sm.blockDownloads.Add(syncPeer, hashes[0]))
+	require.Equal(t, []chainhash.Hash{hashes[0]}, sm.blockDownloads.ForgetForRetryPeer(syncPeer, blockRequestRetryInterval))
+	require.False(t, sm.blockDownloads.RequestedWithin(hashes[0], blockRequestRetryInterval),
+		"sanity: the reopen is what makes the block re-requestable at all")
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return syncRec.count() >= len(hashes)-1 }, 5*time.Second),
+		"the rest of the run must still be asked for")
+
+	require.Equal(t, hashes[1:], syncRec.all(),
+		"the reopened block must not be asked for a second time, and the walk must carry on past it")
+
+	require.True(t, sm.blockDownloads.HasOwner(syncPeer, hashes[0]),
+		"the block has to stay owed by the peer that holds the request, or its copy arrives unowned")
+}
