@@ -23,3 +23,10 @@ func TstNewKnownAddress(na *wire.NetAddress, attempts int,
 	return &KnownAddress{na: na, attempts: attempts, lastattempt: lastattempt,
 		lastsuccess: lastsuccess, tried: tried, refs: refs}
 }
+
+// TstKnownAddressTried reports whether the address sits in the tried table.
+// Exported for the tests only, so they can tell where a draw came from without
+// adding a production accessor nothing in production would call.
+func TstKnownAddressTried(ka *KnownAddress) bool {
+	return ka.tried
+}

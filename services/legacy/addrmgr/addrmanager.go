@@ -972,40 +972,68 @@ func (a *AddrManager) GetAddress() *KnownAddress {
 
 			factor *= 1.2
 		}
-	} else {
-		// new node.
-		// XXX use a closure/function to avoid repeating this.
-		large := 1 << 30
-		factor := 1.0
+	}
 
-		for {
-			// Pick a random bucket.
-			bucket := a.rand.IntN(len(a.addrNew))
-			if len(a.addrNew[bucket]) == 0 {
-				continue
-			}
+	return a.selectNew()
+}
 
-			// Then, a random entry in it.
-			var ka *KnownAddress
+// UnverifiedAddress returns a routable address drawn only from the new table:
+// addresses the node has been told about but has never itself confirmed.
+//
+// This is svnode's Select(newOnly=true) (addrman.cpp:337), and it exists for
+// the feeler probe. GetAddress tosses a coin between the tried and new tables,
+// which is the wrong draw for a probe: the whole purpose of probing is to move
+// addresses INTO tried, and re-verifying one that is already there accomplishes
+// nothing.
+//
+// Returns nil when the new table is empty. That guard is load-bearing rather
+// than defensive: selectNew's bucket loop has no termination condition of its
+// own and would spin forever if every new bucket were empty.
+func (a *AddrManager) UnverifiedAddress() *KnownAddress {
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
 
-			nth := a.rand.IntN(len(a.addrNew[bucket]))
-			for _, value := range a.addrNew[bucket] {
-				if nth == 0 {
-					ka = value
-				}
+	if a.nNew == 0 {
+		return nil
+	}
 
-				nth--
-			}
+	return a.selectNew()
+}
 
-			randval := a.rand.IntN(large)
-			if float64(randval) < (factor * ka.chance() * float64(large)) {
-				a.logger.Debugf("Selected %v from new bucket",
-					NetAddressKey(ka.na))
-				return ka
-			}
+// selectNew picks a random address from the new table, weighted by chance().
+// The caller must hold a.mtx and must have established that the new table is
+// not empty, because the loop below only ends when it finds an address.
+func (a *AddrManager) selectNew() *KnownAddress {
+	large := 1 << 30
+	factor := 1.0
 
-			factor *= 1.2
+	for {
+		// Pick a random bucket.
+		bucket := a.rand.IntN(len(a.addrNew))
+		if len(a.addrNew[bucket]) == 0 {
+			continue
 		}
+
+		// Then, a random entry in it.
+		var ka *KnownAddress
+
+		nth := a.rand.IntN(len(a.addrNew[bucket]))
+		for _, value := range a.addrNew[bucket] {
+			if nth == 0 {
+				ka = value
+			}
+
+			nth--
+		}
+
+		randval := a.rand.IntN(large)
+		if float64(randval) < (factor * ka.chance() * float64(large)) {
+			a.logger.Debugf("Selected %v from new bucket",
+				NetAddressKey(ka.na))
+			return ka
+		}
+
+		factor *= 1.2
 	}
 }
 
