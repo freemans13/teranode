@@ -62,6 +62,7 @@ All metrics are CounterVec type with labels: `function` (handler function name),
 | `teranode_blockassembly_transactions`                         | Gauge     | Number of transactions currently in the block assembler subtree processor        |
 | `teranode_blockassembly_queued_transactions`                  | Gauge     | Number of transactions currently queued in the block assembler subtree processor |
 | `teranode_blockassembly_subtrees`                             | Gauge     | Number of subtrees currently in the block assembler subtree processor            |
+| `teranode_blockassembly_dequeue_staleness_seconds`            | Gauge     | Seconds since the subtree processor's consumer goroutine last passed through its dequeue branch; growing alongside a non-zero `queued_transactions` means intake is queuing unboundedly because the consumer is stuck elsewhere |
 | `teranode_blockassembly_tx_meta_get`                          | Histogram | Histogram of reading tx meta data from txmeta store in block assembler           |
 | `teranode_blockassembly_reorg`                                | Counter   | Number of reorgs in block assembler                                              |
 | `teranode_blockassembly_reorg_duration`                       | Histogram | Histogram of reorg in block assembler                                            |
@@ -195,6 +196,12 @@ CounterVec and HistogramVec metrics use labels: `peer_id`, `success`, `error_typ
 | `teranode_blockvalidation_fork_average_lifetime_seconds`     | Gauge        | Average lifetime of active forks in seconds                      |
 | `teranode_blockvalidation_queue_skip_count`                  | Histogram    | Number of times blocks were skipped before processing            |
 | `teranode_blockvalidation_queue_wait_seconds`                | Histogram    | Time blocks spend in queue before processing                     |
+
+## P2P Service Metrics
+
+| Metric Name                          | Type    | Labels                        | Description                                                                                                                              |
+|--------------------------------------|---------|-------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| `teranode_p2p_publish_blocked_total` | Counter | `topic`, `fsm_state`, `stage` | Outbound P2P messages suppressed by the per-FSM-state allow-list; `stage="precheck"` is an expected skip, `stage="chokepoint"` is a publish that leaked past the pre-checks |
 
 ## Legacy Peer Server Metrics
 

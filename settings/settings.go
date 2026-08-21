@@ -104,7 +104,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MaxRawTxFee:     getUint64("maxrawtxfee", 10_000_000, alternativeContext...), // 0.1 BSV, matches bitcoin-sv DEFAULT_TRANSACTION_MAXFEE (COIN/10)
 			// MaxOrphanTxSize:                 getInt("maxorphantxsize", 1000000, alternativeContext...),
 			DataCarrierSize:              int64(getInt("datacarriersize", 1000000, alternativeContext...)),
-			MaxScriptSizePolicy:          getInt("maxscriptsizepolicy", 500000, alternativeContext...), // 500KB
+			MaxScriptSizePolicy:          getInt("maxscriptsizepolicy", 100000000, alternativeContext...), // 100MB
 			MaxOpsPerScriptPolicy:        int64(getInt("maxopsperscriptpolicy", 1000000, alternativeContext...)),
 			MaxScriptNumLengthPolicy:     getInt("maxscriptnumlengthpolicy", 10000, alternativeContext...),       // 10K
 			MaxPubKeysPerMultisigPolicy:  int64(getInt("maxpubkeyspermultisigpolicy", 0, alternativeContext...)), // 0 is unlimited
@@ -293,6 +293,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MaximumMerkleItemsPerSubtree:         getInt("maximum_merkle_items_per_subtree", 1024*1024, alternativeContext...),
 			DoubleSpendWindow:                    doubleSpendWindow,
 			MaxGetReorgHashes:                    getInt("blockassembly_maxGetReorgHashes", 10_000, alternativeContext...),
+			CoinbaseRecoveryMaxGapBlocks:         getInt("blockassembly_coinbaseRecoveryMaxGapBlocks", 200, alternativeContext...),
+			CoinbaseRecoveryConsecutiveGood:      getInt("blockassembly_coinbaseRecoveryConsecutiveGood", 6, alternativeContext...),
+			CoinbaseRecoveryMaxAttempts:          getInt("blockassembly_coinbaseRecoveryMaxAttempts", 3, alternativeContext...),
 			MinerWalletPrivateKeys:               getMultiString("miner_wallet_private_keys", "|", []string{}, alternativeContext...),
 			DifficultyCache:                      getBool("blockassembly_difficultyCache", true, alternativeContext...),
 			UseDynamicSubtreeSize:                getBool("blockassembly_useDynamicSubtreeSize", false, alternativeContext...),
@@ -357,10 +360,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BatchMissingTransactions:                  getBool("blockvalidation_batch_missing_transactions", false, alternativeContext...),
 			CheckSubtreeFromBlockTimeout:              getDuration("blockvalidation_check_subtree_from_block_timeout", 5*time.Minute),
 			SubtreeDataFetchTimeout:                   getDuration("blockvalidation_subtree_data_fetch_timeout", DefaultSubtreeDataFetchTimeout, alternativeContext...),
+			SubtreeMetaPeerFetchTimeout:               getDuration("blockvalidation_subtree_meta_peer_fetch_timeout", DefaultSubtreeMetaPeerFetchTimeout, alternativeContext...),
 			CheckSubtreeFromBlockRetries:              getInt("blockvalidation_check_subtree_from_block_retries", 5, alternativeContext...),
 			CheckSubtreeFromBlockRetryBackoffDuration: getDuration("blockvalidation_check_subtree_from_block_retry_backoff_duration", 30*time.Second),
 			SecretMiningThreshold:                     getUint32("blockvalidation_secret_mining_threshold", uint32(params.CoinbaseMaturity-1), alternativeContext...), // golint:nolint
-			PreviousBlockHeaderCount:                  getUint64("blockvalidation_previous_block_header_count", 100, alternativeContext...),
+			PreviousBlockHeaderCount:                  getUint64AtLeast("blockvalidation_previous_block_header_count", 100, MedianTimeSpan, alternativeContext...),
 			MaxBlocksBehindBlockAssembly:              getInt("blockvalidation_maxBlocksBehindBlockAssembly", 20, alternativeContext...),
 			PeriodicProcessingInterval:                getDuration("blockvalidation_periodic_processing_interval", 1*time.Minute, alternativeContext...),
 			RecentBlockIDsLimit:                       getUint64("blockvalidation_recentBlockIDsLimit", 50000, alternativeContext...),
@@ -521,6 +525,12 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PeerCacheDir: getString("p2p_peer_cache_dir", "", alternativeContext...), // Empty = binary directory
 			BanThreshold: getInt("p2p_ban_threshold", 100, alternativeContext...),
 			BanDuration:  getDuration("p2p_ban_duration", 24*time.Hour),
+			// Peer map cleanup configuration. Defaults match the p2p service's
+			// own fallback constants, so wiring these keys does not change
+			// behaviour for a deployment that never set them.
+			PeerMapMaxSize:         getInt("p2p_peer_map_max_size", 10000, alternativeContext...),
+			PeerMapTTL:             getDuration("p2p_peer_map_ttl", 10*time.Minute, alternativeContext...),
+			PeerMapCleanupInterval: getDuration("p2p_peer_map_cleanup_interval", time.Minute, alternativeContext...),
 			// Sync manager configuration
 			ForceSyncPeer:                         getString("p2p_force_sync_peer", "", alternativeContext...),
 			NodeStatusTopic:                       getString("p2p_node_status_topic", "", alternativeContext...),
@@ -538,6 +548,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			EnableNAT:       getBool("p2p_enable_nat", false, alternativeContext...),        // Default false - UPnP scans gateway
 			EnableMDNS:      getBool("p2p_enable_mdns", false, alternativeContext...),       // Default false to prevent LAN scanning
 			AllowPrivateIPs: getBool("p2p_allow_private_ips", false, alternativeContext...), // Default false for production safety
+			// GossipSub mesh protection: scoring on by default (Sybil defence), PX requires scoring
+			EnablePeerScoring:              getBool("p2p_enable_peer_scoring", true, alternativeContext...),
+			EnablePeerExchange:             getBool("p2p_enable_peer_exchange", true, alternativeContext...),
+			PeerScoreIPColocationThreshold: getInt("p2p_peer_score_ip_colocation_threshold", 10, alternativeContext...),
 			// Full/pruned node selection configuration
 			AllowPrunedNodeFallback:                   getBool("p2p_allow_pruned_node_fallback", true, alternativeContext...),
 			SyncCoordinatorPeriodicEvaluationInterval: getDuration("p2p_sync_coordinator_periodic_evaluation_interval", 30*time.Second, alternativeContext...),
@@ -546,6 +560,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// Gossip handler load management
 			PeerRegistryBatchInterval: getDuration("p2p_peer_registry_batch_interval", time.Second, alternativeContext...),
 			GossipHandlerConcurrency:  getInt("p2p_gossip_handler_concurrency", 4, alternativeContext...),
+
+			WebSocketMaxConnections:          getInt("p2p_websocket_max_connections", 1000, alternativeContext...),
+			WebSocketMaxConnectionsPerSource: getInt("p2p_websocket_max_connections_per_source", 0, alternativeContext...),
+			WebSocketAllowedOrigins:          getMultiString("p2p_websocket_allowed_origins", "|", []string{}, alternativeContext...),
+			WebSocketTrustedSourceCIDRs:      getMultiString("p2p_websocket_trusted_source_cidrs", "|", []string{"127.0.0.1/32", "::1/128"}, alternativeContext...),
 		},
 		Coinbase: CoinbaseSettings{
 			DB:                          getString("coinbaseDB", "", alternativeContext...),
@@ -665,7 +684,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SavePeers:                        getBool("legacy_savePeers", false, alternativeContext...), // by default we do not save the peers
 			AllowSyncCandidateFromLocalPeers: getBool("legacy_allowSyncCandidateFromLocalPeers", false, alternativeContext...),
 			TempStore:                        getURL("temp_store", "file://./data/tempstore", alternativeContext...),
-			PeerIdleTimeout:                  getDuration("legacy_peerIdleTimeout", 125*time.Second, alternativeContext...),     // ping/pong interval is 2 mins, so we set this to 125s to be sure
+			PeerIdleTimeout:                  getDuration("legacy_peerIdleTimeout", 125*time.Second, alternativeContext...), // ping/pong interval is 2 mins, so we set this to 125s to be sure
+			MaxAddnodePeers:                  getInt("legacy_maxAddnodePeers", 8, alternativeContext...),
+			ReplenishInterval:                getDuration("legacy_replenishInterval", 2*time.Second, alternativeContext...),
 			PeerProcessingTimeout:            getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
 			BlockFailureBackoffBase:          getDuration("legacy_blockFailureBackoffBase", 5*time.Second, alternativeContext...),
 			BlockFailureBackoffMaxDuration:   getDuration("legacy_blockFailureBackoffMaxDuration", 150*time.Second, alternativeContext...),

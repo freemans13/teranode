@@ -52,6 +52,7 @@ var (
 	prometheusBlockAssemblyCurrentBlockHeight           prometheus.Gauge
 	prometheusBlockAssemblyTipLagBlocks                 prometheus.Gauge
 	prometheusBlockAssemblyProcessingStuck              *prometheus.CounterVec
+	prometheusBlockAssemblyCoinbaseDivergence           *prometheus.CounterVec
 	prometheusBlockAssemblerCurrentState                prometheus.Gauge
 	prometheusBlockAssemblerStateTransitions            *prometheus.CounterVec
 	prometheusBlockAssemblerStateDuration               *prometheus.HistogramVec
@@ -73,6 +74,7 @@ var (
 	prometheusBlockAssemblerSubtreeStoredHist           prometheus.Histogram
 	prometheusBlockAssemblerConflictIntentsPending      prometheus.Gauge
 	prometheusBlockAssemblerConflictIntentReplay        *prometheus.CounterVec
+	prometheusBlockAssemblerDequeueStalenessSeconds     prometheus.Gauge
 )
 
 var (
@@ -230,6 +232,15 @@ func _initPrometheusMetrics() {
 		},
 	)
 
+	prometheusBlockAssemblerDequeueStalenessSeconds = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "dequeue_staleness_seconds",
+			Help:      "Seconds since the subtree processor's consumer goroutine last passed through its dequeue branch. A value growing alongside a non-zero queued_transactions means intake is queuing unboundedly because the consumer is stuck elsewhere (reorg/move-forward-block/reset/etc), not that ingest has merely slowed (issue #1429).",
+		},
+	)
+
 	prometheusBlockAssemblerTxMetaGetDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: "teranode",
@@ -323,6 +334,16 @@ func _initPrometheusMetrics() {
 			Help:      "Count of block assembly catch-up/reorg/move-forward failures that left the assembler behind the tip, labelled by reason (issue #980).",
 		},
 		[]string{"reason"},
+	)
+
+	prometheusBlockAssemblyCoinbaseDivergence = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "coinbase_divergence_total",
+			Help:      "Coinbase-divergence events by outcome. Every detection records exactly one follow-up outcome, so detected == repaired + no_gap + escalated + aborted.",
+		},
+		[]string{"outcome"},
 	)
 
 	prometheusBlockAssemblerCurrentState = promauto.NewGauge(
