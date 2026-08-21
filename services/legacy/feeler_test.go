@@ -41,7 +41,10 @@ func TestFeelerBudget(t *testing.T) {
 		targetOutbound int
 		want           int
 	}{
-		{name: "default budget of one", configured: 1, maxPeers: 125, targetOutbound: 8, want: 1},
+		// The shipped shape: legacy_config_MaxPeers = 20 in settings.conf against
+		// the manager's default target of 8, so the reserved slot comes out of the
+		// inbound share and the outbound tier is untouched.
+		{name: "shipped defaults", configured: 1, maxPeers: 20, targetOutbound: 8, want: 1},
 		{name: "operator raises the budget", configured: 3, maxPeers: 125, targetOutbound: 8, want: 3},
 		{name: "zero is the disable lever", configured: 0, maxPeers: 125, targetOutbound: 8, want: 0},
 		{name: "negative is treated as disabled", configured: -1, maxPeers: 125, targetOutbound: 8, want: 0},
@@ -717,8 +720,11 @@ func swapTestConfig(t *testing.T, redirectTo string) {
 
 	orig := cfg
 
+	// MaxPeers matches what ships rather than bsvd's compiled-in 125:
+	// settings.conf sets legacy_config_MaxPeers = 20 and the reflection loader in
+	// config.go applies it to this field on every real run.
 	c := &config{
-		MaxPeers:        125,
+		MaxPeers:        20,
 		MaxPeersPerIP:   5,
 		TrickleInterval: 10 * time.Second,
 		BanDuration:     24 * time.Hour,
@@ -953,8 +959,8 @@ func startFeelerTestListener(t *testing.T, userAgent string) (net.Listener, <-ch
 //
 // Note what this does NOT cover: it exercises the channel directly, not
 // feelerHandler, so deleting feelerHandler's acquisition and letting every tick
-// start a probe would leave this test green. The enforcement site itself is
-// still unpinned.
+// start a probe would leave this test green. That is covered separately, by
+// TestFeelerHandlerWaitsForASlotToken, which drives the real loop.
 func TestFeelerTokensCapProbesInFlight(t *testing.T) {
 	srv := &server{
 		logger:       ulogger.TestLogger{},
@@ -1028,7 +1034,13 @@ func TestSetFeelerBudgetUsesTheManagersEffectiveTarget(t *testing.T) {
 	require.Equal(t, 0, srv.feelerSlots,
 		"a reservation that consumes the node's whole capacity is refused")
 
-	srv.setFeelerBudget(ulogger.TestLogger{}, 1, false, 125)
+	// 20 is what actually ships: settings.conf sets legacy_config_MaxPeers = 20,
+	// which the reflection loader in config.go puts on this very field. The 125 in
+	// config.go is only bsvd's compiled-in fallback, and is overridden on every
+	// real run. So the shipped shape is a cap of 20 against a target of 8: the
+	// reserved slot comes wholly out of the inbound share, taking it from 12 to
+	// 11, and the outbound tier is untouched.
+	srv.setFeelerBudget(ulogger.TestLogger{}, 1, false, 20)
 	require.Equal(t, 1, srv.feelerSlots,
 		"the shipped defaults leave the outbound tier untouched, so the slot is granted")
 }

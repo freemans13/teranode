@@ -71,9 +71,11 @@ func feelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPe
 // for a configured zero, so the number judged here has to be the manager's,
 // not the caller's.
 //
-// Must be called after connmgr.New has returned, and before peerHandler starts:
-// handleAddPeerMsg and handleQuery are the only readers of feelerSlots, and
-// neither runs until then.
+// Must be called after connmgr.New has returned, and before peerHandler starts.
+// That ordering is what makes the field safe to read without synchronisation:
+// every reader of feelerSlots runs later than this write. Those readers are
+// startFeeler and feelerHandler in this file, and handleAddPeerMsg and
+// handleQuery in peer_server.go, none of which runs until peerHandler does.
 func (s *server) setFeelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPeers int) {
 	if s.connManager == nil {
 		s.feelerSlots = 0
@@ -94,8 +96,9 @@ func (s *server) setFeelerBudget(logger ulogger.Logger, configured int, connectO
 // already full still turns a named peer away, and the reservation makes that
 // bite one peer sooner. connectNodeAdmitted, the runtime addnode door,
 // deliberately does not apply the ceiling to a permanent request, so the two
-// doors disagree on this point. That predates the feeler; the TODO at the check
-// itself is where it is tracked.
+// doors disagree on this point. That predates the feeler and nothing tracks it —
+// the TODO beside the check in handleAddPeerMsg asks a different question, what
+// to do with a permanent peer once it has been refused.
 func peerAdmissionCeiling(maxPeers, feelerSlots int) int {
 	ceiling := maxPeers - feelerSlots
 	if ceiling < 0 {
@@ -279,9 +282,14 @@ func (s *server) startFeeler() {
 //     probe does not shorten the following gap, and a long stretch below target
 //     does not bank up a burst of probes (net.cpp:1869).
 //   - There is no pre-dial sleep. svnode adds a random 0-1s before a feeler
-//     dial (net.cpp:1934) purely to break up the half-second granularity of its
-//     own connect loop. Our deadline is an absolute time drawn at nanosecond
-//     granularity, so the jitter is already there.
+//     dial (net.cpp:1934) "to avoid synchronization", in the words of its own
+//     comment two lines above — the same anti-lockstep reason this loop draws its
+//     gap from a distribution rather than using a fixed period. Getting it from
+//     that draw alone is enough, because the gap is random per process and so
+//     nothing lines up across a fleet. It is not because our firing is finer
+//     grained than svnode's: the deadline is computed at nanosecond granularity
+//     but only examined on a feelerPollInterval tick, so firing is quantised to
+//     whole seconds, which is coarser than svnode's 500ms loop.
 //
 // It must be run in a goroutine.
 func (s *server) feelerHandler() {
@@ -326,7 +334,9 @@ func (s *server) feelerHandler() {
 // feelerProbe dials one unverified address, waits for it to identify itself,
 // records what it learned, and hangs up.
 //
-// It never builds a serverPeer and never goes near the connection manager.
+// It never builds a serverPeer and never registers with the connection manager.
+// (It does read that manager — feelerAllowed and countFailedDial both ask it for
+// counts — but it never hands it a connection to keep alive.)
 // Membership of state.outboundPeers is the netgroup claim and the peer count,
 // so a probe registered as an ordinary peer would take both from a real one.
 // The connection manager's job is to keep connections alive: handed a probe,
@@ -531,7 +541,8 @@ func (s *server) shuttingDown() bool {
 //
 // svnode does the same thing by the same means where an operator has asked for
 // it: a user agent matching -banclientua is pushed straight to the ban score
-// threshold as "invalid-UA" (net_processing.cpp:1722). The only difference is
+// threshold as "invalid-UA" (net_processing.cpp:1725, under the guard at
+// :1722). The only difference is
 // that for teranode the BSV-only rule is the protocol requirement rather than an
 // operator option.
 //

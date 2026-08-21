@@ -8,17 +8,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestLegacyFeelerSettings_LoaderReadsKeys guards the two feeler settings
+// TestLegacyFeelerSettings_LoaderReadsKeys guards the three feeler settings
 // against the trap this branch has already fallen into once: a field can carry
 // a full set of struct tags and still be dead, because nothing but a getInt or
 // getDuration line in NewSettings actually reads the key. Without that line the
 // field stays at its Go zero value, which for the budget is the documented
 // "disable everything" value.
 //
-// Two assertions, for two different failure modes. The default check pins the
-// shipped contract (one probe, two minutes apart) and only runs under a context
-// carrying no settings.conf override. The override check runs everywhere: a
-// distinctive value set at the winning precedence must come back out.
+// Two kinds of assertion, for two different failure modes. The default check
+// pins the shipped contract — one probe, two minutes apart, hanging up after
+// twenty-five seconds — and the override check runs everywhere: a distinctive
+// value set at the winning precedence must come back out.
+//
+// The default check is gated on the empty and dev contexts only. That is
+// belt-and-braces rather than a real requirement: none of the three keys appears
+// in settings.conf at all, so no context can override them and the shipped
+// defaults are the struct-tag defaults everywhere.
 func TestLegacyFeelerSettings_LoaderReadsKeys(t *testing.T) {
 	const (
 		budgetKey    = "legacy_maxFeelerPeers"
