@@ -3,8 +3,10 @@ package model
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -756,4 +758,61 @@ func TestSubtreeMetaRegenerator_PoisonedPeer_RetriedWithCacheBust(t *testing.T) 
 	require.NoError(t, err, "the poisoned entry must be bypassed with a cache-busting retry")
 	require.True(t, sawCacheBust.Load(), "the retry must carry a cachebust parameter, or the cache replays the same empty body")
 	requireCompleteMeta(t, meta, subtree.Length())
+}
+
+// TestSubtreeMetaRegenerator_RejectsInternalPeer is the SSRF regression test for the peer
+// fetch path: peerURLs come straight from peer block/subtree announcements. The fetch must be
+// refused after DNS resolution, so a hostname that only resolves to an internal address is no
+// better for an attacker than an internal literal - and the target sees no request even
+// though it is serving exactly what the regenerator wants.
+//
+// The guard now comes from util's shared client (DoHTTPRequestBodyReaderWithRetry); this pins
+// the property at this layer so a future change of client cannot quietly drop it.
+func TestSubtreeMetaRegenerator_RejectsInternalPeer(t *testing.T) {
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+	subtree := createTestSubtree([]chainhash.Hash{*tx1.TxIDChainHash()})
+	subtreeHash := subtree.RootHash()
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	subtreeData.Txs[1] = tx1
+	subtreeDataBytes, err := subtreeData.Serialize()
+	require.NoError(t, err)
+
+	var hits atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(subtreeDataBytes)
+	}))
+	defer server.Close()
+
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	_, port, err := net.SplitHostPort(serverURL.Host)
+	require.NoError(t, err)
+
+	tests := map[string]string{
+		// A hostname: passes the static check (no DNS there), refused at dial time once
+		// resolution reveals the loopback address. This is the case the guard exists for.
+		"http://localhost:" + port + "/api/v1": "loopback address",
+		// A literal cloud metadata endpoint, refused earlier by the static ValidateURL
+		// pre-check without a connection being attempted at all.
+		"http://169.254.169.254/api/v1": "blocked IP address",
+	}
+
+	for peerURL, reason := range tests {
+		t.Run(peerURL, func(t *testing.T) {
+			regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, newMockSubtreeStoreWriter(),
+				[]string{peerURL}, func() uint32 { return 100 }, 288, 5*time.Second)
+
+			data, err := regenerator.getSubtreeDataFromPeer(context.Background(), subtreeHash, subtree, peerURL, false)
+			require.Error(t, err)
+			require.Nil(t, data)
+			require.Contains(t, err.Error(), reason)
+		})
+	}
+
+	require.Zero(t, hits.Load(), "the fetch must not reach the internal target")
 }
