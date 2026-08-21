@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"testing"
@@ -316,5 +317,38 @@ func TestRegenerationSkippedOnCancelledContext(t *testing.T) {
 		err := block.validateSubtree(ctx, logger, newDeps(reg), newCtx(), subtree, 0)
 		require.Error(t, err)
 		require.Zero(t, reg.calls, "shutdown must not fan out subtree-data reads and peer fetches")
+	})
+}
+
+// TestValidatedReaderBindsSubtreeToKey pins the comparison inside the reader
+// itself. Callers hand it a key and a subtree they deserialized from that key,
+// and nothing else in the header check ties the two: the meta's embedded root
+// matches the key because the meta is genuine, and full subtrees in a block
+// share a leaf count so the entry count matches too. Only comparing the
+// subtree's own claimed root against the key rejects a foreign file.
+func TestValidatedReaderBindsSubtreeToKey(t *testing.T) {
+	committed, metaBytes, _ := buildMetaFixture(t)
+
+	// A different subtree with the same number of leaves.
+	foreign, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := byte(0); i < 4; i++ {
+		require.NoError(t, foreign.AddNode(chainhash.HashH([]byte{i, 0xf0}), 1, 0))
+	}
+
+	require.False(t, foreign.RootHash().IsEqual(committed.RootHash()), "fixture must be a different subtree")
+	require.Equal(t, committed.Length(), foreign.Length(), "fixture must share the committed subtree's leaf count")
+
+	t.Run("the committed subtree is accepted", func(t *testing.T) {
+		got, err := NewSubtreeMetaFromValidatedReader(*committed.RootHash(), committed, bytes.NewReader(metaBytes))
+		require.NoError(t, err)
+		require.NotNil(t, got)
+	})
+
+	t.Run("a foreign subtree of the same length is rejected", func(t *testing.T) {
+		_, err := NewSubtreeMetaFromValidatedReader(*committed.RootHash(), foreign, bytes.NewReader(metaBytes))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "does not match its key")
 	})
 }
