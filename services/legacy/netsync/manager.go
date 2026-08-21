@@ -3354,6 +3354,55 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 // blockchain lookups can be made with headerMu released and the commit can tell
 // whether the list moved in the meantime. ok is false when there is nothing
 // usable to walk.
+// lookaheadCeilingLocked returns the highest block height this round may ask for,
+// and whether there is a limit at all. The caller must hold headerMu.
+//
+// legacy_blockDownloadWindow and legacy_maxBlocksInTransitPerPeer bound how MANY
+// requests are outstanding. This bounds how far ahead of itself the node reads,
+// which is a different quantity and the one that decides how much disk the park
+// needs: blocks commit strictly in order, so a block fetched a long way ahead of
+// the block we are waiting for cannot be committed when it arrives and sits in
+// the park until everything between it and the chain has landed.
+//
+// Measured from the front of the header list, which is the block being waited on.
+// svnode measures its -blockdownloadlowerwindow from chainActive.Height(), the
+// validated tip; in headers-first mode with in-order commits those are the same
+// place to within one block, and the front is available here without asking the
+// blockchain service anything.
+//
+// Clamped to the node-wide window, as svnode clamps its lower window to its
+// window: a limit looser than that could never bind.
+func (sm *SyncManager) lookaheadCeilingLocked() (int64, bool) {
+	if sm.settings == nil {
+		return 0, false
+	}
+
+	lower := sm.settings.Legacy.BlockDownloadLowerWindow
+	if lower <= 0 {
+		return 0, false
+	}
+
+	if window := sm.settings.Legacy.BlockDownloadWindow; window > 0 && lower > window {
+		lower = window
+	}
+
+	if sm.headerList == nil {
+		return 0, false
+	}
+
+	front := sm.headerList.Front()
+	if front == nil {
+		return 0, false
+	}
+
+	node, isHeaderNode := front.Value.(*headerNode)
+	if !isHeaderNode {
+		return 0, false
+	}
+
+	return int64(node.height) + int64(lower), true
+}
+
 func (sm *SyncManager) snapshotHeaderCandidates(limit int) (hashes []chainhash.Hash, anchor *list.Element, anchorHash chainhash.Hash, ok bool) {
 	sm.headerMu.Lock()
 	defer sm.headerMu.Unlock()
@@ -3362,6 +3411,8 @@ func (sm *SyncManager) snapshotHeaderCandidates(limit int) (hashes []chainhash.H
 	if anchor == nil {
 		return nil, nil, chainhash.Hash{}, false
 	}
+
+	ceiling, hasCeiling := sm.lookaheadCeilingLocked()
 
 	hashes = make([]chainhash.Hash, 0, limit)
 
@@ -3374,6 +3425,13 @@ func (sm *SyncManager) snapshotHeaderCandidates(limit int) (hashes []chainhash.H
 			// leave startHeader anchored past headers nobody ever asked for.
 			sm.logger.Warnf("Header list node is not a headerNode carrying a hash")
 
+			break
+		}
+
+		// Past the lookahead limit. Stopping here leaves the cursor on this
+		// header, so the next round picks it up once the frontier has moved —
+		// the same shape as running out of budget.
+		if hasCeiling && int64(node.height) > ceiling {
 			break
 		}
 

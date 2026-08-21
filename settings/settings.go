@@ -694,6 +694,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MultiPeerBlockDownload:    getBool("legacy_multiPeerBlockDownload", true, alternativeContext...),
 			MaxBlocksInTransitPerPeer: getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
 			BlockDownloadWindow:       getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
+			BlockDownloadLowerWindow:  getInt("legacy_blockDownloadLowerWindow", 0, alternativeContext...),
 
 			ParkOutOfOrderBlocks: getBool("legacy_parkOutOfOrderBlocks", true, alternativeContext...),
 			ParkMaxBytes:         getInt64("legacy_parkMaxBytes", 4*1024*1024*1024, alternativeContext...),

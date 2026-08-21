@@ -799,3 +799,61 @@ func TestScheduler_NeverAsksTheSamePeerTwiceForAReopenedBlock(t *testing.T) {
 	require.True(t, sm.blockDownloads.HasOwner(syncPeer, hashes[0]),
 		"the block has to stay owed by the peer that holds the request, or its copy arrives unowned")
 }
+
+// TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit pins
+// legacy_blockDownloadLowerWindow, which is the one download bound svnode has and
+// we did not.
+//
+// The two we already had count requests: how many the node may have outstanding,
+// and how many any one peer may owe. Neither says anything about how far ahead of
+// itself the node reads, and that is the quantity that decides how much disk the
+// park needs — blocks commit strictly in order, so a block fetched a long way
+// ahead of the one being waited on cannot be committed when it arrives and sits
+// parked until everything between it and the chain has landed.
+//
+// The second half of the test is the part that matters: the limit has to be a rate
+// and not a stop. Once the frontier moves, the window moves with it.
+func TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xda}
+	msg, hashes := linkedHeaders(anchor, 12, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+
+	// Budgets deliberately left wide, so the lookahead limit is the only thing
+	// that can bind.
+	sm.settings.Legacy.BlockDownloadLowerWindow = 4
+
+	syncPeer, syncRec := schedulerPeer(t, sm, 88, 1000)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	// seedFetchHeaders anchors the list at height 10, so the seeded headers are
+	// heights 11 upwards and a limit of 4 reaches height 14 — the first four.
+	seedFetchHeaders(t, sm, syncPeer, anchor, msg)
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return syncRec.count() >= 4 }, 5*time.Second),
+		"the blocks inside the window must still be asked for")
+
+	require.Equal(t, hashes[0:4], syncRec.all(),
+		"nothing beyond the lookahead limit may be asked for, however much budget is left")
+
+	cursor, ok := startHeaderHash(t, sm)
+	require.True(t, ok, "the walk must still have somewhere to resume from")
+	require.Equal(t, hashes[4], cursor,
+		"and it must stop ON the first header it would not ask for, or that block leaves the walk")
+
+	// The frontier moves: the anchor block arrives and leaves the front of the
+	// list, so the window slides up with it and the next header becomes fetchable.
+	require.True(t, sm.blockDownloads.Add(syncPeer, anchor))
+	_ = sm.handleBlockMsg(&blockQueueMsg{blockHash: anchor, peer: syncPeer})
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return syncRec.count() >= 5 }, 5*time.Second),
+		"a limit that never lets go once the frontier moves is a stall, not a window")
+	require.Equal(t, hashes[0:5], syncRec.all(),
+		"exactly one more block comes into range for one block committed")
+}
