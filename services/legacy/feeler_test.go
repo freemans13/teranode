@@ -1,6 +1,8 @@
 package legacy
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"math"
 	"math/rand/v2"
 	"net"
@@ -1772,7 +1774,7 @@ func TestQuietProbeLoggerKeepsAProbeOutOfTheDisconnectCount(t *testing.T) {
 // The assertion is on the level, not the text: no warning may escape a probe,
 // because a probe is not a peer the node lost.
 func TestFeelerProbeOfANonBSVHostStaysQuiet(t *testing.T) {
-	ln, _ := startFeelerTestListener(t, "/Bitcoin Cash Node:29.1.0(EB32.0)/")
+	ln := startForkClientListener(t, "/Bitcoin Cash Node:29.1.0(EB32.0)/")
 
 	swapTestConfig(t, ln.Addr().String())
 
@@ -1795,4 +1797,81 @@ func TestFeelerProbeOfANonBSVHostStaysQuiet(t *testing.T) {
 	require.Zero(t, warns,
 		"probing a fork client must not add to the disconnect-rate measurement")
 	require.Zero(t, errs, "nor log an error for a host behaving exactly as expected")
+}
+
+// startForkClientListener answers with the given user agent and then sends a
+// message whose command the BSV parser does not know, which is what the mainnet
+// Bitcoin Cash host did and what made the probe's read loop shout.
+func startForkClientListener(t *testing.T, userAgent string) net.Listener {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = ln.Close() })
+
+	tSettings := settings.NewSettings()
+	net2 := tSettings.ChainCfgParams.Net
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+
+		defer func() { _ = conn.Close() }()
+
+		msg, _, err := wire.ReadMessage(conn, wire.ProtocolVersion, net2)
+		if err != nil {
+			return
+		}
+
+		if _, ok := msg.(*wire.MsgVersion); !ok {
+			return
+		}
+
+		me := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 8333, wire.SFNodeNetwork)
+		you := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 8333, wire.SFNodeNetwork)
+
+		reply := wire.NewMsgVersion(me, you, rand.Uint64(), 0)
+		reply.UserAgent = userAgent
+		reply.Services = wire.SFNodeNetwork
+
+		if err := wire.WriteMessage(conn, reply, wire.ProtocolVersion, net2); err != nil {
+			return
+		}
+
+		if err := wire.WriteMessage(conn, wire.NewMsgVerAck(), wire.ProtocolVersion, net2); err != nil {
+			return
+		}
+
+		// A command go-wire has no case for. Written by hand, because the wire
+		// package will only marshal messages it knows about.
+		_, _ = conn.Write(rawWireMessage(uint32(net2), "xversion"))
+
+		buf := make([]byte, 1)
+		_, _ = conn.Read(buf)
+	}()
+
+	return ln
+}
+
+// rawWireMessage builds a bitcoin message header with an empty payload for an
+// arbitrary command string.
+func rawWireMessage(magic uint32, command string) []byte {
+	out := make([]byte, 0, 24)
+
+	out = binary.LittleEndian.AppendUint32(out, magic)
+
+	cmd := make([]byte, 12)
+	copy(cmd, command)
+	out = append(out, cmd...)
+
+	out = binary.LittleEndian.AppendUint32(out, 0)
+
+	first := sha256.Sum256(nil)
+	second := sha256.Sum256(first[:])
+	out = append(out, second[:4]...)
+
+	return out
 }
