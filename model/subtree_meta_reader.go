@@ -23,27 +23,38 @@ const (
 )
 
 // NewSubtreeMetaFromValidatedReader deserializes a .subtreeMeta stream after
-// validating its fixed 36-byte header — the subtree root hash the file was
-// built for and the entry count it claims — against the subtree it is being
-// read for (issue 1425). The file is only a cache, but its consumers trust
-// the contents: a short claimed count leaves tail transactions with zero
-// recorded inputs (block validation then spuriously rejects a valid block on
-// the nil-parents guard), an over-long count panics once it runs past the
-// destination slice — on every restart, since the file is on disk — and a
-// foreign file attributes another subtree's inputs to this one, the one shape
-// that can genuinely hide an in-block double-spend.
+// checking its fixed 36-byte header — the root hash the file was built for and
+// the entry count it claims — against the subtree and key it is being read for
+// (issue 1425).
 //
-// The count is compared against Length() because that is what
-// Meta.serializeTxInpoints writes. Note this is not the same as the slice the
-// deserializer fills: block validation installs a pooled node allocator, which
-// rounds capacity up to a size class, so a short final subtree carries real
-// headroom and an over-claim inside it fills padding quietly rather than
-// panicking. Comparing against the serialized count catches both. Every
-// producer writes that count keyed by the subtree root, so a mismatch always
-// means a torn or foreign file, never a legitimate one.
+// Two constraints are not obvious from the call site. The count is compared
+// against Length(), because that is what Meta.serializeTxInpoints writes; Size()
+// is cap(Nodes) and is larger whenever a pooled allocator or a short final
+// subtree leaves headroom. And the subtree is compared against the key, because
+// RootHash() returns the .subtree header's cached bytes and is never recomputed.
+//
+// Every producer writes the count as the subtree's node count keyed by its root,
+// so any mismatch means a torn or foreign file. Callers with a regenerator behind
+// them should rebuild rather than trust the file.
 func NewSubtreeMetaFromValidatedReader(subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree, reader io.Reader) (*subtreepkg.Meta, error) {
 	if subtree == nil {
 		return nil, errors.NewProcessingError("cannot validate subtree meta for %s: subtree is nil", subtreeHash.String())
+	}
+
+	// The subtree has to answer to the same hash before the meta is checked
+	// against it, or the check compares one file's claim to another's.
+	// DeserializeFromReader caches the .subtree header's root and RootHash()
+	// never recomputes it, so a foreign subtree stored under this key would
+	// otherwise pass: full subtrees in a block share a leaf count, so the entry
+	// count matches too. Done here rather than only at the call sites so every
+	// caller inherits it.
+	subtreeRootHash := subtree.RootHash()
+	if subtreeRootHash == nil {
+		return nil, errors.NewProcessingError("cannot validate subtree meta for %s: subtree has no root hash", subtreeHash.String())
+	}
+
+	if !subtreeRootHash.IsEqual(&subtreeHash) {
+		return nil, errors.NewProcessingError("subtree does not match its key for %s: subtree file was built for %s", subtreeHash.String(), subtreeRootHash.String())
 	}
 
 	var metaHeader [subtreeMetaHeaderSize]byte

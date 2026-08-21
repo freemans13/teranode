@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -1426,6 +1427,40 @@ func storeReorgSubtreeWithTornMeta(t *testing.T, ctx context.Context, blobStore 
 	return key
 }
 
+// storeReorgSubtreeUnderForeignKey stores a real, well-formed subtree under a key
+// it was not built for, alongside a meta that is correct for that key. Both
+// subtrees carry the same leaf count, as every full subtree in a block does, so
+// the meta header's root hash and entry count both match and only the
+// subtree-to-key comparison rejects it.
+func storeReorgSubtreeUnderForeignKey(t *testing.T, ctx context.Context, blobStore *blob_memory.Memory, txs []subtree.Node) *chainhash.Hash {
+	t.Helper()
+
+	_, key, metaBytes := buildReorgSubtree(t, ctx, blobStore, txs)
+
+	// A different subtree with the same number of leaves.
+	foreign, err := subtree.NewTreeByLeafCount(64)
+	require.NoError(t, err)
+	require.NoError(t, foreign.AddCoinbaseNode())
+
+	for i := range txs {
+		h := chainhash.HashH([]byte{0xf0, byte(i)})
+		require.NoError(t, foreign.AddSubtreeNode(subtree.Node{Hash: h, Fee: 7, SizeInBytes: 111}))
+	}
+
+	require.False(t, foreign.RootHash().IsEqual(key), "fixture must actually be a different subtree")
+	require.Equal(t, foreign.Length(), len(txs)+1, "fixture must match the committed subtree's leaf count")
+
+	foreignBytes, err := foreign.Serialize()
+	require.NoError(t, err)
+
+	// Replace the committed subtree's file with the foreign one, leaving the key
+	// and the meta untouched.
+	require.NoError(t, blobStore.Set(ctx, key[:], fileformat.FileTypeSubtree, foreignBytes, options.WithAllowOverwrite(true)))
+	require.NoError(t, blobStore.Set(ctx, key[:], fileformat.FileTypeSubtreeMeta, metaBytes))
+
+	return key
+}
+
 // TestSubtreeProcessor_ReorgThroughRealSubtrees exercises the bulk reorg path
 // (reorgBlocks -> moveBackBlock -> moveBackBlockBulkBuild -> bulkBuildSubtrees)
 // against blocks carrying REAL serialized subtrees, rather than the empty
@@ -1715,5 +1750,111 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward})
 		require.Error(t, err, "a torn subtree meta must fail the reorg, not be trusted and not panic")
 		require.Contains(t, err.Error(), "error deserializing subtree meta")
+	})
+
+	t.Run("a subtree stored under a foreign key fails the reorg", func(t *testing.T) {
+		// The committed key holds a real, well-formed subtree — just not the one
+		// the block commits to. Its meta is correct for the committed hash, and
+		// full subtrees in a block share a leaf count, so the meta header's root
+		// and entry count both match: neither issue-1425 check catches it. Without
+		// binding the file to its key, moveBackBlockBulkBuild inserts the foreign
+		// node hashes into currentTxMap carrying the committed subtree's positional
+		// inpoints, and handleReorg only falls back to a reset on error — so this
+		// poisons assembly state instead of failing.
+		ctx, cancel := context.WithCancel(context.Background())
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, test.CreateBaseTestSettings(t), utxoStoreURL)
+		require.NoError(t, err)
+
+		t.Cleanup(func() {
+			_ = utxoStore.Close(context.Background())
+		})
+
+		blobStore := blob_memory.New()
+		settings := test.CreateBaseTestSettings(t)
+		require.True(t, settings.BlockAssembly.StoreTxInpointsForSubtreeMeta,
+			"the meta read under test is skipped entirely when this setting is off")
+
+		newSubtreeChan := make(chan NewSubtreeRequest, 10)
+
+		mockBlockchainClient := &blockchain.Mock{}
+		mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
+		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
+		mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+
+		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, mockBlockchainClient, utxoStore, newSubtreeChan)
+		require.NoError(t, err)
+		stp.Start(ctx)
+
+		// Stop the processor before the deferred cancel below unblocks the drain,
+		// so neither outlives the subtest.
+		t.Cleanup(func() {
+			stp.Stop(context.Background())
+		})
+
+		tx1Hash, err := chainhash.NewHashFromStr("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4")
+		require.NoError(t, err)
+		tx2Hash, err := chainhash.NewHashFromStr("e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5")
+		require.NoError(t, err)
+
+		// The subtree itself is valid and stored under its real root hash; only
+		// the meta file is torn, so the failure is attributable to the meta.
+		moveBackSubtreeHash := storeReorgSubtreeUnderForeignKey(t, ctx, blobStore, []subtree.Node{
+			{Hash: *tx1Hash, Fee: 100, SizeInBytes: 250},
+			{Hash: *tx2Hash, Fee: 200, SizeInBytes: 300},
+		})
+
+		block2Header := &model.BlockHeader{Version: 1, HashPrevBlock: prevBlockHeader.Hash(), HashMerkleRoot: &chainhash.Hash{}, Timestamp: 1800000004, Bits: model.NBit{}, Nonce: 704}
+		blockNewHeader := &model.BlockHeader{Version: 1, HashPrevBlock: prevBlockHeader.Hash(), HashMerkleRoot: &chainhash.Hash{}, Timestamp: 1800000005, Bits: model.NBit{}, Nonce: 705}
+
+		blockToMoveBack := &model.Block{
+			Height:     2,
+			CoinbaseTx: coinbaseTx2,
+			Subtrees:   []*chainhash.Hash{moveBackSubtreeHash},
+			Header:     block2Header,
+		}
+		blockToMoveForward := &model.Block{
+			Height:     2,
+			CoinbaseTx: coinbaseTx3,
+			Subtrees:   []*chainhash.Hash{},
+			Header:     blockNewHeader,
+		}
+
+		_, err = utxoStore.Create(ctx, coinbaseTx2, 2)
+		require.NoError(t, err)
+		_, err = utxoStore.Create(ctx, coinbaseTx3, 2)
+		require.NoError(t, err)
+
+		stp.InitCurrentBlockHeader(block2Header)
+
+		drained := make(chan struct{})
+
+		go func() {
+			defer close(drained)
+
+			for {
+				select {
+				case req := <-newSubtreeChan:
+					if req.ErrChan != nil {
+						req.ErrChan <- nil
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
+		defer func() {
+			cancel()
+			<-drained
+		}()
+
+		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward})
+		require.Error(t, err, "a subtree that does not match its key must fail the reorg, not have its nodes applied")
+		require.Contains(t, err.Error(), "does not match its key")
 	})
 }

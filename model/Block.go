@@ -1416,17 +1416,13 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 		return errors.NewProcessingError("[validateSubtree][%s] subtree %d was released during validation", b.String(), sIdx)
 	}
 
-	// Resolve the hash before the tracer, not after. RootHash() returns nil for a
-	// zero-node subtree and chainhash.Hash.String() has a value receiver, so
-	// naming it inside the span's log message panics on that input — in an
-	// errgroup goroutine with no recover. Resolving here also means the span and
-	// every error below name the same subtree; naming one hash in the trace and
-	// another in the failure is the identity trap the meta reader's own comments
-	// warn about.
+	// Resolved before the tracer because RootHash() is nil for a zero-node subtree
+	// and chainhash.Hash.String() has a value receiver, so naming it in the span's
+	// log message panics inside an errgroup goroutine. It also keeps the span and
+	// the errors below naming the same subtree.
 	//
-	// This is the file's cached root, which GetAndValidateSubtrees has already
-	// compared against the key it was fetched under, so it and b.Subtrees[sIdx]
-	// agree by construction on that path.
+	// This is the .subtree file's cached root, which GetAndValidateSubtrees has
+	// already compared against the key it was fetched under.
 	subtreeHash := subtree.RootHash()
 	if subtreeHash == nil {
 		return errors.NewProcessingError("[validateSubtree][%s] subtree %d has no root hash", b.String(), sIdx)
@@ -1450,16 +1446,13 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 	// header-validation verdict (root-hash or entry-count mismatch, issue 1425),
 	// and regeneration succeeding would otherwise discard the only trace of a
 	// torn or foreign file.
-	// ctx errors are excluded deliberately. Regeneration reads the whole
-	// .subtreeData and, on a miss, fetches from every configured peer behind a
-	// 30s timeout. At shutdown or on a cancelled validation every subtree of the
-	// in-flight block would do that at once — a refetch storm and a warn burst
-	// indistinguishable from real corruption during triage — to rebuild a file
-	// nothing is going to use.
+	// ctx errors are excluded: regeneration reads the whole .subtreeData and, on a
+	// miss, fetches from every peer behind a 30s timeout. At shutdown that fires
+	// for every subtree of the in-flight block, to rebuild a file nothing will use.
 	if err != nil && deps.metaRegenerator != nil && ctx.Err() == nil {
-		// The "subtree meta not found" token is kept verbatim: it is what existing
-		// log queries and alerts match on for regeneration bursts, and renaming it
-		// would silently zero those out with no overlap window.
+		// "subtree meta not found" is preserved as a substring because that is what
+		// existing queries match on for regeneration bursts. Note the line itself
+		// changed — anything pinned to the exact previous message needs updating.
 		logger.Warnf("[validateSubtree][%s][%s:%d] subtree meta not found or unusable (%v), attempting regeneration", b.String(), subtreeHash.String(), sIdx, err)
 
 		subtreeMetaSlice, err = deps.metaRegenerator.RegenerateMeta(ctx, subtreeHash, subtree, sIdx == 0)
@@ -1907,21 +1900,13 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 					}
 				}
 
-				// Bind the file to the key it was fetched under, once, here.
-				// DeserializeFromReaderWithAllocator caches the root hash straight
-				// out of the .subtree header and RootHash() never recomputes it, so
-				// without this comparison a genuine-but-foreign subtree stored under
-				// the right key is accepted as the committed one — and every later
-				// consumer of RootHash() inherits that. CheckMerkleRoot does not
-				// close it either: for sIdx 0 it recomputes via
-				// RootHashWithReplaceRootNode, so the file's cached root is never
-				// compared to anything there.
-				//
-				// This compares the file's own claim rather than recomputing the
-				// tree, so it catches the wrong file under the right key, not a
-				// rewritten header. Kept a storage error like its neighbours: a
-				// subtree that does not match its key is a bad read, not a verdict
-				// on the block.
+				// Bind the file to its key, once, for every later consumer of
+				// RootHash(). DeserializeFromReaderWithAllocator caches the .subtree
+				// header's root and never recomputes it, and CheckMerkleRoot does not
+				// close the gap either — for sIdx 0 it recomputes via
+				// RootHashWithReplaceRootNode, so the cached root is never compared.
+				// This compares the file's claim, not the tree, so it catches the
+				// wrong file under the right key rather than a rewritten header.
 				rootHash := subtree.RootHash()
 				if rootHash == nil {
 					return errors.NewStorageError("[BLOCK][%s][ID %d] subtree %s deserialized with no root hash", blockHash, blockID, subtreeHash)

@@ -270,6 +270,15 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 
 	fmt.Printf(numTransactionsFormat, st.Length())
 
+	// RootHash() is nil for a subtree claiming zero leaves, and it is dereferenced
+	// below. Printing it above is safe because fmt recovers a Stringer panic; the
+	// deref is not. Report it rather than dying on the malformed file this tool
+	// exists to inspect.
+	stRootHash := st.RootHash()
+	if stRootHash == nil {
+		return errors.NewProcessingError("subtree file has no root hash: it claims zero transactions, so its meta cannot be checked against it")
+	}
+
 	// Buffer the meta so a rejection can still be inspected. The whole point of
 	// this tool is the file that will not load, so it reports the defect and then
 	// dumps whatever the body yields, rather than returning and leaving the
@@ -290,7 +299,7 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 	// to supply a committed hash. So a torn .subtree header is reported here as a
 	// meta root hash mismatch, naming the other file of the two — worth knowing
 	// when reading the output.
-	subtreeMeta, err := blockmodel.NewSubtreeMetaFromValidatedReader(*st.RootHash(), st, bytes.NewReader(metaBytes))
+	subtreeMeta, err := blockmodel.NewSubtreeMetaFromValidatedReader(*stRootHash, st, bytes.NewReader(metaBytes))
 	if err != nil {
 		fmt.Printf("Subtree meta REJECTED: %v\n", err)
 
