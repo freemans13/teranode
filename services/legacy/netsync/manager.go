@@ -694,6 +694,9 @@ type SyncManager struct {
 	// not bound the time they take — see fetchHeaderBlocks.
 	headerMu         sync.Mutex
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
+	// currentCached is the last answer current() worked out, so a peer goroutine
+	// can read it without making the blockchain call itself. See IsCurrentCached.
+	currentCached atomic.Bool
 	headerList       *list.List
 	// headerIndex resolves a block hash to its element in headerList in O(1),
 	// so a caller does not have to walk the list to find a header. Guarded by
@@ -2024,8 +2027,43 @@ func (sm *SyncManager) isCurrent(bestBlockHeaderMeta *model.BlockHeaderMeta) boo
 }
 
 // current returns true if we believe we are synced with our peers, false if we
-// still have blocks to check
+// still have blocks to check.
+//
+// It costs a blockchain round trip, and GetBestBlockHeader can block for minutes
+// during initial sync, so it must only ever be called from a goroutine that can
+// afford to wait. Anything on a peer's own goroutine has to read the answer this
+// leaves behind instead — see IsCurrentCached.
 func (sm *SyncManager) current() bool {
+	answer := sm.computeCurrent()
+	sm.currentCached.Store(answer)
+
+	return answer
+}
+
+// IsCurrentCached reports the last answer current() worked out, without asking
+// the blockchain anything.
+//
+// It exists because the peer layer needs to know whether we are catching up in
+// order to size a block download deadline, and it asks on a fifteen-second timer
+// from every peer's stall handler. Answering that with the real call put an
+// unbounded blockchain round trip on the one goroutine that drains a peer's
+// stallControl channel — a buffered-1 channel whose sends from inHandler are
+// blocking — so a slow blockchain service would stop that peer reading its
+// socket, and stop the stall detector disconnecting anybody, which is the exact
+// failure the stall handler exists to catch.
+//
+// current() runs on the sync manager's own goroutine on every message it handles
+// while the node is behind, and on every inventory announcement once it is not,
+// so the cached answer is refreshed constantly in both regimes. It starts false,
+// which reads as "still catching up" — the safe direction, because the wider
+// deadline that follows from it does not disconnect a peer early.
+func (sm *SyncManager) IsCurrentCached() bool {
+	return sm.currentCached.Load()
+}
+
+// computeCurrent is current() without the caching, and is what actually asks the
+// blockchain.
+func (sm *SyncManager) computeCurrent() bool {
 	_, bestBlockHeaderMeta, err := sm.blockchainClient.GetBestBlockHeader(sm.ctx)
 	if err != nil {
 		sm.logger.Errorf("[current] failed to get best block header: %v", err)

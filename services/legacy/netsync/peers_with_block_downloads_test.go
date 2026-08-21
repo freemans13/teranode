@@ -5,10 +5,15 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/model"
+	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -99,4 +104,70 @@ func TestPeersWithBlockDownloadsIgnoresUnregisteredPeers(t *testing.T) {
 	sm.blockDownloads.Add(busy, chainhash.Hash{0x02})
 
 	require.Equal(t, 1, sm.PeersWithBlockDownloads())
+}
+
+// TestIsCurrentCached_AsksTheBlockchainNothing pins the other half of the deadline
+// plumbing. The peer layer needs to know whether we are catching up in order to
+// size a block download deadline, and it asks on a fifteen-second timer from
+// every peer's stall handler.
+//
+// That goroutine is the only consumer of the peer's stallControl channel, which
+// is buffered to one and whose sends from inHandler are blocking. So a blockchain
+// round trip on this path — and GetBestBlockHeader can block for minutes during
+// initial sync, which is why headerMu is dropped around it — stops that peer
+// reading its socket, and stops the stall detector disconnecting anybody. It
+// mutes the very peers it is meant to police.
+//
+// The read must therefore cost nothing, and must still tell the truth that
+// current() last worked out.
+func TestIsCurrentCached_AsksTheBlockchainNothing(t *testing.T) {
+	running := blockchain2.FSMStateRUNNING
+	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+
+	client := &blockchain2.Mock{}
+	client.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+	// Height 100 is far below mainnet's last checkpoint and the block time is
+	// ancient, so current() computes false — the state a node is in during IBD.
+	client.Mock.On("GetBestBlockHeader", mock.Anything).
+		Return(bestHeader, &model.BlockHeaderMeta{Height: 100}, nil)
+
+	sm := &SyncManager{
+		logger:           ulogger.TestLogger{},
+		settings:         test.CreateBaseTestSettings(t),
+		chainParams:      &chaincfg.MainNetParams,
+		blockchainClient: client,
+		peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
+	}
+
+	calls := func() int {
+		n := 0
+
+		for _, c := range client.Mock.Calls {
+			if c.Method == "GetBestBlockHeader" {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	// Before anything has computed it, the answer reads as "still catching up".
+	// That is the safe direction: the wider deadline it produces does not
+	// disconnect a peer early.
+	require.False(t, sm.IsCurrentCached())
+	require.Zero(t, calls(), "the cached read must not ask the blockchain anything")
+
+	require.False(t, sm.current(), "sanity: a node at height 100 is not current")
+	require.Equal(t, 1, calls(), "current() itself does make the call")
+
+	for i := 0; i < 50; i++ {
+		require.False(t, sm.IsCurrentCached())
+	}
+
+	require.Equal(t, 1, calls(), "no number of cached reads may add a blockchain call")
+
+	// And it carries the answer, rather than being hardwired to one.
+	sm.currentCached.Store(true)
+	require.True(t, sm.IsCurrentCached())
+	require.Equal(t, 1, calls())
 }

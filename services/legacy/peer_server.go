@@ -3084,7 +3084,9 @@ func newPeerConfig(sp *serverPeer) *peer.Config {
 			if sp.server == nil || sp.server.syncManager == nil {
 				return false
 			}
-			return !sp.server.syncManager.IsCurrent()
+			// The cached answer, never the live one: this runs on the peer's
+			// stall handler, which must not block on a blockchain round trip.
+			return !sp.server.syncManager.IsCurrentCached()
 		},
 		PeersWithBlockDownloads: func() int {
 			if sp.server == nil || sp.server.syncManager == nil {
