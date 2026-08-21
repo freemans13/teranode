@@ -250,6 +250,35 @@ func TestProcessCatchupChItem(t *testing.T) {
 		mockBC.AssertNotCalled(t, "ReportPeerFailure", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	})
 
+	// The predicate here is the union of two helpers because neither covers the
+	// local cases alone: IsLocalError is context plus ErrStorageError and misses
+	// the *Unavailable codes, while IsTransientLocalError covers those and misses
+	// context entirely. Using either alone left one class of purely local failure
+	// still charged to an honest primary.
+	for name, localErr := range map[string]error{
+		"context cancellation (shutdown or catchup deadline)": errors.NewContextCanceledError("catchup context cancelled"),
+		"a local service outage (aerospike batch timeout)":    errors.NewServiceUnavailableError("aerospike get batch did not complete within"),
+		"an unavailable store":                                errors.NewStorageUnavailableError("disk below threshold"),
+	} {
+		t.Run(name+" is local: counts toward cap, never blames the peer", func(t *testing.T) {
+			u, _ := newServer(3, localErr)
+			b := testBlock()
+			u.processBlockNotify.Set(*b.Hash(), true, ttlcache.DefaultTTL)
+			u.catchupAlternatives.Set(*b.Hash(), []processBlockCatchup{{block: b, peerID: "altpeer"}}, ttlcache.DefaultTTL)
+
+			u.processCatchupChItem(ctx, item(b))
+
+			it := u.blockCatchupAttempts.Get(*b.Hash())
+			require.NotNil(t, it, "a local fault must still count toward the #1057 cap")
+			require.Equal(t, 1, it.Value())
+			require.Nil(t, u.processBlockNotify.Get(*b.Hash()))
+			require.Nil(t, u.catchupAlternatives.Get(*b.Hash()))
+
+			mockBC := u.blockchainClient.(*blockchain.Mock)
+			mockBC.AssertNotCalled(t, "ReportPeerFailure", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
+
 	t.Run("failure that advanced the chain resets the counter (does not count)", func(t *testing.T) {
 		u, _ := newServer(3, errors.NewServiceError("dropped mid-batch"))
 		b := testBlock()
