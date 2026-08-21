@@ -390,6 +390,47 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 
 		// TODO: all of these should be using error types, and not checking the strings (!)
 		switch {
+		case errors.Is(*err, errors.ErrStorageError):
+			// A failed read or write of our own store — a torn, stale or mis-keyed
+			// external transaction blob (issue 1439), a full disk — is this node's
+			// fault, never the peer's. recordCatchupPeerFailure already exempts
+			// storage errors, so this makes the terminal-error path agree with the
+			// per-fetch one.
+			//
+			// This case must come FIRST, and specifically ahead of the consensus
+			// case below, because an error chain can carry both codes and errors.Is
+			// walks the whole chain. The aerospike UTXO store wraps its own bins'
+			// read failures — including a live client.Get on a paginated record —
+			// and those inner StorageErrors used to be re-wrapped in TxInvalid. Any
+			// such chain reaching here would be scored a validation_failure with
+			// reportMalicious set, blaming an honest peer for our own store. It also
+			// has to precede the IsNetworkError case, for the reason documented on
+			// the ErrExternal case: IsNetworkError falls back to substring matching
+			// and a truncated blob surfaces as "unexpected EOF", which would
+			// otherwise be mislabelled a network error against the primary.
+			//
+			// Server.go's processCatchupChItem tests storage before it tests
+			// isUnvalidatablePeerError, so this ordering is what keeps the two
+			// classifiers from reaching opposite verdicts on the same error.
+			errorType = "local_storage_fault"
+			isPeerError = false
+		case errors.Is(*err, errors.ErrServiceUnavailable):
+			// A local service we depend on was unreachable — ours, not the peer's.
+			// Moved above the consensus and IsNetworkError cases: it was previously
+			// below both, so although it set isPeerError = false, any chain also
+			// carrying a consensus code, or whose text tripped the network substring
+			// match, never reached it and was charged to the peer anyway. The
+			// aerospike batch-read timeout is the common producer.
+			errorType = "local_service_unavailable"
+			isPeerError = false
+		case errors.IsContextError(*err):
+			// Context cancelled or deadline exceeded — a shutdown, or the catchup
+			// context timing out. Never the peer's doing. There was no case for this
+			// at all, so it fell past every branch to "unknown_error" with
+			// isPeerError left true, charging an honest primary for our own
+			// shutdown. Mirrors the predicate now used in processCatchupChItem.
+			errorType = "local_context_cancelled"
+			isPeerError = false
 		case errors.Is(*err, errors.ErrBlockInvalid) || errors.Is(*err, errors.ErrTxInvalid):
 			errorType = "validation_failure"
 			// Mark peer as malicious for validation failure (reported after unlock)
@@ -404,17 +445,6 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// all-peers-failed error as a network error against the primary.
 			errorType = "peer_data_unavailable"
 			isPeerError = false
-		case errors.Is(*err, errors.ErrStorageError):
-			// A failed read or write of our own store — a torn, stale or mis-keyed
-			// external transaction blob (issue 1439), a full disk — is this node's
-			// fault, never the peer's. Must precede the IsNetworkError case for the
-			// same ordering reason documented above: IsNetworkError falls back to
-			// substring matching and a truncated blob surfaces as "unexpected EOF",
-			// which would otherwise be mislabelled a network error against the
-			// primary. recordCatchupPeerFailure already exempts storage errors, so
-			// this makes the terminal-error path agree with the per-fetch one.
-			errorType = "local_storage_fault"
-			isPeerError = false
 		case errors.IsNetworkError(*err):
 			errorType = "network_error"
 		case strings.Contains(errorMsg, "secret mining") || strings.Contains(errorMsg, "secretly mined"):
@@ -428,10 +458,6 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 		case strings.Contains(errorMsg, "block assembly is behind"):
 			// Block assembly being behind is a local system error, not a peer error
 			errorType = "local_system_not_ready"
-			isPeerError = false
-		case errors.Is(*err, errors.ErrServiceUnavailable):
-			// Service unavailable errors are local system issues, not peer errors
-			errorType = "local_service_unavailable"
 			isPeerError = false
 		case errors.IsTransientBlockIncomplete(*err):
 			// Transient LOCAL catchup-ordering gap (unabsorbed parent, issue 1031). Shares the
@@ -1348,8 +1374,12 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan blockForValidat
 						u.reportCatchupMalicious(gCtx, peerID, "invalid_block_validation")
 					}
 
-					// Record metric for validation failure
-					if prometheusCatchupErrors != nil {
+					// Record metric for validation failure. A local storage fault is
+					// not the peer's doing, so it must not be charged against them
+					// here either — the reputation paths above already exempt it, and
+					// charging it in telemetry only would leave the dashboards
+					// blaming an honest peer for this node's disk.
+					if prometheusCatchupErrors != nil && !errors.Is(err, errors.ErrStorageError) {
 						prometheusCatchupErrors.WithLabelValues(peerID, "validation_failure").Inc()
 					}
 
@@ -1406,7 +1436,9 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 
 	// Quick validation: create UTXOs for the block and validate transactions in parallel
 	if err := u.blockValidation.quickValidateBlockAsync(ctx, block, peerID, baseURL, writeJobsChan); err != nil {
-		if prometheusCatchupErrors != nil {
+		// As in validateBlocksOnChannel: do not charge a local storage fault to the
+		// peer, even in telemetry.
+		if prometheusCatchupErrors != nil && !errors.Is(err, errors.ErrStorageError) {
 			prometheusCatchupErrors.WithLabelValues(peerID, "validation_failure").Inc()
 		}
 
