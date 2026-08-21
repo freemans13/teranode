@@ -366,19 +366,7 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		validatorClient:             validatorClient,
 		subtreeValidationClient:     subtreeValidationClient,
 		lastValidatedBlocks: expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute).
-			WithEvictionFunction(func(_ chainhash.Hash, block *model.Block) bool {
-				// Pools heap-backed []Node slices, Closes mmap-backed subtrees
-				// (unmap + backing-file removal), and nils the entries — all
-				// under the block's subtree mutex.
-				//
-				// Attempted, not forced. expiringmap.clean() calls this while
-				// holding the map's write lock, and a block being validated holds
-				// its subtree mutex across store reads with retries — so waiting
-				// for it here would park the cleaner and queue every cache
-				// operation behind one block's I/O. Declining leaves the entry in
-				// place with its expiry unchanged, so the next tick retries it.
-				return tryReleaseBlockNodes(block)
-			}),
+			WithEvictionFunction(evictLastValidatedBlock),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute), // we keep this for 2 hours
 		invalidBlockKafkaProducer:     invalidBlockKafkaProducer,
 		subtreeExistsCache:            expiringmap.New[chainhash.Hash, bool](10 * time.Minute), // we keep this for 10 minutes

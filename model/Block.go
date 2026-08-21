@@ -1276,13 +1276,19 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 
 	subtreeMetaSlice, err = b.getSubtreeMetaSlice(ctx, deps.subtreeStore, *subtreeHash, subtree)
 
-	// Attempt regeneration if meta not found and regenerator is available
+	// Attempt regeneration if meta not found and regenerator is available.
+	//
+	// Both lines here are Debug because RegenerateMeta owns the reporting: it
+	// logs one Info naming the source that worked, and on total failure one Warn
+	// naming every source with its own cause. A missing meta is the routine
+	// reason to be here, so announcing the attempt and the success again at Warn
+	// put two lines per regenerated subtree on a path that succeeded.
 	if err != nil && deps.metaRegenerator != nil {
-		logger.Warnf("[validateSubtree][%s][%s:%d] subtree meta not found, attempting regeneration", b.String(), subtreeHash.String(), sIdx)
+		logger.Debugf("[validateSubtree][%s][%s:%d] subtree meta not found, attempting regeneration", b.String(), subtreeHash.String(), sIdx)
 
 		subtreeMetaSlice, err = deps.metaRegenerator.RegenerateMeta(ctx, subtreeHash, subtree)
 		if err == nil {
-			logger.Warnf("[validateSubtree][%s][%s:%d] successfully regenerated subtree meta", b.String(), subtreeHash.String(), sIdx)
+			logger.Debugf("[validateSubtree][%s][%s:%d] successfully regenerated subtree meta", b.String(), subtreeHash.String(), sIdx)
 		}
 	}
 

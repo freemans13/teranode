@@ -103,8 +103,11 @@ func TestLastValidatedBlocksEviction_DoesNotStallTheCache(t *testing.T) {
 	evictions := make(chan bool, 16)
 
 	m := expiringmap.New[chainhash.Hash, *model.Block](ttl).
-		WithEvictionFunction(func(_ chainhash.Hash, b *model.Block) bool {
-			released := tryReleaseBlockNodes(b)
+		WithEvictionFunction(func(k chainhash.Hash, b *model.Block) bool {
+			// Delegates to the function NewBlockValidation registers, so
+			// restoring that to a forced release fails this test rather than
+			// leaving it green against a locally built stand-in.
+			released := evictLastValidatedBlock(k, b)
 
 			select {
 			case evictions <- released:

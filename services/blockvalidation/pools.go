@@ -21,6 +21,7 @@ package blockvalidation
 import (
 	"sync"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/model"
 )
@@ -156,4 +157,24 @@ func tryReleaseBlockNodes(b *model.Block) bool {
 	released, _ := b.TryReleaseSubtreeNodes(PutNodeSlice)
 
 	return released
+}
+
+// evictLastValidatedBlock is the lastValidatedBlocks eviction function.
+//
+// It pools heap-backed []Node slices, Closes mmap-backed subtrees (unmap plus
+// backing-file removal) and nils the entries — all under the block's subtree
+// mutex.
+//
+// Attempted, not forced. expiringmap.clean() calls this while holding the map's
+// write lock, and a block being validated holds its subtree mutex across store
+// reads with retries — so waiting for it here would park the cleaner and queue
+// every cache operation behind one block's I/O. Declining leaves the entry in
+// place with its expiry unchanged, so the next tick retries it.
+//
+// Named rather than written inline at the WithEvictionFunction call so a test
+// can exercise the function block validation actually registers. As a closure
+// it was reachable only through NewBlockValidation, and restoring it to a
+// forced release left the eviction tests green.
+func evictLastValidatedBlock(_ chainhash.Hash, block *model.Block) bool {
+	return tryReleaseBlockNodes(block)
 }
