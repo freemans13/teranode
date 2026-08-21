@@ -1497,6 +1497,16 @@ func TestErrorCodeToGRPCCode(t *testing.T) {
 			expected: codes.FailedPrecondition,
 		},
 		{
+			// ERR_UTXO_FROZEN moved into the same family in this change. It is
+			// the one member that does not clear by itself, but it is still a
+			// verdict about the chain state rather than a fault in this node, and
+			// every code on publicCauseCodes needs a row here or WrapGRPCPublic
+			// returns its message inside a codes.Internal status.
+			name:     "maps ERR_UTXO_FROZEN to codes.FailedPrecondition",
+			errCode:  ERR_UTXO_FROZEN,
+			expected: codes.FailedPrecondition,
+		},
+		{
 			name:     "unmapped code BLOCK_NOT_FOUND defaults to codes.Internal",
 			errCode:  ERR_BLOCK_NOT_FOUND,
 			expected: codes.Internal,

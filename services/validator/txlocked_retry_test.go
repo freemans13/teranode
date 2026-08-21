@@ -13,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/gocore"
+	prometheustestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -64,16 +65,23 @@ func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
 		// returnErr when nil.
 		wantSentinel error
 		wantRetried  bool
+		// wantCondition is the value the "condition" label must carry on both
+		// counters. Only meaningful when wantRetried is true. These label values
+		// are promised to operators by docs/references/prometheusMetrics.md and by
+		// the validator_txlocked_maxRetries help text, so they are pinned here.
+		wantCondition string
 	}{
 		{
-			name:        "TX_LOCKED is retried to the configured budget",
-			returnErr:   errors.NewTxLockedError("parent still committing its own two-phase commit"),
-			wantRetried: true,
+			name:          "TX_LOCKED is retried to the configured budget",
+			returnErr:     errors.NewTxLockedError("parent still committing its own two-phase commit"),
+			wantRetried:   true,
+			wantCondition: "TX_LOCKED",
 		},
 		{
-			name:        "TX_CREATING is retried to the configured budget",
-			returnErr:   errors.NewTxCreatingError("parent still being written (multi-record create)"),
-			wantRetried: true,
+			name:          "TX_CREATING is retried to the configured budget",
+			returnErr:     errors.NewTxCreatingError("parent still being written (multi-record create)"),
+			wantRetried:   true,
+			wantCondition: "TX_CREATING",
 		},
 		{
 			// The cases above hand the sentinel back as the top-level error,
@@ -99,8 +107,9 @@ func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
 				{Err: aerospikeCreatingErr},
 				{Err: aerospikeCreatingErr},
 			},
-			wantSentinel: aerospikeCreatingErr,
-			wantRetried:  true,
+			wantSentinel:  aerospikeCreatingErr,
+			wantRetried:   true,
+			wantCondition: "TX_CREATING",
 		},
 		{
 			name:        "TX_CONFLICTING breaks out on the first attempt",
@@ -147,6 +156,15 @@ func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
 
 			opts := &Options{}
 
+			// Counters are package-level and shared across subtests, so compare
+			// deltas rather than absolute values.
+			retriesBefore := map[string]float64{}
+			exhaustedBefore := map[string]float64{}
+			for _, c := range []string{"TX_LOCKED", "TX_CREATING"} {
+				retriesBefore[c] = prometheustestutil.ToFloat64(prometheusValidatorParentCommitRetries.WithLabelValues(c))
+				exhaustedBefore[c] = prometheustestutil.ToFloat64(prometheusValidatorParentCommitExhausted.WithLabelValues(c))
+			}
+
 			start := time.Now()
 			_, err := v.ValidateWithOptions(ctx, childTx, 2, opts)
 			elapsed := time.Since(start)
@@ -169,11 +187,31 @@ func TestValidateWithOptions_RetryPredicateByErrorType(t *testing.T) {
 				// fire back-to-back with no backoff) is caught. No sleeps beyond
 				// what the retry budget itself needs.
 				require.GreaterOrEqual(t, elapsed, 30*time.Millisecond, "retried case should have paid the exponential backoff between attempts")
-			} else {
-				require.Less(t, elapsed, 30*time.Millisecond, "non-retried case must not sleep at all")
 			}
+			// No upper bound on elapsed for the non-retried case. The backoff sleep is
+			// only reachable between two attempts, so the call count below already
+			// proves no sleep happened, and a wall-clock ceiling would only add a
+			// scheduler- and GC-sensitive flake under CI contention.
 
 			mockStore.AssertNumberOfCalls(t, "SpendAndCreate", wantCalls)
+
+			// The counters are the observable half of this change: the docs and the
+			// setting's help text tell operators to watch these two names with these
+			// label values, so a rename or a mislabelled increment has to fail here.
+			for _, c := range []string{"TX_LOCKED", "TX_CREATING"} {
+				wantRetries, wantExhausted := 0.0, 0.0
+				if tc.wantRetried && c == tc.wantCondition {
+					wantRetries = float64(tSettings.Validator.TxLockedMaxRetries)
+					wantExhausted = 1
+				}
+
+				require.Equal(t, wantRetries,
+					prometheustestutil.ToFloat64(prometheusValidatorParentCommitRetries.WithLabelValues(c))-retriesBefore[c],
+					"parent_commit_retries{condition=%q} delta", c)
+				require.Equal(t, wantExhausted,
+					prometheustestutil.ToFloat64(prometheusValidatorParentCommitExhausted.WithLabelValues(c))-exhaustedBefore[c],
+					"parent_commit_exhausted{condition=%q} delta", c)
+			}
 		})
 	}
 }
