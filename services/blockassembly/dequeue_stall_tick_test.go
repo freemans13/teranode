@@ -210,3 +210,60 @@ func TestSampleBlockAssemblerMetrics_StartupIsNotReportedAsUnboundedGrowth(t *te
 
 	stp.AssertExpectations(t)
 }
+
+// TestSampleBlockAssemblerMetrics_ReadsConsumerStartedBeforeStaleness pins the
+// order the tick reads its two lifecycle inputs in, which is load-bearing and
+// silently reversible.
+//
+// SubtreeProcessor.Start stores the re-seeded dequeue timestamp and then sets
+// consumerStarted, in that order. Go's atomics are sequentially consistent, so
+// a reader that loads the flag first and sees true is guaranteed to see the
+// re-seed on the following load. Load them the other way round and one
+// interleaving lies: the pre-Start timestamp paired with the post-Start flag,
+// which classifies a routine restart as a wedged consumer and warns "intake is
+// growing unbounded" - the false alarm the whole classification exists to
+// prevent.
+//
+// That interleaving is a two-instruction window that happens at most once per
+// process, so it cannot be provoked from a test. The order itself can be, and
+// it is the only thing a regression would change: swap the two reads back and
+// this fails, while every behavioural test in this file still passes.
+func TestSampleBlockAssemblerMetrics_ReadsConsumerStartedBeforeStaleness(t *testing.T) {
+	initPrometheusMetrics()
+
+	stp := &subtreeprocessor.MockSubtreeProcessor{}
+	stp.Test(t)
+
+	ba := &BlockAssembly{
+		logger:         newCapturingLogger(),
+		blockAssembler: &BlockAssembler{subtreeProcessor: stp},
+	}
+
+	stp.On("TxCount").Return(uint64(0))
+	stp.On("SubtreeCount").Return(0)
+	stp.On("QueueLength").Return(int64(0))
+	stp.On("LastDequeueTime").Return(time.Now())
+	stp.On("ConsumerStarted").Return(true)
+
+	ba.sampleBlockAssemblerMetrics(dequeueStallState{}, time.Now())
+
+	consumerStarted, lastDequeue := -1, -1
+
+	for i, call := range stp.Calls {
+		switch call.Method {
+		case "ConsumerStarted":
+			if consumerStarted == -1 {
+				consumerStarted = i
+			}
+		case "LastDequeueTime":
+			if lastDequeue == -1 {
+				lastDequeue = i
+			}
+		}
+	}
+
+	require.NotEqual(t, -1, consumerStarted, "the tick must sample ConsumerStarted, or it cannot tell startup from a wedge at all")
+	require.NotEqual(t, -1, lastDequeue, "the tick must sample LastDequeueTime, or there is no staleness to report")
+	require.Less(t, consumerStarted, lastDequeue,
+		"ConsumerStarted must be read before LastDequeueTime, so a true reading guarantees the re-seeded timestamp is visible and a restart is never reported as a wedge")
+}

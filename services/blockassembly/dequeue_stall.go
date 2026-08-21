@@ -37,13 +37,23 @@ const (
 // is the correct starting state: not stalled, nothing warned yet.
 type dequeueStallState struct {
 	stalled bool
-	// beforeConsumerStarted records whether the consumer had been started when
-	// this incident began. It only affects how the incident is reported: a gap
-	// that opens before the consumer exists is startup, not a wedge, and its
-	// end is the consumer arriving rather than recovering. Latched on the rising
-	// edge because by the time the incident ends the consumer has necessarily
-	// started - SubtreeProcessor.Start re-seeds the dequeue timestamp, which is
-	// what ends a startup gap in the first place.
+	// beforeConsumerStarted records that this incident is still explained by the
+	// consumer not existing yet. It only affects how the incident is reported: a
+	// gap that opens before the consumer exists is startup, not a wedge, and its
+	// end is the consumer arriving rather than recovering.
+	//
+	// It has to be carried rather than read live at the closing edge, because by
+	// the time an incident ends the consumer has necessarily started -
+	// SubtreeProcessor.Start re-seeds the dequeue timestamp, which is what ends
+	// a startup gap in the first place - so the live reading can no longer tell
+	// startup finishing from a wedge recovering.
+	//
+	// Set on the rising edge and cleared again if a later tick finds the
+	// consumer started while the stall persists, which means startup gave way to
+	// a genuine wedge. Without that clearing, a consumer that starts into the
+	// backlog the reload accumulated and immediately jams would warn correctly
+	// throughout and then close with "consumer started", crediting the startup
+	// sequence for a wedge.
 	beforeConsumerStarted bool
 	// stalledSince is when the consumer stopped, not when we noticed. Set
 	// once on the rising edge and never touched again until recovery, so one
@@ -121,6 +131,20 @@ func observeDequeueStall(state dequeueStallState, now time.Time, queueLength int
 		// go negative: staleness here is at most the threshold, and the
 		// staleness that opened the incident exceeded it.
 		return dequeueStallState{}, dequeueStallEnded, now.Add(-staleness).Sub(state.stalledSince)
+	}
+
+	// Still stalled, and the consumer has started since the incident opened.
+	// That reclassifies it: what looked like startup is now a consumer that
+	// exists and is not dequeuing, so the closing line must not credit the
+	// startup sequence for a wedge. Clearing here rather than at the closing
+	// edge is what makes it safe - an ordinary startup gap never reaches this
+	// point, because SubtreeProcessor.Start re-seeds the dequeue timestamp in
+	// the same breath as setting the flag, so the tick that first sees the flag
+	// true also sees low staleness and takes the ended branch above. Reaching
+	// here with the flag true therefore means the consumer started and then
+	// failed to dequeue for the whole threshold, which is a wedge.
+	if consumerStarted {
+		state.beforeConsumerStarted = false
 	}
 
 	if now.Sub(state.lastWarn) >= dequeueStallWarnRepeat {

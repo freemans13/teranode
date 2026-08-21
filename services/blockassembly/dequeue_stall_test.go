@@ -301,3 +301,96 @@ func TestObserveDequeueStall_IncidentIsReportedAsOneIncident(t *testing.T) {
 		"the reported duration must cover the whole incident, from when the consumer stopped to when it resumed")
 	require.False(t, state.stalled)
 }
+
+// TestObserveDequeueStall_StartupThatBecomesAWedgeIsReportedAsAWedge covers the
+// one sequence where the startup classification would otherwise outlive its
+// truth.
+//
+// BlockAssembler.Start loads unmined transactions with gRPC ingest already
+// accepting, so by the time the consumer starts there is a backlog waiting for
+// it. A consumer that dives into that backlog and jams - in the subtree store,
+// say - has started, so the incident is a wedge from that moment on, and the
+// repeat warnings say so because they read the flag live. The closing line reads
+// the carried value instead, and without clearing it would credit the startup
+// sequence for the whole thing: "consumer started after 12m and is now
+// dequeuing", for an incident that was a wedge for eleven of those minutes.
+//
+// The clearing is safe precisely because an ordinary startup gap cannot reach
+// it: SubtreeProcessor.Start re-seeds the dequeue timestamp in the same breath
+// as setting the flag, so the first tick to see the flag true also sees low
+// staleness and ends the incident. Both halves are asserted here - the ordinary
+// startup gap still closes as startup, and this one does not.
+func TestObserveDequeueStall_StartupThatBecomesAWedgeIsReportedAsAWedge(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("startup that gives way to a wedge closes as a recovery", func(t *testing.T) {
+		var state dequeueStallState
+
+		// The reload is still running: queue filling, consumer not yet started.
+		state, event, _ := observeDequeueStall(state, base, 10_000, time.Minute, false)
+		require.Equal(t, dequeueStallBegan, event)
+		require.True(t, state.beforeConsumerStarted, "a gap that opens before the consumer exists is startup")
+
+		// The consumer has started, and is still not dequeuing. It cannot be
+		// startup any more.
+		state, _, _ = observeDequeueStall(state, base.Add(time.Minute), 10_000, 2*time.Minute, true)
+		require.False(t, state.beforeConsumerStarted,
+			"once the consumer exists and still is not dequeuing, the incident is a wedge and must stop being reported as startup")
+
+		// It recovers. The closing edge must call this a recovery.
+		state, event, stalledFor := observeDequeueStall(state, base.Add(10*time.Minute), 10_000, time.Second, true)
+		require.Equal(t, dequeueStallEnded, event)
+		require.False(t, state.stalled)
+		require.Positive(t, stalledFor)
+	})
+
+	t.Run("a reload that hangs for many ticks still closes as startup", func(t *testing.T) {
+		// The guard on the clearing arm is what this pins. A hanging
+		// loadUnminedTransactions is the one failure mode of the pre-start
+		// window, and it is the only way an incident racks up repeat ticks with
+		// the consumer still absent. Clearing unconditionally rather than only
+		// when the consumer has started would reclassify exactly this case, so a
+		// reload that eventually completed would close with "recovered, was
+		// stalled for 20m" - blaming a consumer that had not existed for any of
+		// it.
+		var state dequeueStallState
+
+		state, event, _ := observeDequeueStall(state, base, 10_000, time.Minute, false)
+		require.Equal(t, dequeueStallBegan, event)
+
+		for tick := 1; tick <= 40; tick++ {
+			elapsed := time.Duration(tick) * 30 * time.Second
+			state, _, _ = observeDequeueStall(state, base.Add(elapsed), 10_000, time.Minute+elapsed, false)
+			require.True(t, state.beforeConsumerStarted,
+				"a stall the consumer has still not started into stays startup, however long the reload hangs")
+		}
+
+		// The reload finally completes and the consumer starts, re-seeding the
+		// timestamp.
+		captured := state.beforeConsumerStarted
+
+		state, event, _ = observeDequeueStall(state, base.Add(21*time.Minute), 10_000, time.Second, true)
+		require.Equal(t, dequeueStallEnded, event)
+		require.True(t, captured,
+			"the reported cause must be the reload, not a consumer that was absent for the whole incident")
+	})
+
+	t.Run("an ordinary startup gap still closes as startup", func(t *testing.T) {
+		var state dequeueStallState
+
+		state, event, _ := observeDequeueStall(state, base, 10_000, 5*time.Minute, false)
+		require.Equal(t, dequeueStallBegan, event)
+		require.True(t, state.beforeConsumerStarted)
+
+		// The consumer starts, which re-seeds the timestamp, so the very tick
+		// that first sees the flag true also sees low staleness. The clearing
+		// arm is unreachable on this path, which is why it is safe.
+		captured := state.beforeConsumerStarted
+
+		state, event, _ = observeDequeueStall(state, base.Add(5*time.Minute), 10_000, time.Second, true)
+		require.Equal(t, dequeueStallEnded, event)
+		require.True(t, captured,
+			"the value the caller reports with must still say startup, or every restart closes as a recovery from an incident that never happened")
+		require.False(t, state.stalled)
+	})
+}

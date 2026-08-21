@@ -407,7 +407,13 @@ type SubtreeProcessor struct {
 	// which the queue is already being filled.
 	lastDequeueMillis atomic.Int64
 
-	// consumerStarted records whether the Start() goroutine has begun running.
+	// consumerStarted records whether Start has launched the consumer. It is
+	// set by Start itself, immediately before the goroutine is spawned, so a
+	// true reading means "the consumer exists" rather than "the select loop has
+	// executed" - which is the distinction that matters here, because the
+	// dequeue timestamp is re-seeded in the same breath and so already reads
+	// fresh from that moment on.
+	//
 	// It exists so the stall signal can tell "the consumer is wedged" from "the
 	// consumer does not exist yet": BlockAssembly.Init starts the metrics
 	// updater and BlockAssembly.Start brings gRPC ingest up, both before
@@ -666,6 +672,14 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 		// already seeded it, but that value may be minutes stale by now
 		// (loadUnminedTransactions runs between the two), and staleness
 		// accrued before the consumer existed must not be attributed to it.
+		//
+		// These two stores must stay in this order. A reader that sees
+		// consumerStarted true must be guaranteed to see the re-seeded
+		// timestamp, or it pairs a pre-Start timestamp with a post-Start flag
+		// and reports a routine restart as a wedged consumer. Go's atomics are
+		// sequentially consistent, so the guarantee holds as long as the seed
+		// is stored first here and the flag is read first there - see the
+		// matching note in BlockAssembly.sampleBlockAssemblerMetrics.
 		stp.lastDequeueMillis.Store(stp.clock.Now().UnixMilli())
 		stp.consumerStarted.Store(true)
 

@@ -322,6 +322,23 @@ func (ba *BlockAssembly) sampleBlockAssemblerMetrics(stallState dequeueStallStat
 
 	prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
 
+	// Sampled with the rest of the tick so the report can name the cause rather
+	// than list candidates: a stale timestamp means a wedged consumer only once
+	// the consumer exists. Like the other three, a plain atomic load, so it
+	// stays answerable while the consumer's select loop is blocked.
+	//
+	// Read BEFORE the dequeue timestamp, and the order is load-bearing.
+	// SubtreeProcessor.Start stores the re-seeded timestamp and then sets this
+	// flag, in that order. Go's atomics are sequentially consistent, so reading
+	// the flag first means a true reading guarantees the following load observes
+	// the re-seed - small staleness, no incident. Reading the timestamp first
+	// admits the one interleaving that lies: a pre-Start timestamp paired with a
+	// post-Start flag, which classifies a routine restart as a wedged consumer
+	// and warns "intake is growing unbounded" - the exact false alarm this
+	// classification exists to prevent. A false reading is honest either way,
+	// since the tick is then reported as startup regardless of staleness.
+	consumerStarted := ba.blockAssembler.ConsumerStarted()
+
 	// now is sampled before the timestamp is read, so a consumer that stamps in
 	// that window leaves staleness fractionally negative. Floor it: a gauge
 	// claiming the consumer last ran in the future is nonsense on a dashboard,
@@ -332,12 +349,6 @@ func (ba *BlockAssembly) sampleBlockAssemblerMetrics(stallState dequeueStallStat
 	}
 
 	prometheusBlockAssemblerDequeueStalenessSeconds.Set(staleness.Seconds())
-
-	// Sampled with the rest of the tick so the report can name the cause rather
-	// than list candidates: a stale timestamp means a wedged consumer only once
-	// the consumer exists. Like the other three, a plain atomic load, so it
-	// stays answerable while the consumer's select loop is blocked.
-	consumerStarted := ba.blockAssembler.ConsumerStarted()
 
 	// Captured before the fold, which resets the state on the closing edge.
 	stallBeganBeforeConsumerStarted := stallState.beforeConsumerStarted
