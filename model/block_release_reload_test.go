@@ -405,10 +405,9 @@ func TestGetAndValidateSubtrees_ReloadDoesNotWriteIntoACallerOwnedArray(t *testi
 
 	b.SubtreeSlices = callerOwned
 
-	// Compared as a plain integer, never dereferenced: the reload Closes this
-	// subtree, so by assert time its Nodes point into a munmapped region and any
-	// formatting of the value (which require.Same does on failure) would fault
-	// the test binary instead of failing it.
+	// Compared as a plain integer rather than with require.Same: the reload
+	// Closes this subtree, so only the pointer identity of the array element is
+	// under test here, not anything reachable through it.
 	expected := reflect.ValueOf(mmapSt).Pointer()
 
 	require.NoError(t, b.GetAndValidateSubtrees(context.Background(), ulogger.TestLogger{}, blobStore,

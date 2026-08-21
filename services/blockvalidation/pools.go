@@ -132,9 +132,9 @@ func NodeAllocFromPool(numLeaves int) []subtreepkg.Node {
 // Its Close error is deliberately dropped here: the only way Close fails is a
 // munmap error, and every caller of this wrapper is a cache-eviction or
 // validation-failure path with no logger in scope and nothing it could do
-// differently. The two release sites that can act on the error — the reload in
-// model.GetAndValidateSubtrees and setTxMinedStatus — call ReleaseSubtreeNodes
-// directly and log.
+// differently. The release sites that can act on the error log it themselves:
+// setTxMinedStatus calls ReleaseSubtreeNodes directly, and the reload in
+// model.GetAndValidateSubtrees closes its mmap-backed survivors inline.
 func releaseBlockNodes(b *model.Block) {
 	if b == nil {
 		return

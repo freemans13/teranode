@@ -1914,6 +1914,12 @@ func (b *Block) closeMmapSubtreesLocked() error {
 			continue
 		}
 
+		// Detach Nodes before unmapping, the same order releaseSubtreeNodesLocked
+		// uses. Close leaves st.Nodes pointing at the region it just unmapped, so
+		// anything that still holds this subtree would be reading freed memory.
+		// The slice is dropped, never pooled: its backing IS the mapped region.
+		_ = st.ReleaseNodes()
+
 		if err := st.Close(); err != nil {
 			closeErrs = append(closeErrs, errors.NewProcessingError("subtree %d", i, err))
 		}
