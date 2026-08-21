@@ -13,8 +13,8 @@ require (
 	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv5
 	github.com/bsv-blockchain/go-bt/v2 v2.6.9
 	github.com/bsv-blockchain/go-chaincfg v1.6.2
-	github.com/bsv-blockchain/go-sdk v1.3.3
-	github.com/bsv-blockchain/go-subtree v1.4.2
+	github.com/bsv-blockchain/go-sdk v1.3.4
+	github.com/bsv-blockchain/go-subtree v1.4.6
 	github.com/bsv-blockchain/testcontainers-aerospike-go v0.4.0
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
 	github.com/btcsuite/goleveldb v1.0.0
@@ -44,7 +44,7 @@ require (
 	github.com/segmentio/encoding v0.4.0 // indirect
 	github.com/sercand/kuberesolver/v6 v6.0.1
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/compose v0.42.0
 	github.com/urfave/cli/v2 v2.27.7
@@ -181,7 +181,7 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.4 // indirect
 	golang.org/x/telemetry v0.0.0-20260708182218-49f421fb7959 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
