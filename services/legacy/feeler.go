@@ -529,11 +529,6 @@ func (s *server) judgeVersion(na *wire.NetAddress, addrString string, res *feele
 	case s.shuttingDown():
 		return "abandoned, shutting down"
 
-	case !isBSVUserAgent(res.userAgent()):
-		s.banNonBSVHost(addrString)
-
-		return "answered but is not a BSV node"
-
 	// Not banned, unlike a non-BSV user agent: this is a BSV node, just one on a
 	// protocol the node will not speak, so the address is honestly reachable and
 	// only unusable. It must still not be promoted, because the ordinary outbound
@@ -546,8 +541,21 @@ func (s *server) judgeVersion(na *wire.NetAddress, addrString string, res *feele
 	// applies the same rule, but only after it has invoked this OnVersion
 	// listener (peer.go:2783 against the callback at :2774), so res.done is
 	// already closed by the time it rejects.
+	//
+	// Ordered before the user-agent test to match the ordinary path exactly.
+	// serverPeer.OnVersion returns at its protocol check (peer_server.go:797)
+	// before it ever looks at the user agent, so a non-BSV client on a protocol
+	// we do not speak is dropped there and never banned. Testing the user agent
+	// first here would have the probe ban a host the ordinary path only drops,
+	// and a ban is the widest thing this feature does — process-wide, for a day,
+	// with sweeps in two layers.
 	case res.protocolVersion() < int32(peer.MinAcceptableProtocolVersion):
 		return "answered on a protocol we do not accept"
+
+	case !isBSVUserAgent(res.userAgent()):
+		s.banNonBSVHost(addrString)
+
+		return "answered but is not a BSV node"
 
 	default:
 		// Promotes the address from new to tried, which is the entire point of

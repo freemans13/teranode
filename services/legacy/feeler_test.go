@@ -1537,6 +1537,32 @@ func TestJudgeVersionRefusesAnUnacceptableProtocol(t *testing.T) {
 				"a BSV node on an old protocol is unusable, not hostile")
 		})
 	}
+
+	// Parity with the ordinary path, which is the whole point of applying this
+	// rule in the probe at all. serverPeer.OnVersion returns at its protocol
+	// check before it ever looks at the user agent, so a non-BSV client on a
+	// protocol we do not speak is dropped there and never banned. The probe has
+	// to reach the same verdict, because a ban is the widest thing this feature
+	// does - process-wide, for a day, with sweeps in two layers.
+	t.Run("a non-BSV client on a bad protocol is dropped, not banned", func(t *testing.T) {
+		swapTestConfig(t, "")
+
+		srv := newFeelerTestServer(t)
+
+		na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+		srv.addrManager.AddAddress(na, testSourceAddr())
+
+		res := settledFeelerResultAt("/Satoshi:0.21.0/", int32(peer.MinAcceptableProtocolVersion)-1)
+
+		require.Equal(t, "answered on a protocol we do not accept",
+			srv.judgeVersion(na, "8.8.8.8:8333", res, "no version received"))
+
+		require.False(t, srv.banList.IsBanned("8.8.8.8"),
+			"the protocol check must be reached first, exactly as in OnVersion")
+
+		require.NotNil(t, srv.addrManager.UnverifiedAddress(),
+			"and the address is still not promoted")
+	})
 }
 
 // TestFeelerHostKeyMatchesThePeerSnapshot pins the two halves of the
