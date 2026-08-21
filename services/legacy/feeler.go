@@ -381,6 +381,8 @@ func (s *server) feelerProbe() {
 			_ = conn.Close()
 		}
 
+		s.logProbe(addrString, "abandoned, shutting down", "")
+
 		return
 	}
 
@@ -390,13 +392,13 @@ func (s *server) feelerProbe() {
 		// manager's own Dial closure, which a direct dial bypasses, so without
 		// this call the probe would only ever teach the book good news.
 		s.recordFailedDial(netAddr)
-		s.logger.Debugf("[Feeler] Dial %s failed: %v", addrString, err)
+		s.logProbe(addrString, fmt.Sprintf("dial failed: %v", err), "")
 
 		return
 	}
 
 	if s.banList.IsBanned(conn.RemoteAddr().String()) {
-		s.logger.Debugf("[Feeler] %s resolved to a banned address, dropping", addrString)
+		s.logProbe(addrString, "resolved to a banned address", "")
 		_ = conn.Close()
 
 		return
@@ -419,7 +421,7 @@ func (s *server) feelerProbe() {
 	// in neither book. Closing it properly needs a reservation shared across two
 	// subsystems, which is not worth it for a probe.
 	if snap := s.feelerPeerSnapshot(); occupiedByAPeer(snap, na) {
-		s.logger.Debugf("[Feeler] %s is now held by a peer, dropping the probe", addrString)
+		s.logProbe(addrString, "a peer took the host while we dialled", "")
 		_ = conn.Close()
 
 		return
@@ -429,7 +431,7 @@ func (s *server) feelerProbe() {
 
 	p, err := peer.NewOutboundPeer(s.logger, s.settings, s.feelerPeerConfig(res), addrString)
 	if err != nil {
-		s.logger.Debugf("[Feeler] Cannot create peer for %s: %v", addrString, err)
+		s.logProbe(addrString, fmt.Sprintf("cannot build a peer: %v", err), "")
 		_ = conn.Close()
 
 		return
@@ -487,8 +489,25 @@ func (s *server) feelerProbe() {
 	// is not a peer the node lost.
 	p.DisconnectWithLogFunc("feeler probe complete", s.logger.Debugf)
 
+	s.logProbe(addrString, outcome, res.userAgent())
+}
+
+// logProbe reports how one probe ended.
+//
+// At info, and from every path that has already counted an attempt, because the
+// counters in this line are the only place the feeler's work is visible on a
+// running node. These arms used to log at debug, which made the claim that "each
+// probe logs a single line at info" true only of probes that got as far as a
+// handshake — and it hid the most interesting outcome of all. A dial that
+// produced nothing is the feature's whole point: it is how a decayed address book
+// is discovered. On the first mainnet soak eight attempts produced two info
+// lines, so six probes, including every dead address found, left no trace.
+//
+// One line per probe at the default two-minute mean is about thirty an hour,
+// which is nothing next to what the legacy layer already logs per block.
+func (s *server) logProbe(addrString, outcome, userAgent string) {
 	s.logger.Infof("[Feeler] Probe %s: %s (user agent %q, attempted %d, verified %d)",
-		addrString, outcome, res.userAgent(), s.feelerAttempted.Load(), s.feelerVerified.Load())
+		addrString, outcome, userAgent, s.feelerAttempted.Load(), s.feelerVerified.Load())
 }
 
 // attemptIfRunning records a dial attempt against na, unless the node has begun
