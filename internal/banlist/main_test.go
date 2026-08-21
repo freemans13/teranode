@@ -8,8 +8,9 @@ import (
 
 // TestMain fails the package if a test leaves a goroutine running. This package
 // is gated because it can actually fail: before the store cleanup in
-// newTestBanList it reported 112 leaked goroutines on the committed defaults
-// (168 with blockchain_use_in_memory_chain_check enabled), and zero after.
+// newTestBanList it reported around 111 leaked goroutines on the committed
+// defaults, or around 167 with blockchain_use_in_memory_chain_check enabled
+// (4 and 6 per store respectively, across 28 tests), and zero after.
 //
 // The single ignore is gocore's init-time goroutine, which is a bare
 // `go func() { for { ...; time.Sleep(1ms) } }()` with no context and no exit
