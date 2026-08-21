@@ -352,3 +352,26 @@ func TestValidatedReaderBindsSubtreeToKey(t *testing.T) {
 		require.Contains(t, err.Error(), "does not match its key")
 	})
 }
+
+// TestMetaHeaderWireContract pins the layout NewSubtreeMetaFromValidatedReader
+// re-implements. The header offsets are read out of go-subtree's private
+// serializer, and nothing in the type system ties the two together: a dependency
+// bump that changed what Meta.Serialize writes would still compile here and then
+// reject every meta file on disk, sending every block into regeneration and
+// failing every reorg. This asserts the contract against the dependency's own
+// output, so that change fails one test instead.
+func TestMetaHeaderWireContract(t *testing.T) {
+	subtree, metaBytes, _ := buildMetaFixture(t)
+
+	// The sizes are the contract, not an implementation detail: they are what the
+	// reader slices with, so drift on either side has to fail here.
+	require.Equal(t, 4, subtreeMetaEntryCountSize)
+	require.Equal(t, 36, subtreeMetaHeaderSize)
+	require.GreaterOrEqual(t, len(metaBytes), subtreeMetaHeaderSize)
+
+	require.Equal(t, subtree.RootHash()[:], metaBytes[:chainhash.HashSize],
+		"the header must open with the raw root hash the meta was built for")
+
+	require.Equal(t, uint32(subtree.Length()), binary.LittleEndian.Uint32(metaBytes[chainhash.HashSize:subtreeMetaHeaderSize]),
+		"the entry count must be a little-endian uint32 of Length(), immediately after the root hash")
+}
