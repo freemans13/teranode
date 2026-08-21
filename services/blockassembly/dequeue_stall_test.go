@@ -211,13 +211,16 @@ func TestObserveDequeueStall_Transitions(t *testing.T) {
 			wantFor: time.Minute - dequeueStallThreshold,
 		},
 		{
-			name: "clockStepBackDoesNotReportANegativeDuration",
-			// Both ends of the duration are a wall-clock reading minus the
-			// staleness at that reading, and time.Now() is not monotonic across
-			// an NTP correction. Here the incident opened at stallBase and the
-			// clock then stepped back five minutes, so the raw subtraction is
-			// about -5m. An operator reading "was stalled for -5m0s" learns
-			// nothing, so it is floored - the same treatment the gauge gets.
+			name: "backwardsClockDoesNotReportANegativeDuration",
+			// Reachable only from this table, and kept deliberately. The
+			// running service hands in time.Now(), whose monotonic reading
+			// survives Add and is the only thing Sub consults, so no NTP step
+			// can invert the subtraction there. stallBase is a time.Date value
+			// with no monotonic reading, which puts the wall clock back in
+			// charge: the incident opens at stallBase and the closing tick is
+			// five minutes earlier, so the raw subtraction is about -5m. A
+			// caller handed "was stalled for -5m0s" learns nothing, so the
+			// pure function floors it rather than relying on who calls it.
 			state:       stalledState(0, 0),
 			now:         stallBase.Add(-5 * time.Minute),
 			staleness:   time.Second,

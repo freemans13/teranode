@@ -151,14 +151,20 @@ func observeDequeueStall(state dequeueStallState, now time.Time, queueLength int
 		// staleness, which is up to dequeueStallThreshold plus a tick. Timing
 		// to now would add that to every reported duration.
 		//
-		// Both ends of that subtraction are a wall-clock reading minus the
-		// staleness at that reading, so each is the moment of a dequeue. The
-		// later dequeue happened after the earlier one, so the difference is
-		// positive whenever the clock advances monotonically between the two
-		// ticks - but time.Now() is not monotonic across an NTP step, and a
-		// backward step between the opening and closing tick would otherwise
-		// report a negative duration. Floored for the same reason the gauge
-		// itself is floored in sampleBlockAssemblerMetrics.
+		// Both ends of that subtraction are a clock reading minus the
+		// staleness at that reading, so each is the moment of a dequeue, and
+		// the later dequeue follows the earlier one. In the running service
+		// the difference cannot go negative, and not because the wall clock
+		// behaves: now comes from time.Now(), Add carries its monotonic
+		// reading through, and Sub between two readings that both carry one
+		// ignores the wall clock entirely - so an NTP step cannot invert it.
+		//
+		// Floored anyway, because the clock here is only a parameter. This
+		// function is pure precisely so the table test can drive it with
+		// time.Date values, which carry no monotonic reading and so restore
+		// every wall-clock hazard the service itself is immune to. Returning
+		// "was stalled for -5m0s" for an input a caller can construct is not
+		// worth the two lines saved.
 		stalledFor := now.Add(-staleness).Sub(state.stalledSince)
 		if stalledFor < 0 {
 			stalledFor = 0
