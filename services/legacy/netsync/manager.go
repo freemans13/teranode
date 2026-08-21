@@ -697,7 +697,7 @@ type SyncManager struct {
 	// currentCached is the last answer current() worked out, so a peer goroutine
 	// can read it without making the blockchain call itself. See IsCurrentCached.
 	currentCached atomic.Bool
-	headerList       *list.List
+	headerList    *list.List
 	// headerIndex resolves a block hash to its element in headerList in O(1),
 	// so a caller does not have to walk the list to find a header. Guarded by
 	// headerMu, and maintained at every single place headerList changes —
