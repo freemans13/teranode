@@ -64,7 +64,7 @@ const (
 	// a full pass takes 32 ticks, sixteen minutes, comfortably inside the half
 	// hour — and it is still only 128 sequential chain lookups per thirty
 	// seconds on the commit goroutine, which is well under a percent of it.
-	// TestBlockPark_TheSweepCanCoverAFullParkBeforeItsBlocksExpire holds the
+	// TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires holds the
 	// arithmetic to this.
 	parkSweepRPCBudget = 128
 
@@ -783,7 +783,7 @@ func (p *blockPark) Recover(ctx context.Context) {
 
 		case strings.HasPrefix(name, "."):
 			// A write that a crash interrupted. The store names its in-progress
-			// file ".<name>.<pid>.tmp", and nothing else writes to this
+			// file ".<name>.<random>.tmp", and nothing else writes to this
 			// directory, so at Start() none of these can be live.
 			p.removeParkFile(name)
 

@@ -1672,28 +1672,6 @@ func (sm *SyncManager) headerListLocator(bestHash *chainhash.Hash) []*chainhash.
 	return locator
 }
 
-// headerListBackHash returns the hash of the last header in the list.
-func (sm *SyncManager) headerListBackHash() (chainhash.Hash, bool) {
-	sm.headerMu.Lock()
-	defer sm.headerMu.Unlock()
-
-	if sm.headerList == nil {
-		return chainhash.Hash{}, false
-	}
-
-	e := sm.headerList.Back()
-	if e == nil {
-		return chainhash.Hash{}, false
-	}
-
-	node, ok := e.Value.(*headerNode)
-	if !ok || node.hash == nil {
-		return chainhash.Hash{}, false
-	}
-
-	return *node.hash, true
-}
-
 // topBlock returns the best chains top block height
 func (sm *SyncManager) topBlock() int32 {
 	sp := sm.loadSyncPeer()

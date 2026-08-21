@@ -28,11 +28,17 @@
 | BlockFailureBackoffBase | time.Duration | 5s | legacy_blockFailureBackoffBase | Base per-block backoff after a transient storage/service failure (0 disables) |
 | BlockFailureBackoffMaxDuration | time.Duration | 150s | legacy_blockFailureBackoffMaxDuration | Cap on the per-block backoff window and the failure-tracking map TTL, kept below the 180s sync-peer stall window (0 disables) |
 | BlockPrefetchBufferBytes | int64 | 268435456 | legacy_blockPrefetchBufferBytes | Byte budget for blocks downloaded ahead of processing during sync (0 disables prefetch) |
+| BlockDownloadTimeoutBasePercent | int64 | 100 | legacy_blockDownloadTimeoutBasePercent | Ceiling on one block download at the chain tip, as a percentage of the target block interval |
+| BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up, when blocks are larger and validation backpressure delays the read loop |
+| BlockDownloadTimeoutPerPeerPercent | int64 | 50 | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling allowed per other peer we are downloading from, since our downstream link is shared |
 | MaxBlockParallelFetch | int | 2 | legacy_maxBlockParallelFetch | Maximum peers downloading the same stalled frontier block at once (1 disables racing) |
 | BlockSlowFetchTimeout | time.Duration | 20s | legacy_blockSlowFetchTimeout | How long the download frontier may sit unchanged before a second peer is asked for the same block (0 disables racing) |
 | MultiPeerBlockDownload | bool | true | legacy_multiPeerBlockDownload | Download block bodies from every eligible peer during legacy sync (false restores the single-sync-peer path) |
 | MaxBlocksInTransitPerPeer | int | 16 | legacy_maxBlocksInTransitPerPeer | Maximum block bodies one peer may be downloading at once (the block-size ladder lowers it further for large blocks) |
 | BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Maximum block bodies the whole node may be downloading at once, counting every peer together |
+| ParkOutOfOrderBlocks | bool | true | legacy_parkOutOfOrderBlocks | Write a block whose parent is not stored yet to the temp store and commit it when the parent arrives, instead of discarding it |
+| ParkMaxBytes | int64 | 4294967296 | legacy_parkMaxBytes | Ceiling on the total serialized bytes of out-of-order blocks held on disk (0 disables the park) |
+| ParkStoreTimeout | time.Duration | 10s | legacy_parkStoreTimeout | Deadline carried by each park blob store operation, bounding the wait for the file store's shared permits on the in-order block commit goroutine |
 | Upnp | bool | false | legacy_upnp | Enable UPnP for automatic port mapping |
 
 ## Configuration Dependencies

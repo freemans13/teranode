@@ -3,6 +3,7 @@ package netsync
 import (
 	"container/list"
 	"context"
+	"encoding/binary"
 	"sync"
 	"testing"
 	"time"
@@ -655,4 +656,67 @@ func TestPublishFrontier(t *testing.T) {
 		defer sm.frontierMu.Unlock()
 		require.Equal(t, chainhash.Hash{}, sm.frontierHash)
 	})
+}
+
+// TestFrontierRace_AFullLedgerDoesNotSuppressTheRaceForever proves that a race
+// abandoned because the download ledger was full leaves nothing behind. The
+// registration is taken back out, so once there is room again the same frontier
+// block can still be raced.
+//
+// Getting this wrong is permanent, not transient: the abandoned registration
+// counts towards legacy_maxBlockParallelFetch, and the frontier only moves when
+// the block arrives — so the one block holding up sync would never be raced by
+// anybody again.
+func TestFrontierRace_AFullLedgerDoesNotSuppressTheRaceForever(t *testing.T) {
+	sm := newRaceManager(t)
+
+	// The sync peer is put below the frontier height so it is ruled out as a
+	// racer by the "has it told us it has the block" test, leaving exactly one
+	// eligible peer. Otherwise either peer could be picked, since a frontier
+	// nobody owes rules nobody out.
+	syncPeer, _, syncRec := connectRacePeer(t, 1, 100)
+	other, _, otherRec := connectRacePeer(t, 2, 1000)
+
+	registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, other)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	// Fill the ledger with blocks owed by the sync peer, deliberately leaving
+	// the frontier itself out of it: that is the one case the size cap can turn
+	// a race away, a frontier whose own record aged out while the ledger stayed
+	// full.
+	filler := make([]chainhash.Hash, 0, maxTrackedBlockDownloads)
+
+	for i := 0; i < maxTrackedBlockDownloads; i++ {
+		var h chainhash.Hash
+
+		binary.LittleEndian.PutUint32(h[:4], uint32(i))
+		h[31] = 0xfe // keep every filler clear of the frontier hash below
+
+		require.True(t, sm.blockDownloads.Add(syncPeer, h), "filling the ledger should succeed")
+
+		filler = append(filler, h)
+	}
+
+	frontier := chainhash.Hash{0xaa}
+	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
+
+	sm.raceFrontierBlock(time.Now())
+
+	require.Zero(t, otherRec.count(), "a full ledger cannot authorise a reply, so nothing may go out on the wire")
+	require.Zero(t, syncRec.count(), "the peer that cannot have the block must never be asked")
+	require.False(t, sm.blockDownloads.HasOwner(other, frontier), "the racer must not be recorded as an owner")
+
+	// The end state that matters: the race is still available. Make one slot of
+	// room and the very same frontier block must be raced to the very same peer.
+	sm.blockDownloads.Remove(filler[0])
+
+	sm.raceFrontierBlock(time.Now())
+
+	require.True(t, WaitUntil(func() bool { return otherRec.count() > 0 }, 5*time.Second),
+		"once there is room the stuck frontier block must still be raceable")
+	require.Equal(t, []chainhash.Hash{frontier}, otherRec.all(),
+		"the second peer should be asked for the stuck block and nothing else")
+	require.True(t, sm.blockDownloads.HasOwner(other, frontier),
+		"the second peer's reply must be authorised in advance")
 }

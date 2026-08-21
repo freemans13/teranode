@@ -290,7 +290,14 @@ func (sm *SyncManager) raceFrontierBlock(now time.Time) {
 	// ceiling while the ledger stayed full. Racing a block we cannot vouch for
 	// would punish the peer that answered, so we let the stall stand instead.
 	if !sm.blockDownloads.Add(target, hash) {
+		// Take the racer registration back out. Leaving it in place would count
+		// towards maxRacing for as long as the frontier sits on this block, and
+		// the frontier only moves when the block arrives — so the one block
+		// holding up sync would never be raced again by anybody.
+		sm.unregisterFrontierRacer(hash, target)
+
 		sm.logger.Warnf("[raceFrontierBlock] block download ledger full at %d blocks, not racing %s", maxTrackedBlockDownloads, hash)
+
 		return
 	}
 
@@ -336,6 +343,20 @@ func (sm *SyncManager) registerFrontierRacer(hash chainhash.Hash, p *peerpkg.Pee
 	sm.frontierRacers[p] = struct{}{}
 
 	return true
+}
+
+// unregisterFrontierRacer undoes registerFrontierRacer for a race that was
+// abandoned before its getdata went out. It is a no-op once the frontier has
+// moved on, because the registration it would remove belongs to a later block.
+func (sm *SyncManager) unregisterFrontierRacer(hash chainhash.Hash, p *peerpkg.Peer) {
+	sm.frontierMu.Lock()
+	defer sm.frontierMu.Unlock()
+
+	if sm.frontierHash != hash {
+		return
+	}
+
+	delete(sm.frontierRacers, p)
 }
 
 // noteRaceWinner is called when a block we had raced is delivered. It cancels
