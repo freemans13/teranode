@@ -116,6 +116,7 @@ func TestLastValidatedBlocksEviction_DoesNotStallTheCache(t *testing.T) {
 
 			return released
 		})
+	defer m.Stop()
 
 	blockHash := *block.Hash()
 	m.Set(blockHash, block)
