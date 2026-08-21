@@ -1478,11 +1478,198 @@ func TestJudgeVersionRefusesToPromoteWhileShuttingDown(t *testing.T) {
 }
 
 // settledFeelerResult is a feelerResult that has already taken a version, as one
-// woken by res.done would be.
+// woken by res.done would be, announcing a protocol the node accepts.
 func settledFeelerResult(userAgent string) *feelerResult {
+	return settledFeelerResultAt(userAgent, int32(wire.ProtocolVersion))
+}
+
+// settledFeelerResultAt is the same, at a chosen protocol version.
+func settledFeelerResultAt(userAgent string, protocol int32) *feelerResult {
 	res := &feelerResult{done: make(chan struct{})}
 	res.ua = userAgent
+	res.protocol = protocol
 	res.once.Do(func() { close(res.done) })
 
 	return res
+}
+
+// TestJudgeVersionRefusesAnUnacceptableProtocol pins the probe against being
+// laxer than the path it feeds.
+//
+// The ordinary outbound path drops a peer below MinAcceptableProtocolVersion
+// without ever marking its address good. The probe has to apply the same rule
+// itself: the peer package applies it only after invoking the OnVersion listener
+// this probe promotes from, so res.done is already closed by the time the peer
+// package rejects. Promotion can evict an existing tried entry, so verifying an
+// address the node then declines to dial costs a usable peer.
+//
+// Not a ban, unlike a non-BSV user agent. The host is a BSV node on a protocol
+// we will not speak, so the address is honestly reachable and merely unusable.
+func TestJudgeVersionRefusesAnUnacceptableProtocol(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		protocol    int32
+		wantOutcome string
+		wantVerdict bool
+	}{
+		{name: "current protocol promotes", protocol: int32(wire.ProtocolVersion), wantOutcome: "verified", wantVerdict: true},
+		{name: "the minimum we accept promotes", protocol: int32(peer.MinAcceptableProtocolVersion), wantOutcome: "verified", wantVerdict: true},
+		{name: "one below the minimum does not", protocol: int32(peer.MinAcceptableProtocolVersion) - 1, wantOutcome: "answered on a protocol we do not accept"},
+		{name: "an unset protocol does not", protocol: 0, wantOutcome: "answered on a protocol we do not accept"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			swapTestConfig(t, "")
+
+			srv := newFeelerTestServer(t)
+
+			na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+			srv.addrManager.AddAddress(na, testSourceAddr())
+
+			res := settledFeelerResultAt("/Bitcoin SV:1.1.0/", tt.protocol)
+
+			require.Equal(t, tt.wantOutcome,
+				srv.judgeVersion(na, "8.8.8.8:8333", res, "no version received"))
+
+			require.Equal(t, tt.wantVerdict, srv.addrManager.UnverifiedAddress() == nil,
+				"only an acceptable protocol moves the address out of the new table")
+
+			require.False(t, srv.banList.IsBanned("8.8.8.8"),
+				"a BSV node on an old protocol is unusable, not hostile")
+		})
+	}
+}
+
+// TestFeelerHostKeyMatchesThePeerSnapshot pins the two halves of the
+// "never a host we are already talking to" rule against drifting apart.
+//
+// peerState.connectedHosts keys on the host part of a peer's dial string, which
+// NetAddressKey builds. The filter used to key on na.IP.String() instead. For
+// IPv4 and IPv6 literals the two happen to agree, so nothing showed; for an
+// OnionCat address they never do — the dial string carries the .onion name and
+// the raw IP the fd87:d87e:eb43: form — and the rule was silently blind to every
+// Tor peer the node had.
+func TestFeelerHostKeyMatchesThePeerSnapshot(t *testing.T) {
+	onion := make(net.IP, net.IPv6len)
+	copy(onion, net.ParseIP("fd87:d87e:eb43::"))
+
+	for i := 6; i < net.IPv6len; i++ {
+		onion[i] = byte(i)
+	}
+
+	for _, tt := range []struct {
+		name string
+		ip   net.IP
+	}{
+		{name: "ipv4", ip: net.ParseIP("8.8.8.8")},
+		{name: "ipv6", ip: net.ParseIP("2001:4860:4860::8888")},
+		{name: "onioncat", ip: onion},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			na := wire.NewNetAddressIPPort(tt.ip, 8333, wire.SFNodeNetwork)
+
+			// Exactly how connectedHosts derives its key, from exactly the string
+			// a peer is dialled with.
+			wantHost, _, err := net.SplitHostPort(addrmgr.NetAddressKey(na))
+			require.NoError(t, err)
+
+			require.Equal(t, wantHost, feelerHostKey(na),
+				"the probe must name a host the same way the peer snapshot does")
+
+			require.True(t, occupiedByAPeer(feelerSnapshot{
+				hosts: map[string]struct{}{wantHost: {}},
+			}, na), "a host the node is talking to must read as occupied")
+		})
+	}
+
+	t.Run("onioncat is not matched by its raw ip", func(t *testing.T) {
+		na := wire.NewNetAddressIPPort(onion, 8333, wire.SFNodeNetwork)
+
+		require.NotEqual(t, na.IP.String(), feelerHostKey(na),
+			"this is the disagreement the bug lived in; if these ever match, "+
+				"the onioncat case above has stopped testing anything")
+
+		require.False(t, occupiedByAPeer(feelerSnapshot{
+			hosts: map[string]struct{}{na.IP.String(): {}},
+		}, na), "the raw-IP key is the one that never appears in a snapshot")
+	})
+}
+
+// TestFeelerProbeDropsAHostAPeerTookDuringTheDial pins the re-check between the
+// dial and the handshake.
+//
+// The snapshot feelerCandidate filters against is taken before the dial, which
+// can take the whole connect timeout, so it is stale by the time the socket is
+// up. svnode re-checks at the same point, in OpenNetworkConnection. The window
+// is real: probing is only allowed at target, so a probe starts, an outbound
+// drops, and replenishment — which counts established peers only — immediately
+// dials the same address the probe is sitting on, because Good has not run yet.
+//
+// The probe must give the host up rather than hold a second connection to a peer
+// the node is mid-download from.
+func TestFeelerProbeDropsAHostAPeerTookDuringTheDial(t *testing.T) {
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+
+	for _, tt := range []struct {
+		name         string
+		taken        bool
+		wantVerified uint64
+	}{
+		{name: "nobody took it, the probe runs", wantVerified: 1},
+		{name: "a peer took it, the probe gives up", taken: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, _ := startFeelerTestListener(t, "/Bitcoin SV:1.1.0/")
+
+			swapTestConfig(t, ln.Addr().String())
+
+			srv := newFeelerTestServer(t)
+			atLeastTwoAutomaticPeers(t, srv)
+			srv.addrManager.AddAddress(na, testSourceAddr())
+
+			// The snapshot the candidate filter sees is empty either way, so the
+			// address is always selected. What changes is the snapshot served to
+			// the re-check after the dial — which is the whole point: a filter
+			// that passed, then a peer that arrived.
+			snaps := []feelerSnapshot{{}}
+			if tt.taken {
+				snaps = append(snaps, feelerSnapshot{
+					hosts: map[string]struct{}{feelerHostKey(na): {}},
+				})
+			}
+
+			serveFeelerSnapshotSequence(srv, snaps)
+
+			runOneProbe(srv)
+
+			require.Equal(t, tt.wantVerified, srv.feelerVerified.Load(),
+				"a host a peer has taken must not be probed through to promotion")
+
+			require.Equal(t, tt.taken, srv.addrManager.UnverifiedAddress() != nil,
+				"and the address must stay put when the probe gives up")
+		})
+	}
+}
+
+// serveFeelerSnapshotSequence answers the probe's snapshot queries with each
+// snapshot in turn, repeating the last one once the list runs out. It stands in
+// for a peer handler whose answer changes while the probe is dialling.
+func serveFeelerSnapshotSequence(srv *server, snaps []feelerSnapshot) {
+	go func() {
+		i := 0
+
+		for {
+			select {
+			case <-srv.quit:
+				return
+			case q := <-srv.query:
+				if msg, ok := q.(getFeelerSnapshotMsg); ok {
+					msg.reply <- snaps[i]
+
+					if i < len(snaps)-1 {
+						i++
+					}
+				}
+			}
+		}
+	}()
 }

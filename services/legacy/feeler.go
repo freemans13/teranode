@@ -343,9 +343,14 @@ func (s *server) feelerHandler() {
 // it would count it against the outbound target and dial a replacement when
 // it hung up.
 //
-// svnode can afford to route its feeler through the ordinary path because its
-// probes live well under a second; ours is asked to claim nothing at all, so it
-// drives a bare peer and calls the address book itself.
+// svnode can afford to route its feeler through its ordinary path because that
+// path has no equivalent accounting to corrupt — its feeler permit is added to
+// the outbound semaphore rather than counted against a target. Ours is asked to
+// claim nothing at all, so it drives a bare peer and calls the address book
+// itself. Not, as this comment used to say, because svnode's probes live under a
+// second: they use the ordinary handshake and can sit until
+// DEFAULT_P2P_HANDSHAKE_TIMEOUT_INTERVAL, which is sixty seconds (net.h:86) —
+// longer than ours.
 func (s *server) feelerProbe() {
 	defer func() { s.feelerTokens <- struct{}{} }()
 
@@ -392,6 +397,29 @@ func (s *server) feelerProbe() {
 
 	if s.banList.IsBanned(conn.RemoteAddr().String()) {
 		s.logger.Debugf("[Feeler] %s resolved to a banned address, dropping", addrString)
+		_ = conn.Close()
+
+		return
+	}
+
+	// The snapshot feelerCandidate filtered against was taken before the dial,
+	// which can have taken the full connect timeout to complete, so by now it is
+	// stale. svnode re-checks the same thing at the same point, with FindNode
+	// inside OpenNetworkConnection (net.cpp:2118), for exactly this reason.
+	//
+	// The window is not theoretical. Probing is only allowed at target, so a
+	// probe starts; an outbound peer then drops; AutomaticOutboundCount counts
+	// established peers only, so replenishment dials immediately and can draw the
+	// very address this probe is sitting on, because Good has not run yet. The
+	// probe is invisible to the connection manager and cannot be deduped against,
+	// so the collision has to be given up from this side. Two connections to one
+	// host is a good way to lose the first, and here the first is a real peer.
+	//
+	// This narrows the window rather than closing it: a dial already in flight is
+	// in neither book. Closing it properly needs a reservation shared across two
+	// subsystems, which is not worth it for a probe.
+	if snap := s.feelerPeerSnapshot(); occupiedByAPeer(snap, na) {
+		s.logger.Debugf("[Feeler] %s is now held by a peer, dropping the probe", addrString)
 		_ = conn.Close()
 
 		return
@@ -506,6 +534,21 @@ func (s *server) judgeVersion(na *wire.NetAddress, addrString string, res *feele
 
 		return "answered but is not a BSV node"
 
+	// Not banned, unlike a non-BSV user agent: this is a BSV node, just one on a
+	// protocol the node will not speak, so the address is honestly reachable and
+	// only unusable. It must still not be promoted, because the ordinary outbound
+	// path refuses it too (peer_server.go, OnVersion) and a probe laxer than the
+	// path it feeds would verify addresses the node then declines to use. Good
+	// can evict an existing tried entry, so promoting one would cost a usable
+	// peer for an unusable address.
+	//
+	// The check has to be here rather than left to the peer package. That package
+	// applies the same rule, but only after it has invoked this OnVersion
+	// listener (peer.go:2783 against the callback at :2774), so res.done is
+	// already closed by the time it rejects.
+	case res.protocolVersion() < int32(peer.MinAcceptableProtocolVersion):
+		return "answered on a protocol we do not accept"
+
 	default:
 		// Promotes the address from new to tried, which is the entire point of
 		// the exercise. svnode's feeler clears the same bar at the same moment,
@@ -516,6 +559,41 @@ func (s *server) judgeVersion(na *wire.NetAddress, addrString string, res *feele
 
 		return "verified"
 	}
+}
+
+// feelerHostKey is how the probe names a host when asking whether the node is
+// already talking to it.
+//
+// It has to match how peerState.connectedHosts names one, which is the host part
+// of a peer's dial string. NetAddressKey builds that same string, so taking its
+// host part keeps the two in step whatever the address format — including
+// OnionCat, where the dial string carries the .onion name and the raw IP does
+// not. On a split failure the whole address is returned, which cannot match any
+// host key, so an unparseable address is treated as unheld rather than silently
+// matching everything.
+func feelerHostKey(na *wire.NetAddress) string {
+	key := addrmgr.NetAddressKey(na)
+
+	host, _, err := net.SplitHostPort(key)
+	if err != nil {
+		return key
+	}
+
+	return host
+}
+
+// occupiedByAPeer reports whether a snapshot of the node's peers already covers
+// na, either at its host or anywhere in its network segment. It is the same pair
+// of tests feelerCandidate applies at selection, asked again once the socket is
+// up against a snapshot that is no longer stale.
+func occupiedByAPeer(snap feelerSnapshot, na *wire.NetAddress) bool {
+	if _, held := snap.hosts[feelerHostKey(na)]; held {
+		return true
+	}
+
+	_, occupied := snap.outboundGroups[addrmgr.GroupKey(na)]
+
+	return occupied
 }
 
 // shuttingDown reports whether the server has begun shutting down. Used by the
@@ -573,10 +651,11 @@ func (s *server) banNonBSVHost(addrString string) {
 
 // feelerResult carries what the probe learned out of the peer callback.
 type feelerResult struct {
-	mtx  sync.Mutex
-	ua   string
-	once sync.Once
-	done chan struct{}
+	mtx      sync.Mutex
+	ua       string
+	protocol int32
+	once     sync.Once
+	done     chan struct{}
 }
 
 func (r *feelerResult) userAgent() string {
@@ -584,6 +663,14 @@ func (r *feelerResult) userAgent() string {
 	defer r.mtx.Unlock()
 
 	return r.ua
+}
+
+// protocolVersion returns the version the remote announced.
+func (r *feelerResult) protocolVersion() int32 {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+
+	return r.protocol
 }
 
 // feelerPeerConfig is a throwaway peer configuration with exactly one listener.
@@ -598,6 +685,7 @@ func (s *server) feelerPeerConfig(res *feelerResult) *peer.Config {
 			OnVersion: func(_ *peer.Peer, msg *wire.MsgVersion) *wire.MsgReject {
 				res.mtx.Lock()
 				res.ua = msg.UserAgent
+				res.protocol = msg.ProtocolVersion
 				res.mtx.Unlock()
 
 				res.once.Do(func() { close(res.done) })
@@ -660,19 +748,16 @@ func (s *server) feelerCandidate() *wire.NetAddress {
 			continue
 		}
 
-		// Never a host the node is already talking to. A second connection to a
-		// peer we are mid-download from is a good way to lose the first one.
-		// The netgroup set below cannot stand in for this: it is derived from
-		// the automatic outbound list alone, so inbound and named peers are
-		// invisible to it.
-		if _, held := snap.hosts[na.IP.String()]; held {
-			continue
-		}
-
-		// Never a netgroup an automatic outbound peer occupies, so a probe can
-		// never be mistaken for the node claiming a second address in a segment
-		// it already reaches.
-		if _, occupied := snap.outboundGroups[addrmgr.GroupKey(na)]; occupied {
+		// Never a host the node is already talking to, and never a netgroup an
+		// automatic outbound peer occupies. Both tests live in occupiedByAPeer,
+		// which the probe asks again once its socket is up; sharing them is what
+		// stops the two copies drifting apart.
+		//
+		// Unlike svnode, which abandons the whole pass on a netgroup collision
+		// (net.cpp:1882), this skips the address and keeps looking. A collision is
+		// a property of the address, not of the moment, so giving up the slot for
+		// two minutes over one would waste the probe.
+		if occupiedByAPeer(snap, na) {
 			continue
 		}
 
