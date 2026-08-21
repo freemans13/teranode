@@ -201,6 +201,20 @@ func TestReleaseCatchupLock_StorageErrorIsLocalNotPeer(t *testing.T) {
 			name: "truncated blob surfacing as unexpected EOF",
 			err:  errors.NewStorageError("[GetTxFromExternalStore][abc] could not read tx from stream", errors.NewProcessingError("unexpected EOF")),
 		},
+		{
+			// The laundering shape: a storage fault wrapped in a consensus code, which
+			// is what the aerospike store produced for its own bins' read failures.
+			// errors.Is walks the whole chain, so both codes match — and the switch
+			// used to test the consensus case first, scoring this a validation_failure
+			// and flagging an honest peer for our own disk. Pins the case ordering.
+			name: "storage fault wrapped in a consensus code",
+			err:  errors.NewTxInvalidError("could not process utxos", errors.NewStorageError("failed to get extra record")),
+		},
+		{
+			// Same shape from the other direction: the block-level consensus code.
+			name: "storage fault wrapped in a block-invalid code",
+			err:  errors.NewBlockInvalidError("block failed validation", errors.NewStorageError("failed to get block ID")),
+		},
 	}
 
 	for _, tc := range cases {
@@ -672,6 +686,61 @@ func TestReleaseCatchupLock_HeaderContextErrorIsNotChargedToPeer(t *testing.T) {
 			defer blocker.mu.Unlock()
 			require.False(t, blocker.maliciousCalled, "a local header-context failure must not report malicious")
 			require.False(t, blocker.errorCalled, "a local header-context failure must not charge the peer")
+		})
+	}
+}
+
+// TestReleaseCatchupLock_ContextErrorIsNotChargedToPeer pins that a shutdown or
+// a catchup-context deadline is never the serving peer's fault.
+//
+// There was no case for a context error in the classification switch at all, so
+// it fell past every branch to "unknown_error" with isPeerError left true, and
+// the honest primary was charged for our own shutdown. recordCatchupPeerFailure
+// has always exempted it (via IsLocalError); this makes the terminal path agree.
+func TestReleaseCatchupLock_ContextErrorIsNotChargedToPeer(t *testing.T) {
+	header := testhelpers.CreateTestHeaders(t, 1)[0]
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{name: "cancelled", err: errors.NewContextCanceledError("catchup context cancelled")},
+		{
+			// Deadline text contains no network token, but must be exempt on class
+			// rather than by luck.
+			name: "deadline exceeded",
+			err:  errors.NewContextCanceledError("context deadline exceeded while catching up"),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _, _, cleanup := setupTestCatchupServer(t)
+			defer cleanup()
+
+			recorder := newPeerFailureRecordingP2PClient()
+			server.p2pClient = recorder
+
+			ctx := &CatchupContext{
+				blockUpTo: &model.Block{Header: header, Height: 1000},
+				baseURL:   "http://honest-primary:8000",
+				peerID:    "honest-primary",
+				startTime: time.Now(),
+			}
+			require.NoError(t, server.acquireCatchupLock(ctx))
+
+			relErr := tc.err
+			server.releaseCatchupLock(ctx, &relErr)
+
+			recorder.mu.Lock()
+			defer recorder.mu.Unlock()
+
+			require.Equal(t, 0, recorder.failuresByPeer["honest-primary"],
+				"our own context cancellation must never be charged to the serving peer")
+
+			require.NotNil(t, server.previousCatchupAttempt)
+			require.Equal(t, "local_context_cancelled", server.previousCatchupAttempt.ErrorType,
+				"must not fall through to unknown_error, which leaves isPeerError true")
 		})
 	}
 }
