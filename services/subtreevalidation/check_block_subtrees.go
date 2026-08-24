@@ -412,7 +412,11 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 	if request.BaseUrl != "" {
 		if err := util.ValidateURL(request.BaseUrl); err != nil {
-			return nil, wrapCheckBlockSubtreesErr(errors.NewInvalidArgumentError("[CheckBlockSubtrees] invalid BaseUrl: %v", err))
+			// No %v verb: errors.New* consumes a trailing error argument as the
+			// wrapped link before formatting, so the verb would survive literally.
+			// That was cosmetic while this site returned bare, but the wrap puts
+			// the outermost message on the status line the caller logs.
+			return nil, wrapCheckBlockSubtreesErr(errors.NewInvalidArgumentError("[CheckBlockSubtrees] invalid BaseUrl", err))
 		}
 	}
 

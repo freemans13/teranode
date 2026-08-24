@@ -16,10 +16,13 @@ import (
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	utxometa "github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // startCheckBlockSubtreesGRPC stands the given *Server up behind a real in-process
@@ -234,4 +237,63 @@ func TestCheckBlockSubtrees_GRPCHoldsBackBatchTxInvalidCode(t *testing.T) {
 	// that triggers irreversible action is withheld.
 	require.Contains(t, err.Error(), "simulated consensus violation",
 		"the underlying reason must survive as text: %v", err)
+}
+
+// TestCheckBlockSubtrees_GRPCPreservesInvalidBaseUrlCode covers the BaseUrl guard,
+// the one return site whose gRPC transport status is not codes.Internal.
+//
+// It matters twice over. The code has to survive so a caller can tell "you sent me
+// a bad request" from "my disk broke", and the message has to be legible: because
+// the wrap moves the chain into status details, the outermost message is now the
+// whole of what a caller sees on the default log path. A format verb left
+// unformatted there would be the entire error text.
+func TestCheckBlockSubtrees_GRPCPreservesInvalidBaseUrlCode(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// The package default is on; set it explicitly so the assertion cannot be
+	// silently voided by another test in this package turning it off.
+	util.SetSSRFProtection(true)
+	t.Cleanup(func() { util.SetSSRFProtection(true) })
+
+	block, _ := blockWithOneSubtree(t)
+
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	client := startCheckBlockSubtreesGRPC(t, server)
+
+	// The canonical SSRF target: link-local, so ValidateURL rejects it.
+	_, err = client.CheckBlockSubtrees(context.Background(), &subtreevalidation_api.CheckBlockSubtreesRequest{
+		Block:   blockBytes,
+		BaseUrl: "http://169.254.169.254/subtree",
+	})
+	require.Error(t, err)
+
+	require.Equal(t, codes.InvalidArgument, status.Code(err),
+		"a malformed request must not cross as an internal server fault: %v", err)
+
+	unwrapped := errors.UnwrapGRPC(err)
+
+	require.True(t, errors.Is(unwrapped, errors.ErrInvalidArgument),
+		"caller lost ERR_INVALID_ARGUMENT across the gRPC boundary: %v", unwrapped)
+
+	require.Contains(t, unwrapped.Error(), "169.254.169.254",
+		"the rejected address must survive so an operator can act on it: %v", unwrapped)
+
+	// Guards the format string on the return site. errors.New* consumes a trailing
+	// error argument as the wrapped link before formatting, so a "%v" in the message
+	// is never substituted and would reach the caller literally.
+	require.NotContains(t, status.Convert(err).Message(), "%v",
+		"unformatted verb in the status message a caller logs: %q", status.Convert(err).Message())
+}
+
+// TestWrapCheckBlockSubtreesErrNilPassthrough pins the helper's nil contract.
+//
+// Several call sites hand it the result of an operation that may have succeeded;
+// if the helper ever manufactured an error out of nil, CheckBlockSubtrees would
+// fail requests that worked.
+func TestWrapCheckBlockSubtreesErrNilPassthrough(t *testing.T) {
+	require.NoError(t, wrapCheckBlockSubtreesErr(nil))
+	require.Nil(t, wrapCheckBlockSubtreesErr(nil))
 }
