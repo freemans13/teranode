@@ -376,14 +376,15 @@ func (ba *BlockAssembly) sampleBlockAssemblerMetrics(stallState dequeueStallStat
 
 // reportDequeueStall logs the opening or a repeat of a dequeue stall.
 //
-// Which of the three consumer lifecycle states explains the incident decides
-// the message. The two lifecycle faults also fix their own level, because
-// there the answer does not depend on depth: a consumer that has not started
-// yet is routine startup and reports at info however much is queued behind it,
-// and one that has exited is a dead service and reports at error even on an
-// empty queue. Only for a consumer that exists and is merely not dequeuing
-// does the level follow whether the queue has held work at any point during
-// the incident - and there it must, because a consumer that has not reached
+// Which of the three consumer lifecycle states explains the incident picks the
+// arm, and within an arm the event picks the opening wording from the repeat.
+// The two lifecycle faults fix their own level, because there the answer does
+// not depend on depth: a consumer that has not started yet is routine startup
+// and reports at info however much is queued behind it, and one that has
+// exited is a dead service and reports at error even on an empty queue. Only
+// for a consumer that exists and is merely not dequeuing do the message and
+// the level both follow whether the queue has held work at any point during
+// the incident - and there they must, because a consumer that has not reached
 // its dequeue branch for the threshold is always worth a record, but only work
 // stacking up behind it means anything is at risk. A large moveForwardBlock on
 // a quiet node trips the threshold legitimately and reports at info; the same
