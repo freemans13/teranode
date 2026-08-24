@@ -1892,14 +1892,16 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 					bufioReaderPool.Put(bufferedReader)
 				}()
 
+				// No retry here. It used to re-run the deserialize on the same
+				// partially-consumed bufferedReader with no re-fetch and no reset, so
+				// it read leftover bytes as a fresh root hash, fees and numLeaves: it
+				// could not recover a truncated read, and could ask nodeAlloc for a
+				// second array sized from garbage while never returning the first. The
+				// transient EOF the old comment described is already covered by
+				// findSubtree above, which retries the fetch and genuinely re-opens
+				// the blob.
 				if err = subtree.DeserializeFromReaderWithAllocator(bufferedReader, nodeAlloc); err != nil {
-					_, err = retry.Retry(gCtx, logger, func() (struct{}, error) {
-						return struct{}{}, subtree.DeserializeFromReaderWithAllocator(bufferedReader, nodeAlloc)
-					}, retry.WithMessage(fmt.Sprintf("[BLOCK][%s][ID %d] failed to deserialize subtree %s", blockHash, blockID, subtreeHash)))
-
-					if err != nil {
-						return errors.NewStorageError("[BLOCK][%s][ID %d] failed to deserialize subtree %s", blockHash, blockID, subtreeHash, err)
-					}
+					return errors.NewStorageError("[BLOCK][%s][ID %d] failed to deserialize subtree %s", blockHash, blockID, subtreeHash, err)
 				}
 
 				// Stored before the check below, not after. The reload path can only

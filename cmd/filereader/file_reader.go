@@ -19,7 +19,6 @@ package filereader
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -279,15 +278,11 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 		return errors.NewProcessingError("subtree file has no root hash: it claims zero transactions, so its meta cannot be checked against it")
 	}
 
-	// Buffer the meta so a rejection can still be inspected. The whole point of
-	// this tool is the file that will not load, so it reports the defect and then
-	// dumps whatever the body yields, rather than returning and leaving the
-	// operator with a verdict and no data.
-	metaBytes, err := io.ReadAll(br)
-	if err != nil {
-		return errors.NewProcessingError("error reading subtree meta", err)
-	}
-
+	// Stream the happy path. A mainnet meta for a million-leaf subtree runs to
+	// tens or hundreds of megabytes, so buffering it up front — and holding it
+	// alive across a second parse — costs that on every healthy file to serve the
+	// rejected one. The best-effort dump below re-opens instead.
+	//
 	// Route through the validated reader rather than the raw one: on an over-long
 	// claimed count the raw deserializer writes past its slice and the CLI dies
 	// with an index out of range instead of naming the defect (issue 1425). The
@@ -299,7 +294,7 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 	// to supply a committed hash. So a torn .subtree header is reported here as a
 	// meta root hash mismatch, naming the other file of the two — worth knowing
 	// when reading the output.
-	subtreeMeta, err := blockmodel.NewSubtreeMetaFromValidatedReader(*stRootHash, st, bytes.NewReader(metaBytes))
+	subtreeMeta, err := blockmodel.NewSubtreeMetaFromValidatedReader(*stRootHash, st, br)
 	if err != nil {
 		fmt.Printf("Subtree meta REJECTED: %v\n", err)
 
@@ -308,7 +303,7 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 		// the process exits non-zero. Printing the defect and exiting 0 would make
 		// `filereader x.subtreeMeta || alert` report success on exactly the corrupt
 		// file the tool exists to find.
-		if best := parseSubtreeMetaBestEffort(st, metaBytes); best != nil {
+		if best := parseSubtreeMetaBestEffort(st, logger, settings, dir, filename); best != nil {
 			fmt.Printf("Dumping the body anyway; entries below come from a file that failed validation.\n")
 			dumpTxInpoints(best)
 		}
@@ -345,7 +340,7 @@ func dumpTxInpoints(meta *subtree.Meta) {
 // deserializer indexes past its destination slice and panics. Recovering is
 // right here and wrong in the node: this is a diagnostic tool being pointed at a
 // file already known to be malformed, and the alternative is showing nothing.
-func parseSubtreeMetaBestEffort(st *subtree.Subtree, metaBytes []byte) (meta *subtree.Meta) {
+func parseSubtreeMetaBestEffort(st *subtree.Subtree, logger ulogger.Logger, settings *settings.Settings, dir, filename string) (meta *subtree.Meta) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("Body could not be parsed: %v\n", r)
@@ -354,7 +349,32 @@ func parseSubtreeMetaBestEffort(st *subtree.Subtree, metaBytes []byte) (meta *su
 		}
 	}()
 
-	parsed, err := subtree.NewSubtreeMetaFromReader(st, bytes.NewReader(metaBytes))
+	// Re-open rather than hold the whole file in memory across both parses. This
+	// runs only for a file already known to be malformed, so the extra read costs
+	// nothing on the healthy path.
+	metaPath := filepath.Join(dir, fmt.Sprintf("%s.%s", filename, fileformat.FileTypeSubtreeMeta))
+
+	_, _, _, reader, err := getReader(metaPath, logger, settings)
+	if err != nil {
+		fmt.Printf("Body could not be re-read: %v\n", err)
+
+		return nil
+	}
+
+	defer func() {
+		if c, ok := reader.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}()
+
+	br := bufio.NewReaderSize(reader, 1024*128)
+	if _, err := fileformat.ReadHeader(br); err != nil {
+		fmt.Printf("Body could not be re-read: %v\n", err)
+
+		return nil
+	}
+
+	parsed, err := subtree.NewSubtreeMetaFromReader(st, br)
 	if err != nil {
 		fmt.Printf("Body could not be parsed: %v\n", err)
 
