@@ -922,3 +922,39 @@ func TestSubtreeMetaRegenerator_RejectsInternalPeer(t *testing.T) {
 
 	require.Zero(t, hits.Load(), "the fetch must not reach the internal target")
 }
+
+// TestStoreRegeneratedMeta_UnserializableIsAnError pins the second of the two
+// layers guarding the rebuild-forever loop. buildMetaFromSubtreeData rejects the
+// input that produces an unserializable meta, so this path should be
+// unreachable — but it used to swallow a serialize failure as a Warnf and report
+// success, which is what let a meta that could never be written look like a
+// successful regeneration. Tested directly because, with both layers in place,
+// no input reaches it.
+func TestStoreRegeneratedMeta_UnserializableIsAnError(t *testing.T) {
+	ctx := context.Background()
+
+	tx0 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+	noInputs := &bt.Tx{}
+
+	subtree := &subtreepkg.Subtree{Nodes: []subtreepkg.Node{
+		{Hash: *tx0.TxIDChainHash()},
+		{Hash: *noInputs.TxIDChainHash()},
+	}}
+
+	// Node 1 left with no inpoints: Meta.Serialize rejects nil parents for every
+	// index except 0.
+	meta := subtreepkg.NewSubtreeMeta(subtree)
+	require.NoError(t, meta.SetTxInpointsFromTx(tx0))
+
+	_, err := meta.Serialize()
+	require.Error(t, err, "fixture must actually be unserializable or this tests nothing")
+
+	store := memory.New()
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, nil, func() uint32 { return 100 }, 288, 0)
+
+	err = regenerator.storeRegeneratedMeta(ctx, subtree.RootHash(), meta)
+	require.Error(t, err, "a meta that cannot be serialized must not be reported as stored")
+
+	_, err = store.Get(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta)
+	require.Error(t, err, "nothing should have been written")
+}
