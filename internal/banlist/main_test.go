@@ -12,6 +12,11 @@ import (
 // defaults, or around 167 with blockchain_use_in_memory_chain_check enabled
 // (4 and 6 per store respectively, across 28 tests), and zero after.
 //
+// One limit to know before copying this: the check only runs when every test in
+// the package passed — VerifyTestMain calls Find only on a zero exit code. A
+// package with a flaky test therefore reports no leaks and looks clean, so a
+// flake has to be fixed before the result here means anything.
+//
 // The single ignore is gocore's init-time goroutine, which is a bare
 // `go func() { for { ...; time.Sleep(1ms) } }()` with no context and no exit
 // path — genuinely unstoppable, so ignoring it is the only option. It must be
