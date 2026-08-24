@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -815,4 +816,81 @@ func TestSubtreeMetaRegenerator_RejectsInternalPeer(t *testing.T) {
 	}
 
 	require.Zero(t, hits.Load(), "the fetch must not reach the internal target")
+}
+
+// TestSubtreeMetaRegenerator_CacheBustTokenIsUniqueAcrossRegenerators pins the
+// property the process-wide counter exists for, which the poisoned-peer test
+// above does not reach: it only asserts a cachebust parameter is present, and a
+// counter living on the struct satisfies that just as well.
+//
+// blockvalidation builds a fresh SubtreeMetaRegenerator for every validation
+// attempt, so a per-instance counter restarts at zero each time and every retry
+// asks for the identical "?cachebust=1". A peer's nginx caches that URL under
+// its own key like any other, so a busted request whose generation also aborted
+// leaves the block wedged for the whole upstream TTL — the exact failure the
+// retry exists to break.
+func TestSubtreeMetaRegenerator_CacheBustTokenIsUniqueAcrossRegenerators(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, full, _ := buildTruncatableSubtreeData(t)
+
+	var (
+		mu     sync.Mutex
+		tokens []string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/subtree_data/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		token := r.URL.Query().Get("cachebust")
+		if token == "" {
+			// The poisoned cache entry: 200 with a body too short for the subtree.
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		mu.Lock()
+		tokens = append(tokens, token)
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full)
+	}))
+	defer server.Close()
+
+	// Two separately constructed regenerators, exactly as two ValidateBlock calls
+	// would produce them.
+	for attempt := 0; attempt < 2; attempt++ {
+		regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, newMockSubtreeStoreWriter(),
+			[]string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
+
+		meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree)
+		require.NoError(t, err, "attempt %d must get past the poisoned entry", attempt)
+		requireCompleteMeta(t, meta, subtree.Length())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	require.Len(t, tokens, 2, "each attempt must make exactly one cache-busting request")
+	require.NotEqual(t, tokens[0], tokens[1], "a second regenerator must not replay the first one's token, or the peer's cache answers it from the poisoned entry")
+}
+
+// TestNewCacheBustCounter_IsClockSeeded pins the other half of the token's
+// uniqueness: across process lifetimes rather than across regenerators. An
+// unseeded counter restarts at zero on every node start, so a node restarted
+// while a peer still holds a poisoned entry replays the tokens it already
+// burned. Seeding from the clock is what stops that.
+func TestNewCacheBustCounter_IsClockSeeded(t *testing.T) {
+	before := time.Now().UnixNano()
+	counter := newCacheBustCounter()
+	after := time.Now().UnixNano()
+
+	seed := counter.Load()
+
+	require.GreaterOrEqual(t, seed, uint64(before), "the counter must start from the clock, not from zero")
+	require.LessOrEqual(t, seed, uint64(after))
 }
