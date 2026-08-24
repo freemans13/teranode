@@ -457,7 +457,7 @@ func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_ReplacesCorruptFile(t *test
 	meta := subtreepkg.NewSubtreeMeta(subtree)
 	meta.TxInpoints[1] = subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}}
 
-	regenerator.storeRegeneratedMeta(ctx, subtreeHash, meta)
+	require.NoError(t, regenerator.storeRegeneratedMeta(ctx, subtreeHash, meta))
 
 	expected, err := meta.Serialize()
 	require.NoError(t, err)
