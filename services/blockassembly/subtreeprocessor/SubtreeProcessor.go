@@ -4306,22 +4306,16 @@ func (stp *SubtreeProcessor) moveBackBlockGetSubtrees(ctx context.Context, block
 			}
 
 			// Bind the file to the key it was fetched under before its nodes are
-			// used, the same comparison Block.GetAndValidateSubtrees makes on the
-			// validation path. DeserializeFromReader caches the .subtree header's
-			// root and RootHash() never recomputes it, so a foreign subtree stored
-			// under this key would otherwise have its nodes inserted into
-			// currentTxMap with the committed subtree's positional inpoints —
-			// poisoning assembly state rather than failing, since handleReorg only
-			// falls back to a reset on error. The check has to sit here rather than
-			// only in the meta reader below, because the StoreTxInpointsForSubtreeMeta
-			// path is optional and the else branch reads no meta at all.
-			subtreeRootHash := subtree.RootHash()
-			if subtreeRootHash == nil {
-				return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] subtree %s deserialized with no root hash", block.String(), subtreeHash.String())
-			}
-
-			if !subtreeRootHash.IsEqual(subtreeHash) {
-				return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] subtree %s does not match its key: file was built for %s", block.String(), subtreeHash.String(), subtreeRootHash.String())
+			// used, the same check Block.GetAndValidateSubtrees makes on the
+			// validation path. Without it a foreign subtree stored under this key has
+			// its nodes inserted into currentTxMap carrying the committed subtree's
+			// positional inpoints, and handleReorg only falls back to a reset on
+			// error — so it poisons assembly state rather than failing. It has to sit
+			// here rather than only in the meta reader below, because
+			// StoreTxInpointsForSubtreeMeta is optional and the else branch reads no
+			// meta at all.
+			if err := model.ValidateSubtreeMatchesKey(subtree, subtreeHash); err != nil {
+				return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s]", block.String(), err)
 			}
 
 			subtreesNodes[idx] = subtree.Nodes

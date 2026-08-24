@@ -22,6 +22,37 @@ const (
 	subtreeMetaHeaderSize = chainhash.HashSize + subtreeMetaEntryCountSize
 )
 
+// ValidateSubtreeMatchesKey checks that a subtree answers to the key it was
+// fetched under. Every consumer of a .subtree file needs this and none of them
+// can derive it from the file alone, so it lives here once rather than being
+// restated at each call site with its own wording and error class.
+//
+// The comparison is of the file's own claim, not a recomputation of the tree, so
+// it catches the wrong file under the right key and not a rewritten header.
+// RootHash() returns the value cached from the .subtree header for anything
+// deserialized from storage; for a subtree built in memory it is derived from the
+// nodes, which makes the check stronger there rather than weaker.
+func ValidateSubtreeMatchesKey(subtree *subtreepkg.Subtree, key *chainhash.Hash) error {
+	if subtree == nil {
+		return errors.NewProcessingError("subtree is nil")
+	}
+
+	if key == nil {
+		return errors.NewProcessingError("subtree key is nil")
+	}
+
+	rootHash := subtree.RootHash()
+	if rootHash == nil {
+		return errors.NewProcessingError("subtree has no root hash, so it cannot be matched against key %s", key.String())
+	}
+
+	if !rootHash.IsEqual(key) {
+		return errors.NewProcessingError("subtree does not match its key %s: file was built for %s", key.String(), rootHash.String())
+	}
+
+	return nil
+}
+
 // NewSubtreeMetaFromValidatedReader deserializes a .subtreeMeta stream after
 // checking its fixed 36-byte header — the root hash the file was built for and
 // the entry count it claims — against the subtree and key it is being read for
@@ -31,7 +62,8 @@ const (
 // against Length(), because that is what Meta.serializeTxInpoints writes; Size()
 // is cap(Nodes) and is larger whenever a pooled allocator or a short final
 // subtree leaves headroom. And the subtree is compared against the key, because
-// RootHash() returns the .subtree header's cached bytes and is never recomputed.
+// RootHash() returns the .subtree header's cached bytes for anything read from
+// storage, rather than recomputing from the nodes.
 //
 // Every producer writes the count as the subtree's node count keyed by its root,
 // so any mismatch means a torn or foreign file. Callers with a regenerator behind
@@ -41,20 +73,12 @@ func NewSubtreeMetaFromValidatedReader(subtreeHash chainhash.Hash, subtree *subt
 		return nil, errors.NewProcessingError("cannot validate subtree meta for %s: subtree is nil", subtreeHash.String())
 	}
 
-	// The subtree has to answer to the same hash before the meta is checked
-	// against it, or the check compares one file's claim to another's.
-	// DeserializeFromReader caches the .subtree header's root and RootHash()
-	// never recomputes it, so a foreign subtree stored under this key would
-	// otherwise pass: full subtrees in a block share a leaf count, so the entry
-	// count matches too. Done here rather than only at the call sites so every
-	// caller inherits it.
-	subtreeRootHash := subtree.RootHash()
-	if subtreeRootHash == nil {
-		return nil, errors.NewProcessingError("cannot validate subtree meta for %s: subtree has no root hash", subtreeHash.String())
-	}
-
-	if !subtreeRootHash.IsEqual(&subtreeHash) {
-		return nil, errors.NewProcessingError("subtree does not match its key for %s: subtree file was built for %s", subtreeHash.String(), subtreeRootHash.String())
+	// The subtree has to answer to the same key before the meta is checked
+	// against it, or this compares one file's claim to another's. Full subtrees in
+	// a block share a leaf count, so the entry count check below would not catch a
+	// foreign subtree on its own.
+	if err := ValidateSubtreeMatchesKey(subtree, &subtreeHash); err != nil {
+		return nil, errors.NewProcessingError("cannot validate subtree meta for %s", subtreeHash.String(), err)
 	}
 
 	var metaHeader [subtreeMetaHeaderSize]byte
@@ -64,8 +88,7 @@ func NewSubtreeMetaFromValidatedReader(subtreeHash chainhash.Hash, subtree *subt
 
 	if !bytes.Equal(metaHeader[:chainhash.HashSize], subtreeHash[:]) {
 		// Print the foreign hash in display order like every other hash in the
-		// logs, or the one line meant for triage shows two incomparable hex
-		// strings (the byte-order trap behind the phantom-fork misdiagnosis).
+		// logs, or the one line meant for triage shows two incomparable hex strings.
 		metaRootHash := chainhash.Hash(metaHeader[:chainhash.HashSize])
 
 		return nil, errors.NewProcessingError("subtree meta root hash mismatch for %s: meta was built for %s", subtreeHash.String(), metaRootHash.String())

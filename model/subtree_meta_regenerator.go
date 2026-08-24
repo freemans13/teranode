@@ -178,7 +178,10 @@ func (r *SubtreeMetaRegenerator) buildAndStoreMeta(ctx context.Context, subtreeH
 		return nil, err
 	}
 
-	r.storeRegeneratedMeta(ctx, subtreeHash, meta)
+	if err := r.storeRegeneratedMeta(ctx, subtreeHash, meta); err != nil {
+		return nil, err
+	}
+
 	r.logger.Warnf("[RegenerateMeta][%s] successfully regenerated meta", subtreeHash.String())
 
 	return meta, nil
@@ -219,18 +222,23 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 	// Fail regeneration instead so the error stays transient, and so RegenerateMeta moves on
 	// to the peers rather than accepting a rebuild it cannot use.
 	//
-	// The test is on the source data, not on the built meta. A nil ParentTxHashes does not
-	// mean "nothing was recorded for this node": newSizedFromInputs leaves it nil for a
-	// transaction with no inputs, and the wire deserializer leaves it nil whenever the
-	// parent count is zero. Both are fully-present nodes, and keying the check off them
-	// would fail regeneration permanently on data that is entirely intact. data.Txs[i] == nil
-	// is the signal the loop above already skips on, and it means exactly what is wanted
-	// here: the deserializer never filled this node.
+	// Two distinct failures, both of which must reject the rebuild.
 	//
-	// Node 0 is exempt only where it holds the coinbase placeholder — the same condition
-	// validateSubtree uses to skip it, so the two agree rather than one leaving a hole the
-	// other then condemns the block for.
-	for i := 0; i < subtree.Length() && i < len(data.Txs); i++ {
+	// data.Txs[i] == nil means the deserializer never filled that node — a short
+	// .subtreeData. It is the signal the loop above already skips on.
+	//
+	// A nil ParentTxHashes means go-subtree cannot serialize the meta at all:
+	// Meta.Serialize rejects it for every index except 0. newSizedFromInputs
+	// leaves it nil for a transaction with no inputs, so such a node yields a meta
+	// that builds fine, fails to serialize, and is therefore never written —
+	// leaving every later read to rebuild from .subtreeData and, on a local miss,
+	// pay the peer fetch again. Returning it as success is the rebuild-forever
+	// loop WithAllowOverwrite exists to break, so it is rejected here instead.
+	//
+	// Node 0 is exempt only where it holds the coinbase placeholder — the same
+	// condition validateSubtree uses to skip it, so the two agree rather than one
+	// leaving a hole the other then condemns the block for.
+	for i := 0; i < subtree.Length(); i++ {
 		if i == 0 && hasCoinbasePlaceholder {
 			continue
 		}
@@ -238,25 +246,34 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 		if data.Txs[i] == nil {
 			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: no transaction for node %d of %d", i, subtree.Length())
 		}
-	}
 
-	if len(data.Txs) < subtree.Length() {
-		return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: %d transactions for %d nodes", len(data.Txs), subtree.Length())
+		if meta.TxInpoints[i].ParentTxHashes == nil {
+			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] unserializable subtree meta: no parent inpoints for node %d of %d", i, subtree.Length())
+		}
 	}
 
 	return meta, nil
 }
 
-// storeRegeneratedMeta stores the regenerated meta for future use (non-blocking, warns on failure)
-func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtreeHash *chainhash.Hash, meta *subtreepkg.Meta) {
+// storeRegeneratedMeta stores the regenerated meta for future use.
+//
+// A serialization failure is returned rather than logged: a meta that cannot be
+// written is one every later read has to rebuild, so reporting success for it
+// hides an unbounded repeat of the .subtreeData read and the peer fetch behind
+// it. The completeness check in buildMetaFromSubtreeData should already have
+// rejected the only input that causes this, so reaching it means that check and
+// Meta.Serialize have drifted apart.
+//
+// A store write failure stays a warning. The meta itself is sound and the caller
+// can use it for this validation; only the caching is lost.
+func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtreeHash *chainhash.Hash, meta *subtreepkg.Meta) error {
 	if r.subtreeStore == nil {
-		return
+		return nil
 	}
 
 	metaBytes, err := meta.Serialize()
 	if err != nil {
-		r.logger.Warnf("[storeRegeneratedMeta][%s] failed to serialize meta: %v", subtreeHash.String(), err)
-		return
+		return errors.NewProcessingError("[storeRegeneratedMeta][%s] regenerated meta cannot be serialized, so it could never be cached", subtreeHash.String(), err)
 	}
 
 	// Regeneration runs for a corrupt meta file as well as a missing one, so the write has to
@@ -267,6 +284,8 @@ func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtr
 		options.WithDeleteAt(dah), options.WithAllowOverwrite(true)); err != nil {
 		r.logger.Warnf("[storeRegeneratedMeta][%s] failed to store meta: %v", subtreeHash.String(), err)
 	}
+
+	return nil
 }
 
 // SubtreeStoreAdapter adapts a SubtreeStore (read-only) to SubtreeStoreWriter

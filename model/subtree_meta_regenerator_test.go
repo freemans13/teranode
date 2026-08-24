@@ -821,20 +821,33 @@ func TestSubtreeMetaRegenerator_PlaceholderExemptionMatchesValidateSubtree(t *te
 	})
 }
 
-// TestSubtreeMetaRegenerator_ZeroInputTxIsComplete pins which nil the
-// completeness check reads. A transaction with no inputs leaves ParentTxHashes
-// nil even though the node is fully present, so keying the check off the built
-// meta rather than off data.Txs fails regeneration permanently on intact data.
-func TestSubtreeMetaRegenerator_ZeroInputTxIsComplete(t *testing.T) {
+// TestSubtreeMetaRegenerator_ZeroInputTxIsRejected pins that a node whose
+// transaction has no inputs fails regeneration rather than producing a meta that
+// can never be written.
+//
+// The earlier version of this test asserted the opposite, and put the zero-input
+// transaction at index 0 — the one index Meta.Serialize exempts from its
+// nil-parents check — so it passed over the bug it was meant to cover. Anywhere
+// else, such a node builds a meta that serializes with an error, which
+// storeRegeneratedMeta used to swallow: RegenerateMeta returned success, nothing
+// reached the store, and every later read rebuilt from .subtreeData and paid the
+// peer fetch again. That is the rebuild-forever loop WithAllowOverwrite was added
+// to break.
+func TestSubtreeMetaRegenerator_ZeroInputTxIsRejected(t *testing.T) {
 	ctx := context.Background()
 
+	tx0 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
 	noInputs := &bt.Tx{}
 
-	subtree := &subtreepkg.Subtree{Nodes: []subtreepkg.Node{{Hash: *noInputs.TxIDChainHash()}}}
+	subtree := &subtreepkg.Subtree{Nodes: []subtreepkg.Node{
+		{Hash: *tx0.TxIDChainHash()},
+		{Hash: *noInputs.TxIDChainHash()},
+	}}
 	subtreeHash := subtree.RootHash()
 
 	data := subtreepkg.NewSubtreeData(subtree)
-	data.Txs[0] = noInputs
+	data.Txs[0] = tx0
+	data.Txs[1] = noInputs
 
 	serialized, err := data.Serialize()
 	require.NoError(t, err)
@@ -845,8 +858,12 @@ func TestSubtreeMetaRegenerator_ZeroInputTxIsComplete(t *testing.T) {
 	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, nil, func() uint32 { return 100 }, 288, 0)
 
 	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree, false)
-	require.NoError(t, err, "a present transaction with no inputs is complete data, not a short rebuild")
-	require.NotNil(t, meta)
+	require.Error(t, err, "a meta that cannot be serialized must not be returned as success")
+	require.Nil(t, meta)
+
+	// And nothing half-written was left behind.
+	_, err = store.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
+	require.Error(t, err)
 }
 
 // TestSubtreeMetaRegenerator_RejectsInternalPeer is the SSRF regression test for the peer

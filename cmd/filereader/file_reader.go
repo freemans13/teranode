@@ -303,26 +303,40 @@ func handleSubtreeMeta(br *bufio.Reader, logger ulogger.Logger, settings *settin
 	if err != nil {
 		fmt.Printf("Subtree meta REJECTED: %v\n", err)
 
-		subtreeMeta = parseSubtreeMetaBestEffort(st, metaBytes)
-		if subtreeMeta == nil {
-			return errors.NewProcessingError("error reading subtree meta", err)
+		// Dump whatever the body yields before returning, so the operator gets the
+		// per-index picture as well as the verdict — but still return the error, so
+		// the process exits non-zero. Printing the defect and exiting 0 would make
+		// `filereader x.subtreeMeta || alert` report success on exactly the corrupt
+		// file the tool exists to find.
+		if best := parseSubtreeMetaBestEffort(st, metaBytes); best != nil {
+			fmt.Printf("Dumping the body anyway; entries below come from a file that failed validation.\n")
+			dumpTxInpoints(best)
 		}
 
-		fmt.Printf("Dumping the body anyway; entries below come from a file that failed validation.\n")
+		return errors.NewProcessingError("error reading subtree meta", err)
 	}
 
-	if verbose {
-		for i, txInpoint := range subtreeMeta.TxInpoints {
-			switch {
-			case txInpoint.ParentTxHashes == nil:
-				fmt.Printf("%10d: <nil>\n", i)
-			default:
-				fmt.Printf(nodeFormat, i, txInpoint.ParentTxHashes)
-			}
-		}
-	}
+	dumpTxInpoints(subtreeMeta)
 
 	return nil
+}
+
+// dumpTxInpoints prints the per-index inpoints when -verbose is set. Shared by
+// the accepted and rejected paths: which entries are missing is the diagnosis an
+// operator opens a suspect file for, so a rejection must not silence it.
+func dumpTxInpoints(meta *subtree.Meta) {
+	if !verbose {
+		return
+	}
+
+	for i, txInpoint := range meta.TxInpoints {
+		switch {
+		case txInpoint.ParentTxHashes == nil:
+			fmt.Printf("%10d: <nil>\n", i)
+		default:
+			fmt.Printf(nodeFormat, i, txInpoint.ParentTxHashes)
+		}
+	}
 }
 
 // parseSubtreeMetaBestEffort re-parses a meta the validated reader rejected, so

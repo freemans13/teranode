@@ -1684,12 +1684,6 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		require.NoError(t, err)
 		stp.Start(ctx)
 
-		// Stop the processor before the deferred cancel below unblocks the drain,
-		// so neither outlives the subtest.
-		t.Cleanup(func() {
-			stp.Stop(context.Background())
-		})
-
 		tx1Hash, err := chainhash.NewHashFromStr("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4")
 		require.NoError(t, err)
 		tx2Hash, err := chainhash.NewHashFromStr("e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5")
@@ -1743,6 +1737,10 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		}()
 
 		defer func() {
+			// Stop first: t.Cleanup callbacks run after every defer, so registering
+			// Stop there left it running against an already-cancelled processor with
+			// nothing draining newSubtreeChan.
+			stp.Stop(context.Background())
 			cancel()
 			<-drained
 		}()
@@ -1790,19 +1788,14 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		require.NoError(t, err)
 		stp.Start(ctx)
 
-		// Stop the processor before the deferred cancel below unblocks the drain,
-		// so neither outlives the subtest.
-		t.Cleanup(func() {
-			stp.Stop(context.Background())
-		})
-
 		tx1Hash, err := chainhash.NewHashFromStr("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4")
 		require.NoError(t, err)
 		tx2Hash, err := chainhash.NewHashFromStr("e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5")
 		require.NoError(t, err)
 
-		// The subtree itself is valid and stored under its real root hash; only
-		// the meta file is torn, so the failure is attributable to the meta.
+		// Inverse of the torn-meta case: the meta is correct for the committed key
+		// and it is the .subtree file that is foreign, so the failure is
+		// attributable to the subtree rather than to its meta.
 		moveBackSubtreeHash := storeReorgSubtreeUnderForeignKey(t, ctx, blobStore, []subtree.Node{
 			{Hash: *tx1Hash, Fee: 100, SizeInBytes: 250},
 			{Hash: *tx2Hash, Fee: 200, SizeInBytes: 300},
@@ -1849,6 +1842,10 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		}()
 
 		defer func() {
+			// Stop first: t.Cleanup callbacks run after every defer, so registering
+			// Stop there left it running against an already-cancelled processor with
+			// nothing draining newSubtreeChan.
+			stp.Stop(context.Background())
 			cancel()
 			<-drained
 		}()
@@ -1892,19 +1889,14 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		require.NoError(t, err)
 		stp.Start(ctx)
 
-		// Stop the processor before the deferred cancel below unblocks the drain,
-		// so neither outlives the subtest.
-		t.Cleanup(func() {
-			stp.Stop(context.Background())
-		})
-
 		tx1Hash, err := chainhash.NewHashFromStr("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4")
 		require.NoError(t, err)
 		tx2Hash, err := chainhash.NewHashFromStr("e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5")
 		require.NoError(t, err)
 
-		// The subtree itself is valid and stored under its real root hash; only
-		// the meta file is torn, so the failure is attributable to the meta.
+		// Inverse of the torn-meta case: the meta is correct for the committed key
+		// and it is the .subtree file that is foreign, so the failure is
+		// attributable to the subtree rather than to its meta.
 		moveBackSubtreeHash := storeReorgSubtreeUnderForeignKey(t, ctx, blobStore, []subtree.Node{
 			{Hash: *tx1Hash, Fee: 100, SizeInBytes: 250},
 			{Hash: *tx2Hash, Fee: 200, SizeInBytes: 300},
@@ -1951,6 +1943,10 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		}()
 
 		defer func() {
+			// Stop first: t.Cleanup callbacks run after every defer, so registering
+			// Stop there left it running against an already-cancelled processor with
+			// nothing draining newSubtreeChan.
+			stp.Stop(context.Background())
 			cancel()
 			<-drained
 		}()

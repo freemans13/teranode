@@ -1463,7 +1463,9 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 
 	// a subtreeMetaSlice is required for further block validation, so if we cannot get it, we return an error
 	if err != nil {
-		return errors.NewProcessingError("[validOrderAndBlessed][%s][%s:%d] error getting subtree meta slice: %v", b.String(), subtreeHash.String(), sIdx, err)
+		// No %v for err: errors.New consumes a trailing error param and wraps it, so an
+		// explicit verb here prints %!v(MISSING) in front of the real cause.
+		return errors.NewProcessingError("[validOrderAndBlessed][%s][%s:%d] error getting subtree meta slice", b.String(), subtreeHash.String(), sIdx, err)
 	}
 
 	for snIdx := 0; snIdx < len(subtree.Nodes); snIdx++ {
@@ -1900,23 +1902,25 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 					}
 				}
 
+				// Stored before the check below, not after. The reload path can only
+				// close what it finds in SubtreeSlices, so returning an error with the
+				// entry still nil orphans a backing array the allocator handed out —
+				// and a peer able to trigger repeated rejections turns that into
+				// sustained pool churn. Returning the error with the entry set matches
+				// what the size checks further down already do.
+				b.SubtreeSlices[i] = subtree
+
 				// Bind the file to its key, once, for every later consumer of
 				// RootHash(). DeserializeFromReaderWithAllocator caches the .subtree
-				// header's root and never recomputes it, and CheckMerkleRoot does not
-				// close the gap either — for sIdx 0 it recomputes via
-				// RootHashWithReplaceRootNode, so the cached root is never compared.
-				// This compares the file's claim, not the tree, so it catches the
-				// wrong file under the right key rather than a rewritten header.
-				rootHash := subtree.RootHash()
-				if rootHash == nil {
-					return errors.NewStorageError("[BLOCK][%s][ID %d] subtree %s deserialized with no root hash", blockHash, blockID, subtreeHash)
+				// header's root for anything read from storage, and CheckMerkleRoot does
+				// not close the gap either —
+				// for sIdx 0 it recomputes via RootHashWithReplaceRootNode, so the
+				// cached root is never compared. This compares the file's claim, not
+				// the tree, so it catches the wrong file under the right key rather
+				// than a rewritten header.
+				if err := ValidateSubtreeMatchesKey(subtree, subtreeHash); err != nil {
+					return errors.NewStorageError("[BLOCK][%s][ID %d] subtree %s", blockHash, blockID, subtreeHash, err)
 				}
-
-				if !rootHash.IsEqual(subtreeHash) {
-					return errors.NewStorageError("[BLOCK][%s][ID %d] subtree %s does not match its key: file was built for %s", blockHash, blockID, subtreeHash, rootHash.String())
-				}
-
-				b.SubtreeSlices[i] = subtree
 
 				sizeInBytes.Add(subtree.SizeInBytes)
 				txCount.Add(uint64(subtree.Length())) // nolint: gosec

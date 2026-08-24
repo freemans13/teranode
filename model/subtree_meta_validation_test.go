@@ -170,7 +170,8 @@ func TestGetSubtreeMetaSliceValidation(t *testing.T) {
 
 // TestSubtreeBoundToItsKey pins the load-site binding. The .subtree file's root
 // hash is cached verbatim from its header by DeserializeFromReaderWithAllocator
-// and RootHash() never recomputes it, so without this comparison a
+// and RootHash() returns that cached value rather than recomputing, so without
+// this comparison a
 // genuine-but-foreign subtree stored under the right key is accepted as the
 // committed one and every later consumer of RootHash() inherits that.
 // CheckMerkleRoot does not close it: for subtree 0 it recomputes the root via
