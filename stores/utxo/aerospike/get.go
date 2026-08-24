@@ -99,11 +99,12 @@ const errCouldNotReadInput = "could not read input"
 // evidence that the transaction is consensus-invalid — the same reasoning that
 // applies to the external blob in getExternalTransaction (issue 1439).
 //
-// Every bin processor already returns a StorageError for the failures it can
-// attribute to the store: a missing or wrong-typed bin, or a failed read of a
-// paginated extra record, which for fields.Utxos is a live Aerospike client.Get
-// and so fails on any transient store problem. The callers used to re-wrap all
-// of them in TxInvalid regardless. Because errors.Is walks the whole chain and
+// Every processor reached through this helper already codes its store-attributable
+// failures — a missing or wrong-typed bin, an input that will not parse back — as
+// either a StorageError or a ProcessingError. (fields.Utxos, whose paginated
+// extra-record read is a live Aerospike client.Get and so fails on any transient
+// store problem, has its own classifier: classifyUTXOReadError.) The callers used
+// to re-wrap all of them in TxInvalid regardless. Because errors.Is walks the whole chain and
 // every downstream switch tests ErrTxInvalid first, that wrap presented a
 // transient store read as a proven consensus violation: the block persisted
 // invalid, its descendants poisoned through the parent-invalid cascade, and the
@@ -113,8 +114,9 @@ const errCouldNotReadInput = "could not read input"
 //
 // Context errors and local service faults are treated the same way for the same
 // reason: neither is evidence about the block. ErrProcessing is included because
-// the only processor that returns it does so for a failed Aerospike key
-// construction, which is unambiguously ours rather than the block's.
+// every producer of it on these paths is unambiguously ours rather than the
+// block's: processInputsToTxInpoints failing to read back an input it wrote, and
+// getAllExtraUTXOs failing to build an Aerospike key.
 func classifyRecordError(message string, err error) error {
 	if errors.IsTransientLocalError(err) || errors.IsContextError(err) || errors.Is(err, errors.ErrProcessing) {
 		return errors.NewStorageError(message, err)
@@ -530,12 +532,12 @@ func (s *Store) putGetBatch(ctx context.Context, item *batchGetItem) error {
 func (s *Store) getTxFromBins(bins aerospike.BinMap) (tx *bt.Tx, err error) {
 	versionUint32, err := safeconversion.IntToUint32(bins[fields.Version.String()].(int))
 	if err != nil {
-		return nil, err
+		return nil, errors.NewStorageError("invalid version", err)
 	}
 
 	locktimeUint32, err := safeconversion.IntToUint32(bins[fields.LockTime.String()].(int))
 	if err != nil {
-		return nil, err
+		return nil, errors.NewStorageError("invalid locktime", err)
 	}
 
 	tx = &bt.Tx{
@@ -981,7 +983,7 @@ NEXT_BATCH_RECORD:
 				if ok {
 					unminedSinceUint32, err := safeconversion.IntToUint32(unminedSince)
 					if err != nil {
-						items[idx].Err = classifyRecordError("invalid unmined since", err)
+						items[idx].Err = errors.NewStorageError("invalid unmined since", err)
 
 						continue NEXT_BATCH_RECORD // because there was an error processing the unmined since.
 					}
