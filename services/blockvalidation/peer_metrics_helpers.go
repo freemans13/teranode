@@ -205,6 +205,29 @@ func (u *Server) reportValidatedChainProgress(ctx context.Context, peerID string
 	}
 }
 
+// shouldReportConsensusMalicious decides whether a failed block validation is
+// solid enough evidence against the serving peer to charge their reputation.
+//
+// A consensus code alone is not enough. errors.Is walks the whole wrap chain, so
+// an error can carry both ErrBlockInvalid/ErrTxInvalid and ErrStorageError, and a
+// storage fault is always this node's disk rather than anything the peer sent
+// (issue 1439). Charging that combination would blame an honest peer for our own
+// corruption, which is the failure this branch exists to remove.
+//
+// The storage exemption is defence in depth rather than a path known to be live:
+// ValidateBlockWithOptions screens ErrStorageError out at its block.Valid failure
+// site before wrapping in BlockInvalid, and validateBlockSubtrees wraps only on
+// ErrTxInvalid. It is written down anyway because releaseCatchupLock already
+// scores exactly that chain local_storage_fault, and two classifiers in one file
+// reaching opposite verdicts on one error is the bug shape, not the safeguard.
+func shouldReportConsensusMalicious(err error) bool {
+	if errors.Is(err, errors.ErrStorageError) {
+		return false
+	}
+
+	return errors.Is(err, errors.ErrBlockInvalid) || errors.Is(err, errors.ErrTxInvalid)
+}
+
 // reportCatchupMalicious reports malicious behavior to the P2P service.
 // Falls back to local metrics if P2P client is unavailable.
 //

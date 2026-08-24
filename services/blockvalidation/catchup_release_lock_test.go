@@ -744,3 +744,63 @@ func TestReleaseCatchupLock_ContextErrorIsNotChargedToPeer(t *testing.T) {
 		})
 	}
 }
+
+// TestShouldReportConsensusMalicious pins the predicate that validateBlocksOnChannel
+// uses to decide whether a failed block validation is chargeable to the serving
+// peer. The cases that matter are the both-codes chains: errors.Is walks the whole
+// wrap chain, so a consensus code sitting outside a storage fault must not be read
+// as proof about the peer. releaseCatchupLock scores those same chains
+// local_storage_fault, and the two must not disagree.
+func TestShouldReportConsensusMalicious(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "bare block-invalid is the peer's fault",
+			err:  errors.NewBlockInvalidError("block does not meet target difficulty"),
+			want: true,
+		},
+		{
+			name: "bare tx-invalid is the peer's fault",
+			err:  errors.NewTxInvalidError("previous tx has no output at index 3"),
+			want: true,
+		},
+		{
+			name: "block-invalid wrapping a storage fault is ours, not the peer's",
+			err: errors.NewBlockInvalidError("block is not valid",
+				errors.NewStorageError("external blob does not hash to its key")),
+			want: false,
+		},
+		{
+			name: "tx-invalid wrapping a storage fault is ours, not the peer's",
+			err: errors.NewTxInvalidError("invalid tx",
+				errors.NewStorageError("could not read input")),
+			want: false,
+		},
+		{
+			name: "storage fault nested two deep is still ours",
+			err: errors.NewBlockInvalidError("block contains invalid transactions",
+				errors.NewTxInvalidError("invalid tx",
+					errors.NewStorageError("invalid version"))),
+			want: false,
+		},
+		{
+			name: "bare storage fault carries no consensus code at all",
+			err:  errors.NewStorageError("external blob does not hash to its key"),
+			want: false,
+		},
+		{
+			name: "an incomplete block is handled elsewhere and is not chargeable here",
+			err:  errors.NewBlockIncompleteError("no coinbase from seeded peer"),
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, shouldReportConsensusMalicious(tc.err))
+		})
+	}
+}

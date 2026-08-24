@@ -410,8 +410,9 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// otherwise be mislabelled a network error against the primary.
 			//
 			// Server.go's processCatchupChItem tests storage before it tests
-			// isUnvalidatablePeerError, so this ordering is what keeps the two
-			// classifiers from reaching opposite verdicts on the same error.
+			// isUnvalidatablePeerError, and validateBlocksOnChannel's malicious
+			// report carries the same exemption, so this ordering is what keeps all
+			// three classifiers from reaching opposite verdicts on the same error.
 			errorType = "local_storage_fault"
 			isPeerError = false
 		case errors.Is(*err, errors.ErrServiceUnavailable):
@@ -1400,17 +1401,27 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan blockForValidat
 					if errors.Is(err, errors.ErrBlockIncomplete) {
 						catchupCtx.incompleteBlockHash = block.Hash().String()
 						u.logger.Warnf("[catchup:validateBlocksOnChannel][%s] block %s from peer %s is incomplete, aborting catchup", blockUpTo.Hash().String(), block.Hash().String(), peerID)
-					} else if errors.Is(err, errors.ErrBlockInvalid) || errors.Is(err, errors.ErrTxInvalid) {
+					} else if shouldReportConsensusMalicious(err) {
 						// ValidateBlockWithOptions already stored the block as invalid if it's a consensus violation
 						u.logger.Warnf("[catchup:validateBlocksOnChannel][%s] block %s violates consensus rules (already stored as invalid by ValidateBlockWithOptions)", blockUpTo.Hash().String(), block.Hash().String())
 						u.reportCatchupMalicious(gCtx, peerID, "invalid_block_validation")
 					}
 
 					// Record metric for validation failure. A local storage fault is
-					// not the peer's doing, so it must not be charged against them
-					// here either — the reputation paths above already exempt it, and
-					// charging it in telemetry only would leave the dashboards
-					// blaming an honest peer for this node's disk.
+					// not the peer's doing, so it is charged neither to reputation
+					// (the consensus branch above carries the same exemption) nor to
+					// telemetry, which would otherwise leave the dashboards blaming an
+					// honest peer for this node's disk.
+					//
+					// The exemption on the consensus branch is defence in depth rather
+					// than a path known to be live: ValidateBlockWithOptions screens
+					// ErrStorageError out at its block.Valid failure site before
+					// wrapping in BlockInvalid, and validateBlockSubtrees wraps only on
+					// ErrTxInvalid. But errors.Is walks the whole chain, so any future
+					// wrap that carries both codes would otherwise reach the malicious
+					// report — and releaseCatchupLock already scores exactly that chain
+					// local_storage_fault, so without this the same file would hold two
+					// opposite verdicts on one error.
 					if prometheusCatchupErrors != nil && !errors.Is(err, errors.ErrStorageError) {
 						prometheusCatchupErrors.WithLabelValues(peerID, "validation_failure").Inc()
 					}
