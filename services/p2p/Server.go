@@ -1018,6 +1018,12 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	go s.publishNodeStatus(ctx)
 
 	apiKey := s.settings.GRPCAdminAPIKey
+	if util.ValidateAdminAPIKey(s.logger, "P2P", apiKey, s.settings.P2P.GRPCListenAddress, s.settings.SecurityLevelGRPC) {
+		// Configured key is a well-known placeholder; ignore it and fall back to
+		// the random-key path below rather than trusting a world-readable value.
+		apiKey = ""
+	}
+
 	if apiKey == "" {
 		// Generate a random API key if not provided
 		apiKey, err = generateRandomKey()
