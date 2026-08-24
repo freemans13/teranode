@@ -228,6 +228,21 @@ func shouldReportConsensusMalicious(err error) bool {
 	return errors.Is(err, errors.ErrBlockInvalid) || errors.Is(err, errors.ErrTxInvalid)
 }
 
+// isLocalCatchupFault reports whether a catchup failure is this node's own doing
+// rather than anything the serving peer did, so no reputation charge is warranted.
+//
+// The predicate is the union of two errors-package helpers because neither covers
+// this on its own, and they are disjoint on exactly the cases that matter here.
+// IsLocalError - what recordCatchupPeerFailure uses - is context errors plus
+// ErrStorageError, and misses the *Unavailable codes. IsTransientLocalError is
+// {ServiceError, StorageError, ServiceUnavailable, StorageUnavailable}, and misses
+// context errors entirely. Either one alone leaves a class of purely local failure
+// charged to an honest primary: a shutdown or catchup-context deadline in the first
+// case, an aerospike batch timeout (ErrServiceUnavailable) in the second.
+func isLocalCatchupFault(err error) bool {
+	return errors.IsTransientLocalError(err) || errors.IsContextError(err)
+}
+
 // reportCatchupMalicious reports malicious behavior to the P2P service.
 // Falls back to local metrics if P2P client is unavailable.
 //

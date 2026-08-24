@@ -1933,16 +1933,9 @@ func (u *Server) processCatchupChItem(ctx context.Context, c processBlockCatchup
 		// turn. recordCatchupPeerFailure already exempts storage errors for exactly
 		// this reason; this closes the matching hole on the terminal-error path.
 		//
-		// The predicate is the union of two helpers because neither covers this on
-		// its own, and they are disjoint on exactly the cases that matter here.
-		// IsLocalError — what recordCatchupPeerFailure uses — is context errors plus
-		// ErrStorageError, and misses the *Unavailable codes; IsTransientLocalError
-		// is {ServiceError, StorageError, ServiceUnavailable, StorageUnavailable},
-		// and misses context errors entirely. Using either alone would leave one
-		// class of purely local failure still charged to an honest primary: a
-		// shutdown or catchup-context deadline in the first case, an aerospike batch
-		// timeout (ErrServiceUnavailable) in the second.
-		if errors.IsTransientLocalError(err) || errors.IsContextError(err) {
+		// isLocalCatchupFault is the union of two errors-package helpers, neither of
+		// which covers this on its own; its doc comment carries the reasoning.
+		if isLocalCatchupFault(err) {
 			// #1057: count this cycle toward the per-block cap (unless it made
 			// progress) so a persistent local service or storage error cannot drive
 			// unbounded re-entry.

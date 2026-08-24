@@ -804,3 +804,74 @@ func TestShouldReportConsensusMalicious(t *testing.T) {
 		})
 	}
 }
+
+// TestIsLocalCatchupFault pins the union predicate processCatchupChItem uses to
+// decide that a terminal catchup error is this node's own fault. The union is the
+// point: errors.IsLocalError misses the *Unavailable codes and
+// errors.IsTransientLocalError misses context errors, so either helper alone leaves
+// a class of purely local failure charged to an honest primary.
+func TestIsLocalCatchupFault(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "storage fault - the mis-keyed external blob this branch reclassified",
+			err:  errors.NewStorageError("external tx does not hash to the key it was stored under"),
+			want: true,
+		},
+		{
+			name: "service error - the pre-existing 1057 case",
+			err:  errors.NewServiceError("blockchain service unavailable"),
+			want: true,
+		},
+		{
+			name: "service unavailable - aerospike batch timeout, missed by IsLocalError",
+			err:  errors.NewServiceUnavailableError("aerospike batch read timed out"),
+			want: true,
+		},
+		{
+			name: "storage unavailable - missed by IsLocalError",
+			err:  errors.NewStorageUnavailableError("blob store health check failed"),
+			want: true,
+		},
+		{
+			name: "context cancelled - shutdown, missed by IsTransientLocalError",
+			err:  errors.NewContextCanceledError("shutting down"),
+			want: true,
+		},
+		{
+			name: "wrapped context deadline - catchup context timing out",
+			err:  errors.NewProcessingError("catchup failed", context.DeadlineExceeded),
+			want: true,
+		},
+		{
+			name: "storage fault nested under a consensus code is still ours",
+			err: errors.NewBlockInvalidError("block is not valid",
+				errors.NewStorageError("could not read tx from stream")),
+			want: true,
+		},
+		{
+			name: "bare block-invalid is the peer's, not ours",
+			err:  errors.NewBlockInvalidError("block does not meet target difficulty"),
+			want: false,
+		},
+		{
+			name: "bare tx-invalid is the peer's, not ours",
+			err:  errors.NewTxInvalidError("previous tx has no output at index 3"),
+			want: false,
+		},
+		{
+			name: "an incomplete block is a peer-supplied shortfall, handled elsewhere",
+			err:  errors.NewBlockIncompleteError("no coinbase from seeded peer"),
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, isLocalCatchupFault(tc.err))
+		})
+	}
+}
