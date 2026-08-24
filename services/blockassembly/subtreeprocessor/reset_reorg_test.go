@@ -1853,6 +1853,14 @@ func TestSubtreeProcessor_ReorgThroughRealSubtrees(t *testing.T) {
 		err = stp.Reorg([]*model.Block{blockToMoveBack}, []*model.Block{blockToMoveForward})
 		require.Error(t, err, "a subtree that does not match its key must fail the reorg, not have its nodes applied")
 		require.Contains(t, err.Error(), "does not match its key")
+
+		// And the rejection must land before anything is mutated. The subtrees are
+		// read and validated ahead of removeCoinbaseUtxos, so a move-back that
+		// cannot proceed leaves the coinbase and its spends alone rather than
+		// handing handleReorg a half-mutated store to reset on top of.
+		coinbaseMeta, getErr := utxoStore.Get(ctx, coinbaseTx2.TxIDChainHash())
+		require.NoError(t, getErr, "the moved-back block's coinbase must survive a rejected move-back")
+		require.NotNil(t, coinbaseMeta)
 	})
 
 	t.Run("a foreign-keyed subtree fails the reorg with subtree-meta storage off", func(t *testing.T) {
