@@ -833,12 +833,17 @@ func (s *server) feelerCandidate() (*wire.NetAddress, net.Addr) {
 		// exercise: a probe exists to move an address into tried, so drawing
 		// one that is already there achieves nothing. svnode restricts the same
 		// way, with Select(newOnly) at addrman.cpp:337.
+		//
+		// The manager answers with values read under its own mutex rather than
+		// with the KnownAddress itself, because the loop below runs long after
+		// the draw and peer goroutines are writing those same fields through
+		// Attempt and Good the whole time.
 		ka := s.addrManager.UnverifiedAddress()
 		if ka == nil {
 			return nil, nil
 		}
 
-		na := ka.NetAddress()
+		na := ka.NetAddress
 
 		addrString := addrmgr.NetAddressKey(na)
 
@@ -899,7 +904,7 @@ func (s *server) feelerCandidate() (*wire.NetAddress, net.Addr) {
 		}
 
 		// Only allow recently attempted nodes after 30 failed tries.
-		if tries < 30 && time.Since(ka.LastAttempt()) < 10*time.Minute {
+		if tries < 30 && time.Since(ka.LastAttempt) < 10*time.Minute {
 			continue
 		}
 

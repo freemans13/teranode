@@ -543,6 +543,75 @@ func TestFeelerCandidateSkipsWhatItCannotResolve(t *testing.T) {
 	})
 }
 
+// TestFeelerCandidateDoesNotRaceTheAddressBook drives a selection pass against
+// the same address-book writes a running node makes, and is meant to be read as
+// a -race test: without the detector it asserts nothing beyond "does not panic".
+//
+// The feeler is a new long-lived goroutine that reads address-book entries up to
+// feelerCandidateTries times a pass, while peer read loops and the connection
+// manager write those same entries through Attempt and Good. KnownAddress says
+// of itself that no accessor on it is safe for concurrent access, so the entry
+// has to be answered on the manager's side of its own mutex rather than handed
+// out to be read afterwards.
+//
+// t.Parallel is deliberately absent: the concurrency under test is inside the
+// test, not between it and its siblings.
+func TestFeelerCandidateDoesNotRaceTheAddressBook(t *testing.T) {
+	swapTestConfig(t, "")
+
+	srv := newFeelerTestServer(t)
+	serveFeelerSnapshot(srv, feelerSnapshot{})
+
+	// Enough entries that selection keeps drawing rather than settling on one,
+	// and all in different /16s so the netgroup filter does not thin them.
+	addrs := make([]*wire.NetAddress, 0, 32)
+
+	for i := 0; i < 32; i++ {
+		na := wire.NewNetAddressIPPort(net.ParseIP(fmt.Sprintf("8.%d.8.1", i)), 8333, wire.SFNodeNetwork)
+		srv.addrManager.AddAddress(na, testSourceAddr())
+		addrs = append(addrs, na)
+	}
+
+	var wg sync.WaitGroup
+
+	writing := make(chan struct{})
+
+	// The writer stands in for the peer read loops and the connection manager:
+	// Attempt writes ka.lastattempt, Good writes it and ka.attempts, both under
+	// the manager's mutex.
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		for {
+			select {
+			case <-writing:
+				return
+			default:
+			}
+
+			for _, na := range addrs {
+				srv.addrManager.Attempt(na, true)
+				srv.addrManager.Good(na)
+			}
+		}
+	}()
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		defer close(writing)
+
+		for i := 0; i < 200; i++ {
+			srv.feelerCandidate()
+		}
+	}()
+
+	wg.Wait()
+}
+
 // TestStartFeelerHonoursTheDisableLever pins the second half of the rollback
 // lever. Setting the budget to zero has to stop the goroutine from starting as
 // well as stop the slot being reserved; a version that reserved nothing but
@@ -659,19 +728,18 @@ func TestFeelerRecordsAFailedDial(t *testing.T) {
 	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
 	srv.addrManager.AddAddress(na, testSourceAddr())
 
-	require.True(t, srv.addrManager.UnverifiedAddress().LastAttempt().IsZero(),
+	require.True(t, srv.addrManager.UnverifiedAddress().LastAttempt.IsZero(),
 		"the address starts out with no attempt against it")
 
-	// One probe, run inline. The KnownAddress accessors are documented as
-	// unsafe to read while the address manager is being written to, so the
-	// assertions below have to happen with no probe in flight.
+	// One probe, run inline, so the assertions below are made after the probe
+	// has finished writing rather than while it still might.
 	runOneProbe(srv)
 
 	ka := srv.addrManager.UnverifiedAddress()
 	require.NotNil(t, ka, "a failed dial must not move the address anywhere")
-	require.False(t, ka.LastAttempt().IsZero(),
+	require.False(t, ka.LastAttempt.IsZero(),
 		"a dial that produced nothing must be recorded against the address")
-	require.Positive(t, ka.Attempts(),
+	require.Positive(t, ka.Attempts,
 		"with the node connected elsewhere, the failure counts against the address")
 	require.Equal(t, uint64(1), srv.feelerAttempted.Load())
 	require.Equal(t, uint64(0), srv.feelerVerified.Load())
@@ -815,7 +883,7 @@ func TestFeelerDoesNotPromoteNonBSVPeer(t *testing.T) {
 
 			ka := srv.addrManager.UnverifiedAddress()
 			require.NotNil(t, ka, "the address must stay in the new table")
-			require.Positive(t, ka.Attempts(), "the attempt is still recorded against it")
+			require.Positive(t, ka.Attempts, "the attempt is still recorded against it")
 			require.Equal(t, tt.wantBanned, srv.banList.IsBanned("8.8.8.8"))
 
 			if tt.wantBanned {
@@ -1035,10 +1103,11 @@ func candidateOf(srv *server) *wire.NetAddress {
 // runOneProbe runs exactly one probe on the calling goroutine and returns when
 // it has finished.
 //
-// Used where a test needs to read the address book afterwards: the
-// KnownAddress accessors are documented as unsafe to read while the address
-// manager is being written to, so those assertions cannot race a probe. The
-// pacing loop around this is covered separately.
+// Used where a test needs to read the address book afterwards. Reading it is
+// safe at any time, since UnverifiedAddress answers under the manager's mutex,
+// but it is only meaningful once the probe has finished: an assertion made
+// alongside a probe in flight would be asserting on a moment rather than on an
+// outcome. The pacing loop around this is covered separately.
 func runOneProbe(srv *server) {
 	srv.feelerTokens = make(chan struct{}, 1)
 
@@ -1460,7 +1529,7 @@ func TestFeelerProbeWritesNothingWhileShuttingDown(t *testing.T) {
 
 				ka := srv.addrManager.UnverifiedAddress()
 				require.NotNil(t, ka, "a failed dial must not move the address anywhere")
-				require.Equal(t, tt.wantRecorded, !ka.LastAttempt().IsZero(),
+				require.Equal(t, tt.wantRecorded, !ka.LastAttempt.IsZero(),
 					"a dial failure is recorded against the address only while the node is running")
 			})
 		}
@@ -1504,7 +1573,7 @@ func TestFeelerProbeWritesNothingWhileShuttingDown(t *testing.T) {
 
 				ka := srv.addrManager.UnverifiedAddress()
 				require.NotNil(t, ka, "an abandoned probe must leave the address where it was")
-				require.Equal(t, tt.wantRecorded, !ka.LastAttempt().IsZero(),
+				require.Equal(t, tt.wantRecorded, !ka.LastAttempt.IsZero(),
 					"an abandoned probe must not record an attempt either")
 				require.Equal(t, uint64(0), srv.feelerVerified.Load())
 			})
@@ -1538,7 +1607,7 @@ func TestAttemptIfRunningRefusesToWriteWhileShuttingDown(t *testing.T) {
 			na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
 			srv.addrManager.AddAddress(na, testSourceAddr())
 
-			require.True(t, srv.addrManager.UnverifiedAddress().LastAttempt().IsZero(),
+			require.True(t, srv.addrManager.UnverifiedAddress().LastAttempt.IsZero(),
 				"the address starts out with no attempt against it")
 
 			if tt.shuttingDown {
@@ -1548,7 +1617,7 @@ func TestAttemptIfRunningRefusesToWriteWhileShuttingDown(t *testing.T) {
 			require.Equal(t, tt.wantWritten, srv.attemptIfRunning(na),
 				"attemptIfRunning must report whether it wrote")
 
-			require.Equal(t, tt.wantWritten, !srv.addrManager.UnverifiedAddress().LastAttempt().IsZero(),
+			require.Equal(t, tt.wantWritten, !srv.addrManager.UnverifiedAddress().LastAttempt.IsZero(),
 				"and the report must match what reached the address book")
 		})
 	}

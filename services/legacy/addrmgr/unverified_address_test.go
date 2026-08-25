@@ -48,9 +48,9 @@ func TestUnverifiedAddressDrawsOnlyFromNew(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		ka := amgr.UnverifiedAddress()
 		require.NotNil(t, ka, "the new table still holds ten addresses")
-		require.False(t, addrmgr.TstKnownAddressTried(ka),
+		require.False(t, addrmgr.TstAddressIsTried(amgr, ka.NetAddress),
 			"UnverifiedAddress must never return an address that is already in tried")
-		require.NotContains(t, promoted, addrmgr.NetAddressKey(ka.NetAddress()))
+		require.NotContains(t, promoted, addrmgr.NetAddressKey(ka.NetAddress))
 	}
 
 	// Companion assertion: extracting selectNew out of GetAddress must not have
@@ -86,7 +86,7 @@ func TestUnverifiedAddressReturnsOnEmptyNewTable(t *testing.T) {
 
 	require.Equal(t, 1, amgr.NumAddresses(), "the address is still known, it has just moved table")
 
-	done := make(chan *addrmgr.KnownAddress, 1)
+	done := make(chan *addrmgr.UnverifiedAddress, 1)
 
 	go func() { done <- amgr.UnverifiedAddress() }()
 
