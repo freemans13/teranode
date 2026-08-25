@@ -18,10 +18,11 @@ import (
 )
 
 // refusedBlock is a headers-first manager walked to the one moment that matters:
-// the front block of the header list has been asked for, has arrived, and the
-// local store has refused it with a fault that says nothing about the block. Its
-// header is off the front of the walk and its download record has been released,
-// so nothing but a rewind can bring it back.
+// the front block of the header list has been asked for, has arrived, and
+// HandleBlockDirect has dropped it. Its header is off the front of the walk and
+// its download record has been released, so nothing but a rewind can bring it
+// back. Which kind of drop it was, a busy store that says nothing about the
+// block or a judgement on the block itself, is the caller's choice.
 type refusedBlock struct {
 	sm    *SyncManager
 	hash  chainhash.Hash
@@ -29,10 +30,21 @@ type refusedBlock struct {
 	peer  *peerpkg.Peer
 }
 
-// newRefusedBlock builds that state. backoffBase is how long the block's
-// transient-failure throttle should last, which is the difference between the
-// two tests below.
+// newRefusedBlock builds that state with a transient store fault, the failure
+// the rewind machinery was originally written for. backoffBase is how long the
+// block's throttle should last, which is the difference between the tests below.
 func newRefusedBlock(t *testing.T, peerIdx uint8, backoffBase time.Duration) *refusedBlock {
+	t.Helper()
+
+	return newDroppedBlock(t, peerIdx, backoffBase, errors.NewStorageError("the store is busy"))
+}
+
+// newDroppedBlock is newRefusedBlock with the failure spelled out. failWith is
+// what the blockchain client returns for the front block's existence check, and
+// so decides which arm of handleBlockMsg's error handling runs: a storage or
+// service error is transient, a context error is our own abort, and anything
+// else is a judgement on the block.
+func newDroppedBlock(t *testing.T, peerIdx uint8, backoffBase time.Duration, failWith error) *refusedBlock {
 	t.Helper()
 
 	// The headers are built first, because the storage mock has to be told which
@@ -52,9 +64,9 @@ func newRefusedBlock(t *testing.T, peerIdx uint8, backoffBase time.Duration) *re
 		Return(bestHeader, &model.BlockHeaderMeta{Height: 100}, nil)
 	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 		Return([]*chainhash.Hash{{}}, nil)
-	// A busy local store, on this one block only.
+	// The failure under test, on this one block only.
 	client.On("GetBlockExists", mock.Anything, &failing).
-		Return(false, errors.NewStorageError("the store is busy"))
+		Return(false, failWith)
 	client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	client.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
@@ -102,11 +114,19 @@ func newRefusedBlock(t *testing.T, peerIdx uint8, backoffBase time.Duration) *re
 
 	block := &wire.MsgBlock{Header: *msg.Headers[0]}
 
-	require.Error(t, sm.handleBlockMsg(&blockQueueMsg{
+	deliverErr := sm.handleBlockMsg(&blockQueueMsg{
 		block:     block,
 		blockHash: failing,
 		peer:      syncPeer,
-	}), "the store refused the block")
+	})
+
+	if errors.IsContextError(failWith) {
+		// The context arm answers nil on purpose: our own abort says nothing
+		// about the block and there is nothing to hand back to the caller.
+		require.NoError(t, deliverErr, "a cancelled block is not reported as an error")
+	} else {
+		require.Error(t, deliverErr, "the block was dropped")
+	}
 
 	require.False(t, sm.blockDownloads.RequestedWithin(failing, time.Minute),
 		"delivering the block released the peer's obligation, so nothing is outstanding for it any more")
@@ -200,4 +220,78 @@ func TestSyncManager_ABlockReDeliveredInsideItsBackoffKeepsItsPlaceInTheWalk(t *
 
 		return r.sm.blockDownloads.RequestedWithin(r.hash, time.Minute)
 	}, 5*time.Second), "a duplicate delivery must not cost the block its place in the download walk")
+}
+
+// TestSyncManager_AJudgedBlockIsAskedForAgain is ChiR1: the drop path that was
+// left with no recovery at all.
+//
+// A block that fails for a reason other than a transient local fault is judged:
+// we reject it to the peer, and we used not to put the walk back on it. That was
+// safe while a judged block "kept the recovery it has always had, the stall
+// detector rebuilds the header list from a fresh peer". With
+// legacy_multiPeerBlockDownload on there is no such rebuild: handleCheckSyncPeer
+// demotes the stalled sync peer and returns, and demoteSyncPeer deliberately
+// leaves the header state alone. The only surviving reset outside a disconnect
+// is resetHeaderStateIfEmpty, which does nothing unless the list is ALREADY
+// empty, so it cannot refill a header taken out of the middle of the walk.
+//
+// Below a checkpoint that header is one the node must have, so the walk could
+// never reach the tip again. The end state asserted here is that the block is
+// outstanding once more, with no headers message and no other block arriving, so
+// nothing but the rewind can have put it there.
+func TestSyncManager_AJudgedBlockIsAskedForAgain(t *testing.T) {
+	r := newDroppedBlock(t, 66, time.Millisecond, errors.NewProcessingError("this block is not acceptable"))
+
+	require.True(t, WaitUntil(func() bool {
+		// What the park sweep's ticker calls, once every 30 seconds.
+		r.sm.resumeHeaderWalk()
+
+		return r.sm.blockDownloads.RequestedWithin(r.hash, time.Minute)
+	}, 5*time.Second), "a judged block must be asked for again once its backoff has expired")
+}
+
+// TestSyncManager_AJudgedBlockIsThrottledBeforeItIsAskedForAgain is the brake
+// that makes the rewind above shippable.
+//
+// The reason a judged block was left out of the rewind is a real one: asking for
+// a block we have just rejected downloads it and rejects it again, and every
+// delivery refreshes the delivering sync peer's stall timer (HandleBlockDirect
+// does it at receipt), so nothing rotates the peer out of the loop either. The
+// answer is not to leave the walk wedged, it is to throttle the retry with the
+// same per-block backoff the transient path uses. That backoff holds the WALK
+// and not just the decorate, so the round stops on the block rather than running
+// on into descendants that can never commit.
+func TestSyncManager_AJudgedBlockIsThrottledBeforeItIsAskedForAgain(t *testing.T) {
+	r := newDroppedBlock(t, 67, time.Hour, errors.NewProcessingError("this block is not acceptable"))
+
+	fs, ok := r.sm.blockFailureBackoff.Get(r.hash)
+	require.True(t, ok, "a judged block must start a backoff, or the rewind spins")
+	require.True(t, fs.nextRetry.After(time.Now()), "the backoff should still be running")
+
+	r.sm.fetchHeaderBlocks()
+	r.sm.resumeHeaderWalk()
+
+	require.False(t, r.sm.blockDownloads.RequestedWithin(r.hash, time.Minute),
+		"a judged block still inside its backoff must not be asked for again yet")
+}
+
+// TestSyncManager_ABlockDroppedOnAContextErrorIsAskedForAgain covers the second
+// half of ChiR1. handleBlockMsg's context-error arm returned nil with no rewind,
+// no failure marker and no getblocks, so a block whose processing was cancelled
+// mid-flight left the walk exactly as a judged one did.
+//
+// The recentlyFailedBlocks assertion is what pins the test to that arm rather
+// than to the judged arm below it: the judged arm marks the block, the context
+// arm returns before it.
+func TestSyncManager_ABlockDroppedOnAContextErrorIsAskedForAgain(t *testing.T) {
+	r := newDroppedBlock(t, 68, time.Millisecond, context.Canceled)
+
+	_, marked := r.sm.recentlyFailedBlocks.Get(r.hash)
+	require.False(t, marked, "a cancelled block is not a failed block, so the context arm must have run")
+
+	require.True(t, WaitUntil(func() bool {
+		r.sm.resumeHeaderWalk()
+
+		return r.sm.blockDownloads.RequestedWithin(r.hash, time.Minute)
+	}, 5*time.Second), "a block dropped on a context error must be asked for again")
 }

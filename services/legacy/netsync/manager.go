@@ -2524,14 +2524,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// No rewind here, and it is worth saying why rather than leaving the
 			// omission to be found again. This block's header is only taken off
 			// the front if this block IS the front, which needs its parent's
-			// header to be gone already. When the parent failed on a local fault
-			// its header is put straight back, so this block is never the front
-			// and never leaves the list — the walk reaches it in order once the
-			// parent is retried. When the parent was judged rather than merely
-			// unlucky there is deliberately nothing to go back to: re-requesting
-			// a descendant of a block that is never coming would download it over
-			// and over, and every delivery refreshes the delivering peer's stall
-			// timer, so nothing would rotate that peer out of the loop either.
+			// header to be gone already. Every path that gives a parent up puts
+			// its header straight back (dropBlockFromWalk), judged or merely
+			// unlucky, so this block is never the front and never leaves the
+			// list. The walk reaches it in order once the parent clears, and
+			// until then the parent's own backoff holds the walk on the parent
+			// rather than letting it run on into descendants like this one.
 			sm.requestMissingBlocks(peer, bmsg.blockHash)
 
 			return nil
@@ -2664,6 +2662,15 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			return nil
 		} else {
 			if errors.Is(err, context.Canceled) || errors.IsContextError(err) {
+				// Neither committed nor judged: our own context went away
+				// mid-processing. The block is still wanted and its header is
+				// already off the front of the walk, so it needs the same
+				// rewind the other drop paths get. On shutdown the rewind is
+				// wasted work on a manager that is about to stop; on a
+				// mid-flight cancellation it is the only thing that asks for
+				// this block again.
+				sm.dropBlockFromWalk(bmsg.blockHash, removedFront)
+
 				return nil
 			}
 
@@ -2690,28 +2697,19 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				peer.PushRejectMsg(wire.CmdBlock, wire.RejectInvalid, "block rejected", &bmsg.blockHash, false)
 			}
 
-			// Record a transient-failure backoff so the next re-delivery of this
-			// block is throttled rather than immediately re-running the full
-			// decorate (#1187). Linear growth capped at the configured max; the
-			// failure count persists across re-deliveries within the map TTL.
-			if serviceError && sm.blockFailureBackoff != nil {
-				sm.recordBlockFailureBackoff(bmsg.blockHash)
-
-				// A local fault says nothing about the block, so the block is
-				// still wanted — and its header is already off the front of the
-				// walk, which in headers-first mode is the only thing that
-				// fetches anything. Put the walk back on it and let the backoff
-				// decide when it goes out again.
-				//
-				// Deliberately NOT done for a block we judged: re-requesting a
-				// block we have just rejected would download it and reject it
-				// again for as long as the peer keeps sending it, and because
-				// every delivery refreshes that peer's stall timer, nothing
-				// would rotate the peer out of the loop. A judged block keeps
-				// the recovery it has always had — the stall detector rebuilds
-				// the header list from a fresh peer.
-				sm.rewindHeaderCursor(bmsg.blockHash, removedFront)
-			}
+			// Put the walk back on the block, throttled, whether we judged it
+			// or merely had bad luck with it. serviceError still decides
+			// whether the peer is told the block was rejected, above; it no
+			// longer decides whether the block keeps its place in the walk.
+			//
+			// A judged block used to be left out of this on the grounds that it
+			// "keeps the recovery it has always had — the stall detector
+			// rebuilds the header list from a fresh peer". That recovery does
+			// not exist any more: with legacy_multiPeerBlockDownload on, a
+			// stalled sync peer is demoted rather than disconnected and
+			// demoteSyncPeer deliberately leaves the header state alone, so
+			// nothing calls resetHeaderState on that path at all.
+			sm.dropBlockFromWalk(bmsg.blockHash, removedFront)
 
 			sm.logger.Errorf("Failed to process new block in service blockQueueMsg %v: %v", bmsg.blockHash, err)
 
@@ -3041,7 +3039,10 @@ func (sm *SyncManager) anchorIsStillTheFrontLocked() bool {
 // takes the anchor off the front, so the trim then deletes the round's FIRST
 // REAL HEADER — every block above it in the round arrives as an orphan of a
 // block nobody will ask for again, the checkpoint block parks with them, and the
-// round stalls until the stall detector rotates the peer. publishFrontierLocked
+// round stalls with nothing left to recover it: with
+// legacy_multiPeerBlockDownload on, the stall detector demotes the sync peer
+// rather than disconnecting it, and demoteSyncPeer leaves the header state
+// alone. publishFrontierLocked
 // now refuses to publish an anchor, which closes that at source; this closes it
 // at the one point both routes pass through.
 //
@@ -3260,6 +3261,39 @@ func (sm *SyncManager) rewindHeaderCursor(hash chainhash.Hash, removed *headerNo
 	sm.logger.Warnf("[rewindHeaderCursor][%s] download cursor moved back after the block was dropped", hash)
 
 	return true
+}
+
+// dropBlockFromWalk gives a delivered-then-dropped block its place in the
+// download walk back, throttled so the re-request cannot spin.
+//
+// Every caller runs after advanceHeaderListFor has already taken the block's
+// header off the front, and in headers-first mode the walk is the only thing
+// that fetches blocks: processInvMsg discards inv replies while headers-first
+// mode is on, and headerListLocator builds its getheaders from the list BACK,
+// which is above the hole, so a fresh headers round cannot refill a header
+// removed from the middle of the list. resetHeaderStateIfEmpty cannot either,
+// because it returns without doing anything unless the list is already empty.
+// Nothing else puts the header back.
+//
+// The throttle is the #1187 transient-failure backoff, and it throttles the WALK
+// and not just the decorate: fetchHeaderBlocks stops the round on a block that
+// is still inside its backoff and leaves the cursor sitting on it. So a block
+// that is never going to validate is asked for once per backoff window instead
+// of once per round, and its descendants are not walked past it and downloaded
+// only to be short-circuited.
+//
+// With the backoff turned off by configuration there is no throttle, and so
+// there is no rewind either: a walk wedged below a checkpoint is bad, an
+// unthrottled re-download loop against a block we have just rejected is worse,
+// and an operator who has set legacy_blockFailureBackoffBase or
+// legacy_blockFailureBackoffMaxDuration to zero has asked for neither.
+func (sm *SyncManager) dropBlockFromWalk(blockHash chainhash.Hash, removedFront *headerNode) {
+	if sm.blockFailureBackoff == nil {
+		return
+	}
+
+	sm.recordBlockFailureBackoff(blockHash)
+	sm.rewindHeaderCursor(blockHash, removedFront)
 }
 
 // fetchHeaderBlocks asks for the next run of blocks the header list describes,
