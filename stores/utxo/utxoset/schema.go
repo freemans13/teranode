@@ -184,7 +184,15 @@ const partitionSQL = `
 CREATE TABLE IF NOT EXISTS utxo_p%[1]d PARTITION OF utxo FOR VALUES IN (%[1]d)
   WITH (fillfactor = 90,
         autovacuum_vacuum_scale_factor  = 0,
-        autovacuum_vacuum_threshold     = 200000,
+        -- Sized to the index, not pinned to a round number. This store makes roughly
+        -- 33,000 dead tuples per block forever, so autovacuum is the one background job
+        -- it does have, and unlike a pruner it CAN fall behind. Each pass is a full scan
+        -- of this partition's index. At fat-band density 200,000 fires every 19 blocks,
+        -- about 1.13 GB/block of index scanning, capping the node near 2.65 blk/s on that
+        -- term alone; 1,000,000 gives ~0.23 GB/block for ~1.6 GB of resident dead rows.
+        -- scale_factor stays 0 because the dead-row rate is proportional to block
+        -- production, not to table size.
+        autovacuum_vacuum_threshold     = 1000000,
         autovacuum_vacuum_cost_delay    = 0,
         autovacuum_vacuum_cost_limit    = 10000,
         autovacuum_analyze_scale_factor = 0.02);
