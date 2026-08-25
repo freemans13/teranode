@@ -59,6 +59,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"math"
 	"slices"
 	"sync/atomic"
 
@@ -72,6 +73,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/utxopersister"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -123,6 +125,45 @@ func classifyRecordError(message string, err error) error {
 	}
 
 	return errors.NewTxInvalidError(message, err)
+}
+
+const (
+	// minSerializedOutputSize is the smallest an output can be on the wire: eight
+	// bytes of satoshis plus a one-byte varint length for an empty locking script.
+	minSerializedOutputSize = 9
+
+	// defaultExcessiveBlockSize mirrors the documented default of the
+	// excessiveblocksize policy setting (4 GB). Used only when the setting is
+	// unset or explicitly 0, which for block acceptance means "no limit" but here
+	// would mean "no bound on an allocation sized from local storage".
+	defaultExcessiveBlockSize = 4 * 1024 * 1024 * 1024
+)
+
+// maxExternalOutputCount bounds the number of outputs this node will reconstruct
+// from an externally stored outputs-only blob.
+//
+// A transaction cannot be larger than the largest block this node would accept,
+// and each of its outputs costs at least minSerializedOutputSize bytes, so no
+// acceptable transaction can carry an output index at or above this value. The
+// bound therefore cannot reject a parent that could legitimately exist; it only
+// catches a corrupt index field, which is otherwise unbounded and would size a
+// multi-gigabyte allocation straight from local disk.
+func maxExternalOutputCount(tSettings *settings.Settings) uint64 {
+	excessiveBlockSize := defaultExcessiveBlockSize
+
+	if tSettings != nil && tSettings.Policy != nil && tSettings.Policy.ExcessiveBlockSize > 0 {
+		excessiveBlockSize = tSettings.Policy.ExcessiveBlockSize
+	}
+
+	count := uint64(excessiveBlockSize) / minSerializedOutputSize //nolint:gosec // guarded > 0 above, and the constant fallback is positive
+
+	// Keep the derived count addressable as an int on every platform, so the
+	// caller's int conversion cannot overflow on an unusually large policy value.
+	if count > math.MaxInt32 {
+		count = math.MaxInt32
+	}
+
+	return count
 }
 
 // batchGetItemData holds the result of a batch get operation
@@ -1939,8 +1980,20 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 		//   - FileTypeOutputs (below) reconstructs outputs only, with no inputs,
 		//     version or locktime, so there is no body to hash. It gets the weaker
 		//     self-declared-txid check documented there.
-		//   - GetTxInpointsFromExternalStore parses input references only, by
-		//     design never materialising scripts or outputs. Same problem.
+		//   - GetTxInpointsFromExternalStore reads the same FileTypeTx blob, so
+		//     unlike the outputs file it does have a full body to hash. It is
+		//     excluded on cost, not impossibility: the function exists to stream
+		//     past every script and output and keep only the input references
+		//     (a ~99% memory saving on a blob that is external precisely because
+		//     it is large), and re-hashing means parsing the whole transaction,
+		//     which is the thing it is built to avoid. The residual exposure is
+		//     real and named here rather than implied: TxMetaFieldsForDecorate
+		//     routes through this path, so a stale or mis-keyed blob yields the
+		//     wrong parent set for that transaction. What that set drives is
+		//     dependency bookkeeping — subtree parent-presence and ordering
+		//     checks, and block assembly's ordering (Validator.go's
+		//     sendToBlockAssembler) — never a script or value check, so it is a
+		//     lower priority than the outputs rather than unreachable.
 		//   - getTxFromBins (the inline path, for transactions small enough to live
 		//     inside the Aerospike record) re-hashes correctly only for a record
 		//     created from a complete transaction. For those the bins do round-trip
@@ -1992,9 +2045,47 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external outputs blob declares a different txid (got %s) — stale, rotted or mis-keyed blob", previousTxHash.String(), uw.TxID.String())
 		}
 
-		utxos := utxopersister.PadUTXOsWithNil(uw.UTXOs)
+		// Size the output slice from the highest index in the blob, bounded.
+		//
+		// u.Index is a raw uint32 read straight out of local storage with no
+		// bound of its own (utxopersister.UTXOWrapper.NewUTXOFromReader), and the
+		// slice below is sized to maxIndex+1. A single flipped bit in that field
+		// therefore allocates up to 2^32 pointers, ~34 GB, and OOMs the node
+		// instead of producing the storage fault this whole function exists to
+		// produce. The neighbouring untrusted fields in this format are already
+		// capped this way — the UTXO count and each script length both refuse to
+		// pre-size from the claim — so the index was the gap.
+		//
+		// The bound is deliberately derived from the node's own block-size policy
+		// rather than picked: an output at index N needs a transaction of at least
+		// 9*(N+1) bytes (8 satoshis plus a one-byte empty script length), and a
+		// transaction cannot exceed the largest block this node would accept. So
+		// the cap can never reject a parent that could have been accepted in the
+		// first place, which is what keeps this from becoming a new permanent-stall
+		// path on a legitimate blob. ExcessiveBlockSize of 0 means "no limit" for
+		// block acceptance; here that would restore the unbounded allocation, so
+		// fall back to the setting's own documented 4 GB default.
+		//
+		// This replaces a utxopersister.PadUTXOsWithNil call whose padded slice was
+		// discarded after its length was read, so it also drops one full-size
+		// throwaway allocation per external outputs read.
+		var maxIndex uint32
+		for _, u := range uw.UTXOs {
+			if u.Index > maxIndex {
+				maxIndex = u.Index
+			}
+		}
 
-		tx.Outputs = make([]*bt.Output, len(utxos))
+		if len(uw.UTXOs) > 0 && uint64(maxIndex) >= maxExternalOutputCount(s.settings) {
+			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external outputs blob declares output index %d, beyond what any acceptable block could hold — rotted blob", previousTxHash.String(), maxIndex)
+		}
+
+		outputCount := 0
+		if len(uw.UTXOs) > 0 {
+			outputCount = int(maxIndex) + 1
+		}
+
+		tx.Outputs = make([]*bt.Output, outputCount)
 
 		for _, u := range uw.UTXOs {
 			lockingScript := bscript.NewFromBytes(u.Script)

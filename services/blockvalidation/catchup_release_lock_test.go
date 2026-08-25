@@ -239,6 +239,15 @@ func TestReleaseCatchupLock_StorageErrorIsLocalNotPeer(t *testing.T) {
 			recorder.mu.Lock()
 			defer recorder.mu.Unlock()
 
+			// The malicious report is the assertion that actually distinguishes the
+			// fix from its absence. Revert the storage case and the two
+			// wrapped-consensus rows below fall through to the consensus case,
+			// which sets reportMalicious and flags an honest peer for our own
+			// disk. failuresByPeer, by contrast, only moves when ctx.failedPeers is
+			// non-empty, which it is not here, so on its own it cannot fail —
+			// review caught that; it is kept as a second, weaker guard.
+			require.Zero(t, recorder.maliciousByPeer["honest-primary"],
+				"an honest peer must never be flagged malicious for a local storage fault")
 			require.Equal(t, 0, recorder.failuresByPeer["honest-primary"],
 				"a local storage fault must never be charged to the serving peer")
 			require.Empty(t, recorder.errorMsgsByPeer["honest-primary"])
@@ -338,6 +347,7 @@ type peerFailureRecordingP2PClient struct {
 	failuresByPeer  map[string]int
 	kindsByPeer     map[string][]string // every failureKind recorded per peer, in call order
 	errorMsgsByPeer map[string]string
+	maliciousByPeer map[string]int
 }
 
 func newPeerFailureRecordingP2PClient() *peerFailureRecordingP2PClient {
@@ -345,6 +355,7 @@ func newPeerFailureRecordingP2PClient() *peerFailureRecordingP2PClient {
 		failuresByPeer:  make(map[string]int),
 		kindsByPeer:     make(map[string][]string),
 		errorMsgsByPeer: make(map[string]string),
+		maliciousByPeer: make(map[string]int),
 	}
 }
 
@@ -361,6 +372,18 @@ func (r *peerFailureRecordingP2PClient) UpdateCatchupError(_ context.Context, pe
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.errorMsgsByPeer[peerID] = errorMsg
+
+	return nil
+}
+
+// RecordCatchupMalicious must be implemented rather than left to the embedded nil
+// P2PClientI: the storage-fault cases below assert that no malicious report is
+// made, and a nil-interface panic would "fail" those tests for the wrong reason
+// while telling a reader nothing about which peer was flagged.
+func (r *peerFailureRecordingP2PClient) RecordCatchupMalicious(_ context.Context, peerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.maliciousByPeer[peerID]++
 
 	return nil
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -125,6 +126,10 @@ func TestGetTxFromExternalStoreRehashesAgainstKey(t *testing.T) {
 
 		_, err := s.getExternalTransaction(ctx, parentHash)
 		require.Error(t, err)
+		// Name the producer, not just the class: three sites in this function
+		// return a StorageError, so asserting the class alone would still pass if
+		// the read failed somewhere else entirely and never reached the parse.
+		require.Contains(t, err.Error(), "could not read tx from stream")
 		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
 		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
 	})
@@ -268,6 +273,10 @@ func TestGetTxInpointsFromExternalStoreClassifiesParseFailureAsStorage(t *testin
 
 		_, err := s.GetTxInpointsFromExternalStore(ctx, parentHash)
 		require.Error(t, err)
+		// The parse is the producer under test; the sibling site in this function
+		// returns the same class for a failed fetch, so the class alone would not
+		// tell the two apart.
+		require.Contains(t, err.Error(), "could not parse input references")
 		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
 		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
 	})
@@ -279,6 +288,7 @@ func TestGetTxInpointsFromExternalStoreClassifiesParseFailureAsStorage(t *testin
 
 		_, err := s.GetTxInpointsFromExternalStore(ctx, parentHash)
 		require.Error(t, err)
+		require.Contains(t, err.Error(), "could not get tx from external store")
 		require.True(t, errors.Is(err, errors.ErrStorageError))
 		require.False(t, errors.Is(err, errors.ErrTxInvalid))
 	})
@@ -428,5 +438,149 @@ func TestClassifyRecordError(t *testing.T) {
 		// violation and a bad block would stall catchup instead of being rejected.
 		err := classifyRecordError("invalid tx", errors.NewTxInvalidError("output index out of range"))
 		require.True(t, errors.Is(err, errors.ErrTxInvalid))
+	})
+}
+
+// TestGetOutpointsFromExternalStoreNeverCachesMismatch mirrors the "never
+// cached" subtest above against the other entry point.
+//
+// GetOutpointsFromExternalStore has its own cache (externalOutpointsCache,
+// deliberately separate from externalTxCache because the value shape differs)
+// and its own second caching rule: a reconstruction with fewer than two active
+// outputs is returned but not retained. Both entry points funnel through
+// getExternalTransaction, so the rejection is shared, but "the rejected read is
+// not memoized" is a property of each cache and was only pinned on one of them.
+func TestGetOutpointsFromExternalStoreNeverCachesMismatch(t *testing.T) {
+	ctx := context.Background()
+
+	// Two outputs, because the caching rule refuses to retain a reconstruction
+	// with fewer than two active ones — a single-output fixture would make this
+	// test pass against a cache that never stored anything.
+	parent := buildParentTx(t, 1000, 0xaa)
+	parent.Outputs = append(parent.Outputs, &bt.Output{
+		Satoshis:      2000,
+		LockingScript: bscript.NewFromBytes([]byte{0x76, 0xa9, 0xcc, 0x88, 0xac}),
+	})
+
+	other := buildParentTx(t, 999999, 0xbb)
+
+	parentHash := *parent.TxIDChainHash()
+	require.NotEqual(t, parentHash, *other.TxIDChainHash())
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	s := &Store{
+		logger:                 ulogger.TestLogger{},
+		settings:               tSettings,
+		externalStore:          memory.New(),
+		externalOutpointsCache: util.NewExpiringConcurrentCacheWithMaxSize[chainhash.Hash, *bt.Tx](10*time.Second, 128),
+	}
+	t.Cleanup(s.externalOutpointsCache.Stop)
+
+	height := tSettings.ChainCfgParams.GenesisActivationHeight + 1
+
+	require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, other.ExtendedBytes()))
+
+	_, err := s.GetOutpointsFromExternalStore(ctx, parentHash, height)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrStorageError))
+
+	// Repair the blob. If the rejected read had been memoized, this would still
+	// fail — the cache is keyed on the txid alone.
+	require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeTx, parent.ExtendedBytes(), options.WithAllowOverwrite(true)))
+
+	got, err := s.GetOutpointsFromExternalStore(ctx, parentHash, height)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1000), got.Outputs[0].Satoshis)
+
+	// Positive control: deleting the blob leaves the store unable to serve a
+	// fresh read, so a second success can only have come from the cache. Without
+	// it this would also pass against a cache that stores nothing at all, which
+	// would prove nothing about the rejected read.
+	require.NoError(t, s.externalStore.Del(ctx, parentHash[:], fileformat.FileTypeTx))
+
+	got, err = s.GetOutpointsFromExternalStore(ctx, parentHash, height)
+	require.NoError(t, err, "a successful reconstruction must be retained by a live cache")
+	require.Equal(t, uint64(1000), got.Outputs[0].Satoshis)
+}
+
+// TestGetExternalTransactionBoundsOutputIndex pins that a corrupt output index
+// in an outputs-only blob produces a storage fault rather than an out-of-memory
+// kill.
+//
+// UTXO.Index is a raw uint32 read straight off local disk with no bound of its
+// own, and the reconstruction sizes its output slice to maxIndex+1. One flipped
+// bit in that field asked for up to 2^32 pointers, ~34 GB, so the node dies
+// instead of reporting the fault this function exists to report. The UTXO count
+// and the script lengths in the same format were already capped; the index was
+// the gap.
+func TestGetExternalTransactionBoundsOutputIndex(t *testing.T) {
+	ctx := context.Background()
+
+	parent := buildParentTx(t, 1000, 0xaa)
+	parentHash := *parent.TxIDChainHash()
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	newStore := func() *Store {
+		return &Store{logger: ulogger.TestLogger{}, settings: tSettings, externalStore: memory.New()}
+	}
+
+	writeOutputsBlob := func(t *testing.T, s *Store, index uint32) {
+		t.Helper()
+
+		wrapper := &utxopersister.UTXOWrapper{
+			TxID:   parentHash,
+			Height: 1,
+			UTXOs: []*utxopersister.UTXO{{
+				Index:  index,
+				Value:  1000,
+				Script: *parent.Outputs[0].LockingScript,
+			}},
+		}
+		require.NoError(t, s.externalStore.Set(ctx, parentHash[:], fileformat.FileTypeOutputs, wrapper.Bytes()))
+	}
+
+	t.Run("an absurd index is rejected as a storage fault", func(t *testing.T) {
+		s := newStore()
+		writeOutputsBlob(t, s, ^uint32(0)) // 2^32-1: what a flipped high bit looks like
+
+		_, err := s.getExternalTransaction(ctx, parentHash)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "beyond what any acceptable block could hold")
+		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
+		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
+	})
+
+	t.Run("a legitimate sparse index is still accepted", func(t *testing.T) {
+		// The bound must not become a new permanent-stall path. Holes are normal
+		// here: StorePartialTransactionExternally skips nil outputs, so a parent
+		// whose low outputs were already spent at write time legitimately declares
+		// only a high index.
+		s := newStore()
+		writeOutputsBlob(t, s, 5000)
+
+		got, err := s.getExternalTransaction(ctx, parentHash)
+		require.NoError(t, err)
+		require.Len(t, got.Outputs, 5001)
+		require.Equal(t, uint64(1000), got.Outputs[5000].Satoshis)
+		require.Nil(t, got.Outputs[0], "the padded holes must stay nil")
+	})
+
+	t.Run("the bound tracks the node's own block-size policy", func(t *testing.T) {
+		// Derived, not picked: an output at index N needs a transaction of at
+		// least 9*(N+1) bytes, and a transaction cannot exceed the largest block
+		// this node would accept. So the cap can never reject a parent that could
+		// have been accepted in the first place.
+		require.Equal(t, uint64(tSettings.Policy.ExcessiveBlockSize)/minSerializedOutputSize, maxExternalOutputCount(tSettings))
+
+		// 0 means "no limit" for block acceptance; here it would restore the
+		// unbounded allocation, so it falls back to the setting's own default.
+		zeroed := test.CreateBaseTestSettings(t)
+		zeroed.Policy.ExcessiveBlockSize = 0
+		require.Equal(t, uint64(defaultExcessiveBlockSize)/minSerializedOutputSize, maxExternalOutputCount(zeroed))
+
+		// Nil settings must not panic into the unbounded path either.
+		require.Equal(t, uint64(defaultExcessiveBlockSize)/minSerializedOutputSize, maxExternalOutputCount(nil))
 	})
 }
