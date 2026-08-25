@@ -56,8 +56,20 @@ type Store struct {
 }
 
 // New opens the store and installs the schema.
+//
+// The store is reached by its own URL scheme, utxoset://, so that an operator selecting it
+// has to mean it rather than flipping a query parameter on a postgres:// URL that points at
+// an incompatible schema. pgx knows nothing about that scheme, and given it will not fail
+// cleanly: it folds the entire URL into a config parameter and falls back to a unix socket,
+// which surfaces as a baffling "unrecognized configuration parameter" against the wrong
+// host. So normalise it here, at the one place that owns the connection.
 func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, storeURL *url.URL) (*Store, error) {
-	pool, err := pgxpool.New(ctx, storeURL.String())
+	dsn := *storeURL
+	if dsn.Scheme == "utxoset" {
+		dsn.Scheme = "postgres"
+	}
+
+	pool, err := pgxpool.New(ctx, dsn.String())
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset] open pool", err)
 	}
