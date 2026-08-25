@@ -90,8 +90,17 @@ func feelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPe
 // startFeeler and feelerHandler in this file, and handleAddPeerMsg and
 // handleQuery in peer_server.go, none of which runs until peerHandler does.
 func (s *server) setFeelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPeers int) {
+	// Unreachable on the real path: newServer assigns s.connManager immediately
+	// above its only call. It is logged rather than left silent because it is the
+	// one way the ordering contract in the doc comment can be broken, and a
+	// silent zero here looks exactly like an operator having switched feelers
+	// off. This is the fourth and last way the budget can come out zero, and like
+	// the three in feelerBudget it says which one it is.
 	if s.connManager == nil {
+		logger.Warnf("[Feeler] Disabled: no connection manager, so the outbound target the reservation is judged against is unknown")
+
 		s.feelerSlots = 0
+
 		return
 	}
 

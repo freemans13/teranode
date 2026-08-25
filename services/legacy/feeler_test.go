@@ -1117,6 +1117,28 @@ func TestSetFeelerBudgetUsesTheManagersEffectiveTarget(t *testing.T) {
 		"the shipped defaults leave the outbound tier untouched, so the slot is granted")
 }
 
+// TestSetFeelerBudgetNamesAMissingConnectionManager covers the fourth and last
+// way the budget can come out zero.
+//
+// newServer assigns connManager immediately above the only call, so this is
+// unreachable in production. It is worth a line anyway: it is the one way the
+// ordering contract in setFeelerBudget's doc comment can be broken, and a
+// silent zero there is indistinguishable from an operator having pulled the
+// legacy_maxFeelerPeers lever. Whoever reorders those two statements should be
+// told what they cost, not left reading an address book that stops being
+// verified.
+func TestSetFeelerBudgetNamesAMissingConnectionManager(t *testing.T) {
+	rec := &recordingLogger{Logger: ulogger.TestLogger{}}
+	srv := &server{logger: ulogger.TestLogger{}}
+
+	srv.setFeelerBudget(rec, 1, false, 20)
+
+	require.Equal(t, 0, srv.feelerSlots,
+		"without a manager there is no target to judge the reservation against, so nothing is reserved")
+	require.Contains(t, rec.logged(), "no connection manager",
+		"the last silent path has to name itself too, or a broken call order looks like a config choice")
+}
+
 // TestFeelerHandlerWaitsForASlotToken pins the enforcement site itself.
 //
 // The reservation is only worth anything if the loop actually respects it. The
