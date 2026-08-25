@@ -417,7 +417,7 @@ func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_Success(t *testing.T) {
 		ParentTxHashes: []chainhash.Hash{},
 	}
 
-	regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta)
+	require.NoError(t, regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta))
 
 	// Verify meta was stored
 	require.Len(t, mockStore.storedMeta, 1)
@@ -487,8 +487,9 @@ func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_NilStore(t *testing.T) {
 	meta := subtreepkg.NewSubtreeMeta(subtree)
 	meta.TxInpoints[1] = subtreepkg.TxInpoints{}
 
-	// Should not panic with nil store
-	regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta)
+	// A nil store is not an error: there is nowhere to cache the meta, so the
+	// caller carries on with the regenerated one in memory rather than failing.
+	require.NoError(t, regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta))
 }
 
 func TestSubtreeStoreAdapter(t *testing.T) {
