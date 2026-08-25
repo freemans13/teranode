@@ -832,7 +832,8 @@ func (s *server) feelerPeerConfig(res *feelerResult) *peer.Config {
 // address: the net.Addr is what gets dialled, the wire.NetAddress is what the
 // book is afterwards told about. Resolving here rather than in the probe is
 // what stops an address this layer cannot dial costing a whole probe interval;
-// the reasoning is at the resolve step at the end of the loop.
+// the reasoning, including why the resolve leads the other tests rather than
+// following them, is at the resolve step in the loop below.
 //
 // The escalation thresholds mirror newAddressFunc exactly, so the probe and the
 // dial path judge an address the same way. Two deliberate differences from
