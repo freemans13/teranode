@@ -31,10 +31,6 @@ func (s *Store) SetMinedMulti(_ context.Context, _ []*chainhash.Hash, _ utxo.Min
 	return nil, errM1("SetMinedMulti")
 }
 
-func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
-	return nil, errM1("GetUnminedTxIterator")
-}
-
 func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
 	return nil, errM1("ScanInconsistentUnminedTxs")
 }
@@ -97,10 +93,6 @@ func (s *Store) BeginConflictIntent(_ context.Context, _ utxo.ConflictIntent) er
 
 func (s *Store) CompleteConflictIntent(_ context.Context, _ chainhash.Hash) error {
 	return errM1("CompleteConflictIntent")
-}
-
-func (s *Store) PendingConflictIntents(_ context.Context) ([]utxo.ConflictIntent, error) {
-	return nil, errM1("PendingConflictIntents")
 }
 
 func (s *Store) MarkTransactionsOnLongestChain(_ context.Context, _ []chainhash.Hash, _ bool) error {
