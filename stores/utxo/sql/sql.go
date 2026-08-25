@@ -1583,19 +1583,8 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		LockTime: lockTime,
 	}
 
-	if contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos) {
-		q := `
-			SELECT
-			 previous_transaction_hash
-			,previous_tx_idx
-			,previous_tx_satoshis
-			,previous_tx_script
-			,unlocking_script
-			,sequence_number
-			FROM inputs
-			WHERE transaction_id = $1
-			ORDER BY idx
-		`
+	if scope := inputsScopeFor(bins); scope != inputsQueryNone {
+		q := inputsQuerySQL(scope, "transaction_id = $1")
 
 		rows, err := s.db.QueryContext(ctx, q, id)
 		if err != nil {
@@ -1609,7 +1598,7 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 			var previousTxHashBytes []byte
 			var previousTxIdx int64
 
-			if err := rows.Scan(&previousTxHashBytes, &previousTxIdx, &input.PreviousTxSatoshis, &input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
+			if err := rows.Scan(scanTargetsForInputScope(scope, &previousTxHashBytes, &previousTxIdx, input)...); err != nil {
 				return nil, err
 			}
 			input.PreviousTxOutIndex = uint32(previousTxIdx)
@@ -1627,7 +1616,7 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		}
 	}
 
-	if contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos) {
+	if needsOutputsQuery(bins) {
 		q := `SELECT locking_script, satoshis FROM outputs WHERE transaction_id = $1 ORDER BY idx`
 
 		rows, err := s.db.QueryContext(ctx, q, id)
@@ -1807,6 +1796,81 @@ func needsBlockIDsQuery(bins []fields.FieldName) bool {
 	return contains(bins, fields.BlockIDs) ||
 		contains(bins, fields.BlockHeights) ||
 		contains(bins, fields.SubtreeIdxs)
+}
+
+// inputsQueryScope says how much of the inputs table a read has to load.
+//
+// The outpoint columns (previous_transaction_hash, previous_tx_idx) are all
+// fields.TxInpoints consumes: subtree.NewTxInpointsFromInputs reads the parent
+// hash and vout of each input and nothing else. The remaining four columns exist
+// so fields.Tx and fields.Inputs can rebuild a whole transaction, and they carry
+// the unlocking script, which is the bulk of an input by size.
+type inputsQueryScope int
+
+const (
+	// inputsQueryNone means the inputs table need not be read at all.
+	inputsQueryNone inputsQueryScope = iota
+	// inputsQueryOutpoints means only the parent hash and vout are needed.
+	inputsQueryOutpoints
+	// inputsQueryFull means every column is needed to rebuild the transaction.
+	inputsQueryFull
+)
+
+// inputsScopeFor reports which inputs columns a field set actually needs. Both
+// read paths call it so the grouping is stated once rather than copied.
+//
+// fields.Utxos is deliberately absent. It is served by its own query over the
+// outputs table (see the fields.Utxos block in Get) and never reads tx.Inputs,
+// so pulling the inputs rows for it was pure waste.
+func inputsScopeFor(bins []fields.FieldName) inputsQueryScope {
+	if contains(bins, fields.Tx) || contains(bins, fields.Inputs) {
+		return inputsQueryFull
+	}
+
+	if contains(bins, fields.TxInpoints) {
+		return inputsQueryOutpoints
+	}
+
+	return inputsQueryNone
+}
+
+// inputsQuerySQL builds the inputs SELECT for a scope. The ORDER BY is load
+// bearing in both scopes: TxInpoints ordering has to match the transaction's
+// input order.
+func inputsQuerySQL(scope inputsQueryScope, whereClause string) string {
+	cols := "previous_transaction_hash,previous_tx_idx"
+	if scope == inputsQueryFull {
+		cols += ",previous_tx_satoshis,previous_tx_script,unlocking_script,sequence_number"
+	}
+
+	return "SELECT " + cols + " FROM inputs WHERE " + whereClause + " ORDER BY idx"
+}
+
+// scanTargetsForInputScope returns the Scan destinations matching the column list
+// inputsQuerySQL emitted for the same scope. In the outpoint scope the extended
+// and unlocking fields are left at their zero values, which is what every
+// fields.TxInpoints consumer already expects to be handed.
+func scanTargetsForInputScope(scope inputsQueryScope, hashBytes *[]byte, prevTxIdx *int64, input *bt.Input) []interface{} {
+	targets := []interface{}{hashBytes, prevTxIdx}
+
+	if scope == inputsQueryFull {
+		targets = append(targets,
+			&input.PreviousTxSatoshis,
+			&input.PreviousTxScript,
+			&input.UnlockingScript,
+			&input.SequenceNumber,
+		)
+	}
+
+	return targets
+}
+
+// needsOutputsQuery reports whether the outputs read is required. fields.Utxos is
+// deliberately absent for the same reason as in inputsScopeFor: it runs its own
+// query and only ever used the outputs read for a slice length, which the
+// vout-indexed sizing no longer needs.
+func needsOutputsQuery(bins []fields.FieldName) bool {
+	return contains(bins, fields.Tx) || contains(bins, fields.Outputs)
 }
 
 // parseInsertedAtMillis converts the inserted_at column value into Unix
@@ -3710,13 +3774,17 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 		ids = append(ids, id)
 	}
 
-	needInputs := contains(bins, fields.Tx) || contains(bins, fields.Inputs) || contains(bins, fields.TxInpoints) || contains(bins, fields.Utxos)
-	needOutputs := contains(bins, fields.Tx) || contains(bins, fields.Outputs) || contains(bins, fields.Utxos)
+	// fields.Utxos is not part of either gate. This path does not populate
+	// SpendingDatas at all, and Get routes a fields.Utxos request away from the
+	// batcher for that reason, so reading inputs and outputs for it fetched rows
+	// that were then discarded.
+	inputsScope := inputsScopeFor(bins)
+	needOutputs := needsOutputsQuery(bins)
 	needBlockIDs := needsBlockIDsQuery(bins)
 
 	// Query 2: Bulk fetch inputs
-	if needInputs {
-		if err := s.batchDecorateInputs(ctx, ids, idToTx); err != nil {
+	if inputsScope != inputsQueryNone {
+		if err := s.batchDecorateInputs(ctx, ids, idToTx, inputsScope); err != nil {
 			return err
 		}
 	}
@@ -3749,7 +3817,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 				Version:  row.version,
 				LockTime: row.lockTime,
 			}
-			if needInputs && row.data.Tx != nil {
+			if inputsScope != inputsQueryNone && row.data.Tx != nil {
 				tx.Inputs = row.data.Tx.Inputs
 			}
 			if needOutputs && row.data.Tx != nil {
@@ -3761,7 +3829,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 			row.data.TxInpoints, _ = subtree.NewTxInpointsFromInputs(row.data.Tx.Inputs)
 		}
 
-		if contains(bins, fields.Tx) || needInputs || needOutputs {
+		if contains(bins, fields.Tx) || inputsScope != inputsQueryNone || needOutputs {
 			row.data.Tx = tx
 		} else {
 			row.data.Tx = nil
@@ -3776,7 +3844,7 @@ func (s *Store) batchDecorateChunk(ctx context.Context, items []*utxo.Unresolved
 }
 
 // batchDecorateInputs bulk-fetches inputs for multiple transactions.
-func (s *Store) batchDecorateInputs(ctx context.Context, ids []int, idToTx map[int]*batchDecorateTxRow) error {
+func (s *Store) batchDecorateInputs(ctx context.Context, ids []int, idToTx map[int]*batchDecorateTxRow, scope inputsQueryScope) error {
 	idPlaceholders := make([]string, len(ids))
 	idArgs := make([]interface{}, len(ids))
 	for i, id := range ids {
@@ -3785,7 +3853,15 @@ func (s *Store) batchDecorateInputs(ctx context.Context, ids []int, idToTx map[i
 	}
 	inClause := "(" + strings.Join(idPlaceholders, ",") + ")"
 
-	q := `SELECT transaction_id, previous_transaction_hash, previous_tx_idx, previous_tx_satoshis, previous_tx_script, unlocking_script, sequence_number FROM inputs WHERE transaction_id IN ` + inClause + ` ORDER BY transaction_id, idx`
+	// transaction_id leads the projection so a batch can be split back out per
+	// transaction; the rest of the column list is the scope's, so an outpoint-only
+	// caller does not pay for the unlocking script of every input in the batch.
+	cols := "transaction_id, previous_transaction_hash, previous_tx_idx"
+	if scope == inputsQueryFull {
+		cols += ", previous_tx_satoshis, previous_tx_script, unlocking_script, sequence_number"
+	}
+
+	q := `SELECT ` + cols + ` FROM inputs WHERE transaction_id IN ` + inClause + ` ORDER BY transaction_id, idx`
 
 	rows, err := s.db.QueryContext(ctx, q, idArgs...)
 	if err != nil {
@@ -3800,7 +3876,11 @@ func (s *Store) batchDecorateInputs(ctx context.Context, ids []int, idToTx map[i
 		)
 		input := &bt.Input{}
 		var previousTxIdx int64
-		if err := rows.Scan(&txID, &prevTxHashBytes, &previousTxIdx, &input.PreviousTxSatoshis, &input.PreviousTxScript, &input.UnlockingScript, &input.SequenceNumber); err != nil {
+
+		scanTargets := append([]interface{}{&txID},
+			scanTargetsForInputScope(scope, &prevTxHashBytes, &previousTxIdx, input)...)
+
+		if err := rows.Scan(scanTargets...); err != nil {
 			return err
 		}
 		input.PreviousTxOutIndex = uint32(previousTxIdx)
@@ -3825,7 +3905,9 @@ func (s *Store) batchDecorateInputs(ctx context.Context, ids []int, idToTx map[i
 		row.data.Tx.Inputs = append(row.data.Tx.Inputs, input)
 	}
 
-	return nil
+	// A truncated read would drop inputs silently, which shows up downstream as a
+	// transaction with fewer parents than it really has.
+	return rows.Err()
 }
 
 // batchDecorateOutputs bulk-fetches outputs for multiple transactions.
