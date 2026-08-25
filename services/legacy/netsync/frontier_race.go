@@ -168,13 +168,12 @@ func (sm *SyncManager) setFrontier(hash chainhash.Hash, height int32, now time.T
 //   - we already have as many peers on it as configuration allows;
 //   - we are throttling our own network reads because local validation is
 //     behind, in which case the silence is ours, not the peer's;
-//   - the sync peer owes the frontier and its connection is visibly pulling
-//     bytes, which means it is part-way through a large block rather than
-//     ignoring us — racing a peer mid-transfer just buys a duplicate of a
-//     download that is already working. The sample is only consulted when the
-//     sync peer is the peer that owes the block, because it is the only
-//     download-throughput sample this node keeps and it says nothing about
-//     anybody else's connection;
+//   - some peer that owes the frontier is visibly pulling bytes, which means it
+//     is part-way through a large block rather than ignoring us. Racing a peer
+//     mid-transfer just buys a duplicate of a download that is already working.
+//     Every owner is asked, not only the sync peer: under the fan-out the
+//     frontier belongs to whichever peer the scheduler gave it to, and one owner
+//     making real progress is enough to call off the race;
 //   - there is nobody else worth asking.
 func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32, *peerpkg.Peer, bool) {
 	var none chainhash.Hash
@@ -257,6 +256,13 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	//
 	// The frontier's own age is already checked above, which is where svnode puts
 	// its per-owner slow-fetch timeout.
+	// Guard before the first read, not after it. Both loops below dereference
+	// peerStates, and SyncedMap.Get takes the receiver's lock, so a nil map
+	// panics on the way in rather than returning "not found".
+	if sm.peerStates == nil {
+		return none, 0, nil, false
+	}
+
 	for _, owner := range sm.blockDownloads.OwnersOf(hash) {
 		if owner == nil || !owner.Connected() {
 			continue
@@ -265,10 +271,6 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 		if state, ok := sm.peerStates.Get(owner); ok && state.isPullingBytes(sm.minSyncPeerNetworkSpeed) {
 			return none, 0, nil, false
 		}
-	}
-
-	if sm.peerStates == nil {
-		return none, 0, nil, false
 	}
 
 	for p, state := range sm.peerStates.Range() {

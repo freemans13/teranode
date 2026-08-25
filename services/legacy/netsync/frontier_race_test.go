@@ -880,3 +880,36 @@ func TestFrontierRace_ADepartedRacerDoesNotDisableTheRace(t *testing.T) {
 	require.True(t, sm.blockDownloads.HasOwner(live, frontier),
 		"the racer's reply has to be authorised in advance")
 }
+
+// TestFrontierRace_NilPeerStatesDoesNotPanic proves the nil-peerStates guard in
+// frontierRaceTarget actually guards. It used to sit below the owner-throughput
+// loop, which calls sm.peerStates.Get; SyncedMap.Get takes the receiver's lock,
+// so a nil map panics on the way in rather than returning "not found", and the
+// one state the guard claimed to defend against crashed before reaching it.
+func TestFrontierRace_NilPeerStatesDoesNotPanic(t *testing.T) {
+	sm := newRaceManager(t)
+
+	owner, _, _ := connectRacePeer(t, 60, 1000)
+	registerRacePeer(sm, owner)
+	sm.storeSyncPeer(owner, &syncPeerState{})
+
+	frontier := chainhash.Hash{0xcd}
+
+	require.True(t, sm.blockDownloads.Add(owner, frontier))
+	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
+
+	// Precondition: every earlier bail-out is cleared, so the loop over the
+	// ledger's owners is genuinely reached. The sole owner is also the only
+	// registered peer, so there is nobody left to race and ok is false.
+	_, _, target, ok := sm.frontierRaceTarget(time.Now())
+	require.False(t, ok)
+	require.Nil(t, target)
+
+	sm.peerStates = nil
+
+	require.NotPanics(t, func() {
+		_, _, target, ok := sm.frontierRaceTarget(time.Now())
+		require.False(t, ok, "with no peer states there is nobody to race")
+		require.Nil(t, target)
+	})
+}
