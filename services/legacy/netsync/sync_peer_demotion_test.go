@@ -550,10 +550,15 @@ func TestDemotion_AHeadersBatchThatStartsConnectingAndThenStopsIsStillPunished(t
 // same lock the block-queue consumer takes first in headers-first mode, and
 // nothing at all for the sender.
 //
-// Two end states are pinned. A peer nobody demoted is disconnected for a batch
-// that never connects, however familiar its headers are. And the demoted peer
-// is covered only while its demotion cooldown is running, which is what the
-// carve-out was written for and the expiry it did not have.
+// Three end states are pinned. A peer that is neither the sync peer nor inside a
+// demotion cooldown is disconnected for a batch that never connects, however
+// familiar its headers are. The demoted peer is covered only while its cooldown
+// is running, which is the expiry the carve-out did not have. And the current
+// sync peer stays covered, because startSync elects on height alone and a peer
+// hundreds of headers below the back of the list answers our locator from the
+// newest block it has: see
+// TestHeadersRoundLocator_APeerThatCannotReachTheBackKeepsItsConnection, which
+// is why scoping this to the demotion cooldown alone is too narrow.
 func TestDemotion_TheLateHeadersCarveOutIsScopedAndExpires(t *testing.T) {
 	var nonce uint32
 
@@ -584,6 +589,14 @@ func TestDemotion_TheLateHeadersCarveOutIsScopedAndExpires(t *testing.T) {
 
 	require.False(t, bystander.Connected(),
 		"the carve-out is for a peer whose late reply we caused, not for anybody re-sending headers we happen to hold")
+
+	// The sync peer re-sending a batch it already contributed is the elected
+	// peer answering our locator from where its own chain ends, so it keeps the
+	// carve-out.
+	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: successor})
+
+	require.True(t, successor.Connected(),
+		"the current sync peer must keep the carve-out, it is the peer we are asking")
 
 	state, ok := sm.peerStates.Get(stalled)
 	require.True(t, ok)

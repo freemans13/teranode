@@ -3817,22 +3817,31 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			// connecting and then stops is a different animal, and still costs
 			// the sender its connection.
 			//
-			// Scoped to a peer inside its demotion cooldown, which is the only
-			// peer whose late reply we caused, and which is also what gives the
-			// carve-out an expiry. Without that scope holdHeader is satisfied by
-			// ANY header currently in the index, so any peer could re-send a
-			// batch it once contributed, or any prefix of it, for ever: 2000
-			// headers of bandwidth and decode plus a headerMu acquisition each
-			// time, the same lock the block-queue consumer takes first in
-			// headers-first mode, and nothing at all for the sender.
+			// Scoped to the two senders whose non-connecting reply we caused,
+			// and to nobody else. Without a scope holdHeader is satisfied by ANY
+			// header currently in the index, so any peer could re-send a batch it
+			// once contributed, or any prefix of it, for ever: up to 2000 headers
+			// of bandwidth and decode plus a headerMu acquisition each time, the
+			// same lock the block-queue consumer takes first in headers-first
+			// mode, and nothing at all for the sender.
+			//
+			// The two are the peer we just demoted, whose getheaders we sent
+			// before the swap, and the current sync peer, which startSync elects
+			// on height alone and so can be hundreds of headers below the back of
+			// the list: it answers our locator from the newest block it has, which
+			// connects to a header we hold rather than to the back. Both expire.
+			// The cooldown expires on its own timer, and a sync peer that only
+			// ever sends headers that do not connect refreshes no block time, so
+			// the stall detector takes the role off it.
 			//
 			// Only reachable with the fan-out on, because that is what keeps a
 			// demoted peer connected in the first place.
 			_, holdParent := sm.headerIndex[blockHeader.PrevBlock]
 			_, holdHeader := sm.headerIndex[blockHash]
+			weAsked := state.inDemotionCooldown() || peer == sm.loadSyncPeer()
 
 			if sm.settings.Legacy.MultiPeerBlockDownload && pushed == 0 &&
-				state.inDemotionCooldown() && (holdParent || holdHeader) {
+				weAsked && (holdParent || holdHeader) {
 				staleReply = true
 
 				break
