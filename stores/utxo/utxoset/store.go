@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/jackc/pgx/v5"
@@ -103,8 +104,30 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 // outpoint set, so a spend needs nothing but the outpoint to be authorised.
 func (s *Store) SupportsOutpointOnlySpend() bool { return true }
 
+// SetBlockHeight records the chain height and, with it, decides whether spends are
+// currently reversible.
+//
+// This is the only production driver of sync mode, and driving it from the height rather
+// than from a setting is deliberate. The journal exists so a reorg can restore a
+// destroyed coin. Below the hardcoded checkpoint a reorg is impossible by rule, so the
+// journal is a heap insert plus an index insert per input, every spend, for nothing:
+// exactly the per-spend write amplification that below-checkpoint mode exists to remove.
+// Above the checkpoint it is load-bearing and must be back on.
+//
+// Tying both edges to the height means neither an operator nor a restart can leave the
+// store in the wrong state, and the node re-arms itself the moment it crosses over. The
+// boundary comes from model.BelowCheckpoint, which documents itself as the single
+// definition and warns against re-deriving the comparison.
+//
+// The factory calls this once per block from a single-threaded notification goroutine
+// (stores/utxo/factory/utxo.go), so it is outside any transaction and cannot contend.
 func (s *Store) SetBlockHeight(height uint32) error {
 	s.blockHeight.Store(height)
+
+	if s.settings != nil {
+		s.SetSyncMode(model.BelowCheckpoint(s.settings.ChainCfgParams.Checkpoints, height))
+	}
+
 	return nil
 }
 
