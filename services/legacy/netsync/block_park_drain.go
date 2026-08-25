@@ -1,6 +1,7 @@
 package netsync
 
 import (
+	"context"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -20,6 +21,40 @@ import (
 // production writes it, and the only reader takes its value once, when the block
 // handler starts.
 var parkSweepInterval = 30 * time.Second
+
+// chainCtx puts a deadline on one blockchain lookup made from the block-commit
+// goroutine.
+//
+// The park already says why, for the other half of its I/O: "Park, read-back and
+// delete all run on the single goroutine that commits blocks in order, so an
+// undeadlined one is head-of-line blocking for every block queued behind it"
+// (blockPark.storeCtx). The chain lookups on that same goroutine had no
+// equivalent, and the sweep makes up to parkSweepRPCBudget of them per tick,
+// sequentially, on sm.ctx, which carries no deadline. Capped in count is not
+// capped in time, and time is the quantity that comment identifies as the one
+// that matters.
+//
+// Same order as legacy_parkStoreTimeout, because it is the same goroutine and
+// the same argument. parkMinStoreTimeout is the fallback for a manager built
+// without a park, which is how most of this package's tests build one.
+func (sm *SyncManager) chainCtx() (context.Context, context.CancelFunc) {
+	timeout := parkMinStoreTimeout
+	if sm.blockPark != nil && sm.blockPark.storeTimeout > 0 {
+		timeout = sm.blockPark.storeTimeout
+	}
+
+	return context.WithTimeout(sm.ctx, timeout)
+}
+
+// blockExistsWithDeadline is the sweep's parent lookup, in a function of its own
+// so the deadline is released at the end of each iteration rather than piling up
+// until the end of the tick.
+func (sm *SyncManager) blockExistsWithDeadline(hash chainhash.Hash) (bool, error) {
+	ctx, cancel := sm.chainCtx()
+	defer cancel()
+
+	return sm.blockchainClient.GetBlockExists(ctx, &hash)
+}
 
 // drainParkedDescendants commits everything parked behind a block that has just
 // been committed, and then everything parked behind those, and so on.
@@ -129,7 +164,10 @@ func (sm *SyncManager) replayingHistory() bool {
 		return false
 	}
 
-	state, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
+	ctx, cancel := sm.chainCtx()
+	defer cancel()
+
+	state, err := sm.blockchainClient.GetFSMCurrentState(ctx)
 	if err != nil {
 		sm.logger.Warnf("[replayingHistory] could not read the FSM state, so no peer is blamed for a block that would not commit: %v", err)
 
@@ -174,7 +212,10 @@ func (sm *SyncManager) noteCommittedParkedBlock(entry parkedBlock) {
 	height := entry.height
 
 	if height <= 0 {
-		_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &entry.hash)
+		ctx, cancel := sm.chainCtx()
+		defer cancel()
+
+		_, meta, err := sm.blockchainClient.GetBlockHeader(ctx, &entry.hash)
 		if err != nil {
 			sm.logger.Warnf("[commitParkedBlock][%s] could not read back the committed height: %v", entry.hash, err)
 		} else if h, convErr := safeconversion.Uint32ToInt32(meta.Height); convErr != nil {
@@ -262,6 +303,13 @@ func (sm *SyncManager) resumeHeaderWalk() {
 // is easy to miss, and it is the more expensive item — a store delete and a
 // cursor rewind rather than a lookup — and the one that arrives in bursts,
 // because blocks parked together age out together.
+//
+// Both of those cap a COUNT. Time is capped separately and has to be: the
+// lookups are sequential, so a slow blockchain service turns a bounded number of
+// calls into an unbounded tick, on the goroutine every queued block is waiting
+// behind. chainCtx is what bounds each one, and a lookup that runs out of time
+// is treated as "could not check", which leaves the block parked for the next
+// tick.
 func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 	if !sm.blockPark.Enabled() {
 		return
@@ -273,7 +321,7 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 	}
 
 	for _, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {
-		exists, err := sm.blockchainClient.GetBlockExists(sm.ctx, &candidate.prevBlock)
+		exists, err := sm.blockExistsWithDeadline(candidate.prevBlock)
 		if err != nil {
 			sm.logger.Warnf("[sweepParkedBlocks][%s] could not check whether parent %s is stored: %v", candidate.hash, candidate.prevBlock, err)
 			continue
