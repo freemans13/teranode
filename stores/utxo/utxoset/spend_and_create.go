@@ -53,6 +53,16 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		return nil, nil, errors.NewInvalidArgumentError("[utxoset][SpendAndCreate] WithCreateOnly and WithSpendOnly are mutually exclusive")
 	}
 
+	// BEFORE the transaction is opened, never inside it. See
+	// ensureSpendJournalPartitionForSpend: the DDL needs its own pool connection, and
+	// taking one while holding a transaction from the same pool deadlocks the pool under
+	// concurrency.
+	if !options.CreateOnly {
+		if err := s.ensureSpendJournalPartitionForSpend(ctx, blockHeight); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	dbTx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, errors.NewStorageError("[utxoset][SpendAndCreate] begin", err)

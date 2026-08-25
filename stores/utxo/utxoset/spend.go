@@ -66,7 +66,27 @@ SELECT k.vin, u.flags, u.spendable_from
 // error, matching the postgres store's contract: the caller needs to know WHICH input
 // failed and why.
 func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	if err := s.ensureSpendJournalPartitionForSpend(ctx, blockHeight); err != nil {
+		return nil, err
+	}
+
 	return s.spendIn(ctx, s.pool, tx, blockHeight, ignoreFlags...)
+}
+
+// ensureSpendJournalPartitionForSpend prepares the journal leaf a spend at this height
+// will write into, and MUST be called before the caller opens its transaction.
+//
+// The ordering is the whole point. The partition DDL needs its own connection, so issuing
+// it from inside a transaction borrowed from the same pool is a nested acquire: at
+// pool_max_conns concurrent spenders, every connection is held by a transaction blocked
+// waiting for a connection, and nothing breaks the cycle. Doing it first costs one extra
+// round trip on the 1-in-48 heights that miss the cache, and nothing on the rest.
+func (s *Store) ensureSpendJournalPartitionForSpend(ctx context.Context, blockHeight uint32) error {
+	if !s.journal.Load() {
+		return nil
+	}
+
+	return s.ensureSpendJournalPartition(ctx, blockHeight)
 }
 
 // spendIn is Spend against an arbitrary querier.
@@ -98,11 +118,11 @@ func (s *Store) spendIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight u
 	var rows pgx.Rows
 
 	if s.journal.Load() {
-		// The journal leaf must exist before the insert, and creating it is idempotent.
-		if err = s.ensureSpendJournalPartition(ctx, blockHeight); err != nil {
-			return nil, err
-		}
-
+		// The partition must already exist. Creating it HERE would be a nested acquire
+		// from the same pool that q is borrowed from when q is a transaction, and once
+		// the number of concurrent spenders reaches pool_max_conns every connection is
+		// held by a transaction waiting for a connection. That deadlock has no timeout.
+		// Callers ensure the partition before they open their transaction.
 		rows, err = q.Query(ctx, spendJournalSQL, leaves, ukeys, txids, vins,
 			int32(blockHeight), spendingTxID[:])
 	} else {

@@ -82,6 +82,18 @@ func (s *Store) ensureSpendJournalPartition(ctx context.Context, height uint32) 
 		return nil
 	}
 
+	// One writer per process. CREATE TABLE IF NOT EXISTS is NOT concurrency-safe in
+	// PostgreSQL: simultaneous attempts race on the pg_type row and raise a unique
+	// violation rather than quietly agreeing. With the spend phase running thousands of
+	// goroutines, that race is the common case rather than the rare one.
+	s.journalDDL.Lock()
+	defer s.journalDDL.Unlock()
+
+	// Re-check under the lock: the winner may have created it while we queued.
+	if s.journalLeaf.Load() == leaf+1 {
+		return nil
+	}
+
 	lo := leaf * SpendJournalPartitionBlocks
 	hi := lo + SpendJournalPartitionBlocks
 

@@ -3,6 +3,7 @@ package utxoset
 import (
 	"context"
 	"net/url"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -50,6 +51,10 @@ type Store struct {
 	// journalLeaf is the spend-journal leaf the last spend landed in, so the catalog is only
 	// touched when it changes.
 	journalLeaf atomic.Uint32
+
+	// journalDDL serialises spend-journal partition creation within this process.
+	// CREATE TABLE IF NOT EXISTS is not concurrency-safe in PostgreSQL.
+	journalDDL sync.Mutex
 
 	// journalRetention is how far back spends stay undoable, in blocks.
 	journalRetention uint32
