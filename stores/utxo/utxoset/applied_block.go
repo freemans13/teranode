@@ -71,3 +71,68 @@ func (s *Store) ApplyBlock(ctx context.Context, blockHash *chainhash.Hash, heigh
 
 	return true, nil
 }
+
+// claimForApplySQL takes the ledger row without marking it done, and reports whether a
+// PREVIOUS attempt already finished.
+//
+// The RETURNING/coalesce shape gives one round trip for three outcomes: no row existed
+// and we now own it (false), a row existed and was completed (true), a row existed and
+// was not completed (false, meaning re-apply). ON CONFLICT DO UPDATE with a no-op SET is
+// what makes the existing row visible to RETURNING at all; a bare DO NOTHING returns no
+// row and cannot distinguish "already done" from "we just claimed it".
+const claimForApplySQL = `
+INSERT INTO applied_block (height, block_hash, chunk_size, chunk_count, completed)
+VALUES ($1, $2, 0, 1, FALSE)
+ON CONFLICT (block_hash) DO UPDATE SET height = applied_block.height
+RETURNING completed`
+
+const completeApplySQL = `UPDATE applied_block SET completed = TRUE WHERE block_hash = $1`
+
+// BeginBlockApply claims a block for application and reports whether it can be skipped.
+//
+// It returns true only when a previous attempt ran to completion. That distinction is the
+// whole value of the call, and getting it backwards is worse than not having it:
+//
+//   - Completed, so skip. Re-applying would insert every output a second time as an
+//     independently spendable row, because createSQL has no ON CONFLICT to protect it.
+//     That is money-supply inflation.
+//   - Claimed but never completed, so RE-APPLY. The previous attempt died part-way. If we
+//     skipped it, its outputs would never exist, every later block spending them would
+//     fail forever, and nothing downstream would flag it. Silent loss is worse than the
+//     duplication it avoids.
+//
+// Re-applying an incomplete block can still duplicate whatever the dead attempt managed
+// to write. This does not fix that, and does not claim to: making it safe needs create
+// and spend for a chunk in one transaction with applied_chunk tracking which rows landed.
+// What this closes is replay of a FINISHED block, which is the routine case (catchup, a
+// restart, the post-restart unrequested-block storm).
+func (s *Store) BeginBlockApply(ctx context.Context, blockHash *chainhash.Hash, height uint32) (bool, error) {
+	if blockHash == nil {
+		return false, errors.NewProcessingError("[utxoset][BeginBlockApply] nil block hash")
+	}
+
+	var completed bool
+
+	if err := s.pool.QueryRow(ctx, claimForApplySQL, int32(height), blockHash[:]).Scan(&completed); err != nil {
+		return false, errors.NewStorageError("[utxoset][BeginBlockApply] claim %s", blockHash.String(), err)
+	}
+
+	return completed, nil
+}
+
+// CompleteBlockApply marks a block finished, so a later offer of it is skipped.
+//
+// Call this only after every output the block creates and every input it spends has been
+// durably committed. Marking it early converts a crash into permanent silent loss,
+// because the next offer will skip a block that never finished.
+func (s *Store) CompleteBlockApply(ctx context.Context, blockHash *chainhash.Hash) error {
+	if blockHash == nil {
+		return errors.NewProcessingError("[utxoset][CompleteBlockApply] nil block hash")
+	}
+
+	if _, err := s.pool.Exec(ctx, completeApplySQL, blockHash[:]); err != nil {
+		return errors.NewStorageError("[utxoset][CompleteBlockApply] %s", blockHash.String(), err)
+	}
+
+	return nil
+}

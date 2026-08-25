@@ -221,6 +221,29 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 		id  uint64
 	)
 
+	// Replay gate. Fails closed: if the ledger cannot be read the block errors and is
+	// retried, because applying a block that may already be applied would duplicate every
+	// one of its outputs. No-op for stores that keep no ledger.
+	alreadyApplied, err := u.claimBlockApply(ctx, block)
+	if err != nil {
+		return errors.NewProcessingError("[quickValidateBlock][%s] failed to claim block for application", block.Hash().String(), err)
+	}
+
+	if alreadyApplied {
+		// The UTXO work and the subtree files are already durable; only the blockchain
+		// entry is missing, which is the crash window between the two.
+		id, err = u.blockchainClient.AssignBlockID(ctx, block.Hash())
+		if err != nil {
+			return errors.NewProcessingError("[quickValidateBlock][%s] failed to assign block ID", block.Hash().String(), err)
+		}
+
+		if block.ID, err = blockIDToUint32(id, block.Hash().String()); err != nil {
+			return err
+		}
+
+		return u.commitBlock(ctx, block, peerID, "quickValidateBlock")
+	}
+
 	if len(block.Subtrees) > 0 {
 		// Process all subtrees in streaming fashion - creates UTXOs, spends, writes files
 		// This function waits for all processing to complete before returning, ensuring block.ID is set
@@ -293,6 +316,26 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 		id  uint64
 	)
 
+	// Replay gate, same contract as the synchronous path: fails closed, and is a no-op
+	// for stores that keep no ledger.
+	alreadyApplied, err := u.claimBlockApply(ctx, block)
+	if err != nil {
+		return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to claim block for application", block.Hash().String(), err)
+	}
+
+	if alreadyApplied {
+		id, err = u.blockchainClient.AssignBlockID(ctx, block.Hash())
+		if err != nil {
+			return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to assign block ID", block.Hash().String(), err)
+		}
+
+		if block.ID, err = blockIDToUint32(id, block.Hash().String()); err != nil {
+			return err
+		}
+
+		return u.commitBlock(ctx, block, peerID, "quickValidateBlockAsync")
+	}
+
 	if len(block.Subtrees) > 0 {
 		// Process subtrees with async file writes
 		prefetchDepth := u.settings.BlockValidation.SubtreeBatchPrefetchDepth
@@ -328,6 +371,16 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 // commit unit the Step-8 parallel window's ordered committer calls in height order.
 // caller labels logs to preserve each call site's existing text.
 func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, peerID, caller string) error {
+	// Mark the block applied BEFORE AddBlock, not after, and the order is the whole
+	// point. Every output is durable by now. If the process dies between here and
+	// AddBlock, the block is re-offered, the ledger says "done", and only the blockchain
+	// entry is redone. Marking it after AddBlock instead would leave that same crash
+	// window re-running the UTXO work, which is exactly the duplication this exists to
+	// prevent. No-op for stores that keep no ledger.
+	if err := u.completeBlockApply(ctx, block); err != nil {
+		return errors.NewProcessingError("[%s][%s] failed to mark block applied", caller, block.Hash().String(), err)
+	}
+
 	// add block directly to blockchain
 	if err := u.blockchainClient.AddBlock(ctx,
 		block,

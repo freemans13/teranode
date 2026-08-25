@@ -93,3 +93,47 @@ func TestApplyBlockFailureLeavesBlockRetryable(t *testing.T) {
 	require.True(t, applied, "a failed block must remain retryable")
 	require.Equal(t, 2, liveRows(t, s, ctx, txid[:]))
 }
+
+// TestBeginBlockApplySkipsOnlyCompletedBlocks pins the semantics the ledger must have
+// when the caller cannot wrap the whole block in one transaction.
+//
+// Block application in teranode is not one unit of work: creates and spends run as
+// separate phases across thousands of goroutines, so ApplyBlock's single-transaction
+// shape does not fit. The claim and the completion have to be separate calls.
+//
+// That makes the completed flag load-bearing. A block claimed and finished is safe to
+// skip. A block claimed and NOT finished died part-way through, and skipping it would
+// leave its outputs missing forever and every later block spending them failing: silent
+// loss, which is worse than the duplication it would be avoiding. So an incomplete claim
+// must re-apply.
+func TestBeginBlockApplySkipsOnlyCompletedBlocks(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	done := chainhash.Hash{0x01}
+	partial := chainhash.Hash{0x02}
+
+	// A block that finishes is skipped on re-offer.
+	skip, err := s.BeginBlockApply(ctx, &done, 10)
+	require.NoError(t, err)
+	require.False(t, skip, "first offer must apply")
+	require.NoError(t, s.CompleteBlockApply(ctx, &done))
+
+	skip, err = s.BeginBlockApply(ctx, &done, 10)
+	require.NoError(t, err)
+	require.True(t, skip, "a completed block must never be applied twice")
+
+	// A block that dies part-way through must be offered again, not skipped.
+	skip, err = s.BeginBlockApply(ctx, &partial, 11)
+	require.NoError(t, err)
+	require.False(t, skip)
+
+	skip, err = s.BeginBlockApply(ctx, &partial, 11)
+	require.NoError(t, err)
+	require.False(t, skip, "an unfinished block must re-apply, or its outputs are lost forever")
+
+	require.NoError(t, s.CompleteBlockApply(ctx, &partial))
+
+	skip, err = s.BeginBlockApply(ctx, &partial, 11)
+	require.NoError(t, err)
+	require.True(t, skip)
+}
