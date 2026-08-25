@@ -251,6 +251,28 @@ type peerSyncState struct {
 	requestQueue  *txmap.SyncedSlice[wire.InvVect]
 	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 
+	// requestQueueMu serialises the drain of requestQueue.
+	//
+	// Inv messages are dispatched one goroutine per message (blockHandler's
+	// "go sm.handleInvMsg(msg)"), so two drains for the same peer share this one
+	// queue. SyncedSlice synchronises each call but not a pair of them, and the
+	// drain reads the front without consuming it and consumes it several
+	// branches later. Interleaved, two drains peek the same item, both deal with
+	// it, and the second Shift throws away the item behind it without ever
+	// looking at it. That is the exact loss the peek was introduced to prevent:
+	// the queue is the only record that a block was announced, and outside
+	// headers-first mode an inv is not guaranteed to come again.
+	//
+	// A compare-before-shift would close that. It would not close the mirror,
+	// where both drains peek the same item, both pass RequestedWithin before
+	// either Add lands, and the peer is asked twice for one hash: the first copy
+	// discharges the obligation in handleBlockMsg and the second is disconnected
+	// as unrequested. A lock closes both, so it is a lock.
+	//
+	// Leaf lock, held only for the drain loop. Nothing else takes it, and the
+	// getdata send is deliberately outside it.
+	requestQueueMu sync.Mutex
+
 	// assocReadBytes and assocReadBytesLastTick are two consecutive samples of
 	// this peer's association-wide read counter, taken on the frontier ticker.
 	// The difference over one tick is how fast the peer is pulling bytes in.
@@ -4058,6 +4080,25 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 
 	// Request as much as possible at once.  Anything that won't fit into
 	// the request will be requested on the next inv message.
+	gdmsg := sm.drainRequestQueue(peer, state)
+
+	if len(gdmsg.InvList) > 0 {
+		sm.logger.Debugf("[handleInvMsg] Requesting %d items from %s", len(gdmsg.InvList), peer)
+		peer.QueueMessage(gdmsg, nil)
+	}
+}
+
+// drainRequestQueue turns as much of a peer's announcement queue as it can into
+// one getdata, and returns it for the caller to send.
+//
+// One drain at a time per peer: see peerSyncState.requestQueueMu for why the
+// peek and the consume have to be one operation. The lock covers the whole loop
+// and nothing else, so an append from a concurrent processInvMsg still lands
+// (SyncedSlice is safe on its own) and the getdata goes out unlocked.
+func (sm *SyncManager) drainRequestQueue(peer *peerpkg.Peer, state *peerSyncState) *wire.MsgGetData {
+	state.requestQueueMu.Lock()
+	defer state.requestQueueMu.Unlock()
+
 	numRequested := 0
 	gdmsg := wire.NewMsgGetData()
 
@@ -4088,7 +4129,7 @@ outside:
 					break outside
 				}
 
-				if err = gdmsg.AddInvVect(iv); err != nil {
+				if err := gdmsg.AddInvVect(iv); err != nil {
 					sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
 					break outside
 				}
@@ -4098,8 +4139,8 @@ outside:
 
 		case wire.InvTypeTx:
 			// Request the transaction if there is not already a pending request.
-			if _, exists = sm.requestedTxns.Get(iv.Hash); !exists {
-				if err = gdmsg.AddInvVect(iv); err != nil {
+			if _, requested := sm.requestedTxns.Get(iv.Hash); !requested {
+				if err := gdmsg.AddInvVect(iv); err != nil {
 					sm.logger.Warnf(unexpectedFailureAddingInventoryMsg, err)
 					break outside
 				}
@@ -4121,10 +4162,7 @@ outside:
 		}
 	}
 
-	if len(gdmsg.InvList) > 0 {
-		sm.logger.Debugf("[handleInvMsg] Requesting %d items from %s", len(gdmsg.InvList), peer)
-		peer.QueueMessage(gdmsg, nil)
-	}
+	return gdmsg
 }
 
 func (sm *SyncManager) processInvMsg(i int, iv *wire.InvVect, processInvs bool, peer *peerpkg.Peer, exists bool, state *peerSyncState, lastBlock int) {
