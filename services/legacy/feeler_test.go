@@ -425,7 +425,7 @@ func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
 		srv.banList = bannedTestBanList(t, "8.8.8.8")
 		srv.addrManager.AddAddress(na, testSourceAddr())
 
-		require.Nil(t, srv.feelerCandidate(),
+		require.Nil(t, candidateOf(srv),
 			"a banned address would be dropped the moment it answered, so it is not worth a probe")
 	})
 
@@ -438,7 +438,7 @@ func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
 
 		require.Equal(t, 1, srv.addrManager.NumAddresses(),
 			"the address is still known, it has just moved into tried")
-		require.Nil(t, srv.feelerCandidate(),
+		require.Nil(t, candidateOf(srv),
 			"probing an address that is already verified achieves nothing")
 	})
 
@@ -449,7 +449,7 @@ func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
 
 			srv.addrManager.AddAddress(na, testSourceAddr())
 
-			got := srv.feelerCandidate()
+			got := candidateOf(srv)
 
 			if !tt.want {
 				require.Nil(t, got, "the candidate should have been skipped")
@@ -460,6 +460,87 @@ func TestFeelerSkipsCandidatesAlreadyHeldOrOccupied(t *testing.T) {
 			require.Equal(t, "8.8.8.8:8333", addrmgr.NetAddressKey(got))
 		})
 	}
+}
+
+// TestFeelerCandidateSkipsWhatItCannotResolve covers the rule that a candidate
+// the node has no way of dialling is skipped at selection instead of being
+// handed to the probe.
+//
+// OnionCat is the concrete case, and it is not hypothetical: IsRoutable admits
+// it on purpose (addrmgr/network.go:230), so gossip lands it in the new table,
+// and bsvdLookup then refuses the .onion host NetAddressKey renders for it
+// (config.go:794) whatever the proxy configuration. Handed to the probe, such
+// an address returned before an attempt was recorded, which cost the whole
+// probe interval and left the entry untouched and equally likely to be drawn
+// next time.
+//
+// The second subtest is what makes the first mean anything: a pass that gave up
+// on the first unresolvable draw would pass "never returns the onion" too.
+func TestFeelerCandidateSkipsWhatItCannotResolve(t *testing.T) {
+	swapTestConfig(t, "")
+
+	// Inside fd87:d87e:eb43::/48, which is what IsOnionCatTor matches and what
+	// ipString turns back into a <base32>.onion name.
+	onion := wire.NewNetAddressIPPort(net.ParseIP("fd87:d87e:eb43:1:2:3:4:5"), 8333, wire.SFNodeNetwork)
+	dialable := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+
+	require.True(t, addrmgr.IsRoutable(onion),
+		"the premise of this test is that the address book accepts OnionCat addresses")
+	require.Contains(t, addrmgr.NetAddressKey(onion), ".onion",
+		"the premise of this test is that such an address is named by its .onion host")
+
+	t.Run("an unresolvable address is the only thing in the book", func(t *testing.T) {
+		srv := newFeelerTestServer(t)
+		serveFeelerSnapshot(srv, feelerSnapshot{})
+
+		srv.addrManager.AddAddress(onion, testSourceAddr())
+
+		require.NotNil(t, srv.addrManager.UnverifiedAddress(),
+			"the address book holds it, which is the whole problem")
+		require.Nil(t, candidateOf(srv),
+			"an address this layer cannot dial must never reach the probe")
+	})
+
+	t.Run("the pass keeps looking past one", func(t *testing.T) {
+		srv := newFeelerTestServer(t)
+		serveFeelerSnapshot(srv, feelerSnapshot{})
+
+		srv.addrManager.AddAddress(onion, testSourceAddr())
+		srv.addrManager.AddAddress(dialable, testSourceAddr())
+
+		// Repeated because the draw is random and weighted: one pass that
+		// happened to pick the dialable address first would prove nothing. Fifty
+		// passes without a single onion is the assertion.
+		for i := 0; i < 50; i++ {
+			na, netAddr := srv.feelerCandidate()
+
+			require.NotNil(t, na, "the dialable address is still there to be found")
+			require.Equal(t, "8.8.8.8:8333", addrmgr.NetAddressKey(na))
+			require.NotNil(t, netAddr, "a candidate is returned already resolved")
+			require.Equal(t, "8.8.8.8:8333", netAddr.String(),
+				"the resolved address and the book's record must be the same host")
+		}
+	})
+
+	// The resolve sits ahead of the ban check for this reason, so the ordering
+	// is worth a test of its own. BanList.IsBanned falls through to
+	// net.ParseIP and logs at error when that fails, so an OnionCat address
+	// reaching it costs an error line; with the pass now continuing rather than
+	// giving up, it would cost one per try.
+	t.Run("an unresolvable address never reaches the ban list", func(t *testing.T) {
+		rec := &recordingLogger{Logger: ulogger.TestLogger{}}
+
+		srv := newFeelerTestServer(t)
+		srv.banList = emptyWritableBanList(t, rec)
+		serveFeelerSnapshot(srv, feelerSnapshot{})
+
+		srv.addrManager.AddAddress(onion, testSourceAddr())
+
+		require.Nil(t, candidateOf(srv))
+
+		_, errs := rec.counts()
+		require.Zero(t, errs, "an address the node cannot dial must not be quizzed about bans: %s", rec.logged())
+	})
 }
 
 // TestStartFeelerHonoursTheDisableLever pins the second half of the rollback
@@ -738,7 +819,7 @@ func TestFeelerDoesNotPromoteNonBSVPeer(t *testing.T) {
 			require.Equal(t, tt.wantBanned, srv.banList.IsBanned("8.8.8.8"))
 
 			if tt.wantBanned {
-				require.Nil(t, srv.feelerCandidate(),
+				require.Nil(t, candidateOf(srv),
 					"a banned non-BSV address must not be drawn again")
 			}
 		})
@@ -753,8 +834,16 @@ func testSourceAddr() *wire.NetAddress {
 
 // emptyWritableBanList returns a ban list backed by an in-memory database,
 // which Add needs because it writes through to storage.
-func emptyWritableBanList(t *testing.T) *p2p.BanList {
+//
+// The optional logger is for the one test that asserts on what the ban list
+// itself logged; everything else takes the default.
+func emptyWritableBanList(t *testing.T, logger ...ulogger.Logger) *p2p.BanList {
 	t.Helper()
+
+	banLogger := ulogger.Logger(ulogger.TestLogger{})
+	if len(logger) > 0 {
+		banLogger = logger[0]
+	}
 
 	storeURL, err := url.Parse("sqlitememory://")
 	require.NoError(t, err)
@@ -762,7 +851,7 @@ func emptyWritableBanList(t *testing.T) *p2p.BanList {
 	store, err := blockchainstore.NewStore(ulogger.TestLogger{}, storeURL, settings.NewSettings())
 	require.NoError(t, err)
 
-	bl := banlist.New(store.GetDB(), util.SqliteMemory, ulogger.TestLogger{})
+	bl := banlist.New(store.GetDB(), util.SqliteMemory, banLogger)
 	require.NoError(t, bl.Init(t.Context()))
 
 	t.Cleanup(bl.Stop)
@@ -932,6 +1021,15 @@ func atLeastTwoAutomaticPeers(t *testing.T, srv *server) {
 
 	require.True(t, srv.feelerAllowed())
 	require.True(t, srv.countFailedDial())
+}
+
+// candidateOf runs one selection pass and returns only the address book's
+// record of what it picked, for tests that have nothing to say about the
+// resolved net.Addr alongside it.
+func candidateOf(srv *server) *wire.NetAddress {
+	na, _ := srv.feelerCandidate()
+
+	return na
 }
 
 // runOneProbe runs exactly one probe on the calling goroutine and returns when

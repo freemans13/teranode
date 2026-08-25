@@ -54,6 +54,10 @@
   ceiling (`legacy_config_MaxPeers`, 20 by default), never out of the automatic
   outbound target, so probing can never cost the node a peer it chose to dial.
 - Probes start only once the automatic outbound tier is already at its target.
+- Selection resolves the address it picks and skips any it cannot resolve, so an
+  address this layer has no way of dialling costs one draw rather than the whole
+  probe interval. OnionCat addresses are the case that always takes this path:
+  the address book accepts them but there is no onion dial path here.
 - Feelers switch themselves off, reservation included, in three cases:
   `MaxFeelerPeers` at zero or below; connect-only mode (`ConnectPeers` set); and a
   peer cap too tight to reserve a slot without pushing the admission ceiling below

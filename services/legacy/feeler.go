@@ -376,18 +376,20 @@ func (s *server) feelerHandler() {
 func (s *server) feelerProbe() {
 	defer func() { s.feelerTokens <- struct{}{} }()
 
-	na := s.feelerCandidate()
+	na, netAddr := s.feelerCandidate()
 	if na == nil {
+		// The one path out of a probe with no info line, and the only one that
+		// should have none: nothing was drawn, so there is no address to report
+		// an outcome against. Every path that names an address goes through
+		// logProbe. This used to be two paths, the other being an address that
+		// would not resolve, which spent the whole interval saying nothing;
+		// feelerCandidate now skips those and keeps looking.
+		s.logger.Debugf("[Feeler] No candidate address in this pass")
+
 		return
 	}
 
 	addrString := addrmgr.NetAddressKey(na)
-
-	netAddr, err := addrStringToNetAddr(addrString)
-	if err != nil {
-		s.logger.Debugf("[Feeler] Cannot resolve %s: %v", addrString, err)
-		return
-	}
 
 	s.feelerAttempted.Add(1)
 
@@ -645,11 +647,22 @@ func (s *server) judgeVersion(na *wire.NetAddress, addrString string, res *feele
 //
 // It has to match how peerState.connectedHosts names one, which is the host part
 // of a peer's dial string. NetAddressKey builds that same string, so taking its
-// host part keeps the two in step whatever the address format — including
-// OnionCat, where the dial string carries the .onion name and the raw IP does
-// not. On a split failure the whole address is returned, which cannot match any
-// host key, so an unparseable address is treated as unheld rather than silently
-// matching everything.
+// host part keeps the two in step. On a split failure the whole address is
+// returned, which cannot match any host key, so an unparseable address is
+// treated as unheld rather than silently matching everything.
+//
+// This comment used to claim the pairing also covers OnionCat, where
+// NetAddressKey renders the .onion name rather than the raw IP. Nothing on
+// either side of the comparison can be an onion address, so that was a
+// statement about a case this layer cannot reach. connectedHosts is built from
+// serverPeer.Addr, which for an outbound peer is a net.Addr from
+// addrStringToNetAddr and for an inbound one is conn.RemoteAddr, and all three
+// connection-manager entry points go through addrStringToNetAddr, which refuses
+// .onion via bsvdLookup (config.go:794). The probe side cannot either, since
+// feelerCandidate now resolves before returning. The function is left as it is
+// because it has no onion-specific branch to remove: the rendering happens
+// inside NetAddressKey, and matching whatever NetAddressKey produces is the
+// property that matters.
 func feelerHostKey(na *wire.NetAddress) string {
 	key := addrmgr.NetAddressKey(na)
 
@@ -791,8 +804,15 @@ func (s *server) feelerPeerConfig(res *feelerResult) *peer.Config {
 	}
 }
 
-// feelerCandidate picks an address worth probing, or nil if this pass found
-// nothing suitable.
+// feelerCandidate picks an address worth probing and resolves it, or returns
+// nil for both if this pass found nothing suitable.
+//
+// It hands back the resolved net.Addr as well as the address book's own record
+// of the address because the probe needs both, and they have to be the same
+// address: the net.Addr is what gets dialled, the wire.NetAddress is what the
+// book is afterwards told about. Resolving here rather than in the probe is
+// what stops an address this layer cannot dial costing a whole probe interval;
+// the reasoning is at the resolve step at the end of the loop.
 //
 // The escalation thresholds mirror newAddressFunc exactly, so the probe and the
 // dial path judge an address the same way. Two deliberate differences from
@@ -805,7 +825,7 @@ func (s *server) feelerPeerConfig(res *feelerResult) *peer.Config {
 //   - No service-flag filter. svnode has one (net.cpp:1902); teranode's dial
 //     path does not, and a probe that is stricter than the thing it feeds would
 //     verify addresses the node then declines to use.
-func (s *server) feelerCandidate() *wire.NetAddress {
+func (s *server) feelerCandidate() (*wire.NetAddress, net.Addr) {
 	snap := s.feelerPeerSnapshot()
 
 	for tries := 0; tries < feelerCandidateTries; tries++ {
@@ -815,15 +835,53 @@ func (s *server) feelerCandidate() *wire.NetAddress {
 		// way, with Select(newOnly) at addrman.cpp:337.
 		ka := s.addrManager.UnverifiedAddress()
 		if ka == nil {
-			return nil
+			return nil, nil
 		}
 
 		na := ka.NetAddress()
 
+		addrString := addrmgr.NetAddressKey(na)
+
+		// Resolved at selection rather than in the probe, so an address this
+		// layer cannot dial costs one try out of feelerCandidateTries rather
+		// than the whole probe interval. The probe used to resolve after
+		// selection and give up on failure, before it had counted an attempt or
+		// written anything, so a bad draw spent the slot in silence and left the
+		// entry exactly as it found it: with no Attempt recorded, ka.lastattempt
+		// does not move, chance() keeps full weight, and the same entry is
+		// eligible for the very next draw.
+		//
+		// OnionCat is the class that always fails, and it is reachable rather
+		// than hypothetical. IsRoutable admits it deliberately, exempting it
+		// from the RFC4193 rejection (addrmgr/network.go:230), so gossip puts it
+		// in the new table; NetAddressKey renders it as <base32>.onion:port
+		// (addrmgr/addrmanager.go:915); and bsvdLookup refuses any .onion host
+		// unconditionally, whatever the proxy configuration (config.go:794).
+		// There is no onion dial path in this layer to give it: cfg.dial is
+		// net.DialTimeout or a SOCKS dialer (config.go:745, :764), bsvdDial is
+		// only ever handed an already-resolved net.Addr (config.go:783), and
+		// nothing outside a test ever builds the onionAddr type.
+		//
+		// First of the tests, ahead of the ban check, because it is the only one
+		// that establishes the address is an IP at all. BanList.IsBanned falls
+		// through to net.ParseIP and logs at error when that fails
+		// (internal/banlist/ban_list.go:228), so asking it about an OnionCat
+		// address costs an error line, and asking it once per try would cost up
+		// to feelerCandidateTries of them. Ordering it first costs an ordinary
+		// entry nothing: NetAddressKey renders every non-OnionCat address as an
+		// IP literal, which addrStringToNetAddr answers from net.ParseIP without
+		// a lookup (peer_server.go:4328).
+		netAddr, err := addrStringToNetAddr(addrString)
+		if err != nil {
+			s.logger.Debugf("[Feeler] Skipping %s, cannot resolve: %v", addrString, err)
+
+			continue
+		}
+
 		// Filtered at selection rather than at dial time, unlike svnode, which
 		// only notices a ban inside OpenNetworkConnection (net.cpp:2113) and so
 		// burns the whole slot on it.
-		if s.banList.IsBanned(addrmgr.NetAddressKey(na)) {
+		if s.banList.IsBanned(addrString) {
 			continue
 		}
 
@@ -850,8 +908,8 @@ func (s *server) feelerCandidate() *wire.NetAddress {
 			continue
 		}
 
-		return na
+		return na, netAddr
 	}
 
-	return nil
+	return nil, nil
 }
