@@ -42,12 +42,15 @@ func TestBlockDownloadBudget(t *testing.T) {
 		peersDownloading int
 		want             time.Duration
 	}{
-		// 100% of one 10-minute interval.
-		{"tip, sole downloader", false, 1, 10 * time.Minute},
-		// 600% while catching up — the whole point of the change.
+		// 100% of one 10-minute interval is ten minutes, below the floor, so
+		// the tip keeps the thirty minutes it had before any of this.
+		{"tip, sole downloader", false, 1, MaxBlockDownloadTime},
+		// 600% while catching up — the whole point of the change. Well clear of
+		// the floor, so the widening is untouched by it.
 		{"catching up, sole downloader", true, 1, 60 * time.Minute},
-		// Only OTHER peers count, so one downloader adds nothing.
-		{"tip, one other peer", false, 2, 15 * time.Minute},
+		// Only OTHER peers count, so one downloader adds nothing. 150% of ten
+		// minutes is still under the floor.
+		{"tip, one other peer", false, 2, MaxBlockDownloadTime},
 		// svnode's mainnet-shaped case: 600 + 50*7 = 950% of 10 minutes.
 		{"catching up, eight peers", true, 8, 95 * time.Minute},
 		// A peer count below one must never subtract from the ceiling.
@@ -114,6 +117,7 @@ func TestBlockDownloadBudgetNeverZero(t *testing.T) {
 // TestBlockDownloadBudgetUnwiredIsSafe pins the behaviour when the callbacks are
 // absent. Nil must mean "at the tip, no compensation" — the SHORTEST ceiling —
 // so a wiring mistake can never silently hand a peer more patience than intended.
+// The shortest ceiling is the floor, not the scaled tip value.
 func TestBlockDownloadBudgetUnwiredIsSafe(t *testing.T) {
 	tSettings := settings.NewSettings()
 	params := *tSettings.ChainCfgParams
@@ -122,5 +126,31 @@ func TestBlockDownloadBudgetUnwiredIsSafe(t *testing.T) {
 	p := &Peer{settings: tSettings, logger: ulogger.TestLogger{}}
 	p.cfg = Config{ChainParams: &params}
 
-	require.Equal(t, 10*time.Minute, p.blockDownloadBudget())
+	require.Equal(t, MaxBlockDownloadTime, p.blockDownloadBudget())
+}
+
+// TestBlockDownloadBudgetNeverNarrowsTheShippedCeiling is ChiR3.
+//
+// Making the ceiling a percentage of the block interval was meant to widen the
+// deadline for multi-peer IBD. At the tip it silently narrowed it instead: the
+// base is 100% and every chain's TargetTimePerBlock is ten minutes, so a fetch
+// that had thirty minutes to complete before this work got ten, whatever its
+// throughput, because the ceiling is on total in-flight time and not on rate.
+// It also left the constant's own rationale describing a value nothing used: a
+// 4 GB block needs ~2.3 MB/s against thirty minutes and ~6.8 MB/s against ten.
+//
+// The end state pinned here is the guarantee, not the arithmetic: no
+// configuration of the three percentage settings can produce a ceiling shorter
+// than the one this PR inherited.
+func TestBlockDownloadBudgetNeverNarrowsTheShippedCeiling(t *testing.T) {
+	for _, base := range []int64{1, 50, 100, 150, 299} {
+		for _, catchingUp := range []bool{false, true} {
+			p := budgetPeer(t, 10*time.Minute, catchingUp, 1)
+			p.settings.Legacy.BlockDownloadTimeoutBasePercent = base
+			p.settings.Legacy.BlockDownloadTimeoutBaseIBDPercent = base
+
+			require.GreaterOrEqual(t, p.blockDownloadBudget(), MaxBlockDownloadTime,
+				"base %d%%, catchingUp %v: the ceiling must never fall below the value it shipped with", base, catchingUp)
+		}
+	}
 }

@@ -94,22 +94,30 @@ const (
 	// to take with numbers from a real sync rather than for symmetry.
 	minBlockDownloadBytesPerSec = 51200
 
-	// MaxBlockDownloadTime is a fixed wall-clock ceiling on how long a single
-	// block fetch may be kept alive by throughput-based deadline extension.
-	// Without a cap, a malicious peer could dribble bytes at just above
-	// minBlockDownloadBytesPerSec indefinitely — never completing a valid block —
-	// and hold the single sync-peer slot, stalling IBD. Generous for honest fat
-	// blocks: a 4 GB block need only average ~2.3 MB/s to finish inside the
-	// window.
+	// MaxBlockDownloadTime is the wall-clock floor AND fallback for how long a
+	// single block fetch may be kept alive by throughput-based deadline
+	// extension. Without such a cap a malicious peer could dribble bytes at just
+	// above minBlockDownloadBytesPerSec indefinitely — never completing a valid
+	// block — and hold the single sync-peer slot, stalling IBD. Generous for
+	// honest fat blocks: a 4 GB block need only average ~2.3 MB/s to finish
+	// inside the window, and that example still describes the shortest window
+	// any fetch gets, because blockDownloadBudget floors on this value.
 	//
-	// The peer layer no longer uses this as its normal ceiling: blockDownloadBudget
-	// scales the ceiling with the chain's block interval, whether we are catching
-	// up, and how many peers we are downloading from. This constant remains the
-	// fallback that blockDownloadBudget returns when that calculation cannot
-	// produce a usable value, and it is still the flat cap on netsync's sync-peer
-	// rotation, which is NOT scaled — so during catch-up netsync rotates the sync
-	// peer at this value even though the peer layer would wait longer. See
-	// SyncManager.CheckSyncPeer.
+	// blockDownloadBudget scales the ceiling with the chain's block interval,
+	// whether we are catching up, and how many peers we are downloading from,
+	// and then takes the larger of that and this constant. The floor exists
+	// because the scaling is only ever meant to WIDEN the deadline for
+	// multi-peer IBD: at the tip the scaled value is 100% of a ten-minute block
+	// interval, which would have narrowed the shipped ceiling threefold and left
+	// the 4 GB example above describing a value nothing used. The cost of the
+	// floor is that legacy_blockDownloadTimeoutBasePercent can no longer narrow
+	// the tip ceiling below thirty minutes; it can still widen it.
+	//
+	// It is also the flat cap on netsync's sync-peer rotation, which is NOT
+	// scaled (SyncManager.CheckSyncPeer). With the floor in place the two layers
+	// can only disagree one way round: the peer layer is at least as patient as
+	// netsync everywhere, so netsync rotates a stalled sync peer before the peer
+	// layer would disconnect it, during catch-up and at the tip alike.
 	MaxBlockDownloadTime = 30 * time.Minute
 )
 
@@ -1581,6 +1589,9 @@ func blockResponsePending(pending map[string]time.Time) bool {
 //
 // Only peers with a genuine outstanding request are counted, so a peer cannot
 // inflate our patience by advertising blocks it does not have.
+//
+// The result is floored at MaxBlockDownloadTime, so this calculation can only
+// widen the deadline, never narrow it. See that constant for why.
 func (p *Peer) blockDownloadBudget() time.Duration {
 	interval := p.cfg.ChainParams.TargetTimePerBlock
 	if interval <= 0 {
@@ -1626,7 +1637,13 @@ func (p *Peer) blockDownloadBudget() time.Duration {
 		return MaxBlockDownloadTime
 	}
 
-	return budget
+	// Widen only. At the tip the scaled value is base (100%) of the block
+	// interval with no other peers to add, which on every chain here is ten
+	// minutes: a third of the ceiling this code replaced. Nothing in the
+	// multi-peer work wanted the tip narrowed, so the shipped value is kept as
+	// the floor and the scaling does its widening above it. During catch-up the
+	// floor never binds: 600% of ten minutes is an hour.
+	return max(budget, MaxBlockDownloadTime)
 }
 
 // shouldExtendBlockDeadline reports whether an expired block-response deadline
