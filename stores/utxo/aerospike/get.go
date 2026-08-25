@@ -136,7 +136,9 @@ const (
 	// excessiveblocksize policy setting (4 GB). Used only when the setting is
 	// unset or explicitly 0, which for block acceptance means "no limit" but here
 	// would mean "no bound on an allocation sized from local storage".
-	defaultExcessiveBlockSize = 4 * 1024 * 1024 * 1024
+	// Typed uint64 rather than left untyped, so it cannot silently overflow the
+	// int it would otherwise be inferred as on a 32-bit build.
+	defaultExcessiveBlockSize uint64 = 4 * 1024 * 1024 * 1024
 )
 
 // maxExternalOutputCount bounds the number of outputs this node will reconstruct
@@ -152,10 +154,10 @@ func maxExternalOutputCount(tSettings *settings.Settings) uint64 {
 	excessiveBlockSize := defaultExcessiveBlockSize
 
 	if tSettings != nil && tSettings.Policy != nil && tSettings.Policy.ExcessiveBlockSize > 0 {
-		excessiveBlockSize = tSettings.Policy.ExcessiveBlockSize
+		excessiveBlockSize = uint64(tSettings.Policy.ExcessiveBlockSize) //nolint:gosec // guarded > 0 on the line above
 	}
 
-	count := uint64(excessiveBlockSize) / minSerializedOutputSize //nolint:gosec // guarded > 0 above, and the constant fallback is positive
+	count := excessiveBlockSize / minSerializedOutputSize
 
 	// Keep the derived count addressable as an int on every platform, so the
 	// caller's int conversion cannot overflow on an unusually large policy value.
