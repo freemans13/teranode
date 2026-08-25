@@ -2076,16 +2076,18 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 			}
 		}
 
-		if len(uw.UTXOs) > 0 && uint64(maxIndex) >= maxExternalOutputCount(s.settings) {
+		if uint64(maxIndex) >= maxExternalOutputCount(s.settings) {
 			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external outputs blob declares output index %d, beyond what any acceptable block could hold — rotted blob", previousTxHash.String(), maxIndex)
 		}
 
-		outputCount := 0
-		if len(uw.UTXOs) > 0 {
-			outputCount = int(maxIndex) + 1
-		}
-
-		tx.Outputs = make([]*bt.Output, outputCount)
+		// maxIndex+1 unconditionally, including for an empty UTXO list: that is
+		// what PadUTXOsWithNil returned for the same input (it starts maxIndex at
+		// zero too), so an outputs blob with every output already pruned still
+		// yields one nil slot rather than an empty slice. Downstream both read the
+		// same — the outpoint decorator bounds-checks and nil-checks before use —
+		// but keeping it identical means the bound is the only behaviour this
+		// change introduces.
+		tx.Outputs = make([]*bt.Output, int(maxIndex)+1)
 
 		for _, u := range uw.UTXOs {
 			lockingScript := bscript.NewFromBytes(u.Script)
