@@ -34,7 +34,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 
 // createIn is Create against an arbitrary querier, so SpendAndCreate can run it inside
 // the same transaction as the spend.
-func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, _ ...utxo.CreateOption) (*meta.Data, error) {
+func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
 	if tx == nil {
 		return nil, errors.NewProcessingError("[utxoset][Create] nil tx")
 	}
@@ -57,9 +57,31 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		spendableFrom = int32(blockHeight) + int32(s.settings.ChainCfgParams.CoinbaseMaturity)
 	}
 
+	// The caller's state options MUST reach the row. schema.go defines these bits and
+	// spend.go checks all three when deciding whether a spend may proceed, so dropping
+	// them here does not fail loudly, it creates an ordinary spendable output and lets
+	// every downstream guard pass quietly on a zero bit. That is a silently wrong answer
+	// rather than a missing feature, which is the worse of the two.
+	options := &utxo.CreateOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	var flags int16
 	if isCoinbase {
 		flags |= FlagCoinbase
+	}
+
+	if options.Frozen {
+		flags |= FlagFrozen
+	}
+
+	if options.Conflicting {
+		flags |= FlagConflicting
+	}
+
+	if options.Locked {
+		flags |= FlagLocked
 	}
 
 	genesisHeight := s.settings.ChainCfgParams.GenesisActivationHeight
