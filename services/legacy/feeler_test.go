@@ -3,10 +3,12 @@ package legacy
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -68,6 +70,74 @@ func TestFeelerBudget(t *testing.T) {
 			require.Equal(t, tt.want, feelerBudget(ulogger.TestLogger{}, tt.configured, tt.connectOnly, tt.maxPeers, tt.targetOutbound))
 		})
 	}
+}
+
+// TestFeelerBudgetNamesTheReasonItRefused holds the promise the settings
+// documentation makes.
+//
+// legacy_settings.md and the legacy_maxFeelerPeers longdesc both tell an
+// operator they can read the reason feelers are off out of the startup log. Two
+// of the three refusals used to return zero without saying anything, so the only
+// line such a node produced was startFeeler's bare "[Feeler] Disabled" — which
+// reports that the loop did not start and nothing about why. An operator in
+// connect-only mode who did not expect feelers to be off had nowhere to look.
+//
+// Each case is asserted on a token an operator can act on: the setting name for
+// the two configuration cases, and the tier being protected for the cap case.
+// The last subtest fixes the precedence, so that a node which is both in
+// connect-only mode and has the lever pulled reports the lever.
+func TestFeelerBudgetNamesTheReasonItRefused(t *testing.T) {
+	tests := []struct {
+		name           string
+		configured     int
+		connectOnly    bool
+		maxPeers       int
+		targetOutbound int
+		wantLogged     string
+		notLogged      string
+	}{
+		{
+			name: "the disable lever names itself", configured: 0, maxPeers: 125, targetOutbound: 8,
+			wantLogged: "legacy_maxFeelerPeers",
+		},
+		{
+			name: "connect-only names the setting that caused it", configured: 1, connectOnly: true, maxPeers: 4, targetOutbound: 4,
+			wantLogged: "legacy_connect_peers",
+		},
+		{
+			name: "a tight cap names the tier it protected", configured: 1, maxPeers: 8, targetOutbound: 8,
+			wantLogged: "automatic outbound target",
+		},
+		{
+			name: "the lever wins when both apply", configured: 0, connectOnly: true, maxPeers: 4, targetOutbound: 4,
+			wantLogged: "legacy_maxFeelerPeers", notLogged: "legacy_connect_peers",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := &recordingLogger{Logger: ulogger.TestLogger{}}
+
+			require.Equal(t, 0, feelerBudget(rec, tt.configured, tt.connectOnly, tt.maxPeers, tt.targetOutbound),
+				"every case here is a refusal; the point of the test is what it said while refusing")
+
+			require.Contains(t, rec.logged(), tt.wantLogged,
+				"a refused reservation has to name its reason, or the documented diagnosis is not available")
+
+			if tt.notLogged != "" {
+				require.NotContains(t, rec.logged(), tt.notLogged,
+					"only one reason should be reported, or an operator cannot tell which lever to move")
+			}
+		})
+	}
+
+	t.Run("a granted reservation says nothing about being disabled", func(t *testing.T) {
+		rec := &recordingLogger{Logger: ulogger.TestLogger{}}
+
+		require.Equal(t, 1, feelerBudget(rec, 1, false, 20, 8), "the shipped defaults grant the slot")
+		require.NotContains(t, rec.logged(), "Disabled",
+			"a node running feelers must not log that they are off")
+	})
 }
 
 // TestPeerAdmissionCeilingReservesFeelerSlots is the test that proves a probe is
@@ -1703,24 +1773,38 @@ func serveFeelerSnapshotSequence(srv *server, snaps []feelerSnapshot) {
 }
 
 // recordingLogger counts what was logged at each level, so a test can assert on
-// the level a line came out at rather than on its text.
+// the level a line came out at rather than on its text. It also keeps the
+// rendered lines, for the tests that do care what was said.
 type recordingLogger struct {
 	ulogger.Logger
 
 	mtx   sync.Mutex
 	warns int
 	errs  int
+	lines []string
+}
+
+func (l *recordingLogger) record(format string, args ...interface{}) {
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *recordingLogger) Infof(format string, args ...interface{}) {
+	l.mtx.Lock()
+	l.record(format, args...)
+	l.mtx.Unlock()
 }
 
 func (l *recordingLogger) Warnf(format string, args ...interface{}) {
 	l.mtx.Lock()
 	l.warns++
+	l.record(format, args...)
 	l.mtx.Unlock()
 }
 
 func (l *recordingLogger) Errorf(format string, args ...interface{}) {
 	l.mtx.Lock()
 	l.errs++
+	l.record(format, args...)
 	l.mtx.Unlock()
 }
 
@@ -1729,6 +1813,16 @@ func (l *recordingLogger) counts() (int, int) {
 	defer l.mtx.Unlock()
 
 	return l.warns, l.errs
+}
+
+// logged returns every line recorded so far, joined, so a test can assert that
+// one particular reason was named without pinning the exact wording of all of
+// them.
+func (l *recordingLogger) logged() string {
+	l.mtx.Lock()
+	defer l.mtx.Unlock()
+
+	return strings.Join(l.lines, "\n")
 }
 
 // TestQuietProbeLoggerKeepsAProbeOutOfTheDisconnectCount is the test for the

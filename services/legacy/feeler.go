@@ -42,8 +42,21 @@ const defaultFeelerInterval = 120 * time.Second
 //     for nothing.
 //   - A budget that would leave no room for an ordinary peer. Reserving the
 //     node's whole capacity for probing is never what an operator meant.
+//
+// Each of the three names itself in the log before returning zero. startFeeler's
+// own "[Feeler] Disabled" reports only that the loop did not start, so without
+// these an operator who did not expect feelers to be off cannot tell which case
+// they are in, and the settings documentation promises they can. The
+// configured-zero test comes first so that the deliberate rollback lever is what
+// gets named when it is combined with either of the others.
 func feelerBudget(logger ulogger.Logger, configured int, connectOnly bool, maxPeers, targetOutbound int) int {
-	if configured <= 0 || connectOnly {
+	if configured <= 0 {
+		logger.Infof("[Feeler] Disabled: legacy_maxFeelerPeers is %d, so no probe runs and no peer slot is reserved", configured)
+		return 0
+	}
+
+	if connectOnly {
+		logger.Infof("[Feeler] Disabled: connect-only mode (legacy_connect_peers is set), so the node dials only its configured list and a verified address has nothing to feed")
 		return 0
 	}
 
