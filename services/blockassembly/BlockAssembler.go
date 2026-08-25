@@ -3148,11 +3148,25 @@ type sortEntry struct {
 //
 // Returns true if the transaction is valid for inclusion in block assembly.
 func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash chainhash.Hash, bestBlockIDsMap map[uint32]bool, dryRun bool) bool {
-	// Only each input's outpoint is read below. fields.Inputs would additionally
-	// load previous_tx_satoshis, previous_tx_script, unlocking_script and
-	// sequence_number, none of which are consumed here.
-	txMeta, err := b.utxoStore.Get(ctx, &txHash, fields.TxInpoints, fields.Conflicting)
-	if err != nil || txMeta == nil {
+	// NOTE: fields.Inputs, not fields.TxInpoints, and deliberately so for now.
+	//
+	// The two stores disagree about what fields.Inputs populates. Aerospike sets
+	// Data.Tx from the inputs bin (stores/utxo/aerospike/get.go, case
+	// fields.Inputs); the SQL store assigns Data.Tx only when fields.Tx was asked
+	// for, so this request comes back with a nil Tx and the guard below returns
+	// false for every transaction. This check is therefore live on aerospike and
+	// dead on SQL today, and on SQL every unmined transaction is dropped by the
+	// caller when input validation is enabled.
+	//
+	// Switching to fields.TxInpoints makes it live on SQL, which is correct but
+	// not a mechanical change: the first transaction that fails takes the
+	// markAsConflicting branch below, which writes to the store while
+	// loadUnminedTransactions still holds the unmined iterator open, and on
+	// SQLite that deadlocks. Fixing it means restructuring who writes during the
+	// reload, so it is tracked separately rather than smuggled into a field-set
+	// trim.
+	txMeta, err := b.utxoStore.Get(ctx, &txHash, fields.Inputs, fields.Conflicting)
+	if err != nil || txMeta == nil || txMeta.Tx == nil || txMeta.Tx.Inputs == nil {
 		return false
 	}
 
@@ -3160,27 +3174,15 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 		return false
 	}
 
-	inpoints := txMeta.TxInpoints.GetTxInpoints()
-	if len(inpoints) == 0 {
-		// An unmined transaction with no recorded inputs cannot be validated for
-		// inclusion. This also settles a divergence the previous nil-slice guard
-		// left open: the SQL store builds Tx.Inputs by appending, so no inputs
-		// meant a nil slice and this returned false, while aerospike allocates a
-		// non-nil empty slice, so the same transaction fell through the loop and
-		// was reported valid. Input-less records are UTXO-set snapshot artifacts
-		// (see meta.Data.TxIsSerializable), so false is the right answer for both.
-		return false
-	}
-
-	for _, inpoint := range inpoints {
-		parentHash := &inpoint.Hash
+	for _, input := range txMeta.Tx.Inputs {
+		parentHash := input.PreviousTxIDChainHash()
 
 		parentMeta, err := b.utxoStore.Get(ctx, parentHash, fields.Utxos)
 		if err != nil || parentMeta == nil {
 			return false
 		}
 
-		vout := int(inpoint.Index)
+		vout := int(input.PreviousTxOutIndex)
 		if parentMeta.SpendingDatas == nil || vout >= len(parentMeta.SpendingDatas) {
 			continue
 		}
