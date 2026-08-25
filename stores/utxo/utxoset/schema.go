@@ -15,11 +15,30 @@
 // monitor do not exist here — on the mainnet box those measured at 76.7% of all disk
 // reads, 52% of statement WAL and 25-30% of CPU.
 //
+// "No background job that can fall behind" is NOT true, and the qualifier matters.
+// Autovacuum is that job: this store makes roughly 33,000 dead tuples per block forever,
+// each pass is a full scan of a partition index, and it is unmeasured at scale. What
+// delete-on-spend removes is the RECLAIM backlog, whose watermark on the old store sat
+// 5,567 to 6,227 blocks behind the tip. It does not remove vacuum, and the autovacuum
+// threshold below is sized deliberately for that reason.
+//
 // Measured evidence behind the design (see docs/superpowers/specs/):
-//   - UTXO index 8.4 GB at the projected tip, vs a 25 GB budget
-//   - 19x less WAL per spend and 23x fewer full-page images than append-only
-//   - index bloat plateaus at exactly 2.00x floor and fully reverses via
+//   - index bloat plateaus at exactly 2.00x its bulk-build floor and fully reverses via
 //     REINDEX CONCURRENTLY (3.1 s per 10M entries)
+//   - a packed 16-byte key costs 63.07 B per index entry at churn equilibrium, against
+//     81.3 B for a bytea32 key
+//
+// Two claims that used to sit here have been REMOVED rather than softened, because
+// neither has a source anywhere in this repository:
+//
+//   - "UTXO index 8.4 GB at the projected tip, vs a 25 GB budget". That figure is the
+//     post-REINDEX floor at an assumed UTXO count, not a steady state, and the count it
+//     assumed is the least certain input in the whole design. The honest position is that
+//     nobody has run gettxoutsetinfo on a synced SV Node, so the tip index size is unknown.
+//   - "19x less WAL per spend and 23x fewer full-page images than append-only".
+//     Reconstructed from the underlying figures the best case is nearer 11.5x and 12.5x,
+//     and the ratio INVERTS at high UTXO counts, because delete-on-spend does not avoid
+//     the index write, it defers it to vacuum. Quote no ratio here until one is measured.
 //
 // M1 scope: the UTXO table and the block/chunk ledger only. Sync mode — below the
 // hardcoded checkpoint, where a reorg is impossible by rule, so no spend journal and no
