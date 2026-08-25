@@ -538,3 +538,62 @@ func TestDemotion_AHeadersBatchThatStartsConnectingAndThenStopsIsStillPunished(t
 	require.Equal(t, len(hashes)+len(goodHashes)+1, sm.headerListLen(),
 		"the headers that did link stay linked")
 }
+
+// TestDemotion_TheLateHeadersCarveOutIsScopedAndExpires is ChiR5.
+//
+// The carve-out above turns a non-connecting headers batch into a silent ignore
+// instead of a disconnect. Its test was "does this batch's first header, or its
+// parent, sit in the header index?", which any header we currently hold
+// satisfies, from anybody, for as long as we hold it. So a peer that once
+// contributed a batch could re-send it, or any prefix of it, indefinitely: 2000
+// headers of bandwidth and decode plus a headerMu acquisition each time, the
+// same lock the block-queue consumer takes first in headers-first mode, and
+// nothing at all for the sender.
+//
+// Two end states are pinned. A peer nobody demoted is disconnected for a batch
+// that never connects, however familiar its headers are. And the demoted peer
+// is covered only while its demotion cooldown is running, which is what the
+// carve-out was written for and the expiry it did not have.
+func TestDemotion_TheLateHeadersCarveOutIsScopedAndExpires(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xf7}
+	msg, hashes := linkedHeaders(anchor, 20, &nonce)
+
+	sm := newDemotionManager(t)
+
+	stalled, _, _ := demotionPeer(t, sm, 121, 1000)
+	successor, _, _ := demotionPeer(t, sm, 122, 1000)
+
+	seedFetchHeaders(t, sm, stalled, anchor, msg)
+
+	sm.storeSyncPeer(stalled, stalledSyncPeerState())
+	stalled.SetSyncPeer(true)
+
+	sm.handleCheckSyncPeer()
+	require.Equal(t, successor, sm.loadSyncPeer())
+
+	continuation, _ := linkedHeaders(hashes[len(hashes)-1], 5, &nonce)
+	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: successor})
+
+	// Registered after the election, so it cannot have been the peer startSync
+	// picked.
+	bystander, _, _ := demotionPeer(t, sm, 123, 1000)
+
+	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: bystander})
+
+	require.False(t, bystander.Connected(),
+		"the carve-out is for a peer whose late reply we caused, not for anybody re-sending headers we happen to hold")
+
+	state, ok := sm.peerStates.Get(stalled)
+	require.True(t, ok)
+	require.True(t, state.inDemotionCooldown(), "demotion should have stamped a cooldown to scope the carve-out to")
+
+	// The demotion window closes. From here the demoted peer is just a peer.
+	state.clearDemotionCooldown()
+
+	sm.handleHeadersMsg(&headersMsg{headers: continuation, peer: stalled})
+
+	require.False(t, stalled.Connected(),
+		"once the cooldown has expired the carve-out no longer covers the demoted peer either")
+}

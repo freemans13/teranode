@@ -3817,12 +3817,22 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			// connecting and then stops is a different animal, and still costs
 			// the sender its connection.
 			//
+			// Scoped to a peer inside its demotion cooldown, which is the only
+			// peer whose late reply we caused, and which is also what gives the
+			// carve-out an expiry. Without that scope holdHeader is satisfied by
+			// ANY header currently in the index, so any peer could re-send a
+			// batch it once contributed, or any prefix of it, for ever: 2000
+			// headers of bandwidth and decode plus a headerMu acquisition each
+			// time, the same lock the block-queue consumer takes first in
+			// headers-first mode, and nothing at all for the sender.
+			//
 			// Only reachable with the fan-out on, because that is what keeps a
 			// demoted peer connected in the first place.
 			_, holdParent := sm.headerIndex[blockHeader.PrevBlock]
 			_, holdHeader := sm.headerIndex[blockHash]
 
-			if sm.settings.Legacy.MultiPeerBlockDownload && pushed == 0 && (holdParent || holdHeader) {
+			if sm.settings.Legacy.MultiPeerBlockDownload && pushed == 0 &&
+				state.inDemotionCooldown() && (holdParent || holdHeader) {
 				staleReply = true
 
 				break
