@@ -1733,11 +1733,27 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 
 		defer rows.Close()
 
-		data.SpendingDatas = make([]*spendpkg.SpendingData, len(tx.Outputs)) // needs to be nullable
+		// SpendingDatas is indexed by vout, so it must be sized by the highest stored
+		// idx and NOT by the number of rows returned. createOutputs skips nil outputs
+		// while preserving each surviving output's original index (see the outputEntry
+		// loop in createOutputs), so a transaction seeded from a UTXO-set snapshot has
+		// gaps in idx: cmd/seeder builds its outputs with utxopersister.PadUTXOsWithNil.
+		// Sizing by the row count then indexes out of range on the first output past a
+		// gap. Grow to cover each idx instead; the query is ORDER BY o.idx, so growth
+		// is monotonic and each append is amortised O(1).
+		data.SpendingDatas = make([]*spendpkg.SpendingData, 0, len(tx.Outputs)) // needs to be nullable
 
 		for rows.Next() {
 			if err = rows.Scan(&idx, &spendingDataBytes, &frozen); err != nil {
 				return nil, err
+			}
+
+			if idx < 0 {
+				return nil, errors.NewProcessingError("negative output index %d for tx %s", idx, hash.String())
+			}
+
+			for len(data.SpendingDatas) <= idx {
+				data.SpendingDatas = append(data.SpendingDatas, nil)
 			}
 
 			if data.Frozen || frozen {
@@ -1750,6 +1766,12 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 			} else {
 				data.SpendingDatas[idx] = nil
 			}
+		}
+
+		// A truncated read would silently under-report the spent set, so surface it
+		// rather than returning a short slice.
+		if err = rows.Err(); err != nil {
+			return nil, err
 		}
 	}
 
