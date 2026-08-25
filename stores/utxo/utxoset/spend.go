@@ -12,7 +12,7 @@ import (
 
 // spendSQL is the whole design in one statement.
 //
-// It does four jobs at once. It is the DOUBLE-SPEND ARBITER: an outpoint that is absent
+// It does four jobs at once. It ARBITRATES DOUBLE-SPENDS: an outpoint that is absent
 // deletes zero rows, and absence is the rejection — there is no spent-set to consult.
 // It is the DECORATE FETCH: RETURNING hands back satoshis and the locking script, so
 // script validation never fetches or deserialises a parent transaction. It is the

@@ -82,7 +82,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 // SupportsOutpointOnlySpend reports that this store can spend by outpoint alone.
 //
 // This gates the below-checkpoint fast path (model.OutpointOnlyEligible). It is true
-// here for a structural reason rather than as an optimisation: the arbiter IS the
+// here for a structural reason rather than as an optimisation: the UTXO table IS the
 // outpoint set, so a spend needs nothing but the outpoint to be authorised.
 func (s *Store) SupportsOutpointOnlySpend() bool { return true }
 
@@ -125,11 +125,11 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 
 // errM1 marks a method that is deliberately out of M1 scope.
 //
-// M1 is the arbiter alone, in sync mode below the hardcoded checkpoint. The undo
+// M1 is the UTXO table alone, in sync mode below the hardcoded checkpoint. The undo
 // journal and the tx_meta window arrive in M3, and everything that depends on them
 // fails loudly here rather than silently returning a wrong answer — a store that
 // quietly answers "not found" for a question it cannot answer is how consensus bugs
 // start.
 func errM1(method string) error {
-	return errors.NewProcessingError("[utxoset] %s is not implemented in M1 (arbiter-only, sync mode); it depends on the spend journal or tx_meta window landing in M3", method)
+	return errors.NewProcessingError("[utxoset] %s is not implemented in M1 (UTXO-table-only, sync mode); it depends on the spend journal or tx_meta window landing in M3", method)
 }

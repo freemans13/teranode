@@ -21,11 +21,11 @@ INSERT INTO utxo (satoshis, created_height, spendable_from, leaf, flags, ukey, t
 SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[], $4::smallint[], $5::smallint[],
                      $6::uuid[], $7::bytea[], $8::bytea[])`
 
-// Create records a transaction's spendable outputs in the arbiter.
+// Create records a transaction's spendable outputs in the UTXO table.
 //
 // Only SPENDABLE outputs get a row. A provably-unspendable output — an OP_RETURN data
 // carrier — creates nothing, because a row that can never be deleted would sit in the
-// arbiter forever and the arbiter's size is the entire budget. This mirrors the
+// table forever and the UTXO table's size is the entire budget. This mirrors the
 // postgres store's spendable_count and the aerospike store's ShouldStoreOutputAsUTXO
 // gate, so all three agree on what "spendable" means.
 func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
@@ -80,7 +80,7 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		}
 
 		if out.LockingScript != nil && !utxo.ShouldStoreOutputAsUTXO(out, blockHeight, genesisHeight) {
-			continue // provably unspendable: no arbiter row, ever
+			continue // provably unspendable: no UTXO row, ever
 		}
 
 		var script []byte

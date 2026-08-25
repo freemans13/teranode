@@ -26,7 +26,7 @@ const SpendJournalPartitionBlocks = 48
 // reclaimed as the chain advances.
 const DefaultSpendJournalRetentionBlocks = 1440
 
-// spendJournalSQL deletes the arbiter row AND captures its payload in one statement.
+// spendJournalSQL deletes the UTXO row AND captures its payload in one statement.
 //
 // One statement, not merely one transaction. A data-modifying CTE guarantees the delete
 // and the journal insert see the same rows and commit together -- there is no ordering,

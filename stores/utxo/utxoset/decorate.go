@@ -8,7 +8,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// decorateSQL reads the two fields an input actually needs from the parent's arbiter row.
+// decorateSQL reads the two fields an input actually needs from the parent's UTXO row.
 //
 // Today's store answers this by fetching the parent's raw_tx -- ~1.7 KB -- and running
 // bt.NewTxFromBytes over it to extract LockingScript and Satoshis, discarding the rest
@@ -116,7 +116,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	}
 
 	if resolved < len(refs) {
-		// A parent that is absent from the arbiter is spent or was never created. Note
+		// A parent that is absent from the UTXO table is spent or was never created. Note
 		// the behavioural difference from the postgres store, which can still decorate
 		// from a spent parent's surviving txs row until the pruner removes it: here the
 		// row is gone the moment it is spent. That is the correct answer for a

@@ -11,7 +11,7 @@ import (
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 )
 
-// setFlagsSQL ORs or ANDs a flag mask onto matching arbiter rows.
+// setFlagsSQL ORs or ANDs a flag mask onto matching UTXO rows.
 //
 // $4 is OR-ed in, $5 is AND-ed, so one statement serves both freeze and unfreeze. The
 // full 32-byte txid recheck is present for the same reason it is everywhere else: the
@@ -25,7 +25,7 @@ UPDATE utxo u
 
 // FreezeUTXOs marks outputs unspendable.
 //
-// The flag lives on the arbiter row, so the spend path enforces it directly: a frozen
+// The flag lives on the UTXO row, so the spend path enforces it directly: a frozen
 // coin fails the DELETE's own predicate rather than being caught by a separate lookup
 // that could race the spend. There is no window in which a freeze has been recorded but
 // a concurrent spend still succeeds.
@@ -77,12 +77,12 @@ func (s *Store) setFlags(ctx context.Context, spends []*utxo.Spend, orMask, andM
 	return nil
 }
 
-// getSpendSQL answers "what happened to this outpoint" from the arbiter first and the
+// getSpendSQL answers "what happened to this outpoint" from the UTXO table first and the
 // journal second.
 //
 // The journal is doing double duty here. It exists so a reorg can restore a coin, but
 // because it records spending_txid it is also the ONLY place this store can recover
-// SPENDER IDENTITY -- the arbiter row is gone, and absence alone cannot distinguish
+// SPENDER IDENTITY -- the UTXO row is gone, and absence alone cannot distinguish
 // "spent by X" from "never existed". That identity is therefore available exactly as far
 // back as journal retention, and no further: beyond it the honest answer is NOT_FOUND.
 const getSpendSQL = `

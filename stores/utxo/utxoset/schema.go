@@ -7,7 +7,7 @@
 // This store indexes only the live UNSPENT set — measured at 74,426,411 and roughly
 // flat — and detects a double-spend by ABSENCE. A spend becomes a DELETE.
 //
-// That single DELETE does four jobs at once: it is the double-spend arbiter (zero rows
+// That single DELETE does four jobs at once: it arbitrates the double-spend (zero rows
 // affected means the outpoint is already gone), it is the decorate fetch (RETURNING
 // hands back satoshis and locking script, so PreviousOutputsDecorate never parses a
 // raw transaction), it is the reclaim (no sweep, no pruner, no pending_deletes), and it
@@ -16,12 +16,12 @@
 // reads, 52% of statement WAL and 25-30% of CPU.
 //
 // Measured evidence behind the design (see docs/superpowers/specs/):
-//   - arbiter index 8.4 GB at the projected tip, vs a 25 GB budget
+//   - UTXO index 8.4 GB at the projected tip, vs a 25 GB budget
 //   - 19x less WAL per spend and 23x fewer full-page images than append-only
 //   - index bloat plateaus at exactly 2.00x floor and fully reverses via
 //     REINDEX CONCURRENTLY (3.1 s per 10M entries)
 //
-// M1 scope: the arbiter and the block/chunk ledger only. Sync mode — below the
+// M1 scope: the UTXO table and the block/chunk ledger only. Sync mode — below the
 // hardcoded checkpoint, where a reorg is impossible by rule, so no spend journal and no
 // tx_meta window are needed. Those arrive in M3.
 package utxoset
@@ -52,7 +52,7 @@ func LeafFor(txid []byte) int16 {
 	return int16(txid[0] & (NumLeaves - 1))
 }
 
-// Pack builds the arbiter key: the first 12 bytes of the txid followed by the vout as
+// Pack builds the UTXO table's key: the first 12 bytes of the txid followed by the vout as
 // big-endian uint32. Sixteen bytes, stored as a uuid.
 //
 // PostgreSQL's uuid is typlen 16 / typalign 'c', so it occupies exactly 16 bytes with no
@@ -84,12 +84,12 @@ const (
 	FlagCoinbase    int16 = 1 << 3
 )
 
-// schemaSQL is the M1 schema: the arbiter plus the ledger that makes block application
+// schemaSQL is the M1 schema: the UTXO table plus the ledger that makes block application
 // idempotent. Deliberately excludes the spend journal and tx_meta — below the checkpoint a
 // reorg is impossible by rule, so neither is reachable.
 const schemaSQL = `
 -- ---------------------------------------------------------------------------
--- THE ARBITER. One row per spendable output. Inserted once, deleted once.
+-- THE UTXO TABLE. One row per spendable output. Inserted once, deleted once.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS utxo (
     satoshis        BIGINT   NOT NULL,
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- ---------------------------------------------------------------------------
 -- THE LEDGER. Replay safety.
 --
--- The arbiter key is non-unique, so there is no ON CONFLICT (txid, vout) to make
+-- The UTXO table's key is non-unique, so there is no ON CONFLICT (txid, vout) to make
 -- create idempotent. A block arriving twice, arriving out of order, or being
 -- re-applied after a crash must therefore be rejected by ground truth: a durable
 -- record written in the SAME transaction as the work it describes. This is what
@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS utxo (
 --
 -- The journal row is therefore written in the SAME STATEMENT as the delete, not merely
 -- the same transaction -- see spendJournalSQL. It carries every field needed to
--- reconstruct the arbiter row byte-for-byte, including hash_override, because
+-- reconstruct the UTXO row byte-for-byte, including hash_override, because
 -- ReAssignUTXO splices an operator-supplied utxo hash that is NOT derivable from
 -- (txid, vout, satoshis, script); recomputing it on restore would silently reverse a
 -- court-ordered reassignment.
@@ -176,7 +176,7 @@ CREATE TABLE IF NOT EXISTS applied_chunk (
 //
 // fillfactor is 90, not 100. The only routine UPDATE is the two-phase-commit SetLocked
 // release; at fillfactor 100 that becomes a non-HOT update which must write into the
-// arbiter index. The tuple never changes size (flags and spendable_from are fixed
+// UTXO index. The tuple never changes size (flags and spendable_from are fixed
 // width), so page slack keeps it HOT with zero index writes. This costs disk, not index
 // budget. The box has never run block assembly with a mempool, so there is no local
 // evidence either way — this is measurement M4.

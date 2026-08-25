@@ -82,11 +82,11 @@ func mkTx(t *testing.T, nOut int, sats uint64) *bt.Tx {
 	return tx
 }
 
-// TestArbiterCreateSpendRoundTrip is the core loop: an output created by Create must be
+// TestUTXOTableCreateSpendRoundTrip is the core loop: an output created by Create must be
 // spendable exactly once, must hand back its satoshis and locking script on the way out
 // (that RETURNING clause is what replaces PreviousOutputsDecorate), and a second attempt
 // must be rejected by ABSENCE rather than by consulting a spent-set.
-func TestArbiterCreateSpendRoundTrip(t *testing.T) {
+func TestUTXOTableCreateSpendRoundTrip(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 2, 5000)
@@ -109,7 +109,7 @@ func TestArbiterCreateSpendRoundTrip(t *testing.T) {
 	require.Len(t, spends, 1)
 	require.NoError(t, spends[0].Err, "first spend must succeed")
 
-	// the decorate fetch: Spend must have populated the input from the arbiter row,
+	// the decorate fetch: Spend must have populated the input from the UTXO row,
 	// so script validation needs no parent lookup at all
 	require.Equal(t, parent.Outputs[0].Satoshis, child.Inputs[0].PreviousTxSatoshis,
 		"Spend must return the satoshis via RETURNING")
@@ -139,10 +139,10 @@ func TestArbiterCreateSpendRoundTrip(t *testing.T) {
 	require.Equal(t, 1, remaining, "output 1 must survive its sibling being spent")
 }
 
-// TestArbiterUnspendableOutputsCreateNoRow pins the rule that keeps the arbiter's size
+// TestUTXOTableUnspendableOutputsCreateNoRow pins the rule that keeps the UTXO table's size
 // bounded: an output that can never be spent must never occupy a row, because a row
 // nothing can ever delete would sit in the budget forever.
-func TestArbiterUnspendableOutputsCreateNoRow(t *testing.T) {
+func TestUTXOTableUnspendableOutputsCreateNoRow(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := bt.NewTx()
@@ -166,17 +166,17 @@ func TestArbiterUnspendableOutputsCreateNoRow(t *testing.T) {
 	var rows int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`,
 		txHash[:]).Scan(&rows))
-	require.Equal(t, 1, rows, "only the spendable output may occupy an arbiter row")
+	require.Equal(t, 1, rows, "only the spendable output may occupy a UTXO row")
 }
 
-// TestDecorateFromArbiter answers the question directly: can PreviousOutputsDecorate be
+// TestDecorateFromUTXOTable answers the question directly: can PreviousOutputsDecorate be
 // served from the UTXO table alone?
 //
 // Today it cannot -- the postgres store fetches the parent's raw_tx (~1.7 KB) and runs
 // bt.NewTxFromBytes over it to pull out two fields. Here those two fields ARE the row,
 // so decorate is an index probe. Note this store holds no transaction bodies at all, so
-// if the input comes back decorated it can only have come from the arbiter.
-func TestDecorateFromArbiter(t *testing.T) {
+// if the input comes back decorated it can only have come from the UTXO table.
+func TestDecorateFromUTXOTable(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 1, 7777)
@@ -198,9 +198,9 @@ func TestDecorateFromArbiter(t *testing.T) {
 	require.NoError(t, s.PreviousOutputsDecorate(ctx, child))
 
 	require.Equal(t, uint64(7777), child.Inputs[0].PreviousTxSatoshis,
-		"satoshis must come from the arbiter row")
+		"satoshis must come from the UTXO row")
 	require.NotNil(t, child.Inputs[0].PreviousTxScript,
-		"locking script must come from the arbiter row")
+		"locking script must come from the UTXO row")
 	require.Equal(t, parent.Outputs[0].LockingScript.String(), child.Inputs[0].PreviousTxScript.String(),
 		"the decorated script must be the parent's actual locking script")
 
@@ -221,7 +221,7 @@ func TestDecorateFromArbiter(t *testing.T) {
 	orphan.Inputs[0].PreviousTxScript = nil
 
 	require.Error(t, s.PreviousOutputsDecorate(ctx, orphan),
-		"a spent parent has no arbiter row and decorate must not fabricate one")
+		"a spent parent has no UTXO row and decorate must not fabricate one")
 }
 
 // TestSpendAndCreateAtomic covers the contract PR 1326 introduces, and the property that
@@ -301,7 +301,7 @@ func TestSpendWritesJournal(t *testing.T) {
 	_, err = s.Spend(ctx, child, 200)
 	require.NoError(t, err)
 
-	// the arbiter row is gone...
+	// the UTXO row is gone...
 	var live int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
 	require.Equal(t, 0, live)
