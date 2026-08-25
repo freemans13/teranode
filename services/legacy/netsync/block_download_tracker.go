@@ -34,6 +34,23 @@ const (
 	maxTrackedBlockDownloads = 50_000
 )
 
+// ownerRecord is what one peer owes us for one block.
+type ownerRecord struct {
+	// at is when we last asked, and what the ownership ceiling is measured from.
+	at time.Time
+	// forgiven marks an assignment the peer has been let off. The record stays,
+	// because a copy that does turn up must still be admitted rather than costing
+	// an honest peer its whole association — but the peer is no longer spending
+	// budget on it, and no longer counts as a peer we are downloading from.
+	//
+	// Without this the two questions were the same question. A demoted peer's
+	// slice was reopened by back-dating it, another peer delivered those blocks,
+	// and because arrival only discharges the delivering peer the back-dated
+	// records sat there for the rest of the hour — spending the whole budget of
+	// the peer the demotion had deliberately kept connected in order to use.
+	forgiven bool
+}
+
 // blockDownloadTracker records which peers owe us which blocks.
 //
 // It replaces two separate expiring maps — one global, one per peer — that
@@ -59,23 +76,6 @@ const (
 // writes do nothing. Reading a nil tracker as "we never asked for this" is the
 // safe direction — it costs a misbehaving-looking peer its connection rather
 // than admitting a block nobody requested.
-// ownerRecord is what one peer owes us for one block.
-type ownerRecord struct {
-	// at is when we last asked, and what the ownership ceiling is measured from.
-	at time.Time
-	// forgiven marks an assignment the peer has been let off. The record stays,
-	// because a copy that does turn up must still be admitted rather than costing
-	// an honest peer its whole association — but the peer is no longer spending
-	// budget on it, and no longer counts as a peer we are downloading from.
-	//
-	// Without this the two questions were the same question. A demoted peer's
-	// slice was reopened by back-dating it, another peer delivered those blocks,
-	// and because arrival only discharges the delivering peer the back-dated
-	// records sat there for the rest of the hour — spending the whole budget of
-	// the peer the demotion had deliberately kept connected in order to use.
-	forgiven bool
-}
-
 type blockDownloadTracker struct {
 	mu  sync.Mutex
 	ttl time.Duration
