@@ -670,12 +670,14 @@ func selectCountersForDemotedTx(ctx context.Context, s Store, demotedTx *bt.Tx, 
 				continue
 			}
 
-			candidateMeta, err := s.Get(ctx, &candidate, fields.Tx, fields.Conflicting, fields.CreatedAt)
+			// candidateSpendsOutput only compares outpoints, so the inpoints are
+			// enough; fields.Tx would rebuild the whole candidate transaction.
+			candidateMeta, err := s.Get(ctx, &candidate, fields.TxInpoints, fields.Conflicting, fields.CreatedAt)
 			if err != nil {
 				return nil, errors.NewProcessingError("[selectCountersForDemotedTx][%s] error getting candidate counter", candidate.String(), err)
 			}
 
-			if candidateMeta == nil || candidateMeta.Tx == nil {
+			if candidateMeta == nil {
 				continue
 			}
 
@@ -683,7 +685,7 @@ func selectCountersForDemotedTx(ctx context.Context, s Store, demotedTx *bt.Tx, 
 				continue
 			}
 
-			if !candidateSpendsOutput(candidateMeta.Tx, parentHash, vout) {
+			if !candidateSpendsOutput(&candidateMeta.TxInpoints, parentHash, vout) {
 				continue
 			}
 
@@ -735,9 +737,9 @@ func isOlderCounter(aCreatedAt int64, aHash chainhash.Hash, bCreatedAt int64, bH
 	return false
 }
 
-func candidateSpendsOutput(tx *bt.Tx, parentHash *chainhash.Hash, vout uint32) bool {
-	for _, in := range tx.Inputs {
-		if in.PreviousTxOutIndex == vout && in.PreviousTxIDChainHash().IsEqual(parentHash) {
+func candidateSpendsOutput(inpoints *subtree.TxInpoints, parentHash *chainhash.Hash, vout uint32) bool {
+	for _, inpoint := range inpoints.GetTxInpoints() {
+		if inpoint.Index == vout && inpoint.Hash.IsEqual(parentHash) {
 			return true
 		}
 	}
@@ -1175,9 +1177,17 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 
 	defer deferFn()
 
-	txMeta, err := s.Get(ctx, &txHash, fields.Tx)
+	// Only the parent hashes are read below, so ask for the inpoints rather than
+	// the whole transaction.
+	txMeta, err := s.Get(ctx, &txHash, fields.TxInpoints)
 	if err != nil {
 		return nil, err
+	}
+
+	// A missing record surfaces as (nil, nil) on some backends (aerospike returns
+	// nil for a not-found tx), which previously dereferenced straight to a panic.
+	if txMeta == nil {
+		return nil, errors.NewTxNotFoundError("[GetCounterConflictingTxHashes][%s] tx not found", txHash.String())
 	}
 
 	counterConflictingMap := make(map[chainhash.Hash]struct{})
@@ -1186,9 +1196,9 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 	// get the unique parent txs
 	parentTxs := make(map[chainhash.Hash][]*chainhash.Hash)
 
-	for _, input := range txMeta.Tx.Inputs {
+	for _, parentHash := range txMeta.TxInpoints.GetParentTxHashes() {
 		// get the parent tx
-		parentTxs[*input.PreviousTxIDChainHash()] = nil
+		parentTxs[parentHash] = nil
 	}
 
 	for parentTx := range parentTxs {

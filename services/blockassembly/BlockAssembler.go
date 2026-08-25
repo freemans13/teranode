@@ -1369,7 +1369,10 @@ func (b *BlockAssembler) unlockConflictParents(ctx context.Context, txHashes []c
 	for i := range txHashes {
 		h := txHashes[i]
 
-		txMeta, err := b.utxoStore.Get(ctx, &h, fields.Tx)
+		// Only the parent hashes are read below, so ask for the inpoints rather
+		// than the whole transaction: fields.Tx pulls every output and, on
+		// aerospike, the external blob of a spilled transaction.
+		txMeta, err := b.utxoStore.Get(ctx, &h, fields.TxInpoints)
 		if err != nil {
 			if errors.Is(err, errors.ErrTxNotFound) {
 				continue
@@ -1378,12 +1381,12 @@ func (b *BlockAssembler) unlockConflictParents(ctx context.Context, txHashes []c
 			return errors.NewProcessingError("[unlockConflictParents][%s] failed to load tx", h.String(), err)
 		}
 
-		if txMeta == nil || txMeta.Tx == nil {
+		if txMeta == nil {
 			continue
 		}
 
-		for _, in := range txMeta.Tx.Inputs {
-			parentSet[*in.PreviousTxIDChainHash()] = struct{}{}
+		for _, parentHash := range txMeta.TxInpoints.GetParentTxHashes() {
+			parentSet[parentHash] = struct{}{}
 		}
 	}
 
@@ -3145,9 +3148,11 @@ type sortEntry struct {
 //
 // Returns true if the transaction is valid for inclusion in block assembly.
 func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash chainhash.Hash, bestBlockIDsMap map[uint32]bool, dryRun bool) bool {
-	// Load only inputs and conflicting flag — NOT full Tx (avoids loading heavy output data)
-	txMeta, err := b.utxoStore.Get(ctx, &txHash, fields.Inputs, fields.Conflicting)
-	if err != nil || txMeta == nil || txMeta.Tx == nil || txMeta.Tx.Inputs == nil {
+	// Only each input's outpoint is read below. fields.Inputs would additionally
+	// load previous_tx_satoshis, previous_tx_script, unlocking_script and
+	// sequence_number, none of which are consumed here.
+	txMeta, err := b.utxoStore.Get(ctx, &txHash, fields.TxInpoints, fields.Conflicting)
+	if err != nil || txMeta == nil {
 		return false
 	}
 
@@ -3155,15 +3160,27 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 		return false
 	}
 
-	for _, input := range txMeta.Tx.Inputs {
-		parentHash := input.PreviousTxIDChainHash()
+	inpoints := txMeta.TxInpoints.GetTxInpoints()
+	if len(inpoints) == 0 {
+		// An unmined transaction with no recorded inputs cannot be validated for
+		// inclusion. This also settles a divergence the previous nil-slice guard
+		// left open: the SQL store builds Tx.Inputs by appending, so no inputs
+		// meant a nil slice and this returned false, while aerospike allocates a
+		// non-nil empty slice, so the same transaction fell through the loop and
+		// was reported valid. Input-less records are UTXO-set snapshot artifacts
+		// (see meta.Data.TxIsSerializable), so false is the right answer for both.
+		return false
+	}
+
+	for _, inpoint := range inpoints {
+		parentHash := &inpoint.Hash
 
 		parentMeta, err := b.utxoStore.Get(ctx, parentHash, fields.Utxos)
 		if err != nil || parentMeta == nil {
 			return false
 		}
 
-		vout := int(input.PreviousTxOutIndex)
+		vout := int(inpoint.Index)
 		if parentMeta.SpendingDatas == nil || vout >= len(parentMeta.SpendingDatas) {
 			continue
 		}
