@@ -377,14 +377,17 @@ func (ba *BlockAssembly) sampleBlockAssemblerMetrics(stallState dequeueStallStat
 // reportDequeueStall logs the opening or a repeat of a dequeue stall.
 //
 // Which of the three consumer lifecycle states explains the incident decides
-// the message, and whether the queue has held work at any point during the
-// incident decides the level. Those are separate questions and conflating them
-// is what makes an operator stop reading the line: a consumer that has not
-// reached its dequeue branch for the threshold is always worth a record, but
-// only work stacking up behind it means anything is at risk. A large
-// moveForwardBlock on a quiet node trips the threshold legitimately and reports
-// at info; the same staleness with transactions queued is issue #1429 and
-// warns.
+// the message. The two lifecycle faults also fix their own level, because
+// there the answer does not depend on depth: a consumer that has not started
+// yet is routine startup and reports at info however much is queued behind it,
+// and one that has exited is a dead service and reports at error even on an
+// empty queue. Only for a consumer that exists and is merely not dequeuing
+// does the level follow whether the queue has held work at any point during
+// the incident - and there it must, because a consumer that has not reached
+// its dequeue branch for the threshold is always worth a record, but only work
+// stacking up behind it means anything is at risk. A large moveForwardBlock on
+// a quiet node trips the threshold legitimately and reports at info; the same
+// staleness with transactions queued is issue #1429 and warns.
 //
 // The level comes from the incident-wide latch, not from this tick's depth.
 // Depth is a single sample of a number the blocking handler is itself draining,
