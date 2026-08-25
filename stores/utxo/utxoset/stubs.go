@@ -35,22 +35,6 @@ func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, erro
 	return nil, errM1("ScanInconsistentUnminedTxs")
 }
 
-func (s *Store) GetPrunableUnminedTxIterator(_ uint32) (utxo.UnminedTxIterator, error) {
-	return nil, errM1("GetPrunableUnminedTxIterator")
-}
-
-func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chainhash.Hash, error) {
-	return nil, errM1("QueryOldUnminedTransactions")
-}
-
-func (s *Store) PreserveTransactions(_ context.Context, _ []chainhash.Hash, _ uint32) error {
-	return errM1("PreserveTransactions")
-}
-
-func (s *Store) ProcessExpiredPreservations(_ context.Context, _ uint32) error {
-	return errM1("ProcessExpiredPreservations")
-}
-
 func (s *Store) BatchDecorate(_ context.Context, _ []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
 	return errM1("BatchDecorate")
 }

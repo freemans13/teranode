@@ -36,3 +36,37 @@ func TestUnminedSetIsEmptyNotUnimplemented(t *testing.T) {
 	require.NoError(t, err, "block assembly replays these at startup")
 	require.Empty(t, intents)
 }
+
+// TestUnminedFamilyIsEmptyNotUnimplemented covers the rest of the unmined-tracking
+// family, which the node hits on background timers rather than at startup.
+//
+// GetPrunableUnminedTxIterator and ProcessExpiredPreservations both fired repeatedly
+// against a live mainnet sync, logging errors on every cycle. Non-fatal, but a store that
+// errors on a timer teaches everyone to ignore its errors.
+//
+// The preservation pair is not merely unimplemented here, it is MEANINGLESS. Preservation
+// exists to stop a pruner deleting a parent that a live unmined child still needs. This
+// store has no pruner and never deletes an unspent output, so there is nothing to
+// preserve anything from, and nothing preserved can expire.
+func TestUnminedFamilyIsEmptyNotUnimplemented(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	it, err := s.GetPrunableUnminedTxIterator(1_000)
+	require.NoError(t, err)
+	require.NotNil(t, it)
+
+	defer func() { require.NoError(t, it.Close()) }()
+
+	batch, err := it.Next(ctx)
+	require.NoError(t, err)
+	require.Empty(t, batch)
+
+	require.NoError(t, s.ProcessExpiredPreservations(ctx, 1_000),
+		"nothing can expire when nothing needed preserving")
+	require.NoError(t, s.PreserveTransactions(ctx, nil, 1_000),
+		"nothing deletes an unspent output here, so there is nothing to preserve from")
+
+	old, err := s.QueryOldUnminedTransactions(ctx, 1_000)
+	require.NoError(t, err)
+	require.Empty(t, old)
+}

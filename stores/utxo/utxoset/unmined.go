@@ -3,6 +3,7 @@ package utxoset
 import (
 	"context"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
@@ -44,4 +45,35 @@ func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
 // Block assembly replays these at startup (BlockAssembler.go:936) and an error is fatal.
 func (s *Store) PendingConflictIntents(_ context.Context) ([]utxo.ConflictIntent, error) {
 	return nil, nil
+}
+
+// GetPrunableUnminedTxIterator reports that nothing is prunable, for the same reason
+// GetUnminedTxIterator reports that nothing is unmined: there is no tx_meta, so no row
+// could represent an unmined transaction, prunable or otherwise.
+func (s *Store) GetPrunableUnminedTxIterator(_ uint32) (utxo.UnminedTxIterator, error) {
+	return emptyUnminedIterator{}, nil
+}
+
+// QueryOldUnminedTransactions finds none, same reason.
+func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chainhash.Hash, error) {
+	return nil, nil
+}
+
+// PreserveTransactions is meaningless here, not merely unimplemented, and that is the
+// stronger claim.
+//
+// Preservation exists to stop a pruner deleting a parent transaction that a live unmined
+// child still needs. This store has no pruner (see pruner.go) and never deletes an
+// unspent output: the only DELETE it issues is the one that spends a coin, authorised by
+// the spend itself. There is nothing to preserve anything from.
+func (s *Store) PreserveTransactions(_ context.Context, _ []chainhash.Hash, _ uint32) error {
+	return nil
+}
+
+// ProcessExpiredPreservations has nothing to expire, because nothing was preserved.
+//
+// This runs on a background timer, so an error here is not fatal but is logged on every
+// cycle, and a store that errors on a timer teaches everyone to ignore its errors.
+func (s *Store) ProcessExpiredPreservations(_ context.Context, _ uint32) error {
+	return nil
 }
