@@ -522,6 +522,14 @@ type server struct {
 	// startFeeler, nil when feelers are disabled.
 	feelerTokens chan struct{}
 
+	// feelerHandshake is how long a probe waits for a version message, settled
+	// from legacy_feelerHandshakeTimeout by startFeeler. Resolved once because
+	// the setting is fixed at startup and its two guards warn: doing it per
+	// probe reported a startup mistake as permanent runtime noise. Written
+	// before the feeler goroutine exists and never again, which is what makes it
+	// safe to read from a probe without synchronisation.
+	feelerHandshake time.Duration
+
 	// feelerSlots is how many peer slots are held back for feeler probes. It
 	// is deducted from the peer-admission ceiling and never from the automatic
 	// outbound target, mirroring svnode's nMaxInbound arithmetic

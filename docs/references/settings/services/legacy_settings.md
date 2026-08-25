@@ -66,6 +66,9 @@
   timeout. If it does not, the peer package hangs up first and a silent host is
   logged at warning as a lost peer rather than being hung up on quietly by the
   probe; values at or above the peer timeout are reduced to 29s with a warning.
+  A non-positive value falls back to 25s, also with a warning. Both warnings are
+  emitted once, at startup, and the deadline the feeler settled on is on the
+  `[Feeler] Starting` line.
 
 ### Batch Processing Performance
 

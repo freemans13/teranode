@@ -276,6 +276,23 @@ func (s *server) startFeeler() {
 		s.feelerTokens <- struct{}{}
 	}
 
+	// Settled once, here, rather than on each probe. The setting is fixed at
+	// startup, so a node configured badly used to repeat feelerHandshakeTimeout's
+	// warning for the life of the process, roughly every two minutes at the
+	// shipped pacing, and emit two or three lines per probe instead of the one
+	// info line the feature is meant to be checkable by. A startup mistake
+	// belongs in the startup log.
+	//
+	// Held on the server rather than passed to feelerProbe so the probe's
+	// signature stays as it is: runOneProbe and every probe test drive
+	// feelerProbe directly, and a parameter would have those tests supplying the
+	// value the production path is supposed to be responsible for.
+	//
+	// Safe to read without synchronisation for the same reason feelerSlots is:
+	// this write is ordered ahead of every probe by the goroutine that starts
+	// below, and nothing writes it again.
+	s.feelerHandshake = feelerHandshakeTimeout(s.logger, s.settings.Legacy.FeelerHandshakeTimeout)
+
 	s.wg.Add(1)
 
 	go s.feelerHandler()
@@ -323,7 +340,7 @@ func (s *server) feelerHandler() {
 		s.logger.Warnf("[Feeler] legacy_feelerInterval must be positive, using %s (set legacy_maxFeelerPeers to 0 to disable feelers)", interval)
 	}
 
-	s.logger.Infof("[Feeler] Starting with %d slot(s), mean interval %s", s.feelerSlots, interval)
+	s.logger.Infof("[Feeler] Starting with %d slot(s), mean interval %s, handshake deadline %s", s.feelerSlots, interval, s.feelerHandshake)
 
 	deadline := time.Now().Add(poissonNext(interval))
 
@@ -474,7 +491,10 @@ func (s *server) feelerProbe() {
 		close(gone)
 	}()
 
-	timer := time.NewTimer(feelerHandshakeTimeout(s.logger, s.settings.Legacy.FeelerHandshakeTimeout))
+	// Already settled by startFeeler. Resolving it here instead re-ran both of
+	// feelerHandshakeTimeout's guards on every probe, so a badly configured node
+	// warned about a startup mistake for ever.
+	timer := time.NewTimer(s.feelerHandshake)
 	defer timer.Stop()
 
 	// Each arm records only why its own wait ended, and the verdict is reached

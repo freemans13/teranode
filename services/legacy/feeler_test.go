@@ -1111,6 +1111,14 @@ func candidateOf(srv *server) *wire.NetAddress {
 func runOneProbe(srv *server) {
 	srv.feelerTokens = make(chan struct{}, 1)
 
+	// startFeeler settles this on the real path, and a test that drove the loop
+	// has already had it set. Left alone when it is, so a test can pin the value
+	// a probe runs with; filled in when it is not, because a zero deadline fires
+	// the moment the timer is built.
+	if srv.feelerHandshake == 0 {
+		srv.feelerHandshake = feelerHandshakeTimeout(srv.logger, srv.settings.Legacy.FeelerHandshakeTimeout)
+	}
+
 	srv.feelerProbe()
 }
 
@@ -1446,6 +1454,72 @@ func TestFeelerProbeUsesTheConfiguredHandshakeTimeout(t *testing.T) {
 	require.Equal(t, uint64(1), srv.feelerAttempted.Load())
 	require.Equal(t, uint64(0), srv.feelerVerified.Load(),
 		"a host that never identified itself must never be promoted")
+}
+
+// TestFeelerHandshakeTimeoutIsSettledOnce pins where the setting is validated.
+//
+// legacy_feelerHandshakeTimeout is fixed at startup and both of
+// feelerHandshakeTimeout's guards log at warn, so validating it inside the probe
+// reported a startup mistake as permanent runtime noise: a warning roughly every
+// two minutes for the life of the process, on the level this series is trying to
+// keep clean, and two or three lines per probe rather than the one info line the
+// feature is meant to be checkable by.
+func TestFeelerHandshakeTimeoutIsSettledOnce(t *testing.T) {
+	t.Run("startFeeler warns once and keeps the corrected value", func(t *testing.T) {
+		rec := &recordingLogger{Logger: ulogger.TestLogger{}}
+
+		srv := newFeelerTestServer(t)
+		srv.logger = rec
+		srv.settings.Legacy.FeelerHandshakeTimeout = -time.Second
+
+		// No connection manager, so feelerAllowed is false and the loop this
+		// starts never probes. Only the startup path is under test here.
+		startFeelerLoop(t, srv)
+
+		require.Equal(t, defaultFeelerHandshakeTimeout, srv.feelerHandshake,
+			"the corrected deadline has to be carried, not recomputed")
+
+		warns, _ := rec.counts()
+		require.Equal(t, 1, warns, "the guard belongs in the startup log: %s", rec.logged())
+	})
+
+	t.Run("a probe never re-validates it", func(t *testing.T) {
+		// A listener that answers, so the probe reaches the timer and then ends
+		// on the version rather than on the deadline. That leaves the warn count
+		// as the only thing separating the two versions of this code, instead of
+		// how long the probe sat there.
+		ln, served := startFeelerTestListener(t, "/Bitcoin SV:1.1.0/")
+
+		swapTestConfig(t, ln.Addr().String())
+
+		rec := &recordingLogger{Logger: ulogger.TestLogger{}}
+
+		srv := newFeelerTestServer(t)
+		srv.logger = rec
+		srv.settings.Legacy.FeelerHandshakeTimeout = -time.Second
+		serveFeelerSnapshot(srv, feelerSnapshot{})
+
+		na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+		srv.addrManager.AddAddress(na, testSourceAddr())
+
+		// Settled the way startFeeler settles it, on a server whose loop was
+		// never started.
+		srv.feelerHandshake = defaultFeelerHandshakeTimeout
+
+		runOneProbe(srv)
+
+		select {
+		case <-served:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the listener was never reached, so the probe never built its timer")
+		}
+
+		require.Equal(t, uint64(1), srv.feelerVerified.Load(),
+			"the probe has to get past the handshake for this to be measuring anything")
+
+		warns, _ := rec.counts()
+		require.Zero(t, warns, "a startup misconfiguration must not be re-reported per probe: %s", rec.logged())
+	})
 }
 
 // startMuteFeelerTestListener accepts one connection, reads the probe's version
