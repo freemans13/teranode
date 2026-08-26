@@ -178,8 +178,20 @@ func (r *SubtreeMetaRegenerator) buildAndStoreMeta(ctx context.Context, subtreeH
 		return nil, err
 	}
 
-	if err := r.storeRegeneratedMeta(ctx, subtreeHash, meta); err != nil {
+	cached, err := r.storeRegeneratedMeta(ctx, subtreeHash, meta)
+	if err != nil {
 		return nil, err
+	}
+
+	// Two outcomes, two lines. A rebuild that did not reach the store is usable for
+	// this validation and is not a repair: whatever was on disk is still there, so
+	// the next read of this subtree rebuilds again. Logging both as success is what
+	// let an operator grep "successfully regenerated meta" and believe a rebuild
+	// loop had been fixed.
+	if !cached {
+		r.logger.Errorf("[RegenerateMeta][%s] regenerated meta for this validation but did not cache it, the next read rebuilds it again", subtreeHash.String())
+
+		return meta, nil
 	}
 
 	r.logger.Warnf("[RegenerateMeta][%s] successfully regenerated meta", subtreeHash.String())
@@ -255,7 +267,8 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 	return meta, nil
 }
 
-// storeRegeneratedMeta stores the regenerated meta for future use.
+// storeRegeneratedMeta caches the regenerated meta and reports whether it
+// reached the store.
 //
 // A serialization failure is returned rather than logged: a meta that cannot be
 // written is one every later read has to rebuild, so reporting success for it
@@ -264,16 +277,24 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 // rejected the only input that causes this, so reaching it means that check and
 // Meta.Serialize have drifted apart.
 //
-// A store write failure stays a warning. The meta itself is sound and the caller
-// can use it for this validation; only the caching is lost.
-func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtreeHash *chainhash.Hash, meta *subtreepkg.Meta) error {
+// A store write failure is not returned, because returning it would send
+// RegenerateMeta on to the peers and no peer can fix a local write. It is not
+// success either: regeneration now runs for a file that is present but rejected
+// as well as for one that is missing, so a failed write leaves the rejected bytes
+// exactly where they were and every later read of that subtree rebuilds from
+// .subtreeData, paying the peer fetch again on a local miss. The caller gets
+// cached false and says so rather than logging a repair that did not happen.
+//
+// A nil store is the same shape: nothing was cached, so cached is false. It is
+// not an error, because there is nowhere to write and the meta is still usable.
+func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtreeHash *chainhash.Hash, meta *subtreepkg.Meta) (bool, error) {
 	if r.subtreeStore == nil {
-		return nil
+		return false, nil
 	}
 
 	metaBytes, err := meta.Serialize()
 	if err != nil {
-		return errors.NewProcessingError("[storeRegeneratedMeta][%s] regenerated meta cannot be serialized, so it could never be cached", subtreeHash.String(), err)
+		return false, errors.NewProcessingError("[storeRegeneratedMeta][%s] regenerated meta cannot be serialized, so it could never be cached", subtreeHash.String(), err)
 	}
 
 	// Regeneration runs for a corrupt meta file as well as a missing one, so the write has to
@@ -282,10 +303,12 @@ func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtr
 	dah := r.getBlockHeight() + r.blockHeightRetention
 	if err := r.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta, metaBytes,
 		options.WithDeleteAt(dah), options.WithAllowOverwrite(true)); err != nil {
-		r.logger.Warnf("[storeRegeneratedMeta][%s] failed to store meta: %v", subtreeHash.String(), err)
+		r.logger.Errorf("[storeRegeneratedMeta][%s] failed to store meta, the rejected file stays on disk and will be rebuilt on every read: %v", subtreeHash.String(), err)
+
+		return false, nil
 	}
 
-	return nil
+	return true, nil
 }
 
 // SubtreeStoreAdapter adapts a SubtreeStore (read-only) to SubtreeStoreWriter

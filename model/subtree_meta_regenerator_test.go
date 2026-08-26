@@ -2,11 +2,14 @@ package model
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -417,7 +420,9 @@ func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_Success(t *testing.T) {
 		ParentTxHashes: []chainhash.Hash{},
 	}
 
-	require.NoError(t, regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta))
+	cached, err := regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta)
+	require.NoError(t, err)
+	require.True(t, cached, "a successful write must be reported as cached")
 
 	// Verify meta was stored
 	require.Len(t, mockStore.storedMeta, 1)
@@ -457,7 +462,9 @@ func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_ReplacesCorruptFile(t *test
 	meta := subtreepkg.NewSubtreeMeta(subtree)
 	meta.TxInpoints[1] = subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}}
 
-	require.NoError(t, regenerator.storeRegeneratedMeta(ctx, subtreeHash, meta))
+	cached, err := regenerator.storeRegeneratedMeta(ctx, subtreeHash, meta)
+	require.NoError(t, err)
+	require.True(t, cached, "the overwrite must be reported as cached")
 
 	expected, err := meta.Serialize()
 	require.NoError(t, err)
@@ -489,7 +496,10 @@ func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_NilStore(t *testing.T) {
 
 	// A nil store is not an error: there is nowhere to cache the meta, so the
 	// caller carries on with the regenerated one in memory rather than failing.
-	require.NoError(t, regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta))
+	// It is not a repair either, so cached is false.
+	cached, err := regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta)
+	require.NoError(t, err)
+	require.False(t, cached, "nothing was cached, so it must not be reported as cached")
 }
 
 func TestSubtreeStoreAdapter(t *testing.T) {
@@ -953,9 +963,142 @@ func TestStoreRegeneratedMeta_UnserializableIsAnError(t *testing.T) {
 	store := memory.New()
 	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, store, nil, func() uint32 { return 100 }, 288, 0)
 
-	err = regenerator.storeRegeneratedMeta(ctx, subtree.RootHash(), meta)
+	cached, err := regenerator.storeRegeneratedMeta(ctx, subtree.RootHash(), meta)
 	require.Error(t, err, "a meta that cannot be serialized must not be reported as stored")
+	require.False(t, cached)
 
 	_, err = store.Get(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta)
 	require.Error(t, err, "nothing should have been written")
+}
+
+// metaWriteFailingStore serves reads from a real in-memory blob store but refuses
+// to write a .subtreeMeta. That is the shape ChiR1 is about: the rebuild itself
+// works, the cache write does not, and whatever was already on disk under that
+// key survives untouched.
+type metaWriteFailingStore struct {
+	*memory.Memory
+	setErr error
+}
+
+func (s *metaWriteFailingStore) Set(ctx context.Context, key []byte, fileType fileformat.FileType, value []byte, opts ...options.FileOption) error {
+	if fileType == fileformat.FileTypeSubtreeMeta {
+		return s.setErr
+	}
+
+	return s.Memory.Set(ctx, key, fileType, value, opts...)
+}
+
+// capturingLogger records the Warnf and Errorf lines so a test can assert on what
+// an operator would actually grep for. New and Duplicate return the same logger:
+// NewSubtreeMetaRegenerator calls New, and ulogger.TestLogger's New hands back a
+// fresh no-op logger that would capture nothing.
+type capturingLogger struct {
+	ulogger.TestLogger
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *capturingLogger) New(_ string, _ ...ulogger.Option) ulogger.Logger { return l }
+
+func (l *capturingLogger) Duplicate(_ ...ulogger.Option) ulogger.Logger { return l }
+
+func (l *capturingLogger) WithTraceContext(_ context.Context) ulogger.Logger { return l }
+
+func (l *capturingLogger) Warnf(format string, args ...interface{}) { l.record(format, args...) }
+
+func (l *capturingLogger) Errorf(format string, args ...interface{}) { l.record(format, args...) }
+
+func (l *capturingLogger) record(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *capturingLogger) contains(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for _, line := range l.lines {
+		if strings.Contains(line, substr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestSubtreeMetaRegenerator_FailedCacheWriteIsNotARepair pins the end state when
+// the rebuild succeeds and the cache write does not.
+//
+// storeRegeneratedMeta used to log a Warnf and return nil there, so
+// buildAndStoreMeta went on to log "successfully regenerated meta" for a subtree
+// whose rejected file was still on disk. With regeneration now running for a
+// present-but-rejected file as well as a missing one, that line told an operator a
+// rebuild loop had been broken when nothing had changed: the next read fails the
+// same header check, re-enters RegenerateMeta and pays the .subtreeData read and,
+// on a local miss, the peer fetch again.
+//
+// The write failure stays non-fatal on purpose. Returning it would send
+// RegenerateMeta on to the peers, and no peer can fix a local write.
+func TestSubtreeMetaRegenerator_FailedCacheWriteIsNotARepair(t *testing.T) {
+	ctx := context.Background()
+
+	tx0 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000002", 0)
+
+	subtree := &subtreepkg.Subtree{Nodes: []subtreepkg.Node{
+		{Hash: *tx0.TxIDChainHash()},
+		{Hash: *tx1.TxIDChainHash()},
+	}}
+	subtreeHash := subtree.RootHash()
+
+	data := subtreepkg.NewSubtreeData(subtree)
+	data.Txs[0] = tx0
+	data.Txs[1] = tx1
+
+	serialized, err := data.Serialize()
+	require.NoError(t, err)
+
+	inner := memory.New()
+	require.NoError(t, inner.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData, serialized))
+
+	// The rejected file this regeneration is supposed to replace, already on disk.
+	poisoned := []byte("rejected meta file")
+	require.NoError(t, inner.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta, poisoned))
+
+	store := &metaWriteFailingStore{Memory: inner, setErr: errors.NewStorageError("disk full")}
+	logger := &capturingLogger{}
+
+	regenerator := NewSubtreeMetaRegenerator(logger, store, nil, func() uint32 { return 100 }, 288, 0)
+
+	meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree, false)
+
+	// The meta is still handed back and still usable for this validation.
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+
+	parents, err := meta.GetParentTxHashes(1)
+	require.NoError(t, err)
+	require.NotEmpty(t, parents, "the regenerated meta must be usable even though it was not cached")
+
+	// End state on disk: the rejected file is exactly where it was, so the next
+	// read rebuilds again.
+	onDisk, err := inner.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
+	require.NoError(t, err)
+	require.Equal(t, poisoned, onDisk, "a failed write must leave the rejected file untouched")
+
+	// End state in the return: storeRegeneratedMeta reports not-cached, with no error.
+	cached, err := regenerator.storeRegeneratedMeta(ctx, subtreeHash, meta)
+	require.NoError(t, err, "a failed cache write must not be returned as an error")
+	require.False(t, cached, "a failed cache write must not be reported as cached")
+
+	// End state in the logs: the success line an operator greps for is absent, and
+	// the line that is there names the consequence.
+	require.False(t, logger.contains("successfully regenerated meta"),
+		"a rebuild that never reached the store must not be logged as a successful regeneration")
+	require.True(t, logger.contains("did not cache it"),
+		"the not-cached outcome needs its own line")
+	require.True(t, logger.contains("rebuilt on every read"),
+		"the write failure must name what it costs")
 }

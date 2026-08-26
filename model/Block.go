@@ -1457,7 +1457,12 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 
 		subtreeMetaSlice, err = deps.metaRegenerator.RegenerateMeta(ctx, subtreeHash, subtree, sIdx == 0)
 		if err == nil {
-			logger.Warnf("[validateSubtree][%s][%s:%d] successfully regenerated subtree meta", b.String(), subtreeHash.String(), sIdx)
+			// Scoped to this validation on purpose. RegenerateMeta returns only the
+			// meta, so this level cannot tell whether the rebuild also replaced the
+			// file on disk; the regenerator emits that verdict itself on the line
+			// immediately before this one. Claiming a repair here would be the same
+			// overstatement storeRegeneratedMeta used to make.
+			logger.Warnf("[validateSubtree][%s][%s:%d] regenerated subtree meta for this validation", b.String(), subtreeHash.String(), sIdx)
 		}
 	}
 
