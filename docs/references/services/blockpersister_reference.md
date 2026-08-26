@@ -424,7 +424,6 @@ All settings use the `BlockPersister` section (setting keys prefixed with `block
 
 - **`BlockPersister.PersistSleep`**: Sleep duration between processing attempts when no blocks are available (default: `10s`).
 - **`BlockPersister.Concurrency`**: Number of parallel persistence workers (default: `8`).
-- **`BlockPersister.BatchMissingTransactions`**: When true, enables batched retrieval of transaction metadata for better performance (default: `true`).
 - **`BlockPersister.ProcessUTXOFiles`**: When true, processes UTXO files during block persistence (default: `true`).
 - **`BlockPersister.SkipUTXODelete`**: Debug setting to skip UTXO deletion during persistence (default: `false`).
 

@@ -263,7 +263,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			Store:                    getURL("blockpersister_store", "file://./data/blockstore", alternativeContext...),
 			HTTPListenAddress:        getString("blockpersister_httpListenAddress", ":8083", alternativeContext...),
 			Concurrency:              getInt("blockpersister_concurrency", 8, alternativeContext...),
-			BatchMissingTransactions: getBool("blockpersister_batchMissingTransactions", true, alternativeContext...),
 			SkipUTXODelete:           getBool("blockpersister_skipUTXODelete", false, alternativeContext...),
 			PersistSleep:             getDuration("blockpersister_persistSleep", 10*time.Second, alternativeContext...),
 			ProcessUTXOFiles:         getBool("blockpersister_processUTXOFiles", true, alternativeContext...),
