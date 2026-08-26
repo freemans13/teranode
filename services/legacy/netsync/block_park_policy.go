@@ -208,6 +208,19 @@ func parkReadFailure(err error) parkDisposition {
 // HandleBlockDirect as a judgement on the block and rejects it to the peer, so a
 // block committed from disk is judged exactly as a block off the wire is. Two
 // different answers to the same error would be its own bug.
+//
+// What that default costs is worth stating, because it is more than the wasted
+// re-download the read path costs. parkDispositionBlockRejected sets markFailed,
+// which writes recentlyFailedBlocks, and handleBlockMsg keys its descendant
+// suppression on the PARENT hash: a block wrongly judged here takes every child
+// with it for recentlyFailedBlocksTTL. handleBlockMsg also reads that map as
+// judgedBefore, so the next live delivery of the block spares the delivering peer
+// its association eviction. Both follow from IsTransientLocalError matching only
+// teranode's own error codes, so a store that hands back a raw driver error
+// instead of a StorageError lands here rather than on retryLater
+// (stores/utxo/sql/sql.go returns the bare error from db.Begin and txn.Commit).
+// That gap is the live path's too, so closing it belongs one layer down in the
+// store, not in a guess made here that would break the symmetry above.
 func parkCommitFailure(err error) parkDisposition {
 	switch {
 	case errors.Is(err, errors.ErrBlockNotFound):
