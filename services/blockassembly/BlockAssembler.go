@@ -368,6 +368,28 @@ func (b *BlockAssembler) GetChainedSubtreesTotalSize() uint64 {
 // intervals costs milliseconds rather than tens of seconds.
 const defaultHeartbeatInterval = 5 * time.Second
 
+// effectiveHeartbeatInterval is the idle tick the listener goroutine will
+// actually use. NewBlockAssembler always sets a positive interval, but the
+// package builds &BlockAssembler{} literals in a lot of tests, and
+// time.NewTicker panics on a non-positive interval from inside a goroutine,
+// which takes the process down rather than failing a test.
+func effectiveHeartbeatInterval(configured time.Duration) time.Duration {
+	if configured <= 0 {
+		return defaultHeartbeatInterval
+	}
+
+	return configured
+}
+
+// livenessTimeoutTooTight reports whether a configured liveness stall timeout
+// sits close enough to the idle tick that it cannot tell an idle loop from a
+// wedged one. Split out from the warning it drives so the rule can be tested
+// without capturing log output. Zero or less means the check is disabled, which
+// is never too tight.
+func livenessTimeoutTooTight(stallTimeout, heartbeatInterval time.Duration) bool {
+	return stallTimeout > 0 && stallTimeout <= 2*heartbeatInterval
+}
+
 // startChannelListeners initializes and starts all channel listeners for block assembly operations.
 // It handles blockchain notifications, mining candidate requests, and reset operations.
 // The listener goroutine also owns the liveness heartbeat, beating on every pass
@@ -393,20 +415,13 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 	// node it returns early when hashes match.
 	b.triggerReconcile()
 
-	// NewBlockAssembler always sets this, but the package builds &BlockAssembler{}
-	// literals in a lot of tests, and time.NewTicker panics on a non-positive
-	// interval from inside the goroutine below, which takes the process down
-	// rather than failing a test.
-	heartbeatInterval := b.heartbeatInterval
-	if heartbeatInterval <= 0 {
-		heartbeatInterval = defaultHeartbeatInterval
-	}
+	heartbeatInterval := effectiveHeartbeatInterval(b.heartbeatInterval)
 
 	// A liveness timeout at or below the idle tick cannot tell an idle loop from
 	// a wedged one, so it would restart a healthy node. Warn rather than clamp:
 	// the operator chose the value and silently overriding it would hide the
 	// mistake (issue 1447).
-	if stallTimeout := b.settings.BlockAssembly.LivenessStallTimeout; stallTimeout > 0 && stallTimeout <= 2*heartbeatInterval {
+	if stallTimeout := b.settings.BlockAssembly.LivenessStallTimeout; livenessTimeoutTooTight(stallTimeout, heartbeatInterval) {
 		b.logger.Warnf("[BlockAssembler] blockassembly_livenessStallTimeout %s is not comfortably longer than the %s heartbeat interval: a healthy idle node may be reported as wedged and restarted", stallTimeout, heartbeatInterval)
 	}
 
@@ -2249,11 +2264,12 @@ func (b *BlockAssembler) validateParentChain(
 
 	// Process transactions in batches for performance
 	for i := 0; i < len(unminedTxs); i += batchSize {
-		// Beat on completed batches: when this runs from the reset path it is
-		// inside a select case, so without it a large-but-progressing validation
-		// looks identical to a wedge. Beating on FORWARD PROGRESS (a finished
-		// batch) rather than on entry keeps the distinction — a run that stops
-		// progressing still goes stale (issue 1447).
+		// Beat once per batch: when this runs from the reset path it is inside a
+		// select case, so without it a large-but-progressing validation looks
+		// identical to a wedge. The beat sits at the top of the batch, which for
+		// every batch after the first is proof the previous one finished, so it
+		// tracks FORWARD PROGRESS: a run that stops progressing gets no further
+		// beats and still goes stale (issue 1447).
 		//
 		// BeatIfStarted, not Beat: this same code also runs from Start, before
 		// the main loop owns the heartbeat, and the rest of that startup path
