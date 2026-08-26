@@ -639,13 +639,46 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 }
 
 // recordCatchupPeerFailure attributes a data-serving failure to the peer that caused
-// it, for the current catchup cycle. Best-effort: with no active catchup context
-// (e.g. a direct block fetch outside catchup) the call is a no-op.
+// it, charging it against whichever catchup cycle is active when the call is made.
+// Best-effort: with no cycle active the call is a no-op.
 //
 // errors.IsLocalError is checked here — not at each call site — so every caller
 // gets the guard for free: a context cancellation (catchup abort / peer switch /
 // shutdown landing mid-retry) or a local storage failure (subtreeStore.Set) is ours,
 // not the peer's, and must never land an innocent peer in failedPeers.
+//
+// Attribution reads the server-wide u.activeCatchupCtx rather than taking a cycle
+// from the caller. Two properties define the limits of that read, and both are worth
+// re-checking before changing anything on this path.
+//
+// A catchup cycle outlives every fetch it starts. fetchAndStoreSubtreeData detaches
+// its context (context.WithoutCancel) so an aborted fetch still finishes writing,
+// but the goroutine stays inside the errgroup fetchSubtreeDataForBlock waits on,
+// which blockWorker waits on, which catchup waits on before releaseCatchupLock
+// clears the context. A slow peer can therefore delay the end of its cycle but can
+// never outlive it. That delay is not a single subtree_data fetch timeout: the
+// deadline is installed per call with no shared budget, and one subtree makes up to
+// two calls per peer (a cache-bypass retry) across each alternative peer, so the
+// drain ceiling is a multiple of that timeout — see fetchAndStoreSubtreeAndSubtreeData.
+// The bound is larger in magnitude but still finite, so a failure raised by a
+// catchup's own fetch is never charged to a later cycle nor dropped into a cleared
+// context. Making any fetch on that path fire-and-forget breaks this and requires the
+// cycle to be threaded from the caller instead — as would an injected
+// fetchSubtreeDataForBlockFn that does not preserve that join.
+// In adaptive-fetch optimistic mode the per-subtree fetch is skipped entirely, so on
+// that branch there is nothing to join and the guarantee holds vacuously rather than
+// by the join above.
+//
+// Not every caller is a catchup. RevalidateBlock reaches this path through
+// fetchSubtreeDataForBlock on its own gRPC goroutine with no interlock against a
+// running catchup, so its per-subtree failures land in whatever catchup cycle is
+// active. releaseCatchupLock drains failedPeers only inside its *err != nil branch,
+// so those failures are charged only if that concurrent cycle itself ends in error;
+// a cycle that succeeds discards the map untouched and the RevalidateBlock failure is
+// then charged to no one. When a failure is charged, it lands on the peer that
+// returned it for that fetch, not on some other peer; that does not prove the peer
+// deserves a reputational charge, because a peer that 404s subtree data the pruner
+// removed did nothing wrong.
 func (u *Server) recordCatchupPeerFailure(peerID string, err error) {
 	if peerID == "" || err == nil || errors.IsLocalError(err) {
 		return
