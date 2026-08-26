@@ -312,7 +312,14 @@ func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtr
 }
 
 // SubtreeStoreAdapter adapts a SubtreeStore (read-only) to SubtreeStoreWriter
-// Use this when you don't need to store regenerated meta
+// Use this when you don't need to store regenerated meta.
+//
+// Note the interaction with storeRegeneratedMeta's cached return: Set here
+// discards the write and reports success, so a regenerator wired to this adapter
+// logs "successfully regenerated meta" for a meta that was never written.
+// Nothing in production uses it (blockvalidation passes a real writer), and the
+// deliberate case for it is a caller that has no meta file to poison. Anyone
+// wiring it to a store that does hold meta files wants a real writer instead.
 type SubtreeStoreAdapter struct {
 	SubtreeStore
 }
