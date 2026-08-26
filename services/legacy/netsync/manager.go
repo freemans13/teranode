@@ -3768,6 +3768,19 @@ func (sm *SyncManager) commitHeaderCandidates(assigner *downloadAssigner, anchor
 			// second copy arrive after the first discharged its obligation, and
 			// loses its whole association for answering us.
 			if sm.blockDownloads.ReassertOwner(target.peer, hashes[i]) {
+				// Charge it like a request, because that is what it is to the
+				// two caps. ReassertOwner clears the forgiven flag, so the block
+				// is back in CountForPeer and back in Len from here on, and both
+				// budgets were computed before this pass ran with the forgiven
+				// records excluded. Skipping the two decrements let every
+				// reassert add one to the peer's live in-flight count without
+				// taking one out of the pass: a demoted peer with a full
+				// reopened slice could finish a pass owing its whole reopened
+				// slice plus another perPeer on top. Only the getdata is
+				// skipped; that peer already has the request.
+				target.budget--
+				assigner.remaining--
+
 				e = e.Next()
 				sm.startHeader = e
 

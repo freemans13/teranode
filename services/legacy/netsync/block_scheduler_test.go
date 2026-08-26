@@ -857,3 +857,55 @@ func TestScheduler_DoesNotReadFurtherAheadThanTheLookaheadLimit(t *testing.T) {
 	require.Equal(t, hashes[0:5], syncRec.all(),
 		"exactly one more block comes into range for one block committed")
 }
+
+// TestScheduler_AReassertedAssignmentSpendsBudgetLikeARequest pins the half of
+// the pass's arithmetic that used to exempt itself.
+//
+// When the assigner hands back the peer that already owns the hash, the walk
+// re-arms the record it holds instead of asking twice, which is right. What it
+// did not do was charge for it. ReassertOwner clears the forgiven flag, so the
+// block is back in CountForPeer from that moment, while both budgets were
+// computed before the pass ran with the forgiven records excluded. Every
+// reassert therefore added one to the peer's live in-flight count and took
+// nothing out of the pass, so a demoted peer whose slice had just been reopened
+// could finish one pass owing its whole reopened slice plus another
+// legacy_maxBlocksInTransitPerPeer on top.
+//
+// The peer here is at exactly that starting point: four blocks owed, all of them
+// reopened. One pass may leave it owing four, never eight.
+func TestScheduler_AReassertedAssignmentSpendsBudgetLikeARequest(t *testing.T) {
+	var nonce uint32
+
+	anchor := chainhash.Hash{0xd8}
+	msg, hashes := linkedHeaders(anchor, 8, &nonce)
+
+	sm := newFetchLockManager(t, nil, nil, nil)
+	sm.settings.Legacy.MaxBlocksInTransitPerPeer = 4
+
+	perPeer := schedulerPeerBudget(sm)
+	require.Equal(t, 4, perPeer, "sanity: the ladder must not be what caps this pass")
+
+	peer, rec := schedulerPeer(t, sm, 92, 1000)
+	sm.storeSyncPeer(peer, &syncPeerState{})
+
+	for i := 0; i < perPeer; i++ {
+		require.True(t, sm.blockDownloads.Add(peer, hashes[i]))
+	}
+
+	// Demotion reopens the peer's own slice: the records are kept, so the peer
+	// may still deliver, but they are forgiven, so they spend no budget and the
+	// walk is free to place the same hashes again.
+	require.Len(t, sm.blockDownloads.ForgetForRetryPeer(peer, blockRequestRetryInterval), perPeer)
+	require.Zero(t, sm.blockDownloads.CountForPeer(peer), "sanity: a reopened slice spends no budget")
+
+	seedFetchHeaders(t, sm, peer, anchor, msg)
+
+	sm.fetchHeaderBlocks()
+
+	require.LessOrEqual(t, sm.blockDownloads.CountForPeer(peer), perPeer,
+		"one pass must not leave a peer owing more than its in-flight cap")
+	require.Equal(t, perPeer, sm.blockDownloads.CountForPeer(peer),
+		"the four reasserts are the whole of this pass's budget")
+	require.False(t, WaitUntil(func() bool { return rec.count() > 0 }, time.Second),
+		"the peer already holds all four requests, so nothing new may go out on the wire")
+}
