@@ -28,6 +28,10 @@ type refusedBlock struct {
 	hash  chainhash.Hash
 	block *wire.MsgBlock
 	peer  *peerpkg.Peer
+	// deliverErr is what handleBlockMsg handed back for that first delivery.
+	// It is the value the read loop classifies with shouldDisconnectOnBlockErr,
+	// so it is what decides whether the delivering peer keeps its association.
+	deliverErr error
 }
 
 // newRefusedBlock builds that state with a transient store fault, the failure
@@ -131,7 +135,7 @@ func newDroppedBlock(t *testing.T, peerIdx uint8, backoffBase time.Duration, fai
 	require.False(t, sm.blockDownloads.RequestedWithin(failing, time.Minute),
 		"delivering the block released the peer's obligation, so nothing is outstanding for it any more")
 
-	return &refusedBlock{sm: sm, hash: failing, block: block, peer: syncPeer}
+	return &refusedBlock{sm: sm, hash: failing, block: block, peer: syncPeer, deliverErr: deliverErr}
 }
 
 // TestSyncManager_ABlockTheStoreRefusesIsAskedForAgain is the case the rewind
@@ -254,13 +258,21 @@ func TestSyncManager_AJudgedBlockIsAskedForAgain(t *testing.T) {
 // that makes the rewind above shippable.
 //
 // The reason a judged block was left out of the rewind is a real one: asking for
-// a block we have just rejected downloads it and rejects it again, and every
-// delivery refreshes the delivering sync peer's stall timer (HandleBlockDirect
-// does it at receipt), so nothing rotates the peer out of the loop either. The
-// answer is not to leave the walk wedged, it is to throttle the retry with the
-// same per-block backoff the transient path uses. That backoff holds the WALK
-// and not just the decorate, so the round stops on the block rather than running
-// on into descendants that can never commit.
+// a block we have just rejected downloads it and rejects it again, and each
+// re-delivery costs the delivering peer its whole association. The read loop
+// turns any non-transient block error into disconnectMisbehaving, which resolves
+// to the association primary (peer_server.go:1197, :1486, :1389), so the peer is
+// removed from the node outright. The stall timer never gets a say: it is
+// refreshed at receipt by HandleBlockDirect, but the eviction happens on the same
+// delivery, long before any stall window could be consulted. So an unthrottled
+// rewind would burn one peer per retry.
+//
+// The answer is not to leave the walk wedged. It is to throttle the retry with
+// the same per-block backoff the transient path uses, and to stop blaming peers
+// for a block we have already judged (ChiR7, the judgedBefore arm in
+// handleBlockMsg). The backoff holds the WALK and not just the decorate, so the
+// round stops on the block rather than running on into descendants that can
+// never commit.
 func TestSyncManager_AJudgedBlockIsThrottledBeforeItIsAskedForAgain(t *testing.T) {
 	r := newDroppedBlock(t, 67, time.Hour, errors.NewProcessingError("this block is not acceptable"))
 
@@ -294,4 +306,93 @@ func TestSyncManager_ABlockDroppedOnAContextErrorIsAskedForAgain(t *testing.T) {
 
 		return r.sm.blockDownloads.RequestedWithin(r.hash, time.Minute)
 	}, 5*time.Second), "a block dropped on a context error must be asked for again")
+}
+
+// deliverJudgedBlockAgain replays the retry the ChiR1 rewind enables: the walk
+// has put the judged block back, its backoff has expired, and some peer answers
+// the fresh getdata with the same block. It returns what handleBlockMsg handed
+// back for that second delivery.
+//
+// The waits are on the backoff, not on a sleep: a block still inside its window
+// is skipped by the earlier arm of handleBlockMsg, which spares the peer for a
+// different reason entirely and would make the assertion below meaningless.
+func deliverJudgedBlockAgain(t *testing.T, r *refusedBlock, deliverer *peerpkg.Peer) error {
+	t.Helper()
+
+	require.True(t, WaitUntil(func() bool {
+		fs, ok := r.sm.blockFailureBackoff.Get(r.hash)
+		return ok && time.Now().After(fs.nextRetry)
+	}, 5*time.Second), "the millisecond backoff must expire, or the delivery hits the backoff skip instead")
+
+	_, judged := r.sm.recentlyFailedBlocks.Get(r.hash)
+	require.True(t, judged, "the first delivery must have marked the block, or there is no second-delivery case to test")
+
+	// The walk asked this peer for the block, so it owes us a copy.
+	r.sm.blockDownloads.Add(deliverer, r.hash)
+
+	return r.sm.handleBlockMsg(&blockQueueMsg{
+		block:     r.block,
+		blockHash: r.hash,
+		peer:      deliverer,
+	})
+}
+
+// TestSyncManager_TheFirstDelivererOfAJudgedBlockIsBlamed pins the half of ChiR7
+// that must NOT change: a peer that hands us a block we then judge is still
+// disconnected for it.
+//
+// The end state is the classification, because that is the whole of the
+// decision: the read loop calls shouldDisconnectOnBlockErr, which is exactly
+// !errors.IsTransientLocalError (peer_server.go:1334-1340), and a false answer
+// runs disconnectMisbehaving, evicting the peer's whole association resolved to
+// the association primary (peer_server.go:1197, :1486, :1389).
+func TestSyncManager_TheFirstDelivererOfAJudgedBlockIsBlamed(t *testing.T) {
+	r := newDroppedBlock(t, 69, time.Millisecond, errors.NewProcessingError("this block is not acceptable"))
+
+	require.Error(t, r.deliverErr)
+	require.False(t, errors.IsTransientLocalError(r.deliverErr),
+		"the first deliverer of a judged block must still lose its association")
+}
+
+// TestSyncManager_ASecondDelivererOfAJudgedBlockIsNotBlamed is ChiR7.
+//
+// The ChiR1 rewind put the walk back on a judged block, so once its backoff
+// expires the assigner hands that hash to whichever peer has budget. Nothing
+// else in that arm changed: it returned the judged error, the read loop read it
+// as the peer's fault, and disconnectMisbehaving evicted that peer's whole
+// association. Before the rewind exactly one peer paid for an unvalidatable
+// block, because it was never asked for again. After it, every retry cost
+// another peer, which is peer churn spent on the suppliers this sync depends on.
+//
+// Below a checkpoint the peer cannot be at fault: the header is
+// checkpoint-verified and the block hashes to it, so a peer answering our
+// getdata answered correctly and the rejection is ours. The reject message still
+// goes out, so the peer is told the block is bad. Only the eviction is spared.
+func TestSyncManager_ASecondDelivererOfAJudgedBlockIsNotBlamed(t *testing.T) {
+	r := newDroppedBlock(t, 70, time.Millisecond, errors.NewProcessingError("this block is not acceptable"))
+
+	// A different peer answers the retry, which is the case that matters: the
+	// first deliverer has already paid, and this one is about to pay for it.
+	second, _, _ := connectRacePeer(t, 71, 1000)
+	registerRacePeer(r.sm, second)
+
+	err := deliverJudgedBlockAgain(t, r, second)
+
+	require.Error(t, err, "the block still fails, so the caller still hears about it")
+	require.True(t, errors.IsTransientLocalError(err),
+		"a peer answering our own retry of an already-judged block must keep its association")
+}
+
+// TestSyncManager_ASecondDelivererIsStillBlamedForALocalFault guards the sparing
+// from swallowing the case it is not for.
+//
+// judgedBefore only spares a peer when the failure was a judgement on the block.
+// A transient local fault takes the earlier arm — no reject, its own
+// classification — and that arm already keeps the peer, so nothing here should
+// depend on the ChiR7 branch to do it.
+func TestSyncManager_ASecondDelivererIsStillBlamedForALocalFault(t *testing.T) {
+	r := newRefusedBlock(t, 72, time.Millisecond)
+
+	require.True(t, errors.IsTransientLocalError(r.deliverErr),
+		"a store fault is not the peer's fault on the first delivery either")
 }

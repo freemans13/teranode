@@ -2702,7 +2702,17 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// ERROR (#1333). Covers both transient and permanent failures — from a
 			// descendant's view the parent is missing either way; the TTL and the
 			// delete-on-success below heal the transient case.
+			//
+			// Read before the write: judgedBefore says we had already given this
+			// hash up once before this delivery, which is what decides below
+			// whether the delivering peer is blamed for it. Nil-guarded because
+			// ExpiringMap.Get takes m.mu.RLock() on the receiver and panics on a
+			// nil map, and tests build SyncManager as a struct literal that
+			// bypasses New() (newRaceManager in frontier_race_test.go).
+			var judgedBefore bool
+
 			if sm.recentlyFailedBlocks != nil {
+				_, judgedBefore = sm.recentlyFailedBlocks.Get(bmsg.blockHash)
 				sm.recentlyFailedBlocks.Set(bmsg.blockHash, struct{}{})
 			}
 
@@ -2734,6 +2744,30 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			sm.dropBlockFromWalk(bmsg.blockHash, removedFront)
 
 			sm.logger.Errorf("Failed to process new block in service blockQueueMsg %v: %v", bmsg.blockHash, err)
+
+			// Blame the first deliverer only. The rewind above means the walk
+			// hands this hash out again once its backoff expires, and the caller
+			// turns a non-transient error into disconnectMisbehaving, which
+			// evicts the delivering peer's whole ASSOCIATION resolved to the
+			// association primary (peer_server.go:1197, :1486, :1389). Without
+			// this, every retry of a block we cannot validate costs another peer
+			// its association, so the rewind that recovers the block spends the
+			// suppliers this sync depends on.
+			//
+			// A peer that answers a request we made after judging the block once
+			// already has answered our own question, and below a checkpoint it
+			// cannot have fabricated the answer: the header is checkpoint-verified
+			// and the block hashes to it. The reject still goes out above, so the
+			// peer is told the block is bad; only the eviction is spared.
+			//
+			// Limit worth naming: recentlyFailedBlocks is also written by the
+			// #1333 cascade suppression, so a descendant marked while its ancestor
+			// was failing reads as judgedBefore on the first delivery that reaches
+			// this arm after the ancestor clears. That costs one unblamed peer for
+			// that block, and only inside the 10-minute TTL.
+			if judgedBefore && !serviceError {
+				return errors.NewServiceUnavailableError("[handleBlockMsg][%s] block already judged, not blaming %s", bmsg.blockHash, peer, err)
+			}
 
 			// Never panic in sync processing goroutines; bubble error to caller.
 			return err
