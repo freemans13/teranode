@@ -34,9 +34,14 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // to put it back. The outer SELECT still returns satoshis and script, so the spend
 // remains its own decorate fetch.
 //
-// Predicates are identical to spendSQL and must stay that way: the full 32-byte txid
-// recheck (the ukey is a non-unique 96-bit prefix and can only locate, never authorise),
-// the frozen and conflicting flag masks, and the maturity test.
+// This is now the ONLY spend statement. There was a journal-free twin of it, used below
+// the checkpoint, whose predicates had to be kept identical by hand; it is deleted rather
+// than flagged off, because two copies of a consensus predicate is a defect waiting for
+// one of them to be edited. The predicates that authorise the delete are the full 32-byte
+// txid recheck (the ukey is a non-unique 96-bit prefix and can only locate, never
+// authorise), the frozen and conflicting flag masks, and the maturity test. classifySQL
+// deliberately omits the last three, so an excluded row surfaces as frozen or immature
+// rather than as spent.
 const spendJournalSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[])

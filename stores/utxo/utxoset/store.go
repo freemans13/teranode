@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/jackc/pgx/v5"
@@ -37,17 +36,6 @@ type Store struct {
 
 	blockHeight     atomic.Uint32
 	medianBlockTime atomic.Uint32
-
-	// journal controls whether a spend captures its undo payload.
-	//
-	// It defaults to TRUE and must be turned off deliberately. Without a journal a
-	// spend is irreversible: nothing can restore the coin on a reorg, and
-	// ProcessConflicting cannot unspend. The only condition under which that is safe
-	// is applying blocks below the hardcoded checkpoint, where a reorg is impossible
-	// by rule and there is no mempool to produce conflicts -- which is exactly what
-	// SetSyncMode asserts. Defaulting to off would make an irreversible store the
-	// accident rather than the choice.
-	journal atomic.Bool
 
 	// journalLeaf is the spend-journal leaf the last spend landed in, so the catalog is only
 	// touched when it changes.
@@ -87,8 +75,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
 		journalRetention: DefaultSpendJournalRetentionBlocks}
-	s.journal.Store(true)
-
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)
@@ -104,29 +90,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 // outpoint set, so a spend needs nothing but the outpoint to be authorised.
 func (s *Store) SupportsOutpointOnlySpend() bool { return true }
 
-// SetBlockHeight records the chain height and, with it, decides whether spends are
-// currently reversible.
+// SetBlockHeight records the chain height.
 //
-// This is the only production driver of sync mode, and driving it from the height rather
-// than from a setting is deliberate. The journal exists so a reorg can restore a
-// destroyed coin. Below the hardcoded checkpoint a reorg is impossible by rule, so the
-// journal is a heap insert plus an index insert per input, every spend, for nothing:
-// exactly the per-spend write amplification that below-checkpoint mode exists to remove.
-// Above the checkpoint it is load-bearing and must be back on.
-//
-// Tying both edges to the height means neither an operator nor a restart can leave the
-// store in the wrong state, and the node re-arms itself the moment it crosses over. The
-// boundary comes from model.BelowCheckpoint, which documents itself as the single
-// definition and warns against re-deriving the comparison.
-//
-// The factory calls this once per block from a single-threaded notification goroutine
-// (stores/utxo/factory/utxo.go), so it is outside any transaction and cannot contend.
+// It deliberately does NOT decide whether spends are reversible. An earlier version of
+// this drove sync mode from model.BelowCheckpoint here, switching the journal off for
+// the whole initial sync on the reasoning that a reorg is impossible below the
+// checkpoint. That reasoning is sound and still irrelevant, because the journal's
+// second job outweighs its first: see the spend_journal comment in schema.go for why it
+// has no off-switch.
 func (s *Store) SetBlockHeight(height uint32) error {
 	s.blockHeight.Store(height)
-
-	if s.settings != nil {
-		s.SetSyncMode(model.BelowCheckpoint(s.settings.ChainCfgParams.Checkpoints, height))
-	}
 
 	return nil
 }
@@ -139,14 +112,6 @@ func (s *Store) SetMedianBlockTime(t uint32) error {
 }
 
 func (s *Store) GetMedianBlockTime() uint32 { return s.medianBlockTime.Load() }
-
-// SetSyncMode disables the spend journal for below-checkpoint block application, where a
-// reorg is impossible by rule and there is no mempool. It must be turned back on before
-// the node crosses the checkpoint or starts accepting unmined transactions.
-func (s *Store) SetSyncMode(on bool) { s.journal.Store(!on) }
-
-// JournalEnabled reports whether spends are currently reversible.
-func (s *Store) JournalEnabled() bool { return s.journal.Load() }
 
 func (s *Store) PoolMaxConns() int { return int(s.pool.Config().MaxConns) }
 
@@ -165,11 +130,10 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 
 // errM1 marks a method that is deliberately out of M1 scope.
 //
-// M1 is the UTXO table alone, in sync mode below the hardcoded checkpoint. The undo
-// journal and the tx_meta window arrive in M3, and everything that depends on them
-// fails loudly here rather than silently returning a wrong answer — a store that
-// quietly answers "not found" for a question it cannot answer is how consensus bugs
-// start.
+// M1 is the UTXO table, the spend journal and the block ledger. What is missing is the
+// transaction window: tx_bounded and tx_mined. Everything that depends on those fails
+// loudly here rather than silently returning a wrong answer — a store that quietly
+// answers "not found" for a question it cannot answer is how consensus bugs start.
 func errM1(method string) error {
-	return errors.NewProcessingError("[utxoset] %s is not implemented in M1 (UTXO-table-only, sync mode); it depends on the spend journal or tx_meta window landing in M3", method)
+	return errors.NewProcessingError("[utxoset] %s is not implemented yet; it depends on the tx_bounded and tx_mined tables", method)
 }

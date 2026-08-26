@@ -40,9 +40,13 @@
 //     and the ratio INVERTS at high UTXO counts, because delete-on-spend does not avoid
 //     the index write, it defers it to vacuum. Quote no ratio here until one is measured.
 //
-// M1 scope: the UTXO table and the block/chunk ledger only. Sync mode — below the
-// hardcoded checkpoint, where a reorg is impossible by rule, so no spend journal and no
-// tx_meta window are needed. Those arrive in M3.
+// M1 scope: the UTXO table, the spend journal and the block/chunk ledger. The tx_meta
+// window arrives in M3.
+//
+// The journal is ALWAYS ON, and that is the one decision here worth stating twice. It
+// reads as reorg insurance, which would make it dead weight below the hardcoded
+// checkpoint where a reorg is impossible by rule. It is also the prune engine, and in
+// that role it is load-bearing from genesis. See the spend_journal DDL comment below.
 package utxoset
 
 import (
@@ -103,9 +107,8 @@ const (
 	FlagCoinbase    int16 = 1 << 3
 )
 
-// schemaSQL is the M1 schema: the UTXO table plus the ledger that makes block application
-// idempotent. Deliberately excludes the spend journal and tx_meta — below the checkpoint a
-// reorg is impossible by rule, so neither is reachable.
+// schemaSQL is the M1 schema: the UTXO table, the spend journal, and the ledger that makes
+// block application idempotent. tx_meta is not here yet.
 const schemaSQL = `
 -- ---------------------------------------------------------------------------
 -- THE UTXO TABLE. One row per spendable output. Inserted once, deleted once.
@@ -158,6 +161,23 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- definition, which is why partition-drop works here and did not for the rejected
 -- epoch-slab design (there, garbage clustered by SPEND time, which is decorrelated
 -- from creation).
+--
+-- IT HAS NO OFF-SWITCH, and the reason is not the one above.
+--
+-- As reorg insurance alone it would be pure overhead below the hardcoded checkpoint,
+-- where a reorg is impossible by rule -- and it was switched off there, for exactly
+-- that reason. But the journal is also the PRUNE ENGINE. A spend deletes one coin row
+-- and signals nothing, so "that transaction's last output has now gone" is a fact about
+-- absence that is recorded nowhere else. The journal records it for free: every spend
+-- writes a row, rows are grouped by height, and a retiring partition therefore IS the
+-- list of transactions to re-examine. Nothing else in the store can produce that list
+-- without a counter on every spend or a scan that races.
+--
+-- With it off, nothing can be reclaimed for the entire initial sync. Mainnet's highest
+-- checkpoint is 945,000, about 6.88 billion transactions are mined below it, and the
+-- unreclaimable residue would be 165 to 444 GB on an 875 GB disk. Measured cost of
+-- leaving it on: 354.8 bytes of WAL and 12.9 microseconds per spend, about 6% of the
+-- per-block budget in the worst band. Not close.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS spend_journal (
     spent_height    INTEGER  NOT NULL,

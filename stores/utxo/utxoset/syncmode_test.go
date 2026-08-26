@@ -3,38 +3,49 @@ package utxoset
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/stretchr/testify/require"
 )
 
-// TestSyncModeFollowsTheCheckpoint wires up the one thing that makes M1 worth having.
+// TestJournalRunsBelowTheCheckpoint is the regression guard for a decision that was made
+// twice, the wrong way round the first time.
 //
-// SetSyncMode existed with no production caller at all, so the spend journal ran for the
-// entire initial sync. That is a heap insert plus an index insert per input, on top of
-// the delete, for every spend from genesis to the tip: precisely the per-spend write
-// amplification the below-checkpoint mode exists to remove.
+// SetBlockHeight used to drive sync mode off model.BelowCheckpoint and switch the journal
+// off for the entire initial sync. The reasoning was correct as far as it went: below the
+// hardcoded checkpoint a reorg is impossible by rule, so the undo payload can never be
+// replayed, and writing it is a heap insert plus an index insert per input for nothing.
 //
-// Below the hardcoded checkpoint a reorg is impossible by rule, so there is nothing the
-// journal could ever be replayed for and skipping it costs nothing. Above it, the journal
-// is what makes a spend reversible, so it MUST come back on. Driving both edges off the
-// height means it cannot be left in the wrong state by an operator or a restart.
-func TestSyncModeFollowsTheCheckpoint(t *testing.T) {
-	s, _ := newTestStore(t)
+// What that missed is that the journal is also the prune engine. Every spend writes a row
+// grouped by height, which is the only record of WHICH transactions had an output spent in
+// a given window -- the work list the pruner reads to decide what is now fully spent. With
+// the journal off, nothing at all can be reclaimed below the checkpoint. Mainnet's highest
+// checkpoint is 945,000, roughly 6.88 billion transactions are mined below it, and the
+// unreclaimable residue is 165 to 444 GB on an 875 GB disk.
+//
+// So the journal has no off-switch, and this test pins the height case that used to
+// disable it: deep below the checkpoint, a spend must still be journalled.
+func TestJournalRunsBelowTheCheckpoint(t *testing.T) {
+	s, ctx := newTestStore(t)
 
-	s.settings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000}}
+	s.settings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 1_000_000}}
+	require.NoError(t, s.SetBlockHeight(200))
 
-	require.NoError(t, s.SetBlockHeight(500))
-	require.False(t, s.JournalEnabled(),
-		"below the checkpoint a reorg is impossible, so the journal is dead weight")
+	parent := mkTx(t, 1, 555)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
 
-	require.NoError(t, s.SetBlockHeight(1_000))
-	require.False(t, s.JournalEnabled(), "the checkpoint height itself is still below")
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
 
-	require.NoError(t, s.SetBlockHeight(1_001))
-	require.True(t, s.JournalEnabled(),
-		"past the checkpoint a spend must be reversible again")
+	_, err = s.Spend(ctx, child, 200)
+	require.NoError(t, err)
 
-	// And it must flip back if the node reorgs down below the checkpoint.
-	require.NoError(t, s.SetBlockHeight(900))
-	require.False(t, s.JournalEnabled())
+	var journalled int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal`).Scan(&journalled))
+	require.Equal(t, 1, journalled,
+		"the journal is the prune engine, not just reorg insurance: without it nothing below the checkpoint can ever be reclaimed")
 }

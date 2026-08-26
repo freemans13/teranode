@@ -22,8 +22,7 @@ import (
 // create is an INSERT; issue both inside one transaction and a failure is a ROLLBACK, so
 // the deletes simply never happened. There is no window in which the inputs are spent
 // and the outputs are missing, no retry loop, and no dependence on Unspend — which
-// matters for this store in particular, because its Unspend needs the spend journal that
-// only exists above the checkpoint.
+// matters for this store in particular, because its Unspend needs the spend journal.
 //
 // On ErrTxExists this is still all-or-nothing, and that is not a contract violation.
 // The interface says the error is returned "with the spends left in place", which reads
@@ -54,11 +53,11 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	}
 
 	// BEFORE the transaction is opened, never inside it. See
-	// ensureSpendJournalPartitionForSpend: the DDL needs its own pool connection, and
-	// taking one while holding a transaction from the same pool deadlocks the pool under
+	// ensureSpendJournalPartition: the DDL needs its own pool connection, and taking one
+	// while holding a transaction from the same pool deadlocks the pool under
 	// concurrency.
 	if !options.CreateOnly {
-		if err := s.ensureSpendJournalPartitionForSpend(ctx, blockHeight); err != nil {
+		if err := s.ensureSpendJournalPartition(ctx, blockHeight); err != nil {
 			return nil, nil, err
 		}
 	}

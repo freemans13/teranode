@@ -284,8 +284,6 @@ func TestSpendAndCreateRejectsContradictoryOptions(t *testing.T) {
 func TestSpendWritesJournal(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	require.True(t, s.JournalEnabled(), "the journal must default to ON: an irreversible store should be a deliberate choice, never an accident")
-
 	parent := mkTx(t, 1, 4242)
 	_, err := s.Create(ctx, parent, 100)
 	require.NoError(t, err)
@@ -326,33 +324,6 @@ func TestSpendWritesJournal(t *testing.T) {
 	require.Equal(t, childHash[:], spender, "and the spender, as the restore ownership token")
 	require.Equal(t, int32(200), spentAt)
 	require.Equal(t, int32(100), createdAt, "created_height must survive, for BIP68 and maturity")
-}
-
-// TestSyncModeSkipsJournal covers the one condition under which an irreversible spend is
-// safe: below the checkpoint a reorg is impossible by rule and there is no mempool, so
-// nothing can ask to undo. It has to be asked for explicitly.
-func TestSyncModeSkipsJournal(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	s.SetSyncMode(true)
-	require.False(t, s.JournalEnabled())
-
-	parent := mkTx(t, 1, 555)
-	_, err := s.Create(ctx, parent, 100)
-	require.NoError(t, err)
-
-	child := bt.NewTx()
-	require.NoError(t, child.FromUTXOs(&bt.UTXO{
-		TxIDHash: parent.TxIDChainHash(), Vout: 0,
-		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
-	}))
-
-	_, err = s.Spend(ctx, child, 200)
-	require.NoError(t, err)
-
-	var journalled int
-	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal`).Scan(&journalled))
-	require.Equal(t, 0, journalled, "sync mode must write no journal rows")
 }
 
 // TestSpendJournalReclaim proves the leaf count is BOUNDED rather than growing forever.
