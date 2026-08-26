@@ -326,10 +326,20 @@ func TestSpendWritesJournal(t *testing.T) {
 	require.Equal(t, int32(100), createdAt, "created_height must survive, for BIP68 and maturity")
 }
 
-// TestSpendJournalReclaim proves the leaf count is BOUNDED rather than growing forever.
-// Reclaim was written before this test and never wired up, so leaves accumulated
-// indefinitely -- the failure this pins.
-func TestSpendJournalReclaim(t *testing.T) {
+// TestSpendJournalReclaimIsDrivenByThePruner pins BOTH halves of moving reclaim off the
+// spend path.
+//
+// Reclaim used to run from ensureSpendJournalPartition, which the spend path calls on
+// every spend. The reasoning was sound for a catalog operation -- dropping a partition is
+// constant time, and a background reclaimer that falls behind is what killed the previous
+// store. But DETACH CONCURRENTLY waits for every open transaction on the parent, so from
+// inside a spend it stalls the pipeline with 6,400 goroutines queued behind it, and the
+// caller could only swallow the error to avoid failing the spend.
+//
+// So: spending must NOT reclaim, and the pruner service MUST. The pruner service is the
+// existing height-driven trigger -- services/pruner/worker.go calls Prune once per block
+// off its own goroutine, logs a returned error at Errorf with a metric, and times it.
+func TestSpendJournalReclaimIsDrivenByThePruner(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	s.journalRetention = 96 // 2 leaves, so the test does not need 1440 blocks
@@ -350,16 +360,74 @@ func TestSpendJournalReclaim(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	var leaves int
+	// Heights 100..500 at 48 per leaf touch leaves 2,3,4,5,6,7,8,9,10.
+	require.Equal(t, 9, journalLeaves(t, s, ctx),
+		"the spend path must create leaves and reclaim NOTHING: DETACH CONCURRENTLY waits on every open transaction on the parent")
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	n, err := svc.Prune(ctx, 500, "deadbeef")
+	require.NoError(t, err)
+	require.Zero(t, n, "no transaction records are deleted yet, and reporting journal rows in a children-deleted counter would be a lie")
+
+	// retention 96 / 48 per leaf = 2, plus the one being filled, plus at most one not
+	// yet crossed. The point is that it is bounded, not that it is exact.
+	require.LessOrEqual(t, journalLeaves(t, s, ctx), 4,
+		"journal leaves must be reclaimed as the chain advances, not accumulate")
+	require.Positive(t, journalLeaves(t, s, ctx), "recent history must still be retained")
+}
+
+// TestSpendJournalReclaimRecoversOrphanedPartitions covers the crash window that moving
+// the drop into a session is supposed to close.
+//
+// Reclaim is two statements: DETACH PARTITION ... CONCURRENTLY, then DROP TABLE. A crash
+// between them leaves a fully detached standalone table, which is verifiably invisible to
+// any listing that joins pg_inherits -- relispartition goes false and the inheritance row
+// is gone. Being "the last step of an idempotent session" does not help if the next
+// session cannot SEE the leak, so the listing has to find orphans by name in the journal's
+// own schema, not just attached partitions.
+func TestSpendJournalReclaimRecoversOrphanedPartitions(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	s.journalRetention = 96
+
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 500)) // leaf 10
+
+	// Simulate the crash: detach leaf 2 and stop, exactly as a kill between the two
+	// statements would leave it.
+	_, err := s.pool.Exec(ctx, `ALTER TABLE spend_journal DETACH PARTITION spend_journal_2 CONCURRENTLY`)
+	require.NoError(t, err, "single-statement DETACH CONCURRENTLY is not in a transaction block and must succeed")
+
+	var isPartition bool
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT relispartition FROM pg_class WHERE oid = 'spend_journal_2'::regclass`).Scan(&isPartition))
+	require.False(t, isPartition, "the orphan is no longer a partition, which is why pg_inherits cannot find it")
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+	_, err = svc.Prune(ctx, 500, "deadbeef")
+	require.NoError(t, err)
+
+	var stillThere bool
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE c.relname = 'spend_journal_2' AND n.nspname = current_schema())`).Scan(&stillThere))
+	require.False(t, stillThere, "an orphaned partition must be reclaimed by the next session, or it leaks forever")
+}
+
+// journalLeaves counts the journal's partitions, resolving the parent the same way the DDL
+// does so another schema's spend_journal cannot be counted here.
+func journalLeaves(t *testing.T, s *Store, ctx context.Context) int {
+	t.Helper()
+
+	var n int
 	require.NoError(t, s.pool.QueryRow(ctx, `
         SELECT count(*) FROM pg_inherits i
-         WHERE i.inhparent = 'spend_journal'::regclass`).Scan(&leaves))
+         WHERE i.inhparent = 'spend_journal'::regclass`).Scan(&n))
 
-	// retention 96 / 48 per leaf = 2, plus the one being filled, plus at most one
-	// not yet crossed. The point is that it is bounded, not that it is exact.
-	require.LessOrEqual(t, leaves, 4,
-		"journal leaves must be reclaimed as the chain advances, not accumulate")
-	require.Positive(t, leaves, "recent history must still be retained")
+	return n
 }
 
 // spendOne creates a parent, spends output 0, and returns the Spend record describing it.

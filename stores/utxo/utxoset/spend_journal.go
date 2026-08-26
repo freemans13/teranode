@@ -119,65 +119,96 @@ CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey
 	// the retry, and fail on a partition that was never created.
 	s.journalLeaf.Store(leaf + 1)
 
-	// Crossing into a new leaf is exactly the moment old ones fall out of retention, so
-	// reclaim here rather than from a background job. That is deliberate: a background
-	// reclaimer that falls behind is the failure mode that dominated the previous store,
-	// and this design has no per-row work to fall behind on -- reclaim is a catalog
-	// operation that either happens or does not.
-	if height > s.journalRetention {
-		if err := s.DropSpendJournalPartitionsBelow(ctx, height-s.journalRetention); err != nil {
-			// Not fatal: a spend must not fail because old history could not be
-			// discarded. Surfaced so it cannot rot silently.
-			s.logger.Warnf("[utxoset] spend journal reclaim below height %d failed: %v",
-				height-s.journalRetention, err)
-		}
-	}
+	// Reclaim deliberately does NOT happen here, though crossing into a new leaf is
+	// exactly the moment old ones fall out of retention. It used to, and the argument was
+	// sound for a catalog operation: dropping a partition is constant time, and a
+	// background reclaimer that falls behind is the failure mode that dominated the
+	// previous store. What it missed is that DETACH CONCURRENTLY waits for every open
+	// transaction on the parent. From a spend, with thousands of goroutines behind it,
+	// that stalls the pipeline; and because a spend must not fail over old history that
+	// could not be discarded, the only available response to an error was to swallow it.
+	// It swallowed a real one for the entire life of the branch.
+	//
+	// The pruner service drives it instead: see GetPrunerService in pruner.go.
 
 	return nil
 }
 
-// DropSpendJournalPartitionsBelow reclaims journal leaves entirely below height.
+// journalLeafSQL lists every journal leaf this store owns, in whichever state it is in.
 //
-// This is the whole reclaim story: DROP TABLE, O(1), no scan, no vacuum, no background
-// job that has to keep pace. The failure mode that dominated the old store -- a sweep
-// that falls behind and never catches up -- has no analogue here because there is no
-// per-row work to fall behind on.
-func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint32) error {
-	// Resolved as 'spend_journal'::regclass rather than by matching relname, so this
-	// finds partitions of the SAME table the DETACH below will name. Matching on the
-	// bare name searches every schema in the database: another schema holding its own
-	// spend_journal contributes its partitions to this list, the unqualified DETACH
-	// then resolves that name against search_path, fails with "relation does not
-	// exist", and returns -- aborting the loop before a single real partition is
-	// reclaimed. That is a permanent silent leak, because the caller only Warnf's it.
-	rows, err := s.pool.Query(ctx, `
-        SELECT c.relname
-          FROM pg_class c
-          JOIN pg_inherits i ON i.inhrelid = c.oid
-         WHERE i.inhparent = 'spend_journal'::regclass`)
+// Three states matter, and all three were verified against PostgreSQL 17 rather than
+// assumed:
+//
+//   - ATTACHED. The normal case. relispartition is true and pg_inherits has the row.
+//   - ORPHANED. A crash between DETACH and DROP leaves a fully standalone table:
+//     relispartition goes FALSE and the pg_inherits row is GONE. A listing that joins
+//     pg_inherits can never see it again, so it would leak forever. Found here by name
+//     within the journal's own schema, which is the only thing left that identifies it.
+//   - DETACH PENDING. A crash DURING a concurrent detach leaves inhdetachpending set.
+//     PostgreSQL then refuses any further ATTACH or DETACH on the parent -- "partition
+//     already pending detach", hinting at FINALIZE -- so an unhandled one wedges all
+//     future reclaim rather than leaking quietly.
+//
+// Scoped to the schema that 'spend_journal'::regclass resolves to, so this agrees with the
+// unqualified DETACH below about which table it means.
+const journalLeafSQL = `
+SELECT c.relname,
+       c.relispartition,
+       COALESCE(i.inhdetachpending, false)
+  FROM pg_class c
+  LEFT JOIN pg_inherits i
+         ON i.inhrelid = c.oid AND i.inhparent = 'spend_journal'::regclass
+ WHERE c.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'spend_journal'::regclass)
+   AND c.relkind  = 'r'
+   AND c.relname ~ '^spend_journal_[0-9]+$'`
+
+// DropSpendJournalPartitionsBelow reclaims journal leaves entirely below height, and
+// returns how many it reclaimed.
+//
+// This is the whole reclaim story: DROP TABLE, O(1), no scan, no vacuum, no per-row work
+// to fall behind on. It is idempotent, which is what lets the caller treat a crash as
+// nothing worse than a repeat: every leaf below the cutoff is reclaimed on every call, in
+// whatever state the last attempt left it, so a partial run is simply redone.
+//
+// It must be the LAST step of a pruner session. Dropping a partition destroys the record
+// of which transactions had an output spent in that window, which is precisely the work
+// list a later session step reads to decide what is now fully spent.
+func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint32) (int, error) {
+	rows, err := s.pool.Query(ctx, journalLeafSQL)
 	if err != nil {
-		return errors.NewStorageError("[utxoset] list spend-journal partitions", err)
+		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
 	}
 
-	var names []string
+	type leafState struct {
+		name          string
+		attached      bool
+		detachPending bool
+	}
+
+	var leaves []leafState
 
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var l leafState
+		if err := rows.Scan(&l.name, &l.attached, &l.detachPending); err != nil {
 			rows.Close()
-			return errors.NewStorageError("[utxoset] scan spend-journal partition", err)
+			return 0, errors.NewStorageError("[utxoset] scan spend-journal leaf", err)
 		}
 
-		names = append(names, name)
+		leaves = append(leaves, l)
 	}
 
 	rows.Close()
 
-	cutoff := height / SpendJournalPartitionBlocks
+	if err := rows.Err(); err != nil {
+		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
+	}
 
-	for _, name := range names {
+	cutoff := height / SpendJournalPartitionBlocks
+	dropped := 0
+
+	for _, l := range leaves {
 		var leaf uint32
-		if _, err := fmt.Sscanf(name, "spend_journal_%d", &leaf); err != nil {
+		if _, err := fmt.Sscanf(l.name, "spend_journal_%d", &leaf); err != nil {
 			continue
 		}
 
@@ -185,18 +216,37 @@ func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint
 			continue
 		}
 
-		// DETACH CONCURRENTLY first, then drop the now-standalone table. A bare DROP
-		// TABLE on an attached partition briefly takes ACCESS EXCLUSIVE on the PARENT,
-		// which would stall every concurrent spend; detaching concurrently does not.
-		if _, err := s.pool.Exec(ctx,
-			fmt.Sprintf(`ALTER TABLE spend_journal DETACH PARTITION %s CONCURRENTLY`, name)); err != nil {
-			return errors.NewStorageError("[utxoset] detach spend-journal partition %s", name, err)
+		switch {
+		case l.detachPending:
+			// FINALIZE is the only way out of this state, and until it runs no other
+			// partition of this table can be detached either.
+			if _, err := s.pool.Exec(ctx,
+				fmt.Sprintf(`ALTER TABLE spend_journal DETACH PARTITION %s FINALIZE`, l.name)); err != nil {
+				return dropped, errors.NewStorageError("[utxoset] finalize detach of spend-journal leaf %s", l.name, err)
+			}
+
+		case l.attached:
+			// DETACH CONCURRENTLY first, then drop the now-standalone table. A bare DROP
+			// TABLE on an attached partition briefly takes ACCESS EXCLUSIVE on the
+			// PARENT, which would stall every concurrent spend; detaching concurrently
+			// does not. It cannot run inside a transaction block, which is why this is a
+			// single-statement Exec on its own and not folded into one.
+			if _, err := s.pool.Exec(ctx,
+				fmt.Sprintf(`ALTER TABLE spend_journal DETACH PARTITION %s CONCURRENTLY`, l.name)); err != nil {
+				return dropped, errors.NewStorageError("[utxoset] detach spend-journal leaf %s", l.name, err)
+			}
+
+		default:
+			// Already standalone: a previous session was interrupted between its DETACH
+			// and its DROP. Nothing to detach, just finish the job.
 		}
 
-		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, name)); err != nil {
-			return errors.NewStorageError("[utxoset] drop spend-journal partition %s", name, err)
+		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, l.name)); err != nil {
+			return dropped, errors.NewStorageError("[utxoset] drop spend-journal leaf %s", l.name, err)
 		}
+
+		dropped++
 	}
 
-	return nil
+	return dropped, nil
 }
