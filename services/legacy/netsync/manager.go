@@ -335,9 +335,6 @@ func (s *peerSyncState) clearDemotionCooldown() {
 	s.demotedUntil.Store(0)
 }
 
-// noteBestKnownHeight raises the peer's best known height to h, and never lowers
-// it. A compare-and-swap loop rather than a load-then-store, because concurrent
-// reports would otherwise let a lower one overwrite a higher one.
 // sampleThroughput takes this tick's reading of the peer's association-wide read
 // counter, keeping the previous one to subtract from.
 func (s *peerSyncState) sampleThroughput(p *peerpkg.Peer) {
@@ -393,6 +390,9 @@ func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
 	return delta >= minSpeed*seconds
 }
 
+// noteBestKnownHeight raises the peer's best known height to h, and never lowers
+// it. A compare-and-swap loop rather than a load-then-store, because concurrent
+// reports would otherwise let a lower one overwrite a higher one.
 func (s *peerSyncState) noteBestKnownHeight(h int32) {
 	for {
 		cur := s.bestKnownHeight.Load()
@@ -3530,11 +3530,6 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	sm.publishFrontier(time.Now())
 }
 
-// snapshotHeaderCandidates copies up to limit hashes from startHeader forward,
-// and returns the element startHeader points at together with its hash, so the
-// blockchain lookups can be made with headerMu released and the commit can tell
-// whether the list moved in the meantime. ok is false when there is nothing
-// usable to walk.
 // lookaheadCeilingLocked returns the highest block height this round may ask for,
 // and whether there is a limit at all. The caller must hold headerMu.
 //
@@ -3584,6 +3579,11 @@ func (sm *SyncManager) lookaheadCeilingLocked() (int64, bool) {
 	return int64(node.height) + int64(lower), true
 }
 
+// snapshotHeaderCandidates copies up to limit hashes from startHeader forward,
+// and returns the element startHeader points at together with its hash, so the
+// blockchain lookups can be made with headerMu released and the commit can tell
+// whether the list moved in the meantime. ok is false when there is nothing
+// usable to walk.
 func (sm *SyncManager) snapshotHeaderCandidates(limit int) (hashes []chainhash.Hash, anchor *list.Element, anchorHash chainhash.Hash, ok bool) {
 	sm.headerMu.Lock()
 	defer sm.headerMu.Unlock()
