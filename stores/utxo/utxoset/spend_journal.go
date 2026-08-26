@@ -138,12 +138,18 @@ CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey
 // that falls behind and never catches up -- has no analogue here because there is no
 // per-row work to fall behind on.
 func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint32) error {
+	// Resolved as 'spend_journal'::regclass rather than by matching relname, so this
+	// finds partitions of the SAME table the DETACH below will name. Matching on the
+	// bare name searches every schema in the database: another schema holding its own
+	// spend_journal contributes its partitions to this list, the unqualified DETACH
+	// then resolves that name against search_path, fails with "relation does not
+	// exist", and returns -- aborting the loop before a single real partition is
+	// reclaimed. That is a permanent silent leak, because the caller only Warnf's it.
 	rows, err := s.pool.Query(ctx, `
         SELECT c.relname
           FROM pg_class c
           JOIN pg_inherits i ON i.inhrelid = c.oid
-          JOIN pg_class p ON p.oid = i.inhparent
-         WHERE p.relname = 'spend_journal'`)
+         WHERE i.inhparent = 'spend_journal'::regclass`)
 	if err != nil {
 		return errors.NewStorageError("[utxoset] list spend-journal partitions", err)
 	}

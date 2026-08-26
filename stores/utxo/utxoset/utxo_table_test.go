@@ -381,10 +381,8 @@ func TestSpendJournalReclaim(t *testing.T) {
 
 	var leaves int
 	require.NoError(t, s.pool.QueryRow(ctx, `
-        SELECT count(*) FROM pg_class c
-          JOIN pg_inherits i ON i.inhrelid = c.oid
-          JOIN pg_class p ON p.oid = i.inhparent
-         WHERE p.relname = 'spend_journal'`).Scan(&leaves))
+        SELECT count(*) FROM pg_inherits i
+         WHERE i.inhparent = 'spend_journal'::regclass`).Scan(&leaves))
 
 	// retention 96 / 48 per leaf = 2, plus the one being filled, plus at most one
 	// not yet crossed. The point is that it is bounded, not that it is exact.

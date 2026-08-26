@@ -27,7 +27,7 @@ func TestAutovacuumThresholdIsSizedToTheIndex(t *testing.T) {
 	var opts []string
 
 	require.NoError(t, s.pool.QueryRow(ctx,
-		`SELECT reloptions FROM pg_class WHERE relname = 'utxo_p0'`).Scan(&opts))
+		`SELECT reloptions FROM pg_class WHERE oid = 'utxo_p0'::regclass`).Scan(&opts))
 
 	require.Contains(t, opts, "autovacuum_vacuum_threshold=1000000",
 		"200000 caps the node near 2.65 blk/s on index scanning alone")
