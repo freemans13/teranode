@@ -1111,14 +1111,10 @@ func candidateOf(srv *server) *wire.NetAddress {
 func runOneProbe(srv *server) {
 	srv.feelerTokens = make(chan struct{}, 1)
 
-	// startFeeler settles this on the real path, and a test that drove the loop
-	// has already had it set. Left alone when it is, so a test can pin the value
-	// a probe runs with; filled in when it is not, because a zero deadline fires
-	// the moment the timer is built.
-	if srv.feelerHandshake == 0 {
-		srv.feelerHandshake = feelerHandshakeTimeout(srv.logger, srv.settings.Legacy.FeelerHandshakeTimeout)
-	}
-
+	// feelerHandshake is left exactly as the caller set it, including unset.
+	// This helper used to fill in a zero so a probe would not build a timer that
+	// fires immediately; feelerProbe now falls back on its own, so backfilling
+	// here would hide the very path that guard exists for.
 	srv.feelerProbe()
 }
 
@@ -1435,6 +1431,12 @@ func TestFeelerProbeUsesTheConfiguredHandshakeTimeout(t *testing.T) {
 	srv.settings.Legacy.FeelerHandshakeTimeout = 250 * time.Millisecond
 	serveFeelerSnapshot(srv, feelerSnapshot{})
 
+	// Settled the way startFeeler settles it, on a server whose loop was never
+	// started. This is the hop under test: runOneProbe used to fill the field in,
+	// which made the helper rather than the production path the thing carrying
+	// the configured value here.
+	srv.feelerHandshake = feelerHandshakeTimeout(srv.logger, srv.settings.Legacy.FeelerHandshakeTimeout)
+
 	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
 	srv.addrManager.AddAddress(na, testSourceAddr())
 
@@ -1520,6 +1522,107 @@ func TestFeelerHandshakeTimeoutIsSettledOnce(t *testing.T) {
 		warns, _ := rec.counts()
 		require.Zero(t, warns, "a startup misconfiguration must not be re-reported per probe: %s", rec.logged())
 	})
+}
+
+// TestFeelerProbeWaitsWhenItsDeadlineWasNeverSettled covers the one input to the
+// probe's timer that nothing else checks: the zero value of s.feelerHandshake.
+//
+// startFeeler settles the field before starting the only goroutine that probes,
+// so production cannot reach the timer with a zero. That invariant is a
+// call-graph fact rather than anything the compiler holds, and the tree already
+// steps around it: TestFeelerHandlerWaitsForASlotToken starts feelerHandler
+// directly with the field unset, and its only assertion reads feelerAttempted,
+// which the probe increments before the dial and long before the timer -- so it
+// drives this path without being able to see it.
+//
+// The cost of the invariant breaking is the least visible failure this feature
+// has. A timer built from zero is ready the moment the select is reached, so the
+// probe reports a timeout before the far side could answer, having already
+// written an Attempt against the address back at the TCP connect. Every probe
+// would discourage the address it was sent to verify: chance() multiplies an
+// attempted address's weight by 0.01 for ten minutes and divides it by 1.5 per
+// counted failure, and isBad condemns a never-successful address at three.
+//
+// Asserted on the end state rather than on the resolved duration. The listener
+// holds its version back longer than an unguarded probe could possibly wait, so
+// "was the address promoted" is the whole question.
+func TestFeelerProbeWaitsWhenItsDeadlineWasNeverSettled(t *testing.T) {
+	ln := startSlowFeelerTestListener(t, "/Bitcoin SV:1.1.0/", 250*time.Millisecond)
+
+	swapTestConfig(t, ln.Addr().String())
+
+	srv := newFeelerTestServer(t)
+	serveFeelerSnapshot(srv, feelerSnapshot{})
+
+	na := wire.NewNetAddressIPPort(net.ParseIP("8.8.8.8"), 8333, wire.SFNodeNetwork)
+	srv.addrManager.AddAddress(na, testSourceAddr())
+
+	require.Zero(t, srv.feelerHandshake,
+		"the unset field is the state under test, so nothing may have settled it")
+
+	// Synchronous: everything below is asserted on a finished probe.
+	runOneProbe(srv)
+
+	require.Equal(t, uint64(1), srv.feelerVerified.Load(),
+		"a probe whose deadline was never settled must still wait for the version")
+
+	require.Nil(t, srv.addrManager.UnverifiedAddress(),
+		"and the address it verified must leave the new table")
+}
+
+// startSlowFeelerTestListener answers like startFeelerTestListener but holds its
+// version back for delay first, so a probe that did not wait cannot be mistaken
+// for one that did.
+func startSlowFeelerTestListener(t *testing.T, userAgent string, delay time.Duration) net.Listener {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = ln.Close() })
+
+	net2 := settings.NewSettings().ChainCfgParams.Net
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+
+		defer func() { _ = conn.Close() }()
+
+		msg, _, err := wire.ReadMessage(conn, wire.ProtocolVersion, net2)
+		if err != nil {
+			return
+		}
+
+		if _, ok := msg.(*wire.MsgVersion); !ok {
+			return
+		}
+
+		time.Sleep(delay)
+
+		me := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 8333, wire.SFNodeNetwork)
+		you := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 8333, wire.SFNodeNetwork)
+
+		reply := wire.NewMsgVersion(me, you, rand.Uint64(), 0)
+		reply.UserAgent = userAgent
+		reply.Services = wire.SFNodeNetwork
+
+		if err := wire.WriteMessage(conn, reply, wire.ProtocolVersion, net2); err != nil {
+			return
+		}
+
+		if err := wire.WriteMessage(conn, wire.NewMsgVerAck(), wire.ProtocolVersion, net2); err != nil {
+			return
+		}
+
+		// Hold the connection open so the probe is the side that hangs up.
+		buf := make([]byte, 1)
+		_, _ = conn.Read(buf)
+	}()
+
+	return ln
 }
 
 // startMuteFeelerTestListener accepts one connection, reads the probe's version

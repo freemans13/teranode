@@ -494,7 +494,26 @@ func (s *server) feelerProbe() {
 	// Already settled by startFeeler. Resolving it here instead re-ran both of
 	// feelerHandshakeTimeout's guards on every probe, so a badly configured node
 	// warned about a startup mistake for ever.
-	timer := time.NewTimer(s.feelerHandshake)
+	//
+	// Guarded anyway, because settling it there leaves the zero value of the
+	// field as the one input to this timer that nothing checks, and a timer built
+	// from zero is ready the instant the select below is reached. The probe would
+	// then report a timeout before the far side could answer, having already
+	// written an Attempt against the address at the TCP connect above -- so every
+	// probe would discourage the address it was sent to verify. The invariant that
+	// makes that unreachable in production is a call-graph fact rather than
+	// anything the compiler holds: startFeeler writes the field before starting
+	// the only goroutine that calls this. A fallback is cheaper than trusting it.
+	//
+	// Silent by design. feelerHandshakeTimeout has already said its piece once at
+	// startup, and repeating it per probe is exactly what settling the value there
+	// removed.
+	handshake := s.feelerHandshake
+	if handshake <= 0 {
+		handshake = defaultFeelerHandshakeTimeout
+	}
+
+	timer := time.NewTimer(handshake)
 	defer timer.Stop()
 
 	// Each arm records only why its own wait ended, and the verdict is reached
