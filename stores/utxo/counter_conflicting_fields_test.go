@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -114,4 +115,38 @@ func inpointsFromTx(t *testing.T, tx *bt.Tx) subtree.TxInpoints {
 	require.NoError(t, err)
 
 	return inpoints
+}
+
+// TestGetCounterConflictingTxHashesWithoutTransactionBody pins the consequence
+// of the field-set trim above: a store that is asked for fields.TxInpoints hands
+// back a nil Tx, so nothing in the walk may read txMeta.Tx.
+//
+// This is the real SQL shape, not a contrived one. sql.Store.getUnbatched
+// assigns meta.Data.Tx only when fields.Tx was requested, and
+// utxostore_getBatcherSize defaults to 1, which leaves sql.Store.getBatcher nil
+// and routes every Get down that unbatched path. Aerospike hides the problem
+// because addAbstractedBins pulls fields.Inputs in behind fields.TxInpoints and
+// the fields.Inputs case builds a Tx.
+func TestGetCounterConflictingTxHashesWithoutTransactionBody(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	txHash := createTestHash("child-tx")
+	parentTxHash := createTestHash("parent-tx")
+
+	inpoints := inpointsFromTx(t, createTestTransactionWithInputs(parentTxHash, 0))
+
+	// What a real store returns for fields.TxInpoints: inpoints set, Tx nil.
+	mockStore.On("Get", mock.Anything, &txHash, mock.Anything).
+		Return(&meta.Data{TxInpoints: inpoints}, nil)
+
+	// The parent's vout 0 is unspent, so the walk collects no counter-spender.
+	mockStore.On("Get", mock.Anything, &parentTxHash, mock.Anything).
+		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{nil}}, nil)
+
+	result, err := GetCounterConflictingTxHashes(ctx, mockStore, txHash, 0)
+
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{txHash}, result)
+	mockStore.AssertExpectations(t)
 }

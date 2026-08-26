@@ -1222,24 +1222,37 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 		parentTxs[*parentTxHash] = spendingTxIDs
 	}
 
-	// validate every input and collect the unique counter-spenders in first-seen
-	// input order; several inputs are typically spent by the same counter tx and
-	// its descendant walk must run only once, not once per input. Dedupe on a
-	// dedicated set: counterConflictingMap is seeded with txHash, and a spender
-	// equal to txHash itself must still be walked.
-	seenSpenders := make(map[chainhash.Hash]struct{}, len(txMeta.Tx.Inputs))
-	uniqueSpendingTxIDs := make([]chainhash.Hash, 0, len(txMeta.Tx.Inputs))
+	// Walk the inpoints, not txMeta.Tx.Inputs. The Get above asks for
+	// fields.TxInpoints only, so txMeta.Tx is nil on the SQL store: getUnbatched
+	// assigns meta.Data.Tx only when fields.Tx was requested, and
+	// utxostore_getBatcherSize defaults to 1, which leaves the get batcher nil and
+	// sends every Get down that unbatched path.
+	//
+	// GetTxInpoints returns the outpoints grouped parent-then-vout rather than in
+	// input order. Only the order of the descendant walks below changes with it,
+	// and the result is accumulated into counterConflictingMap, so the returned
+	// set is the same. It does decide which walk spends the maxNodes budget
+	// first, which was already unspecified for a transaction with several
+	// conflicting parents.
+	inpoints := txMeta.TxInpoints.GetTxInpoints()
 
-	for _, input := range txMeta.Tx.Inputs {
-		parenTxIDS, ok := parentTxs[*input.PreviousTxIDChainHash()]
+	// Collect the unique counter-spenders: several inputs are typically spent by
+	// the same counter tx and its descendant walk must run only once, not once
+	// per input. Dedupe on a dedicated set: counterConflictingMap is seeded with
+	// txHash, and a spender equal to txHash itself must still be walked.
+	seenSpenders := make(map[chainhash.Hash]struct{}, len(inpoints))
+	uniqueSpendingTxIDs := make([]chainhash.Hash, 0, len(inpoints))
+
+	for _, inpoint := range inpoints {
+		parenTxIDS, ok := parentTxs[inpoint.Hash]
 		if ok {
 			// check the length of the spending txs, if it's less than the index, then the input is not spent
-			if len(parenTxIDS) <= int(input.PreviousTxOutIndex) {
+			if len(parenTxIDS) <= int(inpoint.Index) {
 				// throw an error
-				return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] cannot process counter conflicting, input %d of %s is out of range (len: %d, %v)", txHash.String(), input.PreviousTxOutIndex, input.PreviousTxIDChainHash().String(), len(parenTxIDS), parenTxIDS)
+				return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] cannot process counter conflicting, input %d of %s is out of range (len: %d, %v)", txHash.String(), inpoint.Index, inpoint.Hash.String(), len(parenTxIDS), parenTxIDS)
 			}
 
-			spendingTxID := parenTxIDS[input.PreviousTxOutIndex]
+			spendingTxID := parenTxIDS[inpoint.Index]
 			if spendingTxID != nil {
 				counterConflictingMap[*spendingTxID] = struct{}{}
 
