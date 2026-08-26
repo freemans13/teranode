@@ -105,6 +105,15 @@ rather than silent no-ops:
   checkpoint it must reach. This is expected — the node is already catching up
   on its own and will move to RUNNING once it has caught up.
 
+> **Behaviour change:** a fresh node now boots into CATCHINGBLOCKS rather than
+> IDLE, and the checkpoint rule above exempts only IDLE. A brand-new mainnet or
+> testnet node could previously be forced straight to RUNNING with
+> `setfsmstate running`; it now returns the checkpoint error instead, until its
+> tip reaches the checkpoint. Nothing in this repository relied on that
+> shortcut, but out-of-tree boot tooling that forces RUNNING on a fresh node
+> will now get an error where it previously succeeded. Regtest has no
+> checkpoints and is unaffected.
+
 ## Validation
 
 After each state change, verify the new state:
