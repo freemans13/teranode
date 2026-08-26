@@ -785,6 +785,13 @@ type SyncManager struct {
 	// not bound the time they take — see fetchHeaderBlocks.
 	headerMu         sync.Mutex
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
+	// pendingCheckpoint holds the checkpoint block whose round of headers was
+	// never asked for, because it committed when there was nobody to ask. Only
+	// checkpointBlockCommitted writes it and only drainPendingCheckpoint clears
+	// it, and the two run on different goroutines — the block-queue consumer
+	// drains the park, the sync-peer ticker elects — so it is atomic and is
+	// read with a Swap. Nil means there is no round owing.
+	pendingCheckpoint atomic.Pointer[chainhash.Hash]
 	// currentCached is the last answer current() worked out, so a peer goroutine
 	// can read it without making the blockchain call itself. See IsCurrentCached.
 	currentCached atomic.Bool
@@ -1467,6 +1474,14 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		return
 	}
+
+	// After everything this tick might do to the sync peer, not before: the
+	// arms below elect one when there is none and demote-then-re-elect when the
+	// current one has stalled, and a deferred checkpoint round needs whatever
+	// peer that leaves behind. Deferred rather than placed at each return
+	// because there are several, and missing one loses the round until the next
+	// tick. See drainPendingCheckpoint.
+	defer sm.drainPendingCheckpoint()
 
 	sp, sps := sm.loadSyncPeerAndState()
 
@@ -2935,10 +2950,28 @@ func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash ch
 	// advancing it first threw away the question as well as the answer: nothing
 	// went out, and when a peer did turn up the node asked for the round AFTER
 	// the one it was missing, so the gap was never filled and headers-first sync
-	// stopped at this checkpoint. Leaving the checkpoint where it is costs one
-	// repeated transition when a peer returns, which is free.
+	// stopped at this checkpoint.
+	//
+	// Leaving the checkpoint where it is is necessary but not sufficient: the
+	// two callers of this function are a block committing off the wire and the
+	// park drain, and the block is in the chain by the time either returns, so
+	// haveInventory answers true for it and the download walk never asks for it
+	// again. There is no second delivery to re-enter this arm with. So the round
+	// is remembered here and drainPendingCheckpoint replays it from the
+	// sync-peer ticker once an election has produced somebody to ask.
 	if peer == nil {
-		sm.logger.Warnf("[checkpointBlockCommitted][%s] checkpoint reached with no peer to ask for the next round of headers; the checkpoint stays where it is until there is one", blockHash)
+		// Mark the anchor anyway. The block is already in this node's chain, so
+		// if a headers round reaches the list by any other route before the
+		// replay lands, the front must not wedge on a block no peer will send
+		// again — see anchorIsStillTheFrontLocked.
+		sm.headerMu.Lock()
+		sm.markCheckpointAnchorLocked(blockHash)
+		sm.headerMu.Unlock()
+
+		stored := blockHash
+		sm.pendingCheckpoint.Store(&stored)
+
+		sm.logger.Warnf("[checkpointBlockCommitted][%s] checkpoint reached with no peer to ask for the next round of headers; the round is deferred until one is elected", blockHash)
 
 		return nil
 	}
@@ -2947,16 +2980,7 @@ func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash ch
 	// getheaders send and the loadSyncPeer lookup below stay outside the lock.
 	sm.headerMu.Lock()
 
-	// advanceHeaderListFor leaves the checkpoint node in the list so the next
-	// round's first header can prove it links to it. That makes it the next
-	// round's anchor: a block now in this node's chain that no peer will deliver
-	// again. Say so on the node, because this is the moment it becomes true and
-	// nothing later can work it out from where the node sits — see headerNode.
-	if e := sm.headerIndex[blockHash]; e != nil {
-		if node, ok := e.Value.(*headerNode); ok {
-			node.isAnchor = true
-		}
-	}
+	sm.markCheckpointAnchorLocked(blockHash)
 
 	if sm.nextCheckpoint == nil {
 		sm.headerMu.Unlock()
@@ -3002,6 +3026,58 @@ func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash ch
 	}
 
 	return nil
+}
+
+// markCheckpointAnchorLocked records that a checkpoint block is now the header
+// list's anchor. Caller holds headerMu.
+//
+// advanceHeaderListFor leaves the checkpoint node in the list so the next
+// round's first header can prove it links to it. That makes it the next round's
+// anchor: a block now in this node's chain that no peer will deliver again. Say
+// so on the node, because this is the moment it becomes true and nothing later
+// can work it out from where the node sits — see headerNode.
+func (sm *SyncManager) markCheckpointAnchorLocked(blockHash chainhash.Hash) {
+	if e := sm.headerIndex[blockHash]; e != nil {
+		if node, ok := e.Value.(*headerNode); ok {
+			node.isAnchor = true
+		}
+	}
+}
+
+// drainPendingCheckpoint replays a checkpoint transition that could not be made
+// because there was no peer to ask, now that the sync-peer check has had its
+// chance to elect one.
+//
+// This is the step that was missing. checkpointBlockCommitted is reached only by
+// a block committing, and a checkpoint block commits exactly once: after that it
+// is in the chain, haveInventory answers true and the download walk never asks
+// for it again. So the nil-peer arm's decision to leave the checkpoint alone
+// preserved the question but nothing ever asked it, and headers-first sync
+// stopped at that checkpoint for the life of the process.
+//
+// Called from handleCheckSyncPeer, which runs on the sync-peer ticker, while the
+// nil-peer arm is written from the block-queue consumer that drains the park.
+// The Swap is what makes that safe: whichever goroutine takes the hash owns it,
+// and if there is still nobody to ask, checkpointBlockCommitted puts it straight
+// back for the next tick.
+func (sm *SyncManager) drainPendingCheckpoint() {
+	hash := sm.pendingCheckpoint.Swap(nil)
+	if hash == nil {
+		return
+	}
+
+	peer := sm.loadSyncPeer()
+	if peer == nil {
+		sm.pendingCheckpoint.Store(hash)
+
+		return
+	}
+
+	sm.logger.Infof("[drainPendingCheckpoint][%s] a peer is available, asking for the round of headers the checkpoint deferred", *hash)
+
+	if err := sm.checkpointBlockCommitted(peer, *hash); err != nil {
+		sm.logger.Errorf("[drainPendingCheckpoint][%s] deferred checkpoint transition failed: %v", *hash, err)
+	}
 }
 
 // processQueuedBlock is what the block-queue consumer does with one block:
