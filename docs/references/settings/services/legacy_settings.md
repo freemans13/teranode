@@ -28,9 +28,9 @@
 | BlockFailureBackoffBase | time.Duration | 5s | legacy_blockFailureBackoffBase | Base per-block backoff after a transient storage/service failure (0 disables) |
 | BlockFailureBackoffMaxDuration | time.Duration | 150s | legacy_blockFailureBackoffMaxDuration | Cap on the per-block backoff window and the failure-tracking map TTL, kept below the 180s sync-peer stall window (0 disables) |
 | BlockPrefetchBufferBytes | int64 | 268435456 | legacy_blockPrefetchBufferBytes | Byte budget for blocks downloaded ahead of processing during sync (0 disables prefetch) |
-| BlockDownloadTimeoutBasePercent | int64 | 100 | legacy_blockDownloadTimeoutBasePercent | Ceiling on one block download at the chain tip, as a percentage of the target block interval |
-| BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up, when blocks are larger and validation backpressure delays the read loop |
-| BlockDownloadTimeoutPerPeerPercent | int64 | 50 | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling allowed per other peer we are downloading from, since our downstream link is shared |
+| BlockDownloadTimeoutBasePercent | int64 | 100 | legacy_blockDownloadTimeoutBasePercent | Ceiling on one block download at the chain tip, as a percentage of the target block interval; floored at 30 minutes, so values at or below 300 have no effect on a 10-minute chain |
+| BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up, when blocks are larger and validation backpressure delays the read loop; also floored at 30 minutes, which the 600 default clears on a 10-minute chain |
+| BlockDownloadTimeoutPerPeerPercent | int64 | 50 | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling allowed per other peer we are downloading from, since our downstream link is shared; the total is floored at 30 minutes, so this can only add patience |
 | MaxBlockParallelFetch | int | 2 | legacy_maxBlockParallelFetch | Maximum peers downloading the same stalled frontier block at once (1 disables racing) |
 | BlockSlowFetchTimeout | time.Duration | 20s | legacy_blockSlowFetchTimeout | How long the download frontier may sit unchanged before a second peer is asked for the same block (0 disables racing) |
 | MultiPeerBlockDownload | bool | true | legacy_multiPeerBlockDownload | Download block bodies from every eligible peer during legacy sync (false restores the single-sync-peer path) |
