@@ -41,15 +41,23 @@ const (
 
 // CatchupContext holds all the state needed during a catchup operation
 type CatchupContext struct {
-	blockUpTo               *model.Block
-	baseURL                 string
-	peerID                  string
-	startTime               time.Time
-	commonAncestorHash      *chainhash.Hash
-	commonAncestorMeta      *model.BlockHeaderMeta
-	commonAncestorIndex     int // Index of common ancestor in peer headers
-	forkDepth               uint32
-	currentHeight           uint32
+	blockUpTo           *model.Block
+	baseURL             string
+	peerID              string
+	startTime           time.Time
+	commonAncestorHash  *chainhash.Hash
+	commonAncestorMeta  *model.BlockHeaderMeta
+	commonAncestorIndex int // Index of common ancestor in peer headers
+	forkDepth           uint32
+	currentHeight       uint32
+	// bestBlockMeta is the accepted chain tip read once by findCommonAncestor and reused by
+	// every later step, so they all reason about the same tip. Reading it a second time would
+	// let the tip move in between: the ancestor is chosen against this height, so a tip that
+	// decreased would make the ancestor exceed it and trip the height check
+	// checkSecretMiningFromCommonAncestor makes, throwing away a sound catchup over our own
+	// local reorg. That check reports the trip as a service error, so the peer is not charged
+	// for it, but the catchup is lost all the same.
+	bestBlockMeta           *model.BlockHeaderMeta
 	blockHeaders            []*model.BlockHeader
 	headersFetchResult      *catchup.Result
 	useQuickValidation      bool   // Whether to use quick validation for checkpointed blocks
@@ -404,6 +412,24 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// all-peers-failed error as a network error against the primary.
 			errorType = "peer_data_unavailable"
 			isPeerError = false
+		case errors.Is(*err, errors.ErrBlockHeaderContext):
+			// The parent-header run our own store returned was not anchored at the block's
+			// parent, was not linked, or was too short for the median-time-past window (issue
+			// #1467). Purely local: the serving peer had no part in producing it, so charging it
+			// would demote an honest peer and tear down the session over our own state. Same
+			// reasoning as the 1368 and 1031 fixes below.
+			//
+			// Must precede IsNetworkError and the strings.Contains cases, which match on message
+			// text: IsNetworkError counts a message merely containing "http" or "eof" as a network
+			// error, so an outer wrapper carrying a peer baseURL would reclassify this as a peer
+			// error — exactly what this case exists to prevent.
+			//
+			// Deliberately NOT a blanket ErrProcessing case: this switch's own
+			// TestReleaseCatchupLock_DrainChargesPrimaryEvenOnMixedCycle uses a bare
+			// NewProcessingError as its example of a generic PEER error, so suppressing all
+			// processing errors here would stop charging peers that deserve it.
+			errorType = "local_header_context_error"
+			isPeerError = false
 		case errors.IsNetworkError(*err):
 			errorType = "network_error"
 		case strings.Contains(errorMsg, "secret mining") || strings.Contains(errorMsg, "secretly mined"):
@@ -569,13 +595,46 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 }
 
 // recordCatchupPeerFailure attributes a data-serving failure to the peer that caused
-// it, for the current catchup cycle. Best-effort: with no active catchup context
-// (e.g. a direct block fetch outside catchup) the call is a no-op.
+// it, charging it against whichever catchup cycle is active when the call is made.
+// Best-effort: with no cycle active the call is a no-op.
 //
 // errors.IsLocalError is checked here — not at each call site — so every caller
 // gets the guard for free: a context cancellation (catchup abort / peer switch /
 // shutdown landing mid-retry) or a local storage failure (subtreeStore.Set) is ours,
 // not the peer's, and must never land an innocent peer in failedPeers.
+//
+// Attribution reads the server-wide u.activeCatchupCtx rather than taking a cycle
+// from the caller. Two properties define the limits of that read, and both are worth
+// re-checking before changing anything on this path.
+//
+// A catchup cycle outlives every fetch it starts. fetchAndStoreSubtreeData detaches
+// its context (context.WithoutCancel) so an aborted fetch still finishes writing,
+// but the goroutine stays inside the errgroup fetchSubtreeDataForBlock waits on,
+// which blockWorker waits on, which catchup waits on before releaseCatchupLock
+// clears the context. A slow peer can therefore delay the end of its cycle but can
+// never outlive it. That delay is not a single subtree_data fetch timeout: the
+// deadline is installed per call with no shared budget, and one subtree makes up to
+// two calls per peer (a cache-bypass retry) across each alternative peer, so the
+// drain ceiling is a multiple of that timeout — see fetchAndStoreSubtreeAndSubtreeData.
+// The bound is larger in magnitude but still finite, so a failure raised by a
+// catchup's own fetch is never charged to a later cycle nor dropped into a cleared
+// context. Making any fetch on that path fire-and-forget breaks this and requires the
+// cycle to be threaded from the caller instead — as would an injected
+// fetchSubtreeDataForBlockFn that does not preserve that join.
+// In adaptive-fetch optimistic mode the per-subtree fetch is skipped entirely, so on
+// that branch there is nothing to join and the guarantee holds vacuously rather than
+// by the join above.
+//
+// Not every caller is a catchup. RevalidateBlock reaches this path through
+// fetchSubtreeDataForBlock on its own gRPC goroutine with no interlock against a
+// running catchup, so its per-subtree failures land in whatever catchup cycle is
+// active. releaseCatchupLock drains failedPeers only inside its *err != nil branch,
+// so those failures are charged only if that concurrent cycle itself ends in error;
+// a cycle that succeeds discards the map untouched and the RevalidateBlock failure is
+// then charged to no one. When a failure is charged, it lands on the peer that
+// returned it for that fetch, not on some other peer; that does not prove the peer
+// deserves a reputational charge, because a peer that 404s subtree data the pruner
+// removed did nothing wrong.
 func (u *Server) recordCatchupPeerFailure(peerID string, err error) {
 	if peerID == "" || err == nil || errors.IsLocalError(err) {
 		return
@@ -643,13 +702,40 @@ func (u *Server) findCommonAncestor(ctx context.Context, catchupCtx *CatchupCont
 		return errors.NewProcessingError("[catchup][%s] no headers received from peer", catchupCtx.blockUpTo.Hash().String())
 	}
 
-	currentHeight := u.utxoStore.GetBlockHeight()
+	// Where the two chains diverge is a property of the accepted chain, so the baseline is
+	// the blockchain store's tip — the same tip checkSecretMiningFromCommonAncestor weighs
+	// against. It used to be the UTXO store's height, which is a counter refreshed
+	// asynchronously on each block notification and can trail the accepted chain by an
+	// unbounded amount while that subscription is starved or during bulk sync. Mixing the two
+	// sources made the fork depth wrong in both directions: understated here (the ancestor was
+	// pinned at the lagging height, and the depth measured from that same height), so a
+	// genuinely too-deep fork could slip under the coinbase-maturity gate; and overstated in
+	// the secret-mining check, which measures from the real tip, so an honest peer offering a
+	// shallow fork could be accused of withholding a chain. Nothing here needs the ancestor's
+	// UTXOs to be present — catchup validates forward and never unspends or rewinds.
+	//
+	// This is the only place the ancestor search, the fork-depth baseline and the work
+	// comparison take their tip from: it is stashed on the context and handed to the later
+	// steps rather than re-read, so all three measure against one fixed tip.
+	// catchupGetBlockHeaders reads the tip too, earlier in this same catchup, but only to seed
+	// the block locator and the startHash/startHeight it reports — neither feeds a decision
+	// here, so a tip that moves between the two reads costs at most a locator that starts
+	// lower than it needed to.
+	_, bestMeta, err := u.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		// Our own RPC failed. ServiceError so the caller retries without charging the peer for
+		// a local fault (see processCatchupChItem's ErrServiceError branch).
+		return errors.NewServiceError("[catchup][%s] failed to read best block header for the common-ancestor search", catchupCtx.blockUpTo.Hash().String(), err)
+	}
+
+	currentHeight := bestMeta.Height
 	catchupCtx.currentHeight = currentHeight
+	catchupCtx.bestBlockMeta = bestMeta
 
 	// Walk through peer's headers (oldest to newest) to find the highest common ancestor
 	commonAncestorIndex := -1
 	var commonAncestorMeta *model.BlockHeaderMeta
-	u.logger.Debugf("[catchup][%s] Checking %d peer headers for common ancestor (current UTXO height: %d)", catchupCtx.blockUpTo.Hash().String(), len(peerHeaders), currentHeight)
+	u.logger.Debugf("[catchup][%s] Checking %d peer headers for common ancestor (current height: %d)", catchupCtx.blockUpTo.Hash().String(), len(peerHeaders), currentHeight)
 
 	for i, header := range peerHeaders {
 		// GetBlockHeader conveys both existence and height in a single RPC: a
@@ -665,10 +751,14 @@ func (u *Server) findCommonAncestor(ctx context.Context, catchupCtx *CatchupCont
 			return errors.NewProcessingError("[catchup][%s] failed to get header for block %s: %v", catchupCtx.blockUpTo.Hash().String(), header.Hash().String(), err)
 		}
 
-		// Only consider blocks at or below our current UTXO height as potential common ancestors
-		// Blocks ahead of our UTXO height exist in blockchain store but aren't fully processed yet
+		// A candidate ancestor must be at or below our accepted tip. GetBlockHeader reports
+		// any block held in the store, including one on a side chain we did not adopt, which
+		// can sit above our tip — so without this the walk could pick an ancestor higher than
+		// the chain we are measuring divergence from, tripping the invariant
+		// checkSecretMiningFromCommonAncestor asserts. This is the same ceiling as before;
+		// what changed is only where the height comes from.
 		if meta.Height > currentHeight {
-			u.logger.Debugf("[catchup][%s] Block %s at height %d is ahead of current UTXO height %d - stopping search", catchupCtx.blockUpTo.Hash().String(), header.Hash().String(), meta.Height, currentHeight)
+			u.logger.Debugf("[catchup][%s] Block %s at height %d is ahead of our tip %d - stopping search", catchupCtx.blockUpTo.Hash().String(), header.Hash().String(), meta.Height, currentHeight)
 			break
 		}
 
@@ -763,7 +853,7 @@ func (u *Server) checkSecretMining(ctx context.Context, catchupCtx *CatchupConte
 		}
 	}
 
-	return u.checkSecretMiningFromCommonAncestor(ctx, catchupCtx.blockUpTo, catchupCtx.peerID, catchupCtx.baseURL, catchupCtx.commonAncestorHash, catchupCtx.commonAncestorMeta, offeredHeaders)
+	return u.checkSecretMiningFromCommonAncestor(ctx, catchupCtx.blockUpTo, catchupCtx.peerID, catchupCtx.baseURL, catchupCtx.commonAncestorHash, catchupCtx.commonAncestorMeta, catchupCtx.bestBlockMeta, offeredHeaders)
 }
 
 // filterHeaders filters headers to only those after the common ancestor that we don't have.
@@ -1470,27 +1560,34 @@ func getLowestCheckpointHeight(checkpoints []chaincfg.Checkpoint) uint32 {
 //   - baseURL: Peer URL for metrics
 //   - commonAncestorHash: Hash of the common ancestor
 //   - commonAncestorMeta: Metadata of the common ancestor
+//   - bestMeta: The accepted chain tip findCommonAncestor measured the ancestor against,
+//     supplying both the height for the depth trigger and the chainwork for the work gate
 //   - offeredHeaders: Peer's headers after the common ancestor (the candidate chain)
 //
 // Returns:
 //   - error: If secret mining is detected, or the deep fork cannot be safely followed
-func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockUpTo *model.Block, peerID, baseURL string, commonAncestorHash *chainhash.Hash, commonAncestorMeta *model.BlockHeaderMeta, offeredHeaders []*model.BlockHeader) error {
-	// Read the local best chain tip once, from the same source used for the work comparison
-	// below, so the depth trigger and the work gate reason about the same tip (they can
-	// momentarily disagree during catchup). If it can't be read we cannot evaluate the fork:
-	// abort this catchup without penalising the peer — uncertainty must not be treated as malice.
-	_, bestMeta, err := u.blockchainClient.GetBestBlockHeader(ctx)
-	if err != nil {
-		u.logger.Warnf("[catchup][%s] cannot read best block header for secret-mining check from peer %s: %v - aborting without flagging malicious", blockUpTo.Hash().String(), baseURL, err)
-		return errors.NewProcessingError("[catchup][%s] unable to read best block header for secret-mining check", blockUpTo.Hash().String(), err)
+func (u *Server) checkSecretMiningFromCommonAncestor(ctx context.Context, blockUpTo *model.Block, peerID, baseURL string, commonAncestorHash *chainhash.Hash, commonAncestorMeta *model.BlockHeaderMeta, bestMeta *model.BlockHeaderMeta, offeredHeaders []*model.BlockHeader) error {
+	// The tip arrives from findCommonAncestor rather than being read again here, so the depth
+	// trigger, the work gate and the ancestor selection all reason about one fixed tip. Re-reading
+	// let them disagree: the ancestor is selected against a tip that may since have moved, and a
+	// decrease would make the ancestor exceed it and trip the height check below, throwing away
+	// a sound catchup over our own local reorg. That trip is reported as a service error, so the
+	// peer is not charged for it, but the catchup is lost all the same. A missing tip means the
+	// caller skipped that step, which is our fault, not the peer's: abort without penalising it.
+	if bestMeta == nil {
+		u.logger.Warnf("[catchup][%s] no best block header for secret-mining check from peer %s - aborting without flagging malicious", blockUpTo.Hash().String(), baseURL)
+		return errors.NewServiceError("[catchup][%s] no best block header available for secret-mining check", blockUpTo.Hash().String())
 	}
 
 	currentHeight := bestMeta.Height
 
-	// Common ancestor should always be at or below current height due to findCommonAncestor
-	// validation. If not, we cannot reason about the fork - abort without penalising the peer.
+	// findCommonAncestor rejects any candidate above this same tip, so this cannot trip while
+	// both steps share one read — it is kept as a guard on that arrangement, and on the uint32
+	// subtraction below. Both heights come from our own blockchain store, so a trip means our
+	// state is inconsistent with itself, never that the peer misbehaved: ServiceError, so the
+	// caller retries locally rather than charging the peer.
 	if commonAncestorMeta.Height > currentHeight {
-		return errors.NewProcessingError("[catchup][%s] common ancestor height %d is ahead of current height %d - this should not happen", blockUpTo.Hash().String(), commonAncestorMeta.Height, currentHeight)
+		return errors.NewServiceError("[catchup][%s] common ancestor height %d is ahead of current height %d - this should not happen", blockUpTo.Hash().String(), commonAncestorMeta.Height, currentHeight)
 	}
 
 	blocksBehind := currentHeight - commonAncestorMeta.Height
