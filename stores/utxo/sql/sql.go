@@ -1617,7 +1617,18 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 	}
 
 	if needsOutputsQuery(bins) {
-		q := `SELECT locking_script, satoshis FROM outputs WHERE transaction_id = $1 ORDER BY idx`
+		// idx is selected and honoured, so tx.Outputs is indexed by vout.
+		// createOutputs skips nil outputs while preserving each survivor's original
+		// index, so a transaction seeded from a UTXO-set snapshot has holes in
+		// outputs.idx. Appending row by row collapsed those holes and shifted every
+		// later output down a slot, which handed callers the wrong output for a vout
+		// with no error: Outputs[1] was the vout-5 output. Consumers already expect
+		// the vout-indexed form, bounds-checking and nil-checking Outputs[vout]
+		// (services/validator/Validator.go, services/alert/node.go,
+		// services/legacy/netsync/handle_block.go), and meta.Data.TxIsSerializable
+		// already refuses a transaction carrying a nil output, which is what gates
+		// the serializing boundaries.
+		q := `SELECT idx, locking_script, satoshis FROM outputs WHERE transaction_id = $1 ORDER BY idx`
 
 		rows, err := s.db.QueryContext(ctx, q, id)
 		if err != nil {
@@ -1626,13 +1637,29 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		defer rows.Close()
 
 		for rows.Next() {
+			var outputIdx int
+
 			output := &bt.Output{}
 
-			if err := rows.Scan(&output.LockingScript, &output.Satoshis); err != nil {
+			if err := rows.Scan(&outputIdx, &output.LockingScript, &output.Satoshis); err != nil {
 				return nil, err
 			}
 
-			tx.Outputs = append(tx.Outputs, output)
+			if outputIdx < 0 {
+				return nil, errors.NewProcessingError("negative output index %d for tx %s", outputIdx, hash.String())
+			}
+
+			// ORDER BY idx, so growth is monotonic and each append is amortised O(1).
+			for len(tx.Outputs) <= outputIdx {
+				tx.Outputs = append(tx.Outputs, nil)
+			}
+
+			tx.Outputs[outputIdx] = output
+		}
+
+		// A truncated read would silently drop outputs off the end of the slice.
+		if err = rows.Err(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -3920,7 +3947,9 @@ func (s *Store) batchDecorateOutputs(ctx context.Context, ids []int, idToTx map[
 	}
 	inClause := "(" + strings.Join(idPlaceholders, ",") + ")"
 
-	q := `SELECT transaction_id, locking_script, satoshis FROM outputs WHERE transaction_id IN ` + inClause + ` ORDER BY transaction_id, idx`
+	// idx is selected and honoured so Outputs is indexed by vout, for the reasons
+	// set out on the single-transaction outputs read in Get.
+	q := `SELECT transaction_id, idx, locking_script, satoshis FROM outputs WHERE transaction_id IN ` + inClause + ` ORDER BY transaction_id, idx`
 
 	rows, err := s.db.QueryContext(ctx, q, idArgs...)
 	if err != nil {
@@ -3929,9 +3958,13 @@ func (s *Store) batchDecorateOutputs(ctx context.Context, ids []int, idToTx map[
 	defer rows.Close()
 
 	for rows.Next() {
-		var txID int
+		var (
+			txID      int
+			outputIdx int
+		)
+
 		output := &bt.Output{}
-		if err := rows.Scan(&txID, &output.LockingScript, &output.Satoshis); err != nil {
+		if err := rows.Scan(&txID, &outputIdx, &output.LockingScript, &output.Satoshis); err != nil {
 			return err
 		}
 
@@ -3940,14 +3973,25 @@ func (s *Store) batchDecorateOutputs(ctx context.Context, ids []int, idToTx map[
 			continue
 		}
 
+		if outputIdx < 0 {
+			return errors.NewProcessingError("negative output index %d for transaction_id %d", outputIdx, txID)
+		}
+
 		// Store outputs in data.Tx temporarily
 		if row.data.Tx == nil {
 			row.data.Tx = &bt.Tx{Version: row.version, LockTime: row.lockTime}
 		}
-		row.data.Tx.Outputs = append(row.data.Tx.Outputs, output)
+
+		// ORDER BY transaction_id, idx, so growth is monotonic per transaction.
+		for len(row.data.Tx.Outputs) <= outputIdx {
+			row.data.Tx.Outputs = append(row.data.Tx.Outputs, nil)
+		}
+
+		row.data.Tx.Outputs[outputIdx] = output
 	}
 
-	return nil
+	// A truncated read would silently drop outputs off the end of the slice.
+	return rows.Err()
 }
 
 // batchDecorateBlockIDs bulk-fetches block_ids for multiple transactions.
@@ -4459,6 +4503,14 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		}
 
 		for vOut, output := range txMeta.Tx.Outputs {
+			if output == nil {
+				// A hole: Outputs is indexed by vout, and a snapshot-seeded
+				// transaction has no row for the vouts already spent when the
+				// snapshot was taken. There is no output to derive a utxo hash from
+				// and nothing to unspend.
+				continue
+			}
+
 			vOutUint32, err := safeconversion.IntToUint32(vOut)
 			if err != nil {
 				return nil, nil, err

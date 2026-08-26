@@ -149,3 +149,76 @@ func TestGetUtxosWithSparseOutputsReportsSpenderAtItsVout(t *testing.T) {
 	require.NotNil(t, data.SpendingDatas[5], "vout 5 should carry the spend")
 	require.True(t, data.SpendingDatas[5].TxID.IsEqual(spendingTx.TxIDChainHash()))
 }
+
+// TestGetTxOutputsAreIndexedByVout is the regression test for the outputs read.
+// createOutputs preserves each surviving output's original index, so appending
+// row by row collapsed the holes and shifted every later output down a slot:
+// Outputs[1] held the vout-5 output. That was a silent wrong answer, not a
+// panic, and it reached every consumer that indexes Outputs by vout.
+func TestGetTxOutputsAreIndexedByVout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := sparseOutputStore(ctx, t, "sparse_outputs_vout")
+	defer func() {
+		require.NoError(t, store.Close(ctx))
+	}()
+
+	tx, txID := sparseOutputTx(t)
+
+	_, _, err := store.SpendAndCreate(ctx, tx, 100, utxo.WithCreateOnly(), utxo.WithTXID(txID))
+	require.NoError(t, err)
+
+	data, err := store.Get(ctx, txID, fields.Tx)
+	require.NoError(t, err)
+	require.NotNil(t, data)
+	require.NotNil(t, data.Tx)
+
+	// Six slots, not the two rows that came back.
+	require.Len(t, data.Tx.Outputs, 6)
+
+	require.NotNil(t, data.Tx.Outputs[0], "vout 0 exists")
+	require.Equal(t, uint64(1000), data.Tx.Outputs[0].Satoshis)
+
+	require.NotNil(t, data.Tx.Outputs[5], "vout 5 exists and must not have shifted to slot 1")
+	require.Equal(t, uint64(2000), data.Tx.Outputs[5].Satoshis)
+
+	// The gap positions are holes, which is the state TxIsSerializable already
+	// tests for and the state every vout-indexing consumer already nil-checks.
+	for _, vout := range []int{1, 2, 3, 4} {
+		require.Nil(t, data.Tx.Outputs[vout], "vout %d does not exist", vout)
+	}
+
+	// A transaction carrying a hole cannot reproduce its own bytes, and the
+	// serializing boundaries gate on exactly this.
+	require.False(t, data.TxIsSerializable())
+}
+
+// TestBatchDecorateTxOutputsAreIndexedByVout covers the same fix on the batch
+// read path, which has its own outputs query.
+func TestBatchDecorateTxOutputsAreIndexedByVout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := sparseOutputStore(ctx, t, "sparse_outputs_vout_batch")
+	defer func() {
+		require.NoError(t, store.Close(ctx))
+	}()
+
+	tx, txID := sparseOutputTx(t)
+
+	_, _, err := store.SpendAndCreate(ctx, tx, 100, utxo.WithCreateOnly(), utxo.WithTXID(txID))
+	require.NoError(t, err)
+
+	items := []*utxo.UnresolvedMetaData{{Hash: *txID, Idx: 0}}
+
+	require.NoError(t, store.BatchDecorate(ctx, items, fields.Tx))
+	require.NoError(t, items[0].Err)
+	require.NotNil(t, items[0].Data)
+	require.NotNil(t, items[0].Data.Tx)
+
+	require.Len(t, items[0].Data.Tx.Outputs, 6)
+	require.NotNil(t, items[0].Data.Tx.Outputs[5])
+	require.Equal(t, uint64(2000), items[0].Data.Tx.Outputs[5].Satoshis)
+	require.Nil(t, items[0].Data.Tx.Outputs[1])
+}
