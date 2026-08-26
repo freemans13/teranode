@@ -2476,13 +2476,25 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// chain will know about it and nobody needs to fetch it again, or the insert
 	// fails and we retry next time we get an inv.
 	//
-	// Only this peer's obligation goes. Any other peer we also asked keeps
-	// theirs, exactly as the per-peer map it replaced did, so a second copy
-	// already on the wire lands as an answer to our own question rather than as
-	// an unrequested block that costs an honest peer its connection. It cannot
-	// hold up a retry for long: the inv path only declines to re-request a block
-	// somebody was asked for within the last blockRequestRetryInterval.
+	// Only this peer's obligation is cancelled. Any other peer we also asked
+	// keeps its ownership, exactly as the per-peer map it replaced did, so a
+	// second copy already on the wire lands as an answer to our own question
+	// rather than as an unrequested block that costs an honest peer its
+	// connection.
 	sm.blockDownloads.RemoveOwner(peer, bmsg.blockHash)
+
+	// What it keeps is the permission, not the debt. Forgiving the rest is what
+	// gives their budget back and makes the hash re-requestable at once, and it
+	// has to happen on every arrival rather than only on a raced one: the
+	// frontier race was the only path that released them, and it returns early
+	// unless this block is the current frontier with a non-empty racer set. A
+	// second owner arises without any race whenever a rewind puts the walk in
+	// front of a block whose owner was asked more than blockRequestRetryInterval
+	// ago and is still transferring, because the skip above no longer covers it
+	// and the assigner is free to hand it to somebody else. Left un-forgiven
+	// that first owner spends an in-flight slot in CountForPeer until its own
+	// copy lands, it disconnects, or the assignment TTL expires an hour later.
+	sm.blockDownloads.ForgiveOwners(bmsg.blockHash, blockRequestRetryInterval)
 
 	// Per-block transient-failure backoff (#1187): if this block recently failed
 	// with a storage/service error, skip the expensive HandleBlockDirect path

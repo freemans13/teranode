@@ -766,7 +766,7 @@ func TestFrontierRace_AFullLedgerDoesNotSuppressTheRaceForever(t *testing.T) {
 
 	// The end state that matters: the race is still available. Make one slot of
 	// room and the very same frontier block must be raced to the very same peer.
-	sm.blockDownloads.Remove(filler[0])
+	sm.blockDownloads.RemoveOwner(syncPeer, filler[0])
 
 	sm.raceFrontierBlock(time.Now())
 
@@ -912,4 +912,59 @@ func TestFrontierRace_NilPeerStatesDoesNotPanic(t *testing.T) {
 		require.False(t, ok, "with no peer states there is nobody to race")
 		require.Nil(t, target)
 	})
+}
+
+// TestHandleBlockMsg_TheOwnersThatDidNotDeliverGetTheirBudgetBack is the release
+// the frontier race had and nothing else did.
+//
+// An arrival discharged only the peer that delivered. The other owners were let
+// off solely by noteRaceWinner, which returns before it reaches ForgiveOwners
+// unless the block is the current frontier and the racer set is non-empty. The
+// walk creates a second owner with no race involved: once a rewind puts the
+// cursor in front of a block whose owner was asked more than
+// blockRequestRetryInterval ago and is still transferring, the retry skip no
+// longer covers it and the assigner is free to hand it to somebody else. That
+// first owner then held a live in-flight slot in CountForPeer until its own copy
+// landed, it disconnected, or the assignment aged out an hour later.
+//
+// The manager here has no frontier and no racers, so the race path is not the
+// one under test. The end state asserted is the ledger's, not the call's: budget
+// back, permission kept, hash immediately re-requestable.
+func TestHandleBlockMsg_TheOwnersThatDidNotDeliverGetTheirBudgetBack(t *testing.T) {
+	running := blockchain2.FSMStateRUNNING
+	blockchainClient := &blockchain2.Mock{}
+	blockchainClient.Mock.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+
+	sm := newRaceManager(t)
+	sm.ctx = context.Background()
+	sm.blockchainClient = blockchainClient
+
+	slow, _, _ := connectRacePeer(t, 76, 1000)
+	registerRacePeer(sm, slow)
+
+	deliverer, _, _ := connectRacePeer(t, 77, 1000)
+	registerRacePeer(sm, deliverer)
+
+	hash := chainhash.Hash{0x7a}
+	require.True(t, sm.blockDownloads.Add(slow, hash))
+	require.True(t, sm.blockDownloads.Add(deliverer, hash))
+	require.Equal(t, 1, sm.blockDownloads.CountForPeer(slow))
+
+	sm.frontierMu.Lock()
+	noFrontier := sm.frontierHash != hash && len(sm.frontierRacers) == 0
+	sm.frontierMu.Unlock()
+	require.True(t, noFrontier, "sanity: the race path must not be what releases the slow peer here")
+
+	// Carrying no block makes handleBlockMsg bail just past the discharge, so
+	// the error only says it got that far.
+	require.Error(t, sm.handleBlockMsg(&blockQueueMsg{blockHash: hash, peer: deliverer}))
+
+	require.Zero(t, sm.blockDownloads.CountForPeer(deliverer),
+		"the peer that answered no longer owes the block")
+	require.Zero(t, sm.blockDownloads.CountForPeer(slow),
+		"the peer that did not answer must stop spending an in-flight slot on a block already in hand")
+	require.True(t, sm.blockDownloads.HasOwner(slow, hash),
+		"it keeps permission to deliver, so a copy already on the wire is admitted rather than costing it its association")
+	require.False(t, sm.blockDownloads.RequestedWithin(hash, blockRequestRetryInterval),
+		"and the hash is re-requestable at once, which is what a rewind onto a rejected block needs")
 }

@@ -175,7 +175,7 @@ func TestSyncManager_AFreedInFlightSlotIsToppedUpMidRound(t *testing.T) {
 	// committed — it was parked, which releases the peer's obligation and puts
 	// nothing in the chain. It is not the front, so the walk is not moved on by
 	// it and nothing else will notice the free slot.
-	sm.blockDownloads.Remove(chain[1])
+	sm.blockDownloads.RemoveOwner(syncPeer, chain[1])
 
 	next := chain[requested]
 
@@ -265,7 +265,7 @@ func TestSyncManager_AGivenUpBlockAfterACheckpointTransitionIsAskedForAgain(t *t
 
 		// Parking releases the delivering peer's obligation: the block stops
 		// being outstanding, and nothing has gone into the chain for it.
-		sm.blockDownloads.Remove(hash)
+		sm.blockDownloads.RemoveOwner(syncPeer, hash)
 	}
 
 	require.True(t, sawCheckpoint, "the round must reach its checkpoint, or there is no transition to test")

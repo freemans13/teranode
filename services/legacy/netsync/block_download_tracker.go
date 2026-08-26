@@ -276,7 +276,9 @@ func (t *blockDownloadTracker) OwnersOf(h chainhash.Hash) []*peerpkg.Peer {
 // peers it let off. Ownership is kept, so a copy still on the wire from any of
 // them is still admitted; only the obligation goes.
 //
-// This is what a delivered race needs. Cancelling the other owners outright was
+// This is what every delivery needs, raced or not: handleBlockMsg cancels the
+// obligation of the peer that answered and forgives whoever else was asked.
+// Cancelling the other owners outright was
 // the obvious thing and it was wrong in both directions: it freed their budget,
 // which is what the cancel was for, but it also revoked their permission to
 // deliver — so a copy arriving afterwards looked unrequested and cost an honest
@@ -347,19 +349,6 @@ func (t *blockDownloadTracker) RequestedWithin(h chainhash.Hash, maxAge time.Dur
 	}
 
 	return false
-}
-
-// Remove drops block h entirely, whoever was asked for it. Used when the block
-// has arrived and nobody's copy is wanted any more.
-func (t *blockDownloadTracker) Remove(h chainhash.Hash) {
-	if t == nil {
-		return
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.removeHashLocked(h)
 }
 
 // RemoveOwner cancels just this peer's obligation for block h and leaves any
@@ -592,21 +581,6 @@ func (t *blockDownloadTracker) removeOwnerFromHashLocked(p *peerpkg.Peer, h chai
 	if len(owners) == 0 {
 		delete(t.byHash, h)
 	}
-}
-
-// removeHashLocked drops a block and every peer that owed it.
-func (t *blockDownloadTracker) removeHashLocked(h chainhash.Hash) {
-	for p := range t.byHash[h] {
-		if hashes, ok := t.byPeer[p]; ok {
-			delete(hashes, h)
-
-			if len(hashes) == 0 {
-				delete(t.byPeer, p)
-			}
-		}
-	}
-
-	delete(t.byHash, h)
 }
 
 // maybeSweepLocked drops aged-out assignments if a sweep is due. Sweeping runs

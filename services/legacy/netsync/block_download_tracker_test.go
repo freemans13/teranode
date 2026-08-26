@@ -92,9 +92,14 @@ func TestBlockDownloadTracker_MultipleOwnersPerHash(t *testing.T) {
 	require.Equal(t, 0, tr.CountForPeer(p1))
 	require.Equal(t, 1, tr.PeersWithDownloads())
 
-	// The block arriving drops it for everybody.
-	tr.Remove(h)
-	require.False(t, tr.HasOwner(p2, h))
+	// The block arriving forgives whoever is left. Their budget comes back and
+	// the hash is re-requestable at once, but they keep the permission to
+	// deliver, so a copy already on the wire is admitted rather than costing an
+	// honest peer its association. Dropping the hash outright would do the first
+	// half and undo the second, which is why nothing does it.
+	tr.ForgiveOwners(h, blockRequestRetryInterval)
+	require.True(t, tr.HasOwner(p2, h), "a forgiven owner may still deliver its copy")
+	require.Zero(t, tr.CountForPeer(p2), "a forgiven owner spends none of its in-flight budget")
 	require.Zero(t, tr.Len())
 	require.Zero(t, tr.PeersWithDownloads())
 }
@@ -203,7 +208,7 @@ func TestBlockDownloadTracker_NilIsSafeAndFailsClosed(t *testing.T) {
 
 	require.NotPanics(t, func() {
 		tr.Add(p, h)
-		tr.Remove(h)
+		require.Nil(t, tr.ForgiveOwners(h, blockRequestRetryInterval))
 		tr.RemoveOwner(p, h)
 		tr.ClearPeer(p)
 		require.Nil(t, tr.ForgetForRetryPeer(p, blockRequestRetryInterval))
