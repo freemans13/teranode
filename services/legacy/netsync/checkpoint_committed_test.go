@@ -265,3 +265,51 @@ func TestSyncManager_ACheckpointCommittedWithNothingLeftToReachIsANoOp(t *testin
 	require.Zero(t, rec.getBlocksCount(), "nothing to ask for")
 	require.False(t, rec.askedForHeadersUpTo(*first.Hash))
 }
+
+// TestSyncManager_ADeferredRoundIsDroppedOnceItHasBeenAskedFor pins the guard on
+// the replay. A deferred round is only still owed while the checkpoint it
+// belongs to has not moved; replaying one whose round has already been asked for
+// would advance the checkpoint a second time and skip a whole round of headers,
+// and nothing recovers a skipped round.
+//
+// Nothing in the tree advances the checkpoint except the transition itself, so
+// this branch cannot fire today. It is pinned because the failure it prevents is
+// silent and unrecoverable, while the failure it risks, repeating a transition,
+// is free.
+func TestSyncManager_ADeferredRoundIsDroppedOnceItHasBeenAskedFor(t *testing.T) {
+	sm, first, final := newCheckpointManager(t)
+	sm.headersFirstMode.Store(true)
+
+	require.NoError(t, sm.checkpointBlockCommitted(nil, *first.Hash))
+	require.NotNil(t, sm.pendingCheckpoint.Load(), "sanity: the round is owed")
+
+	// Something else asks for the round and moves the checkpoint on.
+	sm.headerMu.Lock()
+	sm.nextCheckpoint = &final
+	sm.headerMu.Unlock()
+
+	peer, _ := connectHeaderRequestPeer(t, 118)
+	sm.storeSyncPeer(peer, &syncPeerState{})
+
+	sm.drainPendingCheckpoint()
+
+	require.Nil(t, sm.pendingCheckpoint.Load(), "a round already asked for must be dropped, not held")
+
+	cp := sm.nextCheckpointSnapshot()
+	require.NotNil(t, cp, "the checkpoint must not be advanced a second time, which past the last one leaves headers-first mode")
+	require.Equal(t, final.Height, cp.Height, "the checkpoint must not be advanced a second time")
+}
+
+// TestSyncManager_ACheckpointWithNothingLeftToReachDefersNothing is the peerless
+// half of TestSyncManager_ACheckpointCommittedWithNothingLeftToReachIsANoOp.
+// Past the last checkpoint there is no round to ask for, so there is nothing to
+// defer either and the ticker must not be left carrying one.
+func TestSyncManager_ACheckpointWithNothingLeftToReachDefersNothing(t *testing.T) {
+	sm, first, _ := newCheckpointManager(t)
+	sm.nextCheckpoint = nil
+	sm.headersFirstMode.Store(true)
+
+	require.NoError(t, sm.checkpointBlockCommitted(nil, *first.Hash))
+
+	require.Nil(t, sm.pendingCheckpoint.Load(), "there is no round left to ask for")
+}

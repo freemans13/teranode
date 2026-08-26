@@ -791,7 +791,7 @@ type SyncManager struct {
 	// it, and the two run on different goroutines — the block-queue consumer
 	// drains the park, the sync-peer ticker elects — so it is atomic and is
 	// read with a Swap. Nil means there is no round owing.
-	pendingCheckpoint atomic.Pointer[chainhash.Hash]
+	pendingCheckpoint atomic.Pointer[deferredCheckpoint]
 	// currentCached is the last answer current() worked out, so a peer goroutine
 	// can read it without making the blockchain call itself. See IsCurrentCached.
 	currentCached atomic.Bool
@@ -2978,10 +2978,22 @@ func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash ch
 		// again — see anchorIsStillTheFrontLocked.
 		sm.headerMu.Lock()
 		sm.markCheckpointAnchorLocked(blockHash)
+		owed := sm.nextCheckpoint
 		sm.headerMu.Unlock()
 
-		stored := blockHash
-		sm.pendingCheckpoint.Store(&stored)
+		// Past the last checkpoint there is no round to ask for and nothing to
+		// defer: the peer-less arm of that case is a no-op, exactly as it is
+		// with a peer.
+		if owed == nil {
+			return nil
+		}
+
+		// The checkpoint this round belongs to travels with the hash, so the
+		// replay can tell whether it is still owed. Nothing else advances the
+		// checkpoint, but if something did the replay would otherwise skip a
+		// round rather than repeat one, which is the direction that loses
+		// headers.
+		sm.pendingCheckpoint.Store(&deferredCheckpoint{hash: blockHash, at: owed})
 
 		sm.logger.Warnf("[checkpointBlockCommitted][%s] checkpoint reached with no peer to ask for the next round of headers; the round is deferred until one is elected", blockHash)
 
@@ -3056,6 +3068,15 @@ func (sm *SyncManager) markCheckpointAnchorLocked(blockHash chainhash.Hash) {
 	}
 }
 
+// deferredCheckpoint is a checkpoint transition that reached its block but could
+// not ask for the round of headers that follows it, because there was no peer to
+// ask. at is the checkpoint that was still owed at the moment the block
+// committed, kept so the replay can tell the round has not been asked for since.
+type deferredCheckpoint struct {
+	hash chainhash.Hash
+	at   *chaincfg.Checkpoint
+}
+
 // drainPendingCheckpoint replays a checkpoint transition that could not be made
 // because there was no peer to ask, now that the sync-peer check has had its
 // chance to elect one.
@@ -3073,22 +3094,33 @@ func (sm *SyncManager) markCheckpointAnchorLocked(blockHash chainhash.Hash) {
 // and if there is still nobody to ask, checkpointBlockCommitted puts it straight
 // back for the next tick.
 func (sm *SyncManager) drainPendingCheckpoint() {
-	hash := sm.pendingCheckpoint.Swap(nil)
-	if hash == nil {
+	pending := sm.pendingCheckpoint.Swap(nil)
+	if pending == nil {
+		return
+	}
+
+	// The round is only still owed while the checkpoint has not moved. Nothing
+	// else advances it today, so this cannot currently fire; it is here because
+	// replaying a transition whose round has already been asked for would
+	// advance the checkpoint a second time and skip a round of headers, and a
+	// skipped round is not recoverable by anything.
+	if cp := sm.nextCheckpointSnapshot(); cp == nil || pending.at == nil || cp.Height != pending.at.Height {
+		sm.logger.Infof("[drainPendingCheckpoint][%s] the deferred round has already been asked for, dropping it", pending.hash)
+
 		return
 	}
 
 	peer := sm.loadSyncPeer()
 	if peer == nil {
-		sm.pendingCheckpoint.Store(hash)
+		sm.pendingCheckpoint.Store(pending)
 
 		return
 	}
 
-	sm.logger.Infof("[drainPendingCheckpoint][%s] a peer is available, asking for the round of headers the checkpoint deferred", *hash)
+	sm.logger.Infof("[drainPendingCheckpoint][%s] a peer is available, asking for the round of headers the checkpoint deferred", pending.hash)
 
-	if err := sm.checkpointBlockCommitted(peer, *hash); err != nil {
-		sm.logger.Errorf("[drainPendingCheckpoint][%s] deferred checkpoint transition failed: %v", *hash, err)
+	if err := sm.checkpointBlockCommitted(peer, pending.hash); err != nil {
+		sm.logger.Errorf("[drainPendingCheckpoint][%s] deferred checkpoint transition failed: %v", pending.hash, err)
 	}
 }
 
