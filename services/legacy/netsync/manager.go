@@ -3090,9 +3090,9 @@ type deferredCheckpoint struct {
 //
 // Called from handleCheckSyncPeer, which runs on the sync-peer ticker, while the
 // nil-peer arm is written from the block-queue consumer that drains the park.
-// The Swap is what makes that safe: whichever goroutine takes the hash owns it,
-// and if there is still nobody to ask, checkpointBlockCommitted puts it straight
-// back for the next tick.
+// The Swap is what makes that safe: whichever goroutine takes the round owns it.
+// If this tick's election still produced nobody, this function puts the round
+// straight back for the next one.
 func (sm *SyncManager) drainPendingCheckpoint() {
 	pending := sm.pendingCheckpoint.Swap(nil)
 	if pending == nil {
