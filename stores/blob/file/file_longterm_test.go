@@ -196,8 +196,12 @@ func TestFileLongtermMissIsNotFound(t *testing.T) {
 	t.Run("a miss in the longterm backend stays ErrNotFound", func(t *testing.T) {
 		// A real backend, not a fake asserting what we want: the memory store
 		// reports a miss the same way the s3 store does, as ErrNotFound rather
-		// than os.ErrNotExist.
-		f := newStore(t, memory.New())
+		// than os.ErrNotExist. It owns a TTL-cleaner goroutine, so the test owns
+		// closing it: this package gates on goroutine leaks.
+		longterm := memory.New()
+		t.Cleanup(func() { require.NoError(t, longterm.Close(context.Background())) })
+
+		f := newStore(t, longterm)
 
 		_, err := f.Get(context.Background(), []byte("absent-key"), fileformat.FileTypeTesting)
 		require.Error(t, err)
