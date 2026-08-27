@@ -178,10 +178,17 @@ func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash
 		if ok {
 			// The stored meta spares our own future validations the regenerator
 			// entirely, but the file the asset service serves is subtree_data, not the
-			// meta. Nothing on the validation path rewrites it before its DAH expires:
-			// the only other writer that can replace it is catchup's
-			// fetchAndStoreSubtreeData, which runs on a different path and would have
-			// to fetch this subtree again to get there.
+			// meta, and nothing on this path rewrites it before its DAH expires.
+			//
+			// Three other writers exist and none of them is a reason to skip this.
+			// blockvalidation's catchup fetchAndStoreSubtreeData would have to fetch
+			// this subtree again to get there. blockpersister's
+			// streaming_process_subtree deletes an unreadable file and writes a fresh
+			// one, but only when the block reaches persistence, and it judges the file
+			// by whether it deserializes rather than by whether it filled every node,
+			// so a short-but-parseable body survives it. The asset service regenerates
+			// a MISSING file on demand and does nothing about a present bad one, which
+			// is the whole reason this repair exists.
 			if localPoisoned {
 				r.repairLocalSubtreeData(ctx, subtreeHash, peerData)
 			}
