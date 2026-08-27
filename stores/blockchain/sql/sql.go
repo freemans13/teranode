@@ -1692,8 +1692,9 @@ func (s *SQL) rebuildOnMainChainFlagTx(ctx context.Context, full bool) (err erro
 //
 // The in-memory route in checkBlockIsInCurrentChainInMemory reads absence from this
 // set as positive proof of main-chain membership: an id at or below maxBlockID that is
-// not in here is answered "on the main chain" with no query at all. Three things have
-// to hold for that to be sound, and every caller of this function owes them.
+// not in here is answered "on the main chain" with no query at all. Three conditions have
+// to hold for that to be sound, and every caller of this function owes them. The two
+// paragraphs after them elaborate on the second.
 //
 // Every committed block is classified. The queries above enumerate the complement of
 // the main chain over the whole blocks table, so after a rebuild every committed id is
@@ -1708,6 +1709,14 @@ func (s *SQL) rebuildOnMainChainFlagTx(ctx context.Context, full bool) (err erro
 // disagree. TestCheckBlockIsInCurrentChain_GapIDDivergesBetweenRoutes writes that
 // divergence down, and blockchain_chain_check_shadow_compare is what would catch it on
 // a live node.
+//
+// A block moving off the main chain is invisible to readers until this set has caught
+// up. maxBlockID is advanced before the rebuild runs, so between the two a freshly
+// forked or invalidated block is inside the id<=maxBlockID range but not yet in this
+// set, and the in-memory route would answer true for it. Callers close that window by
+// holding mainChainRebuilding across BOTH the flag change and the rebuild, which sends
+// readers to the flag-free CTE for the whole of it. StoreBlock, InvalidateBlock and
+// RevalidateBlock all do; a new caller that mutates on_main_chain must too.
 //
 // Block validation is not the only asker, so a gap id would not stay inside consensus.
 // The asset server's GetTransactionMeta and merkle-proof handlers call this with the
@@ -1727,14 +1736,6 @@ func (s *SQL) rebuildOnMainChainFlagTx(ctx context.Context, full bool) (err erro
 // so the node restarts with maxBlockID back at the surviving MAX(id) and the deleted ids
 // land above the bound where they are dropped. An in-process caller of DeleteBlock would
 // break that, and would need maxBlockID recomputed rather than advanced.
-//
-// A block moving off the main chain is invisible to readers until this set has caught
-// up. maxBlockID is advanced before the rebuild runs, so between the two a freshly
-// forked or invalidated block is inside the id<=maxBlockID range but not yet in this
-// set, and the in-memory route would answer true for it. Callers close that window by
-// holding mainChainRebuilding across BOTH the flag change and the rebuild, which sends
-// readers to the flag-free CTE for the whole of it. StoreBlock, InvalidateBlock and
-// RevalidateBlock all do; a new caller that mutates on_main_chain must too.
 //
 // The set itself is replaced wholesale under offChainBlockIDsMu and never mutated in
 // place, so a reader may snapshot the map pointer under RLock and then read it without
