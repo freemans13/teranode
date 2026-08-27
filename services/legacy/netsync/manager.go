@@ -3552,6 +3552,35 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	headerListLen := sm.headerList.Len()
 	sm.headerMu.Unlock()
 
+	// Record which block everything behind it is now waiting on, so the race
+	// timer can tell how long it has been outstanding. Deferred rather than
+	// written at the end, because EVERY exit from this walk has to publish and
+	// two of them are early returns.
+	//
+	// The early returns are the ones that matter. newDownloadAssigner answers nil
+	// when there is no eligible peer, when the node-wide download window is
+	// spent, or when every eligible peer is at its per-peer cap, and all three
+	// mean blocks are outstanding and undelivered — which is precisely the state
+	// raceFrontierBlock exists to rescue. Returning without publishing left the
+	// race with no target, so the one block holding up sync was never asked of a
+	// second peer, nothing committed, the assigner stayed nil, and the walk never
+	// published again. A mainnet soak wedged there permanently. The other two
+	// publish sites cannot cover it: the one in advanceHeaderListFor fires only
+	// when a block commits and the list front moves, and the one in
+	// rewindHeaderCursor only on a successful rewind.
+	//
+	// Self-locking form, and safe as a defer for the same reason it was safe at
+	// the end: headerMu is released above and every helper below takes and
+	// releases it internally, so the function always returns with it released.
+	// The publish-after-send order is unchanged, since the defer runs after
+	// assigner.send. time.Now() is read inside the closure so the frontier is
+	// timestamped when it is published, not when the walk started.
+	//
+	// This publishes what is stuck; it does not invent one. publishFrontierLocked
+	// still clears the frontier when the front block has not been asked for yet,
+	// which is right: nothing is waiting on a block nobody requested.
+	defer func() { sm.publishFrontier(time.Now()) }()
+
 	// Nothing to do if there is no start header.
 	if !haveStartHeader {
 		sm.logger.Warnf("fetchHeaderBlocks called with no start header")
@@ -3604,14 +3633,8 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	}
 
 	// One send per peer that got work, and every one of them with headerMu
-	// released.
+	// released. The deferred publishFrontier above runs after this.
 	assigner.send(sm)
-
-	// Record which block everything behind it is now waiting on, so the race
-	// timer can tell how long it has been outstanding. Self-locking form: the
-	// walk above has already released headerMu, and the publish-after-send
-	// order is unchanged.
-	sm.publishFrontier(time.Now())
 }
 
 // lookaheadCeilingLocked returns the highest block height this round may ask for,
