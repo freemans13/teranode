@@ -174,6 +174,17 @@ SELECT c.relname,
 // of which transactions had an output spent in that window, which is precisely the work
 // list a later session step reads to decide what is now fully spent.
 func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint32) (int, error) {
+	return s.dropSpendJournalPartitionsBelow(ctx, height, nil)
+}
+
+// dropSpendJournalPartitionsBelow reclaims journal leaves below height, calling before on each
+// one first.
+//
+// The callback is where the pruner reads the retiring partition as its work list. The ordering
+// is not a preference: dropping the partition destroys the record of which transactions had an
+// output spent in that window, which is the only place that fact is written down.
+func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint32,
+	before func(context.Context, string) error) (int, error) {
 	rows, err := s.pool.Query(ctx, journalLeafSQL)
 	if err != nil {
 		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
@@ -214,6 +225,12 @@ func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint
 
 		if leaf >= cutoff {
 			continue
+		}
+
+		if before != nil {
+			if err := before(ctx, l.name); err != nil {
+				return dropped, err
+			}
 		}
 
 		switch {

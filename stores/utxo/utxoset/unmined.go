@@ -38,13 +38,22 @@ func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chai
 	return nil, nil
 }
 
-// PreserveTransactions is meaningless here, not merely unimplemented, and that is the
-// stronger claim.
+// PreserveTransactions stays a no-op, but the reason has CHANGED and the old one is no
+// longer true.
 //
-// Preservation exists to stop a pruner deleting a parent transaction that a live unmined
-// child still needs. This store has no pruner (see pruner.go) and never deletes an
-// unspent output: the only DELETE it issues is the one that spends a coin, authorised by
-// the spend itself. There is nothing to preserve anything from.
+// It used to be that this store had no reclaimer and never deleted an unspent output, so
+// there was nothing to preserve anything from. That stopped being true the day tx_ident
+// gained a reclaimer.
+//
+// The new justification is the settled rule, and it is stronger. Preservation exists to stop
+// a reclaimer deleting a parent that a live unmined child still needs, and it does that with
+// a timer: extend the parent's life by 1,440 blocks and hope the child is mined inside it.
+// The reclaimer here does not need the hope, because it consults the spender's status at the
+// moment of the decision rather than racing a clock. It deletes a parent only when every
+// transaction that spent it is buried past the depth at which the node could un-mine it, so
+// there is no window in which preservation would have helped.
+//
+// If anyone ever weakens that rule, this comment must stop claiming the no-op is safe.
 func (s *Store) PreserveTransactions(_ context.Context, _ []chainhash.Hash, _ uint32) error {
 	return nil
 }

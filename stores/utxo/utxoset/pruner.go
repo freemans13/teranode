@@ -53,21 +53,56 @@ func (journalPruner) Start(_ context.Context) {}
 // the journal drop stays last: dropping a leaf destroys the record of which transactions
 // had an output spent in that window, which is the work list the step reads.
 func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int64, error) {
+	// The body horizon and the journal horizon are DIFFERENT numbers, 288 against 1440, so
+	// the two reclaims must not be gated behind one another. Doing so left the bodies
+	// unreclaimed for the whole of early sync, which is exactly when the disk is tightest.
+	bodies, err := p.store.dropTxBodyWindowsBelow(ctx, height)
+	if err != nil {
+		return 0, err
+	}
+
+	if bodies > 0 {
+		p.store.logger.Infof("[utxoset] pruner dropped %d transaction-body windows past the %d-block horizon",
+			bodies, p.store.bodyRetention)
+	}
+
 	if height <= p.store.journalRetention {
 		return 0, nil
 	}
 
 	cutoff := height - p.store.journalRetention
 
-	dropped, err := p.store.DropSpendJournalPartitionsBelow(ctx, cutoff)
+	// The session, in the one order that is safe.
+	//
+	// Each retiring journal partition is read as a work list BEFORE it is dropped, because
+	// dropping it destroys the record of which transactions had an output spent in that
+	// window. Then the partition goes. Then the body windows past their own horizon go.
+	var reclaimed int
+
+	dropped, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff,
+		func(ctx context.Context, partition string) error {
+			n, rerr := p.store.reclaimFromPartition(ctx, partition, height)
+			if rerr != nil {
+				return rerr
+			}
+
+			reclaimed += n
+
+			return nil
+		})
 	if err != nil {
 		return 0, err
 	}
 
-	if dropped > 0 {
-		p.store.logger.Infof("[utxoset] reclaimed %d spend-journal leaves below height %d", dropped, cutoff)
+	if dropped > 0 || reclaimed > 0 {
+		p.store.logger.Infof("[utxoset] pruner reclaimed %d transaction rows and dropped %d spend-journal leaves below height %d",
+			reclaimed, dropped, cutoff)
 	}
 
+	// Still zero records processed, and still exact. The caller adds this to a counter of
+	// child transaction records deleted by a delete-at-height sweep, which this store does
+	// not have. Reporting identity rows or body windows there would put three units in one
+	// metric; they are logged above instead.
 	return 0, nil
 }
 

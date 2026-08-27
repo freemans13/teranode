@@ -70,3 +70,81 @@ ALTER TABLE tx_body_w%[1]d ALTER COLUMN raw_tx SET STORAGE EXTERNAL;`, window, l
 
 	return nil
 }
+
+// txBodyWindowSQL lists the body windows this store owns, resolved through regclass so it
+// finds windows of the SAME table the DROP below will name. Matching on a bare name would
+// search every schema in the database, and an unqualified drop would then resolve against the
+// search path and fail, aborting the loop before a single real window went.
+const txBodyWindowSQL = `
+SELECT c.relname
+  FROM pg_class c
+  JOIN pg_inherits i ON i.inhrelid = c.oid
+ WHERE i.inhparent = 'tx_body'::regclass`
+
+// dropTxBodyWindowsBelow discards the serialized transaction bytes that have aged out.
+//
+// The height passed in is the pruner service's clock, which by default is the last height the
+// block persister has archived rather than the chain tip. That matters: the persister is the
+// only producer of the permanent archive for a block this node mined, and the store's copy of
+// the bytes is its only source. Dropping ahead of it would wedge it permanently, with no
+// fallback. If pruner_force_ignore_block_persister_height is ever set, that protection is
+// gone and this becomes unsafe.
+func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int, error) {
+	if height <= s.bodyRetention {
+		return 0, nil
+	}
+
+	cutoff := (height - s.bodyRetention) / TxBodyPartitionBlocks
+
+	rows, err := s.pool.Query(ctx, txBodyWindowSQL)
+	if err != nil {
+		return 0, errors.NewStorageError("[utxoset] list tx_body windows", err)
+	}
+
+	var names []string
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return 0, errors.NewStorageError("[utxoset] scan tx_body window", err)
+		}
+
+		names = append(names, name)
+	}
+
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return 0, errors.NewStorageError("[utxoset] list tx_body windows", err)
+	}
+
+	dropped := 0
+
+	for _, name := range names {
+		var window uint32
+		if _, err := fmt.Sscanf(name, "tx_body_w%d", &window); err != nil {
+			continue
+		}
+
+		if window >= cutoff {
+			continue
+		}
+
+		// Detach without blocking readers, then drop the now-standalone table. A bare drop
+		// on an attached partition briefly takes an exclusive lock on the parent, which
+		// would stall every concurrent create.
+		if _, err := s.pool.Exec(ctx,
+			fmt.Sprintf(`ALTER TABLE tx_body DETACH PARTITION %s CONCURRENTLY`, name)); err != nil {
+			return dropped, errors.NewStorageError("[utxoset] detach tx_body window %s", name, err)
+		}
+
+		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, name)); err != nil {
+			return dropped, errors.NewStorageError("[utxoset] drop tx_body window %s", name, err)
+		}
+
+		dropped++
+	}
+
+	return dropped, nil
+}
