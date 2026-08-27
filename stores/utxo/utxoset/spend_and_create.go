@@ -33,14 +33,13 @@ import (
 // there is nothing to leave in place and nothing to undo, and a ROLLBACK reaches the
 // same state a COMMIT would. Every path here is genuinely atomic.
 //
-// NOTE this store cannot yet reach that branch at all, and the reason is a real gap
-// rather than a subtlety. Delete-on-spend has no spends row carrying spending_data, so
-// a duplicate transaction arrives as per-input ErrSpent from the DELETE affecting zero
-// rows -- indistinguishable from a genuine double-spend -- and never reaches the create
-// phase to report ErrTxExists. Duplicate detection therefore has to happen BEFORE the
-// spend: the applied_block ledger covers block application, and a mempool duplicate
-// needs tx_meta. Until both exist, this store does not implement the ErrTxExists
-// contract; it does not fake it either.
+// The store reaches that branch through tx_ident's primary key. Delete-on-spend has no
+// spends row carrying spending_data, so a duplicate arrives as per-input ErrSpent from a
+// DELETE affecting zero rows, which is indistinguishable from a genuine double spend.
+// Identity answers it instead: the claim in createIn either inserts the row or reports
+// that someone already holds this txid, and it does so without writing a coin row. One
+// mechanism covers both arrival paths, the re-applied block and the duplicate mempool
+// submission, which is what retires the applied_block ledger.
 func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
 	options := &utxo.CreateOptions{}
@@ -116,15 +115,33 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	}
 
 	data, err := s.createIn(ctx, dbTx, tx, blockHeight, opts...)
-	if err != nil {
+
+	// ErrTxExists is NOT a failure to roll back, and treating it as one is the defect this
+	// ordering exists to avoid.
+	//
+	// The interface says the error is returned "with the spends left in place"
+	// (Interface.go:433-435), and the returned slice is the signal (:441-443). Both block
+	// application paths create every transaction in one pass and spend the inputs in a
+	// separate pass, so a transaction can genuinely be present while its own inputs are
+	// still unspent. Rolling back here would tell the caller "already have it, nothing to
+	// do" while the parent coins stayed live and spendable by anyone else, which makes a
+	// double spend mineable by this node. The claim itself wrote nothing, so committing
+	// keeps the spends and nothing else.
+	txExists := errors.Is(err, errors.ErrTxExists)
+
+	if err != nil && !txExists {
 		return nil, spends, err
 	}
 
-	if err = dbTx.Commit(ctx); err != nil {
-		return nil, spends, errors.NewStorageError("[utxoset][SpendAndCreate] commit", err)
+	if cerr := dbTx.Commit(ctx); cerr != nil {
+		return nil, spends, errors.NewStorageError("[utxoset][SpendAndCreate] commit", cerr)
 	}
 
 	committed = true
+
+	if txExists {
+		return nil, spends, err
+	}
 
 	return data, spends, nil
 }

@@ -2,11 +2,14 @@ package utxoset
 
 import (
 	"context"
+	"encoding/binary"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/jackc/pgx/v5"
 )
 
 // createSQL inserts one row per SPENDABLE output.
@@ -20,6 +23,76 @@ const createSQL = `
 INSERT INTO utxo (satoshis, created_height, spendable_from, leaf, flags, ukey, txid, script)
 SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[], $4::smallint[], $5::smallint[],
                      $6::uuid[], $7::bytea[], $8::bytea[])`
+
+// claimSQL inserts the identity row and reports whether THIS caller inserted it.
+//
+// ON CONFLICT names (leaf, txid) and not (txid): a partitioned parent rejects the shorter
+// form with "there is no unique or exclusion constraint matching the ON CONFLICT
+// specification". And the answer comes back through RETURNING rather than by letting the
+// uniqueness violation raise, because inside a pgx batch a raised error aborts every later
+// statement in the batch -- see commit d648732a9 in this repository.
+//
+// created_height is NOT updated on conflict. The first sighting wins, because it is
+// tx_body's filing address and moving it would strand the body.
+const claimSQL = `
+INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
+                      fee, size_in_bytes, tx_inpoints, locktime, created_at, flags)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (leaf, txid) DO NOTHING
+RETURNING 1`
+
+// packMembership renders mined-block information into the packed form tx_ident carries:
+// 12-byte triples of block id, block height and subtree index, big-endian, in the order the
+// caller supplied. Insertion order is load-bearing -- the conformance suite requires subtree
+// indexes to come back in the order they were written rather than sorted.
+func packMembership(infos []utxo.MinedBlockInfo) []byte {
+	if len(infos) == 0 {
+		return nil
+	}
+
+	b := make([]byte, 0, len(infos)*12)
+
+	for _, mi := range infos {
+		var e [12]byte
+
+		binary.BigEndian.PutUint32(e[0:4], mi.BlockID)
+		binary.BigEndian.PutUint32(e[4:8], mi.BlockHeight)
+		binary.BigEndian.PutUint32(e[8:12], uint32(mi.SubtreeIdx)) //nolint:gosec // subtree index is never negative
+
+		b = append(b, e[:]...)
+	}
+
+	return b
+}
+
+// offChainSinceAt decides whether a newly created transaction belongs in the mempool set.
+//
+// The rule is NOT "was mined-block information supplied". It is "has anyone told us a
+// MAIN-CHAIN block contains this". The distinction is the whole point, and getting it wrong
+// is a live bug in the reference stores.
+//
+// A block-application create passes the block's mined info but leaves OnLongestChain false,
+// because at create time the block is still being validated and its chain status is
+// genuinely unknown. Clearing the marker on that basis gives a transaction from a block that
+// later loses fork-only membership and no marker, so it reads as mined, and once that block
+// is 288 deep it reads as SETTLED despite never having been on the main chain. Block
+// assembly repairs that at reset today; a reclaimer would delete the parent first and make
+// it unrepairable.
+//
+// Marking it and letting the mined stamp clear it fails in the safe direction: a transaction
+// wrongly in the mempool set is narrowed out on the next reload by machinery that already
+// runs.
+func offChainSinceAt(infos []utxo.MinedBlockInfo, blockHeight uint32) *int32 {
+	for _, mi := range infos {
+		if mi.OnLongestChain && !mi.UnsetMined {
+			return nil
+		}
+	}
+
+	h := int32(blockHeight) //nolint:gosec // block height fits int32 for any reachable chain
+
+	return &h
+}
 
 // Create records a transaction's spendable outputs in the UTXO table.
 //
@@ -118,6 +191,31 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		ukeys = append(ukeys, Pack(txHash[:], uint32(vout)))
 		txids = append(txids, txHash[:])
 		scripts = append(scripts, script)
+	}
+
+	// THE CLAIM, and it must come before the coin rows.
+	//
+	// The UTXO table's key is a non-unique 96-bit prefix, so it can never reject a
+	// duplicate. Identity does that, and it has to do it BEFORE any output is written or
+	// the duplicate has already been applied. This is what retires the applied_block
+	// ledger: a block arriving twice becomes a no-op transaction by transaction, and a
+	// duplicate mempool submission is covered by the same mechanism rather than being
+	// left unimplemented.
+	var claimed int
+
+	err := q.QueryRow(ctx, claimSQL,
+		leaf, txHash[:], int32(blockHeight), offChainSinceAt(options.MinedBlockInfos, blockHeight),
+		packMembership(options.MinedBlockInfos),
+		nil, int32(tx.Size()), nil, int32(tx.LockTime), time.Now().UnixMilli(), flags,
+	).Scan(&claimed)
+
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// Someone already holds this txid. Nothing of ours was written, so there is
+		// nothing to undo.
+		return nil, errors.NewTxExistsError("[utxoset][Create] %s", txHash.String())
+	case err != nil:
+		return nil, errors.NewStorageError("[utxoset][Create] claim %s", txHash.String(), err)
 	}
 
 	if len(ukeys) > 0 {
