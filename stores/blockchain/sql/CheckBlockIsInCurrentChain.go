@@ -71,9 +71,10 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 	// server would serve a merkle proof against a block that is not on the chain.
 	//
 	// lastSuccessfulRebuild is set only by a rebuild that completed, so zero means
-	// "never built" and is unambiguous. It cannot race the startup path: the guard
-	// above is released by the same goroutine that sets it, so a cleared guard plus
-	// a zero timestamp is precisely the failed-rebuild case and nothing else.
+	// "never built" and is unambiguous. It cannot race the startup path: the goroutine
+	// that releases the guard above is the same one that runs the startup rebuild, so
+	// a cleared guard together with a zero timestamp is precisely the failed-rebuild
+	// case and nothing else.
 	//
 	// A rebuild that fails AFTER an earlier success is not covered here, and does not
 	// need to be: the previous set still holds every fork the node knew about, only
