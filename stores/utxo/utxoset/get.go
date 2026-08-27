@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -68,23 +69,17 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, _ ...fields.Field
 		return nil, errors.NewProcessingError("[utxoset][Get] nil hash")
 	}
 
-	var (
-		createdHeight       int32
-		offChainSince       *int32
-		membership          []byte
-		fee                 *int64
-		sizeInBytes         *int32
-		txInpoints          []byte
-		locktime            *int32
-		createdAt           *int64
-		conflictingChildren []byte
-		flags               int16
-		rawTx               []byte
-	)
+	// Batched when configured. The validator resolves parents one at a time from many
+	// goroutines, and each of those is otherwise its own round trip.
+	if s.getBatcher != nil {
+		return s.getBatched(ctx, hash)
+	}
+
+	var r metaRow
 
 	err := s.pool.QueryRow(ctx, getSQL, LeafFor(hash[:]), hash[:]).Scan(
-		&createdHeight, &offChainSince, &membership, &fee, &sizeInBytes,
-		&txInpoints, &locktime, &createdAt, &conflictingChildren, &flags, &rawTx)
+		&r.createdHeight, &r.offChainSince, &r.membership, &r.fee, &r.sizeInBytes,
+		&r.txInpoints, &r.locktime, &r.createdAt, &r.conflictingChildren, &r.flags, &r.rawTx)
 
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -93,47 +88,9 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, _ ...fields.Field
 		return nil, errors.NewStorageError("[utxoset][Get] %s", hash.String(), err)
 	}
 
-	data := &meta.Data{
-		IsCoinbase:  flags&FlagCoinbase != 0,
-		Conflicting: flags&FlagConflicting != 0,
-		Locked:      flags&FlagLocked != 0,
-	}
-
-	data.BlockIDs, data.BlockHeights, data.SubtreeIdxs = unpackMembership(membership)
-
-	if data.ConflictingChildren, err = unpackHashes(conflictingChildren); err != nil {
-		return nil, errors.NewStorageError("[utxoset][Get] conflicting children %s", hash.String(), err)
-	}
-
-	if offChainSince != nil {
-		data.UnminedSince = uint32(*offChainSince) //nolint:gosec // a stored height is never negative
-	}
-
-	if fee != nil {
-		data.Fee = uint64(*fee) //nolint:gosec // a fee is never negative
-	}
-
-	if sizeInBytes != nil {
-		data.SizeInBytes = uint64(*sizeInBytes) //nolint:gosec // a size is never negative
-	}
-
-	if locktime != nil {
-		data.LockTime = uint32(*locktime) //nolint:gosec // a locktime is never negative
-	}
-
-	if createdAt != nil {
-		data.CreatedAt = *createdAt
-	}
-
-	// A body-less row is expected once the window has aged out, so this is a nil Tx rather
-	// than an error. Callers that genuinely need the bytes have to check.
-	if len(rawTx) > 0 {
-		tx, terr := bt.NewTxFromBytes(rawTx)
-		if terr != nil {
-			return nil, errors.NewStorageError("[utxoset][Get] decode body %s", hash.String(), terr)
-		}
-
-		data.Tx = tx
+	data, err := r.toMeta(hash)
+	if err != nil {
+		return nil, err
 	}
 
 	return data, nil
@@ -178,4 +135,82 @@ func unpackHashes(b []byte) ([]chainhash.Hash, error) {
 	}
 
 	return out, nil
+}
+
+// metaRow is one row as the identity table and its body return it, before it becomes the
+// record a caller sees.
+//
+// It exists so the single read and the batched read share one conversion. Two copies of
+// "what a stored transaction means" is how the two drift apart on a field nobody notices
+// until something downstream reads a zero.
+type metaRow struct {
+	createdHeight       int32
+	offChainSince       *int32
+	membership          []byte
+	fee                 *int64
+	sizeInBytes         *int32
+	txInpoints          []byte
+	locktime            *int32
+	createdAt           *int64
+	conflictingChildren []byte
+	flags               int16
+	rawTx               []byte
+}
+
+// toMeta turns a stored row into the record callers read.
+func (r *metaRow) toMeta(hash *chainhash.Hash) (*meta.Data, error) {
+	data := &meta.Data{
+		IsCoinbase:  r.flags&FlagCoinbase != 0,
+		Conflicting: r.flags&FlagConflicting != 0,
+		Locked:      r.flags&FlagLocked != 0,
+	}
+
+	data.BlockIDs, data.BlockHeights, data.SubtreeIdxs = unpackMembership(r.membership)
+
+	var err error
+	if data.ConflictingChildren, err = unpackHashes(r.conflictingChildren); err != nil {
+		return nil, errors.NewStorageError("[utxoset] conflicting children %s", hash.String(), err)
+	}
+
+	if r.offChainSince != nil {
+		data.UnminedSince = uint32(*r.offChainSince) //nolint:gosec // a stored height is never negative
+	}
+
+	if r.fee != nil {
+		data.Fee = uint64(*r.fee) //nolint:gosec // a fee is never negative
+	}
+
+	if r.sizeInBytes != nil {
+		data.SizeInBytes = uint64(*r.sizeInBytes) //nolint:gosec // a size is never negative
+	}
+
+	if r.locktime != nil {
+		data.LockTime = uint32(*r.locktime) //nolint:gosec // a locktime is never negative
+	}
+
+	if r.createdAt != nil {
+		data.CreatedAt = *r.createdAt
+	}
+
+	if len(r.txInpoints) > 0 {
+		ip, ierr := subtree.NewTxInpointsFromBytes(r.txInpoints)
+		if ierr != nil {
+			return nil, errors.NewStorageError("[utxoset] inpoints %s", hash.String(), ierr)
+		}
+
+		data.TxInpoints = ip
+	}
+
+	// A body-less row is expected once its window has aged out, so this is a nil transaction
+	// rather than an error. Callers that genuinely need the bytes have to check.
+	if len(r.rawTx) > 0 {
+		tx, terr := bt.NewTxFromBytes(r.rawTx)
+		if terr != nil {
+			return nil, errors.NewStorageError("[utxoset] decode body %s", hash.String(), terr)
+		}
+
+		data.Tx = tx
+	}
+
+	return data, nil
 }

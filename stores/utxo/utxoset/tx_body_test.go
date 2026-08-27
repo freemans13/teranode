@@ -1,6 +1,7 @@
 package utxoset
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -102,3 +103,62 @@ func TestCreateDoesNotWriteASecondBodyForADuplicate(t *testing.T) {
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM tx_body WHERE txid = $1`, h[:]).Scan(&n))
 	require.Equal(t, 1, n, "a duplicate must not file a second body, at a second height")
 }
+
+// TestCreateIsAtomicAcrossItsThreeWrites pins that a Create either lands completely or not
+// at all.
+//
+// Create writes three things: the identity row, the serialized bytes, and one coin row per
+// spendable output. Run them on the connection pool rather than inside one transaction and
+// each commits separately, so a failure partway leaves the earlier writes standing.
+//
+// The damaging case is an identity row with no bytes. A read cannot tell that apart from a
+// transaction whose bytes have aged out of their window, because both are a row with no body
+// row beside it. And a retry is refused, because the identity claim reports the transaction
+// as already present, so the bytes are never written. The transaction stays body-less
+// permanently and nothing reports it.
+//
+// The forced failure here is a body window that does not exist. Detaching one leaves the
+// range unrouted, so the body insert fails while the identity claim has already succeeded.
+func TestCreateIsAtomicAcrossItsThreeWrites(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	// Make the window for height 700_000 exist, then take it away, so the body insert fails
+	// after the claim has been made.
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 700_000))
+
+	window := 700_000 / TxBodyPartitionBlocks
+	_, err := s.pool.Exec(ctx,
+		`ALTER TABLE tx_body DETACH PARTITION tx_body_w`+itoa(window))
+	require.NoError(t, err)
+
+	// Drop the detached table, or it outlives this test as an orphan and breaks the next one.
+	//
+	// DROP TABLE tx_body CASCADE removes the parent and its ATTACHED partitions. A detached
+	// one is no longer a partition, so it survives, and the next test's
+	// CREATE TABLE IF NOT EXISTS then finds the name taken, skips silently, and never
+	// attaches it. Every create at that height afterwards fails with "no partition found",
+	// in a test that did nothing wrong. This is the same orphan hazard the spend journal's
+	// reclaim has to handle, arriving here through a test rather than a crash.
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(ctx, `DROP TABLE IF EXISTS tx_body_w`+itoa(window))
+	})
+
+	tx := mkTx(t, 2, 1_000)
+	_, err = s.Create(ctx, tx, 700_000)
+	require.Error(t, err, "the body cannot be stored, so the create must fail")
+
+	h := tx.TxIDChainHash()
+
+	var idents, coins int
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM tx_ident WHERE txid = $1`, h[:]).Scan(&idents))
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM utxo WHERE txid = $1`, h[:]).Scan(&coins))
+
+	require.Zero(t, idents,
+		"a failed create must leave no identity row: one without its bytes reads as aged-out forever, and the retry is refused as a duplicate")
+	require.Zero(t, coins, "and no coins")
+}
+
+// itoa keeps the partition name readable at the call site.
+func itoa(i int) string { return strconv.Itoa(i) }

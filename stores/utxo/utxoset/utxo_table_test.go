@@ -33,6 +33,33 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 	                       DROP TABLE IF EXISTS applied_chunk CASCADE;
 	                       DROP TABLE IF EXISTS tx_ident CASCADE;
 	                       DROP TABLE IF EXISTS tx_body CASCADE;`)
+
+	// Sweep up detached partitions the parent drop cannot reach. DROP TABLE removes a
+	// partitioned parent and everything still ATTACHED to it; anything detached is an
+	// ordinary table by then and survives, which later makes CREATE TABLE IF NOT EXISTS skip
+	// a name it thinks is taken. A test that crashes mid-detach cannot clean up after itself,
+	// so the setup does it.
+	orphans, oerr := pool.Query(ctx, `
+        SELECT c.relname FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = current_schema() AND c.relkind = 'r'
+           AND c.relname ~ '^(tx_body_w|tx_ident_l|utxo_p|spend_journal_)[0-9]+$'`)
+	if oerr == nil {
+		var names []string
+
+		for orphans.Next() {
+			var n string
+			if orphans.Scan(&n) == nil {
+				names = append(names, n)
+			}
+		}
+
+		orphans.Close()
+
+		for _, n := range names {
+			_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS `+n)
+		}
+	}
 	pool.Close()
 
 	u, err := url.Parse(dsn)

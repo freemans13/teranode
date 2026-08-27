@@ -45,7 +45,11 @@ var (
 // this package has to give each test its own database first --
 // tpostgres.SetupTestPostgresContainer already returns one per call, so the
 // change is to stop sharing through the sync.Once, not to write new plumbing.
-func testDSN(t *testing.T) string {
+//
+// Takes testing.TB rather than *testing.T so the throughput benchmarks in
+// bench_test.go run against the same instance the tests verify. A benchmark
+// that started its own database would be measuring a different machine.
+func testDSN(t testing.TB) string {
 	t.Helper()
 
 	if v := os.Getenv("UTXOSET_TEST_DSN"); v != "" {

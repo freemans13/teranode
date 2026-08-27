@@ -34,6 +34,11 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // to put it back. The outer SELECT still returns satoshis and script, so the spend
 // remains its own decorate fetch.
 //
+// Every parameter is an ARRAY, including the height and the spending transaction, so one
+// statement serves one transaction or a thousand. That is what lets the spend path batch
+// without a second copy of these predicates existing somewhere: the single-transaction path
+// is a batch of one.
+//
 // This is now the ONLY spend statement. There was a journal-free twin of it, used below
 // the checkpoint, whose predicates had to be kept identical by hand; it is deleted rather
 // than flagged off, because two copies of a consensus predicate is a defect waiting for
@@ -44,8 +49,9 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // rather than as spent.
 const spendJournalSQL = `
 WITH k AS (
-    SELECT * FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[])
-        AS t(leaf, ukey, txid, vin)
+    SELECT * FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[],
+                         $5::int[], $6::bytea[])
+        AS t(leaf, ukey, txid, vin, spent_height, spending_txid)
 ),
 del AS (
     DELETE FROM utxo u USING k
@@ -54,15 +60,15 @@ del AS (
        AND u.txid           = k.txid
        AND (u.flags & 1)    = 0
        AND (u.flags & 4)    = 0
-       AND u.spendable_from <= $5
-    RETURNING k.vin, u.satoshis, u.created_height, u.spendable_from, u.flags,
-              u.ukey, u.txid, u.script, u.hash_override
+       AND u.spendable_from <= k.spent_height
+    RETURNING k.vin, k.spent_height, k.spending_txid, u.satoshis, u.created_height,
+              u.spendable_from, u.flags, u.ukey, u.txid, u.script, u.hash_override
 ),
 journal AS (
     INSERT INTO spend_journal (spent_height, satoshis, created_height, spendable_from,
                            flags, ukey, txid, spending_txid, script, hash_override)
-    SELECT $5, d.satoshis, d.created_height, d.spendable_from, d.flags,
-           d.ukey, d.txid, $6::bytea, d.script, d.hash_override
+    SELECT d.spent_height, d.satoshis, d.created_height, d.spendable_from, d.flags,
+           d.ukey, d.txid, d.spending_txid, d.script, d.hash_override
       FROM del d
 )
 SELECT d.vin, d.satoshis, d.script FROM del d`

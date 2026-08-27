@@ -11,37 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
-	"github.com/jackc/pgx/v5"
 )
-
-// createSQL inserts one row per SPENDABLE output.
-//
-// There is deliberately no ON CONFLICT clause. The ukey is a 96-bit prefix and is
-// non-unique, so there is no constraint for ON CONFLICT to act on — idempotence cannot
-// come from the key here and must come from the applied_block ledger instead. Writing
-// ON CONFLICT DO NOTHING against a non-unique index would not merely fail to protect
-// anything, it would read as protection that does not exist.
-const createSQL = `
-INSERT INTO utxo (satoshis, created_height, spendable_from, leaf, flags, ukey, txid, script)
-SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[], $4::smallint[], $5::smallint[],
-                     $6::uuid[], $7::bytea[], $8::bytea[])`
-
-// claimSQL inserts the identity row and reports whether THIS caller inserted it.
-//
-// ON CONFLICT names (leaf, txid) and not (txid): a partitioned parent rejects the shorter
-// form with "there is no unique or exclusion constraint matching the ON CONFLICT
-// specification". And the answer comes back through RETURNING rather than by letting the
-// uniqueness violation raise, because inside a pgx batch a raised error aborts every later
-// statement in the batch -- see commit d648732a9 in this repository.
-//
-// created_height is NOT updated on conflict. The first sighting wins, because it is
-// tx_body's filing address and moving it would strand the body.
-const claimSQL = `
-INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
-                      fee, size_in_bytes, tx_inpoints, locktime, created_at, flags)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-ON CONFLICT (leaf, txid) DO NOTHING
-RETURNING 1`
 
 // noteConflictSQL records a contesting transaction on the parent whose coin it wants.
 //
@@ -61,11 +31,6 @@ UPDATE tx_ident
            ELSE coalesce(conflicting_children, '\x'::bytea) || $3::bytea
        END
  WHERE leaf = $1 AND txid = $2`
-
-// bodySQL files the serialized bytes in the window tx_ident's created_height names, so the
-// two always agree about where to look.
-const bodySQL = `
-INSERT INTO tx_body (created_height, txid, raw_tx) VALUES ($1, $2, $3)`
 
 // packMembership renders mined-block information into the packed form tx_ident carries:
 // 12-byte triples of block id, block height and subtree index, big-endian, in the order the
@@ -128,6 +93,38 @@ func offChainSinceAt(infos []utxo.MinedBlockInfo, blockHeight uint32) *int32 {
 // postgres store's spendable_count and the aerospike store's ShouldStoreOutputAsUTXO
 // gate, so all three agree on what "spendable" means.
 func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
+	// Batched when configured, which is the normal path. The batcher collects calls arriving
+	// from many goroutines and sends them as one round trip, which is what the other two
+	// implementations of this interface do and what this store was missing.
+	//
+	// The conflicting case takes the direct path. It writes to the PARENTS of the incoming
+	// transaction rather than only to the transaction itself, so two items in one batch can
+	// touch the same row, which is exactly the overlap the batched path assumes away.
+	if s.createBatcher != nil {
+		options := &utxo.CreateOptions{}
+		for _, opt := range opts {
+			opt(options)
+		}
+
+		if !options.Conflicting {
+			done := make(chan createResult, 1)
+
+			s.createBatcher.PutCtx(ctx, &createItem{
+				tx:          tx,
+				blockHeight: blockHeight,
+				options:     options,
+				done:        done,
+			})
+
+			select {
+			case res := <-done:
+				return res.data, res.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+
 	if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
 		return nil, err
 	}
@@ -135,41 +132,38 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	return s.createIn(ctx, s.pool, tx, blockHeight, opts...)
 }
 
-// createIn is Create against an arbitrary querier, so SpendAndCreate can run it inside
-// the same transaction as the spend.
-func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
-	if tx == nil {
-		return nil, errors.NewProcessingError("[utxoset][Create] nil tx")
+// appendCreate adds one transaction to the plan: its identity row, its serialized bytes, and
+// one coin row per spendable output.
+//
+// Shared by the single and the batched path so the two cannot drift apart on what they store.
+// Nothing is appended until every failure is behind us, so a transaction this rejects leaves
+// no half-written row in the arrays.
+func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uint32,
+	options *utxo.CreateOptions) (*meta.Data, error) {
+	if options == nil {
+		options = &utxo.CreateOptions{}
 	}
 
 	txHash := tx.TxIDChainHash()
 	leaf := LeafFor(txHash[:])
 	isCoinbase := tx.IsCoinbase()
 
-	// Coinbase maturity and the ReAssignUTXO delay are folded into one precomputed
-	// height so the spend hot path never branches on "is this a coinbase" — it just
-	// compares spendable_from against the current height.
+	// Coinbase maturity and the ReAssignUTXO delay fold into one precomputed height, so the
+	// spend hot path never branches on "is this a coinbase".
 	//
-	// Zero for an ordinary output, NOT the creation height. There is no consensus rule
-	// keeping a normal output from being spent at a height below the one it was created
-	// at, and encoding one here would reject perfectly valid spends -- during a reorg,
-	// or whenever a caller passes a height that is not strictly increasing. Only coinbase
-	// maturity and an explicit reassignment delay may hold an output back.
+	// Zero for an ordinary output, NOT the creation height. No consensus rule stops a normal
+	// output being spent below the height it was created at, and encoding one would reject
+	// valid spends during a reorg or whenever a caller passes a height that is not strictly
+	// increasing.
 	var spendableFrom int32
 	if isCoinbase {
 		spendableFrom = int32(blockHeight) + int32(s.settings.ChainCfgParams.CoinbaseMaturity)
 	}
 
-	// The caller's state options MUST reach the row. schema.go defines these bits and
-	// spend.go checks all three when deciding whether a spend may proceed, so dropping
-	// them here does not fail loudly, it creates an ordinary spendable output and lets
-	// every downstream guard pass quietly on a zero bit. That is a silently wrong answer
-	// rather than a missing feature, which is the worse of the two.
-	options := &utxo.CreateOptions{}
-	for _, opt := range opts {
-		opt(options)
-	}
-
+	// The caller's state options MUST reach the row. spend.go checks all three flags when
+	// deciding whether a spend may proceed, so dropping them here does not fail loudly, it
+	// creates an ordinary spendable output and lets every downstream guard pass quietly on a
+	// zero bit.
 	var flags int16
 	if isCoinbase {
 		flags |= FlagCoinbase
@@ -187,56 +181,9 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		flags |= FlagLocked
 	}
 
-	genesisHeight := s.settings.ChainCfgParams.GenesisActivationHeight
-
-	n := len(tx.Outputs)
-	satoshis := make([]int64, 0, n)
-	createdAt := make([]int32, 0, n)
-	spendable := make([]int32, 0, n)
-	leaves := make([]int16, 0, n)
-	flagArr := make([]int16, 0, n)
-	ukeys := make([][16]byte, 0, n)
-	txids := make([][]byte, 0, n)
-	scripts := make([][]byte, 0, n)
-
-	for vout, out := range tx.Outputs {
-		if out == nil {
-			continue
-		}
-
-		if out.LockingScript != nil && !utxo.ShouldStoreOutputAsUTXO(out, blockHeight, genesisHeight) {
-			continue // provably unspendable: no UTXO row, ever
-		}
-
-		var script []byte
-		if out.LockingScript != nil {
-			script = *out.LockingScript
-		}
-
-		satoshis = append(satoshis, int64(out.Satoshis))
-		createdAt = append(createdAt, int32(blockHeight))
-		spendable = append(spendable, spendableFrom)
-		leaves = append(leaves, leaf)
-		flagArr = append(flagArr, flags)
-		ukeys = append(ukeys, Pack(txHash[:], uint32(vout)))
-		txids = append(txids, txHash[:])
-		scripts = append(scripts, script)
-	}
-
-	// THE CLAIM, and it must come before the coin rows.
-	//
-	// The UTXO table's key is a non-unique 96-bit prefix, so it can never reject a
-	// duplicate. Identity does that, and it has to do it BEFORE any output is written or
-	// the duplicate has already been applied. This is what retires the applied_block
-	// ledger: a block arriving twice becomes a no-op transaction by transaction, and a
-	// duplicate mempool submission is covered by the same mechanism rather than being
-	// left unimplemented.
 	// The inputs, stored rather than re-derived. Block assembly rebuilds a mining candidate
-	// from the fee, the size and these, never from the serialized transaction, and that is
-	// exactly what lets the body age out of its window while the transaction stays
-	// mineable. A transaction dropped from block assembly can never be mined, and on a
-	// delete-on-spend store its inputs' coin rows are already gone, so nobody can spend
-	// them again either.
+	// from the fee, the size and these, never from the serialized transaction, which is what
+	// lets the body age out of its window while the transaction stays mineable.
 	var inpoints []byte
 
 	if !isCoinbase {
@@ -250,40 +197,48 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		}
 	}
 
-	var claimed int
+	genesisHeight := s.settings.ChainCfgParams.GenesisActivationHeight
 
-	err := q.QueryRow(ctx, claimSQL,
-		leaf, txHash[:], int32(blockHeight), offChainSinceAt(options.MinedBlockInfos, blockHeight),
-		packMembership(options.MinedBlockInfos),
-		nil, int32(tx.Size()), inpoints, int32(tx.LockTime), time.Now().UnixMilli(), flags,
-	).Scan(&claimed)
+	// The identity row. k is this transaction's position in the statement, and the result
+	// comes back keyed on it, so a caller learns whether its OWN claim took rather than
+	// whether the batch as a whole wrote anything.
+	p.idx = append(p.idx, int32(len(p.owner))) //nolint:gosec // bounded by batch size
+	p.owner = append(p.owner, item)
+	p.txs = append(p.txs, tx)
+	p.leaves = append(p.leaves, leaf)
+	p.txids = append(p.txids, txHash[:])
+	p.heights = append(p.heights, int32(blockHeight))
+	p.offChain = append(p.offChain, offChainSinceAt(options.MinedBlockInfos, blockHeight))
+	p.membership = append(p.membership, packMembership(options.MinedBlockInfos))
+	p.sizes = append(p.sizes, int32(tx.Size()))
+	p.inpoints = append(p.inpoints, inpoints)
+	p.locktimes = append(p.locktimes, int32(tx.LockTime))
+	p.createdAt = append(p.createdAt, time.Now().UnixMilli())
+	p.txFlags = append(p.txFlags, flags)
+	p.bodies = append(p.bodies, tx.Bytes())
 
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		// Someone already holds this txid. Nothing of ours was written, so there is
-		// nothing to undo.
-		return nil, errors.NewTxExistsError("[utxoset][Create] %s", txHash.String())
-	case err != nil:
-		return nil, errors.NewStorageError("[utxoset][Create] claim %s", txHash.String(), err)
-	}
-
-	// The bytes, filed in the window created_height names. Gated by the claim like the coin
-	// rows: a re-applied block must not write the body again, at a second height.
-	if _, err := q.Exec(ctx, bodySQL, int32(blockHeight), txHash[:], tx.Bytes()); err != nil {
-		return nil, errors.NewStorageError("[utxoset][Create] body %s", txHash.String(), err)
-	}
-
-	if options.Conflicting {
-		if err := s.noteConflictOnParents(ctx, q, tx, txHash[:]); err != nil {
-			return nil, err
+	for vout, out := range tx.Outputs {
+		if out == nil {
+			continue
 		}
-	}
 
-	if len(ukeys) > 0 {
-		if _, err := q.Exec(ctx, createSQL, satoshis, createdAt, spendable,
-			leaves, flagArr, ukeys, txids, scripts); err != nil {
-			return nil, errors.NewStorageError("[utxoset][Create] insert %s", txHash.String(), err)
+		if out.LockingScript != nil && !utxo.ShouldStoreOutputAsUTXO(out, blockHeight, genesisHeight) {
+			continue // provably unspendable: no coin row, ever
 		}
+
+		var script []byte
+		if out.LockingScript != nil {
+			script = *out.LockingScript
+		}
+
+		p.coinSats = append(p.coinSats, int64(out.Satoshis))
+		p.coinHeights = append(p.coinHeights, int32(blockHeight))
+		p.coinSpendable = append(p.coinSpendable, spendableFrom)
+		p.coinLeaves = append(p.coinLeaves, leaf)
+		p.coinFlags = append(p.coinFlags, flags)
+		p.coinUkeys = append(p.coinUkeys, Pack(txHash[:], uint32(vout)))
+		p.coinTxids = append(p.coinTxids, txHash[:])
+		p.coinScripts = append(p.coinScripts, script)
 	}
 
 	return &meta.Data{
@@ -292,6 +247,39 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		SizeInBytes: uint64(tx.Size()),
 		IsCoinbase:  isCoinbase,
 	}, nil
+}
+
+// createIn is Create against an arbitrary querier, so SpendAndCreate can run it inside the
+// same database transaction as the spend.
+//
+// It is a plan of one. There is deliberately no second statement for the single-transaction
+// case: what a create writes, and the claim that decides whether it writes at all, is this
+// store's whole idempotence rule, and two copies of it is a defect waiting for one to be
+// edited alone.
+func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
+	options := &utxo.CreateOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	plan := s.planCreates([]*createItem{{tx: tx, blockHeight: blockHeight, options: options}})
+	if plan.errs[0] != nil {
+		return nil, plan.errs[0]
+	}
+
+	if options.Conflicting {
+		txHash := tx.TxIDChainHash()
+
+		if cerr := s.noteConflictOnParents(ctx, q, tx, txHash[:]); cerr != nil {
+			return nil, cerr
+		}
+	}
+
+	if err := s.runCreatePlan(ctx, q, plan); err != nil {
+		return nil, err
+	}
+
+	return plan.perItem[0], plan.errs[0]
 }
 
 // noteConflictOnParents tells every parent of a losing transaction that it is being contested.

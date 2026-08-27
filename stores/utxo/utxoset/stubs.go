@@ -11,7 +11,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 )
 
 func (s *Store) Delete(_ context.Context, _ *chainhash.Hash) error {
@@ -20,10 +19,6 @@ func (s *Store) Delete(_ context.Context, _ *chainhash.Hash) error {
 
 func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
 	return nil, errM1("ScanInconsistentUnminedTxs")
-}
-
-func (s *Store) BatchDecorate(_ context.Context, _ []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
-	return errM1("BatchDecorate")
 }
 
 func (s *Store) ReAssignUTXO(_ context.Context, _ *utxo.Spend, _ *utxo.Spend, _ *settings.Settings) error {
@@ -52,10 +47,6 @@ func (s *Store) RemoveBlockIDs(_ context.Context, _ []utxo.BlockIDsRemoval) erro
 
 func (s *Store) GetConflictingTxIterator() (utxo.UnminedTxIterator, error) {
 	return nil, errM1("GetConflictingTxIterator")
-}
-
-func (s *Store) SetLocked(_ context.Context, _ []chainhash.Hash, _ bool) error {
-	return errM1("SetLocked")
 }
 
 func (s *Store) BeginConflictIntent(_ context.Context, _ utxo.ConflictIntent) error {
