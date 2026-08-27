@@ -1709,6 +1709,16 @@ func (s *SQL) rebuildOnMainChainFlagTx(ctx context.Context, full bool) (err erro
 // divergence down, and blockchain_chain_check_shadow_compare is what would catch it on
 // a live node.
 //
+// Block validation is not the only asker, so a gap id would not stay inside consensus.
+// The asset server's GetTransactionMeta and merkle-proof handlers call this with the
+// BlockIDs stamped on a transaction's UTXO metadata, to pick which of a transaction's
+// blocks is the main-chain one. checkOldBlockIDs is only reached when something at the
+// tip spends an output, but a client can ask about any transaction it likes, so an id
+// that nothing spends is still reachable through the asset server. That widens the
+// blast radius of a gap id from a block invalidation to a merkle proof served against
+// a block that is not on the chain, which is the reason the shadow comparison defaults
+// on rather than being a debug-only switch.
+//
 // Deleting a committed row is the other way to open a hole, and it stays open because
 // updateMaxBlockID only ever moves the bound up: after a DELETE, maxBlockID keeps the
 // pre-delete high-water mark for the life of the process while the row is gone. Today
