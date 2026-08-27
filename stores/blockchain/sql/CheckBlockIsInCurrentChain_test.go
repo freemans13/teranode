@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -731,4 +732,65 @@ func TestCheckBlockIsInCurrentChain_UnbuiltForkedSetDefersToSQL(t *testing.T) {
 	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID2)})
 	require.NoError(t, err)
 	require.False(t, result)
+}
+
+// countingErrorLogger counts Errorf calls so a test can assert how much a path logs,
+// not just what it computes. Everything else is TestLogger's.
+type countingErrorLogger struct {
+	ulogger.TestLogger
+
+	errors atomic.Uint64
+}
+
+func (l *countingErrorLogger) Errorf(format string, args ...interface{}) {
+	l.errors.Add(1)
+}
+
+// TestCheckBlockIsInCurrentChain_ShadowCompare_SamplesRepeatMismatches pins the third
+// property of the soak instrument, next to "never changes the answer" and "a failed
+// shadow query is not an error": a disagreement that repeats must not drown the node.
+//
+// A systematic mismatch fires on every call that touches the offending id. Unsampled,
+// that is one error line per request, and this instrument defaults on. What must stay
+// exact is the counter, because the two-minute totals line is what a soak is read from.
+func TestCheckBlockIsInCurrentChain_ShadowCompare_SamplesRepeatMismatches(t *testing.T) {
+	const (
+		highID = 100000
+		calls  = 60
+	)
+
+	s := newOnMainChainTestStoreWith(t, func(st *settings.Settings) {
+		st.BlockChain.UseInMemoryChainCheck = true
+		st.BlockChain.ChainCheckShadowCompare = true
+	})
+
+	_, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
+	committed, _, err := s.StoreBlock(context.Background(), block2, "", options.WithID(highID))
+	require.NoError(t, err)
+	require.Equal(t, uint64(highID), committed)
+
+	logger := &countingErrorLogger{}
+	s.logger = logger
+
+	// A gap id disagrees on every call, which is the systematic case.
+	for i := 0; i < calls; i++ {
+		result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{highID - 1})
+		require.NoError(t, err)
+		require.True(t, result, "sampling must not change the answer")
+	}
+
+	require.Equal(t, uint64(calls), s.chainCheckShadowMismatches.Load(), "every mismatch must be counted")
+	require.Equal(t, uint64(10), logger.errors.Load(), "only the first ten mismatches may be logged at error")
+}
+
+func TestShouldLogShadowMismatch(t *testing.T) {
+	for _, total := range []uint64{1, 2, 9, 10, 1000, 2000, 100000} {
+		require.True(t, shouldLogShadowMismatch(total), "mismatch #%d must be logged", total)
+	}
+
+	for _, total := range []uint64{11, 12, 999, 1001, 99999} {
+		require.False(t, shouldLogShadowMismatch(total), "mismatch #%d must be sampled out", total)
+	}
 }

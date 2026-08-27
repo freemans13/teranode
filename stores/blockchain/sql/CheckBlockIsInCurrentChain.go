@@ -163,10 +163,11 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 // question is whether the two routes ever differ on a live node, and the only honest
 // way to find out is to run both and count.
 //
-// Two properties matter more than the measurement. It never changes the answer, and
-// a shadow query that cannot run is not an error. Otherwise turning the instrument on
-// would make the node worse than leaving it off, and nobody would leave it on long
-// enough to learn anything.
+// Three properties matter more than the measurement. It never changes the answer, a
+// shadow query that cannot run is not an error, and a disagreement that repeats does
+// not drown the node in log. Otherwise turning the instrument on would make the node
+// worse than leaving it off, and nobody would leave it on long enough to learn
+// anything.
 func (s *SQL) shadowCompareChainCheck(ctx context.Context, blockIDs []uint32, inMemoryResult bool) {
 	authoritative, err := s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
 	if err != nil {
@@ -182,8 +183,29 @@ func (s *SQL) shadowCompareChainCheck(ctx context.Context, blockIDs []uint32, in
 
 	total := s.chainCheckShadowMismatches.Add(1)
 
+	if !shouldLogShadowMismatch(total) {
+		return
+	}
+
 	s.logger.Errorf("[CheckBlockIsInCurrentChain] shadow mismatch #%d: forked-set route said %v, authoritative route said %v for blocks (%v). The forked-set route is not safe to run without the shadow comparison on this node.",
 		total, inMemoryResult, authoritative, blockIDs)
+}
+
+// shouldLogShadowMismatch samples the per-mismatch error line.
+//
+// A disagreement that is systematic rather than freak, a gap id that several
+// transactions all point at, say, does not happen once. It happens on every call that
+// touches that id, which on a node serving asset traffic is an unbounded error line
+// per request into a disk that has filled and taken a node down on this fleet before.
+// An instrument that can do that is one operators turn off, and this one defaults on.
+//
+// The first ten carry the diagnostic value: the ids involved, and enough repetition to
+// see whether it is one id or many. After that the running total is what matters, and
+// the two-minute totals line from logShadowCompareTotals already carries it, so sample
+// hard. The mismatch counter itself is never sampled, so the number in that line and
+// the number in this function's message stay exact.
+func shouldLogShadowMismatch(total uint64) bool {
+	return total <= 10 || total%1000 == 0
 }
 
 // checkBlockIsInCurrentChainSQL is the SQL fallback implementation used when
