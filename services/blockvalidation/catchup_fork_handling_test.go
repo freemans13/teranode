@@ -644,7 +644,7 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 	initPrometheusMetrics()
 
 	// buildForkScenario wires up a server whose chain forks from a known common
-	// ancestor at ancestorHeight, with the local UTXO tip at currentHeight. The peer
+	// ancestor at ancestorHeight, with the local accepted chain tip at currentHeight. The peer
 	// announces a short fork off that ancestor. mined_set/notification mocks are
 	// registered permissively so the (buggy) early-clear path would execute without
 	// panicking, letting AssertNotCalled catch the regression rather than a panic.
@@ -687,12 +687,15 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).
 			Return(false, nil).Maybe()
 
-		// Metadata for the common ancestor.
+		// findCommonAncestor conveys existence through GetBlockHeader, so the common
+		// ancestor resolves to its header+meta.
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, ancestorHeader.Hash()).
 			Return(ancestorHeader, &model.BlockHeaderMeta{Height: ancestorHeight, ID: 1, ChainWork: ancestorChainWork.Bytes()}, nil).Maybe()
-		// Any other header (the peer's fork blocks) is absent from our chain, so
-		// GetBlockHeader reports not found and the common-ancestor walk stops at the
-		// divergence point, leaving the fork blocks as offered headers.
+		// Every other header (the peer's fork blocks, and the target) must report
+		// ErrBlockNotFound so the walk stops at the divergence point and the fork
+		// headers stay the peer's offered chain. A permissive catch-all that returned
+		// metadata here would make the whole peer chain look already-present, leaving
+		// zero offered headers for the secret-mining check.
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).
 			Return((*model.BlockHeader)(nil), (*model.BlockHeaderMeta)(nil),
 				errors.NewBlockNotFoundError("block not found")).Maybe()
@@ -847,6 +850,13 @@ func TestCatchup_CompetingEqualWorkChains(t *testing.T) {
 
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*chainhash.Hash{bestBlockHeader.Hash()}, nil)
+
+		// Anchored parent-chain runs for both competing chains' blocks:
+		// CheckHeaderContextual requires GetBlockHeaders(parent) to actually return the
+		// parent's chain (issue 1467). Registered before the catch-all below so testify
+		// matches these first.
+		registerParentChainHeaders(mockBlockchainClient, append([]*model.BlockHeader{genesisHeader}, chain1...), 0)
+		registerParentChainHeaders(mockBlockchainClient, append([]*model.BlockHeader{genesisHeader}, chain2...), 0)
 
 		// Mock GetBlockHeaders for common ancestor finding
 		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).

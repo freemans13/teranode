@@ -504,6 +504,16 @@ func initStats(logger ulogger.Logger, client *uaerospike.Client, tSettings *sett
 		return
 	}
 
+	if !tSettings.Aerospike.EnableClientMetrics {
+		// Gated by aerospike_enable_client_metrics. This skips only the
+		// client.Stats() polling goroutine below. client.EnableMetrics(nil) is
+		// disabled unconditionally (see the comment further down, pending #1001),
+		// so this flag has no effect on the per-batch nodeStats contention either
+		// way — it cannot be used to relieve it.
+		logger.Infof("[Aerospike] client metrics disabled (aerospike_enable_client_metrics=false)")
+		return
+	}
+
 	var nonAlphanumericRegex = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
 	aerospikeStatsRefreshInterval := tSettings.Aerospike.StatsRefreshDuration
@@ -884,6 +894,12 @@ func WithExpiration(ttlSeconds uint32) AerospikeWritePolicyOptions {
 // GetAerospikeWritePolicy creates a new Aerospike write policy with the provided options applied.
 // Used to manage default connection parameters for write operations with strong consistency.
 // If no options are provided, the policy will use the configured default values.
+//
+// CommitLevel is deliberately not configurable: every consumer writes state whose
+// loss is not self-healing (UTXO record creation, the tx-creation lock, the
+// conflict WAL, setMined, unspend, preserve/DAH writes), so a master-only ACK
+// would trade a resync for throughput. The pruner relaxes its own idempotent
+// removals instead — see stores/utxo/aerospike/pruner/prune_policies.go.
 func GetAerospikeWritePolicy(tSettings *settings.Settings, generation uint32, options ...AerospikeWritePolicyOptions) *aerospike.WritePolicy {
 	writePolicy := aerospike.NewWritePolicy(generation, aerospike.TTLDontExpire)
 
@@ -929,6 +945,7 @@ func GetAerospikeBatchPolicy(tSettings *settings.Settings) *aerospike.BatchPolic
 
 // GetAerospikeBatchWritePolicy creates a new Aerospike batch write policy with strong consistency.
 // Used for batch write operations to ensure data integrity across multiple records.
+// CommitLevel is deliberately not configurable — see GetAerospikeWritePolicy.
 func GetAerospikeBatchWritePolicy(tSettings *settings.Settings) *aerospike.BatchWritePolicy {
 	batchWritePolicy := aerospike.NewBatchWritePolicy()
 

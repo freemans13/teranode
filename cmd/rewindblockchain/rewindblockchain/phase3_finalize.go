@@ -154,9 +154,27 @@ func (e *env) resetBlockPersisterHeight(ctx context.Context, pf *preflightResult
 // deleteUTXOPersisterLastProcessed removes the file the utxo persister uses
 // to track its position. On next startup it will recompute from block
 // data — which is the correct behaviour post-rewind.
+//
+// NOTE: this Del does not currently match what the persister writes, and never
+// has. services/utxopersister/Server.go:772,826 uses the BLOCK store with
+// options.WithFilename("lastProcessed") and options.WithNoHashPrefix(), which
+// resolves to <blockstore>/lastProcessed.dat. This call uses the SUBTREE store
+// with filename "lastProcessed.dat", and ConstructFilename appends "." +
+// fileType, so it targets <subtreestore>/lastProcessed.dat.dat — a different
+// store and a different name. The Del is best-effort, so the miss is swallowed
+// by the Debugf below. Fixing it needs the block store, which resolveStores
+// does not open; tracked in #1353 rather than widened into the hashPrefix fix.
+//
+// WithNoHashPrefix does more than keep this path byte-identical now that the
+// store carries the node's hashPrefix (see newSubtreeStore). Without it
+// CalculatePrefix would derive "la" from the filename "lastProcessed.dat", and
+// ConstructFilename MkdirAlls the prefix folder on every call including Del
+// (stores/blob/options/Options.go:397-401) — so each rewind would leave a stray
+// empty <subtreestore>/la/ behind while still deleting nothing.
 func (e *env) deleteUTXOPersisterLastProcessed(ctx context.Context) error {
 	key := []byte(utxoPersisterLastHeightFn)
-	if err := e.subtreeStore.Del(ctx, key, fileformat.FileTypeDat, options.WithFilename(utxoPersisterLastHeightFn)); err != nil {
+	if err := e.subtreeStore.Del(ctx, key, fileformat.FileTypeDat,
+		options.WithFilename(utxoPersisterLastHeightFn), options.WithNoHashPrefix()); err != nil {
 		// Best-effort. Log and continue.
 		e.logger.Debugf("delete utxo-persister lastProcessed.dat: %v", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,7 +19,9 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	blockchainsql "github.com/bsv-blockchain/teranode/stores/blockchain/sql"
@@ -1478,4 +1481,191 @@ func TestPreflight_WarnsOnInflatedAndLaggingPersisterHeight(t *testing.T) {
 		require.Contains(t, log.infoText(), "it will be rewritten down to the target",
 			"the preflight log must state the decision, not just the numbers")
 	})
+}
+
+// -----------------------------------------------------------------------------
+// Production store construction (resolveStores)
+// -----------------------------------------------------------------------------
+
+// newFileStoreSettings points all three stores at throwaway backends: real
+// file:// subtree storage in a temp dir, in-memory SQL for the other two. The
+// subtree URL deliberately carries no query parameters, matching the resolved
+// config on a real deployment (subtreestore=file:///data/.../subtreestore),
+// where the node's default hashPrefix=2 applies.
+func newFileStoreSettings(t *testing.T, subtreeQuery string) (*settings.Settings, *url.URL) {
+	t.Helper()
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	bcURL, err := url.Parse("sqlitememory:///")
+	require.NoError(t, err)
+	tSettings.BlockChain.StoreURL = bcURL
+
+	utxoURL, err := url.Parse("sqlitememory:///resolve-stores-utxo")
+	require.NoError(t, err)
+	tSettings.UtxoStore.UtxoStore = utxoURL
+
+	raw := "file://" + t.TempDir()
+	if subtreeQuery != "" {
+		raw += "?" + subtreeQuery
+	}
+
+	subtreeURL, err := url.Parse(raw)
+	require.NoError(t, err)
+	tSettings.SubtreeValidation.SubtreeStore = subtreeURL
+
+	return tSettings, subtreeURL
+}
+
+// TestResolveStores_SubtreeStoreReadsWhatTheNodeWrote is the regression test for
+// the bug where the tool opened the subtree store without options.WithHashPrefix.
+// blob.NewStore does not parse hashPrefix from the URL query (stores/blob/factory.go
+// reads only batch, logger, sizeInBytes, writeKeys), so without the option
+// Options.HashPrefix stayed 0, CalculatePrefix returned "", and the tool resolved
+// flat filenames while the node wrote hash-sharded ones. Every read missed with
+// NOT_FOUND and Phase 2 could not rewind any file:// deployment.
+//
+// The existing Rewind tests all inject memory.New() via Options.Stores, which
+// bypasses resolveStores entirely — so none of them could catch this.
+func TestResolveStores_SubtreeStoreReadsWhatTheNodeWrote(t *testing.T) {
+	ctx := context.Background()
+	tSettings, subtreeURL := newFileStoreSettings(t, "")
+
+	hash := chainhash.HashH([]byte("subtree-hashprefix-regression"))
+	payload := []byte("subtree bytes")
+
+	// Write through a store built the way the daemon builds it
+	// (daemon/daemon_stores.go:454-479): hashPrefix 2, so the blob lands in a
+	// two-character shard directory.
+	nodeStore, err := blob.NewStore(logger(), subtreeURL, options.WithHashPrefix(2))
+	require.NoError(t, err)
+	require.NoError(t, nodeStore.Set(ctx, hash[:], fileformat.FileTypeSubtree, payload))
+
+	// Confirm the fixture really is sharded — otherwise this test would pass
+	// against a flat layout too and prove nothing.
+	shard := filepath.Join(subtreeURL.Path, hash.String()[:2])
+	require.DirExists(t, shard, "fixture must be hash-sharded for this test to mean anything")
+
+	// The tool's own construction path must find it.
+	stores, ownedByUs, err := resolveStores(ctx, logger(), tSettings, Options{})
+	require.NoError(t, err)
+	require.True(t, ownedByUs, "resolveStores opened these, so the caller owns closing them")
+
+	// ownedByUs is the close-me signal; honour it.
+	t.Cleanup(func() {
+		require.NoError(t, stores.Subtree.Close(ctx))
+	})
+
+	exists, err := stores.Subtree.Exists(ctx, hash[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.True(t, exists,
+		"resolveStores must open the subtree store with the node's hashPrefix; "+
+			"without it every subtree read misses and Phase 2 cannot rewind")
+
+	got, err := stores.Subtree.Get(ctx, hash[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+
+	// And the deletion Phase 2 performs must land on the same path.
+	require.NoError(t, stores.Subtree.Del(ctx, hash[:], fileformat.FileTypeSubtree))
+
+	exists, err = stores.Subtree.Exists(ctx, hash[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.False(t, exists, "Del must remove the sharded blob, not a flat path that never existed")
+}
+
+// TestNewSubtreeStore_FlatLayoutMissesShardedBlob pins the mechanism itself, so
+// the regression above cannot be "fixed" by something that merely happens to
+// work. A store opened without the option — the old behaviour — cannot see a
+// blob the node wrote.
+func TestNewSubtreeStore_FlatLayoutMissesShardedBlob(t *testing.T) {
+	ctx := context.Background()
+	_, subtreeURL := newFileStoreSettings(t, "")
+
+	hash := chainhash.HashH([]byte("flat-vs-sharded"))
+
+	nodeStore, err := blob.NewStore(logger(), subtreeURL, options.WithHashPrefix(2))
+	require.NoError(t, err)
+	require.NoError(t, nodeStore.Set(ctx, hash[:], fileformat.FileTypeSubtree, []byte("x")))
+
+	flatStore, err := blob.NewStore(logger(), subtreeURL)
+	require.NoError(t, err)
+
+	exists, err := flatStore.Exists(ctx, hash[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.False(t, exists,
+		"a store opened without WithHashPrefix looks at a flat path — this is the bug, "+
+			"and blob.NewStore never reads hashPrefix from the URL query")
+}
+
+// TestSubtreeHashPrefix covers the tool's own prefix resolution directly.
+//
+// This deliberately does NOT assert on file layout. The file backend parses
+// ?hashPrefix for itself and applies it after the store options
+// (stores/blob/file/file.go:446-453), so a layout-based test passes whether or
+// not this code resolves anything — it cannot discriminate. Asserting on the
+// resolved value pins the tool's logic for every backend, including s3, which
+// does not read the query at all.
+func TestSubtreeHashPrefix(t *testing.T) {
+	t.Run("defaults to the daemon's 2 when the URL carries no query", func(t *testing.T) {
+		// This is every shipped subtreestore setting: a bare file:// URL.
+		u, err := url.Parse("file:///data/teranode/subtreestore")
+		require.NoError(t, err)
+
+		prefix, err := subtreeHashPrefix(u)
+		require.NoError(t, err)
+		require.Equal(t, 2, prefix, "must match daemon.GetSubtreeStore's default")
+	})
+
+	t.Run("honours an explicit ?hashPrefix", func(t *testing.T) {
+		for _, tc := range []struct {
+			query string
+			want  int
+		}{
+			{"hashPrefix=4", 4},
+			{"hashPrefix=0", 0},
+			{"hashPrefix=-2", -2}, // negative means suffix; parity with the daemon
+		} {
+			u, err := url.Parse("file:///data/teranode/subtreestore?" + tc.query)
+			require.NoError(t, err)
+
+			prefix, err := subtreeHashPrefix(u)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, prefix, "query %q", tc.query)
+		}
+	})
+
+	t.Run("rejects a non-numeric ?hashPrefix", func(t *testing.T) {
+		u, err := url.Parse("file:///data/teranode/subtreestore?hashPrefix=banana")
+		require.NoError(t, err)
+
+		_, err = subtreeHashPrefix(u)
+		require.Error(t, err)
+		// Assert on this tool's message, not the substring "hashPrefix": the file
+		// backend also rejects "banana" with a message containing that word, so a
+		// looser assertion would pass even with this parse deleted.
+		require.Contains(t, err.Error(), "subtreestore hashPrefix config error")
+	})
+}
+
+// TestNewSubtreeStore_RejectsBadHashPrefix checks the error surfaces through the
+// constructor rather than being swallowed or replaced by the backend's own.
+func TestNewSubtreeStore_RejectsBadHashPrefix(t *testing.T) {
+	tSettings, _ := newFileStoreSettings(t, "hashPrefix=banana")
+
+	_, err := newSubtreeStore(logger(), tSettings)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "subtreestore hashPrefix config error")
+}
+
+// TestNewSubtreeStore_RejectsNilURL covers the guard added with this fix:
+// blob.NewStore dereferences storeURL.Scheme before any nil check, so an
+// unconfigured subtreestore used to panic.
+func TestNewSubtreeStore_RejectsNilURL(t *testing.T) {
+	tSettings, _ := newFileStoreSettings(t, "")
+	tSettings.SubtreeValidation.SubtreeStore = nil
+
+	_, err := newSubtreeStore(logger(), tSettings)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not configured")
 }
