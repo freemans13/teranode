@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -44,6 +45,30 @@ type SubtreeMetaRegenerator struct {
 	getBlockHeight       func() uint32
 	blockHeightRetention uint32
 	peerFetchTimeout     time.Duration
+}
+
+// cacheBustCounter produces the token appended to a peer request URL when a
+// first attempt came back with an unusable body, so the retry cannot be served
+// from that peer's cache.
+//
+// Process-wide and clock-seeded, deliberately, because it has to be unique
+// across regenerators and not merely within one. blockvalidation builds a fresh
+// SubtreeMetaRegenerator for every validation attempt (createMetaRegenerator is
+// called per ValidateBlock and per ReValidateBlock), so a per-instance counter
+// would restart at zero each time and every retry would request the identical
+// "?cachebust=1" URL. nginx caches that URL under its own key like any other, so
+// a busted request whose generation also aborted would leave the block wedged
+// for the whole upstream TTL, exactly the failure this retry exists to break.
+// blockvalidation's sibling counter gets process-lifetime uniqueness by living
+// on the long-lived Server; this is the model-package equivalent, with a clock
+// seed so a node restart mid-poison does not replay a token either.
+var cacheBustCounter = newCacheBustCounter()
+
+func newCacheBustCounter() *atomic.Uint64 {
+	c := &atomic.Uint64{}
+	c.Store(uint64(time.Now().UnixNano()))
+
+	return c
 }
 
 // NewSubtreeMetaRegenerator creates a new SubtreeMetaRegenerator instance.
@@ -110,8 +135,28 @@ func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash
 	}
 
 	for _, peerURL := range r.peerURLs {
-		data, err = r.getSubtreeDataFromPeer(ctx, subtreeHash, subtree, peerURL)
-		if meta, ok := tryBuild(peerURL, data, err); ok {
+		peerData, answered, peerErr := r.getSubtreeDataFromPeer(ctx, subtreeHash, subtree, peerURL, false)
+
+		meta, ok := tryBuild(peerURL, peerData, peerErr)
+
+		// A peer that answered with a body we could not use gets one more fetch,
+		// past its cache and on a budget of its own. Peers front the asset service
+		// with an nginx proxy_cache that stores any 200 for its TTL, so an aborted
+		// on-demand generation that reached the client as "200 + empty body" is
+		// replayed to every byte-identical request (issue 1368). The cache key
+		// includes the query string while nginx location matching ignores it, so the
+		// busted URL reaches the same handler and misses the cache, which is the only
+		// lever available against a fleet we cannot update.
+		//
+		// Only when the peer answered. A refused connection or an expired budget left
+		// no body for the cache to be blamed for, and a second request would just
+		// spend the budget again before moving on.
+		if !ok && answered {
+			peerData, _, peerErr = r.getSubtreeDataFromPeer(ctx, subtreeHash, subtree, peerURL, true)
+			meta, ok = tryBuild(peerURL+" (cache-busted)", peerData, peerErr)
+		}
+
+		if ok {
 			return meta, nil
 		}
 	}
@@ -142,8 +187,15 @@ func (r *SubtreeMetaRegenerator) getLocalSubtreeData(ctx context.Context, subtre
 // client would otherwise allow a hung peer the full http_streaming_timeout per
 // attempt, retries multiplied by that window.
 //
-// It bounds the whole fetch rather than any single attempt: under sustained 503
-// backoff the later attempts get progressively less of it.
+// It bounds one fetch, covering all of that fetch's 503 retries and its body
+// stream rather than any single attempt: under sustained 503 backoff the later
+// attempts get progressively less of it. It is NOT a whole-peer bound, because
+// RegenerateMeta can make a second, cache-busting fetch to the same peer, and
+// each fetch starts this budget afresh. Worst case per peer is therefore twice
+// this value, and worst case for one RegenerateMeta call is that again per
+// configured peer, which matters because the call runs in a validOrderAndBlessed
+// errgroup goroutine that holds a pooled parent-spends map for its whole
+// duration.
 //
 // Sized to match settings.DefaultSubtreeDataFetchTimeout, which bounds the same
 // subtree_data payload fetched from the same peer endpoint by
@@ -163,21 +215,39 @@ const DefaultPeerFetchTimeout = 10 * time.Minute
 // base URL already carries its API prefix, so only the resource path is
 // appended. Retries on 503 — the peer's asset service may reject under
 // admission control while it generates the file on-demand.
-func (r *SubtreeMetaRegenerator) getSubtreeDataFromPeer(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, peerURL string) (*subtreepkg.Data, error) {
+//
+// With bypassCache set the URL carries a cache-busting query parameter, so a
+// proxy cache in front of the peer cannot replay the answer the first attempt
+// already rejected.
+//
+// The second return value says the peer answered with a body, whether or not
+// that body deserialized. It is what tells the caller a cache-busting retry is
+// worth making: a body we could not use may be a poisoned cache entry, while a
+// refused connection or an expired budget produced no body for a cache to be
+// blamed for.
+func (r *SubtreeMetaRegenerator) getSubtreeDataFromPeer(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, peerURL string, bypassCache bool) (*subtreepkg.Data, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.peerFetchTimeout)
 	defer cancel()
 
 	url := fmt.Sprintf("%s/subtree_data/%s", peerURL, subtreeHash.String())
+	if bypassCache {
+		url = fmt.Sprintf("%s?cachebust=%d", url, cacheBustCounter.Add(1))
+	}
 
 	body, err := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() {
 		_ = body.Close()
 	}()
 
-	return subtreepkg.NewSubtreeDataFromReader(subtree, body)
+	data, err := subtreepkg.NewSubtreeDataFromReader(subtree, body)
+	if err != nil {
+		return nil, true, err
+	}
+
+	return data, true, nil
 }
 
 // buildAndStoreMeta creates meta from subtree data and stores it for future use
