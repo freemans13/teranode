@@ -45,6 +45,15 @@ func (s *Store) ApplyBlock(ctx context.Context, blockHash *chainhash.Hash, heigh
 		return false, errors.NewProcessingError("[utxoset][ApplyBlock] nil block hash")
 	}
 
+	// BEFORE the transaction, never inside it. The callback writes transaction bodies, and
+	// the window they land in is created by DDL that needs its own pool connection. Taking
+	// one while holding a transaction borrowed from the same pool is a nested acquire, and
+	// at pool_max_conns concurrent appliers every connection ends up held by a transaction
+	// waiting for a connection. That deadlock has no timeout.
+	if err := s.ensureTxBodyPartition(ctx, height); err != nil {
+		return false, err
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, errors.NewStorageError("[utxoset][ApplyBlock] begin %s", blockHash.String(), err)

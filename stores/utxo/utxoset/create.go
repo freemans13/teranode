@@ -41,6 +41,11 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT (leaf, txid) DO NOTHING
 RETURNING 1`
 
+// bodySQL files the serialized bytes in the window tx_ident's created_height names, so the
+// two always agree about where to look.
+const bodySQL = `
+INSERT INTO tx_body (created_height, txid, raw_tx) VALUES ($1, $2, $3)`
+
 // packMembership renders mined-block information into the packed form tx_ident carries:
 // 12-byte triples of block id, block height and subtree index, big-endian, in the order the
 // caller supplied. Insertion order is load-bearing -- the conformance suite requires subtree
@@ -102,6 +107,10 @@ func offChainSinceAt(infos []utxo.MinedBlockInfo, blockHeight uint32) *int32 {
 // postgres store's spendable_count and the aerospike store's ShouldStoreOutputAsUTXO
 // gate, so all three agree on what "spendable" means.
 func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
+	if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
+		return nil, err
+	}
+
 	return s.createIn(ctx, s.pool, tx, blockHeight, opts...)
 }
 
@@ -216,6 +225,12 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		return nil, errors.NewTxExistsError("[utxoset][Create] %s", txHash.String())
 	case err != nil:
 		return nil, errors.NewStorageError("[utxoset][Create] claim %s", txHash.String(), err)
+	}
+
+	// The bytes, filed in the window created_height names. Gated by the claim like the coin
+	// rows: a re-applied block must not write the body again, at a second height.
+	if _, err := q.Exec(ctx, bodySQL, int32(blockHeight), txHash[:], tx.Bytes()); err != nil {
+		return nil, errors.NewStorageError("[utxoset][Create] body %s", txHash.String(), err)
 	}
 
 	if len(ukeys) > 0 {

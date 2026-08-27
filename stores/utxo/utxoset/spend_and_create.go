@@ -61,6 +61,12 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		}
 	}
 
+	if !options.SpendOnly {
+		if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	dbTx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, errors.NewStorageError("[utxoset][SpendAndCreate] begin", err)

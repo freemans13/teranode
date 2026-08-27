@@ -48,6 +48,17 @@ type Store struct {
 
 	// journalRetention is how far back spends stay undoable, in blocks.
 	journalRetention uint32
+
+	// bodyWindow is the tx_body window the last create landed in, so the catalog is only
+	// touched when it changes.
+	bodyWindow atomic.Uint32
+
+	// bodyDDL serialises tx_body partition creation within this process, for the same
+	// reason journalDDL does: CREATE TABLE IF NOT EXISTS is not concurrency-safe.
+	bodyDDL sync.Mutex
+
+	// bodyRetention is how long the serialized transaction bytes are kept, in blocks.
+	bodyRetention uint32
 }
 
 // New opens the store and installs the schema.
@@ -75,7 +86,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
-		journalRetention: DefaultSpendJournalRetentionBlocks}
+		journalRetention: DefaultSpendJournalRetentionBlocks,
+		bodyRetention:    DefaultTxBodyRetentionBlocks}
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)

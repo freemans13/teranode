@@ -262,6 +262,38 @@ CREATE TABLE IF NOT EXISTS tx_ident (
         CHECK (membership IS NULL OR length(membership) % 12 = 0),
     PRIMARY KEY (leaf, txid)
 ) PARTITION BY LIST (leaf);
+
+-- ---------------------------------------------------------------------------
+-- THE BODY. Serialized transaction bytes, and nothing else.
+--
+-- This is the ONE part of a transaction whose life is bounded by a horizon rather
+-- than by its coins. Everything on tx_ident is pinned while any output is unspent,
+-- at any age, because the validator reads the parent's block ids and heights for
+-- every input it spends. Keeping the bytes there too would make the transaction
+-- archive permanent for that whole population: measured at 136 GB of out-of-line
+-- storage today against roughly 95 GB free on the mainnet box, and past the disk
+-- at the projected tip.
+--
+-- RANGE partitioned on created_height so reclaim is dropping a file. Measured on
+-- 18.6: a partition drop returned 883 MB to the operating system for 228 KB of
+-- crash-recovery journal, where the equivalent delete plus vacuum returned 128 KB
+-- for 1.75 GB.
+--
+-- Uniqueness here is LOCAL to a partition, and that is fine rather than a
+-- compromise: tx_ident already guarantees the txid appears once globally, and the
+-- claim gates this insert, so two rows for one txid cannot be written.
+--
+-- NO DEFAULT PARTITION, ever. On 18.6 a default partition makes
+-- ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY impossible on every other
+-- partition of the table, and the concurrent form is what keeps a drop from
+-- blocking readers.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tx_body (
+    created_height  INTEGER NOT NULL,
+    txid            BYTEA   NOT NULL,
+    raw_tx          BYTEA,
+    PRIMARY KEY (created_height, txid)
+) PARTITION BY RANGE (created_height);
 `
 
 // partitionSQL is applied per leaf.

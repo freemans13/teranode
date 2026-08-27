@@ -49,7 +49,8 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 	                       DROP TABLE IF EXISTS spend_journal CASCADE;
 	                       DROP TABLE IF EXISTS applied_block CASCADE;
 	                       DROP TABLE IF EXISTS applied_chunk CASCADE;
-	                       DROP TABLE IF EXISTS tx_ident CASCADE;`)
+	                       DROP TABLE IF EXISTS tx_ident CASCADE;
+	                       DROP TABLE IF EXISTS tx_body CASCADE;`)
 	pool.Close()
 
 	u, err := url.Parse(testDSN)
