@@ -153,6 +153,19 @@ type SQL struct {
 	// in-memory off-chain set (true) or the original SQL recursive CTE (false).
 	// Read once at construction from settings; not changed at runtime.
 	useInMemoryChainCheck bool
+	// chainCheckShadowCompare makes CheckBlockIsInCurrentChain compute the
+	// authoritative SQL answer alongside the in-memory one and compare them. Read
+	// once at construction from settings; not changed at runtime. Only consulted
+	// when useInMemoryChainCheck is true.
+	chainCheckShadowCompare bool
+	// chainCheckShadowChecks counts how many in-memory answers have been compared
+	// against the authoritative answer since startup. A soak needs this next to the
+	// mismatch count: zero mismatches is only good news if the comparison ran.
+	chainCheckShadowChecks atomic.Uint64
+	// chainCheckShadowMismatches counts how many times the in-memory answer and the
+	// authoritative answer have differed since startup. Exposed for the soak; a
+	// non-zero value means the forked-set route is not safe to run on its own yet.
+	chainCheckShadowMismatches atomic.Uint64
 	// mainChainRebuilding is a reference counter: each caller that is about to (or
 	// currently is) mutating the on_main_chain column Adds 1 on entry and Adds -1 on
 	// exit. While the counter is > 0, all queries that use on_main_chain fall back to
@@ -262,15 +275,16 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	useInMemory := tSettings.BlockChain.UseInMemoryChainCheck
 
 	s := &SQL{
-		db:                    db,
-		engine:                util.SQLEngine(storeURL.Scheme),
-		logger:                logger,
-		responseCache:         NewGenerationalCache(),
-		cacheTTL:              2 * time.Minute,
-		chainParams:           tSettings.ChainCfgParams,
-		rawMinerTag:           tSettings.BlockChain.RawMinerTag,
-		useInMemoryChainCheck: useInMemory,
-		blockTimestampCache:   newBlockTimestampCache(),
+		db:                      db,
+		engine:                  util.SQLEngine(storeURL.Scheme),
+		logger:                  logger,
+		responseCache:           NewGenerationalCache(),
+		cacheTTL:                2 * time.Minute,
+		chainParams:             tSettings.ChainCfgParams,
+		rawMinerTag:             tSettings.BlockChain.RawMinerTag,
+		useInMemoryChainCheck:   useInMemory,
+		chainCheckShadowCompare: tSettings.BlockChain.ChainCheckShadowCompare,
+		blockTimestampCache:     newBlockTimestampCache(),
 	}
 
 	s.backgroundDone = make(chan struct{})
@@ -1794,8 +1808,27 @@ func (s *SQL) backgroundRefreshLoop() {
 				s.lastSuccessfulRebuild.Store(time.Now().Unix())
 			}
 			cancel()
+
+			s.logShadowCompareTotals()
 		}
 	}
+}
+
+// logShadowCompareTotals prints the running totals of the forked-set shadow
+// comparison, so a soak can be read off the log without a debugger. Silent when the
+// comparison is off or has not run, because a line saying "0 of 0" every two minutes
+// is noise on the many nodes that never enable this.
+func (s *SQL) logShadowCompareTotals() {
+	if !s.useInMemoryChainCheck || !s.chainCheckShadowCompare {
+		return
+	}
+
+	checks := s.chainCheckShadowChecks.Load()
+	if checks == 0 {
+		return
+	}
+
+	s.logger.Infof("[CheckBlockIsInCurrentChain] shadow comparison totals: %d answers compared, %d mismatches", checks, s.chainCheckShadowMismatches.Load())
 }
 
 // reservationSweepInterval is how often reservationSweepLoop reclaims abandoned

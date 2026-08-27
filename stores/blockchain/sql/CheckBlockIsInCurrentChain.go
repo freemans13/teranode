@@ -55,38 +55,106 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		return s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
 	}
 
-	// Drop ids above the highest committed id. These are allocated-but-uncommitted
-	// (GetNextBlockID writes a tx's BlockIDs before AddBlock bumps maxBlockID), so
-	// they have no committed row and are definitively not on the main chain. This
-	// is a pure in-memory reject with no DB round-trip and is consensus-critical:
-	// it keeps useInMemoryChainCheck on/off nodes agreeing on dangling ids.
+	result, fromMemory, err := s.checkBlockIsInCurrentChainInMemory(ctx, blockIDs, maxID)
+	if err != nil {
+		return false, err
+	}
+
+	// While the forked-set route is being soaked, compute the same answer the
+	// authoritative way and compare. See shadowCompareChainCheck.
+	if fromMemory && s.chainCheckShadowCompare {
+		s.shadowCompareChainCheck(ctx, blockIDs, result)
+	}
+
+	return result, nil
+}
+
+// checkBlockIsInCurrentChainInMemory answers ANY-of "is one of blockIDs on the main
+// chain?" from the forked set and maxBlockID, with no query. fromMemory reports
+// whether it managed that: it is false only on the about-to-reject path, where every
+// candidate is in the forked set and the answer is confirmed against SQL first.
+//
+// Callers must have established that the in-memory route applies: the setting is on,
+// no main-chain rebuild is in flight, and maxID is initialised.
+func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs []uint32, maxID uint32) (bool, bool, error) {
+	s.offChainBlockIDsMu.RLock()
+	offChain := s.offChainBlockIDs
+	s.offChainBlockIDsMu.RUnlock()
+
 	candidates := make([]uint32, 0, len(blockIDs))
+
 	for _, id := range blockIDs {
-		if id <= maxID {
-			candidates = append(candidates, id)
+		// Drop ids above the highest committed id. These are allocated-but-uncommitted
+		// (AssignBlockID hands out an id, and the below-checkpoint sync paths stamp a
+		// tx's BlockIDs with it, before AddBlock bumps maxBlockID), so they have no
+		// committed row and are definitively not on the main chain. Pure in-memory
+		// reject, no round trip, and consensus-critical: it keeps useInMemoryChainCheck
+		// on/off nodes agreeing on ids that have been reserved but not yet stored.
+		if id > maxID {
+			continue
 		}
+
+		// Committed, and not in the forked set, so it is on the main chain. Answered
+		// from memory with no query. See the contract note on rebuildOffChainSet for
+		// why absence from the forked set is a positive proof here rather than the
+		// unsound guess it was before PR 1043 closed phantom-id creation.
+		if _, forked := offChain[id]; !forked {
+			return true, true, nil
+		}
+
+		candidates = append(candidates, id)
 	}
 
 	if len(candidates) == 0 {
-		return false, nil
+		return false, true, nil
 	}
 
-	// Confirm the committed candidates against the authoritative SQL route.
+	// Every candidate is in the forked set, so this call is about to reject. Confirm
+	// against the authoritative SQL before doing so.
 	//
-	// We deliberately do NOT use the in-memory off-chain set as a negative
-	// short-circuit. That set is rebuilt FROM the on_main_chain flags
-	// (rebuildOffChainSet), so a transiently-false flag on a block that IS on the
-	// best chain — a raced slow-path StoreBlock whose reconcileOnMainChain failed,
-	// or an exhausted startup rebuild — lands the block in the off-chain set and
-	// would make this a FALSE NEGATIVE. Because checkOldBlockIDs escalates a
-	// negative into a PERMANENT ValidateBlock invalidation, a transient flag must
-	// never be allowed to reject here. checkBlockIsInCurrentChainSQL confirms
-	// positives via the indexed on_main_chain flag and confirms negatives via the
-	// flag-free parent_id CTE, so it stays correct even while flags are mid-flux.
-	// This path is only reached when every parent block id of a tx is off-chain or
-	// uncommitted per the in-memory prefetch, which is rare, so the round-trip is
-	// not on the hot path.
-	return s.checkBlockIsInCurrentChainSQL(ctx, candidates)
+	// The forked set is rebuilt FROM the on_main_chain flags (rebuildOffChainSet), so
+	// a transiently-false flag on a block that IS on the best chain, a raced slow-path
+	// StoreBlock whose reconcileOnMainChain failed or an exhausted startup rebuild,
+	// lands that block in the forked set. Rejecting on it would be a FALSE NEGATIVE,
+	// and checkOldBlockIDs escalates a negative into a PERMANENT ValidateBlock
+	// invalidation that the self-healing flag never gets to undo. That is the incident
+	// PR 1086 fixed and this path preserves.
+	//
+	// The asymmetry is deliberate. Membership of the forked set is enough to stop the
+	// in-memory accept, never enough to reject on its own. Positives short-circuit
+	// above and never reach here, so the confirmation only costs anything on the rare
+	// about-to-reject call.
+	result, err := s.checkBlockIsInCurrentChainSQL(ctx, candidates)
+
+	return result, false, err
+}
+
+// shadowCompareChainCheck recomputes an in-memory answer the authoritative way and
+// records any disagreement. It is the instrument for the forked-set soak: the whole
+// question is whether the two routes ever differ on a live node, and the only honest
+// way to find out is to run both and count.
+//
+// Two properties matter more than the measurement. It never changes the answer, and
+// a shadow query that cannot run is not an error. Otherwise turning the instrument on
+// would make the node worse than leaving it off, and nobody would leave it on long
+// enough to learn anything.
+func (s *SQL) shadowCompareChainCheck(ctx context.Context, blockIDs []uint32, inMemoryResult bool) {
+	authoritative, err := s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
+	if err != nil {
+		s.logger.Debugf("[CheckBlockIsInCurrentChain] shadow comparison could not run for blocks (%v): %v", blockIDs, err)
+		return
+	}
+
+	s.chainCheckShadowChecks.Add(1)
+
+	if authoritative == inMemoryResult {
+		return
+	}
+
+	total := s.chainCheckShadowMismatches.Add(1)
+
+	s.logger.Errorf("[CheckBlockIsInCurrentChain] shadow mismatch #%d: forked-set route said %v, authoritative route said %v for blocks (%v). The forked-set route is not safe to run without the shadow comparison on this node.",
+		total, inMemoryResult, authoritative, blockIDs)
 }
 
 // checkBlockIsInCurrentChainSQL is the SQL fallback implementation used when
