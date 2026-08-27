@@ -277,11 +277,11 @@ func (r *SubtreeMetaRegenerator) getLocalSubtreeData(ctx context.Context, subtre
 	return data, false, nil
 }
 
-// DefaultPeerFetchTimeout is the fallback bound on one peer's fetch (all 503
-// retries plus the body stream) when the caller supplies no timeout. This fetch
-// runs inline in Block.Valid on a context with no deadline, where the shared
-// client would otherwise allow a hung peer the full http_streaming_timeout per
-// attempt, retries multiplied by that window.
+// DefaultPeerFetchTimeout is the fallback bound on one fetch (all 503 retries
+// plus the body stream) when the caller supplies no timeout. This fetch runs
+// inline in Block.Valid on a context with no deadline, where the shared client
+// would otherwise allow a hung peer the full http_streaming_timeout per attempt,
+// retries multiplied by that window.
 //
 // It bounds one fetch, covering all of that fetch's 503 retries and its body
 // stream rather than any single attempt: under sustained 503 backoff the later
@@ -383,7 +383,17 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 	// carry a placeholder would leave TxInpoints[0] unset on a later subtree that
 	// validateSubtree does not skip, and GetParentTxHashes returning nil there is
 	// a BlockInvalidError on a valid block.
-	hasCoinbasePlaceholder := isFirstSubtree && subtree.Length() > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+	//
+	// One read of the slice header, with both the guard and the index derived from
+	// it, for the reason MissingSubtreeDataTxs spells out: Length() takes the
+	// subtree's RWMutex and the direct index does not, while ReleaseNodes sets
+	// Nodes to nil without taking that mutex, so a release landing between the two
+	// reads turns the index into an out-of-range panic in an errgroup goroutine
+	// nothing recovers. Snapshotting removes the panic; it does not make the read
+	// synchronised, and cannot from here.
+	nodesSlice := subtree.Nodes
+	nodes := len(nodesSlice)
+	hasCoinbasePlaceholder := isFirstSubtree && nodes > 0 && nodesSlice[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
 
 	for i, tx := range data.Txs {
 		if tx == nil {
@@ -425,17 +435,17 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 	// Node 0 is exempt only where it holds the coinbase placeholder — the same
 	// condition validateSubtree uses to skip it, so the two agree rather than one
 	// leaving a hole the other then condemns the block for.
-	for i := 0; i < subtree.Length(); i++ {
+	for i := 0; i < nodes; i++ {
 		if i == 0 && hasCoinbasePlaceholder {
 			continue
 		}
 
-		if data.Txs[i] == nil {
-			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: no transaction for node %d of %d", i, subtree.Length())
+		if i >= len(data.Txs) || data.Txs[i] == nil {
+			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: no transaction for node %d of %d", i, nodes)
 		}
 
 		if meta.TxInpoints[i].ParentTxHashes == nil {
-			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] unserializable subtree meta: no parent inpoints for node %d of %d", i, subtree.Length())
+			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] unserializable subtree meta: no parent inpoints for node %d of %d", i, nodes)
 		}
 	}
 
