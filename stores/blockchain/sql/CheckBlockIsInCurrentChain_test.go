@@ -605,3 +605,60 @@ func TestCheckBlockIsInCurrentChain_ShadowCompare_CountsEveryComparison(t *testi
 	require.Equal(t, uint64(3), s.chainCheckShadowChecks.Load(), "every agreeing comparison must be counted too")
 	require.Zero(t, s.chainCheckShadowMismatches.Load())
 }
+
+// TestCheckBlockIsInCurrentChain_RebuildGuardSuppressesForkedSetRoute pins the
+// invariant that every caller mutating on_main_chain leans on.
+//
+// maxBlockID is advanced before the forked set is rebuilt, so between the two a
+// block that has just moved off the main chain is inside the id<=maxBlockID range
+// and not yet in the forked set. The in-memory route reads "not forked" as "on the
+// main chain", so it would answer true for a block that is not on it. What closes
+// that window is mainChainRebuilding: while it is held, CheckBlockIsInCurrentChain
+// must not answer from the forked set at all, and must go to the flag-free SQL.
+//
+// A gap id stands in for the mid-rebuild block here, because it is the input on
+// which the two routes are known to disagree: guard clear it comes back true from
+// the forked set, guard held it comes back false from SQL. Both halves are asserted,
+// so removing the guard from CheckBlockIsInCurrentChain fails this test rather than
+// silently widening the window StoreBlock, InvalidateBlock and RevalidateBlock all
+// hold the guard to cover.
+func TestCheckBlockIsInCurrentChain_RebuildGuardSuppressesForkedSetRoute(t *testing.T) {
+	const highID = 100000
+
+	s := newOnMainChainTestStoreWith(t, func(st *settings.Settings) {
+		st.BlockChain.UseInMemoryChainCheck = true
+		st.BlockChain.ChainCheckShadowCompare = false
+	})
+
+	_, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
+	committed, _, err := s.StoreBlock(context.Background(), block2, "", options.WithID(highID))
+	require.NoError(t, err)
+	require.Equal(t, uint64(highID), committed)
+
+	// Wait out any rebuild StoreBlock kicked off, so the guard state under test is
+	// the one this test sets rather than a leftover.
+	for s.mainChainRebuilding.Load() > 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	// Guard clear: the forked-set route answers, and a gap id comes back true.
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{highID - 1})
+	require.NoError(t, err)
+	require.True(t, result, "precondition: with the guard clear the forked-set route answers")
+
+	// Guard held: the forked-set route must be suppressed and SQL must answer.
+	s.mainChainRebuilding.Add(1)
+	defer s.mainChainRebuilding.Add(-1)
+
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{highID - 1})
+	require.NoError(t, err)
+	require.False(t, result, "while a rebuild is in flight the forked set must not be trusted")
+
+	// A genuinely on-chain id is still on-chain under the guard: the guard suppresses
+	// the fast path, it does not turn correct positives into invalidations.
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{highID})
+	require.NoError(t, err)
+	require.True(t, result)
+}

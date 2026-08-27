@@ -1687,6 +1687,48 @@ func (s *SQL) rebuildOnMainChainFlagTx(ctx context.Context, full bool) (err erro
 // The off-chain set is typically tiny (a few hundred blocks on all of mainnet history)
 // so this operation is fast even when it runs. The CTE walks the full main chain once
 // (O(chain_depth)), which is acceptable since rebuilds are infrequent.
+//
+// # Contract relied on by CheckBlockIsInCurrentChain
+//
+// The in-memory route in checkBlockIsInCurrentChainInMemory reads absence from this
+// set as positive proof of main-chain membership: an id at or below maxBlockID that is
+// not in here is answered "on the main chain" with no query at all. Three things have
+// to hold for that to be sound, and every caller of this function owes them.
+//
+// Every committed block is classified. The queries above enumerate the complement of
+// the main chain over the whole blocks table, so after a rebuild every committed id is
+// either on the main chain or in this set. Neither query has a height or window bound.
+//
+// No id at or below maxBlockID is missing a committed row. AssignBlockID resolves the
+// same block hash to the same id (committed row, then in-memory reservation, then the
+// durable block_id_reservations table, then a fresh nextval), and both stamping paths
+// recover that id from the stamps on retry, so a block that is retried commits at the
+// id already written onto its transactions rather than leaving a hole. An id that does
+// have a hole under it is a gap id, and it is the one input on which the two routes
+// disagree. TestCheckBlockIsInCurrentChain_GapIDDivergesBetweenRoutes writes that
+// divergence down, and blockchain_chain_check_shadow_compare is what would catch it on
+// a live node.
+//
+// Deleting a committed row is the other way to open a hole, and it stays open because
+// updateMaxBlockID only ever moves the bound up: after a DELETE, maxBlockID keeps the
+// pre-delete high-water mark for the life of the process while the row is gone. Today
+// the only caller of DeleteBlock is cmd/rewindblockchain, a separate binary that never
+// serves CheckBlockIsInCurrentChain and whose rewind deletes in descending height order,
+// so the node restarts with maxBlockID back at the surviving MAX(id) and the deleted ids
+// land above the bound where they are dropped. An in-process caller of DeleteBlock would
+// break that, and would need maxBlockID recomputed rather than advanced.
+//
+// A block moving off the main chain is invisible to readers until this set has caught
+// up. maxBlockID is advanced before the rebuild runs, so between the two a freshly
+// forked or invalidated block is inside the id<=maxBlockID range but not yet in this
+// set, and the in-memory route would answer true for it. Callers close that window by
+// holding mainChainRebuilding across BOTH the flag change and the rebuild, which sends
+// readers to the flag-free CTE for the whole of it. StoreBlock, InvalidateBlock and
+// RevalidateBlock all do; a new caller that mutates on_main_chain must too.
+//
+// The set itself is replaced wholesale under offChainBlockIDsMu and never mutated in
+// place, so a reader may snapshot the map pointer under RLock and then read it without
+// the lock.
 func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
 	var (
 		rows *sql.Rows
