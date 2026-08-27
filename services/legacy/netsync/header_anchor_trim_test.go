@@ -46,9 +46,11 @@ func TestSyncManager_ARewoundHeaderInFrontOfTheAnchorSurvivesTheCheckpointTrim(t
 	msg, round := linkedHeaders(anchor, 5, &nonce)
 	checkpoint := round[len(round)-1]
 
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 15, Hash: &checkpoint}
-
 	sm.resetHeaderState(&anchor, 10)
+
+	// resetHeaderState now derives the checkpoint from the height it is given,
+	// so the synthetic one this test needs is put back after it.
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 15, Hash: &checkpoint}
 	sm.headersFirstMode.Store(true)
 
 	// A block from the round that has just finished was parked, so its header
@@ -158,9 +160,11 @@ func TestSyncManager_AnAnchorDeliveredEarlyDoesNotCostTheRoundItsFirstBlock(t *t
 	round := append(append([]chainhash.Hash{}, firstHashes...), secondHashes...)
 	checkpoint := round[len(round)-1]
 
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 16, Hash: &checkpoint}
-
 	sm.resetHeaderState(&anchor, 10)
+
+	// resetHeaderState now derives the checkpoint from the height it is given,
+	// so the synthetic one this test needs is put back after it.
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 16, Hash: &checkpoint}
 	sm.headersFirstMode.Store(true)
 
 	sm.handleHeadersMsg(&headersMsg{headers: first, peer: syncPeer})
@@ -250,9 +254,11 @@ func TestSyncManager_TheAnchorIsNeverRacedFromASecondPeer(t *testing.T) {
 	round := append(append([]chainhash.Hash{}, firstHashes...), secondHashes...)
 	checkpoint := round[len(round)-1]
 
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 16, Hash: &checkpoint}
-
 	sm.resetHeaderState(&anchor, 10)
+
+	// resetHeaderState now derives the checkpoint from the height it is given,
+	// so the synthetic one this test needs is put back after it.
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 16, Hash: &checkpoint}
 	sm.headersFirstMode.Store(true)
 
 	sm.handleHeadersMsg(&headersMsg{headers: first, peer: syncPeer})
@@ -315,9 +321,11 @@ func TestSyncManager_TheRoundAfterACheckpointTrimsTheCheckpointNode(t *testing.T
 	firstRound, firstHashes := linkedHeaders(anchor, 3, &nonce)
 	firstCheckpoint := firstHashes[len(firstHashes)-1]
 
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 13, Hash: &firstCheckpoint}
-
 	sm.resetHeaderState(&anchor, 10)
+
+	// resetHeaderState now derives the checkpoint from the height it is given,
+	// so the synthetic one this test needs is put back after it.
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 13, Hash: &firstCheckpoint}
 	sm.headersFirstMode.Store(true)
 
 	// Round one, start to finish: the headers arrive, the anchor is trimmed, and

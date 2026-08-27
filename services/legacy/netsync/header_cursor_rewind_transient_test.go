@@ -94,13 +94,15 @@ func newDroppedBlock(t *testing.T, peerIdx uint8, backoffBase time.Duration, fai
 	// above the list instead leaves the node in the first half of a round, where
 	// the front is still an anchor already in the chain and nothing may ask for
 	// a block — so the walk under test would never run in production at all.
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 15, Hash: &hashes[len(hashes)-1]}
-
 	syncPeer, _, _ := connectRacePeer(t, peerIdx, 1000)
 	registerRacePeer(sm, syncPeer)
 	sm.storeSyncPeer(syncPeer, &syncPeerState{})
 
 	sm.resetHeaderState(&anchor, 10)
+
+	// resetHeaderState now derives the checkpoint from the height it is given,
+	// so the synthetic one this test needs is put back after it.
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 15, Hash: &hashes[len(hashes)-1]}
 	// resetHeaderState turns headers-first mode off; the walk under test only
 	// runs in headers-first mode.
 	sm.headersFirstMode.Store(true)

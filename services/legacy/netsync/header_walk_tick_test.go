@@ -52,9 +52,11 @@ func TestSyncManager_ATickBetweenHeaderBatchesDoesNotWedgeTheCheckpointTransitio
 	chain := append(append([]chainhash.Hash{}, firstHashes...), secondHashes...)
 	checkpoint := chain[len(chain)-1]
 
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 16, Hash: &checkpoint}
-
 	sm.resetHeaderState(&anchor, 10)
+
+	// resetHeaderState now derives the checkpoint from the height it is given,
+	// so the synthetic one this test needs is put back after it.
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 16, Hash: &checkpoint}
 	sm.headersFirstMode.Store(true)
 
 	// The first batch lands. It does not reach the checkpoint, so the anchor is
@@ -141,9 +143,11 @@ func TestSyncManager_AFreedInFlightSlotIsToppedUpMidRound(t *testing.T) {
 	msg, chain := linkedHeaders(anchor, 25, &nonce)
 	checkpoint := chain[len(chain)-1]
 
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 35, Hash: &checkpoint}
-
 	sm.resetHeaderState(&anchor, 10)
+
+	// resetHeaderState now derives the checkpoint from the height it is given,
+	// so the synthetic one this test needs is put back after it.
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 35, Hash: &checkpoint}
 	sm.headersFirstMode.Store(true)
 
 	// The batch reaches the checkpoint, so the anchor comes off the front and
@@ -230,9 +234,11 @@ func TestSyncManager_AGivenUpBlockAfterACheckpointTransitionIsAskedForAgain(t *t
 	msg, round := linkedHeaders(anchor, 5, &nonce)
 	checkpoint := round[len(round)-1]
 
-	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 11111, Hash: &checkpoint}
-
 	sm.resetHeaderState(&anchor, 11106)
+
+	// resetHeaderState now derives the checkpoint from the height it is given,
+	// so the synthetic one this test needs is put back after it.
+	sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 11111, Hash: &checkpoint}
 	sm.headersFirstMode.Store(true)
 
 	// The batch reaches the checkpoint, so the anchor is trimmed and the round's

@@ -313,3 +313,87 @@ func TestSyncManager_ACheckpointWithNothingLeftToReachDefersNothing(t *testing.T
 
 	require.Nil(t, sm.pendingCheckpoint.Load(), "there is no round left to ask for")
 }
+
+// TestSyncManager_ARebuiltHeaderStateAimsAtTheCheckpointAboveTheTip is the
+// recovery ChiR13 asks for, end to end.
+//
+// A checkpoint block committing with nobody to ask leaves the checkpoint where
+// it is on purpose, because the round of headers it owes has not been asked for.
+// The sync-peer rotation that follows rebuilds the header list from the tip, and
+// the tip is now at or past that checkpoint. Left as it was, startSync's
+// headers-first gate reads bestHeight < nextCheckpoint.Height as false for good:
+// the node takes the getblocks branch, headers-first mode stays off, and the
+// replay then sends a getheaders into a mode whose reply handler disconnects the
+// peer that answers.
+//
+// Rebuilding the list rebuilds the checkpoint it is aimed at, so the election
+// asks for the round itself, with the mode on, and the replay's own guard drops
+// the round because it really has been asked for.
+func TestSyncManager_ARebuiltHeaderStateAimsAtTheCheckpointAboveTheTip(t *testing.T) {
+	sm, first, final := newCheckpointManager(t)
+	sm.headersFirstMode.Store(true)
+
+	// The checkpoint block commits from the park with nobody to ask.
+	require.NoError(t, sm.checkpointBlockCommitted(nil, *first.Hash))
+	require.NotNil(t, sm.pendingCheckpoint.Load(), "sanity: the round is owed")
+
+	// The sync peer departs and updateSyncPeer rebuilds the header list around
+	// the tip, which is the checkpoint block that has just committed.
+	tip := chainhash.Hash{0xb0}
+	sm.resetHeaderState(&tip, first.Height)
+
+	require.False(t, sm.headersFirstMode.Load(), "sanity: rebuilding the list turns headers-first mode off")
+	require.Equal(t, final.Height, sm.nextCheckpointSnapshot().Height,
+		"the rebuilt list is aimed at the checkpoint above the tip, or startSync's headers-first gate is false for good")
+
+	// A candidate turns up and the ticker that elects sync peers runs.
+	_, rec := connectCheckpointCandidate(t, sm, 119)
+
+	sm.handleCheckSyncPeer()
+
+	require.True(t, WaitUntil(func() bool { return rec.askedForHeadersUpTo(*final.Hash) }, 5*time.Second),
+		"the election asks for the round itself, from its own headers-first branch")
+
+	require.True(t, sm.headersFirstMode.Load(),
+		"the election turned headers-first mode back on, so the peer is not disconnected for answering")
+	require.Zero(t, rec.getBlocksCount(), "the node is still below a checkpoint, so it must not fall back to inventory")
+	require.Nil(t, sm.pendingCheckpoint.Load(), "the round has been asked for, so the replay must have dropped it")
+}
+
+// TestSyncManager_ADeferredRoundIsNotAskedForWithHeadersFirstModeOff pins the
+// second half of ChiR13, the guard on the send itself.
+//
+// The replay is the only caller of checkpointBlockCommitted that does not arrive
+// through advanceHeaderListFor, which returns isCheckpointBlock false outright
+// when the mode is off. So it is the only one that has to establish that
+// precondition for itself, and a getheaders sent with the mode off costs the
+// peer its whole association: handleHeadersMsg disconnects a peer that sends
+// headers while the mode is off, ahead of even the empty-message check.
+//
+// The re-derive above is what stops this state arising, so this branch should
+// not be reachable today. It is pinned because the cost of getting it wrong is
+// the self-inflicted disconnect this PR exists to remove.
+func TestSyncManager_ADeferredRoundIsNotAskedForWithHeadersFirstModeOff(t *testing.T) {
+	sm, first, final := newCheckpointManager(t)
+	sm.headersFirstMode.Store(true)
+
+	require.NoError(t, sm.checkpointBlockCommitted(nil, *first.Hash))
+	require.NotNil(t, sm.pendingCheckpoint.Load(), "sanity: the round is owed")
+
+	// The mode goes off with the checkpoint left where it was, which is the
+	// state the replay must refuse to send into.
+	sm.headersFirstMode.Store(false)
+
+	peer, rec := connectHeaderRequestPeer(t, 120)
+	sm.storeSyncPeer(peer, &syncPeerState{})
+
+	sm.drainPendingCheckpoint()
+
+	require.Equal(t, first.Height, sm.nextCheckpointSnapshot().Height,
+		"the round was not asked for, so the checkpoint must not have been advanced past it")
+
+	// The send is over a real connection, so give it a window to arrive rather
+	// than reading the recorder the instant the call returns.
+	require.False(t, WaitUntil(func() bool { return rec.askedForHeadersUpTo(*final.Hash) }, 500*time.Millisecond),
+		"no getheaders may go out with the mode off: the peer would be disconnected for answering it")
+}

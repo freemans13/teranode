@@ -61,11 +61,14 @@ func TestSyncManager_CommittingAParkedBlockMidHeaderRoundDoesNotWedgeTheCheckpoi
 	round := append(append([]chainhash.Hash{}, firstHashes...), secondHashes...)
 	checkpoint := round[len(round)-1]
 
+	h.sm.resetHeaderState(&anchor, 10)
+
+	// resetHeaderState now derives the checkpoint from the height it is given,
+	// so the synthetic one this test needs is put back after it.
 	h.sm.headerMu.Lock()
 	h.sm.nextCheckpoint = &chaincfg.Checkpoint{Height: 16, Hash: &checkpoint}
 	h.sm.headerMu.Unlock()
 
-	h.sm.resetHeaderState(&anchor, 10)
 	h.sm.headersFirstMode.Store(true)
 
 	// The first batch lands. It does not reach the checkpoint, so the anchor is

@@ -915,6 +915,22 @@ func (sm *SyncManager) resetHeaderStateLocked(newestHash *chainhash.Hash, newest
 	// the front — must not be able to put that node back; see rewindHeaderCursor.
 	sm.headerListEpoch++
 
+	// The list is being rebuilt from newestHeight, so the checkpoint the old
+	// list was working towards may already be behind it: a checkpoint block that
+	// committed with nobody to ask leaves exactly that state, because the
+	// nil-peer arm of checkpointBlockCommitted deliberately does not advance.
+	// Left stale, startSync's headers-first gate reads
+	// bestHeight < nextCheckpoint.Height as false for good and the node never
+	// turns the mode back on. Deriving it here from the same two inputs New uses
+	// (manager.go, the findNextHeaderCheckpoint call in New) means whoever
+	// rebuilds the list also rebuilds the target it is aimed at.
+	//
+	// It cannot move the checkpoint backwards. nextCheckpoint is only ever set
+	// to findNextHeaderCheckpoint(prevCheckpointHeight) once the block at
+	// prevCheckpointHeight is in the chain, so newestHeight >= that height and
+	// findNextHeaderCheckpoint is monotonic in its argument.
+	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(newestHeight)
+
 	// When there is a next checkpoint, add an entry for the latest known
 	// block into the header pool.  This allows the next downloaded header
 	// to prove it links to the chain properly.
@@ -3113,6 +3129,22 @@ func (sm *SyncManager) drainPendingCheckpoint() {
 	peer := sm.loadSyncPeer()
 	if peer == nil {
 		sm.pendingCheckpoint.Store(pending)
+
+		return
+	}
+
+	// Belt and braces over the re-derive in resetHeaderStateLocked. This is the
+	// only caller of checkpointBlockCommitted that does not arrive through
+	// advanceHeaderListFor, which returns isCheckpointBlock false outright when
+	// the mode is off, so it is the only one that has to establish the mode for
+	// itself. Sending a getheaders with the mode off is not a no-op: the reply
+	// lands in handleHeadersMsg, which disconnects a peer that sends headers
+	// while the mode is off before it even checks whether the message is empty.
+	// With the mode off the round is the election's to ask for, and startSync's
+	// headers-first branch will ask for it once the re-derive has put a
+	// reachable checkpoint back in place.
+	if !sm.headersFirstMode.Load() {
+		sm.logger.Infof("[drainPendingCheckpoint][%s] headers-first mode is off, so the round is the election's to ask for; dropping it", pending.hash)
 
 		return
 	}
