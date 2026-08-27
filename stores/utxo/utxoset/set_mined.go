@@ -11,39 +11,53 @@ import (
 // stampSQL records a block against every transaction that does not already claim it, and
 // clears the mempool marker when the block is on the longest chain.
 //
+// Every key parameter is an ARRAY, so one statement serves one transaction or a whole block.
+// This used to queue one UPDATE per transaction down a single connection, which already cost
+// only one round trip, so the saving is not round trips. It is PostgreSQL parsing, planning
+// and executing one statement instead of thousands. The create path made the same move and
+// measured 4x on the batch flush, at the same batch widths a block arrives in.
+//
+// A hash named twice in one call is stamped once, because an UPDATE never applies to the same
+// target row twice within one statement. That matches what the per-transaction loop did, where
+// the second attempt found the block already recorded and skipped it.
+//
 // The append is guarded by position_of_the_block rather than by a plain concatenation, so
-// replaying a block does not record it twice.
+// replaying a block does not record it twice. The guard reads the row as it stood before this
+// statement, which is what makes a batch mixing already-stamped and never-stamped
+// transactions come out right in both directions.
 //
 // The marker is cleared only when the caller states the block is on the longest chain. That
 // is the same rule the create gate applies, and for the same reason: "mined into some block"
 // and "on the main chain" are different facts, and a transaction whose only block later
 // loses must stay in the mempool set.
 const stampSQL = `
-UPDATE tx_ident
+UPDATE tx_ident i
    SET membership = CASE
-           WHEN position($3::bytea in coalesce(membership, '\x'::bytea)) > 0 THEN membership
-           ELSE coalesce(membership, '\x'::bytea) || $3::bytea
+           WHEN position($3::bytea in coalesce(i.membership, '\x'::bytea)) > 0 THEN i.membership
+           ELSE coalesce(i.membership, '\x'::bytea) || $3::bytea
        END,
-       off_chain_since = CASE WHEN $4::boolean THEN NULL ELSE off_chain_since END
- WHERE leaf = $1 AND txid = $2`
+       off_chain_since = CASE WHEN $4::boolean THEN NULL ELSE i.off_chain_since END
+  FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
+ WHERE i.leaf = k.leaf AND i.txid = k.txid`
 
 // unstampSQL removes one block from a transaction's membership and puts it back in the
-// mempool set with a FRESH clock.
+// mempool set with a FRESH clock. Array-parameterised for the same reason stampSQL is.
 //
 // The clock is the store's current tip, NOT the transaction's creation height, and that is
 // the fact that decides whether these two columns are one concept or two. A transaction
 // created at height 100 and un-mined while the tip is 5,000 must wait from 5,000, or the
 // preservation pass fires on it immediately. Both reference stores do the same.
 const unstampSQL = `
-UPDATE tx_ident
+UPDATE tx_ident i
    SET membership = CASE
-           WHEN position($3::bytea in coalesce(membership, '\x'::bytea)) > 0
-           THEN overlay(membership placing ''::bytea
-                        from position($3::bytea in membership) for 12)
-           ELSE membership
+           WHEN position($3::bytea in coalesce(i.membership, '\x'::bytea)) > 0
+           THEN overlay(i.membership placing ''::bytea
+                        from position($3::bytea in i.membership) for 12)
+           ELSE i.membership
        END,
-       off_chain_since = $4
- WHERE leaf = $1 AND txid = $2`
+       off_chain_since = $4::int
+  FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
+ WHERE i.leaf = k.leaf AND i.txid = k.txid`
 
 // provePresentSQL is the SECOND statement, and splitting it out is not tidiness.
 //
@@ -64,34 +78,8 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		return map[chainhash.Hash][]uint32{}, nil
 	}
 
-	entry := packMembership([]utxo.MinedBlockInfo{info})
-
-	stmt := stampSQL
-	marker := any(nil)
-
-	if info.UnsetMined {
-		stmt = unstampSQL
-		// A fresh clock from the current tip. See unstampSQL.
-		marker = int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
-	}
-
-	batch := &pgxBatch{}
-	for _, h := range hashes {
-		if h == nil {
-			continue
-		}
-
-		if info.UnsetMined {
-			batch.queue(stmt, LeafFor(h[:]), h[:], entry, marker)
-		} else {
-			batch.queue(stmt, LeafFor(h[:]), h[:], entry, info.OnLongestChain)
-		}
-	}
-
-	if err := batch.send(ctx, s.pool); err != nil {
-		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
-	}
-
+	// Built once and used by both statements, so the set the stamp acted on and the set the
+	// postcondition is checked against cannot disagree.
 	leaves := make([]int16, 0, len(hashes))
 	txids := make([][]byte, 0, len(hashes))
 
@@ -102,6 +90,25 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 
 		leaves = append(leaves, LeafFor(h[:]))
 		txids = append(txids, h[:])
+	}
+
+	if len(txids) == 0 {
+		return map[chainhash.Hash][]uint32{}, nil
+	}
+
+	entry := packMembership([]utxo.MinedBlockInfo{info})
+
+	stmt := stampSQL
+	marker := any(info.OnLongestChain)
+
+	if info.UnsetMined {
+		stmt = unstampSQL
+		// A fresh clock from the current tip. See unstampSQL.
+		marker = int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
+	}
+
+	if _, err := s.pool.Exec(ctx, stmt, leaves, txids, entry, marker); err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
 	}
 
 	rows, err := s.pool.Query(ctx, provePresentSQL, leaves, txids)
