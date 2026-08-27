@@ -374,7 +374,12 @@ func (r *SubtreeMetaRegenerator) buildAndStoreMeta(ctx context.Context, subtreeH
 func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Subtree, data *subtreepkg.Data) (*subtreepkg.Meta, error) {
 	meta := subtreepkg.NewSubtreeMeta(subtree)
 
-	hasCoinbasePlaceholder := subtree.Length() > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+	// One read of the slice header, for the reason MissingSubtreeDataTxs spells
+	// out: Length() locks and the direct index does not, and ReleaseNodes nils
+	// Nodes without the subtree's mutex, so the two reads can disagree.
+	nodesSlice := subtree.Nodes
+	nodes := len(nodesSlice)
+	hasCoinbasePlaceholder := nodes > 0 && nodesSlice[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
 
 	for i, tx := range data.Txs {
 		if tx == nil {
@@ -396,7 +401,7 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 	// empty tail reads downstream as "transaction not found" and condemns a valid
 	// block.
 	if missing := MissingSubtreeDataTxs(subtree, data); missing > 0 {
-		return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: %d of %d txs missing", missing, subtree.Length())
+		return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: %d of %d txs missing", missing, nodes)
 	}
 
 	return meta, nil

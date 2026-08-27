@@ -61,8 +61,19 @@ func MissingSubtreeDataTxs(subtree *subtreepkg.Subtree, data *subtreepkg.Data) i
 		txs = data.Txs
 	}
 
-	nodes := subtree.Length()
-	coinbaseAtZero := nodes > 0 && subtree.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+	// One read of the slice header, with both the guard and the index derived
+	// from it. Subtree.Length() takes the subtree's own RWMutex and returns
+	// len(st.Nodes), but Subtree.ReleaseNodes sets st.Nodes = nil WITHOUT taking
+	// that mutex, so length-then-index would be two separate reads of Nodes and a
+	// release landing between them turns the index into an out-of-range on a
+	// zero-length slice. Both callers reach this with a *Subtree captured out of
+	// Block.SubtreeSlices without holding subtreeSlicesMu, which is the window
+	// releaseSubtreeNodesLocked runs in, and the panic would land in a
+	// per-subtree errgroup goroutine that nothing recovers, killing the node
+	// rather than failing the block.
+	nodesSlice := subtree.Nodes
+	nodes := len(nodesSlice)
+	coinbaseAtZero := nodes > 0 && nodesSlice[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
 
 	missing := 0
 
