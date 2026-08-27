@@ -18,10 +18,6 @@ func (s *Store) Delete(_ context.Context, _ *chainhash.Hash) error {
 	return errM1("Delete")
 }
 
-func (s *Store) SetMinedMulti(_ context.Context, _ []*chainhash.Hash, _ utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
-	return nil, errM1("SetMinedMulti")
-}
-
 func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
 	return nil, errM1("ScanInconsistentUnminedTxs")
 }
