@@ -12,19 +12,10 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
-
-func (s *Store) Get(_ context.Context, _ *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
-	return nil, errM1("Get")
-}
 
 func (s *Store) Delete(_ context.Context, _ *chainhash.Hash) error {
 	return errM1("Delete")
-}
-
-func (s *Store) GetMeta(_ context.Context, _ *chainhash.Hash, _ *meta.Data) error {
-	return errM1("GetMeta")
 }
 
 func (s *Store) SetMinedMulti(_ context.Context, _ []*chainhash.Hash, _ utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
