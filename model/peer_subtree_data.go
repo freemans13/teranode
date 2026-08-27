@@ -15,9 +15,14 @@ import (
 // proxy cache replaying a failed or aborted on-demand generation as
 // "200 + 0 bytes".
 //
-// Two distinct disasters follow from trusting such a body, which is why both
-// the subtree meta regenerator and blockvalidation's catchup subtree_data
-// fetcher call this one predicate rather than each keeping their own copy:
+// This is the shared answer to one question — can this body satisfy this
+// subtree — asked by the two places that judge a subtree_data body as a whole:
+// blockvalidation's catchup fetcher and the subtree meta regenerator's local
+// read. buildMetaFromSubtreeData asks a finer version of it, node by node so it
+// can name the one that is missing, and keeps its own loop; the index-0 rule
+// below is the part all three have to agree on, so it lives here.
+//
+// Two distinct disasters follow from trusting an unsatisfying body:
 //
 //   - A meta derived from it records no parents for the missing tail.
 //     GetParentTxHashes then returns nil with no error, validOrderAndBlessed
@@ -30,14 +35,32 @@ import (
 //     Txs[0].SerializeBytes() on a nil *bt.Tx (IsExtended is nil-safe, so it
 //     falls through to Bytes -> toBytesHelper -> Size).
 //
-// So index 0 counts as missing unless it genuinely holds the coinbase
-// placeholder — the only case Serialize actually tolerates. Exempting index 0
-// unconditionally, matching Serialize's literal `i != 0`, would let such a body
-// through with a count of zero and land the panic in a per-subtree errgroup
-// goroutine that no recover() covers. That is reachable without malice: a
-// non-first subtree has no coinbase placeholder, so any block whose transaction
-// count is congruent to 1 modulo the subtree size ends with a one-node subtree
-// holding a real tx hash at index 0.
+// exemptPlaceholderAtZero decides whether a nil entry under a coinbase
+// placeholder at index 0 counts as missing, and it is the caller's decision
+// rather than something inferred here, because the two callers are protecting
+// different things and the right answer differs.
+//
+// The meta regenerator passes whether this really is the block's first subtree.
+// validateSubtree skips node 0 only for sIdx 0, so a later subtree that happens
+// to carry the placeholder hash there must still have its node 0 filled: a meta
+// with that entry unset makes GetParentTxHashes return nil, which reads
+// downstream as "transaction not found" and condemns a valid block. Inferring
+// from the hash would exempt it and leave exactly that hole.
+//
+// The catchup fetcher passes true, because it is not building a meta. It is
+// keeping Data.Serialize from walking into a nil *bt.Tx, and Serialize's own
+// rule is the hash at index 0 whatever the subtree's position, so rejecting a
+// body Serialize would have handled would charge a peer for a response that was
+// fine.
+//
+// What must never happen either way is exempting index 0 unconditionally,
+// matching Serialize's literal `i != 0` rather than what it safely tolerates.
+// That lets a body through with a count of zero and lands the panic in a
+// per-subtree errgroup goroutine that no recover() covers. It is reachable
+// without malice: a non-first subtree has no coinbase placeholder, so any block
+// whose transaction count is congruent to 1 modulo the subtree size ends with a
+// one-node subtree holding a real tx hash at index 0.
+//
 // The count is driven by the subtree's nodes rather than by len(data.Txs), so a
 // body carrying fewer entries than the subtree has nodes counts the shortfall
 // instead of reporting the entries it does have as complete. Today those two
@@ -51,7 +74,7 @@ import (
 // genuinely zero. That is arithmetic rather than a fail-open default — no body
 // can be judged against a subtree that is not there, and neither caller can
 // reach it, both holding a subtree they have already deserialized against.
-func MissingSubtreeDataTxs(subtree *subtreepkg.Subtree, data *subtreepkg.Data) int {
+func MissingSubtreeDataTxs(subtree *subtreepkg.Subtree, data *subtreepkg.Data, exemptPlaceholderAtZero bool) int {
 	if subtree == nil {
 		return 0
 	}
@@ -71,9 +94,14 @@ func MissingSubtreeDataTxs(subtree *subtreepkg.Subtree, data *subtreepkg.Data) i
 	// releaseSubtreeNodesLocked runs in, and the panic would land in a
 	// per-subtree errgroup goroutine that nothing recovers, killing the node
 	// rather than failing the block.
+	//
+	// This removes the panic. It does not make the read synchronised: a release
+	// concurrent with this call is still a data race on st.Nodes, just one that
+	// now yields a stale-but-valid slice header rather than a crash. Closing it
+	// properly needs the lock to move into go-subtree's ReleaseNodes.
 	nodesSlice := subtree.Nodes
 	nodes := len(nodesSlice)
-	coinbaseAtZero := nodes > 0 && nodesSlice[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
+	coinbaseAtZero := exemptPlaceholderAtZero && nodes > 0 && nodesSlice[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)
 
 	missing := 0
 

@@ -643,8 +643,20 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 	// Reject a response the subtree cannot be satisfied by, before Serialize turns it
 	// into a generic ErrSubtreeLengthMismatch that names no peer — or panics on a nil
 	// tx at index 0. model.MissingSubtreeDataTxs owns that reasoning, shared with the
-	// subtree meta regenerator so the two cannot drift on it.
-	missing := model.MissingSubtreeDataTxs(subtree, subtreeData)
+	// subtree meta regenerator's local read so the two cannot drift on it. The
+	// regenerator's meta build asks a finer version of the same question, node by
+	// node, and keeps its own loop; the index-0 rule is the part the three have to
+	// agree on and it lives in the predicate.
+	//
+	// The exemption argument is true here, which is Data.Serialize's own rule
+	// rather than validateSubtree's. Nothing on this path builds a meta: it stores
+	// the body, and the reason to reject an unsatisfying one is that Serialize
+	// walks into a nil *bt.Tx at index 0. Serialize skips index 0 whenever Nodes[0]
+	// holds the placeholder, whatever the subtree's position, so a stricter rule
+	// here would reject a body Serialize would have handled and charge the peer for
+	// it. The regenerator passes the subtree's real position instead, because a
+	// meta does have to agree with validateSubtree.
+	missing := model.MissingSubtreeDataTxs(subtree, subtreeData, true)
 
 	bytesRead := subtreeDataReader.BytesRead()
 
