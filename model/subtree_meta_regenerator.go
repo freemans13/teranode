@@ -95,17 +95,25 @@ func NewSubtreeMetaRegenerator(logger ulogger.Logger, subtreeStore SubtreeStoreW
 }
 
 // RegenerateMeta attempts to rebuild meta from subtreedata (local store or peers)
-// Returns the regenerated meta or an error if regeneration fails
+// Returns the regenerated meta or an error if regeneration fails.
+//
+// Two things happen here beyond walking the sources in order. A peer that
+// answered with a body too short for the subtree is asked once more on a
+// cache-busting URL, because the likeliest cause is a proxy cache replaying an
+// aborted generation. And a local subtree_data file that exists but cannot
+// satisfy the subtree is overwritten with the first complete peer body, because
+// this node serves that file outward whether or not it can use it itself.
 func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, isFirstSubtree bool) (*subtreepkg.Meta, error) {
 	r.logger.Warnf("[RegenerateMeta][%s] attempting to regenerate subtree meta", subtreeHash.String())
 
 	// A successful read is not a successful rebuild: go-subtree's data
 	// deserializer stops at io.EOF without reporting that it filled fewer nodes
 	// than the subtree has, so a truncated .subtreeData comes back with a nil
-	// error and only fails buildAndStoreMeta's completeness check. Treating that
-	// like a read failure — rather than returning it — is what keeps the peer
-	// fallback reachable; otherwise a truncated local file strands a block that
-	// any peer could repair.
+	// error and is rejected only by a completeness check — getLocalSubtreeData's
+	// for the local file, buildAndStoreMeta's for a peer body. Treating that like
+	// a read failure — rather than returning it — is what keeps the peer fallback
+	// reachable; otherwise a truncated local file strands a block that any peer
+	// could repair.
 	var lastErr error
 
 	tryBuild := func(source string, data *subtreepkg.Data, readErr error) (*subtreepkg.Meta, bool) {
@@ -129,9 +137,20 @@ func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash
 		return meta, true
 	}
 
-	data, err := r.getLocalSubtreeData(ctx, subtreeHash, subtree)
+	// localPoisoned says a subtree_data file is present locally and cannot satisfy
+	// this subtree. That is worse than a source we simply cannot use: the asset
+	// service serves that same file verbatim to any peer that asks for
+	// GET /api/v1/subtree_data/<hash>, checking only that it Exists. Falling
+	// through to a peer would leave this node validating happily while still
+	// handing the bad body outward, so a peer body that turns out complete is
+	// written back over it below.
+	data, localPoisoned, err := r.getLocalSubtreeData(ctx, subtreeHash, subtree, isFirstSubtree)
 	if meta, ok := tryBuild("local", data, err); ok {
 		return meta, nil
+	}
+
+	if localPoisoned {
+		r.logger.Warnf("[RegenerateMeta][%s] the local subtree_data cannot satisfy this subtree, so this node is serving a bad body to every peer that asks for it; a complete peer body will be written back over it", subtreeHash.String())
 	}
 
 	for _, peerURL := range r.peerURLs {
@@ -157,6 +176,16 @@ func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash
 		}
 
 		if ok {
+			// The stored meta spares our own future validations the regenerator
+			// entirely, but the file the asset service serves is subtree_data, not the
+			// meta. Nothing on the validation path rewrites it before its DAH expires:
+			// the only other writer that can replace it is catchup's
+			// fetchAndStoreSubtreeData, which runs on a different path and would have
+			// to fetch this subtree again to get there.
+			if localPoisoned {
+				r.repairLocalSubtreeData(ctx, subtreeHash, peerData)
+			}
+
 			return meta, nil
 		}
 	}
@@ -164,21 +193,88 @@ func (r *SubtreeMetaRegenerator) RegenerateMeta(ctx context.Context, subtreeHash
 	return nil, errors.NewProcessingError("[RegenerateMeta][%s] subtreedata not available locally or from peers", subtreeHash.String(), lastErr)
 }
 
-// getLocalSubtreeData reads subtree data from local store
-func (r *SubtreeMetaRegenerator) getLocalSubtreeData(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree) (*subtreepkg.Data, error) {
+// repairLocalSubtreeData overwrites a poisoned local subtree_data file with a
+// peer body already verified to satisfy the subtree.
+//
+// Best effort throughout, deliberately: the regeneration this is called from has
+// already succeeded, and failing it because the repair failed would turn a
+// recovered block back into a stalled one. Every failure is a Warn, because a
+// node that stays a poisoned source is worth reporting even when its own
+// validation is fine.
+//
+// The DAH matches storeRegeneratedMeta's, so the repaired body expires with the
+// meta built from it rather than outliving it.
+func (r *SubtreeMetaRegenerator) repairLocalSubtreeData(ctx context.Context, subtreeHash *chainhash.Hash, data *subtreepkg.Data) {
 	if r.subtreeStore == nil {
-		return nil, errors.NewNotFoundError("subtree store not available")
+		return
+	}
+
+	// Data.Serialize indexes Subtree.Nodes[0] before it validates anything, so a
+	// data carrying no subtree, or one with no nodes, panics rather than
+	// returning an error. This runs in a validOrderAndBlessed errgroup goroutine
+	// that no recover() covers, and neither shape is repairable anyway.
+	if data == nil || data.Subtree == nil || len(data.Subtree.Nodes) == 0 {
+		return
+	}
+
+	serialized, err := data.Serialize()
+	if err != nil {
+		r.logger.Warnf("[repairLocalSubtreeData][%s] peer body will not serialize, the poisoned local subtree_data stays in place and is still served to peers: %v", subtreeHash.String(), err)
+
+		return
+	}
+
+	dah := r.getBlockHeight() + r.blockHeightRetention
+	if err := r.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData, serialized,
+		options.WithAllowOverwrite(true), options.WithDeleteAt(dah)); err != nil {
+		r.logger.Warnf("[repairLocalSubtreeData][%s] failed to overwrite the poisoned local subtree_data, it is still served to peers: %v", subtreeHash.String(), err)
+
+		return
+	}
+
+	r.logger.Warnf("[repairLocalSubtreeData][%s] replaced the poisoned local subtree_data with the complete peer body", subtreeHash.String())
+}
+
+// getLocalSubtreeData reads subtree data from local store.
+//
+// The second return value reports that a subtree_data file exists in the store
+// and cannot satisfy the subtree, which is a strictly worse condition than the
+// file being absent and is why it is reported separately from the error. The
+// asset service's GetSubtreeDataReader checks only Exists before streaming the
+// file back on GET /api/v1/subtree_data/<hash>, with no validation of the body,
+// so while such a file sits on disk this node is a poisoned source for every
+// peer that asks. A missing file has no such consequence: the asset service
+// regenerates it on demand from the subtree instead.
+//
+// Both unusable shapes count. A body that stops at a clean io.EOF short of the
+// subtree's length deserializes "successfully" and is caught by
+// MissingSubtreeDataTxs; a body truncated mid-transaction fails inside
+// NewSubtreeDataFromReader instead. The file is on disk either way, so it is
+// served outward either way.
+func (r *SubtreeMetaRegenerator) getLocalSubtreeData(ctx context.Context, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, isFirstSubtree bool) (*subtreepkg.Data, bool, error) {
+	if r.subtreeStore == nil {
+		return nil, false, errors.NewNotFoundError("subtree store not available")
 	}
 
 	reader, err := r.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 	if err != nil {
-		return nil, err
+		// No file, or none we can open. Nothing is being served outward.
+		return nil, false, err
 	}
 	defer func() {
 		_ = reader.Close()
 	}()
 
-	return subtreepkg.NewSubtreeDataFromReader(subtree, reader)
+	data, err := subtreepkg.NewSubtreeDataFromReader(subtree, reader)
+	if err != nil {
+		return nil, true, err
+	}
+
+	if missing := MissingSubtreeDataTxs(subtree, data, isFirstSubtree); missing > 0 {
+		return nil, true, errors.NewProcessingError("[RegenerateMeta][%s] local subtree_data is incomplete (%d of %d txs missing)", subtreeHash.String(), missing, subtree.Length())
+	}
+
+	return data, false, nil
 }
 
 // DefaultPeerFetchTimeout is the fallback bound on one peer's fetch (all 503

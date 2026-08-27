@@ -31,6 +31,7 @@ import (
 type mockSubtreeStoreWriter struct {
 	storedMeta  map[string][]byte
 	subtreeData map[string][]byte
+	setOptions  []*options.Options
 	getErr      error
 	setErr      error
 }
@@ -54,11 +55,24 @@ func (m *mockSubtreeStoreWriter) GetIoReader(_ context.Context, key []byte, file
 	return nil, errors.NewNotFoundError("not found")
 }
 
-func (m *mockSubtreeStoreWriter) Set(_ context.Context, key []byte, fileType fileformat.FileType, value []byte, _ ...options.FileOption) error {
+// Set routes a subtree_data write back into the same map GetIoReader reads
+// from, the way a real blob store does. Without that a repair of a poisoned
+// local file would be unobservable: the test could only assert that a write
+// happened, never that a later read returns the repaired body.
+func (m *mockSubtreeStoreWriter) Set(_ context.Context, key []byte, fileType fileformat.FileType, value []byte, opts ...options.FileOption) error {
 	if m.setErr != nil {
 		return m.setErr
 	}
+
+	m.setOptions = append(m.setOptions, options.NewFileOptions(opts...))
+
+	if fileType == fileformat.FileTypeSubtreeData {
+		m.subtreeData[string(key)+"."+string(fileType)] = value
+		return nil
+	}
+
 	m.storedMeta[string(key)+"."+string(fileType)] = value
+
 	return nil
 }
 
@@ -830,9 +844,16 @@ func TestSubtreeMetaRegenerator_PlaceholderExemptionMatchesValidateSubtree(t *te
 		// validateSubtree would not skip node 0 here, so a meta with no inpoints
 		// there gets the block condemned. Failing regeneration keeps the error
 		// transient instead.
+		//
+		// The rejection now fires one layer earlier than it used to, in the local
+		// read rather than in buildMetaFromSubtreeData, because the local read has
+		// to classify the file as poisoned before the peer loop can decide whether
+		// to write a good body back over it. Both layers apply the same index-0
+		// rule, so what is pinned here is the verdict and the node it names, not
+		// which function produced the line.
 		meta, err := regenerator.RegenerateMeta(ctx, subtreeHash, subtree, false)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "no transaction for node 0")
+		require.Contains(t, err.Error(), "local subtree_data is incomplete (1 of 2 txs missing)")
 		require.Nil(t, meta)
 	})
 }
@@ -1341,4 +1362,146 @@ func TestNewCacheBustCounter_IsClockSeeded(t *testing.T) {
 
 	require.GreaterOrEqual(t, seed, uint64(before), "the counter must start from the clock, not from zero")
 	require.LessOrEqual(t, seed, uint64(after))
+}
+
+// TestSubtreeMetaRegenerator_PoisonedLocalData_IsRepairedFromThePeerBody pins
+// the end state of the file the consequence actually lives on.
+//
+// Falling through to a peer fixes this node's own validation and nothing else.
+// The asset service's GetSubtreeDataReader checks only
+// Exists(hash, FileTypeSubtreeData) and then streams the file back verbatim on
+// GET /api/v1/subtree_data/<hash> — the same route this regenerator fetches
+// from — so a node that routes around its own poisoned file goes on serving
+// that file to every peer that asks, for as long as its DAH lasts. That turns a
+// loud local failure into a silent outward one. So the assertion here is on the
+// store, not on the call: after a peer source succeeds, reading the local
+// subtree_data back must yield the complete body.
+func TestSubtreeMetaRegenerator_PoisonedLocalData_IsRepairedFromThePeerBody(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, full, truncated := buildTruncatableSubtreeData(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/subtree_data/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full)
+	}))
+	defer server.Close()
+
+	dataKey := string(subtreeHash[:]) + "." + string(fileformat.FileTypeSubtreeData)
+
+	mockStore := newMockSubtreeStoreWriter()
+	mockStore.subtreeData[dataKey] = truncated
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, mockStore,
+		[]string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
+
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
+	require.NoError(t, err)
+	requireCompleteMeta(t, meta, subtree.Length())
+
+	// The end state, read back through the same accessor the asset service uses.
+	require.Equal(t, full, mockStore.subtreeData[dataKey],
+		"the poisoned local subtree_data must be overwritten with the complete peer body, or this node keeps serving the short one")
+
+	// And it has to be readable as a complete body, not merely equal by bytes:
+	// this is what the asset service hands a peer and what that peer then judges.
+	reader, err := mockStore.GetIoReader(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeData)
+	require.NoError(t, err)
+
+	defer func() {
+		_ = reader.Close()
+	}()
+
+	repaired, err := subtreepkg.NewSubtreeDataFromReader(subtree, reader)
+	require.NoError(t, err)
+	require.Zero(t, MissingSubtreeDataTxs(subtree, repaired, true),
+		"the repaired local body must satisfy the subtree it is stored under")
+
+	// The repaired body must carry the same DAH as the meta built from it so it
+	// does not outlive it, and the overwrite has to be requested explicitly or a
+	// real blob store rejects the write.
+	var sawRepair bool
+
+	for _, opt := range mockStore.setOptions {
+		if opt.AllowOverwrite {
+			sawRepair = true
+
+			require.Equal(t, uint32(100+288), opt.DAH,
+				"the repaired subtree_data must expire with the meta regenerated from it")
+		}
+	}
+
+	require.True(t, sawRepair, "the repair must pass WithAllowOverwrite, or a real blob store rejects the write")
+}
+
+// TestSubtreeMetaRegenerator_AbsentLocalData_IsNotWrittenBack pins the other
+// half of the repair rule: only a file that EXISTS and is unusable is
+// overwritten. A missing subtree_data is not an outward poison at all, because
+// the asset service regenerates it on demand from the subtree, so writing a
+// fresh copy here would resurrect a file the retention policy may have deleted
+// and pay a full-body write on the ordinary missing-meta path.
+func TestSubtreeMetaRegenerator_AbsentLocalData_IsNotWrittenBack(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, full, _ := buildTruncatableSubtreeData(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/subtree_data/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full)
+	}))
+	defer server.Close()
+
+	mockStore := newMockSubtreeStoreWriter()
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, mockStore,
+		[]string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
+
+	_, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
+	require.NoError(t, err)
+
+	require.Empty(t, mockStore.subtreeData, "an absent local subtree_data must not be written back")
+}
+
+// TestSubtreeMetaRegenerator_RepairFailure_DoesNotFailRegeneration pins the
+// repair as best effort. The regeneration it runs inside has already succeeded;
+// failing the block because the repair write failed would turn a recovered
+// block back into a stalled one, which is the failure mode this whole path
+// exists to remove.
+func TestSubtreeMetaRegenerator_RepairFailure_DoesNotFailRegeneration(t *testing.T) {
+	allowLoopbackHTTP(t)
+
+	subtree, subtreeHash, full, truncated := buildTruncatableSubtreeData(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/subtree_data/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full)
+	}))
+	defer server.Close()
+
+	mockStore := newMockSubtreeStoreWriter()
+	mockStore.subtreeData[string(subtreeHash[:])+"."+string(fileformat.FileTypeSubtreeData)] = truncated
+	mockStore.setErr = errors.NewStorageError("store is read only")
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, mockStore,
+		[]string{server.URL + "/api/v1"}, func() uint32 { return 100 }, 288, 0)
+
+	meta, err := regenerator.RegenerateMeta(context.Background(), subtreeHash, subtree, true)
+
+	require.NoError(t, err, "a failed repair must not fail a regeneration that otherwise succeeded")
+	requireCompleteMeta(t, meta, subtree.Length())
 }
