@@ -39,7 +39,10 @@ type journalPruner struct {
 
 // Start does nothing. The pruner service drives Prune once per block; there is no
 // background loop here to fall behind.
-func (journalPruner) Start(_ context.Context) {}
+func (journalPruner) Start(_ context.Context) {
+	// Deliberately empty: the pruner service calls Prune once per block off its own
+	// goroutine, so there is nothing for this store to start and nothing to stop.
+}
 
 // Prune reclaims journal leaves that have aged out at this height.
 //
@@ -109,7 +112,11 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 // AddObserver accepts and discards. Observers are notified when a pruning cycle completes,
 // and nothing registers one: the SQL pruner's AddObserver is also a no-op and
 // services/pruner/server.go never calls it.
-func (journalPruner) AddObserver(_ pruner.Observer) {}
+func (journalPruner) AddObserver(_ pruner.Observer) {
+	// Deliberately empty: nothing registers an observer, and the SQL store's
+	// AddObserver is a no-op for the same reason. Storing one here would be dead
+	// state that reads as a working notification path.
+}
 
 // GetPrunerService satisfies pruner.PrunerServiceProvider.
 //
