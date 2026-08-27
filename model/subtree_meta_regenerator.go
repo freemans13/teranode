@@ -362,7 +362,14 @@ func (r *SubtreeMetaRegenerator) buildAndStoreMeta(ctx context.Context, subtreeH
 		return nil, err
 	}
 
-	r.storeRegeneratedMeta(ctx, subtreeHash, meta)
+	// A meta that will not serialize is unusable, so the source fails and
+	// RegenerateMeta moves to the next one rather than handing the caller a meta
+	// its own serializer just refused. A Set failure is different and stays a
+	// warning inside storeRegeneratedMeta: the meta is fine, only the cache write
+	// missed.
+	if err := r.storeRegeneratedMeta(ctx, subtreeHash, meta); err != nil {
+		return nil, err
+	}
 
 	// The outcome is logged by RegenerateMeta, at Info and naming the source that
 	// worked. Repeating it here — at Warn, and without the source — is the noise
@@ -404,25 +411,66 @@ func (r *SubtreeMetaRegenerator) buildMetaFromSubtreeData(subtree *subtreepkg.Su
 		return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] incomplete subtree data: %d of %d txs missing", missing, nodes)
 	}
 
+	// The check above is about the SOURCE; this one is about the PRODUCT, and
+	// they are not the same question. SetTxInpointsFromTx writes at
+	// Subtree.NodeIndex(txid) rather than at the body index, and
+	// NewTxInpointsFromTx yields a nil ParentTxHashes for a transaction with no
+	// inputs (newSizedFromInputs returns a bare TxInpoints{} at len(inputs) == 0),
+	// so a fully populated data.Txs can still leave a meta entry unset. nil
+	// genuinely means unset here: NewTxInpoints deliberately returns a
+	// non-nil-but-empty slice so Meta.Serialize can tell "no inpoints set yet"
+	// from "this node has no parents".
+	//
+	// Meta.Serialize is the only other detector and it exempts index 0
+	// unconditionally, so an unset entry at index 0 of a non-first subtree would
+	// serialize and be persisted with a DAH. Index 0 is exempted here only when it
+	// genuinely holds the coinbase placeholder, matching MissingSubtreeDataTxs
+	// rather than Serialize's literal `i != 0`.
+	//
+	// No path is known where a block that would otherwise be valid reaches this,
+	// so it is defence in depth rather than a live bug.
+	for i := 0; i < nodes; i++ {
+		if i == 0 && hasCoinbasePlaceholder {
+			continue
+		}
+
+		if meta.TxInpoints[i].ParentTxHashes == nil {
+			return nil, errors.NewProcessingError("[buildMetaFromSubtreeData] meta entry %d of %d was never set from the subtree data", i, nodes)
+		}
+	}
+
 	return meta, nil
 }
 
-// storeRegeneratedMeta stores the regenerated meta for future use (non-blocking, warns on failure)
-func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtreeHash *chainhash.Hash, meta *subtreepkg.Meta) {
-	if r.subtreeStore == nil {
-		return
-	}
-
+// storeRegeneratedMeta stores the regenerated meta for future use.
+//
+// The two failures here mean different things and are reported differently. A
+// serialize refusal says the meta itself is unusable, so it is returned and the
+// caller fails the source: Meta.Serialize refuses exactly the shape that reads
+// downstream as "transaction not found" and condemns a valid block, and handing
+// such a meta back while only logging would let it be used anyway. A Set failure
+// says only that the cache write missed, which costs a future regeneration and
+// nothing else, so it stays a warning.
+//
+// The serialize runs before the store check, deliberately: it is the assertion,
+// not a step towards the write, and a regenerator with no store must not skip
+// it.
+func (r *SubtreeMetaRegenerator) storeRegeneratedMeta(ctx context.Context, subtreeHash *chainhash.Hash, meta *subtreepkg.Meta) error {
 	metaBytes, err := meta.Serialize()
 	if err != nil {
-		r.logger.Warnf("[storeRegeneratedMeta][%s] failed to serialize meta: %v", subtreeHash.String(), err)
-		return
+		return errors.NewProcessingError("[storeRegeneratedMeta][%s] regenerated meta is incomplete and will not serialize", subtreeHash.String(), err)
+	}
+
+	if r.subtreeStore == nil {
+		return nil
 	}
 
 	dah := r.getBlockHeight() + r.blockHeightRetention
 	if err := r.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeMeta, metaBytes, options.WithDeleteAt(dah)); err != nil {
 		r.logger.Warnf("[storeRegeneratedMeta][%s] failed to store meta: %v", subtreeHash.String(), err)
 	}
+
+	return nil
 }
 
 // SubtreeStoreAdapter adapts a SubtreeStore (read-only) to SubtreeStoreWriter

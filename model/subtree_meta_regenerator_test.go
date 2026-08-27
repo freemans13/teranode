@@ -350,7 +350,7 @@ func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_Success(t *testing.T) {
 		ParentTxHashes: []chainhash.Hash{},
 	}
 
-	regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta)
+	require.NoError(t, regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta))
 
 	// Verify meta was stored
 	require.Len(t, mockStore.storedMeta, 1)
@@ -376,8 +376,18 @@ func TestSubtreeMetaRegenerator_StoreRegeneratedMeta_NilStore(t *testing.T) {
 	meta := subtreepkg.NewSubtreeMeta(subtree)
 	meta.TxInpoints[1] = subtreepkg.TxInpoints{}
 
-	// Should not panic with nil store
-	regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta)
+	// A bare TxInpoints has a nil ParentTxHashes, which is exactly what
+	// Meta.Serialize refuses for any index past 0. The serialize runs before the
+	// store check deliberately: it is the assertion that the meta is usable, not
+	// a step towards the write, so a regenerator with no store must not skip it.
+	// Without that ordering an unusable meta would be handed back unexamined.
+	require.Error(t, regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta),
+		"a meta that will not serialize must be reported even when there is no store to write it to")
+
+	// And a usable meta reports success rather than a missing-store error: there
+	// is nothing wrong with the meta, only nowhere to cache it.
+	meta.TxInpoints[1] = subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}}
+	require.NoError(t, regenerator.storeRegeneratedMeta(context.Background(), subtreeHash, meta))
 }
 
 func TestSubtreeStoreAdapter(t *testing.T) {
@@ -1052,4 +1062,121 @@ func TestNewCacheBustCounter_IsClockSeeded(t *testing.T) {
 
 	require.GreaterOrEqual(t, seed, uint64(before), "the counter must start from the clock, not from zero")
 	require.LessOrEqual(t, seed, uint64(after))
+}
+
+// txWithNoInputs builds a transaction whose Inputs slice is empty. That is the
+// shape that leaves a meta entry unset: NewTxInpointsFromTx delegates to
+// newSizedFromInputs, which returns a bare TxInpoints{} when len(inputs) == 0,
+// and a bare TxInpoints has a nil ParentTxHashes. NewTxInpoints() by contrast
+// deliberately returns a non-nil-but-empty slice, because Meta.Serialize uses
+// nil versus empty to tell "no inpoints set yet" from "this node has no
+// parents". So nil genuinely means unset.
+func txWithNoInputs(t *testing.T, payTo uint64) *bt.Tx {
+	t.Helper()
+
+	tx := bt.NewTx()
+	require.NoError(t, tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", payTo))
+	require.Empty(t, tx.Inputs, "sanity: this tx must have no inputs")
+
+	return tx
+}
+
+// TestSubtreeMetaRegenerator_MetaThatWillNotSerialize_FailsTheSource pins the
+// product check, which is a different question from the source check.
+//
+// The body predicate asks whether data.Txs filled every node. It cannot answer
+// whether the META came out complete, because SetTxInpointsFromTx writes at
+// Subtree.NodeIndex(txid) rather than at the body index, and a transaction with
+// no inputs yields a nil ParentTxHashes. So a fully populated data.Txs can still
+// produce a meta entry that was never set.
+//
+// Such a meta must not reach the caller. A nil ParentTxHashes reads downstream
+// as GetParentTxHashes returning nil, which validOrderAndBlessed reports as
+// "transaction could not be found in tx meta data" and a valid block dies. The
+// end state asserted here is that the source fails and NOTHING is persisted, so
+// RegenerateMeta moves on to the next source instead.
+func TestSubtreeMetaRegenerator_MetaThatWillNotSerialize_FailsTheSource(t *testing.T) {
+	ctx := context.Background()
+
+	// The index-0 case is the one Meta.Serialize cannot catch: it exempts index 0
+	// unconditionally, so an unset entry there would serialize and be persisted
+	// with a DAH. A non-first subtree has no coinbase placeholder, so index 0
+	// holding a real transaction is an ordinary shape, not a contrived one.
+	t.Run("unset entry at index 0 of a subtree with no coinbase placeholder", func(t *testing.T) {
+		tx0 := txWithNoInputs(t, 1000)
+		tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+
+		subtree := subtreeWithNodes(t, *tx0.TxIDChainHash(), *tx1.TxIDChainHash())
+
+		data := subtreepkg.NewSubtreeData(subtree)
+		data.Txs[0] = tx0
+		data.Txs[1] = tx1
+
+		// The body is complete by the source predicate, so nothing before the
+		// product check rejects this.
+		require.Zero(t, MissingSubtreeDataTxs(subtree, data))
+
+		mockStore := newMockSubtreeStoreWriter()
+		regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, mockStore, nil, func() uint32 { return 100 }, 288, 0)
+
+		meta, err := regenerator.buildAndStoreMeta(ctx, subtree.RootHash(), subtree, data)
+
+		require.Error(t, err, "a meta with an entry that was never set must fail the source")
+		require.Nil(t, meta)
+		require.Empty(t, mockStore.storedMeta, "nothing may be persisted with a DAH from an incomplete meta")
+
+		// Serialize genuinely does not catch this one, which is why the walk over
+		// the meta exists on top of the serialize refusal.
+		metaBytes, serErr := subtreepkg.NewSubtreeMeta(subtree).Serialize()
+		_ = metaBytes
+		require.Error(t, serErr, "sanity: index 1 is what Serialize objects to here, not index 0")
+	})
+
+	t.Run("unset entry past index 0", func(t *testing.T) {
+		tx0 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+		tx1 := txWithNoInputs(t, 2000)
+
+		subtree := subtreeWithNodes(t, *tx0.TxIDChainHash(), *tx1.TxIDChainHash())
+
+		data := subtreepkg.NewSubtreeData(subtree)
+		data.Txs[0] = tx0
+		data.Txs[1] = tx1
+
+		require.Zero(t, MissingSubtreeDataTxs(subtree, data))
+
+		mockStore := newMockSubtreeStoreWriter()
+		regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, mockStore, nil, func() uint32 { return 100 }, 288, 0)
+
+		meta, err := regenerator.buildAndStoreMeta(ctx, subtree.RootHash(), subtree, data)
+
+		require.Error(t, err)
+		require.Nil(t, meta)
+		require.Empty(t, mockStore.storedMeta)
+	})
+}
+
+// TestSubtreeMetaRegenerator_StoreFailure_StillReturnsTheMeta keeps the two
+// failures inside storeRegeneratedMeta apart. A serialize refusal says the meta
+// is unusable and must fail the source. A Set failure says only that the cache
+// write missed, which costs a future regeneration and nothing else, so it must
+// stay a warning and the good meta must still reach the caller.
+func TestSubtreeMetaRegenerator_StoreFailure_StillReturnsTheMeta(t *testing.T) {
+	tx1 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000001", 0)
+	tx2 := createTestTransaction(t, "0000000000000000000000000000000000000000000000000000000000000002", 0)
+
+	subtree := createTestSubtree([]chainhash.Hash{*tx1.TxIDChainHash(), *tx2.TxIDChainHash()})
+
+	data := subtreepkg.NewSubtreeData(subtree)
+	data.Txs[1] = tx1
+	data.Txs[2] = tx2
+
+	mockStore := newMockSubtreeStoreWriter()
+	mockStore.setErr = errors.NewStorageError("store is read only")
+
+	regenerator := NewSubtreeMetaRegenerator(ulogger.TestLogger{}, mockStore, nil, func() uint32 { return 100 }, 288, 0)
+
+	meta, err := regenerator.buildAndStoreMeta(context.Background(), subtree.RootHash(), subtree, data)
+
+	require.NoError(t, err, "a failed cache write must not fail a meta that is otherwise good")
+	requireCompleteMeta(t, meta, subtree.Length())
 }
