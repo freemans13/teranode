@@ -397,3 +397,31 @@ func TestSyncManager_ADeferredRoundIsNotAskedForWithHeadersFirstModeOff(t *testi
 	require.False(t, WaitUntil(func() bool { return rec.askedForHeadersUpTo(*final.Hash) }, 500*time.Millisecond),
 		"no getheaders may go out with the mode off: the peer would be disconnected for answering it")
 }
+
+// TestSyncManager_ADeferredRoundWithStillNobodyToAskIsPutBack covers the
+// restore. The drain takes the round out with a Swap, so a tick that finds no
+// sync peer has to put it back or the round is lost for the life of the
+// process, which is the wedge the deferral exists to prevent.
+//
+// The restore is a CompareAndSwap, not a Store: the drain runs on the sync-peer
+// ticker while checkpointBlockCommitted stores from the block-queue consumer, so
+// the round in the ticker's hand can in principle be the stale one. No reachable
+// path stores a second round while one is pending, so this test pins the
+// restore, not the race.
+func TestSyncManager_ADeferredRoundWithStillNobodyToAskIsPutBack(t *testing.T) {
+	sm, first, _ := newCheckpointManager(t)
+	sm.headersFirstMode.Store(true)
+
+	require.NoError(t, sm.checkpointBlockCommitted(nil, *first.Hash))
+
+	pending := sm.pendingCheckpoint.Load()
+	require.NotNil(t, pending, "sanity: the round is owed")
+
+	// The tick runs and the election still produced nobody.
+	sm.drainPendingCheckpoint()
+
+	require.Same(t, pending, sm.pendingCheckpoint.Load(),
+		"with nobody to ask the round is still owed and must be waiting for the next tick")
+	require.Equal(t, first.Height, sm.nextCheckpointSnapshot().Height,
+		"nothing was asked for, so the checkpoint must not have moved")
+}

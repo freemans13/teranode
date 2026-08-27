@@ -786,11 +786,13 @@ type SyncManager struct {
 	headerMu         sync.Mutex
 	headersFirstMode atomic.Bool // accessed from multiple goroutines, must be atomic
 	// pendingCheckpoint holds the checkpoint block whose round of headers was
-	// never asked for, because it committed when there was nobody to ask. Only
-	// checkpointBlockCommitted writes it and only drainPendingCheckpoint clears
-	// it, and the two run on different goroutines — the block-queue consumer
-	// drains the park, the sync-peer ticker elects — so it is atomic and is
-	// read with a Swap. Nil means there is no round owing.
+	// never asked for, because it committed when there was nobody to ask.
+	// checkpointBlockCommitted stores it and drainPendingCheckpoint takes it,
+	// restoring it when there is still nobody to ask. The two run on different
+	// goroutines — the block-queue consumer drains the park, the sync-peer
+	// ticker elects — so it is atomic and is read with a Swap. The restore is a
+	// CompareAndSwap for the same reason: the round in the ticker's hand may
+	// already be the stale one. Nil means there is no round owing.
 	pendingCheckpoint atomic.Pointer[deferredCheckpoint]
 	// currentCached is the last answer current() worked out, so a peer goroutine
 	// can read it without making the blockchain call itself. See IsCurrentCached.
@@ -2981,12 +2983,13 @@ func (sm *SyncManager) checkpointBlockCommitted(peer *peerpkg.Peer, blockHash ch
 	// stopped at this checkpoint.
 	//
 	// Leaving the checkpoint where it is is necessary but not sufficient: the
-	// two callers of this function are a block committing off the wire and the
-	// park drain, and the block is in the chain by the time either returns, so
-	// haveInventory answers true for it and the download walk never asks for it
-	// again. There is no second delivery to re-enter this arm with. So the round
-	// is remembered here and drainPendingCheckpoint replays it from the
-	// sync-peer ticker once an election has produced somebody to ask.
+	// two callers that commit a block are a block committing off the wire and
+	// the park drain, and the replay in drainPendingCheckpoint is the third.
+	// For the two commit routes the block is in the chain by the time either
+	// returns, so haveInventory answers true for it and the download walk never
+	// asks for it again. There is no second delivery to re-enter this arm with.
+	// So the round is remembered here and drainPendingCheckpoint replays it from
+	// the sync-peer ticker once an election has produced somebody to ask.
 	if peer == nil {
 		// Mark the anchor anyway. The block is already in this node's chain, so
 		// if a headers round reaches the list by any other route before the
@@ -3097,18 +3100,26 @@ type deferredCheckpoint struct {
 // because there was no peer to ask, now that the sync-peer check has had its
 // chance to elect one.
 //
-// This is the step that was missing. checkpointBlockCommitted is reached only by
-// a block committing, and a checkpoint block commits exactly once: after that it
-// is in the chain, haveInventory answers true and the download walk never asks
-// for it again. So the nil-peer arm's decision to leave the checkpoint alone
-// preserved the question but nothing ever asked it, and headers-first sync
-// stopped at that checkpoint for the life of the process.
+// This is the step that was missing. The two routes into
+// checkpointBlockCommitted that commit a block reach it once each, because a
+// checkpoint block commits exactly once: after that it is in the chain,
+// haveInventory answers true and the download walk never asks for it again. So
+// the nil-peer arm's decision to leave the checkpoint alone preserved the
+// question but nothing ever asked it, and headers-first sync stopped at that
+// checkpoint for the life of the process.
+//
+// This function is the third caller of checkpointBlockCommitted and the only one
+// that does not arrive through advanceHeaderListFor, so it owes by hand the
+// preconditions that gate returns isCheckpointBlock false on: headers-first mode
+// has to be on, and the checkpoint has to be the one the pending round belongs
+// to. Both are checked below. A getheaders sent with the mode off is not a
+// no-op, because handleHeadersMsg disconnects a peer that answers it.
 //
 // Called from handleCheckSyncPeer, which runs on the sync-peer ticker, while the
 // nil-peer arm is written from the block-queue consumer that drains the park.
 // The Swap is what makes that safe: whichever goroutine takes the round owns it.
 // If this tick's election still produced nobody, this function puts the round
-// straight back for the next one.
+// straight back for the next one, but never over a newer one.
 func (sm *SyncManager) drainPendingCheckpoint() {
 	pending := sm.pendingCheckpoint.Swap(nil)
 	if pending == nil {
@@ -3126,9 +3137,18 @@ func (sm *SyncManager) drainPendingCheckpoint() {
 		return
 	}
 
+	// Put the round back for the next tick, but never over a newer one: this runs
+	// on the ticker while checkpointBlockCommitted stores from the block-queue
+	// consumer, so the round in hand may already be the stale one. No reachable
+	// path stores a second round while one is pending, because that needs a
+	// second checkpoint block to commit, which needs that round's headers, which
+	// only the first transition or startSync asks for, and while a round is
+	// pending startSync reads the stale checkpoint and takes the getblocks
+	// branch. The primitive matches the claim anyway, for the same reason the
+	// guard above is here on an unreachable branch.
 	peer := sm.loadSyncPeer()
 	if peer == nil {
-		sm.pendingCheckpoint.Store(pending)
+		sm.pendingCheckpoint.CompareAndSwap(nil, pending)
 
 		return
 	}
