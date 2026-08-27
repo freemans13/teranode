@@ -1718,6 +1718,15 @@ func (s *SQL) rebuildOnMainChainFlagTx(ctx context.Context, full bool) (err erro
 // readers to the flag-free CTE for the whole of it. StoreBlock, InvalidateBlock and
 // RevalidateBlock all do; a new caller that mutates on_main_chain must too.
 //
+// The extreme case of that third condition is a set that was never built at all. The
+// startup rebuild is asynchronous and its guard is released whether it succeeded or
+// failed, while maxBlockID survives a failure because refreshMaxBlockID runs first and
+// is cheap, so a rebuild that times out on a cold cache leaves both of the other
+// escapes satisfied and the set empty. Empty means absent means on-chain for every id
+// the node holds. CheckBlockIsInCurrentChain therefore also gates on
+// lastSuccessfulRebuild being non-zero, which this function stamps itself rather than
+// leaving to its callers.
+//
 // Block validation is not the only asker, so a gap id would not stay inside consensus.
 // The asset server's GetTransactionMeta and merkle-proof handlers call this with the
 // BlockIDs stamped on a transaction's UTXO metadata, to pick which of a transaction's
@@ -1801,6 +1810,12 @@ func (s *SQL) rebuildOffChainSet(ctx context.Context) error {
 	s.offChainBlockIDsMu.Lock()
 	s.offChainBlockIDs = offChain
 	s.offChainBlockIDsMu.Unlock()
+
+	// Stamp the success here rather than only at the call sites. Every caller already
+	// does it on its own happy path, but CheckBlockIsInCurrentChain now gates the
+	// forked-set route on this being non-zero, so "the set has been built" has to be
+	// recorded by the thing that builds it and not by seven callers remembering to.
+	s.lastSuccessfulRebuild.Store(time.Now().Unix())
 
 	if len(offChain) > 0 {
 		s.logger.Infof("rebuildOffChainSet: %d off-chain block IDs, maxBlockID=%d", len(offChain), s.maxBlockID.Load())

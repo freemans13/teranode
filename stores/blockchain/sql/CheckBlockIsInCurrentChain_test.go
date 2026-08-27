@@ -662,3 +662,73 @@ func TestCheckBlockIsInCurrentChain_RebuildGuardSuppressesForkedSetRoute(t *test
 	require.NoError(t, err)
 	require.True(t, result)
 }
+
+// TestCheckBlockIsInCurrentChain_UnbuiltForkedSetDefersToSQL covers the failure the
+// forked-set route is most exposed to, because it is the one the store already expects
+// to happen: rebuildOffChainSet timing out on a cold cache during catchup.
+//
+// mainChainRebuilding is held across the startup rebuild, but it is released whether
+// that rebuild succeeded or failed, and maxBlockID survives a failure because
+// refreshMaxBlockID runs first and is a cheap index-only scan. So both of the earlier
+// escapes in CheckBlockIsInCurrentChain pass while offChainBlockIDs is still the empty
+// map New() made, and an empty forked set makes every committed id look on-chain.
+//
+// That is the false-positive direction this route introduced. A block that is genuinely
+// off the chain must not come back on-chain just because the set failed to build, so the
+// route has to defer to SQL until a rebuild has actually completed once.
+func TestCheckBlockIsInCurrentChain_UnbuiltForkedSetDefersToSQL(t *testing.T) {
+	s := newOnMainChainTestStoreWith(t, func(st *settings.Settings) {
+		st.BlockChain.UseInMemoryChainCheck = true
+		st.BlockChain.ChainCheckShadowCompare = false
+	})
+
+	blockID1, _, err := s.StoreBlock(context.Background(), block1, "")
+	require.NoError(t, err)
+
+	blockID2, _, err := s.StoreBlock(context.Background(), block2, "")
+	require.NoError(t, err)
+
+	// Take block2 genuinely off the chain, so the two routes agree about it and the
+	// only thing under test is whether the forked set is trusted.
+	_, err = s.InvalidateBlock(context.Background(), block2.Header.Hash())
+	require.NoError(t, err)
+
+	for s.mainChainRebuilding.Load() > 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	s.offChainBlockIDsMu.RLock()
+	_, forked := s.offChainBlockIDs[uint32(blockID2)]
+	s.offChainBlockIDsMu.RUnlock()
+	require.True(t, forked, "precondition: the invalidated block must be in the forked set")
+
+	// Reproduce a startup whose rebuild never completed: maxBlockID is populated, the
+	// guard is clear, and the forked set is the empty map New() made.
+	s.offChainBlockIDsMu.Lock()
+	s.offChainBlockIDs = make(map[uint32]struct{})
+	s.offChainBlockIDsMu.Unlock()
+	s.lastSuccessfulRebuild.Store(0)
+
+	require.Zero(t, s.mainChainRebuilding.Load(), "the guard must be clear for this to be the case under test")
+	require.NotZero(t, s.maxBlockID.Load(), "maxBlockID survives a failed rebuild")
+
+	// Absence from an unbuilt forked set is not proof of anything. SQL must answer, and
+	// SQL knows the invalidated block is off the chain.
+	result, err := s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID2)})
+	require.NoError(t, err)
+	require.False(t, result, "an unbuilt forked set must not turn an off-chain block into an on-chain one")
+
+	// The still-on-chain block is unaffected: deferring to SQL suppresses the fast path,
+	// it does not turn correct positives into invalidations.
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID1)})
+	require.NoError(t, err)
+	require.True(t, result)
+
+	// Once a rebuild completes, the route is trusted again and still agrees with SQL.
+	require.NoError(t, s.rebuildOffChainSet(context.Background()))
+	require.NotZero(t, s.lastSuccessfulRebuild.Load(), "a completed rebuild must stamp its own success")
+
+	result, err = s.CheckBlockIsInCurrentChain(context.Background(), []uint32{uint32(blockID2)})
+	require.NoError(t, err)
+	require.False(t, result)
+}

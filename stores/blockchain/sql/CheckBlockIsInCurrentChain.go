@@ -55,6 +55,34 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		return s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
 	}
 
+	// Fail safe when the forked set has never been built. The startup rebuild runs
+	// asynchronously and mainChainRebuilding is held for it, but that guard is
+	// released whether the rebuild succeeded or failed, and rebuildOffChainSet is
+	// explicitly expected to time out on a cold cache during catchup. maxBlockID
+	// survives such a failure, because refreshMaxBlockID runs first and is a cheap
+	// index-only scan, so the two checks above both pass while offChainBlockIDs is
+	// still the empty map New() made.
+	//
+	// An empty forked set means every committed id is absent from it, and absence is
+	// what this route reads as proof of main-chain membership. Every fork block and
+	// every invalidated block on the node would come back on-chain until the next
+	// successful rebuild. That is a FALSE POSITIVE, the direction this route added:
+	// checkOldBlockIDs would accept a parent that lives only on a fork, and the asset
+	// server would serve a merkle proof against a block that is not on the chain.
+	//
+	// lastSuccessfulRebuild is set only by a rebuild that completed, so zero means
+	// "never built" and is unambiguous. It cannot race the startup path: the guard
+	// above is released by the same goroutine that sets it, so a cleared guard plus
+	// a zero timestamp is precisely the failed-rebuild case and nothing else.
+	//
+	// A rebuild that fails AFTER an earlier success is not covered here, and does not
+	// need to be: the previous set still holds every fork the node knew about, only
+	// blocks that forked since the last success are missing, and backgroundRefreshLoop
+	// retries every two minutes.
+	if s.lastSuccessfulRebuild.Load() == 0 {
+		return s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
+	}
+
 	result, fromMemory, err := s.checkBlockIsInCurrentChainInMemory(ctx, blockIDs, maxID)
 	if err != nil {
 		return false, err
