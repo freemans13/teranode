@@ -178,6 +178,24 @@ func TestGetAndValidateSubtrees_ReloadClosesSurvivingSubtrees(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, entries,
 		"the reload must Close a surviving mmap-backed subtree before dropping it, not leak its mapping")
+
+	// Close unmaps the region and removes the backing file, and never touches
+	// Nodes — so a closed mmap subtree that keeps its slice hands a dangling
+	// pointer into freed memory to anyone still holding it. That is a fault
+	// rather than a clean panic. closeMmapSubtreesLocked's ReleaseNodes is the
+	// whole of that fix, and until this assertion existed nothing in the tree
+	// failed if it were removed: the check above only proves the file is gone.
+	//
+	// The closed subtree is still reachable through this local variable. The
+	// nil-ness is evaluated here and only the bool is handed to testify, never
+	// the slice: require.Nil formats a failure as "Expected nil, but got: %#v",
+	// which walks the elements and so faults the test binary instead of failing
+	// the assertion once the region is unmapped. Verified, not assumed — with
+	// the ReleaseNodes call removed, require.Nil dies in fmt.(*pp).printValue
+	// under assert.Nil rather than reporting anything. Same trap as
+	// _ReloadDoesNotWriteIntoACallerOwnedArray's require.Same below.
+	require.True(t, mmapSurvivor.Nodes == nil,
+		"a closed mmap subtree must not keep a slice into the region Close just unmapped")
 }
 
 // TestReleaseSubtreeNodes_ClosesMmapAndNilsEntries pins the full release
