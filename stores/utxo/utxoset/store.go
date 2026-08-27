@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -35,8 +36,12 @@ type Store struct {
 	settings *settings.Settings
 	pool     *pgxpool.Pool
 
-	blockHeight     atomic.Uint32
-	medianBlockTime atomic.Uint32
+	// utxo.BlockStateFields supplies the chain-tip pair — block height and median
+	// block time — and the six Store methods that read and write it, over a single
+	// atomic snapshot. Embedding the shared implementation rather than carrying two
+	// independent atomics here is what keeps GetBlockHeight and GetBlockState
+	// reading the same memory, so they cannot disagree (issue 1443).
+	utxo.BlockStateFields
 
 	// journalLeaf is the spend-journal leaf the last spend landed in, so the catalog is only
 	// touched when it changes.
@@ -112,19 +117,8 @@ func (s *Store) SupportsOutpointOnlySpend() bool { return true }
 // second job outweighs its first: see the spend_journal comment in schema.go for why it
 // has no off-switch.
 func (s *Store) SetBlockHeight(height uint32) error {
-	s.blockHeight.Store(height)
-
-	return nil
+	return s.BlockStateFields.SetBlockHeight(height)
 }
-
-func (s *Store) GetBlockHeight() uint32 { return s.blockHeight.Load() }
-
-func (s *Store) SetMedianBlockTime(t uint32) error {
-	s.medianBlockTime.Store(t)
-	return nil
-}
-
-func (s *Store) GetMedianBlockTime() uint32 { return s.medianBlockTime.Load() }
 
 func (s *Store) PoolMaxConns() int { return int(s.pool.Config().MaxConns) }
 

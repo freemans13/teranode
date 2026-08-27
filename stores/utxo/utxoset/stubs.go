@@ -69,7 +69,3 @@ func (s *Store) CompleteConflictIntent(_ context.Context, _ chainhash.Hash) erro
 func (s *Store) MarkTransactionsOnLongestChain(_ context.Context, _ []chainhash.Hash, _ bool) error {
 	return errM1("MarkTransactionsOnLongestChain")
 }
-
-func (s *Store) GetBlockState() utxo.BlockState {
-	return utxo.BlockState{}
-}
