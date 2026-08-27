@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -210,12 +211,31 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 	// ledger: a block arriving twice becomes a no-op transaction by transaction, and a
 	// duplicate mempool submission is covered by the same mechanism rather than being
 	// left unimplemented.
+	// The inputs, stored rather than re-derived. Block assembly rebuilds a mining candidate
+	// from the fee, the size and these, never from the serialized transaction, and that is
+	// exactly what lets the body age out of its window while the transaction stays
+	// mineable. A transaction dropped from block assembly can never be mined, and on a
+	// delete-on-spend store its inputs' coin rows are already gone, so nobody can spend
+	// them again either.
+	var inpoints []byte
+
+	if !isCoinbase {
+		ip, ierr := subtree.NewTxInpointsFromTx(tx)
+		if ierr != nil {
+			return nil, errors.NewProcessingError("[utxoset][Create] inpoints %s", txHash.String(), ierr)
+		}
+
+		if inpoints, ierr = ip.Serialize(); ierr != nil {
+			return nil, errors.NewProcessingError("[utxoset][Create] serialise inpoints %s", txHash.String(), ierr)
+		}
+	}
+
 	var claimed int
 
 	err := q.QueryRow(ctx, claimSQL,
 		leaf, txHash[:], int32(blockHeight), offChainSinceAt(options.MinedBlockInfos, blockHeight),
 		packMembership(options.MinedBlockInfos),
-		nil, int32(tx.Size()), nil, int32(tx.LockTime), time.Now().UnixMilli(), flags,
+		nil, int32(tx.Size()), inpoints, int32(tx.LockTime), time.Now().UnixMilli(), flags,
 	).Scan(&claimed)
 
 	switch {
