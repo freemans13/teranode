@@ -130,11 +130,14 @@ func NodeAllocFromPool(numLeaves int) []subtreepkg.Node {
 // multiple times. Intended for cache eviction and validation failure paths.
 //
 // Its Close error is deliberately dropped here: the only way Close fails is a
-// munmap error, and every caller of this wrapper is a cache-eviction or
-// validation-failure path with no logger in scope and nothing it could do
-// differently. The release sites that can act on the error log it themselves:
-// setTxMinedStatus calls ReleaseSubtreeNodes directly, and the reload in
-// model.GetAndValidateSubtrees closes its mmap-backed survivors inline.
+// munmap error, and all eight callers of this wrapper are ValidateBlock paths
+// where the block will not be cached, or where a cache Delete has bypassed the
+// eviction function — none of them can do anything differently on a munmap
+// failure. Cache eviction itself goes through tryReleaseBlockNodes instead,
+// because it must not block. The release sites that can act on the error log it
+// themselves: setTxMinedStatus calls ReleaseSubtreeNodes directly, and the
+// reload in model.GetAndValidateSubtrees closes its mmap-backed survivors
+// inline.
 func releaseBlockNodes(b *model.Block) {
 	if b == nil {
 		return
