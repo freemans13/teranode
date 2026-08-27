@@ -3,6 +3,7 @@ package utxoset
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
@@ -109,4 +110,42 @@ func TestGetSurvivesABodyThatHasAgedOut(t *testing.T) {
 	require.NoError(t, err, "an aged-out body is the steady state for an old transaction, not a failure")
 	require.Nil(t, got.Tx, "and the caller must be able to see that it is absent")
 	require.Equal(t, uint64(tx.Size()), got.SizeInBytes, "everything the identity row holds still answers")
+}
+
+// TestCreatingAConflictingTransactionRecordsItOnItsParents.
+//
+// When a transaction loses a double-spend race it is stored as conflicting rather than
+// discarded, because resolving the conflict later needs to find it. Finding it means asking
+// the PARENT whose coin was contested, so the parent has to carry the list.
+//
+// Without this, conflict resolution has no way to walk from a contested coin to the
+// transactions competing for it.
+func TestCreatingAConflictingTransactionRecordsItOnItsParents(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	loser := bt.NewTx()
+	require.NoError(t, loser.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+	loser.AddOutput(&bt.Output{Satoshis: 4_000, LockingScript: parent.Outputs[0].LockingScript})
+
+	_, err = s.Create(ctx, loser, 100, utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	got, err := s.Get(ctx, loser.TxIDChainHash())
+	require.NoError(t, err)
+	require.True(t, got.Conflicting, "the loser is flagged")
+	require.Empty(t, got.ConflictingChildren, "and has no conflicting children of its own")
+
+	gotParent, err := s.Get(ctx, parent.TxIDChainHash())
+	require.NoError(t, err)
+	require.False(t, gotParent.Conflicting, "the parent did nothing wrong")
+	require.Len(t, gotParent.ConflictingChildren, 1,
+		"but it must name the transaction contesting its coin, or conflict resolution cannot find it")
+	require.Equal(t, loser.TxID(), gotParent.ConflictingChildren[0].String())
 }

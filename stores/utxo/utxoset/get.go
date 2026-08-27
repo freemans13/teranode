@@ -101,6 +101,10 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, _ ...fields.Field
 
 	data.BlockIDs, data.BlockHeights, data.SubtreeIdxs = unpackMembership(membership)
 
+	if data.ConflictingChildren, err = unpackHashes(conflictingChildren); err != nil {
+		return nil, errors.NewStorageError("[utxoset][Get] conflicting children %s", hash.String(), err)
+	}
+
 	if offChainSince != nil {
 		data.UnminedSince = uint32(*offChainSince) //nolint:gosec // a stored height is never negative
 	}
@@ -150,4 +154,28 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 	*data = *got
 
 	return nil
+}
+
+// unpackHashes reads a packed run of 32-byte transaction ids.
+func unpackHashes(b []byte) ([]chainhash.Hash, error) {
+	if len(b) == 0 {
+		return nil, nil
+	}
+
+	if len(b)%chainhash.HashSize != 0 {
+		return nil, errors.NewProcessingError("packed hashes are %d bytes, not a multiple of %d",
+			len(b), chainhash.HashSize)
+	}
+
+	out := make([]chainhash.Hash, 0, len(b)/chainhash.HashSize)
+
+	for i := 0; i < len(b); i += chainhash.HashSize {
+		var h chainhash.Hash
+
+		copy(h[:], b[i:i+chainhash.HashSize])
+
+		out = append(out, h)
+	}
+
+	return out, nil
 }

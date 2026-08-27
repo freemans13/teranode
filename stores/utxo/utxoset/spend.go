@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
@@ -29,6 +30,26 @@ import (
 // behaves differently for each. Note the deliberate absence of the flag and maturity
 // predicates here — this asks "does the row exist at all", precisely so a row excluded
 // by the DELETE's eligibility tests surfaces as frozen or immature rather than as spent.
+// spenderSQL asks the journal WHO took a coin that is no longer there.
+//
+// The coin row is destroyed by the spend, so absence is how a double spend is rejected. That
+// answers "no" but not "who", and the caller needs "who": it marks the losing transaction
+// conflicting and walks its descendants.
+//
+// The journal already recorded the spending transaction against every coin it destroyed, so
+// a reorg could match the spender that actually took it. The same row answers this question.
+//
+// Matched on the full 32-byte parent txid as well as the ukey, for the same reason every
+// other predicate here is: the ukey is a non-unique 96-bit prefix, so it can locate a row but
+// never authorise one.
+//
+// Bounded by the journal's retention. Beyond it the store genuinely cannot say who took a
+// coin, and that is a stated limit of delete-on-spend rather than a gap to paper over.
+const spenderSQL = `
+SELECT k.vin, j.spending_txid
+  FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[]) AS k(leaf, ukey, txid, vin)
+  JOIN spend_journal j ON j.ukey = k.ukey AND j.txid = k.txid`
+
 const classifySQL = `
 SELECT k.vin, u.flags, u.spendable_from
   FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[]) AS k(leaf, ukey, txid, vin)
@@ -161,9 +182,10 @@ func (s *Store) classifyMisses(ctx context.Context, q querier, leaves []int16, u
 	}
 
 	// Anything neither deleted nor present is genuinely gone: already spent, or it never
-	// existed. A delete-on-spend store cannot distinguish those two without the undo
-	// journal, which is why ErrSpent is the honest answer here and why spender identity
-	// is explicitly a capability this store gives up beyond the journal's retention.
+	// existed. The coin table cannot distinguish those two, which is why ErrSpent is the
+	// honest answer here.
+	missing := false
+
 	for _, vin := range vins {
 		if _, ok := done[vin]; ok {
 			continue
@@ -171,7 +193,55 @@ func (s *Store) classifyMisses(ctx context.Context, q querier, leaves []int16, u
 
 		if _, ok := present[vin]; !ok {
 			spends[vin].Err = errors.ErrSpent
+			missing = true
 		}
+	}
+
+	if !missing {
+		return nil
+	}
+
+	return s.nameSpenders(ctx, q, leaves, ukeys, txids, vins, spends)
+}
+
+// nameSpenders fills in which transaction took each coin that is no longer there.
+//
+// Reached only after a spend has already failed, so its cost falls on the uncommon path.
+// Beyond the journal's retention it finds nothing and leaves the field nil, which is the
+// honest answer rather than a wrong one.
+func (s *Store) nameSpenders(ctx context.Context, q querier, leaves []int16, ukeys [][16]byte,
+	txids [][]byte, vins []int32, spends []*utxo.Spend) error {
+	rows, err := q.Query(ctx, spenderSQL, leaves, ukeys, txids, vins)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][Spend] find spender", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			vin     int32
+			spender []byte
+		)
+
+		if err := rows.Scan(&vin, &spender); err != nil {
+			return errors.NewStorageError("[utxoset][Spend] spender scan", err)
+		}
+
+		if spends[vin] == nil || !errors.Is(spends[vin].Err, errors.ErrSpent) {
+			continue
+		}
+
+		h, herr := chainhash.NewHash(spender)
+		if herr != nil {
+			return errors.NewStorageError("[utxoset][Spend] spender hash", herr)
+		}
+
+		spends[vin].ConflictingTxID = h
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][Spend] spender rows", err)
 	}
 
 	return nil

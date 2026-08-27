@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -41,6 +42,25 @@ INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT (leaf, txid) DO NOTHING
 RETURNING 1`
+
+// noteConflictSQL records a contesting transaction on the parent whose coin it wants.
+//
+// A transaction that loses a double-spend race is stored as conflicting rather than
+// discarded, because resolving the conflict later has to find it. Finding it means asking the
+// PARENT whose coin was contested, so the parent carries the list. Without it, conflict
+// resolution has no route from a contested coin to the transactions competing for it.
+//
+// Appended only when the parent does not already name it, so re-offering the same losing
+// transaction does not grow the list. Matched on the full 32-byte txid, never on the ukey
+// prefix alone.
+const noteConflictSQL = `
+UPDATE tx_ident
+   SET conflicting_children = CASE
+           WHEN position($3::bytea in coalesce(conflicting_children, '\x'::bytea)) > 0
+           THEN conflicting_children
+           ELSE coalesce(conflicting_children, '\x'::bytea) || $3::bytea
+       END
+ WHERE leaf = $1 AND txid = $2`
 
 // bodySQL files the serialized bytes in the window tx_ident's created_height names, so the
 // two always agree about where to look.
@@ -253,6 +273,12 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		return nil, errors.NewStorageError("[utxoset][Create] body %s", txHash.String(), err)
 	}
 
+	if options.Conflicting {
+		if err := s.noteConflictOnParents(ctx, q, tx, txHash[:]); err != nil {
+			return nil, err
+		}
+	}
+
 	if len(ukeys) > 0 {
 		if _, err := q.Exec(ctx, createSQL, satoshis, createdAt, spendable,
 			leaves, flagArr, ukeys, txids, scripts); err != nil {
@@ -266,4 +292,33 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		SizeInBytes: uint64(tx.Size()),
 		IsCoinbase:  isCoinbase,
 	}, nil
+}
+
+// noteConflictOnParents tells every parent of a losing transaction that it is being contested.
+func (s *Store) noteConflictOnParents(ctx context.Context, q querier, tx *bt.Tx, txid []byte) error {
+	seen := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
+
+	for _, in := range tx.Inputs {
+		if in == nil {
+			continue
+		}
+
+		parent := in.PreviousTxIDChainHash()
+		if parent == nil {
+			continue
+		}
+
+		// One note per parent, however many of its outputs this transaction reaches for.
+		if _, dup := seen[*parent]; dup {
+			continue
+		}
+
+		seen[*parent] = struct{}{}
+
+		if _, err := q.Exec(ctx, noteConflictSQL, LeafFor(parent[:]), parent[:], txid); err != nil {
+			return errors.NewStorageError("[utxoset][Create] note conflict on %s", parent.String(), err)
+		}
+	}
+
+	return nil
 }

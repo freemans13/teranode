@@ -372,3 +372,48 @@ func TestSpendAndCreateKeepsTheSpendsWhenTheTransactionExists(t *testing.T) {
 	require.Zero(t, live,
 		"the parent output must be SPENT: rolling back here leaves it live and spendable by someone else, which makes a double spend mineable")
 }
+
+// TestDoubleSpendNamesTheTransactionThatTookTheCoin.
+//
+// A delete-on-spend store destroys the coin row, so absence is how it rejects a double
+// spend. That answers "no" but not "who", and the caller needs "who" to mark the loser as
+// conflicting and to walk its descendants.
+//
+// The spend journal already holds the answer. It records the spending transaction against
+// every coin it destroys, precisely so a reorg can match the spender that actually took it.
+// So within the journal's retention the store can name the winner, and beyond it cannot,
+// which is a real and stated limit rather than a gap.
+func TestDoubleSpendNamesTheTransactionThatTookTheCoin(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	winner := bt.NewTx()
+	require.NoError(t, winner.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+	winner.AddOutput(&bt.Output{Satoshis: 4_000, LockingScript: parent.Outputs[0].LockingScript})
+
+	_, err = s.Spend(ctx, winner, 100)
+	require.NoError(t, err)
+
+	// A different transaction reaching for the same coin.
+	loser := bt.NewTx()
+	require.NoError(t, loser.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+	loser.AddOutput(&bt.Output{Satoshis: 3_000, LockingScript: parent.Outputs[0].LockingScript})
+
+	spends, err := s.Spend(ctx, loser, 100)
+	require.NoError(t, err)
+	require.Len(t, spends, 1)
+
+	require.True(t, errors.Is(spends[0].Err, errors.ErrSpent), "the coin is gone, so this is a double spend")
+	require.NotNil(t, spends[0].ConflictingTxID,
+		"and the caller needs to know WHICH transaction took it, to mark this one conflicting and walk its children")
+	require.Equal(t, winner.TxID(), spends[0].ConflictingTxID.String())
+}

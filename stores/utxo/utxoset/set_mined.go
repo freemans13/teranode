@@ -92,12 +92,6 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
 	}
 
-	// Un-mining tolerates transactions the store no longer holds, so there is nothing to
-	// prove and no map the caller relies on.
-	if info.UnsetMined {
-		return map[chainhash.Hash][]uint32{}, nil
-	}
-
 	leaves := make([]int16, 0, len(hashes))
 	txids := make([][]byte, 0, len(hashes))
 
@@ -143,6 +137,15 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 
 	// The postcondition, checked rather than assumed. A partial map would leave the caller
 	// believing transactions were mined that this store has never heard of.
+	//
+	// Un-mining is exempt, because the interface says missing entries are tolerated there:
+	// a reorg may un-mine a transaction the store has already discarded. Tolerated means it
+	// does not error, NOT that the answer is empty. Transactions that DO still exist must
+	// still appear, which the conformance suite checks.
+	if info.UnsetMined {
+		return out, nil
+	}
+
 	for _, h := range hashes {
 		if h == nil {
 			continue
