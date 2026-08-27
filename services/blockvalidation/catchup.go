@@ -432,12 +432,23 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// aerospike batch-read timeout is the common producer.
 			errorType = "local_service_unavailable"
 			isPeerError = false
-		case errors.IsContextError(*err):
-			// Context cancelled or deadline exceeded — a shutdown, or the catchup
-			// context timing out. Never the peer's doing. There was no case for this
-			// at all, so it fell past every branch to "unknown_error" with
-			// isPeerError left true, charging an honest primary for our own
-			// shutdown. Mirrors the predicate now used in processCatchupChItem.
+		case errors.Is(*err, errors.ErrContextCanceled):
+			// Our own cancellation — a shutdown, or the catchup context being torn
+			// down. Never the peer's doing. There was no case for this at all, so it
+			// fell past every branch to "unknown_error" with isPeerError left true,
+			// charging an honest primary for our own shutdown.
+			//
+			// Matched by CODE, not by errors.IsContextError, even though that helper
+			// is what processCatchupChItem uses. IsContextError falls back to a
+			// substring match over the rendered chain (errors.go Is, error_utils.go
+			// IsContextError), so at this position it also swallowed every error
+			// whose text merely CONTAINED "context canceled" or "context deadline
+			// exceeded". fetchSubtreeFromPeer wraps a failed peer fetch as a
+			// ServiceError naming the peer URL, so an HTTP deadline against a peer,
+			// rolled up into the all-peers-failed ErrExternal, was scored
+			// local_context_cancelled instead of peer_data_unavailable — the label
+			// issue 1368 exists to make visible. The text-matched form still runs,
+			// below ErrExternal where it can no longer take those labels.
 			errorType = "local_context_cancelled"
 			isPeerError = false
 		case errors.Is(*err, errors.ErrBlockHeaderContext):
@@ -463,7 +474,15 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// processing errors here would stop charging peers that deserve it.
 			errorType = "local_header_context_error"
 			isPeerError = false
-		case errors.Is(*err, errors.ErrBlockInvalid) || errors.Is(*err, errors.ErrTxInvalid):
+		case !isLocalCatchupFault(*err) && (errors.Is(*err, errors.ErrBlockInvalid) || errors.Is(*err, errors.ErrTxInvalid)):
+			// Gated on the same predicate validateBlocksOnChannel and
+			// processCatchupChItem use, rather than on the case ordering above it.
+			// The ordering already exempts storage and service-unavailable chains by
+			// placing them first, but that only works for codes this switch happens
+			// to have a case for, and it breaks the moment a case moves. Since this
+			// branch sets reportMalicious, an error that any sibling classifier calls
+			// local must not reach it. Making the exemption explicit is also what
+			// lets the text-matched context case sit safely below here.
 			errorType = "validation_failure"
 			// Mark peer as malicious for validation failure (reported after unlock)
 			reportMalicious = true
@@ -476,6 +495,19 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 			// connection error inside the chain would otherwise classify the whole
 			// all-peers-failed error as a network error against the primary.
 			errorType = "peer_data_unavailable"
+			isPeerError = false
+		case errors.IsContextError(*err):
+			// The text-matched half of the context check, deliberately down here.
+			// A context deadline that reaches us without a teranode error code —
+			// context.DeadlineExceeded wrapped by a constructor that does not set
+			// one — is still our own timeout and must not be charged to the primary,
+			// which is what this case was added for. But it matches on rendered
+			// text, so it belongs below every case that matches on a code: storage,
+			// service-unavailable, header-context, consensus and ErrExternal all get
+			// their own label first, and only an otherwise-unclassified context
+			// error lands here. It stays above IsNetworkError, which matches "http"
+			// and "eof" as substrings and would take it.
+			errorType = "local_context_cancelled"
 			isPeerError = false
 		case errors.IsNetworkError(*err):
 			errorType = "network_error"
@@ -1479,22 +1511,19 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan blockForValidat
 						u.reportCatchupMalicious(gCtx, peerID, "invalid_block_validation")
 					}
 
-					// Record metric for validation failure. A local storage fault is
-					// not the peer's doing, so it is charged neither to reputation
-					// (the consensus branch above carries the same exemption) nor to
-					// telemetry, which would otherwise leave the dashboards blaming an
-					// honest peer for this node's disk.
+					// Record metric for validation failure. A local fault is not the
+					// peer's doing, so it is charged neither to reputation (the
+					// consensus branch above carries the same exemption, via the same
+					// predicate) nor to telemetry, which would otherwise leave the
+					// dashboards blaming an honest peer for this node's disk, its
+					// aerospike timeout or its own shutdown.
 					//
-					// The exemption on the consensus branch is defence in depth rather
-					// than a path known to be live: ValidateBlockWithOptions screens
-					// ErrStorageError out at its block.Valid failure site before
-					// wrapping in BlockInvalid, and validateBlockSubtrees wraps only on
-					// ErrTxInvalid. But errors.Is walks the whole chain, so any future
-					// wrap that carries both codes would otherwise reach the malicious
-					// report — and releaseCatchupLock already scores exactly that chain
-					// local_storage_fault, so without this the same file would hold two
-					// opposite verdicts on one error.
-					if prometheusCatchupErrors != nil && !errors.Is(err, errors.ErrStorageError) {
+					// Gated on isLocalCatchupFault rather than ErrStorageError alone so
+					// this agrees with releaseCatchupLock and processCatchupChItem on
+					// every code, not just one. errors.Is walks the whole chain, so any
+					// wrap carrying both a consensus code and a local one would
+					// otherwise be scored local there and charged here.
+					if prometheusCatchupErrors != nil && !isLocalCatchupFault(err) {
 						prometheusCatchupErrors.WithLabelValues(peerID, "validation_failure").Inc()
 					}
 
@@ -1551,9 +1580,9 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 
 	// Quick validation: create UTXOs for the block and validate transactions in parallel
 	if err := u.blockValidation.quickValidateBlockAsync(ctx, block, peerID, baseURL, writeJobsChan); err != nil {
-		// As in validateBlocksOnChannel: do not charge a local storage fault to the
-		// peer, even in telemetry.
-		if prometheusCatchupErrors != nil && !errors.Is(err, errors.ErrStorageError) {
+		// As in validateBlocksOnChannel: do not charge a local fault to the peer,
+		// even in telemetry, and use the same predicate the other two sites use.
+		if prometheusCatchupErrors != nil && !isLocalCatchupFault(err) {
 			prometheusCatchupErrors.WithLabelValues(peerID, "validation_failure").Inc()
 		}
 

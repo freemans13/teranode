@@ -547,9 +547,34 @@ func TestGetExternalTransactionBoundsOutputIndex(t *testing.T) {
 
 		_, err := s.getExternalTransaction(ctx, parentHash)
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "beyond what any acceptable block could hold")
+		require.Contains(t, err.Error(), "reconstruction bound")
 		require.True(t, errors.Is(err, errors.ErrStorageError), "must be a storage fault, not a transaction fault")
 		require.False(t, errors.Is(err, errors.ErrTxInvalid), "must never be classified as a consensus violation")
+	})
+
+	t.Run("a single flipped high bit is rejected, not merely made smaller", func(t *testing.T) {
+		// The case the bound exists for. Under the policy-derived ceiling alone,
+		// bit 30 of a zero index sits below excessiveblocksize/9 at the shipped
+		// 10 GB, so it was accepted and asked for 8 GB of pointers on a 32 GB
+		// node. Every single-bit flip that clears the resource ceiling must now
+		// produce the storage fault rather than the allocation.
+		for _, bit := range []uint{24, 26, 28, 30, 31} {
+			s := newStore()
+			writeOutputsBlob(t, s, uint32(1)<<bit)
+
+			_, err := s.getExternalTransaction(ctx, parentHash)
+			require.Error(t, err, "bit %d must be rejected", bit)
+			require.True(t, errors.Is(err, errors.ErrStorageError), "bit %d must be a storage fault", bit)
+		}
+	})
+
+	t.Run("the ceiling itself is rejected", func(t *testing.T) {
+		s := newStore()
+		writeOutputsBlob(t, s, uint32(maxExternalOutputSlots))
+
+		_, err := s.getExternalTransaction(ctx, parentHash)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrStorageError))
 	})
 
 	t.Run("a legitimate sparse index is still accepted", func(t *testing.T) {
@@ -567,20 +592,33 @@ func TestGetExternalTransactionBoundsOutputIndex(t *testing.T) {
 		require.Nil(t, got.Outputs[0], "the padded holes must stay nil")
 	})
 
-	t.Run("the bound tracks the node's own block-size policy", func(t *testing.T) {
-		// Derived, not picked: an output at index N needs a transaction of at
-		// least 9*(N+1) bytes, and a transaction cannot exceed the largest block
-		// this node would accept. So the cap can never reject a parent that could
-		// have been accepted in the first place.
-		require.Equal(t, uint64(tSettings.Policy.ExcessiveBlockSize)/minSerializedOutputSize, maxExternalOutputCount(tSettings))
+	t.Run("the resource ceiling binds, and no setting can widen or narrow it", func(t *testing.T) {
+		// The policy derivation is a correctness ceiling, not a resource one: at
+		// the shipped 10 GB it permits ~1.19e9 slots, 8.9 GB of pointers. The
+		// fixed ceiling is what actually bounds the allocation, and for every
+		// documented policy value it is the lower of the two.
+		require.Equal(t, maxExternalOutputSlots, maxExternalOutputCount(tSettings))
+		require.Less(t, maxExternalOutputSlots, uint64(tSettings.Policy.ExcessiveBlockSize)/minSerializedOutputSize,
+			"the fixed ceiling must be the binding one at the shipped policy, or this guard is policy-dependent again")
 
 		// 0 means "no limit" for block acceptance; here it would restore the
 		// unbounded allocation, so it falls back to the setting's own default.
 		zeroed := test.CreateBaseTestSettings(t)
 		zeroed.Policy.ExcessiveBlockSize = 0
-		require.Equal(t, uint64(defaultExcessiveBlockSize)/minSerializedOutputSize, maxExternalOutputCount(zeroed))
+		require.Equal(t, maxExternalOutputSlots, maxExternalOutputCount(zeroed))
 
 		// Nil settings must not panic into the unbounded path either.
-		require.Equal(t, uint64(defaultExcessiveBlockSize)/minSerializedOutputSize, maxExternalOutputCount(nil))
+		require.Equal(t, maxExternalOutputSlots, maxExternalOutputCount(nil))
+
+		// Monotonic in the setting: lowering excessiveblocksize must not narrow
+		// the bound, or a config edit would retroactively reject an outputs blob
+		// written under a higher value, with no path that ever rewrites it. 128 MB
+		// is a real historic BSV value and sits in the band that would otherwise
+		// bite (128 MB / 9 is below the ceiling).
+		narrowed := test.CreateBaseTestSettings(t)
+		narrowed.Policy.ExcessiveBlockSize = 128 * 1024 * 1024
+		require.Less(t, uint64(narrowed.Policy.ExcessiveBlockSize)/minSerializedOutputSize, maxExternalOutputSlots,
+			"fixture must sit in the band the floor exists to cover, or this asserts nothing")
+		require.Equal(t, maxExternalOutputSlots, maxExternalOutputCount(narrowed))
 	})
 }

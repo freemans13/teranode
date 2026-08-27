@@ -734,6 +734,13 @@ func TestReleaseCatchupLock_ContextErrorIsNotChargedToPeer(t *testing.T) {
 			name: "deadline exceeded",
 			err:  errors.NewContextCanceledError("context deadline exceeded while catching up"),
 		},
+		{
+			// No context code anywhere in the chain, only the stdlib sentinel and
+			// its rendered text. This is what the text-matched case below ErrExternal
+			// exists to catch; the code-matched case at the top of the switch cannot.
+			name: "uncoded stdlib deadline",
+			err:  errors.NewProcessingError("catchup stalled", context.DeadlineExceeded),
+		},
 	}
 
 	for _, tc := range cases {
@@ -766,6 +773,54 @@ func TestReleaseCatchupLock_ContextErrorIsNotChargedToPeer(t *testing.T) {
 				"must not fall through to unknown_error, which leaves isPeerError true")
 		})
 	}
+}
+
+// TestReleaseCatchupLock_PeerFetchDeadlineKeepsPeerLabel pins the ordering fix for
+// the context case: it must not take a label that a code-matched case below it owns.
+//
+// errors.IsContextError falls back to a substring match over the rendered chain, so
+// while it sat at the top of the switch it swallowed anything whose text merely
+// CONTAINED "context deadline exceeded". fetchSubtreeFromPeer wraps a failed peer
+// fetch as a ServiceError naming the peer URL, and the all-peers-failed roll-up
+// wraps those in ErrExternal, so a stalled peer was reported as this node's own
+// shutdown and issue 1368's peer_data_unavailable label went missing from the
+// dashboard exactly when it was needed.
+//
+// The impact is telemetry, not reputation: both cases set isPeerError false. The
+// labels are the product.
+func TestReleaseCatchupLock_PeerFetchDeadlineKeepsPeerLabel(t *testing.T) {
+	header := testhelpers.CreateTestHeaders(t, 1)[0]
+
+	server, _, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	recorder := newPeerFailureRecordingP2PClient()
+	server.p2pClient = recorder
+
+	ctx := &CatchupContext{
+		blockUpTo: &model.Block{Header: header, Height: 1000},
+		baseURL:   "http://honest-primary:8000",
+		peerID:    "honest-primary",
+		startTime: time.Now(),
+	}
+	require.NoError(t, server.acquireCatchupLock(ctx))
+
+	// The shape fetchSubtreeFromPeer produces, rolled up the way the all-peers-failed
+	// path rolls it up. The context text is real and unavoidable: it is what an HTTP
+	// client returns when the request deadline fires against a slow peer.
+	relErr := error(errors.NewExternalError("all peers failed to supply subtree",
+		errors.NewServiceError("failed to fetch subtree from http://slow-peer:8000",
+			context.DeadlineExceeded)))
+	server.releaseCatchupLock(ctx, &relErr)
+
+	require.NotNil(t, server.previousCatchupAttempt)
+	require.Equal(t, "peer_data_unavailable", server.previousCatchupAttempt.ErrorType,
+		"a peer's fetch deadline must keep the peer label, not be relabelled as our own cancellation")
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	require.Equal(t, 0, recorder.failuresByPeer["honest-primary"],
+		"peer_data_unavailable must still not charge the catchup primary for another peer's failure")
 }
 
 // TestShouldReportConsensusMalicious pins the predicate that validateBlocksOnChannel
@@ -817,6 +872,28 @@ func TestShouldReportConsensusMalicious(t *testing.T) {
 		{
 			name: "an incomplete block is handled elsewhere and is not chargeable here",
 			err:  errors.NewBlockIncompleteError("no coinbase from seeded peer"),
+			want: false,
+		},
+		{
+			// The codes below are why this delegates to isLocalCatchupFault rather
+			// than naming ErrStorageError. Both sibling classifiers exempt them, so
+			// screening only storage here would leave one code on which this file
+			// still reaches two opposite verdicts, on the reputation call.
+			name: "block-invalid wrapping a service-unavailable is ours, not the peer's",
+			err: errors.NewBlockInvalidError("block is not valid",
+				errors.NewServiceUnavailableError("aerospike batch timed out")),
+			want: false,
+		},
+		{
+			name: "tx-invalid wrapping a storage-unavailable is ours, not the peer's",
+			err: errors.NewTxInvalidError("invalid tx",
+				errors.NewStorageUnavailableError("blob store is unhealthy")),
+			want: false,
+		},
+		{
+			name: "block-invalid wrapping our own context cancellation is ours",
+			err: errors.NewBlockInvalidError("block is not valid",
+				errors.NewContextCanceledError("catchup context cancelled on shutdown")),
 			want: false,
 		},
 	}
@@ -889,6 +966,19 @@ func TestIsLocalCatchupFault(t *testing.T) {
 			name: "an incomplete block is a peer-supplied shortfall, handled elsewhere",
 			err:  errors.NewBlockIncompleteError("no coinbase from seeded peer"),
 			want: false,
+		},
+		{
+			// IsContextError alone fails this one. It resolves the chain with
+			// errors.As, which stops at the outermost *Error and so reads
+			// ERR_BLOCK_INVALID, then falls back to matching the rendered text
+			// against the exact string "context canceled". This message says
+			// "cancelled", so only the code walk catches it. The wording is the
+			// point of the fixture: a predicate that depends on how a caller spelt
+			// its message is not a predicate.
+			name: "consensus code wrapping our own cancellation, message spelt otherwise",
+			err: errors.NewBlockInvalidError("block is not valid",
+				errors.NewContextCanceledError("catchup context cancelled on shutdown")),
+			want: true,
 		},
 	}
 

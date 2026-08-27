@@ -59,7 +59,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"math"
 	"slices"
 	"sync/atomic"
 
@@ -139,17 +138,42 @@ const (
 	// Typed uint64 rather than left untyped, so it cannot silently overflow the
 	// int it would otherwise be inferred as on a 32-bit build.
 	defaultExcessiveBlockSize uint64 = 4 * 1024 * 1024 * 1024
+
+	// maxExternalOutputSlots is the absolute ceiling on the reconstructed output
+	// slice: ~16.7M entries, 128 MB of pointers.
+	//
+	// The policy-derived count below is a correctness ceiling — it never rejects
+	// a parent the node could have accepted — but it is not a resource ceiling.
+	// At the shipped excessiveblocksize of 10 GB it permits ~1.19e9 slots, 8.9 GB
+	// of pointers, so a single flipped bit still OOMs a 32 GB node instead of
+	// producing the storage fault this function exists to produce. Bounding the
+	// allocation is worth the theoretical rejection: a parent above this needs
+	// >144 MB of standard serialization just for its outputs.
+	maxExternalOutputSlots uint64 = 1 << 24
 )
 
 // maxExternalOutputCount bounds the number of outputs this node will reconstruct
 // from an externally stored outputs-only blob.
 //
-// A transaction cannot be larger than the largest block this node would accept,
-// and each of its outputs costs at least minSerializedOutputSize bytes, so no
-// acceptable transaction can carry an output index at or above this value. The
-// bound therefore cannot reject a parent that could legitimately exist; it only
-// catches a corrupt index field, which is otherwise unbounded and would size a
-// multi-gigabyte allocation straight from local disk.
+// Two ceilings apply and the lower wins.
+//
+// The derived one: a transaction cannot be larger than the largest block this
+// node would accept, and each of its outputs costs at least
+// minSerializedOutputSize bytes, so no acceptable transaction can carry an
+// output index at or above excessiveBlockSize/minSerializedOutputSize. That is a
+// correctness ceiling — it never rejects a parent that could legitimately exist.
+//
+// The absolute one, maxExternalOutputSlots: a resource ceiling, because the
+// derived value is not one. It is what actually bounds the allocation.
+//
+// The derived value is floored at defaultExcessiveBlockSize so the bound is
+// monotonic in the setting. Without that floor, lowering excessiveblocksize
+// would retroactively reject an outputs blob written under a higher value, and
+// since both writers swallow ErrBlobAlreadyExists nothing would ever rewrite it:
+// a config edit would become a permanent read failure presenting as a rotted
+// blob. Historic BSV values such as 128 MB are low enough to reach that band.
+// With the floor in place the absolute ceiling binds for every documented policy
+// value, and the derivation only matters if that ceiling is ever raised.
 func maxExternalOutputCount(tSettings *settings.Settings) uint64 {
 	excessiveBlockSize := defaultExcessiveBlockSize
 
@@ -157,12 +181,14 @@ func maxExternalOutputCount(tSettings *settings.Settings) uint64 {
 		excessiveBlockSize = uint64(tSettings.Policy.ExcessiveBlockSize) //nolint:gosec // guarded > 0 on the line above
 	}
 
+	if excessiveBlockSize < defaultExcessiveBlockSize {
+		excessiveBlockSize = defaultExcessiveBlockSize
+	}
+
 	count := excessiveBlockSize / minSerializedOutputSize
 
-	// Keep the derived count addressable as an int on every platform, so the
-	// caller's int conversion cannot overflow on an unusually large policy value.
-	if count > math.MaxInt32 {
-		count = math.MaxInt32
+	if count > maxExternalOutputSlots {
+		count = maxExternalOutputSlots
 	}
 
 	return count
@@ -2058,15 +2084,16 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 		// capped this way — the UTXO count and each script length both refuse to
 		// pre-size from the claim — so the index was the gap.
 		//
-		// The bound is deliberately derived from the node's own block-size policy
-		// rather than picked: an output at index N needs a transaction of at least
-		// 9*(N+1) bytes (8 satoshis plus a one-byte empty script length), and a
-		// transaction cannot exceed the largest block this node would accept. So
-		// the cap can never reject a parent that could have been accepted in the
-		// first place, which is what keeps this from becoming a new permanent-stall
-		// path on a legitimate blob. ExcessiveBlockSize of 0 means "no limit" for
-		// block acceptance; here that would restore the unbounded allocation, so
-		// fall back to the setting's own documented 4 GB default.
+		// maxExternalOutputCount is the lower of a policy-derived correctness
+		// ceiling and a fixed resource ceiling; see its doc comment. The resource
+		// ceiling is the one that binds in practice, so unlike the derivation
+		// alone this CAN reject a parent the node would otherwise accept: one
+		// carrying an output index at or above ~16.7M. Such a parent needs
+		// >144 MB of outputs on the wire and none is known to exist, but the
+		// rejection is permanent if one ever does, because neither writer rewrites
+		// an existing blob. That is the deliberate trade: a diagnosable stall on a
+		// parent nobody has seen, against an OOM kill on a single flipped bit,
+		// which is not diagnosable because the node is gone before it can report.
 		//
 		// This replaces a utxopersister.PadUTXOsWithNil call whose padded slice was
 		// discarded after its length was read, so it also drops one full-size
@@ -2078,8 +2105,8 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 			}
 		}
 
-		if uint64(maxIndex) >= maxExternalOutputCount(s.settings) {
-			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external outputs blob declares output index %d, beyond what any acceptable block could hold — rotted blob", previousTxHash.String(), maxIndex)
+		if bound := maxExternalOutputCount(s.settings); uint64(maxIndex) >= bound {
+			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] external outputs blob declares output index %d, at or beyond the %d-slot reconstruction bound — rotted blob, or a parent larger than this node will rebuild", previousTxHash.String(), maxIndex, bound)
 		}
 
 		// maxIndex+1 unconditionally, including for an empty UTXO list: that is
