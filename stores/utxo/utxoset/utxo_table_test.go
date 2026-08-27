@@ -48,7 +48,8 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS utxo CASCADE;
 	                       DROP TABLE IF EXISTS spend_journal CASCADE;
 	                       DROP TABLE IF EXISTS applied_block CASCADE;
-	                       DROP TABLE IF EXISTS applied_chunk CASCADE;`)
+	                       DROP TABLE IF EXISTS applied_chunk CASCADE;
+	                       DROP TABLE IF EXISTS tx_ident CASCADE;`)
 	pool.Close()
 
 	u, err := url.Parse(testDSN)

@@ -209,6 +209,59 @@ CREATE TABLE IF NOT EXISTS applied_chunk (
     chunk_idx    INTEGER NOT NULL,
     PRIMARY KEY (block_hash, chunk_idx)
 );
+
+-- ---------------------------------------------------------------------------
+-- THE IDENTITY TABLE. One row per transaction, from first sight to reclaim.
+--
+-- Partitioned BY LIST (leaf), the same eight-way split as utxo, and never by
+-- created_height. Three reasons, worst first:
+--
+--   1. created_height is NOT a property of the transaction. A mempool create writes
+--      tip+1, a guess; a block-application create of the SAME transaction writes the
+--      block's height. One block of mempool residency makes them differ, so a key
+--      including created_height admits the ordinary mempool-then-mined duplicate --
+--      which is the "two outputs became four" failure this table exists to stop.
+--   2. Fifteen Store methods take a txid and no height at all, and two of the
+--      highest-volume ones have no height field in their argument type, so they could
+--      not supply one even after an interface change.
+--   3. Height only ever bought partition-drop reclaim, and a partition holds
+--      transactions whose coins are still unspent, so it can never fire.
+--
+-- leaf is a REAL stored column. PARTITION BY LIST ((get_byte(txid,0) & 7)) is accepted
+-- but then postgres bans every unique constraint on the table, and a GENERATED column
+-- cannot be a partition key -- verified on 17.11 and 18.6, including 18's new VIRTUAL
+-- generated columns.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tx_ident (
+    leaf                 SMALLINT NOT NULL,   -- txid[0] & 7; the partition key
+    txid                 BYTEA    NOT NULL,   -- full 32 bytes: THE identity
+    created_height       INTEGER  NOT NULL,   -- first sight; immutable
+    membership           BYTEA,               -- packed 12-byte triples: blockID, height, subtreeIdx
+    off_chain_since      INTEGER,             -- see the comment on the index below
+    fee                  BIGINT,
+    size_in_bytes        INTEGER,
+    tx_inpoints          BYTEA,
+    locktime             INTEGER,
+    created_at           BIGINT,
+    conflicting_children BYTEA,
+    flags                SMALLINT NOT NULL DEFAULT 0,
+
+    -- LOAD-BEARING, and not defensive tidiness: this IS the global uniqueness rule.
+    --
+    -- Postgres enforces PRIMARY KEY (leaf, txid) only WITHIN a partition. Verified on
+    -- 17.11 and 18.6: the same txid under leaf 0 and leaf 1 is ACCEPTED, two rows, and
+    -- ON CONFLICT (leaf, txid) DO NOTHING reports the second as a fresh insert. Seven of
+    -- the eight wrong values are in range, so no mistake fails safe.
+    --
+    -- The length test must come first and share the AND. get_byte on an empty bytea
+    -- RAISES, where LeafFor returns 0 for an empty txid; the short-circuit turns that
+    -- divergence into a clean constraint violation instead of an error from inside the
+    -- expression.
+    CONSTRAINT tx_ident_ck CHECK (length(txid) = 32 AND leaf = (get_byte(txid, 0) & 7)),
+    CONSTRAINT tx_ident_membership_triples
+        CHECK (membership IS NULL OR length(membership) % 12 = 0),
+    PRIMARY KEY (leaf, txid)
+) PARTITION BY LIST (leaf);
 `
 
 // partitionSQL is applied per leaf.
@@ -241,6 +294,52 @@ CREATE TABLE IF NOT EXISTS utxo_p%[1]d PARTITION OF utxo FOR VALUES IN (%[1]d)
 -- roughly 385M x 63 B = 24 GB and take the budget past 1.4x the entire allowance. Any query filtering on
 -- txid without a ukey range bound is a review failure.
 CREATE INDEX IF NOT EXISTS utxo_p%[1]d_ukey ON utxo_p%[1]d (ukey);
+
+CREATE TABLE IF NOT EXISTS tx_ident_l%[1]d PARTITION OF tx_ident FOR VALUES IN (%[1]d);
+`
+
+// txIdentIndexSQL is the ONE secondary index tx_ident should ever carry, plus the reducer
+// the settled predicate needs.
+//
+// off_chain_since is a CACHED ANSWER TO A CHAIN QUESTION, not a timer, and it can never be
+// derived here. An index only answers questions about columns on the row it indexes, and
+// "is any block containing me on the main chain" is not one: the answer changes when a
+// block is invalidated and no row changes. This store cannot see the chain at all -- it
+// holds a pool, a pushed-in height and journal state -- so the answer has to be written
+// down by the four paths that already learned it. NULL means the last thing we were told is
+// that a MAIN-CHAIN block contains this transaction.
+//
+// The index is PARTIAL, covering only the mempool. Measured on PG 18.6 at 43,000,000 rows
+// with a 43,100-transaction mempool: 524,288 bytes, which is 0.0122 bytes per table row and
+// 0.016% of the primary key beside it. The reload it serves costs 3,484 page fetches with a
+// fresh mempool against 978,145 for the sequential scan it would otherwise need.
+//
+// Do NOT add INCLUDE columns to make it index-only. Measured on 18.6: including
+// tx_inpoints refuses any transaction with 82 or more inputs at INSERT time --
+// "index row size 2720 exceeds btree version 4 maximum 2704" -- which is transaction
+// intake down, not a slow path.
+const txIdentIndexSQL = `
+CREATE INDEX IF NOT EXISTS tx_ident_off_chain_idx ON tx_ident (off_chain_since)
+    WHERE off_chain_since IS NOT NULL;
+
+-- Highest block height named by a packed membership, NULL if there is none.
+--
+-- The casts MUST be bigint. In postgres 255::int << 24 wraps to -16777216, SILENTLY, so an
+-- int4 version returns negative heights and every "<= cutoff" test comes back true, which
+-- would settle every transaction in the store. Verified on 18.6.
+--
+-- The MAXIMUM is what makes the settled predicate sound: it is at least the main-chain
+-- height, so if the maximum is 288 deep the main-chain block is too. Taking the first or
+-- the most favourable height instead lets a child mined low on a fork and re-mined recently
+-- read as stable, which is what the incumbent SQL pruner does.
+CREATE OR REPLACE FUNCTION mh_max(m bytea) RETURNS bigint
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $fn$
+  SELECT max( (get_byte(m, i*12+4)::bigint << 24)
+            | (get_byte(m, i*12+5)::bigint << 16)
+            | (get_byte(m, i*12+6)::bigint <<  8)
+            |  get_byte(m, i*12+7)::bigint )
+    FROM generate_series(0, octet_length(m)/12 - 1) i
+$fn$;
 `
 
 // CreateSchema installs the M1 schema. Idempotent.
@@ -253,6 +352,12 @@ func CreateSchema(ctx context.Context, pool *pgxpool.Pool) error {
 		if _, err := pool.Exec(ctx, fmt.Sprintf(partitionSQL, i)); err != nil {
 			return err
 		}
+	}
+
+	// After the partitions: an index on a partitioned parent is created on every existing
+	// partition, and postgres adds it to any created later.
+	if _, err := pool.Exec(ctx, txIdentIndexSQL); err != nil {
+		return err
 	}
 
 	return nil
