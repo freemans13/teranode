@@ -3,7 +3,6 @@ package utxoset
 import (
 	"context"
 	"net/url"
-	"os"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -17,32 +16,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testDSN points at a throwaway postgres. Overridable so CI and a developer's local
-// instance can both drive it.
-var testDSN = envOr("UTXOSET_TEST_DSN", "postgres://postgres@localhost:5441/soak?sslmode=disable")
-
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-
-	return def
-}
-
 func newTestStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
 
 	ctx := context.Background()
+	dsn := testDSN(t)
 
-	pool, err := pgxpool.New(ctx, testDSN)
-	if err != nil {
-		t.Skipf("skipping: cannot reach postgres: %v", err)
-	}
-
-	if err = pool.Ping(ctx); err != nil {
-		pool.Close()
-		t.Skipf("skipping: cannot reach postgres: %v", err)
-	}
+	pool, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err, "opening the test pool")
+	require.NoError(t, pool.Ping(ctx), "reaching the test postgres")
 
 	// clean slate
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS utxo CASCADE;
@@ -53,7 +35,7 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 	                       DROP TABLE IF EXISTS tx_body CASCADE;`)
 	pool.Close()
 
-	u, err := url.Parse(testDSN)
+	u, err := url.Parse(dsn)
 	require.NoError(t, err)
 
 	tSettings := settings.NewSettings()

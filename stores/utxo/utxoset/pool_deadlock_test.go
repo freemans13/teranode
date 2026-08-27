@@ -3,6 +3,7 @@ package utxoset
 import (
 	"context"
 	"net/url"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -21,16 +22,11 @@ func newSmallPoolStore(t *testing.T, maxConns int) (*Store, context.Context) {
 	t.Helper()
 
 	ctx := context.Background()
+	dsn := testDSN(t)
 
-	pool, err := pgxpool.New(ctx, testDSN)
-	if err != nil {
-		t.Skipf("skipping: cannot reach postgres: %v", err)
-	}
-
-	if err = pool.Ping(ctx); err != nil {
-		pool.Close()
-		t.Skipf("skipping: cannot reach postgres: %v", err)
-	}
+	pool, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err, "opening the test pool")
+	require.NoError(t, pool.Ping(ctx), "reaching the test postgres")
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS utxo CASCADE;
 	                       DROP TABLE IF EXISTS spend_journal CASCADE;
@@ -38,11 +34,11 @@ func newSmallPoolStore(t *testing.T, maxConns int) (*Store, context.Context) {
 	                       DROP TABLE IF EXISTS applied_chunk CASCADE;`)
 	pool.Close()
 
-	u, err := url.Parse(testDSN)
+	u, err := url.Parse(dsn)
 	require.NoError(t, err)
 
 	q := u.Query()
-	q.Set("pool_max_conns", "4")
+	q.Set("pool_max_conns", strconv.Itoa(maxConns))
 	u.RawQuery = q.Encode()
 
 	s, err := New(ctx, ulogger.TestLogger{}, settings.NewSettings(), u)
