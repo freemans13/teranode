@@ -60,21 +60,47 @@ func unpackMembership(m []byte) (blockIDs, heights []uint32, subtreeIdxs []int) 
 
 // Get returns everything the store holds about one transaction.
 //
-// The field list is accepted and deliberately ignored. Both halves arrive on a single row
-// from one statement, so narrowing the projection would save a few bytes on the wire and
-// nothing else, while giving a caller a partially populated meta.Data that it might
+// The field list is ignored with ONE exception. Everything on the identity row and its body
+// arrives together from a single statement, so narrowing the projection would save a few bytes
+// on the wire and nothing else, while handing a caller a partly populated record it might
 // dereference. Answering the whole question is cheaper than answering half of it carefully.
-func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
+//
+// The exception is the per-output spend state, which costs a second query across two tables
+// because this store destroys the coin row on spend and keeps the spender in its journal. That
+// one is answered only when asked for. See decorateSpendingData.
+func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fields.FieldName) (*meta.Data, error) {
 	if hash == nil {
 		return nil, errors.NewProcessingError("[utxoset][Get] nil hash")
 	}
 
+	var (
+		data *meta.Data
+		err  error
+	)
+
 	// Batched when configured. The validator resolves parents one at a time from many
 	// goroutines, and each of those is otherwise its own round trip.
 	if s.getBatcher != nil {
-		return s.getBatched(ctx, hash)
+		data, err = s.getBatched(ctx, hash)
+	} else {
+		data, err = s.getDirect(ctx, hash)
 	}
 
+	if err != nil {
+		return nil, err
+	}
+
+	if wantsSpendingData(fieldNames) {
+		if err = s.decorateSpendingData(ctx, hash, data); err != nil {
+			return nil, err
+		}
+	}
+
+	return data, nil
+}
+
+// getDirect is the unbatched read, one statement for the identity row and its body.
+func (s *Store) getDirect(ctx context.Context, hash *chainhash.Hash) (*meta.Data, error) {
 	var r metaRow
 
 	err := s.pool.QueryRow(ctx, getSQL, LeafFor(hash[:]), hash[:]).Scan(
@@ -88,12 +114,7 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, _ ...fields.Field
 		return nil, errors.NewStorageError("[utxoset][Get] %s", hash.String(), err)
 	}
 
-	data, err := r.toMeta(hash)
-	if err != nil {
-		return nil, err
-	}
-
-	return data, nil
+	return r.toMeta(hash)
 }
 
 // GetMeta fills in an existing meta.Data from the store, which is what callers holding a

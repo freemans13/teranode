@@ -49,18 +49,20 @@ func TestCounterConflictingSurvivesABodyThatHasAgedOut(t *testing.T) {
 	require.Nil(t, got.Tx, "the body is gone, which is the state under test")
 	require.NotEmpty(t, got.TxInpoints.ParentTxHashes, "but what it spends is still known")
 
-	// The call that used to panic here.
+	// The call that used to panic here, and then could not answer at all.
 	//
-	// It still cannot produce the full answer on this store, because naming who spent a
-	// PARENT's output needs spending data the store does not yet put on a metadata read: the
-	// coin row is destroyed on spend and the answer lives in the journal. That is separate
-	// work. What this pins is that the walk gets past reading the transaction's OWN inputs,
-	// which is where it used to die, and fails with a diagnosable error instead of taking the
-	// process down.
-	_, err = utxo.GetCounterConflictingTxHashes(ctx, s, *ch, 1_000)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "is out of range",
-		"the failure must be about the parent's spending data, not about reading the inputs")
-	require.NotContains(t, err.Error(), "cannot read what the transaction spends",
-		"the inputs must have come from the stored inpoints, which do not age out")
+	// It works now because the metadata read names who took each of a parent's outputs, read
+	// from the journal since the coin row is gone. Both halves were needed: reading the
+	// transaction's own inputs from the stored inpoints, which survive the body ageing out, and
+	// reading its parents' spenders from the journal.
+	hashes, err := utxo.GetCounterConflictingTxHashes(ctx, s, *ch, 1_000)
+	require.NoError(t, err, "a body-less transaction must be answerable, not fatal")
+	require.NotEmpty(t, hashes, "and the transaction itself is always in the answer")
+
+	inSet := make(map[string]bool, len(hashes))
+	for _, h := range hashes {
+		inSet[h.String()] = true
+	}
+
+	require.True(t, inSet[ch.String()], "the subject is always part of its own counter set")
 }
