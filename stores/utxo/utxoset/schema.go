@@ -372,6 +372,30 @@ CREATE OR REPLACE FUNCTION mh_max(m bytea) RETURNS bigint
             |  get_byte(m, i*12+7)::bigint )
     FROM generate_series(0, octet_length(m)/12 - 1) i
 $fn$;
+
+-- mh_strip returns the membership with every triple naming one of ids removed, in insertion
+-- order.
+--
+-- The casts MUST be bigint, for exactly the reason mh_max's must. In PostgreSQL 255::int << 24
+-- wraps to a negative number, silently, so an int4 version would compare a negative value
+-- against a positive block id and strip nothing at all.
+--
+-- EVERY matching triple goes, not the first. One block can be stamped against a transaction
+-- twice under different subtree indexes, so a first-match removal would leave it still claiming
+-- a block the caller asked it to forget.
+--
+-- Stripping the last triple yields NULL rather than an empty value, which is what a transaction
+-- no block has ever named already carries, so the two spellings of "no block" stay one. STRICT
+-- keeps a NULL membership NULL rather than turning it into a value.
+CREATE OR REPLACE FUNCTION mh_strip(m bytea, ids bigint[]) RETURNS bytea
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $fn$
+  SELECT string_agg(substring(m from i*12 + 1 for 12), ''::bytea ORDER BY i)
+    FROM generate_series(0, octet_length(m)/12 - 1) i
+   WHERE NOT ( ( (get_byte(m, i*12+0)::bigint << 24)
+               | (get_byte(m, i*12+1)::bigint << 16)
+               | (get_byte(m, i*12+2)::bigint <<  8)
+               |  get_byte(m, i*12+3)::bigint ) = ANY (ids) )
+$fn$;
 `
 
 // CreateSchema installs the M1 schema. Idempotent.

@@ -17,18 +17,6 @@ func (s *Store) ReAssignUTXO(_ context.Context, _ *utxo.Spend, _ *utxo.Spend, _ 
 	return errM1("ReAssignUTXO")
 }
 
-func (s *Store) RemoveFromConflictingChildren(_ context.Context, _ []utxo.ConflictingChildRemoval) error {
-	return errM1("RemoveFromConflictingChildren")
-}
-
-func (s *Store) RemoveBlockIDs(_ context.Context, _ []utxo.BlockIDsRemoval) error {
-	return errM1("RemoveBlockIDs")
-}
-
-func (s *Store) GetConflictingTxIterator() (utxo.UnminedTxIterator, error) {
-	return nil, errM1("GetConflictingTxIterator")
-}
-
 func (s *Store) BeginConflictIntent(_ context.Context, _ utxo.ConflictIntent) error {
 	return errM1("BeginConflictIntent")
 }

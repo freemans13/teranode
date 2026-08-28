@@ -176,3 +176,42 @@ func (s *Store) GetPrunableUnminedTxIterator(cutoffHeight uint32) (utxo.UnminedT
 
 	return &unminedIterator{rows: rows}, nil
 }
+
+// conflictingSQL lists every transaction recorded as having lost a double-spend race.
+//
+// The projection MUST match unminedSQL column for column and in the same order, because the
+// iterator's Next scans these positionally and is shared by all three constructors. A column
+// added to one statement and not the others is a runtime scan failure rather than a compile
+// error, which is why this lives beside them.
+//
+// There is deliberately no test on the mempool marker. A transaction that lost a race can have
+// been mined into a block that later lost, so it carries membership and no marker, and it is
+// still conflicting. Filtering on the marker would hide exactly the transactions a rewind
+// exists to purge, and neither reference store filters on it either.
+//
+// Coinbases are excluded here rather than emitted and skipped later. A coinbase spends nothing,
+// so it can never lose a race for a coin, and excluding it in the statement keeps the shared
+// Next free of a branch only this caller would use.
+//
+// No index serves this predicate and none is added. It is a sequential scan of every partition,
+// which is what the aerospike store does too, and the only caller is an offline repair tool run
+// by hand with the node stopped.
+const conflictingSQL = `
+SELECT txid, fee, size_in_bytes, tx_inpoints, created_at, off_chain_since, membership, flags
+  FROM tx_ident
+ WHERE (flags & $1::smallint) <> 0
+   AND (flags & $2::smallint) = 0`
+
+// GetConflictingTxIterator lists the transactions recorded as having lost a double-spend race.
+//
+// The offline rewind tool reads this to decide what to purge. It holds one connection and one
+// snapshot open for the length of the scan, which would defer the journal pruner's concurrent
+// detach on a running node; that is acceptable because the tool runs with the node stopped.
+func (s *Store) GetConflictingTxIterator() (utxo.UnminedTxIterator, error) {
+	rows, err := s.pool.Query(context.Background(), conflictingSQL, FlagConflicting, FlagCoinbase)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][GetConflictingTxIterator]", err)
+	}
+
+	return &unminedIterator{rows: rows}, nil
+}
