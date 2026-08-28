@@ -425,3 +425,67 @@ func TestSyncManager_ADeferredRoundWithStillNobodyToAskIsPutBack(t *testing.T) {
 	require.Equal(t, first.Height, sm.nextCheckpointSnapshot().Height,
 		"nothing was asked for, so the checkpoint must not have moved")
 }
+
+// TestSyncManager_AStaleRebuildHeightStillLetsTheElectionReAim is the regression
+// test for ChiR15.
+//
+// Both callers of the header-state rebuild read their height outside headerMu
+// and then wait to acquire it, and on that path the lock is contended by every
+// arriving block. So a checkpoint transition can commit in the gap and the
+// height handed to the rebuild can already be behind it. Re-deriving from that
+// stale height leaves the checkpoint naming a block that is now in our chain,
+// and startSync's gate is bestHeight < nextCheckpoint.Height, which such a
+// checkpoint can never satisfy. Headers-first mode would then stay off for the
+// life of the process, silently: the rebuild cleared startHeader, no headers can
+// arrive to repopulate it, and the walk the scheduler assigns slices from has
+// nothing to walk.
+//
+// The stale read is expressed here as an argument rather than raced for.
+func TestSyncManager_AStaleRebuildHeightStillLetsTheElectionReAim(t *testing.T) {
+	sm, first, final := newCheckpointManager(t)
+	sm.headersFirstMode.Store(true)
+
+	// The checkpoint block commits from the park with nobody to ask, so the
+	// nil-peer arm deliberately leaves the checkpoint where it is.
+	require.NoError(t, sm.checkpointBlockCommitted(nil, *first.Hash))
+
+	// The rebuild runs with a height read BEFORE that commit, one below the
+	// checkpoint whose block is now in the chain.
+	tip := chainhash.Hash{0xb0}
+	sm.resetHeaderState(&tip, first.Height-1)
+
+	require.Equal(t, first.Height, sm.nextCheckpointSnapshot().Height,
+		"sanity: the stale height cannot advance the checkpoint, which is the state under test")
+
+	// The election is the one place a current height is in hand, so it must
+	// repair the aim rather than trust the last rebuild.
+	_, rec := connectCheckpointCandidate(t, sm, 121)
+
+	sm.handleCheckSyncPeer()
+
+	require.True(t, WaitUntil(func() bool { return rec.askedForHeadersUpTo(*final.Hash) }, 5*time.Second),
+		"the election must re-aim above the committed checkpoint and ask for the round")
+	require.True(t, sm.headersFirstMode.Load(),
+		"headers-first mode must come back on, or this PR's own feature is off until a restart")
+	require.Zero(t, rec.getBlocksCount(),
+		"the node is still below a checkpoint, so it must not fall back to the inventory path")
+}
+
+// TestSyncManager_AStaleRebuildHeightCannotRewindTheCheckpoint pins the other
+// interleaving of ChiR15, where the checkpoint block arrived from a connected
+// peer so the transition DID advance the checkpoint. An unconditional re-derive
+// from a stale height would put it back onto the checkpoint that just committed.
+func TestSyncManager_AStaleRebuildHeightCannotRewindTheCheckpoint(t *testing.T) {
+	sm, first, final := newCheckpointManager(t)
+	sm.headersFirstMode.Store(true)
+
+	// The transition has already advanced the checkpoint to the next one.
+	sm.nextCheckpoint = &final
+
+	// A rebuild then runs holding a height read before that transition.
+	tip := chainhash.Hash{0xb0}
+	sm.resetHeaderState(&tip, first.Height-1)
+
+	require.Equal(t, final.Height, sm.nextCheckpointSnapshot().Height,
+		"a stale height must never walk the checkpoint back onto a block already in the chain")
+}

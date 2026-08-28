@@ -927,11 +927,26 @@ func (sm *SyncManager) resetHeaderStateLocked(newestHash *chainhash.Hash, newest
 	// (manager.go, the findNextHeaderCheckpoint call in New) means whoever
 	// rebuilds the list also rebuilds the target it is aimed at.
 	//
-	// It cannot move the checkpoint backwards. nextCheckpoint is only ever set
-	// to findNextHeaderCheckpoint(prevCheckpointHeight) once the block at
-	// prevCheckpointHeight is in the chain, so newestHeight >= that height and
-	// findNextHeaderCheckpoint is monotonic in its argument.
-	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(newestHeight)
+	// Monotonic, because newestHeight cannot be trusted to be current. Both
+	// callers read it outside headerMu and then wait to acquire the lock, and on
+	// this path that lock is contended by every arriving block, so a checkpoint
+	// transition can land in the gap and advance the checkpoint before this runs.
+	// An unconditional assignment would then put it back onto the checkpoint
+	// whose block has just committed, and startSync's gate can never be
+	// satisfied by a checkpoint already in the chain: headers-first mode would
+	// stay off for the life of the process, silently, with the header walk
+	// having nothing to walk. Only ever move it forward, and treat nil as
+	// terminal, so a stale height can leave it alone but never rewind it.
+	//
+	// Writing the rule out rather than arguing an invariant is deliberate. It
+	// also makes the DisableCheckpoints case structural instead of a
+	// reachability argument, because findNextHeaderCheckpoint reads
+	// chainParams.Checkpoints directly and that slice is not emptied by the flag.
+	if sm.nextCheckpoint != nil {
+		if derived := sm.findNextHeaderCheckpoint(newestHeight); derived == nil || derived.Height >= sm.nextCheckpoint.Height {
+			sm.nextCheckpoint = derived
+		}
+	}
 
 	// When there is a next checkpoint, add an entry for the latest known
 	// block into the header pool.  This allows the next downloaded header
@@ -1309,6 +1324,25 @@ func (sm *SyncManager) startSync() {
 	// Snapshot the checkpoint under headerMu, then work from the snapshot: the
 	// getheaders send below must not happen with the lock held (Rule B).
 	nextCP := sm.nextCheckpointSnapshot()
+
+	// Re-aim from the height read on this path, which is the only current one
+	// available here, rather than trusting whoever last rebuilt the header list
+	// to have read a fresh one. Both rebuild callers take their height outside
+	// headerMu and then wait for the lock, so a checkpoint transition can commit
+	// in that gap and leave the stored checkpoint naming a block already in our
+	// chain. The gate below can never be satisfied by such a checkpoint, so
+	// headers-first mode would stay off for good and the header walk would have
+	// nothing to walk. Repairing it here makes the gate self-healing whatever
+	// the last rebuild saw.
+	if nextCP != nil && bestBlockHeightInt32 >= nextCP.Height {
+		sm.headerMu.Lock()
+		sm.nextCheckpoint = sm.findNextHeaderCheckpoint(bestBlockHeightInt32)
+		nextCP = sm.nextCheckpoint
+		sm.headerMu.Unlock()
+
+		sm.logger.Infof("[startSync] checkpoint was already in the chain at height %d, re-aimed", bestBlockHeightInt32)
+	}
+
 	if nextCP != nil &&
 		bestBlockHeightInt32 < nextCP.Height &&
 		sm.chainParams != &chaincfg.RegressionNetParams {

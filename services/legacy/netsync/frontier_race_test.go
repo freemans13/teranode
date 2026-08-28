@@ -125,6 +125,12 @@ func newRaceManager(t *testing.T) *SyncManager {
 	}
 	sm.headersFirstMode.Store(true)
 
+	// Mirror New, which only rebuilds the header state when a checkpoint exists
+	// (see the DisableCheckpoints branch there). resetHeaderStateLocked treats a
+	// nil checkpoint as terminal and will not derive one, so a manager built
+	// without this would push no anchor and the walk would have nothing to do.
+	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(0)
+
 	t.Cleanup(func() { sm.racedBlocks.Stop() })
 
 	return sm
