@@ -227,3 +227,83 @@ func TestOneFalseInputLeavesTheHonestCoinsUntouched(t *testing.T) {
 			"output %d must survive a transaction rejected for lying about output 2", vout)
 	}
 }
+
+// A false claim must survive a sibling input that misses, and this is the case that nearly got
+// away. The claim check runs in Go after the DELETE, so the coin it lied about IS taken and IS
+// written to the spend journal, named by this transaction. When any other input of the same
+// plan misses, the store asks the journal who took each coin that is no longer there, over the
+// WHOLE plan rather than just the misses. It then finds the row its own statement wrote a
+// moment ago, reads it as a replay of earlier work, and clears the verdict.
+//
+// Left unguarded that turns a transaction rejected for lying into a transaction merely marked
+// conflicting against whoever took the sibling, which is exactly the outcome the mismatch error
+// exists to prevent.
+func TestAFalseClaimSurvivesASiblingMiss(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 3, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	// Someone else takes output 1 first.
+	thief := spendOutput(t, parent, 1, 4)
+	_, _, err = s.SpendAndCreate(ctx, thief, 101)
+	require.NoError(t, err)
+
+	// Ours spends output 0, which is live and which it lies about, and output 1, which is gone.
+	child := bt.NewTx()
+	for _, vout := range []uint32{0, 1} {
+		require.NoError(t, child.FromUTXOs(&bt.UTXO{
+			TxIDHash:      parent.TxIDChainHash(),
+			Vout:          vout,
+			LockingScript: parent.Outputs[vout].LockingScript,
+			Satoshis:      parent.Outputs[vout].Satoshis,
+		}))
+	}
+
+	child.AddOutput(&bt.Output{Satoshis: 1_000, LockingScript: parent.Outputs[0].LockingScript})
+	child.Inputs[0].PreviousTxSatoshis = 5_000_000_000
+
+	_, spends, err := s.SpendAndCreate(ctx, child, 101)
+	require.Error(t, err)
+	require.Len(t, spends, 2)
+	require.ErrorIs(t, spends[0].Err, errors.ErrUtxoHashMismatch, "the lie must survive the sibling miss")
+	require.ErrorIs(t, spends[1].Err, errors.ErrSpent)
+}
+
+// The same trap by the other route: a genuine replay of a partly applied block, where one input
+// really was taken by this transaction earlier and the other is fresh. The fresh one is the
+// vehicle for the lie, and the replayed one is what invites the store to read its own journal
+// writes as history.
+func TestAFalseClaimSurvivesAGenuineReplayOfASibling(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 3, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	child := bt.NewTx()
+	for _, vout := range []uint32{0, 1} {
+		require.NoError(t, child.FromUTXOs(&bt.UTXO{
+			TxIDHash:      parent.TxIDChainHash(),
+			Vout:          vout,
+			LockingScript: parent.Outputs[vout].LockingScript,
+			Satoshis:      parent.Outputs[vout].Satoshis,
+		}))
+	}
+
+	child.AddOutput(&bt.Output{Satoshis: 1_000, LockingScript: parent.Outputs[0].LockingScript})
+
+	_, spends, err := s.SpendAndCreate(ctx, child, 101, utxo.WithSpendOnly())
+	require.NoError(t, err)
+
+	// Put output 0 back, so the re-offer has one fresh input and one genuine replay.
+	require.NoError(t, s.Unspend(ctx, spends[:1], false))
+
+	child.Inputs[0].PreviousTxSatoshis = 5_000_000_000
+
+	_, redo, err := s.SpendAndCreate(ctx, child, 101, utxo.WithSpendOnly())
+	require.Error(t, err)
+	require.ErrorIs(t, redo[0].Err, errors.ErrUtxoHashMismatch)
+	require.NoError(t, redo[1].Err, "the genuine replay must still be recognised as one")
+}

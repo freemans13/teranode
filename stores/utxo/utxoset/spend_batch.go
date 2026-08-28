@@ -367,7 +367,7 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q querier, p *spendPlan,
 		return nil
 	}
 
-	return s.namePlanSpenders(ctx, q, p)
+	return s.namePlanSpenders(ctx, q, p, done)
 }
 
 // namePlanSpenders reads the journal for every coin that is no longer there, and does two
@@ -391,7 +391,7 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q querier, p *spendPlan,
 // Bounded by the journal's retention. Beyond that the store genuinely cannot say, and a replay
 // that old cannot be recognised either, which is a stated limit of delete-on-spend rather than
 // a gap to paper over.
-func (s *Store) namePlanSpenders(ctx context.Context, q querier, p *spendPlan) error {
+func (s *Store) namePlanSpenders(ctx context.Context, q querier, p *spendPlan, done map[int32]struct{}) error {
 	rows, err := q.Query(ctx, spenderSQL, p.leaves, p.ukeys, p.txids, p.idx)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Spend] find spender", err)
@@ -416,12 +416,21 @@ func (s *Store) namePlanSpenders(ctx context.Context, q querier, p *spendPlan) e
 			return errors.NewStorageError("[utxoset][Spend] spender scan", err)
 		}
 
+		// An input THIS statement just took is not a replay of earlier work, it is this
+		// work. The journal row naming this spender is the one the same statement wrote a
+		// moment ago, so without this guard the replay branch below reads its own writes,
+		// declares a replay, and clears whatever verdict runSpendPlan reached -- including a
+		// rejected false claim about the coin, which is then committed.
+		if _, taken := done[k]; taken {
+			continue
+		}
+
 		sp := p.perItem[p.owner[k]][p.ownerVin[k]]
 		if sp == nil {
 			continue
 		}
 
-		if _, done := replayed[k]; done {
+		if _, settled := replayed[k]; settled {
 			continue
 		}
 
