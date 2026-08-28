@@ -21,10 +21,15 @@ import (
 // target row twice within one statement. That matches what the per-transaction loop did, where
 // the second attempt found the block already recorded and skipped it.
 //
-// The append is guarded by position_of_the_block rather than by a plain concatenation, so
-// replaying a block does not record it twice. The guard reads the row as it stood before this
-// statement, which is what makes a batch mixing already-stamped and never-stamped
-// transactions come out right in both directions.
+// The append is guarded rather than unconditional, so replaying a block does not record it
+// twice. The guard reads the row as it stood before this statement, which is what makes a batch
+// mixing already-stamped and never-stamped transactions come out right in both directions.
+//
+// Membership is tested on a 12-BYTE BOUNDARY. The column is a concatenation of 12-byte triples
+// and the reader unpacks it that way. This used to be a plain substring search, which can match
+// bytes STRADDLING two neighbouring triples, read that as already-recorded, and silently skip a
+// real append, leaving a transaction that never claims a block which actually contains it.
+// unstampSQL carries the identical test, and it matters more there.
 //
 // The marker is cleared only when the caller states the block is on the longest chain. That
 // is the same rule the create gate applies, and for the same reason: "mined into some block"
@@ -33,7 +38,11 @@ import (
 const stampSQL = `
 UPDATE tx_ident i
    SET membership = CASE
-           WHEN position($3::bytea in coalesce(i.membership, '\x'::bytea)) > 0 THEN i.membership
+           WHEN EXISTS (
+                SELECT 1
+                  FROM generate_series(0, coalesce(length(i.membership), 0) / 12 - 1) g
+                 WHERE substring(i.membership from g * 12 + 1 for 12) = $3::bytea)
+           THEN i.membership
            ELSE coalesce(i.membership, '\x'::bytea) || $3::bytea
        END,
        off_chain_since = CASE WHEN $4::boolean THEN NULL ELSE i.off_chain_since END
@@ -43,18 +52,25 @@ UPDATE tx_ident i
 // unstampSQL removes one block from a transaction's membership and puts it back in the
 // mempool set with a FRESH clock. Array-parameterised for the same reason stampSQL is.
 //
+// The entry to remove is located on a 12-BYTE BOUNDARY, and that is the worse half of the
+// alignment rule rather than a symmetry. This used to splice 12 bytes out from wherever a plain
+// substring search first matched. At an unaligned offset that destroys the tail of one triple
+// and the head of the next, and the result is still a multiple of 12, so the length constraint
+// does not catch it and the reader cannot tell it has been handed two invented blocks. A value
+// that is not present on a boundary is not an entry at all, so the right answer is to change
+// nothing, which is what the coalesce does when no aligned match exists.
+//
 // The clock is the store's current tip, NOT the transaction's creation height, and that is
 // the fact that decides whether these two columns are one concept or two. A transaction
 // created at height 100 and un-mined while the tip is 5,000 must wait from 5,000, or the
 // preservation pass fires on it immediately. Both reference stores do the same.
 const unstampSQL = `
 UPDATE tx_ident i
-   SET membership = CASE
-           WHEN position($3::bytea in coalesce(i.membership, '\x'::bytea)) > 0
-           THEN overlay(i.membership placing ''::bytea
-                        from position($3::bytea in i.membership) for 12)
-           ELSE i.membership
-       END,
+   SET membership = coalesce((
+           SELECT overlay(i.membership placing ''::bytea FROM min(g * 12 + 1) FOR 12)
+             FROM generate_series(0, coalesce(length(i.membership), 0) / 12 - 1) g
+            WHERE substring(i.membership from g * 12 + 1 for 12) = $3::bytea
+       ), i.membership),
        off_chain_since = $4::int
   FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
  WHERE i.leaf = k.leaf AND i.txid = k.txid`

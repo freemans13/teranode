@@ -176,3 +176,92 @@ func TestUnsetMinedMultiUnstampsEveryTransactionInOneCall(t *testing.T) {
 		require.Equal(t, int32(5_000), *r.offChainSince, "with a clock from the current tip")
 	}
 }
+
+// mkTriple builds one 12-byte membership entry from raw bytes, for planting a column directly.
+func mkTriple(start byte) []byte {
+	b := make([]byte, 12)
+	for i := range b {
+		b[i] = start + byte(i)
+	}
+
+	return b
+}
+
+// TestStampTestsBlockMembershipOnA12ByteBoundary is a defect test for the statement that
+// records a block against a transaction.
+//
+// The membership column is a concatenation of 12-byte triples of block id, block height and
+// subtree index, and the reader unpacks it on that boundary. A plain substring search can match
+// bytes STRADDLING two neighbouring triples, read that as already-recorded, and silently skip a
+// real append. The transaction then never claims a block that actually contains it.
+//
+// This column is written on every block of every sync, so the exposure is continuous.
+func TestStampTestsBlockMembershipOnA12ByteBoundary(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	var txid [32]byte
+	for i := range txid {
+		txid[i] = byte(i)
+	}
+
+	first := mkTriple(0x01)
+	second := mkTriple(0x0d)
+
+	// Exactly the last half of the first triple followed by the first half of the second, so it
+	// appears at offset 6 and at no 12-byte boundary.
+	straddler := append(append([]byte{}, first[6:]...), second[:6]...)
+
+	_, err := s.pool.Exec(ctx, `
+        INSERT INTO tx_ident (leaf, txid, created_height, membership)
+        VALUES ($1, $2, 100, $3)`,
+		LeafFor(txid[:]), txid[:], append(append([]byte{}, first...), second...))
+	require.NoError(t, err)
+
+	_, err = s.pool.Exec(ctx, stampSQL, []int16{LeafFor(txid[:])}, [][]byte{txid[:]}, straddler, true)
+	require.NoError(t, err)
+
+	var got []byte
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT membership FROM tx_ident WHERE txid = $1`, txid[:]).Scan(&got))
+
+	require.Len(t, got, 36,
+		"a block that only appears straddling two entries is NOT recorded, and must be appended")
+	require.Equal(t, straddler, got[24:36], "and appended at the end, on the boundary")
+}
+
+// TestUnstampRemovesOnlyAWholeEntry is the same defect on the way out, and it is the worse
+// half.
+//
+// Removing a block splices 12 bytes out of the column. At an unaligned offset that destroys the
+// tail of one triple and the head of the next, leaving a length that is still a multiple of 12
+// so the constraint does not catch it and the reader cannot tell. A block that is not recorded
+// on a 12-byte boundary is not recorded at all, and the right answer is to change nothing.
+func TestUnstampRemovesOnlyAWholeEntry(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	var txid [32]byte
+	for i := range txid {
+		txid[i] = byte(i)
+	}
+
+	first := mkTriple(0x01)
+	second := mkTriple(0x0d)
+	planted := append(append([]byte{}, first...), second...)
+	straddler := append(append([]byte{}, first[6:]...), second[:6]...)
+
+	_, err := s.pool.Exec(ctx, `
+        INSERT INTO tx_ident (leaf, txid, created_height, membership)
+        VALUES ($1, $2, 100, $3)`, LeafFor(txid[:]), txid[:], planted)
+	require.NoError(t, err)
+
+	_, err = s.pool.Exec(ctx, unstampSQL,
+		[]int16{LeafFor(txid[:])}, [][]byte{txid[:]}, straddler, int32(5_000))
+	require.NoError(t, err)
+
+	var got []byte
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT membership FROM tx_ident WHERE txid = $1`, txid[:]).Scan(&got))
+
+	require.Equal(t, planted, got,
+		"a value present only across a boundary is not an entry, so both real entries must survive intact")
+}
