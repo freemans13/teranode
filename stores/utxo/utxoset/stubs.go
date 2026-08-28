@@ -56,7 +56,3 @@ func (s *Store) BeginConflictIntent(_ context.Context, _ utxo.ConflictIntent) er
 func (s *Store) CompleteConflictIntent(_ context.Context, _ chainhash.Hash) error {
 	return errM1("CompleteConflictIntent")
 }
-
-func (s *Store) MarkTransactionsOnLongestChain(_ context.Context, _ []chainhash.Hash, _ bool) error {
-	return errM1("MarkTransactionsOnLongestChain")
-}
