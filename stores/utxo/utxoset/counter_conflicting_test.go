@@ -66,3 +66,56 @@ func TestCounterConflictingSurvivesABodyThatHasAgedOut(t *testing.T) {
 
 	require.True(t, inSet[ch.String()], "the subject is always part of its own counter set")
 }
+
+// TestReverseConflictReachesATransactionWhoseBytesHaveGone.
+//
+// This store throws transaction bytes away after a couple of days, but keeps a transaction that
+// lost a double-spend indefinitely, because it may still need promoting. So the two conditions
+// meet routinely rather than rarely.
+//
+// Undoing a conflict used to skip such a transaction outright, and silently: it read the
+// transaction to find out what it spends, found nothing, and moved on. The demotion did not
+// happen and nobody was told. It now reads that from the permanent record instead, so the work
+// still happens.
+//
+// What this does NOT fix is promoting the winner, which calls a method taking an actual
+// transaction. That step still needs the winner's bytes and is a stated limit.
+func TestReverseConflictReachesATransactionWhoseBytesHaveGone(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	loser := spendOutput(t, parent, 0, 1)
+	_, err = s.Create(ctx, loser, 101)
+	require.NoError(t, err)
+
+	spends, err := s.Spend(ctx, loser, 101)
+	require.NoError(t, err)
+	require.NoError(t, spends[0].Err)
+
+	dropped, err := s.dropTxBodyWindowsBelow(ctx, 100_000)
+	require.NoError(t, err)
+	require.Positive(t, dropped, "the bytes must actually be gone for this to test anything")
+
+	lh := loser.TxIDChainHash()
+
+	got, err := s.Get(ctx, lh)
+	require.NoError(t, err)
+	require.Nil(t, got.Tx, "no transaction")
+	require.NotEmpty(t, got.TxInpoints.ParentTxHashes, "but what it spent is still on record")
+
+	// The step that used to be skipped: what does this transaction spend.
+	made, err := s.SpendsMadeBy(ctx, *lh)
+	require.NoError(t, err)
+	require.Len(t, made, 1, "its one input is still findable without the transaction")
+	require.Equal(t, parent.TxIDChainHash().String(), made[0].TxID.String())
+
+	// And the coins can be put back, which is what the undo does with them.
+	require.NoError(t, s.Unspend(ctx, made, false))
+
+	resp, err := s.GetSpend(ctx, &utxo.Spend{TxID: parent.TxIDChainHash(), Vout: 0})
+	require.NoError(t, err)
+	require.Equal(t, int(utxo.Status_OK), resp.Status, "the coin is spendable again")
+}

@@ -441,13 +441,24 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 			continue
 		}
 
-		demotedMeta, getErr := s.Get(ctx, &demotedHash, fields.Tx, fields.Conflicting)
+		demotedMeta, getErr := s.Get(ctx, &demotedHash, fields.Tx, fields.TxInpoints, fields.Conflicting)
 		if getErr != nil {
 			return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting][%s] error getting demoted tx meta", demotedHash.String(), getErr)
 		}
 
-		if demotedMeta == nil || demotedMeta.Tx == nil {
+		if demotedMeta == nil {
 			continue
+		}
+
+		// What this transaction spends, taken from the stored record in preference to the
+		// serialized body. A store that bounds how long it keeps transactions returns no body
+		// for an old one, and a transaction that lost a double-spend is kept indefinitely
+		// because it may still need promoting, so the two conditions meet routinely. This used
+		// to skip such a transaction outright and silently, which meant the demotion did not
+		// happen and nobody was told.
+		demotedInpoints, inErr := counterConflictingInpoints(demotedMeta)
+		if inErr != nil {
+			return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting][%s] cannot read what the demoted tx spends", demotedHash.String(), inErr)
 		}
 
 		if demotedMeta.Conflicting {
@@ -462,7 +473,7 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 			// non-D spender. If any input shows nil or still points at D,
 			// fall through and re-run the steps below; the Mark and
 			// Unspend are idempotent on the already-applied state.
-			fullyReversed, checkErr := isReverseFullyApplied(ctx, s, demotedMeta.Tx, demotedHash)
+			fullyReversed, checkErr := isReverseFullyApplied(ctx, s, demotedInpoints, demotedHash)
 			if checkErr != nil {
 				return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting][%s] error confirming reverse completion via parent state", demotedHash.String(), checkErr)
 			}
@@ -473,7 +484,7 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 		}
 
 		// Step 1: identify counters per input.
-		countersToPromote, selErr := selectCountersForDemotedTx(ctx, s, demotedMeta.Tx, demotedSet)
+		countersToPromote, selErr := selectCountersForDemotedTx(ctx, s, demotedInpoints, demotedSet)
 		if selErr != nil {
 			return nil, nil, selErr
 		}
@@ -576,10 +587,10 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 // spender. An error is surfaced for any Get failure — that's a store-level
 // problem, not a state question, and the caller must abort the reverse rather
 // than make assumptions.
-func isReverseFullyApplied(ctx context.Context, s Store, demotedTx *bt.Tx, demotedHash chainhash.Hash) (bool, error) {
-	for _, input := range demotedTx.Inputs {
-		parentHash := input.PreviousTxIDChainHash()
-		vout := input.PreviousTxOutIndex
+func isReverseFullyApplied(ctx context.Context, s Store, inpoints []subtree.Inpoint, demotedHash chainhash.Hash) (bool, error) {
+	for _, in := range inpoints {
+		parentHash := &in.Hash
+		vout := in.Index
 
 		parentMeta, err := s.Get(ctx, parentHash, fields.Utxos)
 		if err != nil {
@@ -645,14 +656,14 @@ func isReverseFullyApplied(ctx context.Context, s Store, demotedTx *bt.Tx, demot
 // input — caller demotes D + descendants but leaves SpendingDatas[vout]
 // untouched for that input. ReverseProcessConflicting's caller can rely on
 // the returned list being the exact set to feed Spend/UnmarkConflicting.
-func selectCountersForDemotedTx(ctx context.Context, s Store, demotedTx *bt.Tx, demotedSet map[chainhash.Hash]struct{}) ([]chainhash.Hash, error) {
+func selectCountersForDemotedTx(ctx context.Context, s Store, inpoints []subtree.Inpoint, demotedSet map[chainhash.Hash]struct{}) ([]chainhash.Hash, error) {
 	seen := make(map[chainhash.Hash]struct{})
 
 	result := make([]chainhash.Hash, 0)
 
-	for _, input := range demotedTx.Inputs {
-		parentHash := input.PreviousTxIDChainHash()
-		vout := input.PreviousTxOutIndex
+	for _, in := range inpoints {
+		parentHash := &in.Hash
+		vout := in.Index
 
 		parentMeta, err := s.Get(ctx, parentHash, fields.ConflictingChildren)
 		if err != nil {
@@ -684,7 +695,7 @@ func selectCountersForDemotedTx(ctx context.Context, s Store, demotedTx *bt.Tx, 
 				return nil, errors.NewProcessingError("[selectCountersForDemotedTx][%s] error getting candidate counter", candidate.String(), err)
 			}
 
-			if candidateMeta == nil || candidateMeta.Tx == nil {
+			if candidateMeta == nil {
 				continue
 			}
 
@@ -692,7 +703,12 @@ func selectCountersForDemotedTx(ctx context.Context, s Store, demotedTx *bt.Tx, 
 				continue
 			}
 
-			if !candidateSpendsOutput(candidateMeta.Tx, parentHash, vout) {
+			candidateInpoints, cErr := counterConflictingInpoints(candidateMeta)
+			if cErr != nil {
+				continue
+			}
+
+			if !candidateSpendsOutput(candidateInpoints, parentHash, vout) {
 				continue
 			}
 
@@ -744,9 +760,9 @@ func isOlderCounter(aCreatedAt int64, aHash chainhash.Hash, bCreatedAt int64, bH
 	return false
 }
 
-func candidateSpendsOutput(tx *bt.Tx, parentHash *chainhash.Hash, vout uint32) bool {
-	for _, in := range tx.Inputs {
-		if in.PreviousTxOutIndex == vout && in.PreviousTxIDChainHash().IsEqual(parentHash) {
+func candidateSpendsOutput(inpoints []subtree.Inpoint, parentHash *chainhash.Hash, vout uint32) bool {
+	for _, in := range inpoints {
+		if in.Index == vout && in.Hash.IsEqual(parentHash) {
 			return true
 		}
 	}
