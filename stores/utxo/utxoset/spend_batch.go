@@ -1,6 +1,7 @@
 package utxoset
 
 import (
+	"bytes"
 	"context"
 	"time"
 
@@ -276,8 +277,27 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q querier, p *spendPlan,
 	return s.namePlanSpenders(ctx, q, p)
 }
 
-// namePlanSpenders fills in which transaction took each coin that is no longer there, read
-// from the journal. Bounded by its retention: beyond that the store genuinely cannot say.
+// namePlanSpenders reads the journal for every coin that is no longer there, and does two
+// different jobs with the answer.
+//
+// If the transaction the journal names is the one now spending, this is a REPLAY of our own
+// earlier work rather than a competing spend, and it must succeed. Delete-on-spend destroys
+// the coin row, so a block interrupted part-way through application leaves its coins already
+// gone; re-offering that block asks the store to take them again. Calling that a double spend
+// is not merely unhelpful, it is fatal: the block can never be applied, the tip never
+// advances, and no restart helps. Mainnet wedged at height 97389 exactly this way, with all
+// 200 inputs of one transaction reported as already spent by that same transaction.
+//
+// The replay still has to decorate the input, because the spend is also the decorate fetch and
+// script validation has no other source for the satoshis and the locking script. The journal
+// row captured both at the moment of the delete, so it can serve them unchanged.
+//
+// If the journal names a DIFFERENT transaction, this is a real double spend and the caller
+// needs to know who won, so it can mark the loser conflicting and walk its descendants.
+//
+// Bounded by the journal's retention. Beyond that the store genuinely cannot say, and a replay
+// that old cannot be recognised either, which is a stated limit of delete-on-spend rather than
+// a gap to paper over.
 func (s *Store) namePlanSpenders(ctx context.Context, q querier, p *spendPlan) error {
 	rows, err := q.Query(ctx, spenderSQL, p.leaves, p.ukeys, p.txids, p.idx)
 	if err != nil {
@@ -286,18 +306,47 @@ func (s *Store) namePlanSpenders(ctx context.Context, q querier, p *spendPlan) e
 
 	defer rows.Close()
 
+	// A coin can appear in the journal more than once, having been spent, restored by an
+	// unspend, and spent again. One matching row is enough to make this a replay, so once an
+	// input is settled that way no later row may unsettle it.
+	replayed := make(map[int32]struct{})
+
 	for rows.Next() {
 		var (
-			k       int32
-			spender []byte
+			k        int32
+			spender  []byte
+			satoshis int64
+			script   []byte
 		)
 
-		if err := rows.Scan(&k, &spender); err != nil {
+		if err := rows.Scan(&k, &spender, &satoshis, &script); err != nil {
 			return errors.NewStorageError("[utxoset][Spend] spender scan", err)
 		}
 
 		sp := p.perItem[p.owner[k]][p.ownerVin[k]]
-		if sp == nil || !errors.Is(sp.Err, errors.ErrSpent) {
+		if sp == nil {
+			continue
+		}
+
+		if _, done := replayed[k]; done {
+			continue
+		}
+
+		if bytes.Equal(spender, p.spenders[k]) {
+			replayed[k] = struct{}{}
+
+			sp.Err = nil
+			sp.ConflictingTxID = nil
+
+			if in := p.itemTxs[p.owner[k]].Inputs[p.ownerVin[k]]; in != nil {
+				in.PreviousTxSatoshis = uint64(satoshis) //nolint:gosec // satoshis are never negative
+				in.PreviousTxScript = bscript.NewFromBytes(script)
+			}
+
+			continue
+		}
+
+		if !errors.Is(sp.Err, errors.ErrSpent) {
 			continue
 		}
 

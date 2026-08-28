@@ -127,7 +127,15 @@ func TestUTXOTableCreateSpendRoundTrip(t *testing.T) {
 	require.NotNil(t, child.Inputs[0].PreviousTxScript,
 		"Spend must return the locking script via RETURNING")
 
-	// spending it again: the row is gone, and absence IS the rejection
+	// A DIFFERENT transaction reaching for the same coin: the row is gone, and absence IS the
+	// rejection.
+	//
+	// The extra output is what makes it different, and it is load-bearing rather than
+	// incidental. This used to build child2 exactly as child was built, which gave it the same
+	// transaction id, so it was really testing a REPLAY of one transaction and calling the
+	// result a double spend. A replay is not a double spend and now succeeds, which is what
+	// stops a half-applied block wedging the node. The id assertion below keeps the two cases
+	// from quietly becoming one again. Replay has its own test in spend_replay_test.go.
 	child2 := bt.NewTx()
 	require.NoError(t, child2.FromUTXOs(&bt.UTXO{
 		TxIDHash:      parentHash,
@@ -135,6 +143,10 @@ func TestUTXOTableCreateSpendRoundTrip(t *testing.T) {
 		LockingScript: parent.Outputs[0].LockingScript,
 		Satoshis:      parent.Outputs[0].Satoshis,
 	}))
+	child2.AddOutput(&bt.Output{Satoshis: 1, LockingScript: parent.Outputs[0].LockingScript})
+
+	require.NotEqual(t, child.TxIDChainHash().String(), child2.TxIDChainHash().String(),
+		"the rival must be a different transaction, or this is a replay test in disguise")
 
 	spends2, err := s.Spend(ctx, child2, 201)
 	require.NoError(t, err)

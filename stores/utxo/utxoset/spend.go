@@ -43,7 +43,7 @@ import (
 // Bounded by the journal's retention. Beyond it the store genuinely cannot say who took a
 // coin, and that is a stated limit of delete-on-spend rather than a gap to paper over.
 const spenderSQL = `
-SELECT k.vin, j.spending_txid
+SELECT k.vin, j.spending_txid, j.satoshis, j.script
   FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[]) AS k(leaf, ukey, txid, vin)
   JOIN spend_journal j ON j.ukey = k.ukey AND j.txid = k.txid`
 
