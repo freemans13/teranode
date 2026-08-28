@@ -76,10 +76,9 @@ func TestSpendRejectsARewrittenLockingScriptClaim(t *testing.T) {
 	require.NoError(t, honestSpends[0].Err)
 }
 
-// The batched Spend path shares one statement with SpendAndCreate, so it must share the
-// comparison too. It reports per-input rather than as a returned error, which is this store's
-// documented contract for Spend.
-func TestBatchedSpendRejectsAFalseClaim(t *testing.T) {
+// The spend-only form of SpendAndCreate, used by block application and conflict resolution,
+// gets the same comparison as the full spend-and-create.
+func TestSpendOnlyRejectsAFalseClaim(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 2, 5_000)
@@ -89,8 +88,8 @@ func TestBatchedSpendRejectsAFalseClaim(t *testing.T) {
 	child := spendOutput(t, parent, 0, 1)
 	child.Inputs[0].PreviousTxSatoshis = 9_999
 
-	spends, err := s.Spend(ctx, child, 101)
-	require.NoError(t, err)
+	spends, err := spendOnly(ctx, s, child, 101)
+	require.Error(t, err)
 	require.Len(t, spends, 1)
 	require.ErrorIs(t, spends[0].Err, errors.ErrUtxoHashMismatch)
 }
@@ -168,20 +167,20 @@ func TestReplayedSpendRejectsAFalseClaim(t *testing.T) {
 
 	child := spendOutput(t, parent, 0, 1)
 
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
 	// Same transaction, same coin: a replay, which must succeed.
-	replay, err := s.Spend(ctx, child, 101)
+	replay, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, replay[0].Err, "a replay of our own spend must not be a double spend")
 
 	// Now the same replay with a doctored claim.
 	child.Inputs[0].PreviousTxSatoshis = 5_000_000_000
 
-	doctored, err := s.Spend(ctx, child, 101)
-	require.NoError(t, err)
+	doctored, err := spendOnly(ctx, s, child, 101)
+	require.Error(t, err)
 	require.ErrorIs(t, doctored[0].Err, errors.ErrUtxoHashMismatch)
 }
 

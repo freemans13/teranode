@@ -41,7 +41,7 @@ func TestJournalRunsBelowTheCheckpoint(t *testing.T) {
 		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
 	}))
 
-	_, err = s.Spend(ctx, child, 200)
+	_, err = spendOnly(ctx, s, child, 200)
 	require.NoError(t, err)
 
 	var journalled int

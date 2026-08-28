@@ -3,40 +3,26 @@ package utxoset
 import (
 	"bytes"
 	"context"
-	"time"
 
-	"github.com/bsv-blockchain/go-batcher/v2"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/jackc/pgx/v5"
 )
 
-// spendResult is what one queued Spend gets back.
-type spendResult struct {
-	spends []*utxo.Spend
-	err    error
-}
-
-// spendItem is a single Spend waiting for its batch to flush.
+// spendItem is one transaction's worth of spend within a plan.
+//
+// It is not a queue entry. This store has no spend batcher: the only way in is SpendAndCreate,
+// which runs inside one database transaction so a rejected transaction leaves no coin
+// destroyed. The struct survives because planSpends is multi-item by design, which is the
+// shape a batched SpendAndCreate would need.
 type spendItem struct {
 	tx          *bt.Tx
 	blockHeight uint32
 	ignoreFlags utxo.IgnoreFlags
-	done        chan spendResult
-}
-
-// newSpendBatcher wires the spend path through the shared batcher.
-//
-// background is FALSE, matching the sql store's spend batcher and for its stated reason:
-// batch callbacks have to be serialised or two database transactions can lock overlapping
-// rows in different orders and deadlock. That applies here in full. Two blocks can spend
-// coins of the same parent transaction, so unlike the create path, batches genuinely do
-// overlap.
-func newSpendBatcher(s *Store, size int, duration time.Duration) *batcher.Batcher[spendItem] {
-	return batcher.NewWithPool(size, duration, s.sendSpendBatch, false)
 }
 
 // spendPlan is the argument set for one call of the spend statement, however many
@@ -139,50 +125,6 @@ func planSpends(items []*spendItem) *spendPlan {
 	return p
 }
 
-// sendSpendBatch flushes a batch of Spends as one statement.
-func (s *Store) sendSpendBatch(batch []*spendItem) {
-	s.spendInFlight.Add(1)
-	defer s.spendInFlight.Done()
-
-	ctx := context.Background()
-
-	// The journal partitions must exist before the statement runs, and the DDL needs its own
-	// connection, so it happens here rather than inside anything holding one. A batch can
-	// span heights, so every distinct partition is prepared.
-	seen := make(map[uint32]struct{}, 4)
-
-	for _, it := range batch {
-		h := it.blockHeight / SpendJournalPartitionBlocks
-		if _, dup := seen[h]; dup {
-			continue
-		}
-
-		seen[h] = struct{}{}
-
-		if err := s.ensureSpendJournalPartition(ctx, it.blockHeight); err != nil {
-			for _, item := range batch {
-				item.done <- spendResult{err: err}
-			}
-
-			return
-		}
-	}
-
-	plan := planSpends(batch)
-
-	if err := s.runSpendPlan(ctx, s.pool, plan); err != nil {
-		for _, item := range batch {
-			item.done <- spendResult{err: err}
-		}
-
-		return
-	}
-
-	for i, item := range batch {
-		item.done <- spendResult{spends: plan.perItem[i]}
-	}
-}
-
 // claimMismatch compares what a spending transaction CLAIMED about the coin against what the
 // store has just handed back for it, and returns the rejection when they differ.
 //
@@ -239,7 +181,7 @@ func claimMismatch(in *bt.Input, sp *utxo.Spend, satoshis int64, script []byte) 
 
 // runSpendPlan issues the statement and fills in each caller's answers, including the
 // per-input errors that conflict detection reads.
-func (s *Store) runSpendPlan(ctx context.Context, q querier, p *spendPlan) error {
+func (s *Store) runSpendPlan(ctx context.Context, q pgx.Tx, p *spendPlan) error {
 	if len(p.owner) == 0 {
 		return nil
 	}
@@ -304,7 +246,7 @@ func (s *Store) runSpendPlan(ctx context.Context, q querier, p *spendPlan) error
 // The distinction cannot be skipped: absence alone cannot tell "already spent" from "never
 // existed" from "exists but is not yet spendable", and the validator behaves differently for
 // each.
-func (s *Store) classifyPlanMisses(ctx context.Context, q querier, p *spendPlan, done map[int32]struct{}) error {
+func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, done map[int32]struct{}) error {
 	rows, err := q.Query(ctx, classifySQL, p.leaves, p.ukeys, p.txids, p.idx)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Spend] classify", err)
@@ -391,7 +333,7 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q querier, p *spendPlan,
 // Bounded by the journal's retention. Beyond that the store genuinely cannot say, and a replay
 // that old cannot be recognised either, which is a stated limit of delete-on-spend rather than
 // a gap to paper over.
-func (s *Store) namePlanSpenders(ctx context.Context, q querier, p *spendPlan, done map[int32]struct{}) error {
+func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, done map[int32]struct{}) error {
 	rows, err := q.Query(ctx, spenderSQL, p.leaves, p.ukeys, p.txids, p.idx)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Spend] find spender", err)

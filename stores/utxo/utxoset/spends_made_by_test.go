@@ -28,7 +28,7 @@ func TestSpendsMadeByAnswersWithoutTheTransaction(t *testing.T) {
 	_, err = s.Create(ctx, child, 101)
 	require.NoError(t, err)
 
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
@@ -64,7 +64,7 @@ func TestSpendsMadeByStillAnswersOnceTheTransactionHasAgedOut(t *testing.T) {
 	_, err = s.Create(ctx, child, 101)
 	require.NoError(t, err)
 
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
@@ -134,7 +134,7 @@ func TestSpendsMadeByMatchesWhatSetConflictingReturns(t *testing.T) {
 	_, err = s.Create(ctx, child, 101)
 	require.NoError(t, err)
 
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 

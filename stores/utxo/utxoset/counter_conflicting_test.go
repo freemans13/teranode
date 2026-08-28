@@ -33,7 +33,7 @@ func TestCounterConflictingSurvivesABodyThatHasAgedOut(t *testing.T) {
 	_, err = s.Create(ctx, child, 101)
 	require.NoError(t, err)
 
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
@@ -91,7 +91,7 @@ func TestReverseConflictReachesATransactionWhoseBytesHaveGone(t *testing.T) {
 	_, err = s.Create(ctx, loser, 101)
 	require.NoError(t, err)
 
-	spends, err := s.Spend(ctx, loser, 101)
+	spends, err := spendOnly(ctx, s, loser, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 

@@ -115,7 +115,7 @@ func TestUTXOTableCreateSpendRoundTrip(t *testing.T) {
 		Satoshis:      parent.Outputs[0].Satoshis,
 	}))
 
-	spends, err := s.Spend(ctx, child, 200)
+	spends, err := spendOnly(ctx, s, child, 200)
 	require.NoError(t, err)
 	require.Len(t, spends, 1)
 	require.NoError(t, spends[0].Err, "first spend must succeed")
@@ -148,8 +148,8 @@ func TestUTXOTableCreateSpendRoundTrip(t *testing.T) {
 	require.NotEqual(t, child.TxIDChainHash().String(), child2.TxIDChainHash().String(),
 		"the rival must be a different transaction, or this is a replay test in disguise")
 
-	spends2, err := s.Spend(ctx, child2, 201)
-	require.NoError(t, err)
+	spends2, err := spendOnly(ctx, s, child2, 201)
+	require.Error(t, err, "a rejected spend is now a returned error, and rolled back")
 	require.Len(t, spends2, 1)
 	require.Error(t, spends2[0].Err, "double spend must be rejected")
 	require.True(t, errors.Is(spends2[0].Err, errors.ErrSpent),
@@ -233,7 +233,7 @@ func TestDecorateFromUTXOTable(t *testing.T) {
 		TxIDHash: parent.TxIDChainHash(), Vout: 0,
 		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
 	}))
-	_, err = s.Spend(ctx, spent, 200)
+	_, err = spendOnly(ctx, s, spent, 200)
 	require.NoError(t, err)
 
 	orphan := bt.NewTx()
@@ -319,7 +319,7 @@ func TestSpendWritesJournal(t *testing.T) {
 		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
 	}))
 
-	_, err = s.Spend(ctx, child, 200)
+	_, err = spendOnly(ctx, s, child, 200)
 	require.NoError(t, err)
 
 	// the UTXO row is gone...
@@ -379,7 +379,7 @@ func TestSpendJournalReclaimIsDrivenByThePruner(t *testing.T) {
 			LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
 		}))
 
-		_, err = s.Spend(ctx, child, h)
+		_, err = spendOnly(ctx, s, child, h)
 		require.NoError(t, err)
 	}
 
@@ -467,7 +467,7 @@ func spendOne(t *testing.T, s *Store, ctx context.Context, sats uint64, h uint32
 		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
 	}))
 
-	spends, err := s.Spend(ctx, child, h)
+	spends, err := spendOnly(ctx, s, child, h)
 	require.NoError(t, err)
 	require.Len(t, spends, 1)
 
@@ -576,7 +576,7 @@ func TestSpendBelowFirstJournalLeafCreatesPartition(t *testing.T) {
 	}))
 
 	// Height 2 lands in leaf 0 -- the leaf the zero value shadowed.
-	_, err = s.Spend(ctx, child, 2)
+	_, err = spendOnly(ctx, s, child, 2)
 	require.NoError(t, err, "a spend in the first journal leaf must create its partition")
 
 	var journaled int
@@ -613,7 +613,7 @@ func TestCreateDoesNotGateOrdinaryOutputsOnHeight(t *testing.T) {
 	// Assert on the Spend records, not just the returned error: a miss is reported per
 	// input on spends[i].Err and classifyMisses can leave the top-level error nil, so
 	// require.NoError alone would sail straight past the bug this test exists for.
-	spends, err := s.Spend(ctx, child, 1)
+	spends, err := spendOnly(ctx, s, child, 1)
 	require.NoError(t, err)
 	require.Len(t, spends, 1)
 	require.NoError(t, spends[0].Err, "an ordinary output must not be gated on its own creation height")
@@ -622,4 +622,17 @@ func TestCreateDoesNotGateOrdinaryOutputsOnHeight(t *testing.T) {
 	require.NoError(t, s.pool.QueryRow(ctx,
 		`SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
 	require.Equal(t, 0, live, "the coin must actually be gone, not merely reported as spent")
+}
+
+// spendOnly is what the tests used to get from Store.Spend, which no longer exists.
+//
+// SpendAndCreate with the spend-only option is now the only way to consume inputs, so this
+// wrapper keeps the call sites readable. The difference from the old method is deliberate and
+// is the whole point of deleting it: a per-input failure now surfaces as a returned error AND
+// rolls the whole transaction back, so a sibling coin is no longer destroyed by a transaction
+// that was rejected.
+func spendOnly(ctx context.Context, s *Store, tx *bt.Tx, blockHeight uint32,
+	opts ...utxo.CreateOption) ([]*utxo.Spend, error) {
+	_, spends, err := s.SpendAndCreate(ctx, tx, blockHeight, append(opts, utxo.WithSpendOnly())...)
+	return spends, err
 }

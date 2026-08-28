@@ -41,7 +41,7 @@ func spendPair(t *testing.T, s *Store, ctx context.Context, h uint32) (parent, c
 	_, err = s.Create(ctx, child, h)
 	require.NoError(t, err)
 
-	_, err = s.Spend(ctx, child, h)
+	_, err = spendOnly(ctx, s, child, h)
 	require.NoError(t, err)
 
 	return parent, child
@@ -213,7 +213,7 @@ func TestReclaimKeepsAParentThatStillHasALiveCoin(t *testing.T) {
 
 	_, err = s.Create(ctx, child, 100)
 	require.NoError(t, err)
-	_, err = s.Spend(ctx, child, 100)
+	_, err = spendOnly(ctx, s, child, 100)
 	require.NoError(t, err)
 
 	_, err = s.SetMinedMulti(ctx, hashes(child), utxo.MinedBlockInfo{

@@ -26,7 +26,7 @@ func TestSpendReturnsRecordsThisStoreCanRestore(t *testing.T) {
 
 	child := spendOutput(t, parent, 0, 1)
 
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.Len(t, spends, 1)
 	require.NoError(t, spends[0].Err)
@@ -62,10 +62,14 @@ func TestSpendAndCreateReturnsRecordsThisStoreCanRestore(t *testing.T) {
 	require.NoError(t, s.Unspend(ctx, spends, false))
 }
 
-// TestSpendNamesTheRightSpenderPerTransactionInOneBatch. A batch carries many transactions, and
-// each record must name ITS OWN spender. Naming the batch's first, or last, would restore coins
-// to the wrong owner on a rollback.
-func TestSpendNamesTheRightSpenderPerTransactionInOneBatch(t *testing.T) {
+// TestSpendNamesTheRightSpenderPerTransactionInOnePlan. One plan carries many transactions,
+// and each record must name ITS OWN spender. Naming the plan's first, or last, would restore
+// coins to the wrong owner on a rollback.
+//
+// This drives planSpends and runSpendPlan directly, because the store no longer exposes a way
+// to put two transactions through one statement. It keeps the property under test because
+// planSpends is still multi-item, which is the shape a batched SpendAndCreate would need.
+func TestSpendNamesTheRightSpenderPerTransactionInOnePlan(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 3, 5_000)
@@ -77,30 +81,33 @@ func TestSpendNamesTheRightSpenderPerTransactionInOneBatch(t *testing.T) {
 
 	require.NotEqual(t, first.TxIDChainHash().String(), second.TxIDChainHash().String())
 
-	items := []*spendItem{
-		{tx: first, blockHeight: 101, done: make(chan spendResult, 1)},
-		{tx: second, blockHeight: 101, done: make(chan spendResult, 1)},
-	}
+	// The journal partition needs its own connection, so it is prepared before the
+	// transaction opens rather than inside it.
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 101))
 
-	s.sendSpendBatch(items)
+	dbTx, err := s.pool.Begin(ctx)
+	require.NoError(t, err)
 
-	results := make([]spendResult, 0, len(items))
-	for _, it := range items {
-		results = append(results, <-it.done)
-	}
+	plan := planSpends([]*spendItem{
+		{tx: first, blockHeight: 101},
+		{tx: second, blockHeight: 101},
+	})
+
+	require.NoError(t, s.runSpendPlan(ctx, dbTx, plan))
+	require.NoError(t, dbTx.Commit(ctx))
 
 	for i, want := range []string{first.TxIDChainHash().String(), second.TxIDChainHash().String()} {
-		require.NoError(t, results[i].err)
-		require.Len(t, results[i].spends, 1)
-		require.NotNil(t, results[i].spends[0].SpendingData)
-		require.Equal(t, want, results[i].spends[0].SpendingData.TxID.String(),
+		require.Len(t, plan.perItem[i], 1)
+		require.NoError(t, plan.perItem[i][0].Err)
+		require.NotNil(t, plan.perItem[i][0].SpendingData)
+		require.Equal(t, want, plan.perItem[i][0].SpendingData.TxID.String(),
 			"record %d must name its own spender, not another transaction's", i)
 	}
 
-	// And both are restorable together, which is what a batch rollback does.
+	// And both are restorable together, which is what a rollback does.
 	all := make([]*utxo.Spend, 0, 2)
-	for _, r := range results {
-		all = append(all, r.spends...)
+	for _, spends := range plan.perItem {
+		all = append(all, spends...)
 	}
 
 	require.NoError(t, s.Unspend(ctx, all, false))

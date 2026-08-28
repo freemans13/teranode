@@ -53,7 +53,7 @@ func TestGetCounterConflictingNamesTheWinner(t *testing.T) {
 	_, err = s.Create(ctx, winner, 101)
 	require.NoError(t, err)
 
-	spends, err := s.Spend(ctx, winner, 101)
+	spends, err := spendOnly(ctx, s, winner, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 

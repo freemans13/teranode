@@ -90,15 +90,6 @@ type Store struct {
 	// the next test had already dropped and recreated.
 	createInFlight sync.WaitGroup
 
-	// spendBatcher collects Spend calls the same way, and for the same reason.
-	//
-	// Serialised rather than concurrent: two blocks can spend coins of the same parent, so
-	// batches genuinely overlap, and two database transactions locking the same rows in
-	// different orders deadlock. The sql store's spend batcher makes the same choice with
-	// the same justification.
-	spendBatcher  *batcher.Batcher[spendItem]
-	spendInFlight sync.WaitGroup
-
 	// getBatcher funnels single reads into one BatchDecorate call. Reads take no locks, so
 	// batches may run concurrently.
 	getBatcher  *batcher.Batcher[getItem]
@@ -152,11 +143,6 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if size := tSettings.UtxoStore.StoreBatcherSize; size > 1 {
 		d := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
 		s.createBatcher = newCreateBatcher(s, size, d)
-	}
-
-	if size := tSettings.UtxoStore.SpendBatcherSize; size > 1 {
-		d := time.Duration(tSettings.UtxoStore.SpendBatcherDurationMillis) * time.Millisecond
-		s.spendBatcher = newSpendBatcher(s, size, d)
 	}
 
 	if size := tSettings.UtxoStore.GetBatcherSize; size > 1 {

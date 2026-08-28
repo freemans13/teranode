@@ -56,8 +56,8 @@ func TestSetConflictingStopsTheCoinsBeingSpent(t *testing.T) {
 
 	child := spendOutput(t, parent, 0, 1)
 
-	spends, err := s.Spend(ctx, child, 200)
-	require.NoError(t, err)
+	spends, err := spendOnly(ctx, s, child, 200)
+	require.Error(t, err, "a rejected spend is now a returned error, and rolled back")
 	require.True(t, errors.Is(spends[0].Err, errors.ErrTxConflicting),
 		"the coin row must refuse the spend, got %v", spends[0].Err)
 }
@@ -85,7 +85,7 @@ func TestClearingConflictingRestoresSpendability(t *testing.T) {
 
 	child := spendOutput(t, parent, 0, 1)
 
-	spends, err := s.Spend(ctx, child, 200)
+	spends, err := spendOnly(ctx, s, child, 200)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err, "and on the coin row, or the winner can never be spent")
 }
@@ -146,7 +146,7 @@ func TestSetConflictingReturnsOnlySpendsItsOwnUnspendCanRestore(t *testing.T) {
 	require.NoError(t, err)
 
 	// Only now is the coin actually taken, so only now is there anything to restore.
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
@@ -199,7 +199,7 @@ func TestSetConflictingCascadesDownTheChain(t *testing.T) {
 	_, err = s.Create(ctx, child, 101)
 	require.NoError(t, err)
 
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
@@ -207,7 +207,7 @@ func TestSetConflictingCascadesDownTheChain(t *testing.T) {
 	_, err = s.Create(ctx, grandchild, 102)
 	require.NoError(t, err)
 
-	spends, err = s.Spend(ctx, grandchild, 102)
+	spends, err = spendOnly(ctx, s, grandchild, 102)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 

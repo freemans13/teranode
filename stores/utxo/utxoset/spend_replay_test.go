@@ -33,7 +33,7 @@ func TestSpendReplayedByTheSameTransactionSucceeds(t *testing.T) {
 		Satoshis:      parent.Outputs[0].Satoshis,
 	}))
 
-	spends, err := s.Spend(ctx, child, 200)
+	spends, err := spendOnly(ctx, s, child, 200)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err, "the first spend takes the coin")
 
@@ -49,7 +49,7 @@ func TestSpendReplayedByTheSameTransactionSucceeds(t *testing.T) {
 	require.Equal(t, child.TxIDChainHash().String(), replay.TxIDChainHash().String(),
 		"the replay must be the same transaction, or this test proves nothing")
 
-	spends2, err := s.Spend(ctx, replay, 200)
+	spends2, err := spendOnly(ctx, s, replay, 200)
 	require.NoError(t, err)
 	require.NoError(t, spends2[0].Err,
 		"re-spending a coin THIS transaction already took is a replay, not a double spend")
@@ -81,7 +81,7 @@ func TestSpendByADifferentTransactionIsStillRejected(t *testing.T) {
 		Satoshis:      parent.Outputs[0].Satoshis,
 	}))
 
-	spends, err := s.Spend(ctx, first, 200)
+	spends, err := spendOnly(ctx, s, first, 200)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
@@ -97,8 +97,8 @@ func TestSpendByADifferentTransactionIsStillRejected(t *testing.T) {
 
 	require.NotEqual(t, first.TxIDChainHash().String(), rival.TxIDChainHash().String())
 
-	spends2, err := s.Spend(ctx, rival, 200)
-	require.NoError(t, err)
+	spends2, err := spendOnly(ctx, s, rival, 200)
+	require.Error(t, err, "a rejected spend is now a returned error, and rolled back")
 	require.Error(t, spends2[0].Err, "a different transaction must still be rejected")
 	require.NotNil(t, spends2[0].ConflictingTxID, "and told who took the coin")
 	require.Equal(t, first.TxIDChainHash().String(), spends2[0].ConflictingTxID.String())

@@ -23,7 +23,7 @@ func TestGetNamesWhoSpentEachOutputWhenAsked(t *testing.T) {
 
 	child := spendOutput(t, parent, 0, 1)
 
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
@@ -51,7 +51,7 @@ func TestGetLeavesSpendingDataAloneWhenNotAsked(t *testing.T) {
 
 	child := spendOutput(t, parent, 0, 1)
 
-	spends, err := s.Spend(ctx, child, 101)
+	spends, err := spendOnly(ctx, s, child, 101)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 

@@ -95,7 +95,7 @@ func TestDeleteRemovesTheUndoRecordsItOwns(t *testing.T) {
 		Satoshis:      parent.Outputs[0].Satoshis,
 	}))
 
-	spends, err := s.Spend(ctx, child, 200)
+	spends, err := spendOnly(ctx, s, child, 200)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 
@@ -132,7 +132,7 @@ func TestDeleteLeavesTheUndoRecordsWhereItWasTheSpender(t *testing.T) {
 	_, err = s.Create(ctx, child, 200)
 	require.NoError(t, err)
 
-	spends, err := s.Spend(ctx, child, 200)
+	spends, err := spendOnly(ctx, s, child, 200)
 	require.NoError(t, err)
 	require.NoError(t, spends[0].Err)
 

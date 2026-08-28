@@ -182,7 +182,7 @@ func BenchmarkSpend(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if _, err := s.Spend(ctx, children[i], 700_000); err != nil {
+		if _, err := spendOnly(ctx, s, children[i], 700_000); err != nil {
 			b.Fatalf("spend: %v", err)
 		}
 	}

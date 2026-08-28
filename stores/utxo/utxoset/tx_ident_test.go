@@ -405,7 +405,7 @@ func TestDoubleSpendNamesTheTransactionThatTookTheCoin(t *testing.T) {
 	}))
 	winner.AddOutput(&bt.Output{Satoshis: 4_000, LockingScript: parent.Outputs[0].LockingScript})
 
-	_, err = s.Spend(ctx, winner, 100)
+	_, err = spendOnly(ctx, s, winner, 100)
 	require.NoError(t, err)
 
 	// A different transaction reaching for the same coin.
@@ -416,8 +416,8 @@ func TestDoubleSpendNamesTheTransactionThatTookTheCoin(t *testing.T) {
 	}))
 	loser.AddOutput(&bt.Output{Satoshis: 3_000, LockingScript: parent.Outputs[0].LockingScript})
 
-	spends, err := s.Spend(ctx, loser, 100)
-	require.NoError(t, err)
+	spends, err := spendOnly(ctx, s, loser, 100)
+	require.Error(t, err, "a rejected spend is now a returned error, and rolled back")
 	require.Len(t, spends, 1)
 
 	require.True(t, errors.Is(spends[0].Err, errors.ErrSpent), "the coin is gone, so this is a double spend")

@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/jackc/pgx/v5"
 )
 
 // The DELETE is the whole design, and it lives in spendJournalSQL because the journal is
@@ -52,51 +53,23 @@ SELECT k.vin, u.flags, u.spendable_from
   FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[]) AS k(leaf, ukey, txid, vin)
   JOIN utxo u ON u.leaf = k.leaf AND u.ukey = k.ukey AND u.txid = k.txid`
 
-// Spend consumes every input of tx.
+// spendIn consumes every input of tx, inside a caller-supplied database transaction.
 //
-// Errors are reported per-input on the returned Spend records rather than as a single
-// error, matching the postgres store's contract: the caller needs to know WHICH input
-// failed and why.
-func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
-	var flags utxo.IgnoreFlags
-	if len(ignoreFlags) > 0 {
-		flags = ignoreFlags[0]
-	}
-
-	// Batched when configured, which is the normal path. Without it every spend was its own
-	// round trip, and round trips rather than rows were what this store's cost was made of.
-	if s.spendBatcher != nil {
-		done := make(chan spendResult, 1)
-
-		s.spendBatcher.PutCtx(ctx, &spendItem{
-			tx:          tx,
-			blockHeight: blockHeight,
-			ignoreFlags: flags,
-			done:        done,
-		})
-
-		select {
-		case res := <-done:
-			return res.spends, res.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	if err := s.ensureSpendJournalPartition(ctx, blockHeight); err != nil {
-		return nil, err
-	}
-
-	return s.spendIn(ctx, s.pool, tx, blockHeight, flags)
-}
-
-// spendIn is Spend against an arbitrary querier, so SpendAndCreate can run it inside the same
-// database transaction as the create.
+// It takes pgx.Tx rather than the package's querier interface, and that is the point. querier
+// is satisfied by the connection pool as well, so a spend issued through it would autocommit:
+// a transaction rejected on its third input would keep the first two inputs' coins destroyed,
+// with nothing left to roll back. This store used to export exactly that as Store.Spend. The
+// method is gone and the parameter type is what stops it coming back, because reintroducing it
+// is now a compile error rather than a review catch.
 //
-// It is a batch of one. There is deliberately no second implementation: the predicates that
-// authorise a spend are consensus rules, and two copies of them is a defect waiting for one
-// to be edited alone.
-func (s *Store) spendIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+// SpendAndCreate is therefore the only way in, which is what makes rejection all-or-nothing:
+// per-input failures are reported on the returned records, and it rolls the whole transaction
+// back when it sees any.
+//
+// It is a batch of one, deliberately sharing planSpends and runSpendPlan with the multi-item
+// form. The predicates that authorise a spend are consensus rules, and two copies of them is a
+// defect waiting for one to be edited alone.
+func (s *Store) spendIn(ctx context.Context, q pgx.Tx, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	if tx == nil || tx.IsCoinbase() {
 		return nil, nil
 	}
