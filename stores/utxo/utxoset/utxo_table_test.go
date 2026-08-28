@@ -471,7 +471,8 @@ func spendOne(t *testing.T, s *Store, ctx context.Context, sats uint64, h uint32
 	require.NoError(t, err)
 	require.Len(t, spends, 1)
 
-	// the caller is expected to know who spent it; Spend does not fill this in
+	// Spend fills the spender in now. The assignment is kept because it is what a caller
+	// holding a record built elsewhere would do, and it must stay harmless.
 	spends[0].SpendingData = spend.NewSpendingData(child.TxIDChainHash(), 0)
 
 	return parent, child, spends

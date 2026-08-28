@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 )
 
 // spendResult is what one queued Spend gets back.
@@ -87,6 +88,13 @@ func planSpends(items []*spendItem) *spendPlan {
 		spends := make([]*utxo.Spend, len(it.tx.Inputs))
 		spendingTxID := it.tx.TxIDChainHash()
 
+		// One backing array for the records and one for the spenders, rather than a fresh
+		// allocation per input. This loop runs once per input of every transaction in every
+		// block, so the whole set costs three allocations regardless of input count where the
+		// obvious form would cost two more per input.
+		records := make([]utxo.Spend, len(it.tx.Inputs))
+		spenders := make([]spendpkg.SpendingData, len(it.tx.Inputs))
+
 		for vin, in := range it.tx.Inputs {
 			parent := in.PreviousTxIDChainHash()
 
@@ -99,7 +107,23 @@ func planSpends(items []*spendItem) *spendPlan {
 			p.owner = append(p.owner, i)
 			p.ownerVin = append(p.ownerVin, vin)
 
-			spends[vin] = &utxo.Spend{TxID: parent, Vout: in.PreviousTxOutIndex}
+			// The spender belongs on the record from the moment the record exists. Conflict
+			// resolution hands these same records straight back to this store's Unspend,
+			// which restores on the spender and REFUSES a record that cannot name the
+			// transaction that took the coin. Handing out records without one turned every
+			// conflict-resolution failure into the manual-intervention escalation, whatever
+			// had actually gone wrong, because the rollback itself could never succeed.
+			//
+			// The coin hash is deliberately left unset. Computing it is a double hash per
+			// input, which is a real cost on this path, and nothing that reads these records
+			// uses it: this store's Unspend restores on the outpoint and the spender.
+			spenders[vin] = spendpkg.SpendingData{TxID: spendingTxID, Vin: vin}
+			records[vin] = utxo.Spend{
+				TxID:         parent,
+				Vout:         in.PreviousTxOutIndex,
+				SpendingData: &spenders[vin],
+			}
+			spends[vin] = &records[vin]
 		}
 
 		p.perItem[i] = spends
