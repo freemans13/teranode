@@ -56,6 +56,19 @@ type Store struct {
 	// journalRetention is how far back spends stay undoable, in blocks.
 	journalRetention uint32
 
+	// reclaimChunkParents bounds how many parent transactions the reclaimer holds at once.
+	//
+	// One journal leaf covers SpendJournalPartitionBlocks heights, so at fat-band rates it
+	// carries on the order of a million spend records. Reading a whole leaf before asking a
+	// single question put that entire set in memory, twice over, plus a map keyed on every
+	// parent, once per leaf and bounded by nothing. That is the shape of the two out-of-memory
+	// failures this codebase has already had, and it is invisible until the chain gets busy.
+	//
+	// Chunks cut on a PARENT boundary and never on a row boundary. A parent is judged on
+	// whether every transaction that spent it is settled, so a chunk holding only some of its
+	// spenders would judge it on half the evidence.
+	reclaimChunkParents int
+
 	// bodyWindow is the tx_body window the last create landed in, so the catalog is only
 	// touched when it changes.
 	bodyWindow atomic.Uint32
@@ -127,8 +140,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
-		journalRetention: DefaultSpendJournalRetentionBlocks,
-		bodyRetention:    DefaultTxBodyRetentionBlocks}
+		journalRetention:    DefaultSpendJournalRetentionBlocks,
+		bodyRetention:       DefaultTxBodyRetentionBlocks,
+		reclaimChunkParents: DefaultReclaimChunkParents}
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)

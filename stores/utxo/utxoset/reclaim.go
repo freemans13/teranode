@@ -1,6 +1,7 @@
 package utxoset
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
@@ -18,6 +19,14 @@ import (
 // reachable over the network. 144 is the unmined retention, which is when parent preservation
 // starts firing and not a maturity bound at all.
 const SettledDepthBlocks = 288
+
+// DefaultReclaimChunkParents bounds how many parent transactions one reclaim pass holds.
+//
+// 20,000 parents is roughly ten megabytes of transaction ids and map overhead, against a leaf
+// that can hold over a million spend records at fat-band rates. Small enough that the spike is
+// irrelevant next to the 5 GiB heap ceiling, large enough that every query still gets the wide
+// array parameter this store is fastest at.
+const DefaultReclaimChunkParents = 20_000
 
 // settledSQL answers "which of these transactions can never be un-mined" for a batch.
 //
@@ -88,7 +97,11 @@ func (s *Store) settled(ctx context.Context, txids [][]byte, tip uint32) (map[st
 // that had an output spent in a given window is already on disk and arrives on a schedule.
 // Nothing else in the store can produce that list without a counter on every spend or a scan
 // that races.
-const candidatesSQL = `SELECT DISTINCT txid, spending_txid FROM %s`
+// The ORDER BY is load-bearing rather than cosmetic. The reclaimer reads this in bounded
+// batches and may only cut between parents, so every row for one parent has to arrive
+// together. DISTINCT already forces a sort or hash aggregate over the whole partition, so
+// asking for the order costs close to nothing on top.
+const candidatesSQL = `SELECT DISTINCT txid, spending_txid FROM %s ORDER BY txid`
 
 // hasLiveCoinSQL asks whether any of a transaction's outputs is still unspent. A parent with
 // a live coin is needed by whoever eventually spends it, however settled its other spends are.
@@ -155,49 +168,91 @@ DELETE FROM tx_ident i
 // that partition retires, every earlier spend of it sits in a partition that already retired.
 // So a rejected candidate comes back on its own, at exactly the right moment, with no state
 // carried between sessions.
-func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip uint32) (int, error) {
+func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip uint32) (int, int, error) {
+	limit := s.reclaimChunkParents
+	if limit <= 0 {
+		limit = DefaultReclaimChunkParents
+	}
+
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(candidatesSQL, partition))
 	if err != nil {
-		return 0, errors.NewStorageError("[utxoset][reclaim] candidates from %s", partition, err)
+		return 0, 0, errors.NewStorageError("[utxoset][reclaim] candidates from %s", partition, err)
 	}
 
 	var (
-		parents  [][]byte
-		spenders [][]byte
-		spentBy  = map[string][][]byte{}
+		reclaimed  int
+		chunks     int
+		batch      = newReclaimBatch()
+		lastParent []byte
+		scanErr    error
 	)
 
 	for rows.Next() {
 		var parent, spender []byte
 		if err := rows.Scan(&parent, &spender); err != nil {
-			rows.Close()
-			return 0, errors.NewStorageError("[utxoset][reclaim] scan %s", partition, err)
+			scanErr = errors.NewStorageError("[utxoset][reclaim] scan %s", partition, err)
+			break
 		}
 
-		if _, seen := spentBy[string(parent)]; !seen {
-			parents = append(parents, parent)
+		// Cut only when this row starts a NEW parent. The statement orders by parent, so
+		// every row for one parent arrives together, and cutting mid-parent would judge it
+		// on a subset of its spenders.
+		if len(batch.parents) >= limit && !bytes.Equal(parent, lastParent) {
+			n, cerr := s.reclaimBatch(ctx, batch, tip)
+			if cerr != nil {
+				scanErr = cerr
+				break
+			}
+
+			reclaimed += n
+			chunks++
+
+			batch.reset()
 		}
 
-		spentBy[string(parent)] = append(spentBy[string(parent)], spender)
-		spenders = append(spenders, spender)
+		batch.add(parent, spender)
+		lastParent = parent
 	}
 
 	rows.Close()
 
-	if err := rows.Err(); err != nil {
-		return 0, errors.NewStorageError("[utxoset][reclaim] rows %s", partition, err)
+	if scanErr != nil {
+		return reclaimed, chunks, scanErr
 	}
 
-	if len(parents) == 0 {
+	if err := rows.Err(); err != nil {
+		return reclaimed, chunks, errors.NewStorageError("[utxoset][reclaim] rows %s", partition, err)
+	}
+
+	if len(batch.parents) > 0 {
+		n, err := s.reclaimBatch(ctx, batch, tip)
+		if err != nil {
+			return reclaimed, chunks, err
+		}
+
+		reclaimed += n
+		chunks++
+	}
+
+	return reclaimed, chunks, nil
+}
+
+// reclaimBatch is one bounded slice of a partition's work list: the decision, and the delete.
+//
+// Splitting this out is what makes the memory bound possible. It is also the unit a failure
+// stops at: an earlier batch's delete has already committed, which is safe because every batch
+// is decided from ground truth read at that moment and nothing is carried between them.
+func (s *Store) reclaimBatch(ctx context.Context, b *reclaimBatch, tip uint32) (int, error) {
+	if len(b.parents) == 0 {
 		return 0, nil
 	}
 
-	settledSpenders, err := s.settled(ctx, spenders, tip)
+	settledSpenders, err := s.settled(ctx, b.spenders, tip)
 	if err != nil {
 		return 0, err
 	}
 
-	live, err := s.withLiveCoins(ctx, parents)
+	live, err := s.withLiveCoins(ctx, b.parents)
 	if err != nil {
 		return 0, err
 	}
@@ -205,14 +260,14 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 	// The parent must itself be on the main chain. It does NOT separately need to be buried,
 	// because a transaction cannot be mined before the one it spends, so a settled spender
 	// implies at least that much depth on its parent.
-	onChain, err := s.onMainChain(ctx, parents)
+	onChain, err := s.onMainChain(ctx, b.parents)
 	if err != nil {
 		return 0, err
 	}
 
 	var doomed [][]byte
 
-	for _, parent := range parents {
+	for _, parent := range b.parents {
 		key := string(parent)
 
 		if _, hasCoin := live[key]; hasCoin {
@@ -225,7 +280,7 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 
 		allSpendsSettled := true
 
-		for _, spender := range spentBy[key] {
+		for _, spender := range b.spentBy[key] {
 			if _, ok := settledSpenders[string(spender)]; !ok {
 				allSpendsSettled = false
 				break
@@ -247,6 +302,38 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 	}
 
 	return int(tag.RowsAffected()), nil
+}
+
+// reclaimBatch holds one bounded slice of a partition's work list.
+type reclaimBatch struct {
+	parents  [][]byte
+	spenders [][]byte
+	spentBy  map[string][][]byte
+}
+
+func newReclaimBatch() *reclaimBatch {
+	return &reclaimBatch{spentBy: map[string][][]byte{}}
+}
+
+func (b *reclaimBatch) add(parent, spender []byte) {
+	key := string(parent)
+
+	if _, seen := b.spentBy[key]; !seen {
+		b.parents = append(b.parents, parent)
+	}
+
+	b.spentBy[key] = append(b.spentBy[key], spender)
+	b.spenders = append(b.spenders, spender)
+}
+
+// reset drops the batch's contents without keeping the backing arrays.
+//
+// Reusing them would defeat the point: the bound exists so the reclaimer's footprint does not
+// track the largest leaf it has ever seen.
+func (b *reclaimBatch) reset() {
+	b.parents = nil
+	b.spenders = nil
+	b.spentBy = map[string][][]byte{}
 }
 
 // liveCoinArgs expands transaction ids into the four parallel arrays hasLiveCoinSQL takes:

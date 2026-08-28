@@ -79,17 +79,22 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	//
 	// Each retiring journal partition is read as a work list BEFORE it is dropped, because
 	// dropping it destroys the record of which transactions had an output spent in that
-	// window. Then the partition goes. Then the body windows past their own horizon go.
-	var reclaimed int
+	// window. Then the partition goes.
+	//
+	// The body windows went FIRST, at the top of this method, not last. Their horizon is a
+	// different number, so gating them behind this loop left transaction bytes unreclaimed
+	// through all of early sync, which is when the disk is tightest.
+	var reclaimed, batches int
 
 	dropped, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff,
 		func(ctx context.Context, partition string) error {
-			n, rerr := p.store.reclaimFromPartition(ctx, partition, height)
+			n, b, rerr := p.store.reclaimFromPartition(ctx, partition, height)
 			if rerr != nil {
 				return rerr
 			}
 
 			reclaimed += n
+			batches += b
 
 			return nil
 		})
@@ -98,8 +103,11 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	}
 
 	if dropped > 0 || reclaimed > 0 {
-		p.store.logger.Infof("[utxoset] pruner reclaimed %d transaction rows and dropped %d spend-journal leaves below height %d",
-			reclaimed, dropped, cutoff)
+		// The batch count is here so a leaf's size is visible without instrumenting the
+		// store. Batches well above the leaf count mean leaves are running near the memory
+		// bound, which is the signal that reclaimChunkParents wants revisiting.
+		p.store.logger.Infof("[utxoset] pruner reclaimed %d transaction rows in %d batches and dropped %d spend-journal leaves below height %d",
+			reclaimed, batches, dropped, cutoff)
 	}
 
 	// Still zero records processed, and still exact. The caller adds this to a counter of
