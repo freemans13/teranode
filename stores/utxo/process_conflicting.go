@@ -491,7 +491,16 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 
 		// Step 3: unspend D's input spends so parent.SpendingDatas[vout]
 		// no longer points at D.
-		demotedSpends, buildErr := spendsForTx(demotedMeta.Tx)
+		//
+		// The STORE is asked which coins D took, rather than this working it out from D's
+		// inputs. A coin's identity is computed partly from the amount and locking script of
+		// the output being spent, and a transaction only carries those when it is kept in
+		// extended form. A store that keeps the plain form cannot answer that way, and one
+		// that bounds how long it keeps transactions at all cannot answer it for an old
+		// transaction by any route. Asking the store lets each answer from what it actually
+		// holds. For a store keeping the extended form the answer is SpendsForTx over the same
+		// inputs, so nothing about its behaviour changes.
+		demotedSpends, buildErr := s.SpendsMadeBy(ctx, demotedHash)
 		if buildErr != nil {
 			return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting][%s] error building unspend records", demotedHash.String(), buildErr)
 		}
@@ -745,9 +754,15 @@ func candidateSpendsOutput(tx *bt.Tx, parentHash *chainhash.Hash, vout uint32) b
 	return false
 }
 
-// spendsForTx builds the []*Spend records for tx.Inputs in the same shape
+// SpendsForTx builds the []*Spend records for tx.Inputs in the same shape
 // Unspend / Spend expect.
-func spendsForTx(tx *bt.Tx) ([]*Spend, error) {
+//
+// Exported so a store whose transactions are kept in extended form can answer
+// SpendsMadeBy with it directly, rather than growing a second copy of the same
+// loop. A store that keeps transactions in the plain form cannot use this: the
+// amount and locking script it reads off each input are only present in the
+// extended form, and it has to answer from what it does keep instead.
+func SpendsForTx(tx *bt.Tx) ([]*Spend, error) {
 	spends := make([]*Spend, len(tx.Inputs))
 
 	for i, input := range tx.Inputs {
