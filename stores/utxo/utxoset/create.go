@@ -23,10 +23,21 @@ import (
 // Appended only when the parent does not already name it, so re-offering the same losing
 // transaction does not grow the list. Matched on the full 32-byte txid, never on the ukey
 // prefix alone.
+//
+// Membership is tested on a 32-byte BOUNDARY. The column is a concatenation of 32-byte ids and
+// the reader unpacks it that way, rejecting any length that is not a multiple of 32. This used
+// to be a plain substring search, which can match bytes STRADDLING two neighbouring entries,
+// read that as already-present, and silently skip a real append: the parent then never names
+// one of the transactions contesting its coin, and conflict resolution has no route to it.
+// setConflictingSQL's own note statement in conflicting.go carries the identical test, and the
+// two must stay identical, because they are two writers of one column.
 const noteConflictSQL = `
 UPDATE tx_ident
    SET conflicting_children = CASE
-           WHEN position($3::bytea in coalesce(conflicting_children, '\x'::bytea)) > 0
+           WHEN EXISTS (
+                SELECT 1
+                  FROM generate_series(0, coalesce(length(conflicting_children), 0) / 32 - 1) g
+                 WHERE substring(conflicting_children from g * 32 + 1 for 32) = $3::bytea)
            THEN conflicting_children
            ELSE coalesce(conflicting_children, '\x'::bytea) || $3::bytea
        END

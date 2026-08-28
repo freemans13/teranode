@@ -13,10 +13,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
-func (s *Store) Delete(_ context.Context, _ *chainhash.Hash) error {
-	return errM1("Delete")
-}
-
 func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
 	return nil, errM1("ScanInconsistentUnminedTxs")
 }
@@ -31,10 +27,6 @@ func (s *Store) GetCounterConflicting(_ context.Context, _ chainhash.Hash) ([]ch
 
 func (s *Store) GetConflictingChildren(_ context.Context, _ chainhash.Hash) ([]chainhash.Hash, error) {
 	return nil, errM1("GetConflictingChildren")
-}
-
-func (s *Store) SetConflicting(_ context.Context, _ []chainhash.Hash, _ bool) ([]*utxo.Spend, []chainhash.Hash, error) {
-	return nil, nil, errM1("SetConflicting")
 }
 
 func (s *Store) RemoveFromConflictingChildren(_ context.Context, _ []utxo.ConflictingChildRemoval) error {

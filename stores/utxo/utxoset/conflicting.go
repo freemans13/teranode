@@ -1,0 +1,456 @@
+package utxoset
+
+import (
+	"context"
+
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/util"
+)
+
+// conflictingInputsSQL reads what each named transaction spends, and proves the store holds it.
+//
+// It reads tx_inpoints rather than the serialized body for two reasons. The body is dropped
+// once its window ages out, which is the ordinary steady state rather than an error, so a
+// design resting on it would work for 288 blocks and then stop. And this store writes the body
+// in plain rather than extended form, meaning its inputs carry no value or locking script, so
+// even a body that is still present could not answer this.
+//
+// A hash that comes back missing is the not-found answer, in one round trip rather than one
+// probe per transaction.
+const conflictingInputsSQL = `
+SELECT i.txid, i.tx_inpoints
+  FROM tx_ident i
+  JOIN unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
+    ON i.leaf = k.leaf AND i.txid = k.txid`
+
+// noteConflictingChildrenSQL records the contest on every parent whose coin is wanted.
+//
+// A transaction that loses a double-spend race is kept rather than discarded, because
+// resolving the race later has to find it, and finding it means asking the PARENT whose coin
+// was contested. Without this there is no route from a contested coin back to the transactions
+// competing for it.
+//
+// It is a SEPARATE statement from the flag flip, and that is not tidiness. Both update
+// tx_ident, and one named transaction can be the parent of another named transaction in the
+// same call, since the cascade is handed a transaction and its child together. PostgreSQL
+// applies only one update per row per statement, so fusing the two would silently drop one of
+// them. Splitting also puts the note FIRST, matching the aerospike store: a note that fails
+// leaves the transaction unmarked rather than marked but unfindable.
+//
+// Membership is tested on a 32-byte BOUNDARY rather than at any offset. The list is a
+// concatenation of 32-byte ids, and the reader unpacks it that way and rejects a length that is
+// not a multiple of 32. A plain substring search can match bytes straddling two neighbouring
+// entries, which would read as already-present and silently skip a real append. noteConflictSQL
+// in create.go carries the same aligned test for the same reason, and the two must stay
+// identical: they are two writers of one column.
+//
+// Run on BOTH values of the flag, matching both reference stores. Removing an entry is
+// RemoveFromConflictingChildren's job.
+const noteConflictingChildrenSQL = `
+WITH p AS (
+    SELECT * FROM unnest($1::smallint[], $2::bytea[], $3::bytea[])
+        AS t(pleaf, ptxid, child)
+)
+UPDATE tx_ident i
+   SET conflicting_children =
+         coalesce(i.conflicting_children, '\x'::bytea) ||
+         coalesce((
+             SELECT string_agg(c.child, ''::bytea ORDER BY c.child)
+               FROM (SELECT DISTINCT p2.child FROM p p2
+                      WHERE p2.pleaf = i.leaf AND p2.ptxid = i.txid) c
+              WHERE NOT EXISTS (
+                    SELECT 1
+                      FROM generate_series(0, coalesce(length(i.conflicting_children), 0) / 32 - 1) g
+                     WHERE substring(i.conflicting_children from g * 32 + 1 for 32) = c.child)
+         ), '\x'::bytea)
+  FROM (SELECT DISTINCT pleaf, ptxid FROM p) q
+ WHERE i.leaf = q.pleaf AND i.txid = q.ptxid`
+
+// setConflictingSQL flips the flag on both rows and reports both answers the caller needs.
+//
+// BOTH rows, for the reason setLockedSQL gives: the identity row is what a metadata read
+// shows, the coin row is what the spend path reads, and the spend path never looks at the
+// identity row. Moving only one leaves a transaction reporting itself conflicting while its
+// coins stay spendable. The coin bit is what makes the spend statement's flag mask refuse the
+// delete.
+//
+// The coin update is bounded by a key RANGE rather than by transaction id alone. The packed key
+// carries the id prefix first precisely so this is an index range scan, and the full 32-byte id
+// is still rechecked because the prefix is non-unique by design.
+//
+// The 'parent' rows are the spends to be undone, and they come from an INNER join on the
+// journal deliberately. They feed straight into this store's own Unspend, which FAILS unless
+// every record it is given comes back. So a record for an input that was never actually spent,
+// or whose undo payload has aged out, is not a harmless extra: it makes the whole restore fail.
+// Reporting only what the journal still holds is the only honest answer.
+//
+// The 'child' rows are the next level of the cascade. The journal is the only place this store
+// can answer "who took this coin", because the coin row is destroyed the moment it is spent.
+const setConflictingSQL = `
+WITH k AS (
+    SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::uuid[], $5::uuid[])
+        AS t(ref, leaf, txid, lo, hi)
+),
+p AS (
+    SELECT * FROM unnest($6::int[], $7::bytea[], $8::smallint[], $9::bytea[], $10::uuid[], $11::int[])
+        AS t(ref, child, pleaf, ptxid, pukey, pvout)
+),
+ident AS (
+    UPDATE tx_ident i
+       SET flags = CASE WHEN $12::boolean THEN i.flags |  $13::smallint
+                                          ELSE i.flags & ~$13::smallint END
+      FROM k
+     WHERE i.leaf = k.leaf AND i.txid = k.txid
+),
+coins AS (
+    UPDATE utxo u
+       SET flags = CASE WHEN $12::boolean THEN u.flags |  $13::smallint
+                                          ELSE u.flags & ~$13::smallint END
+      FROM k
+     WHERE u.leaf  = k.leaf
+       AND u.ukey BETWEEN k.lo AND k.hi
+       AND u.txid  = k.txid
+)
+SELECT 'parent'::text AS kind, p.ref, p.ptxid, p.pvout,
+       j.satoshis, j.script, j.hash_override, NULL::bytea AS spender
+  FROM p
+  JOIN spend_journal j
+    ON j.ukey = p.pukey AND j.txid = p.ptxid AND j.spending_txid = p.child
+UNION ALL
+SELECT 'child'::text, k.ref, NULL::bytea, NULL::int,
+       NULL::bigint, NULL::bytea, NULL::bytea, j.spending_txid
+  FROM k
+  JOIN spend_journal j
+    ON j.ukey BETWEEN k.lo AND k.hi AND j.txid = k.txid
+ORDER BY 1 DESC, 2`
+
+// SetConflicting marks transactions as having lost a double-spend race, or clears that mark.
+//
+// It returns two things the caller cannot get anywhere else. The first is the set of parent
+// outputs these transactions consumed, in a form this store's own Unspend can restore, which is
+// exactly what conflict resolution does with it. The second is the set of transactions that
+// spent THESE transactions' outputs, which is the next level of the walk that demotes a loser's
+// whole descendant tree.
+//
+// The spender recorded on each returned record is the transaction that took the coin. Its input
+// index is the position in the flattened inpoint list, which is parent-major and therefore NOT
+// the transaction's original input order, because the stored inpoints deduplicate parents.
+// Nothing reads it today; it is stated here so a later reader does not assume otherwise.
+//
+// Both answers are bounded by the journal's retention. Beyond that this store cannot say who
+// took a coin, so a cascade rooted on an older transaction stops early. That is a real limit of
+// delete-on-spend rather than a gap to paper over.
+func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash,
+	value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
+	if len(txHashes) == 0 {
+		return nil, nil, nil
+	}
+
+	// One entry per DISTINCT transaction. The cascade can name the same transaction twice when
+	// two of its parents were both contested, and asking twice would duplicate both answers.
+	named := make([]chainhash.Hash, 0, len(txHashes))
+	seen := make(map[chainhash.Hash]struct{}, len(txHashes))
+
+	for _, h := range txHashes {
+		if _, dup := seen[h]; dup {
+			continue
+		}
+
+		seen[h] = struct{}{}
+
+		named = append(named, h)
+	}
+
+	inpoints, err := s.readConflictingInputs(ctx, named)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	plan := s.planConflicting(named, inpoints)
+
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] begin", err)
+	}
+
+	committed := false
+
+	defer func() {
+		if !committed {
+			_ = dbTx.Rollback(ctx)
+		}
+	}()
+
+	// The note runs first, so a failure here leaves the transactions unmarked rather than
+	// marked but unfindable.
+	if len(plan.pChild) > 0 {
+		if _, err = dbTx.Exec(ctx, noteConflictingChildrenSQL,
+			plan.pLeaf, plan.pTxid, plan.pChild); err != nil {
+			return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] note parents", err)
+		}
+	}
+
+	affected, children, err := s.runConflictingPlan(ctx, dbTx, plan, value)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err = dbTx.Commit(ctx); err != nil {
+		return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] commit", err)
+	}
+
+	committed = true
+
+	return affected, children, nil
+}
+
+// readConflictingInputs fetches what each named transaction spends, and reports any the store
+// does not hold.
+func (s *Store) readConflictingInputs(ctx context.Context,
+	named []chainhash.Hash) (map[chainhash.Hash]subtree.TxInpoints, error) {
+	leaves := make([]int16, 0, len(named))
+	txids := make([][]byte, 0, len(named))
+
+	for i := range named {
+		leaves = append(leaves, LeafFor(named[i][:]))
+		txids = append(txids, named[i][:])
+	}
+
+	rows, err := s.pool.Query(ctx, conflictingInputsSQL, leaves, txids)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetConflicting] read inputs", err)
+	}
+
+	out := make(map[chainhash.Hash]subtree.TxInpoints, len(named))
+
+	for rows.Next() {
+		var (
+			txid []byte
+			raw  []byte
+		)
+
+		if err := rows.Scan(&txid, &raw); err != nil {
+			rows.Close()
+			return nil, errors.NewStorageError("[utxoset][SetConflicting] scan inputs", err)
+		}
+
+		var h chainhash.Hash
+
+		copy(h[:], txid)
+
+		if len(raw) == 0 {
+			// A coinbase stores no inpoints. It spends nothing, so it contributes no parents.
+			out[h] = subtree.NewTxInpoints()
+			continue
+		}
+
+		ip, ierr := subtree.NewTxInpointsFromBytes(raw)
+		if ierr != nil {
+			rows.Close()
+			return nil, errors.NewStorageError("[utxoset][SetConflicting] decode inpoints %s", h.String(), ierr)
+		}
+
+		out[h] = ip
+	}
+
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetConflicting] input rows", err)
+	}
+
+	if len(out) == len(named) {
+		return out, nil
+	}
+
+	// Absent means the store does not hold it, which both reference stores report as an error
+	// rather than skipping. Bounded, so one bad batch cannot produce an error the size of a
+	// block.
+	missing := make([]error, 0, 4)
+
+	for i := range named {
+		if _, ok := out[named[i]]; ok {
+			continue
+		}
+
+		if len(missing) < 10 {
+			missing = append(missing,
+				errors.NewTxNotFoundError("[utxoset][SetConflicting] %s", named[i].String()))
+		}
+	}
+
+	return nil, errors.Join(missing...)
+}
+
+// conflictingPlan is the argument set for one call of the statements above, flattened across
+// however many transactions were named, in the same shape the spend and create paths use.
+type conflictingPlan struct {
+	// One element per named transaction.
+	kRef  []int32
+	kLeaf []int16
+	kTxid [][]byte
+	kLo   [][16]byte
+	kHi   [][16]byte
+	named []chainhash.Hash
+
+	// One element per input, across every named transaction.
+	pRef   []int32
+	pChild [][]byte
+	pLeaf  []int16
+	pTxid  [][]byte
+	pUkey  [][16]byte
+	pVout  []int32
+	pVin   []int
+	pOwner []int
+}
+
+// planConflicting flattens the named transactions and their inputs into arrays.
+func (s *Store) planConflicting(named []chainhash.Hash,
+	inpoints map[chainhash.Hash]subtree.TxInpoints) *conflictingPlan {
+	p := &conflictingPlan{named: named}
+
+	for i := range named {
+		p.kRef = append(p.kRef, int32(i)) //nolint:gosec // bounded by batch size
+		p.kLeaf = append(p.kLeaf, LeafFor(named[i][:]))
+		p.kTxid = append(p.kTxid, named[i][:])
+		p.kLo = append(p.kLo, Pack(named[i][:], 0))
+		p.kHi = append(p.kHi, Pack(named[i][:], ^uint32(0)))
+
+		ip := inpoints[named[i]]
+		flat := ip.GetTxInpoints()
+
+		for vin, in := range flat {
+			// The coinbase placeholder is not a real parent, and following it would look up a
+			// transaction that does not exist. Skipped cleanly rather than left as a hole.
+			if in.Hash == subtree.CoinbasePlaceholderHashValue {
+				continue
+			}
+
+			parent := in.Hash
+
+			p.pRef = append(p.pRef, int32(len(p.pOwner))) //nolint:gosec // bounded by batch size
+			p.pChild = append(p.pChild, named[i][:])
+			p.pLeaf = append(p.pLeaf, LeafFor(parent[:]))
+			p.pTxid = append(p.pTxid, parent[:])
+			p.pUkey = append(p.pUkey, Pack(parent[:], in.Index))
+			p.pVout = append(p.pVout, int32(in.Index)) //nolint:gosec // a vout fits int32
+			p.pVin = append(p.pVin, vin)
+			p.pOwner = append(p.pOwner, i)
+		}
+	}
+
+	return p
+}
+
+// runConflictingPlan flips the flags and reads back both answers.
+func (s *Store) runConflictingPlan(ctx context.Context, q querier, p *conflictingPlan,
+	value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
+	rows, err := q.Query(ctx, setConflictingSQL,
+		p.kRef, p.kLeaf, p.kTxid, p.kLo, p.kHi,
+		p.pRef, p.pChild, p.pLeaf, p.pTxid, p.pUkey, p.pVout,
+		value, FlagConflicting)
+	if err != nil {
+		return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] set", err)
+	}
+
+	var (
+		affected []*utxo.Spend
+		children []chainhash.Hash
+	)
+
+	childSeen := make(map[chainhash.Hash]struct{})
+
+	for rows.Next() {
+		var (
+			kind         string
+			ref          int32
+			ptxid        []byte
+			pvout        *int32
+			satoshis     *int64
+			script       []byte
+			hashOverride []byte
+			spender      []byte
+		)
+
+		if err := rows.Scan(&kind, &ref, &ptxid, &pvout, &satoshis, &script, &hashOverride, &spender); err != nil {
+			rows.Close()
+			return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] scan", err)
+		}
+
+		if kind == "child" {
+			var h chainhash.Hash
+
+			copy(h[:], spender)
+
+			// Deduplicated on the way out: a transaction that spends several outputs of one
+			// parent would otherwise be named once per output.
+			if _, dup := childSeen[h]; dup {
+				continue
+			}
+
+			childSeen[h] = struct{}{}
+
+			children = append(children, h)
+
+			continue
+		}
+
+		sp, serr := p.spendFor(ref, ptxid, pvout, satoshis, script, hashOverride)
+		if serr != nil {
+			rows.Close()
+			return nil, nil, serr
+		}
+
+		affected = append(affected, sp)
+	}
+
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] rows", err)
+	}
+
+	return affected, children, nil
+}
+
+// spendFor turns one journal row into the restorable record conflict resolution hands back to
+// Unspend.
+func (p *conflictingPlan) spendFor(ref int32, ptxid []byte, pvout *int32, satoshis *int64,
+	script []byte, hashOverride []byte) (*utxo.Spend, error) {
+	if pvout == nil || satoshis == nil {
+		return nil, errors.NewStorageError("[utxoset][SetConflicting] journal row %d is incomplete", ref)
+	}
+
+	parent, err := chainhash.NewHash(ptxid)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetConflicting] parent hash", err)
+	}
+
+	child := p.named[p.pOwner[ref]]
+	vout := uint32(*pvout) //nolint:gosec // a vout is never negative
+
+	sp := &utxo.Spend{
+		TxID:         parent,
+		Vout:         vout,
+		SpendingData: spendpkg.NewSpendingData(&child, p.pVin[ref]),
+	}
+
+	// The reassigned identity wins when there is one, exactly as the spend path treats it.
+	if len(hashOverride) > 0 {
+		if h, herr := chainhash.NewHash(hashOverride); herr == nil {
+			sp.UTXOHash = h
+			return sp, nil
+		}
+	}
+
+	if h, herr := util.UTXOHash(parent, vout, bscript.NewFromBytes(script), uint64(*satoshis)); herr == nil { //nolint:gosec // satoshis are never negative
+		sp.UTXOHash = h
+	}
+
+	return sp, nil
+}
