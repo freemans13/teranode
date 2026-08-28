@@ -17,14 +17,6 @@ func (s *Store) ReAssignUTXO(_ context.Context, _ *utxo.Spend, _ *utxo.Spend, _ 
 	return errM1("ReAssignUTXO")
 }
 
-func (s *Store) GetCounterConflicting(_ context.Context, _ chainhash.Hash) ([]chainhash.Hash, error) {
-	return nil, errM1("GetCounterConflicting")
-}
-
-func (s *Store) GetConflictingChildren(_ context.Context, _ chainhash.Hash) ([]chainhash.Hash, error) {
-	return nil, errM1("GetConflictingChildren")
-}
-
 func (s *Store) RemoveFromConflictingChildren(_ context.Context, _ []utxo.ConflictingChildRemoval) error {
 	return errM1("RemoveFromConflictingChildren")
 }
