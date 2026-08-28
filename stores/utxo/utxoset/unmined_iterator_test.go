@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
@@ -82,8 +83,13 @@ func TestUnminedIteratorReturnsAForkMinedTransaction(t *testing.T) {
 
 	forked := mkTx(t, 1, 1_000)
 	_, err := s.Create(ctx, forked, 700_000, utxo.WithMinedBlockInfo(
-		utxo.MinedBlockInfo{BlockID: 77, BlockHeight: 700_000, OnLongestChain: false}))
+		utxo.MinedBlockInfo{BlockID: 77, BlockHeight: 700_000}))
 	require.NoError(t, err)
+
+	// Block assembly determines that block is not on the main chain. That is how this state is
+	// reached: by someone establishing the fact, not by the store guessing at create time when
+	// nobody could know it yet.
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*forked.TxIDChainHash()}, false))
 
 	it, err := s.GetUnminedTxIterator()
 	require.NoError(t, err)

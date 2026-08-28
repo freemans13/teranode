@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -220,37 +221,44 @@ func TestCreateMarksAMempoolArrivalAsOffChain(t *testing.T) {
 	require.Empty(t, r.membership, "nothing has told us a block contains it")
 }
 
-// TestCreateMarksAnUnconfirmedBlockApplicationAsOffChain is the create-gate fix, and it is
-// the reason this must land BEFORE the reclaimer rather than after.
+// TestAForkMinedTransactionCarriesBothMembershipAndTheWaitingMarker.
 //
-// A block-application create passes the block's mined info but leaves OnLongestChain false,
-// because at create time the block is still being validated and its chain status is
-// genuinely unknown. The incumbent sets the marker only when NO mined info was supplied, so
-// such a transaction gets fork-only membership and a NULL marker. It reads as mined, and
-// once that block is 288 deep it reads as SETTLED, having never been on the main chain.
+// This state is real and has to work: a transaction mined only into a block that is NOT on the
+// main chain is in a block AND is still waiting to be mined. The waiting-set query keys on the
+// marker rather than on empty membership precisely so it finds these.
 //
-// Today block assembly repairs that at reset. A reclaimer makes it unrepairable: the parent
-// is deleted, and after the next reset the child's parent-chain validation finds it missing
-// and drops the child and its descendants.
+// What changed is how the state is REACHED. The store used to fake it at create time, marking
+// every transaction created by block application because the block's chain status was not yet
+// known. That treated "unknown" as "not mined", and since block application never claims the
+// longest chain, it applied to every transaction a sync created. On the mainnet box it reached
+// 3.8 million rows, 91% of the store, and stalled the reclaim behind it.
 //
-// Marking it and letting the mined stamp clear it fails in the safe direction. A transaction
-// wrongly in the mempool set is narrowed out by machinery that already exists and already
-// runs on every reload.
-func TestCreateMarksAnUnconfirmedBlockApplicationAsOffChain(t *testing.T) {
+// The state is now reached the way production reaches it, by block assembly telling the store
+// the transaction is not on the longest chain. That is a fact someone has established, rather
+// than a guess made before anyone could know.
+func TestAForkMinedTransactionCarriesBothMembershipAndTheWaitingMarker(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 1_000)
 	_, err := s.Create(ctx, tx, 700_000, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
-		BlockID: 42, BlockHeight: 700_000, SubtreeIdx: 3, OnLongestChain: false,
+		BlockID: 42, BlockHeight: 700_000, SubtreeIdx: 3,
 	}))
 	require.NoError(t, err)
 
 	h := tx.TxIDChainHash()
-	r := readIdent(t, s, ctx, h[:])
 
-	require.NotNil(t, r.offChainSince,
-		"a block whose chain status is still unknown must not clear the marker: unmarked plus fork-only membership reads as settled forever")
-	require.Len(t, r.membership, 12, "the block is still recorded, it just does not confirm the transaction")
+	require.Nil(t, readIdent(t, s, ctx, h[:]).offChainSince,
+		"created in a block, so not waiting: the chain question is not answered here")
+
+	// Block assembly determines the block is not on the main chain.
+	require.NoError(t, s.SetBlockHeight(700_050))
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*h}, false))
+
+	r := readIdent(t, s, ctx, h[:])
+	require.NotNil(t, r.offChainSince, "now it is genuinely waiting again")
+	require.Equal(t, int32(700_050), *r.offChainSince, "with a clock from the current tip")
+	require.NotEmpty(t, r.membership,
+		"and the block it was in is still recorded, which is why the query cannot test for empty membership")
 }
 
 // TestCreateLeavesAConfirmedBlockApplicationOnChain is the other half of the gate. Once a

@@ -69,24 +69,32 @@ func packMembership(infos []utxo.MinedBlockInfo) []byte {
 
 // offChainSinceAt decides whether a newly created transaction belongs in the mempool set.
 //
-// The rule is NOT "was mined-block information supplied". It is "has anyone told us a
-// MAIN-CHAIN block contains this". The distinction is the whole point, and getting it wrong
-// is a live bug in the reference stores.
+// The rule is "was this transaction created because a block contains it". Block information
+// present means mined, and a transaction cannot be mined and waiting to be mined at the same
+// time. That is the same rule the sql store applies, which keys on whether any block info was
+// supplied at all.
 //
-// A block-application create passes the block's mined info but leaves OnLongestChain false,
-// because at create time the block is still being validated and its chain status is
-// genuinely unknown. Clearing the marker on that basis gives a transaction from a block that
-// later loses fork-only membership and no marker, so it reads as mined, and once that block
-// is 288 deep it reads as SETTLED despite never having been on the main chain. Block
-// assembly repairs that at reset today; a reclaimer would delete the parent first and make
-// it unrepairable.
+// This USED to additionally require the block information to claim the block was on the longest
+// chain, on the reasoning that at create time the block is still being validated, so marking
+// the transaction and letting a later stamp clear it failed in the safe direction. It did not
+// fail safe, it failed at scale. The block-application path never claims the longest chain,
+// because at that moment the claim would be untrue, so every transaction created by a sync was
+// stored in both states at once. On the mainnet box that reached 3.8 million rows, 91% of the
+// store, and the damage was not cosmetic: the pass that preserves the parents of transactions
+// waiting to be mined walks that set, and it runs BEFORE the reclaim, so with millions of rows
+// to walk it never finished and nothing was ever reclaimed. Disk grew without bound and the
+// database was eventually killed for memory.
 //
-// Marking it and letting the mined stamp clear it fails in the safe direction: a transaction
-// wrongly in the mempool set is narrowed out on the next reload by machinery that already
-// runs.
+// The hazard the old rule was guarding against is real but is someone else's job. A transaction
+// from a block that later loses is put back in the mempool set by the un-mine path, which sets
+// the marker with a fresh clock taken from the current tip. That mechanism exists, is tested,
+// and is what both reference stores rely on for the identical exposure.
+//
+// An explicit un-mine is the one kind of block information that does NOT mean the transaction
+// is in a block, so it still waits.
 func offChainSinceAt(infos []utxo.MinedBlockInfo, blockHeight uint32) *int32 {
 	for _, mi := range infos {
-		if mi.OnLongestChain && !mi.UnsetMined {
+		if !mi.UnsetMined {
 			return nil
 		}
 	}
