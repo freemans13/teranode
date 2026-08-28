@@ -13,10 +13,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
-func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, error) {
-	return nil, errM1("ScanInconsistentUnminedTxs")
-}
-
 func (s *Store) ReAssignUTXO(_ context.Context, _ *utxo.Spend, _ *utxo.Spend, _ *settings.Settings) error {
 	return errM1("ReAssignUTXO")
 }
