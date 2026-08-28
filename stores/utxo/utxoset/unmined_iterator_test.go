@@ -193,3 +193,53 @@ func TestUnminedIteratorIsEmptyWhenNothingIsWaiting(t *testing.T) {
 
 	require.Empty(t, drain(t, it, ctx))
 }
+
+// TestUnminedIteratorEndsWithNil is the terminator the callers actually test for, and getting
+// it wrong does not fail, it spins.
+//
+// Every consumer of this iterator breaks its loop on a NIL batch, not on an empty one. Handing
+// back an empty but non-nil slice therefore never ends the loop. On the mainnet box that spun
+// inside one call for 67 minutes, burning 15% of the machine's CPU on allocating and zeroing the
+// same slice, and it held up the pruner's second phase, which is the reclaim, so nothing was
+// ever reclaimed.
+//
+// The other two iterators in this package and the sql store's version all return nil here. This
+// one did not.
+func TestUnminedIteratorEndsWithNil(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	// Nothing waiting to be mined, which is the ordinary state and the one that spun.
+	it, err := s.GetUnminedTxIterator()
+	require.NoError(t, err)
+
+	defer func() { require.NoError(t, it.Close()) }()
+
+	batch, err := it.Next(ctx)
+	require.NoError(t, err)
+	require.Nil(t, batch, "an exhausted iterator must return nil, because every caller breaks on nil")
+}
+
+// TestUnminedIteratorEndsWithNilAfterAFullDrain, so the terminator arrives after real rows too
+// rather than only on an empty store.
+func TestUnminedIteratorEndsWithNilAfterAFullDrain(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	for i := 0; i < 3; i++ {
+		tx := mkTx(t, 1, uint64(1_000+i))
+		_, err := s.Create(ctx, tx, 700_000)
+		require.NoError(t, err)
+	}
+
+	it, err := s.GetUnminedTxIterator()
+	require.NoError(t, err)
+
+	defer func() { require.NoError(t, it.Close()) }()
+
+	first, err := it.Next(ctx)
+	require.NoError(t, err)
+	require.Len(t, first, 3)
+
+	second, err := it.Next(ctx)
+	require.NoError(t, err)
+	require.Nil(t, second, "the call after the last row must terminate the caller's loop")
+}

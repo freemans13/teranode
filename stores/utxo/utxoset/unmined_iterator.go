@@ -133,6 +133,22 @@ func (it *unminedIterator) Next(_ context.Context) ([]*utxo.UnminedTransaction, 
 		return nil, it.err
 	}
 
+	// NIL when exhausted, never an empty slice, and this is the whole termination contract
+	// rather than tidiness. Every caller breaks its loop on a nil batch and tests nothing else,
+	// so handing back an empty but non-nil slice does not end the loop, it spins.
+	//
+	// It spun. On the mainnet box one call ran for 67 minutes without returning, burning about
+	// 15% of the machine's CPU on allocating and zeroing this same slice, and because it sits in
+	// the pruner's first phase it held the reclaim in the second phase behind it. Nothing was
+	// ever reclaimed, transaction bodies and the undo journal grew without bound, and the shape
+	// of it was invisible: no error, no log, a live process doing nothing.
+	//
+	// The interface documents nil as the terminator, the sql store returns nil, and the
+	// consistency scan in this package returns nil. This was the one that did not.
+	if len(batch) == 0 {
+		return nil, nil
+	}
+
 	return batch, nil
 }
 
