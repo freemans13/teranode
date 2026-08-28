@@ -24,6 +24,7 @@ type spendResult struct {
 type spendItem struct {
 	tx          *bt.Tx
 	blockHeight uint32
+	ignoreFlags utxo.IgnoreFlags
 	done        chan spendResult
 }
 
@@ -54,6 +55,9 @@ type spendPlan struct {
 	ownerVin []int // global index -> which input of that item
 	perItem  [][]*utxo.Spend
 	itemTxs  []*bt.Tx
+	// skipClaim[i] suppresses the previous-output comparison for item i. Set only by the
+	// gated below-checkpoint outpoint-only path, which is the one caller entitled to it.
+	skipClaim []bool
 }
 
 // planSpends flattens a batch of transactions into one set of arrays.
@@ -76,10 +80,13 @@ func planSpends(items []*spendItem) *spendPlan {
 		ownerVin: make([]int, 0, total),
 		perItem:  make([][]*utxo.Spend, len(items)),
 		itemTxs:  make([]*bt.Tx, len(items)),
+
+		skipClaim: make([]bool, len(items)),
 	}
 
 	for i, it := range items {
 		p.itemTxs[i] = it.tx
+		p.skipClaim[i] = it.ignoreFlags.SkipUTXOHashCheck
 
 		if it.tx == nil || it.tx.IsCoinbase() {
 			continue
@@ -176,6 +183,60 @@ func (s *Store) sendSpendBatch(batch []*spendItem) {
 	}
 }
 
+// claimMismatch compares what a spending transaction CLAIMED about the coin against what the
+// store has just handed back for it, and returns the rejection when they differ.
+//
+// This is the control the other two stores get from the UTXO hash, and the reason that hash
+// has content. A transaction may be submitted in EXTENDED FORMAT, meaning it carries its own
+// copy of every coin it spends -- the coin's value in satoshis and its locking script, the
+// rules for who may move it. The validator deliberately does not re-derive those when they
+// arrive; it validates against whatever the transaction brought. So the no-inflation check
+// sums the submitter's satoshis and script verification runs against the submitter's script.
+// The hash the other two stores compare at the spend is computed from those carried copies,
+// which is what makes it an authentication of the SUBMITTER rather than a consistency check on
+// the store.
+//
+// This store needs no hash to do the same job. Its DELETE returns the coin's real satoshis and
+// script in the same round trip, because the spend is also the decorate fetch, so it holds the
+// truth at exactly the moment the other two are comparing digests. Comparing the values
+// directly is cheaper -- a byte comparison instead of a double hash per input, on the hottest
+// path in the store -- and strictly stronger, because it compares the values themselves rather
+// than a digest of them.
+//
+// A nil PreviousTxScript means the input carried no claim at all, which is the un-decorated
+// below-checkpoint outpoint-only path. There is nothing to authenticate, and that path
+// switches script validation off in the same breath, so nothing acts on a claim either.
+//
+// The error is deliberately the one the other two stores already raise for this condition.
+// Their needsSpendRollback reads it as a genuine invalidity rather than a transient failure,
+// and conflict resolution reads it as "this transaction is invalid" rather than "this
+// transaction lost a race" -- so a false claim is rejected outright instead of being kept as a
+// conflicting transaction whose descendants get walked.
+//
+// Rejection is all-or-nothing on every path a caller can reach in production: SpendAndCreate
+// runs the spend inside one database transaction and rolls it back on any per-input error, and
+// SpendAndCreate is the only entry point the validator, block validation and conflict
+// resolution use. The batched Spend path has no enclosing transaction, so a rejected
+// transaction there leaves the rows the DELETE already took. That is a pre-existing property
+// of that path for every error class, not something this comparison introduces, and no caller
+// outside tests reaches it.
+func claimMismatch(in *bt.Input, sp *utxo.Spend, satoshis int64, script []byte) error {
+	if in == nil || in.PreviousTxScript == nil {
+		return nil
+	}
+
+	if in.PreviousTxSatoshis == uint64(satoshis) && //nolint:gosec // satoshis are never negative
+		bytes.Equal(*in.PreviousTxScript, script) {
+		return nil
+	}
+
+	// The scripts are reported by length rather than by content: one of them is attacker
+	// supplied and unbounded, and this string reaches the logs.
+	return errors.NewUtxoHashMismatchError(
+		"[utxoset][Spend] %s:%d was offered as %d satoshis with a %d-byte script, the store holds %d satoshis with a %d-byte script",
+		sp.TxID, sp.Vout, in.PreviousTxSatoshis, len(*in.PreviousTxScript), satoshis, len(script))
+}
+
 // runSpendPlan issues the statement and fills in each caller's answers, including the
 // per-input errors that conflict detection reads.
 func (s *Store) runSpendPlan(ctx context.Context, q querier, p *spendPlan) error {
@@ -211,6 +272,14 @@ func (s *Store) runSpendPlan(ctx context.Context, q querier, p *spendPlan) error
 		vin := p.ownerVin[k]
 
 		if in := p.itemTxs[item].Inputs[vin]; in != nil {
+			// Before the overwrite, and it has to be: the overwrite is what destroys the
+			// claim this is checking.
+			if !p.skipClaim[item] {
+				if err := claimMismatch(in, p.perItem[item][vin], satoshis, script); err != nil {
+					p.perItem[item][vin].Err = err
+				}
+			}
+
 			in.PreviousTxSatoshis = uint64(satoshis) //nolint:gosec // satoshis are never negative
 			in.PreviousTxScript = bscript.NewFromBytes(script)
 		}
@@ -359,10 +428,20 @@ func (s *Store) namePlanSpenders(ctx context.Context, q querier, p *spendPlan) e
 		if bytes.Equal(spender, p.spenders[k]) {
 			replayed[k] = struct{}{}
 
+			// The replay decorates from the journal rather than from the coin row, which
+			// makes this the SECOND place the store hands a caller's claim back
+			// unexamined. It gets the same comparison as the first, against the payload
+			// the journal captured at the moment of the delete.
+			in := p.itemTxs[p.owner[k]].Inputs[p.ownerVin[k]]
+
 			sp.Err = nil
 			sp.ConflictingTxID = nil
 
-			if in := p.itemTxs[p.owner[k]].Inputs[p.ownerVin[k]]; in != nil {
+			if !p.skipClaim[p.owner[k]] {
+				sp.Err = claimMismatch(in, sp, satoshis, script)
+			}
+
+			if in != nil {
 				in.PreviousTxSatoshis = uint64(satoshis) //nolint:gosec // satoshis are never negative
 				in.PreviousTxScript = bscript.NewFromBytes(script)
 			}

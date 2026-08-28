@@ -58,12 +58,22 @@ SELECT k.vin, u.flags, u.spendable_from
 // error, matching the postgres store's contract: the caller needs to know WHICH input
 // failed and why.
 func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+	var flags utxo.IgnoreFlags
+	if len(ignoreFlags) > 0 {
+		flags = ignoreFlags[0]
+	}
+
 	// Batched when configured, which is the normal path. Without it every spend was its own
 	// round trip, and round trips rather than rows were what this store's cost was made of.
 	if s.spendBatcher != nil {
 		done := make(chan spendResult, 1)
 
-		s.spendBatcher.PutCtx(ctx, &spendItem{tx: tx, blockHeight: blockHeight, done: done})
+		s.spendBatcher.PutCtx(ctx, &spendItem{
+			tx:          tx,
+			blockHeight: blockHeight,
+			ignoreFlags: flags,
+			done:        done,
+		})
 
 		select {
 		case res := <-done:
@@ -77,7 +87,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		return nil, err
 	}
 
-	return s.spendIn(ctx, s.pool, tx, blockHeight, ignoreFlags...)
+	return s.spendIn(ctx, s.pool, tx, blockHeight, flags)
 }
 
 // spendIn is Spend against an arbitrary querier, so SpendAndCreate can run it inside the same
@@ -86,12 +96,17 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 // It is a batch of one. There is deliberately no second implementation: the predicates that
 // authorise a spend are consensus rules, and two copies of them is a defect waiting for one
 // to be edited alone.
-func (s *Store) spendIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, _ ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+func (s *Store) spendIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, ignoreFlags ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
 	if tx == nil || tx.IsCoinbase() {
 		return nil, nil
 	}
 
-	plan := planSpends([]*spendItem{{tx: tx, blockHeight: blockHeight}})
+	var flags utxo.IgnoreFlags
+	if len(ignoreFlags) > 0 {
+		flags = ignoreFlags[0]
+	}
+
+	plan := planSpends([]*spendItem{{tx: tx, blockHeight: blockHeight, ignoreFlags: flags}})
 
 	if err := s.runSpendPlan(ctx, q, plan); err != nil {
 		return nil, err
