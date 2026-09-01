@@ -43,10 +43,12 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 
 	// Fail safe when maxBlockID is uninitialised. It is loaded synchronously at
 	// New() and refreshed by rebuildOffChainSet, but is held in an atomic that
-	// starts at 0. Genesis is committed with id 1 before either runs, so a real
-	// chain never has a committed MAX(id) of 0 — maxID==0 unambiguously means
-	// "not yet initialised" (e.g. the synchronous load errored and the first
-	// async rebuild has not completed). With maxID==0 the id<=maxID filter below
+	// starts at 0. Genesis is committed at id 0, so a real chain holding nothing but
+	// genesis has a committed MAX(id) of 0 too, and this check cannot tell that apart
+	// from "not yet initialised" (the synchronous load errored and the first async
+	// rebuild has not completed). Reading both as uninitialised is deliberate and safe:
+	// both go to SQL, which is correct either way and costs one query on a one-block
+	// chain. Do not "fix" this by treating 0 as initialised. With maxID==0 the id<=maxID filter below
 	// would drop EVERY committed candidate as "dangling" and return a (false, nil)
 	// false negative — which checkOldBlockIDs escalates into a PERMANENT block
 	// invalidation. Defer to the authoritative, flag-free parent_id CTE instead;
@@ -134,8 +136,14 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 		candidates = append(candidates, id)
 	}
 
+	// Every id was above maxBlockID, so this is the allocated-but-uncommitted reject and
+	// not the forked-set accept. Report fromMemory=false so the shadow comparison skips it.
+	// Both routes answer false here by construction, so comparing them cannot ever disagree:
+	// counting it would pad the denominator with answers that prove nothing, and below the
+	// checkpoint (where every node currently sits) this input is the dominant traffic. It
+	// also costs a round trip per call to learn nothing.
 	if len(candidates) == 0 {
-		return false, true, nil
+		return false, false, nil
 	}
 
 	// Every candidate is in the forked set, so this call is about to reject. Confirm
@@ -171,7 +179,14 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 func (s *SQL) shadowCompareChainCheck(ctx context.Context, blockIDs []uint32, inMemoryResult bool) {
 	authoritative, err := s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
 	if err != nil {
+		// Count the failure as well as logging it. Without this a node whose shadow query
+		// fails on every call is indistinguishable from one that never reached this route:
+		// both report nothing, and "no mismatches" reads as a clean bill of health on a
+		// node that never compared anything. The soak's whole value is being able to tell
+		// those two apart.
+		s.chainCheckShadowFailures.Add(1)
 		s.logger.Debugf("[CheckBlockIsInCurrentChain] shadow comparison could not run for blocks (%v): %v", blockIDs, err)
+
 		return
 	}
 
