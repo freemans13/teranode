@@ -117,6 +117,14 @@ func TestWithLiveCoinsDoesNotScanTheCoinTable(t *testing.T) {
 
 	require.NotContains(t, plan, "Seq Scan on utxo_p", "plan reads a coin partition whole:\n"+plan)
 	require.Contains(t, plan, "Index", "plan never reaches the packed-key index:\n"+plan)
+
+	// A bitmap scan still reaches the index, so the assertion above passes on it and cannot
+	// tell the two apart. The difference is what the LIMIT 1 can do: a bitmap scan builds every
+	// matching entry in the range first, so the cost of asking tracks how many outputs the
+	// parent still has, while a plain index scan stops at the first row. Measured on the
+	// mainnet box at 20,000 parents, that was 435 ms against 207 ms.
+	require.NotContains(t, plan, "Bitmap",
+		"the live-coin probe must be a plain index scan, so LIMIT 1 bounds it:\n"+plan)
 }
 
 // TestWithLiveCoinsFindsExactlyTheParentsWithAnUnspentOutput guards the answer while the plan
@@ -156,4 +164,32 @@ func TestWithLiveCoinsFindsExactlyTheParentsWithAnUnspentOutput(t *testing.T) {
 	for _, id := range absent {
 		require.NotContains(t, live, string(id), "unknown transaction reported as having a live coin")
 	}
+}
+
+// TestStorePoolDisablesJIT pins the one setting that stands between this store and a stall.
+//
+// The plan tests above assert the SHAPE of the live-coin plan. They cannot see its estimated
+// COST, and the cost is what postgres reads when it decides whether to hand the plan to LLVM.
+// Because every batch arrives as an array the planner has no statistics for, and because each
+// table is partitioned so the resulting guess gets multiplied, the estimate lands at 679,043
+// on real mainnet data for a query that reads about twenty index pages. Postgres compiles
+// above 100,000.
+//
+// On the mainnet soak box that compile was measured at 1,430,530 ms, then 499 ms on the very
+// next execution in the same session, against 28 ms with JIT off. The spread is memory: nothing
+// caches compiled code between executions, so the cost is really the cost of faulting LLVM's
+// pages back in, which on a loaded box takes minutes.
+//
+// The setting travels in the connection's startup packet, so this also proves a reconnect
+// carries it rather than silently coming back with the server default.
+func TestStorePoolDisablesJIT(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	var jit string
+
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT current_setting('jit')`).Scan(&jit),
+		"reading jit from the store's own pool")
+
+	require.Equal(t, "off", jit,
+		"the store's pool must disable JIT; see the comment on the pool setup in New")
 }
