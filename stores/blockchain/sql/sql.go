@@ -166,6 +166,11 @@ type SQL struct {
 	// authoritative answer have differed since startup. Exposed for the soak; a
 	// non-zero value means the forked-set route is not safe to run on its own yet.
 	chainCheckShadowMismatches atomic.Uint64
+	// chainCheckShadowFailures counts comparisons that could not run because the
+	// authoritative query errored. Without it, a node whose shadow query always fails
+	// reports the same "nothing" as a node that never reached the route, and a soak
+	// cannot tell "zero mismatches" from "zero comparisons".
+	chainCheckShadowFailures atomic.Uint64
 	// mainChainRebuilding is a reference counter: each caller that is about to (or
 	// currently is) mutating the on_main_chain column Adds 1 on entry and Adds -1 on
 	// exit. While the counter is > 0, all queries that use on_main_chain fall back to
@@ -1290,16 +1295,66 @@ func (s *SQL) resetChainWalkCache() {
 	}
 }
 
-// triggerRebuildOffChainSet deduplicates concurrent rebuild requests using singleflight.
-// When multiple goroutines (e.g. concurrent StoreBlock calls detecting forks) trigger
-// a rebuild simultaneously, only one actually executes and the others wait for its result.
-// This prevents race conditions where concurrent rebuilds could see different DB states.
+// triggerRebuildOffChainSet asks for a rebuild and is happy to share one already running.
+// Concurrent callers collapse into a single read of the blocks table, which is what the
+// two-minute background refresh wants: a set a few seconds out of date costs nothing there,
+// and the rebuild is a full-chain recursive walk whenever mainChainRebuilding is raised.
+//
+// Do NOT use this after changing on_main_chain. See triggerRebuildOffChainSetAfterWrite.
 func (s *SQL) triggerRebuildOffChainSet(ctx context.Context) error {
-	_, err, _ := s.rebuildGroup.Do("rebuild", func() (interface{}, error) {
-		return nil, s.rebuildOffChainSet(ctx)
+	return s.runRebuild(ctx, func() error { return s.rebuildOffChainSet(ctx) })
+}
+
+// triggerRebuildOffChainSetAfterWrite asks for a rebuild that is guaranteed to have STARTED
+// reading after this call, and is what every caller that has just moved a block on or off
+// the main chain must use.
+//
+// Sharing is wrong for those callers. singleflight hands a joiner the in-flight leader's
+// result without running the work again, and that leader began reading before the caller's
+// UPDATE committed, so the set it installs does not contain the block the caller just moved.
+// The caller then treats the shared result as its own success: it stamps
+// lastSuccessfulRebuild and releases mainChainRebuilding over a set that is missing exactly
+// the block it changed. CheckBlockIsInCurrentChain reads absence from that set as proof of
+// main-chain membership, so an operator's freshly invalidated block answers "on the main
+// chain" until the next background refresh, up to two minutes later.
+//
+// The fix is one retry, and one retry is enough. The `shared` flag reports that we joined a
+// call already in flight, which is the only case that can predate our write. Retrying then
+// either starts a fresh read, or joins one that began after the first leader finished, and
+// the first leader finished after our UPDATE committed. Either way the read that installs
+// the set started after our write.
+func (s *SQL) triggerRebuildOffChainSetAfterWrite(ctx context.Context) error {
+	return s.runRebuildObservingCallersWrite(ctx, func() error { return s.rebuildOffChainSet(ctx) })
+}
+
+// runRebuild is the deduplicating half of the two functions above, split out so the
+// collision they differ on can be driven deterministically in a test.
+func (s *SQL) runRebuild(ctx context.Context, work func() error) error {
+	_, err, _ := s.rebuildGroup.Do(rebuildGroupKey, func() (interface{}, error) {
+		return nil, work()
 	})
+
 	return err
 }
+
+// runRebuildObservingCallersWrite is the non-sharing half. See
+// triggerRebuildOffChainSetAfterWrite for why the retry is needed and why one is enough.
+func (s *SQL) runRebuildObservingCallersWrite(ctx context.Context, work func() error) error {
+	fn := func() (interface{}, error) { return nil, work() }
+
+	_, err, shared := s.rebuildGroup.Do(rebuildGroupKey, fn)
+	if err != nil || !shared {
+		return err
+	}
+
+	_, err, _ = s.rebuildGroup.Do(rebuildGroupKey, fn)
+
+	return err
+}
+
+// rebuildGroupKey is the single singleflight key every off-chain-set rebuild shares. One
+// key is deliberate: two rebuilds reading the same table concurrently is pure waste.
+const rebuildGroupKey = "rebuild"
 
 // shutdownAwareContext returns a context that is cancelled either when the timeout
 // expires or when Close() is called (s.backgroundDone is closed). Callers must call
@@ -1892,11 +1947,16 @@ func (s *SQL) logShadowCompareTotals() {
 	}
 
 	checks := s.chainCheckShadowChecks.Load()
-	if checks == 0 {
+	failures := s.chainCheckShadowFailures.Load()
+
+	// Stay silent only when nothing has happened at all. A node that reached the route but
+	// could not run a single comparison must still say so, because that is the case a
+	// reader would otherwise mistake for a clean soak.
+	if checks == 0 && failures == 0 {
 		return
 	}
 
-	s.logger.Infof("[CheckBlockIsInCurrentChain] shadow comparison totals: %d answers compared, %d mismatches", checks, s.chainCheckShadowMismatches.Load())
+	s.logger.Infof("[CheckBlockIsInCurrentChain] shadow comparison totals: %d answers compared, %d mismatches, %d comparisons could not run", checks, s.chainCheckShadowMismatches.Load(), failures)
 }
 
 // reservationSweepInterval is how often reservationSweepLoop reclaims abandoned
