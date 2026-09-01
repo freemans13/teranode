@@ -30,26 +30,56 @@ const DefaultReclaimChunkParents = 20_000
 
 // settledSQL answers "which of these transactions can never be un-mined" for a batch.
 //
-// Two clauses, and both are load-bearing. The marker must be NULL, meaning a main-chain block
-// contains it; a transaction whose only block lost is still waiting and its parent's coins
-// may still have to come back. And its DEEPEST block must be at or below the cutoff. Deepest,
-// not first: a transaction can name a block that lost and the block that actually mined it,
-// and taking the convenient one would call it settled while the real one is still shallow.
-// The deepest is safe in the only direction that matters, because it can delay reclaim but
-// never rush it.
+// Three clauses, and all three are load-bearing. The marker must be NULL, meaning a main-chain
+// block contains it; a transaction whose only block lost is still waiting and its parent's
+// coins may still have to come back. Its membership must name at least one block. And its
+// DEEPEST block must be at or below the cutoff. Deepest, not first: a transaction can name a
+// block that lost and the block that actually mined it, and taking the convenient one would
+// call it settled while the real one is still shallow. The deepest is safe in the only
+// direction that matters, because it can delay reclaim but never rush it.
 //
 // The candidate list arrives as an array parameter rather than as a query built over the
 // journal partition. That is deliberate: a data-modifying expression over the partition
 // carries no size estimate, and the planner then throws away the per-key probes and reads
 // both the identity table and the coin table whole. Measured at 174,186 page fetches for a
 // 7,917 row chunk.
+//
+// It asks the deepest-block question WITHOUT calling mh_max, and that is the whole cost of this
+// statement rather than a tidy-up. Measured on the mainnet box, mh_max costs about 52 microseconds per
+// call against an 8.4 microsecond index probe underneath it, and this one statement is roughly
+// three quarters of a retiring leaf's time with 93% of that inside the helper. PostgreSQL
+// cannot inline a SQL function whose body is an aggregate over a set-returning function, and
+// this one is both, so every row paid the full call.
+//
+// "Is the deepest block at or below the cutoff" and "is no block above the cutoff" are the same
+// question, and the second needs no maximum. Written as NOT EXISTS the planner stops at the
+// first triple that disqualifies a row instead of reducing over all of them, and there is no
+// function call left to pay.
+//
+// The length guard is NOT the same as "membership IS NOT NULL", and picking the wrong one
+// settles transactions that must never be settled. mh_max returns NULL for BOTH spellings of
+// "no block": a NULL membership, and the empty value that unstampSQL leaves behind when it
+// removes the last triple with overlay (see set_mined.go). NOT EXISTS over an empty membership
+// is TRUE, so a bare NULL test would flip that empty residue from refused to settled and delete
+// the identity row of a transaction no block contains. octet_length refuses both, because NULL
+// compares to nothing and 0 is below 12.
+//
+// The casts MUST be bigint, for the reason mh_max's own comment gives: in PostgreSQL
+// 255::int << 24 wraps to a negative number, silently, so an int4 version would read a high
+// height as negative and pass every cutoff test.
 const settledSQL = `
 SELECT i.txid
   FROM unnest($1::bytea[]) AS k(txid)
   JOIN tx_ident i ON i.leaf = (get_byte(k.txid, 0) & 7)::smallint AND i.txid = k.txid
  WHERE i.off_chain_since IS NULL
-   AND mh_max(i.membership) IS NOT NULL
-   AND mh_max(i.membership) <= $2`
+   AND octet_length(i.membership) >= 12
+   AND NOT EXISTS (
+       SELECT 1
+         FROM generate_series(0, octet_length(i.membership) / 12 - 1) g
+        WHERE ( (get_byte(i.membership, g * 12 + 4)::bigint << 24)
+              | (get_byte(i.membership, g * 12 + 5)::bigint << 16)
+              | (get_byte(i.membership, g * 12 + 6)::bigint <<  8)
+              |  get_byte(i.membership, g * 12 + 7)::bigint ) > $2)`
 
 // settled returns the subset of txids that can never be un-mined at this tip, keyed by the
 // raw txid bytes as a string so callers can test membership cheaply.
@@ -309,10 +339,27 @@ type reclaimBatch struct {
 	parents  [][]byte
 	spenders [][]byte
 	spentBy  map[string][][]byte
+
+	// seenSpender deduplicates the array handed to the settled check.
+	//
+	// The work list arrives as one row per (parent, spender) pair, so a transaction that
+	// consumed several parents appeared once per parent and was probed once per appearance.
+	// The parents beside it were already deduplicated and the spenders were not. On a measured
+	// mainnet leaf that was 207,500 entries for 103,492 distinct spenders.
+	//
+	// The saving is real but smaller than the leaf-wide ratio suggests, and the difference is
+	// worth knowing before anyone quotes it. Deduplication can only happen INSIDE a batch of
+	// reclaimChunkParents, and a spender's other parents scatter across the whole leaf because
+	// the cut is on parent order, so the measured within-batch factor is about 1.40 against
+	// 2.01 leaf-wide.
+	seenSpender map[string]struct{}
 }
 
 func newReclaimBatch() *reclaimBatch {
-	return &reclaimBatch{spentBy: map[string][][]byte{}}
+	return &reclaimBatch{
+		spentBy:     map[string][][]byte{},
+		seenSpender: map[string]struct{}{},
+	}
 }
 
 func (b *reclaimBatch) add(parent, spender []byte) {
@@ -322,7 +369,17 @@ func (b *reclaimBatch) add(parent, spender []byte) {
 		b.parents = append(b.parents, parent)
 	}
 
+	// EVERY spender goes on the per-parent list, deduplicated or not. That list decides whether
+	// all of a parent's spends have settled, and dropping a repeat from it would be harmless
+	// only by luck; the query array below is the only place a repeat costs anything.
 	b.spentBy[key] = append(b.spentBy[key], spender)
+
+	sk := string(spender)
+	if _, seen := b.seenSpender[sk]; seen {
+		return
+	}
+
+	b.seenSpender[sk] = struct{}{}
 	b.spenders = append(b.spenders, spender)
 }
 
@@ -334,6 +391,7 @@ func (b *reclaimBatch) reset() {
 	b.parents = nil
 	b.spenders = nil
 	b.spentBy = map[string][][]byte{}
+	b.seenSpender = map[string]struct{}{}
 }
 
 // liveCoinArgs expands transaction ids into the four parallel arrays hasLiveCoinSQL takes:
