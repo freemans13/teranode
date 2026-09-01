@@ -195,18 +195,56 @@ func TestCheckBlockIsInCurrentChain_InMemory_ClosedDB(t *testing.T) {
 // never reaches it. The forked-set route accepts it, because it is not in the forked
 // set and the route treats absence as proof of membership.
 //
-// This is issue 1055, and it is deliberate. Nothing can mint such an id any more:
-// PR 1043 made block-id assignment idempotent per block hash, and both stamping
-// paths recover the original id on retry (netsync reuseBlockIDFromUTXO, quick
-// validation's equivalent), so a stamped id always resolves back to its own block.
-// The gap here has to be manufactured with options.WithID, which no production
-// caller does.
+// This is issue 1055, and it is accepted deliberately. Gap ids DO exist and they are
+// created by ordinary running, so do not read the paragraphs below as a claim that they
+// cannot happen. They can, and the reason this is still safe is measured, not argued.
 //
-// The shadow comparison is what would surface it if that belief is ever wrong: while
-// blockchain_chain_check_shadow_compare is on, every in-memory answer is checked
-// against the SQL answer and a mismatch is logged and counted. This test builds the
-// mismatch on purpose so the two routes' behaviour is written down and a reviewer
-// does not have to reconstruct it.
+// MEASURED on the Hetzner boxes, 2026-09-01. Gap ids present:
+//
+//	SELECT (SELECT MAX(id) FROM blocks) + 1 - (SELECT COUNT(*) FROM blocks) FROM blocks;
+//	mainnet 184, testnet 0, teratestnet 0    (genesis commits at id 0, hence the +1)
+//
+// mainnet's 184 sit in 12 interior runs of 1 to 31 ids. Every run follows a multi-minute
+// pause in block storage and is exactly as long as the number of blocks that were in
+// flight when the node stopped. They are restart scars: an id is reserved for a block,
+// the node stops before writing anything about that block, and on restart the block is
+// re-processed under a fresh id. Block HEIGHTS are unbroken across every run, so no block
+// is missing. Only ids were burned.
+//
+// Nothing references them, which is the property that makes the accept safe. The utxoset
+// store packs a transaction's blocks into tx_ident.membership as 12-byte big-endian
+// triples of block id, height and subtree index. Decoding those around all 12 runs, across
+// all 8 partitions: 381,599 stamps examined, ZERO pointing at an id with no blocks row.
+// Transactions reference id 271114 and then jump to 271117; the burned 271115 and 271116
+// appear on nothing. Every transaction carries exactly one block (0 rows with
+// length(membership) > 12 out of 18M on one partition), so a transaction's created_height
+// is the height of the block stamped on it and that scan could not have missed a stamp.
+//
+// So the failure that burns an id lands BEFORE any stamping. The wrong answer exists and
+// is currently unreachable, because reaching it needs something to hold a burned id and
+// hand it to this function. Nothing does.
+//
+// Do NOT re-derive this. Two separate reviews have now spent significant time proving that
+// gap ids exist, which was never in doubt, and stopping there. The question that decides
+// safety is whether anything REFERENCES one, and the query above plus the membership
+// decode answers it in minutes. If you want to re-check it on a node, run those two, not a
+// fresh argument about block-id assignment.
+//
+// What is NOT a guarantee: the protection is where a crash lands, not a rule the code
+// enforces. Two paths can stamp an id that then goes nowhere. storeInvalidBlock re-commits
+// a pre-assigned block under a fresh id, abandoning the id already written onto its
+// transactions (services/blockvalidation/BlockValidation.go). The gRPC AddBlock handler
+// passes a caller-supplied id straight through with no bound and no continuity check
+// (services/blockchain/Server.go). Four production call sites pass options.WithID, so an
+// earlier version of this comment claiming none did was simply wrong. If either path ever
+// fires, the burned id becomes referenced and reachable, permanently, and the asset server
+// reads block ids straight off transaction metadata.
+//
+// The shadow comparison is the standing instrument for that: while
+// blockchain_chain_check_shadow_compare is on, every in-memory answer is checked against
+// the SQL answer and a mismatch is logged and counted. This test builds the mismatch on
+// purpose so the two routes' behaviour is written down and a reviewer does not have to
+// reconstruct it.
 func TestCheckBlockIsInCurrentChain_GapIDDivergesBetweenRoutes(t *testing.T) {
 	const highID = 100000
 
