@@ -3,6 +3,7 @@ package utxoset
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/bsv-blockchain/teranode/errors"
 )
@@ -198,6 +199,7 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 
 	type leafState struct {
 		name          string
+		leaf          uint32
 		attached      bool
 		detachPending bool
 	}
@@ -211,6 +213,13 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 			return 0, errors.NewStorageError("[utxoset] scan spend-journal leaf", err)
 		}
 
+		// A name carrying no leaf number is not one of ours. Parsing here rather than in the
+		// drop loop keeps it in one place, so the ordering below and the cutoff test can never
+		// disagree about which leaf a table is.
+		if _, err := fmt.Sscanf(l.name, "spend_journal_%d", &l.leaf); err != nil {
+			continue
+		}
+
 		leaves = append(leaves, l)
 	}
 
@@ -220,16 +229,27 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
 	}
 
+	// OLDEST FIRST, and the ordering is load-bearing once there is a backlog.
+	//
+	// The listing query has no ORDER BY, so without this the catalog hands leaves back in
+	// whatever order it scanned them, which shifts as tables are created and dropped. With
+	// one leaf retiring every 48 blocks and nothing behind, order is irrelevant. With
+	// thousands outstanding it decides which work gets done before the session ends, and a
+	// session ends when the daemon is restarted rather than when the work runs out.
+	//
+	// Two things follow. Old leaves are the cheap ones, measured at six to thirteen times
+	// less work than leaves near the frontier, so taking them first retires more of them per
+	// session. And the oldest surviving leaf only becomes a usable progress measure if the
+	// oldest is what gets attacked; in catalog order it can sit untouched indefinitely while
+	// newer leaves churn, which is exactly what the mainnet box showed with leaf 4,676 still
+	// present while the session worked on 9,353.
+	sort.Slice(leaves, func(i, j int) bool { return leaves[i].leaf < leaves[j].leaf })
+
 	cutoff := height / SpendJournalPartitionBlocks
 	dropped := 0
 
 	for _, l := range leaves {
-		var leaf uint32
-		if _, err := fmt.Sscanf(l.name, "spend_journal_%d", &leaf); err != nil {
-			continue
-		}
-
-		if leaf >= cutoff {
+		if l.leaf >= cutoff {
 			continue
 		}
 

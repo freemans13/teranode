@@ -2,6 +2,7 @@ package utxoset
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"testing"
 
@@ -635,4 +636,47 @@ func spendOnly(ctx context.Context, s *Store, tx *bt.Tx, blockHeight uint32,
 	opts ...utxo.CreateOption) ([]*utxo.Spend, error) {
 	_, spends, err := s.SpendAndCreate(ctx, tx, blockHeight, append(opts, utxo.WithSpendOnly())...)
 	return spends, err
+}
+
+// TestSpendJournalReclaimTakesTheOldestLeafFirst pins the order the drop loop works in.
+//
+// The listing query has no ORDER BY, so without an explicit sort the catalog returns leaves
+// in whatever order it scanned them, and that order shifts as tables are created and dropped.
+// With one leaf retiring every 48 blocks and nothing behind, the order does not matter. With
+// a backlog it decides which work gets done before the session ends, and a session ends when
+// the daemon restarts rather than when the work runs out.
+//
+// The mainnet box showed the failure: leaf 4,676 was still present while the session was
+// working on leaf 9,353, so the oldest leaf never got attacked and the oldest-surviving-leaf
+// watermark never moved. Old leaves are also the cheap ones, measured at six to thirteen
+// times less work than leaves near the frontier.
+//
+// Creating the leaves out of order is the point of this test. Doing it ascending would pass
+// against the unsorted code by luck, because the catalog would most likely hand them back in
+// creation order.
+func TestSpendJournalReclaimTakesTheOldestLeafFirst(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	// Deliberately scrambled: leaves 10, 2, 7, 4 in creation order.
+	for _, h := range []uint32{500, 100, 350, 200} {
+		require.NoError(t, s.ensureSpendJournalPartition(ctx, h))
+	}
+
+	var seen []uint32
+
+	// A cutoff above every leaf, so all four are eligible and the order is the only variable.
+	_, err := s.dropSpendJournalPartitionsBelow(ctx, 100_000,
+		func(_ context.Context, partition string) error {
+			var leaf uint32
+			_, serr := fmt.Sscanf(partition, "spend_journal_%d", &leaf)
+			require.NoError(t, serr)
+
+			seen = append(seen, leaf)
+
+			return nil
+		})
+	require.NoError(t, err)
+
+	require.Equal(t, []uint32{2, 4, 7, 10}, seen,
+		"leaves must be worked oldest first, whatever order the catalog listed them in")
 }
