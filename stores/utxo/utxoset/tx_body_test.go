@@ -1,6 +1,7 @@
 package utxoset
 
 import (
+	"context"
 	"strconv"
 	"testing"
 
@@ -162,3 +163,128 @@ func TestCreateIsAtomicAcrossItsThreeWrites(t *testing.T) {
 
 // itoa keeps the partition name readable at the call site.
 func itoa(i int) string { return strconv.Itoa(i) }
+
+// tableExists says whether a table of this name is present in the current schema, whether or
+// not it is still attached to a parent.
+func tableExists(t *testing.T, s *Store, ctx context.Context, name string) bool {
+	t.Helper()
+
+	var found bool
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE c.relname = $1 AND n.nspname = current_schema())`, name).Scan(&found))
+
+	return found
+}
+
+// TestTxBodyReclaimRecoversAnOrphanedWindow covers the crash window that the listing query used
+// to be blind to.
+//
+// Discarding a window is two statements: DETACH PARTITION ... CONCURRENTLY, then DROP TABLE. A
+// crash between them leaves a fully standalone table, and PostgreSQL removes its pg_inherits row
+// when it detaches. The listing used to INNER JOIN pg_inherits, so from that moment the window
+// was invisible to every future session and its disk was never returned. Nothing reported it
+// either, because the only symptom is free disk shrinking.
+//
+// The journal's own listing has handled this since it was written. This is the same handling,
+// ported.
+func TestTxBodyReclaimRecoversAnOrphanedWindow(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	s.bodyRetention = 96
+
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 100)) // window 2
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 500)) // window 10
+
+	// Simulate the crash: detach window 2 and stop, exactly as a kill between the two
+	// statements would leave it.
+	_, err := s.pool.Exec(ctx, `ALTER TABLE tx_body DETACH PARTITION tx_body_w2 CONCURRENTLY`)
+	require.NoError(t, err)
+
+	var isPartition bool
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT relispartition FROM pg_class WHERE oid = 'tx_body_w2'::regclass`).Scan(&isPartition))
+	require.False(t, isPartition, "the orphan is no longer a partition, which is why pg_inherits cannot find it")
+
+	dropped, err := s.dropTxBodyWindowsBelow(ctx, 500+96)
+	require.NoError(t, err)
+	require.Positive(t, dropped)
+
+	require.False(t, tableExists(t, s, ctx, "tx_body_w2"),
+		"an orphaned window must be reclaimed by the next session, or its disk is lost for good")
+}
+
+// TestTxBodyReclaimRecoversAWindowStuckMidDetach is the worse of the two crash states, because
+// it does not leak one window, it stops the entire cleanup.
+//
+// A crash DURING a concurrent detach leaves the window marked detach-pending. PostgreSQL then
+// refuses every further attach and detach on tx_body. So the detach in this loop fails on every
+// call, the call returns an error, and Prune returns before it reaches the journal loop at all.
+// Discarding transaction bytes AND discarding undo history both stop. Creating a new window at
+// the next 48-block rollover would fail too.
+//
+// Reaching this state on purpose needs a catalog write, because the only natural route is an
+// interrupted DETACH ... CONCURRENTLY and that cannot be timed reliably. If the test role cannot
+// write the catalog the test SKIPS rather than passing, which matters: an earlier version of it
+// tried to reach the state with a rolled-back transaction, that form cannot produce it at all,
+// and the test then asserted "nothing is pending" against a database where nothing ever was.
+func TestTxBodyReclaimRecoversAWindowStuckMidDetach(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	s.bodyRetention = 96
+
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 100)) // window 2
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 200)) // window 4
+	require.NoError(t, s.ensureTxBodyPartition(ctx, 500)) // window 10
+
+	if _, err := s.pool.Exec(ctx, `UPDATE pg_inherits SET inhdetachpending = true
+         WHERE inhrelid = 'tx_body_w2'::regclass AND inhparent = 'tx_body'::regclass`); err != nil {
+		t.Skipf("cannot reach the detach-pending state here, which needs a catalog write: %v", err)
+	}
+
+	var pending bool
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT COALESCE(bool_or(i.inhdetachpending), false) FROM pg_inherits i
+          WHERE i.inhparent = 'tx_body'::regclass`).Scan(&pending))
+	require.True(t, pending, "the precondition must actually hold, or this test proves nothing")
+
+	dropped, err := s.dropTxBodyWindowsBelow(ctx, 500+96)
+	require.NoError(t, err,
+		"a window stuck mid-detach must be finalised, not returned as an error that stops the whole prune")
+	require.Positive(t, dropped)
+
+	var stuck bool
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT COALESCE(bool_or(i.inhdetachpending), false) FROM pg_inherits i
+          WHERE i.inhparent = 'tx_body'::regclass`).Scan(&stuck))
+	require.False(t, stuck, "leaving it pending stops every later detach and every new window")
+}
+
+// TestTxBodyReclaimTakesTheOldestWindowFirst.
+//
+// The listing query has no ORDER BY, so without an explicit sort the catalog hands windows back
+// in whatever order it scanned them. With one window retiring every 48 blocks and nothing behind,
+// that does not matter. With a backlog, and the mainnet box reached 601 of these holding 14 GB,
+// it decides which disk comes back first and whether the oldest surviving window is a usable
+// measure of progress at all.
+func TestTxBodyReclaimTakesTheOldestWindowFirst(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	s.bodyRetention = 96
+
+	// Created out of order on purpose: ascending creation would pass against unsorted code by
+	// luck, because the catalog would most likely return them in creation order.
+	for _, h := range []uint32{500, 100, 350, 200} {
+		require.NoError(t, s.ensureTxBodyPartition(ctx, h))
+	}
+
+	// A cutoff that retires windows 2 and 4 but not 7 and 10.
+	dropped, err := s.dropTxBodyWindowsBelow(ctx, 250+96)
+	require.NoError(t, err)
+	require.Equal(t, 2, dropped)
+
+	require.False(t, tableExists(t, s, ctx, "tx_body_w2"), "window 2 is the oldest and must go first")
+	require.False(t, tableExists(t, s, ctx, "tx_body_w4"))
+	require.True(t, tableExists(t, s, ctx, "tx_body_w7"), "still inside the horizon")
+	require.True(t, tableExists(t, s, ctx, "tx_body_w10"))
+}

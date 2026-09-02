@@ -3,6 +3,7 @@ package utxoset
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/bsv-blockchain/teranode/errors"
 )
@@ -71,15 +72,38 @@ ALTER TABLE tx_body_w%[1]d ALTER COLUMN raw_tx SET STORAGE EXTERNAL;`, window, l
 	return nil
 }
 
-// txBodyWindowSQL lists the body windows this store owns, resolved through regclass so it
-// finds windows of the SAME table the DROP below will name. Matching on a bare name would
-// search every schema in the database, and an unqualified drop would then resolve against the
-// search path and fail, aborting the loop before a single real window went.
+// txBodyWindowSQL lists the body windows this store owns, in whichever state they are in.
+//
+// This used to INNER JOIN pg_inherits, which made it blind to the very state a crash produces.
+// The three states, all verified against PostgreSQL rather than assumed, and all of them handled
+// twelve lines away in spend_journal.go for the journal's own partitions:
+//
+//   - ATTACHED. The normal case.
+//   - ORPHANED. A crash between DETACH and DROP leaves a fully standalone table: relispartition
+//     goes FALSE and the pg_inherits row is GONE. An inner join can never see it again, so its
+//     disk is never returned and nothing reports it. Found here by name within tx_body's own
+//     schema, which is all that still identifies it.
+//   - DETACH PENDING. A crash DURING a concurrent detach leaves inhdetachpending set. PostgreSQL
+//     then refuses every further ATTACH and DETACH on the parent, so the detach below fails on
+//     every call, dropTxBodyWindowsBelow returns an error, and Prune returns before it reaches
+//     the journal loop at all. That is the WHOLE cleanup stopped, not one table leaked, and it
+//     would also fail the CREATE TABLE ... PARTITION OF that the create path runs at each
+//     48-block rollover.
+//
+// Resolved through regclass so it finds windows of the SAME table the DROP below will name.
+// Matching on a bare name would search every schema in the database, and an unqualified drop
+// would then resolve against the search path and fail, aborting the loop before a single real
+// window went.
 const txBodyWindowSQL = `
-SELECT c.relname
+SELECT c.relname,
+       c.relispartition,
+       COALESCE(i.inhdetachpending, false)
   FROM pg_class c
-  JOIN pg_inherits i ON i.inhrelid = c.oid
- WHERE i.inhparent = 'tx_body'::regclass`
+  LEFT JOIN pg_inherits i
+         ON i.inhrelid = c.oid AND i.inhparent = 'tx_body'::regclass
+ WHERE c.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'tx_body'::regclass)
+   AND c.relkind  = 'r'
+   AND c.relname ~ '^tx_body_w[0-9]+$'`
 
 // dropTxBodyWindowsBelow discards the serialized transaction bytes that have aged out.
 //
@@ -101,16 +125,30 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 		return 0, errors.NewStorageError("[utxoset] list tx_body windows", err)
 	}
 
-	var names []string
+	type windowState struct {
+		name          string
+		window        uint32
+		attached      bool
+		detachPending bool
+	}
+
+	var windows []windowState
 
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var w windowState
+		if err := rows.Scan(&w.name, &w.attached, &w.detachPending); err != nil {
 			rows.Close()
 			return 0, errors.NewStorageError("[utxoset] scan tx_body window", err)
 		}
 
-		names = append(names, name)
+		// A name carrying no window number is not one of ours. Parsing it here rather than in
+		// the drop loop keeps it in one place, so the ordering below and the cutoff test can
+		// never disagree about which window a table is.
+		if _, err := fmt.Sscanf(w.name, "tx_body_w%d", &w.window); err != nil {
+			continue
+		}
+
+		windows = append(windows, w)
 	}
 
 	rows.Close()
@@ -119,28 +157,44 @@ func (s *Store) dropTxBodyWindowsBelow(ctx context.Context, height uint32) (int,
 		return 0, errors.NewStorageError("[utxoset] list tx_body windows", err)
 	}
 
+	// Oldest first, for the reason the journal's own loop sorts: the listing query has no
+	// ORDER BY, so the catalog returns whatever order it scanned, and with a backlog that
+	// decides which disk comes back first and whether the oldest surviving window is a usable
+	// progress measure at all.
+	sort.Slice(windows, func(i, j int) bool { return windows[i].window < windows[j].window })
+
 	dropped := 0
 
-	for _, name := range names {
-		var window uint32
-		if _, err := fmt.Sscanf(name, "tx_body_w%d", &window); err != nil {
+	for _, w := range windows {
+		if w.window >= cutoff {
 			continue
 		}
 
-		if window >= cutoff {
-			continue
+		switch {
+		case w.detachPending:
+			// FINALIZE is the only way out of this state, and until it runs no other window of
+			// this table can be detached either, and no new one can be created.
+			if _, err := s.pool.Exec(ctx,
+				fmt.Sprintf(`ALTER TABLE tx_body DETACH PARTITION %s FINALIZE`, w.name)); err != nil {
+				return dropped, errors.NewStorageError("[utxoset] finalize detach of tx_body window %s", w.name, err)
+			}
+
+		case w.attached:
+			// Detach without blocking readers, then drop the now-standalone table. A bare drop
+			// on an attached partition briefly takes an exclusive lock on the parent, which
+			// would stall every concurrent create.
+			if _, err := s.pool.Exec(ctx,
+				fmt.Sprintf(`ALTER TABLE tx_body DETACH PARTITION %s CONCURRENTLY`, w.name)); err != nil {
+				return dropped, errors.NewStorageError("[utxoset] detach tx_body window %s", w.name, err)
+			}
+
+		default:
+			// Already standalone: a previous session was interrupted between its DETACH and its
+			// DROP. Nothing to detach, just finish the job.
 		}
 
-		// Detach without blocking readers, then drop the now-standalone table. A bare drop
-		// on an attached partition briefly takes an exclusive lock on the parent, which
-		// would stall every concurrent create.
-		if _, err := s.pool.Exec(ctx,
-			fmt.Sprintf(`ALTER TABLE tx_body DETACH PARTITION %s CONCURRENTLY`, name)); err != nil {
-			return dropped, errors.NewStorageError("[utxoset] detach tx_body window %s", name, err)
-		}
-
-		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, name)); err != nil {
-			return dropped, errors.NewStorageError("[utxoset] drop tx_body window %s", name, err)
+		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, w.name)); err != nil {
+			return dropped, errors.NewStorageError("[utxoset] drop tx_body window %s", w.name, err)
 		}
 
 		dropped++
