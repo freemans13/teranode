@@ -69,6 +69,17 @@ type Store struct {
 	// spenders would judge it on half the evidence.
 	reclaimChunkParents int
 
+	// journalSlices is how many pruner runs cover one journal partition. Production uses
+	// SpendJournalSlices; tests that are about chunking or about the whole-partition verdict
+	// set it to 1, which makes the slice predicate match every row and restores the old
+	// read-it-all-at-once behaviour.
+	journalSlices int16
+
+	// lastPruneHeight is the height of the previous pruner run, so a run that follows skipped
+	// heights can cover their slices too. Zero means nothing is remembered yet, which a restart
+	// produces and which falls back to doing one slice.
+	lastPruneHeight atomic.Uint32
+
 	// bodyWindow is the tx_body window the last create landed in, so the catalog is only
 	// touched when it changes.
 	bodyWindow atomic.Uint32
@@ -129,7 +140,37 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		dsn.Scheme = "postgres"
 	}
 
-	pool, err := pgxpool.New(ctx, dsn.String())
+	cfg, err := pgxpool.ParseConfig(dsn.String())
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset] parse dsn", err)
+	}
+
+	// Postgres must not JIT-compile this store's queries, and the reason is the row estimates
+	// rather than anything about JIT itself.
+	//
+	// Every hot statement here hands its batch over as an array and unpacks it with unnest, so
+	// the planner has no statistics for the values it will be given. It guesses, and because
+	// every table is partitioned the guess is then multiplied by the partition count. On the
+	// mainnet soak box hasLiveCoinSQL reads about twenty index pages and is costed at 679,043,
+	// and the decorate read is costed at 1,465,539. Postgres compiles above 100,000 and inlines
+	// and optimises above 500,000, so both clear every threshold on every execution.
+	//
+	// The compile is not the flat cost it looks like. The same statement took 1,430,530 ms, then
+	// 499 ms on the very next execution in the same session, against 28 ms with JIT off. Nothing
+	// caches compiled code between executions, so what varied was whether LLVM's own pages were
+	// still resident. Under memory pressure they are not, and faulting them back in costs
+	// minutes. At its best JIT makes this query eighteen times slower, at its worst fifty
+	// thousand. There is no state in which it wins.
+	//
+	// This rides on the pool rather than the server because the blockchain store shares the same
+	// postgres instance. Its heaviest statement is costed at 37,422, well under the threshold, so
+	// it neither gains nor loses from JIT and should not have the choice made on its behalf.
+	//
+	// RuntimeParams travels in the startup packet, so a reconnect carries it too. jit is a
+	// USERSET setting, which is what makes that legal.
+	cfg.ConnConfig.RuntimeParams["jit"] = "off"
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset] open pool", err)
 	}
@@ -142,7 +183,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
 		journalRetention:    DefaultSpendJournalRetentionBlocks,
 		bodyRetention:       DefaultTxBodyRetentionBlocks,
-		reclaimChunkParents: DefaultReclaimChunkParents}
+		reclaimChunkParents: DefaultReclaimChunkParents,
+		journalSlices:       SpendJournalSlices}
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)

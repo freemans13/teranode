@@ -13,6 +13,14 @@ import (
 // holds roughly 960,000 rows.
 const SpendJournalPartitionBlocks = 48
 
+// SpendJournalSlices is how many pruner runs it takes to cover one journal partition once.
+//
+// One per block of a partition's width, so a partition eligible at height H is covered by the
+// runs at H through H+47 and every slice is done exactly once. Any other number would work
+// arithmetically; matching the width is what makes "which slice" derivable from the block height
+// alone, with nothing written down.
+const SpendJournalSlices = SpendJournalPartitionBlocks
+
 // DefaultSpendJournalRetentionBlocks is how far back a spend stays undoable.
 //
 // 1440, not the 288 the design originally proposed. ParentPreservationBlocks is 1440 and
@@ -141,6 +149,52 @@ CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey
 	return nil
 }
 
+// slicesFor says which slices of a journal partition this pruner run should do.
+//
+// Normally one: the block height picks it, so nothing has to be written down and a restart loses
+// nothing. Two cases need more than one.
+//
+// The pruner deduplicates to the newest notification when it falls behind, so heights are
+// skipped, and a skipped height is a slice no run would ever do. A partition is dropped after
+// SpendJournalSlices heights whether or not its slices were done, so a skipped slice is identity
+// rows nothing can reclaim afterwards. Covering the gap costs nothing, because the heights in
+// between are known: the previous call's height is remembered in memory, and losing it on a
+// restart falls back to doing this height alone rather than to doing something wrong.
+//
+// A gap of a whole partition width or more means every slice is due anyway, so return them all
+// rather than walking a range that wraps.
+func (s *Store) slicesFor(height uint32) []int16 {
+	n := s.journalSlices
+	if n <= 0 {
+		n = SpendJournalSlices
+	}
+
+	last := s.lastPruneHeight.Swap(height)
+
+	if last == 0 || height <= last || height-last >= uint32(n) {
+		if last == 0 || height <= last {
+			// Nothing remembered, or the height went backwards. Do this one slice: the
+			// alternative is doing all of them, which on a large backlog is the unbounded
+			// session this change exists to remove.
+			return []int16{int16(height % uint32(n))}
+		}
+
+		all := make([]int16, n)
+		for i := range all {
+			all[i] = int16(i)
+		}
+
+		return all
+	}
+
+	out := make([]int16, 0, height-last)
+	for h := last + 1; h <= height; h++ {
+		out = append(out, int16(h%uint32(n)))
+	}
+
+	return out
+}
+
 // journalLeafSQL lists every journal leaf this store owns, in whichever state it is in.
 //
 // Three states matter, and all three were verified against PostgreSQL 17 rather than
@@ -181,7 +235,7 @@ SELECT c.relname,
 // of which transactions had an output spent in that window, which is precisely the work
 // list a later session step reads to decide what is now fully spent.
 func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint32) (int, error) {
-	return s.dropSpendJournalPartitionsBelow(ctx, height, nil)
+	return s.dropSpendJournalPartitionsBelow(ctx, height, nil, nil)
 }
 
 // dropSpendJournalPartitionsBelow reclaims journal leaves below height, calling before on each
@@ -190,8 +244,15 @@ func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint
 // The callback is where the pruner reads the retiring partition as its work list. The ordering
 // is not a preference: dropping the partition destroys the record of which transactions had an
 // output spent in that window, which is the only place that fact is written down.
+// A partition is worked across the SpendJournalSlices heights leading up to its due date, one
+// slice per height, so before is called on partitions that are approaching due and only the ones
+// that have reached it are dropped. slices names which of them this call is doing; nil means all
+// of them, which is what the exported wrapper and the tests pass.
+//
+// Retention is unchanged by this. The work happens inside the 1,440 blocks a spend was already
+// going to stay undoable for, not after them.
 func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint32,
-	before func(context.Context, string) error) (int, error) {
+	slices []int16, before func(context.Context, string, int16) error) (int, error) {
 	rows, err := s.pool.Query(ctx, journalLeafSQL)
 	if err != nil {
 		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
@@ -245,18 +306,74 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	// present while the session worked on 9,353.
 	sort.Slice(leaves, func(i, j int) bool { return leaves[i].leaf < leaves[j].leaf })
 
-	cutoff := height / SpendJournalPartitionBlocks
+	// Two cutoffs now, not one, and the work one LEADS the drop one rather than trailing it.
+	//
+	// A partition is read across the SpendJournalSlices heights BEFORE it is due, so that by the
+	// time it is due the work is finished and only the catalog drop is left. dropCutoff is
+	// therefore unchanged from the single cutoff this function used to have, and retention stays
+	// exactly what DefaultSpendJournalRetentionBlocks says. Working the partition AFTER it came
+	// due would have held it a further 48 blocks for no gain.
+	//
+	// Deciding that early is safe with room to spare. A spend record in a partition reaching its
+	// work window is already about 1,393 blocks old, and the bar for treating a spender as
+	// beyond recall is SettledDepthBlocks, which is 288. Nothing about the answer changes in the
+	// last 48 blocks of a 1,440 block wait.
+	//
+	// Partition L is therefore read at heights 48L through 48L+47, which is 48 consecutive
+	// heights and so covers every slice exactly once, and dropped at 48L+48.
+	lead := uint32(s.journalSlices)
+	if s.journalSlices <= 0 {
+		lead = SpendJournalSlices
+	}
+
+	workCutoff := (height + lead) / SpendJournalPartitionBlocks
+	dropCutoff := height / SpendJournalPartitionBlocks
+
 	dropped := 0
 
 	for _, l := range leaves {
-		if l.leaf >= cutoff {
+		if l.leaf >= workCutoff {
 			continue
 		}
 
+		// A partition PAST its due date has no work window left, so it gets all of its slices
+		// now rather than one.
+		//
+		// This is the backlog case and it is not hypothetical: the mainnet box is 2,000
+		// partitions behind, and every one of those is already overdue. Giving an overdue
+		// partition a single slice and then dropping it would destroy the work list with 47
+		// forty-eighths of it unread, and the identity rows those slices would have reclaimed
+		// could never be found again. Spreading work is worth having; leaking rows to get it
+		// is not.
+		//
+		// So spreading only applies on the normal schedule, where a partition is read across
+		// the heights leading up to its due date. Once a backlog exists the cost is what it
+		// always was until the backlog is gone.
+		due := l.leaf < dropCutoff
+
 		if before != nil {
-			if err := before(ctx, l.name); err != nil {
-				return dropped, err
+			todo := slices
+			if todo == nil || due {
+				n := s.journalSlices
+				if n <= 0 {
+					n = SpendJournalSlices
+				}
+
+				todo = make([]int16, n)
+				for i := range todo {
+					todo[i] = int16(i)
+				}
 			}
+
+			for _, sl := range todo {
+				if err := before(ctx, l.name, sl); err != nil {
+					return dropped, err
+				}
+			}
+		}
+
+		if !due {
+			continue
 		}
 
 		switch {
