@@ -86,11 +86,11 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	// through all of early sync, which is when the disk is tightest.
 	var reclaimed, batches int
 
-	slices := p.store.slicesFor(height)
+	offsets := p.store.heightOffsetsFor(height)
 
-	dropped, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff, slices,
-		func(ctx context.Context, partition string, slice int16) error {
-			n, b, rerr := p.store.reclaimFromPartition(ctx, partition, height, slice)
+	dropped, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff, offsets,
+		func(ctx context.Context, partition string, atHeight int64) error {
+			n, b, rerr := p.store.reclaimFromPartition(ctx, partition, height, atHeight)
 			if rerr != nil {
 				return rerr
 			}
@@ -108,8 +108,8 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 		// The batch count is here so a leaf's size is visible without instrumenting the
 		// store. Batches well above the leaf count mean leaves are running near the memory
 		// bound, which is the signal that reclaimChunkParents wants revisiting.
-		p.store.logger.Infof("[utxoset] pruner reclaimed %d transaction rows in %d batches across %d slice(s) and dropped %d spend-journal leaves below height %d",
-			reclaimed, batches, len(slices), dropped, cutoff)
+		p.store.logger.Infof("[utxoset] pruner reclaimed %d transaction rows in %d batches across %d block height(s) and dropped %d spend-journal leaves below height %d",
+			reclaimed, batches, len(offsets), dropped, cutoff)
 	}
 
 	// Still zero records processed, and still exact. The caller adds this to a counter of

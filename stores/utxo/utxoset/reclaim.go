@@ -134,42 +134,24 @@ func (s *Store) settled(ctx context.Context, txids [][]byte, tip uint32) (map[st
 // asking for the order costs close to nothing on top.
 //
 // The slice predicate is what lets one pruner run do a fraction of a partition instead of all
-// of it, and the choice of what to slice ON is the whole reason it is correct.
+// of it. A partition covers 48 block heights, so one run does one of those heights, and over the
+// 48 runs leading up to the partition's due date every height is done exactly once. The block
+// height being cleaned says which one, so nothing has to be written down.
 //
-// Slicing on spent_height would be the obvious reading of "do one block at a time" and it is
-// wrong. A transaction's outputs can be taken in different blocks of the same 48-block window,
-// measured at 16.2% of parents on a real mainnet partition, so a height slice would show the
-// decision only some of who spent that parent and it could call a parent finished on partial
-// evidence. Slicing on the parent's own id cannot: every record naming a parent carries that
-// parent's id, so all of them always land in the same slice. Each slice therefore reaches
-// exactly the verdict the whole-partition read would have reached, on exactly the same evidence.
-//
-// The last byte is used rather than the first because the first already selects the utxo and
-// tx_ident partition, and reusing it would correlate the slice with the leaf. 256 does not
-// divide by SpendJournalSlices, so sixteen slices carry six byte values and thirty-two carry
-// five, a spread of six to five. That unevenness is not worth a hash function.
-//
-// It is also CHEAPER than reading the whole partition, which is the opposite of what a
-// spread-the-work change usually costs. Measured warm on the mainnet box: one slice 236 ms
-// against 33,622 ms for the whole partition, so all 48 slices together are about a third of one
-// whole-partition read. Reading costs about 28 ms either way. The difference is the sort:
-// 182,000 rows spill 13 MB to disk, and a slice of 4,000 stays in memory.
-const candidatesSQL = `SELECT DISTINCT txid, spending_txid FROM %[1]s
- WHERE mod(get_byte(txid, 31), %[2]d) = $1 ORDER BY txid`
+// spent_height is not indexed on a journal partition, so this is a sequential read. That is
+// fine and it is not the cost: reading a whole partition takes about 28 ms, while the DISTINCT
+// over 182,000 rows spills 13 MB to disk and takes tens of seconds. One height's worth is a few
+// thousand rows and sorts in memory.
+// One limitation, stated because it is real rather than because it blocks this. A parent whose
+// outputs were taken in DIFFERENT blocks of the same partition is seen by more than one height,
+// and each of those runs judges it on the spenders it can see. Measured at 16.2% of parents on a
+// real mainnet partition. That is the same shape as the store's existing known gap, where a
+// parent is judged from one partition while a later attached partition holds the spend that took
+// its last coin, and it wants the same fix: a guard that asks whether any undo record for that
+// parent survives anywhere. It is not made better here and it is worth sizing on its own.
+const candidatesSQL = `SELECT DISTINCT txid, spending_txid FROM %s
+ WHERE spent_height = $1 ORDER BY txid`
 
-// candidatesAllSQL reads a whole partition, with no slice predicate, and it is what a partition
-// that is ALREADY past its due date gets.
-//
-// Slicing an overdue partition buys nothing, because there is no window left to spread across,
-// and it costs a great deal. Each slice is a separate pass with its own settled, live-coin and
-// main-chain queries, so slicing 48 ways takes the array those queries are given from about
-// 20,000 transactions down to about 400. Wide arrays are what this store is fastest at, measured
-// elsewhere in this package at 19x on the same shape, so 48 narrow passes lose far more on round
-// trips and per-statement work than the smaller sort saves.
-//
-// Measured on the mainnet box: with every partition overdue, retirement fell from 1.16-1.4
-// partitions a minute to 0.59, and a cleanup cycle that used to take 64 to 115 minutes had not
-// finished after two hours.
 const candidatesAllSQL = `SELECT DISTINCT txid, spending_txid FROM %s ORDER BY txid`
 
 // hasLiveCoinSQL asks whether any of a transaction's outputs is still unspent. A parent with
@@ -238,8 +220,8 @@ DELETE FROM tx_ident i
  USING unnest($1::bytea[]) AS k(txid)
  WHERE i.leaf = (get_byte(k.txid, 0) & 7)::smallint AND i.txid = k.txid`
 
-// A negative slice means no slice predicate at all: read the whole partition. That is what an
-// overdue partition gets, because it has no window left to spread the work across.
+// A negative atHeight means no height predicate at all: read the whole partition. That is what
+// an overdue partition gets, because it has no window left to spread the work across.
 //
 // reclaimFromPartition uses one retiring journal partition as a work list and deletes the
 // identity rows that are genuinely finished.
@@ -256,15 +238,10 @@ DELETE FROM tx_ident i
 // that partition retires, every earlier spend of it sits in a partition that already retired.
 // So a rejected candidate comes back on its own, at exactly the right moment, with no state
 // carried between sessions.
-func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip uint32, slice int16) (int, int, error) {
+func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip uint32, atHeight int64) (int, int, error) {
 	limit := s.reclaimChunkParents
 	if limit <= 0 {
 		limit = DefaultReclaimChunkParents
-	}
-
-	n := s.journalSlices
-	if n <= 0 {
-		n = SpendJournalSlices
 	}
 
 	var (
@@ -272,14 +249,14 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 		err  error
 	)
 
-	if slice < 0 {
+	if atHeight < 0 {
 		rows, err = s.pool.Query(ctx, fmt.Sprintf(candidatesAllSQL, partition))
 	} else {
-		rows, err = s.pool.Query(ctx, fmt.Sprintf(candidatesSQL, partition, n), slice)
+		rows, err = s.pool.Query(ctx, fmt.Sprintf(candidatesSQL, partition), atHeight)
 	}
 
 	if err != nil {
-		return 0, 0, errors.NewStorageError("[utxoset][reclaim] candidates from %s slice %d", partition, slice, err)
+		return 0, 0, errors.NewStorageError("[utxoset][reclaim] candidates from %s at height %d", partition, atHeight, err)
 	}
 
 	var (

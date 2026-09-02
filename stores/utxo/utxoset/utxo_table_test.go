@@ -73,15 +73,6 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 
 	t.Cleanup(func() { _ = s.Close(ctx) })
 
-	// Slicing OFF by default in tests, and production runs with it ON.
-	//
-	// Almost every test here asserts a VERDICT: this parent is finished, that one is not. With
-	// the production 48 slices a verdict only lands in the run whose slice matches a byte of
-	// the parent's transaction id, which is random, so those tests would pass or fail by luck.
-	// One slice makes the predicate match every row, which is the read they were written
-	// against. The slicing itself is covered by its own tests, which set this back.
-	s.journalSlices = 1
-
 	return s, ctx
 }
 
@@ -674,8 +665,8 @@ func TestSpendJournalReclaimTakesTheOldestLeafFirst(t *testing.T) {
 	var seen []uint32
 
 	// A cutoff above every leaf, so all four are eligible and the order is the only variable.
-	_, err := s.dropSpendJournalPartitionsBelow(ctx, 100_000, []int16{0},
-		func(_ context.Context, partition string, _ int16) error {
+	_, err := s.dropSpendJournalPartitionsBelow(ctx, 100_000, []uint32{0},
+		func(_ context.Context, partition string, _ int64) error {
 			var leaf uint32
 			_, serr := fmt.Sscanf(partition, "spend_journal_%d", &leaf)
 			require.NoError(t, serr)

@@ -13,14 +13,6 @@ import (
 // holds roughly 960,000 rows.
 const SpendJournalPartitionBlocks = 48
 
-// SpendJournalSlices is how many pruner runs it takes to cover one journal partition once.
-//
-// One per block of a partition's width, so a partition eligible at height H is covered by the
-// runs at H through H+47 and every slice is done exactly once. Any other number would work
-// arithmetically; matching the width is what makes "which slice" derivable from the block height
-// alone, with nothing written down.
-const SpendJournalSlices = SpendJournalPartitionBlocks
-
 // DefaultSpendJournalRetentionBlocks is how far back a spend stays undoable.
 //
 // 1440, not the 288 the design originally proposed. ParentPreservationBlocks is 1440 and
@@ -149,47 +141,39 @@ CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey
 	return nil
 }
 
-// slicesFor says which slices of a journal partition this pruner run should do.
+// heightOffsetsFor says which of a partition's 48 block heights this pruner run should do.
 //
-// Normally one: the block height picks it, so nothing has to be written down and a restart loses
-// nothing. Two cases need more than one.
+// A partition covers SpendJournalPartitionBlocks consecutive heights. One run does one of them,
+// and the block height being cleaned picks which: offset = height mod 48. Over the 48 runs
+// leading up to a partition's due date every one of its heights is done exactly once, and
+// nothing has to be written down because the height itself is the position.
 //
-// The pruner deduplicates to the newest notification when it falls behind, so heights are
-// skipped, and a skipped height is a slice no run would ever do. A partition is dropped after
-// SpendJournalSlices heights whether or not its slices were done, so a skipped slice is identity
-// rows nothing can reclaim afterwards. Covering the gap costs nothing, because the heights in
-// between are known: the previous call's height is remembered in memory, and losing it on a
-// restart falls back to doing this height alone rather than to doing something wrong.
-//
-// A gap of a whole partition width or more means every slice is due anyway, so return them all
-// rather than walking a range that wraps.
-func (s *Store) slicesFor(height uint32) []int16 {
-	n := s.journalSlices
-	if n <= 0 {
-		n = SpendJournalSlices
-	}
-
+// Two cases need more than one offset. The pruner deduplicates to the newest notification when
+// it falls behind, so heights get skipped, and a skipped height is a height of the partition
+// that no run would ever read. A partition is dropped once its heights are due whether or not
+// they were read, so a skipped one is identity rows nothing can find again. The previous call's
+// height is remembered in memory purely to close that gap, and losing it on a restart falls back
+// to doing one offset rather than to doing something wrong. A gap of a whole partition width or
+// more means every offset is due anyway.
+func (s *Store) heightOffsetsFor(height uint32) []uint32 {
 	last := s.lastPruneHeight.Swap(height)
 
-	if last == 0 || height <= last || height-last >= uint32(n) {
-		if last == 0 || height <= last {
-			// Nothing remembered, or the height went backwards. Do this one slice: the
-			// alternative is doing all of them, which on a large backlog is the unbounded
-			// session this change exists to remove.
-			return []int16{int16(height % uint32(n))}
-		}
+	if last == 0 || height <= last {
+		return []uint32{height % SpendJournalPartitionBlocks}
+	}
 
-		all := make([]int16, n)
+	if height-last >= SpendJournalPartitionBlocks {
+		all := make([]uint32, SpendJournalPartitionBlocks)
 		for i := range all {
-			all[i] = int16(i)
+			all[i] = uint32(i)
 		}
 
 		return all
 	}
 
-	out := make([]int16, 0, height-last)
+	out := make([]uint32, 0, height-last)
 	for h := last + 1; h <= height; h++ {
-		out = append(out, int16(h%uint32(n)))
+		out = append(out, h%SpendJournalPartitionBlocks)
 	}
 
 	return out
@@ -252,7 +236,7 @@ func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint
 // Retention is unchanged by this. The work happens inside the 1,440 blocks a spend was already
 // going to stay undoable for, not after them.
 func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint32,
-	slices []int16, before func(context.Context, string, int16) error) (int, error) {
+	offsets []uint32, before func(context.Context, string, int64) error) (int, error) {
 	rows, err := s.pool.Query(ctx, journalLeafSQL)
 	if err != nil {
 		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
@@ -320,13 +304,8 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	// last 48 blocks of a 1,440 block wait.
 	//
 	// Partition L is therefore read at heights 48L through 48L+47, which is 48 consecutive
-	// heights and so covers every slice exactly once, and dropped at 48L+48.
-	lead := uint32(s.journalSlices)
-	if s.journalSlices <= 0 {
-		lead = SpendJournalSlices
-	}
-
-	workCutoff := (height + lead) / SpendJournalPartitionBlocks
+	// heights and so covers every one of its own heights exactly once, and dropped at 48L+48.
+	workCutoff := (height + SpendJournalPartitionBlocks) / SpendJournalPartitionBlocks
 	dropCutoff := height / SpendJournalPartitionBlocks
 
 	dropped := 0
@@ -352,25 +331,29 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 		due := l.leaf < dropCutoff
 
 		if before != nil {
-			// An overdue partition is read WHOLE, in one pass, which is the negative slice.
+			// An overdue partition is read WHOLE, in one pass, which is the negative height.
 			//
-			// It has no window left to spread across, so slicing it buys nothing, and each
-			// slice is a separate pass with its own decision queries. Slicing 48 ways takes
+			// It has no window left to spread across, so splitting it buys nothing, and each
+			// piece is a separate pass with its own decision queries. Splitting 48 ways takes
 			// the array those queries are given from about 20,000 transactions to about 400,
 			// and wide arrays are what this store is fastest at. Deployed the other way round
 			// on the mainnet box, retirement halved and a cycle that took 64 to 115 minutes
 			// had not finished after two hours.
-			todo := slices
-			if todo == nil {
-				todo = []int16{-1}
+			todo := []int64{-1}
+
+			if !due && offsets != nil {
+				// Offsets are positions within this partition's own 48 heights, so turn them
+				// into the absolute heights this partition actually holds.
+				base := int64(l.leaf) * SpendJournalPartitionBlocks
+
+				todo = make([]int64, 0, len(offsets))
+				for _, off := range offsets {
+					todo = append(todo, base+int64(off))
+				}
 			}
 
-			if due {
-				todo = []int16{-1}
-			}
-
-			for _, sl := range todo {
-				if err := before(ctx, l.name, sl); err != nil {
+			for _, at := range todo {
+				if err := before(ctx, l.name, at); err != nil {
 					return dropped, err
 				}
 			}

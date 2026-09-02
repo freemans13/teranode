@@ -69,12 +69,6 @@ type Store struct {
 	// spenders would judge it on half the evidence.
 	reclaimChunkParents int
 
-	// journalSlices is how many pruner runs cover one journal partition. Production uses
-	// SpendJournalSlices; tests that are about chunking or about the whole-partition verdict
-	// set it to 1, which makes the slice predicate match every row and restores the old
-	// read-it-all-at-once behaviour.
-	journalSlices int16
-
 	// lastPruneHeight is the height of the previous pruner run, so a run that follows skipped
 	// heights can cover their slices too. Zero means nothing is remembered yet, which a restart
 	// produces and which falls back to doing one slice.
@@ -184,7 +178,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		journalRetention:    DefaultSpendJournalRetentionBlocks,
 		bodyRetention:       DefaultTxBodyRetentionBlocks,
 		reclaimChunkParents: DefaultReclaimChunkParents,
-		journalSlices:       SpendJournalSlices}
+	}
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)
