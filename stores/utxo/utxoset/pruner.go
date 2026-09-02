@@ -84,11 +84,15 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 	// The body windows went FIRST, at the top of this method, not last. Their horizon is a
 	// different number, so gating them behind this loop left transaction bytes unreclaimed
 	// through all of early sync, which is when the disk is tightest.
-	var reclaimed, batches int
+	var reclaimed, batches, heightsRead, wholeReads int
 
-	offsets := p.store.heightOffsetsFor(height)
+	// The previous successful run's cutoff, and NOT advanced until this run succeeds. Advancing
+	// it first, as an earlier version did, meant a run that errored part way was never retried:
+	// the worker records the height as processed even on error, so nothing else would come back
+	// for it either.
+	prev := p.store.lastPruneCutoff.Load()
 
-	dropped, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff, offsets,
+	dropped, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff, prev,
 		func(ctx context.Context, partition string, atHeight int64) error {
 			n, b, rerr := p.store.reclaimFromPartition(ctx, partition, height, atHeight)
 			if rerr != nil {
@@ -98,18 +102,30 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 			reclaimed += n
 			batches += b
 
+			if atHeight < 0 {
+				wholeReads++
+			} else {
+				heightsRead++
+			}
+
 			return nil
 		})
 	if err != nil {
 		return 0, err
 	}
 
-	if dropped > 0 || reclaimed > 0 {
+	p.store.lastPruneCutoff.Store(cutoff)
+
+	if dropped > 0 || reclaimed > 0 || wholeReads > 0 {
 		// The batch count is here so a leaf's size is visible without instrumenting the
 		// store. Batches well above the leaf count mean leaves are running near the memory
 		// bound, which is the signal that reclaimChunkParents wants revisiting.
-		p.store.logger.Infof("[utxoset] pruner reclaimed %d transaction rows in %d batches across %d block height(s) and dropped %d spend-journal leaves below height %d",
-			reclaimed, batches, len(offsets), dropped, cutoff)
+		// wholeReads is the number worth watching. On the normal schedule it is zero, because
+		// every partition was read a height at a time before it came due. Anything above zero
+		// is a partition this process could not vouch for: a backlog, a restart, or a run
+		// that failed.
+		p.store.logger.Infof("[utxoset] pruner reclaimed %d transaction rows in %d batches, read %d block height(s) and %d whole partition(s), dropped %d spend-journal leaves below height %d",
+			reclaimed, batches, heightsRead, wholeReads, dropped, cutoff)
 	}
 
 	// Still zero records processed, and still exact. The caller adds this to a counter of

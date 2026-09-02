@@ -69,10 +69,12 @@ type Store struct {
 	// spenders would judge it on half the evidence.
 	reclaimChunkParents int
 
-	// lastPruneHeight is the height of the previous pruner run, so a run that follows skipped
-	// heights can cover their slices too. Zero means nothing is remembered yet, which a restart
-	// produces and which falls back to doing one slice.
-	lastPruneHeight atomic.Uint32
+	// lastPruneCutoff is the retention-adjusted height the previous SUCCESSFUL pruner run
+	// cleaned up to, so this run can read exactly the journal heights reached since. Zero means
+	// nothing is remembered, which a fresh process has, and which makes the next run read every
+	// in-window partition from its start and every due partition whole. It is advanced only
+	// after the run returns without error, so a failed run is redone rather than skipped.
+	lastPruneCutoff atomic.Uint32
 
 	// bodyWindow is the tx_body window the last create landed in, so the catalog is only
 	// touched when it changes.

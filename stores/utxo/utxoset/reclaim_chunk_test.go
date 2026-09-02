@@ -227,86 +227,219 @@ func TestOneHeightDoesNotDoTheWholePartition(t *testing.T) {
 	require.Less(t, n, 20, "one height must not reclaim every parent, or nothing is being spread")
 }
 
-// TestHeightOffsetsCoverHeightsThePrunerSkipped.
-//
-// The pruner deduplicates to the newest notification when it falls behind, so heights are
-// skipped. A skipped height is one of a partition's own heights that no run would ever read, and
-// a partition is dropped once its heights are due whether or not they were read, so a missed one
-// is identity rows nothing can find again. The previous height is remembered in memory purely to
-// close that gap, and losing it on a restart falls back to one height rather than to something
-// wrong.
-func TestHeightOffsetsCoverHeightsThePrunerSkipped(t *testing.T) {
-	s, _ := newTestStore(t)
-
-	require.Equal(t, []uint32{1000 % SpendJournalPartitionBlocks}, s.heightOffsetsFor(1000))
-	require.Equal(t, []uint32{1001 % SpendJournalPartitionBlocks}, s.heightOffsetsFor(1001))
-
-	require.Equal(t, []uint32{
-		1002 % SpendJournalPartitionBlocks, 1003 % SpendJournalPartitionBlocks,
-		1004 % SpendJournalPartitionBlocks, 1005 % SpendJournalPartitionBlocks,
-		1006 % SpendJournalPartitionBlocks,
-	}, s.heightOffsetsFor(1006), "every skipped height must still be read")
-
-	require.Len(t, s.heightOffsetsFor(1006+SpendJournalPartitionBlocks+5),
-		int(SpendJournalPartitionBlocks), "a gap of a whole partition means every height is due")
-
-	require.Len(t, s.heightOffsetsFor(5), 1, "a height going backwards must not produce a wrapped range")
+// recordReads is a `before` callback that records which heights were read from which partition.
+// A read of -1 is a whole-partition read.
+func recordReads(seen map[string][]int64) func(context.Context, string, int64) error {
+	return func(_ context.Context, partition string, at int64) error {
+		seen[partition] = append(seen[partition], at)
+		return nil
+	}
 }
 
-// TestOverduePartitionIsReadWholeBeforeItIsDropped is the backlog case, and it is the one
-// that turns spreading the work into a row leak if it is got wrong.
+// TestNormalScheduleReadsEachHeightOnceAndNeverTheWholePartition drives one partition through its
+// entire work window, one run per height, and then through the run where it becomes due.
 //
-// Spreading only works on the normal schedule, where a partition is read across the heights
-// leading up to its due date. A partition that is ALREADY past its due date has no window left.
-// Handing it one slice and then dropping it would destroy the work list with forty-seven
-// forty-eighths of it unread, and the identity rows those slices would have reclaimed could
-// never be found again, because the partition naming them is gone.
+// This is the test that caught the bug the verifiers found. An earlier version defaulted every
+// due partition to a whole read, so a partition on the normal schedule was read 48 times a
+// height at a time and then a 49th time in full before it was dropped. Spreading the work then
+// cost more than not spreading it, and the peak run it was meant to remove was unchanged.
+func TestNormalScheduleReadsEachHeightOnceAndNeverTheWholePartition(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2: heights 96..143
+
+	seen := map[string][]int64{}
+
+	// The 48 runs whose cutoff lies inside leaf 2, each knowing the previous cutoff.
+	for cutoff := uint32(96); cutoff <= 143; cutoff++ {
+		dropped, err := s.dropSpendJournalPartitionsBelow(ctx, cutoff, cutoff-1, recordReads(seen))
+		require.NoError(t, err)
+		require.Zero(t, dropped, "leaf 2 is inside its work window at cutoff %d", cutoff)
+	}
+
+	counts := map[int64]int{}
+	for _, at := range seen["spend_journal_2"] {
+		counts[at]++
+	}
+
+	for h := int64(96); h <= 143; h++ {
+		require.Equal(t, 1, counts[h], "height %d must be read exactly once during the window", h)
+	}
+
+	require.Zero(t, counts[-1], "no whole read inside the window")
+
+	// The run where leaf 2 becomes due.
+	dropped, err := s.dropSpendJournalPartitionsBelow(ctx, 144, 143, recordReads(seen))
+	require.NoError(t, err)
+	require.Equal(t, 1, dropped, "leaf 2 must be dropped on time")
+
+	counts = map[int64]int{}
+	for _, at := range seen["spend_journal_2"] {
+		counts[at]++
+	}
+
+	require.Zero(t, counts[-1],
+		"a leaf whose 48 heights were all read on the preceding 48 runs must not be read whole again before it is dropped")
+	require.Len(t, seen["spend_journal_2"], 48, "exactly 48 reads in total, one per height, and nothing on the drop run")
+}
+
+// TestPartitionIsWorkedBeforeItIsDueAndDroppedOnTime pins the schedule, and the point is the
+// SECOND half.
 //
-// This is not a hypothetical: the mainnet box is two thousand partitions behind, so every one
-// of them is overdue.
+// The work is spread across the 48 heights LEADING UP TO a partition's due date, not the ones
+// after it. Doing it after would mean holding every partition an extra 48 blocks beyond
+// DefaultSpendJournalRetentionBlocks purely to have somewhere to put the work. So a partition
+// must be readable before it is droppable, and must be dropped at exactly the height it would
+// have been dropped at before any of this. This test was deleted by mistake in an earlier
+// rewrite, which is how the whole-read-on-due bug got through.
+func TestPartitionIsWorkedBeforeItIsDueAndDroppedOnTime(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2: heights 96..143
+
+	seen := map[string][]int64{}
+
+	// Just before the window: nothing read, nothing dropped.
+	dropped, err := s.dropSpendJournalPartitionsBelow(ctx, 95, 94, recordReads(seen))
+	require.NoError(t, err)
+	require.Zero(t, dropped)
+	require.Empty(t, seen, "a partition must not be read before its work window opens")
+
+	// First height of the window: read, not dropped.
+	dropped, err = s.dropSpendJournalPartitionsBelow(ctx, 96, 95, recordReads(seen))
+	require.NoError(t, err)
+	require.Zero(t, dropped, "the work window must not drop the work list out from under itself")
+	require.Equal(t, []int64{96}, seen["spend_journal_2"])
+
+	// Last height of the window: read, still not dropped.
+	dropped, err = s.dropSpendJournalPartitionsBelow(ctx, 143, 142, recordReads(seen))
+	require.NoError(t, err)
+	require.Zero(t, dropped)
+	require.Equal(t, []int64{96, 143}, seen["spend_journal_2"])
+
+	// Due: dropped, at exactly the height the single-cutoff code dropped it, with no read.
+	dropped, err = s.dropSpendJournalPartitionsBelow(ctx, 144, 143, recordReads(seen))
+	require.NoError(t, err)
+	require.Equal(t, 1, dropped, "retention must be unchanged: due means dropped, not deferred")
+	require.Equal(t, []int64{96, 143}, seen["spend_journal_2"], "and the drop run reads nothing")
+}
+
+// TestSkippedHeightsAcrossAPartitionBoundaryGoToTheRightPartition.
+//
+// The pruner deduplicates to the newest notification when it falls behind, so a run can follow
+// several skipped heights. Offsets computed as "tip mod 48" were blind to which partition they
+// belonged to, so a gap straddling a boundary rebased the older partition's tail heights onto the
+// newer one: the newer partition was read early at the wrong heights, and the older one's tail
+// was never read at all. Absolute heights cannot do that, because each partition takes only the
+// heights inside its own range.
+func TestSkippedHeightsAcrossAPartitionBoundaryGoToTheRightPartition(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2: 96..143
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 150)) // leaf 3: 144..191
+
+	seen := map[string][]int64{}
+
+	// Previous run cleaned up to 141. This run cleans up to 150. The nine heights in between
+	// straddle the boundary between leaf 2 and leaf 3.
+	dropped, err := s.dropSpendJournalPartitionsBelow(ctx, 150, 141, recordReads(seen))
+	require.NoError(t, err)
+
+	require.Equal(t, []int64{142, 143}, seen["spend_journal_2"],
+		"leaf 2 gets only its own remaining heights")
+	require.Equal(t, []int64{144, 145, 146, 147, 148, 149, 150}, seen["spend_journal_3"],
+		"leaf 3 gets only its own heights, and nothing rebased from leaf 2")
+	require.Equal(t, 1, dropped, "leaf 2 became due inside this gap and its tail was read, so it goes")
+}
+
+// TestFreshProcessCannotVouchSoItReadsWhatItCannotAccountFor.
+//
+// After a restart nothing is remembered about earlier runs. A partition already due might have
+// had its window under the previous process, or might not, and there is no way to tell, so it
+// is read whole. A partition still in its window is read from its first height up to the
+// current cutoff, which may repeat reads the previous process did; a repeated read is harmless
+// and a skipped one is a permanent leak of identity rows.
+func TestFreshProcessCannotVouchSoItReadsWhatItCannotAccountFor(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 50))  // leaf 1: 48..95, will be due
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2: 96..143, in window
+
+	seen := map[string][]int64{}
+
+	// prevCutoff 0 means unknown. Cutoff 120: leaf 1 is due, leaf 2 is halfway through.
+	dropped, err := s.dropSpendJournalPartitionsBelow(ctx, 120, 0, recordReads(seen))
+	require.NoError(t, err)
+
+	require.Equal(t, []int64{-1}, seen["spend_journal_1"], "a due partition nobody can vouch for is read whole")
+	require.Equal(t, 1, dropped)
+
+	want := make([]int64, 0, 25)
+	for h := int64(96); h <= 120; h++ {
+		want = append(want, h)
+	}
+
+	require.Equal(t, want, seen["spend_journal_2"],
+		"an in-window partition is read from its first height up to the cutoff, and never whole")
+}
+
+// TestAFailedRunIsRedoneNotSkipped.
+//
+// The pruner worker records a height as processed even when Prune returns an error, so nothing
+// upstream comes back for it. The store therefore must not advance its own memory of the
+// previous cutoff until the run has succeeded, or the heights of a failed run are never read.
+func TestAFailedRunIsRedoneNotSkipped(t *testing.T) {
+	s, ctx := newTestStore(t)
+	s.journalRetention = 96
+
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2: 96..143
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	// A successful run at tip 192, cutoff 96, reads height 96 and remembers cutoff 96.
+	_, err = svc.Prune(ctx, 192, "x")
+	require.NoError(t, err)
+	require.Equal(t, uint32(96), s.lastPruneCutoff.Load())
+
+	// A run that fails part way. A cancelled context makes the first database call fail, which
+	// is the shape of a real failure: some work may have happened, the call returned an error.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, err = svc.Prune(cancelled, 193, "x")
+	require.Error(t, err, "the run must fail loudly rather than pretend")
+	require.Equal(t, uint32(96), s.lastPruneCutoff.Load(),
+		"a failed run must not advance the remembered cutoff, or its heights are never read")
+
+	// The next good run at the same height must do height 97, not skip past it.
+	seen := map[string][]int64{}
+	_, err = s.dropSpendJournalPartitionsBelow(ctx, 97, s.lastPruneCutoff.Load(), recordReads(seen))
+	require.NoError(t, err)
+	require.Equal(t, []int64{97}, seen["spend_journal_2"],
+		"the height the failed run was meant to read must be read by the run that follows it")
+}
+
+// TestOverduePartitionIsReadWholeBeforeItIsDropped is the backlog case, and it is the one that
+// turns spreading the work into a row leak if it is got wrong.
+//
+// A partition that was already past its due date at the previous run has no window left, and
+// this process cannot vouch for whatever happened before. Handing it one height and then dropping
+// it would destroy the work list with most of it unread, and the identity rows those heights would
+// have reclaimed could never be found again. This is not hypothetical: the mainnet box was two
+// thousand partitions behind, so every one of them was overdue.
 func TestOverduePartitionIsReadWholeBeforeItIsDropped(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2: 96..143
 
-	seen := make(map[int64]int)
+	seen := map[string][]int64{}
 
-	// A height far past this partition's due date, which is what a backlog looks like, and an
-	// offsets argument naming one height, which is what a normal run passes.
-	dropped, err := s.dropSpendJournalPartitionsBelow(ctx, 100_000, []uint32{7},
-		func(_ context.Context, _ string, at int64) error {
-			seen[at]++
-			return nil
-		})
+	// Both cutoffs far past leaf 2, so it was already due last run and is still here.
+	dropped, err := s.dropSpendJournalPartitionsBelow(ctx, 100_000, 99_999, recordReads(seen))
 	require.NoError(t, err)
 
 	require.Equal(t, 1, dropped, "an overdue partition must still be dropped")
-	require.Equal(t, map[int64]int{-1: 1}, seen,
-		"an overdue partition must be read WHOLE in one pass, not sliced: it has no window left to "+
-			"spread across, and 48 passes shrink the array the decision queries get from 20,000 to 400")
-}
-
-// TestPartitionInsideItsWindowGetsOnlyThisRunsHeight is the other half of the pair above.
-//
-// If an overdue partition takes all its slices, the obvious mistake is to give every partition
-// all its slices, which puts the work straight back into one run and undoes the change.
-func TestPartitionInsideItsWindowGetsOnlyThisRunsHeight(t *testing.T) {
-	s, ctx := newTestStore(t)
-
-	require.NoError(t, s.ensureSpendJournalPartition(ctx, 100)) // leaf 2
-
-	seen := make(map[int64]int)
-
-	// Inside leaf 2's work window: read, not yet due.
-	dropped, err := s.dropSpendJournalPartitionsBelow(ctx, 2*SpendJournalPartitionBlocks,
-		[]uint32{7}, func(_ context.Context, _ string, at int64) error {
-			seen[at]++
-			return nil
-		})
-	require.NoError(t, err)
-
-	require.Zero(t, dropped, "a partition inside its work window is not due yet")
-	require.Equal(t, map[int64]int{2*SpendJournalPartitionBlocks + 7: 1}, seen,
-		"a partition on the normal schedule reads one of its own heights a run, and offset 7 of "+
-			"leaf 2 is absolute height 103")
+	require.Equal(t, []int64{-1}, seen["spend_journal_2"],
+		"an overdue partition must be read WHOLE in one pass, not a height at a time")
 }
