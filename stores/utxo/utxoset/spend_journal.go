@@ -352,17 +352,21 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 		due := l.leaf < dropCutoff
 
 		if before != nil {
+			// An overdue partition is read WHOLE, in one pass, which is the negative slice.
+			//
+			// It has no window left to spread across, so slicing it buys nothing, and each
+			// slice is a separate pass with its own decision queries. Slicing 48 ways takes
+			// the array those queries are given from about 20,000 transactions to about 400,
+			// and wide arrays are what this store is fastest at. Deployed the other way round
+			// on the mainnet box, retirement halved and a cycle that took 64 to 115 minutes
+			// had not finished after two hours.
 			todo := slices
-			if todo == nil || due {
-				n := s.journalSlices
-				if n <= 0 {
-					n = SpendJournalSlices
-				}
+			if todo == nil {
+				todo = []int16{-1}
+			}
 
-				todo = make([]int16, n)
-				for i := range todo {
-					todo[i] = int16(i)
-				}
+			if due {
+				todo = []int16{-1}
 			}
 
 			for _, sl := range todo {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5"
 )
 
 // SettledDepthBlocks is how deep a transaction's block must be before the store treats it as
@@ -156,6 +157,21 @@ func (s *Store) settled(ctx context.Context, txids [][]byte, tip uint32) (map[st
 const candidatesSQL = `SELECT DISTINCT txid, spending_txid FROM %[1]s
  WHERE mod(get_byte(txid, 31), %[2]d) = $1 ORDER BY txid`
 
+// candidatesAllSQL reads a whole partition, with no slice predicate, and it is what a partition
+// that is ALREADY past its due date gets.
+//
+// Slicing an overdue partition buys nothing, because there is no window left to spread across,
+// and it costs a great deal. Each slice is a separate pass with its own settled, live-coin and
+// main-chain queries, so slicing 48 ways takes the array those queries are given from about
+// 20,000 transactions down to about 400. Wide arrays are what this store is fastest at, measured
+// elsewhere in this package at 19x on the same shape, so 48 narrow passes lose far more on round
+// trips and per-statement work than the smaller sort saves.
+//
+// Measured on the mainnet box: with every partition overdue, retirement fell from 1.16-1.4
+// partitions a minute to 0.59, and a cleanup cycle that used to take 64 to 115 minutes had not
+// finished after two hours.
+const candidatesAllSQL = `SELECT DISTINCT txid, spending_txid FROM %s ORDER BY txid`
+
 // hasLiveCoinSQL asks whether any of a transaction's outputs is still unspent. A parent with
 // a live coin is needed by whoever eventually spends it, however settled its other spends are.
 //
@@ -222,6 +238,9 @@ DELETE FROM tx_ident i
  USING unnest($1::bytea[]) AS k(txid)
  WHERE i.leaf = (get_byte(k.txid, 0) & 7)::smallint AND i.txid = k.txid`
 
+// A negative slice means no slice predicate at all: read the whole partition. That is what an
+// overdue partition gets, because it has no window left to spread the work across.
+//
 // reclaimFromPartition uses one retiring journal partition as a work list and deletes the
 // identity rows that are genuinely finished.
 //
@@ -248,7 +267,17 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 		n = SpendJournalSlices
 	}
 
-	rows, err := s.pool.Query(ctx, fmt.Sprintf(candidatesSQL, partition, n), slice)
+	var (
+		rows pgx.Rows
+		err  error
+	)
+
+	if slice < 0 {
+		rows, err = s.pool.Query(ctx, fmt.Sprintf(candidatesAllSQL, partition))
+	} else {
+		rows, err = s.pool.Query(ctx, fmt.Sprintf(candidatesSQL, partition, n), slice)
+	}
+
 	if err != nil {
 		return 0, 0, errors.NewStorageError("[utxoset][reclaim] candidates from %s slice %d", partition, slice, err)
 	}

@@ -382,8 +382,9 @@ func TestOverduePartitionGetsEverySliceBeforeItIsDropped(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 1, dropped, "an overdue partition must still be dropped")
-	require.Len(t, seen, int(SpendJournalSlices),
-		"every slice must be read before an overdue partition goes, not just the one this run was due to do")
+	require.Equal(t, map[int16]int{-1: 1}, seen,
+		"an overdue partition must be read WHOLE in one pass, not sliced: it has no window left to "+
+			"spread across, and 48 passes shrink the array the decision queries get from 20,000 to 400")
 }
 
 // TestPartitionInsideItsWindowGetsOnlyThisRunsSlice is the other half of the pair above.
