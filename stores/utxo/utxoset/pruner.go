@@ -112,6 +112,19 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 			reclaimed, batches, len(slices), dropped, cutoff)
 	}
 
+	// The coin-index rebuild goes LAST, and the ordering is a priority decision rather than a
+	// safety one. The journal reclaim above is behind: measured on mainnet it deletes 3,185
+	// identity rows a block against 6,411 created, so every session it is skipped the backlog
+	// grows. Rebuilding an index is opportunistic by comparison, recovering space that is
+	// already wasted and will still be wasted next block. So reclaim takes the session first
+	// and the rebuild gets what is left.
+	//
+	// A failure here is returned rather than swallowed, but it does not undo the reclaim
+	// above: that work is already committed, and this step touches a different table.
+	if _, err = p.store.rebuildBloatedCoinIndex(ctx); err != nil {
+		return 0, err
+	}
+
 	// Still zero records processed, and still exact. The caller adds this to a counter of
 	// child transaction records deleted by a delete-at-height sweep, which this store does
 	// not have. Reporting identity rows or body windows there would put three units in one

@@ -69,6 +69,16 @@ type Store struct {
 	// spenders would judge it on half the evidence.
 	reclaimChunkParents int
 
+	// coinIndexRebuildBytesPerRow is when a coin index is bloated enough to rebuild, in index
+	// bytes per live row. Zero takes DefaultCoinIndexRebuildBytesPerRow. NEGATIVE disables the
+	// rebuild entirely, which is the switch for an operator who would rather handle index
+	// maintenance themselves than have the node take locks on their database.
+	coinIndexRebuildBytesPerRow int
+
+	// coinIndexMinRows is how many live rows a coin partition needs before its bloat ratio is
+	// trusted. Zero takes DefaultCoinIndexMinRows.
+	coinIndexMinRows int
+
 	// journalSlices is how many pruner runs cover one journal partition. Production uses
 	// SpendJournalSlices; tests that are about chunking or about the whole-partition verdict
 	// set it to 1, which makes the slice predicate match every row and restores the old
@@ -181,10 +191,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
-		journalRetention:    DefaultSpendJournalRetentionBlocks,
-		bodyRetention:       DefaultTxBodyRetentionBlocks,
-		reclaimChunkParents: DefaultReclaimChunkParents,
-		journalSlices:       SpendJournalSlices}
+		journalRetention:            DefaultSpendJournalRetentionBlocks,
+		bodyRetention:               DefaultTxBodyRetentionBlocks,
+		reclaimChunkParents:         DefaultReclaimChunkParents,
+		coinIndexRebuildBytesPerRow: DefaultCoinIndexRebuildBytesPerRow,
+		coinIndexMinRows:            DefaultCoinIndexMinRows,
+		journalSlices:               SpendJournalSlices}
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)
