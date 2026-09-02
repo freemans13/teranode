@@ -48,6 +48,19 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // authorise), the frozen and conflicting flag masks, and the maturity test. classifySQL
 // deliberately omits the last three, so an excluded row surfaces as frozen or immature
 // rather than as spent.
+//
+// The flag test is written (flags & 5) < 1 and not (flags & 1) = 0 AND (flags & 4) = 0,
+// which it is equal to for every value a smallint can hold, because the planner can estimate
+// one and not the other. It has no statistics for a bit-mask expression, so an equality on
+// one is given the default selectivity of one row in two hundred, and two of them one in
+// forty thousand. That told the planner almost no coin survives the test, and with a batch
+// of keys on the other side it chose to walk the whole coin table once PER KEY, since a
+// table of one row is cheap to walk. Measured on a 40,000-row table: a 64-key batch took
+// 3 ms until the table crossed the size where that plan won, then 45 ms, and with
+// materialisation disabled 180 ms. An inequality on an expression without statistics is
+// given one third, which is wrong by three rather than by forty thousand, and it is enough
+// for the planner to reach for the index or hash the batch instead. The single-key form of
+// this statement never showed the problem, because with one key a walk per key is one walk.
 const spendJournalSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[],
@@ -59,8 +72,7 @@ del AS (
      WHERE u.leaf           = k.leaf
        AND u.ukey           = k.ukey
        AND u.txid           = k.txid
-       AND (u.flags & 1)    = 0
-       AND (u.flags & 4)    = 0
+       AND (u.flags & 5)    < 1
        AND u.spendable_from <= k.spent_height
     RETURNING k.vin, k.spent_height, k.spending_txid, u.satoshis, u.created_height,
               u.spendable_from, u.flags, u.ukey, u.txid, u.script, u.hash_override

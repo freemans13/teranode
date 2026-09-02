@@ -51,6 +51,46 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		return nil, nil, errors.NewInvalidArgumentError("[utxoset][SpendAndCreate] WithCreateOnly and WithSpendOnly are mutually exclusive")
 	}
 
+	// Batched when configured, which is the production path: see spend_and_create_batch.go.
+	// Callers arriving together share one transaction, one spend statement and one create
+	// statement, and each still gets the answer this function alone would have given it.
+	//
+	// The conflicting case takes the single path. It writes to the PARENTS of the incoming
+	// transaction rather than only to the transaction itself, so two items in one batch can
+	// touch the same row, which is exactly the overlap the batched path assumes away. A store
+	// that is closing takes it too, so the answer is the pool's closed error and not a panic on
+	// the batcher's closed channel.
+	if s.spendAndCreateBatcher != nil && !options.Conflicting && !s.closed.Load() {
+		// A caller that has already given up gets its answer before anything is queued.
+		// Once queued the item is applied whether or not anyone is waiting.
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+
+		item := newSpendAndCreateItem(tx, blockHeight, options, opts)
+
+		s.spendAndCreateBatcher.PutCtx(ctx, item)
+
+		// Waited for unconditionally, and that is deliberate. The batch runs under its own
+		// context and is bounded by the database exactly as the single path's COMMIT is, so
+		// the wait is bounded too. Returning the caller's context error instead would tell it
+		// "not applied" about a transaction that is about to be applied, and the validator
+		// acts on that: it would neither hand the transaction to block assembly nor accept a
+		// resubmission, which meets ErrTxExists. The only truthful answer is the batch's.
+		res := <-item.done
+
+		return res.data, res.spends, res.err
+	}
+
+	return s.spendAndCreateOne(ctx, tx, blockHeight, options, opts...)
+}
+
+// spendAndCreateOne is SpendAndCreate for one transaction in its own database transaction.
+//
+// It is the reference semantics: the batched path's contract is to give every caller the
+// answer this would, and it hands an item here whenever it cannot settle that inside the batch.
+func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight uint32,
+	options *utxo.CreateOptions, opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
 	// BEFORE the transaction is opened, never inside it. See
 	// ensureSpendJournalPartition: the DDL needs its own pool connection, and taking one
 	// while holding a transaction from the same pool deadlocks the pool under

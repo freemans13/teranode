@@ -1,7 +1,9 @@
 package utxoset
 
 import (
+	"bytes"
 	"context"
+	"sort"
 	"time"
 
 	"github.com/bsv-blockchain/go-batcher/v2"
@@ -181,7 +183,52 @@ func (s *Store) planCreates(items []*createItem) *createPlan {
 		p.perItem[i] = data
 	}
 
+	p.sortRows()
+
 	return p
+}
+
+// sortRows puts the identity rows in one global order, by leaf and txid, for the same reason
+// spendPlan.sortRows does: two batches claiming the same transactions in opposite orders would
+// wait on each other's speculative inserts and deadlock, and in one order they cannot. The coin
+// rows are left as built; nothing about them is unique, so nothing about them can wait.
+func (p *createPlan) sortRows() {
+	n := len(p.owner)
+	if n < 2 {
+		return
+	}
+
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+
+	sort.SliceStable(order, func(a, b int) bool {
+		x, y := order[a], order[b]
+		if p.leaves[x] != p.leaves[y] {
+			return p.leaves[x] < p.leaves[y]
+		}
+
+		return bytes.Compare(p.txids[x], p.txids[y]) < 0
+	})
+
+	p.leaves = permute(p.leaves, order)
+	p.txids = permute(p.txids, order)
+	p.heights = permute(p.heights, order)
+	p.offChain = permute(p.offChain, order)
+	p.membership = permute(p.membership, order)
+	p.sizes = permute(p.sizes, order)
+	p.inpoints = permute(p.inpoints, order)
+	p.locktimes = permute(p.locktimes, order)
+	p.createdAt = permute(p.createdAt, order)
+	p.txFlags = permute(p.txFlags, order)
+	p.bodies = permute(p.bodies, order)
+	p.owner = permute(p.owner, order)
+	p.txs = permute(p.txs, order)
+
+	for k := range p.idx {
+		p.idx[k] = int32(k) //nolint:gosec // bounded by batch size
+	}
 }
 
 // runCreatePlan issues the statement and tells each caller whether its own claim took.

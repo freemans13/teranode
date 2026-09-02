@@ -110,6 +110,16 @@ type Store struct {
 	// the next test had already dropped and recreated.
 	createInFlight sync.WaitGroup
 
+	// spendAndCreateBatcher collects SpendAndCreate calls, which is every production write,
+	// and applies each batch in one database transaction. See spend_and_create_batch.go.
+	// nil when the configured size is 1 or less.
+	spendAndCreateBatcher  *batcher.Batcher[spendAndCreateItem]
+	spendAndCreateInFlight sync.WaitGroup
+
+	// closed is set at the top of Close, so a SpendAndCreate arriving after it takes the
+	// single path and gets the pool's error rather than a send on the batcher's closed channel.
+	closed atomic.Bool
+
 	// getBatcher funnels single reads into one BatchDecorate call. Reads take no locks, so
 	// batches may run concurrently.
 	getBatcher  *batcher.Batcher[getItem]
@@ -166,6 +176,30 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// USERSET setting, which is what makes that legal.
 	cfg.ConnConfig.RuntimeParams["jit"] = "off"
 
+	// Every statement is planned with its actual parameter values, every time. Never from a
+	// generic plan.
+	//
+	// pgx prepares each statement once per connection and PostgreSQL, after the fifth
+	// execution, switches a prepared statement to a generic plan if that plan's estimated cost
+	// is no worse than the custom plans were. For this store's statements the estimate is
+	// wrong in both places that matter. The batch arrives as arrays and is unpacked with
+	// unnest, so a generic plan has no idea whether it is joining one key or five hundred. And
+	// the eligibility tests on the coin row are bit masks on flags, which the planner cannot
+	// estimate at all and costs as if almost no row survives them. Put together, the generic
+	// plan can decide the coin table is a handful of rows worth rescanning per key.
+	//
+	// Measured on a 40,000-row coin table with the 500-key spend statement: executions one to
+	// five took 8 ms each and the sixth took 1,070 ms, as did every one after it. That is the
+	// generic plan taking over, and it turns a batch that should be linear in its width into
+	// one that is quadratic. The single-key statement never showed it because with one key a
+	// rescan is one scan.
+	//
+	// The custom plan costs about 0.2 ms of planning per execution, which a batch of hundreds
+	// does not notice. This rides on the pool for the same reason jit does: the setting is
+	// USERSET, travels in the startup packet, and does not touch the blockchain store sharing
+	// the instance.
+	cfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_custom_plan"
+
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, errors.NewStorageError("[utxoset] open pool", err)
@@ -195,6 +229,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if size := tSettings.UtxoStore.StoreBatcherSize; size > 1 {
 		d := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
 		s.createBatcher = newCreateBatcher(s, size, d)
+
+		// The production write path. Same width and window as the create batcher, because
+		// they carry the same statement; concurrency from the bound every other store's
+		// batchers share.
+		s.spendAndCreateBatcher = newSpendAndCreateBatcher(s, size, d, tSettings.BatcherBackground,
+			tSettings.UtxoStore.BatcherMaxConcurrent)
 	}
 
 	if size := tSettings.UtxoStore.GetBatcherSize; size > 1 {
@@ -232,6 +272,8 @@ func (s *Store) SetBlockHeight(height uint32) error {
 func (s *Store) PoolMaxConns() int { return int(s.pool.Config().MaxConns) }
 
 func (s *Store) Close(_ context.Context) error {
+	s.closed.Store(true)
+
 	// Stop the batcher BEFORE the pool, and stop it at all.
 	//
 	// Without this the batcher's goroutine outlives the store: a batch still queued when
@@ -243,6 +285,11 @@ func (s *Store) Close(_ context.Context) error {
 	if s.createBatcher != nil {
 		s.createBatcher.Close() // every queued item has now been handed to the callback
 		s.createInFlight.Wait() // and now every callback has actually finished
+	}
+
+	if s.spendAndCreateBatcher != nil {
+		s.spendAndCreateBatcher.Close()
+		s.spendAndCreateInFlight.Wait()
 	}
 
 	s.pool.Close()

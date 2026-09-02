@@ -20,6 +20,14 @@ import (
 func newTestStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
 
+	return newTestStoreWith(t, nil)
+}
+
+// newTestStoreWith is newTestStore with the settings adjusted by tune before the store is
+// opened, for tests that need a particular batcher shape.
+func newTestStoreWith(t *testing.T, tune func(*settings.Settings)) (*Store, context.Context) {
+	t.Helper()
+
 	ctx := context.Background()
 	dsn := testDSN(t)
 
@@ -67,6 +75,9 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 	require.NoError(t, err)
 
 	tSettings := settings.NewSettings()
+	if tune != nil {
+		tune(tSettings)
+	}
 
 	s, err := New(ctx, ulogger.TestLogger{}, tSettings, u)
 	require.NoError(t, err)

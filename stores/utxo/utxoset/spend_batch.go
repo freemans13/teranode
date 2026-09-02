@@ -3,6 +3,7 @@ package utxoset
 import (
 	"bytes"
 	"context"
+	"sort"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -122,7 +123,65 @@ func planSpends(items []*spendItem) *spendPlan {
 		p.perItem[i] = spends
 	}
 
+	p.sortRows()
+
 	return p
+}
+
+// sortRows puts the plan's rows in one global order, by leaf, coin key and txid, so every
+// statement built from a plan asks for its rows in the same order as every other.
+//
+// Two batches that spend overlapping coins take their row locks in statement order. In array
+// order that is submission order, which a submitter controls, so two batches carrying the same
+// pair of coins the other way round would deadlock and both be redone as singles after the
+// deadlock timeout. In one global order there is no cycle to form. It costs a sort of the
+// batch and nothing else: k is reassigned after the sort, so the RETURNING mapping is exact,
+// and the sort is stable, so of two rows for one coin the earlier item still comes first.
+func (p *spendPlan) sortRows() {
+	n := len(p.owner)
+	if n < 2 {
+		return
+	}
+
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+
+	sort.SliceStable(order, func(a, b int) bool {
+		x, y := order[a], order[b]
+		if p.leaves[x] != p.leaves[y] {
+			return p.leaves[x] < p.leaves[y]
+		}
+
+		if c := bytes.Compare(p.ukeys[x][:], p.ukeys[y][:]); c != 0 {
+			return c < 0
+		}
+
+		return bytes.Compare(p.txids[x], p.txids[y]) < 0
+	})
+
+	p.leaves = permute(p.leaves, order)
+	p.ukeys = permute(p.ukeys, order)
+	p.txids = permute(p.txids, order)
+	p.heights = permute(p.heights, order)
+	p.spenders = permute(p.spenders, order)
+	p.owner = permute(p.owner, order)
+	p.ownerVin = permute(p.ownerVin, order)
+
+	for k := range p.idx {
+		p.idx[k] = int32(k) //nolint:gosec // bounded by batch size
+	}
+}
+
+// permute returns xs reordered so that the result's i-th element is xs[order[i]].
+func permute[T any](xs []T, order []int) []T {
+	out := make([]T, len(xs))
+	for i, from := range order {
+		out[i] = xs[from]
+	}
+
+	return out
 }
 
 // claimMismatch compares what a spending transaction CLAIMED about the coin against what the
@@ -280,6 +339,15 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 			// inside its delay. NOT a double spend, and reporting it as one would be wrong.
 			sp.Err = errors.NewProcessingError("[utxoset] utxo not spendable until height %d (current %d)",
 				spendableFrom, p.heights[k])
+		default:
+			// Present, eligible, and yet not deleted. The DELETE and this lookup run under
+			// different snapshots, so the only way here is a row that appeared between them:
+			// a create or an unspend that committed a moment ago. Leaving the record without
+			// an error would report the input as spent while its coin sits live in the table,
+			// and the caller would go on to store a child whose parent coin nobody consumed.
+			// A storage error is what callers retry on, and a retry finds the coin.
+			sp.Err = errors.NewStorageError("[utxoset] utxo %s:%d appeared after the spend's snapshot, retry",
+				sp.TxID, sp.Vout)
 		}
 	}
 
