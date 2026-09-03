@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/jackc/pgx/v5"
 )
 
 // SettledDepthBlocks is how deep a transaction's block must be before the store treats it as
@@ -132,27 +131,7 @@ func (s *Store) settled(ctx context.Context, txids [][]byte, tip uint32) (map[st
 // batches and may only cut between parents, so every row for one parent has to arrive
 // together. DISTINCT already forces a sort or hash aggregate over the whole partition, so
 // asking for the order costs close to nothing on top.
-//
-// The slice predicate is what lets one pruner run do a fraction of a partition instead of all
-// of it. A partition covers 48 block heights, so one run does one of those heights, and over the
-// 48 runs leading up to the partition's due date every height is done exactly once. The block
-// height being cleaned says which one, so nothing has to be written down.
-//
-// spent_height is not indexed on a journal partition, so this is a sequential read. That is
-// fine and it is not the cost: reading a whole partition takes about 28 ms, while the DISTINCT
-// over 182,000 rows spills 13 MB to disk and takes tens of seconds. One height's worth is a few
-// thousand rows and sorts in memory.
-// One limitation, stated because it is real rather than because it blocks this. A parent whose
-// outputs were taken in DIFFERENT blocks of the same partition is seen by more than one height,
-// and each of those runs judges it on the spenders it can see. Measured at 16.2% of parents on a
-// real mainnet partition. That is the same shape as the store's existing known gap, where a
-// parent is judged from one partition while a later attached partition holds the spend that took
-// its last coin, and it wants the same fix: a guard that asks whether any undo record for that
-// parent survives anywhere. It is not made better here and it is worth sizing on its own.
-const candidatesSQL = `SELECT DISTINCT txid, spending_txid FROM %s
- WHERE spent_height = $1 ORDER BY txid`
-
-const candidatesAllSQL = `SELECT DISTINCT txid, spending_txid FROM %s ORDER BY txid`
+const candidatesSQL = `SELECT DISTINCT txid, spending_txid FROM %s ORDER BY txid`
 
 // hasLiveCoinSQL asks whether any of a transaction's outputs is still unspent. A parent with
 // a live coin is needed by whoever eventually spends it, however settled its other spends are.
@@ -220,9 +199,6 @@ DELETE FROM tx_ident i
  USING unnest($1::bytea[]) AS k(txid)
  WHERE i.leaf = (get_byte(k.txid, 0) & 7)::smallint AND i.txid = k.txid`
 
-// A negative atHeight means no height predicate at all: read the whole partition. That is what
-// an overdue partition gets, because it has no window left to spread the work across.
-//
 // reclaimFromPartition uses one retiring journal partition as a work list and deletes the
 // identity rows that are genuinely finished.
 //
@@ -238,25 +214,15 @@ DELETE FROM tx_ident i
 // that partition retires, every earlier spend of it sits in a partition that already retired.
 // So a rejected candidate comes back on its own, at exactly the right moment, with no state
 // carried between sessions.
-func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip uint32, atHeight int64) (int, int, error) {
+func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip uint32) (int, int, error) {
 	limit := s.reclaimChunkParents
 	if limit <= 0 {
 		limit = DefaultReclaimChunkParents
 	}
 
-	var (
-		rows pgx.Rows
-		err  error
-	)
-
-	if atHeight < 0 {
-		rows, err = s.pool.Query(ctx, fmt.Sprintf(candidatesAllSQL, partition))
-	} else {
-		rows, err = s.pool.Query(ctx, fmt.Sprintf(candidatesSQL, partition), atHeight)
-	}
-
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(candidatesSQL, partition))
 	if err != nil {
-		return 0, 0, errors.NewStorageError("[utxoset][reclaim] candidates from %s at height %d", partition, atHeight, err)
+		return 0, 0, errors.NewStorageError("[utxoset][reclaim] candidates from %s", partition, err)
 	}
 
 	var (

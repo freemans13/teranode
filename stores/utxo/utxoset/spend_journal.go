@@ -193,7 +193,7 @@ SELECT c.relname,
 // of which transactions had an output spent in that window, which is precisely the work
 // list a later session step reads to decide what is now fully spent.
 func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint32) (int, error) {
-	return s.dropSpendJournalPartitionsBelow(ctx, height, 0, nil)
+	return s.dropSpendJournalPartitionsBelow(ctx, height, nil)
 }
 
 // dropSpendJournalPartitionsBelow reclaims journal leaves below height, calling before on each
@@ -202,25 +202,8 @@ func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint
 // The callback is where the pruner reads the retiring partition as its work list. The ordering
 // is not a preference: dropping the partition destroys the record of which transactions had an
 // output spent in that window, which is the only place that fact is written down.
-// A partition is read one block height per run across the 48 runs leading up to its due date,
-// and dropped on the run it becomes due. Which heights this run reads is derived from two numbers
-// and nothing else: cutoff, the retention-adjusted height this run is cleaning up to, and
-// prevCutoff, the same number from the previous successful run. The heights newly reached are
-// (prevCutoff, cutoff], and each partition takes the ones that fall inside its own 48.
-//
-// That single rule replaces three things that were separately wrong. Offsets computed as
-// "tip mod 48" were blind to which partition they belonged to, so a run following skipped
-// heights that straddled a partition boundary rebased the older partition's heights onto the
-// newer one. A partition on the normal schedule was read WHOLE on the run it became due, on top
-// of the 48 per-height reads it had already had, so spreading cost more than not spreading. And
-// the previous height was advanced before the work, so a run that errored was never retried.
-//
-// prevCutoff of zero means "unknown", which is what a fresh process has. Then a partition still
-// in its window is read from its first height up to cutoff, and a partition already due is read
-// whole, because this process cannot vouch for what an earlier one did. The exported wrapper
-// passes zero for the same reason.
-func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, cutoff, prevCutoff uint32,
-	before func(context.Context, string, int64) error) (int, error) {
+func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint32,
+	before func(context.Context, string) error) (int, error) {
 	rows, err := s.pool.Query(ctx, journalLeafSQL)
 	if err != nil {
 		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
@@ -274,84 +257,18 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, cutoff, pre
 	// present while the session worked on 9,353.
 	sort.Slice(leaves, func(i, j int) bool { return leaves[i].leaf < leaves[j].leaf })
 
-	// Two cutoffs, and the work one LEADS the drop one rather than trailing it.
-	//
-	// A partition is read across the 48 heights BEFORE it is due, so that by the time it is due
-	// the work is finished and only the catalog drop is left. dropCutoff is therefore unchanged
-	// from the single cutoff this function used to have, and retention stays exactly what
-	// DefaultSpendJournalRetentionBlocks says. Working the partition AFTER it came due would have
-	// held it a further 48 blocks for no gain.
-	//
-	// Deciding that early is safe with room to spare. A spend record in a partition reaching its
-	// work window is already about 1,393 blocks old, and the bar for treating a spender as
-	// beyond recall is SettledDepthBlocks, which is 288. Nothing about the answer changes in the
-	// last 48 blocks of a 1,440 block wait.
-	//
-	// Partition L holds heights 48L to 48L+47. It is worked while cutoff is inside that range,
-	// which is 48 consecutive cutoffs, and dropped once cutoff has passed 48L+47.
-	workCutoff := (cutoff + SpendJournalPartitionBlocks) / SpendJournalPartitionBlocks
-	dropCutoff := cutoff / SpendJournalPartitionBlocks
-
-	c := int64(cutoff)
-	prev := int64(prevCutoff)
-
+	cutoff := height / SpendJournalPartitionBlocks
 	dropped := 0
 
 	for _, l := range leaves {
-		if l.leaf >= workCutoff {
+		if l.leaf >= cutoff {
 			continue
 		}
-
-		lo := int64(l.leaf) * SpendJournalPartitionBlocks
-		hi := lo + SpendJournalPartitionBlocks - 1
-		due := l.leaf < dropCutoff
 
 		if before != nil {
-			var todo []int64
-
-			switch {
-			case due && (prevCutoff == 0 || hi < prev):
-				// Due, and this process cannot vouch for its window: either nothing is
-				// remembered, or it was already due at the previous run and is somehow still
-				// here, which means that run failed or belonged to another process. Read it
-				// whole, in one pass. Splitting an overdue partition buys nothing, because
-				// there is no window left, and each piece is a separate pass with its own
-				// decision queries, which measurably halved retirement on the mainnet box.
-				todo = []int64{-1}
-
-			default:
-				// The heights of this partition newly reached since the previous run. On the
-				// normal schedule that is exactly one. After skipped heights it is several,
-				// and a gap that straddles a partition boundary gives each partition only
-				// its own. On a fresh process it is everything from the partition's first
-				// height up to cutoff, which may repeat reads an earlier process did, and a
-				// repeated read is harmless. For a partition that became due since the
-				// previous run it is the tail of its window, after which it is dropped with
-				// no further read.
-				from := lo
-				if prevCutoff != 0 && prev+1 > from {
-					from = prev + 1
-				}
-
-				to := hi
-				if c < to {
-					to = c
-				}
-
-				for h := from; h <= to; h++ {
-					todo = append(todo, h)
-				}
+			if err := before(ctx, l.name); err != nil {
+				return dropped, err
 			}
-
-			for _, at := range todo {
-				if err := before(ctx, l.name, at); err != nil {
-					return dropped, err
-				}
-			}
-		}
-
-		if !due {
-			continue
 		}
 
 		switch {

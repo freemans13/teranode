@@ -676,8 +676,8 @@ func TestSpendJournalReclaimTakesTheOldestLeafFirst(t *testing.T) {
 	var seen []uint32
 
 	// A cutoff above every leaf, so all four are eligible and the order is the only variable.
-	_, err := s.dropSpendJournalPartitionsBelow(ctx, 100_000, 0,
-		func(_ context.Context, partition string, _ int64) error {
+	_, err := s.dropSpendJournalPartitionsBelow(ctx, 100_000,
+		func(_ context.Context, partition string) error {
 			var leaf uint32
 			_, serr := fmt.Sscanf(partition, "spend_journal_%d", &leaf)
 			require.NoError(t, serr)

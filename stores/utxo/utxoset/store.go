@@ -69,13 +69,6 @@ type Store struct {
 	// spenders would judge it on half the evidence.
 	reclaimChunkParents int
 
-	// lastPruneCutoff is the retention-adjusted height the previous SUCCESSFUL pruner run
-	// cleaned up to, so this run can read exactly the journal heights reached since. Zero means
-	// nothing is remembered, which a fresh process has, and which makes the next run read every
-	// in-window partition from its start and every due partition whole. It is advanced only
-	// after the run returns without error, so a failed run is redone rather than skipped.
-	lastPruneCutoff atomic.Uint32
-
 	// bodyWindow is the tx_body window the last create landed in, so the catalog is only
 	// touched when it changes.
 	bodyWindow atomic.Uint32
@@ -213,8 +206,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
 		journalRetention:    DefaultSpendJournalRetentionBlocks,
 		bodyRetention:       DefaultTxBodyRetentionBlocks,
-		reclaimChunkParents: DefaultReclaimChunkParents,
-	}
+		reclaimChunkParents: DefaultReclaimChunkParents}
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)
