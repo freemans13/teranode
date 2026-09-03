@@ -1,7 +1,9 @@
 package utxoset
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -403,4 +405,75 @@ func TestReclaimBatchResetForgetsSpenders(t *testing.T) {
 
 	require.Len(t, b.spenders, 1,
 		"the next chunk must probe this spender again; reset has to forget it")
+}
+
+// TestReclaimDoesNotRefuseAParentWhoseSpenderSortsIntoAnEarlierChunk pins the leak that
+// left about 83 percent of the mainnet identity table unreachable.
+//
+// A pays B and B pays C, all inside one journal partition, all settled. The work list is
+// ordered by transaction id, which is a hash, so half the time B sorts before A. If the
+// reclaimer deletes B's identity row as soon as B's chunk is judged, A's chunk then asks
+// whether A's spender B is settled, finds no row, and refuses A. Nothing ever names A again,
+// because this partition held A's last spend and it is dropped at the end of the session.
+//
+// The test forces the losing order by picking satoshi values until B's id sorts before A's,
+// and a chunk size of one parent so the two are judged in separate chunks. Both A and B must
+// go; C still holds a live coin and stays.
+func TestReclaimDoesNotRefuseAParentWhoseSpenderSortsIntoAnEarlierChunk(t *testing.T) {
+	s, ctx := newTestStore(t)
+	s.journalRetention = 96
+	s.reclaimChunkParents = 1
+
+	const at = uint32(100)
+
+	// Build A and B in memory until B's txid sorts before A's. mkTx is deterministic in its
+	// satoshi argument, so varying it varies the id.
+	var a, b *bt.Tx
+
+	for sats := uint64(5_000); ; sats++ {
+		a = mkTx(t, 1, sats)
+
+		b = bt.NewTx()
+		require.NoError(t, b.FromUTXOs(&bt.UTXO{
+			TxIDHash: a.TxIDChainHash(), Vout: 0,
+			LockingScript: a.Outputs[0].LockingScript, Satoshis: a.Outputs[0].Satoshis,
+		}))
+		b.AddOutput(&bt.Output{Satoshis: sats - 1_000, LockingScript: a.Outputs[0].LockingScript})
+
+		if bytes.Compare(hashBytes(b), hashBytes(a)) < 0 {
+			break
+		}
+
+		require.Less(t, sats, uint64(5_100), "could not find a chain where the spender sorts first")
+	}
+
+	_, err := s.Create(ctx, a, at)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(a), utxo.MinedBlockInfo{
+		BlockID: 1, BlockHeight: at, OnLongestChain: true})
+	require.NoError(t, err)
+
+	_, err = s.Create(ctx, b, at)
+	require.NoError(t, err)
+	_, err = spendOnly(ctx, s, b, at)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(b), utxo.MinedBlockInfo{
+		BlockID: 2, BlockHeight: at, OnLongestChain: true})
+	require.NoError(t, err)
+
+	c := spendOneOutput(t, s, ctx, b, 0, at)
+	_, err = s.SetMinedMulti(ctx, hashes(c), utxo.MinedBlockInfo{
+		BlockID: 3, BlockHeight: at, OnLongestChain: true})
+	require.NoError(t, err)
+
+	partition := fmt.Sprintf("spend_journal_%d", at/SpendJournalPartitionBlocks)
+
+	reclaimed, _, err := s.reclaimFromPartition(ctx, partition, 1_000)
+	require.NoError(t, err)
+
+	require.False(t, identExists(t, s, ctx, b), "B is fully spent by settled C")
+	require.False(t, identExists(t, s, ctx, a),
+		"A is fully spent by settled B; deleting B's row before judging A must not make A look unsettled")
+	require.True(t, identExists(t, s, ctx, c), "C still holds a live coin")
+	require.Equal(t, 2, reclaimed)
 }

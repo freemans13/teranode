@@ -214,6 +214,20 @@ DELETE FROM tx_ident i
 // that partition retires, every earlier spend of it sits in a partition that already retired.
 // So a rejected candidate comes back on its own, at exactly the right moment, with no state
 // carried between sessions.
+//
+// The whole partition is JUDGED before anything is DELETED, and the delete is one database
+// transaction. Both halves are load-bearing. The settled check asks whether each spender's
+// identity row is on the main chain and buried, so it needs the spender's row to still exist.
+// Inside one partition most parents are also spenders (89 percent on a measured mainnet
+// partition), and the work list is ordered by transaction id, which is a hash, so about half
+// the time a spender sorts into an earlier chunk than its parent. Deleting per chunk removed
+// the spender's row before its parent was judged; the parent was refused, and because this
+// partition held the parent's last spend, nothing ever named it again. Measured on mainnet on
+// 3 September 2026: 48 percent of parents deleted per chunk, and about 83 percent of the
+// 196 million identity rows were residue no work list could reach. One transaction for the
+// delete matters for the same reason: a crash between chunked deletes would leave some
+// spenders gone when the next session re-judged the partition, reopening the leak once per
+// crash. TestReclaimDoesNotRefuseAParentWhoseSpenderSortsIntoAnEarlierChunk pins this.
 func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip uint32) (int, int, error) {
 	limit := s.reclaimChunkParents
 	if limit <= 0 {
@@ -226,7 +240,7 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 	}
 
 	var (
-		reclaimed  int
+		doomed     [][]byte
 		chunks     int
 		batch      = newReclaimBatch()
 		lastParent []byte
@@ -244,13 +258,13 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 		// every row for one parent arrives together, and cutting mid-parent would judge it
 		// on a subset of its spenders.
 		if len(batch.parents) >= limit && !bytes.Equal(parent, lastParent) {
-			n, cerr := s.reclaimBatch(ctx, batch, tip)
+			d, cerr := s.judgeBatch(ctx, batch, tip)
 			if cerr != nil {
 				scanErr = cerr
 				break
 			}
 
-			reclaimed += n
+			doomed = append(doomed, d...)
 			chunks++
 
 			batch.reset()
@@ -263,44 +277,94 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 	rows.Close()
 
 	if scanErr != nil {
-		return reclaimed, chunks, scanErr
+		return 0, chunks, scanErr
 	}
 
 	if err := rows.Err(); err != nil {
-		return reclaimed, chunks, errors.NewStorageError("[utxoset][reclaim] rows %s", partition, err)
+		return 0, chunks, errors.NewStorageError("[utxoset][reclaim] rows %s", partition, err)
 	}
 
 	if len(batch.parents) > 0 {
-		n, err := s.reclaimBatch(ctx, batch, tip)
+		d, err := s.judgeBatch(ctx, batch, tip)
 		if err != nil {
-			return reclaimed, chunks, err
+			return 0, chunks, err
 		}
 
-		reclaimed += n
+		doomed = append(doomed, d...)
 		chunks++
+	}
+
+	reclaimed, err := s.deleteIdents(ctx, doomed, limit)
+	if err != nil {
+		return 0, chunks, err
 	}
 
 	return reclaimed, chunks, nil
 }
 
-// reclaimBatch is one bounded slice of a partition's work list: the decision, and the delete.
+// deleteIdents removes the identity rows of every doomed parent in ONE transaction.
 //
-// Splitting this out is what makes the memory bound possible. It is also the unit a failure
-// stops at: an earlier batch's delete has already committed, which is safe because every batch
-// is decided from ground truth read at that moment and nothing is carried between them.
-func (s *Store) reclaimBatch(ctx context.Context, b *reclaimBatch, tip uint32) (int, error) {
-	if len(b.parents) == 0 {
+// The statement still takes the parents in bounded arrays, because a single array of several
+// hundred thousand ids is a needlessly large parameter, but every array runs inside the same
+// transaction, so either the whole partition's verdict lands or none of it does. A crash
+// mid-way rolls all of it back and the next session judges the partition again with every
+// spender row still in place.
+func (s *Store) deleteIdents(ctx context.Context, doomed [][]byte, chunk int) (int, error) {
+	if len(doomed) == 0 {
 		return 0, nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, errors.NewStorageError("[utxoset][reclaim] begin delete", err)
+	}
+
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	reclaimed := 0
+
+	for lo := 0; lo < len(doomed); lo += chunk {
+		hi := lo + chunk
+		if hi > len(doomed) {
+			hi = len(doomed)
+		}
+
+		tag, err := tx.Exec(ctx, deleteIdentSQL, doomed[lo:hi])
+		if err != nil {
+			return 0, errors.NewStorageError("[utxoset][reclaim] delete", err)
+		}
+
+		reclaimed += int(tag.RowsAffected())
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, errors.NewStorageError("[utxoset][reclaim] commit delete", err)
+	}
+
+	return reclaimed, nil
+}
+
+// judgeBatch is one bounded slice of a partition's work list: the decision, and only the
+// decision. It returns the parents that may go; reclaimFromPartition deletes them once the
+// whole partition has been judged.
+//
+// Splitting this out is what makes the memory bound possible: the three probes run on at most
+// reclaimChunkParents parents at a time. What is carried between chunks is only the list of
+// doomed transaction ids, about 32 bytes each, so the fattest partition measured (366,000
+// rows) holds under 20 MB.
+func (s *Store) judgeBatch(ctx context.Context, b *reclaimBatch, tip uint32) ([][]byte, error) {
+	if len(b.parents) == 0 {
+		return nil, nil
 	}
 
 	settledSpenders, err := s.settled(ctx, b.spenders, tip)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	live, err := s.withLiveCoins(ctx, b.parents)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	// The parent must itself be on the main chain. It does NOT separately need to be buried,
@@ -308,7 +372,7 @@ func (s *Store) reclaimBatch(ctx context.Context, b *reclaimBatch, tip uint32) (
 	// implies at least that much depth on its parent.
 	onChain, err := s.onMainChain(ctx, b.parents)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	var doomed [][]byte
@@ -338,16 +402,7 @@ func (s *Store) reclaimBatch(ctx context.Context, b *reclaimBatch, tip uint32) (
 		}
 	}
 
-	if len(doomed) == 0 {
-		return 0, nil
-	}
-
-	tag, err := s.pool.Exec(ctx, deleteIdentSQL, doomed)
-	if err != nil {
-		return 0, errors.NewStorageError("[utxoset][reclaim] delete", err)
-	}
-
-	return int(tag.RowsAffected()), nil
+	return doomed, nil
 }
 
 // reclaimBatch holds one bounded slice of a partition's work list.
