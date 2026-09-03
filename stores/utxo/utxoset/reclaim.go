@@ -131,7 +131,12 @@ func (s *Store) settled(ctx context.Context, txids [][]byte, tip uint32) (map[st
 // batches and may only cut between parents, so every row for one parent has to arrive
 // together. DISTINCT already forces a sort or hash aggregate over the whole partition, so
 // asking for the order costs close to nothing on top.
-const candidatesSQL = `SELECT DISTINCT txid, spending_txid FROM %s ORDER BY txid`
+//
+// The third column is whether EVERY journal row for that (parent, spender) pair carries the
+// applied mark. A pair's rows are written by one statement, so in practice they agree, and
+// bool_and is the conservative reading if they ever did not. The GROUP BY replaces the
+// DISTINCT at the same cost.
+const candidatesSQL = `SELECT txid, spending_txid, bool_and(applied) FROM %s GROUP BY txid, spending_txid ORDER BY txid`
 
 // hasLiveCoinSQL asks whether any of a transaction's outputs is still unspent. A parent with
 // a live coin is needed by whoever eventually spends it, however settled its other spends are.
@@ -248,8 +253,12 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 	)
 
 	for rows.Next() {
-		var parent, spender []byte
-		if err := rows.Scan(&parent, &spender); err != nil {
+		var (
+			parent, spender []byte
+			applied         bool
+		)
+
+		if err := rows.Scan(&parent, &spender, &applied); err != nil {
 			scanErr = errors.NewStorageError("[utxoset][reclaim] scan %s", partition, err)
 			break
 		}
@@ -270,7 +279,7 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 			batch.reset()
 		}
 
-		batch.add(parent, spender)
+		batch.add(parent, spender, applied)
 		lastParent = parent
 	}
 
@@ -348,18 +357,31 @@ func (s *Store) deleteIdents(ctx context.Context, doomed [][]byte, chunk int) (i
 // decision. It returns the parents that may go; reclaimFromPartition deletes them once the
 // whole partition has been judged.
 //
-// Splitting this out is what makes the memory bound possible: the three probes run on at most
+// Splitting this out is what makes the memory bound possible: the probes run on at most
 // reclaimChunkParents parents at a time. What is carried between chunks is only the list of
 // doomed transaction ids, about 32 bytes each, so the fattest partition measured (366,000
 // rows) holds under 20 MB.
+//
+// The live-coin check runs first and on every parent, because it is the one rule no mark
+// can answer: a parent with an unspent output is needed by whoever eventually spends it. A
+// coin-free parent whose EVERY spend carries the applied mark is then finished without
+// another question. The mark says each spend was recorded by the block path below the
+// hardcoded checkpoint, where a block cannot be un-mined by rule, so the spender is in a
+// main-chain block that will never be taken back and the parent, mined at or below it on
+// the same chain, is too. Those parents skip the settled probe (which would have visited
+// each spender's identity row) and the on-chain probe (which would have visited the
+// parent's). Only parents with an unmarked spend, which at the tip is every mempool spend,
+// take the two probes, and only their spenders are asked about.
+//
+// The mark also closes a leak the settled probe cannot see past. That probe is an inner join
+// on the identity table, so a spender with no row is simply absent and the parent reads as
+// unsettled. A spender can lack a row legitimately: it was never stored because it has no
+// spendable outputs, or its own row was already reclaimed. Below the checkpoint the mark
+// answers for it. At the tip the fail-safe stays, because an unmarked spend by a spender
+// with no row proves nothing about depth.
 func (s *Store) judgeBatch(ctx context.Context, b *reclaimBatch, tip uint32) ([][]byte, error) {
 	if len(b.parents) == 0 {
 		return nil, nil
-	}
-
-	settledSpenders, err := s.settled(ctx, b.spenders, tip)
-	if err != nil {
-		return nil, err
 	}
 
 	live, err := s.withLiveCoins(ctx, b.parents)
@@ -367,15 +389,12 @@ func (s *Store) judgeBatch(ctx context.Context, b *reclaimBatch, tip uint32) ([]
 		return nil, err
 	}
 
-	// The parent must itself be on the main chain. It does NOT separately need to be buried,
-	// because a transaction cannot be mined before the one it spends, so a settled spender
-	// implies at least that much depth on its parent.
-	onChain, err := s.onMainChain(ctx, b.parents)
-	if err != nil {
-		return nil, err
-	}
-
-	var doomed [][]byte
+	var (
+		doomed   [][]byte
+		unmarked [][]byte
+		spenders [][]byte
+		seen     = map[string]struct{}{}
+	)
 
 	for _, parent := range b.parents {
 		key := string(parent)
@@ -383,6 +402,44 @@ func (s *Store) judgeBatch(ctx context.Context, b *reclaimBatch, tip uint32) ([]
 		if _, hasCoin := live[key]; hasCoin {
 			continue
 		}
+
+		if b.allApplied[key] {
+			doomed = append(doomed, parent)
+			continue
+		}
+
+		unmarked = append(unmarked, parent)
+
+		for _, spender := range b.spentBy[key] {
+			sk := string(spender)
+			if _, dup := seen[sk]; dup {
+				continue
+			}
+
+			seen[sk] = struct{}{}
+			spenders = append(spenders, spender)
+		}
+	}
+
+	if len(unmarked) == 0 {
+		return doomed, nil
+	}
+
+	settledSpenders, err := s.settled(ctx, spenders, tip)
+	if err != nil {
+		return nil, err
+	}
+
+	// The parent must itself be on the main chain. It does NOT separately need to be buried,
+	// because a transaction cannot be mined before the one it spends, so a settled spender
+	// implies at least that much depth on its parent.
+	onChain, err := s.onMainChain(ctx, unmarked)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, parent := range unmarked {
+		key := string(parent)
 
 		if _, ok := onChain[key]; !ok {
 			continue
@@ -406,52 +463,44 @@ func (s *Store) judgeBatch(ctx context.Context, b *reclaimBatch, tip uint32) ([]
 }
 
 // reclaimBatch holds one bounded slice of a partition's work list.
+//
+// Spenders are deduplicated at judgement time, per parent that still needs them, rather than
+// here. The work list arrives as one row per (parent, spender) pair, so a transaction that
+// consumed several parents appears once per parent; on a measured mainnet leaf that was
+// 207,500 entries for 103,492 distinct spenders. Only the spenders of parents with an
+// unmarked spend are ever asked about, so the set is built once those parents are known.
 type reclaimBatch struct {
-	parents  [][]byte
-	spenders [][]byte
-	spentBy  map[string][][]byte
+	parents [][]byte
+	spentBy map[string][][]byte
 
-	// seenSpender deduplicates the array handed to the settled check.
-	//
-	// The work list arrives as one row per (parent, spender) pair, so a transaction that
-	// consumed several parents appeared once per parent and was probed once per appearance.
-	// The parents beside it were already deduplicated and the spenders were not. On a measured
-	// mainnet leaf that was 207,500 entries for 103,492 distinct spenders.
-	//
-	// The saving is real but smaller than the leaf-wide ratio suggests, and the difference is
-	// worth knowing before anyone quotes it. Deduplication can only happen INSIDE a batch of
-	// reclaimChunkParents, and a spender's other parents scatter across the whole leaf because
-	// the cut is on parent order, so the measured within-batch factor is about 1.40 against
-	// 2.01 leaf-wide.
-	seenSpender map[string]struct{}
+	// allApplied[parent] is true while every (parent, spender) pair seen so far carried the
+	// applied mark. One unmarked pair makes it false for good.
+	allApplied map[string]bool
 }
 
 func newReclaimBatch() *reclaimBatch {
 	return &reclaimBatch{
-		spentBy:     map[string][][]byte{},
-		seenSpender: map[string]struct{}{},
+		spentBy:    map[string][][]byte{},
+		allApplied: map[string]bool{},
 	}
 }
 
-func (b *reclaimBatch) add(parent, spender []byte) {
+func (b *reclaimBatch) add(parent, spender []byte, applied bool) {
 	key := string(parent)
 
 	if _, seen := b.spentBy[key]; !seen {
 		b.parents = append(b.parents, parent)
+		b.allApplied[key] = true
 	}
 
 	// EVERY spender goes on the per-parent list, deduplicated or not. That list decides whether
 	// all of a parent's spends have settled, and dropping a repeat from it would be harmless
-	// only by luck; the query array below is the only place a repeat costs anything.
+	// only by luck.
 	b.spentBy[key] = append(b.spentBy[key], spender)
 
-	sk := string(spender)
-	if _, seen := b.seenSpender[sk]; seen {
-		return
+	if !applied {
+		b.allApplied[key] = false
 	}
-
-	b.seenSpender[sk] = struct{}{}
-	b.spenders = append(b.spenders, spender)
 }
 
 // reset drops the batch's contents without keeping the backing arrays.
@@ -460,9 +509,8 @@ func (b *reclaimBatch) add(parent, spender []byte) {
 // track the largest leaf it has ever seen.
 func (b *reclaimBatch) reset() {
 	b.parents = nil
-	b.spenders = nil
 	b.spentBy = map[string][][]byte{}
-	b.seenSpender = map[string]struct{}{}
+	b.allApplied = map[string]bool{}
 }
 
 // liveCoinArgs expands transaction ids into the four parallel arrays hasLiveCoinSQL takes:

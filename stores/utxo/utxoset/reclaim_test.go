@@ -362,49 +362,54 @@ func TestSettledDoesNotWrapOnAHighHeight(t *testing.T) {
 		"a height above the signed 32-bit boundary must read as huge, not as negative")
 }
 
-// TestReclaimBatchProbesEachSpenderOnce pins the deduplication of the settled check's argument.
+// TestReclaimBatchKeepsEveryPairAndTracksTheMark pins what a batch records per parent.
 //
-// The work list arrives as one row per parent-spender pair, so a transaction that consumed
-// several parents used to be probed once per parent. The parents beside it were already
-// deduplicated.
-func TestReclaimBatchProbesEachSpenderOnce(t *testing.T) {
+// The work list arrives as one row per parent-spender pair. The per-parent spender list must
+// stay whole, because it decides whether ALL of a parent's spends settled; deduplication of the
+// spenders actually probed happens at judgement time, and only for parents that still need a
+// probe. The applied mark is an AND across a parent's pairs: one unmarked spend means the
+// parent takes the full path.
+func TestReclaimBatchKeepsEveryPairAndTracksTheMark(t *testing.T) {
 	b := newReclaimBatch()
 
 	parentOne := []byte("parent-one")
 	parentTwo := []byte("parent-two")
 	spender := []byte("one-transaction-took-both")
+	later := []byte("a-mempool-spender")
 
-	b.add(parentOne, spender)
-	b.add(parentTwo, spender)
+	b.add(parentOne, spender, true)
+	b.add(parentTwo, spender, true)
+	b.add(parentTwo, later, false)
 
-	require.Len(t, b.spenders, 1,
-		"a transaction that consumed two parents is one key to probe, not two")
-	require.Len(t, b.parents, 2, "both parents still have to be judged")
-
-	require.Equal(t, [][]byte{spender}, b.spentBy[string(parentOne)],
+	require.Len(t, b.parents, 2, "both parents have to be judged")
+	require.Equal(t, [][]byte{spender}, b.spentBy[string(parentOne)])
+	require.Equal(t, [][]byte{spender, later}, b.spentBy[string(parentTwo)],
 		"the per-parent list decides whether all of a parent's spends settled and must stay whole")
-	require.Equal(t, [][]byte{spender}, b.spentBy[string(parentTwo)])
+
+	require.True(t, b.allApplied[string(parentOne)], "every spend of parent one was block-applied")
+	require.False(t, b.allApplied[string(parentTwo)], "one unmarked spend puts parent two on the full path")
 }
 
-// TestReclaimBatchResetForgetsSpenders is not defensive tidiness.
+// TestReclaimBatchResetForgetsEverything is not defensive tidiness.
 //
-// Chunks cut on a parent boundary and the batch is reused across them. If reset kept the
-// deduplication set, every spender already seen in an earlier chunk would be silently left out
-// of the next chunk's settled probe, come back unsettled because it was never asked about, and
-// its parent would never be reclaimed. That leaks rather than deletes, so nothing would fail
-// loudly and the leak would look like the workload.
-func TestReclaimBatchResetForgetsSpenders(t *testing.T) {
+// Chunks cut on a parent boundary and the batch is reused across them. Anything reset kept
+// would either be judged twice or, worse, carry a stale mark verdict from an earlier chunk
+// into a parent that shares a key with nothing in this one.
+func TestReclaimBatchResetForgetsEverything(t *testing.T) {
 	b := newReclaimBatch()
 
 	parent := []byte("a-parent")
 	spender := []byte("a-spender")
 
-	b.add(parent, spender)
+	b.add(parent, spender, false)
 	b.reset()
-	b.add(parent, spender)
 
-	require.Len(t, b.spenders, 1,
-		"the next chunk must probe this spender again; reset has to forget it")
+	require.Empty(t, b.parents)
+	require.Empty(t, b.spentBy)
+	require.Empty(t, b.allApplied)
+
+	b.add(parent, spender, true)
+	require.True(t, b.allApplied[string(parent)], "a fresh chunk starts from its own pairs, not the last chunk's verdict")
 }
 
 // TestReclaimDoesNotRefuseAParentWhoseSpenderSortsIntoAnEarlierChunk pins the leak that
@@ -476,4 +481,80 @@ func TestReclaimDoesNotRefuseAParentWhoseSpenderSortsIntoAnEarlierChunk(t *testi
 		"A is fully spent by settled B; deleting B's row before judging A must not make A look unsettled")
 	require.True(t, identExists(t, s, ctx, c), "C still holds a live coin")
 	require.Equal(t, 2, reclaimed)
+}
+
+// spendWithoutIdentity spends one of parent's outputs by a transaction the store never creates,
+// the way the block path does when a transaction with no spendable outputs is not stored, or a
+// spender was reclaimed already. blockApplied marks the spend as recorded by the
+// below-checkpoint block path, which is the outpoint-only option the validator refuses above
+// the checkpoint.
+func spendWithoutIdentity(t *testing.T, s *Store, ctx context.Context, parent *bt.Tx, height uint32,
+	blockApplied bool) *bt.Tx {
+	t.Helper()
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+	child.AddOutput(&bt.Output{Satoshis: 4_000, LockingScript: parent.Outputs[0].LockingScript})
+
+	_, err := spendOnly(ctx, s, child, height, utxo.WithSkipUTXOHashCheck(blockApplied))
+	require.NoError(t, err)
+
+	return child
+}
+
+// TestReclaimTrustsABlockAppliedSpendWhoseSpenderHasNoIdentityRow.
+//
+// Below the hardcoded checkpoint the block path records every spend with the outpoint-only
+// mark, and a block there cannot be un-mined by rule. So a spend carrying the mark says its
+// spender is in a main-chain block that will never be taken back, whether or not the spender
+// still has, or ever had, an identity row. A transaction with no spendable outputs may never
+// be stored at all, and a spender's own row may already have been reclaimed. Asking the
+// identity table about such a spender finds nothing, and treating "no row" as "not settled"
+// is what stranded the parents of every such spend forever.
+func TestReclaimTrustsABlockAppliedSpendWhoseSpenderHasNoIdentityRow(t *testing.T) {
+	s, ctx := newTestStore(t)
+	s.journalRetention = 96
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	spendWithoutIdentity(t, s, ctx, parent, 100, true)
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	_, err = svc.Prune(ctx, 1_000, "deadbeef")
+	require.NoError(t, err)
+
+	require.False(t, identExists(t, s, ctx, parent),
+		"the only spend was block-applied below the checkpoint; the spender needs no row to prove it is buried")
+}
+
+// TestReclaimStillRefusesAnUnmarkedSpendWhoseSpenderHasNoIdentityRow keeps the fail-safe
+// where it still means something. A spend recorded at the tip carries no mark, its spender
+// may be a mempool transaction, and the only proof it is buried is its identity row.
+func TestReclaimStillRefusesAnUnmarkedSpendWhoseSpenderHasNoIdentityRow(t *testing.T) {
+	s, ctx := newTestStore(t)
+	s.journalRetention = 96
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	spendWithoutIdentity(t, s, ctx, parent, 100, false)
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	_, err = svc.Prune(ctx, 1_000, "deadbeef")
+	require.NoError(t, err)
+
+	require.True(t, identExists(t, s, ctx, parent),
+		"an unmarked spend by a spender with no row proves nothing about depth")
 }

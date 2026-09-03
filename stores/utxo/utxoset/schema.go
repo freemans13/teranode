@@ -179,6 +179,18 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- leaving it on: 354.8 bytes of WAL and 12.9 microseconds per spend, about 6% of the
 -- per-block budget in the worst band. Not close.
 -- ---------------------------------------------------------------------------
+-- applied records HOW the spend was written, and it is the one column here that describes
+-- the writer rather than the coin. TRUE means the spend was recorded by the block path
+-- below the hardcoded checkpoint, which is the only path allowed to skip the
+-- previous-output comparison (the outpoint-only option the validator refuses above the
+-- checkpoint). A block there cannot be un-mined by rule, so a marked spend says its
+-- spender is in a main-chain block that will never be taken back, and the reclaimer can
+-- retire the parent without asking the identity table about the spender at all. That
+-- matters twice over: it removes the two random heap probes that were 85 percent of a
+-- reclaim batch, and it stops a spender that has no identity row (never stored, or already
+-- reclaimed) from stranding its parents forever. A mempool spend at the tip is written
+-- FALSE and takes the full three-probe path. Immutable once written, like every other
+-- column in this row; nothing restores it because a restore deletes the row.
 CREATE TABLE IF NOT EXISTS spend_journal (
     spent_height    INTEGER  NOT NULL,
     satoshis        BIGINT   NOT NULL,
@@ -189,8 +201,14 @@ CREATE TABLE IF NOT EXISTS spend_journal (
     txid            BYTEA    NOT NULL,
     spending_txid   BYTEA    NOT NULL,
     script          BYTEA    NOT NULL,
-    hash_override   BYTEA
+    hash_override   BYTEA,
+    applied         BOOLEAN  NOT NULL DEFAULT false
 ) PARTITION BY RANGE (spent_height);
+
+-- Existing databases predate the column. A constant default is a catalog-only change on
+-- PostgreSQL 11 and later, so this is instant on a table of any size and propagates to every
+-- attached partition. Rows written before the column read FALSE and take the full path.
+ALTER TABLE spend_journal ADD COLUMN IF NOT EXISTS applied BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS applied_block (
     height       INTEGER NOT NULL,
