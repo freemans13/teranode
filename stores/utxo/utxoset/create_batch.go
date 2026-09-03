@@ -51,13 +51,17 @@ import (
 //
 // fee is written as NULL deliberately. The store does not compute it, and block assembly
 // rebuilds a mining candidate from size and inpoints instead.
+//
+// births is gated on the claim like body and coins, so a duplicate offer writes nothing, and
+// it fires only for a transaction that wrote no coin row. See the tx_birth DDL comment for
+// why such a transaction needs a work list of its own.
 const createPlanSQL = `
 WITH t AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::int[], $5::int[],
                          $6::bytea[], $7::int[], $8::bytea[], $9::int[], $10::bigint[],
-                         $11::smallint[], $12::bytea[])
+                         $11::smallint[], $12::bytea[], $21::boolean[])
         AS t(k, leaf, txid, created_height, off_chain_since, membership, size_in_bytes,
-             tx_inpoints, locktime, created_at, flags, raw_tx)
+             tx_inpoints, locktime, created_at, flags, raw_tx, no_coins)
 ),
 claim AS (
     INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
@@ -73,6 +77,13 @@ body AS (
     SELECT t.created_height, t.txid, t.raw_tx
       FROM t
       JOIN claim c ON c.leaf = t.leaf AND c.txid = t.txid
+),
+births AS (
+    INSERT INTO tx_birth (created_height, txid)
+    SELECT t.created_height, t.txid
+      FROM t
+      JOIN claim c ON c.leaf = t.leaf AND c.txid = t.txid
+     WHERE t.no_coins
 ),
 coins AS (
     INSERT INTO utxo (satoshis, created_height, spendable_from, leaf, flags, ukey, txid, script)
@@ -125,6 +136,9 @@ type createPlan struct {
 	createdAt  []int64
 	txFlags    []int16
 	bodies     [][]byte
+	// noCoins is true for a transaction that contributed no coin rows, which is what puts
+	// it in the birth ledger.
+	noCoins []bool
 
 	// One element per spendable output, across the whole batch.
 	coinSats      []int64
@@ -215,6 +229,7 @@ func (p *createPlan) sortRows() {
 	p.leaves = permute(p.leaves, order)
 	p.txids = permute(p.txids, order)
 	p.heights = permute(p.heights, order)
+	p.noCoins = permute(p.noCoins, order)
 	p.offChain = permute(p.offChain, order)
 	p.membership = permute(p.membership, order)
 	p.sizes = permute(p.sizes, order)
@@ -241,7 +256,7 @@ func (s *Store) runCreatePlan(ctx context.Context, q querier, p *createPlan) err
 		p.idx, p.leaves, p.txids, p.heights, p.offChain, p.membership, p.sizes,
 		p.inpoints, p.locktimes, p.createdAt, p.txFlags, p.bodies,
 		p.coinSats, p.coinHeights, p.coinSpendable, p.coinLeaves, p.coinFlags,
-		p.coinUkeys, p.coinTxids, p.coinScripts)
+		p.coinUkeys, p.coinTxids, p.coinScripts, p.noCoins)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Create] store", err)
 	}

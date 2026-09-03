@@ -110,6 +110,20 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 			reclaimed, batches, dropped, cutoff)
 	}
 
+	// The birth ledger goes AFTER the journal loop and on the journal's cutoff. A
+	// zero-output transaction is a spender named by its parents' journal rows, and those
+	// parents are judged when their partition retires above; its identity row has to still
+	// be there for that judgement at the tip, where the applied mark does not answer for it.
+	born, birthWindows, err := p.store.reclaimBirthWindowsBelow(ctx, cutoff, height)
+	if err != nil {
+		return 0, err
+	}
+
+	if born > 0 || birthWindows > 0 {
+		p.store.logger.Infof("[utxoset] pruner reclaimed %d zero-output transaction rows and dropped %d birth windows below height %d",
+			born, birthWindows, cutoff)
+	}
+
 	// Still zero records processed, and still exact. The caller adds this to a counter of
 	// child transaction records deleted by a delete-at-height sweep, which this store does
 	// not have. Reporting identity rows or body windows there would put three units in one

@@ -282,6 +282,35 @@ CREATE TABLE IF NOT EXISTS tx_ident (
 ) PARTITION BY LIST (leaf);
 
 -- ---------------------------------------------------------------------------
+-- THE BIRTH LEDGER. The work list for transactions that can never be spent.
+--
+-- The reclaimer learns about a transaction from a spend of one of its outputs: a retiring
+-- journal partition names every parent that had an output spent in that window. A
+-- transaction with no spendable outputs (an OP_FALSE OP_RETURN data carrier, or one whose
+-- outputs are all provably unspendable) is never anyone's parent, so no journal row ever
+-- names it, and its identity row would live forever. On the mainnet box about one in
+-- eight of the identity rows the reclaimer could never reach were this shape.
+--
+-- The row cannot simply be skipped at create. Block assembly needs fee, size and inputs
+-- from it while the transaction is in the mempool, the stamp's postcondition needs it when
+-- a block containing it is stamped, and the block persister reads the bytes back for every
+-- transaction in a block it archives. So the row is written, and this ledger records where
+-- to find it later: one row per such transaction, keyed by the height it was created at,
+-- RANGE partitioned in the same 48-block windows as the transaction bytes and created by
+-- the same DDL. No index: a window is only ever read whole, once, when it retires.
+--
+-- A window retires on the JOURNAL's cadence, 1440 blocks, not the body's 288, and after the
+-- journal loop. A zero-output transaction is a spender, and its parents' journal rows name
+-- it for 1440 blocks; deleting its identity row earlier would make the settled probe for
+-- those parents find no spender row. Below the checkpoint the applied mark answers for it
+-- anyway; at the tip the row must outlive the journal rows that name it.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tx_birth (
+    created_height  INTEGER NOT NULL,
+    txid            BYTEA   NOT NULL
+) PARTITION BY RANGE (created_height);
+
+-- ---------------------------------------------------------------------------
 -- THE BODY. Serialized transaction bytes, and nothing else.
 --
 -- This is the ONE part of a transaction whose life is bounded by a horizon rather

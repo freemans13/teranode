@@ -55,10 +55,16 @@ func (s *Store) ensureTxBodyPartition(ctx context.Context, height uint32) error 
 	// update of another column, because postgres writes only what changed working in from
 	// both ends of the row. Do not set toast_tuple_target to force more of it out -- at 128
 	// the toaster does not stop at raw_tx, it keeps going and externalises txid too.
+	//
+	// The birth ledger's window for the same range is created here too, so a write path
+	// that has ensured the body window can rely on the birth window existing. One catalog
+	// touch per 48 blocks covers both.
 	ddl := fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS tx_body_w%[1]d PARTITION OF tx_body
   FOR VALUES FROM (%[2]d) TO (%[3]d);
-ALTER TABLE tx_body_w%[1]d ALTER COLUMN raw_tx SET STORAGE EXTERNAL;`, window, lo, hi)
+ALTER TABLE tx_body_w%[1]d ALTER COLUMN raw_tx SET STORAGE EXTERNAL;
+CREATE TABLE IF NOT EXISTS tx_birth_w%[1]d PARTITION OF tx_birth
+  FOR VALUES FROM (%[2]d) TO (%[3]d);`, window, lo, hi)
 
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return errors.NewStorageError("[utxoset] create tx_body window %d", window, err)
