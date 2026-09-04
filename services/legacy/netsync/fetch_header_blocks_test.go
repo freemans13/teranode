@@ -40,18 +40,24 @@ func TestFetchHeaderBlocksSurvivesPeerVanishingMidLoop(t *testing.T) {
 	// getdata at the end of the function returns without needing a socket.
 	sp := peerpkg.NewInboundPeer(ulogger.TestLogger{}, test.CreateBaseTestSettings(t), &peerpkg.Config{})
 
+	// Both expiring maps spawn a cleanup goroutine each, so both are stopped on teardown
+	// rather than left running for the rest of the package suite.
+	sharedRequested := expiringmap.New[chainhash.Hash, struct{}](time.Minute)
+	t.Cleanup(sharedRequested.Stop)
+
+	peerRequested := expiringmap.New[chainhash.Hash, struct{}](time.Minute)
+	t.Cleanup(peerRequested.Stop)
+
 	sm := &SyncManager{
 		logger:           ulogger.TestLogger{},
 		ctx:              context.Background(),
 		peerStates:       txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
-		requestedBlocks:  expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		requestedBlocks:  sharedRequested,
 		blockSizeTracker: newBlockSizeTracker(10),
 		headerList:       list.New(),
 	}
 
-	sm.peerStates.Set(sp, &peerSyncState{
-		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
-	})
+	sm.peerStates.Set(sp, &peerSyncState{requestedBlocks: peerRequested})
 
 	sm.storeSyncPeer(sp, &syncPeerState{})
 
@@ -75,8 +81,17 @@ func TestFetchHeaderBlocksSurvivesPeerVanishingMidLoop(t *testing.T) {
 
 	require.NotPanics(t, sm.fetchHeaderBlocks, "a peer disconnecting mid-loop must not segfault the node")
 
+	// Prove the regression window was actually entered. Without these the test could go green
+	// on a future refactor that never reaches haveInventory, or one that leaves the peer in
+	// place, and neither would exercise the crash it exists to catch.
+	blockchainClient.AssertExpectations(t)
+
+	_, stillRegistered := sm.peerStates.Get(sp)
+	require.False(t, stillRegistered, "the peer must have been removed during the loop")
+
 	// The requests were still recorded, so the fix is not "skip the write when the peer is
 	// gone". Losing them would strand those blocks: nothing would re-request a hash that
 	// requestedBlocks claims is already in flight.
 	require.Equal(t, 2, sm.requestedBlocks.Len(), "both headers should still have been requested")
+	require.Equal(t, 2, peerRequested.Len(), "both headers should still be recorded against the peer")
 }
