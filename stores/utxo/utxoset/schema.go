@@ -241,6 +241,12 @@ CREATE TABLE IF NOT EXISTS applied_chunk (
 -- The payload columns are what a transaction needs if it is un-mined back into the mempool
 -- (stage 2); below the checkpoint tx_inpoints is written NULL because nothing there can
 -- un-mine.
+--
+-- fee is carried because tx_ident carries one and the tip's stamp MOVES that row here. A
+-- transaction un-mined back into the mempool is handed to block assembly, which prices it,
+-- so dropping the column would silently zero the fee of every reorged transaction. It is
+-- nullable because the block path has no fee to carry: a create below the checkpoint writes
+-- NULL, exactly as the identity claim does.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS tx_mined (
     txid            BYTEA    NOT NULL,
@@ -250,6 +256,7 @@ CREATE TABLE IF NOT EXISTS tx_mined (
     seq             BIGINT   GENERATED ALWAYS AS IDENTITY,
     created_height  INTEGER  NOT NULL,
     size_in_bytes   INTEGER,
+    fee             BIGINT,
     tx_inpoints     BYTEA,
     locktime        INTEGER,
     created_at      BIGINT,
@@ -269,7 +276,18 @@ CREATE TABLE IF NOT EXISTS tx_mined_floor (
 INSERT INTO tx_mined_floor (id, floor) VALUES (0, 0) ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
--- THE IDENTITY TABLE. One row per MEMPOOL transaction, from first sight until its block.
+-- THE IDENTITY TABLE. One row per MEMPOOL transaction, from first sight until the block
+-- that settles it.
+--
+-- "Settles" rather than "contains", because the two are not the same fact and the difference
+-- decides whether the row leaves. A stamp naming a block ON THE LONGEST CHAIN moves the row
+-- into tx_mined and deletes it here, but only when the row then names exactly ONE block and
+-- carries no conflicting children. A row naming two blocks stays, with its mempool marker
+-- cleared: the id-less mark-on-longest-chain call cannot later say which of them is main, so
+-- the row waits for an un-mine or a further stamp to reduce it to one. A row carrying
+-- conflicting children stays for the same reason in a different register -- that bookkeeping
+-- has no home in tx_mined yet. A stamp for a block NOT on the longest chain moves nothing at
+-- all; it only appends the block.
 --
 -- Partitioned BY LIST (leaf), the same eight-way split as utxo, and never by
 -- created_height. Three reasons, worst first:
@@ -386,9 +404,12 @@ CREATE TABLE IF NOT EXISTS utxo_p%[1]d PARTITION OF utxo FOR VALUES IN (%[1]d)
 CREATE INDEX IF NOT EXISTS utxo_p%[1]d_ukey ON utxo_p%[1]d (ukey);
 
 -- The identity partitions take the coin table's autovacuum block, for the same reason. This is
--- the MEMPOOL table now, and a mempool row is deleted at row level the moment its block is
--- stamped and the transaction moves to tx_mined, so the dead-row rate here tracks block
--- production exactly as the coin table's does. The shipped default (20 percent dead tuples,
+-- the MEMPOOL table now, and the ordinary mempool row is deleted at row level the moment a
+-- longest-chain stamp moves it to tx_mined, so the dead-row rate here tracks block production
+-- exactly as the coin table's does. The rows that stay behind on a stamp -- the ones naming
+-- two blocks, and the ones carrying conflicting children -- are the fork and conflict
+-- residue, a rounding error against a block's worth of ordinary transactions, so they do not
+-- change that rate. The shipped default (20 percent dead tuples,
 -- default throttling) meant a pass every twenty minutes or so per partition with the primary
 -- key drifting toward its 2x bloat plateau between passes. The ALTER makes an existing
 -- database converge; SET is catalog-only.

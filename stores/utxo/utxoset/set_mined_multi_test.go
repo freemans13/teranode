@@ -42,6 +42,10 @@ func txHashes(txs []*bt.Tx) []*chainhash.Hash {
 // TestSetMinedMultiStampsEveryTransactionInOneCall is the case a single statement built
 // around array parameters can get wrong where a statement per transaction cannot: each
 // transaction must gain the block on its OWN row, and on no other.
+//
+// The block is on the longest chain, so each named transaction is settled by it and moves to
+// the membership table. The bystander proves the other half: it keeps its identity row, is
+// stamped by nothing and moved by nothing.
 func TestSetMinedMultiStampsEveryTransactionInOneCall(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -62,15 +66,23 @@ func TestSetMinedMultiStampsEveryTransactionInOneCall(t *testing.T) {
 
 		require.Contains(t, got[*h], uint32(77))
 
-		r := readIdent(t, s, ctx, h[:])
-		require.Equal(t, packTriples(t, [3]uint32{77, 700_005, 2}), r.membership,
+		require.False(t, identExists(t, s, ctx, tx), "settled, so out of the mempool table")
+		require.Equal(t, 1, minedRows(t, s, ctx, tx),
 			"exactly one block, on this transaction's own row")
-		require.Nil(t, r.offChainSince, "mined on the longest chain means no longer waiting")
+
+		m, err := s.Get(ctx, h)
+		require.NoError(t, err)
+		require.Equal(t, []uint32{77}, m.BlockIDs)
+		require.Equal(t, []uint32{700_005}, m.BlockHeights)
+		require.Equal(t, []int{2}, m.SubtreeIdxs)
 	}
+
+	require.True(t, identExists(t, s, ctx, bystander),
+		"a transaction the call did not name must not be moved")
 
 	bh := bystander.TxIDChainHash()
 	br := readIdent(t, s, ctx, bh[:])
-	require.Empty(t, br.membership, "a transaction the call did not name must not be stamped")
+	require.Empty(t, br.membership, "nor stamped")
 	require.NotNil(t, br.offChainSince, "nor lose its mempool marker")
 }
 
@@ -80,6 +92,10 @@ func TestSetMinedMultiStampsEveryTransactionInOneCall(t *testing.T) {
 // The transactions already carrying the block must not gain it twice, and the ones that do
 // not yet carry it must gain it. A statement that got the per-row guard wrong would fail one
 // of those two and pass the other.
+//
+// After the first call the settled transactions are in the membership table, so the second
+// call reaches them through the residue path rather than the stamp, and each half of the batch
+// must still end up claiming this block exactly once.
 func TestSetMinedMultiReplaysOverAMixedBatch(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -96,12 +112,22 @@ func TestSetMinedMultiReplaysOverAMixedBatch(t *testing.T) {
 	require.NoError(t, err, "a re-offered block must not report its transactions missing")
 	require.Len(t, got, 5)
 
-	want := packTriples(t, [3]uint32{77, 700_005, 2})
+	stamped := make([]*bt.Tx, 0, len(first)+len(later))
+	stamped = append(stamped, first...)
+	stamped = append(stamped, later...)
 
-	for _, h := range all {
+	for _, tx := range stamped {
+		h := tx.TxIDChainHash()
+
 		require.Contains(t, got[*h], uint32(77))
-		require.Equal(t, want, readIdent(t, s, ctx, h[:]).membership,
-			"the block is recorded exactly once, whether or not this row already had it")
+		require.False(t, identExists(t, s, ctx, tx))
+		require.Equal(t, 1, minedRows(t, s, ctx, tx),
+			"the block is recorded exactly once, whether or not this transaction already had it")
+
+		m, err := s.Get(ctx, h)
+		require.NoError(t, err)
+		require.Equal(t, []uint32{77}, m.BlockIDs)
+		require.Equal(t, []int{2}, m.SubtreeIdxs)
 	}
 }
 
@@ -122,8 +148,8 @@ func TestSetMinedMultiToleratesTheSameHashTwiceInOneCall(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, got[*h], uint32(77))
 
-	require.Equal(t, packTriples(t, [3]uint32{77, 700_005, 2}),
-		readIdent(t, s, ctx, h[:]).membership, "named twice, recorded once")
+	require.False(t, identExists(t, s, ctx, tx))
+	require.Equal(t, 1, minedRows(t, s, ctx, tx), "named twice, recorded once")
 }
 
 // TestSetMinedMultiKeepsTheMempoolMarkerOffTheLongestChain pins the rule the stamp shares
@@ -151,11 +177,15 @@ func TestSetMinedMultiKeepsTheMempoolMarkerOffTheLongestChain(t *testing.T) {
 
 // TestUnsetMinedMultiUnstampsEveryTransactionInOneCall is the reorg path at batch width: each
 // transaction loses the block and gets a clock from the CURRENT tip.
+//
+// The stamp is a FORK stamp for the reason TestUnsetMinedGivesTheTransactionAFreshClock gives:
+// un-mining is an identity-row operation, and a longest-chain stamp on a row claiming no other
+// block moves that row out of the identity table.
 func TestUnsetMinedMultiUnstampsEveryTransactionInOneCall(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	txs := mkStoredTxs(t, s, 100, 1_000, 4)
-	info := utxo.MinedBlockInfo{BlockID: 5, BlockHeight: 100, SubtreeIdx: 0, OnLongestChain: true}
+	info := utxo.MinedBlockInfo{BlockID: 5, BlockHeight: 100, SubtreeIdx: 0}
 
 	_, err := s.SetMinedMulti(ctx, txHashes(txs), info)
 	require.NoError(t, err)

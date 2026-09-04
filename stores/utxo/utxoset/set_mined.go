@@ -6,7 +6,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
 // stampSQL records a block against every transaction that does not already claim it, and
@@ -100,17 +99,74 @@ SELECT i.txid, i.membership
 // needed.
 const appendMinedSQL = `
 INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
-                      size_in_bytes, tx_inpoints, locktime, created_at, flags)
-SELECT k.txid, $2, $3, $4, m.created_height, m.size_in_bytes, m.tx_inpoints, m.locktime,
-       m.created_at, m.flags
+                      size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
+SELECT k.txid, $2, $3, $4, m.created_height, m.size_in_bytes, m.fee, m.tx_inpoints,
+       m.locktime, m.created_at, m.flags
   FROM unnest($1::bytea[]) AS k(txid)
  CROSS JOIN LATERAL (
-   SELECT created_height, size_in_bytes, tx_inpoints, locktime, created_at, flags
+   SELECT created_height, size_in_bytes, fee, tx_inpoints, locktime, created_at, flags
      FROM tx_mined m
     WHERE m.txid = k.txid
     ORDER BY m.seq
     LIMIT 1 OFFSET 0
  ) AS m
+ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
+
+// moveToMinedSQL moves identity rows that, after this block, name exactly one block into the
+// membership table, deleting them from the identity table in the same statement.
+//
+// A row naming two or more blocks is left where it is with its marker cleared: the id-less
+// mark-on-longest-chain call cannot later say which of them is main, so the row waits for an
+// un-mine or a further stamp to reduce it to one.
+//
+// A row carrying conflicting children is left behind too, and that is a scope boundary rather
+// than a second reading of the same rule. tx_mined has no column for that bookkeeping; it
+// moves to a side table in a later task, and until it does, moving the row would lose the list
+// of children this transaction conflicts with. Its marker is already cleared by the stamp,
+// exactly as the multi-block case's is.
+//
+// The single-block test is an EQUALITY against the packed triple this stamp just appended, not
+// a length test, and that does both halves of the job at once: it is true only when the
+// membership column holds twelve bytes AND those twelve bytes are THIS block. A row whose one
+// triple named some other block would otherwise move under this block's facts. The length test
+// alone cannot go wrong today, because stampSQL has already appended this block by the time
+// this statement runs, but the equality does not depend on that ordering holding.
+//
+// mined_height, block_id and subtree_idx come from the parameters rather than from decoding the
+// membership bytes, because the equality above has already proved the two agree.
+//
+// THE KEYS ARE TWO ARRAY QUALS, NOT A JOIN AGAINST unnest, and that is the difference between
+// one index descent per key and a read of the whole mempool. Written the obvious way --
+// `DELETE FROM tx_ident i USING unnest($1, $2) AS k WHERE i.leaf = k.leaf AND i.txid = k.txid`
+// -- the planner is free to hash-join the keys against the table, and at 40,000 identity rows
+// it does: measured on this schema at 500 keys, the plan carried a Seq Scan on all eight leaf
+// partitions and built a 40,000-row hash to answer 500 keys, 8.7 ms of the statement's 12.4.
+// The array form plans as a bitmap index scan per surviving partition, 0.6 ms at the same
+// width, and its cost is a function of the batch rather than of the mempool. The LATERAL
+// fence the read statements use is not available here: a DELETE cannot laterally reference
+// its own target.
+//
+// txid = ANY is EXACT despite dropping the pairing. txid is the full 32 bytes and tx_ident_ck
+// makes leaf a function of it, so no row can satisfy the txid qual under a leaf other than its
+// own. The leaf array is therefore redundant as a filter and load-bearing as an access path:
+// it is what prunes partitions and what makes the primary key usable, since txid is its second
+// column. It must list the leaf of every txid in the batch, which is why both come from the
+// same loop.
+const moveToMinedSQL = `
+WITH moved AS (
+    DELETE FROM tx_ident i
+     WHERE i.leaf = ANY($1::smallint[])
+       AND i.txid = ANY($2::bytea[])
+       AND i.membership = $6::bytea
+       AND i.conflicting_children IS NULL
+    RETURNING i.txid, i.created_height, i.size_in_bytes, i.fee, i.tx_inpoints,
+              i.locktime, i.created_at, i.flags
+)
+INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
+                      size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
+SELECT m.txid, $3::int, $4::int, $5::int, m.created_height, m.size_in_bytes, m.fee,
+       m.tx_inpoints, m.locktime, m.created_at, m.flags
+  FROM moved m
 ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
 
 // deleteMinedRowSQL removes one block's membership row for a set of transactions.
@@ -153,17 +209,27 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 
 	entry := packMembership([]utxo.MinedBlockInfo{info})
 
-	stmt := stampSQL
-	marker := any(info.OnLongestChain)
+	// A block on the longest chain SETTLES the transactions it names, so the stamp is also a
+	// move: see stampAndMove. Everything else -- a fork stamp, an un-mine -- only rewrites the
+	// identity row, and one statement on the pool is the whole write. Un-mining wins over the
+	// flag when a caller sets both, as it did before the move existed.
+	if info.OnLongestChain && !info.UnsetMined {
+		if err := s.stampAndMove(ctx, leaves, txids, entry, info); err != nil {
+			return nil, err
+		}
+	} else {
+		stmt := stampSQL
+		marker := any(info.OnLongestChain)
 
-	if info.UnsetMined {
-		stmt = unstampSQL
-		// A fresh clock from the current tip. See unstampSQL.
-		marker = int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
-	}
+		if info.UnsetMined {
+			stmt = unstampSQL
+			// A fresh clock from the current tip. See unstampSQL.
+			marker = int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
+		}
 
-	if _, err := s.pool.Exec(ctx, stmt, leaves, txids, entry, marker); err != nil {
-		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
+		if _, err := s.pool.Exec(ctx, stmt, leaves, txids, entry, marker); err != nil {
+			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
+		}
 	}
 
 	rows, err := s.pool.Query(ctx, provePresentSQL, leaves, txids)
@@ -270,10 +336,88 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	return out, nil
 }
 
+// stampAndMove appends this block to every listed identity row, clears their mempool markers,
+// and moves the rows the block has settled into the membership table.
+//
+// The two statements are ONE TRANSACTION, and that is a correctness rule rather than a saved
+// round trip. The read path stops at an identity hit (see lookup.go), so between a committed
+// delete from tx_ident and a committed insert into tx_mined a concurrent reader finds the
+// transaction in neither table and reports it missing -- which makes the validator reject
+// every child of a parent that is merely being mined. Inside one transaction the two states
+// are the only two a reader can see.
+//
+// ensureTxMinedPartition runs BEFORE the transaction opens, because the DDL needs its own pool
+// connection; the same rule the create path follows.
+//
+// The order inside is fixed: stampSQL first, so moveToMinedSQL's single-block test sees the
+// row as this block leaves it. A row that only ever saw this block moves; one that already
+// carried a fork triple now carries two and stays.
+func (s *Store) stampAndMove(ctx context.Context, leaves []int16, txids [][]byte, entry []byte,
+	info utxo.MinedBlockInfo) error {
+	if err := s.ensureTxMinedPartition(ctx, info.BlockHeight); err != nil {
+		return err
+	}
+
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][SetMinedMulti] begin", err)
+	}
+
+	if _, err := dbTx.Exec(ctx, stampSQL, leaves, txids, entry, true); err != nil {
+		_ = dbTx.Rollback(ctx)
+
+		return errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
+	}
+
+	if _, err := dbTx.Exec(ctx, moveToMinedSQL, distinctLeaves(txids), txids,
+		int32(info.BlockHeight), int32(info.BlockID), int32(info.SubtreeIdx), //nolint:gosec // heights and ids fit
+		entry); err != nil {
+		_ = dbTx.Rollback(ctx)
+
+		return errors.NewStorageError("[utxoset][SetMinedMulti] move to membership", err)
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return errors.NewStorageError("[utxoset][SetMinedMulti] commit stamp and move", err)
+	}
+
+	return nil
+}
+
+// distinctLeaves is the set of leaf partitions a batch of transaction ids touches.
+//
+// moveToMinedSQL takes it rather than the per-key leaf array stampSQL takes, because there it
+// is a partition list and not a key: eight values at most, and a batch smaller than eight
+// prunes the partitions it cannot contain. Passing the per-key array would work and would
+// restate one leaf value a thousand times inside the plan.
+func distinctLeaves(txids [][]byte) []int16 {
+	var seen [8]bool
+
+	out := make([]int16, 0, 8)
+
+	for _, txid := range txids {
+		leaf := LeafFor(txid)
+		if seen[leaf] {
+			continue
+		}
+
+		seen[leaf] = true
+		out = append(out, leaf)
+	}
+
+	return out
+}
+
 // minedIDsByTxid reads the block ids tx_mined records for a set of transactions, in insertion
-// order. It reuses readMinedRows rather than a bespoke query, so the ids SetMinedMulti hands
-// back for a block-path transaction and the ids an ordinary Get would report can never
-// disagree about what "insertion order" means.
+// order. It goes through the read path's own membership step rather than a bespoke query, so
+// the ids SetMinedMulti hands back and the ids an ordinary Get would report can never disagree
+// about what "insertion order" means.
+//
+// A row that will not decode fails THIS CALL rather than being reported as a transaction
+// claiming no blocks, which is the conservative reading here: refusing the stamp is
+// recoverable, quietly stamping nothing is not. That is why the per-transaction failures are
+// collected and returned instead of being handed back alongside the answers, as they are on
+// the BatchDecorate path this result type was written for.
 func (s *Store) minedIDsByTxid(ctx context.Context, txids [][]byte) (map[chainhash.Hash][]uint32, error) {
 	hashes := make([]chainhash.Hash, 0, len(txids))
 
@@ -285,13 +429,17 @@ func (s *Store) minedIDsByTxid(ctx context.Context, txids [][]byte) (map[chainha
 		hashes = append(hashes, h)
 	}
 
-	data := make(map[chainhash.Hash]*meta.Data, len(hashes))
-	if err := s.readMinedRows(ctx, hashes, data); err != nil {
+	res := newLookupResult(len(hashes))
+	if err := s.readMinedInto(ctx, hashes, &res); err != nil {
 		return nil, err
 	}
 
-	out := make(map[chainhash.Hash][]uint32, len(data))
-	for h, d := range data {
+	for _, err := range res.failed {
+		return nil, err
+	}
+
+	out := make(map[chainhash.Hash][]uint32, len(res.found))
+	for h, d := range res.found {
 		out[h] = d.BlockIDs
 	}
 

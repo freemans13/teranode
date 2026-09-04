@@ -6,11 +6,14 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
 )
 
 // TestSetMinedRecordsTheBlockAndStopsWaiting is the ordinary path: a transaction that was in
-// the mempool is mined, so it gains block membership and leaves the mempool set.
+// the mempool is mined, so it gains block membership and leaves the mempool set -- which it
+// now does by leaving the mempool TABLE, because a block on the longest chain naming a row
+// that claims no other block settles it, and a settled transaction lives in tx_mined.
 func TestSetMinedRecordsTheBlockAndStopsWaiting(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -28,9 +31,14 @@ func TestSetMinedRecordsTheBlockAndStopsWaiting(t *testing.T) {
 	require.Contains(t, got, *h, "every hash asked about must appear in the answer")
 	require.Contains(t, got[*h], uint32(77), "and every answer must contain the block just recorded")
 
-	r := readIdent(t, s, ctx, h[:])
-	require.Nil(t, r.offChainSince, "mined on the longest chain means no longer waiting")
-	require.Equal(t, packTriples(t, [3]uint32{77, 700_005, 2}), r.membership)
+	require.False(t, identExists(t, s, ctx, tx), "mined on the longest chain means no longer waiting")
+	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+
+	m, err := s.Get(ctx, h)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{77}, m.BlockIDs)
+	require.Equal(t, []uint32{700_005}, m.BlockHeights)
+	require.Equal(t, []int{2}, m.SubtreeIdxs)
 }
 
 // TestSetMinedOnAReplayedBlockStillAnswers is the trap, and it is the reason this is two
@@ -59,8 +67,7 @@ func TestSetMinedOnAReplayedBlockStillAnswers(t *testing.T) {
 	require.Contains(t, got, *h)
 	require.Contains(t, got[*h], uint32(77))
 
-	r := readIdent(t, s, ctx, h[:])
-	require.Equal(t, packTriples(t, [3]uint32{77, 700_005, 2}), r.membership,
+	require.Equal(t, 1, minedRows(t, s, ctx, tx),
 		"and the same block must not be recorded twice")
 }
 
@@ -91,6 +98,13 @@ func TestSetMinedReportsATransactionItDoesNotHold(t *testing.T) {
 // and un-mining is an identity-row operation: it puts a transaction BACK in the mempool set,
 // which is only meaningful for one that was in it. At the tip that is the only shape a reorg
 // ever sees, because everything but the coinbase arrives from the mempool first.
+//
+// The stamp here is a FORK stamp, and that is not a detail. A longest-chain stamp on a row
+// claiming no other block settles it and moves it out of the identity table altogether, and
+// bringing such a row back from tx_mined is its own step (the reverse move). The row this test
+// needs is one that still holds an identity row and still claims a block, which is what a fork
+// stamp leaves behind. The marker-clearing half of the stamp is pinned by
+// TestLongestChainStampOnAMultiBlockRowClearsTheMarkerAndStays.
 func TestUnsetMinedGivesTheTransactionAFreshClock(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -101,11 +115,11 @@ func TestUnsetMinedGivesTheTransactionAFreshClock(t *testing.T) {
 	h := tx.TxIDChainHash()
 
 	_, err = s.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
-		BlockID: 5, BlockHeight: 100, SubtreeIdx: 0, OnLongestChain: true,
+		BlockID: 5, BlockHeight: 100, SubtreeIdx: 0,
 	})
 	require.NoError(t, err)
 
-	require.Nil(t, readIdent(t, s, ctx, h[:]).offChainSince)
+	require.Equal(t, packTriples(t, [3]uint32{5, 100, 0}), readIdent(t, s, ctx, h[:]).membership)
 
 	require.NoError(t, s.SetBlockHeight(5_000))
 
@@ -172,4 +186,79 @@ func TestSetMinedMultiStillFailsForAnUnknownTransaction(t *testing.T) {
 	tx := mkTx(t, 1, 5_000)
 	_, err := s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true})
 	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+}
+
+// TestLongestChainStampMovesAMempoolRowIntoMembership: after the stamp the transaction has no
+// identity row, one membership row, and Get still answers with its block.
+func TestLongestChainStampMovesAMempoolRowIntoMembership(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_099)
+	require.NoError(t, err)
+	require.True(t, identExists(t, s, ctx, tx))
+
+	// The create path writes fee NULL on purpose, so give the row one. A fee lost in the move
+	// would only surface once block assembly rebuilt a candidate from an un-mined transaction.
+	_, err = s.pool.Exec(ctx, `UPDATE tx_ident SET fee = 1234 WHERE txid = $1`, hashBytes(tx))
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, SubtreeIdx: 2, OnLongestChain: true})
+	require.NoError(t, err)
+
+	require.False(t, identExists(t, s, ctx, tx), "mined on the main chain: the mempool row is gone")
+	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+
+	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, got.BlockIDs)
+	require.Equal(t, []int{2}, got.SubtreeIdxs)
+	require.Equal(t, uint64(uint32(tx.Size())), got.SizeInBytes, "the mempool payload travels with the row")
+	require.NotNil(t, got.TxInpoints.ParentTxHashes)
+	require.Equal(t, uint64(1_234), got.Fee, "and so does the fee block assembly would need back")
+}
+
+// TestForkStampAppendsAndMovesNothing: a block not on the longest chain records itself on the
+// identity row and leaves the transaction in the mempool set.
+func TestForkStampAppendsAndMovesNothing(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_099)
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
+	require.NoError(t, err)
+
+	require.True(t, identExists(t, s, ctx, tx))
+	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+
+	got, err := s.Get(ctx, tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, got.BlockIDs)
+	require.NotZero(t, got.UnminedSince, "still in the mempool set")
+}
+
+// TestLongestChainStampOnAMultiBlockRowClearsTheMarkerAndStays: two blocks name it, so no
+// single block is "its" block; the marker clears, the row stays for a later un-mine or stamp
+// to disambiguate.
+func TestLongestChainStampOnAMultiBlockRowClearsTheMarkerAndStays(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_099)
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100, OnLongestChain: true})
+	require.NoError(t, err)
+
+	require.True(t, identExists(t, s, ctx, tx))
+	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+
+	got, err := s.Get(ctx, tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42, 43}, got.BlockIDs)
+	require.Zero(t, got.UnminedSince)
 }

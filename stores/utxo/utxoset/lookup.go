@@ -57,17 +57,17 @@ SELECT i.txid, i.created_height, i.off_chain_since, i.membership, i.fee, i.size_
 // which at 1440 blocks of mainnet is millions of rows, and this read is on the validator's
 // parent-resolution path.
 //
-// OFFSET 0 is the fence itself, the same one hasLiveCoinSQL relies on: it stops the planner
+// OFFSET 0 is the fence itself, the same one coinFactsSQL relies on: it stops the planner
 // pulling the subquery up into the outer join, which is what re-admits the hash join. The
 // inner ORDER BY walks the primary key in order; the outer one is what actually guarantees the
 // grouping the reader relies on, because the LEFT JOIN to the body may reorder rows.
 const minedByTxidSQL = `
-SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes,
+SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes, m.fee,
        m.tx_inpoints, m.locktime, m.created_at, m.flags, b.raw_tx
   FROM unnest($1::bytea[]) AS k(txid)
  CROSS JOIN LATERAL (
    SELECT m.mined_height, m.block_id, m.subtree_idx, m.created_height, m.size_in_bytes,
-          m.tx_inpoints, m.locktime, m.created_at, m.flags, m.seq
+          m.fee, m.tx_inpoints, m.locktime, m.created_at, m.flags, m.seq
      FROM tx_mined m
     WHERE m.txid = k.txid
     ORDER BY m.seq
@@ -78,9 +78,10 @@ SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes,
 
 // coinFactsSQL reads one live coin per transaction, for the transactions nothing else knows.
 // The LATERAL with ORDER BY and LIMIT 1 OFFSET 0 is the fence the planner needs to walk the
-// packed-key index instead of scanning the coin table. See hasLiveCoinSQL for the measurements
-// behind each half of that fence: without the range bound the planner reads every partition,
-// and without the ORDER BY it materialises the whole range before the LIMIT can stop it.
+// packed-key index instead of scanning the coin table, and each half of it was measured:
+// without the packed-key range bound the planner reads every leaf partition, and without the
+// ORDER BY it materialises the whole range before the LIMIT can stop it. createMinedPlanSQL's
+// duplicate-coin guard carries the identical fence, for the identical reason.
 const coinFactsSQL = `
 SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
   FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[]) AS k(leaf, txid, lo, hi)
@@ -287,6 +288,7 @@ func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
 			blockID     int32
 			subtreeIdx  int32
 			sizeInBytes *int32
+			fee         *int64
 			txInpoints  []byte
 			locktime    *int32
 			createdAt   *int64
@@ -295,7 +297,7 @@ func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
 		)
 
 		if err := rows.Scan(&txid, &minedHeight, &blockID, &subtreeIdx,
-			&sizeInBytes, &txInpoints, &locktime, &createdAt, &flags, &rawTx); err != nil {
+			&sizeInBytes, &fee, &txInpoints, &locktime, &createdAt, &flags, &rawTx); err != nil {
 			return errors.NewStorageError("[utxoset][lookup] membership scan", err)
 		}
 
@@ -320,6 +322,12 @@ func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
 
 			if sizeInBytes != nil {
 				data.SizeInBytes = uint64(*sizeInBytes) //nolint:gosec // a size is never negative
+			}
+
+			// NULL for every row the block path wrote, and the fee the identity row carried
+			// for one the tip's stamp moved here. See the fee column in schema.go.
+			if fee != nil {
+				data.Fee = uint64(*fee) //nolint:gosec // a fee is never negative
 			}
 
 			if locktime != nil {
@@ -365,29 +373,6 @@ func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
 
 	if err := rows.Err(); err != nil {
 		return errors.NewStorageError("[utxoset][lookup] membership rows", err)
-	}
-
-	return nil
-}
-
-// readMinedRows is the membership step for a caller that holds a plain map and has no
-// per-transaction error channel to report a fault to.
-//
-// minedIDsByTxid is that caller: it wants the block ids tx_mined records, so that the ids
-// SetMinedMulti hands back and the ids an ordinary Get reports cannot disagree about what
-// insertion order means. A row that will not decode fails ITS call rather than being reported
-// as a transaction claiming no blocks, which is the conservative reading there: refusing the
-// stamp is recoverable, quietly stamping nothing is not.
-func (s *Store) readMinedRows(ctx context.Context, hashes []chainhash.Hash,
-	out map[chainhash.Hash]*meta.Data) error {
-	res := lookupResult{found: out}
-
-	if err := s.readMinedInto(ctx, hashes, &res); err != nil {
-		return err
-	}
-
-	for _, err := range res.failed {
-		return err
 	}
 
 	return nil
@@ -469,9 +454,9 @@ func (s *Store) readCoinFacts(ctx context.Context, hashes []chainhash.Hash,
 	return nil
 }
 
-// liveCoinArgs expands transaction ids into the four parallel arrays coinFactsSQL and
-// hasLiveCoinSQL take: the partition key, the identity, and the packed-key range covering
-// every output the transaction could have created.
+// liveCoinArgs expands transaction ids into the four parallel arrays coinFactsSQL takes: the
+// partition key, the identity, and the packed-key range covering every output the transaction
+// could have created.
 //
 // It is a named function rather than four lines inline so the plan tests can build exactly the
 // arguments the production path builds. A test that explained a hand-written variant would be

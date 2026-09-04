@@ -114,7 +114,9 @@ SELECT t.k
 //     cannot swap the range scan for a scan of the whole leaf partition.
 //
 // tx_inpoints is written NULL: below the checkpoint nothing can un-mine, and at the tip the
-// block path only creates coinbases, which have no inputs.
+// block path only creates coinbases, which have no inputs. fee is written NULL for the same
+// reason createIdentPlanSQL writes it NULL -- the store never computes one, and a coinbase
+// has none to compute.
 const createMinedPlanSQL = `
 WITH t AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::int[], $5::int[],
@@ -125,9 +127,9 @@ WITH t AS (
 ),
 claim AS (
     INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
-                          size_in_bytes, tx_inpoints, locktime, created_at, flags)
+                          size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
     SELECT t.txid, t.mined_height, t.block_id, t.subtree_idx, t.created_height,
-           t.size_in_bytes, NULL, NULL, t.created_at, t.flags
+           t.size_in_bytes, NULL::bigint, NULL::bytea, NULL::int, t.created_at, t.flags
       FROM t
      WHERE NOT EXISTS (SELECT 1 FROM tx_mined m WHERE m.txid = t.txid AND m.mined_height = t.mined_height)
        AND NOT EXISTS (SELECT 1 FROM tx_ident i WHERE i.leaf = t.leaf AND i.txid = t.txid)
