@@ -558,3 +558,92 @@ func TestReclaimStillRefusesAnUnmarkedSpendWhoseSpenderHasNoIdentityRow(t *testi
 	require.True(t, identExists(t, s, ctx, parent),
 		"an unmarked spend by a spender with no row proves nothing about depth")
 }
+
+// twoPartitionParent builds the shape of the too-early-acceptance hole: a parent with two
+// outputs, the first spent in an old partition by a settled child, the second spent much later
+// by a child that is still in the mempool, so the parent has no live coin when the old
+// partition retires but one of its spenders is not buried.
+//
+// firstMarked says whether the old spend carries the block-applied mark, so both reclaim paths
+// (marked fast path and unmarked three-probe path) can be exercised.
+func twoPartitionParent(t *testing.T, s *Store, ctx context.Context, firstMarked bool) *bt.Tx {
+	t.Helper()
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	// Output 0 goes at height 100, into the partition that will retire.
+	first := bt.NewTx()
+	require.NoError(t, first.FromUTXOs(&bt.UTXO{
+		TxIDHash: parent.TxIDChainHash(), Vout: 0,
+		LockingScript: parent.Outputs[0].LockingScript, Satoshis: parent.Outputs[0].Satoshis,
+	}))
+	first.AddOutput(&bt.Output{Satoshis: 4_000, LockingScript: parent.Outputs[0].LockingScript})
+
+	_, err = s.Create(ctx, first, 100)
+	require.NoError(t, err)
+	_, err = spendOnly(ctx, s, first, 100, utxo.WithSkipUTXOHashCheck(firstMarked))
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(first), utxo.MinedBlockInfo{
+		BlockID: 2, BlockHeight: 100, OnLongestChain: true})
+	require.NoError(t, err)
+
+	// Output 1 goes at height 900, into a partition that stays attached, by a spender that is
+	// never mined.
+	spendOneOutput(t, s, ctx, parent, 1, 900)
+
+	return parent
+}
+
+// TestReclaimKeepsAParentWhoseLaterSpendIsStillUnsettled pins the hole four adversaries found
+// in the running code on 3 September 2026.
+//
+// The reclaimer judges a parent from the spenders named by the ONE retiring partition. A spend
+// of the same parent recorded in a newer partition is never consulted, and the only guard
+// against it is the live-coin check, which is false the moment that later spend took the last
+// coin. So a parent whose first output was spent long ago by a settled child and whose last
+// output was spent recently by a mempool child is deleted while that child still needs it. At
+// the 1440-block coupling the two spends must be about 1,400 blocks apart, so it is rare;
+// shorten the lag and it is the ordinary payment-then-change pattern. At the tip, when the
+// child is mined, block validation looks the parent up, finds nothing, and in the RUNNING
+// state stores a valid block as invalid.
+func TestReclaimKeepsAParentWhoseLaterSpendIsStillUnsettled(t *testing.T) {
+	s, ctx := newTestStore(t)
+	s.journalRetention = 96
+
+	parent := twoPartitionParent(t, s, ctx, false)
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	// Tip 1,000: the height-100 partition retires (100 + 96 < 1,000); the height-900 one stays.
+	_, err = svc.Prune(ctx, 1_000, "deadbeef")
+	require.NoError(t, err)
+
+	require.False(t, journalLeafExists(t, s, ctx, 100), "the old partition must have retired for this to test anything")
+	require.True(t, journalLeafExists(t, s, ctx, 900), "the recent spend's partition is still attached")
+	require.True(t, identExists(t, s, ctx, parent),
+		"a spend of this parent in a newer partition has an unmined spender; the parent is still needed")
+}
+
+// TestReclaimKeepsAParentWhoseLaterSpendIsUnsettledEvenWhenTheOldSpendIsMarked. The marked
+// fast path retires a coin-free parent without probing anything. It must still see a recent
+// unmarked spend in a newer partition, or the mark reopens the same hole with no probe at all.
+func TestReclaimKeepsAParentWhoseLaterSpendIsUnsettledEvenWhenTheOldSpendIsMarked(t *testing.T) {
+	s, ctx := newTestStore(t)
+	s.journalRetention = 96
+
+	parent := twoPartitionParent(t, s, ctx, true)
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	_, err = svc.Prune(ctx, 1_000, "deadbeef")
+	require.NoError(t, err)
+
+	require.False(t, journalLeafExists(t, s, ctx, 100))
+	require.True(t, identExists(t, s, ctx, parent),
+		"the old spend being block-applied says nothing about the mempool spend that took the last coin")
+}

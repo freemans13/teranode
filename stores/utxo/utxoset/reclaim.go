@@ -194,6 +194,38 @@ SELECT k.txid
    OFFSET 0
  ) AS hit`
 
+// unmarkedRecentSpendsSQL asks whether ANY spend recorded above the settled depth lacks the
+// applied mark. Below the checkpoint every spend is block-applied and marked, so this is false
+// for the whole of initial sync and the recent-spend probe below never runs. The moment a
+// mempool spend is journaled it is true, and stays true, because the tip is where the probe
+// is needed. Partition pruning on spent_height bounds the scan to the newest few partitions;
+// EXISTS stops at the first match, so the worst case is the no-match case, a sequential read
+// of those partitions once per retiring partition.
+const unmarkedRecentSpendsSQL = `
+SELECT EXISTS (SELECT 1 FROM spend_journal WHERE spent_height > $1 AND NOT applied)`
+
+// recentSpendsSQL returns the subset of parents that have a spend recorded above the settled
+// depth, in any attached partition. Such a spend's spender cannot be buried yet, so the parent
+// is not finished whatever the retiring partition says about it.
+//
+// The shape is hasLiveCoinSQL's: a lateral probe of the journal's packed-key index per
+// partition with ORDER BY and LIMIT 1 OFFSET 0 as the fence, and spent_height in the predicate
+// so only the partitions above the depth are visited.
+const recentSpendsSQL = `
+SELECT k.txid
+  FROM unnest($1::bytea[], $2::uuid[], $3::uuid[]) AS k(txid, lo, hi)
+ CROSS JOIN LATERAL (
+   SELECT 1
+     FROM spend_journal j
+    WHERE j.spent_height > $4
+      AND j.ukey >= k.lo
+      AND j.ukey <= k.hi
+      AND j.txid  = k.txid
+    ORDER BY j.ukey
+    LIMIT 1
+   OFFSET 0
+ ) AS hit`
+
 // deleteIdentSQL removes finished identity rows.
 //
 // This table cannot be reclaimed by dropping a window, because a row dies when its
@@ -220,6 +252,18 @@ DELETE FROM tx_ident i
 // So a rejected candidate comes back on its own, at exactly the right moment, with no state
 // carried between sessions.
 //
+// A parent is judged from the spenders the retiring partition names, and that alone is not
+// enough at the tip. A later spend of the same parent sits in a newer partition the reclaimer
+// has not read, and the live-coin check stops guarding the parent the moment that later spend
+// took the last coin. So a parent whose first output was spent long ago by a settled child
+// and whose last output was spent recently by a mempool child would be deleted with that child
+// unmined; when the child is mined, block validation looks the parent up, finds nothing, and
+// in the RUNNING state stores a valid block as invalid. Below the checkpoint there is no
+// mempool and every spend is settled by construction, so the check is skipped there, decided
+// once per retiring partition by unmarkedRecentSpendsSQL. Above it, every doomed parent is
+// first probed for a spend above the settled depth in any attached partition.
+// TestReclaimKeepsAParentWhoseLaterSpendIsStillUnsettled pins this in both reclaim paths.
+//
 // The whole partition is JUDGED before anything is DELETED, and the delete is one database
 // transaction. Both halves are load-bearing. The settled check asks whether each spender's
 // identity row is on the main chain and buried, so it needs the spender's row to still exist.
@@ -237,6 +281,11 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 	limit := s.reclaimChunkParents
 	if limit <= 0 {
 		limit = DefaultReclaimChunkParents
+	}
+
+	guardRecent, err := s.hasUnmarkedRecentSpends(ctx, tip)
+	if err != nil {
+		return 0, 0, err
 	}
 
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(candidatesSQL, partition))
@@ -267,7 +316,7 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 		// every row for one parent arrives together, and cutting mid-parent would judge it
 		// on a subset of its spenders.
 		if len(batch.parents) >= limit && !bytes.Equal(parent, lastParent) {
-			d, cerr := s.judgeBatch(ctx, batch, tip)
+			d, cerr := s.judgeBatch(ctx, batch, tip, guardRecent)
 			if cerr != nil {
 				scanErr = cerr
 				break
@@ -294,7 +343,7 @@ func (s *Store) reclaimFromPartition(ctx context.Context, partition string, tip 
 	}
 
 	if len(batch.parents) > 0 {
-		d, err := s.judgeBatch(ctx, batch, tip)
+		d, err := s.judgeBatch(ctx, batch, tip, guardRecent)
 		if err != nil {
 			return 0, chunks, err
 		}
@@ -379,10 +428,39 @@ func (s *Store) deleteIdents(ctx context.Context, doomed [][]byte, chunk int) (i
 // spendable outputs, or its own row was already reclaimed. Below the checkpoint the mark
 // answers for it. At the tip the fail-safe stays, because an unmarked spend by a spender
 // with no row proves nothing about depth.
-func (s *Store) judgeBatch(ctx context.Context, b *reclaimBatch, tip uint32) ([][]byte, error) {
+func (s *Store) judgeBatch(ctx context.Context, b *reclaimBatch, tip uint32, guardRecent bool) ([][]byte, error) {
 	if len(b.parents) == 0 {
 		return nil, nil
 	}
+
+	doomed, err := s.judgeBatchLocal(ctx, b, tip)
+	if err != nil || !guardRecent || len(doomed) == 0 {
+		return doomed, err
+	}
+
+	recent, err := s.withRecentSpends(ctx, doomed, tip)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(recent) == 0 {
+		return doomed, nil
+	}
+
+	kept := make([][]byte, 0, len(doomed))
+
+	for _, parent := range doomed {
+		if _, ok := recent[string(parent)]; !ok {
+			kept = append(kept, parent)
+		}
+	}
+
+	return kept, nil
+}
+
+// judgeBatchLocal decides a batch on the retiring partition's own evidence: live coins, the
+// applied mark, and the settled and on-chain probes for unmarked parents.
+func (s *Store) judgeBatchLocal(ctx context.Context, b *reclaimBatch, tip uint32) ([][]byte, error) {
 
 	live, err := s.withLiveCoins(ctx, b.parents)
 	if err != nil {
@@ -460,6 +538,54 @@ func (s *Store) judgeBatch(ctx context.Context, b *reclaimBatch, tip uint32) ([]
 	}
 
 	return doomed, nil
+}
+
+// hasUnmarkedRecentSpends reports whether any spend above the settled depth lacks the applied
+// mark, which is the condition under which the recent-spend probe is needed at all.
+func (s *Store) hasUnmarkedRecentSpends(ctx context.Context, tip uint32) (bool, error) {
+	if tip < SettledDepthBlocks {
+		return true, nil
+	}
+
+	var any bool
+	if err := s.pool.QueryRow(ctx, unmarkedRecentSpendsSQL, int64(tip-SettledDepthBlocks)).Scan(&any); err != nil {
+		return false, errors.NewStorageError("[utxoset][reclaim] unmarked recent spends", err)
+	}
+
+	return any, nil
+}
+
+// withRecentSpends returns the subset of parents with a spend recorded above the settled depth.
+func (s *Store) withRecentSpends(ctx context.Context, parents [][]byte, tip uint32) (map[string]struct{}, error) {
+	out := make(map[string]struct{}, len(parents))
+
+	if len(parents) == 0 || tip < SettledDepthBlocks {
+		return out, nil
+	}
+
+	_, ids, los, his := liveCoinArgs(parents)
+
+	rows, err := s.pool.Query(ctx, recentSpendsSQL, ids, los, his, int64(tip-SettledDepthBlocks))
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][reclaim] recent spends", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var txid []byte
+		if err := rows.Scan(&txid); err != nil {
+			return nil, errors.NewStorageError("[utxoset][reclaim] recent spends scan", err)
+		}
+
+		out[string(txid)] = struct{}{}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, errors.NewStorageError("[utxoset][reclaim] recent spends rows", err)
+	}
+
+	return out, nil
 }
 
 // reclaimBatch holds one bounded slice of a partition's work list.
