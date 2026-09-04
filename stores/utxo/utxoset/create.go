@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/jackc/pgx/v5"
 )
 
 // noteConflictSQL records a contesting transaction on the parent whose coin it wants.
@@ -104,6 +105,28 @@ func offChainSinceAt(infos []utxo.MinedBlockInfo, blockHeight uint32) *int32 {
 	return &h
 }
 
+// minedBlock returns the block a create says contains the transaction, and whether it says so
+// at all.
+//
+// A create carrying mined-block information is a block-path create: below the checkpoint every
+// create, at the tip only block assembly's coinbase. It claims on tx_mined and its coins know
+// their block. Anything else is a mempool create and claims on tx_ident with the unconfirmed
+// sentinel on its coins.
+//
+// An explicit un-mine is the one kind of block information that does NOT mean mined, which is
+// the same exemption offChainSinceAt makes, and for the same reason.
+func minedBlock(infos []utxo.MinedBlockInfo) (utxo.MinedBlockInfo, bool) {
+	for _, mi := range infos {
+		if mi.UnsetMined {
+			continue
+		}
+
+		return mi, true
+	}
+
+	return utxo.MinedBlockInfo{}, false
+}
+
 // Create records a transaction's spendable outputs in the UTXO table.
 //
 // Only SPENDABLE outputs get a row. A provably-unspendable output — an OP_RETURN data
@@ -112,6 +135,14 @@ func offChainSinceAt(infos []utxo.MinedBlockInfo, blockHeight uint32) *int32 {
 // postgres store's spendable_count and the aerospike store's ShouldStoreOutputAsUTXO
 // gate, so all three agree on what "spendable" means.
 func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
+	// Parsed up front rather than only on the batched path, because the single path now needs
+	// to know whether this create carries block information before it opens its transaction:
+	// that is what decides which membership window has to exist.
+	options := &utxo.CreateOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	// Batched when configured, which is the normal path. The batcher collects calls arriving
 	// from many goroutines and sends them as one round trip, which is what the other two
 	// implementations of this interface do and what this store was missing.
@@ -120,11 +151,6 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 	// transaction rather than only to the transaction itself, so two items in one batch can
 	// touch the same row, which is exactly the overlap the batched path assumes away.
 	if s.createBatcher != nil {
-		options := &utxo.CreateOptions{}
-		for _, opt := range opts {
-			opt(options)
-		}
-
 		if !options.Conflicting {
 			done := make(chan createResult, 1)
 
@@ -144,11 +170,54 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		}
 	}
 
+	// Both windows BEFORE the transaction is opened, never inside it: the DDL needs its own
+	// pool connection, and taking one while holding a transaction from the same pool
+	// deadlocks the pool under concurrency, with no timeout.
 	if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
 		return nil, err
 	}
 
-	return s.createIn(ctx, s.pool, tx, blockHeight, opts...)
+	if mi, mined := minedBlock(options.MinedBlockInfos); mined {
+		if err := s.ensureTxMinedPartition(ctx, mi.BlockHeight); err != nil {
+			return nil, err
+		}
+	}
+
+	// A transaction of its own, because the create claim's advisory lock is
+	// transaction-scoped: on the pool it would be released at the end of its own statement
+	// and would guard nothing. Nothing here is worth more than one commit, so the single
+	// path pays one BEGIN and one COMMIT rather than the three statements it used to.
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][Create] begin", err)
+	}
+
+	committed := false
+
+	defer func() {
+		if !committed {
+			_ = dbTx.Rollback(ctx)
+		}
+	}()
+
+	data, cerr := s.createIn(ctx, dbTx, tx, blockHeight, opts...)
+
+	// ErrTxExists is committed rather than rolled back. The claim wrote nothing at all for a
+	// transaction the store already holds, so the two are equivalent for the claim itself --
+	// but the conflicting path also notes the contest on the incoming transaction's PARENTS,
+	// and that note has to survive, because conflict resolution's only route from a contested
+	// coin to the transactions competing for it is the parent's list.
+	if cerr != nil && !errors.Is(cerr, errors.ErrTxExists) {
+		return nil, cerr
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return nil, errors.NewStorageError("[utxoset][Create] commit", err)
+	}
+
+	committed = true
+
+	return data, cerr
 }
 
 // appendCreate adds one transaction to the plan: its identity row, its serialized bytes, and
@@ -218,6 +287,22 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 
 	genesisHeight := s.settings.ChainCfgParams.GenesisActivationHeight
 
+	// Which of the two claims this create takes, and the block facts that go on its coins.
+	// Both heights and the block id are 0 for a mempool create, and mined_height 0 is the
+	// unconfirmed sentinel the coin carries until something stamps it.
+	var (
+		minedHeight int32
+		blockID     int32
+		subtreeIdx  int32
+	)
+
+	mi, mined := minedBlock(options.MinedBlockInfos)
+	if mined {
+		minedHeight = int32(mi.BlockHeight) //nolint:gosec // a height fits int32 for any reachable chain
+		blockID = int32(mi.BlockID)         //nolint:gosec // a block id fits int32
+		subtreeIdx = int32(mi.SubtreeIdx)   //nolint:gosec // a subtree index fits int32
+	}
+
 	// The identity row. k is this transaction's position in the statement, and the result
 	// comes back keyed on it, so a caller learns whether its OWN claim took rather than
 	// whether the batch as a whole wrote anything.
@@ -235,6 +320,12 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	p.createdAt = append(p.createdAt, time.Now().UnixMilli())
 	p.txFlags = append(p.txFlags, flags)
 	p.bodies = append(p.bodies, tx.Bytes())
+	p.minedRows = append(p.minedRows, mined)
+	p.minedHeight = append(p.minedHeight, minedHeight)
+	p.blockID = append(p.blockID, blockID)
+	p.subtreeIdx = append(p.subtreeIdx, subtreeIdx)
+	p.lo = append(p.lo, Pack(txHash[:], 0))
+	p.hi = append(p.hi, Pack(txHash[:], ^uint32(0)))
 
 	coinsBefore := len(p.coinTxids)
 
@@ -260,6 +351,8 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		p.coinUkeys = append(p.coinUkeys, Pack(txHash[:], uint32(vout)))
 		p.coinTxids = append(p.coinTxids, txHash[:])
 		p.coinScripts = append(p.coinScripts, script)
+		p.coinMined = append(p.coinMined, minedHeight)
+		p.coinBlockIDs = append(p.coinBlockIDs, blockID)
 	}
 
 	// No coin row means no spend will ever name this transaction, so the birth ledger has to.
@@ -273,14 +366,20 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	}, nil
 }
 
-// createIn is Create against an arbitrary querier, so SpendAndCreate can run it inside the
-// same database transaction as the spend.
+// createIn is Create inside an EXISTING database transaction, so SpendAndCreate can run it in
+// the same one as the spend.
+//
+// It takes a pgx.Tx rather than the wider querier, and that is a requirement rather than
+// tightening for its own sake: the claim's idempotence rests on a transaction-scoped advisory
+// lock, which on a pool connection would be released at the end of the statement that took it.
+// Every caller therefore opens a transaction, and Create's own is what pays for its single
+// path.
 //
 // It is a plan of one. There is deliberately no second statement for the single-transaction
 // case: what a create writes, and the claim that decides whether it writes at all, is this
 // store's whole idempotence rule, and two copies of it is a defect waiting for one to be
 // edited alone.
-func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
+func (s *Store) createIn(ctx context.Context, dbTx pgx.Tx, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
 	options := &utxo.CreateOptions{}
 	for _, opt := range opts {
 		opt(options)
@@ -291,15 +390,19 @@ func (s *Store) createIn(ctx context.Context, q querier, tx *bt.Tx, blockHeight 
 		return nil, plan.errs[0]
 	}
 
+	if err := s.lockTxids(ctx, dbTx, plan.txids); err != nil {
+		return nil, err
+	}
+
 	if options.Conflicting {
 		txHash := tx.TxIDChainHash()
 
-		if cerr := s.noteConflictOnParents(ctx, q, tx, txHash[:]); cerr != nil {
+		if cerr := s.noteConflictOnParents(ctx, dbTx, tx, txHash[:]); cerr != nil {
 			return nil, cerr
 		}
 	}
 
-	if err := s.runCreatePlan(ctx, q, plan); err != nil {
+	if err := s.runCreatePlan(ctx, dbTx, plan); err != nil {
 		return nil, err
 	}
 

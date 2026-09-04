@@ -284,10 +284,12 @@ func (s *Store) applyChunk(chunk []*spendAndCreateItem, delivered []bool) {
 	}
 }
 
-// ensurePartitionsFor creates every journal leaf and body window the batch will write into.
+// ensurePartitionsFor creates every journal leaf, body window and membership window the batch
+// will write into.
 func (s *Store) ensurePartitionsFor(ctx context.Context, batch []*spendAndCreateItem) error {
 	leaves := make(map[uint32]struct{}, 2)
 	windows := make(map[uint32]struct{}, 2)
+	mined := make(map[uint32]struct{}, 2)
 
 	for _, item := range batch {
 		if !item.options.CreateOnly {
@@ -306,6 +308,16 @@ func (s *Store) ensurePartitionsFor(ctx context.Context, batch []*spendAndCreate
 
 				if err := s.ensureTxBodyPartition(ctx, item.blockHeight); err != nil {
 					return err
+				}
+			}
+
+			if mi, isMined := minedBlock(item.options.MinedBlockInfos); isMined {
+				if win := mi.BlockHeight / TxMinedPartitionBlocks; !has(mined, win) {
+					mined[win] = struct{}{}
+
+					if err := s.ensureTxMinedPartition(ctx, mi.BlockHeight); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -474,15 +486,25 @@ func (s *Store) runSpendAndCreateBatch(ctx context.Context, batch []*spendAndCre
 	if len(creators) > 0 {
 		plan := s.planCreates(creators)
 
-		// A batch with no spends left is one statement, and one statement is atomic on its
-		// own. Issuing it on the pool skips the BEGIN and COMMIT round trips, which is two of
-		// the three a create-only block pass used to pay per transaction.
-		var q querier = s.pool
-		if dbTx != nil {
-			q = dbTx
+		// A create-only batch has no spend phase and so no transaction yet, and it needs one:
+		// the claim's advisory lock is transaction-scoped, so taken on the pool it would be
+		// released at the end of its own statement and would guard nothing. This used to run
+		// on the pool to save the BEGIN and COMMIT round trips, which is a real cost on the
+		// block-application path and a smaller one than two creates of the same transaction
+		// each writing a full set of coins.
+		if dbTx == nil {
+			dbTx, err = s.pool.Begin(ctx)
+			if err != nil {
+				return results, rejected, errors.NewStorageError("[utxoset][SpendAndCreate] begin creates", err)
+			}
 		}
 
-		if err = s.runCreatePlan(ctx, q, plan); err != nil {
+		if err = s.lockTxids(ctx, dbTx, plan.txids); err != nil {
+			rollback()
+			return results, rejected, err
+		}
+
+		if err = s.runCreatePlan(ctx, dbTx, plan); err != nil {
 			rollback()
 			return results, rejected, err
 		}

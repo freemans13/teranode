@@ -29,33 +29,6 @@ func journalLeafExists(t *testing.T, s *Store, ctx context.Context, height uint3
 	return n > 0
 }
 
-// spendOneOutput builds a transaction taking one of parent's outputs and applies the spend at
-// height, leaving the spender unmined.
-func spendOneOutput(t *testing.T, s *Store, ctx context.Context, parent *bt.Tx, vout uint32,
-	height uint32) *bt.Tx {
-	t.Helper()
-
-	child := bt.NewTx()
-	require.NoError(t, child.FromUTXOs(&bt.UTXO{
-		TxIDHash:      parent.TxIDChainHash(),
-		Vout:          vout,
-		LockingScript: parent.Outputs[vout].LockingScript,
-		Satoshis:      parent.Outputs[vout].Satoshis,
-	}))
-	child.AddOutput(&bt.Output{
-		Satoshis:      parent.Outputs[vout].Satoshis - 1_000,
-		LockingScript: parent.Outputs[vout].LockingScript,
-	})
-
-	_, err := s.Create(ctx, child, height)
-	require.NoError(t, err)
-
-	_, err = spendOnly(ctx, s, child, height)
-	require.NoError(t, err)
-
-	return child
-}
-
 // settledPair creates a parent with one output, spends it, and mines both deep enough that
 // the reclaimer will delete the parent.
 func settledPair(t *testing.T, s *Store, ctx context.Context, height uint32, blockID uint32) *bt.Tx {

@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5"
 )
 
 // claimBlockSQL takes the ledger row for a block, or reports that someone already has it.
@@ -40,7 +41,7 @@ ON CONFLICT (block_hash) DO NOTHING`
 // has no inputs and so has no failing spend to trigger that rollback; only the ledger
 // stops it.
 func (s *Store) ApplyBlock(ctx context.Context, blockHash *chainhash.Hash, height uint32,
-	fn func(q querier) error) (bool, error) {
+	fn func(dbTx pgx.Tx) error) (bool, error) {
 	if blockHash == nil {
 		return false, errors.NewProcessingError("[utxoset][ApplyBlock] nil block hash")
 	}

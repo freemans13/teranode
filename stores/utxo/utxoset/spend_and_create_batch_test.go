@@ -92,8 +92,7 @@ func parents(t *testing.T, s *Store, ctx context.Context, n int, height uint32) 
 
 	for i := range out {
 		out[i] = distinctParent(t, uint32(nextParent.Add(1))) //nolint:gosec // test sequence
-		_, err := s.createIn(ctx, s.pool, out[i], height)
-		require.NoError(t, err)
+		require.NoError(t, createDirect(s, ctx, out[i], height))
 	}
 
 	return out

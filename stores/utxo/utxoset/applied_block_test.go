@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,8 +39,8 @@ func TestApplyBlockReplayDoesNotDuplicateOutputs(t *testing.T) {
 	blockHash := chainhash.Hash{0xab, 0xcd}
 
 	apply := func() (bool, error) {
-		return s.ApplyBlock(ctx, &blockHash, 100, func(q querier) error {
-			_, err := s.createIn(ctx, q, tx, 100)
+		return s.ApplyBlock(ctx, &blockHash, 100, func(dbTx pgx.Tx) error {
+			_, err := s.createIn(ctx, dbTx, tx, 100)
 			return err
 		})
 	}
@@ -72,8 +73,8 @@ func TestApplyBlockFailureLeavesBlockRetryable(t *testing.T) {
 	boom := errors.NewProcessingError("chunk failed midway")
 
 	// The application creates its outputs and then fails.
-	applied, err := s.ApplyBlock(ctx, &blockHash, 100, func(q querier) error {
-		if _, cErr := s.createIn(ctx, q, tx, 100); cErr != nil {
+	applied, err := s.ApplyBlock(ctx, &blockHash, 100, func(dbTx pgx.Tx) error {
+		if _, cErr := s.createIn(ctx, dbTx, tx, 100); cErr != nil {
 			return cErr
 		}
 
@@ -85,8 +86,8 @@ func TestApplyBlockFailureLeavesBlockRetryable(t *testing.T) {
 		"a failed application must leave no rows behind")
 
 	// The block must still be offerable, and must apply cleanly this time.
-	applied, err = s.ApplyBlock(ctx, &blockHash, 100, func(q querier) error {
-		_, cErr := s.createIn(ctx, q, tx, 100)
+	applied, err = s.ApplyBlock(ctx, &blockHash, 100, func(dbTx pgx.Tx) error {
+		_, cErr := s.createIn(ctx, dbTx, tx, 100)
 		return cErr
 	})
 	require.NoError(t, err)

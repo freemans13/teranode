@@ -105,6 +105,12 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 		if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
 			return nil, nil, err
 		}
+
+		if mi, mined := minedBlock(options.MinedBlockInfos); mined {
+			if err := s.ensureTxMinedPartition(ctx, mi.BlockHeight); err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 
 	dbTx, err := s.pool.Begin(ctx)

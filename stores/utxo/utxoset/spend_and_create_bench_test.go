@@ -52,7 +52,7 @@ func BenchmarkSpendAndCreateConcurrent(b *testing.B) {
 
 				for i := 0; i < b.N; i++ {
 					parent := benchTx(1)
-					if _, err := s.createIn(ctx, s.pool, parent, 700_000); err != nil {
+					if err := createDirect(s, ctx, parent, 700_000); err != nil {
 						b.Fatalf("setup: %v", err)
 					}
 

@@ -7,22 +7,9 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
-
-// hashBytes is the transaction id as the store stores it.
-func hashBytes(tx *bt.Tx) []byte {
-	h := tx.TxIDChainHash()
-
-	return h[:]
-}
-
-// hashes wraps one transaction as the slice SetMinedMulti takes.
-func hashes(tx *bt.Tx) []*chainhash.Hash {
-	return []*chainhash.Hash{tx.TxIDChainHash()}
-}
 
 // spendPair creates a parent, creates a child that spends its only output, and spends it, so
 // the parent has no live coin left and the spend journal names it.
@@ -47,16 +34,6 @@ func spendPair(t *testing.T, s *Store, ctx context.Context, h uint32) (parent, c
 	require.NoError(t, err)
 
 	return parent, child
-}
-
-func identExists(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) bool {
-	t.Helper()
-
-	var n int
-	require.NoError(t, s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM tx_ident WHERE txid = $1`, hashBytes(tx)).Scan(&n))
-
-	return n > 0
 }
 
 func bodyExists(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) bool {
