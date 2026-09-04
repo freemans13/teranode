@@ -156,15 +156,21 @@ func (s *Store) dropTxMinedWindowsBelow(ctx context.Context, cutoffHeight uint32
 			// Already standalone after an interrupted session: finish the job.
 		}
 
-		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, w.name)); err != nil {
-			return dropped, errors.NewStorageError("[utxoset] drop tx_mined window %s", w.name, err)
-		}
+		// The drop and the floor advance are ONE statement, not two Execs. Both run inside
+		// postgres's implicit transaction for a multi-statement Exec, and DROP TABLE is
+		// fully transactional, so a crash or connection drop between them cannot happen: it
+		// either lands with both effects or neither. Two separate calls would let a crash in
+		// between drop the window from the catalog for good -- gone, so it never resurfaces
+		// in txMinedWindowSQL's listing to retry -- while the floor stayed pointed below it,
+		// and ensureTxMinedPartition would then recreate the very window this loop just
+		// destroyed, doubling every coin still claimed by a transaction in it. window is a
+		// regex-filtered catalog name (^tx_mined_w[0-9]+$), so folding it into the literal
+		// with Sprintf carries no injection risk.
+		ddl := fmt.Sprintf(`DROP TABLE IF EXISTS %[1]s;
+UPDATE tx_mined_floor SET floor = GREATEST(floor, %[2]d) WHERE id = 0;`, w.name, w.window+1)
 
-		// The floor moves BEFORE the next window is touched, so a crash between two drops
-		// still leaves every dropped window below it.
-		if _, err := s.pool.Exec(ctx,
-			`UPDATE tx_mined_floor SET floor = GREATEST(floor, $1) WHERE id = 0`, int32(w.window+1)); err != nil { //nolint:gosec // a window index fits
-			return dropped, errors.NewStorageError("[utxoset] advance tx_mined floor", err)
+		if _, err := s.pool.Exec(ctx, ddl); err != nil {
+			return dropped, errors.NewStorageError("[utxoset] drop tx_mined window %s and advance its floor", w.name, err)
 		}
 
 		dropped++
