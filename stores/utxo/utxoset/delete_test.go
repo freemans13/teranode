@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
 
@@ -205,4 +206,19 @@ func TestDeleteLeavesOtherTransactionsAlone(t *testing.T) {
 	require.Equal(t, 3, countWhere(t, s, ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, kh[:]))
 	require.Equal(t, 1, countWhere(t, s, ctx, `SELECT count(*) FROM tx_ident WHERE txid = $1`, kh[:]))
 	require.Equal(t, 1, countWhere(t, s, ctx, `SELECT count(*) FROM tx_body WHERE txid = $1`, kh[:]))
+}
+
+// TestDeleteRemovesMembershipRows: the rewind tool deletes a transaction outright; its
+// membership rows go with it so a later lookup does not resurrect a deleted transaction.
+func TestDeleteRemovesMembershipRows(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	require.NoError(t, s.Delete(ctx, tx.TxIDChainHash()))
+	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+	require.Equal(t, 0, coinCount(t, s, ctx, tx))
 }

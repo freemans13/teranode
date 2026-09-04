@@ -32,6 +32,18 @@ import (
 //
 // $4 carries the flags to OR in, so a caller asking for flagAsLocked gets the coin back
 // already locked rather than briefly spendable.
+//
+// The journal payload is immutable and carries no block facts -- they can change after the
+// spend was recorded (a reorg can move a still-live parent to a different block), so the
+// journal deliberately does not cache them. The restored coin's mined_height and block_id are
+// therefore read fresh from tx_mined by the parent's txid rather than copied from the journal
+// row. Below the checkpoint every restorable spend's parent is a block-path transaction and
+// has exactly one tx_mined row (identity table is consulted first once stage 2 lands, so an
+// unconfirmed parent restores with the sentinel there too); COALESCE to 0 is the correct
+// fallback for a parent whose window has already retired, matching the unconfirmed sentinel
+// rather than inventing a second one. ORDER BY seq LIMIT 1 picks the earliest row on the rare
+// chance more than one exists (a coinbase re-org can leave a parent claimed at more than one
+// height); seq is a global identity so "earliest" is well defined without touching mined_height.
 const unspendSQL = `
 WITH items AS (
     SELECT * FROM unnest($1::uuid[], $2::bytea[], $3::bytea[]) AS t(ukey, ptxid, stxid)
@@ -46,9 +58,11 @@ taken AS (
 ),
 restored AS (
     INSERT INTO utxo (leaf, txid, ukey, satoshis, script, created_height,
-                      spendable_from, flags, hash_override)
+                      spendable_from, flags, hash_override, mined_height, block_id)
     SELECT (get_byte(t.txid, 0) & 7)::smallint, t.txid, t.ukey, t.satoshis, t.script,
-           t.created_height, t.spendable_from, t.flags | $4::smallint, t.hash_override
+           t.created_height, t.spendable_from, t.flags | $4::smallint, t.hash_override,
+           COALESCE((SELECT m.mined_height FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1), 0),
+           COALESCE((SELECT m.block_id     FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1), 0)
       FROM taken t
      WHERE NOT EXISTS (
            SELECT 1 FROM utxo u

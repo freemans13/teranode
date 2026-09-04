@@ -11,12 +11,14 @@ import (
 // coins, its serialized bytes and its identity row.
 //
 // One statement of arrays, so deleting one transaction and deleting a thousand run the same
-// code, exactly as spendJournalSQL and createPlanSQL do on the write paths.
+// code, exactly as spendJournalSQL and createIdentPlanSQL / createMinedPlanSQL do on the write
+// paths.
 //
-// Data-modifying common table expressions share one snapshot, so the four deletes commit
-// together. That matters for the same reason it mattered to createPlanSQL: a half-deleted
-// transaction, its identity gone and its coins left, is a live output that nothing can ever
-// reclaim, because reclaim finds coins through their identity row.
+// Data-modifying common table expressions share one snapshot, so the five deletes commit
+// together. That matters for the same reason it mattered to createIdentPlanSQL and
+// createMinedPlanSQL: a half-deleted transaction, its identity or membership row gone and its
+// coins left, is a live output that nothing can ever reclaim, because reclaim finds coins
+// through their identity or membership row.
 //
 // Coins are found by a RANGE over the packed key rather than by transaction id. The one index
 // on that table is on the key, and the key packs the transaction id prefix first precisely so
@@ -36,7 +38,14 @@ import (
 //
 // The body is reached through the identity row's created_height rather than by transaction id,
 // because created_height leads the body's primary key and the id alone cannot use it. This is
-// createPlanSQL's claim-gates-the-body join, run backwards.
+// createIdentPlanSQL's claim-gates-the-body join, run backwards.
+//
+// mined removes the transaction's membership rows, tx_mined's replacement for the identity row
+// on a mined transaction. It is keyed by txid alone -- tx_mined has no leaf column, and its
+// primary key leads with txid, so this is an index descent per live window rather than a scan.
+// Left behind, a deleted-but-still-a-member transaction would misreport itself as present to
+// any later lookup that consults tx_mined, exactly the resurrection the identity delete above
+// already guards against for a mempool transaction.
 const deleteTxSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[])
@@ -59,6 +68,10 @@ ident AS (
     DELETE FROM tx_ident i USING k
      WHERE i.leaf = k.leaf AND i.txid = k.txid
     RETURNING i.created_height, i.txid
+),
+mined AS (
+    DELETE FROM tx_mined m USING k
+     WHERE m.txid = k.txid
 ),
 body AS (
     DELETE FROM tx_body b USING ident d
