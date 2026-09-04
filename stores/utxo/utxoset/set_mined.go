@@ -6,6 +6,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
 // stampSQL records a block against every transaction that does not already claim it, and
@@ -87,6 +88,44 @@ SELECT i.txid, i.membership
   FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
   JOIN tx_ident i ON i.leaf = k.leaf AND i.txid = k.txid`
 
+// appendMinedSQL records this block against every listed transaction that already has a
+// membership row, copying the payload from its earliest row. A transaction with no row at all
+// is not appended, so the postcondition still catches an unknown one.
+//
+// The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, for the same reason
+// minedByTxidSQL does: written as a plain `JOIN tx_mined m ON m.txid = k.txid` the planner is
+// free to hash-join the keys against the whole partitioned table, which the measurements
+// behind minedByTxidSQL showed as a Seq Scan on every live window at 500 keys. The LATERAL's
+// own ORDER BY + LIMIT 1 also picks the earliest row directly, so no outer DISTINCT ON is
+// needed.
+const appendMinedSQL = `
+INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
+                      size_in_bytes, tx_inpoints, locktime, created_at, flags)
+SELECT k.txid, $2, $3, $4, m.created_height, m.size_in_bytes, m.tx_inpoints, m.locktime,
+       m.created_at, m.flags
+  FROM unnest($1::bytea[]) AS k(txid)
+ CROSS JOIN LATERAL (
+   SELECT created_height, size_in_bytes, tx_inpoints, locktime, created_at, flags
+     FROM tx_mined m
+    WHERE m.txid = k.txid
+    ORDER BY m.seq
+    LIMIT 1 OFFSET 0
+ ) AS m
+ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
+
+// deleteMinedRowSQL removes one block's membership row for a set of transactions.
+//
+// This is the UnsetMined counterpart to appendMinedSQL, for a transaction whose mined stamp
+// lives only in tx_mined (no identity row for unstampSQL to touch). A reorg below the
+// checkpoint cannot reach here, and at the tip stage 2 owns un-mining a coin, so this is a
+// best-effort cleanup: absence is tolerated, exactly as the interface allows for UnsetMined.
+// mined_height is a literal, not part of the unnest, so partition pruning still confines the
+// delete to the one window this block belongs to.
+const deleteMinedRowSQL = `
+DELETE FROM tx_mined m
+ USING unnest($1::bytea[]) AS k(txid)
+ WHERE m.txid = k.txid AND m.mined_height = $2 AND m.block_id = $3`
+
 // SetMinedMulti marks transactions as mined in the block described by info.
 func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
@@ -133,6 +172,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	}
 
 	out := make(map[chainhash.Hash][]uint32, len(hashes))
+	found := make(map[chainhash.Hash]struct{}, len(hashes))
 
 	for rows.Next() {
 		var (
@@ -150,6 +190,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 
 		ids, _, _ := unpackMembership(membership)
 		out[h] = ids
+		found[h] = struct{}{}
 	}
 
 	rows.Close()
@@ -158,15 +199,62 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] rows", err)
 	}
 
-	// The postcondition, checked rather than assumed. A partial map would leave the caller
-	// believing transactions were mined that this store has never heard of.
+	// The residue: every txid provePresentSQL did NOT answer, because it never held an
+	// identity row (the block path never writes one) or has since lost it. This is where a
+	// block-path transaction -- one the retry path re-stamps, or a sibling block at the same
+	// height -- gets answered, from tx_mined instead of tx_ident.
+	var residue [][]byte
+
+	for _, txid := range txids {
+		var h chainhash.Hash
+
+		copy(h[:], txid)
+
+		if _, ok := found[h]; !ok {
+			residue = append(residue, txid)
+		}
+	}
+
+	// Un-mining is exempt from the postcondition below, because the interface says missing
+	// entries are tolerated there: a reorg may un-mine a transaction the store has already
+	// discarded. Tolerated means it does not error, NOT that the answer is empty. Transactions
+	// that DO still exist must still appear, which the conformance suite checks.
 	//
-	// Un-mining is exempt, because the interface says missing entries are tolerated there:
-	// a reorg may un-mine a transaction the store has already discarded. Tolerated means it
-	// does not error, NOT that the answer is empty. Transactions that DO still exist must
-	// still appear, which the conformance suite checks.
+	// A block-path row has no identity row for unstampSQL to touch, so the residue here also
+	// gets a best-effort delete against tx_mined. Absence is tolerated the same way.
 	if info.UnsetMined {
+		if len(residue) > 0 {
+			if _, err := s.pool.Exec(ctx, deleteMinedRowSQL, residue,
+				int32(info.BlockHeight), int32(info.BlockID)); err != nil { //nolint:gosec // heights and ids fit
+				return nil, errors.NewStorageError("[utxoset][SetMinedMulti] unmine membership", err)
+			}
+		}
+
 		return out, nil
+	}
+
+	// Block-path rows live in tx_mined, not tx_ident. A stamp for such a row is the retry path
+	// (Phase 1.5 on ErrTxExists) or a sibling block at the same height. Append a membership row
+	// for this block if the transaction has any membership row at all; the postcondition is
+	// then answered from tx_mined. A transaction in neither table is genuinely unknown.
+	if len(residue) > 0 {
+		if err := s.ensureTxMinedPartition(ctx, info.BlockHeight); err != nil {
+			return nil, err
+		}
+
+		if _, err := s.pool.Exec(ctx, appendMinedSQL, residue,
+			int32(info.BlockHeight), int32(info.BlockID), int32(info.SubtreeIdx)); err != nil { //nolint:gosec // heights and ids fit
+			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] append membership", err)
+		}
+
+		ids, err := s.minedIDsByTxid(ctx, residue)
+		if err != nil {
+			return nil, err
+		}
+
+		for h, v := range ids {
+			out[h] = v
+		}
 	}
 
 	for _, h := range hashes {
@@ -177,6 +265,34 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 		if _, ok := out[*h]; !ok {
 			return nil, errors.NewTxNotFoundError("[utxoset][SetMinedMulti] %s", h.String())
 		}
+	}
+
+	return out, nil
+}
+
+// minedIDsByTxid reads the block ids tx_mined records for a set of transactions, in insertion
+// order. It reuses readMinedRows rather than a bespoke query, so the ids SetMinedMulti hands
+// back for a block-path transaction and the ids an ordinary Get would report can never
+// disagree about what "insertion order" means.
+func (s *Store) minedIDsByTxid(ctx context.Context, txids [][]byte) (map[chainhash.Hash][]uint32, error) {
+	hashes := make([]chainhash.Hash, 0, len(txids))
+
+	for _, txid := range txids {
+		var h chainhash.Hash
+
+		copy(h[:], txid)
+
+		hashes = append(hashes, h)
+	}
+
+	data := make(map[chainhash.Hash]*meta.Data, len(hashes))
+	if err := s.readMinedRows(ctx, hashes, data); err != nil {
+		return nil, err
+	}
+
+	out := make(map[chainhash.Hash][]uint32, len(data))
+	for h, d := range data {
+		out[h] = d.BlockIDs
 	}
 
 	return out, nil

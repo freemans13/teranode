@@ -131,3 +131,45 @@ func TestUnsetMinedToleratesATransactionItDoesNotHold(t *testing.T) {
 		utxo.MinedBlockInfo{BlockID: 5, BlockHeight: 100, UnsetMined: true})
 	require.NoError(t, err, "un-mining may no-op for a transaction that no longer exists")
 }
+
+// TestSetMinedMultiFindsABlockPathTransactionInTheMembershipTable: the retry path stamps a
+// transaction the block path already created; the postcondition must be satisfied from
+// tx_mined and the returned ids must include the stamped block.
+func TestSetMinedMultiFindsABlockPathTransactionInTheMembershipTable(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	got, err := s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true})
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, got[*tx.TxIDChainHash()])
+	require.Equal(t, 1, minedRows(t, s, ctx, tx), "same block stamped again appends nothing")
+}
+
+// TestSetMinedMultiAppendsASecondBlockAtTheSameHeight: a sibling block at the same height
+// stamps the same transaction; membership records both, in order.
+func TestSetMinedMultiAppendsASecondBlockAtTheSameHeight(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	got, err := s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100})
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42, 43}, got[*tx.TxIDChainHash()])
+	require.Equal(t, 2, minedRows(t, s, ctx, tx))
+}
+
+// TestSetMinedMultiStillFailsForAnUnknownTransaction keeps the postcondition honest.
+func TestSetMinedMultiStillFailsForAnUnknownTransaction(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true})
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+}

@@ -51,6 +51,26 @@ func TestGetServesAnOldParentFromItsCoinOnceTheWindowIsGone(t *testing.T) {
 	require.Nil(t, got.TxInpoints.ParentTxHashes)
 }
 
+// TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists pins the read order. A
+// coin holds one block id; a transaction stamped into two blocks must report both while
+// the window lives, which only the membership table can do.
+func TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	// A second block at the same height stamps it.
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100})
+	require.NoError(t, err)
+
+	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42, 43}, got.BlockIDs, "both blocks, in insertion order")
+}
+
 // TestGetReportsNotFoundForAFullySpentTransactionPastItsWindow is aerospike's behaviour after
 // its delete-at-height and what the shared suite's pruning test requires.
 func TestGetReportsNotFoundForAFullySpentTransactionPastItsWindow(t *testing.T) {
