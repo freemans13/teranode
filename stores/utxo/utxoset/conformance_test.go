@@ -44,4 +44,37 @@ func TestConformance(t *testing.T) {
 		db, _ := newTestStore(t)
 		tests.Conflicting(t, db)
 	})
+
+	t.Run("Restore", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.Restore(t, db)
+	})
+
+	// tests.UnspendIdempotent is deliberately not run here. It fails, and reading it
+	// through unspend.go shows a real defect rather than an unmet assumption: the second
+	// Unspend on an already-restored outpoint finds no spend_journal row (the first call
+	// consumed it) and unspendSQL's own restored/requested count treats that the same as
+	// "genuinely gone" (retention expired, or re-spent by someone else), returning
+	// errors.ErrProcessing instead of recognising the coin is already present at that
+	// ukey/txid and returning success. process_conflicting.go's replay path (BlockAssembler
+	// ProcessConflicting/ReverseProcessConflicting, package stores/utxo, used generically
+	// by every backend including this one) explicitly documents Unspend as idempotent
+	// crash-replay plumbing ("Mark and Unspend are idempotent on the already-applied
+	// state" and "replays idempotently on the next restart"), so this is a genuine gap in
+	// utxoset rather than a test assumption this store's design doesn't share. Reported
+	// BLOCKED in task-8-report.md rather than fixed here, per the task-8 brief.
+
+	t.Run("SetMinedWithSpent", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SetMinedWithSpent(t, db)
+	})
+
+	t.Run("SetMinedUnminedSince", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SetMinedUnminedSince(t, db)
+	})
+
+	// tests.MinedThenSpendAllPrunes is deliberately not run here: it creates through the
+	// mempool path and relies on the longest-chain stamp moving rows out of the identity
+	// table, which is a later stage's change, not this one's.
 }
