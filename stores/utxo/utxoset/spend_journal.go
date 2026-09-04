@@ -62,6 +62,13 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // for the planner to reach for the index or hash the batch instead. The single-key form of
 // this statement never showed the problem, because with one key a walk per key is one walk.
 //
+// The outer SELECT carries hash_override out with the payload, and it costs nothing: the
+// DELETE's RETURNING already reads the whole row. It is non-NULL only on a coin ReAssignUTXO
+// has moved to a new owner, and on such a coin the satoshis and the script beside it are the
+// OLD output's -- the reassign interface has no room for the new ones. claimMismatch reads it
+// to decide which of the two authentications applies, so it has to travel with them rather
+// than be fetched separately, or a coin could be reassigned between the delete and the check.
+//
 // The journal row copies the coin's mined_height and block_id along with the rest of the
 // payload, and they cost nothing extra: the DELETE already carries the whole row, so this is
 // two more columns on a RETURNING that was already reading them. They are what makes a
@@ -95,7 +102,7 @@ journal AS (
            d.hash_override
       FROM del d
 )
-SELECT d.vin, d.satoshis, d.script FROM del d`
+SELECT d.vin, d.satoshis, d.script, d.hash_override FROM del d`
 
 // ensureSpendJournalPartition creates the spend-journal leaf covering height, if absent.
 //

@@ -15,8 +15,8 @@ import (
 //
 // Block assembly calls both of these during startup, before a single block is
 // processed, and treats an error from either as fatal (BlockAssembler.go:936-942 and
-// :2629-2634). Answering errM1 therefore crash-loops the daemon and the node never
-// syncs at all, which is what a deploy of this store did.
+// :2629-2634). Answering "not implemented" therefore crash-loops the daemon and the node
+// never syncs at all, which is what a deploy of this store did.
 //
 // Empty is not a shortcut here, it is the true answer. Both the unmined set and the
 // conflict-intent log are transaction-level state that lives in tx_meta, and this store

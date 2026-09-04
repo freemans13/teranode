@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -221,9 +222,13 @@ func permute[T any](xs []T, order []int) []T {
 // transaction there leaves the rows the DELETE already took. That is a pre-existing property
 // of that path for every error class, not something this comparison introduces, and no caller
 // outside tests reaches it.
-func claimMismatch(in *bt.Input, sp *utxo.Spend, satoshis int64, script []byte) error {
+func claimMismatch(in *bt.Input, sp *utxo.Spend, satoshis int64, script []byte, hashOverride []byte) error {
 	if in == nil || in.PreviousTxScript == nil {
 		return nil
+	}
+
+	if len(hashOverride) > 0 {
+		return reassignedClaimMismatch(in, sp, hashOverride)
 	}
 
 	if in.PreviousTxSatoshis == uint64(satoshis) && //nolint:gosec // satoshis are never negative
@@ -236,6 +241,53 @@ func claimMismatch(in *bt.Input, sp *utxo.Spend, satoshis int64, script []byte) 
 	return errors.NewUtxoHashMismatchError(
 		"[utxoset][Spend] %s:%d was offered as %d satoshis with a %d-byte script, the store holds %d satoshis with a %d-byte script",
 		sp.TxID, sp.Vout, in.PreviousTxSatoshis, len(*in.PreviousTxScript), satoshis, len(script))
+}
+
+// reassignedClaimMismatch is the one case where this store has to fall back on a digest.
+//
+// ReAssignUTXO is handed a utxo.Spend, which carries a UTXO hash and no room for a locking
+// script or an amount, so a reassigned coin's row still holds the OLD owner's script and
+// satoshis and there is nothing to compare a claim against. hash_override is what the store
+// does hold about the new output, so the claim is hashed and matched to it. That is exactly
+// the check the aerospike and sql stores run on every spend; here it applies only to the
+// coins an alert has moved, which are vanishingly few.
+//
+// It inverts the outcome for both parties, which is the point. The old owner's claim -- the
+// script the coin still literally carries -- now hashes to something else and is refused,
+// while the new owner's, which matches nothing on the row, is accepted.
+func reassignedClaimMismatch(in *bt.Input, sp *utxo.Spend, hashOverride []byte) error {
+	claimed, err := util.UTXOHashFromInput(in)
+	if err != nil {
+		return errors.NewUtxoHashMismatchError("[utxoset][Spend] %s:%d was reassigned and the offered output cannot be hashed",
+			sp.TxID, sp.Vout, err)
+	}
+
+	if bytes.Equal(claimed[:], hashOverride) {
+		return nil
+	}
+
+	return errors.NewUtxoHashMismatchError(
+		"[utxoset][Spend] %s:%d was reassigned; the offered %d satoshis with a %d-byte script hash to %x, the store expects %x",
+		sp.TxID, sp.Vout, in.PreviousTxSatoshis, len(*in.PreviousTxScript), claimed[:], hashOverride)
+}
+
+// decorateInput writes the coin's real satoshis and locking script onto the input, which is
+// how the spend doubles as the decorate fetch: script validation reads them straight off the
+// input and never fetches a parent transaction.
+//
+// A REASSIGNED coin is left alone, and it has to be. The row's satoshis and script are the old
+// owner's -- ReAssignUTXO was given a hash and nothing else -- so overwriting would replace
+// the new owner's correct output with the confiscated one, and script validation would then
+// run the old locking script against the new owner's unlocking script and fail every time.
+// What the input already carries has just been authenticated against hash_override by
+// claimMismatch, so it is the better source, not merely the only one.
+func decorateInput(in *bt.Input, satoshis int64, script []byte, hashOverride []byte) {
+	if len(hashOverride) > 0 {
+		return
+	}
+
+	in.PreviousTxSatoshis = uint64(satoshis) //nolint:gosec // satoshis are never negative
+	in.PreviousTxScript = bscript.NewFromBytes(script)
 }
 
 // runSpendPlan issues the statement and fills in each caller's answers, including the
@@ -255,12 +307,13 @@ func (s *Store) runSpendPlan(ctx context.Context, q pgx.Tx, p *spendPlan) error 
 
 	for rows.Next() {
 		var (
-			k        int32
-			satoshis int64
-			script   []byte
+			k            int32
+			satoshis     int64
+			script       []byte
+			hashOverride []byte
 		)
 
-		if err := rows.Scan(&k, &satoshis, &script); err != nil {
+		if err := rows.Scan(&k, &satoshis, &script, &hashOverride); err != nil {
 			rows.Close()
 			return errors.NewStorageError("[utxoset][Spend] scan", err)
 		}
@@ -276,13 +329,12 @@ func (s *Store) runSpendPlan(ctx context.Context, q pgx.Tx, p *spendPlan) error 
 			// Before the overwrite, and it has to be: the overwrite is what destroys the
 			// claim this is checking.
 			if !p.skipClaim[item] {
-				if err := claimMismatch(in, p.perItem[item][vin], satoshis, script); err != nil {
+				if err := claimMismatch(in, p.perItem[item][vin], satoshis, script, hashOverride); err != nil {
 					p.perItem[item][vin].Err = err
 				}
 			}
 
-			in.PreviousTxSatoshis = uint64(satoshis) //nolint:gosec // satoshis are never negative
-			in.PreviousTxScript = bscript.NewFromBytes(script)
+			decorateInput(in, satoshis, script, hashOverride)
 		}
 	}
 
@@ -416,13 +468,14 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 
 	for rows.Next() {
 		var (
-			k        int32
-			spender  []byte
-			satoshis int64
-			script   []byte
+			k            int32
+			spender      []byte
+			satoshis     int64
+			script       []byte
+			hashOverride []byte
 		)
 
-		if err := rows.Scan(&k, &spender, &satoshis, &script); err != nil {
+		if err := rows.Scan(&k, &spender, &satoshis, &script, &hashOverride); err != nil {
 			return errors.NewStorageError("[utxoset][Spend] spender scan", err)
 		}
 
@@ -457,12 +510,11 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 			sp.ConflictingTxID = nil
 
 			if !p.skipClaim[p.owner[k]] {
-				sp.Err = claimMismatch(in, sp, satoshis, script)
+				sp.Err = claimMismatch(in, sp, satoshis, script, hashOverride)
 			}
 
 			if in != nil {
-				in.PreviousTxSatoshis = uint64(satoshis) //nolint:gosec // satoshis are never negative
-				in.PreviousTxScript = bscript.NewFromBytes(script)
+				decorateInput(in, satoshis, script, hashOverride)
 			}
 
 			continue

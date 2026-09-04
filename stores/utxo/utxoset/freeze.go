@@ -1,6 +1,7 @@
 package utxoset
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -85,12 +86,19 @@ func (s *Store) setFlags(ctx context.Context, spends []*utxo.Spend, orMask, andM
 // SPENDER IDENTITY -- the UTXO row is gone, and absence alone cannot distinguish
 // "spent by X" from "never existed". That identity is therefore available exactly as far
 // back as journal retention, and no further: beyond it the honest answer is NOT_FOUND.
+//
+// It carries hash_override and spendable_from out with the flags because both change the
+// answer. hash_override is non-NULL only on a coin ReAssignUTXO has moved, and the caller's
+// UTXOHash must match it: the OLD owner asking about the outpoint they no longer own must be
+// refused rather than shown the coin. spendable_from is what the reassignment delay is written
+// into, and the same column carries coinbase maturity, so reading it here is what makes this
+// report IMMATURE for both without a second rule.
 const getSpendSQL = `
-SELECT 'live'::text, u.flags, NULL::bytea
+SELECT 'live'::text, u.flags, NULL::bytea, u.hash_override, u.spendable_from
   FROM utxo u
  WHERE u.leaf = $1 AND u.ukey = $2 AND u.txid = $3
 UNION ALL
-SELECT 'spent'::text, j.flags, j.spending_txid
+SELECT 'spent'::text, j.flags, j.spending_txid, j.hash_override, j.spendable_from
   FROM spend_journal j
  WHERE j.ukey = $2 AND j.txid = $3
  LIMIT 1`
@@ -111,13 +119,22 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 
 	for rows.Next() {
 		var (
-			where   string
-			flags   int16
-			spender []byte
+			where         string
+			flags         int16
+			spender       []byte
+			hashOverride  []byte
+			spendableFrom int32
 		)
 
-		if err := rows.Scan(&where, &flags, &spender); err != nil {
+		if err := rows.Scan(&where, &flags, &spender, &hashOverride, &spendableFrom); err != nil {
 			return nil, errors.NewStorageError("[utxoset][GetSpend] scan", err)
+		}
+
+		// A reassigned coin answers only to the hash of the output it was reassigned TO. The
+		// old owner names the same outpoint with the old hash, and telling them the coin is
+		// there and unspent would be telling them it is still theirs.
+		if err := reassignedHashMismatch(sp, hashOverride); err != nil {
+			return nil, err
 		}
 
 		if where == "live" {
@@ -128,6 +145,14 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 					Status:       int(utxo.Status_FROZEN),
 					SpendingData: spendpkg.NewSpendingData(&subtree.FrozenBytesTxHash, 0),
 				}, nil
+			}
+
+			// Exists but not yet spendable: a coinbase inside its maturity window, or a
+			// reassigned coin inside the delay that lets the reassignment be challenged
+			// before the new owner can move it. Reporting OK would say the coin is
+			// spendable now, which is the one thing spendable_from exists to deny.
+			if spendableFrom > int32(s.GetBlockHeight()) { //nolint:gosec // block heights are far below 2^31
+				return &utxo.SpendResponse{Status: int(utxo.Status_IMMATURE)}, nil
 			}
 
 			return &utxo.SpendResponse{Status: int(utxo.Status_OK)}, nil
@@ -152,4 +177,27 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 	// journal retains. This store cannot tell those apart, and says NOT_FOUND rather
 	// than guessing.
 	return &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}, nil
+}
+
+// reassignedHashMismatch refuses a lookup that names a reassigned coin by the wrong hash.
+//
+// Only reassigned coins have a stored hash to compare against: this store keeps the satoshis
+// and the locking script themselves, not a digest, so a normal coin has nothing here and any
+// UTXOHash the caller supplies goes unchecked, exactly as before. That is the same position
+// the spend path takes, and the same one the sql store takes when the caller passes nil.
+//
+// A caller that supplies no hash is trusted, because the row was located by the outpoint and
+// the full txid. The bulk UTXO endpoints do this deliberately rather than fetch whole
+// transactions to recompute a digest they already have the outpoint for.
+func reassignedHashMismatch(sp *utxo.Spend, hashOverride []byte) error {
+	if len(hashOverride) == 0 || sp.UTXOHash == nil {
+		return nil
+	}
+
+	if bytes.Equal(sp.UTXOHash[:], hashOverride) {
+		return nil
+	}
+
+	return errors.NewUtxoHashMismatchError("[utxoset][GetSpend] %s:%d was reassigned; %s is no longer its utxo hash",
+		sp.TxID, sp.Vout, sp.UTXOHash)
 }

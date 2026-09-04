@@ -297,13 +297,3 @@ func (s *Store) Health(ctx context.Context, _ bool) (int, string, error) {
 
 	return 200, "utxoset: ok", nil
 }
-
-// errM1 marks a method that is deliberately out of M1 scope.
-//
-// M1 is the UTXO table, the spend journal and the block ledger. What is missing is the
-// transaction window: tx_bounded and tx_mined. Everything that depends on those fails
-// loudly here rather than silently returning a wrong answer — a store that quietly
-// answers "not found" for a question it cannot answer is how consensus bugs start.
-func errM1(method string) error {
-	return errors.NewProcessingError("[utxoset] %s is not implemented yet; it depends on the tx_bounded and tx_mined tables", method)
-}

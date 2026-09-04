@@ -35,6 +35,14 @@ func TestConformance(t *testing.T) {
 		tests.Freeze(t, db)
 	})
 
+	// Reassigning a frozen coin, the alert system's confiscation path. It is the one place a
+	// coin's spending rules change under it, and this store holds the rules themselves rather
+	// than a digest of them, so it needs hash_override to carry what the new output hashes to.
+	t.Run("ReAssign", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.ReAssign(t, db)
+	})
+
 	t.Run("SetMined", func(t *testing.T) {
 		db, _ := newTestStore(t)
 		tests.SetMined(t, db)

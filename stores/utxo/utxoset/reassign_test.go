@@ -1,0 +1,217 @@
+package utxoset
+
+import (
+	"testing"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/stretchr/testify/require"
+)
+
+// newOwnerScript is a locking script that is not the one mkTx writes, so a coin reassigned to
+// it can be told apart from the coin as created.
+func newOwnerScript(t *testing.T) *bscript.Script {
+	t.Helper()
+
+	script, err := bscript.NewFromHexString("76a914111111111111111111111111111111111111111188ac")
+	require.NoError(t, err)
+
+	return script
+}
+
+// TestReAssignRefusesACoinThatWasNeverFrozen pins the order the alert system has to work in.
+//
+// Freezing first is not paperwork. The freeze is what stops the CURRENT owner spending the
+// coin while the reassignment is being written, and this store enforces it as a predicate on
+// the same UPDATE rather than as a prior read, so there is no window between the two. A store
+// that reassigned an unfrozen coin would race the owner's own spend and could lose.
+//
+// The refusal has to be the frozen error specifically, not a generic miss: the alert system
+// distinguishes "you skipped the freeze" from "there is no such coin", and an operator sent
+// looking for a missing coin that is sitting right there loses the incident.
+func TestReAssignRefusesACoinThatWasNeverFrozen(t *testing.T) {
+	s, ctx := newTestStore(t)
+	tSettings := settings.NewSettings()
+
+	require.NoError(t, s.SetBlockHeight(100))
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	old := &utxo.Spend{TxID: parent.TxIDChainHash(), Vout: 0}
+
+	newHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(),
+		&bt.Output{Satoshis: 5_000, LockingScript: newOwnerScript(t)}, 0)
+	require.NoError(t, err)
+
+	err = s.ReAssignUTXO(ctx, old, &utxo.Spend{TxID: old.TxID, Vout: 0, UTXOHash: newHash}, tSettings)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrFrozen), "got %v", err)
+
+	// Nothing was written: the coin is still spendable by its owner on the original terms.
+	spends, err := spendOnly(ctx, s, spendOneOutputTx(t, parent, 0), 101)
+	require.NoError(t, err)
+	require.NoError(t, spends[0].Err)
+}
+
+// TestReAssignRefusesACoinThatIsNotThere is the other half of the same refusal, and it must
+// not be silence. A reassignment that quietly affected no rows would leave the alert system
+// believing a court-ordered confiscation had been applied when nothing had.
+//
+// The coin here was spent rather than never created, which is the case that actually happens:
+// delete-on-spend means a spent coin leaves no row at all, so the freeze that should have
+// preceded this would have failed too.
+func TestReAssignRefusesACoinThatIsNotThere(t *testing.T) {
+	s, ctx := newTestStore(t)
+	tSettings := settings.NewSettings()
+
+	require.NoError(t, s.SetBlockHeight(100))
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	_, err = spendOnly(ctx, s, spendOneOutputTx(t, parent, 0), 101)
+	require.NoError(t, err)
+
+	newHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(),
+		&bt.Output{Satoshis: 5_000, LockingScript: newOwnerScript(t)}, 0)
+	require.NoError(t, err)
+
+	err = s.ReAssignUTXO(ctx, &utxo.Spend{TxID: parent.TxIDChainHash(), Vout: 0},
+		&utxo.Spend{TxID: parent.TxIDChainHash(), Vout: 0, UTXOHash: newHash}, tSettings)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "got %v", err)
+}
+
+// TestReAssignInvertsWhoMaySpendTheCoin is the property the whole feature exists for, and the
+// one this store has to reach differently from every other.
+//
+// The other stores keep a UTXO hash as the coin's identity and reassignment overwrites it.
+// This one keeps the satoshis and the locking script themselves, because its spend is also its
+// decorate fetch, and ReAssignUTXO is handed only a hash -- there is no new script in the
+// argument to write. So the row keeps the OLD owner's script and hash_override carries what
+// the new output must hash to, and the spend path switches from comparing values to comparing
+// the digest for exactly the coins that have one.
+//
+// The test spends past the delay in both directions. The old owner's claim is the script the
+// coin still literally carries and must be refused; the new owner's matches nothing on the row
+// and must be accepted. Getting this backwards is not a failed spend, it is the confiscated
+// coin going back to the party it was taken from.
+func TestReAssignInvertsWhoMaySpendTheCoin(t *testing.T) {
+	s, ctx := newTestStore(t)
+	tSettings := settings.NewSettings()
+
+	require.NoError(t, s.SetBlockHeight(100))
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	old := &utxo.Spend{TxID: parent.TxIDChainHash(), Vout: 0}
+	newOutput := &bt.Output{Satoshis: 5_000, LockingScript: newOwnerScript(t)}
+
+	newHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(), newOutput, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, s.FreezeUTXOs(ctx, []*utxo.Spend{old}, tSettings))
+	require.NoError(t, s.ReAssignUTXO(ctx, old,
+		&utxo.Spend{TxID: old.TxID, Vout: 0, UTXOHash: newHash}, tSettings))
+
+	// Inside the delay nobody spends it, whichever output they claim. The delay is the window
+	// in which the reassignment itself can be challenged.
+	spends, err := spendOnly(ctx, s, spendOneOutputTx(t, parent, 0), 101)
+	require.Error(t, err)
+	require.Contains(t, spends[0].Err.Error(), "not spendable until")
+
+	spendable := 100 + tSettings.UtxoStore.ReAssignedUtxoSpendableAfterBlocks
+	require.NoError(t, s.SetBlockHeight(spendable))
+
+	// The old owner, past the delay, offering the script the row still holds: refused.
+	spends, err = spendOnly(ctx, s, spendOneOutputTx(t, parent, 0), spendable)
+	require.Error(t, err)
+	require.True(t, errors.Is(spends[0].Err, errors.ErrUtxoHashMismatch), "got %v", spends[0].Err)
+
+	// The new owner, offering the output the coin was reassigned to: taken.
+	claimed := spendOneOutputTx(t, parent, 0)
+	claimed.Inputs[0].PreviousTxSatoshis = newOutput.Satoshis
+	claimed.Inputs[0].PreviousTxScript = newOutput.LockingScript
+
+	spends, err = spendOnly(ctx, s, claimed, spendable)
+	require.NoError(t, err)
+	require.NoError(t, spends[0].Err)
+
+	// The decorate left the new owner's output in place rather than overwriting it with the
+	// confiscated one, which is what script validation reads next.
+	require.Equal(t, newOutput.LockingScript.String(), claimed.Inputs[0].PreviousTxScript.String())
+
+	require.Equal(t, 0, coinCount(t, s, ctx, parent))
+}
+
+// TestReAssignedCoinAnswersOnlyToItsNewHash covers the read side. GetSpend is how the alert
+// system and the RPC surface confirm a confiscation landed, so the old owner asking about the
+// outpoint by the hash they used to own must be refused rather than shown a live coin, and the
+// new owner must see the coin held by the delay rather than reported spendable.
+func TestReAssignedCoinAnswersOnlyToItsNewHash(t *testing.T) {
+	s, ctx := newTestStore(t)
+	tSettings := settings.NewSettings()
+
+	require.NoError(t, s.SetBlockHeight(100))
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	oldHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(), parent.Outputs[0], 0)
+	require.NoError(t, err)
+
+	newHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(),
+		&bt.Output{Satoshis: 5_000, LockingScript: newOwnerScript(t)}, 0)
+	require.NoError(t, err)
+
+	old := &utxo.Spend{TxID: parent.TxIDChainHash(), Vout: 0, UTXOHash: oldHash}
+
+	require.NoError(t, s.FreezeUTXOs(ctx, []*utxo.Spend{old}, tSettings))
+	require.NoError(t, s.ReAssignUTXO(ctx, old,
+		&utxo.Spend{TxID: old.TxID, Vout: 0, UTXOHash: newHash}, tSettings))
+
+	_, err = s.GetSpend(ctx, old)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrUtxoHashMismatch), "got %v", err)
+
+	resp, err := s.GetSpend(ctx, &utxo.Spend{TxID: old.TxID, Vout: 0, UTXOHash: newHash})
+	require.NoError(t, err)
+	require.Equal(t, int(utxo.Status_IMMATURE), resp.Status)
+	require.Nil(t, resp.SpendingData)
+
+	require.NoError(t, s.SetBlockHeight(100+tSettings.UtxoStore.ReAssignedUtxoSpendableAfterBlocks))
+
+	resp, err = s.GetSpend(ctx, &utxo.Spend{TxID: old.TxID, Vout: 0, UTXOHash: newHash})
+	require.NoError(t, err)
+	require.Equal(t, int(utxo.Status_OK), resp.Status)
+}
+
+// spendOneOutputTx builds a transaction taking one of parent's outputs, WITHOUT applying it,
+// so a test can adjust what the input claims about the coin before offering it.
+func spendOneOutputTx(t *testing.T, parent *bt.Tx, vout uint32) *bt.Tx {
+	t.Helper()
+
+	child := bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash:      parent.TxIDChainHash(),
+		Vout:          vout,
+		LockingScript: parent.Outputs[vout].LockingScript,
+		Satoshis:      parent.Outputs[vout].Satoshis,
+	}))
+	child.AddOutput(&bt.Output{
+		Satoshis:      parent.Outputs[vout].Satoshis - 1_000,
+		LockingScript: parent.Outputs[vout].LockingScript,
+	})
+
+	return child
+}
