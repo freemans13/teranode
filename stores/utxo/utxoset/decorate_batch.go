@@ -78,20 +78,77 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 // through Get; the coin row is what the spend path reads, and the spend path never looks at
 // the transaction row. Setting only one would leave a transaction reporting itself locked
 // while its coins were still spendable, or the reverse.
+//
+// "The transaction row" is EITHER home, so there are three arms rather than two. A transaction
+// lives in exactly one of tx_ident and tx_mined, this call does not know which, and
+// minedRow.toMeta reads Locked straight off tx_mined.flags -- copied once by the move and
+// updated by nothing afterwards. Without the membership arm a flag set after the stamp was
+// invisible to Get, silently, and in the direction that matters: a transaction reporting itself
+// locked forever. The two-phase-commit release ordinarily runs long before the stamp, so this
+// is narrow, but narrow and silent is the combination worth closing.
+//
+// The membership arm is a plain txid equality because tx_mined's primary key LEADS with txid,
+// so it is one descent per key per live window, and the update touches every membership row the
+// transaction has -- a transaction stamped into two blocks is one transaction and one flag.
+//
+// The coin UPDATE carries the packed-key range, AND it locates its rows through a fenced
+// LATERAL first. schema.go states the rule in its own words: "There is deliberately no index on
+// txid: every by-txid access is a ukey range scan with a full-txid heap recheck. Any query
+// filtering on txid without a ukey range bound is a review failure." This was that query, on
+// the two-phase-commit path, one call per mempool transaction, and every sibling statement --
+// setConflictingSQL, deleteTxSQL, resetCoinsSQL, stampCoinsSQL, coinFactsSQL -- already carried
+// lo/hi. The answer was never wrong, because the full txid was already rechecked.
+//
+// The bound alone does not buy the plan. Measured at 500 keys against 40,000 coin rows: with
+// the range added straight to `UPDATE utxo u FROM k`, the planner still hash-joined the keys
+// against a Seq Scan of all eight leaf partitions and applied the range as a Join Filter --
+// 13.5-14.1 ms, the same plan as without it. That is exactly what resetCoinsSQL's comment
+// records ("the obvious UPDATE ... FROM unnest read all eight coin partitions for 98 ms of a
+// 108 ms statement"), so this takes resetCoinsSQL's shape: a CTE that locates the rows through
+// a CROSS JOIN LATERAL with an OFFSET 0 fence, then an UPDATE keyed on what it found. The fence
+// is what stops the subquery being pulled up into the join, which is what re-admits the scan.
+// No LIMIT inside it, because a transaction has as many coins as it has unspent outputs and all
+// of them take the flag. Measured, eight runs at 500 keys against 40,000 coin rows: 13.2-14.5 ms
+// with the bound as a Join Filter, 8.5-9.9 ms fenced, with a Bitmap Index Scan on each leaf's
+// ukey index and no Seq Scan on any coin partition.
+//
+// Most of what is left is the ident arm above, which is still the paired-unnest join shape:
+// 6.4 ms of the 8.7, a Hash Join over a Seq Scan of all eight identity partitions. That is the
+// shape leafGroups measures and rejects (set_mined.go), and it is worth revisiting here -- but
+// the reshape makes tx_ident mempool-sized rather than the 40,000 rows this was measured at, so
+// it is a throughput item and not a correctness one.
 const setLockedSQL = `
 WITH k AS (
-    SELECT * FROM unnest($1::smallint[], $2::bytea[]) AS t(leaf, txid)
+    SELECT * FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[])
+        AS t(leaf, txid, lo, hi)
 ),
 ident AS (
-    UPDATE tx_ident i SET flags = CASE WHEN $3::boolean
-                                       THEN i.flags | $4::smallint
-                                       ELSE i.flags & ~$4::smallint END
+    UPDATE tx_ident i SET flags = CASE WHEN $5::boolean
+                                       THEN i.flags | $6::smallint
+                                       ELSE i.flags & ~$6::smallint END
       FROM k WHERE i.leaf = k.leaf AND i.txid = k.txid
+),
+mined AS (
+    UPDATE tx_mined m SET flags = CASE WHEN $5::boolean
+                                       THEN m.flags | $6::smallint
+                                       ELSE m.flags & ~$6::smallint END
+      FROM k WHERE m.txid = k.txid
+),
+hit AS (
+    SELECT c.leaf, c.ukey, k.txid
+      FROM k
+     CROSS JOIN LATERAL (
+       SELECT u.leaf, u.ukey
+         FROM utxo u
+        WHERE u.leaf = k.leaf AND u.ukey >= k.lo AND u.ukey <= k.hi AND u.txid = k.txid
+       OFFSET 0
+     ) AS c
 )
-UPDATE utxo u SET flags = CASE WHEN $3::boolean
-                               THEN u.flags | $4::smallint
-                               ELSE u.flags & ~$4::smallint END
-  FROM k WHERE u.leaf = k.leaf AND u.txid = k.txid`
+UPDATE utxo u SET flags = CASE WHEN $5::boolean
+                               THEN u.flags | $6::smallint
+                               ELSE u.flags & ~$6::smallint END
+  FROM hit
+ WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey AND u.txid = hit.txid`
 
 // SetLocked marks transactions as locked for spending, or releases them.
 //
@@ -127,13 +184,17 @@ func (s *Store) setLockedDirect(ctx context.Context, txHashes []chainhash.Hash, 
 
 	leaves := make([]int16, 0, len(txHashes))
 	txids := make([][]byte, 0, len(txHashes))
+	los := make([][16]byte, 0, len(txHashes))
+	his := make([][16]byte, 0, len(txHashes))
 
 	for i := range txHashes {
 		leaves = append(leaves, LeafFor(txHashes[i][:]))
 		txids = append(txids, txHashes[i][:])
+		los = append(los, Pack(txHashes[i][:], 0))
+		his = append(his, Pack(txHashes[i][:], ^uint32(0)))
 	}
 
-	if _, err := s.pool.Exec(ctx, setLockedSQL, leaves, txids, value, FlagLocked); err != nil {
+	if _, err := s.pool.Exec(ctx, setLockedSQL, leaves, txids, los, his, value, FlagLocked); err != nil {
 		return errors.NewStorageError("[utxoset][SetLocked]", err)
 	}
 

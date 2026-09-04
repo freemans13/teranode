@@ -79,6 +79,15 @@ ON CONFLICT DO NOTHING`
 //
 // The 'child' rows are the next level of the cascade. The journal is the only place this store
 // can answer "who took this coin", because the coin row is destroyed the moment it is spent.
+//
+// The flag is flipped on THREE things, not two, for the same reason setLockedSQL flips three.
+// A transaction lives in exactly one of tx_ident and tx_mined and this statement does not know
+// which; a contested parent is very often mined, which is the whole reason the note itself
+// became a side table. minedRow.toMeta reads Conflicting straight off tx_mined.flags, copied
+// once by the move and updated by nothing afterwards, so without the membership arm marking a
+// mined transaction conflicting set the coin bit and not the bit Get reports -- the mirror
+// image of the failure setLockedSQL's own comment warns about. The membership arm is a plain
+// txid equality because tx_mined's primary key leads with txid.
 const setConflictingSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::uuid[], $5::uuid[])
@@ -94,6 +103,13 @@ ident AS (
                                           ELSE i.flags & ~$13::smallint END
       FROM k
      WHERE i.leaf = k.leaf AND i.txid = k.txid
+),
+mined AS (
+    UPDATE tx_mined m
+       SET flags = CASE WHEN $12::boolean THEN m.flags |  $13::smallint
+                                          ELSE m.flags & ~$13::smallint END
+      FROM k
+     WHERE m.txid = k.txid
 ),
 coins AS (
     UPDATE utxo u
