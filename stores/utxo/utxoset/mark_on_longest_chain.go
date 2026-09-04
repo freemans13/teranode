@@ -277,6 +277,10 @@ func (s *Store) markOnAndSettle(ctx context.Context, txids [][]byte) ([]chainhas
 // only deletes from the membership table, and see unstampAndMoveBack for why creating a window
 // here would be wrong.
 //
+// It runs the SAME statement the un-mine runs, with the block height and id NULL. That is the
+// whole difference between the two directions: naming a block drops that block's triple from
+// the membership the identity row comes back with, naming none keeps them all. See moveBackSQL.
+//
 // The move-back writes the marker itself, on the rows it inserts, so it does not matter that
 // the mark statement ran before those rows existed.
 func (s *Store) markOffAndMoveBack(ctx context.Context, txids [][]byte) ([]chainhash.Hash, error) {
@@ -301,7 +305,8 @@ func (s *Store) markOffAndMoveBack(ctx context.Context, txids [][]byte) ([]chain
 		reached = append(reached, marked...)
 	}
 
-	moved, err := queryTxids(ctx, dbTx, moveAllBackSQL, txids, height)
+	// NULL block height and id: this call names no block, so moveBackSQL keeps every triple.
+	moved, err := queryTxids(ctx, dbTx, moveBackSQL, txids, nil, nil, height)
 	if err != nil {
 		_ = dbTx.Rollback(ctx)
 

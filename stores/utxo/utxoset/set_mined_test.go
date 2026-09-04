@@ -328,13 +328,18 @@ func TestUnMineMovesAMembershipRowBackToTheMempool(t *testing.T) {
 	require.Equal(t, int32(0), b)
 }
 
-// TestUnMineKeepsTheOtherBlocksItNames is the CTE visibility rule, and it is the one shape a
-// sibling CTE can get wrong: in PostgreSQL a data-modifying CTE's deletes are NOT visible to
-// its siblings, so a repack that simply reads tx_mined again sees the row being deleted and
-// hands the un-mined block back as a fork triple. The transaction here holds two membership
-// rows, one per sibling block at the same height, and un-mining one must leave exactly the
-// other behind.
-func TestUnMineKeepsTheOtherBlocksItNames(t *testing.T) {
+// TestUnMineMovesTheWholeTransactionBack: a transaction lives in exactly ONE of the two tables
+// at any time, so un-mining ONE of the two blocks that name it still takes the whole
+// transaction back to the mempool table. The block that was not un-mined survives as a FORK
+// TRIPLE on the identity row, not as a membership row.
+//
+// A double home would break more than tidiness. The lazy coin stamp at window retirement reads
+// membership rows, so a surviving row would stamp this transaction's coins into a block it no
+// longer settles under, and the read path's identity-then-membership order assumes one home.
+//
+// Every coin goes back to the sentinel, including one stamped with the SURVIVING block's id: a
+// transaction in the mempool table settles under no block at all.
+func TestUnMineMovesTheWholeTransactionBack(t *testing.T) {
 	s, ctx := newTestStore(t)
 	require.NoError(t, s.SetBlockHeight(700_150))
 
@@ -354,14 +359,15 @@ func TestUnMineKeepsTheOtherBlocksItNames(t *testing.T) {
 	require.NoError(t, err)
 
 	require.True(t, identExists(t, s, ctx, tx))
-	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+	require.Equal(t, 0, minedRows(t, s, ctx, tx), "no membership row survives an un-mine")
 
 	got, err := s.Get(ctx, tx.TxIDChainHash())
 	require.NoError(t, err)
-	require.Equal(t, []uint32{43}, got.BlockIDs, "the un-mined block is dropped, the sibling kept")
+	require.Equal(t, []uint32{43}, got.BlockIDs,
+		"the un-mined block's triple is dropped, the sibling's is remembered as a fork triple")
 	require.Equal(t, uint32(700_150), got.UnminedSince)
 
 	h, b := coinFacts(t, s, ctx, tx)
-	require.Equal(t, int32(0), h, "the coin of the un-mined block is back at the sentinel")
+	require.Equal(t, int32(0), h, "back at the sentinel, sibling block or not")
 	require.Equal(t, int32(0), b)
 }

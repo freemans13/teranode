@@ -181,25 +181,46 @@ settled AS (
 )
 SELECT txid FROM moved`
 
-// moveBackSQL is the un-mine for a transaction whose stamp lives in the membership table: it
-// deletes this block's row and puts the transaction back in the identity table with the
-// unconfirmed marker at the CURRENT tip and any OTHER blocks it still names packed as fork
-// triples. It is the exact reverse of moveToMinedSQL, and the reverse of moveToMinedSQL is
-// what makes the two tables one store rather than two.
+// moveBackSQL is the un-mine: it takes a transaction out of the membership table and puts it
+// back in the mempool table, with the unconfirmed marker at the CURRENT tip and the blocks it
+// still remembers packed as fork triples. It is the exact reverse of moveToMinedSQL, and the
+// reverse of moveToMinedSQL is what makes the two tables one store rather than two.
 //
-// `others` MUST exclude the deleted key explicitly, and that is a PostgreSQL rule rather than
-// belt and braces: a data-modifying CTE's effects are NOT visible to its sibling CTEs, which
-// all see the snapshot the statement began with. A sibling that simply re-read tx_mined would
-// therefore still see the row `gone` is deleting and pack the un-mined block straight back in
-// as a fork triple, so the transaction would claim a block it was just told to forget.
+// A transaction lives in EXACTLY ONE of the two tables at any time, so `gone` deletes EVERY
+// membership row of the txid and not just the un-mined block's. That is an invariant with
+// teeth rather than symmetry: the lazy coin stamp at window retirement reads membership rows,
+// so a row left behind here would later stamp this transaction's coins into a block it no
+// longer settles under, and the read path's identity-then-membership order assumes one home.
+// Deleting only the named block's row and re-packing the others as fork triples would leave
+// the transaction in both tables at once, claiming the same block twice in two different
+// spellings.
+//
+// ONE STATEMENT SERVES BOTH DIRECTIONS, and the difference between them is a single predicate
+// on `packed`: which triples survive into membership.
+//
+//   - SetMinedMulti's un-mine NAMES a block, so that block's triple is DROPPED and the others
+//     are kept. NULL membership when the named block was the only one, which is what a
+//     transaction no block has ever named already carries, so the two spellings of "no block"
+//     stay one.
+//   - MarkTransactionsOnLongestChain(false) names none -- it says only that the chain the node
+//     now believes in does not contain this transaction -- so it cannot drop any single block
+//     and ALL of them are kept for a later stamp or un-mine to resolve. $2 and $3 arrive NULL.
+//
+// The join to `packed` is LEFT for that first case: an un-mine of the only block leaves no
+// triples at all, and an inner join would then drop the identity row the un-mine exists to
+// write.
+//
+// The membership is packed from `gone` itself, never from a second read of tx_mined, and that
+// closes a PostgreSQL trap as well as being simpler: a data-modifying CTE's effects are NOT
+// visible to its sibling CTEs, which all see the snapshot the statement began with, so a
+// sibling that re-read tx_mined would still see the rows `gone` is deleting and hand back the
+// very block it was told to forget.
 //
 // The keys reach the DELETE as `txid = ANY(...)`, not as a join against unnest, and the reason
 // is the one moveToMinedSQL gives: tx_mined's primary key LEADS with txid, so the array form is
 // one index descent per key per live window, while the join form lets the planner hash the keys
 // against a window and read it whole -- measured on this schema at 500 keys against a 60,000-row
-// window, a Seq Scan and 7 ms of the statement's 13. The membership rows that SURVIVE are read
-// through a LATERAL with an OFFSET 0 fence instead, for the reason minedByTxidSQL and
-// appendMinedSQL need one, because there the keys are on the outside of a join.
+// window, a Seq Scan and 7 ms of the statement's 13.
 //
 // The clock is $4, the store's CURRENT height, not the transaction's created_height. See
 // unstampSQL: a transaction created at 100 and un-mined at a tip of 5,000 must wait from
@@ -209,56 +230,11 @@ SELECT txid FROM moved`
 // it, because the transaction is handed to block assembly, which prices it.
 //
 // The COINS are reset by a separate statement in the same transaction, resetCoinsSQL, and not
-// by a fourth CTE here. A CTE cannot take the packed-key range as a plain array value -- it
+// by a further CTE here. A CTE cannot take the packed-key range as a plain array value -- it
 // would have to compute the bounds from the deleted rows -- and the planner then costs the
 // range as a join filter and reads all eight coin partitions instead: measured on this schema
 // at 400,000 coins, a Seq Scan on every partition and 98 ms of the statement's 108.
 const moveBackSQL = `
-WITH gone AS (
-    DELETE FROM tx_mined m
-     WHERE m.txid = ANY($1::bytea[]) AND m.mined_height = $2::int AND m.block_id = $3::int
-    RETURNING m.txid, m.created_height, m.size_in_bytes, m.fee, m.tx_inpoints,
-              m.locktime, m.created_at, m.flags
-),
-keys AS (
-    SELECT DISTINCT txid FROM gone
-),
-others AS (
-    SELECT k.txid, o.membership
-      FROM keys k
-     CROSS JOIN LATERAL (
-       SELECT string_agg(mh_triple(m.block_id, m.mined_height, m.subtree_idx),
-                         ''::bytea ORDER BY m.seq) AS membership
-         FROM tx_mined m
-        WHERE m.txid = k.txid
-          AND NOT (m.mined_height = $2::int AND m.block_id = $3::int)
-       OFFSET 0
-     ) AS o
-),
-back AS (
-    INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
-                          fee, size_in_bytes, tx_inpoints, locktime, created_at, flags)
-    SELECT (get_byte(g.txid, 0) & 7)::smallint, g.txid, g.created_height, $4::int, o.membership,
-           g.fee, g.size_in_bytes, g.tx_inpoints, g.locktime, g.created_at, g.flags
-      FROM (SELECT DISTINCT ON (txid) * FROM gone ORDER BY txid) g
-      LEFT JOIN others o ON o.txid = g.txid
-    ON CONFLICT (leaf, txid) DO NOTHING
-)
-SELECT txid FROM keys`
-
-// moveAllBackSQL is the un-mine that carries no block: every membership row of the
-// transaction comes back, and the blocks they named are remembered as fork triples.
-//
-// That is the one difference from moveBackSQL, and it follows from what the caller knows.
-// SetMinedMulti names a block, so the block it names is DROPPED from the membership and the
-// others are kept. MarkTransactionsOnLongestChain names none -- it says only that the chain
-// the node now believes in does not contain this transaction -- so it cannot drop any single
-// block, and all of them are kept as fork triples for a later stamp or un-mine to resolve.
-// There is no sibling-visibility trap here for the same reason: nothing survives the delete,
-// so the membership is packed from `gone` itself rather than from a second read.
-//
-// The coins are reset by resetCoinsSQL here too, with no block id, because none was given.
-const moveAllBackSQL = `
 WITH gone AS (
     DELETE FROM tx_mined m
      WHERE m.txid = ANY($1::bytea[])
@@ -273,15 +249,17 @@ packed AS (
            string_agg(mh_triple(block_id, mined_height, subtree_idx),
                       ''::bytea ORDER BY seq) AS membership
       FROM gone
+     WHERE $2::int IS NULL
+        OR NOT (mined_height = $2::int AND block_id = $3::int)
      GROUP BY txid
 ),
 back AS (
     INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
                           fee, size_in_bytes, tx_inpoints, locktime, created_at, flags)
-    SELECT (get_byte(g.txid, 0) & 7)::smallint, g.txid, g.created_height, $2::int, p.membership,
+    SELECT (get_byte(g.txid, 0) & 7)::smallint, g.txid, g.created_height, $4::int, p.membership,
            g.fee, g.size_in_bytes, g.tx_inpoints, g.locktime, g.created_at, g.flags
       FROM (SELECT DISTINCT ON (txid) * FROM gone ORDER BY txid, seq) g
-      JOIN packed p ON p.txid = g.txid
+      LEFT JOIN packed p ON p.txid = g.txid
     ON CONFLICT (leaf, txid) DO NOTHING
 )
 SELECT txid FROM keys`
@@ -300,11 +278,15 @@ SELECT txid FROM keys`
 // the fenced read runs first, in a CTE, and the UPDATE then matches on the exact (leaf, ukey)
 // it returns.
 //
-// mined_height > 0 is what leaves a coin already at the sentinel untouched. $5 is the block
-// being un-mined, or NULL for an un-mine that names no block, in which case every stamped coin
-// of the transaction is reset. Testing block_id against a parameter is sound here where testing
-// it for zero would not be: block id 0 is a legitimate id, and it is mined_height that carries
-// the "unconfirmed" fact.
+// mined_height > 0 is what selects the coins that need resetting and what leaves a coin already
+// at the sentinel untouched. It is the right test where block_id = 0 would not be: block id 0 is
+// a legitimate id, and it is mined_height that carries the "unconfirmed" fact.
+//
+// EVERY stamped coin of the transaction is reset, not only those naming the un-mined block, and
+// that follows from the move being whole. A coin stamped with a SIBLING block's id would
+// otherwise go on claiming a block the transaction no longer settles under, because after the
+// move the transaction is in the mempool table and settles under nothing at all. $5 narrows the
+// reset to one block for a caller that has reason to; no caller has today.
 //
 // A coin that has been spent has no row and needs none: its restore resolves the block facts
 // from membership at restore time.
@@ -606,9 +588,9 @@ func (s *Store) unstampAndMoveBack(ctx context.Context, leaves []int16, txids []
 		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] move back to the mempool", err)
 	}
 
-	blockID := int32(info.BlockID) //nolint:gosec // a block id fits int32
-
-	if err := resetCoins(ctx, dbTx, txids, &blockID); err != nil {
+	// No block id: the transaction is back in the mempool table, so it settles under no block
+	// and every one of its stamped coins goes back to the sentinel. See resetCoinsSQL.
+	if err := resetCoins(ctx, dbTx, txids, nil); err != nil {
 		_ = dbTx.Rollback(ctx)
 
 		return nil, err
