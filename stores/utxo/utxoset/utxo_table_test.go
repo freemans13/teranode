@@ -515,18 +515,21 @@ func TestUnspendRestoresFromJournal(t *testing.T) {
 	require.Equal(t, []byte(*parent.Outputs[0].LockingScript), script)
 	require.Equal(t, int32(100), created, "created_height must survive the round trip, for BIP68 and maturity")
 
-	// the journal row is consumed: the restore is single-use, which is what makes it
-	// idempotent without a counter
+	// the journal row is consumed: the restore is single-use
 	var remaining int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal WHERE txid = $1`, parentHash[:]).Scan(&remaining))
 	require.Equal(t, 0, remaining, "the journal row must be consumed by the restore")
 
-	// so a second restore finds nothing and must say so rather than silently succeeding
-	require.Error(t, s.Unspend(ctx, spends), "a second restore must not duplicate the coin")
+	// so a second restore's DELETE finds nothing to consume -- but the coin it would have
+	// restored is already live, and Unspend must recognise that and say so as success, not
+	// error: this is the shape a crashed-and-replayed WAL intent produces (see unspend.go's
+	// live_before), and BlockAssembler's conflict-intent replay depends on Unspend
+	// tolerating it.
+	require.NoError(t, s.Unspend(ctx, spends), "a second restore of an already-live coin must be a no-op, not an error")
 
 	var live int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM utxo WHERE txid = $1`, parentHash[:]).Scan(&live))
-	require.Equal(t, 1, live, "exactly one live row after a double restore attempt")
+	require.Equal(t, 1, live, "exactly one live row after a double restore attempt, never a duplicate")
 }
 
 // TestUnspendRefusesWrongSpender is the ownership token doing its job. A stale reorg

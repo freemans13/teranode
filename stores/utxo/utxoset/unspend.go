@@ -10,13 +10,32 @@ import (
 // unspendSQL restores coins from the journal and CONSUMES the journal rows doing it.
 //
 // The journal row IS the authorisation. Deleting it as part of the restore makes the
-// operation single-use: a second Unspend of the same outpoint matches nothing and does
-// nothing. That is what keeps invariant 5 intact -- the restore is authorised by the
+// operation single-use: a second Unspend of the same outpoint finds no journal row to
+// consume. That is what keeps invariant 5 intact -- the restore is authorised by the
 // presence of a durable row, not by a counter that could drift. A counter drift is
 // exactly what once stamped a live transaction and cascade-deleted it into a
 // TX_NOT_FOUND wedge.
 //
-// Three predicates, each load-bearing:
+// A second call on an outpoint the first call already restored must be a no-op success,
+// not an error -- BlockAssembler's conflict-intent WAL replay (stores/utxo/process_conflicting.go)
+// depends on Unspend tolerating exactly this: a crash between a successful Unspend and the
+// completion record for its intent means replay calls Unspend again on coins it already
+// restored. The journal being single-use means that second call's DELETE matches nothing,
+// which by itself is indistinguishable from the coin being genuinely unrestorable (its
+// journal partition already reclaimed, or the outpoint re-spent by someone else since). The
+// third output column resolves the ambiguity: it counts, from the state as it stood BEFORE this
+// statement touched anything (every CTE here reads that same pre-statement snapshot,
+// including live_before, so a key this call itself restores is not double-counted), how
+// many requested keys already had a live coin at that ukey+txid. A key can be in `taken`
+// (journal row existed and was consumed) or already live before the call, never both -- a
+// coin cannot be simultaneously spent-and-journaled and live -- so restored+alreadyLive
+// partitions the requested set cleanly between "this call did the work", "someone already
+// did", and "genuinely gone". The check deliberately ignores which spender's undo made the
+// coin live: the coin is unspent either way, so a replayed Unspend naming a different (or
+// stale) spending_txid than whatever actually restored it is still the correct no-op --
+// ownership only gates the journal consume, never the already-live short-circuit.
+//
+// Three predicates on the journal delete, each load-bearing:
 //
 //	j.ukey = i.ukey            locates candidates -- and is the journal's only index
 //	j.txid = i.ptxid           full 32 bytes: the ukey is a non-unique 96-bit prefix and
@@ -70,8 +89,21 @@ restored AS (
               AND u.ukey = t.ukey
               AND u.txid = t.txid)
     RETURNING ukey
+),
+live_before AS (
+    -- Requested keys that already had a live coin before this statement touched
+    -- anything -- a prior Unspend's work, seen here because every CTE in one WITH
+    -- query reads the same pre-statement snapshot regardless of execution order.
+    -- Ownership (stxid) is deliberately not checked: the coin is unspent either
+    -- way, so it does not matter whose undo put it there.
+    SELECT i.ukey FROM items i
+     WHERE EXISTS (
+           SELECT 1 FROM utxo u
+            WHERE u.leaf = (get_byte(i.ptxid, 0) & 7)::smallint
+              AND u.ukey = i.ukey
+              AND u.txid = i.ptxid)
 )
-SELECT (SELECT count(*) FROM restored), (SELECT count(*) FROM items)`
+SELECT (SELECT count(*) FROM restored), (SELECT count(*) FROM items), (SELECT count(*) FROM live_before)`
 
 // Unspend restores previously spent UTXOs from the spend journal.
 //
@@ -115,24 +147,27 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		return nil
 	}
 
-	var restored, requested int
+	var restored, requested, alreadyLive int
 
 	if err := s.pool.QueryRow(ctx, unspendSQL, ukeys, ptxids, stxids, extraFlags).
-		Scan(&restored, &requested); err != nil {
+		Scan(&restored, &requested, &alreadyLive); err != nil {
 		return errors.NewStorageError("[utxoset][Unspend] restore", err)
 	}
 
-	if restored != requested {
+	if restored+alreadyLive != requested {
 		// Silence here would be the dangerous outcome: a reorg that believes it has
 		// restored coins which are in fact still missing leaves the UTXO set wrong and
 		// consensus-divergent, with nothing to indicate it. Either every requested coin
-		// came back or the caller must know it did not.
+		// is now accounted for -- restored by this call or already live from an earlier
+		// one -- or the caller must know it is not.
 		//
 		// The usual causes are a journal partition already reclaimed (the spend is older
 		// than retention), or a spender mismatch meaning the coin was re-spent by a
-		// different transaction in the meantime.
-		return errors.NewProcessingError("[utxoset][Unspend] restored %d of %d requested; the rest are beyond journal retention or were re-spent by a different transaction",
-			restored, requested)
+		// different transaction in the meantime. alreadyLive covers the third, benign
+		// cause -- a replayed Unspend on a coin a previous call already restored -- so
+		// it is never itself part of what is missing here.
+		return errors.NewProcessingError("[utxoset][Unspend] restored %d, already live %d, of %d requested; the rest are beyond journal retention or were re-spent by a different transaction",
+			restored, alreadyLive, requested)
 	}
 
 	return nil
