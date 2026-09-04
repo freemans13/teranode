@@ -127,3 +127,21 @@ func TestBatchDecorateFollowsTheSameOrder(t *testing.T) {
 	require.Equal(t, []uint32{7}, items[2].Data.BlockIDs)
 	require.True(t, errors.Is(items[3].Err, errors.ErrTxNotFound))
 }
+
+// TestBlockIdRecoveryReadsTheMembershipRow pins what quick validation and legacy sync do on
+// a retry: Get the first non-coinbase transaction with fields.BlockIDs and reuse BlockIDs[0].
+// That transaction has no identity row in this design; the answer comes from tx_mined.
+// services/blockvalidation/quick_validate.go:429-444, services/legacy/netsync/handle_block.go:1236-1262.
+func TestBlockIdRecoveryReadsTheMembershipRow(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	first := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, first, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	got, err := s.Get(ctx, first.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Len(t, got.BlockIDs, 1)
+	require.Equal(t, uint32(42), got.BlockIDs[0])
+}
