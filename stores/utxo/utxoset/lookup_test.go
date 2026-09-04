@@ -3,6 +3,7 @@ package utxoset
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -164,4 +165,71 @@ func TestBlockIdRecoveryReadsTheMembershipRow(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got.BlockIDs, 1)
 	require.Equal(t, uint32(42), got.BlockIDs[0])
+}
+
+// TestBatchDecorateResolvesEveryLeafOfAMultiLeafBatch pins what the leaf-scalar identity probe
+// changed: the statement now runs once per leaf group instead of once for the batch, so a
+// grouping that dropped a leaf, or a group whose txids were sent under the wrong leaf, would
+// answer for some transactions and report the rest as missing.
+//
+// The batch is deliberately large enough to cover every leaf. LeafFor is the first byte of the
+// txid masked to NumLeaves, so a handful of random transactions is not enough to guarantee it;
+// the loop keeps creating until every leaf has at least one and then checks the count.
+func TestBatchDecorateResolvesEveryLeafOfAMultiLeafBatch(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	seen := map[int16]int{}
+	items := make([]*utxo.UnresolvedMetaData, 0, 64)
+
+	for sats := uint64(5_000); len(seen) < NumLeaves && sats < 5_200; sats++ {
+		tx := mkTx(t, 1, sats)
+		_, err := s.Create(ctx, tx, 700_100)
+		require.NoError(t, err)
+
+		seen[LeafFor(hashBytes(tx))]++
+
+		items = append(items, &utxo.UnresolvedMetaData{Hash: *tx.TxIDChainHash()})
+	}
+
+	require.Len(t, seen, NumLeaves, "the batch has to span every leaf for this to prove anything")
+
+	require.NoError(t, s.BatchDecorate(ctx, items, fields.BlockIDs))
+
+	for _, it := range items {
+		require.NoError(t, it.Err, "%s", it.Hash.String())
+		require.NotNil(t, it.Data)
+	}
+}
+
+// TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch is the same proof on the stamp path,
+// where provePresentSQL is what has to name every transaction the caller asked about. The
+// interface says every hash appears in the answer or the call fails, and a leaf grouping that
+// lost a group would fail the whole batch rather than answer wrongly -- which is the right
+// direction, and still worth pinning.
+func TestSetMinedMultiAnswersForEveryLeafOfAMultiLeafBatch(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	seen := map[int16]int{}
+	hashList := make([]*chainhash.Hash, 0, 64)
+
+	for sats := uint64(6_000); len(seen) < NumLeaves && sats < 6_200; sats++ {
+		tx := mkTx(t, 1, sats)
+		_, err := s.Create(ctx, tx, 700_100)
+		require.NoError(t, err)
+
+		seen[LeafFor(hashBytes(tx))]++
+
+		hashList = append(hashList, tx.TxIDChainHash())
+	}
+
+	require.Len(t, seen, NumLeaves)
+
+	// A fork stamp, so the rows stay in the identity table and provePresentSQL is what answers.
+	got, err := s.SetMinedMulti(ctx, hashList, utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
+	require.NoError(t, err)
+	require.Len(t, got, len(hashList))
+
+	for _, h := range hashList {
+		require.Equal(t, []uint32{42}, got[*h], "%s", h.String())
+	}
 }

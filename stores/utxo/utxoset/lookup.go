@@ -65,15 +65,29 @@ import (
 // transaction. An inner join would report every such transaction as missing, and a missing
 // parent makes the validator reject its children.
 //
-// Both halves are found by (leaf, txid) and (created_height, txid) respectively, so this is
-// two index probes per transaction and no scan. The body's height comes from the identity row,
-// which is why created_height is immutable there: if it moved, the body could not be found.
+// The body's height comes from the identity row, which is why created_height is immutable
+// there: if it moved, the body could not be found.
+//
+// THE LEAF IS A SCALAR AND THE TXIDS AN ARRAY, so this runs once per leaf group. That is the
+// shape leafGroups (set_mined.go) measures and the reason it exists: the paired
+// `unnest(l[],t[]) JOIN tx_ident` form this statement used to carry is the one whose plan
+// FLIPS with statistics -- a hash of the whole mempool at mempool sizes, index probes only once
+// the table is far larger than a mempool ever is. Measured on this schema, 500 keys over eight
+// leaves against 40,000 identity rows, eight runs each: the paired form 7.38-7.69 ms for the
+// batch, the leaf-scalar form 0.29-0.36 ms per group, so about 2.7 ms for the same 500 keys.
+// This is step 1 of every read, on the validator's parent-resolution path.
+//
+// The leaf is redundant as a FILTER and load-bearing as an ACCESS PATH, exactly as it is in
+// moveToMinedSQL: txid is the full 32 bytes and tx_ident_ck makes leaf a function of it, so no
+// row can satisfy the txid qual under another leaf. What the scalar buys is partition pruning
+// to one leaf and a usable primary key, since txid is its second column.
 const identByTxidSQL = `
 SELECT i.txid, i.created_height, i.off_chain_since, i.membership, i.fee, i.size_in_bytes,
        i.tx_inpoints, i.locktime, i.created_at, i.flags, b.raw_tx
-  FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
-  JOIN tx_ident i ON i.leaf = k.leaf AND i.txid = k.txid
-  LEFT JOIN tx_body b ON b.created_height = i.created_height AND b.txid = i.txid`
+  FROM tx_ident i
+  LEFT JOIN tx_body b ON b.created_height = i.created_height AND b.txid = i.txid
+ WHERE i.leaf = $1::smallint
+   AND i.txid = ANY($2::bytea[])`
 
 // minedByTxidSQL reads every membership row for a set of transactions, across every live
 // window, in insertion order. The primary key leads with txid, so this is one descent per
@@ -263,7 +277,6 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 	// would return the row twice and waste the round trip this call exists to save.
 	uniq := make([]chainhash.Hash, 0, len(hashes))
 	seen := make(map[chainhash.Hash]struct{}, len(hashes))
-	leaves := make([]int16, 0, len(hashes))
 	txids := make([][]byte, 0, len(hashes))
 
 	for i := range hashes {
@@ -274,11 +287,10 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 		seen[hashes[i]] = struct{}{}
 
 		uniq = append(uniq, hashes[i])
-		leaves = append(leaves, LeafFor(hashes[i][:]))
 		txids = append(txids, hashes[i][:])
 	}
 
-	if err := s.readIdentRows(ctx, leaves, txids, &res); err != nil {
+	if err := s.readIdentRows(ctx, txids, &res); err != nil {
 		return lookupResult{}, err
 	}
 
@@ -448,9 +460,25 @@ func stillMissing(hashes []chainhash.Hash, res *lookupResult) []chainhash.Hash {
 
 // readIdentRows fills in every transaction that still holds an identity row: a mempool
 // arrival, or one un-mined by a reorg and waiting again.
-func (s *Store) readIdentRows(ctx context.Context, leaves []int16, txids [][]byte,
-	res *lookupResult) error {
-	rows, err := s.pool.Query(ctx, identByTxidSQL, leaves, txids)
+//
+// One statement per LEAF GROUP, not one for the batch, because identByTxidSQL takes the leaf as
+// a scalar. That is up to NumLeaves round trips instead of one, and it is still the cheaper
+// shape by a wide margin -- see identByTxidSQL for the measurement. The leaf a transaction
+// routes to is derived by leafGroups from the txid itself, so this cannot disagree with the
+// check constraint about which partition a row lives in.
+func (s *Store) readIdentRows(ctx context.Context, txids [][]byte, res *lookupResult) error {
+	for _, g := range leafGroups(txids) {
+		if err := s.readIdentGroup(ctx, g, res); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// readIdentGroup is one leaf's worth of readIdentRows.
+func (s *Store) readIdentGroup(ctx context.Context, g leafBatch, res *lookupResult) error {
+	rows, err := s.pool.Query(ctx, identByTxidSQL, g.leaf, g.txids)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][lookup] identity rows", err)
 	}
