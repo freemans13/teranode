@@ -36,16 +36,29 @@ import (
 // it deletes, so destroying them here would turn an ordering mistake into unrecoverable coin
 // loss. They are inert anyway, and retire with their partition.
 //
-// The body is reached through the identity row's created_height rather than by transaction id,
-// because created_height leads the body's primary key and the id alone cannot use it. This is
-// createIdentPlanSQL's claim-gates-the-body join, run backwards.
+// The body is reached through created_height rather than by transaction id, because
+// created_height leads the body's primary key and the id alone cannot use it. This is
+// createIdentPlanSQL's and createMinedPlanSQL's claim-gates-the-body join, run backwards, and it
+// has to run backwards from BOTH: a mempool transaction's body is claimed by tx_ident, but a
+// block-path transaction's is claimed by tx_mined instead (see createMinedPlanSQL), and either
+// one always writes a tx_body row. gone -- the UNION of what ident and mined actually deleted --
+// is therefore the only complete set of (created_height, txid) pairs to join tx_body against.
+// Joining through ident alone left a mined-only transaction's body behind: no tx_ident row
+// exists to gate it, so nothing found it, and it sat there until its 288-block body window aged
+// out on its own, contradicting Delete's promise to remove every trace immediately.
 //
 // mined removes the transaction's membership rows, tx_mined's replacement for the identity row
 // on a mined transaction. It is keyed by txid alone -- tx_mined has no leaf column, and its
 // primary key leads with txid, so this is an index descent per live window rather than a scan.
 // Left behind, a deleted-but-still-a-member transaction would misreport itself as present to
 // any later lookup that consults tx_mined, exactly the resurrection the identity delete above
-// already guards against for a mempool transaction.
+// already guards against for a mempool transaction. It RETURNs created_height and txid for the
+// same reason ident does: to feed the body join.
+//
+// A transaction can hold several tx_mined rows -- one per window its coins are still claimed
+// through, or a coinbase re-org claiming it at more than one height -- all sharing the same
+// created_height, so gone runs them through UNION rather than a plain concatenation to collapse
+// them to one (created_height, txid) pair before the join.
 const deleteTxSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[])
@@ -72,12 +85,18 @@ ident AS (
 mined AS (
     DELETE FROM tx_mined m USING k
      WHERE m.txid = k.txid
+    RETURNING m.created_height, m.txid
+),
+gone AS (
+    SELECT created_height, txid FROM ident
+    UNION
+    SELECT created_height, txid FROM mined
 ),
 body AS (
-    DELETE FROM tx_body b USING ident d
-     WHERE b.created_height = d.created_height AND b.txid = d.txid
+    DELETE FROM tx_body b USING gone g
+     WHERE b.created_height = g.created_height AND b.txid = g.txid
 )
-SELECT count(*) FROM ident`
+SELECT count(DISTINCT txid) FROM gone`
 
 // Delete removes a transaction and everything the store holds about it.
 //
@@ -120,7 +139,9 @@ func (s *Store) deleteIn(ctx context.Context, q querier, hashes []chainhash.Hash
 	// The count is read rather than discarded so that a future batch form can tell its caller
 	// what went, but it is deliberately NOT compared against the number of hashes offered. A
 	// transaction the store never held deletes nothing, and that is the contract rather than a
-	// miss.
+	// miss. It counts distinct transactions found through EITHER path -- a mempool transaction
+	// via tx_ident or a block-path transaction via tx_mined -- not identity rows alone, so a
+	// mined-only delete is not silently reported as zero.
 	var removed int64
 
 	if err := q.QueryRow(ctx, deleteTxSQL, leaves, txids, los, his).Scan(&removed); err != nil {

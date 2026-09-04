@@ -210,6 +210,11 @@ func TestDeleteLeavesOtherTransactionsAlone(t *testing.T) {
 
 // TestDeleteRemovesMembershipRows: the rewind tool deletes a transaction outright; its
 // membership rows go with it so a later lookup does not resurrect a deleted transaction.
+//
+// It also asserts the body, because a block-path transaction has no tx_ident row to gate a
+// body join through -- createMinedPlanSQL claims on tx_mined instead -- so a body join that
+// only ever looked at what ident deleted left a mined-only transaction's tx_body row behind
+// until its window aged out on its own, rather than going with everything else Delete removes.
 func TestDeleteRemovesMembershipRows(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -221,4 +226,7 @@ func TestDeleteRemovesMembershipRows(t *testing.T) {
 	require.NoError(t, s.Delete(ctx, tx.TxIDChainHash()))
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
 	require.Equal(t, 0, coinCount(t, s, ctx, tx))
+	h := tx.TxIDChainHash()
+	require.Equal(t, 0, countWhere(t, s, ctx, `SELECT count(*) FROM tx_body WHERE txid = $1`, h[:]),
+		"a mined-only transaction's body must not survive Delete")
 }
