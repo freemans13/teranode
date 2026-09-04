@@ -74,6 +74,13 @@ type Store struct {
 	// bodyRetention is how long the serialized transaction bytes are kept, in blocks.
 	bodyRetention uint32
 
+	// coinIndexDecider decides whether a utxo_pN_ukey index has bloated past the point
+	// worth a REINDEX CONCURRENTLY. New sets it to coinIndexNeedsRebuild; it exists as a
+	// field, rather than the pruner calling that function directly, so a test can swap in a
+	// stub and observe that the pruner consulted it, without needing a real index bloated
+	// past the threshold or a real REINDEX to complete.
+	coinIndexDecider func(indexBytes, rows int64) bool
+
 	// createBatcher collects Create calls arriving from many goroutines and sends them as
 	// one pipelined round trip.
 	//
@@ -199,7 +206,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
 		journalRetention: DefaultSpendJournalRetentionBlocks,
-		bodyRetention:    DefaultTxBodyRetentionBlocks}
+		bodyRetention:    DefaultTxBodyRetentionBlocks,
+		coinIndexDecider: coinIndexNeedsRebuild}
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)

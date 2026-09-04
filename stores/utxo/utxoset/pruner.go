@@ -76,40 +76,47 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 			bodies, p.store.bodyRetention)
 	}
 
-	if height <= p.store.journalRetention {
-		return 0, nil
+	// The window and spend-journal drops are gated on journalRetention: below it nothing has
+	// aged out yet, so there is nothing to drop. That gate does NOT extend to the coin-index
+	// rebuild below -- a coin index can already be bloated on a chain three blocks deep, and
+	// every dev/test net and every from-scratch sync spends most of its life below
+	// DefaultSpendJournalRetentionBlocks (1440). Gating the rebuild on it, as an earlier
+	// version of this did by putting the rebuild after this block's early return, meant the
+	// rebuild never ran anywhere that mattered for testing it and would not have run during
+	// the early, most write-heavy part of a real sync either.
+	if height > p.store.journalRetention {
+		cutoff := height - p.store.journalRetention
+
+		// Identity reclaim is a partition drop. Nothing is read to decide it: a window whose
+		// upper bound is journalRetention below the pruner's height holds transactions whose
+		// blocks cannot be un-mined and whose coins carry their own block facts.
+		windows, err := p.store.dropTxMinedWindowsBelow(ctx, cutoff)
+		if err != nil {
+			return 0, err
+		}
+
+		// The journal's leaves and the conflict-bookkeeping windows that retire with them, in
+		// one pass: a note names a race whose losing spends are restored out of the journal,
+		// so keeping it past its journal leaf would keep an answer nothing can act on.
+		leaves, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff)
+		if err != nil {
+			return 0, err
+		}
+
+		if windows > 0 || leaves > 0 {
+			p.store.logger.Infof("[utxoset] pruner dropped %d membership windows and %d spend-journal and conflict partitions below height %d",
+				windows, leaves, cutoff)
+		}
 	}
 
-	cutoff := height - p.store.journalRetention
-
-	// Identity reclaim is a partition drop. Nothing is read to decide it: a window whose
-	// upper bound is journalRetention below the pruner's height holds transactions whose
-	// blocks cannot be un-mined and whose coins carry their own block facts.
-	windows, err := p.store.dropTxMinedWindowsBelow(ctx, cutoff)
-	if err != nil {
-		return 0, err
-	}
-
-	// The journal's leaves and the conflict-bookkeeping windows that retire with them, in one
-	// pass: a note names a race whose losing spends are restored out of the journal, so
-	// keeping it past its journal leaf would keep an answer nothing can act on.
-	leaves, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff)
-	if err != nil {
-		return 0, err
-	}
-
-	if windows > 0 || leaves > 0 {
-		p.store.logger.Infof("[utxoset] pruner dropped %d membership windows and %d spend-journal and conflict partitions below height %d",
-			windows, leaves, cutoff)
-	}
-
-	// LAST, and deliberately once per session rather than looped: a REINDEX CONCURRENTLY on
-	// a big partition can run for minutes, so this call returning is not "the index is now
-	// clean", it is "at most one rebuild is in flight". The next block's pruner call runs
-	// this again and finds whichever partition is now worst -- including the one just
-	// finished, back near the 31.5-byte floor -- so the schedule catches up over a run of
-	// blocks rather than blocking this one.
-	if _, err := p.store.rebuildOneBloatedCoinIndex(ctx, coinIndexNeedsRebuild); err != nil {
+	// LAST, and unconditional: every session reaches this, regardless of height or
+	// journalRetention. It is also deliberately once per session rather than looped: a
+	// REINDEX CONCURRENTLY on a big partition can run for minutes, so this call returning is
+	// not "the index is now clean", it is "at most one rebuild is in flight". The next
+	// block's pruner call runs this again and finds whichever partition is now worst --
+	// including the one just finished, back near the 31.5-byte floor -- so the schedule
+	// catches up over a run of blocks rather than blocking this one.
+	if _, err := p.store.rebuildOneBloatedCoinIndex(ctx, p.store.coinIndexDecider); err != nil {
 		return 0, err
 	}
 

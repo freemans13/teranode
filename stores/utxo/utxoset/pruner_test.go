@@ -71,3 +71,35 @@ func TestPrunerDropsMembershipWindowsOnTheJournalCutoff(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint32(1), floor)
 }
+
+// TestPrunerRebuildsCoinIndexBelowJournalRetention pins a review finding: the coin-index
+// rebuild step must not sit inside the "height > journalRetention" gate that guards the
+// window and spend-journal drops. That gate exists because there is nothing aged out to
+// drop below it; it has no bearing on the coin index, which can already be churned on a
+// chain three blocks deep. Every dev/test net and every from-scratch sync spends most of
+// its life below DefaultSpendJournalRetentionBlocks (1440), so a rebuild gated on it would
+// never run there.
+//
+// s.coinIndexDecider is the injection point: New sets it to the real coinIndexNeedsRebuild,
+// and this test swaps in a stub that just counts calls, so the assertion is "the pruner
+// consulted the decider exactly once" rather than depending on a real index actually being
+// bloated. Whether the decider says yes and a REINDEX CONCURRENTLY then runs is already
+// covered by TestRebuildCoinIndexRunsConcurrentlyAndOnce; returning false here keeps this
+// test to the one thing it is pinning, and fast.
+func TestPrunerRebuildsCoinIndexBelowJournalRetention(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	calls := 0
+	s.coinIndexDecider = func(_, _ int64) bool {
+		calls++
+		return false
+	}
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	_, err = svc.Prune(ctx, 100, "deadbeef")
+	require.NoError(t, err)
+	require.Equal(t, 1, calls,
+		"the coin-index rebuild must run on every pruner session, not only past journal retention")
+}
