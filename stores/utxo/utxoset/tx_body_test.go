@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -287,4 +288,41 @@ func TestTxBodyReclaimTakesTheOldestWindowFirst(t *testing.T) {
 	require.False(t, tableExists(t, s, ctx, "tx_body_w4"))
 	require.True(t, tableExists(t, s, ctx, "tx_body_w7"), "still inside the horizon")
 	require.True(t, tableExists(t, s, ctx, "tx_body_w10"))
+}
+
+func bodyExists(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx) bool {
+	t.Helper()
+
+	var n int
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM tx_body WHERE txid = $1`, hashBytes(tx)).Scan(&n))
+
+	return n > 0
+}
+
+// TestBodyWindowsBelowRetentionAreDropped. The transaction bytes are the one part with a
+// horizon rather than a dependency, so their windows go wholesale.
+func TestBodyWindowsBelowRetentionAreDropped(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	old := mkTx(t, 1, 1_000)
+	_, err := s.Create(ctx, old, 100)
+	require.NoError(t, err)
+
+	recent := mkTx(t, 1, 2_000)
+	_, err = s.Create(ctx, recent, 900)
+	require.NoError(t, err)
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	// Tip 1,000, so anything filed below 712 is past the 288-block horizon.
+	_, err = svc.Prune(ctx, 1_000, "deadbeef")
+	require.NoError(t, err)
+
+	require.False(t, bodyExists(t, s, ctx, old), "filed at 100, far past the horizon")
+	require.True(t, bodyExists(t, s, ctx, recent), "filed at 900, still inside it")
+
+	require.True(t, identExists(t, s, ctx, old),
+		"and the identity row survives its body: it is still needed while its coin is unspent")
 }

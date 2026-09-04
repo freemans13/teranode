@@ -16,14 +16,18 @@ import (
 // hardcoded checkpoint a reorg is impossible by rule, so the undo payload can never be
 // replayed, and writing it is a heap insert plus an index insert per input for nothing.
 //
-// What that missed is that the journal is also the prune engine. Every spend writes a row
-// grouped by height, which is the only record of WHICH transactions had an output spent in
-// a given window -- the work list the pruner reads to decide what is now fully spent. With
-// the journal off, nothing at all can be reclaimed below the checkpoint. Mainnet's highest
-// checkpoint is 945,000, roughly 6.88 billion transactions are mined below it, and the
-// unreclaimable residue is 165 to 444 GB on an 875 GB disk.
+// What that missed, at the time, was that the journal was also the prune engine: a retiring
+// partition was the only record of WHICH transactions had an output spent in a window, and
+// with the journal off nothing at all could be reclaimed below the checkpoint.
 //
-// So the journal has no off-switch, and this test pins the height case that used to
+// That is no longer why it stays on. Identity reclaim is a tx_mined window drop and reads
+// nothing, so the journal is undo insurance again. It stays on below the checkpoint because
+// switching it off there is a SECOND spend path -- one that writes the undo row and one that
+// does not -- exercised only during a sync, for a measured 354.8 bytes of WAL and 12.9
+// microseconds per spend. That is about 6% of the per-block budget in the worst band, and not
+// worth a divergent path on the store's hottest statement.
+//
+// So the journal still has no off-switch, and this test pins the height case that used to
 // disable it: deep below the checkpoint, a spend must still be journalled.
 func TestJournalRunsBelowTheCheckpoint(t *testing.T) {
 	s, ctx := newTestStore(t)
@@ -47,5 +51,5 @@ func TestJournalRunsBelowTheCheckpoint(t *testing.T) {
 	var journalled int
 	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM spend_journal`).Scan(&journalled))
 	require.Equal(t, 1, journalled,
-		"the journal is the prune engine, not just reorg insurance: without it nothing below the checkpoint can ever be reclaimed")
+		"the journal has no off-switch: one spend path writes the undo row at every height, checkpoint or not")
 }

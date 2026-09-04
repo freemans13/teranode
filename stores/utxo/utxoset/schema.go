@@ -43,10 +43,12 @@
 // M1 scope: the UTXO table, the spend journal and the block/chunk ledger. The tx_meta
 // window arrives in M3.
 //
-// The journal is ALWAYS ON, and that is the one decision here worth stating twice. It
-// reads as reorg insurance, which would make it dead weight below the hardcoded
-// checkpoint where a reorg is impossible by rule. It is also the prune engine, and in
-// that role it is load-bearing from genesis. See the spend_journal DDL comment below.
+// The journal is undo insurance and nothing else. It once doubled as the prune engine --
+// a retiring partition was the list of parents to re-examine -- which made it load-bearing
+// from genesis even below the hardcoded checkpoint, where a reorg is impossible by rule.
+// It no longer is: a mined transaction claims on tx_mined, its coins carry the height and
+// block that made them, and retiring its identity is dropping the window it lives in. See
+// the spend_journal DDL comment below for what that leaves the journal doing.
 package utxoset
 
 import (
@@ -165,41 +167,30 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- since been re-spent by a different transaction matches nothing and is a no-op rather
 -- than resurrecting a coin someone else now owns.
 --
--- RANGE partitioned by spent_height so reclaim is DROP TABLE -- O(1), no scan, no
+-- RANGE partitioned by spent_height so retiring it is DROP TABLE -- O(1), no scan, no
 -- vacuum, no background job that can fall behind. Age clusters by insert time by
 -- definition, which is why partition-drop works here and did not for the rejected
 -- epoch-slab design (there, garbage clustered by SPEND time, which is decorrelated
 -- from creation).
 --
--- IT HAS NO OFF-SWITCH, and the reason is not the one above.
+-- IT IS UNDO INSURANCE, AND ONLY THAT.
 --
--- As reorg insurance alone it would be pure overhead below the hardcoded checkpoint,
--- where a reorg is impossible by rule -- and it was switched off there, for exactly
--- that reason. But the journal is also the PRUNE ENGINE. A spend deletes one coin row
--- and signals nothing, so "that transaction's last output has now gone" is a fact about
--- absence that is recorded nowhere else. The journal records it for free: every spend
--- writes a row, rows are grouped by height, and a retiring partition therefore IS the
--- list of transactions to re-examine. Nothing else in the store can produce that list
--- without a counter on every spend or a scan that races.
+-- It used to be the PRUNE ENGINE as well, and that is why it had no off-switch. A spend
+-- deletes one coin row and signals nothing, so "that transaction's last output has now
+-- gone" was a fact about absence recorded nowhere else, and the journal recorded it for
+-- free: every spend writes a row, rows are grouped by height, and a retiring partition
+-- therefore WAS the list of transactions to re-examine. Retiring an identity needed that
+-- list, so the journal was load-bearing even below the hardcoded checkpoint where a reorg
+-- is impossible by rule.
 --
--- With it off, nothing can be reclaimed for the entire initial sync. Mainnet's highest
--- checkpoint is 945,000, about 6.88 billion transactions are mined below it, and the
--- unreclaimable residue would be 165 to 444 GB on an 875 GB disk. Measured cost of
--- leaving it on: 354.8 bytes of WAL and 12.9 microseconds per spend, about 6% of the
--- per-block budget in the worst band. Not close.
+-- It is not any more. A mined transaction claims on tx_mined, in 288-block windows, and its
+-- coins carry the height and block of the transaction that made them, so retiring its
+-- identity is dropping a window and nothing has to be re-examined at all. What is left here
+-- is a restore, by outpoint, of a spend inside the retention window. Measured cost of
+-- keeping it: 354.8 bytes of WAL and 12.9 microseconds per spend, about 6% of the per-block
+-- budget in the worst band. Cheap enough that it stays on below the checkpoint too, rather
+-- than adding a second write path that only the tip exercises.
 -- ---------------------------------------------------------------------------
--- applied records HOW the spend was written, and it is the one column here that describes
--- the writer rather than the coin. TRUE means the spend was recorded by the block path
--- below the hardcoded checkpoint, which is the only path allowed to skip the
--- previous-output comparison (the outpoint-only option the validator refuses above the
--- checkpoint). A block there cannot be un-mined by rule, so a marked spend says its
--- spender is in a main-chain block that will never be taken back, and the reclaimer can
--- retire the parent without asking the identity table about the spender at all. That
--- matters twice over: it removes the two random heap probes that were 85 percent of a
--- reclaim batch, and it stops a spender that has no identity row (never stored, or already
--- reclaimed) from stranding its parents forever. A mempool spend at the tip is written
--- FALSE and takes the full three-probe path. Immutable once written, like every other
--- column in this row; nothing restores it because a restore deletes the row.
 CREATE TABLE IF NOT EXISTS spend_journal (
     spent_height    INTEGER  NOT NULL,
     satoshis        BIGINT   NOT NULL,
@@ -210,14 +201,8 @@ CREATE TABLE IF NOT EXISTS spend_journal (
     txid            BYTEA    NOT NULL,
     spending_txid   BYTEA    NOT NULL,
     script          BYTEA    NOT NULL,
-    hash_override   BYTEA,
-    applied         BOOLEAN  NOT NULL DEFAULT false
+    hash_override   BYTEA
 ) PARTITION BY RANGE (spent_height);
-
--- Existing databases predate the column. A constant default is a catalog-only change on
--- PostgreSQL 11 and later, so this is instant on a table of any size and propagates to every
--- attached partition. Rows written before the column read FALSE and take the full path.
-ALTER TABLE spend_journal ADD COLUMN IF NOT EXISTS applied BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS applied_block (
     height       INTEGER NOT NULL,
@@ -284,7 +269,7 @@ CREATE TABLE IF NOT EXISTS tx_mined_floor (
 INSERT INTO tx_mined_floor (id, floor) VALUES (0, 0) ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
--- THE IDENTITY TABLE. One row per transaction, from first sight to reclaim.
+-- THE IDENTITY TABLE. One row per MEMPOOL transaction, from first sight until its block.
 --
 -- Partitioned BY LIST (leaf), the same eight-way split as utxo, and never by
 -- created_height. Three reasons, worst first:
@@ -297,8 +282,8 @@ INSERT INTO tx_mined_floor (id, floor) VALUES (0, 0) ON CONFLICT DO NOTHING;
 --   2. Fifteen Store methods take a txid and no height at all, and two of the
 --      highest-volume ones have no height field in their argument type, so they could
 --      not supply one even after an interface change.
---   3. Height only ever bought partition-drop reclaim, and a partition holds
---      transactions whose coins are still unspent, so it can never fire.
+--   3. Height only ever bought a partition drop, and a partition holds transactions whose
+--      coins are still unspent, so it could never fire.
 --
 -- leaf is a REAL stored column. PARTITION BY LIST ((get_byte(txid,0) & 7)) is accepted
 -- but then postgres bans every unique constraint on the table, and a GENERATED column
@@ -335,35 +320,6 @@ CREATE TABLE IF NOT EXISTS tx_ident (
         CHECK (membership IS NULL OR length(membership) % 12 = 0),
     PRIMARY KEY (leaf, txid)
 ) PARTITION BY LIST (leaf);
-
--- ---------------------------------------------------------------------------
--- THE BIRTH LEDGER. The work list for transactions that can never be spent.
---
--- The reclaimer learns about a transaction from a spend of one of its outputs: a retiring
--- journal partition names every parent that had an output spent in that window. A
--- transaction with no spendable outputs (an OP_FALSE OP_RETURN data carrier, or one whose
--- outputs are all provably unspendable) is never anyone's parent, so no journal row ever
--- names it, and its identity row would live forever. On the mainnet box about one in
--- eight of the identity rows the reclaimer could never reach were this shape.
---
--- The row cannot simply be skipped at create. Block assembly needs fee, size and inputs
--- from it while the transaction is in the mempool, the stamp's postcondition needs it when
--- a block containing it is stamped, and the block persister reads the bytes back for every
--- transaction in a block it archives. So the row is written, and this ledger records where
--- to find it later: one row per such transaction, keyed by the height it was created at,
--- RANGE partitioned in the same 48-block windows as the transaction bytes and created by
--- the same DDL. No index: a window is only ever read whole, once, when it retires.
---
--- A window retires on the JOURNAL's cadence, 1440 blocks, not the body's 288, and after the
--- journal loop. A zero-output transaction is a spender, and its parents' journal rows name
--- it for 1440 blocks; deleting its identity row earlier would make the settled probe for
--- those parents find no spender row. Below the checkpoint the applied mark answers for it
--- anyway; at the tip the row must outlive the journal rows that name it.
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS tx_birth (
-    created_height  INTEGER NOT NULL,
-    txid            BYTEA   NOT NULL
-) PARTITION BY RANGE (created_height);
 
 -- ---------------------------------------------------------------------------
 -- THE BODY. Serialized transaction bytes, and nothing else.
@@ -429,11 +385,13 @@ CREATE TABLE IF NOT EXISTS utxo_p%[1]d PARTITION OF utxo FOR VALUES IN (%[1]d)
 -- txid without a ukey range bound is a review failure.
 CREATE INDEX IF NOT EXISTS utxo_p%[1]d_ukey ON utxo_p%[1]d (ukey);
 
--- The identity partitions take the coin table's autovacuum block, for the same reason. The
--- reclaimer deletes at row level here, several hundred thousand rows a minute during a fast
--- sync, and the shipped default (20 percent dead tuples, default throttling) meant a pass
--- every twenty minutes or so per partition with the primary key drifting toward its 2x bloat
--- plateau between passes. The ALTER makes an existing database converge; SET is catalog-only.
+-- The identity partitions take the coin table's autovacuum block, for the same reason. This is
+-- the MEMPOOL table now, and a mempool row is deleted at row level the moment its block is
+-- stamped and the transaction moves to tx_mined, so the dead-row rate here tracks block
+-- production exactly as the coin table's does. The shipped default (20 percent dead tuples,
+-- default throttling) meant a pass every twenty minutes or so per partition with the primary
+-- key drifting toward its 2x bloat plateau between passes. The ALTER makes an existing
+-- database converge; SET is catalog-only.
 CREATE TABLE IF NOT EXISTS tx_ident_l%[1]d PARTITION OF tx_ident FOR VALUES IN (%[1]d)
   WITH (autovacuum_vacuum_scale_factor  = 0,
         autovacuum_vacuum_threshold     = 1000000,

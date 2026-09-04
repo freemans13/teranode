@@ -38,10 +38,6 @@ type spendPlan struct {
 	idx      []int32
 	heights  []int32
 	spenders [][]byte
-	// applied[k] is written to the journal row for input k: true when the owning item came
-	// through the below-checkpoint block path, which is the same fact skipClaim records per
-	// item. The reclaimer reads it back to retire a parent without probing its spenders.
-	applied  []bool
 	owner    []int // global index -> which item in the batch
 	ownerVin []int // global index -> which input of that item
 	perItem  [][]*utxo.Spend
@@ -67,7 +63,6 @@ func planSpends(items []*spendItem) *spendPlan {
 		idx:      make([]int32, 0, total),
 		heights:  make([]int32, 0, total),
 		spenders: make([][]byte, 0, total),
-		applied:  make([]bool, 0, total),
 		owner:    make([]int, 0, total),
 		ownerVin: make([]int, 0, total),
 		perItem:  make([][]*utxo.Spend, len(items)),
@@ -103,7 +98,6 @@ func planSpends(items []*spendItem) *spendPlan {
 			p.idx = append(p.idx, int32(len(p.owner))) //nolint:gosec // bounded by batch size
 			p.heights = append(p.heights, int32(it.blockHeight))
 			p.spenders = append(p.spenders, spendingTxID[:])
-			p.applied = append(p.applied, it.ignoreFlags.SkipUTXOHashCheck)
 			p.owner = append(p.owner, i)
 			p.ownerVin = append(p.ownerVin, vin)
 
@@ -172,7 +166,6 @@ func (p *spendPlan) sortRows() {
 	p.txids = permute(p.txids, order)
 	p.heights = permute(p.heights, order)
 	p.spenders = permute(p.spenders, order)
-	p.applied = permute(p.applied, order)
 	p.owner = permute(p.owner, order)
 	p.ownerVin = permute(p.ownerVin, order)
 
@@ -253,7 +246,7 @@ func (s *Store) runSpendPlan(ctx context.Context, q pgx.Tx, p *spendPlan) error 
 	}
 
 	rows, err := q.Query(ctx, spendJournalSQL, p.leaves, p.ukeys, p.txids, p.idx,
-		p.heights, p.spenders, p.applied)
+		p.heights, p.spenders)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Spend] delete", err)
 	}

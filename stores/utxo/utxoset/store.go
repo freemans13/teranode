@@ -56,19 +56,6 @@ type Store struct {
 	// journalRetention is how far back spends stay undoable, in blocks.
 	journalRetention uint32
 
-	// reclaimChunkParents bounds how many parent transactions the reclaimer holds at once.
-	//
-	// One journal leaf covers SpendJournalPartitionBlocks heights, so at fat-band rates it
-	// carries on the order of a million spend records. Reading a whole leaf before asking a
-	// single question put that entire set in memory, twice over, plus a map keyed on every
-	// parent, once per leaf and bounded by nothing. That is the shape of the two out-of-memory
-	// failures this codebase has already had, and it is invisible until the chain gets busy.
-	//
-	// Chunks cut on a PARENT boundary and never on a row boundary. A parent is judged on
-	// whether every transaction that spent it is settled, so a chunk holding only some of its
-	// spenders would judge it on half the evidence.
-	reclaimChunkParents int
-
 	// bodyWindow is the tx_body window the last create landed in, so the catalog is only
 	// touched when it changes.
 	bodyWindow atomic.Uint32
@@ -157,8 +144,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Every hot statement here hands its batch over as an array and unpacks it with unnest, so
 	// the planner has no statistics for the values it will be given. It guesses, and because
 	// every table is partitioned the guess is then multiplied by the partition count. On the
-	// mainnet soak box hasLiveCoinSQL reads about twenty index pages and is costed at 679,043,
-	// and the decorate read is costed at 1,465,539. Postgres compiles above 100,000 and inlines
+	// mainnet soak box the live-coin probe reads about twenty index pages and is costed at
+	// 679,043, and the decorate read is costed at 1,465,539. Postgres compiles above 100,000 and inlines
 	// and optimises above 500,000, so both clear every threshold on every execution.
 	//
 	// The compile is not the flat cost it looks like. The same statement took 1,430,530 ms, then
@@ -211,9 +198,8 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	s := &Store{logger: logger, settings: tSettings, pool: pool,
-		journalRetention:    DefaultSpendJournalRetentionBlocks,
-		bodyRetention:       DefaultTxBodyRetentionBlocks,
-		reclaimChunkParents: DefaultReclaimChunkParents}
+		journalRetention: DefaultSpendJournalRetentionBlocks,
+		bodyRetention:    DefaultTxBodyRetentionBlocks}
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)

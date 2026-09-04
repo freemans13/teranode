@@ -327,8 +327,6 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	p.lo = append(p.lo, Pack(txHash[:], 0))
 	p.hi = append(p.hi, Pack(txHash[:], ^uint32(0)))
 
-	coinsBefore := len(p.coinTxids)
-
 	for vout, out := range tx.Outputs {
 		if out == nil {
 			continue
@@ -354,9 +352,6 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		p.coinMined = append(p.coinMined, minedHeight)
 		p.coinBlockIDs = append(p.coinBlockIDs, blockID)
 	}
-
-	// No coin row means no spend will ever name this transaction, so the birth ledger has to.
-	p.noCoins = append(p.noCoins, len(p.coinTxids) == coinsBefore)
 
 	return &meta.Data{
 		Tx:          tx,

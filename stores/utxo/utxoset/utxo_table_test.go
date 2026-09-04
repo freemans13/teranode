@@ -2,7 +2,6 @@ package utxoset
 
 import (
 	"context"
-	"fmt"
 	"net/url"
 	"testing"
 
@@ -651,7 +650,7 @@ func spendOnly(ctx context.Context, s *Store, tx *bt.Tx, blockHeight uint32,
 	return spends, err
 }
 
-// TestSpendJournalReclaimTakesTheOldestLeafFirst pins the order the drop loop works in.
+// TestSpendJournalDropTakesTheOldestLeafFirst pins the order the drop loop works in.
 //
 // The listing query has no ORDER BY, so without an explicit sort the catalog returns leaves
 // in whatever order it scanned them, and that order shifts as tables are created and dropped.
@@ -661,13 +660,16 @@ func spendOnly(ctx context.Context, s *Store, tx *bt.Tx, blockHeight uint32,
 //
 // The mainnet box showed the failure: leaf 4,676 was still present while the session was
 // working on leaf 9,353, so the oldest leaf never got attacked and the oldest-surviving-leaf
-// watermark never moved. Old leaves are also the cheap ones, measured at six to thirteen
-// times less work than leaves near the frontier.
+// watermark never moved.
 //
 // Creating the leaves out of order is the point of this test. Doing it ascending would pass
 // against the unsorted code by luck, because the catalog would most likely hand them back in
 // creation order.
-func TestSpendJournalReclaimTakesTheOldestLeafFirst(t *testing.T) {
+//
+// The order is observed by stopping the run part way. This used to be read off a callback the
+// pruner passed in to use each retiring leaf as a work list; nothing reads a retiring leaf any
+// more, so the leaf that survives an interrupted run is what says where the run had got to.
+func TestSpendJournalDropTakesTheOldestLeafFirst(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	// Deliberately scrambled: leaves 10, 2, 7, 4 in creation order.
@@ -675,21 +677,53 @@ func TestSpendJournalReclaimTakesTheOldestLeafFirst(t *testing.T) {
 		require.NoError(t, s.ensureSpendJournalPartition(ctx, h))
 	}
 
-	var seen []uint32
-
-	// A cutoff above every leaf, so all four are eligible and the order is the only variable.
-	_, err := s.dropSpendJournalPartitionsBelow(ctx, 100_000,
-		func(_ context.Context, partition string) error {
-			var leaf uint32
-			_, serr := fmt.Sscanf(partition, "spend_journal_%d", &leaf)
-			require.NoError(t, serr)
-
-			seen = append(seen, leaf)
-
-			return nil
-		})
+	// Leaf 7 is pinned so the run fails there. A view is the cheapest dependency postgres
+	// refuses to drop through, and it has to be removed again: the test database is shared by
+	// the whole binary, and a pinned leaf left behind would make a later test's
+	// CREATE TABLE IF NOT EXISTS skip a name it thinks is taken.
+	_, err := s.pool.Exec(ctx, `CREATE VIEW journal_leaf_7_pin AS SELECT * FROM spend_journal_7`)
 	require.NoError(t, err)
 
-	require.Equal(t, []uint32{2, 4, 7, 10}, seen,
-		"leaves must be worked oldest first, whatever order the catalog listed them in")
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(ctx, `DROP VIEW IF EXISTS journal_leaf_7_pin`)
+		_, _ = s.pool.Exec(ctx, `DROP TABLE IF EXISTS spend_journal_7`)
+	})
+
+	// A cutoff above every leaf, so all four are eligible and the order is the only variable.
+	_, err = s.dropSpendJournalPartitionsBelow(ctx, 100_000)
+	require.Error(t, err, "leaf 7 cannot be dropped, and the run must report that rather than skip it")
+
+	require.False(t, tableExists(t, s, ctx, "spend_journal_2"), "the oldest leaf must go first")
+	require.False(t, tableExists(t, s, ctx, "spend_journal_4"), "then the next oldest")
+	require.True(t, tableExists(t, s, ctx, "spend_journal_7"), "the run stopped here")
+	require.True(t, tableExists(t, s, ctx, "spend_journal_10"),
+		"and never reached the newest leaf, which is the whole point of oldest-first")
+}
+
+// TestStorePoolDisablesJIT pins the one setting that stands between this store and a stall.
+//
+// A plan assertion can pin the SHAPE of a statement's plan but not its estimated COST, and the
+// cost is what postgres reads when it decides whether to hand the plan to LLVM. Because every
+// batch arrives as an array the planner has no statistics for, and because each table is
+// partitioned so the resulting guess gets multiplied, the estimate lands at 679,043 on real
+// mainnet data for a query that reads about twenty index pages. Postgres compiles above
+// 100,000.
+//
+// On the mainnet soak box that compile was measured at 1,430,530 ms, then 499 ms on the very
+// next execution in the same session, against 28 ms with JIT off. The spread is memory: nothing
+// caches compiled code between executions, so the cost is really the cost of faulting LLVM's
+// pages back in, which on a loaded box takes minutes.
+//
+// The setting travels in the connection's startup packet, so this also proves a reconnect
+// carries it rather than silently coming back with the server default.
+func TestStorePoolDisablesJIT(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	var jit string
+
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT current_setting('jit')`).Scan(&jit),
+		"reading jit from the store's own pool")
+
+	require.Equal(t, "off", jit,
+		"the store's pool must disable JIT; see the comment on the pool setup in New")
 }

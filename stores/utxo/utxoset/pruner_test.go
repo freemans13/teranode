@@ -3,6 +3,7 @@ package utxoset
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,4 +39,35 @@ func TestPrunerServiceContract(t *testing.T) {
 	n, err = svc.Prune(ctx, DefaultSpendJournalRetentionBlocks*3, "deadbeef")
 	require.NoError(t, err)
 	require.Zero(t, n, "no transaction records are deleted yet, and journal rows do not belong in that counter")
+}
+
+// TestPrunerDropsMembershipWindowsOnTheJournalCutoff: identity reclaim in this design is a
+// catalog drop. A window whose upper bound is 1440 blocks below the pruner's height goes,
+// a younger one stays, and the floor advances.
+func TestPrunerDropsMembershipWindowsOnTheJournalCutoff(t *testing.T) {
+	s, ctx := newTestStore(t)
+	s.journalRetention = 96
+
+	old := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, old, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	young := mkTx(t, 1, 5_001)
+	_, err = s.Create(ctx, young, 900, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 2, BlockHeight: 900, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	svc, err := s.GetPrunerService()
+	require.NoError(t, err)
+
+	_, err = svc.Prune(ctx, 1_000, "deadbeef")
+	require.NoError(t, err)
+
+	require.Equal(t, 0, minedRows(t, s, ctx, old), "window 0 retired at 1000 - 96")
+	require.Equal(t, 1, minedRows(t, s, ctx, young), "window 3 is inside retention")
+
+	floor, err := s.txMinedFloor(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), floor)
 }

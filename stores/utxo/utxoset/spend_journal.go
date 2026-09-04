@@ -8,8 +8,8 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// SpendJournalPartitionBlocks is the width of one journal leaf. Reclaim drops whole leaves, so
-// retention is granular to this. At the measured frontier (~20,000 spends/block) a leaf
+// SpendJournalPartitionBlocks is the width of one journal leaf. The pruner drops whole leaves,
+// so retention is granular to this. At the measured frontier (~20,000 spends/block) a leaf
 // holds roughly 960,000 rows.
 const SpendJournalPartitionBlocks = 48
 
@@ -24,7 +24,7 @@ const SpendJournalPartitionBlocks = 48
 // is affordable.
 //
 // Steady-state leaf count is retention/SpendJournalPartitionBlocks + 1 = 31 tables. Bounded, and
-// reclaimed as the chain advances.
+// dropped as the chain advances.
 const DefaultSpendJournalRetentionBlocks = 1440
 
 // spendJournalSQL deletes the UTXO row AND captures its payload in one statement.
@@ -35,9 +35,8 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // to put it back. The outer SELECT still returns satoshis and script, so the spend
 // remains its own decorate fetch.
 //
-// Every parameter is an ARRAY, including the height, the spending transaction and the
-// applied mark (see the spend_journal DDL comment), so one statement serves one transaction
-// or a thousand. That is what lets the spend path batch
+// Every parameter is an ARRAY, including the height and the spending transaction, so one
+// statement serves one transaction or a thousand. That is what lets the spend path batch
 // without a second copy of these predicates existing somewhere: the single-transaction path
 // is a batch of one.
 //
@@ -65,8 +64,8 @@ const DefaultSpendJournalRetentionBlocks = 1440
 const spendJournalSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[],
-                         $5::int[], $6::bytea[], $7::boolean[])
-        AS t(leaf, ukey, txid, vin, spent_height, spending_txid, applied)
+                         $5::int[], $6::bytea[])
+        AS t(leaf, ukey, txid, vin, spent_height, spending_txid)
 ),
 del AS (
     DELETE FROM utxo u USING k
@@ -75,31 +74,25 @@ del AS (
        AND u.txid           = k.txid
        AND (u.flags & 5)    < 1
        AND u.spendable_from <= k.spent_height
-    RETURNING k.vin, k.spent_height, k.spending_txid, k.applied, u.satoshis, u.created_height,
+    RETURNING k.vin, k.spent_height, k.spending_txid, u.satoshis, u.created_height,
               u.spendable_from, u.flags, u.ukey, u.txid, u.script, u.hash_override
 ),
 journal AS (
     INSERT INTO spend_journal (spent_height, satoshis, created_height, spendable_from,
-                           flags, ukey, txid, spending_txid, script, hash_override, applied)
+                           flags, ukey, txid, spending_txid, script, hash_override)
     SELECT d.spent_height, d.satoshis, d.created_height, d.spendable_from, d.flags,
-           d.ukey, d.txid, d.spending_txid, d.script, d.hash_override, d.applied
+           d.ukey, d.txid, d.spending_txid, d.script, d.hash_override
       FROM del d
 )
 SELECT d.vin, d.satoshis, d.script FROM del d`
 
 // ensureSpendJournalPartition creates the spend-journal leaf covering height, if absent.
 //
-// Each leaf gets two indexes. The packed-key btree is what every restore and every reclaim
-// probe uses. The block-range index on applied exists for one question the reclaimer asks
-// once per retiring leaf: is there any spend above the settled depth without the
-// block-applied mark. Below the checkpoint every row is marked, and without an index that is
-// a full read of the newest leaves to find nothing, measured at 15.8 seconds and 243,000 page
-// reads per session on the mainnet box. The journal is append-only in height order, so a
-// block-range summary is exact: a run of 128 pages that are all marked is skipped from a few
-// bytes of summary. At the tip every row is unmarked and the first range answers. It costs
-// about 20 KB per leaf. The mark is indexed as a small integer because PostgreSQL has no
-// block-range operator class for boolean; the guard's predicate uses the same cast so the
-// planner matches the expression.
+// Each leaf gets ONE index, the packed-key btree, which is what every restore probes. There
+// was a second, a block-range summary over a block-applied mark, and it existed only for a
+// question the reclaimer asked once per retiring leaf. Nothing asks it now: retiring a
+// transaction's identity is dropping the tx_mined window it lives in, so the journal is read
+// only by a restore, and only by outpoint.
 //
 // Called on the spend path, so it must be cheap and idempotent. CREATE TABLE IF NOT
 // EXISTS is both, and a leaf covers SpendJournalPartitionBlocks heights so this is a no-op for
@@ -140,8 +133,7 @@ CREATE TABLE IF NOT EXISTS spend_journal_%[1]d PARTITION OF spend_journal
   WITH (fillfactor = 100,
         autovacuum_vacuum_scale_factor = 0,
         autovacuum_vacuum_threshold    = 50000);
-CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey);
-CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_applied ON spend_journal_%[1]d USING brin ((applied::int)) WITH (pages_per_range = 128);`, leaf, lo, hi)
+CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey);`, leaf, lo, hi)
 
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return errors.NewStorageError("[utxoset] create spend-journal partition %d", leaf, err)
@@ -152,15 +144,15 @@ CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_applied ON spend_journal_%[1]d US
 	// the retry, and fail on a partition that was never created.
 	s.journalLeaf.Store(leaf + 1)
 
-	// Reclaim deliberately does NOT happen here, though crossing into a new leaf is
+	// The drop deliberately does NOT happen here, though crossing into a new leaf is
 	// exactly the moment old ones fall out of retention. It used to, and the argument was
 	// sound for a catalog operation: dropping a partition is constant time, and a
-	// background reclaimer that falls behind is the failure mode that dominated the
-	// previous store. What it missed is that DETACH CONCURRENTLY waits for every open
-	// transaction on the parent. From a spend, with thousands of goroutines behind it,
-	// that stalls the pipeline; and because a spend must not fail over old history that
-	// could not be discarded, the only available response to an error was to swallow it.
-	// It swallowed a real one for the entire life of the branch.
+	// background job that falls behind is the failure mode that dominated the previous
+	// store. What it missed is that DETACH CONCURRENTLY waits for every open transaction
+	// on the parent. From a spend, with thousands of goroutines behind it, that stalls the
+	// pipeline; and because a spend must not fail over old history that could not be
+	// discarded, the only available response to an error was to swallow it. It swallowed a
+	// real one for the entire life of the branch.
 	//
 	// The pruner service drives it instead: see GetPrunerService in pruner.go.
 
@@ -179,8 +171,8 @@ CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_applied ON spend_journal_%[1]d US
 //     within the journal's own schema, which is the only thing left that identifies it.
 //   - DETACH PENDING. A crash DURING a concurrent detach leaves inhdetachpending set.
 //     PostgreSQL then refuses any further ATTACH or DETACH on the parent -- "partition
-//     already pending detach", hinting at FINALIZE -- so an unhandled one wedges all
-//     future reclaim rather than leaking quietly.
+//     already pending detach", hinting at FINALIZE -- so an unhandled one wedges every
+//     future drop rather than leaking quietly.
 //
 // Scoped to the schema that 'spend_journal'::regclass resolves to, so this agrees with the
 // unqualified DETACH below about which table it means.
@@ -195,29 +187,24 @@ SELECT c.relname,
    AND c.relkind  = 'r'
    AND c.relname ~ '^spend_journal_[0-9]+$'`
 
-// DropSpendJournalPartitionsBelow reclaims journal leaves entirely below height, and
-// returns how many it reclaimed.
+// DropSpendJournalPartitionsBelow drops journal leaves entirely below height, and returns how
+// many it dropped.
 //
-// This is the whole reclaim story: DROP TABLE, O(1), no scan, no vacuum, no per-row work
-// to fall behind on. It is idempotent, which is what lets the caller treat a crash as
-// nothing worse than a repeat: every leaf below the cutoff is reclaimed on every call, in
-// whatever state the last attempt left it, so a partial run is simply redone.
+// This is the whole story: DROP TABLE, O(1), no scan, no vacuum, no per-row work to fall
+// behind on. It is idempotent, which is what lets the caller treat a crash as nothing worse
+// than a repeat: every leaf below the cutoff is dropped on every call, in whatever state the
+// last attempt left it, so a partial run is simply redone.
 //
-// It must be the LAST step of a pruner session. Dropping a partition destroys the record
-// of which transactions had an output spent in that window, which is precisely the work
-// list a later session step reads to decide what is now fully spent.
+// The journal is undo insurance and nothing else. It used to be the prune engine as well --
+// a retiring leaf was the work list of parents to re-examine -- and the ordering of a pruner
+// session was built around that. Nothing reads a retiring leaf now, so it can be dropped in
+// any order with respect to the rest of the session.
 func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint32) (int, error) {
-	return s.dropSpendJournalPartitionsBelow(ctx, height, nil)
+	return s.dropSpendJournalPartitionsBelow(ctx, height)
 }
 
-// dropSpendJournalPartitionsBelow reclaims journal leaves below height, calling before on each
-// one first.
-//
-// The callback is where the pruner reads the retiring partition as its work list. The ordering
-// is not a preference: dropping the partition destroys the record of which transactions had an
-// output spent in that window, which is the only place that fact is written down.
-func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint32,
-	before func(context.Context, string) error) (int, error) {
+// dropSpendJournalPartitionsBelow drops journal leaves below height.
+func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint32) (int, error) {
 	rows, err := s.pool.Query(ctx, journalLeafSQL)
 	if err != nil {
 		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
@@ -277,12 +264,6 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	for _, l := range leaves {
 		if l.leaf >= cutoff {
 			continue
-		}
-
-		if before != nil {
-			if err := before(ctx, l.name); err != nil {
-				return dropped, err
-			}
 		}
 
 		switch {

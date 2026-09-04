@@ -6,7 +6,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 )
 
-// journalPruner reclaims the spend journal, and nothing else.
+// journalPruner drops what has aged out, and reads nothing to decide it.
 //
 // There is no DAH sweep here and no pile of spent rows to walk. The DELETE that spends an
 // output frees its space and its index entry in the same statement that authorises the
@@ -14,9 +14,16 @@ import (
 // pruner and the vacuum they forced together measured 76.7% of all disk reads and 52% of
 // statement write-ahead log volume, with the watermark thousands of blocks behind the tip.
 //
-// What IS left to reclaim is the spend journal, which retains DefaultSpendJournalRetentionBlocks
-// of undo history in height-ranged partitions. That is a catalog operation -- drop the
-// partitions that have aged out -- and this is where it runs.
+// What is left is three catalog operations on three horizons. Transaction bodies retire on
+// DefaultTxBodyRetentionBlocks, membership windows and the spend journal on
+// DefaultSpendJournalRetentionBlocks. Each is a DROP TABLE of partitions that have aged out,
+// so there is no work list, no probe and no per-row cost that can fall behind.
+//
+// Identity reclaim used to be the expensive half of this: a retiring journal partition read
+// as a work list, each parent judged on whether its spenders were settled, and its identity
+// row deleted. That is gone. A mined transaction claims on tx_mined instead of tx_ident, and
+// its coins carry the height and block that made them, so retiring its membership is dropping
+// the window it lives in.
 //
 // It runs HERE, rather than on the spend path where it used to, for three reasons. The
 // spend path had to swallow the error to avoid failing a spend over old history, and it
@@ -29,9 +36,9 @@ import (
 // Inherited from that worker, and worth knowing rather than discovering: it gates on block
 // assembly being caught up, skips heights at or below pruner_min_block_height, and
 // deduplicates to the latest notification when it falls behind. So a session can be
-// skipped or can jump several leaves at once. Reclaim is written to absorb that -- every
-// call drops every leaf below the cutoff, not one per call -- so a skipped block defers
-// the drop rather than losing it, and the journal simply carries more history until the
+// skipped or can jump several leaves at once. Every drop here absorbs that -- one call
+// drops every partition below the cutoff, not one per call -- so a skipped block defers
+// the drop rather than losing it, and the store simply carries more history until the
 // next session lands.
 type journalPruner struct {
 	store *Store
@@ -44,17 +51,16 @@ func (journalPruner) Start(_ context.Context) {
 	// goroutine, so there is nothing for this store to start and nothing to stop.
 }
 
-// Prune reclaims journal leaves that have aged out at this height.
+// Prune drops the bodies, membership windows and journal leaves that have aged out at this
+// height.
 //
 // The height is the tip, not a retention-adjusted one, so the retention is applied here.
 //
-// It reports ZERO records processed, and that is exact rather than evasive. The caller
-// adds the return value to a counter of child transaction records deleted, and no
-// transaction records are deleted yet -- tx_bounded and tx_mined do not exist. Reporting
-// discarded journal rows in that counter would put two different units in one metric. When
-// the pruner session gains its tx_mined step, that step's count is what belongs here, and
-// the journal drop stays last: dropping a leaf destroys the record of which transactions
-// had an output spent in that window, which is the work list the step reads.
+// It reports ZERO records processed, and that is exact rather than evasive. The caller adds
+// the return value to a counter of child transaction records deleted by a delete-at-height
+// sweep, which this store does not have: nothing here deletes a row at all, it drops
+// partitions. Reporting dropped partitions in that counter would put two different units in
+// one metric, so they are logged instead.
 func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int64, error) {
 	// The body horizon and the journal horizon are DIFFERENT numbers, 288 against 1440, so
 	// the two reclaims must not be gated behind one another. Doing so left the bodies
@@ -75,59 +81,24 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 
 	cutoff := height - p.store.journalRetention
 
-	// The session, in the one order that is safe.
-	//
-	// Each retiring journal partition is read as a work list BEFORE it is dropped, because
-	// dropping it destroys the record of which transactions had an output spent in that
-	// window. Then the partition goes.
-	//
-	// The body windows went FIRST, at the top of this method, not last. Their horizon is a
-	// different number, so gating them behind this loop left transaction bytes unreclaimed
-	// through all of early sync, which is when the disk is tightest.
-	var reclaimed, batches int
-
-	dropped, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff,
-		func(ctx context.Context, partition string) error {
-			n, b, rerr := p.store.reclaimFromPartition(ctx, partition, height)
-			if rerr != nil {
-				return rerr
-			}
-
-			reclaimed += n
-			batches += b
-
-			return nil
-		})
+	// Identity reclaim is a partition drop. Nothing is read to decide it: a window whose
+	// upper bound is journalRetention below the pruner's height holds transactions whose
+	// blocks cannot be un-mined and whose coins carry their own block facts.
+	windows, err := p.store.dropTxMinedWindowsBelow(ctx, cutoff)
 	if err != nil {
 		return 0, err
 	}
 
-	if dropped > 0 || reclaimed > 0 {
-		// The batch count is here so a leaf's size is visible without instrumenting the
-		// store. Batches well above the leaf count mean leaves are running near the memory
-		// bound, which is the signal that reclaimChunkParents wants revisiting.
-		p.store.logger.Infof("[utxoset] pruner reclaimed %d transaction rows in %d batches and dropped %d spend-journal leaves below height %d",
-			reclaimed, batches, dropped, cutoff)
-	}
-
-	// The birth ledger goes AFTER the journal loop and on the journal's cutoff. A
-	// zero-output transaction is a spender named by its parents' journal rows, and those
-	// parents are judged when their partition retires above; its identity row has to still
-	// be there for that judgement at the tip, where the applied mark does not answer for it.
-	born, birthWindows, err := p.store.reclaimBirthWindowsBelow(ctx, cutoff, height)
+	leaves, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff)
 	if err != nil {
 		return 0, err
 	}
 
-	if born > 0 || birthWindows > 0 {
-		p.store.logger.Infof("[utxoset] pruner reclaimed %d zero-output transaction rows and dropped %d birth windows below height %d",
-			born, birthWindows, cutoff)
+	if windows > 0 || leaves > 0 {
+		p.store.logger.Infof("[utxoset] pruner dropped %d membership windows and %d spend-journal leaves below height %d",
+			windows, leaves, cutoff)
 	}
 
-	// Still zero records processed, and still exact. The caller adds this to a counter of
-	// child transaction records deleted by a delete-at-height sweep, which this store does
-	// not have. Reporting identity rows or body windows there would put three units in one
-	// metric; they are logged above instead.
 	return 0, nil
 }
 
