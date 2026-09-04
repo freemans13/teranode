@@ -1,8 +1,13 @@
 package utxoset
 
 import (
+	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,10 +49,10 @@ func TestUnminedSetIsEmptyNotUnimplemented(t *testing.T) {
 // against a live mainnet sync, logging errors on every cycle. Non-fatal, but a store that
 // errors on a timer teaches everyone to ignore its errors.
 //
-// The preservation pair is not merely unimplemented here, it is MEANINGLESS. Preservation
-// exists to stop a pruner deleting a parent that a live unmined child still needs. This
-// store has no pruner and never deletes an unspent output, so there is nothing to
-// preserve anything from, and nothing preserved can expire.
+// The preservation pair does real work now (see TestPreservedParentOutlivesItsMembershipWindow),
+// so what this pins is the empty case the pruner hits on every cycle of a healthy node: no old
+// unmined transactions, no parents named, nothing preserved and nothing to expire. Each of
+// those has to be a quiet success rather than an error on a timer.
 func TestUnminedFamilyIsEmptyNotUnimplemented(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -62,11 +67,136 @@ func TestUnminedFamilyIsEmptyNotUnimplemented(t *testing.T) {
 	require.Empty(t, batch)
 
 	require.NoError(t, s.ProcessExpiredPreservations(ctx, 1_000),
-		"nothing can expire when nothing needed preserving")
+		"an empty preservation table expires nothing and says so quietly")
 	require.NoError(t, s.PreserveTransactions(ctx, nil, 1_000),
-		"nothing deletes an unspent output here, so there is nothing to preserve from")
+		"the pruner names no parents when no transaction has been waiting too long")
 
 	old, err := s.QueryOldUnminedTransactions(ctx, 1_000)
 	require.NoError(t, err)
 	require.Empty(t, old)
+}
+
+// preservedRows counts the preservation side table, which is what tells a test whether
+// PreserveTransactions found a membership row to copy or correctly found nothing.
+func preservedRows(t *testing.T, s *Store, ctx context.Context) int {
+	t.Helper()
+
+	var n int
+	require.NoError(t, s.pool.QueryRow(ctx, `SELECT count(*) FROM preserved_parent`).Scan(&n))
+
+	return n
+}
+
+// TestPreservedParentOutlivesItsMembershipWindow: the pruner's parent-preservation phase names
+// the parents of old unmined transactions; a preserved parent still answers a lookup after
+// its membership window has been dropped and its coins are gone.
+func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	spendOneOutput(t, s, ctx, parent, 0, 150) // the child stays unmined
+
+	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
+
+	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err)
+
+	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{7}, got.BlockIDs)
+
+	require.NoError(t, s.ProcessExpiredPreservations(ctx, 6_000))
+
+	_, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "past its preservation the parent is gone like any other")
+}
+
+// TestPreserveTransactionsCopiesOnlyWhatMembershipHolds: the pruner names a parent by hash and
+// knows nothing about where it lives, so both of the hashes that have no membership row have
+// to be no-ops rather than errors.
+//
+// A mempool parent needs nothing preserved: its identity row is what keeps it, and that row
+// stays for as long as the transaction is unmined. A parent already gone cannot be recovered
+// from a table that only ever copies a live membership row.
+func TestPreserveTransactionsCopiesOnlyWhatMembershipHolds(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	mempool := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, mempool, 100)
+	require.NoError(t, err)
+	require.True(t, identExists(t, s, ctx, mempool), "a mempool arrival is held by its identity row")
+
+	var unknown chainhash.Hash
+	unknown[0] = 0xab
+
+	require.NoError(t, s.PreserveTransactions(ctx,
+		[]chainhash.Hash{*mempool.TxIDChainHash(), unknown, unknown}, 5_000))
+
+	require.Equal(t, 0, preservedRows(t, s, ctx),
+		"neither a mempool-only hash nor an unknown one has a membership row to copy")
+}
+
+// TestPreservedParentStillAnswersItsContest: the contest is attached for every transaction ANY
+// read step answered, and the preservation step is one of them.
+//
+// This is the case that matters most, because the parent whose child is still unmined is
+// exactly the parent whose child may be a double spend.
+func TestPreservedParentStillAnswersItsContest(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	child := spendOneOutput(t, s, ctx, parent, 0, 150)
+	plantConflictNote(t, s, ctx, 150, hashBytes(parent), hashBytes(child))
+
+	require.NoError(t, s.PreserveTransactions(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, 5_000))
+
+	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err)
+
+	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{*child.TxIDChainHash()}, got.ConflictingChildren,
+		"a preserved parent is contested exactly as a mined one is")
+}
+
+// TestPreservingASecondTimeKeepsTheLongerPromise: the pruner names a parent again on every
+// cycle its child is still waiting, and two children of one parent do not age together. A
+// second, nearer expiry must not shorten a promise already made to the older child.
+//
+// It also pins the other end of the row's life: Delete removes the preservation copy too, so
+// the offline rewind tool leaves nothing behind that would keep answering for a transaction
+// the operator has just erased.
+func TestPreservingASecondTimeKeepsTheLongerPromise(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	preserved := []chainhash.Hash{*parent.TxIDChainHash()}
+
+	require.NoError(t, s.PreserveTransactions(ctx, preserved, 5_000))
+	require.NoError(t, s.PreserveTransactions(ctx, preserved, 3_000))
+
+	var until int32
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT preserve_until FROM preserved_parent WHERE txid = $1`, hashBytes(parent)).Scan(&until))
+	require.Equal(t, int32(5_000), until, "a nearer expiry must not shorten a promise already made")
+
+	require.NoError(t, s.ProcessExpiredPreservations(ctx, 4_000),
+		"the row has not reached its expiry yet")
+	require.Equal(t, 1, preservedRows(t, s, ctx))
+
+	require.NoError(t, s.Delete(ctx, parent.TxIDChainHash()))
+	require.Equal(t, 0, preservedRows(t, s, ctx),
+		"Delete promises to remove every trace, and a preservation copy is a trace")
 }

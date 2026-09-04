@@ -10,14 +10,22 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
-// The read order is identity table, then membership by transaction id, then the coin, and
-// the order is a correctness rule rather than a tuning. A coin holds ONE block id, and on the
-// ordinary two-step reorg (a fork block stamped as not on the longest chain, then a later
-// block making it the main chain) nothing rewrites the coins of transactions shared between
-// the two blocks. A coin-first read would then hand block validation an id that lost, and the
-// parent check stores a valid block as invalid. The membership table holds every id while the
-// window lives, so the coin is consulted only once the window is gone, by which time its
-// block is at least 1440 deep and its coin-carried id is the settled one.
+// The read order is identity table, then membership by transaction id, then the preserved
+// parent, then the coin, and the order is a correctness rule rather than a tuning. A coin
+// holds ONE block id, and on the ordinary two-step reorg (a fork block stamped as not on the
+// longest chain, then a later block making it the main chain) nothing rewrites the coins of
+// transactions shared between the two blocks. A coin-first read would then hand block
+// validation an id that lost, and the parent check stores a valid block as invalid. The
+// membership table holds every id while the window lives, so the coin is consulted only once
+// the window is gone, by which time its block is at least 1440 deep and its coin-carried id is
+// the settled one.
+//
+// The preserved-parent step sits between membership and coin, and its position is the same
+// kind of rule. It answers from a COPY of a membership row, taken while the row was still
+// there, so it must never be preferred to the row itself: while the window lives, the row is
+// the record that gets rewritten by a reorg and the copy is not. Once the window is gone the
+// copy is all there is, and it comes before the coin because it carries the whole payload
+// where the coin carries only a block.
 //
 // The spec also names a journal step between membership and coin. While membership and journal
 // retention are both 1440 blocks the journal can only find a spend whose parent's membership
@@ -75,6 +83,35 @@ SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes, m.fee
  ) AS m
   LEFT JOIN tx_body b ON b.created_height = m.created_height AND b.txid = k.txid
  ORDER BY k.txid, m.seq`
+
+// preservedByTxidSQL reads the preserved copies of a set of transactions' membership rows,
+// joining each body only if it is still inside its window.
+//
+// The column list and its order match minedByTxidSQL's exactly, because both feed minedRow: a
+// preserved parent has to answer what its membership row would have answered, and two readers
+// scanning the same struct in two orders is a bug that compiles.
+//
+// The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, and this one was measured
+// BOTH ways because the obvious form looked safe and was not. This table is unpartitioned and
+// keyed by transaction id, so `WHERE p.txid = ANY($1)` reads like a primary-key probe -- and
+// the planner turns it into a Seq Scan with the array as a filter, because it has no
+// statistics for an array and a small table is cheap to read whole. Measured at 500 keys
+// against 40,000 preserved rows: 2.4 ms and a Seq Scan, against 0.59 ms and one primary-key
+// descent per key for the fenced form, and the scan's cost grows with the table while the
+// descent's does not. The table is meant to stay small, but "meant to" is not a plan, and this
+// read is on the validator's parent-resolution path.
+const preservedByTxidSQL = `
+SELECT k.txid, p.mined_height, p.block_id, p.subtree_idx, p.size_in_bytes, p.fee,
+       p.tx_inpoints, p.locktime, p.created_at, p.flags, b.raw_tx
+  FROM unnest($1::bytea[]) AS k(txid)
+ CROSS JOIN LATERAL (
+   SELECT p.mined_height, p.block_id, p.subtree_idx, p.created_height, p.size_in_bytes,
+          p.fee, p.tx_inpoints, p.locktime, p.created_at, p.flags
+     FROM preserved_parent p
+    WHERE p.txid = k.txid
+   OFFSET 0
+ ) AS p
+  LEFT JOIN tx_body b ON b.created_height = p.created_height AND b.txid = k.txid`
 
 // coinFactsSQL reads one live coin per transaction, for the transactions nothing else knows.
 // The LATERAL with ORDER BY and LIMIT 1 OFFSET 0 is the fence the planner needs to walk the
@@ -191,7 +228,17 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 	}
 
 	if len(rest) > 0 {
-		// Step 3: the coin.
+		// Step 3: the preserved parent, for a transaction whose membership window has been
+		// dropped while an unmined child still needed its facts.
+		if err := s.readPreserved(ctx, rest, &res); err != nil {
+			return lookupResult{}, err
+		}
+
+		rest = stillMissing(rest, &res)
+	}
+
+	if len(rest) > 0 {
+		// Step 4: the coin.
 		if err := s.readCoinFacts(ctx, rest, &res); err != nil {
 			return lookupResult{}, err
 		}
@@ -213,9 +260,10 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 // transactions' coins.
 //
 // One statement for the whole batch, keyed on the parent's transaction id alone. That is what
-// makes it answer for a parent in the identity table, a parent in the membership table, and a
-// parent this store knows only from a live coin -- the packed column it replaces could only
-// ever answer for the first of the three.
+// makes it answer for a parent in the identity table, a parent in the membership table, a
+// parent whose membership row survives only as a preservation copy, and a parent this store
+// knows only from a live coin -- the packed column it replaces could only ever answer for the
+// first of the four.
 //
 // DISTINCT because the uniqueness underneath is PER WINDOW: a unique index on a partitioned
 // table must include the partition key, so the same (parent, child) pair noted in two windows
@@ -386,21 +434,13 @@ func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
 
 	for rows.Next() {
 		var (
-			txid        []byte
-			minedHeight int32
-			blockID     int32
-			subtreeIdx  int32
-			sizeInBytes *int32
-			fee         *int64
-			txInpoints  []byte
-			locktime    *int32
-			createdAt   *int64
-			flags       int16
-			rawTx       []byte
+			txid []byte
+			r    minedRow
 		)
 
-		if err := rows.Scan(&txid, &minedHeight, &blockID, &subtreeIdx,
-			&sizeInBytes, &fee, &txInpoints, &locktime, &createdAt, &flags, &rawTx); err != nil {
+		if err := rows.Scan(&txid, &r.minedHeight, &r.blockID, &r.subtreeIdx,
+			&r.sizeInBytes, &r.fee, &r.txInpoints, &r.locktime, &r.createdAt,
+			&r.flags, &r.rawTx); err != nil {
 			return errors.NewStorageError("[utxoset][lookup] membership scan", err)
 		}
 
@@ -417,65 +457,182 @@ func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
 
 		data := res.found[h]
 		if data == nil {
-			data = &meta.Data{
-				IsCoinbase:  flags&FlagCoinbase != 0,
-				Conflicting: flags&FlagConflicting != 0,
-				Locked:      flags&FlagLocked != 0,
-			}
-
-			if sizeInBytes != nil {
-				data.SizeInBytes = uint64(*sizeInBytes) //nolint:gosec // a size is never negative
-			}
-
-			// NULL for every row the block path wrote, and the fee the identity row carried
-			// for one the tip's stamp moved here. See the fee column in schema.go.
-			if fee != nil {
-				data.Fee = uint64(*fee) //nolint:gosec // a fee is never negative
-			}
-
-			if locktime != nil {
-				data.LockTime = uint32(*locktime) //nolint:gosec // a locktime is never negative
-			}
-
-			if createdAt != nil {
-				data.CreatedAt = *createdAt
-			}
-
-			if len(txInpoints) > 0 {
-				ip, ierr := subtree.NewTxInpointsFromBytes(txInpoints)
-				if ierr != nil {
-					res.fail(h, errors.NewStorageError("[utxoset][lookup] inpoints %s", h.String(), ierr))
-
-					continue
-				}
-
-				data.TxInpoints = ip
-			}
-
-			res.found[h] = data
-		}
-
-		data.BlockIDs = append(data.BlockIDs, uint32(blockID))             //nolint:gosec // a block id is never negative
-		data.BlockHeights = append(data.BlockHeights, uint32(minedHeight)) //nolint:gosec // a height is never negative
-		data.SubtreeIdxs = append(data.SubtreeIdxs, int(subtreeIdx))
-
-		// A body-less row is expected once its window has aged out, so this is a nil
-		// transaction rather than an error, exactly as it is on the identity read.
-		if data.Tx == nil && len(rawTx) > 0 {
-			tx, terr := bt.NewTxFromBytes(rawTx)
-			if terr != nil {
-				delete(res.found, h)
-				res.fail(h, errors.NewStorageError("[utxoset][lookup] decode body %s", h.String(), terr))
+			// The first row of a transaction builds the record, block and all.
+			built, derr := r.toMeta(&h)
+			if derr != nil {
+				res.fail(h, derr)
 
 				continue
 			}
 
-			data.Tx = tx
+			res.found[h] = built
+
+			continue
+		}
+
+		// A later row of the same transaction adds only its own block.
+		if derr := r.mergeInto(data, &h); derr != nil {
+			delete(res.found, h)
+			res.fail(h, derr)
 		}
 	}
 
 	if err := rows.Err(); err != nil {
 		return errors.NewStorageError("[utxoset][lookup] membership rows", err)
+	}
+
+	return nil
+}
+
+// minedRow is one membership row, or the preserved copy of one, as the read returns it.
+//
+// It exists so the membership read and the preservation read share one conversion, because
+// they read the same columns and have to answer with the same record: the preserved row is a
+// copy of the membership row, so a difference between the two readers would be a difference
+// between what a parent said yesterday and what it says today. The identity read keeps its own
+// conversion (metaRow) because an identity row packs its blocks into one column rather than
+// arriving as one row per block. Three copies of "what a stored transaction means" is what this
+// store already carried; this is what stops the preservation read being a fourth.
+//
+// Every scalar is a pointer where its column is nullable, because which columns are NULL says
+// which path wrote the row.
+type minedRow struct {
+	minedHeight int32
+	blockID     int32
+	subtreeIdx  int32
+	sizeInBytes *int32
+	fee         *int64
+	txInpoints  []byte
+	locktime    *int32
+	createdAt   *int64
+	flags       int16
+	rawTx       []byte
+}
+
+// toMeta builds the record for a transaction from one row: the scalars that describe the
+// transaction, then the single block this row names.
+func (r *minedRow) toMeta(hash *chainhash.Hash) (*meta.Data, error) {
+	data := &meta.Data{
+		IsCoinbase:  r.flags&FlagCoinbase != 0,
+		Conflicting: r.flags&FlagConflicting != 0,
+		Locked:      r.flags&FlagLocked != 0,
+	}
+
+	if r.sizeInBytes != nil {
+		data.SizeInBytes = uint64(*r.sizeInBytes) //nolint:gosec // a size is never negative
+	}
+
+	// NULL for every row the block path wrote, and the fee the identity row carried for one
+	// the tip's stamp moved here. See the fee column in schema.go.
+	if r.fee != nil {
+		data.Fee = uint64(*r.fee) //nolint:gosec // a fee is never negative
+	}
+
+	if r.locktime != nil {
+		data.LockTime = uint32(*r.locktime) //nolint:gosec // a locktime is never negative
+	}
+
+	if r.createdAt != nil {
+		data.CreatedAt = *r.createdAt
+	}
+
+	if len(r.txInpoints) > 0 {
+		ip, ierr := subtree.NewTxInpointsFromBytes(r.txInpoints)
+		if ierr != nil {
+			return nil, errors.NewStorageError("[utxoset][lookup] inpoints %s", hash.String(), ierr)
+		}
+
+		data.TxInpoints = ip
+	}
+
+	if err := r.mergeInto(data, hash); err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+// mergeInto adds this row's block to a record already built from an earlier row of the same
+// transaction, and decodes the body if the record does not have it yet.
+//
+// Appending rather than assigning is what the shared conformance suite asserts about
+// SubtreeIdxs: one transaction holds one membership row per block that stamped it, and they
+// arrive grouped and in insertion order, which is the order a caller reads them back in.
+func (r *minedRow) mergeInto(data *meta.Data, hash *chainhash.Hash) error {
+	data.BlockIDs = append(data.BlockIDs, uint32(r.blockID))             //nolint:gosec // a block id is never negative
+	data.BlockHeights = append(data.BlockHeights, uint32(r.minedHeight)) //nolint:gosec // a height is never negative
+	data.SubtreeIdxs = append(data.SubtreeIdxs, int(r.subtreeIdx))
+
+	// A body-less row is expected once its window has aged out, so this is a nil transaction
+	// rather than an error, exactly as it is on the identity read.
+	if data.Tx == nil && len(r.rawTx) > 0 {
+		tx, terr := bt.NewTxFromBytes(r.rawTx)
+		if terr != nil {
+			return errors.NewStorageError("[utxoset][lookup] decode body %s", hash.String(), terr)
+		}
+
+		data.Tx = tx
+	}
+
+	return nil
+}
+
+// readPreserved fills in every transaction whose membership window is gone but whose facts the
+// pruner asked to keep, because an unmined child still needs them. See preserved_parent in
+// schema.go for why the table exists and why it is small.
+//
+// One row per transaction, found by primary key -- through the same lateral fence the
+// membership and contest reads use, because without it the planner scans this table rather than
+// probing it. See preservedByTxidSQL for both measurements.
+//
+// The body is joined the same way it is everywhere else, on (created_height, txid), and is
+// absent whenever its own 288-block window has aged out -- which for a preserved parent is the
+// ordinary case, since the transaction is by definition old. A caller that needs the bytes has
+// to check, exactly as it does after the identity and membership reads.
+func (s *Store) readPreserved(ctx context.Context, hashes []chainhash.Hash,
+	res *lookupResult) error {
+	txids := make([][]byte, 0, len(hashes))
+	for i := range hashes {
+		txids = append(txids, hashes[i][:])
+	}
+
+	rows, err := s.pool.Query(ctx, preservedByTxidSQL, txids)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][lookup] preserved parents", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			txid []byte
+			r    minedRow
+		)
+
+		if err := rows.Scan(&txid, &r.minedHeight, &r.blockID, &r.subtreeIdx,
+			&r.sizeInBytes, &r.fee, &r.txInpoints, &r.locktime, &r.createdAt,
+			&r.flags, &r.rawTx); err != nil {
+			return errors.NewStorageError("[utxoset][lookup] preserved parent scan", err)
+		}
+
+		var h chainhash.Hash
+
+		copy(h[:], txid)
+
+		// One row per transaction here, so unlike the membership read there is nothing to
+		// merge: the copy was taken from a single row and answers with that row's block.
+		data, derr := r.toMeta(&h)
+		if derr != nil {
+			res.fail(h, derr)
+
+			continue
+		}
+
+		res.found[h] = data
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][lookup] preserved parents", err)
 	}
 
 	return nil

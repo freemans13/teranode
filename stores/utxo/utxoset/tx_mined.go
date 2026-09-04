@@ -288,6 +288,12 @@ UPDATE tx_mined_floor SET floor = GREATEST(floor, %[2]d) WHERE id = 0;`, w.name,
 		}
 
 		dropped++
+
+		// The ensure cache can be holding the window just destroyed, and would then let a
+		// later create at that height skip the floor read entirely. Clear it so the next
+		// ensure re-reads the floor and refuses loudly instead of failing on a missing
+		// partition. See ensureTxMinedPartition.
+		s.minedWindow.Store(0)
 	}
 
 	return dropped, nil

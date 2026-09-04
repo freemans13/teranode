@@ -55,6 +55,12 @@ import (
 // already guards against for a mempool transaction. It RETURNs created_height and txid for the
 // same reason ident does: to feed the body join.
 //
+// preserved removes the preservation copy of the membership row, if the pruner ever took one.
+// It is a COPY rather than a claim, so it contributes nothing to gone and nothing to the count:
+// a transaction known only by a preserved row is one whose real rows are already gone. Left
+// behind, it would keep answering lookups for a transaction Delete promised to remove every
+// trace of, which is the same resurrection the identity and membership deletes guard against.
+//
 // A transaction can hold several tx_mined rows -- one per window its coins are still claimed
 // through, or a coinbase re-org claiming it at more than one height -- all sharing the same
 // created_height, so gone runs them through UNION rather than a plain concatenation to collapse
@@ -86,6 +92,10 @@ mined AS (
     DELETE FROM tx_mined m USING k
      WHERE m.txid = k.txid
     RETURNING m.created_height, m.txid
+),
+preserved AS (
+    DELETE FROM preserved_parent p USING k
+     WHERE p.txid = k.txid
 ),
 gone AS (
     SELECT created_height, txid FROM ident

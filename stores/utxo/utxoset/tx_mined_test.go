@@ -240,3 +240,24 @@ func TestRetiringWindowStampsWhenTheEarliestRowIsInTheRetiringWindow(t *testing.
 	require.Equal(t, int32(287), h)
 	require.Equal(t, int32(7), b)
 }
+
+// TestDroppingAWindowClearsTheEnsureCache pins the interaction between the two halves of
+// window management, which is invisible until they disagree.
+//
+// ensureTxMinedPartition remembers the last window it created and returns early when the next
+// create lands in the same one. That memory can outlive the window itself: a fork stamp at an
+// old height caches it, the pruner then drops it, and a later stamp at that height hits the
+// cache, skips the floor read, and the INSERT fails with "no partition of relation" instead of
+// the loud, explained refusal the floor exists to give.
+func TestDroppingAWindowClearsTheEnsureCache(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	require.NoError(t, s.ensureTxMinedPartition(ctx, 100))
+
+	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err)
+	require.Equal(t, 1, dropped)
+
+	require.Error(t, s.ensureTxMinedPartition(ctx, 100),
+		"the cached window is gone, so the floor has to be re-read and the create refused")
+}

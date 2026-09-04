@@ -321,6 +321,57 @@ CREATE TABLE IF NOT EXISTS tx_mined_floor (
 INSERT INTO tx_mined_floor (id, floor) VALUES (0, 0) ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
+-- THE PRESERVED PARENT. One row per transaction the pruner asked to keep alive past the
+-- membership window that would otherwise have retired it.
+--
+-- It exists for one case, the lingering unmined child. A parent whose window has been dropped
+-- and whose coins are all spent is GONE, and that is right: nothing on the consensus path can
+-- ask about a transaction that is 1440 blocks buried and has no live output. The exception is
+-- an unmined child still sitting in block assembly, which will be validated again the day it
+-- is finally mined and needs its parent's facts to be validated against. The pruner names
+-- exactly those parents each cycle -- see PreserveParentsOfOldUnminedTransactions -- and this
+-- table is where the answer for them survives.
+--
+-- It is TINY, and by construction rather than by hope. Nothing writes here on the block path
+-- or the validator's path; the only writer is the pruner's phase 1, and it names only the
+-- parents of transactions that have been waiting longer than the retention window. An
+-- ordinary mempool that keeps up puts nothing in it at all.
+--
+-- The payload is the FULL membership payload, not just the block, because this row has to
+-- answer exactly what the tx_mined row it copies would have answered: a thinner row would
+-- hand block assembly a parent with no fee, no size and no inputs, which is a different
+-- record rather than a slower one. See readPreserved for the read and minedRow.toMeta for
+-- the conversion the two share.
+--
+-- This is the store-side version of what aerospike does with its preserveUntil bin: same
+-- pruner, same two calls, same expiry height, but expressed as a row that outlives a dropped
+-- partition instead of a bin that suppresses a delete. preserve_until is that height, and
+-- ProcessExpiredPreservations deletes every row that has reached it.
+--
+-- NOT partitioned, deliberately. It is keyed by transaction id alone and read by primary key,
+-- its rows leave by an expiry height that has nothing to do with any window's bounds, and it
+-- is small enough that a delete plus autovacuum costs nothing worth a catalog operation.
+--
+-- The primary key is its ONLY index. Every read is by transaction id, which the key serves,
+-- and the expiry sweep is a once-per-block scan of a table this small; an index on
+-- preserve_until would be write amplification for a plan that has nothing to gain.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS preserved_parent (
+    txid            BYTEA    PRIMARY KEY CHECK (length(txid) = 32),
+    mined_height    INTEGER  NOT NULL,
+    block_id        INTEGER  NOT NULL,
+    subtree_idx     INTEGER  NOT NULL,
+    created_height  INTEGER  NOT NULL,
+    fee             BIGINT,
+    size_in_bytes   INTEGER,
+    tx_inpoints     BYTEA,
+    locktime        INTEGER,
+    created_at      BIGINT,
+    flags           SMALLINT NOT NULL DEFAULT 0,
+    preserve_until  INTEGER  NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
 -- THE IDENTITY TABLE. One row per MEMPOOL transaction, from first sight until the block
 -- that settles it.
 --

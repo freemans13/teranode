@@ -40,7 +40,7 @@ func unpackMembership(m []byte) (blockIDs, heights []uint32, subtreeIdxs []int) 
 
 // Get returns everything the store holds about one transaction.
 //
-// The field list is ignored with TWO exceptions. Whichever of the three steps answers (see
+// The field list is ignored with TWO exceptions. Whichever of the four steps answers (see
 // lookup.go) returns everything that step holds on one row, so narrowing the projection would
 // save a few bytes on the wire and nothing else, while handing a caller a partly populated
 // record it might dereference. Answering the whole question is cheaper than answering half of
@@ -88,8 +88,8 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fie
 // getDirect is the unbatched read: the shared read order, asked about one transaction.
 //
 // It is a lookupMany of one rather than a statement of its own. The order identity ->
-// membership -> coin is a correctness rule (see lookup.go), and a second copy of it here is
-// a defect waiting for one copy to be fixed and the other forgotten.
+// membership -> preserved parent -> coin is a correctness rule (see lookup.go), and a second
+// copy of it here is a defect waiting for one copy to be fixed and the other forgotten.
 func (s *Store) getDirect(ctx context.Context, hash *chainhash.Hash,
 	wantChildren bool) (*meta.Data, error) {
 	res, err := s.lookupMany(ctx, []chainhash.Hash{*hash}, wantChildren)
