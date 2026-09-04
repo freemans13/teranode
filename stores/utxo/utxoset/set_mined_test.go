@@ -262,3 +262,38 @@ func TestLongestChainStampOnAMultiBlockRowClearsTheMarkerAndStays(t *testing.T) 
 	require.Equal(t, []uint32{42, 43}, got.BlockIDs)
 	require.Zero(t, got.UnminedSince)
 }
+
+// TestForkStampTwiceRecordsTheBlockOnce guards stampSQL's "already claims this block, do not
+// append" test, which has a recorded silent-corruption history: it used to be a plain
+// substring search, which can match bytes STRADDLING two neighbouring triples, read that as
+// already-recorded, and skip a real append.
+//
+// The block has to be a FORK block for the guard to be reachable at all. A longest-chain stamp
+// moves the row into the membership table, so the replay finds no identity row and takes the
+// append path instead -- which is why the two tests that used to cover this guard no longer do.
+func TestForkStampTwiceRecordsTheBlockOnce(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_099)
+	require.NoError(t, err)
+
+	info := utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, SubtreeIdx: 3}
+
+	first, err := s.SetMinedMulti(ctx, hashes(tx), info)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, first[*tx.TxIDChainHash()])
+
+	second, err := s.SetMinedMulti(ctx, hashes(tx), info)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, second[*tx.TxIDChainHash()], "a replayed block is recorded once")
+
+	require.True(t, identExists(t, s, ctx, tx), "a fork stamp moves nothing")
+	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+
+	got, err := s.Get(ctx, tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, got.BlockIDs, "one triple, not two")
+	require.Equal(t, []uint32{700_100}, got.BlockHeights)
+	require.Equal(t, []int{3}, got.SubtreeIdxs)
+}

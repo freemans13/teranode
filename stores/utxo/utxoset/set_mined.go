@@ -6,6 +6,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/jackc/pgx/v5"
 )
 
 // stampSQL records a block against every transaction that does not already claim it, and
@@ -152,6 +153,14 @@ ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
 // it is what prunes partitions and what makes the primary key usable, since txid is its second
 // column. It must list the leaf of every txid in the batch, which is why both come from the
 // same loop.
+//
+// It RETURNS the txids it moved, and that is what keeps the postcondition cheap. provePresentSQL
+// reads tx_ident only, so without this every row the move just settled would be reported absent
+// and fall into the residue set -- an appendMinedSQL and a minedIDsByTxid at full block width on
+// every longest-chain stamp, which is the ordinary tip path. The ids returned are the ones that
+// LEFT tx_ident, taken from the DELETE's own RETURNING rather than the INSERT's: an insert that
+// hits the membership key (the same block replayed) reports nothing, yet the identity row is
+// gone all the same, so keying off the insert would leak those rows back into the residue.
 const moveToMinedSQL = `
 WITH moved AS (
     DELETE FROM tx_ident i
@@ -161,13 +170,16 @@ WITH moved AS (
        AND i.conflicting_children IS NULL
     RETURNING i.txid, i.created_height, i.size_in_bytes, i.fee, i.tx_inpoints,
               i.locktime, i.created_at, i.flags
+),
+settled AS (
+    INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
+                          size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
+    SELECT m.txid, $3::int, $4::int, $5::int, m.created_height, m.size_in_bytes, m.fee,
+           m.tx_inpoints, m.locktime, m.created_at, m.flags
+      FROM moved m
+    ON CONFLICT (txid, mined_height, block_id) DO NOTHING
 )
-INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
-                      size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
-SELECT m.txid, $3::int, $4::int, $5::int, m.created_height, m.size_in_bytes, m.fee,
-       m.tx_inpoints, m.locktime, m.created_at, m.flags
-  FROM moved m
-ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
+SELECT txid FROM moved`
 
 // deleteMinedRowSQL removes one block's membership row for a set of transactions.
 //
@@ -183,13 +195,24 @@ DELETE FROM tx_mined m
  WHERE m.txid = k.txid AND m.mined_height = $2 AND m.block_id = $3`
 
 // SetMinedMulti marks transactions as mined in the block described by info.
+//
+// Three write paths, and the flags on info decide which runs rather than what the store
+// holds. A block ON THE LONGEST CHAIN settles the transactions it names, so its stamp is also
+// a move (stampAndMove). An UN-MINE takes the block back off the identity row (unstampOnly).
+// Anything else is a fork stamp, which only appends the block (forkStamp). Un-mining wins
+// over the longest-chain flag when a caller sets both, as it did before the move existed.
+//
+// Each path answers the postcondition the interface states -- every hash asked about appears
+// in the result, or the call fails -- from three sources: the identity row (provePresentSQL),
+// the identity row this call MOVED into the membership table, and the membership rows a
+// transaction created by the block path already had.
 func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 	info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	if len(hashes) == 0 {
 		return map[chainhash.Hash][]uint32{}, nil
 	}
 
-	// Built once and used by both statements, so the set the stamp acted on and the set the
+	// Built once and used by every statement, so the set a stamp acted on and the set the
 	// postcondition is checked against cannot disagree.
 	leaves := make([]int16, 0, len(hashes))
 	txids := make([][]byte, 0, len(hashes))
@@ -209,118 +232,30 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 
 	entry := packMembership([]utxo.MinedBlockInfo{info})
 
-	// A block on the longest chain SETTLES the transactions it names, so the stamp is also a
-	// move: see stampAndMove. Everything else -- a fork stamp, an un-mine -- only rewrites the
-	// identity row, and one statement on the pool is the whole write. Un-mining wins over the
-	// flag when a caller sets both, as it did before the move existed.
-	if info.OnLongestChain && !info.UnsetMined {
-		if err := s.stampAndMove(ctx, leaves, txids, entry, info); err != nil {
-			return nil, err
-		}
-	} else {
-		stmt := stampSQL
-		marker := any(info.OnLongestChain)
+	var (
+		out map[chainhash.Hash][]uint32
+		err error
+	)
 
-		if info.UnsetMined {
-			stmt = unstampSQL
-			// A fresh clock from the current tip. See unstampSQL.
-			marker = int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
-		}
-
-		if _, err := s.pool.Exec(ctx, stmt, leaves, txids, entry, marker); err != nil {
-			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
-		}
+	switch {
+	case info.UnsetMined:
+		out, err = s.unstampOnly(ctx, leaves, txids, entry, info)
+	case info.OnLongestChain:
+		out, err = s.stampAndMove(ctx, leaves, txids, entry, info)
+	default:
+		out, err = s.forkStamp(ctx, leaves, txids, entry, info)
 	}
 
-	rows, err := s.pool.Query(ctx, provePresentSQL, leaves, txids)
 	if err != nil {
-		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] prove", err)
-	}
-
-	out := make(map[chainhash.Hash][]uint32, len(hashes))
-	found := make(map[chainhash.Hash]struct{}, len(hashes))
-
-	for rows.Next() {
-		var (
-			txid       []byte
-			membership []byte
-		)
-
-		if err := rows.Scan(&txid, &membership); err != nil {
-			rows.Close()
-			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] scan", err)
-		}
-
-		var h chainhash.Hash
-		copy(h[:], txid)
-
-		ids, _, _ := unpackMembership(membership)
-		out[h] = ids
-		found[h] = struct{}{}
-	}
-
-	rows.Close()
-
-	if err := rows.Err(); err != nil {
-		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] rows", err)
-	}
-
-	// The residue: every txid provePresentSQL did NOT answer, because it never held an
-	// identity row (the block path never writes one) or has since lost it. This is where a
-	// block-path transaction -- one the retry path re-stamps, or a sibling block at the same
-	// height -- gets answered, from tx_mined instead of tx_ident.
-	var residue [][]byte
-
-	for _, txid := range txids {
-		var h chainhash.Hash
-
-		copy(h[:], txid)
-
-		if _, ok := found[h]; !ok {
-			residue = append(residue, txid)
-		}
+		return nil, err
 	}
 
 	// Un-mining is exempt from the postcondition below, because the interface says missing
 	// entries are tolerated there: a reorg may un-mine a transaction the store has already
 	// discarded. Tolerated means it does not error, NOT that the answer is empty. Transactions
 	// that DO still exist must still appear, which the conformance suite checks.
-	//
-	// A block-path row has no identity row for unstampSQL to touch, so the residue here also
-	// gets a best-effort delete against tx_mined. Absence is tolerated the same way.
 	if info.UnsetMined {
-		if len(residue) > 0 {
-			if _, err := s.pool.Exec(ctx, deleteMinedRowSQL, residue,
-				int32(info.BlockHeight), int32(info.BlockID)); err != nil { //nolint:gosec // heights and ids fit
-				return nil, errors.NewStorageError("[utxoset][SetMinedMulti] unmine membership", err)
-			}
-		}
-
 		return out, nil
-	}
-
-	// Block-path rows live in tx_mined, not tx_ident. A stamp for such a row is the retry path
-	// (Phase 1.5 on ErrTxExists) or a sibling block at the same height. Append a membership row
-	// for this block if the transaction has any membership row at all; the postcondition is
-	// then answered from tx_mined. A transaction in neither table is genuinely unknown.
-	if len(residue) > 0 {
-		if err := s.ensureTxMinedPartition(ctx, info.BlockHeight); err != nil {
-			return nil, err
-		}
-
-		if _, err := s.pool.Exec(ctx, appendMinedSQL, residue,
-			int32(info.BlockHeight), int32(info.BlockID), int32(info.SubtreeIdx)); err != nil { //nolint:gosec // heights and ids fit
-			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] append membership", err)
-		}
-
-		ids, err := s.minedIDsByTxid(ctx, residue)
-		if err != nil {
-			return nil, err
-		}
-
-		for h, v := range ids {
-			out[h] = v
-		}
 	}
 
 	for _, h := range hashes {
@@ -337,9 +272,9 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 }
 
 // stampAndMove appends this block to every listed identity row, clears their mempool markers,
-// and moves the rows the block has settled into the membership table.
+// moves the rows the block has settled into the membership table, and answers for the rest.
 //
-// The two statements are ONE TRANSACTION, and that is a correctness rule rather than a saved
+// The statements are ONE TRANSACTION, and that is a correctness rule rather than a saved
 // round trip. The read path stops at an identity hit (see lookup.go), so between a committed
 // delete from tx_ident and a committed insert into tx_mined a concurrent reader finds the
 // transaction in neither table and reports it missing -- which makes the validator reject
@@ -347,41 +282,259 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 // are the only two a reader can see.
 //
 // ensureTxMinedPartition runs BEFORE the transaction opens, because the DDL needs its own pool
-// connection; the same rule the create path follows.
-//
-// The order inside is fixed: stampSQL first, so moveToMinedSQL's single-block test sees the
-// row as this block leaves it. A row that only ever saw this block moves; one that already
-// carried a fork triple now carries two and stays.
+// connection; the same rule the create path follows. It is also what lets the residue append
+// live inside the transaction: the window it inserts into is the one this call just created
+// for the move, so the append needs no DDL of its own.
 func (s *Store) stampAndMove(ctx context.Context, leaves []int16, txids [][]byte, entry []byte,
-	info utxo.MinedBlockInfo) error {
+	info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	if err := s.ensureTxMinedPartition(ctx, info.BlockHeight); err != nil {
-		return err
+		return nil, err
 	}
 
 	dbTx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return errors.NewStorageError("[utxoset][SetMinedMulti] begin", err)
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] begin", err)
 	}
 
-	if _, err := dbTx.Exec(ctx, stampSQL, leaves, txids, entry, true); err != nil {
+	out, residue, err := s.stampMoveAndAppend(ctx, dbTx, leaves, txids, entry, info)
+	if err != nil {
 		_ = dbTx.Rollback(ctx)
 
-		return errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
-	}
-
-	if _, err := dbTx.Exec(ctx, moveToMinedSQL, distinctLeaves(txids), txids,
-		int32(info.BlockHeight), int32(info.BlockID), int32(info.SubtreeIdx), //nolint:gosec // heights and ids fit
-		entry); err != nil {
-		_ = dbTx.Rollback(ctx)
-
-		return errors.NewStorageError("[utxoset][SetMinedMulti] move to membership", err)
+		return nil, err
 	}
 
 	if err := dbTx.Commit(ctx); err != nil {
-		return errors.NewStorageError("[utxoset][SetMinedMulti] commit stamp and move", err)
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] commit stamp and move", err)
+	}
+
+	// The block ids of an appended row are read after the commit, on the pool, and only for
+	// the hashes that actually needed appending -- which on the ordinary tip path is none,
+	// because moveToMinedSQL already answered for every row it moved. Reading committed state
+	// through the ordinary membership step keeps "insertion order" a single definition; the
+	// write it reports on is already durable, so nothing needs it inside the transaction.
+	if len(residue) > 0 {
+		ids, err := s.minedIDsByTxid(ctx, residue)
+		if err != nil {
+			return nil, err
+		}
+
+		for h, v := range ids {
+			out[h] = v
+		}
+	}
+
+	return out, nil
+}
+
+// stampMoveAndAppend is the body of the longest-chain transaction, split out so that every
+// failure inside it leaves through one rollback. It returns the answers it established and the
+// transactions still to be answered from the membership table.
+//
+// The order is fixed. stampSQL first, so moveToMinedSQL's single-block test sees the row as
+// this block leaves it: a row that only ever saw this block moves, one that already carried a
+// fork triple now carries two and stays. provePresentSQL after the move, so a row cannot be
+// counted both as moved and as present.
+func (s *Store) stampMoveAndAppend(ctx context.Context, dbTx pgx.Tx, leaves []int16,
+	txids [][]byte, entry []byte, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32,
+	[][]byte, error) {
+	if _, err := dbTx.Exec(ctx, stampSQL, leaves, txids, entry, true); err != nil {
+		return nil, nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
+	}
+
+	out := make(map[chainhash.Hash][]uint32, len(txids))
+
+	// Every row the move settled named exactly one block -- this one, which is what
+	// moveToMinedSQL's equality against the stamped triple proves -- so its answer is known
+	// without reading the membership table back.
+	moved, err := queryTxids(ctx, dbTx, moveToMinedSQL, distinctLeaves(txids), txids,
+		int32(info.BlockHeight), int32(info.BlockID), int32(info.SubtreeIdx), entry) //nolint:gosec // heights and ids fit
+	if err != nil {
+		return nil, nil, errors.NewStorageError("[utxoset][SetMinedMulti] move to membership", err)
+	}
+
+	for _, h := range moved {
+		out[h] = []uint32{info.BlockID}
+	}
+
+	if err := provePresentInto(ctx, dbTx, leaves, txids, out); err != nil {
+		return nil, nil, err
+	}
+
+	// The residue: every transaction neither moved nor present on the identity table, because
+	// it never held an identity row (the block path never writes one) or has since lost it.
+	// A stamp for such a row is the retry path (Phase 1.5 on ErrTxExists) or a sibling block
+	// at the same height. Append a membership row for this block if the transaction has any
+	// membership row at all; a transaction in neither table is genuinely unknown.
+	residue := absentTxids(txids, out)
+	if len(residue) == 0 {
+		return out, nil, nil
+	}
+
+	if _, err := dbTx.Exec(ctx, appendMinedSQL, residue, int32(info.BlockHeight),
+		int32(info.BlockID), int32(info.SubtreeIdx)); err != nil { //nolint:gosec // heights and ids fit
+		return nil, nil, errors.NewStorageError("[utxoset][SetMinedMulti] append membership", err)
+	}
+
+	return out, residue, nil
+}
+
+// forkStamp records a block that is NOT on the longest chain: every listed identity row gains
+// the block and keeps its mempool marker, and nothing moves.
+//
+// No transaction wraps the statements, and that is a real difference from the longest-chain
+// path rather than an oversight. Nothing here deletes. The stamp only appends to tx_ident, the
+// append only inserts into tx_mined, and they act on disjoint sets of transactions, so there
+// is no instant at which a reader finds a transaction in neither table -- which is the whole
+// reason stampAndMove needs one.
+func (s *Store) forkStamp(ctx context.Context, leaves []int16, txids [][]byte, entry []byte,
+	info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	if _, err := s.pool.Exec(ctx, stampSQL, leaves, txids, entry, false); err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
+	}
+
+	out := make(map[chainhash.Hash][]uint32, len(txids))
+	if err := provePresentInto(ctx, s.pool, leaves, txids, out); err != nil {
+		return nil, err
+	}
+
+	residue := absentTxids(txids, out)
+	if len(residue) == 0 {
+		return out, nil
+	}
+
+	if err := s.ensureTxMinedPartition(ctx, info.BlockHeight); err != nil {
+		return nil, err
+	}
+
+	if _, err := s.pool.Exec(ctx, appendMinedSQL, residue, int32(info.BlockHeight),
+		int32(info.BlockID), int32(info.SubtreeIdx)); err != nil { //nolint:gosec // heights and ids fit
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] append membership", err)
+	}
+
+	ids, err := s.minedIDsByTxid(ctx, residue)
+	if err != nil {
+		return nil, err
+	}
+
+	for h, v := range ids {
+		out[h] = v
+	}
+
+	return out, nil
+}
+
+// unstampOnly takes one block off every listed identity row and puts the row back in the
+// mempool set with a fresh clock.
+//
+// A transaction whose stamp lives only in the membership table has no identity row for the
+// unstamp to touch, so the residue gets a best-effort delete of that block's row. Absence is
+// tolerated, exactly as the interface allows for an un-mine.
+func (s *Store) unstampOnly(ctx context.Context, leaves []int16, txids [][]byte, entry []byte,
+	info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	// A fresh clock from the current tip. See unstampSQL.
+	height := int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
+
+	if _, err := s.pool.Exec(ctx, unstampSQL, leaves, txids, entry, height); err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] unstamp", err)
+	}
+
+	out := make(map[chainhash.Hash][]uint32, len(txids))
+	if err := provePresentInto(ctx, s.pool, leaves, txids, out); err != nil {
+		return nil, err
+	}
+
+	residue := absentTxids(txids, out)
+	if len(residue) == 0 {
+		return out, nil
+	}
+
+	if _, err := s.pool.Exec(ctx, deleteMinedRowSQL, residue,
+		int32(info.BlockHeight), int32(info.BlockID)); err != nil { //nolint:gosec // heights and ids fit
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] unmine membership", err)
+	}
+
+	return out, nil
+}
+
+// provePresentInto records, for every listed transaction that still holds an identity row,
+// the blocks that row names. See provePresentSQL for why this is a statement of its own.
+func provePresentInto(ctx context.Context, q querier, leaves []int16, txids [][]byte,
+	out map[chainhash.Hash][]uint32) error {
+	rows, err := q.Query(ctx, provePresentSQL, leaves, txids)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][SetMinedMulti] prove", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			txid       []byte
+			membership []byte
+		)
+
+		if err := rows.Scan(&txid, &membership); err != nil {
+			return errors.NewStorageError("[utxoset][SetMinedMulti] scan", err)
+		}
+
+		var h chainhash.Hash
+
+		copy(h[:], txid)
+
+		ids, _, _ := unpackMembership(membership)
+		out[h] = ids
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][SetMinedMulti] rows", err)
 	}
 
 	return nil
+}
+
+// absentTxids is the set of listed transactions the answer does not yet cover.
+func absentTxids(txids [][]byte, out map[chainhash.Hash][]uint32) [][]byte {
+	var residue [][]byte
+
+	for _, txid := range txids {
+		var h chainhash.Hash
+
+		copy(h[:], txid)
+
+		if _, ok := out[h]; !ok {
+			residue = append(residue, txid)
+		}
+	}
+
+	return residue
+}
+
+// queryTxids runs a statement whose result is one txid column and collects the hashes.
+func queryTxids(ctx context.Context, q querier, stmt string, args ...any) ([]chainhash.Hash, error) {
+	rows, err := q.Query(ctx, stmt, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	var out []chainhash.Hash
+
+	for rows.Next() {
+		var txid []byte
+
+		if err := rows.Scan(&txid); err != nil {
+			return nil, err
+		}
+
+		var h chainhash.Hash
+
+		copy(h[:], txid)
+
+		out = append(out, h)
+	}
+
+	return out, rows.Err()
 }
 
 // distinctLeaves is the set of leaf partitions a batch of transaction ids touches.
@@ -391,9 +544,9 @@ func (s *Store) stampAndMove(ctx context.Context, leaves []int16, txids [][]byte
 // prunes the partitions it cannot contain. Passing the per-key array would work and would
 // restate one leaf value a thousand times inside the plan.
 func distinctLeaves(txids [][]byte) []int16 {
-	var seen [8]bool
+	var seen [NumLeaves]bool
 
-	out := make([]int16, 0, 8)
+	out := make([]int16, 0, NumLeaves)
 
 	for _, txid := range txids {
 		leaf := LeafFor(txid)
