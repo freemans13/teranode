@@ -56,8 +56,29 @@ import (
 // gate. Without that gate a re-applied block would create every output a second time, which
 // is the failure this mechanism exists to prevent.
 //
-// The claim is gated on tx_mined as well as on its own conflict clause, and that guard is what
-// keeps a transaction in EXACTLY ONE of the two tables. A transaction the longest-chain stamp
+// The claim carries THREE guards, and all three are needed. Its own conflict clause catches a
+// transaction the mempool already holds. The tx_mined probe keeps a transaction in exactly one
+// of the two tables. The own-output coin probe catches the case neither of the other two can
+// see: a transaction mined longer ago than the membership retention has no identity row and no
+// membership window, and its coins are still live because window retirement stamped them on the
+// way out. Without that third guard the claim takes, and because the coin insert is gated on
+// the same claim, every output is written a SECOND row -- the coin key is a non-unique 96-bit
+// prefix by design, so nothing downstream catches it. That is money-supply inflation.
+//
+// The spec argued this could not arise because the mempool path spends before it creates, so an
+// old transaction's inputs would fail as already-spent and the create would never run. That is
+// true of SpendAndCreate in its default mode and false with WithCreateOnly, which skips the
+// spend phase entirely. The reachable caller is the validator's CreateConflicting branch
+// (services/validator/Validator.go): when every input fails as already-spent it calls
+// CreateInUtxoStore with markAsConflicting, which is SpendAndCreate + WithCreateOnly and no
+// mined-block info. CreateConflicting is off on the p2p path and ON for every
+// subtree-validation entry point, which is the mainline block path at the tip.
+//
+// The guard is the identical statement createMinedPlanSQL carries, LIMIT 1 OFFSET 0 fence and
+// all, for the identical reason: a bare NOT EXISTS is flattened into an anti-join, and the
+// fence keeps it a per-row subplan on the coin's packed-key range.
+//
+// The tx_mined guard is what keeps a transaction in EXACTLY ONE of the two tables. A transaction the longest-chain stamp
 // has settled has no identity row at all, so ON CONFLICT sees nothing to conflict with: without
 // the guard, a mempool create of an already-settled transaction takes a fresh identity row --
 // two homes, and every read-order argument in this store assumes one -- and, because the coin
@@ -85,9 +106,9 @@ const createIdentPlanSQL = `
 WITH t AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::int[], $5::int[],
                          $6::bytea[], $7::int[], $8::bytea[], $9::int[], $10::bigint[],
-                         $11::smallint[], $12::bytea[])
+                         $11::smallint[], $12::bytea[], $13::uuid[], $14::uuid[])
         AS t(k, leaf, txid, created_height, off_chain_since, membership, size_in_bytes,
-             tx_inpoints, locktime, created_at, flags, raw_tx)
+             tx_inpoints, locktime, created_at, flags, raw_tx, lo, hi)
 ),
 claim AS (
     INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
@@ -96,6 +117,9 @@ claim AS (
            NULL::bigint, t.size_in_bytes, t.tx_inpoints, t.locktime, t.created_at, t.flags
       FROM t
      WHERE NOT EXISTS (SELECT 1 FROM tx_mined m WHERE m.txid = t.txid LIMIT 1 OFFSET 0)
+       AND NOT EXISTS (SELECT 1 FROM utxo u
+                        WHERE u.leaf = t.leaf AND u.ukey >= t.lo AND u.ukey <= t.hi AND u.txid = t.txid
+                        ORDER BY u.ukey LIMIT 1 OFFSET 0)
     ON CONFLICT (leaf, txid) DO NOTHING
     RETURNING leaf, txid
 ),
@@ -110,8 +134,8 @@ coins AS (
                       leaf, flags, ukey, txid, script)
     SELECT o.satoshis, o.created_height, o.spendable_from, 0, 0,
            o.leaf, o.flags, o.ukey, o.txid, o.script
-      FROM unnest($13::bigint[], $14::int[], $15::int[], $16::smallint[], $17::smallint[],
-                  $18::uuid[], $19::bytea[], $20::bytea[])
+      FROM unnest($15::bigint[], $16::int[], $17::int[], $18::smallint[], $19::smallint[],
+                  $20::uuid[], $21::bytea[], $22::bytea[])
         AS o(satoshis, created_height, spendable_from, leaf, flags, ukey, txid, script)
       JOIN claim c ON c.leaf = o.leaf AND c.txid = o.txid
 )
@@ -448,7 +472,7 @@ func (s *Store) runCreatePlan(ctx context.Context, q querier, p *createPlan) err
 func (s *Store) runIdentPlan(ctx context.Context, q querier, p *createPlan) error {
 	rows, err := q.Query(ctx, createIdentPlanSQL,
 		p.idx, p.leaves, p.txids, p.heights, p.offChain, p.membership, p.sizes,
-		p.inpoints, p.locktimes, p.createdAt, p.txFlags, p.bodies,
+		p.inpoints, p.locktimes, p.createdAt, p.txFlags, p.bodies, p.lo, p.hi,
 		p.coinSats, p.coinHeights, p.coinSpendable, p.coinLeaves, p.coinFlags,
 		p.coinUkeys, p.coinTxids, p.coinScripts)
 	if err != nil {
