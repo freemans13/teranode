@@ -562,7 +562,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	// BATCHED SUBTREE LOADING: Get blockIds once before batching
 	blockHeaderIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Header.HashPrevBlock, uint64(u.settings.GetUtxoStoreBlockHeightRetention()*2))
 	if err != nil {
-		return nil, wrapCheckBlockSubtreesErr(errors.NewProcessingError("[CheckSubtree] Failed to get block headers from blockchain client", err))
+		return nil, wrapCheckBlockSubtreesErr(errors.NewProcessingError("[CheckBlockSubtrees] Failed to get block headers from blockchain client", err))
 	}
 
 	blockIds := make(map[uint32]bool, len(blockHeaderIDs))

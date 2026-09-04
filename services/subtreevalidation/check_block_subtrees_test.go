@@ -245,7 +245,10 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		response, err := server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
 		assert.Nil(t, response)
-		assert.Contains(t, err.Error(), "Failed to get block headers from blockchain client")
+		// Tag included on purpose. Server.go carries the same message under
+		// [CheckSubtree], and the gRPC wrap puts this line in front of a caller, so
+		// the tag is the only thing telling the two call sites apart in a log.
+		assert.Contains(t, err.Error(), "[CheckBlockSubtrees] Failed to get block headers from blockchain client")
 	})
 
 	t.Run("HTTPFetchingPath", func(t *testing.T) {
