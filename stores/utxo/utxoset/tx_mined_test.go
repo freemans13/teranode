@@ -3,6 +3,8 @@ package utxoset
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
 )
 
@@ -82,4 +84,59 @@ func TestDroppedMembershipWindowsCannotComeBack(t *testing.T) {
 	require.Error(t, err, "recreating a dropped window would let a stale block double its coins")
 
 	require.NoError(t, s.ensureTxMinedPartition(ctx, 1_000), "a live window is still fine")
+}
+
+// TestRetiringWindowStampsItsLiveCoins: a mempool-created transaction's coins carry the
+// sentinel until its membership window retires, when the surviving coins learn their block
+// from the window's own list. Only then can the coin be the answer for an old parent.
+func TestRetiringWindowStampsItsLiveCoins(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, tx, 99)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
+	require.NoError(t, err)
+
+	h, _ := coinFacts(t, s, ctx, tx)
+	require.Equal(t, int32(0), h, "not stamped at mining")
+
+	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err)
+
+	h, b := coinFacts(t, s, ctx, tx)
+	require.Equal(t, int32(100), h)
+	require.Equal(t, int32(7), b)
+
+	got, err := s.Get(ctx, tx.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{7}, got.BlockIDs, "served from the coin now the window is gone")
+}
+
+// TestRetiringWindowStampsFromTheFirstRow: a transaction that ends up with two tx_mined rows
+// in the same window -- a longest-chain stamp naming block 7, then a fork stamp naming block 8
+// at the same height -- must be stamped with the FIRST row's block after the drop. Since
+// Task 10 a transaction with a surviving tx_mined row settled under it, and the first (lowest
+// seq) is the earliest stamp: a coin naming the second (fork) row's block would be wrong.
+func TestRetiringWindowStampsFromTheFirstRow(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 99)
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true})
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 8, BlockHeight: 100, OnLongestChain: false})
+	require.NoError(t, err)
+
+	require.Equal(t, 2, minedRows(t, s, ctx, tx), "the fork stamp must append a second row, not replace the first")
+
+	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err)
+
+	h, b := coinFacts(t, s, ctx, tx)
+	require.Equal(t, int32(100), h)
+	require.Equal(t, int32(7), b, "the first row's block, not the second")
 }
