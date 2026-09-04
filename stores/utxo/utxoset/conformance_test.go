@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
+	"github.com/stretchr/testify/require"
 )
 
 // The suite used to be opt-in behind UTXOSET_CONFORMANCE, because it failed while the store
@@ -69,7 +70,18 @@ func TestConformance(t *testing.T) {
 		tests.SetMinedUnminedSince(t, db)
 	})
 
-	// tests.MinedThenSpendAllPrunes is deliberately not run here: it creates through the
-	// mempool path and relies on the longest-chain stamp moving rows out of the identity
-	// table, which is a later stage's change, not this one's.
+	// The delete-at-height lifecycle: a mempool-created tx stamped mined on the longest
+	// chain moves into tx_mined, every output gets spent, and Prune(1_000_000) at that
+	// height drops every membership window below the journal-retention cutoff wholesale
+	// (there is no per-row DAH sweep in this design — see pruner.go). The coins are
+	// already gone from the spend, so once the window holding the tx's identity is
+	// dropped, a lookup misses.
+	t.Run("MinedThenSpendAllPrunes", func(t *testing.T) {
+		db, _ := newTestStore(t)
+
+		svc, err := db.GetPrunerService()
+		require.NoError(t, err)
+
+		tests.MinedThenSpendAllPrunes(t, db, svc)
+	})
 }
