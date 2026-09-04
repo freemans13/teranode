@@ -18,12 +18,105 @@ import (
 // off_chain_since is the only column this touches. Block membership is NOT rewritten, because
 // this call does not claim to know which blocks a transaction is in. It answers one narrower
 // question, which is whether the chain the node currently believes in contains it.
+//
+// THE LEAF IS A SCALAR AND THE TXIDS AN ARRAY, so this runs once per leaf group. See
+// leafGroups: it is the only key shape here whose cost is a function of the batch rather than
+// of the mempool, and txid = ANY is exact on its own because tx_ident_ck makes leaf a function
+// of txid.
 const markOnLongestChainSQL = `
 UPDATE tx_ident i
    SET off_chain_since = $3::int
-  FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
- WHERE i.leaf = k.leaf AND i.txid = k.txid
+ WHERE i.leaf = $1::smallint
+   AND i.txid = ANY($2::bytea[])
 RETURNING i.txid`
+
+// singleTripleHeightsSQL reads the block height out of the membership of every listed identity
+// row that names exactly one block and carries no conflicting children -- which is exactly the
+// set moveSingleToMinedSQL will move.
+//
+// It exists because of an ordering constraint rather than for information: the membership
+// windows those rows will land in have to be created before the transaction opens, since the
+// DDL needs its own pool connection, and their heights are not known until the triples are
+// decoded. So the heights are read first, the windows created, and only then does the
+// transaction that marks and moves begin.
+const singleTripleHeightsSQL = `
+SELECT DISTINCT ((get_byte(i.membership, 4)::bigint << 24)
+               | (get_byte(i.membership, 5)::bigint << 16)
+               | (get_byte(i.membership, 6)::bigint <<  8)
+               |  get_byte(i.membership, 7)::bigint)::int AS height
+  FROM tx_ident i
+ WHERE i.leaf = $1::smallint
+   AND i.txid = ANY($2::bytea[])
+   AND octet_length(i.membership) = 12
+   AND i.conflicting_children IS NULL`
+
+// moveSingleToMinedSQL settles the identity rows that name exactly ONE block, taking the
+// block's facts from the triple the row itself carries.
+//
+// It is moveToMinedSQL with the parameters removed, and the removal is the point. The stamp
+// path is TOLD which block settled the transaction, so it can test the membership against that
+// block's packed triple and write the parameters straight through. This call is told nothing
+// but "the chain now contains these transactions", so the only block it can name is the one
+// the row already claims -- which is sound only when the row claims exactly one. A row naming
+// two stays where it is with its marker cleared, because nothing here can say which of them is
+// main; it waits for an un-mine or a further stamp to reduce it to one. A row carrying
+// conflicting children stays for the reason moveToMinedSQL leaves it: tx_mined has no column
+// for that bookkeeping yet.
+//
+// The height, block id and subtree index are decoded big-endian from the twelve bytes, in the
+// order mh_triple and packMembership write them, with the bigint casts mh_max needs: an int4
+// shift of 255 by 24 wraps negative, silently.
+//
+// One leaf group at a time, for the reason spelled out on leafGroups, and the same
+// RETURNING-from-the-DELETE shape moveToMinedSQL uses so a replayed block cannot make a row
+// that HAS left tx_ident look as though it stayed.
+const moveSingleToMinedSQL = `
+WITH moved AS (
+    DELETE FROM tx_ident i
+     WHERE i.leaf = $1::smallint
+       AND i.txid = ANY($2::bytea[])
+       AND octet_length(i.membership) = 12
+       AND i.conflicting_children IS NULL
+    RETURNING i.txid, i.membership, i.created_height, i.size_in_bytes, i.fee,
+              i.tx_inpoints, i.locktime, i.created_at, i.flags
+),
+settled AS (
+    INSERT INTO tx_mined (txid, mined_height, block_id, subtree_idx, created_height,
+                          size_in_bytes, fee, tx_inpoints, locktime, created_at, flags)
+    SELECT m.txid,
+           ((get_byte(m.membership,  4)::bigint << 24)
+          | (get_byte(m.membership,  5)::bigint << 16)
+          | (get_byte(m.membership,  6)::bigint <<  8)
+          |  get_byte(m.membership,  7)::bigint)::int,
+           ((get_byte(m.membership,  0)::bigint << 24)
+          | (get_byte(m.membership,  1)::bigint << 16)
+          | (get_byte(m.membership,  2)::bigint <<  8)
+          |  get_byte(m.membership,  3)::bigint)::int,
+           ((get_byte(m.membership,  8)::bigint << 24)
+          | (get_byte(m.membership,  9)::bigint << 16)
+          | (get_byte(m.membership, 10)::bigint <<  8)
+          |  get_byte(m.membership, 11)::bigint)::int,
+           m.created_height, m.size_in_bytes, m.fee, m.tx_inpoints, m.locktime,
+           m.created_at, m.flags
+      FROM moved m
+    ON CONFLICT (txid, mined_height, block_id) DO NOTHING
+)
+SELECT txid FROM moved`
+
+// minedPresentSQL names the listed transactions that hold at least one membership row.
+//
+// The keys sit outside a LATERAL with an OFFSET 0 fence, the same fence minedByTxidSQL needs,
+// so this is one index descent per key per live window rather than a read of the whole
+// membership set.
+const minedPresentSQL = `
+SELECT k.txid
+  FROM unnest($1::bytea[]) AS k(txid)
+ CROSS JOIN LATERAL (
+   SELECT 1
+     FROM tx_mined m
+    WHERE m.txid = k.txid
+    LIMIT 1 OFFSET 0
+ ) AS p`
 
 // MarkTransactionsOnLongestChain records whether the node's current chain contains these
 // transactions.
@@ -33,6 +126,14 @@ RETURNING i.txid`
 // chain, and hands them here to have the marker cleared. Until this existed the node could
 // not start at all once one such transaction was in the store, which is exactly the state an
 // ordinary sync produces.
+//
+// The call now MOVES rows as well as marking them, in both directions, and it has to: the
+// mempool table and the membership table are the two halves of one set, and a transaction is
+// in whichever half matches what the node last learned about the chain. On the longest chain
+// with exactly one block claimed, the row settles into the membership table. Off the longest
+// chain, every membership row it holds comes back to the mempool table, its blocks remembered
+// as fork triples. Marking a row without moving it would leave a settled transaction that
+// nothing can un-mine, and an un-mined one that no unmined-transaction reload can find.
 //
 // onLongestChain true clears the marker. False sets it to the CURRENT tip rather than to the
 // transaction's creation height, which is the same rule the un-mine path follows: a
@@ -47,48 +148,32 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		return nil
 	}
 
-	leaves := make([]int16, 0, len(txHashes))
 	txids := make([][]byte, 0, len(txHashes))
-
 	for i := range txHashes {
-		leaves = append(leaves, LeafFor(txHashes[i][:]))
 		txids = append(txids, txHashes[i][:])
 	}
 
-	// NULL when the chain contains it, the current tip when it does not.
-	var marker any
-	if !onLongestChain {
-		marker = int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
+	var (
+		reached []chainhash.Hash
+		err     error
+	)
+
+	if onLongestChain {
+		reached, err = s.markOnAndSettle(ctx, txids)
+	} else {
+		reached, err = s.markOffAndMoveBack(ctx, txids)
 	}
 
-	rows, err := s.pool.Query(ctx, markOnLongestChainSQL, leaves, txids, marker)
 	if err != nil {
-		return errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] update", err)
+		return err
 	}
 
-	reached := make(map[chainhash.Hash]struct{}, len(txHashes))
-
-	for rows.Next() {
-		var txid []byte
-
-		if err := rows.Scan(&txid); err != nil {
-			rows.Close()
-			return errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] scan", err)
-		}
-
-		var h chainhash.Hash
-
-		copy(h[:], txid)
-		reached[h] = struct{}{}
+	seen := make(map[chainhash.Hash]struct{}, len(reached))
+	for _, h := range reached {
+		seen[h] = struct{}{}
 	}
 
-	rows.Close()
-
-	if err := rows.Err(); err != nil {
-		return errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] rows", err)
-	}
-
-	if len(reached) == len(txHashes) {
+	if len(seen) == len(txHashes) {
 		return nil
 	}
 
@@ -97,7 +182,7 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 	missing := make([]error, 0, 4)
 
 	for i := range txHashes {
-		if _, ok := reached[txHashes[i]]; ok {
+		if _, ok := seen[txHashes[i]]; ok {
 			continue
 		}
 
@@ -109,4 +194,177 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 	}
 
 	return errors.Join(missing...)
+}
+
+// markOnAndSettle clears the mempool marker and settles every row the clearing leaves naming
+// exactly one block.
+//
+// The mark and the move are ONE TRANSACTION, for the reason stampAndMove's are: a settle
+// deletes an identity row and inserts a membership row, and between two committed statements a
+// concurrent reader would find the transaction in neither table and report it missing.
+//
+// ensureTxMinedPartition runs before the transaction opens, because the DDL needs its own pool
+// connection. Its heights are only known once the single triples have been DECODED, so the
+// order is forced: read the heights (singleTripleHeightsSQL), create the windows, then
+// Begin -> mark -> move -> Commit.
+func (s *Store) markOnAndSettle(ctx context.Context, txids [][]byte) ([]chainhash.Hash, error) {
+	groups := leafGroups(txids)
+
+	heights, err := s.singleTripleHeights(ctx, groups)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, h := range heights {
+		if err := s.ensureTxMinedPartition(ctx, h); err != nil {
+			return nil, err
+		}
+	}
+
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] begin", err)
+	}
+
+	var reached []chainhash.Hash
+
+	for _, g := range groups {
+		// NULL, because the chain contains these transactions.
+		marked, err := queryTxids(ctx, dbTx, markOnLongestChainSQL, g.leaf, g.txids, nil)
+		if err != nil {
+			_ = dbTx.Rollback(ctx)
+
+			return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] update", err)
+		}
+
+		reached = append(reached, marked...)
+	}
+
+	for _, g := range groups {
+		if _, err := dbTx.Exec(ctx, moveSingleToMinedSQL, g.leaf, g.txids); err != nil {
+			_ = dbTx.Rollback(ctx)
+
+			return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] settle", err)
+		}
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] commit mark and settle", err)
+	}
+
+	if len(reached) == len(txids) {
+		return reached, nil
+	}
+
+	// A transaction ALREADY in the membership table is already in the state this call asks
+	// for, so it counts as reached even though no identity row moved. Without this the call
+	// would not be idempotent: settling a row here deletes its identity row, and a repeat of
+	// the same repair -- an ordinary startup after an interrupted one -- would then report
+	// every transaction it had already fixed as one the store does not hold. The probe runs
+	// only when something was missed, so the ordinary path still costs two statements.
+	also, err := queryTxids(ctx, s.pool, minedPresentSQL, txids)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] probe membership", err)
+	}
+
+	return append(reached, also...), nil
+}
+
+// markOffAndMoveBack sets the mempool marker and brings every membership row these
+// transactions hold back to the mempool table.
+//
+// ONE TRANSACTION, for the reason markOnAndSettle is. No ensureTxMinedPartition: the move-back
+// only deletes from the membership table, and see unstampAndMoveBack for why creating a window
+// here would be wrong.
+//
+// The move-back writes the marker itself, on the rows it inserts, so it does not matter that
+// the mark statement ran before those rows existed.
+func (s *Store) markOffAndMoveBack(ctx context.Context, txids [][]byte) ([]chainhash.Hash, error) {
+	// The current tip, not created_height. See MarkTransactionsOnLongestChain.
+	height := int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
+
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] begin", err)
+	}
+
+	var reached []chainhash.Hash
+
+	for _, g := range leafGroups(txids) {
+		marked, err := queryTxids(ctx, dbTx, markOnLongestChainSQL, g.leaf, g.txids, height)
+		if err != nil {
+			_ = dbTx.Rollback(ctx)
+
+			return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] update", err)
+		}
+
+		reached = append(reached, marked...)
+	}
+
+	moved, err := queryTxids(ctx, dbTx, moveAllBackSQL, txids, height)
+	if err != nil {
+		_ = dbTx.Rollback(ctx)
+
+		return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] move back to the mempool", err)
+	}
+
+	// No block id: this call names none, so every stamped coin of these transactions goes back
+	// to the sentinel.
+	if err := resetCoins(ctx, dbTx, txids, nil); err != nil {
+		_ = dbTx.Rollback(ctx)
+
+		return nil, err
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] commit mark and move back", err)
+	}
+
+	return append(reached, moved...), nil
+}
+
+// singleTripleHeights is the set of block heights named by the listed identity rows that hold
+// exactly one triple. See singleTripleHeightsSQL for why it is read separately.
+func (s *Store) singleTripleHeights(ctx context.Context, groups []leafBatch) ([]uint32, error) {
+	var out []uint32
+
+	for _, g := range groups {
+		heights, err := s.singleTripleHeightsIn(ctx, g)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, heights...)
+	}
+
+	return out, nil
+}
+
+// singleTripleHeightsIn is one leaf group's worth, split out so the rows are closed by a
+// return rather than at the end of the whole loop.
+func (s *Store) singleTripleHeightsIn(ctx context.Context, g leafBatch) ([]uint32, error) {
+	rows, err := s.pool.Query(ctx, singleTripleHeightsSQL, g.leaf, g.txids)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] read single triples", err)
+	}
+
+	defer rows.Close()
+
+	var out []uint32
+
+	for rows.Next() {
+		var height int32
+
+		if err := rows.Scan(&height); err != nil {
+			return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] scan single triple", err)
+		}
+
+		out = append(out, uint32(height)) //nolint:gosec // a stored height is never negative
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] single triple rows", err)
+	}
+
+	return out, nil
 }

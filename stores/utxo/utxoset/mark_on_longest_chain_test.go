@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
 
@@ -94,4 +95,58 @@ func TestMarkOnLongestChainOnAnEmptyListIsANoOp(t *testing.T) {
 
 	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, nil, true))
 	require.NoError(t, errors.Join())
+}
+
+// TestMarkOffLongestChainIsAnUnMine: the mark call with false carries no block, so every
+// membership row of the transaction comes back as a fork triple and the marker is set.
+func TestMarkOffLongestChainIsAnUnMine(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_150))
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_099)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true})
+	require.NoError(t, err)
+
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, false))
+
+	require.True(t, identExists(t, s, ctx, tx))
+	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+
+	got, err := s.Get(ctx, tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Equal(t, []uint32{42}, got.BlockIDs, "the block is remembered as a fork triple")
+	require.Equal(t, uint32(700_150), got.UnminedSince)
+}
+
+// TestMarkOnLongestChainMovesASingleBlockRow: the mark call with true on a row naming one
+// block moves it into membership; on a row naming two it only clears the marker.
+func TestMarkOnLongestChainMovesASingleBlockRow(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_099)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
+	require.NoError(t, err)
+
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true))
+	require.False(t, identExists(t, s, ctx, tx))
+	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+
+	// A row naming two blocks stays: the call carries no block id, so it cannot say which of
+	// them is main.
+	two := mkTx(t, 1, 6_000)
+	_, err = s.Create(ctx, two, 700_099)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(two), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100})
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(two), utxo.MinedBlockInfo{BlockID: 44, BlockHeight: 700_101})
+	require.NoError(t, err)
+
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*two.TxIDChainHash()}, true))
+	require.True(t, identExists(t, s, ctx, two))
+	require.Equal(t, 0, minedRows(t, s, ctx, two))
+	require.Nil(t, readIdent(t, s, ctx, two.TxIDChainHash()[:]).offChainSince)
 }

@@ -247,7 +247,7 @@ func TestStampTestsBlockMembershipOnA12ByteBoundary(t *testing.T) {
 		LeafFor(txid[:]), txid[:], append(append([]byte{}, first...), second...))
 	require.NoError(t, err)
 
-	_, err = s.pool.Exec(ctx, stampSQL, []int16{LeafFor(txid[:])}, [][]byte{txid[:]}, straddler, true)
+	_, err = s.pool.Exec(ctx, stampSQL, LeafFor(txid[:]), [][]byte{txid[:]}, straddler, true)
 	require.NoError(t, err)
 
 	var got []byte
@@ -285,7 +285,7 @@ func TestUnstampRemovesOnlyAWholeEntry(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = s.pool.Exec(ctx, unstampSQL,
-		[]int16{LeafFor(txid[:])}, [][]byte{txid[:]}, straddler, int32(5_000))
+		LeafFor(txid[:]), [][]byte{txid[:]}, straddler, int32(5_000))
 	require.NoError(t, err)
 
 	var got []byte

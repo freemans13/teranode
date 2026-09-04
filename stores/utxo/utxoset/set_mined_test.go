@@ -297,3 +297,71 @@ func TestForkStampTwiceRecordsTheBlockOnce(t *testing.T) {
 	require.Equal(t, []uint32{700_100}, got.BlockHeights)
 	require.Equal(t, []int{3}, got.SubtreeIdxs)
 }
+
+// TestUnMineMovesAMembershipRowBackToTheMempool: the block is taken back; the transaction
+// returns to the identity table with the unconfirmed marker at the CURRENT tip, its other
+// blocks as fork triples, and its coins reset to the unconfirmed sentinel.
+func TestUnMineMovesAMembershipRowBackToTheMempool(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_150))
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_099)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true})
+	require.NoError(t, err)
+	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, UnsetMined: true})
+	require.NoError(t, err)
+
+	require.True(t, identExists(t, s, ctx, tx))
+	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+
+	got, err := s.Get(ctx, tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Empty(t, got.BlockIDs)
+	require.Equal(t, uint32(700_150), got.UnminedSince, "a fresh clock from the current tip, not the creation height")
+
+	h, b := coinFacts(t, s, ctx, tx)
+	require.Equal(t, int32(0), h)
+	require.Equal(t, int32(0), b)
+}
+
+// TestUnMineKeepsTheOtherBlocksItNames is the CTE visibility rule, and it is the one shape a
+// sibling CTE can get wrong: in PostgreSQL a data-modifying CTE's deletes are NOT visible to
+// its siblings, so a repack that simply reads tx_mined again sees the row being deleted and
+// hands the un-mined block back as a fork triple. The transaction here holds two membership
+// rows, one per sibling block at the same height, and un-mining one must leave exactly the
+// other behind.
+func TestUnMineKeepsTheOtherBlocksItNames(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_150))
+
+	// Created by the block path, so its coins carry real block facts to reset.
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100, OnLongestChain: true})
+	require.NoError(t, err)
+	require.Equal(t, 2, minedRows(t, s, ctx, tx))
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, UnsetMined: true})
+	require.NoError(t, err)
+
+	require.True(t, identExists(t, s, ctx, tx))
+	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+
+	got, err := s.Get(ctx, tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Equal(t, []uint32{43}, got.BlockIDs, "the un-mined block is dropped, the sibling kept")
+	require.Equal(t, uint32(700_150), got.UnminedSince)
+
+	h, b := coinFacts(t, s, ctx, tx)
+	require.Equal(t, int32(0), h, "the coin of the un-mined block is back at the sentinel")
+	require.Equal(t, int32(0), b)
+}

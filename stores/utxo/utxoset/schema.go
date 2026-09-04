@@ -493,6 +493,37 @@ CREATE OR REPLACE FUNCTION mh_strip(m bytea, ids bigint[]) RETURNS bytea
                | (get_byte(m, i*12+2)::bigint <<  8)
                |  get_byte(m, i*12+3)::bigint ) = ANY (ids) )
 $fn$;
+
+-- mh_triple packs ONE membership entry: block id, height, subtree index, each a big-endian
+-- uint32 in that order, which is the layout packMembership writes and mh_max and mh_strip
+-- read.
+--
+-- It exists because the un-mine has to REBUILD a membership from tx_mined rows, and written
+-- inline that is twelve nested set_byte calls inside a string_agg -- unreadable, and
+-- impossible to check by eye against the Go packer. One function, one place to compare.
+--
+-- The casts MUST be bigint, for exactly the reason mh_max's must. In PostgreSQL
+-- 255::int << 24 wraps to a negative number, silently, and set_byte then raises on a value
+-- outside 0..255 instead of storing the byte the caller meant.
+CREATE OR REPLACE FUNCTION mh_triple(block_id int, height int, subtree int) RETURNS bytea
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $fn$
+  SELECT set_byte(set_byte(set_byte(set_byte(
+         set_byte(set_byte(set_byte(set_byte(
+         set_byte(set_byte(set_byte(set_byte(
+             '\x000000000000000000000000'::bytea,
+              0, ((block_id::bigint >> 24) & 255)::int),
+              1, ((block_id::bigint >> 16) & 255)::int),
+              2, ((block_id::bigint >>  8) & 255)::int),
+              3, ( block_id::bigint        & 255)::int),
+              4, ((height::bigint   >> 24) & 255)::int),
+              5, ((height::bigint   >> 16) & 255)::int),
+              6, ((height::bigint   >>  8) & 255)::int),
+              7, ( height::bigint          & 255)::int),
+              8, ((subtree::bigint  >> 24) & 255)::int),
+              9, ((subtree::bigint  >> 16) & 255)::int),
+             10, ((subtree::bigint  >>  8) & 255)::int),
+             11, ( subtree::bigint         & 255)::int)
+$fn$;
 `
 
 // CreateSchema installs the M1 schema. Idempotent.

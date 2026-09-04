@@ -36,6 +36,10 @@ import (
 // is the same rule the create gate applies, and for the same reason: "mined into some block"
 // and "on the main chain" are different facts, and a transaction whose only block later
 // loses must stay in the mempool set.
+//
+// THE LEAF IS A SCALAR AND THE TXIDS AN ARRAY, so the statement runs once per leaf group. See
+// leafGroups for the measurements: it is the only one of the three key shapes whose cost is a
+// function of the batch rather than of the mempool.
 const stampSQL = `
 UPDATE tx_ident i
    SET membership = CASE
@@ -47,8 +51,8 @@ UPDATE tx_ident i
            ELSE coalesce(i.membership, '\x'::bytea) || $3::bytea
        END,
        off_chain_since = CASE WHEN $4::boolean THEN NULL ELSE i.off_chain_since END
-  FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
- WHERE i.leaf = k.leaf AND i.txid = k.txid`
+ WHERE i.leaf = $1::smallint
+   AND i.txid = ANY($2::bytea[])`
 
 // unstampSQL removes one block from a transaction's membership and puts it back in the
 // mempool set with a FRESH clock. Array-parameterised for the same reason stampSQL is.
@@ -65,6 +69,9 @@ UPDATE tx_ident i
 // the fact that decides whether these two columns are one concept or two. A transaction
 // created at height 100 and un-mined while the tip is 5,000 must wait from 5,000, or the
 // preservation pass fires on it immediately. Both reference stores do the same.
+//
+// One leaf group at a time, the same key shape stampSQL takes and for the same reason. See
+// leafGroups.
 const unstampSQL = `
 UPDATE tx_ident i
    SET membership = coalesce((
@@ -73,8 +80,8 @@ UPDATE tx_ident i
             WHERE substring(i.membership from g * 12 + 1 for 12) = $3::bytea
        ), i.membership),
        off_chain_since = $4::int
-  FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
- WHERE i.leaf = k.leaf AND i.txid = k.txid`
+ WHERE i.leaf = $1::smallint
+   AND i.txid = ANY($2::bytea[])`
 
 // provePresentSQL is the SECOND statement, and splitting it out is not tidiness.
 //
@@ -136,23 +143,16 @@ ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
 // mined_height, block_id and subtree_idx come from the parameters rather than from decoding the
 // membership bytes, because the equality above has already proved the two agree.
 //
-// THE KEYS ARE TWO ARRAY QUALS, NOT A JOIN AGAINST unnest, and that is the difference between
-// one index descent per key and a read of the whole mempool. Written the obvious way --
-// `DELETE FROM tx_ident i USING unnest($1, $2) AS k WHERE i.leaf = k.leaf AND i.txid = k.txid`
-// -- the planner is free to hash-join the keys against the table, and at 40,000 identity rows
-// it does: measured on this schema at 500 keys, the plan carried a Seq Scan on all eight leaf
-// partitions and built a 40,000-row hash to answer 500 keys, 8.7 ms of the statement's 12.4.
-// The array form plans as a bitmap index scan per surviving partition, 0.6 ms at the same
-// width, and its cost is a function of the batch rather than of the mempool. The LATERAL
-// fence the read statements use is not available here: a DELETE cannot laterally reference
-// its own target.
+// THE LEAF IS A SCALAR AND THE TXIDS AN ARRAY, so this runs once per leaf group, and that is
+// the difference between one index descent per key and a read of the whole mempool. See
+// leafGroups for the three key shapes measured and the numbers. The LATERAL fence the read
+// statements use is not available here: a DELETE cannot laterally reference its own target.
 //
 // txid = ANY is EXACT despite dropping the pairing. txid is the full 32 bytes and tx_ident_ck
 // makes leaf a function of it, so no row can satisfy the txid qual under a leaf other than its
-// own. The leaf array is therefore redundant as a filter and load-bearing as an access path:
-// it is what prunes partitions and what makes the primary key usable, since txid is its second
-// column. It must list the leaf of every txid in the batch, which is why both come from the
-// same loop.
+// own. The leaf is therefore redundant as a filter and load-bearing as an access path: it is
+// what prunes to the one partition and what makes the primary key usable, since txid is its
+// second column.
 //
 // It RETURNS the txids it moved, and that is what keeps the postcondition cheap. provePresentSQL
 // reads tx_ident only, so without this every row the move just settled would be reported absent
@@ -164,7 +164,7 @@ ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
 const moveToMinedSQL = `
 WITH moved AS (
     DELETE FROM tx_ident i
-     WHERE i.leaf = ANY($1::smallint[])
+     WHERE i.leaf = $1::smallint
        AND i.txid = ANY($2::bytea[])
        AND i.membership = $6::bytea
        AND i.conflicting_children IS NULL
@@ -181,18 +181,149 @@ settled AS (
 )
 SELECT txid FROM moved`
 
-// deleteMinedRowSQL removes one block's membership row for a set of transactions.
+// moveBackSQL is the un-mine for a transaction whose stamp lives in the membership table: it
+// deletes this block's row and puts the transaction back in the identity table with the
+// unconfirmed marker at the CURRENT tip and any OTHER blocks it still names packed as fork
+// triples. It is the exact reverse of moveToMinedSQL, and the reverse of moveToMinedSQL is
+// what makes the two tables one store rather than two.
 //
-// This is the UnsetMined counterpart to appendMinedSQL, for a transaction whose mined stamp
-// lives only in tx_mined (no identity row for unstampSQL to touch). A reorg below the
-// checkpoint cannot reach here, and at the tip stage 2 owns un-mining a coin, so this is a
-// best-effort cleanup: absence is tolerated, exactly as the interface allows for UnsetMined.
-// mined_height is a literal, not part of the unnest, so partition pruning still confines the
-// delete to the one window this block belongs to.
-const deleteMinedRowSQL = `
-DELETE FROM tx_mined m
- USING unnest($1::bytea[]) AS k(txid)
- WHERE m.txid = k.txid AND m.mined_height = $2 AND m.block_id = $3`
+// `others` MUST exclude the deleted key explicitly, and that is a PostgreSQL rule rather than
+// belt and braces: a data-modifying CTE's effects are NOT visible to its sibling CTEs, which
+// all see the snapshot the statement began with. A sibling that simply re-read tx_mined would
+// therefore still see the row `gone` is deleting and pack the un-mined block straight back in
+// as a fork triple, so the transaction would claim a block it was just told to forget.
+//
+// The keys reach the DELETE as `txid = ANY(...)`, not as a join against unnest, and the reason
+// is the one moveToMinedSQL gives: tx_mined's primary key LEADS with txid, so the array form is
+// one index descent per key per live window, while the join form lets the planner hash the keys
+// against a window and read it whole -- measured on this schema at 500 keys against a 60,000-row
+// window, a Seq Scan and 7 ms of the statement's 13. The membership rows that SURVIVE are read
+// through a LATERAL with an OFFSET 0 fence instead, for the reason minedByTxidSQL and
+// appendMinedSQL need one, because there the keys are on the outside of a join.
+//
+// The clock is $4, the store's CURRENT height, not the transaction's created_height. See
+// unstampSQL: a transaction created at 100 and un-mined at a tip of 5,000 must wait from
+// 5,000, or the preservation pass fires on it immediately.
+//
+// The fee comes back with the row. tx_mined carries it precisely so that this move can return
+// it, because the transaction is handed to block assembly, which prices it.
+//
+// The COINS are reset by a separate statement in the same transaction, resetCoinsSQL, and not
+// by a fourth CTE here. A CTE cannot take the packed-key range as a plain array value -- it
+// would have to compute the bounds from the deleted rows -- and the planner then costs the
+// range as a join filter and reads all eight coin partitions instead: measured on this schema
+// at 400,000 coins, a Seq Scan on every partition and 98 ms of the statement's 108.
+const moveBackSQL = `
+WITH gone AS (
+    DELETE FROM tx_mined m
+     WHERE m.txid = ANY($1::bytea[]) AND m.mined_height = $2::int AND m.block_id = $3::int
+    RETURNING m.txid, m.created_height, m.size_in_bytes, m.fee, m.tx_inpoints,
+              m.locktime, m.created_at, m.flags
+),
+keys AS (
+    SELECT DISTINCT txid FROM gone
+),
+others AS (
+    SELECT k.txid, o.membership
+      FROM keys k
+     CROSS JOIN LATERAL (
+       SELECT string_agg(mh_triple(m.block_id, m.mined_height, m.subtree_idx),
+                         ''::bytea ORDER BY m.seq) AS membership
+         FROM tx_mined m
+        WHERE m.txid = k.txid
+          AND NOT (m.mined_height = $2::int AND m.block_id = $3::int)
+       OFFSET 0
+     ) AS o
+),
+back AS (
+    INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
+                          fee, size_in_bytes, tx_inpoints, locktime, created_at, flags)
+    SELECT (get_byte(g.txid, 0) & 7)::smallint, g.txid, g.created_height, $4::int, o.membership,
+           g.fee, g.size_in_bytes, g.tx_inpoints, g.locktime, g.created_at, g.flags
+      FROM (SELECT DISTINCT ON (txid) * FROM gone ORDER BY txid) g
+      LEFT JOIN others o ON o.txid = g.txid
+    ON CONFLICT (leaf, txid) DO NOTHING
+)
+SELECT txid FROM keys`
+
+// moveAllBackSQL is the un-mine that carries no block: every membership row of the
+// transaction comes back, and the blocks they named are remembered as fork triples.
+//
+// That is the one difference from moveBackSQL, and it follows from what the caller knows.
+// SetMinedMulti names a block, so the block it names is DROPPED from the membership and the
+// others are kept. MarkTransactionsOnLongestChain names none -- it says only that the chain
+// the node now believes in does not contain this transaction -- so it cannot drop any single
+// block, and all of them are kept as fork triples for a later stamp or un-mine to resolve.
+// There is no sibling-visibility trap here for the same reason: nothing survives the delete,
+// so the membership is packed from `gone` itself rather than from a second read.
+//
+// The coins are reset by resetCoinsSQL here too, with no block id, because none was given.
+const moveAllBackSQL = `
+WITH gone AS (
+    DELETE FROM tx_mined m
+     WHERE m.txid = ANY($1::bytea[])
+    RETURNING m.txid, m.mined_height, m.block_id, m.subtree_idx, m.seq, m.created_height,
+              m.size_in_bytes, m.fee, m.tx_inpoints, m.locktime, m.created_at, m.flags
+),
+keys AS (
+    SELECT DISTINCT txid FROM gone
+),
+packed AS (
+    SELECT txid,
+           string_agg(mh_triple(block_id, mined_height, subtree_idx),
+                      ''::bytea ORDER BY seq) AS membership
+      FROM gone
+     GROUP BY txid
+),
+back AS (
+    INSERT INTO tx_ident (leaf, txid, created_height, off_chain_since, membership,
+                          fee, size_in_bytes, tx_inpoints, locktime, created_at, flags)
+    SELECT (get_byte(g.txid, 0) & 7)::smallint, g.txid, g.created_height, $2::int, p.membership,
+           g.fee, g.size_in_bytes, g.tx_inpoints, g.locktime, g.created_at, g.flags
+      FROM (SELECT DISTINCT ON (txid) * FROM gone ORDER BY txid, seq) g
+      JOIN packed p ON p.txid = g.txid
+    ON CONFLICT (leaf, txid) DO NOTHING
+)
+SELECT txid FROM keys`
+
+// resetCoinsSQL puts a transaction's live coins back to the unconfirmed sentinel.
+//
+// The packed-key range comes in as PLAIN ARRAY VALUES built by liveCoinArgs and is used inside a
+// LATERAL with an OFFSET 0 fence, and BOTH halves of that are load-bearing. The coin table
+// carries one index, on the packed key, and the schema says in its own words that a query
+// filtering on txid without a packed-key range bound is a review failure. Bounds computed
+// inside the statement from a CTE's rows satisfy the letter of that rule and not its point:
+// the planner costs them as a join filter and reads every coin partition whole. Bounds passed
+// as arrays but joined directly are no better -- measured at 500 keys, a Hash Join against a
+// Seq Scan of all eight partitions -- because an UPDATE cannot laterally reference its own
+// target, which is the fence every other by-transaction coin read in this store relies on. So
+// the fenced read runs first, in a CTE, and the UPDATE then matches on the exact (leaf, ukey)
+// it returns.
+//
+// mined_height > 0 is what leaves a coin already at the sentinel untouched. $5 is the block
+// being un-mined, or NULL for an un-mine that names no block, in which case every stamped coin
+// of the transaction is reset. Testing block_id against a parameter is sound here where testing
+// it for zero would not be: block id 0 is a legitimate id, and it is mined_height that carries
+// the "unconfirmed" fact.
+//
+// A coin that has been spent has no row and needs none: its restore resolves the block facts
+// from membership at restore time.
+const resetCoinsSQL = `
+WITH hit AS (
+    SELECT c.leaf, c.ukey
+      FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[]) AS k(leaf, txid, lo, hi)
+     CROSS JOIN LATERAL (
+       SELECT u.leaf, u.ukey
+         FROM utxo u
+        WHERE u.leaf = k.leaf AND u.ukey >= k.lo AND u.ukey <= k.hi AND u.txid = k.txid
+          AND u.mined_height > 0
+          AND ($5::int IS NULL OR u.block_id = $5::int)
+       OFFSET 0
+     ) AS c
+)
+UPDATE utxo u SET mined_height = 0, block_id = 0
+  FROM hit
+ WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey`
 
 // SetMinedMulti marks transactions as mined in the block described by info.
 //
@@ -239,7 +370,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 
 	switch {
 	case info.UnsetMined:
-		out, err = s.unstampOnly(ctx, leaves, txids, entry, info)
+		out, err = s.unstampAndMoveBack(ctx, leaves, txids, entry, info)
 	case info.OnLongestChain:
 		out, err = s.stampAndMove(ctx, leaves, txids, entry, info)
 	default:
@@ -337,8 +468,12 @@ func (s *Store) stampAndMove(ctx context.Context, leaves []int16, txids [][]byte
 func (s *Store) stampMoveAndAppend(ctx context.Context, dbTx pgx.Tx, leaves []int16,
 	txids [][]byte, entry []byte, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32,
 	[][]byte, error) {
-	if _, err := dbTx.Exec(ctx, stampSQL, leaves, txids, entry, true); err != nil {
-		return nil, nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
+	groups := leafGroups(txids)
+
+	for _, g := range groups {
+		if _, err := dbTx.Exec(ctx, stampSQL, g.leaf, g.txids, entry, true); err != nil {
+			return nil, nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
+		}
 	}
 
 	out := make(map[chainhash.Hash][]uint32, len(txids))
@@ -346,14 +481,16 @@ func (s *Store) stampMoveAndAppend(ctx context.Context, dbTx pgx.Tx, leaves []in
 	// Every row the move settled named exactly one block -- this one, which is what
 	// moveToMinedSQL's equality against the stamped triple proves -- so its answer is known
 	// without reading the membership table back.
-	moved, err := queryTxids(ctx, dbTx, moveToMinedSQL, distinctLeaves(txids), txids,
-		int32(info.BlockHeight), int32(info.BlockID), int32(info.SubtreeIdx), entry) //nolint:gosec // heights and ids fit
-	if err != nil {
-		return nil, nil, errors.NewStorageError("[utxoset][SetMinedMulti] move to membership", err)
-	}
+	for _, g := range groups {
+		moved, err := queryTxids(ctx, dbTx, moveToMinedSQL, g.leaf, g.txids,
+			int32(info.BlockHeight), int32(info.BlockID), int32(info.SubtreeIdx), entry) //nolint:gosec // heights and ids fit
+		if err != nil {
+			return nil, nil, errors.NewStorageError("[utxoset][SetMinedMulti] move to membership", err)
+		}
 
-	for _, h := range moved {
-		out[h] = []uint32{info.BlockID}
+		for _, h := range moved {
+			out[h] = []uint32{info.BlockID}
+		}
 	}
 
 	if err := provePresentInto(ctx, dbTx, leaves, txids, out); err != nil {
@@ -388,8 +525,10 @@ func (s *Store) stampMoveAndAppend(ctx context.Context, dbTx pgx.Tx, leaves []in
 // reason stampAndMove needs one.
 func (s *Store) forkStamp(ctx context.Context, leaves []int16, txids [][]byte, entry []byte,
 	info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
-	if _, err := s.pool.Exec(ctx, stampSQL, leaves, txids, entry, false); err != nil {
-		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
+	for _, g := range leafGroups(txids) {
+		if _, err := s.pool.Exec(ctx, stampSQL, g.leaf, g.txids, entry, false); err != nil {
+			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] stamp", err)
+		}
 	}
 
 	out := make(map[chainhash.Hash][]uint32, len(txids))
@@ -423,37 +562,83 @@ func (s *Store) forkStamp(ctx context.Context, leaves []int16, txids [][]byte, e
 	return out, nil
 }
 
-// unstampOnly takes one block off every listed identity row and puts the row back in the
-// mempool set with a fresh clock.
+// unstampAndMoveBack takes one block back off every listed transaction, wherever its stamp
+// lives: off the membership column for a transaction still in the mempool table, and out of
+// the membership table -- back into the mempool table -- for one the longest-chain stamp had
+// settled.
 //
-// A transaction whose stamp lives only in the membership table has no identity row for the
-// unstamp to touch, so the residue gets a best-effort delete of that block's row. Absence is
-// tolerated, exactly as the interface allows for an un-mine.
-func (s *Store) unstampOnly(ctx context.Context, leaves []int16, txids [][]byte, entry []byte,
-	info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+// The two statements are ONE TRANSACTION, and for the same reason stampAndMove's are: the read
+// path stops at an identity hit, so between a committed delete from tx_mined and a committed
+// insert into tx_ident a concurrent reader would find the transaction in neither table and
+// report it missing, which makes the validator reject every child of the parent being
+// un-mined. Inside one transaction the two states are the only two a reader can see.
+//
+// No ensureTxMinedPartition, and that is not an omission. Move-back only DELETES from tx_mined;
+// the window it deletes from either exists, or the block was never stamped at that height and
+// there is nothing to un-mine. Creating a window here would be actively wrong -- the floor
+// exists to stop a retired window being recreated.
+//
+// Both statements run over the WHOLE key set rather than a residue split, because each is
+// already confined to the rows the other cannot reach: unstampSQL touches only identity rows,
+// and moveBackSQL only membership rows for this exact (height, block id).
+func (s *Store) unstampAndMoveBack(ctx context.Context, leaves []int16, txids [][]byte,
+	entry []byte, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	// A fresh clock from the current tip. See unstampSQL.
 	height := int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32
 
-	if _, err := s.pool.Exec(ctx, unstampSQL, leaves, txids, entry, height); err != nil {
-		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] unstamp", err)
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] begin", err)
 	}
 
+	for _, g := range leafGroups(txids) {
+		if _, err := dbTx.Exec(ctx, unstampSQL, g.leaf, g.txids, entry, height); err != nil {
+			_ = dbTx.Rollback(ctx)
+
+			return nil, errors.NewStorageError("[utxoset][SetMinedMulti] unstamp", err)
+		}
+	}
+
+	if _, err := dbTx.Exec(ctx, moveBackSQL, txids, int32(info.BlockHeight),
+		int32(info.BlockID), height); err != nil { //nolint:gosec // heights and ids fit
+		_ = dbTx.Rollback(ctx)
+
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] move back to the mempool", err)
+	}
+
+	blockID := int32(info.BlockID) //nolint:gosec // a block id fits int32
+
+	if err := resetCoins(ctx, dbTx, txids, &blockID); err != nil {
+		_ = dbTx.Rollback(ctx)
+
+		return nil, err
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] commit un-mine", err)
+	}
+
+	// Read after the commit, so a transaction the move-back returned to the mempool table
+	// answers from the row it now has. A hash in neither table is answered by nobody, which
+	// the un-mine tolerates.
 	out := make(map[chainhash.Hash][]uint32, len(txids))
 	if err := provePresentInto(ctx, s.pool, leaves, txids, out); err != nil {
 		return nil, err
 	}
 
-	residue := absentTxids(txids, out)
-	if len(residue) == 0 {
-		return out, nil
-	}
-
-	if _, err := s.pool.Exec(ctx, deleteMinedRowSQL, residue,
-		int32(info.BlockHeight), int32(info.BlockID)); err != nil { //nolint:gosec // heights and ids fit
-		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] unmine membership", err)
-	}
-
 	return out, nil
+}
+
+// resetCoins puts the listed transactions' stamped coins back to the unconfirmed sentinel.
+// blockID confines it to the coins of one block; nil resets every stamped coin they hold.
+func resetCoins(ctx context.Context, q querier, txids [][]byte, blockID *int32) error {
+	leaves, ids, los, his := liveCoinArgs(txids)
+
+	if _, err := q.Exec(ctx, resetCoinsSQL, leaves, ids, los, his, blockID); err != nil {
+		return errors.NewStorageError("[utxoset] reset coins to the unconfirmed sentinel", err)
+	}
+
+	return nil
 }
 
 // provePresentInto records, for every listed transaction that still holds an identity row,
@@ -537,25 +722,52 @@ func queryTxids(ctx context.Context, q querier, stmt string, args ...any) ([]cha
 	return out, rows.Err()
 }
 
-// distinctLeaves is the set of leaf partitions a batch of transaction ids touches.
-//
-// moveToMinedSQL takes it rather than the per-key leaf array stampSQL takes, because there it
-// is a partition list and not a key: eight values at most, and a batch smaller than eight
-// prunes the partitions it cannot contain. Passing the per-key array would work and would
-// restate one leaf value a thousand times inside the plan.
-func distinctLeaves(txids [][]byte) []int16 {
-	var seen [NumLeaves]bool
+// leafBatch is one leaf partition and the transactions of a batch that route to it.
+type leafBatch struct {
+	leaf  int16
+	txids [][]byte
+}
 
-	out := make([]int16, 0, NumLeaves)
+// leafGroups splits a batch of transaction ids by the partition each routes to, so that every
+// statement keyed on (leaf, txid) can run with the LEAF AS A SCALAR and the txids as an array.
+//
+// That key shape is not a style choice, it is the only one of the three that keeps the cost a
+// function of the batch. Measured on this schema, postgres 16, 500 keys spread over all eight
+// partitions, EXPLAIN (ANALYZE, BUFFERS), best of eight runs down one connection:
+//
+//	                            40,000 mempool rows      400,000 mempool rows
+//	leaf = ANY(...), txid = ANY  5.0 ms, Seq Scan x8      41 ms, Seq Scan x8
+//	join against unnest(l[],t[]) 9.3 ms, Hash Join + Seq   2.9 ms, index probes
+//	leaf scalar, txid = ANY      0.33 ms per group         0.4 ms per group
+//
+// Both array forms read the mempool. leaf = ANY puts an array on the primary key's LEADING
+// column, which makes the planner cost eight times five hundred index descents instead of five
+// hundred, so it prefers a sequential scan and stays with it as the table grows -- 41 ms at
+// 400,000 rows, where the index path it rejected runs in 15. The join form's plan is worse
+// still in that it FLIPS: a hash of the whole table at mempool sizes, index probes only once
+// the table is far larger than a mempool ever is, so its measured cost depends on statistics
+// that move. With the leaf a scalar the partition is fixed, the array sits on the key's second
+// column, and the plan is an index scan at both sizes.
+//
+// The groups come back in ASCENDING LEAF ORDER, which is a lock order rather than tidiness:
+// every path that writes a batch of identity rows takes their row locks in the same sequence,
+// so two concurrent batches sharing transactions cannot deadlock against each other.
+func leafGroups(txids [][]byte) []leafBatch {
+	var byLeaf [NumLeaves][][]byte
 
 	for _, txid := range txids {
 		leaf := LeafFor(txid)
-		if seen[leaf] {
+		byLeaf[leaf] = append(byLeaf[leaf], txid)
+	}
+
+	out := make([]leafBatch, 0, NumLeaves)
+
+	for leaf := range byLeaf {
+		if len(byLeaf[leaf]) == 0 {
 			continue
 		}
 
-		seen[leaf] = true
-		out = append(out, leaf)
+		out = append(out, leafBatch{leaf: int16(leaf), txids: byLeaf[leaf]}) //nolint:gosec // a leaf index fits
 	}
 
 	return out
