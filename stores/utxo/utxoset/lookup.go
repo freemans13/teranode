@@ -62,7 +62,7 @@ SELECT i.txid, i.created_height, i.off_chain_since, i.membership, i.fee, i.size_
 // inner ORDER BY walks the primary key in order; the outer one is what actually guarantees the
 // grouping the reader relies on, because the LEFT JOIN to the body may reorder rows.
 const minedByTxidSQL = `
-SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.created_height, m.size_in_bytes,
+SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.size_in_bytes,
        m.tx_inpoints, m.locktime, m.created_at, m.flags, b.raw_tx
   FROM unnest($1::bytea[]) AS k(txid)
  CROSS JOIN LATERAL (
@@ -82,7 +82,7 @@ SELECT k.txid, m.mined_height, m.block_id, m.subtree_idx, m.created_height, m.si
 // behind each half of that fence: without the range bound the planner reads every partition,
 // and without the ORDER BY it materialises the whole range before the LIMIT can stop it.
 const coinFactsSQL = `
-SELECT k.txid, hit.mined_height, hit.block_id, hit.created_height, hit.flags, b.raw_tx
+SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
   FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[]) AS k(leaf, txid, lo, hi)
  CROSS JOIN LATERAL (
    SELECT u.mined_height, u.block_id, u.created_height, u.flags
@@ -92,15 +92,61 @@ SELECT k.txid, hit.mined_height, hit.block_id, hit.created_height, hit.flags, b.
  ) AS hit
   LEFT JOIN tx_body b ON b.created_height = hit.created_height AND b.txid = k.txid`
 
-// lookupMany resolves a set of transactions in the read order. Misses are absent from the map.
+// lookupResult is one read of the store: what it found, and what it could not make sense of.
+//
+// The two maps are separate because a transaction the store HOLDS but cannot decode is not the
+// same answer as one it does not hold, and the difference decides what the caller does. A miss
+// makes the validator reject a child for a missing parent, which is recoverable and correct. A
+// corrupt row is a storage fault on that one transaction, and it belongs on that transaction's
+// own entry rather than on the whole batch: BatchDecorate's contract is that a transaction the
+// store cannot serve is reported on ITS OWN entry, so one unreadable tx_inpoints must not
+// reject every transaction that happened to travel with it.
+type lookupResult struct {
+	found  map[chainhash.Hash]*meta.Data
+	failed map[chainhash.Hash]error
+}
+
+func newLookupResult(n int) lookupResult {
+	return lookupResult{found: make(map[chainhash.Hash]*meta.Data, n), failed: nil}
+}
+
+// fail records a per-transaction fault. The hash counts as RESOLVED from here on, which is the
+// point: a corrupt identity row must not fall through to the membership table or the coin, or
+// the store would answer from a coin for a transaction whose real record it just refused to
+// read, silently substituting a thinner answer for a fault.
+func (r *lookupResult) fail(h chainhash.Hash, err error) {
+	if r.failed == nil {
+		r.failed = map[chainhash.Hash]error{}
+	}
+
+	r.failed[h] = err
+}
+
+// resolved reports whether any step has already answered for this hash, either way.
+func (r *lookupResult) resolved(h chainhash.Hash) bool {
+	if _, ok := r.found[h]; ok {
+		return true
+	}
+
+	_, ok := r.failed[h]
+
+	return ok
+}
+
+// lookupMany resolves a set of transactions in the read order. Misses are absent from both
+// maps; a transaction whose stored row will not decode lands in failed rather than found.
 //
 // Each step asks only about the hashes the steps before it could not answer, so a batch of
 // ordinary mined parents costs one membership probe each and never touches the coin table,
 // and a batch of mempool parents never leaves the identity table.
-func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash) (map[chainhash.Hash]*meta.Data, error) {
-	out := make(map[chainhash.Hash]*meta.Data, len(hashes))
+//
+// The returned error is for faults that are NOT per-transaction: a dead connection, a syntax
+// error, a partition that vanished mid-read. Those really do fail every entry, because nothing
+// was answered.
+func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash) (lookupResult, error) {
+	res := newLookupResult(len(hashes))
 	if len(hashes) == 0 {
-		return out, nil
+		return res, nil
 	}
 
 	// Step 1: the identity table (mempool and fork-limbo rows).
@@ -124,35 +170,43 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash) (map[ch
 		txids = append(txids, hashes[i][:])
 	}
 
-	if err := s.readIdentRows(ctx, leaves, txids, out); err != nil {
-		return nil, err
+	if err := s.readIdentRows(ctx, leaves, txids, &res); err != nil {
+		return lookupResult{}, err
 	}
 
-	rest := missing(uniq, out)
+	rest := stillMissing(uniq, &res)
 	if len(rest) == 0 {
-		return out, nil
+		return res, nil
 	}
 
 	// Step 2: membership by transaction id.
-	if err := s.readMinedRows(ctx, rest, out); err != nil {
-		return nil, err
+	if err := s.readMinedInto(ctx, rest, &res); err != nil {
+		return lookupResult{}, err
 	}
 
-	rest = missing(rest, out)
+	rest = stillMissing(rest, &res)
 	if len(rest) == 0 {
-		return out, nil
+		return res, nil
 	}
 
 	// Step 3: the coin.
-	return out, s.readCoinFacts(ctx, rest, out)
+	if err := s.readCoinFacts(ctx, rest, &res); err != nil {
+		return lookupResult{}, err
+	}
+
+	return res, nil
 }
 
-// missing returns the hashes no step so far has answered.
-func missing(hashes []chainhash.Hash, have map[chainhash.Hash]*meta.Data) []chainhash.Hash {
+// stillMissing returns the hashes no step so far has answered.
+//
+// Named for the shadowing it avoids: MarkTransactionsOnLongestChain has a []error local called
+// missing, and two different things called the same name in one package is how a reader ends
+// up reasoning about the wrong one.
+func stillMissing(hashes []chainhash.Hash, res *lookupResult) []chainhash.Hash {
 	var rest []chainhash.Hash
 
 	for _, h := range hashes {
-		if _, ok := have[h]; !ok {
+		if !res.resolved(h) {
 			rest = append(rest, h)
 		}
 	}
@@ -163,7 +217,7 @@ func missing(hashes []chainhash.Hash, have map[chainhash.Hash]*meta.Data) []chai
 // readIdentRows fills in every transaction that still holds an identity row: a mempool
 // arrival, or one un-mined by a reorg and waiting again.
 func (s *Store) readIdentRows(ctx context.Context, leaves []int16, txids [][]byte,
-	out map[chainhash.Hash]*meta.Data) error {
+	res *lookupResult) error {
 	rows, err := s.pool.Query(ctx, identByTxidSQL, leaves, txids)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][lookup] identity rows", err)
@@ -187,12 +241,15 @@ func (s *Store) readIdentRows(ctx context.Context, leaves []int16, txids [][]byt
 
 		copy(h[:], txid)
 
+		// A row that will not decode is this transaction's fault alone. See lookupResult.
 		data, derr := r.toMeta(&h)
 		if derr != nil {
-			return derr
+			res.fail(h, derr)
+
+			continue
 		}
 
-		out[h] = data
+		res.found[h] = data
 	}
 
 	if err := rows.Err(); err != nil {
@@ -209,8 +266,8 @@ func (s *Store) readIdentRows(ctx context.Context, leaves []int16, txids [][]byt
 // SubtreeIdxs. The scalars that describe the transaction rather than a block come off the
 // FIRST row; the rows are written by one statement per block application, so they agree, and
 // taking the first is the reading that does not depend on how many blocks claim it.
-func (s *Store) readMinedRows(ctx context.Context, hashes []chainhash.Hash,
-	out map[chainhash.Hash]*meta.Data) error {
+func (s *Store) readMinedInto(ctx context.Context, hashes []chainhash.Hash,
+	res *lookupResult) error {
 	txids := make([][]byte, 0, len(hashes))
 	for i := range hashes {
 		txids = append(txids, hashes[i][:])
@@ -225,20 +282,19 @@ func (s *Store) readMinedRows(ctx context.Context, hashes []chainhash.Hash,
 
 	for rows.Next() {
 		var (
-			txid          []byte
-			minedHeight   int32
-			blockID       int32
-			subtreeIdx    int32
-			createdHeight int32
-			sizeInBytes   *int32
-			txInpoints    []byte
-			locktime      *int32
-			createdAt     *int64
-			flags         int16
-			rawTx         []byte
+			txid        []byte
+			minedHeight int32
+			blockID     int32
+			subtreeIdx  int32
+			sizeInBytes *int32
+			txInpoints  []byte
+			locktime    *int32
+			createdAt   *int64
+			flags       int16
+			rawTx       []byte
 		)
 
-		if err := rows.Scan(&txid, &minedHeight, &blockID, &subtreeIdx, &createdHeight,
+		if err := rows.Scan(&txid, &minedHeight, &blockID, &subtreeIdx,
 			&sizeInBytes, &txInpoints, &locktime, &createdAt, &flags, &rawTx); err != nil {
 			return errors.NewStorageError("[utxoset][lookup] membership scan", err)
 		}
@@ -247,7 +303,14 @@ func (s *Store) readMinedRows(ctx context.Context, hashes []chainhash.Hash,
 
 		copy(h[:], txid)
 
-		data := out[h]
+		// A row this loop already refused is not retried on its later rows: the first fault
+		// is the answer for the transaction, and appending a second block to a record that
+		// was never built would panic on a nil map entry.
+		if _, bad := res.failed[h]; bad {
+			continue
+		}
+
+		data := res.found[h]
 		if data == nil {
 			data = &meta.Data{
 				IsCoinbase:  flags&FlagCoinbase != 0,
@@ -270,13 +333,15 @@ func (s *Store) readMinedRows(ctx context.Context, hashes []chainhash.Hash,
 			if len(txInpoints) > 0 {
 				ip, ierr := subtree.NewTxInpointsFromBytes(txInpoints)
 				if ierr != nil {
-					return errors.NewStorageError("[utxoset][lookup] inpoints %s", h.String(), ierr)
+					res.fail(h, errors.NewStorageError("[utxoset][lookup] inpoints %s", h.String(), ierr))
+
+					continue
 				}
 
 				data.TxInpoints = ip
 			}
 
-			out[h] = data
+			res.found[h] = data
 		}
 
 		data.BlockIDs = append(data.BlockIDs, uint32(blockID))             //nolint:gosec // a block id is never negative
@@ -288,7 +353,10 @@ func (s *Store) readMinedRows(ctx context.Context, hashes []chainhash.Hash,
 		if data.Tx == nil && len(rawTx) > 0 {
 			tx, terr := bt.NewTxFromBytes(rawTx)
 			if terr != nil {
-				return errors.NewStorageError("[utxoset][lookup] decode body %s", h.String(), terr)
+				delete(res.found, h)
+				res.fail(h, errors.NewStorageError("[utxoset][lookup] decode body %s", h.String(), terr))
+
+				continue
 			}
 
 			data.Tx = tx
@@ -302,6 +370,29 @@ func (s *Store) readMinedRows(ctx context.Context, hashes []chainhash.Hash,
 	return nil
 }
 
+// readMinedRows is the membership step for a caller that holds a plain map and has no
+// per-transaction error channel to report a fault to.
+//
+// minedIDsByTxid is that caller: it wants the block ids tx_mined records, so that the ids
+// SetMinedMulti hands back and the ids an ordinary Get reports cannot disagree about what
+// insertion order means. A row that will not decode fails ITS call rather than being reported
+// as a transaction claiming no blocks, which is the conservative reading there: refusing the
+// stamp is recoverable, quietly stamping nothing is not.
+func (s *Store) readMinedRows(ctx context.Context, hashes []chainhash.Hash,
+	out map[chainhash.Hash]*meta.Data) error {
+	res := lookupResult{found: out}
+
+	if err := s.readMinedInto(ctx, hashes, &res); err != nil {
+		return err
+	}
+
+	for _, err := range res.failed {
+		return err
+	}
+
+	return nil
+}
+
 // readCoinFacts is the last step: a transaction nothing else knows about, answered from one of
 // its own live coins.
 //
@@ -310,7 +401,7 @@ func (s *Store) readMinedRows(ctx context.Context, hashes []chainhash.Hash,
 // can say about a parent whose block it no longer holds, and all the validator needs to check
 // a child's inputs.
 func (s *Store) readCoinFacts(ctx context.Context, hashes []chainhash.Hash,
-	out map[chainhash.Hash]*meta.Data) error {
+	res *lookupResult) error {
 	txids := make([][]byte, 0, len(hashes))
 	for i := range hashes {
 		txids = append(txids, hashes[i][:])
@@ -327,16 +418,14 @@ func (s *Store) readCoinFacts(ctx context.Context, hashes []chainhash.Hash,
 
 	for rows.Next() {
 		var (
-			txid          []byte
-			minedHeight   int32
-			blockID       int32
-			createdHeight int32
-			flags         int16
-			rawTx         []byte
+			txid        []byte
+			minedHeight int32
+			blockID     int32
+			flags       int16
+			rawTx       []byte
 		)
 
-		if err := rows.Scan(&txid, &minedHeight, &blockID, &createdHeight, &flags,
-			&rawTx); err != nil {
+		if err := rows.Scan(&txid, &minedHeight, &blockID, &flags, &rawTx); err != nil {
 			return errors.NewStorageError("[utxoset][lookup] coin facts scan", err)
 		}
 
@@ -362,13 +451,15 @@ func (s *Store) readCoinFacts(ctx context.Context, hashes []chainhash.Hash,
 		if len(rawTx) > 0 {
 			tx, terr := bt.NewTxFromBytes(rawTx)
 			if terr != nil {
-				return errors.NewStorageError("[utxoset][lookup] decode body %s", h.String(), terr)
+				res.fail(h, errors.NewStorageError("[utxoset][lookup] decode body %s", h.String(), terr))
+
+				continue
 			}
 
 			data.Tx = tx
 		}
 
-		out[h] = data
+		res.found[h] = data
 	}
 
 	if err := rows.Err(); err != nil {

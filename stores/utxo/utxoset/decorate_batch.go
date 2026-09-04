@@ -31,7 +31,7 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 		hashes = append(hashes, it.Hash)
 	}
 
-	found, err := s.lookupMany(ctx, hashes)
+	res, err := s.lookupMany(ctx, hashes)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][BatchDecorate]", err)
 	}
@@ -42,7 +42,15 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 	given := make(map[chainhash.Hash]struct{}, len(items))
 
 	for _, it := range items {
-		data, ok := found[it.Hash]
+		// A row that would not decode is reported on its own entry, the same way a miss is.
+		// That is this call's whole contract: one corrupt tx_inpoints must not reject every
+		// transaction that happened to be resolved beside it.
+		if derr, bad := res.failed[it.Hash]; bad {
+			it.Err = derr
+			continue
+		}
+
+		data, ok := res.found[it.Hash]
 		if !ok {
 			it.Err = errors.NewTxNotFoundError("[utxoset][BatchDecorate] %s", it.Hash.String())
 			continue

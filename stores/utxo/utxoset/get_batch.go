@@ -48,7 +48,7 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 		hashes[i] = it.hash
 	}
 
-	found, err := s.lookupMany(ctx, hashes)
+	res, err := s.lookupMany(ctx, hashes)
 	if err != nil {
 		for _, it := range batch {
 			it.done <- getResult{err: err}
@@ -66,7 +66,14 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 	given := make(map[chainhash.Hash]struct{}, len(batch))
 
 	for _, it := range batch {
-		data, ok := found[it.hash]
+		// A row that would not decode fails its OWN read, not the batch's, exactly as a miss
+		// does. See lookupResult.
+		if derr, bad := res.failed[it.hash]; bad {
+			it.done <- getResult{err: derr}
+			continue
+		}
+
+		data, ok := res.found[it.hash]
 		if !ok {
 			it.done <- getResult{err: errors.NewTxNotFoundError("[utxoset][Get] %s", it.hash.String())}
 			continue

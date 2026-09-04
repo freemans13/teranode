@@ -86,12 +86,19 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fie
 // membership -> coin is a correctness rule (see lookup.go), and a second copy of it here is
 // a defect waiting for one copy to be fixed and the other forgotten.
 func (s *Store) getDirect(ctx context.Context, hash *chainhash.Hash) (*meta.Data, error) {
-	found, err := s.lookupMany(ctx, []chainhash.Hash{*hash})
+	res, err := s.lookupMany(ctx, []chainhash.Hash{*hash})
 	if err != nil {
 		return nil, err
 	}
 
-	data, ok := found[*hash]
+	// A row the store holds but cannot decode is this transaction's own storage fault, and
+	// distinct from not holding it at all: the caller must not read a decode failure as a
+	// missing parent and reject a child over it.
+	if derr, bad := res.failed[*hash]; bad {
+		return nil, derr
+	}
+
+	data, ok := res.found[*hash]
 	if !ok {
 		return nil, errors.NewTxNotFoundError("[utxoset][Get] %s", hash.String())
 	}
