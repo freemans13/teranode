@@ -407,7 +407,11 @@ func wrapCheckBlockSubtreesErr(err error) error {
 func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidation_api.CheckBlockSubtreesRequest) (*subtreevalidation_api.CheckBlockSubtreesResponse, error) {
 	block, err := model.NewBlockFromBytes(request.Block)
 	if err != nil {
-		return nil, wrapCheckBlockSubtreesErr(errors.NewProcessingError("[CheckBlockSubtrees] Failed to get block from blockchain client", err))
+		// Names what actually failed: deserialising the block bytes carried on the
+		// request. Nothing here talks to the blockchain client, and the wrap now puts
+		// this message on the status line the caller logs, so a wrong dependency in it
+		// sends whoever reads that log at the wrong service.
+		return nil, wrapCheckBlockSubtreesErr(errors.NewProcessingError("[CheckBlockSubtrees] failed to deserialise block from request bytes", err))
 	}
 
 	if request.BaseUrl != "" {

@@ -173,7 +173,11 @@ func TestCheckBlockSubtrees(t *testing.T) {
 		response, err := server.CheckBlockSubtrees(context.Background(), request)
 		require.Error(t, err)
 		assert.Nil(t, response)
-		assert.Contains(t, err.Error(), "Failed to get block from blockchain client")
+		// The message must name the thing that actually failed. This site parses the
+		// block bytes off the request; it never touches the blockchain client, and the
+		// gRPC wrap puts this message on the status line a caller logs.
+		assert.Contains(t, err.Error(), "failed to deserialise block from request bytes")
+		assert.NotContains(t, err.Error(), "blockchain client")
 	})
 
 	t.Run("BlockchainClientError", func(t *testing.T) {
