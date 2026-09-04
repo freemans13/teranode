@@ -212,7 +212,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// NOTE: last use of `block` — from here down only scalars and tx hash
 	// copies are referenced, so the decode arena is collectable as soon as
 	// createTxMap inside prepareSubtrees returns.
-	subtrees, preparedSubtreeSlices, blockID, err := sm.prepareSubtrees(ctx, block)
+	subtrees, preparedSubtreeSlices, blockID, err := sm.prepareSubtrees(ctx, block, previousBlockHeaderMeta.ID)
 	if err != nil {
 		return err
 	}
@@ -354,11 +354,16 @@ type TxMapWrapper struct {
 type blockIdent struct {
 	hash      chainhash.Hash
 	prevBlock chainhash.Hash
+	// prevID is the parent's COMMITTED block id, from the header lookup HandleBlockDirect
+	// already does on receipt. It is here because this block's own id is not yet committed
+	// while the phases below run, so the parent is the only end of the link that can answer
+	// a question about the chain. See createUtxos.
+	prevID    uint32
 	height    uint32
 	timestamp time.Time
 }
 
-func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block) (subtrees []*chainhash.Hash, subtreeSlices []*subtreepkg.Subtree, blockID uint32, err error) {
+func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block, prevBlockID uint32) (subtrees []*chainhash.Hash, subtreeSlices []*subtreepkg.Subtree, blockID uint32, err error) {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "prepareSubtrees",
 		tracing.WithLogMessage(
 			sm.logger,
@@ -435,6 +440,7 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	bi := blockIdent{
 		hash:      *block.Hash(),
 		prevBlock: block.MsgBlock().Header.PrevBlock,
+		prevID:    prevBlockID,
 		height:    blockHeight32,
 		timestamp: block.MsgBlock().Header.Timestamp,
 	}
@@ -1238,10 +1244,27 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 		// mempool, so a wrong answer is worse than a retry — hence the error return rather
 		// than a fallback. Every backend already expects an honest flag here: it is what
 		// block validation passes on its own SetMinedMulti calls.
+		//
+		// The question is asked about the PARENT, and it has to be. This block's own id is
+		// allocated but uncommitted while this runs: createUtxos is called from
+		// ValidateTransactionsLegacyMode, which prepareSubtrees calls at the create/spend
+		// stage, and AddBlock does not happen until ProcessBlock much later.
+		// CheckBlockIsInCurrentChain documents exactly that case and rejects it in memory
+		// with no round trip — "Drop ids above the highest committed id. These are
+		// allocated-but-uncommitted ... so they have no committed row and are definitively
+		// not on the main chain" (stores/blockchain/sql/CheckBlockIsInCurrentChain.go). Asking
+		// about this block therefore answered false for EVERY block: a round trip on the IBD
+		// hot loop that learned nothing, and a stamp that would refuse to settle an identity
+		// row the moment this path met one.
+		//
+		// The parent is committed, so it can answer, and a block extends the current chain
+		// exactly when its parent is on it — this block is about to become the tip above it.
+		// The parent's id costs nothing to have: HandleBlockDirect looks its header up on
+		// receipt to derive the height, and threads the id in through blockIdent.
 		var onLongestChain bool
 
-		if onLongestChain, err = sm.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{blockID}); err != nil {
-			return errors.NewServiceError("[createUtxos][%s] error checking whether block id %d is on the current chain", bi.hash.String(), blockID, err)
+		if onLongestChain, err = sm.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{bi.prevID}); err != nil {
+			return errors.NewServiceError("[createUtxos][%s] error checking whether parent block id %d is on the current chain", bi.hash.String(), bi.prevID, err)
 		}
 
 		minedBlockInfo := utxo.MinedBlockInfo{

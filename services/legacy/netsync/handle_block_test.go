@@ -108,6 +108,14 @@ func TestSyncManager_HandleBlockDirect(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// withPrevID sets the parent's committed block id on a blockIdent, which is what
+// prepareSubtrees threads in from the header lookup HandleBlockDirect already did.
+func withPrevID(bi blockIdent, prevID uint32) blockIdent {
+	bi.prevID = prevID
+
+	return bi
+}
+
 // testBlockIdent builds the scalar blockIdent for a test block, mirroring
 // what prepareSubtrees derives before dropping the decoded block.
 func testBlockIdent(block *bsvutil.Block) blockIdent {
@@ -573,7 +581,7 @@ func TestSyncManager_prepareSubtrees(t *testing.T) {
 		ctx:               context.Background(),
 	}
 
-	subtrees, subtreeSlices, blockID, err := sm.prepareSubtrees(context.Background(), block)
+	subtrees, subtreeSlices, blockID, err := sm.prepareSubtrees(context.Background(), block, 0)
 	require.NoError(t, err)
 	assert.Len(t, subtrees, 1, "2 txs fit in a single subtree")
 	assert.Equal(t, uint32(0), blockID, "non-quick-validation path never assigns a block ID")
@@ -1545,12 +1553,20 @@ func TestClassifyAndCountPrewarmError(t *testing.T) {
 // The legacy path applies every block it accepts, and during a fork that includes
 // side-chain blocks. Hard-coding OnLongestChain: true told the store that a side-chain
 // block had settled its transactions on the main chain, which on a store that moves a
-// settled transaction out of the mempool table is not a flag but a one-way move. The stamp
-// now asks the blockchain service which chain the block is on and reports that.
+// settled transaction out of the mempool table is not a flag but a one-way move.
+//
+// The stamp asks the blockchain service, and it asks about the block's PARENT. This block's
+// own id is allocated but uncommitted at this point -- createUtxos runs inside
+// ValidateTransactionsLegacyMode, which prepareSubtrees calls before AddBlock -- and
+// CheckBlockIsInCurrentChain drops ids above the highest committed id as definitively not on
+// the main chain. Asking about this block therefore answered false for EVERY block, which is
+// not honesty, it is a round trip to learn nothing. The parent is committed, so it can answer,
+// and a block extends the current chain exactly when its parent is on it.
 func TestLegacyStampReportsTheChainHonestly(t *testing.T) {
 	const (
 		checkpointHeight = int32(1000)
 		blockID          = uint32(9)
+		prevBlockID      = uint32(8)
 	)
 
 	newSyncManager := func(t *testing.T, onCurrentChain bool, chainErr error) (*SyncManager, *createSpyStore, *blockchain.Mock) {
@@ -1565,7 +1581,9 @@ func TestLegacyStampReportsTheChainHonestly(t *testing.T) {
 		}
 
 		mockBlockchain := &blockchain.Mock{}
-		mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{blockID}).
+		// The PARENT's id, not this block's. Asking about this block's own id is asking
+		// about a row AddBlock has not written yet.
+		mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{prevBlockID}).
 			Return(onCurrentChain, chainErr)
 
 		sm := &SyncManager{
@@ -1586,7 +1604,7 @@ func TestLegacyStampReportsTheChainHonestly(t *testing.T) {
 		sm, spy, mockBlockchain := newSyncManager(t, false, nil)
 
 		_, _, txMap := twoTxMap(t)
-		require.NoError(t, sm.createUtxos(context.Background(), txMap, testBlockIdent(block), blockID, false))
+		require.NoError(t, sm.createUtxos(context.Background(), txMap, withPrevID(testBlockIdent(block), prevBlockID), blockID, false))
 
 		stamps := spy.minedStamps()
 		require.NotEmpty(t, stamps, "every tx pre-existed, so the merge stamp must have run")
@@ -1604,7 +1622,7 @@ func TestLegacyStampReportsTheChainHonestly(t *testing.T) {
 		sm, spy, mockBlockchain := newSyncManager(t, true, nil)
 
 		_, _, txMap := twoTxMap(t)
-		require.NoError(t, sm.createUtxos(context.Background(), txMap, testBlockIdent(block), blockID, false))
+		require.NoError(t, sm.createUtxos(context.Background(), txMap, withPrevID(testBlockIdent(block), prevBlockID), blockID, false))
 
 		stamps := spy.minedStamps()
 		require.NotEmpty(t, stamps)
@@ -1620,7 +1638,7 @@ func TestLegacyStampReportsTheChainHonestly(t *testing.T) {
 		sm, spy, _ := newSyncManager(t, false, errors.NewServiceError("blockchain unavailable"))
 
 		_, _, txMap := twoTxMap(t)
-		err := sm.createUtxos(context.Background(), txMap, testBlockIdent(block), blockID, false)
+		err := sm.createUtxos(context.Background(), txMap, withPrevID(testBlockIdent(block), prevBlockID), blockID, false)
 		require.Error(t, err)
 		require.Empty(t, spy.minedStamps(), "no stamp may be written on a guess")
 	})

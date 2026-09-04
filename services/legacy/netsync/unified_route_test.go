@@ -84,7 +84,7 @@ func TestSyncManager_prepareSubtrees_UnifiedSkipsUTXOOps(t *testing.T) {
 
 	block, _, _ := buildExtendedSubtreeBlock(t, blockHeight, 5)
 
-	subtrees, subtreeSlices, blockID, err := sm.prepareSubtrees(context.Background(), block)
+	subtrees, subtreeSlices, blockID, err := sm.prepareSubtrees(context.Background(), block, 0)
 	require.NoError(t, err)
 
 	// (a) blockID must be 0 — server-side assignment deferred
