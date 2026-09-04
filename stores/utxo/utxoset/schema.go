@@ -190,6 +190,34 @@ CREATE TABLE IF NOT EXISTS utxo (
 -- keeping it: 354.8 bytes of WAL and 12.9 microseconds per spend, about 6% of the per-block
 -- budget in the worst band. Cheap enough that it stays on below the checkpoint too, rather
 -- than adding a second write path that only the tip exercises.
+--
+-- IT IS ALSO THE LAST RECORD OF A FULLY-SPENT OLD PARENT.
+--
+-- mined_height and block_id are copied off the coin at the moment the spend destroys it. The
+-- rule the design started from was that nothing mutable goes into the journal payload, and
+-- that rule is about the RESTORE, which must keep re-resolving block facts at restore time
+-- because a reorg can move a still-live parent to a different block. It is not about the
+-- READ. These two columns are settled facts by the time anything reads them: a coin carries
+-- them only once the block path wrote them or window retirement stamped them, and the only
+-- reader is the lookup step that runs when identity, membership, preservation and the coin
+-- have ALL missed. That is exactly the fully-spent parent older than the membership
+-- retention, whose block is at least 1440 deep and cannot change.
+--
+-- Without them that parent is in no table at all, and model/Block.go's checkParentTransactions
+-- asks about it on most blocks above the highest checkpoint: 96 percent of a block's
+-- out-of-block parents have no coin left by the time block validation asks. getParentTxMetaBlockIDs
+-- turns not-found into BlockIncompleteError, which callers retry rather than persist, so the
+-- block retries forever. Both the base branch and aerospike keep a fully-spent parent
+-- answerable for a window AFTER the spend; this is how that property comes back.
+--
+-- The two retentions are counted from DIFFERENT clocks and the sets are not nested: membership
+-- retires 1440 blocks after the parent was MINED, the journal 1440 blocks after the coin was
+-- SPENT. A parent mined at 500,000 and spent at 900,001 lost its window at 501,440 and keeps
+-- its journal row until 901,441.
+--
+-- DEFAULT 0 on both is the unconfirmed sentinel, and the read step filters mined_height > 0
+-- for it: a mempool parent's spend journals no block, and reporting block id 0 for it would be
+-- a lie block validation cannot tell from genesis, whose id really is 0.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS spend_journal (
     spent_height    INTEGER  NOT NULL,
@@ -197,6 +225,8 @@ CREATE TABLE IF NOT EXISTS spend_journal (
     created_height  INTEGER  NOT NULL,
     spendable_from  INTEGER  NOT NULL,
     flags           SMALLINT NOT NULL,
+    mined_height    INTEGER  NOT NULL DEFAULT 0,
+    block_id        INTEGER  NOT NULL DEFAULT 0,
     ukey            UUID     NOT NULL,
     txid            BYTEA    NOT NULL,
     spending_txid   BYTEA    NOT NULL,

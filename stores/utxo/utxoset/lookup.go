@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/jackc/pgx/v5"
 )
 
 // The read order is identity table, then membership by transaction id, then the preserved
@@ -27,9 +28,33 @@ import (
 // copy is all there is, and it comes before the coin because it carries the whole payload
 // where the coin carries only a block.
 //
-// The spec also names a journal step between membership and coin. While membership and journal
-// retention are both 1440 blocks the journal can only find a spend whose parent's membership
-// row also still exists, so that step is omitted here. Revisit if the two retentions diverge.
+// The spend journal is the FIFTH step, after the coin rather than before it, and that order is
+// the same rule again. A live coin is the settled record of a transaction that still exists;
+// the journal row is a copy taken off a coin that has since been destroyed. Ask the journal
+// first and a transaction with one output spent and one still live would be answered from the
+// spent one, which is a copy where a record was available. Ask it last and it is reached only
+// for a transaction with no live coin at all, which is the case it exists for.
+//
+// It exists because nothing else can answer for a FULLY-SPENT parent mined more than the
+// membership retention ago, and model/Block.go's checkParentTransactions asks about exactly
+// that on most blocks above the highest checkpoint. No identity row (it was mined), no
+// membership window (dropped 1440 blocks after it was mined), no preserved copy (preservation
+// names parents of children unmined for 144 blocks, and this child is mined in the next
+// block), and no coin (the last one was just spent). getParentTxMetaBlockIDs turns the
+// resulting not-found into a BlockIncompleteError, which callers retry rather than persist, so
+// the block retries forever. Below the highest checkpoint skipOrderAndBlessedBelowCheckpoint
+// skips the whole check, which is why a from-genesis sync runs clean until it passes it.
+//
+// The spec's own version of this step could not have worked: it read the parent's block facts
+// from tx_mined by the spent height's partition, and for this parent tx_mined has no row at
+// any height. The journal now carries the facts itself, copied off the coin the spend
+// destroyed. Trusting a copied block id here is not the mutability the restore rule forbids: a
+// parent reaching this step has had its window retired, so its block is at least 1440 deep and
+// cannot change. See the spend_journal comment in schema.go.
+//
+// The step buys the journal's retention and not a block more. Past both retentions the
+// transaction is genuinely gone and the store reports not-found, which is what aerospike's
+// delete-at-height does and what the shared suite's pruning test requires.
 
 // identByTxidSQL reads the identity rows for a set of transactions, joining each body only if
 // it is still inside its window.
@@ -130,6 +155,49 @@ SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
  ) AS hit
   LEFT JOIN tx_body b ON b.created_height = hit.created_height AND b.txid = k.txid`
 
+// spentParentFactsSQL reads ONE journal row per transaction, for a fully-spent parent whose
+// membership window has already retired. It is the last thing the store can say about a
+// transaction before not-found.
+//
+// The shape is coinFactsSQL's, and for the same reasons. The keys sit on the OUTSIDE of a
+// LATERAL with the ORDER BY / LIMIT 1 / OFFSET 0 fence: OFFSET 0 stops the planner pulling the
+// subquery up into the outer join, which is what would re-admit a hash join against every live
+// leaf; the packed-key range bound is what makes it a range scan rather than a read of the
+// whole leaf; and the ORDER BY is what lets the LIMIT stop the scan instead of materialising
+// the range first. ukey is the journal leaf's only index, so this is one range probe per leaf
+// per key.
+//
+// The spend height is not known to the reader -- that is the whole point of the step, the
+// caller is asking about a parent it has lost track of -- so there is no partition bound and
+// every live leaf is probed. At the journal's 1440-block retention in 48-block leaves that is
+// 30 leaves, and 500 keys is therefore 15,000 index descents. Measured on this schema at 500
+// keys against 39,990 journal rows across 30 leaves, eight runs: 7.4-9.2 ms, an Index Scan on
+// every leaf's ukey index and no Seq Scan on any of them, flat across all eight. That is the
+// price of the step and it is worth knowing before the soak, because above the highest
+// checkpoint most out-of-block parents reach it.
+//
+// The full 32-byte txid recheck is not optional. ukey is a non-unique 96-bit prefix by design,
+// so the range locates candidates and only the txid establishes identity.
+//
+// mined_height > 0 filters out the unconfirmed sentinel. A mempool parent's spend journals no
+// block, and reporting block id 0 for it would be a lie block validation cannot tell from
+// genesis, whose id really is 0. A mempool parent is answered by its identity row at step 1
+// anyway; this is the belt to that braces.
+//
+// Any output of the transaction will do, so there is no preference between the rows a
+// multi-output transaction left behind: every one of them was stamped with the same block
+// facts, by the block path at create or by window retirement, before any of them was spent.
+const spentParentFactsSQL = `
+SELECT k.txid, hit.mined_height, hit.block_id, hit.flags, b.raw_tx
+  FROM unnest($1::bytea[], $2::uuid[], $3::uuid[]) AS k(txid, lo, hi)
+ CROSS JOIN LATERAL (
+   SELECT j.mined_height, j.block_id, j.created_height, j.flags
+     FROM spend_journal j
+    WHERE j.ukey >= k.lo AND j.ukey <= k.hi AND j.txid = k.txid AND j.mined_height > 0
+    ORDER BY j.ukey LIMIT 1 OFFSET 0
+ ) AS hit
+  LEFT JOIN tx_body b ON b.created_height = hit.created_height AND b.txid = k.txid`
+
 // lookupResult is one read of the store: what it found, and what it could not make sense of.
 //
 // The two maps are separate because a transaction the store HOLDS but cannot decode is not the
@@ -176,7 +244,8 @@ func (r *lookupResult) resolved(h chainhash.Hash) bool {
 //
 // Each step asks only about the hashes the steps before it could not answer, so a batch of
 // ordinary mined parents costs one membership probe each and never touches the coin table,
-// and a batch of mempool parents never leaves the identity table.
+// a batch of mempool parents never leaves the identity table, and the journal is read only for
+// a transaction the four steps above it all missed.
 //
 // The returned error is for faults that are NOT per-transaction: a dead connection, a syntax
 // error, a partition that vanished mid-read. Those really do fail every entry, because nothing
@@ -240,6 +309,17 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
 	if len(rest) > 0 {
 		// Step 4: the coin.
 		if err := s.readCoinFacts(ctx, rest, &res); err != nil {
+			return lookupResult{}, err
+		}
+
+		rest = stillMissing(rest, &res)
+	}
+
+	if len(rest) > 0 {
+		// Step 5: the spend journal, for a fully-spent parent whose membership window has
+		// already retired. Last, so a live coin is always preferred to a copy taken off a
+		// destroyed one.
+		if err := s.readSpentParents(ctx, rest, &res); err != nil {
 			return lookupResult{}, err
 		}
 	}
@@ -659,6 +739,45 @@ func (s *Store) readCoinFacts(ctx context.Context, hashes []chainhash.Hash,
 		return errors.NewStorageError("[utxoset][lookup] coin facts", err)
 	}
 
+	return scanBlockFacts(rows, "coin facts", res)
+}
+
+// readSpentParents is the step past the last one: a transaction with no identity row, no
+// membership window, no preserved copy and no live coin, answered from the journal row its
+// last spend left behind.
+//
+// It answers exactly what readCoinFacts answers, and it has to, because the two are the same
+// claim from two sources: this transaction was mined in this block and the store no longer
+// holds the record that would say more. What comes back is thin -- a block, and the body if
+// its window happens to still hold it -- which is all the validator needs to check a child's
+// inputs, and all a pruned SV Node could say either.
+//
+// The packed-key arguments are built by the same liveCoinArgs the coin step uses, so the two
+// statements are explained with identical inputs and neither can drift into pinning a plan
+// nothing runs. The journal has no leaf column, so the leaf array it returns is unused here:
+// the journal is partitioned by spent height, and the ukey range is what locates the row.
+func (s *Store) readSpentParents(ctx context.Context, hashes []chainhash.Hash,
+	res *lookupResult) error {
+	txids := make([][]byte, 0, len(hashes))
+	for i := range hashes {
+		txids = append(txids, hashes[i][:])
+	}
+
+	_, ids, los, his := liveCoinArgs(txids)
+
+	rows, err := s.pool.Query(ctx, spentParentFactsSQL, ids, los, his)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][lookup] spent parents", err)
+	}
+
+	return scanBlockFacts(rows, "spent parents", res)
+}
+
+// scanBlockFacts reads the (txid, mined_height, block_id, flags, raw_tx) shape both thin steps
+// return, and it is shared rather than copied because the two are one answer from two sources:
+// a divergence between them would be a transaction reporting a different block depending on
+// whether its last coin had been spent yet.
+func scanBlockFacts(rows pgx.Rows, what string, res *lookupResult) error {
 	defer rows.Close()
 
 	for rows.Next() {
@@ -671,7 +790,7 @@ func (s *Store) readCoinFacts(ctx context.Context, hashes []chainhash.Hash,
 		)
 
 		if err := rows.Scan(&txid, &minedHeight, &blockID, &flags, &rawTx); err != nil {
-			return errors.NewStorageError("[utxoset][lookup] coin facts scan", err)
+			return errors.NewStorageError("[utxoset][lookup] %s scan", what, err)
 		}
 
 		var h chainhash.Hash
@@ -708,7 +827,7 @@ func (s *Store) readCoinFacts(ctx context.Context, hashes []chainhash.Hash,
 	}
 
 	if err := rows.Err(); err != nil {
-		return errors.NewStorageError("[utxoset][lookup] coin facts", err)
+		return errors.NewStorageError("[utxoset][lookup] %s", what, err)
 	}
 
 	return nil

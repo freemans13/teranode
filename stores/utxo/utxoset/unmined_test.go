@@ -111,8 +111,20 @@ func TestPreservedParentOutlivesItsMembershipWindow(t *testing.T) {
 
 	require.NoError(t, s.ProcessExpiredPreservations(ctx, 6_000))
 
+	// The spend at 150 left a journal row carrying the parent's block facts, and the read
+	// order's last step answers from it, so "gone like any other" now means past the journal's
+	// retention as well as past preservation. That is the point of the journal step: a
+	// fully-spent parent stays answerable for a window AFTER the spend, which is what both the
+	// base branch and aerospike do.
+	got, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{7}, got.BlockIDs)
+
+	_, err = s.dropSpendJournalPartitionsBelow(ctx, 2_000)
+	require.NoError(t, err)
+
 	_, err = s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs)
-	require.True(t, errors.Is(err, errors.ErrTxNotFound), "past its preservation the parent is gone like any other")
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "past both retentions the parent is gone like any other")
 }
 
 // TestPreserveTransactionsCopiesOnlyWhatMembershipHolds: the pruner names a parent by hash and

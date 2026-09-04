@@ -52,17 +52,26 @@ import (
 // $4 carries the flags to OR in, so a caller asking for flagAsLocked gets the coin back
 // already locked rather than briefly spendable.
 //
-// The journal payload is immutable and carries no block facts -- they can change after the
-// spend was recorded (a reorg can move a still-live parent to a different block), so the
-// journal deliberately does not cache them. The restored coin's mined_height and block_id are
-// therefore read fresh from tx_mined by the parent's txid rather than copied from the journal
-// row. Below the checkpoint every restorable spend's parent is a block-path transaction and
-// has exactly one tx_mined row (identity table is consulted first once stage 2 lands, so an
-// unconfirmed parent restores with the sentinel there too); COALESCE to 0 is the correct
-// fallback for a parent whose window has already retired, matching the unconfirmed sentinel
-// rather than inventing a second one. ORDER BY seq LIMIT 1 picks the earliest row on the rare
+// The restored coin's block facts are RE-RESOLVED, in three preferences, and the order is the
+// immutability rule rather than a convenience.
+//
+// tx_mined first. Block facts can change after the spend was recorded -- a reorg can move a
+// still-live parent to a different block -- so while the membership row exists it is the
+// record that gets rewritten and the journal's copy is not. Reading it fresh by the parent's
+// txid is what keeps a restore honest. ORDER BY seq LIMIT 1 picks the earliest row on the rare
 // chance more than one exists (a coinbase re-org can leave a parent claimed at more than one
 // height); seq is a global identity so "earliest" is well defined without touching mined_height.
+//
+// Then the journal's own copy, gated on mined_height > 0. Once the membership window has
+// retired there is nothing left to re-resolve from, and before this the restore put back the
+// unconfirmed sentinel on a coin that was demonstrably mined -- a coin claiming no block at
+// all, which the read order would then answer from as if the transaction were in the mempool.
+// The copy is safe to trust in exactly this case for the same reason readSpentParents is: a
+// window that has retired is at least 1440 blocks deep and its block cannot change.
+//
+// Then 0, which is the unconfirmed sentinel and the correct answer for a parent that was
+// genuinely unconfirmed when it was spent. Both columns move together in every branch, because
+// each pair comes from one row.
 const unspendSQL = `
 WITH items AS (
     SELECT * FROM unnest($1::uuid[], $2::bytea[], $3::bytea[]) AS t(ukey, ptxid, stxid)
@@ -73,15 +82,17 @@ taken AS (
        AND j.txid          = i.ptxid
        AND j.spending_txid = i.stxid
     RETURNING j.ukey, j.txid, j.satoshis, j.script, j.created_height,
-              j.spendable_from, j.flags, j.hash_override
+              j.spendable_from, j.flags, j.hash_override, j.mined_height, j.block_id
 ),
 restored AS (
     INSERT INTO utxo (leaf, txid, ukey, satoshis, script, created_height,
                       spendable_from, flags, hash_override, mined_height, block_id)
     SELECT (get_byte(t.txid, 0) & 7)::smallint, t.txid, t.ukey, t.satoshis, t.script,
            t.created_height, t.spendable_from, t.flags | $4::smallint, t.hash_override,
-           COALESCE((SELECT m.mined_height FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1), 0),
-           COALESCE((SELECT m.block_id     FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1), 0)
+           COALESCE((SELECT m.mined_height FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1),
+                    NULLIF(t.mined_height, 0), 0),
+           COALESCE((SELECT m.block_id     FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1),
+                    CASE WHEN t.mined_height > 0 THEN t.block_id END, 0)
       FROM taken t
      WHERE NOT EXISTS (
            SELECT 1 FROM utxo u

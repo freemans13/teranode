@@ -71,9 +71,20 @@ func TestGetNeverAnswersBlockIdsFromTheCoinWhileAMembershipRowExists(t *testing.
 	require.Equal(t, []uint32{42, 43}, got.BlockIDs, "both blocks, in insertion order")
 }
 
-// TestGetReportsNotFoundForAFullySpentTransactionPastItsWindow is aerospike's behaviour after
-// its delete-at-height and what the shared suite's pruning test requires.
-func TestGetReportsNotFoundForAFullySpentTransactionPastItsWindow(t *testing.T) {
+// TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives is the case block
+// validation asks about on most blocks above the highest checkpoint.
+//
+// This test used to assert ErrTxNotFound for exactly this state, and that was wrong by design:
+// membership retires 1440 blocks after the parent was MINED and the journal 1440 blocks after
+// the coin was SPENT, so the two are counted from different clocks and a parent can lose its
+// window while its journal row still stands. During that window the store CAN answer, and it
+// must: the alternative is a BlockIncompleteError the caller retries forever. Both the base
+// branch and aerospike keep a fully-spent parent answerable for a window after the spend.
+//
+// TestGetStillReportsNotFoundOnceTheJournalLeafIsGoneToo in spent_parent_test.go is the other
+// half: past both retentions the transaction really is gone, which is aerospike's behaviour
+// after its delete-at-height and what the shared suite's pruning test requires.
+func TestGetServesAFullySpentTransactionPastItsWindowWhileItsJournalLeafLives(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 1, 5_000)
@@ -84,6 +95,15 @@ func TestGetReportsNotFoundForAFullySpentTransactionPastItsWindow(t *testing.T) 
 	spendOneOutput(t, s, ctx, parent, 0, 100)
 
 	_, err = s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err)
+
+	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.BlockIDs, fields.BlockHeights)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{7}, got.BlockIDs)
+	require.Equal(t, []uint32{100}, got.BlockHeights)
+
+	// And once the journal leaf goes too, there is genuinely nothing left.
+	_, err = s.dropSpendJournalPartitionsBelow(ctx, 2_000)
 	require.NoError(t, err)
 
 	_, err = s.Get(ctx, parent.TxIDChainHash())

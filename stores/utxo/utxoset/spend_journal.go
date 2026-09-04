@@ -61,6 +61,14 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // given one third, which is wrong by three rather than by forty thousand, and it is enough
 // for the planner to reach for the index or hash the batch instead. The single-key form of
 // this statement never showed the problem, because with one key a walk per key is one walk.
+//
+// The journal row copies the coin's mined_height and block_id along with the rest of the
+// payload, and they cost nothing extra: the DELETE already carries the whole row, so this is
+// two more columns on a RETURNING that was already reading them. They are what makes a
+// fully-spent parent older than the membership retention still answerable -- see
+// readSpentParents in lookup.go and the spend_journal comment in schema.go. Placeholders are
+// unchanged at $1..$6, because both values come off the deleted row rather than from the
+// caller.
 const spendJournalSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[],
@@ -75,13 +83,16 @@ del AS (
        AND (u.flags & 5)    < 1
        AND u.spendable_from <= k.spent_height
     RETURNING k.vin, k.spent_height, k.spending_txid, u.satoshis, u.created_height,
-              u.spendable_from, u.flags, u.ukey, u.txid, u.script, u.hash_override
+              u.spendable_from, u.flags, u.mined_height, u.block_id, u.ukey, u.txid,
+              u.script, u.hash_override
 ),
 journal AS (
     INSERT INTO spend_journal (spent_height, satoshis, created_height, spendable_from,
-                           flags, ukey, txid, spending_txid, script, hash_override)
+                           flags, mined_height, block_id, ukey, txid, spending_txid,
+                           script, hash_override)
     SELECT d.spent_height, d.satoshis, d.created_height, d.spendable_from, d.flags,
-           d.ukey, d.txid, d.spending_txid, d.script, d.hash_override
+           d.mined_height, d.block_id, d.ukey, d.txid, d.spending_txid, d.script,
+           d.hash_override
       FROM del d
 )
 SELECT d.vin, d.satoshis, d.script FROM del d`
