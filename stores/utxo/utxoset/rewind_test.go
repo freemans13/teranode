@@ -209,3 +209,68 @@ func TestConflictingTxIteratorListsConflictingNonCoinbaseTransactions(t *testing
 	require.False(t, names[hashOf(conflictingCoinbase).String()],
 		"and not a coinbase, which spends nothing so can never lose a race")
 }
+
+// TestRemoveBlockIDsReachesMembershipRows: a mined transaction's membership lives in tx_mined,
+// not in tx_ident, so a rewind that only touched the identity table reached mempool and
+// fork-limbo rows and silently missed every settled transaction. The tool exists to recover
+// from a bad chain state, and its documented contract is that a miss is a silent no-op, so an
+// operator got no signal that the rewind was partial.
+func TestRemoveBlockIDsReachesMembershipRows(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	require.False(t, identExists(t, s, ctx, tx), "a mined transaction has no identity row")
+	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+
+	require.NoError(t, s.RemoveBlockIDs(ctx, []utxo.BlockIDsRemoval{
+		{TxHash: tx.TxIDChainHash(), BlockIDs: []uint32{42}},
+	}))
+
+	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+}
+
+// TestRemoveBlockIDsLeavesAMembershipRowNamingAnotherBlock: the tool removes the blocks the
+// caller has stopped believing in and nothing else.
+func TestRemoveBlockIDsLeavesAMembershipRowNamingAnotherBlock(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100})
+	require.NoError(t, err)
+	require.Equal(t, 2, minedRows(t, s, ctx, tx))
+
+	require.NoError(t, s.RemoveBlockIDs(ctx, []utxo.BlockIDsRemoval{
+		{TxHash: tx.TxIDChainHash(), BlockIDs: []uint32{42}},
+	}))
+
+	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+
+	var kept int32
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT block_id FROM tx_mined WHERE txid = $1`, hashBytes(tx)).Scan(&kept))
+	require.Equal(t, int32(43), kept)
+}
+
+// TestRemoveBlockIDsIsIdempotentOnMembershipRows, for the same crash-replay reason the identity
+// arm is idempotent.
+func TestRemoveBlockIDsIsIdempotentOnMembershipRows(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	rm := []utxo.BlockIDsRemoval{{TxHash: tx.TxIDChainHash(), BlockIDs: []uint32{42}}}
+	require.NoError(t, s.RemoveBlockIDs(ctx, rm))
+	require.NoError(t, s.RemoveBlockIDs(ctx, rm), "stripping twice must not fail")
+	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+}

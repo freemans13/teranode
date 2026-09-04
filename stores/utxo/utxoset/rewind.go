@@ -51,6 +51,13 @@ DELETE FROM conflict_children c
 // The mempool marker is deliberately untouched, matching both reference stores. This call does
 // not claim to know whether the chain still contains the transaction, only which blocks the
 // caller has stopped believing in.
+//
+// This statement reaches the IDENTITY table only, and under the reshape that is half the job:
+// a settled transaction has no identity row at all, its membership is one row per block in
+// tx_mined. removeMinedBlockIDsSQL is the other half, and the two run together. Splitting them
+// rather than folding them into one statement is the honest shape, because the two tables hold
+// membership in different forms -- a packed list in one column against a row per block -- and a
+// combined statement would need both anyway.
 const removeBlockIDsSQL = `
 WITH k AS (
     SELECT leaf, txid, array_agg(DISTINCT block_id) AS ids
@@ -64,6 +71,28 @@ UPDATE tx_ident i
    AND i.txid = k.txid
    AND octet_length(i.membership) > 0
    AND mh_strip(i.membership, k.ids) IS DISTINCT FROM i.membership`
+
+// removeMinedBlockIDsSQL deletes the membership rows naming blocks the caller has rewound.
+//
+// A settled transaction's membership is not a packed list to strip but a row per block, so
+// removing a block is a DELETE rather than an UPDATE, which is what makes this arm idempotent
+// for free: a second run matches nothing.
+//
+// tx_mined's primary key leads with txid, so this is one descent per pair. The pairs are the
+// same flattened arrays removeBlockIDsSQL takes, so a caller cannot pass one shape to one
+// statement and another shape to the other.
+//
+// If this leaves a transaction with no membership row and no identity row, the transaction is
+// then answered by its own coin -- one block id, from the coin's stamp -- or by the journal
+// step, or not at all. That is the tool's caller's decision to make: the rewind is being told
+// which blocks to stop believing in, and it is not this store's place to decide what the
+// transaction becomes afterwards. It is the same silence the identity arm already keeps about
+// a transaction that loses its last block.
+const removeMinedBlockIDsSQL = `
+DELETE FROM tx_mined m
+ USING unnest($1::bytea[], $2::int[]) AS k(txid, block_id)
+ WHERE m.txid = k.txid
+   AND m.block_id = k.block_id`
 
 // RemoveFromConflictingChildren takes transactions off their parents' contested-coin lists.
 //
@@ -103,6 +132,13 @@ func (s *Store) RemoveFromConflictingChildren(ctx context.Context, removals []ut
 //
 // Called only by the offline rewind tool. A transaction the store does not hold, or a block it
 // never claimed, is a silent no-op, for the same crash-replay reason.
+//
+// BOTH homes are stripped. A transaction lives in exactly one of tx_ident and tx_mined, and the
+// caller does not know which, so a rewind that reached only the identity table found mempool
+// and fork-limbo rows and silently missed every settled transaction -- a partial rewind with no
+// signal, which is the worst outcome available to a tool for recovering from a bad chain state.
+// The two statements run in ONE transaction so a crash cannot leave a transaction stripped in
+// one table and not the other.
 func (s *Store) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemoval) error {
 	if len(removals) == 0 {
 		return nil
@@ -113,6 +149,7 @@ func (s *Store) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemo
 	leaves := make([]int16, 0, len(removals))
 	txids := make([][]byte, 0, len(removals))
 	blockIDs := make([]int64, 0, len(removals))
+	minedIDs := make([]int32, 0, len(removals))
 
 	for _, r := range removals {
 		if r.TxHash == nil {
@@ -123,6 +160,7 @@ func (s *Store) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemo
 			leaves = append(leaves, LeafFor(r.TxHash[:]))
 			txids = append(txids, r.TxHash[:])
 			blockIDs = append(blockIDs, int64(id))
+			minedIDs = append(minedIDs, int32(id)) //nolint:gosec // a block id fits int32
 		}
 	}
 
@@ -130,8 +168,25 @@ func (s *Store) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemo
 		return nil
 	}
 
-	if _, err := s.pool.Exec(ctx, removeBlockIDsSQL, leaves, txids, blockIDs); err != nil {
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][RemoveBlockIDs] begin", err)
+	}
+
+	if _, err := dbTx.Exec(ctx, removeBlockIDsSQL, leaves, txids, blockIDs); err != nil {
+		_ = dbTx.Rollback(ctx)
+
 		return errors.NewStorageError("[utxoset][RemoveBlockIDs]", err)
+	}
+
+	if _, err := dbTx.Exec(ctx, removeMinedBlockIDsSQL, txids, minedIDs); err != nil {
+		_ = dbTx.Rollback(ctx)
+
+		return errors.NewStorageError("[utxoset][RemoveBlockIDs] membership", err)
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return errors.NewStorageError("[utxoset][RemoveBlockIDs] commit", err)
 	}
 
 	return nil
