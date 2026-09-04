@@ -54,7 +54,7 @@ func TestCollectMoveForwardTxHashes_BuildsTxSet(t *testing.T) {
 		store := blob_memory.New()
 		stp := newReverseHelpersStp(t, plainBlob{store})
 
-		got, _, err := stp.collectMoveForwardTxHashes(t.Context(), nil)
+		got, err := stp.collectMoveForwardTxHashes(t.Context(), nil)
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		require.Empty(t, got)
@@ -64,7 +64,7 @@ func TestCollectMoveForwardTxHashes_BuildsTxSet(t *testing.T) {
 		store := blob_memory.New()
 		stp := newReverseHelpersStp(t, plainBlob{store})
 
-		got, _, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
+		got, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
 			{Subtrees: nil},
 		})
 		require.NoError(t, err)
@@ -75,7 +75,7 @@ func TestCollectMoveForwardTxHashes_BuildsTxSet(t *testing.T) {
 		store := blob_memory.New()
 		stp := newReverseHelpersStp(t, plainBlob{store})
 
-		got, _, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{nil})
+		got, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{nil})
 		require.NoError(t, err)
 		require.Empty(t, got)
 	})
@@ -87,7 +87,7 @@ func TestCollectMoveForwardTxHashes_BuildsTxSet(t *testing.T) {
 		s, txs := buildSubtreeWithTxs(t, "carry-over-nil-subtree-hash", 2)
 		require.NoError(t, store.Set(t.Context(), s.RootHash()[:], fileformat.FileTypeSubtree, mustSerialize(t, s)))
 
-		got, _, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
+		got, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
 			{Subtrees: []*chainhash.Hash{nil, s.RootHash()}},
 		})
 		require.NoError(t, err)
@@ -105,7 +105,7 @@ func TestCollectMoveForwardTxHashes_BuildsTxSet(t *testing.T) {
 		s, txs := buildSubtreeWithTxs(t, "carry-over-coinbase", 2)
 		require.NoError(t, store.Set(t.Context(), s.RootHash()[:], fileformat.FileTypeSubtree, mustSerialize(t, s)))
 
-		got, _, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
+		got, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
 			{Subtrees: []*chainhash.Hash{s.RootHash()}},
 		})
 		require.NoError(t, err)
@@ -126,7 +126,7 @@ func TestCollectMoveForwardTxHashes_BuildsTxSet(t *testing.T) {
 		require.NoError(t, store.Set(t.Context(), s1.RootHash()[:], fileformat.FileTypeSubtree, mustSerialize(t, s1)))
 		require.NoError(t, store.Set(t.Context(), s2.RootHash()[:], fileformat.FileTypeSubtree, mustSerialize(t, s2)))
 
-		got, _, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
+		got, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
 			{Subtrees: []*chainhash.Hash{s1.RootHash()}},
 			{Subtrees: []*chainhash.Hash{s2.RootHash()}},
 		})
@@ -143,7 +143,7 @@ func TestCollectMoveForwardTxHashes_BuildsTxSet(t *testing.T) {
 		// path in the helper's GetIoReader chain.
 		require.NoError(t, store.Set(t.Context(), s.RootHash()[:], fileformat.FileTypeSubtreeToCheck, mustSerialize(t, s)))
 
-		got, _, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
+		got, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
 			{Subtrees: []*chainhash.Hash{s.RootHash()}},
 		})
 		require.NoError(t, err)
@@ -157,7 +157,7 @@ func TestCollectMoveForwardTxHashes_BuildsTxSet(t *testing.T) {
 		stp := newReverseHelpersStp(t, plainBlob{store})
 
 		phantom := chainhash.HashH([]byte("phantom-subtree"))
-		_, _, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
+		_, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
 			{Subtrees: []*chainhash.Hash{&phantom}},
 		})
 		require.Error(t, err, "absent subtree must fail loudly so the reorg doesn't silently skip carry-over txs")
@@ -171,7 +171,7 @@ func TestCollectMoveForwardTxHashes_BuildsTxSet(t *testing.T) {
 		// Just the file magic and a few bytes; deserialize will fail.
 		require.NoError(t, store.Set(t.Context(), corrupt[:], fileformat.FileTypeSubtree, []byte("S-1.0   \x00\x00")))
 
-		_, _, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
+		_, err := stp.collectMoveForwardTxHashes(t.Context(), []*model.Block{
 			{Subtrees: []*chainhash.Hash{&corrupt}},
 		})
 		require.Error(t, err)
