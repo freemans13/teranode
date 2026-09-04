@@ -70,7 +70,7 @@ func createDirect(s *Store, ctx context.Context, tx *bt.Tx, height uint32) error
 		return err
 	}
 
-	if _, err := s.createIn(ctx, dbTx, tx, height); err != nil {
+	if _, err := s.createIn(ctx, dbTx, tx, height, height); err != nil {
 		_ = dbTx.Rollback(ctx)
 
 		return err
@@ -120,4 +120,43 @@ func coinFactsOf(t *testing.T, s *Store, ctx context.Context, txid []byte) (mine
 		LeafFor(txid), lo, hi, txid).Scan(&minedHeight, &blockID))
 
 	return minedHeight, blockID
+}
+
+// plantConflictNote records one (parent, child) contest directly, at a height whose window it
+// creates first. Setup that went through SetConflicting would depend on the code under test.
+func plantConflictNote(t *testing.T, s *Store, ctx context.Context, height uint32,
+	parent, child []byte) {
+	t.Helper()
+
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, height))
+
+	_, err := s.pool.Exec(ctx, `
+        INSERT INTO conflict_children (noted_height, parent_txid, child_txid)
+        VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, int32(height), parent, child)
+	require.NoError(t, err)
+}
+
+// conflictChildrenOf reads the children recorded against one parent, across every live window,
+// deduplicated the way the read path deduplicates them.
+func conflictChildrenOf(t *testing.T, s *Store, ctx context.Context, parent []byte) [][]byte {
+	t.Helper()
+
+	rows, err := s.pool.Query(ctx, `
+        SELECT DISTINCT child_txid FROM conflict_children
+         WHERE parent_txid = $1 ORDER BY child_txid`, parent)
+	require.NoError(t, err)
+
+	defer rows.Close()
+
+	var out [][]byte
+
+	for rows.Next() {
+		var c []byte
+		require.NoError(t, rows.Scan(&c))
+		out = append(out, c)
+	}
+
+	require.NoError(t, rows.Err())
+
+	return out
 }

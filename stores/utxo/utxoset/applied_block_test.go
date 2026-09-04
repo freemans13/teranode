@@ -40,7 +40,7 @@ func TestApplyBlockReplayDoesNotDuplicateOutputs(t *testing.T) {
 
 	apply := func() (bool, error) {
 		return s.ApplyBlock(ctx, &blockHash, 100, func(dbTx pgx.Tx) error {
-			_, err := s.createIn(ctx, dbTx, tx, 100)
+			_, err := s.createIn(ctx, dbTx, tx, 100, 100)
 			return err
 		})
 	}
@@ -74,7 +74,7 @@ func TestApplyBlockFailureLeavesBlockRetryable(t *testing.T) {
 
 	// The application creates its outputs and then fails.
 	applied, err := s.ApplyBlock(ctx, &blockHash, 100, func(dbTx pgx.Tx) error {
-		if _, cErr := s.createIn(ctx, dbTx, tx, 100); cErr != nil {
+		if _, cErr := s.createIn(ctx, dbTx, tx, 100, 100); cErr != nil {
 			return cErr
 		}
 
@@ -87,7 +87,7 @@ func TestApplyBlockFailureLeavesBlockRetryable(t *testing.T) {
 
 	// The block must still be offerable, and must apply cleanly this time.
 	applied, err = s.ApplyBlock(ctx, &blockHash, 100, func(dbTx pgx.Tx) error {
-		_, cErr := s.createIn(ctx, dbTx, tx, 100)
+		_, cErr := s.createIn(ctx, dbTx, tx, 100, 100)
 		return cErr
 	})
 	require.NoError(t, err)

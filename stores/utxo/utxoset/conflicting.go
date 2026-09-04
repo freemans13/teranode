@@ -35,41 +35,29 @@ SELECT i.txid, i.tx_inpoints
 // was contested. Without this there is no route from a contested coin back to the transactions
 // competing for it.
 //
-// It is a SEPARATE statement from the flag flip, and that is not tidiness. Both update
-// tx_ident, and one named transaction can be the parent of another named transaction in the
-// same call, since the cascade is handed a transaction and its child together. PostgreSQL
-// applies only one update per row per statement, so fusing the two would silently drop one of
-// them. Splitting also puts the note FIRST, matching the aerospike store: a note that fails
-// leaves the transaction unmarked rather than marked but unfindable.
+// It writes to conflict_children, keyed on the parent's txid alone, and that is what lets a
+// MINED parent be contested. The row this used to update lived on tx_ident, which a mined
+// transaction does not have -- the longest-chain stamp moved it into tx_mined -- so the note
+// was a zero-row update for exactly the parents that matter, and silently succeeded.
 //
-// Membership is tested on a 32-byte BOUNDARY rather than at any offset. The list is a
-// concatenation of 32-byte ids, and the reader unpacks it that way and rejects a length that is
-// not a multiple of 32. A plain substring search can match bytes straddling two neighbouring
-// entries, which would read as already-present and silently skip a real append. noteConflictSQL
-// in create.go carries the same aligned test for the same reason, and the two must stay
-// identical: they are two writers of one column.
+// Two consequences of the move are worth stating, because both were rules here before. It no
+// longer has to be a separate statement from the flag flip to avoid PostgreSQL's
+// one-update-per-row-per-statement rule, since it updates no row; it stays separate because
+// the note must go FIRST, so a note that fails leaves the transaction unmarked rather than
+// marked but unfindable. And the 32-byte boundary test is gone with the packed column it
+// guarded: one row per child cannot be matched straddling its neighbours.
 //
 // Run on BOTH values of the flag, matching both reference stores. Removing an entry is
 // RemoveFromConflictingChildren's job.
+//
+// $1 is the height, $2 the parents and $3 the children, one element per (parent, child) pair.
+// ON CONFLICT DO NOTHING against the window's own unique index makes a repeat free; the
+// reader still says DISTINCT, because the index is per window. See the schema comment.
 const noteConflictingChildrenSQL = `
-WITH p AS (
-    SELECT * FROM unnest($1::smallint[], $2::bytea[], $3::bytea[])
-        AS t(pleaf, ptxid, child)
-)
-UPDATE tx_ident i
-   SET conflicting_children =
-         coalesce(i.conflicting_children, '\x'::bytea) ||
-         coalesce((
-             SELECT string_agg(c.child, ''::bytea ORDER BY c.child)
-               FROM (SELECT DISTINCT p2.child FROM p p2
-                      WHERE p2.pleaf = i.leaf AND p2.ptxid = i.txid) c
-              WHERE NOT EXISTS (
-                    SELECT 1
-                      FROM generate_series(0, coalesce(length(i.conflicting_children), 0) / 32 - 1) g
-                     WHERE substring(i.conflicting_children from g * 32 + 1 for 32) = c.child)
-         ), '\x'::bytea)
-  FROM (SELECT DISTINCT pleaf, ptxid FROM p) q
- WHERE i.leaf = q.pleaf AND i.txid = q.ptxid`
+INSERT INTO conflict_children (noted_height, parent_txid, child_txid)
+SELECT DISTINCT $1::int, p.ptxid, p.child
+  FROM unnest($2::bytea[], $3::bytea[]) AS p(ptxid, child)
+ON CONFLICT DO NOTHING`
 
 // setConflictingSQL flips the flag on both rows and reports both answers the caller needs.
 //
@@ -173,6 +161,19 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash,
 
 	plan := s.planConflicting(named, inpoints)
 
+	// The height is read ONCE and used for both the window and the row, because a second read
+	// that crossed a 48-block boundary would insert into a partition that does not exist.
+	notedHeight := s.GetBlockHeight()
+
+	// The note's window BEFORE the transaction is opened, never inside it: the DDL needs its
+	// own pool connection, and taking one while holding a transaction from the same pool
+	// deadlocks the pool under concurrency, with no timeout.
+	if len(plan.pChild) > 0 {
+		if err := s.ensureSpendJournalPartition(ctx, notedHeight); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	dbTx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] begin", err)
@@ -190,7 +191,7 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash,
 	// marked but unfindable.
 	if len(plan.pChild) > 0 {
 		if _, err = dbTx.Exec(ctx, noteConflictingChildrenSQL,
-			plan.pLeaf, plan.pTxid, plan.pChild); err != nil {
+			int32(notedHeight), plan.pTxid, plan.pChild); err != nil { //nolint:gosec // a chain height fits int32
 			return nil, nil, errors.NewStorageError("[utxoset][SetConflicting] note parents", err)
 		}
 	}

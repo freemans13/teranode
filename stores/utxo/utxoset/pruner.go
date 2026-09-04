@@ -14,8 +14,9 @@ import (
 // pruner and the vacuum they forced together measured 76.7% of all disk reads and 52% of
 // statement write-ahead log volume, with the watermark thousands of blocks behind the tip.
 //
-// What is left is three catalog operations on three horizons. Transaction bodies retire on
-// DefaultTxBodyRetentionBlocks, membership windows and the spend journal on
+// What is left is catalog operations on two horizons. Transaction bodies retire on
+// DefaultTxBodyRetentionBlocks; membership windows, the spend journal and the
+// conflict-bookkeeping windows created alongside its leaves retire on
 // DefaultSpendJournalRetentionBlocks. Each is a DROP TABLE of partitions that have aged out,
 // so there is no work list, no probe and no per-row cost that can fall behind.
 //
@@ -89,13 +90,16 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 		return 0, err
 	}
 
+	// The journal's leaves and the conflict-bookkeeping windows that retire with them, in one
+	// pass: a note names a race whose losing spends are restored out of the journal, so
+	// keeping it past its journal leaf would keep an answer nothing can act on.
 	leaves, err := p.store.dropSpendJournalPartitionsBelow(ctx, cutoff)
 	if err != nil {
 		return 0, err
 	}
 
 	if windows > 0 || leaves > 0 {
-		p.store.logger.Infof("[utxoset] pruner dropped %d membership windows and %d spend-journal leaves below height %d",
+		p.store.logger.Infof("[utxoset] pruner dropped %d membership windows and %d spend-journal and conflict partitions below height %d",
 			windows, leaves, cutoff)
 	}
 

@@ -42,7 +42,8 @@ func newTestStoreWith(t *testing.T, tune func(*settings.Settings)) (*Store, cont
 	                       DROP TABLE IF EXISTS tx_ident CASCADE;
 	                       DROP TABLE IF EXISTS tx_body CASCADE;
 	                       DROP TABLE IF EXISTS tx_mined CASCADE;
-	                       DROP TABLE IF EXISTS tx_mined_floor CASCADE;`)
+	                       DROP TABLE IF EXISTS tx_mined_floor CASCADE;
+	                       DROP TABLE IF EXISTS conflict_children CASCADE;`)
 
 	// Sweep up detached partitions the parent drop cannot reach. DROP TABLE removes a
 	// partitioned parent and everything still ATTACHED to it; anything detached is an
@@ -53,7 +54,7 @@ func newTestStoreWith(t *testing.T, tune func(*settings.Settings)) (*Store, cont
         SELECT c.relname FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE n.nspname = current_schema() AND c.relkind = 'r'
-           AND c.relname ~ '^(tx_body_w|tx_ident_l|utxo_p|spend_journal_|tx_mined_w)[0-9]+$'`)
+           AND c.relname ~ '^(tx_body_w|tx_ident_l|utxo_p|spend_journal_|conflict_children_|tx_mined_w)[0-9]+$'`)
 	if oerr == nil {
 		var names []string
 

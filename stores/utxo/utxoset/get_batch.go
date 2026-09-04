@@ -17,9 +17,15 @@ type getResult struct {
 }
 
 // getItem is a single read waiting for its batch to flush.
+//
+// wantChildren travels with the item because two reads in one batch can disagree about it: the
+// validator resolving a parent never wants the contest, and a conflict walk always does. The
+// batch runs the extra statement if ANY item asked, which is one statement for the batch
+// rather than one per asking caller, and gives an item that did not ask a field it can ignore.
 type getItem struct {
-	hash chainhash.Hash
-	done chan getResult
+	hash         chainhash.Hash
+	wantChildren bool
+	done         chan getResult
 }
 
 // newGetBatcher funnels single reads into one BatchDecorate call, which is what the sql
@@ -44,11 +50,17 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 	ctx := context.Background()
 
 	hashes := make([]chainhash.Hash, len(batch))
+	wantChildren := false
+
 	for i, it := range batch {
 		hashes[i] = it.hash
+
+		if it.wantChildren {
+			wantChildren = true
+		}
 	}
 
-	res, err := s.lookupMany(ctx, hashes)
+	res, err := s.lookupMany(ctx, hashes, wantChildren)
 	if err != nil {
 		for _, it := range batch {
 			it.done <- getResult{err: err}
@@ -150,10 +162,11 @@ func (s *Store) sendLockBatch(batch []*lockItem) {
 }
 
 // getBatched routes one read through the batcher.
-func (s *Store) getBatched(ctx context.Context, hash *chainhash.Hash) (*meta.Data, error) {
+func (s *Store) getBatched(ctx context.Context, hash *chainhash.Hash,
+	wantChildren bool) (*meta.Data, error) {
 	done := make(chan getResult, 1)
 
-	s.getBatcher.PutCtx(ctx, &getItem{hash: *hash, done: done})
+	s.getBatcher.PutCtx(ctx, &getItem{hash: *hash, wantChildren: wantChildren, done: done})
 
 	select {
 	case res := <-done:

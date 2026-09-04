@@ -7,55 +7,29 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
-// removeConflictingChildrenSQL takes named transactions off the lists their parents keep of who
-// contested their coins.
+// removeConflictingChildrenSQL deletes the recorded contest between named parents and named
+// children.
 //
-// The grouping is correctness rather than tidiness. PostgreSQL applies at most one update to a
-// row per statement, so a parent named by ten removals would otherwise see only one of them
-// take effect. The offline rewind genuinely produces that shape, because two deleted children
-// can share a parent.
+// It is a DELETE of rows rather than a rebuild of a packed list, and that is the whole
+// difference the side table makes here. The list used to be a concatenation of 32-byte ids in
+// one column, so a removal had to split it, drop the named entries and reassemble the rest in
+// order -- with the membership test aligned to a 32-byte boundary, because a plain substring
+// search matches a window straddling two neighbouring entries and as a remover deletes bytes
+// that were never an entry, corrupting both neighbours and leaving a length the reader
+// rejects. One row per (parent, child) makes that entire class of defect impossible.
 //
-// The rebuild splits the list into 32-byte chunks, drops the ones named, and reassembles the
-// rest in their original order. Insertion order is load-bearing everywhere this store packs a
-// list.
+// The pairs arrive as two parallel arrays, one element per removal, and every window is
+// searched: a pair can have been noted at any height still inside the journal's retention, and
+// the caller does not know which. Each window carries an index on (parent_txid).
 //
-// Membership is tested on a 32-byte BOUNDARY, which is the same test the two writers of this
-// column use, run in the opposite direction. Without the alignment a plain substring search
-// matches a window straddling two neighbouring entries, and as a remover that deletes bytes
-// that were never an entry, corrupting both neighbours and leaving a length the reader rejects.
-// Writer and remover have to agree on what membership means, or the column means two different
-// things.
-//
-// The guard is where idempotence lives and where a no-op costs nothing. A parent the store does
-// not hold fails the join, a parent with no list yields no chunks, and a child that was never
-// noted matches nothing. All three write no row, no journal and no vacuum debt.
-//
-// The rebuild reads the column inside the SET expression rather than through a separate read.
-// Under the default isolation an update that meets a concurrently-updated row re-evaluates both
-// its condition and its assignment against the new version, so the appender running at
-// validator rate cannot lose a note to this statement.
-//
-// An emptied list becomes NULL, which is what a transaction that never had a contesting child
-// already carries, so the two ways of saying "none" stay one.
+// Idempotence is free, and a no-op costs nothing. A parent the store never held, a pair that
+// was never noted, and a second run after the first succeeded all match no row, so they write
+// no row, no journal and no vacuum debt.
 const removeConflictingChildrenSQL = `
-WITH k AS (
-    SELECT leaf, parent, array_agg(DISTINCT child) AS drop_list
-      FROM unnest($1::smallint[], $2::bytea[], $3::bytea[]) AS t(leaf, parent, child)
-     GROUP BY leaf, parent
-)
-UPDATE tx_ident i
-   SET conflicting_children = (
-           SELECT string_agg(substring(i.conflicting_children from g * 32 + 1 for 32),
-                             ''::bytea ORDER BY g)
-             FROM generate_series(0, coalesce(length(i.conflicting_children), 0) / 32 - 1) g
-            WHERE NOT (substring(i.conflicting_children from g * 32 + 1 for 32) = ANY (k.drop_list)))
-  FROM k
- WHERE i.leaf = k.leaf
-   AND i.txid = k.parent
-   AND EXISTS (
-           SELECT 1
-             FROM generate_series(0, coalesce(length(i.conflicting_children), 0) / 32 - 1) g
-            WHERE substring(i.conflicting_children from g * 32 + 1 for 32) = ANY (k.drop_list))`
+DELETE FROM conflict_children c
+ USING unnest($1::bytea[], $2::bytea[]) AS k(parent, child)
+ WHERE c.parent_txid = k.parent
+   AND c.child_txid  = k.child`
 
 // removeBlockIDsSQL strips named blocks from the transactions that claim them.
 //
@@ -102,7 +76,6 @@ func (s *Store) RemoveFromConflictingChildren(ctx context.Context, removals []ut
 		return nil
 	}
 
-	leaves := make([]int16, 0, len(removals))
 	parents := make([][]byte, 0, len(removals))
 	children := make([][]byte, 0, len(removals))
 
@@ -111,7 +84,6 @@ func (s *Store) RemoveFromConflictingChildren(ctx context.Context, removals []ut
 			continue
 		}
 
-		leaves = append(leaves, LeafFor(r.ParentHash[:]))
 		parents = append(parents, r.ParentHash[:])
 		children = append(children, r.ChildHash[:])
 	}
@@ -120,7 +92,7 @@ func (s *Store) RemoveFromConflictingChildren(ctx context.Context, removals []ut
 		return nil
 	}
 
-	if _, err := s.pool.Exec(ctx, removeConflictingChildrenSQL, leaves, parents, children); err != nil {
+	if _, err := s.pool.Exec(ctx, removeConflictingChildrenSQL, parents, children); err != nil {
 		return errors.NewStorageError("[utxoset][RemoveFromConflictingChildren]", err)
 	}
 

@@ -127,13 +127,37 @@ func (s *Store) ensureSpendJournalPartition(ctx context.Context, height uint32) 
 	lo := leaf * SpendJournalPartitionBlocks
 	hi := lo + SpendJournalPartitionBlocks
 
+	// The conflict-bookkeeping window is created in the SAME statement, over the SAME range,
+	// and that is the invariant it rests on: a note lands at the store's current height, which
+	// is the height whose journal leaf the spend path has already ensured, so the window a
+	// note needs exists whenever its journal leaf does. Two separate ensure calls, or a window
+	// created on first note, would leave the one case that matters -- a conflict noted at a
+	// height nothing has spent at -- failing with "no partition found for row".
+	//
+	// The unique index is PER WINDOW rather than on the parent. A unique index on a
+	// partitioned table must include the partition key, and (noted_height, parent_txid,
+	// child_txid) would admit the same pair twice at two heights, so it would buy nothing the
+	// reader's DISTINCT does not already have to do. Per window it makes the repeated note
+	// inside one window -- the common case, since a losing transaction is re-offered -- an
+	// ON CONFLICT DO NOTHING that writes nothing at all.
+	//
+	// It is also the ONE index, and that is deliberate rather than an omission. Every read of
+	// this table is by parent_txid, which LEADS the pair, so a second index on (parent_txid)
+	// alone can only duplicate work the planner already does here: measured at 500 keys
+	// against 40,000 rows in six windows, with both indexes present, the read and the removal
+	// both chose the pair index and neither touched the parent-only one. A second index on a
+	// table written on every double-spend is write amplification for nothing.
 	ddl := fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS spend_journal_%[1]d PARTITION OF spend_journal
   FOR VALUES FROM (%[2]d) TO (%[3]d)
   WITH (fillfactor = 100,
         autovacuum_vacuum_scale_factor = 0,
         autovacuum_vacuum_threshold    = 50000);
-CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey);`, leaf, lo, hi)
+CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey);
+CREATE TABLE IF NOT EXISTS conflict_children_%[1]d PARTITION OF conflict_children
+  FOR VALUES FROM (%[2]d) TO (%[3]d);
+CREATE UNIQUE INDEX IF NOT EXISTS conflict_children_%[1]d_pair
+    ON conflict_children_%[1]d (parent_txid, child_txid);`, leaf, lo, hi)
 
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return errors.NewStorageError("[utxoset] create spend-journal partition %d", leaf, err)
@@ -159,7 +183,9 @@ CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey
 	return nil
 }
 
-// journalLeafSQL lists every journal leaf this store owns, in whichever state it is in.
+// partitionLeafSQL lists every leaf of one height-partitioned parent, in whichever state it
+// is in. The parent's name is substituted twice: once as the regclass the state columns are
+// judged against, and once as the name prefix that identifies an orphan.
 //
 // Three states matter, and all three were verified against PostgreSQL 17 rather than
 // assumed:
@@ -168,24 +194,78 @@ CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey
 //   - ORPHANED. A crash between DETACH and DROP leaves a fully standalone table:
 //     relispartition goes FALSE and the pg_inherits row is GONE. A listing that joins
 //     pg_inherits can never see it again, so it would leak forever. Found here by name
-//     within the journal's own schema, which is the only thing left that identifies it.
+//     within the parent's own schema, which is the only thing left that identifies it.
 //   - DETACH PENDING. A crash DURING a concurrent detach leaves inhdetachpending set.
 //     PostgreSQL then refuses any further ATTACH or DETACH on the parent -- "partition
 //     already pending detach", hinting at FINALIZE -- so an unhandled one wedges every
 //     future drop rather than leaking quietly.
 //
-// Scoped to the schema that 'spend_journal'::regclass resolves to, so this agrees with the
+// Scoped to the schema that the parent's regclass resolves to, so this agrees with the
 // unqualified DETACH below about which table it means.
-const journalLeafSQL = `
+const partitionLeafSQL = `
 SELECT c.relname,
        c.relispartition,
        COALESCE(i.inhdetachpending, false)
   FROM pg_class c
   LEFT JOIN pg_inherits i
-         ON i.inhrelid = c.oid AND i.inhparent = 'spend_journal'::regclass
- WHERE c.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'spend_journal'::regclass)
+         ON i.inhrelid = c.oid AND i.inhparent = '%[1]s'::regclass
+ WHERE c.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = '%[1]s'::regclass)
    AND c.relkind  = 'r'
-   AND c.relname ~ '^spend_journal_[0-9]+$'`
+   AND c.relname ~ '^%[1]s_[0-9]+$'`
+
+// journalLeafParents are the two parents whose leaves retire TOGETHER on the journal's
+// cutoff, oldest first, in one pass.
+//
+// conflict_children is here rather than on a horizon of its own because its retention is not
+// an independent choice. It records which losing transactions contest a parent's coin, and
+// what conflict resolution DOES with that answer is restore the losing spends out of the
+// journal. A note whose journal leaf has been dropped names a race that can no longer be
+// undone, so keeping it past the journal would be keeping an answer nothing can act on.
+var journalLeafParents = []string{"spend_journal", "conflict_children"}
+
+// leafState is one partition of one of those parents, and which of the three states it is in.
+type leafState struct {
+	parent        string
+	name          string
+	leaf          uint32
+	attached      bool
+	detachPending bool
+}
+
+// listPartitionLeaves reads the leaves of one partitioned parent.
+func (s *Store) listPartitionLeaves(ctx context.Context, parent string) ([]leafState, error) {
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(partitionLeafSQL, parent))
+	if err != nil {
+		return nil, errors.NewStorageError("[utxoset] list %s leaves", parent, err)
+	}
+
+	var out []leafState
+
+	for rows.Next() {
+		l := leafState{parent: parent}
+		if err := rows.Scan(&l.name, &l.attached, &l.detachPending); err != nil {
+			rows.Close()
+			return nil, errors.NewStorageError("[utxoset] scan %s leaf", parent, err)
+		}
+
+		// A name carrying no leaf number is not one of ours. Parsing here rather than in the
+		// drop loop keeps it in one place, so the ordering below and the cutoff test can never
+		// disagree about which leaf a table is.
+		if _, err := fmt.Sscanf(l.name, parent+"_%d", &l.leaf); err != nil {
+			continue
+		}
+
+		out = append(out, l)
+	}
+
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return nil, errors.NewStorageError("[utxoset] list %s leaves", parent, err)
+	}
+
+	return out, nil
+}
 
 // DropSpendJournalPartitionsBelow drops journal leaves entirely below height, and returns how
 // many it dropped.
@@ -203,43 +283,26 @@ func (s *Store) DropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	return s.dropSpendJournalPartitionsBelow(ctx, height)
 }
 
-// dropSpendJournalPartitionsBelow drops journal leaves below height.
+// dropSpendJournalPartitionsBelow drops journal leaves, and the conflict-bookkeeping windows
+// that retire with them, below height.
+//
+// Both parents are listed and merged into ONE ordered pass rather than dropped in two loops.
+// The three-state handling is per table, because a crash between detaching the journal leaf
+// and detaching its conflict window leaves the two in different states, and the ordering
+// argument below is about age rather than about which parent a table belongs to.
+//
+// The count returned is the number of tables dropped across both parents, which is what the
+// pruner logs. It is not a leaf count and does not claim to be.
 func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint32) (int, error) {
-	rows, err := s.pool.Query(ctx, journalLeafSQL)
-	if err != nil {
-		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
-	}
-
-	type leafState struct {
-		name          string
-		leaf          uint32
-		attached      bool
-		detachPending bool
-	}
-
 	var leaves []leafState
 
-	for rows.Next() {
-		var l leafState
-		if err := rows.Scan(&l.name, &l.attached, &l.detachPending); err != nil {
-			rows.Close()
-			return 0, errors.NewStorageError("[utxoset] scan spend-journal leaf", err)
+	for _, parent := range journalLeafParents {
+		found, err := s.listPartitionLeaves(ctx, parent)
+		if err != nil {
+			return 0, err
 		}
 
-		// A name carrying no leaf number is not one of ours. Parsing here rather than in the
-		// drop loop keeps it in one place, so the ordering below and the cutoff test can never
-		// disagree about which leaf a table is.
-		if _, err := fmt.Sscanf(l.name, "spend_journal_%d", &l.leaf); err != nil {
-			continue
-		}
-
-		leaves = append(leaves, l)
-	}
-
-	rows.Close()
-
-	if err := rows.Err(); err != nil {
-		return 0, errors.NewStorageError("[utxoset] list spend-journal leaves", err)
+		leaves = append(leaves, found...)
 	}
 
 	// OLDEST FIRST, and the ordering is load-bearing once there is a backlog.
@@ -256,7 +319,16 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 	// oldest is what gets attacked; in catalog order it can sit untouched indefinitely while
 	// newer leaves churn, which is exactly what the mainnet box showed with leaf 4,676 still
 	// present while the session worked on 9,353.
-	sort.Slice(leaves, func(i, j int) bool { return leaves[i].leaf < leaves[j].leaf })
+	//
+	// The parent name breaks the tie so the order is total rather than dependent on the sort
+	// being stable, which sort.Slice is not.
+	sort.Slice(leaves, func(i, j int) bool {
+		if leaves[i].leaf != leaves[j].leaf {
+			return leaves[i].leaf < leaves[j].leaf
+		}
+
+		return leaves[i].parent < leaves[j].parent
+	})
 
 	cutoff := height / SpendJournalPartitionBlocks
 	dropped := 0
@@ -271,8 +343,8 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 			// FINALIZE is the only way out of this state, and until it runs no other
 			// partition of this table can be detached either.
 			if _, err := s.pool.Exec(ctx,
-				fmt.Sprintf(`ALTER TABLE spend_journal DETACH PARTITION %s FINALIZE`, l.name)); err != nil {
-				return dropped, errors.NewStorageError("[utxoset] finalize detach of spend-journal leaf %s", l.name, err)
+				fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s FINALIZE`, l.parent, l.name)); err != nil {
+				return dropped, errors.NewStorageError("[utxoset] finalize detach of leaf %s", l.name, err)
 			}
 
 		case l.attached:
@@ -282,8 +354,8 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 			// does not. It cannot run inside a transaction block, which is why this is a
 			// single-statement Exec on its own and not folded into one.
 			if _, err := s.pool.Exec(ctx,
-				fmt.Sprintf(`ALTER TABLE spend_journal DETACH PARTITION %s CONCURRENTLY`, l.name)); err != nil {
-				return dropped, errors.NewStorageError("[utxoset] detach spend-journal leaf %s", l.name, err)
+				fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s CONCURRENTLY`, l.parent, l.name)); err != nil {
+				return dropped, errors.NewStorageError("[utxoset] detach leaf %s", l.name, err)
 			}
 
 		default:
@@ -292,7 +364,7 @@ func (s *Store) dropSpendJournalPartitionsBelow(ctx context.Context, height uint
 		}
 
 		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %s`, l.name)); err != nil {
-			return dropped, errors.NewStorageError("[utxoset] drop spend-journal leaf %s", l.name, err)
+			return dropped, errors.NewStorageError("[utxoset] drop leaf %s", l.name, err)
 		}
 
 		dropped++

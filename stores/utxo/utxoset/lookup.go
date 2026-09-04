@@ -37,7 +37,7 @@ import (
 // which is why created_height is immutable there: if it moved, the body could not be found.
 const identByTxidSQL = `
 SELECT i.txid, i.created_height, i.off_chain_since, i.membership, i.fee, i.size_in_bytes,
-       i.tx_inpoints, i.locktime, i.created_at, i.conflicting_children, i.flags, b.raw_tx
+       i.tx_inpoints, i.locktime, i.created_at, i.flags, b.raw_tx
   FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
   JOIN tx_ident i ON i.leaf = k.leaf AND i.txid = k.txid
   LEFT JOIN tx_body b ON b.created_height = i.created_height AND b.txid = i.txid`
@@ -144,7 +144,8 @@ func (r *lookupResult) resolved(h chainhash.Hash) bool {
 // The returned error is for faults that are NOT per-transaction: a dead connection, a syntax
 // error, a partition that vanished mid-read. Those really do fail every entry, because nothing
 // was answered.
-func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash) (lookupResult, error) {
+func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash,
+	wantChildren bool) (lookupResult, error) {
 	res := newLookupResult(len(hashes))
 	if len(hashes) == 0 {
 		return res, nil
@@ -175,27 +176,129 @@ func (s *Store) lookupMany(ctx context.Context, hashes []chainhash.Hash) (lookup
 		return lookupResult{}, err
 	}
 
+	// The later steps are SKIPPED rather than returned from when nothing is left to ask
+	// about, because the contest read below has to run whether or not the identity table
+	// answered everything.
 	rest := stillMissing(uniq, &res)
-	if len(rest) == 0 {
-		return res, nil
+
+	if len(rest) > 0 {
+		// Step 2: membership by transaction id.
+		if err := s.readMinedInto(ctx, rest, &res); err != nil {
+			return lookupResult{}, err
+		}
+
+		rest = stillMissing(rest, &res)
 	}
 
-	// Step 2: membership by transaction id.
-	if err := s.readMinedInto(ctx, rest, &res); err != nil {
-		return lookupResult{}, err
+	if len(rest) > 0 {
+		// Step 3: the coin.
+		if err := s.readCoinFacts(ctx, rest, &res); err != nil {
+			return lookupResult{}, err
+		}
 	}
 
-	rest = stillMissing(rest, &res)
-	if len(rest) == 0 {
-		return res, nil
-	}
-
-	// Step 3: the coin.
-	if err := s.readCoinFacts(ctx, rest, &res); err != nil {
-		return lookupResult{}, err
+	// The contest, if the caller asked for it, for every transaction ANY step answered. A
+	// mined parent is contested exactly as a mempool one is, so this cannot be folded into
+	// the identity read: the parents that matter most are the ones that left it.
+	if wantChildren {
+		if err := s.attachConflictingChildren(ctx, uniq, &res); err != nil {
+			return lookupResult{}, err
+		}
 	}
 
 	return res, nil
+}
+
+// conflictChildrenSQL names the transactions recorded as contesting each of these
+// transactions' coins.
+//
+// One statement for the whole batch, keyed on the parent's transaction id alone. That is what
+// makes it answer for a parent in the identity table, a parent in the membership table, and a
+// parent this store knows only from a live coin -- the packed column it replaces could only
+// ever answer for the first of the three.
+//
+// DISTINCT because the uniqueness underneath is PER WINDOW: a unique index on a partitioned
+// table must include the partition key, so the same (parent, child) pair noted in two windows
+// is two legal rows. See the schema comment on conflict_children.
+//
+// The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, which is the same shape and
+// the same reason as minedByTxidSQL. Written as the plain `WHERE c.parent_txid = ANY($1)` the
+// planner has no statistics for an array and guesses a sixth of each window, so it seq-scans
+// every live window: measured at 500 keys against 40,000 rows in six windows, 2.3 ms with a
+// Seq Scan on all six. OFFSET 0 is the fence itself -- it stops the subquery being pulled up
+// into the outer join, which is what re-admits the scan -- and each window's unique index,
+// which parent_txid leads, then gives one descent per key per window: 2.7 ms, flat across
+// eight executions.
+const conflictChildrenSQL = `
+SELECT DISTINCT k.parent, hit.child_txid
+  FROM unnest($1::bytea[]) AS k(parent)
+ CROSS JOIN LATERAL (
+   SELECT c.child_txid
+     FROM conflict_children c
+    WHERE c.parent_txid = k.parent
+   OFFSET 0
+ ) AS hit`
+
+// attachConflictingChildren fills in the contest on every transaction the read found.
+//
+// Asked for rather than always run, and it is the second field on this store that works that
+// way: everything else a metadata read returns arrives on the row that answered, so narrowing
+// a projection would save nothing, while this costs a statement of its own. The shared
+// conflict walks name fields.ConflictingChildren when they need it, and the validator's
+// parent resolution never does.
+//
+// A transaction with no contest gets a nil slice rather than an empty one, which is what a
+// caller reading "no conflicting children" already expects from every other store.
+func (s *Store) attachConflictingChildren(ctx context.Context, hashes []chainhash.Hash,
+	res *lookupResult) error {
+	if len(res.found) == 0 {
+		return nil
+	}
+
+	parents := make([][]byte, 0, len(res.found))
+
+	for i := range hashes {
+		if _, ok := res.found[hashes[i]]; ok {
+			parents = append(parents, hashes[i][:])
+		}
+	}
+
+	if len(parents) == 0 {
+		return nil
+	}
+
+	rows, err := s.pool.Query(ctx, conflictChildrenSQL, parents)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][lookup] conflicting children", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var parent, child []byte
+
+		if err := rows.Scan(&parent, &child); err != nil {
+			return errors.NewStorageError("[utxoset][lookup] conflicting children scan", err)
+		}
+
+		var p, c chainhash.Hash
+
+		copy(p[:], parent)
+		copy(c[:], child)
+
+		data := res.found[p]
+		if data == nil {
+			continue
+		}
+
+		data.ConflictingChildren = append(data.ConflictingChildren, c)
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][lookup] conflicting children", err)
+	}
+
+	return nil
 }
 
 // stillMissing returns the hashes no step so far has answered.
@@ -234,7 +337,7 @@ func (s *Store) readIdentRows(ctx context.Context, leaves []int16, txids [][]byt
 
 		if err := rows.Scan(&txid, &r.createdHeight, &r.offChainSince, &r.membership,
 			&r.fee, &r.sizeInBytes, &r.txInpoints, &r.locktime, &r.createdAt,
-			&r.conflictingChildren, &r.flags, &r.rawTx); err != nil {
+			&r.flags, &r.rawTx); err != nil {
 			return errors.NewStorageError("[utxoset][lookup] identity scan", err)
 		}
 

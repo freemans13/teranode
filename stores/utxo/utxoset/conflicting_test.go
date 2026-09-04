@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
 )
 
@@ -112,7 +113,7 @@ func TestSetConflictingNotesTheContestOnItsParents(t *testing.T) {
 	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*ch}, true)
 	require.NoError(t, err)
 
-	pmeta, err := s.Get(ctx, parent.TxIDChainHash())
+	pmeta, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
 	require.NoError(t, err)
 	require.Len(t, pmeta.ConflictingChildren, 1)
 	require.Equal(t, ch.String(), pmeta.ConflictingChildren[0].String(),
@@ -122,7 +123,7 @@ func TestSetConflictingNotesTheContestOnItsParents(t *testing.T) {
 	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*ch}, true)
 	require.NoError(t, err)
 
-	pmeta, err = s.Get(ctx, parent.TxIDChainHash())
+	pmeta, err = s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
 	require.NoError(t, err)
 	require.Len(t, pmeta.ConflictingChildren, 1, "a repeat must not be noted twice")
 }
@@ -259,47 +260,152 @@ func TestSetConflictingOnAnEmptyListIsANoOp(t *testing.T) {
 	require.Empty(t, next)
 }
 
-// TestNotingAConflictingChildTestsMembershipOnA32ByteBoundary is a defect test for the
-// statement create.go uses when it stores a transaction already known to be conflicting.
+// TestNotingTheSameContestTwiceRecordsItOnce.
 //
-// The column is a concatenation of 32-byte transaction ids, and the reader unpacks it that way
-// and rejects a length that is not a multiple of 32. A plain substring search can therefore
-// match bytes that STRADDLE two neighbouring entries, read that as already-present, and
-// silently skip a real append. The parent then never names one of the transactions contesting
-// its coin, and conflict resolution has no route to it.
+// This replaces a defect test for the packed column the bookkeeping used to live in. That
+// column was a concatenation of 32-byte ids, so membership had to be tested on a 32-byte
+// boundary: a plain substring search matches bytes STRADDLING two neighbouring entries, reads
+// that as already-present, and silently skips a real append. One row per child cannot be
+// matched straddling its neighbours, so that whole class of defect is gone rather than
+// defended against.
 //
-// The straddling value is planted directly, because no amount of test data will produce one by
-// chance from real transaction ids.
-func TestNotingAConflictingChildTestsMembershipOnA32ByteBoundary(t *testing.T) {
+// What is left to pin is the dedupe, which now has two halves. Inside one window the unique
+// index and ON CONFLICT DO NOTHING make a repeat write nothing; across windows the same pair
+// is two legal rows, because a unique index on a partitioned table must include the partition
+// key, so the READER has to say DISTINCT. Both are exercised: the store's height is moved past
+// a window boundary between the two notes.
+func TestNotingTheSameContestTwiceRecordsItOnce(t *testing.T) {
 	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(100))
 
-	var parent, childA, childB, straddler [32]byte
-
-	for i := 0; i < 32; i++ {
-		parent[i] = byte(i)
-		childA[i] = byte(0xa0 + i)
-		childB[i] = byte(0xb0 + i)
-	}
-
-	// Exactly the second half of A followed by the first half of B, so it appears in A||B at
-	// offset 16 and at no 32-byte boundary.
-	copy(straddler[:16], childA[16:])
-	copy(straddler[16:], childB[:16])
-
-	_, err := s.pool.Exec(ctx, `
-        INSERT INTO tx_ident (leaf, txid, created_height, conflicting_children)
-        VALUES ($1, $2, 100, $3)`,
-		LeafFor(parent[:]), parent[:], append(append([]byte{}, childA[:]...), childB[:]...))
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
 	require.NoError(t, err)
 
-	_, err = s.pool.Exec(ctx, noteConflictSQL, LeafFor(parent[:]), parent[:], straddler[:])
+	loser := spendOutput(t, parent, 0, 1)
+	_, err = s.Create(ctx, loser, 100, utxo.WithConflicting(true))
 	require.NoError(t, err)
 
-	var got []byte
-	require.NoError(t, s.pool.QueryRow(ctx,
-		`SELECT conflicting_children FROM tx_ident WHERE txid = $1`, parent[:]).Scan(&got))
+	// Same window: the insert's ON CONFLICT is what absorbs this.
+	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*loser.TxIDChainHash()}, true)
+	require.NoError(t, err)
 
-	require.Len(t, got, 96,
-		"a value that only appears straddling two entries is NOT present, and must be appended")
-	require.Equal(t, straddler[:], got[64:96], "and appended at the end, on the boundary")
+	// A different window: two rows now exist, and only the reader's DISTINCT hides them.
+	require.NoError(t, s.SetBlockHeight(100+SpendJournalPartitionBlocks))
+
+	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*loser.TxIDChainHash()}, true)
+	require.NoError(t, err)
+
+	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
+	require.NoError(t, err)
+	require.Len(t, got.ConflictingChildren, 1, "a repeat must not be named twice")
+	require.Equal(t, loser.TxID(), got.ConflictingChildren[0].String())
+}
+
+// TestConflictingChildrenSurviveTheParentLeavingTheIdentityTable.
+//
+// A contested parent is very often a MINED transaction, and a mined transaction has no
+// identity row: the longest-chain stamp moved it into the membership table. Bookkeeping kept
+// on the identity row therefore has nowhere to land, and the note becomes a zero-row update.
+// The route from a contested coin to the transactions competing for it is the only route
+// conflict resolution has, so losing it loses the conflict.
+func TestConflictingChildrenSurviveTheParentLeavingTheIdentityTable(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_101))
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 700_099)
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(parent),
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true})
+	require.NoError(t, err)
+	require.False(t, identExists(t, s, ctx, parent),
+		"the stamp must have moved the parent out of the identity table, or this test proves nothing")
+
+	loser := spendOneOutput(t, s, ctx, parent, 0, 700_101)
+
+	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*loser.TxIDChainHash()}, true)
+	require.NoError(t, err)
+
+	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{*loser.TxIDChainHash()}, got.ConflictingChildren,
+		"a mined parent must still name the transaction contesting its coin")
+}
+
+// TestConflictingChildrenSurviveAParentSettledByTheIdlessStamp is the same requirement on the
+// other move.
+//
+// A stamp for a block not yet known to be on the longest chain leaves the row in the identity
+// table carrying one triple; MarkTransactionsOnLongestChain then settles it and moves it out.
+// That move used to refuse a row carrying conflicting children, so the bookkeeping pinned the
+// transaction in the mempool table forever -- and the transaction stayed pinned whether or not
+// anything ever read the list.
+func TestConflictingChildrenSurviveAParentSettledByTheIdlessStamp(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_101))
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 700_099)
+	require.NoError(t, err)
+
+	// No OnLongestChain: the row stays in the identity table with one triple.
+	_, err = s.SetMinedMulti(ctx, hashes(parent),
+		utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100})
+	require.NoError(t, err)
+	require.True(t, identExists(t, s, ctx, parent))
+
+	loser := spendOneOutput(t, s, ctx, parent, 0, 700_101)
+
+	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*loser.TxIDChainHash()}, true)
+	require.NoError(t, err)
+
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
+		[]chainhash.Hash{*parent.TxIDChainHash()}, true))
+	require.False(t, identExists(t, s, ctx, parent),
+		"a contested parent must settle like any other, not be pinned by its own bookkeeping")
+	require.Equal(t, 1, minedRows(t, s, ctx, parent))
+
+	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{*loser.TxIDChainHash()}, got.ConflictingChildren)
+}
+
+// TestConflictingChildrenAnswerForAParentKnownOnlyFromItsCoin is the third read step.
+//
+// A transaction whose membership window has been dropped is known to this store only through
+// one of its own live coins -- which is exactly what a pruned SV Node can say about a parent
+// whose block it no longer holds. The contest is keyed on the txid rather than on whichever
+// row answered, so it must attach to that answer too. Folding it into the identity read, or
+// into the membership read, would have lost it here.
+func TestConflictingChildrenAnswerForAParentKnownOnlyFromItsCoin(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_101))
+
+	// The block path, so the parent never has an identity row at all. TWO outputs, because the
+	// coin the read answers from has to survive the spend below.
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 7, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err)
+	require.Equal(t, 1, dropped, "the membership window has to be gone for this test to mean anything")
+
+	loser := spendOneOutput(t, s, ctx, parent, 0, 700_101)
+
+	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*loser.TxIDChainHash()}, true)
+	require.NoError(t, err)
+
+	// Neither of the first two steps can answer now, so the coin is the only source left.
+	require.False(t, identExists(t, s, ctx, parent))
+	require.Equal(t, 0, minedRows(t, s, ctx, parent))
+
+	got, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{7}, got.BlockIDs, "the block came off the coin row")
+	require.Nil(t, got.TxInpoints.ParentTxHashes, "and the coin answer is thin, as it is for a pruned parent")
+	require.Equal(t, []chainhash.Hash{*loser.TxIDChainHash()}, got.ConflictingChildren)
 }

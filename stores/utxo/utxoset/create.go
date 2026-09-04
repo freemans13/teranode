@@ -14,35 +14,35 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// noteConflictSQL records a contesting transaction on the parent whose coin it wants.
+// noteConflictSQL records the contesting transaction on every parent whose coin it wants.
 //
 // A transaction that loses a double-spend race is stored as conflicting rather than
 // discarded, because resolving the conflict later has to find it. Finding it means asking the
-// PARENT whose coin was contested, so the parent carries the list. Without it, conflict
-// resolution has no route from a contested coin to the transactions competing for it.
+// PARENT whose coin was contested, so the route runs from the parent, and this statement is
+// what writes it. Without it, conflict resolution has no route from a contested coin to the
+// transactions competing for it.
 //
-// Appended only when the parent does not already name it, so re-offering the same losing
-// transaction does not grow the list. Matched on the full 32-byte txid, never on the ukey
-// prefix alone.
+// It writes to conflict_children rather than to a column on tx_ident, and that is the fix for
+// a real hole rather than a tidy-up. A contested parent is very often MINED, and a mined
+// transaction has no identity row: the stamp moved it into tx_mined. The old UPDATE therefore
+// matched nothing at all for exactly the parents that matter most, and it succeeded while
+// doing so, because an UPDATE that touches no row is not an error.
 //
-// Membership is tested on a 32-byte BOUNDARY. The column is a concatenation of 32-byte ids and
-// the reader unpacks it that way, rejecting any length that is not a multiple of 32. This used
-// to be a plain substring search, which can match bytes STRADDLING two neighbouring entries,
-// read that as already-present, and silently skip a real append: the parent then never names
-// one of the transactions contesting its coin, and conflict resolution has no route to it.
-// setConflictingSQL's own note statement in conflicting.go carries the identical test, and the
-// two must stay identical, because they are two writers of one column.
+// The 32-byte boundary test the old statement carried is gone with the packed column it
+// guarded. One row per child cannot be matched straddling its neighbours, so the whole class
+// of defect no longer exists rather than being defended against.
+//
+// ON CONFLICT DO NOTHING against the window's own unique index is what makes re-offering the
+// same losing transaction free. See the schema comment for why that index is per window and
+// why the reader still has to say DISTINCT.
+//
+// One ARRAY of parents, so a transaction reaching for coins of twenty parents is one
+// statement. $1 is the height, $2 the parents, $3 the one child.
 const noteConflictSQL = `
-UPDATE tx_ident
-   SET conflicting_children = CASE
-           WHEN EXISTS (
-                SELECT 1
-                  FROM generate_series(0, coalesce(length(conflicting_children), 0) / 32 - 1) g
-                 WHERE substring(conflicting_children from g * 32 + 1 for 32) = $3::bytea)
-           THEN conflicting_children
-           ELSE coalesce(conflicting_children, '\x'::bytea) || $3::bytea
-       END
- WHERE leaf = $1 AND txid = $2`
+INSERT INTO conflict_children (noted_height, parent_txid, child_txid)
+SELECT $1::int, p.parent, $3::bytea
+  FROM unnest($2::bytea[]) AS p(parent)
+ON CONFLICT DO NOTHING`
 
 // packMembership renders mined-block information into the packed form tx_ident carries:
 // 12-byte triples of block id, block height and subtree index, big-endian, in the order the
@@ -183,6 +183,19 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		}
 	}
 
+	// A conflicting create notes the contest on its parents, and that note lands in a
+	// height-partitioned window created alongside the spend journal's leaf. It is ensured
+	// HERE, before the transaction opens, for the same reason the two above are: the DDL
+	// needs its own pool connection, and taking one while holding a transaction from the same
+	// pool deadlocks the pool under concurrency, with no timeout.
+	notedHeight := s.GetBlockHeight()
+
+	if options.Conflicting {
+		if err := s.ensureSpendJournalPartition(ctx, notedHeight); err != nil {
+			return nil, err
+		}
+	}
+
 	// A transaction of its own, because the create claim's advisory lock is
 	// transaction-scoped: on the pool it would be released at the end of its own statement
 	// and would guard nothing. Nothing here is worth more than one commit, so the single
@@ -200,7 +213,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		}
 	}()
 
-	data, cerr := s.createIn(ctx, dbTx, tx, blockHeight, opts...)
+	data, cerr := s.createIn(ctx, dbTx, tx, blockHeight, notedHeight, opts...)
 
 	// ErrTxExists is committed rather than rolled back. The claim wrote nothing at all for a
 	// transaction the store already holds, so the two are equivalent for the claim itself --
@@ -374,7 +387,14 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 // case: what a create writes, and the claim that decides whether it writes at all, is this
 // store's whole idempotence rule, and two copies of it is a defect waiting for one to be
 // edited alone.
-func (s *Store) createIn(ctx context.Context, dbTx pgx.Tx, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
+// notedHeight is the height a conflict note is stamped with, and it is a PARAMETER rather
+// than a read of s.GetBlockHeight() here so that it cannot differ from the height whose
+// window the caller ensured. The note lands in a height-partitioned window that only the
+// caller can create -- the DDL needs its own pool connection, and this function already holds
+// a transaction from the same pool -- so a second read of the tip that crossed a 48-block
+// boundary in between would insert into a partition that does not exist. It is ignored unless
+// the create is conflicting.
+func (s *Store) createIn(ctx context.Context, dbTx pgx.Tx, tx *bt.Tx, blockHeight, notedHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
 	options := &utxo.CreateOptions{}
 	for _, opt := range opts {
 		opt(options)
@@ -392,7 +412,7 @@ func (s *Store) createIn(ctx context.Context, dbTx pgx.Tx, tx *bt.Tx, blockHeigh
 	if options.Conflicting {
 		txHash := tx.TxIDChainHash()
 
-		if cerr := s.noteConflictOnParents(ctx, dbTx, tx, txHash[:]); cerr != nil {
+		if cerr := s.noteConflictOnParents(ctx, dbTx, tx, txHash[:], notedHeight); cerr != nil {
 			return nil, cerr
 		}
 	}
@@ -405,8 +425,14 @@ func (s *Store) createIn(ctx context.Context, dbTx pgx.Tx, tx *bt.Tx, blockHeigh
 }
 
 // noteConflictOnParents tells every parent of a losing transaction that it is being contested.
-func (s *Store) noteConflictOnParents(ctx context.Context, q querier, tx *bt.Tx, txid []byte) error {
+//
+// One statement for the whole input set, not one per parent. notedHeight is the store's
+// current chain height as the CALLER read it, so the window it lands in is the one the caller
+// ensured; see createIn for why that cannot be re-read here.
+func (s *Store) noteConflictOnParents(ctx context.Context, q querier, tx *bt.Tx, txid []byte,
+	notedHeight uint32) error {
 	seen := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
+	parents := make([][]byte, 0, len(tx.Inputs))
 
 	for _, in := range tx.Inputs {
 		if in == nil {
@@ -425,9 +451,15 @@ func (s *Store) noteConflictOnParents(ctx context.Context, q querier, tx *bt.Tx,
 
 		seen[*parent] = struct{}{}
 
-		if _, err := q.Exec(ctx, noteConflictSQL, LeafFor(parent[:]), parent[:], txid); err != nil {
-			return errors.NewStorageError("[utxoset][Create] note conflict on %s", parent.String(), err)
-		}
+		parents = append(parents, parent[:])
+	}
+
+	if len(parents) == 0 {
+		return nil
+	}
+
+	if _, err := q.Exec(ctx, noteConflictSQL, int32(notedHeight), parents, txid); err != nil { //nolint:gosec // a chain height fits int32
+		return errors.NewStorageError("[utxoset][Create] note conflict on %d parents", len(parents), err)
 	}
 
 	return nil

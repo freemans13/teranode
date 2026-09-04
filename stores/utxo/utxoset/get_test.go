@@ -6,6 +6,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
 )
 
@@ -147,12 +148,12 @@ func TestCreatingAConflictingTransactionRecordsItOnItsParents(t *testing.T) {
 	_, err = s.Create(ctx, loser, 100, utxo.WithConflicting(true))
 	require.NoError(t, err)
 
-	got, err := s.Get(ctx, loser.TxIDChainHash())
+	got, err := s.Get(ctx, loser.TxIDChainHash(), fields.ConflictingChildren)
 	require.NoError(t, err)
 	require.True(t, got.Conflicting, "the loser is flagged")
 	require.Empty(t, got.ConflictingChildren, "and has no conflicting children of its own")
 
-	gotParent, err := s.Get(ctx, parent.TxIDChainHash())
+	gotParent, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
 	require.NoError(t, err)
 	require.False(t, gotParent.Conflicting, "the parent did nothing wrong")
 	require.Len(t, gotParent.ConflictingChildren, 1,

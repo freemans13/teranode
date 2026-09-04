@@ -21,6 +21,10 @@ func hashOf(b []byte) *chainhash.Hash {
 // Two parents in one call, each losing a DIFFERENT child, with a second child left on each.
 // An implementation that built one combined drop list and applied it to every named row would
 // pass a single-parent test and fail this one, which is the mutation worth catching.
+//
+// The parents are planted with NO identity row at all, which is the case that matters: a
+// contested parent is usually mined, and this bookkeeping is keyed on the txid rather than
+// hanging off a mempool row.
 func TestRemoveFromConflictingChildrenDropsOnlyWhatIsNamed(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -29,30 +33,42 @@ func TestRemoveFromConflictingChildrenDropsOnlyWhatIsNamed(t *testing.T) {
 	childA1, childA2 := idBytes(0x81), idBytes(0x82)
 	childB1, childB2 := idBytes(0x91), idBytes(0x92)
 
-	plantIdent(t, s, ctx, parentA, nil, nil)
-	plantIdent(t, s, ctx, parentB, nil, nil)
-
-	_, err := s.pool.Exec(ctx, `UPDATE tx_ident SET conflicting_children = $2 WHERE txid = $1`,
-		parentA, append(append([]byte{}, childA1...), childA2...))
-	require.NoError(t, err)
-
-	_, err = s.pool.Exec(ctx, `UPDATE tx_ident SET conflicting_children = $2 WHERE txid = $1`,
-		parentB, append(append([]byte{}, childB1...), childB2...))
-	require.NoError(t, err)
+	plantConflictNote(t, s, ctx, 100, parentA, childA1)
+	plantConflictNote(t, s, ctx, 100, parentA, childA2)
+	plantConflictNote(t, s, ctx, 100, parentB, childB1)
+	plantConflictNote(t, s, ctx, 100, parentB, childB2)
 
 	require.NoError(t, s.RemoveFromConflictingChildren(ctx, []utxo.ConflictingChildRemoval{
 		{ParentHash: hashOf(parentA), ChildHash: hashOf(childA1)},
 		{ParentHash: hashOf(parentB), ChildHash: hashOf(childB2)},
 	}))
 
-	var gotA, gotB []byte
-	require.NoError(t, s.pool.QueryRow(ctx,
-		`SELECT conflicting_children FROM tx_ident WHERE txid = $1`, parentA).Scan(&gotA))
-	require.NoError(t, s.pool.QueryRow(ctx,
-		`SELECT conflicting_children FROM tx_ident WHERE txid = $1`, parentB).Scan(&gotB))
+	require.Equal(t, [][]byte{childA2}, conflictChildrenOf(t, s, ctx, parentA),
+		"A loses its FIRST child and keeps the second")
+	require.Equal(t, [][]byte{childB1}, conflictChildrenOf(t, s, ctx, parentB),
+		"B loses its SECOND child and keeps the first")
+}
 
-	require.Equal(t, childA2, gotA, "A loses its FIRST child and keeps the second")
-	require.Equal(t, childB1, gotB, "B loses its SECOND child and keeps the first")
+// TestRemoveFromConflictingChildrenSearchesEveryWindow. The pair can have been noted at any
+// height still inside the journal's retention, and the caller has no way to know which, so a
+// removal that only looked in the current window would silently leave the route in place.
+func TestRemoveFromConflictingChildrenSearchesEveryWindow(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := idBytes(0x75)
+	child := idBytes(0x85)
+
+	plantConflictNote(t, s, ctx, 100, parent, child)
+	plantConflictNote(t, s, ctx, 5_000, parent, child)
+	require.Equal(t, [][]byte{child}, conflictChildrenOf(t, s, ctx, parent),
+		"the same pair in two windows reads back once")
+
+	require.NoError(t, s.RemoveFromConflictingChildren(ctx, []utxo.ConflictingChildRemoval{
+		{ParentHash: hashOf(parent), ChildHash: hashOf(child)},
+	}))
+
+	require.Empty(t, conflictChildrenOf(t, s, ctx, parent),
+		"both copies must go, or the contest is still findable")
 }
 
 // TestRemoveFromConflictingChildrenIsIdempotentAndSilent. A rewind is re-run after a crash, and
@@ -63,21 +79,14 @@ func TestRemoveFromConflictingChildrenIsIdempotentAndSilent(t *testing.T) {
 	parent := idBytes(0x73)
 	child := idBytes(0x83)
 
-	plantIdent(t, s, ctx, parent, nil, nil)
-
-	_, err := s.pool.Exec(ctx, `UPDATE tx_ident SET conflicting_children = $2 WHERE txid = $1`,
-		parent, child)
-	require.NoError(t, err)
+	plantConflictNote(t, s, ctx, 100, parent, child)
 
 	rm := []utxo.ConflictingChildRemoval{{ParentHash: hashOf(parent), ChildHash: hashOf(child)}}
 
 	require.NoError(t, s.RemoveFromConflictingChildren(ctx, rm))
 	require.NoError(t, s.RemoveFromConflictingChildren(ctx, rm), "removing twice must not fail")
 
-	var got []byte
-	require.NoError(t, s.pool.QueryRow(ctx,
-		`SELECT conflicting_children FROM tx_ident WHERE txid = $1`, parent).Scan(&got))
-	require.Empty(t, got, "an emptied list reads the same as one that never had a child")
+	require.Empty(t, conflictChildrenOf(t, s, ctx, parent))
 
 	// A parent the store does not hold, and a child that was never noted.
 	require.NoError(t, s.RemoveFromConflictingChildren(ctx, []utxo.ConflictingChildRemoval{

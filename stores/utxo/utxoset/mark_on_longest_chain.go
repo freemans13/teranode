@@ -31,8 +31,7 @@ UPDATE tx_ident i
 RETURNING i.txid`
 
 // singleTripleHeightsSQL reads the block height out of the membership of every listed identity
-// row that names exactly one block and carries no conflicting children -- which is exactly the
-// set moveSingleToMinedSQL will move.
+// row that names exactly one block -- which is exactly the set moveSingleToMinedSQL will move.
 //
 // It exists because of an ordering constraint rather than for information: the membership
 // windows those rows will land in have to be created before the transaction opens, since the
@@ -47,8 +46,7 @@ SELECT DISTINCT ((get_byte(i.membership, 4)::bigint << 24)
   FROM tx_ident i
  WHERE i.leaf = $1::smallint
    AND i.txid = ANY($2::bytea[])
-   AND octet_length(i.membership) = 12
-   AND i.conflicting_children IS NULL`
+   AND octet_length(i.membership) = 12`
 
 // moveSingleToMinedSQL settles the identity rows that name exactly ONE block, taking the
 // block's facts from the triple the row itself carries.
@@ -60,8 +58,8 @@ SELECT DISTINCT ((get_byte(i.membership, 4)::bigint << 24)
 // the row already claims -- which is sound only when the row claims exactly one. A row naming
 // two stays where it is with its marker cleared, because nothing here can say which of them is
 // main; it waits for an un-mine or a further stamp to reduce it to one. A row carrying
-// conflicting children stays for the reason moveToMinedSQL leaves it: tx_mined has no column
-// for that bookkeeping yet.
+// conflicting children no longer stays: that bookkeeping is a side table keyed on the txid
+// (see conflict_children in schema.go), so it survives the move.
 //
 // The height, block id and subtree index are decoded big-endian from the twelve bytes, in the
 // order mh_triple and packMembership write them, with the bigint casts mh_max needs: an int4
@@ -83,7 +81,6 @@ WITH moved AS (
      WHERE i.leaf = $1::smallint
        AND i.txid = ANY($2::bytea[])
        AND octet_length(i.membership) = 12
-       AND i.conflicting_children IS NULL
        AND ((get_byte(i.membership, 4)::bigint << 24)
           | (get_byte(i.membership, 5)::bigint << 16)
           | (get_byte(i.membership, 6)::bigint <<  8)

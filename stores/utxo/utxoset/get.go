@@ -40,15 +40,18 @@ func unpackMembership(m []byte) (blockIDs, heights []uint32, subtreeIdxs []int) 
 
 // Get returns everything the store holds about one transaction.
 //
-// The field list is ignored with ONE exception. Whichever of the three steps answers (see
+// The field list is ignored with TWO exceptions. Whichever of the three steps answers (see
 // lookup.go) returns everything that step holds on one row, so narrowing the projection would
 // save a few bytes on the wire and nothing else, while handing a caller a partly populated
 // record it might dereference. Answering the whole question is cheaper than answering half of
 // it carefully.
 //
-// The exception is the per-output spend state, which costs a second query across two tables
-// because this store destroys the coin row on spend and keeps the spender in its journal. That
-// one is answered only when asked for. See decorateSpendingData.
+// The exceptions are the two fields that do NOT arrive on that row. The per-output spend state
+// costs a second query across two tables, because this store destroys the coin row on spend
+// and keeps the spender in its journal (see decorateSpendingData). The contest -- which losing
+// transactions want this one's coins -- costs a second statement against conflict_children,
+// because a contested parent is usually mined and a mined transaction's row is in a different
+// table (see attachConflictingChildren). Both are answered only when asked for.
 func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fields.FieldName) (*meta.Data, error) {
 	if hash == nil {
 		return nil, errors.NewProcessingError("[utxoset][Get] nil hash")
@@ -61,10 +64,12 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fie
 
 	// Batched when configured. The validator resolves parents one at a time from many
 	// goroutines, and each of those is otherwise its own round trip.
+	wantChildren := wantsConflictingChildren(fieldNames)
+
 	if s.getBatcher != nil {
-		data, err = s.getBatched(ctx, hash)
+		data, err = s.getBatched(ctx, hash, wantChildren)
 	} else {
-		data, err = s.getDirect(ctx, hash)
+		data, err = s.getDirect(ctx, hash, wantChildren)
 	}
 
 	if err != nil {
@@ -85,8 +90,9 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fie
 // It is a lookupMany of one rather than a statement of its own. The order identity ->
 // membership -> coin is a correctness rule (see lookup.go), and a second copy of it here is
 // a defect waiting for one copy to be fixed and the other forgotten.
-func (s *Store) getDirect(ctx context.Context, hash *chainhash.Hash) (*meta.Data, error) {
-	res, err := s.lookupMany(ctx, []chainhash.Hash{*hash})
+func (s *Store) getDirect(ctx context.Context, hash *chainhash.Hash,
+	wantChildren bool) (*meta.Data, error) {
+	res, err := s.lookupMany(ctx, []chainhash.Hash{*hash}, wantChildren)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +119,10 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 		return errors.NewProcessingError("[utxoset][GetMeta] nil data")
 	}
 
-	got, err := s.Get(ctx, hash)
+	// Every field, because the caller is refreshing a record it already holds and has no way
+	// to say which parts of it it cares about. That includes the contest, which Get answers
+	// only when named.
+	got, err := s.Get(ctx, hash, fields.ConflictingChildren)
 	if err != nil {
 		return err
 	}
@@ -123,30 +132,6 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 	return nil
 }
 
-// unpackHashes reads a packed run of 32-byte transaction ids.
-func unpackHashes(b []byte) ([]chainhash.Hash, error) {
-	if len(b) == 0 {
-		return nil, nil
-	}
-
-	if len(b)%chainhash.HashSize != 0 {
-		return nil, errors.NewProcessingError("packed hashes are %d bytes, not a multiple of %d",
-			len(b), chainhash.HashSize)
-	}
-
-	out := make([]chainhash.Hash, 0, len(b)/chainhash.HashSize)
-
-	for i := 0; i < len(b); i += chainhash.HashSize {
-		var h chainhash.Hash
-
-		copy(h[:], b[i:i+chainhash.HashSize])
-
-		out = append(out, h)
-	}
-
-	return out, nil
-}
-
 // metaRow is one row as the identity table and its body return it, before it becomes the
 // record a caller sees.
 //
@@ -154,17 +139,16 @@ func unpackHashes(b []byte) ([]chainhash.Hash, error) {
 // "what a stored transaction means" is how the two drift apart on a field nobody notices
 // until something downstream reads a zero.
 type metaRow struct {
-	createdHeight       int32
-	offChainSince       *int32
-	membership          []byte
-	fee                 *int64
-	sizeInBytes         *int32
-	txInpoints          []byte
-	locktime            *int32
-	createdAt           *int64
-	conflictingChildren []byte
-	flags               int16
-	rawTx               []byte
+	createdHeight int32
+	offChainSince *int32
+	membership    []byte
+	fee           *int64
+	sizeInBytes   *int32
+	txInpoints    []byte
+	locktime      *int32
+	createdAt     *int64
+	flags         int16
+	rawTx         []byte
 }
 
 // toMeta turns a stored row into the record callers read.
@@ -177,10 +161,9 @@ func (r *metaRow) toMeta(hash *chainhash.Hash) (*meta.Data, error) {
 
 	data.BlockIDs, data.BlockHeights, data.SubtreeIdxs = unpackMembership(r.membership)
 
-	var err error
-	if data.ConflictingChildren, err = unpackHashes(r.conflictingChildren); err != nil {
-		return nil, errors.NewStorageError("[utxoset] conflicting children %s", hash.String(), err)
-	}
+	// ConflictingChildren is deliberately NOT filled in here. It lives in conflict_children,
+	// keyed on the txid alone rather than on the identity row, and is attached by
+	// attachConflictingChildren when the caller asks for it.
 
 	if r.offChainSince != nil {
 		data.UnminedSince = uint32(*r.offChainSince) //nolint:gosec // a stored height is never negative

@@ -127,11 +127,10 @@ ON CONFLICT (txid, mined_height, block_id) DO NOTHING`
 // mark-on-longest-chain call cannot later say which of them is main, so the row waits for an
 // un-mine or a further stamp to reduce it to one.
 //
-// A row carrying conflicting children is left behind too, and that is a scope boundary rather
-// than a second reading of the same rule. tx_mined has no column for that bookkeeping; it
-// moves to a side table in a later task, and until it does, moving the row would lose the list
-// of children this transaction conflicts with. Its marker is already cleared by the stamp,
-// exactly as the multi-block case's is.
+// A row carrying conflicting children used to be left behind too, because the bookkeeping was
+// a column of tx_ident and tx_mined had nowhere to put it -- so a contested transaction was
+// pinned in the mempool table for good. That bookkeeping is a side table now, keyed on the
+// txid in either table, so a contested parent moves like any other.
 //
 // The single-block test is an EQUALITY against the packed triple this stamp just appended, not
 // a length test, and that does both halves of the job at once: it is true only when the
@@ -167,7 +166,6 @@ WITH moved AS (
      WHERE i.leaf = $1::smallint
        AND i.txid = ANY($2::bytea[])
        AND i.membership = $6::bytea
-       AND i.conflicting_children IS NULL
     RETURNING i.txid, i.created_height, i.size_in_bytes, i.fee, i.tx_inpoints,
               i.locktime, i.created_at, i.flags
 ),

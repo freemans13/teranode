@@ -15,13 +15,16 @@ import (
 // call. The validator turns a missing parent into a rejection for that transaction alone, so
 // failing the batch would reject every transaction that happened to be resolved beside it.
 //
-// The field list is accepted and ignored, as it is on the single read: whichever step answers
-// returns every column it holds on one row, so narrowing the projection would save a little on
-// the wire and hand the caller a partly populated record it might dereference.
+// The field list is accepted and ignored with one exception, as it is on the single read:
+// whichever step answers returns every column it holds on one row, so narrowing the projection
+// would save a little on the wire and hand the caller a partly populated record it might
+// dereference. The exception is the contest, which is not on that row at all -- it is keyed on
+// the txid in conflict_children, because a contested parent is usually mined -- so it costs a
+// statement and is read only when named.
 //
 // The read order lives in lookupMany, which this, Get and the get batcher all go through, so
 // there is one answer to "where does a transaction come from" rather than three.
-func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
+func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, fieldNames ...fields.FieldName) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -31,7 +34,7 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 		hashes = append(hashes, it.Hash)
 	}
 
-	res, err := s.lookupMany(ctx, hashes)
+	res, err := s.lookupMany(ctx, hashes, wantsConflictingChildren(fieldNames))
 	if err != nil {
 		return errors.NewStorageError("[utxoset][BatchDecorate]", err)
 	}

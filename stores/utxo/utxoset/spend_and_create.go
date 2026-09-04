@@ -101,6 +101,8 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 		}
 	}
 
+	notedHeight := s.GetBlockHeight()
+
 	if !options.SpendOnly {
 		if err := s.ensureTxBodyPartition(ctx, blockHeight); err != nil {
 			return nil, nil, err
@@ -108,6 +110,16 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 
 		if mi, mined := minedBlock(options.MinedBlockInfos); mined {
 			if err := s.ensureTxMinedPartition(ctx, mi.BlockHeight); err != nil {
+				return nil, nil, err
+			}
+		}
+
+		// The conflict note lands at the store's CURRENT height, which need not be in the
+		// same window as blockHeight: a block being applied is behind the tip, and the ensure
+		// above is for the block's height. Asked for explicitly so the note cannot fail on a
+		// window nothing created, and the height read here is the one createIn is given.
+		if options.Conflicting {
+			if err := s.ensureSpendJournalPartition(ctx, notedHeight); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -166,7 +178,7 @@ func (s *Store) spendAndCreateOne(ctx context.Context, tx *bt.Tx, blockHeight ui
 		}
 	}
 
-	data, err := s.createIn(ctx, dbTx, tx, blockHeight, opts...)
+	data, err := s.createIn(ctx, dbTx, tx, blockHeight, notedHeight, opts...)
 
 	// ErrTxExists is NOT a failure to roll back, and treating it as one is the defect this
 	// ordering exists to avoid.

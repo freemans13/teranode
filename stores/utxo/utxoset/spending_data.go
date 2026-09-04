@@ -51,6 +51,24 @@ func wantsSpendingData(fieldNames []fields.FieldName) bool {
 	return false
 }
 
+// wantsConflictingChildren reports whether the caller asked which losing transactions contest
+// this one's coins.
+//
+// It is the second field this store does not answer for free, and for a different reason than
+// the first: the answer is in conflict_children, keyed on the txid rather than carried on
+// whichever row answered the read, so naming it costs a statement. The shared conflict walks
+// ask for it explicitly; the validator's parent resolution never does, and that is the path
+// this keeps it off.
+func wantsConflictingChildren(fieldNames []fields.FieldName) bool {
+	for _, f := range fieldNames {
+		if f == fields.ConflictingChildren {
+			return true
+		}
+	}
+
+	return false
+}
+
 // decorateSpendingData fills in who took each of a transaction's outputs.
 //
 // The shared conflict walks ask this question of every parent they reach and act on the answer,

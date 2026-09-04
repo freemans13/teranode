@@ -204,6 +204,51 @@ CREATE TABLE IF NOT EXISTS spend_journal (
     hash_override   BYTEA
 ) PARTITION BY RANGE (spent_height);
 
+-- ---------------------------------------------------------------------------
+-- CONFLICT BOOKKEEPING. One row per (contested parent, losing child).
+--
+-- A transaction that loses a double-spend race is kept rather than discarded, because
+-- resolving the race later has to find it, and finding it means asking the PARENT whose coin
+-- was contested. This table IS that route.
+--
+-- It is a side table rather than a column on tx_ident, and that is a correctness requirement
+-- rather than normalisation for its own sake. A contested parent is very often MINED, and a
+-- mined transaction has no identity row at all: the longest-chain stamp moved it into
+-- tx_mined. A column on tx_ident therefore had nowhere to land the note, so the write was a
+-- zero-row update and the route silently did not exist -- and the stamp had to REFUSE to move
+-- any row carrying the column, pinning contested transactions in the mempool table forever.
+-- Keyed on the txid alone, this answers for a parent in either table, or in neither.
+--
+-- RANGE partitioned on noted_height, in the SAME 48-block windows as the spend journal and
+-- created by the same DDL statement, so a window exists whenever its journal leaf does. It is
+-- dropped in the same pass and on the same cutoff, which is the honest retention: the journal
+-- is what conflict resolution restores the losing spends FROM, so a note whose journal leaf
+-- has gone can no longer be acted on.
+--
+-- noted_height is the store's CURRENT chain height at the moment of noting, not a property of
+-- either transaction. It is bookkeeping about a race happening now.
+--
+-- The uniqueness is PER WINDOW, deliberately, and the reader deduplicates. A unique index on
+-- a partitioned table must include the partition key, so a global UNIQUE (parent_txid,
+-- child_txid) is not available without noted_height in it -- which would defeat the purpose,
+-- since the same pair noted at two heights would then be two legal rows anyway. So each
+-- window carries a plain UNIQUE (parent_txid, child_txid), the inserts are ON CONFLICT DO
+-- NOTHING against it, and the read is SELECT DISTINCT: a repeated note inside one window
+-- writes nothing, and the same pair noted in two windows reads back once.
+--
+-- That pair index is the window's ONLY index, and it serves the reads too, because
+-- parent_txid leads it and every read here is by parent_txid. See ensureSpendJournalPartition
+-- for the DDL and the measurement.
+--
+-- NO DEFAULT PARTITION, for the reason tx_body gives: a default partition makes
+-- ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY impossible on every other partition.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS conflict_children (
+    noted_height    INTEGER NOT NULL,
+    parent_txid     BYTEA   NOT NULL,
+    child_txid      BYTEA   NOT NULL
+) PARTITION BY RANGE (noted_height);
+
 CREATE TABLE IF NOT EXISTS applied_block (
     height       INTEGER NOT NULL,
     block_hash   BYTEA   NOT NULL,
@@ -281,13 +326,15 @@ INSERT INTO tx_mined_floor (id, floor) VALUES (0, 0) ON CONFLICT DO NOTHING;
 --
 -- "Settles" rather than "contains", because the two are not the same fact and the difference
 -- decides whether the row leaves. A stamp naming a block ON THE LONGEST CHAIN moves the row
--- into tx_mined and deletes it here, but only when the row then names exactly ONE block and
--- carries no conflicting children. A row naming two blocks stays, with its mempool marker
--- cleared: the id-less mark-on-longest-chain call cannot later say which of them is main, so
--- the row waits for an un-mine or a further stamp to reduce it to one. A row carrying
--- conflicting children stays for the same reason in a different register -- that bookkeeping
--- has no home in tx_mined yet. A stamp for a block NOT on the longest chain moves nothing at
+-- into tx_mined and deletes it here, but only when the row then names exactly ONE block. A row
+-- naming two blocks stays, with its mempool marker cleared: the id-less mark-on-longest-chain
+-- call cannot later say which of them is main, so the row waits for an un-mine or a further
+-- stamp to reduce it to one. A stamp for a block NOT on the longest chain moves nothing at
 -- all; it only appends the block.
+--
+-- Conflict bookkeeping used to pin a row here too, because it lived in a column of this table
+-- and tx_mined had nowhere to put it. It is a side table now (see conflict_children above),
+-- keyed on the txid alone, so a contested row settles like any other.
 --
 -- Partitioned BY LIST (leaf), the same eight-way split as utxo, and never by
 -- created_height. Three reasons, worst first:
@@ -319,7 +366,6 @@ CREATE TABLE IF NOT EXISTS tx_ident (
     tx_inpoints          BYTEA,
     locktime             INTEGER,
     created_at           BIGINT,
-    conflicting_children BYTEA,
     flags                SMALLINT NOT NULL DEFAULT 0,
 
     -- LOAD-BEARING, and not defensive tidiness: this IS the global uniqueness rule.
