@@ -8,19 +8,10 @@ package utxoset
 import (
 	"context"
 
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
 func (s *Store) ReAssignUTXO(_ context.Context, _ *utxo.Spend, _ *utxo.Spend, _ *settings.Settings) error {
 	return errM1("ReAssignUTXO")
-}
-
-func (s *Store) BeginConflictIntent(_ context.Context, _ utxo.ConflictIntent) error {
-	return errM1("BeginConflictIntent")
-}
-
-func (s *Store) CompleteConflictIntent(_ context.Context, _ chainhash.Hash) error {
-	return errM1("CompleteConflictIntent")
 }

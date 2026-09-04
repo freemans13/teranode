@@ -121,4 +121,12 @@ func TestConformance(t *testing.T) {
 		db, _ := newTestStore(t)
 		tests.SpendAndCreateInvalidOptions(t, db)
 	})
+
+	// The conflict-resolution write-ahead log. Block assembly reads it once at startup and
+	// replays whatever a crash left half-finished, so an intent that does not survive is a
+	// conflict resolution that silently never completes.
+	t.Run("ConflictWAL", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.ConflictWAL(t, db)
+	})
 }

@@ -280,6 +280,37 @@ CREATE TABLE IF NOT EXISTS conflict_children (
     child_txid      BYTEA   NOT NULL
 ) PARTITION BY RANGE (noted_height);
 
+-- ---------------------------------------------------------------------------
+-- THE CONFLICT-RESOLUTION WRITE-AHEAD LOG. One row per in-flight resolution.
+--
+-- ProcessConflicting and its reverse mutate several transactions' state in sequence, and a
+-- process killed between two of those steps leaves the set half-moved with nothing recording
+-- that it was ever asked for. The row goes in BEFORE the first mutation and comes out AFTER
+-- the last, so anything still here at startup is work a crash interrupted, and block assembly
+-- replays it (BlockAssembler.go:936).
+--
+-- intent_id is the caller's deterministic hash over kind, block, height and the SORTED tx
+-- hashes (utxo.ConflictIntent.IntentID), which is what makes Begin idempotent: a crash-retry
+-- of the same operation, in whatever hash order, writes the same key and ON CONFLICT DO
+-- NOTHING absorbs it. The length CHECK is there because the id is the primary key and a short
+-- one would silently make a different intent addressable.
+--
+-- tx_hashes is the operation's hash list concatenated, 32 bytes each, in the order the caller
+-- gave. Not an array type: the read splits it once at startup and nothing ever queries INTO
+-- it, so a bytea costs one column and no per-element overhead.
+--
+-- Unpartitioned and unindexed beyond the key. In-flight resolutions number in the ones, the
+-- table is read exactly once per process start, and every write is by primary key.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS conflict_intents (
+    intent_id    BYTEA   PRIMARY KEY CHECK (length(intent_id) = 32),
+    kind         TEXT    NOT NULL,
+    block_height INTEGER NOT NULL,
+    block_hash   BYTEA   NOT NULL,
+    tx_hashes    BYTEA   NOT NULL,
+    started_at   BIGINT  NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS applied_block (
     height       INTEGER NOT NULL,
     block_hash   BYTEA   NOT NULL,
@@ -675,7 +706,7 @@ func CreateSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	return assertSchemaShape(ctx, pool)
 }
 
-// requiredColumns are the three facts that distinguish this schema from the one before it. A
+// requiredColumns are the facts that distinguish this schema from the one before it. A
 // database missing any of them cannot serve this binary.
 //
 // A table name with an empty column asserts the table itself. tx_mined did not exist at all in
@@ -688,6 +719,7 @@ var requiredColumns = []struct{ table, column string }{
 	{"tx_mined", ""},
 	{"spend_journal", "mined_height"},
 	{"spend_journal", "block_id"},
+	{"conflict_intents", ""},
 }
 
 // assertSchemaShape refuses to start against a database written by the previous schema.

@@ -22,18 +22,6 @@ func (emptyUnminedIterator) Next(_ context.Context) ([]*utxo.UnminedTransaction,
 func (emptyUnminedIterator) Err() error   { return nil }
 func (emptyUnminedIterator) Close() error { return nil }
 
-// PendingConflictIntents reports that no conflict resolution was interrupted.
-//
-// Same reasoning as GetUnminedTxIterator, and additionally: the intent log exists so a
-// ProcessConflicting interrupted by a crash can be replayed, and this store cannot begin
-// an intent in the first place, since BeginConflictIntent is still unimplemented. A store
-// that cannot start one cannot have an unfinished one.
-//
-// Block assembly replays these at startup (BlockAssembler.go:936) and an error is fatal.
-func (s *Store) PendingConflictIntents(_ context.Context) ([]utxo.ConflictIntent, error) {
-	return nil, nil
-}
-
 // QueryOldUnminedTransactions finds none, same reason.
 func (s *Store) QueryOldUnminedTransactions(_ context.Context, _ uint32) ([]chainhash.Hash, error) {
 	return nil, nil
