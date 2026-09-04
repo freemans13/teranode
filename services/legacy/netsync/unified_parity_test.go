@@ -198,7 +198,7 @@ func runInlinePipeline(t *testing.T, ctx context.Context, corpus *parityCorpus, 
 	}
 
 	for _, block := range corpus.blocks {
-		_, _, _, prepErr := sm.prepareSubtrees(ctx, block, 0)
+		_, _, _, prepErr := sm.prepareSubtrees(ctx, block)
 		require.NoError(t, prepErr, "Run A prepareSubtrees failed at height %d", block.Height())
 	}
 }

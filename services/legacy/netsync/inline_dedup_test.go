@@ -122,7 +122,7 @@ func TestLegacyInline_DuplicateTxid_Rejected(t *testing.T) {
 
 	block := makeDuplicateTxidBlock(height)
 
-	_, _, _, prepErr := sm.prepareSubtrees(ctx, block, 0)
+	_, _, _, prepErr := sm.prepareSubtrees(ctx, block)
 	require.Error(t, prepErr, "a duplicated txid must be rejected on the inline path")
 	require.True(t, errors.Is(prepErr, errors.ErrBlockInvalid),
 		"duplicate-txid rejection must be a BlockInvalidError (CVE-2012-2459), got: %v", prepErr)

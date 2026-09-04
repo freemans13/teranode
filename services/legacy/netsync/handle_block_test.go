@@ -108,14 +108,6 @@ func TestSyncManager_HandleBlockDirect(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// withPrevID sets the parent's committed block id on a blockIdent, which is what
-// prepareSubtrees threads in from the header lookup HandleBlockDirect already did.
-func withPrevID(bi blockIdent, prevID uint32) blockIdent {
-	bi.prevID = prevID
-
-	return bi
-}
-
 // testBlockIdent builds the scalar blockIdent for a test block, mirroring
 // what prepareSubtrees derives before dropping the decoded block.
 func testBlockIdent(block *bsvutil.Block) blockIdent {
@@ -125,6 +117,24 @@ func testBlockIdent(block *bsvutil.Block) blockIdent {
 		height:    uint32(block.Height()), //nolint:gosec // test helper, heights are small
 		timestamp: block.MsgBlock().Header.Timestamp,
 	}
+}
+
+// fakeBestHeader builds a deterministic, fully-populated *model.BlockHeader (nonce
+// distinguishes one from another) together with its hash. A test drives the "this
+// block's parent is the current tip" case by giving a block a PrevBlock equal to this
+// hash and mocking GetBestBlockHeader to return the same header; it drives the
+// "current tip is a sibling" case by mocking GetBestBlockHeader to return a header
+// built with a different nonce, whose hash differs.
+func fakeBestHeader(nonce uint32) (*model.BlockHeader, chainhash.Hash) {
+	h := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+		Timestamp:      1,
+		Nonce:          nonce,
+	}
+
+	return h, *h.Hash()
 }
 
 func TestSyncManager_createTxMap(t *testing.T) {
@@ -581,7 +591,7 @@ func TestSyncManager_prepareSubtrees(t *testing.T) {
 		ctx:               context.Background(),
 	}
 
-	subtrees, subtreeSlices, blockID, err := sm.prepareSubtrees(context.Background(), block, 0)
+	subtrees, subtreeSlices, blockID, err := sm.prepareSubtrees(context.Background(), block)
 	require.NoError(t, err)
 	assert.Len(t, subtrees, 1, "2 txs fit in a single subtree")
 	assert.Equal(t, uint32(0), blockID, "non-quick-validation path never assigns a block ID")
@@ -1072,9 +1082,12 @@ func TestSyncManager_createUtxos_MergesBlockIDsForExistingTxs(t *testing.T) {
 
 	// Wire up a SyncManager just enough for createUtxos: utxoStore, settings, logger,
 	// the txMap, and the blockchain client the merge stamp asks which chain the block
-	// is on (this fixture's block is the current tip, so: yes).
+	// is on. The block's PrevBlock is set to this fixture's best header's hash, so the
+	// stamp sees this block's parent as the current tip (i.e. yes, on the longest chain).
+	parentHeader, parentHash := fakeBestHeader(1)
+
 	mockBlockchain := &blockchain.Mock{}
-	mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+	mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(parentHeader, &model.BlockHeaderMeta{}, nil)
 
 	sm := &SyncManager{
 		settings:         tSettings,
@@ -1086,7 +1099,7 @@ func TestSyncManager_createUtxos_MergesBlockIDsForExistingTxs(t *testing.T) {
 	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](1)
 	txMap.Set(txHash, &TxMapWrapper{Tx: tx})
 
-	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1}})
+	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1, PrevBlock: parentHash}})
 	block.SetHeight(100)
 
 	const expectedBlockID uint32 = 42
@@ -1137,8 +1150,12 @@ func newChunkingTestSetup(t *testing.T, totalTxs, batchSize, routines int) (
 
 	// The merge stamp asks the blockchain service which chain the block is on; these
 	// fixtures all drive the on-chain case, which is what the chunking assertions are about.
+	// Giving the block a PrevBlock equal to the mocked best header's hash makes this
+	// block's parent the current tip.
+	parentHeader, parentHash := fakeBestHeader(1)
+
 	mockBlockchain := &blockchain.Mock{}
-	mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+	mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(parentHeader, &model.BlockHeaderMeta{}, nil)
 
 	sm := &SyncManager{
 		settings:         tSettings,
@@ -1152,7 +1169,7 @@ func newChunkingTestSetup(t *testing.T, totalTxs, batchSize, routines int) (
 		txMap.Set(h, &TxMapWrapper{Tx: txs[i]})
 	}
 
-	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1}})
+	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1, PrevBlock: parentHash}})
 	block.SetHeight(100)
 
 	return sm, txMap, block, mockStore, hashes
@@ -1555,21 +1572,30 @@ func TestClassifyAndCountPrewarmError(t *testing.T) {
 // block had settled its transactions on the main chain, which on a store that moves a
 // settled transaction out of the mempool table is not a flag but a one-way move.
 //
-// The stamp asks the blockchain service, and it asks about the block's PARENT. This block's
-// own id is allocated but uncommitted at this point -- createUtxos runs inside
-// ValidateTransactionsLegacyMode, which prepareSubtrees calls before AddBlock -- and
-// CheckBlockIsInCurrentChain drops ids above the highest committed id as definitively not on
-// the main chain. Asking about this block therefore answered false for EVERY block, which is
-// not honesty, it is a round trip to learn nothing. The parent is committed, so it can answer,
-// and a block extends the current chain exactly when its parent is on it.
+// A first fix asked whether the block's PARENT was on the current chain. That is
+// necessary but not sufficient: after block A at height h has been applied and become
+// the tip, a same-height sibling B sharing A's parent P arrives later. P is still on
+// the current chain, so the parent-on-chain test answers true for B too, even though B
+// is the losing block. The exact test is best-header equality: a block extends the
+// current chain iff its parent IS the current best header, which tells the winner (A)
+// apart from the sibling (B) even though both share the same parent P.
 func TestLegacyStampReportsTheChainHonestly(t *testing.T) {
 	const (
 		checkpointHeight = int32(1000)
 		blockID          = uint32(9)
-		prevBlockID      = uint32(8)
 	)
 
-	newSyncManager := func(t *testing.T, onCurrentChain bool, chainErr error) (*SyncManager, *createSpyStore, *blockchain.Mock) {
+	// parentHeader is this test block's real parent; parentHash is its hash, which the
+	// block below carries as its own PrevBlock. siblingHeader stands in for a
+	// same-height sibling of this block: a different header (a different nonce, so a
+	// different hash) that itself descends from the same parent P, but is not P.
+	parentHeader, parentHash := fakeBestHeader(1)
+	siblingHeader, _ := fakeBestHeader(2)
+
+	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1, PrevBlock: parentHash}})
+	block.SetHeight(500)
+
+	newSyncManager := func(t *testing.T, best *model.BlockHeader, chainErr error) (*SyncManager, *createSpyStore, *blockchain.Mock) {
 		t.Helper()
 
 		tSettings, params := newOutpointOnlySettings(t, false, true, checkpointHeight)
@@ -1581,10 +1607,12 @@ func TestLegacyStampReportsTheChainHonestly(t *testing.T) {
 		}
 
 		mockBlockchain := &blockchain.Mock{}
-		// The PARENT's id, not this block's. Asking about this block's own id is asking
-		// about a row AddBlock has not written yet.
-		mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{prevBlockID}).
-			Return(onCurrentChain, chainErr)
+
+		if chainErr != nil {
+			mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(nil, nil, chainErr)
+		} else {
+			mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(best, &model.BlockHeaderMeta{}, nil)
+		}
 
 		sm := &SyncManager{
 			settings:         tSettings,
@@ -1597,48 +1625,45 @@ func TestLegacyStampReportsTheChainHonestly(t *testing.T) {
 		return sm, spy, mockBlockchain
 	}
 
-	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1}})
-	block.SetHeight(500)
-
-	t.Run("a block that is not on the current chain is stamped as not on the longest chain", func(t *testing.T) {
-		sm, spy, mockBlockchain := newSyncManager(t, false, nil)
+	t.Run("best header is the block's parent: stamped on the longest chain", func(t *testing.T) {
+		sm, spy, mockBlockchain := newSyncManager(t, parentHeader, nil)
 
 		_, _, txMap := twoTxMap(t)
-		require.NoError(t, sm.createUtxos(context.Background(), txMap, withPrevID(testBlockIdent(block), prevBlockID), blockID, false))
+		require.NoError(t, sm.createUtxos(context.Background(), txMap, testBlockIdent(block), blockID, false))
 
 		stamps := spy.minedStamps()
 		require.NotEmpty(t, stamps, "every tx pre-existed, so the merge stamp must have run")
 
 		for _, stamp := range stamps {
 			require.Equal(t, blockID, stamp.BlockID)
-			require.False(t, stamp.OnLongestChain,
-				"a side-chain block must not settle its transactions as main-chain")
-		}
-
-		mockBlockchain.AssertExpectations(t)
-	})
-
-	t.Run("a block on the current chain is still stamped as on the longest chain", func(t *testing.T) {
-		sm, spy, mockBlockchain := newSyncManager(t, true, nil)
-
-		_, _, txMap := twoTxMap(t)
-		require.NoError(t, sm.createUtxos(context.Background(), txMap, withPrevID(testBlockIdent(block), prevBlockID), blockID, false))
-
-		stamps := spy.minedStamps()
-		require.NotEmpty(t, stamps)
-
-		for _, stamp := range stamps {
 			require.True(t, stamp.OnLongestChain)
 		}
 
 		mockBlockchain.AssertExpectations(t)
 	})
 
-	t.Run("an unanswerable chain question fails the block rather than guessing", func(t *testing.T) {
-		sm, spy, _ := newSyncManager(t, false, errors.NewServiceError("blockchain unavailable"))
+	t.Run("best header is a same-height sibling: not stamped on the longest chain", func(t *testing.T) {
+		sm, spy, mockBlockchain := newSyncManager(t, siblingHeader, nil)
 
 		_, _, txMap := twoTxMap(t)
-		err := sm.createUtxos(context.Background(), txMap, withPrevID(testBlockIdent(block), prevBlockID), blockID, false)
+		require.NoError(t, sm.createUtxos(context.Background(), txMap, testBlockIdent(block), blockID, false))
+
+		stamps := spy.minedStamps()
+		require.NotEmpty(t, stamps, "every tx pre-existed, so the merge stamp must have run")
+
+		for _, stamp := range stamps {
+			require.False(t, stamp.OnLongestChain,
+				"a losing same-height sibling must not settle its transactions as main-chain")
+		}
+
+		mockBlockchain.AssertExpectations(t)
+	})
+
+	t.Run("an unanswerable chain question fails the block rather than guessing", func(t *testing.T) {
+		sm, spy, _ := newSyncManager(t, nil, errors.NewServiceError("blockchain unavailable"))
+
+		_, _, txMap := twoTxMap(t)
+		err := sm.createUtxos(context.Background(), txMap, testBlockIdent(block), blockID, false)
 		require.Error(t, err)
 		require.Empty(t, spy.minedStamps(), "no stamp may be written on a guess")
 	})

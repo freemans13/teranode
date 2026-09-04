@@ -212,7 +212,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// NOTE: last use of `block` — from here down only scalars and tx hash
 	// copies are referenced, so the decode arena is collectable as soon as
 	// createTxMap inside prepareSubtrees returns.
-	subtrees, preparedSubtreeSlices, blockID, err := sm.prepareSubtrees(ctx, block, previousBlockHeaderMeta.ID)
+	subtrees, preparedSubtreeSlices, blockID, err := sm.prepareSubtrees(ctx, block)
 	if err != nil {
 		return err
 	}
@@ -352,18 +352,16 @@ type TxMapWrapper struct {
 // given until the span closes: a *chainhash.Hash from block.Hash() would pin
 // the whole wrapper for the duration of the stage.
 type blockIdent struct {
-	hash      chainhash.Hash
+	hash chainhash.Hash
+	// prevBlock is the header's PrevBlock: the parent's hash, not its id. createUtxos
+	// compares this against the chain's current best header to decide whether this
+	// block extends the longest chain — see the comment there for why.
 	prevBlock chainhash.Hash
-	// prevID is the parent's COMMITTED block id, from the header lookup HandleBlockDirect
-	// already does on receipt. It is here because this block's own id is not yet committed
-	// while the phases below run, so the parent is the only end of the link that can answer
-	// a question about the chain. See createUtxos.
-	prevID    uint32
 	height    uint32
 	timestamp time.Time
 }
 
-func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block, prevBlockID uint32) (subtrees []*chainhash.Hash, subtreeSlices []*subtreepkg.Subtree, blockID uint32, err error) {
+func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block) (subtrees []*chainhash.Hash, subtreeSlices []*subtreepkg.Subtree, blockID uint32, err error) {
 	ctx, _, deferFn := tracing.Tracer("netsync").Start(ctx, "prepareSubtrees",
 		tracing.WithLogMessage(
 			sm.logger,
@@ -440,7 +438,6 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	bi := blockIdent{
 		hash:      *block.Hash(),
 		prevBlock: block.MsgBlock().Header.PrevBlock,
-		prevID:    prevBlockID,
 		height:    blockHeight32,
 		timestamp: block.MsgBlock().Header.Timestamp,
 	}
@@ -1245,27 +1242,32 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 		// than a fallback. Every backend already expects an honest flag here: it is what
 		// block validation passes on its own SetMinedMulti calls.
 		//
-		// The question is asked about the PARENT, and it has to be. This block's own id is
-		// allocated but uncommitted while this runs: createUtxos is called from
-		// ValidateTransactionsLegacyMode, which prepareSubtrees calls at the create/spend
-		// stage, and AddBlock does not happen until ProcessBlock much later.
-		// CheckBlockIsInCurrentChain documents exactly that case and rejects it in memory
-		// with no round trip — "Drop ids above the highest committed id. These are
-		// allocated-but-uncommitted ... so they have no committed row and are definitively
-		// not on the main chain" (stores/blockchain/sql/CheckBlockIsInCurrentChain.go). Asking
-		// about this block therefore answered false for EVERY block: a round trip on the IBD
-		// hot loop that learned nothing, and a stamp that would refuse to settle an identity
-		// row the moment this path met one.
+		// A first fix asked CheckBlockIsInCurrentChain about the PARENT's committed id,
+		// reasoning that a block extends the current chain exactly when its parent is on
+		// it. That is not enough: after block A at height h has been applied and become the
+		// tip, a same-height sibling B sharing A's parent P arrives later. P is still on the
+		// current chain, so the parent-on-chain test answers true for B too, and B is a
+		// losing block — its transactions get moved out of the mempool table regardless.
+		// Parent-on-chain is necessary but not sufficient; it does not distinguish the
+		// winning child from a sibling.
 		//
-		// The parent is committed, so it can answer, and a block extends the current chain
-		// exactly when its parent is on it — this block is about to become the tip above it.
-		// The parent's id costs nothing to have: HandleBlockDirect looks its header up on
-		// receipt to derive the height, and threads the id in through blockIdent.
-		var onLongestChain bool
+		// The exact test is best-header equality: a block extends the current chain iff its
+		// parent IS the current best header, not merely somewhere on it. bi.prevBlock already
+		// carries the header's PrevBlock, so comparing it against GetBestBlockHeader's hash
+		// costs one round trip and needs no committed id at all — bi.prevID is gone. This
+		// equality is exact only because this block itself has not been added yet: createUtxos
+		// runs inside ValidateTransactionsLegacyMode, which prepareSubtrees calls at the
+		// create/spend stage, and AddBlock does not happen until ProcessBlock much later. Once
+		// this block were added and became the new best header itself, the same comparison
+		// would flip (best header would equal this block's own hash, not its parent's) — this
+		// code must never run again for the same block after that point.
+		var best *model.BlockHeader
 
-		if onLongestChain, err = sm.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{bi.prevID}); err != nil {
-			return errors.NewServiceError("[createUtxos][%s] error checking whether parent block id %d is on the current chain", bi.hash.String(), bi.prevID, err)
+		if best, _, err = sm.blockchainClient.GetBestBlockHeader(ctx); err != nil {
+			return errors.NewServiceError("[createUtxos][%s] error getting best block header", bi.hash.String(), err)
 		}
+
+		onLongestChain := best.Hash().IsEqual(&bi.prevBlock)
 
 		minedBlockInfo := utxo.MinedBlockInfo{
 			BlockID:        blockID,
