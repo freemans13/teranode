@@ -55,6 +55,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -669,6 +670,75 @@ func CreateSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	// partition, and postgres adds it to any created later.
 	if _, err := pool.Exec(ctx, txIdentIndexSQL); err != nil {
 		return err
+	}
+
+	return assertSchemaShape(ctx, pool)
+}
+
+// requiredColumns are the three facts that distinguish this schema from the one before it. A
+// database missing any of them cannot serve this binary.
+//
+// A table name with an empty column asserts the table itself. tx_mined did not exist at all in
+// the previous shape, so a database old enough to be missing it has to be refused by name
+// rather than by column: information_schema.columns simply returns nothing for a table that is
+// not there, and "tx_mined.txid is missing" would send an operator looking for a column.
+var requiredColumns = []struct{ table, column string }{
+	{"utxo", "mined_height"},
+	{"utxo", "block_id"},
+	{"tx_mined", ""},
+	{"spend_journal", "mined_height"},
+	{"spend_journal", "block_id"},
+}
+
+// assertSchemaShape refuses to start against a database written by the previous schema.
+//
+// Fresh-sync-only is by design and there is no migration, but that design needs a gate. Every
+// statement in CreateSchema is CREATE TABLE IF NOT EXISTS, so against a database from the
+// previous shape it is a complete no-op on utxo -- the table is there, without mined_height
+// and block_id -- creates tx_mined, tx_mined_floor, preserved_parent and conflict_children
+// beside it, installs the functions, and reports success. New then returns a healthy store,
+// and the first create to run fails with `column "mined_height" of relation "utxo" does not
+// exist`. Every batch after it fails the same way, forever, and the columns the reshape
+// removed are all nullable or defaulted, so nothing fails earlier or louder.
+//
+// One query converts that flood into a single startup refusal naming what is missing. It runs
+// as part of CreateSchema rather than beside it so that no caller can install the schema and
+// skip the check.
+func assertSchemaShape(ctx context.Context, pool *pgxpool.Pool) error {
+	for _, req := range requiredColumns {
+		var found bool
+
+		var err error
+
+		if req.column == "" {
+			err = pool.QueryRow(ctx, `
+				SELECT EXISTS (SELECT 1 FROM information_schema.tables
+				                WHERE table_schema = current_schema() AND table_name = $1)`,
+				req.table).Scan(&found)
+		} else {
+			err = pool.QueryRow(ctx, `
+				SELECT EXISTS (SELECT 1 FROM information_schema.columns
+				                WHERE table_schema = current_schema() AND table_name = $1
+				                  AND column_name = $2)`,
+				req.table, req.column).Scan(&found)
+		}
+
+		if err != nil {
+			return errors.NewStorageError("[utxoset] check schema shape for %s", req.table, err)
+		}
+
+		if found {
+			continue
+		}
+
+		what := req.table
+		if req.column != "" {
+			what = req.table + "." + req.column
+		}
+
+		return errors.NewConfigurationError(
+			"[utxoset] this database was written by an older schema: %s is missing. There is no migration by design -- the store needs a fresh database, and the chain has to be re-synced into it",
+			what)
 	}
 
 	return nil
