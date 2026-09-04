@@ -77,6 +77,13 @@ type Store struct {
 	// reason journalDDL does: CREATE TABLE IF NOT EXISTS is not concurrency-safe.
 	bodyDDL sync.Mutex
 
+	// minedWindow is the tx_mined window the last block-path create landed in, so the
+	// catalog is only touched when it changes. Holds window+1 so zero means "nothing yet".
+	minedWindow atomic.Uint32
+
+	// minedDDL serialises tx_mined window creation within this process.
+	minedDDL sync.Mutex
+
 	// bodyRetention is how long the serialized transaction bytes are kept, in blocks.
 	bodyRetention uint32
 

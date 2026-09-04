@@ -112,11 +112,20 @@ const (
 const schemaSQL = `
 -- ---------------------------------------------------------------------------
 -- THE UTXO TABLE. One row per spendable output. Inserted once, deleted once.
+--
+-- The coin carries the height and block of the transaction that created it, exactly as
+-- SV Node's coin carries nHeight. mined_height = 0 is the unconfirmed sentinel because no
+-- spendable coin exists at height 0 -- genesis pays nobody -- so a mempool create can use
+-- it without colliding with a real block. block_id = 0 must stay legitimate rather than
+-- becoming a second sentinel: the seed tool writes it (cmd/seeder/seeder.go:674-681) and
+-- block validation treats it as the genesis block's id (model/Block.go:47).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS utxo (
     satoshis        BIGINT   NOT NULL,
-    created_height  INTEGER  NOT NULL,   -- BIP68 relative locktime, utxoHeights
+    created_height  INTEGER  NOT NULL,   -- first sight; keys the body window; restored verbatim
     spendable_from  INTEGER  NOT NULL,   -- coinbase maturity and ReAssignUTXO delay
+    mined_height    INTEGER  NOT NULL DEFAULT 0, -- height of the block containing the creating tx; 0 = unconfirmed
+    block_id        INTEGER  NOT NULL DEFAULT 0, -- blockchain store id of that block; 0 is legitimate (genesis, seeder)
     leaf            SMALLINT NOT NULL,   -- txid[0] & 7; the partition key
     flags           SMALLINT NOT NULL DEFAULT 0,
     ukey            UUID     NOT NULL,   -- pack(txid, vout). NON-UNIQUE by design.
@@ -227,6 +236,52 @@ CREATE TABLE IF NOT EXISTS applied_chunk (
     chunk_idx    INTEGER NOT NULL,
     PRIMARY KEY (block_hash, chunk_idx)
 );
+
+-- ---------------------------------------------------------------------------
+-- BLOCK MEMBERSHIP. One row per (transaction, block) that stamped it, for the reorg window.
+--
+-- This replaces the identity row for a MINED transaction. Below the checkpoint it is written
+-- once at create and read by nothing on the consensus path; at the tip a mempool row moves
+-- here when its block is stamped on the longest chain (stage 2). It is RANGE partitioned by
+-- mined_height in 288-block windows and dropped whole once a window's upper bound is 1440
+-- blocks below the pruner's height, so reclaim is a catalog operation with nothing to fall
+-- behind on.
+--
+-- The primary key LEADS with txid. PostgreSQL requires the partition key inside a partitioned
+-- table's primary key but not at its head, and a height-leading key cannot be probed by
+-- transaction id: on 18 it becomes a skip scan over every distinct height in the partition.
+-- Every by-id lookup here is one descent per live window, six at 288-block windows.
+--
+-- seq keeps insertion order, which the shared conformance suite requires of BlockIDs.
+-- The payload columns are what a transaction needs if it is un-mined back into the mempool
+-- (stage 2); below the checkpoint tx_inpoints is written NULL because nothing there can
+-- un-mine.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tx_mined (
+    txid            BYTEA    NOT NULL,
+    mined_height    INTEGER  NOT NULL,
+    block_id        INTEGER  NOT NULL,
+    subtree_idx     INTEGER  NOT NULL,
+    seq             BIGINT   GENERATED ALWAYS AS IDENTITY,
+    created_height  INTEGER  NOT NULL,
+    size_in_bytes   INTEGER,
+    tx_inpoints     BYTEA,
+    locktime        INTEGER,
+    created_at      BIGINT,
+    flags           SMALLINT NOT NULL DEFAULT 0,
+    CONSTRAINT tx_mined_ck CHECK (length(txid) = 32),
+    PRIMARY KEY (txid, mined_height, block_id)
+) PARTITION BY RANGE (mined_height);
+
+-- The highest membership window ever dropped, plus one. ensureTxMinedPartition refuses to
+-- create a window at or below it: a block re-offered more than 1440 blocks after its first
+-- application would otherwise recreate its window and claim every transaction in it afresh,
+-- and the coin table has no uniqueness on the outpoint to stop the coins doubling.
+CREATE TABLE IF NOT EXISTS tx_mined_floor (
+    id      SMALLINT PRIMARY KEY CHECK (id = 0),
+    floor   INTEGER  NOT NULL
+);
+INSERT INTO tx_mined_floor (id, floor) VALUES (0, 0) ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- THE IDENTITY TABLE. One row per transaction, from first sight to reclaim.
