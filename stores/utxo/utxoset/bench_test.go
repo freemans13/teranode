@@ -91,12 +91,24 @@ func benchStore(b *testing.B) (*Store, context.Context) {
 	return s, ctx
 }
 
+// truncateAllSQL empties every table a create or a spend writes to, without dropping the
+// schema, so setup cost stays out of the timed section.
+//
+// EVERY table, and the list is here once rather than spelled out at each call site because it
+// has already cost a measurement. tx_mined, conflict_children and preserved_parent were added
+// by the reshape and not added here, so a benchmark's later iterations ran against a membership
+// table carrying every earlier iteration's rows -- and the block-path create probes tx_mined
+// twice per transaction. Attributing a measured slowdown found that the missing truncate
+// accounted for two thirds of it. A benchmark whose setup leaks state is measuring the leak.
+const truncateAllSQL = `TRUNCATE utxo, tx_ident, tx_body, tx_mined, spend_journal,
+                                 conflict_children, preserved_parent CASCADE`
+
 // wipe returns the store to empty without dropping the schema, so setup cost stays out of
 // the timed section.
 func wipe(b *testing.B, s *Store, ctx context.Context) {
 	b.Helper()
 
-	_, err := s.pool.Exec(ctx, `TRUNCATE utxo, tx_ident, tx_body, spend_journal CASCADE`)
+	_, err := s.pool.Exec(ctx, truncateAllSQL)
 	require.NoError(b, err)
 }
 
@@ -425,7 +437,7 @@ func runCreatePathBench(b *testing.B, s *Store, ctx context.Context, n int, mine
 		// Untimed: clean slate plus a fresh unique batch.
 		b.StopTimer()
 
-		if _, err := s.pool.Exec(ctx, `TRUNCATE utxo, tx_ident, tx_body, spend_journal CASCADE`); err != nil {
+		if _, err := s.pool.Exec(ctx, truncateAllSQL); err != nil {
 			b.Fatalf("truncate: %v", err)
 		}
 
