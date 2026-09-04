@@ -34,3 +34,22 @@ func TestAutovacuumThresholdIsSizedToTheIndex(t *testing.T) {
 	require.Contains(t, opts, "autovacuum_vacuum_scale_factor=0",
 		"dead rows scale with block production, not with table size")
 }
+
+// TestIdentityPartitionsCarryTheReclaimerSizedAutovacuum. The identity table shipped with no
+// storage parameters at all, so it vacuumed at the default 20 percent dead-tuple threshold with
+// default throttling. With the reclaimer deleting several hundred thousand rows a minute that
+// is a pass every twenty minutes or so per partition, each a full scan of its primary key, and
+// between passes the key drifts toward the measured 2x bloat plateau. The coin table's block
+// applies here for the same reason it applies there.
+func TestIdentityPartitionsCarryTheReclaimerSizedAutovacuum(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	var opts []string
+
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT reloptions FROM pg_class WHERE oid = 'tx_ident_l0'::regclass`).Scan(&opts))
+
+	require.Contains(t, opts, "autovacuum_vacuum_threshold=1000000")
+	require.Contains(t, opts, "autovacuum_vacuum_scale_factor=0")
+	require.Contains(t, opts, "autovacuum_vacuum_cost_delay=0")
+}

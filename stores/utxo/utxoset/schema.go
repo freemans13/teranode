@@ -374,7 +374,23 @@ CREATE TABLE IF NOT EXISTS utxo_p%[1]d PARTITION OF utxo FOR VALUES IN (%[1]d)
 -- txid without a ukey range bound is a review failure.
 CREATE INDEX IF NOT EXISTS utxo_p%[1]d_ukey ON utxo_p%[1]d (ukey);
 
-CREATE TABLE IF NOT EXISTS tx_ident_l%[1]d PARTITION OF tx_ident FOR VALUES IN (%[1]d);
+-- The identity partitions take the coin table's autovacuum block, for the same reason. The
+-- reclaimer deletes at row level here, several hundred thousand rows a minute during a fast
+-- sync, and the shipped default (20 percent dead tuples, default throttling) meant a pass
+-- every twenty minutes or so per partition with the primary key drifting toward its 2x bloat
+-- plateau between passes. The ALTER makes an existing database converge; SET is catalog-only.
+CREATE TABLE IF NOT EXISTS tx_ident_l%[1]d PARTITION OF tx_ident FOR VALUES IN (%[1]d)
+  WITH (autovacuum_vacuum_scale_factor  = 0,
+        autovacuum_vacuum_threshold     = 1000000,
+        autovacuum_vacuum_cost_delay    = 0,
+        autovacuum_vacuum_cost_limit    = 10000,
+        autovacuum_analyze_scale_factor = 0.02);
+ALTER TABLE tx_ident_l%[1]d
+  SET (autovacuum_vacuum_scale_factor  = 0,
+       autovacuum_vacuum_threshold     = 1000000,
+       autovacuum_vacuum_cost_delay    = 0,
+       autovacuum_vacuum_cost_limit    = 10000,
+       autovacuum_analyze_scale_factor = 0.02);
 `
 
 // txIdentIndexSQL is the ONE secondary index tx_ident should ever carry, plus the reducer
