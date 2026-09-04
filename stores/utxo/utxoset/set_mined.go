@@ -195,6 +195,20 @@ SELECT txid FROM moved`
 // the transaction in both tables at once, claiming the same block twice in two different
 // spellings.
 //
+// Only a transaction that HAS a membership row for the named block takes part, which `named`
+// establishes before anything is deleted. A transaction the caller un-mines from a block it was
+// never in has nothing to take back, and taking it back anyway would un-settle it out of the
+// block it actually IS in -- turning a tolerated absence into a wrong answer. When no block is
+// named ($2 NULL) `named` is empty and irrelevant, and every row of every listed transaction
+// goes.
+//
+// There is NO `ON CONFLICT` on the identity insert, deliberately, and the absence is the safety
+// property. `gone` has already deleted the membership rows by the time the insert runs, so a
+// conflict swallowed here would lose the transaction's block facts from BOTH tables at once. A
+// unique violation instead rolls the whole move back, having lost nothing. The conflict means a
+// transaction had a home in both tables, which createIdentPlanSQL's membership guard is what
+// prevents; if it ever happens, the loud failure is the bug report.
+//
 // ONE STATEMENT SERVES BOTH DIRECTIONS, and the difference between them is a single predicate
 // on `packed`: which triples survive into membership.
 //
@@ -235,9 +249,16 @@ SELECT txid FROM moved`
 // range as a join filter and reads all eight coin partitions instead: measured on this schema
 // at 400,000 coins, a Seq Scan on every partition and 98 ms of the statement's 108.
 const moveBackSQL = `
-WITH gone AS (
+WITH named AS (
+    SELECT DISTINCT m.txid
+      FROM tx_mined m
+     WHERE m.txid = ANY($1::bytea[])
+       AND m.mined_height = $2::int AND m.block_id = $3::int
+),
+gone AS (
     DELETE FROM tx_mined m
      WHERE m.txid = ANY($1::bytea[])
+       AND ($2::int IS NULL OR m.txid IN (SELECT txid FROM named))
     RETURNING m.txid, m.mined_height, m.block_id, m.subtree_idx, m.seq, m.created_height,
               m.size_in_bytes, m.fee, m.tx_inpoints, m.locktime, m.created_at, m.flags
 ),
@@ -260,7 +281,6 @@ back AS (
            g.fee, g.size_in_bytes, g.tx_inpoints, g.locktime, g.created_at, g.flags
       FROM (SELECT DISTINCT ON (txid) * FROM gone ORDER BY txid, seq) g
       LEFT JOIN packed p ON p.txid = g.txid
-    ON CONFLICT (leaf, txid) DO NOTHING
 )
 SELECT txid FROM keys`
 
@@ -288,11 +308,18 @@ SELECT txid FROM keys`
 // move the transaction is in the mempool table and settles under nothing at all. $5 narrows the
 // reset to one block for a caller that has reason to; no caller has today.
 //
+// The UPDATE rechecks the FULL TXID and not only the (leaf, ukey) the read found the row by,
+// and that is a correctness rule rather than a repeated predicate. ukey is a 96-bit prefix and
+// NON-UNIQUE by design -- see Pack -- so two transactions in one leaf can share it, and an
+// UPDATE keyed on it alone would reset a stranger's coin to the unconfirmed sentinel: a
+// spendable coin reading as immature, or a mined coin reading as mempool. Every other by-key
+// write in this store rechecks txid for the same reason (spend.go, unspend.go, freeze.go).
+//
 // A coin that has been spent has no row and needs none: its restore resolves the block facts
 // from membership at restore time.
 const resetCoinsSQL = `
 WITH hit AS (
-    SELECT c.leaf, c.ukey
+    SELECT c.leaf, c.ukey, k.txid
       FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[]) AS k(leaf, txid, lo, hi)
      CROSS JOIN LATERAL (
        SELECT u.leaf, u.ukey
@@ -305,7 +332,7 @@ WITH hit AS (
 )
 UPDATE utxo u SET mined_height = 0, block_id = 0
   FROM hit
- WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey`
+ WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey AND u.txid = hit.txid`
 
 // SetMinedMulti marks transactions as mined in the block described by info.
 //
@@ -562,7 +589,8 @@ func (s *Store) forkStamp(ctx context.Context, leaves []int16, txids [][]byte, e
 //
 // Both statements run over the WHOLE key set rather than a residue split, because each is
 // already confined to the rows the other cannot reach: unstampSQL touches only identity rows,
-// and moveBackSQL only membership rows for this exact (height, block id).
+// and moveBackSQL only transactions that HOLD a membership row for this exact (height, block
+// id), which a transaction with an identity row does not.
 func (s *Store) unstampAndMoveBack(ctx context.Context, leaves []int16, txids [][]byte,
 	entry []byte, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	// A fresh clock from the current tip. See unstampSQL.
@@ -581,19 +609,27 @@ func (s *Store) unstampAndMoveBack(ctx context.Context, leaves []int16, txids []
 		}
 	}
 
-	if _, err := dbTx.Exec(ctx, moveBackSQL, txids, int32(info.BlockHeight),
-		int32(info.BlockID), height); err != nil { //nolint:gosec // heights and ids fit
+	moved, err := queryTxids(ctx, dbTx, moveBackSQL, txids, int32(info.BlockHeight),
+		int32(info.BlockID), height) //nolint:gosec // heights and ids fit
+	if err != nil {
 		_ = dbTx.Rollback(ctx)
 
 		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] move back to the mempool", err)
 	}
 
-	// No block id: the transaction is back in the mempool table, so it settles under no block
-	// and every one of its stamped coins goes back to the sentinel. See resetCoinsSQL.
-	if err := resetCoins(ctx, dbTx, txids, nil); err != nil {
-		_ = dbTx.Rollback(ctx)
+	// The coins that are reset are the ones of the transactions that actually MOVED, not of
+	// every hash named. An un-mine of a block a transaction was never in moves nothing, and
+	// resetting its coins would un-confirm a coin whose block still contains it.
+	//
+	// No block id is passed, because a transaction that moved is back in the mempool table and
+	// settles under no block at all -- not even a sibling that still names it. See
+	// resetCoinsSQL.
+	if len(moved) > 0 {
+		if err := resetCoins(ctx, dbTx, txidsOf(moved), nil); err != nil {
+			_ = dbTx.Rollback(ctx)
 
-		return nil, err
+			return nil, err
+		}
 	}
 
 	if err := dbTx.Commit(ctx); err != nil {
@@ -609,6 +645,17 @@ func (s *Store) unstampAndMoveBack(ctx context.Context, leaves []int16, txids []
 	}
 
 	return out, nil
+}
+
+// txidsOf is the byte-slice form of a set of hashes, as the array-parameterised statements take.
+func txidsOf(hashes []chainhash.Hash) [][]byte {
+	out := make([][]byte, 0, len(hashes))
+
+	for i := range hashes {
+		out = append(out, hashes[i][:])
+	}
+
+	return out
 }
 
 // resetCoins puts the listed transactions' stamped coins back to the unconfirmed sentinel.

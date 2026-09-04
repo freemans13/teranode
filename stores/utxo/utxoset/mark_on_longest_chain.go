@@ -67,6 +67,13 @@ SELECT DISTINCT ((get_byte(i.membership, 4)::bigint << 24)
 // order mh_triple and packMembership write them, with the bigint casts mh_max needs: an int4
 // shift of 255 by 24 wraps negative, silently.
 //
+// $3 is the LOWEST HEIGHT still covered by a membership window, and a row naming anything
+// below it is left exactly where it is. Its window has been dropped and cannot be recreated:
+// the floor exists to stop a retired window claiming its transactions afresh and doubling every
+// coin still live in it. A single-block row that old is ordinary fork residue -- roughly 300
+// blocks of it is what block assembly's startup reload hands this call -- so refusing to settle
+// it must not refuse the marker clear for every other hash in the batch. See markOnAndSettle.
+//
 // One leaf group at a time, for the reason spelled out on leafGroups, and the same
 // RETURNING-from-the-DELETE shape moveToMinedSQL uses so a replayed block cannot make a row
 // that HAS left tx_ident look as though it stayed.
@@ -77,6 +84,10 @@ WITH moved AS (
        AND i.txid = ANY($2::bytea[])
        AND octet_length(i.membership) = 12
        AND i.conflicting_children IS NULL
+       AND ((get_byte(i.membership, 4)::bigint << 24)
+          | (get_byte(i.membership, 5)::bigint << 16)
+          | (get_byte(i.membership, 6)::bigint <<  8)
+          |  get_byte(i.membership, 7)::bigint) >= $3::bigint
     RETURNING i.txid, i.membership, i.created_height, i.size_in_bytes, i.fee,
               i.tx_inpoints, i.locktime, i.created_at, i.flags
 ),
@@ -207,6 +218,13 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 // connection. Its heights are only known once the single triples have been DECODED, so the
 // order is forced: read the heights (singleTripleHeightsSQL), create the windows, then
 // Begin -> mark -> move -> Commit.
+//
+// A height whose window has already been DROPPED is skipped rather than refused. The floor
+// makes ensureTxMinedPartition reject it, and that rejection used to abort the whole call
+// before the marker clear had run -- so one stale fork triple, which is precisely what block
+// assembly's startup reload turns up, could leave the node unable to start. Those rows keep
+// their identity row and get their marker cleared, which is the repair the caller asked for;
+// only the settle is skipped, and moveSingleToMinedSQL's own floor guard is what skips it.
 func (s *Store) markOnAndSettle(ctx context.Context, txids [][]byte) ([]chainhash.Hash, error) {
 	groups := leafGroups(txids)
 
@@ -215,10 +233,29 @@ func (s *Store) markOnAndSettle(ctx context.Context, txids [][]byte) ([]chainhas
 		return nil, err
 	}
 
+	floor, err := s.txMinedFloor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// The lowest height any live window can still cover.
+	minHeight := floor * TxMinedPartitionBlocks
+	dropped := 0
+
 	for _, h := range heights {
+		if h < minHeight {
+			dropped++
+
+			continue
+		}
+
 		if err := s.ensureTxMinedPartition(ctx, h); err != nil {
 			return nil, err
 		}
+	}
+
+	if dropped > 0 {
+		s.logger.Warnf("[utxoset][MarkTransactionsOnLongestChain] %d single-block height(s) below the membership floor %d: marker cleared, rows left in the mempool table", dropped, minHeight)
 	}
 
 	dbTx, err := s.pool.Begin(ctx)
@@ -241,7 +278,7 @@ func (s *Store) markOnAndSettle(ctx context.Context, txids [][]byte) ([]chainhas
 	}
 
 	for _, g := range groups {
-		if _, err := dbTx.Exec(ctx, moveSingleToMinedSQL, g.leaf, g.txids); err != nil {
+		if _, err := dbTx.Exec(ctx, moveSingleToMinedSQL, g.leaf, g.txids, int64(minHeight)); err != nil {
 			_ = dbTx.Rollback(ctx)
 
 			return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] settle", err)
@@ -313,12 +350,15 @@ func (s *Store) markOffAndMoveBack(ctx context.Context, txids [][]byte) ([]chain
 		return nil, errors.NewStorageError("[utxoset][MarkTransactionsOnLongestChain] move back to the mempool", err)
 	}
 
-	// No block id: this call names none, so every stamped coin of these transactions goes back
-	// to the sentinel.
-	if err := resetCoins(ctx, dbTx, txids, nil); err != nil {
-		_ = dbTx.Rollback(ctx)
+	// Only the transactions that actually MOVED, and with no block id: each is back in the
+	// mempool table and settles under nothing at all, so every one of its stamped coins goes to
+	// the sentinel. A hash that held no membership row moved nothing and keeps its coins.
+	if len(moved) > 0 {
+		if err := resetCoins(ctx, dbTx, txidsOf(moved), nil); err != nil {
+			_ = dbTx.Rollback(ctx)
 
-		return nil, err
+			return nil, err
+		}
 	}
 
 	if err := dbTx.Commit(ctx); err != nil {
@@ -330,6 +370,14 @@ func (s *Store) markOffAndMoveBack(ctx context.Context, txids [][]byte) ([]chain
 
 // singleTripleHeights is the set of block heights named by the listed identity rows that hold
 // exactly one triple. See singleTripleHeightsSQL for why it is read separately.
+//
+// It reads OUTSIDE the transaction that then moves those rows, so a concurrent stamp can append
+// a triple, or an un-mine remove one, between the read and the move. That is acceptable here and
+// only here: this is a startup repair, and both outcomes are safe. A row that gained a second
+// triple no longer satisfies moveSingleToMinedSQL's single-triple test and simply stays, and a
+// row whose height changed is one whose window this call may not have created -- in which case
+// the INSERT fails and the whole transaction rolls back, losing nothing. A stamp path could not
+// tolerate that gap, which is why stampAndMove takes its height from the caller instead.
 func (s *Store) singleTripleHeights(ctx context.Context, groups []leafBatch) ([]uint32, error) {
 	var out []uint32
 

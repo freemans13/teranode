@@ -15,17 +15,53 @@ import (
 // bounded number of round trips rather than one per transaction.
 const stampRetiringWindowChunk = 20_000
 
-// retiringWindowRowsSQL lists a window's rows for the coin stamp, oldest (txid, seq) first so
-// the FIRST row per transaction id -- the one taken below -- is the earliest block that ever
-// settled it. Paged by a KEYSET on (txid, seq) rather than OFFSET, so the plan stays an index
-// scan at every page rather than degrading as the offset grows: an OFFSET-based page has to
-// skip every row before it, which is O(rows read so far) per page over a window that can hold
-// tens of millions of rows.
+// retiringWindowRowsSQL lists a window's rows in (txid, seq) order, to name WHICH transactions
+// the coin stamp has to visit. It deliberately does not read mined_height or block_id: this
+// window's own row is not necessarily the transaction's earliest, so the block facts come from
+// firstMinedRowSQL instead.
+//
+// Paged by a KEYSET on (txid, seq) rather than OFFSET, so the plan stays an index scan at every
+// page rather than degrading as the offset grows: an OFFSET-based page has to skip every row
+// before it, which is O(rows read so far) per page over a window that can hold tens of millions
+// of rows. Ordering by txid also keeps one transaction's rows contiguous across page
+// boundaries, which is what makes the dedup below correct.
 const retiringWindowRowsSQL = `
-SELECT txid, mined_height, block_id, seq FROM %[1]s
+SELECT txid, seq FROM %[1]s
  WHERE (txid, seq) > ($1::bytea, $2::bigint)
  ORDER BY txid, seq
  LIMIT $3`
+
+// firstMinedRowSQL resolves, for each listed transaction, the block named by its EARLIEST
+// membership row across EVERY LIVE WINDOW -- not just the one that is retiring.
+//
+// It has to look across windows because a transaction's rows do not all live in one. A window
+// is keyed by mined_height, and a transaction mined at height h can be fork-stamped at h-1 or
+// h+1 by appendMinedSQL, which straddles a 288 boundary about one block in 288. The older
+// window then retires first, and stamping from the row IT holds would hand the coin a FORK
+// block whenever that is the row it has -- permanently, because the mined_height = 0 guard
+// skips the coin when the other window retires and nothing survives to correct it from.
+//
+// The earliest row by seq is the transaction's LONGEST-CHAIN stamp, and that is a rule rather
+// than an ordering accident. Since task 9 a transaction only reaches the membership table by a
+// longest-chain stamp or a block-path create; a fork stamp gets there only by appendMinedSQL,
+// which copies an EXISTING row's payload, so it can never be the first row. seq is a table-wide
+// identity, so "earliest" is well defined across windows without comparing heights -- which
+// would be the wrong test anyway, as this statement's own fork case shows.
+//
+// The keys sit on the OUTSIDE of a LATERAL with an OFFSET 0 fence, the shape minedByTxidSQL and
+// appendMinedSQL use: one primary-key descent per key per live window. A plain
+// `JOIN tx_mined m ON m.txid = ANY(...)` lets the planner hash the keys against the windows and
+// read them whole, which is what the measurements behind minedByTxidSQL found at 500 keys.
+const firstMinedRowSQL = `
+SELECT k.txid, m.mined_height, m.block_id
+  FROM unnest($1::bytea[]) AS k(txid)
+ CROSS JOIN LATERAL (
+   SELECT m.mined_height, m.block_id
+     FROM tx_mined m
+    WHERE m.txid = k.txid
+    ORDER BY m.seq
+    LIMIT 1 OFFSET 0
+ ) AS m`
 
 // stampCoinsSQL stamps every live (unconfirmed) coin of the listed transactions with the
 // block their FIRST surviving tx_mined row named. See liveCoinArgs for the leaf/lo/hi shape;
@@ -49,9 +85,16 @@ SELECT txid, mined_height, block_id, seq FROM %[1]s
 //
 // EVERY live coin of the transaction is stamped, not just one, so the LATERAL carries no
 // LIMIT -- unlike coinFactsSQL, which only ever needs one.
+//
+// The UPDATE rechecks the FULL TXID and not only the (leaf, ukey) the read found the row by.
+// ukey is a 96-bit prefix and NON-UNIQUE by design -- see Pack -- so a stranger's coin in the
+// same leaf can share it, and it is a coin at the SENTINEL that this statement is looking for,
+// which is exactly what a colliding row is most likely to be. Stamping it would hand a coin the
+// facts of a block that does not contain its transaction, and once this window is dropped there
+// is nothing left to correct it from. resetCoinsSQL carries the identical recheck.
 const stampCoinsSQL = `
 WITH hit AS (
-    SELECT c.leaf, c.ukey, k.h, k.b
+    SELECT c.leaf, c.ukey, k.txid, k.h, k.b
       FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[], $5::int[], $6::int[])
            AS k(leaf, txid, lo, hi, h, b)
      CROSS JOIN LATERAL (
@@ -64,7 +107,7 @@ WITH hit AS (
 )
 UPDATE utxo u SET mined_height = hit.h, block_id = hit.b
   FROM hit
- WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey`
+ WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey AND u.txid = hit.txid`
 
 // TxMinedPartitionBlocks is the width of one membership window.
 //
@@ -250,10 +293,10 @@ UPDATE tx_mined_floor SET floor = GREATEST(floor, %[2]d) WHERE id = 0;`, w.name,
 	return dropped, nil
 }
 
-// stampRetiringWindowCoins is the lazy coin stamp: it reads window's own rows and stamps the
-// FIRST (lowest seq) row's block against every one of its transactions' still-unconfirmed
-// coins, before the window is detached. Returns the number of distinct transactions read and
-// the number of coin rows the stamp touched.
+// stampRetiringWindowCoins is the lazy coin stamp: it reads the distinct transactions of the
+// window about to be detached and stamps each one's still-unconfirmed coins with the block its
+// EARLIEST membership row names, resolved across every live window. Returns the number of
+// distinct transactions read and the number of coin rows the stamp touched.
 //
 // It reads in pages of stampRetiringWindowChunk rows, oldest (txid, seq) first, rather than one
 // query for the whole window: a window can hold a full 288 blocks of mainnet membership, tens
@@ -264,11 +307,19 @@ UPDATE tx_mined_floor SET floor = GREATEST(floor, %[2]d) WHERE id = 0;`, w.name,
 // page and does not degrade as the window is worked through: an OFFSET-based page N has to skip
 // the N-1 pages before it, at O(rows read so far) per page.
 //
-// A transaction's rows always sort together, because the window's rows are ordered by
-// (txid, seq) and a transaction cannot appear in two different windows -- a window is keyed by
-// mined_height, which is a property of the transaction's block, not of the transaction. So a
-// transaction whose rows straddle a page boundary is still resolved correctly: dedup runs
-// across the whole window via lastStampedTxid, not just within one page.
+// The window's rows say WHICH transactions to stamp; firstMinedRowSQL says with WHAT. A
+// transaction's rows are NOT all in one window -- see firstMinedRowSQL -- so the block cannot be
+// taken from the retiring window's own row without risking a fork block on the coin. The two
+// reads are separate for that reason, not for tidiness.
+//
+// Within this window a transaction's rows still sort together, because the pages are ordered by
+// (txid, seq), so a transaction straddling a page boundary is deduplicated correctly:
+// lastStampedTxid carries across pages rather than resetting with each one.
+//
+// The one case this cannot get right is a transaction whose FIRST row is a fork stamp, and it
+// cannot arise: a fork stamp on a transaction that still has an identity row rewrites that row
+// and stays in the mempool table, and a fork stamp on one that does not can only append to a
+// membership row that already exists. So there is nothing to test there, and nothing to guard.
 func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (txCount, coinCount int, err error) {
 	var (
 		lastTxid       = []byte{}
@@ -289,24 +340,17 @@ func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (tx
 		}
 
 		var (
-			leaves  []int16
-			txids   [][]byte
-			los     [][16]byte
-			his     [][16]byte
-			heights []int32
-			blockID []int32
-			n       int
+			txids [][]byte
+			n     int
 		)
 
 		for rows.Next() {
 			var (
-				txid   []byte
-				height int32
-				block  int32
-				seq    int64
+				txid []byte
+				seq  int64
 			)
 
-			if serr := rows.Scan(&txid, &height, &block, &seq); serr != nil {
+			if serr := rows.Scan(&txid, &seq); serr != nil {
 				rows.Close()
 				return txCount, coinCount, errors.NewStorageError("[utxoset] scan retiring window %s", window, serr)
 			}
@@ -323,12 +367,7 @@ func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (tx
 			lastStampedTxid = txid
 			txCount++
 
-			leaves = append(leaves, LeafFor(txid))
 			txids = append(txids, txid)
-			los = append(los, Pack(txid, 0))
-			his = append(his, Pack(txid, ^uint32(0)))
-			heights = append(heights, height)
-			blockID = append(blockID, block)
 		}
 
 		rerr := rows.Err()
@@ -340,12 +379,12 @@ func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (tx
 		}
 
 		if len(txids) > 0 {
-			tag, uerr := s.pool.Exec(ctx, stampCoinsSQL, leaves, txids, los, his, heights, blockID)
-			if uerr != nil {
-				return txCount, coinCount, errors.NewStorageError("[utxoset] stamp coins for retiring window %s", window, uerr)
+			stamped, serr := s.stampCoinsOf(ctx, txids)
+			if serr != nil {
+				return txCount, coinCount, errors.NewStorageError("[utxoset] stamp coins for retiring window %s", window, serr)
 			}
 
-			coinCount += int(tag.RowsAffected())
+			coinCount += stamped
 		}
 
 		if n < stampRetiringWindowChunk {
@@ -354,4 +393,62 @@ func (s *Store) stampRetiringWindowCoins(ctx context.Context, window string) (tx
 	}
 
 	return txCount, coinCount, nil
+}
+
+// stampCoinsOf resolves each transaction's earliest membership row across every live window and
+// stamps its still-unconfirmed coins with that row's block.
+//
+// A transaction whose rows have all gone -- nothing can produce that here, since the retiring
+// window has not been detached yet -- is simply absent from the resolve and is not stamped, the
+// CROSS JOIN LATERAL being an inner join.
+func (s *Store) stampCoinsOf(ctx context.Context, txids [][]byte) (int, error) {
+	rows, err := s.pool.Query(ctx, firstMinedRowSQL, txids)
+	if err != nil {
+		return 0, err
+	}
+
+	var (
+		found   [][]byte
+		heights []int32
+		blockID []int32
+	)
+
+	for rows.Next() {
+		var (
+			txid   []byte
+			height int32
+			block  int32
+		)
+
+		if serr := rows.Scan(&txid, &height, &block); serr != nil {
+			rows.Close()
+
+			return 0, serr
+		}
+
+		found = append(found, txid)
+		heights = append(heights, height)
+		blockID = append(blockID, block)
+	}
+
+	rerr := rows.Err()
+
+	rows.Close()
+
+	if rerr != nil {
+		return 0, rerr
+	}
+
+	if len(found) == 0 {
+		return 0, nil
+	}
+
+	leaves, ids, los, his := liveCoinArgs(found)
+
+	tag, err := s.pool.Exec(ctx, stampCoinsSQL, leaves, ids, los, his, heights, blockID)
+	if err != nil {
+		return 0, err
+	}
+
+	return int(tag.RowsAffected()), nil
 }

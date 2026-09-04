@@ -371,3 +371,59 @@ func TestUnMineMovesTheWholeTransactionBack(t *testing.T) {
 	require.Equal(t, int32(0), h, "back at the sentinel, sibling block or not")
 	require.Equal(t, int32(0), b)
 }
+
+// TestUnMineDoesNotResetAnotherTransactionsCoin: the coin reset must recheck the full
+// transaction id, not just the packed key it found the row by.
+//
+// ukey is a 96-bit prefix and non-unique by design, so two transactions in the same leaf can
+// share one. Matching an UPDATE on (leaf, ukey) alone would reset a stranger's coin to the
+// unconfirmed sentinel -- a coin that is spendable now reading as immature, or a mined coin
+// reading as mempool -- which is why every other by-key write in this store rechecks txid.
+func TestUnMineDoesNotResetAnotherTransactionsCoin(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_150))
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	other := insertCollidingCoin(t, s, ctx, tx, 600_000, 99)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, UnsetMined: true})
+	require.NoError(t, err)
+
+	h, b := coinFacts(t, s, ctx, tx)
+	require.Equal(t, int32(0), h, "the un-mined transaction's own coin is reset")
+	require.Equal(t, int32(0), b)
+
+	oh, ob := coinFactsOf(t, s, ctx, other)
+	require.Equal(t, int32(600_000), oh, "a coin sharing the packed key must be untouched")
+	require.Equal(t, int32(99), ob)
+}
+
+// TestUnMineOfABlockTheTransactionDoesNotNameIsANoOp. An un-mine names a block, and a
+// transaction with no membership row for THAT block was never mined into it, so there is
+// nothing to take back. The interface tolerates the absence; it must not turn it into an
+// un-settling of the block the transaction actually is in.
+func TestUnMineOfABlockTheTransactionDoesNotNameIsANoOp(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_150))
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 43, BlockHeight: 700_100, UnsetMined: true})
+	require.NoError(t, err)
+
+	require.Equal(t, 1, minedRows(t, s, ctx, tx), "block 42's membership row stays")
+	require.False(t, identExists(t, s, ctx, tx), "and the transaction stays settled")
+
+	h, b := coinFacts(t, s, ctx, tx)
+	require.Equal(t, int32(700_100), h, "its coin keeps block 42's facts")
+	require.Equal(t, int32(42), b)
+}

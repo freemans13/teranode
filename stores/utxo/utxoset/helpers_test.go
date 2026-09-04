@@ -78,3 +78,46 @@ func createDirect(s *Store, ctx context.Context, tx *bt.Tx, height uint32) error
 
 	return dbTx.Commit(ctx)
 }
+
+// insertCollidingCoin writes a coin row that SHARES another transaction's packed key: the same
+// first twelve bytes of txid, so the same leaf and the same ukey, with a different full
+// 32-byte txid.
+//
+// Pack is a 96-bit prefix and NON-UNIQUE by design (see its comment in schema.go), so this row
+// is legal and this collision is the one an attacker can buy with 2^48 of work. Any by-key
+// write that does not recheck the full txid will hit it, which is what the tests using this
+// helper are for. It returns the other transaction id so the caller can read the row back.
+func insertCollidingCoin(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx,
+	minedHeight, blockID int32) []byte {
+	t.Helper()
+
+	other := append([]byte(nil), hashBytes(tx)...)
+	// Byte 0 is untouched, so the leaf is the same; bytes 12 onward are outside the packed key,
+	// so the ukey is the same too.
+	other[31] ^= 0xff
+
+	ukey := Pack(hashBytes(tx), 0)
+
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO utxo (satoshis, created_height, spendable_from, mined_height, block_id,
+		                  leaf, flags, ukey, txid, script)
+		VALUES (1000, 100, 0, $1, $2, $3, 0, $4, $5,
+		        '\x76a914000000000000000000000000000000000000000088ac'::bytea)`,
+		minedHeight, blockID, LeafFor(other), ukey, other)
+	require.NoError(t, err)
+
+	return other
+}
+
+// coinFactsOf reads the block facts off the one coin row carrying this exact txid.
+func coinFactsOf(t *testing.T, s *Store, ctx context.Context, txid []byte) (minedHeight, blockID int32) {
+	t.Helper()
+
+	lo, hi := Pack(txid, 0), Pack(txid, ^uint32(0))
+	require.NoError(t, s.pool.QueryRow(ctx, `
+		SELECT mined_height, block_id FROM utxo
+		 WHERE leaf = $1 AND ukey >= $2 AND ukey <= $3 AND txid = $4`,
+		LeafFor(txid), lo, hi, txid).Scan(&minedHeight, &blockID))
+
+	return minedHeight, blockID
+}

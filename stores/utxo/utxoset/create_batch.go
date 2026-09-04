@@ -56,6 +56,29 @@ import (
 // gate. Without that gate a re-applied block would create every output a second time, which
 // is the failure this mechanism exists to prevent.
 //
+// The claim is gated on tx_mined as well as on its own conflict clause, and that guard is what
+// keeps a transaction in EXACTLY ONE of the two tables. A transaction the longest-chain stamp
+// has settled has no identity row at all, so ON CONFLICT sees nothing to conflict with: without
+// the guard, a mempool create of an already-settled transaction takes a fresh identity row --
+// two homes, and every read-order argument in this store assumes one -- and, because the coin
+// insert is gated on that same claim taking, writes every one of its outputs a SECOND time.
+// Duplicate coins are the failure the claim mechanism exists to prevent. With the guard such a
+// create claims nothing and settle reports it as ErrTxExists, which is exactly what the block
+// path already answers for a mempool stray, in the other direction.
+//
+// It costs one index descent per live window, and the OFFSET 0 inside it is what buys that.
+// tx_mined's primary key LEADS with txid, so the probe is cheap, but a bare NOT EXISTS is
+// flattened into an anti-join and the planner then costs a hash of the whole window below 500
+// per-key probes: measured at 500 keys against 40,000 membership rows, a Hash Anti Join over a
+// Seq Scan of the window, 9.4 ms. OFFSET 0 fences the subquery so it stays a per-row subplan on
+// the primary key -- the same fence minedByTxidSQL and appendMinedSQL need, for the same
+// reason. At 400,000 rows the planner reaches for the index either way, which is exactly why
+// the fence has to be written down rather than left to the estimate.
+//
+// The lock lockTxids takes before this statement is what makes the guard trustworthy, exactly
+// as it does for createMinedPlanSQL's three: the read takes no row lock of its own, so two
+// concurrent creates of one transaction could otherwise both find nothing.
+//
 // fee is written as NULL deliberately. The store does not compute it, and block assembly
 // rebuilds a mining candidate from size and inpoints instead.
 const createIdentPlanSQL = `
@@ -72,6 +95,7 @@ claim AS (
     SELECT t.leaf, t.txid, t.created_height, t.off_chain_since, t.membership,
            NULL::bigint, t.size_in_bytes, t.tx_inpoints, t.locktime, t.created_at, t.flags
       FROM t
+     WHERE NOT EXISTS (SELECT 1 FROM tx_mined m WHERE m.txid = t.txid LIMIT 1 OFFSET 0)
     ON CONFLICT (leaf, txid) DO NOTHING
     RETURNING leaf, txid
 ),

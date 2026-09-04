@@ -141,3 +141,27 @@ func TestBlockPathCreateRefusesAMempoolStray(t *testing.T) {
 	require.Equal(t, 1, coinCount(t, s, ctx, tx))
 	require.Equal(t, 0, minedRows(t, s, ctx, tx))
 }
+
+// TestMempoolCreateRefusesASettledTransaction is the mirror of
+// TestBlockPathCreateRefusesAMempoolStray, and the reason a transaction can live in exactly
+// ONE of the two tables.
+//
+// Without a membership guard on the mempool claim, a create of an already-settled transaction
+// takes a fresh identity row -- the transaction then has a home in both tables -- and, because
+// the coin insert is gated on that claim taking, writes every one of its outputs a SECOND
+// time. Duplicate coins are the failure the whole claim mechanism exists to prevent.
+func TestMempoolCreateRefusesASettledTransaction(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	_, err = s.Create(ctx, tx, 700_101)
+	require.True(t, errors.Is(err, errors.ErrTxExists), "a settled transaction already exists")
+
+	require.Equal(t, 1, coinCount(t, s, ctx, tx), "and its coins are not written twice")
+	require.False(t, identExists(t, s, ctx, tx))
+	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+}

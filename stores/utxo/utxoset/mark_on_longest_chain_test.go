@@ -150,3 +150,42 @@ func TestMarkOnLongestChainMovesASingleBlockRow(t *testing.T) {
 	require.Equal(t, 0, minedRows(t, s, ctx, two))
 	require.Nil(t, readIdent(t, s, ctx, two.TxIDChainHash()[:]).offChainSince)
 }
+
+// TestMarkOnLongestChainSkipsADroppedWindow. A single-block identity row can name a height
+// whose membership window has already been dropped -- roughly 300 blocks of fork residue is
+// exactly what block assembly's startup reload hands this call -- and the window cannot be
+// recreated, because the floor exists to stop a retired window claiming its transactions
+// afresh.
+//
+// The repair must still happen for every hash. Refusing the whole call because one stale fork
+// triple cannot be settled would leave the node unable to start, which is the failure this
+// method was written to fix in the first place. So a row naming a dropped window has its
+// marker cleared and stays in the mempool table.
+func TestMarkOnLongestChainSkipsADroppedWindow(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	// A block-path create is what puts window 0 on the table, so that dropping it moves the
+	// floor past the height the fork triple below names.
+	filler := mkTx(t, 1, 1_111)
+	_, err := s.Create(ctx, filler, 100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err = s.Create(ctx, tx, 100)
+	require.NoError(t, err)
+	_, err = s.SetMinedMulti(ctx, hashes(tx), utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 100})
+	require.NoError(t, err)
+
+	dropped, err := s.dropTxMinedWindowsBelow(ctx, 2_000)
+	require.NoError(t, err)
+	require.Equal(t, 1, dropped, "window 0 has to be gone for this test to mean anything")
+
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
+		[]chainhash.Hash{*tx.TxIDChainHash()}, true))
+
+	require.True(t, identExists(t, s, ctx, tx), "it stays in the mempool table")
+	require.Equal(t, 0, minedRows(t, s, ctx, tx))
+	require.Nil(t, readIdent(t, s, ctx, tx.TxIDChainHash()[:]).offChainSince,
+		"the marker is cleared even though the row could not be settled")
+}
