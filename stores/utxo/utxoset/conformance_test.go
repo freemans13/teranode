@@ -16,10 +16,9 @@ import (
 // implementation (postgres, aerospike, sql) is held to it, and the same invariants must
 // hold here regardless of how radically the storage model differs underneath.
 //
-// These are expected to FAIL until the corresponding methods land. That is deliberate:
-// the failures are the worklist, expressed in the repo's own terms rather than a
-// hand-written approximation of them. Each subtest is named for the capability it pins
-// so a failure says what is missing rather than merely that something is.
+// Each subtest is named for the capability it pins, so a failure says what is missing rather
+// than merely that something is. They all pass; a suite not listed here is one this store does
+// not implement the entry point for, not one that is failing quietly.
 func TestConformance(t *testing.T) {
 	t.Run("Store", func(t *testing.T) {
 		db, _ := newTestStore(t)
@@ -83,5 +82,43 @@ func TestConformance(t *testing.T) {
 		require.NoError(t, err)
 
 		tests.MinedThenSpendAllPrunes(t, db, svc)
+	})
+
+	// The six SpendAndCreate entry points. The spec named them as ones this design should
+	// enable, and they are the cross-store contract for the option C1's own-output coin guard
+	// turns on: WithCreateOnly skips the spend phase, which is the path a mempool create takes
+	// when the validator's CreateConflicting branch fires.
+	//
+	// The package's own spend_and_create_batch_test.go covers similar ground, but it is written
+	// against this store's internals. These are written against the interface, which is what
+	// makes them a contract rather than a second opinion.
+	t.Run("SpendAndCreate", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SpendAndCreate(t, db)
+	})
+
+	t.Run("SpendAndCreateCreateOnly", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SpendAndCreateCreateOnly(t, db)
+	})
+
+	t.Run("SpendAndCreateSpendOnly", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SpendAndCreateSpendOnly(t, db)
+	})
+
+	t.Run("SpendAndCreateTxExistsKeepsSpends", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SpendAndCreateTxExistsKeepsSpends(t, db)
+	})
+
+	t.Run("SpendAndCreateSpendErrorSurfacesPerInput", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SpendAndCreateSpendErrorSurfacesPerInput(t, db)
+	})
+
+	t.Run("SpendAndCreateInvalidOptions", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SpendAndCreateInvalidOptions(t, db)
 	})
 }
