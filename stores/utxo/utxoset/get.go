@@ -10,27 +10,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
-	"github.com/jackc/pgx/v5"
 )
-
-// getSQL reads one transaction from the identity row, joining the body only if it is still
-// inside its window.
-//
-// The join is LEFT, and that is the point rather than caution. The body window is dropped
-// after 288 blocks while the identity row lives for as long as any of the transaction's
-// outputs is unspent, at any age, so a body-less row is the ordinary steady state for an old
-// transaction. An inner join would report every such transaction as missing, and a missing
-// parent makes the validator reject its children.
-//
-// Both halves are found by (leaf, txid) and (created_height, txid) respectively, so this is
-// two index probes and no scan. The body's height comes from the identity row, which is why
-// created_height is immutable there: if it moved, the body could not be found.
-const getSQL = `
-SELECT i.created_height, i.off_chain_since, i.membership, i.fee, i.size_in_bytes,
-       i.tx_inpoints, i.locktime, i.created_at, i.conflicting_children, i.flags, b.raw_tx
-  FROM tx_ident i
-  LEFT JOIN tx_body b ON b.created_height = i.created_height AND b.txid = i.txid
- WHERE i.leaf = $1 AND i.txid = $2`
 
 // unpackMembership turns the packed 12-byte triples back into the three parallel slices the
 // meta.Data carries, in the order they were written.
@@ -60,10 +40,11 @@ func unpackMembership(m []byte) (blockIDs, heights []uint32, subtreeIdxs []int) 
 
 // Get returns everything the store holds about one transaction.
 //
-// The field list is ignored with ONE exception. Everything on the identity row and its body
-// arrives together from a single statement, so narrowing the projection would save a few bytes
-// on the wire and nothing else, while handing a caller a partly populated record it might
-// dereference. Answering the whole question is cheaper than answering half of it carefully.
+// The field list is ignored with ONE exception. Whichever of the three steps answers (see
+// lookup.go) returns everything that step holds on one row, so narrowing the projection would
+// save a few bytes on the wire and nothing else, while handing a caller a partly populated
+// record it might dereference. Answering the whole question is cheaper than answering half of
+// it carefully.
 //
 // The exception is the per-output spend state, which costs a second query across two tables
 // because this store destroys the coin row on spend and keeps the spender in its journal. That
@@ -99,22 +80,23 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fie
 	return data, nil
 }
 
-// getDirect is the unbatched read, one statement for the identity row and its body.
+// getDirect is the unbatched read: the shared read order, asked about one transaction.
+//
+// It is a lookupMany of one rather than a statement of its own. The order identity ->
+// membership -> coin is a correctness rule (see lookup.go), and a second copy of it here is
+// a defect waiting for one copy to be fixed and the other forgotten.
 func (s *Store) getDirect(ctx context.Context, hash *chainhash.Hash) (*meta.Data, error) {
-	var r metaRow
-
-	err := s.pool.QueryRow(ctx, getSQL, LeafFor(hash[:]), hash[:]).Scan(
-		&r.createdHeight, &r.offChainSince, &r.membership, &r.fee, &r.sizeInBytes,
-		&r.txInpoints, &r.locktime, &r.createdAt, &r.conflictingChildren, &r.flags, &r.rawTx)
-
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return nil, errors.NewTxNotFoundError("[utxoset][Get] %s", hash.String())
-	case err != nil:
-		return nil, errors.NewStorageError("[utxoset][Get] %s", hash.String(), err)
+	found, err := s.lookupMany(ctx, []chainhash.Hash{*hash})
+	if err != nil {
+		return nil, err
 	}
 
-	return r.toMeta(hash)
+	data, ok := found[*hash]
+	if !ok {
+		return nil, errors.NewTxNotFoundError("[utxoset][Get] %s", hash.String())
+	}
+
+	return data, nil
 }
 
 // GetMeta fills in an existing meta.Data from the store, which is what callers holding a

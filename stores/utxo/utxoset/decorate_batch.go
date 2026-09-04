@@ -9,98 +9,50 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 )
 
-// batchGetSQL resolves many transactions in one statement.
-//
-// Subtree validation resolves thousands at a time, so one round trip each would dominate.
-// Both other implementations of this interface funnel single reads into this call for that
-// reason, and this store now does the same.
-//
-// The join to the body is LEFT, exactly as the single read's is, and for the same reason: a
-// transaction whose bytes have aged out of their window is the ordinary steady state, not an
-// error, and an inner join would report every one of them as missing.
-const batchGetSQL = `
-SELECT i.txid, i.created_height, i.off_chain_since, i.membership, i.fee, i.size_in_bytes,
-       i.tx_inpoints, i.locktime, i.created_at, i.conflicting_children, i.flags, b.raw_tx
-  FROM unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
-  JOIN tx_ident i ON i.leaf = k.leaf AND i.txid = k.txid
-  LEFT JOIN tx_body b ON b.created_height = i.created_height AND b.txid = i.txid`
-
 // BatchDecorate fills in metadata for many transactions at once.
 //
 // A transaction the store does not hold is reported on ITS OWN entry, not by failing the
 // call. The validator turns a missing parent into a rejection for that transaction alone, so
 // failing the batch would reject every transaction that happened to be resolved beside it.
 //
-// The field list is accepted and ignored, as it is on the single read: every column arrives
-// on one row from one statement, so narrowing the projection would save a little on the wire
-// and hand the caller a partly populated record it might dereference.
+// The field list is accepted and ignored, as it is on the single read: whichever step answers
+// returns every column it holds on one row, so narrowing the projection would save a little on
+// the wire and hand the caller a partly populated record it might dereference.
+//
+// The read order lives in lookupMany, which this, Get and the get batcher all go through, so
+// there is one answer to "where does a transaction come from" rather than three.
 func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
 	if len(items) == 0 {
 		return nil
 	}
 
-	leaves := make([]int16, 0, len(items))
-	txids := make([][]byte, 0, len(items))
-
-	// One entry per DISTINCT hash. A batch can name the same parent twice, and asking twice
-	// would return two rows for it and waste the round trip this call exists to save.
-	seen := make(map[chainhash.Hash]struct{}, len(items))
-
+	hashes := make([]chainhash.Hash, 0, len(items))
 	for _, it := range items {
-		if _, dup := seen[it.Hash]; dup {
-			continue
-		}
-
-		seen[it.Hash] = struct{}{}
-
-		leaves = append(leaves, LeafFor(it.Hash[:]))
-		txids = append(txids, it.Hash[:])
+		hashes = append(hashes, it.Hash)
 	}
 
-	rows, err := s.pool.Query(ctx, batchGetSQL, leaves, txids)
+	found, err := s.lookupMany(ctx, hashes)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][BatchDecorate]", err)
 	}
 
-	found := make(map[chainhash.Hash]*metaRow, len(items))
-
-	for rows.Next() {
-		var (
-			txid []byte
-			r    metaRow
-		)
-
-		if err := rows.Scan(&txid, &r.createdHeight, &r.offChainSince, &r.membership,
-			&r.fee, &r.sizeInBytes, &r.txInpoints, &r.locktime, &r.createdAt,
-			&r.conflictingChildren, &r.flags, &r.rawTx); err != nil {
-			rows.Close()
-			return errors.NewStorageError("[utxoset][BatchDecorate] scan", err)
-		}
-
-		var h chainhash.Hash
-		copy(h[:], txid)
-
-		row := r
-		found[h] = &row
-	}
-
-	rows.Close()
-
-	if err := rows.Err(); err != nil {
-		return errors.NewStorageError("[utxoset][BatchDecorate] rows", err)
-	}
+	// One record per ENTRY, even where two entries name the same transaction. lookupMany
+	// resolves a repeated hash once, and handing both entries the same pointer would let a
+	// caller decorating one of them mutate the other's answer.
+	given := make(map[chainhash.Hash]struct{}, len(items))
 
 	for _, it := range items {
-		row, ok := found[it.Hash]
+		data, ok := found[it.Hash]
 		if !ok {
 			it.Err = errors.NewTxNotFoundError("[utxoset][BatchDecorate] %s", it.Hash.String())
 			continue
 		}
 
-		data, derr := row.toMeta(&it.Hash)
-		if derr != nil {
-			it.Err = derr
-			continue
+		if _, dup := given[it.Hash]; dup {
+			copied := *data
+			data = &copied
+		} else {
+			given[it.Hash] = struct{}{}
 		}
 
 		it.Data = data

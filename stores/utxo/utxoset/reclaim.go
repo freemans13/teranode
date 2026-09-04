@@ -640,29 +640,6 @@ func (b *reclaimBatch) reset() {
 	b.allApplied = map[string]bool{}
 }
 
-// liveCoinArgs expands transaction ids into the four parallel arrays hasLiveCoinSQL takes:
-// the partition key, the identity, and the packed-key range covering every output the
-// transaction could have created.
-//
-// It is a named function rather than four lines inline so the plan test can build exactly the
-// arguments the production path builds. A test that explained a hand-written variant would be
-// pinning the plan of a statement nothing runs.
-func liveCoinArgs(txids [][]byte) (leaves []int16, ids [][]byte, los, his [][16]byte) {
-	leaves = make([]int16, 0, len(txids))
-	ids = make([][]byte, 0, len(txids))
-	los = make([][16]byte, 0, len(txids))
-	his = make([][16]byte, 0, len(txids))
-
-	for _, id := range txids {
-		leaves = append(leaves, LeafFor(id))
-		ids = append(ids, id)
-		los = append(los, Pack(id, 0))
-		his = append(his, Pack(id, ^uint32(0)))
-	}
-
-	return leaves, ids, los, his
-}
-
 // withLiveCoins returns the subset of txids that still have at least one unspent output.
 func (s *Store) withLiveCoins(ctx context.Context, txids [][]byte) (map[string]struct{}, error) {
 	out := make(map[string]struct{}, len(txids))

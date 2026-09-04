@@ -44,15 +44,25 @@ func TestGetReportsAMissingTransactionAsNotFound(t *testing.T) {
 
 // TestGetUnpacksBlockMembershipInInsertionOrder pins the ordering the shared conformance
 // suite asserts: subtree indexes come back in the order they were written, never sorted.
+//
+// The two blocks are now reached by two stamps rather than by one create carrying two
+// MinedBlockInfos. A create that carries block information takes the block path, which claims
+// a single membership row for the block it was given, so two blocks can only ever be two
+// separate acts. At the tip that is what happens anyway: the transaction arrives from the
+// mempool and each block that contains it stamps it in turn.
 func TestGetUnpacksBlockMembershipInInsertionOrder(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 1_000)
-	_, err := s.Create(ctx, tx, 700_000,
-		utxo.WithMinedBlockInfo(
-			utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 700_002, SubtreeIdx: 7, OnLongestChain: true},
-			utxo.MinedBlockInfo{BlockID: 4, BlockHeight: 700_001, SubtreeIdx: 2, OnLongestChain: true},
-		))
+	_, err := s.Create(ctx, tx, 700_000)
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 700_002, SubtreeIdx: 7, OnLongestChain: true})
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 4, BlockHeight: 700_001, SubtreeIdx: 2, OnLongestChain: true})
 	require.NoError(t, err)
 
 	got, err := s.Get(ctx, tx.TxIDChainHash())

@@ -22,6 +22,11 @@ import (
 //
 // The sql store keys on whether any block information was supplied at all, and this now matches
 // it.
+// The assertion now reads through Get rather than off tx_ident, because a create carrying
+// block information no longer writes an identity row at all: it claims a membership row and
+// coins that know their block. The waiting marker is a column on the row it does not have, so
+// the state this test was written to forbid is now unreachable by construction, and what is
+// worth pinning is that the read path says the same thing -- in a block, not waiting.
 func TestCreateWithABlockIsNotAlsoWaitingToBeMined(t *testing.T) {
 	s, ctx := newTestStore(t)
 
@@ -34,12 +39,15 @@ func TestCreateWithABlockIsNotAlsoWaitingToBeMined(t *testing.T) {
 	}))
 	require.NoError(t, err)
 
-	h := tx.TxIDChainHash()
-	r := readIdent(t, s, ctx, h[:])
+	require.False(t, identExists(t, s, ctx, tx),
+		"a mined transaction has no identity row, so it cannot carry the marker either")
 
-	require.NotEmpty(t, r.membership, "it is in a block")
-	require.Nil(t, r.offChainSince,
-		"so it must NOT also be marked as waiting to be mined")
+	got, err := s.Get(ctx, tx.TxIDChainHash())
+	require.NoError(t, err)
+
+	require.NotEmpty(t, got.BlockIDs, "it is in a block")
+	require.Zero(t, got.UnminedSince,
+		"so it must NOT also be reported as waiting to be mined")
 }
 
 // TestCreateWithoutABlockIsWaitingToBeMined is the other half, and the reason the marker

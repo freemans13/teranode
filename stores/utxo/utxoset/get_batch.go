@@ -7,7 +7,6 @@ import (
 	"github.com/bsv-blockchain/go-batcher/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
@@ -33,20 +32,24 @@ func newGetBatcher(s *Store, size int, duration time.Duration) *batcher.Batcher[
 	return batcher.NewWithPool(size, duration, s.sendGetBatch, true)
 }
 
-// sendGetBatch resolves a batch of reads through the one statement BatchDecorate already
-// issues, then hands each caller its own answer.
+// sendGetBatch resolves a batch of reads through the shared read order, then hands each caller
+// its own answer.
+//
+// It calls lookupMany rather than going the long way round through BatchDecorate, so all three
+// entry points sit directly on the one function that owns the order.
 func (s *Store) sendGetBatch(batch []*getItem) {
 	s.getInFlight.Add(1)
 	defer s.getInFlight.Done()
 
 	ctx := context.Background()
 
-	items := make([]*utxo.UnresolvedMetaData, len(batch))
+	hashes := make([]chainhash.Hash, len(batch))
 	for i, it := range batch {
-		items[i] = &utxo.UnresolvedMetaData{Hash: it.hash, Idx: i}
+		hashes[i] = it.hash
 	}
 
-	if err := s.BatchDecorate(ctx, items); err != nil {
+	found, err := s.lookupMany(ctx, hashes)
+	if err != nil {
 		for _, it := range batch {
 			it.done <- getResult{err: err}
 		}
@@ -56,8 +59,27 @@ func (s *Store) sendGetBatch(batch []*getItem) {
 
 	// A miss is reported per entry rather than as a call failure, so each caller gets its own
 	// verdict. One absent parent must not fail the reads it happened to travel with.
-	for i, it := range batch {
-		it.done <- getResult{data: items[i].Data, err: items[i].Err}
+	//
+	// Each caller gets its OWN record, because two reads in one batch can name the same
+	// transaction and lookupMany resolves it once; a shared pointer would let one caller's
+	// spending-data decoration land in the other's answer.
+	given := make(map[chainhash.Hash]struct{}, len(batch))
+
+	for _, it := range batch {
+		data, ok := found[it.hash]
+		if !ok {
+			it.done <- getResult{err: errors.NewTxNotFoundError("[utxoset][Get] %s", it.hash.String())}
+			continue
+		}
+
+		if _, dup := given[it.hash]; dup {
+			copied := *data
+			data = &copied
+		} else {
+			given[it.hash] = struct{}{}
+		}
+
+		it.done <- getResult{data: data}
 	}
 }
 

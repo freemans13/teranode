@@ -86,15 +86,25 @@ func TestSetMinedReportsATransactionItDoesNotHold(t *testing.T) {
 // TestUnsetMinedGivesTheTransactionAFreshClock covers the reorg path, and pins the fact that
 // settled the merge question: a resurrected transaction gets a clock taken from the CURRENT
 // tip, not its creation height. That is why the marker cannot be derived from created_height.
+// The mined state is now reached by a stamp on a mempool arrival rather than by a create
+// carrying block information. That create takes the block path, which writes no identity row,
+// and un-mining is an identity-row operation: it puts a transaction BACK in the mempool set,
+// which is only meaningful for one that was in it. At the tip that is the only shape a reorg
+// ever sees, because everything but the coinbase arrives from the mempool first.
 func TestUnsetMinedGivesTheTransactionAFreshClock(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 1_000)
-	_, err := s.Create(ctx, tx, 100, utxo.WithMinedBlockInfo(
-		utxo.MinedBlockInfo{BlockID: 5, BlockHeight: 100, SubtreeIdx: 0, OnLongestChain: true}))
+	_, err := s.Create(ctx, tx, 100)
 	require.NoError(t, err)
 
 	h := tx.TxIDChainHash()
+
+	_, err = s.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
+		BlockID: 5, BlockHeight: 100, SubtreeIdx: 0, OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
 	require.Nil(t, readIdent(t, s, ctx, h[:]).offChainSince)
 
 	require.NoError(t, s.SetBlockHeight(5_000))

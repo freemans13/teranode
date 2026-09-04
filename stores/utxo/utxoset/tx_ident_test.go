@@ -236,19 +236,27 @@ func TestCreateMarksAMempoolArrivalAsOffChain(t *testing.T) {
 // The state is now reached the way production reaches it, by block assembly telling the store
 // the transaction is not on the longest chain. That is a fact someone has established, rather
 // than a guess made before anyone could know.
+// The mined state is now reached by a stamp rather than by a create carrying block
+// information. That create takes the block path, which writes no identity row at all, and
+// this test is about two columns of the identity row. At the tip the stamp IS the shape:
+// everything but the coinbase arrives from the mempool, is stamped by the block that mines
+// it, and only later learns whether that block won.
 func TestAForkMinedTransactionCarriesBothMembershipAndTheWaitingMarker(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 1_000)
-	_, err := s.Create(ctx, tx, 700_000, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
-		BlockID: 42, BlockHeight: 700_000, SubtreeIdx: 3,
-	}))
+	_, err := s.Create(ctx, tx, 700_000)
 	require.NoError(t, err)
 
 	h := tx.TxIDChainHash()
 
+	_, err = s.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
+		BlockID: 42, BlockHeight: 700_000, SubtreeIdx: 3, OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
 	require.Nil(t, readIdent(t, s, ctx, h[:]).offChainSince,
-		"created in a block, so not waiting: the chain question is not answered here")
+		"stamped into a block on the longest chain, so not waiting")
 
 	// Block assembly determines the block is not on the main chain.
 	require.NoError(t, s.SetBlockHeight(700_050))
@@ -264,16 +272,22 @@ func TestAForkMinedTransactionCarriesBothMembershipAndTheWaitingMarker(t *testin
 // TestCreateLeavesAConfirmedBlockApplicationOnChain is the other half of the gate. Once a
 // caller states the block is on the longest chain, the transaction is mined and belongs
 // nowhere near the mempool set.
+// Reached by a stamp on a mempool arrival, for the reason the test above it explains: a
+// create carrying block information writes no identity row, and these are its columns.
 func TestCreateLeavesAConfirmedBlockApplicationOnChain(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 1_000)
-	_, err := s.Create(ctx, tx, 700_000, utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
-		BlockID: 42, BlockHeight: 700_000, SubtreeIdx: 3, OnLongestChain: true,
-	}))
+	_, err := s.Create(ctx, tx, 700_000)
 	require.NoError(t, err)
 
 	h := tx.TxIDChainHash()
+
+	_, err = s.SetMinedMulti(ctx, []*chainhash.Hash{h}, utxo.MinedBlockInfo{
+		BlockID: 42, BlockHeight: 700_000, SubtreeIdx: 3, OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
 	r := readIdent(t, s, ctx, h[:])
 
 	require.Nil(t, r.offChainSince, "confirmed on the longest chain means mined")
@@ -282,15 +296,23 @@ func TestCreateLeavesAConfirmedBlockApplicationOnChain(t *testing.T) {
 
 // TestCreatePacksEveryBlockInInsertionOrder pins the packing, including the ordering the
 // conformance suite asserts: subtree indexes come back in insertion order, never sorted.
+// Two blocks are now two stamps. A create that carries block information takes the block
+// path, which claims one membership row for the one block it was handed, so a transaction in
+// two blocks can only get there by being stamped twice -- which is exactly what happens at the
+// tip, where each block that contains it stamps it in turn.
 func TestCreatePacksEveryBlockInInsertionOrder(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	tx := mkTx(t, 1, 1_000)
-	_, err := s.Create(ctx, tx, 700_000,
-		utxo.WithMinedBlockInfo(
-			utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 700_002, SubtreeIdx: 7, OnLongestChain: true},
-			utxo.MinedBlockInfo{BlockID: 4, BlockHeight: 700_001, SubtreeIdx: 2, OnLongestChain: false},
-		))
+	_, err := s.Create(ctx, tx, 700_000)
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 700_002, SubtreeIdx: 7, OnLongestChain: true})
+	require.NoError(t, err)
+
+	_, err = s.SetMinedMulti(ctx, hashes(tx),
+		utxo.MinedBlockInfo{BlockID: 4, BlockHeight: 700_001, SubtreeIdx: 2, OnLongestChain: false})
 	require.NoError(t, err)
 
 	h := tx.TxIDChainHash()

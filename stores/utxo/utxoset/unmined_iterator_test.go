@@ -78,12 +78,21 @@ func TestUnminedIteratorReturnsEveryTransactionWaitingToBeMined(t *testing.T) {
 // waiting to be mined. Testing for empty membership would drop it. Measured on a 20 million
 // row table, that weaker test returned 25,000 of 25,499 waiting transactions: the 499 it
 // missed were exactly these.
+// The fork membership is now reached by a stamp rather than by a create carrying block
+// information. That create takes the block path, which writes no identity row, and this
+// iterator walks the identity table. At the tip the stamp is the only shape there is:
+// everything but the coinbase arrives from the mempool first, and a block that later loses
+// stamped it on the way past.
 func TestUnminedIteratorReturnsAForkMinedTransaction(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	forked := mkTx(t, 1, 1_000)
-	_, err := s.Create(ctx, forked, 700_000, utxo.WithMinedBlockInfo(
-		utxo.MinedBlockInfo{BlockID: 77, BlockHeight: 700_000}))
+	_, err := s.Create(ctx, forked, 700_000)
+	require.NoError(t, err)
+
+	// Stamped by a block nobody claims is on the longest chain, so the marker is left alone.
+	_, err = s.SetMinedMulti(ctx, hashes(forked),
+		utxo.MinedBlockInfo{BlockID: 77, BlockHeight: 700_000})
 	require.NoError(t, err)
 
 	// Block assembly determines that block is not on the main chain. That is how this state is
