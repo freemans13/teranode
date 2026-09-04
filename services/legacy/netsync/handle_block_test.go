@@ -1062,12 +1062,17 @@ func TestSyncManager_createUtxos_MergesBlockIDsForExistingTxs(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, pre.BlockIDs, "tx should start with empty BlockIDs to reproduce the bug")
 
-	// Wire up a SyncManager just enough for createUtxos. createUtxos only
-	// touches utxoStore, settings, logger and the txMap — no need for full DI.
+	// Wire up a SyncManager just enough for createUtxos: utxoStore, settings, logger,
+	// the txMap, and the blockchain client the merge stamp asks which chain the block
+	// is on (this fixture's block is the current tip, so: yes).
+	mockBlockchain := &blockchain.Mock{}
+	mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+
 	sm := &SyncManager{
-		settings:  tSettings,
-		logger:    logger,
-		utxoStore: utxoStore,
+		settings:         tSettings,
+		logger:           logger,
+		utxoStore:        utxoStore,
+		blockchainClient: mockBlockchain,
 	}
 
 	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](1)
@@ -1122,10 +1127,16 @@ func newChunkingTestSetup(t *testing.T, totalTxs, batchSize, routines int) (
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 	).Return((*meta.Data)(nil), nil, errors.ErrTxExists)
 
+	// The merge stamp asks the blockchain service which chain the block is on; these
+	// fixtures all drive the on-chain case, which is what the chunking assertions are about.
+	mockBlockchain := &blockchain.Mock{}
+	mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(true, nil)
+
 	sm := &SyncManager{
-		settings:  tSettings,
-		logger:    logger,
-		utxoStore: mockStore,
+		settings:         tSettings,
+		logger:           logger,
+		utxoStore:        mockStore,
+		blockchainClient: mockBlockchain,
 	}
 
 	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](totalTxs)
@@ -1526,4 +1537,91 @@ func TestClassifyAndCountPrewarmError(t *testing.T) {
 			require.Equal(t, before+1, after, "counter for label %q must increment by 1", tt.label)
 		})
 	}
+}
+
+// TestLegacyStampReportsTheChainHonestly pins the honesty of the mined stamp the legacy
+// block path writes for transactions that already existed in the UTXO store.
+//
+// The legacy path applies every block it accepts, and during a fork that includes
+// side-chain blocks. Hard-coding OnLongestChain: true told the store that a side-chain
+// block had settled its transactions on the main chain, which on a store that moves a
+// settled transaction out of the mempool table is not a flag but a one-way move. The stamp
+// now asks the blockchain service which chain the block is on and reports that.
+func TestLegacyStampReportsTheChainHonestly(t *testing.T) {
+	const (
+		checkpointHeight = int32(1000)
+		blockID          = uint32(9)
+	)
+
+	newSyncManager := func(t *testing.T, onCurrentChain bool, chainErr error) (*SyncManager, *createSpyStore, *blockchain.Mock) {
+		t.Helper()
+
+		tSettings, params := newOutpointOnlySettings(t, false, true, checkpointHeight)
+
+		spy := &createSpyStore{
+			NullStore:     &nullstore.NullStore{},
+			created:       map[chainhash.Hash]bool{},
+			alreadyExists: true, // every tx pre-exists, so every tx takes the stamp path
+		}
+
+		mockBlockchain := &blockchain.Mock{}
+		mockBlockchain.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{blockID}).
+			Return(onCurrentChain, chainErr)
+
+		sm := &SyncManager{
+			settings:         tSettings,
+			chainParams:      params,
+			logger:           ulogger.TestLogger{},
+			utxoStore:        spy,
+			blockchainClient: mockBlockchain,
+		}
+
+		return sm, spy, mockBlockchain
+	}
+
+	block := bsvutil.NewBlock(&wire.MsgBlock{Header: wire.BlockHeader{Version: 1}})
+	block.SetHeight(500)
+
+	t.Run("a block that is not on the current chain is stamped as not on the longest chain", func(t *testing.T) {
+		sm, spy, mockBlockchain := newSyncManager(t, false, nil)
+
+		_, _, txMap := twoTxMap(t)
+		require.NoError(t, sm.createUtxos(context.Background(), txMap, testBlockIdent(block), blockID, false))
+
+		stamps := spy.minedStamps()
+		require.NotEmpty(t, stamps, "every tx pre-existed, so the merge stamp must have run")
+
+		for _, stamp := range stamps {
+			require.Equal(t, blockID, stamp.BlockID)
+			require.False(t, stamp.OnLongestChain,
+				"a side-chain block must not settle its transactions as main-chain")
+		}
+
+		mockBlockchain.AssertExpectations(t)
+	})
+
+	t.Run("a block on the current chain is still stamped as on the longest chain", func(t *testing.T) {
+		sm, spy, mockBlockchain := newSyncManager(t, true, nil)
+
+		_, _, txMap := twoTxMap(t)
+		require.NoError(t, sm.createUtxos(context.Background(), txMap, testBlockIdent(block), blockID, false))
+
+		stamps := spy.minedStamps()
+		require.NotEmpty(t, stamps)
+
+		for _, stamp := range stamps {
+			require.True(t, stamp.OnLongestChain)
+		}
+
+		mockBlockchain.AssertExpectations(t)
+	})
+
+	t.Run("an unanswerable chain question fails the block rather than guessing", func(t *testing.T) {
+		sm, spy, _ := newSyncManager(t, false, errors.NewServiceError("blockchain unavailable"))
+
+		_, _, txMap := twoTxMap(t)
+		err := sm.createUtxos(context.Background(), txMap, testBlockIdent(block), blockID, false)
+		require.Error(t, err)
+		require.Empty(t, spy.minedStamps(), "no stamp may be written on a guess")
+	})
 }

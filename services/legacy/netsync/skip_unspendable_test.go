@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -18,19 +19,42 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// createSpyStore records which transactions createUtxos asked the store to create.
+// createSpyStore records which transactions createUtxos asked the store to create, and
+// which mined-block info it later stamped on the ones that already existed.
 type createSpyStore struct {
 	*nullstore.NullStore
 	mu      sync.Mutex
 	created map[chainhash.Hash]bool
+	// alreadyExists makes every create report the transaction as already present, which is
+	// how createUtxos is driven onto its follow-up SetMinedMulti merge path.
+	alreadyExists bool
+	stamps        []utxo.MinedBlockInfo
 }
 
 func (s *createSpyStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
 	s.mu.Lock()
 	s.created[*tx.TxIDChainHash()] = true
+	alreadyExists := s.alreadyExists
 	s.mu.Unlock()
 
+	if alreadyExists {
+		return nil, nil, errors.NewTxExistsError("[createSpyStore] %s", tx.TxIDChainHash().String())
+	}
+
 	return s.NullStore.SpendAndCreate(ctx, tx, blockHeight, opts...)
+}
+
+func (s *createSpyStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
+	s.mu.Lock()
+	s.stamps = append(s.stamps, info)
+	s.mu.Unlock()
+
+	out := make(map[chainhash.Hash][]uint32, len(hashes))
+	for _, hash := range hashes {
+		out[*hash] = []uint32{info.BlockID}
+	}
+
+	return out, nil
 }
 
 func (s *createSpyStore) SupportsOutpointOnlySpend() bool { return true }
@@ -40,6 +64,14 @@ func (s *createSpyStore) was(tx *bt.Tx) bool {
 	defer s.mu.Unlock()
 
 	return s.created[*tx.TxIDChainHash()]
+}
+
+// minedStamps returns a copy of every MinedBlockInfo the store was stamped with.
+func (s *createSpyStore) minedStamps() []utxo.MinedBlockInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]utxo.MinedBlockInfo(nil), s.stamps...)
 }
 
 // twoTxMap holds one ordinary transaction and one whose only output is OP_FALSE OP_RETURN

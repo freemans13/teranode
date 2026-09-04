@@ -1229,11 +1229,26 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	// existing tx in the block overruns the aerospike client connection pool on fat
 	// blocks (e.g. mainnet 755880 = 2.87M txs).
 	if len(existingTxHashes) > 0 {
+		// A block the legacy path applies is not necessarily on the longest chain: during a
+		// fork this node validates and applies side-chain blocks too, and it is the
+		// blockchain service, not this path, that knows which branch won. Hard-coding
+		// OnLongestChain: true told the store that a side-chain block had settled its
+		// transactions on the main chain. On a store that keeps settled transactions in a
+		// separate membership table that is not a flag but a one-way move out of the
+		// mempool, so a wrong answer is worse than a retry — hence the error return rather
+		// than a fallback. Every backend already expects an honest flag here: it is what
+		// block validation passes on its own SetMinedMulti calls.
+		var onLongestChain bool
+
+		if onLongestChain, err = sm.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{blockID}); err != nil {
+			return errors.NewServiceError("[createUtxos][%s] error checking whether block id %d is on the current chain", bi.hash.String(), blockID, err)
+		}
+
 		minedBlockInfo := utxo.MinedBlockInfo{
 			BlockID:        blockID,
 			BlockHeight:    blockHeightUint32,
 			SubtreeIdx:     0,
-			OnLongestChain: true,
+			OnLongestChain: onLongestChain,
 		}
 
 		if err = utxo.SetMinedMultiChunked(ctx, sm.logger, sm.utxoStore, existingTxHashes, minedBlockInfo,

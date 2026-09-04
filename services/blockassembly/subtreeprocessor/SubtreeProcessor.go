@@ -1761,25 +1761,40 @@ func (stp *SubtreeProcessor) GetRemoveMapLength() int {
 	return stp.removeMap.Length()
 }
 
+// blockSubtreeTxHashes holds one block's transaction hashes grouped by the subtree they
+// were mined in, so the slice index is the SubtreeIdx a mined stamp must carry. The
+// coinbase placeholder is replaced by the block's real coinbase txid, since the store is
+// keyed by txid and the placeholder is not a transaction.
+type blockSubtreeTxHashes [][]chainhash.Hash
+
 // collectMoveForwardTxHashes loads the tx hashes from every subtree of every
 // moveForward block into a set. Used by reorgBlocks to decide which entries
 // in a moveBack block's subtree.ConflictingNodes are re-mined on the new
 // chain and therefore should not be reversed (their canonical-spender
 // state carries across).
 //
+// The second return is the same hashes kept per block and per subtree, which reorgBlocks
+// stamps into the UTXO store as mined. It has one entry per moveForwardBlocks element,
+// including nil blocks (an empty entry), so the caller can index it by block position. The
+// subtrees are read once and serve both returns: a second pass over them would double the
+// deserialization cost of a large reorg.
+//
 // Returns an empty (non-nil) map when moveForwardBlocks is empty so callers
 // can do a single existence check without nil-guarding. Subtree-load errors
 // are surfaced so the reorg fails loudly instead of silently skipping
 // legitimate carry-over txs.
-func (stp *SubtreeProcessor) collectMoveForwardTxHashes(ctx context.Context, moveForwardBlocks []*model.Block) (map[chainhash.Hash]struct{}, error) {
+func (stp *SubtreeProcessor) collectMoveForwardTxHashes(ctx context.Context, moveForwardBlocks []*model.Block) (map[chainhash.Hash]struct{}, []blockSubtreeTxHashes, error) {
 	out := make(map[chainhash.Hash]struct{})
+	perBlock := make([]blockSubtreeTxHashes, len(moveForwardBlocks))
 
-	for _, block := range moveForwardBlocks {
+	for blockIdx, block := range moveForwardBlocks {
 		if block == nil {
 			continue
 		}
 
-		for _, subtreeHash := range block.Subtrees {
+		perBlock[blockIdx] = make(blockSubtreeTxHashes, len(block.Subtrees))
+
+		for subtreeIdx, subtreeHash := range block.Subtrees {
 			if subtreeHash == nil {
 				continue
 			}
@@ -1788,29 +1803,84 @@ func (stp *SubtreeProcessor) collectMoveForwardTxHashes(ctx context.Context, mov
 			if err != nil {
 				subtreeReader, err = stp.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 				if err != nil {
-					return nil, errors.NewServiceError("[collectMoveForwardTxHashes][%s] error getting subtree %s", block.String(), subtreeHash.String(), err)
+					return nil, nil, errors.NewServiceError("[collectMoveForwardTxHashes][%s] error getting subtree %s", block.String(), subtreeHash.String(), err)
 				}
 			}
 
 			subtree := &subtreepkg.Subtree{}
 			if err = subtree.DeserializeFromReader(subtreeReader); err != nil {
 				_ = subtreeReader.Close()
-				return nil, errors.NewProcessingError("[collectMoveForwardTxHashes][%s] error deserializing subtree %s", block.String(), subtreeHash.String(), err)
+				return nil, nil, errors.NewProcessingError("[collectMoveForwardTxHashes][%s] error deserializing subtree %s", block.String(), subtreeHash.String(), err)
 			}
 
 			_ = subtreeReader.Close()
 
+			subtreeHashes := make([]chainhash.Hash, 0, len(subtree.Nodes))
+
 			for _, node := range subtree.Nodes {
 				if node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+					// The placeholder stands in for the coinbase in the subtree, which the
+					// store knows by its txid. processCoinbaseUtxos creates that row, but
+					// its create is skipped when the row already exists, so this is the
+					// only place a reorg records which block mines it.
+					if block.CoinbaseTx != nil {
+						subtreeHashes = append(subtreeHashes, *block.CoinbaseTx.TxIDChainHash())
+					}
+
 					continue
 				}
 
 				out[node.Hash] = struct{}{}
+				subtreeHashes = append(subtreeHashes, node.Hash)
 			}
+
+			perBlock[blockIdx][subtreeIdx] = subtreeHashes
 		}
 	}
 
-	return out, nil
+	return out, perBlock, nil
+}
+
+// stampMoveForwardBlockAsMined records block as the block that mined every transaction it
+// carries, on the longest chain, one SetMinedMulti per subtree so each stamp carries the
+// right SubtreeIdx.
+//
+// This runs over ALL of the block's transactions, not the filtered set the id-less
+// MarkTransactionsOnLongestChain call below gets. That filter drops every transaction the
+// moved-back block also carried — in a reorg that is most of them, since the winning block
+// usually re-mines the losing block's transactions — and mark-on-longest-chain carries no
+// block id anyway. A store that keeps settled transactions in a membership table keyed by
+// (transaction, block) needs the id to settle them at all, and cannot infer it for a
+// transaction that names more than one block.
+//
+// The other backends are unaffected: on aerospike and the SQL store re-stamping a block a
+// transaction already records appends nothing, and an honest OnLongestChain is exactly what
+// they already get from block validation.
+func (stp *SubtreeProcessor) stampMoveForwardBlockAsMined(ctx context.Context, block *model.Block, hashesBySubtree blockSubtreeTxHashes) error {
+	for subtreeIdx, hashes := range hashesBySubtree {
+		if len(hashes) == 0 {
+			continue
+		}
+
+		hashPtrs := make([]*chainhash.Hash, len(hashes))
+		for i := range hashes {
+			hashPtrs[i] = &hashes[i]
+		}
+
+		info := utxostore.MinedBlockInfo{
+			BlockID:        block.ID,
+			BlockHeight:    block.Height,
+			SubtreeIdx:     subtreeIdx,
+			OnLongestChain: true,
+		}
+
+		if err := utxostore.SetMinedMultiChunked(ctx, stp.logger, stp.utxoStore, hashPtrs, info,
+			stp.settings.UtxoStore.MaxMinedBatchSize, stp.settings.UtxoStore.MaxMinedRoutines); err != nil {
+			return errors.NewProcessingError("[stampMoveForwardBlockAsMined][%s] error stamping subtree %d transactions as mined", block.String(), subtreeIdx, err)
+		}
+	}
+
+	return nil
 }
 
 // cloneReverseCascadedSet returns a copy of the current reorgBlocks-scoped
@@ -3498,7 +3568,9 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	// moveForward (or worse, have the filter skip the re-process) leaves
 	// the UTXO state inconsistent with what moveForward expects. Skip
 	// these in the Reverse call.
-	moveForwardTxSet, err := stp.collectMoveForwardTxHashes(ctx, moveForwardBlocks)
+	// moveForwardTxHashes is the same data kept per block and per subtree, used below to
+	// stamp each moved-forward block as the block that mined its transactions.
+	moveForwardTxSet, moveForwardTxHashes, err := stp.collectMoveForwardTxHashes(ctx, moveForwardBlocks)
 	if err != nil {
 		return errors.NewProcessingError("[reorgBlocks] error collecting moveForward tx hashes", err)
 	}
@@ -3692,6 +3764,22 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 				rawLosingTxHashes = append(rawLosingTxHashes, hash)
 				return true
 			})
+		}
+
+		// Now that the block has been applied, record it as the block that mines its
+		// transactions. This runs per block, immediately after that block, rather than
+		// once after the loop: a stamp is only committed for a block that was applied, and
+		// a later block failing leaves the earlier ones honestly recorded (the chain has
+		// already switched — it is block assembly's in-memory state that then rolls back
+		// and is rebuilt by BlockAssembler's reset fallback).
+		//
+		// It also stays BEFORE the two MarkTransactionsOnLongestChain calls below, so
+		// mark(false) still has the last word on any hash that ends up in both sets —
+		// the ordering those calls' comments rely on is unchanged.
+		if blockIdx < len(moveForwardTxHashes) {
+			if err = stp.stampMoveForwardBlockAsMined(ctx, block, moveForwardTxHashes[blockIdx]); err != nil {
+				return err
+			}
 		}
 
 		stp.currentBlockHeader.Store(block.Header)
