@@ -1166,9 +1166,27 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 		existingTxHashes []*chainhash.Hash
 	)
 
+	// A transaction with no spendable outputs can never be spent, so below the checkpoint on a
+	// node with no block persister there is nothing to store for it: SV Node keeps no record of
+	// such a transaction at all. Its inputs are still spent in the validation phase, so the
+	// UTXO set is unaffected. The same setting already governs the quick-validation path; this
+	// is the legacy block path, which is how a mainnet node receives its blocks, and without
+	// this the setting changed nothing there. Gated on outpointOnly, which is the
+	// below-checkpoint test, and on the setting, which documents its incompatibility with a
+	// running block persister.
+	skipUnspendable := outpointOnly && sm.settings.BlockValidation.SkipUnspendableTxStorageDuringCatchup
+	genesisHeight := sm.settings.ChainCfgParams.GenesisActivationHeight
+
 	// create all the utxos first
 	for _, txHash := range txMap.Keys() {
 		txHash := txHash
+
+		if skipUnspendable {
+			if txWrapper, ok := txMap.Get(txHash); ok &&
+				utxo.HasNoSpendableOutputs(txWrapper.Tx, txWrapper.Tx.IsCoinbase(), blockHeightUint32, genesisHeight) {
+				continue // never spendable, never stored; its inputs are still spent below
+			}
+		}
 
 		g.Go(func() error {
 			txWrapper, ok := txMap.Get(txHash)
