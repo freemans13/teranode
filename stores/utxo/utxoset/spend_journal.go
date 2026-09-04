@@ -89,6 +89,18 @@ SELECT d.vin, d.satoshis, d.script FROM del d`
 
 // ensureSpendJournalPartition creates the spend-journal leaf covering height, if absent.
 //
+// Each leaf gets two indexes. The packed-key btree is what every restore and every reclaim
+// probe uses. The block-range index on applied exists for one question the reclaimer asks
+// once per retiring leaf: is there any spend above the settled depth without the
+// block-applied mark. Below the checkpoint every row is marked, and without an index that is
+// a full read of the newest leaves to find nothing, measured at 15.8 seconds and 243,000 page
+// reads per session on the mainnet box. The journal is append-only in height order, so a
+// block-range summary is exact: a run of 128 pages that are all marked is skipped from a few
+// bytes of summary. At the tip every row is unmarked and the first range answers. It costs
+// about 20 KB per leaf. The mark is indexed as a small integer because PostgreSQL has no
+// block-range operator class for boolean; the guard's predicate uses the same cast so the
+// planner matches the expression.
+//
 // Called on the spend path, so it must be cheap and idempotent. CREATE TABLE IF NOT
 // EXISTS is both, and a leaf covers SpendJournalPartitionBlocks heights so this is a no-op for
 // all but one spend in that many.
@@ -128,7 +140,8 @@ CREATE TABLE IF NOT EXISTS spend_journal_%[1]d PARTITION OF spend_journal
   WITH (fillfactor = 100,
         autovacuum_vacuum_scale_factor = 0,
         autovacuum_vacuum_threshold    = 50000);
-CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey);`, leaf, lo, hi)
+CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_ukey ON spend_journal_%[1]d (ukey);
+CREATE INDEX IF NOT EXISTS spend_journal_%[1]d_applied ON spend_journal_%[1]d USING brin ((applied::int)) WITH (pages_per_range = 128);`, leaf, lo, hi)
 
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return errors.NewStorageError("[utxoset] create spend-journal partition %d", leaf, err)

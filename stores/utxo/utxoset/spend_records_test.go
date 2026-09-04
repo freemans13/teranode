@@ -112,3 +112,55 @@ func TestSpendNamesTheRightSpenderPerTransactionInOnePlan(t *testing.T) {
 
 	require.NoError(t, s.Unspend(ctx, all, false))
 }
+
+// TestJournalPartitionsCarryABlockRangeIndexOnTheMark pins the index the reclaimer's guard
+// needs. Once per retiring partition the reclaimer asks whether any spend above the settled
+// depth lacks the block-applied mark. Below the checkpoint every row is marked, so without an
+// index that is a full read of the newest partitions to find nothing, measured at 15.8 seconds
+// and 243,000 page reads on the mainnet box. A block-range index over the mark summarises
+// each run of pages as all-marked, so the same question is answered from a few kilobytes.
+func TestJournalPartitionsCarryABlockRangeIndexOnTheMark(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	spendOneOutput(t, s, ctx, parent, 0, 100)
+
+	var n int
+	require.NoError(t, s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'spend_journal_2' AND indexdef ILIKE '%USING brin (((applied)::integer))%'`).Scan(&n))
+	require.Equal(t, 1, n, "every journal partition needs the block-range index on applied")
+
+	// A test-sized partition is a handful of pages, where a sequential read is cheaper than any
+	// index and the planner rightly says so. Turning sequential scans off makes the test about
+	// the one thing it can pin here: the guard's predicate matches the index expression, so the
+	// planner CAN use it. The mainnet box is where it is worth using, and there it is chosen.
+	tx, err := s.pool.Begin(ctx)
+	require.NoError(t, err)
+
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	_, err = tx.Exec(ctx, `SET LOCAL enable_seqscan = off`)
+	require.NoError(t, err)
+
+	rows, err := tx.Query(ctx,
+		`EXPLAIN (FORMAT text) SELECT EXISTS (SELECT 1 FROM spend_journal WHERE spent_height > 50 AND (applied::int) = 0)`)
+	require.NoError(t, err)
+
+	var full string
+
+	for rows.Next() {
+		var line string
+		require.NoError(t, rows.Scan(&line))
+
+		full += line + "\n"
+	}
+
+	rows.Close()
+
+	require.Contains(t, full, "spend_journal_2_applied",
+		"the guard's predicate must match the index expression, or the index is dead weight")
+}

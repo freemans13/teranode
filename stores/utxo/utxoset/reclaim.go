@@ -198,11 +198,12 @@ SELECT k.txid
 // applied mark. Below the checkpoint every spend is block-applied and marked, so this is false
 // for the whole of initial sync and the recent-spend probe below never runs. The moment a
 // mempool spend is journaled it is true, and stays true, because the tip is where the probe
-// is needed. Partition pruning on spent_height bounds the scan to the newest few partitions;
-// EXISTS stops at the first match, so the worst case is the no-match case, a sequential read
-// of those partitions once per retiring partition.
+// is needed. Partition pruning on spent_height bounds it to the newest few partitions, and
+// the block-range index on the mark (see ensureSpendJournalPartition) answers the no-match
+// case from a few kilobytes of page summaries instead of a sequential read. The cast matches
+// the index expression; NOT applied would not.
 const unmarkedRecentSpendsSQL = `
-SELECT EXISTS (SELECT 1 FROM spend_journal WHERE spent_height > $1 AND NOT applied)`
+SELECT EXISTS (SELECT 1 FROM spend_journal WHERE spent_height > $1 AND (applied::int) = 0)`
 
 // recentSpendsSQL returns the subset of parents that have a spend recorded above the settled
 // depth, in any attached partition. Such a spend's spender cannot be buried yet, so the parent
