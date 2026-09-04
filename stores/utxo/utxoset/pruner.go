@@ -103,6 +103,16 @@ func (p journalPruner) Prune(ctx context.Context, height uint32, _ string) (int6
 			windows, leaves, cutoff)
 	}
 
+	// LAST, and deliberately once per session rather than looped: a REINDEX CONCURRENTLY on
+	// a big partition can run for minutes, so this call returning is not "the index is now
+	// clean", it is "at most one rebuild is in flight". The next block's pruner call runs
+	// this again and finds whichever partition is now worst -- including the one just
+	// finished, back near the 31.5-byte floor -- so the schedule catches up over a run of
+	// blocks rather than blocking this one.
+	if _, err := p.store.rebuildOneBloatedCoinIndex(ctx, coinIndexNeedsRebuild); err != nil {
+		return 0, err
+	}
+
 	return 0, nil
 }
 
