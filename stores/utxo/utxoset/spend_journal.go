@@ -45,9 +45,18 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // than flagged off, because two copies of a consensus predicate is a defect waiting for
 // one of them to be edited. The predicates that authorise the delete are the full 32-byte
 // txid recheck (the ukey is a non-unique 96-bit prefix and can only locate, never
-// authorise), the frozen and conflicting flag masks, and the maturity test. classifySQL
-// deliberately omits the last three, so an excluded row surfaces as frozen or immature
-// rather than as spent.
+// authorise), the refusing-flag mask, and the maturity test. classifySQL deliberately omits
+// the last two, so an excluded row surfaces as frozen, conflicting, locked or immature rather
+// than as spent.
+//
+// THE FLAG MASK IS PER KEY, not a constant, because two of the three flags it tests are
+// waivable and the waiver belongs to the caller rather than to the coin. Conflict resolution
+// spends the promoted winner through the very lock and conflicting mark it set a moment
+// earlier -- that is what WithIgnoreLocked and WithIgnoreConflicting are for -- while an
+// ordinary validator spend of the same coin must be refused. The mask used to be the literal 5
+// and neither option had any effect: a locked coin was spendable by anybody, which made the
+// lock decorative, and an ignored conflicting flag still refused. Frozen has no waiver in any
+// store and is always in the mask. See spendGuardMask.
 //
 // The flag test is written (flags & 5) < 1 and not (flags & 1) = 0 AND (flags & 4) = 0,
 // which it is equal to for every value a smallint can hold, because the planner can estimate
@@ -73,21 +82,21 @@ const DefaultSpendJournalRetentionBlocks = 1440
 // payload, and they cost nothing extra: the DELETE already carries the whole row, so this is
 // two more columns on a RETURNING that was already reading them. They are what makes a
 // fully-spent parent older than the membership retention still answerable -- see
-// readSpentParents in lookup.go and the spend_journal comment in schema.go. Placeholders are
-// unchanged at $1..$6, because both values come off the deleted row rather than from the
-// caller.
+// readSpentParents in lookup.go and the spend_journal comment in schema.go. They add no
+// placeholder, because both values come off the deleted row rather than from the caller.
+// $7 is the per-key flag mask, and it is the only placeholder added since.
 const spendJournalSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[],
-                         $5::int[], $6::bytea[])
-        AS t(leaf, ukey, txid, vin, spent_height, spending_txid)
+                         $5::int[], $6::bytea[], $7::smallint[])
+        AS t(leaf, ukey, txid, vin, spent_height, spending_txid, mask)
 ),
 del AS (
     DELETE FROM utxo u USING k
      WHERE u.leaf           = k.leaf
        AND u.ukey           = k.ukey
        AND u.txid           = k.txid
-       AND (u.flags & 5)    < 1
+       AND (u.flags & k.mask) < 1
        AND u.spendable_from <= k.spent_height
     RETURNING k.vin, k.spent_height, k.spending_txid, u.satoshis, u.created_height,
               u.spendable_from, u.flags, u.mined_height, u.block_id, u.ukey, u.txid,

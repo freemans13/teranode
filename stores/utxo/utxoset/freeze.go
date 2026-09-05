@@ -138,24 +138,7 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 		}
 
 		if where == "live" {
-			if flags&FlagFrozen != 0 {
-				// A frozen coin reports a sentinel spender rather than a real one, which
-				// is how every store signals "immobilised" through this interface.
-				return &utxo.SpendResponse{
-					Status:       int(utxo.Status_FROZEN),
-					SpendingData: spendpkg.NewSpendingData(&subtree.FrozenBytesTxHash, 0),
-				}, nil
-			}
-
-			// Exists but not yet spendable: a coinbase inside its maturity window, or a
-			// reassigned coin inside the delay that lets the reassignment be challenged
-			// before the new owner can move it. Reporting OK would say the coin is
-			// spendable now, which is the one thing spendable_from exists to deny.
-			if spendableFrom > int32(s.GetBlockHeight()) { //nolint:gosec // block heights are far below 2^31
-				return &utxo.SpendResponse{Status: int(utxo.Status_IMMATURE)}, nil
-			}
-
-			return &utxo.SpendResponse{Status: int(utxo.Status_OK)}, nil
+			return liveSpendResponse(flags, spendableFrom, s.GetBlockHeight()), nil
 		}
 
 		hash, hErr := chainhash.NewHash(spender)
@@ -200,4 +183,51 @@ func reassignedHashMismatch(sp *utxo.Spend, hashOverride []byte) error {
 
 	return errors.NewUtxoHashMismatchError("[utxoset][GetSpend] %s:%d was reassigned; %s is no longer its utxo hash",
 		sp.TxID, sp.Vout, sp.UTXOHash)
+}
+
+// liveSpendResponse turns one live coin's flags into the answer the interface reports.
+//
+// The tests are written as successive overrides rather than as an if/else chain, and the ORDER
+// IS THE PRECEDENCE, taken from the aerospike store so three implementations answer the same
+// question the same way. Least specific first: not yet spendable, then immobilised by the alert
+// system, then lost a double-spend race, then held by conflict resolution. A coin can be
+// several of these at once and the caller gets one status, so which one it gets is a contract
+// rather than an implementation detail.
+//
+// A frozen coin keeps its SENTINEL SPENDER even when a later test overrides the status. That is
+// not tidiness: conflict resolution reads the spending data to recognise a frozen coin, and
+// dropping it because the coin is also conflicting would hide the freeze from the one caller
+// that acts on it. Both reference stores keep it for the same reason.
+func liveSpendResponse(flags int16, spendableFrom int32, height uint32) *utxo.SpendResponse {
+	resp := &utxo.SpendResponse{Status: int(utxo.Status_OK)}
+
+	// Exists but not yet spendable: a coinbase inside its maturity window, or a reassigned
+	// coin inside the delay that lets the reassignment be challenged before the new owner can
+	// move it. Reporting OK would say the coin is spendable now, which is the one thing
+	// spendable_from exists to deny.
+	if spendableFrom > int32(height) { //nolint:gosec // block heights are far below 2^31
+		resp.Status = int(utxo.Status_IMMATURE)
+	}
+
+	if flags&FlagFrozen != 0 {
+		resp.Status = int(utxo.Status_FROZEN)
+		resp.SpendingData = spendpkg.NewSpendingData(&subtree.FrozenBytesTxHash, 0)
+	}
+
+	// The coin bit, not the identity bit. The spend path reads this one and never looks at the
+	// identity row, so this is the flag that actually decides whether the coin moves, and
+	// reporting it is what lets a caller see the refusal coming.
+	if flags&FlagConflicting != 0 {
+		resp.Status = int(utxo.Status_CONFLICTING)
+	}
+
+	// The most specific answer, and the last word. Conflict resolution locks a parent while it
+	// swaps which child owns the coin, so LOCKED says "held, briefly, by an operation in
+	// flight" where CONFLICTING says "this coin's spender lost". A coin can be both at once
+	// mid-resolution and the more transient fact is the one that explains the refusal.
+	if flags&FlagLocked != 0 {
+		resp.Status = int(utxo.Status_LOCKED)
+	}
+
+	return resp
 }

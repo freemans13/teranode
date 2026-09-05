@@ -43,9 +43,34 @@ type spendPlan struct {
 	ownerVin []int // global index -> which input of that item
 	perItem  [][]*utxo.Spend
 	itemTxs  []*bt.Tx
+	// masks[k] is the set of coin flags that refuse row k's spend, derived from the option
+	// its own caller passed. Per row rather than per plan, because a batch can mix a conflict
+	// resolution's waived spend with an ordinary one.
+	masks []int16
 	// skipClaim[i] suppresses the previous-output comparison for item i. Set only by the
 	// gated below-checkpoint outpoint-only path, which is the one caller entitled to it.
 	skipClaim []bool
+}
+
+// spendGuardMask is the set of coin flags that refuse a spend for one caller's options.
+//
+// Frozen is never waivable: no store offers an option for it, because the alert system's
+// immobilisation is not something a caller may talk its way past. The other two are, and the
+// waiver exists for exactly one caller. Conflict resolution marks a loser conflicting, locks
+// the contested parent, and then has to spend that parent's coin on behalf of the winner --
+// through both of its own marks. Every other caller gets the full mask.
+func spendGuardMask(f utxo.IgnoreFlags) int16 {
+	mask := FlagFrozen | FlagLocked | FlagConflicting
+
+	if f.IgnoreConflicting {
+		mask &^= FlagConflicting
+	}
+
+	if f.IgnoreLocked {
+		mask &^= FlagLocked
+	}
+
+	return mask
 }
 
 // planSpends flattens a batch of transactions into one set of arrays.
@@ -64,6 +89,7 @@ func planSpends(items []*spendItem) *spendPlan {
 		idx:      make([]int32, 0, total),
 		heights:  make([]int32, 0, total),
 		spenders: make([][]byte, 0, total),
+		masks:    make([]int16, 0, total),
 		owner:    make([]int, 0, total),
 		ownerVin: make([]int, 0, total),
 		perItem:  make([][]*utxo.Spend, len(items)),
@@ -82,6 +108,7 @@ func planSpends(items []*spendItem) *spendPlan {
 
 		spends := make([]*utxo.Spend, len(it.tx.Inputs))
 		spendingTxID := it.tx.TxIDChainHash()
+		mask := spendGuardMask(it.ignoreFlags)
 
 		// One backing array for the records and one for the spenders, rather than a fresh
 		// allocation per input. This loop runs once per input of every transaction in every
@@ -99,6 +126,7 @@ func planSpends(items []*spendItem) *spendPlan {
 			p.idx = append(p.idx, int32(len(p.owner))) //nolint:gosec // bounded by batch size
 			p.heights = append(p.heights, int32(it.blockHeight))
 			p.spenders = append(p.spenders, spendingTxID[:])
+			p.masks = append(p.masks, mask)
 			p.owner = append(p.owner, i)
 			p.ownerVin = append(p.ownerVin, vin)
 
@@ -167,6 +195,7 @@ func (p *spendPlan) sortRows() {
 	p.txids = permute(p.txids, order)
 	p.heights = permute(p.heights, order)
 	p.spenders = permute(p.spenders, order)
+	p.masks = permute(p.masks, order)
 	p.owner = permute(p.owner, order)
 	p.ownerVin = permute(p.ownerVin, order)
 
@@ -298,7 +327,7 @@ func (s *Store) runSpendPlan(ctx context.Context, q pgx.Tx, p *spendPlan) error 
 	}
 
 	rows, err := q.Query(ctx, spendJournalSQL, p.leaves, p.ukeys, p.txids, p.idx,
-		p.heights, p.spenders)
+		p.heights, p.spenders, p.masks)
 	if err != nil {
 		return errors.NewStorageError("[utxoset][Spend] delete", err)
 	}
@@ -381,11 +410,26 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 
 		sp := p.perItem[p.owner[k]][p.ownerVin[k]]
 
+		// Only the flags THIS caller's mask actually refuses on. A conflict resolution that
+		// waived the lock and then found the coin immature must be told it is immature, not
+		// handed back the flag it already said to ignore.
+		//
+		// The order is terminal before transient, which is the opposite of the precedence
+		// GetSpend reports and deliberately so. Frozen and conflicting are settled facts about
+		// the coin; ErrTxLocked means "held by an operation in flight", and the validator and
+		// legacy netsync both READ IT AS RETRYABLE. Reporting the transient error for a coin
+		// that is also permanently refused would send the caller round a retry loop that can
+		// never come out. GetSpend has no retry to mislead, so it reports the most specific
+		// state instead, matching both reference stores.
+		refusing := flags & p.masks[k]
+
 		switch {
-		case flags&FlagFrozen != 0:
+		case refusing&FlagFrozen != 0:
 			sp.Err = errors.ErrFrozen
-		case flags&FlagConflicting != 0:
+		case refusing&FlagConflicting != 0:
 			sp.Err = errors.ErrTxConflicting
+		case refusing&FlagLocked != 0:
+			sp.Err = errors.ErrTxLocked
 		case spendableFrom > p.heights[k]:
 			// Exists, but immature: a coinbase before maturity, or a reassigned output still
 			// inside its delay. NOT a double spend, and reporting it as one would be wrong.

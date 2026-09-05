@@ -147,4 +147,19 @@ func TestConformance(t *testing.T) {
 		db, _ := newTestStore(t)
 		tests.ConflictWALCrashRecovery(t, db)
 	})
+
+	// The conflicting flag from the outside: GetSpend reports CONFLICTING on the coin, Get
+	// reports it on the metadata, a spend of that coin fails with ErrTxConflicting, and the
+	// contested parent names the child without becoming conflicting itself.
+	t.Run("SetConflictingBehavior", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SetConflictingBehavior(t, db)
+	})
+
+	// The lock from the outside, and the round trip: OK, locked, a spend refused with
+	// ErrTxLocked, unlocked, OK, and the same spend now accepted.
+	t.Run("SetLockedBehavior", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SetLockedBehavior(t, db)
+	})
 }
