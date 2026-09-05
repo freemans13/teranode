@@ -221,23 +221,27 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// Close can only be honest about drained work if the callback has actually returned.
 	if size := tSettings.UtxoStore.StoreBatcherSize; size > 1 {
 		d := time.Duration(tSettings.UtxoStore.StoreBatcherDurationMillis) * time.Millisecond
-		s.createBatcher = newCreateBatcher(s, size, d)
+		s.createBatcher = newCreateBatcher(s, size, d,
+			tSettings.UtxoStore.StoreBatcherDrainMode, tSettings.UtxoStore.StoreBatcherGreedyAccumulate)
 
 		// The production write path. Same width and window as the create batcher, because
 		// they carry the same statement; concurrency from the bound every other store's
 		// batchers share.
 		s.spendAndCreateBatcher = newSpendAndCreateBatcher(s, size, d, tSettings.BatcherBackground,
-			tSettings.UtxoStore.BatcherMaxConcurrent)
+			tSettings.UtxoStore.BatcherMaxConcurrent,
+			tSettings.UtxoStore.StoreBatcherDrainMode, tSettings.UtxoStore.StoreBatcherGreedyAccumulate)
 	}
 
 	if size := tSettings.UtxoStore.GetBatcherSize; size > 1 {
 		d := time.Duration(tSettings.UtxoStore.GetBatcherDurationMillis) * time.Millisecond
-		s.getBatcher = newGetBatcher(s, size, d)
+		s.getBatcher = newGetBatcher(s, size, d,
+			tSettings.UtxoStore.GetBatcherDrainMode, tSettings.UtxoStore.GetBatcherGreedyAccumulate)
 	}
 
 	if size := tSettings.UtxoStore.LockedBatcherSize; size > 1 {
 		d := time.Duration(tSettings.UtxoStore.LockedBatcherDurationMillis) * time.Millisecond
-		s.lockBatcher = newLockBatcher(s, size, d)
+		s.lockBatcher = newLockBatcher(s, size, d,
+			tSettings.UtxoStore.LockedBatcherDrainMode, tSettings.UtxoStore.LockedBatcherGreedyAccumulate)
 	}
 
 	return s, nil

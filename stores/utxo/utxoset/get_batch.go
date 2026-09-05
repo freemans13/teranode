@@ -34,8 +34,18 @@ type getItem struct {
 //
 // background is true. A read takes no locks, so two batches running at once cannot deadlock
 // or interfere.
-func newGetBatcher(s *Store, size int, duration time.Duration) *batcher.Batcher[getItem] {
-	return batcher.NewWithPool(size, duration, s.sendGetBatch, true)
+//
+// Drain mode and greedy accumulate come from GetBatcherDrainMode and
+// GetBatcherGreedyAccumulate, the same keys the aerospike store's get batcher reads.
+func newGetBatcher(s *Store, size int, duration time.Duration, drainMode, greedyAccumulate bool) *batcher.Batcher[getItem] {
+	b := batcher.NewWithPool(size, duration, s.sendGetBatch, true,
+		batcher.WithGreedyAccumulate(greedyAccumulate))
+
+	if drainMode {
+		b.SetDrainMode(true)
+	}
+
+	return b
 }
 
 // sendGetBatch resolves a batch of reads through the shared read order, then hands each caller
@@ -117,8 +127,18 @@ type lockItem struct {
 // background is false. The update touches the coin rows of whichever transactions are in the
 // batch, and two batches can name the same transaction, so concurrent batches could lock the
 // same rows in different orders.
-func newLockBatcher(s *Store, size int, duration time.Duration) *batcher.Batcher[lockItem] {
-	return batcher.NewWithPool(size, duration, s.sendLockBatch, false)
+//
+// Drain mode and greedy accumulate come from LockedBatcherDrainMode and
+// LockedBatcherGreedyAccumulate, the same keys the aerospike store's locked batcher reads.
+func newLockBatcher(s *Store, size int, duration time.Duration, drainMode, greedyAccumulate bool) *batcher.Batcher[lockItem] {
+	b := batcher.NewWithPool(size, duration, s.sendLockBatch, false,
+		batcher.WithGreedyAccumulate(greedyAccumulate))
+
+	if drainMode {
+		b.SetDrainMode(true)
+	}
+
+	return b
 }
 
 // sendLockBatch splits the batch by the value being set and issues at most two statements.

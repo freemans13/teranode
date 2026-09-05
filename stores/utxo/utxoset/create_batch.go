@@ -575,7 +575,10 @@ func (s *Store) lockTxids(ctx context.Context, q pgx.Tx, txids [][]byte) error {
 // aerospike stores do.
 //
 // background is FALSE, which differs from the sql store's create batcher, and the reason is
-// specific to this store rather than a disagreement about deadlocks.
+// specific to this store rather than a disagreement about deadlocks. This decision is
+// independent of drain mode versus greedy accumulate below, which only change how items already
+// queued for one dispatch are gathered, not whether dispatch itself runs concurrently -- so
+// nothing here needed to move when that choice stopped being fixed.
 //
 // The sql store's create callback issues statements and nothing else, so two batches running
 // at once cannot interfere. This one may also run DDL: a create at a height whose body window
@@ -591,8 +594,21 @@ func (s *Store) lockTxids(ctx context.Context, q pgx.Tx, txids [][]byte) error {
 // It also makes Close honest. The batcher guarantees only that queued items have been HANDED
 // TO the callback; with background dispatch the work was still landing afterwards, which
 // showed up as one test's batch inserting into tables a later test had already replaced.
-func newCreateBatcher(s *Store, size int, duration time.Duration) *batcher.Batcher[createItem] {
-	return batcher.NewWithPool(size, duration, s.sendCreateBatch, false)
+//
+// Drain mode and greedy accumulate take the same StoreBatcher* settings the spend-and-create
+// batcher reads, for the reason recorded on newSpendAndCreateBatcher: forcing drain traded a
+// tip-time win against burst load for a fixed per-flush cost paid on every flush, including
+// the small ones a sync produces, and which of those a deployment wants is now its own choice
+// rather than a constant fixed here.
+func newCreateBatcher(s *Store, size int, duration time.Duration, drainMode, greedyAccumulate bool) *batcher.Batcher[createItem] {
+	b := batcher.NewWithPool(size, duration, s.sendCreateBatch, false,
+		batcher.WithGreedyAccumulate(greedyAccumulate))
+
+	if drainMode {
+		b.SetDrainMode(true)
+	}
+
+	return b
 }
 
 // sendCreateBatch flushes a batch of Creates as one statement.

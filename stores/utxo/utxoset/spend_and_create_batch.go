@@ -131,38 +131,34 @@ func (it *spendAndCreateItem) restoreClaims() {
 // pool connection and takes no second one while it holds it, so the bound need only stay
 // below the pool size to be safe.
 //
-// Drain mode, always. The batcher then fires whatever has queued the moment its worker is
-// free, so a batch is as wide as the load and never waits on a timer, and the configured size
-// is a cap rather than a target. A fixed window is the wrong shape for this path whatever its
-// length: below the batch size it turns the callers' parallel commits into one serial commit
-// per window, and measured against the single-transaction path on a local instance it lost at
-// every concurrency below the batch width. Transactions a second, 20,000 transactions,
-// batch cap 500, 16 concurrent batches:
-//
-//	callers    single    25 ms window    1 ms window    drain
-//	    16      7,095             426          3,079    7,096
-//	    64      7,443           1,509          9,025   13,370
-//	   512      7,267          21,985         23,660   45,077
-//
-// Drain mode is the only column that never loses, and at high concurrency it wins by the most,
-// because it keeps every worker busy instead of waiting for a batch to fill or a timer to
-// fire. The duration setting therefore has no effect on this batcher.
-//
-// The partition hazard that kept the create batcher serial does not apply. Both partition
-// creators take a process-wide mutex and are called before the transaction is opened, so two
-// batches reaching a new window at once queue on the mutex rather than racing the catalog.
+// Drain mode and greedy accumulate used to be a decision made here: drain forced on, because
+// under concurrent load it adapts the batch to whatever has queued rather than waiting on a
+// timer, and against the single-transaction path on a local instance that won at every
+// concurrency below the batch width. That result is real but partial: it is a tip-time trade,
+// made under bursts wide enough to fill a worker's queue between flushes. Mainnet at height
+// 430,000 is not that load. There the batcher fired 26.5 million times, every flush adaptive,
+// averaging 11.8 items for a fixed 9.3 ms commit cost each -- paying the per-commit cost of a
+// twelve-row batch when the queue depth would have supported far more had the flush waited.
+// Greedy accumulate never fires early; it only pulls what is already queued into the batch
+// faster, so it does not pay that cost and does not lose the drain columns' win under real
+// bursts either. Which one is right depends on the load a given deployment actually sees, so
+// the choice is now the operator's, through the same StoreBatcherDrainMode and
+// StoreBatcherGreedyAccumulate keys every store reads, not a constant fixed here.
 func newSpendAndCreateBatcher(s *Store, size int, duration time.Duration, background bool,
-	maxConcurrent int) *batcher.Batcher[spendAndCreateItem] {
+	maxConcurrent int, drainMode, greedyAccumulate bool) *batcher.Batcher[spendAndCreateItem] {
 	b := batcher.NewWithPool(size, duration, s.sendSpendAndCreateBatch, background,
 		batcher.WithName("utxoset_spend_and_create"),
 		batcher.WithLogger(s.logger),
-		batcher.WithMetrics(batchermetrics.Provider()))
+		batcher.WithMetrics(batchermetrics.Provider()),
+		batcher.WithGreedyAccumulate(greedyAccumulate))
 
 	if background && maxConcurrent > 0 {
 		b.SetMaxConcurrent(maxConcurrent)
 	}
 
-	b.SetDrainMode(true)
+	if drainMode {
+		b.SetDrainMode(true)
+	}
 
 	return b
 }
