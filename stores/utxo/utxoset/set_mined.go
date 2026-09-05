@@ -361,7 +361,6 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 
 	// Built once and used by every statement, so the set a stamp acted on and the set the
 	// postcondition is checked against cannot disagree.
-	leaves := make([]int16, 0, len(hashes))
 	txids := make([][]byte, 0, len(hashes))
 
 	for _, h := range hashes {
@@ -369,7 +368,6 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 			continue
 		}
 
-		leaves = append(leaves, LeafFor(h[:]))
 		txids = append(txids, h[:])
 	}
 
@@ -386,11 +384,11 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 
 	switch {
 	case info.UnsetMined:
-		out, err = s.unstampAndMoveBack(ctx, leaves, txids, entry, info)
+		out, err = s.unstampAndMoveBack(ctx, txids, entry, info)
 	case info.OnLongestChain:
-		out, err = s.stampAndMove(ctx, leaves, txids, entry, info)
+		out, err = s.stampAndMove(ctx, txids, entry, info)
 	default:
-		out, err = s.forkStamp(ctx, leaves, txids, entry, info)
+		out, err = s.forkStamp(ctx, txids, entry, info)
 	}
 
 	if err != nil {
@@ -432,7 +430,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash,
 // connection; the same rule the create path follows. It is also what lets the residue append
 // live inside the transaction: the window it inserts into is the one this call just created
 // for the move, so the append needs no DDL of its own.
-func (s *Store) stampAndMove(ctx context.Context, leaves []int16, txids [][]byte, entry []byte,
+func (s *Store) stampAndMove(ctx context.Context, txids [][]byte, entry []byte,
 	info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	if err := s.ensureTxMinedPartition(ctx, info.BlockHeight); err != nil {
 		return nil, err
@@ -443,7 +441,7 @@ func (s *Store) stampAndMove(ctx context.Context, leaves []int16, txids [][]byte
 		return nil, errors.NewStorageError("[utxoset][SetMinedMulti] begin", err)
 	}
 
-	out, residue, err := s.stampMoveAndAppend(ctx, dbTx, leaves, txids, entry, info)
+	out, residue, err := s.stampMoveAndAppend(ctx, dbTx, txids, entry, info)
 	if err != nil {
 		_ = dbTx.Rollback(ctx)
 
@@ -481,7 +479,7 @@ func (s *Store) stampAndMove(ctx context.Context, leaves []int16, txids [][]byte
 // this block leaves it: a row that only ever saw this block moves, one that already carried a
 // fork triple now carries two and stays. provePresentSQL after the move, so a row cannot be
 // counted both as moved and as present.
-func (s *Store) stampMoveAndAppend(ctx context.Context, dbTx pgx.Tx, leaves []int16,
+func (s *Store) stampMoveAndAppend(ctx context.Context, dbTx pgx.Tx,
 	txids [][]byte, entry []byte, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32,
 	[][]byte, error) {
 	groups := leafGroups(txids)
@@ -539,7 +537,7 @@ func (s *Store) stampMoveAndAppend(ctx context.Context, dbTx pgx.Tx, leaves []in
 // append only inserts into tx_mined, and they act on disjoint sets of transactions, so there
 // is no instant at which a reader finds a transaction in neither table -- which is the whole
 // reason stampAndMove needs one.
-func (s *Store) forkStamp(ctx context.Context, leaves []int16, txids [][]byte, entry []byte,
+func (s *Store) forkStamp(ctx context.Context, txids [][]byte, entry []byte,
 	info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	for _, g := range leafGroups(txids) {
 		if _, err := s.pool.Exec(ctx, stampSQL, g.leaf, g.txids, entry, false); err != nil {
@@ -598,7 +596,7 @@ func (s *Store) forkStamp(ctx context.Context, leaves []int16, txids [][]byte, e
 // already confined to the rows the other cannot reach: unstampSQL touches only identity rows,
 // and moveBackSQL only transactions that HOLD a membership row for this exact (height, block
 // id), which a transaction with an identity row does not.
-func (s *Store) unstampAndMoveBack(ctx context.Context, leaves []int16, txids [][]byte,
+func (s *Store) unstampAndMoveBack(ctx context.Context, txids [][]byte,
 	entry []byte, info utxo.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	// A fresh clock from the current tip. See unstampSQL.
 	height := int32(s.GetBlockHeight()) //nolint:gosec // a chain height fits int32

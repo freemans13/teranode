@@ -285,6 +285,19 @@ func (s *Store) Close(_ context.Context) error {
 		s.spendAndCreateInFlight.Wait()
 	}
 
+	// getBatcher and lockBatcher take no schema-changing locks, but the same rule applies:
+	// a batch still in flight when Close returns would run against a pool that Close is
+	// about to close underneath it.
+	if s.getBatcher != nil {
+		s.getBatcher.Close()
+		s.getInFlight.Wait()
+	}
+
+	if s.lockBatcher != nil {
+		s.lockBatcher.Close()
+		s.lockInFlight.Wait()
+	}
+
 	s.pool.Close()
 
 	return nil

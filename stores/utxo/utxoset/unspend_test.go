@@ -150,3 +150,54 @@ func TestUnspendWithoutTheHoldLeavesALiveCoinAlone(t *testing.T) {
 	require.NoError(t, s.Unspend(ctx, affected, false))
 	require.Zero(t, coinFlagsOf(t, s, ctx, parent, 0)&FlagLocked)
 }
+
+// TestUnspendGatesTheJournalsBlockFactsOnASingleSharedCondition pins the fact that
+// mined_height and block_id are read off the journal's own copy as ONE pair, gated on the
+// same condition, rather than as two independently-gated columns that happen to usually
+// agree.
+//
+// mined_height falling back through NULLIF(t.mined_height, 0) and block_id falling back
+// through CASE WHEN t.mined_height > 0 are two different mechanisms for what must be the
+// same fact: nothing in the schema stops mined_height from going negative (it is a plain
+// INTEGER, no CHECK), and NULLIF only tests "not exactly zero" while the CASE tests
+// "greater than zero" -- they diverge on a negative value. A journal row that got there
+// some other way than the paired write the comments assume -- mined_height negative,
+// block_id still carrying whatever it last held -- must restore the coin as fully
+// unconfirmed, not as a height with no matching block.
+func TestUnspendGatesTheJournalsBlockFactsOnASingleSharedCondition(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 700_100)
+	require.NoError(t, err)
+
+	ph := parent.TxIDChainHash()
+	spender := chainhash.HashH([]byte("spender"))
+
+	// The coin is spent by hand, outside the normal spend path, so the journal row below is
+	// the only fact the restore has to work from -- there is no tx_mined row to prefer it
+	// over either.
+	_, err = s.pool.Exec(ctx, `DELETE FROM utxo WHERE leaf = $1 AND ukey = $2 AND txid = $3`,
+		LeafFor(ph[:]), Pack(ph[:], 0), ph[:])
+	require.NoError(t, err)
+
+	require.NoError(t, s.ensureSpendJournalPartition(ctx, 700_150))
+
+	_, err = s.pool.Exec(ctx, `
+        INSERT INTO spend_journal (spent_height, satoshis, created_height, spendable_from,
+                                   flags, mined_height, block_id, ukey, txid, spending_txid,
+                                   script)
+        VALUES (700150, $1, 700100, 0, 0, -7, 55, $2, $3, $4, '\x00')`,
+		parent.Outputs[0].Satoshis, Pack(ph[:], 0), ph[:], spender[:])
+	require.NoError(t, err)
+
+	require.NoError(t, s.Unspend(ctx, []*utxo.Spend{{
+		TxID:         ph,
+		Vout:         0,
+		SpendingData: spend.NewSpendingData(&spender, 0),
+	}}))
+
+	h, b := coinFacts(t, s, ctx, parent)
+	require.Zero(t, h, "a negative journal height must never surface as this coin's mined height")
+	require.Zero(t, b, "and its paired block id must be zeroed with it, not restored on its own")
+}

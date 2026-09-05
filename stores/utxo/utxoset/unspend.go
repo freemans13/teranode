@@ -107,7 +107,7 @@ restored AS (
     SELECT (get_byte(t.txid, 0) & 7)::smallint, t.txid, t.ukey, t.satoshis, t.script,
            t.created_height, t.spendable_from, t.flags | $4::smallint, t.hash_override,
            COALESCE((SELECT m.mined_height FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1),
-                    NULLIF(t.mined_height, 0), 0),
+                    CASE WHEN t.mined_height > 0 THEN t.mined_height END, 0),
            COALESCE((SELECT m.block_id     FROM tx_mined m WHERE m.txid = t.txid ORDER BY m.seq LIMIT 1),
                     CASE WHEN t.mined_height > 0 THEN t.block_id END, 0)
       FROM taken t

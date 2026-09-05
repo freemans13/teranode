@@ -112,21 +112,17 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 // with the bound as a Join Filter, 8.5-9.9 ms fenced, with a Bitmap Index Scan on each leaf's
 // ukey index and no Seq Scan on any coin partition.
 //
-// Most of what is left is the ident arm above, which is still the paired-unnest join shape:
-// 6.4 ms of the 8.7, a Hash Join over a Seq Scan of all eight identity partitions. That is the
-// shape leafGroups measures and rejects (set_mined.go), and it is worth revisiting here -- but
-// the reshape makes tx_ident mempool-sized rather than the 40,000 rows this was measured at, so
-// it is a throughput item and not a correctness one.
+// The ident arm used to live in here too, as the same paired-unnest join every other
+// identity statement was measured and rejected for: leafGroups (set_mined.go) found it
+// 5.19-5.31 ms for 500 keys against 40,000 identity rows, a Hash Join over a Seq Scan of
+// all eight partitions, against 0.29-0.33 ms per leaf group for the leaf-scalar form. It is
+// now setLockedIdentSQL below, run once per leaf group the same way stampSQL and
+// provePresentSQL are, and setLockedDirect wraps that loop and this statement in one
+// transaction so the three arms still commit or fail together.
 const setLockedSQL = `
 WITH k AS (
     SELECT * FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[])
         AS t(leaf, txid, lo, hi)
-),
-ident AS (
-    UPDATE tx_ident i SET flags = CASE WHEN $5::boolean
-                                       THEN i.flags | $6::smallint
-                                       ELSE i.flags & ~$6::smallint END
-      FROM k WHERE i.leaf = k.leaf AND i.txid = k.txid
 ),
 mined AS (
     UPDATE tx_mined m SET flags = CASE WHEN $5::boolean
@@ -149,6 +145,17 @@ UPDATE utxo u SET flags = CASE WHEN $5::boolean
                                ELSE u.flags & ~$6::smallint END
   FROM hit
  WHERE u.leaf = hit.leaf AND u.ukey = hit.ukey AND u.txid = hit.txid`
+
+// setLockedIdentSQL is the ident arm on its own, in the leaf-scalar shape: LEAF AS A SCALAR
+// and the txids as an array, run once per leaf group (leafGroups, set_mined.go) rather than
+// joined against a paired unnest(leaf[], txid[]). See setLockedSQL's comment for the
+// measurements this shape is chosen on.
+const setLockedIdentSQL = `
+UPDATE tx_ident i SET flags = CASE WHEN $3::boolean
+                                   THEN i.flags | $4::smallint
+                                   ELSE i.flags & ~$4::smallint END
+ WHERE i.leaf = $1::smallint
+   AND i.txid = ANY($2::bytea[])`
 
 // SetLocked marks transactions as locked for spending, or releases them.
 //
@@ -180,8 +187,12 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value 
 }
 
 // setLockedDirect issues the update, and is what both the direct and the batched path end at.
+//
+// The ident arm runs first, once per leaf group (leafGroups), and the mined+coin statement
+// runs after it -- both inside ONE transaction, so a caller reading either row mid-flight
+// still sees them agree: never a transaction whose identity row is locked and whose coin or
+// membership row is not, or the reverse.
 func (s *Store) setLockedDirect(ctx context.Context, txHashes []chainhash.Hash, value bool) error {
-
 	leaves := make([]int16, 0, len(txHashes))
 	txids := make([][]byte, 0, len(txHashes))
 	los := make([][16]byte, 0, len(txHashes))
@@ -194,8 +205,27 @@ func (s *Store) setLockedDirect(ctx context.Context, txHashes []chainhash.Hash, 
 		his = append(his, Pack(txHashes[i][:], ^uint32(0)))
 	}
 
-	if _, err := s.pool.Exec(ctx, setLockedSQL, leaves, txids, los, his, value, FlagLocked); err != nil {
+	dbTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][SetLocked] begin", err)
+	}
+
+	for _, g := range leafGroups(txids) {
+		if _, err := dbTx.Exec(ctx, setLockedIdentSQL, g.leaf, g.txids, value, FlagLocked); err != nil {
+			_ = dbTx.Rollback(ctx)
+
+			return errors.NewStorageError("[utxoset][SetLocked] ident", err)
+		}
+	}
+
+	if _, err := dbTx.Exec(ctx, setLockedSQL, leaves, txids, los, his, value, FlagLocked); err != nil {
+		_ = dbTx.Rollback(ctx)
+
 		return errors.NewStorageError("[utxoset][SetLocked]", err)
+	}
+
+	if err := dbTx.Commit(ctx); err != nil {
+		return errors.NewStorageError("[utxoset][SetLocked] commit", err)
 	}
 
 	return nil
