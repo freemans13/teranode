@@ -86,10 +86,12 @@ func TestSetLockedDoesNotTouchACollidingTransactionsCoins(t *testing.T) {
 // setConflictingSQL's ident CTE updates tx_ident only, so marking a mined transaction
 // conflicting set the coin bit and not the bit Get reports.
 //
-// It goes in at runConflictingPlan rather than through SetConflicting because SetConflicting's
-// first step, readConflictingInputs, reads tx_ident alone and reports a mined transaction as
-// TxNotFound before the flag statement ever runs. That is a separate defect (I3 in the review)
-// and it is not fixed here; testing through it would test the miss rather than the flag.
+// It goes in at runConflictingPlan rather than through SetConflicting so that it pins THIS
+// statement on its own. SetConflicting's first step, readConflictingInputs, used to read
+// tx_ident alone and report a mined transaction as TxNotFound before the flag statement ever
+// ran; that separate defect is fixed too, and
+// TestSetConflictingReadsInputsFromAMinedTransaction in conflicting_test.go covers the whole
+// path end to end.
 func TestSetConflictingReachesAMinedTransaction(t *testing.T) {
 	s, ctx := newTestStore(t)
 

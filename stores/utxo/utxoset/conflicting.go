@@ -20,13 +20,47 @@ import (
 // in plain rather than extended form, meaning its inputs carry no value or locking script, so
 // even a body that is still present could not answer this.
 //
-// A hash that comes back missing is the not-found answer, in one round trip rather than one
-// probe per transaction.
+// BOTH HOMES, because a transaction lives in exactly one of them and this statement does not
+// know which. A transaction that lost a double-spend race is very often mined -- it arrives in
+// a block on the fork being abandoned, and conflict resolution has to read what it spent so
+// those spends can be undone -- and the longest-chain stamp moved its inpoints out of tx_ident
+// and onto its membership row. Reading the identity table alone reported exactly those
+// transactions as not held at all, so SetConflicting failed instead of resolving the race.
+//
+// The identity arm has THE LEAF AS A SCALAR and the txids as an array, so it runs once per leaf
+// group: see leafGroups for the measurements that reject the other two key shapes. It replaced
+// the paired `unnest(l[],t[]) JOIN tx_ident` form, whose plan flips with statistics.
+//
+// The membership arm puts the keys on the OUTSIDE of a LATERAL with an OFFSET 0 fence, the
+// shape minedByTxidSQL and firstMinedRowSQL use, so it is one primary-key descent per key per
+// live window rather than a hash join against every window read whole. The earliest row by seq
+// is the transaction's longest-chain stamp, which is the row whose payload was carried over by
+// the move; a later fork stamp only ever copies it.
+//
+// tx_inpoints IS NOT NULL makes a BLOCK-PATH membership row a not-found here, deliberately.
+// Such a row records that a transaction is in a block, not what it spends, so it cannot be a
+// conflict participant: only coinbases take that path at the tip, and below the checkpoint
+// nothing conflicts. Reading it as "spends nothing" would be worse than refusing it, because an
+// empty input set reports a transaction with no counter-spender at all, and that is the answer
+// that lets a double spend through.
+//
+// A hash that comes back missing from both arms is the not-found answer.
 const conflictingInputsSQL = `
 SELECT i.txid, i.tx_inpoints
   FROM tx_ident i
-  JOIN unnest($1::smallint[], $2::bytea[]) AS k(leaf, txid)
-    ON i.leaf = k.leaf AND i.txid = k.txid`
+ WHERE i.leaf = $1::smallint
+   AND i.txid = ANY($2::bytea[])
+UNION ALL
+SELECT k.txid, m.tx_inpoints
+  FROM unnest($2::bytea[]) AS k(txid)
+ CROSS JOIN LATERAL (
+   SELECT m.tx_inpoints
+     FROM tx_mined m
+    WHERE m.txid = k.txid
+      AND m.tx_inpoints IS NOT NULL
+    ORDER BY m.seq
+    LIMIT 1 OFFSET 0
+ ) AS m`
 
 // noteConflictingChildrenSQL records the contest on every parent whose coin is wanted.
 //
@@ -230,55 +264,21 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash,
 // does not hold.
 func (s *Store) readConflictingInputs(ctx context.Context,
 	named []chainhash.Hash) (map[chainhash.Hash]subtree.TxInpoints, error) {
-	leaves := make([]int16, 0, len(named))
 	txids := make([][]byte, 0, len(named))
-
 	for i := range named {
-		leaves = append(leaves, LeafFor(named[i][:]))
 		txids = append(txids, named[i][:])
-	}
-
-	rows, err := s.pool.Query(ctx, conflictingInputsSQL, leaves, txids)
-	if err != nil {
-		return nil, errors.NewStorageError("[utxoset][SetConflicting] read inputs", err)
 	}
 
 	out := make(map[chainhash.Hash]subtree.TxInpoints, len(named))
 
-	for rows.Next() {
-		var (
-			txid []byte
-			raw  []byte
-		)
-
-		if err := rows.Scan(&txid, &raw); err != nil {
-			rows.Close()
-			return nil, errors.NewStorageError("[utxoset][SetConflicting] scan inputs", err)
+	// One round trip per leaf group, because the identity arm needs the leaf as a scalar to
+	// keep its plan an index scan. The membership arm rides along in the same statement rather
+	// than taking a round trip of its own: it does not need the leaf, and splitting the keys
+	// across groups costs it nothing, since it is one primary-key descent per key either way.
+	for _, g := range leafGroups(txids) {
+		if err := s.readInputsForLeaf(ctx, g, out); err != nil {
+			return nil, err
 		}
-
-		var h chainhash.Hash
-
-		copy(h[:], txid)
-
-		if len(raw) == 0 {
-			// A coinbase stores no inpoints. It spends nothing, so it contributes no parents.
-			out[h] = subtree.NewTxInpoints()
-			continue
-		}
-
-		ip, ierr := subtree.NewTxInpointsFromBytes(raw)
-		if ierr != nil {
-			rows.Close()
-			return nil, errors.NewStorageError("[utxoset][SetConflicting] decode inpoints %s", h.String(), ierr)
-		}
-
-		out[h] = ip
-	}
-
-	rows.Close()
-
-	if err := rows.Err(); err != nil {
-		return nil, errors.NewStorageError("[utxoset][SetConflicting] input rows", err)
 	}
 
 	if len(out) == len(named) {
@@ -302,6 +302,52 @@ func (s *Store) readConflictingInputs(ctx context.Context,
 	}
 
 	return nil, errors.Join(missing...)
+}
+
+// readInputsForLeaf runs both arms of conflictingInputsSQL for one leaf group, folding the
+// answers into out.
+func (s *Store) readInputsForLeaf(ctx context.Context, g leafBatch,
+	out map[chainhash.Hash]subtree.TxInpoints) error {
+	rows, err := s.pool.Query(ctx, conflictingInputsSQL, g.leaf, g.txids)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][SetConflicting] read inputs", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			txid []byte
+			raw  []byte
+		)
+
+		if err := rows.Scan(&txid, &raw); err != nil {
+			return errors.NewStorageError("[utxoset][SetConflicting] scan inputs", err)
+		}
+
+		var h chainhash.Hash
+
+		copy(h[:], txid)
+
+		if len(raw) == 0 {
+			// A coinbase stores no inpoints. It spends nothing, so it contributes no parents.
+			out[h] = subtree.NewTxInpoints()
+			continue
+		}
+
+		ip, ierr := subtree.NewTxInpointsFromBytes(raw)
+		if ierr != nil {
+			return errors.NewStorageError("[utxoset][SetConflicting] decode inpoints %s", h.String(), ierr)
+		}
+
+		out[h] = ip
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][SetConflicting] input rows", err)
+	}
+
+	return nil
 }
 
 // conflictingPlan is the argument set for one call of the statements above, flattened across

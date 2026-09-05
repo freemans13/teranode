@@ -409,3 +409,97 @@ func TestConflictingChildrenAnswerForAParentKnownOnlyFromItsCoin(t *testing.T) {
 	require.Nil(t, got.TxInpoints.ParentTxHashes, "and the coin answer is thin, as it is for a pruned parent")
 	require.Equal(t, []chainhash.Hash{*loser.TxIDChainHash()}, got.ConflictingChildren)
 }
+
+// TestSetConflictingReadsInputsFromAMinedTransaction.
+//
+// A transaction that lost a double-spend race is very often mined: it arrives in a block on the
+// fork being abandoned, and conflict resolution then has to mark it, read what it spent, and
+// hand those spends back so they can be undone. A longest-chain stamp moves it out of tx_ident
+// and into tx_mined, so an inputs read that looks only at the identity table reports the
+// transaction as not held at all -- and SetConflicting fails rather than resolving the race.
+func TestSetConflictingReadsInputsFromAMinedTransaction(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_100))
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 700_000)
+	require.NoError(t, err)
+
+	child := spendOneOutput(t, s, ctx, parent, 0, 700_100)
+
+	// The move: stamped into a longest-chain block, so its identity row is gone and its
+	// inpoints live on the membership row.
+	_, err = s.SetMinedMulti(ctx, hashes(child),
+		utxo.MinedBlockInfo{BlockID: 44, BlockHeight: 700_100})
+	require.NoError(t, err)
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
+		[]chainhash.Hash{*child.TxIDChainHash()}, true))
+	require.False(t, identExists(t, s, ctx, child))
+	require.Equal(t, 1, minedRows(t, s, ctx, child))
+
+	affected, _, err := s.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
+	require.NoError(t, err, "a mined transaction must be markable")
+
+	require.Len(t, affected, 1, "and its spend must come back so conflict resolution can undo it")
+	require.Equal(t, parent.TxIDChainHash().String(), affected[0].TxID.String())
+	require.Equal(t, uint32(0), affected[0].Vout)
+
+	got, err := s.Get(ctx, child.TxIDChainHash(), fields.Conflicting)
+	require.NoError(t, err)
+	require.True(t, got.Conflicting, "and the membership row must report the flag")
+
+	pmeta, err := s.Get(ctx, parent.TxIDChainHash(), fields.ConflictingChildren)
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{*child.TxIDChainHash()}, pmeta.ConflictingChildren,
+		"the contest is noted on the parent whichever table the child lives in")
+}
+
+// TestSpendsMadeByReachesAMinedTransaction. The undo half of the same gap: reversing a
+// conflict resolution asks the demoted transaction what it took, and the demoted transaction
+// came from a block.
+func TestSpendsMadeByReachesAMinedTransaction(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_100))
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 700_000)
+	require.NoError(t, err)
+
+	child := spendOneOutput(t, s, ctx, parent, 0, 700_100)
+
+	_, err = s.SetMinedMulti(ctx, hashes(child),
+		utxo.MinedBlockInfo{BlockID: 44, BlockHeight: 700_100})
+	require.NoError(t, err)
+	require.NoError(t, s.MarkTransactionsOnLongestChain(ctx,
+		[]chainhash.Hash{*child.TxIDChainHash()}, true))
+
+	made, err := s.SpendsMadeBy(ctx, *child.TxIDChainHash())
+	require.NoError(t, err)
+	require.Len(t, made, 1)
+	require.Equal(t, parent.TxIDChainHash().String(), made[0].TxID.String())
+	require.Equal(t, uint32(0), made[0].Vout)
+}
+
+// TestSetConflictingRefusesABlockPathMinedRow.
+//
+// A membership row written by the block path carries NULL inpoints: it records that a
+// transaction is in a block, not what the transaction spends. Only a coinbase takes that path
+// at the tip, and below the checkpoint nothing conflicts, so such a row can never be a conflict
+// participant. Reading it as "spends nothing" would be worse than refusing it -- an empty
+// input set makes the cascade report no counter-spender at all, which is the answer that lets
+// a double spend through -- so it is a not-found here.
+func TestSetConflictingRefusesABlockPathMinedRow(t *testing.T) {
+	s, ctx := newTestStore(t)
+	require.NoError(t, s.SetBlockHeight(700_100))
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 700_000, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 9, BlockHeight: 700_000, OnLongestChain: true}))
+	require.NoError(t, err)
+	require.False(t, identExists(t, s, ctx, tx))
+	require.Equal(t, 1, minedRows(t, s, ctx, tx))
+
+	_, _, err = s.SetConflicting(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound), "got %v", err)
+}
