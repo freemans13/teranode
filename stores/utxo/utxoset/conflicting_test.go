@@ -164,10 +164,17 @@ func TestSetConflictingReturnsOnlySpendsItsOwnUnspendCanRestore(t *testing.T) {
 		"every record returned must be one this store can restore")
 }
 
-// TestSetConflictingReportsNothingToRestoreForAnUnspentTransaction. Same rule from the other
-// side: a transaction whose inputs were never taken must report NO restorable spends, or the
-// restore fails on records that were never spends.
-func TestSetConflictingReportsNothingToRestoreForAnUnspentTransaction(t *testing.T) {
+// TestSetConflictingStillNamesAParentWhoseCoinWasNeverTaken. The same rule from the other
+// side, and it used to say the opposite: a transaction whose inputs were never taken reported
+// NO spends at all, on the argument that a record which is not a spend makes the restore fail.
+//
+// It does not. Unspend counts an already-live coin as work someone else has done and returns
+// success, so the record costs a probe and nothing else. Omitting it is what actually breaks,
+// because the shared conflict-resolution driver takes the parents named here as the set to
+// unlock when it finishes: a parent locked by a crashed run, whose coin was restored before the
+// crash, would be left locked forever with nothing to say so. That is the state
+// ConflictWALCrashRecovery's forward_after_step2_unspend_lock case reconstructs.
+func TestSetConflictingStillNamesAParentWhoseCoinWasNeverTaken(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	parent := mkTx(t, 2, 5_000)
@@ -180,7 +187,44 @@ func TestSetConflictingReportsNothingToRestoreForAnUnspentTransaction(t *testing
 
 	affected, _, err := s.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
 	require.NoError(t, err)
-	require.Empty(t, affected, "nothing was spent, so there is nothing to restore")
+	require.Len(t, affected, 1, "the parent whose coin is still live must be named")
+	require.Equal(t, parent.TxIDChainHash().String(), affected[0].TxID.String())
+	require.Equal(t, uint32(0), affected[0].Vout)
+	require.Nil(t, affected[0].UTXOHash,
+		"no journal row means no captured amount or script, so no coin identity is invented")
+
+	// The proof that the extra record is harmless: it goes straight back to Unspend, which is
+	// what conflict resolution does with it.
+	require.NoError(t, s.Unspend(ctx, affected, false),
+		"an already-live coin is a no-op success, not a missing-coin failure")
+}
+
+// TestSetConflictingReportsNothingBeyondJournalRetention is the half of the old rule that
+// stands. An input with no journal row AND no live coin cannot be restored by this store: the
+// undo payload has aged out, or a different transaction re-spent the coin since. Reporting it
+// would make Unspend fail the whole restore rather than complete it, so it is omitted.
+func TestSetConflictingReportsNothingBeyondJournalRetention(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	child := spendOutput(t, parent, 0, 1)
+	_, err = s.Create(ctx, child, 101)
+	require.NoError(t, err)
+
+	spends, err := spendOnly(ctx, s, child, 101)
+	require.NoError(t, err)
+	require.NoError(t, spends[0].Err)
+
+	// The coin is gone, destroyed by the spend, and now the undo record goes too.
+	_, err = s.pool.Exec(ctx, `DELETE FROM spend_journal`)
+	require.NoError(t, err)
+
+	affected, _, err := s.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
+	require.NoError(t, err)
+	require.Empty(t, affected, "a coin this store cannot restore must not be offered as one")
 }
 
 // TestSetConflictingCascadesDownTheChain exercises the second return value, which drives the

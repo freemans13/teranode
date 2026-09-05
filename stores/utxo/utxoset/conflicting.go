@@ -105,11 +105,37 @@ ON CONFLICT DO NOTHING`
 // carries the id prefix first precisely so this is an index range scan, and the full 32-byte id
 // is still rechecked because the prefix is non-unique by design.
 //
-// The 'parent' rows are the spends to be undone, and they come from an INNER join on the
-// journal deliberately. They feed straight into this store's own Unspend, which FAILS unless
-// every record it is given comes back. So a record for an input that was never actually spent,
-// or whose undo payload has aged out, is not a harmless extra: it makes the whole restore fail.
-// Reporting only what the journal still holds is the only honest answer.
+// The 'parent' rows are the spends to be undone, and the join to the journal is OUTER with a
+// guard, in two parts, for two different reasons.
+//
+// The journal row is what makes a spend undoable, so an input that still has one is reported
+// with its full undo payload. An input with NO journal row is reported too, but only when the
+// parent coin is currently LIVE at that outpoint. That case is not hypothetical bookkeeping:
+// it is what a crash between the unspend and the unlock leaves behind, and the shared
+// conflict-resolution replay depends on seeing it. The driver takes the parents named here as
+// the set to unlock at the end of the run, so an input omitted because its coin was already
+// restored is a parent left LOCKED FOREVER with no operator signal. Both reference stores
+// report every input unconditionally for exactly this reason.
+//
+// Handing back a record for a coin that is already live is safe here because Unspend counts it:
+// its live_before arm makes a restore of an already-restored coin a no-op success rather than a
+// missing-coin failure, so the extra record costs one probe and changes nothing else. The
+// The probe is a LATERAL with an OFFSET 0 fence rather than a plain EXISTS, and the fence is
+// the whole difference. Written as `OR EXISTS (SELECT 1 FROM utxo ...)` the planner is free to
+// pull the subquery up and hash it, and it does: measured on this schema at 40,000 coins across
+// all eight partitions with 500 keys, the plan carried a hashed SubPlan over a Seq Scan of
+// every one of utxo_p0..p7, 30.6 ms, and its cost grows with the coin table rather than with
+// the batch. Fenced, it is one index descent per key on the leaf partition's ukey index with
+// the full 32-byte txid rechecked on the heap -- the bound schema.go requires of every by-txid
+// coin access, because the packed key is a non-unique 96-bit prefix that can find a row but
+// must never justify acting on one.
+//
+// An input with neither a journal row nor a live coin is still omitted, and that is the half of
+// the old rule that was right. Its undo payload has aged out of the journal, or the coin was
+// re-spent by a different transaction since; either way this store cannot restore it, and
+// Unspend FAILS the whole restore if a single record it is given cannot be accounted for. A
+// cascade rooted on a transaction older than journal retention therefore still stops early,
+// which is a real limit of delete-on-spend rather than something to paper over.
 //
 // The 'child' rows are the next level of the cascade. The journal is the only place this store
 // can answer "who took this coin", because the coin row is destroyed the moment it is spent.
@@ -157,8 +183,15 @@ coins AS (
 SELECT 'parent'::text AS kind, p.ref, p.ptxid, p.pvout,
        j.satoshis, j.script, j.hash_override, NULL::bytea AS spender
   FROM p
-  JOIN spend_journal j
+  LEFT JOIN spend_journal j
     ON j.ukey = p.pukey AND j.txid = p.ptxid AND j.spending_txid = p.child
+  LEFT JOIN LATERAL (
+    SELECT 1 AS live
+      FROM utxo u
+     WHERE u.leaf = p.pleaf AND u.ukey = p.pukey AND u.txid = p.ptxid
+     LIMIT 1 OFFSET 0
+  ) AS lv ON TRUE
+ WHERE j.ukey IS NOT NULL OR lv.live IS NOT NULL
 UNION ALL
 SELECT 'child'::text, k.ref, NULL::bytea, NULL::int,
        NULL::bigint, NULL::bytea, NULL::bytea, j.spending_txid
@@ -485,8 +518,10 @@ func (s *Store) runConflictingPlan(ctx context.Context, q querier, p *conflictin
 // Unspend.
 func (p *conflictingPlan) spendFor(ref int32, ptxid []byte, pvout *int32, satoshis *int64,
 	script []byte, hashOverride []byte) (*utxo.Spend, error) {
-	if pvout == nil || satoshis == nil {
-		return nil, errors.NewStorageError("[utxoset][SetConflicting] journal row %d is incomplete", ref)
+	// The vout comes from the plan's own inpoint rather than from the journal, so it is never
+	// absent. A missing one would mean the statement returned a row the plan did not ask for.
+	if pvout == nil {
+		return nil, errors.NewStorageError("[utxoset][SetConflicting] row %d names no output", ref)
 	}
 
 	parent, err := chainhash.NewHash(ptxid)
@@ -509,6 +544,15 @@ func (p *conflictingPlan) spendFor(ref int32, ptxid []byte, pvout *int32, satosh
 			sp.UTXOHash = h
 			return sp, nil
 		}
+	}
+
+	// No journal row means the coin is already live, so there is no captured amount or script
+	// to compute the coin's identity from and the record carries none. Nothing in this store
+	// reads it -- Unspend restores on the outpoint and the spender, and that is all the driver
+	// does with these -- and inventing one from a coin row would be a second, unverified
+	// opinion about a value the journal is the record for.
+	if satoshis == nil {
+		return sp, nil
 	}
 
 	if h, herr := util.UTXOHash(parent, vout, bscript.NewFromBytes(script), uint64(*satoshis)); herr == nil { //nolint:gosec // satoshis are never negative

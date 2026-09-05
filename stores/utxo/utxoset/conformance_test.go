@@ -137,4 +137,14 @@ func TestConformance(t *testing.T) {
 		db, _ := newTestStore(t)
 		tests.ConflictWAL(t, db)
 	})
+
+	// Crash recovery for that log: for each step boundary of the forward and reverse
+	// conflict-resolution operations it rebuilds the on-disk state a SIGKILL would leave and
+	// replays. It is the hardest suite here because the parent is MINED throughout, so every
+	// read the driver makes on it -- its inputs, its spenders, its locked flag -- has to reach
+	// tx_mined rather than the identity table.
+	t.Run("ConflictWALCrashRecovery", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.ConflictWALCrashRecovery(t, db)
+	})
 }
