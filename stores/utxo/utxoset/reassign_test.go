@@ -127,7 +127,11 @@ func TestReAssignInvertsWhoMaySpendTheCoin(t *testing.T) {
 	// in which the reassignment itself can be challenged.
 	spends, err := spendOnly(ctx, s, spendOneOutputTx(t, parent, 0), 101)
 	require.Error(t, err)
-	require.Contains(t, spends[0].Err.Error(), "not spendable until")
+	// ErrFrozen specifically, not a plain processing error and not ErrTxLocked. The
+	// reassignment delay is the alert system's hold, and the shared rollback predicate lists
+	// ErrFrozen: classified as anything else, a multi-input transaction failing on one held
+	// input strands its other inputs marked spent by a transaction that can never be accepted.
+	require.True(t, errors.Is(spends[0].Err, errors.ErrFrozen), "got %v", spends[0].Err)
 
 	spendable := 100 + tSettings.UtxoStore.ReAssignedUtxoSpendableAfterBlocks
 	require.NoError(t, s.SetBlockHeight(spendable))

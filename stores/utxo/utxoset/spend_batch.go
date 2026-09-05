@@ -431,10 +431,27 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 		case refusing&FlagLocked != 0:
 			sp.Err = errors.ErrTxLocked
 		case spendableFrom > p.heights[k]:
-			// Exists, but immature: a coinbase before maturity, or a reassigned output still
-			// inside its delay. NOT a double spend, and reporting it as one would be wrong.
-			sp.Err = errors.NewProcessingError("[utxoset] utxo not spendable until height %d (current %d)",
-				spendableFrom, p.heights[k])
+			// Exists, but not yet spendable. NOT a double spend, and reporting it as one
+			// would be wrong. One column carries two different holds and they get different
+			// errors, because their callers act on them differently.
+			//
+			// A coinbase inside its maturity window is ErrTxCoinbaseImmature, which says the
+			// coin becomes spendable at a known height and nothing is wrong with it.
+			//
+			// Anything else in this column is the alert system's reassignment delay, and it
+			// is ErrFrozen. It must NOT be reported as merely locked or as a plain processing
+			// error: both reference stores classify it as frozen, and the sql store carries a
+			// test pinning that (spendable_in_frozen_test.go), because the shared rollback
+			// predicate lists ErrFrozen and not the others. Get it wrong and a multi-input
+			// transaction that fails on one held input strands its other inputs marked spent
+			// by a transaction that can never be accepted.
+			if flags&FlagCoinbase != 0 {
+				sp.Err = errors.NewTxCoinbaseImmatureError("[utxoset] coinbase %s:%d not spendable until height %d (current %d)",
+					sp.TxID, sp.Vout, spendableFrom, p.heights[k])
+			} else {
+				sp.Err = errors.NewUtxoFrozenError("[utxoset] utxo %s:%d is held until height %d (current %d)",
+					sp.TxID, sp.Vout, spendableFrom, p.heights[k])
+			}
 		default:
 			// Present, eligible, and yet not deleted. The DELETE and this lookup run under
 			// different snapshots, so the only way here is a row that appeared between them:
@@ -453,9 +470,11 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 		return errors.NewStorageError("[utxoset][Spend] classify rows", err)
 	}
 
-	// Anything neither deleted nor present is genuinely gone: already spent, or it never
-	// existed. The coin table cannot tell those apart, which is why ErrSpent is the honest
-	// answer, and why the journal is asked next for who took it.
+	// Anything neither deleted nor present is gone from the coin table: already spent, or
+	// never there at all. The coin table cannot tell those apart on its own, so ErrSpent is
+	// the provisional answer and the journal is asked next for who took it. An input the
+	// journal cannot explain either goes on to nameUnknownParents, which decides between
+	// "spent" and "never seen".
 	missing := false
 
 	for _, k := range p.idx {
@@ -578,6 +597,123 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 
 	if err := rows.Err(); err != nil {
 		return errors.NewStorageError("[utxoset][Spend] spender rows", err)
+	}
+
+	return s.nameUnknownParents(ctx, q, p)
+}
+
+// parentKnownSQL asks, for a set of outpoints, whether the store holds the parent transaction
+// at all -- in any of the four places it can be held.
+//
+// Each probe sits inside a LATERAL with an OFFSET 0 fence, the shape minedByTxidSQL and
+// firstMinedRowSQL use, so each is one index descent per key rather than a subquery the
+// planner is free to pull up and hash against the whole table. Written as four ORed EXISTS
+// clauses the planner does exactly that: measured elsewhere in this store on 40,000 coins, an
+// unfenced EXISTS over the coin table planned as a hashed SubPlan across every leaf partition.
+//
+// The coin probe is bounded by the packed-key RANGE and rechecked on the full 32-byte txid,
+// which schema.go requires of every by-txid coin access, and it asks about ANY output of the
+// parent rather than the one being spent: a parent whose membership window has retired is
+// known to this store only through a surviving coin, which is exactly what a pruned SV Node
+// can say about one.
+const parentKnownSQL = `
+SELECT k.vin
+  FROM unnest($1::smallint[], $2::bytea[], $3::uuid[], $4::uuid[], $5::int[])
+       AS k(leaf, txid, lo, hi, vin)
+  LEFT JOIN LATERAL (
+    SELECT 1 AS hit FROM tx_ident i
+     WHERE i.leaf = k.leaf AND i.txid = k.txid LIMIT 1 OFFSET 0) a ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT 1 AS hit FROM tx_mined m
+     WHERE m.txid = k.txid LIMIT 1 OFFSET 0) b ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT 1 AS hit FROM preserved_parent pp
+     WHERE pp.txid = k.txid LIMIT 1 OFFSET 0) c ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT 1 AS hit FROM utxo u
+     WHERE u.leaf = k.leaf AND u.ukey BETWEEN k.lo AND k.hi AND u.txid = k.txid
+     LIMIT 1 OFFSET 0) d ON TRUE
+ WHERE a.hit IS NOT NULL OR b.hit IS NOT NULL OR c.hit IS NOT NULL OR d.hit IS NOT NULL`
+
+// nameUnknownParents downgrades ErrSpent to ErrTxNotFound for the inputs whose parent this
+// store has never held.
+//
+// The two are not interchangeable to the caller. ErrSpent means a competing transaction took
+// the coin, and the validator answers it by marking the loser conflicting and walking its
+// descendants. ErrTxNotFound means the parent has not arrived, and the validator answers it by
+// fetching the parent and retrying. Reporting the first for an outpoint the store has never
+// seen makes the node declare a double spend against a transaction that does not exist, which
+// is both wrong and unrecoverable without operator action. Both reference stores distinguish
+// them, because both read the parent's record before they touch a coin.
+//
+// This store does not read the parent's record on the spend path, deliberately -- the spend IS
+// the read, straight off the coin, and that is where its speed comes from. So the question is
+// asked only here, for the inputs nothing else could explain: no live coin, and no journal row
+// naming a spender. That is the error path, never the hot one.
+//
+// ONE CASE STAYS AMBIGUOUS, and it is reported as spent rather than missing. A parent whose
+// membership window has retired, whose coins are all gone, and whose spend is older than
+// journal retention leaves no trace here at all, so it is indistinguishable from one that
+// never arrived. Answering "not found" there is the conservative choice: it asks the caller to
+// fetch a parent rather than to condemn a transaction as a double spend on no evidence.
+func (s *Store) nameUnknownParents(ctx context.Context, q pgx.Tx, p *spendPlan) error {
+	var (
+		leaves []int16
+		txids  [][]byte
+		los    [][16]byte
+		his    [][16]byte
+		vins   []int32
+	)
+
+	for _, k := range p.idx {
+		sp := p.perItem[p.owner[k]][p.ownerVin[k]]
+		// Only the inputs still unexplained: ErrSpent with nobody named as having taken it.
+		if sp == nil || !errors.Is(sp.Err, errors.ErrSpent) || sp.ConflictingTxID != nil {
+			continue
+		}
+
+		leaves = append(leaves, p.leaves[k])
+		txids = append(txids, p.txids[k])
+		los = append(los, Pack(p.txids[k], 0))
+		his = append(his, Pack(p.txids[k], ^uint32(0)))
+		vins = append(vins, k)
+	}
+
+	if len(vins) == 0 {
+		return nil
+	}
+
+	rows, err := q.Query(ctx, parentKnownSQL, leaves, txids, los, his, vins)
+	if err != nil {
+		return errors.NewStorageError("[utxoset][Spend] parent known", err)
+	}
+
+	defer rows.Close()
+
+	known := make(map[int32]struct{}, len(vins))
+
+	for rows.Next() {
+		var k int32
+
+		if err := rows.Scan(&k); err != nil {
+			return errors.NewStorageError("[utxoset][Spend] parent known scan", err)
+		}
+
+		known[k] = struct{}{}
+	}
+
+	if err := rows.Err(); err != nil {
+		return errors.NewStorageError("[utxoset][Spend] parent known rows", err)
+	}
+
+	for _, k := range vins {
+		if _, ok := known[k]; ok {
+			continue
+		}
+
+		sp := p.perItem[p.owner[k]][p.ownerVin[k]]
+		sp.Err = errors.NewTxNotFoundError("[utxoset] %s:%d has no parent transaction in this store",
+			sp.TxID, sp.Vout)
 	}
 
 	return nil

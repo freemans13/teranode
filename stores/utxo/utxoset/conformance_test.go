@@ -162,4 +162,21 @@ func TestConformance(t *testing.T) {
 		db, _ := newTestStore(t)
 		tests.SetLockedBehavior(t, db)
 	})
+
+	// Re-spending a coin with the SAME spending transaction is a no-op success, not a double
+	// spend. Block validation replays a block it has already applied, and a store that raised
+	// there could never re-apply one.
+	t.Run("SpendIdempotent", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SpendIdempotent(t, db)
+	})
+
+	// The four ways a spend is refused, each with its own error, because the validator
+	// behaves differently for each: a parent it has never seen, a claim about the coin that
+	// does not match, a coinbase inside its maturity window, and a coin some other
+	// transaction already took -- which must also name the transaction that took it.
+	t.Run("SpendErrorTypes", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SpendErrorTypes(t, db)
+	})
 }
