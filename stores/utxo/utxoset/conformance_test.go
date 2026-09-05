@@ -179,4 +179,71 @@ func TestConformance(t *testing.T) {
 		db, _ := newTestStore(t)
 		tests.SpendErrorTypes(t, db)
 	})
+
+	// Not-found is a STATUS from GetSpend, never an error. A caller asking about an outpoint
+	// the store does not hold is asking a legitimate question.
+	t.Run("GetSpendNotFound", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.GetSpendNotFound(t, db)
+	})
+
+	// Height zero is refused, because it is the unconfirmed sentinel throughout this store and
+	// accepting it would make every maturity and retention test read true.
+	t.Run("SetBlockHeightZero", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SetBlockHeightZero(t, db)
+	})
+
+	// The two halves of the block-state snapshot contract (issue 1443). The write side: one
+	// SetBlockState and the snapshot and both single-field getters agree, because DAH and
+	// maturity read the height directly and would otherwise freeze at a stale one. The read
+	// side: a pair some single writer actually published, never one assembled from two loads,
+	// which only shows up while a writer is mid-update.
+	t.Run("SetBlockStateContract", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SetBlockStateContract(t, db)
+	})
+
+	t.Run("SetBlockStateSnapshotUnderConcurrency", func(t *testing.T) {
+		db, _ := newTestStore(t)
+		tests.SetBlockStateSnapshotUnderConcurrency(t, db)
+	})
+
+	// Sanity is LEFT OUT, and not because this store fails it. It cannot run anywhere: at
+	// tests.go:739 it builds its spending transaction with
+	//
+	//	spentTx.ChangeToAddress("1A1z...", &bt.FeeQuote{})
+	//
+	// and a zero-value bt.FeeQuote carries no fee types, so go-bt returns "feetype not found"
+	// and the require fails before the store is touched at all. The call needs bt.NewFeeQuote(),
+	// which is a change to the shared suite and out of this store's hands -- editing
+	// stores/utxo/tests/tests.go is not this task's to make. No other store enables Sanity,
+	// which is why it has gone unnoticed.
+	//
+	// Nothing else here covers what it would: a thousand transactions created, each spent by a
+	// child, and all thousand outpoints then asked about by name. That is the only width in the
+	// suite at which a statement whose cost is a function of the table rather than the batch
+	// shows up as a stall rather than as a wrong answer. It is worth turning on the day the
+	// shared suite is fixed.
+}
+
+// BenchmarkConformance is the shared suite's own benchmark: create, spend, unspend, delete,
+// through the interface, one round per iteration.
+//
+// It is a benchmark rather than a test, so it needs its own top-level function -- t.Run cannot
+// give it a *testing.B -- and `go test` without -bench does not run it at all. That is the
+// -short skip the task asked for, provided by the toolchain rather than by a guard here, so
+// nothing about it lengthens an ordinary run. Measured on the container instance at 3.0 ms per
+// round, so it is cheap enough to keep.
+//
+// tests.Benchmark discards the error from bt.ChangeToAddress, which fails with "feetype not
+// found" because the shared suite passes a zero-value bt.FeeQuote carrying no fee types. The
+// spending transaction therefore has no change output. That costs the benchmark nothing -- it
+// still creates, spends, unspends and deletes -- and the fix belongs in the shared suite. It is
+// the same defect that blocks tests.Sanity, which does NOT discard the error; see the comment
+// at the Sanity call site above.
+func BenchmarkConformance(b *testing.B) {
+	db, _ := benchStore(b)
+
+	tests.Benchmark(b, db)
 }
