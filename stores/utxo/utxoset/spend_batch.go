@@ -48,7 +48,10 @@ type spendPlan struct {
 	// resolution's waived spend with an ordinary one.
 	masks []int16
 	// skipClaim[i] suppresses the previous-output comparison for item i. Set only by the
-	// gated below-checkpoint outpoint-only path, which is the one caller entitled to it.
+	// gated below-checkpoint outpoint-only path, which is the one caller entitled to it. It
+	// does not reach a reassigned coin: claimMismatch refuses that combination outright,
+	// because a coin whose only stored authentication is a digest cannot also waive the claim
+	// the digest is computed from.
 	skipClaim []bool
 }
 
@@ -251,13 +254,41 @@ func permute[T any](xs []T, order []int) []T {
 // transaction there leaves the rows the DELETE already took. That is a pre-existing property
 // of that path for every error class, not something this comparison introduces, and no caller
 // outside tests reaches it.
-func claimMismatch(in *bt.Input, sp *utxo.Spend, satoshis int64, script []byte, hashOverride []byte) error {
-	if in == nil || in.PreviousTxScript == nil {
+// The skipClaim decision is a PARAMETER rather than a gate at the call site, and that is the
+// point of it being here. It used to be an if around the whole call, written independently of
+// the reassignment check inside; the two then interacted silently, and an outpoint-only spend
+// of a reassigned coin was authenticated by nothing at all. One function decides now, so the
+// exemption cannot be granted without the exception to it being considered in the same breath.
+func claimMismatch(in *bt.Input, sp *utxo.Spend, satoshis int64, script []byte, hashOverride []byte,
+	skipClaim bool) error {
+	// A REASSIGNED coin is the one case with no way out. There is nothing on the row to
+	// compare a claim against -- the satoshis and the script are the confiscated owner's,
+	// since ReAssignUTXO is handed a hash and nothing else -- so the digest is the only
+	// authentication available, and a spend that presents no claim, or is excused from
+	// presenting one, would be authorised by the outpoint alone. The outpoint is exactly what
+	// the confiscated party still knows.
+	if len(hashOverride) > 0 {
+		if skipClaim {
+			return errors.NewUtxoHashMismatchError(
+				"[utxoset][Spend] %s:%d was reassigned and cannot be spent outpoint-only; the new output has to be presented",
+				sp.TxID, sp.Vout)
+		}
+
+		if in == nil || in.PreviousTxScript == nil {
+			return errors.NewUtxoHashMismatchError(
+				"[utxoset][Spend] %s:%d was reassigned and was offered with no output to check; the spending transaction must arrive extended",
+				sp.TxID, sp.Vout)
+		}
+
+		return reassignedClaimMismatch(in, sp, hashOverride)
+	}
+
+	if skipClaim {
 		return nil
 	}
 
-	if len(hashOverride) > 0 {
-		return reassignedClaimMismatch(in, sp, hashOverride)
+	if in == nil || in.PreviousTxScript == nil {
+		return nil
 	}
 
 	if in.PreviousTxSatoshis == uint64(satoshis) && //nolint:gosec // satoshis are never negative
@@ -357,10 +388,9 @@ func (s *Store) runSpendPlan(ctx context.Context, q pgx.Tx, p *spendPlan) error 
 		if in := p.itemTxs[item].Inputs[vin]; in != nil {
 			// Before the overwrite, and it has to be: the overwrite is what destroys the
 			// claim this is checking.
-			if !p.skipClaim[item] {
-				if err := claimMismatch(in, p.perItem[item][vin], satoshis, script, hashOverride); err != nil {
-					p.perItem[item][vin].Err = err
-				}
+			if err := claimMismatch(in, p.perItem[item][vin], satoshis, script, hashOverride,
+				p.skipClaim[item]); err != nil {
+				p.perItem[item][vin].Err = err
 			}
 
 			decorateInput(in, satoshis, script, hashOverride)
@@ -572,9 +602,7 @@ func (s *Store) namePlanSpenders(ctx context.Context, q pgx.Tx, p *spendPlan, do
 			sp.Err = nil
 			sp.ConflictingTxID = nil
 
-			if !p.skipClaim[p.owner[k]] {
-				sp.Err = claimMismatch(in, sp, satoshis, script, hashOverride)
-			}
+			sp.Err = claimMismatch(in, sp, satoshis, script, hashOverride, p.skipClaim[p.owner[k]])
 
 			if in != nil {
 				decorateInput(in, satoshis, script, hashOverride)

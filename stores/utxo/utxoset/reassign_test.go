@@ -200,6 +200,127 @@ func TestReAssignedCoinAnswersOnlyToItsNewHash(t *testing.T) {
 	require.Equal(t, int(utxo.Status_OK), resp.Status)
 }
 
+// TestReAssignedCoinIsNotDecoratedFromItsOldOutput closes the hole that made the whole feature
+// work only for pre-extended transactions.
+//
+// The validator extends every transaction through BatchPreviousOutputsDecorate before it
+// validates one (Validator.go:1631). That read used to hand back the coin row's satoshis and
+// script unconditionally, and on a reassigned coin those are the CONFISCATED owner's. So the
+// new owner's unextended transaction had the old output written onto it, the spend then hashed
+// exactly those stale values against hash_override, and the spend was refused -- the store
+// fabricating the wrong claim and then rejecting the victim for making it.
+//
+// The input is left alone instead. Only the new owner holds the script the coin was reassigned
+// to, so only they can present it, and the refusal has to be loud: a nil script returned with
+// no error would have the validator mark the transaction extended and validate it against no
+// script at all.
+func TestReAssignedCoinIsNotDecoratedFromItsOldOutput(t *testing.T) {
+	s, ctx := newTestStore(t)
+	tSettings := settings.NewSettings()
+
+	require.NoError(t, s.SetBlockHeight(100))
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	old := &utxo.Spend{TxID: parent.TxIDChainHash(), Vout: 0}
+
+	newHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(),
+		&bt.Output{Satoshis: 5_000, LockingScript: newOwnerScript(t)}, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, s.FreezeUTXOs(ctx, []*utxo.Spend{old}, tSettings))
+	require.NoError(t, s.ReAssignUTXO(ctx, old,
+		&utxo.Spend{TxID: old.TxID, Vout: 0, UTXOHash: newHash}, tSettings))
+
+	// An unextended arrival: the input names the outpoint and carries no output.
+	child := spendOneOutputTx(t, parent, 0)
+	child.Inputs[0].PreviousTxScript = nil
+	child.Inputs[0].PreviousTxSatoshis = 0
+
+	err = s.PreviousOutputsDecorate(ctx, child)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "reassigned")
+	require.Nil(t, child.Inputs[0].PreviousTxScript, "the confiscated output must not be written onto the input")
+	require.Zero(t, child.Inputs[0].PreviousTxSatoshis)
+
+	// Not a missing parent: the coin is right there, and sending the caller to fetch a parent
+	// transaction would never resolve it.
+	require.False(t, errors.Is(err, errors.ErrTxNotFound), "got %v", err)
+
+	// A coin that was NOT reassigned still decorates from the row, in the same batch shape.
+	other := mkTx(t, 1, 7_000)
+	_, err = s.Create(ctx, other, 100)
+	require.NoError(t, err)
+
+	plain := spendOneOutputTx(t, other, 0)
+	plain.Inputs[0].PreviousTxScript = nil
+	plain.Inputs[0].PreviousTxSatoshis = 0
+
+	require.NoError(t, s.PreviousOutputsDecorate(ctx, plain))
+	require.Equal(t, uint64(7_000), plain.Inputs[0].PreviousTxSatoshis)
+	require.NotNil(t, plain.Inputs[0].PreviousTxScript)
+}
+
+// TestReAssignedCoinCannotBeSpentOutpointOnly pins the interaction between two exemptions that
+// were written independently.
+//
+// WithSkipUTXOHashCheck is the gated below-checkpoint path: the transaction arrives as
+// outpoints alone, there is no claim to authenticate, and script validation is off in the same
+// breath. A reassigned coin is the one coin where that reasoning fails, because the digest IS
+// its only authentication -- the row's own satoshis and script belong to the party it was taken
+// from. Waiving the claim there would authorise the spend on the outpoint alone, and the
+// outpoint is exactly what the confiscated party still knows.
+//
+// It cannot arise below a checkpoint in practice. It is refused anyway, because the two guards
+// live in different files and the next person to widen either one should hit a test rather
+// than a silent hole.
+func TestReAssignedCoinCannotBeSpentOutpointOnly(t *testing.T) {
+	s, ctx := newTestStore(t)
+	tSettings := settings.NewSettings()
+
+	require.NoError(t, s.SetBlockHeight(100))
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 100)
+	require.NoError(t, err)
+
+	old := &utxo.Spend{TxID: parent.TxIDChainHash(), Vout: 0}
+	newOutput := &bt.Output{Satoshis: 5_000, LockingScript: newOwnerScript(t)}
+
+	newHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(), newOutput, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, s.FreezeUTXOs(ctx, []*utxo.Spend{old}, tSettings))
+	require.NoError(t, s.ReAssignUTXO(ctx, old,
+		&utxo.Spend{TxID: old.TxID, Vout: 0, UTXOHash: newHash}, tSettings))
+
+	spendable := 100 + tSettings.UtxoStore.ReAssignedUtxoSpendableAfterBlocks
+	require.NoError(t, s.SetBlockHeight(spendable))
+
+	outpointOnly := spendOneOutputTx(t, parent, 0)
+	outpointOnly.Inputs[0].PreviousTxScript = nil
+	outpointOnly.Inputs[0].PreviousTxSatoshis = 0
+
+	_, spends, err := s.SpendAndCreate(ctx, outpointOnly, spendable, utxo.WithSpendOnly(),
+		utxo.WithSkipUTXOHashCheck(true), utxo.WithSkipExtendedInputs(true))
+	require.Error(t, err)
+	require.True(t, errors.Is(spends[0].Err, errors.ErrUtxoHashMismatch), "got %v", spends[0].Err)
+	require.Contains(t, spends[0].Err.Error(), "outpoint-only")
+
+	// Rejection is all-or-nothing, so the coin is still there for its rightful new owner.
+	require.Equal(t, 1, coinCount(t, s, ctx, parent))
+
+	claimed := spendOneOutputTx(t, parent, 0)
+	claimed.Inputs[0].PreviousTxSatoshis = newOutput.Satoshis
+	claimed.Inputs[0].PreviousTxScript = newOutput.LockingScript
+
+	spends, err = spendOnly(ctx, s, claimed, spendable)
+	require.NoError(t, err)
+	require.NoError(t, spends[0].Err)
+}
+
 // spendOneOutputTx builds a transaction taking one of parent's outputs, WITHOUT applying it,
 // so a test can adjust what the input claims about the coin before offering it.
 func spendOneOutputTx(t *testing.T, parent *bt.Tx, vout uint32) *bt.Tx {

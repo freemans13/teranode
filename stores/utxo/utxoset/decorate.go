@@ -19,8 +19,15 @@ import (
 // Decorate runs BEFORE the spend, so the parent is still unspent and still present --
 // and the page it lands on is the same one the imminent DELETE will touch, so the read
 // warms it rather than competing with it.
+//
+// hash_override comes with them because on a REASSIGNED coin those two fields are stale and
+// must not be handed out. ReAssignUTXO is given the new output's hash and nothing else, so the
+// row keeps the confiscated owner's satoshis and script; decorating from them would write the
+// old output onto the new owner's input, and the spend would then hash exactly those stale
+// values against the override and refuse the transaction. It costs one more column on a probe
+// that already reads the row.
 const decorateSQL = `
-SELECT k.ref, u.satoshis, u.script
+SELECT k.ref, u.satoshis, u.script, u.hash_override
   FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[]) AS k(leaf, ukey, txid, ref)
   JOIN utxo u
     ON u.leaf = k.leaf
@@ -88,15 +95,19 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	defer rows.Close()
 
 	resolved := 0
+	reassigned := 0
+
+	var firstReassigned *bt.Input
 
 	for rows.Next() {
 		var (
-			ref      int32
-			satoshis int64
-			script   []byte
+			ref          int32
+			satoshis     int64
+			script       []byte
+			hashOverride []byte
 		)
 
-		if err := rows.Scan(&ref, &satoshis, &script); err != nil {
+		if err := rows.Scan(&ref, &satoshis, &script, &hashOverride); err != nil {
 			return errors.NewStorageError("[utxoset][BatchPreviousOutputsDecorate] scan", err)
 		}
 
@@ -106,6 +117,23 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 
 		r := refs[ref]
 		in := txs[r.txIdx].Inputs[r.inpIdx]
+
+		// The coin was found, so it counts as resolved -- it is neither missing nor spent, and
+		// reporting it as a missing parent would send the caller looking for a transaction that
+		// is right there. But it is left UNDECORATED, because this store does not hold the
+		// output it was reassigned to. Only the new owner has that script, so only they can
+		// present it, and the transaction has to arrive already extended.
+		if len(hashOverride) > 0 {
+			resolved++
+			reassigned++
+
+			if firstReassigned == nil {
+				firstReassigned = in
+			}
+
+			continue
+		}
+
 		in.PreviousTxSatoshis = uint64(satoshis)
 		in.PreviousTxScript = bscript.NewFromBytes(script)
 		resolved++
@@ -113,6 +141,21 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 
 	if err := rows.Err(); err != nil {
 		return errors.NewStorageError("[utxoset][BatchPreviousOutputsDecorate] rows", err)
+	}
+
+	// Reported before the missing-parent tally, and as a processing error rather than a
+	// not-found one, because the two need opposite handling. A missing parent is something the
+	// caller can go and fetch; a reassigned coin never becomes decoratable, however long anyone
+	// waits, so the validator must turn it into "can't extend" rather than into a parent hunt.
+	//
+	// Silence is the one thing this must not be. The validator marks a transaction extended the
+	// moment this returns nil (Validator.go:1631-1645), so leaving an input with a nil script
+	// and no error would declare it validated against no script at all.
+	if reassigned > 0 {
+		parent := firstReassigned.PreviousTxIDChainHash()
+
+		return errors.NewProcessingError("[utxoset][BatchPreviousOutputsDecorate] %d of %d parent outputs were reassigned (%s:%d among them); this store holds only the hash of the new output, so the spending transaction must arrive extended",
+			reassigned, len(refs), parent, firstReassigned.PreviousTxOutIndex)
 	}
 
 	if resolved < len(refs) {
