@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
 	bloboptions "github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -1221,6 +1222,34 @@ func (u *BlockValidation) processSubtreeBatch(
 	return batch, nil
 }
 
+// quickValidateCreateLimit returns the caller concurrency for quick validation's
+// UTXO create wave (Phase 1 of createAndSpendUTXOsForBatch, before any input is
+// spent). This is a callers-in-flight limit, not a store-statements-in-flight
+// limit: each caller blocks until the batch it lands in commits, so the number
+// of create statements actually in flight to the store is (callers / batch
+// size).
+//
+// blockvalidation_quick_validate_create_concurrency, when set above 0, is used
+// directly. Otherwise the limit is derived from the UTXO store's own batcher
+// settings: StoreBatcherSize * BatcherMaxConcurrent, so every batcher worker
+// can have a full batch of callers queued behind it, floored at
+// StoreBatcherSize * 8 for a store whose BatcherMaxConcurrent is 0 (unbounded
+// workers) — the flat multiplier the derivation replaces.
+func quickValidateCreateLimit(bv *settings.BlockValidationSettings, store *settings.UtxoStoreSettings) int {
+	if bv.QuickValidateCreateConcurrency > 0 {
+		return bv.QuickValidateCreateConcurrency
+	}
+
+	derived := store.StoreBatcherSize * store.BatcherMaxConcurrent
+	floor := store.StoreBatcherSize * 8
+
+	if derived > floor {
+		return derived
+	}
+
+	return floor
+}
+
 // createAndSpendUTXOsForBatch creates and spends UTXOs for all transactions in a batch.
 // This is used by quick validation for checkpoint-verified blocks.
 //
@@ -1256,10 +1285,14 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	// Phase 1: Create UTXOs in parallel, collecting any that already exist
 	createG, createCtx := errgroup.WithContext(ctx)
-	// Set concurrency to 8x StoreBatcherSize to allow sufficient parallelism while the
-	// UTXO store batches operations internally. This multiplier balances throughput with
-	// resource usage, allowing multiple batches to be in flight simultaneously.
-	util.SafeSetLimit(u.logger, createG, u.settings.UtxoStore.StoreBatcherSize*8)
+	// This limit bounds callers, not store statements: each caller blocks until the batch it
+	// lands in commits, so statements actually in flight to the store is (callers / batch size).
+	// A flat 8x StoreBatcherSize therefore capped every store at 8 statements in flight no
+	// matter how many batcher workers it runs — with a 50-row batch and 64 workers that is 8
+	// statements where the store could sustain far more. quickValidateCreateLimit derives the
+	// caller count from the store's own batcher settings instead, so every worker can have a
+	// full batch of callers queued behind it.
+	util.SafeSetLimit(u.logger, createG, quickValidateCreateLimit(&u.settings.BlockValidation, &u.settings.UtxoStore))
 
 	// Track transactions that already exist so we can update their mined info
 	var existingTxsMu sync.Mutex
