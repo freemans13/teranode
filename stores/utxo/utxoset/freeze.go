@@ -188,16 +188,22 @@ func reassignedHashMismatch(sp *utxo.Spend, hashOverride []byte) error {
 // liveSpendResponse turns one live coin's flags into the answer the interface reports.
 //
 // The tests are written as successive overrides rather than as an if/else chain, and the ORDER
-// IS THE PRECEDENCE, taken from the aerospike store so three implementations answer the same
-// question the same way. Least specific first: not yet spendable, then immobilised by the alert
+// IS THE PRECEDENCE. Least specific first: not yet spendable, then immobilised by the alert
 // system, then lost a double-spend race, then held by conflict resolution. A coin can be
 // several of these at once and the caller gets one status, so which one it gets is a contract
 // rather than an implementation detail.
 //
+// The order is AEROSPIKE'S, not a consensus of both references. The two disagree about one
+// thing and only one: aerospike applies the spendable-until hold first, so conflicting and
+// locked override it, while the sql store applies it LAST (sql.go:3545-3563), so a coin that is
+// both held and conflicting reports IMMATURE there and CONFLICTING here. Aerospike is followed
+// because it keeps the most specific state, and because it leaves this store's own pre-existing
+// frozen-over-immature answer unchanged.
+//
 // A frozen coin keeps its SENTINEL SPENDER even when a later test overrides the status. That is
 // not tidiness: conflict resolution reads the spending data to recognise a frozen coin, and
 // dropping it because the coin is also conflicting would hide the freeze from the one caller
-// that acts on it. Both reference stores keep it for the same reason.
+// that acts on it. Both reference stores keep it for the same reason, and on that they agree.
 func liveSpendResponse(flags int16, spendableFrom int32, height uint32) *utxo.SpendResponse {
 	resp := &utxo.SpendResponse{Status: int(utxo.Status_OK)}
 

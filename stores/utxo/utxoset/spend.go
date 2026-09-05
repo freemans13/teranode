@@ -48,8 +48,13 @@ SELECT k.vin, j.spending_txid, j.satoshis, j.script, j.hash_override
   FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[]) AS k(leaf, ukey, txid, vin)
   JOIN spend_journal j ON j.ukey = k.ukey AND j.txid = k.txid`
 
+// hash_override travels with the flags because the classifier needs it to tell one hold from
+// another. spendable_from carries both coinbase maturity and the alert system's reassignment
+// delay, and the two get different errors; reassignSQL is the only writer of an override on a
+// live coin and writes both columns together, so its presence is what says which hold this is.
+// The column costs nothing: the index probe already reads the whole row.
 const classifySQL = `
-SELECT k.vin, u.flags, u.spendable_from
+SELECT k.vin, u.flags, u.spendable_from, u.hash_override
   FROM unnest($1::smallint[], $2::uuid[], $3::bytea[], $4::int[]) AS k(leaf, ukey, txid, vin)
   JOIN utxo u ON u.leaf = k.leaf AND u.ukey = k.ukey AND u.txid = k.txid`
 

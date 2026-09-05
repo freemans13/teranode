@@ -1,8 +1,10 @@
 package utxoset
 
 import (
+	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
@@ -67,4 +69,84 @@ func TestUnspendOfAnAlreadyRestoredCoinIsANoOp(t *testing.T) {
 	require.NoError(t, s.Unspend(ctx, fakeSpends),
 		"re-unspending an already-restored coin must be a no-op even under a different claimed spender")
 	require.Equal(t, 1, coinCount(t, s, ctx, parent), "a replayed restore must not create a second coin")
+}
+
+// coinFlagsOf reads the flag byte off one live coin, located exactly.
+func coinFlagsOf(t *testing.T, s *Store, ctx context.Context, tx *bt.Tx, vout uint32) int16 {
+	t.Helper()
+
+	h := tx.TxIDChainHash()
+
+	var flags int16
+	require.NoError(t, s.pool.QueryRow(ctx,
+		`SELECT flags FROM utxo WHERE leaf = $1 AND ukey = $2 AND txid = $3`,
+		LeafFor(h[:]), Pack(h[:], vout), h[:]).Scan(&flags))
+
+	return flags
+}
+
+// TestUnspendLocksACoinItFoundAlreadyLive is the hold half of the restore, and it was missing
+// for exactly the coins conflict resolution needs it for.
+//
+// Unspend(spends, true) means "put these coins back AND hold them", and the hold is what stops
+// anyone else spending a contested parent while the resolution decides which child gets it. The
+// flag was ORed only into rows the restore INSERTED, so a parent whose coin was already live --
+// which is what a crash between the unspend and the lock leaves, and exactly the case
+// SetConflicting now reports -- came back from step 2 unheld, stayed spendable for the whole of
+// steps 2 to 5, and then had step 5's SetLocked(false) applied to it anyway. If it had been
+// locked for some unrelated reason, that step dropped the unrelated lock too.
+//
+// The sql reference locks the transaction row unconditionally, which is why it has never had
+// this gap.
+func TestUnspendLocksACoinItFoundAlreadyLive(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	// A block-path parent: its coin is live and nothing has ever spent it, so there is no
+	// journal row for the restore to consume.
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	// The child that contests it, marked conflicting. SetConflicting names the parent because
+	// its coin is live, which is the record ProcessConflicting hands to Unspend at step 2.
+	child := spendOutput(t, parent, 0, 1)
+	_, err = s.Create(ctx, child, 700_101)
+	require.NoError(t, err)
+
+	affected, _, err := s.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
+	require.NoError(t, err)
+	require.Len(t, affected, 1, "the live parent must be named, or there is nothing to hold")
+
+	require.NoError(t, s.Unspend(ctx, affected, true))
+
+	require.Equal(t, 1, coinCount(t, s, ctx, parent), "nothing was restored, and nothing duplicated")
+	require.NotZero(t, coinFlagsOf(t, s, ctx, parent, 0)&FlagLocked,
+		"a coin the restore found already live must still be held")
+
+	// And the driver's step 5 releases it, which is the whole point of naming it.
+	require.NoError(t, s.SetLocked(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, false))
+	require.Zero(t, coinFlagsOf(t, s, ctx, parent, 0)&FlagLocked)
+}
+
+// TestUnspendWithoutTheHoldLeavesALiveCoinAlone is the other half: Unspend(spends) with no hold
+// asked for must not invent one. A reorg restore has no business locking anything.
+func TestUnspendWithoutTheHoldLeavesALiveCoinAlone(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	parent := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, parent, 700_100, utxo.WithMinedBlockInfo(
+		utxo.MinedBlockInfo{BlockID: 42, BlockHeight: 700_100, OnLongestChain: true}))
+	require.NoError(t, err)
+
+	child := spendOutput(t, parent, 0, 1)
+	_, err = s.Create(ctx, child, 700_101)
+	require.NoError(t, err)
+
+	affected, _, err := s.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
+	require.NoError(t, err)
+	require.Len(t, affected, 1)
+
+	require.NoError(t, s.Unspend(ctx, affected, false))
+	require.Zero(t, coinFlagsOf(t, s, ctx, parent, 0)&FlagLocked)
 }

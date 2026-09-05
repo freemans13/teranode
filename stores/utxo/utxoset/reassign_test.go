@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -339,4 +340,86 @@ func spendOneOutputTx(t *testing.T, parent *bt.Tx, vout uint32) *bt.Tx {
 	})
 
 	return child
+}
+
+// mkCoinbase builds a real coinbase: the all-zero previous txid with the 0xffffffff index, so
+// go-bt's IsCoinbase() answers true and the create path stamps FlagCoinbase and the maturity
+// height on the coin.
+func mkCoinbase(t *testing.T, sats uint64) *bt.Tx {
+	t.Helper()
+
+	in := &bt.Input{
+		PreviousTxOutIndex: 0xffffffff,
+		SequenceNumber:     0xffffffff,
+		UnlockingScript:    bscript.NewFromBytes([]byte{0x04, 0xff, 0xff, 0x00, 0x1d}),
+	}
+	require.NoError(t, in.PreviousTxIDAdd(&chainhash.Hash{}))
+
+	tx := bt.NewTx()
+	tx.Inputs = []*bt.Input{in}
+	tx.AddOutput(&bt.Output{Satoshis: sats, LockingScript: newOwnerScript(t)})
+
+	require.True(t, tx.IsCoinbase())
+
+	return tx
+}
+
+// TestAReassignedCoinbaseInsideItsDelayIsFrozenNotImmature.
+//
+// One column, spendable_from, carries two different holds, and the spend classifier has to say
+// which one refused the coin because the two are acted on differently: the shared rollback
+// predicate lists ErrFrozen and does not list ErrTxCoinbaseImmature, so a multi-input
+// transaction failing on a held input strands its siblings marked spent unless the alert
+// system's hold is reported as frozen.
+//
+// A reassigned coinbase is where a flag test alone gets it wrong. FlagCoinbase is still set --
+// the coin was minted by one -- but reassignSQL has overwritten spendable_from with the
+// reassignment delay, so the maturity window it used to hold is gone and the surviving hold is
+// the alert system's. hash_override is what says so, because reassignSQL is the only writer of
+// one on a live coin and writes both columns together.
+func TestAReassignedCoinbaseInsideItsDelayIsFrozenNotImmature(t *testing.T) {
+	s, ctx := newTestStore(t)
+	tSettings := settings.NewSettings()
+
+	require.NoError(t, s.SetBlockHeight(100))
+
+	cb := mkCoinbase(t, 5_000)
+	_, err := s.Create(ctx, cb, 100)
+	require.NoError(t, err)
+
+	old := &utxo.Spend{TxID: cb.TxIDChainHash(), Vout: 0}
+	newOutput := &bt.Output{Satoshis: 5_000, LockingScript: newOwnerScript(t)}
+
+	newHash, err := util.UTXOHashFromOutput(cb.TxIDChainHash(), newOutput, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, s.FreezeUTXOs(ctx, []*utxo.Spend{old}, tSettings))
+	require.NoError(t, s.ReAssignUTXO(ctx, old,
+		&utxo.Spend{TxID: old.TxID, Vout: 0, UTXOHash: newHash}, tSettings))
+
+	// Past coinbase maturity, so the only hold left is the reassignment's. Spending it must be
+	// refused as frozen, not as an immature coinbase.
+	spendHeight := uint32(100 + tSettings.ChainCfgParams.CoinbaseMaturity + 1)
+	spends, err := spendOnly(ctx, s, spendOneOutputTx(t, cb, 0), spendHeight)
+	require.Error(t, err)
+	require.True(t, errors.Is(spends[0].Err, errors.ErrFrozen), "got %v", spends[0].Err)
+	require.False(t, errors.Is(spends[0].Err, errors.ErrTxCoinbaseImmature),
+		"the maturity window was overwritten by the reassignment; only the alert system's hold is left")
+}
+
+// TestAnOrdinaryCoinbaseInsideItsMaturityIsStillImmature pins the branch the test above must
+// not have taken over: with no reassignment there is no override, and the coinbase answer is
+// the right one.
+func TestAnOrdinaryCoinbaseInsideItsMaturityIsStillImmature(t *testing.T) {
+	s, ctx := newTestStore(t)
+
+	require.NoError(t, s.SetBlockHeight(100))
+
+	cb := mkCoinbase(t, 5_000)
+	_, err := s.Create(ctx, cb, 100)
+	require.NoError(t, err)
+
+	spends, err := spendOnly(ctx, s, spendOneOutputTx(t, cb, 0), 100)
+	require.Error(t, err)
+	require.True(t, errors.Is(spends[0].Err, errors.ErrTxCoinbaseImmature), "got %v", spends[0].Err)
 }

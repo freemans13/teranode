@@ -119,7 +119,9 @@ ON CONFLICT DO NOTHING`
 //
 // Handing back a record for a coin that is already live is safe here because Unspend counts it:
 // its live_before arm makes a restore of an already-restored coin a no-op success rather than a
-// missing-coin failure, so the extra record costs one probe and changes nothing else. The
+// missing-coin failure, and its held arm puts the caller's hold on such a coin, so the record
+// costs one probe and is acted on exactly as one with a journal row would be.
+//
 // The probe is a LATERAL with an OFFSET 0 fence rather than a plain EXISTS, and the fence is
 // the whole difference. Written as `OR EXISTS (SELECT 1 FROM utxo ...)` the planner is free to
 // pull the subquery up and hash it, and it does: measured on this schema at 40,000 coins across

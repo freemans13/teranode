@@ -429,9 +429,10 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 			k             int32
 			flags         int16
 			spendableFrom int32
+			hashOverride  []byte
 		)
 
-		if err := rows.Scan(&k, &flags, &spendableFrom); err != nil {
+		if err := rows.Scan(&k, &flags, &spendableFrom, &hashOverride); err != nil {
 			rows.Close()
 			return errors.NewStorageError("[utxoset][Spend] classify scan", err)
 		}
@@ -465,20 +466,32 @@ func (s *Store) classifyPlanMisses(ctx context.Context, q pgx.Tx, p *spendPlan, 
 			// would be wrong. One column carries two different holds and they get different
 			// errors, because their callers act on them differently.
 			//
-			// A coinbase inside its maturity window is ErrTxCoinbaseImmature, which says the
-			// coin becomes spendable at a known height and nothing is wrong with it.
+			// THE REASSIGNMENT DELAY IS TESTED FIRST, and the order matters because a
+			// reassigned COINBASE would otherwise be answered by the wrong branch. The alert
+			// system's hold is ErrFrozen: it must not be reported as merely locked, as a plain
+			// processing error, or as coinbase immaturity, because the shared rollback
+			// predicate lists ErrFrozen and lists none of those. Get it wrong and a
+			// multi-input transaction that fails on one held input strands its other inputs
+			// marked spent by a transaction that can never be accepted. The sql store carries
+			// a test pinning the classification (spendable_in_frozen_test.go).
 			//
-			// Anything else in this column is the alert system's reassignment delay, and it
-			// is ErrFrozen. It must NOT be reported as merely locked or as a plain processing
-			// error: both reference stores classify it as frozen, and the sql store carries a
-			// test pinning that (spendable_in_frozen_test.go), because the shared rollback
-			// predicate lists ErrFrozen and not the others. Get it wrong and a multi-input
-			// transaction that fails on one held input strands its other inputs marked spent
-			// by a transaction that can never be accepted.
-			if flags&FlagCoinbase != 0 {
+			// hash_override is what identifies the hold as a reassignment's. reassignSQL is
+			// the only writer of it on a live coin, and it writes hash_override and
+			// spendable_from in the same statement, overwriting whatever maturity the coin
+			// carried before. So on a coin with an override the surviving hold IS the reassign
+			// delay, whether or not the coin began life as a coinbase.
+			//
+			// Everything left is a coinbase inside its maturity window, which is
+			// ErrTxCoinbaseImmature: the coin becomes spendable at a known height and nothing
+			// is wrong with it.
+			switch {
+			case len(hashOverride) > 0:
+				sp.Err = errors.NewUtxoFrozenError("[utxoset] utxo %s:%d was reassigned and is held until height %d (current %d)",
+					sp.TxID, sp.Vout, spendableFrom, p.heights[k])
+			case flags&FlagCoinbase != 0:
 				sp.Err = errors.NewTxCoinbaseImmatureError("[utxoset] coinbase %s:%d not spendable until height %d (current %d)",
 					sp.TxID, sp.Vout, spendableFrom, p.heights[k])
-			} else {
+			default:
 				sp.Err = errors.NewUtxoFrozenError("[utxoset] utxo %s:%d is held until height %d (current %d)",
 					sp.TxID, sp.Vout, spendableFrom, p.heights[k])
 			}
@@ -679,11 +692,11 @@ SELECT k.vin
 // asked only here, for the inputs nothing else could explain: no live coin, and no journal row
 // naming a spender. That is the error path, never the hot one.
 //
-// ONE CASE STAYS AMBIGUOUS, and it is reported as spent rather than missing. A parent whose
-// membership window has retired, whose coins are all gone, and whose spend is older than
-// journal retention leaves no trace here at all, so it is indistinguishable from one that
-// never arrived. Answering "not found" there is the conservative choice: it asks the caller to
-// fetch a parent rather than to condemn a transaction as a double spend on no evidence.
+// ONE CASE STAYS AMBIGUOUS. A parent whose membership window has retired, whose coins are all
+// gone, and whose spend is older than journal retention leaves no trace here at all, so it is
+// indistinguishable from one that never arrived, and it is reported as NOT FOUND like the rest.
+// That is the conservative choice: it asks the caller to fetch a parent rather than to condemn a
+// transaction as a double spend on no evidence.
 func (s *Store) nameUnknownParents(ctx context.Context, q pgx.Tx, p *spendPlan) error {
 	var (
 		leaves []int16

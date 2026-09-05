@@ -50,7 +50,24 @@ import (
 // could otherwise produce a duplicate live row for one outpoint, which is counterfeit.
 //
 // $4 carries the flags to OR in, so a caller asking for flagAsLocked gets the coin back
-// already locked rather than briefly spendable.
+// already locked rather than briefly spendable. IT REACHES BOTH OUTCOMES, the coin this call
+// restores and the coin it found already live, and the second arm was missing.
+//
+// "Restore these coins AND hold them" is one instruction, and the hold is what stops anyone
+// else spending a contested parent while conflict resolution decides which child gets it. ORing
+// the flag only into the rows the INSERT produced meant a parent whose coin was already live
+// came back unheld -- which is exactly the parent SetConflicting now names, and exactly the
+// state a crash between the unspend and the lock leaves behind. That parent stayed spendable
+// for the whole of the resolution and then had the driver's closing SetLocked(false) applied to
+// it anyway, dropping any unrelated lock it happened to carry. The sql reference locks the
+// transaction row unconditionally, which is why it has never had this gap.
+//
+// The locking arm is gated on $4 being non-zero, so an ordinary reorg restore, which asks for no
+// hold, issues no update. It matches the live coin by its exact (leaf, ukey) with the full
+// 32-byte txid rechecked -- the packed-key bound schema.go requires of every by-txid coin
+// access -- and it cannot collide with the INSERT above: every CTE here reads the same
+// pre-statement snapshot, so the rows this arm can see are precisely the ones `restored`
+// excluded itself from touching.
 //
 // The restored coin's block facts are RE-RESOLVED, in three preferences, and the order is the
 // immutability rule rather than a convenience.
@@ -103,16 +120,42 @@ restored AS (
 ),
 live_before AS (
     -- Requested keys that already had a live coin before this statement touched
-    -- anything -- a prior Unspend's work, seen here because every CTE in one WITH
-    -- query reads the same pre-statement snapshot regardless of execution order.
-    -- Ownership (stxid) is deliberately not checked: the coin is unspent either
-    -- way, so it does not matter whose undo put it there.
-    SELECT i.ukey FROM items i
-     WHERE EXISTS (
-           SELECT 1 FROM utxo u
-            WHERE u.leaf = (get_byte(i.ptxid, 0) & 7)::smallint
-              AND u.ukey = i.ukey
-              AND u.txid = i.ptxid)
+    -- anything -- a prior Unspend's work, or a coin nobody ever spent, seen here
+    -- because every CTE in one WITH query reads the same pre-statement snapshot
+    -- regardless of execution order. Ownership (stxid) is deliberately not checked:
+    -- the coin is unspent either way, so it does not matter whose undo put it there.
+    --
+    -- The keys drive a LATERAL with an OFFSET 0 fence, the shape stampCoinsSQL uses
+    -- and for the identical reason. Written as a plain WHERE EXISTS subquery,
+    -- the planner hashes the whole coin table against the keys: measured on this
+    -- schema at 40,000 coins across all eight partitions with 500 keys, a Hash Semi
+    -- Join over a Seq Scan of every one of utxo_p0..p7. LIMIT 1 keeps one row per
+    -- requested key, so the count below still partitions the request cleanly.
+    SELECT c.leaf, c.ukey, k.ptxid
+      FROM unnest($1::uuid[], $2::bytea[]) AS k(ukey, ptxid)
+     CROSS JOIN LATERAL (
+       SELECT u.leaf, u.ukey
+         FROM utxo u
+        WHERE u.leaf = (get_byte(k.ptxid, 0) & 7)::smallint
+          AND u.ukey = k.ukey
+          AND u.txid = k.ptxid
+        LIMIT 1 OFFSET 0
+     ) AS c
+),
+held AS (
+    -- The hold on the coins this call did not have to restore. Same instruction, same flags,
+    -- other outcome. No-op when the caller asked for no flags.
+    --
+    -- It matches on the exact (leaf, ukey) the fenced read above returned, which is the other
+    -- half of stampCoinsSQL's shape: the read finds the rows by index and the update names
+    -- them, rather than the update searching for them itself.
+    UPDATE utxo u
+       SET flags = u.flags | $4::smallint
+      FROM live_before b
+     WHERE $4::smallint <> 0
+       AND u.leaf = b.leaf
+       AND u.ukey = b.ukey
+       AND u.txid = b.ptxid
 )
 SELECT (SELECT count(*) FROM restored), (SELECT count(*) FROM items), (SELECT count(*) FROM live_before)`
 
@@ -175,8 +218,11 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		// The usual causes are a journal partition already reclaimed (the spend is older
 		// than retention), or a spender mismatch meaning the coin was re-spent by a
 		// different transaction in the meantime. alreadyLive covers the third, benign
-		// cause -- a replayed Unspend on a coin a previous call already restored -- so
-		// it is never itself part of what is missing here.
+		// cause -- a replayed Unspend on a coin a previous call already restored, or one
+		// nobody ever spent -- so it is never itself part of what is missing here. Those
+		// coins are a full success rather than a tolerated miss: with flagAsLocked the
+		// `held` arm above has just put the hold on them, so the caller gets the coin
+		// unspent and held, which is the whole instruction.
 		return errors.NewProcessingError("[utxoset][Unspend] restored %d, already live %d, of %d requested; the rest are beyond journal retention or were re-spent by a different transaction",
 			restored, alreadyLive, requested)
 	}
