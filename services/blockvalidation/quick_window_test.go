@@ -302,9 +302,16 @@ func TestQuickWindow_CommitFailureFailsTheEntryAndAbortsSuccessors(t *testing.T)
 	e1.StoreDone()
 	e2.StoreDone()
 
-	require.Error(t, e1.WaitCommitted(ctx))
+	err = e1.WaitCommitted(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "commit failed at 1", "the head's error must wrap the committer's own error")
+
 	err = e2.WaitCommitted(ctx)
 	require.True(t, errors.IsTransientLocalError(err))
+
+	c.mu.Lock()
+	require.Empty(t, c.order, "nothing commits after the head's own commit call failed")
+	c.mu.Unlock()
 }
 
 func TestQuickWindow_IDAssignedChainOrdersSuccessors(t *testing.T) {
@@ -351,4 +358,148 @@ func TestQuickWindow_AwaitParentReturnsWhenTheParentIsAdmitted(t *testing.T) {
 	e1, _, err := w.Admit(ctx, blocks[0])
 	require.NoError(t, err)
 	require.Same(t, e1, <-found)
+}
+
+// Leaving an entry before it has ever reached StoreDone is a caller giving up early instead of
+// calling Fail. The window must fail-close it (and everything behind it) rather than silently
+// erase it from the ordered chain, or the committer would wedge waiting on channels nothing
+// would ever close again.
+func TestQuickWindow_LeaveBeforeCommitAbortsSuccessorsAndFreesTheWindow(t *testing.T) {
+	c := &recordingCommitter{}
+	w, cancel := newTestWindow(t, 2, c)
+	defer cancel()
+
+	blocks := chainOf(t, 2)
+	ctx := context.Background()
+
+	e1, _, err := w.Admit(ctx, blocks[0])
+	require.NoError(t, err)
+	e2, _, err := w.Admit(ctx, blocks[1])
+	require.NoError(t, err)
+
+	// e1 never calls StoreDone; its owner bails out and leaves directly.
+	e1.Leave()
+
+	err = e2.WaitCommitted(ctx)
+	require.Error(t, err)
+	require.True(t, errors.IsTransientLocalError(err), "an aborted successor returns a service error, got %v", err)
+	e2.Leave()
+
+	c.mu.Lock()
+	require.Empty(t, c.order, "nothing commits once the head left before committing")
+	c.mu.Unlock()
+
+	// The window is empty again and admits fresh.
+	_, _, err = w.Admit(ctx, blocks[0])
+	require.NoError(t, err)
+}
+
+// failLocked cancels the entry's context before closing committed, so a caller waiting on
+// e.Context() races a select between the two: with no non-blocking re-check, Go picks between
+// two simultaneously-ready channels at random, and roughly half the calls would see a bare
+// context.Canceled instead of the recorded service error. 200 iterations makes that failure
+// mode from the old code (were it still present) all but certain to show up.
+func TestQuickWindow_WaitCommittedNeverReturnsBareContextCanceledAfterFail(t *testing.T) {
+	c := &recordingCommitter{}
+	w, cancel := newTestWindow(t, 1, c)
+	defer cancel()
+
+	blocks := chainOf(t, 1)
+	ctx := context.Background()
+
+	e1, _, err := w.Admit(ctx, blocks[0])
+	require.NoError(t, err)
+
+	// A service error, not a processing error: WaitCommitted returns the head's own recorded
+	// error verbatim, so the error must itself already classify as a transient local fault for
+	// the assertions below to be meaningful.
+	e1.Fail(errors.NewServiceError("boom"))
+
+	for i := 0; i < 200; i++ {
+		err := e1.WaitCommitted(e1.Context())
+		require.Error(t, err)
+		require.True(t, errors.IsTransientLocalError(err), "iteration %d: got %v", i, err)
+		require.False(t, errors.Is(err, context.Canceled), "iteration %d: got a bare context.Canceled", i)
+	}
+}
+
+// Leave releases the retained id, not just the ordered-chain slot: RegisterBatch's duplicate
+// check must stop seeing a txid the moment its owner has left.
+func TestQuickWindow_LeaveClearsRegistered(t *testing.T) {
+	c := &recordingCommitter{}
+	w, cancel := newTestWindow(t, 2, c)
+	defer cancel()
+
+	blocks := chainOf(t, 1)
+	ctx := context.Background()
+
+	e1, _, err := w.Admit(ctx, blocks[0])
+	require.NoError(t, err)
+
+	txid := chainhash.HashH([]byte("gone-after-leave"))
+	_, err = e1.RegisterBatch([]chainhash.Hash{txid})
+	require.NoError(t, err)
+	require.True(t, w.Registered(&txid))
+
+	e1.StoreDone()
+	require.NoError(t, e1.WaitCommitted(ctx))
+	e1.Leave()
+
+	require.False(t, w.Registered(&txid), "Leave must release the retained id")
+}
+
+// A head failing concurrently with a fourth block's Admit blocked at depth must resolve
+// cleanly: the abort frees the ordered-chain slots the blocked Admit is waiting on, nothing
+// commits, and there is no deadlock between the committer, the failing goroutine and the
+// blocked admitter.
+func TestQuickWindow_ConcurrentHeadFailureAndBlockedAdmitResolveWithoutDeadlock(t *testing.T) {
+	c := &recordingCommitter{}
+	w, cancel := newTestWindow(t, 3, c)
+	defer cancel()
+
+	blocks := chainOf(t, 4)
+	ctx := context.Background()
+
+	e1, _, err := w.Admit(ctx, blocks[0])
+	require.NoError(t, err)
+	e2, _, err := w.Admit(ctx, blocks[1])
+	require.NoError(t, err)
+	e3, _, err := w.Admit(ctx, blocks[2])
+	require.NoError(t, err)
+
+	admitted := make(chan *windowEntry, 1)
+	go func() {
+		e4, _, err := w.Admit(ctx, blocks[3])
+		require.NoError(t, err)
+		admitted <- e4
+	}()
+
+	select {
+	case <-admitted:
+		t.Fatal("fourth block admitted while the window was full at depth 3")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	go e1.Fail(errors.NewProcessingError("boom"))
+
+	require.Error(t, e1.WaitCommitted(ctx))
+	require.Error(t, e2.WaitCommitted(ctx))
+	require.Error(t, e3.WaitCommitted(ctx))
+
+	var e4 *windowEntry
+	select {
+	case e4 = <-admitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fourth block was not admitted after the head failed")
+	}
+	require.NotNil(t, e4)
+
+	c.mu.Lock()
+	require.Empty(t, c.order, "nothing committed once the head failed")
+	c.mu.Unlock()
+
+	e1.Leave()
+	e2.Leave()
+	e3.Leave()
+	e4.Leave()
 }

@@ -122,7 +122,14 @@ func newQuickWindow(logger ulogger.Logger, depth int, callerLimit int, commit fu
 }
 
 func (w *quickWindow) Enabled() bool { return w != nil && w.depth >= 1 }
-func (w *quickWindow) Depth() int    { return w.depth }
+
+func (w *quickWindow) Depth() int {
+	if w == nil {
+		return 0
+	}
+
+	return w.depth
+}
 
 // Start runs the committer until ctx is cancelled.
 func (w *quickWindow) Start(ctx context.Context) {
@@ -145,6 +152,10 @@ func (w *quickWindow) Admit(ctx context.Context, block *model.Block) (*windowEnt
 		return e, true, nil
 	}
 
+	if w.depth < 1 {
+		return nil, false, errors.NewServiceError("[quickWindow][%s] window depth is %d; quick window is disabled", hash.String(), w.depth)
+	}
+
 	for len(w.entries) >= w.depth {
 		if err := w.waitLocked(ctx); err != nil {
 			return nil, false, err
@@ -160,6 +171,7 @@ func (w *quickWindow) Admit(ctx context.Context, block *model.Block) (*windowEnt
 	if n := len(w.entries); n > 0 {
 		tail := w.entries[n-1]
 		if !tail.hash.IsEqual(block.Header.HashPrevBlock) {
+			w.logger.Warnf("[quickWindow][%s] admission refused: parent %s is not the window tail %s at height %d", hash.String(), block.Header.HashPrevBlock.String(), tail.hash.String(), tail.height)
 			return nil, false, errors.NewServiceError("[quickWindow][%s] parent %s is not the window tail %s at height %d", hash.String(), block.Header.HashPrevBlock.String(), tail.hash.String(), tail.height)
 		}
 
@@ -184,7 +196,9 @@ func (w *quickWindow) Admit(ctx context.Context, block *model.Block) (*windowEnt
 
 	w.entries = append(w.entries, e)
 	w.byHash[hash] = e
-	prometheusBlockValidationQuickWindowDepth.Set(float64(len(w.entries)))
+	// The gauge means "admitted and not yet left", which is len(byHash): an entry that has
+	// committed or aborted stays there, holding its dedup slot, until its owner calls Leave.
+	prometheusBlockValidationQuickWindowDepth.Set(float64(len(w.byHash)))
 	w.cond.Broadcast()
 	w.kick()
 
@@ -291,6 +305,12 @@ func (w *quickWindow) run(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
+			// Every entry still in the ordered chain is parked on WaitCommitted with nothing
+			// left to close its committed channel once this goroutine stops. Abort the whole
+			// remaining chain so nothing waits forever past shutdown.
+			w.logger.Warnf("[quickWindow][%s] shutting down: aborting in-flight window from height %d", head.hash.String(), head.height)
+			w.abortFrom(head, "shutdown")
+
 			return
 		case <-head.storeDone:
 			if head.failed.Load() {
@@ -303,6 +323,7 @@ func (w *quickWindow) run(ctx context.Context) {
 				// (CAS the failed flag, cancel, fail the head's own gates, close committed).
 				// Setting head.failed here directly would make that later CompareAndSwap a
 				// no-op and leave head.committed unclosed forever.
+				w.logger.Warnf("[quickWindow][%s] commit failed at height %d: %v", head.hash.String(), head.height, err)
 				head.recordErr(err)
 				w.abortFrom(head, "commit_failed")
 
@@ -341,6 +362,9 @@ func (w *quickWindow) pop(e *windowEntry) {
 			break
 		}
 	}
+
+	// A committed entry can free a slot below depth for an Admit parked on w.cond.Wait.
+	w.cond.Broadcast()
 }
 
 // abortFrom fails every entry from failed to the tail, records the abort before signalling,
@@ -366,20 +390,50 @@ func (w *quickWindow) abortFrom(failed *windowEntry, headCause string) {
 
 	doomed := append([]*windowEntry(nil), w.entries[idx:]...)
 	w.entries = w.entries[:idx]
+	// Freed slots (and, for the tail entries, an emptied window) can unblock an Admit parked
+	// on w.cond.Wait below depth.
+	w.cond.Broadcast()
 	w.mu.Unlock()
 
 	for i, e := range doomed {
 		if i == 0 {
+			w.logger.Warnf("[quickWindow][%s] head failed at height %d, cause=%s, err=%v; aborting window", e.hash.String(), e.height, headCause, e.recordedErr())
 			e.failLocked(nil, headCause)
 			continue
 		}
 
+		w.logger.Debugf("[quickWindow][%s] aborting at height %d: predecessor %s at height %d failed", e.hash.String(), e.height, failed.hash.String(), failed.height)
 		e.failLocked(errors.NewServiceError("[quickWindow][%s] aborted at height %d: predecessor %s at height %d failed", e.hash.String(), e.height, failed.hash.String(), failed.height), "predecessor_failed")
 	}
 }
 
-// leave removes e from the window entirely and frees its retained ids and its dedup slot.
+// leave removes e from the window entirely, frees its retained ids and its dedup slot, drops
+// the parent link any still-resident child holds to it, and releases the block, txids and
+// gates it pinned.
+//
+// An entry still queued for commit or abort when its owner calls Leave has not gone through
+// the normal StoreDone-then-commit or Fail path (a bug, or a caller giving up early instead of
+// calling Fail). Erasing it from the ordered chain in that state would leave the committer, if
+// it is parked on this entry as head, waiting on channels nothing will ever close again — the
+// whole window would wedge. So it is fail-closed first, exactly as a genuine failure would be.
 func (w *quickWindow) leave(e *windowEntry) {
+	w.mu.Lock()
+	stillQueued := false
+
+	for _, x := range w.entries {
+		if x == e {
+			stillQueued = true
+			break
+		}
+	}
+	w.mu.Unlock()
+
+	if stillQueued {
+		w.logger.Warnf("[quickWindow][%s] left before commit at height %d; aborting window from here", e.hash.String(), e.height)
+		e.recordErr(errors.NewServiceError("[quickWindow][%s] left before commit at height %d", e.hash.String(), e.height))
+		w.abortFrom(e, "left_before_commit")
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -392,6 +446,16 @@ func (w *quickWindow) leave(e *windowEntry) {
 
 	delete(w.byHash, e.hash)
 
+	// A predecessor that has left has already closed registered/idAssigned/committed, so a
+	// child still pointing to it loses nothing by having the link cleared — and without this,
+	// every entry would keep pinning the one before it back to the last time the window was
+	// empty, which under continuous IBD is never.
+	for _, x := range w.byHash {
+		if x.parent == e {
+			x.parent = nil
+		}
+	}
+
 	e.gatesMu.Lock()
 	for _, id := range e.txids {
 		if w.retained[id] == e {
@@ -402,18 +466,52 @@ func (w *quickWindow) leave(e *windowEntry) {
 			delete(w.open, id)
 		}
 	}
+	// Nothing still reachable needs these: children no longer point at e, and its own gates
+	// have already been closed (either by a normal commit's caller or by failLocked above).
+	e.block = nil
+	e.txids = nil
+	e.gates = nil
 	e.gatesMu.Unlock()
 
-	prometheusBlockValidationQuickWindowDepth.Set(float64(len(w.entries)))
+	// The gauge means "admitted and not yet left".
+	prometheusBlockValidationQuickWindowDepth.Set(float64(len(w.byHash)))
 	w.cond.Broadcast()
 	w.kick()
 }
 
 // ---- windowEntry ----
 
+// closed reports whether ch is already closed, without blocking.
+func closed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// wrapCtxErr turns a context error into a local service fault. A caller waiting on this window
+// must always see a transient local error, never a bare context.Canceled/context.DeadlineExceeded
+// (errors.IsTransientLocalError does not recognise either as one).
+func wrapCtxErr(hash chainhash.Hash, ctx context.Context) error {
+	return errors.NewServiceError("[quickWindow][%s] wait cancelled: %v", hash.String(), ctx.Err())
+}
+
 func (e *windowEntry) Block() *model.Block      { return e.block }
 func (e *windowEntry) Height() uint32           { return e.height }
 func (e *windowEntry) Context() context.Context { return e.ctx }
+
+// parentEntry reads the current predecessor link under the window's lock: leave clears a
+// child's link to its parent the moment the parent itself leaves, so this is the only safe way
+// to read it. A predecessor that has left has already closed registered/idAssigned/committed,
+// so treating a cleared link as "no predecessor" loses nothing.
+func (e *windowEntry) parentEntry() *windowEntry {
+	e.w.mu.Lock()
+	defer e.w.mu.Unlock()
+
+	return e.parent
+}
 
 func (e *windowEntry) recordErr(err error) {
 	e.errMu.Lock()
@@ -440,7 +538,9 @@ func (e *windowEntry) RegisterBatch(txids []chainhash.Hash) (*batchGate, error) 
 	for _, id := range txids {
 		if other, ok := e.w.retained[id]; ok && other != e {
 			e.w.mu.Unlock()
-			return nil, errors.NewProcessingError("[quickWindow][%s] transaction %s is already claimed by in-flight block %s at height %d", e.hash.String(), id.String(), other.hash.String(), other.height)
+			// A fault in our own bookkeeping (two in-flight entries claiming the same txid)
+			// must never be charged to the peer that delivered either block.
+			return nil, errors.NewServiceError("[quickWindow][%s] transaction %s is already claimed by in-flight block %s at height %d", e.hash.String(), id.String(), other.hash.String(), other.height)
 		}
 	}
 
@@ -467,40 +567,97 @@ func (e *windowEntry) RegistrationComplete() {
 }
 
 // WaitPredecessorsRegistered blocks until every in-flight predecessor has registered all of
-// its batches, so the open-gate map is complete before the first dependency check.
+// its batches, so the open-gate map is complete before the first dependency check. The parent
+// link is re-read through parentEntry on each step, so the walk only ever visits entries still
+// resident in the window (at most depth of them), never the whole history behind them.
 func (e *windowEntry) WaitPredecessorsRegistered(ctx context.Context) error {
-	for p := e.parent; p != nil; p = p.parent {
+	for p := e.parentEntry(); p != nil; p = p.parentEntry() {
+		resolved := func() (bool, error) {
+			if closed(p.registered) {
+				return true, nil
+			}
+
+			if closed(p.committed) {
+				if p.failed.Load() {
+					return true, errors.NewServiceError("[quickWindow][%s] predecessor %s failed before registering", e.hash.String(), p.hash.String())
+				}
+
+				return true, nil
+			}
+
+			return false, nil
+		}
+
+		if done, err := resolved(); done {
+			if err != nil {
+				return err
+			}
+
+			continue
+		}
+
 		select {
 		case <-p.registered:
 		case <-p.committed:
-			if p.failed.Load() {
-				return errors.NewServiceError("[quickWindow][%s] predecessor %s failed before registering", e.hash.String(), p.hash.String())
-			}
 		case <-ctx.Done():
-			return ctx.Err()
 		}
+
+		// A signal that lands in the same instant ctx is cancelled must still win: re-check
+		// non-blockingly before treating this as a cancellation.
+		if done, err := resolved(); done {
+			if err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		return wrapCtxErr(e.hash, ctx)
 	}
 
 	return nil
 }
 
+// WaitPredecessorIDAssigned blocks until the direct predecessor has assigned its block ID (or
+// has itself resolved without doing so), re-checking both signal channels non-blockingly after
+// ctx fires so a ready signal always wins over a bare context error.
 func (e *windowEntry) WaitPredecessorIDAssigned(ctx context.Context) error {
-	if e.parent == nil {
+	p := e.parentEntry()
+	if p == nil {
 		return nil
+	}
+
+	resolved := func() (bool, error) {
+		if closed(p.idAssigned) {
+			return true, nil
+		}
+
+		if closed(p.committed) {
+			if p.failed.Load() {
+				return true, errors.NewServiceError("[quickWindow][%s] predecessor %s failed before assigning its id", e.hash.String(), p.hash.String())
+			}
+
+			return true, nil
+		}
+
+		return false, nil
+	}
+
+	if done, err := resolved(); done {
+		return err
 	}
 
 	select {
-	case <-e.parent.idAssigned:
-		return nil
-	case <-e.parent.committed:
-		if e.parent.failed.Load() {
-			return errors.NewServiceError("[quickWindow][%s] predecessor %s failed before assigning its id", e.hash.String(), e.parent.hash.String())
-		}
-
-		return nil
+	case <-p.idAssigned:
+	case <-p.committed:
 	case <-ctx.Done():
-		return ctx.Err()
 	}
+
+	if done, err := resolved(); done {
+		return err
+	}
+
+	return wrapCtxErr(e.hash, ctx)
 }
 
 func (e *windowEntry) IDAssigned() {
@@ -543,23 +700,41 @@ func (e *windowEntry) failLocked(err error, cause string) {
 }
 
 // WaitCommitted returns nil once the ordered tail has run for this entry, or the recorded
-// error once it failed or was aborted.
+// error once it failed or was aborted. failLocked cancels the entry's context before closing
+// committed, so a caller waiting on e.Context() would otherwise race a select between the two
+// and see a bare context.Canceled about half the time; resolved is checked non-blockingly both
+// before waiting and again after ctx fires, so a closed committed always wins.
 func (e *windowEntry) WaitCommitted(ctx context.Context) error {
+	resolved := func() (bool, error) {
+		if !closed(e.committed) {
+			return false, nil
+		}
+
+		if e.failed.Load() {
+			if err := e.recordedErr(); err != nil {
+				return true, err
+			}
+
+			return true, errors.NewServiceError("[quickWindow][%s] aborted", e.hash.String())
+		}
+
+		return true, nil
+	}
+
+	if done, err := resolved(); done {
+		return err
+	}
+
 	select {
 	case <-e.committed:
 	case <-ctx.Done():
-		return ctx.Err()
 	}
 
-	if e.failed.Load() {
-		if err := e.recordedErr(); err != nil {
-			return err
-		}
-
-		return errors.NewServiceError("[quickWindow][%s] aborted", e.hash.String())
+	if done, err := resolved(); done {
+		return err
 	}
 
-	return nil
+	return wrapCtxErr(e.hash, ctx)
 }
 
 // Leave removes the entry from the window. The owner calls it exactly once, after its pipeline
@@ -592,17 +767,34 @@ func (g *batchGate) fail() {
 }
 
 // Wait blocks until the gate closes. A gate closed by failure returns a service error, so the
-// waiting block fails as a local fault.
+// waiting block fails as a local fault. resolved is checked non-blockingly both before waiting
+// and again once ctx fires, so a gate that closes at the same instant ctx is cancelled is never
+// mistaken for a bare context error.
 func (g *batchGate) Wait(ctx context.Context) error {
+	resolved := func() (bool, error) {
+		if !closed(g.done) {
+			return false, nil
+		}
+
+		if g.failed.Load() {
+			return true, errors.NewServiceError("[quickWindow][%s] parent block %s at height %d failed; its outputs cannot be spent", g.entry.hash.String(), g.entry.hash.String(), g.entry.height)
+		}
+
+		return true, nil
+	}
+
+	if done, err := resolved(); done {
+		return err
+	}
+
 	select {
 	case <-g.done:
 	case <-ctx.Done():
-		return ctx.Err()
 	}
 
-	if g.failed.Load() {
-		return errors.NewServiceError("[quickWindow][%s] parent block %s at height %d failed; its outputs cannot be spent", g.entry.hash.String(), g.entry.hash.String(), g.entry.height)
+	if done, err := resolved(); done {
+		return err
 	}
 
-	return nil
+	return wrapCtxErr(g.entry.hash, ctx)
 }
