@@ -1728,7 +1728,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// Process the block directly. A missing-parent error (ErrBlockNotFound)
 	// always triggers a getblocks request from our best block so block
 	// validation can proceed in order — see the orphan-continuation note below.
-	if err = sm.HandleBlockDirect(sm.ctx, bmsg.peer, bmsg.blockHash, msgBlock); err != nil {
+	if err = sm.HandleBlockDirect(sm.ctx, bmsg.peer, bmsg.blockHash, msgBlock, nil); err != nil {
 		if errors.Is(err, errors.ErrBlockNotFound) {
 			// We don't have the parent of this block. While catching blocks
 			// this is typically the peer announcing its tip while we are
