@@ -358,7 +358,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "blockvalidation",
 			Name:      "quick_window_aborts_total",
-			Help:      "Entries failed, by cause",
+			Help:      "Entries failed, by cause: head_failed, predecessor_failed, gate_failed, commit_failed, shutdown, left_before_commit",
 		},
 		[]string{"cause"},
 	)

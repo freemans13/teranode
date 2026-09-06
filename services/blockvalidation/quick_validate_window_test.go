@@ -308,17 +308,20 @@ func TestWindow_CoinbaseOnlyBlockCompletesItsRegistration(t *testing.T) {
 	require.Equal(t, uint32(7), b1.ID)
 }
 
-// windowMissCase is one row of the backstop's classification table.
+// windowMissCase is one row of the backstop's classification table. ownRegistered runs the row
+// with the calling block itself as the entry that registered the parent, which is the case the
+// backstop must NOT reclassify.
 type windowMissCase struct {
-	name        string
-	err         func(parent *chainhash.Hash) error
-	reclassify  bool
-	description string
+	name          string
+	err           func(parent *chainhash.Hash) error
+	reclassify    bool
+	ownRegistered bool
+	description   string
 }
 
 // The backstop turns exactly two error shapes into a local fault, and only when the parent the
-// error points at is registered by an in-flight block. Everything else is handed back untouched
-// so the block fails the way it always did.
+// error points at is registered by an in-flight block OTHER than the one being applied.
+// Everything else is handed back untouched so the block fails the way it always did.
 func TestWindow_MissBackstopClassification(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -367,6 +370,15 @@ func TestWindow_MissBackstopClassification(t *testing.T) {
 			reclassify:  true,
 			description: "an anonymous spent answer for a claimed parent is the miss shape",
 		},
+		{
+			name: "not found naming an id this block registered itself",
+			err: func(p *chainhash.Hash) error {
+				return errors.NewTxNotFoundError("output %s:%d not found", p, 0)
+			},
+			reclassify:    false,
+			ownRegistered: true,
+			description:   "an in-block parent was never gated, so a miss on it is this block's own hard failure",
+		},
 	}
 
 	for _, tc := range cases {
@@ -382,9 +394,16 @@ func TestWindow_MissBackstopClassification(t *testing.T) {
 			_, err = e.RegisterBatch([]chainhash.Hash{*parent})
 			require.NoError(t, err)
 
+			// nil owner is "some other block is applying this transaction"; e is "the block
+			// that registered the parent is the one applying the spend".
+			var owner *windowEntry
+			if tc.ownRegistered {
+				owner = e
+			}
+
 			before := testutil.ToFloat64(prometheusBlockValidationQuickWindowMissTotal)
 			in := tc.err(parent)
-			out := windowMissError(&model.Block{Header: &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}}, w, child, in)
+			out := windowMissError(&model.Block{Header: &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}}, w, owner, child, in)
 			after := testutil.ToFloat64(prometheusBlockValidationQuickWindowMissTotal)
 
 			if tc.reclassify {
@@ -421,7 +440,7 @@ func TestWindow_MissBackstopIgnoresUnregisteredParents(t *testing.T) {
 
 	before := testutil.ToFloat64(prometheusBlockValidationQuickWindowMissTotal)
 	in := errors.NewTxNotFoundError("output %s:%d not found", parentTx.TxIDChainHash(), 0)
-	out := windowMissError(&model.Block{Header: &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}}, w, child, in)
+	out := windowMissError(&model.Block{Header: &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}}, w, nil, child, in)
 
 	require.Equal(t, in, out)
 	require.Equal(t, before, testutil.ToFloat64(prometheusBlockValidationQuickWindowMissTotal))

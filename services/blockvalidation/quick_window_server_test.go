@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -174,11 +175,20 @@ func newWindowServer(t *testing.T, name string, tweak ...func(*settings.Settings
 	s := New(logger, tSettings, subtreeStore, txStore, utxoStore, nil, client, nil, nil, nil)
 	s.blockValidation = NewBlockValidation(ctx, logger, tSettings, client, subtreeStore, txStore, utxoStore, nil, nil)
 
-	// Derived rather than hardcoded so a tweak may ask for a different depth (the integration
-	// tests run at 3 and at 1); with no tweak this is still the two-deep window above.
-	require.Equal(t, quickWindowDepth(tSettings, logger), s.blockValidation.quickWindow.Depth(),
-		"the settings above must produce the configured window depth")
-	require.True(t, s.blockValidation.quickWindow.Enabled())
+	if tSettings.BlockValidation.QuickWindowBlocks == 0 {
+		require.False(t, s.blockValidation.quickWindow.Enabled(), "at 0 the service builds no window at all")
+	} else {
+		// Written out rather than read back from quickWindowDepth, which is the code under
+		// test: with the setting at 2, coins created unlocked (so nothing forces it to 1) and
+		// the default block-assembly allowance of 20 (half of which, 10, does not bite), the
+		// window runs two deep. A tweak may ask for a different depth, and the test that asked
+		// for it asserts what it expects.
+		if len(tweak) == 0 {
+			require.Equal(t, 2, s.blockValidation.quickWindow.Depth(), "the settings above must produce a two-deep window")
+		}
+
+		require.True(t, s.blockValidation.quickWindow.Enabled())
+	}
 
 	bits, err := model.NewNBitFromString("207fffff")
 	require.NoError(t, err)
@@ -427,14 +437,15 @@ func (g *gateStub) observations() []bool {
 // left so the window drains behind it.
 func TestProcessBlockFound_GateFailureAfterAdmissionUnwindsTheEntry(t *testing.T) {
 	// maxBlocksBehind 0 means block assembly must be at or above the block's own height, and
-	// the stub reports height 0, so the gate can never pass. It does not shrink the window:
-	// the depth cap only applies at maxBlocksBehindBlockAssembly / 2 >= 1.
+	// the stub reports height 0, so the gate can never pass. It also collapses the window to
+	// one block: an allowance of 0 or 1 is the tightest possible gate, so the shared depth rule
+	// floors the cap at 1. This test admits a single block, so that costs it nothing.
 	ws := newWindowServer(t, "window_server_gate", func(s *settings.Settings) {
 		s.BlockValidation.MaxBlocksBehindBlockAssembly = 0
 	})
 
 	w := ws.s.blockValidation.quickWindow
-	require.Equal(t, 2, w.Depth(), "the gate setting must not have shrunk the window")
+	require.Equal(t, 1, w.Depth(), "an allowance of 0 floors the window at one block")
 
 	block1 := coinbaseOnlyBlock(t, ws, ws.genesis, 1)
 
@@ -493,4 +504,118 @@ func TestProcessBlockFound_ParentThatLeftTheWindowWithoutCommittingIsRefused(t *
 
 	require.Nil(t, w.Lookup(block2.Hash()), "the child must have left the window it was refused from")
 	require.Empty(t, ws.client.addedBlocks(), "neither block may reach the chain store")
+}
+
+// TestProcessBlockFound_LegacyBlockWithTheWindowOffFailsClosed covers the settings mismatch
+// between the two services that read blockvalidation_quick_window_blocks. With the window on in
+// legacy sync and off here, legacy hands over block N+1 while N is still in flight — and N is
+// in flight nowhere this service can see, so its parent is simply missing. The catch-up divert
+// would return nil, which legacy records as an accepted block with nothing stored, so the block
+// is refused with a local fault naming the setting instead. A legacy block never belongs in the
+// divert anyway: legacy resolves its own orphans with a getblocks.
+func TestProcessBlockFound_LegacyBlockWithTheWindowOffFailsClosed(t *testing.T) {
+	ws := newWindowServer(t, "window_server_off_legacy", func(s *settings.Settings) {
+		s.BlockValidation.QuickWindowBlocks = 0
+	})
+
+	require.False(t, ws.s.blockValidation.quickWindow.Enabled(), "precondition: the window is off on this service")
+
+	orphan := coinbaseOnlyBlock(t, ws, chainhash.Hash{0x09, 0x08, 0x07}, 2)
+
+	err := ws.s.processBlockFound(context.Background(), orphan.Hash(), "peer-1", "legacy", orphan)
+	require.Error(t, err, "a legacy block with no stored parent must never come back nil")
+	require.True(t, errors.IsTransientLocalError(err), "a settings mismatch is ours, not the peer's: %v", err)
+	require.Contains(t, err.Error(), "blockvalidation_quick_window_blocks")
+
+	require.Empty(t, ws.client.addedBlocks(), "nothing may be stored for a block whose parent is unknown")
+}
+
+// TestProcessBlockFound_NonLegacyBlockKeepsTheCatchupDivert is the other half of the rule
+// above: only a legacy block is refused. Everything else with a missing parent still goes to
+// catch-up, which is how the native path has always resolved an orphan, and still returns nil.
+func TestProcessBlockFound_NonLegacyBlockKeepsTheCatchupDivert(t *testing.T) {
+	ws := newWindowServer(t, "window_server_off_native", func(s *settings.Settings) {
+		s.BlockValidation.QuickWindowBlocks = 0
+	})
+
+	orphan := coinbaseOnlyBlock(t, ws, chainhash.Hash{0x06, 0x05, 0x04}, 2)
+
+	err := ws.s.processBlockFound(context.Background(), orphan.Hash(), "peer-1", "http://peer:8000", orphan)
+	require.NoError(t, err, "a non-legacy block with a missing parent still takes the catch-up divert")
+
+	require.Eventually(t, func() bool { return len(ws.s.catchupCh) == 1 }, 5*time.Second, 10*time.Millisecond,
+		"the block must have been handed to catch-up")
+	require.Empty(t, ws.client.addedBlocks())
+}
+
+// capturingLogger records the lines the window's startup log writes, so the depth resolution
+// can be asserted on rather than merely run.
+type capturingLogger struct {
+	ulogger.TestLogger
+
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *capturingLogger) Infof(format string, args ...interface{}) { l.record(format, args...) }
+func (l *capturingLogger) Warnf(format string, args ...interface{}) { l.record(format, args...) }
+
+func (l *capturingLogger) record(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *capturingLogger) recorded() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return append([]string(nil), l.lines...)
+}
+
+// TestQuickWindowDepth_ResolvesFromSettingsAndLogsTheClamp pins block validation's half of the
+// one-depth-rule: the number comes from the settings helper legacy sync also calls, and the
+// startup line says what was resolved and why. The expected numbers are written out, so this
+// test is not the code's own oracle.
+func TestQuickWindowDepth_ResolvesFromSettingsAndLogsTheClamp(t *testing.T) {
+	cases := []struct {
+		name        string
+		blocks      int
+		skipLock    bool
+		maxBehind   int
+		expected    int
+		expectClamp bool
+	}{
+		{name: "off", blocks: 0, skipLock: true, maxBehind: 20, expected: 0},
+		{name: "under the cap", blocks: 4, skipLock: true, maxBehind: 20, expected: 4},
+		{name: "capped at half the gate allowance", blocks: 20, skipLock: true, maxBehind: 20, expected: 10, expectClamp: true},
+		{name: "forced to one without the skip-lock setting", blocks: 4, skipLock: false, maxBehind: 20, expected: 1, expectClamp: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tSettings := test.CreateBaseTestSettings(t)
+			tSettings.BlockValidation.QuickWindowBlocks = tc.blocks
+			tSettings.BlockValidation.QuickValidateSkipUtxoLock = tc.skipLock
+			tSettings.BlockValidation.MaxBlocksBehindBlockAssembly = tc.maxBehind
+
+			logger := &capturingLogger{}
+			require.Equal(t, tc.expected, quickWindowDepth(tSettings, logger))
+
+			fromSettings, _ := tSettings.BlockValidation.QuickWindowConfiguredDepth()
+			require.Equal(t, fromSettings, tc.expected, "block validation must run the depth legacy sync resolves")
+
+			lines := logger.recorded()
+			require.Len(t, lines, 1, "the resolved depth is logged exactly once at startup")
+			require.Contains(t, lines[0], fmt.Sprintf("blockvalidation_quick_window_blocks=%d", tc.blocks))
+			require.Contains(t, lines[0], fmt.Sprintf("resolved to depth %d", tc.expected))
+
+			if tc.expectClamp {
+				require.Contains(t, lines[0], "blockvalidation_", "a clamp must name the setting that caused it")
+				require.Greater(t, len(lines[0]), len(fmt.Sprintf("[quickWindow] blockvalidation_quick_window_blocks=%d resolved to depth %d", tc.blocks, tc.expected)),
+					"a clamped depth must say why")
+			}
+		})
+	}
 }

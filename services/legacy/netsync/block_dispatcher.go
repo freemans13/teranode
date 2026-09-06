@@ -3,6 +3,7 @@ package netsync
 import (
 	"context"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -195,37 +196,29 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 	// Depth 1 with the default budget is the pre-window behaviour, and it is what a
 	// SyncManager built as a struct literal in a test gets.
 	if sm.settings != nil {
-		bd.depth = sm.settings.BlockValidation.QuickWindowBlocks
 		bd.budget = windowBudgetBytes(sm.settings.BlockValidation.QuickWindowBudgetMiB)
 
-		// Mirrors quickWindowDepth on the block validation side: a depth above 1
-		// needs coins created unlocked (the unlock statement over block N's rows
-		// racing block N+1's deletes of the same rows is a postgres deadlock shape),
-		// and can never exceed half the block-assembly gate's allowance or admission
-		// would enter that gate's retry ladder.
-		if bd.depth < 1 {
-			bd.depth = 1
-		}
+		// One rule for both services: block validation's quickWindowDepth resolves the
+		// same setting through this same helper, so legacy can never overlap blocks
+		// block validation would refuse to admit.
+		depth, reasons := sm.settings.BlockValidation.QuickWindowConfiguredDepth()
 
-		if bd.depth > 1 && !sm.settings.BlockValidation.QuickValidateSkipUtxoLock {
-			sm.logger.Warnf("[blockDispatcher] blockvalidation_quick_window_blocks=%d requires blockvalidation_quick_validate_skip_utxo_lock=true; running with depth 1", bd.depth)
+		// One startup line, the mirror of block validation's, so a mismatch between the
+		// two services is visible in the log rather than only in a diverted block.
+		switch {
+		case depth == 0:
+			// The dispatcher is built but never fed: dispatchBlocks hands the queue to the
+			// pre-window consumer instead. bd.depth is left at 1 so nothing can read a 0
+			// here as a window that admits nothing.
+			sm.logger.Infof("[blockDispatcher] blockvalidation_quick_window_blocks=0: the quick window is off and the block queue is consumed the pre-window way, one block head to tail")
+		case len(reasons) > 0:
+			bd.depth = depth
 
-			bd.depth = 1
-		}
+			sm.logger.Warnf("[blockDispatcher] blockvalidation_quick_window_blocks=%d resolved to depth %d: %s", sm.settings.BlockValidation.QuickWindowBlocks, bd.depth, strings.Join(reasons, "; "))
+		default:
+			bd.depth = depth
 
-		// A gate allowance of 0 or 1 halves to 0, which is not a licence to run the
-		// configured depth: it is the tightest possible gate, so the window collapses
-		// to one block.
-		if capped := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly / 2; bd.depth > capped {
-			if capped < 1 {
-				capped = 1
-			}
-
-			if bd.depth > capped {
-				sm.logger.Warnf("[blockDispatcher] blockvalidation_quick_window_blocks=%d capped at %d (half of blockvalidation_maxBlocksBehindBlockAssembly)", bd.depth, capped)
-
-				bd.depth = capped
-			}
+			sm.logger.Infof("[blockDispatcher] blockvalidation_quick_window_blocks=%d resolved to depth %d", sm.settings.BlockValidation.QuickWindowBlocks, bd.depth)
 		}
 	}
 
@@ -489,6 +482,13 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 
 		switch {
 		case head.d.aborted:
+			// The abort is the verdict that reaches the peer, but a successor that had a
+			// failure of its own is worth seeing: without this line the only record of it
+			// is gone the moment the service error replaces it.
+			if head.err != nil {
+				bd.sm.logger.Debugf("[blockDispatcher] aborted successor %s had its own error: %v", head.hash.String(), head.err)
+			}
+
 			err = errors.NewServiceError("[blockDispatcher][%s] aborted at height %d: a predecessor failed", head.hash.String(), head.height)
 		case err != nil && (errors.Is(err, context.Canceled) || errors.IsContextError(err)):
 			// Substituted, and deliberately neither wrapping the cause nor quoting its
