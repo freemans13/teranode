@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/jackc/pgx/v5"
@@ -316,20 +317,31 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		subtreeIdx = int32(mi.SubtreeIdx)   //nolint:gosec // a subtree index fits int32
 	}
 
-	// The serialized bytes, or nothing at all for a transaction mined at or below the
-	// hardcoded checkpoint when the operator has asked for that (see bodyFloor on Store).
+	// The serialized bytes, or nothing at all for a transaction mined below the hardcoded
+	// checkpoint when the operator has asked for that (see bodyCheckpoints on Store).
+	//
+	// SERIALISED ONLY WHEN IT IS KEPT. tx.Bytes() renders the whole transaction into a fresh
+	// buffer, ~1.35 KB on mainnet, and this runs in the create prepare stage, which is already
+	// GC-bound. Building it and then dropping it on the skip path would pay the entire cost the
+	// setting exists to avoid, in the one process the setting is meant to relieve.
 	//
 	// nil rather than an empty slice, because nil is what pgx sends as SQL NULL inside a
 	// bytea[], and NULL is what the statement's body CTE tests on. An empty slice would write
 	// a zero-length body row, which is a row the reader would then try to decode.
 	//
+	// The boundary is model.BelowCheckpoint over the store's own checkpoint list, never a
+	// hand-written comparison: model/checkpoint.go is the single definition every
+	// below-checkpoint gate shares, including the outpoint-only spend gate this rides behind,
+	// and it excludes genesis. A nil list -- the setting off, or a network with no checkpoints
+	// -- makes it false for every height, which is how "off" is expressed.
+	//
 	// The gate is on the MINED height, not on the height the create was filed at. Only a
 	// transaction a block places below the checkpoint has its bytes in a subtree data file; a
 	// mempool arrival carries no mined height at all and keeps its body whatever the setting
-	// says, which is why `mined` has to hold before the comparison is even meaningful.
-	body := tx.Bytes()
-	if mined && s.bodyFloor > 0 && mi.BlockHeight <= s.bodyFloor {
-		body = nil
+	// says, which is why `mined` has to hold before the boundary is even consulted.
+	var body []byte
+	if !mined || !model.BelowCheckpoint(s.bodyCheckpoints, mi.BlockHeight) {
+		body = tx.Bytes()
 	}
 
 	// The identity row. k is this transaction's position in the statement, and the result
