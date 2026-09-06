@@ -174,7 +174,10 @@ func newWindowServer(t *testing.T, name string, tweak ...func(*settings.Settings
 	s := New(logger, tSettings, subtreeStore, txStore, utxoStore, nil, client, nil, nil, nil)
 	s.blockValidation = NewBlockValidation(ctx, logger, tSettings, client, subtreeStore, txStore, utxoStore, nil, nil)
 
-	require.Equal(t, 2, s.blockValidation.quickWindow.Depth(), "the settings above must produce a two-deep window")
+	// Derived rather than hardcoded so a tweak may ask for a different depth (the integration
+	// tests run at 3 and at 1); with no tweak this is still the two-deep window above.
+	require.Equal(t, quickWindowDepth(tSettings, logger), s.blockValidation.quickWindow.Depth(),
+		"the settings above must produce the configured window depth")
 	require.True(t, s.blockValidation.quickWindow.Enabled())
 
 	bits, err := model.NewNBitFromString("207fffff")
