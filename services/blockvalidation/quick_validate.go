@@ -1369,8 +1369,11 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	var (
 		chainedCreates []txApply
 		chainedSpends  []*bt.Tx
-		chainedCount   int
-		unspendable    int
+		// chainedCount and unspendable measure different axes (parentage and
+		// spendability) and overlap: a chained tx with only unspendable outputs
+		// counts in both, so independent+chained+unspendable can exceed the batch.
+		chainedCount int
+		unspendable  int
 	)
 
 	batchSize := batch.batchEnd - batch.batchStart
