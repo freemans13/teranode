@@ -213,15 +213,28 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 			bd.depth = 1
 		}
 
-		if capped := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly / 2; capped >= 1 && bd.depth > capped {
-			sm.logger.Warnf("[blockDispatcher] blockvalidation_quick_window_blocks=%d capped at %d (half of blockvalidation_maxBlocksBehindBlockAssembly)", bd.depth, capped)
+		// A gate allowance of 0 or 1 halves to 0, which is not a licence to run the
+		// configured depth: it is the tightest possible gate, so the window collapses
+		// to one block.
+		if capped := sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly / 2; bd.depth > capped {
+			if capped < 1 {
+				capped = 1
+			}
 
-			bd.depth = capped
+			if bd.depth > capped {
+				sm.logger.Warnf("[blockDispatcher] blockvalidation_quick_window_blocks=%d capped at %d (half of blockvalidation_maxBlocksBehindBlockAssembly)", bd.depth, capped)
+
+				bd.depth = capped
+			}
 		}
 	}
 
+	// d.msg.peer, not d.peer: HandleBlockDirect has always been handed the peer that
+	// delivered the block (a stream sub-peer on an association), and its tracing tags
+	// and log lines name it. d.peer is that peer resolved to its association's primary,
+	// which is what the tail's own bookkeeping needs — the two must not be swapped.
 	bd.run = func(ctx context.Context, d *blockDispatch, parent *inflightParent) error {
-		return sm.HandleBlockDirect(ctx, d.peer, d.msg.blockHash, d.msgBlock, parent)
+		return sm.HandleBlockDirect(ctx, d.msg.peer, d.msg.blockHash, d.msgBlock, parent)
 	}
 
 	// The default tail keeps the backlog decrement, its progress stamp and the reply
@@ -324,6 +337,10 @@ func (bd *blockDispatcher) blockAssemblyHeight() (uint32, bool) {
 func (bd *blockDispatcher) frontierEmpty() bool { return bd == nil || len(bd.frontier) == 0 }
 
 // tailHeight is the height of the last block admitted, or 0 when nothing is in flight.
+// The zero means the block-assembly lag arm of effectiveDepth sees a lag of 0 until the
+// first admission, so at most one block can be admitted on a stale reading of the lag;
+// that block then parks in the block-assembly gate exactly as it would have before the
+// window existed, and every later admission sees the real frontier tail.
 func (bd *blockDispatcher) tailHeight() uint32 {
 	if n := len(bd.frontier); n > 0 {
 		return bd.frontier[n-1].height
@@ -431,6 +448,14 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 			err = run(ctx, d, d.parent)
 		}
 
+		// Nothing after this point reads the decoded block — the tail works from the
+		// dispatch's own fields — and this entry can outlive the frontier as a child's
+		// resolved parent, so drop the reference here rather than pinning a multi-GB
+		// block (and its decode arena) until that child settles. Safe to write from
+		// this goroutine: the consumer never touches msgBlock after dispatch, and the
+		// completion send below is the happens-before edge for everything that does.
+		d.msgBlock = nil
+
 		// settle after run returns, so rpcStarted (closed inside HandleBlockDirect)
 		// always closes strictly before settled in program order.
 		e.settle(err)
@@ -479,6 +504,11 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 			bd.failFrom(head)
 		}
 
+		// Clear the slot before resliding: the backing array outlives the reslice, so
+		// leaving the pointer there would pin this entry (and everything it reaches)
+		// until a later append reallocates — long after the reply released the block's
+		// prefetch budget.
+		bd.frontier[0] = nil
 		bd.frontier = bd.frontier[1:]
 		bd.inflight -= head.d.bytes * windowBytesPerWireByte
 
@@ -492,6 +522,12 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 
 // failFrom marks every other entry in the frontier aborted: they are all descendants of
 // e, so none of them can store, and none of them was ever at fault.
+//
+// A successor whose own run had already returned nil is still reported failed, because
+// complete reads aborted at pop time and lets it win over the recorded error. That is
+// only sound because block validation's window never commits a successor after its
+// predecessor failed mid-RPC: a run that returned nil under a failed predecessor did not
+// commit a block, so calling it failed here matches what the store actually holds.
 func (bd *blockDispatcher) failFrom(e *frontierEntry) {
 	for _, x := range bd.frontier {
 		if x == e {

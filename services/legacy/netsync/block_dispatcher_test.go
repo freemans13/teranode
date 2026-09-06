@@ -417,3 +417,304 @@ func TestDispatcher_ParentForAndInFlight(t *testing.T) {
 	require.False(t, bd.inFlight(first.msg.blockHash))
 	require.Nil(t, bd.parentFor(&second.msg.blockHash))
 }
+
+// loopHarness is the minimum a SyncManager needs for dispatchBlocks to run a block
+// end to end with the work itself stubbed: a registered peer, the FSM in catch-up,
+// and the maps the tail writes to.
+type loopHarness struct {
+	sm     *SyncManager
+	peer   *peer.Peer
+	blocks []*wire.MsgBlock
+	queue  chan *blockQueueMsg
+	client *blockchain2.Mock
+}
+
+func newLoopHarness(t *testing.T, blocks int) *loopHarness {
+	t.Helper()
+
+	catchingBlocks := blockchain2.FSMStateCATCHINGBLOCKS
+	bestHeader := &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}
+
+	client := &blockchain2.Mock{}
+	client.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil)
+	client.On("GetBestBlockHeader", mock.Anything).Return(bestHeader, &model.BlockHeaderMeta{Height: 100}, nil)
+	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return([]*chainhash.Hash{bestHeader.Hash()}, nil)
+
+	tSettings := test.CreateBaseTestSettings(t)
+	p := peer.NewInboundPeer(ulogger.TestLogger{}, tSettings, &peer.Config{})
+
+	state := &peerSyncState{
+		requestedTxns:   expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),
+		requestedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+	}
+	t.Cleanup(func() { state.requestedTxns.Stop(); state.requestedBlocks.Stop() })
+
+	sm := &SyncManager{
+		ctx:                  context.Background(),
+		logger:               ulogger.TestLogger{},
+		settings:             tSettings,
+		chainParams:          &chaincfg.MainNetParams,
+		blockchainClient:     client,
+		peerStates:           txmap.NewSyncedMap[*peer.Peer, *peerSyncState](),
+		requestedBlocks:      expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		rejectedTxns:         txmap.NewSyncedMap[chainhash.Hash, struct{}](100),
+		blockSizeTracker:     newBlockSizeTracker(10),
+		blockFailureBackoff:  expiringmap.New[chainhash.Hash, *blockFailureState](time.Minute),
+		recentlyFailedBlocks: expiringmap.New[chainhash.Hash, struct{}](time.Minute),
+		quit:                 make(chan struct{}),
+	}
+	t.Cleanup(func() { sm.requestedBlocks.Stop(); sm.blockFailureBackoff.Stop(); sm.recentlyFailedBlocks.Stop() })
+	sm.peerStates.Set(p, state)
+
+	h := &loopHarness{sm: sm, peer: p, client: client, queue: make(chan *blockQueueMsg, 8)}
+
+	prev := chainhash.Hash{0x01}
+
+	for i := 0; i < blocks; i++ {
+		b := wire.NewMsgBlock(wire.NewBlockHeader(1, &prev, &chainhash.Hash{}, 0, uint32(i)))
+		h.blocks = append(h.blocks, b)
+		prev = b.Header.BlockHash()
+
+		hash := b.Header.BlockHash()
+		state.requestedBlocks.Set(hash, struct{}{})
+		sm.requestedBlocks.Set(hash, struct{}{})
+	}
+
+	sm.dispatcher = newBlockDispatcher(sm)
+
+	return h
+}
+
+// enqueue puts block i on the queue with its backlog counted, the way the feeder in
+// blockHandler does, and returns its reply channel.
+func (h *loopHarness) enqueue(i int) chan error {
+	reply := make(chan error, 1)
+
+	h.sm.blockBacklog.Add(1)
+	h.queue <- &blockQueueMsg{
+		block:       h.blocks[i],
+		blockHash:   h.blocks[i].Header.BlockHash(),
+		blockHeight: int32(101 + i),
+		peer:        h.peer,
+		reply:       reply,
+	}
+
+	return reply
+}
+
+// recordTails wraps the dispatcher's tail so the test can see the order the tails ran
+// in without disturbing the backlog and reply pairing the real tail does.
+func (h *loopHarness) recordTails(n int) chan chainhash.Hash {
+	order := make(chan chainhash.Hash, n)
+	orig := h.sm.dispatcher.tail
+
+	h.sm.dispatcher.tail = func(d *blockDispatch, err error) error {
+		order <- d.msg.blockHash
+
+		return orig(d, err)
+	}
+
+	return order
+}
+
+func requireReply(t *testing.T, reply chan error, what string) error {
+	t.Helper()
+
+	select {
+	case err := <-reply:
+		select {
+		case <-reply:
+			t.Fatalf("%s was replied to twice", what)
+		default:
+		}
+
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for the reply to %s", what)
+	}
+
+	return nil
+}
+
+// TestDispatchBlocks_PendingSlotDisablesTheQueueArm pins the shape the whole design
+// rests on: with one slot, the block behind the one in flight is head-processed and
+// parked, and the block behind that is not taken off the queue at all until the first
+// one completes. Their tails then run in queue order.
+func TestDispatchBlocks_PendingSlotDisablesTheQueueArm(t *testing.T) {
+	h := newLoopHarness(t, 3)
+
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	h.sm.dispatcher.run = func(context.Context, *blockDispatch, *inflightParent) error {
+		<-release
+
+		return nil
+	}
+
+	order := h.recordTails(3)
+
+	go h.sm.dispatchBlocks(h.queue)
+
+	replies := []chan error{h.enqueue(0), h.enqueue(1), h.enqueue(2)}
+
+	// The first is in flight, the second is parked in the pending slot, and the third
+	// is still on the queue because the queue arm is disabled.
+	require.Eventually(t, func() bool { return len(h.queue) == 1 }, 5*time.Second, 5*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, 1, len(h.queue), "the queue arm must stay disabled while a block is pending")
+
+	close(release)
+
+	for i, reply := range replies {
+		require.NoError(t, requireReply(t, reply, "block "+string(rune('1'+i))))
+	}
+
+	for i := 0; i < 3; i++ {
+		require.Equal(t, h.blocks[i].Header.BlockHash(), <-order, "tails run in queue order")
+	}
+
+	require.Equal(t, int64(0), h.sm.blockBacklog.Load())
+}
+
+// TestDispatchBlocks_ShutdownRepliesForInFlightAndPending covers the drain: the block
+// whose worker is still running and the block parked in the pending slot each get
+// exactly one error reply, and the backlog returns to zero.
+func TestDispatchBlocks_ShutdownRepliesForInFlightAndPending(t *testing.T) {
+	h := newLoopHarness(t, 2)
+
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	h.sm.dispatcher.run = func(context.Context, *blockDispatch, *inflightParent) error {
+		<-release
+
+		return nil
+	}
+
+	go h.sm.dispatchBlocks(h.queue)
+
+	inFlight := h.enqueue(0)
+	pending := h.enqueue(1)
+
+	require.Eventually(t, func() bool { return len(h.queue) == 0 }, 5*time.Second, 5*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+
+	close(h.sm.quit)
+
+	require.Error(t, requireReply(t, inFlight, "the in-flight block"))
+	require.Error(t, requireReply(t, pending, "the pending block"))
+	require.Equal(t, int64(0), h.sm.blockBacklog.Load())
+}
+
+// TestDispatchBlocks_PendingChildOfAFailedParentTakesTheCascadePath is the window-off
+// case: the head exempted this block from the #1333 cascade check because its parent
+// was in flight, and there is no resolved in-flight parent to abort it at admission.
+// It must still never be revalidated, and must get exactly the treatment the head's
+// own cascade branch gives.
+func TestDispatchBlocks_PendingChildOfAFailedParentTakesTheCascadePath(t *testing.T) {
+	h := newLoopHarness(t, 2)
+	require.False(t, h.sm.windowRouteEnabled(), "precondition: this is the window-off path")
+
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	parentHash := h.blocks[0].Header.BlockHash()
+	childHash := h.blocks[1].Header.BlockHash()
+
+	var ran []chainhash.Hash
+
+	var mu sync.Mutex
+
+	h.sm.dispatcher.run = func(_ context.Context, d *blockDispatch, _ *inflightParent) error {
+		mu.Lock()
+		ran = append(ran, d.msg.blockHash)
+		mu.Unlock()
+
+		<-release
+
+		return errors.NewStorageError("boom")
+	}
+
+	go h.sm.dispatchBlocks(h.queue)
+
+	parentReply := h.enqueue(0)
+	childReply := h.enqueue(1)
+
+	require.Eventually(t, func() bool { return len(h.queue) == 0 }, 5*time.Second, 5*time.Millisecond)
+
+	close(release)
+
+	require.Error(t, requireReply(t, parentReply, "the parent"))
+	require.NoError(t, requireReply(t, childReply, "the child"), "a short-circuited descendant replies nil")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []chainhash.Hash{parentHash}, ran, "the child of a failed parent is never revalidated")
+
+	_, marked := h.sm.recentlyFailedBlocks.Get(childHash)
+	require.True(t, marked, "a skipped descendant must itself be marked failed")
+
+	h.client.AssertCalled(t, "GetBlockLocator", mock.Anything, mock.Anything, mock.Anything)
+	require.Equal(t, int64(0), h.sm.blockBacklog.Load())
+}
+
+// TestDispatcher_AbortedSuccessorRecordsNoBackoff runs the real tail: the head keeps
+// its own failure backoff, the successor it aborted earns none.
+func TestDispatcher_AbortedSuccessorRecordsNoBackoff(t *testing.T) {
+	h := newLoopHarness(t, 2)
+	bd := h.sm.dispatcher
+
+	rec := &tailRecorder{}
+	bd.tail = func(d *blockDispatch, err error) error {
+		_ = h.sm.handleBlockMsgTail(d, err)
+
+		return rec.tail(d, err)
+	}
+
+	bd.run = func(_ context.Context, d *blockDispatch, _ *inflightParent) error {
+		if d.height == 1 {
+			return errors.NewStorageError("boom")
+		}
+
+		return nil
+	}
+
+	head := dispatchAt(1, 1000)
+	head.peer = h.peer
+	head.msg.peer = h.peer
+	head.catchingBlocks = true
+
+	successor := dispatchAt(2, 1000)
+	successor.peer = h.peer
+	successor.msg.peer = h.peer
+	successor.catchingBlocks = true
+
+	bd.dispatch(head)
+	bd.dispatch(successor)
+	bd.drainCompletions(t, rec, 2)
+
+	_, headBackoff := h.sm.blockFailureBackoff.Get(head.msg.blockHash)
+	require.True(t, headBackoff, "the block that actually failed is throttled on its next delivery")
+
+	_, successorBackoff := h.sm.blockFailureBackoff.Get(successor.msg.blockHash)
+	require.False(t, successorBackoff, "an aborted successor never ran a failing attempt of its own")
+}

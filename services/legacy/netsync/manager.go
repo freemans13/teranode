@@ -1531,6 +1531,36 @@ func (sm *SyncManager) requestMissingBlocks(peer *peerpkg.Peer, blockHash chainh
 	}
 }
 
+// parentFailedWhileWaiting reports whether the parent of a block that was waiting for
+// window capacity has failed in the meantime, and if so gives the block the same #1333
+// treatment the head gives a descendant of an already-failed block: mark it failed so
+// its own descendants are suppressed transitively, refresh the delivering peer's stall
+// timer (the fault is a rejected ancestor, not the peer), and answer with a getblocks so
+// sync recovers once the root block is resolved. The caller replies nil, exactly as the
+// head's branch does, so the window-off path behaves as it did before the window
+// existed. A parent that is in flight right now is not a failed parent: it was
+// re-admitted, and its child must not be dropped as part of a cascade being retried.
+func (sm *SyncManager) parentFailedWhileWaiting(d *blockDispatch) bool {
+	if sm.recentlyFailedBlocks == nil || sm.dispatcher.inFlight(d.prevHash) {
+		return false
+	}
+
+	if _, failed := sm.recentlyFailedBlocks.Get(d.prevHash); !failed {
+		return false
+	}
+
+	sm.recentlyFailedBlocks.Set(d.msg.blockHash, struct{}{})
+	sm.logger.Debugf("[dispatchBlocks][%s] parent %s failed while this block waited for capacity; skipping descendant (root failure already logged)", d.msg.blockHash, d.prevHash)
+
+	if sps, ok := sm.syncPeerStateFor(d.peer); ok {
+		sps.updateLastBlockTime()
+	}
+
+	sm.requestMissingBlocks(d.peer, d.msg.blockHash)
+
+	return true
+}
+
 // dispatchBlocks is the block-queue consumer: it runs every pre-check and every
 // chain-order step for one block on this goroutine and hands only the block's own
 // work to a worker, so up to K consecutive below-checkpoint blocks can have their
@@ -1564,9 +1594,18 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 		if pending == nil {
 			queueArm = blockQueue
 		} else if bd.canDispatch(pending) {
-			bd.dispatch(pending)
-
+			d := pending
 			pending = nil
+
+			// The parent may have failed while this block waited for capacity, on any
+			// route: the head's own #1333 check exempted it because the parent was in
+			// flight at the time, and the window's admission-time abort only covers a
+			// block whose parent it actually resolved.
+			if sm.parentFailedWhileWaiting(d) {
+				finish(d.msg, nil)
+			} else {
+				bd.dispatch(d)
+			}
 
 			continue
 		}
@@ -1615,11 +1654,10 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 				continue
 			}
 
-			if bd.canDispatch(d) {
-				bd.dispatch(d)
-			} else {
-				pending = d
-			}
+			// Park it unconditionally: the top of the loop runs before the next
+			// receive, so a block that can start does so immediately, and there is one
+			// place where a block is admitted.
+			pending = d
 		case c := <-bd.completions:
 			bd.complete(c)
 		}
@@ -1822,11 +1860,14 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		}
 	}
 
+	// Serializing a multi-GB block to measure it is not free, and both the size
+	// tracker and the window's byte charge want the same number.
+	blockSize := int64(msgBlock.SerializeSize())
+
 	// Track block size for dynamic in-flight adjustment during headers-first mode.
 	// This allows us to start aggressive (20 blocks) and automatically reduce
 	// to 1 block when encountering large (>2GB) blocks on mainnet.
 	if sm.headersFirstMode.Load() {
-		blockSize := int64(msgBlock.SerializeSize())
 		sm.blockSizeTracker.addBlockSize(blockSize)
 
 		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
@@ -1845,7 +1886,7 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		prevHash:       prevBlockHash,
 		catchingBlocks: catchingBlocks,
 		isCheckpoint:   isCheckpointBlock,
-		bytes:          int64(msgBlock.SerializeSize()),
+		bytes:          blockSize,
 	}
 
 	// Resolve the height only where it can change the routing decision. With the
@@ -1905,7 +1946,9 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		return err
 	}
 
-	err = sm.HandleBlockDirect(sm.ctx, d.peer, d.msg.blockHash, d.msgBlock, d.parent)
+	// d.msg.peer is the delivering peer, which is what HandleBlockDirect has always
+	// been given; d.peer is its association's primary, for the tail's bookkeeping.
+	err = sm.HandleBlockDirect(sm.ctx, d.msg.peer, d.msg.blockHash, d.msgBlock, d.parent)
 
 	return sm.handleBlockMsgTail(d, err)
 }
