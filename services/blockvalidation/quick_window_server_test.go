@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,7 +13,10 @@ import (
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
@@ -121,7 +125,9 @@ type windowServer struct {
 	bits    model.NBit
 }
 
-func newWindowServer(t *testing.T, name string) *windowServer {
+// newWindowServer builds the harness. tweak, if given, adjusts the settings after the window
+// defaults are in place and before anything is constructed from them.
+func newWindowServer(t *testing.T, name string, tweak ...func(*settings.Settings)) *windowServer {
 	t.Helper()
 
 	initPrometheusMetrics()
@@ -143,6 +149,10 @@ func newWindowServer(t *testing.T, name string) *windowServer {
 	tSettings.BlockValidation.OutpointOnlyBelowCheckpoint = true
 	tSettings.BlockValidation.QuickWindowBlocks = 2
 	tSettings.BlockValidation.QuickValidateSkipUtxoLock = true
+
+	for _, fn := range tweak {
+		fn(tSettings)
+	}
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///" + name)
 	require.NoError(t, err)
@@ -335,15 +345,26 @@ func TestProcessBlockFound_DuplicateInFlightBlockReturnsTheLiveOutcome(t *testin
 		t.Fatal("the first delivery never reached its commit")
 	}
 
-	second := make(chan error, 1)
+	// The live entry must be there before the second delivery starts, otherwise the second
+	// call could take the block-already-exists early return and the test would pass without
+	// ever reaching the duplicate branch.
+	require.NotNil(t, ws.s.blockValidation.quickWindow.Lookup(block1.Hash()), "the first delivery must be in flight")
+
+	var (
+		second     = make(chan error, 1)
+		secondDone atomic.Bool
+	)
 
 	go func() {
-		second <- ws.s.processBlockFound(context.Background(), redelivered.Hash(), "peer-2", "legacy", redelivered)
+		err := ws.s.processBlockFound(context.Background(), redelivered.Hash(), "peer-2", "legacy", redelivered)
+		secondDone.Store(true)
+		second <- err
 	}()
 
-	// Give the second delivery time to get as far as it is going to get before the first is
-	// allowed to finish, so the duplicate really is concurrent with the live attempt.
-	time.Sleep(200 * time.Millisecond)
+	// The duplicate must park on the live attempt. If it had started its own, or taken the
+	// early return, it would come back while the first is still held in its commit.
+	require.Never(t, secondDone.Load, 300*time.Millisecond, 20*time.Millisecond,
+		"the duplicate returned while the live attempt was still held in its commit")
 
 	release()
 
@@ -352,4 +373,121 @@ func TestProcessBlockFound_DuplicateInFlightBlockReturnsTheLiveOutcome(t *testin
 
 	requireStored(t, ws, block1.Hash())
 	require.Equal(t, 1, ws.client.countOf(block1.Hash()), "the block must be added to the chain store exactly once")
+}
+
+// windowChainLen is the length of the window's ordered commit chain, which is not the same as
+// the number of entries resident in it: a failed or committed entry is dropped from the chain
+// immediately but stays resident, holding its dedup slot, until its owner calls Leave.
+func windowChainLen(w *quickWindow) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return len(w.entries)
+}
+
+// gateStub is a block-assembly client reporting a height the gate will never accept, so
+// blockassemblyutil.WaitForBlockAssemblyReady keeps retrying until the caller's context runs
+// out. observe is called on every gate evaluation, which is how the test proves the block was
+// already admitted by the time the gate ran. Every other method of the interface is nil: the
+// gate is the only thing processBlockFound asks a block-assembly client for.
+type gateStub struct {
+	blockassembly.ClientI
+
+	observe func() bool
+
+	mu       sync.Mutex
+	observed []bool
+}
+
+func (g *gateStub) GetBlockAssemblyState(_ context.Context) (*blockassembly_api.StateMessage, error) {
+	g.mu.Lock()
+	g.observed = append(g.observed, g.observe())
+	g.mu.Unlock()
+
+	return &blockassembly_api.StateMessage{CurrentHeight: 0}, nil
+}
+
+// observations returns what observe saw, in call order.
+func (g *gateStub) observations() []bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return append([]bool(nil), g.observed...)
+}
+
+// TestProcessBlockFound_GateFailureAfterAdmissionUnwindsTheEntry pins the ordering this task
+// exists for and the unwind that pays for it. The block-assembly gate can park a block for as
+// long as block assembly is behind; a block parked outside the window holds no slot in it, so
+// the successor legacy sync is already sending would find no parent to chain to. Admission
+// therefore comes first, and the gate's own failure has to hand the slot back: wrapped as a
+// local fault so legacy sync neither rejects the block nor rotates the peer, then failed and
+// left so the window drains behind it.
+func TestProcessBlockFound_GateFailureAfterAdmissionUnwindsTheEntry(t *testing.T) {
+	// maxBlocksBehind 0 means block assembly must be at or above the block's own height, and
+	// the stub reports height 0, so the gate can never pass. It does not shrink the window:
+	// the depth cap only applies at maxBlocksBehindBlockAssembly / 2 >= 1.
+	ws := newWindowServer(t, "window_server_gate", func(s *settings.Settings) {
+		s.BlockValidation.MaxBlocksBehindBlockAssembly = 0
+	})
+
+	w := ws.s.blockValidation.quickWindow
+	require.Equal(t, 2, w.Depth(), "the gate setting must not have shrunk the window")
+
+	block1 := coinbaseOnlyBlock(t, ws, ws.genesis, 1)
+
+	stub := &gateStub{observe: func() bool { return w.Lookup(block1.Hash()) != nil }}
+	ws.s.blockAssemblyClient = stub
+
+	// The gate's retry ladder is fixed at 100 attempts, so the caller's context is what ends
+	// it, exactly as it would on a shutdown with block assembly still behind.
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	err := ws.s.processBlockFound(ctx, block1.Hash(), "peer-1", "legacy", block1)
+	require.Error(t, err, "a block the gate never let through must not come back nil")
+	require.True(t, errors.IsTransientLocalError(err), "a parked gate is our condition, not the peer's: %v", err)
+	require.Contains(t, err.Error(), "block assembly not ready")
+
+	observed := stub.observations()
+	require.NotEmpty(t, observed, "the gate must have been evaluated")
+	require.True(t, observed[0], "the block must already be admitted the first time the gate is evaluated")
+
+	require.Nil(t, w.Lookup(block1.Hash()), "the gate failure must leave the window")
+	require.Zero(t, windowChainLen(w), "and must not leave the commit chain blocked behind it")
+	require.Empty(t, ws.client.addedBlocks(), "nothing may be stored for a block the gate refused")
+}
+
+// TestProcessBlockFound_ParentThatLeftTheWindowWithoutCommittingIsRefused covers the gap
+// between finding a parent in flight and admitting behind it. A parent that fails in that gap
+// is dropped from the commit chain but stays resident, so the child still resolves it and then
+// gets admitted into an empty window, which Admit reads as "the caller confirmed the parent is
+// stored". It is not stored, and committing the child would put its height in the chain store
+// with the parent's missing, so the child is refused as a local fault.
+func TestProcessBlockFound_ParentThatLeftTheWindowWithoutCommittingIsRefused(t *testing.T) {
+	ws := newWindowServer(t, "window_server_parent_left")
+
+	w := ws.s.blockValidation.quickWindow
+
+	block1 := coinbaseOnlyBlock(t, ws, ws.genesis, 1)
+	block2 := coinbaseOnlyBlock(t, ws, *block1.Hash(), 2)
+
+	// Put the parent in the window and fail it without ever committing or leaving it, which is
+	// what an aborted predecessor looks like to a child arriving right behind it.
+	parent, duplicate, err := w.Admit(context.Background(), block1)
+	require.NoError(t, err)
+	require.False(t, duplicate)
+
+	parent.Fail(errors.NewServiceError("test: the parent failed"))
+
+	require.Eventually(t, func() bool { return windowChainLen(w) == 0 }, 10*time.Second, 10*time.Millisecond,
+		"the failed parent must be dropped from the commit chain")
+	require.NotNil(t, w.Lookup(block1.Hash()), "and must still be resident, because nothing has Left it")
+
+	err = ws.s.processBlockFound(context.Background(), block2.Hash(), "peer-1", "legacy", block2)
+	require.Error(t, err, "a child whose parent failed must not come back nil")
+	require.True(t, errors.IsTransientLocalError(err), "the parent's failure is ours, not the peer's: %v", err)
+	require.Contains(t, err.Error(), "left the window without committing")
+
+	require.Nil(t, w.Lookup(block2.Hash()), "the child must have left the window it was refused from")
+	require.Empty(t, ws.client.addedBlocks(), "neither block may reach the chain store")
 }

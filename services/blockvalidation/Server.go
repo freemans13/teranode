@@ -1595,13 +1595,14 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	// what every consumer downstream reads.
 	unifiedRoute := u.legacyUnifiedRoute(block, baseURL)
 
-	// The two evaluations disagree only if the settled height crossed the checkpoint boundary
-	// the request height was on. deriveBlockHeight has already refused every non-zero claim
-	// that is not parent+1, and the window route is only reachable with a claim set, so this
-	// is unreachable; it is here so that a future caller which does reach it fails closed
-	// rather than admitting a block on a route it no longer belongs to.
+	// The two evaluations disagree only if the checkpoint boundary moved between them, which
+	// takes a local settings or params change: deriveBlockHeight has already refused every
+	// non-zero claim that is not parent+1, and the window route is only reachable with a claim
+	// set. So the cause is ours, never the peer's, and this is a local fault. It is here so
+	// that a caller which does reach it fails closed rather than being admitted on a route it
+	// no longer belongs to.
 	if windowRoute && !unifiedRoute {
-		return errors.NewBlockInvalidError("[processBlockFound][%s] rejecting block with peer-inconsistent height: settled height %d is not on the unified route its request height claimed", hash.String(), block.Height)
+		return errors.NewServiceError("[processBlockFound][%s] the unified route closed under this block at height %d between the request height and the settled height", hash.String(), block.Height)
 	}
 
 	// Admission comes BEFORE the block-assembly gate. The gate can park a block for as long
@@ -1614,6 +1615,13 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 
 		entry, duplicate, err = u.blockValidation.quickWindow.Admit(ctx, block)
 		if err != nil {
+			// Admit's own refusals are already service errors, but a caller parked below depth
+			// hands back the bare context error, which errors.IsTransientLocalError does not
+			// recognise: legacy sync would rotate the peer over our own shutdown.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return errors.NewServiceError("[processBlockFound][%s] admission cancelled", hash.String(), err)
+			}
+
 			return err
 		}
 
