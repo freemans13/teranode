@@ -52,6 +52,14 @@ func unpackMembership(m []byte) (blockIDs, heights []uint32, subtreeIdxs []int) 
 // transactions want this one's coins -- costs a second statement against conflict_children,
 // because a contested parent is usually mined and a mined transaction's row is in a different
 // table (see attachConflictingChildren). Both are answered only when asked for.
+//
+// A NIL Tx IS A LEGAL ANSWER, and fields.Tx does not change that. It happens for a transaction
+// whose body window has aged out, and, when utxostore_skipTxBodyBelowCheckpoint is on, for
+// every transaction mined at or below the hardcoded checkpoint, whose bytes were never written
+// (see bodyFloor on Store). Both cases return the metadata with Tx nil and NO error: the
+// transaction exists and its coins are live, so ErrTxNotFound would be a lie, and a caller
+// reading it as a missing parent would reject that transaction's children. A caller that
+// genuinely needs the bytes has to check for a nil Tx and go to the subtree data file.
 func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, fieldNames ...fields.FieldName) (*meta.Data, error) {
 	if hash == nil {
 		return nil, errors.NewProcessingError("[utxoset][Get] nil hash")

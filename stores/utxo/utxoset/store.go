@@ -9,6 +9,7 @@ import (
 
 	"github.com/bsv-blockchain/go-batcher/v2"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -73,6 +74,21 @@ type Store struct {
 
 	// bodyRetention is how long the serialized transaction bytes are kept, in blocks.
 	bodyRetention uint32
+
+	// bodyFloor is the height at or below which a MINED create writes no serialized bytes at
+	// all: the highest hardcoded checkpoint, when utxostore_skipTxBodyBelowCheckpoint is on.
+	//
+	// ZERO MEANS OFF, and it means off for two reasons that coincide rather than one standing
+	// in for the other. The setting being off leaves it 0, and a network with no checkpoints
+	// (regtest, teratestnet) computes 0 from a list with nothing in it. Both must skip
+	// nothing, and `mined height <= 0` is false for every real block because mined height 0 is
+	// the unconfirmed sentinel a mempool create carries, so the single comparison covers both
+	// without a second flag to keep in step with this one.
+	//
+	// See the setting's longdesc for why below the checkpoint the bytes are not needed: the
+	// subtree data files hold them, the outpoint-only spend route reads no parent body, and
+	// this store's decorate reads the coin row.
+	bodyFloor uint32
 
 	// coinIndexDecider decides whether a utxo_pN_ukey index has bloated past the point
 	// worth a REINDEX CONCURRENTLY. New sets it to coinIndexNeedsRebuild; it exists as a
@@ -208,6 +224,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		journalRetention: DefaultSpendJournalRetentionBlocks,
 		bodyRetention:    DefaultTxBodyRetentionBlocks,
 		coinIndexDecider: coinIndexNeedsRebuild}
+
+	// The body floor, derived from the SAME checkpoint list the outpoint-only spend gate uses
+	// (model.OutpointOnlyEligible -> model.BelowCheckpoint), so the height at which this store
+	// stops writing bodies cannot drift from the height at which spends stop reading them.
+	if tSettings.UtxoStore.SkipTxBodyBelowCheckpoint && tSettings.ChainCfgParams != nil {
+		s.bodyFloor = model.HighestCheckpointHeight(tSettings.ChainCfgParams.Checkpoints)
+
+		logger.Infof("[utxoset] skipping the tx_body write for transactions mined at or below height %d (the highest hardcoded checkpoint); block persister and the asset service need the subtree data files for those blocks", s.bodyFloor)
+	}
+
 	if err := CreateSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, errors.NewStorageError("[utxoset] create schema", err)
