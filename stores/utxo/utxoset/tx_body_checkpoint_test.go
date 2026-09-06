@@ -274,3 +274,55 @@ func TestSkipTxBodyReplayStillReportsTxExistsAndWritesNoBody(t *testing.T) {
 	require.Equal(t, 0, bodyRows(t, s, ctx, tx))
 	require.Equal(t, 1, coinCount(t, s, ctx, tx))
 }
+
+// TestGenesisKeepsItsBodyBelowTheCheckpoint pins the one height the shared boundary excludes.
+//
+// model.BelowCheckpoint requires height > 0, so genesis is NOT below the checkpoint however
+// many checkpoints sit above it. A hand-written `height <= highest` would take genesis's body
+// away, and this store would then disagree with the outpoint-only spend gate about which
+// blocks are on the fast path. The boundary has exactly one definition; this is the test that
+// says which one.
+func TestGenesisKeepsItsBodyBelowTheCheckpoint(t *testing.T) {
+	s, ctx := newCheckpointStore(t, true)
+
+	tx := mkTx(t, 1, 5_000)
+	_, err := s.Create(ctx, tx, 0, minedAt(0, 1))
+	require.NoError(t, err)
+
+	require.Equal(t, 1, bodyRows(t, s, ctx, tx), "genesis is not below the checkpoint")
+}
+
+// TestSkipTxBodyBelowCheckpointThroughSpendAndCreate is the entry point mainnet actually uses.
+//
+// Every production write is a SpendAndCreate, so a gate proven only through Create is proven on
+// a path block application does not take. The shape here is block application's own: a parent
+// already applied, then a child that spends it and is created in the same call, both carrying
+// the block that contains them.
+func TestSkipTxBodyBelowCheckpointThroughSpendAndCreate(t *testing.T) {
+	s, ctx := newCheckpointStore(t, true)
+
+	parent := mkTx(t, 2, 5_000)
+	_, err := s.Create(ctx, parent, checkpointFloor-2, minedAt(checkpointFloor-2, 5))
+	require.NoError(t, err)
+	require.Equal(t, 0, bodyRows(t, s, ctx, parent))
+
+	child := spendOutput(t, parent, 0, 2)
+
+	_, spends, err := s.SpendAndCreate(ctx, child, checkpointFloor-1, minedAt(checkpointFloor-1, 6))
+	require.NoError(t, err)
+	require.Len(t, spends, 1)
+	require.NoError(t, spends[0].Err)
+
+	require.Equal(t, 0, bodyRows(t, s, ctx, child), "the create half of the call skips the body too")
+	require.Equal(t, 2, coinCount(t, s, ctx, child), "and both its outputs still have coins")
+
+	// The parent's spent coin is gone, which is what proves the spend half ran.
+	require.Equal(t, 1, coinCount(t, s, ctx, parent))
+
+	// A body-less transaction's own outputs stay spendable.
+	grandchild := spendOutput(t, child, 0, 1)
+
+	_, err = spendOnly(ctx, s, grandchild, checkpointFloor)
+	require.NoError(t, err)
+	require.Equal(t, 1, coinCount(t, s, ctx, child))
+}

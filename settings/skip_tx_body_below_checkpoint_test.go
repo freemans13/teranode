@@ -17,21 +17,17 @@ import (
 func TestSkipTxBodyBelowCheckpoint_LoaderReadsKey(t *testing.T) {
 	const key = "utxostore_skipTxBodyBelowCheckpoint"
 
-	// gocore resolves key.<context> first, so a runtime Set on the bare key is shadowed by any
-	// settings.conf override under the ambient context. Set at the precedence that wins.
-	ctx := gocore.Config().GetContext()
-	winKey := key
-
-	if ctx != "" {
-		winKey = key + "." + ctx
-	}
-
 	require.False(t, NewSettings().UtxoStore.SkipTxBodyBelowCheckpoint,
 		"the default must be off: skipping bodies is opt-in")
 
-	gocore.Config().Set(winKey, "true")
-	t.Cleanup(func() { gocore.Config().Set(winKey, "") })
+	// t.Setenv rather than gocore.Config().Set, for two reasons. An environment variable wins
+	// over every settings.conf entry in gocore's lookup (config.go getInternal checks
+	// os.LookupEnv first), so the test is hermetic whatever context the run carries and needs
+	// no key.<context> dance. And t.Setenv RESTORES the previous state, where a Set has to be
+	// undone by hand and the only undo available is setting the key to "", which is a value
+	// rather than an absence and leaves the config dirty for the rest of the binary.
+	t.Setenv(key, "true")
 
 	require.True(t, NewSettings().UtxoStore.SkipTxBodyBelowCheckpoint,
-		"loader must read %s under context %q", key, ctx)
+		"loader must read %s under context %q", key, gocore.Config().GetContext())
 }
