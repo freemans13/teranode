@@ -1044,6 +1044,15 @@ type SubtreeProcessingBatch struct {
 	// It is per batch, never per block: a block may hold a billion transactions, the batch is
 	// the bounded unit, and this slice dies with the batch.
 	//
+	// The predicate is in-BLOCK, not in-batch: the extendedTxs map it is derived from
+	// accumulates across every batch of the block, so a child whose parent landed in an
+	// EARLIER batch is classified as chained even though that parent's create has long since
+	// committed. That is conservative rather than wrong — batches are consumed strictly
+	// serially, so such a child could safely take the one-wave path — and it costs only the
+	// transactions that straddle a batch boundary. The whole argument rests on one block being
+	// applied at a time; work that overlaps blocks has to revisit it, because a parent from a
+	// concurrently-applied block would not be in this map at all.
+	//
 	// A short or nil slice means "not derived", and txIsIndependent then answers false — a
 	// transaction of unknown provenance takes the conservative two-phase path. That is what
 	// keeps a hand-built batch (tests, and any future caller that fills batchTxs directly)
@@ -1282,12 +1291,16 @@ func (u *BlockValidation) processSubtreeBatch(
 	return batch, nil
 }
 
-// quickValidateCreateLimit returns the caller concurrency for quick validation's
-// UTXO create wave (Phase 1 of createAndSpendUTXOsForBatch, before any input is
-// spent). This is a callers-in-flight limit, not a store-statements-in-flight
-// limit: each caller blocks until the batch it lands in commits, so the number
-// of create statements actually in flight to the store is (callers / batch
-// size).
+// quickValidateCreateLimit returns the caller concurrency for each of quick
+// validation's two creating waves: the combined one-wave apply and the chained
+// create wave of createAndSpendUTXOsForBatch. Those two now run at the same
+// time, each bounded by this number, so the peak callers a batch puts on the
+// store is up to twice what this returns. The one-wave apply also spends as it
+// creates, so this is no longer a bound taken before any input is spent.
+//
+// This is a callers-in-flight limit, not a store-statements-in-flight limit:
+// each caller blocks until the batch it lands in commits, so the number of
+// statements actually in flight to the store is (callers / batch size).
 //
 // blockvalidation_quick_validate_create_concurrency, when set above 0, is used
 // directly. Otherwise the limit is derived from the UTXO store's own batcher
@@ -1356,6 +1369,8 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	var (
 		chainedCreates []txApply
 		chainedSpends  []*bt.Tx
+		chainedCount   int
+		unspendable    int
 	)
 
 	batchSize := batch.batchEnd - batch.batchStart
@@ -1370,10 +1385,17 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 			// An unspendable transaction is not written to the store at all; its inputs are
 			// still spent, so it joins the spend wave and no create wave.
 			skipCreate := shouldSkipUnspendableCreate(lockUTXOs, u.settings, tx, block.Height)
+			if skipCreate {
+				unspendable++
+			}
 
-			if !skipCreate && batch.txIsIndependent(txIdx) {
-				independent = append(independent, item)
-				continue
+			if batch.txIsIndependent(txIdx) {
+				if !skipCreate {
+					independent = append(independent, item)
+					continue
+				}
+			} else {
+				chainedCount++
 			}
 
 			if !skipCreate {
@@ -1410,10 +1432,19 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	var oneWaveDuration, chainedDuration time.Duration
 
-	// Closed when the one-wave apply is finished, win or lose. The chained spend wave waits
-	// on it as well as on its own create wave, and that is a correctness requirement, not
-	// caution: a chained transaction may spend the output of an INDEPENDENT sibling, whose
-	// create commits in the one-wave apply. Spending it before that commit would find no coin.
+	// Closed ONLY when the one-wave apply has succeeded. The chained spend wave waits on it
+	// as well as on its own create wave, and that is a correctness requirement, not caution:
+	// a chained transaction may spend the output of an INDEPENDENT sibling, whose create
+	// commits in the one-wave apply. Spending it before that commit would find no coin.
+	//
+	// Closing it on failure too — with a defer, say — would be a real regression. The
+	// errgroup records the error and cancels gCtx only AFTER the goroutine's function has
+	// returned, so a defer would leave a window in which both select arms are ready and the
+	// choice between them is random: the chained spend wave could run in full against a
+	// partially applied one-wave. The old two-phase code guaranteed no spend at all after a
+	// create-phase failure, and that guarantee is kept here by never releasing the barrier on
+	// a failure and by re-checking gCtx on both sides of the select.
+	//
 	// The waves still start together, so the wait costs nothing whenever the chained create
 	// wave is the slower of the two, which is the case whenever chained transactions dominate.
 	oneWaveDone := make(chan struct{})
@@ -1421,12 +1452,16 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	g, gCtx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		defer close(oneWaveDone)
-
 		start := time.Now()
 		defer func() { oneWaveDuration = time.Since(start) }()
 
-		return u.applyOneWave(gCtx, block, independent, lockUTXOs, outpointOnly, createLimit, collectExisting)
+		if err := u.applyOneWave(gCtx, block, independent, lockUTXOs, outpointOnly, createLimit, collectExisting); err != nil {
+			return err
+		}
+
+		close(oneWaveDone)
+
+		return nil
 	})
 
 	g.Go(func() error {
@@ -1437,10 +1472,18 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 			return err
 		}
 
+		if err := gCtx.Err(); err != nil {
+			return err
+		}
+
 		select {
 		case <-oneWaveDone:
 		case <-gCtx.Done():
 			return gCtx.Err()
+		}
+
+		if err := gCtx.Err(); err != nil {
+			return err
 		}
 
 		// Spend the chained transactions, retrying transient store errors the way the
@@ -1455,12 +1498,16 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		return u.spendBatchWithRetry(gCtx, block, chainedSpends, outpointOnly)
 	})
 
-	if err := g.Wait(); err != nil {
-		return err
-	}
+	applyErr := g.Wait()
 
-	u.logger.Infof("[createAndSpendUTXOsForBatch][%s] batch %d-%d applied: independent=%d chained=%d existing=%d (onewave=%v, chained=%v)",
-		block.Hash().String(), batch.batchStart, batch.batchEnd, len(independent), len(chainedSpends), len(existingTxHashes), oneWaveDuration, chainedDuration)
+	// Logged on the failure path too: when a batch fails, how long each wave ran for is the
+	// first thing anyone reading the log wants.
+	u.logger.Infof("[createAndSpendUTXOsForBatch][%s] batch %d-%d applied: independent=%d chained=%d unspendable=%d existing=%d (onewave=%v, chained=%v, err=%v)",
+		block.Hash().String(), batch.batchStart, batch.batchEnd, len(independent), chainedCount, unspendable, len(existingTxHashes), oneWaveDuration, chainedDuration, applyErr)
+
+	if applyErr != nil {
+		return applyErr
+	}
 
 	// Update mined info for transactions that already existed. This handles the case where a
 	// previous attempt created UTXOs with a different block ID. Chunked via the shared helper

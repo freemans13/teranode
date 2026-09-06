@@ -44,8 +44,14 @@ type recordedApply struct {
 func (r recordedApply) combined() bool { return !r.createOnly && !r.spendOnly }
 
 // applyRecorder is a real utxo.Store that also remembers every SpendAndCreate made through it.
+//
+// failCombined, when set, makes every combined (one-wave) call fail without reaching the store,
+// which is how the barrier test forces the one-wave apply to lose.
 type applyRecorder struct {
 	utxo.Store
+
+	failCombined      error
+	failCombinedDelay time.Duration
 
 	mu    sync.Mutex
 	calls []recordedApply
@@ -53,9 +59,24 @@ type applyRecorder struct {
 
 func (a *applyRecorder) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
-	md, spends, err := a.Store.SpendAndCreate(ctx, tx, blockHeight, opts...)
-
 	options := parseCreateOptions(opts)
+
+	if a.failCombined != nil && !options.CreateOnly && !options.SpendOnly {
+		// The delay is what makes the barrier test a real discriminator. It lets the chained
+		// create wave finish and park on the barrier BEFORE the one-wave apply reports its
+		// failure, so a barrier released on failure has a waiter to release.
+		if a.failCombinedDelay > 0 {
+			time.Sleep(a.failCombinedDelay)
+		}
+
+		a.mu.Lock()
+		a.calls = append(a.calls, recordedApply{txID: *tx.TxIDChainHash(), err: a.failCombined})
+		a.mu.Unlock()
+
+		return nil, nil, a.failCombined
+	}
+
+	md, spends, err := a.Store.SpendAndCreate(ctx, tx, blockHeight, opts...)
 
 	a.mu.Lock()
 	a.calls = append(a.calls, recordedApply{
@@ -83,6 +104,22 @@ func (a *applyRecorder) callsFor(h *chainhash.Hash) []recordedApply {
 	}
 
 	return out
+}
+
+// spendOnlyCalls counts the calls that carried WithSpendOnly, whatever their transaction.
+func (a *applyRecorder) spendOnlyCalls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	n := 0
+
+	for _, c := range a.calls {
+		if c.spendOnly {
+			n++
+		}
+	}
+
+	return n
 }
 
 func (a *applyRecorder) reset() {
@@ -399,6 +436,63 @@ func TestOneWave_MissingParentFailsTheBlock(t *testing.T) {
 
 	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
 	require.Error(t, err, "a transaction with no parent anywhere must fail the block")
-	require.True(t, errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrProcessing),
-		"the failure must name the missing coin, got: %v", err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound),
+		"the failure must be the not-found class, got: %v", err)
+	require.Contains(t, err.Error(), fmt.Sprintf("%s:0", ghost.TxIDChainHash().String()),
+		"the failure must name the missing outpoint, got: %v", err)
+}
+
+// TestOneWave_FailedApplyReleasesNoChainedSpends pins the barrier's failure side.
+//
+// The chained spend wave must not start when the one-wave apply has failed: the one-wave set
+// is then only partly applied, and a chained transaction may spend the output of an
+// independent sibling whose create never landed. The two-phase code it replaces guaranteed
+// zero spends after a create-phase failure, and that guarantee has to survive the two waves
+// running at the same time.
+//
+// What this test can and cannot prove. It catches any DETERMINISTIC release of the barrier on
+// a failed apply — a barrier closed before the apply runs, or closed unconditionally with the
+// gCtx guards gone. It did NOT go red against the shape it replaced, a plain
+// `defer close(oneWaveDone)`, in 100 attempts: applyTxsWithRetry checks ctx.Err() before it
+// issues anything, so the exposure is only the nanoseconds between the barrier closing and
+// the errgroup cancelling its context, and the spend wave loses that race every time. The fix
+// is therefore hardening of a reasoning hazard rather than of a reproduced failure, and this
+// test is its regression guard, not its proof.
+//
+// failCombinedDelay makes the chained create wave finish and park on the barrier before the
+// one-wave apply reports its failure, which is the widest window the black box allows.
+func TestOneWave_FailedApplyReleasesNoChainedSpends(t *testing.T) {
+	for run := 0; run < 5; run++ {
+		t.Run(fmt.Sprintf("run %d", run), func(t *testing.T) {
+			bv, recorder, cleanup := newOneWaveHarness(t, fmt.Sprintf("one_wave_barrier_%d", run))
+			defer cleanup()
+
+			ctx := context.Background()
+
+			root, key := seedRoot(t, recorder.Store, 3, "ONE_WAVE_BARRIER_KEY")
+
+			// c1 is independent and c2 spends it, so c2's spend depends on c1's create — which
+			// is exactly the create the failing one-wave apply never lands.
+			c1 := spendOf(t, key, root, 0, 90_000)
+			c2 := spendOf(t, key, c1, 0, 80_000)
+			i1 := spendOf(t, key, root, 1, 90_000)
+
+			block := &model.Block{Height: 100, ID: 42}
+			batch := oneWaveBatchFor(t, bv, block, []*bt.Tx{c1, c2, i1})
+
+			require.Equal(t, []bool{false, true, false}, batch.hasInBlockParent)
+
+			recorder.reset()
+			recorder.failCombined = errors.NewProcessingError("forced one-wave failure")
+			recorder.failCombinedDelay = 50 * time.Millisecond
+
+			err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+			require.Error(t, err, "a failed one-wave apply must fail the block")
+
+			require.Zero(t, recorder.spendOnlyCalls(),
+				"no chained spend may be issued after the one-wave apply failed")
+			require.Contains(t, err.Error(), "forced one-wave failure",
+				"the apply's own failure must surface, not a context error masking it")
+		})
+	}
 }
