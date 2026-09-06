@@ -326,10 +326,11 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 // locked UTXOs, update subtree DAH (which fires BlockSubtreesSet), and mark the
 // block present in cache. Extracted verbatim from quickValidateBlock /
 // quickValidateBlockAsync so both share one commit tail; it is also the per-block
-// commit unit the Step-8 parallel window's ordered committer calls in height order.
+// commit unit the quick window's committer runs in height order, see quick_window.go.
 // caller labels logs to preserve each call site's existing text.
 func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, peerID, caller string) error {
-	// add block directly to blockchain
+	start := time.Now()
+
 	if err := u.blockchainClient.AddBlock(ctx,
 		block,
 		peerID,
@@ -340,20 +341,31 @@ func (u *BlockValidation) commitBlock(ctx context.Context, block *model.Block, p
 		return errors.NewProcessingError("[%s][%s] failed to add block to blockchain", caller, block.Hash().String(), err)
 	}
 
+	prometheusBlockValidationQuickCommitAddBlock.Observe(time.Since(start).Seconds())
+	start = time.Now()
+
 	// Unlock all UTXOs - final commit point (no-op when the lock was never taken; #1103).
 	if err := u.unlockSubtreeTransactionsIfNeeded(ctx, block, caller); err != nil {
 		return err
 	}
+
+	prometheusBlockValidationQuickCommitUnlock.Observe(time.Since(start).Seconds())
+	start = time.Now()
 
 	// Update subtrees DAH and send BlockSubtreesSet notification.
 	if err := u.updateSubtreesDAH(ctx, block); err != nil {
 		return errors.NewProcessingError("[%s][%s] failed to update subtrees DAH", caller, block.Hash().String(), err)
 	}
 
+	prometheusBlockValidationQuickCommitSubtreesSet.Observe(time.Since(start).Seconds())
+	start = time.Now()
+
 	// Mark block as existing in cache.
 	if err := u.SetBlockExists(block.Hash()); err != nil {
 		u.logger.Errorf("[%s][%s] failed to set block exists cache: %s", caller, block.Hash().String(), err)
 	}
+
+	prometheusBlockValidationQuickCommitBlockExists.Observe(time.Since(start).Seconds())
 
 	return nil
 }
