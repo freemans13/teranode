@@ -41,8 +41,11 @@ import (
 // createIdentPlanSQL's and createMinedPlanSQL's claim-gates-the-body join, run backwards, and it
 // has to run backwards from BOTH: a mempool transaction's body is claimed by tx_ident, but a
 // block-path transaction's is claimed by tx_mined instead (see createMinedPlanSQL), and either
-// one always writes a tx_body row. gone -- the UNION of what ident and mined actually deleted --
-// is therefore the only complete set of (created_height, txid) pairs to join tx_body against.
+// one may have written a tx_body row. gone -- the UNION of what ident and mined actually deleted
+// -- is therefore the only complete set of (created_height, txid) pairs to join tx_body against.
+// "May" rather than "always" since utxostore_skipTxBodyBelowCheckpoint: a transaction mined at
+// or below the checkpoint has no body to reach, and a DELETE that matches nothing is not an
+// error, so the join is unchanged either way.
 // Joining through ident alone left a mined-only transaction's body behind: no tx_ident row
 // exists to gate it, so nothing found it, and it sat there until its 288-block body window aged
 // out on its own, contradicting Delete's promise to remove every trace immediately.

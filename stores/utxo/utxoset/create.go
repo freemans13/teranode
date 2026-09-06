@@ -316,6 +316,22 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 		subtreeIdx = int32(mi.SubtreeIdx)   //nolint:gosec // a subtree index fits int32
 	}
 
+	// The serialized bytes, or nothing at all for a transaction mined at or below the
+	// hardcoded checkpoint when the operator has asked for that (see bodyFloor on Store).
+	//
+	// nil rather than an empty slice, because nil is what pgx sends as SQL NULL inside a
+	// bytea[], and NULL is what the statement's body CTE tests on. An empty slice would write
+	// a zero-length body row, which is a row the reader would then try to decode.
+	//
+	// The gate is on the MINED height, not on the height the create was filed at. Only a
+	// transaction a block places below the checkpoint has its bytes in a subtree data file; a
+	// mempool arrival carries no mined height at all and keeps its body whatever the setting
+	// says, which is why `mined` has to hold before the comparison is even meaningful.
+	body := tx.Bytes()
+	if mined && s.bodyFloor > 0 && mi.BlockHeight <= s.bodyFloor {
+		body = nil
+	}
+
 	// The identity row. k is this transaction's position in the statement, and the result
 	// comes back keyed on it, so a caller learns whether its OWN claim took rather than
 	// whether the batch as a whole wrote anything.
@@ -332,7 +348,7 @@ func (s *Store) appendCreate(p *createPlan, item int, tx *bt.Tx, blockHeight uin
 	p.locktimes = append(p.locktimes, int32(tx.LockTime))
 	p.createdAt = append(p.createdAt, time.Now().UnixMilli())
 	p.txFlags = append(p.txFlags, flags)
-	p.bodies = append(p.bodies, tx.Bytes())
+	p.bodies = append(p.bodies, body)
 	p.minedRows = append(p.minedRows, mined)
 	p.minedHeight = append(p.minedHeight, minedHeight)
 	p.blockID = append(p.blockID, blockID)

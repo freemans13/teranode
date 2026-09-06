@@ -165,6 +165,14 @@ SELECT t.k
 // block path only creates coinbases, which have no inputs. fee is written NULL for the same
 // reason createIdentPlanSQL writes it NULL -- the store never computes one, and a coinbase
 // has none to compute.
+//
+// The body CTE's `raw_tx IS NOT NULL` is how utxostore_skipTxBodyBelowCheckpoint is applied,
+// and it is a filter on the ROW rather than a second statement on purpose. Block application
+// below the checkpoint and the tip's own writes reach the same batcher, so one statement
+// routinely carries transactions from both sides of the floor; and a second statement would be
+// a second plan, which on this store means a second set of estimates to keep honest. The
+// caller decides per transaction by handing NULL instead of the bytes (see appendCreate),
+// so this statement needs no knowledge of checkpoints at all.
 const createMinedPlanSQL = `
 WITH t AS (
     SELECT * FROM unnest($1::int[], $2::smallint[], $3::bytea[], $4::int[], $5::int[],
@@ -191,6 +199,7 @@ body AS (
     INSERT INTO tx_body (created_height, txid, raw_tx)
     SELECT t.created_height, t.txid, t.raw_tx
       FROM t JOIN claim c ON c.txid = t.txid
+     WHERE t.raw_tx IS NOT NULL
 ),
 coins AS (
     INSERT INTO utxo (satoshis, created_height, spendable_from, mined_height, block_id,
