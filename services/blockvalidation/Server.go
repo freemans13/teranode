@@ -1561,7 +1561,7 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 	// quick-validation machinery as native catchup (default off).
 	if u.legacyUnifiedRoute(block, baseURL) {
 		u.logger.Debugf("[processBlockFound][%s] unified route: quick-validating legacy block at height %d", block.Hash().String(), block.Height)
-		return u.blockValidation.quickValidateBlock(ctx, block, peerID, baseURL)
+		return u.blockValidation.quickValidateBlock(ctx, block, peerID, baseURL, nil)
 	}
 
 	// validate the block

@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"golang.org/x/sync/semaphore"
 )
@@ -96,6 +97,29 @@ type batchGate struct {
 	done   chan struct{}
 	failed atomic.Bool
 	once   sync.Once
+}
+
+// quickWindowDepth is the effective depth: the setting, capped at half the block-assembly
+// gate's allowance so admission never enters the gate's retry ladder, and forced to 1 unless
+// coins are created unlocked below the checkpoint (the unlock statement over block N's rows
+// racing block N+1's deletes of the same rows is a postgres deadlock shape).
+func quickWindowDepth(s *settings.Settings, logger ulogger.Logger) int {
+	depth := s.BlockValidation.QuickWindowBlocks
+	if depth <= 1 {
+		return depth
+	}
+
+	if !s.BlockValidation.QuickValidateSkipUtxoLock {
+		logger.Warnf("[quickWindow] blockvalidation_quick_window_blocks=%d requires blockvalidation_quick_validate_skip_utxo_lock=true; running with depth 1", depth)
+		return 1
+	}
+
+	if capped := s.BlockValidation.MaxBlocksBehindBlockAssembly / 2; capped >= 1 && depth > capped {
+		logger.Warnf("[quickWindow] blockvalidation_quick_window_blocks=%d capped at %d (half of blockvalidation_maxBlocksBehindBlockAssembly)", depth, capped)
+		depth = capped
+	}
+
+	return depth
 }
 
 func newQuickWindow(logger ulogger.Logger, depth int, callerLimit int, commit func(context.Context, *windowEntry) error) *quickWindow {

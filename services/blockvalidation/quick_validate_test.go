@@ -43,7 +43,7 @@ func TestQuickValidateBlock(t *testing.T) {
 
 		block := testhelpers.CreateTestBlocks(t, 1)[0]
 
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "", nil)
 		assert.NoError(t, err, "Should successfully quick validate an empty block")
 
 		// Verify AddBlock was called with correct parameters
@@ -138,7 +138,7 @@ func TestQuickValidateBlock(t *testing.T) {
 		// Setup validator to return no errors (one for each transaction: coinbase + 2 regular)
 		suite.MockValidator.Errors = []error{nil, nil, nil}
 
-		err = suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+		err = suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "", nil)
 		assert.NoError(t, err, "Should successfully quick validate a block with transactions")
 
 		// Verify AddBlock was called with correct parameters
@@ -199,7 +199,7 @@ func TestProcessBlockSubtrees(t *testing.T) {
 		}
 
 		// Execute processBlockSubtrees (outpointOnly irrelevant here — errors on no subtrees)
-		_, err := suite.Server.blockValidation.processBlockSubtrees(suite.Ctx, block, false)
+		_, err := suite.Server.blockValidation.processBlockSubtrees(suite.Ctx, block, false, nil)
 
 		// Verify error
 		assert.Error(t, err, "Should fail when block has no subtrees")
@@ -505,7 +505,7 @@ func TestProcessSubtreeBatch_SameBlockParentVoutBounds(t *testing.T) {
 
 	// Must return a clean error (not panic) whose chain mentions the out-of-range output.
 	require.NotPanics(t, func() {
-		_, err = suite.Server.blockValidation.processBlockSubtrees(suite.Ctx, block, false)
+		_, err = suite.Server.blockValidation.processBlockSubtrees(suite.Ctx, block, false, nil)
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "non-existent output")
@@ -519,7 +519,7 @@ func TestQuickValidateBlock_IncompleteBlockNilCoinbase(t *testing.T) {
 		block := testhelpers.CreateTestBlocks(t, 1)[0]
 		block.CoinbaseTx = nil
 
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "", nil)
 		require.Error(t, err)
 		assert.True(t, errors.Is(err, errors.ErrBlockIncomplete), "expected ErrBlockIncomplete, got: %v", err)
 		assert.False(t, errors.Is(err, errors.ErrBlockInvalid), "should NOT be ErrBlockInvalid")
@@ -532,7 +532,7 @@ func TestQuickValidateBlock_IncompleteBlockNilCoinbase(t *testing.T) {
 		block := testhelpers.CreateTestBlocks(t, 1)[0]
 		block.CoinbaseTx = &bt.Tx{Inputs: []*bt.Input{}}
 
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "", nil)
 		require.Error(t, err)
 		assert.True(t, errors.Is(err, errors.ErrBlockIncomplete), "expected ErrBlockIncomplete, got: %v", err)
 		assert.False(t, errors.Is(err, errors.ErrBlockInvalid), "should NOT be ErrBlockInvalid")
@@ -785,7 +785,7 @@ func TestQuickValidateBlock_UtxoLockGating(t *testing.T) {
 
 		block := buildOneSubtreeBlock(t, suite, 100)
 
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "", nil)
 		require.NoError(t, err)
 
 		assertCreatedLocked(t, suite.MockUTXOStore, true)
@@ -801,7 +801,7 @@ func TestQuickValidateBlock_UtxoLockGating(t *testing.T) {
 
 		block := buildOneSubtreeBlock(t, suite, 100)
 
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "", nil)
 		require.NoError(t, err)
 
 		assertCreatedLocked(t, suite.MockUTXOStore, false)
@@ -817,7 +817,7 @@ func TestQuickValidateBlock_UtxoLockGating(t *testing.T) {
 
 		block := buildOneSubtreeBlock(t, suite, 100)
 
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "", nil)
 		require.NoError(t, err)
 
 		assertCreatedLocked(t, suite.MockUTXOStore, true)
@@ -918,7 +918,7 @@ func TestQuickValidate_OutpointOnly_NoDecorate_ZeroFees(t *testing.T) {
 		enableOutpointOnlyFastPath(t, suite) // make the mock store report fast-path support
 		block := buildOneSubtreeBlockWithExternalParentTx(t, suite, 500)
 
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "", nil)
 		require.NoError(t, err)
 
 		// Gate suppresses the call — no expectation registered, any call would panic.
@@ -947,7 +947,7 @@ func TestQuickValidate_OutpointOnly_NoDecorate_ZeroFees(t *testing.T) {
 		// Register expectation: decorate must be called with the unextended tx.
 		suite.MockUTXOStore.On("BatchPreviousOutputsDecorate", mock.Anything, mock.Anything).Return(nil).Once()
 
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "", nil)
 		require.NoError(t, err)
 
 		// Without the gate, decorate IS called — proving the un-extended tx genuinely
@@ -1245,7 +1245,7 @@ func TestOutpointOnly_MetricIncrementsBelowOnly(t *testing.T) {
 		block := buildOneSubtreeBlock(t, suite, 500)
 
 		before := prometheustestutil.ToFloat64(prometheusBlockValidationOutpointOnlyBlocks)
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "", nil)
 		require.NoError(t, err)
 		require.Equal(t, before+1, prometheustestutil.ToFloat64(prometheusBlockValidationOutpointOnlyBlocks))
 	})
@@ -1261,7 +1261,7 @@ func TestOutpointOnly_MetricIncrementsBelowOnly(t *testing.T) {
 		block := buildOneSubtreeBlock(t, suite, 500)
 
 		before := prometheustestutil.ToFloat64(prometheusBlockValidationOutpointOnlyBlocks)
-		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "")
+		err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test-peer", "", nil)
 		require.NoError(t, err)
 		require.Equal(t, before, prometheustestutil.ToFloat64(prometheusBlockValidationOutpointOnlyBlocks))
 	})

@@ -122,6 +122,23 @@ func (a *applyRecorder) spendOnlyCalls() int {
 	return n
 }
 
+// spendCallsFor counts the spend-only calls recorded for one transaction. A block that was
+// stopped before its spend wave ran has none.
+func (a *applyRecorder) spendCallsFor(tx *bt.Tx) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	n := 0
+
+	for _, c := range a.calls {
+		if c.spendOnly && c.txID == *tx.TxIDChainHash() {
+			n++
+		}
+	}
+
+	return n
+}
+
 func (a *applyRecorder) reset() {
 	a.mu.Lock()
 	a.calls = nil
