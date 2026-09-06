@@ -146,6 +146,14 @@ func newQuickWindow(logger ulogger.Logger, depth int, callerLimit int, commit fu
 	return w
 }
 
+// quickWindowParentWait bounds how long a window-route block waits for its parent to be
+// admitted before deciding the parent is neither stored nor in flight. Legacy sync hands
+// block N+1 over as soon as N's own call has started, so the gap between the two is normally
+// microseconds; the ten seconds is there for a badly stalled predecessor, not for the common
+// case. It is a var rather than a const only so tests can shrink it: nothing writes it in
+// production.
+var quickWindowParentWait = 10 * time.Second
+
 func (w *quickWindow) Enabled() bool { return w != nil && w.depth >= 1 }
 
 func (w *quickWindow) Depth() int {
