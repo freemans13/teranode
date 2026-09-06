@@ -295,6 +295,12 @@ func (w *quickWindow) AwaitParent(ctx context.Context, parent *chainhash.Hash, t
 
 // GateFor returns the open gate that will release txid, unless it belongs to owner: an entry
 // never waits on its own gates (in-block parents are handled by the two-phase path).
+//
+// A gate returned here always belongs to a PREDECESSOR of owner, never to a successor: a batch
+// registers only the ids of its own block, and admission accepts only the current tail's child,
+// so every other entry holding an id is either ahead of owner in the chain or has already left.
+// That one-way shape is what makes the shared caller budget deadlock-free — waiting always runs
+// backwards along the chain, and a block parked on a gate holds no caller slot.
 func (w *quickWindow) GateFor(owner *windowEntry, txid *chainhash.Hash) *batchGate {
 	w.mu.Lock()
 	defer w.mu.Unlock()

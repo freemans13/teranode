@@ -3,6 +3,7 @@ package blockvalidation
 import (
 	"bufio"
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -211,8 +212,10 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 	if err != nil {
 		entry.Fail(err)
 
-		// Return the recorded outcome: for an aborted successor that is the predecessor's
-		// service error, not whatever the cancelled pipeline surfaced first.
+		// Return the recorded outcome, on the CALLER's context: the inner wait runs on the
+		// entry's own context, which an abort cancels, so it hands back a generic cancellation
+		// where this one hands back the predecessor's recorded service error. That is the error
+		// legacy sync has to see to treat the failure as ours rather than the peer's.
 		if werr := entry.WaitCommitted(ctx); werr != nil {
 			return werr
 		}
@@ -266,9 +269,10 @@ func (u *BlockValidation) quickValidateBlockInner(ctx context.Context, block *mo
 			return errors.NewProcessingError("[quickValidateBlock][%s] block ID was not assigned during subtree processing", block.Hash().String())
 		}
 
-		// Belt and braces: a block whose every batch was empty never reaches the in-pipeline
-		// probe, and a successor waiting on this signal would then wait until this block
-		// committed. IDAssigned is idempotent, so signalling it again here costs nothing.
+		// Belt and braces for the one case the in-pipeline probe cannot reach: a retry that
+		// arrives with block.ID already set and whose every batch turns out to be empty never
+		// runs the probe, so nothing there signals. Without this a successor would wait on
+		// idAssigned until this block committed. IDAssigned is idempotent.
 		if entry != nil {
 			entry.IDAssigned()
 		}
@@ -293,6 +297,12 @@ func (u *BlockValidation) quickValidateBlockInner(ctx context.Context, block *mo
 
 		if entry != nil {
 			entry.IDAssigned()
+			// A coinbase-only block registers no batches at all, so nothing else would ever
+			// close its registered channel. Without this a successor's
+			// WaitPredecessorsRegistered would fall through to the committed channel instead,
+			// which only closes once the ordered committer has run this block — collapsing the
+			// window to depth 1 for exactly the blocks early mainnet is made of.
+			entry.RegistrationComplete()
 		}
 	}
 
@@ -304,6 +314,10 @@ func (u *BlockValidation) quickValidateBlockInner(ctx context.Context, block *mo
 	// this call returns whatever that produced for this block.
 	entry.StoreDone()
 
+	// ctx here is the ENTRY's context, which failLocked cancels. For a successor aborted by a
+	// predecessor that means this call usually returns a generic cancellation rather than the
+	// predecessor's recorded service error. The wrapper re-waits on the caller's context and
+	// that is what surfaces the real cause, so neither wait can be simplified away.
 	return entry.WaitCommitted(ctx)
 }
 
@@ -1912,6 +1926,14 @@ const spendRetryBackoffDefault = 2 * time.Second
 // spentWithoutConflict reports whether err is a "utxo already spent" that names no spending
 // transaction. One that DOES name a spender is a genuine conflict and keeps its own hard-fail:
 // only the anonymous form is the shape a missed gate produces.
+//
+// Every store in this tree builds a real double spend through errors.NewUtxoSpentError with a
+// non-nil SpendingData, so "no spender named" really does exclude them: sql (sql.go, five call
+// sites, including the concurrently-spent branch that substitutes the attempted spend data when
+// the winner is unknown), aerospike (spend.go), and the shared duplicate_spend.go rejection that
+// both go through; nullstore never raises it at all. A future store that reported ErrSpent
+// with an empty SpendingData would be treated as a possible gate miss, which is the fail-closed
+// direction: a local fault and a retry rather than a peer ban.
 func spentWithoutConflict(err error) bool {
 	if !errors.Is(err, errors.ErrSpent) {
 		return false
@@ -1923,6 +1945,46 @@ func spentWithoutConflict(err error) bool {
 	}
 
 	return true
+}
+
+// windowMissSuspects returns the input parents the error actually points at.
+//
+// An ErrSpent carries the outpoint in structured data (UtxoSpentErrData.Hash is the parent
+// whose output was spent), so it names exactly one. ErrTxNotFound carries nothing structured —
+// the SQL store spells it "output <txid>:<vout> not found" in the message and nothing else — so
+// the parents are picked out by looking for their txid in the error text, which any store that
+// reports the outpoint at all must contain.
+//
+// An error that names no parent this transaction spends falls back to every parent. That keeps
+// the backstop working against a store whose wording we cannot read, at the cost of the wider
+// any-registered-parent rule for those.
+func windowMissSuspects(tx *bt.Tx, err error) []*chainhash.Hash {
+	var spent *errors.UtxoSpentErrData
+	if errors.AsData(err, &spent) && spent != nil {
+		named := spent.Hash
+
+		return []*chainhash.Hash{&named}
+	}
+
+	text := err.Error()
+	named := make([]*chainhash.Hash, 0, 1)
+
+	for _, in := range tx.Inputs {
+		if parent := in.PreviousTxIDChainHash(); strings.Contains(text, parent.String()) {
+			named = append(named, parent)
+		}
+	}
+
+	if len(named) > 0 {
+		return named
+	}
+
+	all := make([]*chainhash.Hash, 0, len(tx.Inputs))
+	for _, in := range tx.Inputs {
+		all = append(all, in.PreviousTxIDChainHash())
+	}
+
+	return all
 }
 
 // windowMissError reclassifies a spend that found no coin although an in-flight block had
@@ -1940,8 +2002,7 @@ func windowMissError(block *model.Block, w *quickWindow, tx *bt.Tx, err error) e
 		return err
 	}
 
-	for _, in := range tx.Inputs {
-		parent := in.PreviousTxIDChainHash()
+	for _, parent := range windowMissSuspects(tx, err) {
 		if !w.Registered(parent) {
 			continue
 		}
