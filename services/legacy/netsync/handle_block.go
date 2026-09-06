@@ -669,10 +669,23 @@ func (sm *SyncManager) legacyUnified(height uint32) bool {
 		sm.legacyOutpointOnly(height)
 }
 
+// windowRouteEnabled is every conjunct of windowRoute that does not depend on the
+// block's height: the settings, the store's outpoint-only support and the chain
+// params. The dispatcher asks it before spending an RPC to resolve a block's height,
+// because with any of these off the answer to windowRoute could only be false.
+func (sm *SyncManager) windowRouteEnabled() bool {
+	return sm.settings != nil &&
+		sm.settings.BlockValidation.QuickWindowBlocks >= 1 &&
+		sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint &&
+		sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint &&
+		sm.utxoStore != nil && sm.utxoStore.SupportsOutpointOnlySpend() &&
+		sm.chainParams != nil
+}
+
 // windowRoute reports whether blocks at height take the quick window: the unified
 // below-checkpoint route with the window setting at 1 or more.
 func (sm *SyncManager) windowRoute(height uint32) bool {
-	return sm.settings != nil && sm.settings.BlockValidation.QuickWindowBlocks >= 1 && sm.legacyUnified(height)
+	return sm.windowRouteEnabled() && model.BelowCheckpoint(sm.chainParams.Checkpoints, height)
 }
 
 // legacyFailClosed reports whether this block takes the fail-closed variant of the
