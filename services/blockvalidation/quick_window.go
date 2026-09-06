@@ -41,6 +41,7 @@ type quickWindow struct {
 
 	mu      sync.Mutex
 	cond    *sync.Cond // signalled when an entry leaves or is admitted
+	shut    bool       // set once the committer has stopped; refuses every further Admit
 	entries []*windowEntry
 	byHash  map[chainhash.Hash]*windowEntry
 	// open holds every registered id whose gate has not closed; retained holds every id
@@ -148,6 +149,10 @@ func (w *quickWindow) Admit(ctx context.Context, block *model.Block) (*windowEnt
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.shut {
+		return nil, false, errors.NewServiceError("[quickWindow] window closed")
+	}
+
 	if e, ok := w.byHash[hash]; ok {
 		return e, true, nil
 	}
@@ -159,6 +164,10 @@ func (w *quickWindow) Admit(ctx context.Context, block *model.Block) (*windowEnt
 	for len(w.entries) >= w.depth {
 		if err := w.waitLocked(ctx); err != nil {
 			return nil, false, err
+		}
+
+		if w.shut {
+			return nil, false, errors.NewServiceError("[quickWindow] window closed")
 		}
 
 		if e, ok := w.byHash[hash]; ok {
@@ -198,6 +207,8 @@ func (w *quickWindow) Admit(ctx context.Context, block *model.Block) (*windowEnt
 	w.byHash[hash] = e
 	// The gauge means "admitted and not yet left", which is len(byHash): an entry that has
 	// committed or aborted stays there, holding its dedup slot, until its owner calls Leave.
+	// It can legitimately read above the configured depth (the admission bound, len(entries))
+	// by however many entries are in exactly that committed-or-aborted-but-not-yet-left state.
 	prometheusBlockValidationQuickWindowDepth.Set(float64(len(w.byHash)))
 	w.cond.Broadcast()
 	w.kick()
@@ -295,6 +306,7 @@ func (w *quickWindow) run(ctx context.Context) {
 		if head == nil {
 			select {
 			case <-ctx.Done():
+				w.shutdown()
 				return
 			case <-w.wake:
 				continue
@@ -305,12 +317,7 @@ func (w *quickWindow) run(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
-			// Every entry still in the ordered chain is parked on WaitCommitted with nothing
-			// left to close its committed channel once this goroutine stops. Abort the whole
-			// remaining chain so nothing waits forever past shutdown.
-			w.logger.Warnf("[quickWindow][%s] shutting down: aborting in-flight window from height %d", head.hash.String(), head.height)
-			w.abortFrom(head, "shutdown")
-
+			w.shutdown()
 			return
 		case <-head.storeDone:
 			if head.failed.Load() {
@@ -336,6 +343,25 @@ func (w *quickWindow) run(ctx context.Context) {
 			// Closed by Fail before store work finished; cause unused, already recorded there.
 			w.abortFrom(head, "head_failed")
 		}
+	}
+}
+
+// shutdown marks the window closed to new admissions and aborts every entry still resident.
+// It loops rather than aborting a single captured head, because a concurrent Leave's own abort
+// cascade (see leave) can have already invalidated whatever entry a single read of head would
+// have returned; re-reading head each time always finds whatever is actually still there. shut
+// is set before the loop starts, under w.mu, so no Admit racing in around this moment can add
+// an entry after the point this loop stops looking: it either lands in w.entries before shut is
+// observed true (and this loop catches it) or observes shut and refuses.
+func (w *quickWindow) shutdown() {
+	w.mu.Lock()
+	w.shut = true
+	w.mu.Unlock()
+
+	w.logger.Warnf("[quickWindow] shutting down: aborting the in-flight window and refusing further admissions")
+
+	for e := w.head(); e != nil; e = w.head() {
+		w.abortFrom(e, "shutdown")
 	}
 }
 
@@ -430,7 +456,14 @@ func (w *quickWindow) leave(e *windowEntry) {
 
 	if stillQueued {
 		w.logger.Warnf("[quickWindow][%s] left before commit at height %d; aborting window from here", e.hash.String(), e.height)
-		e.recordErr(errors.NewServiceError("[quickWindow][%s] left before commit at height %d", e.hash.String(), e.height))
+
+		// recordErr is first-wins: only offer this generic cause if nothing more specific
+		// (a real commit failure, a gate failure) got there first. failLocked still does the
+		// authoritative failed-flag CAS below, this just avoids clobbering a better message.
+		if !e.failed.Load() {
+			e.recordErr(errors.NewServiceError("[quickWindow][%s] left before commit at height %d", e.hash.String(), e.height))
+		}
+
 		w.abortFrom(e, "left_before_commit")
 	}
 
@@ -446,10 +479,14 @@ func (w *quickWindow) leave(e *windowEntry) {
 
 	delete(w.byHash, e.hash)
 
-	// A predecessor that has left has already closed registered/idAssigned/committed, so a
-	// child still pointing to it loses nothing by having the link cleared — and without this,
-	// every entry would keep pinning the one before it back to the last time the window was
-	// empty, which under continuous IBD is never.
+	// A predecessor that has left has committed closed (either it resolved normally before
+	// Leave was called, or the stillQueued branch above just fail-closed it), and on the
+	// failure path abortFrom has already fail-closed every successor still pointing to it
+	// before this loop runs. So no live successor can wrongly read a cleared link as "there
+	// was never a predecessor" — it has already observed the real outcome, or is about to via
+	// its own committed channel. Without clearing the link at all, every entry would keep
+	// pinning the one before it back to the last time the window was empty, which under
+	// continuous IBD is never.
 	for _, x := range w.byHash {
 		if x.parent == e {
 			x.parent = nil
@@ -466,14 +503,19 @@ func (w *quickWindow) leave(e *windowEntry) {
 			delete(w.open, id)
 		}
 	}
-	// Nothing still reachable needs these: children no longer point at e, and its own gates
-	// have already been closed (either by a normal commit's caller or by failLocked above).
-	e.block = nil
+	// txids and gates are no longer reachable from anyone (children no longer point at e, and
+	// its own gates are already closed), so free them here. e.block is left alone: on the
+	// leave-before-commit path the committer can still be inside commit(ctx, e), reading
+	// e.Block() through its unlocked getter, at the very moment this runs — nil-ing it here
+	// would race that read and could hand the commit callback a nil block. The struct, block
+	// included, is reclaimed once nothing (including the committer's own stack) references it.
 	e.txids = nil
 	e.gates = nil
 	e.gatesMu.Unlock()
 
-	// The gauge means "admitted and not yet left".
+	// "Admitted and not yet left": this can legitimately read above the configured depth by
+	// however many entries have committed or aborted (freeing their w.entries slot) but whose
+	// owner hasn't called Leave yet.
 	prometheusBlockValidationQuickWindowDepth.Set(float64(len(w.byHash)))
 	w.cond.Broadcast()
 	w.kick()
@@ -504,8 +546,9 @@ func (e *windowEntry) Context() context.Context { return e.ctx }
 
 // parentEntry reads the current predecessor link under the window's lock: leave clears a
 // child's link to its parent the moment the parent itself leaves, so this is the only safe way
-// to read it. A predecessor that has left has already closed registered/idAssigned/committed,
-// so treating a cleared link as "no predecessor" loses nothing.
+// to read it. A predecessor that has left has committed closed, and on the failure path every
+// successor still pointing to it was already fail-closed by abortFrom before the link was
+// cleared, so treating a cleared link as "no predecessor" never loses a live signal.
 func (e *windowEntry) parentEntry() *windowEntry {
 	e.w.mu.Lock()
 	defer e.w.mu.Unlock()

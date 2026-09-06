@@ -467,11 +467,18 @@ func TestQuickWindow_ConcurrentHeadFailureAndBlockedAdmitResolveWithoutDeadlock(
 	e3, _, err := w.Admit(ctx, blocks[2])
 	require.NoError(t, err)
 
-	admitted := make(chan *windowEntry, 1)
+	// admitResult carries the goroutine's outcome back to the test goroutine: require must
+	// never be called from a non-test goroutine, since t.FailNow only unwinds that goroutine,
+	// not the test.
+	type admitResult struct {
+		e   *windowEntry
+		err error
+	}
+
+	admitted := make(chan admitResult, 1)
 	go func() {
 		e4, _, err := w.Admit(ctx, blocks[3])
-		require.NoError(t, err)
-		admitted <- e4
+		admitted <- admitResult{e: e4, err: err}
 	}()
 
 	select {
@@ -486,13 +493,15 @@ func TestQuickWindow_ConcurrentHeadFailureAndBlockedAdmitResolveWithoutDeadlock(
 	require.Error(t, e2.WaitCommitted(ctx))
 	require.Error(t, e3.WaitCommitted(ctx))
 
-	var e4 *windowEntry
+	var res admitResult
 	select {
-	case e4 = <-admitted:
+	case res = <-admitted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("fourth block was not admitted after the head failed")
 	}
-	require.NotNil(t, e4)
+	require.NoError(t, res.err)
+	require.NotNil(t, res.e)
+	e4 := res.e
 
 	c.mu.Lock()
 	require.Empty(t, c.order, "nothing committed once the head failed")
@@ -502,4 +511,103 @@ func TestQuickWindow_ConcurrentHeadFailureAndBlockedAdmitResolveWithoutDeadlock(
 	e2.Leave()
 	e3.Leave()
 	e4.Leave()
+}
+
+// Leave on an entry still mid-commit (violating the normal "Leave only after the pipeline
+// returns" contract) must not race the committer's own read of e.Block(), and must not panic.
+// leave clears the parent links that make e unreachable from the window, but must never nil
+// e.block itself while a commit callback holding the same *windowEntry could still be reading
+// it.
+func TestQuickWindow_LeaveDuringCommitDoesNotRaceOrPanic(t *testing.T) {
+	initPrometheusMetrics()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	commitDone := make(chan struct{})
+
+	var sawNilBlock atomic.Bool
+	var readHeight atomic.Uint32
+
+	commit := func(_ context.Context, e *windowEntry) error {
+		close(entered)
+		<-release
+
+		// Read the block the same way a real commit callback does, concurrently with the
+		// Leave call below.
+		b := e.Block()
+		if b == nil {
+			sawNilBlock.Store(true)
+		} else {
+			readHeight.Store(b.Height)
+		}
+
+		// e1.committed can already be closed by the concurrent Leave by this point (it aborts
+		// the still-queued entry before this call returns), so WaitCommitted alone gives the
+		// test no happens-before edge to this goroutine's stores above. Close commitDone to
+		// give it one.
+		close(commitDone)
+
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := newQuickWindow(ulogger.TestLogger{}, 1, 64, commit)
+	w.Start(ctx)
+
+	blocks := chainOf(t, 1)
+	admitCtx := context.Background()
+
+	e1, _, err := w.Admit(admitCtx, blocks[0])
+	require.NoError(t, err)
+
+	e1.StoreDone()
+	<-entered // commit is now blocked mid-call, holding e1's block
+
+	e1.Leave()
+	close(release)
+
+	select {
+	case <-commitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("commit callback never returned")
+	}
+
+	// Whichever outcome wins the race between the concurrent Leave and the in-flight commit,
+	// WaitCommitted must return without hanging.
+	_ = e1.WaitCommitted(admitCtx)
+
+	require.False(t, sawNilBlock.Load(), "commit must never observe a nil block")
+	require.Equal(t, uint32(1), readHeight.Load())
+}
+
+// Once the committer stops, no entry still in the window may be left parked on WaitCommitted
+// forever, and no further Admit may succeed and hand back an entry nothing will ever resolve.
+func TestQuickWindow_ShutdownAbortsInFlightAndRefusesFurtherAdmits(t *testing.T) {
+	c := &recordingCommitter{}
+	w, cancel := newTestWindow(t, 2, c)
+	defer cancel()
+
+	blocks := chainOf(t, 3)
+	ctx := context.Background()
+
+	e1, _, err := w.Admit(ctx, blocks[0])
+	require.NoError(t, err)
+	e2, _, err := w.Admit(ctx, blocks[1])
+	require.NoError(t, err)
+
+	cancel()
+
+	err = e1.WaitCommitted(ctx)
+	require.Error(t, err)
+	require.True(t, errors.IsTransientLocalError(err), "got %v", err)
+
+	err = e2.WaitCommitted(ctx)
+	require.Error(t, err)
+	require.True(t, errors.IsTransientLocalError(err), "got %v", err)
+
+	_, _, err = w.Admit(ctx, blocks[2])
+	require.Error(t, err)
+	require.True(t, errors.IsTransientLocalError(err), "got %v", err)
 }
