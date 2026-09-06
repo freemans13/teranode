@@ -1561,12 +1561,73 @@ func (sm *SyncManager) parentFailedWhileWaiting(d *blockDispatch) bool {
 	return true
 }
 
+// finishBlockMsg pairs the backlog decrement, its progress stamp and the reply for
+// every message that leaves the pipeline without running a tail. The dispatcher's tail
+// does the same three things, in the same order, for every block that reaches a worker
+// (see newBlockDispatcher), and so does the pre-window consumer below.
+func (sm *SyncManager) finishBlockMsg(msg *blockQueueMsg, err error) {
+	sm.blockBacklog.Add(-1)
+	sm.noteBacklogProgress()
+
+	if msg.reply != nil {
+		msg.reply <- err
+	}
+}
+
+// consumeBlocksSerially is the pre-window block-queue consumer, run when
+// blockvalidation_quick_window_blocks is 0: one block at a time, its pre-checks, its own
+// work and its chain-order tail all on this goroutine, so block N+1 is not even taken off
+// the queue until block N has finished. The shutdown drain is the dispatcher's, verbatim:
+// under prefetch each queued block has an awaitBlockResult goroutine holding budget and
+// waiting on its reply, so replying here lets them exit promptly instead of waiting for the
+// peer's own quit/ctx. The feeder races the same sm.quit close, so a block enqueued after
+// this drain returns is not caught here — that block's awaitBlockResult still exits via
+// sp.quit/sp.ctx.Done(), and the feeder's enqueue is itself sm.quit-guarded, so the drain
+// only makes the common case prompt and is not relied on for correctness.
+func (sm *SyncManager) consumeBlocksSerially(blockQueue <-chan *blockQueueMsg) {
+	for {
+		select {
+		case <-sm.quit:
+			for {
+				select {
+				case msg := <-blockQueue:
+					sm.finishBlockMsg(msg, errors.NewServiceError("sync manager shutting down"))
+				default:
+					return
+				}
+			}
+		case msg := <-blockQueue:
+			sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
+
+			err := sm.handleBlockMsg(msg)
+
+			// A completion advances the backlog: finishBlockMsg stamps it so the stall
+			// check treats the pipeline as live for another window (see
+			// noteBacklogProgress / localReadBackpressured).
+			sm.finishBlockMsg(msg, err)
+		}
+	}
+}
+
 // dispatchBlocks is the block-queue consumer: it runs every pre-check and every
 // chain-order step for one block on this goroutine and hands only the block's own
 // work to a worker, so up to K consecutive below-checkpoint blocks can have their
 // UTXO store work in flight while their tails still run in dispatch order. It
 // returns when sm.quit closes.
 func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
+	// blockvalidation_quick_window_blocks=0 is a true bypass, not a one-deep window: the
+	// dispatcher is not used at all and the queue is consumed the way it was before the
+	// window existed, so a rollback to the setting is a rollback to the old code path. It
+	// matters because even at depth 1 the dispatcher splits a block's head (the FSM state
+	// call, requestedBlocks, headerList, size sampling, the cascade marks) from its tail,
+	// so block N+1's head would run while N was still in flight.
+	if sm.settings != nil {
+		if depth, _ := sm.settings.BlockValidation.QuickWindowConfiguredDepth(); depth == 0 {
+			sm.consumeBlocksSerially(blockQueue)
+			return
+		}
+	}
+
 	bd := sm.dispatcher
 
 	// pending holds one head-processed block waiting for capacity. While it is
@@ -1575,18 +1636,7 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 	// work already done.
 	var pending *blockDispatch
 
-	// finish pairs the backlog decrement, its progress stamp and the reply for
-	// every message that leaves the pipeline without running a tail. The tail
-	// itself does the same three things, in the same order, for every block that
-	// reaches a worker (see newBlockDispatcher).
-	finish := func(msg *blockQueueMsg, err error) {
-		sm.blockBacklog.Add(-1)
-		sm.noteBacklogProgress()
-
-		if msg.reply != nil {
-			msg.reply <- err
-		}
-	}
+	finish := sm.finishBlockMsg
 
 	for {
 		var queueArm <-chan *blockQueueMsg

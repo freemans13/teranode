@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,24 +100,18 @@ type batchGate struct {
 	once   sync.Once
 }
 
-// quickWindowDepth is the effective depth: the setting, capped at half the block-assembly
-// gate's allowance so admission never enters the gate's retry ladder, and forced to 1 unless
-// coins are created unlocked below the checkpoint (the unlock statement over block N's rows
-// racing block N+1's deletes of the same rows is a postgres deadlock shape).
+// quickWindowDepth is the effective depth for this service. The arithmetic itself lives in
+// settings.QuickWindowConfiguredDepth, which legacy sync's dispatcher calls too, so the two
+// services cannot drift apart on how many blocks may be in flight; all this adds is the one
+// startup line that makes the resolved depth (and any clamp) visible in the log next to
+// legacy's own line.
 func quickWindowDepth(s *settings.Settings, logger ulogger.Logger) int {
-	depth := s.BlockValidation.QuickWindowBlocks
-	if depth <= 1 {
-		return depth
-	}
+	depth, reasons := s.BlockValidation.QuickWindowConfiguredDepth()
 
-	if !s.BlockValidation.QuickValidateSkipUtxoLock {
-		logger.Warnf("[quickWindow] blockvalidation_quick_window_blocks=%d requires blockvalidation_quick_validate_skip_utxo_lock=true; running with depth 1", depth)
-		return 1
-	}
-
-	if capped := s.BlockValidation.MaxBlocksBehindBlockAssembly / 2; capped >= 1 && depth > capped {
-		logger.Warnf("[quickWindow] blockvalidation_quick_window_blocks=%d capped at %d (half of blockvalidation_maxBlocksBehindBlockAssembly)", depth, capped)
-		depth = capped
+	if len(reasons) > 0 {
+		logger.Warnf("[quickWindow] blockvalidation_quick_window_blocks=%d resolved to depth %d: %s", s.BlockValidation.QuickWindowBlocks, depth, strings.Join(reasons, "; "))
+	} else {
+		logger.Infof("[quickWindow] blockvalidation_quick_window_blocks=%d resolved to depth %d", s.BlockValidation.QuickWindowBlocks, depth)
 	}
 
 	return depth
@@ -219,7 +214,15 @@ func (w *quickWindow) Admit(ctx context.Context, block *model.Block) (*windowEnt
 		parent = tail
 	}
 
-	ectx, cancel := context.WithCancel(context.Background())
+	// WithoutCancel, not Background: the entry keeps the caller's context VALUES — the trace
+	// span and its baggage — so a windowed block's spans still hang off the call that admitted
+	// it instead of each becoming a root, and the log correlation that goes with them survives.
+	// What it deliberately does not inherit is the caller's cancellation or deadline (Go's
+	// WithoutCancel drops both): the committer owns this block from here, and a caller that
+	// gives up, or whose RPC is torn down, must not cancel store work that is still going to be
+	// committed. The entry's own cancel, called by failLocked, is the only thing that tears the
+	// block down.
+	ectx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	e := &windowEntry{
 		w:          w,
 		block:      block,
@@ -321,13 +324,22 @@ func (w *quickWindow) GateFor(owner *windowEntry, txid *chainhash.Hash) *batchGa
 	return g
 }
 
-func (w *quickWindow) Registered(txid *chainhash.Hash) bool {
+// Registered reports whether txid is claimed by an in-flight block OTHER than owner. The miss
+// backstop asks it before reclassifying a store failure as a gate miss, and the owner filter is
+// what keeps that reclassification honest: an id the calling block registered itself was never
+// gated (in-block parents take the two-phase path), so a not-found or anonymous-spent answer
+// for one of them is a real failure of this block, not our bookkeeping. Without the filter it
+// would come back as a local service error — an endless local re-request of a block that will
+// never succeed — and would move quick_validate_window_miss_total, whose ship gate is zero.
+//
+// owner nil means "no calling block", which is every id in the window.
+func (w *quickWindow) Registered(owner *windowEntry, txid *chainhash.Hash) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	_, ok := w.retained[*txid]
+	e, ok := w.retained[*txid]
 
-	return ok
+	return ok && e != owner
 }
 
 func (w *quickWindow) kick() {
@@ -339,13 +351,25 @@ func (w *quickWindow) kick() {
 
 // run is the committer: it owns the ordered tail and the abort cascade.
 func (w *quickWindow) run(ctx context.Context) {
+	// The oldest-in-flight gauge is what a hung block shows up as, so it cannot only be written
+	// on the way past: parking on the head's channels would freeze it at the microseconds it
+	// read when the block was admitted, which is the reading that hides exactly the incident it
+	// exists for. This ticker refreshes it from whatever the head is now, and zeroes it when the
+	// window is empty so a drained window does not keep reporting its last block's age forever.
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
 	for {
 		head := w.head()
 		if head == nil {
+			prometheusBlockValidationQuickWindowOldestAgeSeconds.Set(0)
+
 			select {
 			case <-ctx.Done():
 				w.shutdown()
 				return
+			case <-ticker.C:
+				continue
 			case <-w.wake:
 				continue
 			}
@@ -357,6 +381,11 @@ func (w *quickWindow) run(ctx context.Context) {
 		case <-ctx.Done():
 			w.shutdown()
 			return
+		case <-ticker.C:
+			// Re-read the head and refresh the gauge. Nothing is lost by looping: a storeDone or
+			// committed channel that was ready alongside the tick stays closed, so the next pass
+			// through this select takes it.
+			continue
 		case <-head.storeDone:
 			if head.failed.Load() {
 				w.abortFrom(head, "head_failed") // cause unused: failLocked already ran once
@@ -576,6 +605,16 @@ func closed(ch <-chan struct{}) bool {
 // (errors.IsTransientLocalError does not recognise either as one).
 func wrapCtxErr(hash chainhash.Hash, ctx context.Context) error {
 	return errors.NewServiceError("[quickWindow][%s] wait cancelled: %v", hash.String(), ctx.Err())
+}
+
+// windowOf returns the window this entry belongs to, nil for a block running outside the
+// window. Nil-safe so a caller can hand its (possibly nil) entry straight through.
+func (e *windowEntry) windowOf() *quickWindow {
+	if e == nil {
+		return nil
+	}
+
+	return e.w
 }
 
 func (e *windowEntry) Block() *model.Block      { return e.block }

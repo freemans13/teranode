@@ -1539,6 +1539,17 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 		}
 	}
 
+	// A legacy block on the unified route must never take the catch-up divert: legacy sync
+	// resolves its own orphans with a getblocks, and the divert returns nil, which legacy
+	// records as an accepted block with nothing stored. It can only get here when the two
+	// services disagree about the setting — legacy has the window on, so it handed this block
+	// over with its parent still in flight here, and this service has it off, so there is no
+	// window to find that parent in. Fail closed, naming the setting, rather than silently
+	// losing the block.
+	if !parentExists && parentEntry == nil && !windowRoute && baseURL == "legacy" && u.legacyUnifiedRoute(block, baseURL) {
+		return errors.NewServiceError("[processBlockFound] legacy block %s has no stored parent and the quick window is off on this service; check blockvalidation_quick_window_blocks matches on legacy and block validation", hash.String())
+	}
+
 	if !parentExists && parentEntry == nil {
 		// add to catchup channel, which will block processing any new blocks until we have caught up
 		go func() {

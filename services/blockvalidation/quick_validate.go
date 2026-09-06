@@ -372,7 +372,7 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 		if prefetchDepth <= 0 {
 			prefetchDepth = 2 // Default for async mode
 		}
-		_, err = u.processBlockSubtreesPipelineAsync(ctx, block, prefetchDepth, writeJobsChan, outpointOnly, nil)
+		_, err = u.processBlockSubtreesPipelineAsync(ctx, block, prefetchDepth, writeJobsChan, outpointOnly)
 		if err != nil {
 			return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to process block subtrees", block.Hash().String(), err)
 		}
@@ -573,6 +573,12 @@ func (u *BlockValidation) processBlockSubtreesSequential(ctx context.Context, bl
 		batch.Close()
 	}
 
+	// Registration is complete only here, after the LAST batch: unlike the pipeline variant,
+	// whose extender stage registers each batch as it produces it, this loop does its store work
+	// batch by batch on one goroutine, so a successor's WaitPredecessorsRegistered is held until
+	// the whole block has been claimed. On a multi-batch block that costs the successor its
+	// overlap. It does not bite today: legacy blocks arrive as one subtree, so this loop runs a
+	// single batch, and the pipeline variant is what a multi-batch block takes.
 	if entry != nil {
 		entry.RegistrationComplete()
 	}
@@ -771,7 +777,11 @@ func (u *BlockValidation) processBlockSubtreesPipeline(ctx context.Context, bloc
 // Returns:
 //   - uint64: Existing BlockID if retry detected, 0 otherwise
 //   - error: If processing fails or context is cancelled
-func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context, block *model.Block, prefetchDepth int, writeJobsChan chan<- *SubtreeWriteJob, outpointOnly bool, entry *windowEntry) (uint64, error) {
+//
+// Native catch-up is outside the quick window by design (spec section 11), and this async
+// variant is the catch-up path only, so it takes no window entry: nothing here registers,
+// waits on a predecessor or signals.
+func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context, block *model.Block, prefetchDepth int, writeJobsChan chan<- *SubtreeWriteJob, outpointOnly bool) (uint64, error) {
 	numSubtrees := len(block.Subtrees)
 	block.SubtreeSlices = make([]*subtreepkg.Subtree, numSubtrees)
 	var existingBlockID uint64
@@ -815,21 +825,10 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 	g.Go(func() error {
 		defer close(extendedChan)
 
-		if entry != nil {
-			// The extender owns registration: a successor's dependency check is only complete
-			// once every batch of this block has claimed its ids. The defer covers the error
-			// path too, so a block that gives up never leaves a successor waiting.
-			defer entry.RegistrationComplete()
-		}
-
 		extendedTxs := make(map[chainhash.Hash]*bt.Tx)
 		for batch := range prefetchChan {
 			start := time.Now()
 			if err := u.extendBatch(gCtx, block, batch, extendedTxs); err != nil {
-				return err
-			}
-
-			if err := registerBatchWithWindow(entry, batch); err != nil {
 				return err
 			}
 
@@ -847,14 +846,6 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 	// Stage 3: Processor - UTXO create+spend, then queue write jobs (per batch)
 	// Unlike the sync version, we don't wait for writes - just queue them
 	g.Go(func() error {
-		if entry != nil {
-			// The open-gate map must be complete before the first dependency check, which is
-			// inside the first createAndSpendUTXOsForBatch call below.
-			if err := entry.WaitPredecessorsRegistered(gCtx); err != nil {
-				return err
-			}
-		}
-
 		for batch := range extendedChan {
 			// Block ID check (first batch only)
 			if !blockIDSet && len(batch.batchTxs) > 0 {
@@ -864,13 +855,6 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 					block.ID = existingMeta.BlockIDs[0]
 					u.logger.Debugf("[processBlockSubtreesPipelineAsync][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 				} else if block.ID == 0 {
-					// Block ids are handed out in the order they are asked for.
-					if entry != nil {
-						if err := entry.WaitPredecessorIDAssigned(gCtx); err != nil {
-							return err
-						}
-					}
-
 					id, err := u.blockchainClient.AssignBlockID(gCtx, block.Hash())
 					if err != nil {
 						return errors.NewProcessingError("[processBlockSubtreesPipelineAsync][%s] failed to assign block ID", block.Hash().String(), err)
@@ -881,10 +865,6 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 					}
 				}
 				blockIDSet = true
-
-				if entry != nil {
-					entry.IDAssigned()
-				}
 			}
 
 			// Run UTXO ops and subtree building in parallel
@@ -1724,7 +1704,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		start := time.Now()
 		defer func() { oneWaveDuration = time.Since(start) }()
 
-		if err := u.applyOneWave(gCtx, block, independent, lockUTXOs, outpointOnly, createLimit, w, collectExisting); err != nil {
+		if err := u.applyOneWave(gCtx, block, independent, lockUTXOs, outpointOnly, createLimit, batch.window, collectExisting); err != nil {
 			return err
 		}
 
@@ -1787,7 +1767,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		// permanently attributed to a non-canonical tx. Hard-fail instead (fail-closed).
 		// Dirty-restart replay does not need conflict tolerance: re-spending an output
 		// with the same spender is the store's idempotent success path.
-		return u.spendBatchWithRetry(gCtx, block, chainedSpends, outpointOnly, w)
+		return u.spendBatchWithRetry(gCtx, block, chainedSpends, outpointOnly, batch.window)
 	})
 
 	applyErr := g.Wait()
@@ -1843,8 +1823,8 @@ type txApply struct {
 // reports the create's ErrTxExists, and against utxo.SequentialSpendAndCreate, which returns
 // the same error with its spends still applied.
 func (u *BlockValidation) applyOneWave(ctx context.Context, block *model.Block, items []txApply,
-	lockUTXOs, outpointOnly bool, limit int, w *quickWindow, collectExisting func(*bt.Tx)) error {
-	return u.applyTxsWithRetry(ctx, block, "applyOneWave", items, limit, w, func(ctx context.Context, item txApply) error {
+	lockUTXOs, outpointOnly bool, limit int, owner *windowEntry, collectExisting func(*bt.Tx)) error {
+	return u.applyTxsWithRetry(ctx, block, "applyOneWave", items, limit, owner, func(ctx context.Context, item txApply) error {
 		_, _, err := u.utxoStore.SpendAndCreate(ctx, item.tx, block.Height,
 			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
 				BlockID:     block.ID,
@@ -1987,13 +1967,18 @@ func windowMissSuspects(tx *bt.Tx, err error) []*chainhash.Hash {
 	return all
 }
 
-// windowMissError reclassifies a spend that found no coin although an in-flight block had
+// windowMissError reclassifies a spend that found no coin although ANOTHER in-flight block had
 // registered the parent transaction with the window. That combination cannot be the peer's
 // fault: the parent is claimed by a block we are applying right now, so a gate should have held
 // this spend back and did not. It is counted and returned as a local service fault, so legacy
 // sync retries the delivery instead of banning the peer that made it. Every other failure is
 // returned untouched.
-func windowMissError(block *model.Block, w *quickWindow, tx *bt.Tx, err error) error {
+//
+// owner is the calling block's own entry, and it is excluded: a parent this block registered
+// itself was never behind a gate (in-block parents take the two-phase path), so a miss on one of
+// them is this block's own hard failure. Reclassifying it would turn a genuine block failure
+// into an endless local re-request and would move the miss counter, whose ship gate is zero.
+func windowMissError(block *model.Block, w *quickWindow, owner *windowEntry, tx *bt.Tx, err error) error {
 	if w == nil || tx == nil {
 		return err
 	}
@@ -2003,7 +1988,7 @@ func windowMissError(block *model.Block, w *quickWindow, tx *bt.Tx, err error) e
 	}
 
 	for _, parent := range windowMissSuspects(tx, err) {
-		if !w.Registered(parent) {
+		if !w.Registered(owner, parent) {
 			continue
 		}
 
@@ -2027,9 +2012,14 @@ func windowMissError(block *model.Block, w *quickWindow, tx *bt.Tx, err error) e
 // should be retried, and a wrapped one when the block should fail. Two waves share this loop —
 // the combined one-wave apply and the spend wave — and both need exactly this behaviour, so it
 // lives here once. stage names the caller in the log and error text.
+//
+// owner is the calling block's window entry, nil outside the window: it supplies both the
+// window whose caller budget the waves share and the identity the miss backstop excludes.
 func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Block, stage string,
-	items []txApply, limit int, w *quickWindow, apply func(context.Context, txApply) error) error {
+	items []txApply, limit int, owner *windowEntry, apply func(context.Context, txApply) error) error {
 	const maxRetries = 10
+
+	w := owner.windowOf()
 
 	if len(items) == 0 {
 		return nil
@@ -2090,7 +2080,7 @@ func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Bl
 					}
 
 					mu.Lock()
-					hardFail = windowMissError(block, w, item.tx, err)
+					hardFail = windowMissError(block, w, owner, item.tx, err)
 					mu.Unlock()
 				}
 
@@ -2125,7 +2115,7 @@ func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Bl
 // spendBatchWithRetry spends txs in parallel with bounded retries, over the shared retry loop.
 // It is the second wave for transactions that spend a sibling of the same block; transactions
 // with no in-block parent never reach it, because applyOneWave has already spent them.
-func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.Block, txs []*bt.Tx, outpointOnly bool, w *quickWindow) error {
+func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.Block, txs []*bt.Tx, outpointOnly bool, owner *windowEntry) error {
 	items := make([]txApply, len(txs))
 	for i, tx := range txs {
 		items[i] = txApply{tx: tx}
@@ -2133,7 +2123,7 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 
 	limit := u.settings.UtxoStore.SpendBatcherSize * u.settings.UtxoStore.SpendBatcherConcurrency * 2
 
-	return u.applyTxsWithRetry(ctx, block, "spendBatchWithRetry", items, limit, w, func(ctx context.Context, item txApply) error {
+	return u.applyTxsWithRetry(ctx, block, "spendBatchWithRetry", items, limit, owner, func(ctx context.Context, item txApply) error {
 		if _, _, err := u.utxoStore.SpendAndCreate(ctx, item.tx, block.Height, utxo.WithSpendOnly(),
 			utxo.WithIgnoreLocked(true), utxo.WithSkipUTXOHashCheck(outpointOnly)); err != nil {
 			if errors.IsRetryableError(err) {

@@ -197,7 +197,7 @@ func TestQuickWindow_GateReleasesWaiterOnlyWhenClosed(t *testing.T) {
 	require.NoError(t, e2.WaitPredecessorsRegistered(ctx))
 	require.Same(t, g, w.GateFor(e2, &parent), "block 2 must see block 1's open gate")
 	require.Nil(t, w.GateFor(e1, &parent), "an entry never waits on its own gate")
-	require.True(t, w.Registered(&parent))
+	require.True(t, w.Registered(nil, &parent))
 
 	var released atomic.Bool
 	done := make(chan struct{})
@@ -217,7 +217,7 @@ func TestQuickWindow_GateReleasesWaiterOnlyWhenClosed(t *testing.T) {
 	<-done
 	require.True(t, released.Load())
 	require.Nil(t, w.GateFor(e2, &parent), "a closed gate is no longer open")
-	require.True(t, w.Registered(&parent), "the retained set keeps the id until the entry leaves")
+	require.True(t, w.Registered(nil, &parent), "the retained set keeps the id until the entry leaves")
 }
 
 func TestQuickWindow_RegisterBatchRefusesATxidHeldByAnotherLiveEntry(t *testing.T) {
@@ -439,13 +439,13 @@ func TestQuickWindow_LeaveClearsRegistered(t *testing.T) {
 	txid := chainhash.HashH([]byte("gone-after-leave"))
 	_, err = e1.RegisterBatch([]chainhash.Hash{txid})
 	require.NoError(t, err)
-	require.True(t, w.Registered(&txid))
+	require.True(t, w.Registered(nil, &txid))
 
 	e1.StoreDone()
 	require.NoError(t, e1.WaitCommitted(ctx))
 	e1.Leave()
 
-	require.False(t, w.Registered(&txid), "Leave must release the retained id")
+	require.False(t, w.Registered(nil, &txid), "Leave must release the retained id")
 }
 
 // A head failing concurrently with a fourth block's Admit blocked at depth must resolve
