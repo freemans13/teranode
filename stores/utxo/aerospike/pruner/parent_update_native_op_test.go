@@ -34,12 +34,8 @@ func isUDF(rec aerospike.BatchRecordIfc) bool {
 	return ok
 }
 
-// The combined cleanup path (defensive mode off) must route parent updates
-// through the injected native-op builder when it is present, NOT through a raw
-// Lua NewBatchUDF — even though luaPackage is also set as the fallback. This is
-// the regression that left the pruner emitting a per-block batch_sub_udf burst
-// on native-op-enabled deployments running with defensive mode off.
-func TestBuildCombinedCleanupRecords_PrefersNativeBuilderOverUDF(t *testing.T) {
+// Parent updates must prefer the native-op builder when it is available.
+func TestBuildParentUpdateRecords_PrefersNativeBuilderOverUDF(t *testing.T) {
 	nativeCalls := 0
 
 	s := &Service{
@@ -52,48 +48,43 @@ func TestBuildCombinedCleanupRecords_PrefersNativeBuilderOverUDF(t *testing.T) {
 
 	updates := makeParentUpdates(t, 2)
 
-	records, parentEnd, usesModTeranode := s.buildCombinedCleanupRecords(updates, nil)
+	records := s.buildParentUpdateRecords(updates)
+	require.Len(t, records, len(updates))
 
 	require.Equal(t, len(updates), nativeCalls, "native builder must be invoked once per parent update")
-	require.Equal(t, len(updates), parentEnd, "parentEnd must cover exactly the parent-update records")
-	require.True(t, usesModTeranode, "native-op path must be flagged as mod-teranode for SUCCESS-map result parsing")
 
-	for i := 0; i < parentEnd; i++ {
+	for i := 0; i < len(records); i++ {
 		require.Falsef(t, isUDF(records[i]), "parent update %d must not be a NewBatchUDF when the native builder is present", i)
 	}
 }
 
-// With no native builder but a lua package configured, the combined path still
-// falls back to the Lua UDF call and flags the mod-teranode SUCCESS-map shape.
-func TestBuildCombinedCleanupRecords_FallsBackToUDFWhenNoNativeBuilder(t *testing.T) {
+// With no native builder but a lua package configured, the parent update path
+// falls back to the Lua UDF call.
+func TestBuildParentUpdateRecords_FallsBackToUDFWhenNoNativeBuilder(t *testing.T) {
 	s := &Service{luaPackage: "teranode"}
 
 	updates := makeParentUpdates(t, 2)
 
-	records, parentEnd, usesModTeranode := s.buildCombinedCleanupRecords(updates, nil)
+	records := s.buildParentUpdateRecords(updates)
+	require.Len(t, records, len(updates))
 
-	require.Equal(t, len(updates), parentEnd)
-	require.True(t, usesModTeranode, "UDF path is also a mod-teranode SUCCESS-map path")
-
-	for i := 0; i < parentEnd; i++ {
+	for i := 0; i < len(records); i++ {
 		require.Truef(t, isUDF(records[i]), "parent update %d must be a NewBatchUDF when only luaPackage is set", i)
 	}
 }
 
-// With neither a native builder nor a lua package, the combined path uses the
-// plain MapPutItems BatchWrite and reports it is NOT a mod-teranode path (so
+// With neither a native builder nor a lua package, the fallback uses the
+// plain MapPutItems BatchWrite (so
 // results are parsed via KEY_NOT_FOUND, not a SUCCESS map).
-func TestBuildCombinedCleanupRecords_PlainMapWriteWhenNoLuaNoNative(t *testing.T) {
+func TestBuildParentUpdateRecords_PlainMapWriteWhenNoLuaNoNative(t *testing.T) {
 	s := &Service{fieldDeletedChildren: "deletedChildren"}
 
 	updates := makeParentUpdates(t, 2)
 
-	records, parentEnd, usesModTeranode := s.buildCombinedCleanupRecords(updates, nil)
+	records := s.buildParentMapUpdateRecords(updates)
+	require.Len(t, records, len(updates))
 
-	require.Equal(t, len(updates), parentEnd)
-	require.False(t, usesModTeranode, "plain MapPutItems path must not be flagged as mod-teranode")
-
-	for i := 0; i < parentEnd; i++ {
+	for i := 0; i < len(records); i++ {
 		require.Falsef(t, isUDF(records[i]), "parent update %d must be a BatchWrite, not a UDF", i)
 	}
 }

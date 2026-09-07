@@ -407,17 +407,14 @@ func TestExternalFileAlreadyDeleted(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, exists)
 
-	// Trigger cleanup - should handle missing file gracefully
+	// Missing inputs must retain the record so replay protection can be retried.
 	pruneCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	recordsProcessed, err := service.Prune(pruneCtx, 7, "<test-hash>")
-	cancel()
-	require.NoError(t, err)
-	require.GreaterOrEqual(t, recordsProcessed, int64(0))
-
-	// Verify the Aerospike record was still deleted
-	_, err = client.Get(nil, key)
+	defer cancel()
+	_, err = service.Prune(pruneCtx, 7, "<test-hash>")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not found")
+	_, err = client.Get(nil, key)
+	require.NoError(t, err)
+
 }
 
 // TestMixedExternalAndNormalTransactions tests pruning of both types in one batch

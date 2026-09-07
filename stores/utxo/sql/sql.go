@@ -2120,6 +2120,7 @@ type spendSelectResult struct {
 	coinbaseSpendingHeight uint32
 	utxoHash               []byte
 	spendingDataBytes      []byte
+	childPruned            bool
 	frozen                 bool
 	conflicting            bool
 	locked                 bool
@@ -2145,7 +2146,8 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 	sb.WriteString(`
 		SELECT v.batch_idx,
 		       o.transaction_id, o.coinbase_spending_height, o.utxo_hash,
-		       o.spending_data, o.frozen OR t.frozen AS frozen, t.conflicting, t.locked, o.spendableIn
+		       o.spending_data, o.frozen OR t.frozen AS frozen, t.conflicting, t.locked, o.spendableIn,
+               EXISTS (SELECT 1 FROM deleted_children d WHERE d.parent_id = t.id AND d.child_hash = substr(o.spending_data, 1, 32))
 		FROM (VALUES `)
 	args := make([]interface{}, 0, len(batch)*3)
 	paramIdx := 1
@@ -2177,7 +2179,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 	for rows.Next() {
 		r := &spendSelectResult{}
 		if err := rows.Scan(&r.batchIdx, &r.transactionID, &r.coinbaseSpendingHeight,
-			&r.utxoHash, &r.spendingDataBytes, &r.frozen, &r.conflicting, &r.locked, &r.spendableIn); err != nil {
+			&r.utxoHash, &r.spendingDataBytes, &r.frozen, &r.conflicting, &r.locked, &r.spendableIn, &r.childPruned); err != nil {
 			rows.Close()
 			if isDeadlock(err) {
 				return true
@@ -2261,6 +2263,10 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 					continue
 				}
 				validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
+				continue
+			}
+			if r.childPruned {
+				validationErrors[i] = errors.NewUtxoError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
 				continue
 			}
 			// Idempotent re-spend: same spending data — treat as success without UPDATE.
@@ -2676,6 +2682,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 		,t.conflicting
 		,t.locked
 		,o.spendableIn
+		,EXISTS (SELECT 1 FROM deleted_children d WHERE d.parent_id = t.id AND d.child_hash = substr(o.spending_data, 1, 32))
 		FROM outputs o
 		JOIN transactions t ON o.transaction_id = t.id
 		WHERE t.hash = $1
@@ -2710,6 +2717,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 			coinbaseSpendingHeight uint32
 			utxoHash               []byte
 			spendingDataBytes      []byte
+			childPruned            bool
 			frozen                 bool
 			conflicting            bool
 			locked                 bool
@@ -2718,7 +2726,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 
 		err = txn.QueryRowContext(s.ctx, q1, spend.TxID[:], spend.Vout).Scan(
 			&transactionID, &coinbaseSpendingHeight, &utxoHash,
-			&spendingDataBytes, &frozen, &conflicting, &locked, &spendableIn,
+			&spendingDataBytes, &frozen, &conflicting, &locked, &spendableIn, &childPruned,
 		)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -2767,6 +2775,10 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 					continue
 				}
 				validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
+				continue
+			}
+			if childPruned {
+				validationErrors[i] = errors.NewUtxoError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
 				continue
 			}
 		}
@@ -4991,6 +5003,16 @@ func createPostgresSchemaImpl(db DBExecutor) error {
 		return errors.NewStorageError("could not create conflict_intents table - [%+v]", err)
 	}
 
+	// Markers outlive a pruned child, but disappear with the surviving parent.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS deleted_children (
+  parent_id BIGINT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+  child_hash BYTEA NOT NULL,
+  PRIMARY KEY (parent_id, child_hash)
+ );`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create deleted_children table - [%+v]", err)
+	}
+
 	return nil
 }
 
@@ -5302,6 +5324,16 @@ func createSqliteSchema(db *usql.DB) error {
 	`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not create conflict_intents table - [%+v]", err)
+	}
+
+	// Markers outlive a pruned child, but disappear with the surviving parent.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS deleted_children (
+  parent_id BIGINT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+  child_hash BLOB NOT NULL,
+  PRIMARY KEY (parent_id, child_hash)
+ );`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create deleted_children table - [%+v]", err)
 	}
 
 	return nil

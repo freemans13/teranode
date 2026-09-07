@@ -2,6 +2,7 @@ package pruner
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -134,23 +135,22 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 
 	// Defensive child verification is conditional on the UTXODefensiveEnabled setting
 	// When disabled, parents are deleted without verifying children are stable
-	var deleteQuery string
-	var result interface{ RowsAffected() (int64, error) }
-	var err error
+	var candidates string
+	args := []interface{}{blockHeight}
 
 	if !s.defensiveEnabled {
 		// Defensive mode disabled - delete all transactions past their expiration
-		deleteQuery = `
-			DELETE FROM transactions
+		candidates = `
+			SELECT id FROM transactions
 			WHERE delete_at_height IS NOT NULL
 			  AND delete_at_height <= $1
 		`
-		result, err = s.db.ExecContext(ctx, deleteQuery, blockHeight)
+
 	} else {
 		// Defensive mode enabled - verify ALL spending children are stable before deletion
 		// This prevents orphaning any child transaction
-		deleteQuery = `
-			DELETE FROM transactions
+		candidates = `
+			SELECT id FROM transactions
 			WHERE id IN (
 				SELECT t.id
 				FROM transactions t
@@ -163,6 +163,11 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 				    FROM outputs o
 				    WHERE o.transaction_id = t.id
 				      AND o.spending_data IS NOT NULL
+				      AND NOT EXISTS (
+				          SELECT 1 FROM deleted_children d
+				          WHERE d.parent_id = t.id
+				            AND d.child_hash = substr(o.spending_data, 1, 32)
+				      )
 				      AND (
 				        -- Extract child TX hash from spending_data (first 32 bytes)
 				        -- Check if this child is NOT stable
@@ -178,8 +183,37 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 				  )
 			)
 		`
-		result, err = s.db.ExecContext(ctx, deleteQuery, blockHeight, safetyWindow)
+		args = append(args, safetyWindow)
 	}
+
+	// Use one serializable snapshot for candidate selection, parent markers and
+	// deletion. Cross-record atomicity is required even with defensive mode off.
+	txn, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return 0, errors.NewStorageError("failed to begin pruning transaction", err)
+	}
+	defer func() { _ = txn.Rollback() }()
+
+	// Materialize the candidates once: newly inserted markers can make another
+	// parent eligible in defensive mode, but that parent needs its own markers
+	// before a later prune can delete it. Temporary tables are connection-local
+	// and this transaction owns the connection until commit or rollback.
+	if _, err := txn.ExecContext(ctx, "CREATE TEMP TABLE utxo_prune_candidates AS "+candidates, args...); err != nil {
+		return 0, errors.NewStorageError("failed to select pruning candidates", err)
+	}
+	deleteQuery := "DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)"
+	markerQuery := `INSERT INTO deleted_children (parent_id, child_hash)
+  SELECT DISTINCT parent.id, child.hash
+  FROM utxo_prune_candidates candidate
+  JOIN transactions child ON child.id = candidate.id
+  JOIN inputs i ON i.transaction_id = child.id
+  JOIN transactions parent ON parent.hash = i.previous_transaction_hash
+  WHERE true
+  ON CONFLICT (parent_id, child_hash) DO NOTHING`
+	if _, err := txn.ExecContext(ctx, markerQuery); err != nil {
+		return 0, errors.NewStorageError("failed to mark pruned children", err)
+	}
+	result, err := txn.ExecContext(ctx, deleteQuery)
 
 	if err != nil {
 		return 0, errors.NewStorageError("failed to delete transactions", err)
@@ -188,6 +222,14 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 	count, err := result.RowsAffected()
 	if err != nil {
 		return 0, errors.NewStorageError("failed to get rows affected", err)
+	}
+
+	if _, err := txn.ExecContext(ctx, "DROP TABLE utxo_prune_candidates"); err != nil {
+		return 0, errors.NewStorageError("failed to clear pruning candidates", err)
+	}
+
+	if err := txn.Commit(); err != nil {
+		return 0, errors.NewStorageError("failed to commit pruning transaction", err)
 	}
 
 	return count, nil

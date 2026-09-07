@@ -326,36 +326,6 @@ func TestTallyParentUpdateResults(t *testing.T) {
 	})
 }
 
-// TestTallyChildDeletionResults locks the idempotency rule: a child that is
-// already gone is the outcome the deletion asked for, not an error.
-func TestTallyChildDeletionResults(t *testing.T) {
-	t.Run("KEY_NOT_FOUND is success", func(t *testing.T) {
-		deleteErrors, firstErr := tallyChildDeletionResults(
-			[]aerospike.BatchRecordIfc{notFoundRecord(t), notFoundRecord(t)})
-
-		require.Zero(t, deleteErrors)
-		require.Nil(t, firstErr)
-	})
-
-	t.Run("real errors are counted", func(t *testing.T) {
-		failing := &aerospike.BatchWrite{BatchRecord: *batchRecordWithErr(t, aerospike.ErrTimeout)}
-
-		deleteErrors, firstErr := tallyChildDeletionResults(
-			[]aerospike.BatchRecordIfc{notFoundRecord(t), failing, failing})
-
-		require.Equal(t, 2, deleteErrors)
-		require.NotNil(t, firstErr)
-	})
-
-	t.Run("clean batch reports nothing", func(t *testing.T) {
-		deleteErrors, firstErr := tallyChildDeletionResults(
-			[]aerospike.BatchRecordIfc{okRecord(t)})
-
-		require.Zero(t, deleteErrors)
-		require.Nil(t, firstErr)
-	})
-}
-
 // TestTallyParentUpdateResultsObservesErrors covers the hook that lets the store
 // demote itself off the native path.
 //
