@@ -79,7 +79,7 @@ const (
 
 	// defaultBlockProcessingStallTimeout bounds how long localReadBackpressured
 	// keeps suppressing the sync-peer stall check while the block backlog is
-	// non-empty but not advancing (see lastBacklogProgress). It is only the
+	// non-empty but not committing (see lastChainProgress). It is only the
 	// fallback for settings.Legacy.PeerProcessingTimeout — the pre-prefetch
 	// per-message watchdog whose coverage this progress-aware rule restores —
 	// used when a SyncManager has no settings wired (unit tests) or the setting
@@ -719,18 +719,17 @@ type SyncManager struct {
 	// peer. Written by the blockHandler goroutines, read by handleCheckSyncPeer.
 	blockBacklog atomic.Int64
 
-	// lastBacklogProgress is the UnixNano time the block backlog last advanced:
-	// the 0->1 enqueue that opened the current backpressure window, or the most
-	// recent block completion. localReadBackpressured suppresses the sync-peer
-	// stall check only while this stays fresh — a backlog that stops advancing
-	// for longer than blockProcessingStallTimeout is a genuine processing hang
-	// (store/validator deadlock, Aerospike overload), not slow-but-progressing
+	// lastChainProgress is the UnixNano time a block last joined the chain.
+	// localReadBackpressured suppresses the sync-peer stall check only while
+	// this stays fresh — a backlog that stops producing commits for longer than
+	// blockProcessingStallTimeout is a genuine processing hang (store or
+	// validator deadlock, Aerospike overload), not slow-but-progressing
 	// validation, and must be allowed to rotate the peer. This restores the
 	// liveness coverage lost when the per-message watchdog was disarmed for
 	// prefetched blocks, without the false rotation of a merely-slow block.
-	// Written by the blockHandler goroutines (the 0->1 enqueue and every
-	// completion, via noteBacklogProgress), read by handleCheckSyncPeer.
-	lastBacklogProgress atomic.Int64
+	// Written by the block-queue consumer and by the drain, via
+	// noteChainProgress, and read by handleCheckSyncPeer.
+	lastChainProgress atomic.Int64
 
 	// blockPrefetchBudget bounds, by total serialized bytes, the blocks that
 	// have been received from peers but not yet finished processing. It lets
@@ -3261,6 +3260,37 @@ func (sm *SyncManager) drainPendingCheckpoint() {
 	}
 }
 
+// consumeQueuedBlock is the block-queue consumer's whole turn: process the
+// block, settle the backlog accounting, and answer the caller.
+//
+// Extracted from blockHandler's select so the accounting can be tested without
+// standing the handler up, because the rule it enforces is easy to get wrong and
+// was wrong until recently.
+func (sm *SyncManager) consumeQueuedBlock(msg *blockQueueMsg) {
+	sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
+
+	err := sm.processQueuedBlock(msg)
+
+	sm.blockBacklog.Add(-1)
+
+	// Progress is a block joining the chain, not a queue message finishing. A
+	// parked block finishes its message and moves nothing, so stamping here
+	// would keep localReadBackpressured suppressing the stall check while the
+	// tip stood still. The stamp is shared across peers, so one peer's stream of
+	// out-of-order blocks used to hold that suppression open over a DIFFERENT
+	// peer's silence.
+	if msg.committed {
+		sm.noteChainProgress()
+	}
+
+	// A block handed to a parking worker has had its reply taken by the job, so
+	// msg.reply is nil here and the worker answers instead. That is what holds
+	// the prefetch budget until the worker has finished with the decoded block.
+	if msg.reply != nil {
+		msg.reply <- err
+	}
+}
+
 // processQueuedBlock is what the block-queue consumer does with one block:
 // commit it, and then commit everything that was parked waiting for it.
 //
@@ -4678,12 +4708,10 @@ func (sm *SyncManager) blockHandler() {
 				for {
 					select {
 					case msg := <-blockQueue:
-						// Keep the backlog decrement and its progress stamp paired
-						// on every completion path (here the shutdown drain) so the
-						// liveness invariant holds uniformly; rotation is moot during
-						// shutdown, but the uniform pairing is easier to reason about.
+						// The counter has to come back down or Stop's accounting
+						// is wrong, but nothing committed here, so nothing is
+						// stamped. Rotation is moot during shutdown either way.
 						sm.blockBacklog.Add(-1)
-						sm.noteBacklogProgress()
 
 						if msg.reply != nil {
 							msg.reply <- errors.NewServiceError("sync manager shutting down")
@@ -4707,19 +4735,7 @@ func (sm *SyncManager) blockHandler() {
 				sm.applyParkOutcome(outcome)
 
 			case msg := <-blockQueue:
-				sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
-
-				err := sm.processQueuedBlock(msg)
-
-				// A completion advances the backlog: stamp it so the stall check
-				// treats the pipeline as live for another window (see
-				// noteBacklogProgress / localReadBackpressured).
-				sm.blockBacklog.Add(-1)
-				sm.noteBacklogProgress()
-
-				if msg.reply != nil {
-					msg.reply <- err
-				}
+				sm.consumeQueuedBlock(msg)
 			}
 		}
 	}()
@@ -4781,9 +4797,7 @@ out:
 				// completions advance processing, so letting a peer refresh the
 				// liveness signal merely by feeding more blocks into a hung
 				// pipeline would mask the hang.
-				if sm.blockBacklog.Add(1) == 1 {
-					sm.noteBacklogProgress()
-				}
+				sm.blockBacklog.Add(1)
 
 				// Guard the enqueue with sm.quit. This is the sole feeder of
 				// blockQueue; without the guard, a full queue whose consumer has
@@ -4799,11 +4813,9 @@ out:
 					reply:       msg.reply,
 				}:
 				case <-sm.quit:
-					// Enqueue aborted on shutdown: undo the Add(1) above and keep
-					// the decrement paired with its progress stamp, matching every
-					// other completion path (uniform invariant; harmless here).
+					// Enqueue aborted on shutdown: undo the Add(1) above. Nothing
+					// committed, so nothing is stamped.
 					sm.blockBacklog.Add(-1)
-					sm.noteBacklogProgress()
 
 					if msg.reply != nil {
 						msg.reply <- errors.NewServiceError("sync manager shutting down")
@@ -5055,16 +5067,29 @@ func (sm *SyncManager) ReleaseBlockPrefetch(blockHash chainhash.Hash, weight int
 	sm.blockPrefetchBudget.Release(weight)
 }
 
-// noteBacklogProgress records that the block backlog just advanced — a block was
-// enqueued to open a fresh backpressure window, or one finished processing. It
-// must run on every backlog transition that constitutes progress: the 0->1
-// enqueue and every completion decrement. localReadBackpressured treats a stamp
-// older than blockProcessingStallTimeout as a hung pipeline rather than
-// slow-but-progressing validation, so keeping this current is what lets the
-// stall detector distinguish the two. Enqueues into an already-non-empty backlog
-// deliberately do NOT call this (only completions advance processing).
-func (sm *SyncManager) noteBacklogProgress() {
-	sm.lastBacklogProgress.Store(time.Now().UnixNano())
+// noteChainProgress records that a block joined the chain. Nothing else counts,
+// and the name is the whole of the rule.
+//
+// localReadBackpressured reads it to tell slow-but-progressing validation from a
+// hung pipeline, and suppresses the sync-peer stall check while the former is
+// true. It used to be stamped by any queue message finishing, which was right
+// while every finished message was a commit and became wrong when the park
+// started deferring blocks instead: a node doing nothing but parking looked
+// exactly like a node committing steadily.
+//
+// The stamp is shared across peers, which is what made that worse than it
+// sounds. One peer's stream of out-of-order blocks kept the suppression open
+// over a different peer's silence, so the stall check never ran and the silent
+// peer was never rotated.
+//
+// What this does NOT do is rotate a peer that keeps delivering out-of-order
+// blocks. HandleBlockDirect refreshes that peer's own last-block time at
+// receipt, deliberately, so a multi-gigabyte block's minutes of validation are
+// not read as a stall. A peer that answers every request is doing what was asked
+// of it; a peer that answers nothing for maxLastBlockTime is the one this
+// restores rotation for.
+func (sm *SyncManager) noteChainProgress() {
+	sm.lastChainProgress.Store(time.Now().UnixNano())
 }
 
 // blockProcessingStallTimeout is how long a non-empty block backlog may go
@@ -5122,7 +5147,7 @@ func (sm *SyncManager) localReadBackpressured() bool {
 			return true
 		}
 
-		return time.Since(time.Unix(0, sm.lastBacklogProgress.Load())) < sm.blockProcessingStallTimeout()
+		return time.Since(time.Unix(0, sm.lastChainProgress.Load())) < sm.blockProcessingStallTimeout()
 	}
 
 	// Under prefetch also suppress while a read-loop is parked in

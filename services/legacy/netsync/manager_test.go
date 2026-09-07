@@ -1536,8 +1536,8 @@ func TestHandleCheckSyncPeer_LocalBacklog(t *testing.T) {
 		sps := newStalledState()
 		sm := newSyncManager(sp, sps)
 
-		sm.blockBacklog.Add(1)   // a block is queued or mid-validation locally
-		sm.noteBacklogProgress() // fresh progress: backlog is advancing, not hung
+		sm.blockBacklog.Add(1) // a block is queued or mid-validation locally
+		sm.noteChainProgress() // fresh progress: backlog is advancing, not hung
 
 		// Rotation would panic in this minimal SyncManager (no blockchain
 		// client), so NotPanics proves the peer was kept.

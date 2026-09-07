@@ -154,6 +154,12 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 	// block after the first successful drain.
 	isCheckpointBlock, _ := sm.advanceHeaderListFor(entry.hash)
 
+	// A parked block committing is a block joining the chain, and it is the one
+	// commit that never passes through the block queue. Without this a node
+	// working purely off its park looks, to the stall check, like a node that
+	// has stopped.
+	sm.noteChainProgress()
+
 	sm.applyParkDisposition(entry, parkDispositionCommitted)
 
 	if sm.blockFailureBackoff != nil {
