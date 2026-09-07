@@ -1055,8 +1055,11 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		//
 		// A record whose input references cannot be resolved is retained, not
 		// fatal. Retention is the safe outcome: the record itself carries the
-		// replay protection its parents would otherwise inherit, and the next
-		// prune cycle retries it. Failing the chunk instead would unwind through
+		// replay protection its parents would otherwise inherit. Every later
+		// cycle reconsiders it, but a transaction whose external blob is gone
+		// for good will fail here every time, so for those records retention is
+		// permanent and utxo_pruner_input_resolution_errors_total is the signal
+		// to act on. Failing the chunk instead would unwind through
 		// partitionWorker into PruneWithPartitions, where a non-TimeoutError is
 		// never retried, so a single unresolvable record would block pruning
 		// node-wide forever.
@@ -1153,7 +1156,11 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 	}
 
 	if inputErrorCount > 0 {
-		s.logger.Errorf("Pruner retained %d records in chunk whose input references could not be resolved; they keep their own replay protection and will be retried (sample error: %v)", inputErrorCount, firstInputError)
+		// Warn, not Error: the cycle succeeded and these records are safe where
+		// they are. If the count does not fall across cycles the blobs are gone
+		// for good and the records will never prune; alert on
+		// utxo_pruner_input_resolution_errors_total rather than on this line.
+		s.logger.Warnf("Pruner retained %d records in chunk whose input references could not be resolved; they keep their own replay protection and are reconsidered next cycle (sample error: %v)", inputErrorCount, firstInputError)
 	}
 
 	return processedCount, skippedCount, nil
@@ -1438,11 +1445,19 @@ func (s *Service) getTxInputsFromBins(ctx context.Context, blockHeight uint32, b
 				}
 
 				if exists {
-					// Only outputs exist, no inputs needed for cleanup
+					// An outputs-only blob is written for zero-input transactions
+					// alone (create.go guards both write sites on
+					// len(tx.Inputs) == 0), so this record has no parents that
+					// could need a replay marker. Deleting it unmarked is safe,
+					// which is why this branch and the one below take opposite
+					// decisions on a similar-looking missing-inputs situation.
 					return nil, nil
 				}
 
-				// Without input references we cannot persist replay protection.
+				// Both blobs are gone, so the inputs are unrecoverable and no
+				// parent can be marked. The caller retains the record instead:
+				// its own presence is the replay protection the markers would
+				// have provided.
 				return nil, errors.NewProcessingError("missing external tx %s at height %d: cannot safely prune without input references", txHash.String(), blockHeight)
 			}
 			// Other errors should still be reported
