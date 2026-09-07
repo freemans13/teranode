@@ -176,5 +176,7 @@ func Test_getUtxoBlockHeightAndExtendForParentTx_BodylessParent(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "its body is not retained by this node")
 	require.Contains(t, err.Error(), "utxostore_skipTxBodyBelowCheckpoint")
-	require.NotContains(t, err.Error(), "has no output for index")
+	// The vout reported is the child input's PreviousTxOutIndex, the same
+	// coordinate the neighbouring out-of-range error names.
+	require.Contains(t, err.Error(), "index 0 can be read")
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -21,9 +22,28 @@ import (
 // so the two cases stay distinguishable.
 type bodylessUtxoStore struct {
 	utxoStore.Store
+
+	// refuseTxField makes a Get that names fields.Tx fail outright. An existence
+	// check must not ask for the body at all, so the tests that pin that choice
+	// set this: reverting canonicalCoinbaseAt to fields.Tx then turns them red
+	// instead of passing on a record this double happens to strip anyway.
+	refuseTxField bool
+
+	// stripInpoints additionally clears the stored inpoints, which is the shape a
+	// utxoset record created below the checkpoint actually has: createMinedPlanSQL
+	// writes NULL tx_inpoints, and the skip-body gate writes no body.
+	stripInpoints bool
 }
 
 func (s *bodylessUtxoStore) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
+	if s.refuseTxField {
+		for _, name := range f {
+			if name == fields.Tx {
+				return nil, errors.NewStorageError("[bodylessUtxoStore] asked for fields.Tx: an existence check must decide on the record, not the body")
+			}
+		}
+	}
+
 	data, err := s.Store.Get(ctx, hash, f...)
 	if err != nil || data == nil {
 		return data, err
@@ -33,6 +53,10 @@ func (s *bodylessUtxoStore) Get(ctx context.Context, hash *chainhash.Hash, f ...
 	// readers hold.
 	stripped := *data
 	stripped.Tx = nil
+
+	if s.stripInpoints {
+		stripped.TxInpoints = subtree.TxInpoints{}
+	}
 
 	return &stripped, nil
 }
@@ -61,7 +85,23 @@ func TestCanonicalCoinbaseAt_BodylessRecordIsPresent(t *testing.T) {
 	cb2 := coinbaseTxForHeader(t, blockHeader2)
 	addCanonicalBlockWithCoinbase(ctx, t, items, blockHeader2, cb2)
 
-	items.blockAssembler.utxoStore = &bodylessUtxoStore{Store: items.utxoStore}
+	// Proof the double really is body-less, so the assertions below are not
+	// passing for the wrong reason.
+	probe := &bodylessUtxoStore{Store: items.utxoStore}
+
+	stripped, err := probe.Get(ctx, cb1.TxIDChainHash(), fields.Tx)
+	require.NoError(t, err)
+	require.NotNil(t, stripped)
+	require.Nil(t, stripped.Tx)
+
+	// And the store really does answer the second one with a not-found.
+	_, err = probe.Get(ctx, cb2.TxIDChainHash(), fields.Tx)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound))
+
+	// refuseTxField pins the field choice: asking for the body at all is the bug
+	// under test, so the double refuses it rather than quietly returning a
+	// stripped record that would let the old code pass.
+	items.blockAssembler.utxoStore = &bodylessUtxoStore{Store: items.utxoStore, refuseTxField: true}
 
 	// The record exists with no body at all: present.
 	present, blk, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 1)
@@ -69,22 +109,11 @@ func TestCanonicalCoinbaseAt_BodylessRecordIsPresent(t *testing.T) {
 	require.True(t, present, "a coinbase whose body was never written is still present")
 	require.NotNil(t, blk)
 
-	// Proof the double really is body-less, so the assertion above is not
-	// passing for the wrong reason.
-	stripped, err := items.blockAssembler.utxoStore.Get(ctx, cb1.TxIDChainHash(), fields.Tx)
-	require.NoError(t, err)
-	require.NotNil(t, stripped)
-	require.Nil(t, stripped.Tx)
-
 	// No record at all: absent, and still no error.
 	absent, blk2, err := items.blockAssembler.canonicalCoinbaseAt(ctx, 2)
 	require.NoError(t, err)
 	require.False(t, absent, "a coinbase with no record is missing")
 	require.NotNil(t, blk2)
-
-	// And the store really did answer that one with a not-found.
-	_, err = items.blockAssembler.utxoStore.Get(ctx, cb2.TxIDChainHash(), fields.Tx)
-	require.True(t, errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound))
 }
 
 // TestStartupCoinbaseDivergenceCheck_BodylessCoinbasesRaiseNoAlarm is the same
@@ -109,7 +138,7 @@ func TestStartupCoinbaseDivergenceCheck_BodylessCoinbasesRaiseNoAlarm(t *testing
 
 	logger := &capturingLogger{}
 	items.blockAssembler.logger = logger
-	items.blockAssembler.utxoStore = &bodylessUtxoStore{Store: items.utxoStore}
+	items.blockAssembler.utxoStore = &bodylessUtxoStore{Store: items.utxoStore, refuseTxField: true}
 
 	items.blockAssembler.checkCoinbaseDivergenceOnStart(ctx)
 
@@ -131,23 +160,7 @@ func TestUnlockConflictParents_BodylessWinnerStillUnlocksItsParents(t *testing.T
 	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
 	require.NotNil(t, items)
 
-	parent := coinbaseTxForHeader(t, blockHeader1)
-
-	_, _, err := items.utxoStore.SpendAndCreate(ctx, parent, 1, utxoStore.WithCreateOnly())
-	require.NoError(t, err)
-
-	child := bt.NewTx()
-	require.NoError(t, child.FromUTXOs(&bt.UTXO{
-		TxIDHash:      parent.TxIDChainHash(),
-		Vout:          0,
-		LockingScript: parent.Outputs[0].LockingScript,
-		Satoshis:      parent.Outputs[0].Satoshis,
-	}))
-	child.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{bscript.OpTRUE})
-	child.AddOutput(&bt.Output{Satoshis: parent.Outputs[0].Satoshis - 1, LockingScript: parent.Outputs[0].LockingScript})
-
-	_, _, err = items.utxoStore.SpendAndCreate(ctx, child, 2, utxoStore.WithCreateOnly())
-	require.NoError(t, err)
+	parent, child := seedParentAndChild(ctx, t, items)
 
 	// Lock the parent, the state a forward ProcessConflicting leaves at step 2.
 	require.NoError(t, items.utxoStore.SetLocked(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, true))
@@ -181,4 +194,96 @@ func TestUnlockConflictParents_MissingWinnerIsSkipped(t *testing.T) {
 	require.Error(t, err)
 
 	require.NoError(t, items.blockAssembler.unlockConflictParents(ctx, []chainhash.Hash{*never.TxIDChainHash()}))
+}
+
+// TestUnlockConflictParents_NeitherInpointsNorBodyIsAnError covers the shape a
+// utxoset record created below the checkpoint actually has: createMinedPlanSQL
+// writes NULL tx_inpoints for every transaction the mined path creates (quick
+// validation routes all of a block's transactions through it, not just the
+// coinbase), and utxostore_skipTxBodyBelowCheckpoint writes no body. A record
+// with neither cannot yield its parents, and reporting that as "no parents"
+// would leave them locked while the heal reported success.
+func TestUnlockConflictParents_NeitherInpointsNorBodyIsAnError(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+
+	_, child := seedParentAndChild(ctx, t, items)
+
+	items.blockAssembler.utxoStore = &bodylessUtxoStore{Store: items.utxoStore, stripInpoints: true}
+
+	err := items.blockAssembler.unlockConflictParents(ctx, []chainhash.Hash{*child.TxIDChainHash()})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "neither stored inpoints nor a transaction body")
+	require.Contains(t, err.Error(), child.TxIDChainHash().String())
+}
+
+// TestValidateUnminedTxInputs_BodylessRecordValidatesFromInpoints is the same
+// (b) fault in the reload path. The read asked for fields.Inputs and bailed on a
+// nil txMeta.Tx, so on the SQL store — which populates data.Tx only for
+// fields.Tx — every unmined transaction was silently dropped from the mining
+// candidate, and on utxoset every record whose body had aged out was too. An
+// unmined record carries its inpoints, which is what it reads now.
+func TestValidateUnminedTxInputs_BodylessRecordValidatesFromInpoints(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+
+	_, child := seedParentAndChild(ctx, t, items)
+
+	items.blockAssembler.utxoStore = &bodylessUtxoStore{Store: items.utxoStore}
+
+	valid, err := items.blockAssembler.validateUnminedTxInputs(ctx, *child.TxIDChainHash(), map[uint32]bool{}, true)
+	require.NoError(t, err)
+	require.True(t, valid, "an unmined transaction with stored inpoints must validate without its body")
+}
+
+// TestValidateUnminedTxInputs_NeitherInpointsNorBodyIsAnError pins the other
+// half: undecidable is not the same answer as invalid, and must not be reported
+// as one.
+func TestValidateUnminedTxInputs_NeitherInpointsNorBodyIsAnError(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+
+	_, child := seedParentAndChild(ctx, t, items)
+
+	items.blockAssembler.utxoStore = &bodylessUtxoStore{Store: items.utxoStore, stripInpoints: true}
+
+	valid, err := items.blockAssembler.validateUnminedTxInputs(ctx, *child.TxIDChainHash(), map[uint32]bool{}, true)
+	require.Error(t, err)
+	require.False(t, valid)
+	require.Contains(t, err.Error(), "neither stored inpoints nor a transaction body")
+}
+
+// seedParentAndChild creates a coinbase parent and one child spending its first
+// output, both as unmined records in the UTXO store, and returns them.
+func seedParentAndChild(ctx context.Context, t *testing.T, items *baTestItems) (parent, child *bt.Tx) {
+	t.Helper()
+
+	parent = coinbaseTxForHeader(t, blockHeader1)
+
+	_, _, err := items.utxoStore.SpendAndCreate(ctx, parent, 1, utxoStore.WithCreateOnly())
+	require.NoError(t, err)
+
+	child = bt.NewTx()
+	require.NoError(t, child.FromUTXOs(&bt.UTXO{
+		TxIDHash:      parent.TxIDChainHash(),
+		Vout:          0,
+		LockingScript: parent.Outputs[0].LockingScript,
+		Satoshis:      parent.Outputs[0].Satoshis,
+	}))
+	child.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{bscript.OpTRUE})
+	child.AddOutput(&bt.Output{Satoshis: parent.Outputs[0].Satoshis - 1, LockingScript: parent.Outputs[0].LockingScript})
+
+	_, _, err = items.utxoStore.SpendAndCreate(ctx, child, 2, utxoStore.WithCreateOnly())
+	require.NoError(t, err)
+
+	return parent, child
 }

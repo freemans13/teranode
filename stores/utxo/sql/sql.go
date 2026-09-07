@@ -4321,15 +4321,31 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		utxoHash      *chainhash.Hash
 	)
 
-	// Create a database transaction
-	txn, err := s.db.Begin()
-	if err != nil {
-		return nil, nil, err
+	// Every read this function needs is taken BEFORE the write transaction opens,
+	// and none of them is taken through it.
+	//
+	// s.Get and s.GetSpend go to the POOL, i.e. to a different connection from the
+	// one the transaction holds. Once the UPDATE below has run, that connection is
+	// a writer, and on SQLite -- where the shared-cache write lock blocks every
+	// other connection's reads -- a read issued from inside the transaction waits
+	// for a writer that is waiting for it. That is a permanent deadlock, not a slow
+	// query: it wedged block assembly's unmined reload for the full test timeout.
+	// (Postgres is unaffected: MVCC serves the reader the pre-UPDATE snapshot. The
+	// bug was reachable only once validateUnminedTxInputs started resolving parents
+	// from the stored inpoints, because until then it never reached this path on a
+	// SQL store at all.)
+	//
+	// Hoisting is semantics-preserving. The UPDATE writes conflicting and
+	// delete_at_height on the transactions row; GetSpend's answer is derived from
+	// the outputs row's spending data and the coinbase spending height, neither of
+	// which the UPDATE touches.
+	type conflictingRead struct {
+		hash             chainhash.Hash
+		txMeta           *meta.Data
+		spendingTxHashes []chainhash.Hash
 	}
 
-	defer func() {
-		_ = txn.Rollback()
-	}()
+	reads := make([]conflictingRead, 0, len(txHashes))
 
 	for _, conflictingTxHash := range txHashes {
 		// get the extended tx
@@ -4338,29 +4354,11 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			return nil, nil, err
 		}
 
-		if err = txn.QueryRowContext(ctx, qUpdate, conflictingTxHash[:], setValue, deleteAtHeight).Scan(&transactionID); err != nil {
-			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", conflictingTxHash, err)
+		if txMeta == nil || txMeta.Tx == nil {
+			return nil, nil, errors.NewProcessingError("[SetConflicting][%s] record carries no transaction body, so its inputs and outputs cannot be resolved", conflictingTxHash.String())
 		}
 
-		if err = s.updateParentConflictingChildren(ctx, transactionID, txMeta.Tx, txn); err != nil {
-			return nil, nil, err
-		}
-
-		for i, input := range txMeta.Tx.Inputs {
-			utxoHash, err = util.UTXOHashFromInput(input)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			spend := &utxo.Spend{
-				TxID:         input.PreviousTxIDChainHash(),
-				Vout:         input.PreviousTxOutIndex,
-				UTXOHash:     utxoHash,
-				SpendingData: spendpkg.NewSpendingData(&conflictingTxHash, i),
-			}
-
-			affectedParentSpends = append(affectedParentSpends, spend)
-		}
+		read := conflictingRead{hash: conflictingTxHash, txMeta: txMeta}
 
 		for vOut, output := range txMeta.Tx.Outputs {
 			vOutUint32, err := safeconversion.IntToUint32(vOut)
@@ -4386,9 +4384,51 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			}
 
 			if spendResponse.Status == int(utxo.Status_SPENT) && spendResponse.SpendingData != nil && spendResponse.SpendingData.TxID != nil {
-				spendingTxHashes = append(spendingTxHashes, *spendResponse.SpendingData.TxID)
+				read.spendingTxHashes = append(read.spendingTxHashes, *spendResponse.SpendingData.TxID)
 			}
 		}
+
+		reads = append(reads, read)
+	}
+
+	// Create a database transaction
+	txn, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	defer func() {
+		_ = txn.Rollback()
+	}()
+
+	for _, read := range reads {
+		conflictingTxHash := read.hash
+
+		if err = txn.QueryRowContext(ctx, qUpdate, conflictingTxHash[:], setValue, deleteAtHeight).Scan(&transactionID); err != nil {
+			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", conflictingTxHash, err)
+		}
+
+		if err = s.updateParentConflictingChildren(ctx, transactionID, read.txMeta.Tx, txn); err != nil {
+			return nil, nil, err
+		}
+
+		for i, input := range read.txMeta.Tx.Inputs {
+			utxoHash, err = util.UTXOHashFromInput(input)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			spend := &utxo.Spend{
+				TxID:         input.PreviousTxIDChainHash(),
+				Vout:         input.PreviousTxOutIndex,
+				UTXOHash:     utxoHash,
+				SpendingData: spendpkg.NewSpendingData(&conflictingTxHash, i),
+			}
+
+			affectedParentSpends = append(affectedParentSpends, spend)
+		}
+
+		spendingTxHashes = append(spendingTxHashes, read.spendingTxHashes...)
 	}
 
 	if err = txn.Commit(); err != nil {

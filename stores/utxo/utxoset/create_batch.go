@@ -161,10 +161,26 @@ SELECT t.k
 //     historic duplicate coinbases. Written with the LIMIT 1 OFFSET 0 fence so the planner
 //     cannot swap the range scan for a scan of the whole leaf partition.
 //
-// tx_inpoints is written NULL: below the checkpoint nothing can un-mine, and at the tip the
-// block path only creates coinbases, which have no inputs. fee is written NULL for the same
-// reason createIdentPlanSQL writes it NULL -- the store never computes one, and a coinbase
-// has none to compute.
+// tx_inpoints is written NULL, deliberately and for every transaction this statement creates,
+// not just for coinbases. Below the checkpoint quick validation routes EVERY transaction in a
+// block through this path, so "the block path only creates coinbases" -- which an earlier
+// version of this comment claimed -- is false: it holds at the tip, where a block's ordinary
+// transactions already exist as mempool records and are stamped rather than created, and not
+// below it, where they are created here for the first time.
+//
+// The consequence is worth stating, because it is not local to this statement. The two readers
+// that resolve a transaction's parents from the identity record -- conflict handling
+// (counterConflictingInpoints, and block assembly's unlockConflictParents /
+// validateUnminedTxInputs through spentOutpoints) -- get nothing from a record created here,
+// and fall through to the body. With utxostore_skipTxBodyBelowCheckpoint on there is no body
+// either, and those readers then fail loudly rather than treating a transaction that spends
+// something as one that spends nothing. Neither reader runs for a checkpointed block: nothing
+// below the checkpoint can un-mine, and its transactions are mined rather than unmined. Storing
+// the inpoints would cost the WAL bytes this store is being shaped to avoid, so the trade is
+// intentional -- but a reader that assumes inpoints are always there is wrong on this path.
+//
+// fee is written NULL for the same reason createIdentPlanSQL writes it NULL -- the store never
+// computes one, and a coinbase has none to compute.
 //
 // The body CTE's `raw_tx IS NOT NULL` is how utxostore_skipTxBodyBelowCheckpoint is applied,
 // and it is a filter on the ROW rather than a second statement on purpose. Block application

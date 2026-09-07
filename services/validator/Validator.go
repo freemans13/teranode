@@ -1198,6 +1198,23 @@ func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context,
 		}
 	}
 
+	// A body-less parent record is a legal answer from the UTXO store: the body
+	// window has aged out, or utxostore_skipTxBodyBelowCheckpoint meant the bytes
+	// were never written for a parent mined at or below the checkpoint. Extension
+	// genuinely needs that parent's output script, so this is still a failure —
+	// but it is a different failure from a parent that exists and simply has no
+	// such output, and reporting it as the latter sends an operator hunting a
+	// malformed transaction that does not exist.
+	//
+	// Tested once, above the loop: whether the parent has a body does not vary
+	// per input. The vout reported is the one the neighbouring "has no output for
+	// index" error reports, so both errors name the same coordinate. len(idxs)==0
+	// extends nothing, so there is nothing to refuse.
+	if extend && txMeta.Tx == nil && len(idxs) > 0 {
+		return errors.NewProcessingError("[Validate][%s] parent transaction %s is in the store but its body is not retained by this node (aged out, or below the utxostore_skipTxBodyBelowCheckpoint boundary), so no output for index %d can be read",
+			tx.TxIDChainHash().String(), parentTxHash.String(), tx.Inputs[idxs[0]].PreviousTxOutIndex)
+	}
+
 	if extend {
 		// extend the transaction inputs with the parent tx outputs (idx bounds
 		// already validated at the top of the function)
@@ -1209,18 +1226,6 @@ func (v *Validator) getUtxoBlockHeightAndExtendForParentTx(gCtx context.Context,
 			// range and crashes the validator. Mirrors the guard in
 			// stores/utxo/aerospike/get.go.
 			vout := tx.Inputs[idx].PreviousTxOutIndex
-
-			// A body-less parent record is a legal answer from the UTXO store: the
-			// body window has aged out, or utxostore_skipTxBodyBelowCheckpoint meant
-			// the bytes were never written for a parent mined at or below the
-			// checkpoint. Extension genuinely needs that parent's output script, so
-			// this is still a failure — but it is a different failure from a parent
-			// that exists and simply has no such output, and reporting it as the
-			// latter sends an operator hunting a malformed transaction.
-			if txMeta.Tx == nil {
-				return errors.NewProcessingError("[Validate][%s] parent transaction %s is in the store but its body is not retained by this node (aged out, or below the utxostore_skipTxBodyBelowCheckpoint boundary), so input %d cannot be extended",
-					tx.TxIDChainHash().String(), parentTxHash.String(), idx)
-			}
 
 			if txMeta.Tx.Outputs == nil ||
 				int(vout) >= len(txMeta.Tx.Outputs) || txMeta.Tx.Outputs[vout] == nil {
