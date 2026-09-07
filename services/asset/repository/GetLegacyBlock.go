@@ -551,6 +551,16 @@ func (repo *Repository) writeChunkToWriter(ctx context.Context, w io.Writer, blo
 			}
 			continue
 		} else {
+			// A record with no serialized body is a legal answer from the UTXO store
+			// — the body window has aged out, or utxostore_skipTxBodyBelowCheckpoint
+			// meant the bytes below the checkpoint were never written — and getTxs
+			// does not count it as missed, because the record is there. WriteTo on a
+			// nil *bt.Tx dereferences it, so say what is wrong instead of taking the
+			// streaming writer down with a nil-pointer panic.
+			if chunkMetaSlice[i] == nil || chunkMetaSlice[i].Tx == nil {
+				return errors.NewProcessingError("[writeChunkToWriter] tx %s at offset %d is not retained in full by this node", chunkHashes[i].String(), chunkOffset+i)
+			}
+
 			// always write the non-extended normal bytes to the subtree data file !
 			// our peer node should extend the transactions if needed
 			if _, err := chunkMetaSlice[i].Tx.WriteTo(w); err != nil {

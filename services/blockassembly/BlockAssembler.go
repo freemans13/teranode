@@ -1363,13 +1363,24 @@ func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utx
 // inputs — the parents a forward ProcessConflicting locks at step 2 and unlocks
 // at step 5. Used when healing a stale forward whose step-5 unlock a crash
 // skipped. A winner whose record is gone (pruned) contributes no parents.
+//
+// The parents come from the stored inpoints rather than from the transaction
+// body. The two carry the same set, but only the inpoints are on the identity
+// record: a store may hold a transaction with Tx nil once its body window has
+// aged out, or, with utxostore_skipTxBodyBelowCheckpoint on, because the bytes
+// below the checkpoint were never written. Reading the body meant every such
+// winner contributed no parents and was skipped in silence, leaving parents
+// locked with nothing left to unlock them — the same wrong signal that made
+// canonicalCoinbaseAt report intact coinbases as missing. The body stays as the
+// fallback for a record that carries no inpoints, so nothing regresses for a
+// store that never had them.
 func (b *BlockAssembler) unlockConflictParents(ctx context.Context, txHashes []chainhash.Hash) error {
 	parentSet := make(map[chainhash.Hash]struct{}, len(txHashes))
 
 	for i := range txHashes {
 		h := txHashes[i]
 
-		txMeta, err := b.utxoStore.Get(ctx, &h, fields.Tx)
+		txMeta, err := b.utxoStore.Get(ctx, &h, fields.TxInpoints, fields.Tx)
 		if err != nil {
 			if errors.Is(err, errors.ErrTxNotFound) {
 				continue
@@ -1378,7 +1389,19 @@ func (b *BlockAssembler) unlockConflictParents(ctx context.Context, txHashes []c
 			return errors.NewProcessingError("[unlockConflictParents][%s] failed to load tx", h.String(), err)
 		}
 
-		if txMeta == nil || txMeta.Tx == nil {
+		if txMeta == nil {
+			continue
+		}
+
+		if parents := txMeta.TxInpoints.ParentTxHashes; len(parents) > 0 {
+			for _, p := range parents {
+				parentSet[p] = struct{}{}
+			}
+
+			continue
+		}
+
+		if txMeta.Tx == nil {
 			continue
 		}
 
