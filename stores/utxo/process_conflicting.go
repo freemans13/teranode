@@ -527,6 +527,19 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 				return nil, nil, errors.NewProcessingError("[ReverseProcessConflicting][%s] error getting counter tx %s", demotedHash.String(), counterHash.String(), getCounterErr)
 			}
 
+			// TODO: this skips a counter whose record carries no body, in silence.
+			// Re-spending its inputs needs the body -- SpendAndCreate takes a
+			// *bt.Tx and there is no body-free route in the interface -- but a
+			// body-less record is not exotic: on the utxoset store the tx_body
+			// window ages out, so an unmined counter older than the window has no
+			// body at all, and below the checkpoint with
+			// utxostore_skipTxBodyBelowCheckpoint on neither the body nor the
+			// stored inpoints exist. When that happens the promoted counter's
+			// inputs are left unspent and this reports success. Making it loud
+			// needs a logger on this path (this is a free function over the store
+			// interface, with none), and turning it into a hard error would fail
+			// any reorg touching a pruned counter -- so it is left as is here and
+			// tracked as a follow-up rather than changed blind.
 			if counterMeta == nil || counterMeta.Tx == nil {
 				continue
 			}
