@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -48,11 +49,17 @@ func TestLivenessDoesNotRestartAnIdleNode(t *testing.T) {
 	}, 5*time.Second, 5*time.Millisecond, "loop must take ownership of the heartbeat")
 
 	// No blocks, no transactions — only the idle tick can keep this healthy.
-	time.Sleep(30 * tick)
+	//
+	// Sampled continuously rather than once after a sleep. A single sample has a
+	// cliff: one scheduler or GC stall longer than the timeout landing on that
+	// one instant fails the test. It also under-asserts, because the property is
+	// that an idle node stays healthy for the whole window, not that it happens
+	// to be healthy at one moment.
+	require.Never(t, func() bool {
+		status, _, err := server.Health(context.Background(), true)
 
-	status, msg, err := server.Health(t.Context(), true)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, status, "an idle but responsive node must stay healthy: %s", msg)
+		return err != nil || status != http.StatusOK
+	}, 30*tick, tick/2, "an idle but responsive node must stay healthy for the whole window")
 }
 
 // TestLivenessDoesNotRestartDuringStartup pins the window review found to be
@@ -300,4 +307,56 @@ func TestLivenessReportsALoopThatHasStopped(t *testing.T) {
 
 		return err == nil && status == http.StatusServiceUnavailable
 	}, 5*time.Second, 10*time.Millisecond, "a loop that has stopped being serviced must be reported as wedged")
+}
+
+// TestLivenessCatchUpFetchBeats pins the path review found still unbeaten after
+// the startup-safety fix: startChannelListeners queues an initial reconcile
+// BEFORE the listener goroutine exists, so on any node that restarts behind the
+// chain tip the loop claims the heartbeat and then immediately spends its FIRST
+// select pass catching up. That work is unbounded, so without a beat inside it a
+// healthy catching-up node reports 503, gets restarted, and re-enters the same
+// catch-up: the crash loop this whole feature exists to avoid (issue 1447).
+//
+// The assertion is on the age observed INSIDE subtreeProcessor.Reorg, not on the
+// age after processNewBlockAnnouncement returns. Reorg is the step after the
+// per-block fetch, so a small age there is evidence the fetch loop beat while it
+// was running, and not evidence of some later beat on the way out. Deleting the
+// BeatIfStarted calls in getReorgBlocks fails this test.
+func TestLivenessCatchUpFetchBeats(t *testing.T) {
+	initPrometheusMetrics()
+
+	items := setupBlockAssemblyTest(t)
+	genesis := genesisHeader(t, items)
+
+	chain := buildChain(genesis, 5, 900)
+	addChain(t, items, chain)
+
+	const staleBy = time.Hour
+
+	var ageInsideReorg time.Duration
+
+	mockStp := &subtreeprocessor.MockSubtreeProcessor{}
+	mockStp.On("Reorg", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) {
+			ageInsideReorg = items.blockAssembler.heartbeat.Age()
+		}).
+		Return(nil)
+	injectMockStp(t, items, mockStp)
+
+	// BA sits at genesis while the chain is at height 5, so this takes the
+	// catch-up branch and fetches all five blocks.
+	items.blockAssembler.setBestBlockHeader(genesis, 0)
+
+	// Stand in for a loop that claimed the heartbeat and then went straight into
+	// this catch-up. It must be armed: BeatIfStarted is a no-op before the loop
+	// owns the heartbeat, which is what keeps startup safe.
+	items.blockAssembler.heartbeat.SetLastBeatForTest(time.Now().Add(-staleBy))
+	require.Greater(t, items.blockAssembler.heartbeat.Age(), staleBy/2,
+		"precondition: the heartbeat must start this test stale")
+
+	items.blockAssembler.processNewBlockAnnouncement(t.Context())
+
+	mockStp.AssertCalled(t, "Reorg", mock.Anything, mock.Anything)
+	require.Less(t, ageInsideReorg, time.Minute,
+		"the per-block catch-up fetch must beat, or a node restarting behind the tip reports itself wedged")
 }

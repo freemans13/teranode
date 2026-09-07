@@ -442,9 +442,16 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 		// First beat happens HERE, not at construction: everything before this
 		// point is startup work that is legitimately unbounded (waiting on
 		// pending block validation, reloading a large unmined set), and the
-		// heartbeat must not age through it.
-		b.heartbeat.Beat()
-
+		// heartbeat must not age through it. The beat is at the top of the loop
+		// body, so the first pass is what claims the heartbeat for this
+		// goroutine and every later pass renews it.
+		//
+		// The first pass is not necessarily idle: triggerReconcile above queued
+		// a reconcile before this goroutine existed, so on a node that restarts
+		// behind the tip the loop claims the heartbeat and immediately runs a
+		// catch-up. getReorgBlocks beats once per block through the fetch, but
+		// subtreeProcessor.Reorg applies the whole set in one call and is not
+		// beaten — see the setting's "What it cannot bound".
 		for {
 			b.heartbeat.Beat()
 
@@ -2040,8 +2047,23 @@ func (b *BlockAssembler) getReorgBlocks(ctx context.Context, header *model.Block
 	// moveBackBlocks will contain all blocks we need to move down to get to the common ancestor
 	moveBackBlocks := make([]blockWithMeta, 0, len(moveBackBlockHeadersWithMeta))
 
+	// Both loops below run one blockchainClient.GetBlock round trip per block, from
+	// inside a single pass of the main select, so without a beat a long-but-
+	// progressing catch-up is indistinguishable from a wedge. That is not a rare
+	// path: startChannelListeners queues an initial reconcile before the loop
+	// starts, so on any node that restarts behind the tip this is the FIRST thing
+	// the loop does after it claims the heartbeat, and a spurious restart would
+	// re-enter the same work (issue 1447).
+	//
+	// The beat sits at the top of the iteration, so for every block after the first
+	// it is proof the previous GetBlock returned: it tracks FORWARD PROGRESS, and a
+	// fetch that stops progressing still goes stale. BeatIfStarted, not Beat, for
+	// the same reason as validateParentChain — every caller today is inside the
+	// loop, but a future startup caller must not be able to arm the probe.
 	var block *model.Block
 	for _, headerWithMeta := range moveForwardBlockHeadersWithMeta {
+		b.heartbeat.BeatIfStarted()
+
 		block, err = b.blockchainClient.GetBlock(ctx, headerWithMeta.header.Hash())
 		if err != nil {
 			return nil, nil, errors.NewServiceError("error getting block", err)
@@ -2054,6 +2076,8 @@ func (b *BlockAssembler) getReorgBlocks(ctx context.Context, header *model.Block
 	}
 
 	for _, headerWithMeta := range moveBackBlockHeadersWithMeta {
+		b.heartbeat.BeatIfStarted()
+
 		block, err = b.blockchainClient.GetBlock(ctx, headerWithMeta.header.Hash())
 		if err != nil {
 			return nil, nil, errors.NewServiceError("error getting block", err)
