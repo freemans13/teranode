@@ -3350,15 +3350,33 @@ func (sm *SyncManager) removeHeaderAnchorLocked() {
 // Without it a parked block is a silent loss of one in-flight slot, and the
 // pipeline drains one block at a time until nothing is outstanding at all.
 //
-// All three of its callers — a block accepted into the park, a parked block
-// committed off disk, and the park sweep's ticker carrying a rewound cursor
-// forward — can run while the round's anchor is still the front of the header
-// list, so the check that says "not yet" lives here rather than in any one of
-// them. It is deliberately not the check the ticker makes: "the cursor is on the
-// front" is true of a rewound cursor and false of an ordinary forward walk,
-// which is right for driving the walk from a timer and would silently switch off
-// the top-up this function exists for.
+// Both of its callers, a block accepted into the park and a parked block
+// committed off disk, can run while the round's anchor is still the front of the
+// header list, so the check that says "not yet" lives in topUpHeaderBlocks below
+// rather than in either of them. It is deliberately not the check the sweep
+// ticker used to make: "the cursor is on the front" is true of a rewound cursor
+// and false of an ordinary forward walk, which is right for driving the walk
+// from a timer and would silently switch off the top-up this function exists
+// for.
+//
+// The sweep ticker's resume does NOT come through here, because the per-peer
+// question this asks is the wrong one for it. See resumeHeaderWalk.
 func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
+	sm.topUpHeaderBlocks(func() bool {
+		return sm.blockDownloads.CountForPeer(peer) < sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	})
+}
+
+// topUpHeaderBlocks is fetchMoreHeaderBlocks with the "has this peer got room"
+// question left to the caller, because the sweep's walk resume asks a different
+// one: not whether one named peer has room, but whether the node has anywhere to
+// put a block at all. A nil gate means the download assigner is the only gate,
+// which is what fetchHeaderBlocks consults anyway.
+//
+// Everything else is common to both and stays here: the walk only runs in
+// headers-first mode, and never while the round's anchor is still the front of
+// the list.
+func (sm *SyncManager) topUpHeaderBlocks(hasRoom func() bool) {
 	if !sm.headersFirstMode.Load() || sm.blockSizeTracker == nil {
 		return
 	}
@@ -3368,13 +3386,15 @@ func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
 	anchorIsStillTheFront := sm.anchorIsStillTheFrontLocked()
 	sm.headerMu.Unlock()
 
-	if anchorIsStillTheFront {
+	if anchorIsStillTheFront || !haveMoreHeaders {
 		return
 	}
 
-	if haveMoreHeaders && sm.blockDownloads.CountForPeer(peer) < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
-		sm.fetchHeaderBlocks()
+	if hasRoom != nil && !hasRoom() {
+		return
 	}
+
+	sm.fetchHeaderBlocks()
 }
 
 // reinsertHeaderLocked puts a header node that left the list back into it, and

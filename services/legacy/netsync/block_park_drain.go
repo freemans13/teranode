@@ -273,8 +273,8 @@ func (sm *SyncManager) livePeer(recorded *peerpkg.Peer) *peerpkg.Peer {
 // It used to check that the cursor was sitting on the front of the list before
 // sending anything, and to call that check the whole of its safety. The rule it
 // was reaching for — nothing may fetch while the round's anchor is still the
-// front — now lives in fetchMoreHeaderBlocks, which is the one place all three
-// of the top-up callers pass through, and it is stated there as a fact about the
+// front — now lives in topUpHeaderBlocks, which is the one place every one of
+// the top-up callers passes through, and it is stated there as a fact about the
 // list rather than about the cursor. What is left of the old check is an
 // accident: "the cursor is on the front" is also false during an ordinary
 // forward walk, where the cursor is deliberately ahead of the front, so the
@@ -282,9 +282,28 @@ func (sm *SyncManager) livePeer(recorded *peerpkg.Peer) *peerpkg.Peer {
 // for. Keeping it would have meant keeping a condition no test could hold to
 // account, next to a comment claiming it was load-bearing.
 //
+// It is gated on the node having somewhere to put a block, not on the sync peer
+// having room. The gate it used to take, the sync peer's own count against the
+// block-size ladder, is right for topping a peer's queue back up after that
+// peer's block stopped being outstanding, and wrong here: at the ladder's lowest
+// rung the cap is one block, so a sync peer mid-transfer on a multi-gigabyte
+// block holds the resume shut for hours while the assigner would have handed the
+// rewound front block to an idle peer. The frontier race cannot cover it either,
+// because publishFrontierLocked clears the frontier for a front block nobody has
+// asked for, which is exactly what a rewound front is.
+//
+// svnode schedules per peer, in each peer's own send pass, with each peer
+// checking only its own in-flight count and no sync peer involved in block
+// bodies at all (FindNextBlocksToDownload, src/net/net_processing.cpp:5522).
+// Letting the assigner decide is that shape: it spreads over every eligible peer
+// with budget and refuses the pass when the node-wide download window is spent
+// or every peer is at its per-peer cap. With legacy_multiPeerBlockDownload off
+// it collapses to the sync peer at the ladder's budget, which is the behaviour
+// this had before.
+//
 // Called from the park sweep's ticker, on the block-queue consumer.
 func (sm *SyncManager) resumeHeaderWalk() {
-	sm.fetchMoreHeaderBlocks(sm.loadSyncPeer())
+	sm.topUpHeaderBlocks(nil)
 }
 
 // sweepParkedBlocks is the safety net for blocks whose parent never arrives
