@@ -22,6 +22,36 @@ import (
 // handler starts.
 var parkSweepInterval = 30 * time.Second
 
+// parkSweepTimeBudget is how long one sweep tick may spend before it stops and
+// leaves the rest for the next one.
+//
+// It is the bound the two count caps cannot give. Every item the sweep handles
+// waits on something outside this process, a blob-store write permit for a
+// delete and the blockchain service for a lookup, each with a deadline of its
+// own around ten seconds, and they are handled one after another on the goroutine
+// that commits blocks in order. Bounded in count is a twenty-minute tick in the
+// worst case; bounded in time is a tick that gets out of the way.
+//
+// A sixth of parkSweepInterval, so the sweep never holds the commit goroutine
+// for a meaningful share of the interval it runs on, and normal ticks are far
+// under it: a full 128-entry expiry burst against a store with permits free is
+// milliseconds. Nothing is lost by stopping, only deferred by parkSweepInterval,
+// and every item the sweep defers is one already past its own deadline, so the
+// only question is rate.
+var parkSweepTimeBudget = 5 * time.Second
+
+// parkSweepClock reads the clock the sweep measures its own tick against. The
+// tick's `now` argument is the time the sweep is judging the park AT, which
+// tests move by hours; this is how long the tick itself has been running, which
+// is a different question and needs a real clock.
+func (sm *SyncManager) parkSweepClock() time.Time {
+	if sm.parkSweepNow != nil {
+		return sm.parkSweepNow()
+	}
+
+	return time.Now()
+}
+
 // chainCtx puts a deadline on one blockchain lookup made from the block-commit
 // goroutine.
 //
@@ -323,23 +353,51 @@ func (sm *SyncManager) resumeHeaderWalk() {
 // cursor rewind rather than a lookup — and the one that arrives in bursts,
 // because blocks parked together age out together.
 //
-// Both of those cap a COUNT. Time is capped separately and has to be: the
-// lookups are sequential, so a slow blockchain service turns a bounded number of
-// calls into an unbounded tick, on the goroutine every queued block is waiting
-// behind. chainCtx is what bounds each one, and a lookup that runs out of time
-// is treated as "could not check", which leaves the block parked for the next
-// tick.
+// Both of those cap a COUNT, and a count is not a bound on the tick. Each item
+// carries its own deadline, chainCtx for a lookup and the park's store timeout
+// for a delete, and both of those wait on resources the rest of the process is
+// competing for: the blockchain service, and the blob store's process-wide write
+// permits. A bounded number of sequential items each allowed ten seconds is a
+// twenty-minute tick, on the goroutine every queued block is waiting behind, and
+// then the block queue fills and dispatch backs up for every peer, which is the
+// failure the count caps were introduced to prevent. So the tick has its own
+// elapsed-time budget, parkSweepTimeBudget, and both halves stop at it.
+//
+// Stopping is free for the lookups, which leave the block parked for the next
+// tick anyway. It is not free for the expiries, because Expire has already taken
+// those entries out of the index: an entry the tick does not reach is put back,
+// or its blob is left charged against the budget with nothing tracking it and
+// its cursor is never rewound.
 func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 	if !sm.blockPark.Enabled() {
 		return
 	}
 
-	for _, entry := range sm.blockPark.Expire(now, parkSweepExpiryBudget) {
+	deadline := sm.parkSweepClock().Add(parkSweepTimeBudget)
+
+	expired := sm.blockPark.Expire(now, parkSweepExpiryBudget)
+
+	for i, entry := range expired {
+		// Always one, however long the tick has already run: a budget that can
+		// refuse every item is a sweep that never sweeps.
+		if i > 0 && !sm.parkSweepClock().Before(deadline) {
+			sm.blockPark.RestoreAll(expired[i:])
+			sm.logger.Warnf("[sweepParkedBlocks] out of time after giving up %d blocks, %d put back for the next tick", i, len(expired)-i)
+
+			break
+		}
+
 		sm.logger.Warnf("[sweepParkedBlocks][%s] %s, giving the block up after %s: parent %s", entry.hash, parkDispositionExpired.reason, parkEntryTTL, entry.prevBlock)
 		sm.applyParkDisposition(entry, parkDispositionExpired)
 	}
 
-	for _, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {
+	for i, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {
+		if i > 0 && !sm.parkSweepClock().Before(deadline) {
+			sm.logger.Warnf("[sweepParkedBlocks] out of time after %d parent lookups, the rest wait for the next tick", i)
+
+			break
+		}
+
 		exists, err := sm.blockExistsWithDeadline(candidate.prevBlock)
 		if err != nil {
 			sm.logger.Warnf("[sweepParkedBlocks][%s] could not check whether parent %s is stored: %v", candidate.hash, candidate.prevBlock, err)

@@ -691,7 +691,13 @@ type SyncManager struct {
 	// again. nil means the park is off and the old discard path runs; every entry
 	// point is nil-safe, because tests build SyncManager as a struct literal that
 	// never goes through New().
-	blockPark     *blockPark
+	blockPark *blockPark
+
+	// parkSweepNow is the clock the park sweep measures its own tick against, so
+	// a test can make one store delete look slow without sleeping. nil means
+	// time.Now; nothing in production sets it.
+	parkSweepNow func() time.Time
+
 	syncPeerMu    sync.RWMutex // protects syncPeer and syncPeerState
 	syncPeer      *peerpkg.Peer
 	syncPeerState *syncPeerState

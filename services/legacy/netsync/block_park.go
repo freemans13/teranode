@@ -88,6 +88,13 @@ const (
 	// takes is unspecified, because map order is, and it does not matter: every
 	// candidate is already past the TTL, so there is no fairness question, only a
 	// rate one.
+	//
+	// This cap is on the COUNT and does not on its own do what the paragraph
+	// above describes. Each of the 128 deletes carries legacy_parkStoreTimeout,
+	// so a contended write pool turns a capped tick into a twenty-minute one and
+	// backs the block queue up exactly as an uncapped pass would. What bounds the
+	// tick is parkSweepTimeBudget, applied over both halves of the sweep; this
+	// bounds the work it will start.
 	parkSweepExpiryBudget = 128
 
 	// parkRecoverBudgetOps is how many store operations' worth of waiting the
@@ -572,6 +579,35 @@ func (p *blockPark) Restore(entry parkedBlock) {
 	stored := entry
 	p.entries[entry.hash] = &stored
 	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+	p.setGauges()
+}
+
+// RestoreAll puts a batch of taken entries back, for the sweep that runs out of
+// time part-way through a burst of expiries. Expire has already removed them
+// from the index, so an entry nothing puts back is a blob left on disk still
+// charged against the park's byte budget with nothing tracking it, and a block
+// whose cursor is never rewound and which is therefore never asked for again.
+//
+// One lock acquisition rather than one per entry, because the caller is the
+// block-commit goroutine and it is already over its time budget.
+func (p *blockPark) RestoreAll(entries []parkedBlock) {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, entry := range entries {
+		if _, ok := p.entries[entry.hash]; ok {
+			continue
+		}
+
+		stored := entry
+		p.entries[entry.hash] = &stored
+		p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+	}
+
 	p.setGauges()
 }
 
