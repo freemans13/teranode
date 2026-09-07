@@ -2053,6 +2053,21 @@ func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Bl
 			hardFail  error
 		)
 
+		// Every goroutine below records its outcome in retryable or hardFail and returns nil.
+		// That is deliberate, and it is the one thing about this loop worth spelling out.
+		//
+		// errgroup.WithContext cancels applyCtx as soon as a goroutine returns non-nil, and
+		// applyCtx is the context the store call runs under. SpendAndCreate is not atomic on
+		// any backend: utxo.SequentialSpendAndCreate spends and then creates, and both the SQL
+		// and Aerospike stores delegate to it. Cancelling it between those two is precisely how
+		// a transaction ends up with its inputs spent and no row of its own, and the rollback
+		// that would repair it runs under the same cancelled context. So a hard failure must
+		// not tear down its siblings mid-call.
+		//
+		// Nothing is lost by not cancelling. hardFail is checked immediately after Wait, so the
+		// wave still fails on the first hard error; the only cost is the queued applies that
+		// still run, which are bounded by this batch and converge on replay through the store's
+		// own create and spend guards.
 		for _, item := range pending {
 			applyG.Go(func() error {
 				// The per-wave limit above is this block's ceiling; the window's budget is the
@@ -2088,7 +2103,14 @@ func (u *BlockValidation) applyTxsWithRetry(ctx context.Context, block *model.Bl
 			})
 		}
 
-		_ = applyG.Wait()
+		// Wait cannot report a failure while every goroutine above returns nil, but the result
+		// is folded in rather than discarded so that a goroutine which starts returning an
+		// error later cannot have it silently dropped here. hardFail wins when both are set:
+		// it carries the miss-backstop classification that decides local fault against peer
+		// fault, and a bare errgroup error does not.
+		if err := applyG.Wait(); err != nil && hardFail == nil {
+			hardFail = err
+		}
 
 		if hardFail != nil {
 			return hardFail
