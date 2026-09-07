@@ -1915,33 +1915,41 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 	}
 
 	// Serializing a multi-GB block to measure it is not free, and exactly two consumers want
-	// the number: the headers-first size tracker below and the dispatcher's byte charge. So
-	// measure it once when either of those is live, and not at all when neither is — a node
-	// with headers-first off and the window route off then pays nothing it did not pay before
-	// the window existed, which is where this measurement used to sit.
-	//
-	// blockSize stays zero in that case, and the dispatcher is fine with that: it charges and
-	// releases d.bytes symmetrically, and canDispatch reads it only on the window route, where
-	// windowRouteEnabled() is true by definition. Off that route a block needs an empty
-	// frontier whatever its size.
-	var blockSize int64
+	// the number: the headers-first size tracker just below, and the dispatcher's byte charge
+	// further down. Measure it at most once, and only when one of them actually asks, so a node
+	// with headers-first off and no windowed block pays nothing it did not pay before the
+	// window existed, which is where this measurement used to sit.
+	var (
+		blockSize  int64
+		blockSized bool
+	)
+
+	sizeOf := func() int64 {
+		if !blockSized {
+			blockSize = int64(msgBlock.SerializeSize())
+			blockSized = true
+		}
+
+		return blockSize
+	}
 
 	headersFirst := sm.headersFirstMode.Load()
-
-	if headersFirst || sm.windowRouteEnabled() {
-		blockSize = int64(msgBlock.SerializeSize())
-	}
 
 	// Track block size for dynamic in-flight adjustment during headers-first mode.
 	// This allows us to start aggressive (20 blocks) and automatically reduce
 	// to 1 block when encountering large (>2GB) blocks on mainnet.
+	//
+	// This stays ahead of the parent lookup, where it has always been: the tracker is measuring
+	// what the wire delivered, and an orphan is still a block that arrived.
 	if headersFirst {
-		sm.blockSizeTracker.addBlockSize(blockSize)
+		size := sizeOf()
+
+		sm.blockSizeTracker.addBlockSize(size)
 
 		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 		avgSize := sm.blockSizeTracker.getAverageSize()
 		sm.logger.Debugf("[handleBlockMsg][%s] Block size: %d bytes, avg: %d bytes, dynamic max in-flight: %d",
-			bmsg.blockHash, blockSize, avgSize, dynamicMax)
+			bmsg.blockHash, size, avgSize, dynamicMax)
 	}
 
 	sm.logger.Debugf("[handleBlockMsgHead][%s] pre-checks passed, resolving the parent", bmsg.blockHash)
@@ -1954,11 +1962,23 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		prevHash:       prevBlockHash,
 		catchingBlocks: catchingBlocks,
 		isCheckpoint:   isCheckpointBlock,
-		bytes:          blockSize,
 	}
 
 	if finished, err := sm.resolveWindowRoute(d, bmsg, peer, prevBlockHash); finished {
 		return nil, true, err
+	}
+
+	// The byte charge is the dispatcher's window bookkeeping, and only a windowed block ever
+	// pays it, so the size is asked for here rather than above: resolveWindowRoute has just
+	// settled the route, so a block on an enabled window route that turns out not to be
+	// windowed after all (above the checkpoint, say) is never measured for it. On the window
+	// route with headers-first on, sizeOf has already run and this is free.
+	//
+	// d.bytes stays zero otherwise, and the dispatcher is fine with that: it charges and
+	// releases symmetrically, and canDispatch reads bytes only after the !d.windowed early
+	// return. Off the window route a block needs an empty frontier whatever its size.
+	if d.windowed {
+		d.bytes = sizeOf()
 	}
 
 	// A re-admitted block clears the cascade mark on its own hash, so a child

@@ -134,11 +134,16 @@ func TestQuickWindow_AdmitBlocksAtDepthAndResumesWhenAnEntryLeaves(t *testing.T)
 	e1, _, err := w.Admit(ctx, blocks[0])
 	require.NoError(t, err)
 
-	admitted := make(chan struct{})
+	// The admit error comes back over a channel rather than being asserted in the goroutine:
+	// require calls t.FailNow, which testing documents as safe only on the test goroutine, so
+	// a failure in here would kill this goroutine and leave the test reading a channel that
+	// never closes.
+	admitted := make(chan error, 1)
+
 	go func() {
-		defer close(admitted)
 		_, _, err := w.Admit(ctx, blocks[1])
-		require.NoError(t, err)
+		admitted <- err
+		close(admitted)
 	}()
 
 	select {
@@ -152,7 +157,8 @@ func TestQuickWindow_AdmitBlocksAtDepthAndResumesWhenAnEntryLeaves(t *testing.T)
 	e1.Leave()
 
 	select {
-	case <-admitted:
+	case err := <-admitted:
+		require.NoError(t, err, "the second block admits cleanly once the first has left")
 	case <-time.After(2 * time.Second):
 		t.Fatal("second block was not admitted after the first left")
 	}
@@ -199,12 +205,18 @@ func TestQuickWindow_GateReleasesWaiterOnlyWhenClosed(t *testing.T) {
 	require.Nil(t, w.GateFor(e1, &parent), "an entry never waits on its own gate")
 	require.True(t, w.Registered(nil, &parent))
 
+	// The wait result comes back over a channel rather than being asserted in the goroutine:
+	// require calls t.FailNow, which testing documents as safe only on the test goroutine, so
+	// a failure in here would kill this goroutine and leave the test blocked on <-done.
 	var released atomic.Bool
-	done := make(chan struct{})
+
+	done := make(chan error, 1)
+
 	go func() {
-		defer close(done)
-		require.NoError(t, g.Wait(ctx))
+		err := g.Wait(ctx)
 		released.Store(true)
+		done <- err
+		close(done)
 	}()
 
 	select {
@@ -214,7 +226,7 @@ func TestQuickWindow_GateReleasesWaiterOnlyWhenClosed(t *testing.T) {
 	}
 
 	g.Close()
-	<-done
+	require.NoError(t, <-done, "a gate that closes cleanly releases its waiter without an error")
 	require.True(t, released.Load())
 	require.Nil(t, w.GateFor(e2, &parent), "a closed gate is no longer open")
 	require.True(t, w.Registered(nil, &parent), "the retained set keeps the id until the entry leaves")

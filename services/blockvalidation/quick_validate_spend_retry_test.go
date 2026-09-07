@@ -95,10 +95,13 @@ func TestApplyTxsWithRetry_HardFailDoesNotCancelSiblingsMidCall(t *testing.T) {
 
 	failing := *txs[0].TxIDChainHash()
 
+	// Cancellations come back over a buffered channel rather than a shared variable: every
+	// sibling would write it at once if the guard ever regressed, which is a data race in the
+	// very run that is supposed to report the regression.
 	var (
 		siblingStarted = make(chan struct{})
 		failed         = make(chan struct{})
-		siblingCtxErr  error
+		siblingCtxErrs = make(chan error, len(txs))
 		siblingDone    atomic.Int64
 		startOnce      sync.Once
 	)
@@ -123,7 +126,7 @@ func TestApplyTxsWithRetry_HardFailDoesNotCancelSiblingsMidCall(t *testing.T) {
 			// microseconds and Done fires long before this timer.
 			select {
 			case <-ctx.Done():
-				siblingCtxErr = ctx.Err()
+				siblingCtxErrs <- ctx.Err()
 			case <-time.After(250 * time.Millisecond):
 			}
 
@@ -132,8 +135,10 @@ func TestApplyTxsWithRetry_HardFailDoesNotCancelSiblingsMidCall(t *testing.T) {
 			return nil
 		})
 
+	close(siblingCtxErrs)
+
 	require.Error(t, err, "the wave fails on the hard error")
-	require.NoError(t, siblingCtxErr, "a hard failure must not cancel a sibling that is mid store call")
+	require.Empty(t, siblingCtxErrs, "a hard failure must not cancel a sibling that is mid store call")
 	require.Equal(t, int64(len(txs)-1), siblingDone.Load(), "every sibling ran to completion")
 }
 
