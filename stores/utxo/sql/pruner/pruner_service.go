@@ -135,21 +135,25 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 
 	// Defensive child verification is conditional on the UTXODefensiveEnabled setting
 	// When disabled, parents are deleted without verifying children are stable
-	var candidates string
+	// Each branch is a complete literal statement rather than a fragment
+	// concatenated at runtime, so no part of the SQL is ever built from data.
+	var createCandidates string
+
 	args := []interface{}{blockHeight}
 
 	if !s.defensiveEnabled {
 		// Defensive mode disabled - delete all transactions past their expiration
-		candidates = `
+		createCandidates = `
+			CREATE TEMP TABLE utxo_prune_candidates AS
 			SELECT id FROM transactions
 			WHERE delete_at_height IS NOT NULL
 			  AND delete_at_height <= $1
 		`
-
 	} else {
 		// Defensive mode enabled - verify ALL spending children are stable before deletion
 		// This prevents orphaning any child transaction
-		candidates = `
+		createCandidates = `
+			CREATE TEMP TABLE utxo_prune_candidates AS
 			SELECT id FROM transactions
 			WHERE id IN (
 				SELECT t.id
@@ -198,7 +202,7 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 	// parent eligible in defensive mode, but that parent needs its own markers
 	// before a later prune can delete it. Temporary tables are connection-local
 	// and this transaction owns the connection until commit or rollback.
-	if _, err := txn.ExecContext(ctx, "CREATE TEMP TABLE utxo_prune_candidates AS "+candidates, args...); err != nil {
+	if _, err := txn.ExecContext(ctx, createCandidates, args...); err != nil {
 		return 0, errors.NewStorageError("failed to select pruning candidates", err)
 	}
 	deleteQuery := "DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)"

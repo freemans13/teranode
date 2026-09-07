@@ -12,8 +12,20 @@ import (
 const defaultPrunedTxSetCapacity = 2_000_000_000
 
 // PrunedTxSet is a sharded, two-generation cuckoo-filter-backed set tracking
-// TXIDs of records pruned across sessions. It is used to skip wasteful parent
-// updates for parents that have already been pruned.
+// TXIDs of records pruned across sessions. It used to skip parent updates for
+// parents believed already pruned.
+//
+// It is deliberately retained but no longer wired into pruning. A cuckoo filter
+// answers "possibly present", never "certainly absent", so a false positive
+// suppressed the replay marker on a parent that was in fact still there. The
+// only remaining callers are tests: its own unit tests, and
+// TestPrunerReplayProtection/filter_collision in
+// stores/utxo/aerospike/pruner_replay_test.go, which uses NewPrunedTxSet to
+// build a controlled collision and prove the marker now survives it. Deleting
+// this type would delete that regression fixture with it.
+//
+// The pruner_utxoPrunedSetMaxEntries setting is likewise retained, inactive,
+// for configuration compatibility.
 //
 // Why two generations:
 //
