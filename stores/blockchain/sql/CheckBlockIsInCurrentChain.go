@@ -86,28 +86,69 @@ func (s *SQL) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32)
 		return s.checkBlockIsInCurrentChainSQL(ctx, blockIDs)
 	}
 
-	result, fromMemory, err := s.checkBlockIsInCurrentChainInMemory(ctx, blockIDs, maxID)
+	result, answeredBy, err := s.checkBlockIsInCurrentChainInMemory(ctx, blockIDs, maxID)
 	if err != nil {
 		return false, err
 	}
 
-	// While the forked-set route is being soaked, compute the same answer the
-	// authoritative way and compare. See shadowCompareChainCheck.
-	if fromMemory && s.chainCheckShadowCompare {
-		s.shadowCompareChainCheck(ctx, blockIDs, result)
+	// While the forked-set route is being soaked, compute the same answer the authoritative
+	// way and compare. See shadowCompareChainCheck for what each population costs.
+	if s.chainCheckShadowCompare {
+		switch answeredBy {
+		case answeredByForkedSet:
+			s.shadowCompareChainCheck(ctx, blockIDs, result)
+		case answeredByMaxBlockIDReject:
+			if s.chainCheckShadowRejectChecks.Add(1)%shadowRejectSampleRate == 0 {
+				s.shadowCompareChainCheck(ctx, blockIDs, result)
+			}
+		case answeredBySQL:
+			// The authoritative query already ran and produced this answer. Comparing it
+			// with itself measures nothing.
+		}
 	}
 
 	return result, nil
 }
 
+// answeredBy names which of the three routes produced an answer, because the shadow
+// comparison costs and means something different on each.
+type answeredBy int
+
+const (
+	// answeredByForkedSet is the accept this PR added: an id at or below maxBlockID and
+	// absent from the forked set, answered with no query. This is the population the soak
+	// exists to measure, so every one of them is compared.
+	answeredByForkedSet answeredBy = iota
+	// answeredByMaxBlockIDReject is the allocated-but-uncommitted reject. Both routes
+	// answer false whenever maxBlockID is current, so it looks like it needs no comparison,
+	// and that was the argument for skipping it. It holds only while maxBlockID is current.
+	// updateMaxBlockID runs after AddBlock commits, so between those two a committed
+	// on-chain id sits above the bound: the in-memory route drops it and returns false
+	// while SQL returns true. checkOldBlockIDs escalates a false into a PERMANENT
+	// ValidateBlock invalidation, so that is the dangerous direction, and skipping the
+	// comparison made it the one class of divergence the instrument could not see.
+	// Sampled rather than compared in full because below the checkpoint this is the
+	// dominant input and a query per call would cost more than the route saves.
+	answeredByMaxBlockIDReject
+	// answeredBySQL is the about-to-reject path, where every candidate is in the forked
+	// set and the authoritative query has already run to confirm it.
+	answeredBySQL
+)
+
+// shadowRejectSampleRate is how many maxBlockID rejects share one comparison. The window
+// it is watching for is a race between AddBlock committing and updateMaxBlockID running,
+// which repeats on every block rather than happening once, so a sample finds it while a
+// full comparison would put a round trip on the hottest input this route has.
+const shadowRejectSampleRate = 1024
+
 // checkBlockIsInCurrentChainInMemory answers ANY-of "is one of blockIDs on the main
-// chain?" from the forked set and maxBlockID, with no query. fromMemory reports
-// whether it managed that: it is false only on the about-to-reject path, where every
-// candidate is in the forked set and the answer is confirmed against SQL first.
+// chain?" from the forked set and maxBlockID. The second return says which of the three
+// routes produced the answer, so the caller can decide what the shadow comparison would
+// cost and mean; see the answeredBy constants.
 //
 // Callers must have established that the in-memory route applies: the setting is on,
 // no main-chain rebuild is in flight, and maxID is initialised.
-func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs []uint32, maxID uint32) (bool, bool, error) {
+func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs []uint32, maxID uint32) (bool, answeredBy, error) {
 	s.offChainBlockIDsMu.RLock()
 	offChain := s.offChainBlockIDs
 	s.offChainBlockIDsMu.RUnlock()
@@ -130,20 +171,18 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 		// why absence from the forked set is a positive proof here rather than the
 		// unsound guess it was before PR 1043 closed phantom-id creation.
 		if _, forked := offChain[id]; !forked {
-			return true, true, nil
+			return true, answeredByForkedSet, nil
 		}
 
 		candidates = append(candidates, id)
 	}
 
-	// Every id was above maxBlockID, so this is the allocated-but-uncommitted reject and
-	// not the forked-set accept. Report fromMemory=false so the shadow comparison skips it.
-	// Both routes answer false here by construction, so comparing them cannot ever disagree:
-	// counting it would pad the denominator with answers that prove nothing, and below the
-	// checkpoint (where every node currently sits) this input is the dominant traffic. It
-	// also costs a round trip per call to learn nothing.
+	// Every id was above maxBlockID, so this is the allocated-but-uncommitted reject rather
+	// than the forked-set accept. See answeredByMaxBlockIDReject for why it is sampled
+	// instead of compared in full, and for the one window in which the two routes can
+	// disagree here.
 	if len(candidates) == 0 {
-		return false, false, nil
+		return false, answeredByMaxBlockIDReject, nil
 	}
 
 	// Every candidate is in the forked set, so this call is about to reject. Confirm
@@ -163,7 +202,7 @@ func (s *SQL) checkBlockIsInCurrentChainInMemory(ctx context.Context, blockIDs [
 	// about-to-reject call.
 	result, err := s.checkBlockIsInCurrentChainSQL(ctx, candidates)
 
-	return result, false, err
+	return result, answeredBySQL, err
 }
 
 // shadowCompareChainCheck recomputes an in-memory answer the authoritative way and
