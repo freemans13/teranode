@@ -5187,8 +5187,9 @@ func (sm *SyncManager) QueueHeaders(headers *wire.MsgHeaders, peer *peerpkg.Peer
 // hour.
 //
 // This runs on the caller's goroutine, which is the peer's read loop. It takes
-// the download ledger's leaf lock and then, released, the header lock; both are
-// held for pure in-memory work, so the read loop is never parked on I/O.
+// the peer-state map, the download ledger's leaf lock and then, released, the
+// header lock; all three are held for pure in-memory work, so the read loop is
+// never parked on I/O.
 //
 // With the fan-out off, the sync peer is the only peer ever asked for a body and
 // asking it again for a block it has just said it does not have has nowhere else
@@ -5204,6 +5205,24 @@ func (sm *SyncManager) NotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) 
 		return
 	}
 
+	// The ledger is keyed by association primaries, so a notfound arriving on a
+	// stream sub-peer has to be resolved before anything is asked of it. Under
+	// the BlockPriority policy the getdata goes out on one stream and the reply
+	// can land on another, and every sibling receive path resolves first for
+	// exactly that reason. Without this the loop below matches nothing, and the
+	// handler silently does the one thing it was written to stop: the peer keeps
+	// the assignment for the whole ownership ceiling, its in-flight slot stays
+	// charged, and the hash sits behind the forward-only cursor with nobody
+	// owing it.
+	//
+	// A peer we have no state for resolves to itself, which is the behaviour this
+	// handler already had: whatever that peer owes the ledger is still released,
+	// and a peer that owes nothing releases nothing either way.
+	_, owner, _ := sm.peerStateResolvingPrimary(peer)
+	if owner != peer {
+		sm.logger.Debugf("[NotFound] resolved stream peer %s to primary peer %s", peer, owner)
+	}
+
 	released := make([]chainhash.Hash, 0, len(notFound.InvList))
 
 	for _, iv := range notFound.InvList {
@@ -5211,11 +5230,11 @@ func (sm *SyncManager) NotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) 
 			continue
 		}
 
-		if !sm.blockDownloads.HasOwner(peer, iv.Hash) {
+		if !sm.blockDownloads.HasOwner(owner, iv.Hash) {
 			continue
 		}
 
-		sm.blockDownloads.RemoveOwner(peer, iv.Hash)
+		sm.blockDownloads.RemoveOwner(owner, iv.Hash)
 
 		released = append(released, iv.Hash)
 	}
