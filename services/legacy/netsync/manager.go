@@ -144,6 +144,10 @@ const (
 	// unexpectedFailureAddingInventoryMsg is logged when adding an inventory
 	// vector to a getdata message fails unexpectedly.
 	unexpectedFailureAddingInventoryMsg = "Unexpected failure when adding inventory to getdata message: %v"
+
+	// syncManagerShuttingDownMsg is the service error returned to every queued or
+	// in-flight block that is drained when the sync manager stops.
+	syncManagerShuttingDownMsg = "sync manager shutting down"
 )
 
 // zeroHash is the zero-value hash (all zeros).  It is defined as a convenience.
@@ -1591,7 +1595,7 @@ func (sm *SyncManager) consumeBlocksSerially(blockQueue <-chan *blockQueueMsg) {
 			for {
 				select {
 				case msg := <-blockQueue:
-					sm.finishBlockMsg(msg, errors.NewServiceError("sync manager shutting down"))
+					sm.finishBlockMsg(msg, errors.NewServiceError(syncManagerShuttingDownMsg))
 				default:
 					return
 				}
@@ -1675,13 +1679,13 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 			// can never deadlock. This drain only makes the common case prompt; it
 			// is not relied on for correctness.
 			if pending != nil {
-				finish(pending.msg, errors.NewServiceError("sync manager shutting down"))
+				finish(pending.msg, errors.NewServiceError(syncManagerShuttingDownMsg))
 
 				pending = nil
 			}
 
 			for _, e := range bd.frontier {
-				finish(e.d.msg, errors.NewServiceError("sync manager shutting down"))
+				finish(e.d.msg, errors.NewServiceError(syncManagerShuttingDownMsg))
 			}
 
 			bd.frontier = nil
@@ -1689,7 +1693,7 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 			for {
 				select {
 				case msg := <-blockQueue:
-					finish(msg, errors.NewServiceError("sync manager shutting down"))
+					finish(msg, errors.NewServiceError(syncManagerShuttingDownMsg))
 				default:
 					return
 				}
@@ -1939,40 +1943,8 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		bytes:          blockSize,
 	}
 
-	// Resolve the height only where it can change the routing decision. With the
-	// window off (or the unified below-checkpoint route off) the answer could only
-	// ever be "not windowed", so the lookup below is pure cost and the block takes
-	// exactly the pre-window path: dispatched alone, with HandleBlockDirect doing
-	// its own parent lookup.
-	if sm.windowRouteEnabled() {
-		if p := sm.dispatcher.parentFor(&prevBlockHash); p != nil {
-			// The parent is still in the window, so it is not in the blockchain
-			// store yet and only the dispatcher knows its height.
-			d.parent = p
-			d.height = p.height + 1
-		} else {
-			_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &prevBlockHash)
-			if err != nil {
-				if errors.Is(err, errors.ErrBlockNotFound) {
-					// Orphan / out-of-order: the same answer the post-HandleBlockDirect
-					// path gives, just reached one RPC earlier.
-					sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks", bmsg.blockHash, prevBlockHash)
-
-					sm.requestMissingBlocks(peer, bmsg.blockHash)
-
-					return nil, true, nil
-				}
-
-				return nil, true, errors.NewProcessingError("[handleBlockMsg][%s] failed to get block header for previous block %s", bmsg.blockHash, prevBlockHash, err)
-			}
-
-			d.height = meta.Height + 1
-		}
-
-		// A windowed block whose parent is not in flight still has to start the
-		// window from an empty frontier: nothing before it in the frontier is its
-		// ancestor, so the ordering hand-shake would have nothing to wait on.
-		d.windowed = sm.windowRoute(d.height) && (d.parent != nil || sm.dispatcher.frontierEmpty())
+	if finished, err := sm.resolveWindowRoute(d, bmsg, peer, prevBlockHash); finished {
+		return nil, true, err
 	}
 
 	// A re-admitted block clears the cascade mark on its own hash, so a child
@@ -1984,6 +1956,52 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 	}
 
 	return d, false, nil
+}
+
+// resolveWindowRoute fills in the dispatch's height, in-flight parent and windowed
+// flag, on the consumer goroutine. It returns finished=true when the head is done
+// with this block, and err is then what the caller must reply.
+//
+// The height is resolved only where it can change the routing decision. With the
+// window off (or the unified below-checkpoint route off) the answer could only ever
+// be "not windowed", so the lookup is pure cost and the block takes exactly the
+// pre-window path: dispatched alone, with HandleBlockDirect doing its own parent
+// lookup.
+func (sm *SyncManager) resolveWindowRoute(d *blockDispatch, bmsg *blockQueueMsg, peer *peerpkg.Peer, prevBlockHash chainhash.Hash) (bool, error) {
+	if !sm.windowRouteEnabled() {
+		return false, nil
+	}
+
+	if p := sm.dispatcher.parentFor(&prevBlockHash); p != nil {
+		// The parent is still in the window, so it is not in the blockchain store
+		// yet and only the dispatcher knows its height.
+		d.parent = p
+		d.height = p.height + 1
+	} else {
+		_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &prevBlockHash)
+		if err != nil {
+			if errors.Is(err, errors.ErrBlockNotFound) {
+				// Orphan / out-of-order: the same answer the post-HandleBlockDirect
+				// path gives, just reached one RPC earlier.
+				sm.logger.Infof("Block %v has missing parent %v, requesting missing blocks", bmsg.blockHash, prevBlockHash)
+
+				sm.requestMissingBlocks(peer, bmsg.blockHash)
+
+				return true, nil
+			}
+
+			return true, errors.NewProcessingError("[handleBlockMsg][%s] failed to get block header for previous block %s", bmsg.blockHash, prevBlockHash, err)
+		}
+
+		d.height = meta.Height + 1
+	}
+
+	// A windowed block whose parent is not in flight still has to start the window
+	// from an empty frontier: nothing before it in the frontier is its ancestor, so
+	// the ordering hand-shake would have nothing to wait on.
+	d.windowed = sm.windowRoute(d.height) && (d.parent != nil || sm.dispatcher.frontierEmpty())
+
+	return false, nil
 }
 
 // handleBlockMsg processes one queued block end to end on the calling goroutine:
@@ -2867,7 +2885,7 @@ out:
 					sm.noteBacklogProgress()
 
 					if msg.reply != nil {
-						msg.reply <- errors.NewServiceError("sync manager shutting down")
+						msg.reply <- errors.NewServiceError(syncManagerShuttingDownMsg)
 					}
 				}
 

@@ -38,6 +38,10 @@ const (
 	// txNotFoundInTxMapMsg is the error message used when a transaction hash
 	// cannot be located in the block's txMap.
 	txNotFoundInTxMapMsg = "transaction %s not found in txMap"
+
+	// blockHeightConversionMsg is the processing error returned when a block
+	// height cannot be safely narrowed to an int32.
+	blockHeightConversionMsg = "failed to convert block height to int32"
 )
 
 func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, blockHash chainhash.Hash, msgBlock *wire.MsgBlock, parent *inflightParent) (err error) {
@@ -86,7 +90,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 
 		heightInt32, cerr := safeconversion.Uint32ToInt32(blockHeight)
 		if cerr != nil {
-			return errors.NewProcessingError("failed to convert block height to int32", cerr)
+			return errors.NewProcessingError(blockHeightConversionMsg, cerr)
 		}
 
 		block.SetHeight(heightInt32)
@@ -115,7 +119,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 
 			blockHeightInt32, err := safeconversion.Uint32ToInt32(blockHeight)
 			if err != nil {
-				return errors.NewProcessingError("failed to convert block height to int32", err)
+				return errors.NewProcessingError(blockHeightConversionMsg, err)
 			}
 
 			block.SetHeight(blockHeightInt32)
@@ -123,7 +127,7 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 			// check whether the block height being reported is the correct block height
 			previousBlockHeightInt32, err := safeconversion.Uint32ToInt32(previousBlockHeaderMeta.Height + 1)
 			if err != nil {
-				return errors.NewProcessingError("failed to convert block height to int32", err)
+				return errors.NewProcessingError(blockHeightConversionMsg, err)
 			}
 
 			if block.Height() != previousBlockHeightInt32 {
