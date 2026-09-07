@@ -5377,6 +5377,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	blockAssembly blockassembly.ClientI, config *Config) (*SyncManager, error) {
 	initPrometheusMetrics()
 
+	// One ceiling, derived from the same settings inputs as the peer layer's
+	// download budget, so the ledger cannot expire an assignment while that
+	// budget is still legitimately keeping the same transfer alive. The
+	// raced-block grace is the same figure by definition; see racedBlockGraceTTL.
+	assignmentCeiling := blockRequestAssignmentCeiling(tSettings, config.ChainParams)
+
 	sm := SyncManager{
 		ctx:          ctx,
 		settings:     tSettings,
@@ -5386,11 +5392,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		chainParams:    config.ChainParams,
 		rejectedTxns:   txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns), // limit map size to maxRejectedTxns
 		requestedTxns:  expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),   // give peers 10 seconds to respond
-		blockDownloads: newBlockDownloadTracker(blockRequestAssignmentTTL),
+		blockDownloads: newBlockDownloadTracker(assignmentCeiling),
 		peerStates:     txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		// Peers we asked for a second copy of a stalled block, so their late
 		// copy is dropped rather than costing them their connection.
-		racedBlocks: expiringmap.New[chainhash.Hash, map[*peerpkg.Peer]struct{}](racedBlockGraceTTL).WithMaxSize(racedBlockGraceMaxTracked),
+		racedBlocks: expiringmap.New[chainhash.Hash, map[*peerpkg.Peer]struct{}](assignmentCeiling).WithMaxSize(racedBlockGraceMaxTracked),
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		headerList:       list.New(),
