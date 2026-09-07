@@ -4330,15 +4330,30 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	// other connection's reads -- a read issued from inside the transaction waits
 	// for a writer that is waiting for it. That is a permanent deadlock, not a slow
 	// query: it wedged block assembly's unmined reload for the full test timeout.
-	// (Postgres is unaffected: MVCC serves the reader the pre-UPDATE snapshot. The
-	// bug was reachable only once validateUnminedTxInputs started resolving parents
+	// It was reachable only once validateUnminedTxInputs started resolving parents
 	// from the stored inpoints, because until then it never reached this path on a
-	// SQL store at all.)
+	// SQL store at all. Postgres did not deadlock, but it did spend two pool
+	// connections per call for the duration of the transaction.
 	//
-	// Hoisting is semantics-preserving. The UPDATE writes conflicting and
-	// delete_at_height on the transactions row; GetSpend's answer is derived from
-	// the outputs row's spending data and the coinbase spending height, neither of
-	// which the UPDATE touches.
+	// What hoisting does NOT rest on is the reads being independent of the UPDATE.
+	// They are not: GetSpend selects t.conflicting and t.locked and maps
+	// conflicting to Status_CONFLICTING, which is exactly the column the UPDATE
+	// writes. What makes the move safe is that those reads never saw the UPDATE in
+	// either version. They run on a pool connection, outside the transaction's
+	// snapshot, so they read the last COMMITTED value -- and this transaction has
+	// not committed while the loop runs. Before the hoist and after it, GetSpend
+	// answers from the pre-call state.
+	//
+	// The delete-at-height decision is not read back here either; it is made in SQL
+	// inside the UPDATE itself, by the preserve_until guard in qUpdate above.
+	//
+	// What the hoist does change is the width of an already non-atomic window: the
+	// gap between reading a spend status and committing the flag now also spans the
+	// UPDATE loop. A concurrent writer could spend one of these outputs inside that
+	// wider gap and its txid would be missing from spendingTxHashes. That race
+	// existed before at loop-iteration width; this widens it to loop width, which is
+	// the price of removing a read-inside-write-transaction shape that deadlocks
+	// outright on SQLite.
 	type conflictingRead struct {
 		hash             chainhash.Hash
 		txMeta           *meta.Data

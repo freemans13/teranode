@@ -191,7 +191,8 @@ func TestUnlockConflictParents_MissingWinnerIsSkipped(t *testing.T) {
 	never := coinbaseTxForHeader(t, blockHeader2)
 
 	_, err := items.utxoStore.Get(ctx, never.TxIDChainHash())
-	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound),
+		"the premise of this test is that the record is absent, not that the read failed some other way")
 
 	require.NoError(t, items.blockAssembler.unlockConflictParents(ctx, []chainhash.Hash{*never.TxIDChainHash()}))
 }
@@ -286,4 +287,47 @@ func seedParentAndChild(ctx context.Context, t *testing.T, items *baTestItems) (
 	require.NoError(t, err)
 
 	return parent, child
+}
+
+// erroringParentUtxoStore answers the first Get (the transaction's own record)
+// from the wrapped store and fails every later one with a storage error, which is
+// how a store that is up but faulting looks to validateUnminedTxInputs: the tx
+// resolves, its parents do not.
+type erroringParentUtxoStore struct {
+	utxoStore.Store
+
+	self chainhash.Hash
+}
+
+func (s *erroringParentUtxoStore) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
+	if hash != nil && hash.IsEqual(&s.self) {
+		return s.Store.Get(ctx, hash, f...)
+	}
+
+	return nil, errors.NewStorageError("[erroringParentUtxoStore] the store cannot answer for %s", hash.String())
+}
+
+// TestValidateUnminedTxInputs_ParentReadErrorIsReturned pins the last of the
+// conflations. A failed parent read used to return (false, nil) -- the store
+// could not answer, and that was reported as a decision to drop the transaction,
+// two lines below the code that had just stopped making exactly that mistake for
+// the inpoint resolution.
+func TestValidateUnminedTxInputs_ParentReadErrorIsReturned(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := t.Context()
+	items := setupBlockAssemblyTestWithUtxoStore(t, withCoinbaseMaturity(testCoinbaseMaturity))
+	require.NotNil(t, items)
+
+	_, child := seedParentAndChild(ctx, t, items)
+
+	items.blockAssembler.utxoStore = &erroringParentUtxoStore{
+		Store: items.utxoStore,
+		self:  *child.TxIDChainHash(),
+	}
+
+	valid, err := items.blockAssembler.validateUnminedTxInputs(ctx, *child.TxIDChainHash(), map[uint32]bool{}, true)
+	require.Error(t, err, "a store that cannot answer for a parent is undecidable, not invalid")
+	require.False(t, valid)
+	require.Contains(t, err.Error(), "failed to load parent")
 }

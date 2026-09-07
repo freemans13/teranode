@@ -3259,6 +3259,14 @@ type sortEntry struct {
 // dropped, and on the utxoset store every record whose body had aged out was
 // too. The parents and their vouts are read from the stored inpoints now, which
 // is where an unmined record keeps them.
+//
+// Every store read here follows the same rule: a not-found is a decision about
+// the transaction (a parent that is gone cannot be validly spent, a counter with
+// no record is on no block), and any other store failure is returned. The two
+// counter-conflict reads matter most, because they used to `continue` on error:
+// that is the check which drops a transaction whose counter-conflict is confirmed
+// on chain, so skipping it on a transient failure failed OPEN and let exactly that
+// transaction into the candidate.
 func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash chainhash.Hash, bestBlockIDsMap map[uint32]bool, dryRun bool) (bool, error) {
 	// TxInpoints, not the body: the parent hashes and their vouts are on the
 	// identity record, so this neither loads heavy output data nor depends on a
@@ -3298,8 +3306,22 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 		parentHash := &inpoint.Hash
 
 		parentMeta, err := b.utxoStore.Get(ctx, parentHash, fields.Utxos)
-		if err != nil || parentMeta == nil {
-			return false, nil
+		if err != nil {
+			if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+				// The parent is gone. That is the one classified outcome here: an
+				// input whose parent no longer exists cannot be validly spent, so
+				// this is a decision about the transaction.
+				return false, nil
+			}
+
+			// Anything else is the store failing to answer. Reporting that as
+			// "invalid" is the same conflation the inpoint resolution above stopped
+			// making, one loop iteration later.
+			return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load parent %s", txHash.String(), parentHash.String(), err)
+		}
+
+		if parentMeta == nil {
+			return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] store returned no record and no error for parent %s", txHash.String(), parentHash.String())
 		}
 
 		vout := int(inpoint.Index)
@@ -3329,7 +3351,20 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 		// This catches the scenario where ProcessConflicting incorrectly flipped a
 		// confirmed transaction to "loser" status.
 		counterTxMeta, err := b.utxoStore.Get(ctx, parentHash, fields.ConflictingChildren)
-		if err != nil || counterTxMeta == nil {
+		if err != nil {
+			if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+				// No parent record, so no contest recorded against it.
+				continue
+			}
+
+			// Skipping on a store failure fails OPEN: this check is what drops a
+			// transaction whose counter-conflict is confirmed on chain, so a
+			// transient error would let exactly that transaction into the
+			// candidate. Fail closed by reporting it instead.
+			return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load the contest on parent %s", txHash.String(), parentHash.String(), err)
+		}
+
+		if counterTxMeta == nil {
 			continue
 		}
 
@@ -3339,7 +3374,18 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 			}
 
 			counterMeta, err := b.utxoStore.Get(ctx, &counterChild, fields.BlockIDs)
-			if err != nil || counterMeta == nil {
+			if err != nil {
+				if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+					// The counter's own record is gone, so it is on no block.
+					continue
+				}
+
+				// Same fail-open hazard as the read above: this is the lookup that
+				// decides whether the counter is confirmed on the current chain.
+				return false, errors.NewProcessingError("[validateUnminedTxInputs][%s] failed to load counter-conflicting tx %s", txHash.String(), counterChild.String(), err)
+			}
+
+			if counterMeta == nil {
 				continue
 			}
 

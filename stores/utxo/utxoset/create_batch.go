@@ -168,10 +168,10 @@ SELECT t.k
 // transactions already exist as mempool records and are stamped rather than created, and not
 // below it, where they are created here for the first time.
 //
-// The consequence is worth stating, because it is not local to this statement. The two readers
-// that resolve a transaction's parents from the identity record -- conflict handling
-// (counterConflictingInpoints, and block assembly's unlockConflictParents /
-// validateUnminedTxInputs through spentOutpoints) -- get nothing from a record created here,
+// The consequence is worth stating, because it is not local to this statement. The readers that
+// resolve a transaction's parents from the identity record -- counterConflictingInpoints in the
+// store's own conflict handling, and block assembly's unlockConflictParents and
+// validateUnminedTxInputs through spentOutpoints -- get nothing from a record created here,
 // and fall through to the body. With utxostore_skipTxBodyBelowCheckpoint on there is no body
 // either, and those readers then fail loudly rather than treating a transaction that spends
 // something as one that spends nothing. Neither reader runs for a checkpointed block: nothing
