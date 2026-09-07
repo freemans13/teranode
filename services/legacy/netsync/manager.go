@@ -693,6 +693,14 @@ type SyncManager struct {
 	// never goes through New().
 	blockPark *blockPark
 
+	// parkJobs carries an admitted block to a parking worker, and parkOutcomes
+	// carries the answer back to the block-queue consumer. Both exist so the
+	// stateless check and the blob write do not run on the goroutine that
+	// commits blocks in order; see block_park_worker.go.
+	parkJobs     chan parkJob
+	parkOutcomes chan parkOutcome
+	parkWorkers  sync.WaitGroup
+
 	// parkSweepNow is the clock the park sweep measures its own tick against, so
 	// a test can make one store delete look slow without sleeping. nil means
 	// time.Now; nothing in production sets it.
@@ -2713,50 +2721,35 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				removedFront: removedFront,
 			}
 
-			result := sm.blockPark.Park(sm.ctx, entry, msgBlock)
-
-			// The same table the drain and the sweep answer to: whether the
-			// blob survives, whether the walk goes back onto the block, and
-			// whether the peer hears about it. See block_park_policy.go.
-			d := parkWriteOutcome(result)
-
-			if catchingBlocks {
-				// While catching blocks handleBlockMsg suppresses every other
-				// reject, because we are replaying history rather than judging
-				// a peer's tip. Parking must not judge a peer differently from
-				// discarding.
-				d = d.withoutBlame()
-			}
+			// Admit is the cheap half: the duplicate check, the byte budget and
+			// registering the entry. The stateless check and the blob write are
+			// the expensive half and they go to a parking worker, because this
+			// is the one goroutine that commits blocks in order and a gigabyte
+			// block spends minutes in those two steps.
+			stored, admitted := sm.blockPark.Admit(entry, msgBlock)
 
 			// The reject, like every other reject in handleBlockMsg, goes to the
 			// resolved primary rather than to a stream sub-peer, so it is
 			// applied to a copy of the entry that names it. Safe to copy because
-			// every write outcome leaves the blob alone: whatever the park kept
-			// it kept under its own entry, and nothing the caller is holding is
-			// charged against the budget.
+			// no write outcome touches a blob the caller is holding.
 			blamed := entry
 			blamed.peer = peer
 
-			if result == parkAccepted {
-				sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
+			switch admitted {
+			case admitNoRoom:
+				// The same table the drain and the sweep answer to: whether the
+				// blob survives, whether the walk goes back onto the block, and
+				// whether the peer hears about it. See block_park_policy.go.
+				d := parkWriteOutcome(parkUnavailable)
 
-				// No stall-timer refresh here. HandleBlockDirect already
-				// refreshed it at receipt, before the parent lookup that made
-				// this an orphan, so a second refresh bought nothing — and a
-				// peer that answers with an endless stream of orphans is exactly
-				// what the stall detector exists to rotate. The drop path below
-				// has never refreshed it, and parking must not judge a peer
-				// differently from discarding.
-				sm.applyParkDisposition(blamed, d)
+				if catchingBlocks {
+					// While catching blocks handleBlockMsg suppresses every
+					// other reject, because we are replaying history rather than
+					// judging a peer's tip. Parking must not judge a peer
+					// differently from discarding.
+					d = d.withoutBlame()
+				}
 
-				// The block is kept, so the walk must NOT be rewound onto it: it
-				// is already downloaded and the park commits it from disk when
-				// the parent lands. Every path that later gives the block up
-				// rewinds then instead. What does need doing is topping the
-				// pipeline back up, because this peer's in-flight count just
-				// dropped and nothing else will notice.
-				sm.fetchMoreHeaderBlocks(peer)
-			} else {
 				sm.logger.Infof("Block %v has missing parent %v and was not kept (%s), requesting missing blocks",
 					bmsg.blockHash, prevBlockHash, d.reason)
 
@@ -2766,6 +2759,46 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				// returns before it can request anything, so the block is never
 				// asked for again.
 				sm.applyParkDisposition(blamed, d)
+
+			case admitAlreadyHeld:
+				sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
+
+				sm.fetchMoreHeaderBlocks(peer)
+
+			case admitRegistered:
+				// No stall-timer refresh here. HandleBlockDirect already
+				// refreshed it at receipt, before the parent lookup that made
+				// this an orphan, so a second refresh bought nothing — and a
+				// peer that answers with an endless stream of orphans is exactly
+				// what the stall detector exists to rotate. The drop path above
+				// has never refreshed it, and parking must not judge a peer
+				// differently from discarding.
+				sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
+
+				// The block is kept, so the walk must NOT be rewound onto it: it
+				// is already downloaded and the park commits it from disk when
+				// the parent lands. Every path that later gives the block up
+				// rewinds then instead. What does need doing is topping the
+				// pipeline back up, because this peer's in-flight count just
+				// dropped and nothing else will notice.
+				sm.fetchMoreHeaderBlocks(peer)
+
+				job := parkJob{
+					entry:          stored,
+					blamed:         blamed,
+					msgBlock:       msgBlock,
+					reply:          bmsg.reply,
+					catchingBlocks: catchingBlocks,
+				}
+
+				// The reply travels with the job, so blockHandler does not
+				// answer for this block when handleBlockMsg returns. That is
+				// what holds the prefetch budget the decoded block is charged
+				// against until the worker has finished with it, rather than
+				// releasing it while a worker still holds a gigabyte of block.
+				bmsg.reply = nil
+
+				sm.submitParkJob(job)
 			}
 
 			// Parked or dropped, the parent still has to be asked for, and the
@@ -4667,6 +4700,12 @@ func (sm *SyncManager) blockHandler() {
 				// resumeHeaderWalk.
 				sm.resumeHeaderWalk()
 
+			case outcome := <-sm.parkOutcomes:
+				// A parking worker has finished with a block this goroutine
+				// admitted. Everything that needs ordering or the header list
+				// waited for this.
+				sm.applyParkOutcome(outcome)
+
 			case msg := <-blockQueue:
 				sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
 
@@ -5315,6 +5354,11 @@ func (sm *SyncManager) Stop() error {
 	close(sm.quit)
 	<-sm.handlerDone
 
+	// The workers select on sm.quit, and one that is mid-write finishes that
+	// write first: the blob store call carries its own deadline, so this waits
+	// for at most legacy_parkStoreTimeout.
+	sm.parkWorkers.Wait()
+
 	sm.orphanTxs.Stop()
 	sm.requestedTxns.Stop()
 
@@ -5569,6 +5613,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// (#1333). Like blockFailureBackoff this starts a background eviction goroutine
 	// stopped only via Stop(), so build it after the last fallible step above.
 	sm.recentlyFailedBlocks = expiringmap.New[chainhash.Hash, struct{}](recentlyFailedBlocksTTL).WithMaxSize(blockFailureBackoffMaxTracked)
+
+	// Below GetBestBlockHeader for the same reason the two maps above are: a
+	// goroutine started before the last fallible step leaks when that step
+	// returns an error, because the caller receives a nil SyncManager and can
+	// never call Stop.
+	sm.startParkWorkers(tSettings.Legacy.ParkWorkers)
 
 	if !config.DisableCheckpoints {
 		bestBlockHeightInt32, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)

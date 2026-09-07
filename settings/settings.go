@@ -716,6 +716,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ParkOutOfOrderBlocks:     getBool("legacy_parkOutOfOrderBlocks", true, alternativeContext...),
 			ParkMaxBytes:             getInt64("legacy_parkMaxBytes", 4*1024*1024*1024, alternativeContext...),
 			ParkStoreTimeout:         getDuration("legacy_parkStoreTimeout", 10*time.Second, alternativeContext...),
+			ParkWorkers:              getInt("legacy_parkWorkers", 2, alternativeContext...),
 			PeerRegistryEnabled:      getBool("legacy_peerRegistryEnabled", true, alternativeContext...),
 			PeerRegistrySyncInterval: getDuration("legacy_peerRegistrySyncInterval", 10*time.Second, alternativeContext...),
 		},

@@ -199,7 +199,27 @@ type parkedBlock struct {
 	// Restore, RestoreAll and Recover all insert entries whose write has already
 	// landed, so the zero value is correct for them.
 	writing bool
+	// parentDrained records that a drain for this block's parent ran while the
+	// block was still being written, and was refused. The drain cannot come
+	// back on its own — it is driven by a commit that has already happened — so
+	// whoever finishes the write has to ask for it again or the block sits in
+	// the park behind a parent that is already in the chain.
+	parentDrained bool
 }
+
+// admitResult says what Admit did with an offered block, and in particular
+// whether the caller now owes it a write.
+type admitResult int
+
+const (
+	// admitAlreadyHeld: this block is already parked. Nothing is owed.
+	admitAlreadyHeld admitResult = iota
+	// admitRegistered: the entry is in the index with its write still owed. The
+	// caller MUST follow with WriteAdmitted, which settles it either way.
+	admitRegistered
+	// admitNoRoom: the budget or the entry cap refused it. Nothing is owed.
+	admitNoRoom
+)
 
 // blockPark keeps blocks whose parent is not stored yet on disk, and commits
 // them when the parent lands.
@@ -363,11 +383,58 @@ func (p *blockPark) Park(ctx context.Context, entry parkedBlock, msgBlock *wire.
 		return parkDisabled
 	}
 
+	stored, admitted := p.Admit(entry, msgBlock)
+
+	switch admitted {
+	case admitAlreadyHeld:
+		return parkAccepted
+
+	case admitNoRoom:
+		return parkUnavailable
+
+	case admitRegistered:
+	}
+
+	if result := p.WriteAdmitted(ctx, stored, msgBlock); result != parkAccepted {
+		return result
+	}
+
+	p.FinishWrite(stored.hash)
+
+	return parkAccepted
+}
+
+// Admit takes the cheap half of parking: the duplicate check, the byte budget,
+// and registering the entry with its write still owed. It never touches the
+// disk, so it is safe on the goroutine that commits blocks in order.
+//
+// A caller that gets admitRegistered owes the block a WriteAdmitted, and until
+// that lands the entry carries the writing flag and every reader refuses it.
+//
+// The stateless check deliberately runs AFTER this rather than before, which is
+// the one thing that changed when the write moved off the commit goroutine. A
+// block that turns out to be rubbish therefore holds an entry and its bytes for
+// as long as its merkle rebuild takes. That is bounded by the number of parking
+// workers rather than by anything an attacker chooses, the entry is invisible to
+// every reader while it is held, and WriteAdmitted gives all of it back. The
+// order that matters for safety is unchanged: nothing reaches the disk until the
+// check has passed.
+func (p *blockPark) Admit(entry parkedBlock, msgBlock *wire.MsgBlock) (parkedBlock, admitResult) {
+	if p == nil {
+		return parkedBlock{}, admitNoRoom
+	}
+
+	// SerializeSize is arithmetic over the decoded block, not a serialization.
+	entry.size = int64(msgBlock.SerializeSize())
+	entry.parkedAt = time.Now()
+	entry.writing = true
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	// A re-delivered copy of something we already hold costs nothing. Refresh
 	// the recorded peer, because the newer one is more likely to still be
 	// connected when the block drains.
-	p.mu.Lock()
-
 	if existing, ok := p.entries[entry.hash]; ok {
 		if entry.peer != nil {
 			existing.peer = entry.peer
@@ -381,103 +448,128 @@ func (p *blockPark) Park(ctx context.Context, entry parkedBlock, msgBlock *wire.
 			existing.removedFront = entry.removedFront
 		}
 
-		p.mu.Unlock()
-
-		return parkAccepted
+		return *existing, admitAlreadyHeld
 	}
-
-	p.mu.Unlock()
-
-	// Timed, not deadlined, and the difference is the point. The stateless check
-	// rebuilds the merkle tree over every transaction in the block, which is CPU
-	// work on this same in-order commit goroutine that no context can interrupt
-	// part way through. legacy_parkStoreTimeout cannot bound it. What it can do
-	// is make it visible, so an operator who sees the commit goroutine stalling
-	// can tell validation from store contention.
-	validationStart := time.Now()
-
-	err := validateParkCandidate(msgBlock, entry.hash)
-
-	if elapsed := time.Since(validationStart); elapsed > p.storeTimeout {
-		p.logger.Warnf("[blockPark][%s] the stateless check on a %d transaction block took %s, longer than the %s store deadline; this is CPU on the block commit goroutine and no deadline bounds it", entry.hash, len(msgBlock.Transactions), elapsed, p.storeTimeout)
-	}
-
-	if err != nil {
-		p.logger.Warnf("[blockPark][%s] refusing to park an invalid block: %v", entry.hash, err)
-
-		return parkRejected
-	}
-
-	// SerializeSize is arithmetic over the decoded block, not a serialization.
-	entry.size = int64(msgBlock.SerializeSize())
-	entry.parkedAt = time.Now()
-
-	// Reserve the space before the write so two writers can never both pass the
-	// check. Rolled back below on any failure.
-	p.mu.Lock()
 
 	if len(p.entries) >= maxParkedEntries || p.bytes+entry.size > p.maxBytes {
-		held, count := p.bytes, len(p.entries)
-		p.mu.Unlock()
+		p.logger.Warnf("[blockPark][%s] no room for a %d byte block: %d blocks holding %d of %d bytes", entry.hash, entry.size, len(p.entries), p.bytes, p.maxBytes)
 
-		p.logger.Warnf("[blockPark][%s] no room for a %d byte block: %d blocks holding %d of %d bytes", entry.hash, entry.size, count, held, p.maxBytes)
-
-		return parkUnavailable
+		return parkedBlock{}, admitNoRoom
 	}
-
-	p.bytes += entry.size
 
 	// Registered BEFORE the write, not after it. A parent that commits while
 	// this block is still being written has to find the block in children, or
 	// the drain looks at a park that does not yet mention it and only a later
 	// sweep recovers it. What keeps that safe is the flag rather than the
 	// entry's absence: every reader refuses an entry whose bytes are not on
-	// disk yet, and Park clears the flag when the write lands.
-	stored := entry
-	stored.writing = true
+	// disk yet.
+	p.bytes += entry.size
 
+	stored := entry
 	p.entries[entry.hash] = &stored
 	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
 	p.setGauges()
-	p.mu.Unlock()
+
+	return stored, admitRegistered
+}
+
+// WriteAdmitted runs the stateless check and then the blob write for a block
+// Admit has registered, and rolls the admission back on any failure. It is the
+// half that costs a merkle rebuild over every transaction and a streamed write
+// of the whole block, so it is what runs on a parking worker rather than on the
+// goroutine that commits blocks in order.
+//
+// On parkAccepted the entry is still registered and still flagged; the caller
+// clears the flag with FinishWrite once it has done whatever else it owes.
+func (p *blockPark) WriteAdmitted(ctx context.Context, entry parkedBlock, msgBlock *wire.MsgBlock) parkResult {
+	if p == nil {
+		return parkDisabled
+	}
+
+	// Timed, not deadlined, and the difference is the point. The stateless check
+	// rebuilds the merkle tree over every transaction in the block, which is CPU
+	// work no context can interrupt part way through. legacy_parkStoreTimeout
+	// cannot bound it. What it can do is make it visible, so an operator who
+	// sees a parking worker stalling can tell validation from store contention.
+	validationStart := time.Now()
+
+	err := validateParkCandidate(msgBlock, entry.hash)
+
+	if elapsed := time.Since(validationStart); elapsed > p.storeTimeout {
+		p.logger.Warnf("[blockPark][%s] the stateless check on a %d transaction block took %s, longer than the %s store deadline; this is CPU that no deadline bounds", entry.hash, len(msgBlock.Transactions), elapsed, p.storeTimeout)
+	}
+
+	if err != nil {
+		p.Abandon(entry)
+
+		p.logger.Warnf("[blockPark][%s] refusing to park an invalid block: %v", entry.hash, err)
+
+		return parkRejected
+	}
 
 	if err := p.write(ctx, entry.hash, msgBlock); err != nil {
-		// Undo all three: the entry, its parent edge and its byte charge.
-		// Anything left behind here is an entry with no blob under it, refused
-		// by every reader because the flag never clears, holding its bytes
-		// against the budget for the life of the process.
-		p.mu.Lock()
-
-		if current, ok := p.entries[entry.hash]; ok && current == &stored {
-			delete(p.entries, entry.hash)
-			p.removeChildLocked(entry.prevBlock, entry.hash)
-
-			p.bytes -= entry.size
-			if p.bytes < 0 {
-				p.bytes = 0
-			}
-
-			p.setGauges()
-		}
-
-		p.mu.Unlock()
+		p.Abandon(entry)
 
 		p.logger.Warnf("[blockPark][%s] failed to park block, it will have to be downloaded again: %v", entry.hash, err)
 
 		return parkUnavailable
 	}
 
+	return parkAccepted
+}
+
+// Abandon gives back everything Admit reserved: the entry, its parent edge and
+// its byte charge. Anything left behind here is an entry with no blob under it,
+// refused by every reader because the flag never clears, holding its bytes
+// against the budget for the life of the process.
+func (p *blockPark) Abandon(entry parkedBlock) {
+	if p == nil {
+		return
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Only this entry's flag, and only if it is still the one this call
-	// registered. The gauges do not move: the count and the bytes were both
-	// published when the entry went in.
-	if current, ok := p.entries[entry.hash]; ok && current == &stored {
-		current.writing = false
+	current, ok := p.entries[entry.hash]
+	if !ok || !current.writing {
+		return
 	}
 
-	return parkAccepted
+	delete(p.entries, entry.hash)
+	p.removeChildLocked(entry.prevBlock, entry.hash)
+
+	p.bytes -= entry.size
+	if p.bytes < 0 {
+		p.bytes = 0
+	}
+
+	p.setGauges()
+}
+
+// FinishWrite clears the flag on a block whose bytes are now on disk, and
+// reports whether a drain for its parent was refused while it was being
+// written. A true return means the caller must ask for that drain again: the
+// drain is driven by a commit that has already happened and will not come back
+// on its own.
+//
+// The gauges do not move. Both the count and the bytes were published when the
+// entry went in.
+func (p *blockPark) FinishWrite(hash chainhash.Hash) bool {
+	if p == nil {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	entry, ok := p.entries[hash]
+	if !ok || !entry.writing {
+		return false
+	}
+
+	entry.writing = false
+
+	return entry.parentDrained
 }
 
 // storeCtx puts the configured deadline on one blob store operation.
@@ -597,6 +689,11 @@ func (p *blockPark) TakeChildren(parent chainhash.Hash) []parkedBlock {
 		}
 
 		if entry.writing {
+			// Remember that this drain happened and was refused. It is driven by
+			// a commit that has already been made, so it will not come round
+			// again on its own, and whoever finishes the write has to ask for it.
+			entry.parentDrained = true
+
 			kept = append(kept, h)
 
 			continue
