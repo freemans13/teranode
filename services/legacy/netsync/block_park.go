@@ -192,6 +192,13 @@ type parkedBlock struct {
 	// looked at first, which is what makes it a round robin over the whole park
 	// rather than a repeated random sample of it.
 	lastSweptAt time.Time
+	// writing is true between the entry being registered and its bytes reaching
+	// the disk. The entry is registered first so that a parent committing in
+	// that window finds the block in children rather than missing it, and the
+	// flag is what stops every reader acting on a blob that is not there yet.
+	// Restore, RestoreAll and Recover all insert entries whose write has already
+	// landed, so the zero value is correct for them.
+	writing bool
 }
 
 // blockPark keeps blocks whose parent is not stored yet on disk, and commits
@@ -419,11 +426,40 @@ func (p *blockPark) Park(ctx context.Context, entry parkedBlock, msgBlock *wire.
 	}
 
 	p.bytes += entry.size
+
+	// Registered BEFORE the write, not after it. A parent that commits while
+	// this block is still being written has to find the block in children, or
+	// the drain looks at a park that does not yet mention it and only a later
+	// sweep recovers it. What keeps that safe is the flag rather than the
+	// entry's absence: every reader refuses an entry whose bytes are not on
+	// disk yet, and Park clears the flag when the write lands.
+	stored := entry
+	stored.writing = true
+
+	p.entries[entry.hash] = &stored
+	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+	p.setGauges()
 	p.mu.Unlock()
 
 	if err := p.write(ctx, entry.hash, msgBlock); err != nil {
+		// Undo all three: the entry, its parent edge and its byte charge.
+		// Anything left behind here is an entry with no blob under it, refused
+		// by every reader because the flag never clears, holding its bytes
+		// against the budget for the life of the process.
 		p.mu.Lock()
-		p.bytes -= entry.size
+
+		if current, ok := p.entries[entry.hash]; ok && current == &stored {
+			delete(p.entries, entry.hash)
+			p.removeChildLocked(entry.prevBlock, entry.hash)
+
+			p.bytes -= entry.size
+			if p.bytes < 0 {
+				p.bytes = 0
+			}
+
+			p.setGauges()
+		}
+
 		p.mu.Unlock()
 
 		p.logger.Warnf("[blockPark][%s] failed to park block, it will have to be downloaded again: %v", entry.hash, err)
@@ -434,10 +470,12 @@ func (p *blockPark) Park(ctx context.Context, entry parkedBlock, msgBlock *wire.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	stored := entry
-	p.entries[entry.hash] = &stored
-	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
-	p.setGauges()
+	// Only this entry's flag, and only if it is still the one this call
+	// registered. The gauges do not move: the count and the bytes were both
+	// published when the entry went in.
+	if current, ok := p.entries[entry.hash]; ok && current == &stored {
+		current.writing = false
+	}
 
 	return parkAccepted
 }
@@ -545,15 +583,33 @@ func (p *blockPark) TakeChildren(parent chainhash.Hash) []parkedBlock {
 		return nil
 	}
 
-	delete(p.children, parent)
-
 	taken := make([]parkedBlock, 0, len(hashes))
 
+	// Kept, not dropped. A block still being written stays in the index AND
+	// keeps this edge, because losing the edge is the hole the early
+	// registration exists to close.
+	var kept []chainhash.Hash
+
 	for _, h := range hashes {
-		if entry, ok := p.entries[h]; ok {
-			taken = append(taken, *entry)
-			delete(p.entries, h)
+		entry, ok := p.entries[h]
+		if !ok {
+			continue
 		}
+
+		if entry.writing {
+			kept = append(kept, h)
+
+			continue
+		}
+
+		taken = append(taken, *entry)
+		delete(p.entries, h)
+	}
+
+	if len(kept) == 0 {
+		delete(p.children, parent)
+	} else {
+		p.children[parent] = kept
 	}
 
 	p.setGauges()
@@ -661,6 +717,12 @@ func (p *blockPark) Expire(now time.Time, limit int) []parkedBlock {
 			break
 		}
 
+		// A block whose bytes are still being written has not been waiting for
+		// its parent, it has been waiting for the disk.
+		if entry.writing {
+			continue
+		}
+
 		if now.Sub(entry.parkedAt) < parkEntryTTL {
 			continue
 		}
@@ -694,6 +756,11 @@ func (p *blockPark) StuckCandidates(now time.Time, limit int) []parkedBlock {
 	eligible := make([]*parkedBlock, 0, len(p.entries))
 
 	for _, entry := range p.entries {
+		// No point spending a parent lookup on a block Take would then refuse.
+		if entry.writing {
+			continue
+		}
+
 		if now.Sub(entry.parkedAt) < parkStuckThreshold {
 			continue
 		}
@@ -748,6 +815,17 @@ func (p *blockPark) Take(hash chainhash.Hash) (parkedBlock, bool) {
 
 	entry, ok := p.entries[hash]
 	if !ok {
+		return parkedBlock{}, false
+	}
+
+	// Refused while the write is in flight, and the reason is that Take removes
+	// the entry. Park would then find nothing under this hash, never clear the
+	// flag, and the copy handed back here would carry writing true for good:
+	// restored, it would be invisible to every reader while still holding its
+	// bytes. StuckCandidates already skips these, so this guard refuses
+	// something that cannot reach it today. It is here because the failure it
+	// prevents is unrecoverable rather than merely wrong.
+	if entry.writing {
 		return parkedBlock{}, false
 	}
 
