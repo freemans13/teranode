@@ -28,10 +28,24 @@
 | BlockFailureBackoffBase | time.Duration | 5s | legacy_blockFailureBackoffBase | Base per-block backoff after a transient storage/service failure (0 disables) |
 | BlockFailureBackoffMaxDuration | time.Duration | 150s | legacy_blockFailureBackoffMaxDuration | Cap on the per-block backoff window and the failure-tracking map TTL, kept below the 180s sync-peer stall window (0 disables) |
 | BlockPrefetchBufferBytes | int64 | 268435456 | legacy_blockPrefetchBufferBytes | Byte budget for blocks downloaded ahead of processing during sync (0 disables prefetch) |
+| BlockDownloadTimeoutBasePercent | int64 | 100 | legacy_blockDownloadTimeoutBasePercent | Ceiling on one block download at the chain tip, as a percentage of the target block interval; floored at 30 minutes, so values at or below 300 have no effect on a 10-minute chain |
+| BlockDownloadTimeoutBaseIBDPercent | int64 | 600 | legacy_blockDownloadTimeoutBaseIBDPercent | The same ceiling while catching up, when blocks are larger and validation backpressure delays the read loop; also floored at 30 minutes, which the 600 default clears on a 10-minute chain |
+| BlockDownloadTimeoutPerPeerPercent | int64 | 50 | legacy_blockDownloadTimeoutPerPeerPercent | Extra ceiling allowed per other peer we are downloading from, since our downstream link is shared; the total is floored at 30 minutes, so this can only add patience |
+| MaxBlockParallelFetch | int | 2 | legacy_maxBlockParallelFetch | Maximum peers downloading the same stalled frontier block at once (1 disables racing) |
+| BlockSlowFetchTimeout | time.Duration | 20s | legacy_blockSlowFetchTimeout | How long the download frontier may sit unchanged before a second peer is asked for the same block (0 disables racing) |
+| MultiPeerBlockDownload | bool | true | legacy_multiPeerBlockDownload | Download block bodies from every eligible peer during legacy sync (false restores the single-sync-peer path) |
+| MaxBlocksInTransitPerPeer | int | 16 | legacy_maxBlocksInTransitPerPeer | Maximum block bodies one peer may be downloading at once (the block-size ladder lowers it further for large blocks) |
+| BlockDownloadWindow | int | 1024 | legacy_blockDownloadWindow | Maximum block bodies the whole node may be downloading at once, counting every peer together (a count, not svnode's per-peer height range) |
+| BlockDownloadLowerWindow | int | 0 | legacy_blockDownloadLowerWindow | Never ask for a block more than this many ahead of the one waiting to be committed (0 disables; svnode uses 10 when pruning) |
+| ParkOutOfOrderBlocks | bool | true | legacy_parkOutOfOrderBlocks | Write a block whose parent is not stored yet to the temp store and commit it when the parent arrives, instead of discarding it |
+| ParkMaxBytes | int64 | 4294967296 | legacy_parkMaxBytes | Ceiling on the total serialized bytes of out-of-order blocks held on disk (0 disables the park) |
+| ParkStoreTimeout | time.Duration | 10s | legacy_parkStoreTimeout | Deadline carried by each park blob store operation, bounding the wait for the file store's shared permits on the in-order block commit goroutine |
 | Upnp | bool | false | legacy_upnp | Enable UPnP for automatic port mapping |
 | MaxFeelerPeers | int | 1 | legacy_maxFeelerPeers | Peer slots reserved for short-lived feeler probes (0 disables feelers and the reservation together) |
 | FeelerInterval | time.Duration | 120s | legacy_feelerInterval | Mean of the randomised gap between feeler probes (not a disable lever; a non-positive value falls back to the default) |
 | FeelerHandshakeTimeout | time.Duration | 25s | legacy_feelerHandshakeTimeout | How long a feeler waits for a version message; must stay under the 30s peer negotiate timeout |
+| PeerRegistryEnabled | bool | true | legacy_peerRegistryEnabled | Mirror connected legacy peers into the centralized peer registry so the dashboard can show them (false is a kill switch) |
+| PeerRegistrySyncInterval | time.Duration | 10s | legacy_peerRegistrySyncInterval | How often the mirror reconciles connected legacy peers into the registry |
 
 ## Configuration Dependencies
 
@@ -94,6 +108,40 @@
 
 - `BlockPrefetchBufferBytes` bounds the bytes of received-but-not-yet-processed blocks so download overlaps validation during sync; `0` disables prefetch (synchronous ingestion).
 - Big-block era: a block at least as large as the whole budget is admitted alone (weight clamped), giving zero overlap — identical to pre-prefetch behaviour. To get overlap on large blocks, set the budget to at least ~2× the typical block size.
+
+### Peer Registry Mirror
+
+**PeerRegistryEnabled** and **PeerRegistrySyncInterval** control the mirror that
+makes legacy peers visible in the dashboard beside libp2p peers.
+
+The mirror is a read-only visibility path. It feeds no sync, catchup or
+peer-selection decision, and the legacy service's own sync engine
+(`services/legacy/netsync`) is unaffected by it either way.
+
+- Each tick snapshots the connected legacy peers and pushes only what changed,
+  so an idle peer costs no RPC.
+- Entries are registered with the wire-protocol transport type and keyed
+  `legacy:host:port`, which keeps them distinguishable from libp2p peers at
+  every layer.
+- A peer that disappears is marked disconnected once, then left for the
+  registry TTL to reap.
+- Each registry call is bounded independently, so an unresponsive blockchain
+  service delays a tick rather than stalling the mirror.
+
+**Requirements**
+
+- The blockchain service must be reachable, since it hosts the registry. When
+  the registry client is unavailable the mirror does not start and the legacy
+  service runs normally without dashboard peer visibility.
+
+**Recommendations**
+
+- Keep **PeerRegistryEnabled** at true for operator visibility. Set it to false
+  only if the extra registry traffic is unwelcome on a node carrying very many
+  legacy connections.
+- The default 10s interval sits well below the legacy two-minute ping interval.
+  Values under one second are pointless, because the underlying peer statistics
+  do not change that fast.
 
 ## Service Dependencies
 

@@ -512,7 +512,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockTopic:         getString("p2p_block_topic", "", alternativeContext...),
 			SubtreeTopic:       getString("p2p_subtree_topic", "", alternativeContext...),
 			GRPCAddress:        getString("p2p_grpcAddress", "", alternativeContext...),
-			GRPCListenAddress:  getString("p2p_grpcListenAddress", ":9906", alternativeContext...),
+			GRPCListenAddress:  getString("p2p_grpcListenAddress", "localhost:9906", alternativeContext...),
 			HTTPAddress:        getString("p2p_httpAddress", "localhost:9906", alternativeContext...),
 			HTTPListenAddress:  getString("p2p_httpListenAddress", "", alternativeContext...),
 			ListenAddresses:    getMultiString("p2p_listen_addresses", "|", []string{}, alternativeContext...),
@@ -534,6 +534,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PeerMapMaxSize:         getInt("p2p_peer_map_max_size", 10000, alternativeContext...),
 			PeerMapTTL:             getDuration("p2p_peer_map_ttl", 10*time.Minute, alternativeContext...),
 			PeerMapCleanupInterval: getDuration("p2p_peer_map_cleanup_interval", time.Minute, alternativeContext...),
+			SeenHashMaxSize:        getInt("p2p_seen_hash_max_size", 10000, alternativeContext...),
+			SeenHashTTL:            getDuration("p2p_seen_hash_ttl", 2*time.Minute, alternativeContext...),
+			SeenHashMaxPublishers:  getInt("p2p_seen_hash_max_publishers", 3, alternativeContext...),
 			// Sync manager configuration
 			ForceSyncPeer:                         getString("p2p_force_sync_peer", "", alternativeContext...),
 			NodeStatusTopic:                       getString("p2p_node_status_topic", "", alternativeContext...),
@@ -696,7 +699,26 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PeerProcessingTimeout:            getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
 			BlockFailureBackoffBase:          getDuration("legacy_blockFailureBackoffBase", 5*time.Second, alternativeContext...),
 			BlockFailureBackoffMaxDuration:   getDuration("legacy_blockFailureBackoffMaxDuration", 150*time.Second, alternativeContext...),
-			BlockPrefetchBufferBytes:         getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
+
+			BlockDownloadTimeoutBasePercent:    getInt64("legacy_blockDownloadTimeoutBasePercent", 100, alternativeContext...),
+			BlockDownloadTimeoutBaseIBDPercent: getInt64("legacy_blockDownloadTimeoutBaseIBDPercent", 600, alternativeContext...),
+			BlockDownloadTimeoutPerPeerPercent: getInt64("legacy_blockDownloadTimeoutPerPeerPercent", 50, alternativeContext...),
+
+			BlockPrefetchBufferBytes: getInt64("legacy_blockPrefetchBufferBytes", 256*1024*1024, alternativeContext...),
+
+			MaxBlockParallelFetch: getInt("legacy_maxBlockParallelFetch", 2, alternativeContext...),
+			BlockSlowFetchTimeout: getDuration("legacy_blockSlowFetchTimeout", 20*time.Second, alternativeContext...),
+
+			MultiPeerBlockDownload:    getBool("legacy_multiPeerBlockDownload", true, alternativeContext...),
+			MaxBlocksInTransitPerPeer: getInt("legacy_maxBlocksInTransitPerPeer", 16, alternativeContext...),
+			BlockDownloadWindow:       getInt("legacy_blockDownloadWindow", 1024, alternativeContext...),
+			BlockDownloadLowerWindow:  getInt("legacy_blockDownloadLowerWindow", 0, alternativeContext...),
+
+			ParkOutOfOrderBlocks:     getBool("legacy_parkOutOfOrderBlocks", true, alternativeContext...),
+			ParkMaxBytes:             getInt64("legacy_parkMaxBytes", 4*1024*1024*1024, alternativeContext...),
+			ParkStoreTimeout:         getDuration("legacy_parkStoreTimeout", 10*time.Second, alternativeContext...),
+			PeerRegistryEnabled:      getBool("legacy_peerRegistryEnabled", true, alternativeContext...),
+			PeerRegistrySyncInterval: getDuration("legacy_peerRegistrySyncInterval", 10*time.Second, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),
