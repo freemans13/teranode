@@ -611,3 +611,48 @@ func TestQuickWindow_ShutdownAbortsInFlightAndRefusesFurtherAdmits(t *testing.T)
 	require.Error(t, err)
 	require.True(t, errors.IsTransientLocalError(err), "got %v", err)
 }
+
+// A caller parked in AwaitParent is waiting for a block that a closed window will never admit,
+// so shutdown has to release it the way it releases a caller parked in Admit. The window here
+// is empty when it shuts down, which is the case that has nothing to abort and so raises no
+// signal of its own: without the shut check the caller sleeps out the full timeout, adding that
+// much to every shutdown that catches a block on the window route.
+func TestQuickWindow_ShutdownReleasesAwaitParentOnAnEmptyWindow(t *testing.T) {
+	c := &recordingCommitter{}
+	w, cancel := newTestWindow(t, 2, c)
+	defer cancel()
+
+	blocks := chainOf(t, 1)
+	ctx := context.Background()
+
+	const timeout = 30 * time.Second
+
+	done := make(chan *windowEntry, 1)
+
+	started := make(chan struct{})
+
+	go func() {
+		close(started)
+		done <- w.AwaitParent(ctx, blocks[0].Hash(), timeout)
+	}()
+
+	<-started
+
+	// Give the goroutine a moment to actually park on the condition variable, so the test
+	// exercises the wake path rather than the entry check.
+	require.Eventually(t, func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+
+		return len(w.entries) == 0
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+
+	select {
+	case e := <-done:
+		require.Nil(t, e, "a closed window has no parent to return")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "AwaitParent did not return on shutdown; it waited out its own timeout instead")
+	}
+}

@@ -68,6 +68,12 @@ type windowEntry struct {
 	// (task 4); the window itself attaches no behaviour to it.
 	peerID string
 
+	// ctx is the entry's own lifetime, not a call's. An entry outlives the RPC that admitted
+	// it: the committer owns the block from admission to commit, so the context cannot be a
+	// parameter threaded through the methods. It is built in Admit as
+	// WithCancel(WithoutCancel(caller)), which keeps the caller's trace span and drops the
+	// caller's cancellation and deadline; see the comment there for why both halves matter.
+	// cancel is called only by failLocked, which is the sole teardown for an entry.
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -285,6 +291,13 @@ func (w *quickWindow) AwaitParent(ctx context.Context, parent *chainhash.Hash, t
 			return e
 		}
 
+		// A closed window will never admit this parent, so sleeping out the rest of the
+		// timeout only delays shutdown. Admit refuses on the same flag; this keeps the two
+		// entry points consistent about what a closed window means.
+		if w.shut {
+			return nil
+		}
+
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return nil
@@ -423,6 +436,11 @@ func (w *quickWindow) run(ctx context.Context) {
 func (w *quickWindow) shutdown() {
 	w.mu.Lock()
 	w.shut = true
+	// Wake every waiter here, not only the ones the aborts below happen to reach. An empty
+	// window runs that loop zero times and so raises no signal of its own, and AwaitParent's
+	// wait is bounded by its own timeout rather than by anything the window does, so without
+	// this broadcast a caller parked there adds its full timeout to the shutdown.
+	w.cond.Broadcast()
 	w.mu.Unlock()
 
 	w.logger.Warnf("[quickWindow] shutting down: aborting the in-flight window and refusing further admissions")
