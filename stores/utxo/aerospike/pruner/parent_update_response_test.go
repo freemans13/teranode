@@ -277,9 +277,9 @@ func brokenRecord(t *testing.T) aerospike.BatchRecordIfc {
 		aerospike.BinMap{"SUCCESS": "not-a-map"})}
 }
 
-// TestTallyParentUpdateResults covers the aggregation the combined and two-call
-// cleanup paths both run over their parent-update region — previously inline in
-// executeBatchCleanupCombined and therefore only reachable with a live client.
+// TestTallyParentUpdateResults covers the aggregation executeBatchParentUpdates
+// runs over its batch response. It was once inline in the caller and so only
+// reachable with a live client; as a free function it is unit-testable.
 func TestTallyParentUpdateResults(t *testing.T) {
 	t.Run("counts each outcome independently", func(t *testing.T) {
 		records := []aerospike.BatchRecordIfc{
