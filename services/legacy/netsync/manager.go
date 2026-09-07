@@ -1592,11 +1592,29 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// wall-clock window the peer is rotated regardless of throughput, so a
 	// malicious peer cannot dribble bytes just above the threshold forever to
 	// hold the single sync-peer slot and stall IBD.
-	if isLastBlockTimeViolation &&
+	// Both arms are suppressed, not just the last-block-time one. validNetworkSpeed
+	// reads BytesReceived, which is this peer object's own counter, and under the
+	// BlockPriority stream policy a large block arrives on DATA1 while that
+	// counter barely moves. So a peer downloading a multi-GB block at full rate
+	// records a speed violation every tick, and gating only the last-block-time
+	// arm left the speed arm free to rotate it anyway. Measured on mainnet at
+	// 124 MB average blocks: the sync peer was demoted three times in seven
+	// minutes, mid-transfer, each demotion reopening its assignments and rewinding
+	// the cursor, so the work was done twice.
+	//
+	// This is what svnode does and for the same reason: DetectStalling asks
+	// whether the peer is actually downloading before it acts, and resets the
+	// stall clock rather than disconnecting a peer making real progress.
+	//
+	// The wall-clock cap is kept and now covers both arms, so a peer cannot
+	// dribble bytes just above the floor to hold the sync-peer slot indefinitely.
+	if (isLastBlockTimeViolation || isNetworkSpeedViolation) &&
 		lastBlockSince < peerpkg.MaxBlockDownloadTime &&
 		sps.hasHealthyDownloadThroughput(sm.minSyncPeerNetworkSpeed) {
-		sm.logger.Debugf("[CheckSyncPeer] sync peer %s exceeded last-block-time but association still downloading at a healthy rate (%.0fs in, cap %s); not rotating", sp.String(), lastBlockSince.Seconds(), peerpkg.MaxBlockDownloadTime)
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s violated %s but its association is still downloading at a healthy rate (%.0fs in, cap %s); not rotating", sp.String(), violationNames(isNetworkSpeedViolation, isLastBlockTimeViolation), lastBlockSince.Seconds(), peerpkg.MaxBlockDownloadTime)
+
 		isLastBlockTimeViolation = false
+		isNetworkSpeedViolation = false
 	}
 
 	// If no violations detected, the sync peer is healthy — nothing to do.
@@ -5934,5 +5952,17 @@ func (sm *SyncManager) samplePeerThroughput() {
 
 	for p, state := range sm.peerStates.Range() {
 		state.sampleThroughput(p)
+	}
+}
+
+// violationNames renders which stall arms tripped, for one log line.
+func violationNames(networkSpeed, lastBlockTime bool) string {
+	switch {
+	case networkSpeed && lastBlockTime:
+		return "network speed and last-block-time"
+	case networkSpeed:
+		return "network speed"
+	default:
+		return "last-block-time"
 	}
 }

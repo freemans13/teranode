@@ -1837,3 +1837,65 @@ func TestHandleNewPeerMsg_SkipsDisconnectedPeer(t *testing.T) {
 
 	require.False(t, sm.peerStates.Exists(disconnectedPeer), "disconnected peer must not be registered in peerStates")
 }
+
+// TestHandleCheckSyncPeer_SpeedArmRespectsAssociationThroughput covers the arm
+// the healthy-throughput suppression used to miss.
+//
+// validNetworkSpeed reads BytesReceived, which is the sync peer object's own
+// counter. Under the BlockPriority stream policy a large block arrives on DATA1,
+// so that counter barely moves while the association is pulling at full rate,
+// and the peer records a speed violation every tick. The suppression guarded
+// only the last-block-time arm, so the speed arm rotated a peer that was
+// downloading perfectly well. Observed on mainnet at 124 MB average blocks: the
+// sync peer was demoted three times in seven minutes, mid-transfer, each
+// demotion reopening its assignments and rewinding the cursor, so the work was
+// done twice.
+func TestHandleCheckSyncPeer_SpeedArmRespectsAssociationThroughput(t *testing.T) {
+	// speedViolatingState has a clean last-block-time arm so only the speed arm
+	// can fire, which is what isolates the arm under test. The general stream is
+	// silent and the association is pulling hard: a large block on DATA1.
+	speedViolatingState := func(assocBytes uint64) *syncPeerState {
+		return &syncPeerState{
+			lastBlockTime:          time.Now(),
+			ticks:                  maxNetworkViolations + 1,
+			violations:             maxNetworkViolations,
+			recvBytes:              0,
+			recvBytesLastTick:      0,
+			assocReadBytes:         assocBytes,
+			assocReadBytesLastTick: 0,
+		}
+	}
+
+	t.Run("a peer downloading on DATA1 is not rotated for a quiet general stream", func(t *testing.T) {
+		sm := newDemotionManager(t)
+		sm.headersFirstMode.Store(false) // speed checks only run outside headers-first
+		sm.minSyncPeerNetworkSpeed = 51200
+
+		sp, _, _ := connectRacePeer(t, 90, 1000)
+		state := registerRacePeer(sm, sp)
+		sm.storeSyncPeer(sp, speedViolatingState(64<<20))
+
+		sm.handleCheckSyncPeer()
+
+		// The demotion cooldown is the observable, not the sync-peer pointer: a
+		// demoted peer is re-elected immediately when it is the only candidate,
+		// so the pointer looks unchanged either way.
+		require.False(t, state.inDemotionCooldown(),
+			"a peer whose association is downloading at a healthy rate must not be demoted for a quiet general stream")
+	})
+
+	t.Run("a genuinely silent peer is still rotated", func(t *testing.T) {
+		sm := newDemotionManager(t)
+		sm.headersFirstMode.Store(false)
+		sm.minSyncPeerNetworkSpeed = 51200
+
+		sp, _, _ := connectRacePeer(t, 91, 1000)
+		state := registerRacePeer(sm, sp)
+		sm.storeSyncPeer(sp, speedViolatingState(0)) // nothing anywhere on the association
+
+		sm.handleCheckSyncPeer()
+
+		require.True(t, state.inDemotionCooldown(),
+			"a peer sending nothing on any stream is stalled and must still be demoted")
+	})
+}
