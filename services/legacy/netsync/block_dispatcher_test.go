@@ -216,6 +216,35 @@ func TestDispatcher_NonWindowBlockWaitsForAnEmptyFrontier(t *testing.T) {
 	require.True(t, bd.canDispatch(serial))
 }
 
+// With the window route off, handleBlockMsgHead never measures the block, so every dispatch
+// reaches the dispatcher with bytes zero. That has to change nothing: an unmeasured block is
+// still admitted only into an empty frontier, and the budget it charges and releases still
+// nets back to where it started rather than drifting.
+func TestDispatcher_UnmeasuredNonWindowBlockChargesNothingAndStillSerialises(t *testing.T) {
+	bd, rec := testDispatcher(t, 3)
+	block := make(chan struct{})
+	bd.run = func(context.Context, *blockDispatch, *inflightParent) error { <-block; return nil }
+
+	require.Zero(t, bd.inflight)
+
+	first := dispatchAt(1, 0)
+	first.windowed = false
+	require.True(t, bd.canDispatch(first))
+	bd.dispatch(first)
+	require.Zero(t, bd.inflight, "an unmeasured block charges nothing")
+
+	second := dispatchAt(2, 0)
+	second.windowed = false
+	require.False(t, bd.canDispatch(second), "a zero size must not let a second block join the frontier")
+
+	close(block)
+	bd.drainCompletions(t, rec, 1)
+
+	require.True(t, bd.frontierEmpty())
+	require.Zero(t, bd.inflight, "the release nets the charge back to zero")
+	require.True(t, bd.canDispatch(second))
+}
+
 func TestDispatcher_CheckpointBlockIsABarrier(t *testing.T) {
 	bd, rec := testDispatcher(t, 3)
 	block := make(chan struct{})

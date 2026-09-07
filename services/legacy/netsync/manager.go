@@ -1914,14 +1914,28 @@ func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, 
 		}
 	}
 
-	// Serializing a multi-GB block to measure it is not free, and both the size
-	// tracker and the window's byte charge want the same number.
-	blockSize := int64(msgBlock.SerializeSize())
+	// Serializing a multi-GB block to measure it is not free, and exactly two consumers want
+	// the number: the headers-first size tracker below and the dispatcher's byte charge. So
+	// measure it once when either of those is live, and not at all when neither is — a node
+	// with headers-first off and the window route off then pays nothing it did not pay before
+	// the window existed, which is where this measurement used to sit.
+	//
+	// blockSize stays zero in that case, and the dispatcher is fine with that: it charges and
+	// releases d.bytes symmetrically, and canDispatch reads it only on the window route, where
+	// windowRouteEnabled() is true by definition. Off that route a block needs an empty
+	// frontier whatever its size.
+	var blockSize int64
+
+	headersFirst := sm.headersFirstMode.Load()
+
+	if headersFirst || sm.windowRouteEnabled() {
+		blockSize = int64(msgBlock.SerializeSize())
+	}
 
 	// Track block size for dynamic in-flight adjustment during headers-first mode.
 	// This allows us to start aggressive (20 blocks) and automatically reduce
 	// to 1 block when encountering large (>2GB) blocks on mainnet.
-	if sm.headersFirstMode.Load() {
+	if headersFirst {
 		sm.blockSizeTracker.addBlockSize(blockSize)
 
 		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
