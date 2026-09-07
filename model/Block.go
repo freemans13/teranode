@@ -1416,33 +1416,63 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 		return errors.NewProcessingError("[validateSubtree][%s] subtree %d was released during validation", b.String(), sIdx)
 	}
 
+	// Resolved before the tracer because RootHash() is nil for a zero-node subtree
+	// and chainhash.Hash.String() has a value receiver, so naming it in the span's
+	// log message panics inside an errgroup goroutine. It also keeps the span and
+	// the errors below naming the same subtree.
+	//
+	// This is the .subtree file's cached root, which GetAndValidateSubtrees has
+	// already compared against the key it was fetched under.
+	subtreeHash := subtree.RootHash()
+	if subtreeHash == nil {
+		return errors.NewProcessingError("[validateSubtree][%s] subtree %d has no root hash", b.String(), sIdx)
+	}
+
 	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "validateSubtree",
-		tracing.WithLogMessage(logger, "[validateSubtree][%s][%s:%d] called", b.String(), subtree.RootHash().String(), sIdx),
+		tracing.WithLogMessage(logger, "[validateSubtree][%s][%s:%d] called", b.String(), subtreeHash.String(), sIdx),
 	)
 	defer deferFn()
 
 	var (
 		subtreeMetaSlice    *subtreepkg.Meta
-		subtreeHash         = subtree.RootHash()
 		checkParentTxHashes = make([]missingParentTx, 0, len(subtree.Nodes)/16)
 		err                 error
 	)
 
 	subtreeMetaSlice, err = b.getSubtreeMetaSlice(ctx, deps.subtreeStore, *subtreeHash, subtree)
 
-	// Attempt regeneration if meta not found and regenerator is available
-	if err != nil && deps.metaRegenerator != nil {
-		logger.Warnf("[validateSubtree][%s][%s:%d] subtree meta not found, attempting regeneration", b.String(), subtreeHash.String(), sIdx)
+	// Attempt regeneration if the meta is missing or invalid and a regenerator is
+	// available. The read error is included in the log line: it carries the
+	// header-validation verdict (root-hash or entry-count mismatch, issue 1425),
+	// and regeneration succeeding would otherwise discard the only trace of a
+	// torn or foreign file.
+	// ctx errors are excluded: regeneration reads the whole .subtreeData and, on a
+	// miss, fetches from every peer behind blockvalidation_subtree_meta_peer_fetch_timeout
+	// (10m as shipped, and a peer serving an unusable body gets a second fetch with a
+	// fresh budget). At shutdown that fires for every subtree of the in-flight block,
+	// to rebuild a file nothing will use.
+	if err != nil && deps.metaRegenerator != nil && ctx.Err() == nil {
+		// "subtree meta not found" is preserved as a substring because that is what
+		// existing queries match on for regeneration bursts. Note the line itself
+		// changed — anything pinned to the exact previous message needs updating.
+		logger.Warnf("[validateSubtree][%s][%s:%d] subtree meta not found or unusable (%v), attempting regeneration", b.String(), subtreeHash.String(), sIdx, err)
 
-		subtreeMetaSlice, err = deps.metaRegenerator.RegenerateMeta(ctx, subtreeHash, subtree)
+		subtreeMetaSlice, err = deps.metaRegenerator.RegenerateMeta(ctx, subtreeHash, subtree, sIdx == 0)
 		if err == nil {
-			logger.Warnf("[validateSubtree][%s][%s:%d] successfully regenerated subtree meta", b.String(), subtreeHash.String(), sIdx)
+			// Scoped to this validation on purpose. RegenerateMeta returns only the
+			// meta, so this level cannot tell whether the rebuild also replaced the
+			// file on disk; the regenerator emits that verdict itself on the line
+			// immediately before this one. Claiming a repair here would be the same
+			// overstatement storeRegeneratedMeta used to make.
+			logger.Warnf("[validateSubtree][%s][%s:%d] regenerated subtree meta for this validation", b.String(), subtreeHash.String(), sIdx)
 		}
 	}
 
 	// a subtreeMetaSlice is required for further block validation, so if we cannot get it, we return an error
 	if err != nil {
-		return errors.NewProcessingError("[validOrderAndBlessed][%s][%s:%d] error getting subtree meta slice: %v", b.String(), subtreeHash.String(), sIdx, err)
+		// No %v for err: errors.New consumes a trailing error param and wraps it, so an
+		// explicit verb here prints %!v(MISSING) in front of the real cause.
+		return errors.NewProcessingError("[validOrderAndBlessed][%s][%s:%d] error getting subtree meta slice", b.String(), subtreeHash.String(), sIdx, err)
 	}
 
 	for snIdx := 0; snIdx < len(subtree.Nodes); snIdx++ {
@@ -1783,13 +1813,39 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 		}
 	}
 
-	// Close whatever survived the loaded-check before dropping the slice.
-	// Reallocating over an mmap-backed survivor would leak its mapping and its
-	// backing file, since nothing else holds a reference once the slice header
-	// is replaced. Nodes are not pooled here: the pool's put function lives in
-	// blockvalidation and this path has no access to it.
-	if closeErr := b.releaseSubtreeNodesLocked(nil); closeErr != nil {
-		logger.Warnf("[BLOCK][%s][ID %d] failed closing subtrees before reload: %v", b.Hash().String(), b.ID, closeErr)
+	// Close the mmap-backed survivors before dropping the slice. Reallocating
+	// over one would leak its mapping and its backing file, since nothing else
+	// holds a reference once the slice header is replaced.
+	//
+	// Heap-backed survivors are deliberately left alone: the block does not
+	// exclusively own them. blockvalidation's quick_validate puts the same
+	// *Subtree into both block.SubtreeSlices and the SubtreeWriteJob it queues
+	// on the shared write channel, and blockassembly aliases the processor's
+	// live job.Subtrees into a model.Block. Releasing one of those under a write
+	// worker races its Nodes and makes Serialize write a 0-leaf .subtree over a
+	// good one. Nothing is lost by leaving them: a heap subtree needs no Close,
+	// and dropping the reference is all the reallocation below has to do.
+	//
+	// For quick_validate that is airtight: it builds the shared subtree with
+	// AddNode, and its mmap-capable branch queues a job carrying no Subtree at
+	// all, so the entry it shares is always heap-backed.
+	//
+	// blockassembly is NOT airtight. With blockassembly_subtreeMmapDir set the
+	// processor's chained subtrees come from SubtreeProcessor.newSubtree, which
+	// returns NewTreeByLeafCountMmap — so a job subtree aliased into a Block can
+	// be mmap-backed, and Closing it would unmap and delete a file the live
+	// processor is still using. What saves that path today is that it never
+	// reaches here: its SubtreeSlices are always fully loaded and the same
+	// length as its Subtrees, so the "already loaded" check above returns first.
+	//
+	// Anything that tightens that check has to give blockassembly ownership of
+	// what it hands over, and copying the slice is not enough to do that: Close
+	// acts on the *Subtree, so a cloned array still holds the same pointers and
+	// unmapping one still tears down the mapping the processor is reading. It
+	// needs either subtrees of its own or a way to tell this release the entries
+	// are not the block's to close.
+	if closeErr := b.closeMmapSubtreesLocked(); closeErr != nil {
+		logger.Warnf("[BLOCK][%s][ID %d] failed closing mmap subtrees before reload: %v", b.Hash().String(), b.ID, closeErr)
 	}
 
 	b.SubtreeSlices = make([]*subtreepkg.Subtree, len(b.Subtrees))
@@ -1869,17 +1925,37 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 					bufioReaderPool.Put(bufferedReader)
 				}()
 
+				// No retry here. It used to re-run the deserialize on the same
+				// partially-consumed bufferedReader with no re-fetch and no reset, so
+				// it read leftover bytes as a fresh root hash, fees and numLeaves: it
+				// could not recover a truncated read, and could ask nodeAlloc for a
+				// second array sized from garbage while never returning the first. The
+				// transient EOF the old comment described is already covered by
+				// findSubtree above, which retries the fetch and genuinely re-opens
+				// the blob.
 				if err = subtree.DeserializeFromReaderWithAllocator(bufferedReader, nodeAlloc); err != nil {
-					_, err = retry.Retry(gCtx, logger, func() (struct{}, error) {
-						return struct{}{}, subtree.DeserializeFromReaderWithAllocator(bufferedReader, nodeAlloc)
-					}, retry.WithMessage(fmt.Sprintf("[BLOCK][%s][ID %d] failed to deserialize subtree %s", blockHash, blockID, subtreeHash)))
-
-					if err != nil {
-						return errors.NewStorageError("[BLOCK][%s][ID %d] failed to deserialize subtree %s", blockHash, blockID, subtreeHash, err)
-					}
+					return errors.NewStorageError("[BLOCK][%s][ID %d] failed to deserialize subtree %s", blockHash, blockID, subtreeHash, err)
 				}
 
+				// Stored before the check below, not after. The reload path can only
+				// close what it finds in SubtreeSlices, so returning an error with the
+				// entry still nil orphans a backing array the allocator handed out —
+				// and a peer able to trigger repeated rejections turns that into
+				// sustained pool churn. Returning the error with the entry set matches
+				// what the size checks further down already do.
 				b.SubtreeSlices[i] = subtree
+
+				// Bind the file to its key, once, for every later consumer of
+				// RootHash(). DeserializeFromReaderWithAllocator caches the .subtree
+				// header's root for anything read from storage, and CheckMerkleRoot does
+				// not close the gap either —
+				// for sIdx 0 it recomputes via RootHashWithReplaceRootNode, so the
+				// cached root is never compared. This compares the file's claim, not
+				// the tree, so it catches the wrong file under the right key rather
+				// than a rewritten header.
+				if err := ValidateSubtreeMatchesKey(subtree, subtreeHash); err != nil {
+					return errors.NewStorageError("[BLOCK][%s][ID %d] subtree %s", blockHash, blockID, subtreeHash, err)
+				}
 
 				sizeInBytes.Add(subtree.SizeInBytes)
 				txCount.Add(uint64(subtree.Length())) // nolint: gosec
@@ -1943,6 +2019,27 @@ func (b *Block) ReleaseSubtreeNodes(put func([]subtreepkg.Node)) error {
 	return b.releaseSubtreeNodesLocked(put)
 }
 
+// TryReleaseSubtreeNodes is ReleaseSubtreeNodes for callers that must not block.
+// It reports whether the release happened: false means the block's subtree mutex
+// was held by someone else and nothing was touched.
+//
+// For callers running underneath another lock. blockvalidation's
+// lastValidatedBlocks eviction function runs inside expiringmap.clean(), which
+// holds the map's own write lock for the whole sweep, while
+// GetAndValidateSubtrees holds a block's subtree mutex across store reads with
+// retries and backoff. Blocking there parks the cleaner under the map lock and
+// queues every Get/Set/Delete on the cache behind a single block's I/O. Such a
+// caller should decline the eviction instead and let the next tick retry it —
+// clean() leaves a vetoed entry in place with its expiry unchanged.
+func (b *Block) TryReleaseSubtreeNodes(put func([]subtreepkg.Node)) (bool, error) {
+	if !b.subtreeSlicesMu.TryLock() {
+		return false, nil
+	}
+	defer b.subtreeSlicesMu.Unlock()
+
+	return true, b.releaseSubtreeNodesLocked(put)
+}
+
 // releaseSubtreeNodesLocked is ReleaseSubtreeNodes' body. The caller must hold
 // b.subtreeSlicesMu for writing.
 func (b *Block) releaseSubtreeNodesLocked(put func([]subtreepkg.Node)) error {
@@ -1963,6 +2060,67 @@ func (b *Block) releaseSubtreeNodesLocked(put func([]subtreepkg.Node)) error {
 		}
 
 		b.SubtreeSlices[i] = nil
+	}
+
+	return errors.Join(closeErrs...)
+}
+
+// ReplaceSubtreeSlices swaps in a freshly built set of subtree slices under the
+// block's subtree mutex.
+//
+// Callers that reload a block's subtrees must build the replacement in a local
+// slice and hand it over here, rather than assigning SubtreeSlices and then
+// filling its entries. A block can be reachable from blockvalidation's
+// lastValidatedBlocks while it is being reloaded, and that cache's TTL cleaner
+// runs ReleaseSubtreeNodes on it under this same mutex — so an unlocked reload
+// races the release on both the slice header and its elements, and entries the
+// reload has just filled get nil-ed underneath it.
+func (b *Block) ReplaceSubtreeSlices(slices []*subtreepkg.Subtree) {
+	b.subtreeSlicesMu.Lock()
+	defer b.subtreeSlicesMu.Unlock()
+
+	b.SubtreeSlices = slices
+}
+
+// closeMmapSubtreesLocked Closes every mmap-backed subtree in SubtreeSlices,
+// leaving heap-backed subtrees untouched. The caller must hold
+// b.subtreeSlicesMu for writing.
+//
+// Used where the block is about to drop its references to the subtrees but may
+// not be their only holder. Closing is only needed for mmap-backed subtrees —
+// it unmaps the region and removes the backing file, which no finalizer would
+// ever do.
+//
+// Callers must satisfy themselves that the block's mmap-backed entries are its
+// own. That holds for every caller today, but not because mmap-backed subtrees
+// are inherently unshared: see the note in GetAndValidateSubtrees on
+// blockassembly, whose job subtrees are mmap-backed whenever
+// blockassembly_subtreeMmapDir is set and are only ever safe here because that
+// path returns before reaching this function.
+//
+// The array itself is not written to, deliberately. SubtreeSlices can be the
+// caller's own slice: blockassembly builds a model.Block with
+// SubtreeSlices: job.Subtrees and calls Valid on it, sharing the backing array
+// with the live subtree processor. Nil-ing an element there would reach into the
+// processor's state to no purpose, since the only caller replaces the slice
+// header immediately afterwards. Returns the joined Close errors, if any.
+func (b *Block) closeMmapSubtreesLocked() error {
+	var closeErrs []error
+
+	for i, st := range b.SubtreeSlices {
+		if st == nil || !st.IsMmapBacked() {
+			continue
+		}
+
+		// Detach Nodes before unmapping, the same order releaseSubtreeNodesLocked
+		// uses. Close leaves st.Nodes pointing at the region it just unmapped, so
+		// anything that still holds this subtree would be reading freed memory.
+		// The slice is dropped, never pooled: its backing IS the mapped region.
+		_ = st.ReleaseNodes()
+
+		if err := st.Close(); err != nil {
+			closeErrs = append(closeErrs, errors.NewProcessingError("subtree %d", i, err))
+		}
 	}
 
 	return errors.Join(closeErrs...)
@@ -2006,8 +2164,11 @@ func (b *Block) getSubtreeMetaSlice(ctx context.Context, subtreeStore SubtreeSto
 		_ = subtreeMetaReader.Close()
 	}()
 
-	// no need to check whether this fails or not, it's just a cache file and not critical
-	subtreeMetaSlice, err := subtreepkg.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
+	// Validate the file's fixed header against the subtree being checked before
+	// any body deserialization (issue 1425); a mismatch fails loudly here and
+	// routes the caller into meta regeneration. See
+	// NewSubtreeMetaFromValidatedReader for the three torn-file failure shapes.
+	subtreeMetaSlice, err := NewSubtreeMetaFromValidatedReader(subtreeHash, subtree, subtreeMetaReader)
 	if err != nil {
 		return nil, errors.NewProcessingError("[BLOCK][%s][%s] failed to deserialize subtree meta", b.String(), subtreeHash.String(), err)
 	}

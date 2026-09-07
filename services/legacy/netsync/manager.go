@@ -193,12 +193,6 @@ type txMsg struct {
 	reply chan struct{}
 }
 
-// getSyncPeerMsg is a message type to be sent across the message channel for
-// retrieving the current sync peer.
-type getSyncPeerMsg struct {
-	reply chan int32
-}
-
 // isCurrentMsg is a message type to be sent across the message channel for
 // requesting whether or not the sync manager believes it is synced with the
 // currently connected peers.
@@ -2013,7 +2007,17 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 			}
 
 			sm.requestedBlocks.Set(*node.hash, struct{}{})
-			peerState, _ := sm.peerStates.Get(sp)
+
+			// peerState is the one fetched and existence-checked above, deliberately not
+			// looked up again here. sp does not change across the loop, so a second lookup
+			// returned the same value on every iteration, and it discarded the existence
+			// flag. A peer that went away between the check above and this line therefore
+			// left a nil pointer that was written to immediately, which segfaulted the node
+			// on mainnet on 2026-09-02 with an invalid memory address at offset 0x18.
+			//
+			// Reusing the checked pointer is also correct when the peer HAS gone: the map it
+			// writes into is that peer's own, so a stale entry is read by nobody and the
+			// disconnect path discards the whole state.
 			peerState.requestedBlocks.Set(*node.hash, struct{}{})
 
 			numRequested++
@@ -2615,14 +2619,6 @@ out:
 					msg.reply <- struct{}{}
 				}
 
-			case getSyncPeerMsg:
-				var peerID int32
-
-				if sp := sm.loadSyncPeer(); sp != nil {
-					peerID = sp.ID()
-				}
-				msg.reply <- peerID
-
 			case isCurrentMsg:
 				sm.logger.Warnf("isCurrentMsg is deprecated, use current() instead")
 				msg.reply <- sm.current()
@@ -3128,11 +3124,20 @@ func (sm *SyncManager) closeTxAnnounceBatcher() {
 }
 
 // SyncPeerID returns the ID of the current sync peer, or 0 if there is none.
+//
+// It reads syncPeer under its mutex rather than round-tripping through
+// msgChan. The old message path could block for ever: reply was unbuffered and
+// blockHandler is its only responder, so a call racing SyncManager.Stop had
+// nothing left to answer it. The value is identical either way — storeSyncPeer
+// is the only writer and takes the same lock — and this keeps a caller off
+// blockHandler, which is the sync manager's single serialization point for
+// disconnects, sync-peer rotation, inv, headers and tx dispatch.
 func (sm *SyncManager) SyncPeerID() int32 {
-	reply := make(chan int32)
-	sm.msgChan <- getSyncPeerMsg{reply: reply}
+	if sp := sm.loadSyncPeer(); sp != nil {
+		return sp.ID()
+	}
 
-	return <-reply
+	return 0
 }
 
 // IsCurrent returns whether the sync manager believes it is synced with
