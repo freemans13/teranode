@@ -135,3 +135,44 @@ func TestHandleBlockDirect_GateFailureOnWindowRouteIsALocalFault(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.IsTransientLocalError(err), "a parked gate on the window route must be a local fault, got: %v", err)
 }
+
+// No blockchain client returns a nil meta alongside a nil error, but the height this lookup
+// produces is what decides whether the block takes the window route, so resolveWindowRoute must
+// fail closed on it rather than dereference the nil. Block validation already guards the same
+// lookup in processBlockFound; this pins the legacy side to the same answer.
+func TestResolveWindowRoute_NilParentMetaFailsClosed(t *testing.T) {
+	initPrometheusMetrics()
+
+	const checkpointHeight = int32(1000)
+
+	tSettings, params := newOutpointOnlySettings(t, true, true, checkpointHeight)
+	tSettings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
+	tSettings.BlockValidation.QuickWindowBlocks = 2
+
+	blockchainClient := &blockchain.Mock{}
+	blockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(&model.BlockHeader{}, (*model.BlockHeaderMeta)(nil), nil)
+
+	sm := &SyncManager{
+		settings:         tSettings,
+		logger:           ulogger.TestLogger{},
+		chainParams:      params,
+		ctx:              context.Background(),
+		blockchainClient: blockchainClient,
+		utxoStore:        &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}},
+	}
+	sm.dispatcher = newBlockDispatcher(sm)
+
+	require.True(t, sm.windowRouteEnabled(), "precondition: the window route must be on for the lookup to run at all")
+
+	d := &blockDispatch{}
+	bmsg := &blockQueueMsg{blockHash: chainhash.Hash{0x01}}
+
+	require.NotPanics(t, func() {
+		finished, err := sm.resolveWindowRoute(d, bmsg, &peer.Peer{}, chainhash.Hash{0x02})
+
+		require.True(t, finished, "a parent height that cannot be resolved finishes the head")
+		require.Error(t, err, "and it finishes with an error rather than a silent nil route")
+		require.Zero(t, d.height, "no height is derived from a nil meta")
+		require.False(t, d.windowed, "and the block is never marked windowed on the back of one")
+	})
+}

@@ -2007,6 +2007,14 @@ func (sm *SyncManager) resolveWindowRoute(d *blockDispatch, bmsg *blockQueueMsg,
 			return true, errors.NewProcessingError("[handleBlockMsg][%s] failed to get block header for previous block %s", bmsg.blockHash, prevBlockHash, err)
 		}
 
+		// No implementation returns a nil meta with a nil error, but this height decides
+		// whether the block takes the window route at all, so fail closed rather than derive
+		// it from a nil dereference. Mirrors the guard block validation already applies to the
+		// same lookup in processBlockFound.
+		if meta == nil {
+			return true, errors.NewProcessingError("[handleBlockMsg][%s] nil metadata for previous block %s", bmsg.blockHash, prevBlockHash)
+		}
+
 		d.height = meta.Height + 1
 	}
 
