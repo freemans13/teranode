@@ -153,3 +153,109 @@ func testPrunerReplayProtection(t *testing.T, seedFalsePositive, paginated, mark
 	require.NoError(t, err)
 	require.False(t, exists)
 }
+
+// TestPrunerUnresolvableRecordDoesNotBlockCycle proves that a record whose
+// external blob has vanished is retained on its own while the rest of the cycle
+// still prunes. Before the fix, getTxInputsFromBins returned a ProcessingError
+// that unwound the whole chunk into PruneWithPartitions, where a non-timeout
+// error is never retried, so one such record blocked all pruning permanently.
+func TestPrunerUnresolvableRecordDoesNotBlockCycle(t *testing.T) {
+	logger := ulogger.New("pruner-unresolvable-test")
+	s := test.CreateBaseTestSettings(t)
+	s.UtxoStore.DisableDAHCleaner = false
+	s.Pruner.UTXODefensiveEnabled = false
+	s.Aerospike.EnableSpendFilterExpressions = true
+
+	client, store, ctx, cleanup := initAerospike(t, s, logger)
+	t.Cleanup(cleanup)
+	require.NoError(t, store.SetBlockHeight(1000))
+
+	// Parent keeps output 2 unspent so it survives this prune cycle and can carry
+	// the replay markers we assert on.
+	parent := bt.NewTx()
+	require.NoError(t, parent.From("1111111111111111111111111111111111111111111111111111111111111111", 0, "51", 30000))
+
+	for i := 0; i < 3; i++ {
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+	}
+
+	_, err := store.Create(ctx, parent, 1000)
+	require.NoError(t, err)
+
+	// Two independent children of the same parent, both fully spent and mined,
+	// so both are eligible for pruning in the same cycle.
+	children := make([]*bt.Tx, 2)
+
+	for i := range children {
+		child := bt.NewTx()
+		require.NoError(t, child.From(parent.TxID(), uint32(i), parent.Outputs[i].LockingScript.String(), parent.Outputs[i].Satoshis))
+		require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+		_, _, err = store.SpendAndCreate(ctx, child, 1000)
+		require.NoError(t, err)
+		_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{child.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+		require.NoError(t, err)
+
+		grandchild := bt.NewTx()
+		require.NoError(t, grandchild.From(child.TxID(), 0, child.Outputs[0].LockingScript.String(), child.Outputs[0].Satoshis))
+		require.NoError(t, grandchild.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2000))
+		_, _, err = store.SpendAndCreate(ctx, grandchild, 1001)
+		require.NoError(t, err)
+		_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{grandchild.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+		require.NoError(t, err)
+
+		children[i] = child
+	}
+
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+	require.NoError(t, err)
+
+	broken, healthy := children[0], children[1]
+
+	brokenKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), broken.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+
+	healthyKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), healthy.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+
+	// Mark one record external without writing any blob. Its input references are
+	// now unrecoverable, which is exactly the anomaly the old code swallowed by
+	// deleting the record and losing the parent's replay protection.
+	require.NoError(t, client.Put(nil, brokenKey, aerospike.BinMap{fields.External.String(): true}))
+
+	astore.ResetPrunerServiceForTests()
+	t.Cleanup(astore.ResetPrunerServiceForTests)
+	require.NoError(t, store.CreateIndexIfNotExists(ctx, apruner.IndexName, fields.DeleteAtHeight.String(), aerospike.NUMERIC))
+	require.NoError(t, store.WaitForIndexReady(ctx, apruner.IndexName))
+
+	svc, err := store.GetPrunerService()
+	require.NoError(t, err)
+
+	n, err := svc.(*apruner.Service).PruneWithPartitions(ctx, 1300, "unresolvable-record", 1)
+	require.NoError(t, err, "one unresolvable record must not fail the prune cycle")
+	require.Equal(t, int64(1), n, "the healthy child must still be pruned")
+
+	require.Eventually(t, func() bool {
+		exists, err := client.Exists(nil, healthyKey)
+		return err == nil && !exists
+	}, 5*time.Second, 20*time.Millisecond)
+
+	exists, err := client.Exists(nil, brokenKey)
+	require.NoError(t, err)
+	require.True(t, exists, "the unresolvable record must be retained, not deleted")
+
+	parentKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), parent.TxIDChainHash().CloneBytes())
+	require.NoError(t, err)
+
+	parentRecord, err := client.Get(nil, parentKey)
+	require.NoError(t, err)
+	require.Contains(t, parentRecord.Bins[fields.DeletedChildren.String()], healthy.TxID(), "the pruned child must leave replay protection on its parent")
+
+	// A second cycle still makes progress rather than aborting, so a retained
+	// record cannot wedge pruning.
+	_, err = svc.(*apruner.Service).PruneWithPartitions(ctx, 1300, "unresolvable-record-retry", 1)
+	require.NoError(t, err, "the retained record must not wedge later cycles")
+
+	exists, err = client.Exists(nil, brokenKey)
+	require.NoError(t, err)
+	require.True(t, exists)
+}

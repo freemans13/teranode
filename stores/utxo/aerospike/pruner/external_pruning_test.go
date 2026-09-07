@@ -407,14 +407,17 @@ func TestExternalFileAlreadyDeleted(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, exists)
 
-	// Missing inputs must retain the record so replay protection can be retried.
+	// Missing inputs must retain the record so replay protection can be retried,
+	// and must do so without failing the cycle: a hard error here would unwind
+	// into PruneWithPartitions, which never retries a non-timeout error, so this
+	// one record would block all pruning permanently.
 	pruneCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err = service.Prune(pruneCtx, 7, "<test-hash>")
-	require.Error(t, err)
-	_, err = client.Get(nil, key)
+	processed, err := service.Prune(pruneCtx, 7, "<test-hash>")
 	require.NoError(t, err)
-
+	require.Equal(t, int64(0), processed)
+	_, err = client.Get(nil, key)
+	require.NoError(t, err, "record with unresolvable inputs must be retained")
 }
 
 // TestMixedExternalAndNormalTransactions tests pruning of both types in one batch

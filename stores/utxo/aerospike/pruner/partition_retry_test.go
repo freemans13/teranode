@@ -24,6 +24,9 @@ func ensurePrometheusMetrics() {
 		prometheusUtxoRecordErrors = prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "test_utxo_pruner_record_errors_total",
 		})
+		prometheusUtxoInputResolutionErrors = prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "test_utxo_pruner_input_resolution_errors_total",
+		})
 		prometheusUtxoBatchQueryError = prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "test_utxo_pruner_batch_query_errors_total",
 		})

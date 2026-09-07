@@ -6,7 +6,9 @@ import (
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -71,4 +73,60 @@ func TestProcessRecordChunk_EmptyInputs(t *testing.T) {
 	require.Equal(t, 1, processed)
 	require.Equal(t, 0, skipped)
 
+}
+
+// TestProcessRecordChunk_MissingExternalTxIsSkippedNotFatal proves that a record
+// whose external blob has vanished is retained on its own without aborting the
+// chunk. Before the fix this returned a ProcessingError, which PruneWithPartitions
+// classifies as a non-timeout error and never retries, so one bad record stopped
+// all pruning permanently.
+func TestProcessRecordChunk_MissingExternalTxIsSkippedNotFatal(t *testing.T) {
+	ctx := context.Background()
+	svc := newChunkTestService(t)
+	svc.external = memory.New()
+
+	var missingTxID, healthyTxID chainhash.Hash
+	for i := range missingTxID {
+		missingTxID[i] = 0x11
+		healthyTxID[i] = 0x22
+	}
+
+	missingKey, keyErr := aerospike.NewKey(svc.namespace, svc.set, missingTxID[:])
+	require.NoError(t, keyErr)
+
+	healthyKey, keyErr := aerospike.NewKey(svc.namespace, svc.set, healthyTxID[:])
+	require.NoError(t, keyErr)
+
+	// Neither the .tx nor the .outputs blob exists for missingTxID, so its input
+	// references cannot be recovered and its parents cannot be marked.
+	exists, err := svc.external.Exists(ctx, missingTxID[:], fileformat.FileTypeOutputs)
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	chunk := []*aerospike.Result{
+		{
+			Record: &aerospike.Record{
+				Key: missingKey,
+				Bins: aerospike.BinMap{
+					svc.fieldTxID:     missingTxID.CloneBytes(),
+					svc.fieldExternal: true,
+				},
+			},
+		},
+		{
+			Record: &aerospike.Record{
+				Key: healthyKey,
+				Bins: aerospike.BinMap{
+					svc.fieldTxID:     healthyTxID.CloneBytes(),
+					svc.fieldInputs:   []interface{}{},
+					svc.fieldExternal: false,
+				},
+			},
+		},
+	}
+
+	processed, skipped, err := svc.processRecordChunk(ctx, 1000, chunk)
+	require.NoError(t, err, "an unresolvable record must not fail the whole chunk")
+	require.Equal(t, 1, processed, "the healthy record in the same chunk must still be pruned")
+	require.Equal(t, 1, skipped, "the unresolvable record must be counted as skipped")
 }

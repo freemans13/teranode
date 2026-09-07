@@ -84,6 +84,7 @@ var (
 	prometheusMetricsInitOnce                 sync.Once
 	prometheusUtxoCleanupBatch                prometheus.Histogram
 	prometheusUtxoRecordErrors                prometheus.Counter
+	prometheusUtxoInputResolutionErrors       prometheus.Counter
 	prometheusUtxoBatchQueryError             prometheus.Counter
 	prometheusUtxoRecordsDeleted              prometheus.Counter
 	prometheusUtxoRecordsDeletedSkipped       prometheus.Counter
@@ -276,6 +277,10 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		prometheusUtxoRecordErrors = promauto.NewCounter(prometheus.CounterOpts{
 			Name: "utxo_pruner_record_errors_total",
 			Help: "Total number of Aerospike record-level errors during pruning",
+		})
+		prometheusUtxoInputResolutionErrors = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_input_resolution_errors_total",
+			Help: "Total number of records retained during pruning because their input references could not be resolved",
 		})
 		prometheusUtxoBatchQueryError = promauto.NewCounter(prometheus.CounterOpts{
 			Name: "utxo_pruner_batch_query_errors_total",
@@ -901,6 +906,10 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 	var recordErrorCount int
 	var firstRecordError error
 
+	// Track records retained because their input references could not be resolved
+	var inputErrorCount int
+	var firstInputError error
+
 	if !s.defensiveEnabled {
 		// Defensive mode disabled - allow all deletions without child verification
 		safetyMap = make(map[string]bool)
@@ -1043,24 +1052,64 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		}
 
 		// Safe to delete - get inputs for parent updates.
+		//
+		// A record whose input references cannot be resolved is retained, not
+		// fatal. Retention is the safe outcome: the record itself carries the
+		// replay protection its parents would otherwise inherit, and the next
+		// prune cycle retries it. Failing the chunk instead would unwind through
+		// partitionWorker into PruneWithPartitions, where a non-TimeoutError is
+		// never retried, so a single unresolvable record would block pruning
+		// node-wide forever.
 		inputs, err := s.getTxInputsFromBins(ctx, blockHeight, rec.Record.Bins, txHash)
 		if err != nil {
-			return 0, 0, err
+			inputErrorCount++
+			if firstInputError == nil {
+				firstInputError = err
+			}
+			prometheusUtxoInputResolutionErrors.Inc()
+			skippedCount++
+
+			continue
 		}
 
 		// Both defensive pruning (master) and the spend path (output page) need
 		// the marker. A probabilistic filter cannot prove either record is absent.
+		// Markers are staged per record and only merged into the chunk-wide map
+		// once every input resolved, so a failure here skips this record alone.
+		recordUpdates := make(map[string]*parentUpdateInfo, len(inputs)*2)
+
+		var updateErr error
+
 		for _, input := range inputs {
 			parentTxID := input.PreviousTxIDChainHash()
 			masterSource := parentTxID.CloneBytes()
-			if err := s.addParentUpdate(allParentUpdates, masterSource, txHash); err != nil {
-				return 0, 0, err
+			if updateErr = s.addParentUpdate(recordUpdates, masterSource, txHash); updateErr != nil {
+				break
 			}
 			pageSource := uaerospike.CalculateKeySource(parentTxID, input.PreviousTxOutIndex, s.utxoBatchSize)
 			if string(pageSource) != string(masterSource) {
-				if err := s.addParentUpdate(allParentUpdates, pageSource, txHash); err != nil {
-					return 0, 0, err
+				if updateErr = s.addParentUpdate(recordUpdates, pageSource, txHash); updateErr != nil {
+					break
 				}
+			}
+		}
+
+		if updateErr != nil {
+			inputErrorCount++
+			if firstInputError == nil {
+				firstInputError = updateErr
+			}
+			prometheusUtxoInputResolutionErrors.Inc()
+			skippedCount++
+
+			continue
+		}
+
+		for source, info := range recordUpdates {
+			if existing, ok := allParentUpdates[source]; ok {
+				existing.childHashes = append(existing.childHashes, info.childHashes...)
+			} else {
+				allParentUpdates[source] = info
 			}
 		}
 
@@ -1101,6 +1150,10 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 	// Report record-level errors once per chunk (avoid log flooding)
 	if recordErrorCount > 0 {
 		s.logger.Errorf("Aerospike record errors in chunk: %d records failed (sample error: %v)", recordErrorCount, firstRecordError)
+	}
+
+	if inputErrorCount > 0 {
+		s.logger.Errorf("Pruner retained %d records in chunk whose input references could not be resolved; they keep their own replay protection and will be retried (sample error: %v)", inputErrorCount, firstInputError)
 	}
 
 	return processedCount, skippedCount, nil
