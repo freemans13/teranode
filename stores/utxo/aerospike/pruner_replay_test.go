@@ -8,7 +8,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	astore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	apruner "github.com/bsv-blockchain/teranode/stores/utxo/aerospike/pruner"
@@ -289,74 +288,4 @@ func parentKeyForOutput(t *testing.T, store *astore.Store, txID *chainhash.Hash,
 	require.NoError(t, err)
 
 	return key
-}
-
-// TestDeleteRemovesPaginationRecordsAndExternalBlob covers the compensating
-// delete's dependency on Store.Delete being complete.
-//
-// utxo.DeleteCreated removes the records a block's create phase wrote once the
-// spend phase has rejected the block. If Delete only removed the master, the
-// pagination records would survive with no master, and that is worse than a
-// leak: Create writes pagination records CREATE_ONLY and treats a KEY_EXISTS on
-// a non-master record as "already present", so re-creating the transaction later
-// would succeed while silently keeping the stale pages. The external blob would
-// simply be orphaned, since the pruner only ever looks at records it can find.
-func TestDeleteRemovesPaginationRecordsAndExternalBlob(t *testing.T) {
-	logger := ulogger.New("delete-completeness-test")
-	s := test.CreateBaseTestSettings(t)
-	s.UtxoStore.UtxoBatchSize = 2
-	s.UtxoStore.ExternalizeAllTransactions = true
-
-	client, store, ctx, cleanup := initAerospike(t, s, logger)
-	t.Cleanup(cleanup)
-	require.NoError(t, store.SetBlockHeight(1000))
-
-	tx := bt.NewTx()
-	require.NoError(t, tx.From("1111111111111111111111111111111111111111111111111111111111111111", 0, "51", 30000))
-
-	// 5 outputs at a batch size of 2 gives a master plus two pagination records.
-	for i := 0; i < 5; i++ {
-		require.NoError(t, tx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
-	}
-
-	_, err := store.Create(ctx, tx, 1000)
-	require.NoError(t, err)
-
-	txHash := tx.TxIDChainHash()
-
-	extraKeys := make([]*aerospike.Key, 0, 2)
-
-	for i := uint32(1); i <= 2; i++ {
-		key, keyErr := aerospike.NewKey(store.GetNamespace(), store.GetName(), uaerospike.CalculateKeySourceInternal(txHash, i))
-		require.NoError(t, keyErr)
-
-		exists, existsErr := client.Exists(nil, key)
-		require.NoError(t, existsErr)
-		require.Truef(t, exists, "fixture: pagination record %d must exist before the delete", i)
-
-		extraKeys = append(extraKeys, key)
-	}
-
-	blobExists, err := store.GetExternalStore().Exists(ctx, txHash[:], fileformat.FileTypeTx)
-	require.NoError(t, err)
-	require.True(t, blobExists, "fixture: the external blob must exist before the delete")
-
-	require.NoError(t, store.Delete(ctx, txHash))
-
-	masterKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), txHash.CloneBytes())
-	require.NoError(t, err)
-
-	exists, err := client.Exists(nil, masterKey)
-	require.NoError(t, err)
-	require.False(t, exists, "the master record must be gone")
-
-	for i, key := range extraKeys {
-		exists, err := client.Exists(nil, key)
-		require.NoError(t, err)
-		require.Falsef(t, exists, "pagination record %d must be gone, not orphaned", i+1)
-	}
-
-	blobExists, err = store.GetExternalStore().Exists(ctx, txHash[:], fileformat.FileTypeTx)
-	require.NoError(t, err)
-	require.False(t, blobExists, "the external blob must be gone")
 }

@@ -49,7 +49,7 @@ func DeleteCreated(ctx context.Context, logger ulogger.Logger, store Store, hash
 		hash := hash
 
 		deleteG.Go(func() error {
-			if err := store.Delete(ctx, hash); err != nil {
+			if err := store.DeleteComplete(ctx, hash); err != nil {
 				if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
 					return nil
 				}
