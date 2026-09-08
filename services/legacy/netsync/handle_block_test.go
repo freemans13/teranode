@@ -1189,6 +1189,9 @@ func newChunkingTestSetup(t *testing.T, totalTxs, batchSize, routines int) (
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 	).Return((*meta.Data)(nil), nil, errors.ErrTxExists)
 
+	// None of the existing records is a locked leftover of an earlier attempt.
+	mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
 	sm := &SyncManager{
 		settings:  tSettings,
 		logger:    logger,

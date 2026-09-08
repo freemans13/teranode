@@ -2110,6 +2110,13 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 
 	const maxRetries = 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// A retried attempt starts from the store's current state: an input
+		// classified idempotent last time may be written fresh this time, and a
+		// stale flag would then keep a spend this call wrote out of the rollback.
+		for _, item := range batch {
+			item.idempotent = false
+		}
+
 		retryable := s.trySendSpendBatch(batch)
 		if !retryable {
 			return

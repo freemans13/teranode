@@ -7,6 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"golang.org/x/sync/errgroup"
 )
@@ -47,18 +48,14 @@ import (
 // whoever put it there and is left alone. The walk is transitive through ghosts
 // only.
 //
-// That last rule has a known, accepted residual. If an earlier attempt at the
-// same block wrote the dependent and then did not reach this compensation - a
-// crash or cancellation anywhere between the create phase and the delete, or
-// a delete that failed past its retries - the dependent already exists when
-// the next attempt starts, answers ErrTxExists to its create phase, and is
-// filed as pre-existing. Nothing in the store distinguishes that leftover from
-// a legitimately pre-existing dependent: its only markers went with the pruned
-// parent, its block ids are the block's own, and its outputs are unspent in
-// both cases. Closing it needs a durable per-transaction mark the stores do not
-// have; until then the leftover is mined with unspent outputs that history
-// already consumed, locked on the blockvalidation path while the block never
-// completes and unlocked on the legacy path.
+// "This attempt created it" includes records an EARLIER attempt at the same
+// block created and never finished with: see LeftoversAmong. Without that, a
+// crash or cancellation between the create phase and this compensation, a
+// delete that failed past its retries, or a create batch the store client
+// re-sent and got KEY_EXISTS back for, left a record that the next attempt
+// filed as pre-existing, and a replay of a chain the pruner removed end to end
+// was then blessed on the strength of it. The callers pass createdHere
+// accordingly.
 //
 // txs need not be in dependency order; the walk repeats until it adds nothing.
 // Every hash in rejected must name a transaction in txs, which holds at both
@@ -114,6 +111,58 @@ func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere fu
 	}
 
 	return result
+}
+
+// LeftoversAmong returns, out of the transactions whose create answered
+// ErrTxExists, the ones an earlier attempt at this same block wrote and never
+// finished with. They must be treated exactly like the records this attempt
+// wrote: their presence proves nothing about prior validation, and if the
+// spend phase rejects them they are ghosts to delete.
+//
+// The durable mark is the lock. Both below-checkpoint block paths create every
+// transaction of a block locked and clear the lock only once the block is
+// committed, so a record that already exists AND is locked at create time is a
+// two-phase write that never completed: this block's own earlier attempt, or a
+// sibling validation of the same block, which comes to the same thing. A
+// legitimately pre-existing mined record is never locked: a mempool
+// transaction is created locked but SetMined clears it when its block is
+// processed, and a block-created record is unlocked by that block's post-commit
+// pass. Read BEFORE the caller's SetMinedMulti for existing transactions, which
+// clears the lock; the caller then leaves leftovers out of that call, which is
+// safe because AssignBlockID is idempotent per block hash, so a leftover already
+// carries this block's id.
+//
+// Two limits, both stated rather than hidden. With the catch-up lock switched
+// off (blockvalidation_quick_validate_skip_utxo_lock) nothing writes the mark,
+// and a leftover is filed as pre-existing again. And conflict resolution locks
+// the parents of a conflicting transaction for the few store round trips of
+// ProcessConflicting; a replay of such a parent's block in exactly that window
+// would misfile it as a leftover, and if its own parent is pruned too it would
+// be deleted. That fails towards a missing record this node will notice when it
+// next validates a spend of it, not towards a double-spendable output.
+func LeftoversAmong(ctx context.Context, store Store, existing []*chainhash.Hash) (map[chainhash.Hash]struct{}, error) {
+	if len(existing) == 0 {
+		return nil, nil
+	}
+
+	unresolved := make([]*UnresolvedMetaData, len(existing))
+	for i, hash := range existing {
+		unresolved[i] = &UnresolvedMetaData{Hash: *hash, Idx: i}
+	}
+
+	if err := store.BatchDecorate(ctx, unresolved, fields.Locked); err != nil {
+		return nil, errors.NewStorageError("[LeftoversAmong] could not read the lock state of %d existing transactions", len(existing), err)
+	}
+
+	leftovers := make(map[chainhash.Hash]struct{})
+
+	for _, item := range unresolved {
+		if item.Data != nil && item.Data.Locked {
+			leftovers[item.Hash] = struct{}{}
+		}
+	}
+
+	return leftovers, nil
 }
 
 // IsPrunedReplayRejection reports whether a spend-phase error identifies the

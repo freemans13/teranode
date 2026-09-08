@@ -20,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
@@ -1726,6 +1727,159 @@ func TestQuickValidateRejectsReplayWhoseParentWasAlsoPruned(t *testing.T) {
 	thief := transactions.Create(t, transactions.WithPrivateKey(privateKey), transactions.WithInput(child, 0), transactions.WithP2PKHOutputs(1, 3999, publicKey))
 	_, _, err = store.SpendAndCreate(ctx, thief, 1401)
 	require.Error(t, err, "C:0 was consumed by G in a confirmed block and must not be spendable again")
+}
+
+// prunedChainEndToEnd builds P -> C -> G where each spends the previous one's
+// only output, mines them, and prunes P and C in one cycle so C's marker goes
+// with P and nothing in the store says C ever existed.
+func prunedChainEndToEnd(t *testing.T, store utxo.Store, seed string) (child, grandchild *bt.Tx, privateKey *bec.PrivateKey, publicKey *bec.PublicKey) {
+	t.Helper()
+
+	sqlStore, ok := store.(*sql.Store)
+	require.True(t, ok)
+
+	sql.ResetPrunerServiceForTests()
+	t.Cleanup(sql.ResetPrunerServiceForTests)
+
+	ctx := context.Background()
+	require.NoError(t, store.SetBlockHeight(1002))
+
+	privateKey, publicKey = bec.PrivateKeyFromBytes([]byte(seed))
+
+	parent := transactions.Create(t, transactions.WithCoinbaseData(1, "/p/"), transactions.WithP2PKHOutputs(1, 5000, publicKey))
+	mineTxs(t, store, 1000, parent)
+
+	child = transactions.Create(t, transactions.WithPrivateKey(privateKey), transactions.WithInput(parent, 0), transactions.WithP2PKHOutputs(1, 4000, publicKey))
+	mineTxs(t, store, 1001, child)
+
+	grandchild = transactions.Create(t, transactions.WithPrivateKey(privateKey), transactions.WithInput(child, 0), transactions.WithP2PKHOutputs(1, 3000, publicKey))
+	mineTxs(t, store, 1002, grandchild)
+
+	prunerService, err := sqlStore.GetPrunerService()
+	require.NoError(t, err)
+	pruned, err := prunerService.Prune(ctx, 1300, "pruned-chain-end-to-end")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), pruned, "fixture: P and C are pruned in one cycle")
+
+	var markers int
+	require.NoError(t, sqlStore.RawDB().QueryRowContext(ctx, "SELECT COUNT(*) FROM deleted_children").Scan(&markers))
+	require.Equal(t, 0, markers, "fixture: no marker survives once the parent is pruned too")
+
+	return child, grandchild, privateKey, publicKey
+}
+
+// TestQuickValidateLeftoverOfInterruptedAttemptIsNotBlessedOnRetry: attempt 1 at
+// a block replaying a fully pruned chain writes the child in phase 1 and dies
+// before the spend phase. The leftover is still locked. Attempt 2 finds it
+// (ErrTxExists) and must treat it as its own, not as a pre-existing child of a
+// pruned parent: it is a ghost to reject and delete, not a record to bless.
+// Three routes leave the leftover; the create-only one is the smallest.
+func TestQuickValidateLeftoverOfInterruptedAttemptIsNotBlessedOnRetry(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	child, _, privateKey, publicKey := prunedChainEndToEnd(t, store, "QUICK_VALIDATE_LEFTOVER_KEY")
+
+	// Attempt 1, phase 1 only: exactly what createAndSpendUTXOsForBatch writes
+	// for a locked below-checkpoint block, then the process dies.
+	_, _, err := store.SpendAndCreate(ctx, child, 1400, utxo.WithCreateOnly(),
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1400, BlockHeight: 1400}), utxo.WithLocked(true))
+	require.NoError(t, err)
+
+	meta, err := store.Get(ctx, child.TxIDChainHash(), fields.Locked)
+	require.NoError(t, err)
+	require.True(t, meta.Locked, "precondition: the leftover is locked")
+
+	// Attempt 2.
+	block, batch := replayBatch(child)
+
+	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err, "the retry must not validate a replay of a fully pruned chain")
+	require.ErrorIs(t, err, errors.ErrTxNotFound)
+
+	_, err = store.Get(ctx, child.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the leftover must be removed, not blessed")
+
+	thief := transactions.Create(t, transactions.WithPrivateKey(privateKey), transactions.WithInput(child, 0), transactions.WithP2PKHOutputs(1, 3999, publicKey))
+	_, _, err = store.SpendAndCreate(ctx, thief, 1401)
+	require.Error(t, err, "C:0 was consumed in a confirmed block and must not be spendable again")
+}
+
+// TestQuickValidateLeftoverAfterFailedDeleteIsNotBlessedOnRetry is the same
+// through the route that needs no crash: attempt 1 runs in full but its
+// compensating delete fails past its retries.
+func TestQuickValidateLeftoverAfterFailedDeleteIsNotBlessedOnRetry(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	child, _, privateKey, publicKey := prunedChainEndToEnd(t, store, "QUICK_VALIDATE_LEFTOVER_DELETE_KEY")
+
+	flaky := &failingDeleteStore{Store: store}
+	bv.utxoStore = flaky
+
+	block, batch := replayBatch(child)
+
+	flaky.failing.Store(true)
+
+	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "could not be removed")
+
+	_, err = store.Get(ctx, child.TxIDChainHash())
+	require.NoError(t, err, "precondition: the ghost is left behind")
+
+	flaky.failing.Store(false)
+
+	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err, "the retry must not validate a replay of a fully pruned chain")
+	require.ErrorIs(t, err, errors.ErrTxNotFound)
+
+	_, err = store.Get(ctx, child.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the leftover must be removed on the retry")
+
+	thief := transactions.Create(t, transactions.WithPrivateKey(privateKey), transactions.WithInput(child, 0), transactions.WithP2PKHOutputs(1, 3999, publicKey))
+	_, _, err = store.SpendAndCreate(ctx, thief, 1401)
+	require.Error(t, err, "C:0 was consumed in a confirmed block and must not be spendable again")
+}
+
+// TestQuickValidateLeftoverDependentIsRemovedOnRetry: attempt 1 wrote both the
+// root and its dependent and died. On the retry the root is rejected on its
+// marker; the dependent, which spends the recreated root, must be recognised as
+// the earlier attempt's own write and removed with it, not filed as
+// pre-existing, unlocked by phase 1.5 and left with an output history consumed.
+func TestQuickValidateLeftoverDependentIsRemovedOnRetry(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+
+	for _, tx := range []*bt.Tx{f.child, f.grandchild} {
+		_, _, err := store.SpendAndCreate(ctx, tx, 1400, utxo.WithCreateOnly(),
+			utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1400, BlockHeight: 1400}), utxo.WithLocked(true))
+		require.NoError(t, err)
+	}
+
+	block, batch := replayBatch(f.child, f.grandchild, f.sibling)
+
+	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "spending transaction was pruned")
+
+	for _, hash := range []*chainhash.Hash{f.child.TxIDChainHash(), f.grandchild.TxIDChainHash()} {
+		_, err = store.Get(ctx, hash)
+		require.ErrorIs(t, err, errors.ErrTxNotFound, "both leftovers must be removed")
+	}
+
+	thief := transactions.Create(t, transactions.WithPrivateKey(f.privateKey), transactions.WithInput(f.grandchild, 0), transactions.WithP2PKHOutputs(1, 1999, f.publicKey))
+	_, _, err = store.SpendAndCreate(ctx, thief, 1401)
+	require.Error(t, err, "D:0 was consumed by E in a confirmed block and must not be spendable again")
+
+	meta, err := store.Get(ctx, f.sibling.TxIDChainHash())
+	require.NoError(t, err, "the valid sibling survives")
+	require.NotNil(t, meta)
 }
 
 // failingDeleteStore fails DeleteComplete while failing is set. Everything else

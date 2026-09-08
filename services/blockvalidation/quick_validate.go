@@ -1314,6 +1314,30 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		return err
 	}
 
+	// Records an earlier attempt at this block wrote and never finished with are
+	// ours, not pre-existing: they are still locked (utxo.LeftoversAmong). Read
+	// before phase 1.5, which clears the lock, and left out of it, since
+	// AssignBlockID is idempotent per block hash so they already carry this
+	// block's id.
+	leftovers, err := utxo.LeftoversAmong(ctx, u.utxoStore, existingTxHashes)
+	if err != nil {
+		return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] failed to classify %d existing txs", block.Hash().String(), len(existingTxHashes), err)
+	}
+
+	if len(leftovers) > 0 {
+		u.logger.Warnf("[createAndSpendUTXOsForBatch][%s] %d of %d existing transactions are locked leftovers of an earlier attempt at this block", block.Hash().String(), len(leftovers), len(existingTxHashes))
+
+		kept := existingTxHashes[:0]
+
+		for _, txHash := range existingTxHashes {
+			if _, leftover := leftovers[*txHash]; !leftover {
+				kept = append(kept, txHash)
+			}
+		}
+
+		existingTxHashes = kept
+	}
+
 	// Phase 1.5: Update mined info for transactions that already existed
 	// This handles the case where a previous attempt created UTXOs with a different
 	// block ID. Chunked via the shared helper (issue 936): on a fat-batch retry every tx
@@ -1340,6 +1364,10 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// wrote is not proof of prior validation, and the compensation below only
 	// removes dependents this attempt wrote.
 	createdHere := func(txHash *chainhash.Hash) bool {
+		if _, leftover := leftovers[*txHash]; leftover {
+			return true
+		}
+
 		_, existed := existingTxSet[*txHash]
 
 		return !existed
