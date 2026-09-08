@@ -1608,34 +1608,22 @@ func (s *Service) addParentUpdate(updates map[string]*parentUpdateInfo, source [
 	return nil
 }
 
-// addParentUpdatesForInput queues the marker writes one spent outpoint needs.
+// addParentUpdatesForInput queues the one marker write a spent outpoint needs:
+// on the output PAGE that holds this vout, which is the record the spend path
+// reads (uaerospike.CalculateKeySource, the same key Lua's spend targets).
 //
-// The record the spend path reads is the output PAGE that holds this vout, so
-// that key is always written. The master record is written as well only in
-// defensive mode, where the pruner scans records and reads deletedChildren off
-// whichever record it scanned. In the deployed configuration
-// (pruner_utxoDefensiveEnabled = false) the master copy is read by nothing
-// whenever it differs from the page key - the Lua spend reads the page record it
-// targets, and the pruner does not even request the deletedChildren bin - while
-// still accumulating ~70 bytes per pruned child on a record that never shrinks.
-// A high fan-out parent would eventually cross write-block-size and every later
-// prune cycle would fail on the same RECORD_TOO_BIG.
+// No copy goes on the master record. When the page differs from the master
+// (vout >= utxoBatchSize) nothing reads a master entry in either defensive mode:
+// the Lua spend reads the page it targets, and the defensive scan matches
+// deletedChildren against the scanned record's own utxos bin, which on the master
+// holds outputs 0..utxoBatchSize-1 only (splitIntoBatches), so a child of a
+// higher output is never named there. What the copy did do was accumulate ~70
+// bytes per pruned child on a record that never shrinks; a 16k-output parent
+// crossed write-block-size at roughly 15k children and every later marker write
+// to it failed with RECORD_TOO_BIG. Page-only marking bounds each record to one
+// entry per output it actually holds.
 func (s *Service) addParentUpdatesForInput(updates map[string]*parentUpdateInfo, parentTxID *chainhash.Hash, vout uint32, childHash *chainhash.Hash) error {
-	pageSource := uaerospike.CalculateKeySource(parentTxID, vout, s.utxoBatchSize)
-	if err := s.addParentUpdate(updates, pageSource, childHash); err != nil {
-		return err
-	}
-
-	if !s.defensiveEnabled {
-		return nil
-	}
-
-	masterSource := parentTxID.CloneBytes()
-	if string(masterSource) == string(pageSource) {
-		return nil
-	}
-
-	return s.addParentUpdate(updates, masterSource, childHash)
+	return s.addParentUpdate(updates, uaerospike.CalculateKeySource(parentTxID, vout, s.utxoBatchSize), childHash)
 }
 
 // flushCleanupBatches persists replay protection before removing children, and

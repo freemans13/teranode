@@ -111,20 +111,15 @@ func TestAddParentUpdatesForInput(t *testing.T) {
 
 	require.NotEqual(t, masterKey, pageKey, "fixture must use a vout past the first page")
 
-	t.Run("non-defensive writes only the page the spend path reads", func(t *testing.T) {
-		updates := map[string]*parentUpdateInfo{}
-		require.NoError(t, newService(false).addParentUpdatesForInput(updates, &parent, 300, &child))
-		require.Len(t, updates, 1)
-		require.Contains(t, updates, pageKey)
-		require.NotContains(t, updates, masterKey, "the master copy is read by nothing when it differs, and grows without bound")
-	})
-
-	t.Run("defensive also writes the master the pruner scans", func(t *testing.T) {
-		updates := map[string]*parentUpdateInfo{}
-		require.NoError(t, newService(true).addParentUpdatesForInput(updates, &parent, 300, &child))
-		require.Len(t, updates, 2)
-		require.Contains(t, updates, pageKey)
-		require.Contains(t, updates, masterKey)
+	t.Run("either mode writes only the page the spend path reads", func(t *testing.T) {
+		for _, defensive := range []bool{false, true} {
+			updates := map[string]*parentUpdateInfo{}
+			require.NoError(t, newService(defensive).addParentUpdatesForInput(updates, &parent, 300, &child))
+			require.Len(t, updates, 1)
+			require.Contains(t, updates, pageKey)
+			require.NotContains(t, updates, masterKey,
+				"the master holds outputs 0..batchSize-1 only, so a marker for a higher output is read by nothing there and grows the record without bound")
+		}
 	})
 
 	t.Run("first page needs one write in either mode", func(t *testing.T) {
@@ -148,7 +143,7 @@ func TestAddParentUpdatesForInput(t *testing.T) {
 			require.NoError(t, s.addParentUpdatesForInput(updates, &parent, vout, &child))
 		}
 
-		require.Len(t, updates, 79, "one entry per output page, plus the master")
+		require.Len(t, updates, 79, "one entry per output page (page 0 is the master)")
 
 		for source, info := range updates {
 			require.Lenf(t, info.childHashes, 1, "parent record %x queued %d copies of the same child", source, len(info.childHashes))
