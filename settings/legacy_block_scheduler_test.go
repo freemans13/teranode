@@ -22,8 +22,22 @@ func TestLegacyBlockScheduler_Defaults(t *testing.T) {
 		"default must be svnode's MAX_BLOCKS_IN_TRANSIT_PER_PEER of 16")
 	require.Equal(t, 1024, tSettings.Legacy.BlockDownloadWindow,
 		"default must be svnode's DEFAULT_BLOCK_DOWNLOAD_WINDOW of 1024")
-	require.Zero(t, tSettings.Legacy.BlockDownloadLowerWindow,
-		"the lookahead limit ships off, which is what svnode does when pruning is not enabled")
+	// This used to assert zero, on the reading that svnode leaves its lower
+	// window off unless pruning is enabled. That is not what svnode does.
+	// init.cpp:2463 sets the lower window to DEFAULT_BLOCK_DOWNLOAD_LOWER_WINDOW
+	// (10) only when -prune is set, and to the FULL download window (1024)
+	// otherwise, so an unpruned svnode is always bounded at 1024 blocks above
+	// its connected tip. There is no configuration in which it reads ahead
+	// without a tip-relative limit.
+	//
+	// 128 rather than 1024 because the byte budget beside it is what actually
+	// bounds the park, and this only has to stay clear of the fan-out: eight
+	// peers at legacy_maxBlocksInTransitPerPeer each cannot use more than 128
+	// blocks of depth, so this never constrains parallel download.
+	require.Equal(t, 128, tSettings.Legacy.BlockDownloadLowerWindow,
+		"read-ahead is bounded by height as well as by bytes; svnode is never unbounded here")
+	require.Equal(t, int64(32*1024*1024*1024), tSettings.Legacy.BlockDownloadMaxBytes,
+		"and by bytes, which is the unit that matters once a block can be a gigabyte")
 }
 
 // TestLegacyBlockScheduler_LoaderReadsOverrides catches the field-exists-but-the-

@@ -239,8 +239,21 @@ type blockPark struct {
 	// commits blocks in order.
 	storeTimeout time.Duration
 
-	mu       sync.Mutex
-	entries  map[chainhash.Hash]*parkedBlock
+	mu      sync.Mutex
+	entries map[chainhash.Hash]*parkedBlock
+	// charged is what each block has been billed to the byte budget, by hash.
+	//
+	// bytes used to be moved by hand at four sites, two of which subtracted a
+	// size the CALLER supplied, so a block settled twice was subtracted twice
+	// and a block restored without being re-billed was never subtracted at all.
+	// Neither shows up as an error: the running total simply drifts, and the
+	// floor at zero swallows the evidence. Mainnet's counter read 14.7 GB
+	// against 9.2 GB actually on disk.
+	//
+	// Billing per hash makes both impossible rather than unlikely. A charge is
+	// recorded once, a release subtracts exactly what was recorded, and both are
+	// idempotent, so bytes is the sum of this map by construction.
+	charged  map[chainhash.Hash]int64
 	children map[chainhash.Hash][]chainhash.Hash
 	bytes    int64
 }
@@ -293,6 +306,7 @@ func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blo
 		storeTimeout: storeTimeout,
 		entries:      make(map[chainhash.Hash]*parkedBlock),
 		children:     make(map[chainhash.Hash][]chainhash.Hash),
+		charged:      make(map[chainhash.Hash]int64),
 	}
 }
 
@@ -463,7 +477,7 @@ func (p *blockPark) Admit(entry parkedBlock, msgBlock *wire.MsgBlock) (parkedBlo
 	// sweep recovers it. What keeps that safe is the flag rather than the
 	// entry's absence: every reader refuses an entry whose bytes are not on
 	// disk yet.
-	p.bytes += entry.size
+	p.chargeLocked(entry.hash, entry.size)
 
 	stored := entry
 	p.entries[entry.hash] = &stored
@@ -537,12 +551,7 @@ func (p *blockPark) Abandon(entry parkedBlock) {
 
 	delete(p.entries, entry.hash)
 	p.removeChildLocked(entry.prevBlock, entry.hash)
-
-	p.bytes -= entry.size
-	if p.bytes < 0 {
-		p.bytes = 0
-	}
-
+	p.releaseLocked(entry.hash)
 	p.setGauges()
 }
 
@@ -732,6 +741,12 @@ func (p *blockPark) Restore(entry parkedBlock) {
 	stored := entry
 	p.entries[entry.hash] = &stored
 	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+
+	// Re-bill if the path that took this block gave its charge back. Whether it
+	// did depends on which path that was, and asking here rather than at each
+	// call site is the point: the charge is a property of the block, not of the
+	// route it travelled.
+	p.chargeLocked(entry.hash, entry.size)
 	p.setGauges()
 }
 
@@ -778,10 +793,7 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	}
 
 	p.mu.Lock()
-	p.bytes -= entry.size
-	if p.bytes < 0 {
-		p.bytes = 0
-	}
+	p.releaseLocked(entry.hash)
 	p.setGauges()
 	p.mu.Unlock()
 
@@ -946,6 +958,49 @@ func (p *blockPark) removeChildLocked(parent, child chainhash.Hash) {
 
 	if len(p.children[parent]) == 0 {
 		delete(p.children, parent)
+	}
+}
+
+// chargeLocked bills a block to the byte budget once. The caller holds mu.
+//
+// Idempotent on purpose: Restore puts back a block that may or may not still be
+// billed, depending on which path took it, and asking that question at every
+// call site is how the old accounting drifted.
+func (p *blockPark) chargeLocked(hash chainhash.Hash, size int64) {
+	if _, ok := p.charged[hash]; ok {
+		return
+	}
+
+	// Lazily, because a blockPark built as a struct literal — which several
+	// tests do — has no map, and a park that cannot bill is worse than one that
+	// allocates late.
+	if p.charged == nil {
+		p.charged = make(map[chainhash.Hash]int64)
+	}
+
+	p.charged[hash] = size
+	p.bytes += size
+}
+
+// releaseLocked gives back exactly what a block was billed, and nothing if it
+// was not billed at all. The caller holds mu.
+func (p *blockPark) releaseLocked(hash chainhash.Hash) {
+	size, ok := p.charged[hash]
+	if !ok {
+		return
+	}
+
+	delete(p.charged, hash)
+
+	p.bytes -= size
+
+	// Unreachable now that every charge and release goes through this pair, and
+	// kept as an alarm rather than a cushion: a floor that silently absorbs a
+	// negative total is what let the old drift run unnoticed.
+	if p.bytes < 0 {
+		p.logger.Warnf("[blockPark] byte accounting went negative after releasing %s; this is a bug", hash)
+
+		p.bytes = 0
 	}
 }
 
@@ -1127,7 +1182,7 @@ func (p *blockPark) Recover(ctx context.Context) {
 		stored := entry
 		p.entries[entry.hash] = &stored
 		p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
-		p.bytes += size
+		p.chargeLocked(entry.hash, size)
 		p.setGauges()
 		p.mu.Unlock()
 

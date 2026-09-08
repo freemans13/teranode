@@ -3772,6 +3772,51 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	assigner.send(sm)
 }
 
+// readAheadBudgetExhausted reports whether this node is already holding, or is
+// already owed, as many bytes of blocks as it is allowed to read ahead.
+//
+// The height ceiling beside it counts BLOCKS, which is the wrong unit once a
+// block can be a gigabyte: the same window is 200 MB in 2015 and a terabyte in
+// 2022. SV Node has only the block count, and gets away with it because storing
+// an early block costs it one ordinary disk write into the same file an in-order
+// block goes to. Here an early block is held in the park until everything below
+// it lands, so the bytes are what has to be bounded.
+//
+// Both halves are needed. Parked bytes are what is already on disk; bytes in
+// flight are what is about to be, and leaving them out lets one round request
+// far past the budget and only discover it on delivery, after the merkle
+// rebuild has already been paid for.
+//
+// The in-flight half is an estimate and cannot be anything else: a block's size
+// is not known until it arrives. The rolling average of recently delivered
+// blocks is the best available reading and is the same one the per-peer
+// in-flight cap is derived from, so the two agree about what a block costs.
+func (sm *SyncManager) readAheadBudgetExhausted() bool {
+	if sm.settings == nil {
+		return false
+	}
+
+	budget := sm.settings.Legacy.BlockDownloadMaxBytes
+	if budget <= 0 {
+		return false
+	}
+
+	held := sm.blockPark.Bytes()
+
+	var owed int64
+	if sm.blockSizeTracker != nil {
+		owed = int64(sm.blockDownloads.Len()) * sm.blockSizeTracker.getAverageSize()
+	}
+
+	if held+owed < budget {
+		return false
+	}
+
+	sm.logger.Debugf("[fetchHeaderBlocks] read-ahead budget reached: %d parked plus %d owed against %d, holding the walk", held, owed, budget)
+
+	return true
+}
+
 // lookaheadCeilingLocked returns the highest block height this round may ask for,
 // and whether there is a limit at all. The caller must hold headerMu.
 //
@@ -3832,6 +3877,13 @@ func (sm *SyncManager) snapshotHeaderCandidates(limit int) (hashes []chainhash.H
 
 	anchor = sm.startHeader
 	if anchor == nil {
+		return nil, nil, chainhash.Hash{}, false
+	}
+
+	// Asked once rather than per header: it is a property of the node, not of
+	// the header being considered. Returning nothing leaves the cursor exactly
+	// where it is, which is the same shape as running out of peer budget.
+	if sm.readAheadBudgetExhausted() {
 		return nil, nil, chainhash.Hash{}, false
 	}
 
