@@ -7,9 +7,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
-	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/bsv-blockchain/teranode/util"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -51,9 +49,7 @@ import (
 //
 // txs need not be in dependency order; the walk repeats until it adds nothing.
 // Every hash in rejected must name a transaction in txs, which holds at both
-// call sites because the rejections came from spending exactly that list; the
-// transactions are returned rather than their hashes because DeleteCreated needs
-// their inputs.
+// call sites because the rejections came from spending exactly that list.
 func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere func(*chainhash.Hash) bool) []*bt.Tx {
 	if len(rejected) == 0 {
 		return nil
@@ -118,34 +114,41 @@ func spendsAny(tx *bt.Tx, set map[chainhash.Hash]struct{}) bool {
 	return false
 }
 
-// deleteCreatedAttempts and deleteCreatedBackoff bound the retry of each store
-// call the compensation makes. A record left behind here is the ghost this
-// package exists to remove, and for a dependent of a pruned replay the next
-// attempt cannot tell the leftover from a legitimately pre-existing record (see
+// deleteCreatedAttempts and deleteCreatedBackoff bound the retry of one
+// compensating delete. A record left behind here is the ghost this package
+// exists to remove, and for a dependent of a pruned replay the next attempt
+// cannot tell the leftover from a legitimately pre-existing record (see
 // PrunedReplayGhosts), so the in-band retry is the only chance to finish the job.
 const (
 	deleteCreatedAttempts = 3
 	deleteCreatedBackoff  = 100 * time.Millisecond
 )
 
-// DeleteCreated removes the ghosts PrunedReplayGhosts found, and first releases
-// every output they spent that survives them.
+// DeleteCreated removes the ghosts PrunedReplayGhosts found. It deletes their
+// records and nothing else.
 //
-// Deleting a record does not reverse its input spends. A descendant ghost can
-// have spent a recreated pruned transaction AND an unrelated, perfectly valid
-// output in the same block; removing its record alone leaves that output
-// recorded as spent by a transaction that no longer exists, and the output's
-// real spender is then refused with ErrSpent naming a ghost. So for every ghost,
-// each input whose parent is not itself a ghost is unspent through Store.Unspend
-// before anything is deleted. Both stores match on the spending data, so an
-// output already rolled back, or since taken by another spender, is left alone.
-// Inputs whose parent is a ghost are skipped: that record is about to go, and
-// releasing its outputs would be work on a record nobody will read.
+// In particular it does NOT reverse the ghosts' input spends, and that is the
+// point rather than an omission. A replayed transaction carries the same
+// identity as its original, so a parent output that records the ghost as its
+// spender cannot say whether that spend is the confirmed, historical one or one
+// this attempt just made, and the stores' spender-matched Unspend cannot tell
+// them apart either. Every spend a ghost holds on a surviving output is the
+// historical one:
 //
-// The release runs for every ghost before the first delete. Aerospike's unspend
-// verifies the UTXO hash, which for an outpoint-only replay has to be fetched
-// from the parent through PreviousOutputsDecorate, and a ghost parent must
-// still be there when its ghost child is decorated.
+//   - A rejected transaction's spend of the markered output never committed,
+//     and the store rolls back whatever fresh sibling spends it made in the
+//     same call (needsSpendRollback). What its inputs still record is the
+//     original, confirmed spend, which the marker protects; clearing it would
+//     hand a confirmed output to any new spender, and the marker would not
+//     object because it names only the original child.
+//   - A dependent ghost that spends a surviving output either hit that
+//     output's marker for itself, in which case it was rejected and is a root
+//     above, or the output has no marker for it, which means it was pruned by
+//     code that wrote none and the output has recorded its spend all along, so
+//     the re-spend was idempotent and the record holds the historical spend.
+//
+// Deleting the record and leaving those spends in place is exactly the state
+// a normal prune leaves: a spent parent output naming a child that is gone.
 //
 // A missing record is success: it is gone, which is the outcome asked for. Any
 // other failure is retried, then logged per transaction and reported in
@@ -160,31 +163,6 @@ func DeleteCreated(ctx context.Context, logger ulogger.Logger, store Store, ghos
 
 	if maxWorkers < 1 {
 		maxWorkers = 1
-	}
-
-	ghostSet := make(map[chainhash.Hash]struct{}, len(ghosts))
-	for _, tx := range ghosts {
-		ghostSet[*tx.TxIDChainHash()] = struct{}{}
-	}
-
-	releaseG := new(errgroup.Group)
-	releaseG.SetLimit(maxWorkers)
-
-	for _, tx := range ghosts {
-		tx := tx
-
-		releaseG.Go(func() error {
-			err := retryStoreCall(ctx, func() error { return releaseSurvivingSpends(ctx, store, tx, ghostSet) })
-			if err != nil {
-				logger.Errorf("[DeleteCreated] failed to release the spends of %s after a failed block phase (%d attempts); its record is kept so the spends stay attributable: %v", tx.TxIDChainHash().String(), deleteCreatedAttempts, err)
-			}
-
-			return err
-		})
-	}
-
-	if err := releaseG.Wait(); err != nil {
-		return errors.NewStorageError("[DeleteCreated] could not release the spends of all %d created transaction(s) after a failed block phase", len(ghosts), err)
 	}
 
 	deleteG := new(errgroup.Group)
@@ -215,58 +193,6 @@ func DeleteCreated(ctx context.Context, logger ulogger.Logger, store Store, ghos
 	}
 
 	return nil
-}
-
-// releaseSurvivingSpends unspends every input of ghost whose parent is not in
-// ghostSet. See DeleteCreated for why.
-func releaseSurvivingSpends(ctx context.Context, store Store, ghost *bt.Tx, ghostSet map[chainhash.Hash]struct{}) error {
-	ghostHash := ghost.TxIDChainHash()
-	surviving := make([]int, 0, len(ghost.Inputs))
-	decorate := false
-
-	for vin, input := range ghost.Inputs {
-		if _, isGhost := ghostSet[*input.PreviousTxIDChainHash()]; isGhost {
-			continue
-		}
-
-		surviving = append(surviving, vin)
-
-		if input.PreviousTxScript == nil {
-			decorate = true
-		}
-	}
-
-	if len(surviving) == 0 {
-		return nil
-	}
-
-	// An outpoint-only replay carries no parent script or amount, and the
-	// Aerospike unspend refuses an input whose UTXO hash it cannot verify.
-	if decorate {
-		if err := store.PreviousOutputsDecorate(ctx, ghost); err != nil {
-			return errors.NewStorageError("[DeleteCreated] could not decorate the inputs of %s", ghostHash.String(), err)
-		}
-	}
-
-	spends := make([]*Spend, 0, len(surviving))
-
-	for _, vin := range surviving {
-		input := ghost.Inputs[vin]
-
-		utxoHash, err := util.UTXOHashFromInput(input)
-		if err != nil {
-			return errors.NewProcessingError("[DeleteCreated] could not hash input %d of %s", vin, ghostHash.String(), err)
-		}
-
-		spends = append(spends, &Spend{
-			TxID:         input.PreviousTxIDChainHash(),
-			Vout:         input.PreviousTxOutIndex,
-			UTXOHash:     utxoHash,
-			SpendingData: spendpkg.NewSpendingData(ghostHash, vin),
-		})
-	}
-
-	return store.Unspend(ctx, spends)
 }
 
 // retryStoreCall runs fn up to deleteCreatedAttempts times with a linear

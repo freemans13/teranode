@@ -11,7 +11,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -197,63 +196,24 @@ func TestDeleteCreatedRetriesATransientFailure(t *testing.T) {
 	})
 }
 
-// TestDeleteCreatedReleasesSurvivingSpends: a descendant ghost spent both the
-// recreated pruned transaction and an unrelated, valid output. Deleting its
-// record alone leaves that output recorded as spent by a transaction that no
-// longer exists. The spend of the surviving parent must be released, with the
-// ghost named as the spender so the store's own match protects any other
-// spender; the spend of the ghost parent is skipped because that record goes.
-func TestDeleteCreatedReleasesSurvivingSpends(t *testing.T) {
+// TestDeleteCreatedNeverTouchesSpends pins the design: the compensation deletes
+// records and issues no Unspend and no decorate, because a ghost's spends of
+// surviving outputs are the historical ones and clearing them would hand a
+// confirmed output to a new spender.
+func TestDeleteCreatedNeverTouchesSpends(t *testing.T) {
 	f := newGhostChainFixture(t)
 	ctx := context.Background()
 
-	// D spends C:0 (a ghost) and P:1 (survives).
 	descendant := bt.NewTx()
 	require.NoError(t, descendant.From(f.child.TxID(), 0, f.child.Outputs[0].LockingScript.String(), f.child.Outputs[0].Satoshis))
 	require.NoError(t, descendant.From(f.parent.TxID(), 1, f.parent.Outputs[1].LockingScript.String(), f.parent.Outputs[1].Satoshis))
 	require.NoError(t, descendant.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 7000))
 
-	t.Run("extended inputs are released without a decorate", func(t *testing.T) {
-		store := &flakyDeleteStore{}
-		store.failuresLeft.Store(0)
+	store := &flakyDeleteStore{}
+	store.failuresLeft.Store(0)
 
-		require.NoError(t, DeleteCreated(ctx, ulogger.TestLogger{}, store, []*bt.Tx{f.child, descendant}, 1))
-
-		require.Empty(t, store.decorated, "extended inputs carry the parent script; no decorate needed")
-		require.Len(t, store.unspent, 2, "C's spend of P:0 and D's spend of P:1; D's spend of C:0 is skipped")
-
-		wantHash, err := util.UTXOHashFromOutput(f.parent.TxIDChainHash(), f.parent.Outputs[1], 1)
-		require.NoError(t, err)
-
-		var released *Spend
-
-		for _, spend := range store.unspent {
-			if spend.Vout == 1 {
-				released = spend
-			}
-		}
-
-		require.NotNil(t, released)
-		require.Equal(t, f.parent.TxIDChainHash(), released.TxID)
-		require.Equal(t, wantHash, released.UTXOHash)
-		require.Equal(t, descendant.TxIDChainHash(), released.SpendingData.TxID, "the ghost is named as the spender so the store's match protects any other spender")
-		require.Equal(t, 1, released.SpendingData.Vin)
-
-		require.ElementsMatch(t, []chainhash.Hash{*f.child.TxIDChainHash(), *descendant.TxIDChainHash()}, store.deleted,
-			"end state: both records are gone, after the release")
-	})
-
-	t.Run("outpoint-only inputs are decorated first", func(t *testing.T) {
-		bare := bt.NewTx()
-		bare.Inputs = append(bare.Inputs, &bt.Input{PreviousTxOutIndex: 1, PreviousTxSatoshis: 0})
-		require.NoError(t, bare.Inputs[0].PreviousTxIDAdd(f.parent.TxIDChainHash()))
-		require.NoError(t, bare.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1))
-
-		store := &flakyDeleteStore{}
-		store.failuresLeft.Store(0)
-
-		require.NoError(t, DeleteCreated(ctx, ulogger.TestLogger{}, store, []*bt.Tx{bare}, 1))
-		require.Equal(t, []chainhash.Hash{*bare.TxIDChainHash()}, store.decorated)
-		require.Len(t, store.unspent, 1)
-	})
+	require.NoError(t, DeleteCreated(ctx, ulogger.TestLogger{}, store, []*bt.Tx{f.child, descendant}, 2))
+	require.Empty(t, store.unspent, "no spend may be reversed")
+	require.Empty(t, store.decorated)
+	require.ElementsMatch(t, []chainhash.Hash{*f.child.TxIDChainHash(), *descendant.TxIDChainHash()}, store.deleted)
 }
