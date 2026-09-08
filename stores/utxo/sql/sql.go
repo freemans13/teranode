@@ -2269,6 +2269,19 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			continue
 		}
 
+		// Replay of a transaction the pruner already removed. The marker names
+		// this spender, so it fires whether the output still records the spend,
+		// has been unspent by a rollback, or was never spent by anyone. It is
+		// checked BEFORE the conflicting-spender test below on purpose: once a
+		// rollback has cleared the output and a replacement transaction has taken
+		// it, a replay would otherwise be answered ErrSpent, which the block paths
+		// cannot tell from an ordinary double spend, and the record their create
+		// phase wrote for the replay would never be compensated.
+		if r.childPruned {
+			validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
+			continue
+		}
+
 		// Check if already spent by a different transaction
 		if len(r.spendingDataBytes) > 0 && spend.SpendingData != nil && !bytes.Equal(r.spendingDataBytes, spend.SpendingData.Bytes()) {
 			existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(r.spendingDataBytes)
@@ -2277,15 +2290,6 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				continue
 			}
 			validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
-			continue
-		}
-
-		// Replay of a transaction the pruner already removed. Checked outside the
-		// "still spent by exactly this child" test above: the marker names this
-		// spender, so it fires whether the output still records the spend, has
-		// been unspent by a rollback, or was never spent by anyone.
-		if r.childPruned {
-			validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
 			continue
 		}
 
@@ -2792,6 +2796,14 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 			continue
 		}
 
+		// See the bulk path: the marker names this spender, so an Unspend that
+		// cleared spending_data cannot disarm it, and it takes precedence over
+		// the conflicting-spender answer so a replay is always identifiable.
+		if childPruned {
+			validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
+			continue
+		}
+
 		// Check if already spent by a different transaction
 		if len(spendingDataBytes) > 0 && spend.SpendingData != nil && !bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
 			existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(spendingDataBytes)
@@ -2800,13 +2812,6 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 				continue
 			}
 			validationErrors[i] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
-			continue
-		}
-
-		// See the bulk path: the marker names this spender, so an Unspend that
-		// cleared spending_data cannot disarm it.
-		if childPruned {
-			validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
 			continue
 		}
 

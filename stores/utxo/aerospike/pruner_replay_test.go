@@ -23,8 +23,8 @@ import (
 // TestPrunerReplayProtection exercises real pruning and the same-spender replay path.
 func TestPrunerReplayProtection(t *testing.T) {
 	for _, tc := range []struct {
-		name                                                           string
-		paginated, markerFailure, ttl, unspend, expressions, defensive bool
+		name                                                                    string
+		paginated, markerFailure, ttl, unspend, expressions, defensive, replace bool
 	}{
 		{name: "normal"},
 		{name: "ttl", ttl: true},
@@ -37,6 +37,10 @@ func TestPrunerReplayProtection(t *testing.T) {
 		// firing at the moment a compensating rollback depends on it.
 		{name: "unspent_parent", unspend: true},
 		{name: "paginated_unspent_parent", paginated: true, unspend: true},
+		// After the rollback a replacement transaction takes the output. The
+		// marker must still win over the conflicting-spender answer, or the block
+		// paths cannot identify the replay and its recreated record survives.
+		{name: "replaced_parent", unspend: true, replace: true},
 		// The expression spend path (utxoBatchSize == 1) writes without Lua when
 		// its filter passes. After an unspend the element IS the bare hash, so
 		// the first-seen clause passes; the filter has to consult the marker
@@ -44,6 +48,7 @@ func TestPrunerReplayProtection(t *testing.T) {
 		{name: "expressions", expressions: true},
 		{name: "expressions_unspent_parent", expressions: true, unspend: true},
 		{name: "expressions_paginated_unspent_parent", expressions: true, paginated: true, unspend: true},
+		{name: "expressions_replaced_parent", expressions: true, unspend: true, replace: true},
 		// Defensive mode reads the marker off the scanned record and verifies
 		// each spending child before deleting; the marker set must be the same
 		// page-only set in both modes.
@@ -51,12 +56,12 @@ func TestPrunerReplayProtection(t *testing.T) {
 		{name: "defensive_paginated_parent", defensive: true, paginated: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testPrunerReplayProtection(t, tc.paginated, tc.markerFailure, tc.ttl, tc.unspend, tc.expressions, tc.defensive)
+			testPrunerReplayProtection(t, tc.paginated, tc.markerFailure, tc.ttl, tc.unspend, tc.expressions, tc.defensive, tc.replace)
 		})
 	}
 }
 
-func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, unspendParent, expressions, defensive bool) {
+func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, unspendParent, expressions, defensive, replaceParent bool) {
 	t.Helper()
 	logger := ulogger.New("pruner-replay-test")
 	s := test.CreateBaseTestSettings(t)
@@ -178,9 +183,17 @@ func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, uns
 		require.NoError(t, getErr)
 		require.Contains(t, record.Bins[fields.DeletedChildren.String()], child.TxID(), "unspend must leave the replay marker in place")
 	}
+	if replaceParent {
+		replacement := bt.NewTx()
+		require.NoError(t, replacement.From(parent.TxID(), outputIndex, parent.Outputs[outputIndex].LockingScript.String(), parent.Outputs[outputIndex].Satoshis))
+		require.NoError(t, replacement.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2999))
+		_, _, err = store.SpendAndCreate(ctx, replacement, 1200)
+		require.NoError(t, err, "fixture: the replacement takes the output")
+	}
 
 	_, _, err = store.SpendAndCreate(ctx, child, 1200)
 	require.ErrorIs(t, err, errors.ErrUtxoSpendingTxPruned, "pruned confirmed child must not be recreated")
+	require.NotErrorIs(t, err, errors.ErrSpent, "the marker must win over the conflicting-spender answer")
 	require.Contains(t, err.Error(), "spending transaction was pruned")
 	exists, err := client.Exists(nil, childKey)
 	require.NoError(t, err)
