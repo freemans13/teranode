@@ -1261,9 +1261,12 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// resource usage, allowing multiple batches to be in flight simultaneously.
 	util.SafeSetLimit(u.logger, createG, u.settings.UtxoStore.StoreBatcherSize*8)
 
-	// Track transactions that already exist so we can update their mined info
+	// Track transactions that already exist so we can update their mined info.
+	// They are also the ones the compensating delete below must NOT touch: this
+	// block did not create them.
 	var existingTxsMu sync.Mutex
 	var existingTxHashes []*chainhash.Hash
+	existingTxSet := make(map[chainhash.Hash]struct{})
 
 	minedBlockInfo := utxo.MinedBlockInfo{
 		BlockID:     block.ID,
@@ -1296,6 +1299,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 						txHash := tx.TxIDChainHash()
 						existingTxsMu.Lock()
 						existingTxHashes = append(existingTxHashes, txHash)
+						existingTxSet[*txHash] = struct{}{}
 						existingTxsMu.Unlock()
 						return nil
 					}
@@ -1331,7 +1335,55 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// permanently attributed to a non-canonical tx. Hard-fail instead (fail-closed).
 	// Dirty-restart replay does not need conflict tolerance: re-spending an output
 	// with the same spender is the store's idempotent success path.
-	return u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly)
+	if err := u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly); err != nil {
+		// Compensate phase 1. Create never consults the pruner's replay markers,
+		// so a block replaying a pruned transaction gets all the way through the
+		// create phase and is only rejected here. The record it wrote is stored
+		// mined with no delete_at_height, so nothing reclaims it and the block
+		// can never validate: without this the node is left with a permanently
+		// locked ghost.
+		//
+		// ctx, not the errgroup context: the spend group's context is cancelled
+		// by the time we get here.
+		if deleteErr := utxo.DeleteCreated(ctx, u.logger, u.utxoStore,
+			u.createdInBatch(batch, block, lockUTXOs, existingTxSet),
+			u.settings.UtxoStore.StoreBatcherSize*8); deleteErr != nil {
+			return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] spend phase failed and the created records could not be removed", block.Hash().String(), errors.Join(err, deleteErr))
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+// createdInBatch lists the transactions this batch's create phase actually
+// wrote: every tx it did not skip, minus the ones that were already in the store.
+// Recomputed from the same inputs rather than accumulated during phase 1, so the
+// success path carries no extra allocation.
+func (u *BlockValidation) createdInBatch(batch *SubtreeProcessingBatch, block *model.Block, lockUTXOs bool, existing map[chainhash.Hash]struct{}) []*chainhash.Hash {
+	created := make([]*chainhash.Hash, 0, len(batch.batchTxs))
+
+	batchSize := batch.batchEnd - batch.batchStart
+	for i := 0; i < batchSize; i++ {
+		txRange := batch.txRanges[i]
+		for txIdx := txRange[0]; txIdx < txRange[1]; txIdx++ {
+			tx := batch.batchTxs[txIdx]
+
+			if shouldSkipUnspendableCreate(lockUTXOs, u.settings, tx, block.Height) {
+				continue
+			}
+
+			txHash := tx.TxIDChainHash()
+			if _, ok := existing[*txHash]; ok {
+				continue
+			}
+
+			created = append(created, txHash)
+		}
+	}
+
+	return created
 }
 
 // spendRetryBackoffDefault is the pause between spend retry attempts. Matches the

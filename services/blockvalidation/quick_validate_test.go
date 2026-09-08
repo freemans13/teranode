@@ -1246,3 +1246,89 @@ func TestOutpointOnly_MetricIncrementsBelowOnly(t *testing.T) {
 		require.Equal(t, before, prometheustestutil.ToFloat64(prometheusBlockValidationOutpointOnlyBlocks))
 	})
 }
+
+// TestQuickValidateRemovesCreatesWhenSpendPhaseFails drives the whole ghost
+// scenario end to end on a real store: prune a confirmed child, then feed a
+// block that replays it.
+//
+// createAndSpendUTXOsForBatch creates every transaction first and spends
+// afterwards, and Create does not consult the pruner's replay markers, so the
+// pruned child is recreated in phase 1 and only rejected in phase 2. The record
+// phase 1 wrote is stored mined with no delete_at_height, so nothing reclaims
+// it. The assertion is the store's own answer for that hash after the call, not
+// that a delete was issued.
+func TestQuickValidateRemovesCreatesWhenSpendPhaseFails(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	sqlStore, ok := store.(*sql.Store)
+	require.True(t, ok)
+
+	sql.ResetPrunerServiceForTests()
+	t.Cleanup(sql.ResetPrunerServiceForTests)
+
+	ctx := context.Background()
+	require.NoError(t, store.SetBlockHeight(1002))
+
+	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("QUICK_VALIDATE_COMPENSATION_KEY"))
+
+	parentTx := transactions.Create(t,
+		transactions.WithCoinbaseData(1, "/genesis/"),
+		transactions.WithP2PKHOutputs(2, 5000, publicKey),
+	)
+	_, err := sqlStore.Create(ctx, parentTx, 1000)
+	require.NoError(t, err)
+
+	childTx := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(parentTx, 0),
+		transactions.WithP2PKHOutputs(1, 4000, publicKey),
+	)
+	// The parent is a coinbase, so the child cannot spend it until maturity.
+	_, _, err = store.SpendAndCreate(ctx, childTx, 1001)
+	require.NoError(t, err)
+
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parentTx.TxIDChainHash(), childTx.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+	require.NoError(t, err)
+
+	// The grandchild spends the child's only output, so the child becomes fully
+	// spent and picks up a delete_at_height.
+	grandchildTx := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(childTx, 0),
+		transactions.WithP2PKHOutputs(1, 3000, publicKey),
+	)
+	_, _, err = store.SpendAndCreate(ctx, grandchildTx, 1002)
+	require.NoError(t, err)
+
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{grandchildTx.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1002, BlockHeight: 1002, OnLongestChain: true})
+	require.NoError(t, err)
+
+	prunerService, err := sqlStore.GetPrunerService()
+	require.NoError(t, err)
+
+	pruned, err := prunerService.Prune(ctx, 1300, "quick-validate-compensation")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), pruned)
+
+	_, err = store.Get(ctx, childTx.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the pruner must have removed the child")
+
+	block := &model.Block{Height: 1400, ID: 1400}
+	batch := &SubtreeProcessingBatch{
+		batchTxs:   []*bt.Tx{childTx},
+		txRanges:   [][2]int{{0, 1}},
+		batchStart: 0,
+		batchEnd:   1,
+	}
+
+	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err, "a block replaying a pruned transaction must not validate")
+	require.Contains(t, err.Error(), "spending transaction was pruned")
+
+	_, err = store.Get(ctx, childTx.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound,
+		"the record the create phase wrote must not survive the failed spend phase")
+}

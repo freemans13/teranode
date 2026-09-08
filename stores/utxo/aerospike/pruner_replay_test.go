@@ -12,7 +12,9 @@ import (
 	astore "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	apruner "github.com/bsv-blockchain/teranode/stores/utxo/aerospike/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/stretchr/testify/require"
@@ -21,8 +23,8 @@ import (
 // TestPrunerReplayProtection exercises real pruning and the same-spender replay path.
 func TestPrunerReplayProtection(t *testing.T) {
 	for _, tc := range []struct {
-		name                          string
-		paginated, markerFailure, ttl bool
+		name                                   string
+		paginated, markerFailure, ttl, unspend bool
 	}{
 		{name: "normal"},
 		{name: "ttl", ttl: true},
@@ -30,14 +32,19 @@ func TestPrunerReplayProtection(t *testing.T) {
 		{name: "paginated_parent", paginated: true},
 		{name: "marker_failure", markerFailure: true},
 		{name: "paginated_marker_failure", paginated: true, markerFailure: true},
+		// Unspend resets the utxo to its bare hash and leaves the marker alone,
+		// so a check nested under "still spent by exactly this child" would stop
+		// firing at the moment a compensating rollback depends on it.
+		{name: "unspent_parent", unspend: true},
+		{name: "paginated_unspent_parent", paginated: true, unspend: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testPrunerReplayProtection(t, tc.paginated, tc.markerFailure, tc.ttl)
+			testPrunerReplayProtection(t, tc.paginated, tc.markerFailure, tc.ttl, tc.unspend)
 		})
 	}
 }
 
-func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl bool) {
+func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, unspendParent bool) {
 	t.Helper()
 	logger := ulogger.New("pruner-replay-test")
 	s := test.CreateBaseTestSettings(t)
@@ -142,6 +149,21 @@ func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl bool
 			}
 		}
 	}
+	if unspendParent {
+		utxoHash, hashErr := util.UTXOHashFromOutput(parent.TxIDChainHash(), parent.Outputs[outputIndex], outputIndex)
+		require.NoError(t, hashErr)
+		require.NoError(t, store.Unspend(ctx, []*utxo.Spend{{
+			TxID:         parent.TxIDChainHash(),
+			Vout:         outputIndex,
+			UTXOHash:     utxoHash,
+			SpendingData: spendpkg.NewSpendingData(child.TxIDChainHash(), 0),
+		}}))
+
+		record, getErr := client.Get(nil, parentKeyForOutput(t, store, parent.TxIDChainHash(), outputIndex, s.UtxoStore.UtxoBatchSize))
+		require.NoError(t, getErr)
+		require.Contains(t, record.Bins[fields.DeletedChildren.String()], child.TxID(), "unspend must leave the replay marker in place")
+	}
+
 	_, _, err = store.SpendAndCreate(ctx, child, 1200)
 	require.ErrorIs(t, err, errors.ErrUtxoSpendingTxPruned, "pruned confirmed child must not be recreated")
 	require.Contains(t, err.Error(), "spending transaction was pruned")
@@ -254,4 +276,16 @@ func TestPrunerUnresolvableRecordDoesNotBlockCycle(t *testing.T) {
 	exists, err = client.Exists(nil, brokenKey)
 	require.NoError(t, err)
 	require.True(t, exists)
+}
+
+// parentKeyForOutput returns the Aerospike key of the record that holds a given
+// output of a transaction: the master record for the first page, a pagination
+// record beyond it.
+func parentKeyForOutput(t *testing.T, store *astore.Store, txID *chainhash.Hash, vout uint32, batchSize int) *aerospike.Key {
+	t.Helper()
+
+	key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), uaerospike.CalculateKeySource(txID, vout, batchSize))
+	require.NoError(t, err)
+
+	return key
 }

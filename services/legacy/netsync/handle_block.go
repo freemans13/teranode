@@ -855,7 +855,8 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 	// conflicting subtree node. Computed once and threaded in for the same reason.
 	failClosed := sm.legacyFailClosed(bi.height)
 
-	if err = sm.createUtxos(ctx, txMap, bi, blockID, outpointOnly); err != nil {
+	createdTxHashes, err := sm.createUtxos(ctx, txMap, bi, blockID, outpointOnly)
+	if err != nil {
 		return err
 	}
 
@@ -867,6 +868,18 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 	}
 
 	if err = sm.PreValidateTransactions(ctx, txMap, bi.hash, bi.height, candidateBlockTime, candidateParentMedianTime, outpointOnly, failClosed); err != nil {
+		// Compensate createUtxos. Create never consults the pruner's replay
+		// markers, so a block replaying a pruned transaction gets through the
+		// create phase and is only rejected here. On this path the record is
+		// created without WithLocked, so leaving it behind is worse than on the
+		// blockvalidation path: it is mined, unlocked and spendable even though a
+		// mined grandchild already consumed those outputs, and with no
+		// delete_at_height nothing ever reclaims it.
+		if deleteErr := utxo.DeleteCreated(ctx, sm.logger, sm.utxoStore, createdTxHashes,
+			sm.settings.Legacy.StoreBatcherSize*sm.settings.Legacy.StoreBatcherConcurrency); deleteErr != nil {
+			return errors.NewProcessingError("[validateTransactionsLegacyMode] pre-validation failed and the created records could not be removed", errors.Join(err, deleteErr))
+		}
+
 		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to pre-validate transactions", err)
 	}
 
@@ -1122,7 +1135,12 @@ func candidateParentMedianTimeFromHeaders(parentHash *chainhash.Hash, headers []
 // createUtxos creates all the utxos for the transactions in the block in parallel
 // before any spending is done. This only occurs in legacy mode when we assume the
 // block is valid.
-func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper], bi blockIdent, blockID uint32, outpointOnly bool) (err error) {
+//
+// It returns the transactions it actually wrote, which is every transaction in
+// the block minus the ones that were already in the store. That list is what
+// validateTransactionsLegacyMode hands to utxo.DeleteCreated when the
+// pre-validation phase then rejects the block.
+func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper], bi blockIdent, blockID uint32, outpointOnly bool) (createdTxHashes []*chainhash.Hash, err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "createUtxos",
 		tracing.WithLogMessage(sm.logger, "[createUtxos] called for block %s / height %d", bi.hash, bi.height),
 		tracing.WithHistogram(prometheusLegacyNetsyncCreateUtxos),
@@ -1164,6 +1182,7 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	var (
 		existingTxsMu    sync.Mutex
 		existingTxHashes []*chainhash.Hash
+		createdMu        sync.Mutex
 	)
 
 	// create all the utxos first
@@ -1195,13 +1214,17 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 				return err
 			}
 
+			createdMu.Lock()
+			createdTxHashes = append(createdTxHashes, &txHash)
+			createdMu.Unlock()
+
 			return nil
 		})
 	}
 
 	// wait for all utxos to be created
 	if err = g.Wait(); err != nil {
-		return errors.NewProcessingError("failed to create utxos", err)
+		return nil, errors.NewProcessingError("failed to create utxos", err)
 	}
 
 	// Merge our blockID into any tx that already existed. Without this, those txs
@@ -1220,11 +1243,11 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 
 		if err = utxo.SetMinedMultiChunked(ctx, sm.logger, sm.utxoStore, existingTxHashes, minedBlockInfo,
 			sm.settings.UtxoStore.MaxMinedBatchSize, sm.settings.UtxoStore.MaxMinedRoutines); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	return nil
+	return createdTxHashes, nil
 }
 
 // reuseBlockIDFromUTXO returns an already-recorded block id for this block by

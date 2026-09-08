@@ -382,26 +382,38 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
             end
         end
 
+        -- Reject a replay of a transaction the pruner already removed.
+        --
+        -- Keyed on the INCOMING spender, not on what this utxo currently
+        -- records, and checked before the already-spent handling below. Nesting
+        -- it under bytes_equal(existingSpendingData, spendingData) let unspend
+        -- disarm it: unspend resets the utxo to its bare hash and deliberately
+        -- leaves BIN_DELETED_CHILDREN alone, so the marker survived but matched
+        -- nothing. Matching the spender means the rejection survives any
+        -- rollback of the spend it protects.
+        if deletedChildren ~= nil and spendingData ~= nil then
+            local childTxID = spendingDataBytesToTxHex(spendingData)
+            if deletedChildren[childTxID] then
+                local error = map()
+
+                error[FIELD_ERROR_CODE] = ERROR_CODE_INVALID_SPEND
+                error[FIELD_MESSAGE] = MSG_INVALID_SPEND
+
+                if existingSpendingData then
+                    error[FIELD_SPENDING_DATA] = spendingDataBytesToHex(existingSpendingData)
+                end
+
+                errors[idx] = error
+
+                goto continue
+            end
+        end
+
         -- Handle already spent UTXO
         if existingSpendingData then
 
             if bytes_equal(existingSpendingData, spendingData) then
                 -- Already spent with same data
-
-                if deletedChildren ~= nil then
-                    -- Check whether this child tx (by txid) exists in the deletedChildren map, if yes, error out
-                    local childTxID = spendingDataBytesToTxHex(existingSpendingData)
-                    if deletedChildren[childTxID] then
-                        local error = map()
-
-                        error[FIELD_ERROR_CODE] = ERROR_CODE_INVALID_SPEND
-                        error[FIELD_MESSAGE] = MSG_INVALID_SPEND
-                        error[FIELD_SPENDING_DATA] = spendingDataBytesToHex(existingSpendingData)
-
-                        errors[idx] = error
-                    end
-                end
-
                 goto continue
             elseif isFrozen(existingSpendingData) then
                 local error = map()

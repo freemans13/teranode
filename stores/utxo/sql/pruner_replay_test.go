@@ -9,6 +9,8 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -255,6 +257,99 @@ func TestPrunedReplayRollsBackSiblingSpends(t *testing.T) {
 			require.NoError(t, store.db.QueryRowContext(ctx,
 				"SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", child.TxIDChainHash()[:]).Scan(&childExists))
 			require.False(t, childExists, "the pruned child must not be recreated")
+		})
+	}
+}
+
+// TestPrunedReplayRejectedAfterUnspend pins the marker's lifetime against the
+// rollback path. Unspend clears the parent output's spending_data and
+// deliberately leaves deleted_children alone, so a check nested inside "still
+// spent by exactly this child" would silently stop firing at the moment a
+// compensating rollback depends on it. The check keys on the incoming spender
+// instead, so it survives.
+func TestPrunedReplayRejectedAfterUnspend(t *testing.T) {
+	for _, backend := range []string{"sqlite", "postgres"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var store *Store
+
+			if backend == "postgres" {
+				store, ctx = setupPostgresStore(t)
+			} else {
+				store, _ = setup(ctx, t)
+			}
+
+			ResetPrunerServiceForTests()
+			t.Cleanup(ResetPrunerServiceForTests)
+			require.NoError(t, store.SetBlockHeight(1000))
+
+			parent := bt.NewTx()
+			require.NoError(t, parent.From("1111111111111111111111111111111111111111111111111111111111111111", 0, "51", 30000))
+			parent.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+			require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+			require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+			_, err := store.Create(ctx, parent, 1000)
+			require.NoError(t, err)
+
+			child := bt.NewTx()
+			require.NoError(t, child.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+			child.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+			require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+			_, _, err = store.SpendAndCreate(ctx, child, 1000)
+			require.NoError(t, err)
+
+			_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash(), child.TxIDChainHash()},
+				utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+			require.NoError(t, err)
+
+			grandchild := bt.NewTx()
+			require.NoError(t, grandchild.From(child.TxID(), 0, child.Outputs[0].LockingScript.String(), child.Outputs[0].Satoshis))
+			grandchild.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+			require.NoError(t, grandchild.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2000))
+			_, _, err = store.SpendAndCreate(ctx, grandchild, 1001)
+			require.NoError(t, err)
+
+			_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{grandchild.TxIDChainHash()},
+				utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+			require.NoError(t, err)
+
+			svc, err := store.GetPrunerService()
+			require.NoError(t, err)
+			n, err := svc.Prune(ctx, 1300, "unspend-then-replay")
+			require.NoError(t, err)
+			require.Equal(t, int64(1), n)
+
+			// Roll the parent output's spend back through the real Unspend, the
+			// path unspendWithRetry takes after a failed create.
+			utxoHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(), parent.Outputs[0], 0)
+			require.NoError(t, err)
+			require.NoError(t, store.Unspend(ctx, []*utxo.Spend{{
+				TxID:         parent.TxIDChainHash(),
+				Vout:         0,
+				UTXOHash:     utxoHash,
+				SpendingData: spendpkg.NewSpendingData(child.TxIDChainHash(), 0),
+			}}))
+
+			var stillSpent bool
+			require.NoError(t, store.db.QueryRowContext(ctx,
+				"SELECT spending_data IS NOT NULL FROM outputs WHERE idx = 0 AND transaction_id IN (SELECT id FROM transactions WHERE hash = $1)",
+				parent.TxIDChainHash()[:]).Scan(&stillSpent))
+			require.False(t, stillSpent, "fixture: the unspend must actually have cleared spending_data")
+
+			var markers int
+			require.NoError(t, store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM deleted_children").Scan(&markers))
+			require.Equal(t, 1, markers, "Unspend must leave the replay marker in place")
+
+			_, _, err = store.SpendAndCreate(ctx, child, 1200)
+			require.ErrorIs(t, err, errors.ErrUtxoSpendingTxPruned,
+				"the marker must still reject the pruned child once its spend has been rolled back")
+
+			var exists bool
+			require.NoError(t, store.db.QueryRowContext(ctx,
+				"SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", child.TxIDChainHash()[:]).Scan(&exists))
+			require.False(t, exists)
 		})
 	}
 }
