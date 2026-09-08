@@ -174,20 +174,16 @@ func (sm *SyncManager) drainParkedDescendants(committed chainhash.Hash) {
 // The entry has already been taken out of the park index by the caller. Its blob
 // is still on disk and still charged against the budget, so every path out of
 // here goes through applyParkDisposition, which is what settles that.
+//
+// It is composed from three helpers rather than written out, because a second
+// scheduler commits parked blocks through a worker and a tail and has to apply
+// exactly the same policy. Two copies of this classification would drift, and the
+// two defaults point opposite ways: a read failure keeps the block, a commit
+// failure judges it.
 func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 	msgBlock, err := sm.blockPark.Read(sm.ctx, entry.hash)
 	if err != nil {
-		// A read can fail because the blob is bad, but it can equally fail
-		// because the store had no permit free inside the park's deadline or
-		// because the node is shutting down — and neither of those says anything
-		// about the block. parkReadFailure tells them apart; treating them alike
-		// destroys fully downloaded blocks under ordinary load.
-		d := parkReadFailure(err)
-
-		sm.logger.Warnf("[commitParkedBlock][%s] parked block could not be read back (%s): %v", entry.hash, d.reason, err)
-		sm.applyParkDisposition(entry, d)
-
-		return false
+		return sm.parkedReadFailed(entry, err)
 	}
 
 	// A nil in-flight parent: the parent of a parked block is in the chain by the
@@ -204,6 +200,45 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 	// block after the first successful drain.
 	isCheckpointBlock, _ := sm.advanceHeaderListFor(entry.hash)
 
+	sm.parkedBlockCommitted(entry, isCheckpointBlock)
+
+	return true
+}
+
+// parkedReadFailed decides what to do with a parked block whose blob would not
+// read back, and reports false so the drain stops walking that branch.
+//
+// A read can fail because the blob is bad, but it can equally fail because the
+// store had no permit free inside the park's deadline or because the node is
+// shutting down, and neither of those says anything about the block.
+// parkReadFailure tells them apart; treating them alike destroys fully
+// downloaded blocks under ordinary load. That is why this is a function of its
+// own rather than an arm of a shared failure path: the commit failure beside it
+// defaults the other way, to judging the block.
+func (sm *SyncManager) parkedReadFailed(entry parkedBlock, err error) bool {
+	d := parkReadFailure(err)
+
+	sm.logger.Warnf("[commitParkedBlock][%s] parked block could not be read back (%s): %v", entry.hash, d.reason, err)
+	sm.applyParkDisposition(entry, d)
+
+	return false
+}
+
+// parkedBlockCommitted is everything owed after a parked block has gone into the
+// chain and its header node has been taken off the front: the progress stamp, the
+// disposition that deletes the blob and gives its bytes back, the backoff and
+// cascade clears, the peer bookkeeping, and either the checkpoint transition or
+// the pipeline top-up.
+//
+// isCheckpointBlock is the answer advanceHeaderListFor gave for this block, passed
+// in rather than recomputed, because by the time this runs the front has moved and
+// the question can no longer be asked.
+//
+// It deliberately does not drain the blocks parked behind this one. The caller
+// owns that: the serial path walks an explicit stack in drainParkedDescendants,
+// and a stack is what stops a chain of parked blocks nesting one frame per link,
+// each holding a decoded block.
+func (sm *SyncManager) parkedBlockCommitted(entry parkedBlock, isCheckpointBlock bool) {
 	// A parked block committing is a block joining the chain, and it is the one
 	// commit that never passes through the block queue. Without this a node
 	// working purely off its park looks, to the stall check, like a node that
@@ -227,16 +262,14 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 		// headers is never asked for, headers-first sync stops here for good. So
 		// this one falls back to the current sync peer when the peer that
 		// delivered the block has gone.
-		if err = sm.checkpointBlockCommitted(sm.livePeer(entry.peer), entry.hash); err != nil {
+		if err := sm.checkpointBlockCommitted(sm.livePeer(entry.peer), entry.hash); err != nil {
 			sm.logger.Errorf("[commitParkedBlock][%s] failed to move past the checkpoint: %v", entry.hash, err)
 		}
 
-		return true
+		return
 	}
 
 	sm.fetchMoreHeaderBlocks(sm.livePeer(entry.peer))
-
-	return true
 }
 
 // replayingHistory reports whether the node is catching blocks rather than
