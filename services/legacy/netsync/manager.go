@@ -758,6 +758,11 @@ type SyncManager struct {
 	parkJobHeld  *parkJob
 	parkJobAsync atomic.Bool
 
+	// consumerWatchdogState is the diagnostic that explains a block loop which
+	// has stopped admitting. Embedded so the whole thing can be read, and taken
+	// out again, as one piece; see consumer_watchdog.go.
+	consumerWatchdogState
+
 	// parkSweepNow is the clock the park sweep measures its own tick against, so
 	// a test can make one store delete look slow without sleeping. nil means
 	// time.Now; nothing in production sets it.
@@ -2610,6 +2615,12 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 
 	finish := sm.finishBlockMsg
 
+	// Start the watchdog's clock here rather than at the first admission, so a
+	// loop that wedges before it ever places work is still described. Left at
+	// zero the report suppresses itself, which is the one case worth hearing
+	// about most.
+	sm.noteConsumerAdmitted(time.Now())
+
 	for {
 		var queueArm <-chan *blockQueueMsg
 
@@ -2622,6 +2633,8 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 		case admitDrained:
 			if sm.drainStep(bd) {
 				sm.lastDispatchWasDrained = true
+
+				sm.noteConsumerAdmitted(time.Now())
 
 				continue
 			}
@@ -2644,6 +2657,8 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 				bd.dispatch(d)
 			}
 
+			sm.noteConsumerAdmitted(time.Now())
+
 			continue
 
 		case admitNothing:
@@ -2657,6 +2672,8 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 			case sm.parkJobs <- *sm.parkJobHeld:
 				sm.parkJobHeld = nil
 
+				sm.noteConsumerAdmitted(time.Now())
+
 				continue
 			default:
 			}
@@ -2665,6 +2682,11 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 		if pending == nil && sm.parkJobHeld == nil {
 			queueArm = blockQueue
 		}
+
+		// Recorded here, not anywhere earlier, so it describes the wait rather
+		// than the work that led to it. Nothing below reads it; the watchdog on
+		// the message-handling goroutine does.
+		sm.publishConsumerWait(time.Now(), queueArm != nil, pending)
 
 		select {
 		case <-sm.quit:
@@ -2726,6 +2748,11 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 				}
 			}
 		case msg := <-queueArm:
+			// Taking a block off the queue is progress in its own right, whatever
+			// the head then decides: a loop parking blocks it cannot commit is
+			// working, and only a loop doing nothing at all is wedged.
+			sm.noteConsumerAdmitted(time.Now())
+
 			sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsgHead", msg.blockHash)
 
 			d, finished, err := sm.handleBlockMsgHead(msg)
@@ -5530,7 +5557,14 @@ out:
 			// same tick and over the same interval, so the rate and the decision
 			// cannot be measured against different clocks.
 			sm.samplePeerThroughput()
-			sm.raceFrontierBlock(time.Now())
+
+			now := time.Now()
+
+			sm.raceFrontierBlock(now)
+
+			// Deliberately on this goroutine and not the block loop's: a report
+			// the stuck goroutine had to print could never be printed.
+			sm.reportConsumerStall(now)
 		case m := <-sm.msgChan:
 			// whenever legacy receives a message, check if we are current
 			// this call should have the current state cached, so it should be fast
