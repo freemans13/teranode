@@ -1798,6 +1798,13 @@ func (sm *SyncManager) demoteSyncPeer(sp *peerpkg.Peer, state *peerSyncState) {
 func (sm *SyncManager) reopenDemotedPeerSlice(sp *peerpkg.Peer) {
 	// Leaf lock only, and taken with headerMu released.
 	reopened := sm.blockDownloads.ForgetForRetryPeer(sp, blockRequestRetryInterval)
+
+	// Before the early return, and regardless of whether anything was reopened:
+	// this peer has been judged stalled, so it must stop counting towards the
+	// racing cap whatever it still owed. See forgetFrontierRacer for the
+	// forty-minute mainnet stall that came of leaving it in place.
+	sm.forgetFrontierRacer(sp)
+
 	if len(reopened) == 0 {
 		return
 	}
