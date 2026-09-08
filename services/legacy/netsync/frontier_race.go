@@ -182,6 +182,8 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	var none chainhash.Hash
 
 	if sm.settings == nil {
+		sm.noteRaceDeclined("settings are not loaded")
+
 		return none, 0, nil, false
 	}
 
@@ -189,10 +191,14 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	slowAfter := sm.settings.Legacy.BlockSlowFetchTimeout
 
 	if maxRacing < 2 || slowAfter <= 0 {
+		sm.noteRaceDeclined("racing is switched off by configuration")
+
 		return none, 0, nil, false
 	}
 
 	if !sm.headersFirstMode.Load() {
+		sm.noteRaceDeclined("not in headers-first mode")
+
 		return none, 0, nil, false
 	}
 
@@ -223,16 +229,22 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	sm.frontierMu.Unlock()
 
 	if hash == none {
+		sm.noteRaceDeclined("no frontier is published, so nothing is holding up commits")
+
 		return none, 0, nil, false
 	}
 
 	if now.Sub(since) < slowAfter {
+		sm.noteRaceDeclined("the frontier has not been outstanding long enough yet")
+
 		return none, 0, nil, false
 	}
 
 	// The peer that already owes us the block counts towards the limit, so at
 	// the default of 2 exactly one extra peer is ever added.
 	if len(racing)+1 >= maxRacing {
+		sm.noteRaceDeclined("as many peers are already racing it as configuration allows")
+
 		return none, 0, nil, false
 	}
 
@@ -257,6 +269,8 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	// nothing here changes when a peer is demoted or disconnected: this asks a
 	// second peer for a copy and nothing more.
 	if sm.localReadBackpressured() && sm.blockPark.Len() == 0 {
+		sm.noteRaceDeclined("we are throttling our own reads and are holding nothing we cannot commit")
+
 		return none, 0, nil, false
 	}
 
@@ -269,11 +283,15 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	// park the same question before it requests a block, and Has takes only the
 	// park's own lock, so it is safe from this ticker.
 	if sm.blockPark.Has(hash) {
+		sm.noteRaceDeclined("the park already holds this block")
+
 		return none, 0, nil, false
 	}
 
 	sp, _ := sm.loadSyncPeerAndState()
 	if sp == nil {
+		sm.noteRaceDeclined("there is no sync peer")
+
 		return none, 0, nil, false
 	}
 
@@ -295,6 +313,8 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	// peerStates, and SyncedMap.Get takes the receiver's lock, so a nil map
 	// panics on the way in rather than returning "not found".
 	if sm.peerStates == nil {
+		sm.noteRaceDeclined("no peer states")
+
 		return none, 0, nil, false
 	}
 
@@ -304,6 +324,8 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 		}
 
 		if state, ok := sm.peerStates.Get(owner); ok && state.isPullingBytes(sm.minSyncPeerNetworkSpeed) {
+			sm.noteRaceDeclined("an owner is visibly pulling bytes, so it is slow rather than stalled")
+
 			return none, 0, nil, false
 		}
 	}
@@ -333,6 +355,8 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 
 		return hash, height, p, true
 	}
+
+	sm.noteRaceDeclined("no other peer is worth asking")
 
 	return none, 0, nil, false
 }
@@ -533,4 +557,34 @@ func (sm *SyncManager) BlockRacedTo(peer *peerpkg.Peer, blockHash *chainhash.Has
 	}
 
 	return false
+}
+
+// noteRaceDeclined records why the frontier race chose not to run, and says so in
+// the log at most once a minute per reason, with a running count.
+//
+// It exists because the decision has twelve separate exits and not one of them
+// was observable from outside the process. On mainnet the race fired twice in an
+// hour while a block sat outstanding for eighty-four seconds, and there was no
+// way to tell which condition had refused it; guessing cost four wrong theories
+// in a single day. A rate-limited line that names the condition ends that.
+func (sm *SyncManager) noteRaceDeclined(reason string) {
+	now := time.Now()
+
+	sm.raceDeclinedMu.Lock()
+	defer sm.raceDeclinedMu.Unlock()
+
+	if sm.raceDeclinedAt == nil {
+		sm.raceDeclinedAt = make(map[string]time.Time, 12)
+		sm.raceDeclinedCount = make(map[string]int, 12)
+	}
+
+	sm.raceDeclinedCount[reason]++
+
+	if last, seen := sm.raceDeclinedAt[reason]; seen && now.Sub(last) < time.Minute {
+		return
+	}
+
+	sm.raceDeclinedAt[reason] = now
+
+	sm.logger.Infof("[raceFrontierBlock] not racing the frontier: %s (%d times)", reason, sm.raceDeclinedCount[reason])
 }

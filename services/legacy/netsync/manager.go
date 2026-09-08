@@ -920,6 +920,14 @@ type SyncManager struct {
 	// tests build SyncManager as a struct literal.
 	racedBlocks *expiringmap.ExpiringMap[chainhash.Hash, map[*peerpkg.Peer]struct{}]
 
+	// raceDeclinedAt and raceDeclinedCount are the frontier race's own account of
+	// why it did not run, one entry per reason, reported at most once a minute
+	// each. The decision has nine exits and none of them used to be observable
+	// from outside the process.
+	raceDeclinedMu    sync.Mutex
+	raceDeclinedAt    map[string]time.Time
+	raceDeclinedCount map[string]int
+
 	// An optional fee estimator.
 	// feeEstimator *mempool.FeeEstimator
 	currentFeeFilter atomic.Uint64
