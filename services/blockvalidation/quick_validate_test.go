@@ -21,9 +21,11 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	testutil "github.com/bsv-blockchain/teranode/util/test"
 	prometheustestutil "github.com/prometheus/client_golang/prometheus/testutil"
@@ -1353,6 +1355,8 @@ func TestQuickValidateRemovesCreatesWhenSpendPhaseFails(t *testing.T) {
 // rejected on P's marker, but D spends the freshly recreated C and succeeds.
 type prunedChainFixture struct {
 	parent, child, grandchild, sibling *bt.Tx
+	privateKey                         *bec.PrivateKey
+	publicKey                          *bec.PublicKey
 }
 
 func newPrunedChainFixture(t *testing.T, store utxo.Store) prunedChainFixture {
@@ -1422,7 +1426,7 @@ func newPrunedChainFixture(t *testing.T, store utxo.Store) prunedChainFixture {
 	// A valid transaction that shares the batch and must survive.
 	siblingTx := spendOf(parentTx, 1, 4000)
 
-	return prunedChainFixture{parent: parentTx, child: childTx, grandchild: grandchildTx, sibling: siblingTx}
+	return prunedChainFixture{parent: parentTx, child: childTx, grandchild: grandchildTx, sibling: siblingTx, privateKey: privateKey, publicKey: publicKey}
 }
 
 func replayBatch(txs ...*bt.Tx) (*model.Block, *SubtreeProcessingBatch) {
@@ -1462,6 +1466,82 @@ func TestQuickValidateRemovesRecreatedDescendantsOfPrunedReplay(t *testing.T) {
 	meta, err := store.Get(ctx, f.sibling.TxIDChainHash())
 	require.NoError(t, err, "the valid sibling must survive")
 	require.NotNil(t, meta)
+}
+
+// TestQuickValidateCompensationReleasesDescendantSpends: a descendant that
+// spends both the recreated pruned transaction and an unrelated valid output is
+// itself a ghost, but deleting its record does not reverse its spends. Without
+// the release, P:1 stays recorded as spent by a transaction that no longer
+// exists and its legitimate spender is refused with ErrSpent naming a ghost.
+func TestQuickValidateCompensationReleasesDescendantSpends(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+
+	descendant := transactions.Create(t,
+		transactions.WithPrivateKey(f.privateKey),
+		transactions.WithInput(f.child, 0),
+		transactions.WithInput(f.parent, 1),
+		transactions.WithP2PKHOutputs(1, 7000, f.publicKey),
+	)
+
+	block, batch := replayBatch(f.child, descendant)
+
+	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "spending transaction was pruned")
+
+	for _, hash := range []*chainhash.Hash{f.child.TxIDChainHash(), descendant.TxIDChainHash()} {
+		_, err = store.Get(ctx, hash)
+		require.ErrorIs(t, err, errors.ErrTxNotFound)
+	}
+
+	// End state: P:1 is spendable again by its legitimate spender.
+	_, _, err = store.SpendAndCreate(ctx, f.sibling, 1401)
+	require.NoError(t, err, "the deleted descendant's spend of the surviving output must have been released")
+}
+
+// TestQuickValidateRemovesReplayAfterReplacementSpend: the replay's input was
+// rolled back and then taken by a replacement transaction. The store must still
+// answer the replay with the pruned-replay rejection, not a plain double-spend,
+// or the block path cannot identify the recreated record and it survives.
+func TestQuickValidateRemovesReplayAfterReplacementSpend(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+
+	utxoHash, err := util.UTXOHashFromOutput(f.parent.TxIDChainHash(), f.parent.Outputs[0], 0)
+	require.NoError(t, err)
+	require.NoError(t, store.Unspend(ctx, []*utxo.Spend{{
+		TxID:         f.parent.TxIDChainHash(),
+		Vout:         0,
+		UTXOHash:     utxoHash,
+		SpendingData: spendpkg.NewSpendingData(f.child.TxIDChainHash(), 0),
+	}}))
+
+	replacement := transactions.Create(t,
+		transactions.WithPrivateKey(f.privateKey),
+		transactions.WithInput(f.parent, 0),
+		transactions.WithP2PKHOutputs(1, 3999, f.publicKey),
+	)
+	_, _, err = store.SpendAndCreate(ctx, replacement, 1301)
+	require.NoError(t, err, "fixture: the replacement takes P:0")
+
+	block, batch := replayBatch(f.child)
+
+	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "spending transaction was pruned", "the marker must win over the conflicting-spender answer")
+
+	_, err = store.Get(ctx, f.child.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the recreated replay must be removed")
+
+	_, err = store.Get(ctx, replacement.TxIDChainHash())
+	require.NoError(t, err, "the replacement is untouched")
 }
 
 // failingDeleteStore fails DeleteComplete while failing is set. Everything else

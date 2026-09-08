@@ -1135,8 +1135,15 @@ func TestSyncManager_createUtxos_ReportsWhatItCreated(t *testing.T) {
 
 	require.Equal(t, wanted, got)
 
-	// End state: handing that list to DeleteCreated leaves nothing behind.
-	require.NoError(t, utxo.DeleteCreated(ctx, logger, utxoStore, created, 4))
+	// End state: handing that list through the ghost walk to DeleteCreated, the
+	// way validateTransactionsLegacyMode does, leaves nothing behind.
+	ghosts := utxo.PrunedReplayGhosts(blockTransactions(txMap), created, func(h *chainhash.Hash) bool {
+		_, ok := got[*h]
+
+		return ok
+	})
+	require.Len(t, ghosts, len(wanted))
+	require.NoError(t, utxo.DeleteCreated(ctx, logger, utxoStore, ghosts, 4))
 
 	for hash := range wanted {
 		hash := hash
