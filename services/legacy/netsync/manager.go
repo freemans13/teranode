@@ -2703,7 +2703,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			entry := parkedBlock{
 				hash:      bmsg.blockHash,
 				prevBlock: prevBlockHash,
-				height:    bmsg.blockHeight,
+				height:    sm.parkedBlockHeight(bmsg.blockHeight, bmsg.blockHash, removedFront),
 				// The resolved association primary, not bmsg.peer. A block
 				// delivered on a stream sub-peer (BlockPriority DATA1) carries
 				// that sub-peer, and sub-peers are not registered in peerStates
@@ -3770,6 +3770,44 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	// One send per peer that got work, and every one of them with headerMu
 	// released. The deferred publishFrontier above runs after this.
 	assigner.send(sm)
+}
+
+// parkedBlockHeight is the height to record against a block being parked, and it
+// exists because the obvious source is empty.
+//
+// The queue message's height comes from the decoded block, and a legacy block is
+// built by bsvutil.NewBlockFromBlockAndBytes with no height set, so it arrives as
+// BlockHeightUnknown. parkedBlock.height's own comment has always conceded it is
+// "often 0". Anything that judges a parked block by its height therefore judges
+// nothing at all, which is how a height rule can look correct and do nothing.
+//
+// Two sources that do have it. The header node this block's arrival took off the
+// front travels with the entry already, for the rewind, and carries its height.
+// For a block that was never the front, the header index still holds its node.
+// Between them, every block fetched through the header walk has a height.
+//
+// A block with no height anywhere is left at whatever was reported. Restart
+// recovery is the honest case: those entries are rebuilt from disk with no header
+// list behind them, and a height guessed for them would be worse than none.
+func (sm *SyncManager) parkedBlockHeight(reported int32, hash chainhash.Hash, removedFront *headerNode) int32 {
+	if reported > 0 {
+		return reported
+	}
+
+	if removedFront != nil && removedFront.height > 0 {
+		return removedFront.height
+	}
+
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if element, ok := sm.headerIndex[hash]; ok && element != nil {
+		if node, isHeaderNode := element.Value.(*headerNode); isHeaderNode && node.height > 0 {
+			return node.height
+		}
+	}
+
+	return reported
 }
 
 // readAheadBudgetExhausted reports whether this node is already holding, or is
