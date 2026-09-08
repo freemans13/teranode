@@ -1672,6 +1672,62 @@ func TestQuickValidateRemovesReplayAfterReplacementSpend(t *testing.T) {
 	require.NoError(t, err, "the replacement is untouched")
 }
 
+// TestQuickValidateRejectsReplayWhoseParentWasAlsoPruned: a linear chain
+// P -> C -> G where each spends the previous one's only output, so one prune
+// removes P and C together and C's marker, which lived on P, goes with it.
+// Nothing in the store then says C ever existed. Replaying C creates it in
+// phase 1; phase 2 spends P:0 on a parent that is gone, and both stores'
+// "already blessed" fallback would clear that on the strength of the record
+// phase 1 just wrote. The block must not validate, C must not survive, and
+// C:0, which G consumed in a confirmed block, must not be spendable again.
+func TestQuickValidateRejectsReplayWhoseParentWasAlsoPruned(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	sqlStore, ok := store.(*sql.Store)
+	require.True(t, ok)
+
+	sql.ResetPrunerServiceForTests()
+	t.Cleanup(sql.ResetPrunerServiceForTests)
+
+	ctx := context.Background()
+	require.NoError(t, store.SetBlockHeight(1002))
+
+	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("QUICK_VALIDATE_PRUNED_PARENT_CHAIN_KEY"))
+
+	parent := transactions.Create(t, transactions.WithCoinbaseData(1, "/p/"), transactions.WithP2PKHOutputs(1, 5000, publicKey))
+	mineTxs(t, store, 1000, parent)
+
+	child := transactions.Create(t, transactions.WithPrivateKey(privateKey), transactions.WithInput(parent, 0), transactions.WithP2PKHOutputs(1, 4000, publicKey))
+	mineTxs(t, store, 1001, child)
+
+	grandchild := transactions.Create(t, transactions.WithPrivateKey(privateKey), transactions.WithInput(child, 0), transactions.WithP2PKHOutputs(1, 3000, publicKey))
+	mineTxs(t, store, 1002, grandchild)
+
+	prunerService, err := sqlStore.GetPrunerService()
+	require.NoError(t, err)
+	pruned, err := prunerService.Prune(ctx, 1300, "pruned-parent-chain")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), pruned, "fixture: P and C are pruned in one cycle")
+
+	var markers int
+	require.NoError(t, sqlStore.RawDB().QueryRowContext(ctx, "SELECT COUNT(*) FROM deleted_children").Scan(&markers))
+	require.Equal(t, 0, markers, "fixture: C's marker cascaded away with P")
+
+	block, batch := replayBatch(child)
+
+	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err, "a replay of a chain the pruner removed end to end must not validate")
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the missing parent must surface, not be blessed by the record phase 1 wrote")
+
+	_, err = store.Get(ctx, child.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the recreated child must not survive")
+
+	thief := transactions.Create(t, transactions.WithPrivateKey(privateKey), transactions.WithInput(child, 0), transactions.WithP2PKHOutputs(1, 3999, publicKey))
+	_, _, err = store.SpendAndCreate(ctx, thief, 1401)
+	require.Error(t, err, "C:0 was consumed by G in a confirmed block and must not be spendable again")
+}
+
 // failingDeleteStore fails DeleteComplete while failing is set. Everything else
 // goes to the real store.
 type failingDeleteStore struct {

@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -441,4 +442,191 @@ func TestPrunedReplayRejectedAfterReplacementSpend(t *testing.T) {
 			require.False(t, exists)
 		})
 	}
+}
+
+// twoParentPrunedChild builds P and Q (two outputs each, output 1 unspent so
+// both survive), C spending P:0 and Q:0, and G spending C's only output, all
+// mined; then prunes C, which writes C's marker on both P and Q.
+func twoParentPrunedChild(t *testing.T, ctx context.Context, store *Store) (p, q, child *bt.Tx) {
+	t.Helper()
+
+	parents := make([]*bt.Tx, 2)
+
+	for i := range parents {
+		parent := bt.NewTx()
+		require.NoError(t, parent.From("111111111111111111111111111111111111111111111111111111111111111"+string(rune('1'+i)), 0, "51", 30000))
+		parent.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+		_, err := store.Create(ctx, parent, 1000)
+		require.NoError(t, err)
+
+		parents[i] = parent
+	}
+
+	p, q = parents[0], parents[1]
+
+	child = bt.NewTx()
+	for _, parent := range parents {
+		require.NoError(t, child.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	}
+
+	for i := range child.Inputs {
+		child.Inputs[i].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+	}
+
+	require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+	_, _, err := store.SpendAndCreate(ctx, child, 1000)
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{p.TxIDChainHash(), q.TxIDChainHash(), child.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+	require.NoError(t, err)
+
+	grandchild := bt.NewTx()
+	require.NoError(t, grandchild.From(child.TxID(), 0, child.Outputs[0].LockingScript.String(), child.Outputs[0].Satoshis))
+	grandchild.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+	require.NoError(t, grandchild.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2000))
+	_, _, err = store.SpendAndCreate(ctx, grandchild, 1001)
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{grandchild.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+	require.NoError(t, err)
+
+	svc, err := store.GetPrunerService()
+	require.NoError(t, err)
+	n, err := svc.Prune(ctx, 1300, "two-parent-child")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n, "fixture: only the child is pruned")
+
+	return p, q, child
+}
+
+func forEachBackend(t *testing.T, body func(t *testing.T, ctx context.Context, store *Store)) {
+	t.Helper()
+
+	for _, backend := range []string{"sqlite", "postgres"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var store *Store
+
+			if backend == "postgres" {
+				store, ctx = setupPostgresStore(t)
+			} else {
+				store, _ = setup(ctx, t)
+			}
+
+			ResetPrunerServiceForTests()
+			t.Cleanup(ResetPrunerServiceForTests)
+			require.NoError(t, store.SetBlockHeight(1000))
+
+			body(t, ctx, store)
+		})
+	}
+}
+
+func outputSpendingData(t *testing.T, ctx context.Context, store *Store, parent *bt.Tx, vout uint32) []byte {
+	t.Helper()
+
+	var sd []byte
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		"SELECT spending_data FROM outputs WHERE idx = $2 AND transaction_id IN (SELECT id FROM transactions WHERE hash = $1)",
+		parent.TxIDChainHash()[:], vout).Scan(&sd))
+
+	return sd
+}
+
+// TestPrunedReplayRollbackPreservesHistoricalSpend: C is replayed and rejected
+// on Q's marker while P carries no marker for it (a pre-marker prune, or one
+// parent's marker write having failed) and P:0 still records C's confirmed
+// spend. The replay's spend of P:0 is an idempotent match that writes nothing,
+// so the rollback must leave it alone: reversing it would hand a confirmed
+// output to any new spender. Reproduced by review on all three stores.
+func TestPrunedReplayRollbackPreservesHistoricalSpend(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
+		p, _, child := twoParentPrunedChild(t, ctx, store)
+
+		_, err := store.db.ExecContext(ctx,
+			"DELETE FROM deleted_children WHERE parent_id IN (SELECT id FROM transactions WHERE hash = $1)", p.TxIDChainHash()[:])
+		require.NoError(t, err)
+
+		var markers int
+		require.NoError(t, store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM deleted_children").Scan(&markers))
+		require.Equal(t, 1, markers, "fixture: exactly one marker survives, on Q")
+
+		historical := spendpkg.NewSpendingData(child.TxIDChainHash(), 0).Bytes()
+		require.Equal(t, historical, outputSpendingData(t, ctx, store, p, 0), "fixture: P:0 is confirmed spent by the child")
+
+		_, err = store.Spend(ctx, child, 1200)
+		require.ErrorIs(t, err, errors.ErrUtxoSpendingTxPruned, "the replay is rejected on Q's marker")
+
+		require.Equal(t, historical, outputSpendingData(t, ctx, store, p, 0),
+			"rejecting the replay must not release P:0's confirmed spend by the pruned child")
+
+		replacement := bt.NewTx()
+		require.NoError(t, replacement.From(p.TxID(), 0, p.Outputs[0].LockingScript.String(), p.Outputs[0].Satoshis))
+		replacement.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, replacement.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 2999))
+		_, _, err = store.SpendAndCreate(ctx, replacement, 1200)
+		require.ErrorIs(t, err, errors.ErrSpent, "P:0 was confirmed spent by the child and must not be spendable again")
+	})
+}
+
+// TestPrunedReplayRejectedBeforeFrozen: the marker takes precedence over every
+// other answer about the output. Here the rolled-back output has been frozen;
+// without precedence the replay is answered ErrFrozen, which the block paths
+// cannot tell from an ordinary failure, and the record their create phase wrote
+// for the replay is never compensated.
+func TestPrunedReplayRejectedBeforeFrozen(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
+		p, _, child := twoParentPrunedChild(t, ctx, store)
+
+		utxoHash, err := util.UTXOHashFromOutput(p.TxIDChainHash(), p.Outputs[0], 0)
+		require.NoError(t, err)
+
+		spend := &utxo.Spend{TxID: p.TxIDChainHash(), Vout: 0, UTXOHash: utxoHash, SpendingData: spendpkg.NewSpendingData(child.TxIDChainHash(), 0)}
+		require.NoError(t, store.Unspend(ctx, []*utxo.Spend{spend}))
+		require.NoError(t, store.FreezeUTXOs(ctx, []*utxo.Spend{{TxID: p.TxIDChainHash(), Vout: 0, UTXOHash: utxoHash}}, test.CreateBaseTestSettings(t)))
+
+		_, err = store.Spend(ctx, child, 1200)
+		require.ErrorIs(t, err, errors.ErrUtxoSpendingTxPruned, "the marker must win over the frozen answer")
+		require.NotErrorIs(t, err, errors.ErrFrozen)
+	})
+}
+
+// TestSpendDoesNotBlessSpenderCreatedByCaller: "parent not found, but the
+// spending transaction exists" is treated as a transaction validated before its
+// parent was pruned, and the error is cleared. Not when the caller wrote that
+// record itself in this pass: the create-first block paths write the spender
+// before they spend, so a replay of a transaction whose parent was pruned too
+// would be blessed by the copy the replay just created.
+func TestSpendDoesNotBlessSpenderCreatedByCaller(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, ctx context.Context, store *Store) {
+		parent := bt.NewTx()
+		require.NoError(t, parent.From("1111111111111111111111111111111111111111111111111111111111111111", 0, "51", 30000))
+		parent.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, parent.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 4000))
+		_, err := store.Create(ctx, parent, 1000)
+		require.NoError(t, err)
+
+		child := bt.NewTx()
+		require.NoError(t, child.From(parent.TxID(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+		child.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x51})
+		require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 3000))
+		_, _, err = store.SpendAndCreate(ctx, child, 1000)
+		require.NoError(t, err)
+		_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parent.TxIDChainHash(), child.TxIDChainHash()},
+			utxo.MinedBlockInfo{BlockID: 1000, BlockHeight: 1000, OnLongestChain: true})
+		require.NoError(t, err)
+
+		// The parent is gone; the child's record remains.
+		require.NoError(t, store.DeleteComplete(ctx, parent.TxIDChainHash()))
+
+		_, err = store.Spend(ctx, child, 1200)
+		require.NoError(t, err, "control: a pre-existing child with a pruned parent is blessed")
+
+		_, err = store.Spend(ctx, child, 1200, utxo.IgnoreFlags{SpenderCreatedByCaller: true})
+		require.ErrorIs(t, err, errors.ErrTxNotFound, "a record the caller wrote itself is not proof of prior validation")
+	})
 }

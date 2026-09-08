@@ -1335,7 +1335,17 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// permanently attributed to a non-canonical tx. Hard-fail instead (fail-closed).
 	// Dirty-restart replay does not need conflict tolerance: re-spending an output
 	// with the same spender is the store's idempotent success path.
-	prunedReplays, err := u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly)
+	// createdHere answers "did phase 1 write this record?": the spend phase tells
+	// the store so for every such transaction, because a record this attempt
+	// wrote is not proof of prior validation, and the compensation below only
+	// removes dependents this attempt wrote.
+	createdHere := func(txHash *chainhash.Hash) bool {
+		_, existed := existingTxSet[*txHash]
+
+		return !existed
+	}
+
+	prunedReplays, err := u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly, createdHere)
 	if err != nil {
 		// Compensate phase 1 for the ghosts a pruned replay leaves behind: the
 		// transactions the store rejected on a replay marker, plus anything in
@@ -1353,11 +1363,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		// recorded it as pre-existing; deleting those out from under that block
 		// would break it. Only this batch is walked: a later batch's create
 		// phase has not run, so it left nothing behind.
-		ghosts := utxo.PrunedReplayGhosts(batch.batchTxs, prunedReplays, func(txHash *chainhash.Hash) bool {
-			_, existed := existingTxSet[*txHash]
-
-			return !existed
-		})
+		ghosts := utxo.PrunedReplayGhosts(batch.batchTxs, prunedReplays, createdHere)
 
 		// ctx, not the errgroup context: the spend group's context is cancelled
 		// by the time we get here.
@@ -1384,10 +1390,18 @@ const spendRetryBackoffDefault = 2 * time.Second
 // makes no progress. Retry cadence mirrors the legacy path's PreValidateTransactions
 // (maxRetries=10, 2s backoff) so both below-checkpoint implementations converge
 // identically after dirty restarts.
-// It also returns the transactions whose spend was rejected because the pruner
-// had already removed them: those are the records phase 1 recreated and the
-// caller has to delete again, since Create does not consult the replay markers.
-func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.Block, txs []*bt.Tx, outpointOnly bool) ([]*chainhash.Hash, error) {
+// It also returns the transactions the store identified as replays of pruned
+// transactions, which are the records phase 1 recreated and the caller has to
+// delete again, since Create does not consult the replay markers. Two answers
+// qualify: the marker rejection (ErrUtxoSpendingTxPruned), and a missing parent
+// (ErrTxNotFound) for a transaction phase 1 created. Below the checkpoint a
+// parent record is absent only because it was fully spent and buried, so a
+// transaction this attempt had to create in order to spend it is a replay of a
+// chain the pruner removed end to end; the stores' "already blessed" fallback
+// is switched off for those transactions (WithSpenderCreatedByCaller) so the
+// missing parent surfaces at all instead of being blessed by the record this
+// attempt just wrote.
+func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.Block, txs []*bt.Tx, outpointOnly bool, createdHere func(*chainhash.Hash) bool) ([]*chainhash.Hash, error) {
 	const maxRetries = 10
 
 	backoff := u.spendRetryBackoff
@@ -1423,8 +1437,12 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 		for _, tx := range pending {
 			tx := tx
 			spendG.Go(func() error {
+				txHash := tx.TxIDChainHash()
+				created := createdHere != nil && createdHere(txHash)
+
 				if _, _, err := u.utxoStore.SpendAndCreate(spendCtx, tx, block.Height, utxo.WithSpendOnly(),
-					utxo.WithIgnoreLocked(true), utxo.WithSkipUTXOHashCheck(outpointOnly)); err != nil {
+					utxo.WithIgnoreLocked(true), utxo.WithSkipUTXOHashCheck(outpointOnly),
+					utxo.WithSpenderCreatedByCaller(created)); err != nil {
 					if errors.IsRetryableError(err) {
 						mu.Lock()
 						retryable = append(retryable, tx)
@@ -1433,8 +1451,8 @@ func (u *BlockValidation) spendBatchWithRetry(ctx context.Context, block *model.
 						return nil
 					}
 					mu.Lock()
-					if errors.Is(err, errors.ErrUtxoSpendingTxPruned) {
-						prunedReplays = append(prunedReplays, tx.TxIDChainHash())
+					if utxo.IsPrunedReplayRejection(err, created) {
+						prunedReplays = append(prunedReplays, txHash)
 					}
 					hardFail = errors.NewProcessingError("[spendBatchWithRetry][%s] failed to spend tx %s", block.Hash().String(), tx.TxIDChainHash().String(), err)
 					mu.Unlock()

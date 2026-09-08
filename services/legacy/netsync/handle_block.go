@@ -867,7 +867,22 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to select finality time sources", err)
 	}
 
-	prunedReplays, err := sm.PreValidateTransactions(ctx, txMap, bi.hash, bi.height, candidateBlockTime, candidateParentMedianTime, outpointOnly, failClosed)
+	// createdHere answers "did createUtxos write this record?": PreValidateTransactions
+	// tells the validator and the store so for every such transaction, because a
+	// record this attempt wrote is not proof of prior validation, and the
+	// compensation below only removes dependents this attempt wrote.
+	created := make(map[chainhash.Hash]struct{}, len(createdTxHashes))
+	for _, txHash := range createdTxHashes {
+		created[*txHash] = struct{}{}
+	}
+
+	createdHere := func(txHash *chainhash.Hash) bool {
+		_, ok := created[*txHash]
+
+		return ok
+	}
+
+	prunedReplays, err := sm.PreValidateTransactions(ctx, txMap, bi.hash, bi.height, candidateBlockTime, candidateParentMedianTime, outpointOnly, failClosed, createdHere)
 	if err != nil {
 		// Compensate createUtxos for the ghosts a pruned replay leaves behind:
 		// the transactions the store rejected on a replay marker, plus anything
@@ -884,16 +899,7 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 		// Deliberately NOT everything createUtxos wrote. The rest may be valid
 		// and wanted by a concurrently validating sibling block that took
 		// ErrTxExists on them.
-		created := make(map[chainhash.Hash]struct{}, len(createdTxHashes))
-		for _, txHash := range createdTxHashes {
-			created[*txHash] = struct{}{}
-		}
-
-		ghosts := utxo.PrunedReplayGhosts(blockTransactions(txMap), prunedReplays, func(txHash *chainhash.Hash) bool {
-			_, ok := created[*txHash]
-
-			return ok
-		})
+		ghosts := utxo.PrunedReplayGhosts(blockTransactions(txMap), prunedReplays, createdHere)
 
 		if deleteErr := utxo.DeleteCreated(ctx, sm.logger, sm.utxoStore, ghosts,
 			sm.settings.Legacy.StoreBatcherSize*sm.settings.Legacy.StoreBatcherConcurrency); deleteErr != nil {
@@ -1337,7 +1343,8 @@ func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, bi blockIdent, 
 // caller deletes them again: Create does not consult the replay markers, so
 // nothing else stops the block leaving a permanent ghost behind.
 func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
-	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32, outpointOnly bool, failClosed bool) (prunedReplays []*chainhash.Hash, err error) {
+	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32, outpointOnly bool, failClosed bool,
+	createdHere func(*chainhash.Hash) bool) (prunedReplays []*chainhash.Hash, err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "PreValidateTransactions",
 		tracing.WithLogMessage(sm.logger, "[PreValidateTransactions] called for block %s / height %d", blockHash, blockHeight),
 		tracing.WithHistogram(prometheusLegacyNetsyncPreValidateTransactions),
@@ -1419,7 +1426,12 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					return nil
 				}
 
+				created := createdHere != nil && createdHere(&txHash)
+
 				validateOpts := []validator.Option{
+					// A record createUtxos wrote is not proof of prior validation; see
+					// WithSpenderCreatedByCaller.
+					validator.WithSpenderCreatedByCaller(created),
 					validator.WithSkipUtxoCreation(true),
 					validator.WithAddTXToBlockAssembly(false),
 					validator.WithSkipPolicyChecks(true),
@@ -1476,7 +1488,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 						mu.Unlock()
 					} else {
 						mu.Lock()
-						prunedReplays = appendPrunedReplay(prunedReplays, validateErr, txWrapper.Tx.TxIDChainHash())
+						prunedReplays = appendPrunedReplay(prunedReplays, validateErr, txWrapper.Tx.TxIDChainHash(), created)
 						hardFail = validateErr
 						mu.Unlock()
 					}
@@ -1513,11 +1525,11 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 		len(pendingTxHashes), totalTxCount, maxRetries)
 }
 
-// appendPrunedReplay records txHash when err is the store's pruned-replay
-// rejection, so validateTransactionsLegacyMode can remove the record createUtxos
-// wrote for it.
-func appendPrunedReplay(prunedReplays []*chainhash.Hash, err error, txHash *chainhash.Hash) []*chainhash.Hash {
-	if !errors.Is(err, errors.ErrUtxoSpendingTxPruned) {
+// appendPrunedReplay records txHash when err identifies the transaction as a
+// replay of a pruned transaction (utxo.IsPrunedReplayRejection), so
+// validateTransactionsLegacyMode can remove the record createUtxos wrote for it.
+func appendPrunedReplay(prunedReplays []*chainhash.Hash, err error, txHash *chainhash.Hash, createdHere bool) []*chainhash.Hash {
+	if !utxo.IsPrunedReplayRejection(err, createdHere) {
 		return prunedReplays
 	}
 

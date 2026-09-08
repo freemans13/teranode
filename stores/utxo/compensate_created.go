@@ -47,6 +47,19 @@ import (
 // whoever put it there and is left alone. The walk is transitive through ghosts
 // only.
 //
+// That last rule has a known, accepted residual. If an earlier attempt at the
+// same block wrote the dependent and then did not reach this compensation - a
+// crash or cancellation anywhere between the create phase and the delete, or
+// a delete that failed past its retries - the dependent already exists when
+// the next attempt starts, answers ErrTxExists to its create phase, and is
+// filed as pre-existing. Nothing in the store distinguishes that leftover from
+// a legitimately pre-existing dependent: its only markers went with the pruned
+// parent, its block ids are the block's own, and its outputs are unspent in
+// both cases. Closing it needs a durable per-transaction mark the stores do not
+// have; until then the leftover is mined with unspent outputs that history
+// already consumed, locked on the blockvalidation path while the block never
+// completes and unlocked on the legacy path.
+//
 // txs need not be in dependency order; the walk repeats until it adds nothing.
 // Every hash in rejected must name a transaction in txs, which holds at both
 // call sites because the rejections came from spending exactly that list.
@@ -101,6 +114,25 @@ func PrunedReplayGhosts(txs []*bt.Tx, rejected []*chainhash.Hash, createdHere fu
 	}
 
 	return result
+}
+
+// IsPrunedReplayRejection reports whether a spend-phase error identifies the
+// spending transaction as a replay of one the pruner removed.
+//
+// Two answers qualify. The marker rejection, ErrUtxoSpendingTxPruned, names the
+// replay directly. A missing parent, ErrTxNotFound, does so only for a
+// transaction this attempt created: below the checkpoint a parent record is
+// absent only because it was fully spent and buried, so a transaction that had
+// to be created in order to spend it is a replay of a chain the pruner removed
+// end to end, marker and all. A pre-existing transaction with a missing parent
+// is the case the stores' "already blessed" fallback exists for and is not a
+// replay.
+func IsPrunedReplayRejection(err error, createdHere bool) bool {
+	if errors.Is(err, errors.ErrUtxoSpendingTxPruned) {
+		return true
+	}
+
+	return createdHere && errors.Is(err, errors.ErrTxNotFound)
 }
 
 // spendsAny reports whether tx spends an output of any transaction in set.

@@ -202,8 +202,12 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 
 	for attempt := 0; attempt < maxPruneAttempts; attempt++ {
 		count, err = s.deleteTombstonedTx(ctx, blockHeight)
-		if err == nil || !isPruneRetryable(err) {
-			return count, err
+		if err == nil {
+			return count, nil
+		}
+
+		if !isPruneRetryable(err) {
+			return 0, errors.NewStorageError("pruning transaction failed", err)
 		}
 
 		if attempt == maxPruneAttempts-1 {
@@ -224,8 +228,25 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 
 	s.logger.Warnf("[pruner] serialization/lock conflict persisted after %d attempts: %v", maxPruneAttempts, err)
 
-	return 0, err
+	return 0, errors.NewStorageError("pruning transaction failed after %d attempts", maxPruneAttempts, err)
 }
+
+// pruneStepError is how one attempt of the pruning transaction reports a
+// failed statement to deleteTombstoned. It keeps the driver's own error
+// reachable through Unwrap, which errors.NewStorageError does not: that
+// constructor replaces a foreign wrapped error with a bare *errors.Error
+// carrying only its message, so isPruneRetryable could never see a
+// *pgconn.PgError or *sqlite.Error through it and the retry never fired.
+// deleteTombstoned wraps the final error for its caller once the retry
+// decision has been made.
+type pruneStepError struct {
+	step string
+	err  error
+}
+
+func (e *pruneStepError) Error() string { return e.step + ": " + e.err.Error() }
+
+func (e *pruneStepError) Unwrap() error { return e.err }
 
 // deleteTombstonedTx runs one attempt of the pruning transaction: select the
 // candidates, write a replay marker on every parent of every candidate, then
@@ -312,11 +333,11 @@ var pruneTxOptions = &sql.TxOptions{Isolation: sql.LevelSerializable}
 func finishPrune(txn *sql.Tx, result sql.Result) (int64, error) {
 	count, err := result.RowsAffected()
 	if err != nil {
-		return 0, errors.NewStorageError("failed to get rows affected", err)
+		return 0, &pruneStepError{step: "failed to get rows affected", err: err}
 	}
 
 	if err := txn.Commit(); err != nil {
-		return 0, errors.NewStorageError("failed to commit pruning transaction", err)
+		return 0, &pruneStepError{step: "failed to commit pruning transaction", err: err}
 	}
 
 	return count, nil
@@ -340,18 +361,18 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
 
 	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
 	if err != nil {
-		return 0, errors.NewStorageError("failed to begin pruning transaction", err)
+		return 0, &pruneStepError{step: "failed to begin pruning transaction", err: err}
 	}
 
 	defer func() { _ = txn.Rollback() }()
 
 	if _, err := txn.ExecContext(ctx, markerQuery, blockHeight); err != nil {
-		return 0, errors.NewStorageError("failed to mark pruned children", err)
+		return 0, &pruneStepError{step: "failed to mark pruned children", err: err}
 	}
 
 	result, err := txn.ExecContext(ctx, deleteQuery, blockHeight)
 	if err != nil {
-		return 0, errors.NewStorageError("failed to delete transactions", err)
+		return 0, &pruneStepError{step: "failed to delete transactions", err: err}
 	}
 
 	return finishPrune(txn, result)
@@ -441,26 +462,26 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 
 	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
 	if err != nil {
-		return 0, errors.NewStorageError("failed to begin pruning transaction", err)
+		return 0, &pruneStepError{step: "failed to begin pruning transaction", err: err}
 	}
 
 	defer func() { _ = txn.Rollback() }()
 
 	if _, err := txn.ExecContext(ctx, dropStale); err != nil {
-		return 0, errors.NewStorageError("failed to clear stale pruning candidates", err)
+		return 0, &pruneStepError{step: "failed to clear stale pruning candidates", err: err}
 	}
 
 	if _, err := txn.ExecContext(ctx, createCandidates, blockHeight, s.safetyWindow); err != nil {
-		return 0, errors.NewStorageError("failed to select pruning candidates", err)
+		return 0, &pruneStepError{step: "failed to select pruning candidates", err: err}
 	}
 
 	if _, err := txn.ExecContext(ctx, markerQuery); err != nil {
-		return 0, errors.NewStorageError("failed to mark pruned children", err)
+		return 0, &pruneStepError{step: "failed to mark pruned children", err: err}
 	}
 
 	result, err := txn.ExecContext(ctx, deleteQuery)
 	if err != nil {
-		return 0, errors.NewStorageError("failed to delete transactions", err)
+		return 0, &pruneStepError{step: "failed to delete transactions", err: err}
 	}
 
 	return finishPrune(txn, result)

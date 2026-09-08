@@ -86,6 +86,7 @@ local FIELD_BLOCK_IDS = "blockIDs"
 local FIELD_ERRORS = "errors"
 local FIELD_CHILD_COUNT = "childCount"
 local FIELD_SPENDING_DATA = "spendingData"
+local FIELD_IDEMPOTENT = "idempotent"      -- spend: indexes whose utxo already recorded exactly this spend (nothing written)
 -- local FIELD_DEBUG = "debug"
 
 -- Helper functions
@@ -342,6 +343,10 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
 
     local blockIDs = rec[BIN_BLOCK_IDS]
     local errors = map()
+    -- Indexes whose utxo already recorded exactly this spend. Nothing is written
+    -- for them, and the caller must not roll them back on a later failure: the
+    -- spend they matched is the confirmed, historical one.
+    local idempotent = list()
     local deletedChildren = rec[BIN_DELETED_CHILDREN]
     local spendableIn = rec[BIN_UTXO_SPENDABLE_IN]
     local spendCount = #spends
@@ -366,20 +371,6 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
             errors[idx] = error
 
             goto continue
-        end
-
-        if spendableIn then
-            local spendableHeight = spendableIn[offset]
-            if spendableHeight and spendableHeight > currentBlockHeight then
-                local error = map()
-
-                error[FIELD_ERROR_CODE] = ERROR_CODE_FROZEN_UNTIL
-                error[FIELD_MESSAGE] = MSG_FROZEN_UNTIL .. spendableHeight
-
-                errors[idx] = error
-
-                goto continue
-            end
         end
 
         -- Reject a replay of a transaction the pruner already removed.
@@ -409,11 +400,26 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
             end
         end
 
+        if spendableIn then
+            local spendableHeight = spendableIn[offset]
+            if spendableHeight and spendableHeight > currentBlockHeight then
+                local error = map()
+
+                error[FIELD_ERROR_CODE] = ERROR_CODE_FROZEN_UNTIL
+                error[FIELD_MESSAGE] = MSG_FROZEN_UNTIL .. spendableHeight
+
+                errors[idx] = error
+
+                goto continue
+            end
+        end
+
         -- Handle already spent UTXO
         if existingSpendingData then
 
             if bytes_equal(existingSpendingData, spendingData) then
                 -- Already spent with same data
+                list.append(idempotent, idx)
                 goto continue
             elseif isFrozen(existingSpendingData) then
                 local error = map()
@@ -461,6 +467,10 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
         response[FIELD_ERRORS] = errors
     else
         response[FIELD_STATUS] = STATUS_OK
+    end
+
+    if list.size(idempotent) > 0 then
+        response[FIELD_IDEMPOTENT] = idempotent
     end
 
     if blockIDs then

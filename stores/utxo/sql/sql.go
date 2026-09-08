@@ -97,6 +97,11 @@ type batchSpend struct {
 	ignoreConflicting bool
 	ignoreLocked      bool
 	skipUTXOHashCheck bool
+	// idempotent is set by the batch when the output already recorded exactly
+	// this spend, so nothing was written. Spend keeps such inputs out of the
+	// rollback list: the spend they matched is the confirmed, historical one,
+	// and reversing it would hand a confirmed output to any new spender.
+	idempotent bool
 }
 
 // Store implements the UTXO store interface using a SQL database backend.
@@ -1868,6 +1873,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
 	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
 	useSkipUTXOHashCheck := len(ignoreFlags) > 0 && ignoreFlags[0].SkipUTXOHashCheck
+	spenderCreatedByCaller := len(ignoreFlags) > 0 && ignoreFlags[0].SpenderCreatedByCaller
 
 	if useSkipUTXOHashCheck {
 		spends, err = utxo.GetSpendsOutpointOnly(tx)
@@ -1887,7 +1893,8 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	var (
 		mu              sync.Mutex
 		txAlreadyExists bool
-		spentSpends     = make([]*utxo.Spend, 0, len(spends))
+		succeeded       int
+		spentSpends     = make([]*utxo.Spend, 0, len(spends)) // fresh spends only, for the rollback
 		g               errgroup.Group
 	)
 
@@ -1918,14 +1925,15 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			}()
 
 			errCh := make(chan error, 1)
-			s.spendBatcher.PutCtx(ctx, &batchSpend{
+			item := &batchSpend{
 				spend:             spend,
 				blockHeight:       blockHeight,
 				errCh:             errCh,
 				ignoreConflicting: useIgnoreConflicting,
 				ignoreLocked:      useIgnoreLocked,
 				skipUTXOHashCheck: useSkipUTXOHashCheck,
-			})
+			}
+			s.spendBatcher.PutCtx(ctx, item)
 
 			// Wait for batch response with timeout to prevent indefinite blocking
 			spendTimeout := s.settings.UtxoStore.SpendWaitTimeout
@@ -1950,8 +1958,12 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			}
 
 			// Handle "already blessed" — parent tx not found but spending tx exists.
-			// Mirrors aerospike spend.go:343-361.
-			if batchErr != nil && errors.Is(batchErr, errors.ErrTxNotFound) {
+			// Mirrors aerospike spend.go resolveSpendCompletions. Never for a record
+			// the caller wrote in this pass: the create-first block paths write the
+			// spender before they spend, so its presence is not prior validation,
+			// and a replay of a transaction whose parent was pruned too would be
+			// blessed by the copy the replay itself just created.
+			if batchErr != nil && errors.Is(batchErr, errors.ErrTxNotFound) && !spenderCreatedByCaller {
 				mu.Lock()
 				exists := txAlreadyExists
 				mu.Unlock()
@@ -1988,7 +2000,15 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			}
 
 			mu.Lock()
-			spentSpends = append(spentSpends, spend)
+			succeeded++
+
+			// An idempotent match wrote nothing: the output already recorded this
+			// exact spend from history. It counts as success, but there is nothing
+			// of this call to roll back, and reversing the historical spend would
+			// free a confirmed output.
+			if !item.idempotent {
+				spentSpends = append(spentSpends, spend)
+			}
 			mu.Unlock()
 
 			return nil
@@ -1999,7 +2019,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		return nil, errors.NewError("error in sql spend (batched mode)", err)
 	}
 
-	if len(spends) != len(spentSpends) {
+	if succeeded != len(spends) {
 		// Rollback successful spends when the transaction has genuine validation failures
 		// (double-spend, frozen, conflicting, hash mismatch). For transient errors, skip
 		// rollback — the optimistic locking makes spends idempotent for the same spender.
@@ -2248,6 +2268,20 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			continue
 		}
 
+		// Replay of a transaction the pruner already removed. The marker names
+		// this spender, so it fires whether the output still records the spend,
+		// has been unspent by a rollback, or was never spent by anyone, and it is
+		// checked before every other answer about the output (frozen, conflicting,
+		// locked, height-gated, spent by someone else, hash mismatch) on purpose:
+		// each of those is something the block paths cannot tell from an ordinary
+		// failure, so the record their create phase wrote for the replay would
+		// never be compensated. The marker says what the spender IS, whatever the
+		// output's state.
+		if r.childPruned {
+			validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
+			continue
+		}
+
 		if r.frozen {
 			validationErrors[i] = errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
 			continue
@@ -2269,19 +2303,6 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			continue
 		}
 
-		// Replay of a transaction the pruner already removed. The marker names
-		// this spender, so it fires whether the output still records the spend,
-		// has been unspent by a rollback, or was never spent by anyone. It is
-		// checked BEFORE the conflicting-spender test below on purpose: once a
-		// rollback has cleared the output and a replacement transaction has taken
-		// it, a replay would otherwise be answered ErrSpent, which the block paths
-		// cannot tell from an ordinary double spend, and the record their create
-		// phase wrote for the replay would never be compensated.
-		if r.childPruned {
-			validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
-			continue
-		}
-
 		// Check if already spent by a different transaction
 		if len(r.spendingDataBytes) > 0 && spend.SpendingData != nil && !bytes.Equal(r.spendingDataBytes, spend.SpendingData.Bytes()) {
 			existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(r.spendingDataBytes)
@@ -2298,6 +2319,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			// Record the parent so DAH can still be (re)evaluated and heal NULL DAHs
 			// left by spends that happened before the DAH-on-spend fix landed.
 			idempotentParentIDs[r.transactionID] = struct{}{}
+			item.idempotent = true
 			continue
 		}
 
@@ -2566,6 +2588,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				// else with our exact spending_data. Treat it as an idempotent
 				// match for DAH-healing purposes, same as the in-statement path.
 				idempotentParentIDs[resultMap[bIdx].transactionID] = struct{}{}
+				batch[bIdx].idempotent = true
 			}
 			if err := iRows.Close(); err != nil {
 				if isDeadlock(err) {
@@ -2771,6 +2794,14 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 			continue
 		}
 
+		// See the bulk path: the marker names this spender and takes precedence
+		// over every other answer about the output, so a replay is always
+		// identifiable.
+		if childPruned {
+			validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
+			continue
+		}
+
 		// Validate the UTXO state
 		if frozen {
 			validationErrors[i] = errors.NewUtxoFrozenError("[Spend] utxo is frozen for %s:%d", spend.TxID, spend.Vout)
@@ -2793,14 +2824,6 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 		// a freeze that will not clear for many blocks.
 		if spendableIn != nil && *spendableIn > 0 && item.blockHeight < *spendableIn {
 			validationErrors[i] = errors.NewUtxoFrozenError("[Spend] utxo %s:%d is not spendable until %d", spend.TxID, spend.Vout, *spendableIn)
-			continue
-		}
-
-		// See the bulk path: the marker names this spender, so an Unspend that
-		// cleared spending_data cannot disarm it, and it takes precedence over
-		// the conflicting-spender answer so a replay is always identifiable.
-		if childPruned {
-			validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
 			continue
 		}
 
@@ -2850,6 +2873,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 			// Still record the parent so DAH can be (re)evaluated — this heals DAHs
 			// that an earlier spend (before the DAH-on-spend fix) failed to set.
 			if len(spendingDataBytes) > 0 && spend.SpendingData != nil && bytes.Equal(spendingDataBytes, spend.SpendingData.Bytes()) {
+				item.idempotent = true
 				successItems = append(successItems, item)
 				spentParentIDs[transactionID] = struct{}{}
 				continue
