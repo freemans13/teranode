@@ -23,8 +23,8 @@ import (
 // TestPrunerReplayProtection exercises real pruning and the same-spender replay path.
 func TestPrunerReplayProtection(t *testing.T) {
 	for _, tc := range []struct {
-		name                                   string
-		paginated, markerFailure, ttl, unspend bool
+		name                                                           string
+		paginated, markerFailure, ttl, unspend, expressions, defensive bool
 	}{
 		{name: "normal"},
 		{name: "ttl", ttl: true},
@@ -37,25 +37,41 @@ func TestPrunerReplayProtection(t *testing.T) {
 		// firing at the moment a compensating rollback depends on it.
 		{name: "unspent_parent", unspend: true},
 		{name: "paginated_unspent_parent", paginated: true, unspend: true},
+		// The expression spend path (utxoBatchSize == 1) writes without Lua when
+		// its filter passes. After an unspend the element IS the bare hash, so
+		// the first-seen clause passes; the filter has to consult the marker
+		// too, or the replay goes straight through.
+		{name: "expressions", expressions: true},
+		{name: "expressions_unspent_parent", expressions: true, unspend: true},
+		{name: "expressions_paginated_unspent_parent", expressions: true, paginated: true, unspend: true},
+		// Defensive mode reads the marker off the scanned record and verifies
+		// each spending child before deleting; the marker set must be the same
+		// page-only set in both modes.
+		{name: "defensive", defensive: true},
+		{name: "defensive_paginated_parent", defensive: true, paginated: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testPrunerReplayProtection(t, tc.paginated, tc.markerFailure, tc.ttl, tc.unspend)
+			testPrunerReplayProtection(t, tc.paginated, tc.markerFailure, tc.ttl, tc.unspend, tc.expressions, tc.defensive)
 		})
 	}
 }
 
-func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, unspendParent bool) {
+func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, unspendParent, expressions, defensive bool) {
 	t.Helper()
 	logger := ulogger.New("pruner-replay-test")
 	s := test.CreateBaseTestSettings(t)
 	s.UtxoStore.DisableDAHCleaner = false
-	s.Pruner.UTXODefensiveEnabled = false
+	s.Pruner.UTXODefensiveEnabled = defensive
 	s.Pruner.UTXOSetTTL = ttl
 	s.Aerospike.EnableSpendFilterExpressions = true
 	var outputIndex uint32
 	if paginated {
 		s.UtxoStore.UtxoBatchSize = 2
 		outputIndex = 3
+	}
+	if expressions {
+		// useExpressionSpend requires one utxo per record.
+		s.UtxoStore.UtxoBatchSize = 1
 	}
 	client, store, ctx, cleanup := initAerospike(t, s, logger)
 	t.Cleanup(cleanup)
@@ -129,10 +145,9 @@ func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, uns
 		require.Eventually(t, func() bool { exists, err := client.Exists(nil, childKey); return err == nil && !exists }, 5*time.Second, 20*time.Millisecond)
 
 		// The record the spend path reads is the page holding the spent output,
-		// so that is the one that must carry the marker. With defensive mode off
-		// (the deployed default, and what this test sets) the master copy is not
-		// written when it differs: nothing reads it there, and it would grow
-		// without bound on a high fan-out parent.
+		// so that is the one that must carry the marker. The master gets no copy
+		// in either mode when it differs: nothing reads it there, and it grew
+		// without bound on a high fan-out parent until RECORD_TOO_BIG.
 		pageRecord, err := client.Get(nil, parentKey)
 		require.NoError(t, err)
 		require.Contains(t, pageRecord.Bins[fields.DeletedChildren.String()], child.TxID(), "the spending page must carry replay protection")
@@ -145,7 +160,7 @@ func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl, uns
 
 			if markers := masterRecord.Bins[fields.DeletedChildren.String()]; markers != nil {
 				require.NotContains(t, markers, child.TxID(),
-					"with defensive mode off the master must not accumulate markers for outputs it does not hold")
+					"the master must not accumulate markers for outputs it does not hold")
 			}
 		}
 	}
