@@ -305,11 +305,17 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 	// load-bearing: the tail returns nil from paths that did NOT put the block in the
 	// chain, and draining after one of those would try to commit the children of a
 	// block that is not there.
+	//
+	// scheduleDrain rather than drainParkedDescendants, and that is the whole of
+	// this change from the consumer's point of view: with a loop to admit into,
+	// the parked children become dispatches of their own, and the reply below
+	// lands microseconds after this block's own tail work instead of after every
+	// block parked behind it has been read off disk and validated.
 	bd.tail = func(d *blockDispatch, err error) error {
 		terr := sm.handleBlockMsgTail(d, err)
 
 		if terr == nil && d.msg.committed {
-			sm.drainParkedDescendants(d.msg.blockHash)
+			sm.scheduleDrain(d.msg.blockHash, d.height)
 		}
 
 		sm.finishBlockMsg(d.msg, terr)
@@ -355,6 +361,13 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 
 		default:
 			sm.parkedBlockCommitted(entry, d.parkedIsCheckpoint)
+
+			// The chain continues: whatever was parked behind this block is now
+			// committable. Scheduled here rather than inside parkedBlockCommitted,
+			// because the serial path calls that too and would turn its explicit
+			// stack walk back into recursion, one frame set per link of a chain
+			// that can be thousands long, each frame holding a decoded block.
+			sm.scheduleDrain(entry.hash, d.height)
 		}
 
 		return err

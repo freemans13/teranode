@@ -87,31 +87,36 @@ func (sm *SyncManager) blockExistsWithDeadline(hash chainhash.Hash) (bool, error
 	return sm.blockchainClient.GetBlockExists(ctx, &hash)
 }
 
-// parentChainState answers both questions the sweep has about a parent in one
-// round trip: is it stored, and is it usable.
+// parentChainState answers every question the sweep has about a parent in one
+// round trip: is it stored, is it usable, and how high is it.
 //
 // Asking only whether it exists was a real hole. Invalidation is a flag on the
 // row, not a delete, so a parent this node has REJECTED still exists, and the
 // sweep would commit its descendant on the strength of that. The pair is the
 // same one haveInventory already uses for the same reason.
-func (sm *SyncManager) parentChainState(hash chainhash.Hash) (exists bool, invalid bool, err error) {
+//
+// The height comes back because this lookup has already paid for it, and it is
+// the only chain-derived height a sweep-posted drain can have. Zero when the
+// parent is absent or its row carries no height, which every reader must take as
+// "not known" rather than "genesis".
+func (sm *SyncManager) parentChainState(hash chainhash.Hash) (exists bool, invalid bool, height uint32, err error) {
 	ctx, cancel := sm.chainCtx()
 	defer cancel()
 
 	_, meta, err := sm.blockchainClient.GetBlockHeader(ctx, &hash)
 	if err != nil {
 		if errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound) {
-			return false, false, nil
+			return false, false, 0, nil
 		}
 
-		return false, false, err
+		return false, false, 0, err
 	}
 
 	if meta == nil {
-		return false, false, nil
+		return false, false, 0, nil
 	}
 
-	return true, meta.Invalid, nil
+	return true, meta.Invalid, meta.Height, nil
 }
 
 // parkEvictionFloor is the height below which a parked block can never be
@@ -474,29 +479,182 @@ func (sm *SyncManager) runParkSweep() {
 // The inline path is for a manager that has no channel, which is how most of
 // this package's tests build one, and it is what the sweep did before it had a
 // goroutine of its own. A send on a nil channel would block forever.
-func (sm *SyncManager) submitParkCommit(entry parkedBlock) {
+func (sm *SyncManager) submitParkCommit(commit parkCommit) {
 	if sm.parkCommits == nil {
-		sm.commitParkedBlockAndDrain(entry)
+		sm.commitParkedBlockAndDrain(commit.entry)
 
 		return
 	}
 
+	// Checked before the select, not as an arm of it. Both arms can be ready at
+	// once and select picks uniformly, so after quit this would still post into a
+	// channel nobody drains, and the entry would be lost rather than restored.
 	select {
-	case sm.parkCommits <- entry:
+	case <-sm.quit:
+		sm.blockPark.Restore(commit.entry)
+
+		return
+	default:
+	}
+
+	select {
+	case sm.parkCommits <- commit:
 
 	case <-sm.quit:
 		// Nobody will commit it now. The caller took it out of the index, so put
 		// it back: its blob stays charged and Recover finds it on the next start.
-		sm.blockPark.Restore(entry)
+		sm.blockPark.Restore(commit.entry)
 	}
 }
 
+// parkCommit is one parked block the sweep found a stored parent for, with the
+// height of that parent, which the sweep's own lookup already fetched. The height
+// travels because a drained dispatch's frontier entry must not read height zero:
+// a zero there is refused as a parent, so the block behind it waits for an empty
+// frontier instead of chaining on.
+type parkCommit struct {
+	entry        parkedBlock
+	parentHeight uint32
+}
+
 // commitParkedBlockAndDrain commits one parked block and then everything parked
-// behind it. It is the consumer's side of submitParkCommit.
+// behind it, both on the calling goroutine. It is what a manager with no
+// dispatcher does, which is the pre-window path and every struct-literal test
+// manager.
 func (sm *SyncManager) commitParkedBlockAndDrain(entry parkedBlock) {
 	if sm.commitParkedBlock(entry) {
 		sm.drainParkedDescendants(entry.hash)
 	}
+}
+
+// scheduleDrain records that a block has committed and blocks parked behind it
+// may now be committable. It is the one entry point for that, and it has two
+// behaviours.
+//
+// With the drain running asynchronously it merges a request into the consumer's
+// own queue and returns at once, so the commit that discovered the work is not
+// held up by it. The queue holds parent hashes and heights, never claimed park
+// entries, which is what keeps a queued request's block visible to the sweep's
+// eviction and stuck-candidate passes while it waits.
+//
+// Otherwise it walks the stack synchronously, exactly as before. That is the
+// pre-window path, where there is no consumer loop to admit anything, and every
+// manager a test builds as a struct literal. Keeping the old call here rather
+// than routing everything through the queue is what makes
+// blockvalidation_quick_window_blocks = 0 a true rollback.
+//
+// Every caller runs on the goroutine that owns the queue, so there is no lock and
+// no channel: a channel would only add a send that can block the one goroutine
+// this whole change exists to keep free.
+func (sm *SyncManager) scheduleDrain(parent chainhash.Hash, parentHeight uint32) {
+	if !sm.drainAsync.Load() {
+		sm.drainParkedDescendants(parent)
+
+		return
+	}
+
+	if !sm.blockPark.Enabled() {
+		return
+	}
+
+	for i := range sm.drainQueue {
+		if sm.drainQueue[i].parent.IsEqual(&parent) {
+			// Deduped by parent, keeping the better height. The same parent can be
+			// discovered twice, by a commit and by a worker whose write finished
+			// after that commit, and draining it twice is wasted lookups.
+			if parentHeight > sm.drainQueue[i].parentHeight {
+				sm.drainQueue[i].parentHeight = parentHeight
+			}
+
+			return
+		}
+	}
+
+	// Bounded by the number of distinct parents of parked blocks, and capped at
+	// the park's own entry limit besides. A dropped request is not a lost block:
+	// the sweep finds it within its interval, because a parked block whose parent
+	// is stored is exactly what StuckCandidates hands over.
+	if len(sm.drainQueue) >= maxParkedEntries {
+		sm.logger.Warnf("[scheduleDrain][%s] the drain queue is full at %d parents; this one waits for the sweep", parent, len(sm.drainQueue))
+
+		return
+	}
+
+	sm.drainQueue = append(sm.drainQueue, drainRequest{parent: parent, parentHeight: parentHeight})
+}
+
+// drainRequest is one committed block whose parked children may now be
+// committable, held by hash rather than by claimed entry.
+type drainRequest struct {
+	parent       chainhash.Hash
+	parentHeight uint32
+}
+
+// drainStep turns at most one parked block into a dispatch, and reports whether
+// it did. It runs on the consumer goroutine, in the same loop turn as the
+// admission test, so the answer cannot go stale between them.
+//
+// The order is peek, test, claim, advance the header front, dispatch. Peeking
+// first is what stops a refused candidate being stranded out of the index, and it
+// is also where the size comes from, which the byte arm of the admission test
+// needs. The header front is advanced here rather than in the tail because the
+// front has to be past this block before the next arriving block is
+// head-processed, and freeing the consumer is precisely what makes that not
+// automatic any more: a live successor examined while the front still sits on an
+// in-flight parked block matches nothing, never removes its own node, never
+// learns it is the checkpoint block, and wedges the walk on a block already
+// committed.
+func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
+	for len(sm.drainQueue) > 0 {
+		req := sm.drainQueue[0]
+
+		peeked, ok := sm.blockPark.FirstChildFor(req.parent)
+		if !ok {
+			// Nothing left behind this parent that can be committed now. A child
+			// still being written stays queued under its own parent and is asked
+			// for by whoever finishes the write.
+			sm.drainQueue = sm.drainQueue[1:]
+
+			continue
+		}
+
+		d := &blockDispatch{parked: &peeked, bytes: peeked.size}
+
+		if req.parentHeight > 0 {
+			d.height = req.parentHeight + 1
+		}
+
+		if !bd.canDispatch(d) {
+			// Left in the queue, entry untouched, to be offered again next turn.
+			return false
+		}
+
+		entry, ok := sm.blockPark.Take(peeked.hash)
+		if !ok {
+			// The sweep took it between the peek and the claim. Its own path will
+			// commit it, so this turn has nothing to do.
+			return false
+		}
+
+		isCheckpointBlock, removedFront := sm.advanceHeaderListFor(entry.hash)
+
+		// Merged onto the entry the dispatch owns, because every path that gives
+		// the block up rewinds from it, and by then the node is gone from both the
+		// list and the index.
+		if removedFront != nil {
+			entry.removedFront = removedFront
+		}
+
+		d.parked = &entry
+		d.parkedIsCheckpoint = isCheckpointBlock
+		d.isCheckpoint = isCheckpointBlock
+
+		bd.dispatch(d)
+
+		return true
+	}
+
+	return false
 }
 
 // sweepParkedBlocks is the safety net for blocks whose parent never arrives
@@ -562,7 +720,7 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 			break
 		}
 
-		exists, invalid, err := sm.parentChainState(candidate.prevBlock)
+		exists, invalid, parentHeight, err := sm.parentChainState(candidate.prevBlock)
 		if err != nil {
 			sm.logger.Warnf("[sweepParkedBlocks][%s] could not check whether parent %s is usable: %v", candidate.hash, candidate.prevBlock, err)
 			continue
@@ -589,6 +747,6 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 
 		sm.logger.Infof("[sweepParkedBlocks][%s] parent %s is in the chain after all, committing the parked block", entry.hash, entry.prevBlock)
 
-		sm.submitParkCommit(entry)
+		sm.submitParkCommit(parkCommit{entry: entry, parentHeight: parentHeight})
 	}
 }

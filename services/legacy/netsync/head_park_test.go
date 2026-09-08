@@ -333,11 +333,14 @@ func TestSweep_PostsCommitsToTheConsumerInsteadOfCommitting(t *testing.T) {
 	_, failed := h.sm.recentlyFailedBlocks.Get(child)
 	require.False(t, failed, "and without judging the block")
 
-	entry := <-h.sm.parkCommits
-	require.Equal(t, child, entry.hash)
+	commit := <-h.sm.parkCommits
+	require.Equal(t, child, commit.entry.hash)
+	require.Positive(t, commit.parentHeight,
+		"the sweep passes the parent height its own lookup fetched, so the drained block's frontier entry is not height-blind")
 
-	// The consumer's side.
-	h.sm.commitParkedBlockAndDrain(entry)
+	// The consumer's side, which is the same one every drained block takes: put
+	// the entry back, then let the drain step claim it through one admission test.
+	h.sm.commitParkedBlockAndDrain(commit.entry)
 
 	for _, name := range parkDirEntries(t, h.parkDir) {
 		require.NotContains(t, name, child.String(), "the consumer's commit is what deletes the blob")

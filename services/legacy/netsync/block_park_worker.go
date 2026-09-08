@@ -64,7 +64,7 @@ func (sm *SyncManager) startParkWorkers(workers int) {
 
 	// One slot per commit a sweep tick can post, so a tick never waits on the
 	// consumer for room and the consumer never waits on the sweep for anything.
-	sm.parkCommits = make(chan parkedBlock, parkSweepRPCBudget)
+	sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
 
 	for i := 0; i < workers; i++ {
 		sm.parkWorkers.Add(1)
@@ -180,7 +180,7 @@ func (sm *SyncManager) applyParkOutcome(outcome parkOutcome) {
 		if outcome.drainParent {
 			sm.logger.Infof("[applyParkOutcome][%s] its parent committed while it was being written, draining now", job.entry.hash)
 
-			sm.drainParkedDescendants(job.entry.prevBlock)
+			sm.scheduleDrain(job.entry.prevBlock, 0)
 		}
 
 	default:
