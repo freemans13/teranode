@@ -599,6 +599,11 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 	bd.frontier = append(bd.frontier, e)
 	bd.inflight += d.bytes * windowBytesPerWireByte
 
+	// The window now accounts for this block's memory, so the download budget
+	// does not have to. A parked dispatch has no queue message and never held
+	// download bytes in the first place.
+	noteHandedOff(d.msg)
+
 	if d.isCheckpoint {
 		bd.barrier = true
 	}

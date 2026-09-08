@@ -236,7 +236,27 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 		return none, 0, nil, false
 	}
 
-	if sm.localReadBackpressured() {
+	// Our own read throttling is a reason not to blame a peer for silence, and it
+	// is the right reason while the pipeline is genuinely the bottleneck. It is
+	// the wrong reason when we are holding blocks we cannot commit, because then
+	// the frontier block is the only thing standing between us and work that is
+	// already on disk, and how busy we look has nothing to do with it.
+	//
+	// A non-empty park is exactly that condition, said in terms of the thing
+	// itself rather than inferred from throughput. Measured on mainnet at height
+	// 752,965: 119 blocks parked in six chains, each above a different block that
+	// had never arrived, while localReadBackpressured held permanently because
+	// eight peers kept the backlog non-empty and drained blocks kept the progress
+	// stamp fresh. The race fired once in an hour where a late front block should
+	// draw a second peer every legacy_blockSlowFetchTimeout.
+	//
+	// Every other protection stands: the frontier must already be older than that
+	// timeout, no owner may be visibly pulling bytes, the racer count is capped by
+	// legacy_maxBlockParallelFetch, and the park's own check below refuses a block
+	// we are holding anyway. The stall check keeps the unmodified predicate, so
+	// nothing here changes when a peer is demoted or disconnected: this asks a
+	// second peer for a copy and nothing more.
+	if sm.localReadBackpressured() && sm.blockPark.Len() == 0 {
 		return none, 0, nil, false
 	}
 

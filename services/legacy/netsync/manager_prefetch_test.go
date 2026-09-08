@@ -23,7 +23,7 @@ func newPrefetchManager(budget int64) *SyncManager {
 	if budget > 0 {
 		sm.blockPrefetchBudgetBytes = budget
 		sm.blockPrefetchBudget = semaphore.NewWeighted(budget)
-		sm.inFlightBlocks = make(map[chainhash.Hash]struct{})
+		sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
 	}
 
 	return sm
