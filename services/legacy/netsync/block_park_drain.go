@@ -620,8 +620,34 @@ func (sm *SyncManager) drainStep(bd *blockDispatcher) bool {
 
 		d := &blockDispatch{parked: &peeked, bytes: peeked.size}
 
-		if req.parentHeight > 0 {
+		// The same routing rule a live block gets, and for the same reason. A
+		// drained block used to be dispatched un-windowed, which demands an empty
+		// frontier, so each one waited for the previous to finish entirely: its
+		// blob read and the two blockchain lookups every block makes before its
+		// work starts all landed after the previous block rather than beside it.
+		// Measured on mainnet at 82% duty cycle, that was a flat one second per
+		// block, flat being the clue, since a disk read would scale with the
+		// block's size and this did not.
+		//
+		// The parent is the frontier tail whenever a chain is drained in order,
+		// which is the ordinary case, and the tail is what the ordering
+		// hand-shake waits on. parentFor refuses a tail whose height is unknown,
+		// so a resolved parent always carries a chain-derived height.
+		if p := sm.dispatcher.parentFor(&peeked.prevBlock); p != nil {
+			d.height = p.height + 1
+
+			if sm.windowRoute(d.height) {
+				d.parent = p
+				d.windowed = true
+			}
+		} else if req.parentHeight > 0 {
 			d.height = req.parentHeight + 1
+
+			// No parent in flight, so this block starts the window from an empty
+			// frontier exactly as a live block in the same position does: nothing
+			// ahead of it in the frontier is its ancestor, so the hand-shake would
+			// have nothing to wait on.
+			d.windowed = sm.windowRoute(d.height) && bd.frontierEmpty()
 		}
 
 		if !bd.canDispatch(d) {
