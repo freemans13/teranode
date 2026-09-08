@@ -974,3 +974,128 @@ func TestHandleBlockMsg_TheOwnersThatDidNotDeliverGetTheirBudgetBack(t *testing.
 	require.False(t, sm.blockDownloads.RequestedWithin(hash, blockRequestRetryInterval),
 		"and the hash is re-requestable at once, which is what a rewind onto a rejected block needs")
 }
+
+// TestFrontierRace_ADemotedRacerDoesNotDisableTheRace is the sibling of the
+// departed-racer test above, and the case that test's fix does not cover.
+//
+// frontierRaceTarget prunes a racer that has disconnected. A demoted peer has
+// not disconnected: demoteSyncPeer keeps the connection deliberately, because a
+// peer that is slow at headers may still be a fine source of block bodies. So a
+// peer judged stalled, whose owed blocks have been handed back for retry, keeps
+// its racing slot for as long as the frontier sits on the block it failed to
+// deliver — and the frontier only moves when that block arrives.
+//
+// At the default cap of two, the owner plus one such ghost fills it, so the one
+// block holding up the entire chain becomes the one block that can never be
+// raced again. Mainnet sat like that for forty minutes on 2026-09-08: an empty
+// window, nothing parked, the block loop idle with its queue arm open and
+// willing, demoting a fresh sync peer every two minutes and re-fetching headers
+// it already had, while the race declined every five seconds because "as many
+// peers are already racing it as configuration allows".
+//
+// reopenDemotedPeerSlice's own warning names the frontier race as the recovery
+// of last resort. Leaving the ghost in place is what disables it.
+func TestFrontierRace_ADemotedRacerDoesNotDisableTheRace(t *testing.T) {
+	sm := newRaceManager(t)
+
+	syncPeer, _, syncRec := connectRacePeer(t, 40, 100)
+	owner, _, _ := connectRacePeer(t, 41, 1000)
+	stalled, _, _ := connectRacePeer(t, 42, 1000)
+	live, _, liveRec := connectRacePeer(t, 43, 1000)
+
+	registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, owner)
+	stalledState := registerRacePeer(sm, stalled)
+	registerRacePeer(sm, live)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	frontier := chainhash.Hash{0xfb}
+
+	require.True(t, sm.blockDownloads.Add(owner, frontier))
+	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
+
+	// The racer we already asked, which never delivered.
+	require.True(t, sm.registerFrontierRacer(frontier, stalled))
+
+	// The precondition that makes this test different from the departed one, and
+	// without which it would prove nothing: the stalled peer is still connected,
+	// so the existing pruning leaves it exactly where it is.
+	require.True(t, stalled.Connected(), "precondition: a demoted peer keeps its connection")
+
+	// And the cap is genuinely reached, so the race is off before the demotion.
+	sm.raceFrontierBlock(time.Now())
+	require.Zero(t, liveRec.count(), "precondition: the owner plus one racer already fills the cap")
+
+	// What demotion does, in the order demoteSyncPeer does it: bar the peer from
+	// re-election, then hand back what it owed us. After this it is not a peer we
+	// are waiting on, so it must neither count as racing nor be raced itself.
+	stalledState.noteDemotedFor(maxLastBlockTime)
+	sm.reopenDemotedPeerSlice(stalled)
+
+	sm.raceFrontierBlock(time.Now())
+
+	require.True(t, WaitUntil(func() bool { return liveRec.count() > 0 }, 5*time.Second),
+		"a demoted racer must not keep the parallel-fetch slot; the stuck block must still be raced")
+	require.Equal(t, []chainhash.Hash{frontier}, liveRec.all(),
+		"and it must be raced the frontier block, nothing else")
+	require.Zero(t, syncRec.count(), "the peer below the frontier height must not be asked")
+
+	require.True(t, sm.blockDownloads.HasOwner(live, frontier),
+		"the racer's reply has to be authorised in advance")
+}
+
+// TestFrontierRace_ADemotedPeerIsNotTheOneRaced is the other half of the fix
+// above, isolated so it is actually proved.
+//
+// forgetFrontierRacer frees the racing slot a demoted peer was holding. On its
+// own that is not enough: the candidate loop picks any connected sync candidate
+// tall enough to have the block, and the peer we have just judged stalled fits
+// that description. With two eligible peers the choice is a coin toss on map
+// order, so half the time the freed slot goes straight back to the peer that
+// failed to deliver, and the stall runs for another cycle.
+//
+// Here the demoted peer is the only candidate, so there is no luck left in it:
+// either it is skipped and nothing is asked, or the fix does nothing.
+func TestFrontierRace_ADemotedPeerIsNotTheOneRaced(t *testing.T) {
+	sm := newRaceManager(t)
+
+	syncPeer, _, syncRec := connectRacePeer(t, 50, 100)
+	owner, _, _ := connectRacePeer(t, 51, 1000)
+	stalled, _, stalledRec := connectRacePeer(t, 52, 1000)
+
+	registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, owner)
+	stalledState := registerRacePeer(sm, stalled)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	frontier := chainhash.Hash{0xfc}
+
+	require.True(t, sm.blockDownloads.Add(owner, frontier))
+	sm.setFrontier(frontier, 500, time.Now().Add(-30*time.Second))
+
+	// Demoted, and the only peer that could otherwise be asked: the sync peer is
+	// too short to have the block and the owner already owes it.
+	stalledState.noteDemotedFor(maxLastBlockTime)
+	sm.reopenDemotedPeerSlice(stalled)
+
+	require.True(t, stalled.Connected(), "precondition: a demoted peer keeps its connection")
+	require.True(t, stalledState.inDemotionCooldown(), "precondition: the peer is inside its cooldown")
+
+	sm.raceFrontierBlock(time.Now())
+
+	// Deliberately a negative assertion with a wait behind it, so a getdata that
+	// merely takes a moment to reach the recorder cannot pass as an absence.
+	require.False(t, WaitUntil(func() bool { return stalledRec.count() > 0 }, 2*time.Second),
+		"the peer just judged stalled must not be handed the racing slot it was freed from")
+	require.Zero(t, syncRec.count(), "the peer below the frontier height must not be asked either")
+
+	// And once the cooldown lapses it is a candidate again, because demotion is a
+	// cooldown rather than a ban: nothing else may be left to ask.
+	stalledState.clearDemotionCooldown()
+
+	sm.raceFrontierBlock(time.Now())
+
+	require.True(t, WaitUntil(func() bool { return stalledRec.count() > 0 }, 5*time.Second),
+		"out of its cooldown the peer is worth asking again")
+	require.Equal(t, []chainhash.Hash{frontier}, stalledRec.all())
+}

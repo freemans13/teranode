@@ -350,6 +350,15 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 			continue
 		}
 
+		// A peer inside its demotion cooldown has just been judged stalled, so
+		// racing it is asking the peer that already failed to deliver. This pairs
+		// with forgetFrontierRacer: that frees the slot a demoted peer was
+		// holding, and without this the very next race hands the slot straight
+		// back to it and the fix buys nothing.
+		if state.inDemotionCooldown() {
+			continue
+		}
+
 		// No point asking a peer that has not told us it has the block.
 		if height > 0 && p.LastBlock() < height {
 			continue
@@ -445,6 +454,38 @@ func (sm *SyncManager) registerFrontierRacer(hash chainhash.Hash, p *peerpkg.Pee
 	sm.frontierRacers[p] = struct{}{}
 
 	return true
+}
+
+// forgetFrontierRacer stops a peer counting towards the racing cap. Called when
+// the peer's claim on the blocks it owed has been handed back, because those are
+// the same fact said twice: a peer we have stopped waiting on is not racing
+// anything for us.
+//
+// The pruning in frontierRaceTarget does not cover this. It drops a racer that
+// has disconnected, and a demoted peer has not disconnected — demoteSyncPeer
+// keeps the connection deliberately, since a peer that is slow at headers may
+// still serve block bodies well. So a peer already judged stalled kept its
+// racing slot for as long as the frontier sat on the block it failed to deliver,
+// and the frontier only moves when that block arrives. At the default cap of two
+// the owner plus one such ghost fills it, which made the one block holding up
+// the entire chain the one block that could never be raced again.
+//
+// Mainnet sat in exactly that state for forty minutes on 2026-09-08: an empty
+// window, nothing parked, the block loop idle with its queue arm open and
+// willing to take anything, a fresh sync peer demoted every two minutes, headers
+// re-fetched that we already had, and the race declining every five seconds
+// because as many peers were already racing it as configuration allowed.
+// reopenDemotedPeerSlice's own warning calls the frontier race the recovery of
+// last resort; leaving the ghost in place is what switched it off.
+func (sm *SyncManager) forgetFrontierRacer(p *peerpkg.Peer) {
+	if p == nil {
+		return
+	}
+
+	sm.frontierMu.Lock()
+	defer sm.frontierMu.Unlock()
+
+	delete(sm.frontierRacers, p)
 }
 
 // unregisterFrontierRacer undoes registerFrontierRacer for a race that was
