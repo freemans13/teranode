@@ -867,17 +867,25 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to select finality time sources", err)
 	}
 
-	if err = sm.PreValidateTransactions(ctx, txMap, bi.hash, bi.height, candidateBlockTime, candidateParentMedianTime, outpointOnly, failClosed); err != nil {
-		// Compensate createUtxos. Create never consults the pruner's replay
-		// markers, so a block replaying a pruned transaction gets through the
-		// create phase and is only rejected here. On this path the record is
-		// created without WithLocked, so leaving it behind is worse than on the
-		// blockvalidation path: it is mined, unlocked and spendable even though a
-		// mined grandchild already consumed those outputs, and with no
+	prunedReplays, err := sm.PreValidateTransactions(ctx, txMap, bi.hash, bi.height, candidateBlockTime, candidateParentMedianTime, outpointOnly, failClosed)
+	if err != nil {
+		// Compensate createUtxos, but only for the transactions that are
+		// actually ghosts. Create never consults the pruner's replay markers, so
+		// a block replaying a pruned transaction gets through the create phase
+		// and is only rejected here. On this path the record is created without
+		// WithLocked, so leaving it behind is worse than on the blockvalidation
+		// path: it is mined, unlocked and spendable even though a mined
+		// grandchild already consumed those outputs, and with no
 		// delete_at_height nothing ever reclaims it.
-		if deleteErr := utxo.DeleteCreated(ctx, sm.logger, sm.utxoStore, createdTxHashes,
+		//
+		// Deliberately NOT everything createUtxos wrote. The rest may be valid
+		// and wanted by a concurrently validating sibling block that took
+		// ErrTxExists on them; a transaction rejected on a replay marker can
+		// never legitimately exist, so no block needs it.
+		if deleteErr := utxo.DeleteCreated(ctx, sm.logger, sm.utxoStore,
+			intersectHashes(createdTxHashes, prunedReplays),
 			sm.settings.Legacy.StoreBatcherSize*sm.settings.Legacy.StoreBatcherConcurrency); deleteErr != nil {
-			return errors.NewProcessingError("[validateTransactionsLegacyMode] pre-validation failed and the created records could not be removed", errors.Join(err, deleteErr))
+			return errors.NewProcessingError("[validateTransactionsLegacyMode] pre-validation failed and the recreated pruned transactions could not be removed", errors.Join(err, deleteErr))
 		}
 
 		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to pre-validate transactions", err)
@@ -1250,6 +1258,30 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	return createdTxHashes, nil
 }
 
+// intersectHashes returns the members of want that are also in created. Used to
+// hold the compensating delete to records this block's own create phase wrote:
+// a transaction that was already in the store belongs to whoever put it there.
+func intersectHashes(created, want []*chainhash.Hash) []*chainhash.Hash {
+	if len(created) == 0 || len(want) == 0 {
+		return nil
+	}
+
+	createdSet := make(map[chainhash.Hash]struct{}, len(created))
+	for _, hash := range created {
+		createdSet[*hash] = struct{}{}
+	}
+
+	result := make([]*chainhash.Hash, 0, len(want))
+
+	for _, hash := range want {
+		if _, ok := createdSet[*hash]; ok {
+			result = append(result, hash)
+		}
+	}
+
+	return result
+}
+
 // reuseBlockIDFromUTXO returns an already-recorded block id for this block by
 // reading the BlockIDs of its first non-coinbase transaction from the UTXO
 // store. This recovers the id after a restart (when the blockchain service's
@@ -1294,8 +1326,13 @@ func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, bi blockIdent, 
 // only when blockHeight >= CSVHeight (bitcoin-sv's post-BIP113 path at
 // src/validation.cpp:6001). The caller passes the one matching this block's
 // era and zeroes the other.
+//
+// It also returns the transactions the store rejected because the pruner had
+// already removed them. Those are the records createUtxos recreated, and the
+// caller deletes them again: Create does not consult the replay markers, so
+// nothing else stops the block leaving a permanent ghost behind.
 func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
-	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32, outpointOnly bool, failClosed bool) (err error) {
+	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32, outpointOnly bool, failClosed bool) (prunedReplays []*chainhash.Hash, err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "PreValidateTransactions",
 		tracing.WithLogMessage(sm.logger, "[PreValidateTransactions] called for block %s / height %d", blockHash, blockHeight),
 		tracing.WithHistogram(prometheusLegacyNetsyncPreValidateTransactions),
@@ -1316,7 +1353,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
 	// can read mtpStore[h] without locking and without making gRPC calls.
 	if err = sm.validationClient.EnsureMTPLoaded(ctx, blockHeight); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Below-checkpoint outpoint-only fast path: validate spends by outpoint only,
@@ -1339,7 +1376,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if ctx.Err() != nil {
-			return errors.NewProcessingError("[PreValidateTransactions] context cancelled")
+			return prunedReplays, errors.NewProcessingError("[PreValidateTransactions] context cancelled")
 		}
 
 		if attempt > 0 {
@@ -1373,6 +1410,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					mu.Lock()
 					hardFail = errors.NewProcessingError(txNotFoundInTxMapMsg, txHash.String())
 					mu.Unlock()
+
 					return nil
 				}
 
@@ -1433,6 +1471,9 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 						mu.Unlock()
 					} else {
 						mu.Lock()
+						if errors.Is(validateErr, errors.ErrUtxoSpendingTxPruned) {
+							prunedReplays = append(prunedReplays, txWrapper.Tx.TxIDChainHash())
+						}
 						hardFail = validateErr
 						mu.Unlock()
 					}
@@ -1445,26 +1486,27 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 		_ = g.Wait()
 
 		if hardFail != nil {
-			return errors.NewProcessingError("[PreValidateTransactions] non-retryable error", hardFail)
+			return prunedReplays, errors.NewProcessingError("[PreValidateTransactions] non-retryable error", hardFail)
 		}
 
 		if len(retryableTxs) == 0 {
 			if attempt > 0 {
 				sm.logger.Infof("[PreValidateTransactions] all transactions succeeded after %d retries", attempt)
 			}
-			return nil
+
+			return nil, nil
 		}
 
 		// No progress since last attempt — stop retrying
 		if attempt > 0 && len(retryableTxs) >= len(pendingTxHashes) {
-			return errors.NewProcessingError("[PreValidateTransactions] %d of %d transactions failed with no progress, giving up",
+			return prunedReplays, errors.NewProcessingError("[PreValidateTransactions] %d of %d transactions failed with no progress, giving up",
 				len(retryableTxs), totalTxCount, lastErr)
 		}
 
 		pendingTxHashes = retryableTxs
 	}
 
-	return errors.NewProcessingError("[PreValidateTransactions] %d of %d transactions still failing after %d retries",
+	return prunedReplays, errors.NewProcessingError("[PreValidateTransactions] %d of %d transactions still failing after %d retries",
 		len(pendingTxHashes), totalTxCount, maxRetries)
 }
 

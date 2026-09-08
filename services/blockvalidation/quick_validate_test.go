@@ -1316,10 +1316,20 @@ func TestQuickValidateRemovesCreatesWhenSpendPhaseFails(t *testing.T) {
 	_, err = store.Get(ctx, childTx.TxIDChainHash())
 	require.ErrorIs(t, err, errors.ErrTxNotFound, "the pruner must have removed the child")
 
+	// A second, entirely valid transaction shares the batch. The compensation
+	// must not touch it: another block validating concurrently would have taken
+	// ErrTxExists on it and be relying on it, whereas the replayed pruned child
+	// can never legitimately exist.
+	siblingTx := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(parentTx, 1),
+		transactions.WithP2PKHOutputs(1, 4000, publicKey),
+	)
+
 	block := &model.Block{Height: 1400, ID: 1400}
 	batch := &SubtreeProcessingBatch{
-		batchTxs:   []*bt.Tx{childTx},
-		txRanges:   [][2]int{{0, 1}},
+		batchTxs:   []*bt.Tx{childTx, siblingTx},
+		txRanges:   [][2]int{{0, 2}},
 		batchStart: 0,
 		batchEnd:   1,
 	}
@@ -1331,4 +1341,8 @@ func TestQuickValidateRemovesCreatesWhenSpendPhaseFails(t *testing.T) {
 	_, err = store.Get(ctx, childTx.TxIDChainHash())
 	require.ErrorIs(t, err, errors.ErrTxNotFound,
 		"the record the create phase wrote must not survive the failed spend phase")
+
+	meta, err := store.Get(ctx, siblingTx.TxIDChainHash())
+	require.NoError(t, err, "the compensation must remove the ghost only, not the whole batch")
+	require.NotNil(t, meta)
 }
