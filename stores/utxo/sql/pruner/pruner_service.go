@@ -272,135 +272,50 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 // mainnet-sized store it is hours of work inside one transaction, which is not
 // something a node should do on every boot.
 func (s *Service) deleteTombstonedTx(ctx context.Context, blockHeight uint32) (int64, error) {
-	// Use configured safety window from settings
-	safetyWindow := s.safetyWindow
-
-	// Defensive child verification is conditional on the UTXODefensiveEnabled
-	// setting. When disabled, parents are deleted without verifying children are
-	// stable. Each branch is a complete literal statement rather than a fragment
-	// concatenated at runtime, so no part of the SQL is ever built from data.
-	var candidateSelect string
-
-	args := []interface{}{blockHeight}
-
+	// Every statement below is a complete literal. Nothing is concatenated at
+	// runtime and no part of the SQL is ever built from data.
+	//
+	// Non-defensive mode (the deployed configuration) needs no candidates table:
+	// its predicate cannot be changed by anything inside this transaction, so
+	// the marker INSERT and the DELETE can share the same sub-select. That also
+	// makes the first statement a write, so SQLite takes its write lock straight
+	// away instead of upgrading later.
+	//
+	// Defensive mode has to materialise, because the marker INSERT changes the
+	// defensive predicate: a newly marked parent becomes eligible, and
+	// re-evaluating in the DELETE would remove parents that never got markers of
+	// their own.
 	if !s.defensiveEnabled {
-		// Defensive mode disabled - delete all transactions past their expiration
-		candidateSelect = `
-			SELECT id FROM transactions
-			WHERE delete_at_height IS NOT NULL
-			  AND delete_at_height <= $1
-		`
-	} else {
-		// Defensive mode enabled - verify ALL spending children are stable before deletion
-		// This prevents orphaning any child transaction
-		candidateSelect = `
-			SELECT id FROM transactions
-			WHERE id IN (
-				SELECT t.id
-				FROM transactions t
-				WHERE t.delete_at_height IS NOT NULL
-				  AND t.delete_at_height <= $1
-				  AND NOT EXISTS (
-				    -- Find ANY unstable child - if found, parent cannot be deleted
-				    -- This ensures ALL children must be stable before parent deletion
-				    SELECT 1
-				    FROM outputs o
-				    WHERE o.transaction_id = t.id
-				      AND o.spending_data IS NOT NULL
-				      AND NOT EXISTS (
-				          SELECT 1 FROM deleted_children d
-				          WHERE d.parent_id = t.id
-				            AND d.child_hash = substr(o.spending_data, 1, 32)
-				      )
-				      AND (
-				        -- Extract child TX hash from spending_data (first 32 bytes)
-				        -- Check if this child is NOT stable
-				        NOT EXISTS (
-				          SELECT 1
-				          FROM transactions child
-				          INNER JOIN block_ids child_blocks ON child.id = child_blocks.transaction_id
-				          WHERE child.hash = substr(o.spending_data, 1, 32)
-				            AND child.unmined_since IS NULL  -- Child must be mined
-				            AND child_blocks.block_height <= ($1 - $2)  -- Child must be stable
-				        )
-				      )
-				  )
-			)
-		`
-		args = append(args, safetyWindow)
+		return s.pruneWithoutDefensiveCheck(ctx, blockHeight)
 	}
 
-	// Isolation note, corrected. LevelSerializable is honoured by Postgres only.
-	// modernc.org/sqlite's conn.BeginTx reads opts.ReadOnly and the DSN _txlock
-	// mode and never inspects opts.Isolation, and because the driver implements
-	// driver.ConnBeginTx, database/sql does not reject the level either.
-	// util/sql.go builds the SQLite DSN with no _txlock, so what we actually get
-	// there is a plain deferred BEGIN. The cross-statement atomicity this
-	// function needs still holds on SQLite - one writer at a time, and the
-	// transaction rolls back as a unit - but it holds because SQLite serialises
-	// writers, not because the level was asked for. A deferred BEGIN that starts
-	// as a reader can also fail to upgrade with SQLITE_BUSY_SNAPSHOT, which is
-	// why deleteTombstoned retries the whole transaction.
+	return s.pruneWithDefensiveCheck(ctx, blockHeight)
+}
+
+// beginPruneTx opens the pruning transaction.
+//
+// Isolation note, corrected. LevelSerializable is honoured by Postgres only.
+// modernc.org/sqlite's conn.BeginTx reads opts.ReadOnly and the DSN _txlock mode
+// and never inspects opts.Isolation, and because the driver implements
+// driver.ConnBeginTx, database/sql does not reject the level either. util/sql.go
+// builds the SQLite DSN with no _txlock, so what we actually get there is a
+// plain deferred BEGIN. The cross-statement atomicity this function needs still
+// holds on SQLite - one writer at a time, and the transaction rolls back as a
+// unit - but it holds because SQLite serialises writers, not because the level
+// was asked for. A deferred BEGIN that starts as a reader can also fail to
+// upgrade with SQLITE_BUSY_SNAPSHOT, which is why deleteTombstoned retries the
+// whole transaction.
+func (s *Service) beginPruneTx(ctx context.Context) (*sql.Tx, error) {
 	txn, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
-		return 0, errors.NewStorageError("failed to begin pruning transaction", err)
+		return nil, errors.NewStorageError("failed to begin pruning transaction", err)
 	}
 
-	defer func() { _ = txn.Rollback() }()
+	return txn, nil
+}
 
-	// candidateRef is the sub-select that both the marker INSERT and the DELETE
-	// run against; candidateArgs are its parameters.
-	candidateRef := candidateSelect
-	candidateArgs := args
-
-	if s.defensiveEnabled {
-		// Defensive mode only: materialise the candidates first. The marker
-		// INSERT below changes the defensive predicate - a newly marked parent
-		// can become eligible - so re-evaluating it in the DELETE would delete
-		// parents that never got markers of their own. The non-defensive
-		// predicate (delete_at_height IS NOT NULL AND delete_at_height <= $1)
-		// cannot be changed by anything inside this transaction, so that path
-		// skips the temp table and its DDL entirely.
-		//
-		// Temporary tables are connection-local and this transaction owns the
-		// connection until commit or rollback. Postgres drops it at COMMIT via
-		// ON COMMIT DROP; SQLite has no such clause and keeps a committed temp
-		// table on the connection, so the leading DROP TABLE IF EXISTS clears
-		// any leftover. Neither adds a failure path AFTER the delete has already
-		// happened, which is the point: the previous explicit DROP ran after
-		// RowsAffected and threw away a completed prune if it errored.
-		if _, err := txn.ExecContext(ctx, "DROP TABLE IF EXISTS utxo_prune_candidates"); err != nil {
-			return 0, errors.NewStorageError("failed to clear stale pruning candidates", err)
-		}
-
-		createCandidates := "CREATE TEMP TABLE utxo_prune_candidates " + s.onCommitDrop() + "AS" + candidateSelect
-		if _, err := txn.ExecContext(ctx, createCandidates, args...); err != nil {
-			return 0, errors.NewStorageError("failed to select pruning candidates", err)
-		}
-
-		candidateRef = "SELECT id FROM utxo_prune_candidates"
-		candidateArgs = nil
-	}
-
-	markerQuery := `INSERT INTO deleted_children (parent_id, child_hash)
-  SELECT DISTINCT parent.id, child.hash
-  FROM (` + candidateRef + `) candidate
-  JOIN transactions child ON child.id = candidate.id
-  JOIN inputs i ON i.transaction_id = child.id
-  JOIN transactions parent ON parent.hash = i.previous_transaction_hash
-  ON CONFLICT (parent_id, child_hash) DO NOTHING`
-
-	if _, err := txn.ExecContext(ctx, markerQuery, candidateArgs...); err != nil {
-		return 0, errors.NewStorageError("failed to mark pruned children", err)
-	}
-
-	deleteQuery := "DELETE FROM transactions WHERE id IN (" + candidateRef + ")"
-
-	result, err := txn.ExecContext(ctx, deleteQuery, candidateArgs...)
-	if err != nil {
-		return 0, errors.NewStorageError("failed to delete transactions", err)
-	}
-
+// finishPrune reads the delete's row count and commits.
+func finishPrune(txn *sql.Tx, result sql.Result) (int64, error) {
 	count, err := result.RowsAffected()
 	if err != nil {
 		return 0, errors.NewStorageError("failed to get rows affected", err)
@@ -413,14 +328,146 @@ func (s *Service) deleteTombstonedTx(ctx context.Context, blockHeight uint32) (i
 	return count, nil
 }
 
-// onCommitDrop returns the Postgres ON COMMIT DROP clause for the candidates
-// temp table, or an empty string on engines that do not support it. SQLite has
-// no ON COMMIT clause, so there the leading DROP TABLE IF EXISTS is what stops
-// the table surviving onto the next prune on the same pooled connection.
-func (s *Service) onCommitDrop() string {
-	if s.engine == "postgres" {
-		return "ON COMMIT DROP "
+// pruneWithoutDefensiveCheck marks and deletes every transaction past its
+// expiration, with no child-stability verification.
+func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight uint32) (int64, error) {
+	const markerQuery = `INSERT INTO deleted_children (parent_id, child_hash)
+  SELECT DISTINCT parent.id, child.hash
+  FROM transactions child
+  JOIN inputs i ON i.transaction_id = child.id
+  JOIN transactions parent ON parent.hash = i.previous_transaction_hash
+  WHERE child.delete_at_height IS NOT NULL
+    AND child.delete_at_height <= $1
+  ON CONFLICT (parent_id, child_hash) DO NOTHING`
+
+	const deleteQuery = `DELETE FROM transactions
+  WHERE delete_at_height IS NOT NULL
+    AND delete_at_height <= $1`
+
+	txn, err := s.beginPruneTx(ctx)
+	if err != nil {
+		return 0, err
 	}
 
-	return ""
+	defer func() { _ = txn.Rollback() }()
+
+	if _, err := txn.ExecContext(ctx, markerQuery, blockHeight); err != nil {
+		return 0, errors.NewStorageError("failed to mark pruned children", err)
+	}
+
+	result, err := txn.ExecContext(ctx, deleteQuery, blockHeight)
+	if err != nil {
+		return 0, errors.NewStorageError("failed to delete transactions", err)
+	}
+
+	return finishPrune(txn, result)
+}
+
+// pruneWithDefensiveCheck verifies that every spending child of a candidate is
+// mined and stable before deleting it, so no child is orphaned.
+//
+// The candidates are materialised into a temp table first. Temporary tables are
+// connection-local and this transaction owns the connection until commit or
+// rollback. Postgres drops it at COMMIT via ON COMMIT DROP; SQLite has no such
+// clause and keeps a committed temp table on the connection, so the leading
+// DROP TABLE IF EXISTS clears any leftover. Neither adds a failure path AFTER
+// the delete has already happened, which is the point: an explicit DROP running
+// after RowsAffected throws away a completed prune if it errors.
+func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint32) (int64, error) {
+	const dropStale = `DROP TABLE IF EXISTS utxo_prune_candidates`
+
+	const createCandidatesPostgres = `CREATE TEMP TABLE utxo_prune_candidates ON COMMIT DROP AS
+			SELECT t.id
+			FROM transactions t
+			WHERE t.delete_at_height IS NOT NULL
+			  AND t.delete_at_height <= $1
+			  AND NOT EXISTS (
+			    -- Find ANY unstable child - if found, parent cannot be deleted
+			    -- This ensures ALL children must be stable before parent deletion
+			    SELECT 1
+			    FROM outputs o
+			    WHERE o.transaction_id = t.id
+			      AND o.spending_data IS NOT NULL
+			      AND NOT EXISTS (
+			          SELECT 1 FROM deleted_children d
+			          WHERE d.parent_id = t.id
+			            AND d.child_hash = substr(o.spending_data, 1, 32)
+			      )
+			      AND NOT EXISTS (
+			        -- Extract child TX hash from spending_data (first 32 bytes)
+			        -- Check if this child is NOT stable
+			        SELECT 1
+			        FROM transactions child
+			        INNER JOIN block_ids child_blocks ON child.id = child_blocks.transaction_id
+			        WHERE child.hash = substr(o.spending_data, 1, 32)
+			          AND child.unmined_since IS NULL  -- Child must be mined
+			          AND child_blocks.block_height <= ($1 - $2)  -- Child must be stable
+			      )
+			  )`
+
+	const createCandidatesPortable = `CREATE TEMP TABLE utxo_prune_candidates AS
+			SELECT t.id
+			FROM transactions t
+			WHERE t.delete_at_height IS NOT NULL
+			  AND t.delete_at_height <= $1
+			  AND NOT EXISTS (
+			    SELECT 1
+			    FROM outputs o
+			    WHERE o.transaction_id = t.id
+			      AND o.spending_data IS NOT NULL
+			      AND NOT EXISTS (
+			          SELECT 1 FROM deleted_children d
+			          WHERE d.parent_id = t.id
+			            AND d.child_hash = substr(o.spending_data, 1, 32)
+			      )
+			      AND NOT EXISTS (
+			        SELECT 1
+			        FROM transactions child
+			        INNER JOIN block_ids child_blocks ON child.id = child_blocks.transaction_id
+			        WHERE child.hash = substr(o.spending_data, 1, 32)
+			          AND child.unmined_since IS NULL
+			          AND child_blocks.block_height <= ($1 - $2)
+			      )
+			  )`
+
+	const markerQuery = `INSERT INTO deleted_children (parent_id, child_hash)
+  SELECT DISTINCT parent.id, child.hash
+  FROM utxo_prune_candidates candidate
+  JOIN transactions child ON child.id = candidate.id
+  JOIN inputs i ON i.transaction_id = child.id
+  JOIN transactions parent ON parent.hash = i.previous_transaction_hash
+  ON CONFLICT (parent_id, child_hash) DO NOTHING`
+
+	const deleteQuery = `DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)`
+
+	createCandidates := createCandidatesPortable
+	if s.engine == "postgres" {
+		createCandidates = createCandidatesPostgres
+	}
+
+	txn, err := s.beginPruneTx(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	defer func() { _ = txn.Rollback() }()
+
+	if _, err := txn.ExecContext(ctx, dropStale); err != nil {
+		return 0, errors.NewStorageError("failed to clear stale pruning candidates", err)
+	}
+
+	if _, err := txn.ExecContext(ctx, createCandidates, blockHeight, s.safetyWindow); err != nil {
+		return 0, errors.NewStorageError("failed to select pruning candidates", err)
+	}
+
+	if _, err := txn.ExecContext(ctx, markerQuery); err != nil {
+		return 0, errors.NewStorageError("failed to mark pruned children", err)
+	}
+
+	result, err := txn.ExecContext(ctx, deleteQuery)
+	if err != nil {
+		return 0, errors.NewStorageError("failed to delete transactions", err)
+	}
+
+	return finishPrune(txn, result)
 }
