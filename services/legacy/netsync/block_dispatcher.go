@@ -326,6 +326,13 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 	// The parked run: read the blob on the worker, then the same call the serial
 	// drain makes. The decoded block lives in this worker's local, so the consumer
 	// never holds one.
+	//
+	// A nil in-flight parent, always. The parent of a parked block is in the chain
+	// by the time anything commits it, so HandleBlockDirect looks it up there, and
+	// that lookup is what enforces "never hand block validation a parentless
+	// block" in the worker rather than on a promise from the consumer. Handing it
+	// a resolved parent instead would skip the lookup and is the single most
+	// dangerous edit anyone can make here.
 	bd.parkedRun = func(ctx context.Context, d *blockDispatch) error {
 		msgBlock, err := sm.blockPark.Read(ctx, d.parked.hash)
 		if err != nil {
@@ -336,13 +343,7 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 			return err
 		}
 
-		// The parent the head resolved, which is nil unless this block's parent is
-		// the frontier tail. Nil sends the worker to its own chain lookup, which is
-		// what enforces the never-hand-over-a-parentless-block rule for a block
-		// whose parent has already committed. A resolved tail is the other case:
-		// the parent is in the window, so its height is the authority and the
-		// ordering hand-shake waits on its entry.
-		return sm.HandleBlockDirect(ctx, d.parked.peer, d.parked.hash, msgBlock, d.parent)
+		return sm.HandleBlockDirect(ctx, d.parked.peer, d.parked.hash, msgBlock, nil)
 	}
 
 	// The parked tail: classify in one place, on the consumer, in admission order,
@@ -552,25 +553,6 @@ func (bd *blockDispatcher) canDispatch(d *blockDispatch) bool {
 	return true
 }
 
-// parkedShapeOK reports whether a parked dispatch is in one of its two permitted
-// shapes: no resolved parent into an empty frontier, or a parent that is exactly
-// the frontier tail and is exactly this block's parent.
-func (bd *blockDispatcher) parkedShapeOK(d *blockDispatch) bool {
-	if d.parent == nil {
-		// Un-windowed and alone, which is how a chain's first block goes, or
-		// windowed into an empty frontier, which is the same position a live
-		// block takes when its parent is stored.
-		return bd.frontierEmpty()
-	}
-
-	n := len(bd.frontier)
-	if n == 0 || d.parent.entry != bd.frontier[n-1] {
-		return false
-	}
-
-	return bd.frontier[n-1].hash.IsEqual(&d.parked.prevBlock)
-}
-
 // msgHash is the hash of the block a dispatch is for, from whichever of its two
 // sources the dispatch has: the queue message for a block off the wire, the park
 // entry for a block being committed off disk. A parked dispatch has no queue
@@ -586,24 +568,15 @@ func (d *blockDispatch) msgHash() chainhash.Hash {
 
 // dispatch charges the budget, appends the frontier entry and starts the worker.
 //
-// A parked dispatch must arrive in one of exactly two shapes, and the guard is
-// here rather than in a comment because every way of getting it wrong is silent.
-//
-// Either it has no resolved parent, and then it needs an empty frontier: with
-// nothing in flight the server-side window holds no legacy entry either, so its
-// admission there takes the empty-window branch, which requires the parent to be
-// stored. It is, because a commit is what discovered this block.
-//
-// Or its parent is the frontier tail, and then that tail must really be its
-// parent. The tail is in the window, so the child's own admission chains onto it
-// and the ordering hand-shake waits on it. Resolving a parent that is NOT the
-// tail would have the worker take a height on trust from a block the window does
-// not hold, which the server then refuses as inconsistent.
-//
-// Failing closed costs one restored park entry and one ERROR line; failing open
-// costs a lost block.
+// A parked dispatch must arrive in exactly one shape, and the guard is here rather
+// than in a comment because the two ways of getting it wrong are both silent. A
+// resolved parent would skip the worker's own parent lookup, which is what
+// enforces the never-hand-over-a-parentless-block rule. A non-empty frontier
+// would mean the server-side window already holds a legacy entry, so an
+// unwindowed parked block would be refused admission there. Failing closed costs
+// one restored park entry and one ERROR line; failing open costs a lost block.
 func (bd *blockDispatcher) dispatch(d *blockDispatch) {
-	if d.parked != nil && !bd.parkedShapeOK(d) {
+	if d.parked != nil && (d.parent != nil || d.windowed || !bd.frontierEmpty()) {
 		bd.sm.logger.Errorf("[blockDispatcher][%s] refusing a parked dispatch in the wrong shape: parent=%v windowed=%v frontier=%d", d.parked.hash.String(), d.parent != nil, d.windowed, len(bd.frontier))
 		bd.sm.blockPark.Restore(*d.parked)
 
