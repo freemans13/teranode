@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/mock"
@@ -31,13 +32,17 @@ func slowSweepManager(t *testing.T, entries int) (*SyncManager, *blockPark, time
 	)
 
 	client := &blockchain2.Mock{}
-	client.On("GetBlockExists", mock.Anything, mock.Anything).
+
+	// GetBlockHeader, not GetBlockExists: the sweep needs to know whether a
+	// parent is usable, and existence alone cannot say, because invalidation is
+	// a flag on the row rather than a delete.
+	client.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Run(func(mock.Arguments) {
 			mu.Lock()
 			lookups++
 			mu.Unlock()
 		}).
-		Return(false, nil)
+		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
 
 	sm := &SyncManager{
 		logger:           ulogger.TestLogger{},
@@ -54,9 +59,15 @@ func slowSweepManager(t *testing.T, entries int) (*SyncManager, *blockPark, time
 		binary.LittleEndian.PutUint32(hash[:], uint32(i))
 		binary.LittleEndian.PutUint32(prev[4:], uint32(i))
 
-		park.entries[hash] = &parkedBlock{hash: hash, prevBlock: prev, parkedAt: parked}
+		park.entries[hash] = &parkedBlock{hash: hash, prevBlock: prev, parkedAt: parked, height: int32(i + 1)}
 		park.children[prev] = append(park.children[prev], hash)
 	}
+
+	// Every one of them below the chain's tip, so the eviction half has a full
+	// burst to work through. This used to be done by backdating parkedAt past a
+	// thirty-minute expiry; nothing expires on a clock any more, and what makes
+	// a block droppable is the chain having gone past it.
+	sm.noteCommittedHeight(int32(entries + 1))
 
 	reads := 0
 	sm.parkSweepNow = func() time.Time {
@@ -87,7 +98,7 @@ func TestParkSweep_StopsAtItsTimeBudget(t *testing.T) {
 
 	sm, park, parked, lookups := slowSweepManager(t, entries)
 
-	sm.sweepParkedBlocks(parked.Add(parkEntryTTL + time.Second))
+	sm.sweepParkedBlocks(parked.Add(parkStuckThreshold + time.Second))
 
 	require.Equal(t, entries-1, park.Len(),
 		"a tick out of time must give up exactly the block it had started on and stop, not work through the whole burst")
@@ -99,18 +110,17 @@ func TestParkSweep_StopsAtItsTimeBudget(t *testing.T) {
 // TestParkSweep_KeepsWhatItDidNotReach is the half of the time budget that is
 // not free.
 //
-// blockPark.Expire takes its entries OUT of the index and hands them back, so a
-// caller that abandons them abandons the only record of them: the blob stays on
-// disk still charged against the park's byte budget with nothing tracking it,
-// and the cursor rewind that would have the block asked for again never runs. So
-// the tick puts back what it did not reach, and the next tick, which is still
-// past their TTL, carries on.
+// blockPark.EvictBelow takes its entries OUT of the index and hands them back,
+// so a caller that abandons them abandons the only record of them: the blob
+// stays on disk still charged against the park's byte budget with nothing
+// tracking it. So the tick puts back what it did not reach, and the next tick,
+// where the chain is no further back, carries on.
 func TestParkSweep_KeepsWhatItDidNotReach(t *testing.T) {
 	const entries = 8
 
 	sm, park, parked, _ := slowSweepManager(t, entries)
 
-	sm.sweepParkedBlocks(parked.Add(parkEntryTTL + time.Second))
+	sm.sweepParkedBlocks(parked.Add(parkStuckThreshold + time.Second))
 	require.Equal(t, entries-1, park.Len(), "sanity: one gone, the rest put back")
 
 	// Every entry the first tick put back is still expired, still indexed under
@@ -121,7 +131,7 @@ func TestParkSweep_KeepsWhatItDidNotReach(t *testing.T) {
 	}
 
 	for tick := 2; tick <= entries; tick++ {
-		sm.sweepParkedBlocks(parked.Add(parkEntryTTL + time.Duration(tick)*parkSweepInterval))
+		sm.sweepParkedBlocks(parked.Add(time.Duration(tick) * parkSweepInterval))
 	}
 
 	require.Zero(t, park.Len(), "the burst must still drain, one tick's worth at a time")
@@ -137,7 +147,7 @@ func TestParkSweep_WholeBurstFitsWhenTheTicksAreFast(t *testing.T) {
 	sm, park, parked, _ := slowSweepManager(t, entries)
 	sm.parkSweepNow = nil
 
-	sm.sweepParkedBlocks(parked.Add(parkEntryTTL + time.Second))
+	sm.sweepParkedBlocks(parked.Add(parkStuckThreshold + time.Second))
 
 	require.Zero(t, park.Len(), "a tick inside its budget must clear the whole burst")
 }

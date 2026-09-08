@@ -60,6 +60,11 @@ func TestSyncManager_TheBlockHandlerRunsTheParkSweep(t *testing.T) {
 	// drain was ever triggered — the state a restart leaves behind.
 	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
+	// And usable, not merely present: the sweep asks that as one question now,
+	// because invalidation is a flag on the row rather than a delete, so a
+	// parent this node has rejected still exists.
+	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
+
 	// And the block has been waiting long enough for the sweep to spend a chain
 	// lookup on it. The ticker passes the real clock, so the age has to be real.
 	h.sm.blockPark.mu.Lock()

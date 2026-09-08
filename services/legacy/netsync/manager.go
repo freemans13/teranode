@@ -731,6 +731,17 @@ type SyncManager struct {
 	// noteChainProgress, and read by handleCheckSyncPeer.
 	lastChainProgress atomic.Int64
 
+	// lastCommittedHeight is the height of the highest block this node has put
+	// into the chain, recorded by HandleBlockDirect on success. Monotonic, and 0
+	// until the first commit.
+	//
+	// Read by the park sweep, which uses it to drop blocks the chain has gone
+	// past. It is deliberately not derived from the header list: an arriving
+	// front block's header is removed before the park sees the block, so the
+	// front sits one above the block being waited for, and a sweep judging by
+	// the front throws away exactly the block it needs.
+	lastCommittedHeight atomic.Int32
+
 	// blockPrefetchBudget bounds, by total serialized bytes, the blocks that
 	// have been received from peers but not yet finished processing. It lets
 	// OnBlock admit a block and return (so the read-loop downloads the next
@@ -5155,6 +5166,23 @@ func (sm *SyncManager) ReleaseBlockPrefetch(blockHash chainhash.Hash, weight int
 		return
 	}
 	sm.blockPrefetchBudget.Release(weight)
+}
+
+// noteCommittedHeight records the height of a block that has just joined the
+// chain, and never moves backwards. A reorg lowers the tip, and a floor that
+// followed it down would start keeping blocks it had already been right to
+// drop; leaving it where it is costs a little disk and nothing else.
+func (sm *SyncManager) noteCommittedHeight(height int32) {
+	for {
+		current := sm.lastCommittedHeight.Load()
+		if height <= current {
+			return
+		}
+
+		if sm.lastCommittedHeight.CompareAndSwap(current, height) {
+			return
+		}
+	}
 }
 
 // noteChainProgress records that a block joined the chain. Nothing else counts,

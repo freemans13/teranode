@@ -42,11 +42,6 @@ const (
 	// 20 and falls towards 1 as blocks grow).
 	maxParkedEntries = 4096
 
-	// parkEntryTTL is how long a block may sit parked before it is given up on
-	// and re-requested. A parent that has not arrived in half an hour is not
-	// coming from the walk that queued it.
-	parkEntryTTL = 30 * time.Minute
-
 	// parkStuckThreshold is how old a parked block must be before the sweep
 	// spends an RPC asking whether its parent is in the chain after all. A
 	// missing parent is not the only thing that surfaces as ErrBlockNotFound,
@@ -56,20 +51,28 @@ const (
 	// parkSweepRPCBudget caps how many of those lookups one sweep tick may make,
 	// so the safety net can never turn into a scan of the whole park in one go.
 	//
-	// It has to be big enough that a full pass over a full park finishes inside
-	// parkEntryTTL, or the sweep is not a safety net: a restart with a full park
-	// would leave most of those blocks unexamined until they expired and were
-	// downloaded a second time. parkEntryTTL / parkSweepInterval is 60 ticks, and
-	// the park holds up to maxParkedEntries, so the floor is 4096/60 = 69. At 128
-	// a full pass takes 32 ticks, sixteen minutes, comfortably inside the half
-	// hour — and it is still only 128 sequential chain lookups per thirty
-	// seconds on the commit goroutine, which is well under a percent of it.
+	// It has to be big enough that a full pass over a full park finishes in
+	// minutes rather than hours, or the safety net is not one: a restart with a
+	// full park would leave most of those blocks unexamined, and a parent that
+	// arrived quietly would go unnoticed. The park holds up to maxParkedEntries,
+	// so at 128 a full pass takes 32 ticks, sixteen minutes — and it is still
+	// only 128 sequential chain lookups per thirty seconds on the commit
+	// goroutine, which is well under a percent of it.
 	// TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires holds the
 	// arithmetic to this.
 	parkSweepRPCBudget = 128
 
-	// parkSweepExpiryBudget caps how many expired blocks one sweep tick gives up
-	// on, for the same reason parkSweepRPCBudget caps the lookups beside it, and
+	// parkFullPassBudget is how long the sweep may take to ask about every block
+	// in a full park, and it is what parkSweepRPCBudget is sized against.
+	//
+	// It used to be the thirty-minute expiry that bounded this: a full pass had
+	// to finish before blocks started being thrown away. Nothing is thrown away
+	// on a clock any more, so the bound is what an operator will tolerate for a
+	// parent that turned up quietly to be noticed.
+	parkFullPassBudget = 20 * time.Minute
+
+	// parkSweepExpiryBudget caps how many overtaken blocks one sweep tick gives
+	// up on, for the same reason parkSweepRPCBudget caps the lookups beside it, and
 	// against a bill that is larger per item.
 	//
 	// Each one costs a store Del carrying legacy_parkStoreTimeout — a write permit
@@ -83,11 +86,9 @@ const (
 	// dispatch stall for every peer.
 	//
 	// 128 matches its neighbour and drains a full park in 32 ticks, sixteen
-	// minutes — well inside parkEntryTTL, so nothing waits appreciably longer to
-	// be re-requested than it did when the loop was unbounded. Which 128 a tick
-	// takes is unspecified, because map order is, and it does not matter: every
-	// candidate is already past the TTL, so there is no fairness question, only a
-	// rate one.
+	// minutes. Which 128 a tick takes is unspecified, because map order is, and
+	// it does not matter: every candidate is one the chain has already gone
+	// past, so there is no fairness question, only a rate one.
 	//
 	// This cap is on the COUNT and does not on its own do what the paragraph
 	// above describes. Each of the 128 deletes carries legacy_parkStoreTimeout,
@@ -805,48 +806,51 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	}
 }
 
-// Expire removes and returns up to limit blocks that have been parked longer
-// than parkEntryTTL. Their parents are not coming; the caller re-requests them.
+// EvictBelow removes and returns up to limit blocks the chain has already gone
+// past. Their blobs stay on disk and stay charged until the caller settles them,
+// exactly as TakeChildren leaves things.
 //
-// The limit is what stops a burst of expiry becoming one long turn on the
-// block-queue consumer — see parkSweepExpiryBudget. Anything over it waits for
-// the next tick, which costs it nothing it was not already waiting for.
-func (p *blockPark) Expire(now time.Time, limit int) []parkedBlock {
-	if p == nil || limit <= 0 {
+// This replaces an expiry on a thirty-minute timer. A timer answered the wrong
+// question: it asked how long a block had been waiting, when what matters is
+// whether it can still be used. A block below the chain's frontier cannot, and
+// one still waiting on a late parent can, however long it has waited. The timer
+// threw away perfectly good blocks — 39 of them in one measured 19-minute window
+// on mainnet — and each one had to be downloaded again.
+//
+// An entry with no usable height is skipped rather than guessed at. Restart
+// recovery rebuilds entries from disk with no header list behind them, so they
+// have no height, and evicting one because its height reads as zero would throw
+// away exactly the blocks recovery exists to keep.
+func (p *blockPark) EvictBelow(floor int32, limit int) []parkedBlock {
+	if p == nil || limit <= 0 || floor <= 0 {
 		return nil
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	var expired []parkedBlock
+	var evicted []parkedBlock
 
 	for h, entry := range p.entries {
-		if len(expired) == limit {
+		if len(evicted) == limit {
 			break
 		}
 
-		// A block whose bytes are still being written has not been waiting for
-		// its parent, it has been waiting for the disk.
-		if entry.writing {
+		if entry.writing || entry.height <= 0 || entry.height >= floor {
 			continue
 		}
 
-		if now.Sub(entry.parkedAt) < parkEntryTTL {
-			continue
-		}
-
-		expired = append(expired, *entry)
+		evicted = append(evicted, *entry)
 
 		delete(p.entries, h)
 		p.removeChildLocked(entry.prevBlock, h)
 	}
 
-	if len(expired) > 0 {
+	if len(evicted) > 0 {
 		p.setGauges()
 	}
 
-	return expired
+	return evicted
 }
 
 // StuckCandidates returns up to limit blocks that have been parked longer than
@@ -1163,8 +1167,8 @@ func (p *blockPark) Recover(ctx context.Context) {
 		// The blob's modification time is when the block was parked, and it is on
 		// disk, so it is the one thing about a recovered block that survives the
 		// restart. Stamping time.Now() here instead would restart every block's
-		// half hour on every boot: a node restarting more often than parkEntryTTL
-		// would never expire anything, and a block whose parent is genuinely
+		// window on every boot: a node restarting often would never notice
+		// anything had gone stale, and a block whose parent is genuinely
 		// never coming would hold its budget for as long as that went on. Anything
 		// unusable — a zero time, or a clock that has gone backwards since the
 		// write — falls back to now, which is only ever the old behaviour.

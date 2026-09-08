@@ -111,6 +111,11 @@ func TestSyncManager_CommittingAParkedBlockMidHeaderRoundDoesNotWedgeTheCheckpoi
 	// triggered — exactly the state a restart leaves behind.
 	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 
+	// And the parent is usable, not merely present. The sweep asks that as one
+	// question now, because invalidation is a flag on the row rather than a
+	// delete, so a parent this node has rejected still exists.
+	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
+
 	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 
 	require.Zero(t, h.sm.blockPark.Len(), "the sweep must have committed the parked block")

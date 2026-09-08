@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/mock"
@@ -34,7 +35,7 @@ func newIndexOnlyPark() *blockPark {
 // The sweep is the ONLY thing that ever commits a parked block whose parent was
 // already in the chain when the node started: a block recovered from disk never
 // sees a commit event for that parent, so nothing else will ever look at it. It
-// gets from parkStuckThreshold to parkEntryTTL to work through the park, one
+// gets a bounded number of ticks to work through the whole park, one
 // tick every parkSweepInterval, parkSweepRPCBudget parents per tick. If a full
 // pass over a full park does not fit in that window, then after a restart with a
 // full park the blocks it never reached expire and are downloaded a second time
@@ -52,7 +53,10 @@ func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
 	)
 
 	client := &blockchain2.Mock{}
-	client.On("GetBlockExists", mock.Anything, mock.Anything).
+	// GetBlockHeader, not GetBlockExists: the sweep needs to know whether a
+	// parent is usable, and existence alone cannot say, because invalidation is
+	// a flag on the row rather than a delete.
+	client.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			hash, ok := args.Get(1).(*chainhash.Hash)
 			require.True(t, ok)
@@ -61,7 +65,7 @@ func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
 			seen[*hash] = struct{}{}
 			mu.Unlock()
 		}).
-		Return(false, nil)
+		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
 
 	sm := &SyncManager{
 		logger:           ulogger.TestLogger{},
@@ -88,7 +92,7 @@ func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
 	// full pass fits" rather than "a full pass happens eventually".
 	ticks := maxParkedEntries / parkSweepRPCBudget
 
-	require.LessOrEqual(t, time.Duration(ticks)*parkSweepInterval, parkEntryTTL-parkStuckThreshold,
+	require.LessOrEqual(t, time.Duration(ticks)*parkSweepInterval, parkFullPassBudget,
 		"a full pass has to fit between a block becoming a candidate and its time running out")
 
 	for tick := 0; tick < ticks; tick++ {
@@ -107,11 +111,15 @@ func TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires(t *testing.T) {
 }
 
 // TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart closes the
-// second half of the same hole. Stamping parkedAt at recovery time means a node
-// that restarts more often than parkEntryTTL never expires anything: a block
-// whose parent is genuinely never coming is held, and its budget with it, for
-// as long as the node keeps restarting. The blob's own modification time is
-// when the block was parked, and it survives the restart because it is on disk.
+// second half of the same hole. Stamping parkedAt at recovery time would mean a
+// node that restarts often never asks about any parent: every recovered block
+// would start its parkStuckThreshold wait again, and a parent that turned up
+// quietly while the node was down would go unnoticed. The blob's own
+// modification time is when the block was parked, and it survives the restart
+// because it is on disk.
+//
+// This used to assert against the thirty-minute expiry, which no longer exists.
+// The age still decides something, and it is the lookup gate beside it.
 func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T) {
 	park, dir := newTestPark(t, "")
 
@@ -122,8 +130,8 @@ func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T)
 	require.Equal(t, parkAccepted,
 		park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
 
-	// The node ran for longer than the TTL, then restarted.
-	aged := time.Now().Add(-parkEntryTTL - time.Minute)
+	// The node ran for a while, then restarted.
+	aged := time.Now().Add(-parkStuckThreshold - time.Minute)
 
 	for _, name := range parkDirEntries(t, dir) {
 		require.NoError(t, os.Chtimes(filepath.Join(dir, name), aged, aged))
@@ -134,25 +142,24 @@ func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T)
 	fresh.store = park.store
 	fresh.Recover(context.Background())
 
-	require.Equal(t, 1, fresh.Len(), "the block must be adopted before anything can expire it")
+	require.Equal(t, 1, fresh.Len(), "the block must be adopted before anything can be asked about it")
 
-	expired := fresh.Expire(time.Now(), parkSweepExpiryBudget)
+	candidates := fresh.StuckCandidates(time.Now(), parkSweepRPCBudget)
 
-	require.Len(t, expired, 1,
-		"a block parked longer ago than the TTL must expire on the first sweep after a restart, not start its half hour again")
-	require.True(t, expired[0].hash.IsEqual(&hash))
-	require.Zero(t, fresh.Len())
+	require.Len(t, candidates, 1,
+		"a block parked before the restart is due a parent lookup at once, not after starting its wait again")
+	require.True(t, candidates[0].hash.IsEqual(&hash))
 }
 
 // TestBlockPark_ExpiryIsRatedPerTickLikeTheLookupsBesideIt pins the second of the
 // sweep's two caps.
 //
 // The lookup half was given a per-tick budget with a paragraph of arithmetic
-// behind it; the expiry half directly above it had none, and it is the more
-// expensive item — each block given up on costs a store delete carrying
-// legacy_parkStoreTimeout and a cursor rewind under headerMu, on the one
-// goroutine that commits blocks in order. It is also the half that arrives in
-// bursts, because blocks parked together age out together. An uncapped pass could
+// behind it; the eviction half directly above it had none, and it is the more
+// expensive item — each block dropped costs a store delete carrying
+// legacy_parkStoreTimeout, on the one goroutine that commits blocks in order. It
+// is also the half that arrives in bursts, because the frontier moving past a
+// run of parked blocks overtakes all of them at once. An uncapped pass could
 // hand the whole index to that goroutine in a single tick, and with blockQueue
 // full the outer loop blocks on it and every peer's dispatch stalls behind it.
 //
@@ -162,11 +169,11 @@ func TestBlockPark_ARecoveredBlockKeepsTheAgeItHadBeforeTheRestart(t *testing.T)
 func TestBlockPark_ExpiryIsRatedPerTickLikeTheLookupsBesideIt(t *testing.T) {
 	park, _ := newTestPark(t, "")
 
-	// Comfortably more than one tick's worth, and all of them already past the
-	// TTL, so nothing but the budget decides how many go.
+	// Comfortably more than one tick's worth, and every one of them below the
+	// floor, so nothing but the budget decides how many go.
 	const parked = parkSweepExpiryBudget + 40
 
-	aged := time.Now().Add(-parkEntryTTL - time.Minute)
+	const floor = int32(parked + 1)
 
 	park.mu.Lock()
 
@@ -178,7 +185,7 @@ func TestBlockPark_ExpiryIsRatedPerTickLikeTheLookupsBesideIt(t *testing.T) {
 		binary.LittleEndian.PutUint32(prev[:4], uint32(i))
 		prev[31] = 0xb2
 
-		entry := &parkedBlock{hash: h, prevBlock: prev, parkedAt: aged}
+		entry := &parkedBlock{hash: h, prevBlock: prev, height: int32(i + 1)}
 		park.entries[h] = entry
 		park.children[prev] = append(park.children[prev], h)
 	}
@@ -189,14 +196,14 @@ func TestBlockPark_ExpiryIsRatedPerTickLikeTheLookupsBesideIt(t *testing.T) {
 
 	// Lengths compared as counts, not with require.Len on the slice: a failure
 	// there prints every parkedBlock it holds and buries the message.
-	first := park.Expire(time.Now(), parkSweepExpiryBudget)
+	first := park.EvictBelow(floor, parkSweepExpiryBudget)
 	require.Equal(t, parkSweepExpiryBudget, len(first),
 		"one tick must give up exactly its budget, however many are ready")
 	require.Equal(t, parked-parkSweepExpiryBudget, park.Len(),
 		"the rest must still be parked, to be given up on the next tick")
 
 	// And the remainder is not stranded: the next tick takes what is left.
-	second := park.Expire(time.Now(), parkSweepExpiryBudget)
+	second := park.EvictBelow(floor, parkSweepExpiryBudget)
 	require.Equal(t, parked-parkSweepExpiryBudget, len(second),
 		"the following tick must take the remainder rather than leaving it behind")
 	require.Zero(t, park.Len())

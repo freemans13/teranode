@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
 	teranodeblockchain "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
@@ -84,6 +85,53 @@ func (sm *SyncManager) blockExistsWithDeadline(hash chainhash.Hash) (bool, error
 	defer cancel()
 
 	return sm.blockchainClient.GetBlockExists(ctx, &hash)
+}
+
+// parentChainState answers both questions the sweep has about a parent in one
+// round trip: is it stored, and is it usable.
+//
+// Asking only whether it exists was a real hole. Invalidation is a flag on the
+// row, not a delete, so a parent this node has REJECTED still exists, and the
+// sweep would commit its descendant on the strength of that. The pair is the
+// same one haveInventory already uses for the same reason.
+func (sm *SyncManager) parentChainState(hash chainhash.Hash) (exists bool, invalid bool, err error) {
+	ctx, cancel := sm.chainCtx()
+	defer cancel()
+
+	_, meta, err := sm.blockchainClient.GetBlockHeader(ctx, &hash)
+	if err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound) {
+			return false, false, nil
+		}
+
+		return false, false, err
+	}
+
+	if meta == nil {
+		return false, false, nil
+	}
+
+	return true, meta.Invalid, nil
+}
+
+// parkEvictionFloor is the height below which a parked block can never be
+// needed, or 0 when the node cannot say.
+//
+// It is the highest block this node has actually committed, and eviction is
+// strictly below it. Nothing approximate: a block parked below a block we have
+// already put in the chain cannot be a link in any chain we are building, and
+// its parent is missing so it cannot be a sibling either.
+//
+// It is NOT the front of the header list, which was the obvious reading and is
+// wrong. An arriving front block has its header removed from the list before the
+// park sees it, so the front sits one height above the block being waited on, and
+// a sweep judging by the front evicts exactly the block it needs.
+//
+// Zero until the first commit, which switches eviction off on a node that has
+// not committed anything yet. That is the right way round: a node still finding
+// its feet should keep what it has downloaded.
+func (sm *SyncManager) parkEvictionFloor() int32 {
+	return sm.lastCommittedHeight.Load()
 }
 
 // drainParkedDescendants commits everything parked behind a block that has just
@@ -381,7 +429,7 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 
 	deadline := sm.parkSweepClock().Add(parkSweepTimeBudget)
 
-	expired := sm.blockPark.Expire(now, parkSweepExpiryBudget)
+	expired := sm.blockPark.EvictBelow(sm.parkEvictionFloor(), parkSweepExpiryBudget)
 
 	for i, entry := range expired {
 		// Always one, however long the tick has already run: a budget that can
@@ -393,8 +441,8 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 			break
 		}
 
-		sm.logger.Warnf("[sweepParkedBlocks][%s] %s, giving the block up after %s: parent %s", entry.hash, parkDispositionExpired.reason, parkEntryTTL, entry.prevBlock)
-		sm.applyParkDisposition(entry, parkDispositionExpired)
+		sm.logger.Infof("[sweepParkedBlocks][%s] %s (height %d), dropping it: parent %s", entry.hash, parkDispositionOvertaken.reason, entry.height, entry.prevBlock)
+		sm.applyParkDisposition(entry, parkDispositionOvertaken)
 	}
 
 	for i, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {
@@ -404,9 +452,9 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 			break
 		}
 
-		exists, err := sm.blockExistsWithDeadline(candidate.prevBlock)
+		exists, invalid, err := sm.parentChainState(candidate.prevBlock)
 		if err != nil {
-			sm.logger.Warnf("[sweepParkedBlocks][%s] could not check whether parent %s is stored: %v", candidate.hash, candidate.prevBlock, err)
+			sm.logger.Warnf("[sweepParkedBlocks][%s] could not check whether parent %s is usable: %v", candidate.hash, candidate.prevBlock, err)
 			continue
 		}
 
@@ -416,6 +464,16 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 
 		entry, ok := sm.blockPark.Take(candidate.hash)
 		if !ok {
+			continue
+		}
+
+		if invalid {
+			// The parent is stored and rejected, so this block can never be
+			// committed. Committing it on the strength of the parent merely
+			// EXISTING is the bug this closes.
+			sm.logger.Warnf("[sweepParkedBlocks][%s] %s (%s), dropping it", entry.hash, parkDispositionParentInvalid.reason, entry.prevBlock)
+			sm.applyParkDisposition(entry, parkDispositionParentInvalid)
+
 			continue
 		}
 

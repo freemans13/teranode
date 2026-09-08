@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -54,7 +55,7 @@ func TestSyncManager_ARewindOntoARebuiltHeaderListDoesNotReRequestAStoredBlock(t
 
 	// The parked block's time runs out. The sweep gives it up and rewinds the
 	// walk onto it, using the header node from the list that no longer exists.
-	h.sm.sweepParkedBlocks(time.Now().Add(parkEntryTTL + time.Second))
+	h.sm.sweepParkedBlocks(time.Now())
 
 	// The headers land, reach the checkpoint, and the walk goes out for blocks.
 	h.sm.handleHeadersMsg(&headersMsg{headers: msg, peer: h.peer})
@@ -99,34 +100,53 @@ func TestSyncManager_TwoGivenUpBlocksAreAskedForInTheOrderTheyAreNeeded(t *testi
 
 	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 
-	// The first block parks as the front; once its header is gone the second one
-	// is the front, and it parks too. Both carry a header node home with them.
+	// The first block parks as the front, and the third parks behind it. They are
+	// deliberately NOT parent and child: giving a block up now needs its parent
+	// to look present, and a parent that looks present is one the walk treats as
+	// already-have and skips — so a parked child would make the test claim the
+	// chain holds the very block it then asserts is asked for again.
 	first := h.blocks[0].MsgBlock().BlockHash()
-	second := h.blocks[1].MsgBlock().BlockHash()
+	second := h.blocks[2].MsgBlock().BlockHash()
 
 	require.NoError(t, h.deliver(t, 0))
-	require.NoError(t, h.deliver(t, 1))
+	require.NoError(t, h.deliver(t, 2))
 	require.Equal(t, 2, h.sm.blockPark.Len(), "both blocks arrived before their parents")
 
 	getDataBefore := h.rec.getDataCount()
 
-	// Neither parent ever turns up, so both are given up on and both rewind —
-	// the parent on this tick and the child on the next. Holding the child's
-	// clock at the sweep time is what keeps it: an entry expires on how long it
-	// has been parked, so a child parked "now" is not yet old enough.
-	parentGivenUpAt := time.Now().Add(parkEntryTTL + time.Second)
+	// Both blocks are given up on, and both rewind, one tick at a time with the
+	// parent going first. The staggering is deliberate and the comment above
+	// says why: batching them hides the bug this catches.
+	//
+	// The old trigger was the thirty-minute timer, staggered by holding the
+	// child's parked-at clock. There is no timer now, and a late parent is no
+	// longer a reason to drop anything, so the give-up runs through a path that
+	// does rewind: the parent turns up, the sweep goes to commit the block, and
+	// the blob will not read back. Staggering it means letting one parent turn
+	// up at a time.
+	h.store.failReadsWith(errors.ErrBlobNotFound)
 
-	h.sm.blockPark.mu.Lock()
-	h.sm.blockPark.entries[second].parkedAt = parentGivenUpAt
-	h.sm.blockPark.mu.Unlock()
+	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
 
-	h.sm.sweepParkedBlocks(parentGivenUpAt)
+	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 
-	require.Equal(t, 1, h.sm.blockPark.Len(), "only the parent may have been given up on so far")
+	require.Equal(t, 1, h.sm.blockPark.Len(), "only the first may have been given up on so far")
 
-	h.sm.sweepParkedBlocks(parentGivenUpAt.Add(parkEntryTTL + time.Second))
+	h.chainHolds(t, h.blocks[2].MsgBlock().Header.PrevBlock)
 
-	require.Zero(t, h.sm.blockPark.Len(), "the child must have been given up on too")
+	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
+
+	require.Zero(t, h.sm.blockPark.Len(), "the second must have been given up on too")
+
+	h.sm.headerMu.Lock()
+	startHeader := h.sm.startHeader
+	listLen := h.sm.headerList.Len()
+	h.sm.headerMu.Unlock()
+
+	require.NotNil(t, startHeader, "DIAG: both rewinds must have put the cursor back")
+	t.Logf("DIAG list=%d cursorHeight=%d exhausted=%v maxBytes=%d parked=%d owed=%d avg=%d",
+		listLen, startHeader.Value.(*headerNode).height, h.sm.readAheadBudgetExhausted(),
+		h.sm.settings.Legacy.BlockDownloadMaxBytes, h.sm.blockPark.Bytes(), h.sm.blockDownloads.Len(), h.sm.blockSizeTracker.getAverageSize())
 
 	h.sm.fetchHeaderBlocks()
 
@@ -178,7 +198,7 @@ func TestSyncManager_PastTheFinalCheckpointAGivenUpBlockIsNotRewound(t *testing.
 	h.sm.headersFirstMode.Store(false)
 
 	// The parked block's time runs out and it is given up on.
-	h.sm.sweepParkedBlocks(time.Now().Add(parkEntryTTL + time.Second))
+	h.sm.sweepParkedBlocks(time.Now())
 
 	// A walk, synchronously: a block is recorded in the download ledger before
 	// its getdata is queued.
