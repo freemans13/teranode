@@ -2589,6 +2589,21 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 			}
 
 			for _, e := range bd.frontier {
+				// A parked dispatch has no queue message: nothing incremented the
+				// backlog for it and nobody is waiting on a reply, so finishing it
+				// would send on a nil channel and underflow the counter that
+				// suppresses the sync-peer stall check for the life of the process.
+				// What it needs instead is its park entry back, because the entry
+				// was taken out of the index to dispatch it. Without the Restore the
+				// blob is adopted by the next start's recovery with no height, no
+				// peer and no header node, which is the one entry that can never be
+				// rewound into the download walk.
+				if e.d.parked != nil {
+					sm.blockPark.Restore(*e.d.parked)
+
+					continue
+				}
+
 				finish(e.d.msg, errors.NewServiceError(syncManagerShuttingDownMsg))
 			}
 
