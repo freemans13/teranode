@@ -1337,31 +1337,27 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// with the same spender is the store's idempotent success path.
 	prunedReplays, err := u.spendBatchWithRetry(ctx, block, batch.batchTxs, outpointOnly)
 	if err != nil {
-		// Compensate phase 1, but only for the transactions that are actually
-		// ghosts. Create never consults the pruner's replay markers, so a block
-		// replaying a pruned transaction gets all the way through the create
-		// phase and is only rejected here. The record it wrote is stored mined
-		// with no delete_at_height, so nothing reclaims it and the block can
-		// never validate.
+		// Compensate phase 1 for the ghosts a pruned replay leaves behind: the
+		// transactions the store rejected on a replay marker, plus anything in
+		// this batch that spends one of them and that this attempt created. What
+		// qualifies, and why a rejected transaction is removed even when the
+		// create phase found it already present, is set out on
+		// utxo.PrunedReplayGhosts. Create never consults the markers, so the
+		// records got written and are only rejected here; stored mined with no
+		// delete_at_height, nothing else reclaims them and the block can never
+		// validate.
 		//
 		// Deliberately NOT the whole batch. Every other transaction the create
 		// phase wrote may be perfectly valid and wanted by a concurrently
 		// validating sibling block, which would have taken ErrTxExists on it and
 		// recorded it as pre-existing; deleting those out from under that block
-		// would break it. A transaction rejected on a replay marker is different:
-		// it can never legitimately exist, so no block needs it.
-		//
-		// Transactions that were already in the store are excluded for the same
-		// reason: this block did not create them.
-		ghosts := make([]*chainhash.Hash, 0, len(prunedReplays))
+		// would break it. Only this batch is walked: a later batch's create
+		// phase has not run, so it left nothing behind.
+		ghosts := utxo.PrunedReplayGhosts(batch.batchTxs, prunedReplays, func(txHash *chainhash.Hash) bool {
+			_, existed := existingTxSet[*txHash]
 
-		for _, txHash := range prunedReplays {
-			if _, existed := existingTxSet[*txHash]; existed {
-				continue
-			}
-
-			ghosts = append(ghosts, txHash)
-		}
+			return !existed
+		})
 
 		// ctx, not the errgroup context: the spend group's context is cancelled
 		// by the time we get here.

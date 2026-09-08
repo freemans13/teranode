@@ -3,6 +3,7 @@ package blockvalidation
 import (
 	"context"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1344,5 +1345,177 @@ func TestQuickValidateRemovesCreatesWhenSpendPhaseFails(t *testing.T) {
 
 	meta, err := store.Get(ctx, siblingTx.TxIDChainHash())
 	require.NoError(t, err, "the compensation must remove the ghost only, not the whole batch")
+	require.NotNil(t, meta)
+}
+
+// prunedChainFixture builds P -> C -> D -> E on a real store, mines them, and
+// prunes C and D, so a block replaying C and D is the reviewer's scenario: C is
+// rejected on P's marker, but D spends the freshly recreated C and succeeds.
+type prunedChainFixture struct {
+	parent, child, grandchild, sibling *bt.Tx
+}
+
+func newPrunedChainFixture(t *testing.T, store utxo.Store) prunedChainFixture {
+	t.Helper()
+
+	sqlStore, ok := store.(*sql.Store)
+	require.True(t, ok)
+
+	sql.ResetPrunerServiceForTests()
+	t.Cleanup(sql.ResetPrunerServiceForTests)
+
+	ctx := context.Background()
+	require.NoError(t, store.SetBlockHeight(1003))
+
+	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("QUICK_VALIDATE_COMPENSATION_KEY"))
+
+	parentTx := transactions.Create(t,
+		transactions.WithCoinbaseData(1, "/genesis/"),
+		transactions.WithP2PKHOutputs(2, 5000, publicKey),
+	)
+	_, err := sqlStore.Create(ctx, parentTx, 1000)
+	require.NoError(t, err)
+
+	spendOf := func(prev *bt.Tx, vout uint32, sats uint64) *bt.Tx {
+		return transactions.Create(t,
+			transactions.WithPrivateKey(privateKey),
+			transactions.WithInput(prev, vout),
+			transactions.WithP2PKHOutputs(1, sats, publicKey),
+		)
+	}
+
+	childTx := spendOf(parentTx, 0, 4000)
+	_, _, err = store.SpendAndCreate(ctx, childTx, 1001)
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{parentTx.TxIDChainHash(), childTx.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1001, BlockHeight: 1001, OnLongestChain: true})
+	require.NoError(t, err)
+
+	grandchildTx := spendOf(childTx, 0, 3000)
+	_, _, err = store.SpendAndCreate(ctx, grandchildTx, 1002)
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{grandchildTx.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1002, BlockHeight: 1002, OnLongestChain: true})
+	require.NoError(t, err)
+
+	// E spends D's only output, so both C and D are fully spent and pick up a
+	// delete_at_height.
+	greatGrandchildTx := spendOf(grandchildTx, 0, 2000)
+	_, _, err = store.SpendAndCreate(ctx, greatGrandchildTx, 1003)
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{greatGrandchildTx.TxIDChainHash()},
+		utxo.MinedBlockInfo{BlockID: 1003, BlockHeight: 1003, OnLongestChain: true})
+	require.NoError(t, err)
+
+	prunerService, err := sqlStore.GetPrunerService()
+	require.NoError(t, err)
+
+	pruned, err := prunerService.Prune(ctx, 1300, "quick-validate-compensation")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), pruned, "fixture: the pruner must remove C and D")
+
+	for _, hash := range []*chainhash.Hash{childTx.TxIDChainHash(), grandchildTx.TxIDChainHash()} {
+		_, err = store.Get(ctx, hash)
+		require.ErrorIs(t, err, errors.ErrTxNotFound, "fixture: pruned")
+	}
+
+	// A valid transaction that shares the batch and must survive.
+	siblingTx := spendOf(parentTx, 1, 4000)
+
+	return prunedChainFixture{parent: parentTx, child: childTx, grandchild: grandchildTx, sibling: siblingTx}
+}
+
+func replayBatch(txs ...*bt.Tx) (*model.Block, *SubtreeProcessingBatch) {
+	return &model.Block{Height: 1400, ID: 1400}, &SubtreeProcessingBatch{
+		batchTxs:   txs,
+		txRanges:   [][2]int{{0, len(txs)}},
+		batchStart: 0,
+		batchEnd:   1,
+	}
+}
+
+// TestQuickValidateRemovesRecreatedDescendantsOfPrunedReplay: replaying C and D
+// together recreates both. C hits P's marker, but D successfully spends the
+// freshly recreated C, so only C is rejected. Without walking the block's
+// dependency graph the compensation removed C and left D mined with an unspent
+// output that E already consumed.
+func TestQuickValidateRemovesRecreatedDescendantsOfPrunedReplay(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+
+	block, batch := replayBatch(f.child, f.grandchild, f.sibling)
+
+	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err, "a block replaying a pruned transaction must not validate")
+	require.Contains(t, err.Error(), "spending transaction was pruned")
+
+	_, err = store.Get(ctx, f.child.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound, "the rejected transaction must not survive")
+
+	_, err = store.Get(ctx, f.grandchild.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound,
+		"the recreated descendant spent the recreated ghost and was never rejected itself; it must go with its parent")
+
+	meta, err := store.Get(ctx, f.sibling.TxIDChainHash())
+	require.NoError(t, err, "the valid sibling must survive")
+	require.NotNil(t, meta)
+}
+
+// failingDeleteStore fails DeleteComplete while failing is set. Everything else
+// goes to the real store.
+type failingDeleteStore struct {
+	utxo.Store
+	failing atomic.Bool
+}
+
+func (s *failingDeleteStore) DeleteComplete(ctx context.Context, hash *chainhash.Hash) error {
+	if s.failing.Load() {
+		return errors.NewStorageError("injected delete failure for %s", hash.String())
+	}
+
+	return s.Store.DeleteComplete(ctx, hash)
+}
+
+// TestQuickValidateCompensationRecoversAfterFailedDelete: if the compensating
+// delete fails, the record is still there on the next attempt and the create
+// phase answers ErrTxExists for it. Classifying that as "pre-existing, not ours"
+// made the leftover permanent. The store rejecting the spend again is what
+// identifies it, and that has to win.
+func TestQuickValidateCompensationRecoversAfterFailedDelete(t *testing.T) {
+	bv, store, cleanup := newBlockValidationWithRealStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	f := newPrunedChainFixture(t, store)
+
+	flaky := &failingDeleteStore{Store: store}
+	bv.utxoStore = flaky
+
+	block, batch := replayBatch(f.child, f.sibling)
+
+	flaky.failing.Store(true)
+
+	err := bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "could not be removed", "the failed compensation must be reported")
+
+	_, err = store.Get(ctx, f.child.TxIDChainHash())
+	require.NoError(t, err, "precondition: the ghost is left behind by the failed delete")
+
+	flaky.failing.Store(false)
+
+	err = bv.createAndSpendUTXOsForBatch(ctx, block, batch)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "spending transaction was pruned")
+
+	_, err = store.Get(ctx, f.child.TxIDChainHash())
+	require.ErrorIs(t, err, errors.ErrTxNotFound,
+		"the leftover answered ErrTxExists to the create phase and must still be removed")
+
+	meta, err := store.Get(ctx, f.sibling.TxIDChainHash())
+	require.NoError(t, err)
 	require.NotNil(t, meta)
 }
