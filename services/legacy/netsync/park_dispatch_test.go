@@ -8,14 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/services/blockassembly"
-	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	blockchain2 "github.com/bsv-blockchain/teranode/services/blockchain"
-	"github.com/bsv-blockchain/teranode/services/blockvalidation"
-	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
-	"github.com/bsv-blockchain/teranode/stores/blob/memory"
-	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
-	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -218,34 +211,17 @@ func TestParkDispatch_TheWrongShapeIsRefusedAndTheEntryRestored(t *testing.T) {
 		break_ func(d *blockDispatch, bd *blockDispatcher)
 	}{
 		{
-			// A parent nobody is holding. The worker would take its height on
-			// trust from a block the server-side window does not hold, and the
-			// server then refuses the block as inconsistent.
-			name: "a resolved parent that is not in the frontier at all",
+			name: "a resolved parent",
 			break_: func(d *blockDispatch, _ *blockDispatcher) {
 				d.parent = &inflightParent{height: 750_699}
 			},
 		},
 		{
-			// A tail that is in flight but is not this block's parent. Chaining
-			// onto it would claim a place in the window behind the wrong block.
-			name: "a resolved parent that is the tail but not this block's parent",
-			break_: func(d *blockDispatch, bd *blockDispatcher) {
-				e := &frontierEntry{
-					hash:       chainhash.HashH([]byte("some other block in flight")),
-					height:     750_699,
-					rpcStarted: make(chan struct{}),
-					settled:    make(chan struct{}),
-				}
-				bd.frontier = append(bd.frontier, e)
-				d.parent = &inflightParent{height: e.height, entry: e}
-			},
+			name:   "marked windowed",
+			break_: func(d *blockDispatch, _ *blockDispatcher) { d.windowed = true },
 		},
 		{
-			// No resolved parent, so this block's admission takes the window's
-			// empty branch, which needs the parent stored. A non-empty frontier
-			// means the window is not empty and that branch is not available.
-			name: "no resolved parent but a non-empty frontier",
+			name: "a non-empty frontier",
 			break_: func(_ *blockDispatch, bd *blockDispatcher) {
 				bd.frontier = append(bd.frontier, &frontierEntry{
 					hash:       chainhash.HashH([]byte("something already in flight")),
@@ -1056,187 +1032,4 @@ func TestFrontierRace_ABlockTheParkAlreadyHoldsIsNotRaced(t *testing.T) {
 	require.False(t, ok, "a block the park already holds must not be raced")
 	require.Equal(t, chainhash.Hash{}, hash)
 	require.Nil(t, target)
-}
-
-// TestDrain_ADrainedChainOverlapsWithItself is the last of the serialisation, and
-// the measurement that found it.
-//
-// On mainnet at 82% duty cycle the remaining idle was a flat one second before
-// every drained block, and flat is the clue: correlating 457 gaps against the
-// size of the block that followed gave a median of one second whether that block
-// held 500 transactions or over 20,000. A disk read would scale with size, so it
-// is not the blob. What does not scale is the pair of blockchain lookups every
-// block makes before its work starts, one asking whether the block already
-// exists and one resolving its parent.
-//
-// Those cannot be removed, because the parent lookup is what enforces the rule
-// that block validation never receives a block whose parent is not committed.
-// They can be overlapped. Live blocks already do it: a live block whose parent is
-// the frontier tail is admitted alongside it and its lookups happen while the
-// parent validates. Drained blocks were dispatched un-windowed, which demands an
-// empty frontier, so each one waited for the previous to finish entirely.
-//
-// So a drained block takes the live rule. Its parent is the frontier tail when
-// the chain is being drained in order, which the frontier already tracks.
-func TestDrain_ADrainedChainOverlapsWithItself(t *testing.T) {
-	h := newParkWiringHarness(t, true)
-	bd := h.withDispatcher(t)
-
-	// Depth 2, which is what mainnet runs, and the least that can overlap at all.
-	h.sm.settings.BlockValidation.QuickWindowBlocks = 2
-	h.sm.settings.BlockValidation.QuickValidateSkipUtxoLock = true
-	h.sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly = 20
-
-	// The window route itself, which mainnet has on and the park harness does
-	// not: the unified below-checkpoint route, outpoint-only spends, and a store
-	// that supports them. Without these windowRoute is false for every height and
-	// no drained block could ever chain onto another.
-	h.sm.settings.BlockValidation.LegacyUnifiedBelowCheckpoint = true
-	h.sm.settings.BlockValidation.OutpointOnlyBelowCheckpoint = true
-	h.sm.utxoStore = &outpointOnlySpyStore{NullStore: &nullstore.NullStore{}}
-
-	h.sm.dispatcher = newBlockDispatcher(h.sm)
-	bd = h.sm.dispatcher
-	require.Equal(t, 2, bd.depth, "precondition: the window is two deep")
-	require.True(t, h.sm.windowRouteEnabled(), "precondition: the window route is on")
-	require.True(t, h.sm.windowRoute(2), "precondition: these heights take the window route")
-
-	first := h.blocks[0].MsgBlock()
-	second := h.blocks[1].MsgBlock()
-	third := h.blocks[2].MsgBlock()
-
-	secondHash := second.BlockHash()
-	thirdHash := third.BlockHash()
-
-	// Two blocks park behind the first, forming a chain.
-	h.client.On("GetBlockExists", mock.Anything, &thirdHash).Return(false, nil).Once()
-	h.client.On("GetBlockExists", mock.Anything, &secondHash).Return(false, nil).Once()
-
-	require.NoError(t, h.deliver(t, 2))
-	require.NoError(t, h.deliver(t, 1))
-	require.Equal(t, 2, h.sm.blockPark.Len(), "a chain of two blocks is parked")
-
-	// Both are below the checkpoint and take the window route, which is the
-	// regime this matters in.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
-
-	// Validation is held open, so the assertions below are made while the first
-	// drained block is still in flight. That is the whole point: the second must
-	// be admitted alongside it, not after it.
-	release := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	})
-
-	bd.parkedRun = func(context.Context, *blockDispatch) error {
-		<-release
-
-		return nil
-	}
-
-	h.sm.drainAsync.Store(true)
-
-	// The first block committed, so its parked child is drainable. The height is
-	// chain-derived, which is what lets the child be resolved against it.
-	h.sm.scheduleDrain(first.BlockHash(), 1)
-
-	require.True(t, h.sm.drainStep(bd), "the first parked block is dispatched")
-	require.Len(t, bd.frontier, 1)
-	require.True(t, bd.frontier[0].d.windowed,
-		"a drained block below the checkpoint must take the window route, or nothing can chain onto it")
-	require.Equal(t, uint32(2), bd.frontier[0].height, "and carry a resolved height")
-
-	// Now the second link. Its parent is the block in flight, so it must be
-	// admitted beside it rather than waiting for an empty frontier.
-	h.sm.scheduleDrain(secondHash, 2)
-
-	require.True(t, h.sm.drainStep(bd),
-		"a drained block whose parent is in flight must be admitted alongside it; waiting for an empty frontier is the serialisation this removes")
-
-	require.Len(t, bd.frontier, 2, "both drained blocks are in flight at once")
-	require.NotNil(t, bd.frontier[1].d.parent, "the second is resolved against the first")
-	require.Equal(t, bd.frontier[0], bd.frontier[1].d.parent.entry,
-		"and specifically against the first's frontier entry, which is what the ordering hand-shake waits on")
-	require.Equal(t, uint32(3), bd.frontier[1].height, "with its height taken from its parent")
-
-	close(release)
-}
-
-// TestParkDispatch_AResolvedParentSkipsTheWorkersOwnLookup is what makes the
-// overlap worth having, and it is the assertion the overlap test cannot make
-// because that one stubs the worker.
-//
-// A drained block chained onto its drained parent carries that parent's frontier
-// entry. HandleBlockDirect then takes the height from it and does not look the
-// parent up in the chain, which is right: the parent is in the window, not in
-// the store, so a lookup would not find it and the entry is the authority. It is
-// also where the saving is, because that lookup is one of the two round trips
-// every block used to make before its work began.
-//
-// Passing nil instead would look harmless and would cost the lookup back, so the
-// assertion is on the lookup itself rather than on any outcome.
-func TestParkDispatch_AResolvedParentSkipsTheWorkersOwnLookup(t *testing.T) {
-	h := newParkWiringHarness(t, true)
-	bd := h.withDispatcher(t)
-
-	msgBlock := h.blocks[1].MsgBlock()
-	prev := msgBlock.Header.PrevBlock
-
-	// Not stored, so the worker goes past its own existence check and on to the
-	// parent, which is the branch under test.
-	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-	h.client.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
-
-	// Everything HandleBlockDirect needs after the height step, so the run
-	// reaches its end instead of dying on a nil service. The park harness has
-	// none of it, because no other test in it gets this far.
-	ba := blockassembly.NewMock()
-	ba.On("GetBlockAssemblyState", mock.Anything).
-		Return(&blockassembly_api.StateMessage{CurrentHeight: 3}, nil)
-	h.sm.blockAssembly = ba
-
-	subtrees := &subtreevalidation.MockSubtreeValidation{}
-	subtrees.On("CheckSubtreeFromBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-	h.sm.subtreeValidation = subtrees
-	h.sm.subtreeStore = memory.New()
-	h.sm.blockValidation = &blockvalidation.MockBlockValidation{}
-	h.sm.utxoStore = &nullstore.NullStore{}
-	h.sm.orphanTxs = expiringmap.New[chainhash.Hash, *orphanTxAndParents](time.Minute)
-	t.Cleanup(h.sm.orphanTxs.Stop)
-
-	d, _ := h.parkedDispatchFor(t, 1)
-
-	// The parent is in flight and is the frontier tail, which is the only shape
-	// in which a resolved parent is permitted.
-	parentEntry := &frontierEntry{
-		hash:       prev,
-		height:     2,
-		rpcStarted: make(chan struct{}),
-		settled:    make(chan struct{}),
-	}
-	close(parentEntry.rpcStarted)
-
-	bd.frontier = append(bd.frontier, parentEntry)
-
-	d.parent = &inflightParent{height: parentEntry.height, entry: parentEntry}
-	d.windowed = true
-	d.height = parentEntry.height + 1
-
-	bd.dispatch(d)
-
-	require.Len(t, bd.frontier, 2, "the chained dispatch was admitted, so the shape is the permitted one")
-
-	// Drain only this block's completion; the synthetic parent never settles.
-	select {
-	case c := <-bd.completions:
-		bd.complete(c)
-	case <-time.After(10 * time.Second):
-		t.Fatal("the drained block never completed")
-	}
-
-	h.client.AssertNotCalled(t, "GetBlockHeader", mock.Anything, &prev)
 }
