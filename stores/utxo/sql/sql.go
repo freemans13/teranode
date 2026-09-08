@@ -1591,8 +1591,10 @@ func (s *Store) getUnbatched(ctx context.Context, hash *chainhash.Hash, bins []f
 		}
 	}
 
-	// Cohort label (issue 556). The column is NOT NULL DEFAULT 0, but it is read
-	// as nullable so a database whose rows predate the ALTER cannot fail the scan.
+	// Cohort label (issue 556). The ALTER adds the column NOT NULL DEFAULT 0 and
+	// so backfills every pre-existing row with 0; no row this store wrote can
+	// scan NULL. The nullable scan is defensive against a column added NULL-able
+	// out of band, not against old rows.
 	data.Cohort = cohortFromNullInt64(cohort)
 
 	// CreatedAt mirrors the aerospike bin: Unix milliseconds, set once at insert.

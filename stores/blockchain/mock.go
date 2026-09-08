@@ -15,6 +15,7 @@ package blockchain
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -809,7 +810,17 @@ func (m *MockStore) GetFSMState(ctx context.Context) (string, error) {
 
 // RecordCohortMap records cohort->block rows in the mock's in-memory map,
 // insert-only: a pair that is already present is left exactly as it is.
+//
+// The unset cohort is rejected exactly as the SQL store rejects it, and before
+// anything is written, so a test written against the mock cannot pass on a call
+// that the real store would fail.
 func (m *MockStore) RecordCohortMap(_ context.Context, rows []CohortMapRow) error {
+	for _, row := range rows {
+		if row.Cohort.IsUnset() {
+			return errors.NewInvalidArgumentError("cannot map the unset cohort to block %d", row.BlockID)
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -891,7 +902,9 @@ func (m *MockStore) AllocateSplitCohort(_ context.Context, sourceCohort cohort.I
 		m.SplitAllocations = map[string]cohort.ID{}
 	}
 
-	key := sourceCohort.String() + "/" + blockHash.String()
+	// Keyed on the numeric cohort rather than its String() rendering: String is a
+	// human label, and the key has to be injective on the id itself.
+	key := strconv.FormatUint(uint64(sourceCohort), 10) + "/" + blockHash.String()
 	if allocated, ok := m.SplitAllocations[key]; ok {
 		return allocated, nil
 	}

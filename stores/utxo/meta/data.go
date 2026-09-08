@@ -77,6 +77,14 @@ type Data struct {
 	// corruption on the consensus path. The Meta pair has a fixed 17-byte header
 	// with no version field and the same problem. Carrying the cohort through
 	// those encodings needs a versioned format, which is not part of this change.
+	//
+	// The consequence is that Cohort does not survive the txmeta cache: the byte
+	// backend round-trips through MetaBytesInto and the pointer backend rebuilds
+	// through metadataOnly, and neither carries the field. So on a store that
+	// populates it on every read (the SQL one), a GetMeta returns the real
+	// cohort on a cache miss and zero on a cache hit. Zero is indistinguishable
+	// from "never stamped", so nothing may read this field as authoritative
+	// until the versioned encoding lands. Nothing does today.
 	Cohort uint32 `json:"cohort,omitempty"`
 
 	// CreatedAt is the wall-clock time (Unix milliseconds) when the tx record was

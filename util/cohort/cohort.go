@@ -52,8 +52,21 @@ const (
 	Historical ID = 1
 
 	// BornMined marks transactions created as part of a block - quick-validate,
-	// legacy netsync, and coinbase transactions. They are mined by construction,
-	// so they never need a cohort map row.
+	// legacy netsync, and coinbase transactions. They are mined at the moment
+	// they are created, so they carry no cohort map row and read as mined
+	// unconditionally.
+	//
+	// That answer is chain-independent, so it is only sound for a block that
+	// cannot leave the main chain. Quick-validate satisfies that: it runs below
+	// a checkpoint. The other two creators do not - legacy netsync creates
+	// through this sentinel for tip blocks as well as historical ones, and the
+	// block-assembly coinbase is created at the tip by definition - so a reorg
+	// would leave those transactions still reading as mined. Nothing consumes a
+	// cohort yet, so no reader can observe it today. Closing it belongs with the
+	// map-row writer: a tip creator has to take a real cohort with a real map
+	// row, so the blocks-table flags govern it the way they govern everything
+	// else. Giving a tip creator a real cohort BEFORE that writer exists would
+	// be strictly worse - the transaction would then read as never mined.
 	BornMined ID = 2
 
 	// FirstSynthetic is the lowest synthetic cohort ID. Synthetic IDs are minted

@@ -1673,8 +1673,11 @@ func SpendAndCreateInvalidOptions(t *testing.T, db utxostore.Store) {
 // the label at cohort.Unset.
 //
 // fields.Cohort is requested explicitly because it is deliberately not part of
-// utxostore.MetaFields — nothing reads the cohort yet, so no hot read path pays
-// for it.
+// utxostore.MetaFields, so aerospike only fetches the bin when a caller names
+// it. The SQL store is not field-gated at all — getUnbatched and
+// batchDecorateChunk both select a fixed column list and populate Cohort on
+// every read — so naming the field is what makes this test mean the same thing
+// on both backends, not a claim that no read path pays for the column.
 func CohortRoundTrip(t *testing.T, db utxostore.Store) {
 	ctx := context.Background()
 

@@ -114,6 +114,14 @@ type StepKind uint8
 const (
 	// StepInheritBlocks inserts one cohort map row per block the source cohort
 	// is already mapped to, this time against the fresh cohort.
+	//
+	// An inherited row must be written with MemberCount 0 and Verified false.
+	// Only a subset of the source's transactions moves to the fresh cohort, so
+	// copying the source row's count across would state a number that describes
+	// the wrong cohort, and model.CohortMapRow freezes Verified at first insert:
+	// the map is insert-only, so a wrong count recorded here can never be
+	// corrected. Zero-and-unverified says what is actually known, which is that
+	// the fresh cohort is in that block and the count has not been established.
 	StepInheritBlocks StepKind = iota
 
 	// StepRestamp rewrites the cohort label on the transactions of the moved

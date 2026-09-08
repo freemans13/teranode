@@ -309,6 +309,12 @@ type Validator struct {
 	// second they were created in. One stamper per Validator instance, because
 	// the stamper keeps a floor across the stamps it issues.
 	//
+	// That floor is therefore per-process, and Teranode runs a validator inside
+	// every propagation pod as well as the validator service, so a cluster holds
+	// several independent floors. Nothing calls ObserveMapped yet, so no floor
+	// is ever raised today; making the floor a real global guard is part of the
+	// map-row writer, not of this spine. See util/cohort.Stamper.
+	//
 	// nil when UtxoStore.CohortStamping is off, in which case no create call
 	// passes WithCohort at all and the stored label stays at cohort.Unset.
 	cohortStamper *cohort.Stamper

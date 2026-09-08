@@ -10,6 +10,16 @@ import (
 // DefaultMinMapAge is how old a clock cohort must be before a block is allowed
 // to map it. It gives in-flight transactions that were stamped with that second
 // time to finish being written before the cohort is nailed to a block.
+//
+// The window it has to cover is the whole of Stamp() returning through to the
+// record being durable in the UTXO store, which on the validator path runs
+// through the create batcher and whatever backpressure is on it. That is not
+// bounded by anything, so 7s is a working default, not a derived one: a create
+// that lands after its cohort was mapped makes the transaction read as mined in
+// a block it was never in. Before a mapper ships, the stamp-to-durable latency
+// has to be measured and this constant justified against it, or the gap closed
+// structurally by refusing to map a cohort while any stamp at or below it is
+// still outstanding.
 const DefaultMinMapAge = 7 * time.Second
 
 // Stamper hands out cohort IDs at transaction create time. It is safe for
@@ -20,11 +30,30 @@ const DefaultMinMapAge = 7 * time.Second
 // was never in the block. So the stamper keeps a floor: the newest clock cohort
 // it has been told is already mapped. Stamps are never issued at or below that
 // floor.
+//
 // Stamp is lock-free: it reads the floor, compares, and returns. Two callers
 // racing on the fallback both return floor+1, which is correct - a cohort is a
 // group, many transactions share one - and neither can land at or below the
-// floor, which is the only thing the guard has to guarantee. Stamping is on the
-// per-transaction create path, so it must not serialise on a mutex.
+// floor AS THEY READ IT. Stamping is on the per-transaction create path, so it
+// must not serialise on a mutex.
+//
+// Two limits of the floor, both of which the follow-up work has to close and
+// neither of which the floor is claimed to solve on its own:
+//
+//   - It is a per-process hint, not a global one. The stamper is built per
+//     Validator, and Teranode runs a validator inside every propagation pod as
+//     well as the validator service, so a cluster holds several independent
+//     floors. Poisoning a cohort has to be global; raising the floor in one
+//     process leaves every other process free to keep stamping into that same
+//     second.
+//   - It does not order against a concurrent ObserveMapped. Stamp can load the
+//     floor, decide its candidate is above it, and return while another
+//     goroutine raises the floor past that candidate.
+//
+// What actually keeps a stamp out of a mapped cohort is CanMap's minimum age
+// (see DefaultMinMapAge), which refuses to map a cohort until it is old enough
+// that nothing should still be arriving in it. The floor is a second line
+// behind that, not the guarantee.
 type Stamper struct {
 	now    func() time.Time
 	floor  atomic.Uint32
