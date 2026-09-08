@@ -293,26 +293,20 @@ func (s *Service) deleteTombstonedTx(ctx context.Context, blockHeight uint32) (i
 }
 
 // beginPruneTx opens the pruning transaction.
+// pruneTxOptions is the isolation the pruning transaction asks for.
 //
 // Isolation note, corrected. LevelSerializable is honoured by Postgres only.
 // modernc.org/sqlite's conn.BeginTx reads opts.ReadOnly and the DSN _txlock mode
 // and never inspects opts.Isolation, and because the driver implements
 // driver.ConnBeginTx, database/sql does not reject the level either. util/sql.go
 // builds the SQLite DSN with no _txlock, so what we actually get there is a
-// plain deferred BEGIN. The cross-statement atomicity this function needs still
+// plain deferred BEGIN. The cross-statement atomicity the pruner needs still
 // holds on SQLite - one writer at a time, and the transaction rolls back as a
 // unit - but it holds because SQLite serialises writers, not because the level
 // was asked for. A deferred BEGIN that starts as a reader can also fail to
 // upgrade with SQLITE_BUSY_SNAPSHOT, which is why deleteTombstoned retries the
 // whole transaction.
-func (s *Service) beginPruneTx(ctx context.Context) (*sql.Tx, error) {
-	txn, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-	if err != nil {
-		return nil, errors.NewStorageError("failed to begin pruning transaction", err)
-	}
-
-	return txn, nil
-}
+var pruneTxOptions = &sql.TxOptions{Isolation: sql.LevelSerializable}
 
 // finishPrune reads the delete's row count and commits.
 func finishPrune(txn *sql.Tx, result sql.Result) (int64, error) {
@@ -344,9 +338,9 @@ func (s *Service) pruneWithoutDefensiveCheck(ctx context.Context, blockHeight ui
   WHERE delete_at_height IS NOT NULL
     AND delete_at_height <= $1`
 
-	txn, err := s.beginPruneTx(ctx)
+	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
 	if err != nil {
-		return 0, err
+		return 0, errors.NewStorageError("failed to begin pruning transaction", err)
 	}
 
 	defer func() { _ = txn.Rollback() }()
@@ -445,9 +439,9 @@ func (s *Service) pruneWithDefensiveCheck(ctx context.Context, blockHeight uint3
 		createCandidates = createCandidatesPostgres
 	}
 
-	txn, err := s.beginPruneTx(ctx)
+	txn, err := s.db.BeginTx(ctx, pruneTxOptions)
 	if err != nil {
-		return 0, err
+		return 0, errors.NewStorageError("failed to begin pruning transaction", err)
 	}
 
 	defer func() { _ = txn.Rollback() }()

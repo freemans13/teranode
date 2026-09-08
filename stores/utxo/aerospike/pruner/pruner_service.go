@@ -926,6 +926,106 @@ func (s *Service) Prune(ctx context.Context, blockHeight uint32, blockHashStr st
 	return s.PruneWithPartitions(ctx, blockHeight, blockHashStr, numWorkers)
 }
 
+// verifyChunkChildren runs the defensive check for a whole chunk in two steps:
+// pull every spending child named by the scanned records' own utxos bins, then
+// verify them all in one BatchGet.
+//
+// Returns the per-child stability verdict and, per scanned record key, the
+// children that record's outputs name. Extracted from processRecordChunk so the
+// chunk loop reads as the decision it makes rather than the bin parsing it needs.
+func (s *Service) verifyChunkChildren(chunk []*aerospike.Result, blockHeight uint32) (map[string]bool, map[string][]string) {
+	uniqueSpendingChildren := make(map[string][]byte, 1000)   // hex hash -> bytes (typical: ~50-100 children per chunk)
+	parentToChildren := make(map[string][]string, len(chunk)) // parent record key -> child hashes
+	deletedChildren := make(map[string]bool, 20)              // child hash -> already deleted (typical: 0-20)
+
+	for _, rec := range chunk {
+		if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
+			// Skip errored/empty records - errors will be tracked in main processing loop
+			continue
+		}
+
+		// A child in the deletedChildren map was already pruned and must not
+		// block its parent's deletion.
+		s.collectDeletedChildren(rec.Record.Bins, deletedChildren)
+
+		children := extractSpendingChildren(rec.Record.Bins[s.fieldUtxos], uniqueSpendingChildren)
+		if len(children) > 0 {
+			parentToChildren[rec.Record.Key.String()] = children
+		}
+	}
+
+	if len(uniqueSpendingChildren) == 0 {
+		return make(map[string]bool), parentToChildren
+	}
+
+	return s.batchVerifyChildrenSafety(uniqueSpendingChildren, blockHeight, deletedChildren), parentToChildren
+}
+
+// collectDeletedChildren folds one record's deletedChildren bin into the
+// chunk-wide set of children already known to be pruned.
+func (s *Service) collectDeletedChildren(bins aerospike.BinMap, into map[string]bool) {
+	raw, ok := bins[s.fieldDeletedChildren]
+	if !ok {
+		return
+	}
+
+	deletedMap, ok := raw.(map[interface{}]interface{})
+	if !ok {
+		s.logger.Debugf("deletedChildren bin wrong type: %T", raw)
+		return
+	}
+
+	for childHashIface := range deletedMap {
+		if childHashStr, ok := childHashIface.(string); ok {
+			into[childHashStr] = true
+		}
+	}
+}
+
+// extractSpendingChildren reads the child transactions named by a record's spent
+// utxos, adding each to the chunk-wide unique set and returning this record's
+// own list. Each utxo entry is the 32-byte utxo hash followed by 36 bytes of
+// spending data, whose first 32 bytes are the spending transaction's id; an
+// all-zero id means unspent.
+func extractSpendingChildren(utxosRaw interface{}, unique map[string][]byte) []string {
+	utxosList, ok := utxosRaw.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	children := make([]string, 0, 16) // Pre-allocate for typical ~10 spent UTXOs per tx
+
+	for _, utxoRaw := range utxosList {
+		utxoBytes, ok := utxoRaw.([]byte)
+		if !ok || len(utxoBytes) < 68 { // 32 (utxo hash) + 36 (spending data)
+			continue
+		}
+
+		childTxHashBytes := utxoBytes[32:64]
+		if isZeroBytes(childTxHashBytes) {
+			continue
+		}
+
+		hexHash := chainhash.Hash(childTxHashBytes).String()
+		unique[hexHash] = childTxHashBytes
+		children = append(children, hexHash)
+	}
+
+	return children
+}
+
+// isZeroBytes reports whether every byte is zero, which is how an unspent utxo
+// records its spending data.
+func isZeroBytes(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
 // processRecordChunk processes a chunk of parent records with batched child verification
 // Returns: (processedCount, skippedCount, error)
 func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, chunk []*aerospike.Result) (int, int, error) {
@@ -951,86 +1051,7 @@ func (s *Service) processRecordChunk(ctx context.Context, blockHeight uint32, ch
 		safetyMap = make(map[string]bool)
 		parentToChildren = make(map[string][]string)
 	} else {
-		// Step 1: Extract ALL unique spending children from chunk
-		// For each parent record, we extract all spending child TX hashes from spent UTXOs
-		// We must verify EVERY child is stable before deleting the parent
-		uniqueSpendingChildren := make(map[string][]byte, 1000)  // hex hash -> bytes (typical: ~50-100 children per chunk)
-		parentToChildren = make(map[string][]string, len(chunk)) // parent record key -> child hashes
-		deletedChildren := make(map[string]bool, 20)             // child hash -> already deleted (typical: 0-20)
-
-		for _, rec := range chunk {
-			if rec.Err != nil || rec.Record == nil || rec.Record.Bins == nil {
-				// Skip errored/empty records - errors will be tracked in main processing loop
-				continue
-			}
-
-			// Extract deletedChildren map from parent record
-			// If a child is in this map, it means it was already pruned and shouldn't block parent deletion
-			if deletedChildrenRaw, hasDeleted := rec.Record.Bins[s.fieldDeletedChildren]; hasDeleted {
-				if deletedMap, ok := deletedChildrenRaw.(map[interface{}]interface{}); ok {
-					for childHashIface := range deletedMap {
-						if childHashStr, ok := childHashIface.(string); ok {
-							deletedChildren[childHashStr] = true
-							// s.logger.Debugf("Worker %d: Found deleted child in parent record: %s", workerID, childHashStr[:8])
-						}
-					}
-				} else {
-					s.logger.Debugf("deletedChildren bin wrong type: %T", deletedChildrenRaw)
-				}
-			}
-
-			// Extract all spending children from this parent's UTXOs
-			utxosRaw, hasUtxos := rec.Record.Bins[s.fieldUtxos]
-			if !hasUtxos {
-				continue
-			}
-
-			utxosList, ok := utxosRaw.([]interface{})
-			if !ok {
-				continue
-			}
-
-			parentKey := rec.Record.Key.String()
-			childrenForThisParent := make([]string, 0, 16) // Pre-allocate for typical ~10 spent UTXOs per tx
-
-			// Scan all UTXOs for spending data
-			for _, utxoRaw := range utxosList {
-				utxoBytes, ok := utxoRaw.([]byte)
-				if !ok || len(utxoBytes) < 68 { // 32 (utxo hash) + 36 (spending data)
-					continue
-				}
-
-				// spending_data starts at byte 32, first 32 bytes of spending_data is child TX hash
-				childTxHashBytes := utxoBytes[32:64]
-
-				// Check if this is actual spending data (not all zeros)
-				hasSpendingData := false
-				for _, b := range childTxHashBytes {
-					if b != 0 {
-						hasSpendingData = true
-						break
-					}
-				}
-
-				if hasSpendingData {
-					hexHash := chainhash.Hash(childTxHashBytes).String()
-					uniqueSpendingChildren[hexHash] = childTxHashBytes
-					childrenForThisParent = append(childrenForThisParent, hexHash)
-					// s.logger.Debugf("Worker %d: Extracted spending child from UTXO: %s", workerID, hexHash[:8])
-				}
-			}
-
-			if len(childrenForThisParent) > 0 {
-				parentToChildren[parentKey] = childrenForThisParent
-			}
-		}
-
-		// Step 2: Batch verify all unique children (single BatchGet call for entire chunk)
-		if len(uniqueSpendingChildren) > 0 {
-			safetyMap = s.batchVerifyChildrenSafety(uniqueSpendingChildren, blockHeight, deletedChildren)
-		} else {
-			safetyMap = make(map[string]bool)
-		}
+		safetyMap, parentToChildren = s.verifyChunkChildren(chunk, blockHeight)
 	}
 
 	// Step 3: Accumulate operations for entire chunk, then flush once (efficient batching)
