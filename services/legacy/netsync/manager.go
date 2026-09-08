@@ -174,6 +174,11 @@ type blockMsg struct {
 	block *bsvutil.Block
 	peer  *peerpkg.Peer
 	reply chan error
+
+	// handedOff is closed once the block's memory is charged to the budget that
+	// owns it next, so the peer can give its download bytes back without waiting
+	// for validation. Carried through to the queue message unchanged.
+	handedOff chan struct{}
 }
 
 // headersMsg packages a bitcoin headers message and the peer it came from
@@ -819,7 +824,7 @@ type SyncManager struct {
 	// property this gate exists to guarantee. nil (alongside a nil
 	// blockPrefetchBudget) when prefetch is disabled, so the synchronous/regtest
 	// path skips dedup entirely. inFlightBlocksMu guards the map.
-	inFlightBlocks   map[chainhash.Hash]struct{}
+	inFlightBlocks   map[chainhash.Hash]*inFlightBlock
 	inFlightBlocksMu sync.Mutex
 
 	// blockPrefetchWaiters counts read-loops currently blocked acquiring
@@ -2813,6 +2818,25 @@ func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpo
 	return isCheckpointBlock, removedFront
 }
 
+// noteHandedOff tells the peer's awaiting goroutine that this block's memory is
+// now charged to another budget, so the download bytes it reserved can go back.
+// Closed exactly once, by the consumer goroutine, and safe on a message that
+// carries no channel.
+func noteHandedOff(msg *blockQueueMsg) {
+	if msg == nil || msg.handedOff == nil {
+		return
+	}
+
+	select {
+	case <-msg.handedOff:
+		// Already signalled. Cannot happen on today's paths, since each of the two
+		// charge points runs once per block, but closing a closed channel panics
+		// and the cost of asking is nothing.
+	default:
+		close(msg.handedOff)
+	}
+}
+
 // admissionChoice is which of the consumer's two admission sources takes a turn.
 type admissionChoice int
 
@@ -3400,12 +3424,17 @@ func (sm *SyncManager) parkOrphanBlock(d *blockDispatch, msgBlock *wire.MsgBlock
 			catchingBlocks: catchingBlocks,
 		}
 
-		// The reply travels with the job, so the consumer does not
-		// answer for this block when the head returns. That is
-		// what holds the prefetch budget the decoded block is charged
-		// against until the worker has finished with it, rather than
-		// releasing it while a worker still holds a gigabyte of block.
+		// The reply travels with the job, so the consumer does not answer for
+		// this block when the head returns. That is what keeps the peer's
+		// awaiting goroutine alive until the worker has finished with the
+		// decoded block.
 		bmsg.reply = nil
+
+		// Admit has charged the block to the park's own byte budget, and the
+		// park is what accounts for it from here, including while the worker
+		// holds it to write. So the download bytes go back now rather than at
+		// the reply, which is minutes later for a mainnet giant block.
+		noteHandedOff(bmsg)
 
 		sm.submitParkJob(job)
 	}
@@ -5394,6 +5423,14 @@ type blockQueueMsg struct {
 	blockHeight int32
 	peer        *peerpkg.Peer
 	reply       chan error
+
+	// handedOff is closed by the consumer once this block's memory has been
+	// charged to the budget that owns it next: the window's byte charge for a
+	// dispatched block, the park's byte budget for a parked one. The peer's
+	// awaiting goroutine gives the download bytes back when it closes, rather
+	// than holding them through validation and keeping other peers from reading.
+	// Nil when nobody is waiting, which is every manager a test builds by hand.
+	handedOff chan struct{}
 	// committed says handleBlockMsg actually put this block in the chain, as
 	// opposed to the several paths on which it returns nil having done no such
 	// thing. Only the consumer reads it, and only to decide whether to drain the
@@ -5546,6 +5583,7 @@ out:
 					blockHeight: msg.block.Height(),
 					peer:        msg.peer,
 					reply:       msg.reply,
+					handedOff:   msg.handedOff,
 				}:
 				case <-sm.quit:
 					// Enqueue aborted on shutdown: undo the Add(1) above. Nothing
@@ -5620,14 +5658,22 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 // QueueBlock adds the passed block message and peer to the block handling
 // queue. Responds to the done channel argument after the block message is
 // processed.
-func (sm *SyncManager) QueueBlock(block *bsvutil.Block, peer *peerpkg.Peer, done chan error) {
+func (sm *SyncManager) QueueBlock(block *bsvutil.Block, peer *peerpkg.Peer, done chan error, handedOff ...chan struct{}) {
 	// Don't accept more blocks if we're shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		done <- nil
 		return
 	}
 
-	sm.msgChan <- &blockMsg{block: block, peer: peer, reply: done}
+	msg := &blockMsg{block: block, peer: peer, reply: done}
+
+	// Variadic so the many callers that do not run under the prefetch path, the
+	// regtest tooling and this package's tests among them, are unchanged.
+	if len(handedOff) > 0 {
+		msg.handedOff = handedOff[0]
+	}
+
+	sm.msgChan <- msg
 }
 
 // UsePrefetchIngestion reports whether OnBlock should take the bounded async
@@ -5724,7 +5770,7 @@ func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan str
 		sm.inFlightBlocksMu.Unlock()
 		return 0, ErrDuplicateBlockInFlight
 	}
-	sm.inFlightBlocks[blockHash] = struct{}{}
+	sm.inFlightBlocks[blockHash] = &inFlightBlock{}
 	sm.inFlightBlocksMu.Unlock()
 
 	// removeInFlight undoes the reservation above. It runs only when the budget
@@ -5788,6 +5834,22 @@ func (sm *SyncManager) AcquireBlockPrefetch(ctx context.Context, quit <-chan str
 // the dup/early-return paths never reach here (OnBlock does not spawn
 // awaitBlockResult for them), so no hash is deleted that was not first inserted.
 func (sm *SyncManager) ReleaseBlockPrefetch(blockHash chainhash.Hash, weight int64) {
+	sm.ReleaseBlockPrefetchBytes(blockHash, weight)
+	sm.ReleaseBlockPrefetchHash(blockHash)
+}
+
+// inFlightBlock is what the admission gate remembers about one block between its
+// acquire and its departure from the pipeline. Its presence is the dedup half of
+// the gate; bytesReleased is what makes the byte half exactly once.
+type inFlightBlock struct {
+	bytesReleased bool
+}
+
+// ReleaseBlockPrefetchHash drops a block's hash from the in-flight dedup set,
+// which is the half of the admission gate that stops a second copy of a block
+// being validated while the first is still in the pipeline. It runs when the
+// block leaves that pipeline, which is when its reply is sent.
+func (sm *SyncManager) ReleaseBlockPrefetchHash(blockHash chainhash.Hash) {
 	if sm.blockPrefetchBudget == nil {
 		return
 	}
@@ -5795,10 +5857,52 @@ func (sm *SyncManager) ReleaseBlockPrefetch(blockHash chainhash.Hash, weight int
 	sm.inFlightBlocksMu.Lock()
 	delete(sm.inFlightBlocks, blockHash)
 	sm.inFlightBlocksMu.Unlock()
+}
 
-	if weight <= 0 {
+// ReleaseBlockPrefetchBytes gives a block's byte weight back to the download
+// budget. It runs as soon as the block's memory has been charged to whichever
+// budget owns it next, which is earlier than the reply and is the point of the
+// split.
+//
+// The two halves used to share one lifetime, deliberately, so that neither could
+// drift from the other. The dedup half still ends at the reply. The byte half
+// must not, because the budget is acquired AFTER a block has been read off the
+// wire, in OnBlock, and a read loop blocked in that acquire cannot read its next
+// message at all. Holding the bytes through validation therefore stops other
+// peers downloading: measured on mainnet at height 752,100 with a 256 MiB budget,
+// one or two blocks in flight and five or six read loops blocked, on a link
+// delivering 27 MB/s.
+//
+// Nothing becomes unbounded. A dispatched block's memory is charged to the
+// window's byte budget in blockDispatcher.dispatch, and a parked block's to the
+// park's own budget in blockPark.Admit. What the split removes is the download
+// budget double-counting memory another budget is already accounting for, and it
+// is that second count which shuts the peers out.
+//
+// Exactly-once is the caller's to guarantee, and awaitBlockResult is the only
+// caller for a live block: it holds the weight from its own successful acquire
+// and releases it on whichever of the hand-off and the reply comes first.
+// Releasing a weight twice, or one never acquired, panics the semaphore on a
+// peer's read loop.
+func (sm *SyncManager) ReleaseBlockPrefetchBytes(blockHash chainhash.Hash, weight int64) {
+	if sm.blockPrefetchBudget == nil || weight <= 0 {
 		return
 	}
+
+	sm.inFlightBlocksMu.Lock()
+
+	if b, ok := sm.inFlightBlocks[blockHash]; ok {
+		if b.bytesReleased {
+			sm.inFlightBlocksMu.Unlock()
+
+			return
+		}
+
+		b.bytesReleased = true
+	}
+
+	sm.inFlightBlocksMu.Unlock()
+
 	sm.blockPrefetchBudget.Release(weight)
 }
 
@@ -6327,7 +6431,7 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// Dedup half of the same admission gate as the budget semaphore, created
 		// in lockstep with it: paired 1:1 with each budget reservation so at most
 		// one copy of a block hash is ever admitted/queued at a time.
-		sm.inFlightBlocks = make(map[chainhash.Hash]struct{})
+		sm.inFlightBlocks = make(map[chainhash.Hash]*inFlightBlock)
 	}
 
 	// The fail-closed inline lever is a no-op unless the outpoint-only below-checkpoint

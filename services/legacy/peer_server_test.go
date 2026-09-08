@@ -1747,7 +1747,7 @@ func TestAwaitBlockResult_ReleasesAndExitsOnTeardown(t *testing.T) {
 
 		finished := make(chan struct{})
 		go func() {
-			sp.awaitBlockResult(done, 0, &chainhash.Hash{})
+			sp.awaitBlockResult(done, nil, 0, &chainhash.Hash{})
 			close(finished)
 		}()
 
@@ -1776,7 +1776,7 @@ func TestAwaitBlockResult_ReleasesAndExitsOnTeardown(t *testing.T) {
 
 		finished := make(chan struct{})
 		go func() {
-			sp.awaitBlockResult(done, 0, &chainhash.Hash{})
+			sp.awaitBlockResult(done, nil, 0, &chainhash.Hash{})
 			close(finished)
 		}()
 
@@ -1802,7 +1802,7 @@ func TestAwaitBlockResult_ReleasesAndExitsOnTeardown(t *testing.T) {
 
 		finished := make(chan struct{})
 		go func() {
-			sp.awaitBlockResult(done, 0, &chainhash.Hash{})
+			sp.awaitBlockResult(done, nil, 0, &chainhash.Hash{})
 			close(finished)
 		}()
 
@@ -1829,7 +1829,7 @@ func TestAwaitBlockResult_ReleasesAndExitsOnTeardown(t *testing.T) {
 				panicked <- recover()
 				close(finished)
 			}()
-			sp.awaitBlockResult(done, 0, &chainhash.Hash{})
+			sp.awaitBlockResult(done, nil, 0, &chainhash.Hash{})
 		}()
 
 		// Tear down with done still empty so the goroutine must take the sp.quit
