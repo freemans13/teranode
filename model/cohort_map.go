@@ -20,7 +20,11 @@ type CohortMapRow struct {
 	// MemberCount is how many of that cohort's transactions are in that block.
 	MemberCount uint64
 
-	// Verified records whether that count has been confirmed against the block.
+	// Verified records whether that count was confirmed against the block at
+	// the moment the row was written. The map is insert-only, so this is fixed
+	// when the row is first inserted and cannot later be flipped by re-recording
+	// the same cohort and block; a consumer that needs to confirm a count after
+	// the fact has to add an explicit update path.
 	Verified bool
 }
 

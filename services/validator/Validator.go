@@ -196,8 +196,9 @@ type Validator struct {
 	mtpStore []uint32
 
 	// cohortStamper hands out the issue-556 cohort label for transactions this
-	// validator creates. Transactions that reach the validator come from the
-	// mempool and go on to block assembly, so they get a wall-clock cohort - the
+	// validator creates. Transactions that reach the validator have no block ID
+	// at create time - whether they arrived from the mempool or were first seen
+	// inside a block being validated - so they get a wall-clock cohort, the
 	// second they were created in. One stamper per Validator instance, because
 	// the stamper keeps a floor across the stamps it issues.
 	//
