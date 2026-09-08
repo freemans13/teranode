@@ -861,3 +861,136 @@ func TestDrain_NextAdmissionGivesBothSourcesATurn(t *testing.T) {
 	require.Equal(t, 5, drained, "the drain gets half the turns")
 	require.Equal(t, 5, live, "and the live path gets the other half")
 }
+
+// TestParkJob_AFullPoolDoesNotBlockTheConsumer is the last consumer-blocking
+// site, and it matters more after the drain moved off that goroutine than it did
+// before.
+//
+// The head hands an admitted block to a park worker. With both workers mid-write
+// that hand-off used to wait, and a park write of a mainnet giant block is
+// minutes: the stateless merkle check alone has been measured above three
+// minutes. Waiting there stops completions, sweep posts and drain steps being
+// serviced for all of it, and with the drain gone the consumer reaches that
+// hand-off far more often, because most arrivals in this regime park.
+//
+// So the job is handed to the consumer's own select and offered to a worker
+// without blocking. The backpressure is unchanged: while a job is held the queue
+// arm is disabled, the same rule the pending dispatch follows.
+func TestParkJob_AFullPoolDoesNotBlockTheConsumer(t *testing.T) {
+	h := newParkWiringHarness(t, true)
+	h.withDispatcher(t)
+
+	h.sm.settings.BlockValidation.QuickWindowBlocks = 1
+	h.sm.settings.BlockValidation.QuickValidateSkipUtxoLock = true
+	h.sm.quit = make(chan struct{})
+
+	// Nothing is stored, so every arrival is an orphan and parks.
+	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+
+	// One worker, held inside its blob write, so the pool is full for the rest of
+	// the test and the hand-off has nowhere to go.
+	gate := &gatedWriteStore{
+		Store:   h.sm.blockPark.store,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h.sm.blockPark.store = gate
+
+	startParkPool(t, h, 1)
+
+	queue := make(chan *blockQueueMsg, 4)
+
+	go h.sm.dispatchBlocks(queue)
+
+	t.Cleanup(func() {
+		select {
+		case <-gate.release:
+		default:
+			close(gate.release)
+		}
+	})
+
+	// The first block fills the only worker.
+	first := h.blocks[1].MsgBlock()
+	h.sm.blockDownloads.Add(h.peer, first.BlockHash())
+	h.sm.blockBacklog.Add(1)
+
+	queue <- &blockQueueMsg{
+		block:       first,
+		blockHash:   first.BlockHash(),
+		blockHeight: 2,
+		peer:        h.peer,
+		reply:       make(chan error, 1),
+	}
+
+	select {
+	case <-gate.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first block never reached the blob write")
+	}
+
+	// A second block now needs the park too, and there is no worker for it. Its
+	// job is held by the consumer.
+	second := h.blocks[2].MsgBlock()
+	h.sm.blockDownloads.Add(h.peer, second.BlockHash())
+	h.sm.blockBacklog.Add(1)
+
+	queue <- &blockQueueMsg{
+		block:       second,
+		blockHash:   second.BlockHash(),
+		blockHeight: 3,
+		peer:        h.peer,
+		reply:       make(chan error, 1),
+	}
+
+	require.True(t, WaitUntil(func() bool { return !h.sm.blockDownloads.HasOwner(h.peer, second.BlockHash()) }, 10*time.Second),
+		"the second block must be head-processed even though no park worker is free")
+
+	// And the consumer is still answering, which is the claim. A sweep post is
+	// the cheapest thing to ask it for, and only that goroutine handles it.
+	require.True(t, WaitUntil(func() bool {
+		select {
+		case h.sm.parkCommits <- parkCommit{}:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second), "the sweep can still post")
+
+	require.True(t, WaitUntil(func() bool { return len(h.sm.parkCommits) == 0 }, 10*time.Second),
+		"and the consumer is still servicing its select while a park job waits for a worker")
+
+	// The backpressure the slot preserves: while a job is held, nothing else is
+	// head-processed, which is the same rule the pending dispatch follows. A third
+	// block put on the queue must stay there.
+	third := h.blocks[0].MsgBlock()
+	h.sm.blockDownloads.Add(h.peer, third.BlockHash())
+	h.sm.blockBacklog.Add(1)
+
+	queue <- &blockQueueMsg{
+		block:       third,
+		blockHash:   third.BlockHash(),
+		blockHeight: 1,
+		peer:        h.peer,
+		reply:       make(chan error, 1),
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	require.Equal(t, 1, len(queue),
+		"a held park job must keep the queue arm shut, or the park's backpressure is gone")
+	require.True(t, h.sm.blockDownloads.HasOwner(h.peer, third.BlockHash()),
+		"and the third block must not have been head-processed")
+
+	// Now let the write finish. The held job has to be offered again, or the block
+	// it belongs to is never written at all.
+	close(gate.release)
+
+	require.True(t, WaitUntil(func() bool { return h.sm.blockPark.Len() == 3 }, 15*time.Second),
+		"the held job must be offered to a worker once one is free, and the third block head-processed after it")
+
+	names := parkDirEntries(t, h.parkDir)
+	require.Contains(t, names, first.BlockHash().String()+".msgBlock")
+	require.Contains(t, names, second.BlockHash().String()+".msgBlock",
+		"the held job's block reaches the disk, or holding it lost the block")
+}

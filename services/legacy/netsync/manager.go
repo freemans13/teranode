@@ -736,6 +736,23 @@ type SyncManager struct {
 	// ran, which every struct-literal test manager is.
 	consumerDone chan struct{}
 
+	// parkJobHeld is the one park job the head has admitted and not yet handed to
+	// a worker, and parkJobAsync says there is a loop to hold it. Both are owned
+	// by the block-queue consumer alone, no lock, on the same terms as drainQueue:
+	// the head runs on that goroutine, so it can set the field directly.
+	//
+	// A field rather than a channel, and for a reason worth keeping. A channel
+	// whose only consumer is the goroutine that sends on it deadlocks on the
+	// first send. That is not hypothetical: it is what the first version of this
+	// did.
+	//
+	// While it is set the consumer disables its queue arm, so nothing else is
+	// head-processed, which is the same rule the pending dispatch slot follows and
+	// is what keeps the park's backpressure intact. When there is no loop,
+	// submitParkJob waits where it stands, which is the pre-window path.
+	parkJobHeld  *parkJob
+	parkJobAsync atomic.Bool
+
 	// parkSweepNow is the clock the park sweep measures its own tick against, so
 	// a test can make one store delete look slow without sleeping. nil means
 	// time.Now; nothing in production sets it.
@@ -2562,9 +2579,15 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 	bd := sm.dispatcher
 
 	// From here the drain is this loop's second admission source rather than a
-	// call made inside a tail, so scheduleDrain queues instead of walking.
+	// call made inside a tail, so scheduleDrain queues instead of walking, and
+	// the head leaves park jobs for this loop rather than waiting for a worker.
 	sm.drainAsync.Store(true)
-	defer sm.drainAsync.Store(false)
+	sm.parkJobAsync.Store(true)
+
+	defer func() {
+		sm.drainAsync.Store(false)
+		sm.parkJobAsync.Store(false)
+	}()
 
 	// pending holds one head-processed block waiting for capacity. While it is
 	// set the queue arm is disabled, so nothing else is head-processed until this
@@ -2613,7 +2636,20 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 		case admitNothing:
 		}
 
-		if pending == nil {
+		// One park job at a time, offered to a worker without blocking this
+		// goroutine. Tried before the queue arm opens, for the same reason the
+		// pending dispatch is: it is work already accepted.
+		if sm.parkJobHeld != nil {
+			select {
+			case sm.parkJobs <- *sm.parkJobHeld:
+				sm.parkJobHeld = nil
+
+				continue
+			default:
+			}
+		}
+
+		if pending == nil && sm.parkJobHeld == nil {
 			queueArm = blockQueue
 		}
 
@@ -2635,6 +2671,16 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 				finish(pending.msg, errors.NewServiceError(syncManagerShuttingDownMsg))
 
 				pending = nil
+			}
+
+			// A held park job has the queued block's reply, so nobody else will
+			// answer for it, and its prefetch budget is held until somebody does.
+			// Its admission is given back too, because no write is coming.
+			if sm.parkJobHeld != nil {
+				sm.blockPark.Abandon(sm.parkJobHeld.entry)
+				sm.replyToParkJob(*sm.parkJobHeld, errors.NewServiceError(syncManagerShuttingDownMsg))
+
+				sm.parkJobHeld = nil
 			}
 
 			for _, e := range bd.frontier {
