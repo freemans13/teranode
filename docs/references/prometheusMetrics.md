@@ -62,6 +62,7 @@ All metrics are CounterVec type with labels: `function` (handler function name),
 | `teranode_blockassembly_transactions`                         | Gauge     | Number of transactions currently in the block assembler subtree processor        |
 | `teranode_blockassembly_queued_transactions`                  | Gauge     | Number of transactions currently queued in the block assembler subtree processor |
 | `teranode_blockassembly_subtrees`                             | Gauge     | Number of subtrees currently in the block assembler subtree processor            |
+| `teranode_blockassembly_dequeue_staleness_seconds`            | Gauge     | Seconds since the subtree processor's consumer goroutine last passed through its dequeue branch; growing alongside a non-zero `queued_transactions` means intake is queuing unboundedly because the consumer is stuck elsewhere |
 | `teranode_blockassembly_tx_meta_get`                          | Histogram | Histogram of reading tx meta data from txmeta store in block assembler           |
 | `teranode_blockassembly_reorg`                                | Counter   | Number of reorgs in block assembler                                              |
 | `teranode_blockassembly_reorg_duration`                       | Histogram | Histogram of reorg in block assembler                                            |
@@ -334,6 +335,8 @@ Each metric measures "The time taken to handle a specific legacy action handler"
 | `teranode_validator_send_to_blockvalidation_kafka` | Histogram | Histogram of sending transactions to block validation kafka   |
 | `teranode_validator_send_to_p2p_kafka`             | Histogram | Histogram of sending rejected transactions to p2p kafka       |
 | `teranode_validator_set_tx_meta`                   | Histogram | Histogram of validator set tx meta                            |
+| `teranode_validator_parent_commit_retries`         | Counter   | Retries spent waiting for a parent transaction to finish committing, by `condition` (`TX_LOCKED`, `TX_CREATING`) |
+| `teranode_validator_parent_commit_exhausted`       | Counter   | Transactions rejected because the parent-commit retry budget ran out, by `condition` (`TX_LOCKED`, `TX_CREATING`) |
 
 ## TxMetaCache Service Metrics
 
