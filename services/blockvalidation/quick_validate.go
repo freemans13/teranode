@@ -1393,9 +1393,16 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 		// phase has not run, so it left nothing behind.
 		ghosts := utxo.PrunedReplayGhosts(batch.batchTxs, prunedReplays, createdHere)
 
-		// ctx, not the errgroup context: the spend group's context is cancelled
-		// by the time we get here.
-		if deleteErr := utxo.DeleteCreated(ctx, u.logger, u.utxoStore, ghosts,
+		// Detached from ctx on purpose. ctx is the batch's errgroup context,
+		// shared with the sibling subtree-write goroutine, so a write failure
+		// landing at the same moment as this hard-fail would cancel the
+		// compensation and leave the ghost (locked, so the next attempt would
+		// reclassify it as its own, but only with the catch-up lock on). The
+		// delete gets its own bounded budget instead.
+		deleteCtx, cancelDelete := context.WithTimeout(context.WithoutCancel(ctx), compensatingDeleteTimeout)
+		defer cancelDelete()
+
+		if deleteErr := utxo.DeleteCreated(deleteCtx, u.logger, u.utxoStore, ghosts,
 			u.settings.UtxoStore.StoreBatcherSize*8); deleteErr != nil {
 			return errors.NewProcessingError("[createAndSpendUTXOsForBatch][%s] spend phase failed and the recreated pruned transactions could not be removed", block.Hash().String(), errors.Join(err, deleteErr))
 		}
@@ -1409,6 +1416,10 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 // spendRetryBackoffDefault is the pause between spend retry attempts. Matches the
 // legacy path's retryBackoff (services/legacy/netsync PreValidateTransactions).
 const spendRetryBackoffDefault = 2 * time.Second
+
+// compensatingDeleteTimeout bounds the compensating delete after a failed spend
+// phase, which runs detached from the batch context (see the call site).
+const compensatingDeleteTimeout = 2 * time.Minute
 
 // spendBatchWithRetry spends txs in parallel with bounded retries. Per attempt:
 // retryable errors (transient store overload) queue the tx for the next attempt;

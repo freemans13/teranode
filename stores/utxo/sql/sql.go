@@ -2283,7 +2283,11 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		// each of those is something the block paths cannot tell from an ordinary
 		// failure, so the record their create phase wrote for the replay would
 		// never be compensated. The marker says what the spender IS, whatever the
-		// output's state.
+		// output's state. Lua keeps three record-level answers ahead of its
+		// marker check (conflicting, locked, coinbase immaturity), none of which
+		// a fully spent, buried parent can be in at the same time as its child is
+		// replayed, and the block paths spend with IgnoreLocked; so the two stores
+		// agree on every reachable state, not on the order of every check.
 		if r.childPruned {
 			validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
 			continue
