@@ -994,3 +994,42 @@ func TestParkJob_AFullPoolDoesNotBlockTheConsumer(t *testing.T) {
 	require.Contains(t, names, second.BlockHash().String()+".msgBlock",
 		"the held job's block reaches the disk, or holding it lost the block")
 }
+
+// TestFrontierRace_ABlockTheParkAlreadyHoldsIsNotRaced is one line of production
+// code and it can only save work.
+//
+// The race asks a second peer for the block the whole chain is queued behind. A
+// parked block is already downloaded, checked and on disk, waiting for its
+// parent, so racing it spends a multi-gigabyte transfer on a block this node is
+// holding. The frontier really can sit on one: the frontier is published from the
+// header list, and a parked block whose own arrival never matched the front is
+// still in that list.
+func TestFrontierRace_ABlockTheParkAlreadyHoldsIsNotRaced(t *testing.T) {
+	h := newParkWiringHarness(t, true)
+
+	child := h.blocks[1].MsgBlock().BlockHash()
+
+	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+
+	require.NoError(t, h.deliver(t, 1))
+	require.True(t, h.sm.blockPark.Has(child), "precondition: the block is parked")
+
+	// A second peer, so there would be somebody to race to.
+	other, _, _ := connectRacePeer(t, 73, 1000)
+	registerRacePeer(h.sm, other)
+
+	// The frontier sits on the parked block, outstanding long enough to be worth
+	// racing on every other count.
+	h.sm.frontierMu.Lock()
+	h.sm.frontierHash = child
+	h.sm.frontierHeight = 2
+	h.sm.frontierSince = time.Now().Add(-time.Hour)
+	h.sm.frontierRacers = nil
+	h.sm.frontierMu.Unlock()
+
+	hash, _, target, ok := h.sm.frontierRaceTarget(time.Now())
+
+	require.False(t, ok, "a block the park already holds must not be raced")
+	require.Equal(t, chainhash.Hash{}, hash)
+	require.Nil(t, target)
+}

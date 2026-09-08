@@ -240,6 +240,18 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 		return none, 0, nil, false
 	}
 
+	// Already downloaded, checked and on disk, waiting for its parent. Asking a
+	// second peer for it would spend a multi-gigabyte transfer on a block this
+	// node is holding, and the frontier can sit on such a block: the drain claims
+	// a parked block and advances the header front at dispatch, but the frontier
+	// is published from the header list and a parked block whose own arrival never
+	// matched the front is still in that list. The inventory path already asks the
+	// park the same question before it requests a block, and Has takes only the
+	// park's own lock, so it is safe from this ticker.
+	if sm.blockPark.Has(hash) {
+		return none, 0, nil, false
+	}
+
 	sp, _ := sm.loadSyncPeerAndState()
 	if sp == nil {
 		return none, 0, nil, false
