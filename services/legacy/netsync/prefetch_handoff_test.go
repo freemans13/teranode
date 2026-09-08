@@ -241,3 +241,88 @@ func TestPrefetch_AParkedBlockGivesItsDownloadBytesBack(t *testing.T) {
 		"and the park is what accounts for it from then on")
 	require.Positive(t, h.sm.blockPark.Bytes(), "with its bytes charged there")
 }
+
+// TestFrontierRace_ParkedWorkMakesTheFrontierWorthRacing is the fix for the idle
+// an operator actually sees, and the reasoning is worth stating because the
+// predicate it changes looks obviously correct until you know what it measures.
+//
+// Measured on mainnet at height 752,965: 119 blocks downloaded, checked and on
+// disk, forming six chains each stacked above a different block that had never
+// arrived. Six holes, each a few minutes old, constantly reforming, because the
+// walk hands out up to sixteen blocks per peer across eight peers from a
+// thousand-block window and peers deliver at whatever speed they manage. Every
+// block that arrives before its parent parks. So the validator sits idle with a
+// quarter of a gigabyte of work on disk, waiting for whichever block is at the
+// front of the nearest hole.
+//
+// The frontier race exists for precisely that: a front block outstanding longer
+// than legacy_blockSlowFetchTimeout, with no owner visibly sending it, is asked
+// of a second peer. It fired once in an hour. localReadBackpressured is why: it
+// returns true whenever the block backlog is non-empty and the chain is still
+// advancing, and with eight peers delivering and drained blocks committing, both
+// hold permanently.
+//
+// That predicate means "zero throughput reflects our own validation speed, so do
+// not blame the peer". It is right when the pipeline is the bottleneck. It is
+// wrong when we are holding blocks we cannot commit: then the missing block is
+// the only thing between us and work already on disk, and how busy we look is
+// beside the point. A non-empty park is exactly that condition, stated in terms
+// of the thing itself rather than inferred from throughput.
+func TestFrontierRace_ParkedWorkMakesTheFrontierWorthRacing(t *testing.T) {
+	setUp := func(t *testing.T) (*parkWiringHarness, chainhash.Hash) {
+		t.Helper()
+
+		h := newParkWiringHarness(t, true)
+
+		// Backpressured by the old reading: a block in the backlog and the chain
+		// advancing, which is the steady state of a node syncing from eight peers.
+		h.sm.blockBacklog.Add(1)
+		h.sm.noteChainProgress()
+		require.True(t, h.sm.localReadBackpressured(),
+			"precondition: the node looks backpressured, which is what suppressed the race")
+
+		// A second peer to race to.
+		other, _, _ := connectRacePeer(t, 74, 1000)
+		registerRacePeer(h.sm, other)
+
+		// The frontier sits on a block nobody has delivered, outstanding far longer
+		// than the slow-fetch timeout.
+		stuck := chainhash.HashH([]byte("the block at the front of the hole"))
+
+		h.sm.frontierMu.Lock()
+		h.sm.frontierHash = stuck
+		h.sm.frontierHeight = 2
+		h.sm.frontierSince = time.Now().Add(-time.Hour)
+		h.sm.frontierRacers = nil
+		h.sm.frontierMu.Unlock()
+
+		return h, stuck
+	}
+
+	t.Run("with blocks parked, the frontier is raced despite the backpressure", func(t *testing.T) {
+		h, stuck := setUp(t)
+
+		// Work we cannot do: a block on disk whose parent has not arrived.
+		h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+		require.NoError(t, h.deliver(t, 1))
+		require.Equal(t, 1, h.sm.blockPark.Len(), "precondition: we are holding work we cannot commit")
+
+		hash, _, target, ok := h.sm.frontierRaceTarget(time.Now())
+
+		require.True(t, ok,
+			"a node holding downloaded blocks it cannot commit must race the block that is blocking them, however busy it looks")
+		require.Equal(t, stuck, hash)
+		require.NotNil(t, target)
+	})
+
+	t.Run("with nothing parked, the backpressure still declines the race", func(t *testing.T) {
+		h, _ := setUp(t)
+
+		require.Zero(t, h.sm.blockPark.Len(), "precondition: no work is being held")
+
+		_, _, _, ok := h.sm.frontierRaceTarget(time.Now())
+
+		require.False(t, ok,
+			"with nothing buffered, slow progress really is our own speed and the peer must not be raced")
+	})
+}
