@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -72,8 +73,16 @@ func TestSyncManager_ARedeliveredCopyThatWasTheFrontKeepsTheBlockReachable(t *te
 	require.False(t, indexed, "the second copy took the header out of the list and out of the index")
 	require.Equal(t, 1, listLen, "only the block after it is left, so nothing but the carried node can bring this one back")
 
-	// The parent never arrives and the block is given up on.
-	h.sm.sweepParkedBlocks(time.Now().Add(parkEntryTTL + time.Second))
+	// The block is given up on. The trigger used to be a thirty-minute timer,
+	// which no longer exists, and the rules that replaced it deliberately do not
+	// rewind: a block the chain has gone past should not be asked for again. So
+	// the give-up is driven here through a path that does rewind and that a node
+	// meets in earnest — the parent turns up, the sweep goes to commit the
+	// block, and its blob will not read back.
+	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
+	h.store.failReadsWith(errors.ErrBlobNotFound)
+
+	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 
 	require.Zero(t, h.sm.blockPark.Len())
 
@@ -132,8 +141,16 @@ func TestSyncManager_ALaterCopyOfAParkedFrontBlockDoesNotWipeItsHeaderNode(t *te
 	require.NoError(t, h.deliver(t, 0))
 	require.Equal(t, 1, h.sm.blockPark.Len(), "a re-delivered copy of a parked block is not a second block")
 
-	// The parent never arrives and the block is given up on.
-	h.sm.sweepParkedBlocks(time.Now().Add(parkEntryTTL + time.Second))
+	// The block is given up on. The trigger used to be a thirty-minute timer,
+	// which no longer exists, and the rules that replaced it deliberately do not
+	// rewind: a block the chain has gone past should not be asked for again. So
+	// the give-up is driven here through a path that does rewind and that a node
+	// meets in earnest — the parent turns up, the sweep goes to commit the
+	// block, and its blob will not read back.
+	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
+	h.store.failReadsWith(errors.ErrBlobNotFound)
+
+	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 
 	require.Zero(t, h.sm.blockPark.Len())
 

@@ -202,8 +202,16 @@ func TestSyncManager_AParkedFrontBlockIsAskedForAgainWhenItIsGivenUp(t *testing.
 
 	require.False(t, stillIndexed, "an arriving front block's header is removed before the park sees it")
 
-	// The parent never arrives and the block's time runs out.
-	h.sm.sweepParkedBlocks(time.Now().Add(parkEntryTTL + time.Second))
+	// The block is given up on. The trigger used to be a thirty-minute timer;
+	// there is no timer any more, and the rules that replaced it deliberately do
+	// not rewind, because a block the chain has gone past should not be asked
+	// for again. So this drives the give-up through a path that does rewind and
+	// that a node meets in earnest: the parent turns up, the sweep goes to
+	// commit the block, and its blob will not read back.
+	h.chainHolds(t, h.blocks[0].MsgBlock().Header.PrevBlock)
+	h.store.failReadsWith(errors.ErrBlobNotFound)
+
+	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 
 	require.Zero(t, h.sm.blockPark.Len())
 

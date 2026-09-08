@@ -42,11 +42,6 @@ const (
 	// 20 and falls towards 1 as blocks grow).
 	maxParkedEntries = 4096
 
-	// parkEntryTTL is how long a block may sit parked before it is given up on
-	// and re-requested. A parent that has not arrived in half an hour is not
-	// coming from the walk that queued it.
-	parkEntryTTL = 30 * time.Minute
-
 	// parkStuckThreshold is how old a parked block must be before the sweep
 	// spends an RPC asking whether its parent is in the chain after all. A
 	// missing parent is not the only thing that surfaces as ErrBlockNotFound,
@@ -56,20 +51,28 @@ const (
 	// parkSweepRPCBudget caps how many of those lookups one sweep tick may make,
 	// so the safety net can never turn into a scan of the whole park in one go.
 	//
-	// It has to be big enough that a full pass over a full park finishes inside
-	// parkEntryTTL, or the sweep is not a safety net: a restart with a full park
-	// would leave most of those blocks unexamined until they expired and were
-	// downloaded a second time. parkEntryTTL / parkSweepInterval is 60 ticks, and
-	// the park holds up to maxParkedEntries, so the floor is 4096/60 = 69. At 128
-	// a full pass takes 32 ticks, sixteen minutes, comfortably inside the half
-	// hour — and it is still only 128 sequential chain lookups per thirty
-	// seconds on the commit goroutine, which is well under a percent of it.
+	// It has to be big enough that a full pass over a full park finishes in
+	// minutes rather than hours, or the safety net is not one: a restart with a
+	// full park would leave most of those blocks unexamined, and a parent that
+	// arrived quietly would go unnoticed. The park holds up to maxParkedEntries,
+	// so at 128 a full pass takes 32 ticks, sixteen minutes — and it is still
+	// only 128 sequential chain lookups per thirty seconds on the commit
+	// goroutine, which is well under a percent of it.
 	// TestBlockPark_AFullParkIsAskedAboutBeforeAnyOfItExpires holds the
 	// arithmetic to this.
 	parkSweepRPCBudget = 128
 
-	// parkSweepExpiryBudget caps how many expired blocks one sweep tick gives up
-	// on, for the same reason parkSweepRPCBudget caps the lookups beside it, and
+	// parkFullPassBudget is how long the sweep may take to ask about every block
+	// in a full park, and it is what parkSweepRPCBudget is sized against.
+	//
+	// It used to be the thirty-minute expiry that bounded this: a full pass had
+	// to finish before blocks started being thrown away. Nothing is thrown away
+	// on a clock any more, so the bound is what an operator will tolerate for a
+	// parent that turned up quietly to be noticed.
+	parkFullPassBudget = 20 * time.Minute
+
+	// parkSweepExpiryBudget caps how many overtaken blocks one sweep tick gives
+	// up on, for the same reason parkSweepRPCBudget caps the lookups beside it, and
 	// against a bill that is larger per item.
 	//
 	// Each one costs a store Del carrying legacy_parkStoreTimeout — a write permit
@@ -83,11 +86,16 @@ const (
 	// dispatch stall for every peer.
 	//
 	// 128 matches its neighbour and drains a full park in 32 ticks, sixteen
-	// minutes — well inside parkEntryTTL, so nothing waits appreciably longer to
-	// be re-requested than it did when the loop was unbounded. Which 128 a tick
-	// takes is unspecified, because map order is, and it does not matter: every
-	// candidate is already past the TTL, so there is no fairness question, only a
-	// rate one.
+	// minutes. Which 128 a tick takes is unspecified, because map order is, and
+	// it does not matter: every candidate is one the chain has already gone
+	// past, so there is no fairness question, only a rate one.
+	//
+	// This cap is on the COUNT and does not on its own do what the paragraph
+	// above describes. Each of the 128 deletes carries legacy_parkStoreTimeout,
+	// so a contended write pool turns a capped tick into a twenty-minute one and
+	// backs the block queue up exactly as an uncapped pass would. What bounds the
+	// tick is parkSweepTimeBudget, applied over both halves of the sweep; this
+	// bounds the work it will start.
 	parkSweepExpiryBudget = 128
 
 	// parkRecoverBudgetOps is how many store operations' worth of waiting the
@@ -185,7 +193,34 @@ type parkedBlock struct {
 	// looked at first, which is what makes it a round robin over the whole park
 	// rather than a repeated random sample of it.
 	lastSweptAt time.Time
+	// writing is true between the entry being registered and its bytes reaching
+	// the disk. The entry is registered first so that a parent committing in
+	// that window finds the block in children rather than missing it, and the
+	// flag is what stops every reader acting on a blob that is not there yet.
+	// Restore, RestoreAll and Recover all insert entries whose write has already
+	// landed, so the zero value is correct for them.
+	writing bool
+	// parentDrained records that a drain for this block's parent ran while the
+	// block was still being written, and was refused. The drain cannot come
+	// back on its own — it is driven by a commit that has already happened — so
+	// whoever finishes the write has to ask for it again or the block sits in
+	// the park behind a parent that is already in the chain.
+	parentDrained bool
 }
+
+// admitResult says what Admit did with an offered block, and in particular
+// whether the caller now owes it a write.
+type admitResult int
+
+const (
+	// admitAlreadyHeld: this block is already parked. Nothing is owed.
+	admitAlreadyHeld admitResult = iota
+	// admitRegistered: the entry is in the index with its write still owed. The
+	// caller MUST follow with WriteAdmitted, which settles it either way.
+	admitRegistered
+	// admitNoRoom: the budget or the entry cap refused it. Nothing is owed.
+	admitNoRoom
+)
 
 // blockPark keeps blocks whose parent is not stored yet on disk, and commits
 // them when the parent lands.
@@ -205,8 +240,21 @@ type blockPark struct {
 	// commits blocks in order.
 	storeTimeout time.Duration
 
-	mu       sync.Mutex
-	entries  map[chainhash.Hash]*parkedBlock
+	mu      sync.Mutex
+	entries map[chainhash.Hash]*parkedBlock
+	// charged is what each block has been billed to the byte budget, by hash.
+	//
+	// bytes used to be moved by hand at four sites, two of which subtracted a
+	// size the CALLER supplied, so a block settled twice was subtracted twice
+	// and a block restored without being re-billed was never subtracted at all.
+	// Neither shows up as an error: the running total simply drifts, and the
+	// floor at zero swallows the evidence. Mainnet's counter read 14.7 GB
+	// against 9.2 GB actually on disk.
+	//
+	// Billing per hash makes both impossible rather than unlikely. A charge is
+	// recorded once, a release subtracts exactly what was recorded, and both are
+	// idempotent, so bytes is the sum of this map by construction.
+	charged  map[chainhash.Hash]int64
 	children map[chainhash.Hash][]chainhash.Hash
 	bytes    int64
 }
@@ -259,6 +307,7 @@ func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blo
 		storeTimeout: storeTimeout,
 		entries:      make(map[chainhash.Hash]*parkedBlock),
 		children:     make(map[chainhash.Hash][]chainhash.Hash),
+		charged:      make(map[chainhash.Hash]int64),
 	}
 }
 
@@ -349,11 +398,58 @@ func (p *blockPark) Park(ctx context.Context, entry parkedBlock, msgBlock *wire.
 		return parkDisabled
 	}
 
+	stored, admitted := p.Admit(entry, msgBlock)
+
+	switch admitted {
+	case admitAlreadyHeld:
+		return parkAccepted
+
+	case admitNoRoom:
+		return parkUnavailable
+
+	case admitRegistered:
+	}
+
+	if result := p.WriteAdmitted(ctx, stored, msgBlock); result != parkAccepted {
+		return result
+	}
+
+	p.FinishWrite(stored.hash)
+
+	return parkAccepted
+}
+
+// Admit takes the cheap half of parking: the duplicate check, the byte budget,
+// and registering the entry with its write still owed. It never touches the
+// disk, so it is safe on the goroutine that commits blocks in order.
+//
+// A caller that gets admitRegistered owes the block a WriteAdmitted, and until
+// that lands the entry carries the writing flag and every reader refuses it.
+//
+// The stateless check deliberately runs AFTER this rather than before, which is
+// the one thing that changed when the write moved off the commit goroutine. A
+// block that turns out to be rubbish therefore holds an entry and its bytes for
+// as long as its merkle rebuild takes. That is bounded by the number of parking
+// workers rather than by anything an attacker chooses, the entry is invisible to
+// every reader while it is held, and WriteAdmitted gives all of it back. The
+// order that matters for safety is unchanged: nothing reaches the disk until the
+// check has passed.
+func (p *blockPark) Admit(entry parkedBlock, msgBlock *wire.MsgBlock) (parkedBlock, admitResult) {
+	if p == nil {
+		return parkedBlock{}, admitNoRoom
+	}
+
+	// SerializeSize is arithmetic over the decoded block, not a serialization.
+	entry.size = int64(msgBlock.SerializeSize())
+	entry.parkedAt = time.Now()
+	entry.writing = true
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	// A re-delivered copy of something we already hold costs nothing. Refresh
 	// the recorded peer, because the newer one is more likely to still be
 	// connected when the block drains.
-	p.mu.Lock()
-
 	if existing, ok := p.entries[entry.hash]; ok {
 		if entry.peer != nil {
 			existing.peer = entry.peer
@@ -367,72 +463,123 @@ func (p *blockPark) Park(ctx context.Context, entry parkedBlock, msgBlock *wire.
 			existing.removedFront = entry.removedFront
 		}
 
-		p.mu.Unlock()
-
-		return parkAccepted
+		return *existing, admitAlreadyHeld
 	}
-
-	p.mu.Unlock()
-
-	// Timed, not deadlined, and the difference is the point. The stateless check
-	// rebuilds the merkle tree over every transaction in the block, which is CPU
-	// work on this same in-order commit goroutine that no context can interrupt
-	// part way through. legacy_parkStoreTimeout cannot bound it. What it can do
-	// is make it visible, so an operator who sees the commit goroutine stalling
-	// can tell validation from store contention.
-	validationStart := time.Now()
-
-	err := validateParkCandidate(msgBlock, entry.hash)
-
-	if elapsed := time.Since(validationStart); elapsed > p.storeTimeout {
-		p.logger.Warnf("[blockPark][%s] the stateless check on a %d transaction block took %s, longer than the %s store deadline; this is CPU on the block commit goroutine and no deadline bounds it", entry.hash, len(msgBlock.Transactions), elapsed, p.storeTimeout)
-	}
-
-	if err != nil {
-		p.logger.Warnf("[blockPark][%s] refusing to park an invalid block: %v", entry.hash, err)
-
-		return parkRejected
-	}
-
-	// SerializeSize is arithmetic over the decoded block, not a serialization.
-	entry.size = int64(msgBlock.SerializeSize())
-	entry.parkedAt = time.Now()
-
-	// Reserve the space before the write so two writers can never both pass the
-	// check. Rolled back below on any failure.
-	p.mu.Lock()
 
 	if len(p.entries) >= maxParkedEntries || p.bytes+entry.size > p.maxBytes {
-		held, count := p.bytes, len(p.entries)
-		p.mu.Unlock()
+		p.logger.Warnf("[blockPark][%s] no room for a %d byte block: %d blocks holding %d of %d bytes", entry.hash, entry.size, len(p.entries), p.bytes, p.maxBytes)
 
-		p.logger.Warnf("[blockPark][%s] no room for a %d byte block: %d blocks holding %d of %d bytes", entry.hash, entry.size, count, held, p.maxBytes)
-
-		return parkUnavailable
+		return parkedBlock{}, admitNoRoom
 	}
 
-	p.bytes += entry.size
-	p.mu.Unlock()
-
-	if err := p.write(ctx, entry.hash, msgBlock); err != nil {
-		p.mu.Lock()
-		p.bytes -= entry.size
-		p.mu.Unlock()
-
-		p.logger.Warnf("[blockPark][%s] failed to park block, it will have to be downloaded again: %v", entry.hash, err)
-
-		return parkUnavailable
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// Registered BEFORE the write, not after it. A parent that commits while
+	// this block is still being written has to find the block in children, or
+	// the drain looks at a park that does not yet mention it and only a later
+	// sweep recovers it. What keeps that safe is the flag rather than the
+	// entry's absence: every reader refuses an entry whose bytes are not on
+	// disk yet.
+	p.chargeLocked(entry.hash, entry.size)
 
 	stored := entry
 	p.entries[entry.hash] = &stored
 	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
 	p.setGauges()
 
+	return stored, admitRegistered
+}
+
+// WriteAdmitted runs the stateless check and then the blob write for a block
+// Admit has registered, and rolls the admission back on any failure. It is the
+// half that costs a merkle rebuild over every transaction and a streamed write
+// of the whole block, so it is what runs on a parking worker rather than on the
+// goroutine that commits blocks in order.
+//
+// On parkAccepted the entry is still registered and still flagged; the caller
+// clears the flag with FinishWrite once it has done whatever else it owes.
+func (p *blockPark) WriteAdmitted(ctx context.Context, entry parkedBlock, msgBlock *wire.MsgBlock) parkResult {
+	if p == nil {
+		return parkDisabled
+	}
+
+	// Timed, not deadlined, and the difference is the point. The stateless check
+	// rebuilds the merkle tree over every transaction in the block, which is CPU
+	// work no context can interrupt part way through. legacy_parkStoreTimeout
+	// cannot bound it. What it can do is make it visible, so an operator who
+	// sees a parking worker stalling can tell validation from store contention.
+	validationStart := time.Now()
+
+	err := validateParkCandidate(msgBlock, entry.hash)
+
+	if elapsed := time.Since(validationStart); elapsed > p.storeTimeout {
+		p.logger.Warnf("[blockPark][%s] the stateless check on a %d transaction block took %s, longer than the %s store deadline; this is CPU that no deadline bounds", entry.hash, len(msgBlock.Transactions), elapsed, p.storeTimeout)
+	}
+
+	if err != nil {
+		p.Abandon(entry)
+
+		p.logger.Warnf("[blockPark][%s] refusing to park an invalid block: %v", entry.hash, err)
+
+		return parkRejected
+	}
+
+	if err := p.write(ctx, entry.hash, msgBlock); err != nil {
+		p.Abandon(entry)
+
+		p.logger.Warnf("[blockPark][%s] failed to park block, it will have to be downloaded again: %v", entry.hash, err)
+
+		return parkUnavailable
+	}
+
 	return parkAccepted
+}
+
+// Abandon gives back everything Admit reserved: the entry, its parent edge and
+// its byte charge. Anything left behind here is an entry with no blob under it,
+// refused by every reader because the flag never clears, holding its bytes
+// against the budget for the life of the process.
+func (p *blockPark) Abandon(entry parkedBlock) {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	current, ok := p.entries[entry.hash]
+	if !ok || !current.writing {
+		return
+	}
+
+	delete(p.entries, entry.hash)
+	p.removeChildLocked(entry.prevBlock, entry.hash)
+	p.releaseLocked(entry.hash)
+	p.setGauges()
+}
+
+// FinishWrite clears the flag on a block whose bytes are now on disk, and
+// reports whether a drain for its parent was refused while it was being
+// written. A true return means the caller must ask for that drain again: the
+// drain is driven by a commit that has already happened and will not come back
+// on its own.
+//
+// The gauges do not move. Both the count and the bytes were published when the
+// entry went in.
+func (p *blockPark) FinishWrite(hash chainhash.Hash) bool {
+	if p == nil {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	entry, ok := p.entries[hash]
+	if !ok || !entry.writing {
+		return false
+	}
+
+	entry.writing = false
+
+	return entry.parentDrained
 }
 
 // storeCtx puts the configured deadline on one blob store operation.
@@ -538,15 +685,38 @@ func (p *blockPark) TakeChildren(parent chainhash.Hash) []parkedBlock {
 		return nil
 	}
 
-	delete(p.children, parent)
-
 	taken := make([]parkedBlock, 0, len(hashes))
 
+	// Kept, not dropped. A block still being written stays in the index AND
+	// keeps this edge, because losing the edge is the hole the early
+	// registration exists to close.
+	var kept []chainhash.Hash
+
 	for _, h := range hashes {
-		if entry, ok := p.entries[h]; ok {
-			taken = append(taken, *entry)
-			delete(p.entries, h)
+		entry, ok := p.entries[h]
+		if !ok {
+			continue
 		}
+
+		if entry.writing {
+			// Remember that this drain happened and was refused. It is driven by
+			// a commit that has already been made, so it will not come round
+			// again on its own, and whoever finishes the write has to ask for it.
+			entry.parentDrained = true
+
+			kept = append(kept, h)
+
+			continue
+		}
+
+		taken = append(taken, *entry)
+		delete(p.entries, h)
+	}
+
+	if len(kept) == 0 {
+		delete(p.children, parent)
+	} else {
+		p.children[parent] = kept
 	}
 
 	p.setGauges()
@@ -572,6 +742,41 @@ func (p *blockPark) Restore(entry parkedBlock) {
 	stored := entry
 	p.entries[entry.hash] = &stored
 	p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+
+	// Re-bill if the path that took this block gave its charge back. Whether it
+	// did depends on which path that was, and asking here rather than at each
+	// call site is the point: the charge is a property of the block, not of the
+	// route it travelled.
+	p.chargeLocked(entry.hash, entry.size)
+	p.setGauges()
+}
+
+// RestoreAll puts a batch of taken entries back, for the sweep that runs out of
+// time part-way through a burst of expiries. Expire has already removed them
+// from the index, so an entry nothing puts back is a blob left on disk still
+// charged against the park's byte budget with nothing tracking it, and a block
+// whose cursor is never rewound and which is therefore never asked for again.
+//
+// One lock acquisition rather than one per entry, because the caller is the
+// block-commit goroutine and it is already over its time budget.
+func (p *blockPark) RestoreAll(entries []parkedBlock) {
+	if p == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, entry := range entries {
+		if _, ok := p.entries[entry.hash]; ok {
+			continue
+		}
+
+		stored := entry
+		p.entries[entry.hash] = &stored
+		p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
+	}
+
 	p.setGauges()
 }
 
@@ -589,10 +794,7 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	}
 
 	p.mu.Lock()
-	p.bytes -= entry.size
-	if p.bytes < 0 {
-		p.bytes = 0
-	}
+	p.releaseLocked(entry.hash)
 	p.setGauges()
 	p.mu.Unlock()
 
@@ -604,42 +806,51 @@ func (p *blockPark) Delete(ctx context.Context, entry parkedBlock) {
 	}
 }
 
-// Expire removes and returns up to limit blocks that have been parked longer
-// than parkEntryTTL. Their parents are not coming; the caller re-requests them.
+// EvictBelow removes and returns up to limit blocks the chain has already gone
+// past. Their blobs stay on disk and stay charged until the caller settles them,
+// exactly as TakeChildren leaves things.
 //
-// The limit is what stops a burst of expiry becoming one long turn on the
-// block-queue consumer — see parkSweepExpiryBudget. Anything over it waits for
-// the next tick, which costs it nothing it was not already waiting for.
-func (p *blockPark) Expire(now time.Time, limit int) []parkedBlock {
-	if p == nil || limit <= 0 {
+// This replaces an expiry on a thirty-minute timer. A timer answered the wrong
+// question: it asked how long a block had been waiting, when what matters is
+// whether it can still be used. A block below the chain's frontier cannot, and
+// one still waiting on a late parent can, however long it has waited. The timer
+// threw away perfectly good blocks — 39 of them in one measured 19-minute window
+// on mainnet — and each one had to be downloaded again.
+//
+// An entry with no usable height is skipped rather than guessed at. Restart
+// recovery rebuilds entries from disk with no header list behind them, so they
+// have no height, and evicting one because its height reads as zero would throw
+// away exactly the blocks recovery exists to keep.
+func (p *blockPark) EvictBelow(floor int32, limit int) []parkedBlock {
+	if p == nil || limit <= 0 || floor <= 0 {
 		return nil
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	var expired []parkedBlock
+	var evicted []parkedBlock
 
 	for h, entry := range p.entries {
-		if len(expired) == limit {
+		if len(evicted) == limit {
 			break
 		}
 
-		if now.Sub(entry.parkedAt) < parkEntryTTL {
+		if entry.writing || entry.height <= 0 || entry.height >= floor {
 			continue
 		}
 
-		expired = append(expired, *entry)
+		evicted = append(evicted, *entry)
 
 		delete(p.entries, h)
 		p.removeChildLocked(entry.prevBlock, h)
 	}
 
-	if len(expired) > 0 {
+	if len(evicted) > 0 {
 		p.setGauges()
 	}
 
-	return expired
+	return evicted
 }
 
 // StuckCandidates returns up to limit blocks that have been parked longer than
@@ -658,6 +869,11 @@ func (p *blockPark) StuckCandidates(now time.Time, limit int) []parkedBlock {
 	eligible := make([]*parkedBlock, 0, len(p.entries))
 
 	for _, entry := range p.entries {
+		// No point spending a parent lookup on a block Take would then refuse.
+		if entry.writing {
+			continue
+		}
+
 		if now.Sub(entry.parkedAt) < parkStuckThreshold {
 			continue
 		}
@@ -715,6 +931,17 @@ func (p *blockPark) Take(hash chainhash.Hash) (parkedBlock, bool) {
 		return parkedBlock{}, false
 	}
 
+	// Refused while the write is in flight, and the reason is that Take removes
+	// the entry. Park would then find nothing under this hash, never clear the
+	// flag, and the copy handed back here would carry writing true for good:
+	// restored, it would be invisible to every reader while still holding its
+	// bytes. StuckCandidates already skips these, so this guard refuses
+	// something that cannot reach it today. It is here because the failure it
+	// prevents is unrecoverable rather than merely wrong.
+	if entry.writing {
+		return parkedBlock{}, false
+	}
+
 	delete(p.entries, hash)
 	p.removeChildLocked(entry.prevBlock, hash)
 	p.setGauges()
@@ -735,6 +962,49 @@ func (p *blockPark) removeChildLocked(parent, child chainhash.Hash) {
 
 	if len(p.children[parent]) == 0 {
 		delete(p.children, parent)
+	}
+}
+
+// chargeLocked bills a block to the byte budget once. The caller holds mu.
+//
+// Idempotent on purpose: Restore puts back a block that may or may not still be
+// billed, depending on which path took it, and asking that question at every
+// call site is how the old accounting drifted.
+func (p *blockPark) chargeLocked(hash chainhash.Hash, size int64) {
+	if _, ok := p.charged[hash]; ok {
+		return
+	}
+
+	// Lazily, because a blockPark built as a struct literal — which several
+	// tests do — has no map, and a park that cannot bill is worse than one that
+	// allocates late.
+	if p.charged == nil {
+		p.charged = make(map[chainhash.Hash]int64)
+	}
+
+	p.charged[hash] = size
+	p.bytes += size
+}
+
+// releaseLocked gives back exactly what a block was billed, and nothing if it
+// was not billed at all. The caller holds mu.
+func (p *blockPark) releaseLocked(hash chainhash.Hash) {
+	size, ok := p.charged[hash]
+	if !ok {
+		return
+	}
+
+	delete(p.charged, hash)
+
+	p.bytes -= size
+
+	// Unreachable now that every charge and release goes through this pair, and
+	// kept as an alarm rather than a cushion: a floor that silently absorbs a
+	// negative total is what let the old drift run unnoticed.
+	if p.bytes < 0 {
+		p.logger.Warnf("[blockPark] byte accounting went negative after releasing %s; this is a bug", hash)
+
+		p.bytes = 0
 	}
 }
 
@@ -897,8 +1167,8 @@ func (p *blockPark) Recover(ctx context.Context) {
 		// The blob's modification time is when the block was parked, and it is on
 		// disk, so it is the one thing about a recovered block that survives the
 		// restart. Stamping time.Now() here instead would restart every block's
-		// half hour on every boot: a node restarting more often than parkEntryTTL
-		// would never expire anything, and a block whose parent is genuinely
+		// window on every boot: a node restarting often would never notice
+		// anything had gone stale, and a block whose parent is genuinely
 		// never coming would hold its budget for as long as that went on. Anything
 		// unusable — a zero time, or a clock that has gone backwards since the
 		// write — falls back to now, which is only ever the old behaviour.
@@ -916,7 +1186,7 @@ func (p *blockPark) Recover(ctx context.Context) {
 		stored := entry
 		p.entries[entry.hash] = &stored
 		p.children[entry.prevBlock] = append(p.children[entry.prevBlock], entry.hash)
-		p.bytes += size
+		p.chargeLocked(entry.hash, size)
 		p.setGauges()
 		p.mu.Unlock()
 

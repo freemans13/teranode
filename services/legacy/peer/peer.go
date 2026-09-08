@@ -1592,6 +1592,16 @@ func blockResponsePending(pending map[string]time.Time) bool {
 //
 // The result is floored at MaxBlockDownloadTime, so this calculation can only
 // widen the deadline, never narrow it. See that constant for why.
+//
+// It is also capped at MaxBlockDownloadBudget, the largest value these same
+// settings can produce. svnode keeps one clock: the figure that bounds a
+// download is the figure the timeout fires on, because its BlockDownloadTracker
+// has no expiry of its own at all. This node holds a second record of who owes
+// what, and that record's ceiling is derived from MaxBlockDownloadBudget too, so
+// capping here is what stops the two clocks disagreeing when the number of peers
+// downloading exceeds what the node's own download window and per-peer depth
+// imply. At shipped settings the cap never binds: it is 375 minutes against a
+// realistic catch-up budget of 95.
 func (p *Peer) blockDownloadBudget() time.Duration {
 	interval := p.cfg.ChainParams.TargetTimePerBlock
 	if interval <= 0 {
@@ -1612,7 +1622,112 @@ func (p *Peer) blockDownloadBudget() time.Duration {
 		}
 	}
 
-	total := base + p.settings.Legacy.BlockDownloadTimeoutPerPeerPercent*int64(others)
+	budget := scaledBlockDownloadBudget(interval, base, p.settings.Legacy.BlockDownloadTimeoutPerPeerPercent, int64(others))
+
+	return min(budget, MaxBlockDownloadBudget(p.settings, interval))
+}
+
+// maxPeersWithBlockDownloads is the number of peers the node's own configuration
+// lets hold a block download at once, and so the bound on the "other peers
+// downloading" term of the budget.
+//
+// The scheduler will not place a block once the ledger holds
+// legacy_blockDownloadWindow of them, and it fills one peer to
+// legacy_maxBlocksInTransitPerPeer before moving to the next (block_scheduler.go
+// hands out contiguous runs), so the window divided by that depth is how many
+// peers the configuration spreads the work over. At shipped settings that is
+// 1024/16 = 64.
+//
+// It is a configuration figure, not a runtime measurement, which is the point:
+// the download ledger's ownership ceiling and the peer layer's budget both
+// derive from it, so neither can drift away from the other. blockDownloadBudget
+// caps itself at the result, so a runtime peer count above this bound narrows
+// the budget rather than escaping the ceiling.
+func maxPeersWithBlockDownloads(s *settings.Settings) int {
+	if s == nil {
+		return 1
+	}
+
+	window := max(1, s.Legacy.BlockDownloadWindow)
+
+	perPeer := max(1, s.Legacy.MaxBlocksInTransitPerPeer)
+
+	// Written as a division and a remainder rather than (window+perPeer-1)/perPeer,
+	// which overflows on a window set near MaxInt.
+	peers := window / perPeer
+	if window%perPeer != 0 {
+		peers++
+	}
+
+	return max(1, peers)
+}
+
+// MaxBlockDownloadBudget is the largest wall-clock ceiling blockDownloadBudget
+// can return for these settings on a chain with this target block interval.
+//
+// The download ledger in netsync uses it to size how long a peer stays on the
+// hook for a block it was asked for. That has to be at least this, or a transfer
+// the peer layer legitimately keeps alive outlives the record saying we asked
+// for it, and the finished block arrives looking unrequested: the peer loses its
+// whole association and the completed download is thrown away.
+//
+// Maximising over both bases and over the peer bound rather than reading the
+// live state keeps it a pure function of settings, so both callers get the same
+// answer at any moment. A negative per-peer percentage is read as zero here,
+// because with one the budget shrinks as peers are added and the maximum is the
+// no-other-peers case.
+//
+// Both terms are held to what the arithmetic can carry. The formula falls back
+// to MaxBlockDownloadTime when a percentage would overflow the interval
+// multiply, and a maximum that took that fallback would be SHORTER than the live
+// budget of a configuration that does not overflow, which would turn the cap in
+// blockDownloadBudget into a narrowing. Clamping instead returns the largest
+// ceiling the arithmetic can express, which no live budget can exceed.
+func MaxBlockDownloadBudget(s *settings.Settings, interval time.Duration) time.Duration {
+	if s == nil || interval <= 0 {
+		return MaxBlockDownloadTime
+	}
+
+	// The largest percentage total this interval can carry, from the same bound
+	// scaledBlockDownloadBudget applies to the product.
+	maxTotal := int64(math.MaxInt64) / int64(interval)
+
+	base := min(maxTotal, max(s.Legacy.BlockDownloadTimeoutBasePercent, s.Legacy.BlockDownloadTimeoutBaseIBDPercent))
+	perPeer := max(int64(0), s.Legacy.BlockDownloadTimeoutPerPeerPercent)
+	others := int64(maxPeersWithBlockDownloads(s) - 1)
+
+	if perPeer > 0 {
+		if room := (maxTotal - base) / perPeer; others > room {
+			others = room
+		}
+	}
+
+	return scaledBlockDownloadBudget(interval, base, perPeer, others)
+}
+
+// scaledBlockDownloadBudget is svnode's
+//
+//	nPowTargetSpacing * (timeoutBase + timeoutPerPeer * nOtherPeers) / 100
+//
+// with this node's floor and misconfiguration fallbacks applied. It is shared by
+// the live budget and by the maximum the ledger derives its ceiling from, so
+// there is one formula rather than two that can be edited apart.
+func scaledBlockDownloadBudget(interval time.Duration, base, perPeer, others int64) time.Duration {
+	if interval <= 0 {
+		return MaxBlockDownloadTime
+	}
+
+	// Bound this multiply rather than inspecting its result, for the reason the
+	// interval multiply below is bounded: an overflowed product is as likely to
+	// look small and plausible as to look wrong. The headroom is measured against
+	// a base of zero when the base is negative, so the guard itself cannot
+	// overflow on a misconfigured base; a negative base only makes the sum
+	// smaller, which the total check below already handles.
+	if perPeer > 0 && others > (math.MaxInt64-max(int64(0), base))/perPeer {
+		return MaxBlockDownloadTime
+	}
+
+	total := base + perPeer*others
 	if total <= 0 {
 		// A misconfiguration must never produce a zero ceiling, which would
 		// disconnect every peer immediately. Fall back to the old constant.

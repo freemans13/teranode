@@ -55,7 +55,10 @@ const (
 	// it is dropped quietly rather than treated as an unrequested block.
 	//
 	// It is the ledger's own ownership ceiling, not the peer package's 30-minute
-	// constant it used to be. That constant stopped being the ceiling on a block
+	// constant it used to be. The running node takes that ceiling from
+	// blockRequestAssignmentCeiling, which derives it from settings and is never
+	// shorter than this; this constant is the floor, and what the tests build
+	// against. That 30-minute constant stopped being the ceiling on a block
 	// download when blockDownloadBudget started scaling one: at the IBD defaults
 	// a peer sharing our downlink with seven others is given 95 minutes, so a
 	// grace of 30 left an hour in which a peer still legitimately sending was

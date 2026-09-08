@@ -39,7 +39,11 @@ func TestBlockPark_ASlowChainLookupCannotHoldTheSweep(t *testing.T) {
 	)
 
 	client := &blockchain2.Mock{}
-	client.On("GetBlockExists", mock.Anything, mock.Anything).
+
+	// The sweep asks GetBlockHeader, not GetBlockExists: existence alone cannot
+	// say whether a parent has been invalidated, and invalidation is a flag
+	// rather than a delete.
+	client.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			ctx, ok := args.Get(0).(context.Context)
 			require.True(t, ok)
@@ -51,7 +55,7 @@ func TestBlockPark_ASlowChainLookupCannotHoldTheSweep(t *testing.T) {
 			case <-time.After(unanswered):
 			}
 		}).
-		Return(false, errors.NewContextCanceledError("the lookup ran out of time"))
+		Return(nil, nil, errors.NewContextCanceledError("the lookup ran out of time"))
 
 	park := newIndexOnlyPark()
 	park.storeTimeout = lookupBudget

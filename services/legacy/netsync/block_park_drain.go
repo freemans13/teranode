@@ -6,21 +6,52 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	"github.com/bsv-blockchain/teranode/errors"
 	teranodeblockchain "github.com/bsv-blockchain/teranode/services/blockchain"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 )
 
-// parkSweepInterval is how often the block-queue consumer looks over the park
-// for blocks that have been waiting too long, or whose parent turned up without
-// a commit event this node saw. It runs on that goroutine and not on the outer
-// message handler because a commit is minutes of work, and the outer handler
-// dispatches disconnects, invs and headers for every peer.
+// parkSweepInterval is how often the sweep looks over the park for blocks that
+// have been waiting too long, or whose parent turned up without a commit event
+// this node saw. The sweep has a goroutine of its own (runParkSweep); what it
+// finds worth committing it posts to the block-queue consumer, which is the one
+// goroutine that commits blocks in order.
 //
 // A var rather than a const so the two tests that prove this ticker is really
 // wired up can run in milliseconds instead of half a minute. Nothing in
 // production writes it, and the only reader takes its value once, when the block
 // handler starts.
 var parkSweepInterval = 30 * time.Second
+
+// parkSweepTimeBudget is how long one sweep tick may spend before it stops and
+// leaves the rest for the next one.
+//
+// It is the bound the two count caps cannot give. Every item the sweep handles
+// waits on something outside this process, a blob-store write permit for a
+// delete and the blockchain service for a lookup, each with a deadline of its
+// own around ten seconds, and they are handled one after another. Bounded in
+// count is a twenty-minute tick in the worst case; bounded in time is a tick
+// that finishes inside its interval, so a block that becomes stuck is looked at
+// on the next tick rather than after a backlog of somebody else's deletes.
+//
+// A sixth of parkSweepInterval, and normal ticks are far under it: a full
+// 128-entry expiry burst against a store with permits free is milliseconds.
+// Nothing is lost by stopping, only deferred by parkSweepInterval, and every item
+// the sweep defers is one already past its own deadline, so the only question is
+// rate.
+var parkSweepTimeBudget = 5 * time.Second
+
+// parkSweepClock reads the clock the sweep measures its own tick against. The
+// tick's `now` argument is the time the sweep is judging the park AT, which
+// tests move by hours; this is how long the tick itself has been running, which
+// is a different question and needs a real clock.
+func (sm *SyncManager) parkSweepClock() time.Time {
+	if sm.parkSweepNow != nil {
+		return sm.parkSweepNow()
+	}
+
+	return time.Now()
+}
 
 // chainCtx puts a deadline on one blockchain lookup made from the block-commit
 // goroutine.
@@ -54,6 +85,53 @@ func (sm *SyncManager) blockExistsWithDeadline(hash chainhash.Hash) (bool, error
 	defer cancel()
 
 	return sm.blockchainClient.GetBlockExists(ctx, &hash)
+}
+
+// parentChainState answers both questions the sweep has about a parent in one
+// round trip: is it stored, and is it usable.
+//
+// Asking only whether it exists was a real hole. Invalidation is a flag on the
+// row, not a delete, so a parent this node has REJECTED still exists, and the
+// sweep would commit its descendant on the strength of that. The pair is the
+// same one haveInventory already uses for the same reason.
+func (sm *SyncManager) parentChainState(hash chainhash.Hash) (exists bool, invalid bool, err error) {
+	ctx, cancel := sm.chainCtx()
+	defer cancel()
+
+	_, meta, err := sm.blockchainClient.GetBlockHeader(ctx, &hash)
+	if err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound) {
+			return false, false, nil
+		}
+
+		return false, false, err
+	}
+
+	if meta == nil {
+		return false, false, nil
+	}
+
+	return true, meta.Invalid, nil
+}
+
+// parkEvictionFloor is the height below which a parked block can never be
+// needed, or 0 when the node cannot say.
+//
+// It is the highest block this node has actually committed, and eviction is
+// strictly below it. Nothing approximate: a block parked below a block we have
+// already put in the chain cannot be a link in any chain we are building, and
+// its parent is missing so it cannot be a sibling either.
+//
+// It is NOT the front of the header list, which was the obvious reading and is
+// wrong. An arriving front block has its header removed from the list before the
+// park sees it, so the front sits one height above the block being waited on, and
+// a sweep judging by the front evicts exactly the block it needs.
+//
+// Zero until the first commit, which switches eviction off on a node that has
+// not committed anything yet. That is the right way round: a node still finding
+// its feet should keep what it has downloaded.
+func (sm *SyncManager) parkEvictionFloor() int32 {
+	return sm.lastCommittedHeight.Load()
 }
 
 // drainParkedDescendants commits everything parked behind a block that has just
@@ -112,7 +190,9 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 		return false
 	}
 
-	if err = sm.HandleBlockDirect(sm.ctx, entry.peer, entry.hash, msgBlock); err != nil {
+	// A nil in-flight parent: the parent of a parked block is in the chain by the
+	// time anything commits it, so HandleBlockDirect looks it up there.
+	if err = sm.HandleBlockDirect(sm.ctx, entry.peer, entry.hash, msgBlock, nil); err != nil {
 		return sm.parkedBlockFailed(entry, err)
 	}
 
@@ -123,6 +203,12 @@ func (sm *SyncManager) commitParkedBlock(entry parkedBlock) bool {
 	// checkpoint transition never fires — headers-first sync would wedge one
 	// block after the first successful drain.
 	isCheckpointBlock, _ := sm.advanceHeaderListFor(entry.hash)
+
+	// A parked block committing is a block joining the chain, and it is the one
+	// commit that never passes through the block queue. Without this a node
+	// working purely off its park looks, to the stall check, like a node that
+	// has stopped.
+	sm.noteChainProgress()
 
 	sm.applyParkDisposition(entry, parkDispositionCommitted)
 
@@ -273,8 +359,8 @@ func (sm *SyncManager) livePeer(recorded *peerpkg.Peer) *peerpkg.Peer {
 // It used to check that the cursor was sitting on the front of the list before
 // sending anything, and to call that check the whole of its safety. The rule it
 // was reaching for — nothing may fetch while the round's anchor is still the
-// front — now lives in fetchMoreHeaderBlocks, which is the one place all three
-// of the top-up callers pass through, and it is stated there as a fact about the
+// front — now lives in topUpHeaderBlocks, which is the one place every one of
+// the top-up callers passes through, and it is stated there as a fact about the
 // list rather than about the cursor. What is left of the old check is an
 // accident: "the cursor is on the front" is also false during an ordinary
 // forward walk, where the cursor is deliberately ahead of the front, so the
@@ -282,9 +368,102 @@ func (sm *SyncManager) livePeer(recorded *peerpkg.Peer) *peerpkg.Peer {
 // for. Keeping it would have meant keeping a condition no test could hold to
 // account, next to a comment claiming it was load-bearing.
 //
-// Called from the park sweep's ticker, on the block-queue consumer.
+// It is gated on the node having somewhere to put a block, not on the sync peer
+// having room. The gate it used to take, the sync peer's own count against the
+// block-size ladder, is right for topping a peer's queue back up after that
+// peer's block stopped being outstanding, and wrong here: at the ladder's lowest
+// rung the cap is one block, so a sync peer mid-transfer on a multi-gigabyte
+// block holds the resume shut for hours while the assigner would have handed the
+// rewound front block to an idle peer. The frontier race cannot cover it either,
+// because publishFrontierLocked clears the frontier for a front block nobody has
+// asked for, which is exactly what a rewound front is.
+//
+// svnode schedules per peer, in each peer's own send pass, with each peer
+// checking only its own in-flight count and no sync peer involved in block
+// bodies at all (FindNextBlocksToDownload, src/net/net_processing.cpp:5522).
+// Letting the assigner decide is that shape: it spreads over every eligible peer
+// with budget and refuses the pass when the node-wide download window is spent
+// or every peer is at its per-peer cap. With legacy_multiPeerBlockDownload off
+// it collapses to the sync peer at the ladder's budget, which is the behaviour
+// this had before.
+//
+// Called from the park sweep's ticker, on the sweep's own goroutine. Everything
+// it touches is under headerMu or is a peer send, which handleHeadersMsg already
+// does from a goroutine of its own.
 func (sm *SyncManager) resumeHeaderWalk() {
-	sm.fetchMoreHeaderBlocks(sm.loadSyncPeer())
+	sm.topUpHeaderBlocks(nil)
+}
+
+// runParkSweep drives the park sweep and the rewound-cursor resume from a
+// goroutine of their own until the manager stops.
+//
+// The sweep used to be a ticker arm on the goroutine that committed blocks in
+// order, and that was the whole justification for its per-tick time budget: a
+// slow tick there held up commits. Under the dispatcher that goroutine admits
+// blocks, and the ordering guarantee comes from block validation's own single
+// committer and its admission rule, so a slow tick there would only delay the
+// admission of blocks that have nothing to do with the park. Everything that
+// needs no ordering therefore runs here: deciding, the parent lookups, the
+// evictions and the store deletes. The one thing that may not is committing,
+// and sweepParkedBlocks posts those back to the consumer through parkCommits.
+func (sm *SyncManager) runParkSweep() {
+	ticker := time.NewTicker(parkSweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.quit:
+			return
+
+		case <-ticker.C:
+			sm.sweepParkedBlocks(time.Now())
+			// A rewind — from the sweep just above, or from a block given up
+			// on since the last tick — moves the download cursor back and
+			// sends nothing. This is what carries it out. See
+			// resumeHeaderWalk.
+			sm.resumeHeaderWalk()
+		}
+	}
+}
+
+// submitParkCommit hands a parked block whose parent is in the chain to the
+// block-queue consumer to commit, or commits it here when there is no consumer
+// to hand it to.
+//
+// The sweep must not commit from its own goroutine. A commit admits the block
+// into block validation's quick window, and the dispatcher is admitting blocks
+// there at the same time from the consumer goroutine: two admitters race for the
+// window's tail, and the loser is refused for a parent that is in fact stored
+// and judged a local fault. Posting the commit to the consumer puts it behind
+// the dispatcher's own admissions, which is the same route the parking workers
+// use for their outcomes.
+//
+// The inline path is for a manager that has no channel, which is how most of
+// this package's tests build one, and it is what the sweep did before it had a
+// goroutine of its own. A send on a nil channel would block forever.
+func (sm *SyncManager) submitParkCommit(entry parkedBlock) {
+	if sm.parkCommits == nil {
+		sm.commitParkedBlockAndDrain(entry)
+
+		return
+	}
+
+	select {
+	case sm.parkCommits <- entry:
+
+	case <-sm.quit:
+		// Nobody will commit it now. The caller took it out of the index, so put
+		// it back: its blob stays charged and Recover finds it on the next start.
+		sm.blockPark.Restore(entry)
+	}
+}
+
+// commitParkedBlockAndDrain commits one parked block and then everything parked
+// behind it. It is the consumer's side of submitParkCommit.
+func (sm *SyncManager) commitParkedBlockAndDrain(entry parkedBlock) {
+	if sm.commitParkedBlock(entry) {
+		sm.drainParkedDescendants(entry.hash)
+	}
 }
 
 // sweepParkedBlocks is the safety net for blocks whose parent never arrives
@@ -296,34 +475,63 @@ func (sm *SyncManager) resumeHeaderWalk() {
 // commit event for a parent that was already in the chain when the node started,
 // so nothing would ever drain it.
 //
-// It runs on the block-queue consumer, the same goroutine that commits blocks in
-// order, so BOTH halves are capped per tick and neither can turn into a pass over
-// the whole park in one go: the chain lookups by parkSweepRPCBudget, and the
-// blocks it gives up on by parkSweepExpiryBudget. The second cap is the one that
-// is easy to miss, and it is the more expensive item — a store delete and a
-// cursor rewind rather than a lookup — and the one that arrives in bursts,
-// because blocks parked together age out together.
+// It runs on the sweep's own goroutine (runParkSweep) and commits nothing
+// itself: a parked block whose parent turns out to be stored is posted to the
+// block-queue consumer through submitParkCommit. BOTH halves are still capped
+// per tick and neither can turn into a pass over the whole park in one go: the
+// chain lookups by parkSweepRPCBudget, and the blocks it gives up on by
+// parkSweepExpiryBudget. The second cap is the one that is easy to miss, and it
+// is the more expensive item — a store delete and a cursor rewind rather than a
+// lookup — and the one that arrives in bursts, because blocks parked together
+// age out together.
 //
-// Both of those cap a COUNT. Time is capped separately and has to be: the
-// lookups are sequential, so a slow blockchain service turns a bounded number of
-// calls into an unbounded tick, on the goroutine every queued block is waiting
-// behind. chainCtx is what bounds each one, and a lookup that runs out of time
-// is treated as "could not check", which leaves the block parked for the next
-// tick.
+// Both of those cap a COUNT, and a count is not a bound on the tick. Each item
+// carries its own deadline, chainCtx for a lookup and the park's store timeout
+// for a delete, and both of those wait on resources the rest of the process is
+// competing for: the blockchain service, and the blob store's process-wide write
+// permits. A bounded number of sequential items each allowed ten seconds is a
+// twenty-minute tick, during which nothing newly stuck is looked at and every
+// commit this tick has already posted waits behind it. So the tick has its own
+// elapsed-time budget, parkSweepTimeBudget, and both halves stop at it.
+//
+// Stopping is free for the lookups, which leave the block parked for the next
+// tick anyway. It is not free for the expiries, because Expire has already taken
+// those entries out of the index: an entry the tick does not reach is put back,
+// or its blob is left charged against the budget with nothing tracking it and
+// its cursor is never rewound.
 func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 	if !sm.blockPark.Enabled() {
 		return
 	}
 
-	for _, entry := range sm.blockPark.Expire(now, parkSweepExpiryBudget) {
-		sm.logger.Warnf("[sweepParkedBlocks][%s] %s, giving the block up after %s: parent %s", entry.hash, parkDispositionExpired.reason, parkEntryTTL, entry.prevBlock)
-		sm.applyParkDisposition(entry, parkDispositionExpired)
+	deadline := sm.parkSweepClock().Add(parkSweepTimeBudget)
+
+	expired := sm.blockPark.EvictBelow(sm.parkEvictionFloor(), parkSweepExpiryBudget)
+
+	for i, entry := range expired {
+		// Always one, however long the tick has already run: a budget that can
+		// refuse every item is a sweep that never sweeps.
+		if i > 0 && !sm.parkSweepClock().Before(deadline) {
+			sm.blockPark.RestoreAll(expired[i:])
+			sm.logger.Warnf("[sweepParkedBlocks] out of time after giving up %d blocks, %d put back for the next tick", i, len(expired)-i)
+
+			break
+		}
+
+		sm.logger.Infof("[sweepParkedBlocks][%s] %s (height %d), dropping it: parent %s", entry.hash, parkDispositionOvertaken.reason, entry.height, entry.prevBlock)
+		sm.applyParkDisposition(entry, parkDispositionOvertaken)
 	}
 
-	for _, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {
-		exists, err := sm.blockExistsWithDeadline(candidate.prevBlock)
+	for i, candidate := range sm.blockPark.StuckCandidates(now, parkSweepRPCBudget) {
+		if i > 0 && !sm.parkSweepClock().Before(deadline) {
+			sm.logger.Warnf("[sweepParkedBlocks] out of time after %d parent lookups, the rest wait for the next tick", i)
+
+			break
+		}
+
+		exists, invalid, err := sm.parentChainState(candidate.prevBlock)
 		if err != nil {
-			sm.logger.Warnf("[sweepParkedBlocks][%s] could not check whether parent %s is stored: %v", candidate.hash, candidate.prevBlock, err)
+			sm.logger.Warnf("[sweepParkedBlocks][%s] could not check whether parent %s is usable: %v", candidate.hash, candidate.prevBlock, err)
 			continue
 		}
 
@@ -336,10 +544,18 @@ func (sm *SyncManager) sweepParkedBlocks(now time.Time) {
 			continue
 		}
 
+		if invalid {
+			// The parent is stored and rejected, so this block can never be
+			// committed. Committing it on the strength of the parent merely
+			// EXISTING is the bug this closes.
+			sm.logger.Warnf("[sweepParkedBlocks][%s] %s (%s), dropping it", entry.hash, parkDispositionParentInvalid.reason, entry.prevBlock)
+			sm.applyParkDisposition(entry, parkDispositionParentInvalid)
+
+			continue
+		}
+
 		sm.logger.Infof("[sweepParkedBlocks][%s] parent %s is in the chain after all, committing the parked block", entry.hash, entry.prevBlock)
 
-		if sm.commitParkedBlock(entry) {
-			sm.drainParkedDescendants(entry.hash)
-		}
+		sm.submitParkCommit(entry)
 	}
 }

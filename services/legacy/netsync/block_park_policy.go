@@ -92,7 +92,7 @@ var (
 	// and let the sweep try again. Rewinding here would ask a peer to send a
 	// block we are holding; deleting it would throw that block away over a
 	// condition that is over in seconds. Blocks kept this way are not kept
-	// forever: parkEntryTTL expires them into parkDispositionExpired.
+	// forever: the sweep evicts them once the chain has gone past them.
 	parkDispositionRetryLater = parkDisposition{
 		reason: "a local fault that says nothing about the block",
 		blob:   parkBlobKeep,
@@ -117,14 +117,27 @@ var (
 		rewindCursor: true,
 	}
 
-	// parkDispositionExpired — the parent never arrived. The block may be
-	// perfectly good, but it cannot be held any longer, so it is given up on and
-	// re-requested. Not the peer's fault: it sent what we asked for.
-	parkDispositionExpired = parkDisposition{
-		reason: "the parent never arrived",
+	// parkDispositionOvertaken — the chain has gone past this block's height, so
+	// nothing will ever ask for it again. Drop the blob and do NOT rewind: the
+	// rewind exists to get a block re-requested, and re-requesting a block the
+	// chain no longer needs is the waste this replaces. Not the peer's fault
+	// either; it sent what we asked for.
+	parkDispositionOvertaken = parkDisposition{
+		reason: "the chain has gone past it",
+		blob:   parkBlobDrop,
+	}
+
+	// parkDispositionParentInvalid — the parent is in the chain and marked
+	// invalid, so this block can never be committed however long it is held.
+	// Drop the blob, do not re-request it, and write it off so its own
+	// descendants are short-circuited rather than each discovering this
+	// separately. The peer is not blamed: it sent a block whose parent WE
+	// rejected, which says nothing about the peer.
+	parkDispositionParentInvalid = parkDisposition{
+		reason: "its parent is invalid",
 		blob:   parkBlobDrop,
 
-		rewindCursor: true,
+		markFailed: true,
 	}
 
 	// parkDispositionBlockRejected — the block itself would not go into the
@@ -176,7 +189,7 @@ var (
 // downloaded block needs positive evidence that the blob is bad; anything else,
 // including an error nobody anticipated, keeps it. A blob that is permanently
 // unreadable for an unrecognised reason is not held forever — it is retried by
-// the sweep and given up at parkEntryTTL — so the cost of guessing "keep" is a
+// the sweep and dropped once the chain passes it — so guessing "keep" costs a
 // delay, while the cost of guessing "drop" is a re-download of a block we have.
 //
 // One consequence worth naming: the file store raises a StorageError both for a

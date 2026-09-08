@@ -5,15 +5,17 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/settings"
 )
 
 const (
-	// blockRequestAssignmentTTL is how long a peer stays on the hook for a block
-	// we asked it for. It is the ceiling the disconnect decision uses: a peer
-	// that delivers within it is answering our question, however late, and must
-	// keep its connection. Inherited from the per-peer map this replaced, whose
-	// comment explained the hour is what legacy sync and checkpoint batches need.
+	// blockRequestAssignmentTTL is the FLOOR under how long a peer stays on the
+	// hook for a block we asked it for. The ceiling actually used is derived from
+	// settings by blockRequestAssignmentCeiling and is never shorter than this.
+	// Inherited from the per-peer map this replaced, whose comment explained the
+	// hour is what legacy sync and checkpoint batches need.
 	blockRequestAssignmentTTL = 60 * time.Minute
 
 	// blockRequestRetryInterval is how long we wait before an announced block is
@@ -88,6 +90,46 @@ type blockDownloadTracker struct {
 	// count and its removal are both O(what that peer owes) rather than O(all).
 	byPeer    map[*peerpkg.Peer]map[chainhash.Hash]struct{}
 	lastSweep time.Time
+}
+
+// blockRequestAssignmentCeiling is how long a peer stays on the hook for a block
+// we asked it for: the longest a block download can legitimately take, or an
+// hour, whichever is longer.
+//
+// svnode keeps ONE clock. Its BlockDownloadTracker has no expiry at all: an
+// entry leaves when the block arrives, when the download is explicitly failed,
+// or when the peer disconnects (src/net/block_download_tracker.h), and the only
+// timer is the per-block in-flight timeout in DetectStalling
+// (src/net/net_processing.cpp:5446), which is computed from the same
+// nPowTargetSpacing * (timeoutBase + timeoutPerPeer * nOtherPeers) figure that
+// bounds the transfer. This node has a second record, so it needs a second
+// clock, and a flat hour was one that could expire while the peer layer was
+// still legitimately extending the same transfer. A multi-gigabyte block
+// completing at minute 61 of a 95-minute budget then arrived with no owner: the
+// peer lost its whole association for "Got unrequested block" and a finished
+// download was thrown away. Deriving both from the same settings is what stops
+// them disagreeing again.
+//
+// The record is deliberately NOT refreshed mid-transfer. svnode refreshes
+// nothing, and a refresh would be a second invention layered on the first: the
+// ledger would then say a peer owes us a block for as long as it keeps sending
+// bytes, which is a different question from the one it is asked.
+//
+// A long ceiling is the safe direction. It is a backstop, not the stall
+// detector: the peer layer disconnects a genuinely stalled peer inside its own
+// budget (services/legacy/peer/peer.go, DetectStalling's equivalent in the stall
+// handler), and a disconnect clears that peer's assignments outright. What is
+// left for expiry is the case svnode does not have to handle, a stream sub-peer
+// whose release call does not run. At shipped mainnet settings the ceiling works
+// out at 375 minutes: window 1024 over a per-peer depth of 16 is 64 peers, so
+// 600% + 63 * 50% of a ten-minute interval.
+func blockRequestAssignmentCeiling(tSettings *settings.Settings, params *chaincfg.Params) time.Duration {
+	var interval time.Duration
+	if params != nil {
+		interval = params.TargetTimePerBlock
+	}
+
+	return max(blockRequestAssignmentTTL, peerpkg.MaxBlockDownloadBudget(tSettings, interval))
 }
 
 // newBlockDownloadTracker builds a ledger whose assignments expire after ttl.

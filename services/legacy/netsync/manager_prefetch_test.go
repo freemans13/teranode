@@ -455,7 +455,7 @@ func TestLocalReadBackpressured(t *testing.T) {
 	// stale backdates the progress stamp well past the stall timeout so a
 	// non-empty backlog reads as a hung pipeline rather than progressing work.
 	stale := func(sm *SyncManager) {
-		sm.lastBacklogProgress.Store(time.Now().Add(-time.Hour).UnixNano())
+		sm.lastChainProgress.Store(time.Now().Add(-time.Hour).UnixNano())
 	}
 
 	t.Run("kill switch (budget nil): suppression is unconditional on any backlog", func(t *testing.T) {
@@ -467,7 +467,7 @@ func TestLocalReadBackpressured(t *testing.T) {
 		// blocks and owns processing-stall liveness, so suppression here stays
 		// UNCONDITIONAL — exactly as pre-prefetch.
 		sm.blockBacklog.Add(1)
-		sm.noteBacklogProgress()
+		sm.noteChainProgress()
 		require.True(t, sm.localReadBackpressured())
 
 		// Even a stale progress stamp must NOT lift suppression on the kill switch:
@@ -487,7 +487,7 @@ func TestLocalReadBackpressured(t *testing.T) {
 		// A progressing backlog is self-backpressure: a stale last-block-time
 		// then reflects our validation speed, not the peer.
 		sm.blockBacklog.Add(5)
-		sm.noteBacklogProgress()
+		sm.noteChainProgress()
 		require.True(t, sm.localReadBackpressured())
 
 		// Progress has stalled past the timeout — a genuine hang. Deliberately do
@@ -560,7 +560,7 @@ func TestHandleCheckSyncPeer_PrefetchBackpressure(t *testing.T) {
 		// reflects our validation speed, not the peer. The healthy peer must be
 		// kept (rotation would panic in this minimal SyncManager).
 		sm.blockBacklog.Add(3)
-		sm.noteBacklogProgress()
+		sm.noteChainProgress()
 
 		require.NotPanics(t, func() { sm.handleCheckSyncPeer() })
 		require.Equal(t, sp, sm.loadSyncPeer())
@@ -575,7 +575,7 @@ func TestHandleCheckSyncPeer_PrefetchBackpressure(t *testing.T) {
 		// the rotation path runs (panicking in this minimal SyncManager, which
 		// proves it ran rather than being suppressed).
 		sm.blockBacklog.Add(3)
-		sm.lastBacklogProgress.Store(time.Now().Add(-time.Hour).UnixNano())
+		sm.lastChainProgress.Store(time.Now().Add(-time.Hour).UnixNano())
 
 		require.Panics(t, func() { sm.handleCheckSyncPeer() })
 	})

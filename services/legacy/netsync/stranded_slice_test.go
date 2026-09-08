@@ -119,3 +119,54 @@ func TestNotFound_TheBlockComesBackToTheWalk(t *testing.T) {
 	require.Equal(t, hashes[0:4], syncData.all(),
 		"the other peer's in-flight blocks must not be asked for a second time")
 }
+
+// TestNotFound_FromAStreamPeerReleasesThePrimarysAssignment is the same
+// discharge reached over a BlockPriority association, which is how it arrives on
+// a real node: the getdata went out on the primary and the notfound comes back
+// on a stream sub-peer that is not itself in peerStates and never owed anything.
+//
+// Read literally, against the raw receiving peer, the handler matches nothing
+// and returns having done nothing — the assignment stands for the whole
+// ownership ceiling, the primary's queue slot stays charged, and the hash sits
+// behind the forward-only cursor with nobody asking for it. That is the wedge
+// this handler exists to prevent, reached through the transport that was added
+// after it.
+//
+// What is pinned is the end state, not the resolution: the primary no longer
+// owes the block, the rest of its run is untouched, and the block is asked for
+// again.
+func TestNotFound_FromAStreamPeerReleasesThePrimarysAssignment(t *testing.T) {
+	sm := newDemotionManager(t)
+
+	hashes, syncData, fanoutData, fanout := strandedRun(t, sm, 125, 126)
+
+	// A DATA1 stream of the fan-out peer's association: a distinct Peer, not
+	// registered in peerStates, owing nothing in its own name.
+	stream := &peerpkg.Peer{}
+	stream.SetAssociation(peerpkg.NewAssociation([]byte{0x7f}, fanout))
+
+	_, exists := sm.peerStates.Get(stream)
+	require.False(t, exists, "the stream sub-peer must not be registered in its own right")
+	require.False(t, sm.blockDownloads.HasOwner(stream, hashes[5]),
+		"and it must own nothing in its own right, or the test proves nothing")
+
+	notFound := wire.NewMsgNotFound()
+	require.NoError(t, notFound.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hashes[5])))
+
+	sm.NotFound(notFound, stream)
+
+	require.False(t, sm.blockDownloads.HasOwner(fanout, hashes[5]),
+		"the primary's assignment must be discharged by a notfound arriving on its stream")
+	require.True(t, sm.blockDownloads.HasOwner(fanout, hashes[6]),
+		"and the rest of its run must be untouched")
+
+	sm.fetchHeaderBlocks()
+
+	require.True(t, WaitUntil(func() bool { return fanoutData.count() == 5 }, 5*time.Second),
+		"the block nobody owes any more must be asked for again")
+	require.Equal(t, append(append([]chainhash.Hash{}, hashes[4:8]...), hashes[5]), fanoutData.all(),
+		"and only that block: the rest of the run is still owed by a live peer")
+
+	require.Equal(t, hashes[0:4], syncData.all(),
+		"the other peer's in-flight blocks must not be asked for a second time")
+}

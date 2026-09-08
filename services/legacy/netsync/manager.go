@@ -79,7 +79,7 @@ const (
 
 	// defaultBlockProcessingStallTimeout bounds how long localReadBackpressured
 	// keeps suppressing the sync-peer stall check while the block backlog is
-	// non-empty but not advancing (see lastBacklogProgress). It is only the
+	// non-empty but not committing (see lastChainProgress). It is only the
 	// fallback for settings.Legacy.PeerProcessingTimeout — the pre-prefetch
 	// per-message watchdog whose coverage this progress-aware rule restores —
 	// used when a SyncManager has no settings wired (unit tests) or the setting
@@ -144,6 +144,10 @@ const (
 	// unexpectedFailureAddingInventoryMsg is logged when adding an inventory
 	// vector to a getdata message fails unexpectedly.
 	unexpectedFailureAddingInventoryMsg = "Unexpected failure when adding inventory to getdata message: %v"
+
+	// syncManagerShuttingDownMsg is the service error returned to every queued or
+	// in-flight block that is drained when the sync manager stops.
+	syncManagerShuttingDownMsg = "sync manager shutting down"
 )
 
 // zeroHash is the zero-value hash (all zeros).  It is defined as a convenience.
@@ -691,7 +695,29 @@ type SyncManager struct {
 	// again. nil means the park is off and the old discard path runs; every entry
 	// point is nil-safe, because tests build SyncManager as a struct literal that
 	// never goes through New().
-	blockPark     *blockPark
+	blockPark *blockPark
+
+	// parkJobs carries an admitted block to a parking worker, and parkOutcomes
+	// carries the answer back to the block-queue consumer. Both exist so the
+	// stateless check and the blob write do not run on the goroutine that
+	// commits blocks in order; see block_park_worker.go.
+	parkJobs     chan parkJob
+	parkOutcomes chan parkOutcome
+	parkWorkers  sync.WaitGroup
+
+	// parkCommits carries a parked block the sweep has found a stored parent for
+	// back to the block-queue consumer, which is the one goroutine that commits.
+	// The sweep runs on its own goroutine and may not commit from there: it
+	// would race the dispatcher for admission into the window. nil on a manager
+	// built as a struct literal, and submitParkCommit then commits inline, which
+	// is what the sweep did before it had a goroutine of its own.
+	parkCommits chan parkedBlock
+
+	// parkSweepNow is the clock the park sweep measures its own tick against, so
+	// a test can make one store delete look slow without sleeping. nil means
+	// time.Now; nothing in production sets it.
+	parkSweepNow func() time.Time
+
 	syncPeerMu    sync.RWMutex // protects syncPeer and syncPeerState
 	syncPeer      *peerpkg.Peer
 	syncPeerState *syncPeerState
@@ -705,18 +731,28 @@ type SyncManager struct {
 	// peer. Written by the blockHandler goroutines, read by handleCheckSyncPeer.
 	blockBacklog atomic.Int64
 
-	// lastBacklogProgress is the UnixNano time the block backlog last advanced:
-	// the 0->1 enqueue that opened the current backpressure window, or the most
-	// recent block completion. localReadBackpressured suppresses the sync-peer
-	// stall check only while this stays fresh — a backlog that stops advancing
-	// for longer than blockProcessingStallTimeout is a genuine processing hang
-	// (store/validator deadlock, Aerospike overload), not slow-but-progressing
+	// lastChainProgress is the UnixNano time a block last joined the chain.
+	// localReadBackpressured suppresses the sync-peer stall check only while
+	// this stays fresh — a backlog that stops producing commits for longer than
+	// blockProcessingStallTimeout is a genuine processing hang (store or
+	// validator deadlock, Aerospike overload), not slow-but-progressing
 	// validation, and must be allowed to rotate the peer. This restores the
 	// liveness coverage lost when the per-message watchdog was disarmed for
 	// prefetched blocks, without the false rotation of a merely-slow block.
-	// Written by the blockHandler goroutines (the 0->1 enqueue and every
-	// completion, via noteBacklogProgress), read by handleCheckSyncPeer.
-	lastBacklogProgress atomic.Int64
+	// Written by the block-queue consumer and by the drain, via
+	// noteChainProgress, and read by handleCheckSyncPeer.
+	lastChainProgress atomic.Int64
+
+	// lastCommittedHeight is the height of the highest block this node has put
+	// into the chain, recorded by HandleBlockDirect on success. Monotonic, and 0
+	// until the first commit.
+	//
+	// Read by the park sweep, which uses it to drop blocks the chain has gone
+	// past. It is deliberately not derived from the header list: an arriving
+	// front block's header is removed before the park sees the block, so the
+	// front sits one above the block being waited for, and a sweep judging by
+	// the front throws away exactly the block it needs.
+	lastCommittedHeight atomic.Int32
 
 	// blockPrefetchBudget bounds, by total serialized bytes, the blocks that
 	// have been received from peers but not yet finished processing. It lets
@@ -811,6 +847,11 @@ type SyncManager struct {
 	nextCheckpoint   *chaincfg.Checkpoint
 	blockSizeTracker *blockSizeTracker // tracks block sizes for dynamic in-flight adjustment
 
+	// dispatcher owns the quick window: it decides how many queued blocks may have
+	// their UTXO store work in flight at once and runs every chain-order step in
+	// dispatch order. Built in New(); nil when SyncManager was built as a struct
+	// literal in a test, which every dispatcher accessor tolerates.
+	dispatcher *blockDispatcher
 	// The download frontier: the oldest block we have asked for and not yet
 	// received. Because blocks are committed strictly in order, that one block
 	// gates everything behind it, so it is the only block worth asking a second
@@ -1586,11 +1627,29 @@ func (sm *SyncManager) handleCheckSyncPeer() {
 	// wall-clock window the peer is rotated regardless of throughput, so a
 	// malicious peer cannot dribble bytes just above the threshold forever to
 	// hold the single sync-peer slot and stall IBD.
-	if isLastBlockTimeViolation &&
+	// Both arms are suppressed, not just the last-block-time one. validNetworkSpeed
+	// reads BytesReceived, which is this peer object's own counter, and under the
+	// BlockPriority stream policy a large block arrives on DATA1 while that
+	// counter barely moves. So a peer downloading a multi-GB block at full rate
+	// records a speed violation every tick, and gating only the last-block-time
+	// arm left the speed arm free to rotate it anyway. Measured on mainnet at
+	// 124 MB average blocks: the sync peer was demoted three times in seven
+	// minutes, mid-transfer, each demotion reopening its assignments and rewinding
+	// the cursor, so the work was done twice.
+	//
+	// This is what svnode does and for the same reason: DetectStalling asks
+	// whether the peer is actually downloading before it acts, and resets the
+	// stall clock rather than disconnecting a peer making real progress.
+	//
+	// The wall-clock cap is kept and now covers both arms, so a peer cannot
+	// dribble bytes just above the floor to hold the sync-peer slot indefinitely.
+	if (isLastBlockTimeViolation || isNetworkSpeedViolation) &&
 		lastBlockSince < peerpkg.MaxBlockDownloadTime &&
 		sps.hasHealthyDownloadThroughput(sm.minSyncPeerNetworkSpeed) {
-		sm.logger.Debugf("[CheckSyncPeer] sync peer %s exceeded last-block-time but association still downloading at a healthy rate (%.0fs in, cap %s); not rotating", sp.String(), lastBlockSince.Seconds(), peerpkg.MaxBlockDownloadTime)
+		sm.logger.Debugf("[CheckSyncPeer] sync peer %s violated %s but its association is still downloading at a healthy rate (%.0fs in, cap %s); not rotating", sp.String(), violationNames(isNetworkSpeedViolation, isLastBlockTimeViolation), lastBlockSince.Seconds(), peerpkg.MaxBlockDownloadTime)
+
 		isLastBlockTimeViolation = false
+		isNetworkSpeedViolation = false
 	}
 
 	// If no violations detected, the sync peer is healthy — nothing to do.
@@ -2353,6 +2412,226 @@ func (sm *SyncManager) requestMissingBlocks(peer *peerpkg.Peer, blockHash chainh
 	}
 }
 
+// parentFailedWhileWaiting reports whether the parent of a block that was waiting for
+// window capacity has failed in the meantime, and if so gives the block the same #1333
+// treatment the head gives a descendant of an already-failed block: mark it failed so
+// its own descendants are suppressed transitively, refresh the delivering peer's stall
+// timer (the fault is a rejected ancestor, not the peer), and answer with a getblocks so
+// sync recovers once the root block is resolved. The caller replies nil, exactly as the
+// head's branch does, so the window-off path behaves as it did before the window
+// existed. A parent that is in flight right now is not a failed parent: it was
+// re-admitted, and its child must not be dropped as part of a cascade being retried.
+func (sm *SyncManager) parentFailedWhileWaiting(d *blockDispatch) bool {
+	if sm.recentlyFailedBlocks == nil || sm.dispatcher.inFlight(d.prevHash) {
+		return false
+	}
+
+	if _, failed := sm.recentlyFailedBlocks.Get(d.prevHash); !failed {
+		return false
+	}
+
+	sm.recentlyFailedBlocks.Set(d.msg.blockHash, struct{}{})
+	sm.logger.Debugf("[dispatchBlocks][%s] parent %s failed while this block waited for capacity; skipping descendant (root failure already logged)", d.msg.blockHash, d.prevHash)
+
+	if sps, ok := sm.syncPeerStateFor(d.peer); ok {
+		sps.updateLastBlockTime()
+	}
+
+	// Unlike the head's own cascade branch, this block's header HAS left the
+	// front. Its parent was in flight when the head ran, so the parent's header
+	// was already gone and this block was the front when advanceHeaderListFor
+	// saw it. The parent's failure has just put the parent's header back; this
+	// puts this block's back behind it, so once the parent's backoff clears the
+	// walk asks for both in order instead of skipping from the parent straight
+	// to this block's children. No backoff of its own, for the same reason the
+	// tail records none for an aborted successor: this block never ran a failing
+	// attempt.
+	sm.rewindHeaderCursor(d.msg.blockHash, d.removedFront)
+
+	sm.requestMissingBlocks(d.peer, d.msg.blockHash)
+
+	return true
+}
+
+// finishBlockMsg settles the backlog accounting and answers the caller for one
+// queue message that has left the pipeline. The dispatcher's tail ends with it for
+// every block that reached a worker (see newBlockDispatcher), the pre-window
+// consumer ends every turn with it, and both shutdown drains use it.
+//
+// Progress is a block joining the chain, not a queue message finishing. A parked
+// block finishes its message and moves nothing, so stamping unconditionally would
+// keep localReadBackpressured suppressing the stall check while the tip stood
+// still. The stamp is shared across peers, so one peer's stream of out-of-order
+// blocks used to hold that suppression open over a DIFFERENT peer's silence.
+//
+// A block handed to a parking worker has had its reply taken by the job, so
+// msg.reply is nil here and the worker answers instead. That is what holds the
+// prefetch budget until the worker has finished with the decoded block.
+func (sm *SyncManager) finishBlockMsg(msg *blockQueueMsg, err error) {
+	sm.blockBacklog.Add(-1)
+
+	if msg.committed {
+		sm.noteChainProgress()
+	}
+
+	if msg.reply != nil {
+		msg.reply <- err
+	}
+}
+
+// consumeBlocksSerially is the pre-window block-queue consumer, run when
+// blockvalidation_quick_window_blocks is 0: one block at a time, its pre-checks, its own
+// work and its chain-order tail all on this goroutine, so block N+1 is not even taken off
+// the queue until block N has finished. The shutdown drain is the dispatcher's, verbatim:
+// under prefetch each queued block has an awaitBlockResult goroutine holding budget and
+// waiting on its reply, so replying here lets them exit promptly instead of waiting for the
+// peer's own quit/ctx. The feeder races the same sm.quit close, so a block enqueued after
+// this drain returns is not caught here — that block's awaitBlockResult still exits via
+// sp.quit/sp.ctx.Done(), and the feeder's enqueue is itself sm.quit-guarded, so the drain
+// only makes the common case prompt and is not relied on for correctness.
+//
+// The two park arms are the same ones the dispatcher has, because whichever
+// consumer is running is the one goroutine that commits blocks in order, and a
+// parking worker's outcome and a sweep-posted commit both have to land there.
+func (sm *SyncManager) consumeBlocksSerially(blockQueue <-chan *blockQueueMsg) {
+	for {
+		select {
+		case <-sm.quit:
+			for {
+				select {
+				case msg := <-blockQueue:
+					sm.finishBlockMsg(msg, errors.NewServiceError(syncManagerShuttingDownMsg))
+				default:
+					return
+				}
+			}
+		case outcome := <-sm.parkOutcomes:
+			sm.applyParkOutcome(outcome)
+		case entry := <-sm.parkCommits:
+			sm.commitParkedBlockAndDrain(entry)
+		case msg := <-blockQueue:
+			sm.consumeQueuedBlock(msg)
+		}
+	}
+}
+
+// dispatchBlocks is the block-queue consumer: it runs every pre-check and every
+// chain-order step for one block on this goroutine and hands only the block's own
+// work to a worker, so up to K consecutive below-checkpoint blocks can have their
+// UTXO store work in flight while their tails still run in dispatch order. A block
+// whose parent is neither in the chain nor in flight never reaches a worker: the
+// head parks it, with its bytes, and the drain commits it when the parent lands.
+// It returns when sm.quit closes.
+func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
+	// blockvalidation_quick_window_blocks=0 is a true bypass, not a one-deep window: the
+	// dispatcher is not used at all and the queue is consumed the way it was before the
+	// window existed, so a rollback to the setting is a rollback to the old code path. It
+	// matters because even at depth 1 the dispatcher splits a block's head (the FSM state
+	// call, requestedBlocks, headerList, size sampling, the cascade marks) from its tail,
+	// so block N+1's head would run while N was still in flight.
+	if sm.settings != nil {
+		if depth, _ := sm.settings.BlockValidation.QuickWindowConfiguredDepth(); depth == 0 {
+			sm.consumeBlocksSerially(blockQueue)
+			return
+		}
+	}
+
+	bd := sm.dispatcher
+
+	// pending holds one head-processed block waiting for capacity. While it is
+	// set the queue arm is disabled, so nothing else is head-processed until this
+	// block is dispatched: "receive only while a slot is free", with the head
+	// work already done.
+	var pending *blockDispatch
+
+	finish := sm.finishBlockMsg
+
+	for {
+		var queueArm <-chan *blockQueueMsg
+
+		if pending == nil {
+			queueArm = blockQueue
+		} else if bd.canDispatch(pending) {
+			d := pending
+			pending = nil
+
+			// The parent may have failed while this block waited for capacity, on any
+			// route: the head's own #1333 check exempted it because the parent was in
+			// flight at the time, and the window's admission-time abort only covers a
+			// block whose parent it actually resolved.
+			if sm.parentFailedWhileWaiting(d) {
+				finish(d.msg, nil)
+			} else {
+				bd.dispatch(d)
+			}
+
+			continue
+		}
+
+		select {
+		case <-sm.quit:
+			// Best-effort drain with an error reply before exiting: the block
+			// waiting for capacity, every block already in flight (its worker
+			// keeps running, but its completion is dropped) and everything still
+			// queued. Under prefetch each of those has an awaitBlockResult
+			// goroutine holding budget and waiting on its reply, so replying here
+			// lets them exit promptly on shutdown instead of waiting for the
+			// peer's own quit/ctx. The feeder races the same sm.quit close, so a
+			// block it enqueues after this drain returns is not caught here — that
+			// block's awaitBlockResult still exits via sp.quit/sp.ctx.Done() (the
+			// backstop), and the feeder's enqueue is itself sm.quit-guarded so it
+			// can never deadlock. This drain only makes the common case prompt; it
+			// is not relied on for correctness.
+			if pending != nil {
+				finish(pending.msg, errors.NewServiceError(syncManagerShuttingDownMsg))
+
+				pending = nil
+			}
+
+			for _, e := range bd.frontier {
+				finish(e.d.msg, errors.NewServiceError(syncManagerShuttingDownMsg))
+			}
+
+			bd.frontier = nil
+
+			for {
+				select {
+				case msg := <-blockQueue:
+					finish(msg, errors.NewServiceError(syncManagerShuttingDownMsg))
+				default:
+					return
+				}
+			}
+		case msg := <-queueArm:
+			sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsgHead", msg.blockHash)
+
+			d, finished, err := sm.handleBlockMsgHead(msg)
+			if finished {
+				finish(msg, err)
+
+				continue
+			}
+
+			// Hold it unconditionally: the top of the loop runs before the next
+			// receive, so a block that can start does so immediately, and there is one
+			// place where a block is admitted.
+			pending = d
+		case c := <-bd.completions:
+			bd.complete(c)
+		case outcome := <-sm.parkOutcomes:
+			// A parking worker has finished with a block the head admitted.
+			// Everything that needs ordering or the header list waited for this.
+			sm.applyParkOutcome(outcome)
+		case entry := <-sm.parkCommits:
+			// The sweep found a parked block whose parent is in the chain after
+			// all. It decided that on its own goroutine and posts the commit here,
+			// because this is the one goroutine that admits blocks: a commit from
+			// the sweep would race the dispatcher for admission into the window.
+			sm.commitParkedBlockAndDrain(entry)
+		}
+	}
+}
+
 // advanceHeaderListFor moves the header list on for a block that has arrived.
 //
 // When in headers-first mode, if the block matches the hash of the first header
@@ -2414,14 +2693,26 @@ func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpo
 	return isCheckpointBlock, removedFront
 }
 
-func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
+// handleBlockMsgHead runs every pre-check for one queued block on the consumer
+// goroutine — peer resolution, the FSM state, headers-first bookkeeping, the
+// download ledger, the backoff and cascade skips, block-size sampling — and then
+// answers the one question that decides where the block goes: is its parent in
+// flight, in the chain, or neither. The first two become a dispatch; the third
+// is parked here, while the decoded block is still in hand, because parking needs
+// its bytes and nothing after dispatch may read them.
+//
+// It returns (dispatch, false, nil) when the block is ready to be handed to a
+// worker, or (nil, true, err) when the block is finished here and err is what the
+// caller must reply. Everything it touches (headerList, the download ledger,
+// nextCheckpoint, startHeader, the park index) stays on this one goroutine.
+func (sm *SyncManager) handleBlockMsgHead(bmsg *blockQueueMsg) (*blockDispatch, bool, error) {
 	sm.logger.Debugf("[handleBlockMsg][%s] received block height %d from %s", bmsg.blockHash, bmsg.blockHeight, bmsg.peer)
 	peer := bmsg.peer
 
 	state, resolved, exists := sm.peerStateResolvingPrimary(peer)
 	if !exists {
 		sm.logger.Errorf("[handleBlockMsg][%s] Received block message from unknown peer %s", bmsg.blockHash, peer)
-		return errors.NewServiceError("[handleBlockMsg] Received block message from unknown peer %s", peer)
+		return nil, true, errors.NewServiceError("[handleBlockMsg] Received block message from unknown peer %s", peer)
 	}
 	if resolved != peer {
 		// Stream peers (e.g. BlockPriority) are not registered in peerStates
@@ -2465,7 +2756,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// completely untouched.
 	if sm.UsePrefetchIngestion() && !bmsg.peer.Connected() {
 		sm.logger.Debugf("[handleBlockMsg][%s] skipping block from disconnected peer %s", bmsg.blockHash, bmsg.peer)
-		return errors.NewServiceError("[handleBlockMsg] skipping block %s from disconnected peer %s", bmsg.blockHash, bmsg.peer)
+		return nil, true, errors.NewServiceError("[handleBlockMsg] skipping block %s from disconnected peer %s", bmsg.blockHash, bmsg.peer)
 	}
 
 	catchingBlocks := false
@@ -2474,7 +2765,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 
 	fsmState, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
 	if err != nil {
-		return errors.NewProcessingError("[handleBlockMsg] failed to get current FSM state", err)
+		return nil, true, errors.NewProcessingError("[handleBlockMsg] failed to get current FSM state", err)
 	}
 
 	if fsmState != nil && *fsmState == teranodeblockchain.FSMStateCATCHINGBLOCKS {
@@ -2496,13 +2787,13 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			if sm.BlockRacedTo(peer, &bmsg.blockHash) {
 				sm.logger.Debugf("[handleBlockMsg][%s] discarding late copy from %s, another peer already delivered it", bmsg.blockHash, peer)
 
-				return errors.NewServiceError("[handleBlockMsg] late copy of block %v from %s", bmsg.blockHash, peer)
+				return nil, true, errors.NewServiceError("[handleBlockMsg] late copy of block %v from %s", bmsg.blockHash, peer)
 			}
 
 			reason := fmt.Sprintf("Got unrequested block %v", bmsg.blockHash)
 			peer.DisconnectWithWarning(reason)
 
-			return errors.NewServiceError("Got unrequested block %v", bmsg.blockHash)
+			return nil, true, errors.NewServiceError("Got unrequested block %v", bmsg.blockHash)
 		}
 	}
 
@@ -2578,7 +2869,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// block that is still inside its backoff and leaves the cursor on it.
 			sm.rewindHeaderCursor(bmsg.blockHash, removedFront)
 
-			return errors.NewServiceUnavailableError("[handleBlockMsg][%s] block in backoff after %d transient failure(s)", bmsg.blockHash, fs.attempts)
+			return nil, true, errors.NewServiceUnavailableError("[handleBlockMsg][%s] block in backoff after %d transient failure(s)", bmsg.blockHash, fs.attempts)
 		}
 	}
 
@@ -2593,7 +2884,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 		// dropped, it is a queue message that never carried one — a programming
 		// fault, not a sync one — and every test that advances the header list
 		// by hand comes through here.
-		return errors.NewProcessingError("[handleBlockMsg][%s] block message carries no block", bmsg.blockHash)
+		return nil, true, errors.NewProcessingError("[handleBlockMsg][%s] block message carries no block", bmsg.blockHash)
 	}
 
 	prevBlockHash := msgBlock.Header.PrevBlock
@@ -2610,7 +2901,11 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 	// #1187 backoff skip above) so a skipped, re-delivered descendant does not
 	// keep re-sampling its size into the moving average and biasing
 	// calculateMaxInFlightBlocks().
-	if sm.recentlyFailedBlocks != nil {
+	//
+	// A parent the dispatcher is working on right now is not a failed parent, even
+	// if a previous attempt at it failed: it was re-admitted, so its child must not
+	// be short-circuited as part of a cascade that is already being retried.
+	if sm.recentlyFailedBlocks != nil && !sm.dispatcher.inFlight(prevBlockHash) {
 		if _, failed := sm.recentlyFailedBlocks.Get(prevBlockHash); failed {
 			sm.recentlyFailedBlocks.Set(bmsg.blockHash, struct{}{})
 			sm.logger.Debugf("[handleBlockMsg][%s] parent %s recently failed to store/validate; skipping descendant (root failure already logged)", bmsg.blockHash, prevBlockHash)
@@ -2630,131 +2925,383 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// rather than letting it run on into descendants like this one.
 			sm.requestMissingBlocks(peer, bmsg.blockHash)
 
-			return nil
+			return nil, true, nil
 		}
 	}
+
+	// Serializing a multi-GB block to measure it is not free, and exactly two consumers want
+	// the number: the headers-first size tracker just below, and the dispatcher's byte charge
+	// further down. Measure it at most once, and only when one of them actually asks, so a node
+	// with headers-first off and no windowed block pays nothing it did not pay before the
+	// window existed, which is where this measurement used to sit.
+	var (
+		blockSize  int64
+		blockSized bool
+	)
+
+	sizeOf := func() int64 {
+		if !blockSized {
+			blockSize = int64(msgBlock.SerializeSize())
+			blockSized = true
+		}
+
+		return blockSize
+	}
+
+	headersFirst := sm.headersFirstMode.Load()
 
 	// Track block size for dynamic in-flight adjustment during headers-first mode.
 	// This allows us to start aggressive (20 blocks) and automatically reduce
 	// to 1 block when encountering large (>2GB) blocks on mainnet.
-	if sm.headersFirstMode.Load() {
-		blockSize := int64(msgBlock.SerializeSize())
-		sm.blockSizeTracker.addBlockSize(blockSize)
+	//
+	// This stays ahead of the parent lookup, where it has always been: the tracker is measuring
+	// what the wire delivered, and an orphan is still a block that arrived.
+	if headersFirst {
+		size := sizeOf()
+
+		sm.blockSizeTracker.addBlockSize(size)
 
 		dynamicMax := sm.blockSizeTracker.calculateMaxInFlightBlocks()
 		avgSize := sm.blockSizeTracker.getAverageSize()
 		sm.logger.Debugf("[handleBlockMsg][%s] Block size: %d bytes, avg: %d bytes, dynamic max in-flight: %d",
-			bmsg.blockHash, blockSize, avgSize, dynamicMax)
+			bmsg.blockHash, size, avgSize, dynamicMax)
 	}
 
-	sm.logger.Debugf("[handleBlockMsg][%s] calling HandleBlockDirect", bmsg.blockHash)
+	sm.logger.Debugf("[handleBlockMsgHead][%s] pre-checks passed, resolving the parent", bmsg.blockHash)
 
-	// Process the block directly. A missing-parent error (ErrBlockNotFound)
-	// always triggers a getblocks request from our best block so block
-	// validation can proceed in order — see the orphan-continuation note below.
-	if err = sm.HandleBlockDirect(sm.ctx, bmsg.peer, bmsg.blockHash, msgBlock); err != nil {
+	d := &blockDispatch{
+		msg:            bmsg,
+		peer:           peer,
+		state:          state,
+		msgBlock:       msgBlock,
+		prevHash:       prevBlockHash,
+		catchingBlocks: catchingBlocks,
+		isCheckpoint:   isCheckpointBlock,
+		removedFront:   removedFront,
+	}
+
+	// HandleBlockDirect's opening — is the block stored, is its parent — asked
+	// here so the answer decides where the block goes while its bytes are still
+	// in hand. The worker is handed what was resolved, so it does not ask again.
+	if finished, err := sm.resolveParent(d, msgBlock); finished {
+		return nil, true, err
+	}
+
+	// The byte charge is the dispatcher's window bookkeeping, and only a windowed block ever
+	// pays it, so the size is asked for here rather than above: resolveParent has just
+	// settled the route, so a block on an enabled window route that turns out not to be
+	// windowed after all (above the checkpoint, say) is never measured for it. On the window
+	// route with headers-first on, sizeOf has already run and this is free.
+	//
+	// d.bytes stays zero otherwise, and the dispatcher is fine with that: it charges and
+	// releases symmetrically, and canDispatch reads bytes only after the !d.windowed early
+	// return. Off the window route a block needs an empty frontier whatever its size.
+	if d.windowed {
+		d.bytes = sizeOf()
+	}
+
+	// A re-admitted block clears the cascade mark on its own hash, so a child
+	// delivered while this attempt is in flight is not dropped as the descendant of
+	// a failure that is being retried right now. The tail sets the mark again if
+	// this attempt fails too.
+	if sm.recentlyFailedBlocks != nil {
+		sm.recentlyFailedBlocks.Delete(bmsg.blockHash)
+	}
+
+	return d, false, nil
+}
+
+// resolveParent is HandleBlockDirect's opening, run on the consumer goroutine
+// before the block is dispatched, and every answer is routed exactly as it was
+// when HandleBlockDirect gave it: whether the block is already stored, and then
+// whether its parent is in flight, in the chain, or neither. It fills in the
+// dispatch's height, in-flight parent and windowed flag, and returns
+// finished=true when the head is done with the block — parked, already stored
+// and settled, or failed — with err then being what the caller must reply.
+//
+// The order is HandleBlockDirect's, and it matters. A block that is already in
+// the chain was never parked, whatever its parent lookup says; and a lookup that
+// fails for any reason other than "not found" was never an orphan either, it was
+// a failure of the block's own work, and it took the failure arm of the tail:
+// the walk is put back on the block, throttled, and the error is classified
+// before anything is said to the peer. The head hands those to the tail itself,
+// so the serial path and the dispatcher's path agree with 1606 to the branch.
+//
+// A stored block is not finished here. HandleBlockDirect returned nil for one
+// and the success tail then ran, drain included, and that is what the head keeps
+// by dispatching it: the worker's own existence check gives the same answer and
+// the tail records a commit.
+//
+// The dispatcher is asked about the parent before the chain, because a parent in
+// flight is not in the chain and a chain lookup would wrongly call it missing.
+// Only the frontier's tail can be resolved as an in-flight parent: the frontier
+// is a chain, so any earlier entry is the ancestor of a block already admitted,
+// and a block naming one of those as its parent is a fork off a block still
+// being worked on. Both that fork and a tail-parented block off the window route
+// are dispatched without a resolved parent, which makes the dispatcher hold them
+// for an empty frontier; by then the parent has either committed, and the
+// worker's own lookup finds it, or failed, and parentFailedWhileWaiting gives
+// the block the cascade treatment. Neither needs the park, because the parent's
+// outcome is known before the block starts.
+//
+// A stored parent is handed to the worker with its height and no frontier entry.
+// HandleBlockDirect reads the height off it and skips the lookup the head has
+// just made, and the ordering hand-shake is guarded on the entry, so nothing
+// waits on anything.
+func (sm *SyncManager) resolveParent(d *blockDispatch, msgBlock *wire.MsgBlock) (bool, error) {
+	bmsg := d.msg
+	prevBlockHash := d.prevHash
+
+	exists, err := sm.blockchainClient.GetBlockExists(sm.ctx, &bmsg.blockHash)
+	if err != nil {
+		sm.logger.Errorf("[handleBlockMsg][%s] failed to check if block exists: %s", bmsg.blockHash, err)
+
+		return true, sm.handleBlockMsgTail(d, errors.NewProcessingError("failed to check if block exists", err))
+	}
+
+	if exists {
+		sm.logger.Warnf("[handleBlockMsg][%s] block already exists", bmsg.blockHash)
+
+		return false, nil
+	}
+
+	// The sync peer's association just delivered a full block. Refresh its
+	// last-block time now, at receipt, so what follows — minutes of validation
+	// for a block that is dispatched, or the park's own work for one that is
+	// not — is not mistaken for a stall. HandleBlockDirect did this at the same
+	// point for every block; the head does it for every block now, because the
+	// parked ones never reach HandleBlockDirect. None of the park outcomes
+	// refreshes it again: a peer that answers with an endless stream of orphans
+	// is exactly what the stall detector exists to rotate, and parking must not
+	// judge a peer differently from discarding.
+	if sps, ok := sm.syncPeerStateFor(bmsg.peer); ok {
+		sps.updateLastBlockTime()
+	}
+
+	if p := sm.dispatcher.parentFor(&prevBlockHash); p != nil {
+		// The parent is still in the window, so it is not in the blockchain store
+		// yet and only the dispatcher knows its height.
+		d.height = p.height + 1
+
+		if sm.windowRoute(d.height) {
+			d.parent = p
+			d.windowed = true
+		}
+
+		return false, nil
+	}
+
+	if sm.dispatcher.inFlight(prevBlockHash) {
+		return false, nil
+	}
+
+	_, meta, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &prevBlockHash)
+	if err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound) {
+			sm.parkOrphanBlock(d, msgBlock)
+
+			return true, nil
+		}
+
+		sm.logger.Errorf("[handleBlockMsg][%s] failed to get block header for previous block %s: %s", bmsg.blockHash, prevBlockHash, err)
+
+		return true, sm.handleBlockMsgTail(d, errors.NewProcessingError("failed to get block header for previous block %s", prevBlockHash, err))
+	}
+
+	// No implementation returns a nil meta with a nil error, but this height decides
+	// whether the block takes the window route at all, so fail closed rather than derive
+	// it from a nil dereference. Mirrors the guard block validation already applies to the
+	// same lookup in processBlockFound.
+	if meta == nil {
+		return true, sm.handleBlockMsgTail(d, errors.NewProcessingError("[handleBlockMsg][%s] nil metadata for previous block %s", bmsg.blockHash, prevBlockHash))
+	}
+
+	d.height = meta.Height + 1
+	d.parent = &inflightParent{height: meta.Height}
+
+	// A windowed block whose parent is not in flight still has to start the window
+	// from an empty frontier: nothing before it in the frontier is its ancestor, so
+	// the ordering hand-shake would have nothing to wait on.
+	d.windowed = sm.windowRoute(d.height) && sm.dispatcher.frontierEmpty()
+
+	return false, nil
+}
+
+// parkOrphanBlock keeps a block whose parent is neither in the chain nor in
+// flight, and asks for the parent. It runs in the head, before the block is ever
+// dispatched, because it is the one step that needs the decoded block after the
+// pre-checks: the release of that block after dispatch is sound only because
+// nothing downstream reads it.
+//
+// While catching blocks this is typically the peer announcing its tip while we
+// are still behind — and in the legacy sync protocol that orphan tip doubles as
+// the batch-continuation signal: the peer pushes its tip inv after delivering a
+// getblocks batch and waits for the next getblocks before sending more.
+// Swallowing the orphan stalls the sync until the stall detector rotates the
+// peer, so it always ends with a getblocks from our best block. PushGetBlocksMsg
+// filters duplicate requests and the peer only invs blocks past the locator fork
+// point, so a redundant request costs one inv message at most.
+//
+// The block is kept instead of thrown away. It is checked before anything
+// reaches the disk, so a peer cannot fill the park with rubbish, and it is
+// committed from disk as soon as its parent lands.
+func (sm *SyncManager) parkOrphanBlock(d *blockDispatch, msgBlock *wire.MsgBlock) {
+	bmsg := d.msg
+	peer := d.peer
+	prevBlockHash := d.prevHash
+	catchingBlocks := d.catchingBlocks
+	removedFront := d.removedFront
+
+	entry := parkedBlock{
+		hash:      bmsg.blockHash,
+		prevBlock: prevBlockHash,
+		height:    sm.parkedBlockHeight(bmsg.blockHeight, bmsg.blockHash, removedFront),
+		// The resolved association primary, not bmsg.peer. A block
+		// delivered on a stream sub-peer (BlockPriority DATA1) carries
+		// that sub-peer, and sub-peers are not registered in peerStates
+		// — so noteCommittedParkedBlock's lookup missed and the height
+		// bookkeeping a committed block is supposed to do was silently
+		// skipped. The ledger records the primary too, which is the
+		// identity HasOwner and the reject path ask about.
+		peer: peer,
+		// The header node this block's arrival already took off the
+		// front, so whichever path eventually gives the block up can put
+		// it back. Without it a parked front block is unreachable: its
+		// header is gone from the list and from the index, and the
+		// rewind has nothing to work from.
+		removedFront: removedFront,
+	}
+
+	// Admit is the cheap half: the duplicate check, the byte budget and
+	// registering the entry. The stateless check and the blob write are
+	// the expensive half and they go to a parking worker, because this
+	// is the one goroutine that commits blocks in order and a gigabyte
+	// block spends minutes in those two steps.
+	stored, admitted := sm.blockPark.Admit(entry, msgBlock)
+
+	// The reject, like every other reject in handleBlockMsg, goes to the
+	// resolved primary rather than to a stream sub-peer, so it is
+	// applied to a copy of the entry that names it. Safe to copy because
+	// no write outcome touches a blob the caller is holding.
+	blamed := entry
+	blamed.peer = peer
+
+	switch admitted {
+	case admitNoRoom:
+		// The same table the drain and the sweep answer to: whether the
+		// blob survives, whether the walk goes back onto the block, and
+		// whether the peer hears about it. See block_park_policy.go.
+		disposition := parkWriteOutcome(parkUnavailable)
+
+		if catchingBlocks {
+			// While catching blocks handleBlockMsg suppresses every
+			// other reject, because we are replaying history rather than
+			// judging a peer's tip. Parking must not judge a peer
+			// differently from discarding.
+			disposition = disposition.withoutBlame()
+		}
+
+		sm.logger.Infof("Block %v has missing parent %v and was not kept (%s), requesting missing blocks",
+			bmsg.blockHash, prevBlockHash, disposition.reason)
+
+		// The block is being dropped, so put the download walk back on
+		// it. Without this the getblocks below is the only recovery
+		// there is, and in headers-first mode it is inert: processInvMsg
+		// returns before it can request anything, so the block is never
+		// asked for again.
+		sm.applyParkDisposition(blamed, disposition)
+
+	case admitAlreadyHeld:
+		sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
+
+		sm.fetchMoreHeaderBlocks(peer)
+
+	case admitRegistered:
+		sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
+
+		// The block is kept, so the walk must NOT be rewound onto it: it
+		// is already downloaded and the park commits it from disk when
+		// the parent lands. Every path that later gives the block up
+		// rewinds then instead. What does need doing is topping the
+		// pipeline back up, because this peer's in-flight count just
+		// dropped and nothing else will notice.
+		sm.fetchMoreHeaderBlocks(peer)
+
+		job := parkJob{
+			entry:          stored,
+			blamed:         blamed,
+			msgBlock:       msgBlock,
+			reply:          bmsg.reply,
+			catchingBlocks: catchingBlocks,
+		}
+
+		// The reply travels with the job, so the consumer does not
+		// answer for this block when the head returns. That is
+		// what holds the prefetch budget the decoded block is charged
+		// against until the worker has finished with it, rather than
+		// releasing it while a worker still holds a gigabyte of block.
+		bmsg.reply = nil
+
+		sm.submitParkJob(job)
+	}
+
+	// Parked or dropped, the parent still has to be asked for, and the
+	// getblocks is not an alternative to keeping the block — it is the
+	// only thing that fetches the gap. It is also the batch-continuation
+	// signal the legacy protocol runs on: the peer pushes its tip after
+	// a batch and then sends nothing at all until the next getblocks
+	// arrives. Sent in both modes, exactly as the drop path has always
+	// sent it, so turning the park on cannot change what a peer sees.
+	// Inside headers-first mode the reply is dropped by processInvMsg
+	// and the request costs one message; outside it — every node past
+	// the final checkpoint — it is the whole of the recovery, and
+	// fetchMoreHeaderBlocks above does nothing at all.
+	sm.requestMissingBlocks(peer, bmsg.blockHash)
+}
+
+// handleBlockMsg processes one queued block end to end on the calling goroutine:
+// head, work, tail. The dispatcher splits those three steps apart so up to K blocks
+// can be in flight; this serial form is what the tests that drive a single block
+// through the pipeline still use.
+func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
+	d, finished, err := sm.handleBlockMsgHead(bmsg)
+	if finished {
+		return err
+	}
+
+	// d.msg.peer is the delivering peer, which is what HandleBlockDirect has always
+	// been given; d.peer is its association's primary, for the tail's bookkeeping.
+	err = sm.HandleBlockDirect(sm.ctx, d.msg.peer, d.msg.blockHash, d.msgBlock, d.parent)
+
+	return sm.handleBlockMsgTail(d, err)
+}
+
+// handleBlockMsgTail is every chain-order step for one block: the failure
+// classification and reject/backoff decision, the cascade bookkeeping, the peer
+// height update, and the headers-first continuation. It runs on the consumer
+// goroutine in dispatch order, never on a worker, so headers-first state stays
+// single-threaded and blocks are accepted strictly in height order.
+func (sm *SyncManager) handleBlockMsgTail(d *blockDispatch, err error) error {
+	bmsg := d.msg
+	peer := d.peer
+	state := d.state
+	catchingBlocks := d.catchingBlocks
+	isCheckpointBlock := d.isCheckpoint
+	prevBlockHash := d.prevHash
+
+	if err != nil {
 		if errors.Is(err, errors.ErrBlockNotFound) {
-			// We don't have the parent of this block. While catching blocks
-			// this is typically the peer announcing its tip while we are
-			// still behind — and in the legacy sync protocol that orphan tip
-			// doubles as the batch-continuation signal: the peer pushes its
-			// tip inv after delivering a getblocks batch and waits for the
-			// next getblocks before sending more. Swallowing the orphan here
-			// stalls the sync until the stall detector rotates the peer, so
-			// always answer with a getblocks from our best block.
-			// PushGetBlocksMsg filters duplicate requests and the peer only
-			// invs blocks past the locator fork point, so a redundant
-			// request costs one inv message at most.
-			// Keep the block instead of throwing it away. It is checked before
-			// anything reaches the disk, so a peer cannot fill the park with
-			// rubbish, and it is committed from disk as soon as its parent
-			// lands.
-			entry := parkedBlock{
-				hash:      bmsg.blockHash,
-				prevBlock: prevBlockHash,
-				height:    bmsg.blockHeight,
-				// The resolved association primary, not bmsg.peer. A block
-				// delivered on a stream sub-peer (BlockPriority DATA1) carries
-				// that sub-peer, and sub-peers are not registered in peerStates
-				// — so noteCommittedParkedBlock's lookup missed and the height
-				// bookkeeping a committed block is supposed to do was silently
-				// skipped. The ledger records the primary too, which is the
-				// identity HasOwner and the reject path ask about.
-				peer: peer,
-				// The header node this block's arrival already took off the
-				// front, so whichever path eventually gives the block up can put
-				// it back. Without it a parked front block is unreachable: its
-				// header is gone from the list and from the index, and the
-				// rewind has nothing to work from.
-				removedFront: removedFront,
-			}
+			// The head resolved this block's parent as stored or in flight before
+			// the block was dispatched, so a missing parent here is not an orphan
+			// — the park owns those, and it decided before any of this ran. It is
+			// the parent going away between the head's lookup and the worker's, or
+			// something else in block validation surfacing as ErrBlockNotFound,
+			// which the park's own sweep already knows to be possible. Neither is
+			// a judgement on the block: put the walk back on it, throttled, and
+			// answer with the getblocks the orphan path has always sent.
+			sm.logger.Infof("Block %v has missing parent %v after dispatch, requesting missing blocks", bmsg.blockHash, prevBlockHash)
 
-			result := sm.blockPark.Park(sm.ctx, entry, msgBlock)
-
-			// The same table the drain and the sweep answer to: whether the
-			// blob survives, whether the walk goes back onto the block, and
-			// whether the peer hears about it. See block_park_policy.go.
-			d := parkWriteOutcome(result)
-
-			if catchingBlocks {
-				// While catching blocks handleBlockMsg suppresses every other
-				// reject, because we are replaying history rather than judging
-				// a peer's tip. Parking must not judge a peer differently from
-				// discarding.
-				d = d.withoutBlame()
-			}
-
-			// The reject, like every other reject in handleBlockMsg, goes to the
-			// resolved primary rather than to a stream sub-peer, so it is
-			// applied to a copy of the entry that names it. Safe to copy because
-			// every write outcome leaves the blob alone: whatever the park kept
-			// it kept under its own entry, and nothing the caller is holding is
-			// charged against the budget.
-			blamed := entry
-			blamed.peer = peer
-
-			if result == parkAccepted {
-				sm.logger.Infof("Block %v is waiting on its parent %v, parked", bmsg.blockHash, prevBlockHash)
-
-				// No stall-timer refresh here. HandleBlockDirect already
-				// refreshed it at receipt, before the parent lookup that made
-				// this an orphan, so a second refresh bought nothing — and a
-				// peer that answers with an endless stream of orphans is exactly
-				// what the stall detector exists to rotate. The drop path below
-				// has never refreshed it, and parking must not judge a peer
-				// differently from discarding.
-				sm.applyParkDisposition(blamed, d)
-
-				// The block is kept, so the walk must NOT be rewound onto it: it
-				// is already downloaded and the park commits it from disk when
-				// the parent lands. Every path that later gives the block up
-				// rewinds then instead. What does need doing is topping the
-				// pipeline back up, because this peer's in-flight count just
-				// dropped and nothing else will notice.
-				sm.fetchMoreHeaderBlocks(peer)
-			} else {
-				sm.logger.Infof("Block %v has missing parent %v and was not kept (%s), requesting missing blocks",
-					bmsg.blockHash, prevBlockHash, d.reason)
-
-				// The block is being dropped, so put the download walk back on
-				// it. Without this the getblocks below is the only recovery
-				// there is, and in headers-first mode it is inert: processInvMsg
-				// returns before it can request anything, so the block is never
-				// asked for again.
-				sm.applyParkDisposition(blamed, d)
-			}
-
-			// Parked or dropped, the parent still has to be asked for, and the
-			// getblocks is not an alternative to keeping the block — it is the
-			// only thing that fetches the gap. It is also the batch-continuation
-			// signal the legacy protocol runs on: the peer pushes its tip after
-			// a batch and then sends nothing at all until the next getblocks
-			// arrives. Sent in both modes, exactly as the drop path has always
-			// sent it, so turning the park on cannot change what a peer sees.
-			// Inside headers-first mode the reply is dropped by processInvMsg
-			// and the request costs one message; outside it — every node past
-			// the final checkpoint — it is the whole of the recovery, and
-			// fetchMoreHeaderBlocks above does nothing at all.
+			sm.dropBlockFromWalk(bmsg.blockHash, d.removedFront)
 			sm.requestMissingBlocks(peer, bmsg.blockHash)
 
 			return nil
@@ -2767,7 +3314,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 				// wasted work on a manager that is about to stop; on a
 				// mid-flight cancellation it is the only thing that asks for
 				// this block again.
-				sm.dropBlockFromWalk(bmsg.blockHash, removedFront)
+				sm.dropBlockFromWalk(bmsg.blockHash, d.removedFront)
 
 				return nil
 			}
@@ -2817,9 +3364,31 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 			// stalled sync peer is demoted rather than disconnected and
 			// demoteSyncPeer deliberately leaves the header state alone, so
 			// nothing calls resetHeaderState on that path at all.
-			sm.dropBlockFromWalk(bmsg.blockHash, removedFront)
+			//
+			// An aborted successor never ran a failing attempt of its own — a
+			// predecessor in the window failed — so it earns no backoff; the
+			// predecessor's backoff already throttles the whole run. It still
+			// needs its header back. It was the front when it arrived, because
+			// its parent was in flight and so already off the list, and the
+			// parent's own drop has just put the parent's header back in front of
+			// where this one belongs. Without this rewind the walk would run from
+			// the retried parent straight past this block to its children, every
+			// one of which would then park behind a parent nothing asks for.
+			if d.aborted {
+				sm.rewindHeaderCursor(bmsg.blockHash, d.removedFront)
+			} else {
+				sm.dropBlockFromWalk(bmsg.blockHash, d.removedFront)
+			}
 
-			sm.logger.Errorf("Failed to process new block in service blockQueueMsg %v: %v", bmsg.blockHash, err)
+			// An aborted successor is not a failure worth an ERROR line: the one
+			// root failure was already logged by the predecessor's own tail, and at
+			// depth K every head failure would otherwise print K-1 misleading
+			// ERRORs (the same argument as the #1333 cascade suppression).
+			if d.aborted {
+				sm.logger.Debugf("Block %v aborted: a predecessor in the window failed: %v", bmsg.blockHash, err)
+			} else {
+				sm.logger.Errorf("Failed to process new block in service blockQueueMsg %v: %v", bmsg.blockHash, err)
+			}
 
 			// Blame the first deliverer only. The rewind above means the walk
 			// hands this hash out again once its backoff expires, and the caller
@@ -2897,6 +3466,16 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockQueueMsg) error {
 
 	heightUpdate = bmsg.blockHeight
 	blkHashUpdate = &bmsg.blockHash
+
+	if heightUpdate <= 0 && d.height > 0 {
+		// The head already resolved this block's height from its parent, so the
+		// lookup below is a round trip we do not have to make.
+		if h, cerr := safeconversion.Uint32ToInt32(d.height); cerr != nil {
+			sm.logger.Errorf(failedToConvertBlockHeightInt32Msg, cerr)
+		} else {
+			heightUpdate = h
+		}
+	}
 
 	if heightUpdate <= 0 {
 		// get the height of the new block from the blockchain store
@@ -3204,6 +3783,22 @@ func (sm *SyncManager) drainPendingCheckpoint() {
 	}
 }
 
+// consumeQueuedBlock is the block-queue consumer's whole turn: process the
+// block, settle the backlog accounting, and answer the caller.
+//
+// Extracted from blockHandler's select so the accounting can be tested without
+// standing the handler up, because the rule it enforces is easy to get wrong and
+// was wrong until recently.
+func (sm *SyncManager) consumeQueuedBlock(msg *blockQueueMsg) {
+	sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
+
+	err := sm.processQueuedBlock(msg)
+
+	// The rule itself lives in finishBlockMsg, which the dispatcher's tail ends
+	// with too, so the two consumers cannot drift on what counts as progress.
+	sm.finishBlockMsg(msg, err)
+}
+
 // processQueuedBlock is what the block-queue consumer does with one block:
 // commit it, and then commit everything that was parked waiting for it.
 //
@@ -3350,15 +3945,33 @@ func (sm *SyncManager) removeHeaderAnchorLocked() {
 // Without it a parked block is a silent loss of one in-flight slot, and the
 // pipeline drains one block at a time until nothing is outstanding at all.
 //
-// All three of its callers — a block accepted into the park, a parked block
-// committed off disk, and the park sweep's ticker carrying a rewound cursor
-// forward — can run while the round's anchor is still the front of the header
-// list, so the check that says "not yet" lives here rather than in any one of
-// them. It is deliberately not the check the ticker makes: "the cursor is on the
-// front" is true of a rewound cursor and false of an ordinary forward walk,
-// which is right for driving the walk from a timer and would silently switch off
-// the top-up this function exists for.
+// Both of its callers, a block accepted into the park and a parked block
+// committed off disk, can run while the round's anchor is still the front of the
+// header list, so the check that says "not yet" lives in topUpHeaderBlocks below
+// rather than in either of them. It is deliberately not the check the sweep
+// ticker used to make: "the cursor is on the front" is true of a rewound cursor
+// and false of an ordinary forward walk, which is right for driving the walk
+// from a timer and would silently switch off the top-up this function exists
+// for.
+//
+// The sweep ticker's resume does NOT come through here, because the per-peer
+// question this asks is the wrong one for it. See resumeHeaderWalk.
 func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
+	sm.topUpHeaderBlocks(func() bool {
+		return sm.blockDownloads.CountForPeer(peer) < sm.blockSizeTracker.calculateMaxInFlightBlocks()
+	})
+}
+
+// topUpHeaderBlocks is fetchMoreHeaderBlocks with the "has this peer got room"
+// question left to the caller, because the sweep's walk resume asks a different
+// one: not whether one named peer has room, but whether the node has anywhere to
+// put a block at all. A nil gate means the download assigner is the only gate,
+// which is what fetchHeaderBlocks consults anyway.
+//
+// Everything else is common to both and stays here: the walk only runs in
+// headers-first mode, and never while the round's anchor is still the front of
+// the list.
+func (sm *SyncManager) topUpHeaderBlocks(hasRoom func() bool) {
 	if !sm.headersFirstMode.Load() || sm.blockSizeTracker == nil {
 		return
 	}
@@ -3368,13 +3981,15 @@ func (sm *SyncManager) fetchMoreHeaderBlocks(peer *peerpkg.Peer) {
 	anchorIsStillTheFront := sm.anchorIsStillTheFrontLocked()
 	sm.headerMu.Unlock()
 
-	if anchorIsStillTheFront {
+	if anchorIsStillTheFront || !haveMoreHeaders {
 		return
 	}
 
-	if haveMoreHeaders && sm.blockDownloads.CountForPeer(peer) < sm.blockSizeTracker.calculateMaxInFlightBlocks() {
-		sm.fetchHeaderBlocks()
+	if hasRoom != nil && !hasRoom() {
+		return
 	}
+
+	sm.fetchHeaderBlocks()
 }
 
 // reinsertHeaderLocked puts a header node that left the list back into it, and
@@ -3665,6 +4280,89 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	assigner.send(sm)
 }
 
+// parkedBlockHeight is the height to record against a block being parked, and it
+// exists because the obvious source is empty.
+//
+// The queue message's height comes from the decoded block, and a legacy block is
+// built by bsvutil.NewBlockFromBlockAndBytes with no height set, so it arrives as
+// BlockHeightUnknown. parkedBlock.height's own comment has always conceded it is
+// "often 0". Anything that judges a parked block by its height therefore judges
+// nothing at all, which is how a height rule can look correct and do nothing.
+//
+// Two sources that do have it. The header node this block's arrival took off the
+// front travels with the entry already, for the rewind, and carries its height.
+// For a block that was never the front, the header index still holds its node.
+// Between them, every block fetched through the header walk has a height.
+//
+// A block with no height anywhere is left at whatever was reported. Restart
+// recovery is the honest case: those entries are rebuilt from disk with no header
+// list behind them, and a height guessed for them would be worse than none.
+func (sm *SyncManager) parkedBlockHeight(reported int32, hash chainhash.Hash, removedFront *headerNode) int32 {
+	if reported > 0 {
+		return reported
+	}
+
+	if removedFront != nil && removedFront.height > 0 {
+		return removedFront.height
+	}
+
+	sm.headerMu.Lock()
+	defer sm.headerMu.Unlock()
+
+	if element, ok := sm.headerIndex[hash]; ok && element != nil {
+		if node, isHeaderNode := element.Value.(*headerNode); isHeaderNode && node.height > 0 {
+			return node.height
+		}
+	}
+
+	return reported
+}
+
+// readAheadBudgetExhausted reports whether this node is already holding, or is
+// already owed, as many bytes of blocks as it is allowed to read ahead.
+//
+// The height ceiling beside it counts BLOCKS, which is the wrong unit once a
+// block can be a gigabyte: the same window is 200 MB in 2015 and a terabyte in
+// 2022. SV Node has only the block count, and gets away with it because storing
+// an early block costs it one ordinary disk write into the same file an in-order
+// block goes to. Here an early block is held in the park until everything below
+// it lands, so the bytes are what has to be bounded.
+//
+// Both halves are needed. Parked bytes are what is already on disk; bytes in
+// flight are what is about to be, and leaving them out lets one round request
+// far past the budget and only discover it on delivery, after the merkle
+// rebuild has already been paid for.
+//
+// The in-flight half is an estimate and cannot be anything else: a block's size
+// is not known until it arrives. The rolling average of recently delivered
+// blocks is the best available reading and is the same one the per-peer
+// in-flight cap is derived from, so the two agree about what a block costs.
+func (sm *SyncManager) readAheadBudgetExhausted() bool {
+	if sm.settings == nil {
+		return false
+	}
+
+	budget := sm.settings.Legacy.BlockDownloadMaxBytes
+	if budget <= 0 {
+		return false
+	}
+
+	held := sm.blockPark.Bytes()
+
+	var owed int64
+	if sm.blockSizeTracker != nil {
+		owed = int64(sm.blockDownloads.Len()) * sm.blockSizeTracker.getAverageSize()
+	}
+
+	if held+owed < budget {
+		return false
+	}
+
+	sm.logger.Debugf("[fetchHeaderBlocks] read-ahead budget reached: %d parked plus %d owed against %d, holding the walk", held, owed, budget)
+
+	return true
+}
+
 // lookaheadCeilingLocked returns the highest block height this round may ask for,
 // and whether there is a limit at all. The caller must hold headerMu.
 //
@@ -3725,6 +4423,13 @@ func (sm *SyncManager) snapshotHeaderCandidates(limit int) (hashes []chainhash.H
 
 	anchor = sm.startHeader
 	if anchor == nil {
+		return nil, nil, chainhash.Hash{}, false
+	}
+
+	// Asked once rather than per header: it is a property of the node, not of
+	// the header being considered. Returning nothing leaves the cursor exactly
+	// where it is, which is the same shape as running out of peer budget.
+	if sm.readAheadBudgetExhausted() {
 		return nil, nil, chainhash.Hash{}, false
 	}
 
@@ -4576,70 +5281,28 @@ func (sm *SyncManager) blockHandler() {
 	// create a block queue to handle block messages in a separate goroutine, in order
 	blockQueue := make(chan *blockQueueMsg, maxBlockQueue)
 
+	// The dispatcher owns the block queue from here: it runs every pre-check and
+	// every chain-order step on this one goroutine and hands only the block's own
+	// work (HandleBlockDirect) to a worker, so up to K consecutive below-checkpoint
+	// blocks can have their UTXO store work in flight while their tails still run in
+	// dispatch order. Nil-guarded because tests build SyncManager as a struct
+	// literal that bypasses New().
+	if sm.dispatcher == nil {
+		sm.dispatcher = newBlockDispatcher(sm)
+	}
+
 	// start the block queue handler
-	go func() {
-		// The park sweep runs on THIS goroutine, not the outer handler below,
-		// because committing a block is minutes of work and the outer handler
-		// dispatches disconnects, invs, headers and tx for every peer.
-		parkSweep := time.NewTicker(parkSweepInterval)
-		defer parkSweep.Stop()
+	go sm.dispatchBlocks(blockQueue)
 
-		for {
-			select {
-			case <-sm.quit:
-				// Best-effort drain of already-queued blocks with an error reply
-				// before exiting. Under prefetch each queued block has an
-				// awaitBlockResult goroutine holding budget and waiting on its
-				// reply; replying here lets them exit promptly on shutdown instead
-				// of waiting for the peer's quit/ctx to fire. The feeder (the outer
-				// loop) races the same sm.quit close, so a block it enqueues after
-				// this drain returns is not caught here — that block's
-				// awaitBlockResult still exits via sp.quit/sp.ctx.Done() (the
-				// backstop), and the feeder's enqueue is itself sm.quit-guarded so
-				// it can never deadlock. This drain only makes the common case
-				// prompt; it is not relied on for correctness.
-				for {
-					select {
-					case msg := <-blockQueue:
-						// Keep the backlog decrement and its progress stamp paired
-						// on every completion path (here the shutdown drain) so the
-						// liveness invariant holds uniformly; rotation is moot during
-						// shutdown, but the uniform pairing is easier to reason about.
-						sm.blockBacklog.Add(-1)
-						sm.noteBacklogProgress()
-
-						if msg.reply != nil {
-							msg.reply <- errors.NewServiceError("sync manager shutting down")
-						}
-					default:
-						return
-					}
-				}
-			case <-parkSweep.C:
-				sm.sweepParkedBlocks(time.Now())
-				// A rewind — from the sweep just above, or from a block given up
-				// on since the last tick — moves the download cursor back and
-				// sends nothing. This is what carries it out. See
-				// resumeHeaderWalk.
-				sm.resumeHeaderWalk()
-
-			case msg := <-blockQueue:
-				sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsg", msg.blockHash)
-
-				err := sm.processQueuedBlock(msg)
-
-				// A completion advances the backlog: stamp it so the stall check
-				// treats the pipeline as live for another window (see
-				// noteBacklogProgress / localReadBackpressured).
-				sm.blockBacklog.Add(-1)
-				sm.noteBacklogProgress()
-
-				if msg.reply != nil {
-					msg.reply <- err
-				}
-			}
-		}
-	}()
+	// The park sweep gets a goroutine of its own rather than a ticker arm on the
+	// consumer. It used to share the goroutine that committed blocks in order,
+	// and a slow tick there held up commits; under the dispatcher that goroutine
+	// admits blocks, and the ordering guarantee comes from block validation's own
+	// single committer, so a slow tick there would only delay admission of blocks
+	// that have nothing to do with the park. The sweep decides, looks parents up,
+	// evicts and deletes on its own; the one thing it may not do is commit, and
+	// it posts those back to the consumer through parkCommits.
+	go sm.runParkSweep()
 
 out:
 	for {
@@ -4698,9 +5361,7 @@ out:
 				// completions advance processing, so letting a peer refresh the
 				// liveness signal merely by feeding more blocks into a hung
 				// pipeline would mask the hang.
-				if sm.blockBacklog.Add(1) == 1 {
-					sm.noteBacklogProgress()
-				}
+				sm.blockBacklog.Add(1)
 
 				// Guard the enqueue with sm.quit. This is the sole feeder of
 				// blockQueue; without the guard, a full queue whose consumer has
@@ -4716,14 +5377,12 @@ out:
 					reply:       msg.reply,
 				}:
 				case <-sm.quit:
-					// Enqueue aborted on shutdown: undo the Add(1) above and keep
-					// the decrement paired with its progress stamp, matching every
-					// other completion path (uniform invariant; harmless here).
+					// Enqueue aborted on shutdown: undo the Add(1) above. Nothing
+					// committed, so nothing is stamped.
 					sm.blockBacklog.Add(-1)
-					sm.noteBacklogProgress()
 
 					if msg.reply != nil {
-						msg.reply <- errors.NewServiceError("sync manager shutting down")
+						msg.reply <- errors.NewServiceError(syncManagerShuttingDownMsg)
 					}
 				}
 
@@ -4972,16 +5631,46 @@ func (sm *SyncManager) ReleaseBlockPrefetch(blockHash chainhash.Hash, weight int
 	sm.blockPrefetchBudget.Release(weight)
 }
 
-// noteBacklogProgress records that the block backlog just advanced — a block was
-// enqueued to open a fresh backpressure window, or one finished processing. It
-// must run on every backlog transition that constitutes progress: the 0->1
-// enqueue and every completion decrement. localReadBackpressured treats a stamp
-// older than blockProcessingStallTimeout as a hung pipeline rather than
-// slow-but-progressing validation, so keeping this current is what lets the
-// stall detector distinguish the two. Enqueues into an already-non-empty backlog
-// deliberately do NOT call this (only completions advance processing).
-func (sm *SyncManager) noteBacklogProgress() {
-	sm.lastBacklogProgress.Store(time.Now().UnixNano())
+// noteCommittedHeight records the height of a block that has just joined the
+// chain, and never moves backwards. A reorg lowers the tip, and a floor that
+// followed it down would start keeping blocks it had already been right to
+// drop; leaving it where it is costs a little disk and nothing else.
+func (sm *SyncManager) noteCommittedHeight(height int32) {
+	for {
+		current := sm.lastCommittedHeight.Load()
+		if height <= current {
+			return
+		}
+
+		if sm.lastCommittedHeight.CompareAndSwap(current, height) {
+			return
+		}
+	}
+}
+
+// noteChainProgress records that a block joined the chain. Nothing else counts,
+// and the name is the whole of the rule.
+//
+// localReadBackpressured reads it to tell slow-but-progressing validation from a
+// hung pipeline, and suppresses the sync-peer stall check while the former is
+// true. It used to be stamped by any queue message finishing, which was right
+// while every finished message was a commit and became wrong when the park
+// started deferring blocks instead: a node doing nothing but parking looked
+// exactly like a node committing steadily.
+//
+// The stamp is shared across peers, which is what made that worse than it
+// sounds. One peer's stream of out-of-order blocks kept the suppression open
+// over a different peer's silence, so the stall check never ran and the silent
+// peer was never rotated.
+//
+// What this does NOT do is rotate a peer that keeps delivering out-of-order
+// blocks. HandleBlockDirect refreshes that peer's own last-block time at
+// receipt, deliberately, so a multi-gigabyte block's minutes of validation are
+// not read as a stall. A peer that answers every request is doing what was asked
+// of it; a peer that answers nothing for maxLastBlockTime is the one this
+// restores rotation for.
+func (sm *SyncManager) noteChainProgress() {
+	sm.lastChainProgress.Store(time.Now().UnixNano())
 }
 
 // blockProcessingStallTimeout is how long a non-empty block backlog may go
@@ -5039,7 +5728,7 @@ func (sm *SyncManager) localReadBackpressured() bool {
 			return true
 		}
 
-		return time.Since(time.Unix(0, sm.lastBacklogProgress.Load())) < sm.blockProcessingStallTimeout()
+		return time.Since(time.Unix(0, sm.lastChainProgress.Load())) < sm.blockProcessingStallTimeout()
 	}
 
 	// Under prefetch also suppress while a read-loop is parked in
@@ -5161,8 +5850,9 @@ func (sm *SyncManager) QueueHeaders(headers *wire.MsgHeaders, peer *peerpkg.Peer
 // hour.
 //
 // This runs on the caller's goroutine, which is the peer's read loop. It takes
-// the download ledger's leaf lock and then, released, the header lock; both are
-// held for pure in-memory work, so the read loop is never parked on I/O.
+// the peer-state map, the download ledger's leaf lock and then, released, the
+// header lock; all three are held for pure in-memory work, so the read loop is
+// never parked on I/O.
 //
 // With the fan-out off, the sync peer is the only peer ever asked for a body and
 // asking it again for a block it has just said it does not have has nowhere else
@@ -5178,6 +5868,24 @@ func (sm *SyncManager) NotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) 
 		return
 	}
 
+	// The ledger is keyed by association primaries, so a notfound arriving on a
+	// stream sub-peer has to be resolved before anything is asked of it. Under
+	// the BlockPriority policy the getdata goes out on one stream and the reply
+	// can land on another, and every sibling receive path resolves first for
+	// exactly that reason. Without this the loop below matches nothing, and the
+	// handler silently does the one thing it was written to stop: the peer keeps
+	// the assignment for the whole ownership ceiling, its in-flight slot stays
+	// charged, and the hash sits behind the forward-only cursor with nobody
+	// owing it.
+	//
+	// A peer we have no state for resolves to itself, which is the behaviour this
+	// handler already had: whatever that peer owes the ledger is still released,
+	// and a peer that owes nothing releases nothing either way.
+	_, owner, _ := sm.peerStateResolvingPrimary(peer)
+	if owner != peer {
+		sm.logger.Debugf("[NotFound] resolved stream peer %s to primary peer %s", peer, owner)
+	}
+
 	released := make([]chainhash.Hash, 0, len(notFound.InvList))
 
 	for _, iv := range notFound.InvList {
@@ -5185,11 +5893,11 @@ func (sm *SyncManager) NotFound(notFound *wire.MsgNotFound, peer *peerpkg.Peer) 
 			continue
 		}
 
-		if !sm.blockDownloads.HasOwner(peer, iv.Hash) {
+		if !sm.blockDownloads.HasOwner(owner, iv.Hash) {
 			continue
 		}
 
-		sm.blockDownloads.RemoveOwner(peer, iv.Hash)
+		sm.blockDownloads.RemoveOwner(owner, iv.Hash)
 
 		released = append(released, iv.Hash)
 	}
@@ -5251,6 +5959,11 @@ func (sm *SyncManager) Stop() error {
 	sm.logger.Infof("Sync manager shutting down")
 	close(sm.quit)
 	<-sm.handlerDone
+
+	// The workers select on sm.quit, and one that is mid-write finishes that
+	// write first: the blob store call carries its own deadline, so this waits
+	// for at most legacy_parkStoreTimeout.
+	sm.parkWorkers.Wait()
 
 	sm.orphanTxs.Stop()
 	sm.requestedTxns.Stop()
@@ -5377,6 +6090,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	blockAssembly blockassembly.ClientI, config *Config) (*SyncManager, error) {
 	initPrometheusMetrics()
 
+	// One ceiling, derived from the same settings inputs as the peer layer's
+	// download budget, so the ledger cannot expire an assignment while that
+	// budget is still legitimately keeping the same transfer alive. The
+	// raced-block grace is the same figure by definition; see racedBlockGraceTTL.
+	assignmentCeiling := blockRequestAssignmentCeiling(tSettings, config.ChainParams)
+
 	sm := SyncManager{
 		ctx:          ctx,
 		settings:     tSettings,
@@ -5386,11 +6105,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		chainParams:    config.ChainParams,
 		rejectedTxns:   txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns), // limit map size to maxRejectedTxns
 		requestedTxns:  expiringmap.New[chainhash.Hash, struct{}](10 * time.Second),   // give peers 10 seconds to respond
-		blockDownloads: newBlockDownloadTracker(blockRequestAssignmentTTL),
+		blockDownloads: newBlockDownloadTracker(assignmentCeiling),
 		peerStates:     txmap.NewSyncedMap[*peerpkg.Peer, *peerSyncState](),
 		// Peers we asked for a second copy of a stalled block, so their late
 		// copy is dropped rather than costing them their connection.
-		racedBlocks: expiringmap.New[chainhash.Hash, map[*peerpkg.Peer]struct{}](racedBlockGraceTTL).WithMaxSize(racedBlockGraceMaxTracked),
+		racedBlocks: expiringmap.New[chainhash.Hash, map[*peerpkg.Peer]struct{}](assignmentCeiling).WithMaxSize(racedBlockGraceMaxTracked),
 		// progressLogger:  newBlockProgressLogger("Processed", log),
 		msgChan:          make(chan interface{}, maxMsgQueueSize),
 		headerList:       list.New(),
@@ -5500,6 +6219,15 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// (#1333). Like blockFailureBackoff this starts a background eviction goroutine
 	// stopped only via Stop(), so build it after the last fallible step above.
 	sm.recentlyFailedBlocks = expiringmap.New[chainhash.Hash, struct{}](recentlyFailedBlocksTTL).WithMaxSize(blockFailureBackoffMaxTracked)
+
+	// The dispatcher holds a pointer to the manager returned below, so it must be
+	// built from &sm, not from the local value.
+	sm.dispatcher = newBlockDispatcher(&sm)
+	// Below GetBestBlockHeader for the same reason the two maps above are: a
+	// goroutine started before the last fallible step leaks when that step
+	// returns an error, because the caller receives a nil SyncManager and can
+	// never call Stop.
+	sm.startParkWorkers(tSettings.Legacy.ParkWorkers)
 
 	if !config.DisableCheckpoints {
 		bestBlockHeightInt32, err := safeconversion.Uint32ToInt32(bestBlockHeaderMeta.Height)
@@ -5883,5 +6611,17 @@ func (sm *SyncManager) samplePeerThroughput() {
 
 	for p, state := range sm.peerStates.Range() {
 		state.sampleThroughput(p)
+	}
+}
+
+// violationNames renders which stall arms tripped, for one log line.
+func violationNames(networkSpeed, lastBlockTime bool) string {
+	switch {
+	case networkSpeed && lastBlockTime:
+		return "network speed and last-block-time"
+	case networkSpeed:
+		return "network speed"
+	default:
+		return "last-block-time"
 	}
 }

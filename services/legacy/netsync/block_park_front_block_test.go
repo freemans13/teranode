@@ -129,6 +129,11 @@ func TestSyncManager_AParkedBlobThatIsNotTheBlockItClaimsIsGivenUp(t *testing.T)
 
 			front := h.parkFrontBlock(t)
 
+			// After the block is parked, not before: the same lookup decides
+			// whether the block parks at all, and a parent that resolves on
+			// arrival means the block commits instead of parking.
+			h.chainHolds(t, prev)
+
 			tc.corrupt(t, h, filepath.Join(h.parkDir, front.String()+".msgBlock"))
 
 			getDataBefore := h.rec.getDataCount()
@@ -173,6 +178,10 @@ func TestSyncManager_AParkedFrontBlockThatFailsValidationIsGivenUpAndRejected(t 
 	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 
 	h.parkFrontBlock(t)
+
+	// After the block is parked, not before: the same lookup decides whether the
+	// block parks at all.
+	h.chainHolds(t, prev)
 
 	getDataBefore := h.rec.getDataCount()
 

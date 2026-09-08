@@ -39,6 +39,11 @@ type parkWiringHarness struct {
 	// without disturbing the blob itself. Pass-through until a test says
 	// otherwise, so every other test in this file is unaffected.
 	store *parkReadFaultStore
+	// noSuchBlock is the catch-all GetBlockHeader expectation. testify matches
+	// the first registered expectation whose arguments fit, so a per-hash answer
+	// added later would never be reached while this one stands. chainHolds
+	// unsets it, adds the specific answer, and puts it back behind.
+	noSuchBlock *mock.Call
 }
 
 func newParkWiringHarness(t *testing.T, parkOn bool) *parkWiringHarness {
@@ -68,7 +73,7 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	client.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return([]*chainhash.Hash{{}}, nil)
 	// Nothing is stored, so every parent lookup fails the way it does for a
 	// block that arrives before its parent.
-	client.On("GetBlockHeader", mock.Anything, mock.Anything).
+	noSuchBlock := client.On("GetBlockHeader", mock.Anything, mock.Anything).
 		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
 
 	root := t.TempDir()
@@ -121,7 +126,46 @@ func newParkWiringHarnessInState(t *testing.T, parkOn bool, fsmState blockchain2
 	sm.headerMu.Unlock()
 	sm.headersFirstMode.Store(true)
 
-	return &parkWiringHarness{sm: sm, client: client, peer: syncPeer, rec: rec, parkDir: parkDirectory(storeURL), blocks: blocks, store: store}
+	return &parkWiringHarness{sm: sm, client: client, peer: syncPeer, rec: rec, parkDir: parkDirectory(storeURL), blocks: blocks, store: store, noSuchBlock: noSuchBlock}
+}
+
+// chainHolds makes the blockchain answer that it has this block, and that the
+// block is valid.
+//
+// The sweep asks GetBlockHeader rather than GetBlockExists because invalidation
+// is a flag on the row and not a delete, so existence alone cannot say whether a
+// parent is usable. The harness answers "no such block" for everything by
+// default, and testify serves the first matching expectation, so making one hash
+// resolve means taking the catch-all out and putting it back behind the specific
+// answer.
+func (h *parkWiringHarness) chainHolds(t *testing.T, hash chainhash.Hash) {
+	t.Helper()
+
+	h.noSuchBlock.Unset()
+
+	h.client.On("GetBlockHeader", mock.Anything, &hash).
+		Return(&model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}},
+			&model.BlockHeaderMeta{Height: 1}, nil)
+
+	h.noSuchBlock = h.client.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
+}
+
+// chainHoldsInvalid is the same, for a parent this node has stored and rejected.
+// A parked block behind one of those can never be committed, however long it is
+// held, and committing it on the strength of the parent merely existing is the
+// hole the pair closes.
+func (h *parkWiringHarness) chainHoldsInvalid(t *testing.T, hash chainhash.Hash) {
+	t.Helper()
+
+	h.noSuchBlock.Unset()
+
+	h.client.On("GetBlockHeader", mock.Anything, &hash).
+		Return(&model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}},
+			&model.BlockHeaderMeta{Height: 1, Invalid: true}, nil)
+
+	h.noSuchBlock = h.client.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewBlockNotFoundError("no such block"))
 }
 
 // deliver feeds one block through the block-queue consumer's own path.
@@ -340,7 +384,7 @@ func TestHandleBlockDirect_ToleratesANilPeer(t *testing.T) {
 	h.sm.settings.BlockValidation.IsParentMinedRetryBackoffDuration = time.Millisecond
 
 	require.NotPanics(t, func() {
-		err := h.sm.HandleBlockDirect(context.Background(), nil, hash, msgBlock)
+		err := h.sm.HandleBlockDirect(context.Background(), nil, hash, msgBlock, nil)
 		require.Error(t, err, "the parent is not mined, so this must fail there — not on a nil peer")
 	})
 }
@@ -363,17 +407,29 @@ func TestSyncManager_TheSweepCommitsABlockWhoseParentTurnedUpQuietly(t *testing.
 	// The parent is in the chain, but nothing in this node committed it, so no
 	// drain was ever triggered.
 	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
+	h.chainHolds(t, h.blocks[1].MsgBlock().Header.PrevBlock)
 
 	h.sm.sweepParkedBlocks(time.Now().Add(parkStuckThreshold + time.Second))
 
 	require.Zero(t, h.sm.blockPark.Len(),
-		"a parked block whose parent is in the chain must be committed by the sweep, not left to expire")
+		"a parked block whose parent is in the chain must be committed by the sweep, not left waiting")
 }
 
-// TestSyncManager_TheSweepGivesUpOnABlockWhoseParentNeverArrives: the park is
-// bounded in time as well as in bytes, and giving a block up must leave it
-// re-requestable rather than simply losing it.
-func TestSyncManager_TheSweepGivesUpOnABlockWhoseParentNeverArrives(t *testing.T) {
+// TestSyncManager_TheSweepKeepsABlockWhoseParentIsMerelyLate is the inversion of
+// what this test used to assert, and the inversion is the change.
+//
+// The park used to give a block up after thirty minutes and re-request it. That
+// answered the wrong question: it asked how long the block had been waiting,
+// when what matters is whether it can still be used. A block whose parent is
+// late can still be used, however long it has waited, so throwing it away only
+// bought a second download of a block already on disk — 39 of them in one
+// measured 19-minute window on mainnet.
+//
+// So a late parent is no longer a reason to drop anything. What bounds the park
+// is legacy_blockDownloadMaxBytes, which stops the walk asking for more rather
+// than discarding what it has, and the two rules that can actually be decided:
+// the chain going past the block, and its parent turning out to be invalid.
+func TestSyncManager_TheSweepKeepsABlockWhoseParentIsMerelyLate(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
 	child := h.blocks[1].MsgBlock().BlockHash()
@@ -383,20 +439,26 @@ func TestSyncManager_TheSweepGivesUpOnABlockWhoseParentNeverArrives(t *testing.T
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
-	h.sm.sweepParkedBlocks(time.Now().Add(parkEntryTTL + time.Second))
+	held := h.sm.blockPark.Bytes()
+	require.Positive(t, held)
 
-	require.Zero(t, h.sm.blockPark.Len())
-	require.Zero(t, h.sm.blockPark.Bytes())
-
-	for _, name := range parkDirEntries(t, h.parkDir) {
-		require.NotContains(t, name, child.String(), "a block given up on must not leave its blob behind")
+	// Many ticks, well past the half hour the old timer allowed, and the parent
+	// still absent throughout.
+	for tick := 0; tick < 80; tick++ {
+		h.sm.sweepParkedBlocks(time.Now().Add(time.Duration(tick) * parkSweepInterval))
 	}
+
+	require.Equal(t, 1, h.sm.blockPark.Len(),
+		"a block whose parent is merely late must be kept, however long it waits")
+	require.Equal(t, held, h.sm.blockPark.Bytes(), "and it keeps its place in the byte budget")
+
+	require.Contains(t, parkDirEntries(t, h.parkDir), child.String()+".msgBlock",
+		"its blob stays on disk, because downloading it again is the cost this avoids")
 
 	h.sm.headerMu.Lock()
 	startHeader := h.sm.startHeader
 	h.sm.headerMu.Unlock()
 
-	require.NotNil(t, startHeader)
-	require.Equal(t, child.String(), startHeader.Value.(*headerNode).hash.String(),
-		"a block given up on must be back in front of the download walk, or nothing ever asks for it again")
+	require.Nil(t, startHeader,
+		"and the walk is not rewound onto it, because we already have it")
 }
