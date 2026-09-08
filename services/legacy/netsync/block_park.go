@@ -693,18 +693,11 @@ func (p *blockPark) TakeChildren(parent chainhash.Hash) []parkedBlock {
 	var kept []chainhash.Hash
 
 	for _, h := range hashes {
-		entry, ok := p.entries[h]
+		entry, ok := p.committableChildLocked(h)
 		if !ok {
-			continue
-		}
-
-		if entry.writing {
-			// Remember that this drain happened and was refused. It is driven by
-			// a commit that has already been made, so it will not come round
-			// again on its own, and whoever finishes the write has to ask for it.
-			entry.parentDrained = true
-
-			kept = append(kept, h)
+			if entry != nil {
+				kept = append(kept, h)
+			}
 
 			continue
 		}
@@ -722,6 +715,66 @@ func (p *blockPark) TakeChildren(parent chainhash.Hash) []parkedBlock {
 	p.setGauges()
 
 	return taken
+}
+
+// committableChildLocked answers whether one child hash may be committed now, and
+// applies the writing rule when it may not. The caller holds mu.
+//
+// Three answers, and the middle one is why this is a function rather than an
+// inline test. A hash with no entry is gone and its edge goes with it: (nil,
+// false). A hash whose bytes are not on disk yet is not committable but its edge
+// must stay, and the refused drain has to be remembered, because the drain is
+// driven by a commit that has already happened and will not come round again on
+// its own: (entry, false). Anything else is committable: (entry, true).
+//
+// It exists because two callers now ask this question, the drain that takes every
+// child at once and the drain step that peeks one at a time, and a divergence
+// between them is exactly the hole that registering an entry before its write
+// exists to close.
+func (p *blockPark) committableChildLocked(child chainhash.Hash) (*parkedBlock, bool) {
+	entry, ok := p.entries[child]
+	if !ok {
+		return nil, false
+	}
+
+	if entry.writing {
+		entry.parentDrained = true
+
+		return entry, false
+	}
+
+	return entry, true
+}
+
+// FirstChildFor returns a copy of the first child of parent that may be committed
+// now, without removing it from the index. It reports false when the parent has no
+// child that is ready.
+//
+// Peek, then claim, and the order is the whole point. Claiming first and asking
+// the dispatcher for admission second leaves a refused block stranded: out of the
+// index, blob on disk, still charged against the park's budget, no cursor rewind,
+// and nothing to recover it until the process restarts. That is not a corner case
+// under a one-deep window, which is what the block-size ladder forces in a
+// giant-block era, because the depth arm refuses every candidate while anything
+// else is in flight.
+//
+// The copy carries the size Admit already computed, which is what the byte arm of
+// the admission test needs and would otherwise read as zero.
+func (p *blockPark) FirstChildFor(parent chainhash.Hash) (parkedBlock, bool) {
+	if p == nil {
+		return parkedBlock{}, false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, h := range p.children[parent] {
+		if entry, ok := p.committableChildLocked(h); ok {
+			return *entry, true
+		}
+	}
+
+	return parkedBlock{}, false
 }
 
 // Restore puts a block the caller could not commit back in the index. Used when

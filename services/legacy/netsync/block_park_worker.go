@@ -64,7 +64,7 @@ func (sm *SyncManager) startParkWorkers(workers int) {
 
 	// One slot per commit a sweep tick can post, so a tick never waits on the
 	// consumer for room and the consumer never waits on the sweep for anything.
-	sm.parkCommits = make(chan parkedBlock, parkSweepRPCBudget)
+	sm.parkCommits = make(chan parkCommit, parkSweepRPCBudget)
 
 	for i := 0; i < workers; i++ {
 		sm.parkWorkers.Add(1)
@@ -134,23 +134,46 @@ func (sm *SyncManager) submitParkJob(job parkJob) {
 		return
 	}
 
-	// Blocking here is the backpressure: with every worker busy the commit
-	// goroutine waits rather than admitting blocks faster than they can be
-	// written.
+	// Handing the job to the consumer's own select, when there is one, rather than
+	// waiting for a worker here.
 	//
-	// It has to keep draining outcomes while it waits, and this used to be a
-	// bare send on the strength of "parkOutcomes has a slot for every worker,
-	// so no worker can be stuck posting". A worker can always post ONCE. The
-	// only goroutine that drains outcomes is this one, and while it is blocked
-	// on the send it drains nothing, so a consumer that took two queue messages
-	// in a row with every worker mid-write (select picks uniformly among ready
-	// arms, so that is a coin toss, not a corner case) filled every slot; the
-	// workers then blocked posting, this blocked sending, and the three waited
-	// on each other for as long as the process ran. That stopped mainnet on
-	// 2026-09-08, minutes after a restart delivered twenty-four out-of-order
-	// blocks in three seconds. Applying an outcome here is the same work the
-	// consumer's own select arm does, on the same goroutine, so nothing about
-	// where dispositions are applied changes.
+	// Waiting here at all is what this avoids. With the drain no longer on the
+	// consumer this is the last place that goroutine blocks, and it reaches it far
+	// more often, because in the measured regime most arrivals park. A wait here
+	// stops completions, sweep posts and drain steps being serviced for as long as
+	// a park write takes, and a park write of a mainnet giant block is minutes: the
+	// stateless check alone has been measured above three minutes.
+	//
+	// The slot preserves the backpressure exactly. While it is set the consumer
+	// disables its queue arm, so nothing else is head-processed, which is the same
+	// rule the pending dispatch slot follows.
+	if sm.parkJobAsync.Load() {
+		// Offered once, without blocking. A worker that is free takes it now; one
+		// that is not leaves it for the consumer's loop to offer again, which
+		// costs a field assignment on the goroutine that owns it. The head runs
+		// on that same goroutine, which is why this can be a field at all.
+		select {
+		case sm.parkJobs <- job:
+		default:
+			sm.parkJobHeld = &job
+		}
+
+		return
+	}
+
+	// Otherwise wait here, draining outcomes while waiting. This is the
+	// pre-window consumer's path, which has no slot to hand a job to.
+	//
+	// Draining while waiting is load-bearing, and it used to be a bare send on
+	// the strength of "parkOutcomes has a slot for every worker, so no worker can
+	// be stuck posting". A worker can always post ONCE. The only goroutine that
+	// drains outcomes is this one, and while it is blocked on the send it drains
+	// nothing, so a consumer that took two queue messages in a row with every
+	// worker mid-write (select picks uniformly among ready arms, so that is a coin
+	// toss, not a corner case) filled every slot; the workers then blocked
+	// posting, this blocked sending, and the three waited on each other for as
+	// long as the process ran. That stopped mainnet on 2026-09-08, minutes after a
+	// restart delivered twenty-four out-of-order blocks in three seconds.
 	for {
 		select {
 		case sm.parkJobs <- job:
@@ -180,7 +203,7 @@ func (sm *SyncManager) applyParkOutcome(outcome parkOutcome) {
 		if outcome.drainParent {
 			sm.logger.Infof("[applyParkOutcome][%s] its parent committed while it was being written, draining now", job.entry.hash)
 
-			sm.drainParkedDescendants(job.entry.prevBlock)
+			sm.scheduleDrain(job.entry.prevBlock, 0)
 		}
 
 	default:

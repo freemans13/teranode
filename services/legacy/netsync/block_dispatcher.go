@@ -157,6 +157,28 @@ type blockDispatch struct {
 	// nothing else can find it. It is an 80-byte header, not the decoded block.
 	removedFront *headerNode
 
+	// parked is the park entry this dispatch commits, and nil for a block that
+	// arrived on the wire. A parked dispatch carries no queue message worth
+	// replying to and no peer obligation to settle: its blob is read by the
+	// worker, its outcome is classified by the park's disposition table, and its
+	// bytes were charged to the park rather than to the prefetch budget. It is
+	// the field that selects run and tail below, so the two kinds of dispatch
+	// cannot share a code path by accident.
+	parked *parkedBlock
+
+	// parkedIsCheckpoint is what advanceHeaderListFor answered for a parked
+	// dispatch when its header node was taken off the front, which happens at
+	// dispatch rather than at commit. By the time the tail runs the front has
+	// moved on and the question can no longer be asked.
+	parkedIsCheckpoint bool
+
+	// readErr is a parked dispatch's blob-read failure, kept apart from the
+	// completion error because the two are classified by opposite defaults: a
+	// read failure keeps the block, a commit failure judges it and blames a
+	// peer. Collapsing them loses fully downloaded blocks under ordinary store
+	// load.
+	readErr error
+
 	// aborted is set by complete before the tail runs when this block was never at
 	// fault — a predecessor failed. The tail reads it to skip the failure backoff.
 	// Written and read on the consumer goroutine only.
@@ -198,6 +220,37 @@ type blockDispatcher struct {
 	// Both are fields so the dispatcher tests can drive it without a peer or a store.
 	run  func(ctx context.Context, d *blockDispatch, parent *inflightParent) error
 	tail func(d *blockDispatch, err error) error
+
+	// parkedRun and parkedTail are the same two steps for a dispatch that commits
+	// a parked block off disk. They are separate fields rather than branches
+	// inside run and tail because a test that swaps run must not silently take
+	// over the blob read as well, and because a parked dispatch must never be
+	// able to reach handleBlockMsgTail or finishBlockMsg: it has no queue
+	// message, so a reply would send on a nil channel and a backlog decrement
+	// would underflow the counter that suppresses the sync-peer stall check.
+	parkedRun  func(ctx context.Context, d *blockDispatch) error
+	parkedTail func(d *blockDispatch, err error) error
+}
+
+// runFor picks the work step for one dispatch, and tailFor picks its bookkeeping
+// step. The parked field is the only discriminator, in one place, so the two kinds
+// of dispatch cannot drift apart.
+func (bd *blockDispatcher) runFor(d *blockDispatch) func(context.Context, *blockDispatch, *inflightParent) error {
+	if d.parked != nil {
+		return func(ctx context.Context, d *blockDispatch, _ *inflightParent) error {
+			return bd.parkedRun(ctx, d)
+		}
+	}
+
+	return bd.run
+}
+
+func (bd *blockDispatcher) tailFor(d *blockDispatch) func(*blockDispatch, error) error {
+	if d.parked != nil {
+		return bd.parkedTail
+	}
+
+	return bd.tail
 }
 
 func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
@@ -252,16 +305,72 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 	// load-bearing: the tail returns nil from paths that did NOT put the block in the
 	// chain, and draining after one of those would try to commit the children of a
 	// block that is not there.
+	//
+	// scheduleDrain rather than drainParkedDescendants, and that is the whole of
+	// this change from the consumer's point of view: with a loop to admit into,
+	// the parked children become dispatches of their own, and the reply below
+	// lands microseconds after this block's own tail work instead of after every
+	// block parked behind it has been read off disk and validated.
 	bd.tail = func(d *blockDispatch, err error) error {
 		terr := sm.handleBlockMsgTail(d, err)
 
 		if terr == nil && d.msg.committed {
-			sm.drainParkedDescendants(d.msg.blockHash)
+			sm.scheduleDrain(d.msg.blockHash, d.height)
 		}
 
 		sm.finishBlockMsg(d.msg, terr)
 
 		return terr
+	}
+
+	// The parked run: read the blob on the worker, then the same call the serial
+	// drain makes. The decoded block lives in this worker's local, so the consumer
+	// never holds one.
+	//
+	// A nil in-flight parent, always. The parent of a parked block is in the chain
+	// by the time anything commits it, so HandleBlockDirect looks it up there, and
+	// that lookup is what enforces "never hand block validation a parentless
+	// block" in the worker rather than on a promise from the consumer. Handing it
+	// a resolved parent instead would skip the lookup and is the single most
+	// dangerous edit anyone can make here.
+	bd.parkedRun = func(ctx context.Context, d *blockDispatch) error {
+		msgBlock, err := sm.blockPark.Read(ctx, d.parked.hash)
+		if err != nil {
+			// Recorded apart from the returned error so the tail cannot classify a
+			// read failure by the commit table, which judges the block.
+			d.readErr = err
+
+			return err
+		}
+
+		return sm.HandleBlockDirect(ctx, d.parked.peer, d.parked.hash, msgBlock, nil)
+	}
+
+	// The parked tail: classify in one place, on the consumer, in admission order,
+	// out of the same three helpers the serial drain uses. It never touches the
+	// backlog and never replies, because a parked dispatch has no queue message.
+	bd.parkedTail = func(d *blockDispatch, err error) error {
+		entry := *d.parked
+
+		switch {
+		case d.readErr != nil:
+			sm.parkedReadFailed(entry, d.readErr)
+
+		case err != nil:
+			sm.parkedBlockFailed(entry, err)
+
+		default:
+			sm.parkedBlockCommitted(entry, d.parkedIsCheckpoint)
+
+			// The chain continues: whatever was parked behind this block is now
+			// committable. Scheduled here rather than inside parkedBlockCommitted,
+			// because the serial path calls that too and would turn its explicit
+			// stack walk back into recursion, one frame set per link of a chain
+			// that can be thousands long, each frame holding a decoded block.
+			sm.scheduleDrain(entry.hash, d.height)
+		}
+
+		return err
 	}
 
 	return bd
@@ -352,6 +461,10 @@ func (bd *blockDispatcher) frontierEmpty() bool { return bd == nil || len(bd.fro
 // first admission, so at most one block can be admitted on a stale reading of the lag;
 // that block then parks in the block-assembly gate exactly as it would have before the
 // window existed, and every later admission sees the real frontier tail.
+//
+// A frontier entry whose height was never resolved reads as that same zero, which is the
+// right answer for it and needs no special case: such an entry is dispatched un-windowed,
+// so canDispatch admits it only into an empty frontier and it is the only entry there.
 func (bd *blockDispatcher) tailHeight() uint32 {
 	if n := len(bd.frontier); n > 0 {
 		return bd.frontier[n-1].height
@@ -363,6 +476,18 @@ func (bd *blockDispatcher) tailHeight() uint32 {
 // parentFor returns the frontier tail as the in-flight parent for a block whose prevHash
 // matches it, else nil. Only the tail can be a parent: the frontier is a chain, so any
 // earlier entry is an ancestor of a block already admitted.
+//
+// A tail whose height is 0 is refused. Height 0 means "not resolved", not "the genesis
+// block": two arms of resolveParent dispatch a block without resolving its height, the
+// one for a block already in the chain and the one for a block whose parent is in the
+// frontier but is not its tail, and dispatch stamps that zero onto the entry. Handing it
+// over as a parent gives the child height 1, and nothing downstream on this side catches
+// it, because HandleBlockDirect's mismatch guard needs a height the block claims and a
+// legacy wire block claims none. Block validation does catch it, in deriveBlockHeight,
+// and answers BlockInvalidError, which is not a transient fault: the block is rejected to
+// the peer, the peer's whole association is evicted as misbehaving, and every descendant
+// is suppressed for the cascade TTL. So the answer here is no parent, which sends the
+// child down the nil-parent route where the worker looks the parent up in the chain.
 func (bd *blockDispatcher) parentFor(prevHash *chainhash.Hash) *inflightParent {
 	if bd == nil {
 		return nil
@@ -370,6 +495,12 @@ func (bd *blockDispatcher) parentFor(prevHash *chainhash.Hash) *inflightParent {
 
 	if n := len(bd.frontier); n > 0 && bd.frontier[n-1].hash.IsEqual(prevHash) {
 		e := bd.frontier[n-1]
+
+		if e.height == 0 {
+			bd.sm.logger.Warnf("[blockDispatcher][%s] the block in flight has no resolved height, so it is not offered as a parent; its child will look the parent up in the chain", e.hash.String())
+
+			return nil
+		}
 
 		return &inflightParent{height: e.height, entry: e}
 	}
@@ -422,10 +553,43 @@ func (bd *blockDispatcher) canDispatch(d *blockDispatch) bool {
 	return true
 }
 
+// msgHash is the hash of the block a dispatch is for, from whichever of its two
+// sources the dispatch has: the queue message for a block off the wire, the park
+// entry for a block being committed off disk. A parked dispatch has no queue
+// message at all, so every read of d.msg on a path both kinds reach goes through
+// here.
+func (d *blockDispatch) msgHash() chainhash.Hash {
+	if d.parked != nil {
+		return d.parked.hash
+	}
+
+	return d.msg.blockHash
+}
+
 // dispatch charges the budget, appends the frontier entry and starts the worker.
+//
+// A parked dispatch must arrive in exactly one shape, and the guard is here rather
+// than in a comment because the two ways of getting it wrong are both silent. A
+// resolved parent would skip the worker's own parent lookup, which is what
+// enforces the never-hand-over-a-parentless-block rule. A non-empty frontier
+// would mean the server-side window already holds a legacy entry, so an
+// unwindowed parked block would be refused admission there. Failing closed costs
+// one restored park entry and one ERROR line; failing open costs a lost block.
 func (bd *blockDispatcher) dispatch(d *blockDispatch) {
+	if d.parked != nil && (d.parent != nil || d.windowed || !bd.frontierEmpty()) {
+		bd.sm.logger.Errorf("[blockDispatcher][%s] refusing a parked dispatch in the wrong shape: parent=%v windowed=%v frontier=%d", d.parked.hash.String(), d.parent != nil, d.windowed, len(bd.frontier))
+		bd.sm.blockPark.Restore(*d.parked)
+
+		return
+	}
+
+	// The parked kind carries no queue message, so its hash comes off the entry.
+	// Reading d.msg unconditionally would dereference nil for exactly the dispatch
+	// this function was just taught to accept.
+	hash := d.msgHash()
+
 	e := &frontierEntry{
-		hash:       d.msg.blockHash,
+		hash:       hash,
 		height:     d.height,
 		rpcStarted: make(chan struct{}),
 		settled:    make(chan struct{}),
@@ -447,7 +611,7 @@ func (bd *blockDispatcher) dispatch(d *blockDispatch) {
 		e.aborted.Store(true)
 	}
 
-	run := bd.run
+	run := bd.runFor(d)
 	ctx := contextWithFrontierEntry(bd.sm.ctx, e)
 
 	go func() {
@@ -534,7 +698,7 @@ func (bd *blockDispatcher) complete(c *blockCompletion) {
 			bd.barrier = false
 		}
 
-		_ = bd.tail(head.d, err)
+		_ = bd.tailFor(head.d)(head.d, err)
 	}
 }
 

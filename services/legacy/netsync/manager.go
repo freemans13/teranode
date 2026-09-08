@@ -711,7 +711,47 @@ type SyncManager struct {
 	// would race the dispatcher for admission into the window. nil on a manager
 	// built as a struct literal, and submitParkCommit then commits inline, which
 	// is what the sweep did before it had a goroutine of its own.
-	parkCommits chan parkedBlock
+	parkCommits chan parkCommit
+
+	// drainQueue is the parents whose parked children may now be committable, and
+	// lastDispatchWasDrained alternates the two admission sources so neither
+	// starves. Both are owned by the block-queue consumer alone, with no lock, on
+	// the same terms as the dispatcher's frontier: every producer of a drain
+	// request already runs on that goroutine.
+	drainQueue             []drainRequest
+	lastDispatchWasDrained bool
+
+	// drainAsync says the consumer loop is running and will admit drained blocks
+	// itself. It is false for a manager with no such loop, which is the
+	// pre-window consumer and every manager a test builds as a struct literal,
+	// and scheduleDrain then walks the stack synchronously as it always did.
+	drainAsync atomic.Bool
+
+	// consumerDone closes when the block-queue consumer has returned, which is
+	// after its quit arm has settled every dispatch in flight. Stop waits on it,
+	// because a parked entry the shutdown does not restore is adopted by the next
+	// start's recovery with no height, no peer and no header node, and that is
+	// the one entry that can never be rewound back into the download walk. Built
+	// by blockHandler beside the consumer; nil on a manager whose handler never
+	// ran, which every struct-literal test manager is.
+	consumerDone chan struct{}
+
+	// parkJobHeld is the one park job the head has admitted and not yet handed to
+	// a worker, and parkJobAsync says there is a loop to hold it. Both are owned
+	// by the block-queue consumer alone, no lock, on the same terms as drainQueue:
+	// the head runs on that goroutine, so it can set the field directly.
+	//
+	// A field rather than a channel, and for a reason worth keeping. A channel
+	// whose only consumer is the goroutine that sends on it deadlocks on the
+	// first send. That is not hypothetical: it is what the first version of this
+	// did.
+	//
+	// While it is set the consumer disables its queue arm, so nothing else is
+	// head-processed, which is the same rule the pending dispatch slot follows and
+	// is what keeps the park's backpressure intact. When there is no loop,
+	// submitParkJob waits where it stands, which is the pre-window path.
+	parkJobHeld  *parkJob
+	parkJobAsync atomic.Bool
 
 	// parkSweepNow is the clock the park sweep measures its own tick against, so
 	// a test can make one store delete look slow without sleeping. nil means
@@ -2507,8 +2547,8 @@ func (sm *SyncManager) consumeBlocksSerially(blockQueue <-chan *blockQueueMsg) {
 			}
 		case outcome := <-sm.parkOutcomes:
 			sm.applyParkOutcome(outcome)
-		case entry := <-sm.parkCommits:
-			sm.commitParkedBlockAndDrain(entry)
+		case commit := <-sm.parkCommits:
+			sm.commitParkedBlockAndDrain(commit.entry)
 		case msg := <-blockQueue:
 			sm.consumeQueuedBlock(msg)
 		}
@@ -2538,6 +2578,17 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 
 	bd := sm.dispatcher
 
+	// From here the drain is this loop's second admission source rather than a
+	// call made inside a tail, so scheduleDrain queues instead of walking, and
+	// the head leaves park jobs for this loop rather than waiting for a worker.
+	sm.drainAsync.Store(true)
+	sm.parkJobAsync.Store(true)
+
+	defer func() {
+		sm.drainAsync.Store(false)
+		sm.parkJobAsync.Store(false)
+	}()
+
 	// pending holds one head-processed block waiting for capacity. While it is
 	// set the queue arm is disabled, so nothing else is head-processed until this
 	// block is dispatched: "receive only while a slot is free", with the head
@@ -2549,11 +2600,26 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 	for {
 		var queueArm <-chan *blockQueueMsg
 
-		if pending == nil {
-			queueArm = blockQueue
-		} else if bd.canDispatch(pending) {
+		// One admission per turn, chosen rather than raced. The choice itself is
+		// nextAdmission, so it can be read and tested on its own.
+		canLive := pending != nil && bd.canDispatch(pending)
+		drainOpen := len(sm.drainQueue) > 0 && bd.frontierEmpty()
+
+		switch nextAdmission(sm.lastDispatchWasDrained, canLive, drainOpen) {
+		case admitDrained:
+			if sm.drainStep(bd) {
+				sm.lastDispatchWasDrained = true
+
+				continue
+			}
+
+			// Nothing admissible behind that parent after all. Fall through rather
+			// than spin on a queue that cannot progress this turn.
+
+		case admitLive:
 			d := pending
 			pending = nil
+			sm.lastDispatchWasDrained = false
 
 			// The parent may have failed while this block waited for capacity, on any
 			// route: the head's own #1333 check exempted it because the parent was in
@@ -2566,6 +2632,25 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 			}
 
 			continue
+
+		case admitNothing:
+		}
+
+		// One park job at a time, offered to a worker without blocking this
+		// goroutine. Tried before the queue arm opens, for the same reason the
+		// pending dispatch is: it is work already accepted.
+		if sm.parkJobHeld != nil {
+			select {
+			case sm.parkJobs <- *sm.parkJobHeld:
+				sm.parkJobHeld = nil
+
+				continue
+			default:
+			}
+		}
+
+		if pending == nil && sm.parkJobHeld == nil {
+			queueArm = blockQueue
 		}
 
 		select {
@@ -2588,7 +2673,32 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 				pending = nil
 			}
 
+			// A held park job has the queued block's reply, so nobody else will
+			// answer for it, and its prefetch budget is held until somebody does.
+			// Its admission is given back too, because no write is coming.
+			if sm.parkJobHeld != nil {
+				sm.blockPark.Abandon(sm.parkJobHeld.entry)
+				sm.replyToParkJob(*sm.parkJobHeld, errors.NewServiceError(syncManagerShuttingDownMsg))
+
+				sm.parkJobHeld = nil
+			}
+
 			for _, e := range bd.frontier {
+				// A parked dispatch has no queue message: nothing incremented the
+				// backlog for it and nobody is waiting on a reply, so finishing it
+				// would send on a nil channel and underflow the counter that
+				// suppresses the sync-peer stall check for the life of the process.
+				// What it needs instead is its park entry back, because the entry
+				// was taken out of the index to dispatch it. Without the Restore the
+				// blob is adopted by the next start's recovery with no height, no
+				// peer and no header node, which is the one entry that can never be
+				// rewound into the download walk.
+				if e.d.parked != nil {
+					sm.blockPark.Restore(*e.d.parked)
+
+					continue
+				}
+
 				finish(e.d.msg, errors.NewServiceError(syncManagerShuttingDownMsg))
 			}
 
@@ -2622,12 +2732,22 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 			// A parking worker has finished with a block the head admitted.
 			// Everything that needs ordering or the header list waited for this.
 			sm.applyParkOutcome(outcome)
-		case entry := <-sm.parkCommits:
+		case commit := <-sm.parkCommits:
 			// The sweep found a parked block whose parent is in the chain after
-			// all. It decided that on its own goroutine and posts the commit here,
-			// because this is the one goroutine that admits blocks: a commit from
-			// the sweep would race the dispatcher for admission into the window.
-			sm.commitParkedBlockAndDrain(entry)
+			// all. It decided that on its own goroutine and posts here, because
+			// this is the one goroutine that admits blocks: committing from the
+			// sweep would race the dispatcher for admission into the window.
+			//
+			// Put back, then queued, rather than committed here. The sweep took
+			// the entry out of the index to hand it over, and restoring it means
+			// the drain step claims it through the one path every other drained
+			// block takes, with one admission test and one header-front advance.
+			// It also keeps the block visible to the sweep's own eviction pass
+			// while it waits, and it is two map operations rather than a full
+			// commit, which is what stops a 128-entry tick queueing minutes of
+			// work onto this goroutine.
+			sm.blockPark.Restore(commit.entry)
+			sm.scheduleDrain(commit.entry.prevBlock, commit.parentHeight)
 		}
 	}
 }
@@ -2691,6 +2811,51 @@ func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpo
 	sm.headerMu.Unlock()
 
 	return isCheckpointBlock, removedFront
+}
+
+// admissionChoice is which of the consumer's two admission sources takes a turn.
+type admissionChoice int
+
+const (
+	admitNothing admissionChoice = iota
+	admitLive
+	admitDrained
+)
+
+// nextAdmission decides which source admits this turn, given whether the last
+// admission was a drained block and whether each source has something ready.
+//
+// It is a function of its own because it is a priority decision and the obvious
+// implementation is wrong. Both sources are ready at once routinely: the drain is
+// open whenever the frontier is empty and a parent has parked children, and a
+// live block is admissible in exactly that state too. Leaving the choice to a
+// select would pick uniformly among ready cases, which starves whichever source
+// happens to lose repeatedly.
+//
+// Neither direction is safe to prefer unconditionally. Always preferring the
+// drain makes a live block wait behind a parked chain that can be thousands long,
+// and the live block is the one the whole chain is waiting for. Always preferring
+// the live path starves the drain for as long as blocks keep arriving, which is
+// the regime this exists for. So whichever went last yields, and each source gets
+// every other turn while both are ready.
+func nextAdmission(lastWasDrained, canLive, drainOpen bool) admissionChoice {
+	switch {
+	case canLive && drainOpen:
+		if lastWasDrained {
+			return admitLive
+		}
+
+		return admitDrained
+
+	case drainOpen:
+		return admitDrained
+
+	case canLive:
+		return admitLive
+
+	default:
+		return admitNothing
+	}
 }
 
 // handleBlockMsgHead runs every pre-check for one queued block on the consumer
@@ -5292,7 +5457,13 @@ func (sm *SyncManager) blockHandler() {
 	}
 
 	// start the block queue handler
-	go sm.dispatchBlocks(blockQueue)
+	sm.consumerDone = make(chan struct{})
+
+	go func() {
+		defer close(sm.consumerDone)
+
+		sm.dispatchBlocks(blockQueue)
+	}()
 
 	// The park sweep gets a goroutine of its own rather than a ticker arm on the
 	// consumer. It used to share the goroutine that committed blocks in order,
@@ -5959,6 +6130,15 @@ func (sm *SyncManager) Stop() error {
 	sm.logger.Infof("Sync manager shutting down")
 	close(sm.quit)
 	<-sm.handlerDone
+
+	// The block-queue consumer's quit arm is what restores a park entry whose
+	// dispatch was still in flight, and the restore is only a guarantee if
+	// somebody waits for it. Bounded by the deadlined client calls the consumer
+	// can be inside, so it costs shutdown latency rather than risking it hanging.
+	// Nil on a manager whose handler never ran.
+	if sm.consumerDone != nil {
+		<-sm.consumerDone
+	}
 
 	// The workers select on sm.quit, and one that is mid-write finishes that
 	// write first: the blob store call carries its own deadline, so this waits
