@@ -5,6 +5,8 @@
 package netsync
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -235,7 +237,7 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	}
 
 	if now.Sub(since) < slowAfter {
-		sm.noteRaceDeclined("the frontier has not been outstanding long enough yet")
+		sm.noteRaceDeclined(fmt.Sprintf("the frontier %s at height %d has only been outstanding %s", hash, height, now.Sub(since).Round(time.Second)))
 
 		return none, 0, nil, false
 	}
@@ -283,7 +285,7 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	// park the same question before it requests a block, and Has takes only the
 	// park's own lock, so it is safe from this ticker.
 	if sm.blockPark.Has(hash) {
-		sm.noteRaceDeclined("the park already holds this block")
+		sm.noteRaceDeclined(fmt.Sprintf("the park already holds the frontier block %s at height %d", hash, height))
 
 		return none, 0, nil, false
 	}
@@ -570,6 +572,14 @@ func (sm *SyncManager) BlockRacedTo(peer *peerpkg.Peer, blockHash *chainhash.Has
 func (sm *SyncManager) noteRaceDeclined(reason string) {
 	now := time.Now()
 
+	// Keyed on the first few words rather than the whole string, because two of
+	// the reasons name the block and a per-block key would defeat the rate limit
+	// and fill the log.
+	key := reason
+	if i := strings.Index(key, " block "); i > 0 {
+		key = key[:i]
+	}
+
 	sm.raceDeclinedMu.Lock()
 	defer sm.raceDeclinedMu.Unlock()
 
@@ -578,13 +588,13 @@ func (sm *SyncManager) noteRaceDeclined(reason string) {
 		sm.raceDeclinedCount = make(map[string]int, 12)
 	}
 
-	sm.raceDeclinedCount[reason]++
+	sm.raceDeclinedCount[key]++
 
-	if last, seen := sm.raceDeclinedAt[reason]; seen && now.Sub(last) < time.Minute {
+	if last, seen := sm.raceDeclinedAt[key]; seen && now.Sub(last) < time.Minute {
 		return
 	}
 
-	sm.raceDeclinedAt[reason] = now
+	sm.raceDeclinedAt[key] = now
 
-	sm.logger.Infof("[raceFrontierBlock] not racing the frontier: %s (%d times)", reason, sm.raceDeclinedCount[reason])
+	sm.logger.Infof("[raceFrontierBlock] not racing the frontier: %s (%d times)", reason, sm.raceDeclinedCount[key])
 }
