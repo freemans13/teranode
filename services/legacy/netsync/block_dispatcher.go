@@ -117,18 +117,26 @@ func frontierEntryFromContext(ctx context.Context) *frontierEntry {
 	return e
 }
 
-// inflightParent is what the dispatcher resolved for a block whose parent is still in
-// the window: the parent's height and its frontier entry. nil means "look the parent
-// up in the blockchain store as before" — the pre-window behaviour, and what every
-// caller other than the dispatcher itself still passes.
+// inflightParent is what the head resolved for a block's parent: the parent's
+// height, and its frontier entry when the parent is still in the window. A nil
+// entry with a height is a parent the head found in the chain, so HandleBlockDirect
+// takes the height and skips the lookup the head has just made; the ordering
+// hand-shake is guarded on the entry and never waits on a stored parent. A nil
+// inflightParent means "look the parent up in the blockchain store" — the
+// pre-window behaviour, and what the park drain and every caller other than the
+// head still pass.
 type inflightParent struct {
 	height uint32
 	entry  *frontierEntry
 }
 
 // blockDispatch is what handleBlockMsgHead produced: one queued block that passed every
-// pre-check, with its parent resolved and its route decided. It carries the state the
-// chain-order tail needs so the tail can run long after the head did.
+// pre-check, with its parent resolved as stored or in flight and its route decided. It
+// carries the state the chain-order tail needs so the tail can run long after the head
+// did, and none of that state is the decoded block: msgBlock is released the moment the
+// worker returns, and the tail must never want it. A block whose parent is neither
+// stored nor in flight never becomes a dispatch at all; the head parks it while it
+// still holds the bytes.
 type blockDispatch struct {
 	msg            *blockQueueMsg
 	peer           *peerpkg.Peer
@@ -141,6 +149,13 @@ type blockDispatch struct {
 	parent         *inflightParent
 	windowed       bool
 	bytes          int64
+
+	// removedFront is the header node this block's arrival took off the front of
+	// the headers-first list, or nil when it was not the front. The tail needs it
+	// to put the block back into the download walk when the block fails or is
+	// aborted: by then the header is gone from both the list and the index, so
+	// nothing else can find it. It is an 80-byte header, not the decoded block.
+	removedFront *headerNode
 
 	// aborted is set by complete before the tail runs when this block was never at
 	// fault — a predecessor failed. The tail reads it to skip the failure backoff.
@@ -230,18 +245,21 @@ func newBlockDispatcher(sm *SyncManager) *blockDispatcher {
 		return sm.HandleBlockDirect(ctx, d.msg.peer, d.msg.blockHash, d.msgBlock, parent)
 	}
 
-	// The default tail keeps the backlog decrement, its progress stamp and the reply
-	// paired on every completion path, in that order, exactly as the pre-window
-	// consumer did.
+	// The default tail is the pre-window consumer's whole turn after the block's own
+	// work: the chain-order tail, then the drain of whatever was parked behind a block
+	// that committed, then the backlog accounting and the reply through finishBlockMsg,
+	// so both consumers settle a block by the same rule. The committed guard is
+	// load-bearing: the tail returns nil from paths that did NOT put the block in the
+	// chain, and draining after one of those would try to commit the children of a
+	// block that is not there.
 	bd.tail = func(d *blockDispatch, err error) error {
 		terr := sm.handleBlockMsgTail(d, err)
 
-		sm.blockBacklog.Add(-1)
-		sm.noteBacklogProgress()
-
-		if d.msg.reply != nil {
-			d.msg.reply <- terr
+		if terr == nil && d.msg.committed {
+			sm.drainParkedDescendants(d.msg.blockHash)
 		}
+
+		sm.finishBlockMsg(d.msg, terr)
 
 		return terr
 	}
