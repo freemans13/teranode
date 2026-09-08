@@ -96,6 +96,14 @@ type consumerWait struct {
 	// with nothing being admitted is the shape the operator sees as "idle with
 	// blocks downloaded".
 	parked int
+
+	// drainDeclines is how many turns have been offered to the drain and given
+	// back. It is the fact the first version of this report was missing: a drain
+	// that walks its queue, rules every parent out and drops them leaves no
+	// trace in the queue length, so a snapshot taken afterwards showed nothing
+	// queued and nothing in flight, which read as a loop with no work rather
+	// than a loop that had just thrown a turn away.
+	drainDeclines int64
 }
 
 // publishConsumerWait records what the loop is about to block on. Called by the
@@ -130,6 +138,8 @@ func (sm *SyncManager) publishConsumerWait(now time.Time, queueArmOpen bool, pen
 		w.parked = sm.blockPark.Len()
 	}
 
+	w.drainDeclines = sm.drainDeclined.Load()
+
 	sm.consumerWaitState.Store(w)
 }
 
@@ -163,6 +173,13 @@ func describeFrontierEntry(e *frontierEntry) string {
 	}
 
 	return b.String()
+}
+
+// noteDrainDeclined counts a turn the drain was given and did not use. Written
+// by the consumer only, and read by the watchdog, for the same reason as the
+// snapshot beside it.
+func (sm *SyncManager) noteDrainDeclined() {
+	sm.drainDeclined.Add(1)
 }
 
 // noteConsumerAdmitted records that the loop placed work. The watchdog measures
@@ -301,6 +318,9 @@ type consumerWatchdogState struct {
 	// consumerStallLoggedAt is when the watchdog last spoke, so a wedge is
 	// described once a minute rather than on every tick.
 	consumerStallLoggedAt atomic.Int64
+
+	// drainDeclined counts turns the drain was offered and gave back.
+	drainDeclined atomic.Int64
 }
 
 // shortHash trims a block hash to its leading digits for a log line. The full

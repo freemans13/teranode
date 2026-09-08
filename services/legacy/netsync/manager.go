@@ -2629,8 +2629,27 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 		canLive := pending != nil && bd.canDispatch(pending)
 		drainOpen := len(sm.drainQueue) > 0 && bd.frontierEmpty()
 
-		switch nextAdmission(sm.lastDispatchWasDrained, canLive, drainOpen) {
-		case admitDrained:
+		choice := nextAdmission(sm.lastDispatchWasDrained, canLive, drainOpen)
+
+		// A chosen drain may still decline: drainStep walks the queued parents
+		// itself and can find that none of them has a child it can commit yet,
+		// dropping the ones it has ruled out. That must not cost the turn.
+		//
+		// It used to. The loop fell through to its wait, and the wait was
+		// unreachable from anywhere: the queue arm is shut while a block is
+		// pending, the window was empty so no completion was coming, the park
+		// workers were idle and the sweep had nothing to offer. Mainnet stopped
+		// for good at height 755,112 with the next block ready to go and nothing
+		// left alive to notice. The ordering is not a corner case either, because
+		// a block's own tail is what queues a drain for its parked children and
+		// the tail runs on this goroutine, so the turn straight after any commit
+		// has both sources ready and the alternation gives it to the drain.
+		//
+		// Deciding again with the drain taken out of the running is what hands
+		// that turn to a live block that was ready. It cannot loop: the drain is
+		// only ever removed from the choice, never put back, so the second
+		// decision is admitLive or admitNothing and never admitDrained.
+		if choice == admitDrained {
 			if sm.drainStep(bd) {
 				sm.lastDispatchWasDrained = true
 
@@ -2639,9 +2658,12 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 				continue
 			}
 
-			// Nothing admissible behind that parent after all. Fall through rather
-			// than spin on a queue that cannot progress this turn.
+			sm.noteDrainDeclined()
 
+			choice = nextAdmission(sm.lastDispatchWasDrained, canLive, false)
+		}
+
+		switch choice {
 		case admitLive:
 			d := pending
 			pending = nil
