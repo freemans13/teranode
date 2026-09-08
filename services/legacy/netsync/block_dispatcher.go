@@ -352,6 +352,10 @@ func (bd *blockDispatcher) frontierEmpty() bool { return bd == nil || len(bd.fro
 // first admission, so at most one block can be admitted on a stale reading of the lag;
 // that block then parks in the block-assembly gate exactly as it would have before the
 // window existed, and every later admission sees the real frontier tail.
+//
+// A frontier entry whose height was never resolved reads as that same zero, which is the
+// right answer for it and needs no special case: such an entry is dispatched un-windowed,
+// so canDispatch admits it only into an empty frontier and it is the only entry there.
 func (bd *blockDispatcher) tailHeight() uint32 {
 	if n := len(bd.frontier); n > 0 {
 		return bd.frontier[n-1].height
@@ -363,6 +367,18 @@ func (bd *blockDispatcher) tailHeight() uint32 {
 // parentFor returns the frontier tail as the in-flight parent for a block whose prevHash
 // matches it, else nil. Only the tail can be a parent: the frontier is a chain, so any
 // earlier entry is an ancestor of a block already admitted.
+//
+// A tail whose height is 0 is refused. Height 0 means "not resolved", not "the genesis
+// block": two arms of resolveParent dispatch a block without resolving its height, the
+// one for a block already in the chain and the one for a block whose parent is in the
+// frontier but is not its tail, and dispatch stamps that zero onto the entry. Handing it
+// over as a parent gives the child height 1, and nothing downstream on this side catches
+// it, because HandleBlockDirect's mismatch guard needs a height the block claims and a
+// legacy wire block claims none. Block validation does catch it, in deriveBlockHeight,
+// and answers BlockInvalidError, which is not a transient fault: the block is rejected to
+// the peer, the peer's whole association is evicted as misbehaving, and every descendant
+// is suppressed for the cascade TTL. So the answer here is no parent, which sends the
+// child down the nil-parent route where the worker looks the parent up in the chain.
 func (bd *blockDispatcher) parentFor(prevHash *chainhash.Hash) *inflightParent {
 	if bd == nil {
 		return nil
@@ -370,6 +386,12 @@ func (bd *blockDispatcher) parentFor(prevHash *chainhash.Hash) *inflightParent {
 
 	if n := len(bd.frontier); n > 0 && bd.frontier[n-1].hash.IsEqual(prevHash) {
 		e := bd.frontier[n-1]
+
+		if e.height == 0 {
+			bd.sm.logger.Warnf("[blockDispatcher][%s] the block in flight has no resolved height, so it is not offered as a parent; its child will look the parent up in the chain", e.hash.String())
+
+			return nil
+		}
 
 		return &inflightParent{height: e.height, entry: e}
 	}
