@@ -136,13 +136,34 @@ func (sm *SyncManager) submitParkJob(job parkJob) {
 
 	// Blocking here is the backpressure: with every worker busy the commit
 	// goroutine waits rather than admitting blocks faster than they can be
-	// written. It cannot deadlock, because parkOutcomes has a slot for every
-	// worker, so no worker can be stuck posting an outcome while this waits.
-	select {
-	case sm.parkJobs <- job:
+	// written.
+	//
+	// It has to keep draining outcomes while it waits, and this used to be a
+	// bare send on the strength of "parkOutcomes has a slot for every worker,
+	// so no worker can be stuck posting". A worker can always post ONCE. The
+	// only goroutine that drains outcomes is this one, and while it is blocked
+	// on the send it drains nothing, so a consumer that took two queue messages
+	// in a row with every worker mid-write (select picks uniformly among ready
+	// arms, so that is a coin toss, not a corner case) filled every slot; the
+	// workers then blocked posting, this blocked sending, and the three waited
+	// on each other for as long as the process ran. That stopped mainnet on
+	// 2026-09-08, minutes after a restart delivered twenty-four out-of-order
+	// blocks in three seconds. Applying an outcome here is the same work the
+	// consumer's own select arm does, on the same goroutine, so nothing about
+	// where dispositions are applied changes.
+	for {
+		select {
+		case sm.parkJobs <- job:
+			return
 
-	case <-sm.quit:
-		sm.replyToParkJob(job, errors.NewServiceError("sync manager shutting down"))
+		case outcome := <-sm.parkOutcomes:
+			sm.applyParkOutcome(outcome)
+
+		case <-sm.quit:
+			sm.replyToParkJob(job, errors.NewServiceError("sync manager shutting down"))
+
+			return
+		}
 	}
 }
 
