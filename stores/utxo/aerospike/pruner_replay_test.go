@@ -21,11 +21,10 @@ import (
 // TestPrunerReplayProtection exercises real pruning and the same-spender replay path.
 func TestPrunerReplayProtection(t *testing.T) {
 	for _, tc := range []struct {
-		name                                     string
-		collision, paginated, markerFailure, ttl bool
+		name                          string
+		paginated, markerFailure, ttl bool
 	}{
 		{name: "normal"},
-		{name: "filter_collision", collision: true},
 		{name: "ttl", ttl: true},
 		{name: "ttl_marker_failure", ttl: true, markerFailure: true},
 		{name: "paginated_parent", paginated: true},
@@ -33,12 +32,12 @@ func TestPrunerReplayProtection(t *testing.T) {
 		{name: "paginated_marker_failure", paginated: true, markerFailure: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testPrunerReplayProtection(t, tc.collision, tc.paginated, tc.markerFailure, tc.ttl)
+			testPrunerReplayProtection(t, tc.paginated, tc.markerFailure, tc.ttl)
 		})
 	}
 }
 
-func testPrunerReplayProtection(t *testing.T, seedFalsePositive, paginated, markerFailure, ttl bool) {
+func testPrunerReplayProtection(t *testing.T, paginated, markerFailure, ttl bool) {
 	t.Helper()
 	logger := ulogger.New("pruner-replay-test")
 	s := test.CreateBaseTestSettings(t)
@@ -98,36 +97,18 @@ func testPrunerReplayProtection(t *testing.T, seedFalsePositive, paginated, mark
 		svc, err := store.GetPrunerService()
 		require.NoError(t, err)
 		require.NotNil(t, svc)
-		if seedFalsePositive {
-			// Controlled collision fixture: cuckoo uses the prefix for its
-			// fingerprint/index/shard, so a distinct suffix gives a false hit.
-			// Before the fix, pruning this record seeded the filter and suppressed
-			// the surviving parent marker. This is a synthetic collision.
-			collision := *parent.TxIDChainHash()
-			collision[31] ^= 1
-			probe := apruner.NewPrunedTxSet(256, s.Pruner.UTXOPrunedSetMaxEntries)
-			probe.Add(collision)
-			require.True(t, probe.CheckAndRemove(*parent.TxIDChainHash()))
-			key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), collision.CloneBytes())
-			require.NoError(t, err)
-			require.NoError(t, client.Put(nil, key, aerospike.BinMap{
-				fields.TxID.String():           collision.CloneBytes(),
-				fields.DeleteAtHeight.String(): 1,
-				fields.TotalExtraRecs.String(): 0,
-				fields.Inputs.String():         []interface{}{},
-			}))
-			n, pruneErr := svc.(*apruner.Service).PruneWithPartitions(ctx, 999, "isolated-filter-seed", 1)
-			require.NoError(t, pruneErr)
-			require.Equal(t, int64(1), n)
-			t.Logf("Pruned historical collision fixture with distinct hash %s colliding with retained parent %s", collision.String(), parent.TxID())
-		}
 		parentKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), uaerospike.CalculateKeySource(parent.TxIDChainHash(), outputIndex, s.UtxoStore.UtxoBatchSize))
 		require.NoError(t, err)
 		if markerFailure {
-			// A malformed marker bin makes the real parent update fail on the server.
+			// A malformed marker bin makes the real parent update fail on the
+			// server. The cycle must SUCCEED and hold this one child back:
+			// returning an error here would unwind into PruneWithPartitions,
+			// which never retries a non-timeout error, so one poison record
+			// would block pruning node-wide forever.
 			require.NoError(t, client.Put(nil, parentKey, aerospike.BinMap{fields.DeletedChildren.String(): "invalid-map"}))
-			_, err = svc.(*apruner.Service).PruneWithPartitions(ctx, 1300, "failed-parent-update", 1)
-			require.Error(t, err)
+			pruned, err := svc.(*apruner.Service).PruneWithPartitions(ctx, 1300, "failed-parent-update", 1)
+			require.NoError(t, err, "a per-record marker failure must not fail the cycle")
+			require.Equal(t, int64(0), pruned, "the held-back child must not be counted as pruned")
 			retained, getErr := client.Get(nil, childKey)
 			require.NoError(t, getErr, "failed marker write must retain the child")
 			require.Equal(t, before.Expiration, retained.Expiration, "failed marker write must not schedule child expiry")
@@ -139,16 +120,31 @@ func testPrunerReplayProtection(t *testing.T, seedFalsePositive, paginated, mark
 		require.NoError(t, err)
 		require.Equal(t, int64(1), n, "normal pruning must delete the fully spent child only")
 		require.Eventually(t, func() bool { exists, err := client.Exists(nil, childKey); return err == nil && !exists }, 5*time.Second, 20*time.Millisecond)
-		for _, source := range [][]byte{parent.TxIDChainHash().CloneBytes(), uaerospike.CalculateKeySource(parent.TxIDChainHash(), outputIndex, s.UtxoStore.UtxoBatchSize)} {
-			key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), source)
+
+		// The record the spend path reads is the page holding the spent output,
+		// so that is the one that must carry the marker. With defensive mode off
+		// (the deployed default, and what this test sets) the master copy is not
+		// written when it differs: nothing reads it there, and it would grow
+		// without bound on a high fan-out parent.
+		pageRecord, err := client.Get(nil, parentKey)
+		require.NoError(t, err)
+		require.Contains(t, pageRecord.Bins[fields.DeletedChildren.String()], child.TxID(), "the spending page must carry replay protection")
+
+		if paginated {
+			masterKey, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), parent.TxIDChainHash().CloneBytes())
 			require.NoError(t, err)
-			record, err := client.Get(nil, key)
+			masterRecord, err := client.Get(nil, masterKey)
 			require.NoError(t, err)
-			require.Contains(t, record.Bins[fields.DeletedChildren.String()], child.TxID(), "both master and spending page must retain replay protection")
+
+			if markers := masterRecord.Bins[fields.DeletedChildren.String()]; markers != nil {
+				require.NotContains(t, markers, child.TxID(),
+					"with defensive mode off the master must not accumulate markers for outputs it does not hold")
+			}
 		}
 	}
 	_, _, err = store.SpendAndCreate(ctx, child, 1200)
-	require.ErrorIs(t, err, errors.ErrUtxoError, "pruned confirmed child must not be recreated")
+	require.ErrorIs(t, err, errors.ErrUtxoSpendingTxPruned, "pruned confirmed child must not be recreated")
+	require.Contains(t, err.Error(), "spending transaction was pruned")
 	exists, err := client.Exists(nil, childKey)
 	require.NoError(t, err)
 	require.False(t, exists)

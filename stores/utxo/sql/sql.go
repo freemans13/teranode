@@ -2038,7 +2038,8 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 		if errors.Is(spend.Err, errors.ErrSpent) ||
 			errors.Is(spend.Err, errors.ErrTxConflicting) ||
 			errors.Is(spend.Err, errors.ErrFrozen) ||
-			errors.Is(spend.Err, errors.ErrUtxoHashMismatch) {
+			errors.Is(spend.Err, errors.ErrUtxoHashMismatch) ||
+			errors.Is(spend.Err, errors.ErrUtxoSpendingTxPruned) {
 			return true
 		}
 	}
@@ -2147,7 +2148,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		SELECT v.batch_idx,
 		       o.transaction_id, o.coinbase_spending_height, o.utxo_hash,
 		       o.spending_data, o.frozen OR t.frozen AS frozen, t.conflicting, t.locked, o.spendableIn,
-               EXISTS (SELECT 1 FROM deleted_children d WHERE d.parent_id = t.id AND d.child_hash = substr(o.spending_data, 1, 32))
+		       EXISTS (SELECT 1 FROM deleted_children d WHERE d.parent_id = t.id AND d.child_hash = substr(o.spending_data, 1, 32))
 		FROM (VALUES `)
 	args := make([]interface{}, 0, len(batch)*3)
 	paramIdx := 1
@@ -2266,7 +2267,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				continue
 			}
 			if r.childPruned {
-				validationErrors[i] = errors.NewUtxoError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
+				validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
 				continue
 			}
 			// Idempotent re-spend: same spending data — treat as success without UPDATE.
@@ -2778,7 +2779,7 @@ func (s *Store) trySendSpendBatchPerRow(batch []*batchSpend) (retryable bool) {
 				continue
 			}
 			if childPruned {
-				validationErrors[i] = errors.NewUtxoError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
+				validationErrors[i] = errors.NewUtxoSpendingTxPrunedError("[Spend] invalid spend for %s:%d: spending transaction was pruned", spend.TxID, spend.Vout)
 				continue
 			}
 		}

@@ -129,7 +129,7 @@ func TestBuildParentMapUpdateRecordsKeepsCommitAll(t *testing.T) {
 		fieldDeletedChildren: "deletedChildren",
 	}
 
-	batchRecords := s.buildParentMapUpdateRecords(updates)
+	batchRecords, _ := s.buildParentMapUpdateRecords(updates)
 
 	require.Len(t, batchRecords, len(updates))
 
@@ -158,7 +158,7 @@ func TestBuildParentUpdateRecordsKeepCommitAll(t *testing.T) {
 		luaPackage:           "teranode",
 	}
 
-	batchRecords := s.buildParentUpdateRecords(updates)
+	batchRecords, _ := s.buildParentUpdateRecords(updates)
 
 	require.Len(t, batchRecords, len(updates))
 

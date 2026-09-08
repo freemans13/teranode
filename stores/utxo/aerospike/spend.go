@@ -611,7 +611,8 @@ func isSpendRollbackError(err error) bool {
 	return errors.Is(err, errors.ErrSpent) ||
 		errors.Is(err, errors.ErrTxConflicting) ||
 		errors.Is(err, errors.ErrFrozen) ||
-		errors.Is(err, errors.ErrUtxoHashMismatch)
+		errors.Is(err, errors.ErrUtxoHashMismatch) ||
+		errors.Is(err, errors.ErrUtxoSpendingTxPruned)
 }
 
 // needsSpendRollback returns true if any spend failed due to a validation error
@@ -1080,7 +1081,13 @@ func (s *Store) createSpendError(errMsg LuaErrorInfo, batchItem *batchSpend, txI
 		return errors.NewStorageError("[SPEND_BATCH_LUA][%s] UTXO already spent but no spending data provided", txID.String())
 
 	case LuaErrorCodeInvalidSpend:
-		return errors.NewUtxoError("[SPEND_BATCH_LUA][%s] invalid spend for vout %d: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+		// INVALID_SPEND has exactly one producer: the deletedChildren check in
+		// teranode.lua's spend, which rejects a replay of a child the pruner has
+		// already removed. It gets the dedicated pruned-spend code so
+		// isSpendRollbackError can roll the transaction's sibling spends back
+		// instead of leaving them recorded against a transaction that will
+		// never exist.
+		return errors.NewUtxoSpendingTxPrunedError("[SPEND_BATCH_LUA][%s] invalid spend for vout %d: spending transaction was pruned: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
 
 	case LuaErrorCodeFrozen:
 		return errors.NewUtxoFrozenError("[SPEND_BATCH_LUA][%s] UTXO is frozen, vout %d: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)

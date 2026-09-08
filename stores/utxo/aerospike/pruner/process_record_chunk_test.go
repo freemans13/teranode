@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -125,8 +126,18 @@ func TestProcessRecordChunk_MissingExternalTxIsSkippedNotFatal(t *testing.T) {
 		},
 	}
 
+	before := testutil.ToFloat64(prometheusUtxoInputResolutionErrors)
+
 	processed, skipped, err := svc.processRecordChunk(ctx, 1000, chunk)
 	require.NoError(t, err, "an unresolvable record must not fail the whole chunk")
 	require.Equal(t, 1, processed, "the healthy record in the same chunk must still be pruned")
-	require.Equal(t, 1, skipped, "the unresolvable record must be counted as skipped")
+
+	// Deliberately NOT counted as skipped: skippedCount feeds the pre-existing
+	// utxo_pruner_records_deleted_skipped_total, which has always meant "the
+	// defensive check refused to delete this". An unresolvable record is a
+	// different condition and gets its own counter, so the old one keeps its
+	// meaning.
+	require.Equal(t, 0, skipped, "an input-resolution retention must not be reported as a defensive deletion skip")
+	require.Equal(t, float64(1), testutil.ToFloat64(prometheusUtxoInputResolutionErrors)-before,
+		"the retained record must be reported on utxo_pruner_input_resolution_errors_total")
 }

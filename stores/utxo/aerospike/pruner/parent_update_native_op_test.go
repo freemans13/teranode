@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,7 +49,7 @@ func TestBuildParentUpdateRecords_PrefersNativeBuilderOverUDF(t *testing.T) {
 
 	updates := makeParentUpdates(t, 2)
 
-	records := s.buildParentUpdateRecords(updates)
+	records, _ := s.buildParentUpdateRecords(updates)
 	require.Len(t, records, len(updates))
 
 	require.Equal(t, len(updates), nativeCalls, "native builder must be invoked once per parent update")
@@ -65,7 +66,7 @@ func TestBuildParentUpdateRecords_FallsBackToUDFWhenNoNativeBuilder(t *testing.T
 
 	updates := makeParentUpdates(t, 2)
 
-	records := s.buildParentUpdateRecords(updates)
+	records, _ := s.buildParentUpdateRecords(updates)
 	require.Len(t, records, len(updates))
 
 	for i := 0; i < len(records); i++ {
@@ -81,10 +82,76 @@ func TestBuildParentUpdateRecords_PlainMapWriteWhenNoLuaNoNative(t *testing.T) {
 
 	updates := makeParentUpdates(t, 2)
 
-	records := s.buildParentMapUpdateRecords(updates)
+	records, _ := s.buildParentMapUpdateRecords(updates)
 	require.Len(t, records, len(updates))
 
 	for i := 0; i < len(records); i++ {
 		require.Falsef(t, isUDF(records[i]), "parent update %d must be a BatchWrite, not a UDF", i)
 	}
+}
+
+// TestAddParentUpdatesForInput covers what the pruner asks Aerospike to write for
+// one spent outpoint: which parent records get a marker, and how many copies of
+// the child hash each one receives.
+func TestAddParentUpdatesForInput(t *testing.T) {
+	var parent chainhash.Hash
+
+	parent[0] = 0xAA
+
+	var child chainhash.Hash
+
+	child[0] = 0xBB
+
+	newService := func(defensive bool) *Service {
+		return &Service{namespace: "test", set: "utxo", utxoBatchSize: 128, defensiveEnabled: defensive}
+	}
+
+	masterKey := string(parent.CloneBytes())
+	pageKey := string(uaerospike.CalculateKeySource(&parent, 300, 128))
+
+	require.NotEqual(t, masterKey, pageKey, "fixture must use a vout past the first page")
+
+	t.Run("non-defensive writes only the page the spend path reads", func(t *testing.T) {
+		updates := map[string]*parentUpdateInfo{}
+		require.NoError(t, newService(false).addParentUpdatesForInput(updates, &parent, 300, &child))
+		require.Len(t, updates, 1)
+		require.Contains(t, updates, pageKey)
+		require.NotContains(t, updates, masterKey, "the master copy is read by nothing when it differs, and grows without bound")
+	})
+
+	t.Run("defensive also writes the master the pruner scans", func(t *testing.T) {
+		updates := map[string]*parentUpdateInfo{}
+		require.NoError(t, newService(true).addParentUpdatesForInput(updates, &parent, 300, &child))
+		require.Len(t, updates, 2)
+		require.Contains(t, updates, pageKey)
+		require.Contains(t, updates, masterKey)
+	})
+
+	t.Run("first page needs one write in either mode", func(t *testing.T) {
+		for _, defensive := range []bool{false, true} {
+			updates := map[string]*parentUpdateInfo{}
+			require.NoError(t, newService(defensive).addParentUpdatesForInput(updates, &parent, 7, &child))
+			require.Len(t, updates, 1)
+			require.Contains(t, updates, masterKey, "vout 0..127 lives on the master record")
+		}
+	})
+
+	t.Run("a consolidation spend queues one child hash, not one per input", func(t *testing.T) {
+		// 10k outputs of the same paginated parent, spread across pages: every
+		// input asks for the same (parent, child) marker. Without dedup this
+		// produced a 10,000-element list of the identical 64-char hex string in
+		// one batch record.
+		s := newService(true)
+		updates := map[string]*parentUpdateInfo{}
+
+		for vout := uint32(0); vout < 10_000; vout++ {
+			require.NoError(t, s.addParentUpdatesForInput(updates, &parent, vout, &child))
+		}
+
+		require.Len(t, updates, 79, "one entry per output page, plus the master")
+
+		for source, info := range updates {
+			require.Lenf(t, info.childHashes, 1, "parent record %x queued %d copies of the same child", source, len(info.childHashes))
+		}
+	})
 }

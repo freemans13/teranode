@@ -286,7 +286,7 @@ func TestTallyParentUpdateResults(t *testing.T) {
 			okRecord(t), okRecord(t), notFoundRecord(t), brokenRecord(t),
 		}
 
-		tally := tallyParentUpdateResults(records, true, nil)
+		tally := tallyParentUpdateResults(records, nil, true, nil)
 
 		require.Equal(t, 2, tally.success)
 		require.Equal(t, 1, tally.notFound)
@@ -298,7 +298,7 @@ func TestTallyParentUpdateResults(t *testing.T) {
 	// the routine shape when the pruner already deleted the parents.
 	t.Run("all-skipped is not a failure", func(t *testing.T) {
 		tally := tallyParentUpdateResults(
-			[]aerospike.BatchRecordIfc{notFoundRecord(t), notFoundRecord(t)}, true, nil)
+			[]aerospike.BatchRecordIfc{notFoundRecord(t), notFoundRecord(t)}, nil, true, nil)
 
 		require.Zero(t, tally.failed)
 		require.Equal(t, 2, tally.notFound)
@@ -310,14 +310,14 @@ func TestTallyParentUpdateResults(t *testing.T) {
 			aerospike.BinMap{"SUCCESS": map[interface{}]interface{}{"status": "FIRST_FAILURE"}})}
 
 		tally := tallyParentUpdateResults(
-			[]aerospike.BatchRecordIfc{unknownStatus, brokenRecord(t)}, true, nil)
+			[]aerospike.BatchRecordIfc{unknownStatus, brokenRecord(t)}, nil, true, nil)
 
 		require.Equal(t, 2, tally.failed)
 		require.ErrorContains(t, tally.firstErr, "FIRST_FAILURE")
 	})
 
 	t.Run("empty region tallies nothing", func(t *testing.T) {
-		tally := tallyParentUpdateResults(nil, true, nil)
+		tally := tallyParentUpdateResults(nil, nil, true, nil)
 
 		require.Zero(t, tally.success)
 		require.Zero(t, tally.notFound)
@@ -343,7 +343,7 @@ func TestTallyParentUpdateResultsObservesErrors(t *testing.T) {
 			notFoundRecord(t),
 		}
 
-		tally := tallyParentUpdateResults(records, true, func(err error) { seen = append(seen, err) })
+		tally := tallyParentUpdateResults(records, nil, true, func(err error) { seen = append(seen, err) })
 
 		// Both failing records are reported; the successful one is not. Filtering
 		// by result code is the store's job, so KEY_NOT_FOUND is passed on too.
@@ -361,7 +361,7 @@ func TestTallyParentUpdateResultsObservesErrors(t *testing.T) {
 			&aerospike.BatchWrite{BatchRecord: *batchRecordWithErr(t, aerospike.ErrInvalidParam)},
 		}
 
-		tallyParentUpdateResults(records, false, func(error) { called = true })
+		tallyParentUpdateResults(records, nil, false, func(error) { called = true })
 
 		require.False(t, called, "non-mod-teranode records must not reach the native-op observer")
 	})
@@ -371,13 +371,13 @@ func TestTallyParentUpdateResultsObservesErrors(t *testing.T) {
 			&aerospike.BatchWrite{BatchRecord: *batchRecordWithErr(t, aerospike.ErrInvalidParam)},
 		}
 
-		require.NotPanics(t, func() { tallyParentUpdateResults(records, true, nil) })
+		require.NotPanics(t, func() { tallyParentUpdateResults(records, nil, true, nil) })
 	})
 
 	t.Run("successful batches report nothing", func(t *testing.T) {
 		called := false
 
-		tallyParentUpdateResults([]aerospike.BatchRecordIfc{okRecord(t)}, true, func(error) { called = true })
+		tallyParentUpdateResults([]aerospike.BatchRecordIfc{okRecord(t)}, nil, true, func(error) { called = true })
 
 		require.False(t, called)
 	})

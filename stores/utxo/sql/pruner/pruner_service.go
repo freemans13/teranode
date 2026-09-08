@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -12,6 +13,10 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/usql"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/lib/pq"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Ensure Store implements the Pruner Service interface
@@ -21,6 +26,7 @@ var _ pruner.Service = (*Service)(nil)
 type Service struct {
 	safetyWindow     uint32 // Block height retention for child stability verification
 	defensiveEnabled bool   // Enable defensive checks before deleting UTXO transactions
+	engine           string // URL scheme of the store ("postgres" or "sqlite*"); selects engine-specific SQL
 	logger           ulogger.Logger
 	settings         *settings.Settings
 	db               *usql.DB
@@ -41,6 +47,11 @@ type Options struct {
 	// SafetyWindow is the number of blocks a child must be stable before parent deletion
 	// If not specified, defaults to global_blockHeightRetention (288 blocks)
 	SafetyWindow uint32
+
+	// Engine is the store URL scheme ("postgres", "sqlite", "sqlitememory").
+	// Only ON COMMIT DROP support differs, so an empty value is treated as
+	// "not Postgres" and falls back to the portable form.
+	Engine string
 }
 
 // NewService creates a new cleanup service for the SQL store
@@ -66,6 +77,7 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	service := &Service{
 		safetyWindow:     safetyWindow,
 		defensiveEnabled: tSettings.Pruner.UTXODefensiveEnabled,
+		engine:           opts.Engine,
 		logger:           opts.Logger,
 		settings:         tSettings,
 		db:               opts.DB,
@@ -127,24 +139,153 @@ func (s *Service) Prune(ctx context.Context, blockHeight uint32, blockHashStr st
 	return deletedCount, nil
 }
 
-// deleteTombstoned removes transactions that have passed their expiration time.
-// Only deletes parent transactions if their last spending child is mined and stable.
+// Retry budget for the pruning transaction. The transaction below is opened
+// with s.db.BeginTx, which resolves to the embedded stdlib method: every
+// txn.ExecContext on it is a raw *sql.Tx call that does NOT go through usql's
+// per-statement retry or its circuit breaker. On Postgres a SERIALIZABLE
+// transaction can abort with 40001 against the concurrent spend traffic, and on
+// SQLite a deferred transaction that starts as a reader can fail to upgrade with
+// SQLITE_BUSY_SNAPSHOT, which busy_timeout cannot wait out. Both are safe to
+// retry by re-running the whole transaction, so the retry lives here.
+// Mirrors stores/blockchain/sql/sql.go rebuildOnMainChainFlag.
+const (
+	maxPruneAttempts   = 3
+	pruneRetryBaseWait = 100 * time.Millisecond
+)
+
+// isPruneRetryable reports whether err is a conflict that re-running the whole
+// pruning transaction can clear: a Postgres serialization failure or deadlock,
+// or a SQLite lock/snapshot conflict. usql's own isRetriable covers the same
+// ground for statements that go through usql, but this transaction does not,
+// and its SQLite branch matches only the primary SQLITE_BUSY code, never the
+// extended SQLITE_BUSY_SNAPSHOT a WAL writer-upgrade raises.
+func isPruneRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == usql.PgErrSerializationFail || pgErr.Code == usql.PgErrDeadlockDetected
+	}
+
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		code := string(pqErr.Code)
+
+		return code == usql.PgErrSerializationFail || code == usql.PgErrDeadlockDetected
+	}
+
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		switch sqliteErr.Code() {
+		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_BUSY_SNAPSHOT, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_LOCKED_SHAREDCACHE:
+			return true
+		}
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
+}
+
+// deleteTombstoned removes transactions that have passed their expiration time,
+// re-running the whole transaction on a serialization or lock conflict.
+//
+// Only deletes parent transactions if their last spending child is mined and
+// stable (defensive mode only).
 func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int64, error) {
+	var (
+		count int64
+		err   error
+	)
+
+	for attempt := 0; attempt < maxPruneAttempts; attempt++ {
+		count, err = s.deleteTombstonedTx(ctx, blockHeight)
+		if err == nil || !isPruneRetryable(err) {
+			return count, err
+		}
+
+		if attempt == maxPruneAttempts-1 {
+			break
+		}
+
+		backoff := pruneRetryBaseWait << uint(attempt)
+
+		s.logger.Warnf("[pruner] serialization/lock conflict on pruning transaction (attempt %d/%d), retrying in %s: %v",
+			attempt+1, maxPruneAttempts, backoff, err)
+
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+
+	s.logger.Warnf("[pruner] serialization/lock conflict persisted after %d attempts: %v", maxPruneAttempts, err)
+
+	return 0, err
+}
+
+// deleteTombstonedTx runs one attempt of the pruning transaction: select the
+// candidates, write a replay marker on every parent of every candidate, then
+// delete the candidates. Marker-before-delete is the whole point, so the two
+// must commit together.
+//
+// LIMITATION - the protection is not retroactive. A marker only exists for a
+// child this code pruned. On a node that was already pruning before this landed,
+// every child pruned by the old code left no marker, and the child row is gone,
+// so nothing can reconstruct one. Two consequences, both permanent for that
+// backlog:
+//
+//   - Spend path: a replay of such a child still takes the idempotent re-spend
+//     branch in Store.trySendSpendBatchBulk / trySendSpendBatchPerRow and the
+//     caller can recreate the transaction. That is the bug this change fixes,
+//     and it stays open for children pruned before the upgrade on every
+//     deployment that was already pruning.
+//   - Prune path (defensive mode only): the deleted_children escape clause below
+//     fires only for markered children, so a parent whose child was pruned by
+//     the old code keeps failing the unstable-child test and can never be
+//     pruned. Not a regression - the old code had no escape clause at all, so
+//     such a parent was already unprunable - but this change does not clear it
+//     either. Defensive mode is off by default (settings.conf
+//     pruner_utxoDefensiveEnabled = false), so the deployed configuration is
+//     unaffected on the prune side.
+//
+// Neither can be backfilled from inside the pruner. "Child row absent" is NOT a
+// safe substitute for a marker: SequentialSpendAndCreate spends before it
+// creates, so a legitimately in-flight child is also absent while its parent's
+// output already names it, and inferring "pruned" there would let the pruner
+// delete a parent out from under a child that is about to exist.
+//
+// An operator who wants the backlog cleared can run the equivalent one-shot
+// backfill with the node stopped, when no create can be in flight:
+//
+//	INSERT INTO deleted_children (parent_id, child_hash)
+//	SELECT DISTINCT o.transaction_id, substr(o.spending_data, 1, 32)
+//	FROM outputs o
+//	WHERE o.spending_data IS NOT NULL
+//	  AND NOT EXISTS (SELECT 1 FROM transactions c WHERE c.hash = substr(o.spending_data, 1, 32))
+//	ON CONFLICT DO NOTHING;
+//
+// That is a full scan of outputs and is deliberately not run automatically: on a
+// mainnet-sized store it is hours of work inside one transaction, which is not
+// something a node should do on every boot.
+func (s *Service) deleteTombstonedTx(ctx context.Context, blockHeight uint32) (int64, error) {
 	// Use configured safety window from settings
 	safetyWindow := s.safetyWindow
 
-	// Defensive child verification is conditional on the UTXODefensiveEnabled setting
-	// When disabled, parents are deleted without verifying children are stable
-	// Each branch is a complete literal statement rather than a fragment
+	// Defensive child verification is conditional on the UTXODefensiveEnabled
+	// setting. When disabled, parents are deleted without verifying children are
+	// stable. Each branch is a complete literal statement rather than a fragment
 	// concatenated at runtime, so no part of the SQL is ever built from data.
-	var createCandidates string
+	var candidateSelect string
 
 	args := []interface{}{blockHeight}
 
 	if !s.defensiveEnabled {
 		// Defensive mode disabled - delete all transactions past their expiration
-		createCandidates = `
-			CREATE TEMP TABLE utxo_prune_candidates AS
+		candidateSelect = `
 			SELECT id FROM transactions
 			WHERE delete_at_height IS NOT NULL
 			  AND delete_at_height <= $1
@@ -152,8 +293,7 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 	} else {
 		// Defensive mode enabled - verify ALL spending children are stable before deletion
 		// This prevents orphaning any child transaction
-		createCandidates = `
-			CREATE TEMP TABLE utxo_prune_candidates AS
+		candidateSelect = `
 			SELECT id FROM transactions
 			WHERE id IN (
 				SELECT t.id
@@ -190,35 +330,73 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 		args = append(args, safetyWindow)
 	}
 
-	// Use one serializable snapshot for candidate selection, parent markers and
-	// deletion. Cross-record atomicity is required even with defensive mode off.
+	// Isolation note, corrected. LevelSerializable is honoured by Postgres only.
+	// modernc.org/sqlite's conn.BeginTx reads opts.ReadOnly and the DSN _txlock
+	// mode and never inspects opts.Isolation, and because the driver implements
+	// driver.ConnBeginTx, database/sql does not reject the level either.
+	// util/sql.go builds the SQLite DSN with no _txlock, so what we actually get
+	// there is a plain deferred BEGIN. The cross-statement atomicity this
+	// function needs still holds on SQLite - one writer at a time, and the
+	// transaction rolls back as a unit - but it holds because SQLite serialises
+	// writers, not because the level was asked for. A deferred BEGIN that starts
+	// as a reader can also fail to upgrade with SQLITE_BUSY_SNAPSHOT, which is
+	// why deleteTombstoned retries the whole transaction.
 	txn, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return 0, errors.NewStorageError("failed to begin pruning transaction", err)
 	}
+
 	defer func() { _ = txn.Rollback() }()
 
-	// Materialize the candidates once: newly inserted markers can make another
-	// parent eligible in defensive mode, but that parent needs its own markers
-	// before a later prune can delete it. Temporary tables are connection-local
-	// and this transaction owns the connection until commit or rollback.
-	if _, err := txn.ExecContext(ctx, createCandidates, args...); err != nil {
-		return 0, errors.NewStorageError("failed to select pruning candidates", err)
+	// candidateRef is the sub-select that both the marker INSERT and the DELETE
+	// run against; candidateArgs are its parameters.
+	candidateRef := candidateSelect
+	candidateArgs := args
+
+	if s.defensiveEnabled {
+		// Defensive mode only: materialise the candidates first. The marker
+		// INSERT below changes the defensive predicate - a newly marked parent
+		// can become eligible - so re-evaluating it in the DELETE would delete
+		// parents that never got markers of their own. The non-defensive
+		// predicate (delete_at_height IS NOT NULL AND delete_at_height <= $1)
+		// cannot be changed by anything inside this transaction, so that path
+		// skips the temp table and its DDL entirely.
+		//
+		// Temporary tables are connection-local and this transaction owns the
+		// connection until commit or rollback. Postgres drops it at COMMIT via
+		// ON COMMIT DROP; SQLite has no such clause and keeps a committed temp
+		// table on the connection, so the leading DROP TABLE IF EXISTS clears
+		// any leftover. Neither adds a failure path AFTER the delete has already
+		// happened, which is the point: the previous explicit DROP ran after
+		// RowsAffected and threw away a completed prune if it errored.
+		if _, err := txn.ExecContext(ctx, "DROP TABLE IF EXISTS utxo_prune_candidates"); err != nil {
+			return 0, errors.NewStorageError("failed to clear stale pruning candidates", err)
+		}
+
+		createCandidates := "CREATE TEMP TABLE utxo_prune_candidates " + s.onCommitDrop() + "AS" + candidateSelect
+		if _, err := txn.ExecContext(ctx, createCandidates, args...); err != nil {
+			return 0, errors.NewStorageError("failed to select pruning candidates", err)
+		}
+
+		candidateRef = "SELECT id FROM utxo_prune_candidates"
+		candidateArgs = nil
 	}
-	deleteQuery := "DELETE FROM transactions WHERE id IN (SELECT id FROM utxo_prune_candidates)"
+
 	markerQuery := `INSERT INTO deleted_children (parent_id, child_hash)
   SELECT DISTINCT parent.id, child.hash
-  FROM utxo_prune_candidates candidate
+  FROM (` + candidateRef + `) candidate
   JOIN transactions child ON child.id = candidate.id
   JOIN inputs i ON i.transaction_id = child.id
   JOIN transactions parent ON parent.hash = i.previous_transaction_hash
-  WHERE true
   ON CONFLICT (parent_id, child_hash) DO NOTHING`
-	if _, err := txn.ExecContext(ctx, markerQuery); err != nil {
+
+	if _, err := txn.ExecContext(ctx, markerQuery, candidateArgs...); err != nil {
 		return 0, errors.NewStorageError("failed to mark pruned children", err)
 	}
-	result, err := txn.ExecContext(ctx, deleteQuery)
 
+	deleteQuery := "DELETE FROM transactions WHERE id IN (" + candidateRef + ")"
+
+	result, err := txn.ExecContext(ctx, deleteQuery, candidateArgs...)
 	if err != nil {
 		return 0, errors.NewStorageError("failed to delete transactions", err)
 	}
@@ -228,13 +406,21 @@ func (s *Service) deleteTombstoned(ctx context.Context, blockHeight uint32) (int
 		return 0, errors.NewStorageError("failed to get rows affected", err)
 	}
 
-	if _, err := txn.ExecContext(ctx, "DROP TABLE utxo_prune_candidates"); err != nil {
-		return 0, errors.NewStorageError("failed to clear pruning candidates", err)
-	}
-
 	if err := txn.Commit(); err != nil {
 		return 0, errors.NewStorageError("failed to commit pruning transaction", err)
 	}
 
 	return count, nil
+}
+
+// onCommitDrop returns the Postgres ON COMMIT DROP clause for the candidates
+// temp table, or an empty string on engines that do not support it. SQLite has
+// no ON COMMIT clause, so there the leading DROP TABLE IF EXISTS is what stops
+// the table surviving onto the next prune on the same pooled connection.
+func (s *Service) onCommitDrop() string {
+	if s.engine == "postgres" {
+		return "ON COMMIT DROP "
+	}
+
+	return ""
 }
