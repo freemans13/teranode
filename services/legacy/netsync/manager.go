@@ -2856,22 +2856,45 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 	}
 }
 
-// advanceHeaderListFor moves the header list on for a block that has arrived.
+// advanceHeaderListFor takes a committed block's header out of the list,
+// wherever in the list it sits.
 //
-// When in headers-first mode, if the block matches the hash of the first header
-// in the list of headers that are being fetched, it is eligible for less
-// validation since the headers have already been verified to link together and
-// are valid up to the next checkpoint. The list entry is removed for all blocks
-// except the checkpoint, which is needed to verify that the next round of
-// headers links properly.
+// It used to remove a header only when the arriving hash matched the FRONT, and
+// that cost mainnet twenty-eight minutes on 2026-09-09. Two paths commit a
+// parked block and they advance in opposite order: the sweep commits and then
+// advances, the dispatcher advances and then commits, and both race for the
+// same park. So the dispatcher could advance for block N+1 while N was still
+// mid-commit and therefore still the front. N+1 matched nothing and was left
+// behind; N's commit then removed N, and N+1 sat at the front as a block
+// already in the chain with nobody left who would ever advance for it.
+//
+// Downstream that is expensive, because two mechanisms read the list as "blocks
+// we still need". The frontier is published from the front, so it named a
+// committed block and the frontier race asked seven peers for it in turn. And
+// rewindToLowestHeader looks released hashes up in the header index, so every
+// time one of those peers was lost the download cursor wound back to a height
+// the chain had passed. The node ran dry for eight minutes and forty-four
+// seconds. See TestSyncManager_ACommittedBlockLeavesTheHeaderListWhateverTheOrder.
+//
+// Matching by hash rather than by position makes both orderings safe, and needs
+// no new state: headerIndex already maps hash to list element.
+//
+// Three things it must not disturb. The checkpoint node stays in the list to
+// anchor the next round of headers, and is still reported only from the front,
+// which is safe because a checkpoint block can only commit once every block
+// below it has, and with this fix those have all left the list. The frontier
+// and the racers are touched only when the FRONT changed, so a header taken out
+// of the middle leaves both exactly as they were. And startHeader, which every
+// download walk starts from, is a pointer to a list element: removing the
+// element it points at would detach it, and a detached element answers Next()
+// with nil, so the walk would silently ask for nothing. That hazard could not
+// arise while only the front was ever removed, because the front is always
+// behind the cursor.
 //
 // It returns whether this was the checkpoint block, and the header node it took
-// off the front — nil when the block was not the front, or was the checkpoint
-// and so was left in place. Both the arriving-block path and the park drain go
-// through here: a block committed off disk never passes the arrival path, so
-// without this the front would stick on a block we already have, the next block
-// would never match it, the frontier would never be republished and the
-// checkpoint transition would never fire.
+// out — nil when the block was not in the list, or was the checkpoint and so was
+// left in place. Callers keep that node so a block given up on later can be put
+// back into the walk, and parkedBlockHeight reads its height.
 func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpointBlock bool, removedFront *headerNode) {
 	if !sm.headersFirstMode.Load() {
 		return false, nil
@@ -2882,32 +2905,44 @@ func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpo
 	// into a serialisation bug.
 	sm.headerMu.Lock()
 
-	firstNodeEl := sm.headerList.Front()
-	if firstNodeEl != nil {
-		firstNode := firstNodeEl.Value.(*headerNode)
+	// headerIndex maps hash to list element and is written at every insertion
+	// that touches headerList — resetHeaderStateLocked, handleHeadersMsg and
+	// reinsertHeaderLocked's caller — so a hash in the list is a hash in the
+	// index. Looking it up here is what makes the removal independent of
+	// position.
+	if e := sm.headerIndex[blockHash]; e != nil {
+		if node, ok := e.Value.(*headerNode); ok && node.hash != nil {
+			wasFront := e == sm.headerList.Front()
 
-		if blockHash.IsEqual(firstNode.hash) {
-			if sm.nextCheckpoint != nil && firstNode.hash.IsEqual(sm.nextCheckpoint.Hash) {
-				isCheckpointBlock = true
+			if sm.nextCheckpoint != nil && node.hash.IsEqual(sm.nextCheckpoint.Hash) {
+				// Left in the list to anchor the next round of headers.
+				isCheckpointBlock = wasFront
 			} else {
-				sm.unindexHeaderLocked(firstNodeEl, *firstNode.hash)
-				sm.headerList.Remove(firstNodeEl)
+				// Read Next() before the removal, because a removed element
+				// answers Next() with nil and the cursor would be left detached.
+				if sm.startHeader == e {
+					sm.startHeader = e.Next()
+				}
 
-				removedFront = firstNode
+				sm.unindexHeaderLocked(e, *node.hash)
+				sm.headerList.Remove(e)
+
+				removedFront = node
 			}
 
-			// The block everything else was queued behind has arrived. Tidy
-			// up after any race for it, then move the frontier on. At a
-			// checkpoint the header node stays in the list to anchor the
-			// next round of headers, but the block itself is no longer
-			// outstanding, so there is nothing to race until the next batch
-			// of getdata requests goes out.
-			sm.noteRaceWinner(blockHash)
+			// Only a change at the FRONT is visible to the frontier and to the
+			// racers, so a header taken out of the middle stops here. The block
+			// everything is waiting on has not changed, and nobody was racing
+			// this one: setFrontier drops the racers whenever the frontier
+			// moves, so they only ever belong to the current front.
+			if wasFront {
+				sm.noteRaceWinner(blockHash)
 
-			if isCheckpointBlock {
-				sm.clearFrontier()
-			} else {
-				sm.publishFrontierLocked(time.Now())
+				if isCheckpointBlock {
+					sm.clearFrontier()
+				} else {
+					sm.publishFrontierLocked(time.Now())
+				}
 			}
 		}
 	}
