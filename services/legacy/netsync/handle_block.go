@@ -23,6 +23,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
 	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -614,10 +615,39 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 		}
 	}
 
+	// Concurrent, because there is nothing to serialise. This loop used to be a
+	// plain indexed for, and on mainnet block 759245 it spent 34.5 seconds
+	// writing 25 subtrees at 1.38 seconds each while 47 of the box's 48 cores sat
+	// idle. Each iteration touches only its own index of three slices, and
+	// writeSubtree reads nothing from the manager but the logger, the settings
+	// and the store, so the iterations share no mutable state. The three blob
+	// keys it writes derive from that subtree's own root hash, so two iterations
+	// cannot collide on a key either.
+	//
+	// The limit is derived from the store's own write concurrency rather than
+	// chosen, so the two cannot drift: each writeSubtree takes three of the
+	// store's write permits, one per artefact, and going past what the store will
+	// admit converts parallelism into queueing. It is then capped, because the
+	// binding constraint here is not the store but the heap: this runs with a
+	// decoded block resident against a soft memory limit, and go-bt's extended
+	// write path allocates heavily per transaction, so widening this multiplies
+	// allocation pressure at exactly the wrong moment. Four is deliberately
+	// short of what the store would allow.
+	writeConcurrency := parkWriteConcurrency(sm.settings)
+
+	wg, wgCtx := errgroup.WithContext(ctx)
+	wg.SetLimit(writeConcurrency)
+
 	for i := 0; i < numSubtrees; i++ {
-		if err = sm.writeSubtree(ctx, bi, slices[i], subtreeDatas[i], subtreeMetas[i], quickValidationMode); err != nil {
-			return nil, nil, 0, err
-		}
+		i := i
+
+		wg.Go(func() error {
+			return sm.writeSubtree(wgCtx, bi, slices[i], subtreeDatas[i], subtreeMetas[i], quickValidationMode)
+		})
+	}
+
+	if err = wg.Wait(); err != nil {
+		return nil, nil, 0, err
 	}
 
 	// In quickValidationMode the transactions and subtree files have already been
@@ -757,6 +787,39 @@ func (sm *SyncManager) checkSubtreeFromBlock(ctx context.Context, bi blockIdent,
 	}
 
 	return nil
+}
+
+// subtreeWriteArtefacts is how many of the blob store's write permits one
+// writeSubtree call takes: the subtree's node file, its transaction data and its
+// meta, each through its own file storer.
+const subtreeWriteArtefacts = 3
+
+// maxConcurrentSubtreeWrites is the ceiling on how many subtrees are written at
+// once, whatever the store would allow. The store is not the binding constraint:
+// this runs with a whole decoded block resident against a soft memory limit, and
+// the extended-transaction write path allocates heavily per transaction, so
+// widening this multiplies allocation pressure at the worst moment. Four
+// recovers most of a serial loop's cost while leaving the heap alone.
+const maxConcurrentSubtreeWrites = 4
+
+// parkWriteConcurrency reports how many subtree writes may run at once. Derived
+// from the store's own limit so the two cannot drift into over-subscription,
+// where extra goroutines only queue for permits, then capped for the heap.
+func parkWriteConcurrency(tSettings *settings.Settings) int {
+	if tSettings == nil {
+		return 1
+	}
+
+	permits := tSettings.Block.FileStoreWriteConcurrency / subtreeWriteArtefacts
+	if permits > maxConcurrentSubtreeWrites {
+		permits = maxConcurrentSubtreeWrites
+	}
+
+	if permits < 1 {
+		permits = 1
+	}
+
+	return permits
 }
 
 func (sm *SyncManager) writeSubtree(ctx context.Context, bi blockIdent, subtree *subtreepkg.Subtree,
