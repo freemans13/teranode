@@ -388,8 +388,22 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 		}
 	}
 
+	// Counted so the decline can say why nobody qualified, rather than only that
+	// nobody did. "No other peer is worth asking" was true on mainnet for
+	// thirteen minutes at a stretch and named none of the four reasons it can
+	// mean, which is a diagnostic that stops exactly where it gets interesting.
+	var skipped struct {
+		notCandidate int
+		owesIt       int
+		alreadyRaced int
+		coolingDown  int
+		tooShort     int
+	}
+
 	for p, state := range sm.peerStates.Range() {
 		if state == nil || !state.syncCandidate || !p.Connected() {
+			skipped.notCandidate++
+
 			continue
 		}
 
@@ -399,10 +413,14 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 		// it again buys nothing while the sync peer — the one peer this used to
 		// rule out — is frequently the healthiest peer available to ask.
 		if sm.blockDownloads.HasOwner(p, hash) {
+			skipped.owesIt++
+
 			continue
 		}
 
 		if _, already := racing[p]; already {
+			skipped.alreadyRaced++
+
 			continue
 		}
 
@@ -412,18 +430,24 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 		// holding, and without this the very next race hands the slot straight
 		// back to it and the fix buys nothing.
 		if state.inDemotionCooldown() {
+			skipped.coolingDown++
+
 			continue
 		}
 
 		// No point asking a peer that has not told us it has the block.
 		if height > 0 && p.LastBlock() < height {
+			skipped.tooShort++
+
 			continue
 		}
 
 		return hash, height, p, true
 	}
 
-	sm.noteRaceDeclined("no other peer is worth asking")
+	sm.noteRaceDeclined(fmt.Sprintf(
+		"no other peer is worth asking: %d not a candidate, %d already owe it, %d already racing, %d cooling down after a demotion, %d too short to have it",
+		skipped.notCandidate, skipped.owesIt, skipped.alreadyRaced, skipped.coolingDown, skipped.tooShort))
 
 	return none, 0, nil, false
 }
