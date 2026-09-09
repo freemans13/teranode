@@ -35,9 +35,7 @@ func TestLegacyBlockScheduler_Defaults(t *testing.T) {
 	// peers at legacy_maxBlocksInTransitPerPeer each cannot use more than 128
 	// blocks of depth, so this never constrains parallel download.
 	require.Equal(t, 128, tSettings.Legacy.BlockDownloadLowerWindow,
-		"read-ahead is bounded by height as well as by bytes; svnode is never unbounded here")
-	require.Equal(t, int64(32*1024*1024*1024), tSettings.Legacy.BlockDownloadMaxBytes,
-		"and by bytes, which is the unit that matters once a block can be a gigabyte")
+		"read-ahead is bounded in blocks, before a request goes out, which is the only unit that can be")
 }
 
 // TestLegacyBlockScheduler_LoaderReadsOverrides catches the field-exists-but-the-

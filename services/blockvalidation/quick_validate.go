@@ -1494,8 +1494,13 @@ func (u *BlockValidation) processSubtreeBatch(
 
 			batch.hasInBlockParent = append(batch.hasInBlockParent, inBlockParent)
 
-			extendedTxsFromPrevBatches[*tx.TxIDChainHash()] = tx
-			tx.SetTxHash(tx.TxIDChainHash())
+			// Computed once, cached, then used; see the same change in
+			// extendBatch above for why two calls cost two full passes over the
+			// block.
+			txID := tx.TxIDChainHash()
+			tx.SetTxHash(txID)
+
+			extendedTxsFromPrevBatches[*txID] = tx
 			batch.batchTxs = append(batch.batchTxs, tx)
 		}
 		batch.txRanges[i] = [2]int{startIdx, len(batch.batchTxs)}
@@ -2394,8 +2399,23 @@ func (u *BlockValidation) extendBatch(
 
 			batch.hasInBlockParent = append(batch.hasInBlockParent, inBlockParent)
 
-			extendedTxs[*tx.TxIDChainHash()] = tx
-			tx.SetTxHash(tx.TxIDChainHash())
+			// Computed once, cached, then used. It used to be called twice, and
+			// TxIDChainHash never populates its own cache: it returns
+			// &chainhash.DoubleHashH(tx.Bytes()) on every miss (go-bt tx.go:353),
+			// so each call re-serialised the whole transaction and double-hashed
+			// it. Two calls per transaction over a 100,001-transaction block is
+			// two full passes over 3.44 GB on the one goroutine that owns this
+			// stage, because it owns the block-wide extendedTxs map and cannot be
+			// parallelised. Measured at 17.5 microseconds and 41 KB allocated per
+			// call for a 33 KB transaction, so a pass costs 1.75 core-seconds and
+			// 4.1 GB of garbage against a heap already at its soft limit.
+			//
+			// SetTxHash before the map insert rather than after, so every later
+			// call anywhere in the pipeline is a cache hit too.
+			txID := tx.TxIDChainHash()
+			tx.SetTxHash(txID)
+
+			extendedTxs[*txID] = tx
 			batch.batchTxs = append(batch.batchTxs, tx)
 		}
 		batch.txRanges[i] = [2]int{startIdx, len(batch.batchTxs)}
