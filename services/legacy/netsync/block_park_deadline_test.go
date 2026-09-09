@@ -50,10 +50,10 @@ func (s stallingStore) Del(ctx context.Context, _ []byte, _ fileformat.FileType,
 // deadline so the test does not have to wait out a realistic one.
 func newStalledPark(timeout time.Duration) *blockPark {
 	return &blockPark{
-		logger:       ulogger.TestLogger{},
-		store:        stallingStore{},
-		dir:          "/nonexistent",
-		maxBytes:     1 << 30,
+		logger: ulogger.TestLogger{},
+		store:  stallingStore{},
+		dir:    "/nonexistent",
+
 		storeTimeout: timeout,
 		entries:      make(map[chainhash.Hash]*parkedBlock),
 		children:     make(map[chainhash.Hash][]chainhash.Hash),

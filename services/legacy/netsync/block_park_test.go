@@ -252,15 +252,21 @@ func TestBlockPark_RefusesOverBudgetAndWritesNothing(t *testing.T) {
 	msgBlock := blocks[0].MsgBlock()
 	hash := msgBlock.BlockHash()
 
-	t.Run("byte budget", func(t *testing.T) {
+	t.Run("size alone never refuses", func(t *testing.T) {
+		// There used to be a byte budget here and it was removed, because it
+		// could only be evaluated after the block had been downloaded and
+		// decoded, so it never saved any bandwidth, and because a park filled
+		// above a hole would refuse the very block that would drain it. The
+		// bound is now the number of blocks held, and the disk is bounded
+		// upstream by the download walk's read-ahead depth, in blocks.
 		park, dir := newTestPark(t, "")
-		park.maxBytes = int64(msgBlock.SerializeSize()) - 1
 
-		require.Equal(t, parkUnavailable,
+		require.Equal(t, parkAccepted,
 			park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: msgBlock.Header.PrevBlock}, msgBlock))
 
-		require.Empty(t, parkDirEntries(t, dir), "a block that does not fit must not be written")
-		require.Zero(t, park.Bytes(), "a refused block must not be charged")
+		require.NotEmpty(t, parkDirEntries(t, dir), "the block must be written whatever its size")
+		require.Equal(t, int64(msgBlock.SerializeSize()), park.Bytes(),
+			"the byte total is still tracked, for the gauge, it just no longer refuses")
 	})
 
 	t.Run("entry cap", func(t *testing.T) {
@@ -342,9 +348,12 @@ func TestBlockPark_RecoversWhatAPreviousRunLeftBehind(t *testing.T) {
 		"a blob the store could not open says nothing about the block, so recovery must leave it for the next start")
 }
 
-// TestBlockPark_RecoveryStopsAtThisRunsBudget: a previous run's park must never
-// exceed the budget this run is configured with.
-func TestBlockPark_RecoveryStopsAtThisRunsBudget(t *testing.T) {
+// TestBlockPark_RecoveryAdoptsEverythingAPreviousRunParked: recovery used to
+// stop at a byte budget and delete whatever it could not afford, which threw
+// away fully downloaded blocks on every restart for no gain. With the byte
+// budget gone it adopts the lot, and the only thing that can still stop it is
+// the cap on how many blocks the park holds.
+func TestBlockPark_RecoveryAdoptsEverythingAPreviousRunParked(t *testing.T) {
 	park, dir := newTestPark(t, "")
 
 	blocks := minedBlocks(t, 3)
@@ -360,11 +369,10 @@ func TestBlockPark_RecoveryStopsAtThisRunsBudget(t *testing.T) {
 	fresh, _ := newTestPark(t, "")
 	fresh.dir = dir
 	fresh.store = park.store
-	fresh.maxBytes = int64(blocks[0].MsgBlock().SerializeSize())
 	fresh.Recover(context.Background())
 
-	require.Equal(t, 1, fresh.Len(), "recovery must stop at this run's budget")
-	require.LessOrEqual(t, fresh.Bytes(), fresh.maxBytes)
+	require.Equal(t, 3, fresh.Len(),
+		"every block a previous run parked is adopted; there is no byte budget to stop at")
 
 	blobs := 0
 
@@ -374,7 +382,42 @@ func TestBlockPark_RecoveryStopsAtThisRunsBudget(t *testing.T) {
 		}
 	}
 
-	require.Equal(t, 1, blobs, "blocks recovery cannot afford must be deleted, not left to leak")
+	require.Equal(t, 3, blobs,
+		"a restart must not delete blocks it has already paid to download")
+}
+
+// TestBlockPark_TheBlockCountStillBounds proves the surviving bound actually
+// bounds. Removing the byte budget left the number of blocks held as the park's
+// only limit, so if that stopped refusing there would be nothing at all between
+// an out-of-order flood and the disk.
+func TestBlockPark_TheBlockCountStillBounds(t *testing.T) {
+	park, _ := newTestPark(t, "")
+
+	blocks := minedBlocks(t, 2)
+	first := blocks[0].MsgBlock()
+	second := blocks[1].MsgBlock()
+
+	require.Equal(t, parkAccepted,
+		park.Park(context.Background(), parkedBlock{hash: first.BlockHash(), prevBlock: first.Header.PrevBlock}, first))
+
+	// Filled to the cap directly, because parking maxParkedEntries real blocks
+	// would take minutes. The entries map is what the clause counts.
+	park.mu.Lock()
+	for i := 0; i < maxParkedEntries; i++ {
+		h := chainhash.Hash{}
+		h[0] = byte(i)
+		h[1] = byte(i >> 8)
+		h[2] = byte(i >> 16)
+		park.entries[h] = &parkedBlock{hash: h}
+	}
+	held := len(park.entries)
+	park.mu.Unlock()
+
+	require.GreaterOrEqual(t, held, maxParkedEntries, "precondition: the park is at its cap")
+
+	require.Equal(t, parkUnavailable,
+		park.Park(context.Background(), parkedBlock{hash: second.BlockHash(), prevBlock: second.Header.PrevBlock}, second),
+		"at its block limit the park must refuse, or nothing bounds the disk")
 }
 
 // TestBlockPark_IsOffWhenItCannotBeRecovered covers the two settings-only kill
@@ -396,13 +439,6 @@ func TestBlockPark_IsOffWhenItCannotBeRecovered(t *testing.T) {
 	t.Run("legacy_parkOutOfOrderBlocks false", func(t *testing.T) {
 		tSettings := base(t)
 		tSettings.Legacy.ParkOutOfOrderBlocks = false
-
-		require.Nil(t, newBlockPark(ulogger.TestLogger{}, tSettings, blob_memory.New()))
-	})
-
-	t.Run("legacy_parkMaxBytes zero", func(t *testing.T) {
-		tSettings := base(t)
-		tSettings.Legacy.ParkMaxBytes = 0
 
 		require.Nil(t, newBlockPark(ulogger.TestLogger{}, tSettings, blob_memory.New()))
 	})

@@ -229,10 +229,10 @@ const (
 // the many tests that build SyncManager as a struct literal, and any deployment
 // that turns the park off, take the old discard path unchanged.
 type blockPark struct {
-	logger   ulogger.Logger
-	store    blob.Store
-	dir      string
-	maxBytes int64
+	logger ulogger.Logger
+	store  blob.Store
+	dir    string
+
 	// storeTimeout is the ceiling on ONE blob store operation. Every one of the
 	// park's — write, read back, delete, and the header peek the restart scan
 	// makes — carries it, because all of them wait on the same process-wide
@@ -272,11 +272,6 @@ func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blo
 		return nil
 	}
 
-	if tSettings.Legacy.ParkMaxBytes <= 0 {
-		logger.Infof("[blockPark] legacy_parkMaxBytes is 0, so out-of-order blocks will be discarded")
-		return nil
-	}
-
 	dir := parkDirectory(tSettings.Legacy.TempStore)
 	if dir == "" {
 		scheme := "none"
@@ -297,13 +292,12 @@ func newBlockPark(logger ulogger.Logger, tSettings *settings.Settings, store blo
 		storeTimeout = parkMinStoreTimeout
 	}
 
-	logger.Infof("[blockPark] parking out-of-order blocks in %s, up to %d bytes, store deadline %s", dir, tSettings.Legacy.ParkMaxBytes, storeTimeout)
+	logger.Infof("[blockPark] parking out-of-order blocks in %s, up to %d blocks, store deadline %s", dir, maxParkedEntries, storeTimeout)
 
 	return &blockPark{
 		logger:       logger,
 		store:        store,
 		dir:          dir,
-		maxBytes:     tSettings.Legacy.ParkMaxBytes,
 		storeTimeout: storeTimeout,
 		entries:      make(map[chainhash.Hash]*parkedBlock),
 		children:     make(map[chainhash.Hash][]chainhash.Hash),
@@ -466,8 +460,31 @@ func (p *blockPark) Admit(entry parkedBlock, msgBlock *wire.MsgBlock) (parkedBlo
 		return *existing, admitAlreadyHeld
 	}
 
-	if len(p.entries) >= maxParkedEntries || p.bytes+entry.size > p.maxBytes {
-		p.logger.Warnf("[blockPark][%s] no room for a %d byte block: %d blocks holding %d of %d bytes", entry.hash, entry.size, len(p.entries), p.bytes, p.maxBytes)
+	// Bounded by the number of blocks held, and by nothing else. There used to be
+	// a byte budget beside this, and it was the wrong shape twice over.
+	//
+	// It was evaluated too late to save anything. A block's size is only known
+	// once it has been downloaded and decoded, so the budget could not stop the
+	// bandwidth being spent; all it could do was throw away a block already in
+	// hand. On mainnet on 2026-09-09 that cost 153 discarded gigabyte-class
+	// downloads in two hours, one every 47 seconds, each one re-requested and
+	// paid for again.
+	//
+	// Worse, it could refuse the one block that would empty the park. Its defence
+	// was that the oldest parked block is closest to being committable, so the
+	// newest arrival is the right one to turn away. That is false whenever there
+	// is a hole: the block closest to being committable is the one whose parent
+	// is in the chain, and with a hole that is the newest arrival, not the oldest
+	// resident. A park filled above a hole therefore refused the block that would
+	// have drained it, on every retry, with nothing evicting to make room.
+	//
+	// What bounds the disk instead is the download walk's read-ahead depth, which
+	// is legacy_blockDownloadLowerWindow and is expressed in blocks. That is the
+	// bound SV Node uses (fTooFarAhead against MinBlocksToKeep, checked before a
+	// block is written rather than after), and being in blocks it can be checked
+	// before the bandwidth is spent.
+	if len(p.entries) >= maxParkedEntries {
+		p.logger.Warnf("[blockPark][%s] no room for a %d byte block: the park already holds %d blocks, its limit", entry.hash, entry.size, len(p.entries))
 
 		return parkedBlock{}, admitNoRoom
 	}
@@ -1184,8 +1201,8 @@ func (p *blockPark) Recover(ctx context.Context) {
 			size = 0
 		}
 
-		if adopted >= maxParkedEntries || adoptedBytes+size > p.maxBytes {
-			// A previous run's park must never exceed this run's budget.
+		if adopted >= maxParkedEntries {
+			// A previous run's park must never exceed what this run will hold.
 			p.Delete(ctx, parkedBlock{hash: *hash})
 
 			discarded++
