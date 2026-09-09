@@ -240,7 +240,19 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// has cloned the scripts out, nothing references block/msgBlock any more,
 	// so the multi-GB wire block and its decode arena can be collected while
 	// the heavy extend/subtree/utxo/validate phases are still running.
+	// Timed, because it is a full walk over every transaction in the block and
+	// nothing used to say so. On mainnet block 759245, 3.44 GB across 100,001
+	// transactions, 60 of the block's 113 seconds sat in regions that emitted no
+	// log line at all, and this is one of them. A phase that is not timed cannot
+	// be argued about, only guessed at, and four guesses about these regions have
+	// already been wrong.
+	_, _, sizeDone := tracing.Tracer("netsync").Start(ctx, "blockSerializeSize",
+		tracing.WithLogMessage(sm.logger, "[blockSerializeSize][%s] measuring %d transactions", block.Hash().String(), len(block.Transactions())),
+	)
+
 	blockSize := block.MsgBlock().SerializeSize()
+
+	sizeDone()
 
 	blockSizeUint64, err := safeconversion.IntToUint64(blockSize)
 	if err != nil {
@@ -252,11 +264,24 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	// Pre-extract the tx hashes for the orphan-processing goroutine below.
 	// Copy the hash *values* (not the *chainhash.Hash pointers returned by
 	// tx.Hash(), which alias into the bsvutil.Tx wrapper and would pin it).
+	//
+	// Timed for the same reason as the size walk above, and this one is the more
+	// expensive of the two: a transaction's hash is a double SHA256 over its full
+	// serialisation, so this loop is another complete pass over the block's bytes
+	// on a single goroutine.
+	_, _, hashDone := tracing.Tracer("netsync").Start(ctx, "blockTxHashes",
+		tracing.WithLogMessage(sm.logger, "[blockTxHashes][%s] hashing %d transactions", block.Hash().String(), len(block.Transactions())),
+	)
+
 	wireTxs := block.Transactions()
 	txHashes := make([]chainhash.Hash, len(wireTxs))
+
 	for i, tx := range wireTxs {
 		txHashes[i] = *tx.Hash()
 	}
+
+	hashDone()
+
 	blockHashStr := block.Hash().String()
 
 	// validate all subtrees and store all subtree data
@@ -2047,8 +2072,12 @@ func calculateTransactionFee(tx *bt.Tx) (uint64, error) {
 // stages iterate instead of block.Transactions(), so this is the last function
 // that needs the decoded wire block.
 func (sm *SyncManager) createTxMap(ctx context.Context, block *bsvutil.Block, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) ([]chainhash.Hash, error) {
+	// At info rather than debug: this is where 22 of block 759245's unlogged
+	// seconds sit, and it is the phase that converts the whole block into a
+	// second representation, so it is the one most worth seeing in a production
+	// log. One line per block is not a volume problem.
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "createTxMap",
-		tracing.WithDebugLogMessage(
+		tracing.WithLogMessage(
 			sm.logger,
 			"[createTxMap][%s %d] processing transactions into map for block",
 			block.Hash().String(),
