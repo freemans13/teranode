@@ -18,8 +18,6 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	"github.com/bsv-blockchain/teranode/services/legacy/blockchain"
-	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 	peerpkg "github.com/bsv-blockchain/teranode/services/legacy/peer"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -1332,11 +1330,15 @@ func validateParkCandidate(msgBlock *wire.MsgBlock, expected chainhash.Hash) err
 		return errors.NewBlockInvalidError("[blockPark][%s] no block", expected)
 	}
 
-	// Not cosmetic. BuildMerkleTreeStore below sizes its array as
-	// nextPowerOfTwo(n)*2-1, and nextPowerOfTwo(0) is 0, so an empty transaction
-	// list asks for a slice of length -1 and panics. A peer can simply send a
-	// block with a transaction count of zero — the wire decoder accepts it — so
-	// without this guard that is a remote panic on the block-queue goroutine.
+	// A block with no transactions has no coinbase and cannot be valid, and the
+	// wire decoder accepts a transaction count of zero, so a peer can simply send
+	// one. Refusing here keeps it off the disk for free.
+	//
+	// This guard used to exist for a sharper reason: the merkle builder below it
+	// sized its array as nextPowerOfTwo(n)*2-1, and nextPowerOfTwo(0) is 0, so an
+	// empty transaction list asked for a slice of length -1 and panicked the
+	// block-queue goroutine. That builder has gone, but every reader downstream
+	// still assumes at least a coinbase, so the guard stays.
 	if len(msgBlock.Transactions) == 0 {
 		return errors.NewBlockInvalidError("[blockPark][%s] block has no transactions", expected)
 	}
@@ -1362,17 +1364,40 @@ func validateParkCandidate(msgBlock *wire.MsgBlock, expected chainhash.Hash) err
 		return errors.NewBlockInvalidError("[blockPark][%s] block does not meet its own target difficulty", expected, err)
 	}
 
-	// The merkle root, which is the check that matters most here. Without it a
-	// peer can pair a genuine, real-work header with any transaction list it
-	// likes: the block passes the hash check above, gets parked, and only fails
-	// when it is drained — by which point the block has been given up on. One
-	// message on a public port would be enough to stop sync.
-	merkles := blockchain.BuildMerkleTreeStore(bsvutil.NewBlock(msgBlock).Transactions())
-
-	root := merkles[len(merkles)-1]
-	if root == nil || !root.IsEqual(&msgBlock.Header.MerkleRoot) {
-		return errors.NewBlockInvalidError("[blockPark][%s] transactions do not build the block's merkle root", expected)
-	}
+	// The merkle root is deliberately NOT checked here, and this is where it used
+	// to be.
+	//
+	// It cost a merkle rebuild over every transaction in the block, which means
+	// hashing every one of them, which means serialising every one of them. On
+	// mainnet that measured 13.7 seconds for a 100,001-transaction block and a
+	// mean of 19.9 seconds across the blocks large enough to log a warning, paid
+	// on 91% of blocks because that is how many arrive out of order. By contrast
+	// createSubtrees builds the same tree in 0.8 seconds on the drain path, for
+	// the simple reason that the transaction hashes are already computed by then.
+	//
+	// The same verification runs again during normal block processing, on
+	// subtrees built from the transactions the peer actually sent, so a
+	// fabricated transaction list still fails. On the unified route legacy checks
+	// it locally in HandleBlockDirect; off that route block validation checks it
+	// server-side in validateSubtrees. Exactly one of the two runs for any block,
+	// so removing this leaves one check rather than none. The duplicate-
+	// transaction floor, which a merkle root cannot catch because the
+	// duplicate-last-when-odd rule preserves it, runs unconditionally on every
+	// route in prepareSubtrees.
+	//
+	// What is given up is timing, not detection: bad bytes now reach the disk and
+	// are deleted when the later check refuses them. That path already exists and
+	// is exercised by TestParkRejectionLeavesTheBlockRequestable, which pins the
+	// property that makes this safe: a rejected block has its bytes dropped, goes
+	// back on the download walk, and can be obtained again. The cascade mark the
+	// rejection sets is keyed on the rejected block's own hash and the arrival
+	// path tests a block's parent hash, so a block's own mark cannot suppress its
+	// own retry.
+	//
+	// The two checks above stay because they are the cheap ones and one of them
+	// is the real defence: proof of work on the 80-byte header is what stops a
+	// peer minting unlimited distinct blocks to fill the park, and it cannot be
+	// forged. Without it this would be an invitation.
 
 	return nil
 }
