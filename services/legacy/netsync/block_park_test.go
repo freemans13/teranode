@@ -92,16 +92,34 @@ func parkDirEntries(t *testing.T, dir string) []string {
 	return names
 }
 
-// TestBlockPark_RefusesABlockWhoseTransactionsDoNotMatchItsMerkleRoot is the
-// one that matters most. A peer can pair a genuine, real-work header with any
-// transaction list it likes. Checking only that the 80-byte header hashes to
-// the key lets that through, and the block then fails on drain — by which point
-// it has been given up on. One crafted message on a public port would stop
-// sync.
+// TestBlockPark_ParksABlockWhoseMerkleRootIsCheckedLater records a deliberate
+// change of behaviour, and the reasoning matters more than the assertion.
 //
-// The assertion is that NOTHING REACHED THE DISK, not merely that an error came
-// back.
-func TestBlockPark_RefusesABlockWhoseTransactionsDoNotMatchItsMerkleRoot(t *testing.T) {
+// This test used to assert the opposite: that a peer pairing a genuine,
+// real-work header with somebody else's transactions was refused before
+// anything reached the disk. It called itself the check that mattered most, on
+// the grounds that such a block would otherwise fail only on drain, "by which
+// point it has been given up on", so one crafted message on a public port would
+// stop sync.
+//
+// That last step is no longer true, and it is what the check rested on. A
+// rejection on the drain path drops the parked bytes, puts the block back on the
+// download walk and blames the peer, so the block is obtained again rather than
+// given up on; TestParkRejectionLeavesTheBlockRequestable pins that, including
+// the cascade mark not suppressing the block's own retry.
+//
+// What the check cost was a merkle rebuild over every transaction: 13.7 seconds
+// for a 100,001-transaction mainnet block, a 19.9 second mean across the blocks
+// big enough to log a warning, paid on 91% of blocks because that is how many
+// arrive out of order. The same root is verified during normal block processing
+// on subtrees built from the transactions the peer actually sent, so the
+// fabrication is still caught, just later.
+//
+// So the park now takes this block, and the exposure is a file that exists until
+// the later check refuses it. The proof-of-work check on the 80-byte header
+// stays, and it is the one that matters for flooding: a peer cannot mint
+// unlimited distinct blocks without real work.
+func TestBlockPark_ParksABlockWhoseMerkleRootIsCheckedLater(t *testing.T) {
 	park, dir := newTestPark(t, "")
 
 	blocks := minedBlocks(t, 2)
@@ -115,10 +133,21 @@ func TestBlockPark_RefusesABlockWhoseTransactionsDoNotMatchItsMerkleRoot(t *test
 
 	result := park.Park(context.Background(), parkedBlock{hash: hash, prevBlock: tampered.Header.PrevBlock}, tampered)
 
-	require.Equal(t, parkRejected, result, "a block whose transactions do not build its merkle root must be refused")
-	require.Empty(t, parkDirEntries(t, dir), "nothing may reach the disk once the block has been refused")
-	require.Zero(t, park.Len())
-	require.Zero(t, park.Bytes())
+	require.Equal(t, parkAccepted, result,
+		"the park no longer rebuilds the merkle tree; normal block processing verifies it")
+	require.NotEmpty(t, parkDirEntries(t, dir))
+	require.Equal(t, 1, park.Len())
+
+	// And the cheap header checks still bite, so this is not a free-for-all: a
+	// block that does not hash to the key we asked for is still refused before
+	// anything is written.
+	fresh, freshDir := newTestPark(t, "")
+	wrongKey := chainhash.Hash{0xde, 0xad}
+
+	require.Equal(t, parkRejected,
+		fresh.Park(context.Background(), parkedBlock{hash: wrongKey}, blocks[0].MsgBlock()),
+		"a block that is not the block we asked for is still refused")
+	require.Empty(t, parkDirEntries(t, freshDir))
 }
 
 // TestBlockPark_RefusesABlockWithNoTransactions covers a remote panic, not just

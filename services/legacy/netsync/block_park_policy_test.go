@@ -189,14 +189,19 @@ func TestSyncManager_ABlockTheParkRefusesIsDroppedAndAskedForAgain(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			h := newParkWiringHarnessInState(t, true, tc.fsmState)
 
-			// A real header with real proof of work, carrying somebody else's
-			// transactions. It hashes to the front block of the header list, so
-			// the header list gives it up on arrival exactly as it would for the
-			// genuine article — and then the park refuses it on the merkle root.
-			tampered := &wire.MsgBlock{
-				Header:       h.blocks[0].MsgBlock().Header,
-				Transactions: h.blocks[1].MsgBlock().Transactions,
-			}
+			// A real header with real proof of work and no transactions at all.
+			// It hashes to the front block of the header list, so the header list
+			// gives it up on arrival exactly as it would for the genuine article,
+			// and then the park refuses it.
+			//
+			// This used to be a header carrying somebody else's transactions,
+			// refused on the merkle root. That check is no longer in the park: it
+			// cost a rebuild over every transaction, 13.7 seconds for a
+			// 100,001-transaction mainnet block on 91% of blocks, and normal block
+			// processing verifies the same root anyway. An empty transaction list
+			// is the cheapest thing the park still refuses, and the disposition
+			// under test is the same one either way.
+			tampered := &wire.MsgBlock{Header: h.blocks[0].MsgBlock().Header}
 			front := tampered.BlockHash()
 
 			h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)

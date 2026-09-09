@@ -595,6 +595,11 @@ func (bst *blockSizeTracker) getAverageSize() int64 {
 	return bst.avgSize
 }
 
+// maxInFlightLadderTop is what calculateMaxInFlightBlocks returns for small
+// blocks, and therefore the denominator when its answer is used as a ratio
+// rather than as a count. Kept beside the ladder so the two cannot drift.
+const maxInFlightLadderTop = 20
+
 // calculateMaxInFlightBlocks returns the recommended max in-flight blocks
 // based on average block size. Scales from 20 (small blocks) down to 1 (huge blocks).
 func (bst *blockSizeTracker) calculateMaxInFlightBlocks() int {
@@ -617,7 +622,7 @@ func (bst *blockSizeTracker) calculateMaxInFlightBlocks() int {
 	case avgSize >= 100*MB:
 		return 10 // smallish blocks
 	default:
-		return 20 // small blocks: default aggressive
+		return maxInFlightLadderTop // small blocks: default aggressive
 	}
 }
 
@@ -4636,6 +4641,44 @@ func (sm *SyncManager) lookaheadCeilingLocked() (int64, bool) {
 
 	if window := sm.settings.Legacy.BlockDownloadWindow; window > 0 && lower > window {
 		lower = window
+	}
+
+	// Scaled by the block size actually being seen, because a fixed count of
+	// blocks means completely different things at different points in the chain.
+	// legacy_blockDownloadLowerWindow is 128, which is 128 KB of read-ahead at
+	// height 100,000 and 440 GB of it at height 759,000 where blocks measure
+	// 3.44 GB. One number cannot be right for both.
+	//
+	// This is the bound that matters now, since the two byte budgets that used to
+	// sit beside it are gone: a block's size is unknown until it has been
+	// downloaded, so a byte bound could only ever discard a block already paid
+	// for, and mainnet threw away 1.02 TB in two days doing exactly that. What is
+	// left is a count of blocks, checked before the request goes out, which is
+	// what SV Node bounds by. A count is only honest if it tracks the era.
+	//
+	// It also decides how much disk the park can hold, because the park holds
+	// what has been fetched and cannot yet be committed. At a flat 128 that is a
+	// worst case near 440 GB. Scaled, it is about 20 GB.
+	//
+	// The scaling reuses the ladder the node already derives from its rolling
+	// average block size, rather than introducing a second opinion about what a
+	// big block is. That ladder already governs how many blocks one peer may have
+	// in flight and how deep the quick window goes; the read-ahead depth was the
+	// one bound ignoring it. Its range is 20 for small blocks down to 1 above
+	// 2 GB, so the ratio to its own maximum is the scaling factor, and the
+	// configured depth is what that ratio applies to.
+	//
+	// Never below one: a depth of zero would stop the walk asking for anything at
+	// all, which is a stall rather than a conservative setting.
+	if sm.blockSizeTracker != nil {
+		if fetch := sm.blockSizeTracker.calculateMaxInFlightBlocks(); fetch >= 1 && fetch < maxInFlightLadderTop {
+			scaled := lower * fetch / maxInFlightLadderTop
+			if scaled < 1 {
+				scaled = 1
+			}
+
+			lower = scaled
+		}
 	}
 
 	if sm.headerList == nil {
