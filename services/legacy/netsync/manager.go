@@ -914,7 +914,7 @@ type SyncManager struct {
 	frontierHash   chainhash.Hash
 	frontierHeight int32
 	frontierSince  time.Time
-	frontierRacers map[*peerpkg.Peer]struct{}
+	frontierRacers map[*peerpkg.Peer]time.Time
 
 	// racedBlocks remembers, for each block we asked more than one peer for,
 	// exactly which peers were left holding a request we then cancelled once a

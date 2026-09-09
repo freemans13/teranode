@@ -1099,3 +1099,151 @@ func TestFrontierRace_ADemotedPeerIsNotTheOneRaced(t *testing.T) {
 		"out of its cooldown the peer is worth asking again")
 	require.Equal(t, []chainhash.Hash{frontier}, stalledRec.all())
 }
+
+// TestFrontierRace_ARacerThatNeverDeliversStopsCountingIsTheRealFix is the third
+// and general case, after the departed racer and the demoted one.
+//
+// Those two fixes each name a way a racer stops being credible: it disconnects,
+// or it is demoted. Neither covers the ordinary case, and it took a fourth
+// mainnet stall to see it. Only the sync peer is ever demoted, so a racer that
+// is any other peer is never cleared by either rule. It simply sits there, and
+// the set is otherwise cleared only when the frontier moves or the block
+// arrives, which is the block that is not arriving.
+//
+// Mainnet, 2026-09-09 at height 756,370, running the demoted-racer fix: 97% dead
+// air over twenty-five minutes, no bytes on the wire, the block loop idle with
+// an empty window and nothing parked, and the race declining 930 times with "as
+// many peers are already racing it as configuration allows".
+//
+// So credibility has to expire on its own. A racer that has held the frontier
+// longer than legacy_blockSlowFetchTimeout without pulling bytes has failed by
+// exactly the test that qualified the race in the first place, and must stop
+// counting. That replaces a dead racer rather than adding to the live ones, so
+// the concurrent-fetch cap still bounds the bandwidth, and it is what SV Node
+// gets for free by re-evaluating every owner on every send pass.
+func TestFrontierRace_ARacerThatNeverDeliversStopsCountingIsTheRealFix(t *testing.T) {
+	sm := newRaceManager(t)
+
+	syncPeer, _, syncRec := connectRacePeer(t, 70, 100)
+	owner, _, _ := connectRacePeer(t, 71, 1000)
+	silent, _, silentRec := connectRacePeer(t, 72, 1000)
+	live, _, liveRec := connectRacePeer(t, 73, 1000)
+
+	registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, owner)
+	silentState := registerRacePeer(sm, silent)
+	registerRacePeer(sm, live)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	frontier := chainhash.Hash{0xfd}
+
+	require.True(t, sm.blockDownloads.Add(owner, frontier))
+	sm.setFrontier(frontier, 500, time.Now().Add(-5*time.Minute))
+
+	// A racer asked long ago that has sent nothing since. It is the ordinary
+	// case: still connected, never demoted, and therefore untouched by both
+	// earlier fixes.
+	require.True(t, sm.registerFrontierRacer(frontier, silent))
+	sm.ageFrontierRacer(silent, time.Now().Add(-5*time.Minute))
+
+	require.True(t, silent.Connected(), "precondition: the racer is still connected")
+	require.False(t, silentState.inDemotionCooldown(), "precondition: and was never demoted")
+
+	sm.raceFrontierBlock(time.Now())
+
+	// Counted across both eligible peers rather than named, because expiring the
+	// stale racer also makes it a candidate again and map order decides which of
+	// the two is asked. What matters is that the race is no longer blocked, not
+	// who answers it; naming one peer here made this test pass on map order.
+	require.True(t, WaitUntil(func() bool { return liveRec.count()+silentRec.count() > 0 }, 5*time.Second),
+		"a racer that has delivered nothing past the slow-fetch timeout must not keep the slot")
+	require.Equal(t, 1, liveRec.count()+silentRec.count(),
+		"and exactly one extra peer is asked, so the cap still bounds the duplicate fetch")
+
+	asked := append(append([]chainhash.Hash{}, liveRec.all()...), silentRec.all()...)
+	require.Equal(t, []chainhash.Hash{frontier}, asked,
+		"and it must be asked the frontier block, nothing else")
+
+	require.Zero(t, syncRec.count(), "the peer below the frontier height must not be asked")
+}
+
+// TestFrontierRace_ARacerStillWithinTheTimeoutKeepsItsSlot is the other side of
+// it, and without this the change above would be a licence to ask every peer at
+// once for a multi-gigabyte block.
+//
+// A racer asked two seconds ago has not failed at anything. It keeps its slot
+// until the same slow-fetch timeout that qualified the race has passed.
+func TestFrontierRace_ARacerStillWithinTheTimeoutKeepsItsSlot(t *testing.T) {
+	sm := newRaceManager(t)
+
+	syncPeer, _, _ := connectRacePeer(t, 80, 100)
+	owner, _, _ := connectRacePeer(t, 81, 1000)
+	fresh, _, freshRec := connectRacePeer(t, 82, 1000)
+	live, _, liveRec := connectRacePeer(t, 83, 1000)
+
+	registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, owner)
+	registerRacePeer(sm, fresh)
+	registerRacePeer(sm, live)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	frontier := chainhash.Hash{0xfe}
+
+	require.True(t, sm.blockDownloads.Add(owner, frontier))
+	sm.setFrontier(frontier, 500, time.Now().Add(-5*time.Minute))
+
+	require.True(t, sm.registerFrontierRacer(frontier, fresh))
+
+	sm.raceFrontierBlock(time.Now())
+
+	// Asserted across both candidates, not just one. With two peers eligible the
+	// choice is map order, so a test watching only one of them passes half the
+	// time on a build that expires the racer it should have kept — which is
+	// exactly how the first version of this let that mutation through.
+	require.False(t, WaitUntil(func() bool { return liveRec.count()+freshRec.count() > 0 }, 2*time.Second),
+		"a racer asked moments ago has failed at nothing, so the cap holds and nobody is asked")
+}
+
+// TestFrontierRace_ARacerPullingBytesKeepsItsSlot covers the other half of the
+// expiry rule, and the reason it is not a bare timeout.
+//
+// A peer part-way through a multi-gigabyte block is slow, not stalled. Racing
+// past it throws away the bandwidth already spent on a transfer that is going to
+// finish, which is why the owner test above it asks the same question. Age alone
+// is not failure; age with nothing arriving is.
+func TestFrontierRace_ARacerPullingBytesKeepsItsSlot(t *testing.T) {
+	sm := newRaceManager(t)
+
+	syncPeer, _, _ := connectRacePeer(t, 90, 100)
+	owner, _, _ := connectRacePeer(t, 91, 1000)
+	busy, _, busyRec := connectRacePeer(t, 92, 1000)
+	live, _, liveRec := connectRacePeer(t, 93, 1000)
+
+	registerRacePeer(sm, syncPeer)
+	registerRacePeer(sm, owner)
+	busyState := registerRacePeer(sm, busy)
+	registerRacePeer(sm, live)
+	sm.storeSyncPeer(syncPeer, &syncPeerState{})
+
+	frontier := chainhash.Hash{0xff}
+
+	require.True(t, sm.blockDownloads.Add(owner, frontier))
+	sm.setFrontier(frontier, 500, time.Now().Add(-5*time.Minute))
+
+	// Asked long ago, so the timeout alone would expire it — but visibly bringing
+	// bytes in, in the same terms samplePeerThroughput records them.
+	require.True(t, sm.registerFrontierRacer(frontier, busy))
+	sm.ageFrontierRacer(busy, time.Now().Add(-5*time.Minute))
+
+	busyState.assocReadBytesLastTick.Store(0)
+	busyState.assocReadBytes.Store(64 << 20)
+	busyState.throughputTicks.Store(2)
+
+	require.True(t, busyState.isPullingBytes(sm.minSyncPeerNetworkSpeed),
+		"precondition: the racer is visibly pulling bytes")
+
+	sm.raceFrontierBlock(time.Now())
+
+	require.False(t, WaitUntil(func() bool { return liveRec.count()+busyRec.count() > 0 }, 2*time.Second),
+		"a racer still bringing bytes in is slow rather than stalled and keeps the slot")
+}
