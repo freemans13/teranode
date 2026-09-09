@@ -171,6 +171,11 @@ type MessageListeners struct {
 	// block without an O(all-tx) SerializeSize() walk on the read-loop.
 	OnBlock func(p *Peer, msg *wire.MsgBlock, buf []byte, payloadSize int64)
 
+	// OnBlockOnDisk is invoked for a block whose body was streamed to the park
+	// rather than decoded. Its transactions are not in memory; the listener
+	// reads them back from the park if it needs them.
+	OnBlockOnDisk func(p *Peer, msg *MsgBlockOnDisk)
+
 	// OnCFilter is invoked when a peer receives a cfilter bitcoin message.
 	OnCFilter func(p *Peer, msg *wire.MsgCFilter)
 
@@ -2281,6 +2286,11 @@ out:
 				// the read-loop — the largest blocks are exactly where that walk
 				// hurt the download/processing overlap this feature exists for.
 				p.cfg.Listeners.OnBlock(p, msg, nil, int64(n-wire.MessageHeaderSize))
+			}
+
+		case *MsgBlockOnDisk:
+			if p.cfg.Listeners.OnBlockOnDisk != nil {
+				p.cfg.Listeners.OnBlockOnDisk(p, msg)
 			}
 
 		case *wire.MsgInv:
