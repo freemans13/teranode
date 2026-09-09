@@ -709,8 +709,8 @@ type SyncManager struct {
 
 	// parkJobs carries an admitted block to a parking worker, and parkOutcomes
 	// carries the answer back to the block-queue consumer. Both exist so the
-	// stateless check and the blob write do not run on the goroutine that
-	// commits blocks in order; see block_park_worker.go.
+	// blob write does not run on the goroutine that commits blocks in order;
+	// see block_park_worker.go.
 	parkJobs     chan parkJob
 	parkOutcomes chan parkOutcome
 	parkWorkers  sync.WaitGroup
@@ -3496,10 +3496,9 @@ func (sm *SyncManager) parkOrphanBlock(d *blockDispatch, msgBlock *wire.MsgBlock
 	}
 
 	// Admit is the cheap half: the duplicate check, the byte budget and
-	// registering the entry. The stateless check and the blob write are
-	// the expensive half and they go to a parking worker, because this
-	// is the one goroutine that commits blocks in order and a gigabyte
-	// block spends minutes in those two steps.
+	// registering the entry. The blob write is the expensive half and it
+	// goes to a parking worker, because this is the one goroutine that
+	// commits blocks in order and a gigabyte block spends minutes writing.
 	stored, admitted := sm.blockPark.Admit(entry, msgBlock)
 
 	// The reject, like every other reject in handleBlockMsg, goes to the

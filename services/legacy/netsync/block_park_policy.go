@@ -9,7 +9,9 @@ import (
 // purpose.
 //
 // A parked block is a block that is already downloaded, already checked against
-// its own header and merkle root, and already written to disk. Many things can
+// its own header hash and proof of work, and already written to disk. Its merkle
+// root is NOT checked at park time; that happens on the way back out, in
+// HandleBlockDirect. Many things can
 // go wrong with it afterwards — the blob will not read back, the commit fails,
 // the parent disappears under a reorg, its time runs out, the node is shutting
 // down, the store is out of permits, the budget is full — and each of those has

@@ -421,7 +421,8 @@ func (p *blockPark) Park(ctx context.Context, entry parkedBlock, msgBlock *wire.
 // The stateless check deliberately runs AFTER this rather than before, which is
 // the one thing that changed when the write moved off the commit goroutine. A
 // block that turns out to be rubbish therefore holds an entry and its bytes for
-// as long as its merkle rebuild takes. That is bounded by the number of parking
+// as long as that check takes, which is now a header read rather than the merkle
+// rebuild it used to be. That is bounded by the number of parking
 // workers rather than by anything an attacker chooses, the entry is invisible to
 // every reader while it is held, and WriteAdmitted gives all of it back. The
 // order that matters for safety is unchanged: nothing reaches the disk until the
@@ -505,9 +506,11 @@ func (p *blockPark) Admit(entry parkedBlock, msgBlock *wire.MsgBlock) (parkedBlo
 
 // WriteAdmitted runs the stateless check and then the blob write for a block
 // Admit has registered, and rolls the admission back on any failure. It is the
-// half that costs a merkle rebuild over every transaction and a streamed write
-// of the whole block, so it is what runs on a parking worker rather than on the
-// goroutine that commits blocks in order.
+// half that costs a streamed write of the whole block, so it is what runs on a
+// parking worker rather than on the goroutine that commits blocks in order.
+//
+// The check itself is cheap now. It reads the header and the transaction count
+// and nothing else, so the write is the whole cost; see validateParkCandidate.
 //
 // On parkAccepted the entry is still registered and still flagged; the caller
 // clears the flag with FinishWrite once it has done whatever else it owes.
@@ -516,17 +519,22 @@ func (p *blockPark) WriteAdmitted(ctx context.Context, entry parkedBlock, msgBlo
 		return parkDisabled
 	}
 
-	// Timed, not deadlined, and the difference is the point. The stateless check
-	// rebuilds the merkle tree over every transaction in the block, which is CPU
-	// work no context can interrupt part way through. legacy_parkStoreTimeout
-	// cannot bound it. What it can do is make it visible, so an operator who
-	// sees a parking worker stalling can tell validation from store contention.
+	// Timed, not deadlined. The check is CPU work that no context can interrupt
+	// part way through, so legacy_parkStoreTimeout cannot bound it; what the
+	// timing can do is make it visible, so an operator who sees a parking worker
+	// stalling can tell it from store contention.
+	//
+	// It should now never fire. The check reads the header and the transaction
+	// count, so it is microseconds whatever the block's size. It used to rebuild
+	// the merkle tree over every transaction and ran to minutes, which is what
+	// this timing was added for. Left in place because a warning here would mean
+	// the check had grown a walk over the block again.
 	validationStart := time.Now()
 
 	err := validateParkCandidate(msgBlock, entry.hash)
 
 	if elapsed := time.Since(validationStart); elapsed > p.storeTimeout {
-		p.logger.Warnf("[blockPark][%s] the stateless check on a %d transaction block took %s, longer than the %s store deadline; this is CPU that no deadline bounds", entry.hash, len(msgBlock.Transactions), elapsed, p.storeTimeout)
+		p.logger.Warnf("[blockPark][%s] the stateless check on a %d transaction block took %s, longer than the %s store deadline; it reads only the header, so this means it has grown a walk over the block", entry.hash, len(msgBlock.Transactions), elapsed, p.storeTimeout)
 	}
 
 	if err != nil {
@@ -674,8 +682,8 @@ func (p *blockPark) Read(ctx context.Context, hash chainhash.Hash) (*wire.MsgBlo
 	}
 
 	// Eighty bytes of hashing that catches a mis-keyed or bit-rotted file. The
-	// merkle root was checked before the block was written and is checked again
-	// by HandleBlockDirect on the way in, so it is not repeated here.
+	// merkle root is checked by HandleBlockDirect on the way in, which is the
+	// only place it is checked at all, so it is not repeated here.
 	if got := msgBlock.BlockHash(); !got.IsEqual(&hash) {
 		return nil, errors.NewBlockInvalidError("[blockPark][%s] parked block is really %s", hash, got)
 	}
