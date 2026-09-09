@@ -209,8 +209,9 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 	height := sm.frontierHeight
 	since := sm.frontierSince
 	racing := make(map[*peerpkg.Peer]struct{}, len(sm.frontierRacers))
+	askedAt := make(map[*peerpkg.Peer]time.Time, len(sm.frontierRacers))
 
-	for p := range sm.frontierRacers {
+	for p, at := range sm.frontierRacers {
 		if p == nil || !p.Connected() {
 			// A racer that has gone can deliver nothing, so it must count
 			// towards nothing. Nothing else takes it out either: the set is only
@@ -227,8 +228,63 @@ func (sm *SyncManager) frontierRaceTarget(now time.Time) (chainhash.Hash, int32,
 		}
 
 		racing[p] = struct{}{}
+		askedAt[p] = at
 	}
 	sm.frontierMu.Unlock()
+
+	// A racer whose own request has outlived the slow-fetch timeout without a
+	// byte arriving has failed by exactly the test that qualified this race in
+	// the first place, so it stops counting.
+	//
+	// This is the general case the two earlier fixes each missed a piece of. One
+	// drops a racer that has disconnected, the other one that has been demoted,
+	// and only the sync peer is ever demoted — so an ordinary peer that simply
+	// goes quiet was cleared by neither, and the set is otherwise emptied only
+	// when the frontier moves or the block arrives, which is the block that is
+	// not arriving. Mainnet stopped for twenty-five minutes on that at height
+	// 756,370 with 97% dead air, an empty window, nothing parked and the block
+	// loop idle and willing.
+	//
+	// It replaces a dead racer rather than adding to the live ones, so
+	// legacy_maxBlockParallelFetch still bounds how many peers are pulling the
+	// same multi-gigabyte block at once. SV Node gets this for free by
+	// re-evaluating every owner on every send pass; teranode asks on a timer and
+	// so has to expire them itself.
+	//
+	// Judged outside frontierMu because it reads peerStates, whose own lock must
+	// not be taken underneath it, and applied back under the lock afterwards.
+	if len(racing) > 0 && sm.peerStates != nil {
+		var stale []*peerpkg.Peer
+
+		for p := range racing {
+			if now.Sub(askedAt[p]) < slowAfter {
+				continue
+			}
+
+			if state, ok := sm.peerStates.Get(p); ok && state.isPullingBytes(sm.minSyncPeerNetworkSpeed) {
+				continue
+			}
+
+			stale = append(stale, p)
+		}
+
+		if len(stale) > 0 {
+			sm.frontierMu.Lock()
+
+			for _, p := range stale {
+				// Only if the frontier is still the block it was asked for: a
+				// frontier that moved took the whole set with it, and a racer
+				// registered against the new one has not failed at anything.
+				if sm.frontierHash == hash {
+					delete(sm.frontierRacers, p)
+				}
+
+				delete(racing, p)
+			}
+
+			sm.frontierMu.Unlock()
+		}
+	}
 
 	if hash == none {
 		sm.noteRaceDeclined("no frontier is published, so nothing is holding up commits")
@@ -444,16 +500,31 @@ func (sm *SyncManager) registerFrontierRacer(hash chainhash.Hash, p *peerpkg.Pee
 	}
 
 	if sm.frontierRacers == nil {
-		sm.frontierRacers = make(map[*peerpkg.Peer]struct{}, 1)
+		sm.frontierRacers = make(map[*peerpkg.Peer]time.Time, 1)
 	}
 
 	if _, already := sm.frontierRacers[p]; already {
 		return false
 	}
 
-	sm.frontierRacers[p] = struct{}{}
+	// When it was asked, because that is what lets its credibility expire. A
+	// racer that delivers nothing has to stop counting on its own; see the
+	// pruning in frontierRaceTarget.
+	sm.frontierRacers[p] = time.Now()
 
 	return true
+}
+
+// ageFrontierRacer backdates when a racer was asked. Test-only, and a method
+// rather than a poke at the map from the test file so the lock is taken the same
+// way every other writer takes it.
+func (sm *SyncManager) ageFrontierRacer(p *peerpkg.Peer, at time.Time) {
+	sm.frontierMu.Lock()
+	defer sm.frontierMu.Unlock()
+
+	if _, ok := sm.frontierRacers[p]; ok {
+		sm.frontierRacers[p] = at
+	}
 }
 
 // forgetFrontierRacer stops a peer counting towards the racing cap. Called when
