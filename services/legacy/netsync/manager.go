@@ -2693,9 +2693,9 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 		case admitNothing:
 		}
 
-		// One park job at a time, offered to a worker without blocking this
-		// goroutine. Tried before the queue arm opens, for the same reason the
-		// pending dispatch is: it is work already accepted.
+		// One park job at a time, handed to a worker without this goroutine ever
+		// waiting on one. Tried before the queue arm opens, for the same reason
+		// the pending dispatch is: it is work already accepted.
 		if sm.parkJobHeld != nil {
 			select {
 			case sm.parkJobs <- *sm.parkJobHeld:
@@ -2712,12 +2712,42 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 			queueArm = blockQueue
 		}
 
+		// The hand-off, as an arm of the wait below rather than only the offer
+		// above. The offer cannot block, so it fails whenever no worker happens
+		// to be sitting in its receive at that instant, and without an arm here
+		// the loop then waited with the job still in its hand for something that
+		// was never coming: the window may be empty so no completion is due, the
+		// queue arm is shut while a job is held, and no worker will post an
+		// outcome if none is running. Mainnet stopped for thirty-four minutes on
+		// exactly that at height 756,370, with both park workers idle in their
+		// receive and the loop asleep holding their work.
+		//
+		// A nil channel disables a select arm, which is what makes this safe when
+		// there is nothing to hand over. The value has to be built here either
+		// way, because a select evaluates every send case's operands on the way
+		// in whether or not that case is chosen, so dereferencing the field
+		// inside the arm would fault when it is nil.
+		var (
+			parkArm  chan<- parkJob
+			parkWork parkJob
+		)
+
+		if sm.parkJobHeld != nil {
+			parkArm = sm.parkJobs
+			parkWork = *sm.parkJobHeld
+		}
+
 		// Recorded here, not anywhere earlier, so it describes the wait rather
 		// than the work that led to it. Nothing below reads it; the watchdog on
 		// the message-handling goroutine does.
 		sm.publishConsumerWait(time.Now(), queueArm != nil, pending)
 
 		select {
+		case parkArm <- parkWork:
+			sm.parkJobHeld = nil
+
+			sm.noteConsumerAdmitted(time.Now())
+
 		case <-sm.quit:
 			// Best-effort drain with an error reply before exiting: the block
 			// waiting for capacity, every block already in flight (its worker
