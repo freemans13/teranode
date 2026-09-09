@@ -2043,7 +2043,34 @@ func WireTxToGoBtTx(wireTx *bsvutil.Tx, tx *bt.Tx) error {
 			PreviousTxOutIndex: in.PreviousOutPoint.Index,
 			SequenceNumber:     in.Sequence,
 		}
-		_ = tx.Inputs[i].PreviousTxIDAdd(&in.PreviousOutPoint.Hash)
+		// The 32 bytes are COPIED, not pointed at. go-bt's PreviousTxIDAdd
+		// stores the pointer it is given (input.go:141), so passing
+		// &in.PreviousOutPoint.Hash kept this bt.Input holding an interior
+		// pointer into the wire transaction it came from. That kept the wire
+		// transaction alive, which kept its SignatureScript slice header alive,
+		// which kept that slice's whole 4 MiB decode-arena chunk alive. Every
+		// chunk carries at least one input script, so one retained pointer per
+		// input pinned the ENTIRE arena for as long as any converted
+		// transaction lived, which is the whole pipeline.
+		//
+		// That defeated the point of cloning the scripts below. The clone exists
+		// so the arena can be released once this conversion returns, which is
+		// what the notes at lines 238, 265, 430 and 527 all promise. It was not
+		// happening: measured, dropping the wire block released nothing at all.
+		// So the process carried two complete copies of every block, roughly
+		// 7 GB for a mainnet 3.44 GB block against a 6 GiB soft limit, and the
+		// repo's own benchmark measures this loop running eight times slower
+		// once that limit is reached.
+		//
+		// The same trap two lines up in createTxMap was already handled, for the
+		// same reason, with the same fix: the note there says SetTxHash stores
+		// the pointer, so the transaction hash is copied before being handed
+		// over. This is that fix applied to the one pointer it missed.
+		//
+		// See TestArenaIsReleasedAfterConversion, which measures it.
+		prevHash := in.PreviousOutPoint.Hash
+
+		_ = tx.Inputs[i].PreviousTxIDAdd(&prevHash)
 		*tx.Inputs[i].UnlockingScript = bytes.Clone(in.SignatureScript)
 	}
 
