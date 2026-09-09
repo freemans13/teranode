@@ -8,14 +8,16 @@ import (
 // The parking workers exist because parking a block is expensive and commits are
 // not allowed to wait for it.
 //
-// A parked block pays two costs: a stateless check that rebuilds the merkle tree
-// over every transaction in it, and a streamed write of the whole block into the
+// The cost of parking a block is the streamed write of the whole block into the
 // blob store under legacy_parkStoreTimeout, waiting on write permits shared
 // process-wide with subtree writes, transaction writes and both persisters. On
-// mainnet those blocks run to gigabytes and the check alone has been measured at
-// over three minutes. All of it used to run on the single goroutine that commits
-// blocks in order, so a node with an out-of-order backlog spent its time filing
-// blocks instead of committing them.
+// mainnet those blocks run to gigabytes, so that write is minutes. It used to
+// run on the single goroutine that commits blocks in order, so a node with an
+// out-of-order backlog spent its time filing blocks instead of committing them.
+//
+// It used to pay a second cost, a merkle rebuild over every transaction, which
+// was the larger of the two at a measured three minutes and more. That is gone;
+// see validateParkCandidate, which now reads the header and nothing else.
 //
 // What stays on the commit goroutine — the block-queue consumer, which under
 // the quick window is the dispatcher — is everything that is ordered or that
@@ -141,8 +143,7 @@ func (sm *SyncManager) submitParkJob(job parkJob) {
 	// consumer this is the last place that goroutine blocks, and it reaches it far
 	// more often, because in the measured regime most arrivals park. A wait here
 	// stops completions, sweep posts and drain steps being serviced for as long as
-	// a park write takes, and a park write of a mainnet giant block is minutes: the
-	// stateless check alone has been measured above three minutes.
+	// a park write takes, and a park write of a mainnet giant block is minutes.
 	//
 	// The slot preserves the backpressure exactly. While it is set the consumer
 	// disables its queue arm, so nothing else is head-processed, which is the same

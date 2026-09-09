@@ -709,8 +709,8 @@ type SyncManager struct {
 
 	// parkJobs carries an admitted block to a parking worker, and parkOutcomes
 	// carries the answer back to the block-queue consumer. Both exist so the
-	// stateless check and the blob write do not run on the goroutine that
-	// commits blocks in order; see block_park_worker.go.
+	// blob write does not run on the goroutine that commits blocks in order;
+	// see block_park_worker.go.
 	parkJobs     chan parkJob
 	parkOutcomes chan parkOutcome
 	parkWorkers  sync.WaitGroup
@@ -3496,10 +3496,9 @@ func (sm *SyncManager) parkOrphanBlock(d *blockDispatch, msgBlock *wire.MsgBlock
 	}
 
 	// Admit is the cheap half: the duplicate check, the byte budget and
-	// registering the entry. The stateless check and the blob write are
-	// the expensive half and they go to a parking worker, because this
-	// is the one goroutine that commits blocks in order and a gigabyte
-	// block spends minutes in those two steps.
+	// registering the entry. The blob write is the expensive half and it
+	// goes to a parking worker, because this is the one goroutine that
+	// commits blocks in order and a gigabyte block spends minutes writing.
 	stored, admitted := sm.blockPark.Admit(entry, msgBlock)
 
 	// The reject, like every other reject in handleBlockMsg, goes to the
@@ -4196,6 +4195,174 @@ func (sm *SyncManager) anchorIsStillTheFrontLocked() bool {
 	}
 
 	return node.isAnchor
+}
+
+// trimHeadersTheChainAlreadyHas drops headers from the FRONT of the list whose
+// blocks are already in the chain.
+//
+// It exists because the chain routinely runs AHEAD of the header list. Blocks
+// arrive out of order, park on disk, and commit from there when their parent
+// lands, so the committed height can be dozens of blocks past the last header
+// the list ever held. The next round of headers then answers from wherever the
+// locator pointed, which is behind the chain, and handleHeadersMsg pushes every
+// header that links onto the back without asking whether we already have it.
+//
+// The front of the list is then a block already in the chain, and everything
+// downstream reads that list as "blocks we still need". The frontier is
+// published from the front, so it names a committed block; the frontier race
+// asks peer after peer for it; and rewindToLowestHeader finds it in the header
+// index, so losing any of those peers winds the whole download back to a height
+// the chain passed long ago.
+//
+// Measured on Hetzner mainnet on 2026-09-09: the list drained to no frontier at
+// 17:30:19, a peer delivered 38,602 headers at 17:30:58, and one second later
+// the frontier named block 761392, which had committed at 17:23:28. It was asked
+// for five more times over the next eight minutes while the tip ran to 761531.
+// An earlier episode cost eight minutes and forty-four seconds with an empty
+// pipeline and nothing on disk. See
+// TestSyncManager_AHeadersRoundDoesNotReaddBlocksTheChainAlreadyHas.
+//
+// How "already in the chain" is decided depends on where we are. Below the last
+// checkpoint the chain is checkpoint-verified and there is one of it, so height
+// against the highest committed height is exact and costs nothing. Above the
+// last checkpoint a header at or below that height is not necessarily one we
+// have, so it asks the blockchain store per header. That is why the store
+// lookups are gathered first and made with headerMu released: every other reader
+// of the list holds that lock, and a blocking client call under it would
+// serialise the whole sync path.
+func (sm *SyncManager) trimHeadersTheChainAlreadyHas() {
+	if !sm.headersFirstMode.Load() {
+		return
+	}
+
+	committed := sm.lastCommittedHeight.Load()
+
+	type candidate struct {
+		hash   chainhash.Hash
+		height int32
+	}
+
+	var ask []candidate
+
+	// First pass: take out everything height alone can settle, and collect the
+	// rest to ask the store about.
+	sm.headerMu.Lock()
+
+	for e := sm.headerList.Front(); e != nil; {
+		next := e.Next()
+
+		node, ok := e.Value.(*headerNode)
+		if !ok || node.hash == nil {
+			break
+		}
+
+		// The anchor is the block the round was asked from, so it is below the
+		// chain by definition. It is left alone: removeHeaderAnchorLocked owns
+		// it, and an anchor at the front publishes no frontier anyway.
+		if node.isAnchor {
+			e = next
+			continue
+		}
+
+		// The checkpoint node stays to anchor the round that follows.
+		if sm.nextCheckpoint != nil && node.hash.IsEqual(sm.nextCheckpoint.Hash) {
+			break
+		}
+
+		if node.height <= 0 {
+			break
+		}
+
+		if !model.BelowCheckpoint(sm.chainParams.Checkpoints, uint32(node.height)) { //nolint:gosec
+			ask = append(ask, candidate{hash: *node.hash, height: node.height})
+			e = next
+
+			continue
+		}
+
+		if node.height > committed {
+			break
+		}
+
+		sm.removeHeaderLocked(e, node)
+
+		e = next
+	}
+
+	sm.publishFrontierLocked(time.Now())
+	sm.headerMu.Unlock()
+
+	if len(ask) == 0 {
+		return
+	}
+
+	// Second pass, above the last checkpoint. Ask the store with the lock
+	// released, then take it again and remove only what is still where we left
+	// it: the list can have moved on while we were away.
+	ctx, cancel := sm.chainCtx()
+	defer cancel()
+
+	have := make([]chainhash.Hash, 0, len(ask))
+
+	for _, c := range ask {
+		hash := c.hash
+
+		exists, err := sm.blockchainClient.GetBlockExists(ctx, &hash)
+		if err != nil {
+			// Keeping the header is the safe answer: the block gets asked for
+			// again, which costs a duplicate download rather than a stall.
+			sm.logger.Warnf("[trimHeaders][%s] could not check whether the chain already has this block, keeping its header: %v", hash, err)
+
+			continue
+		}
+
+		if exists {
+			have = append(have, hash)
+		}
+	}
+
+	if len(have) == 0 {
+		return
+	}
+
+	sm.headerMu.Lock()
+
+	for _, hash := range have {
+		e := sm.headerIndex[hash]
+		if e == nil {
+			continue
+		}
+
+		node, ok := e.Value.(*headerNode)
+		if !ok || node.hash == nil {
+			continue
+		}
+
+		if sm.nextCheckpoint != nil && node.hash.IsEqual(sm.nextCheckpoint.Hash) {
+			continue
+		}
+
+		sm.removeHeaderLocked(e, node)
+	}
+
+	sm.publishFrontierLocked(time.Now())
+	sm.headerMu.Unlock()
+}
+
+// removeHeaderLocked takes one header out of the list and the index, moving the
+// download cursor off it first. The caller must hold headerMu.
+//
+// The cursor move is not optional: startHeader is what every download walk
+// starts from, and an element out of the list answers Next() with nil, so a walk
+// left on a removed element would ask for nothing at all and sync would wedge
+// silently.
+func (sm *SyncManager) removeHeaderLocked(e *list.Element, node *headerNode) {
+	if sm.startHeader == e {
+		sm.startHeader = e.Next()
+	}
+
+	sm.unindexHeaderLocked(e, *node.hash)
+	sm.headerList.Remove(e)
 }
 
 // removeHeaderAnchorLocked takes the round's anchor out of the header list, and
@@ -5209,6 +5376,12 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	}
 
 	sm.headerMu.Unlock()
+
+	// The round may cover ground the chain has already walked, so drop the front
+	// of it before anything reads the list. Done after the unlock, because above
+	// the last checkpoint this asks the blockchain store and headerMu must never
+	// be held across a client call.
+	sm.trimHeadersTheChainAlreadyHas()
 
 	// A peer that hands us headers up to height N has demonstrably got the chain
 	// that far. Done after the unlock, so no peer state is touched under
