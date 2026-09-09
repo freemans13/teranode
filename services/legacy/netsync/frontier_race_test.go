@@ -616,8 +616,16 @@ func TestHandleBlockMsg_AdvancesTheFrontier(t *testing.T) {
 
 	arriving := chainhash.Hash{0xa1}
 	next := chainhash.Hash{0xa2}
-	sm.headerList.PushBack(&headerNode{height: 10, hash: &arriving})
-	sm.headerList.PushBack(&headerNode{height: 11, hash: &next})
+
+	// Indexed as well as listed, because advanceHeaderListFor finds the header
+	// by hash rather than by position, and every production insertion writes
+	// both together. A list built without the index is a state the node never
+	// reaches.
+	sm.headerMu.Lock()
+	sm.indexHeaderLocked(sm.headerList.PushBack(&headerNode{height: 10, hash: &arriving}), arriving)
+	sm.indexHeaderLocked(sm.headerList.PushBack(&headerNode{height: 11, hash: &next}), next)
+	sm.headerMu.Unlock()
+
 	sm.startHeader = nil // everything in the list has been requested
 
 	sm.blockDownloads.Add(syncPeer, arriving)

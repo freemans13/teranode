@@ -40,37 +40,40 @@ func TestSyncManager_ARedeliveredCopyThatWasTheFrontKeepsTheBlockReachable(t *te
 	// Nothing is in the chain, so every delivery below is an orphan and parks.
 	h.client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 
-	// The first copy arrives while the block is behind another header, so it
-	// takes nothing off the front and the park has no header node for it.
+	// The first copy arrives while the block is behind another header. It takes
+	// its own header out of the middle of the list and the park keeps that node.
+	//
+	// This used to record nothing, because a header was removed only when the
+	// arriving hash matched the FRONT. That is the bug this file's sibling test
+	// is about: a block committed while it was not the front left its header in
+	// the list forever, and the frontier then named a block already in the chain.
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
 	h.sm.blockPark.mu.Lock()
-	require.Nil(t, h.sm.blockPark.entries[child].removedFront,
-		"the first copy was not the front, so there is no header node to record yet")
+	require.NotNil(t, h.sm.blockPark.entries[child].removedFront,
+		"the header comes out wherever it sat, and the park carries the node so a give-up can put it back")
 	h.sm.blockPark.mu.Unlock()
 
-	// The block in front of it arrives and moves the list on, so our block is
-	// now the front.
+	h.sm.headerMu.Lock()
+	_, indexed := h.sm.headerIndex[child]
+	h.sm.headerMu.Unlock()
+	require.False(t, indexed, "and it is out of the index, so no cursor rewind can target a block already on disk")
+
+	// The block in front of it arrives and moves the list on.
 	h.sm.advanceHeaderListFor(first)
 
-	h.sm.headerMu.Lock()
-	front := h.sm.headerList.Front().Value.(*headerNode)
-	h.sm.headerMu.Unlock()
-
-	require.Equal(t, child.String(), front.hash.String())
-
-	// A second copy of the same block turns up. It takes the header off the
-	// front, and the park is where that node has to be kept.
+	// A second copy of the same block turns up. It is not a second block, and
+	// there is no header left for it to take.
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len(), "a re-delivered copy of a parked block is not a second block")
 
 	h.sm.headerMu.Lock()
-	_, indexed := h.sm.headerIndex[child]
+	_, indexed = h.sm.headerIndex[child]
 	listLen := h.sm.headerList.Len()
 	h.sm.headerMu.Unlock()
 
-	require.False(t, indexed, "the second copy took the header out of the list and out of the index")
+	require.False(t, indexed, "still out of the list and out of the index")
 	require.Equal(t, 1, listLen, "only the block after it is left, so nothing but the carried node can bring this one back")
 
 	// The block is given up on. The trigger used to be a thirty-minute timer,

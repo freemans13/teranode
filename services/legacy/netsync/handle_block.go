@@ -2147,12 +2147,16 @@ func (sm *SyncManager) createTxMap(ctx context.Context, block *bsvutil.Block, tx
 	txOrder := make([]chainhash.Hash, 0, len(block.Transactions()))
 
 	for _, wireTx := range block.Transactions() {
-		// Copy the hash value out of the bsvutil.Tx wrapper. bt.Tx.SetTxHash
-		// stores the pointer, so passing wireTx.Hash() directly would keep
-		// the wrapping wire.MsgTx (and its decode arena) alive through this
-		// bt.Tx and the TxMapWrapper it lands in.
-		hashCopy := *wireTx.Hash()
-		txOrder = append(txOrder, hashCopy)
+		// The wrapper's hash is shared rather than copied. It used to be copied
+		// so that bt.Tx.SetTxHash, which stores the pointer it is given, could
+		// not keep the wrapping wire.MsgTx and its decode arena alive. The
+		// converter below now aliases that arena on purpose, so a copy here
+		// prevents nothing and costs one allocation per transaction.
+		//
+		// bsvutil.Tx.Hash memoises into a field it assigns exactly once and
+		// never reassigns, so the value behind this pointer does not move.
+		hash := wireTx.Hash()
+		txOrder = append(txOrder, *hash)
 
 		tx := &bt.Tx{}
 
@@ -2162,8 +2166,8 @@ func (sm *SyncManager) createTxMap(ctx context.Context, block *bsvutil.Block, tx
 
 		// don't add the coinbase to the txMap, we cannot process it anyway
 		if !tx.IsCoinbase() {
-			tx.SetTxHash(&hashCopy)
-			txMap.Set(hashCopy, &TxMapWrapper{Tx: tx})
+			tx.SetTxHash(hash)
+			txMap.Set(*hash, &TxMapWrapper{Tx: tx})
 		}
 	}
 
@@ -2187,50 +2191,56 @@ func WireTxToGoBtTx(wireTx *bsvutil.Tx, tx *bt.Tx) error {
 	tx.LockTime = wTx.LockTime
 
 	tx.Inputs = make([]*bt.Input, len(wTx.TxIn))
+
 	for i, in := range wTx.TxIn {
+		// The scripts are ALIASED, not copied, and so is the previous-output
+		// hash. The bt.Tx points into the decoded wire transaction and into
+		// go-wire's decode arena behind it, which means the wire block stays
+		// reachable for as long as any converted transaction does. That is
+		// deliberate. See TestConversionHoldsOneCopyOfTheBlock.
+		//
+		// This used to clone every script, so the arena could be released when
+		// the conversion returned. The reasoning was that holding both
+		// representations at once does not fit a 3.44 GB block under a 6 GiB
+		// soft limit. The reasoning was right and the conclusion was backwards.
+		//
+		// Mainnet transactions at this height average a measured 27 KB, so a
+		// transaction is almost entirely script bytes. Holding the arena and
+		// holding your own copies of the scripts are therefore the same number
+		// of bytes: measured, the converted transactions alone come to 0.98
+		// times the wire block and the aliased ones to 1.01. What the clone
+		// added was a transient peak of 1.98 times the wire block while both
+		// were live, plus a full copy of every script.
+		//
+		// Under the node's own conditions, a heap pinned at a 6 GiB limit
+		// against 137 million live objects, that copy cost 22.89 ms per block
+		// at the mainnet shape against 0.43 ms for aliasing, because each
+		// allocation must pay off sweep debt before it may proceed. It also
+		// allocated 56 MB per block against 1.09 MB.
+		//
+		// Aliasing is safe because of what go-wire's arena guarantees in its
+		// own documentation: returned slices are stable forever with nothing
+		// ever moving them, capacity equals length so an append cannot reach
+		// into the neighbouring script, and the arena is never explicitly freed,
+		// so a chunk is reclaimed only once nothing points into it. Nothing in
+		// teranode or in go-bt writes through a script pointer, which
+		// TestConversionDoesNotModifyTheWireBlock holds to.
 		tx.Inputs[i] = &bt.Input{
-			UnlockingScript:    &bscript.Script{},
+			UnlockingScript:    (*bscript.Script)(&in.SignatureScript),
 			PreviousTxOutIndex: in.PreviousOutPoint.Index,
 			SequenceNumber:     in.Sequence,
 		}
-		// The 32 bytes are COPIED, not pointed at. go-bt's PreviousTxIDAdd
-		// stores the pointer it is given (input.go:141), so passing
-		// &in.PreviousOutPoint.Hash kept this bt.Input holding an interior
-		// pointer into the wire transaction it came from. That kept the wire
-		// transaction alive, which kept its SignatureScript slice header alive,
-		// which kept that slice's whole 4 MiB decode-arena chunk alive. Every
-		// chunk carries at least one input script, so one retained pointer per
-		// input pinned the ENTIRE arena for as long as any converted
-		// transaction lived, which is the whole pipeline.
-		//
-		// That defeated the point of cloning the scripts below. The clone exists
-		// so the arena can be released once this conversion returns, which is
-		// what the notes at lines 238, 265, 430 and 527 all promise. It was not
-		// happening: measured, dropping the wire block released nothing at all.
-		// So the process carried two complete copies of every block, roughly
-		// 7 GB for a mainnet 3.44 GB block against a 6 GiB soft limit, and the
-		// repo's own benchmark measures this loop running eight times slower
-		// once that limit is reached.
-		//
-		// The same trap two lines up in createTxMap was already handled, for the
-		// same reason, with the same fix: the note there says SetTxHash stores
-		// the pointer, so the transaction hash is copied before being handed
-		// over. This is that fix applied to the one pointer it missed.
-		//
-		// See TestArenaIsReleasedAfterConversion, which measures it.
-		prevHash := in.PreviousOutPoint.Hash
 
-		_ = tx.Inputs[i].PreviousTxIDAdd(&prevHash)
-		*tx.Inputs[i].UnlockingScript = bytes.Clone(in.SignatureScript)
+		_ = tx.Inputs[i].PreviousTxIDAdd(&in.PreviousOutPoint.Hash)
 	}
 
 	tx.Outputs = make([]*bt.Output, len(wTx.TxOut))
+
 	for i, out := range wTx.TxOut {
 		tx.Outputs[i] = &bt.Output{
-			Satoshis:      uint64(out.Value),
-			LockingScript: &bscript.Script{},
+			Satoshis:      uint64(out.Value), //nolint:gosec
+			LockingScript: (*bscript.Script)(&out.PkScript),
 		}
-		*tx.Outputs[i].LockingScript = bytes.Clone(out.PkScript)
 	}
 
 	return nil

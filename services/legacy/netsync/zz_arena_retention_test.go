@@ -12,91 +12,68 @@ import (
 	"github.com/bsv-blockchain/teranode/services/legacy/bsvutil"
 )
 
-// TestArenaIsReleasedAfterConversion is the measurement behind a claim the code
-// makes in five places and, until this test, nowhere proved: that the wire
-// block's decode arena becomes collectable once WireTxToGoBtTx has run.
+// The invariant these tests protect is that converting a block from its wire
+// form to bt.Tx leaves the process holding ONE copy of the block's bytes, not
+// two. On a 3.44 GB mainnet block against a 6 GiB soft memory limit, two copies
+// do not fit.
 //
-// The claim matters because the conversion clones every script, so while the
-// wire block is still reachable the process holds two complete copies. On
-// mainnet at 3.44 GB a block that is roughly 7 GB of live heap against a 6 GiB
-// soft limit, and the repo's own benchmark measures an eightfold slowdown in
-// this exact loop when the limit is reached.
+// How that invariant is met changed, and the history matters because the
+// obvious reading of this file is now the opposite of what it used to say.
 //
-// It is measured rather than reasoned about because reasoning got it wrong. Every
-// bt.Input retained a pointer into the wire transaction it came from, which kept
-// that transaction's script slice alive, which kept its whole 4 MiB arena chunk
-// alive. Since every chunk carries at least one input script, one retained
-// pointer per input pinned the entire arena for as long as the converted
-// transactions lived.
-func TestArenaIsReleasedAfterConversion(t *testing.T) {
-	if raceDetectorEnabled {
-		// The detector allocates shadow memory for every access and changes
-		// allocation behaviour throughout, so the share of the heap released
-		// here is not the share a production build releases. The property under
-		// test is a memory one, so there is nothing to salvage by loosening the
-		// threshold: it would either stop catching the regression or start
-		// failing at random.
-		t.Skip("this measures heap proportions, which the race detector perturbs")
-	}
+// It used to be met by cloning every script, so the wire block and its decode
+// arena could be dropped the moment the conversion returned. The test here
+// asserted exactly that: dropping the wire block must give back most of what it
+// cost. That worked, after a fashion, but it paid for the guarantee with a full
+// copy of every script and a transient peak of both representations at once,
+// measured at 1.98 times the wire block.
+//
+// It is now met by aliasing: the bt.Tx points at the decoder's script bytes and
+// the arena is deliberately retained. At the transaction size mainnet is
+// actually carrying, a measured mean of 27 KB, a transaction is almost entirely
+// script, so holding the arena and holding your own copies come to the same
+// number of bytes. The clone bought nothing and cost a full pass over the block.
+// Measured with the heap pinned at a 6 GiB limit against 137 million live
+// objects, the conversion loop went from 22.89 ms to 0.43 ms per block at that
+// shape, and the peak from 1.98 times the wire block to 1.01.
+//
+// Aliasing is safe because of what go-wire's arena promises in its own
+// documentation: returned slices are stable forever with nothing ever moving
+// them, capacity equals length so an append cannot reach into the next script,
+// and the arena is never explicitly freed, so the collector reclaims a chunk
+// only once nothing points into it. Nothing in teranode or go-bt writes through
+// a script pointer.
 
-	// A baseline before anything is built, because this test runs inside a shared
-	// test binary and whatever ran before it leaves heap behind. An assertion
-	// against a share of TOTAL heap passes alone and fails in the suite, which is
-	// how the third version of this test went wrong. Every figure below is
-	// therefore relative to a quantity measured here.
-	var baseline runtime.MemStats
+// convertedHeapMultiple returns the live heap once both the wire block and its
+// converted transactions exist, as a multiple of what the wire block cost on
+// its own.
+func convertedHeapMultiple(tb testing.TB, convert func(*bsvutil.Tx, *bt.Tx)) float64 {
+	tb.Helper()
+
+	var baseline, wireOnly, withBoth runtime.MemStats
 
 	runtime.GC()
 	runtime.ReadMemStats(&baseline)
 
-	// Decoded from serialised bytes, not built object by object. This matters:
-	// go-wire's decoder puts every script into a bump-allocated arena in 4 MiB
-	// chunks, and a block assembled with NewMsgTx and AddTxIn has no arena at
-	// all, so a test built that way cannot observe the retention it is about.
-	// The first version of this test made exactly that mistake.
-	block := wire.NewMsgBlock(wire.NewBlockHeader(1, &chainhash.Hash{}, &chainhash.Hash{}, 0, 0))
-
-	for _, tx := range buildBenchTxs(t) {
-		_ = block.AddTransaction(tx.MsgTx())
-	}
-
-	var serialised bytes.Buffer
-	if err := block.Serialize(&serialised); err != nil {
-		t.Fatalf("serialise: %v", err)
-	}
-
-	block = nil
-
-	decoded := wire.NewMsgBlock(wire.NewBlockHeader(1, &chainhash.Hash{}, &chainhash.Hash{}, 0, 0))
-	if err := decoded.Bsvdecode(bytes.NewReader(serialised.Bytes()), 0, wire.BaseEncoding); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-
-	serialised.Reset()
-
-	wireTxs := make([]*bsvutil.Tx, 0, len(decoded.Transactions))
-	for _, msgTx := range decoded.Transactions {
-		wt := bsvutil.NewTx(msgTx)
-		_ = wt.Hash()
-		wireTxs = append(wireTxs, wt)
-	}
-
-	decoded = nil
-
-	var wireOnly runtime.MemStats
+	// Decoded from serialised bytes, not built object by object. go-wire's
+	// decoder puts every script into a bump-allocated arena in 4 MiB chunks; a
+	// block assembled with NewMsgTx and AddTxIn has no arena at all, so a test
+	// built that way cannot observe anything this file is about. The first
+	// version of the old test made exactly that mistake.
+	//
+	// The shape is the one mainnet carries. At 370-byte transactions the wire
+	// structs outweigh the script bytes and the two strategies come much closer
+	// together, which would make this a weak test of a strong property.
+	wireTxs, _ := buildDecodedBenchTxs(tb, 2000, 2, 2, 107, 13500)
 
 	runtime.GC()
 	runtime.ReadMemStats(&wireOnly)
-	t.Logf("heap with the wire block alone: %.1f MB", float64(wireOnly.HeapAlloc)/(1<<20))
 
 	converted := make([]*bt.Tx, 0, len(wireTxs))
 	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](len(wireTxs))
 
 	for _, wireTx := range wireTxs {
 		tx := &bt.Tx{}
-		if err := WireTxToGoBtTx(wireTx, tx); err != nil {
-			t.Fatalf("conversion failed: %v", err)
-		}
+		convert(wireTx, tx)
 
 		hashCopy := *wireTx.Hash()
 		tx.SetTxHash(&hashCopy)
@@ -104,56 +81,126 @@ func TestArenaIsReleasedAfterConversion(t *testing.T) {
 		converted = append(converted, tx)
 	}
 
-	var withBoth runtime.MemStats
-
 	runtime.GC()
 	runtime.ReadMemStats(&withBoth)
 
-	// MANDATORY, and the reason the first two versions of this test measured
-	// nothing. The only later use of wireTxs is the assignment to nil below,
-	// which is never read, so without this the compiler treats it as dead the
-	// moment the loop ends and Go's precise collector reclaims it BEFORE the
-	// measurement above. Both readings then come out identical and the test
-	// reports no retention whether or not any exists.
+	// MANDATORY, and the reason three earlier attempts at this measured
+	// nothing. Without it the compiler treats these as dead the moment the loop
+	// ends and Go's precise collector reclaims them BEFORE the reading above,
+	// so both readings come out identical whether or not the property holds.
 	runtime.KeepAlive(wireTxs)
-
-	// Drop the wire side, exactly as HandleBlockDirect intends to when
-	// prepareSubtrees returns. Only the converted transactions stay reachable.
-	wireTxs = nil
-
-	var afterDrop runtime.MemStats
-
-	runtime.GC()
-	runtime.GC()
-	runtime.ReadMemStats(&afterDrop)
-
-	// Keep the converted side alive across the measurement, or the compiler is
-	// entitled to collect it and the numbers mean nothing.
 	runtime.KeepAlive(converted)
 	runtime.KeepAlive(txMap)
 
-	released := int64(withBoth.HeapAlloc) - int64(afterDrop.HeapAlloc)
 	wireSize := int64(wireOnly.HeapAlloc) - int64(baseline.HeapAlloc)
-
-	t.Logf("the wire block itself: %.1f MB", float64(wireSize)/(1<<20))
-	t.Logf("heap with both copies: %.1f MB", float64(withBoth.HeapAlloc)/(1<<20))
-	t.Logf("heap after dropping the wire block: %.1f MB", float64(afterDrop.HeapAlloc)/(1<<20))
-	t.Logf("released: %.1f MB, which is %.0f%% of the wire block",
-		float64(released)/(1<<20), 100*float64(released)/float64(wireSize))
+	both := int64(withBoth.HeapAlloc) - int64(baseline.HeapAlloc)
 
 	if wireSize <= 0 {
-		t.Fatalf("the wire block measured %d bytes, so nothing here means anything", wireSize)
+		tb.Fatalf("the wire block measured %d bytes, so nothing here means anything", wireSize)
 	}
 
-	// Dropping the wire block must give back most of what the wire block cost.
-	// Half is the floor rather than a round number: the converted transactions
-	// keep their own copies of every script, so a little of the wire side is
-	// legitimately shared, and the point is to catch the whole decode arena
-	// being pinned rather than to pin an exact ratio across Go versions and
-	// transaction shapes. Measured on this benchmark's shape the fixed code
-	// gives back essentially all of it and the unfixed code about a third.
-	if float64(released) < float64(wireSize)*0.5 {
-		t.Fatalf("dropping the wire block gave back only %.1f MB of the %.1f MB it cost; the decode arena is still pinned, so the process carries two full copies of every block through the rest of the pipeline",
-			float64(released)/(1<<20), float64(wireSize)/(1<<20))
+	// Every figure is relative to a baseline taken inside this function. An
+	// assertion against a share of TOTAL heap passes alone and fails in the
+	// suite, because the test binary is shared; that is how the third version
+	// of the old test went wrong.
+	return float64(both) / float64(wireSize)
+}
+
+// TestConversionHoldsOneCopyOfTheBlock is the invariant. Converting must not
+// double the block's footprint, even for the moment it takes to convert.
+func TestConversionHoldsOneCopyOfTheBlock(t *testing.T) {
+	if raceDetectorEnabled {
+		// The detector allocates shadow memory for every access and changes
+		// allocation behaviour throughout, so the multiple measured here is not
+		// the multiple a production build reaches. The property under test is a
+		// memory one, so there is nothing to salvage by loosening the
+		// threshold: it would either stop catching the regression or start
+		// failing at random.
+		t.Skip("this measures heap proportions, which the race detector perturbs")
+	}
+
+	got := convertedHeapMultiple(t, func(w *bsvutil.Tx, tx *bt.Tx) {
+		if err := WireTxToGoBtTx(w, tx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Logf("peak heap during conversion: %.2f times the wire block", got)
+
+	// 1.35 rather than a tight bound on the measured 1.01, because the slack is
+	// the bt.Tx, bt.Input and bt.Output structs, whose share of the total moves
+	// with transaction size and with the Go version. A conversion that copied
+	// the scripts would land near 2.0 and is what this must catch.
+	if got > 1.35 {
+		t.Fatalf("conversion peaked at %.2f times the wire block; the process is carrying two copies of it, which does not fit a 3.44 GB block under a 6 GiB limit", got)
+	}
+}
+
+// TestConversionDoesNotModifyTheWireBlock is the safety half of aliasing. The
+// bt.Tx now points at the decoder's bytes, so anything writing through a script
+// would corrupt the block the node received, and the corruption would only
+// surface later as a hash mismatch.
+func TestConversionDoesNotModifyTheWireBlock(t *testing.T) {
+	wireTxs, raw := buildDecodedBenchTxsWithBytes(t, 200, 3, 3, 107, 512)
+
+	before := append([]byte(nil), raw...)
+
+	converted := make([]*bt.Tx, 0, len(wireTxs))
+
+	for _, wireTx := range wireTxs {
+		tx := &bt.Tx{}
+		if err := WireTxToGoBtTx(wireTx, tx); err != nil {
+			t.Fatal(err)
+		}
+
+		converted = append(converted, tx)
+	}
+
+	// Re-serialise the wire block from the objects the conversion aliased, and
+	// compare against the bytes it was decoded from.
+	rebuilt := wire.NewMsgBlock(wire.NewBlockHeader(1, &chainhash.Hash{}, &chainhash.Hash{}, 0, 0))
+	for _, wireTx := range wireTxs {
+		if err := rebuilt.AddTransaction(wireTx.MsgTx()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	if err := rebuilt.Serialize(&out); err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(before, out.Bytes()) {
+		t.Fatal("the wire block changed during conversion; an aliased script was written through")
+	}
+
+	runtime.KeepAlive(converted)
+}
+
+// TestConvertedTransactionsMatchTheWireBytes checks the content, not just that
+// nothing was overwritten: each converted transaction must serialise to exactly
+// the bytes the wire transaction does. Aliasing the wrong slice, or off by an
+// input, would pass the mutation test above and fail here.
+func TestConvertedTransactionsMatchTheWireBytes(t *testing.T) {
+	wireTxs, _ := buildDecodedBenchTxsWithBytes(t, 200, 3, 3, 107, 512)
+
+	for i, wireTx := range wireTxs {
+		tx := &bt.Tx{}
+		if err := WireTxToGoBtTx(wireTx, tx); err != nil {
+			t.Fatal(err)
+		}
+
+		var want bytes.Buffer
+		if err := wireTx.MsgTx().Serialize(&want); err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Equal(want.Bytes(), tx.Bytes()) {
+			t.Fatalf("transaction %d does not serialise to the bytes it came from", i)
+		}
+
+		if *tx.TxIDChainHash() != *wireTx.Hash() {
+			t.Fatalf("transaction %d has a different id after conversion", i)
+		}
 	}
 }

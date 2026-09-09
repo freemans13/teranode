@@ -602,14 +602,17 @@ func TestDrain_TheFrontIsAdvancedAtDispatchNotAtCommit(t *testing.T) {
 	require.NoError(t, h.deliver(t, 1))
 	require.Equal(t, 1, h.sm.blockPark.Len())
 
-	// The parent's own arrival took its node off the front, so the child's node is
-	// the front now, which is the state a drain runs in.
-	_, _ = h.sm.advanceHeaderListFor(h.blocks[0].MsgBlock().BlockHash())
-
+	// The delivery above already took the child's header out, wherever it sat:
+	// advanceHeaderListFor matches by hash, not by position. Before that fix it
+	// came out only if the child happened to be the front, and a child that was
+	// not left its header behind for good.
 	h.sm.headerMu.Lock()
-	front := h.sm.headerList.Front().Value.(*headerNode)
+	_, stillThere := h.sm.headerIndex[child]
 	h.sm.headerMu.Unlock()
-	require.Equal(t, child.String(), front.hash.String(), "precondition: the parked block's node is the front")
+	require.False(t, stillThere, "precondition: the parked block's header is already out of the list")
+
+	// The parent's own arrival moves the front on.
+	_, _ = h.sm.advanceHeaderListFor(h.blocks[0].MsgBlock().BlockHash())
 
 	// The validation is held open, so any assertion below is made while the
 	// drained block is still in flight.
@@ -634,12 +637,12 @@ func TestDrain_TheFrontIsAdvancedAtDispatchNotAtCommit(t *testing.T) {
 	require.True(t, h.sm.drainStep(bd), "the parked block is dispatched")
 
 	h.sm.headerMu.Lock()
-	front = h.sm.headerList.Front().Value.(*headerNode)
+	front := h.sm.headerList.Front().Value.(*headerNode)
 	_, stillIndexed := h.sm.headerIndex[child]
 	h.sm.headerMu.Unlock()
 
 	require.False(t, stillIndexed,
-		"the drained block's node must come off the front at dispatch, or the next arriving block matches nothing")
+		"the drained block's node must be out of the list before it commits, or the next arriving block matches nothing")
 	require.Equal(t, h.blocks[2].MsgBlock().BlockHash().String(), front.hash.String(),
 		"and the front must already be on the block after it, while the drained block is still validating")
 
