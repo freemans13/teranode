@@ -2,13 +2,12 @@ package peer
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
-	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/errors"
 )
 
 // defaultStreamToDiskAtLeast is the payload size at or above which a block's
@@ -24,6 +23,29 @@ var streamToDiskAtLeast int64 = defaultStreamToDiskAtLeast
 // manager installs one, and a nil sink means every block is decoded, which is
 // what keeps callers that never wire a store working unchanged.
 var blockBodySink func(hash chainhash.Hash, r io.Reader, n int64) error
+
+// blockBodyGate answers whether a block's body may be streamed to disk, and is
+// the only thing standing between a peer and this node's disk. It is
+// installed by the sync manager, which is the only place that knows both the
+// chain's difficulty limit and what this node actually asked for; this
+// package has neither, and checking proof of work here against nothing but
+// the header's own declared target bounds nothing; a peer can declare
+// whatever target it likes. A nil gate means no streaming at all: the handler
+// falls back to decoding, exactly as a nil blockBodySink already does, so a
+// caller that wires a sink but forgets a gate gets the old safe behaviour
+// rather than an open door.
+var blockBodyGate func(hash chainhash.Hash, header *wire.BlockHeader) error
+
+// blockBodyDelete removes a block body already written under hash. It is
+// installed alongside blockBodySink and blockBodyGate. A body can be fully
+// written and only then found unusable, for example a peer's stream ending
+// short of what it declared, or a transaction count that will not parse. An
+// orphaned body left on disk under a well-formed hash is worse than a failed
+// download: a failed download is simply retried by the download walk, but
+// nothing downstream of this handler knows to distrust bytes sitting on disk
+// under a hash that looks legitimate. Nil until the sync manager installs it,
+// same as the other two.
+var blockBodyDelete func(hash chainhash.Hash) error
 
 // streamingBlockHandler is a wire.SetExternalHandler implementation for the
 // "block" message that decodes the block payload directly from the network
@@ -45,10 +67,10 @@ var blockBodySink func(hash chainhash.Hash, r io.Reader, n int64) error
 // streaming would require a TeeReader → SHA-256 pass over multi-GB
 // payloads, which is not justified given the downstream guarantees.
 //
-// Above streamToDiskAtLeast, and only when a sink is installed, the body is
-// never decoded at all: the header is read, checked, and everything after it
-// goes straight to the sink. That is what keeps a multi-gigabyte block from
-// ever existing as a Go object on this path.
+// Above streamToDiskAtLeast, and only when both a sink and a gate are
+// installed, the body is never decoded at all: the header is read, put to the
+// gate, and everything after it goes straight to the sink. That is what keeps
+// a multi-gigabyte block from ever existing as a Go object on this path.
 func streamingBlockHandler(r io.Reader, length uint64, totalBytes int) (int, wire.Message, []byte, error) {
 	// Cap the inner reader so a malformed varint cannot read past the declared
 	// payload boundary and desync the next ReadMessage call.
@@ -59,14 +81,17 @@ func streamingBlockHandler(r io.Reader, length uint64, totalBytes int) (int, wir
 	// Drain any unread payload bytes so the next ReadMessage starts on a clean
 	// header boundary, and surface a short stream as an error. io.Copy on a
 	// LimitedReader returns nil if the underlying reader EOFs before N reaches
-	// 0, so lr.N is checked explicitly.
+	// 0, so lr.N is checked explicitly. This also runs after a gate rejection,
+	// since readBlockMessage returns as soon as the gate refuses without
+	// touching the rest of lr, so the bytes it never read still need draining
+	// here for the connection to stay on a clean message boundary.
 	var drainErr error
 
 	if lr.N > 0 {
 		if _, copyErr := io.Copy(io.Discard, lr); copyErr != nil {
 			drainErr = copyErr
 		} else if lr.N > 0 {
-			drainErr = fmt.Errorf("streaming block: peer declared %d byte payload but stream ended with %d bytes unread", length, lr.N)
+			drainErr = errors.NewProcessingError("streaming block: peer declared %d byte payload but stream ended with %d bytes unread", length, lr.N)
 		}
 	}
 
@@ -82,9 +107,9 @@ func streamingBlockHandler(r io.Reader, length uint64, totalBytes int) (int, wir
 }
 
 // readBlockMessage returns the block either decoded or as a body on disk,
-// depending on its declared size and whether a sink is installed.
+// depending on its declared size and whether a sink and a gate are installed.
 func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error) {
-	if blockBodySink == nil || int64(length) < streamToDiskAtLeast {
+	if blockBodySink == nil || blockBodyGate == nil || int64(length) < streamToDiskAtLeast {
 		msg := &wire.MsgBlock{}
 
 		return msg, msg.Bsvdecode(lr, wire.ProtocolVersion, wire.BaseEncoding)
@@ -92,23 +117,27 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 
 	var header wire.BlockHeader
 	if err := header.Deserialize(lr); err != nil {
-		return nil, fmt.Errorf("streaming block: could not read the header: %w", err)
+		return nil, errors.NewProcessingError("streaming block: could not read the header", err)
 	}
 
 	hash := header.BlockHash()
 
-	// The stateless check runs HERE, before a byte of body is stored, and it is
-	// the whole reason a peer cannot fill this node's disk. Proof of work is what
-	// stops an attacker minting unlimited distinct "blocks"; it is header-only,
-	// so it costs nothing to do at the wire.
+	// blockBodyGate is what stops a peer filling this node's disk: nothing is
+	// written until it returns nil. The sync manager's implementation of it is
+	// expected to check, in order, that this node actually asked for this
+	// hash, that the header's declared target is not easier than the chain's
+	// own difficulty limit, and only then that the header meets that (now
+	// bounded) target; the first check answers "was this asked for", and of
+	// the other two the limit check is what makes the target check mean
+	// anything, since without it a peer can simply declare a target it always
+	// meets.
 	//
-	// It used to run in the park, in validateParkCandidate, AFTER the body had
-	// been written. That was safe when the body arrived already decoded, because
-	// the decode itself bounded what a peer could send. Streaming removes that
-	// bound, so the check has to move ahead of the write. WriteAdmitted skips it
-	// for a streamed body precisely because it has already happened here.
-	if err := checkBlockHeaderStandsAlone(&header, hash); err != nil {
-		return nil, err
+	// This runs before the park sees the block at all. A future change to the
+	// park's admission path for a streamed body is expected to skip re-running
+	// any of this, on the grounds that it already happened here; as written
+	// today that admission path only knows about decoded blocks.
+	if err := blockBodyGate(hash, &header); err != nil {
+		return nil, errors.NewProcessingError("streaming block %s: refused", hash, err)
 	}
 
 	// Everything from the transaction count onward goes to the sink untouched,
@@ -120,12 +149,22 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 	counted.r = lr
 
 	if err := blockBodySink(hash, &counted, int64(length)-int64(wire.MaxBlockHeaderPayload)); err != nil {
-		return nil, fmt.Errorf("streaming block %s: could not store the body: %w", hash, err)
+		return nil, deleteOrphanedBody(hash, errors.NewProcessingError("streaming block %s: could not store the body", hash, err))
+	}
+
+	// The sink returned success, but if the peer's declared payload still has
+	// unread bytes, the body just written is shorter than declared: a
+	// truncated body sitting under a well-formed hash. Caught here, before the
+	// caller's generic drain runs, so the orphan can be deleted rather than
+	// left behind uncounted.
+	if lr.N > 0 {
+		return nil, deleteOrphanedBody(hash, errors.NewProcessingError(
+			"streaming block %s: peer declared %d byte payload but the body ended early with %d bytes unread", hash, length, lr.N))
 	}
 
 	txCount, err := wire.ReadVarInt(bytes.NewReader(counted.first), wire.ProtocolVersion)
 	if err != nil {
-		return nil, fmt.Errorf("streaming block %s: could not read the transaction count: %w", hash, err)
+		return nil, deleteOrphanedBody(hash, errors.NewProcessingError("streaming block %s: could not read the transaction count", hash, err))
 	}
 
 	return &MsgBlockOnDisk{BlockBody{
@@ -134,6 +173,20 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 		Size:    int64(length),
 		Hash:    hash,
 	}}, nil
+}
+
+// deleteOrphanedBody removes a body already written under hash before
+// returning err. See blockBodyDelete's doc comment for why an orphaned body is
+// worse than a failed download. The delete is best-effort: its own failure is
+// swallowed rather than returned, because err is the reason the caller is
+// failing in the first place and must not be masked by a secondary cleanup
+// error.
+func deleteOrphanedBody(hash chainhash.Hash, err error) error {
+	if blockBodyDelete != nil {
+		_ = blockBodyDelete(hash)
+	}
+
+	return err
 }
 
 // countingReader passes bytes straight through while keeping the first nine,
@@ -157,32 +210,6 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	}
 
 	return n, err
-}
-
-// checkBlockHeaderStandsAlone is everything about a block that can be judged
-// from its 80-byte header, with no transactions and no chain context.
-//
-// It is the same pair of questions the park used to ask after writing the body:
-// does the block hash to what the header says, and does it meet its own target
-// difficulty. Asked here, before the body is stored, they are what stops a peer
-// filling the disk with rubbish. Whether nBits itself is right needs chain
-// context and stays where it is.
-func checkBlockHeaderStandsAlone(header *wire.BlockHeader, hash chainhash.Hash) error {
-	var headerBytes bytes.Buffer
-	if err := header.Serialize(&headerBytes); err != nil {
-		return fmt.Errorf("streaming block %s: could not serialize the header: %w", hash, err)
-	}
-
-	h, err := model.NewBlockHeaderFromBytes(headerBytes.Bytes())
-	if err != nil {
-		return fmt.Errorf("streaming block %s: could not read the header: %w", hash, err)
-	}
-
-	if met, _, err := h.HasMetTargetDifficulty(); !met {
-		return fmt.Errorf("streaming block %s: does not meet its own target difficulty: %w", hash, err)
-	}
-
-	return nil
 }
 
 var registerStreamingBlockHandlerOnce sync.Once

@@ -64,3 +64,21 @@ func (m *MsgBlockOnDisk) Command() string { return wire.CmdBlock }
 func (m *MsgBlockOnDisk) MaxPayloadLength(pver uint32) uint64 {
 	return (&wire.MsgBlock{}).MaxPayloadLength(pver)
 }
+
+// SetBlockBodyGate installs the gate that decides whether a block's body may
+// be streamed to disk. The sync manager calls this where it installs
+// blockBodySink (via SetBlockBodySink), since a store reachable with no gate
+// in front of it is a store anybody can fill; the two must be installed, and
+// removed, together. See blockBodyGate's doc comment for what the gate is
+// required to check.
+func SetBlockBodyGate(f func(hash chainhash.Hash, header *wire.BlockHeader) error) {
+	blockBodyGate = f
+}
+
+// SetBlockBodyDelete installs the callback that removes a body already
+// written under a hash, for the handler to call when it fails after the sink
+// has already returned success. See blockBodyDelete's doc comment for why an
+// orphaned body is worse than a failed download.
+func SetBlockBodyDelete(f func(hash chainhash.Hash) error) {
+	blockBodyDelete = f
+}
