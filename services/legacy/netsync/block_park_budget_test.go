@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/stretchr/testify/require"
 )
 
@@ -110,33 +109,40 @@ func TestBlockPark_ARestoredBlockIsStillBilled(t *testing.T) {
 	require.Zero(t, chargedTotal(park))
 }
 
-// TestReadAhead_TheWalkStopsAtTheByteBudget is the brake.
+// TestReadAhead_TheWalkStopsAtItsBlockDepth is the brake, and it counts blocks.
 //
-// The block-count window beside it says nothing about disk, because a window of
-// 128 is 1.4 GB of small blocks and 190 GB of 2022-era ones. What bounds the
-// park is the byte budget, and it has to count the bytes already owed by peers
-// as well as the bytes already on disk: a round that ignores what is coming
-// requests far past the budget and only finds out on delivery, after the merkle
-// rebuild has been paid for.
-func TestReadAhead_TheWalkStopsAtTheByteBudget(t *testing.T) {
+// There used to be a byte budget here instead, and it was removed. A block's
+// size is not known until it has been downloaded, so a byte bound cannot stop
+// the bandwidth being spent, only refuse a block already paid for; its default
+// matched the park's own ceiling so the walk filled the park to exactly its
+// refusal point; and the round it abandoned included the header at the front of
+// the list, which is the one block whose arrival would have freed the bytes.
+// Mainnet discarded 1.02 TB of block bytes in two days under it.
+//
+// What is left is the depth, in blocks, checked before a request goes out. That
+// is what SV Node bounds by and all it bounds by.
+func TestReadAhead_TheWalkStopsAtItsBlockDepth(t *testing.T) {
 	h := newParkWiringHarness(t, true)
 
-	h.sm.blockSizeTracker = newBlockSizeTracker(10)
+	h.sm.headerMu.Lock()
+	ceiling, ok := h.sm.lookaheadCeilingLocked()
+	h.sm.headerMu.Unlock()
 
-	require.False(t, h.sm.readAheadBudgetExhausted(), "an empty park with nothing owed is not at its budget")
+	require.True(t, ok, "with a header list and a configured lower window there is a ceiling")
 
-	// Two blocks owed, at the average size the tracker has learned.
-	h.sm.blockSizeTracker.addBlockSize(4 * 1024 * 1024)
-	h.sm.blockDownloads.Add(h.peer, chainhash.Hash{0x01})
-	h.sm.blockDownloads.Add(h.peer, chainhash.Hash{0x02})
+	h.sm.headerMu.Lock()
+	front := h.sm.headerList.Front().Value.(*headerNode).height
+	h.sm.headerMu.Unlock()
 
-	h.sm.settings.Legacy.BlockDownloadMaxBytes = 16 * 1024 * 1024
-	require.False(t, h.sm.readAheadBudgetExhausted(), "8 MiB owed against a 16 MiB budget leaves room")
+	require.Equal(t, int64(front)+int64(h.sm.settings.Legacy.BlockDownloadLowerWindow), ceiling,
+		"the ceiling is the front of the header list plus the configured depth, in blocks")
 
-	h.sm.settings.Legacy.BlockDownloadMaxBytes = 8 * 1024 * 1024
-	require.True(t, h.sm.readAheadBudgetExhausted(),
-		"the bytes peers already owe count against the budget, not just the bytes on disk")
+	// Zero disables it, which is the compiled default and means no limit.
+	h.sm.settings.Legacy.BlockDownloadLowerWindow = 0
 
-	h.sm.settings.Legacy.BlockDownloadMaxBytes = 0
-	require.False(t, h.sm.readAheadBudgetExhausted(), "zero disables the ceiling")
+	h.sm.headerMu.Lock()
+	_, ok = h.sm.lookaheadCeilingLocked()
+	h.sm.headerMu.Unlock()
+
+	require.False(t, ok, "a lower window of zero is no ceiling at all")
 }

@@ -144,9 +144,9 @@ func TestSyncManager_TwoGivenUpBlocksAreAskedForInTheOrderTheyAreNeeded(t *testi
 	h.sm.headerMu.Unlock()
 
 	require.NotNil(t, startHeader, "DIAG: both rewinds must have put the cursor back")
-	t.Logf("DIAG list=%d cursorHeight=%d exhausted=%v downloadMaxBytes=%d parked=%d owed=%d avg=%d",
-		listLen, startHeader.Value.(*headerNode).height, h.sm.readAheadBudgetExhausted(),
-		h.sm.settings.Legacy.BlockDownloadMaxBytes, h.sm.blockPark.Bytes(), h.sm.blockDownloads.Len(), h.sm.blockSizeTracker.getAverageSize())
+	t.Logf("DIAG list=%d cursorHeight=%d lowerWindow=%d parked=%d owed=%d avg=%d",
+		listLen, startHeader.Value.(*headerNode).height,
+		h.sm.settings.Legacy.BlockDownloadLowerWindow, h.sm.blockPark.Bytes(), h.sm.blockDownloads.Len(), h.sm.blockSizeTracker.getAverageSize())
 
 	h.sm.fetchHeaderBlocks()
 

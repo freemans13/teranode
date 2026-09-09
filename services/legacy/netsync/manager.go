@@ -4606,51 +4606,6 @@ func (sm *SyncManager) parkedBlockHeight(reported int32, hash chainhash.Hash, re
 	return reported
 }
 
-// readAheadBudgetExhausted reports whether this node is already holding, or is
-// already owed, as many bytes of blocks as it is allowed to read ahead.
-//
-// The height ceiling beside it counts BLOCKS, which is the wrong unit once a
-// block can be a gigabyte: the same window is 200 MB in 2015 and a terabyte in
-// 2022. SV Node has only the block count, and gets away with it because storing
-// an early block costs it one ordinary disk write into the same file an in-order
-// block goes to. Here an early block is held in the park until everything below
-// it lands, so the bytes are what has to be bounded.
-//
-// Both halves are needed. Parked bytes are what is already on disk; bytes in
-// flight are what is about to be, and leaving them out lets one round request
-// far past the budget and only discover it on delivery, after the merkle
-// rebuild has already been paid for.
-//
-// The in-flight half is an estimate and cannot be anything else: a block's size
-// is not known until it arrives. The rolling average of recently delivered
-// blocks is the best available reading and is the same one the per-peer
-// in-flight cap is derived from, so the two agree about what a block costs.
-func (sm *SyncManager) readAheadBudgetExhausted() bool {
-	if sm.settings == nil {
-		return false
-	}
-
-	budget := sm.settings.Legacy.BlockDownloadMaxBytes
-	if budget <= 0 {
-		return false
-	}
-
-	held := sm.blockPark.Bytes()
-
-	var owed int64
-	if sm.blockSizeTracker != nil {
-		owed = int64(sm.blockDownloads.Len()) * sm.blockSizeTracker.getAverageSize()
-	}
-
-	if held+owed < budget {
-		return false
-	}
-
-	sm.logger.Debugf("[fetchHeaderBlocks] read-ahead budget reached: %d parked plus %d owed against %d, holding the walk", held, owed, budget)
-
-	return true
-}
-
 // lookaheadCeilingLocked returns the highest block height this round may ask for,
 // and whether there is a limit at all. The caller must hold headerMu.
 //
@@ -4717,9 +4672,37 @@ func (sm *SyncManager) snapshotHeaderCandidates(limit int) (hashes []chainhash.H
 	// Asked once rather than per header: it is a property of the node, not of
 	// the header being considered. Returning nothing leaves the cursor exactly
 	// where it is, which is the same shape as running out of peer budget.
-	if sm.readAheadBudgetExhausted() {
-		return nil, nil, chainhash.Hash{}, false
-	}
+	// There is no byte brake here any more, deliberately. There used to be one,
+	// comparing parked plus in-flight bytes against legacy_blockDownloadMaxBytes,
+	// and it was the wrong unit and the wrong place.
+	//
+	// A block's size is not known until it has been downloaded, so a byte bound
+	// cannot stop the bandwidth being spent; it can only refuse a block already
+	// paid for. Its default was 32 GiB, the same figure mainnet gave the park's
+	// own ceiling, so the walk was licensed to fill the park to exactly its
+	// refusal point and every request already in flight arrived to no room.
+	// Measured on mainnet: 2,370 refusals over 654 distinct blocks and 1.02 TB of
+	// block bytes downloaded and discarded in two days.
+	//
+	// It was also a stall waiting to happen. This return abandons the whole round
+	// including the header at the FRONT of the list, which is the one block whose
+	// arrival would drain the park and free the bytes. Nothing else frees them:
+	// the height-floor eviction skips every entry above a hole. So once held
+	// bytes reached the budget with nothing owed, the walk asked for nothing,
+	// for ever.
+	//
+	// What bounds read-ahead instead is the ceiling below, in BLOCKS, checked
+	// before a request goes out. That is what SV Node bounds by and all it bounds
+	// by: nWindowEnd against GetBlockDownloadWindow, nBlocksInFlight against
+	// MAX_BLOCKS_IN_TRANSIT_PER_PEER, and fTooFarAhead against MinBlocksToKeep.
+	// It has no byte bound on block download anywhere.
+	//
+	// The cost that argument does not cover, and it is real: SV Node writes an
+	// early block into the same file an in-order block goes to, so holding it
+	// costs no extra disk, while teranode holds it in a park that is pure
+	// overhead. The answer is to set the depth so its worst case fits the disk,
+	// which is a number an operator can reason about, rather than a byte ceiling
+	// that cannot be checked in time to matter.
 
 	ceiling, hasCeiling := sm.lookaheadCeilingLocked()
 
