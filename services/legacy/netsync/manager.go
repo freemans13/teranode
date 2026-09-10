@@ -5145,6 +5145,34 @@ func (sm *SyncManager) commitHeaderCandidates(assigner *downloadAssigner, anchor
 
 	e := anchor
 
+	// cursorPinned marks that the walk has stepped over a block this node does
+	// not have, so startHeader must not move past it.
+	//
+	// This is SV Node's rule and it is the one thing teranode did differently.
+	// SV Node keeps two pointers: the walk runs ahead and steps over blocks
+	// already in flight, exactly as this loop does, while pindexLastCommonBlock
+	// advances only past blocks it actually HAS data for and stops at the first
+	// it does not. Teranode collapsed both into startHeader, so a skip was made
+	// permanent and the next pass began ABOVE the gap. The comment further down
+	// spells out the consequence: nothing but four specific events ever puts the
+	// cursor back in front of such a block, and one of those, a notfound reply,
+	// cannot fire for a block at all.
+	//
+	// That is why holes persisted. Measured on mainnet on 2026-09-10: fifteen
+	// distinct holes open at once beneath 115 parked blocks, the node idle with
+	// 4.9 GB of committable work on disk.
+	//
+	// Pinning changes nothing about which blocks get requested this pass. The
+	// walk still runs ahead and still asks for higher blocks, so the fan-out is
+	// untouched. What changes is where the NEXT pass starts.
+	cursorPinned := false
+
+	advanceCursor := func(to *list.Element) {
+		if !cursorPinned {
+			sm.startHeader = to
+		}
+	}
+
 	for i := range hashes {
 		if e == nil {
 			return requested, false
@@ -5191,8 +5219,13 @@ func (sm *SyncManager) commitHeaderCandidates(assigner *downloadAssigner, anchor
 		}
 
 		if !alreadyHave[i] && sm.blockDownloads.RequestedWithin(hashes[i], blockRequestRetryInterval) {
+			// Somebody was asked for this and it has not arrived. Step over it so
+			// the pass keeps requesting higher blocks, but pin the cursor here so
+			// the next pass comes back to it. Advancing past it is what turned a
+			// late block into a permanent hole.
+			cursorPinned = true
+
 			e = e.Next()
-			sm.startHeader = e
 
 			continue
 		}
@@ -5234,7 +5267,7 @@ func (sm *SyncManager) commitHeaderCandidates(assigner *downloadAssigner, anchor
 				assigner.remaining--
 
 				e = e.Next()
-				sm.startHeader = e
+				advanceCursor(e)
 
 				continue
 			}
@@ -5270,7 +5303,7 @@ func (sm *SyncManager) commitHeaderCandidates(assigner *downloadAssigner, anchor
 		}
 
 		e = e.Next()
-		sm.startHeader = e
+		advanceCursor(e)
 	}
 
 	return requested, e != nil
