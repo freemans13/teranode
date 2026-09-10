@@ -287,7 +287,25 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		return
 	}
 
-	sm.scheduleDrain(entry.prevBlock, 0)
+	// Hand the drain request to the consumer rather than queueing it here.
+	//
+	// This runs on blockHandler, and drainQueue is owned by the dispatchBlocks
+	// consumer alone with no lock, on the stated invariant that every producer of
+	// a drain request already runs on that goroutine. Calling scheduleDrain from
+	// here broke that twice over: it raced the queue, and it could not wake a
+	// consumer already asleep in its select, so a streamed block whose parent was
+	// already committed parked and stayed there.
+	//
+	// Measured on mainnet on 2026-09-10: block 783,942 committed at 15:21:00, a
+	// 177 MB block whose parent was that block streamed to disk at 15:21:17, and
+	// nothing committed it. The operator's own probe read idle with 115 blocks
+	// parked holding 4.9 GB.
+	//
+	// parkCommits is the existing route for precisely this, used by the sweep. Its
+	// arm on the consumer restores the entry, which is a no-op for one already
+	// registered, and then schedules the drain on the goroutine that owns the
+	// queue. Sending also wakes a sleeping consumer, which queueing never could.
+	sm.submitParkCommit(parkCommit{entry: entry})
 }
 
 // parentIsReachable reports whether a parked block's parent is something this
