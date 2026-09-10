@@ -66,13 +66,12 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 		require.Empty(t, h.sm.drainQueue,
 			"this goroutine must not touch the consumer's queue")
 
-		select {
-		case c := <-h.sm.parkCommits:
-			require.Equal(t, body.Hash, c.entry.hash,
-				"the consumer has to be handed the block, which both queues the drain on the right goroutine and wakes it")
-		default:
-			t.Fatal("nothing was handed to the consumer, so a streamed block whose parent is committed would wait for the 30-second sweep")
-		}
+		// The harness answers not-found for every header, so this parent is NOT in
+		// the chain and no drain should be asked for: the block is worth keeping
+		// but is not committable yet, and its parent's own commit will schedule
+		// the drain when it lands.
+		require.Empty(t, h.sm.parkCommits,
+			"asking for a drain on an uncommitted parent sends the consumer after a block that cannot commit, and each attempt costs a store lookup on the goroutine that commits blocks")
 	})
 
 	t.Run("the delivering peer is recorded", func(t *testing.T) {
@@ -234,5 +233,49 @@ func TestParentIsReachable_ParkedParentCounts(t *testing.T) {
 
 		require.False(t, h.sm.parentIsReachable(chainhash.Hash{0x9e}),
 			"the gate must still refuse a body whose parent is in neither the park, the header list nor the chain")
+	})
+}
+
+// TestHandleBlockOnDiskMsg_DrainsOnlyWhenTheParentIsCommitted separates the two
+// questions this path has to ask, which were briefly answered by one predicate.
+//
+// Whether the body is worth keeping is the looser question, and a parked parent
+// counts. Whether a drain is worth asking for is the stricter one, and only a
+// committed parent counts. Conflating them sent the consumer after blocks that
+// could not commit: measured on mainnet on 2026-09-10, five blocks streamed and
+// six parent-missing failures inside one 45-second window with nothing committing.
+func TestHandleBlockOnDiskMsg_DrainsOnlyWhenTheParentIsCommitted(t *testing.T) {
+	header := wire.BlockHeader{Version: 1, PrevBlock: chainhash.Hash{0xc1}}
+	body := peerpkg.BlockBody{Header: header, TxCount: 1, Size: 2048, Hash: header.BlockHash()}
+
+	t.Run("a committed parent asks for a drain", func(t *testing.T) {
+		h := newParkWiringHarness(t, true)
+		h.sm.drainAsync.Store(true)
+		h.sm.parkCommits = make(chan parkCommit, 4)
+
+		h.chainHolds(t, header.PrevBlock)
+
+		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
+
+		require.Len(t, h.sm.parkCommits, 1,
+			"the parent is committed, so this block can be committed now and the consumer must be told")
+	})
+
+	t.Run("an uncommitted parent is kept but not drained", func(t *testing.T) {
+		h := newParkWiringHarness(t, true)
+		h.sm.drainAsync.Store(true)
+		h.sm.parkCommits = make(chan parkCommit, 4)
+
+		// A parent that is parked rather than committed: worth keeping the child,
+		// not worth a drain.
+		parent := parkedBlock{hash: header.PrevBlock, prevBlock: chainhash.Hash{0xc0}, size: 64}
+		require.True(t, h.sm.blockPark.AdoptWritten(parent))
+
+		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
+
+		require.True(t, h.sm.blockPark.Has(body.Hash),
+			"a parked parent still makes the body worth keeping")
+		require.Empty(t, h.sm.parkCommits,
+			"but it is not committable yet, and its parent's own commit will schedule the drain")
 	})
 }

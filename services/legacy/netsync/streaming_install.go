@@ -305,7 +305,38 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 	// arm on the consumer restores the entry, which is a no-op for one already
 	// registered, and then schedules the drain on the goroutine that owns the
 	// queue. Sending also wakes a sleeping consumer, which queueing never could.
+	// Only ask for a drain when the parent is actually IN THE CHAIN. A parent
+	// that is merely parked means this block is not committable yet, and its own
+	// commit will schedule the drain when it lands.
+	//
+	// parentIsReachable above is a different question and deliberately looser: a
+	// parked parent makes the body worth keeping. Using that same answer to
+	// trigger a drain sent the consumer after blocks whose parent was not
+	// committed, and each attempt fails with the parent missing and costs a store
+	// lookup on the goroutine that commits blocks. Measured on mainnet on
+	// 2026-09-10 in one 45-second window with nothing committing: five blocks
+	// streamed to disk and six of those failures.
+	//
+	// The sweep already applies this rule before it posts, which is why it does
+	// not produce them.
+	if !sm.parentIsInChain(entry.prevBlock) {
+		return
+	}
+
 	sm.submitParkCommit(parkCommit{entry: entry})
+}
+
+// parentIsInChain reports whether this node has committed the parent, which is
+// the condition for the block being committable now rather than merely worth
+// keeping. Consumer goroutine only, like its caller.
+func (sm *SyncManager) parentIsInChain(parent chainhash.Hash) bool {
+	if sm.blockchainClient == nil {
+		return false
+	}
+
+	_, _, err := sm.blockchainClient.GetBlockHeader(sm.ctx, &parent)
+
+	return err == nil
 }
 
 // parentIsReachable reports whether a parked block's parent is something this
