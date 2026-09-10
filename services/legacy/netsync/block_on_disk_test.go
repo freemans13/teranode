@@ -45,6 +45,7 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 
 	t.Run("the block is adopted and a drain is asked for", func(t *testing.T) {
 		h := withConsumer(t)
+		h.sm.parkCommits = make(chan parkCommit, 4)
 
 		// A parent the harness has in its header list, because an invented one is
 		// now correctly refused as unreachable.
@@ -58,13 +59,25 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 		require.Equal(t, int64(1<<20), h.sm.blockPark.Bytes(),
 			"an adopted block must be charged, or the park's accounting drifts from its disk")
 
-		require.Len(t, h.sm.drainQueue, 1,
-			"a streamed block whose parent is already in the chain must not wait for the 30-second sweep")
-		require.Equal(t, parent, h.sm.drainQueue[0].parent)
+		// The drain request goes to the consumer through parkCommits rather than
+		// onto drainQueue directly: this handler runs on blockHandler and the
+		// queue belongs to the dispatchBlocks consumer with no lock. Queueing it
+		// here raced that queue and could not wake a sleeping consumer.
+		require.Empty(t, h.sm.drainQueue,
+			"this goroutine must not touch the consumer's queue")
+
+		select {
+		case c := <-h.sm.parkCommits:
+			require.Equal(t, body.Hash, c.entry.hash,
+				"the consumer has to be handed the block, which both queues the drain on the right goroutine and wakes it")
+		default:
+			t.Fatal("nothing was handed to the consumer, so a streamed block whose parent is committed would wait for the 30-second sweep")
+		}
 	})
 
 	t.Run("the delivering peer is recorded", func(t *testing.T) {
 		h := withConsumer(t)
+		h.sm.parkCommits = make(chan parkCommit, 4)
 
 		body := bodyFor(h.blocks[1].MsgBlock().BlockHash(), 4096)
 		h.sm.handleBlockOnDiskMsg(&blockOnDiskMsg{body: body, peer: h.peer})
@@ -77,6 +90,7 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 
 	t.Run("a re-delivered body is not adopted twice", func(t *testing.T) {
 		h := withConsumer(t)
+		h.sm.parkCommits = make(chan parkCommit, 4)
 
 		body := bodyFor(h.blocks[1].MsgBlock().BlockHash(), 2048)
 
@@ -90,6 +104,7 @@ func TestHandleBlockOnDiskMsg(t *testing.T) {
 
 	t.Run("a park that refuses the entry has the orphaned body deleted", func(t *testing.T) {
 		h := withConsumer(t)
+		h.sm.parkCommits = make(chan parkCommit, 4)
 
 		// Fill to the ceiling so adoption is refused for a reason other than
 		// already holding it.
@@ -154,8 +169,8 @@ func TestHandleBlockOnDiskMsg_RefusesAnUnreachableParent(t *testing.T) {
 
 		require.False(t, h.sm.blockPark.Has(body.Hash),
 			"an unreachable block must not be held, or the drain offers it to the chain forever")
-		require.Empty(t, h.sm.drainQueue,
-			"and no drain should be asked for on its behalf")
+		require.Empty(t, h.sm.parkCommits,
+			"and nothing should be handed to the consumer on its behalf")
 	})
 
 	t.Run("a parent still ahead of us in the header list is accepted", func(t *testing.T) {
