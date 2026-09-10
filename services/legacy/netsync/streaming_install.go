@@ -240,6 +240,13 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 		peer:      msg.peer,
 	}
 
+	// Said at info, once per streamed block, because without it there is no way
+	// to tell from a running node whether this path is carrying anything at all.
+	// Both paths end with a body in the same store under the same name, so the
+	// park's own files cannot answer it and neither can the block's size.
+	sm.logger.Infof("[blockOnDisk][%s] body streamed to disk, %d bytes, %d txs, parent %s",
+		entry.hash, entry.size, msg.body.TxCount, entry.prevBlock)
+
 	if !sm.blockPark.AdoptWritten(entry) {
 		// Either we already hold this block, in which case the body on disk is
 		// the one the existing entry points at and there is nothing to do, or
