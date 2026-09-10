@@ -140,15 +140,32 @@ func readBlockMessage(lr *io.LimitedReader, length uint64) (wire.Message, error)
 		return nil, errors.NewProcessingError("streaming block %s: refused", hash, err)
 	}
 
-	// Everything from the transaction count onward goes to the sink untouched,
-	// so what is stored is byte-for-byte what a serialized block is: header,
-	// count, transactions. The count is read back out of the stored bytes rather
-	// than here, because reading it here would mean putting it back.
+	// The header goes to the sink ahead of the body, so what is stored is
+	// byte-for-byte what a serialized block is: header, count, transactions.
+	// That is what lets the park read a streamed block back with the same
+	// deserializer it uses for one it wrote itself, with no second file type and
+	// no flag saying which path produced it.
+	//
+	// The header is re-serialized rather than tee'd off the wire because it has
+	// already been consumed by Deserialize above, and 80 bytes is not the size
+	// this path exists to avoid buffering.
+	var headerBytes bytes.Buffer
+	if err := header.Serialize(&headerBytes); err != nil {
+		return nil, errors.NewProcessingError("streaming block %s: could not re-serialize the header", hash, err)
+	}
+
+	// counted wraps the post-header stream only, so the first bytes it sees are
+	// the transaction count. Wrapping the MultiReader instead would put the
+	// header's first nine bytes there and the count would be read out of the
+	// version field. The count is taken from the passing bytes rather than read
+	// here, because reading it here would mean putting it back.
 	var counted countingReader
 
 	counted.r = lr
 
-	if err := blockBodySink(hash, &counted, int64(length)-int64(wire.MaxBlockHeaderPayload)); err != nil {
+	body := io.MultiReader(bytes.NewReader(headerBytes.Bytes()), &counted)
+
+	if err := blockBodySink(hash, body, int64(length)); err != nil {
 		return nil, deleteOrphanedBody(hash, errors.NewProcessingError("streaming block %s: could not store the body", hash, err))
 	}
 

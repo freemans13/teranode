@@ -5961,6 +5961,11 @@ out:
 					}
 				}(msg)
 
+			case *blockOnDiskMsg:
+				// A body already on disk. No budget to release and no reply to
+				// send: the read loop was free the moment the bytes landed.
+				sm.handleBlockOnDiskMsg(msg)
+
 			case *blockMsg:
 				sm.logger.Debugf("[blockHandler][%s] queueing block for validation", msg.block.Hash())
 
@@ -6826,6 +6831,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// contents a restart could not enumerate; every call site reads nil as
 	// "discard the block", which is what the node did before the park existed.
 	sm.blockPark = newBlockPark(logger, tSettings, tempStore)
+
+	// Now the park exists, the wire layer can be told where to put a block body
+	// it reads straight off the socket. Before this call the streaming handler
+	// was registered but inert: it checks for a sink and a gate and found
+	// neither, so every block took the decoding path. See streaming_install.go
+	// for why that mattered beyond the allocation.
+	sm.installStreamingBlockPath(peerpkg.SetBlockBodyStreaming)
 
 	// Bounded async block prefetch: with a positive budget OnBlock admits a
 	// block against this global byte-weighted semaphore and returns, so the
