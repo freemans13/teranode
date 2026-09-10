@@ -204,3 +204,35 @@ func TestHandleBlockOnDiskMsg_RefusesAnUnreachableParent(t *testing.T) {
 			"our own storage being briefly unwell says nothing about the block, and discarding it would pay for the download twice")
 	})
 }
+
+// TestParentIsReachable_ParkedParentCounts is the regression test for a fault
+// this function caused on the day it shipped.
+//
+// A parked parent is a block already on disk waiting for its own parent, so a
+// child of it is exactly as reachable as a child of a committed block. Leaving the
+// park out of the test meant discarding bodies whose parents were sitting a few
+// inches away, which manufactured the very holes the node was stalling on.
+//
+// Measured on mainnet on 2026-09-10: sixteen of seventeen holes had their parent
+// in the park at that moment, no discard appears in four days of log before this
+// deployed, and it looped with the frontier race, which re-requested each missing
+// block only to have the arriving copy discarded again. Fourteen of the 28.7 GB
+// streamed in the log went round that loop.
+func TestParentIsReachable_ParkedParentCounts(t *testing.T) {
+	t.Run("a parent in the park is reachable", func(t *testing.T) {
+		h := newParkWiringHarness(t, true)
+
+		parent := parkedBlock{hash: chainhash.Hash{0xa1}, prevBlock: chainhash.Hash{0xa0}, size: 512}
+		require.True(t, h.sm.blockPark.AdoptWritten(parent))
+
+		require.True(t, h.sm.parentIsReachable(parent.hash),
+			"the parent is on this node's own disk; discarding its child manufactures the hole the node then stalls on")
+	})
+
+	t.Run("a parent nowhere at all is still unreachable", func(t *testing.T) {
+		h := newParkWiringHarness(t, true)
+
+		require.False(t, h.sm.parentIsReachable(chainhash.Hash{0x9e}),
+			"the gate must still refuse a body whose parent is in neither the park, the header list nor the chain")
+	})
+}

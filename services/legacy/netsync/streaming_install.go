@@ -317,6 +317,23 @@ func (sm *SyncManager) handleBlockOnDiskMsg(msg *blockOnDiskMsg) {
 // holds that lock and a blocking client call underneath it would serialise the
 // whole sync path.
 func (sm *SyncManager) parentIsReachable(parent chainhash.Hash) bool {
+	// The park first, and this was the omission that made this function a hole
+	// factory. A parked parent is a block we already hold on disk, waiting for
+	// ITS own parent, so a child of it is exactly as reachable as a child of a
+	// committed block. Leaving the park out meant discarding bodies whose parents
+	// were sitting a few inches away.
+	//
+	// Measured on mainnet on 2026-09-10, hours after this function shipped:
+	// sixteen of seventeen holes had their parent in the park at that moment, and
+	// there was not one discard in four days of log before this deployed. It also
+	// formed a loop with the frontier race, which re-requests the missing block,
+	// receives it, and has it discarded again: one hash went round four times on a
+	// thirty-second period, and 14 GB of the 28.7 GB streamed in the log is that
+	// loop.
+	if sm.blockPark.Has(parent) {
+		return true
+	}
+
 	sm.headerMu.Lock()
 	_, inList := sm.headerIndex[parent]
 	sm.headerMu.Unlock()
