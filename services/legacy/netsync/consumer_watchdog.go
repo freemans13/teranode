@@ -97,6 +97,18 @@ type consumerWait struct {
 	// blocks downloaded".
 	parked int
 
+	// drainShutByWindow records that parents were queued for a drain and the
+	// drain could not have its turn, because the drain only opens when the
+	// dispatcher's window is empty.
+	//
+	// It is the difference between "nothing to commit" and "something to commit
+	// and no way to commit it", and the second is the fault an operator sees as
+	// a tip that will not move with blocks piled on disk. Measured on mainnet on
+	// 2026-09-10: the block for the next height was on disk with its parent
+	// already committed, 127 blocks stacked behind it, and the sweep offering it
+	// every thirty seconds for two and a half hours.
+	drainShutByWindow bool
+
 	// downloadBudget, downloadHeld and downloadWaiters describe the byte budget
 	// that admits a block off the wire, which is a DIFFERENT budget from the
 	// window's and the one this report was missing.
@@ -143,6 +155,7 @@ func (sm *SyncManager) publishConsumerWait(now time.Time, queueArmOpen bool, pen
 	}
 
 	if bd := sm.dispatcher; bd != nil {
+		w.drainShutByWindow = len(sm.drainQueue) > 0 && !bd.frontierEmpty()
 		w.barrier = bd.barrier
 		w.inflightBytes = bd.inflight
 		w.budget = bd.budget
@@ -319,6 +332,10 @@ func (w *consumerWait) describe(now time.Time) string {
 		b.WriteString("; ")
 		b.WriteString(strconv.Itoa(w.drainQueued))
 		b.WriteString(" parents queued for a drain")
+
+		if w.drainShutByWindow {
+			b.WriteString(", but the drain cannot have its turn until the window is empty, so a block that is already on disk and whose parent is committed is waiting on whatever the window still holds")
+		}
 	}
 
 	b.WriteString("; ")
