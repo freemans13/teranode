@@ -2746,7 +2746,9 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 			case sm.parkJobs <- *sm.parkJobHeld:
 				sm.parkJobHeld = nil
 
-				sm.noteConsumerAdmitted(time.Now())
+				// Deliberately NOT an admission. Handing a block to a parking
+				// worker moves it from memory to disk; it commits nothing and
+				// advances the chain by nothing. See noteConsumerAdmitted.
 
 				continue
 			default:
@@ -2791,7 +2793,7 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 		case parkArm <- parkWork:
 			sm.parkJobHeld = nil
 
-			sm.noteConsumerAdmitted(time.Now())
+			// Not an admission, for the same reason as the offer above.
 
 		case <-sm.quit:
 			// Best-effort drain with an error reply before exiting: the block
@@ -2852,10 +2854,22 @@ func (sm *SyncManager) dispatchBlocks(blockQueue <-chan *blockQueueMsg) {
 				}
 			}
 		case msg := <-queueArm:
-			// Taking a block off the queue is progress in its own right, whatever
-			// the head then decides: a loop parking blocks it cannot commit is
-			// working, and only a loop doing nothing at all is wedged.
-			sm.noteConsumerAdmitted(time.Now())
+			// Taking a block off the queue is NOT progress, and the comment that
+			// used to sit here said the opposite: that a loop parking blocks it
+			// cannot commit is working, and only a loop doing nothing at all is
+			// wedged. That premise is what blinded this watchdog to the fault an
+			// operator actually watches.
+			//
+			// Measured on mainnet on 2026-09-10: the tip sat at 783,277 with the
+			// block for 783,278 already on disk and its parent already committed,
+			// 127 more blocks stacked behind it in one contiguous chain, and the
+			// sweep announcing every thirty seconds that it was committing the
+			// block. Nothing committed for over five minutes and the watchdog
+			// never spoke, because arriving blocks kept being received and parked
+			// and each of those reset its clock.
+			//
+			// What counts is a dispatch or a drained commit. Both stamp the clock
+			// themselves, a few lines above.
 
 			sm.logger.Debugf("[blockHandler][%s] processing block queue message into handleBlockMsgHead", msg.blockHash)
 
