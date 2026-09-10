@@ -5598,8 +5598,15 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		}
 	}
 
-	// by default, we do not process transactions / blocks
-	// only when we are in the running state we process transaction and new block messages
+	// Transaction announcements only. Blocks are accepted in every state, and
+	// have to be: past the last checkpoint headers-first mode is off, and then an
+	// inv is the only way this node hears that a block exists. The Kafka
+	// listeners downstream are wired the same way, with the block listener
+	// unconditionally enabled and the transaction listener gated on RUNNING.
+	//
+	// The name and the state read stay as they are; only the comment was wrong,
+	// and it claimed to cover blocks for long enough that two readers reported
+	// the switch below as a missing gate.
 	processInvs := false
 
 	fsmState, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
@@ -5726,10 +5733,16 @@ outside:
 func (sm *SyncManager) processInvMsg(i int, iv *wire.InvVect, processInvs bool, peer *peerpkg.Peer, exists bool, state *peerSyncState, lastBlock int) {
 	switch iv.Type {
 	case wire.InvTypeBlock:
+		// Deliberately empty, and Go does not fall through. A block
+		// announcement is taken in every FSM state, because past the last
+		// checkpoint headers-first mode is off and an inv is then the only way
+		// this node learns a block exists. Gating it on RUNNING would leave a
+		// node that is catching blocks with no block discovery at all.
 	case wire.InvTypeTx:
 		if !processInvs {
-			// If we are not in running state, we are not interested in new transaction or block messages
-			sm.logger.Debugf("[handleInvMsg] Ignoring inv message from %s, not in running state", peer)
+			// A transaction we are not going to validate yet is a transaction
+			// not worth fetching. Blocks are the other case above.
+			sm.logger.Debugf("[handleInvMsg] Ignoring transaction inv from %s, not in running state", peer)
 			return
 		}
 	default:
