@@ -576,7 +576,15 @@ func (d *blockDispatch) msgHash() chainhash.Hash {
 // unwindowed parked block would be refused admission there. Failing closed costs
 // one restored park entry and one ERROR line; failing open costs a lost block.
 func (bd *blockDispatcher) dispatch(d *blockDispatch) {
-	if d.parked != nil && (d.parent != nil || d.windowed || !bd.frontierEmpty()) {
+	// A parked dispatch must still arrive with no resolved parent: that is what
+	// leaves the worker's own parent lookup in place, which enforces the
+	// never-hand-over-a-parentless-block rule.
+	//
+	// It may now be windowed, and if it is it may arrive alongside another block.
+	// The condition that used to demand an empty window was a consequence of
+	// never being windowed rather than a rule of its own, and it is what kept the
+	// validator idle between every block drained from the park.
+	if d.parked != nil && (d.parent != nil || (!d.windowed && !bd.frontierEmpty())) {
 		bd.sm.logger.Errorf("[blockDispatcher][%s] refusing a parked dispatch in the wrong shape: parent=%v windowed=%v frontier=%d", d.parked.hash.String(), d.parent != nil, d.windowed, len(bd.frontier))
 		bd.sm.blockPark.Restore(*d.parked)
 
