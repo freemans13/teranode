@@ -50,6 +50,11 @@ const (
 	// route back.
 	parentMissingRetryAfter = 5 * time.Second
 
+	// parkReadSlowAfter is how long reading a parked block back may take before
+	// it is worth a line. Below this the read is not the reason a block was slow
+	// and a line per commit would only crowd out what is.
+	parkReadSlowAfter = 500 * time.Millisecond
+
 	// parkStuckThreshold is how old a parked block must be before the sweep
 	// spends an RPC asking whether its parent is in the chain after all. A
 	// missing parent is not the only thing that surfaces as ErrBlockNotFound,
@@ -771,9 +776,29 @@ func (p *blockPark) Read(ctx context.Context, hash chainhash.Hash) (*wire.MsgBlo
 		}
 	}()
 
+	// Timed, because this was the one unlogged step on the drain's critical path
+	// and it hid a measurable cost. Tracing a single block on mainnet on
+	// 2026-09-10 accounted for every stage of a thirty-one second block except a
+	// five-second stretch between the sweep offering it and delivery starting,
+	// and reading it back is the only substantial work in that stretch. Parked
+	// files run to 143 MB and the whole block is rebuilt as a Go object here.
+	//
+	// Reported only above a threshold, so the common small block stays quiet and
+	// a slow read is visible without the log carrying a line per commit. Bytes
+	// and duration together, because the useful figure is the rate: a read that
+	// is slow because the file is enormous is a different problem from one that
+	// is slow at 20 MB.
+	readStart := time.Now()
+
 	msgBlock := &wire.MsgBlock{}
 	if err = msgBlock.Deserialize(bufio.NewReaderSize(rc, parkReadBufferSize)); err != nil {
 		return nil, errors.NewBlockInvalidError("[blockPark][%s] parked block would not decode", hash, err)
+	}
+
+	if took := time.Since(readStart); took >= parkReadSlowAfter {
+		size := int64(msgBlock.SerializeSize())
+		p.logger.Infof("[blockPark][%s] reading the parked block back took %s for %d bytes (%.1f MB/s)",
+			hash, took.Round(time.Millisecond), size, float64(size)/took.Seconds()/(1024*1024))
 	}
 
 	// Eighty bytes of hashing that catches a mis-keyed or bit-rotted file. The
