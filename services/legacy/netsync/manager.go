@@ -358,8 +358,19 @@ func (s *peerSyncState) sampleThroughput(p *peerpkg.Peer) {
 // be fine is one duplicate block, and the cost of not racing a silent one is the
 // stall the race exists to break.
 func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
+	_, pulling := s.readDelta(minSpeed)
+
+	return pulling
+}
+
+// readDelta is isPullingBytes with the measurement it made, so a caller that
+// declines on the answer can log what the answer was made of. The frontier race
+// needs that: the same "an owner is pulling bytes" decline covers an owner
+// genuinely mid-transfer and an association total moving for some other reason,
+// and those want different fixes.
+func (s *peerSyncState) readDelta(minSpeed uint64) (uint64, bool) {
 	if s == nil || s.throughputTicks.Load() < 2 {
-		return false
+		return 0, false
 	}
 
 	cur := s.assocReadBytes.Load()
@@ -369,7 +380,7 @@ func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
 	// dying between samples drops the total. A decrease is the opposite of
 	// progress, not a wrapped-around healthy figure.
 	if cur < prev {
-		return false
+		return 0, false
 	}
 
 	delta := cur - prev
@@ -378,7 +389,7 @@ func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
 	// configured as 0, and a bare comparison against 0 would make a peer that
 	// sent nothing look busy and switch the race off altogether.
 	if delta == 0 {
-		return false
+		return 0, false
 	}
 
 	// Multiplied rather than divided: `delta/seconds >= minSpeed` truncates, and
@@ -390,7 +401,7 @@ func (s *peerSyncState) isPullingBytes(minSpeed uint64) bool {
 		seconds = 1
 	}
 
-	return delta >= minSpeed*seconds
+	return delta, delta >= minSpeed*seconds
 }
 
 // noteBestKnownHeight raises the peer's best known height to h, and never lowers
