@@ -2910,6 +2910,10 @@ func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpo
 	// reinsertHeaderLocked's caller — so a hash in the list is a hash in the
 	// index. Looking it up here is what makes the removal independent of
 	// position.
+	// Whether the lookup below has already said what the frontier should be.
+	// Anything it does not settle has to fall through to the republish after it.
+	frontierSettled := false
+
 	if e := sm.headerIndex[blockHash]; e != nil {
 		if node, ok := e.Value.(*headerNode); ok && node.hash != nil {
 			wasFront := e == sm.headerList.Front()
@@ -2943,8 +2947,32 @@ func (sm *SyncManager) advanceHeaderListFor(blockHash chainhash.Hash) (isCheckpo
 				} else {
 					sm.publishFrontierLocked(time.Now())
 				}
+
+				frontierSettled = true
 			}
 		}
+	}
+
+	// Nothing above spoke for the frontier, which happens in two ways: the
+	// header had already left the list, so there was nothing to look up, or it
+	// was behind the front, so removing it left the front alone. In both the
+	// frontier is whatever it was before this commit, and it can already be
+	// naming the block that has just committed. The racer chases whatever the
+	// frontier names, so a stale one sends peers after a block this node holds.
+	//
+	// Measured on mainnet: block 762018 committed at 00:53:46 and was raced four
+	// more times over the next five and a half minutes. Its frontier was stamped
+	// eight seconds before the commit and never moved, because by the time the
+	// block committed its header had gone.
+	//
+	// This refreshes rather than republishes, and the difference matters. A full
+	// publish clears the frontier when the list has no front to name, and a
+	// clear takes the racers with it and restarts the outstanding clock on the
+	// next publish, which would delay the very race this is meant to keep
+	// pointed at the right block. Naming a real front is always an improvement;
+	// having no front to name is not a reason to forget the one we had.
+	if !frontierSettled {
+		sm.refreshFrontierLocked(time.Now())
 	}
 
 	sm.headerMu.Unlock()

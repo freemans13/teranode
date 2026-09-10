@@ -287,11 +287,18 @@ func TestFrontierRace_ParkedWorkMakesTheFrontierWorthRacing(t *testing.T) {
 
 		// The frontier sits on a block nobody has delivered, outstanding far longer
 		// than the slow-fetch timeout.
-		stuck := chainhash.HashH([]byte("the block at the front of the hole"))
+		//
+		// It has to be the header list's own front, not an invented hash. The
+		// frontier is derived from that front rather than stored, so a frontier
+		// naming a block absent from the list is a state the node only reaches
+		// when a commit leaves it stale, and every commit now refreshes it. The
+		// front of the list is the front of the nearest hole, which is what this
+		// test is about.
+		stuck := h.blocks[0].MsgBlock().BlockHash()
 
 		h.sm.frontierMu.Lock()
 		h.sm.frontierHash = stuck
-		h.sm.frontierHeight = 2
+		h.sm.frontierHeight = 1
 		h.sm.frontierSince = time.Now().Add(-time.Hour)
 		h.sm.frontierRacers = nil
 		h.sm.frontierMu.Unlock()

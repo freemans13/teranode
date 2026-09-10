@@ -137,6 +137,33 @@ func (sm *SyncManager) publishFrontierLocked(now time.Time) {
 	sm.setFrontier(*node.hash, node.height, now)
 }
 
+// refreshFrontierLocked names the list's front as the frontier if there is one
+// to name, and leaves the frontier untouched if there is not.
+//
+// It is publishFrontierLocked without the clear. Callers that know the frontier
+// has just become meaningless want the clear; a caller that only suspects the
+// frontier is stale wants this, because clearing drops the racers registered
+// against it and makes the next publish restart the outstanding clock from
+// zero. Publishing the same hash again is already a no-op inside setFrontier,
+// so on a front that has not moved this costs one comparison.
+func (sm *SyncManager) refreshFrontierLocked(now time.Time) {
+	if !sm.headersFirstMode.Load() || sm.headerList == nil {
+		return
+	}
+
+	front := sm.headerList.Front()
+	if front == nil || front == sm.startHeader {
+		return
+	}
+
+	node, ok := front.Value.(*headerNode)
+	if !ok || node.hash == nil || node.isAnchor {
+		return
+	}
+
+	sm.setFrontier(*node.hash, node.height, now)
+}
+
 // clearFrontier records that there is currently no block whose absence is
 // holding up sync.
 func (sm *SyncManager) clearFrontier() {
